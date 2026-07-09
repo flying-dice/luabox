@@ -166,7 +166,18 @@ fn main() -> anyhow::Result<()> {
         Command::Toolchain { .. } => unimplemented("toolchain", "P4"),
         Command::Vendor => unimplemented("vendor", "P2"),
         Command::Audit => unimplemented("audit", "P5"),
-        Command::Explain { .. } => unimplemented("explain", "P0"),
+        Command::Explain { code } => {
+            let parsed: luabox_diag::Code = code.parse().map_err(|_| {
+                anyhow::anyhow!("`{code}` is not a valid diagnostic code; codes look like LB0421")
+            })?;
+            match luabox_diag::explain(&parsed) {
+                Some(entry) => {
+                    println!("{}: {}\n\n{}", entry.code, entry.title, entry.explain);
+                    Ok(())
+                }
+                None => bail!("no such diagnostic code `{parsed}`; codes look like LB0421"),
+            }
+        }
     }
 }
 

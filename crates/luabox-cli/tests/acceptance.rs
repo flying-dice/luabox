@@ -32,6 +32,10 @@ impl AcceptanceWorld {
     fn stderr(&self) -> String {
         String::from_utf8_lossy(&self.output().stderr).into_owned()
     }
+
+    fn stdout(&self) -> String {
+        String::from_utf8_lossy(&self.output().stdout).into_owned()
+    }
 }
 
 #[given("an empty directory")]
@@ -97,6 +101,15 @@ fn stderr_contains(world: &mut AcceptanceWorld, needle: String) {
     assert!(
         stderr.contains(&needle),
         "stderr does not contain `{needle}`; stderr:\n{stderr}"
+    );
+}
+
+#[then(expr = "stdout contains {string}")]
+fn stdout_contains(world: &mut AcceptanceWorld, needle: String) {
+    let stdout = world.stdout();
+    assert!(
+        stdout.contains(&needle),
+        "stdout does not contain `{needle}`; stdout:\n{stdout}"
     );
 }
 

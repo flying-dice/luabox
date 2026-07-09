@@ -7,4 +7,21 @@
 //! GitHub Actions, GitLab Code Quality. Block `LB2xxx` is reserved for
 //! shapes (SHAPES.md §5).
 //!
-//! Status: under construction — P0.
+//! The pieces:
+//! - [`Code`] / [`Severity`] — the coded vocabulary.
+//! - [`Span`] / [`Label`] / [`Suggestion`] / [`Diagnostic`] — the payload.
+//! - [`registry::explain`] — title + Markdown explain page per code.
+//! - [`render`] — one function per output [`Format`].
+
+mod code;
+mod diagnostic;
+pub mod registry;
+mod render;
+
+pub use code::{Code, CodeParseError, Severity};
+pub use diagnostic::{Diagnostic, Label, Span, Suggestion};
+pub use registry::{Entry, explain};
+pub use render::{
+    Format, SourceLookup, render, render_github_actions, render_gitlab_code_quality, render_human,
+    render_json, render_sarif,
+};
