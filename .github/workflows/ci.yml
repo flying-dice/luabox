@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo test --workspace
+
+  # SPEC.md §16.1 — perf gates are CI-blocking once the corpus and harness
+  # exist. Until then this job only proves the release binary builds and
+  # records cold-start time for the record; flip continue-on-error off when
+  # the real gate lands.
+  perf-gates:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p luabox-cli
+      - name: Cold-start smoke (target < 50 ms)
+        run: |
+          start=$(date +%s%N)
+          ./target/release/luabox --version
+          end=$(date +%s%N)
+          echo "cold start: $(( (end - start) / 1000000 )) ms"

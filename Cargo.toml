@@ -1,0 +1,49 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://gitlab.beluga-sirius.ts.net/flying-dice/luabox"
+rust-version = "1.92"
+
+[workspace.dependencies]
+# Intra-workspace (bounded contexts — see SPEC.md §16)
+luabox-syntax = { path = "crates/luabox-syntax", version = "0.1.0" }
+luabox-hir = { path = "crates/luabox-hir", version = "0.1.0" }
+luabox-types = { path = "crates/luabox-types", version = "0.1.0" }
+luabox-db = { path = "crates/luabox-db", version = "0.1.0" }
+luabox-lower = { path = "crates/luabox-lower", version = "0.1.0" }
+luabox-bundle = { path = "crates/luabox-bundle", version = "0.1.0" }
+luabox-resolve = { path = "crates/luabox-resolve", version = "0.1.0" }
+luabox-store = { path = "crates/luabox-store", version = "0.1.0" }
+luabox-lsp = { path = "crates/luabox-lsp", version = "0.1.0" }
+luabox-test = { path = "crates/luabox-test", version = "0.1.0" }
+
+# External
+rowan = "0.16"
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1"
+# Acceptance layer (SPEC.md §16.2)
+cucumber = "0.21"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+
+# SPEC.md §16.1 release profile
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

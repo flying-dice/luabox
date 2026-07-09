@@ -1,0 +1,14 @@
+[package]
+name = "luabox-bundle"
+description = "luabox: require-graph bundling, tree-shaking, minify, sourcemaps (Emit context)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+luabox-lower.workspace = true
+
+[lints]
+workspace = true

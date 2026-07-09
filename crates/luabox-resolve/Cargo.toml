@@ -1,0 +1,11 @@
+[package]
+name = "luabox-resolve"
+description = "luabox: PubGrub dependency solver, registry + luarocks bridge (Distribution context)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

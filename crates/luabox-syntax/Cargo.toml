@@ -1,0 +1,14 @@
+[package]
+name = "luabox-syntax"
+description = "luabox: lossless syntax trees and lexer/parser for all Lua dialects (Syntax context)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rowan.workspace = true
+
+[lints]
+workspace = true

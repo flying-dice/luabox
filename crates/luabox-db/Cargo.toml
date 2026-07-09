@@ -1,0 +1,16 @@
+[package]
+name = "luabox-db"
+description = "luabox: incremental query database shared by check/lint/lsp/fmt (Semantics context)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+luabox-syntax.workspace = true
+luabox-hir.workspace = true
+luabox-types.workspace = true
+
+[lints]
+workspace = true

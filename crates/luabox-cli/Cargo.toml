@@ -1,0 +1,31 @@
+[package]
+name = "luabox-cli"
+description = "luabox: the unified Lua toolchain CLI (Frontend context)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# SPEC.md: CLI binary `luabox`; the `lb` alias is created at install time
+# by the packaging scripts (hardlink/shim), not as a second cargo target.
+[[bin]]
+name = "luabox"
+path = "src/main.rs"
+
+[dependencies]
+luabox-syntax.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+cucumber.workspace = true
+tokio.workspace = true
+tempfile.workspace = true
+
+[[test]]
+name = "acceptance"
+harness = false
+
+[lints]
+workspace = true

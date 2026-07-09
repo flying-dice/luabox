@@ -1,0 +1,3 @@
+# Proper nouns clippy::doc_markdown should not demand backticks for.
+# ".." keeps clippy's built-in default list.
+doc-valid-idents = ["LuaJIT", "LuaLS", "LuaRocks", "PubGrub", "OpenResty", ".."]
