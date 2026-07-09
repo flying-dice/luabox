@@ -39,7 +39,81 @@ syntax_kinds! {
 
         // === Nodes (parser output; grows as the grammar lands) ===
         SOURCE_FILE,
+        /// Tokens the parser could not fit into the grammar; recovery keeps
+        /// them here so the tree stays lossless.
         ERROR_NODE,
+        BLOCK,
+
+        // --- Statements ---
+        /// `local a <const>, b = 1, 2` (attribs are 5.4; union grammar).
+        LOCAL_STMT,
+        /// One declared name with its optional attribute: `a <const>`.
+        LOCAL_NAME,
+        /// `<const>` / `<close>` (5.4 attribs; validated per dialect later).
+        NAME_ATTRIB,
+        /// `a, b.c[k] = 1, 2` — two `EXPR_LIST` children around `=`.
+        ASSIGN_STMT,
+        /// An expression in statement position; only calls are legal, but
+        /// recovery wraps any expression here (with a `ParseError`).
+        CALL_STMT,
+        DO_STMT,
+        WHILE_STMT,
+        REPEAT_STMT,
+        IF_STMT,
+        ELSEIF_CLAUSE,
+        ELSE_CLAUSE,
+        /// `for i = a, b [, c] do ... end`
+        NUMERIC_FOR_STMT,
+        /// `for a, b in exprs do ... end`
+        GENERIC_FOR_STMT,
+        /// `function a.b.c:d(...) ... end`
+        FUNCTION_DECL_STMT,
+        /// The dotted/method path of a `FUNCTION_DECL_STMT`.
+        FUNCTION_NAME,
+        LOCAL_FUNCTION_STMT,
+        RETURN_STMT,
+        BREAK_STMT,
+        /// `goto label` (5.2+/LuaJIT; in 5.1 `goto` lexes as IDENT).
+        GOTO_STMT,
+        /// `::label::`
+        LABEL_STMT,
+
+        // --- Expressions ---
+        NAME_EXPR,
+        /// `nil`, `true`, `false`, NUMBER, STRING.
+        LITERAL_EXPR,
+        /// `...`
+        VARARG_EXPR,
+        PAREN_EXPR,
+        /// Unary: `not x`, `#x`, `-x`, `~x`.
+        PREFIX_EXPR,
+        BIN_EXPR,
+        /// `function (...) ... end`
+        FUNCTION_EXPR,
+        /// Table constructor `{ ... }`.
+        TABLE_EXPR,
+        /// `f(args)`, `f "s"`, `f {t}`.
+        CALL_EXPR,
+        /// `o:m(args)`.
+        METHOD_CALL_EXPR,
+        /// `t[k]`
+        INDEX_EXPR,
+        /// `t.name`
+        FIELD_EXPR,
+
+        // --- Support ---
+        PARAM_LIST,
+        /// One parameter: a name or `...`.
+        PARAM,
+        /// Call arguments: `( EXPR_LIST )`, a STRING, or a `TABLE_EXPR`.
+        ARG_LIST,
+        EXPR_LIST,
+        /// `[k] = v`
+        TABLE_KEY_FIELD,
+        /// `name = v`
+        TABLE_NAME_FIELD,
+        /// Positional `v`.
+        TABLE_ITEM_FIELD,
     }
 }
 

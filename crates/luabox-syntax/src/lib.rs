@@ -23,4 +23,4 @@ mod kind_macro;
 pub mod lua;
 pub mod shape;
 
-pub use lua::{Dialect, LuaLanguage, SyntaxKind, Token, lex};
+pub use lua::{Dialect, LuaLanguage, Parse, ParseError, SyntaxKind, Token, lex, parse};
