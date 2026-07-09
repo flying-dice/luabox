@@ -102,5 +102,11 @@ fn stderr_contains(world: &mut AcceptanceWorld, needle: String) {
 
 #[tokio::main]
 async fn main() {
-    AcceptanceWorld::run("tests/features").await;
+    // @wip gates feature files written ahead of implementation (spec-first,
+    // SPEC.md §16.2). Remove the tag when the behaviour ships.
+    AcceptanceWorld::filter_run("tests/features", |feature, _rule, scenario| {
+        let wip = |tags: &[String]| tags.iter().any(|t| t == "wip");
+        !wip(&feature.tags) && !wip(&scenario.tags)
+    })
+    .await;
 }

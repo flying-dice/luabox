@@ -1,10 +1,12 @@
 /// A Lua dialect luabox can read (`edition`) or emit (`target`).
 ///
-/// See SPEC.md §2 for the full support matrix. The lexer lexes the *union*
-/// of all dialects wherever that is unambiguous (dialect-illegal constructs
-/// are diagnosed later, with spans, rather than mangled at token level); the
-/// only token-level divergences are the keyword set and Luau-specific string
-/// syntax, which this type gates.
+/// See SPEC.md §2 for the support matrix. Luau is out of scope
+/// toolchain-wide (SPEC.md §1) — not a variant here, by decision.
+///
+/// The lexer lexes the *union* of all dialects wherever that is unambiguous
+/// (dialect-illegal constructs are diagnosed later, with spans, rather than
+/// mangled at token level); the only token-level divergences are the `goto`
+/// keyword and LuaJIT number suffixes, which this type gates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Dialect {
     Lua51,
@@ -14,20 +16,13 @@ pub enum Dialect {
     /// LuaJIT: 5.1 plus extensions (`goto`, hex floats, `LL`/`ULL`/`i`
     /// number suffixes).
     LuaJit,
-    Luau,
 }
 
 impl Dialect {
     /// `goto`/`::label::` are part of the grammar (5.2+, LuaJIT).
-    /// Where false, `goto` lexes as a plain identifier.
+    /// Where false (5.1), `goto` lexes as a plain identifier.
     pub fn has_goto(self) -> bool {
-        !matches!(self, Dialect::Lua51 | Dialect::Luau)
-    }
-
-    /// Luau-only lexical syntax: backtick interpolated strings, compound
-    /// assignment operators, `->` in type position.
-    pub fn is_luau(self) -> bool {
-        self == Dialect::Luau
+        self != Dialect::Lua51
     }
 
     /// The identifier used in `luabox.toml` (`edition = "5.4"`).
@@ -38,7 +33,6 @@ impl Dialect {
             Dialect::Lua53 => "5.3",
             Dialect::Lua54 => "5.4",
             Dialect::LuaJit => "luajit",
-            Dialect::Luau => "luau",
         }
     }
 
@@ -50,8 +44,16 @@ impl Dialect {
             "5.3" => Dialect::Lua53,
             "5.4" => Dialect::Lua54,
             "luajit" => Dialect::LuaJit,
-            "luau" => Dialect::Luau,
             _ => return None,
         })
     }
+
+    /// All dialects, for matrix-style tests and validation sweeps.
+    pub const ALL: [Dialect; 5] = [
+        Dialect::Lua51,
+        Dialect::Lua52,
+        Dialect::Lua53,
+        Dialect::Lua54,
+        Dialect::LuaJit,
+    ];
 }

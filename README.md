@@ -4,7 +4,10 @@
 
 One static binary that is the package manager, typechecker, linter, formatter,
 bundler, test runner, LSP server, and toolchain manager for every Lua dialect
-(5.1–5.4, LuaJIT, Luau). See [SPEC.md](SPEC.md) for the full design.
+(5.1–5.4, LuaJIT). Types come from full LuaCATS annotation support plus the
+`.lb` shape DSL — Rust struct/trait declarations checked over untyped Lua,
+analyser-only. See [SPEC.md](SPEC.md) and [SHAPES.md](SHAPES.md) for the full
+design. Luau is explicitly out of scope.
 
 ## Status
 
@@ -17,9 +20,9 @@ Cargo workspace, one crate per bounded context (SPEC.md §16):
 
 | Crate | Owns |
 |---|---|
-| `luabox-syntax` | lossless parser, all dialects |
+| `luabox-syntax` | lossless parser: Lua dialects + `.lb` shape grammar |
 | `luabox-hir` | desugared IR, name resolution |
-| `luabox-types` | unified type IR (LuaLS ⊕ Luau), inference |
+| `luabox-types` | unified type IR (LuaCATS ⊕ shapes), inference |
 | `luabox-db` | incremental query database |
 | `luabox-lower` | target lowering + polyfills |
 | `luabox-bundle` | require-graph, tree-shake, minify, sourcemaps |

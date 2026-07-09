@@ -12,9 +12,9 @@ Feature: Project scaffolding — luabox init / luabox new
 
   Scenario: init a library project
     Given an empty directory
-    When I run "luabox init --lib --edition luau"
+    When I run "luabox init --lib --edition luajit"
     Then the command succeeds
-    And "luabox.toml" contains 'edition = "luau"'
+    And "luabox.toml" contains 'edition = "luajit"'
     And the file "src/lib.lua" exists
 
   Scenario: init refuses to overwrite an existing project
@@ -27,6 +27,12 @@ Feature: Project scaffolding — luabox init / luabox new
   Scenario: init rejects an unknown edition
     Given an empty directory
     When I run "luabox init --edition 6.0"
+    Then the command fails
+    And stderr contains "unknown edition"
+
+  Scenario: luau is not a supported edition
+    Given an empty directory
+    When I run "luabox init --edition luau"
     Then the command fails
     And stderr contains "unknown edition"
 

@@ -1,4 +1,4 @@
-//! Lossless lexer for every supported dialect.
+//! Lossless lexer for every supported Lua dialect.
 //!
 //! Invariant: the concatenation of all token texts is byte-identical to the
 //! input — nothing is skipped, normalized, or merged. Whitespace and comments
@@ -6,17 +6,16 @@
 //!
 //! The lexer accepts the *union* of all dialect lexical grammars wherever
 //! that is unambiguous (`::`, `//`, `<<` lex the same everywhere; a 5.1
-//! validator diagnoses them later with a proper span). Only two things are
-//! dialect-gated at token level because they change token *boundaries*:
-//! the `goto` keyword and Luau-only syntax (backtick interpolated strings,
-//! compound assignment, `->`, `?`, LuaJIT number suffixes on the JIT side).
+//! validator diagnoses them later with a proper span). The only things
+//! dialect-gated at token level, because they change token *boundaries*,
+//! are the `goto` keyword and LuaJIT number suffixes.
 //!
 //! Unterminated long strings/comments lex to end-of-input with their natural
 //! kind (the validator sees the missing terminator in the text); an
 //! unterminated *short* string becomes an [`SyntaxKind::ERROR`] token ending
 //! at the newline, so the rest of the line still lexes normally.
 
-use crate::{Dialect, SyntaxKind};
+use super::{Dialect, SyntaxKind};
 
 /// One lexed token: a kind and a byte length. Positions are implicit — the
 /// tokens tile the input exactly, in order.
@@ -84,7 +83,6 @@ impl Lexer<'_> {
                 }
             }
             b'\'' | b'"' => self.short_string(start, b),
-            b'`' if self.dialect.is_luau() => self.interp_string(start),
             b'0'..=b'9' => self.number(start),
             b'.' => {
                 if matches!(self.peek(1), Some(b'0'..=b'9')) {
@@ -99,30 +97,19 @@ impl Lexer<'_> {
     }
 
     fn minus(&mut self, start: usize) {
-        match self.peek(1) {
-            Some(b'-') => {
-                self.pos += 2;
-                if let Some(level) = self.long_bracket_level() {
-                    self.long_bracket(start, level, SyntaxKind::COMMENT);
-                } else {
-                    while !matches!(self.peek(0), None | Some(b'\n')) {
-                        self.pos += 1;
-                    }
-                    self.push(SyntaxKind::COMMENT, start);
+        if self.peek(1) == Some(b'-') {
+            self.pos += 2;
+            if let Some(level) = self.long_bracket_level() {
+                self.long_bracket(start, level, SyntaxKind::COMMENT);
+            } else {
+                while !matches!(self.peek(0), None | Some(b'\n')) {
+                    self.pos += 1;
                 }
+                self.push(SyntaxKind::COMMENT, start);
             }
-            Some(b'>') if self.dialect.is_luau() => {
-                self.pos += 2;
-                self.push(SyntaxKind::THIN_ARROW, start);
-            }
-            Some(b'=') if self.dialect.is_luau() => {
-                self.pos += 2;
-                self.push(SyntaxKind::MINUS_EQ, start);
-            }
-            _ => {
-                self.pos += 1;
-                self.push(SyntaxKind::MINUS, start);
-            }
+        } else {
+            self.pos += 1;
+            self.push(SyntaxKind::MINUS, start);
         }
     }
 
@@ -200,45 +187,10 @@ impl Lexer<'_> {
         }
     }
 
-    /// Luau `` `text {expr}` `` — lexed as a single token; the parser
-    /// re-lexes the `{}` holes. Brace depth is tracked so `{ {a=1} }` holes
-    /// don't end the string early. Unterminated → ERROR to end of line.
-    fn interp_string(&mut self, start: usize) {
-        self.pos += 1;
-        let mut depth = 0usize;
-        loop {
-            match self.peek(0) {
-                None | Some(b'\n') => {
-                    self.push(SyntaxKind::ERROR, start);
-                    return;
-                }
-                Some(b'\\') => self.pos += if self.peek(1).is_some() { 2 } else { 1 },
-                Some(b'{') => {
-                    depth += 1;
-                    self.pos += 1;
-                }
-                Some(b'}') => {
-                    depth = depth.saturating_sub(1);
-                    self.pos += 1;
-                }
-                Some(b'`') if depth == 0 => {
-                    self.pos += 1;
-                    self.push(SyntaxKind::INTERP_STRING, start);
-                    return;
-                }
-                Some(_) => self.pos += 1,
-            }
-        }
-    }
-
     fn number(&mut self, start: usize) {
-        let is_digit_sep = |b: u8| b == b'_' && self.dialect.is_luau();
         if self.peek(0) == Some(b'0') && matches!(self.peek(1), Some(b'x' | b'X')) {
             self.pos += 2;
-            while self
-                .peek(0)
-                .is_some_and(|b| b.is_ascii_hexdigit() || is_digit_sep(b))
-            {
+            while self.peek(0).is_some_and(|b| b.is_ascii_hexdigit()) {
                 self.pos += 1;
             }
             if self.peek(0) == Some(b'.') {
@@ -251,31 +203,14 @@ impl Lexer<'_> {
             if matches!(self.peek(0), Some(b'p' | b'P')) {
                 self.exponent();
             }
-        } else if self.peek(0) == Some(b'0')
-            && matches!(self.peek(1), Some(b'b' | b'B'))
-            && self.dialect.is_luau()
-        {
-            self.pos += 2;
-            while self
-                .peek(0)
-                .is_some_and(|b| matches!(b, b'0' | b'1' | b'_'))
-            {
-                self.pos += 1;
-            }
         } else {
-            while self
-                .peek(0)
-                .is_some_and(|b| b.is_ascii_digit() || is_digit_sep(b))
-            {
+            while self.peek(0).is_some_and(|b| b.is_ascii_digit()) {
                 self.pos += 1;
             }
             if self.peek(0) == Some(b'.') && self.peek(1) != Some(b'.') {
                 // `1..2` is NUMBER DOT_DOT NUMBER, not a malformed float.
                 self.pos += 1;
-                while self
-                    .peek(0)
-                    .is_some_and(|b| b.is_ascii_digit() || is_digit_sep(b))
-                {
+                while self.peek(0).is_some_and(|b| b.is_ascii_digit()) {
                     self.pos += 1;
                 }
             }
@@ -290,8 +225,8 @@ impl Lexer<'_> {
     }
 
     /// `e`/`E`/`p`/`P` exponent: consumed only if digits (after an optional
-    /// sign) actually follow, so `1e` lexes as NUMBER(1e)… no — as
-    /// NUMBER(1) IDENT(e), matching how `print(1e)` should diagnose.
+    /// sign) actually follow, so `1e` lexes as NUMBER(1) IDENT(e) and the
+    /// parser diagnoses it.
     fn exponent(&mut self) {
         let sign = usize::from(matches!(self.peek(1), Some(b'+' | b'-')));
         if self.peek(1 + sign).is_some_and(|b| b.is_ascii_digit()) {
@@ -324,9 +259,6 @@ impl Lexer<'_> {
             if self.peek(2) == Some(b'.') {
                 self.pos += 3;
                 self.push(SyntaxKind::DOT_DOT_DOT, start);
-            } else if self.peek(2) == Some(b'=') && self.dialect.is_luau() {
-                self.pos += 3;
-                self.push(SyntaxKind::DOT_DOT_EQ, start);
             } else {
                 self.pos += 2;
                 self.push(SyntaxKind::DOT_DOT, start);
@@ -373,43 +305,35 @@ impl Lexer<'_> {
     }
 
     fn symbol(&mut self, start: usize, b: u8) {
-        let luau = self.dialect.is_luau();
-        let (kind, len) = match (b, self.peek(1), self.peek(2)) {
-            (b'/', Some(b'/'), Some(b'=')) if luau => (SyntaxKind::SLASH_SLASH_EQ, 3),
-            (b'/', Some(b'/'), _) => (SyntaxKind::SLASH_SLASH, 2),
-            (b'/', Some(b'='), _) if luau => (SyntaxKind::SLASH_EQ, 2),
-            (b'/', _, _) => (SyntaxKind::SLASH, 1),
-            (b'<', Some(b'<'), _) => (SyntaxKind::LT_LT, 2),
-            (b'<', Some(b'='), _) => (SyntaxKind::LT_EQ, 2),
-            (b'<', _, _) => (SyntaxKind::LT, 1),
-            (b'>', Some(b'>'), _) => (SyntaxKind::GT_GT, 2),
-            (b'>', Some(b'='), _) => (SyntaxKind::GT_EQ, 2),
-            (b'>', _, _) => (SyntaxKind::GT, 1),
-            (b'=', Some(b'='), _) => (SyntaxKind::EQ_EQ, 2),
-            (b'=', _, _) => (SyntaxKind::EQ, 1),
-            (b'~', Some(b'='), _) => (SyntaxKind::TILDE_EQ, 2),
-            (b'~', _, _) => (SyntaxKind::TILDE, 1),
-            (b':', Some(b':'), _) => (SyntaxKind::COLON_COLON, 2),
-            (b':', _, _) => (SyntaxKind::COLON, 1),
-            (b'+', Some(b'='), _) if luau => (SyntaxKind::PLUS_EQ, 2),
-            (b'+', _, _) => (SyntaxKind::PLUS, 1),
-            (b'*', Some(b'='), _) if luau => (SyntaxKind::STAR_EQ, 2),
-            (b'*', _, _) => (SyntaxKind::STAR, 1),
-            (b'%', Some(b'='), _) if luau => (SyntaxKind::PERCENT_EQ, 2),
-            (b'%', _, _) => (SyntaxKind::PERCENT, 1),
-            (b'^', Some(b'='), _) if luau => (SyntaxKind::CARET_EQ, 2),
-            (b'^', _, _) => (SyntaxKind::CARET, 1),
-            (b'#', _, _) => (SyntaxKind::HASH, 1),
-            (b'&', _, _) => (SyntaxKind::AMP, 1),
-            (b'|', _, _) => (SyntaxKind::PIPE, 1),
-            (b'(', _, _) => (SyntaxKind::L_PAREN, 1),
-            (b')', _, _) => (SyntaxKind::R_PAREN, 1),
-            (b'{', _, _) => (SyntaxKind::L_BRACE, 1),
-            (b'}', _, _) => (SyntaxKind::R_BRACE, 1),
-            (b']', _, _) => (SyntaxKind::R_BRACKET, 1),
-            (b';', _, _) => (SyntaxKind::SEMICOLON, 1),
-            (b',', _, _) => (SyntaxKind::COMMA, 1),
-            (b'?', _, _) if luau => (SyntaxKind::QUESTION, 1),
+        let (kind, len) = match (b, self.peek(1)) {
+            (b'/', Some(b'/')) => (SyntaxKind::SLASH_SLASH, 2),
+            (b'/', _) => (SyntaxKind::SLASH, 1),
+            (b'<', Some(b'<')) => (SyntaxKind::LT_LT, 2),
+            (b'<', Some(b'=')) => (SyntaxKind::LT_EQ, 2),
+            (b'<', _) => (SyntaxKind::LT, 1),
+            (b'>', Some(b'>')) => (SyntaxKind::GT_GT, 2),
+            (b'>', Some(b'=')) => (SyntaxKind::GT_EQ, 2),
+            (b'>', _) => (SyntaxKind::GT, 1),
+            (b'=', Some(b'=')) => (SyntaxKind::EQ_EQ, 2),
+            (b'=', _) => (SyntaxKind::EQ, 1),
+            (b'~', Some(b'=')) => (SyntaxKind::TILDE_EQ, 2),
+            (b'~', _) => (SyntaxKind::TILDE, 1),
+            (b':', Some(b':')) => (SyntaxKind::COLON_COLON, 2),
+            (b':', _) => (SyntaxKind::COLON, 1),
+            (b'+', _) => (SyntaxKind::PLUS, 1),
+            (b'*', _) => (SyntaxKind::STAR, 1),
+            (b'%', _) => (SyntaxKind::PERCENT, 1),
+            (b'^', _) => (SyntaxKind::CARET, 1),
+            (b'#', _) => (SyntaxKind::HASH, 1),
+            (b'&', _) => (SyntaxKind::AMP, 1),
+            (b'|', _) => (SyntaxKind::PIPE, 1),
+            (b'(', _) => (SyntaxKind::L_PAREN, 1),
+            (b')', _) => (SyntaxKind::R_PAREN, 1),
+            (b'{', _) => (SyntaxKind::L_BRACE, 1),
+            (b'}', _) => (SyntaxKind::R_BRACE, 1),
+            (b']', _) => (SyntaxKind::R_BRACKET, 1),
+            (b';', _) => (SyntaxKind::SEMICOLON, 1),
+            (b',', _) => (SyntaxKind::COMMA, 1),
             _ => {
                 // Unrecognized byte: consume the full UTF-8 char so token
                 // boundaries stay char boundaries.
@@ -457,14 +381,7 @@ mod tests {
             "weird = £ § unterminated'",
         ];
         for src in corpus {
-            for d in [
-                Dialect::Lua51,
-                Dialect::Lua52,
-                Dialect::Lua53,
-                Dialect::Lua54,
-                Dialect::LuaJit,
-                Dialect::Luau,
-            ] {
+            for d in Dialect::ALL {
                 check(src, d); // asserts tiling internally
             }
         }
@@ -475,7 +392,6 @@ mod tests {
         assert_eq!(kinds("goto", Dialect::Lua54), vec![GOTO_KW]);
         assert_eq!(kinds("goto", Dialect::LuaJit), vec![GOTO_KW]);
         assert_eq!(kinds("goto", Dialect::Lua51), vec![IDENT]);
-        assert_eq!(kinds("goto", Dialect::Luau), vec![IDENT]);
     }
 
     #[test]
@@ -506,11 +422,6 @@ mod tests {
         assert_eq!(kinds("0x1p4", Dialect::Lua52), vec![NUMBER]);
         // `1..2` is a concat of numbers, not a malformed float
         assert_eq!(kinds("1..2", Dialect::Lua51), vec![NUMBER, DOT_DOT, NUMBER]);
-        // Luau: binary literal + digit separators
-        assert_eq!(kinds("0b1010", Dialect::Luau), vec![NUMBER]);
-        assert_eq!(kinds("1_000_000", Dialect::Luau), vec![NUMBER]);
-        // ...which are two tokens outside Luau
-        assert_eq!(kinds("1_000", Dialect::Lua54), vec![NUMBER, IDENT]);
         // LuaJIT suffixes
         assert_eq!(kinds("42ULL", Dialect::LuaJit), vec![NUMBER]);
         assert_eq!(kinds("12.5i", Dialect::LuaJit), vec![NUMBER]);
@@ -579,36 +490,6 @@ mod tests {
     }
 
     #[test]
-    fn luau_syntax() {
-        assert_eq!(
-            kinds("x += 1", Dialect::Luau),
-            vec![IDENT, WHITESPACE, PLUS_EQ, WHITESPACE, NUMBER]
-        );
-        assert_eq!(
-            kinds("s ..= 'a'", Dialect::Luau),
-            vec![IDENT, WHITESPACE, DOT_DOT_EQ, WHITESPACE, STRING]
-        );
-        assert_eq!(
-            kinds("(x: number) -> string?", Dialect::Luau),
-            vec![
-                L_PAREN, IDENT, COLON, WHITESPACE, IDENT, R_PAREN, WHITESPACE, THIN_ARROW,
-                WHITESPACE, IDENT, QUESTION
-            ]
-        );
-        assert_eq!(
-            kinds("`hi {name} and { {n=1} }`", Dialect::Luau),
-            vec![INTERP_STRING]
-        );
-        // compound assignment does not exist outside Luau
-        assert_eq!(
-            kinds("x += 1", Dialect::Lua54),
-            vec![IDENT, WHITESPACE, PLUS, EQ, WHITESPACE, NUMBER]
-        );
-        // backtick is an error byte outside Luau
-        assert_eq!(kinds("`x`", Dialect::Lua54), vec![ERROR, IDENT, ERROR]);
-    }
-
-    #[test]
     fn labels() {
         assert_eq!(
             kinds("::top::", Dialect::Lua54),
@@ -620,5 +501,7 @@ mod tests {
     fn error_bytes_keep_char_boundaries() {
         // multi-byte char must be one ERROR token, not split bytes
         assert_eq!(kinds("£", Dialect::Lua51), vec![ERROR]);
+        // backtick has no meaning in any supported dialect (Luau is out of scope)
+        assert_eq!(kinds("`x`", Dialect::Lua54), vec![ERROR, IDENT, ERROR]);
     }
 }

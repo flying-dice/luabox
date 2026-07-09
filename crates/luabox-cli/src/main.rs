@@ -31,7 +31,7 @@ enum Command {
         /// Scaffold a binary/script project
         #[arg(long)]
         bin: bool,
-        /// Dialect you write: 5.1, 5.2, 5.3, 5.4, luajit, luau
+        /// Dialect you write: 5.1, 5.2, 5.3, 5.4, luajit
         #[arg(long, default_value = "5.4")]
         edition: String,
     },
@@ -131,7 +131,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ToolchainAction {
-    /// Install a runtime (e.g. 5.4.6, luajit-2.1, luau-0.640)
+    /// Install a runtime (e.g. 5.4.6, luajit-2.1)
     Install { version: String },
     /// Pin the project runtime
     Pin { version: String },

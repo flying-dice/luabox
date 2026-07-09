@@ -1,6 +1,6 @@
 [package]
 name = "luabox-types"
-description = "luabox: unified type IR (LuaLS ⊕ Luau) and inference engine (Semantics context)"
+description = "luabox: unified type IR (LuaCATS ⊕ shapes) and inference engine (Semantics context)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

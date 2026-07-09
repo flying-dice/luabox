@@ -10,7 +10,7 @@ use luabox_syntax::Dialect;
 /// layout; the default is a binary/script project.
 pub fn init(dir: &Path, lib: bool, edition: &str) -> anyhow::Result<()> {
     let Some(dialect) = Dialect::from_manifest_id(edition) else {
-        bail!("unknown edition `{edition}` — expected one of: 5.1, 5.2, 5.3, 5.4, luajit, luau");
+        bail!("unknown edition `{edition}` — expected one of: 5.1, 5.2, 5.3, 5.4, luajit");
     };
     let manifest = dir.join("luabox.toml");
     if manifest.exists() {

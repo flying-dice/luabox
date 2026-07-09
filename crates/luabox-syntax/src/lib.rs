@@ -1,21 +1,26 @@
-//! Lossless syntax trees for every Lua dialect — the **Syntax** bounded
+//! Lossless syntax trees for the luabox toolchain — the **Syntax** bounded
 //! context (SPEC.md §16).
 //!
-//! One grammar with dialect feature-gating; rowan green/red trees preserving
-//! every byte (comments, whitespace) so the same tree feeds the formatter,
-//! linter, fixes, and refactors. Error-resilient: broken code still parses.
+//! Two independent grammars share the rowan infrastructure and nothing else:
 //!
-//! Currently implemented: the lossless lexer ([`lex`]) and the
-//! [`SyntaxKind`]/[`LuaLanguage`] vocabulary. The parser proper (green-tree
-//! construction over these tokens) is the next P0 milestone.
+//! - [`lua`] — every supported Lua dialect (5.1–5.4, LuaJIT), one grammar
+//!   with dialect feature-gating. Luau is out of scope toolchain-wide
+//!   (SPEC.md §1).
+//! - [`shape`] — the `.lb` shape DSL (SHAPES.md): analyser-only Rust-style
+//!   struct/trait declarations. Own syntax-kind space, zero coupling to the
+//!   Lua grammar (SHAPES.md §9).
+//!
+//! Both trees are lossless (comments/whitespace preserved; tree text is
+//! byte-identical to input) and will be error-resilient once the parsers
+//! land: broken code still yields a tree.
 //!
 //! Boundary contract: tree types + parse API; nothing above this crate knows
 //! token details.
 
-mod dialect;
-mod kind;
-mod lexer;
+#[macro_use]
+mod kind_macro;
 
-pub use dialect::Dialect;
-pub use kind::{LuaLanguage, SyntaxKind};
-pub use lexer::{Token, lex};
+pub mod lua;
+pub mod shape;
+
+pub use lua::{Dialect, LuaLanguage, SyntaxKind, Token, lex};
