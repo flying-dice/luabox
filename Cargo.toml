@@ -10,7 +10,9 @@ repository = "https://gitlab.beluga-sirius.ts.net/flying-dice/luabox"
 rust-version = "1.92"
 
 [workspace.dependencies]
-# Intra-workspace (bounded contexts — see SPEC.md §16)
+# Intra-workspace (bounded contexts — see SPEC.md §16; luabox-diag is a
+# cross-cutting support crate like rustc_errors, not a bounded context)
+luabox-diag = { path = "crates/luabox-diag", version = "0.1.0" }
 luabox-syntax = { path = "crates/luabox-syntax", version = "0.1.0" }
 luabox-hir = { path = "crates/luabox-hir", version = "0.1.0" }
 luabox-types = { path = "crates/luabox-types", version = "0.1.0" }
@@ -26,6 +28,10 @@ luabox-test = { path = "crates/luabox-test", version = "0.1.0" }
 rowan = "0.16"
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml_edit = { version = "0.22", features = ["serde"] }
+proptest = "1"
 # Acceptance layer (SPEC.md §16.2)
 cucumber = "0.21"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

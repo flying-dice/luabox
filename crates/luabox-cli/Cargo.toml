@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 luabox-syntax.workspace = true
+luabox-diag.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 
