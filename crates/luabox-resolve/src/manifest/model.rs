@@ -1,0 +1,157 @@
+//! Typed model for `luabox.toml` (SPEC.md §5, §6, §15).
+
+use std::collections::BTreeMap;
+
+use serde::Serialize;
+
+/// Dialects accepted for `[package] edition`, `[build] target`, and
+/// `[package] lua-versions` entries.
+///
+/// Distribution never parses syntax (SPEC.md §16): this is a local,
+/// string-only allow-list, not a dependency on `luabox-syntax::Dialect`.
+pub const ALLOWED_DIALECTS: &[&str] = &["5.1", "5.2", "5.3", "5.4", "luajit"];
+
+/// `[package]` (SPEC.md §5, §6, §15).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Package {
+    pub name: String,
+    pub version: String,
+    /// Dialect you write. One of [`ALLOWED_DIALECTS`].
+    pub edition: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    /// SPEC.md §6: dialects this package declares itself compatible with.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub lua_versions: Vec<String>,
+    /// SPEC.md §15: minimum toolchain version the resolver must respect.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_luabox_version: Option<String>,
+}
+
+/// `[build]` (SPEC.md §5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Build {
+    /// Dialect you ship. Defaults to `[package] edition` when absent.
+    pub target: String,
+    /// Output directory. Defaults to `"dist"`.
+    pub out: String,
+}
+
+/// `[types]` (SPEC.md §5, SHAPES.md §6).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Types {
+    pub strict: bool,
+    /// Ambient definition packages (`*.d.lua` / `---@meta` modules).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub defs: Vec<String>,
+    /// `.lb` shape search directories (SHAPES.md §6, tier 2 of `---@use` resolution).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub shape_paths: Vec<String>,
+    /// Shape modules this package exports for dependents (SHAPES.md §6, tier 3).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub shapes: Vec<String>,
+}
+
+/// One `[dependencies]` / `[dev-dependencies]` entry.
+///
+/// TOML shape: a bare version-requirement string, or an inline table with
+/// exactly one of `git`, `path`, or `workspace = true`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum Dependency {
+    /// `pkg = "1.2.3"`
+    Version(String),
+    /// `pkg = { git = "…", rev|tag|branch = "…" }`
+    Git(GitDependency),
+    /// `pkg = { path = "…" }`
+    Path(PathDependency),
+    /// `pkg = { workspace = true }`
+    Workspace(WorkspaceDependency),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct GitDependency {
+    pub git: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PathDependency {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct WorkspaceDependency {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+/// One `[tasks]` entry: a single shell command, or a sequence run in order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum TaskValue {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+/// `[workspace]` (SPEC.md §5).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Workspace {
+    /// Member globs. Only a whole-segment `*` wildcard is supported
+    /// (`packages/*`), matching cargo's common case.
+    pub members: Vec<String>,
+}
+
+/// The typed, validated contents of a `luabox.toml`.
+///
+/// Construct via [`crate::manifest::Manifest::parse`]. Carries the parsed
+/// [`toml_edit::DocumentMut`] alongside the typed view so edits (e.g.
+/// [`crate::manifest::Manifest::set_dependency`]) preserve comments and
+/// formatting for everything they don't touch.
+#[derive(Debug, Clone)]
+pub struct Manifest {
+    pub package: Package,
+    pub build: Build,
+    pub types: Types,
+    pub dependencies: BTreeMap<String, Dependency>,
+    pub dev_dependencies: BTreeMap<String, Dependency>,
+    pub tasks: BTreeMap<String, TaskValue>,
+    pub workspace: Option<Workspace>,
+    pub(super) document: toml_edit::DocumentMut,
+}
+
+impl Manifest {
+    /// The lossless, comment-preserving document this manifest was parsed
+    /// from (or last serialized to). Mutating it directly is valid; prefer
+    /// typed helpers like [`Manifest::set_dependency`] where available.
+    #[must_use]
+    pub fn document(&self) -> &toml_edit::DocumentMut {
+        &self.document
+    }
+}
+
+impl std::fmt::Display for Manifest {
+    /// Renders the manifest as TOML text, preserving comments/formatting of
+    /// everything untouched since parse.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.document)
+    }
+}
