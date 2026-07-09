@@ -47,8 +47,22 @@ syntax_kinds! {
         PARAM_LIST,
         PARAM,
         GENERIC_PARAMS,
+        /// One `T: Bound + Bound2` (or bare `T`) inside [`Self::GENERIC_PARAMS`].
+        GENERIC_PARAM,
         GENERIC_ARGS,
+        /// A named/generic type reference: `IDENT generic_args?`
+        /// (`number`, `Vec<T>`, `HashMap<K, V>`).
         TYPE_REF,
+        /// A nil-union postfix type: `<inner> "?"`.
+        OPTIONAL_TYPE,
+        /// A union type: `<inner> ("|" <inner>)+`.
+        UNION_TYPE,
+        /// A function type: `"fn" "(" params? ")" ("->" ret)?`.
+        FN_TYPE,
+        /// A parenthesised type: `"(" type ")"`.
+        PAREN_TYPE,
+        /// A return clause: `"->" type ("," type)*` (multi-return).
+        RET_TYPE,
         ERROR_NODE,
     }
 }
@@ -80,3 +94,10 @@ impl rowan::Language for ShapeLanguage {
         rowan::SyntaxKind(kind as u16)
     }
 }
+
+/// A parsed `.lb` syntax node in the [`ShapeLanguage`] tree.
+pub type ShapeSyntaxNode = rowan::SyntaxNode<ShapeLanguage>;
+/// A leaf token in the [`ShapeLanguage`] tree.
+pub type ShapeSyntaxToken = rowan::SyntaxToken<ShapeLanguage>;
+/// A node-or-token element in the [`ShapeLanguage`] tree.
+pub type ShapeSyntaxElement = rowan::SyntaxElement<ShapeLanguage>;

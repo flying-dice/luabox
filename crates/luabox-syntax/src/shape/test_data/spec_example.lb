@@ -1,0 +1,16 @@
+/// 2D geometry primitives.
+struct Point { x: number, y: number, label: string? }
+
+trait Shape {
+    fn area(self) -> number;
+    fn perimeter(self) -> number;
+}
+
+trait Drawable: Shape {
+    fn draw(self, surface: Surface);
+}
+
+struct Circle { radius: number }
+impl Shape for Circle;
+
+struct Pair<T> { first: T, second: T }
