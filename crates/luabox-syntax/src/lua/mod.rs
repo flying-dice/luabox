@@ -8,10 +8,12 @@
 
 pub mod ast;
 mod dialect;
+pub mod fmt;
 mod grammar;
 mod kind;
 mod lexer;
 mod parser;
+pub mod validate;
 
 pub use dialect::Dialect;
 pub use kind::{LuaLanguage, SyntaxKind};
