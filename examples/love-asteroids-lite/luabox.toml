@@ -1,0 +1,19 @@
+[package]
+name = "asteroids-lite"
+version = "0.1.0"
+edition = "5.1"       # LÖVE runs LuaJIT (5.1-compatible)
+
+[build]
+mode = "love"         # `luabox bundle` packages a .love archive
+out = "dist"
+
+[types]
+strict = true
+defs = ["love2d"]     # ambient LÖVE API types from defs/love2d.d.lua
+
+[lint]
+# `love` is LÖVE's ambient global; the defs file declares it, so allow the
+# single global write there instead of fighting the framework's convention.
+globals = ["love"]
+
+[dependencies]

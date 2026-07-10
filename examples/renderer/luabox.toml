@@ -1,0 +1,20 @@
+[package]
+name = "renderer"
+version = "0.1.0"
+edition = "5.1"
+
+[build]
+target = "5.1"
+out = "dist"
+
+[types]
+strict = true
+shape-paths = ["shapes"]
+
+[dependencies]
+# A path dependency on the sibling library. Run `luabox install` once to
+# resolve it into luabox.lock (committed — this is an application).
+geometry = { path = "../geometry" }
+
+[tasks]
+start = "luabox run src/main.lua"

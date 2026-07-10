@@ -1,0 +1,9 @@
+[package]
+name = "workspace-root"
+version = "0.1.0"
+edition = "5.1"
+
+# A workspace groups multiple packages under one tree with a shared lockfile.
+# `luabox check` from here walks every member's sources.
+[workspace]
+members = ["packages/*"]

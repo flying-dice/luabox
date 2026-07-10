@@ -1,0 +1,21 @@
+[package]
+name = "legacy-inifile"
+version = "0.1.0"
+edition = "5.1"
+
+[build]
+target = "5.1"
+out = "dist"
+
+[types]
+# Warn mode: LuaCATS type mismatches surface as warnings, not errors. This is
+# the friendly on-ramp for an existing annotated codebase — turn the dial to
+# `strict = true` once the warnings are clean.
+strict = false
+
+[lint]
+# Legacy libraries often publish themselves as a global for backwards compat.
+# Allow that single, deliberate global write instead of fighting it.
+globals = ["inifile"]
+
+[dependencies]

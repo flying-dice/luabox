@@ -1,0 +1,17 @@
+[package]
+name = "hello-luabox"
+version = "0.1.0"
+edition = "5.4"
+
+[build]
+target = "5.4"
+out = "dist"
+
+[types]
+strict = true
+
+[tasks]
+start = "luabox run src/main.lua"
+ci = ["luabox check", "luabox lint", "luabox test"]
+
+[dependencies]

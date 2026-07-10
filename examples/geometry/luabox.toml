@@ -1,0 +1,17 @@
+[package]
+name = "geometry"
+version = "0.1.0"
+edition = "5.4"
+
+[build]
+target = "5.4"
+out = "dist"
+
+[types]
+strict = true
+shape-paths = ["shapes"]
+# Export the `geometry` shape module to downstream packages. A consumer that
+# path/registry-depends on us can `---@use geometry` (see ../renderer).
+shapes = ["geometry"]
+
+[dependencies]

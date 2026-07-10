@@ -1,0 +1,46 @@
+/// 2D geometry primitives and the shapes they satisfy.
+///
+/// This is a `.lb` shape module: Rust struct/trait syntax in a separate file,
+/// analyser-only, never on the require path and never in build output. Plain
+/// Lua binds to these declarations with `---@use` / `---@struct` / `---@impl`.
+/// A point in 2D space. `label` is optional (the `?` suffix).
+struct Point {
+    x: number,
+    y: number,
+    label: string?,
+}
+
+/// A circle defined by its radius.
+struct Circle {
+    radius: number,
+}
+
+/// An axis-aligned rectangle.
+struct Rect {
+    width: number,
+    height: number,
+}
+
+/// A homogeneous pair — a tiny generic container, monomorphised per use site.
+struct Pair<T> {
+    first: T,
+    second: T,
+}
+
+/// Anything with an area and a perimeter.
+trait Shape {
+    fn area(self) -> number;
+    fn perimeter(self) -> number;
+}
+
+/// A Shape that can also render itself as text. `Drawable: Shape` makes Shape
+/// a supertrait: any carrier that impls Drawable must also conform to Shape.
+trait Drawable: Shape {
+    fn draw(self) -> string;
+}
+
+// Conformance assertions: Circle and Rect are Shapes. The method bodies live
+// in the .lua carriers (src/circle.lua, src/rect.lua), bound with ---@impl.
+impl Shape for Circle;
+
+impl Shape for Rect;

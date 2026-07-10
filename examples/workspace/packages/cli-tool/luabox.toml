@@ -1,0 +1,14 @@
+[package]
+name = "cli-tool"
+version = "0.1.0"
+edition = "5.1"
+
+[types]
+strict = true
+
+[dependencies]
+# Path dependency on the sibling workspace member.
+core = { path = "../core" }
+
+[tasks]
+start = "luabox run src/main.lua"

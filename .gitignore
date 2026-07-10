@@ -1,3 +1,8 @@
 /target
 tools/gen-corpus/target/
 tools/differ/target/
+
+# Example build artifacts and installed deps (the renderer's luabox.lock is
+# committed deliberately — it is an application).
+examples/**/dist/
+examples/**/lua_modules/

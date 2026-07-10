@@ -1,0 +1,9 @@
+[package]
+name = "core"
+version = "0.1.0"
+edition = "5.1"
+
+[types]
+strict = true
+
+[dependencies]

@@ -43,3 +43,21 @@ jobs:
         with:
           key: perf-gates
       - run: bash scripts/perf-gate.sh
+
+  # Every example project under examples/ must pass check + fmt --check + lint
+  # cleanly against the real binary, plus its per-example extras (install,
+  # build, bundle, .love packaging, tests). See scripts/examples.sh.
+  examples:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: examples
+      - run: cargo build --release --bin luabox
+      - name: Install Lua 5.1 and unzip
+        run: sudo apt-get update && sudo apt-get install -y lua5.1 unzip
+      - run: bash scripts/examples.sh
