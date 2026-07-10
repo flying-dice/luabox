@@ -11,6 +11,16 @@ The toolchain is feature-complete; these are the release-machinery gaps
 between "code-complete on a branch" and "a stranger can install and trust
 it." **Blockers** must land before the first public release.
 
+**Drop-of-`.luab` prerequisites** (the LuaCATS path must reach parity before
+`.luab` is removed — all verified missing today by the example conversion):
+
+- [#107](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/107)
+  Enforce `---@class` conformance (`: Interface`, `__index`-aware)
+- [#108](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/108)
+  Cross-package LuaCATS type sharing
+- [#84](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/84)
+  Real generic type variables + generic classes in LuaCATS
+
 Blockers:
 
 - [#92](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/92)
@@ -54,8 +64,6 @@ _None open — the SHAPES-V2 checker-quality and LSP waves are landed
 
 - [#83](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/83)
   `[types] rename` for colliding dependency namespaces
-- [#84](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/84)
-  Real generic type variables in LuaCATS
 - [#85](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/85)
   Cross-file `require` resolution
 - [#86](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/86)
