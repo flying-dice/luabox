@@ -10,8 +10,9 @@ out = "dist"
 [types]
 strict = true
 shape-paths = ["shapes"]
-# Export the `geometry` shape module to downstream packages. A consumer that
-# path/registry-depends on us can `---@use geometry` (see ../renderer).
-shapes = ["geometry"]
+# The type entrypoint (TS-style): the `export type` declarations in this file
+# form the package's published surface. A dependent addresses them under the
+# package name — `geometry.Shape`, `geometry.Point` (see ../renderer).
+entry = "shapes/geometry.luab"
 
 [dependencies]

@@ -93,17 +93,14 @@ ul.item-list .summary { margin-left: .8em; color: var(--muted); font-size: .9rem
 <ul>
 <li><a href="shape.geometry.html">geometry</a></li>
 </ul>
-<h3>Structs</h3>
+<h3>Types</h3>
 <ul>
-<li><a href="struct.Point.html">Point</a></li>
-<li><a href="struct.Circle.html">Circle</a></li>
-<li><a href="struct.Rect.html">Rect</a></li>
-<li><a href="struct.Pair.html">Pair</a></li>
-</ul>
-<h3>Traits</h3>
-<ul>
-<li><a href="trait.Shape.html">Shape</a></li>
-<li><a href="trait.Drawable.html">Drawable</a></li>
+<li><a href="type.geometry.Point.html">geometry.Point</a></li>
+<li><a href="type.geometry.Circle.html">geometry.Circle</a></li>
+<li><a href="type.geometry.Rect.html">geometry.Rect</a></li>
+<li><a href="type.geometry.Pair.html">geometry.Pair</a></li>
+<li><a href="type.geometry.Shape.html">geometry.Shape</a></li>
+<li><a href="type.geometry.Drawable.html">geometry.Drawable</a></li>
 </ul>
 </nav>
 <main>
@@ -124,12 +121,12 @@ ul.item-list .summary { margin-left: .8em; color: var(--muted); font-size: .9rem
 </ul>
 <h2>Types</h2>
 <ul class="item-list">
-<li><a href="struct.Point.html">Point</a><span class="summary">2D geometry primitives and the shapes they satisfy.</span></li>
-<li><a href="struct.Circle.html">Circle</a><span class="summary">A circle defined by its radius.</span></li>
-<li><a href="struct.Rect.html">Rect</a><span class="summary">An axis-aligned rectangle.</span></li>
-<li><a href="struct.Pair.html">Pair</a><span class="summary">A homogeneous pair — a tiny generic container, monomorphised per use site.</span></li>
-<li><a href="trait.Shape.html">Shape</a><span class="summary">Anything with an area and a perimeter.</span></li>
-<li><a href="trait.Drawable.html">Drawable</a><span class="summary">A Shape that can also render itself as text. `Drawable: Shape` makes Shape</span></li>
+<li><a href="type.geometry.Point.html">geometry.Point</a><span class="summary">2D geometry primitives and the shapes they satisfy.</span></li>
+<li><a href="type.geometry.Circle.html">geometry.Circle</a><span class="summary">A circle defined by its radius.</span></li>
+<li><a href="type.geometry.Rect.html">geometry.Rect</a><span class="summary">An axis-aligned rectangle.</span></li>
+<li><a href="type.geometry.Pair.html">geometry.Pair</a><span class="summary">A homogeneous pair — a tiny generic container, monomorphised per use site.</span></li>
+<li><a href="type.geometry.Shape.html">geometry.Shape</a><span class="summary">Anything with an area and a perimeter. Conformance is structural and</span></li>
+<li><a href="type.geometry.Drawable.html">geometry.Drawable</a><span class="summary">A Shape that can also render itself as text. The intersection makes the</span></li>
 </ul>
 <h2>Functions</h2>
 <ul class="item-list">
@@ -141,7 +138,7 @@ ul.item-list .summary { margin-left: .8em; color: var(--muted); font-size: .9rem
 <li><a href="module.rect.html#fn.Rect.new">Rect.new</a></li>
 </ul>
 </div>
-<script type="application/json" id="search-index">[{"name":"circle","kind":"module","href":"module.circle.html","summary":""},{"name":"Circle:area","kind":"function","href":"module.circle.html#fn.Circle-area","summary":"function Circle:area()"},{"name":"Circle:perimeter","kind":"function","href":"module.circle.html#fn.Circle-perimeter","summary":"function Circle:perimeter()"},{"name":"Circle.new","kind":"function","href":"module.circle.html#fn.Circle.new","summary":"function Circle.new(radius: number): Circle"},{"name":"rect","kind":"module","href":"module.rect.html","summary":""},{"name":"Rect:area","kind":"function","href":"module.rect.html#fn.Rect-area","summary":"function Rect:area()"},{"name":"Rect:perimeter","kind":"function","href":"module.rect.html#fn.Rect-perimeter","summary":"function Rect:perimeter()"},{"name":"Rect.new","kind":"function","href":"module.rect.html#fn.Rect.new","summary":"function Rect.new(width: number, height: number): Rect"},{"name":"shapes_data","kind":"module","href":"module.shapes_data.html","summary":""},{"name":"tests.geometry_test","kind":"module","href":"module.tests.geometry_test.html","summary":""},{"name":"geometry","kind":"shape module","href":"shape.geometry.html","summary":""},{"name":"Point","kind":"struct","href":"struct.Point.html","summary":"2D geometry primitives and the shapes they satisfy."},{"name":"Circle","kind":"struct","href":"struct.Circle.html","summary":"A circle defined by its radius."},{"name":"Rect","kind":"struct","href":"struct.Rect.html","summary":"An axis-aligned rectangle."},{"name":"Pair","kind":"struct","href":"struct.Pair.html","summary":"A homogeneous pair — a tiny generic container, monomorphised per use site."},{"name":"Shape","kind":"trait","href":"trait.Shape.html","summary":"Anything with an area and a perimeter."},{"name":"Drawable","kind":"trait","href":"trait.Drawable.html","summary":"A Shape that can also render itself as text. `Drawable: Shape` makes Shape"}]</script>
+<script type="application/json" id="search-index">[{"name":"circle","kind":"module","href":"module.circle.html","summary":""},{"name":"Circle:area","kind":"function","href":"module.circle.html#fn.Circle-area","summary":"function Circle:area(): number"},{"name":"Circle:perimeter","kind":"function","href":"module.circle.html#fn.Circle-perimeter","summary":"function Circle:perimeter(): number"},{"name":"Circle.new","kind":"function","href":"module.circle.html#fn.Circle.new","summary":"function Circle.new(radius: number): geometry.Circle"},{"name":"rect","kind":"module","href":"module.rect.html","summary":""},{"name":"Rect:area","kind":"function","href":"module.rect.html#fn.Rect-area","summary":"function Rect:area(): number"},{"name":"Rect:perimeter","kind":"function","href":"module.rect.html#fn.Rect-perimeter","summary":"function Rect:perimeter(): number"},{"name":"Rect.new","kind":"function","href":"module.rect.html#fn.Rect.new","summary":"function Rect.new(width: number, height: number): geometry.Rect"},{"name":"shapes_data","kind":"module","href":"module.shapes_data.html","summary":""},{"name":"tests.geometry_test","kind":"module","href":"module.tests.geometry_test.html","summary":""},{"name":"geometry","kind":"shape module","href":"shape.geometry.html","summary":""},{"name":"geometry.Point","kind":"type","href":"type.geometry.Point.html","summary":"2D geometry primitives and the shapes they satisfy."},{"name":"geometry.Circle","kind":"type","href":"type.geometry.Circle.html","summary":"A circle defined by its radius."},{"name":"geometry.Rect","kind":"type","href":"type.geometry.Rect.html","summary":"An axis-aligned rectangle."},{"name":"geometry.Pair","kind":"type","href":"type.geometry.Pair.html","summary":"A homogeneous pair — a tiny generic container, monomorphised per use site."},{"name":"geometry.Shape","kind":"type","href":"type.geometry.Shape.html","summary":"Anything with an area and a perimeter. Conformance is structural and"},{"name":"geometry.Drawable","kind":"type","href":"type.geometry.Drawable.html","summary":"A Shape that can also render itself as text. The intersection makes the"}]</script>
 <script>
 (function () {
   'use strict';

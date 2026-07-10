@@ -1,43 +1,47 @@
 # geometry
 
-The `.luab` shape DSL flagship. A library (`edition = "5.4"`) whose types live
-in a **shape module** — Rust struct/trait syntax in a separate `.luab` file —
-while the implementations live in ordinary Lua, bound with `---@` tags.
+The `.luab` shape-module flagship. A library (`edition = "5.4"`) whose types
+live in a **shape module** — TypeScript-adjacent `type` declarations in a
+separate `.luab` file — while the implementations live in ordinary Lua,
+consumed through the **standard annotation positions** (`---@type` /
+`---@param` / `---@return`). No imports, no binding tags (SHAPES-V2.md).
 
 ```
 geometry/
-├── luabox.toml
-├── shapes/geometry.luab        # structs, traits, a supertrait, a generic
-├── src/circle.lua            # ---@impl Shape for Circle
-├── src/rect.lua              # ---@impl Shape for Rect
-├── src/shapes_data.lua       # ---@struct bindings + sealed-checking demo
+├── luabox.toml               # [types] entry — the published type surface
+├── shapes/geometry.luab      # type declarations, an intersection, a generic
+├── src/circle.lua            # Shape carrier + positional assertion
+├── src/rect.lua              # Shape carrier + positional assertion
+├── src/shapes_data.lua       # ---@type bindings + sealed-checking demo
 └── tests/geometry_test.lua
 ```
 
 ## The shape workflow
 
-1. **Declare types in `.luab`.** `shapes/geometry.luab` declares structs
-   (`Point`, `Circle`, `Rect`), a generic `Pair<T>`, a trait `Shape`, and a
-   supertrait `Drawable: Shape`. It has no bodies — the parser rejects them
-   ("implementations live in .lua"). It is analyser-only: never required at
-   runtime, never emitted by `build`/`bundle`.
+1. **Declare types in `.luab`.** `shapes/geometry.luab` declares object types
+   (`Point`, `Circle`, `Rect`), a generic `Pair<T>`, a method-set type
+   `Shape`, and an intersection `Drawable = Shape & { draw(self): string }`.
+   It has no bodies — the parser rejects them ("implementations live in
+   .lua"). It is analyser-only: never required at runtime, never emitted by
+   `build`/`bundle`.
 
-2. **Point the manifest at it.** `[types] shape-paths = ["shapes"]` tells the
-   resolver where to find `.luab` modules for `---@use`.
+2. **Point the manifest at it.** `[types] shape-paths = ["shapes"]` makes
+   every module under `shapes/` **ambient**: its types are addressable from
+   any file by fully-qualified name, derived from the module's path —
+   `shapes/geometry.luab` declares `geometry.Point`, `geometry.Shape`, …
 
-3. **Bind Lua to shapes with tags:**
-   - `---@use geometry` — import the shape module (file top).
-   - `---@struct Point` — bind a table literal to a struct. The literal is
-     **sealed-checked** against the fields. On a class *carrier*
-     (`---@struct Circle` on `local Circle = {}`), constructor
-     `setmetatable(literal, Circle)` calls are sealed-checked too, and
-     their result types as a `Circle` instance.
-   - `---@impl Shape for Circle` — assert conformance. Every trait fn must be
-     present with a compatible signature; `:` vs `.` receivers must match
-     `self`; extra inherent methods are fine.
+3. **Consume through standard annotations.** There is nothing new to learn:
+   - `---@type geometry.Point` on a table literal **sealed-checks** it:
+     every non-optional field present, no undeclared keys.
+   - `---@return geometry.Circle` on a constructor checks the
+     `setmetatable(literal, Circle)` result at the return position.
+   - `---@type geometry.Shape` on a carrier binding is a **conformance
+     assertion by construction** — conformance is structural and positional,
+     so the general mechanism covers the special case. No `impl`, no
+     `---@impl`.
 
 4. **Check it.** `luabox check` runs both front-ends — LuaCATS annotations and
-   `.luab` shapes — through one type IR.
+   `.luab` types — through one type IR.
 
 ```sh
 luabox check        # 0 errors across .lua + .luab
@@ -48,56 +52,51 @@ luabox test         # exercises the Circle/Rect/Point API on your Lua runtime
 
 ## Sealed checking (what *would* error)
 
-Shapes are sealed: a missing non-optional field or an unknown key is a hard
-error at **every** strictness level (the `---@struct` tag is itself the
-opt-in). `src/shapes_data.lua` keeps these as commented illustrations so the
-project stays green. Bind `local p = { x = 0 }` to `Point` and `luabox check`
-reports:
+Object types are sealed. `src/shapes_data.lua` keeps these as commented
+illustrations so the project stays green. Bind `local p = { x = 0 }` to
+`geometry.Point` and `luabox check` reports:
 
 ```
-error[LB2001]: missing non-optional field `y` on a value bound to struct `Point`
-  --> src/main.lua:4:11
-  |
-4 | local p = { x = 0 }
-  |           ^^^^^^^^^ `Point` requires `y: number`
+error[LB0302]: missing required field `y` in table literal
 ```
 
 Add an undeclared key and you get the dual diagnostic:
 
 ```
-error[LB2002]: unknown key `z` on sealed struct `Point`
-  --> src/main.lua:4:27
-  |
-4 | local p = { x = 0, y = 0, z = 0 }
-  |                           ^^^^^ `Point` declares no field `z`
+error[LB0303]: unknown field `z`
 ```
 
-Delete `Circle:perimeter` and the trait coherence check fires instead:
-`error[LB2003]: incomplete ---@impl Shape for Circle: missing perimeter`.
+Delete `Circle:perimeter` and the positional conformance assertion in
+`src/circle.lua` fires, naming the member:
 
-## Exporting shapes to dependents
+```
+error[LB0300]: type mismatch: expected `geometry.Shape`, found
+`{ area: fun(): number, ... }`: missing `perimeter`
+```
 
-`[types] shapes = ["geometry"]` marks the `geometry` module as **exported**.
-A downstream package that depends on this one can then `---@use geometry` and
-get the same sealed checking across the package boundary. See `../renderer`,
-which consumes these shapes and implements `Drawable` for its own type.
+## Exporting types to dependents
+
+`[types] entry = "shapes/geometry.luab"` names the **type entrypoint**
+(TS-style, like package.json `"types"`): its `export type` declarations form
+this package's published surface, mounted under the package name. A
+downstream package that depends on this one addresses them as
+`geometry.Shape`, `geometry.Point` — same names, no import. See
+`../renderer`, which declares its own type and asserts it is a
+`geometry.Drawable`.
 
 ## Constructors under strict types
 
-`Circle.new(radius)` is written the way a Rust developer would write it:
+`Circle.new(radius)` is plain Lua with standard annotations:
 
 ```lua
 ---@param radius number
----@return Circle
+---@return geometry.Circle
 function Circle.new(radius)
     return setmetatable({ radius = radius }, Circle)
 end
 ```
 
-Because the carrier is bound with `---@struct Circle`, the checker knows
-three things at once: the `---@param` type flows into the body (so
-`radius` is a `number` inside the literal), the `setmetatable` literal is
-sealed-checked against the struct's fields, and the *result* of
-`setmetatable(literal, Circle)` is a `Circle` instance — so it unifies
-with the declared `---@return Circle`. Inside `:` methods, `self` gets the
-struct's instance type: `self.radius` is the declared `number`.
+The `---@param` type flows into the body (so `radius` is a `number` inside
+the literal), and the `setmetatable(literal, Circle)` result is checked
+against the declared `---@return geometry.Circle` — the return position is
+where the instance literal meets the type.

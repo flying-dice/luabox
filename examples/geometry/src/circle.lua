@@ -1,29 +1,32 @@
----@use geometry
-
 -- Circle is a class carrier: a table with an __index metatable whose methods
--- are the impl of the `Shape` trait. `---@struct Circle` binds the carrier to
--- the struct (so `setmetatable(literal, Circle)` is sealed-checked and its
--- result types as a Circle instance), and `---@impl Shape for Circle` binds
--- it to the trait; `luabox check` then enforces that every trait fn is
--- present with a compatible signature (try deleting `perimeter` to see
--- error[LB2003]).
----@struct Circle
----@impl Shape for Circle
+-- make it a `geometry.Shape` *structurally* — there is no binding tag and no
+-- conformance declaration. The constructor's `---@return geometry.Circle` is
+-- where the instance literal is checked against the type (try removing
+-- `radius` from the literal to see the error), and the test suite asserts
+-- Shape conformance positionally with a plain `---@type geometry.Shape`.
 local Circle = {}
 Circle.__index = Circle
 
+---@return number
 function Circle:area()
     return math.pi * self.radius ^ 2
 end
 
+---@return number
 function Circle:perimeter()
     return 2 * math.pi * self.radius
 end
 
 ---@param radius number
----@return Circle
+---@return geometry.Circle
 function Circle.new(radius)
     return setmetatable({ radius = radius }, Circle)
 end
+
+-- Positional conformance assertion (SHAPES-V2.md): a `---@type` binding is
+-- an assertion by construction. Delete `Circle:perimeter` above and this is
+-- the line where `luabox check` reports it — naming the missing member.
+---@type geometry.Shape
+local _ = Circle
 
 return Circle

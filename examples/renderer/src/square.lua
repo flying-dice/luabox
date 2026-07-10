@@ -1,27 +1,20 @@
--- Square: our Drawable carrier. Implements the `Drawable` trait imported from
--- the geometry dependency's exported shape module.
-
----@use geometry
----@use render
-
--- Square implements Drawable. The trait's supertrait is Shape, so we must also
--- provide area + perimeter — `luabox check` enforces the whole obligation.
--- `---@struct Square` binds the carrier to the struct: `self.side` types as
--- the declared `integer`, and the constructor's `setmetatable` literal is
--- sealed-checked against the struct's fields.
----@struct Square
----@impl Drawable for Square
+-- Square: our Drawable carrier. The Drawable type comes from the geometry
+-- dependency's exported surface (`geometry.Drawable`) — no import needed,
+-- the scope is ambient (SHAPES-V2.md).
 local Square = {}
 Square.__index = Square
 
+---@return number
 function Square:area()
     return self.side * self.side
 end
 
+---@return number
 function Square:perimeter()
     return 4 * self.side
 end
 
+---@return string
 function Square:draw()
     local rows = {}
     for _row = 1, self.side do
@@ -31,9 +24,15 @@ function Square:draw()
 end
 
 ---@param side integer
----@return Square
+---@return render.Square
 function Square.new(side)
     return setmetatable({ side = side }, Square)
 end
+
+-- Positional conformance: Drawable is `geometry.Shape & { draw }`, so this
+-- single assertion carries the whole obligation — area, perimeter, and
+-- draw. Delete any of them and `luabox check` names it here.
+---@type geometry.Drawable
+local _ = Square
 
 return Square

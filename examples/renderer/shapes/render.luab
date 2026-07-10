@@ -1,20 +1,13 @@
-/// Renderer-local shapes.
+/// Renderer-local types.
 ///
-/// `use geometry;` pulls in the shape module exported by the geometry
-/// dependency (its manifest lists `[types] shapes = ["geometry"]`), so the
-/// `Shape` and `Drawable` traits are in scope here across the package
-/// boundary. We declare our own struct and assert it is Drawable.
-use geometry;
-
+/// No imports: the geometry dependency's exported surface is ambient here,
+/// mounted under its package name — `geometry.Shape`, `geometry.Drawable`
+/// (its manifest names a `[types] entry`). We declare our own type; whether
+/// a Square *is* a Drawable is checked positionally, wherever one is
+/// demanded (SHAPES-V2.md).
 /// A filled square rendered as ASCII art. The side is a cell count, so it
 /// is an `integer` — and `string.rep("#", self.side)` typechecks against
 /// the stdlib's `integer` count parameter.
-struct Square {
+type Square = {
     side: integer,
 }
-
-// Square is Drawable. Because `Drawable: Shape`, this also requires Square to
-// conform to Shape (area + perimeter) on the same carrier.
-impl Shape for Square;
-
-impl Drawable for Square;

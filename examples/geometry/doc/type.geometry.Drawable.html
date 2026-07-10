@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Trait Shape</title>
+<title>Type geometry.Drawable</title>
 <style>
 :root {
   color-scheme: light dark;
@@ -93,34 +93,24 @@ ul.item-list .summary { margin-left: .8em; color: var(--muted); font-size: .9rem
 <ul>
 <li><a href="shape.geometry.html">geometry</a></li>
 </ul>
-<h3>Structs</h3>
+<h3>Types</h3>
 <ul>
-<li><a href="struct.Point.html">Point</a></li>
-<li><a href="struct.Circle.html">Circle</a></li>
-<li><a href="struct.Rect.html">Rect</a></li>
-<li><a href="struct.Pair.html">Pair</a></li>
-</ul>
-<h3>Traits</h3>
-<ul>
-<li><a href="trait.Shape.html">Shape</a></li>
-<li><a href="trait.Drawable.html">Drawable</a></li>
+<li><a href="type.geometry.Point.html">geometry.Point</a></li>
+<li><a href="type.geometry.Circle.html">geometry.Circle</a></li>
+<li><a href="type.geometry.Rect.html">geometry.Rect</a></li>
+<li><a href="type.geometry.Pair.html">geometry.Pair</a></li>
+<li><a href="type.geometry.Shape.html">geometry.Shape</a></li>
+<li><a href="type.geometry.Drawable.html">geometry.Drawable</a></li>
 </ul>
 </nav>
 <main>
-<h1>Trait <code>Shape</code></h1>
-<p>Anything with an area and a perimeter.</p>
-<h2>Required functions</h2>
-<div class="item" id="fn.area">
-<pre class="sig">fn area(self) -&gt; number</pre>
+<h1>Type <code>geometry.Drawable</code><span class="badge">export</span></h1>
+<p>= <a href="type.geometry.Shape.html">Shape</a> &amp; { … }</p>
+<p>A Shape that can also render itself as text. The intersection makes the obligation explicit: a Drawable carries every Shape member plus <code>draw</code>.</p>
+<h2>Methods</h2>
+<div class="item" id="fn.draw">
+<pre class="sig">draw(self): string</pre>
 </div>
-<div class="item" id="fn.perimeter">
-<pre class="sig">fn perimeter(self) -&gt; number</pre>
-</div>
-<h2>Implementors</h2>
-<ul class="item-list">
-<li><a href="struct.Circle.html">Circle</a></li>
-<li><a href="struct.Rect.html">Rect</a></li>
-</ul>
 </main>
 </body>
 </html>

@@ -1,7 +1,7 @@
 # renderer
 
 Consumes the `../geometry` library across a **package boundary** and
-implements geometry's `Drawable` trait for its own type. An application
+conforms to geometry's `Drawable` type with its own carrier. An application
 (`edition = "5.1"`, so it runs end-to-end on a stock Lua 5.1) that draws
 ASCII shapes to stdout.
 
@@ -9,8 +9,8 @@ ASCII shapes to stdout.
 renderer/
 ├── luabox.toml           # [dependencies] geometry = { path = "../geometry" }
 ├── luabox.lock           # committed — this is an app, not a library
-├── shapes/render.luab      # `use geometry;` + our own `struct Square`
-├── src/square.lua        # ---@impl Drawable for Square
+├── shapes/render.luab    # our own `type Square`
+├── src/square.lua        # carrier + `---@type geometry.Drawable` assertion
 └── src/main.lua          # draws a square with `luabox run start`
 ```
 
@@ -27,23 +27,27 @@ like `../geometry` don't commit a lockfile.)
 
 ## Crossing the package boundary
 
-geometry's manifest exports its shape module with `[types] shapes =
-["geometry"]`. That makes tier-3 resolution work: our `shapes/render.luab` says
-`use geometry;` and gets geometry's `Shape` and `Drawable` traits in scope,
-even though they were declared in a different package. We then declare our own
-`struct Square` and assert `impl Drawable for Square;`.
+geometry's manifest names a type entrypoint (`[types] entry =
+"shapes/geometry.luab"`). Its `export type` declarations mount here under the
+package name — `geometry.Shape`, `geometry.Drawable` — with **no import**:
+the scope is ambient (SHAPES-V2.md). We declare our own `type Square` in
+`shapes/render.luab` and assert conformance positionally in `src/square.lua`:
 
-In `src/square.lua`, `---@struct Square` + `---@impl Drawable for Square`
-bind the carrier. Because `Drawable: Shape` (Shape is a supertrait),
-`luabox check` requires Square to implement **area + perimeter + draw** —
-the full obligation across both traits. Drop any one and check reports the
-gap. The struct declares `side: integer`, so inside the methods `self.side`
-types as `integer` — which is exactly what `string.rep("#", self.side)` in
-`draw` requires — and the constructor's declared `---@return Square` is
-satisfied by its `setmetatable({ side = side }, Square)` result.
+```lua
+---@type geometry.Drawable
+local _ = Square
+```
+
+Because `Drawable = Shape & { draw(self): string }` is an intersection,
+that single assertion carries the whole obligation — **area + perimeter +
+draw**. Drop any one and `luabox check` reports the gap, naming the member.
+The type declares `side: integer`, so `string.rep("#", self.side)` in `draw`
+typechecks against the stdlib's `integer` count parameter, and the
+constructor's declared `---@return render.Square` is satisfied by its
+`setmetatable({ side = side }, Square)` result.
 
 ```sh
-luabox check        # 0 errors — cross-package shapes resolve and seal
+luabox check        # 0 errors — cross-package types resolve and seal
 luabox fmt --check
 luabox lint
 luabox test
@@ -63,6 +67,7 @@ area = 16, perimeter = 16
 
 ## Contrast with geometry
 
-- `../geometry` **declares and exports** the shapes.
-- `renderer` **imports** them (`use geometry;`) and adds a new conformer
-  (`Square`) — the trait/impl model working across a dependency edge.
+- `../geometry` **declares and exports** the types (via `[types] entry`).
+- `renderer` **consumes** them by fully-qualified name and adds a new
+  conformer (`Square`) — structural conformance working across a
+  dependency edge.

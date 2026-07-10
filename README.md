@@ -4,10 +4,11 @@
 
 One static binary that is the package manager, typechecker, linter, formatter,
 bundler, test runner, LSP server, and toolchain manager for every Lua dialect
-(5.1–5.4, LuaJIT). Types come from full LuaCATS annotation support plus the
-`.luab` shape DSL — Rust struct/trait declarations checked over untyped Lua,
-analyser-only. See [SPEC.md](SPEC.md) and [SHAPES.md](SHAPES.md) for the full
-design. Luau is explicitly out of scope.
+(5.1–5.4, LuaJIT). Types come from full LuaCATS annotation support plus
+`.luab` shape modules — TypeScript-adjacent `type` declarations checked
+structurally over untyped Lua, analyser-only. See [SPEC.md](SPEC.md) and
+[SHAPES-V2.md](SHAPES-V2.md) for the full design. Luau is explicitly out of
+scope.
 
 ## Status
 

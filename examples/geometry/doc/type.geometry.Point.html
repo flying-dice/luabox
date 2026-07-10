@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Struct Pair</title>
+<title>Type geometry.Point</title>
 <style>
 :root {
   color-scheme: light dark;
@@ -93,28 +93,26 @@ ul.item-list .summary { margin-left: .8em; color: var(--muted); font-size: .9rem
 <ul>
 <li><a href="shape.geometry.html">geometry</a></li>
 </ul>
-<h3>Structs</h3>
+<h3>Types</h3>
 <ul>
-<li><a href="struct.Point.html">Point</a></li>
-<li><a href="struct.Circle.html">Circle</a></li>
-<li><a href="struct.Rect.html">Rect</a></li>
-<li><a href="struct.Pair.html">Pair</a></li>
-</ul>
-<h3>Traits</h3>
-<ul>
-<li><a href="trait.Shape.html">Shape</a></li>
-<li><a href="trait.Drawable.html">Drawable</a></li>
+<li><a href="type.geometry.Point.html">geometry.Point</a></li>
+<li><a href="type.geometry.Circle.html">geometry.Circle</a></li>
+<li><a href="type.geometry.Rect.html">geometry.Rect</a></li>
+<li><a href="type.geometry.Pair.html">geometry.Pair</a></li>
+<li><a href="type.geometry.Shape.html">geometry.Shape</a></li>
+<li><a href="type.geometry.Drawable.html">geometry.Drawable</a></li>
 </ul>
 </nav>
 <main>
-<h1>Struct <code>Pair&lt;T&gt;</code><span class="badge">sealed</span></h1>
-<p class="muted">Sealed: tables bound to this struct may not carry undeclared fields (SHAPES.md §5).</p>
-<p>A homogeneous pair — a tiny generic container, monomorphised per use site.</p>
+<h1>Type <code>geometry.Point</code><span class="badge">export</span></h1>
+<p>2D geometry primitives and the shapes they satisfy.</p>
+<p>This is a <code>.luab</code> shape module: TypeScript-adjacent type declarations in a separate file, analyser-only, never on the require path and never in build output. There are no imports and no binding tags — every module under <code>[types] shape-paths</code> is ambient, addressed by its fully-qualified name (<code>geometry.Point</code>), and plain Lua consumes these types through the standard annotation positions (<code>---@type</code> / <code>---@param</code> / <code>---@return</code>). A point in 2D space. <code>label</code> is optional (the <code>?</code> suffix).</p>
 <h2>Fields</h2>
 <table class="fields">
 <tr><th>Field</th><th>Type</th><th></th></tr>
-<tr><td>first</td><td>T</td><td class="muted"></td></tr>
-<tr><td>second</td><td>T</td><td class="muted"></td></tr>
+<tr><td>x</td><td>number</td><td class="muted"></td></tr>
+<tr><td>y</td><td>number</td><td class="muted"></td></tr>
+<tr><td>label</td><td>string?</td><td class="muted"></td></tr>
 </table>
 </main>
 </body>

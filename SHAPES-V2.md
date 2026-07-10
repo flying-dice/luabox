@@ -1,7 +1,7 @@
 # SHAPES v2 — TypeScript-adjacent shape modules
 
-Status: **accepted, not yet implemented** (2026-07-10)
-Supersedes: [SHAPES.md](SHAPES.md) upon implementation.
+Status: **implemented** (2026-07-10)
+Supersedes: [SHAPES.md](SHAPES.md) (retired).
 
 ## Motivation
 

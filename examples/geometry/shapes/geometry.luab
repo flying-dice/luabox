@@ -1,46 +1,45 @@
 /// 2D geometry primitives and the shapes they satisfy.
 ///
-/// This is a `.luab` shape module: Rust struct/trait syntax in a separate file,
-/// analyser-only, never on the require path and never in build output. Plain
-/// Lua binds to these declarations with `---@use` / `---@struct` / `---@impl`.
+/// This is a `.luab` shape module: TypeScript-adjacent type declarations in
+/// a separate file, analyser-only, never on the require path and never in
+/// build output. There are no imports and no binding tags — every module
+/// under `[types] shape-paths` is ambient, addressed by its fully-qualified
+/// name (`geometry.Point`), and plain Lua consumes these types through the
+/// standard annotation positions (`---@type` / `---@param` / `---@return`).
 /// A point in 2D space. `label` is optional (the `?` suffix).
-struct Point {
+export type Point = {
     x: number,
     y: number,
-    label: string?,
+    label?: string,
 }
 
 /// A circle defined by its radius.
-struct Circle {
+export type Circle = {
     radius: number,
 }
 
 /// An axis-aligned rectangle.
-struct Rect {
+export type Rect = {
     width: number,
     height: number,
 }
 
 /// A homogeneous pair — a tiny generic container, monomorphised per use site.
-struct Pair<T> {
+export type Pair<T> = {
     first: T,
     second: T,
 }
 
-/// Anything with an area and a perimeter.
-trait Shape {
-    fn area(self) -> number;
-    fn perimeter(self) -> number;
+/// Anything with an area and a perimeter. Conformance is structural and
+/// positional: a value is a Shape wherever a Shape is demanded — there is
+/// no `impl` declaration to write (SHAPES-V2.md).
+export type Shape = {
+    area(self): number,
+    perimeter(self): number,
 }
 
-/// A Shape that can also render itself as text. `Drawable: Shape` makes Shape
-/// a supertrait: any carrier that impls Drawable must also conform to Shape.
-trait Drawable: Shape {
-    fn draw(self) -> string;
+/// A Shape that can also render itself as text. The intersection makes the
+/// obligation explicit: a Drawable carries every Shape member plus `draw`.
+export type Drawable = Shape & {
+    draw(self): string,
 }
-
-// Conformance assertions: Circle and Rect are Shapes. The method bodies live
-// in the .lua carriers (src/circle.lua, src/rect.lua), bound with ---@impl.
-impl Shape for Circle;
-
-impl Shape for Rect;
