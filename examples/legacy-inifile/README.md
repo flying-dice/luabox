@@ -48,15 +48,17 @@ This example deliberately shows both suppression mechanisms:
 
 ## LuaCATS vs. shapes — when to reach for which
 
-| | LuaCATS (`---@class`) | `.luab` shapes |
+| | LuaCATS (`---@class`) | `.luab` shape modules |
 |---|---|---|
-| Lives in | `.lua` comments | separate `.luab` files |
-| Sealing | width/optional per strictness | **sealed** — hard errors always |
-| Traits / conformance | ad-hoc | `trait` + `---@impl` coherence |
+| Lives in | `.lua` comments | separate `.luab` files (SHAPES-V2.md) |
+| Sealing | width/optional per strictness | **sealed** object types — literal freshness at annotated positions |
+| Conformance | ad-hoc | structural + positional, member-naming errors |
+| Naming | global class names | ambient fully-qualified names (`geometry.Point`) |
 | Editor support | every LuaLS editor | luabox-aware tooling |
-| Best for | existing code, gradual typing | new libraries wanting rigor |
+| Best for | existing code, gradual typing | new libraries wanting a curated, exported type surface |
 
-Both compile to one IR and interoperate freely — a `.luab` struct is usable in a
-`---@param`, and a `---@class` table can satisfy a `.luab` trait. Use LuaCATS to
-adopt luabox on what you already have; add shapes where you want Rust-grade
-guarantees.
+Both compile to one IR and interoperate freely — a `.luab` type is usable in
+any `---@param`/`---@type`/`---@return`, and a `---@class` table satisfies a
+`.luab` type wherever one is demanded. Use LuaCATS to adopt luabox on what you
+already have; add shape modules where you want TypeScript-grade guarantees
+and a published type surface (`export type` + `[types] entry`).
