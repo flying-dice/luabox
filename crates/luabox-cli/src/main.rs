@@ -60,6 +60,21 @@ enum Command {
         /// Add to [dev-dependencies]
         #[arg(long)]
         dev: bool,
+        /// Add as a path dependency rooted at this directory
+        #[arg(long, conflicts_with = "git")]
+        path: Option<String>,
+        /// Add as a git dependency at this URL
+        #[arg(long)]
+        git: Option<String>,
+        /// Pin the git dependency to a commit
+        #[arg(long, requires = "git", conflicts_with_all = ["tag", "branch"])]
+        rev: Option<String>,
+        /// Pin the git dependency to a tag
+        #[arg(long, requires = "git", conflicts_with = "branch")]
+        tag: Option<String>,
+        /// Track a branch of the git dependency
+        #[arg(long, requires = "git")]
+        branch: Option<String>,
     },
     /// Remove a dependency from luabox.toml
     Remove { package: String },
@@ -112,9 +127,16 @@ enum Command {
     },
     /// Run tests on the configured runtime(s)
     Test {
+        /// Substring filter: matched against test file paths, else test names
         pattern: Option<String>,
+        /// Rerun on every source/manifest change until interrupted (Ctrl-C);
+        /// a failing run is reported but does not stop watching
         #[arg(long)]
         watch: bool,
+        /// Run the suite against every Lua runtime found on PATH
+        #[arg(long)]
+        matrix: bool,
+        /// Collect coverage (not implemented yet — see SPEC.md §11)
         #[arg(long)]
         coverage: bool,
     },
@@ -171,7 +193,26 @@ fn main() -> anyhow::Result<()> {
         Command::New {
             name, lib, edition, ..
         } => scaffold::new(&std::env::current_dir()?, &name, lib, &edition),
-        Command::Add { package, dev } => deps_cmd::add(&std::env::current_dir()?, &package, dev),
+        Command::Add {
+            package,
+            dev,
+            path,
+            git,
+            rev,
+            tag,
+            branch,
+        } => deps_cmd::add(
+            &std::env::current_dir()?,
+            &deps_cmd::AddOptions {
+                package,
+                dev,
+                path,
+                git,
+                rev,
+                tag,
+                branch,
+            },
+        ),
         Command::Remove { package } => deps_cmd::remove(&std::env::current_dir()?, &package),
         Command::Install => deps_cmd::install(&std::env::current_dir()?),
         Command::Update { package } => {
@@ -184,21 +225,21 @@ fn main() -> anyhow::Result<()> {
         } => check_cmd::run(&std::env::current_dir()?, target.as_deref(), &format, watch),
         Command::Lint { fix } => lint_cmd::run(&std::env::current_dir()?, fix),
         Command::Fmt { check, watch } => fmt_cmd::run(&std::env::current_dir()?, check, watch),
-        Command::Build { target, out } => build_cmd::run(
-            &std::env::current_dir()?,
-            target.as_deref(),
-            out.as_deref(),
-        ),
+        Command::Build { target, out } => {
+            build_cmd::run(&std::env::current_dir()?, target.as_deref(), out.as_deref())
+        }
         Command::Bundle { .. } => unimplemented("bundle", "P3"),
         Command::Test {
             pattern,
             watch,
+            matrix,
             coverage,
         } => test_cmd::run(
             &std::env::current_dir()?,
             pattern.as_deref(),
             watch,
             coverage,
+            matrix,
         ),
         Command::Bench => unimplemented("bench", "P4"),
         Command::Run { .. } => unimplemented("run", "P4"),

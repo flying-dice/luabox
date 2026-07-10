@@ -22,8 +22,9 @@
 //!
 //! The root project's own entry carries no `source`/`checksum` (it *is*
 //! the tree being resolved), mirroring Cargo.lock. `source` strings are
-//! `registry` (checksums arrive with #20), `git+<url>#<ref>` (#21 will pin
-//! the resolved commit), or `path+<root-relative path>`.
+//! `registry` (checksums arrive with #20), `git+<url>#<commit>` (the
+//! *resolved* commit sha, pinned by `GitProvider` even for tag/branch
+//! refs), or `path+<root-relative path>`.
 
 use std::fmt;
 
@@ -45,7 +46,9 @@ const HEADER: &str =
 pub enum LockedSource {
     /// The first-party registry (SPEC.md §6).
     Registry,
-    /// A git source: `url#reference` (resolved commit once #21 lands).
+    /// A git source: `url#commit`, where `commit` is the resolved sha
+    /// (falling back to the symbolic reference for providers that cannot
+    /// pin one).
     Git { spec: String },
     /// A path/workspace dependency, root-relative with forward slashes.
     Path { path: String },

@@ -59,18 +59,29 @@ pub fn run(cwd: &Path, target: Option<&str>, format: &str, watch: bool) -> anyho
         let target = target.map(str::to_owned);
         let format = format.to_owned();
         return crate::watch::run(&project.root, project.out_dir.as_deref(), move || {
-            run_once(&cwd, target.as_deref(), &format)
+            run_once(&cwd, target.as_deref(), &format, None)
         });
     }
-    run_once(cwd, target, format)
+    run_once(cwd, target, format, None)
 }
 
 /// The single-pass body of `luabox check`: discover the project, typecheck
 /// every file, and translate the diagnostics into an exit code. Shared by
-/// one-shot `run` and each rerun of `run` in `--watch` mode.
-fn run_once(cwd: &Path, target: Option<&str>, format: &str) -> anyhow::Result<()> {
+/// one-shot `run`, each rerun of `run` in `--watch` mode, and the
+/// check-first gate of `luabox build` (`crate::build_cmd`), which passes
+/// its chosen out directory as `skip_out` so previously emitted output is
+/// never checked as project source even under a custom `--out`.
+pub(crate) fn run_once(
+    cwd: &Path,
+    target: Option<&str>,
+    format: &str,
+    skip_out: Option<&Path>,
+) -> anyhow::Result<()> {
     let format = parse_format(format)?;
-    let project = discover(cwd)?;
+    let mut project = discover(cwd)?;
+    if let Some(out) = skip_out {
+        project.out_dir = Some(out.to_path_buf());
+    }
 
     // Validate --target up front: a bad value is itself a diagnostic.
     let mut target_dialect = None;
@@ -267,11 +278,14 @@ fn parse_format(format: &str) -> anyhow::Result<Format> {
     })
 }
 
-struct Project {
-    root: PathBuf,
-    dialect: Dialect,
+pub(crate) struct Project {
+    pub(crate) root: PathBuf,
+    pub(crate) dialect: Dialect,
     strictness: Strictness,
-    out_dir: Option<PathBuf>,
+    pub(crate) out_dir: Option<PathBuf>,
+    /// `[build] target` — the dialect you ship (SPEC.md §2.1, §5); defaults
+    /// to the edition. Consumed by `crate::build_cmd`.
+    pub(crate) build_target: Dialect,
     /// `[types] shape-paths`, absolute, in manifest order (SHAPES.md §6).
     shape_paths: Vec<PathBuf>,
     /// `[types] defs`, ambient definition packages resolved from the
@@ -282,7 +296,7 @@ struct Project {
 /// Find the project: nearest `luabox.toml` walking up from `cwd`
 /// (cargo-style), or a manifest-less default rooted at `cwd` (Lua 5.4,
 /// warn mode — least surprise).
-fn discover(cwd: &Path) -> anyhow::Result<Project> {
+pub(crate) fn discover(cwd: &Path) -> anyhow::Result<Project> {
     let mut dir = Some(cwd);
     while let Some(current) = dir {
         let manifest_path = current.join("luabox.toml");
@@ -304,11 +318,19 @@ fn discover(cwd: &Path) -> anyhow::Result<Project> {
                     manifest_path.display()
                 );
             };
+            let Some(build_target) = Dialect::from_manifest_id(&manifest.build.target) else {
+                bail!(
+                    "unknown build target `{}` in `{}` (see `luabox explain LB1001`)",
+                    manifest.build.target,
+                    manifest_path.display()
+                );
+            };
             return Ok(Project {
                 root: current.to_path_buf(),
                 dialect,
                 strictness: Strictness::from_manifest_flag(manifest.types.strict),
                 out_dir: Some(current.join(&manifest.build.out)),
+                build_target,
                 shape_paths: manifest
                     .types
                     .shape_paths
@@ -325,6 +347,7 @@ fn discover(cwd: &Path) -> anyhow::Result<Project> {
         dialect: Dialect::Lua54,
         strictness: Strictness::Warn,
         out_dir: None,
+        build_target: Dialect::Lua54,
         shape_paths: Vec::new(),
         defs: Vec::new(),
     })
@@ -398,7 +421,7 @@ fn collect_d_lua(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// All `*.lua` and `*.lb` files under the project root, deterministic
 /// order, skipping dot-directories and the build output directory.
-fn collect_files(project: &Project) -> anyhow::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+pub(crate) fn collect_files(project: &Project) -> anyhow::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let mut lua = Vec::new();
     let mut lb = Vec::new();
     walk(&project.root, project, &mut lua, &mut lb)?;
@@ -440,7 +463,7 @@ fn walk(
 }
 
 /// Root-relative path with forward slashes — stable output across platforms.
-fn display_rel(path: &Path, root: &Path) -> String {
+pub(crate) fn display_rel(path: &Path, root: &Path) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path);
     rel.to_string_lossy().replace('\\', "/")
 }

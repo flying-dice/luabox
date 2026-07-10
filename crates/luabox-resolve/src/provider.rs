@@ -1,17 +1,19 @@
 //! Package metadata sources for the resolver (SPEC.md §6).
 //!
 //! [`PackageProvider`] is the boundary between the PubGrub solver and
-//! wherever package metadata physically lives. Two implementations ship
+//! wherever package metadata physically lives. Three implementations ship
 //! today:
 //!
 //! - [`PathProvider`] — path/workspace dependencies, read from each
 //!   dependency's `luabox.toml` on disk.
+//! - [`crate::GitProvider`] — git dependencies, fetched with the `git` CLI
+//!   into a local cache (see `git_provider`).
 //! - [`StaticProvider`] — an in-memory package universe for tests and
 //!   benchmarks.
 //!
-//! The registry client (sparse index, #20) and the git fetcher (#21) plug
-//! in behind this same trait; [`StackedProvider`] chains providers so a
-//! project can mix source kinds in one resolve.
+//! The registry client (sparse index, #20) plugs in behind this same
+//! trait; [`StackedProvider`] chains providers so a project can mix source
+//! kinds in one resolve.
 //!
 //! Package names are plain strings and deliberately admit both flat
 //! (`penlight`) and scoped (`@org/pkg`, SPEC.md §19) forms.
@@ -34,7 +36,7 @@ pub enum Source {
     /// A directory on disk containing a `luabox.toml` (path and workspace
     /// dependencies). The path is lexically normalized and absolute.
     Path { path: PathBuf },
-    /// A git repository (fetcher lands in #21).
+    /// A git repository (fetched by [`crate::GitProvider`]).
     Git {
         url: String,
         reference: GitReference,
@@ -125,6 +127,11 @@ pub struct PackageMeta {
     /// Content checksum for the lockfile (`sha256:…`). Plain string here;
     /// verification against the store is #18/#21 integration.
     pub checksum: Option<String>,
+    /// The immutable revision this version was resolved from, when the
+    /// source is mutable-by-reference: for git dependencies this is the
+    /// resolved commit sha, which the lockfile records instead of the
+    /// symbolic rev/tag/branch so installs are reproducible.
+    pub pinned: Option<String>,
 }
 
 /// Errors a provider (or the solver's manifest-shaped dependency
@@ -382,6 +389,7 @@ impl PackageProvider for PathProvider {
             Ok(PackageMeta {
                 lua_versions: m.package.lua_versions.clone(),
                 checksum: None,
+                pinned: None,
             })
         })?
     }
@@ -452,6 +460,7 @@ impl StaticProvider {
             PackageMeta {
                 lua_versions: lua_versions.iter().map(|s| (*s).to_owned()).collect(),
                 checksum: checksum.map(str::to_owned),
+                pinned: None,
             },
         );
     }

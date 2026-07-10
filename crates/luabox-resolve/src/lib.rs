@@ -10,14 +10,16 @@
 //! plain strings against a local allow-list, not via `luabox-syntax`.
 //!
 //! Resolution ([`resolve`]) is PubGrub over the [`provider::PackageProvider`]
-//! seam: path/workspace deps resolve from disk today; registry (#20) and
-//! git (#21) providers plug in behind the same trait. Results carry a
-//! deterministic [`Lockfile`] (`luabox.lock`), and failures render
-//! cargo-style conflict reports via `Display`.
+//! seam: path/workspace deps resolve from disk, git deps via the
+//! [`GitProvider`] (`git` CLI, sha-pinned); the registry provider (#20)
+//! plugs in behind the same trait. Results carry a deterministic
+//! [`Lockfile`] (`luabox.lock`), and failures render cargo-style conflict
+//! reports via `Display`.
 //!
-//! Status: manifest parsing, solver, and lockfile landed. Registry client
-//! and luarocks bridge are P2 follow-ups (#20/#21).
+//! Status: manifest parsing/editing, solver, lockfile, and git fetching
+//! landed. Registry client and luarocks bridge are P2 follow-ups (#19/#20).
 
+pub mod git_provider;
 pub mod lockfile;
 pub mod manifest;
 pub mod provider;
@@ -25,6 +27,7 @@ mod report;
 mod semver_ranges;
 pub mod solver;
 
+pub use git_provider::{GitCheckout, GitProvider};
 pub use lockfile::{
     LOCKFILE_NAME, LOCKFILE_VERSION, LockedPackage, LockedSource, Lockfile, LockfileError,
 };

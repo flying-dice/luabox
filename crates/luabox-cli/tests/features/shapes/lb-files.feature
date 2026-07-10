@@ -8,12 +8,23 @@ Feature: .lb files are analyser-only
     Then diagnostic LB2010 is reported
     And stdout contains "implementations live in .lua"
 
-  @wip
   Scenario: build output identical with and without shapes
-    Given a project that builds successfully
-    And the same project with .lb shape modules added
-    When I run "luabox build" on both
-    Then the emitted output is byte-identical
+    Given a project with edition "5.4" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      local mask = 5
+      print(mask & 3)
+      """
+    When I run "luabox build"
+    Then the command succeeds
+    And I stash the build output
+    Given a file "src/geometry.lb" containing:
+      """
+      struct Point { x: number, y: number }
+      """
+    When I run "luabox build"
+    Then the command succeeds
+    And the build output is byte-identical to the stashed output
 
   Scenario: .lb files are formatted by luabox fmt
     Given an empty directory

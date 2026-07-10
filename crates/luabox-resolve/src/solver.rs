@@ -567,7 +567,13 @@ fn build_resolution(
                 path: relative_display(&ctx.root_dir, path),
             },
             Source::Git { url, reference } => LockedSource::Git {
-                spec: format!("{url}#{reference}"),
+                // Pin the resolved commit sha when the provider reports one
+                // (SPEC.md §6: reproducible installs even for branch refs);
+                // fall back to the symbolic reference otherwise.
+                spec: match &meta.pinned {
+                    Some(commit) => format!("{url}#{commit}"),
+                    None => format!("{url}#{reference}"),
+                },
             },
         };
         packages.push(ResolvedPackage {

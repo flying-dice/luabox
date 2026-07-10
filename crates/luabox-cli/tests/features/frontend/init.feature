@@ -45,6 +45,6 @@ Feature: Project scaffolding — luabox init / luabox new
 
   Scenario: unimplemented commands say which phase ships them
     Given an empty directory
-    When I run "luabox build"
+    When I run "luabox bundle"
     Then the command fails
     And stderr contains "not implemented"

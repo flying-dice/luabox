@@ -895,6 +895,9 @@ name = "luabox-lower"
 version = "0.1.0"
 dependencies = [
  "luabox-hir",
+ "luabox-syntax",
+ "proptest",
+ "rowan",
 ]
 
 [[package]]
@@ -949,6 +952,11 @@ dependencies = [
 [[package]]
 name = "luabox-test"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rayon",
+ "tempfile",
+]
 
 [[package]]
 name = "luabox-types"

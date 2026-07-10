@@ -141,6 +141,36 @@ static REGISTRY: &[Entry] = &[
         explain: LB0508,
     },
     Entry {
+        code: Code::new(601),
+        title: "irreducible `goto`",
+        explain: LB0601,
+    },
+    Entry {
+        code: Code::new(602),
+        title: "assignment to a `<const>` variable",
+        explain: LB0602,
+    },
+    Entry {
+        code: Code::new(603),
+        title: "`<close>` lowering fidelity",
+        explain: LB0603,
+    },
+    Entry {
+        code: Code::new(604),
+        title: "`_ENV` use not lowerable",
+        explain: LB0604,
+    },
+    Entry {
+        code: Code::new(605),
+        title: "LuaJIT extension not lowerable",
+        explain: LB0605,
+    },
+    Entry {
+        code: Code::new(606),
+        title: "integer/float divergence on lowering",
+        explain: LB0606,
+    },
+    Entry {
         code: Code::new(1001),
         title: "unknown edition",
         explain: LB1001,
@@ -734,6 +764,175 @@ end
 
 Fill in the body, invert the condition and move the code, or delete the
 branch. A single explanatory comment suppresses the lint.
+";
+
+const LB0601: &str = "\
+# LB0601: irreducible `goto`
+
+`luabox build` lowers `goto`/labels to Lua 5.1 by restructuring the two
+reducible shapes (SPEC.md §2.1):
+
+- **backward goto as loop** — a label followed later *in the same block*
+  by its single goto, either `if <cond> then goto L end` (becomes
+  `repeat … until not (<cond>)`) or an unconditional `goto L` as the
+  block's last statement (becomes `while true do … end`);
+- **forward goto as skip** — goto(s) before their label in the same block
+  (each becomes a flag; the skipped statements are wrapped in
+  `if not <flag> then … end`). The `goto continue` idiom is this shape.
+
+A goto that fits neither shape — nested deeper than one `if` branch,
+jumping out of a loop, mixing backward and forward jumps to one label,
+interleaving regions, or crossing a `break` boundary — cannot be
+restructured faithfully and is reported here.
+
+```lua
+-- irreducible: jumps out of the loop
+while true do
+  goto out
+end
+::out::
+
+-- restructure by hand, e.g.:
+while true do
+  break
+end
+```
+
+Restructure the control flow by hand (usually a `break`, a flag, or a
+function extraction). Note `---@luabox-allow lossy-lowering` does **not**
+apply to goto: the escape hatch exists for bounded fidelity trade-offs
+(see LB0603), not for control flow, where any deviation changes what the
+program does.
+";
+
+const LB0602: &str = "\
+# LB0602: assignment to a `<const>` variable
+
+`<const>` (Lua 5.4) is a compile-time reassignment ban. When `luabox
+build` lowers it away for a pre-5.4 target, the ban is enforced by the
+compiler instead — exactly as Lua 5.4 itself would reject the program —
+so dropping the attribute never changes behaviour.
+
+```lua
+local limit <const> = 10
+limit = 20            -- LB0602, just as Lua 5.4 errors here
+
+local f = function()
+  limit = 30          -- LB0602 too: 5.4 also bans upvalue assignment
+end
+```
+
+Shadowing is respected: a new `local limit` afterwards is a different
+variable and may be assigned freely.
+
+Fix the assignment or drop the `<const>` attribute if the variable is
+genuinely meant to be mutable. (`<close>` variables are also constant and
+get the same check.)
+";
+
+const LB0603: &str = "\
+# LB0603: `<close>` lowering fidelity
+
+`local h <close> = v` (Lua 5.4) calls `getmetatable(v).__close(v, err)`
+when the variable's scope exits, normally or via an error. Lowering to
+pre-5.4 targets rewrites the scope tail through the runtime helper:
+
+```lua
+local h = open()
+__luabox_rt.close_scope(h, function()
+  -- original scope tail
+end)
+```
+
+`close_scope` runs the tail under `pcall`, invokes `__close(v, err)` with
+the error object (or `nil` on the normal path), then re-raises the error
+unmodified.
+
+**Warn tier (this code, suppressible).** One fidelity delta is not
+lowerable at all (SPEC.md §2.1): if a coroutine suspended inside the
+scope is discarded, Lua 5.4 still closes the variable when the coroutine
+is collected or closed; the `pcall` wrapper never resumes, so the close
+action never runs. Annotate the declaration to acknowledge the trade-off:
+
+```lua
+---@luabox-allow lossy-lowering
+local h <close> = open()
+```
+
+**Error tier (this code, not suppressible).** The scope tail becomes a
+function body, so a tail containing `return`, a `break` bound to an outer
+loop, a `goto` out of the scope, or `...` cannot be wrapped — those
+constructs cannot cross a function boundary. Restructure the scope (e.g.
+compute the return value before the `<close>` declaration, or narrow the
+variable's scope with a `do … end` block).
+";
+
+const LB0604: &str = "\
+# LB0604: `_ENV` use not lowerable
+
+Explicit `_ENV` (Lua 5.2+) lowers to 5.1/LuaJIT via `setfenv`/`getfenv`
+for the common idioms (SPEC.md §2.1):
+
+```lua
+local _ENV = t        -- chunk/function-body level → setfenv(1, t)
+_ENV = t              -- same position               → setfenv(1, t)
+print(_ENV)           -- expression read             → getfenv(1)
+```
+
+Everything else is reported here: `_ENV` in a multi-name `local` or
+multi-target assignment, `local _ENV` inside a nested block (its 5.2
+scope would end at the block's `end`, but `setfenv` affects the whole
+function — not equivalent), or an `_ENV` function parameter.
+
+Restructure to one of the lowerable idioms, or keep an explicit table
+(`local env = t; env.x = 1`) instead of environment manipulation.
+";
+
+const LB0605: &str = "\
+# LB0605: LuaJIT extension not lowerable
+
+Lowering LuaJIT code to Lua 5.1 polyfills the `bit.*` library through the
+injected `__luabox_rt` module (SPEC.md §2.1): `bit.band`, `bor`, `bxor`,
+`bnot`, `lshift`, `rshift`, `arshift`, `rol`, `ror`, `bswap`, `tobit`,
+and `tohex` are all covered, including `require(\"bit\")` aliases.
+
+This error reports the extensions with no faithful polyfill:
+
+- **`ffi`** — `require(\"ffi\")`: C data, C calls, and cdata semantics
+  cannot be reproduced in plain Lua. Not lowerable, by design.
+- **unknown `bit` members** — anything outside the documented `bit` API.
+- **64-bit/imaginary number literals** — `42LL`, `7ULL`, `3i` create
+  cdata boxes; a double cannot represent them.
+
+Keep such code behind a runtime check and provide a plain-Lua fallback,
+or target LuaJIT itself.
+";
+
+const LB0606: &str = "\
+# LB0606: integer/float divergence on lowering
+
+Lua 5.3+ has true 64-bit integers; 5.1, 5.2, and LuaJIT represent every
+number as a double (exact only up to 2^53) and their bit shims are
+32-bit. Lowering cannot bridge that representation gap, so `luabox build`
+warns on the surfaces where the divergence is observable (SPEC.md §2.1
+diagnostic tiers — warn on observable divergence):
+
+- **Integer literals beyond 2^53** — the constant itself is already
+  inexact on the target.
+- **`//` lowering** (reported once per file) — `math.floor(a / b)` equals
+  integer floor division up to 2^53; beyond it the double division can
+  round before flooring, and integer division by zero raises in 5.3 but
+  yields `inf`/`nan` in doubles.
+- **`string.format` with `%d`** — 5.3+ rejects non-integral arguments
+  and prints full 64-bit integers; double-only targets coerce and lose
+  precision.
+- Bitwise operands wider than 32 bits truncate in every available shim
+  (`bit32`, `bit`, and the pure-Lua fallback are all 32-bit).
+
+If your values stay within 32 bits (bitops) / 2^53 (arithmetic) — the
+overwhelmingly common case for code that targets 5.1 at all — the lowered
+program is exact and the warning can be ignored. Otherwise restructure to
+avoid the construct or raise the target.
 ";
 
 const LB1001: &str = "\
