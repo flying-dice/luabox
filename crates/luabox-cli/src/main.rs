@@ -3,14 +3,18 @@
 //! Thin frontend over the bounded-context crates: owns UX, argument parsing,
 //! and diagnostic rendering; none of the domain logic.
 
+mod bench_cmd;
 mod build_cmd;
+mod bundle_cmd;
 mod check_cmd;
 mod deps_cmd;
 mod fmt_cmd;
 mod lint_cmd;
 mod lsp_cmd;
+mod run_cmd;
 mod scaffold;
 mod test_cmd;
+mod toolchain_cmd;
 mod watch;
 
 use std::path::PathBuf;
@@ -228,7 +232,9 @@ fn main() -> anyhow::Result<()> {
         Command::Build { target, out } => {
             build_cmd::run(&std::env::current_dir()?, target.as_deref(), out.as_deref())
         }
-        Command::Bundle { .. } => unimplemented("bundle", "P3"),
+        Command::Bundle { minify, sourcemap } => {
+            bundle_cmd::run(&std::env::current_dir()?, minify, sourcemap)
+        }
         Command::Test {
             pattern,
             watch,
@@ -241,12 +247,16 @@ fn main() -> anyhow::Result<()> {
             coverage,
             matrix,
         ),
-        Command::Bench => unimplemented("bench", "P4"),
-        Command::Run { .. } => unimplemented("run", "P4"),
+        Command::Bench => bench_cmd::run(&std::env::current_dir()?),
+        Command::Run { script, args } => run_cmd::run(&std::env::current_dir()?, &script, &args),
         Command::Doc { .. } => unimplemented("doc", "P5"),
         Command::Publish => unimplemented("publish", "P2"),
         Command::Lsp { .. } => lsp_cmd::run(),
-        Command::Toolchain { .. } => unimplemented("toolchain", "P4"),
+        Command::Toolchain { action } => match action {
+            Some(ToolchainAction::Install { version }) => toolchain_cmd::install(&version),
+            Some(ToolchainAction::Pin { version }) => toolchain_cmd::pin(&version),
+            Some(ToolchainAction::List) | None => toolchain_cmd::list(),
+        },
         Command::Vendor => deps_cmd::vendor(&std::env::current_dir()?),
         Command::Audit => unimplemented("audit", "P5"),
         Command::Explain { code } => {
