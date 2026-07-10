@@ -27,6 +27,7 @@ luabox-test = { path = "crates/luabox-test", version = "0.1.0" }
 
 # External
 rowan = "0.16"
+salsa = "0.27"
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1"
 rayon = "1"
