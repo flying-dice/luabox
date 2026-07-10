@@ -11,8 +11,34 @@ design. Luau is explicitly out of scope.
 
 ## Status
 
-Pre-alpha — P0 (parser, `luabox.toml`, `init`/`fmt`/`check`, CLI skeleton) in
-progress. Nothing here is usable yet.
+**0.1.0** — the full command surface works end to end. Alpha quality: the
+executable spec is 167 cucumber scenarios driving the real binary, perf gates
+(cold start < 50 ms, `check` on 100 kLOC < 1 s warm) block CI, and lowering is
+verified by differential execution against real runtimes in CI. Not yet
+published to any registry; build from source.
+
+```sh
+cargo build --release            # target/release/luabox
+```
+
+## Commands
+
+| | |
+|---|---|
+| `init` / `new` | scaffold a project (`--lib`, `--edition 5.1..5.4\|luajit`) |
+| `check` | typecheck: LuaCATS + `.lb` shapes + rich inference, dialect legality, `--target`, `--watch`, `--format json\|sarif\|github\|gitlab` |
+| `fmt` | canonical formatter for `.lua` + `.lb` (`--check`, `--watch`) |
+| `lint` | 8 type-informed rules, `---@luabox-ignore`, `--fix` |
+| `build` | lower `edition → target` (goto, bitops, `<close>`, `_ENV`, …) with tree-shaken polyfills |
+| `bundle` | single-file bundle, `--minify`, `--sourcemap` + `unmap`, `--mode love\|nvim-plugin` |
+| `test` / `bench` | zero-config runner (busted-compatible), `--matrix` across runtimes; criterion-lite bench |
+| `add` / `remove` / `install` / `update` / `vendor` | PubGrub resolver, `luabox.lock`, CAS store with hard-link installs; path/git/registry/`luarocks/*` deps |
+| `publish` / `audit` | sparse-index registry publish with yank; advisory-DB audit |
+| `run` | `[tasks]` entries or scripts via the resolved runtime |
+| `toolchain` | install/pin/list managed Lua runtimes |
+| `lsp` | language server: diagnostics, hover, goto, completion, symbols |
+| `doc` | static docs from annotations + shapes |
+| `explain LBnnnn` | rustc-style diagnostic pages |
 
 ## Layout
 
