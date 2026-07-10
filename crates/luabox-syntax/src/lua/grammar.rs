@@ -627,9 +627,14 @@ fn call_args(p: &mut Parser) {
 
 /// `tableconstructor ::= '{' [fieldlist] '}'`; tolerant of stray separators
 /// and junk between fields.
+///
+/// Fields must be separated by `,` or `;`; a field that starts right after
+/// another without one (`{1 2}`) is reported once at the boundary and then
+/// parsed anyway, so the tree keeps both fields.
 fn table_expr(p: &mut Parser) {
     p.start_node(TABLE_EXPR);
     p.bump(); // {
+    let mut needs_separator = false;
     loop {
         match p.current() {
             None => {
@@ -640,19 +645,36 @@ fn table_expr(p: &mut Parser) {
                 p.bump();
                 break;
             }
-            Some(COMMA | SEMICOLON) => p.bump(),
-            Some(L_BRACKET) => table_key_field(p),
+            Some(COMMA | SEMICOLON) => {
+                p.bump();
+                needs_separator = false;
+            }
+            Some(L_BRACKET) => {
+                if needs_separator {
+                    p.error("expected ',' or ';' between table fields");
+                }
+                table_key_field(p);
+                needs_separator = true;
+            }
             Some(IDENT) if p.nth(1) == Some(EQ) => {
+                if needs_separator {
+                    p.error("expected ',' or ';' between table fields");
+                }
                 p.start_node(TABLE_NAME_FIELD);
                 p.bump(); // Name
                 p.bump(); // =
                 expr(p);
                 p.finish_node();
+                needs_separator = true;
             }
             Some(kind) if can_start_expr(kind) => {
+                if needs_separator {
+                    p.error("expected ',' or ';' between table fields");
+                }
                 p.start_node(TABLE_ITEM_FIELD);
                 expr(p);
                 p.finish_node();
+                needs_separator = true;
             }
             Some(kind) if is_block_end(kind) || can_start_stmt(kind) => {
                 // Likely an unclosed table: hand the token back to the

@@ -771,6 +771,63 @@ SOURCE_FILE@0..4
     }
 
     #[test]
+    fn table_constructor_requires_separator_between_fields() {
+        let parse = parse("t = {1 2}", Dialect::Lua54);
+        assert_lossless(&parse, "t = {1 2}");
+        assert_eq!(
+            parse.errors(),
+            &[ParseError {
+                message: "expected ',' or ';' between table fields".to_string(),
+                range: TextRange::new(TextSize::from(7), TextSize::from(8)),
+            }],
+            "{}",
+            parse.debug_dump()
+        );
+        let ast::Stmt::Assign(assign) = first_stmt(&parse) else {
+            panic!("expected assignment");
+        };
+        let Some(ast::Expr::Table(table)) = assign.values().unwrap().exprs().next() else {
+            panic!("expected table");
+        };
+        let fields: Vec<_> = table.fields().collect();
+        assert_eq!(fields.len(), 2, "{}", parse.debug_dump());
+        assert!(fields.iter().all(|f| matches!(f, ast::TableField::Item(_))));
+    }
+
+    #[test]
+    fn table_constructor_separators_are_clean() {
+        ok("t = {1, 2}");
+        ok("t = {1; 2}");
+        ok("t = {1, 2,}");
+    }
+
+    #[test]
+    fn table_constructor_missing_separator_between_calls_errors() {
+        err("t = {f() g()}");
+    }
+
+    #[test]
+    fn nested_table_missing_separator_errors_once() {
+        let parse = err("t = { {1 2} }");
+        assert_eq!(parse.errors().len(), 1, "{}", parse.debug_dump());
+    }
+
+    #[test]
+    fn table_constructor_missing_separator_recovers_when_unterminated() {
+        // Unclosed on top of a missing separator: recovers without looping,
+        // and both fields still make it into the tree.
+        let parse = err("t = {1 2");
+        assert_lossless(&parse, "t = {1 2");
+        let ast::Stmt::Assign(assign) = first_stmt(&parse) else {
+            panic!("expected assignment");
+        };
+        let Some(ast::Expr::Table(table)) = assign.values().unwrap().exprs().next() else {
+            panic!("expected table");
+        };
+        assert_eq!(table.fields().count(), 2, "{}", parse.debug_dump());
+    }
+
+    #[test]
     fn function_expr_and_varargs() {
         ok("local f = function(...) return ... end");
         ok("f(...)");
