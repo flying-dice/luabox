@@ -22,8 +22,8 @@ mod workspace;
 
 pub use error::ManifestError;
 pub use model::{
-    ALLOWED_DIALECTS, Build, Dependency, GitDependency, Manifest, Package, PathDependency,
-    TaskValue, Types, Workspace, WorkspaceDependency,
+    ALLOWED_DIALECTS, Build, Dependency, GitDependency, LINT_TIERS, Lint, LintLevel, Manifest,
+    Package, PathDependency, TaskValue, Types, Workspace, WorkspaceDependency,
 };
 
 #[cfg(test)]
@@ -367,5 +367,54 @@ mod tests {
     fn malformed_toml_reports_a_parse_error() {
         let errors = Manifest::parse("[package\nname = \"ok\"\n").unwrap_err();
         assert!(!errors.is_empty());
+    }
+
+    const PREAMBLE: &str = "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n";
+
+    #[test]
+    fn lint_defaults_to_empty() {
+        let manifest = Manifest::parse(PREAMBLE).expect("valid manifest");
+        assert!(manifest.lint.globals.is_empty());
+        assert!(manifest.lint.tiers.is_empty());
+        assert!(manifest.lint.rules.is_empty());
+    }
+
+    #[test]
+    fn lint_parses_globals_tiers_and_rules() {
+        let src = format!(
+            "{PREAMBLE}\n[lint]\nglobals = [\"vim\", \"love\"]\npedantic = \"warn\"\nunused-local = \"allow\"\nglobal-write = \"deny\"\n"
+        );
+        let manifest = Manifest::parse(&src).expect("valid [lint]");
+        assert_eq!(manifest.lint.globals, vec!["vim", "love"]);
+        assert_eq!(manifest.lint.tiers.get("pedantic"), Some(&LintLevel::Warn));
+        assert_eq!(
+            manifest.lint.rules.get("unused-local"),
+            Some(&LintLevel::Allow)
+        );
+        assert_eq!(
+            manifest.lint.rules.get("global-write"),
+            Some(&LintLevel::Deny)
+        );
+        // A tier name is classified as a tier, not a rule.
+        assert!(!manifest.lint.rules.contains_key("pedantic"));
+    }
+
+    #[test]
+    fn lint_bad_level_suggests_valid_levels() {
+        let src = format!("{PREAMBLE}\n[lint]\nunused-local = \"alow\"\n");
+        let errors = Manifest::parse(&src).unwrap_err();
+        let msg = &errors[0].message;
+        assert!(msg.contains("did you mean `allow`"), "{msg}");
+    }
+
+    #[test]
+    fn lint_non_string_level_is_reported() {
+        let src = format!("{PREAMBLE}\n[lint]\nunused-local = 3\n");
+        let errors = Manifest::parse(&src).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("must be a level string"))
+        );
     }
 }

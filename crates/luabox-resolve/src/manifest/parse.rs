@@ -11,8 +11,8 @@ use toml_edit::{ImDocument, Item, Table, TableLike};
 
 use super::error::ManifestError;
 use super::model::{
-    ALLOWED_DIALECTS, Build, Dependency, GitDependency, Manifest, Package, PathDependency,
-    TaskValue, Types, Workspace, WorkspaceDependency,
+    ALLOWED_DIALECTS, Build, Dependency, GitDependency, LINT_TIERS, Lint, LintLevel, Manifest,
+    Package, PathDependency, TaskValue, Types, Workspace, WorkspaceDependency,
 };
 
 const TOP_LEVEL_KEYS: &[&str] = &[
@@ -23,7 +23,9 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "dev-dependencies",
     "tasks",
     "workspace",
+    "lint",
 ];
+const LINT_LEVELS: &[&str] = &["allow", "warn", "deny"];
 const PACKAGE_KEYS: &[&str] = &[
     "name",
     "version",
@@ -74,6 +76,7 @@ impl Manifest {
         let dev_dependencies = parse_dependencies(root, "dev-dependencies", &mut errors);
         let tasks = parse_tasks(root, &mut errors);
         let workspace = parse_workspace(root, &mut errors);
+        let lint = parse_lint(root, &mut errors);
 
         if errors.is_empty() {
             Ok(Manifest {
@@ -84,6 +87,7 @@ impl Manifest {
                 dev_dependencies,
                 tasks,
                 workspace,
+                lint,
                 document: im_document.into_mut(),
             })
         } else {
@@ -426,6 +430,55 @@ fn parse_workspace(root: &Table, errors: &mut Vec<ManifestError>) -> Option<Work
     Some(Workspace {
         members: get_string_array(table, "workspace", "members", errors),
     })
+}
+
+/// Parse `[lint]` (SPEC.md §9). `globals` is a string array; every other key
+/// is a level entry (`allow`/`warn`/`deny`) targeting either a tier name
+/// ([`LINT_TIERS`]) or a rule id. Rule ids are open (they live in
+/// `luabox-lint`), so unknown keys are not rejected here — only the *level
+/// value* is validated, with a cargo-style did-you-mean nudge.
+fn parse_lint(root: &Table, errors: &mut Vec<ManifestError>) -> Lint {
+    let Some(table) = get_table(root, "lint", errors) else {
+        return Lint::default();
+    };
+    let mut lint = Lint::default();
+    for (key, item) in table.iter() {
+        if key == "globals" {
+            lint.globals = get_string_array(table, "lint", "globals", errors);
+            continue;
+        }
+        let Some(raw) = item.as_str() else {
+            errors.push(ManifestError::new(
+                format!("`lint.{key}` must be a level string (allow, warn, deny)"),
+                item.span(),
+            ));
+            continue;
+        };
+        let Some(level) = parse_lint_level(raw) else {
+            errors.push(ManifestError::unknown_key(
+                &format!("lint level for `{key}`"),
+                raw,
+                LINT_LEVELS,
+                item_span(table, key),
+            ));
+            continue;
+        };
+        if LINT_TIERS.contains(&key) {
+            lint.tiers.insert(key.to_owned(), level);
+        } else {
+            lint.rules.insert(key.to_owned(), level);
+        }
+    }
+    lint
+}
+
+fn parse_lint_level(raw: &str) -> Option<LintLevel> {
+    match raw {
+        "allow" => Some(LintLevel::Allow),
+        "warn" => Some(LintLevel::Warn),
+        "deny" => Some(LintLevel::Deny),
+        _ => None,
+    }
 }
 
 fn parse_dependencies(

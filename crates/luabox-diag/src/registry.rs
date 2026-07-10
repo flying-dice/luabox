@@ -91,6 +91,56 @@ static REGISTRY: &[Entry] = &[
         explain: LB0305,
     },
     Entry {
+        code: Code::new(306),
+        title: "field not found on inferred table shape",
+        explain: LB0306,
+    },
+    Entry {
+        code: Code::new(500),
+        title: "malformed `---@luabox-ignore`",
+        explain: LB0500,
+    },
+    Entry {
+        code: Code::new(501),
+        title: "unused local (unused-local)",
+        explain: LB0501,
+    },
+    Entry {
+        code: Code::new(502),
+        title: "unused parameter (unused-param)",
+        explain: LB0502,
+    },
+    Entry {
+        code: Code::new(503),
+        title: "shadowed local (shadowed-local)",
+        explain: LB0503,
+    },
+    Entry {
+        code: Code::new(504),
+        title: "assignment to a global (global-write)",
+        explain: LB0504,
+    },
+    Entry {
+        code: Code::new(505),
+        title: "explicit nil comparison as truthiness (explicit-nil-compare-truthiness)",
+        explain: LB0505,
+    },
+    Entry {
+        code: Code::new(506),
+        title: "string concatenation in a loop (concat-in-loop)",
+        explain: LB0506,
+    },
+    Entry {
+        code: Code::new(507),
+        title: "`pairs` on an array (pairs-on-array)",
+        explain: LB0507,
+    },
+    Entry {
+        code: Code::new(508),
+        title: "empty `if ... then` body (empty-then)",
+        explain: LB0508,
+    },
+    Entry {
         code: Code::new(1001),
         title: "unknown edition",
         explain: LB1001,
@@ -460,6 +510,227 @@ definition packages) lands in P1; until then each file is checked against
 its own declarations. The unresolved type is treated as `unknown`.
 ";
 
+const LB0306: &str = "\
+# LB0306: field not found on inferred table shape
+
+A field read (or `:` method call) names a key that provably does not exist
+on a locally-constructed table. Rich table inference (SPEC.md §3) tracks
+the *shape* of every table built in the file — constructor entries, later
+`t.x = v` assignments, `function T.f()` / `function T:m()` declarations,
+and `setmetatable`/`__index` chains — so a read that none of those supply
+is a typo, not a dynamic lookup.
+
+```lua
+local Circle = {}
+Circle.__index = Circle
+
+function Circle.new(radius)
+  local o = setmetatable({}, Circle)
+  o.radius = radius
+  return o
+end
+
+function Circle:area()
+  return 3.14 * self.radiuss ^ 2   -- LB0306: no field `radiuss`
+end
+```
+
+The check is deliberately conservative. It stays silent when the shape is
+not fully known: tables that escape into unanalyzed code (arguments to
+unknown functions, global writes), tables with dynamic-key writes or
+indexer types, tables whose metatable/`__index` cannot be resolved, and
+carriers bound to a `---@class` or `.lb` struct (those are governed by
+their declarations — `LB0303`/`LB2002`) never produce this diagnostic.
+
+Fix the spelling, or assign the field somewhere the checker can see.
+";
+
+const LB0500: &str = "\
+# LB0500: malformed `---@luabox-ignore`
+
+A `---@luabox-ignore` suppression comment is missing its rule id, its
+mandatory reason, or both (SPEC.md §9). Every suppression must say *which*
+rule it silences and *why* — the reason is not optional, so a bare tag is
+itself a (correctness-tier) diagnostic.
+
+```lua
+-- wrong: no reason
+---@luabox-ignore global-write
+counter = 0
+
+-- right: rule id + reason
+---@luabox-ignore global-write intentional module-level singleton
+counter = 0
+```
+
+The comment attaches to the statement on the same line or the line below;
+placed before the first statement it suppresses the rule file-wide.
+";
+
+const LB0501: &str = "\
+# LB0501: unused local (unused-local)
+
+A `local` (or `local function`) is declared but never read. Style tier. Its
+value is computed and discarded, which is usually a leftover or a typo.
+
+```lua
+local total = compute()   -- LB0501 if `total` is never used
+```
+
+Prefix the name with `_` to mark it deliberately unused, or delete the
+binding. `luabox lint --fix` renames a never-referenced local to `_name`
+(machine-applicable). Resolution is HIR-based: a use inside a nested closure
+still counts, so genuine captures are never flagged.
+";
+
+const LB0502: &str = "\
+# LB0502: unused parameter (unused-param)
+
+A function parameter is never read. Pedantic tier (off unless enabled),
+because unused parameters are often required by an interface or callback
+shape. The implicit `self` of a `:` method is always exempt.
+
+```lua
+---@param event table
+---@param _unused number
+local function handler(event, _unused) end   -- `_unused` is exempt
+```
+
+Prefix the name with `_` to silence, or drop the parameter if the signature
+is yours to change.
+";
+
+const LB0503: &str = "\
+# LB0503: shadowed local (shadowed-local)
+
+A new `local` shadows a still-live binding of the same name in an
+*enclosing* scope. Suspicious tier: the outer binding is now unreachable for
+the rest of the inner scope, which is a common source of bugs.
+
+```lua
+local value = 1
+do
+  local value = 2   -- LB0503: shadows the outer `value`
+  print(value)
+end
+```
+
+Re-declaring a local in the *same* block (`local x = 1; local x = f(x)`) is
+idiomatic Lua and is **not** flagged — only shadowing across a scope
+boundary is. Rename one of the two, or reuse the outer binding.
+";
+
+const LB0504: &str = "\
+# LB0504: assignment to a global (global-write)
+
+An assignment targets a name that resolves to a global (no `local` is in
+scope). Suspicious tier: a missing `local` is the classic Lua footgun — the
+value silently leaks into `_G`.
+
+```lua
+local function reset()
+  counter = 0   -- LB0504: writes the global `counter`; missing `local`?
+end
+```
+
+Add `local`, or — if the global is intentional (a runtime injects it) — add
+its name to `[lint] globals` in `luabox.toml`:
+
+```toml
+[lint]
+globals = [\"vim\", \"love\"]
+```
+
+Only bare-name targets are flagged; `t.field = v` and `t[k] = v` are field
+writes, not global writes.
+";
+
+const LB0505: &str = "\
+# LB0505: explicit nil comparison as truthiness (explicit-nil-compare-truthiness)
+
+An `if` condition is exactly `x ~= nil` (or `x == nil`) where plain
+truthiness — `if x then` / `if not x then` — is provably equivalent. Style
+tier, and **type-informed**: it fires only when `x`'s type cannot be
+`boolean` and cannot contain `false`, so the rewrite can never change
+behaviour. When the type is unknown the rule stays silent.
+
+```lua
+---@type string
+local name = get()
+if name ~= nil then end   -- LB0505 -> `if name then`
+
+---@type boolean
+local flag = get()
+if flag ~= nil then end   -- NOT flagged: `flag` may be `false`
+```
+
+`luabox lint --fix` applies the rewrite in both directions.
+";
+
+const LB0506: &str = "\
+# LB0506: string concatenation in a loop (concat-in-loop)
+
+A loop-carried accumulator is grown with `s = s .. expr` on every iteration.
+Perf tier: each `..` allocates a fresh string, so the loop is quadratic in
+the total length.
+
+```lua
+local out = \"\"
+for _, line in ipairs(lines) do
+  out = out .. line   -- LB0506
+end
+```
+
+Collect the pieces in a table and join once:
+
+```lua
+local parts = {}
+for _, line in ipairs(lines) do
+  parts[#parts + 1] = line
+end
+local out = table.concat(parts)
+```
+
+No autofix — the correct rewrite depends on the surrounding code.
+";
+
+const LB0507: &str = "\
+# LB0507: `pairs` on an array (pairs-on-array)
+
+`pairs(t)` is used where `t`'s inferred or declared shape is an array
+(`T[]` / `table<integer, V>`, or a positional-only table literal). Perf
+tier: `ipairs` (or a numeric `for`) iterates the array part in order without
+hashing, and `pairs` gives no ordering guarantee.
+
+```lua
+---@param xs number[]
+local function total(xs)
+  for _, x in pairs(xs) do end   -- LB0507 -> ipairs(xs)
+end
+```
+
+`luabox lint --fix` rewrites `pairs` to `ipairs` (machine-applicable). The
+rule stays silent when the shape is unknown or has non-array keys.
+";
+
+const LB0508: &str = "\
+# LB0508: empty `if ... then` body (empty-then)
+
+An `if`/`elseif` branch has an empty, comment-free body. Suspicious tier:
+either the body was forgotten, the condition is inverted, or the branch is
+dead and should be removed.
+
+```lua
+if ready then end          -- LB0508
+if ready then
+  -- TODO: handle later    -- NOT flagged: a comment documents intent
+end
+```
+
+Fill in the body, invert the condition and move the code, or delete the
+branch. A single explanatory comment suppresses the lint.
+";
+
 const LB1001: &str = "\
 # LB1001: unknown edition
 
@@ -741,8 +1012,10 @@ mod tests {
     fn seeded_codes_are_all_present() {
         for raw in [
             "LB0001", "LB0010", "LB0011", "LB0012", "LB0013", "LB0014", "LB0015", "LB0016",
-            "LB0300", "LB0301", "LB0302", "LB0303", "LB0304", "LB0305", "LB1001", "LB2001",
-            "LB2002", "LB2003", "LB2004", "LB2005", "LB2006", "LB2007", "LB2008", "LB2010",
+            "LB0300", "LB0301", "LB0302", "LB0303", "LB0304", "LB0305", "LB0306", "LB0500",
+            "LB0501", "LB0502", "LB0503", "LB0504", "LB0505", "LB0506", "LB0507", "LB0508",
+            "LB1001", "LB2001", "LB2002", "LB2003", "LB2004", "LB2005", "LB2006", "LB2007",
+            "LB2008", "LB2010",
         ] {
             let code: Code = raw.parse().unwrap();
             assert!(explain(&code).is_some(), "{raw} missing from registry");

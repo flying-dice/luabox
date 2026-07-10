@@ -111,6 +111,44 @@ pub enum TaskValue {
     Multiple(Vec<String>),
 }
 
+/// A lint severity level in `[lint]` (SPEC.md §9): the analog of clippy's
+/// `allow` / `warn` / `deny`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LintLevel {
+    /// Rule is off — no diagnostics.
+    Allow,
+    /// Rule fires at warning severity (does not fail the command).
+    Warn,
+    /// Rule fires at error severity (fails the command).
+    Deny,
+}
+
+/// The lint tier names a `[lint]` toggle may target (SPEC.md §9). Held as a
+/// local list rather than a dependency on `luabox-lint` — Distribution never
+/// depends on the Semantics/Frontend crates (SPEC.md §16, acyclic graph).
+pub const LINT_TIERS: &[&str] = &["correctness", "suspicious", "perf", "style", "pedantic"];
+
+/// `[lint]` (SPEC.md §9): per-rule and per-tier level overrides plus a global
+/// allow-list for the `global-write` rule.
+///
+/// Rule ids live in `luabox-lint` (which this crate must not depend on), so
+/// keys that are neither `globals` nor a [`LINT_TIERS`] name are recorded as
+/// rule-id overrides without validating the id here; `luabox-lint` resolves
+/// (and can diagnose) unknown ids when it consumes the config.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct Lint {
+    /// Extra names the `global-write` rule treats as intentional globals.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub globals: Vec<String>,
+    /// Tier-level overrides, keyed by a [`LINT_TIERS`] name.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub tiers: BTreeMap<String, LintLevel>,
+    /// Rule-id overrides (`unused-local = "allow"`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub rules: BTreeMap<String, LintLevel>,
+}
+
 /// `[workspace]` (SPEC.md §5).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -135,6 +173,8 @@ pub struct Manifest {
     pub dev_dependencies: BTreeMap<String, Dependency>,
     pub tasks: BTreeMap<String, TaskValue>,
     pub workspace: Option<Workspace>,
+    /// `[lint]` configuration (SPEC.md §9).
+    pub lint: Lint,
     pub(super) document: toml_edit::DocumentMut,
 }
 
