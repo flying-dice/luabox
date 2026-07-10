@@ -1,15 +1,603 @@
-//! Unified type IR and inference engine — **Semantics** bounded context
+//! Unified type IR and checker — **Semantics** bounded context
 //! (SPEC.md §3, §16).
 //!
-//! One internal type IR fed by two front-ends: LuaCATS annotations
-//! (`---@class` etc., full compatibility non-negotiable) and the `.lb`
-//! shape DSL (SHAPES.md — sealed structs, traits, coherence). One checker,
-//! no parallel type system; interop between the front-ends is total.
+//! One internal type IR fed (eventually) by two front-ends: LuaCATS
+//! annotations (`---@class` etc., full compatibility non-negotiable) and
+//! the `.lb` shape DSL (SHAPES.md). One checker, no parallel type system.
 //!
-//! Bidirectional inference, flow-sensitive narrowing, literal types,
-//! generics with constraints. Rich table inference is a hard requirement:
-//! tables never degrade to a bare `table` type (SPEC.md §3).
-//! Strictness ladder: `none` → `warn` → `strict`; shape rules are hard
-//! errors at every level.
+//! **P0 scope (this crate today):** the annotation-driven subset behind
+//! `luabox check` — types come from LuaCATS annotations and literals only.
+//! The load-bearing design decision is the *structural* table
+//! representation ([`ty::TableTy`]): field map + indexers + array part,
+//! never an opaque `table` primitive, so checking a table literal against
+//! a `---@class` parameter produces field-level diagnostics and P1's rich
+//! table inference (SPEC.md §3 hard requirement) extends this IR instead
+//! of replacing it.
 //!
-//! Status: placeholder — P1.
+//! **P1 (TODO):** bidirectional inference, flow-sensitive narrowing,
+//! metatable/`__index` resolution, method calls, generics as real type
+//! variables, cross-file `require` resolution over the salsa DB, `.lb`
+//! shape checking, function subtyping.
+//!
+//! Diagnostics carry `LB03xx` codes registered in `luabox-diag` (this
+//! crate depends on it the way rustc crates depend on `rustc_errors`).
+
+mod assign;
+mod check;
+mod env;
+mod lower;
+pub mod ty;
+
+pub use assign::assignable;
+pub use env::TypeEnv;
+
+use luabox_diag::Diagnostic;
+use luabox_syntax::lua;
+
+/// The strictness ladder (SPEC.md §3): `none` → `warn` → `strict`.
+///
+/// - `None`: type diagnostics are suppressed entirely.
+/// - `Warn`: mismatches are warnings; `unknown` is assignable both ways.
+/// - `Strict`: mismatches are errors; `unknown -> T` is itself a mismatch
+///   (untyped = `unknown`, not `any`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Strictness {
+    /// No type diagnostics.
+    None,
+    /// Warning severity, permissive `unknown`.
+    Warn,
+    /// Error severity, strict `unknown`.
+    Strict,
+}
+
+impl Strictness {
+    /// Map the manifest's `[types] strict` boolean: `true` → strict,
+    /// `false` → warn. TODO: surface the full three-level ladder (plus
+    /// per-file overrides) in the manifest; `None` is currently only
+    /// reachable programmatically.
+    #[must_use]
+    pub fn from_manifest_flag(strict: bool) -> Self {
+        if strict {
+            Strictness::Strict
+        } else {
+            Strictness::Warn
+        }
+    }
+}
+
+/// Typecheck one parsed file against its own annotations.
+///
+/// `file` names the file in diagnostic spans. Cross-file `require`
+/// resolution is P1 — every file is checked against a per-file
+/// environment.
+#[must_use]
+pub fn check_file(parse: &lua::Parse, file: &str, strictness: Strictness) -> Vec<Diagnostic> {
+    if strictness == Strictness::None {
+        return Vec::new();
+    }
+    let env = TypeEnv::build(parse);
+    check::run(parse, &env, file, strictness == Strictness::Strict)
+}
+
+#[cfg(test)]
+mod tests {
+    use luabox_diag::Severity;
+    use luabox_syntax::lua::{Dialect, parse};
+
+    use super::*;
+
+    fn check(source: &str, strictness: Strictness) -> Vec<Diagnostic> {
+        let parse = parse(source, Dialect::Lua54);
+        assert_eq!(parse.errors(), &[], "fixture must parse cleanly");
+        check_file(&parse, "test.lua", strictness)
+    }
+
+    fn codes(source: &str, strictness: Strictness) -> Vec<String> {
+        check(source, strictness)
+            .iter()
+            .map(|d| d.code.to_string())
+            .collect()
+    }
+
+    fn strict_codes(source: &str) -> Vec<String> {
+        codes(source, Strictness::Strict)
+    }
+
+    // --- rule a: call sites -------------------------------------------
+
+    #[test]
+    fn call_argument_type_mismatch() {
+        let src = "\
+---@param n number
+local function double(n)
+  return n * 2
+end
+double(\"nope\")
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn call_with_matching_literal_is_clean() {
+        let src = "\
+---@param n number
+---@param s string
+local function f(n, s) end
+f(2, \"ok\")
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn arity_too_few_and_too_many() {
+        let src = "\
+---@param a number
+---@param b number
+local function f(a, b) end
+f(1)
+f(1, 2, 3)
+";
+        assert_eq!(strict_codes(src), vec!["LB0301", "LB0301"]);
+    }
+
+    #[test]
+    fn optional_params_and_varargs_relax_arity() {
+        let src = "\
+---@param a number
+---@param b? number
+local function f(a, b) end
+---@param a number
+---@param ... string
+local function g(a, ...) end
+f(1)
+f(1, 2)
+g(1)
+g(1, \"x\", \"y\")
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn vararg_arguments_are_typechecked() {
+        let src = "\
+---@param a number
+---@param ... string
+local function g(a, ...) end
+g(1, \"x\", 2)
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn nil_satisfies_optional_param() {
+        let src = "\
+---@param a number
+---@param b? string
+local function f(a, b) end
+f(1, nil)
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn annotated_local_flows_into_call() {
+        let src = "\
+---@param n number
+local function f(n) end
+---@type string
+local s = \"x\"
+f(s)
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn annotated_call_result_flows_into_call() {
+        let src = "\
+---@return string
+local function name() return \"x\" end
+---@param n number
+local function f(n) end
+f(name())
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn function_reference_argument() {
+        let src = "\
+---@param cb fun(x: number)
+local function on(cb) end
+---@param x number
+local function handler(x) end
+on(handler)
+on(3)
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn multi_return_expansion_fills_arity() {
+        let src = "\
+---@return number, string
+local function pair() return 1, \"x\" end
+---@param a number
+---@param b string
+local function f(a, b) end
+f(pair())
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn unknown_callee_is_never_checked() {
+        assert_eq!(strict_codes("print(1, 2, 3)\n"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn dotted_function_names_resolve() {
+        let src = "\
+local M = {}
+---@param n number
+function M.double(n)
+  return n * 2
+end
+M.double(\"no\")
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
+    // --- table literals against class shapes ----------------------------
+
+    const POINT: &str = "\
+---@class Point
+---@field x number
+---@field y number
+---@field label? string
+
+---@param p Point
+local function use(p) end
+";
+
+    #[test]
+    fn table_literal_missing_required_field() {
+        let src = format!("{POINT}use({{ x = 1 }})\n");
+        let diags = check(&src, Strictness::Strict);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code.to_string(), "LB0302");
+        assert!(diags[0].message.contains("`y`"), "{}", diags[0].message);
+    }
+
+    #[test]
+    fn table_literal_unknown_field() {
+        let src = format!("{POINT}use({{ x = 1, y = 2, z = 3 }})\n");
+        let diags = check(&src, Strictness::Strict);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code.to_string(), "LB0303");
+        assert!(diags[0].message.contains("`z`"), "{}", diags[0].message);
+    }
+
+    #[test]
+    fn table_literal_field_type_mismatch() {
+        let src = format!("{POINT}use({{ x = 1, y = \"two\" }})\n");
+        let diags = check(&src, Strictness::Strict);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code.to_string(), "LB0300");
+    }
+
+    #[test]
+    fn table_literal_optional_field_may_be_absent() {
+        let src = format!("{POINT}use({{ x = 1, y = 2 }})\n");
+        assert_eq!(strict_codes(&src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn each_field_problem_is_its_own_diagnostic() {
+        let src = format!("{POINT}use({{ y = \"two\", z = 3 }})\n");
+        let mut found: Vec<String> = strict_codes(&src);
+        found.sort();
+        assert_eq!(found, vec!["LB0300", "LB0302", "LB0303"]);
+    }
+
+    #[test]
+    fn inherited_fields_count() {
+        let src = "\
+---@class Base
+---@field id number
+
+---@class Derived: Base
+---@field name string
+
+---@param d Derived
+local function f(d) end
+f({ name = \"x\" })
+f({ id = 1, name = \"x\" })
+";
+        assert_eq!(strict_codes(src), vec!["LB0302"]);
+    }
+
+    #[test]
+    fn indexer_keeps_class_open() {
+        let src = "\
+---@class Bag
+---@field size number
+---@field [string] boolean
+
+---@param b Bag
+local function f(b) end
+f({ size = 1, extra = true })
+f({ size = 1, extra = 3 })
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn array_items_checked_against_array_part() {
+        let src = "\
+---@param xs string[]
+local function f(xs) end
+f({ \"a\", \"b\" })
+f({ \"a\", 2 })
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn nested_table_literal_checked_field_by_field() {
+        let src = "\
+---@class Inner
+---@field n number
+
+---@class Outer
+---@field inner Inner
+
+---@param o Outer
+local function f(o) end
+f({ inner = { n = \"no\" } })
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
+    // --- rule b: annotated locals ----------------------------------------
+
+    #[test]
+    fn typed_local_initializer_checked() {
+        let src = "\
+---@type number
+local n = \"nope\"
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn typed_local_assignment_checked() {
+        let src = "\
+---@type number
+local n = 1
+n = \"nope\"
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn untyped_local_assignment_unchecked() {
+        let src = "\
+local n = 1
+n = \"fine\"
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn typed_local_table_literal_field_level() {
+        let src = "\
+---@class Cfg
+---@field port number
+
+---@type Cfg
+local cfg = { port = \"8080\" }
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
+    // --- rule c: returns ---------------------------------------------------
+
+    #[test]
+    fn return_type_mismatch() {
+        let src = "\
+---@return number
+local function f()
+  return \"nope\"
+end
+";
+        assert_eq!(strict_codes(src), vec!["LB0304"]);
+    }
+
+    #[test]
+    fn return_count_mismatch() {
+        let src = "\
+---@return number, string
+local function f()
+  return 1
+end
+---@return number
+local function g()
+  return 1, 2
+end
+";
+        assert_eq!(strict_codes(src), vec!["LB0304", "LB0304"]);
+    }
+
+    #[test]
+    fn nilable_missing_returns_are_fine() {
+        let src = "\
+---@return number, string?
+local function f()
+  return 1
+end
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn nested_unannotated_function_returns_unchecked() {
+        let src = "\
+---@return number
+local function f()
+  local g = function()
+    return \"inner is fine\"
+  end
+  g()
+  return 1
+end
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn annotated_param_flows_into_return_check() {
+        let src = "\
+---@param s string
+---@return number
+local function f(s)
+  return s
+end
+";
+        assert_eq!(strict_codes(src), vec!["LB0304"]);
+    }
+
+    // --- enums, aliases, LB0305 -----------------------------------------
+
+    #[test]
+    fn enum_member_satisfies_enum_param() {
+        let src = "\
+---@enum Color
+local Color = {
+  red = 1,
+  green = 2,
+}
+---@param c Color
+local function paint(c) end
+paint(Color.red)
+paint(2)
+paint(9)
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn alias_literal_union() {
+        let src = "\
+---@alias Mode \"fast\"|\"slow\"
+---@param m Mode
+local function run(m) end
+run(\"fast\")
+run(\"medium\")
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn unknown_type_name_reported() {
+        let src = "\
+---@param x Wibble
+local function f(x) end
+";
+        assert_eq!(strict_codes(src), vec!["LB0305"]);
+    }
+
+    #[test]
+    fn generic_params_do_not_report_lb0305() {
+        let src = "\
+---@generic T
+---@param x T
+---@return T
+local function id(x)
+  return x
+end
+id(1)
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    // --- strictness ladder -----------------------------------------------
+
+    #[test]
+    fn warn_mode_downgrades_severity() {
+        let src = "\
+---@param n number
+local function f(n) end
+f(\"no\")
+";
+        let warn = check(src, Strictness::Warn);
+        assert_eq!(warn.len(), 1);
+        assert_eq!(warn[0].severity, Severity::Warning);
+        let strict = check(src, Strictness::Strict);
+        assert_eq!(strict[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn unknown_argument_strict_vs_warn() {
+        let src = "\
+---@param n number
+local function f(n) end
+local x = tonumber(\"3\")
+f(x)
+";
+        // Warn: `unknown` flows freely. Strict: unknown -> number errors.
+        assert_eq!(codes(src, Strictness::Warn), Vec::<String>::new());
+        assert_eq!(codes(src, Strictness::Strict), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn none_suppresses_everything() {
+        let src = "\
+---@param n number
+local function f(n) end
+f(\"no\")
+";
+        assert_eq!(codes(src, Strictness::None), Vec::<String>::new());
+    }
+
+    #[test]
+    fn strictness_from_manifest_flag() {
+        assert_eq!(Strictness::from_manifest_flag(true), Strictness::Strict);
+        assert_eq!(Strictness::from_manifest_flag(false), Strictness::Warn);
+    }
+
+    // --- end to end ---------------------------------------------------------
+
+    #[test]
+    fn clean_annotated_file_has_no_diagnostics() {
+        let src = "\
+---@class Greeter
+---@field name string
+---@field excited? boolean
+
+---@param g Greeter
+---@return string
+local function greet(g)
+  return g.name
+end
+
+---@type Greeter
+local g = { name = \"lua\" }
+greet(g)
+greet({ name = \"world\", excited = true })
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn diagnostics_carry_file_and_span() {
+        let src = "\
+---@param n number
+local function f(n) end
+f(\"no\")
+";
+        let diags = check(src, Strictness::Strict);
+        let label = diags[0].primary_label().expect("primary label");
+        assert_eq!(label.span.file, "test.lua");
+        assert_eq!(&src[label.span.range.clone()], "\"no\"");
+    }
+}

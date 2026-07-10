@@ -1,4 +1,3 @@
-@wip
 Feature: Dialect-legality validation
   SPEC.md §2 + §2.1 — the parser accepts the union of every Lua dialect's
   grammar; `luabox check` diagnoses constructs that parsed but are illegal

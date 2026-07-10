@@ -61,6 +61,36 @@ static REGISTRY: &[Entry] = &[
         explain: LB0016,
     },
     Entry {
+        code: Code::new(300),
+        title: "type mismatch",
+        explain: LB0300,
+    },
+    Entry {
+        code: Code::new(301),
+        title: "wrong argument count",
+        explain: LB0301,
+    },
+    Entry {
+        code: Code::new(302),
+        title: "missing required field",
+        explain: LB0302,
+    },
+    Entry {
+        code: Code::new(303),
+        title: "unknown field",
+        explain: LB0303,
+    },
+    Entry {
+        code: Code::new(304),
+        title: "return count/type mismatch",
+        explain: LB0304,
+    },
+    Entry {
+        code: Code::new(305),
+        title: "unknown type name in annotation",
+        explain: LB0305,
+    },
+    Entry {
         code: Code::new(1001),
         title: "unknown edition",
         explain: LB1001,
@@ -296,6 +326,140 @@ Raise `edition` to `5.3` or later, or spell out the encoded bytes directly.
 an older target.
 ";
 
+const LB0300: &str = "\
+# LB0300: type mismatch
+
+A value flowed into a slot whose annotated type does not accept it: an
+argument against its `---@param`, an initializer or assignment against a
+`---@type` local, or a table-literal field against its `---@field` type.
+
+```lua
+---@param n number
+local function double(n) return n * 2 end
+
+double(\"nope\")   -- LB0300: expected `number`, found `\"nope\"`
+```
+
+Argument and value types come from annotations and literals (P0 subset):
+literals, table constructors, `---@type` locals, references to and calls of
+annotated functions. Everything else is `unknown` — in warn mode `unknown`
+flows freely; in strict mode (`[types] strict = true`) passing `unknown`
+where a concrete type is expected is itself this error, because untyped
+code is `unknown`, not `any` (SPEC.md §3).
+
+Fix the value, fix the annotation, or annotate the value's source so the
+checker can see its type.
+";
+
+const LB0301: &str = "\
+# LB0301: wrong argument count
+
+A call to an annotated function supplies fewer arguments than its
+non-optional `---@param`s require, or more than its parameter list (plus
+`...`) accepts.
+
+```lua
+---@param a number
+---@param b? number
+local function f(a, b) end
+
+f()          -- LB0301: takes at least 1 argument
+f(1, 2, 3)   -- LB0301: takes at most 2 arguments
+```
+
+Optional parameters (`---@param b? T`) and a `...` vararg relax the limit.
+A call or `...` in the final argument position counts as open-ended: too-few
+diagnostics are suppressed because its value count is unknowable statically.
+";
+
+const LB0302: &str = "\
+# LB0302: missing required field
+
+A table literal checked against a `---@class` (or table type) omits a field
+the type requires. Fields are required unless declared optional
+(`---@field name? T`) or nilable (`T?`/`T|nil`).
+
+```lua
+---@class Point
+---@field x number
+---@field y number
+
+---@param p Point
+local function use(p) end
+
+use({ x = 1 })   -- LB0302: missing required field `y`
+```
+
+Each missing field is reported separately. Add the field, or mark it
+optional in the class declaration.
+";
+
+const LB0303: &str = "\
+# LB0303: unknown field
+
+A table literal checked against a `---@class` (or table type) contains a
+field the type does not declare. Following LuaLS, unknown fields on a class
+*literal* are diagnosed — the class is closed for literals unless it
+declares an indexer (`---@field [string] T`), which accepts (and types) the
+extras. Plain assignability between already-constructed tables stays
+width-based: extra fields there are fine.
+
+```lua
+---@class Point
+---@field x number
+---@field y number
+
+---@param p Point
+local function use(p) end
+
+use({ x = 1, y = 2, z = 3 })   -- LB0303: unknown field `z`
+```
+
+Remove the field, add it to the class, or open the class with an indexer.
+";
+
+const LB0304: &str = "\
+# LB0304: return count/type mismatch
+
+A `return` inside a function annotated with `---@return` returns the wrong
+number of values, or a value of the wrong type.
+
+```lua
+---@return number, string
+local function pair()
+  return 1        -- LB0304: expected 2 return values
+end
+
+---@return number
+local function n()
+  return \"no\"   -- LB0304: expected `number`, found `\"no\"`
+end
+```
+
+Trailing declared returns that accept `nil` (`T?`) may be omitted. A call
+or `...` in the final position is open-ended and suppresses the too-few
+check. `---@return T ...` allows any number of extra values.
+";
+
+const LB0305: &str = "\
+# LB0305: unknown type name in annotation
+
+An annotation references a type name that is neither built-in (`nil`,
+`boolean`, `number`, `integer`, `string`, `table`, `function`, `thread`,
+`userdata`, `any`, `unknown`, ...) nor declared in the file as a
+`---@class`, `---@alias`, or `---@enum`.
+
+```lua
+---@param x Wibble   -- LB0305: unknown type name `Wibble`
+local function f(x) end
+```
+
+Declare the type, fix the spelling, or — if it comes from another module —
+note that cross-file annotation resolution (`require`, `---@meta`
+definition packages) lands in P1; until then each file is checked against
+its own declarations. The unresolved type is treated as `unknown`.
+";
+
 const LB1001: &str = "\
 # LB1001: unknown edition
 
@@ -416,8 +580,8 @@ mod tests {
     fn seeded_codes_are_all_present() {
         for raw in [
             "LB0001", "LB0010", "LB0011", "LB0012", "LB0013", "LB0014", "LB0015", "LB0016",
-            "LB1001", "LB2001", "LB2002", "LB2003", "LB2004", "LB2005", "LB2006", "LB2007",
-            "LB2008", "LB2010",
+            "LB0300", "LB0301", "LB0302", "LB0303", "LB0304", "LB0305", "LB1001", "LB2001",
+            "LB2002", "LB2003", "LB2004", "LB2005", "LB2006", "LB2007", "LB2008", "LB2010",
         ] {
             let code: Code = raw.parse().unwrap();
             assert!(explain(&code).is_some(), "{raw} missing from registry");

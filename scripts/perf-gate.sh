@@ -3,11 +3,8 @@
 # 100-kLOC corpus < 1 s warm (LSP keystroke-to-diagnostics gate is future
 # work, not covered here).
 #
-# `luabox check` doesn't exist yet (ticket #6), so this harness gates
-# `luabox fmt --check` on the same corpus as a parse+format throughput
-# proxy. Search for "CHECK GATE" below to flip on the real gate once
-# `check` lands: uncomment that block (and drop the fmt proxy block, or
-# keep both during the overlap).
+# Gates: cold start, `fmt --check` throughput (kept as a wider safety
+# net), and the real `check` gate (live since ticket #6).
 #
 # Env:
 #   LUABOX_PERF_FACTOR   float multiplier applied to every budget, for
@@ -29,7 +26,7 @@ factor="${LUABOX_PERF_FACTOR:-1.0}"
 
 cold_start_budget_base_ms=50
 fmt_budget_base_ms=2000
-# check_budget_base_ms=1000   # CHECK GATE — see block near the bottom
+check_budget_base_ms=1000
 
 # Plain `awk` (POSIX, present on every CI/dev box we target) does the
 # float multiply; everything else is integer ms from here on.
@@ -121,25 +118,22 @@ else
 fi
 
 # --- CHECK GATE ------------------------------------------------------------
-# SPEC.md §16.1: `check` on the 100-kLOC corpus < 1 s warm. Flip on once
-# ticket #6 (`luabox check`) merges: uncomment this block. Consider
-# deleting the fmt --check proxy block above once this is live, or keep
-# both during the overlap for a wider safety net.
-#
-# check_budget=$(awk -v b="$check_budget_base_ms" -v f="$factor" 'BEGIN { printf "%d", b * f }')
-# echo
-# echo "perf-gate: check throughput on corpus (warm)..."
-# ( cd "$corpus_dir" && "$luabox_bin" check >/dev/null 2>&1 ) || true
-# start=$(date +%s%N)
-# ( cd "$corpus_dir" && "$luabox_bin" check >/dev/null 2>&1 ) || true
-# end=$(date +%s%N)
-# check_ms=$(( (end - start) / 1000000 ))
-# if [[ "$check_ms" -lt "$check_budget" ]]; then
-#   echo "PASS check (warm): ${check_ms} ms < ${check_budget} ms"
-# else
-#   echo "FAIL check (warm): ${check_ms} ms >= ${check_budget} ms"
-#   fail=1
-# fi
+# SPEC.md §16.1: `check` on the 100-kLOC corpus < 1 s warm. Live since
+# ticket #6; the fmt --check proxy above stays as a wider safety net.
+check_budget=$(awk -v b="$check_budget_base_ms" -v f="$factor" 'BEGIN { printf "%d", b * f }')
+echo
+echo "perf-gate: check throughput on corpus (warm)..."
+( cd "$corpus_dir" && "$luabox_bin" check >/dev/null 2>&1 ) || true
+start=$(date +%s%N)
+( cd "$corpus_dir" && "$luabox_bin" check >/dev/null 2>&1 ) || true
+end=$(date +%s%N)
+check_ms=$(( (end - start) / 1000000 ))
+if [[ "$check_ms" -lt "$check_budget" ]]; then
+  echo "PASS check (warm): ${check_ms} ms < ${check_budget} ms"
+else
+  echo "FAIL check (warm): ${check_ms} ms >= ${check_budget} ms"
+  fail=1
+fi
 
 echo
 if [[ "$fail" -eq 0 ]]; then

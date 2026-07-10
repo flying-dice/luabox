@@ -5,11 +5,8 @@
     (CI runs the bash version on ubuntu-latest; this is for local dev use).
 
 .DESCRIPTION
-    `luabox check` doesn't exist yet (ticket #6), so this harness gates
-    `luabox fmt --check` on the same corpus as a parse+format throughput
-    proxy. Search for "CHECK GATE" below to flip on the real gate once
-    `check` lands: uncomment that block (and drop the fmt proxy block, or
-    keep both during the overlap).
+    Gates: cold start, `fmt --check` throughput (kept as a wider safety
+    net), and the real `check` gate (live since ticket #6).
 
 .PARAMETER Factor
     Multiplier applied to every budget, for slow/loaded machines
@@ -41,7 +38,7 @@ Set-Location $repoRoot
 
 $ColdStartBudgetBaseMs = 50
 $FmtBudgetBaseMs = 2000
-# $CheckBudgetBaseMs = 1000   # CHECK GATE — see block near the bottom
+$CheckBudgetBaseMs = 1000
 
 $coldStartBudget = $ColdStartBudgetBaseMs * $Factor
 $fmtBudget = $FmtBudgetBaseMs * $Factor
@@ -146,30 +143,27 @@ strict = true
     }
 
     # --- CHECK GATE ----------------------------------------------------------
-    # SPEC.md §16.1: `check` on the 100-kLOC corpus < 1 s warm. Flip on
-    # once ticket #6 (`luabox check`) merges: uncomment this block.
-    # Consider deleting the fmt --check proxy block above once this is
-    # live, or keep both during the overlap for a wider safety net.
-    #
-    # $checkBudget = $CheckBudgetBaseMs * $Factor
-    # Write-Host ""
-    # Write-Host "perf-gate: check throughput on corpus (warm)..."
-    # Push-Location $corpusDir
-    # try {
-    #     & $luaboxBin check *> $null
-    #     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    #     & $luaboxBin check *> $null
-    #     $sw.Stop()
-    # } finally {
-    #     Pop-Location
-    # }
-    # $checkMs = $sw.Elapsed.TotalMilliseconds
-    # if ($checkMs -lt $checkBudget) {
-    #     Write-Host ("PASS check (warm): {0:N1} ms < {1:N1} ms" -f $checkMs, $checkBudget)
-    # } else {
-    #     Write-Host ("FAIL check (warm): {0:N1} ms >= {1:N1} ms" -f $checkMs, $checkBudget)
-    #     $fail = $true
-    # }
+    # SPEC.md §16.1: `check` on the 100-kLOC corpus < 1 s warm. Live since
+    # ticket #6; the fmt --check proxy above stays as a wider safety net.
+    $checkBudget = $CheckBudgetBaseMs * $Factor
+    Write-Host ""
+    Write-Host "perf-gate: check throughput on corpus (warm)..."
+    Push-Location $corpusDir
+    try {
+        & $luaboxBin check *> $null
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        & $luaboxBin check *> $null
+        $sw.Stop()
+    } finally {
+        Pop-Location
+    }
+    $checkMs = $sw.Elapsed.TotalMilliseconds
+    if ($checkMs -lt $checkBudget) {
+        Write-Host ("PASS check (warm): {0:N1} ms < {1:N1} ms" -f $checkMs, $checkBudget)
+    } else {
+        Write-Host ("FAIL check (warm): {0:N1} ms >= {1:N1} ms" -f $checkMs, $checkBudget)
+        $fail = $true
+    }
 
     Write-Host ""
     if (-not $fail) {

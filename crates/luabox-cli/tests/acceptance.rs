@@ -147,6 +147,80 @@ fn stdout_contains(world: &mut AcceptanceWorld, needle: String) {
     );
 }
 
+// --- project fixtures (check.feature, dialect-validation.feature) --------
+
+/// Write a minimal `luabox.toml` for a scenario project.
+fn write_manifest(world: &AcceptanceWorld, edition: &str, strict: bool) {
+    let manifest = format!(
+        "[package]\n\
+         name = \"fixture\"\n\
+         version = \"0.1.0\"\n\
+         edition = \"{edition}\"\n\
+         \n\
+         [types]\n\
+         strict = {strict}\n"
+    );
+    std::fs::write(world.dir.path().join("luabox.toml"), manifest)
+        .expect("failed to write luabox.toml");
+}
+
+#[given(expr = "a project with edition {string}")]
+fn project_with_edition(world: &mut AcceptanceWorld, edition: String) {
+    write_manifest(world, &edition, false);
+}
+
+#[given(expr = "a strict project with edition {string}")]
+fn strict_project_with_edition(world: &mut AcceptanceWorld, edition: String) {
+    write_manifest(world, &edition, true);
+}
+
+/// A one-line Lua source (used by the dialect-legality Examples tables).
+/// Captured with a regex so backslash escapes in the source (`"a\x41"`)
+/// arrive verbatim.
+#[given(regex = r"^a Lua file containing '(.*)'$")]
+fn lua_file_containing(world: &mut AcceptanceWorld, source: String) {
+    let path = world.dir.path().join("src").join("main.lua");
+    std::fs::create_dir_all(path.parent().expect("src parent"))
+        .expect("failed to create src directory");
+    std::fs::write(&path, format!("{source}\n")).expect("failed to write src/main.lua");
+}
+
+#[then(expr = "diagnostic {word} is reported")]
+fn diagnostic_reported(world: &mut AcceptanceWorld, code: String) {
+    let stdout = world.stdout();
+    assert!(
+        stdout.contains(&code),
+        "expected diagnostic `{code}`; stdout:\n{stdout}\nstderr:\n{}",
+        world.stderr()
+    );
+}
+
+/// The dialect-legality codes (SPEC.md §2.1). "No dialect diagnostic"
+/// means none of these — type/parse diagnostics are out of scope for the
+/// dialect matrix.
+const DIALECT_CODES: &[&str] = &[
+    "LB0010", "LB0011", "LB0012", "LB0013", "LB0014", "LB0015", "LB0016",
+];
+
+#[then("no dialect diagnostic is reported")]
+fn no_dialect_diagnostic(world: &mut AcceptanceWorld) {
+    let output = format!("{}\n{}", world.stdout(), world.stderr());
+    for code in DIALECT_CODES {
+        assert!(
+            !output.contains(code),
+            "expected no dialect diagnostic, found `{code}`; output:\n{output}"
+        );
+    }
+}
+
+#[then("stdout is valid JSON")]
+fn stdout_is_valid_json(world: &mut AcceptanceWorld) {
+    let stdout = world.stdout();
+    if let Err(error) = serde_json::from_str::<serde_json::Value>(&stdout) {
+        panic!("stdout is not valid JSON: {error}\nstdout:\n{stdout}");
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // @wip gates feature files written ahead of implementation (spec-first,

@@ -3,6 +3,7 @@
 //! Thin frontend over the bounded-context crates: owns UX, argument parsing,
 //! and diagnostic rendering; none of the domain logic.
 
+mod check_cmd;
 mod fmt_cmd;
 mod scaffold;
 
@@ -62,9 +63,12 @@ enum Command {
     Update { package: Option<String> },
     /// Typecheck the project
     Check {
-        /// Check against a ship target instead of the edition
+        /// Also validate dialect legality against a ship target
         #[arg(long)]
         target: Option<String>,
+        /// Output format: human, json, sarif, github, gitlab
+        #[arg(long, default_value = "human")]
+        format: String,
     },
     /// Lint the project
     Lint {
@@ -153,7 +157,9 @@ fn main() -> anyhow::Result<()> {
         Command::Remove { .. } => unimplemented("remove", "P2"),
         Command::Install => unimplemented("install", "P2"),
         Command::Update { .. } => unimplemented("update", "P2"),
-        Command::Check { .. } => unimplemented("check", "P0"),
+        Command::Check { target, format } => {
+            check_cmd::run(&std::env::current_dir()?, target.as_deref(), &format)
+        }
         Command::Lint { .. } => unimplemented("lint", "P1"),
         Command::Fmt { check } => fmt_cmd::run(&std::env::current_dir()?, check),
         Command::Build { .. } => unimplemented("build", "P3"),
