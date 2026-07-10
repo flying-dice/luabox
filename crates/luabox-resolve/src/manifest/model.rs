@@ -57,7 +57,7 @@ pub struct Types {
     /// Ambient definition packages (`*.d.lua` / `---@meta` modules).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub defs: Vec<String>,
-    /// `.lb` shape search directories (SHAPES.md §6, tier 2 of `---@use` resolution).
+    /// `.luab` shape search directories (SHAPES.md §6, tier 2 of `---@use` resolution).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub shape_paths: Vec<String>,
     /// Shape modules this package exports for dependents (SHAPES.md §6, tier 3).

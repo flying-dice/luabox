@@ -1,11 +1,11 @@
-//! `.lb` shape support (SHAPES.md): loading, lowering into the unified IR,
+//! `.luab` shape support (SHAPES.md): loading, lowering into the unified IR,
 //! `---@use` resolution, and the `LB2xxx` binding checks.
 //!
 //! Two front-ends, one IR (SHAPES.md invariant 2): shape declarations lower
 //! into the same [`crate::ty::Ty`] the LuaCATS front-end produces — structs
 //! become *sealed* structural tables, traits become method-set interfaces,
-//! aliases expand. Interop is total: a `.lb` struct is usable from
-//! `---@param`/`---@field`, and a `---@class` table can satisfy a `.lb`
+//! aliases expand. Interop is total: a `.luab` struct is usable from
+//! `---@param`/`---@field`, and a `---@class` table can satisfy a `.luab`
 //! trait via `---@impl`.
 
 mod check;

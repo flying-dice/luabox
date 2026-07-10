@@ -20,7 +20,7 @@
 //!    dialect-validated under the *target*; any residue (e.g. hex floats
 //!    targeting 5.1, which have no lowering rule) fails the build rather
 //!    than shipping a file the target runtime would reject.
-//! 5. **Emit** to the out directory preserving relative paths. `.lb` shape
+//! 5. **Emit** to the out directory preserving relative paths. `.luab` shape
 //!    files never reach the output (SHAPES.md §1 invariant 3 — they are
 //!    not even candidates: only the `.lua` file list is emitted), and
 //!    `*.d.lua` definition files are analyser-only surfaces, also skipped.
@@ -126,7 +126,7 @@ pub fn run(cwd: &Path, target: Option<&str>, out: Option<&Path>) -> anyhow::Resu
 /// Lower one file. Returns the output bytes (when emittable) plus the
 /// diagnostics to render. `edition == target` is a byte-identical copy —
 /// no lowering, no reprint (SHAPES.md §1 invariant 1 keeps this
-/// shape-blind by construction: `.lb` files play no part here).
+/// shape-blind by construction: `.luab` files play no part here).
 fn lower_one(
     source: &str,
     rel: &str,

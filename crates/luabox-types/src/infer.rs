@@ -42,7 +42,7 @@
 //! *fully known*: never for shapes that escaped into unanalyzed code
 //! (arguments to unmodeled calls), shapes with indexers or dynamic-key
 //! writes, shapes whose metatable is unresolved, or carriers bound to a
-//! `---@class`/`.lb` struct (their declarations govern instead). Unknown
+//! `---@class`/`.luab` struct (their declarations govern instead). Unknown
 //! stays `unknown` — never `any`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -198,7 +198,7 @@ struct ShapeData {
     /// `setmetatable` was called with an untracked metatable — field
     /// lookups can no longer be proven absent.
     meta_unknown: bool,
-    /// The `---@class`/`.lb` struct name bound to this table's declaration,
+    /// The `---@class`/`.luab` struct name bound to this table's declaration,
     /// when any. Field lookups consult the declaration; `LB0306` defers to
     /// the declaration's own diagnostics.
     declared: Option<String>,

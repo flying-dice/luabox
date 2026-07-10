@@ -1,6 +1,6 @@
 /// 2D geometry primitives and the shapes they satisfy.
 ///
-/// This is a `.lb` shape module: Rust struct/trait syntax in a separate file,
+/// This is a `.luab` shape module: Rust struct/trait syntax in a separate file,
 /// analyser-only, never on the require path and never in build output. Plain
 /// Lua binds to these declarations with `---@use` / `---@struct` / `---@impl`.
 /// A point in 2D space. `label` is optional (the `?` suffix).

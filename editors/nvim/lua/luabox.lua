@@ -1,7 +1,7 @@
 -- luabox — Neovim integration
 -- ============================================================================
 -- Wires the `luabox lsp` language server into Neovim and teaches the editor
--- about `.lb` shape files (filetype + `//` comment string).
+-- about `.luab` shape files (filetype + `//` comment string).
 --
 -- Requires a `luabox` binary on your PATH (or set `opts.cmd` below). Build it
 -- from the repo root with `cargo build --release` (binary: target/release/luabox).
@@ -9,7 +9,7 @@
 -- This file lives in a regular Neovim plugin layout (editors/nvim is the
 -- plugin root: lua/, syntax/, ftdetect/, ftplugin/), so `editors/nvim` can be
 -- put on the runtimepath directly — via a plugin manager or `:packadd`. The
--- syntax/ftdetect files give `.lb` buffers fallback highlighting even before
+-- syntax/ftdetect files give `.luab` buffers fallback highlighting even before
 -- (or without) `setup()`; the LSP's semantic tokens layer on top.
 --
 -- Usage (Neovim 0.11+, no plugins needed):
@@ -34,12 +34,12 @@ local M = {}
 --- @field root_markers? string[] Project root markers. Default {"luabox.toml",".git"}.
 --- @field settings?   table     Server settings forwarded to the LSP.
 
---- Register `.lb` filetype detection and the shape comment string.
+--- Register `.luab` filetype detection and the shape comment string.
 local function register_filetype()
-  -- `.lb` files are the luabox shape DSL, not Lua. Give them their own filetype.
+  -- `.luab` files are the luabox shape DSL, not Lua. Give them their own filetype.
   vim.filetype.add({
     extension = {
-      lb = "luabox",
+      luab = "luabox",
     },
   })
 
@@ -88,8 +88,8 @@ return M
 -- ============================================================================
 -- Do NOT require this file for the snippet below — copy it into your config.
 --
---   -- `.lb` filetype + comment string
---   vim.filetype.add({ extension = { lb = "luabox" } })
+--   -- `.luab` filetype + comment string
+--   vim.filetype.add({ extension = { luab = "luabox" } })
 --   vim.api.nvim_create_autocmd("FileType", {
 --     pattern = "luabox",
 --     callback = function() vim.bo.commentstring = "// %s" end,

@@ -1,4 +1,4 @@
-//! Checking `.lua` binding tags against `.lb` shapes (SHAPES.md §4, §5).
+//! Checking `.lua` binding tags against `.luab` shapes (SHAPES.md §4, §5).
 //!
 //! Emits the `LB2xxx` family. Shape rules are **hard errors at every
 //! strictness level** — `---@struct`/`---@impl` are themselves the opt-in,
@@ -681,7 +681,7 @@ impl ShapeChecker<'_> {
             );
             return;
         };
-        // Interop: the implementing type may be a `.lb` struct or a
+        // Interop: the implementing type may be a `.luab` struct or a
         // LuaCATS `---@class`.
         if !self.scope.has_struct(&tag.struct_name) && !self.env.has_class(&tag.struct_name) {
             self.error(

@@ -19,7 +19,7 @@
 //!   table constructor field names, and `::label::`s (labels have no
 //!   standard token type, so they render as `variable`).
 //!
-//! **`.lb` shapes** (token walk over the shape tree):
+//! **`.luab` shapes** (token walk over the shape tree):
 //! - `struct`/`trait`/`impl`/`for`/`fn`/`type`/`use`/`self` keywords;
 //! - `///` doc comments get `documentation`, `//`+`/* */` stay `comment`;
 //! - declared names: structs `class`, traits `interface`, aliases `type`,
@@ -347,9 +347,9 @@ fn is_lua_operator(kind: SyntaxKind) -> bool {
     )
 }
 
-// === .lb shapes ===========================================================
+// === .luab shapes ===========================================================
 
-/// Semantic tokens for one `.lb` shape file. Parse errors do not disable
+/// Semantic tokens for one `.luab` shape file. Parse errors do not disable
 /// highlighting — the tree is lossless, so whatever parsed still colours.
 #[must_use]
 pub fn lb_tokens(text: &str) -> Vec<SemanticToken> {

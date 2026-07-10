@@ -39,9 +39,9 @@ pub(crate) struct EnumDef {
 pub struct TypeEnv {
     classes: BTreeMap<String, ClassDef>,
     enums: BTreeMap<String, EnumDef>,
-    /// `.lb` structs in scope (via `---@use`): sealed structural shapes.
+    /// `.luab` structs in scope (via `---@use`): sealed structural shapes.
     shape_structs: BTreeMap<String, TableTy>,
-    /// `.lb` traits in scope: interfaces as method-set tables.
+    /// `.luab` traits in scope: interfaces as method-set tables.
     shape_traits: BTreeMap<String, TableTy>,
     /// Annotated functions by (dotted) name — `f`, `M.helper`.
     functions: BTreeMap<String, FunctionTy>,
@@ -72,7 +72,7 @@ impl TypeEnv {
     }
 
     /// Build the environment from pre-harvested annotations, optionally
-    /// with `.lb` shapes in scope (interop: shape structs/traits/aliases
+    /// with `.luab` shapes in scope (interop: shape structs/traits/aliases
     /// become referenceable from LuaCATS annotations, and resolvable
     /// through [`TypeEnv::resolve_named`] / [`TypeEnv::class_shape`]).
     ///
@@ -466,7 +466,7 @@ impl TypeEnv {
     // --- lookups -----------------------------------------------------
 
     /// The merged structural shape of a class: parents first (depth-first),
-    /// own members overriding, with a cycle guard. `.lb` structs and
+    /// own members overriding, with a cycle guard. `.luab` structs and
     /// traits in scope resolve here too (one checker, one IR).
     pub(crate) fn class_shape(&self, name: &str) -> Option<TableTy> {
         if !self.classes.contains_key(name) {
@@ -511,7 +511,7 @@ impl TypeEnv {
     }
 
     /// Resolve a [`Ty::Named`] reference to its structural type: a class
-    /// (or `.lb` struct/trait) becomes its table shape, an enum the union
+    /// (or `.luab` struct/trait) becomes its table shape, an enum the union
     /// of its member values.
     pub(crate) fn resolve_named(&self, name: &str) -> Option<Ty> {
         if let Some(shape) = self.class_shape(name) {

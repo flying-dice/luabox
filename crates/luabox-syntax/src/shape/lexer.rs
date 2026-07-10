@@ -1,7 +1,7 @@
-//! Lossless lexer for `.lb` shape files (SHAPES.md §2–3).
+//! Lossless lexer for `.luab` shape files (SHAPES.md §2–3).
 //!
 //! Same invariant as the Lua lexer: tokens tile the input byte-for-byte.
-//! The `.lb` surface is small — no string or numeric literals exist in the
+//! The `.luab` surface is small — no string or numeric literals exist in the
 //! grammar; anything outside it becomes an [`ShapeSyntaxKind::ERROR`] token
 //! and lexing continues.
 
@@ -15,7 +15,7 @@ pub struct ShapeToken {
     pub len: u32,
 }
 
-/// Lex `.lb` source. Never fails.
+/// Lex `.luab` source. Never fails.
 pub fn lex(text: &str) -> Vec<ShapeToken> {
     let mut lexer = Lexer {
         text,

@@ -852,7 +852,7 @@ fn class_page(
 
 fn shape_page(sm: &ShapeModule, links: &Links, sidebar: &str) -> String {
     let mut content = format!(
-        "<h1>Shape module <code>{}</code></h1>\n<p class=\"muted\">Declared in <code>{}.lb</code> \
+        "<h1>Shape module <code>{}</code></h1>\n<p class=\"muted\">Declared in <code>{}.luab</code> \
          — analyser-only shape declarations (SHAPES.md).</p>\n",
         escape(&sm.name),
         escape(&sm.name)

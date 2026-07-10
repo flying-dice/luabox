@@ -27,7 +27,7 @@ function buildClient(): LanguageClient {
   };
 
   const clientOptions: LanguageClientOptions = {
-    // Attach to plain Lua *and* .lb shape files. We deliberately do NOT declare
+    // Attach to plain Lua *and* .luab shape files. We deliberately do NOT declare
     // the `lua` language (avoids clobbering other Lua extensions' grammars) and
     // only select documents by language id here.
     //

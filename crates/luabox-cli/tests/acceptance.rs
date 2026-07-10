@@ -255,7 +255,7 @@ fn write_file(world: &AcceptanceWorld, rel: &str, content: &str) {
 
 #[given(regex = r#"^a shape module "(\w+)" declaring (.+)$"#)]
 fn shape_module_declaring(world: &mut AcceptanceWorld, name: String, decl: String) {
-    write_file(world, &format!("src/{name}.lb"), &format!("{decl}\n"));
+    write_file(world, &format!("src/{name}.luab"), &format!("{decl}\n"));
 }
 
 #[given(regex = r"^a Lua file binding a table (\{.*\}) with ---@struct (\w+)$")]
@@ -270,43 +270,43 @@ fn trait_shape_with_fns(world: &mut AcceptanceWorld, first: String, second: Stri
         "struct Circle {{ }}\n\
          trait Shape {{\n    fn {first}(self) -> number;\n    fn {second}(self) -> number;\n}}\n"
     );
-    write_file(world, "src/geometry.lb", &module);
+    write_file(world, "src/geometry.luab", &module);
 }
 
 #[given(regex = r"^trait Shape with fn area\(self\) -> number$")]
 fn trait_shape_with_area(world: &mut AcceptanceWorld) {
     write_file(
         world,
-        "src/geometry.lb",
+        "src/geometry.luab",
         "struct Circle { }\ntrait Shape {\n    fn area(self) -> number;\n}\n",
     );
 }
 
-#[given(regex = r#"^trait Drawable: Shape in "geometry\.lb"$"#)]
+#[given(regex = r#"^trait Drawable: Shape in "geometry\.luab"$"#)]
 fn trait_drawable_supertrait(world: &mut AcceptanceWorld) {
     write_file(
         world,
-        "src/geometry.lb",
+        "src/geometry.luab",
         "struct Circle { }\n\
          trait Shape {\n    fn area(self) -> number;\n}\n\
          trait Drawable: Shape {\n    fn draw(self);\n}\n",
     );
 }
 
-#[given(regex = r#"^trait Shape in "geometry\.lb"$"#)]
+#[given(regex = r#"^trait Shape in "geometry\.luab"$"#)]
 fn trait_shape_in_geometry(world: &mut AcceptanceWorld) {
     write_file(
         world,
-        "src/geometry.lb",
+        "src/geometry.luab",
         "trait Shape {\n    fn area(self) -> number;\n}\n",
     );
 }
 
-#[given(regex = r#"^struct Point in "geometry\.lb"$"#)]
+#[given(regex = r#"^struct Point in "geometry\.luab"$"#)]
 fn struct_point_in_geometry(world: &mut AcceptanceWorld) {
     write_file(
         world,
-        "src/geometry.lb",
+        "src/geometry.luab",
         "struct Point { x: number, y: number }\n",
     );
 }
@@ -401,7 +401,7 @@ fn lua_file_with_missing_use(world: &mut AcceptanceWorld) {
 fn shape_module_with_body(world: &mut AcceptanceWorld) {
     write_file(
         world,
-        "src/bad.lb",
+        "src/bad.luab",
         "trait Shape {\n    fn area(self) -> number { return 1 }\n}\n",
     );
 }
@@ -431,7 +431,7 @@ fn diagnostic_with_both_spans(world: &mut AcceptanceWorld, code: String) {
         "expected diagnostic `{code}`; stdout:\n{stdout}\nstderr:\n{}",
         world.stderr()
     );
-    for file in ["main.lua", "geometry.lb"] {
+    for file in ["main.lua", "geometry.luab"] {
         assert!(
             stdout.contains(file),
             "expected `{code}` to show a span in `{file}`; stdout:\n{stdout}"
@@ -698,7 +698,7 @@ fn emitted_output_contains_no(world: &mut AcceptanceWorld, needle: String) {
 
 /// Snapshot the build output into a hidden dir (skipped by the file walk)
 /// so a later build of the same project can be compared byte-for-byte —
-/// SHAPES.md §1 invariant 1: `.lb` shapes never affect emitted output.
+/// SHAPES.md §1 invariant 1: `.luab` shapes never affect emitted output.
 #[then("I stash the build output")]
 fn stash_build_output(world: &mut AcceptanceWorld) {
     let dist = world.dir.path().join("dist");

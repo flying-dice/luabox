@@ -1,6 +1,6 @@
 //! LSP formatting over the shipped canonical formatters (SPEC.md §10):
 //! `.lua` through [`luabox_syntax::lua::fmt::format`] with the project's
-//! edition, `.lb` through [`luabox_syntax::shape::format`].
+//! edition, `.luab` through [`luabox_syntax::shape::format`].
 //!
 //! Both formatters guarantee they never destroy code — inputs that do not
 //! parse cleanly come back unchanged — so a formatting request on a broken

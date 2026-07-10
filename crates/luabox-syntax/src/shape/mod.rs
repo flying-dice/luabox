@@ -1,4 +1,4 @@
-//! The `.lb` shape DSL grammar (SHAPES.md).
+//! The `.luab` shape DSL grammar (SHAPES.md).
 //!
 //! Analyser-only Rust-style struct/trait declarations. Additive module: own
 //! syntax-kind space ([`ShapeSyntaxKind`]), same rowan infrastructure, zero

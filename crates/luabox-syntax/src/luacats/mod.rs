@@ -252,7 +252,7 @@ pub struct UnknownTag {
     pub span: Span,
 }
 
-/// luabox `---@use <module>` — import a `.lb` shape module (SHAPES.md §4).
+/// luabox `---@use <module>` — import a `.luab` shape module (SHAPES.md §4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UseTag {
     /// The (possibly dotted) module path.
@@ -260,7 +260,7 @@ pub struct UseTag {
     pub span: Span,
 }
 
-/// luabox `---@struct <Struct>` — bind the following value to a `.lb`
+/// luabox `---@struct <Struct>` — bind the following value to a `.luab`
 /// struct (SHAPES.md §4). Generic use sites (`---@struct Pair<number>`)
 /// keep their argument list as raw text; the shape checker parses it with
 /// the shape type grammar.

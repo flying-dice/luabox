@@ -4,7 +4,7 @@
 //! - **LuaCATS annotations** in `.lua` files (`luabox_syntax::luacats`):
 //!   classes (+fields), functions (`@param`/`@return`), aliases, enums,
 //!   plain doc lines, `@deprecated`, `---@impl` conformance assertions.
-//! - **`.lb` shape declarations** (`luabox_syntax::shape`): structs
+//! - **`.luab` shape declarations** (`luabox_syntax::shape`): structs
 //!   (fields, sealed/open), traits (fns, supertraits), impls, type
 //!   aliases — each with its `///` doc comments.
 //!
@@ -29,9 +29,9 @@ pub struct DocModel {
     pub package: String,
     /// One entry per project `.lua` file, in walk order.
     pub modules: Vec<Module>,
-    /// One entry per `.lb` shape module, in walk order.
+    /// One entry per `.luab` shape module, in walk order.
     pub shape_modules: Vec<ShapeModule>,
-    /// Every trait-conformance assertion (`.lb` `impl` items plus Lua
+    /// Every trait-conformance assertion (`.luab` `impl` items plus Lua
     /// `---@impl` tags), project-wide.
     pub impls: Vec<ImplDoc>,
 }
@@ -159,7 +159,7 @@ pub struct ImplDoc {
     pub struct_name: String,
 }
 
-/// One documented `.lb` shape module.
+/// One documented `.luab` shape module.
 #[derive(Debug)]
 pub struct ShapeModule {
     /// The module name (file stem — SHAPES.md §6 resolution key).
@@ -171,7 +171,7 @@ pub struct ShapeModule {
     pub impls: Vec<ImplDoc>,
 }
 
-/// A `.lb` `struct` declaration.
+/// A `.luab` `struct` declaration.
 #[derive(Debug)]
 pub struct StructDoc {
     pub name: String,
@@ -183,7 +183,7 @@ pub struct StructDoc {
     pub docs: String,
 }
 
-/// One field of a `.lb` struct. Nil-optionality is part of the rendered
+/// One field of a `.luab` struct. Nil-optionality is part of the rendered
 /// type (`number?`), not a separate flag.
 #[derive(Debug)]
 pub struct ShapeFieldDoc {
@@ -192,7 +192,7 @@ pub struct ShapeFieldDoc {
     pub docs: String,
 }
 
-/// A `.lb` `trait` declaration.
+/// A `.luab` `trait` declaration.
 #[derive(Debug)]
 pub struct TraitDoc {
     pub name: String,
@@ -202,7 +202,7 @@ pub struct TraitDoc {
     pub docs: String,
 }
 
-/// One required function of a `.lb` trait.
+/// One required function of a `.luab` trait.
 #[derive(Debug)]
 pub struct TraitFnDoc {
     pub name: String,
@@ -211,7 +211,7 @@ pub struct TraitFnDoc {
     pub docs: String,
 }
 
-/// A `.lb` `type` alias.
+/// A `.luab` `type` alias.
 #[derive(Debug)]
 pub struct ShapeAliasDoc {
     pub name: String,
@@ -229,7 +229,7 @@ pub fn module_name(rel: &str) -> String {
     let path = rel.strip_prefix("src/").unwrap_or(rel);
     let path = path
         .strip_suffix(".lua")
-        .or_else(|| path.strip_suffix(".lb"))
+        .or_else(|| path.strip_suffix(".luab"))
         .unwrap_or(path);
     let dotted = path.replace('/', ".");
     match dotted.strip_suffix(".init") {
@@ -661,7 +661,7 @@ pub fn render_type(ty: &luacats::TypeExpr) -> String {
 
 // === Shape extraction =====================================================
 
-/// Extract the documentation model of one `.lb` shape module.
+/// Extract the documentation model of one `.luab` shape module.
 pub fn shape_module(name: &str, source: &str) -> ShapeModule {
     let parse = shape::parse(source);
     let root = parse.syntax();
@@ -786,7 +786,7 @@ fn generic_display(params: Option<luabox_syntax::shape::ast::GenericParams>) -> 
         .collect()
 }
 
-/// Render a `.lb` type expression back to source-ish text.
+/// Render a `.luab` type expression back to source-ish text.
 pub fn render_shape_type(ty: &ShapeTypeRef) -> String {
     match ty {
         ShapeTypeRef::Named(named) => {
@@ -827,7 +827,7 @@ pub fn render_shape_type(ty: &ShapeTypeRef) -> String {
 }
 
 /// `///` doc comments indexed by the source offset of the token they
-/// precede. Doc comments are trivia in the `.lb` tree (SHAPES.md §2), so
+/// precede. Doc comments are trivia in the `.luab` tree (SHAPES.md §2), so
 /// they are collected from the token stream rather than the node structure:
 /// a run of `///` lines separated by single newlines, ending directly above
 /// the item (no blank line), documents that item.
@@ -1110,7 +1110,7 @@ mod tests {
         assert_eq!(module_name("src/geometry/circle.lua"), "geometry.circle");
         assert_eq!(module_name("src/geometry/init.lua"), "geometry");
         assert_eq!(module_name("lib/util.lua"), "lib.util");
-        assert_eq!(module_name("src/geometry.lb"), "geometry");
+        assert_eq!(module_name("src/geometry.luab"), "geometry");
     }
 
     #[test]

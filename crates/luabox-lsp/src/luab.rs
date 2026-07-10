@@ -1,8 +1,8 @@
-//! Minimal `.lb` shape-file support: parse diagnostics (see
+//! Minimal `.luab` shape-file support: parse diagnostics (see
 //! [`crate::diagnostics::lb_diagnostics`]), plus same-file hover and goto
 //! definition for struct/trait names.
 //!
-//! `.lb` files never enter the Lua analysis host — they are parsed directly
+//! `.luab` files never enter the Lua analysis host — they are parsed directly
 //! with [`shape::parse`] from the text the server tracks (overlay over disk).
 
 use luabox_syntax::shape::{

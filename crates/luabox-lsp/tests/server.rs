@@ -727,12 +727,12 @@ end
     client.shutdown();
 }
 
-// === .lb shape files =====================================================
+// === .luab shape files =====================================================
 
 #[test]
 fn lb_files_publish_shape_parse_errors() {
     let client = start(&[]);
-    let uri = client.uri("shapes.lb");
+    let uri = client.uri("shapes.luab");
     // A trait fn with a body: rejected at parse time with LB2010.
     let source = "trait Shape {\n    fn area(self) -> number { return 1 }\n}\n";
     let diags = client.open(&uri, source);
@@ -749,7 +749,7 @@ fn lb_files_publish_shape_parse_errors() {
 #[test]
 fn lb_goto_and_hover_resolve_struct_names() {
     let client = start(&[]);
-    let uri = client.uri("shapes.lb");
+    let uri = client.uri("shapes.luab");
     let source = "struct Point { x: number, y: number }\ntype Pair = Point;\n";
     client.open(&uri, source);
     let mut client = client;
@@ -845,7 +845,7 @@ fn formatting_parse_error_document_returns_no_edits() {
 fn lb_formatting_matches_shape_formatter() {
     let source = "struct Point {x: number, y: number}\n";
     let client = start(&[]);
-    let uri = client.uri("shapes.lb");
+    let uri = client.uri("shapes.luab");
     client.open(&uri, source);
     let mut client = client;
     let edits = client.formatting(&uri).expect("edits");
@@ -853,7 +853,7 @@ fn lb_formatting_matches_shape_formatter() {
     let canonical = luabox_syntax::shape::format(source);
     assert_ne!(canonical, source, "fixture must not already be canonical");
     assert_eq!(edits[0].new_text, canonical);
-    // A parse-error .lb document yields no edits.
+    // A parse-error .luab document yields no edits.
     client.change(&uri, "struct {\n");
     let edits = client.formatting(&uri).expect("edits");
     assert!(edits.is_empty(), "{edits:?}");
@@ -978,7 +978,7 @@ impl Shape for Circle;
 struct Pair<T> { first: T }
 ";
     let client = start(&[]);
-    let uri = client.uri("shapes.lb");
+    let uri = client.uri("shapes.luab");
     client.open(&uri, source);
     let mut client = client;
     let data = client.semantic_tokens(&uri);
@@ -1031,7 +1031,7 @@ fn lb_semantic_tokens_survive_parse_errors() {
     // The shape tree is lossless: broken input still highlights.
     let source = "trait Shape {\n    fn area(self) -> number { return 1 }\n}\n";
     let client = start(&[]);
-    let uri = client.uri("shapes.lb");
+    let uri = client.uri("shapes.luab");
     client.open(&uri, source);
     let mut client = client;
     let data = client.semantic_tokens(&uri);

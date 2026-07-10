@@ -1,7 +1,7 @@
 Feature: luabox build — target lowering emit
   SPEC.md §2.1/§4 (§18 P3): `luabox build` lowers the edition (dialect you
   write) to the target (dialect you ship) and emits to the out dir. Check
-  runs first — build refuses on check errors. `.lb` shape files never
+  runs first — build refuses on check errors. `.luab` shape files never
   reach the output (SHAPES.md §1).
 
   Scenario: goto lowered away for a 5.1 target
@@ -47,20 +47,20 @@ Feature: luabox build — target lowering emit
       print(x)
       """
 
-  Scenario: .lb shape files never reach the output
+  Scenario: .luab shape files never reach the output
     Given a project with edition "5.4" targeting "5.1"
     And a file "src/main.lua" containing:
       """
       print("ok")
       """
-    And a file "src/geometry.lb" containing:
+    And a file "src/geometry.luab" containing:
       """
       struct Point { x: number, y: number }
       """
     When I run "luabox build"
     Then the command succeeds
     And the file "dist/src/main.lua" exists
-    And the file "dist/src/geometry.lb" does not exist
+    And the file "dist/src/geometry.luab" does not exist
 
   Scenario: build refuses on check errors
     Given a strict project with edition "5.4" targeting "5.1"

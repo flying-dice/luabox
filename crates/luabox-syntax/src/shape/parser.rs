@@ -1,4 +1,4 @@
-//! Recursive-descent, error-resilient parser for the `.lb` shape grammar
+//! Recursive-descent, error-resilient parser for the `.luab` shape grammar
 //! (SHAPES.md §3), producing a lossless rowan green tree.
 //!
 //! Design notes:
@@ -66,7 +66,7 @@ impl ShapeParse {
     }
 }
 
-/// Parse `.lb` source into a lossless green tree. Never fails, never panics:
+/// Parse `.luab` source into a lossless green tree. Never fails, never panics:
 /// malformed input yields a tree with `ERROR_NODE` spans and diagnostics.
 #[must_use]
 pub fn parse(text: &str) -> ShapeParse {
@@ -684,7 +684,7 @@ mod tests {
 
     #[test]
     fn lossless_on_spec_example() {
-        let src = include_str!("test_data/spec_example.lb");
+        let src = include_str!("test_data/spec_example.luab");
         let p = parse(src);
         assert_eq!(p.syntax().to_string(), src, "tree must tile the input");
         assert!(p.errors().is_empty(), "errors: {:?}", p.errors());
@@ -795,7 +795,7 @@ mod tests {
     #[test]
     fn spec_example_ast_assertions() {
         use crate::shape::ast::{Item, TypeRef};
-        let src = include_str!("test_data/spec_example.lb");
+        let src = include_str!("test_data/spec_example.luab");
         let p = parse(src);
         assert!(p.errors().is_empty(), "{:?}", p.errors());
         let file = crate::shape::ast::ShapeFile::cast(p.syntax()).unwrap();
@@ -865,7 +865,7 @@ mod proptests {
     use super::*;
     use proptest::prelude::*;
 
-    /// Fragments drawn from the `.lb` alphabet — joining these stresses the
+    /// Fragments drawn from the `.luab` alphabet — joining these stresses the
     /// lexer boundaries and every parser recovery path.
     fn shape_token_soup() -> impl Strategy<Value = String> {
         let frag = prop::sample::select(vec![

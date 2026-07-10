@@ -12,12 +12,12 @@
 //! 3. **Typecheck** (annotation-driven, per-file environment; cross-file
 //!    `require` resolution is P1) at the manifest's strictness:
 //!    `[types] strict = true` → strict (errors), otherwise warn — plus
-//!    `.lb` shape bindings (`---@use`/`---@struct`/`---@impl`, SHAPES.md),
+//!    `.luab` shape bindings (`---@use`/`---@struct`/`---@impl`, SHAPES.md),
 //!    whose `LB2xxx` rules are hard errors at every strictness.
 //!
-//! `.lb` shape modules are checked too: parse errors (including `LB2010`
+//! `.luab` shape modules are checked too: parse errors (including `LB2010`
 //! body rejection) and shape-level diagnostics (`LB2005`/`LB2007`) carry
-//! the `.lb` file and spans. Shape resolution uses the file's directory
+//! the `.luab` file and spans. Shape resolution uses the file's directory
 //! (sibling tier) plus the manifest's `[types] shape-paths`; parsed
 //! modules are cached in a store shared across the rayon workers.
 //!
@@ -138,7 +138,7 @@ pub(crate) fn run_once(
             Ok(diags)
         })
         .collect();
-    // `.lb` shape files get their own pass: parse errors (LB2010, LB0001)
+    // `.luab` shape files get their own pass: parse errors (LB2010, LB0001)
     // plus shape-level diagnostics attributed to the declaring file.
     let per_lb: Vec<anyhow::Result<Vec<Diagnostic>>> = lb_files
         .par_iter()
@@ -369,8 +369,8 @@ pub(crate) fn discover(cwd: &Path) -> anyhow::Result<Project> {
 /// actually export shape modules contribute an entry; a dependency with no
 /// manifest on disk (uninstalled, or a source kind whose root cannot be
 /// located here) or an empty `[types] shapes` simply exports nothing and is
-/// skipped. `.lb` sources are never parsed here — only the manifest is read
-/// (SHAPES.md §7: distribution ships `.lb` opaquely).
+/// skipped. `.luab` sources are never parsed here — only the manifest is read
+/// (SHAPES.md §7: distribution ships `.luab` opaquely).
 fn resolve_dep_shape_exports(root: &Path, manifest: &Manifest) -> Vec<DepShapeExport> {
     let mut exports = Vec::new();
     for (name, dep) in manifest
@@ -472,7 +472,7 @@ fn collect_d_lua(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// All `*.lua` and `*.lb` files under the project root, deterministic
+/// All `*.lua` and `*.luab` files under the project root, deterministic
 /// order, skipping dot-directories and the build output directory.
 pub(crate) fn collect_files(project: &Project) -> anyhow::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let mut lua = Vec::new();
@@ -507,7 +507,7 @@ fn walk(
                 // `*.d.lua` are `---@meta` definition files (ambient type
                 // surfaces), never checked as project source.
                 Some("lua") if !name.ends_with(".d.lua") => lua.push(path),
-                Some("lb") => lb.push(path),
+                Some("luab") => lb.push(path),
                 _ => {}
             }
         }

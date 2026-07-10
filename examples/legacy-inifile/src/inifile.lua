@@ -1,5 +1,5 @@
 -- legacy-inifile: a small INI parser annotated entirely with LuaCATS
--- (`---@class` / `---@param` / `---@return`). No `.lb` shapes — this is what
+-- (`---@class` / `---@param` / `---@return`). No `.luab` shapes — this is what
 -- an existing, idiomatic Lua 5.1 library looks like when luabox checks it.
 
 ---@class IniFile

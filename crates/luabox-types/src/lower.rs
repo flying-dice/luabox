@@ -17,16 +17,16 @@ use crate::ty::{FieldTy, FunctionTy, ParamTy, TableTy, Ty};
 
 /// The type names a file declares, collected before lowering so forward
 /// references resolve. Shape names imported via `---@use` participate so
-/// LuaCATS annotations can reference `.lb` structs/traits (interop,
+/// LuaCATS annotations can reference `.luab` structs/traits (interop,
 /// SHAPES.md §3) without tripping LB0305.
 #[derive(Debug, Default)]
 pub(crate) struct Declared {
     pub classes: BTreeSet<String>,
     pub enums: BTreeSet<String>,
     pub aliases: BTreeMap<String, AliasTag>,
-    /// `.lb` struct/trait names in scope — lower to [`Ty::Named`].
+    /// `.luab` struct/trait names in scope — lower to [`Ty::Named`].
     pub shape_names: BTreeSet<String>,
-    /// Concrete `.lb` aliases in scope — pre-lowered, substituted inline.
+    /// Concrete `.luab` aliases in scope — pre-lowered, substituted inline.
     pub shape_aliases: BTreeMap<String, Ty>,
 }
 

@@ -1,6 +1,6 @@
 " Vim syntax file
-" Language:  luabox shapes (.lb)
-" Fallback highlighting so `.lb` files read well even without the luabox
+" Language:  luabox shapes (.luab)
+" Fallback highlighting so `.luab` files read well even without the luabox
 " language server attached. When the LSP is running, Neovim's semantic
 " tokens (0.9+) layer on top of these groups.
 

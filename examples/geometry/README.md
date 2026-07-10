@@ -1,13 +1,13 @@
 # geometry
 
-The `.lb` shape DSL flagship. A library (`edition = "5.4"`) whose types live
-in a **shape module** — Rust struct/trait syntax in a separate `.lb` file —
+The `.luab` shape DSL flagship. A library (`edition = "5.4"`) whose types live
+in a **shape module** — Rust struct/trait syntax in a separate `.luab` file —
 while the implementations live in ordinary Lua, bound with `---@` tags.
 
 ```
 geometry/
 ├── luabox.toml
-├── shapes/geometry.lb        # structs, traits, a supertrait, a generic
+├── shapes/geometry.luab        # structs, traits, a supertrait, a generic
 ├── src/circle.lua            # ---@impl Shape for Circle
 ├── src/rect.lua              # ---@impl Shape for Rect
 ├── src/shapes_data.lua       # ---@struct bindings + sealed-checking demo
@@ -16,14 +16,14 @@ geometry/
 
 ## The shape workflow
 
-1. **Declare types in `.lb`.** `shapes/geometry.lb` declares structs
+1. **Declare types in `.luab`.** `shapes/geometry.luab` declares structs
    (`Point`, `Circle`, `Rect`), a generic `Pair<T>`, a trait `Shape`, and a
    supertrait `Drawable: Shape`. It has no bodies — the parser rejects them
    ("implementations live in .lua"). It is analyser-only: never required at
    runtime, never emitted by `build`/`bundle`.
 
 2. **Point the manifest at it.** `[types] shape-paths = ["shapes"]` tells the
-   resolver where to find `.lb` modules for `---@use`.
+   resolver where to find `.luab` modules for `---@use`.
 
 3. **Bind Lua to shapes with tags:**
    - `---@use geometry` — import the shape module (file top).
@@ -34,11 +34,11 @@ geometry/
      `self`; extra inherent methods are fine.
 
 4. **Check it.** `luabox check` runs both front-ends — LuaCATS annotations and
-   `.lb` shapes — through one type IR.
+   `.luab` shapes — through one type IR.
 
 ```sh
-luabox check        # 0 errors across .lua + .lb
-luabox fmt --check  # .lb files are formatted too (4-space, trailing commas)
+luabox check        # 0 errors across .lua + .luab
+luabox fmt --check  # .luab files are formatted too (4-space, trailing commas)
 luabox lint
 luabox test         # exercises the Circle/Rect/Point API on your Lua runtime
 ```

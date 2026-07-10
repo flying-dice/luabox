@@ -1,4 +1,4 @@
-//! Typed AST layer over the lossless `.lb` green tree (SHAPES.md §3).
+//! Typed AST layer over the lossless `.luab` green tree (SHAPES.md §3).
 //!
 //! Thin wrappers around [`ShapeSyntaxNode`]: each accessor re-derives its value
 //! from the tree on demand, so the AST stays a *view* — never a second source
@@ -68,7 +68,7 @@ impl ShapeFile {
     }
 }
 
-/// Any top-level `.lb` declaration.
+/// Any top-level `.luab` declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
     /// A `struct` declaration.

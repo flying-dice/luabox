@@ -40,7 +40,7 @@ use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
 use crate::line_index::LineIndex;
 use crate::sema::FileSema;
 use crate::uri::{path_to_uri, uri_to_path};
-use crate::{completion, diagnostics, fmt, goto_def, hover, lb, semantic_tokens, symbols};
+use crate::{completion, diagnostics, fmt, goto_def, hover, luab, semantic_tokens, symbols};
 
 /// Run the server over stdio until the client sends `shutdown`/`exit`.
 /// A leading `--stdio` argument, which editors commonly pass, is harmless:
@@ -148,7 +148,7 @@ impl ProjectConfig {
     }
 }
 
-/// The server state: the analysis host plus `.lb` texts (which never enter
+/// The server state: the analysis host plus `.luab` texts (which never enter
 /// the Lua host — they are parsed with the shape grammar on demand).
 struct Server {
     connection: Connection,
@@ -156,7 +156,7 @@ struct Server {
     root: PathBuf,
     dialect: Dialect,
     out_dir: Option<PathBuf>,
-    /// Effective text of `.lb` files: overlay (open buffers) over disk.
+    /// Effective text of `.luab` files: overlay (open buffers) over disk.
     lb_overlay: HashMap<PathBuf, String>,
     lb_disk: HashMap<PathBuf, String>,
 }
@@ -177,7 +177,7 @@ impl Server {
 
     /// Load every `.lua` file under the root into the host (so
     /// `project_diagnostics` and cross-file goto have the full picture) and
-    /// remember `.lb` texts.
+    /// remember `.luab` texts.
     fn bootstrap(&mut self) {
         let mut stack = vec![self.root.clone()];
         while let Some(dir) = stack.pop() {
@@ -206,7 +206,7 @@ impl Server {
                             });
                         }
                     }
-                    Some("lb") => {
+                    Some("luab") => {
                         if let Ok(text) = fs::read_to_string(&path) {
                             self.lb_disk.insert(path, text);
                         }
@@ -300,7 +300,7 @@ impl Server {
             let text = self.lb_text(&path)?.to_string();
             let index = LineIndex::new(text);
             let offset = index.offset(position);
-            let (range, decl) = lb::definition(index.text(), offset)?;
+            let (range, decl) = luab::definition(index.text(), offset)?;
             return Some(Hover {
                 contents: lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
                     kind: lsp_types::MarkupKind::Markdown,
@@ -320,7 +320,7 @@ impl Server {
             let text = self.lb_text(&path)?.to_string();
             let index = LineIndex::new(text);
             let offset = index.offset(position);
-            let (range, _) = lb::definition(index.text(), offset)?;
+            let (range, _) = luab::definition(index.text(), offset)?;
             return Some(Location {
                 uri: path_to_uri(&path),
                 range: index.range(usize::from(range.start())..usize::from(range.end())),
@@ -495,7 +495,7 @@ impl Server {
 }
 
 fn is_lb(path: &Path) -> bool {
-    path.extension().and_then(|e| e.to_str()) == Some("lb")
+    path.extension().and_then(|e| e.to_str()) == Some("luab")
 }
 
 /// Extract a request's id and params, or surface a protocol error.

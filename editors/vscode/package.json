@@ -1,7 +1,7 @@
 {
   "name": "luabox",
   "displayName": "luabox",
-  "description": "luabox language support: typecheck, lint, hover, goto-def and completion for Lua and .lb shape files, powered by `luabox lsp`.",
+  "description": "luabox language support: typecheck, lint, hover, goto-def and completion for Lua and .luab shape files, powered by `luabox lsp`.",
   "version": "0.1.0",
   "publisher": "luabox",
   "license": "MIT",
@@ -36,10 +36,10 @@
         "aliases": [
           "luabox shape",
           "luabox-shape",
-          "lb"
+          "luab"
         ],
         "extensions": [
-          ".lb"
+          ".luab"
         ],
         "configuration": "./language-configuration.json"
       }

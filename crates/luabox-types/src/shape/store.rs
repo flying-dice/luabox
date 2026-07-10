@@ -1,24 +1,24 @@
-//! Loading and resolving `.lb` shape modules from disk (SHAPES.md §6).
+//! Loading and resolving `.luab` shape modules from disk (SHAPES.md §6).
 //!
-//! `---@use <name>` (and `use` inside `.lb`) resolves, first hit wins:
+//! `---@use <name>` (and `use` inside `.luab`) resolves, first hit wins:
 //!
-//! 1. a sibling `<name>.lb` next to the using file;
+//! 1. a sibling `<name>.luab` next to the using file;
 //! 2. the `[types] shape-paths` directories, in manifest order — more than
 //!    one hit *within* this tier is an ambiguity error (`LB2005`);
 //! 3. dependency-exported shapes: a dependency exports modules by listing
 //!    them in `[types] shapes` in *its own* manifest ([`DepShapeExport`]).
 //!    Only exported names are resolvable across the package boundary; the
-//!    exported `<name>.lb` is looked up at the dependency root and then on
+//!    exported `<name>.luab` is looked up at the dependency root and then on
 //!    the dependency's own `[types] shape-paths`. Two dependencies exporting
 //!    the same name is an ambiguity error, listing both.
 //!
-//! A dependency's own `.lb` file resolves *its* nested `use`s within that
+//! A dependency's own `.luab` file resolves *its* nested `use`s within that
 //! dependency package only — its sibling directory plus its shape-paths, and
 //! **not** the dependency's own dependencies (resolution stops one level
 //! deep; a dependency-of-a-dependency's exports are invisible).
 //!
 //! Parsed modules are cached behind a mutex so rayon workers checking many
-//! `.lua` files share one parse per `.lb` file.
+//! `.lua` files share one parse per `.luab` file.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -38,7 +38,7 @@ const BODY_IN_LB: u16 = 2010;
 /// (SHAPES.md §6, resolution tier 3). Built by the CLI from the project
 /// manifest plus each dependency's own `[types] shapes` declaration — the
 /// shape store never parses manifests itself (SHAPES.md §7: distribution
-/// ships `.lb` as opaque source; the store only reads `.lb` files).
+/// ships `.luab` as opaque source; the store only reads `.luab` files).
 #[derive(Debug, Clone)]
 pub struct DepShapeExport {
     /// The dependency's package name (used to disambiguate candidates and in
@@ -49,23 +49,23 @@ pub struct DepShapeExport {
     pub root: PathBuf,
     /// The module names the dependency exports (`[types] shapes` in the
     /// dependency's own manifest). Only these names are resolvable across the
-    /// package boundary — a `.lb` file the dependency does not export is
+    /// package boundary — a `.luab` file the dependency does not export is
     /// invisible to dependents.
     pub exported: Vec<String>,
     /// The dependency's own `[types] shape-paths`, made absolute against its
-    /// root. An exported `<mod>.lb` is looked up at the root and then on
+    /// root. An exported `<mod>.luab` is looked up at the root and then on
     /// these paths; they also bound a dependency module's own nested `use`s
     /// (which resolve within the dependency package only).
     pub shape_paths: Vec<PathBuf>,
 }
 
-/// The empty dependency set — the resolution context for a `.lb` file that
+/// The empty dependency set — the resolution context for a `.luab` file that
 /// lives inside a dependency, which never chases further dependency exports.
 const NO_DEPS: &[DepShapeExport] = &[];
 
 /// The outcome of resolving one module name.
 pub(crate) enum ResolveOutcome {
-    /// Exactly one `.lb` file matched.
+    /// Exactly one `.luab` file matched.
     Found(PathBuf),
     /// More than one candidate in the same tier.
     Ambiguous(Vec<PathBuf>),
@@ -80,7 +80,7 @@ pub(crate) fn resolve(
     shape_paths: &[PathBuf],
     dependencies: &[DepShapeExport],
 ) -> ResolveOutcome {
-    let file_name = format!("{name}.lb");
+    let file_name = format!("{name}.luab");
 
     // Tier 1: sibling.
     let sibling = sibling_dir.join(&file_name);
@@ -101,7 +101,7 @@ pub(crate) fn resolve(
     }
 
     // Tier 3: dependency-exported shapes. A dependency contributes a
-    // candidate only when it *exports* this module name and the `<name>.lb`
+    // candidate only when it *exports* this module name and the `<name>.luab`
     // is present at its root or on its own shape-paths; two exporting
     // dependencies are ambiguous, listing both.
     let dep_hits: Vec<PathBuf> = dependencies
@@ -148,7 +148,7 @@ fn context_for<'a>(
 }
 
 /// A process-wide cache of parsed shape modules, shared across the per-file
-/// check workers. Also the entry point for checking `.lb` files themselves.
+/// check workers. Also the entry point for checking `.luab` files themselves.
 #[derive(Debug)]
 pub struct ShapeStore {
     /// Project root — diagnostics name files relative to it.
@@ -193,7 +193,7 @@ impl ShapeStore {
 
     /// Build the merged scope reachable from `roots` (following transitive
     /// `use`s, cycle-safe). Unresolved nested `use`s become `LB2005`
-    /// diagnostics *inside the scope* (attributed to the declaring `.lb`
+    /// diagnostics *inside the scope* (attributed to the declaring `.luab`
     /// file — surfaced when that file itself is checked).
     pub(crate) fn scope_from(
         &self,
@@ -214,8 +214,8 @@ impl ShapeStore {
             let Some(module) = self.load(&path) else {
                 continue;
             };
-            // A dependency's own `.lb` resolves its nested `use`s within that
-            // dependency package only; a project `.lb` sees the full project
+            // A dependency's own `.luab` resolves its nested `use`s within that
+            // dependency package only; a project `.luab` sees the full project
             // context (tiers 1–3).
             let (ctx_paths, ctx_deps) = context_for(&path, shape_paths, dependencies);
             for import in &module.uses {
@@ -271,19 +271,19 @@ impl ShapeStore {
             .with_label(Label::primary(
                 Span::new(file, range),
                 format!(
-                    "no `{name}.lb` next to this file, on `[types] shape-paths`, or exported by a \
+                    "no `{name}.luab` next to this file, on `[types] shape-paths`, or exported by a \
                      dependency"
                 ),
             ))
             .with_note(
-                "resolution checks, in order: a sibling `.lb`, the `[types] shape-paths` \
+                "resolution checks, in order: a sibling `.luab`, the `[types] shape-paths` \
                  directories, and shape modules a dependency exports via `[types] shapes` in \
                  its own manifest",
             ),
         }
     }
 
-    /// Check one `.lb` file: parse diagnostics (`LB2010` body rejection,
+    /// Check one `.luab` file: parse diagnostics (`LB2010` body rejection,
     /// plain syntax errors as `LB0001`) plus the shape-level diagnostics its
     /// declarations raise (unresolved `use` → `LB2005`, generic bound
     /// violations → `LB2007`).
@@ -322,7 +322,7 @@ impl ShapeStore {
         }
 
         // Lower with the full reachable scope so cross-module bounds check;
-        // keep only diagnostics belonging to *this* file (each `.lb` file
+        // keep only diagnostics belonging to *this* file (each `.luab` file
         // reports its own problems exactly once).
         // Seed the cache with the freshly parsed module text.
         let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());

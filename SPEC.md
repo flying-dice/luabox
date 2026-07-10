@@ -3,7 +3,7 @@
 **Name:** `luabox`. CLI binary: `luabox`, alias `lb`.
 **One-line:** cargo + rustup + rust-analyzer + bun, for Lua. Not a runtime. Ever.
 
-The `.lb` shape DSL is specified in [SHAPES.md](SHAPES.md). Until the cucumber feature files
+The `.luab` shape DSL is specified in [SHAPES.md](SHAPES.md). Until the cucumber feature files
 exist for a behaviour, this text is the sole source of truth; from then on the feature files
 govern.
 
@@ -12,14 +12,14 @@ govern.
 - One static binary. Zero-install-friction (curl | sh, brew, scoop, mise). Written in Rust.
 - Bun's ethos: one tool, instant startup, batteries included, obscene speed.
 - Rust's ethos: correctness-first, one blessed workflow, first-class diagnostics, stability guarantees.
-- Type system: `.lb` shape DSL (Rust struct/trait style, [SHAPES.md](SHAPES.md)) layered over untyped Lua, with full LuaCATS (LuaLS/sumneko) annotation compatibility — both front-ends, one IR.
+- Type system: `.luab` shape DSL (Rust struct/trait style, [SHAPES.md](SHAPES.md)) layered over untyped Lua, with full LuaCATS (LuaLS/sumneko) annotation compatibility — both front-ends, one IR.
 - Runtimes are pluggable externals (`lua5.1`, `lua5.4`, `luajit`, love2d, OpenResty, Neovim). Luabox compiles/checks/bundles *for* them, never *is* them.
 
 ### Non-goals
 
 - No interpreter/VM. No REPL beyond delegating to a configured runtime.
-- Full LuaCATS (`---@class` etc.) support is non-negotiable — existing annotated codebases check day one. The `.lb` shape DSL is an additional analyser-only front-end into the same type IR, never a replacement.
-- **Luau: explicitly out of scope.** Alternative typed paradigm with its own owner and toolchain (Roblox, luau-lsp). Luabox's typed story is `.lb` shapes over untyped Lua. Scope decision, not an oversight.
+- Full LuaCATS (`---@class` etc.) support is non-negotiable — existing annotated codebases check day one. The `.luab` shape DSL is an additional analyser-only front-end into the same type IR, never a replacement.
+- **Luau: explicitly out of scope.** Alternative typed paradigm with its own owner and toolchain (Roblox, luau-lsp). Luabox's typed story is `.luab` shapes over untyped Lua. Scope decision, not an oversight.
 - No LuaRocks replacement-by-fiat — interop first, supersede by being better.
 
 ## 2. Supported dialects & targets
@@ -56,13 +56,13 @@ Luau: out of scope (§1). No parse, no check, no lowering.
 - **Source of truth:** LuaLS annotations (`---@class`, `---@field`, `---@param`, `---@return`, `---@generic`, `---@alias`, `---@overload`, `---@type`, `---@cast`, `---@enum`, `---@meta`). Full dialect compatibility.
 - **Definition packages:** `@types/*`-style. `*.d.lua` files (`---@meta` modules) distributed via registry. Runtime API defs shipped for: 5.1–5.4 stdlib, LuaJIT ext, LÖVE, Neovim, OpenResty.
 - Strictness ladder (per-package, per-file override): `none` → `warn` → `strict` (untyped = `unknown`, not `any`).
-- Inference: bidirectional, flow-sensitive narrowing (`if type(x) == "string"`), literal types, generics with constraints. Match/exceed LuaLS on annotated Lua; `.lb` shapes add the rigor LuaLS lacks.
+- Inference: bidirectional, flow-sensitive narrowing (`if type(x) == "string"`), literal types, generics with constraints. Match/exceed LuaLS on annotated Lua; `.luab` shapes add the rigor LuaLS lacks.
 - **Rich table inference — hard requirement.** Tables never degrade to a bare `table` type. The IR models table *shapes* structurally, and inference maintains them without annotations:
   - Per-field shapes from table constructors and subsequent assignments (`t.x = 1` extends/refines the shape; sealed vs unsealed per strictness level).
   - Array part vs hash part vs mixed distinguished; element types for `t[i]`, and `pairs`/`ipairs`/`next` iteration typed from the shape.
   - Metatable semantics: `setmetatable`/`__index` chains (table and function forms) resolve field lookup, so idiomatic OOP (`Class.__index = Class`, `:` methods, inheritance chains) types correctly without annotations.
   - Literal-keyed indexing narrows (`t["x"]` ≡ `t.x`); dynamic keys fall back to indexer types, not `any`.
-  - Inferred shapes unify with declared `---@class`/`---@field` and `.lb` struct types: missing/excess-field diagnostics per strictness level, width subtyping for function arguments.
+  - Inferred shapes unify with declared `---@class`/`---@field` and `.luab` struct types: missing/excess-field diagnostics per strictness level, width subtyping for function arguments.
 - `luabox check` = standalone typecheck, CI-grade, machine-readable output (JSON, SARIF, GitHub/GitLab annotations).
 - Shapes: see [SHAPES.md](SHAPES.md). Analyser-only, sealed semantics, coexists with LuaCATS in one IR.
 
@@ -110,7 +110,7 @@ out = "dist"
 [types]
 strict = true
 defs = ["love2d"]           # ambient definition packages
-shape-paths = ["shapes/"]   # .lb search dirs (SHAPES.md §6)
+shape-paths = ["shapes/"]   # .luab search dirs (SHAPES.md §6)
 
 [dependencies]
 penlight = "1.14"
@@ -204,7 +204,7 @@ Cargo workspace, one crate per bounded context. Boundary-only communication (pub
 
 ```
 crates/
-  luabox-syntax      lossless parser: Lua dialects (feature-flagged) + .lb shape grammar
+  luabox-syntax      lossless parser: Lua dialects (feature-flagged) + .luab shape grammar
   luabox-hir         desugared IR, name resolution
   luabox-types       unified type IR (LuaCATS ⊕ shapes), inference engine
   luabox-db          salsa incremental database (shared: check/lint/lsp/fmt)
@@ -252,7 +252,7 @@ crates/
 | selene / luacheck | lint | type-aware rules, autofix |
 | StyLua | fmt | same tree as analysis, style-compatible |
 | darklua | dialect transforms (Luau-centric) | full 5.x matrix, semantics-preservation guarantees |
-| Luau / luau-lsp | typed Lua paradigm | deliberately not competed with — luabox types untyped Lua via `.lb` |
+| Luau / luau-lsp | typed Lua paradigm | deliberately not competed with — luabox types untyped Lua via `.luab` |
 | busted | test | zero-config, runtime matrix, own-emit coverage |
 | aftman / rokit / hererocks | toolchains | integrated, manifest-pinned |
 | tsc | target lowering | the model, applied to the Lua dialect lattice |
@@ -261,9 +261,9 @@ crates/
 
 ## 18. Phasing
 
-1. **P0 — Core:** Lua parser (all dialects) + `.lb` grammar module, `luabox.toml`, `init/fmt/check` (LuaCATS subset), CLI skeleton. Formatter ships first.
+1. **P0 — Core:** Lua parser (all dialects) + `.luab` grammar module, `luabox.toml`, `init/fmt/check` (LuaCATS subset), CLI skeleton. Formatter ships first.
 2. **P1 — Types & LSP:** full inference, salsa DB, shape checking (sealed + coherence), cross-front-end interop, LSP completion/hover/diagnostics/goto.
-3. **P2 — Packages:** resolver, store, lockfile, luarocks bridge, `add/install/publish`, registry MVP, `.lb` in package artifacts.
+3. **P2 — Packages:** resolver, store, lockfile, luarocks bridge, `add/install/publish`, registry MVP, `.luab` in package artifacts.
 4. **P3 — Build:** lowering matrix, bundler, sourcemaps.
 5. **P4 — Runner-adjacent:** test matrix, bench, toolchain manager, coverage, LSP shape polish.
 6. **P5 — Ecosystem:** doc hosting, audit DB, editor extensions, LÖVE/Neovim embedding.

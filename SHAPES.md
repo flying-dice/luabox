@@ -1,28 +1,28 @@
-# luabox shape spec — `.lb` declarations (spec rev 3)
+# luabox shape spec — `.luab` declarations (spec rev 3)
 
-**One-line:** Rust struct/trait syntax in separate `.lb` files; plain Lua binds via `---@` tags; checked with Rust temperament. Analyser-only — no def emit, ever.
+**One-line:** Rust struct/trait syntax in separate `.luab` files; plain Lua binds via `---@` tags; checked with Rust temperament. Analyser-only — no def emit, ever.
 
 Companion to [SPEC.md](SPEC.md).
 
 ## 1. Scope & invariants
 
-In: `.lb` grammar; binding tags `---@use`/`---@struct`/`---@impl`; sealed checking; `.lb` package distribution; LSP/fmt/lint over shape files.
+In: `.luab` grammar; binding tags `---@use`/`---@struct`/`---@impl`; sealed checking; `.luab` package distribution; LSP/fmt/lint over shape files.
 Out: any runtime behaviour; `.d.lua`/`.d.luau` emit; macros/derive; consuming `.d.ts`/`.d.tl`; replacing LuaCATS.
 
 **Invariants (violate = spec bug):**
 1. Shapes never affect runtime output — check-time only; emitted Lua byte-identical with or without them.
 2. Shapes lower into the unified type IR. One checker. No parallel type system.
-3. `*.lb` never on require path, never in build/bundle output.
+3. `*.luab` never on require path, never in build/bundle output.
 4. No opt-in = zero cost, zero diagnostics.
 
 **Accepted trade-off:** shape types visible to luabox consumers only; stock LuaLS sees untyped API.
 
 ## 2. File format
 
-- Extension `.lb` — invisible to Lua tooling by construction; no exclude config needed.
+- Extension `.luab` — invisible to Lua tooling by construction; no exclude config needed.
 - UTF-8. Not Lua. Own grammar/parser in `luabox-syntax` (rowan, lossless).
 - Comments `//`, `/* */`; doc comments `///` surface in hover and `luabox doc`.
-- One file = one shape module; module name = file stem (`geometry.lb` → `geometry`).
+- One file = one shape module; module name = file stem (`geometry.luab` → `geometry`).
 
 ## 3. Grammar
 
@@ -81,7 +81,7 @@ Banned: lifetimes/`&`, `mut`, `Box`/`Rc`, `where`, `dyn`. Rust flavour, Lua real
 
 ### Coexistence
 
-Two type front-ends, one IR: LuaCATS annotations (`.lua`, fully supported, unchanged) and the shape DSL (`.lb` + tags). Interop total: `.lb` struct usable in `---@param`/`---@field`; `---@class` table can satisfy a `.lb` trait via `---@impl`; mixed projects are the norm. Luau: out of scope toolchain-wide.
+Two type front-ends, one IR: LuaCATS annotations (`.lua`, fully supported, unchanged) and the shape DSL (`.luab` + tags). Interop total: `.luab` struct usable in `---@param`/`---@field`; `---@class` table can satisfy a `.luab` trait via `---@impl`; mixed projects are the norm. Luau: out of scope toolchain-wide.
 
 ## 4. Binding annotations (in `.lua`)
 
@@ -132,28 +132,28 @@ local origin = { x = 0, y = 0 }
 | LB2006 | `---@struct` names undeclared struct |
 | LB2007 | generic bound unsatisfied |
 | LB2008 | supertrait conformance missing |
-| LB2010 | body in `.lb` |
+| LB2010 | body in `.luab` |
 
 All get `luabox explain` pages.
 
 ## 6. Resolution
 
-`---@use <name>`, first hit wins: (1) sibling `<name>.lb`; (2) `[types] shape-paths` dirs in `luabox.toml`, in order; (3) dependency-exported shapes (`[types] shapes = [...]` in the dep's manifest). Same-tier ambiguity = error. `use` inside `.lb` resolves identically.
+`---@use <name>`, first hit wins: (1) sibling `<name>.luab`; (2) `[types] shape-paths` dirs in `luabox.toml`, in order; (3) dependency-exported shapes (`[types] shapes = [...]` in the dep's manifest). Same-tier ambiguity = error. `use` inside `.luab` resolves identically.
 
 ## 7. Analyser-only surface
 
 - Shapes live exclusively in `luabox-db`; consumed by check, lint, LSP, doc. Nothing else sees them.
-- No generated artifacts of any kind. The `.lb` file IS the declaration.
+- No generated artifacts of any kind. The `.luab` file IS the declaration.
 - Build/bundle shape-blind (invariant 1).
-- Distribution ships `.lb` as opaque source inside package artifacts; consumers analyse directly.
+- Distribution ships `.luab` as opaque source inside package artifacts; consumers analyse directly.
 
 ## 8. Toolchain integration
 
-check: same diagnostic stream. fmt: `.lb` formatted (4-space, trailing commas, one item/line, no options). lint: same DB. build/bundle: `.lb` always excluded. LSP: full in `.lb` (completion, hover with `///`, goto struct↔binding↔impl, cross-file rename, find-refs); in `.lua`: hover shows struct, stub-generation and bind-table code actions. doc: shapes as first-class type pages.
+check: same diagnostic stream. fmt: `.luab` formatted (4-space, trailing commas, one item/line, no options). lint: same DB. build/bundle: `.luab` always excluded. LSP: full in `.luab` (completion, hover with `///`, goto struct↔binding↔impl, cross-file rename, find-refs); in `.lua`: hover shows struct, stub-generation and bind-table code actions. doc: shapes as first-class type pages.
 
 ## 9. Architecture impact
 
-Syntax: additive shape grammar module, own SyntaxKind space, Lua grammar untouched. Semantics: HIR type decls; sealed/interface/coherence in the IR; DB queries `shape_modules`, `resolve_use`, `impl_conformance`. Emit: untouched. Distribution: manifest fields + opaque `.lb` in artifacts, never parsed. Frontend: LSP only, no new CLI. Execution: untouched.
+Syntax: additive shape grammar module, own SyntaxKind space, Lua grammar untouched. Semantics: HIR type decls; sealed/interface/coherence in the IR; DB queries `shape_modules`, `resolve_use`, `impl_conformance`. Emit: untouched. Distribution: manifest fields + opaque `.luab` in artifacts, never parsed. Frontend: LSP only, no new CLI. Execution: untouched.
 
 ## 10. Testing (cucumber — write first)
 
@@ -176,17 +176,17 @@ Feature: Trait coherence
 
 Feature: Ecosystem interop
   Scenario: LuaCATS class satisfies a shape trait
-    Given trait Shape in "geometry.lb"
+    Given trait Shape in "geometry.luab"
     And a ---@class annotated table with ---@impl Shape for Square
     When I run "luabox check"
     Then zero diagnostics are reported
 ```
 
-Plus proptest fmt idempotence on `.lb`; `cargo-fuzz` on the shape parser.
+Plus proptest fmt idempotence on `.luab`; `cargo-fuzz` on the shape parser.
 
 ## 11. Phasing
 
-P0+: `.lb` grammar + parser + fmt (additive, no Lua-checking dependency). P1: IR lowering, sealed/coherence, binding tags, interop, LB2xxx, LSP basics. P2: manifest fields, dependency shapes, `.lb` in artifacts. P4+: rename polish, stub generation, doc rendering.
+P0+: `.luab` grammar + parser + fmt (additive, no Lua-checking dependency). P1: IR lowering, sealed/coherence, binding tags, interop, LB2xxx, LSP basics. P2: manifest fields, dependency shapes, `.luab` in artifacts. P4+: rename polish, stub generation, doc rendering.
 
 ## 12. Open questions (escalate, don't guess)
 

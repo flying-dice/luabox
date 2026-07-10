@@ -1,6 +1,6 @@
 //! `luabox fmt [--check] [--watch]` — canonical formatting for a whole
 //! project (SPEC.md §10): every `**/*.lua` under the package in the
-//! manifest's edition, plus every `**/*.lb` shape module via the shape
+//! manifest's edition, plus every `**/*.luab` shape module via the shape
 //! formatter.
 //!
 //! Project discovery walks up from the working directory to the nearest
@@ -136,7 +136,7 @@ fn discover(cwd: &Path) -> anyhow::Result<Project> {
     })
 }
 
-/// All `*.lua` / `*.lb` files under the project root, deterministic order,
+/// All `*.lua` / `*.luab` files under the project root, deterministic order,
 /// skipping dot-directories and the build output directory.
 fn collect_source_files(project: &Project) -> anyhow::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
@@ -162,7 +162,7 @@ fn walk(dir: &Path, project: &Project, files: &mut Vec<PathBuf>) -> anyhow::Resu
         } else if !hidden
             && matches!(
                 path.extension().and_then(|e| e.to_str()),
-                Some("lua" | "lb")
+                Some("lua" | "luab")
             )
         {
             files.push(path);

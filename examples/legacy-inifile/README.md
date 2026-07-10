@@ -1,9 +1,9 @@
 # legacy-inifile
 
-A pure-**LuaCATS** library: no `.lb` shapes at all. This is what an existing,
+A pure-**LuaCATS** library: no `.luab` shapes at all. This is what an existing,
 idiomatic Lua 5.1 codebase looks like when luabox checks it — proving the
 "annotated Lua checks day one" promise. Contrast it with `../geometry`, which
-layers the `.lb` shape DSL on top of the same type IR.
+layers the `.luab` shape DSL on top of the same type IR.
 
 ```
 legacy-inifile/
@@ -48,15 +48,15 @@ This example deliberately shows both suppression mechanisms:
 
 ## LuaCATS vs. shapes — when to reach for which
 
-| | LuaCATS (`---@class`) | `.lb` shapes |
+| | LuaCATS (`---@class`) | `.luab` shapes |
 |---|---|---|
-| Lives in | `.lua` comments | separate `.lb` files |
+| Lives in | `.lua` comments | separate `.luab` files |
 | Sealing | width/optional per strictness | **sealed** — hard errors always |
 | Traits / conformance | ad-hoc | `trait` + `---@impl` coherence |
 | Editor support | every LuaLS editor | luabox-aware tooling |
 | Best for | existing code, gradual typing | new libraries wanting rigor |
 
-Both compile to one IR and interoperate freely — a `.lb` struct is usable in a
-`---@param`, and a `---@class` table can satisfy a `.lb` trait. Use LuaCATS to
+Both compile to one IR and interoperate freely — a `.luab` struct is usable in a
+`---@param`, and a `---@class` table can satisfy a `.luab` trait. Use LuaCATS to
 adopt luabox on what you already have; add shapes where you want Rust-grade
 guarantees.

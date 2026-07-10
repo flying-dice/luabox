@@ -9,7 +9,7 @@ Work through them top to bottom; each introduces one new idea.
 | # | Example | Edition → target | Demonstrates |
 |---|---------|------------------|--------------|
 | 1 | [hello-luabox](hello-luabox/) | 5.4 | The 60-second tour: `init` → `check` → `fmt` → `lint` → `test` → `run`, one annotated function, `[tasks]` |
-| 2 | [geometry](geometry/) | 5.4 | The `.lb` **shape DSL**: structs, traits, a supertrait, a generic, `---@use`/`---@struct`/`---@impl`, sealed checking, shape export |
+| 2 | [geometry](geometry/) | 5.4 | The `.luab` **shape DSL**: structs, traits, a supertrait, a generic, `---@use`/`---@struct`/`---@impl`, sealed checking, shape export |
 | 3 | [renderer](renderer/) | 5.1 | **Consuming shapes across a package boundary** (path dependency), `luabox install`, implementing an imported trait; runs end-to-end |
 | 4 | [legacy-inifile](legacy-inifile/) | 5.1 | **Pure LuaCATS** (`---@class`/`---@param`/`---@return`), warn mode, `[lint]` allowlist + `---@luabox-ignore`; LuaCATS vs. shapes |
 | 5 | [timemachine](timemachine/) | 5.4 → **5.1** | **Cross-version lowering**: write 5.4 (`goto`, bitops, `<close>`, `//`), `build` + `bundle` to 5.1, run the output on stock Lua 5.1 |
@@ -21,7 +21,7 @@ Work through them top to bottom; each introduces one new idea.
 1. **Start at `hello-luabox`** to feel the core loop — the commands you'll use
    every day.
 2. **`geometry` then `renderer`** are a pair: the first *declares and exports*
-   `.lb` shapes, the second *imports* them across a dependency edge. This is
+   `.luab` shapes, the second *imports* them across a dependency edge. This is
    luabox's signature feature — Rust-style structs and traits over untyped Lua.
 3. **`legacy-inifile`** is the counterpoint: no shapes at all, just LuaCATS
    annotations on an ordinary Lua 5.1 library. It shows luabox meeting existing

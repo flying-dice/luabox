@@ -227,7 +227,7 @@ static REGISTRY: &[Entry] = &[
     },
     Entry {
         code: Code::new(2010),
-        title: "body in `.lb` file",
+        title: "body in `.luab` file",
         explain: LB2010,
     },
 ];
@@ -579,7 +579,7 @@ The check is deliberately conservative. It stays silent when the shape is
 not fully known: tables that escape into unanalyzed code (arguments to
 unknown functions, global writes), tables with dynamic-key writes or
 indexer types, tables whose metatable/`__index` cannot be resolved, and
-carriers bound to a `---@class` or `.lb` struct (those are governed by
+carriers bound to a `---@class` or `.luab` struct (those are governed by
 their declarations — `LB0303`/`LB2002`) never produce this diagnostic.
 
 Fix the spelling, or assign the field somewhere the checker can see.
@@ -956,7 +956,7 @@ The value supplied is none of these.
 
 Note: **Luau is intentionally out of scope** (SPEC.md §1). It is a separate
 typed paradigm with its own owner and toolchain; luabox's typed story is the
-`.lb` shape DSL layered over untyped Lua, so `luau` is not a valid edition.
+`.luab` shape DSL layered over untyped Lua, so `luau` is not a valid edition.
 ";
 
 const LB1002: &str = "\
@@ -1020,7 +1020,7 @@ field the struct declares as non-optional. Structs are *sealed* (SHAPES.md
 §5): every field not marked `?` must be present.
 
 ```rust
-// geometry.lb
+// geometry.luab
 struct Point { x: number, y: number, label: string? }
 ```
 
@@ -1035,7 +1035,7 @@ local p = { x = 0 }        -- LB2001: missing non-optional field `y`
 Shape rules are hard errors at every strictness level — the `---@struct`
 binding is itself the opt-in.
 
-Add the missing field, or mark it optional in the `.lb` declaration
+Add the missing field, or mark it optional in the `.luab` declaration
 (`field: T?`).
 ";
 
@@ -1046,7 +1046,7 @@ A table literal, field read, or field write used a key the struct does not
 declare. Sealed structs reject unknown keys outright (SHAPES.md §5).
 
 ```rust
-// geometry.lb
+// geometry.luab
 struct Point { x: number, y: number }
 struct Bag { n: number, .. }          // `..` opens the shape
 ```
@@ -1075,7 +1075,7 @@ An `---@impl Trait for Struct` carrier does not define every function the
 trait requires. The diagnostic lists all missing functions.
 
 ```rust
-// geometry.lb
+// geometry.luab
 trait Shape {
     fn area(self) -> number;
     fn perimeter(self) -> number;
@@ -1111,7 +1111,7 @@ the `:` vs `.` receiver must agree with `self` in the trait. Both spans are
 shown: the implementation and the trait declaration.
 
 ```rust
-// geometry.lb
+// geometry.luab
 trait Shape {
     fn area(self) -> number;
 }
@@ -1143,10 +1143,10 @@ E?` (SHAPES.md §12.1).
 const LB2005: &str = "\
 # LB2005: unresolved `---@use` module
 
-A `---@use <module>` (or a `use` inside a `.lb` file) names a shape module
+A `---@use <module>` (or a `use` inside a `.luab` file) names a shape module
 that could not be resolved. Resolution tries, first hit wins (SHAPES.md §6):
 
-1. a sibling `<module>.lb` next to the using file;
+1. a sibling `<module>.luab` next to the using file;
 2. the `[types] shape-paths` directories from `luabox.toml`, in order —
    more than one hit *within* this tier is an ambiguity, also this error;
 3. dependency-exported shapes. A dependency *exports* shape modules by
@@ -1159,21 +1159,21 @@ that could not be resolved. Resolution tries, first hit wins (SHAPES.md §6):
    ```
 
    The consumer then resolves `---@use geometry` to that dependency's
-   `geometry.lb` (looked up at the dependency root, then on the
+   `geometry.luab` (looked up at the dependency root, then on the
    dependency's own `[types] shape-paths`). Only exported names cross the
-   package boundary — a `.lb` the dependency does not list stays private.
+   package boundary — a `.luab` the dependency does not list stays private.
    Two dependencies exporting the same module is an ambiguity, this error,
    listing both candidates.
 
 ```lua
----@use geometry     -- LB2005 if no geometry.lb is found in tiers 1–3
+---@use geometry     -- LB2005 if no geometry.luab is found in tiers 1–3
 ```
 
 A dependency's own shape file resolves *its* nested `use`s within that
 dependency package only (one level): the exports of a
 dependency-of-a-dependency are not visible.
 
-Create the `.lb` file next to the using file, add its directory to
+Create the `.luab` file next to the using file, add its directory to
 `[types] shape-paths`, have the owning dependency export it via
 `[types] shapes`, or fix the spelling. For an ambiguity, remove or rename
 one of the competing modules (the diagnostic lists the candidates).
@@ -1186,7 +1186,7 @@ A `---@struct <Name>` (or the trait/struct in an `---@impl`) refers to a
 name that no shape module in scope declares.
 
 ```rust
-// geometry.lb
+// geometry.luab
 struct Point { x: number, y: number }
 ```
 
@@ -1199,7 +1199,7 @@ local p = { x = 0, y = 0 }
 
 Check the spelling, and check the declaring module is imported with
 `---@use`. For `---@impl T for S`, `S` may also be a `---@class` declared in
-the same file (LuaCATS interop) — but `T` must be a `.lb` trait.
+the same file (LuaCATS interop) — but `T` must be a `.luab` trait.
 ";
 
 const LB2007: &str = "\
@@ -1210,7 +1210,7 @@ the parameter's declared bound. Generics are monomorphised per use site and
 violations are reported at the use site, rustc-style (SHAPES.md §5).
 
 ```rust
-// geometry.lb
+// geometry.luab
 trait Shape { fn area(self) -> number; }
 struct Circle { radius: number }
 impl Shape for Circle;
@@ -1232,7 +1232,7 @@ An `---@impl` of a trait with supertraits (`trait Drawable: Shape`) requires
 the carrier to conform to every supertrait as well, on the same carrier.
 
 ```rust
-// geometry.lb
+// geometry.luab
 trait Shape    { fn area(self) -> number; }
 trait Drawable: Shape { fn draw(self); }
 struct Circle  { radius: number }
@@ -1250,18 +1250,18 @@ function Circle:draw() end
 ```
 
 Add `---@impl Shape for Circle` (with its required functions) to the same
-carrier, or assert `impl Shape for Circle;` in a `.lb` module.
+carrier, or assert `impl Shape for Circle;` in a `.luab` module.
 ";
 
 const LB2010: &str = "\
-# LB2010: body in `.lb` file
+# LB2010: body in `.luab` file
 
-A `.lb` shape file contains a function body. Shape files are
+A `.luab` shape file contains a function body. Shape files are
 declaration-only — no bodies, no expressions (SHAPES.md §3). Implementations
 live in `.lua` and bind with `---@impl`.
 
 ```rust
-// geometry.lb
+// geometry.luab
 trait Shape {
     fn area(self) -> number { return 1 }   // LB2010
 }

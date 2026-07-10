@@ -1,4 +1,4 @@
-//! Fuzz the `.lb` shape grammar: `shape::parse` and `shape::format`
+//! Fuzz the `.luab` shape grammar: `shape::parse` and `shape::format`
 //! (SHAPES.md, SPEC.md §16.1).
 //!
 //! Invariants checked for arbitrary input:

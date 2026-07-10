@@ -4,21 +4,21 @@ First-class VS Code support for the [luabox](https://github.com/luabox/luabox)
 Lua toolchain. This extension is a thin wrapper around the `luabox lsp`
 language server: typecheck, lint, hover, goto-definition, completion, document
 symbols, formatting and semantic highlighting for both `.lua` sources and
-`.lb` shape files.
+`.luab` shape files.
 
 ## What it provides
 
 - Launches `luabox lsp` (stdio) via `vscode-languageclient` and attaches it to
-  `lua` and `luabox-shape` (`.lb`) documents.
+  `lua` and `luabox-shape` (`.luab`) documents.
 - **Formatting** (`Format Document`, and `Format Selection` with
   whole-document MVP semantics) via the canonical luabox formatters — see
   [Formatting](#formatting) below.
 - **Semantic highlighting**: the server advertises semantic tokens with only
   standard token types/modifiers, and `vscode-languageclient` requests them
   automatically — no theme configuration needed. Locals vs globals,
-  parameters, LuaCATS `---@` annotation comments, and `.lb`
+  parameters, LuaCATS `---@` annotation comments, and `.luab`
   structs/traits/generics all render distinctly.
-- A `luabox-shape` language definition for `.lb` files with a TextMate grammar
+- A `luabox-shape` language definition for `.luab` files with a TextMate grammar
   (Rust-like `struct` / `trait` / `impl` / `fn` keywords + Lua-ish types) and a
   comment/bracket language configuration.
 - A `luabox.path` setting to point at a specific `luabox` binary.
@@ -40,12 +40,12 @@ symbols, formatting and semantic highlighting for both `.lua` sources and
 
 The server provides document (and range) formatting for both languages:
 `.lua` is formatted in the canonical luabox style for the project's edition
-(SPEC §10), `.lb` in the canonical shape style. The formatter never destroys
+(SPEC §10), `.luab` in the canonical shape style. The formatter never destroys
 code — a document with parse errors is simply left unchanged. Range
 formatting has MVP semantics: the whole document is formatted (the canonical
 formatter is whole-file by design).
 
-For `.lb` files this extension is the only formatter, but make it explicit —
+For `.luab` files this extension is the only formatter, but make it explicit —
 and opt into format-on-save — in your `settings.json`:
 
 ```jsonc
@@ -85,7 +85,7 @@ npm run compile          # tsc -> ./out/extension.js
 ### Run in the Extension Development Host
 
 Open `editors/vscode` in VS Code and press <kbd>F5</kbd> (Run Extension). A new
-window opens with the extension loaded; open a `.lua` or `.lb` file to activate
+window opens with the extension loaded; open a `.lua` or `.luab` file to activate
 the server.
 
 ### Package a `.vsix`

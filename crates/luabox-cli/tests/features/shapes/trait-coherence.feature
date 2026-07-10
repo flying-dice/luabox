@@ -15,7 +15,7 @@ Feature: Trait coherence
     Then diagnostic LB2004 is reported with both spans
 
   Scenario: supertrait conformance required
-    Given trait Drawable: Shape in "geometry.lb"
+    Given trait Drawable: Shape in "geometry.luab"
     And a carrier table with ---@impl Drawable for Circle but no Shape impl
     When I run "luabox check"
     Then diagnostic LB2008 is reported

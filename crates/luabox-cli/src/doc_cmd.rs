@@ -1,10 +1,10 @@
 //! `luabox doc [--open]` — a static documentation site from LuaCATS
-//! annotations and `.lb` shape declarations (SPEC.md §13).
+//! annotations and `.luab` shape declarations (SPEC.md §13).
 //!
 //! Pipeline:
 //!
 //! 1. **Discover** the project (nearest `luabox.toml`, like `luabox check`)
-//!    and walk its `.lua` and `.lb` files, plus any `.lb` modules under the
+//!    and walk its `.lua` and `.luab` files, plus any `.luab` modules under the
 //!    manifest's `[types] shape-paths`.
 //! 2. **Harvest** the model (`doc_cmd::model`): per-file modules with
 //!    functions/classes/aliases/enums from the LuaCATS harvest, per-file
@@ -41,7 +41,7 @@ pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
     let (lua_files, lb_files) = check_cmd::collect_files(&project)?;
     let (package, shape_paths) = manifest_facts(&project.root);
 
-    // `.lb` modules: project files plus the manifest's shape-paths tiers,
+    // `.luab` modules: project files plus the manifest's shape-paths tiers,
     // deduplicated (a shape path inside the project root is walked twice).
     let mut lb_set: BTreeSet<PathBuf> = lb_files.into_iter().collect();
     for dir in &shape_paths {
@@ -123,7 +123,7 @@ fn manifest_facts(root: &Path) -> (String, Vec<PathBuf>) {
     (manifest.package.name, shape_paths)
 }
 
-/// Collect every `.lb` file under `dir`, recursively, into `out`.
+/// Collect every `.luab` file under `dir`, recursively, into `out`.
 fn collect_lb(dir: &Path, out: &mut BTreeSet<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -132,7 +132,7 @@ fn collect_lb(dir: &Path, out: &mut BTreeSet<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             collect_lb(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("lb") {
+        } else if path.extension().and_then(|e| e.to_str()) == Some("luab") {
             out.insert(path);
         }
     }

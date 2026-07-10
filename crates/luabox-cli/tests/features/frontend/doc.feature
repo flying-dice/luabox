@@ -1,6 +1,6 @@
 Feature: luabox doc — static documentation site
   SPEC.md §13: `luabox doc` generates a static site into `doc/` from
-  LuaCATS annotations and `.lb` shape declarations — search, cross-linked
+  LuaCATS annotations and `.luab` shape declarations — search, cross-linked
   types, one page per module and per class/struct/trait, no external
   assets. Doc examples running under `luabox test --doc` are not
   implemented yet. `--open` (launching a browser) is deliberately not
@@ -45,9 +45,9 @@ Feature: luabox doc — static documentation site
     And "doc/class.Circle.html" contains "Fields inherited from"
     And "doc/class.Circle.html" contains "id"
 
-  Scenario: .lb struct page renders with a sealed marker
+  Scenario: .luab struct page renders with a sealed marker
     Given a project with edition "5.4"
-    And a file "src/geometry.lb" containing:
+    And a file "src/geometry.luab" containing:
       """
       /// A 2D point.
       struct Point {
@@ -64,7 +64,7 @@ Feature: luabox doc — static documentation site
 
   Scenario: type names cross-link to their documented pages
     Given a project with edition "5.4"
-    And a file "src/geometry.lb" containing:
+    And a file "src/geometry.luab" containing:
       """
       struct Point { x: number, y: number }
       """
@@ -85,7 +85,7 @@ Feature: luabox doc — static documentation site
 
   Scenario: trait page lists required functions and implementors
     Given a project with edition "5.4"
-    And a file "src/geometry.lb" containing:
+    And a file "src/geometry.luab" containing:
       """
       struct Circle { radius: number }
 

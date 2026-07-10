@@ -36,7 +36,7 @@
 //! ## Filtering
 //!
 //! Only sources that can affect the command's outcome trigger a rerun:
-//! `*.lua`, `*.lb`, and the manifest `luabox.toml`. Everything else is
+//! `*.lua`, `*.luab`, and the manifest `luabox.toml`. Everything else is
 //! noise and is ignored by [`is_relevant`]:
 //! - dot-directories and dot-files anywhere under the root (`.git/`,
 //!   `.luabox/`, editor state) — same "hidden" convention `check_cmd`'s
@@ -140,7 +140,7 @@ fn filter_and_dedupe(raw: Vec<PathBuf>, root: &Path, out_dir: Option<&Path>) -> 
         .collect()
 }
 
-/// Whether a changed path should trigger a rerun: a `.lua`/`.lb` source or
+/// Whether a changed path should trigger a rerun: a `.lua`/`.luab` source or
 /// `luabox.toml`, not under a dot-directory/dot-file or the build output
 /// directory, and not an editor temp/lock file.
 pub(crate) fn is_relevant(path: &Path, root: &Path, out_dir: Option<&Path>) -> bool {
@@ -162,7 +162,11 @@ pub(crate) fn is_relevant(path: &Path, root: &Path, out_dir: Option<&Path>) -> b
         return false;
     }
 
-    name == "luabox.toml" || matches!(path.extension().and_then(OsStr::to_str), Some("lua" | "lb"))
+    name == "luabox.toml"
+        || matches!(
+            path.extension().and_then(OsStr::to_str),
+            Some("lua" | "luab")
+        )
 }
 
 fn is_dotfile(component: &OsStr) -> bool {
@@ -273,7 +277,7 @@ mod tests {
     fn relevant_lua_lb_and_manifest() {
         let root = Path::new("/proj");
         assert!(is_relevant(Path::new("/proj/src/foo.lua"), root, None));
-        assert!(is_relevant(Path::new("/proj/shapes/foo.lb"), root, None));
+        assert!(is_relevant(Path::new("/proj/shapes/foo.luab"), root, None));
         assert!(is_relevant(Path::new("/proj/luabox.toml"), root, None));
     }
 

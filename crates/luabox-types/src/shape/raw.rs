@@ -1,16 +1,16 @@
-//! The owned, thread-safe mirror of the `.lb` typed AST.
+//! The owned, thread-safe mirror of the `.luab` typed AST.
 //!
 //! [`crate::shape::ShapeStore`] caches parsed shape modules across rayon
 //! workers, and rowan syntax nodes are not `Send` — so the AST is converted
 //! into this plain-data model immediately after parsing. Ranges are byte
-//! offsets into the `.lb` source, kept for diagnostics.
+//! offsets into the `.luab` source, kept for diagnostics.
 
 use std::ops::Range;
 use std::path::PathBuf;
 
 use luabox_syntax::shape::{self, ast};
 
-/// A `.lb` type expression, owned (SHAPES.md §3 `type`).
+/// A `.luab` type expression, owned (SHAPES.md §3 `type`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RawTy {
     /// `Name` or `Name<Args>`; also every primitive keyword.
@@ -29,7 +29,7 @@ pub(crate) enum RawTy {
         returns: Vec<RawTy>,
     },
     /// Unparseable — lowers to `unknown` (the parse error is reported when
-    /// the `.lb` file itself is checked).
+    /// the `.luab` file itself is checked).
     Error,
 }
 
@@ -109,7 +109,7 @@ pub(crate) struct RawError {
     pub range: Range<usize>,
 }
 
-/// One fully parsed `.lb` shape module.
+/// One fully parsed `.luab` shape module.
 #[derive(Debug)]
 pub(crate) struct RawModule {
     /// Diagnostic file name (project-relative, forward slashes).
@@ -129,7 +129,7 @@ fn node_range(node: &shape::ShapeSyntaxNode) -> Range<usize> {
     usize::from(r.start())..usize::from(r.end())
 }
 
-/// Parse `.lb` source into the owned module model.
+/// Parse `.luab` source into the owned module model.
 pub(crate) fn parse_module(source: &str, file: String, dir: PathBuf) -> RawModule {
     let parse = shape::parse(source);
     let mut module = RawModule {

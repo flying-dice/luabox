@@ -9,7 +9,7 @@ ASCII shapes to stdout.
 renderer/
 ├── luabox.toml           # [dependencies] geometry = { path = "../geometry" }
 ├── luabox.lock           # committed — this is an app, not a library
-├── shapes/render.lb      # `use geometry;` + our own `struct Square`
+├── shapes/render.luab      # `use geometry;` + our own `struct Square`
 ├── src/square.lua        # ---@impl Drawable for Square
 └── src/main.lua          # draws a square with `luabox run start`
 ```
@@ -28,7 +28,7 @@ like `../geometry` don't commit a lockfile.)
 ## Crossing the package boundary
 
 geometry's manifest exports its shape module with `[types] shapes =
-["geometry"]`. That makes tier-3 resolution work: our `shapes/render.lb` says
+["geometry"]`. That makes tier-3 resolution work: our `shapes/render.luab` says
 `use geometry;` and gets geometry's `Shape` and `Drawable` traits in scope,
 even though they were declared in a different package. We then declare our own
 `struct Square` and assert `impl Drawable for Square;`.

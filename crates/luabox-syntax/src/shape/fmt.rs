@@ -1,4 +1,4 @@
-//! The canonical `.lb` formatter (SHAPES.md §8): 4-space indent, one item per
+//! The canonical `.luab` formatter (SHAPES.md §8): 4-space indent, one item per
 //! line, a single blank line between items, trailing commas on multi-line field
 //! lists — and *no configuration*.
 //!
@@ -25,7 +25,7 @@ use rowan::NodeOrToken;
 
 const INDENT: &str = "    ";
 
-/// Format `.lb` source into its canonical form (SHAPES.md §8).
+/// Format `.luab` source into its canonical form (SHAPES.md §8).
 ///
 /// Returns the input unchanged when it does not parse cleanly, or when
 /// reformatting would drop a comment — a formatter never destroys code.
@@ -398,7 +398,7 @@ struct Point {
 
     #[test]
     fn idempotent_on_spec_example() {
-        let src = include_str!("test_data/spec_example.lb");
+        let src = include_str!("test_data/spec_example.luab");
         let once = format(src);
         assert_eq!(format(&once), once, "format must be idempotent");
     }

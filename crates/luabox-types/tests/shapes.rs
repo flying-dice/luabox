@@ -3,7 +3,7 @@
 //! supertraits, LuaCATS interop, the `Result<T, E>` convention, sealed vs
 //! open (`..`), and `setmetatable` instantiation.
 //!
-//! Fixtures are real temp-dir projects: `.lb` files on disk, `.lua` sources
+//! Fixtures are real temp-dir projects: `.luab` files on disk, `.lua` sources
 //! checked through the public [`luabox_types::check_file_shaped`] API.
 
 use std::path::PathBuf;
@@ -79,10 +79,10 @@ impl Fixture {
             .collect()
     }
 
-    /// Check a `.lb` file previously written with [`Fixture::write`].
+    /// Check a `.luab` file previously written with [`Fixture::write`].
     fn check_lb(&self, rel: &str) -> Vec<Diagnostic> {
         let path = self.dir.path().join(rel);
-        let source = std::fs::read_to_string(&path).expect("read .lb");
+        let source = std::fs::read_to_string(&path).expect("read .luab");
         let store = ShapeStore::new(self.dir.path());
         store.check_lb_file(&path, &source, &self.shape_paths, &self.dependencies)
     }
@@ -91,7 +91,7 @@ impl Fixture {
 fn geometry_fixture() -> Fixture {
     let f = Fixture::new();
     f.write(
-        "src/geometry.lb",
+        "src/geometry.luab",
         "struct Point { x: number, y: number, label: string? }\n\
          struct Bag { n: number, .. }\n",
     );
@@ -237,7 +237,7 @@ fn declared_struct_is_not_lb2006() {
 fn circle_fixture() -> Fixture {
     let f = Fixture::new();
     f.write(
-        "src/geometry.lb",
+        "src/geometry.luab",
         "struct Circle { radius: number }\n\
          trait Shape {\n    fn area(self) -> number;\n    fn perimeter(self) -> number;\n}\n",
     );
@@ -393,7 +393,7 @@ end
         .iter()
         .find(|l| !l.primary)
         .expect("secondary label");
-    assert_eq!(secondary.span.file, "src/geometry.lb");
+    assert_eq!(secondary.span.file, "src/geometry.luab");
 }
 
 #[test]
@@ -468,7 +468,7 @@ end
 fn lb2004_param_contravariance_violation() {
     let f = Fixture::new();
     f.write(
-        "src/geometry.lb",
+        "src/geometry.luab",
         "struct Circle { radius: number }\n\
          trait Scalable {\n    fn scale(self, factor: number);\n}\n",
     );
@@ -492,7 +492,7 @@ end
 fn annotated_matching_signature_is_clean() {
     let f = Fixture::new();
     f.write(
-        "src/geometry.lb",
+        "src/geometry.luab",
         "struct Circle { radius: number }\n\
          trait Scalable {\n    fn scale(self, factor: number) -> number;\n}\n",
     );
@@ -517,7 +517,7 @@ end
 fn lb2008_supertrait_conformance_missing() {
     let f = Fixture::new();
     f.write(
-        "src/geometry.lb",
+        "src/geometry.luab",
         "struct Circle { radius: number }\n\
          trait Shape {\n    fn area(self) -> number;\n}\n\
          trait Drawable: Shape {\n    fn draw(self);\n}\n",
@@ -541,7 +541,7 @@ end
 fn lb2008_satisfied_by_impl_on_same_carrier() {
     let f = Fixture::new();
     f.write(
-        "src/geometry.lb",
+        "src/geometry.luab",
         "struct Circle { radius: number }\n\
          trait Shape {\n    fn area(self) -> number;\n}\n\
          trait Drawable: Shape {\n    fn draw(self);\n}\n",
@@ -569,7 +569,7 @@ end
 fn lb2008_satisfied_by_lb_impl_assertion() {
     let f = Fixture::new();
     f.write(
-        "src/geometry.lb",
+        "src/geometry.luab",
         "struct Circle { radius: number }\n\
          trait Shape {\n    fn area(self) -> number;\n}\n\
          trait Drawable: Shape {\n    fn draw(self);\n}\n\
@@ -621,7 +621,7 @@ function Thing:x() end
 fn luacats_class_satisfies_a_shape_trait() {
     let f = Fixture::new();
     f.write(
-        "src/geometry.lb",
+        "src/geometry.luab",
         "trait Shape {\n    fn area(self) -> number;\n}\n",
     );
     let src = "\
@@ -644,7 +644,7 @@ end
 fn luacats_class_field_fn_type_counts_as_method() {
     let f = Fixture::new();
     f.write(
-        "src/geometry.lb",
+        "src/geometry.luab",
         "trait Shape {\n    fn area(self) -> number;\n}\n",
     );
     let src = "\
@@ -719,7 +719,10 @@ fn lb2005_unresolved_module_documents_all_tiers() {
 fn dependency_exported_shape_resolves_and_seals() {
     let mut f = Fixture::new();
     // A dependency package rooted at `dep/`, exporting `geometry`.
-    f.write("dep/geometry.lb", "struct Point { x: number, y: number }\n");
+    f.write(
+        "dep/geometry.luab",
+        "struct Point { x: number, y: number }\n",
+    );
     f.add_dependency("geo", "dep", &["geometry"]);
     // The consumer `---@use geometry` resolves across the package boundary,
     // and sealed checking fires on the bound literal.
@@ -732,9 +735,12 @@ fn dependency_exported_shape_resolves_and_seals() {
 #[test]
 fn dependency_not_exporting_the_module_is_lb2005() {
     let mut f = Fixture::new();
-    // The `.lb` exists in the dependency, but it is not in `[types] shapes`,
+    // The `.luab` exists in the dependency, but it is not in `[types] shapes`,
     // so it stays invisible across the package boundary.
-    f.write("dep/geometry.lb", "struct Point { x: number, y: number }\n");
+    f.write(
+        "dep/geometry.luab",
+        "struct Point { x: number, y: number }\n",
+    );
     f.add_dependency("geo", "dep", &[]);
     let diags = f.check("---@use geometry\n");
     assert_eq!(diags.len(), 1, "{diags:?}");
@@ -744,8 +750,8 @@ fn dependency_not_exporting_the_module_is_lb2005() {
 #[test]
 fn two_dependencies_exporting_the_same_module_are_ambiguous() {
     let mut f = Fixture::new();
-    f.write("dep_a/geometry.lb", "struct Point { x: number }\n");
-    f.write("dep_b/geometry.lb", "struct Point { x: number }\n");
+    f.write("dep_a/geometry.luab", "struct Point { x: number }\n");
+    f.write("dep_b/geometry.luab", "struct Point { x: number }\n");
     f.add_dependency("geo_a", "dep_a", &["geometry"]);
     f.add_dependency("geo_b", "dep_b", &["geometry"]);
     let diags = f.check("---@use geometry\n");
@@ -764,10 +770,13 @@ fn two_dependencies_exporting_the_same_module_are_ambiguous() {
 #[test]
 fn local_tiers_win_over_dependency_exports() {
     let mut f = Fixture::new();
-    // A sibling `geometry.lb` (tier 1) and a dependency both define it; the
+    // A sibling `geometry.luab` (tier 1) and a dependency both define it; the
     // sibling wins, so this literal is clean only via the local file.
-    f.write("src/geometry.lb", "struct Point { x: number }\n");
-    f.write("dep/geometry.lb", "struct Point { x: number, y: number }\n");
+    f.write("src/geometry.luab", "struct Point { x: number }\n");
+    f.write(
+        "dep/geometry.luab",
+        "struct Point { x: number, y: number }\n",
+    );
     f.add_dependency("geo", "dep", &["geometry"]);
     let diags = f.check("---@use geometry\n\n---@struct Point\nlocal p = { x = 1 }\n");
     assert!(diags.is_empty(), "{diags:?}");
@@ -776,11 +785,11 @@ fn local_tiers_win_over_dependency_exports() {
 #[test]
 fn dependency_shape_nested_use_stays_within_its_package() {
     let mut f = Fixture::new();
-    // The exported `geometry.lb` itself `use`s a sibling `base.lb` that lives
+    // The exported `geometry.luab` itself `use`s a sibling `base.luab` that lives
     // in the same dependency package — nested resolution finds it there.
-    f.write("dep/base.lb", "struct Point { x: number, y: number }\n");
+    f.write("dep/base.luab", "struct Point { x: number, y: number }\n");
     f.write(
-        "dep/geometry.lb",
+        "dep/geometry.luab",
         "use base;\nstruct Segment { from: Point, to: Point }\n",
     );
     f.add_dependency("geo", "dep", &["geometry"]);
@@ -803,9 +812,9 @@ fn sibling_tier_resolves_first() {
     let mut f = Fixture::new();
     f.add_shape_path("shapes");
     // Same module name in both tiers: the sibling must win.
-    f.write("src/geometry.lb", "struct Point { x: number }\n");
+    f.write("src/geometry.luab", "struct Point { x: number }\n");
     f.write(
-        "shapes/geometry.lb",
+        "shapes/geometry.luab",
         "struct Point { x: number, y: number }\n",
     );
     // Sibling's Point has no `y`: this literal is clean only via tier 1.
@@ -817,7 +826,7 @@ fn sibling_tier_resolves_first() {
 fn shape_path_tier_resolves_when_no_sibling() {
     let mut f = Fixture::new();
     f.add_shape_path("shapes");
-    f.write("shapes/geometry.lb", "struct Point { x: number }\n");
+    f.write("shapes/geometry.luab", "struct Point { x: number }\n");
     let diags = f.check("---@use geometry\n\n---@struct Point\nlocal p = { x = 1 }\n");
     assert!(diags.is_empty(), "{diags:?}");
 }
@@ -827,8 +836,8 @@ fn lb2005_same_tier_ambiguity() {
     let mut f = Fixture::new();
     f.add_shape_path("shapes_a");
     f.add_shape_path("shapes_b");
-    f.write("shapes_a/geometry.lb", "struct Point { x: number }\n");
-    f.write("shapes_b/geometry.lb", "struct Point { x: number }\n");
+    f.write("shapes_a/geometry.luab", "struct Point { x: number }\n");
+    f.write("shapes_b/geometry.luab", "struct Point { x: number }\n");
     let diags = f.check("---@use geometry\n");
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert_eq!(diags[0].code.to_string(), "LB2005");
@@ -842,9 +851,9 @@ fn lb2005_same_tier_ambiguity() {
 #[test]
 fn use_inside_lb_resolves_transitively() {
     let f = Fixture::new();
-    f.write("src/base.lb", "struct Point { x: number, y: number }\n");
+    f.write("src/base.luab", "struct Point { x: number, y: number }\n");
     f.write(
-        "src/geometry.lb",
+        "src/geometry.luab",
         "use base;\nstruct Segment { from: Point, to: Point }\n",
     );
     let src = "\
@@ -866,7 +875,7 @@ local s = { from = { x = 0, y = 0 }, to = { x = 1 } }
 fn generic_struct_monomorphised_at_binding_site() {
     let f = Fixture::new();
     f.write(
-        "src/geometry.lb",
+        "src/geometry.luab",
         "struct Pair<T> { first: T, second: T }\n",
     );
     let src = "\
@@ -893,7 +902,7 @@ local p = { first = 1 }
 fn generic_field_types_are_substituted() {
     let f = Fixture::new();
     f.write(
-        "src/geometry.lb",
+        "src/geometry.luab",
         "struct Pair<T> { first: T, second: T }\n",
     );
     let src = "\
@@ -911,7 +920,7 @@ local p = { first = \"no\", second = 2 }
 fn lb2007_bound_violation_at_lua_use_site() {
     let f = Fixture::new();
     f.write(
-        "src/geometry.lb",
+        "src/geometry.luab",
         "trait Shape {\n    fn area(self) -> number;\n}\n\
          struct Holder<T: Shape> { value: T }\n",
     );
@@ -929,7 +938,7 @@ local h = { value = 1 }
 fn bound_satisfied_by_lb_impl() {
     let f = Fixture::new();
     f.write(
-        "src/geometry.lb",
+        "src/geometry.luab",
         "trait Shape {\n    fn area(self) -> number;\n}\n\
          struct Circle { radius: number }\n\
          impl Shape for Circle;\n\
@@ -948,17 +957,17 @@ local h = { value = { radius = 1 } }
 fn lb2007_bound_violation_inside_lb_file() {
     let f = Fixture::new();
     f.write(
-        "src/geometry.lb",
+        "src/geometry.luab",
         "trait Shape {\n    fn area(self) -> number;\n}\n\
          struct Holder<T: Shape> { value: T }\n\
          struct Bad { h: Holder<number> }\n",
     );
-    let diags = f.check_lb("src/geometry.lb");
+    let diags = f.check_lb("src/geometry.luab");
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert_eq!(diags[0].code.to_string(), "LB2007");
     assert_eq!(
         diags[0].primary_label().expect("label").span.file,
-        "src/geometry.lb"
+        "src/geometry.luab"
     );
 }
 
@@ -966,7 +975,7 @@ fn lb2007_bound_violation_inside_lb_file() {
 fn vec_and_hashmap_lower_structurally() {
     let f = Fixture::new();
     f.write(
-        "src/geometry.lb",
+        "src/geometry.luab",
         "struct Poly { points: Vec<number>, tags: HashMap<string, boolean> }\n",
     );
     let src = "\
@@ -984,7 +993,7 @@ local p = { points = { 1, 2 }, tags = {} }
 fn result_expands_to_optional_pair_in_return_position() {
     let f = Fixture::new();
     f.write(
-        "src/geometry.lb",
+        "src/geometry.luab",
         "struct Point { x: number, y: number }\n\
          trait Parser {\n    fn parse(self, s: string) -> Result<Point, string>;\n}\n",
     );
@@ -1023,16 +1032,16 @@ end
     assert_eq!(codes, vec!["LB2004"]);
 }
 
-// === .lb file checking (LB2010 / syntax) ====================================
+// === .luab file checking (LB2010 / syntax) ====================================
 
 #[test]
 fn lb2010_body_in_lb_file() {
     let f = Fixture::new();
     f.write(
-        "src/bad.lb",
+        "src/bad.luab",
         "trait Shape {\n    fn area(self) -> number { return 1 }\n}\n",
     );
-    let diags = f.check_lb("src/bad.lb");
+    let diags = f.check_lb("src/bad.luab");
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert_eq!(diags[0].code.to_string(), "LB2010");
     assert!(diags[0].message.contains("implementations live in .lua"));
@@ -1041,8 +1050,8 @@ fn lb2010_body_in_lb_file() {
 #[test]
 fn lb_syntax_error_is_lb0001() {
     let f = Fixture::new();
-    f.write("src/bad.lb", "struct { x: number }\n");
-    let diags = f.check_lb("src/bad.lb");
+    f.write("src/bad.luab", "struct { x: number }\n");
+    let diags = f.check_lb("src/bad.luab");
     assert!(!diags.is_empty());
     assert!(
         diags.iter().all(|d| d.code.to_string() == "LB0001"),
@@ -1054,10 +1063,10 @@ fn lb_syntax_error_is_lb0001() {
 fn lb2005_for_unresolved_use_inside_lb() {
     let f = Fixture::new();
     f.write(
-        "src/geometry.lb",
+        "src/geometry.luab",
         "use missing;\nstruct Point { x: number }\n",
     );
-    let diags = f.check_lb("src/geometry.lb");
+    let diags = f.check_lb("src/geometry.luab");
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert_eq!(diags[0].code.to_string(), "LB2005");
 }
@@ -1087,6 +1096,6 @@ measure({ area = function() return 1 end, perimeter = function() return 2 end })
 #[test]
 fn no_tags_means_no_shape_machinery() {
     let f = Fixture::new();
-    // No .lb files anywhere; a file without tags must be silent.
+    // No .luab files anywhere; a file without tags must be silent.
     assert!(f.check("local x = 1\nprint(x)\n").is_empty());
 }

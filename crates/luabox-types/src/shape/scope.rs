@@ -1,4 +1,4 @@
-//! Lowering `.lb` declarations into the unified type IR (SHAPES.md §2, §5).
+//! Lowering `.luab` declarations into the unified type IR (SHAPES.md §2, §5).
 //!
 //! A [`ShapeScope`] is the merged view of every shape module a file can see
 //! (its `---@use` roots plus their transitive `use`s): structs lowered to
@@ -45,7 +45,7 @@ pub struct StructShape {
     pub params: Vec<GenericParamDef>,
     /// The structural shape; `sealed` unless the struct carries `..`.
     pub table: TableTy,
-    /// The `.lb` file declaring the struct (diagnostic name).
+    /// The `.luab` file declaring the struct (diagnostic name).
     pub file: String,
     /// The declaration's byte range within that file.
     pub range: Range<usize>,
@@ -65,7 +65,7 @@ pub struct TraitFnSig {
     pub params: Vec<ParamTy>,
     /// Declared returns (`Result<T, E>` already expanded to `(T?, E?)`).
     pub returns: Vec<Ty>,
-    /// The `.lb` file declaring the trait (for LB2004's secondary label).
+    /// The `.luab` file declaring the trait (for LB2004's secondary label).
     pub file: String,
     /// The signature's byte range within that file.
     pub range: Range<usize>,
@@ -80,7 +80,7 @@ pub struct TraitShape {
     pub supertraits: Vec<String>,
     /// The required functions, by name.
     pub fns: BTreeMap<String, TraitFnSig>,
-    /// The `.lb` file declaring the trait.
+    /// The `.luab` file declaring the trait.
     pub file: String,
     /// The declaration's byte range within that file.
     pub range: Range<usize>,
@@ -106,9 +106,9 @@ pub struct ShapeScope {
     pub aliases: BTreeMap<String, AliasShape>,
     /// `(trait, struct)` conformance assertions from `impl ...;` items.
     pub impls: BTreeSet<(String, String)>,
-    /// Diagnostics raised while lowering the `.lb` declarations themselves
+    /// Diagnostics raised while lowering the `.luab` declarations themselves
     /// (e.g. `LB2007` at a use site inside a shape file). Reported when the
-    /// declaring `.lb` file is checked — *not* per importing `.lua` file.
+    /// declaring `.luab` file is checked — *not* per importing `.lua` file.
     pub diags: Vec<Diagnostic>,
 }
 
@@ -195,7 +195,7 @@ impl ShapeScope {
     }
 
     /// Whether `(trait, struct)` conformance is asserted by an `impl` item
-    /// in a `.lb` module in scope.
+    /// in a `.luab` module in scope.
     #[must_use]
     pub fn lb_impl(&self, trait_name: &str, struct_name: &str) -> bool {
         self.impls
@@ -568,7 +568,7 @@ impl LowerCtx<'_> {
         }
     }
 
-    /// The `.lb` type-vocabulary builtins (SHAPES.md §3): primitives plus
+    /// The `.luab` type-vocabulary builtins (SHAPES.md §3): primitives plus
     /// the `Vec`/`HashMap`/`Option`/`Result` constructors.
     fn lower_builtin(
         &mut self,

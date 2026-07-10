@@ -1,5 +1,5 @@
 //! Per-file diagnostics for publishing: parse errors, dialect legality, and
-//! type diagnostics for `.lua`; shape parse errors for `.lb`.
+//! type diagnostics for `.lua`; shape parse errors for `.luab`.
 //!
 //! Mirrors `luabox check`'s three passes over one memoized parse, converted
 //! to LSP ranges through the file's [`LineIndex`].
@@ -76,7 +76,7 @@ pub fn lua_diagnostics(
     Some(out)
 }
 
-/// Diagnostics for one `.lb` shape file: its parse errors (including the
+/// Diagnostics for one `.luab` shape file: its parse errors (including the
 /// `LB2010` body rejection), straight from `shape::parse` over `text`.
 #[must_use]
 pub fn lb_diagnostics(text: &str) -> Vec<Diagnostic> {

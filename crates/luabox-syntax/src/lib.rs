@@ -6,7 +6,7 @@
 //! - [`lua`] — every supported Lua dialect (5.1–5.4, LuaJIT), one grammar
 //!   with dialect feature-gating. Luau is out of scope toolchain-wide
 //!   (SPEC.md §1).
-//! - [`shape`] — the `.lb` shape DSL (SHAPES.md): analyser-only Rust-style
+//! - [`shape`] — the `.luab` shape DSL (SHAPES.md): analyser-only Rust-style
 //!   struct/trait declarations. Own syntax-kind space, zero coupling to the
 //!   Lua grammar (SHAPES.md §9).
 //!

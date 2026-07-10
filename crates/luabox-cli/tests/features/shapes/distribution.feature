@@ -1,9 +1,9 @@
-Feature: .lb shape distribution across package boundaries
+Feature: .luab shape distribution across package boundaries
   SHAPES.md §6 (resolution tier 3) and §7 — a dependency exports shape modules
   by listing them in `[types] shapes` in its own manifest; the consumer then
-  resolves `---@use <module>` to the dependency's `.lb`, and sealed checking
+  resolves `---@use <module>` to the dependency's `.luab`, and sealed checking
   fires cross-package. A module a dependency does not export stays private, and
-  two dependencies exporting the same name are an ambiguity. `.lb` ships as
+  two dependencies exporting the same name are an ambiguity. `.luab` ships as
   opaque source and never leaks into build output. All scenarios are hermetic:
   path dependencies used in place, or a pre-populated `lua_modules/`.
 
@@ -28,7 +28,7 @@ Feature: .lb shape distribution across package boundaries
       [types]
       shapes = ["geometry"]
       """
-    And a file "geo/geometry.lb" containing:
+    And a file "geo/geometry.luab" containing:
       """
       struct Point { x: number, y: number }
       """
@@ -64,7 +64,7 @@ Feature: .lb shape distribution across package boundaries
       [types]
       shapes = ["geometry"]
       """
-    And a file "lua_modules/geo/geometry.lb" containing:
+    And a file "lua_modules/geo/geometry.luab" containing:
       """
       struct Point { x: number, y: number }
       """
@@ -97,7 +97,7 @@ Feature: .lb shape distribution across package boundaries
       version = "1.0.0"
       edition = "5.4"
       """
-    And a file "geo/geometry.lb" containing:
+    And a file "geo/geometry.luab" containing:
       """
       struct Point { x: number, y: number }
       """
@@ -131,7 +131,7 @@ Feature: .lb shape distribution across package boundaries
       [types]
       shapes = ["geometry"]
       """
-    And a file "alpha/geometry.lb" containing:
+    And a file "alpha/geometry.luab" containing:
       """
       struct Point { x: number }
       """
@@ -145,7 +145,7 @@ Feature: .lb shape distribution across package boundaries
       [types]
       shapes = ["geometry"]
       """
-    And a file "beta/geometry.lb" containing:
+    And a file "beta/geometry.luab" containing:
       """
       struct Point { x: number }
       """
@@ -156,13 +156,13 @@ Feature: .lb shape distribution across package boundaries
     When I run "luabox check"
     Then diagnostic LB2005 is reported
     And stdout contains "ambiguous"
-    And stdout contains "alpha/geometry.lb"
-    And stdout contains "beta/geometry.lb"
+    And stdout contains "alpha/geometry.luab"
+    And stdout contains "beta/geometry.luab"
     And the command fails
 
-  Scenario: a dependency's .lb never leaks into build output
+  Scenario: a dependency's .luab never leaks into build output
     Given a project with edition "5.4" targeting "5.1"
-    And a file "lua_modules/geo/geometry.lb" containing:
+    And a file "lua_modules/geo/geometry.luab" containing:
       """
       struct Point { x: number, y: number }
       """

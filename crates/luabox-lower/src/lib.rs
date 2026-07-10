@@ -24,7 +24,7 @@
 //! The engine operates as targeted text edits over the lossless
 //! `luabox-syntax` tree (rust-analyzer style): untransformed input text is
 //! preserved byte-for-byte, never reprinted. Lowering is shape-blind by
-//! invariant (SHAPES.md §1): `.lb` files never reach this crate.
+//! invariant (SHAPES.md §1): `.luab` files never reach this crate.
 //!
 //! Like `luabox-syntax`, this crate does not depend on `luabox-diag`
 //! (acyclic dep graph, SPEC.md §16): diagnostics carry plain `LBnnnn` code

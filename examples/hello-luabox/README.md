@@ -41,5 +41,5 @@ also run the script directly: `luabox run src/main.lua`.
 
 ## Where to go next
 
-`../geometry` introduces the `.lb` shape DSL. See `../README.md` for the
+`../geometry` introduces the `.luab` shape DSL. See `../README.md` for the
 full learning path.

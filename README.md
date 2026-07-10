@@ -5,7 +5,7 @@
 One static binary that is the package manager, typechecker, linter, formatter,
 bundler, test runner, LSP server, and toolchain manager for every Lua dialect
 (5.1–5.4, LuaJIT). Types come from full LuaCATS annotation support plus the
-`.lb` shape DSL — Rust struct/trait declarations checked over untyped Lua,
+`.luab` shape DSL — Rust struct/trait declarations checked over untyped Lua,
 analyser-only. See [SPEC.md](SPEC.md) and [SHAPES.md](SHAPES.md) for the full
 design. Luau is explicitly out of scope.
 
@@ -26,8 +26,8 @@ cargo build --release            # target/release/luabox
 | | |
 |---|---|
 | `init` / `new` | scaffold a project (`--lib`, `--edition 5.1..5.4\|luajit`) |
-| `check` | typecheck: LuaCATS + `.lb` shapes + rich inference, dialect legality, `--target`, `--watch`, `--format json\|sarif\|github\|gitlab` |
-| `fmt` | canonical formatter for `.lua` + `.lb` (`--check`, `--watch`) |
+| `check` | typecheck: LuaCATS + `.luab` shapes + rich inference, dialect legality, `--target`, `--watch`, `--format json\|sarif\|github\|gitlab` |
+| `fmt` | canonical formatter for `.lua` + `.luab` (`--check`, `--watch`) |
 | `lint` | 8 type-informed rules, `---@luabox-ignore`, `--fix` |
 | `build` | lower `edition → target` (goto, bitops, `<close>`, `_ENV`, …) with tree-shaken polyfills |
 | `bundle` | single-file bundle, `--minify`, `--sourcemap` + `unmap`, `--mode love\|nvim-plugin` |
@@ -46,7 +46,7 @@ Cargo workspace, one crate per bounded context (SPEC.md §16):
 
 | Crate | Owns |
 |---|---|
-| `luabox-syntax` | lossless parser: Lua dialects + `.lb` shape grammar |
+| `luabox-syntax` | lossless parser: Lua dialects + `.luab` shape grammar |
 | `luabox-hir` | desugared IR, name resolution |
 | `luabox-types` | unified type IR (LuaCATS ⊕ shapes), inference |
 | `luabox-db` | incremental query database |
@@ -74,13 +74,13 @@ fixture projects — the executable spec (SPEC.md §16.2).
 ## Editor setup
 
 Editor integrations wrap the `luabox lsp` stdio language server (diagnostics,
-hover, goto-definition, completion, document symbols; `.lua` and `.lb` files).
+hover, goto-definition, completion, document symbols; `.lua` and `.luab` files).
 They live under [`editors/`](editors/):
 
 | Editor | Path | Notes |
 |---|---|---|
-| VS Code | [`editors/vscode/`](editors/vscode/) | First-class TypeScript extension; ships a `.lb` shape grammar. `npm install && npm run compile`, then `npx @vscode/vsce package` for a `.vsix`. |
-| Neovim | [`editors/nvim/`](editors/nvim/) | `require("luabox").setup()` (Neovim 0.11+ native LSP; lspconfig fallback included). Adds `.lb` filetype detection. |
+| VS Code | [`editors/vscode/`](editors/vscode/) | First-class TypeScript extension; ships a `.luab` shape grammar. `npm install && npm run compile`, then `npx @vscode/vsce package` for a `.vsix`. |
+| Neovim | [`editors/nvim/`](editors/nvim/) | `require("luabox").setup()` (Neovim 0.11+ native LSP; lspconfig fallback included). Adds `.luab` filetype detection. |
 | JetBrains | [`editors/jetbrains.md`](editors/jetbrains.md) | Via LSP4IJ (all editions) or the native LSP API (Ultimate/plugin authors). |
 
 All three resolve the `luabox` binary from `PATH` (overridable per editor) and

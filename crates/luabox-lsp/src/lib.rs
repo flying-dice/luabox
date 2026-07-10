@@ -10,7 +10,7 @@
 //! # Tranche 1 features (this crate today)
 //!
 //! - **Streamed diagnostics** — parse errors, dialect legality, and type
-//!   diagnostics pushed after every open/change/close; `.lb` shape parse
+//!   diagnostics pushed after every open/change/close; `.luab` shape parse
 //!   errors too.
 //! - **Hover** — binding types from `---@type`/`---@param`, function
 //!   signatures from `@param`/`@return`, class fields, with LuaCATS doc text.
@@ -26,7 +26,7 @@
 //!   no edits, never an error.
 //! - **Semantic tokens** — full-document, standard-types-only legend, for
 //!   both `.lua` (HIR-resolved locals vs globals, LuaCATS doc comments) and
-//!   `.lb` (see [`semantic_tokens`]).
+//!   `.luab` (see [`semantic_tokens`]).
 //!
 //! The remaining SPEC §8 surface (find-refs, rename, inlay hints, code
 //! actions, signature help, call hierarchy, TCP transport) is P4 polish.
@@ -36,8 +36,8 @@ mod diagnostics;
 mod fmt;
 mod goto_def;
 mod hover;
-mod lb;
 mod line_index;
+mod luab;
 mod sema;
 mod semantic_tokens;
 mod server;

@@ -64,15 +64,15 @@ Feature: Canonical formatting — luabox fmt
     Then the command succeeds
     And stdout contains "all formatted"
 
-  Scenario: .lb shape modules are formatted too
+  Scenario: .luab shape modules are formatted too
     Given an empty directory
-    And a file "shapes/point.lb" containing:
+    And a file "shapes/point.luab" containing:
       """
       struct   Point{x:number,y:number}
       """
     When I run "luabox fmt"
     Then the command succeeds
-    And "shapes/point.lb" equals:
+    And "shapes/point.luab" equals:
       """
       struct Point {
           x: number,

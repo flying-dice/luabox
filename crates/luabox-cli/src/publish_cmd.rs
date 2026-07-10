@@ -11,7 +11,7 @@
 //!    without `---@param`/`---@return` annotations are listed as a warning,
 //!    never a failure (MVP; SPEC.md §6 wants this fatal eventually).
 //! 2. **Pack.** The package tree — `luabox.toml`, `README*`, everything
-//!    under `src/`, and any `.lb` shape modules — is staged, excluding
+//!    under `src/`, and any `.luab` shape modules — is staged, excluding
 //!    build output (`[build] out`, default `dist/`), `lua_modules/`,
 //!    `vendor/`, and dot-files/dirs.
 //! 3. **Hash.** The staged tree is interned into the content-addressed
@@ -129,7 +129,7 @@ fn publish(project: &Project, registry: &Registry, name: &str) -> anyhow::Result
     let tree_dir = staging.path().join("tree");
     let files = stage_package_tree(project, &tree_dir)?;
     if files == 0 {
-        bail!("nothing to publish: no `src/` sources, `.lb` modules, or README found");
+        bail!("nothing to publish: no `src/` sources, `.luab` modules, or README found");
     }
 
     let store = Store::open(deps_cmd::store_root()?);
@@ -243,7 +243,7 @@ fn run_test_gate(project: &Project) -> anyhow::Result<()> {
 // --- packaging ---------------------------------------------------------------
 
 /// Copy the publishable tree into `dest`: `luabox.toml`, root `README*`,
-/// everything under `src/`, and any `.lb` shape modules — excluding the
+/// everything under `src/`, and any `.luab` shape modules — excluding the
 /// build output dir, `lua_modules/`, `vendor/`, and dot-files/dirs.
 /// Returns the number of files staged.
 fn stage_package_tree(project: &Project, dest: &Path) -> anyhow::Result<usize> {
@@ -292,7 +292,7 @@ fn should_publish_file(rel: &Path, name: &str) -> bool {
     let top_level = rel.components().count() == 1;
     let is_lb = rel
         .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("lb"));
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("luab"));
     (top_level && (name == "luabox.toml" || name.starts_with("README")))
         || rel.starts_with("src")
         || is_lb
@@ -458,8 +458,8 @@ return M
             "init.lua"
         ));
         assert!(should_publish_file(
-            Path::new("shapes/geometry.lb"),
-            "geometry.lb"
+            Path::new("shapes/geometry.luab"),
+            "geometry.luab"
         ));
         assert!(!should_publish_file(
             Path::new("scripts/build.lua"),

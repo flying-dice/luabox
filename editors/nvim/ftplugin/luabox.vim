@@ -1,4 +1,4 @@
-" luabox — filetype plugin for `.lb` shape files.
+" luabox — filetype plugin for `.luab` shape files.
 if exists("b:did_ftplugin")
   finish
 endif

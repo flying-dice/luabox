@@ -1,6 +1,6 @@
 # luabox in JetBrains IDEs
 
-JetBrains IDEs don't ship a Lua or `.lb` language server of their own, but the
+JetBrains IDEs don't ship a Lua or `.luab` language server of their own, but the
 `luabox lsp` server can be wired in through the **Language Server Protocol
 (LSP)**. There are two routes depending on your IDE edition and how much you
 want to build.
@@ -23,14 +23,14 @@ development required.
      `C:\path\to\luabox.exe lsp`, if `luabox` is not on the IDE's `PATH`).
 3. **Mappings tab** — tell LSP4IJ which files to route to the server:
    - Add a **file name pattern** `*.lua` (associate with a "Lua" language/None).
-   - Add a **file name pattern** `*.lb`.
+   - Add a **file name pattern** `*.luab`.
    Alternatively map by *Language* if you have a Lua plugin installed.
-4. **Apply**. Open a `.lua` or `.lb` file — diagnostics, hover, go-to-definition
+4. **Apply**. Open a `.lua` or `.luab` file — diagnostics, hover, go-to-definition
    and completion from `luabox lsp` now appear. The **LSP Consoles** tool window
    shows the traffic for troubleshooting.
 
-> `.lb` files have no built-in JetBrains file type. Under *Settings ▸ Editor ▸
-> File Types*, add a file type (or map the pattern `*.lb`) so the editor opens
+> `.luab` files have no built-in JetBrains file type. Under *Settings ▸ Editor ▸
+> File Types*, add a file type (or map the pattern `*.luab`) so the editor opens
 > them as text; LSP4IJ then supplies the language features. `//` line comments
 > and `/* */` blocks can be configured on that file type for comment toggling.
 
@@ -58,7 +58,7 @@ class LuaboxLspSupportProvider : LspServerSupportProvider {
         file: VirtualFile,
         serverStarter: LspServerSupportProvider.LspServerStarter,
     ) {
-        if (file.extension == "lua" || file.extension == "lb") {
+        if (file.extension == "lua" || file.extension == "luab") {
             serverStarter.ensureServerStarted(LuaboxLspServerDescriptor(project))
         }
     }
@@ -67,7 +67,7 @@ class LuaboxLspSupportProvider : LspServerSupportProvider {
 class LuaboxLspServerDescriptor(project: Project) :
     ProjectWideLspServerDescriptor(project, "luabox") {
     override fun isSupportedFile(file: VirtualFile) =
-        file.extension == "lua" || file.extension == "lb"
+        file.extension == "lua" || file.extension == "luab"
 
     override fun createCommandLine() = GeneralCommandLine("luabox", "lsp")
 }

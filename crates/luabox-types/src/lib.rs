@@ -3,7 +3,7 @@
 //!
 //! One internal type IR fed (eventually) by two front-ends: LuaCATS
 //! annotations (`---@class` etc., full compatibility non-negotiable) and
-//! the `.lb` shape DSL (SHAPES.md). One checker, no parallel type system.
+//! the `.luab` shape DSL (SHAPES.md). One checker, no parallel type system.
 //!
 //! **P0 scope (this crate today):** the annotation-driven subset behind
 //! `luabox check` — types come from LuaCATS annotations and literals only.
@@ -16,7 +16,7 @@
 //!
 //! **P1 (TODO):** bidirectional inference, flow-sensitive narrowing,
 //! metatable/`__index` resolution, method calls, generics as real type
-//! variables, cross-file `require` resolution over the salsa DB, `.lb`
+//! variables, cross-file `require` resolution over the salsa DB, `.luab`
 //! shape checking, function subtyping.
 //!
 //! Diagnostics carry `LB03xx` codes registered in `luabox-diag` (this
@@ -70,7 +70,7 @@ impl Strictness {
     }
 }
 
-/// Typecheck one parsed file against its own annotations (no `.lb` shape
+/// Typecheck one parsed file against its own annotations (no `.luab` shape
 /// resolution — see [`check_file_shaped`]).
 ///
 /// `file` names the file in diagnostic spans. Cross-file `require`

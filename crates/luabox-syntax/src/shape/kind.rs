@@ -1,8 +1,8 @@
-//! Token/node vocabulary for the `.lb` shape grammar — deliberately its own
+//! Token/node vocabulary for the `.luab` shape grammar — deliberately its own
 //! kind space, disjoint from [`crate::lua::SyntaxKind`] (SHAPES.md §9).
 
 syntax_kinds! {
-    /// Every token and node kind in the `.lb` grammar (SHAPES.md §3).
+    /// Every token and node kind in the `.luab` grammar (SHAPES.md §3).
     ///
     /// The numbering is not stable across versions — never persist it.
     ShapeSyntaxKind {
@@ -79,7 +79,7 @@ impl ShapeSyntaxKind {
     }
 }
 
-/// The rowan language tag for `.lb` shape files.
+/// The rowan language tag for `.luab` shape files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ShapeLanguage {}
 
@@ -95,7 +95,7 @@ impl rowan::Language for ShapeLanguage {
     }
 }
 
-/// A parsed `.lb` syntax node in the [`ShapeLanguage`] tree.
+/// A parsed `.luab` syntax node in the [`ShapeLanguage`] tree.
 pub type ShapeSyntaxNode = rowan::SyntaxNode<ShapeLanguage>;
 /// A leaf token in the [`ShapeLanguage`] tree.
 pub type ShapeSyntaxToken = rowan::SyntaxToken<ShapeLanguage>;
