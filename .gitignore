@@ -6,3 +6,6 @@ tools/differ/target/
 # committed deliberately — it is an application).
 examples/**/dist/
 examples/**/lua_modules/
+
+# IDE state
+.idea/
