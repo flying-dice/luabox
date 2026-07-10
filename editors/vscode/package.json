@@ -26,8 +26,7 @@
   },
   "main": "./out/extension.js",
   "activationEvents": [
-    "onLanguage:lua",
-    "onLanguage:luabox-shape"
+    "onLanguage:lua"
   ],
   "contributes": {
     "languages": [
@@ -80,9 +79,12 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "vscode:prepublish": "npm run check-types && npm run bundle -- --minify",
+    "compile": "npm run check-types && npm run bundle",
+    "check-types": "tsc -p ./ --noEmit",
+    "bundle": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node",
+    "watch": "npm run bundle -- --watch",
+    "package": "vsce package --no-dependencies"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
@@ -90,6 +92,8 @@
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.28.1",
     "typescript": "^5.4.0"
   }
 }
