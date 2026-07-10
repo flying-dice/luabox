@@ -737,10 +737,15 @@ impl Checker<'_> {
             } else {
                 "type mismatch"
             };
+            // Name the offending members when both sides are table-shaped
+            // (SHAPES-V2.md: conformance errors surface positionally, so
+            // the message must carry what a v1 impl-check would have said).
+            let detail = crate::assign::explain_mismatch(self.env, self.strict, &found, expected)
+                .map_or(String::new(), |d| format!(": {d}"));
             self.report(
                 mismatch_code,
                 slot_range(slot),
-                format!("{noun}: expected `{expected}`, found `{found}`"),
+                format!("{noun}: expected `{expected}`, found `{found}`{detail}"),
                 format!("expected `{expected}`"),
             );
         }

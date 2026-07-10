@@ -8,12 +8,12 @@
 //!    manifest's `[types] shape-paths`.
 //! 2. **Harvest** the model (`doc_cmd::model`): per-file modules with
 //!    functions/classes/aliases/enums from the LuaCATS harvest, per-file
-//!    shape modules with structs/traits/impls/aliases and their `///` docs.
+//!    shape modules with their `type` declarations and `///` docs.
 //! 3. **Render** (`doc_cmd::render`) a zero-install static site into
 //!    `<root>/doc/` (a sibling of the `[build] out` directory): one page
-//!    per module and per class/struct/trait, an index with a client-side
-//!    search box over an embedded JSON index, cross-links through one
-//!    global name table, inline CSS/JS only — no external assets.
+//!    per module and per class/type, an index with a client-side search
+//!    box over an embedded JSON index, cross-links through one global
+//!    name table, inline CSS/JS only — no external assets.
 //! 4. `--open` launches the generated `index.html` in the default browser.
 //!
 //! Doc text renders through the minimal markdown renderer
@@ -49,34 +49,28 @@ pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
     }
 
     let mut modules = Vec::new();
-    let mut impls = Vec::new();
     for path in &lua_files {
         let rel = check_cmd::display_rel(path, &project.root);
         let source = fs::read_to_string(path).with_context(|| format!("cannot read `{rel}`"))?;
         let name = model::module_name(&rel);
-        let (module, module_impls) = model::lua_module(&name, &source, project.dialect);
-        modules.push(module);
-        impls.extend(module_impls);
+        modules.push(model::lua_module(&name, &source, project.dialect));
     }
 
     let mut shape_modules = Vec::new();
     for path in &lb_set {
         let rel = check_cmd::display_rel(path, &project.root);
         let source = fs::read_to_string(path).with_context(|| format!("cannot read `{rel}`"))?;
-        // Shape modules resolve by file stem (SHAPES.md §6).
-        let name = path
-            .file_stem()
-            .map_or_else(|| rel.clone(), |s| s.to_string_lossy().into_owned());
-        let module = model::shape_module(&name, &source);
-        impls.extend(module.impls.clone());
-        shape_modules.push(module);
+        // A module's namespace derives from its path under the shape-path
+        // that contains it (SHAPES-V2.md); files outside every shape-path
+        // fall back to the file stem.
+        let name = shape_namespace(path, &shape_paths);
+        shape_modules.push(model::shape_module(&name, &source));
     }
 
     let model = DocModel {
         package,
         modules,
         shape_modules,
-        impls,
     };
 
     let out_dir = project.root.join("doc");
@@ -121,6 +115,26 @@ fn manifest_facts(root: &Path) -> (String, Vec<PathBuf>) {
         .map(|p| root.join(p))
         .collect();
     (manifest.package.name, shape_paths)
+}
+
+/// A shape module's dotted namespace: its path relative to the shape-path
+/// directory that contains it, dots for separators, `.luab` stripped
+/// (`shapes/love/graphics.luab` → `love.graphics`).
+fn shape_namespace(path: &Path, shape_paths: &[PathBuf]) -> String {
+    let rel = shape_paths
+        .iter()
+        .find_map(|dir| path.strip_prefix(dir).ok())
+        .unwrap_or_else(|| Path::new(path.file_name().unwrap_or_default()));
+    let mut parts: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if let Some(last) = parts.last_mut()
+        && let Some(stem) = last.strip_suffix(".luab")
+    {
+        *last = stem.to_string();
+    }
+    parts.join(".")
 }
 
 /// Collect every `.luab` file under `dir`, recursively, into `out`.

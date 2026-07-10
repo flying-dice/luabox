@@ -11,8 +11,8 @@ use lsp_types::notification::{
     Notification as _, PublishDiagnostics,
 };
 use lsp_types::request::{
-    Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest,
-    InlayHintRequest, RangeFormatting, Request as _, SemanticTokensFullRequest, Shutdown,
+    Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, InlayHintRequest,
+    RangeFormatting, Request as _, SemanticTokensFullRequest, Shutdown,
 };
 use lsp_types::{
     CompletionItemKind, CompletionParams, CompletionResponse, DiagnosticSeverity,
@@ -742,32 +742,32 @@ end
 fn lb_files_publish_shape_parse_errors() {
     let client = start(&[]);
     let uri = client.uri("shapes.luab");
-    // A trait fn with a body: rejected at parse time with LB2010.
-    let source = "trait Shape {\n    fn area(self) -> number { return 1 }\n}\n";
+    // A method with a body: rejected at parse time with LB2010.
+    let source = "type Shape = {\n    area(self): number { return 1 },\n}\n";
     let diags = client.open(&uri, source);
     assert!(
         diags.iter().any(|d| code_of(d) == "LB2010"),
         "expected LB2010, got {diags:?}"
     );
     // A clean edit clears them.
-    let clean = "trait Shape {\n    fn area(self) -> number;\n}\n";
+    let clean = "type Shape = {\n    area(self): number,\n}\n";
     assert!(client.change(&uri, clean).is_empty());
     client.shutdown();
 }
 
 #[test]
-fn lb_goto_and_hover_resolve_struct_names() {
+fn lb_goto_and_hover_resolve_type_names() {
     let client = start(&[]);
     let uri = client.uri("shapes.luab");
-    let source = "struct Point { x: number, y: number }\ntype Pair = Point;\n";
+    let source = "type Point = { x: number, y: number }\ntype Pair = Point\n";
     client.open(&uri, source);
     let mut client = client;
-    // `Point` on line 1 (the alias) → the struct declaration on line 0.
+    // `Point` on line 1 (the alias RHS) → the declaration on line 0.
     let location = client.definition(&uri, 1, 14).expect("definition");
-    assert_eq!(location.range, range((0, 7), (0, 12)));
+    assert_eq!(location.range, range((0, 5), (0, 10)));
     let hover = client.hover(&uri, 1, 14).expect("hover");
     assert!(
-        hover_text(&hover).contains("struct Point"),
+        hover_text(&hover).contains("type Point"),
         "{}",
         hover_text(&hover)
     );
@@ -852,7 +852,7 @@ fn formatting_parse_error_document_returns_no_edits() {
 
 #[test]
 fn lb_formatting_matches_shape_formatter() {
-    let source = "struct Point {x: number, y: number}\n";
+    let source = "type Point = {x: number, y: number}\n";
     let client = start(&[]);
     let uri = client.uri("shapes.luab");
     client.open(&uri, source);
@@ -863,7 +863,7 @@ fn lb_formatting_matches_shape_formatter() {
     assert_ne!(canonical, source, "fixture must not already be canonical");
     assert_eq!(edits[0].new_text, canonical);
     // A parse-error .luab document yields no edits.
-    client.change(&uri, "struct {\n");
+    client.change(&uri, "type = {\n");
     let edits = client.formatting(&uri).expect("edits");
     assert!(edits.is_empty(), "{edits:?}");
     client.shutdown();
@@ -979,12 +979,11 @@ fn semantic_token_columns_and_lengths_are_utf16() {
 fn lb_semantic_tokens_classify_shape_declarations() {
     let source = "\
 /// A closed shape.
-trait Shape {
-    fn area(self) -> number;
+export type Shape = {
+    area(self): number,
 }
-struct Circle { radius: number }
-impl Shape for Circle;
-struct Pair<T> { first: T }
+type Circle = { radius: number }
+type Pair<T> = { first: T }
 ";
     let client = start(&[]);
     let uri = client.uri("shapes.luab");
@@ -1000,45 +999,41 @@ struct Pair<T> { first: T }
         doc.modifiers.contains(&"documentation".to_string()),
         "{doc:?}"
     );
-    assert_eq!(token_at(&tokens, 1, 0).token_type, "keyword"); // trait
+    assert_eq!(token_at(&tokens, 1, 0).token_type, "keyword"); // export
+    assert_eq!(token_at(&tokens, 1, 7).token_type, "keyword"); // type
 
-    // The trait name is an interface-type declaration.
-    let shape = token_at(&tokens, 1, 6);
-    assert_eq!(shape.token_type, "interface");
+    // The declared name is a type declaration.
+    let shape = token_at(&tokens, 1, 12);
+    assert_eq!(shape.token_type, "type");
     assert!(
         shape.modifiers.contains(&"declaration".to_string()),
         "{shape:?}"
     );
 
-    // Trait fn: method, `self` keyword, return type.
-    assert_eq!(token_at(&tokens, 2, 7).token_type, "method"); // area
-    assert_eq!(token_at(&tokens, 2, 12).token_type, "keyword"); // self
-    assert_eq!(token_at(&tokens, 2, 21).token_type, "type"); // number
+    // Method member: method, `self` keyword, return type.
+    assert_eq!(token_at(&tokens, 2, 4).token_type, "method"); // area
+    assert_eq!(token_at(&tokens, 2, 9).token_type, "keyword"); // self
+    assert_eq!(token_at(&tokens, 2, 16).token_type, "type"); // number
 
-    // struct name, field name and field type.
-    assert_eq!(token_at(&tokens, 4, 7).token_type, "class"); // Circle
+    // Field name and field type.
     assert_eq!(token_at(&tokens, 4, 16).token_type, "property"); // radius
     assert_eq!(token_at(&tokens, 4, 24).token_type, "type"); // number
 
-    // `impl Shape for Circle`: trait vs struct references.
-    assert_eq!(token_at(&tokens, 5, 5).token_type, "interface"); // Shape
-    assert_eq!(token_at(&tokens, 5, 15).token_type, "class"); // Circle
-
     // Generics: `T` declares a type parameter and its use resolves to it.
-    let generic = token_at(&tokens, 6, 12);
+    let generic = token_at(&tokens, 5, 10);
     assert_eq!(generic.token_type, "typeParameter");
     assert!(
         generic.modifiers.contains(&"declaration".to_string()),
         "{generic:?}"
     );
-    assert_eq!(token_at(&tokens, 6, 24).token_type, "typeParameter"); // first: T
+    assert_eq!(token_at(&tokens, 5, 24).token_type, "typeParameter"); // first: T
     client.shutdown();
 }
 
 #[test]
 fn lb_semantic_tokens_survive_parse_errors() {
     // The shape tree is lossless: broken input still highlights.
-    let source = "trait Shape {\n    fn area(self) -> number { return 1 }\n}\n";
+    let source = "type Shape = {\n    area(self): number { return 1 },\n}\n";
     let client = start(&[]);
     let uri = client.uri("shapes.luab");
     client.open(&uri, source);
@@ -1046,7 +1041,7 @@ fn lb_semantic_tokens_survive_parse_errors() {
     let data = client.semantic_tokens(&uri);
     let tokens = client.decode_tokens(&data);
     assert!(!tokens.is_empty());
-    assert_eq!(token_at(&tokens, 1, 7).token_type, "method"); // area
+    assert_eq!(token_at(&tokens, 1, 4).token_type, "method"); // area
     client.shutdown();
 }
 
@@ -1316,7 +1311,10 @@ local a = geo.area(3, 4)
     assert_eq!(hint_label(hint_at(&hints, 1, 7)), ": integer"); // a
 
     // Editing the dependent invalidates the dependency's hints.
-    client.change(&main_uri, "local geo = require(\"geometry\")\nlocal a = geo.area(\"s\", 4)\n");
+    client.change(
+        &main_uri,
+        "local geo = require(\"geometry\")\nlocal a = geo.area(\"s\", 4)\n",
+    );
     let hints = client.inlay_hints(&geo_uri, range((0, 0), (8, 0)));
     assert_eq!(hint_label(hint_at(&hints, 2, 17)), ": string"); // w reseeded
     client.shutdown();

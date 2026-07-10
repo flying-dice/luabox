@@ -40,7 +40,7 @@ use luabox_hir::{BindingKind, Resolution};
 use luabox_syntax::lua::SyntaxKind;
 use luabox_syntax::shape::{
     self, ShapeSyntaxKind, ShapeSyntaxNode, ShapeSyntaxToken,
-    ast::{AstNode, Item, ShapeFile},
+    ast::{AstNode, ShapeFile},
 };
 use rowan::{NodeOrToken, TextRange};
 
@@ -50,10 +50,11 @@ use crate::sema::FileSema;
 // === Legend ===============================================================
 // The indices below are the positions in `legend()`; keep them in sync.
 
-const NAMESPACE: u32 = 0;
+// Indices 0 (`namespace`) and 3 (`interface`) stay in the legend for
+// LuaCATS-side classification and client compatibility, but the v2 shape
+// grammar no longer produces them.
 const TYPE: u32 = 1;
 const CLASS: u32 = 2;
-const INTERFACE: u32 = 3;
 const TYPE_PARAMETER: u32 = 4;
 const PARAMETER: u32 = 5;
 const VARIABLE: u32 = 6;
@@ -365,20 +366,14 @@ pub fn lb_tokens(text: &str) -> Vec<SemanticToken> {
         let classified = match token.kind() {
             ShapeSyntaxKind::DOC_COMMENT => Some((COMMENT, M_DOCUMENTATION)),
             ShapeSyntaxKind::COMMENT => Some((COMMENT, 0)),
-            ShapeSyntaxKind::STRUCT_KW
-            | ShapeSyntaxKind::TRAIT_KW
-            | ShapeSyntaxKind::IMPL_KW
-            | ShapeSyntaxKind::FOR_KW
-            | ShapeSyntaxKind::FN_KW
-            | ShapeSyntaxKind::SELF_KW
-            | ShapeSyntaxKind::TYPE_KW
-            | ShapeSyntaxKind::USE_KW => Some((KEYWORD, 0)),
-            ShapeSyntaxKind::ARROW
+            ShapeSyntaxKind::TYPE_KW | ShapeSyntaxKind::EXPORT_KW | ShapeSyntaxKind::SELF_KW => {
+                Some((KEYWORD, 0))
+            }
+            ShapeSyntaxKind::FAT_ARROW
             | ShapeSyntaxKind::PIPE
-            | ShapeSyntaxKind::PLUS
+            | ShapeSyntaxKind::AMP
             | ShapeSyntaxKind::QUESTION
-            | ShapeSyntaxKind::EQ
-            | ShapeSyntaxKind::DOT_DOT => Some((OPERATOR, 0)),
+            | ShapeSyntaxKind::EQ => Some((OPERATOR, 0)),
             ShapeSyntaxKind::IDENT => Some(classify_lb_ident(&token, &decls)),
             _ => None,
         };
@@ -395,28 +390,18 @@ pub fn lb_tokens(text: &str) -> Vec<SemanticToken> {
 
 /// The file's declared names, for resolving type references.
 struct LbDecls {
-    structs: HashSet<String>,
-    traits: HashSet<String>,
+    types: HashSet<String>,
 }
 
 impl LbDecls {
     fn harvest(root: &ShapeSyntaxNode) -> Self {
-        let mut structs = HashSet::new();
-        let mut traits = HashSet::new();
+        let mut types = HashSet::new();
         if let Some(file) = ShapeFile::cast(root.clone()) {
             for item in file.items() {
-                match &item {
-                    Item::Struct(s) => {
-                        structs.extend(s.name());
-                    }
-                    Item::Trait(t) => {
-                        traits.extend(t.name());
-                    }
-                    Item::Impl(_) | Item::Alias(_) | Item::Use(_) => {}
-                }
+                types.extend(item.name());
             }
         }
-        Self { structs, traits }
+        Self { types }
     }
 }
 
@@ -425,46 +410,24 @@ fn classify_lb_ident(token: &ShapeSyntaxToken, decls: &LbDecls) -> (u32, u32) {
         return (TYPE, 0);
     };
     match parent.kind() {
-        ShapeSyntaxKind::STRUCT_DEF => (CLASS, M_DECLARATION),
-        ShapeSyntaxKind::TRAIT_DEF => (INTERFACE, M_DECLARATION),
-        ShapeSyntaxKind::TYPE_ALIAS => (TYPE, M_DECLARATION),
-        // `impl Trait for Struct`: interface before `for`, class after.
-        ShapeSyntaxKind::IMPL_DEF => {
-            if follows_for_kw(token) {
-                (CLASS, 0)
-            } else {
-                (INTERFACE, 0)
-            }
-        }
-        ShapeSyntaxKind::SUPERTRAITS => (INTERFACE, 0),
-        // `T: Bound + Bound2`: the parameter declares, bounds are traits.
-        ShapeSyntaxKind::GENERIC_PARAM => {
-            if follows_colon(token) {
-                (INTERFACE, 0)
-            } else {
-                (TYPE_PARAMETER, M_DECLARATION)
-            }
-        }
+        ShapeSyntaxKind::TYPE_DEF => (TYPE, M_DECLARATION),
+        ShapeSyntaxKind::GENERIC_PARAM => (TYPE_PARAMETER, M_DECLARATION),
         ShapeSyntaxKind::FIELD => (PROPERTY, M_DECLARATION),
-        ShapeSyntaxKind::TRAIT_FN => (METHOD, M_DECLARATION),
+        ShapeSyntaxKind::METHOD => (METHOD, M_DECLARATION),
         ShapeSyntaxKind::PARAM => (PARAMETER, M_DECLARATION),
-        ShapeSyntaxKind::USE_DECL => (NAMESPACE, 0),
         ShapeSyntaxKind::TYPE_REF => classify_lb_type_ref(token, decls),
         _ => (TYPE, 0),
     }
 }
 
-/// A type reference: an in-scope generic parameter, a declared trait, a
-/// declared struct, or a plain type (primitives, aliases, unknowns).
+/// A type reference: an in-scope generic parameter, a sibling declaration,
+/// or a plain type (primitives, qualified names, unknowns).
 fn classify_lb_type_ref(token: &ShapeSyntaxToken, decls: &LbDecls) -> (u32, u32) {
     let name = token.text();
     if generic_param_in_scope(token, name) {
         return (TYPE_PARAMETER, 0);
     }
-    if decls.traits.contains(name) {
-        return (INTERFACE, 0);
-    }
-    if decls.structs.contains(name) {
+    if decls.types.contains(name) {
         return (CLASS, 0);
     }
     (TYPE, 0)
@@ -485,27 +448,6 @@ fn generic_param_in_scope(token: &ShapeSyntaxToken, name: &str) -> bool {
             })
             .any(|t| t.text() == name)
     })
-}
-
-/// Whether a `for` keyword token precedes `token` among its siblings.
-fn follows_for_kw(token: &ShapeSyntaxToken) -> bool {
-    preceded_by(token, ShapeSyntaxKind::FOR_KW)
-}
-
-/// Whether a `:` token precedes `token` among its siblings.
-fn follows_colon(token: &ShapeSyntaxToken) -> bool {
-    preceded_by(token, ShapeSyntaxKind::COLON)
-}
-
-fn preceded_by(token: &ShapeSyntaxToken, kind: ShapeSyntaxKind) -> bool {
-    let Some(parent) = token.parent() else {
-        return false;
-    };
-    parent
-        .children_with_tokens()
-        .filter_map(NodeOrToken::into_token)
-        .take_while(|t| t.text_range() != token.text_range())
-        .any(|t| t.kind() == kind)
 }
 
 // === Delta encoding =======================================================

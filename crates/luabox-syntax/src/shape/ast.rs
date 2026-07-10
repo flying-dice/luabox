@@ -1,4 +1,4 @@
-//! Typed AST layer over the lossless `.luab` green tree (SHAPES.md §3).
+//! Typed AST layer over the lossless `.luab` green tree (SHAPES-V2.md).
 //!
 //! Thin wrappers around [`ShapeSyntaxNode`]: each accessor re-derives its value
 //! from the tree on demand, so the AST stays a *view* — never a second source
@@ -7,9 +7,9 @@
 
 use super::{ShapeSyntaxKind, ShapeSyntaxNode, ShapeSyntaxToken};
 use ShapeSyntaxKind::{
-    DOT, FIELD, FN_TYPE, FOR_KW, GENERIC_ARGS, GENERIC_PARAM, GENERIC_PARAMS, IDENT, IMPL_DEF,
-    OPEN_MARKER, OPTIONAL_TYPE, PARAM, PARAM_LIST, PAREN_TYPE, RET_TYPE, SELF_KW, STRUCT_DEF,
-    SUPERTRAITS, TRAIT_DEF, TRAIT_FN, TYPE_ALIAS, TYPE_REF, UNION_TYPE, USE_DECL,
+    COLON, DOT, EXPORT_KW, FIELD, FN_TYPE, GENERIC_ARGS, GENERIC_PARAM, GENERIC_PARAMS, IDENT,
+    INTERSECTION_TYPE, METHOD, OBJECT_TYPE, OPTIONAL_TYPE, PARAM, PARAM_LIST, PAREN_TYPE, QUESTION,
+    SELF_KW, TYPE_DEF, TYPE_REF, UNION_TYPE,
 };
 
 /// A typed handle onto a syntax node of a specific kind.
@@ -57,140 +57,130 @@ macro_rules! ast_node {
     };
 }
 
-// --- file & items -------------------------------------------------------
+// --- file & the single item form ----------------------------------------
 
 ast_node!(ShapeFile, ShapeSyntaxKind::SHAPE_FILE);
 
 impl ShapeFile {
-    /// The declarations in the file, in source order.
-    pub fn items(&self) -> impl Iterator<Item = Item> + '_ {
-        self.0.children().filter_map(Item::cast)
+    /// The type declarations in the file, in source order.
+    pub fn items(&self) -> impl Iterator<Item = TypeDef> + '_ {
+        child_nodes(&self.0)
     }
 }
 
-/// Any top-level `.luab` declaration.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Item {
-    /// A `struct` declaration.
-    Struct(StructDef),
-    /// A `trait` declaration.
-    Trait(TraitDef),
-    /// An `impl Trait for Struct;` conformance assertion.
-    Impl(ImplDef),
-    /// A `type X = ...;` alias.
-    Alias(TypeAlias),
-    /// A `use path;` import.
-    Use(UseDecl),
+ast_node!(TypeDef, TYPE_DEF);
+
+impl TypeDef {
+    /// Whether the declaration carries the `export` modifier.
+    pub fn is_export(&self) -> bool {
+        first_token(&self.0, EXPORT_KW).is_some()
+    }
+
+    /// The declared name.
+    pub fn name(&self) -> Option<String> {
+        first_ident(&self.0)
+    }
+
+    /// The generic parameter list, if any.
+    pub fn generic_params(&self) -> Option<GenericParams> {
+        child_node(&self.0)
+    }
+
+    /// The right-hand type expression.
+    pub fn ty(&self) -> Option<TypeRef> {
+        child_node(&self.0)
+    }
 }
 
-impl AstNode for Item {
+// --- generics -----------------------------------------------------------
+
+ast_node!(GenericParams, GENERIC_PARAMS);
+
+impl GenericParams {
+    /// The declared parameters, in order.
+    pub fn params(&self) -> impl Iterator<Item = GenericParam> + '_ {
+        child_nodes(&self.0)
+    }
+}
+
+ast_node!(GenericParam, GENERIC_PARAM);
+
+impl GenericParam {
+    /// The parameter name.
+    pub fn name(&self) -> Option<String> {
+        first_ident(&self.0)
+    }
+}
+
+ast_node!(GenericArgs, GENERIC_ARGS);
+
+impl GenericArgs {
+    /// The type arguments, in order.
+    pub fn args(&self) -> impl Iterator<Item = TypeRef> + '_ {
+        child_nodes(&self.0)
+    }
+}
+
+// --- object types & members ---------------------------------------------
+
+ast_node!(ObjectType, OBJECT_TYPE);
+
+impl ObjectType {
+    /// The members, in source order.
+    pub fn members(&self) -> impl Iterator<Item = Member> + '_ {
+        self.0.children().filter_map(Member::cast)
+    }
+}
+
+/// One member of an object type: a data field or a method signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Member {
+    /// `name?: type`
+    Field(FieldMember),
+    /// `name(self?, params...): ret?`
+    Method(MethodMember),
+}
+
+impl AstNode for Member {
     fn cast(node: ShapeSyntaxNode) -> Option<Self> {
         match node.kind() {
-            STRUCT_DEF => Some(Self::Struct(StructDef(node))),
-            TRAIT_DEF => Some(Self::Trait(TraitDef(node))),
-            IMPL_DEF => Some(Self::Impl(ImplDef(node))),
-            TYPE_ALIAS => Some(Self::Alias(TypeAlias(node))),
-            USE_DECL => Some(Self::Use(UseDecl(node))),
+            FIELD => Some(Self::Field(FieldMember(node))),
+            METHOD => Some(Self::Method(MethodMember(node))),
             _ => None,
         }
     }
 
     fn syntax(&self) -> &ShapeSyntaxNode {
         match self {
-            Self::Struct(n) => n.syntax(),
-            Self::Trait(n) => n.syntax(),
-            Self::Impl(n) => n.syntax(),
-            Self::Alias(n) => n.syntax(),
-            Self::Use(n) => n.syntax(),
+            Self::Field(n) => n.syntax(),
+            Self::Method(n) => n.syntax(),
         }
     }
 }
 
-// --- struct -------------------------------------------------------------
+ast_node!(FieldMember, FIELD);
 
-ast_node!(StructDef, STRUCT_DEF);
-
-impl StructDef {
-    /// The struct name.
-    pub fn name(&self) -> Option<String> {
-        first_ident(&self.0)
-    }
-
-    /// The generic parameter list, if any.
-    pub fn generic_params(&self) -> Option<GenericParams> {
-        child_node(&self.0)
-    }
-
-    /// The declared fields, in order.
-    pub fn fields(&self) -> impl Iterator<Item = Field> + '_ {
-        child_nodes(&self.0)
-    }
-
-    /// Whether the struct carries the `..` open marker.
-    pub fn is_open(&self) -> bool {
-        self.0.children().any(|c| c.kind() == OPEN_MARKER)
-    }
-}
-
-ast_node!(Field, FIELD);
-
-impl Field {
+impl FieldMember {
     /// The field name.
     pub fn name(&self) -> Option<String> {
         first_ident(&self.0)
+    }
+
+    /// Whether the field is declared optional (`name?: T`).
+    pub fn optional(&self) -> bool {
+        first_token(&self.0, QUESTION).is_some()
     }
 
     /// The field type.
     pub fn ty(&self) -> Option<TypeRef> {
         child_node(&self.0)
     }
-
-    /// Whether the field type is nil-optional (`T?`).
-    pub fn optional(&self) -> bool {
-        matches!(self.ty(), Some(TypeRef::Optional(_)))
-    }
 }
 
-// --- trait --------------------------------------------------------------
+ast_node!(MethodMember, METHOD);
 
-ast_node!(TraitDef, TRAIT_DEF);
-
-impl TraitDef {
-    /// The trait name.
-    pub fn name(&self) -> Option<String> {
-        first_ident(&self.0)
-    }
-
-    /// The generic parameter list, if any.
-    pub fn generic_params(&self) -> Option<GenericParams> {
-        child_node(&self.0)
-    }
-
-    /// The supertrait names from `: A + B`, in order.
-    pub fn supertraits(&self) -> Vec<String> {
-        self.0
-            .children()
-            .find(|c| c.kind() == SUPERTRAITS)
-            .map(|s| {
-                s.children_with_tokens()
-                    .filter_map(rowan::NodeOrToken::into_token)
-                    .filter(|t| t.kind() == IDENT)
-                    .map(|t| t.text().to_string())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// The trait function signatures, in order.
-    pub fn fns(&self) -> impl Iterator<Item = TraitFn> + '_ {
-        child_nodes(&self.0)
-    }
-}
-
-ast_node!(TraitFn, TRAIT_FN);
-
-impl TraitFn {
-    /// The function name.
+impl MethodMember {
+    /// The method name.
     pub fn name(&self) -> Option<String> {
         first_ident(&self.0)
     }
@@ -200,20 +190,20 @@ impl TraitFn {
         child_node(&self.0)
     }
 
-    /// Whether the first parameter is `self`.
+    /// Whether the first parameter is `self` (receiver-taking: implemented
+    /// and called with `:`).
     pub fn has_self(&self) -> bool {
         self.params()
             .and_then(|p| p.params().next())
             .is_some_and(|p| p.is_self())
     }
 
-    /// The return types (possibly multiple; empty when the fn returns nothing).
-    pub fn returns(&self) -> Vec<TypeRef> {
-        self.0
-            .children()
-            .find(|c| c.kind() == RET_TYPE)
-            .map(|r| r.children().filter_map(TypeRef::cast).collect())
-            .unwrap_or_default()
+    /// The declared return type, if any. A parenthesised comma list is a
+    /// multi-return (see [`ParenType::inners`]).
+    pub fn ret(&self) -> Option<TypeRef> {
+        // The return type is the TypeRef that is a *direct* child of the
+        // METHOD node (parameter types live inside the PARAM_LIST child).
+        child_node(&self.0)
     }
 }
 
@@ -243,134 +233,41 @@ impl Param {
         }
     }
 
+    /// Whether the parameter is declared optional (`name?: T`).
+    pub fn optional(&self) -> bool {
+        // The `?` on a parameter sits before the `:`, directly in the PARAM.
+        self.0
+            .children_with_tokens()
+            .filter_map(rowan::NodeOrToken::into_token)
+            .take_while(|t| t.kind() != COLON)
+            .any(|t| t.kind() == QUESTION)
+    }
+
     /// The parameter type (`None` for `self`).
     pub fn ty(&self) -> Option<TypeRef> {
         child_node(&self.0)
     }
 }
 
-// --- impl / alias / use -------------------------------------------------
+// --- type expressions -----------------------------------------------------
 
-ast_node!(ImplDef, IMPL_DEF);
-
-impl ImplDef {
-    /// The trait being asserted (the name before `for`).
-    pub fn trait_name(&self) -> Option<String> {
-        first_ident(&self.0)
-    }
-
-    /// The struct the trait is asserted for (the name after `for`).
-    pub fn struct_name(&self) -> Option<String> {
-        let mut seen_for = false;
-        for t in self
-            .0
-            .children_with_tokens()
-            .filter_map(rowan::NodeOrToken::into_token)
-        {
-            if seen_for && t.kind() == IDENT {
-                return Some(t.text().to_string());
-            }
-            if t.kind() == FOR_KW {
-                seen_for = true;
-            }
-        }
-        None
-    }
-
-    /// The generic parameter list on the trait reference, if any.
-    pub fn generic_params(&self) -> Option<GenericParams> {
-        child_node(&self.0)
-    }
-}
-
-ast_node!(TypeAlias, TYPE_ALIAS);
-
-impl TypeAlias {
-    /// The alias name.
-    pub fn name(&self) -> Option<String> {
-        first_ident(&self.0)
-    }
-
-    /// The generic parameter list, if any.
-    pub fn generic_params(&self) -> Option<GenericParams> {
-        child_node(&self.0)
-    }
-
-    /// The aliased type (right of `=`).
-    pub fn ty(&self) -> Option<TypeRef> {
-        child_node(&self.0)
-    }
-}
-
-ast_node!(UseDecl, USE_DECL);
-
-impl UseDecl {
-    /// The dotted import path (e.g. `pkg.geometry.core`).
-    pub fn path(&self) -> String {
-        self.0
-            .children_with_tokens()
-            .filter_map(rowan::NodeOrToken::into_token)
-            .filter(|t| matches!(t.kind(), IDENT | DOT))
-            .map(|t| t.text().to_string())
-            .collect()
-    }
-}
-
-// --- generics -----------------------------------------------------------
-
-ast_node!(GenericParams, GENERIC_PARAMS);
-
-impl GenericParams {
-    /// The declared parameters, in order.
-    pub fn params(&self) -> impl Iterator<Item = GenericParam> + '_ {
-        child_nodes(&self.0)
-    }
-}
-
-ast_node!(GenericParam, GENERIC_PARAM);
-
-impl GenericParam {
-    /// The parameter name.
-    pub fn name(&self) -> Option<String> {
-        first_ident(&self.0)
-    }
-
-    /// The declared bounds from `: A + B` (empty if unbounded).
-    pub fn bounds(&self) -> Vec<String> {
-        // Every IDENT after the first is a bound.
-        self.0
-            .children_with_tokens()
-            .filter_map(rowan::NodeOrToken::into_token)
-            .filter(|t| t.kind() == IDENT)
-            .skip(1)
-            .map(|t| t.text().to_string())
-            .collect()
-    }
-}
-
-ast_node!(GenericArgs, GENERIC_ARGS);
-
-impl GenericArgs {
-    /// The type arguments, in order.
-    pub fn args(&self) -> impl Iterator<Item = TypeRef> + '_ {
-        child_nodes(&self.0)
-    }
-}
-
-// --- types --------------------------------------------------------------
-
-/// A type expression (SHAPES.md §3 `type`).
+/// A type expression (SHAPES-V2.md grammar `type_expr`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeRef {
-    /// A named/generic type: `number`, `Vec<T>`, `HashMap<K, V>`.
+    /// A named reference, possibly qualified and generic:
+    /// `number`, `geometry.Point`, `Pair<T>`.
     Named(NamedType),
+    /// An object type: `{ x: number, area(self): number }`.
+    Object(ObjectType),
     /// A nil-optional type: `T?`.
     Optional(OptionalType),
     /// A union type: `A | B`.
     Union(UnionType),
-    /// A function type: `fn(a: A) -> R`.
+    /// An intersection type: `A & B`.
+    Intersection(IntersectionType),
+    /// A function type: `(a: A) => R`.
     Fn(FnType),
-    /// A parenthesised type: `(T)`.
+    /// A parenthesised type: `(T)`, or a multi-return list `(A, B)`.
     Paren(ParenType),
 }
 
@@ -378,8 +275,10 @@ impl AstNode for TypeRef {
     fn cast(node: ShapeSyntaxNode) -> Option<Self> {
         match node.kind() {
             TYPE_REF => Some(Self::Named(NamedType(node))),
+            OBJECT_TYPE => Some(Self::Object(ObjectType(node))),
             OPTIONAL_TYPE => Some(Self::Optional(OptionalType(node))),
             UNION_TYPE => Some(Self::Union(UnionType(node))),
+            INTERSECTION_TYPE => Some(Self::Intersection(IntersectionType(node))),
             FN_TYPE => Some(Self::Fn(FnType(node))),
             PAREN_TYPE => Some(Self::Paren(ParenType(node))),
             _ => None,
@@ -389,8 +288,10 @@ impl AstNode for TypeRef {
     fn syntax(&self) -> &ShapeSyntaxNode {
         match self {
             Self::Named(n) => n.syntax(),
+            Self::Object(n) => n.syntax(),
             Self::Optional(n) => n.syntax(),
             Self::Union(n) => n.syntax(),
+            Self::Intersection(n) => n.syntax(),
             Self::Fn(n) => n.syntax(),
             Self::Paren(n) => n.syntax(),
         }
@@ -400,9 +301,16 @@ impl AstNode for TypeRef {
 ast_node!(NamedType, TYPE_REF);
 
 impl NamedType {
-    /// The type constructor name.
-    pub fn name(&self) -> Option<String> {
-        first_ident(&self.0)
+    /// The full (possibly dotted) reference path: `Point`,
+    /// `love.graphics.Canvas`. Generic-argument idents live in the
+    /// [`GenericArgs`] child node and are not included.
+    pub fn path(&self) -> String {
+        self.0
+            .children_with_tokens()
+            .filter_map(rowan::NodeOrToken::into_token)
+            .filter(|t| matches!(t.kind(), IDENT | DOT))
+            .map(|t| t.text().to_string())
+            .collect()
     }
 
     /// The generic arguments, if any.
@@ -429,6 +337,15 @@ impl UnionType {
     }
 }
 
+ast_node!(IntersectionType, INTERSECTION_TYPE);
+
+impl IntersectionType {
+    /// The intersection members, in order.
+    pub fn members(&self) -> impl Iterator<Item = TypeRef> + '_ {
+        child_nodes(&self.0)
+    }
+}
+
 ast_node!(FnType, FN_TYPE);
 
 impl FnType {
@@ -437,20 +354,22 @@ impl FnType {
         child_node(&self.0)
     }
 
-    /// The return types (empty when none).
-    pub fn returns(&self) -> Vec<TypeRef> {
-        self.0
-            .children()
-            .find(|c| c.kind() == RET_TYPE)
-            .map(|r| r.children().filter_map(TypeRef::cast).collect())
-            .unwrap_or_default()
+    /// The return type (right of `=>`).
+    pub fn ret(&self) -> Option<TypeRef> {
+        child_node(&self.0)
     }
 }
 
 ast_node!(ParenType, PAREN_TYPE);
 
 impl ParenType {
-    /// The parenthesised inner type.
+    /// The parenthesised inner types. One element for a plain group; several
+    /// for a multi-return list (legal only in return position).
+    pub fn inners(&self) -> impl Iterator<Item = TypeRef> + '_ {
+        child_nodes(&self.0)
+    }
+
+    /// The single inner type, when this is a plain group.
     pub fn inner(&self) -> Option<TypeRef> {
         child_node(&self.0)
     }

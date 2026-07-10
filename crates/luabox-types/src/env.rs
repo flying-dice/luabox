@@ -50,10 +50,9 @@ pub(crate) struct CastEntry {
 pub struct TypeEnv {
     classes: BTreeMap<String, ClassDef>,
     enums: BTreeMap<String, EnumDef>,
-    /// `.luab` structs in scope (via `---@use`): sealed structural shapes.
+    /// Ambient `.luab` types with structural table bodies, by FQ name:
+    /// sealed shapes `Ty::Named` references resolve to (SHAPES-V2.md).
     shape_structs: BTreeMap<String, TableTy>,
-    /// `.luab` traits in scope: interfaces as method-set tables.
-    shape_traits: BTreeMap<String, TableTy>,
     /// Annotated functions by (dotted) name — `f`, `M.helper`.
     functions: BTreeMap<String, FunctionTy>,
     /// `---@type` annotations keyed by their target `local` statement.
@@ -143,26 +142,20 @@ impl TypeEnv {
             env.global_types = ambient.env.global_types.clone();
         }
         if let Some(scope) = shapes {
-            for (name, shape) in &scope.structs {
-                decl.shape_names.insert(name.clone());
-                if shape.params.is_empty() {
-                    env.shape_structs.insert(name.clone(), shape.table.clone());
-                }
-            }
-            for (name, trait_shape) in &scope.traits {
-                decl.shape_names.insert(name.clone());
-                env.shape_traits
-                    .insert(name.clone(), trait_table(trait_shape));
-            }
-            for (name, alias) in &scope.aliases {
-                if alias.params.is_empty() {
-                    decl.shape_aliases.insert(name.clone(), alias.ty.clone());
-                } else {
-                    decl.shape_names.insert(name.clone());
+            // Concrete object types resolve nominally: seed their sealed
+            // structural tables so `Ty::Named(fq)` resolves through
+            // `class_shape`/`resolve_named`. Templates and alias-like types
+            // are handled at the lowerer (monomorphised / expanded inline).
+            for (name, shape) in &scope.types {
+                if shape.params.is_empty()
+                    && let crate::ty::Ty::Table(table) = &shape.ty
+                {
+                    env.shape_structs.insert(name.clone(), (**table).clone());
                 }
             }
         }
         let mut lowerer = Lowerer::new(&decl);
+        lowerer.shape_scope = shapes;
         let root = parse.syntax();
         for item in items {
             lowerer.generics = item
@@ -331,12 +324,6 @@ impl TypeEnv {
                     if let Some(span) = item.target {
                         self.declared_targets
                             .insert((span.start, span.end), c.name.clone());
-                    }
-                }
-                Tag::Struct(s) if !s.name.is_empty() => {
-                    if let Some(span) = item.target {
-                        self.declared_targets
-                            .insert((span.start, span.end), s.name.clone());
                     }
                 }
                 Tag::Field(f) => {
@@ -539,21 +526,12 @@ impl TypeEnv {
             if let Some(table) = self.shape_structs.get(name) {
                 return Some(table.clone());
             }
-            if let Some(table) = self.shape_traits.get(name) {
-                return Some(table.clone());
-            }
             return None;
         }
         let mut shape = TableTy::default();
         let mut seen = HashSet::new();
         self.collect_class(name, &mut shape, &mut seen);
         Some(shape)
-    }
-
-    /// Whether the file declares a `---@class` of this name (used by the
-    /// shape checker's `---@impl` interop path).
-    pub(crate) fn has_class(&self, name: &str) -> bool {
-        self.classes.contains_key(name)
     }
 
     fn collect_class(&self, name: &str, shape: &mut TableTy, seen: &mut HashSet<String>) {
@@ -632,29 +610,6 @@ fn lower_cast(tag: &luacats::CastTag, lowerer: &mut Lowerer<'_>) -> CastEntry {
             .map(|op| (op.kind, lowerer.lower(&op.ty)))
             .collect(),
     }
-}
-
-/// A trait as a structural interface: its functions become fields typed as
-/// functions (the `self` receiver is dropped — Lua method-call syntax
-/// supplies it).
-fn trait_table(trait_shape: &crate::shape::TraitShape) -> TableTy {
-    let mut table = TableTy::default();
-    for (name, sig) in &trait_shape.fns {
-        let func = crate::ty::FunctionTy {
-            params: sig.params.clone(),
-            returns: sig.returns.clone(),
-            has_return_annotation: true,
-            ..crate::ty::FunctionTy::default()
-        };
-        table.fields.insert(
-            name.clone(),
-            FieldTy {
-                ty: Ty::Function(Box::new(func)),
-                optional: false,
-            },
-        );
-    }
-    table
 }
 
 /// The innermost statement whose range is exactly `target`.

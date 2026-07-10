@@ -1,9 +1,10 @@
 Feature: .luab files are analyser-only
-  SHAPES.md §1 invariants — shapes never affect runtime output; .luab never on
-  the require path, never in build/bundle output; bodies are rejected.
+  SHAPES-V2.md invariants — shapes never affect runtime output; .luab never
+  on the require path, never in build/bundle output; method bodies are
+  rejected.
 
   Scenario: body in .luab rejected
-    Given a shape module containing a fn with a body
+    Given a shape module containing a method with a body
     When I run "luabox check"
     Then diagnostic LB2010 is reported
     And stdout contains "implementations live in .lua"
@@ -20,7 +21,7 @@ Feature: .luab files are analyser-only
     And I stash the build output
     Given a file "src/geometry.luab" containing:
       """
-      struct Point { x: number, y: number }
+      type Point = { x: number, y: number }
       """
     When I run "luabox build"
     Then the command succeeds
@@ -30,16 +31,15 @@ Feature: .luab files are analyser-only
     Given an empty directory
     And a file "shapes/bag.luab" containing:
       """
-      struct Bag{count:number,label:string?,..}
+      export type Bag={count:number,label?:string}
       """
     When I run "luabox fmt"
     Then the command succeeds
     And "shapes/bag.luab" equals:
       """
-      struct Bag {
+      export type Bag = {
           count: number,
-          label: string?,
-          ..
+          label?: string,
       }
       """
     When I run "luabox fmt"

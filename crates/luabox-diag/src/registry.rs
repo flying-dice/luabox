@@ -186,48 +186,18 @@ static REGISTRY: &[Entry] = &[
         explain: LB1100,
     },
     Entry {
-        code: Code::new(2001),
-        title: "missing non-optional field on shape-bound literal",
-        explain: LB2001,
-    },
-    Entry {
-        code: Code::new(2002),
-        title: "unknown key on sealed shape",
-        explain: LB2002,
-    },
-    Entry {
-        code: Code::new(2003),
-        title: "incomplete `---@impl`",
-        explain: LB2003,
-    },
-    Entry {
-        code: Code::new(2004),
-        title: "impl signature mismatch",
-        explain: LB2004,
-    },
-    Entry {
         code: Code::new(2005),
-        title: "unresolved `---@use` module",
+        title: "duplicate `.luab` type declaration",
         explain: LB2005,
     },
     Entry {
-        code: Code::new(2006),
-        title: "`---@struct` names an undeclared struct",
-        explain: LB2006,
-    },
-    Entry {
         code: Code::new(2007),
-        title: "generic bound unsatisfied",
+        title: "bad `.luab` type instantiation or reference",
         explain: LB2007,
     },
     Entry {
-        code: Code::new(2008),
-        title: "supertrait conformance missing",
-        explain: LB2008,
-    },
-    Entry {
         code: Code::new(2010),
-        title: "body in `.luab` file",
+        title: "method body in `.luab` file",
         explain: LB2010,
     },
 ];
@@ -579,8 +549,8 @@ The check is deliberately conservative. It stays silent when the shape is
 not fully known: tables that escape into unanalyzed code (arguments to
 unknown functions, global writes), tables with dynamic-key writes or
 indexer types, tables whose metatable/`__index` cannot be resolved, and
-carriers bound to a `---@class` or `.luab` struct (those are governed by
-their declarations — `LB0303`/`LB2002`) never produce this diagnostic.
+carriers checked against a `---@class` or `.luab` type (those are governed
+by their declarations — `LB0302`/`LB0303`) never produce this diagnostic.
 
 Fix the spelling, or assign the field somewhere the checker can see.
 ";
@@ -1028,275 +998,90 @@ package is used — accept the risk consciously; there is no in-manifest
 suppression for this code yet (SPEC.md §19).
 ";
 
-const LB2001: &str = "\
-# LB2001: missing non-optional field on shape-bound literal
-
-A table bound to a struct with `---@struct` (or passed to
-`setmetatable(literal, Carrier)` where the carrier is struct-bound) omits a
-field the struct declares as non-optional. Structs are *sealed* (SHAPES.md
-§5): every field not marked `?` must be present.
-
-```rust
-// geometry.luab
-struct Point { x: number, y: number, label: string? }
-```
-
-```lua
----@use geometry
-
----@struct Point
-local p = { x = 0 }        -- LB2001: missing non-optional field `y`
-                           -- (`label` may be omitted: it is `string?`)
-```
-
-Shape rules are hard errors at every strictness level — the `---@struct`
-binding is itself the opt-in.
-
-Add the missing field, or mark it optional in the `.luab` declaration
-(`field: T?`).
-";
-
-const LB2002: &str = "\
-# LB2002: unknown key on sealed shape
-
-A table literal, field read, or field write used a key the struct does not
-declare. Sealed structs reject unknown keys outright (SHAPES.md §5).
-
-```rust
-// geometry.luab
-struct Point { x: number, y: number }
-struct Bag { n: number, .. }          // `..` opens the shape
-```
-
-```lua
----@use geometry
-
----@struct Point
-local p = { x = 0, y = 0, z = 0 }   -- LB2002: unknown key `z`
-p.w = 1                             -- LB2002: unknown key `w`
-print(p.v)                          -- LB2002: unknown key `v`
-
----@struct Bag
-local b = { n = 1, extra = true }   -- fine: Bag is open, extras are `unknown`
-```
-
-Remove the key, add the field to the struct, or open the struct with `..`
-(extra keys then type as `unknown`). Carrier method names (`function
-Point:magnitude()`) and `__`-prefixed metafields are always allowed.
-";
-
-const LB2003: &str = "\
-# LB2003: incomplete `---@impl`
-
-An `---@impl Trait for Struct` carrier does not define every function the
-trait requires. The diagnostic lists all missing functions.
-
-```rust
-// geometry.luab
-trait Shape {
-    fn area(self) -> number;
-    fn perimeter(self) -> number;
-}
-struct Circle { radius: number }
-```
-
-```lua
----@use geometry
-
----@struct Circle
-local Circle = {}
-Circle.__index = Circle
-
----@impl Shape for Circle           -- LB2003: missing `perimeter`
-function Circle:area()
-  return math.pi * self.radius ^ 2
-end
-```
-
-Define the listed functions on the same carrier (`function Circle:perimeter()
-... end`). Extra inherent methods beyond the trait are always fine.
-";
-
-const LB2004: &str = "\
-# LB2004: impl signature mismatch
-
-A function on an `---@impl` carrier does not match the trait's declared
-signature. Parameters are contravariant (the implementation must accept
-everything the trait promises callers may pass), returns are covariant (the
-implementation must return something the trait's return type accepts), and
-the `:` vs `.` receiver must agree with `self` in the trait. Both spans are
-shown: the implementation and the trait declaration.
-
-```rust
-// geometry.luab
-trait Shape {
-    fn area(self) -> number;
-}
-struct Circle { radius: number }
-```
-
-```lua
----@use geometry
-
----@struct Circle
-local Circle = {}
-Circle.__index = Circle
-
----@impl Shape for Circle
----@return string
-function Circle:area()             -- LB2004: expected return `number`,
-  return \"round\"                   --         found `string`
-end
-```
-
-Also raised when the arity differs, when a parameter type cannot accept the
-trait's, and when a `self` trait function is declared with `.` (or vice
-versa). A `.`-declared function with an explicit leading `self` parameter
-counts as taking `self`. `Result<T, E>` in a trait return position means the
-multi-return pair `(T?, E?)` — annotate the implementation `---@return T?,
-E?` (SHAPES.md §12.1).
-";
-
 const LB2005: &str = "\
-# LB2005: unresolved `---@use` module
+# LB2005: duplicate `.luab` type declaration
 
-A `---@use <module>` (or a `use` inside a `.luab` file) names a shape module
-that could not be resolved. Resolution tries, first hit wins (SHAPES.md §6):
+The package type scope is *ambient* (SHAPES-V2.md): every `.luab` module
+under `[types] shape-paths` is loaded, namespaced by its path, and every
+fully-qualified name must be declared exactly once. Two modules declaring
+the same name is this error at both sites — never a silent merge.
 
-1. a sibling `<module>.luab` next to the using file;
-2. the `[types] shape-paths` directories from `luabox.toml`, in order —
-   more than one hit *within* this tier is an ambiguity, also this error;
-3. dependency-exported shapes. A dependency *exports* shape modules by
-   listing them in `[types] shapes` in **its own** manifest:
-
-   ```toml
-   # a dependency's luabox.toml
-   [types]
-   shapes = [\"geometry\"]
-   ```
-
-   The consumer then resolves `---@use geometry` to that dependency's
-   `geometry.luab` (looked up at the dependency root, then on the
-   dependency's own `[types] shape-paths`). Only exported names cross the
-   package boundary — a `.luab` the dependency does not list stays private.
-   Two dependencies exporting the same module is an ambiguity, this error,
-   listing both candidates.
-
-```lua
----@use geometry     -- LB2005 if no geometry.luab is found in tiers 1–3
+```typescript
+// shapes/geometry.luab        → declares geometry.Point
+type Point = { x: number }
 ```
 
-A dependency's own shape file resolves *its* nested `use`s within that
-dependency package only (one level): the exports of a
-dependency-of-a-dependency are not visible.
-
-Create the `.luab` file next to the using file, add its directory to
-`[types] shape-paths`, have the owning dependency export it via
-`[types] shapes`, or fix the spelling. For an ambiguity, remove or rename
-one of the competing modules (the diagnostic lists the candidates).
-";
-
-const LB2006: &str = "\
-# LB2006: `---@struct` names an undeclared struct
-
-A `---@struct <Name>` (or the trait/struct in an `---@impl`) refers to a
-name that no shape module in scope declares.
-
-```rust
-// geometry.luab
-struct Point { x: number, y: number }
+```typescript
+// shapes2/geometry.luab       → also declares geometry.Point: LB2005
+type Point = { y: number }
 ```
 
-```lua
----@use geometry
-
----@struct Piont      -- LB2006: undeclared struct (typo)
-local p = { x = 0, y = 0 }
-```
-
-Check the spelling, and check the declaring module is imported with
-`---@use`. For `---@impl T for S`, `S` may also be a `---@class` declared in
-the same file (LuaCATS interop) — but `T` must be a `.luab` trait.
+Rename one declaration or remove the duplicate. A *local* declaration that
+shadows a type exported by a dependency is a warning under this code
+(adding a dependency must not break names the package already owned) — the
+local declaration wins.
 ";
 
 const LB2007: &str = "\
-# LB2007: generic bound unsatisfied
+# LB2007: bad `.luab` type instantiation or reference
 
-A generic shape was instantiated with a type argument that does not satisfy
-the parameter's declared bound. Generics are monomorphised per use site and
-violations are reported at the use site, rustc-style (SHAPES.md §5).
+A `.luab` type reference is malformed: a generic type instantiated with the
+wrong number of arguments, type arguments given to a non-generic type, or a
+short name that belongs to *another* module (references outside the
+declaring module are fully qualified — SHAPES-V2.md).
 
-```rust
-// geometry.luab
-trait Shape { fn area(self) -> number; }
-struct Circle { radius: number }
-impl Shape for Circle;
-
-struct Holder<T: Shape> { value: T }
-struct Ok  { h: Holder<Circle> }   // fine: impl Shape for Circle
-struct Bad { h: Holder<number> }   // LB2007: `number` is not `Shape`
+```typescript
+// shapes/geometry.luab
+type Pair<T> = { first: T, second: T }
 ```
 
-The same check runs at `.lua` binding sites (`---@struct Holder<number>`).
-Conformance comes from an `impl Bound for Arg;` assertion in a shape module
-in scope. Also raised for a wrong number of type arguments.
-";
-
-const LB2008: &str = "\
-# LB2008: supertrait conformance missing
-
-An `---@impl` of a trait with supertraits (`trait Drawable: Shape`) requires
-the carrier to conform to every supertrait as well, on the same carrier.
-
-```rust
-// geometry.luab
-trait Shape    { fn area(self) -> number; }
-trait Drawable: Shape { fn draw(self); }
-struct Circle  { radius: number }
+```typescript
+// shapes/other.luab
+type Bad     = geometry.Pair<number, string>  // LB2007: expected 1 argument
+type AlsoBad = Pair<number>                   // LB2007: not declared here —
+                                              // did you mean `geometry.Pair`?
 ```
 
-```lua
----@use geometry
-
----@struct Circle
-local Circle = {}
-Circle.__index = Circle
-
----@impl Drawable for Circle       -- LB2008: `Shape` conformance missing
-function Circle:draw() end
-```
-
-Add `---@impl Shape for Circle` (with its required functions) to the same
-carrier, or assert `impl Shape for Circle;` in a `.luab` module.
+Fix the argument count, or qualify the reference with its module namespace
+(`geometry.Pair<number>`). Sibling references within the declaring module
+stay short; everything else is fully qualified.
 ";
 
 const LB2010: &str = "\
-# LB2010: body in `.luab` file
+# LB2010: method body in `.luab` file
 
-A `.luab` shape file contains a function body. Shape files are
-declaration-only — no bodies, no expressions (SHAPES.md §3). Implementations
-live in `.lua` and bind with `---@impl`.
+A `.luab` shape file contains a method body. Shape files are
+declaration-only — no bodies, no expressions (SHAPES-V2.md). Implementations
+live in `.lua`; conformance is positional, checked wherever a value meets an
+annotated position.
 
-```rust
+```typescript
 // geometry.luab
-trait Shape {
-    fn area(self) -> number { return 1 }   // LB2010
+type Shape = {
+    area(self): number { return 1 },   // LB2010
 }
 ```
 
-Write the signature only, terminated with `;`:
+Write the signature only:
 
-```rust
-trait Shape {
-    fn area(self) -> number;
+```typescript
+type Shape = {
+    area(self): number,
 }
 ```
 
-and implement it in Lua:
+and implement it in Lua, asserting conformance with a standard annotation
+where you want the check to fire:
 
 ```lua
----@impl Shape for Circle
+local Circle = {}
+Circle.__index = Circle
+
+---@return number
 function Circle:area() return math.pi * self.radius ^ 2 end
+
+---@type geometry.Shape
+local as_shape = Circle
 ```
 ";
 
@@ -1310,8 +1095,7 @@ mod tests {
             "LB0001", "LB0010", "LB0011", "LB0012", "LB0013", "LB0014", "LB0015", "LB0016",
             "LB0300", "LB0301", "LB0302", "LB0303", "LB0304", "LB0305", "LB0306", "LB0500",
             "LB0501", "LB0502", "LB0503", "LB0504", "LB0505", "LB0506", "LB0507", "LB0508",
-            "LB1001", "LB1100", "LB2001", "LB2002", "LB2003", "LB2004", "LB2005", "LB2006",
-            "LB2007", "LB2008", "LB2010",
+            "LB1001", "LB1100", "LB2005", "LB2007", "LB2010",
         ] {
             let code: Code = raw.parse().unwrap();
             assert!(explain(&code).is_some(), "{raw} missing from registry");

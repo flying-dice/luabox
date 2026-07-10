@@ -381,55 +381,19 @@ fn simple_tags() {
 }
 
 #[test]
-fn use_tag_parses() {
-    let Tag::Use(u) = one_tag("---@use geometry") else {
-        panic!("expected a use tag")
-    };
-    assert_eq!(u.module, "geometry");
-    let Tag::Use(u) = one_tag("---@use pkg.geometry.core") else {
-        panic!("expected a use tag")
-    };
-    assert_eq!(u.module, "pkg.geometry.core");
-}
-
-#[test]
-fn struct_tag_parses() {
-    let Tag::Struct(s) = one_tag("---@struct Point") else {
-        panic!("expected a struct tag")
-    };
-    assert_eq!(s.name, "Point");
-    assert_eq!(s.args, None);
-
-    let Tag::Struct(s) = one_tag("---@struct Pair<number>") else {
-        panic!("expected a struct tag")
-    };
-    assert_eq!(s.name, "Pair");
-    assert_eq!(s.args.as_deref(), Some("number"));
-
-    // Nested generics balance to the matching top-level `>`.
-    let Tag::Struct(s) = one_tag("---@struct Wrap<Pair<number>>") else {
-        panic!("expected a struct tag")
-    };
-    assert_eq!(s.name, "Wrap");
-    assert_eq!(s.args.as_deref(), Some("Pair<number>"));
-}
-
-#[test]
-fn impl_tag_parses() {
-    let Tag::Impl(i) = one_tag("---@impl Shape for Circle") else {
-        panic!("expected an impl tag")
-    };
-    assert_eq!(i.trait_name, "Shape");
-    assert_eq!(i.struct_name, "Circle");
-}
-
-#[test]
-fn malformed_impl_tag_keeps_empty_struct() {
-    let Tag::Impl(i) = one_tag("---@impl Shape") else {
-        panic!("expected an impl tag")
-    };
-    assert_eq!(i.trait_name, "Shape");
-    assert_eq!(i.struct_name, "");
+fn retired_shape_tags_parse_as_unknown() {
+    // SHAPES-V2.md: the v1 binding tags are gone from the vocabulary. They
+    // parse as Unknown — surfaced to v1 users, never silently accepted.
+    for src in [
+        "---@use geometry",
+        "---@struct Point",
+        "---@impl Shape for Circle",
+    ] {
+        let Tag::Unknown(u) = one_tag(src) else {
+            panic!("retired tag must parse as Unknown: {src}")
+        };
+        assert!(!u.tag.is_empty());
+    }
 }
 
 #[test]

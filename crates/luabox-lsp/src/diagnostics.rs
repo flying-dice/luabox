@@ -63,15 +63,14 @@ pub fn lua_diagnostics(
         ));
     }
 
-    // 3. Types + shape bindings — the same shaped pass as `luabox check`
-    // (SHAPES.md §4–§6), so `---@use`d structs/traits resolve identically
-    // in the editor and in CI. The span file name is dropped on conversion
-    // (LSP diagnostics are already per-document), so the lossy path is fine.
+    // 3. Types with the ambient `.luab` package scope — the same shaped
+    // pass as `luabox check` (SHAPES-V2.md), so fully-qualified shape types
+    // resolve identically in the editor and in CI. The span file name is
+    // dropped on conversion (LSP diagnostics are already per-document), so
+    // the lossy path is fine.
     let rel = path.to_string_lossy();
-    let file_dir = path.parent().unwrap_or(Path::new(""));
     let opts = ShapeOptions {
         store: shapes.store,
-        file_dir,
         shape_paths: shapes.shape_paths,
         dependencies: shapes.dependencies,
     };

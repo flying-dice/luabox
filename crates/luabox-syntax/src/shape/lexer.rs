@@ -1,4 +1,4 @@
-//! Lossless lexer for `.luab` shape files (SHAPES.md §2–3).
+//! Lossless lexer for `.luab` shape files (SHAPES-V2.md).
 //!
 //! Same invariant as the Lua lexer: tokens tile the input byte-for-byte.
 //! The `.luab` surface is small — no string or numeric literals exist in the
@@ -59,18 +59,9 @@ impl Lexer<'_> {
             }
             b'/' => self.slash(start),
             b'A'..=b'Z' | b'a'..=b'z' | b'_' => self.ident_or_keyword(start),
-            b'-' if self.peek(1) == Some(b'>') => {
+            b'=' if self.peek(1) == Some(b'>') => {
                 self.pos += 2;
-                self.push(ShapeSyntaxKind::ARROW, start);
-            }
-            b'.' => {
-                if self.peek(1) == Some(b'.') {
-                    self.pos += 2;
-                    self.push(ShapeSyntaxKind::DOT_DOT, start);
-                } else {
-                    self.pos += 1;
-                    self.push(ShapeSyntaxKind::DOT, start);
-                }
+                self.push(ShapeSyntaxKind::FAT_ARROW, start);
             }
             _ => self.symbol(start, b),
         }
@@ -132,14 +123,9 @@ impl Lexer<'_> {
             self.pos += 1;
         }
         let kind = match &self.text[start..self.pos] {
-            "struct" => ShapeSyntaxKind::STRUCT_KW,
-            "trait" => ShapeSyntaxKind::TRAIT_KW,
-            "impl" => ShapeSyntaxKind::IMPL_KW,
-            "for" => ShapeSyntaxKind::FOR_KW,
-            "fn" => ShapeSyntaxKind::FN_KW,
-            "self" => ShapeSyntaxKind::SELF_KW,
             "type" => ShapeSyntaxKind::TYPE_KW,
-            "use" => ShapeSyntaxKind::USE_KW,
+            "export" => ShapeSyntaxKind::EXPORT_KW,
+            "self" => ShapeSyntaxKind::SELF_KW,
             _ => ShapeSyntaxKind::IDENT,
         };
         self.push(kind, start);
@@ -154,12 +140,12 @@ impl Lexer<'_> {
             b'<' => ShapeSyntaxKind::L_ANGLE,
             b'>' => ShapeSyntaxKind::R_ANGLE,
             b':' => ShapeSyntaxKind::COLON,
-            b';' => ShapeSyntaxKind::SEMICOLON,
             b',' => ShapeSyntaxKind::COMMA,
             b'?' => ShapeSyntaxKind::QUESTION,
             b'|' => ShapeSyntaxKind::PIPE,
-            b'+' => ShapeSyntaxKind::PLUS,
+            b'&' => ShapeSyntaxKind::AMP,
             b'=' => ShapeSyntaxKind::EQ,
+            b'.' => ShapeSyntaxKind::DOT,
             _ => {
                 // Consume the full UTF-8 char so token boundaries stay char
                 // boundaries.
@@ -204,21 +190,18 @@ mod tests {
     fn spec_example_lexes_clean() {
         let src = r"
 /// 2D geometry primitives.
-struct Point { x: number, y: number, label: string? }
+type Point = { x: number, y: number, label?: string }
+type Circle = { radius: number }
+type Pair<T> = { first: T, second: T }
 
-trait Shape {
-    fn area(self) -> number;
-    fn perimeter(self) -> number;
+export type Shape = {
+    area(self): number,
+    perimeter(self): number,
 }
 
-trait Drawable: Shape {
-    fn draw(self, surface: Surface);
+export type Drawable = Shape & {
+    draw(self, surface: Surface),
 }
-
-struct Circle { radius: number }
-impl Shape for Circle;
-
-struct Pair<T> { first: T, second: T }
 ";
         let toks = check(src);
         assert!(
@@ -228,56 +211,62 @@ struct Pair<T> { first: T, second: T }
     }
 
     #[test]
-    fn struct_tokens() {
+    fn type_def_tokens() {
         assert_eq!(
-            nontrivia("struct Point { x: number, }"),
+            nontrivia("type Point = { x: number, }"),
             vec![
-                STRUCT_KW, IDENT, L_BRACE, IDENT, COLON, IDENT, COMMA, R_BRACE
+                TYPE_KW, IDENT, EQ, L_BRACE, IDENT, COLON, IDENT, COMMA, R_BRACE
             ]
         );
     }
 
     #[test]
-    fn open_marker_and_optional() {
+    fn export_and_optional_field() {
         assert_eq!(
-            nontrivia("struct Bag { n: number? .. }"),
+            nontrivia("export type Bag = { n?: number }"),
             vec![
-                STRUCT_KW, IDENT, L_BRACE, IDENT, COLON, IDENT, QUESTION, DOT_DOT, R_BRACE
+                EXPORT_KW, TYPE_KW, IDENT, EQ, L_BRACE, IDENT, QUESTION, COLON, IDENT, R_BRACE
             ]
         );
     }
 
     #[test]
-    fn trait_fn_signature() {
+    fn method_member() {
         assert_eq!(
-            nontrivia("fn area(self) -> number;"),
-            vec![
-                FN_KW, IDENT, L_PAREN, SELF_KW, R_PAREN, ARROW, IDENT, SEMICOLON
-            ]
+            nontrivia("area(self): number"),
+            vec![IDENT, L_PAREN, SELF_KW, R_PAREN, COLON, IDENT]
         );
     }
 
     #[test]
-    fn supertraits_and_impl() {
+    fn intersection_and_union() {
         assert_eq!(
-            nontrivia("trait Drawable: Shape + Sized {}"),
-            vec![TRAIT_KW, IDENT, COLON, IDENT, PLUS, IDENT, L_BRACE, R_BRACE]
+            nontrivia("Shape & { draw(self): string }"),
+            vec![
+                IDENT, AMP, L_BRACE, IDENT, L_PAREN, SELF_KW, R_PAREN, COLON, IDENT, R_BRACE
+            ]
         );
+        assert_eq!(nontrivia("number | string"), vec![IDENT, PIPE, IDENT]);
+    }
+
+    #[test]
+    fn qualified_reference() {
         assert_eq!(
-            nontrivia("impl Shape for Circle;"),
-            vec![IMPL_KW, IDENT, FOR_KW, IDENT, SEMICOLON]
+            nontrivia("export type Canvas = love.graphics.Canvas"),
+            vec![EXPORT_KW, TYPE_KW, IDENT, EQ, IDENT, DOT, IDENT, DOT, IDENT]
         );
     }
 
     #[test]
-    fn alias_and_use() {
+    fn fn_type_fat_arrow() {
         assert_eq!(
-            nontrivia("type Points = Vec<Point>;"),
+            nontrivia("type F = (x: number) => string"),
             vec![
-                TYPE_KW, IDENT, EQ, IDENT, L_ANGLE, IDENT, R_ANGLE, SEMICOLON
+                TYPE_KW, IDENT, EQ, L_PAREN, IDENT, COLON, IDENT, R_PAREN, FAT_ARROW, IDENT
             ]
         );
-        assert_eq!(nontrivia("use geometry;"), vec![USE_KW, IDENT, SEMICOLON]);
+        // `=` followed by non-`>` is plain EQ
+        assert_eq!(nontrivia("= >"), vec![EQ, R_ANGLE]);
     }
 
     #[test]
@@ -293,8 +282,12 @@ struct Pair<T> { first: T, second: T }
 
     #[test]
     fn keywords_are_exact() {
-        // `selfish` is an ident, not SELF_KW + ish
-        assert_eq!(nontrivia("selfish structs"), vec![IDENT, IDENT]);
+        // `selfish` is an ident, not SELF_KW + ish; retired v1 keywords are
+        // plain idents now.
+        assert_eq!(
+            nontrivia("selfish struct trait impl fn use for"),
+            vec![IDENT, IDENT, IDENT, IDENT, IDENT, IDENT, IDENT]
+        );
     }
 
     #[test]
@@ -302,8 +295,9 @@ struct Pair<T> { first: T, second: T }
         // no numbers or strings in the grammar
         assert_eq!(nontrivia("x: 5"), vec![IDENT, COLON, ERROR]);
         assert_eq!(kinds("£"), vec![ERROR]);
-        // lone slash and lone minus are errors
+        // lone slash, minus, and the retired thin arrow are errors
         assert_eq!(nontrivia("a / b"), vec![IDENT, ERROR, IDENT]);
         assert_eq!(nontrivia("a - b"), vec![IDENT, ERROR, IDENT]);
+        assert_eq!(nontrivia("-> x"), vec![ERROR, R_ANGLE, IDENT]);
     }
 }

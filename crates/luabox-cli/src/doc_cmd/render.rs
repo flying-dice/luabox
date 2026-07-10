@@ -8,16 +8,14 @@
 //!
 //! Cross-links resolve through one global name table (`Links`): any type
 //! name appearing in a rendered signature that names a documented
-//! class/struct/trait/alias/enum becomes an `<a href>`; unresolved names
-//! render plain.
+//! class/type/alias/enum becomes an `<a href>`; unresolved names render
+//! plain.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use super::markdown::{self, escape};
-use super::model::{
-    self, ClassDoc, DocModel, FunctionDoc, Module, ShapeModule, StructDoc, TraitDoc,
-};
+use super::model::{self, ClassDoc, DocModel, FunctionDoc, Module, ShapeModule, TypeDoc};
 
 /// The global name table: documented type name → href.
 pub type Links = BTreeMap<String, String>;
@@ -37,26 +35,28 @@ pub fn pages(model: &DocModel) -> Vec<(String, String)> {
         for class in &module.classes {
             out.push((
                 class_file(&class.name),
-                class_page(class, &classes, model, &links, &sidebar),
+                class_page(class, &classes, &links, &sidebar),
             ));
         }
     }
     for sm in &model.shape_modules {
         out.push((shape_file(&sm.name), shape_page(sm, &links, &sidebar)));
-        for st in &sm.structs {
-            out.push((
-                struct_file(&st.name),
-                struct_page(st, model, &links, &sidebar),
-            ));
-        }
-        for tr in &sm.traits {
-            out.push((
-                trait_file(&tr.name),
-                trait_page(tr, model, &links, &sidebar),
-            ));
+        for ty in &sm.types {
+            let fq = fq_type_name(sm, ty);
+            out.push((type_file(&fq), type_page(&fq, ty, &links, &sidebar)));
         }
     }
     out
+}
+
+/// The fully-qualified name a `.luab` type is addressed by (SHAPES-V2.md):
+/// the module's path-derived namespace dot the declared name.
+fn fq_type_name(sm: &ShapeModule, ty: &TypeDoc) -> String {
+    if sm.name.is_empty() {
+        ty.name.clone()
+    } else {
+        format!("{}.{}", sm.name, ty.name)
+    }
 }
 
 // === File naming ==========================================================
@@ -83,11 +83,8 @@ fn shape_file(name: &str) -> String {
 fn class_file(name: &str) -> String {
     format!("class.{}.html", slug(name))
 }
-fn struct_file(name: &str) -> String {
-    format!("struct.{}.html", slug(name))
-}
-fn trait_file(name: &str) -> String {
-    format!("trait.{}.html", slug(name))
+fn type_file(fq_name: &str) -> String {
+    format!("type.{}.html", slug(fq_name))
 }
 
 // === Link resolution ======================================================
@@ -113,17 +110,13 @@ pub fn build_links(model: &DocModel) -> Links {
         }
     }
     for sm in &model.shape_modules {
-        for st in &sm.structs {
-            links.insert(st.name.clone(), struct_file(&st.name));
-        }
-        for tr in &sm.traits {
-            links.insert(tr.name.clone(), trait_file(&tr.name));
-        }
-        for alias in &sm.aliases {
-            links.insert(
-                alias.name.clone(),
-                format!("{}#alias.{}", shape_file(&sm.name), slug(&alias.name)),
-            );
+        for ty in &sm.types {
+            let fq = fq_type_name(sm, ty);
+            let href = type_file(&fq);
+            // Registered under the FQ name (how `.lua` annotations address
+            // it) and the short name (how sibling `.luab` references render).
+            links.insert(fq, href.clone());
+            links.entry(ty.name.clone()).or_insert(href);
         }
     }
     links
@@ -273,29 +266,9 @@ pub fn search_index_json(model: &DocModel) -> String {
             shape_file(&sm.name),
             String::new(),
         ));
-        for st in &sm.structs {
-            entries.push((
-                st.name.clone(),
-                "struct",
-                struct_file(&st.name),
-                summary(&st.docs),
-            ));
-        }
-        for tr in &sm.traits {
-            entries.push((
-                tr.name.clone(),
-                "trait",
-                trait_file(&tr.name),
-                summary(&tr.docs),
-            ));
-        }
-        for alias in &sm.aliases {
-            entries.push((
-                alias.name.clone(),
-                "alias",
-                format!("{}#alias.{}", shape_file(&sm.name), slug(&alias.name)),
-                summary(&alias.docs),
-            ));
+        for ty in &sm.types {
+            let fq = fq_type_name(sm, ty);
+            entries.push((fq.clone(), "type", type_file(&fq), summary(&ty.docs)));
         }
     }
 
@@ -488,21 +461,17 @@ fn sidebar_html(model: &DocModel) -> String {
             classes.push((class.name.clone(), class_file(&class.name)));
         }
     }
-    let mut structs: Vec<(String, String)> = Vec::new();
-    let mut traits: Vec<(String, String)> = Vec::new();
+    let mut shape_types: Vec<(String, String)> = Vec::new();
     for sm in &model.shape_modules {
-        for st in &sm.structs {
-            structs.push((st.name.clone(), struct_file(&st.name)));
-        }
-        for tr in &sm.traits {
-            traits.push((tr.name.clone(), trait_file(&tr.name)));
+        for ty in &sm.types {
+            let fq = fq_type_name(sm, ty);
+            shape_types.push((fq.clone(), type_file(&fq)));
         }
     }
     section(&mut nav, "Modules", &modules);
     section(&mut nav, "Shape modules", &shapes);
     section(&mut nav, "Classes", &classes);
-    section(&mut nav, "Structs", &structs);
-    section(&mut nav, "Traits", &traits);
+    section(&mut nav, "Types", &shape_types);
     nav
 }
 
@@ -573,11 +542,9 @@ fn index_page(model: &DocModel, sidebar: &str) -> String {
         }
     }
     for sm in &model.shape_modules {
-        for st in &sm.structs {
-            types.push((st.name.clone(), struct_file(&st.name), summary(&st.docs)));
-        }
-        for tr in &sm.traits {
-            types.push((tr.name.clone(), trait_file(&tr.name), summary(&tr.docs)));
+        for ty in &sm.types {
+            let fq = fq_type_name(sm, ty);
+            types.push((fq.clone(), type_file(&fq), summary(&ty.docs)));
         }
     }
     listing(&mut content, "Types", types);
@@ -771,7 +738,6 @@ fn field_table(rows: &[(String, String, String)], links: &Links) -> String {
 fn class_page(
     class: &ClassDoc,
     classes: &BTreeMap<&str, &ClassDoc>,
-    model: &DocModel,
     links: &Links,
     sidebar: &str,
 ) -> String {
@@ -838,91 +804,33 @@ fn class_page(
         }
     }
 
-    let implemented = traits_of(model, &class.name);
-    if !implemented.is_empty() {
-        content.push_str("<h2>Trait implementations</h2>\n<ul class=\"item-list\">\n");
-        for tr in implemented {
-            let _ = writeln!(content, "<li>{}</li>", link_types(&tr, links));
-        }
-        content.push_str("</ul>\n");
-    }
-
     page(&format!("Class {}", class.name), sidebar, &content)
 }
 
-fn shape_page(sm: &ShapeModule, links: &Links, sidebar: &str) -> String {
+fn shape_page(sm: &ShapeModule, _links: &Links, sidebar: &str) -> String {
     let mut content = format!(
-        "<h1>Shape module <code>{}</code></h1>\n<p class=\"muted\">Declared in <code>{}.luab</code> \
-         — analyser-only shape declarations (SHAPES.md).</p>\n",
-        escape(&sm.name),
+        "<h1>Shape module <code>{}</code></h1>\n<p class=\"muted\">Analyser-only type \
+         declarations (SHAPES-V2.md); addressed by fully-qualified name.</p>\n",
         escape(&sm.name)
     );
-    if !sm.structs.is_empty() {
-        content.push_str("<h2>Structs</h2>\n<ul class=\"item-list\">\n");
-        for st in &sm.structs {
+    if !sm.types.is_empty() {
+        content.push_str("<h2>Types</h2>\n<ul class=\"item-list\">\n");
+        for ty in &sm.types {
+            let fq = fq_type_name(sm, ty);
             let _ = write!(
                 content,
                 "<li><a href=\"{}\">{}</a>",
-                escape(&struct_file(&st.name)),
-                escape(&st.name)
+                escape(&type_file(&fq)),
+                escape(&fq)
             );
-            let s = summary(&st.docs);
+            if ty.export {
+                content.push_str("<span class=\"badge\">export</span>");
+            }
+            let s = summary(&ty.docs);
             if !s.is_empty() {
                 let _ = write!(content, "<span class=\"summary\">{}</span>", escape(&s));
             }
             content.push_str("</li>\n");
-        }
-        content.push_str("</ul>\n");
-    }
-    if !sm.traits.is_empty() {
-        content.push_str("<h2>Traits</h2>\n<ul class=\"item-list\">\n");
-        for tr in &sm.traits {
-            let _ = write!(
-                content,
-                "<li><a href=\"{}\">{}</a>",
-                escape(&trait_file(&tr.name)),
-                escape(&tr.name)
-            );
-            let s = summary(&tr.docs);
-            if !s.is_empty() {
-                let _ = write!(content, "<span class=\"summary\">{}</span>", escape(&s));
-            }
-            content.push_str("</li>\n");
-        }
-        content.push_str("</ul>\n");
-    }
-    if !sm.aliases.is_empty() {
-        content.push_str("<h2>Type aliases</h2>\n");
-        for alias in &sm.aliases {
-            let _ = writeln!(
-                content,
-                "<div class=\"item\" id=\"alias.{}\">",
-                slug(&alias.name)
-            );
-            let generics = if alias.generics.is_empty() {
-                String::new()
-            } else {
-                format!("&lt;{}&gt;", escape(&alias.generics.join(", ")))
-            };
-            let _ = writeln!(
-                content,
-                "<pre class=\"sig\">type {}{generics} = {}</pre>",
-                escape(&alias.name),
-                link_types(&alias.ty, links)
-            );
-            content.push_str(&markdown::to_html(&alias.docs));
-            content.push_str("</div>\n");
-        }
-    }
-    if !sm.impls.is_empty() {
-        content.push_str("<h2>Impls</h2>\n<ul class=\"item-list\">\n");
-        for imp in &sm.impls {
-            let _ = writeln!(
-                content,
-                "<li><code>impl {} for {}</code></li>",
-                link_types(&imp.trait_name, links),
-                link_types(&imp.struct_name, links)
-            );
         }
         content.push_str("</ul>\n");
     }
@@ -937,29 +845,34 @@ fn generics_html(generics: &[String]) -> String {
     }
 }
 
-fn struct_page(st: &StructDoc, model: &DocModel, links: &Links, sidebar: &str) -> String {
-    let seal = if st.sealed { "sealed" } else { "open" };
+fn type_page(fq: &str, ty: &TypeDoc, links: &Links, sidebar: &str) -> String {
     let mut content = format!(
-        "<h1>Struct <code>{}{}</code><span class=\"badge\">{seal}</span></h1>\n",
-        escape(&st.name),
-        generics_html(&st.generics)
+        "<h1>Type <code>{}{}</code>",
+        escape(fq),
+        generics_html(&ty.generics)
     );
-    if st.sealed {
-        content.push_str(
-            "<p class=\"muted\">Sealed: tables bound to this struct may not carry \
-             undeclared fields (SHAPES.md §5).</p>\n",
-        );
-    } else {
-        content.push_str(
-            "<p class=\"muted\">Open (<code>..</code>): tables bound to this struct may \
-             carry extra fields.</p>\n",
+    if ty.export {
+        content.push_str("<span class=\"badge\">export</span>");
+    }
+    content.push_str("</h1>\n");
+
+    if !ty.bases.is_empty() {
+        let bases: Vec<String> = ty.bases.iter().map(|b| link_types(b, links)).collect();
+        let _ = writeln!(content, "<p>= {} &amp; {{ … }}</p>", bases.join(" &amp; "));
+    } else if !ty.rhs.is_empty() {
+        let _ = writeln!(
+            content,
+            "<pre class=\"sig\">type {}{} = {}</pre>",
+            escape(&ty.name),
+            generics_html(&ty.generics),
+            link_types(&ty.rhs, links)
         );
     }
-    content.push_str(&markdown::to_html(&st.docs));
+    content.push_str(&markdown::to_html(&ty.docs));
 
-    if !st.fields.is_empty() {
+    if !ty.fields.is_empty() {
         content.push_str("<h2>Fields</h2>\n");
-        let rows: Vec<(String, String, String)> = st
+        let rows: Vec<(String, String, String)> = ty
             .fields
             .iter()
             .map(|f| (f.name.clone(), f.ty.clone(), summary(&f.docs)))
@@ -967,88 +880,25 @@ fn struct_page(st: &StructDoc, model: &DocModel, links: &Links, sidebar: &str) -
         content.push_str(&field_table(&rows, links));
     }
 
-    let implemented = traits_of(model, &st.name);
-    if !implemented.is_empty() {
-        content.push_str("<h2>Trait implementations</h2>\n<ul class=\"item-list\">\n");
-        for tr in implemented {
-            let _ = writeln!(content, "<li>{}</li>", link_types(&tr, links));
-        }
-        content.push_str("</ul>\n");
-    }
-
-    page(&format!("Struct {}", st.name), sidebar, &content)
-}
-
-fn trait_page(tr: &TraitDoc, model: &DocModel, links: &Links, sidebar: &str) -> String {
-    let mut content = format!(
-        "<h1>Trait <code>{}{}</code></h1>\n",
-        escape(&tr.name),
-        generics_html(&tr.generics)
-    );
-    if !tr.supertraits.is_empty() {
-        let supers: Vec<String> = tr
-            .supertraits
-            .iter()
-            .map(|s| link_types(s, links))
-            .collect();
-        let _ = writeln!(content, "<p>requires {}</p>", supers.join(" + "));
-    }
-    content.push_str(&markdown::to_html(&tr.docs));
-
-    if !tr.fns.is_empty() {
-        content.push_str("<h2>Required functions</h2>\n");
-        for func in &tr.fns {
+    if !ty.methods.is_empty() {
+        content.push_str("<h2>Methods</h2>\n");
+        for method in &ty.methods {
             let _ = writeln!(
                 content,
                 "<div class=\"item\" id=\"fn.{}\">",
-                slug(&func.name)
+                slug(&method.name)
             );
             let _ = writeln!(
                 content,
                 "<pre class=\"sig\">{}</pre>",
-                link_types(&func.sig, links)
+                link_types(&method.sig, links)
             );
-            content.push_str(&markdown::to_html(&func.docs));
+            content.push_str(&markdown::to_html(&method.docs));
             content.push_str("</div>\n");
         }
     }
 
-    let implementors = implementors_of(model, &tr.name);
-    if !implementors.is_empty() {
-        content.push_str("<h2>Implementors</h2>\n<ul class=\"item-list\">\n");
-        for name in implementors {
-            let _ = writeln!(content, "<li>{}</li>", link_types(&name, links));
-        }
-        content.push_str("</ul>\n");
-    }
-
-    page(&format!("Trait {}", tr.name), sidebar, &content)
-}
-
-/// The traits `struct_name` implements, per the project-wide impl set.
-fn traits_of(model: &DocModel, struct_name: &str) -> Vec<String> {
-    let mut out: Vec<String> = model
-        .impls
-        .iter()
-        .filter(|i| i.struct_name == struct_name)
-        .map(|i| i.trait_name.clone())
-        .collect();
-    out.sort();
-    out.dedup();
-    out
-}
-
-/// The structs (or classes) implementing `trait_name`.
-fn implementors_of(model: &DocModel, trait_name: &str) -> Vec<String> {
-    let mut out: Vec<String> = model
-        .impls
-        .iter()
-        .filter(|i| i.trait_name == trait_name)
-        .map(|i| i.struct_name.clone())
-        .collect();
-    out.sort();
-    out.dedup();
-    out
+    page(&format!("Type {fq}"), sidebar, &content)
 }
 
 #[cfg(test)]
@@ -1057,42 +907,43 @@ mod tests {
     use luabox_syntax::Dialect;
 
     fn fixture_model() -> DocModel {
-        let (module, mut impls) = model::lua_module(
+        let module = model::lua_module(
             "main",
             "--- Entry module.\n\
              \n\
              --- Distance from origin.\n\
-             ---@param p Point the point\n\
+             ---@param p geometry.Point the point\n\
              ---@return number\n\
              local function dist(p)\n  return 0\nend\n",
             Dialect::Lua54,
         );
         let shapes = model::shape_module(
             "geometry",
-            "/// A 2D point.\nstruct Point { x: number, y: number }\n\
-             trait Shape {\n    fn area(self) -> number;\n}\n\
-             impl Shape for Point;\n",
+            "/// A 2D point.\ntype Point = { x: number, y: number }\n\
+             export type Shape = {\n    area(self): number,\n}\n",
         );
-        impls.extend(shapes.impls.clone());
         DocModel {
             package: "fixture".to_string(),
             modules: vec![module],
             shape_modules: vec![shapes],
-            impls,
         }
     }
 
     #[test]
-    fn links_cover_classes_structs_traits_and_aliases() {
+    fn links_cover_fq_and_short_type_names() {
         let model = fixture_model();
         let links = build_links(&model);
         assert_eq!(
-            links.get("Point").map(String::as_str),
-            Some("struct.Point.html")
+            links.get("geometry.Point").map(String::as_str),
+            Some("type.geometry.Point.html")
         );
         assert_eq!(
-            links.get("Shape").map(String::as_str),
-            Some("trait.Shape.html")
+            links.get("Point").map(String::as_str),
+            Some("type.geometry.Point.html")
+        );
+        assert_eq!(
+            links.get("geometry.Shape").map(String::as_str),
+            Some("type.geometry.Shape.html")
         );
         assert!(!links.contains_key("number"));
     }
@@ -1100,18 +951,21 @@ mod tests {
     #[test]
     fn link_types_wraps_known_names_only() {
         let mut links = Links::new();
-        links.insert("Point".to_string(), "struct.Point.html".to_string());
-        let html = link_types("fun(p: Point): number", &links);
+        links.insert(
+            "geometry.Point".to_string(),
+            "type.geometry.Point.html".to_string(),
+        );
+        let html = link_types("fun(p: geometry.Point): number", &links);
         assert_eq!(
             html,
-            "fun(p: <a href=\"struct.Point.html\">Point</a>): number"
+            "fun(p: <a href=\"type.geometry.Point.html\">geometry.Point</a>): number"
         );
     }
 
     #[test]
     fn link_types_skips_string_literals_and_escapes() {
         let mut links = Links::new();
-        links.insert("Point".to_string(), "struct.Point.html".to_string());
+        links.insert("Point".to_string(), "type.geometry.Point.html".to_string());
         assert_eq!(
             link_types("\"Point\"|Point", &links).matches("<a ").count(),
             1
@@ -1131,8 +985,8 @@ mod tests {
             .map(|e| e["name"].as_str().expect("name"))
             .collect();
         assert!(names.contains(&"dist"));
-        assert!(names.contains(&"Point"));
-        assert!(names.contains(&"Shape"));
+        assert!(names.contains(&"geometry.Point"));
+        assert!(names.contains(&"geometry.Shape"));
         assert!(names.contains(&"main"));
         for entry in entries {
             assert!(entry["kind"].is_string());
@@ -1144,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn pages_cross_link_param_types_to_struct_pages() {
+    fn pages_cross_link_param_types_to_type_pages() {
         let model = fixture_model();
         let pages = pages(&model);
         let module = &pages
@@ -1152,7 +1006,7 @@ mod tests {
             .find(|(name, _)| name == "module.main.html")
             .expect("module page")
             .1;
-        assert!(module.contains("href=\"struct.Point.html\""));
+        assert!(module.contains("href=\"type.geometry.Point.html\""));
         let index = &pages
             .iter()
             .find(|(name, _)| name == "index.html")
@@ -1162,24 +1016,21 @@ mod tests {
     }
 
     #[test]
-    fn struct_page_carries_seal_marker_and_impls() {
+    fn type_pages_carry_members_and_export_badge() {
         let model = fixture_model();
         let pages = pages(&model);
-        let st = &pages
+        let point = &pages
             .iter()
-            .find(|(name, _)| name == "struct.Point.html")
-            .expect("struct page")
+            .find(|(name, _)| name == "type.geometry.Point.html")
+            .expect("type page")
             .1;
-        assert!(st.contains("sealed"));
-        assert!(st.contains("href=\"trait.Shape.html\""));
-        let tr = &pages
+        assert!(point.contains("<h2>Fields</h2>"));
+        let shape = &pages
             .iter()
-            .find(|(name, _)| name == "trait.Shape.html")
-            .expect("trait page")
+            .find(|(name, _)| name == "type.geometry.Shape.html")
+            .expect("type page")
             .1;
-        assert!(
-            tr.contains("fn area(self) -&gt; number") || tr.contains("fn area(self) -> number")
-        );
-        assert!(tr.contains("href=\"struct.Point.html\""));
+        assert!(shape.contains("area(self): number"));
+        assert!(shape.contains("export"));
     }
 }

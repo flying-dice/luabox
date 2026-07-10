@@ -72,10 +72,9 @@ pub struct TableTy {
     pub indexers: Vec<(Ty, Ty)>,
     /// The array-part element type (`T[]`).
     pub array: Option<Ty>,
-    /// Whether this table is a *sealed* `.luab` struct shape (SHAPES.md §5):
-    /// unknown-key reads and writes on shape-bound values are hard errors
-    /// (`LB2002`). The `..` open marker sets this back to `false` (extras
-    /// type as `unknown`). LuaCATS tables are never sealed.
+    /// Whether this table is a *sealed* `.luab` object shape (SHAPES-V2.md):
+    /// literals checked against it get freshness diagnostics for undeclared
+    /// keys (`LB0303`). LuaCATS tables are never sealed.
     pub sealed: bool,
 }
 

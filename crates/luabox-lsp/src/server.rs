@@ -24,8 +24,8 @@ use lsp_types::notification::{
     PublishDiagnostics,
 };
 use lsp_types::request::{
-    Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest,
-    InlayHintRequest, RangeFormatting, Request as _, SemanticTokensFullRequest,
+    Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, InlayHintRequest,
+    RangeFormatting, Request as _, SemanticTokensFullRequest,
 };
 use lsp_types::{
     CompletionOptions, CompletionResponse, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
@@ -167,10 +167,11 @@ impl ProjectConfig {
     }
 }
 
-/// Build the dependency shape-export table for resolution tier 3
-/// (SHAPES.md §6). Mirrors `check_cmd::resolve_dep_shape_exports` in the
-/// CLI — the two frontends currently each own this manifest join;
-/// unify if a third consumer appears.
+/// Build the dependency type-export surfaces (SHAPES-V2.md): each
+/// dependency's `[types] entry` names the `.luab` whose `export type`
+/// declarations mount under the dependency's package name. Mirrors
+/// `check_cmd::resolve_dep_shape_exports` in the CLI — the two frontends
+/// currently each own this manifest join; unify if a third consumer appears.
 fn resolve_dep_shape_exports(root: &Path, manifest: &Manifest) -> Vec<DepShapeExport> {
     let mut exports = Vec::new();
     for (name, dep) in manifest
@@ -188,19 +189,18 @@ fn resolve_dep_shape_exports(root: &Path, manifest: &Manifest) -> Vec<DepShapeEx
         let Ok(dep_manifest) = Manifest::parse(&text) else {
             continue;
         };
-        if dep_manifest.types.shapes.is_empty() {
+        let Some(entry) = &dep_manifest.types.entry else {
             continue;
-        }
+        };
         exports.push(DepShapeExport {
             name: name.clone(),
+            entry: Some(dep_root.join(entry.replace('\\', "/"))),
             shape_paths: dep_manifest
                 .types
                 .shape_paths
                 .iter()
                 .map(|p| dep_root.join(p))
                 .collect(),
-            exported: dep_manifest.types.shapes.clone(),
-            root: dep_root,
         });
     }
     exports

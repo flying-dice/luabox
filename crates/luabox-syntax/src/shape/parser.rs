@@ -1,31 +1,33 @@
 //! Recursive-descent, error-resilient parser for the `.luab` shape grammar
-//! (SHAPES.md §3), producing a lossless rowan green tree.
+//! (SHAPES-V2.md), producing a lossless rowan green tree.
 //!
 //! Design notes:
 //! - **Lossless.** Every lexed token — trivia included — is emitted into the
 //!   tree exactly once, so `parse(text).syntax().to_string() == text` for any
 //!   input. This is asserted by the property test at the bottom of the file.
-//! - **Leading trivia nests inward.** Item/field/fn nodes are opened *before*
+//! - **Leading trivia nests inward.** Item/member nodes are opened *before*
 //!   their first token is bumped, so preceding doc comments and comments land
 //!   inside the node they document (the formatter relies on this).
 //! - **Never panics.** Unexpected tokens become [`ShapeSyntaxKind::ERROR_NODE`]
 //!   spans and parsing resynchronises at the next item keyword. Bodies (a `{`
-//!   where a trait-fn signature expects `;`) are rejected with `LB2010` and
-//!   skipped over balanced braces.
+//!   after a method signature) are rejected with `LB2010` and skipped over
+//!   balanced braces.
+//! - **No terminators.** Items are self-delimiting: an item ends where its
+//!   type expression ends, and the next `export`/`type` keyword (or EOF)
+//!   starts the next one.
 
 use rowan::{GreenNode, GreenNodeBuilder, TextRange, TextSize};
 
 use super::{ShapeLanguage, ShapeSyntaxKind, ShapeSyntaxNode, lex};
 use ShapeSyntaxKind::{
-    ARROW, COLON, COMMA, DOT, DOT_DOT, EQ, ERROR_NODE, FIELD, FN_KW, FN_TYPE, FOR_KW, GENERIC_ARGS,
-    GENERIC_PARAM, GENERIC_PARAMS, IDENT, IMPL_DEF, IMPL_KW, L_ANGLE, L_BRACE, L_PAREN,
-    OPEN_MARKER, OPTIONAL_TYPE, PARAM, PARAM_LIST, PAREN_TYPE, PIPE, PLUS, QUESTION, R_ANGLE,
-    R_BRACE, R_PAREN, RET_TYPE, SELF_KW, SEMICOLON, SHAPE_FILE, STRUCT_DEF, STRUCT_KW, SUPERTRAITS,
-    TRAIT_DEF, TRAIT_FN, TRAIT_KW, TYPE_ALIAS, TYPE_KW, TYPE_REF, UNION_TYPE, USE_DECL, USE_KW,
+    AMP, COLON, COMMA, DOT, EQ, ERROR_NODE, EXPORT_KW, FAT_ARROW, FIELD, FN_TYPE, GENERIC_ARGS,
+    GENERIC_PARAM, GENERIC_PARAMS, IDENT, INTERSECTION_TYPE, L_ANGLE, L_BRACE, L_PAREN, METHOD,
+    OBJECT_TYPE, OPTIONAL_TYPE, PARAM, PARAM_LIST, PAREN_TYPE, PIPE, QUESTION, R_ANGLE, R_BRACE,
+    R_PAREN, SELF_KW, SHAPE_FILE, TYPE_DEF, TYPE_KW, TYPE_REF, UNION_TYPE,
 };
 
-/// The exact `LB2010` message required by SHAPES.md §3 / §5.
-pub const LB2010_MESSAGE: &str = "implementations live in .lua - bind with ---@impl";
+/// The exact `LB2010` message (SHAPES-V2.md: `.luab` stays analyser-only).
+pub const LB2010_MESSAGE: &str = "implementations live in .lua - .luab declares types only";
 
 /// A single parse diagnostic. `code` is the `LB2xxx` string when one applies
 /// (only `LB2010` is raised at parse time); syntax errors carry `None`.
@@ -116,7 +118,7 @@ fn raw(k: ShapeSyntaxKind) -> rowan::SyntaxKind {
 }
 
 fn is_item_start(k: ShapeSyntaxKind) -> bool {
-    matches!(k, STRUCT_KW | TRAIT_KW | IMPL_KW | TYPE_KW | USE_KW)
+    matches!(k, TYPE_KW | EXPORT_KW)
 }
 
 fn describe(k: ShapeSyntaxKind) -> &'static str {
@@ -128,9 +130,9 @@ fn describe(k: ShapeSyntaxKind) -> &'static str {
         R_PAREN => "`)`",
         R_ANGLE => "`>`",
         COLON => "`:`",
-        SEMICOLON => "`;`",
         EQ => "`=`",
-        FOR_KW => "`for`",
+        FAT_ARROW => "`=>`",
+        TYPE_KW => "`type`",
         _ => "a token",
     }
 }
@@ -258,13 +260,10 @@ impl Parser<'_> {
     fn file(&mut self) {
         self.start(SHAPE_FILE);
         while let Some(k) = self.current() {
-            match k {
-                STRUCT_KW => self.struct_def(),
-                TRAIT_KW => self.trait_def(),
-                IMPL_KW => self.impl_def(),
-                TYPE_KW => self.type_alias(),
-                USE_KW => self.use_decl(),
-                _ => self.error_item(),
+            if is_item_start(k) {
+                self.type_def();
+            } else {
+                self.error_item();
             }
         }
         // Flush trailing trivia so the tree tiles the input to EOF.
@@ -287,254 +286,17 @@ impl Parser<'_> {
         self.error(None, "unexpected token".to_string(), start, end);
     }
 
-    fn struct_def(&mut self) {
-        self.start(STRUCT_DEF);
-        self.bump(); // `struct`
-        self.expect(IDENT);
-        if self.at(L_ANGLE) {
-            self.generic_params();
-        }
-        if self.at(L_BRACE) {
-            self.bump();
-            let mut seen_open = false;
-            loop {
-                match self.current() {
-                    None | Some(R_BRACE) => break,
-                    Some(DOT_DOT) => {
-                        if seen_open {
-                            let at = self.current_start();
-                            self.error(None, "duplicate `..` open marker".to_string(), at, at);
-                        }
-                        self.open_marker();
-                        seen_open = true;
-                    }
-                    Some(IDENT) => {
-                        if seen_open {
-                            let at = self.current_start();
-                            self.error(
-                                None,
-                                "`..` must be the last item in a struct body".to_string(),
-                                at,
-                                at,
-                            );
-                        }
-                        self.field();
-                    }
-                    Some(_) => self.error_bump_one("expected a field or `}`"),
-                }
-            }
-            self.expect(R_BRACE);
-        } else {
-            self.expect(L_BRACE);
-        }
-        self.finish();
-    }
-
-    fn open_marker(&mut self) {
-        self.start(OPEN_MARKER);
-        self.bump(); // `..`
-        self.finish();
-    }
-
-    fn field(&mut self) {
-        self.start(FIELD);
-        self.bump(); // IDENT (leading doc comments nest inside FIELD)
-        self.expect(COLON);
-        self.type_expr();
-        self.eat(COMMA); // trailing comma optional
-        self.finish();
-    }
-
-    fn trait_def(&mut self) {
-        self.start(TRAIT_DEF);
-        self.bump(); // `trait`
-        self.expect(IDENT);
-        if self.at(L_ANGLE) {
-            self.generic_params();
-        }
-        if self.at(COLON) {
-            self.supertraits();
-        }
-        if self.at(L_BRACE) {
-            self.bump();
-            loop {
-                match self.current() {
-                    None | Some(R_BRACE) => break,
-                    Some(FN_KW) => self.trait_fn(),
-                    Some(_) => self.error_bump_one("expected `fn` or `}`"),
-                }
-            }
-            self.expect(R_BRACE);
-        } else {
-            self.expect(L_BRACE);
-        }
-        self.finish();
-    }
-
-    fn supertraits(&mut self) {
-        self.start(SUPERTRAITS);
-        self.bump(); // `:`
-        self.expect(IDENT);
-        while self.eat(PLUS) {
-            self.expect(IDENT);
-        }
-        self.finish();
-    }
-
-    fn trait_fn(&mut self) {
-        self.start(TRAIT_FN);
-        self.bump(); // `fn` (leading doc comments nest inside TRAIT_FN)
-        self.expect(IDENT);
-        if self.at(L_PAREN) {
-            self.param_list();
-        } else {
-            self.expect(L_PAREN);
-        }
-        if self.at(ARROW) {
-            self.ret();
-        }
-        if self.at(L_BRACE) {
-            // A body where a `;` is expected: reject with LB2010, skip it.
-            let start = self.current_start();
-            self.skip_balanced_braces();
-            let end = self.consumed_end;
-            self.error(Some("LB2010"), LB2010_MESSAGE.to_string(), start, end);
-            self.eat(SEMICOLON); // tolerate a stray `;` after the body
-        } else {
-            self.expect(SEMICOLON);
-        }
-        self.finish();
-    }
-
-    /// Consume a balanced `{ ... }` region into an `ERROR_NODE`. Cursor must be
-    /// at the opening `{`.
-    fn skip_balanced_braces(&mut self) {
-        self.start(ERROR_NODE);
-        let mut depth = 0usize;
-        loop {
-            match self.current() {
-                None => break,
-                Some(L_BRACE) => {
-                    depth += 1;
-                    self.bump();
-                }
-                Some(R_BRACE) => {
-                    depth -= 1;
-                    self.bump();
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                Some(_) => self.bump(),
-            }
-        }
-        self.finish();
-    }
-
-    fn param_list(&mut self) {
-        self.start(PARAM_LIST);
-        self.bump(); // `(`
-        loop {
-            match self.current() {
-                None | Some(R_PAREN) => break,
-                Some(SELF_KW | IDENT) => {
-                    self.param();
-                    if !self.eat(COMMA) {
-                        break;
-                    }
-                }
-                Some(_) => self.error_bump_one("expected a parameter or `)`"),
-            }
-        }
-        self.expect(R_PAREN);
-        self.finish();
-    }
-
-    fn param(&mut self) {
-        self.start(PARAM);
-        if self.at(SELF_KW) {
-            self.bump();
-        } else {
-            self.bump(); // IDENT
-            self.expect(COLON);
-            self.type_expr();
-        }
-        self.finish();
-    }
-
-    fn ret(&mut self) {
-        self.start(RET_TYPE);
-        self.bump(); // `->`
-        self.type_expr();
-        while self.eat(COMMA) {
-            let before = self.pos;
-            self.type_expr();
-            if self.pos == before {
-                break;
-            }
-        }
-        self.finish();
-    }
-
-    fn impl_def(&mut self) {
-        self.start(IMPL_DEF);
-        self.bump(); // `impl`
-        self.expect(IDENT); // trait name
-        if self.at(L_ANGLE) {
-            self.generic_params();
-        }
-        // SHAPES.md §12.3: `impl A + B for C;` sugar is rejected (not in the
-        // grammar). Recover by consuming the extra `+ Trait` clauses.
-        if self.at(PLUS) {
-            let start = self.current_start();
-            while self.eat(PLUS) {
-                self.expect(IDENT);
-                if self.at(L_ANGLE) {
-                    self.generic_params();
-                }
-            }
-            let end = self.consumed_end;
-            self.error(
-                None,
-                "multiple traits in one `impl` are not supported; write a separate \
-                 `impl Trait for Struct;` line for each"
-                    .to_string(),
-                start,
-                end,
-            );
-        }
-        self.expect(FOR_KW);
-        self.expect(IDENT); // struct name
-        self.expect(SEMICOLON);
-        self.finish();
-    }
-
-    fn type_alias(&mut self) {
-        self.start(TYPE_ALIAS);
-        self.bump(); // `type`
+    /// `export? type Name<T, ...> = type_expr` — the only item form.
+    fn type_def(&mut self) {
+        self.start(TYPE_DEF);
+        self.eat(EXPORT_KW);
+        self.expect(TYPE_KW);
         self.expect(IDENT);
         if self.at(L_ANGLE) {
             self.generic_params();
         }
         self.expect(EQ);
         self.type_expr();
-        self.expect(SEMICOLON);
-        self.finish();
-    }
-
-    fn use_decl(&mut self) {
-        self.start(USE_DECL);
-        self.bump(); // `use`
-        if self.at(IDENT) {
-            self.bump();
-            while self.at(DOT) {
-                self.bump();
-                self.expect(IDENT);
-            }
-        } else {
-            self.expect(IDENT);
-        }
-        self.expect(SEMICOLON);
         self.finish();
     }
 
@@ -561,13 +323,7 @@ impl Parser<'_> {
 
     fn generic_param(&mut self) {
         self.start(GENERIC_PARAM);
-        self.bump(); // IDENT
-        if self.eat(COLON) {
-            self.expect(IDENT);
-            while self.eat(PLUS) {
-                self.expect(IDENT);
-            }
-        }
+        self.bump(); // IDENT (v2 generics carry no bounds)
         self.finish();
     }
 
@@ -605,14 +361,27 @@ impl Parser<'_> {
         }
     }
 
-    // --- type expressions (precedence: `?` tightest, `|` loosest) --------
+    // --- type expressions -------------------------------------------------
+    // Precedence, tightest first: `?` postfix, `&`, `|`.
 
     fn type_expr(&mut self) {
         let cp = self.checkpoint();
-        self.type_postfix();
+        self.type_intersection();
         if self.at(PIPE) {
             self.start_at(cp, UNION_TYPE);
             while self.eat(PIPE) {
+                self.type_intersection();
+            }
+            self.finish();
+        }
+    }
+
+    fn type_intersection(&mut self) {
+        let cp = self.checkpoint();
+        self.type_postfix();
+        if self.at(AMP) {
+            self.start_at(cp, INTERSECTION_TYPE);
+            while self.eat(AMP) {
                 self.type_postfix();
             }
             self.finish();
@@ -634,36 +403,178 @@ impl Parser<'_> {
             Some(IDENT) => {
                 self.start(TYPE_REF);
                 self.bump();
+                while self.at(DOT) {
+                    self.bump();
+                    self.expect(IDENT);
+                }
                 if self.at(L_ANGLE) {
                     self.generic_args();
                 }
                 self.finish();
             }
-            Some(FN_KW) => {
-                self.start(FN_TYPE);
-                self.bump(); // `fn`
-                if self.at(L_PAREN) {
-                    self.param_list();
-                } else {
-                    self.expect(L_PAREN);
-                }
-                if self.at(ARROW) {
-                    self.ret();
-                }
-                self.finish();
-            }
-            Some(L_PAREN) => {
-                self.start(PAREN_TYPE);
-                self.bump(); // `(`
-                self.type_expr();
-                self.expect(R_PAREN);
-                self.finish();
-            }
+            Some(L_BRACE) => self.object_type(),
+            Some(L_PAREN) => self.paren_or_fn_type(),
             _ => {
                 let at = self.current_start();
                 self.error(None, "expected a type".to_string(), at, at);
             }
         }
+    }
+
+    /// Disambiguate `(a: A) => R` (function type) from `(T)` / `(A, B)`
+    /// (parenthesised group / multi-return list) by looking past the `(`:
+    /// `)` or `self` or `name [?] :` means function-type parameters.
+    fn paren_or_fn_type(&mut self) {
+        let is_fn = match self.nth(1) {
+            Some(R_PAREN | SELF_KW) => true,
+            Some(IDENT) => {
+                matches!(self.nth(2), Some(COLON))
+                    || (self.nth(2) == Some(QUESTION) && self.nth(3) == Some(COLON))
+            }
+            _ => false,
+        };
+        if is_fn {
+            self.start(FN_TYPE);
+            self.param_list();
+            self.expect(FAT_ARROW);
+            self.type_expr();
+            self.finish();
+            return;
+        }
+        let cp = self.checkpoint();
+        self.start(PAREN_TYPE);
+        self.bump(); // `(`
+        self.type_list(R_PAREN);
+        self.expect(R_PAREN);
+        self.finish();
+        // `(A) => R`: function-type params must be named. Recover by wrapping
+        // the group as the FN_TYPE's parameter position and say so.
+        if self.at(FAT_ARROW) {
+            let start = self.current_start();
+            self.start_at(cp, FN_TYPE);
+            self.bump(); // `=>`
+            self.type_expr();
+            self.finish();
+            let end = self.consumed_end;
+            self.error(
+                None,
+                "function-type parameters must be named: `(x: T) => R`".to_string(),
+                start,
+                end,
+            );
+        }
+    }
+
+    // --- object types & members -------------------------------------------
+
+    fn object_type(&mut self) {
+        self.start(OBJECT_TYPE);
+        self.bump(); // `{`
+        loop {
+            match self.current() {
+                None | Some(R_BRACE) => break,
+                Some(IDENT) => self.member(),
+                Some(_) => self.error_bump_one("expected a member or `}`"),
+            }
+        }
+        self.expect(R_BRACE);
+        self.finish();
+    }
+
+    /// One object member: `name?: type` (field) or
+    /// `name(params...) (":" ret)?` (method).
+    fn member(&mut self) {
+        if self.nth(1) == Some(L_PAREN) {
+            self.method();
+        } else {
+            self.field();
+        }
+    }
+
+    fn field(&mut self) {
+        self.start(FIELD);
+        self.bump(); // IDENT (leading doc comments nest inside FIELD)
+        self.eat(QUESTION);
+        self.expect(COLON);
+        self.type_expr();
+        self.eat(COMMA); // trailing comma optional
+        self.finish();
+    }
+
+    fn method(&mut self) {
+        self.start(METHOD);
+        self.bump(); // IDENT (leading doc comments nest inside METHOD)
+        self.param_list();
+        if self.eat(COLON) {
+            self.type_expr();
+        }
+        if self.at(L_BRACE) {
+            // A body where a member separator is expected: reject with
+            // LB2010, skip it balanced.
+            let start = self.current_start();
+            self.skip_balanced_braces();
+            let end = self.consumed_end;
+            self.error(Some("LB2010"), LB2010_MESSAGE.to_string(), start, end);
+        }
+        self.eat(COMMA);
+        self.finish();
+    }
+
+    /// Consume a balanced `{ ... }` region into an `ERROR_NODE`. Cursor must be
+    /// at the opening `{`.
+    fn skip_balanced_braces(&mut self) {
+        self.start(ERROR_NODE);
+        let mut depth = 0usize;
+        loop {
+            match self.current() {
+                None => break,
+                Some(L_BRACE) => {
+                    depth += 1;
+                    self.bump();
+                }
+                Some(R_BRACE) => {
+                    depth -= 1;
+                    self.bump();
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Some(_) => self.bump(),
+            }
+        }
+        self.finish();
+    }
+
+    fn param_list(&mut self) {
+        self.start(PARAM_LIST);
+        self.expect(L_PAREN);
+        loop {
+            match self.current() {
+                None | Some(R_PAREN) => break,
+                Some(SELF_KW | IDENT) => {
+                    self.param();
+                    if !self.eat(COMMA) {
+                        break;
+                    }
+                }
+                Some(_) => self.error_bump_one("expected a parameter or `)`"),
+            }
+        }
+        self.expect(R_PAREN);
+        self.finish();
+    }
+
+    fn param(&mut self) {
+        self.start(PARAM);
+        if self.at(SELF_KW) {
+            self.bump();
+        } else {
+            self.bump(); // IDENT
+            self.eat(QUESTION);
+            self.expect(COLON);
+            self.type_expr();
+        }
+        self.finish();
     }
 }
 
@@ -692,27 +603,40 @@ mod tests {
 
     #[test]
     fn all_constructs_parse_clean() {
-        parse_ok("struct P { x: number, y: number, label: string? }");
-        parse_ok("struct Bag { n: number, .. }");
-        parse_ok("struct Empty {}");
-        parse_ok("struct Pair<T> { first: T, second: T }");
-        parse_ok("struct Kv<K: Hash + Eq, V> { m: HashMap<K, V> }");
-        parse_ok("trait Shape { fn area(self) -> number; }");
-        parse_ok("trait Drawable: Shape + Sized { fn draw(self, s: Surface); }");
-        parse_ok("trait Multi { fn split(self) -> A, B; }");
-        parse_ok("impl Shape for Circle;");
-        parse_ok("type Points = Vec<Point>;");
-        parse_ok("type Handler = fn(a: A, b: B) -> R;");
-        parse_ok("type MaybeNum = number?;");
-        parse_ok("type Either = A | B | C;");
-        parse_ok("type Nested = Vec<HashMap<string, Point?>>;");
-        parse_ok("use geometry;");
-        parse_ok("use pkg.geometry.core;");
+        parse_ok("type P = { x: number, y: number, label?: string }");
+        parse_ok("type Empty = {}");
+        parse_ok("type Pair<T> = { first: T, second: T }");
+        parse_ok("type Kv<K, V> = { m: Map<K, V> }");
+        parse_ok("export type Shape = { area(self): number }");
+        parse_ok("type D = Shape & { draw(self, s: Surface) }");
+        parse_ok("type Multi = { split(self): (A, B) }");
+        parse_ok("type Alias = geometry.Point");
+        parse_ok("export type Canvas = love.graphics.Canvas");
+        parse_ok("type Handler = (a: A, b: B) => R");
+        parse_ok("type Thunk = () => number");
+        parse_ok("type MaybeNum = number?");
+        parse_ok("type Either = A | B | C");
+        parse_ok("type Both = A & B & C");
+        parse_ok("type Mixed = A & B | C?");
+        parse_ok("type Nested = Vec<Map<string, Point?>>");
+        parse_ok("type Opt = { f(x?: number): string }");
+    }
+
+    #[test]
+    fn items_are_self_delimiting() {
+        let src = "type A = number\ntype B = { x: A }\nexport type C = A | B";
+        let p = parse_ok(src);
+        let file = crate::shape::ast::ShapeFile::cast(p.syntax()).unwrap();
+        let items: Vec<_> = file.items().collect();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].name().as_deref(), Some("A"));
+        assert!(!items[0].is_export());
+        assert!(items[2].is_export());
     }
 
     #[test]
     fn lb2010_body_rejected_with_recovery() {
-        let src = "trait T { fn a(self) { return 1; } fn b(self) -> number; }";
+        let src = "type T = { a(self) { return 1 }, b(self): number }";
         let p = parse(src);
         assert_eq!(p.syntax().to_string(), src);
         let lb = p
@@ -721,21 +645,25 @@ mod tests {
             .find(|e| e.code == Some("LB2010"))
             .expect("LB2010 expected");
         assert_eq!(lb.message, LB2010_MESSAGE);
-        // Recovery: `fn b` after the body still parses; the only error is LB2010.
+        // Recovery: member `b` after the body still parses; the only error
+        // is LB2010.
         assert_eq!(p.errors().len(), 1, "errors: {:?}", p.errors());
         let root = crate::shape::ast::ShapeFile::cast(p.syntax()).unwrap();
         let t = root.items().next().unwrap();
-        let crate::shape::ast::Item::Trait(t) = t else {
-            panic!("expected trait")
+        let Some(crate::shape::ast::TypeRef::Object(obj)) = t.ty() else {
+            panic!("expected object type")
         };
-        let fns: Vec<_> = t.fns().collect();
-        assert_eq!(fns.len(), 2);
-        assert_eq!(fns[1].name().as_deref(), Some("b"));
+        let members: Vec<_> = obj.members().collect();
+        assert_eq!(members.len(), 2);
+        let crate::shape::ast::Member::Method(b) = &members[1] else {
+            panic!("expected method")
+        };
+        assert_eq!(b.name().as_deref(), Some("b"));
     }
 
     #[test]
     fn nested_body_braces_are_balanced() {
-        let src = "trait T { fn a(self) { if x { y } else { z } } fn b(self); }";
+        let src = "type T = { a(self) { if x { y } else { z } }, b(self): number }";
         let p = parse(src);
         assert_eq!(p.syntax().to_string(), src);
         assert_eq!(
@@ -749,43 +677,39 @@ mod tests {
 
     #[test]
     fn garbage_between_items_recovers() {
-        let src = "struct A { x: number } @@@ !! 42 struct B { y: number }";
+        let src = "type A = { x: number } @@@ !! 42 type B = { y: number }";
         let p = parse(src);
         assert_eq!(p.syntax().to_string(), src);
         assert!(!p.errors().is_empty());
         let root = crate::shape::ast::ShapeFile::cast(p.syntax()).unwrap();
-        let names: Vec<_> = root
-            .items()
-            .filter_map(|i| match i {
-                crate::shape::ast::Item::Struct(s) => s.name(),
-                _ => None,
-            })
-            .collect();
+        let names: Vec<_> = root.items().filter_map(|i| i.name()).collect();
         assert_eq!(names, vec!["A".to_string(), "B".to_string()]);
     }
 
     #[test]
-    fn impl_multi_trait_sugar_rejected() {
-        let src = "impl Shape + Drawable for Circle;";
+    fn unnamed_fn_params_recover_with_hint() {
+        let src = "type F = (A) => B";
         let p = parse(src);
         assert_eq!(p.syntax().to_string(), src);
         let e = &p.errors()[0];
-        assert!(e.code.is_none());
-        assert!(e.message.contains("separate"), "message: {}", e.message);
+        assert!(e.message.contains("named"), "message: {}", e.message);
     }
 
     #[test]
     fn never_panics_on_truncated_input() {
         for src in [
-            "struct",
-            "struct A {",
-            "trait T { fn",
-            "type X =",
-            "use",
-            "impl A for",
-            "struct A { x: }",
-            "< > | ? -> ,",
-            "fn(",
+            "type",
+            "export",
+            "export type",
+            "type A =",
+            "type A = {",
+            "type A = { x:",
+            "type A = { f(",
+            "type A = ( ",
+            "type A = B &",
+            "type A = B |",
+            "< > | ? & => ,",
+            "( ) =>",
         ] {
             let p = parse(src);
             assert_eq!(p.syntax().to_string(), src, "lossless for {src:?}");
@@ -794,69 +718,85 @@ mod tests {
 
     #[test]
     fn spec_example_ast_assertions() {
-        use crate::shape::ast::{Item, TypeRef};
+        use crate::shape::ast::{Member, TypeRef};
         let src = include_str!("test_data/spec_example.luab");
         let p = parse(src);
         assert!(p.errors().is_empty(), "{:?}", p.errors());
         let file = crate::shape::ast::ShapeFile::cast(p.syntax()).unwrap();
-        let items: Vec<Item> = file.items().collect();
+        let items: Vec<_> = file.items().collect();
         assert_eq!(items.len(), 6);
 
-        // struct Point { x, y, label: string? }
-        let Item::Struct(point) = &items[0] else {
-            panic!()
-        };
+        // type Point = { x, y, label?: string }
+        let point = &items[0];
         assert_eq!(point.name().as_deref(), Some("Point"));
-        let fields: Vec<_> = point.fields().collect();
-        assert_eq!(fields.len(), 3);
-        assert_eq!(fields[2].name().as_deref(), Some("label"));
-        assert!(fields[2].optional(), "label is string?");
-        assert!(!fields[0].optional());
-        assert!(!point.is_open());
-
-        // trait Shape { fn area(self) -> number; fn perimeter(self) -> number; }
-        let Item::Trait(shape) = &items[1] else {
+        assert!(!point.is_export());
+        let Some(TypeRef::Object(obj)) = point.ty() else {
+            panic!("Point is an object type")
+        };
+        let members: Vec<_> = obj.members().collect();
+        assert_eq!(members.len(), 3);
+        let Member::Field(label) = &members[2] else {
             panic!()
         };
-        assert_eq!(shape.name().as_deref(), Some("Shape"));
-        assert!(shape.supertraits().is_empty());
-        let sfns: Vec<_> = shape.fns().collect();
-        assert_eq!(sfns.len(), 2);
-        assert_eq!(sfns[0].name().as_deref(), Some("area"));
-        assert!(sfns[0].has_self());
-        assert_eq!(sfns[0].returns().len(), 1);
-
-        // trait Drawable: Shape { fn draw(self, surface: Surface); }
-        let Item::Trait(drawable) = &items[2] else {
+        assert_eq!(label.name().as_deref(), Some("label"));
+        assert!(label.optional());
+        let Member::Field(x) = &members[0] else {
             panic!()
         };
-        assert_eq!(drawable.supertraits(), vec!["Shape".to_string()]);
-        let dfn = drawable.fns().next().unwrap();
-        assert_eq!(dfn.name().as_deref(), Some("draw"));
-        let params: Vec<_> = dfn.params().unwrap().params().collect();
-        assert_eq!(params.len(), 2);
-        assert!(params[0].is_self());
-        assert_eq!(params[1].name().as_deref(), Some("surface"));
-        assert!(dfn.returns().is_empty());
+        assert!(!x.optional());
 
-        // struct Circle; impl Shape for Circle;
-        let Item::Struct(circle) = &items[3] else {
-            panic!()
-        };
-        assert_eq!(circle.name().as_deref(), Some("Circle"));
-        let Item::Impl(imp) = &items[4] else { panic!() };
-        assert_eq!(imp.trait_name().as_deref(), Some("Shape"));
-        assert_eq!(imp.struct_name().as_deref(), Some("Circle"));
-
-        // struct Pair<T> { first: T, second: T }
-        let Item::Struct(pair) = &items[5] else {
-            panic!()
-        };
+        // type Pair<T> = { first: T, second: T }
+        let pair = &items[2];
         let gp: Vec<_> = pair.generic_params().unwrap().params().collect();
         assert_eq!(gp.len(), 1);
         assert_eq!(gp[0].name().as_deref(), Some("T"));
-        let f0 = pair.fields().next().unwrap();
-        assert!(matches!(f0.ty(), Some(TypeRef::Named(_))));
+
+        // export type Shape = { area(self): number, perimeter(self): number }
+        let shape = &items[3];
+        assert!(shape.is_export());
+        let Some(TypeRef::Object(shape_obj)) = shape.ty() else {
+            panic!()
+        };
+        let smembers: Vec<_> = shape_obj.members().collect();
+        assert_eq!(smembers.len(), 2);
+        let Member::Method(area) = &smembers[0] else {
+            panic!()
+        };
+        assert_eq!(area.name().as_deref(), Some("area"));
+        assert!(area.has_self());
+        assert!(area.ret().is_some());
+
+        // export type Drawable = Shape & { draw(self, surface: Surface) }
+        let drawable = &items[4];
+        let Some(TypeRef::Intersection(both)) = drawable.ty() else {
+            panic!("Drawable is an intersection")
+        };
+        let parts: Vec<_> = both.members().collect();
+        assert_eq!(parts.len(), 2);
+        let TypeRef::Named(base) = &parts[0] else {
+            panic!()
+        };
+        assert_eq!(base.path(), "Shape");
+        let TypeRef::Object(ext) = &parts[1] else {
+            panic!()
+        };
+        let Member::Method(draw) = ext.members().next().unwrap() else {
+            panic!()
+        };
+        assert_eq!(draw.name().as_deref(), Some("draw"));
+        let params: Vec<_> = draw.params().unwrap().params().collect();
+        assert_eq!(params.len(), 2);
+        assert!(params[0].is_self());
+        assert_eq!(params[1].name().as_deref(), Some("surface"));
+        assert!(draw.ret().is_none());
+
+        // export type Canvas = love.graphics.Canvas (re-export of a dep type)
+        let canvas = &items[5];
+        assert!(canvas.is_export());
+        let Some(TypeRef::Named(target)) = canvas.ty() else {
+            panic!()
+        };
+        assert_eq!(target.path(), "love.graphics.Canvas");
     }
 }
 
@@ -866,12 +806,13 @@ mod proptests {
     use proptest::prelude::*;
 
     /// Fragments drawn from the `.luab` alphabet — joining these stresses the
-    /// lexer boundaries and every parser recovery path.
+    /// lexer boundaries and every parser recovery path. Retired v1 tokens
+    /// (`->`, `..`, `struct`, …) stay in the soup as junk.
     fn shape_token_soup() -> impl Strategy<Value = String> {
         let frag = prop::sample::select(vec![
-            "struct", "trait", "impl", "for", "fn", "self", "type", "use", "Foo", "x", "number",
-            "{", "}", "(", ")", "<", ">", ":", ";", ",", "?", "|", "+", "=", "->", "..", ".", " ",
-            "\n", "// c\n", "/// d\n", "/* b */", "@", "5",
+            "type", "export", "self", "Foo", "x", "number", "{", "}", "(", ")", "<", ">", ":", ",",
+            "?", "|", "&", "=", "=>", ".", " ", "\n", "// c\n", "/// d\n", "/* b */", "struct",
+            "impl", "->", "..", ";", "@", "5",
         ]);
         prop::collection::vec(frag, 0..40).prop_map(|v| v.join(""))
     }

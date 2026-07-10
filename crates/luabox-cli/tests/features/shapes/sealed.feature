@@ -1,27 +1,33 @@
-Feature: Sealed shape checking
-  SHAPES.md §5 — structs are sealed: missing non-optional fields and unknown
-  keys are hard errors at every strictness level; `..` opens the shape.
+Feature: Sealed object checking (positional)
+  SHAPES-V2.md — object types are sealed structural tables, and conformance
+  is positional: a table literal flowing into an annotated position
+  (`---@type` / `---@param` / `---@return`) must carry every required member
+  and no undeclared keys. There are no binding tags and no imports; types are
+  addressed by fully-qualified name.
 
   Scenario: missing field rejected
-    Given a shape module "geometry" declaring struct Point { x: number, y: number }
-    And a Lua file binding a table { x = 0 } with ---@struct Point
+    Given a shape module "geometry" declaring type Point = { x: number, y: number }
+    And a Lua file binding a table { x = 0 } with ---@type geometry.Point
     When I run "luabox check"
-    Then diagnostic LB2001 is reported naming field "y"
+    Then diagnostic LB0302 is reported naming field "y"
+    And the command fails
 
-  Scenario: unknown key on sealed shape rejected
-    Given a shape module "geometry" declaring struct Point { x: number, y: number }
-    And a Lua file binding a table { x = 0, y = 0, z = 0 } with ---@struct Point
+  Scenario: unknown key on sealed object rejected
+    Given a shape module "geometry" declaring type Point = { x: number, y: number }
+    And a Lua file binding a table { x = 0, y = 0, z = 0 } with ---@type geometry.Point
     When I run "luabox check"
-    Then diagnostic LB2002 is reported naming key "z"
-
-  Scenario: open shape accepts extra keys
-    Given a shape module "geometry" declaring struct Bag { n: number, .. }
-    And a Lua file binding a table { n = 1, extra = true } with ---@struct Bag
-    When I run "luabox check"
-    Then zero shape diagnostics are reported
+    Then diagnostic LB0303 is reported naming key "z"
+    And the command fails
 
   Scenario: optional field may be omitted
-    Given a shape module "geometry" declaring struct Point { x: number, label: string? }
-    And a Lua file binding a table { x = 0 } with ---@struct Point
+    Given a shape module "geometry" declaring type Point = { x: number, label?: string }
+    And a Lua file binding a table { x = 0 } with ---@type geometry.Point
     When I run "luabox check"
-    Then zero shape diagnostics are reported
+    Then zero diagnostics are reported
+
+  Scenario: short names do not resolve — references are fully qualified
+    Given a shape module "geometry" declaring type Point = { x: number }
+    And a Lua file binding a table { x = 0 } with ---@type Point
+    When I run "luabox check"
+    Then diagnostic LB0305 is reported
+    And the command fails

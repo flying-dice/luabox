@@ -128,7 +128,6 @@ pub(crate) fn run_once(
             check_one(
                 &source,
                 &rel,
-                path,
                 &project,
                 target_dialect,
                 &store,
@@ -167,7 +166,6 @@ pub(crate) fn run_once(
 fn check_one(
     source: &str,
     rel: &str,
-    path: &Path,
     project: &Project,
     target: Option<Dialect>,
     store: &ShapeStore,
@@ -214,13 +212,11 @@ fn check_one(
         }
     }
 
-    // 3. Types + shape bindings (SHAPES.md §4–§6). Shape resolution needs
-    // the file's own directory (sibling tier) plus the manifest's
-    // `[types] shape-paths`.
-    let file_dir = path.parent().unwrap_or(&project.root);
+    // 3. Types with the ambient `.luab` package scope (SHAPES-V2.md):
+    // every module under the manifest's `[types] shape-paths` plus each
+    // dependency's exported surface, no imports.
     let opts = ShapeOptions {
         store,
-        file_dir,
         shape_paths: &project.shape_paths,
         dependencies: &project.dependencies,
     };
@@ -368,9 +364,9 @@ pub(crate) fn discover(cwd: &Path) -> anyhow::Result<Project> {
 /// and `[types] shape-paths` from its manifest. Only dependencies that
 /// actually export shape modules contribute an entry; a dependency with no
 /// manifest on disk (uninstalled, or a source kind whose root cannot be
-/// located here) or an empty `[types] shapes` simply exports nothing and is
-/// skipped. `.luab` sources are never parsed here — only the manifest is read
-/// (SHAPES.md §7: distribution ships `.luab` opaquely).
+/// located here) or no `[types] entry` simply exports nothing and is
+/// skipped. `.luab` sources are never parsed here — only the manifest is
+/// read (distribution ships `.luab` opaquely).
 fn resolve_dep_shape_exports(root: &Path, manifest: &Manifest) -> Vec<DepShapeExport> {
     let mut exports = Vec::new();
     for (name, dep) in manifest
@@ -388,19 +384,18 @@ fn resolve_dep_shape_exports(root: &Path, manifest: &Manifest) -> Vec<DepShapeEx
         let Ok(dep_manifest) = Manifest::parse(&text) else {
             continue;
         };
-        if dep_manifest.types.shapes.is_empty() {
+        let Some(entry) = &dep_manifest.types.entry else {
             continue;
-        }
+        };
         exports.push(DepShapeExport {
             name: name.clone(),
+            entry: Some(dep_root.join(entry.replace('\\', "/"))),
             shape_paths: dep_manifest
                 .types
                 .shape_paths
                 .iter()
                 .map(|p| dep_root.join(p))
                 .collect(),
-            exported: dep_manifest.types.shapes.clone(),
-            root: dep_root,
         });
     }
     exports

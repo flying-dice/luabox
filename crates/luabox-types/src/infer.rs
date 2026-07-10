@@ -711,7 +711,7 @@ impl Infer<'_> {
                 // inferred constructor value never shadows the declaration
                 // — `self.side` is `integer` when the struct says so, #73),
                 // inferred extensions fill in the rest, and absences defer
-                // to the declaration's own diagnostics (LB0303 / LB2002).
+                // to the declaration's own diagnostics (LB0302 / LB0303).
                 provable = false;
                 if let Some(shape) = self.env.class_shape(&class)
                     && let Some(field) = shape.fields.get(name)
@@ -1155,8 +1155,7 @@ impl Infer<'_> {
                     Target::Field { name, .. } | Target::Global(name) => Some(name.as_str()),
                     _ => None,
                 };
-                if let Some(seeds) = exported_name.and_then(|n| externals.fn_param_seeds.get(n))
-                {
+                if let Some(seeds) = exported_name.and_then(|n| externals.fn_param_seeds.get(n)) {
                     let itys: Vec<ITy> = seeds.iter().cloned().map(ITy::Ty).collect();
                     self.record_arg_seeds(fn_body, &itys, takes_self);
                 }
@@ -1946,8 +1945,10 @@ impl Infer<'_> {
                     if let (Some(externals), Some(key)) =
                         (self.externals, self.expr_range(body, expr))
                         && let Some(edge) = self.hir.requires().iter().find(|edge| {
-                            (usize::from(edge.range.start()), usize::from(edge.range.end()))
-                                == key
+                            (
+                                usize::from(edge.range.start()),
+                                usize::from(edge.range.end()),
+                            ) == key
                         })
                         && let Some(ty) = externals.requires.get(&edge.module)
                     {
@@ -2091,8 +2092,7 @@ impl Infer<'_> {
                 let Expr::Function(fn_body) = expr else {
                     continue;
                 };
-                let Some(range) = self.hir.source_map().range(HirId::expr(body_id, expr_id))
-                else {
+                let Some(range) = self.hir.source_map().range(HirId::expr(body_id, expr_id)) else {
                     continue;
                 };
                 let Some(data) = self.funcs.get(fn_body) else {
@@ -3193,7 +3193,12 @@ end
         }
         // And no binding of any kind reifies to the opaque catch-all.
         for b in &out.binding_types {
-            assert_ne!(b.ty.to_string(), "table", "binding `{}` is bare table", b.name);
+            assert_ne!(
+                b.ty.to_string(),
+                "table",
+                "binding `{}` is bare table",
+                b.name
+            );
         }
     }
 

@@ -16,24 +16,24 @@ use luabox_syntax::luacats::{
 use crate::ty::{FieldTy, FunctionTy, ParamTy, TableTy, Ty};
 
 /// The type names a file declares, collected before lowering so forward
-/// references resolve. Shape names imported via `---@use` participate so
-/// LuaCATS annotations can reference `.luab` structs/traits (interop,
-/// SHAPES.md §3) without tripping LB0305.
+/// references resolve.
 #[derive(Debug, Default)]
 pub(crate) struct Declared {
     pub classes: BTreeSet<String>,
     pub enums: BTreeSet<String>,
     pub aliases: BTreeMap<String, AliasTag>,
-    /// `.luab` struct/trait names in scope — lower to [`Ty::Named`].
-    pub shape_names: BTreeSet<String>,
-    /// Concrete `.luab` aliases in scope — pre-lowered, substituted inline.
-    pub shape_aliases: BTreeMap<String, Ty>,
 }
 
 /// Lowers [`TypeExpr`]s against a set of declared names, recording every
 /// reference to an undeclared type (surfaced as LB0305).
+///
+/// `.luab` types resolve through the ambient package scope (SHAPES-V2.md):
+/// any standard annotation position may name any fully-qualified shape type
+/// — there are no imports and no shape-specific tags.
 pub(crate) struct Lowerer<'a> {
     decl: &'a Declared,
+    /// The ambient `.luab` package scope, when the project has one.
+    pub shape_scope: Option<&'a crate::shape::ShapeScope>,
     /// Generic parameter names currently in scope (lower to `unknown`).
     pub generics: HashSet<String>,
     /// Alias-expansion stack (cycle guard).
@@ -46,6 +46,7 @@ impl<'a> Lowerer<'a> {
     pub fn new(decl: &'a Declared) -> Self {
         Lowerer {
             decl,
+            shape_scope: None,
             generics: HashSet::new(),
             stack: Vec::new(),
             unknown_names: Vec::new(),
@@ -96,11 +97,25 @@ impl<'a> Lowerer<'a> {
             // TODO(P1): generic classes — `args` are ignored for now.
             return Ty::Named(name.to_string());
         }
-        if let Some(ty) = self.decl.shape_aliases.get(name) {
-            return ty.clone();
-        }
-        if self.decl.shape_names.contains(name) {
-            return Ty::Named(name.to_string());
+        if let Some(scope) = self.shape_scope
+            && let Some(shape) = scope.get(name)
+        {
+            if shape.params.is_empty() {
+                return match &shape.ty {
+                    // Concrete object types stay nominal (resolved
+                    // structurally via the environment); alias-like RHS
+                    // expands inline.
+                    Ty::Table(_) => Ty::Named(name.to_string()),
+                    other => other.clone(),
+                };
+            }
+            // Monomorphise a template use site. Lenient on arity —
+            // TODO(P1): surface arity errors at the annotation site.
+            let args: Vec<Ty> = args.iter().map(|a| self.lower(a)).collect();
+            let mut scratch = Vec::new();
+            return scope
+                .instantiate(name, &args, "", 0..0, &mut scratch)
+                .unwrap_or(Ty::Unknown);
         }
         self.unknown_names.push((name.to_string(), span));
         Ty::Unknown

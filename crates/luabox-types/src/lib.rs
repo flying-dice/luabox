@@ -136,14 +136,15 @@ pub fn check_file(parse: &lua::Parse, file: &str, strictness: Strictness) -> Vec
     check_file_shaped(parse, file, strictness, None, None)
 }
 
-/// Typecheck one parsed file, resolving `---@use`/`---@struct`/`---@impl`
-/// shape bindings when `shapes` is provided (SHAPES.md §4–§6).
+/// Typecheck one parsed file with the ambient `.luab` package scope in
+/// reach when `shapes` is provided (SHAPES-V2.md).
 ///
-/// Shape rules (`LB2xxx`) are **hard errors at every strictness level**,
-/// including `none` — the binding tags are themselves the opt-in, so the
-/// strictness ladder only governs the ordinary `LB03xx` diagnostics.
-/// Files that use no shape tags never touch the shape machinery
-/// (zero-cost, SHAPES.md invariant 4).
+/// There are no shape tags and no imports: `.luab` types resolve in the
+/// standard annotation positions by fully-qualified name, and conformance
+/// is positional — a value is checked against a shape type exactly where
+/// one is demanded. The scope is built once per store and shared, so a
+/// file that never names a shape type pays a lookup miss, not scope
+/// construction (the v2 zero-cost invariant).
 ///
 /// `ambient` is the definition-package layer selected by the project
 /// `edition` ([`stdlib_defs`] / [`combined_defs`]): its stdlib globals and
@@ -160,16 +161,9 @@ pub fn check_file_shaped(
     let items = luacats::harvest(parse);
 
     let mut diags: Vec<Diagnostic> = Vec::new();
-    let scope = match shapes {
-        Some(opts) if shape::uses_shapes(&items) => {
-            let (scope, use_diags) = shape::resolve_uses(&items, opts, file);
-            diags.extend(use_diags);
-            Some(scope)
-        }
-        _ => None,
-    };
+    let scope = shapes.map(ShapeOptions::scope);
 
-    let env = TypeEnv::build_from_items(parse, &items, scope.as_ref(), ambient);
+    let env = TypeEnv::build_from_items(parse, &items, scope.as_deref(), ambient);
     let mut inferred_types = std::collections::HashMap::new();
     if strictness != Strictness::None {
         // Rich table inference (SPEC.md §3) runs first: the checker uses
@@ -195,17 +189,7 @@ pub fn check_file_shaped(
         diags.extend(inference.diags);
         inferred_types = inference.expr_types;
     }
-    if let Some(scope) = &scope {
-        diags.extend(shape::check_bindings(
-            parse,
-            &items,
-            scope,
-            &env,
-            file,
-            strictness,
-            &inferred_types,
-        ));
-    }
+    let _ = inferred_types;
     diags.sort_by_key(|d| d.primary_label().map_or(0, |l| l.span.range.start));
     diags
 }

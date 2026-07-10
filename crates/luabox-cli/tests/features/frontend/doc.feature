@@ -45,35 +45,32 @@ Feature: luabox doc — static documentation site
     And "doc/class.Circle.html" contains "Fields inherited from"
     And "doc/class.Circle.html" contains "id"
 
-  Scenario: .luab struct page renders with a sealed marker
+  Scenario: .luab type page renders fields and docs
     Given a project with edition "5.4"
     And a file "src/geometry.luab" containing:
       """
       /// A 2D point.
-      struct Point {
+      type Point = {
           x: number,
           y: number,
       }
       """
     When I run "luabox doc"
     Then the command succeeds
-    And the file "doc/struct.Point.html" exists
-    And "doc/struct.Point.html" contains "sealed"
-    And "doc/struct.Point.html" contains "A 2D point."
-    And "doc/struct.Point.html" contains "number"
+    And the file "doc/type.geometry.Point.html" exists
+    And "doc/type.geometry.Point.html" contains "A 2D point."
+    And "doc/type.geometry.Point.html" contains "number"
 
   Scenario: type names cross-link to their documented pages
     Given a project with edition "5.4"
     And a file "src/geometry.luab" containing:
       """
-      struct Point { x: number, y: number }
+      type Point = { x: number, y: number }
       """
     And a file "src/main.lua" containing:
       """
-      ---@use geometry
-
       --- Distance from the origin.
-      ---@param p Point the point
+      ---@param p geometry.Point the point
       ---@return number
       local function dist(p)
         return (p.x ^ 2 + p.y ^ 2) ^ 0.5
@@ -81,25 +78,20 @@ Feature: luabox doc — static documentation site
       """
     When I run "luabox doc"
     Then the command succeeds
-    And "doc/module.main.html" contains 'href="struct.Point.html"'
+    And "doc/module.main.html" contains 'href="type.geometry.Point.html"'
 
-  Scenario: trait page lists required functions and implementors
+  Scenario: type page lists methods and the export badge
     Given a project with edition "5.4"
     And a file "src/geometry.luab" containing:
       """
-      struct Circle { radius: number }
-
       /// Things with an area.
-      trait Shape {
+      export type Shape = {
           /// The enclosed area.
-          fn area(self) -> number;
+          area(self): number,
       }
-
-      impl Shape for Circle;
       """
     When I run "luabox doc"
     Then the command succeeds
-    And the file "doc/trait.Shape.html" exists
-    And "doc/trait.Shape.html" contains "fn area(self)"
-    And "doc/trait.Shape.html" contains 'href="struct.Circle.html"'
-    And "doc/struct.Circle.html" contains 'href="trait.Shape.html"'
+    And the file "doc/type.geometry.Shape.html" exists
+    And "doc/type.geometry.Shape.html" contains "area(self)"
+    And "doc/type.geometry.Shape.html" contains "export"

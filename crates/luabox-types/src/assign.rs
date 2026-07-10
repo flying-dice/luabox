@@ -141,6 +141,76 @@ impl Ctx<'_> {
     }
 }
 
+/// A short human explanation of why `value` does not fit `target`, when
+/// both resolve to table shapes: the missing required members, then the
+/// members whose types mismatch (SHAPES-V2.md: assignability errors must
+/// name the members, not just the types). `None` when there is no
+/// table-level story to tell.
+pub(crate) fn explain_mismatch(
+    env: &TypeEnv,
+    strict: bool,
+    value: &Ty,
+    target: &Ty,
+) -> Option<String> {
+    let value_table = resolve_table(env, value)?;
+    let target_table = resolve_table(env, target)?;
+    let mut missing: Vec<String> = Vec::new();
+    let mut wrong: Vec<String> = Vec::new();
+    for (name, field) in &target_table.fields {
+        match value_table.fields.get(name) {
+            None => {
+                if !field.optional && !field.ty.admits_nil() {
+                    missing.push(format!("`{name}`"));
+                }
+            }
+            Some(actual) => {
+                let mut expected = field.ty.clone();
+                if field.optional {
+                    expected = expected.optional();
+                }
+                if !assignable(env, strict, &actual.ty, &expected) {
+                    wrong.push(format!(
+                        "`{name}` (expected `{expected}`, found `{}`)",
+                        actual.ty
+                    ));
+                }
+            }
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !missing.is_empty() {
+        parts.push(format!("missing {}", missing.join(", ")));
+    }
+    if !wrong.is_empty() {
+        parts.push(format!("mismatched {}", wrong.join(", ")));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
+    }
+}
+
+/// Resolve a type to its structural table shape, unwrapping `T?` optionals
+/// and following `Ty::Named` through the environment.
+fn resolve_table(env: &TypeEnv, ty: &Ty) -> Option<TableTy> {
+    match ty {
+        Ty::Table(table) => Some((**table).clone()),
+        Ty::Named(name) => match env.resolve_named(name)? {
+            Ty::Table(table) => Some(*table),
+            _ => None,
+        },
+        Ty::Union(members) => {
+            let non_nil: Vec<&Ty> = members.iter().filter(|m| **m != Ty::Nil).collect();
+            match non_nil[..] {
+                [single] => resolve_table(env, single),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Whether a number-literal's text denotes an integer value.
 pub(crate) fn is_integral_literal(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();

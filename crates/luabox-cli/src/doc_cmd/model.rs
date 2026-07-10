@@ -16,9 +16,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use luabox_syntax::lua::ast::{self, AstNode};
 use luabox_syntax::lua::{self, SyntaxKind, SyntaxNode};
-use luabox_syntax::shape::ast::{
-    AstNode as ShapeAstNode, Item, ShapeFile, TraitFn, TypeRef as ShapeTypeRef,
-};
+use luabox_syntax::shape::ast::{AstNode as ShapeAstNode, ShapeFile, TypeRef as ShapeTypeRef};
 use luabox_syntax::shape::{self, ShapeSyntaxKind};
 use luabox_syntax::{Dialect, luacats};
 
@@ -31,9 +29,6 @@ pub struct DocModel {
     pub modules: Vec<Module>,
     /// One entry per `.luab` shape module, in walk order.
     pub shape_modules: Vec<ShapeModule>,
-    /// Every trait-conformance assertion (`.luab` `impl` items plus Lua
-    /// `---@impl` tags), project-wide.
-    pub impls: Vec<ImplDoc>,
 }
 
 /// One documented `.lua` file.
@@ -151,40 +146,37 @@ pub struct EnumDoc {
     pub docs: String,
 }
 
-/// One trait-conformance assertion: `impl Trait for Struct;` or
-/// `---@impl Trait for Struct`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImplDoc {
-    pub trait_name: String,
-    pub struct_name: String,
-}
-
-/// One documented `.luab` shape module.
+/// One documented `.luab` shape module (SHAPES-V2.md).
 #[derive(Debug)]
 pub struct ShapeModule {
-    /// The module name (file stem — SHAPES.md §6 resolution key).
+    /// The module's dotted namespace, derived from its path under
+    /// `[types] shape-paths`.
     pub name: String,
-    pub structs: Vec<StructDoc>,
-    pub traits: Vec<TraitDoc>,
-    pub aliases: Vec<ShapeAliasDoc>,
-    /// `impl` items declared in this module.
-    pub impls: Vec<ImplDoc>,
+    pub types: Vec<TypeDoc>,
 }
 
-/// A `.luab` `struct` declaration.
+/// A `.luab` `type` declaration — the only item form in v2.
 #[derive(Debug)]
-pub struct StructDoc {
+pub struct TypeDoc {
     pub name: String,
-    /// Generic parameters as display strings (`T`, `T: Bound + Other`).
+    /// Whether the declaration carries `export`.
+    pub export: bool,
+    /// Generic parameter names (v2 generics carry no bounds).
     pub generics: Vec<String>,
+    /// Rendered right-hand side for alias-like declarations
+    /// (`geometry.Point`, `number?`, `(a: A) => R`); empty when the
+    /// members lists carry an object body.
+    pub rhs: String,
+    /// The named base types of an intersection (`Shape` in
+    /// `Shape & { ... }`).
+    pub bases: Vec<String>,
     pub fields: Vec<ShapeFieldDoc>,
-    /// `true` unless the struct carries the `..` open marker (SHAPES.md §3).
-    pub sealed: bool,
+    pub methods: Vec<ShapeMethodDoc>,
     pub docs: String,
 }
 
-/// One field of a `.luab` struct. Nil-optionality is part of the rendered
-/// type (`number?`), not a separate flag.
+/// One field of a `.luab` object type. Nil-optionality is part of the
+/// rendered type (`number?`), not a separate flag.
 #[derive(Debug)]
 pub struct ShapeFieldDoc {
     pub name: String,
@@ -192,31 +184,12 @@ pub struct ShapeFieldDoc {
     pub docs: String,
 }
 
-/// A `.luab` `trait` declaration.
+/// One method member of a `.luab` object type.
 #[derive(Debug)]
-pub struct TraitDoc {
+pub struct ShapeMethodDoc {
     pub name: String,
-    pub generics: Vec<String>,
-    pub supertraits: Vec<String>,
-    pub fns: Vec<TraitFnDoc>,
-    pub docs: String,
-}
-
-/// One required function of a `.luab` trait.
-#[derive(Debug)]
-pub struct TraitFnDoc {
-    pub name: String,
-    /// Rendered signature: `fn area(self) -> number`.
+    /// Rendered signature: `area(self): number`.
     pub sig: String,
-    pub docs: String,
-}
-
-/// A `.luab` `type` alias.
-#[derive(Debug)]
-pub struct ShapeAliasDoc {
-    pub name: String,
-    pub generics: Vec<String>,
-    pub ty: String,
     pub docs: String,
 }
 
@@ -241,7 +214,7 @@ pub fn module_name(rel: &str) -> String {
 // === Lua extraction =======================================================
 
 /// Extract the documentation model of one `.lua` file.
-pub fn lua_module(name: &str, source: &str, dialect: Dialect) -> (Module, Vec<ImplDoc>) {
+pub fn lua_module(name: &str, source: &str, dialect: Dialect) -> Module {
     let parse = lua::parse(source, dialect);
     let root = parse.syntax();
     let items = luacats::harvest(&parse);
@@ -249,7 +222,6 @@ pub fn lua_module(name: &str, source: &str, dialect: Dialect) -> (Module, Vec<Im
     let mut classes: Vec<ClassDoc> = Vec::new();
     let mut aliases: Vec<AliasDoc> = Vec::new();
     let mut enums: Vec<EnumDoc> = Vec::new();
-    let mut impls: Vec<ImplDoc> = Vec::new();
     // Local binding name → class name (`---@class geometry.Circle` bound to
     // `local Circle = {}` makes `Circle:m` a method of `geometry.Circle`).
     let mut bindings: HashMap<String, String> = HashMap::new();
@@ -281,10 +253,6 @@ pub fn lua_module(name: &str, source: &str, dialect: Dialect) -> (Module, Vec<Im
                     key: en.key,
                     docs: docs.clone(),
                 }),
-                luacats::Tag::Impl(imp) => impls.push(ImplDoc {
-                    trait_name: imp.trait_name.clone(),
-                    struct_name: imp.struct_name.clone(),
-                }),
                 _ => {}
             }
         }
@@ -299,15 +267,14 @@ pub fn lua_module(name: &str, source: &str, dialect: Dialect) -> (Module, Vec<Im
         }
     }
 
-    let module = Module {
+    Module {
         name: name.to_string(),
         docs: module_docs(&items, &root, source),
         functions,
         classes,
         aliases,
         enums,
-    };
-    (module, impls)
+    }
 }
 
 fn class_doc(tag: &luacats::ClassTag, block: &luacats::AnnotationBlock, docs: String) -> ClassDoc {
@@ -669,69 +636,77 @@ pub fn shape_module(name: &str, source: &str) -> ShapeModule {
 
     let mut module = ShapeModule {
         name: name.to_string(),
-        structs: Vec::new(),
-        traits: Vec::new(),
-        aliases: Vec::new(),
-        impls: Vec::new(),
+        types: Vec::new(),
     };
     let Some(file) = ShapeFile::cast(root) else {
         return module;
     };
     for item in file.items() {
-        match item {
-            Item::Struct(st) => {
-                let Some(name) = st.name() else { continue };
-                module.structs.push(StructDoc {
-                    docs: docs.before(st.syntax()),
-                    generics: generic_display(st.generic_params()),
-                    fields: st
-                        .fields()
-                        .map(|f| ShapeFieldDoc {
-                            docs: docs.before(f.syntax()),
-                            name: f.name().unwrap_or_default(),
-                            ty: f.ty().as_ref().map(render_shape_type).unwrap_or_default(),
-                        })
-                        .collect(),
-                    sealed: !st.is_open(),
-                    name,
-                });
-            }
-            Item::Trait(tr) => {
-                let Some(name) = tr.name() else { continue };
-                module.traits.push(TraitDoc {
-                    docs: docs.before(tr.syntax()),
-                    generics: generic_display(tr.generic_params()),
-                    supertraits: tr.supertraits(),
-                    fns: tr.fns().filter_map(|f| trait_fn_doc(&f, &docs)).collect(),
-                    name,
-                });
-            }
-            Item::Impl(imp) => {
-                if let (Some(trait_name), Some(struct_name)) = (imp.trait_name(), imp.struct_name())
-                {
-                    module.impls.push(ImplDoc {
-                        trait_name,
-                        struct_name,
-                    });
+        let Some(name) = item.name() else { continue };
+        let mut doc = TypeDoc {
+            docs: docs.before(item.syntax()),
+            export: item.is_export(),
+            generics: generic_display(item.generic_params()),
+            rhs: String::new(),
+            bases: Vec::new(),
+            fields: Vec::new(),
+            methods: Vec::new(),
+            name,
+        };
+        match item.ty() {
+            Some(ShapeTypeRef::Object(obj)) => absorb_members(&mut doc, &obj, &docs),
+            Some(ShapeTypeRef::Intersection(inter)) => {
+                for member in inter.members() {
+                    match member {
+                        ShapeTypeRef::Object(obj) => absorb_members(&mut doc, &obj, &docs),
+                        other => doc.bases.push(render_shape_type(&other)),
+                    }
                 }
             }
-            Item::Alias(alias) => {
-                let Some(name) = alias.name() else { continue };
-                module.aliases.push(ShapeAliasDoc {
-                    docs: docs.before(alias.syntax()),
-                    generics: generic_display(alias.generic_params()),
-                    ty: alias
-                        .ty()
-                        .as_ref()
-                        .map(render_shape_type)
-                        .unwrap_or_default(),
-                    name,
-                });
-            }
-            Item::Use(_) => {}
+            Some(other) => doc.rhs = render_shape_type(&other),
+            None => {}
         }
+        module.types.push(doc);
     }
     module
+}
+
+/// Fold one object body's members into a [`TypeDoc`].
+fn absorb_members(
+    doc: &mut TypeDoc,
+    obj: &luabox_syntax::shape::ast::ObjectType,
+    docs: &DocComments,
+) {
+    for member in obj.members() {
+        match member {
+            luabox_syntax::shape::ast::Member::Field(f) => doc.fields.push(ShapeFieldDoc {
+                docs: docs.before(f.syntax()),
+                ty: {
+                    let base = f.ty().as_ref().map(render_shape_type).unwrap_or_default();
+                    if f.optional() && !base.ends_with('?') {
+                        format!("{base}?")
+                    } else {
+                        base
+                    }
+                },
+                name: f.name().unwrap_or_default(),
+            }),
+            luabox_syntax::shape::ast::Member::Method(m) => {
+                let Some(name) = m.name() else { continue };
+                let params = render_shape_params(m.params());
+                let mut sig = format!("{name}({})", params.join(", "));
+                if let Some(ret) = m.ret() {
+                    sig.push_str(": ");
+                    sig.push_str(&render_shape_type(&ret));
+                }
+                doc.methods.push(ShapeMethodDoc {
+                    docs: docs.before(m.syntax()),
+                    name,
+                    sig,
+                });
+            }
+        }
+    }
 }
 
 /// Render a parameter list as display strings (`self`, `a: number`).
@@ -751,46 +726,19 @@ fn render_shape_params(list: Option<luabox_syntax::shape::ast::ParamList>) -> Ve
         .collect()
 }
 
-fn trait_fn_doc(func: &TraitFn, docs: &DocComments) -> Option<TraitFnDoc> {
-    let name = func.name()?;
-    let params = render_shape_params(func.params());
-    let mut sig = format!("fn {name}({})", params.join(", "));
-    let returns = func.returns();
-    if !returns.is_empty() {
-        let rets: Vec<String> = returns.iter().map(render_shape_type).collect();
-        sig.push_str(" -> ");
-        sig.push_str(&rets.join(", "));
-    }
-    Some(TraitFnDoc {
-        docs: docs.before(func.syntax()),
-        name,
-        sig,
-    })
-}
-
 fn generic_display(params: Option<luabox_syntax::shape::ast::GenericParams>) -> Vec<String> {
     let Some(params) = params else {
         return Vec::new();
     };
-    params
-        .params()
-        .filter_map(|p| {
-            let name = p.name()?;
-            let bounds = p.bounds();
-            if bounds.is_empty() {
-                Some(name)
-            } else {
-                Some(format!("{name}: {}", bounds.join(" + ")))
-            }
-        })
-        .collect()
+    params.params().filter_map(|p| p.name()).collect()
 }
 
-/// Render a `.luab` type expression back to source-ish text.
+/// Render a `.luab` type expression back to source-ish text (SHAPES-V2.md
+/// grammar).
 pub fn render_shape_type(ty: &ShapeTypeRef) -> String {
     match ty {
         ShapeTypeRef::Named(named) => {
-            let name = named.name().unwrap_or_default();
+            let name = named.path();
             match named.args() {
                 Some(args) => {
                     let args: Vec<String> = args.args().map(|a| render_shape_type(&a)).collect();
@@ -798,6 +746,31 @@ pub fn render_shape_type(ty: &ShapeTypeRef) -> String {
                 }
                 None => name,
             }
+        }
+        ShapeTypeRef::Object(obj) => {
+            let members: Vec<String> = obj
+                .members()
+                .map(|m| match m {
+                    luabox_syntax::shape::ast::Member::Field(f) => format!(
+                        "{}{}: {}",
+                        f.name().unwrap_or_default(),
+                        if f.optional() { "?" } else { "" },
+                        f.ty().as_ref().map(render_shape_type).unwrap_or_default()
+                    ),
+                    luabox_syntax::shape::ast::Member::Method(m) => {
+                        let params = render_shape_params(m.params());
+                        let ret = m
+                            .ret()
+                            .map_or_else(String::new, |r| format!(": {}", render_shape_type(&r)));
+                        format!(
+                            "{}({}){ret}",
+                            m.name().unwrap_or_default(),
+                            params.join(", ")
+                        )
+                    }
+                })
+                .collect();
+            format!("{{ {} }}", members.join(", "))
         }
         ShapeTypeRef::Optional(opt) => match opt.inner() {
             Some(inner) => format!("{}?", render_shape_type(&inner)),
@@ -808,21 +781,23 @@ pub fn render_shape_type(ty: &ShapeTypeRef) -> String {
             .map(|m| render_shape_type(&m))
             .collect::<Vec<_>>()
             .join(" | "),
+        ShapeTypeRef::Intersection(inter) => inter
+            .members()
+            .map(|m| render_shape_type(&m))
+            .collect::<Vec<_>>()
+            .join(" & "),
         ShapeTypeRef::Fn(func) => {
             let params = render_shape_params(func.params());
-            let mut out = format!("fn({})", params.join(", "));
-            let returns = func.returns();
-            if !returns.is_empty() {
-                let rets: Vec<String> = returns.iter().map(render_shape_type).collect();
-                out.push_str(" -> ");
-                out.push_str(&rets.join(", "));
-            }
-            out
+            let ret = func.ret().map_or_else(
+                || " => ()".to_string(),
+                |r| format!(" => {}", render_shape_type(&r)),
+            );
+            format!("({}){ret}", params.join(", "))
         }
-        ShapeTypeRef::Paren(paren) => match paren.inner() {
-            Some(inner) => format!("({})", render_shape_type(&inner)),
-            None => "()".to_string(),
-        },
+        ShapeTypeRef::Paren(paren) => {
+            let inners: Vec<String> = paren.inners().map(|t| render_shape_type(&t)).collect();
+            format!("({})", inners.join(", "))
+        }
     }
 }
 
@@ -932,13 +907,13 @@ pub fn inherited_fields<'a>(
 mod tests {
     use super::*;
 
-    fn module(source: &str) -> (Module, Vec<ImplDoc>) {
+    fn module(source: &str) -> Module {
         lua_module("fixture", source, Dialect::Lua54)
     }
 
     #[test]
     fn function_signature_from_param_and_return_tags() {
-        let (m, _) = module(
+        let m = module(
             "--- Adds two numbers.\n\
              ---@param a number the left addend\n\
              ---@param b number\n\
@@ -957,13 +932,13 @@ mod tests {
 
     #[test]
     fn untyped_and_vararg_params_render_plain() {
-        let (m, _) = module("local function f(x, ...)\nend\n");
+        let m = module("local function f(x, ...)\nend\n");
         assert_eq!(m.functions[0].signature(), "function f(x, ...)");
     }
 
     #[test]
     fn class_with_fields_methods_and_binding_alias() {
-        let (m, _) = module(
+        let m = module(
             "--- A circle.\n\
              ---@class geometry.Circle: geometry.Shape\n\
              ---@field radius number the radius\n\
@@ -990,7 +965,7 @@ mod tests {
 
     #[test]
     fn alias_and_enum_are_harvested() {
-        let (m, _) = module(
+        let m = module(
             "--- Directions.\n\
              ---@alias Direction\n\
              ---| \"north\" # up\n\
@@ -1011,97 +986,78 @@ mod tests {
 
     #[test]
     fn module_docs_come_from_a_leading_prose_block() {
-        let (m, _) = module("--- The geometry toolkit.\n--- With two lines.\n\nlocal x = 1\n");
+        let m = module("--- The geometry toolkit.\n--- With two lines.\n\nlocal x = 1\n");
         assert_eq!(m.docs, "The geometry toolkit.\nWith two lines.");
     }
 
     #[test]
     fn blank_doc_lines_become_paragraph_breaks() {
-        let (m, _) = module("--- First paragraph.\n---\n--- Second paragraph.\n\nlocal x = 1\n");
+        let m = module("--- First paragraph.\n---\n--- Second paragraph.\n\nlocal x = 1\n");
         assert_eq!(m.docs, "First paragraph.\n\nSecond paragraph.");
     }
 
     #[test]
     fn function_doc_block_is_not_stolen_as_module_docs() {
-        let (m, _) = module("--- Frobnicates.\nlocal function frob()\nend\n");
+        let m = module("--- Frobnicates.\nlocal function frob()\nend\n");
         assert_eq!(m.docs, "");
         assert_eq!(m.functions[0].docs, "Frobnicates.");
     }
 
     #[test]
-    fn lua_impl_tags_are_collected() {
-        let (_, impls) = module(
-            "---@struct Circle\nlocal Circle = {}\n\
-             ---@impl Shape for Circle\nfunction Circle.area()\n  return 1\nend\n",
-        );
-        assert_eq!(
-            impls,
-            vec![ImplDoc {
-                trait_name: "Shape".to_string(),
-                struct_name: "Circle".to_string(),
-            }]
-        );
-    }
-
-    #[test]
     fn deprecated_is_flagged() {
-        let (m, _) = module("---@deprecated use add2\nlocal function add()\nend\n");
+        let m = module("---@deprecated use add2\nlocal function add()\nend\n");
         assert!(m.functions[0].deprecated);
     }
 
     #[test]
-    fn shape_structs_traits_impls_and_docs() {
+    fn shape_types_members_and_docs() {
         let sm = shape_module(
             "geometry",
             "/// A 2D point.\n\
              /// Immutable.\n\
-             struct Point {\n    /// Horizontal.\n    x: number,\n    y: number?,\n}\n\
+             type Point = {\n    /// Horizontal.\n    x: number,\n    y?: number,\n}\n\
              \n\
-             struct Bag<T> { items: T, .. }\n\
+             type Bag<T> = { items: T }\n\
              \n\
              /// Things with an area.\n\
-             trait Shape: Drawable {\n    /// The enclosed area.\n    fn area(self) -> number;\n}\n\
+             export type Shape = {\n    /// The enclosed area.\n    area(self): number,\n}\n\
              \n\
-             impl Shape for Point;\n\
+             export type Drawable = Shape & { draw(self): string }\n\
              \n\
-             type Pair<T> = fn(a: T) -> T;\n",
+             type Pair<T> = (a: T) => T\n",
         );
-        assert_eq!(sm.structs.len(), 2);
-        let point = &sm.structs[0];
+        assert_eq!(sm.types.len(), 5);
+        let point = &sm.types[0];
         assert_eq!(point.name, "Point");
-        assert!(point.sealed);
+        assert!(!point.export);
         assert_eq!(point.docs, "A 2D point.\nImmutable.");
         assert_eq!(point.fields.len(), 2);
         assert_eq!(point.fields[0].name, "x");
         assert_eq!(point.fields[0].ty, "number");
         assert_eq!(point.fields[0].docs, "Horizontal.");
         assert_eq!(point.fields[1].ty, "number?");
-        let bag = &sm.structs[1];
-        assert!(!bag.sealed);
+        let bag = &sm.types[1];
         assert_eq!(bag.generics, vec!["T".to_string()]);
 
-        assert_eq!(sm.traits.len(), 1);
-        let shape = &sm.traits[0];
-        assert_eq!(shape.supertraits, vec!["Drawable".to_string()]);
-        assert_eq!(shape.fns.len(), 1);
-        assert_eq!(shape.fns[0].sig, "fn area(self) -> number");
-        assert_eq!(shape.fns[0].docs, "The enclosed area.");
+        let shape = &sm.types[2];
+        assert!(shape.export);
+        assert_eq!(shape.methods.len(), 1);
+        assert_eq!(shape.methods[0].sig, "area(self): number");
+        assert_eq!(shape.methods[0].docs, "The enclosed area.");
 
-        assert_eq!(
-            sm.impls,
-            vec![ImplDoc {
-                trait_name: "Shape".to_string(),
-                struct_name: "Point".to_string(),
-            }]
-        );
-        assert_eq!(sm.aliases.len(), 1);
-        assert_eq!(sm.aliases[0].ty, "fn(a: T) -> T");
+        let drawable = &sm.types[3];
+        assert_eq!(drawable.bases, vec!["Shape".to_string()]);
+        assert_eq!(drawable.methods.len(), 1);
+        assert_eq!(drawable.methods[0].sig, "draw(self): string");
+
+        let pair = &sm.types[4];
+        assert_eq!(pair.rhs, "(a: T) => T");
     }
 
     #[test]
     fn blank_line_detaches_shape_docs() {
-        let sm = shape_module("m", "/// Stray comment.\n\nstruct Point { x: number }\n");
-        assert_eq!(sm.structs[0].docs, "");
+        let sm = shape_module("m", "/// Stray comment.\n\ntype Point = { x: number }\n");
+        assert_eq!(sm.types[0].docs, "");
     }
 
     #[test]
@@ -1115,7 +1071,7 @@ mod tests {
 
     #[test]
     fn inherited_fields_walk_the_parent_chain() {
-        let (m, _) = module(
+        let m = module(
             "---@class Base\n---@field id integer\nlocal Base = {}\n\
              \n\
              ---@class Mid: Base\n---@field label string\nlocal Mid = {}\n\
@@ -1126,7 +1082,6 @@ mod tests {
             package: "p".to_string(),
             modules: vec![m],
             shape_modules: Vec::new(),
-            impls: Vec::new(),
         };
         let classes = classes_by_name(&model);
         let leaf = classes["Leaf"];

@@ -1,7 +1,8 @@
-//! Shape checking end-to-end (SHAPES.md §4–§6): every `LB2xxx` rule firing
-//! and not firing, resolution tiers and ambiguity, generics bounds,
-//! supertraits, LuaCATS interop, the `Result<T, E>` convention, sealed vs
-//! open (`..`), and `setmetatable` instantiation.
+//! Shape checking end-to-end (SHAPES-V2.md): ambient fully-qualified
+//! resolution in the standard annotation positions, positional structural
+//! conformance, sealed-literal freshness, generics, intersections,
+//! re-exports, dependency export surfaces, and the `.luab` file checks
+//! (LB2005 duplicates, LB2007 instantiation, LB2010 bodies).
 //!
 //! Fixtures are real temp-dir projects: `.luab` files on disk, `.lua` sources
 //! checked through the public [`luabox_types::check_file_shaped`] API.
@@ -39,16 +40,18 @@ impl Fixture {
         self.shape_paths.push(path);
     }
 
-    /// Register a dependency rooted at `root_rel` (under the fixture dir)
-    /// that exports the given shape module names from its own root.
-    fn add_dependency(&mut self, name: &str, root_rel: &str, exported: &[&str]) {
-        let root = self.dir.path().join(root_rel);
-        std::fs::create_dir_all(&root).expect("mkdir");
+    /// Register a dependency whose types load from `shape_paths_rel` and
+    /// export through the entrypoint at `entry_rel` (both under the fixture
+    /// dir).
+    fn add_dependency(&mut self, name: &str, entry_rel: &str, shape_paths_rel: &[&str]) {
+        let entry = self.dir.path().join(entry_rel);
         self.dependencies.push(DepShapeExport {
             name: name.to_owned(),
-            root,
-            exported: exported.iter().map(|s| (*s).to_owned()).collect(),
-            shape_paths: Vec::new(),
+            entry: Some(entry),
+            shape_paths: shape_paths_rel
+                .iter()
+                .map(|rel| self.dir.path().join(rel))
+                .collect(),
         });
     }
 
@@ -57,11 +60,8 @@ impl Fixture {
         let parsed = parse(source, Dialect::Lua54);
         assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
         let store = ShapeStore::new(self.dir.path());
-        let file_dir = self.dir.path().join("src");
-        std::fs::create_dir_all(&file_dir).expect("mkdir");
         let opts = ShapeOptions {
             store: &store,
-            file_dir: &file_dir,
             shape_paths: &self.shape_paths,
             dependencies: &self.dependencies,
         };
@@ -69,14 +69,7 @@ impl Fixture {
     }
 
     fn check(&self, source: &str) -> Vec<Diagnostic> {
-        self.check_at(source, Strictness::Warn)
-    }
-
-    fn codes(&self, source: &str) -> Vec<String> {
-        self.check(source)
-            .iter()
-            .map(|d| d.code.to_string())
-            .collect()
+        self.check_at(source, Strictness::Strict)
     }
 
     /// Check a `.luab` file previously written with [`Fixture::write`].
@@ -89,1114 +82,298 @@ impl Fixture {
 }
 
 fn geometry_fixture() -> Fixture {
-    let f = Fixture::new();
-    f.write(
-        "src/geometry.luab",
-        "struct Point { x: number, y: number, label: string? }\n\
-         struct Bag { n: number, .. }\n",
-    );
-    f
-}
-
-// === Sealed checking (LB2001 / LB2002) ====================================
-
-#[test]
-fn lb2001_missing_field_on_bound_literal() {
-    let f = geometry_fixture();
-    let diags = f.check("---@use geometry\n\n---@struct Point\nlocal p = { x = 0 }\n");
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code.to_string(), "LB2001");
-    assert!(diags[0].message.contains("`y`"), "{}", diags[0].message);
-}
-
-#[test]
-fn lb2001_optional_field_may_be_omitted() {
-    let f = geometry_fixture();
-    let diags = f.check("---@use geometry\n\n---@struct Point\nlocal p = { x = 0, y = 1 }\n");
-    assert!(diags.is_empty(), "{diags:?}");
-}
-
-#[test]
-fn lb2002_unknown_key_in_bound_literal() {
-    let f = geometry_fixture();
-    let diags =
-        f.check("---@use geometry\n\n---@struct Point\nlocal p = { x = 0, y = 0, z = 0 }\n");
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code.to_string(), "LB2002");
-    assert!(diags[0].message.contains("`z`"), "{}", diags[0].message);
-}
-
-#[test]
-fn lb2002_unknown_key_write_and_read() {
-    let f = geometry_fixture();
-    let src = "\
----@use geometry
-
----@struct Point
-local p = { x = 0, y = 0 }
-p.z = 1
-print(p.w)
-";
-    let codes = f.codes(src);
-    assert_eq!(codes, vec!["LB2002", "LB2002"]);
-}
-
-#[test]
-fn known_field_reads_and_writes_are_clean() {
-    let f = geometry_fixture();
-    let src = "\
----@use geometry
-
----@struct Point
-local p = { x = 0, y = 0 }
-p.x = 2
-p.label = \"origin\"
-print(p.y, p.label)
-";
-    assert!(f.check(src).is_empty());
-}
-
-#[test]
-fn field_write_type_mismatch_is_lb0300_at_strictness() {
-    let f = geometry_fixture();
-    let src = "\
----@use geometry
-
----@struct Point
-local p = { x = 0, y = 0 }
-p.x = \"nope\"
-";
-    let warn = f.check(src);
-    assert_eq!(warn.len(), 1, "{warn:?}");
-    assert_eq!(warn[0].code.to_string(), "LB0300");
-    assert_eq!(warn[0].severity, luabox_diag::Severity::Warning);
-    let strict = f.check_at(src, Strictness::Strict);
-    assert_eq!(strict[0].severity, luabox_diag::Severity::Error);
-}
-
-#[test]
-fn open_struct_accepts_extra_keys() {
-    let f = geometry_fixture();
-    let src = "\
----@use geometry
-
----@struct Bag
-local b = { n = 1, extra = true }
-b.more = 2
-print(b.other)
-";
-    assert!(f.check(src).is_empty(), "{:?}", f.check(src));
-}
-
-#[test]
-fn sealed_field_value_types_checked_in_literal() {
-    let f = geometry_fixture();
-    let src = "\
----@use geometry
-
----@struct Point
-local p = { x = \"no\", y = 0 }
-";
-    let diags = f.check_at(src, Strictness::Strict);
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code.to_string(), "LB0300");
-}
-
-#[test]
-fn lb2xxx_fire_even_at_strictness_none() {
-    let f = geometry_fixture();
-    let diags = f.check_at(
-        "---@use geometry\n\n---@struct Point\nlocal p = { x = 0 }\n",
-        Strictness::None,
-    );
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code.to_string(), "LB2001");
-    assert_eq!(diags[0].severity, luabox_diag::Severity::Error);
-}
-
-// === LB2006: undeclared struct =============================================
-
-#[test]
-fn lb2006_undeclared_struct() {
-    let f = geometry_fixture();
-    let codes = f.codes("---@use geometry\n\n---@struct Wibble\nlocal w = {}\n");
-    assert_eq!(codes, vec!["LB2006"]);
-}
-
-#[test]
-fn declared_struct_is_not_lb2006() {
-    let f = geometry_fixture();
-    assert!(
-        f.check("---@use geometry\n\n---@struct Point\nlocal p = { x = 0, y = 0 }\n")
-            .is_empty()
-    );
-}
-
-// === Instantiation: setmetatable(literal, Carrier) ========================
-
-fn circle_fixture() -> Fixture {
-    let f = Fixture::new();
-    f.write(
-        "src/geometry.luab",
-        "struct Circle { radius: number }\n\
-         trait Shape {\n    fn area(self) -> number;\n    fn perimeter(self) -> number;\n}\n",
-    );
-    f
-}
-
-const CIRCLE_CARRIER: &str = "\
----@use geometry
-
----@struct Circle
-local Circle = {}
-Circle.__index = Circle
-
----@impl Shape for Circle
-function Circle:area()
-  return 3.14 * self.radius * self.radius
-end
-
-function Circle:perimeter()
-  return 2 * 3.14 * self.radius
-end
-";
-
-#[test]
-fn carrier_with_methods_is_clean() {
-    let f = circle_fixture();
-    let src = format!(
-        "{CIRCLE_CARRIER}\nfunction Circle.new(radius)\n  return setmetatable({{ radius = radius }}, Circle)\nend\n"
-    );
-    let diags = f.check(&src);
-    assert!(diags.is_empty(), "{diags:?}");
-}
-
-#[test]
-fn setmetatable_literal_missing_field_is_lb2001() {
-    let f = circle_fixture();
-    let src = format!(
-        "{CIRCLE_CARRIER}\nfunction Circle.new()\n  return setmetatable({{}}, Circle)\nend\n"
-    );
-    let diags = f.check(&src);
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code.to_string(), "LB2001");
-    assert!(diags[0].message.contains("`radius`"));
-}
-
-#[test]
-fn setmetatable_literal_unknown_key_is_lb2002() {
-    let f = circle_fixture();
-    let src =
-        format!("{CIRCLE_CARRIER}\nlocal c = setmetatable({{ radius = 1, wobble = 2 }}, Circle)\n");
-    let codes: Vec<String> = f.check(&src).iter().map(|d| d.code.to_string()).collect();
-    assert_eq!(codes, vec!["LB2002"]);
-}
-
-#[test]
-fn setmetatable_result_is_a_sealed_instance() {
-    let f = circle_fixture();
-    let src = format!(
-        "{CIRCLE_CARRIER}\nlocal c = setmetatable({{ radius = 1 }}, Circle)\nprint(c.radius)\nprint(c:area())\nprint(c.oops)\n"
-    );
-    let diags = f.check(&src);
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code.to_string(), "LB2002");
-    assert!(diags[0].message.contains("`oops`"));
-}
-
-#[test]
-fn self_in_methods_is_sealed_too() {
-    let f = circle_fixture();
-    let src = "\
----@use geometry
-
----@struct Circle
-local Circle = {}
-Circle.__index = Circle
-
----@impl Shape for Circle
-function Circle:area()
-  return self.radius * self.typo
-end
-
-function Circle:perimeter()
-  return 0
-end
-";
-    let diags = f.check(src);
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code.to_string(), "LB2002");
-    assert!(diags[0].message.contains("`typo`"));
-}
-
-// === Trait coherence (LB2003 / LB2004 / LB2008) ============================
-
-#[test]
-fn lb2003_incomplete_impl_lists_missing_fns() {
-    let f = circle_fixture();
-    let src = "\
----@use geometry
-
----@struct Circle
-local Circle = {}
-Circle.__index = Circle
-
----@impl Shape for Circle
-function Circle:area()
-  return 1
-end
-";
-    let diags = f.check(src);
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code.to_string(), "LB2003");
-    assert!(
-        diags[0].message.contains("`perimeter`"),
-        "{}",
-        diags[0].message
-    );
-}
-
-#[test]
-fn extra_inherent_methods_are_fine() {
-    let f = circle_fixture();
-    let src = format!("{CIRCLE_CARRIER}\nfunction Circle:describe()\n  return \"a circle\"\nend\n");
-    assert!(f.check(&src).is_empty());
-}
-
-#[test]
-fn lb2004_return_covariance_violation_has_both_spans() {
-    let f = circle_fixture();
-    let src = "\
----@use geometry
-
----@struct Circle
-local Circle = {}
-Circle.__index = Circle
-
----@impl Shape for Circle
----@return string
-function Circle:area()
-  return \"round\"
-end
-
-function Circle:perimeter()
-  return 0
-end
-";
-    let diags = f.check(src);
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code.to_string(), "LB2004");
-    let primary = diags[0].primary_label().expect("primary");
-    assert_eq!(primary.span.file, "src/main.lua");
-    let secondary = diags[0]
-        .labels
-        .iter()
-        .find(|l| !l.primary)
-        .expect("secondary label");
-    assert_eq!(secondary.span.file, "src/geometry.luab");
-}
-
-#[test]
-fn lb2004_receiver_mismatch() {
-    let f = circle_fixture();
-    let src = "\
----@use geometry
-
----@struct Circle
-local Circle = {}
-Circle.__index = Circle
-
----@impl Shape for Circle
-function Circle.area()
-  return 1
-end
-
-function Circle:perimeter()
-  return 0
-end
-";
-    let codes: Vec<String> = f.check(src).iter().map(|d| d.code.to_string()).collect();
-    assert_eq!(codes, vec!["LB2004"]);
-}
-
-#[test]
-fn dot_decl_with_explicit_self_satisfies_receiver() {
-    let f = circle_fixture();
-    let src = "\
----@use geometry
-
----@struct Circle
-local Circle = {}
-Circle.__index = Circle
-
----@impl Shape for Circle
-function Circle.area(self)
-  return 1
-end
-
-function Circle:perimeter()
-  return 0
-end
-";
-    assert!(f.check(src).is_empty(), "{:?}", f.check(src));
-}
-
-#[test]
-fn lb2004_param_arity_mismatch() {
-    let f = circle_fixture();
-    let src = "\
----@use geometry
-
----@struct Circle
-local Circle = {}
-Circle.__index = Circle
-
----@impl Shape for Circle
-function Circle:area(extra)
-  return 1
-end
-
-function Circle:perimeter()
-  return 0
-end
-";
-    let codes: Vec<String> = f.check(src).iter().map(|d| d.code.to_string()).collect();
-    assert_eq!(codes, vec!["LB2004"]);
-}
-
-#[test]
-fn lb2004_param_contravariance_violation() {
-    let f = Fixture::new();
-    f.write(
-        "src/geometry.luab",
-        "struct Circle { radius: number }\n\
-         trait Scalable {\n    fn scale(self, factor: number);\n}\n",
-    );
-    let src = "\
----@use geometry
-
----@struct Circle
-local Circle = {}
-Circle.__index = Circle
-
----@impl Scalable for Circle
----@param factor string
-function Circle:scale(factor)
-end
-";
-    let codes: Vec<String> = f.check(src).iter().map(|d| d.code.to_string()).collect();
-    assert_eq!(codes, vec!["LB2004"]);
-}
-
-#[test]
-fn annotated_matching_signature_is_clean() {
-    let f = Fixture::new();
-    f.write(
-        "src/geometry.luab",
-        "struct Circle { radius: number }\n\
-         trait Scalable {\n    fn scale(self, factor: number) -> number;\n}\n",
-    );
-    let src = "\
----@use geometry
-
----@struct Circle
-local Circle = {}
-Circle.__index = Circle
-
----@impl Scalable for Circle
----@param factor number
----@return number
-function Circle:scale(factor)
-  return factor
-end
-";
-    assert!(f.check(src).is_empty(), "{:?}", f.check(src));
-}
-
-#[test]
-fn lb2008_supertrait_conformance_missing() {
-    let f = Fixture::new();
-    f.write(
-        "src/geometry.luab",
-        "struct Circle { radius: number }\n\
-         trait Shape {\n    fn area(self) -> number;\n}\n\
-         trait Drawable: Shape {\n    fn draw(self);\n}\n",
-    );
-    let src = "\
----@use geometry
-
----@struct Circle
-local Circle = {}
-Circle.__index = Circle
-
----@impl Drawable for Circle
-function Circle:draw()
-end
-";
-    let codes: Vec<String> = f.check(src).iter().map(|d| d.code.to_string()).collect();
-    assert_eq!(codes, vec!["LB2008"]);
-}
-
-#[test]
-fn lb2008_satisfied_by_impl_on_same_carrier() {
-    let f = Fixture::new();
-    f.write(
-        "src/geometry.luab",
-        "struct Circle { radius: number }\n\
-         trait Shape {\n    fn area(self) -> number;\n}\n\
-         trait Drawable: Shape {\n    fn draw(self);\n}\n",
-    );
-    let src = "\
----@use geometry
-
----@struct Circle
-local Circle = {}
-Circle.__index = Circle
-
----@impl Shape for Circle
-function Circle:area()
-  return 1
-end
-
----@impl Drawable for Circle
-function Circle:draw()
-end
-";
-    assert!(f.check(src).is_empty(), "{:?}", f.check(src));
-}
-
-#[test]
-fn lb2008_satisfied_by_lb_impl_assertion() {
-    let f = Fixture::new();
-    f.write(
-        "src/geometry.luab",
-        "struct Circle { radius: number }\n\
-         trait Shape {\n    fn area(self) -> number;\n}\n\
-         trait Drawable: Shape {\n    fn draw(self);\n}\n\
-         impl Shape for Circle;\n",
-    );
-    let src = "\
----@use geometry
-
----@struct Circle
-local Circle = {}
-Circle.__index = Circle
-
----@impl Drawable for Circle
-function Circle:draw()
-end
-";
-    assert!(f.check(src).is_empty(), "{:?}", f.check(src));
-}
-
-#[test]
-fn lb2006_impl_of_undeclared_trait_or_struct() {
-    let f = circle_fixture();
-    let src = "\
----@use geometry
-
-local Thing = {}
-
----@impl Nope for Circle
-function Thing:x() end
-";
-    let codes: Vec<String> = f.check(src).iter().map(|d| d.code.to_string()).collect();
-    assert_eq!(codes, vec!["LB2006"]);
-
-    let src = "\
----@use geometry
-
-local Thing = {}
-
----@impl Shape for Missing
-function Thing:x() end
-";
-    let codes: Vec<String> = f.check(src).iter().map(|d| d.code.to_string()).collect();
-    assert_eq!(codes, vec!["LB2006"]);
-}
-
-// === Interop with LuaCATS ===================================================
-
-#[test]
-fn luacats_class_satisfies_a_shape_trait() {
-    let f = Fixture::new();
-    f.write(
-        "src/geometry.luab",
-        "trait Shape {\n    fn area(self) -> number;\n}\n",
-    );
-    let src = "\
----@use geometry
-
----@class Square
----@field side number
-local Square = {}
-Square.__index = Square
-
----@impl Shape for Square
-function Square:area()
-  return self.side * self.side
-end
-";
-    assert!(f.check(src).is_empty(), "{:?}", f.check(src));
-}
-
-#[test]
-fn luacats_class_field_fn_type_counts_as_method() {
-    let f = Fixture::new();
-    f.write(
-        "src/geometry.luab",
-        "trait Shape {\n    fn area(self) -> number;\n}\n",
-    );
-    let src = "\
----@use geometry
-
----@class Square
----@field side number
----@field area fun(self: Square): number
-local Square = {}
-
----@impl Shape for Square
-local _ = Square
-";
-    assert!(f.check(src).is_empty(), "{:?}", f.check(src));
-}
-
-#[test]
-fn shape_struct_usable_in_luacats_annotations() {
-    let f = geometry_fixture();
-    let src = "\
----@use geometry
-
----@param p Point
----@return number
-local function get_x(p)
-  return p.x
-end
-
-get_x({ x = 1, y = 2 })
-";
-    let diags = f.check_at(src, Strictness::Strict);
-    assert!(diags.is_empty(), "{diags:?}");
-}
-
-#[test]
-fn shape_struct_in_annotation_checks_fields() {
-    let f = geometry_fixture();
-    let src = "\
----@use geometry
-
----@param p Point
-local function use(p) end
-
-use({ x = 1 })
-";
-    let diags = f.check_at(src, Strictness::Strict);
-    // The ordinary checker reports the missing field on the literal.
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code.to_string(), "LB0302");
-}
-
-// === Resolution (LB2005) ====================================================
-
-#[test]
-fn lb2005_unresolved_module_documents_all_tiers() {
-    let f = Fixture::new();
-    let diags = f.check("---@use missing_module\n");
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code.to_string(), "LB2005");
-    assert!(
-        diags[0]
-            .notes
-            .iter()
-            .any(|n| n.contains("shape-paths") && n.contains("[types] shapes")),
-        "expected the note to document every resolution tier: {diags:?}"
-    );
-}
-
-// === Resolution tier 3: dependency-exported shapes (SHAPES.md §6) ==========
-
-#[test]
-fn dependency_exported_shape_resolves_and_seals() {
-    let mut f = Fixture::new();
-    // A dependency package rooted at `dep/`, exporting `geometry`.
-    f.write(
-        "dep/geometry.luab",
-        "struct Point { x: number, y: number }\n",
-    );
-    f.add_dependency("geo", "dep", &["geometry"]);
-    // The consumer `---@use geometry` resolves across the package boundary,
-    // and sealed checking fires on the bound literal.
-    let diags = f.check("---@use geometry\n\n---@struct Point\nlocal p = { x = 0 }\n");
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code.to_string(), "LB2001");
-    assert!(diags[0].message.contains("`y`"), "{}", diags[0].message);
-}
-
-#[test]
-fn dependency_not_exporting_the_module_is_lb2005() {
-    let mut f = Fixture::new();
-    // The `.luab` exists in the dependency, but it is not in `[types] shapes`,
-    // so it stays invisible across the package boundary.
-    f.write(
-        "dep/geometry.luab",
-        "struct Point { x: number, y: number }\n",
-    );
-    f.add_dependency("geo", "dep", &[]);
-    let diags = f.check("---@use geometry\n");
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code.to_string(), "LB2005");
-}
-
-#[test]
-fn two_dependencies_exporting_the_same_module_are_ambiguous() {
-    let mut f = Fixture::new();
-    f.write("dep_a/geometry.luab", "struct Point { x: number }\n");
-    f.write("dep_b/geometry.luab", "struct Point { x: number }\n");
-    f.add_dependency("geo_a", "dep_a", &["geometry"]);
-    f.add_dependency("geo_b", "dep_b", &["geometry"]);
-    let diags = f.check("---@use geometry\n");
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code.to_string(), "LB2005");
-    assert!(
-        diags[0].message.contains("ambiguous"),
-        "{}",
-        diags[0].message
-    );
-    // Both candidate files are named.
-    let note = diags[0].notes.join(" ");
-    assert!(note.contains("dep_a") && note.contains("dep_b"), "{note}");
-}
-
-#[test]
-fn local_tiers_win_over_dependency_exports() {
-    let mut f = Fixture::new();
-    // A sibling `geometry.luab` (tier 1) and a dependency both define it; the
-    // sibling wins, so this literal is clean only via the local file.
-    f.write("src/geometry.luab", "struct Point { x: number }\n");
-    f.write(
-        "dep/geometry.luab",
-        "struct Point { x: number, y: number }\n",
-    );
-    f.add_dependency("geo", "dep", &["geometry"]);
-    let diags = f.check("---@use geometry\n\n---@struct Point\nlocal p = { x = 1 }\n");
-    assert!(diags.is_empty(), "{diags:?}");
-}
-
-#[test]
-fn dependency_shape_nested_use_stays_within_its_package() {
-    let mut f = Fixture::new();
-    // The exported `geometry.luab` itself `use`s a sibling `base.luab` that lives
-    // in the same dependency package — nested resolution finds it there.
-    f.write("dep/base.luab", "struct Point { x: number, y: number }\n");
-    f.write(
-        "dep/geometry.luab",
-        "use base;\nstruct Segment { from: Point, to: Point }\n",
-    );
-    f.add_dependency("geo", "dep", &["geometry"]);
-    let src = "\
----@use geometry
-
----@struct Segment
-local s = { from = { x = 0, y = 0 }, to = { x = 1 } }
-";
-    // The nested `to` literal misses `y`: sealed checking recurses across the
-    // dependency's own `use`.
-    let diags = f.check(src);
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code.to_string(), "LB2001");
-    assert!(diags[0].message.contains("`y`"));
-}
-
-#[test]
-fn sibling_tier_resolves_first() {
     let mut f = Fixture::new();
     f.add_shape_path("shapes");
-    // Same module name in both tiers: the sibling must win.
-    f.write("src/geometry.luab", "struct Point { x: number }\n");
     f.write(
         "shapes/geometry.luab",
-        "struct Point { x: number, y: number }\n",
+        "type Point = { x: number, y: number, label?: string }\n\
+         type Radius = number\n\
+         type Pair<T> = { first: T, second: T }\n\
+         export type Shape = {\n\
+             area(self): number,\n\
+             perimeter(self): number,\n\
+         }\n\
+         export type Drawable = Shape & { draw(self): string }\n",
     );
-    // Sibling's Point has no `y`: this literal is clean only via tier 1.
-    let diags = f.check("---@use geometry\n\n---@struct Point\nlocal p = { x = 1 }\n");
+    f
+}
+
+// === Ambient FQ resolution in standard positions ==========================
+
+#[test]
+fn typed_local_literal_conforms() {
+    let f = geometry_fixture();
+    let diags = f.check("---@type geometry.Point\nlocal p = { x = 0, y = 1 }\nreturn p\n");
     assert!(diags.is_empty(), "{diags:?}");
 }
 
 #[test]
-fn shape_path_tier_resolves_when_no_sibling() {
-    let mut f = Fixture::new();
-    f.add_shape_path("shapes");
-    f.write("shapes/geometry.luab", "struct Point { x: number }\n");
-    let diags = f.check("---@use geometry\n\n---@struct Point\nlocal p = { x = 1 }\n");
-    assert!(diags.is_empty(), "{diags:?}");
+fn optional_field_may_be_omitted_or_given() {
+    let f = geometry_fixture();
+    let ok = "---@type geometry.Point\nlocal p = { x = 0, y = 1, label = \"origin\" }\nreturn p\n";
+    assert!(f.check(ok).is_empty(), "{:?}", f.check(ok));
 }
 
 #[test]
-fn lb2005_same_tier_ambiguity() {
-    let mut f = Fixture::new();
-    f.add_shape_path("shapes_a");
-    f.add_shape_path("shapes_b");
-    f.write("shapes_a/geometry.luab", "struct Point { x: number }\n");
-    f.write("shapes_b/geometry.luab", "struct Point { x: number }\n");
-    let diags = f.check("---@use geometry\n");
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code.to_string(), "LB2005");
-    assert!(
-        diags[0].message.contains("ambiguous"),
-        "{}",
-        diags[0].message
-    );
+fn missing_required_field_errors() {
+    let f = geometry_fixture();
+    let diags = f.check("---@type geometry.Point\nlocal p = { x = 0 }\nreturn p\n");
+    assert!(!diags.is_empty(), "missing `y` must be diagnosed");
+    assert!(diags.iter().any(|d| d.message.contains('y')), "{diags:?}");
 }
 
 #[test]
-fn use_inside_lb_resolves_transitively() {
-    let f = Fixture::new();
-    f.write("src/base.luab", "struct Point { x: number, y: number }\n");
-    f.write(
-        "src/geometry.luab",
-        "use base;\nstruct Segment { from: Point, to: Point }\n",
-    );
-    let src = "\
----@use geometry
-
----@struct Segment
-local s = { from = { x = 0, y = 0 }, to = { x = 1 } }
-";
-    // The nested `to` literal misses `y` — sealed checking recurses.
-    let diags = f.check(src);
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code.to_string(), "LB2001");
-    assert!(diags[0].message.contains("`y`"));
-}
-
-// === Generics (LB2007) ======================================================
-
-#[test]
-fn generic_struct_monomorphised_at_binding_site() {
-    let f = Fixture::new();
-    f.write(
-        "src/geometry.luab",
-        "struct Pair<T> { first: T, second: T }\n",
-    );
-    let src = "\
----@use geometry
-
----@struct Pair<number>
-local p = { first = 1, second = 2 }
-";
-    assert!(f.check(src).is_empty(), "{:?}", f.check(src));
-
-    let bad = "\
----@use geometry
-
----@struct Pair<number>
-local p = { first = 1 }
-";
-    let diags = f.check(bad);
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code.to_string(), "LB2001");
-    assert!(diags[0].message.contains("`second`"));
+fn sealed_freshness_rejects_unknown_field() {
+    let f = geometry_fixture();
+    let diags = f.check("---@type geometry.Point\nlocal p = { x = 0, y = 0, z = 0 }\nreturn p\n");
+    assert!(!diags.is_empty(), "excess `z` must be diagnosed");
+    assert!(diags.iter().any(|d| d.message.contains('z')), "{diags:?}");
 }
 
 #[test]
-fn generic_field_types_are_substituted() {
-    let f = Fixture::new();
-    f.write(
-        "src/geometry.luab",
-        "struct Pair<T> { first: T, second: T }\n",
-    );
-    let src = "\
----@use geometry
-
----@struct Pair<number>
-local p = { first = \"no\", second = 2 }
-";
-    let diags = f.check_at(src, Strictness::Strict);
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code.to_string(), "LB0300");
-}
-
-#[test]
-fn lb2007_bound_violation_at_lua_use_site() {
-    let f = Fixture::new();
-    f.write(
-        "src/geometry.luab",
-        "trait Shape {\n    fn area(self) -> number;\n}\n\
-         struct Holder<T: Shape> { value: T }\n",
-    );
-    let src = "\
----@use geometry
-
----@struct Holder<number>
-local h = { value = 1 }
-";
-    let codes: Vec<String> = f.check(src).iter().map(|d| d.code.to_string()).collect();
-    assert_eq!(codes, vec!["LB2007"]);
-}
-
-#[test]
-fn bound_satisfied_by_lb_impl() {
-    let f = Fixture::new();
-    f.write(
-        "src/geometry.luab",
-        "trait Shape {\n    fn area(self) -> number;\n}\n\
-         struct Circle { radius: number }\n\
-         impl Shape for Circle;\n\
-         struct Holder<T: Shape> { value: T }\n",
-    );
-    let src = "\
----@use geometry
-
----@struct Holder<Circle>
-local h = { value = { radius = 1 } }
-";
-    assert!(f.check(src).is_empty(), "{:?}", f.check(src));
-}
-
-#[test]
-fn lb2007_bound_violation_inside_lb_file() {
-    let f = Fixture::new();
-    f.write(
-        "src/geometry.luab",
-        "trait Shape {\n    fn area(self) -> number;\n}\n\
-         struct Holder<T: Shape> { value: T }\n\
-         struct Bad { h: Holder<number> }\n",
-    );
-    let diags = f.check_lb("src/geometry.luab");
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code.to_string(), "LB2007");
-    assert_eq!(
-        diags[0].primary_label().expect("label").span.file,
-        "src/geometry.luab"
-    );
-}
-
-#[test]
-fn vec_and_hashmap_lower_structurally() {
-    let f = Fixture::new();
-    f.write(
-        "src/geometry.luab",
-        "struct Poly { points: Vec<number>, tags: HashMap<string, boolean> }\n",
-    );
-    let src = "\
----@use geometry
-
----@struct Poly
-local p = { points = { 1, 2 }, tags = {} }
-";
-    assert!(f.check(src).is_empty(), "{:?}", f.check(src));
-}
-
-// === Result<T, E> convention (SHAPES.md §12.1) ==============================
-
-#[test]
-fn result_expands_to_optional_pair_in_return_position() {
-    let f = Fixture::new();
-    f.write(
-        "src/geometry.luab",
-        "struct Point { x: number, y: number }\n\
-         trait Parser {\n    fn parse(self, s: string) -> Result<Point, string>;\n}\n",
-    );
-    let ok = "\
----@use geometry
-
----@struct Point
-local Point = {}
-Point.__index = Point
-
----@impl Parser for Point
----@param s string
----@return Point?, string?
-function Point:parse(s)
-  return nil, \"unimplemented\"
-end
-";
+fn param_and_return_positions_check() {
+    let f = geometry_fixture();
+    let ok = "---@param p geometry.Point\n---@return geometry.Point\n\
+              local function id(p) return p end\n\
+              return id({ x = 1, y = 2 })\n";
     assert!(f.check(ok).is_empty(), "{:?}", f.check(ok));
 
-    // A single un-optional return does not match the (T?, E?) pair.
-    let bad = "\
----@use geometry
-
----@struct Point
-local Point = {}
-Point.__index = Point
-
----@impl Parser for Point
----@param s string
----@return string
-function Point:parse(s)
-  return \"nope\"
-end
-";
-    let codes: Vec<String> = f.check(bad).iter().map(|d| d.code.to_string()).collect();
-    assert_eq!(codes, vec!["LB2004"]);
-}
-
-// === .luab file checking (LB2010 / syntax) ====================================
-
-#[test]
-fn lb2010_body_in_lb_file() {
-    let f = Fixture::new();
-    f.write(
-        "src/bad.luab",
-        "trait Shape {\n    fn area(self) -> number { return 1 }\n}\n",
-    );
-    let diags = f.check_lb("src/bad.luab");
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code.to_string(), "LB2010");
-    assert!(diags[0].message.contains("implementations live in .lua"));
+    let bad = "---@param p geometry.Point\nlocal function f(p) return p end\n\
+               return f({ x = 1 })\n";
+    assert!(!f.check(bad).is_empty(), "missing `y` at call site");
 }
 
 #[test]
-fn lb_syntax_error_is_lb0001() {
-    let f = Fixture::new();
-    f.write("src/bad.luab", "struct { x: number }\n");
-    let diags = f.check_lb("src/bad.luab");
-    assert!(!diags.is_empty());
+fn short_names_do_not_resolve() {
+    let f = geometry_fixture();
+    // References are fully qualified: bare `Point` is an unknown type name.
+    let diags = f.check("---@type Point\nlocal p = { x = 0, y = 1 }\nreturn p\n");
     assert!(
-        diags.iter().all(|d| d.code.to_string() == "LB0001"),
+        diags.iter().any(|d| d.code.to_string() == "LB0305"),
+        "bare `Point` must be an unknown name: {diags:?}"
+    );
+}
+
+#[test]
+fn no_use_tag_needed_and_v1_tags_are_unknown() {
+    let f = geometry_fixture();
+    // The scope is ambient — and the retired v1 tags no longer parse as
+    // anything meaningful (they surface via the unknown-tag path, without
+    // breaking the check).
+    let diags = f.check("---@type geometry.Point\nlocal p = { x = 0, y = 1 }\nreturn p\n");
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn nested_namespace_from_path() {
+    let mut f = Fixture::new();
+    f.add_shape_path("shapes");
+    f.write(
+        "shapes/love/graphics.luab",
+        "export type Canvas = { width: number, height: number }\n",
+    );
+    let ok = "---@type love.graphics.Canvas\nlocal c = { width = 1, height = 2 }\nreturn c\n";
+    assert!(f.check(ok).is_empty(), "{:?}", f.check(ok));
+    let bad = "---@type love.graphics.Canvas\nlocal c = { width = 1 }\nreturn c\n";
+    assert!(!f.check(bad).is_empty(), "missing `height`");
+}
+
+// === Alias-like declarations and re-exports ================================
+
+#[test]
+fn alias_rhs_expands_inline() {
+    let f = geometry_fixture();
+    let ok = "---@type geometry.Radius\nlocal r = 2\nreturn r\n";
+    assert!(f.check(ok).is_empty(), "{:?}", f.check(ok));
+    let bad = "---@type geometry.Radius\nlocal r = \"two\"\nreturn r\n";
+    assert!(!f.check(bad).is_empty(), "string is not a Radius (number)");
+}
+
+#[test]
+fn reexport_is_a_plain_alias() {
+    let mut f = geometry_fixture();
+    f.add_shape_path("shapes2");
+    f.write("shapes2/api.luab", "export type P = geometry.Point\n");
+    let ok = "---@type api.P\nlocal p = { x = 0, y = 1 }\nreturn p\n";
+    assert!(f.check(ok).is_empty(), "{:?}", f.check(ok));
+    let bad = "---@type api.P\nlocal p = { x = 0 }\nreturn p\n";
+    assert!(!f.check(bad).is_empty(), "P is Point; missing `y`");
+}
+
+// === Generics ==============================================================
+
+#[test]
+fn generic_instantiation_checks_fields() {
+    let f = geometry_fixture();
+    let ok = "---@type geometry.Pair<number>\nlocal p = { first = 1, second = 2 }\nreturn p\n";
+    assert!(f.check(ok).is_empty(), "{:?}", f.check(ok));
+    let bad = "---@type geometry.Pair<number>\nlocal p = { first = 1, second = \"x\" }\nreturn p\n";
+    assert!(!f.check(bad).is_empty(), "string is not T=number");
+}
+
+// === Positional conformance: methods and intersections =====================
+
+#[test]
+fn carrier_with_all_methods_conforms() {
+    let f = geometry_fixture();
+    let src = "local Circle = {}\nCircle.__index = Circle\n\
+               ---@return number\nfunction Circle:area() return 1 end\n\
+               ---@return number\nfunction Circle:perimeter() return 2 end\n\
+               ---@type geometry.Shape\nlocal s = Circle\nreturn s\n";
+    let diags = f.check(src);
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn carrier_missing_method_fails_positionally() {
+    let f = geometry_fixture();
+    let src = "local Circle = {}\nCircle.__index = Circle\n\
+               ---@return number\nfunction Circle:area() return 1 end\n\
+               ---@type geometry.Shape\nlocal s = Circle\nreturn s\n";
+    let diags = f.check(src);
+    assert!(!diags.is_empty(), "missing `perimeter` must be diagnosed");
+    assert!(
+        diags.iter().any(|d| d.message.contains("perimeter")),
         "{diags:?}"
     );
 }
 
 #[test]
-fn lb2005_for_unresolved_use_inside_lb() {
+fn intersection_requires_all_members() {
+    let f = geometry_fixture();
+    let ok = "local C = {}\nC.__index = C\n\
+              ---@return number\nfunction C:area() return 1 end\n\
+              ---@return number\nfunction C:perimeter() return 2 end\n\
+              ---@return string\nfunction C:draw() return \"o\" end\n\
+              ---@type geometry.Drawable\nlocal d = C\nreturn d\n";
+    assert!(f.check(ok).is_empty(), "{:?}", f.check(ok));
+
+    let bad = "local C = {}\nC.__index = C\n\
+               ---@return number\nfunction C:area() return 1 end\n\
+               ---@return number\nfunction C:perimeter() return 2 end\n\
+               ---@type geometry.Drawable\nlocal d = C\nreturn d\n";
+    let diags = f.check(bad);
+    assert!(
+        diags.iter().any(|d| d.message.contains("draw")),
+        "Drawable = Shape & {{draw}}: missing `draw` must be diagnosed: {diags:?}"
+    );
+}
+
+// === Dependency export surfaces ============================================
+
+#[test]
+fn dependency_exports_mount_under_package_name() {
+    let mut f = Fixture::new();
+    f.add_shape_path("shapes");
+    f.write("shapes/app.luab", "type Unused = number\n");
+    // The dependency: internal module + entrypoint re-export.
+    f.write(
+        "dep/shapes/internal/core.luab",
+        "export type Vec2 = { x: number, y: number }\ntype Hidden = { secret: number }\n",
+    );
+    f.write(
+        "dep/shapes/init.luab",
+        "export type Vec2 = internal.core.Vec2\n",
+    );
+    f.add_dependency("geo", "dep/shapes/init.luab", &["dep/shapes"]);
+
+    let ok = "---@type geo.Vec2\nlocal v = { x = 1, y = 2 }\nreturn v\n";
+    assert!(f.check(ok).is_empty(), "{:?}", f.check(ok));
+
+    // Internal module paths are not addressable from outside.
+    let hidden = "---@type internal.core.Hidden\nlocal h = { secret = 1 }\nreturn h\n";
+    let diags = f.check(hidden);
+    assert!(
+        diags.iter().any(|d| d.code.to_string() == "LB0305"),
+        "dep-internal names must be invisible: {diags:?}"
+    );
+}
+
+// === `.luab` file checks ====================================================
+
+#[test]
+fn lb2010_method_body_rejected() {
     let f = Fixture::new();
     f.write(
-        "src/geometry.luab",
-        "use missing;\nstruct Point { x: number }\n",
+        "shapes/bad.luab",
+        "type T = { area(self): number { return 1 } }\n",
     );
-    let diags = f.check_lb("src/geometry.luab");
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code.to_string(), "LB2005");
-}
-
-// === Traits as annotation types / zero-cost guarantee =======================
-
-#[test]
-fn trait_usable_in_luacats_annotation() {
-    let f = circle_fixture();
-    // `Shape` must resolve as an annotation type (no LB0305) and expose
-    // its method set as a structural interface.
-    let src = "\
----@use geometry
-
----@param s Shape
-local function measure(s)
-  local area_fn = s.area
-  return area_fn
-end
-
-measure({ area = function() return 1 end, perimeter = function() return 2 end })
-";
-    let diags = f.check_at(src, Strictness::Strict);
-    assert!(diags.is_empty(), "{diags:?}");
-}
-
-#[test]
-fn no_tags_means_no_shape_machinery() {
-    let f = Fixture::new();
-    // No .luab files anywhere; a file without tags must be silent.
-    assert!(f.check("local x = 1\nprint(x)\n").is_empty());
-}
-
-// === Carrier constructors & `self` typing (#73) =============================
-
-/// A carrier bound with `---@struct`, an annotated constructor, and `:`
-/// methods — the idiomatic OOP form the dogfooded examples use.
-fn square_fixture() -> Fixture {
-    let f = Fixture::new();
-    f.write("src/render.luab", "struct Square { side: integer }\n");
-    f
-}
-
-const SQUARE_CARRIER: &str = "\
----@use render
-
----@param n integer
-local function wanti(n) end
----@param s string
-local function wants(s) end
-
----@struct Square
-local Square = {}
-Square.__index = Square
-
-function Square:grow()
-  wanti(self.side)
-end
-
----@param side integer
----@return Square
-function Square.new(side)
-  return setmetatable({ side = side }, Square)
-end
-";
-
-#[test]
-fn struct_carrier_constructor_checks_clean_in_strict() {
-    let f = square_fixture();
-    let diags = f.check_at(SQUARE_CARRIER, Strictness::Strict);
-    assert!(diags.is_empty(), "{diags:?}");
-}
-
-#[test]
-fn annotated_param_flows_into_the_sealed_constructor_literal() {
-    // `side` annotated as `string` no longer satisfies the struct's
-    // `integer` field — the parameter's type reaches the literal.
-    let f = square_fixture();
-    let src = SQUARE_CARRIER.replace("---@param side integer", "---@param side string");
-    let diags = f.check_at(&src, Strictness::Strict);
-    let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
-    assert!(codes.contains(&"LB0300".to_string()), "{diags:?}");
-}
-
-#[test]
-fn constructor_literal_stays_sealed_against_the_struct() {
-    let f = square_fixture();
-    let src = SQUARE_CARRIER.replace(
-        "setmetatable({ side = side }, Square)",
-        "setmetatable({ side = side, colour = 1 }, Square)",
+    let diags = f.check_lb("shapes/bad.luab");
+    assert!(
+        diags.iter().any(|d| d.code.to_string() == "LB2010"),
+        "{diags:?}"
     );
-    let diags = f.check_at(src.as_str(), Strictness::Strict);
-    let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
-    assert_eq!(codes, vec!["LB2002"], "{diags:?}");
 }
 
 #[test]
-fn wrong_struct_constructor_return_still_errors() {
-    let f = square_fixture();
-    let src = SQUARE_CARRIER.replace(
-        "return setmetatable({ side = side }, Square)",
-        "return side",
+fn lb2005_duplicate_fq_declaration() {
+    let mut f = Fixture::new();
+    f.add_shape_path("shapes");
+    f.write("shapes/geometry.luab", "type Point = { x: number }\n");
+    f.write("shapes2/geometry.luab", "type Point = { y: number }\n");
+    f.add_shape_path("shapes2");
+    let diags = f.check_lb("shapes2/geometry.luab");
+    assert!(
+        diags.iter().any(|d| d.code.to_string() == "LB2005"),
+        "duplicate `geometry.Point` must error: {diags:?}"
     );
-    let diags = f.check_at(src.as_str(), Strictness::Strict);
-    let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
-    assert_eq!(codes, vec!["LB0304"], "{diags:?}");
 }
 
 #[test]
-fn self_field_uses_the_declared_struct_type() {
-    // Positive is covered by `struct_carrier_constructor_checks_clean_in_strict`
-    // (`wanti(self.side)` with `side: integer`); negative: the declared
-    // integer is NOT a string.
-    let f = square_fixture();
-    let src = SQUARE_CARRIER.replace("wanti(self.side)", "wants(self.side)");
-    let diags = f.check_at(src.as_str(), Strictness::Strict);
-    let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
-    assert_eq!(codes, vec!["LB0300"], "{diags:?}");
-}
-
-#[test]
-fn annotated_instance_exposes_declared_fields_and_methods() {
-    let f = square_fixture();
-    let src = format!(
-        "{SQUARE_CARRIER}
-local sq = Square.new(3)
-wanti(sq.side)
-sq:grow()
-"
+fn lb2007_wrong_arity_and_qualification_hint() {
+    let mut f = Fixture::new();
+    f.add_shape_path("shapes");
+    f.write(
+        "shapes/geometry.luab",
+        "type Pair<T> = { first: T, second: T }\n",
     );
-    let diags = f.check_at(&src, Strictness::Strict);
+    f.write(
+        "shapes/other.luab",
+        "type Bad = geometry.Pair<number, string>\ntype AlsoBad = Pair<number>\n",
+    );
+    let diags = f.check_lb("shapes/other.luab");
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code.to_string() == "LB2007" && d.message.contains("wrong number")),
+        "arity must error: {diags:?}"
+    );
+    assert!(
+        diags.iter().any(|d| d.code.to_string() == "LB2007"
+            && d.labels.iter().any(|l| l.message.contains("geometry.Pair"))),
+        "short cross-module name must hint the FQ candidate: {diags:?}"
+    );
+}
+
+#[test]
+fn sibling_short_names_resolve_within_module() {
+    let mut f = Fixture::new();
+    f.add_shape_path("shapes");
+    f.write(
+        "shapes/geometry.luab",
+        "type Point = { x: number, y: number }\n\
+         export type Segment = { from: Point, to: Point }\n",
+    );
+    let diags = f.check_lb("shapes/geometry.luab");
+    assert!(diags.is_empty(), "sibling refs are legal: {diags:?}");
+    // And the sibling reference behaves as the FQ type at use sites.
+    let bad = "---@type geometry.Segment\nlocal s = { from = { x = 1 }, to = { x = 1, y = 2 } }\nreturn s\n";
+    assert!(!f.check(bad).is_empty(), "nested Point missing `y`");
+}
+
+// === Result convention (unchanged in v2) ====================================
+
+#[test]
+fn result_in_return_position_is_pair() {
+    let mut f = Fixture::new();
+    f.add_shape_path("shapes");
+    f.write(
+        "shapes/io.luab",
+        "export type Reader = { read(self): Result<string, string> }\n",
+    );
+    let ok = "local R = {}\nR.__index = R\n\
+              ---@return string?, string?\nfunction R:read() return \"data\", nil end\n\
+              ---@type io.Reader\nlocal r = R\nreturn r\n";
+    let diags = f.check(ok);
     assert!(diags.is_empty(), "{diags:?}");
 }

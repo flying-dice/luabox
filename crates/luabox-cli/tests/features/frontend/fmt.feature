@@ -68,13 +68,13 @@ Feature: Canonical formatting — luabox fmt
     Given an empty directory
     And a file "shapes/point.luab" containing:
       """
-      struct   Point{x:number,y:number}
+      type   Point={x:number,y:number}
       """
     When I run "luabox fmt"
     Then the command succeeds
     And "shapes/point.luab" equals:
       """
-      struct Point {
+      type Point = {
           x: number,
           y: number,
       }

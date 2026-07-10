@@ -1,31 +1,31 @@
-//! The canonical `.luab` formatter (SHAPES.md §8): 4-space indent, one item per
-//! line, a single blank line between items, trailing commas on multi-line field
-//! lists — and *no configuration*.
+//! The canonical `.luab` formatter (SHAPES-V2.md): 4-space indent, one item
+//! per declaration, a single blank line between items, trailing commas on
+//! expanded member lists — and *no configuration*.
 //!
 //! Canonical shape choices (deterministic, no width heuristics):
-//! - A braced body with no members prints inline as `{}`.
-//! - A struct with one or more fields (or a `..` marker) always expands, one
-//!   field per line, each terminated by a trailing comma.
-//! - Trait-fn parameter lists stay on the signature line (they are short by
-//!   construction), so the "trailing comma on multi-line param lists" rule is
-//!   satisfied vacuously.
-//! - Doc comments and comments attach to the item/field they precede.
+//! - An object type with no members prints inline as `{}`.
+//! - An object type with members always expands, one member per line, each
+//!   terminated by a trailing comma. Nested objects expand at nested indent.
+//! - Union/intersection members join inline (`A | B`, `Shape & { ... }`) —
+//!   an expanded object opens its brace on the same line.
+//! - Method parameter lists stay on the member line (they are short by
+//!   construction).
+//! - Doc comments and comments attach to the item/member they precede.
 //!
 //! Contract: a formatter must never destroy code. [`format`] returns the input
 //! **unchanged** if it does not parse cleanly, and also if formatting would drop
 //! any comment (a conservative safety net).
 
 use super::ast::{
-    AstNode, Field, FnType, GenericArgs, GenericParams, Item, ParamList, ShapeFile, TraitFn,
-    TypeRef,
+    AstNode, GenericArgs, GenericParams, Member, ObjectType, ParamList, ShapeFile, TypeDef, TypeRef,
 };
 use super::{ShapeSyntaxKind, ShapeSyntaxNode, parse};
-use ShapeSyntaxKind::{COMMENT, DOC_COMMENT, FIELD, TRAIT_FN, WHITESPACE};
+use ShapeSyntaxKind::{COMMENT, DOC_COMMENT, FIELD, METHOD, WHITESPACE};
 use rowan::NodeOrToken;
 
 const INDENT: &str = "    ";
 
-/// Format `.luab` source into its canonical form (SHAPES.md §8).
+/// Format `.luab` source into its canonical form (SHAPES-V2.md).
 ///
 /// Returns the input unchanged when it does not parse cleanly, or when
 /// reformatting would drop a comment — a formatter never destroys code.
@@ -56,153 +56,121 @@ pub fn format(text: &str) -> String {
 
 // --- items --------------------------------------------------------------
 
-fn format_item(out: &mut String, item: &Item) {
+fn format_item(out: &mut String, item: &TypeDef) {
     push_comments(out, &leading_comments(item.syntax()), "");
-    match item {
-        Item::Struct(s) => {
-            let mut header = format!("struct {}", s.name().unwrap_or_default());
-            if let Some(g) = s.generic_params() {
-                header.push_str(&format_generic_params(&g));
-            }
-            let fields: Vec<Field> = s.fields().collect();
-            let is_open = s.is_open();
-            if fields.is_empty() && !is_open {
-                out.push_str(&header);
-                out.push_str(" {}\n");
-                return;
-            }
-            out.push_str(&header);
-            out.push_str(" {\n");
-            for f in &fields {
-                push_comments(out, &leading_comments(f.syntax()), INDENT);
-                out.push_str(INDENT);
-                out.push_str(&f.name().unwrap_or_default());
-                out.push_str(": ");
-                out.push_str(&format_type_opt(f.ty().as_ref()));
-                out.push_str(",\n");
-            }
-            if is_open {
-                out.push_str(INDENT);
-                out.push_str("..\n");
-            }
-            push_comments(out, &trailing_comments(s.syntax(), FIELD), INDENT);
-            out.push_str("}\n");
-        }
-        Item::Trait(t) => {
-            let mut header = format!("trait {}", t.name().unwrap_or_default());
-            if let Some(g) = t.generic_params() {
-                header.push_str(&format_generic_params(&g));
-            }
-            let supers = t.supertraits();
-            if !supers.is_empty() {
-                header.push_str(": ");
-                header.push_str(&supers.join(" + "));
-            }
-            let fns: Vec<TraitFn> = t.fns().collect();
-            if fns.is_empty() {
-                out.push_str(&header);
-                out.push_str(" {}\n");
-                return;
-            }
-            out.push_str(&header);
-            out.push_str(" {\n");
-            for f in &fns {
-                push_comments(out, &leading_comments(f.syntax()), INDENT);
-                out.push_str(INDENT);
-                out.push_str(&format_trait_fn(f));
-                out.push_str(";\n");
-            }
-            push_comments(out, &trailing_comments(t.syntax(), TRAIT_FN), INDENT);
-            out.push_str("}\n");
-        }
-        Item::Impl(im) => {
-            out.push_str("impl ");
-            out.push_str(&im.trait_name().unwrap_or_default());
-            if let Some(g) = im.generic_params() {
-                out.push_str(&format_generic_params(&g));
-            }
-            out.push_str(" for ");
-            out.push_str(&im.struct_name().unwrap_or_default());
-            out.push_str(";\n");
-        }
-        Item::Alias(a) => {
-            out.push_str("type ");
-            out.push_str(&a.name().unwrap_or_default());
-            if let Some(g) = a.generic_params() {
-                out.push_str(&format_generic_params(&g));
-            }
-            out.push_str(" = ");
-            out.push_str(&format_type_opt(a.ty().as_ref()));
-            out.push_str(";\n");
-        }
-        Item::Use(u) => {
-            out.push_str("use ");
-            out.push_str(&u.path());
-            out.push_str(";\n");
-        }
+    if item.is_export() {
+        out.push_str("export ");
     }
-}
-
-fn format_trait_fn(f: &TraitFn) -> String {
-    let mut s = format!("fn {}(", f.name().unwrap_or_default());
-    s.push_str(&format_params(f.params().as_ref()));
-    s.push(')');
-    let rets = f.returns();
-    if !rets.is_empty() {
-        s.push_str(" -> ");
-        s.push_str(&join_types(&rets));
+    out.push_str("type ");
+    out.push_str(&item.name().unwrap_or_default());
+    if let Some(g) = item.generic_params() {
+        out.push_str(&format_generic_params(&g));
     }
-    s
+    out.push_str(" = ");
+    out.push_str(&format_type_opt(item.ty().as_ref(), 0));
+    out.push('\n');
 }
 
 // --- types --------------------------------------------------------------
 
-fn format_type_opt(ty: Option<&TypeRef>) -> String {
-    ty.map_or_else(String::new, format_type)
+fn format_type_opt(ty: Option<&TypeRef>, depth: usize) -> String {
+    ty.map_or_else(String::new, |t| format_type(t, depth))
 }
 
-fn format_type(ty: &TypeRef) -> String {
+/// Render a type expression. `depth` is the indent level the expression
+/// starts at; expanded object members print at `depth + 1`.
+fn format_type(ty: &TypeRef, depth: usize) -> String {
     match ty {
         TypeRef::Named(n) => {
-            let mut s = n.name().unwrap_or_default();
+            let mut s = n.path();
             if let Some(args) = n.args() {
-                s.push_str(&format_generic_args(&args));
+                s.push_str(&format_generic_args(&args, depth));
             }
             s
         }
+        TypeRef::Object(o) => format_object(o, depth),
         TypeRef::Optional(o) => match o.inner() {
-            Some(inner) => format!("{}?", format_type(&inner)),
+            Some(inner) => format!("{}?", format_type(&inner, depth)),
             None => "?".to_string(),
         },
-        TypeRef::Union(u) => {
-            let members: Vec<TypeRef> = u.members().collect();
-            members
-                .iter()
-                .map(format_type)
-                .collect::<Vec<_>>()
-                .join(" | ")
+        TypeRef::Union(u) => u
+            .members()
+            .map(|m| format_type(&m, depth))
+            .collect::<Vec<_>>()
+            .join(" | "),
+        TypeRef::Intersection(i) => i
+            .members()
+            .map(|m| format_type(&m, depth))
+            .collect::<Vec<_>>()
+            .join(" & "),
+        TypeRef::Fn(f) => {
+            let mut s = format!("({})", format_params(f.params().as_ref(), depth));
+            s.push_str(" => ");
+            s.push_str(&format_type_opt(f.ret().as_ref(), depth));
+            s
         }
-        TypeRef::Fn(f) => format_fn_type(f),
-        TypeRef::Paren(p) => match p.inner() {
-            Some(inner) => format!("({})", format_type(&inner)),
-            None => "()".to_string(),
-        },
+        TypeRef::Paren(p) => {
+            let inners: Vec<TypeRef> = p.inners().collect();
+            format!(
+                "({})",
+                inners
+                    .iter()
+                    .map(|t| format_type(t, depth))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
     }
 }
 
-fn format_fn_type(f: &FnType) -> String {
-    let mut s = String::from("fn(");
-    s.push_str(&format_params(f.params().as_ref()));
-    s.push(')');
-    let rets = f.returns();
-    if !rets.is_empty() {
-        s.push_str(" -> ");
-        s.push_str(&join_types(&rets));
+fn format_object(obj: &ObjectType, depth: usize) -> String {
+    let members: Vec<Member> = obj.members().collect();
+    if members.is_empty() {
+        return "{}".to_string();
     }
+    let inner_indent = INDENT.repeat(depth + 1);
+    let close_indent = INDENT.repeat(depth);
+    let mut s = String::from("{\n");
+    for m in &members {
+        for c in leading_comments(m.syntax()) {
+            s.push_str(&inner_indent);
+            s.push_str(c.trim_end());
+            s.push('\n');
+        }
+        s.push_str(&inner_indent);
+        match m {
+            Member::Field(f) => {
+                s.push_str(&f.name().unwrap_or_default());
+                if f.optional() {
+                    s.push('?');
+                }
+                s.push_str(": ");
+                s.push_str(&format_type_opt(f.ty().as_ref(), depth + 1));
+            }
+            Member::Method(f) => {
+                s.push_str(&f.name().unwrap_or_default());
+                s.push('(');
+                s.push_str(&format_params(f.params().as_ref(), depth + 1));
+                s.push(')');
+                if let Some(ret) = f.ret() {
+                    s.push_str(": ");
+                    s.push_str(&format_type(&ret, depth + 1));
+                }
+            }
+        }
+        s.push_str(",\n");
+    }
+    for c in trailing_member_comments(obj.syntax()) {
+        s.push_str(&inner_indent);
+        s.push_str(c.trim_end());
+        s.push('\n');
+    }
+    s.push_str(&close_indent);
+    s.push('}');
     s
 }
 
-fn format_params(params: Option<&ParamList>) -> String {
+fn format_params(params: Option<&ParamList>, depth: usize) -> String {
     let Some(params) = params else {
         return String::new();
     };
@@ -213,9 +181,10 @@ fn format_params(params: Option<&ParamList>) -> String {
                 "self".to_string()
             } else {
                 format!(
-                    "{}: {}",
+                    "{}{}: {}",
                     p.name().unwrap_or_default(),
-                    format_type_opt(p.ty().as_ref())
+                    if p.optional() { "?" } else { "" },
+                    format_type_opt(p.ty().as_ref(), depth)
                 )
             }
         })
@@ -223,28 +192,13 @@ fn format_params(params: Option<&ParamList>) -> String {
         .join(", ")
 }
 
-fn join_types(types: &[TypeRef]) -> String {
-    types.iter().map(format_type).collect::<Vec<_>>().join(", ")
-}
-
-fn format_generic_args(args: &GenericArgs) -> String {
-    let parts: Vec<TypeRef> = args.args().collect();
-    format!("<{}>", join_types(&parts))
+fn format_generic_args(args: &GenericArgs, depth: usize) -> String {
+    let parts: Vec<String> = args.args().map(|t| format_type(&t, depth)).collect();
+    format!("<{}>", parts.join(", "))
 }
 
 fn format_generic_params(params: &GenericParams) -> String {
-    let parts: Vec<String> = params
-        .params()
-        .map(|p| {
-            let mut s = p.name().unwrap_or_default();
-            let bounds = p.bounds();
-            if !bounds.is_empty() {
-                s.push_str(": ");
-                s.push_str(&bounds.join(" + "));
-            }
-            s
-        })
-        .collect();
+    let parts: Vec<String> = params.params().filter_map(|p| p.name()).collect();
     format!("<{}>", parts.join(", "))
 }
 
@@ -274,12 +228,12 @@ fn leading_comments(node: &ShapeSyntaxNode) -> Vec<String> {
     out
 }
 
-/// Comment tokens that are direct children of `node` and appear *after* the last
-/// member of `member_kind` (i.e. dangling before the closing brace).
-fn trailing_comments(node: &ShapeSyntaxNode, member_kind: ShapeSyntaxKind) -> Vec<String> {
+/// Comment tokens that are direct children of an object node and appear
+/// *after* its last member (i.e. dangling before the closing brace).
+fn trailing_member_comments(node: &ShapeSyntaxNode) -> Vec<String> {
     let last_end = node
         .children()
-        .filter(|c| c.kind() == member_kind)
+        .filter(|c| matches!(c.kind(), FIELD | METHOD))
         .map(|c| c.text_range().end())
         .max();
     let Some(last_end) = last_end else {
@@ -305,58 +259,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn formats_messy_struct() {
-        let src = "struct   Point{x:number,y:number,label:string?}";
+    fn formats_messy_object() {
+        let src = "type   Point={x:number,y:number,label?:string}";
         let expected = "\
-struct Point {
+type Point = {
     x: number,
     y: number,
-    label: string?,
+    label?: string,
 }
 ";
         assert_eq!(format(src), expected);
     }
 
     #[test]
-    fn empty_struct_stays_inline() {
-        assert_eq!(format("struct  Empty  {  }"), "struct Empty {}\n");
+    fn empty_object_stays_inline() {
+        assert_eq!(format("type  Empty  =  {  }"), "type Empty = {}\n");
     }
 
     #[test]
-    fn open_marker_on_own_line() {
-        let src = "struct Bag{n:number,..}";
+    fn formats_methods_and_intersection() {
+        let src = "export type Drawable=Shape&{draw(self,surface:Surface),id(self):number}";
         let expected = "\
-struct Bag {
-    n: number,
-    ..
+export type Drawable = Shape & {
+    draw(self, surface: Surface),
+    id(self): number,
 }
 ";
         assert_eq!(format(src), expected);
     }
 
     #[test]
-    fn formats_trait_and_impl() {
-        let src = "trait Drawable:Shape+Sized{fn draw(self,surface:Surface);fn id(self)->number;}\nimpl Shape for Circle;";
+    fn formats_generics_aliases_and_fn_types() {
+        let src = "type Handler=(a:A,b:B)=>R\ntype M=Map<string,Point?>\ntype Pair<T,U>={a:T,b:U}";
         let expected = "\
-trait Drawable: Shape + Sized {
-    fn draw(self, surface: Surface);
-    fn id(self) -> number;
-}
+type Handler = (a: A, b: B) => R
 
-impl Shape for Circle;
-";
-        assert_eq!(format(src), expected);
-    }
+type M = Map<string, Point?>
 
-    #[test]
-    fn formats_generics_and_types() {
-        let src = "type Handler=fn(a:A,b:B)->R,E;\ntype M=HashMap<string,Point?>;\nstruct Pair<T:Hash+Eq,U>{a:T,b:U}";
-        let expected = "\
-type Handler = fn(a: A, b: B) -> R, E;
-
-type M = HashMap<string, Point?>;
-
-struct Pair<T: Hash + Eq, U> {
+type Pair<T, U> = {
     a: T,
     b: U,
 }
@@ -365,17 +305,38 @@ struct Pair<T: Hash + Eq, U> {
     }
 
     #[test]
+    fn qualified_reexport_on_one_line() {
+        assert_eq!(
+            format("export   type Canvas=love.graphics.Canvas"),
+            "export type Canvas = love.graphics.Canvas\n"
+        );
+    }
+
+    #[test]
+    fn nested_object_expands_at_nested_indent() {
+        let src = "type A = { inner: { x: number } }";
+        let expected = "\
+type A = {
+    inner: {
+        x: number,
+    },
+}
+";
+        assert_eq!(format(src), expected);
+    }
+
+    #[test]
     fn single_blank_line_between_items() {
-        let src = "use a;\n\n\n\nuse b.c;";
-        assert_eq!(format(src), "use a;\n\nuse b.c;\n");
+        let src = "type A = number\n\n\n\ntype B = string";
+        assert_eq!(format(src), "type A = number\n\ntype B = string\n");
     }
 
     #[test]
     fn doc_comment_stays_with_item() {
-        let src = "/// A point.\nstruct Point{x:number}";
+        let src = "/// A point.\ntype Point={x:number}";
         let expected = "\
 /// A point.
-struct Point {
+type Point = {
     x: number,
 }
 ";
@@ -383,8 +344,8 @@ struct Point {
     }
 
     #[test]
-    fn field_doc_comment_preserved() {
-        let src = "struct P{\n/// the x coord\nx:number,\ny:number}";
+    fn member_doc_comment_preserved() {
+        let src = "type P={\n/// the x coord\nx:number,\ny:number}";
         let out = format(src);
         assert!(out.contains("/// the x coord"), "got: {out}");
         assert!(out.contains("    x: number,"), "got: {out}");
@@ -392,7 +353,7 @@ struct Point {
 
     #[test]
     fn invalid_input_returned_unchanged() {
-        let src = "struct { oops";
+        let src = "type = { oops";
         assert_eq!(format(src), src);
     }
 
@@ -417,30 +378,25 @@ mod proptests {
         .prop_map(String::from)
     }
 
+    fn qualified() -> impl Strategy<Value = String> {
+        prop::collection::vec(ident(), 1..3).prop_map(|p| p.join("."))
+    }
+
     /// A bounded, always-parseable type expression.
     fn ty() -> impl Strategy<Value = String> {
-        ident().prop_recursive(3, 12, 3, |inner| {
+        qualified().prop_recursive(3, 12, 3, |inner| {
             prop_oneof![
                 (ident(), prop::collection::vec(inner.clone(), 1..3))
                     .prop_map(|(n, args)| format!("{n}<{}>", args.join(", "))),
                 inner.clone().prop_map(|t| format!("{t}?")),
-                prop::collection::vec(inner, 2..3).prop_map(|m| m.join(" | ")),
+                prop::collection::vec(inner.clone(), 2..3).prop_map(|m| m.join(" | ")),
+                prop::collection::vec(inner, 2..3).prop_map(|m| m.join(" & ")),
             ]
         })
     }
 
     fn generic_params() -> impl Strategy<Value = String> {
-        prop::collection::vec(
-            (ident(), prop::collection::vec(ident(), 0..2)).prop_map(|(n, bounds)| {
-                if bounds.is_empty() {
-                    n
-                } else {
-                    format!("{n}: {}", bounds.join(" + "))
-                }
-            }),
-            0..3,
-        )
-        .prop_map(|ps| {
+        prop::collection::vec(ident(), 0..3).prop_map(|ps| {
             if ps.is_empty() {
                 String::new()
             } else {
@@ -450,27 +406,8 @@ mod proptests {
     }
 
     fn field() -> impl Strategy<Value = String> {
-        (ident(), ty()).prop_map(|(n, t)| format!("{n}: {t}"))
-    }
-
-    fn struct_item() -> impl Strategy<Value = String> {
-        (
-            ident(),
-            generic_params(),
-            prop::collection::vec(field(), 0..4),
-            any::<bool>(),
-        )
-            .prop_map(|(n, g, fields, open)| {
-                let mut body = fields.join(", ");
-                if open {
-                    if body.is_empty() {
-                        body.push_str("..");
-                    } else {
-                        body.push_str(", ..");
-                    }
-                }
-                format!("struct {n}{g} {{ {body} }}")
-            })
+        (ident(), any::<bool>(), ty())
+            .prop_map(|(n, opt, t)| format!("{n}{}: {t}", if opt { "?" } else { "" }))
     }
 
     fn param() -> impl Strategy<Value = String> {
@@ -480,46 +417,37 @@ mod proptests {
         ]
     }
 
-    fn trait_fn() -> impl Strategy<Value = String> {
+    fn method() -> impl Strategy<Value = String> {
         (
             ident(),
             prop::collection::vec(param(), 0..3),
-            prop::collection::vec(ty(), 0..3),
+            prop::option::of(ty()),
         )
-            .prop_map(|(n, params, rets)| {
-                let ret = if rets.is_empty() {
-                    String::new()
-                } else {
-                    format!(" -> {}", rets.join(", "))
-                };
-                format!("fn {n}({}){ret};", params.join(", "))
+            .prop_map(|(n, params, ret)| {
+                let ret = ret.map(|r| format!(": {r}")).unwrap_or_default();
+                format!("{n}({}){ret}", params.join(", "))
             })
     }
 
-    fn trait_item() -> impl Strategy<Value = String> {
-        (
-            ident(),
-            prop::collection::vec(ident(), 0..2),
-            prop::collection::vec(trait_fn(), 0..3),
-        )
-            .prop_map(|(n, supers, fns)| {
-                let sup = if supers.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {}", supers.join(" + "))
-                };
-                format!("trait {n}{sup} {{ {} }}", fns.join(" "))
-            })
+    fn object() -> impl Strategy<Value = String> {
+        prop::collection::vec(prop_oneof![field(), method()], 0..4)
+            .prop_map(|ms| format!("{{ {} }}", ms.join(", ")))
     }
 
     fn item() -> impl Strategy<Value = String> {
-        prop_oneof![
-            struct_item(),
-            trait_item(),
-            (ident(), ident()).prop_map(|(a, b)| format!("impl {a} for {b};")),
-            (ident(), generic_params(), ty()).prop_map(|(n, g, t)| format!("type {n}{g} = {t};")),
-            prop::collection::vec(ident(), 1..3).prop_map(|p| format!("use {};", p.join("."))),
-        ]
+        (
+            any::<bool>(),
+            ident(),
+            generic_params(),
+            prop_oneof![
+                ty(),
+                object(),
+                (ty(), object()).prop_map(|(t, o)| format!("{t} & {o}"))
+            ],
+        )
+            .prop_map(|(exp, n, g, rhs)| {
+                format!("{}type {n}{g} = {rhs}", if exp { "export " } else { "" })
+            })
     }
 
     fn shape_file() -> impl Strategy<Value = String> {

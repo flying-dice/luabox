@@ -1,8 +1,8 @@
 //! Token/node vocabulary for the `.luab` shape grammar — deliberately its own
-//! kind space, disjoint from [`crate::lua::SyntaxKind`] (SHAPES.md §9).
+//! kind space, disjoint from [`crate::lua::SyntaxKind`] (SHAPES-V2.md).
 
 syntax_kinds! {
-    /// Every token and node kind in the `.luab` grammar (SHAPES.md §3).
+    /// Every token and node kind in the `.luab` grammar (SHAPES-V2.md).
     ///
     /// The numbering is not stable across versions — never persist it.
     ShapeSyntaxKind {
@@ -11,58 +11,57 @@ syntax_kinds! {
         /// `//` line comment or `/* ... */` block comment (nesting allowed).
         COMMENT,
         /// `///` doc comment — trivia in the tree, but harvested for hover
-        /// and `luabox doc` (SHAPES.md §2).
+        /// and `luabox doc`.
         DOC_COMMENT,
 
         // === Names ===
         IDENT,
 
         // === Keywords ===
-        STRUCT_KW, TRAIT_KW, IMPL_KW, FOR_KW, FN_KW, SELF_KW, TYPE_KW, USE_KW,
+        TYPE_KW, EXPORT_KW, SELF_KW,
 
         // === Symbols ===
         L_BRACE, R_BRACE, L_PAREN, R_PAREN, L_ANGLE, R_ANGLE,
-        COLON, SEMICOLON, COMMA, QUESTION, PIPE, PLUS, EQ,
-        /// `->` return-type arrow.
-        ARROW,
-        DOT,
-        /// `..` open-shape marker.
-        DOT_DOT,
+        COLON, COMMA, QUESTION, PIPE, AMP, EQ, DOT,
+        /// `=>` function-type arrow.
+        FAT_ARROW,
 
         /// Byte(s) no rule matched, or an unterminated block-comment tail.
         ERROR,
 
-        // === Nodes (parser output; grows as the grammar lands) ===
+        // === Nodes ===
         SHAPE_FILE,
-        STRUCT_DEF,
-        TRAIT_DEF,
-        IMPL_DEF,
-        TYPE_ALIAS,
-        USE_DECL,
-        FIELD,
-        /// The `..` open marker inside a struct body.
-        OPEN_MARKER,
-        SUPERTRAITS,
-        TRAIT_FN,
-        PARAM_LIST,
-        PARAM,
+        /// `export? type Name<T, ...> = <type-expr>` — the only item form.
+        TYPE_DEF,
         GENERIC_PARAMS,
-        /// One `T: Bound + Bound2` (or bare `T`) inside [`Self::GENERIC_PARAMS`].
+        /// One bare `T` inside [`Self::GENERIC_PARAMS`] (no bounds in v2 —
+        /// generics are checked structurally at instantiation).
         GENERIC_PARAM,
         GENERIC_ARGS,
-        /// A named/generic type reference: `IDENT generic_args?`
-        /// (`number`, `Vec<T>`, `HashMap<K, V>`).
+        /// A (possibly dotted) named type reference with optional args:
+        /// `number`, `geometry.Point`, `Pair<T>`, `love.graphics.Canvas`.
         TYPE_REF,
+        /// An object type: `{ member, ... }`.
+        OBJECT_TYPE,
+        /// A data member inside an object type: `name?: type`.
+        FIELD,
+        /// A method member inside an object type:
+        /// `name(self?, params...) (":" ret)?`. A `self` first parameter
+        /// marks the member as receiver-taking (`:` definition side).
+        METHOD,
+        PARAM_LIST,
+        PARAM,
+        /// A function type: `"(" params? ")" "=>" ret`.
+        FN_TYPE,
         /// A nil-union postfix type: `<inner> "?"`.
         OPTIONAL_TYPE,
         /// A union type: `<inner> ("|" <inner>)+`.
         UNION_TYPE,
-        /// A function type: `"fn" "(" params? ")" ("->" ret)?`.
-        FN_TYPE,
-        /// A parenthesised type: `"(" type ")"`.
+        /// An intersection type: `<inner> ("&" <inner>)+`.
+        INTERSECTION_TYPE,
+        /// A parenthesised type: `"(" type ")"`. With commas it is a
+        /// multi-return list, legal only in return position: `(a, b)`.
         PAREN_TYPE,
-        /// A return clause: `"->" type ("," type)*` (multi-return).
-        RET_TYPE,
         ERROR_NODE,
     }
 }

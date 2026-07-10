@@ -36,7 +36,7 @@ const PACKAGE_KEYS: &[&str] = &[
     "min-luabox-version",
 ];
 const BUILD_KEYS: &[&str] = &["target", "out", "mode"];
-const TYPES_KEYS: &[&str] = &["strict", "defs", "shape-paths", "shapes"];
+const TYPES_KEYS: &[&str] = &["strict", "defs", "shape-paths", "entry"];
 const WORKSPACE_KEYS: &[&str] = &["members"];
 const DEPENDENCY_KEYS: &[&str] = &[
     "git",
@@ -452,7 +452,7 @@ fn parse_types(root: &Table, errors: &mut Vec<ManifestError>) -> Types {
         strict: get_bool(table, "types", "strict", false, errors),
         defs: get_string_array(table, "types", "defs", errors),
         shape_paths: get_string_array(table, "types", "shape-paths", errors),
-        shapes: get_string_array(table, "types", "shapes", errors),
+        entry: get_string(table, "types", "entry", false, errors),
     }
 }
 

@@ -253,156 +253,176 @@ fn write_file(world: &AcceptanceWorld, rel: &str, content: &str) {
     std::fs::write(&full, content).unwrap_or_else(|e| panic!("cannot write `{rel}`: {e}"));
 }
 
+/// The manifest every step-built shape fixture shares: strict types (so
+/// positional conformance errors are hard) and `shapes/` as the ambient
+/// shape path (SHAPES-V2.md — the scope is ambient, there are no imports).
+fn ensure_shape_manifest(world: &AcceptanceWorld) {
+    if world.dir.path().join("luabox.toml").is_file() {
+        return;
+    }
+    write_file(
+        world,
+        "luabox.toml",
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n\n\
+         [types]\nstrict = true\nshape-paths = [\"shapes\"]\n",
+    );
+}
+
 #[given(regex = r#"^a shape module "(\w+)" declaring (.+)$"#)]
 fn shape_module_declaring(world: &mut AcceptanceWorld, name: String, decl: String) {
-    write_file(world, &format!("src/{name}.luab"), &format!("{decl}\n"));
+    ensure_shape_manifest(world);
+    write_file(world, &format!("shapes/{name}.luab"), &format!("{decl}\n"));
 }
 
-#[given(regex = r"^a Lua file binding a table (\{.*\}) with ---@struct (\w+)$")]
-fn lua_file_binding_table(world: &mut AcceptanceWorld, table: String, struct_name: String) {
-    let source = format!("---@use geometry\n\n---@struct {struct_name}\nlocal value = {table}\n");
+#[given(regex = r"^a Lua file binding a table (\{.*\}) with ---@type ([\w.]+)$")]
+fn lua_file_binding_table(world: &mut AcceptanceWorld, table: String, type_name: String) {
+    ensure_shape_manifest(world);
+    let source = format!("---@type {type_name}\nlocal value = {table}\nreturn value\n");
     write_file(world, "src/main.lua", &source);
 }
 
-#[given(regex = r"^trait Shape with fns (\w+) and (\w+)$")]
-fn trait_shape_with_fns(world: &mut AcceptanceWorld, first: String, second: String) {
+#[given(regex = r"^type Shape with methods (\w+) and (\w+)$")]
+fn type_shape_with_methods(world: &mut AcceptanceWorld, first: String, second: String) {
+    ensure_shape_manifest(world);
     let module = format!(
-        "struct Circle {{ }}\n\
-         trait Shape {{\n    fn {first}(self) -> number;\n    fn {second}(self) -> number;\n}}\n"
+        "export type Shape = {{\n    {first}(self): number,\n    {second}(self): number,\n}}\n"
     );
-    write_file(world, "src/geometry.luab", &module);
+    write_file(world, "shapes/geometry.luab", &module);
 }
 
-#[given(regex = r"^trait Shape with fn area\(self\) -> number$")]
-fn trait_shape_with_area(world: &mut AcceptanceWorld) {
+#[given(regex = r#"^type Drawable = Shape & draw in "geometry\.luab"$"#)]
+fn type_drawable_intersection(world: &mut AcceptanceWorld) {
+    ensure_shape_manifest(world);
     write_file(
         world,
-        "src/geometry.luab",
-        "struct Circle { }\ntrait Shape {\n    fn area(self) -> number;\n}\n",
+        "shapes/geometry.luab",
+        "export type Shape = {\n    area(self): number,\n    perimeter(self): number,\n}\n\
+         export type Drawable = Shape & { draw(self): string }\n",
     );
 }
 
-#[given(regex = r#"^trait Drawable: Shape in "geometry\.luab"$"#)]
-fn trait_drawable_supertrait(world: &mut AcceptanceWorld) {
+#[given(regex = r#"^type Shape in "geometry\.luab"$"#)]
+fn type_shape_in_geometry(world: &mut AcceptanceWorld) {
+    ensure_shape_manifest(world);
     write_file(
         world,
-        "src/geometry.luab",
-        "struct Circle { }\n\
-         trait Shape {\n    fn area(self) -> number;\n}\n\
-         trait Drawable: Shape {\n    fn draw(self);\n}\n",
+        "shapes/geometry.luab",
+        "export type Shape = {\n    area(self): number,\n}\n",
     );
 }
 
-#[given(regex = r#"^trait Shape in "geometry\.luab"$"#)]
-fn trait_shape_in_geometry(world: &mut AcceptanceWorld) {
+#[given(regex = r#"^type Point in "geometry\.luab"$"#)]
+fn type_point_in_geometry(world: &mut AcceptanceWorld) {
+    ensure_shape_manifest(world);
     write_file(
         world,
-        "src/geometry.luab",
-        "trait Shape {\n    fn area(self) -> number;\n}\n",
+        "shapes/geometry.luab",
+        "type Point = { x: number, y: number }\n",
     );
 }
 
-#[given(regex = r#"^struct Point in "geometry\.luab"$"#)]
-fn struct_point_in_geometry(world: &mut AcceptanceWorld) {
+/// A carrier class table with the given `:`-methods, positionally asserted
+/// against `asserted` via a `---@type` binding — the v2 idiom for a local
+/// conformance check (SHAPES-V2.md: the general mechanism covers the
+/// special case; no dedicated tag exists).
+fn carrier_asserted(methods: &[&str], asserted: &str) -> String {
+    use std::fmt::Write as _;
+    let mut src = String::from("local Circle = {}\nCircle.__index = Circle\n");
+    for m in methods {
+        let _ = write!(
+            src,
+            "\n---@return number\nfunction Circle:{m}()\n  return 1\nend\n"
+        );
+    }
+    let _ = write!(src, "\n---@type {asserted}\nlocal s = Circle\nreturn s\n");
+    src
+}
+
+#[given(regex = r"^a carrier table defining only (\w+) asserted as ([\w.]+)$")]
+fn carrier_defining_only(world: &mut AcceptanceWorld, only: String, asserted: String) {
+    ensure_shape_manifest(world);
     write_file(
         world,
-        "src/geometry.luab",
-        "struct Point { x: number, y: number }\n",
+        "src/main.lua",
+        &carrier_asserted(&[&only], &asserted),
     );
 }
 
-/// The common carrier preamble: `---@struct Circle` bound to a class table.
-const CARRIER_PREAMBLE: &str = "\
----@use geometry
-
----@struct Circle
-local Circle = {}
-Circle.__index = Circle
-";
-
-#[given(regex = r"^a carrier table with ---@impl Shape for Circle defining only (\w+)$")]
-fn carrier_defining_only(world: &mut AcceptanceWorld, only: String) {
-    let source = format!(
-        "{CARRIER_PREAMBLE}\n---@impl Shape for Circle\nfunction Circle:{only}()\n  return 1\nend\n"
+#[given(regex = r"^a carrier table defining (\w+) and (\w+) asserted as ([\w.]+)$")]
+fn carrier_defining_two(
+    world: &mut AcceptanceWorld,
+    first: String,
+    second: String,
+    asserted: String,
+) {
+    ensure_shape_manifest(world);
+    write_file(
+        world,
+        "src/main.lua",
+        &carrier_asserted(&[&first, &second], &asserted),
     );
-    write_file(world, "src/main.lua", &source);
 }
 
-#[given("a carrier table with ---@impl Shape for Circle whose area returns a string")]
-fn carrier_area_returns_string(world: &mut AcceptanceWorld) {
-    let source = format!(
-        "{CARRIER_PREAMBLE}\n\
-         ---@impl Shape for Circle\n\
-         ---@return string\n\
-         function Circle:area()\n  return \"round\"\nend\n"
+#[given(
+    regex = r"^a carrier table defining (\w+), (\w+) and an inherent helper asserted as ([\w.]+)$"
+)]
+fn carrier_with_inherent_helper(
+    world: &mut AcceptanceWorld,
+    first: String,
+    second: String,
+    asserted: String,
+) {
+    ensure_shape_manifest(world);
+    write_file(
+        world,
+        "src/main.lua",
+        &carrier_asserted(&[&first, &second, "helper"], &asserted),
     );
-    write_file(world, "src/main.lua", &source);
 }
 
-#[given("a carrier table with ---@impl Drawable for Circle but no Shape impl")]
-fn carrier_drawable_without_shape(world: &mut AcceptanceWorld) {
-    let source =
-        format!("{CARRIER_PREAMBLE}\n---@impl Drawable for Circle\nfunction Circle:draw()\nend\n");
-    write_file(world, "src/main.lua", &source);
-}
-
-#[given("a carrier table with ---@impl Shape for Circle defining area and an inherent helper")]
-fn carrier_with_inherent_helper(world: &mut AcceptanceWorld) {
-    let source = format!(
-        "{CARRIER_PREAMBLE}\n\
-         ---@impl Shape for Circle\n\
-         function Circle:area()\n  return 1\nend\n\
-         \n\
-         function Circle:helper()\n  return 2\nend\n"
-    );
-    write_file(world, "src/main.lua", &source);
-}
-
-#[given("a ---@class annotated table with ---@impl Shape for Square")]
-fn class_table_with_impl(world: &mut AcceptanceWorld) {
+#[given("a ---@class annotated table asserted as geometry.Shape")]
+fn class_table_asserted(world: &mut AcceptanceWorld) {
+    ensure_shape_manifest(world);
     let source = "\
----@use geometry
-
 ---@class Square
 ---@field side number
 local Square = {}
 Square.__index = Square
 
----@impl Shape for Square
+---@return number
 function Square:area()
   return self.side * self.side
 end
+
+---@type geometry.Shape
+local s = Square
+return s
 ";
     write_file(world, "src/main.lua", source);
 }
 
-#[given("a Lua function annotated ---@param p Point reading p.x")]
+#[given("a Lua function annotated ---@param p geometry.Point reading p.x")]
 fn lua_function_reading_point(world: &mut AcceptanceWorld) {
+    ensure_shape_manifest(world);
     let source = "\
----@use geometry
-
----@param p Point
+---@param p geometry.Point
 ---@return number
 local function get_x(p)
   return p.x
 end
 
-get_x({ x = 1, y = 2 })
+return get_x({ x = 1, y = 2 })
 ";
     write_file(world, "src/main.lua", source);
 }
 
-#[given("a Lua file with ---@use missing_module")]
-fn lua_file_with_missing_use(world: &mut AcceptanceWorld) {
-    write_file(world, "src/main.lua", "---@use missing_module\n");
-}
-
-#[given("a shape module containing a fn with a body")]
+#[given("a shape module containing a method with a body")]
 fn shape_module_with_body(world: &mut AcceptanceWorld) {
+    ensure_shape_manifest(world);
     write_file(
         world,
-        "src/bad.luab",
-        "trait Shape {\n    fn area(self) -> number { return 1 }\n}\n",
+        "shapes/bad.luab",
+        "type Shape = {\n    area(self): number { return 1 },\n}\n",
     );
 }
 

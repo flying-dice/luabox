@@ -67,7 +67,7 @@ mod tests {
         assert!(manifest.types.strict);
         assert_eq!(manifest.types.defs, vec!["love2d".to_owned()]);
         assert_eq!(manifest.types.shape_paths, vec!["shapes/".to_owned()]);
-        assert!(manifest.types.shapes.is_empty());
+        assert!(manifest.types.entry.is_none());
 
         assert_eq!(
             manifest.dependencies.get("penlight"),

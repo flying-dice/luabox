@@ -1,27 +1,30 @@
-Feature: Trait coherence
-  SHAPES.md §5 — ---@impl enforces completeness and signature compatibility;
-  supertraits must be conformed on the same carrier.
+Feature: Positional structural conformance
+  SHAPES-V2.md — there is no conformance tag. A value is a `geometry.Shape`
+  exactly where one is demanded; the assignability error names the missing
+  or mismatched members. Intersection types require every merged member.
 
-  Scenario: incomplete impl rejected
-    Given trait Shape with fns area and perimeter
-    And a carrier table with ---@impl Shape for Circle defining only area
+  Scenario: carrier with all methods conforms
+    Given type Shape with methods area and perimeter
+    And a carrier table defining area and perimeter asserted as geometry.Shape
     When I run "luabox check"
-    Then diagnostic LB2003 is reported listing "perimeter"
+    Then zero diagnostics are reported
 
-  Scenario: impl signature mismatch rejected
-    Given trait Shape with fn area(self) -> number
-    And a carrier table with ---@impl Shape for Circle whose area returns a string
+  Scenario: missing method diagnosed positionally, naming the member
+    Given type Shape with methods area and perimeter
+    And a carrier table defining only area asserted as geometry.Shape
     When I run "luabox check"
-    Then diagnostic LB2004 is reported with both spans
+    Then diagnostic LB0300 is reported listing "perimeter"
+    And the command fails
 
-  Scenario: supertrait conformance required
-    Given trait Drawable: Shape in "geometry.luab"
-    And a carrier table with ---@impl Drawable for Circle but no Shape impl
+  Scenario: intersection requires members from every part
+    Given type Drawable = Shape & draw in "geometry.luab"
+    And a carrier table defining area and perimeter asserted as geometry.Drawable
     When I run "luabox check"
-    Then diagnostic LB2008 is reported
+    Then diagnostic LB0300 is reported listing "draw"
+    And the command fails
 
   Scenario: extra inherent methods are fine
-    Given trait Shape with fn area(self) -> number
-    And a carrier table with ---@impl Shape for Circle defining area and an inherent helper
+    Given type Shape with methods area and perimeter
+    And a carrier table defining area, perimeter and an inherent helper asserted as geometry.Shape
     When I run "luabox check"
-    Then zero shape diagnostics are reported
+    Then zero diagnostics are reported

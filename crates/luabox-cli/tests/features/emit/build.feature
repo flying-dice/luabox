@@ -55,7 +55,7 @@ Feature: luabox build — target lowering emit
       """
     And a file "src/geometry.luab" containing:
       """
-      struct Point { x: number, y: number }
+      type Point = { x: number, y: number }
       """
     When I run "luabox build"
     Then the command succeeds

@@ -84,7 +84,9 @@ pub fn outgoing_calls(db: &dyn Db, file: SourceFile) -> OutgoingCalls {
     let parsed = parse(db, file);
     let name = display(db, file);
     let ambient = stdlib_defs(file.dialect(db));
-    OutgoingCalls::new(infer_display_types(parsed.parse(), &name, Some(ambient), None).outgoing_calls)
+    OutgoingCalls::new(
+        infer_display_types(parsed.parse(), &name, Some(ambient), None).outgoing_calls,
+    )
 }
 
 /// The inferred module export of one file (the chunk's `return` value),
