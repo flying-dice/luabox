@@ -38,6 +38,8 @@ Release-needed:
   Registry story for 0.1 (path/git/luarocks/`file://` vs hosted)
 - [#102](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/102)
   Distribute the editor integrations
+- [#103](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/103)
+  `undefined-global` diagnostic (typo'd/unknown global reads)
 
 ## Ready
 
@@ -64,3 +66,5 @@ _None open — the SHAPES-V2 checker-quality and LSP waves are landed
   Strictness for un-shaped LuaCATS code (SPEC §19)
 - [#91](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/91)
   SHAPES-V2 housekeeping (cache key, Zed rev, watch.rs, completion gating)
+- [#104](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/104)
+  Typing globals from the `.luab` surface (or document defs as the mechanism)
