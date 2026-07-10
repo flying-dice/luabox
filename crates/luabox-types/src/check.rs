@@ -451,6 +451,10 @@ impl Checker<'_> {
         if let Some(func) = self.env.function(name) {
             return Ty::Function(Box::new(func.clone()));
         }
+        // Ambient module tables / scalar globals (`math`, `_VERSION`, ...).
+        if let Some(ty) = self.env.global_type(name) {
+            return ty.clone();
+        }
         Ty::Unknown
     }
 
@@ -553,6 +557,41 @@ impl Checker<'_> {
 
     // --- rule a: call sites ---------------------------------------------
 
+    /// Whether `sig` accepts this argument list — a non-reporting predicate
+    /// used to resolve `---@overload` candidates. Mirrors the arity and
+    /// per-slot assignability rules of [`Checker::check_call`] without
+    /// emitting diagnostics.
+    fn call_accepts(&self, sig: &FunctionTy, slots: &[Slot], open_ended: bool) -> bool {
+        let supplied = slots.len();
+        if supplied < sig.required_params() && !open_ended {
+            return false;
+        }
+        if supplied > sig.params.len() && sig.varargs.is_none() {
+            return false;
+        }
+        for (i, slot) in slots.iter().enumerate() {
+            let expected = if let Some(param) = sig.params.get(i) {
+                if param.optional {
+                    param.ty.clone().optional()
+                } else {
+                    param.ty.clone()
+                }
+            } else if let Some(varargs) = &sig.varargs {
+                varargs.clone()
+            } else {
+                continue;
+            };
+            let found = match slot {
+                Slot::Expr(expr) => self.expr_ty(expr),
+                Slot::Ty(ty, _) => ty.clone(),
+            };
+            if !self.assignable(&found, &expected) {
+                return false;
+            }
+        }
+        true
+    }
+
     fn check_call(&mut self, call: &CallExpr) {
         let Some(sig) = call.callee().and_then(|c| self.callee_sig(&c)) else {
             return;
@@ -562,6 +601,20 @@ impl Checker<'_> {
             slots.push(Slot::Ty(ty, range));
         }
         let open_ended = self.expand_last(&mut slots);
+
+        // Overloaded stdlib functions (e.g. `tonumber`, `table.insert`): a
+        // call is accepted when it matches the primary signature *or* any
+        // `---@overload`. Only when none match do we report against the
+        // primary (TODO(P1): pick and report the closest overload).
+        if !sig.overloads.is_empty()
+            && (self.call_accepts(&sig, &slots, open_ended)
+                || sig
+                    .overloads
+                    .iter()
+                    .any(|o| self.call_accepts(o, &slots, open_ended)))
+        {
+            return;
+        }
 
         let supplied = slots.len();
         let required = sig.required_params();

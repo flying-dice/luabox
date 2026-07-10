@@ -463,6 +463,7 @@ impl Infer<'_> {
             returns,
             returns_vararg: false,
             has_return_annotation: false,
+            overloads: Vec::new(),
         }
     }
 
@@ -1379,7 +1380,10 @@ impl Infer<'_> {
                     Some(ity) => ity.clone(),
                     None => match self.env.function(&name) {
                         Some(sig) => ITy::Ty(Ty::Function(Box::new(sig.clone()))),
-                        None => ITy::unknown(),
+                        None => match self.env.global_type(&name) {
+                            Some(ty) => ITy::Ty(ty.clone()),
+                            None => ITy::unknown(),
+                        },
                     },
                 },
             },

@@ -1,5 +1,5 @@
-//! `luabox check [--target <t>] [--format <f>]` — the CI-grade standalone
-//! typecheck (SPEC.md §3, §4, §14).
+//! `luabox check [--target <t>] [--format <f>] [--watch]` — the CI-grade
+//! standalone typecheck (SPEC.md §3, §4, §14).
 //!
 //! Per `.lua` file, three passes over one parse:
 //!
@@ -25,6 +25,10 @@
 //! warnings in K files` summary goes to stderr. The exit code is nonzero
 //! iff any Error-severity diagnostic was produced — warnings never fail
 //! the command.
+//!
+//! `--watch` (SPEC.md §4) turns this into a long-running rerun-on-change
+//! loop instead of a one-shot check — see `crate::watch` for the debounce
+//! and filtering rules.
 
 use std::collections::HashSet;
 use std::fs;
@@ -34,11 +38,37 @@ use anyhow::{Context, bail};
 use luabox_diag::{Code, Diagnostic, Format, Label, Severity, Span, render};
 use luabox_resolve::manifest::Manifest;
 use luabox_syntax::{Dialect, lua};
-use luabox_types::{ShapeOptions, ShapeStore, Strictness};
+use luabox_types::{Ambient, ShapeOptions, ShapeStore, Strictness, combined_defs, stdlib_defs};
 use rayon::prelude::*;
 
-/// Execute `luabox check` from `cwd`.
-pub fn run(cwd: &Path, target: Option<&str>, format: &str) -> anyhow::Result<()> {
+/// Execute `luabox check` from `cwd`. With `watch`, the check reruns on
+/// every debounced, filtered filesystem change under the project root
+/// (`crate::watch`) until interrupted (Ctrl-C); a failing rerun is
+/// reported but does not stop the watcher, so in watch mode this function
+/// only returns on setup failure (e.g. the watch root can't be observed).
+/// Without `watch` it runs once and its `Result` becomes the process exit
+/// code, as before.
+pub fn run(cwd: &Path, target: Option<&str>, format: &str, watch: bool) -> anyhow::Result<()> {
+    if watch {
+        // Discover once up front purely to get a root/out-dir to watch;
+        // `run_once` rediscovers the project fresh on every rerun, so a
+        // manifest edit (edition, strictness, shape paths) takes effect
+        // on the very next rerun without any extra plumbing here.
+        let project = discover(cwd)?;
+        let cwd = cwd.to_path_buf();
+        let target = target.map(str::to_owned);
+        let format = format.to_owned();
+        return crate::watch::run(&project.root, project.out_dir.as_deref(), move || {
+            run_once(&cwd, target.as_deref(), &format)
+        });
+    }
+    run_once(cwd, target, format)
+}
+
+/// The single-pass body of `luabox check`: discover the project, typecheck
+/// every file, and translate the diagnostics into an exit code. Shared by
+/// one-shot `run` and each rerun of `run` in `--watch` mode.
+fn run_once(cwd: &Path, target: Option<&str>, format: &str) -> anyhow::Result<()> {
     let format = parse_format(format)?;
     let project = discover(cwd)?;
 
@@ -57,6 +87,20 @@ pub fn run(cwd: &Path, target: Option<&str>, format: &str) -> anyhow::Result<()>
     }
 
     let (lua_files, lb_files) = collect_files(&project)?;
+    // Definition packages (SPEC.md §3): the dialect stdlib layer, plus any
+    // project-local `[types] defs` resolved from `<root>/defs/`. Built once
+    // and shared by reference across the rayon workers; the stdlib-only case
+    // reuses a process-lifetime cache (perf gate: paid once).
+    let (def_sources, def_diags) = resolve_project_defs(&project.root, &project.defs);
+    let ambient_owned: Option<Ambient> = if project.defs.is_empty() {
+        None
+    } else {
+        Some(combined_defs(project.dialect, &def_sources))
+    };
+    let ambient: &Ambient = ambient_owned
+        .as_ref()
+        .unwrap_or_else(|| stdlib_defs(project.dialect));
+
     // Shape modules are parsed once and cached across workers.
     let store = ShapeStore::new(project.root.clone());
     // SPEC.md §16: rayon per-module. Files are independent (cross-file
@@ -75,6 +119,7 @@ pub fn run(cwd: &Path, target: Option<&str>, format: &str) -> anyhow::Result<()>
                 &project,
                 target_dialect,
                 &store,
+                ambient,
                 &mut diags,
             );
             Ok(diags)
@@ -91,7 +136,7 @@ pub fn run(cwd: &Path, target: Option<&str>, format: &str) -> anyhow::Result<()>
             Ok(store.check_lb_file(path, &source, &project.shape_paths))
         })
         .collect();
-    let mut diags: Vec<Diagnostic> = Vec::new();
+    let mut diags: Vec<Diagnostic> = def_diags;
     for result in per_file.into_iter().chain(per_lb) {
         diags.extend(result?);
     }
@@ -113,6 +158,7 @@ fn check_one(
     project: &Project,
     target: Option<Dialect>,
     store: &ShapeStore,
+    ambient: &Ambient,
     diags: &mut Vec<Diagnostic>,
 ) {
     let parse = lua::parse(source, project.dialect);
@@ -169,6 +215,7 @@ fn check_one(
         rel,
         project.strictness,
         Some(&opts),
+        Some(ambient),
     ));
 }
 
@@ -227,6 +274,9 @@ struct Project {
     out_dir: Option<PathBuf>,
     /// `[types] shape-paths`, absolute, in manifest order (SHAPES.md §6).
     shape_paths: Vec<PathBuf>,
+    /// `[types] defs`, ambient definition packages resolved from the
+    /// project-local `defs/` directory (SPEC.md §3, §5).
+    defs: Vec<String>,
 }
 
 /// Find the project: nearest `luabox.toml` walking up from `cwd`
@@ -265,6 +315,7 @@ fn discover(cwd: &Path) -> anyhow::Result<Project> {
                     .iter()
                     .map(|p| current.join(p))
                     .collect(),
+                defs: manifest.types.defs.clone(),
             });
         }
         dir = current.parent();
@@ -275,7 +326,74 @@ fn discover(cwd: &Path) -> anyhow::Result<Project> {
         strictness: Strictness::Warn,
         out_dir: None,
         shape_paths: Vec::new(),
+        defs: Vec::new(),
     })
+}
+
+/// Resolve `[types] defs` entries against the project-local `defs/`
+/// directory: each name loads `defs/<name>.d.lua` or every `*.d.lua` under
+/// `defs/<name>/` (SPEC.md §3 — registry-distributed packages are P2+).
+/// Returns the concatenated sources plus a diagnostic per unresolvable entry.
+fn resolve_project_defs(root: &Path, names: &[String]) -> (Vec<String>, Vec<Diagnostic>) {
+    let mut sources = Vec::new();
+    let mut diags = Vec::new();
+    let defs_dir = root.join("defs");
+    for name in names {
+        let single = defs_dir.join(format!("{name}.d.lua"));
+        let dir = defs_dir.join(name);
+        let mut found = false;
+        if single.is_file()
+            && let Ok(text) = fs::read_to_string(&single)
+        {
+            sources.push(text);
+            found = true;
+        }
+        if dir.is_dir() {
+            let mut files = Vec::new();
+            collect_d_lua(&dir, &mut files);
+            files.sort();
+            for file in files {
+                if let Ok(text) = fs::read_to_string(&file) {
+                    sources.push(text);
+                    found = true;
+                }
+            }
+        }
+        if !found {
+            diags.push(
+                Diagnostic::error(
+                    code(1002),
+                    format!(
+                        "cannot resolve definition package `{name}` from `[types] defs`"
+                    ),
+                )
+                .with_note(format!(
+                    "expected `defs/{name}.d.lua` or a `defs/{name}/` directory of `*.d.lua` files under the project root"
+                )),
+            );
+        }
+    }
+    (sources, diags)
+}
+
+/// Collect every `*.d.lua` file under `dir`, recursively.
+fn collect_d_lua(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_d_lua(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("lua")
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".d.lua"))
+        {
+            out.push(path);
+        }
+    }
 }
 
 /// All `*.lua` and `*.lb` files under the project root, deterministic
@@ -307,8 +425,12 @@ fn walk(
                 walk(&path, project, lua, lb)?;
             }
         } else if !hidden {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
             match path.extension().and_then(|e| e.to_str()) {
-                Some("lua") => lua.push(path),
+                // `*.d.lua` are `---@meta` definition files (ambient type
+                // surfaces), never checked as project source.
+                Some("lua") if !name.ends_with(".d.lua") => lua.push(path),
                 Some("lb") => lb.push(path),
                 _ => {}
             }

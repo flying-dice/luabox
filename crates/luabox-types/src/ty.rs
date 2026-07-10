@@ -105,6 +105,11 @@ pub struct FunctionTy {
     /// Whether any `---@return` was written. Without one, return
     /// statements are not checked and calls evaluate to `unknown`.
     pub has_return_annotation: bool,
+    /// Additional `---@overload fun(...)` signatures. A call is accepted
+    /// when it matches this primary signature *or* any overload; the
+    /// primary governs the inferred result type (TODO(P1): pick the
+    /// matching overload's return).
+    pub overloads: Vec<FunctionTy>,
 }
 
 impl FunctionTy {

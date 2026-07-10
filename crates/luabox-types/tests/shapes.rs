@@ -49,7 +49,7 @@ impl Fixture {
             file_dir: &file_dir,
             shape_paths: &self.shape_paths,
         };
-        check_file_shaped(&parsed, "src/main.lua", strictness, Some(&opts))
+        check_file_shaped(&parsed, "src/main.lua", strictness, Some(&opts), None)
     }
 
     fn check(&self, source: &str) -> Vec<Diagnostic> {

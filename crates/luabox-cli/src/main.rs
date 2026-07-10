@@ -8,6 +8,7 @@ mod fmt_cmd;
 mod lint_cmd;
 mod lsp_cmd;
 mod scaffold;
+mod watch;
 
 use std::path::PathBuf;
 
@@ -71,6 +72,10 @@ enum Command {
         /// Output format: human, json, sarif, github, gitlab
         #[arg(long, default_value = "human")]
         format: String,
+        /// Rerun on every source/manifest change until interrupted (Ctrl-C);
+        /// a failing run is reported but does not stop watching
+        #[arg(long)]
+        watch: bool,
     },
     /// Lint the project
     Lint {
@@ -83,6 +88,10 @@ enum Command {
         /// Fail (without writing) if any file is not already formatted
         #[arg(long)]
         check: bool,
+        /// Rerun on every source/manifest change until interrupted (Ctrl-C);
+        /// a failing run is reported but does not stop watching
+        #[arg(long)]
+        watch: bool,
     },
     /// Lower to the configured target and emit
     Build {
@@ -163,11 +172,13 @@ fn main() -> anyhow::Result<()> {
         Command::Remove { .. } => unimplemented("remove", "P2"),
         Command::Install => unimplemented("install", "P2"),
         Command::Update { .. } => unimplemented("update", "P2"),
-        Command::Check { target, format } => {
-            check_cmd::run(&std::env::current_dir()?, target.as_deref(), &format)
-        }
+        Command::Check {
+            target,
+            format,
+            watch,
+        } => check_cmd::run(&std::env::current_dir()?, target.as_deref(), &format, watch),
         Command::Lint { fix } => lint_cmd::run(&std::env::current_dir()?, fix),
-        Command::Fmt { check } => fmt_cmd::run(&std::env::current_dir()?, check),
+        Command::Fmt { check, watch } => fmt_cmd::run(&std::env::current_dir()?, check, watch),
         Command::Build { .. } => unimplemented("build", "P3"),
         Command::Bundle { .. } => unimplemented("bundle", "P3"),
         Command::Test { .. } => unimplemented("test", "P4"),

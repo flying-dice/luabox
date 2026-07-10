@@ -146,6 +146,11 @@ static REGISTRY: &[Entry] = &[
         explain: LB1001,
     },
     Entry {
+        code: Code::new(1002),
+        title: "unresolvable definition package",
+        explain: LB1002,
+    },
+    Entry {
         code: Code::new(2001),
         title: "missing non-optional field on shape-bound literal",
         explain: LB2001,
@@ -748,6 +753,25 @@ The value supplied is none of these.
 Note: **Luau is intentionally out of scope** (SPEC.md §1). It is a separate
 typed paradigm with its own owner and toolchain; luabox's typed story is the
 `.lb` shape DSL layered over untyped Lua, so `luau` is not a valid edition.
+";
+
+const LB1002: &str = "\
+# LB1002: unresolvable definition package
+
+`[types] defs = [...]` in `luabox.toml` names ambient definition packages —
+`---@meta` `.d.lua` files that declare types for an environment your code
+runs in (a game engine, an editor API, a framework).
+
+An entry could not be resolved. Today definition packages are project-local:
+an entry `\"love2d\"` must exist as either
+
+- `defs/love2d.d.lua`, or
+- `defs/love2d/` containing one or more `.d.lua` files,
+
+relative to the project root. Registry-distributed definition packages
+arrive with the package manager (SPEC.md §3, §6).
+
+Fix: create the defs file/directory, correct the name, or remove the entry.
 ";
 
 const LB2001: &str = "\

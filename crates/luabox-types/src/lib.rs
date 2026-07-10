@@ -24,6 +24,7 @@
 
 mod assign;
 mod check;
+mod defs;
 mod env;
 mod infer;
 mod lower;
@@ -31,6 +32,7 @@ pub mod shape;
 pub mod ty;
 
 pub use assign::assignable;
+pub use defs::{Ambient, combined as combined_defs, stdlib as stdlib_defs};
 pub use env::TypeEnv;
 pub use shape::{ShapeOptions, ShapeStore};
 
@@ -76,7 +78,7 @@ impl Strictness {
 /// environment.
 #[must_use]
 pub fn check_file(parse: &lua::Parse, file: &str, strictness: Strictness) -> Vec<Diagnostic> {
-    check_file_shaped(parse, file, strictness, None)
+    check_file_shaped(parse, file, strictness, None, None)
 }
 
 /// Typecheck one parsed file, resolving `---@use`/`---@struct`/`---@impl`
@@ -87,12 +89,18 @@ pub fn check_file(parse: &lua::Parse, file: &str, strictness: Strictness) -> Vec
 /// strictness ladder only governs the ordinary `LB03xx` diagnostics.
 /// Files that use no shape tags never touch the shape machinery
 /// (zero-cost, SHAPES.md invariant 4).
+///
+/// `ambient` is the definition-package layer selected by the project
+/// `edition` ([`stdlib_defs`] / [`combined_defs`]): its stdlib globals and
+/// module tables become visible to both the checker and inference, merged
+/// beneath the file's own declarations (SPEC.md §3).
 #[must_use]
 pub fn check_file_shaped(
     parse: &lua::Parse,
     file: &str,
     strictness: Strictness,
     shapes: Option<&ShapeOptions<'_>>,
+    ambient: Option<&Ambient>,
 ) -> Vec<Diagnostic> {
     let items = luacats::harvest(parse);
 
@@ -106,7 +114,7 @@ pub fn check_file_shaped(
         _ => None,
     };
 
-    let env = TypeEnv::build_from_items(parse, &items, scope.as_ref());
+    let env = TypeEnv::build_from_items(parse, &items, scope.as_ref(), ambient);
     if strictness != Strictness::None {
         // Rich table inference (SPEC.md §3) runs first: the checker uses
         // its published types wherever annotations are absent (annotations

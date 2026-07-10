@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use luabox_syntax::lua::ast::{AstNode, Expr, LocalStmt, Stmt};
 use luabox_syntax::lua::{self, SyntaxKind, SyntaxNode};
-use luabox_syntax::luacats::{self, FieldKey, ParamTag, ReturnTag, Tag, TypeExprKind};
+use luabox_syntax::luacats::{self, AliasTag, FieldKey, ParamTag, ReturnTag, Tag, TypeExprKind};
 
 use crate::lower::{Declared, Lowerer};
 use crate::ty::{FieldTy, FunctionTy, ParamTy, TableTy, Ty};
@@ -19,7 +19,7 @@ pub(crate) type Target = (usize, usize);
 
 /// A declared `---@class`: parents plus *own* members (inherited members
 /// are merged on demand by [`TypeEnv::class_shape`]).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct ClassDef {
     pub parents: Vec<String>,
     pub fields: BTreeMap<String, FieldTy>,
@@ -28,7 +28,7 @@ pub(crate) struct ClassDef {
 
 /// A declared `---@enum`: member name → value type, plus the union of all
 /// member values (what the enum *type* accepts).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct EnumDef {
     pub members: BTreeMap<String, Ty>,
     pub value_union: Ty,
@@ -54,6 +54,11 @@ pub struct TypeEnv {
     /// annotate (the carrier `local`). Inference uses this to associate a
     /// locally-constructed table with its declaration.
     declared_targets: HashMap<Target, String>,
+    /// Ambient / global values by name: stdlib module tables (`string`,
+    /// `math`, ...) and scalar globals (`_VERSION`) declared by definition
+    /// packages (`---@meta` `.d.lua`). Populated only for the ambient
+    /// layer; per-file annotations shadow these.
+    global_types: BTreeMap<String, Ty>,
     /// References to undeclared type names (LB0305): `(name, span)`.
     pub(crate) unknown_names: Vec<(String, luacats::Span)>,
 }
@@ -63,19 +68,39 @@ impl TypeEnv {
     #[must_use]
     pub fn build(parse: &lua::Parse) -> TypeEnv {
         let items = luacats::harvest(parse);
-        Self::build_from_items(parse, &items, None)
+        Self::build_from_items(parse, &items, None, None)
     }
 
     /// Build the environment from pre-harvested annotations, optionally
     /// with `.lb` shapes in scope (interop: shape structs/traits/aliases
     /// become referenceable from LuaCATS annotations, and resolvable
     /// through [`TypeEnv::resolve_named`] / [`TypeEnv::class_shape`]).
+    ///
+    /// `ambient` is the definition-package layer (stdlib + project `defs`,
+    /// [`crate::defs::Ambient`]) merged *beneath* the file's own
+    /// declarations: its classes/enums/functions/globals seed the
+    /// environment first, so a same-named file declaration shadows them.
     pub(crate) fn build_from_items(
         parse: &lua::Parse,
         items: &[luacats::AnnotatedItem],
         shapes: Option<&crate::shape::ShapeScope>,
+        ambient: Option<&crate::defs::Ambient>,
     ) -> TypeEnv {
         let mut decl = Declared::default();
+        // Ambient type names must be visible to the file's lowerer so
+        // annotations that reference stdlib classes/aliases don't trip
+        // LB0305. File-declared names (inserted below) win on collision.
+        if let Some(ambient) = ambient {
+            for name in ambient.env.classes.keys() {
+                decl.classes.insert(name.clone());
+            }
+            for name in ambient.env.enums.keys() {
+                decl.enums.insert(name.clone());
+            }
+            for (name, alias) in &ambient.aliases {
+                decl.aliases.insert(name.clone(), alias.clone());
+            }
+        }
         for item in items {
             for tag in &item.block.tags {
                 match tag {
@@ -94,6 +119,13 @@ impl TypeEnv {
         }
 
         let mut env = TypeEnv::default();
+        // Seed the ambient declarations beneath the file's own.
+        if let Some(ambient) = ambient {
+            env.classes = ambient.env.classes.clone();
+            env.enums = ambient.env.enums.clone();
+            env.functions = ambient.env.functions.clone();
+            env.global_types = ambient.env.global_types.clone();
+        }
         if let Some(scope) = shapes {
             for (name, shape) in &scope.structs {
                 decl.shape_names.insert(name.clone());
@@ -133,6 +165,101 @@ impl TypeEnv {
         env
     }
 
+    /// Build the ambient environment for a definition package: a set of
+    /// `---@meta` `.d.lua` sources, each already parsed and harvested.
+    ///
+    /// All files share one declared-name universe (so a class declared in
+    /// `io.d.lua` is referenceable from `os.d.lua`), then each is lowered
+    /// independently and its name-keyed declarations merged — module tables
+    /// and scalar globals surface as [`TypeEnv::global_type`] entries. The
+    /// returned alias map lets a consuming file's lowerer expand ambient
+    /// `---@alias`es without re-parsing the packages.
+    pub(crate) fn build_ambient(
+        files: &[(lua::Parse, Vec<luacats::AnnotatedItem>)],
+    ) -> (TypeEnv, BTreeMap<String, AliasTag>) {
+        let mut decl = Declared::default();
+        let mut aliases: BTreeMap<String, AliasTag> = BTreeMap::new();
+        for (_, items) in files {
+            for item in items {
+                for tag in &item.block.tags {
+                    match tag {
+                        Tag::Class(c) if !c.name.is_empty() => {
+                            decl.classes.insert(c.name.clone());
+                        }
+                        Tag::Alias(a) if !a.name.is_empty() => {
+                            decl.aliases.insert(a.name.clone(), a.clone());
+                            aliases.insert(a.name.clone(), a.clone());
+                        }
+                        Tag::Enum(e) if !e.name.is_empty() => {
+                            decl.enums.insert(e.name.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let mut env = TypeEnv::default();
+        for (parse, items) in files {
+            let root = parse.syntax();
+            let mut file_env = TypeEnv::default();
+            let mut lowerer = Lowerer::new(&decl);
+            for item in items {
+                lowerer.generics = item
+                    .block
+                    .tags
+                    .iter()
+                    .filter_map(|tag| match tag {
+                        Tag::Generic(g) => Some(g.params.iter().map(|p| p.name.clone())),
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect();
+                file_env.absorb_block(item, &mut lowerer, &root);
+            }
+            file_env.collect_global_types(&root);
+            // Name-keyed maps merge without collision across files (byte
+            // ranges would — hence the per-file lowering above).
+            env.classes.append(&mut file_env.classes);
+            env.enums.append(&mut file_env.enums);
+            env.functions.append(&mut file_env.functions);
+            env.global_types.append(&mut file_env.global_types);
+            env.unknown_names.append(&mut lowerer.unknown_names.clone());
+        }
+        (env, aliases)
+    }
+
+    /// Bind module tables (`math = {}` under `---@class mathlib`) and scalar
+    /// globals (`_VERSION` under `---@type string`) to their declared types,
+    /// so field reads like `math.pi` and `_VERSION` resolve. Called once per
+    /// definition file, before its range-keyed maps are merged away.
+    fn collect_global_types(&mut self, root: &SyntaxNode) {
+        for node in root.descendants() {
+            let Some(Stmt::Assign(assign)) = Stmt::cast(node.clone()) else {
+                continue;
+            };
+            let targets: Vec<Expr> = assign
+                .targets()
+                .map(|t| t.exprs().collect())
+                .unwrap_or_default();
+            let [Expr::Name(name)] = &targets[..] else {
+                continue; // only simple single-name globals: `NAME = ...`
+            };
+            let Some(name) = name.name() else { continue };
+            let range = node.text_range();
+            let key = (usize::from(range.start()), usize::from(range.end()));
+            if let Some(class) = self.declared_targets.get(&key) {
+                self.global_types
+                    .insert(name.text().to_string(), Ty::Named(class.clone()));
+            } else if let Some(types) = self.typed_locals.get(&key)
+                && let Some(ty) = types.first()
+            {
+                self.global_types
+                    .insert(name.text().to_string(), ty.clone());
+            }
+        }
+    }
+
     /// Process one annotation block: class/field members, function
     /// signatures, `---@type` locals, and enums.
     fn absorb_block(
@@ -145,6 +272,7 @@ impl TypeEnv {
         let mut params: Vec<&ParamTag> = Vec::new();
         let mut returns: Vec<&ReturnTag> = Vec::new();
         let mut types: Option<Vec<Ty>> = None;
+        let mut overloads: Vec<FunctionTy> = Vec::new();
 
         for tag in &item.block.tags {
             match tag {
@@ -209,15 +337,20 @@ impl TypeEnv {
                     let def = enum_def(e, item.target, root);
                     self.enums.insert(e.name.clone(), def);
                 }
+                Tag::Overload(o) => {
+                    if let Ty::Function(func) = lowerer.lower(&o.ty) {
+                        overloads.push(*func);
+                    }
+                }
                 _ => {}
             }
         }
 
         let target = item.target.map(|span| (span.start, span.end));
-        if (!params.is_empty() || !returns.is_empty())
+        if (!params.is_empty() || !returns.is_empty() || !overloads.is_empty())
             && let Some(target) = target
         {
-            self.attach_function(&params, &returns, target, lowerer, root);
+            self.attach_function(&params, &returns, overloads, target, lowerer, root);
         }
         if let (Some(types), Some(target)) = (types, target) {
             self.typed_locals.insert(target, types);
@@ -231,11 +364,15 @@ impl TypeEnv {
         &mut self,
         params: &[&ParamTag],
         returns: &[&ReturnTag],
+        overloads: Vec<FunctionTy>,
         target: Target,
         lowerer: &mut Lowerer<'_>,
         root: &SyntaxNode,
     ) {
-        let mut func = FunctionTy::default();
+        let mut func = FunctionTy {
+            overloads,
+            ..FunctionTy::default()
+        };
         for param in params {
             let ty = lowerer.lower(&param.ty);
             if param.vararg {
@@ -385,6 +522,13 @@ impl TypeEnv {
 
     pub(crate) fn function(&self, name: &str) -> Option<&FunctionTy> {
         self.functions.get(name)
+    }
+
+    /// The ambient type of a global value (stdlib module table or scalar
+    /// global) declared by a definition package. `None` for names the
+    /// active definition packages do not declare.
+    pub(crate) fn global_type(&self, name: &str) -> Option<&Ty> {
+        self.global_types.get(name)
     }
 
     pub(crate) fn typed_local(&self, target: Target) -> Option<&[Ty]> {

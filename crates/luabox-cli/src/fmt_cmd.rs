@@ -1,12 +1,18 @@
-//! `luabox fmt [--check]` — canonical formatting for a whole project
-//! (SPEC.md §10): every `**/*.lua` under the package in the manifest's
-//! edition, plus every `**/*.lb` shape module via the shape formatter.
+//! `luabox fmt [--check] [--watch]` — canonical formatting for a whole
+//! project (SPEC.md §10): every `**/*.lua` under the package in the
+//! manifest's edition, plus every `**/*.lb` shape module via the shape
+//! formatter.
 //!
 //! Project discovery walks up from the working directory to the nearest
 //! `luabox.toml` (cargo-style) and skips the `[build] out` directory —
 //! build output is generated, not source. With no manifest in sight the
 //! command still works standalone: it formats everything under the working
 //! directory as Lua 5.4 (least surprise).
+//!
+//! `--watch` (SPEC.md §4) turns this into a long-running rerun-on-change
+//! loop instead of a one-shot format — see `crate::watch` for the
+//! debounce and filtering rules. It composes with `--check`: `luabox fmt
+//! --check --watch` re-reports (without writing) on every change.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,8 +22,30 @@ use luabox_resolve::manifest::Manifest;
 use luabox_syntax::{Dialect, lua, shape};
 
 /// Execute `luabox fmt` from `cwd`. In `--check` mode nothing is written;
-/// the command fails listing every file that would change.
-pub fn run(cwd: &Path, check: bool) -> anyhow::Result<()> {
+/// the command fails listing every file that would change. With `watch`,
+/// it reruns on every debounced, filtered filesystem change under the
+/// project root (`crate::watch`) until interrupted (Ctrl-C); a failing
+/// rerun is reported but does not stop the watcher, so in watch mode this
+/// function only returns on setup failure. Without `watch` it runs once
+/// and its `Result` becomes the process exit code, as before.
+pub fn run(cwd: &Path, check: bool, watch: bool) -> anyhow::Result<()> {
+    if watch {
+        // Discover once up front purely to get a root/out-dir to watch;
+        // `run_once` rediscovers the project fresh on every rerun, so a
+        // manifest edit (edition) takes effect on the very next rerun.
+        let project = discover(cwd)?;
+        let cwd = cwd.to_path_buf();
+        return crate::watch::run(&project.root, project.out_dir.as_deref(), move || {
+            run_once(&cwd, check)
+        });
+    }
+    run_once(cwd, check)
+}
+
+/// The single-pass body of `luabox fmt`: discover the project, format (or,
+/// in `--check` mode, just check) every file. Shared by one-shot `run` and
+/// each rerun of `run` in `--watch` mode.
+fn run_once(cwd: &Path, check: bool) -> anyhow::Result<()> {
     let project = discover(cwd)?;
     let files = collect_source_files(&project)?;
 
