@@ -12,7 +12,9 @@
 
 plugins {
     id("java")
-    id("org.jetbrains.kotlin.jvm") version "2.0.21"
+    // Kotlin 2.2+ is required to read the IU 2025.2 platform jars (their
+    // metadata is Kotlin 2.2; KGP 2.0.x refuses it).
+    id("org.jetbrains.kotlin.jvm") version "2.2.20"
     id("org.jetbrains.intellij.platform") version "2.16.0"
 }
 
@@ -28,10 +30,13 @@ repositories {
 
 dependencies {
     intellijPlatform {
-        // Target IntelliJ IDEA Ultimate 2024.2 — the native LSP API is
-        // Ultimate-only at this build. "IU" = IntelliJ IDEA Ultimate; the
-        // typed equivalent is `intellijIdeaUltimate("2024.2")`.
-        create("IU", "2024.2")
+        // Target IntelliJ IDEA 2025.3 — the first release where the native
+        // LSP API (incl. the semantic tokens that drive all .luab/.lua
+        // highlighting) is available to ALL users, not just licensed
+        // Ultimate: in the unified 2025.2 installer the sandbox boots in
+        // free mode with `com.intellij.modules.lsp` disabled, so the plugin
+        // silently fails to load there.
+        create("IU", "2025.3")
     }
 }
 
@@ -46,9 +51,10 @@ intellijPlatform {
             "document symbols, formatting, semantic highlighting)."
 
         ideaVersion {
-            sinceBuild = "242"
-            // Open-ended: the LSP API surface used here is stable across
-            // 2024.2+. Pin `untilBuild = "242.*"` if you want to restrict it.
+            // 2025.3+: first build where `com.intellij.modules.lsp` is
+            // available in every edition/mode (LSP semantic tokens drive
+            // .luab/.lua highlighting).
+            sinceBuild = "253"
             untilBuild = provider { null }
         }
 

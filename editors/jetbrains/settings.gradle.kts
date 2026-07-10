@@ -1,20 +1,8 @@
-// IntelliJ Platform Gradle Plugin 2.x requires the `intellijPlatform`
-// repository to be declared for BOTH the settings plugin (here) and the
-// project (build.gradle.kts). See:
-// https://plugins.jetbrains.com/docs/intellij/tools-intellij-platform-gradle-plugin.html
+// Repositories are declared in build.gradle.kts. The IntelliJ Platform
+// Gradle Plugin's `org.jetbrains.intellij.platform.settings` plugin is only
+// needed when repositories are centralised via dependencyResolutionManagement;
+// its settings-level `intellijPlatform` DSL fails to compile under
+// Gradle 9 + plugin 2.16, and FAIL_ON_PROJECT_REPOS would conflict with the
+// project-level repository declarations anyway.
 
 rootProject.name = "luabox-jetbrains"
-
-plugins {
-    id("org.jetbrains.intellij.platform.settings") version "2.16.0"
-}
-
-dependencyResolutionManagement {
-    repositoriesMode = RepositoriesMode.FAIL_ON_PROJECT_REPOS
-    repositories {
-        mavenCentral()
-        intellijPlatform {
-            defaultRepositories()
-        }
-    }
-}
