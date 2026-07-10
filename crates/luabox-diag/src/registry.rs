@@ -26,6 +26,41 @@ static REGISTRY: &[Entry] = &[
         explain: LB0001,
     },
     Entry {
+        code: Code::new(10),
+        title: "`goto`/label not available in this edition",
+        explain: LB0010,
+    },
+    Entry {
+        code: Code::new(11),
+        title: "integer division `//` not available in this edition",
+        explain: LB0011,
+    },
+    Entry {
+        code: Code::new(12),
+        title: "bitwise operator not available in this edition",
+        explain: LB0012,
+    },
+    Entry {
+        code: Code::new(13),
+        title: "`<const>`/`<close>` attribute not available in this edition",
+        explain: LB0013,
+    },
+    Entry {
+        code: Code::new(14),
+        title: "hex float literal not available in this edition",
+        explain: LB0014,
+    },
+    Entry {
+        code: Code::new(15),
+        title: "`\\z`/`\\x` string escape not available in this edition",
+        explain: LB0015,
+    },
+    Entry {
+        code: Code::new(16),
+        title: "`\\u{...}` string escape not available in this edition",
+        explain: LB0016,
+    },
+    Entry {
         code: Code::new(1001),
         title: "unknown edition",
         explain: LB1001,
@@ -109,6 +144,156 @@ region is reported here.
 Fix the highlighted token and re-run. If the construct is only valid in a Lua
 dialect newer than your `edition`, either raise the edition in `luabox.toml`
 or rewrite it for the edition you target.
+";
+
+const LB0010: &str = "\
+# LB0010: `goto`/label not available in this edition
+
+`goto` statements and `::label::` declarations are Lua 5.2+ (also LuaJIT).
+Lua 5.1 has no `goto` statement at all — `goto` lexes as an ordinary
+identifier there, so `goto top` in 5.1 source is a variable/call, not a jump.
+
+```lua
+-- illegal under edition = \"5.1\"
+::top::
+i = i + 1
+if i < 10 then goto top end
+
+-- workaround: restructure with a loop and a flag
+local more = true
+while more do
+  i = i + 1
+  more = i < 10
+end
+```
+
+Raise `edition` to `5.2` or later (or `luajit`), or restructure the control
+flow by hand. `luabox build` can also lower `goto`/labels down to 5.1 via a
+loop/flag rewrite for code that targets an older runtime (SPEC.md §2.1);
+irreducible gotos are a hard diagnostic at build time.
+";
+
+const LB0011: &str = "\
+# LB0011: integer division `//` not available in this edition
+
+`//` (floor division) is Lua 5.3+. It is not available in 5.1, 5.2, or
+LuaJIT.
+
+```lua
+-- illegal under edition = \"5.1\"/\"5.2\"/\"luajit\"
+local q = a // b
+
+-- workaround
+local q = math.floor(a / b)
+```
+
+Raise `edition` to `5.3` or later, or use `math.floor(a / b)` directly.
+`luabox build --target 5.2`/`5.1`/`luajit` lowers `//` to a `math.floor`
+call automatically (SPEC.md §2.1).
+";
+
+const LB0012: &str = "\
+# LB0012: bitwise operator not available in this edition
+
+The bitwise operators `&`, `|`, `~` (binary xor and unary not), `<<`, and
+`>>` are Lua 5.3+. They are not available in 5.1, 5.2, or LuaJIT (LuaJIT's
+bitwise ops live in the `bit.*` library instead, with different semantics).
+Note `~=` (not-equal) is unaffected — it is a distinct operator, legal in
+every edition.
+
+```lua
+-- illegal under edition = \"5.1\"/\"5.2\"/\"luajit\"
+local mask = a & b | c
+
+-- workaround (5.2, with the `bit32` library)
+local mask = bit32.bor(bit32.band(a, b), c)
+-- workaround (LuaJIT, with the `bit` library)
+local mask = bit.bor(bit.band(a, b), c)
+```
+
+Raise `edition` to `5.3` or later, or call the `bit32` (5.2) / `bit`
+(LuaJIT) shim library directly. `luabox build` injects the matching shim
+automatically when lowering to an older target (SPEC.md §2.1).
+";
+
+const LB0013: &str = "\
+# LB0013: `<const>`/`<close>` attribute not available in this edition
+
+Local variable attributes (`local x <const> = 1`, `local f <close> = …`)
+are Lua 5.4 only.
+
+```lua
+-- illegal under edition = \"5.1\"/\"5.2\"/\"5.3\"/\"luajit\"
+local x <const> = 1
+
+-- workaround: drop the attribute (lose the compile-time guarantee)
+local x = 1
+```
+
+Raise `edition` to `5.4`, or drop the attribute. `luabox build` lowers
+`<const>` by dropping it (with a compile-time const-check already having
+run) and lowers `<close>` via a `pcall`-wrapped scope-exit rewrite; truly
+non-lowerable `<close>` semantics (e.g. under error inside a 5.1 coroutine)
+are a hard diagnostic with the `---@luabox-allow lossy-lowering` escape
+hatch (SPEC.md §2.1).
+";
+
+const LB0014: &str = "\
+# LB0014: hex float literal not available in this edition
+
+Hexadecimal float literals (`0x1p4`, `0x1.8p3`, …) are Lua 5.2+ (also
+LuaJIT). Plain hex integers (`0xBEBADA`) are unaffected — they are legal in
+every edition.
+
+```lua
+-- illegal under edition = \"5.1\"
+local x = 0x1p4
+
+-- workaround: write the equivalent decimal float
+local x = 16.0
+```
+
+Raise `edition` to `5.2` or later (or `luajit`), or write the literal in
+decimal form.
+";
+
+const LB0015: &str = "\
+# LB0015: `\\z`/`\\x` string escape not available in this edition
+
+The `\\z` (skip following whitespace) and `\\xXX` (hex byte) string escapes
+are Lua 5.2+ (also LuaJIT).
+
+```lua
+-- illegal under edition = \"5.1\"
+local s = \"a\\z
+           b\\x41\"
+
+-- workaround: avoid the escapes
+local s = \"a\" ..
+          \"b\" .. string.char(0x41)
+```
+
+Raise `edition` to `5.2` or later (or `luajit`), or rewrite the string
+without them.
+";
+
+const LB0016: &str = "\
+# LB0016: `\\u{...}` string escape not available in this edition
+
+The `\\u{XXX}` Unicode escape (UTF-8 encoded at compile time) is Lua 5.3+.
+It is not available in 5.1, 5.2, or LuaJIT.
+
+```lua
+-- illegal under edition = \"5.1\"/\"5.2\"/\"luajit\"
+local s = \"\\u{2603}\"
+
+-- workaround: spell out the UTF-8 bytes
+local s = \"\\xE2\\x98\\x83\"
+```
+
+Raise `edition` to `5.3` or later, or spell out the encoded bytes directly.
+`luabox build` can perform this substitution automatically when lowering to
+an older target.
 ";
 
 const LB1001: &str = "\
@@ -230,8 +415,9 @@ mod tests {
     #[test]
     fn seeded_codes_are_all_present() {
         for raw in [
-            "LB0001", "LB1001", "LB2001", "LB2002", "LB2003", "LB2004", "LB2005", "LB2006",
-            "LB2007", "LB2008", "LB2010",
+            "LB0001", "LB0010", "LB0011", "LB0012", "LB0013", "LB0014", "LB0015", "LB0016",
+            "LB1001", "LB2001", "LB2002", "LB2003", "LB2004", "LB2005", "LB2006", "LB2007",
+            "LB2008", "LB2010",
         ] {
             let code: Code = raw.parse().unwrap();
             assert!(explain(&code).is_some(), "{raw} missing from registry");
