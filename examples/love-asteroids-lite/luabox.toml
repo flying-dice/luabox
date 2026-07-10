@@ -11,9 +11,4 @@ out = "dist"
 strict = true
 defs = ["love2d"]     # ambient LÖVE API types from defs/love2d.d.lua
 
-[lint]
-# `love` is LÖVE's ambient global; the defs file declares it, so allow the
-# single global write there instead of fighting the framework's convention.
-globals = ["love"]
-
 [dependencies]

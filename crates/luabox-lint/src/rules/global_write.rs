@@ -10,6 +10,11 @@ use crate::rule::{Rule, Tier};
 /// An assignment whose bare-name target resolves to a global — the classic
 /// "forgot `local`" footgun (SPEC.md §9). Field writes (`t.x = v`) are not
 /// flagged; the allow-list comes from `[lint] globals`.
+///
+/// Silent for the whole file when it is a `---@meta` definition file
+/// (SPEC.md §3, ticket #76): declaring globals — `love = {}` and the like —
+/// is such a file's entire purpose, so it needs no `[lint] globals` entry to
+/// stay clean.
 pub struct GlobalWrite;
 
 impl Rule for GlobalWrite {
@@ -30,6 +35,9 @@ impl Rule for GlobalWrite {
     }
 
     fn check(&self, ctx: &LintContext<'_>) -> Vec<LintDiagnostic> {
+        if ctx.facts.is_meta() {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         for (body_id, body) in ctx.lowered.bodies() {
             for (_, stmt) in body.stmts() {

@@ -10,6 +10,11 @@ use crate::rule::{Rule, Tier};
 /// A `local` (or `local function`) that is declared but never read (SPEC.md
 /// §9). Skips `_`-prefixed names; fixes by renaming to `_name` when the
 /// binding has no other references (a single, safe edit).
+///
+/// Silent for the whole file when it is a `---@meta` definition file
+/// (SPEC.md §3, ticket #76): a defs file's locals are often structural
+/// scaffolding (e.g. building up a class table before exporting it) rather
+/// than leftovers.
 pub struct UnusedLocal;
 
 impl Rule for UnusedLocal {
@@ -30,6 +35,9 @@ impl Rule for UnusedLocal {
     }
 
     fn check(&self, ctx: &LintContext<'_>) -> Vec<LintDiagnostic> {
+        if ctx.facts.is_meta() {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         for (id, binding) in ctx.lowered.bindings() {
             let is_local = matches!(

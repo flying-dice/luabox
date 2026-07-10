@@ -34,7 +34,8 @@ With that, `luabox check` type-checks your calls into LÖVE — a wrong-arity
 ```sh
 luabox check        # 0 errors — LÖVE calls typed against the defs
 luabox fmt --check
-luabox lint         # `love` global allowed via [lint] globals = ["love"]
+luabox lint         # clean — defs/love2d.d.lua is a `---@meta` defs module,
+                     # so declaring the `love` global there needs no [lint] entry
 ```
 
 ## Packaging a `.love`

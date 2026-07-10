@@ -71,6 +71,17 @@ Feature: luabox lint — type-informed lint rules (clippy analog)
     Then the command succeeds
     And stderr contains "0 errors, 0 warnings"
 
+  Scenario: a `---@meta` definition file is exempt from global-write and unused-local
+    Given a file "src/defs.lua" containing:
+      """
+      ---@meta
+      local scaffold = {}
+      love = {}
+      """
+    When I run "luabox lint"
+    Then the command succeeds
+    And stderr contains "0 errors, 0 warnings"
+
   Scenario: a [lint] allow entry silences a rule
     Given a file "luabox.toml" containing:
       """

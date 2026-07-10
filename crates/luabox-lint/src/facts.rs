@@ -10,19 +10,21 @@
 
 use std::collections::HashMap;
 
-use luabox_hir::{Binding, BindingId, BindingKind, LoweredFile};
+use luabox_hir::{Binding, BindingId, BindingKind, HirId, LoweredFile};
 use luabox_syntax::lua;
-use luabox_syntax::luacats::{self, Span, Tag, TypeExpr, TypeExprKind};
+use luabox_syntax::luacats::{self, AnnotatedItem, Span, Tag, TypeExpr, TypeExprKind};
 
 /// Declared types keyed by the binding they annotate.
 #[derive(Debug, Default)]
 pub struct TypeFacts {
     binding_types: HashMap<BindingId, TypeExpr>,
+    is_meta: bool,
 }
 
 impl TypeFacts {
     /// Harvest `---@param` and `---@type` annotations and bind them to HIR
-    /// bindings by name within the annotated statement.
+    /// bindings by name within the annotated statement. Also determines
+    /// whether the file is a `---@meta` definition file (SPEC.md §3).
     #[must_use]
     pub fn build(parse: &lua::Parse, lowered: &LoweredFile) -> Self {
         let items = luacats::harvest(parse);
@@ -48,7 +50,22 @@ impl TypeFacts {
                 }
             }
         }
-        Self { binding_types }
+        let is_meta = has_leading_meta_tag(&items, first_stmt_offset(lowered));
+        Self {
+            binding_types,
+            is_meta,
+        }
+    }
+
+    /// Whether this file is a `---@meta` definition file (SPEC.md §3): a
+    /// `---@meta` tag appears before any statement. Definition surfaces exist
+    /// only to declare an ambient API surface — `global-write` and
+    /// `unused-local` both stay silent for the whole file, since declaring
+    /// globals and structural placeholder locals is the file's entire
+    /// purpose (ticket #76).
+    #[must_use]
+    pub fn is_meta(&self) -> bool {
+        self.is_meta
     }
 
     /// Whether the binding's declared type provably excludes `false` (so a
@@ -75,6 +92,31 @@ impl TypeFacts {
 fn within(target: Span, binding: &Binding) -> bool {
     let start = usize::from(binding.range.start());
     target.start <= start && start < target.end
+}
+
+/// The byte offset of the file's first statement (any body, so a nested
+/// statement never beats its enclosing one), or `usize::MAX` when the file
+/// has no statements at all.
+fn first_stmt_offset(lowered: &LoweredFile) -> usize {
+    lowered
+        .bodies()
+        .flat_map(|(body_id, body)| body.stmts().map(move |(id, _)| HirId::stmt(body_id, id)))
+        .filter_map(|id| lowered.source_map().range(id))
+        .map(|range| usize::from(range.start()))
+        .min()
+        .unwrap_or(usize::MAX)
+}
+
+/// Whether any harvested `---@meta` tag's span starts before `first_stmt`
+/// (ticket #76): the tag must precede every statement in the file, not
+/// merely exist somewhere in it.
+fn has_leading_meta_tag(items: &[AnnotatedItem], first_stmt: usize) -> bool {
+    items.iter().any(|item| {
+        item.block
+            .tags
+            .iter()
+            .any(|tag| matches!(tag, Tag::Meta(_)) && tag.span().start < first_stmt)
+    })
 }
 
 /// The earliest parameter binding named `name` within `target` (the outer

@@ -145,6 +145,44 @@ fn allowlisted_global_is_silenced() {
     assert!(!has("vim = 1\n", &c, "LB0504"));
 }
 
+// --- `---@meta` definition-file policy (LB0504 + LB0501, ticket #76) -------
+
+#[test]
+fn meta_file_global_write_lints_clean() {
+    let src = "---@meta\nlove = {}\nlove.graphics = {}\n";
+    assert_eq!(default_codes(src), Vec::<String>::new());
+}
+
+#[test]
+fn same_content_without_meta_tag_still_fires_global_write() {
+    let src = "love = {}\nlove.graphics = {}\n";
+    assert!(default_codes(src).contains(&"LB0504".to_owned()));
+}
+
+#[test]
+fn mid_file_meta_comment_does_not_exempt_the_file() {
+    // The `---@meta` tag appears after a statement, so it does not count —
+    // the tag must precede every statement in the file.
+    let src = "local x = 1\nreturn x\n---@meta\ncounter = 0\n";
+    assert!(default_codes(src).contains(&"LB0504".to_owned()));
+}
+
+#[test]
+fn meta_file_unused_local_lints_clean() {
+    // `scaffold` is never read — plain unused-local, exempted only because
+    // the file is a `---@meta` defs module.
+    let src = "---@meta\nlocal scaffold = {}\nlove = {}\n";
+    assert!(!default_codes(src).contains(&"LB0501".to_owned()));
+}
+
+#[test]
+fn meta_file_named_variant_is_still_recognised() {
+    // `---@meta <name>` (a named module) is the same tag, just with an
+    // optional module-name argument — still exempts the file.
+    let src = "---@meta love2d\nlove = {}\n";
+    assert_eq!(default_codes(src), Vec::<String>::new());
+}
+
 // --- explicit-nil-compare-truthiness (LB0505, style, type-informed) --------
 
 #[test]

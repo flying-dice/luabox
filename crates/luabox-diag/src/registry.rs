@@ -621,6 +621,12 @@ Prefix the name with `_` to mark it deliberately unused, or delete the
 binding. `luabox lint --fix` renames a never-referenced local to `_name`
 (machine-applicable). Resolution is HIR-based: a use inside a nested closure
 still counts, so genuine captures are never flagged.
+
+**`---@meta` definition files are exempt.** A file where a `---@meta` tag
+appears before any statement (SPEC.md §3, ticket #76) never gets
+`unused-local`: a defs file's locals are often structural scaffolding (e.g.
+building up a class table before assigning it to a global) rather than
+leftovers.
 ";
 
 const LB0502: &str = "\
@@ -683,6 +689,17 @@ globals = [\"vim\", \"love\"]
 
 Only bare-name targets are flagged; `t.field = v` and `t[k] = v` are field
 writes, not global writes.
+
+**`---@meta` definition files are exempt.** A file where a `---@meta` tag
+appears before any statement (SPEC.md §3) is a pure definition surface —
+declaring its exported globals (`love = {}` and the like) is the file's
+entire purpose, so `global-write` never fires there and no `[lint] globals`
+entry is needed for it:
+
+```lua
+---@meta
+love = {}   -- fine: this file is a `---@meta` defs module
+```
 ";
 
 const LB0505: &str = "\
