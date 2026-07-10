@@ -54,9 +54,14 @@ Feature: luabox bundle --mode — embedding modes (LÖVE, Neovim plugin)
       """
       not-really-an-image
       """
+    And a file "assets/sub/nested.txt" containing:
+      """
+      nested-and-not-really-an-image-either
+      """
     When I run "luabox bundle"
     Then the command succeeds
     And the archive "dist/fixture.love" contains "assets/sprite.txt"
+    And the archive "dist/fixture.love" contains "assets/sub/nested.txt"
 
   Scenario: love mode without conf.lua or assets packages just main.lua
     Given a project with edition "5.1" targeting "5.1" using mode "love"

@@ -53,18 +53,35 @@
 //! No dependency in this workspace writes zip archives, so `.love`
 //! packaging shells out, per-platform:
 //!
-//! - **Windows**: `Compress-Archive` via `powershell -Command` — bundled
-//!   with every supported Windows version, so no availability check is
-//!   needed beyond `powershell` itself existing.
+//! - **Windows**: the system `bsdtar`
+//!   (`%SystemRoot%\System32\tar.exe`, the same trick
+//!   `toolchain_cmd::tar_program` uses — bundled since Windows 10 1809, so
+//!   present on every supported Windows version) via `tar --format zip -cf`.
+//!   `--format zip` is required explicitly: `-a`'s extension-sniffing
+//!   doesn't recognize `.love`, and silently falls back to a plain POSIX
+//!   tar archive (verified empirically while fixing ticket #75). Unlike
+//!   `Compress-Archive`, `bsdtar` reliably writes ZIP-spec forward-slash
+//!   (`/`) entry separators regardless of Windows/.NET version — that
+//!   reliability, not just availability, is why it's preferred over
+//!   `Compress-Archive` for entries that are read on other platforms (a
+//!   `.love` archive with backslash entries is a cross-platform hazard:
+//!   `love.filesystem` and other unzip tools may not accept `\` as a path
+//!   separator inside the archive). If `System32\tar.exe` isn't present
+//!   (a non-standard Windows install), this falls back to
+//!   `Compress-Archive` via `powershell -Command`; after it runs, the
+//!   resulting archive's entries are inspected (via .NET
+//!   `System.IO.Compression.ZipFile`) and, if any contain a backslash, a
+//!   warning is printed naming the tool limitation — the archive is still
+//!   produced (there's no reliable way to *rewrite* entry names inside a
+//!   zip's central directory from `PowerShell` without re-creating the whole
+//!   archive), but the operator is told exactly why and how to fix it
+//!   (install/repair `tar.exe`).
 //! - **Unix**: `zip -r`, falling back to `python3 -m zipfile` / `python -m
-//!   zipfile` when `zip` isn't on `PATH`.
+//!   zipfile` when `zip` isn't on `PATH`. Both already emit forward-slash
+//!   entries, so this path is unchanged.
 //!
 //! If none of these are available the error names all of them, so the fix
-//! is obvious. (`tar` cannot *create* zip archives portably — GNU `tar`
-//! never can, and while some `bsdtar` builds support `--format=zip`, it
-//! isn't guaranteed across platforms — but `bsdtar` reads zip archives
-//! fine, so tests verify `.love` contents with `tar -tf` rather than
-//! relying on `tar` to produce them.)
+//! is obvious.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -228,7 +245,11 @@ fn zip_directory(stage: &Path, dest: &Path) -> anyhow::Result<()> {
     }
 
     if cfg!(windows) {
-        zip_with_powershell(stage, dest, &entries)
+        if let Some(bsdtar) = system_bsdtar() {
+            zip_with_bsdtar(&bsdtar, stage, dest, &entries)
+        } else {
+            zip_with_powershell(stage, dest, &entries)
+        }
     } else if which("zip") {
         zip_with_zip(stage, dest, &entries)
     } else if which("python3") {
@@ -257,10 +278,56 @@ fn ps_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-/// Windows: `Compress-Archive` via `powershell -Command`. Zips to a
-/// `.zip`-suffixed temp path first (`Compress-Archive` has no opinion on
-/// the destination extension, but staying on the safe, documented side)
-/// then renames onto `dest`, whatever its extension.
+/// Locate the Windows-bundled `bsdtar` at `%SystemRoot%\System32\tar.exe`
+/// — the same trick `toolchain_cmd::tar_program` uses to make sure a
+/// git-shipped GNU tar earlier on `PATH` (which cannot create zip archives
+/// at all) doesn't shadow it. Returns `None` on a non-standard Windows
+/// install missing it, in which case the caller falls back to
+/// `Compress-Archive`.
+fn system_bsdtar() -> Option<PathBuf> {
+    let root = std::env::var("SystemRoot").ok()?;
+    let candidate = Path::new(&root).join("System32").join("tar.exe");
+    candidate.is_file().then_some(candidate)
+}
+
+/// Windows preferred path: the System32 `bsdtar` can create zip archives
+/// directly and — unlike `Compress-Archive` — reliably writes ZIP-spec
+/// forward-slash entry separators (see module docs). Run with `stage` as
+/// the working directory so archive paths are relative (no leading
+/// directory), matching `zip_with_zip`/`zip_with_python` on Unix.
+/// `--format zip` is passed explicitly rather than relying on `-a`'s
+/// extension-sniffing, which doesn't recognize `.love` and silently falls
+/// back to a plain POSIX tar archive (verified empirically — ticket #75).
+fn zip_with_bsdtar(
+    bsdtar: &Path,
+    stage: &Path,
+    dest: &Path,
+    entries: &[String],
+) -> anyhow::Result<()> {
+    let output = Command::new(bsdtar)
+        .current_dir(stage)
+        .args(["--format", "zip", "-cf"])
+        .arg(dest)
+        .args(entries)
+        .output()
+        .with_context(|| format!("failed to spawn `{}`", bsdtar.display()))?;
+    if !output.status.success() {
+        bail!(
+            "`{} --format zip` failed:\n{}",
+            bsdtar.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// Windows fallback when `System32\tar.exe` is missing: `Compress-Archive`
+/// via `powershell -Command`. Zips to a `.zip`-suffixed temp path first
+/// (`Compress-Archive` has no opinion on the destination extension, but
+/// staying on the safe, documented side) then renames onto `dest`,
+/// whatever its extension. Warns (doesn't fail) if the result has
+/// backslash entry paths — see module docs and
+/// [`warn_if_backslash_entries`].
 fn zip_with_powershell(stage: &Path, dest: &Path, entries: &[String]) -> anyhow::Result<()> {
     let paths = entries
         .iter()
@@ -291,7 +358,49 @@ fn zip_with_powershell(stage: &Path, dest: &Path, entries: &[String]) -> anyhow:
                 dest.display()
             )
         })?;
+    warn_if_backslash_entries(dest);
     Ok(())
+}
+
+/// Best-effort, never-fails post-creation check for the `Compress-Archive`
+/// fallback (ticket #75): lists `dest`'s entries via .NET
+/// `System.IO.Compression.ZipFile` and, if any contain a backslash, prints
+/// a warning naming the tool limitation. There's no reliable way to
+/// *rewrite* entry names inside a zip's central directory from `PowerShell`
+/// short of re-creating the whole archive, so this only warns — the
+/// archive is still produced and returned to the caller.
+fn warn_if_backslash_entries(dest: &Path) {
+    let script = format!(
+        "Add-Type -AssemblyName System.IO.Compression.FileSystem; \
+         $zip = [System.IO.Compression.ZipFile]::OpenRead({}); \
+         try {{ $zip.Entries | Where-Object {{ $_.FullName -match '\\\\' }} | \
+         ForEach-Object {{ $_.FullName }} }} finally {{ $zip.Dispose() }}",
+        ps_quote(&dest.display().to_string())
+    );
+    let Ok(output) = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+    else {
+        return;
+    };
+    let bad = String::from_utf8_lossy(&output.stdout);
+    let bad_entries: Vec<&str> = bad
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if !bad_entries.is_empty() {
+        eprintln!(
+            "warning: `{}` contains backslash-separated entry paths ({}) — this Windows \
+             `Compress-Archive` wrote OS path separators instead of the ZIP-spec `/`, which can \
+             break LÖVE's `love.filesystem` and other unzip tools on non-Windows platforms. \
+             Install/repair the Windows `tar.exe` (bundled since Windows 10 1809, normally at \
+             `%SystemRoot%\\System32\\tar.exe`) so luabox can use it instead of \
+             `Compress-Archive` for `.love` packaging.",
+            dest.display(),
+            bad_entries.join(", ")
+        );
+    }
 }
 
 /// Unix: `zip -r <dest> <entries…>`, run with `stage` as the working
@@ -386,6 +495,57 @@ mod tests {
             .expect("emit_nvim_plugin succeeds");
         let doc = fs::read_to_string(root.join("doc").join("mypkg.txt")).expect("doc written");
         assert!(doc.contains("no description"));
+    }
+
+    /// Regression test for ticket #75: on Windows, `.love` archives must
+    /// use ZIP-spec forward-slash entry separators for nested paths, not
+    /// the OS separator. `zip_directory` should prefer the System32
+    /// `bsdtar` path (`zip_with_bsdtar`), which writes `/` regardless of
+    /// platform; this asserts against the listing of the archive it
+    /// actually produces, so it fails if the dispatch in `zip_directory`
+    /// ever silently falls back to a separator-unsafe tool.
+    #[cfg(windows)]
+    #[test]
+    fn love_archive_entries_use_forward_slash_separators_on_windows() {
+        let bsdtar = system_bsdtar()
+            .expect("System32\\tar.exe should be present on any supported Windows version");
+
+        let staging = tempfile::tempdir().expect("tempdir");
+        let stage = staging.path();
+        fs::write(stage.join("main.lua"), "return 1\n").expect("write main.lua");
+        fs::create_dir_all(stage.join("assets").join("sub")).expect("mkdir nested assets");
+        fs::write(stage.join("assets").join("README.txt"), b"hi").expect("write asset");
+        fs::write(stage.join("assets").join("sub").join("deep.txt"), b"deep")
+            .expect("write nested asset");
+
+        let out = tempfile::tempdir().expect("tempdir");
+        let dest = out.path().join("test.love");
+        zip_directory(stage, &dest).expect("zip_directory succeeds");
+
+        let output = Command::new(&bsdtar)
+            .arg("-tf")
+            .arg(&dest)
+            .output()
+            .expect("bsdtar -tf should run against the archive we just created");
+        assert!(
+            output.status.success(),
+            "bsdtar -tf failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let listing = String::from_utf8_lossy(&output.stdout);
+
+        assert!(
+            listing.contains("assets/README.txt"),
+            "expected a forward-slash nested entry `assets/README.txt`, got:\n{listing}"
+        );
+        assert!(
+            listing.contains("assets/sub/deep.txt"),
+            "expected a forward-slash doubly-nested entry `assets/sub/deep.txt`, got:\n{listing}"
+        );
+        assert!(
+            !listing.contains('\\'),
+            "no entry path should contain a backslash separator:\n{listing}"
+        );
     }
 
     #[test]
