@@ -6,6 +6,12 @@
 -- Requires a `luabox` binary on your PATH (or set `opts.cmd` below). Build it
 -- from the repo root with `cargo build --release` (binary: target/release/luabox).
 --
+-- This file lives in a regular Neovim plugin layout (editors/nvim is the
+-- plugin root: lua/, syntax/, ftdetect/, ftplugin/), so `editors/nvim` can be
+-- put on the runtimepath directly — via a plugin manager or `:packadd`. The
+-- syntax/ftdetect files give `.lb` buffers fallback highlighting even before
+-- (or without) `setup()`; the LSP's semantic tokens layer on top.
+--
 -- Usage (Neovim 0.11+, no plugins needed):
 --
 --     require("luabox").setup()
@@ -69,7 +75,7 @@ function M.setup(opts)
   else
     vim.notify(
       "luabox: Neovim 0.11+ is required for the native LSP API. "
-        .. "Use the lspconfig fallback in editors/nvim/luabox.lua instead.",
+        .. "Use the lspconfig fallback in editors/nvim/lua/luabox.lua instead.",
       vim.log.levels.WARN
     )
   end

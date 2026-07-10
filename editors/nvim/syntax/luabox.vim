@@ -1,0 +1,53 @@
+" Vim syntax file
+" Language:  luabox shapes (.lb)
+" Fallback highlighting so `.lb` files read well even without the luabox
+" language server attached. When the LSP is running, Neovim's semantic
+" tokens (0.9+) layer on top of these groups.
+
+if exists("b:current_syntax")
+  finish
+endif
+
+" --- Keywords -------------------------------------------------------------
+syn keyword lbKeyword struct trait impl for fn type use
+syn keyword lbSelf self
+
+" --- Types ----------------------------------------------------------------
+" Builtin/primitive type names.
+syn keyword lbBuiltinType number integer string boolean table any nil
+" User types read as capitalised identifiers (structs, traits, aliases,
+" single-letter generics like T).
+syn match lbType "\<[A-Z][A-Za-z0-9_]*\>"
+
+" --- Declarations ---------------------------------------------------------
+" A trait-fn name: `fn area(...)`.
+syn match lbFunction "\<fn\s\+\zs[A-Za-z_][A-Za-z0-9_]*\>"
+" A field or parameter name before `:` (lowercase, so generic bounds like
+" `T: Ord` keep their type colour).
+syn match lbField "\<[a-z_][A-Za-z0-9_]*\>\ze\s*:"
+
+" --- Operators & generics --------------------------------------------------
+syn match lbAngle "[<>]"
+syn match lbOperator "->\||\|?\|+\|=\|\.\."
+
+" --- Comments ---------------------------------------------------------------
+" Order matters: `///` doc comments are defined after `//` so they win.
+syn region lbComment start="//" end="$" contains=@Spell
+syn region lbDocComment start="///" end="$" contains=@Spell
+" `/* */` blocks nest (SHAPES.md), hence the self-containment.
+syn region lbBlockComment start="/\*" end="\*/" contains=lbBlockComment,@Spell
+
+" --- Default highlight links -------------------------------------------------
+hi def link lbKeyword      Keyword
+hi def link lbSelf         Special
+hi def link lbBuiltinType  Type
+hi def link lbType         Type
+hi def link lbFunction     Function
+hi def link lbField        Identifier
+hi def link lbAngle        Delimiter
+hi def link lbOperator     Operator
+hi def link lbComment      Comment
+hi def link lbDocComment   SpecialComment
+hi def link lbBlockComment Comment
+
+let b:current_syntax = "luabox"

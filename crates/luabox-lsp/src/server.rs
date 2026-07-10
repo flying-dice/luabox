@@ -24,21 +24,23 @@ use lsp_types::notification::{
     PublishDiagnostics,
 };
 use lsp_types::request::{
-    Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, Request as _,
+    Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, RangeFormatting,
+    Request as _, SemanticTokensFullRequest,
 };
 use lsp_types::{
     CompletionOptions, CompletionResponse, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DocumentSymbolResponse, GotoDefinitionResponse, Hover,
     HoverProviderCapability, InitializeParams, InitializeResult, Location, OneOf,
-    PublishDiagnosticsParams, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Uri,
+    PublishDiagnosticsParams, SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions,
+    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri,
 };
 use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
 
 use crate::line_index::LineIndex;
 use crate::sema::FileSema;
 use crate::uri::{path_to_uri, uri_to_path};
-use crate::{completion, diagnostics, goto_def, hover, lb, symbols};
+use crate::{completion, diagnostics, fmt, goto_def, hover, lb, semantic_tokens, symbols};
 
 /// Run the server over stdio until the client sends `shutdown`/`exit`.
 /// A leading `--stdio` argument, which editors commonly pass, is harmless:
@@ -73,8 +75,10 @@ pub fn run(connection: Connection) -> anyhow::Result<()> {
     server.main_loop()
 }
 
-/// The capabilities advertised at initialize (tranche 1: full sync, hover,
-/// definition, completion triggered on `.`/`:`, document symbols).
+/// The capabilities advertised at initialize: full sync, hover, definition,
+/// completion triggered on `.`/`:`, document symbols, whole-document and
+/// range formatting (range formats the whole document — see [`crate::fmt`]),
+/// and semantic tokens (full) with a standard-types-only legend.
 fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
@@ -85,6 +89,15 @@ fn server_capabilities() -> ServerCapabilities {
             ..CompletionOptions::default()
         }),
         document_symbol_provider: Some(OneOf::Left(true)),
+        document_formatting_provider: Some(OneOf::Left(true)),
+        document_range_formatting_provider: Some(OneOf::Left(true)),
+        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+            SemanticTokensOptions {
+                legend: semantic_tokens::legend(),
+                full: Some(SemanticTokensFullOptions::Bool(true)),
+                ..SemanticTokensOptions::default()
+            },
+        )),
         ..ServerCapabilities::default()
     }
 }
@@ -253,6 +266,24 @@ impl Server {
                     .map(DocumentSymbolResponse::Nested);
                 Response::new_ok(id, result)
             }
+            Formatting::METHOD => {
+                let (id, params) = cast_request::<Formatting>(req)?;
+                let result = self.formatting(&params.text_document.uri);
+                Response::new_ok(id, result)
+            }
+            RangeFormatting::METHOD => {
+                // MVP range semantics (see `crate::fmt`): the canonical
+                // formatters are whole-file, so a range request returns the
+                // same whole-document edit as a full format.
+                let (id, params) = cast_request::<RangeFormatting>(req)?;
+                let result = self.formatting(&params.text_document.uri);
+                Response::new_ok(id, result)
+            }
+            SemanticTokensFullRequest::METHOD => {
+                let (id, params) = cast_request::<SemanticTokensFullRequest>(req)?;
+                let result = self.semantic_tokens(&params.text_document.uri);
+                Response::new_ok(id, result)
+            }
             _ => Response::new_err(
                 req.id,
                 ErrorCode::MethodNotFound as i32,
@@ -321,6 +352,35 @@ impl Server {
         }
         let sema = self.sema(&path)?;
         Some(symbols::document_symbols(&sema))
+    }
+
+    /// Full-document formatting; also serves range requests (MVP semantics,
+    /// see [`crate::fmt`]). `None` for unknown documents; `Some(vec![])`
+    /// when nothing changed — including the formatters' parse-error
+    /// "return input unchanged" guarantee, which must not become an error.
+    fn formatting(&self, uri: &Uri) -> Option<Vec<TextEdit>> {
+        let path = uri_to_path(uri)?;
+        if is_lb(&path) {
+            let text = self.lb_text(&path)?;
+            let formatted = luabox_syntax::shape::format(text);
+            return Some(fmt::full_document_edits(text, &formatted));
+        }
+        let text = self.host.snapshot().file_text(&path)?;
+        let formatted = luabox_syntax::lua::fmt::format(&text, self.dialect);
+        Some(fmt::full_document_edits(&text, &formatted))
+    }
+
+    fn semantic_tokens(&self, uri: &Uri) -> Option<SemanticTokensResult> {
+        let path = uri_to_path(uri)?;
+        let data = if is_lb(&path) {
+            semantic_tokens::lb_tokens(self.lb_text(&path)?)
+        } else {
+            semantic_tokens::lua_tokens(&self.sema(&path)?)
+        };
+        Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        }))
     }
 
     fn sema(&self, path: &Path) -> Option<FileSema> {

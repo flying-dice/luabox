@@ -11,16 +11,19 @@ use lsp_types::notification::{
     Notification as _, PublishDiagnostics,
 };
 use lsp_types::request::{
-    Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, Request as _, Shutdown,
+    Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, RangeFormatting,
+    Request as _, SemanticTokensFullRequest, Shutdown,
 };
 use lsp_types::{
     CompletionItemKind, CompletionParams, CompletionResponse, DiagnosticSeverity,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
+    DocumentFormattingParams, DocumentRangeFormattingParams, DocumentSymbolParams,
+    DocumentSymbolResponse, FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse,
     HoverContents, HoverParams, InitializeParams, NumberOrString, PartialResultParams, Position,
-    PublishDiagnosticsParams, Range, SymbolKind, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Uri,
-    VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceFolder,
+    PublishDiagnosticsParams, Range, SemanticToken, SemanticTokensParams, SemanticTokensResult,
+    SymbolKind, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, TextEdit, Uri, VersionedTextDocumentIdentifier,
+    WorkDoneProgressParams, WorkspaceFolder,
 };
 use tempfile::TempDir;
 
@@ -230,6 +233,94 @@ impl TestClient {
         }
     }
 
+    fn formatting(&mut self, uri: &Uri) -> Option<Vec<TextEdit>> {
+        self.request::<Formatting>(DocumentFormattingParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            options: FormattingOptions {
+                tab_size: 4,
+                insert_spaces: true,
+                ..FormattingOptions::default()
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        })
+    }
+
+    fn range_formatting(&mut self, uri: &Uri, range: Range) -> Option<Vec<TextEdit>> {
+        self.request::<RangeFormatting>(DocumentRangeFormattingParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range,
+            options: FormattingOptions {
+                tab_size: 4,
+                insert_spaces: true,
+                ..FormattingOptions::default()
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        })
+    }
+
+    fn semantic_tokens(&mut self, uri: &Uri) -> Vec<SemanticToken> {
+        let response = self.request::<SemanticTokensFullRequest>(SemanticTokensParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        });
+        match response {
+            Some(SemanticTokensResult::Tokens(tokens)) => tokens.data,
+            other => panic!("expected a token stream, got {other:?}"),
+        }
+    }
+
+    /// Decode the delta stream into absolute tokens with legend names,
+    /// asserting delta-consistency (indices in the advertised legend,
+    /// strictly increasing positions) along the way.
+    fn decode_tokens(&self, data: &[SemanticToken]) -> Vec<DecodedToken> {
+        let legend = &self.init_result["capabilities"]["semanticTokensProvider"]["legend"];
+        let types: Vec<String> =
+            serde_json::from_value(legend["tokenTypes"].clone()).expect("legend token types");
+        let modifiers: Vec<String> = serde_json::from_value(legend["tokenModifiers"].clone())
+            .expect("legend token modifiers");
+        let mut out: Vec<DecodedToken> = Vec::new();
+        let (mut line, mut start) = (0u32, 0u32);
+        for token in data {
+            if token.delta_line > 0 {
+                line += token.delta_line;
+                start = token.delta_start;
+            } else {
+                start += token.delta_start;
+            }
+            if let Some(prev) = out.last() {
+                assert!(
+                    (line, start) > (prev.line, prev.start),
+                    "token stream not strictly increasing at ({line}, {start})"
+                );
+            }
+            assert!(token.length > 0, "zero-length token at ({line}, {start})");
+            let token_type = types
+                .get(token.token_type as usize)
+                .unwrap_or_else(|| panic!("token type {} outside the legend", token.token_type))
+                .clone();
+            let mods: Vec<String> = modifiers
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| token.token_modifiers_bitset & (1 << i) != 0)
+                .map(|(_, m)| m.clone())
+                .collect();
+            assert!(
+                token.token_modifiers_bitset < (1 << modifiers.len()),
+                "modifier bit outside the legend: {:#b}",
+                token.token_modifiers_bitset
+            );
+            out.push(DecodedToken {
+                line,
+                start,
+                length: token.length,
+                token_type,
+                modifiers: mods,
+            });
+        }
+        out
+    }
+
     fn shutdown(mut self) {
         let id = self.send_request_raw(Shutdown::METHOD, serde_json::Value::Null);
         let _ = self.wait_response(&id);
@@ -239,6 +330,24 @@ impl TestClient {
             .expect("server thread panicked")
             .expect("server errored");
     }
+}
+
+/// One absolute, legend-resolved semantic token.
+#[derive(Debug)]
+struct DecodedToken {
+    line: u32,
+    start: u32,
+    length: u32,
+    token_type: String,
+    modifiers: Vec<String>,
+}
+
+/// The decoded token starting exactly at `(line, start)`.
+fn token_at(tokens: &[DecodedToken], line: u32, start: u32) -> &DecodedToken {
+    tokens
+        .iter()
+        .find(|t| t.line == line && t.start == start)
+        .unwrap_or_else(|| panic!("no token at ({line}, {start}) in {tokens:?}"))
 }
 
 fn range(start: (u32, u32), end: (u32, u32)) -> Range {
@@ -653,6 +762,282 @@ fn lb_goto_and_hover_resolve_struct_names() {
         "{}",
         hover_text(&hover)
     );
+    client.shutdown();
+}
+
+// === Formatting ==========================================================
+
+/// Un-canonical spacing/indentation that still parses cleanly.
+const MESSY_LUA: &str = "local x=1\nif x>0 then\nprint( x )\nend\n";
+
+#[test]
+fn initialize_advertises_formatting_and_semantic_tokens() {
+    let client = start(&[]);
+    let caps = &client.init_result["capabilities"];
+    assert_eq!(caps["documentFormattingProvider"], true);
+    assert_eq!(caps["documentRangeFormattingProvider"], true);
+    assert_eq!(caps["semanticTokensProvider"]["full"], true);
+    let types = &caps["semanticTokensProvider"]["legend"]["tokenTypes"];
+    for expected in [
+        "variable",
+        "parameter",
+        "function",
+        "keyword",
+        "comment",
+        "interface",
+    ] {
+        assert!(
+            types.as_array().unwrap().iter().any(|t| t == expected),
+            "legend missing `{expected}`: {types}"
+        );
+    }
+    client.shutdown();
+}
+
+#[test]
+fn formatting_returns_whole_document_edit_matching_canonical_fmt() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, MESSY_LUA);
+    let mut client = client;
+    let edits = client.formatting(&uri).expect("edits");
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    let edit = &edits[0];
+    // A single whole-document replacement...
+    assert_eq!(edit.range.start, Position::new(0, 0));
+    assert_eq!(edit.range.end, Position::new(4, 0));
+    // ...whose application equals the canonical formatter's output.
+    let canonical = luabox_syntax::lua::fmt::format(MESSY_LUA, luabox_syntax::lua::Dialect::Lua54);
+    assert_ne!(
+        canonical, MESSY_LUA,
+        "fixture must not already be canonical"
+    );
+    assert_eq!(edit.new_text, canonical);
+    client.shutdown();
+}
+
+#[test]
+fn formatting_canonical_document_returns_no_edits() {
+    let canonical = luabox_syntax::lua::fmt::format(MESSY_LUA, luabox_syntax::lua::Dialect::Lua54);
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, &canonical);
+    let mut client = client;
+    let edits = client.formatting(&uri).expect("edits");
+    assert!(edits.is_empty(), "{edits:?}");
+    client.shutdown();
+}
+
+#[test]
+fn formatting_parse_error_document_returns_no_edits() {
+    // The formatter never destroys broken code: no edits, not an error
+    // response (`wait_response` panics on protocol errors).
+    let client = start(&[]);
+    let uri = client.uri("broken.lua");
+    client.open(&uri, "local = 1\n");
+    let mut client = client;
+    let edits = client.formatting(&uri).expect("edits");
+    assert!(edits.is_empty(), "{edits:?}");
+    client.shutdown();
+}
+
+#[test]
+fn lb_formatting_matches_shape_formatter() {
+    let source = "struct Point {x: number, y: number}\n";
+    let client = start(&[]);
+    let uri = client.uri("shapes.lb");
+    client.open(&uri, source);
+    let mut client = client;
+    let edits = client.formatting(&uri).expect("edits");
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    let canonical = luabox_syntax::shape::format(source);
+    assert_ne!(canonical, source, "fixture must not already be canonical");
+    assert_eq!(edits[0].new_text, canonical);
+    // A parse-error .lb document yields no edits.
+    client.change(&uri, "struct {\n");
+    let edits = client.formatting(&uri).expect("edits");
+    assert!(edits.is_empty(), "{edits:?}");
+    client.shutdown();
+}
+
+#[test]
+fn range_formatting_returns_the_whole_document_edit() {
+    // MVP range semantics: the canonical formatter is whole-file, so a
+    // range request returns the same single whole-document edit.
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, MESSY_LUA);
+    let mut client = client;
+    let full = client.formatting(&uri).expect("full edits");
+    let ranged = client
+        .range_formatting(&uri, range((2, 0), (2, 10)))
+        .expect("range edits");
+    assert_eq!(ranged, full);
+    client.shutdown();
+}
+
+// === Semantic tokens =====================================================
+
+#[test]
+fn semantic_tokens_distinguish_locals_globals_params_and_doc_comments() {
+    let source = "\
+---@param n number
+local function double(n)
+    return n * 2
+end
+-- plain comment
+local answer = double(2)
+print(answer)
+";
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, source);
+    let mut client = client;
+    let data = client.semantic_tokens(&uri);
+    assert!(!data.is_empty());
+    let tokens = client.decode_tokens(&data);
+
+    // `---@param n number`: a LuaCATS annotation, not a prose comment.
+    let doc = token_at(&tokens, 0, 0);
+    assert_eq!(doc.token_type, "comment");
+    assert!(
+        doc.modifiers.contains(&"documentation".to_string()),
+        "{doc:?}"
+    );
+    // `-- plain comment` stays an undecorated comment.
+    let prose = token_at(&tokens, 4, 0);
+    assert_eq!(prose.token_type, "comment");
+    assert!(prose.modifiers.is_empty(), "{prose:?}");
+
+    // Keywords and the declaration site.
+    assert_eq!(token_at(&tokens, 1, 0).token_type, "keyword"); // local
+    assert_eq!(token_at(&tokens, 1, 6).token_type, "keyword"); // function
+    let decl = token_at(&tokens, 1, 15); // double
+    assert_eq!(decl.token_type, "function");
+    assert!(
+        decl.modifiers.contains(&"declaration".to_string()),
+        "{decl:?}"
+    );
+    let param_decl = token_at(&tokens, 1, 22); // n
+    assert_eq!(param_decl.token_type, "parameter");
+
+    // `n` inside the body resolves through HIR to the parameter.
+    assert_eq!(token_at(&tokens, 2, 11).token_type, "parameter");
+    assert_eq!(token_at(&tokens, 2, 13).token_type, "operator"); // *
+    assert_eq!(token_at(&tokens, 2, 15).token_type, "number"); // 2
+
+    // Local vs global: `answer` is a plain variable, `print` is a global
+    // (static) from the standard library (defaultLibrary).
+    let local_use = token_at(&tokens, 6, 6); // answer in print(answer)
+    assert_eq!(local_use.token_type, "variable");
+    assert!(local_use.modifiers.is_empty(), "{local_use:?}");
+    let global = token_at(&tokens, 6, 0); // print
+    assert_eq!(global.token_type, "variable");
+    assert!(
+        global.modifiers.contains(&"static".to_string()),
+        "{global:?}"
+    );
+    assert!(
+        global.modifiers.contains(&"defaultLibrary".to_string()),
+        "{global:?}"
+    );
+    // `double(2)` resolves to the local function.
+    assert_eq!(token_at(&tokens, 5, 15).token_type, "function");
+    client.shutdown();
+}
+
+#[test]
+fn semantic_token_columns_and_lengths_are_utf16() {
+    // The emoji is 4 bytes but 2 UTF-16 units.
+    let source = "--[[\u{1F600}]] local x = 1\n";
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, source);
+    let mut client = client;
+    let data = client.semantic_tokens(&uri);
+    let tokens = client.decode_tokens(&data);
+    let comment = token_at(&tokens, 0, 0);
+    assert_eq!(comment.token_type, "comment");
+    assert_eq!(comment.length, 8); // --[[ + emoji(2) + ]]
+    assert_eq!(token_at(&tokens, 0, 9).token_type, "keyword"); // local
+    let x = token_at(&tokens, 0, 15);
+    assert_eq!(x.token_type, "variable");
+    assert!(x.modifiers.contains(&"declaration".to_string()), "{x:?}");
+    client.shutdown();
+}
+
+#[test]
+fn lb_semantic_tokens_classify_shape_declarations() {
+    let source = "\
+/// A closed shape.
+trait Shape {
+    fn area(self) -> number;
+}
+struct Circle { radius: number }
+impl Shape for Circle;
+struct Pair<T> { first: T }
+";
+    let client = start(&[]);
+    let uri = client.uri("shapes.lb");
+    client.open(&uri, source);
+    let mut client = client;
+    let data = client.semantic_tokens(&uri);
+    let tokens = client.decode_tokens(&data);
+
+    // `///` doc comment vs keywords.
+    let doc = token_at(&tokens, 0, 0);
+    assert_eq!(doc.token_type, "comment");
+    assert!(
+        doc.modifiers.contains(&"documentation".to_string()),
+        "{doc:?}"
+    );
+    assert_eq!(token_at(&tokens, 1, 0).token_type, "keyword"); // trait
+
+    // The trait name is an interface-type declaration.
+    let shape = token_at(&tokens, 1, 6);
+    assert_eq!(shape.token_type, "interface");
+    assert!(
+        shape.modifiers.contains(&"declaration".to_string()),
+        "{shape:?}"
+    );
+
+    // Trait fn: method, `self` keyword, return type.
+    assert_eq!(token_at(&tokens, 2, 7).token_type, "method"); // area
+    assert_eq!(token_at(&tokens, 2, 12).token_type, "keyword"); // self
+    assert_eq!(token_at(&tokens, 2, 21).token_type, "type"); // number
+
+    // struct name, field name and field type.
+    assert_eq!(token_at(&tokens, 4, 7).token_type, "class"); // Circle
+    assert_eq!(token_at(&tokens, 4, 16).token_type, "property"); // radius
+    assert_eq!(token_at(&tokens, 4, 24).token_type, "type"); // number
+
+    // `impl Shape for Circle`: trait vs struct references.
+    assert_eq!(token_at(&tokens, 5, 5).token_type, "interface"); // Shape
+    assert_eq!(token_at(&tokens, 5, 15).token_type, "class"); // Circle
+
+    // Generics: `T` declares a type parameter and its use resolves to it.
+    let generic = token_at(&tokens, 6, 12);
+    assert_eq!(generic.token_type, "typeParameter");
+    assert!(
+        generic.modifiers.contains(&"declaration".to_string()),
+        "{generic:?}"
+    );
+    assert_eq!(token_at(&tokens, 6, 24).token_type, "typeParameter"); // first: T
+    client.shutdown();
+}
+
+#[test]
+fn lb_semantic_tokens_survive_parse_errors() {
+    // The shape tree is lossless: broken input still highlights.
+    let source = "trait Shape {\n    fn area(self) -> number { return 1 }\n}\n";
+    let client = start(&[]);
+    let uri = client.uri("shapes.lb");
+    client.open(&uri, source);
+    let mut client = client;
+    let data = client.semantic_tokens(&uri);
+    let tokens = client.decode_tokens(&data);
+    assert!(!tokens.is_empty());
+    assert_eq!(token_at(&tokens, 1, 7).token_type, "method"); // area
     client.shutdown();
 }
 

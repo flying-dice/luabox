@@ -21,18 +21,25 @@
 //!   scope-visible locals, file globals, and keywords elsewhere.
 //! - **Document symbols** — functions (nested, with containers), top-level
 //!   locals, `---@class` declarations.
+//! - **Formatting** — whole-document and range (MVP: range formats the whole
+//!   document, see [`fmt`]) via the canonical formatters; parse errors yield
+//!   no edits, never an error.
+//! - **Semantic tokens** — full-document, standard-types-only legend, for
+//!   both `.lua` (HIR-resolved locals vs globals, LuaCATS doc comments) and
+//!   `.lb` (see [`semantic_tokens`]).
 //!
-//! The remaining SPEC §8 surface (find-refs, rename, inlay hints, semantic
-//! tokens, code actions, signature help, call hierarchy, TCP transport) is
-//! P4 polish.
+//! The remaining SPEC §8 surface (find-refs, rename, inlay hints, code
+//! actions, signature help, call hierarchy, TCP transport) is P4 polish.
 
 mod completion;
 mod diagnostics;
+mod fmt;
 mod goto_def;
 mod hover;
 mod lb;
 mod line_index;
 mod sema;
+mod semantic_tokens;
 mod server;
 mod symbols;
 mod uri;

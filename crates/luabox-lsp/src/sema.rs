@@ -119,6 +119,28 @@ impl FileSema {
         None
     }
 
+    /// Every resolved name *use* in the file as `(range, resolution)` pairs,
+    /// in one pass over the HIR (semantic tokens classify all names at once,
+    /// so the per-offset [`Self::resolution_at`] scan would be quadratic).
+    #[must_use]
+    pub fn name_resolutions(&self) -> Vec<(TextRange, Resolution)> {
+        let file = self.lowered.file();
+        let mut out = Vec::new();
+        for (body_id, body) in file.bodies() {
+            for (expr_id, expr) in body.exprs() {
+                if !matches!(expr, HirExpr::Name(_)) {
+                    continue;
+                }
+                let id = HirId::expr(body_id, expr_id);
+                if let (Some(range), Some(res)) = (file.source_map().range(id), file.resolution(id))
+                {
+                    out.push((range, res.clone()));
+                }
+            }
+        }
+        out
+    }
+
     /// The binding *declared* at `offset` (the cursor is on the definition).
     #[must_use]
     pub fn binding_decl_at(&self, offset: usize) -> Option<BindingId> {

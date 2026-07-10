@@ -2,13 +2,22 @@
 
 First-class VS Code support for the [luabox](https://github.com/luabox/luabox)
 Lua toolchain. This extension is a thin wrapper around the `luabox lsp`
-language server: typecheck, lint, hover, goto-definition, completion and
-document symbols for both `.lua` sources and `.lb` shape files.
+language server: typecheck, lint, hover, goto-definition, completion, document
+symbols, formatting and semantic highlighting for both `.lua` sources and
+`.lb` shape files.
 
 ## What it provides
 
 - Launches `luabox lsp` (stdio) via `vscode-languageclient` and attaches it to
   `lua` and `luabox-shape` (`.lb`) documents.
+- **Formatting** (`Format Document`, and `Format Selection` with
+  whole-document MVP semantics) via the canonical luabox formatters — see
+  [Formatting](#formatting) below.
+- **Semantic highlighting**: the server advertises semantic tokens with only
+  standard token types/modifiers, and `vscode-languageclient` requests them
+  automatically — no theme configuration needed. Locals vs globals,
+  parameters, LuaCATS `---@` annotation comments, and `.lb`
+  structs/traits/generics all render distinctly.
 - A `luabox-shape` language definition for `.lb` files with a TextMate grammar
   (Rust-like `struct` / `trait` / `impl` / `fn` keywords + Lua-ish types) and a
   comment/bracket language configuration.
@@ -26,6 +35,37 @@ document symbols for both `.lua` sources and `.lb` shape files.
   Build it from the repo root with `cargo build --release`; the binary lands at
   `target/release/luabox` (a `lb` alias is created by the packaging scripts).
 - VS Code `^1.85.0`.
+
+## Formatting
+
+The server provides document (and range) formatting for both languages:
+`.lua` is formatted in the canonical luabox style for the project's edition
+(SPEC §10), `.lb` in the canonical shape style. The formatter never destroys
+code — a document with parse errors is simply left unchanged. Range
+formatting has MVP semantics: the whole document is formatted (the canonical
+formatter is whole-file by design).
+
+For `.lb` files this extension is the only formatter, but make it explicit —
+and opt into format-on-save — in your `settings.json`:
+
+```jsonc
+"[luabox-shape]": {
+  "editor.defaultFormatter": "luabox.luabox",
+  "editor.formatOnSave": true
+},
+```
+
+For `.lua` files other Lua extensions may also register formatters, so pick
+luabox explicitly if you want it:
+
+```jsonc
+"[lua]": {
+  "editor.defaultFormatter": "luabox.luabox",
+  "editor.formatOnSave": true
+},
+```
+
+(`luabox.luabox` is this extension's ID: `publisher.name`.)
 
 ## Configuration
 
