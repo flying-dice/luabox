@@ -40,6 +40,10 @@ Release-needed:
   Distribute the editor integrations
 - [#103](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/103)
   `undefined-global` diagnostic (typo'd/unknown global reads)
+- [#105](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/105)
+  Def-declared scalar fields on global tables aren't typed
+- [#106](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/106)
+  Call return type not propagated to an unannotated local (`local p = f()`)
 
 ## Ready
 
