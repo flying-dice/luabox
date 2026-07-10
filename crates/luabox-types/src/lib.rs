@@ -25,6 +25,7 @@
 mod assign;
 mod check;
 mod env;
+mod infer;
 mod lower;
 pub mod shape;
 pub mod ty;
@@ -107,12 +108,20 @@ pub fn check_file_shaped(
 
     let env = TypeEnv::build_from_items(parse, &items, scope.as_ref());
     if strictness != Strictness::None {
+        // Rich table inference (SPEC.md §3) runs first: the checker uses
+        // its published types wherever annotations are absent (annotations
+        // always win), and inference contributes its own diagnostics
+        // (LB0306) at the same strictness-mapped severity.
+        let lowered = luabox_hir::lower(parse);
+        let inference = infer::run(&lowered, &env, file, strictness == Strictness::Strict);
         diags.extend(check::run(
             parse,
             &env,
             file,
             strictness == Strictness::Strict,
+            &inference.expr_types,
         ));
+        diags.extend(inference.diags);
     }
     if let Some(scope) = &scope {
         diags.extend(shape::check_bindings(

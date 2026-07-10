@@ -50,6 +50,10 @@ pub struct TypeEnv {
     /// Function signatures keyed by their target statement (for return
     /// checking inside the body).
     fn_sigs: HashMap<Target, FunctionTy>,
+    /// `---@class` / `---@struct` names keyed by the statement they
+    /// annotate (the carrier `local`). Inference uses this to associate a
+    /// locally-constructed table with its declaration.
+    declared_targets: HashMap<Target, String>,
     /// References to undeclared type names (LB0305): `(name, span)`.
     pub(crate) unknown_names: Vec<(String, luacats::Span)>,
 }
@@ -161,6 +165,16 @@ impl TypeEnv {
                         },
                     );
                     current_class = Some(c.name.clone());
+                    if let Some(span) = item.target {
+                        self.declared_targets
+                            .insert((span.start, span.end), c.name.clone());
+                    }
+                }
+                Tag::Struct(s) if !s.name.is_empty() => {
+                    if let Some(span) = item.target {
+                        self.declared_targets
+                            .insert((span.start, span.end), s.name.clone());
+                    }
                 }
                 Tag::Field(f) => {
                     let Some(class) = current_class
@@ -379,6 +393,11 @@ impl TypeEnv {
 
     pub(crate) fn fn_sig(&self, target: Target) -> Option<&FunctionTy> {
         self.fn_sigs.get(&target)
+    }
+
+    /// The `---@class`/`---@struct` name bound to a statement, if any.
+    pub(crate) fn declared_target(&self, target: Target) -> Option<&str> {
+        self.declared_targets.get(&target).map(String::as_str)
     }
 }
 

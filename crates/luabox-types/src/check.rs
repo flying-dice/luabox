@@ -37,12 +37,15 @@ const UNKNOWN_FIELD: u16 = 303;
 const RETURN_MISMATCH: u16 = 304;
 const UNKNOWN_TYPE_NAME: u16 = 305;
 
-/// Run the checker over one parsed file.
+/// Run the checker over one parsed file. `inferred` carries the
+/// inference engine's expression types keyed by byte range — consulted
+/// where annotations are absent (annotations always win).
 pub(crate) fn run(
     parse: &lua::Parse,
     typeenv: &TypeEnv,
     file: &str,
     strict: bool,
+    inferred: &HashMap<(usize, usize), Ty>,
 ) -> Vec<Diagnostic> {
     let severity = if strict {
         Severity::Error
@@ -54,6 +57,7 @@ pub(crate) fn run(
         file,
         strict,
         severity,
+        inferred,
         diags: Vec::new(),
         scopes: vec![HashMap::new()],
         ret_stack: Vec::new(),
@@ -99,6 +103,9 @@ struct Checker<'a> {
     file: &'a str,
     strict: bool,
     severity: Severity,
+    /// Inference results by byte range (rich table inference, SPEC.md §3):
+    /// the fallback for expressions annotations cannot type.
+    inferred: &'a HashMap<(usize, usize), Ty>,
     diags: Vec<Diagnostic>,
     scopes: Vec<HashMap<String, Binding>>,
     /// Expected returns of the enclosing function(s); `None` = unannotated.
@@ -390,8 +397,31 @@ impl Checker<'_> {
 
     // --- expression types ---------------------------------------------
 
-    /// The (first-value) type of an expression. Unknowable stays `unknown`.
+    /// The (first-value) type of an expression: annotation-derived first,
+    /// falling back to the inference engine's published type (rich table
+    /// inference, SPEC.md §3) when annotations say nothing.
     fn expr_ty(&self, expr: &Expr) -> Ty {
+        // Name references prefer the flow-sensitive inferred type: for
+        // annotated bindings it *starts* from the annotation
+        // (authoritative) and only ever refines it (narrowing), and for
+        // unannotated bindings it is the only source of information.
+        if matches!(expr, Expr::Name(_))
+            && let Some(ty) = self.inferred.get(&range_key(expr.syntax()))
+        {
+            return ty.clone();
+        }
+        let ty = self.annotated_expr_ty(expr);
+        if matches!(ty, Ty::Unknown)
+            && let Some(inferred) = self.inferred.get(&range_key(expr.syntax()))
+        {
+            return inferred.clone();
+        }
+        ty
+    }
+
+    /// The annotation/literal-derived type of an expression (the P0
+    /// subset). Unknowable stays `unknown`.
+    fn annotated_expr_ty(&self, expr: &Expr) -> Ty {
         match expr {
             Expr::Literal(_) => env::literal_ty(expr).unwrap_or(Ty::Unknown),
             Expr::Name(name) => name.name().map_or(Ty::Unknown, |t| self.name_ty(t.text())),
