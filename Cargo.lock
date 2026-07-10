@@ -932,10 +932,12 @@ name = "luabox-resolve"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "luabox-syntax",
  "proptest",
  "pubgrub",
  "semver",
  "serde",
+ "serde_json",
  "tempfile",
  "toml_edit",
 ]

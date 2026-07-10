@@ -19,10 +19,13 @@
 //! Status: manifest parsing/editing, solver, lockfile, and git fetching
 //! landed. Registry client and luarocks bridge are P2 follow-ups (#19/#20).
 
+pub mod advisory;
 pub mod git_provider;
 pub mod lockfile;
+pub mod luarocks;
 pub mod manifest;
 pub mod provider;
+pub mod registry;
 mod report;
 mod semver_ranges;
 pub mod solver;
@@ -31,9 +34,11 @@ pub use git_provider::{GitCheckout, GitProvider};
 pub use lockfile::{
     LOCKFILE_NAME, LOCKFILE_VERSION, LockedPackage, LockedSource, Lockfile, LockfileError,
 };
+pub use luarocks::{LUAROCKS_PREFIX, LuaRocksProvider};
 pub use manifest::{Manifest, ManifestError};
 pub use provider::{
     GitReference, PackageId, PackageMeta, PackageProvider, PathProvider, ProviderError, Source,
     StackedProvider, StaticProvider,
 };
+pub use registry::{IndexDep, IndexEntry, REGISTRY_ENV, Registry, RegistryError, RegistryProvider};
 pub use solver::{Resolution, ResolveError, ResolvedPackage, resolve, verify_resolution};

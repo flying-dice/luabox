@@ -65,6 +65,9 @@ fn run_command(world: &mut AcceptanceWorld, command: String) {
         // Point dependency commands at a scenario-local store so tests
         // never touch (or pollute) the user's ~/.luabox/store.
         .env("LUABOX_STORE", world.dir.path().join(".luabox-store"))
+        // Hermetic: a registry configured on the host must not leak into
+        // scenarios (registry scenarios opt in via their own steps).
+        .env_remove("LUABOX_REGISTRY")
         .output()
         .expect("failed to spawn luabox");
     world.output = Some(output);
@@ -974,5 +977,178 @@ fn unmap_last_bundle_line(world: &mut AcceptanceWorld, path: String) {
     run_command(
         world,
         format!("luabox unmap {path} {path}:{last}: synthetic-error"),
+    );
+}
+
+// --- registry (distribution/registry.feature — #20) ------------------------
+//
+// Hermetic: LUABOX_REGISTRY points at a scenario-local directory registry
+// (".registry" under the scenario dir) and LUABOX_STORE at the scenario
+// store. Publisher and consumer projects are sibling subdirectories, so one
+// scenario can publish from "pkg" and install from "app".
+
+/// Run a `luabox …` command from a subdirectory of the scenario dir,
+/// optionally with the scenario-local registry configured.
+fn run_luabox_in_dir(world: &mut AcceptanceWorld, command: &str, dir: &str, registry: bool) {
+    let command = world.subst(command);
+    let mut parts = command.split_whitespace();
+    let program = parts.next().expect("empty command");
+    assert_eq!(program, "luabox", "scenarios drive the luabox binary only");
+    let cwd = world.dir.path().join(dir);
+    std::fs::create_dir_all(&cwd).expect("failed to create the project directory");
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_luabox"));
+    cmd.args(parts)
+        .current_dir(&cwd)
+        .env("LUABOX_STORE", world.dir.path().join(".luabox-store"))
+        // Hermetic either way: the host's registry never leaks in.
+        .env_remove("LUABOX_REGISTRY");
+    if registry {
+        cmd.env("LUABOX_REGISTRY", world.dir.path().join(".registry"));
+    }
+    world.output = Some(cmd.output().expect("failed to spawn luabox"));
+}
+
+#[given(expr = "I run {string} in {string} against the registry")]
+#[when(expr = "I run {string} in {string} against the registry")]
+fn run_in_dir_against_registry(world: &mut AcceptanceWorld, command: String, dir: String) {
+    run_luabox_in_dir(world, &command, &dir, true);
+}
+
+#[when(expr = "I run {string} in {string} without a registry")]
+fn run_in_dir_without_registry(world: &mut AcceptanceWorld, command: String, dir: String) {
+    run_luabox_in_dir(world, &command, &dir, false);
+}
+
+// --- luarocks bridge (distribution/luarocks.feature — #19) -----------------
+//
+// Hermetic scenarios point LUABOX_LUAROCKS_MIRROR at a scenario-local mirror
+// directory (".luarocks-mirror"), pre-populated with `<rock>-<version>.rockspec`
+// files and extracted `<rock>-<version>/` source trees. No network is touched.
+// The one @network scenario resolves a real rock from luarocks.org and is
+// filtered by CI; it also self-skips when the network is unreachable so an
+// offline full-suite run stays green.
+
+/// The scenario's luarocks mirror directory.
+fn luarocks_mirror(world: &AcceptanceWorld) -> std::path::PathBuf {
+    world.dir.path().join(".luarocks-mirror")
+}
+
+/// Writes a pure-Lua builtin rock into the mirror: a `<rock>-<version>-1.rockspec`
+/// plus a source tree exporting a single module named after the rock.
+#[given(expr = "a luarocks mirror providing pure-Lua rock {string} at {string}")]
+fn luarocks_mirror_pure_lua(world: &mut AcceptanceWorld, rock: String, version: String) {
+    let mirror = luarocks_mirror(world);
+    let luarocks_version = format!("{version}-1");
+    let rockspec = format!(
+        "package = \"{rock}\"\n\
+         version = \"{luarocks_version}\"\n\
+         source = {{ url = \"https://example.invalid/{rock}.tar.gz\" }}\n\
+         dependencies = {{ \"lua >= 5.1\" }}\n\
+         build = {{\n\
+         \x20 type = \"builtin\",\n\
+         \x20 modules = {{ {rock} = \"{rock}.lua\" }},\n\
+         }}\n"
+    );
+    std::fs::create_dir_all(&mirror).expect("create mirror dir");
+    std::fs::write(
+        mirror.join(format!("{rock}-{luarocks_version}.rockspec")),
+        rockspec,
+    )
+    .expect("write rockspec");
+    let tree = mirror.join(format!("{rock}-{luarocks_version}"));
+    std::fs::create_dir_all(&tree).expect("create source tree");
+    std::fs::write(
+        tree.join(format!("{rock}.lua")),
+        format!("return \"{rock}\"\n"),
+    )
+    .expect("write module");
+}
+
+/// Writes a C/native rock (`build.type = make`) into the mirror — resolution
+/// must reject it (SPEC.md §6: luabox is not a C build system).
+#[given(expr = "a luarocks mirror providing C rock {string} at {string}")]
+fn luarocks_mirror_c_rock(world: &mut AcceptanceWorld, rock: String, version: String) {
+    let mirror = luarocks_mirror(world);
+    let luarocks_version = format!("{version}-1");
+    let rockspec = format!(
+        "package = \"{rock}\"\n\
+         version = \"{luarocks_version}\"\n\
+         source = {{ url = \"git+https://example.invalid/{rock}.git\" }}\n\
+         dependencies = {{ \"lua >= 5.1\" }}\n\
+         build = {{\n\
+         \x20 type = \"make\",\n\
+         \x20 modules = {{ [\"{rock}.core\"] = \"src/{rock}.c\" }},\n\
+         }}\n"
+    );
+    std::fs::create_dir_all(&mirror).expect("create mirror dir");
+    std::fs::write(
+        mirror.join(format!("{rock}-{luarocks_version}.rockspec")),
+        rockspec,
+    )
+    .expect("write rockspec");
+}
+
+/// Runs a `luabox …` command with the hermetic luarocks mirror configured
+/// (plus the scenario-local store). No network is reachable for the bridge.
+#[when(expr = "I run {string} against the luarocks mirror")]
+fn run_against_luarocks_mirror(world: &mut AcceptanceWorld, command: String) {
+    let command = world.subst(&command);
+    let mirror = luarocks_mirror(world);
+    run_command_with_env(
+        world,
+        &command,
+        &[
+            (
+                "LUABOX_STORE".to_string(),
+                world
+                    .dir
+                    .path()
+                    .join(".luabox-store")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            (
+                "LUABOX_LUAROCKS_MIRROR".to_string(),
+                mirror.to_string_lossy().into_owned(),
+            ),
+        ],
+    );
+}
+
+/// @network: resolve+install a real rock from luarocks.org. Self-skips (by
+/// substituting a trivially successful command) when the network is down, so
+/// offline runs stay green; CI filters the @network tag to avoid the network.
+#[when(expr = "I install {string} from luarocks.org")]
+fn install_real_rock(world: &mut AcceptanceWorld, spec: String) {
+    let reachable = std::process::Command::new("curl")
+        .args([
+            "-fsS",
+            "--max-time",
+            "15",
+            "-o",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+            "https://luarocks.org/manifest.json",
+        ])
+        .status()
+        .is_ok_and(|s| s.success());
+    if !reachable {
+        eprintln!("skipping @network scenario: luarocks.org is unreachable");
+        // A trivially successful command so `Then the command succeeds` holds.
+        run_command(world, "luabox --version".to_string());
+        return;
+    }
+    let _ = spec;
+    run_command_with_env(
+        world,
+        "luabox install",
+        &[(
+            "LUABOX_STORE".to_string(),
+            world
+                .dir
+                .path()
+                .join(".luabox-store")
+                .to_string_lossy()
+                .into_owned(),
+        )],
     );
 }

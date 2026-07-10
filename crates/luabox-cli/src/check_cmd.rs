@@ -36,9 +36,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use luabox_diag::{Code, Diagnostic, Format, Label, Severity, Span, render};
-use luabox_resolve::manifest::Manifest;
+use luabox_resolve::manifest::{Dependency, Manifest};
 use luabox_syntax::{Dialect, lua};
-use luabox_types::{Ambient, ShapeOptions, ShapeStore, Strictness, combined_defs, stdlib_defs};
+use luabox_types::{
+    Ambient, DepShapeExport, ShapeOptions, ShapeStore, Strictness, combined_defs, stdlib_defs,
+};
 use rayon::prelude::*;
 
 /// Execute `luabox check` from `cwd`. With `watch`, the check reruns on
@@ -144,7 +146,7 @@ pub(crate) fn run_once(
             let rel = display_rel(path, &project.root);
             let source =
                 fs::read_to_string(path).with_context(|| format!("cannot read `{rel}`"))?;
-            Ok(store.check_lb_file(path, &source, &project.shape_paths))
+            Ok(store.check_lb_file(path, &source, &project.shape_paths, &project.dependencies))
         })
         .collect();
     let mut diags: Vec<Diagnostic> = def_diags;
@@ -220,6 +222,7 @@ fn check_one(
         store,
         file_dir,
         shape_paths: &project.shape_paths,
+        dependencies: &project.dependencies,
     };
     diags.extend(luabox_types::check_file_shaped(
         &parse,
@@ -288,6 +291,9 @@ pub(crate) struct Project {
     pub(crate) build_target: Dialect,
     /// `[types] shape-paths`, absolute, in manifest order (SHAPES.md §6).
     shape_paths: Vec<PathBuf>,
+    /// Dependencies that export shape modules (SHAPES.md §6, tier 3), each
+    /// with its package root and its own `[types] shapes`/`shape-paths`.
+    dependencies: Vec<DepShapeExport>,
     /// `[types] defs`, ambient definition packages resolved from the
     /// project-local `defs/` directory (SPEC.md §3, §5).
     defs: Vec<String>,
@@ -337,6 +343,7 @@ pub(crate) fn discover(cwd: &Path) -> anyhow::Result<Project> {
                     .iter()
                     .map(|p| current.join(p))
                     .collect(),
+                dependencies: resolve_dep_shape_exports(current, &manifest),
                 defs: manifest.types.defs.clone(),
             });
         }
@@ -349,8 +356,54 @@ pub(crate) fn discover(cwd: &Path) -> anyhow::Result<Project> {
         out_dir: None,
         build_target: Dialect::Lua54,
         shape_paths: Vec::new(),
+        dependencies: Vec::new(),
         defs: Vec::new(),
     })
+}
+
+/// Build the dependency shape-export table for resolution tier 3 (SHAPES.md
+/// §6): for each declared dependency, locate its package root (a path
+/// dependency in place at its `path`, every other kind under
+/// `lua_modules/<name>/`) and read that dependency's *own* `[types] shapes`
+/// and `[types] shape-paths` from its manifest. Only dependencies that
+/// actually export shape modules contribute an entry; a dependency with no
+/// manifest on disk (uninstalled, or a source kind whose root cannot be
+/// located here) or an empty `[types] shapes` simply exports nothing and is
+/// skipped. `.lb` sources are never parsed here — only the manifest is read
+/// (SHAPES.md §7: distribution ships `.lb` opaquely).
+fn resolve_dep_shape_exports(root: &Path, manifest: &Manifest) -> Vec<DepShapeExport> {
+    let mut exports = Vec::new();
+    for (name, dep) in manifest
+        .dependencies
+        .iter()
+        .chain(&manifest.dev_dependencies)
+    {
+        let dep_root = match dep {
+            Dependency::Path(p) => root.join(p.path.replace('\\', "/")),
+            _ => root.join("lua_modules").join(name),
+        };
+        let Ok(text) = fs::read_to_string(dep_root.join("luabox.toml")) else {
+            continue;
+        };
+        let Ok(dep_manifest) = Manifest::parse(&text) else {
+            continue;
+        };
+        if dep_manifest.types.shapes.is_empty() {
+            continue;
+        }
+        exports.push(DepShapeExport {
+            name: name.clone(),
+            shape_paths: dep_manifest
+                .types
+                .shape_paths
+                .iter()
+                .map(|p| dep_root.join(p))
+                .collect(),
+            exported: dep_manifest.types.shapes.clone(),
+            root: dep_root,
+        });
+    }
+    exports
 }
 
 /// Resolve `[types] defs` entries against the project-local `defs/`

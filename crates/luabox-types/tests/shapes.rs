@@ -10,11 +10,12 @@ use std::path::PathBuf;
 
 use luabox_diag::Diagnostic;
 use luabox_syntax::lua::{Dialect, parse};
-use luabox_types::{ShapeOptions, ShapeStore, Strictness, check_file_shaped};
+use luabox_types::{DepShapeExport, ShapeOptions, ShapeStore, Strictness, check_file_shaped};
 
 struct Fixture {
     dir: tempfile::TempDir,
     shape_paths: Vec<PathBuf>,
+    dependencies: Vec<DepShapeExport>,
 }
 
 impl Fixture {
@@ -22,6 +23,7 @@ impl Fixture {
         Fixture {
             dir: tempfile::tempdir().expect("tempdir"),
             shape_paths: Vec::new(),
+            dependencies: Vec::new(),
         }
     }
 
@@ -37,6 +39,19 @@ impl Fixture {
         self.shape_paths.push(path);
     }
 
+    /// Register a dependency rooted at `root_rel` (under the fixture dir)
+    /// that exports the given shape module names from its own root.
+    fn add_dependency(&mut self, name: &str, root_rel: &str, exported: &[&str]) {
+        let root = self.dir.path().join(root_rel);
+        std::fs::create_dir_all(&root).expect("mkdir");
+        self.dependencies.push(DepShapeExport {
+            name: name.to_owned(),
+            root,
+            exported: exported.iter().map(|s| (*s).to_owned()).collect(),
+            shape_paths: Vec::new(),
+        });
+    }
+
     /// Check `source` as `src/main.lua` at the given strictness.
     fn check_at(&self, source: &str, strictness: Strictness) -> Vec<Diagnostic> {
         let parsed = parse(source, Dialect::Lua54);
@@ -48,6 +63,7 @@ impl Fixture {
             store: &store,
             file_dir: &file_dir,
             shape_paths: &self.shape_paths,
+            dependencies: &self.dependencies,
         };
         check_file_shaped(&parsed, "src/main.lua", strictness, Some(&opts), None)
     }
@@ -68,7 +84,7 @@ impl Fixture {
         let path = self.dir.path().join(rel);
         let source = std::fs::read_to_string(&path).expect("read .lb");
         let store = ShapeStore::new(self.dir.path());
-        store.check_lb_file(&path, &source, &self.shape_paths)
+        store.check_lb_file(&path, &source, &self.shape_paths, &self.dependencies)
     }
 }
 
@@ -683,15 +699,103 @@ use({ x = 1 })
 // === Resolution (LB2005) ====================================================
 
 #[test]
-fn lb2005_unresolved_module_with_p2_note() {
+fn lb2005_unresolved_module_documents_all_tiers() {
     let f = Fixture::new();
     let diags = f.check("---@use missing_module\n");
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert_eq!(diags[0].code.to_string(), "LB2005");
     assert!(
-        diags[0].notes.iter().any(|n| n.contains("P2")),
-        "expected the dependency-shapes note: {diags:?}"
+        diags[0]
+            .notes
+            .iter()
+            .any(|n| n.contains("shape-paths") && n.contains("[types] shapes")),
+        "expected the note to document every resolution tier: {diags:?}"
     );
+}
+
+// === Resolution tier 3: dependency-exported shapes (SHAPES.md §6) ==========
+
+#[test]
+fn dependency_exported_shape_resolves_and_seals() {
+    let mut f = Fixture::new();
+    // A dependency package rooted at `dep/`, exporting `geometry`.
+    f.write("dep/geometry.lb", "struct Point { x: number, y: number }\n");
+    f.add_dependency("geo", "dep", &["geometry"]);
+    // The consumer `---@use geometry` resolves across the package boundary,
+    // and sealed checking fires on the bound literal.
+    let diags = f.check("---@use geometry\n\n---@struct Point\nlocal p = { x = 0 }\n");
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code.to_string(), "LB2001");
+    assert!(diags[0].message.contains("`y`"), "{}", diags[0].message);
+}
+
+#[test]
+fn dependency_not_exporting_the_module_is_lb2005() {
+    let mut f = Fixture::new();
+    // The `.lb` exists in the dependency, but it is not in `[types] shapes`,
+    // so it stays invisible across the package boundary.
+    f.write("dep/geometry.lb", "struct Point { x: number, y: number }\n");
+    f.add_dependency("geo", "dep", &[]);
+    let diags = f.check("---@use geometry\n");
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code.to_string(), "LB2005");
+}
+
+#[test]
+fn two_dependencies_exporting_the_same_module_are_ambiguous() {
+    let mut f = Fixture::new();
+    f.write("dep_a/geometry.lb", "struct Point { x: number }\n");
+    f.write("dep_b/geometry.lb", "struct Point { x: number }\n");
+    f.add_dependency("geo_a", "dep_a", &["geometry"]);
+    f.add_dependency("geo_b", "dep_b", &["geometry"]);
+    let diags = f.check("---@use geometry\n");
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code.to_string(), "LB2005");
+    assert!(
+        diags[0].message.contains("ambiguous"),
+        "{}",
+        diags[0].message
+    );
+    // Both candidate files are named.
+    let note = diags[0].notes.join(" ");
+    assert!(note.contains("dep_a") && note.contains("dep_b"), "{note}");
+}
+
+#[test]
+fn local_tiers_win_over_dependency_exports() {
+    let mut f = Fixture::new();
+    // A sibling `geometry.lb` (tier 1) and a dependency both define it; the
+    // sibling wins, so this literal is clean only via the local file.
+    f.write("src/geometry.lb", "struct Point { x: number }\n");
+    f.write("dep/geometry.lb", "struct Point { x: number, y: number }\n");
+    f.add_dependency("geo", "dep", &["geometry"]);
+    let diags = f.check("---@use geometry\n\n---@struct Point\nlocal p = { x = 1 }\n");
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn dependency_shape_nested_use_stays_within_its_package() {
+    let mut f = Fixture::new();
+    // The exported `geometry.lb` itself `use`s a sibling `base.lb` that lives
+    // in the same dependency package — nested resolution finds it there.
+    f.write("dep/base.lb", "struct Point { x: number, y: number }\n");
+    f.write(
+        "dep/geometry.lb",
+        "use base;\nstruct Segment { from: Point, to: Point }\n",
+    );
+    f.add_dependency("geo", "dep", &["geometry"]);
+    let src = "\
+---@use geometry
+
+---@struct Segment
+local s = { from = { x = 0, y = 0 }, to = { x = 1 } }
+";
+    // The nested `to` literal misses `y`: sealed checking recurses across the
+    // dependency's own `use`.
+    let diags = f.check(src);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code.to_string(), "LB2001");
+    assert!(diags[0].message.contains("`y`"));
 }
 
 #[test]

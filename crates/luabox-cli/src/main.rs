@@ -7,12 +7,12 @@ mod audit_cmd;
 mod bench_cmd;
 mod build_cmd;
 mod bundle_cmd;
-mod publish_cmd;
 mod check_cmd;
 mod deps_cmd;
 mod fmt_cmd;
 mod lint_cmd;
 mod lsp_cmd;
+mod publish_cmd;
 mod run_cmd;
 mod scaffold;
 mod test_cmd;
@@ -160,7 +160,12 @@ enum Command {
         open: bool,
     },
     /// Publish the package to the registry
-    Publish,
+    Publish {
+        /// Yank a published version: hidden from new resolutions, still
+        /// restorable from existing lockfiles, never deleted
+        #[arg(long, value_name = "VERSION")]
+        yank: Option<String>,
+    },
     /// Start the language server (stdio)
     Lsp {
         /// Accepted for editor compatibility; stdio is the only transport.
@@ -260,7 +265,7 @@ fn main() -> anyhow::Result<()> {
         Command::Bench => bench_cmd::run(&std::env::current_dir()?),
         Command::Run { script, args } => run_cmd::run(&std::env::current_dir()?, &script, &args),
         Command::Doc { .. } => unimplemented("doc", "P5"),
-        Command::Publish => publish_cmd::run(&std::env::current_dir()?),
+        Command::Publish { yank } => publish_cmd::run(&std::env::current_dir()?, yank.as_deref()),
         Command::Lsp { .. } => lsp_cmd::run(),
         Command::Toolchain { action } => {
             let cwd = std::env::current_dir()?;

@@ -14,7 +14,7 @@ mod scope;
 mod store;
 
 pub use scope::{AliasShape, GenericParamDef, ShapeScope, StructShape, TraitFnSig, TraitShape};
-pub use store::ShapeStore;
+pub use store::{DepShapeExport, ShapeStore};
 
 use std::path::{Path, PathBuf};
 
@@ -34,6 +34,10 @@ pub struct ShapeOptions<'a> {
     pub file_dir: &'a Path,
     /// `[types] shape-paths` directories, absolute, in manifest order.
     pub shape_paths: &'a [PathBuf],
+    /// Dependencies that may export shape modules (SHAPES.md §6, tier 3).
+    /// Empty when the project has no shape-exporting dependencies; the store
+    /// never reads dependency manifests itself — the CLI builds this list.
+    pub dependencies: &'a [DepShapeExport],
 }
 
 /// Whether the harvested annotations use any shape binding tag at all —
@@ -63,7 +67,12 @@ pub(crate) fn resolve_uses(
             if use_tag.module.is_empty() {
                 continue;
             }
-            let outcome = store::resolve(&use_tag.module, opts.file_dir, opts.shape_paths);
+            let outcome = store::resolve(
+                &use_tag.module,
+                opts.file_dir,
+                opts.shape_paths,
+                opts.dependencies,
+            );
             match outcome {
                 store::ResolveOutcome::Found(path) => roots.push(path),
                 other => diags.push(opts.store.unresolved_use(
@@ -75,7 +84,9 @@ pub(crate) fn resolve_uses(
             }
         }
     }
-    let scope = opts.store.scope_from(&roots, opts.shape_paths);
+    let scope = opts
+        .store
+        .scope_from(&roots, opts.shape_paths, opts.dependencies);
     (scope, diags)
 }
 

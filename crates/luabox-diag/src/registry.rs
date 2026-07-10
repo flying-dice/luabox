@@ -181,6 +181,11 @@ static REGISTRY: &[Entry] = &[
         explain: LB1002,
     },
     Entry {
+        code: Code::new(1100),
+        title: "known security advisory affects a locked dependency",
+        explain: LB1100,
+    },
+    Entry {
         code: Code::new(2001),
         title: "missing non-optional field on shape-bound literal",
         explain: LB2001,
@@ -973,6 +978,39 @@ arrive with the package manager (SPEC.md §3, §6).
 Fix: create the defs file/directory, correct the name, or remove the entry.
 ";
 
+const LB1100: &str = "\
+# LB1100: known security advisory affects a locked dependency
+
+`luabox audit` (SPEC.md §6, §14) matched a package pinned in `luabox.lock`
+against a version range a loaded advisory marks as affected — and not
+excluded by a `patched` range, and not withdrawn.
+
+Advisories come from a local, directory-of-TOML-files database (RUSTSEC-
+analog; no hosted feed exists yet): `LUABOX_ADVISORY_DB`, or
+`~/.luabox/advisory-db` if unset. When neither location exists, `luabox
+audit` prints a note and exits `0` — a security check must never fail a
+build merely because no database was ever configured; once a database *is*
+present, findings are judged normally.
+
+Severity maps to how loud this diagnostic is:
+
+- `critical` / `high` → error (nonzero exit).
+- `medium` / `low` → warning (does not fail the command by itself).
+
+```
+$ luabox audit
+error[LB1100]: LBSEC-2026-0001 insecure-pkg 1.0.0: remote code execution (high)
+note: insecure-pkg evaluates untrusted input passed to run()
+note: more info: https://example.com/advisories/LBSEC-2026-0001
+audit: 1 advisory loaded, 1 finding (1 error, 0 warnings) against 1 locked package(s)
+```
+
+Upgrade the dependency to a patched version (`luabox update <pkg>`), pin an
+alternative, or — if the advisory genuinely does not apply to how the
+package is used — accept the risk consciously; there is no in-manifest
+suppression for this code yet (SPEC.md §19).
+";
+
 const LB2001: &str = "\
 # LB2001: missing non-optional field on shape-bound literal
 
@@ -1111,16 +1149,34 @@ that could not be resolved. Resolution tries, first hit wins (SHAPES.md §6):
 1. a sibling `<module>.lb` next to the using file;
 2. the `[types] shape-paths` directories from `luabox.toml`, in order —
    more than one hit *within* this tier is an ambiguity, also this error;
-3. dependency-exported shapes (`[types] shapes` in the dependency's
-   manifest) — **not searched yet**; that tier lands in P2.
+3. dependency-exported shapes. A dependency *exports* shape modules by
+   listing them in `[types] shapes` in **its own** manifest:
+
+   ```toml
+   # a dependency's luabox.toml
+   [types]
+   shapes = [\"geometry\"]
+   ```
+
+   The consumer then resolves `---@use geometry` to that dependency's
+   `geometry.lb` (looked up at the dependency root, then on the
+   dependency's own `[types] shape-paths`). Only exported names cross the
+   package boundary — a `.lb` the dependency does not list stays private.
+   Two dependencies exporting the same module is an ambiguity, this error,
+   listing both candidates.
 
 ```lua
----@use geometry     -- LB2005 if no geometry.lb is found in tiers 1–2
+---@use geometry     -- LB2005 if no geometry.lb is found in tiers 1–3
 ```
 
+A dependency's own shape file resolves *its* nested `use`s within that
+dependency package only (one level): the exports of a
+dependency-of-a-dependency are not visible.
+
 Create the `.lb` file next to the using file, add its directory to
-`[types] shape-paths`, or fix the spelling. For an ambiguity, remove or
-rename one of the competing files (the diagnostic lists the candidates).
+`[types] shape-paths`, have the owning dependency export it via
+`[types] shapes`, or fix the spelling. For an ambiguity, remove or rename
+one of the competing modules (the diagnostic lists the candidates).
 ";
 
 const LB2006: &str = "\
@@ -1237,8 +1293,8 @@ mod tests {
             "LB0001", "LB0010", "LB0011", "LB0012", "LB0013", "LB0014", "LB0015", "LB0016",
             "LB0300", "LB0301", "LB0302", "LB0303", "LB0304", "LB0305", "LB0306", "LB0500",
             "LB0501", "LB0502", "LB0503", "LB0504", "LB0505", "LB0506", "LB0507", "LB0508",
-            "LB1001", "LB2001", "LB2002", "LB2003", "LB2004", "LB2005", "LB2006", "LB2007",
-            "LB2008", "LB2010",
+            "LB1001", "LB1100", "LB2001", "LB2002", "LB2003", "LB2004", "LB2005", "LB2006",
+            "LB2007", "LB2008", "LB2010",
         ] {
             let code: Code = raw.parse().unwrap();
             assert!(explain(&code).is_some(), "{raw} missing from registry");

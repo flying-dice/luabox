@@ -9,10 +9,16 @@ rust-version.workspace = true
 
 [dependencies]
 serde.workspace = true
+# The registry index (SPEC.md §6) is JSON-lines, crates.io sparse-index style.
+serde_json.workspace = true
 toml_edit.workspace = true
 anyhow.workspace = true
 pubgrub.workspace = true
 semver.workspace = true
+# The LuaRocks bridge (SPEC.md §6) parses rockspecs — which are Lua files —
+# with the same lossless parser the rest of luabox uses, then evaluates a
+# bounded subset statically. This is the one place Distribution reads Lua.
+luabox-syntax.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

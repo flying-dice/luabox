@@ -34,7 +34,7 @@ pub mod ty;
 pub use assign::assignable;
 pub use defs::{Ambient, combined as combined_defs, stdlib as stdlib_defs};
 pub use env::TypeEnv;
-pub use shape::{ShapeOptions, ShapeStore};
+pub use shape::{DepShapeExport, ShapeOptions, ShapeStore};
 
 use luabox_diag::Diagnostic;
 use luabox_syntax::{lua, luacats};
