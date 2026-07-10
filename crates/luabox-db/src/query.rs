@@ -18,7 +18,7 @@ use luabox_types::{TypeEnv, check_file};
 
 use crate::db::Db;
 use crate::input::{Project, SourceFile};
-use crate::value::{Annotations, Diagnostics, ParsedModule, TypeEnvHandle};
+use crate::value::{Annotations, Diagnostics, LoweredHandle, ParsedModule, TypeEnvHandle};
 
 /// Parse a file into a lossless syntax tree.
 ///
@@ -48,6 +48,22 @@ pub fn type_env(db: &dyn Db, file: SourceFile) -> TypeEnvHandle {
     db.push_log(format!("type_env({})", display(db, file)));
     let parsed = parse(db, file);
     TypeEnvHandle::new(TypeEnv::build(parsed.parse()))
+}
+
+/// Lower a file to HIR: desugared bodies plus name resolution
+/// (local/upvalue/global), the source map, and the `require` graph.
+///
+/// This is exactly [`luabox_hir::lower`] over the memoized parse — the query
+/// behind LSP goto-definition and scope-aware completion.
+///
+/// `no_eq`: [`luabox_hir::LoweredFile`] is not comparable, so this query never
+/// backdates — a re-parse always yields a fresh lowering. See
+/// [`LoweredHandle`].
+#[salsa::tracked(no_eq)]
+pub fn lower(db: &dyn Db, file: SourceFile) -> LoweredHandle {
+    db.push_log(format!("lower({})", display(db, file)));
+    let parsed = parse(db, file);
+    LoweredHandle::new(luabox_hir::lower(parsed.parse()))
 }
 
 /// Typecheck a file against its own annotations at the project strictness.

@@ -225,3 +225,55 @@ fn whitespace_only_edit_backdates_diagnostics() {
         "identical aggregated diagnostics must backdate the aggregator: {log:?}"
     );
 }
+
+#[test]
+fn lower_exposes_name_resolution_and_is_memoized() {
+    let mut host = host();
+    host.apply_change(set("a.lua", GOOD));
+    let a = Path::new("a.lua");
+
+    let snap = host.snapshot();
+    let lowered = snap.lower(a).unwrap();
+    // `local function f` introduces one binding named `f`, plus its param.
+    let names: Vec<&str> = lowered
+        .file()
+        .bindings()
+        .map(|(_, b)| b.name.as_str())
+        .collect();
+    assert!(names.contains(&"f"), "bindings: {names:?}");
+    let _ = host.take_execution_log();
+
+    // Re-reading without an edit is served from cache.
+    let _ = host.snapshot().lower(a);
+    let log = host.take_execution_log();
+    assert!(
+        mentioning(&log, "lower(a.lua)").is_empty(),
+        "unchanged file must not re-lower: {log:?}"
+    );
+
+    // Unknown path -> None.
+    assert!(host.snapshot().lower(Path::new("missing.lua")).is_none());
+}
+
+#[test]
+fn file_text_and_files_reflect_the_effective_content() {
+    let mut host = host();
+    host.apply_change(set("a.lua", GOOD));
+    let a = Path::new("a.lua");
+    assert_eq!(host.snapshot().file_text(a).as_deref(), Some(GOOD));
+
+    // The overlay becomes the effective text.
+    host.apply_change(Change::SetOverlay {
+        path: PathBuf::from("a.lua"),
+        text: BAD.to_owned(),
+    });
+    assert_eq!(host.snapshot().file_text(a).as_deref(), Some(BAD));
+    assert!(
+        host.snapshot()
+            .file_text(Path::new("missing.lua"))
+            .is_none()
+    );
+
+    let files: Vec<_> = host.snapshot().files().map(Path::to_path_buf).collect();
+    assert_eq!(files, vec![PathBuf::from("a.lua")]);
+}

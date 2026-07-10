@@ -12,9 +12,9 @@
 //! - **Inputs** — [`SourceFile`] (path, text, dialect) and [`Project`]
 //!   (strictness, file list): the leaves of the graph, mutated via
 //!   [`salsa::Setter`].
-//! - **Queries** — [`parse`], [`annotations`], [`type_env`], [`diagnostics`],
-//!   [`project_diagnostics`]: `#[salsa::tracked]` functions, memoized per
-//!   revision.
+//! - **Queries** — [`parse`], [`annotations`], [`type_env`], [`lower`],
+//!   [`diagnostics`], [`project_diagnostics`]: `#[salsa::tracked]` functions,
+//!   memoized per revision.
 //! - **Values** — [`ParsedModule`], [`Annotations`], [`Diagnostics`],
 //!   [`TypeEnvHandle`]: `Arc`-backed, salsa-compatible wrappers around producer
 //!   outputs (rowan trees are not `PartialEq`/`Update` on their own).
@@ -50,8 +50,8 @@ mod vfs;
 pub use db::{Db, RootDatabase};
 pub use host::{Analysis, AnalysisHost, Change};
 pub use input::{Project, SourceFile};
-pub use query::{annotations, diagnostics, parse, project_diagnostics, type_env};
-pub use value::{Annotations, Diagnostics, ParsedModule, TypeEnvHandle};
+pub use query::{annotations, diagnostics, lower, parse, project_diagnostics, type_env};
+pub use value::{Annotations, Diagnostics, LoweredHandle, ParsedModule, TypeEnvHandle};
 pub use vfs::{FileId, Vfs};
 
 // Re-export the upstream vocabulary consumers configure the host with, so a

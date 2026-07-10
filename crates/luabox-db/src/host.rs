@@ -22,7 +22,7 @@ use salsa::Setter;
 use crate::db::RootDatabase;
 use crate::input::{Project, SourceFile};
 use crate::query;
-use crate::value::{Annotations, ParsedModule, TypeEnvHandle};
+use crate::value::{Annotations, LoweredHandle, ParsedModule, TypeEnvHandle};
 use crate::vfs::{FileId, Vfs};
 
 /// One atomic edit to apply to the world. Batch several with
@@ -227,5 +227,25 @@ impl Analysis {
     pub fn type_env(&self, path: &Path) -> Option<TypeEnvHandle> {
         let file = *self.files.get(path)?;
         Some(query::type_env(&self.db, file))
+    }
+
+    /// The HIR lowering for `path` — name resolution, source map, requires.
+    #[must_use]
+    pub fn lower(&self, path: &Path) -> Option<LoweredHandle> {
+        let file = *self.files.get(path)?;
+        Some(query::lower(&self.db, file))
+    }
+
+    /// The current effective text of `path` (overlay when set, disk
+    /// otherwise), or `None` if it is not a known file.
+    #[must_use]
+    pub fn file_text(&self, path: &Path) -> Option<String> {
+        let file = *self.files.get(path)?;
+        Some(file.text(&self.db).clone())
+    }
+
+    /// Every file path this snapshot knows about, in unspecified order.
+    pub fn files(&self) -> impl Iterator<Item = &Path> {
+        self.files.keys().map(PathBuf::as_path)
     }
 }

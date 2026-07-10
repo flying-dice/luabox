@@ -806,8 +806,13 @@ dependencies = [
  "lsp-types",
  "luabox-db",
  "luabox-diag",
+ "luabox-hir",
+ "luabox-resolve",
+ "luabox-syntax",
+ "rowan",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -21,6 +21,7 @@
 use std::sync::Arc;
 
 use luabox_diag::Diagnostic;
+use luabox_hir::LoweredFile;
 use luabox_syntax::lua;
 use luabox_syntax::luacats::AnnotatedItem;
 use luabox_types::TypeEnv;
@@ -170,6 +171,42 @@ impl TypeEnvHandle {
 // SAFETY: fully-owned `Arc` payload. `TypeEnv` is not `PartialEq`, so we fall
 // back to `Arc`-identity comparison; distinct allocations always replace.
 unsafe impl salsa::Update for TypeEnvHandle {
+    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
+        // SAFETY: forwarded from the `Update` contract.
+        let old = unsafe { &mut *old_pointer };
+        if Arc::ptr_eq(&old.0, &new_value.0) {
+            false
+        } else {
+            *old = new_value;
+            true
+        }
+    }
+}
+
+/// The memoized HIR lowering of one file (desugared bodies, name resolution,
+/// source map, `require` edges) — what the LSP's goto-definition reads.
+///
+/// [`LoweredFile`] is not comparable, so the `lower` query opts out of
+/// backdating (`no_eq`) and this handle compares by `Arc` identity, exactly
+/// like [`TypeEnvHandle`].
+#[derive(Clone, Debug)]
+pub struct LoweredHandle(Arc<LoweredFile>);
+
+impl LoweredHandle {
+    pub(crate) fn new(file: LoweredFile) -> Self {
+        Self(Arc::new(file))
+    }
+
+    /// The lowered file: bodies, bindings, resolutions, source map, requires.
+    #[must_use]
+    pub fn file(&self) -> &LoweredFile {
+        &self.0
+    }
+}
+
+// SAFETY: fully-owned `Arc` payload. `LoweredFile` is not `PartialEq`, so we
+// fall back to `Arc`-identity comparison; distinct allocations always replace.
+unsafe impl salsa::Update for LoweredHandle {
     unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
         // SAFETY: forwarded from the `Update` contract.
         let old = unsafe { &mut *old_pointer };

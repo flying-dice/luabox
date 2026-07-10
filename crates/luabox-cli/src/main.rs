@@ -122,7 +122,11 @@ enum Command {
     /// Publish the package to the registry
     Publish,
     /// Start the language server (stdio)
-    Lsp,
+    Lsp {
+        /// Accepted for editor compatibility; stdio is the only transport.
+        #[arg(long)]
+        stdio: bool,
+    },
     /// Manage Lua runtimes (install, pin, list)
     Toolchain {
         #[command(subcommand)]
@@ -171,7 +175,7 @@ fn main() -> anyhow::Result<()> {
         Command::Run { .. } => unimplemented("run", "P4"),
         Command::Doc { .. } => unimplemented("doc", "P5"),
         Command::Publish => unimplemented("publish", "P2"),
-        Command::Lsp => lsp_cmd::run(),
+        Command::Lsp { .. } => lsp_cmd::run(),
         Command::Toolchain { .. } => unimplemented("toolchain", "P4"),
         Command::Vendor => unimplemented("vendor", "P2"),
         Command::Audit => unimplemented("audit", "P5"),
