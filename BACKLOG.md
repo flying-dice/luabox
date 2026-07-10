@@ -11,15 +11,24 @@ The toolchain is feature-complete; these are the release-machinery gaps
 between "code-complete on a branch" and "a stranger can install and trust
 it." **Blockers** must land before the first public release.
 
-**Drop-of-`.luab` prerequisites** (the LuaCATS path must reach parity before
-`.luab` is removed — all verified missing today by the example conversion):
+**Feature-parity + strictness (launch gate)** — the LuaCATS front-end must
+verify everything luals does (parity, so interop is real) plus luabox's
+strictness (the edge), before launch. See [DIRECTION.md](DIRECTION.md). All
+verified missing today by the example conversion (commit `a01684b`).
+
+Parity (match luals):
+
+- [#84](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/84)
+  Real generic type variables + generic classes in LuaCATS
+- [#108](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/108)
+  Cross-package LuaCATS type sharing
+
+Strictness (exceed luals):
 
 - [#107](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/107)
   Enforce `---@class` conformance (`: Interface`, `__index`-aware)
-- [#108](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/108)
-  Cross-package LuaCATS type sharing
-- [#84](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/84)
-  Real generic type variables + generic classes in LuaCATS
+- [#103](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/103)
+  `undefined-global` diagnostic (typo'd/unknown global reads)
 
 Blockers:
 
@@ -48,8 +57,6 @@ Release-needed:
   Registry story for 0.1 (path/git/luarocks/`file://` vs hosted)
 - [#102](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/102)
   Distribute the editor integrations
-- [#103](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/103)
-  `undefined-global` diagnostic (typo'd/unknown global reads)
 - [#105](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/105)
   Def-declared scalar fields on global tables aren't typed
 - [#106](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/106)
