@@ -7,17 +7,8 @@ index only — the issues carry the user stories and acceptance criteria.
 
 ## Ready
 
-- [#78](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/78)
-  Generic arity errors at LuaCATS annotation sites
-- [#79](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/79)
-  LB0305: suggest fully-qualified shape names
-- [#80](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/80)
-  Declaration-site labels on conformance errors
-- [#81](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/81)
-  Diagnose lenient `.luab` edges (multi-return position, non-table
-  intersections)
-- [#82](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/82)
-  Pin sealed-key semantics beyond literals
+_None open — the SHAPES-V2 checker-quality and LSP waves are landed
+(#77–#82 closed)._
 
 ## Icebox
 
