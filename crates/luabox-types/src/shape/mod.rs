@@ -91,7 +91,10 @@ pub(crate) fn resolve_uses(
 }
 
 /// Run the shape binding checks for one `.lua` file (hard errors at every
-/// strictness — `---@struct` is the opt-in).
+/// strictness — `---@struct` is the opt-in). `inferred` carries the
+/// inference engine's expression types keyed by byte range, so annotated
+/// parameter values (`{ radius = radius }` in a constructor) type-check
+/// instead of degrading to `unknown` (#73).
 pub(crate) fn check_bindings(
     parse: &lua::Parse,
     items: &[AnnotatedItem],
@@ -99,6 +102,7 @@ pub(crate) fn check_bindings(
     env: &TypeEnv,
     file: &str,
     strictness: Strictness,
+    inferred: &std::collections::HashMap<(usize, usize), crate::ty::Ty>,
 ) -> Vec<Diagnostic> {
-    check::run(parse, items, scope, env, file, strictness)
+    check::run(parse, items, scope, env, file, strictness, inferred)
 }

@@ -370,6 +370,18 @@ pub struct AnnotatedItem {
     pub target: Option<Span>,
 }
 
+/// An inline `--[[@as T]]` cast comment: the expression the comment
+/// directly follows is treated as `T` (the LuaLS "inline as" form). These
+/// are long-bracket comments, not `---` doc comments, so [`harvest`] never
+/// sees them — collect them with [`harvest_inline_as`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineAs {
+    /// The cast-to type. Malformed types become error nodes (lenient).
+    pub ty: TypeExpr,
+    /// The comment token's file-absolute span.
+    pub span: Span,
+}
+
 // === Block parsing ===
 
 /// Parse one doc-comment block. `text` is the raw source slice of the block
@@ -935,6 +947,58 @@ fn parse_operator(
 }
 
 // === Harvesting ===
+
+/// Collect every inline `--[[@as T]]` cast comment in a parsed file (any
+/// long-bracket level: `--[==[@as T]==]` works too). The caller anchors
+/// each cast to the expression the comment directly follows.
+#[must_use]
+pub fn harvest_inline_as(parse: &lua::Parse) -> Vec<InlineAs> {
+    let root = parse.syntax();
+    let mut out = Vec::new();
+    for token in root
+        .descendants_with_tokens()
+        .filter_map(rowan::NodeOrToken::into_token)
+    {
+        if token.kind() != SyntaxKind::COMMENT {
+            continue;
+        }
+        let text = token.text();
+        let Some((body, body_off)) = long_comment_body(text) else {
+            continue;
+        };
+        let (body, stripped) = {
+            let trimmed = body.trim_start();
+            (trimmed, body.len() - trimmed.len())
+        };
+        let Some(rest) = body.strip_prefix("@as") else {
+            continue;
+        };
+        if !rest.starts_with(|c: char| c.is_ascii_whitespace()) {
+            continue;
+        }
+        let start = usize::from(token.text_range().start());
+        let ty_base = start + body_off + stripped + 3;
+        let mut p = TypeParser::new(rest, ty_base);
+        let ty = p.parse_type();
+        out.push(InlineAs {
+            ty,
+            span: Span::new(start, start + text.len()),
+        });
+    }
+    out
+}
+
+/// The body of a closed `--[[ ... ]]` long-bracket comment together with
+/// its byte offset within the token text; `None` for line comments and
+/// unterminated blocks.
+fn long_comment_body(text: &str) -> Option<(&str, usize)> {
+    let rest = text.strip_prefix("--")?.strip_prefix('[')?;
+    let level = rest.bytes().take_while(|&b| b == b'=').count();
+    let body = rest[level..].strip_prefix('[')?;
+    let close = format!("]{}]", "=".repeat(level));
+    let body = body.strip_suffix(close.as_str())?;
+    Some((body, 2 + 1 + level + 1))
+}
 
 /// One collected token with the facts `harvest` needs (offsets, triviality,
 /// newline count).

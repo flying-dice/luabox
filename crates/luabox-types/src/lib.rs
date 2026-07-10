@@ -115,6 +115,7 @@ pub fn check_file_shaped(
     };
 
     let env = TypeEnv::build_from_items(parse, &items, scope.as_ref(), ambient);
+    let mut inferred_types = std::collections::HashMap::new();
     if strictness != Strictness::None {
         // Rich table inference (SPEC.md §3) runs first: the checker uses
         // its published types wherever annotations are absent (annotations
@@ -130,10 +131,17 @@ pub fn check_file_shaped(
             &inference.expr_types,
         ));
         diags.extend(inference.diags);
+        inferred_types = inference.expr_types;
     }
     if let Some(scope) = &scope {
         diags.extend(shape::check_bindings(
-            parse, &items, scope, &env, file, strictness,
+            parse,
+            &items,
+            scope,
+            &env,
+            file,
+            strictness,
+            &inferred_types,
         ));
     }
     diags.sort_by_key(|d| d.primary_label().map_or(0, |l| l.span.range.start));

@@ -84,6 +84,7 @@ pub(crate) fn run(
     typeenv: &TypeEnv,
     file: &str,
     strictness: Strictness,
+    inferred: &HashMap<(usize, usize), Ty>,
 ) -> Vec<Diagnostic> {
     let root = parse.syntax();
     let mut checker = ShapeChecker {
@@ -91,6 +92,7 @@ pub(crate) fn run(
         env: typeenv,
         file,
         strictness,
+        inferred,
         diags: Vec::new(),
         methods: HashMap::new(),
         carrier_hints: HashSet::new(),
@@ -121,6 +123,10 @@ struct ShapeChecker<'a> {
     env: &'a TypeEnv,
     file: &'a str,
     strictness: Strictness,
+    /// Inference results by byte range: the fallback for value expressions
+    /// [`simple_expr_ty`] cannot type (annotated parameters flowing into
+    /// constructor literals, #73).
+    inferred: &'a HashMap<(usize, usize), Ty>,
     diags: Vec<Diagnostic>,
     /// Methods per carrier/base name: `function X:m()`, `function X.m()`,
     /// `X.m = function`, and function-valued literal fields.
@@ -629,7 +635,16 @@ impl ShapeChecker<'_> {
             return;
         }
         let strict = self.strictness == Strictness::Strict;
-        let found = simple_expr_ty(value);
+        let mut found = simple_expr_ty(value);
+        if matches!(found, Ty::Unknown) {
+            // Fall back to the inference engine (annotated parameters and
+            // locals flowing into shape-bound values, #73).
+            let r = value.syntax().text_range();
+            let key = (usize::from(r.start()), usize::from(r.end()));
+            if let Some(ty) = self.inferred.get(&key) {
+                found = ty.clone();
+            }
+        }
         if !assignable(self.env, strict, &found, expected) {
             let severity = if strict {
                 Severity::Error

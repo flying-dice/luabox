@@ -1,0 +1,28 @@
+{
+  "name": "tree-sitter-luab",
+  "version": "0.1.0",
+  "description": "Tree-sitter grammar for the luabox .luab shape DSL",
+  "license": "MIT",
+  "keywords": ["tree-sitter", "luab", "luabox", "parser"],
+  "repository": {
+    "type": "git",
+    "url": "https://gitlab.beluga-sirius.ts.net/flying-dice/luabox"
+  },
+  "main": "bindings/node",
+  "files": [
+    "grammar.js",
+    "queries/*",
+    "src/**"
+  ],
+  "tree-sitter": [
+    {
+      "scope": "source.luab",
+      "file-types": ["luab"],
+      "highlights": ["queries/highlights.scm"],
+      "injection-regex": "^luab$"
+    }
+  ],
+  "devDependencies": {
+    "tree-sitter-cli": "^0.24.0"
+  }
+}

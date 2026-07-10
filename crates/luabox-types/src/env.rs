@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use luabox_syntax::lua::ast::{AstNode, Expr, LocalStmt, Stmt};
 use luabox_syntax::lua::{self, SyntaxKind, SyntaxNode};
-use luabox_syntax::luacats::{self, AliasTag, FieldKey, ParamTag, ReturnTag, Tag, TypeExprKind};
+use luabox_syntax::luacats::{
+    self, AliasTag, CastKind, FieldKey, ParamTag, ReturnTag, Tag, TypeExprKind,
+};
 
 use crate::lower::{Declared, Lowerer};
 use crate::ty::{FieldTy, FunctionTy, ParamTy, TableTy, Ty};
@@ -32,6 +34,15 @@ pub(crate) struct ClassDef {
 pub(crate) struct EnumDef {
     pub members: BTreeMap<String, Ty>,
     pub value_union: Ty,
+}
+
+/// A lowered `---@cast var [+|-]T[, ...]` bound to the statement it
+/// precedes: applied as a flow-state override when inference reaches that
+/// statement.
+#[derive(Debug, Clone)]
+pub(crate) struct CastEntry {
+    pub var: String,
+    pub ops: Vec<(CastKind, Ty)>,
 }
 
 /// Everything the annotations of one file declare.
@@ -59,6 +70,11 @@ pub struct TypeEnv {
     /// packages (`---@meta` `.d.lua`). Populated only for the ambient
     /// layer; per-file annotations shadow these.
     global_types: BTreeMap<String, Ty>,
+    /// `---@cast` overrides keyed by the statement they precede.
+    casts: HashMap<Target, Vec<CastEntry>>,
+    /// Inline `--[[@as T]]` casts keyed by the byte offset of the end of
+    /// the expression they follow (the anchor).
+    as_casts: HashMap<usize, Ty>,
     /// References to undeclared type names (LB0305): `(name, span)`.
     pub(crate) unknown_names: Vec<(String, luacats::Span)>,
 }
@@ -273,6 +289,7 @@ impl TypeEnv {
         let mut returns: Vec<&ReturnTag> = Vec::new();
         let mut types: Option<Vec<Ty>> = None;
         let mut overloads: Vec<FunctionTy> = Vec::new();
+        let mut casts: Vec<CastEntry> = Vec::new();
 
         for tag in &item.block.tags {
             match tag {
@@ -373,12 +390,16 @@ impl TypeEnv {
             overloads,
             ..FunctionTy::default()
         };
+        // Lower every tag up front (unknown type names must be reported even
+        // for tags that end up unbound); non-vararg tags are *reconciled by
+        // name* against the AST parameter list below.
+        let mut tag_params: Vec<ParamTy> = Vec::new();
         for param in params {
             let ty = lowerer.lower(&param.ty);
             if param.vararg {
                 func.varargs = Some(ty);
             } else {
-                func.params.push(ParamTy {
+                tag_params.push(ParamTy {
                     name: param.name.clone(),
                     ty,
                     optional: param.optional,
@@ -431,10 +452,16 @@ impl TypeEnv {
             _ => return,
         };
 
-        // Reconcile with the real parameter list: unannotated trailing
-        // parameters become optional `unknown` (permissive — partial
-        // annotation must not manufacture arity errors), and an
-        // unannotated `...` still lifts the arity ceiling.
+        // Reconcile with the real parameter list: `@param` tags bind to the
+        // parameter of the *same name* (names are mandatory in the tag
+        // syntax), so a partially-annotated function never misassociates a
+        // tag with the wrong position. Unannotated parameters become
+        // optional `unknown` (permissive — partial annotation must not
+        // manufacture arity errors), and an unannotated `...` still lifts
+        // the arity ceiling.
+        //
+        // TODO(P2): tags naming no parameter are silently unbound today
+        // (LuaLS warns); surface a diagnostic for them.
         if let Some(list) = param_list {
             let mut ast_names: Vec<String> = Vec::new();
             let mut ast_vararg = false;
@@ -445,16 +472,31 @@ impl TypeEnv {
                     ast_names.push(name.text().to_string());
                 }
             }
-            for name in ast_names.iter().skip(func.params.len()) {
-                func.params.push(ParamTy {
-                    name: name.clone(),
-                    ty: Ty::Unknown,
-                    optional: true,
-                });
+            let mut used = vec![false; tag_params.len()];
+            for name in &ast_names {
+                let tag = tag_params
+                    .iter()
+                    .enumerate()
+                    .find(|(i, tag)| !used[*i] && &tag.name == name);
+                match tag {
+                    Some((i, tag)) => {
+                        func.params.push(tag.clone());
+                        used[i] = true;
+                    }
+                    None => func.params.push(ParamTy {
+                        name: name.clone(),
+                        ty: Ty::Unknown,
+                        optional: true,
+                    }),
+                }
             }
             if ast_vararg && func.varargs.is_none() {
                 func.varargs = Some(Ty::Unknown);
             }
+        } else {
+            // No AST parameter list to reconcile against (malformed source):
+            // fall back to tag order.
+            func.params = tag_params;
         }
 
         if let Some(name) = name {

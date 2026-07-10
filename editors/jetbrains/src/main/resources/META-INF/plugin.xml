@@ -1,0 +1,33 @@
+<idea-plugin>
+    <!-- id / name / version / vendor / idea-version are injected at build time
+         from the `intellijPlatform { pluginConfiguration { ... } }` block in
+         build.gradle.kts — do not duplicate them here. -->
+
+    <!-- Base platform. -->
+    <depends>com.intellij.modules.platform</depends>
+    <!-- Native LSP client API (com.intellij.platform.lsp). Present in
+         Ultimate-tier IDEs 2023.2+. Depending on this module also gates the
+         plugin so it only loads where the LSP API exists. -->
+    <depends>com.intellij.modules.lsp</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- `.luab` shape file type, backed by the LuaBox language. -->
+        <fileType
+                name="LuaBox"
+                implementationClass="com.luabox.LuaboxFileType"
+                fieldName="INSTANCE"
+                language="LuaBox"
+                extensions="luab"/>
+
+        <!-- Start `luabox lsp` for .lua and .luab files. -->
+        <platform.lsp.serverSupportProvider
+                implementation="com.luabox.LuaboxLspServerSupportProvider"/>
+
+        <!-- Settings ▸ Tools ▸ luabox — the executable path. -->
+        <applicationConfigurable
+                instance="com.luabox.LuaboxConfigurable"
+                id="com.luabox.settings"
+                parentId="tools"
+                displayName="luabox"/>
+    </extensions>
+</idea-plugin>

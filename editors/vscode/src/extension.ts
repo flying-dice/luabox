@@ -43,7 +43,7 @@ function buildClient(): LanguageClient {
     ],
     synchronize: {
       fileEvents: vscode.workspace.createFileSystemWatcher(
-        "**/*.{lua,lb,toml}"
+        "**/*.{lua,luab,toml}"
       ),
     },
   };

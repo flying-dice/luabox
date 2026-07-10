@@ -93,6 +93,7 @@ pub(crate) fn run(hir: &LoweredFile, env: &TypeEnv, file: &str, strict: bool) ->
         shapes: Vec::new(),
         shape_of_expr: HashMap::new(),
         instances: HashMap::new(),
+        declared_carriers: HashMap::new(),
         funcs: HashMap::new(),
         state: HashMap::new(),
         declared: HashSet::new(),
@@ -202,6 +203,11 @@ struct ShapeData {
     /// when any. Field lookups consult the declaration; `LB0306` defers to
     /// the declaration's own diagnostics.
     declared: Option<String>,
+    /// This is the shared *instance* shape of a carrier (the type of
+    /// `setmetatable(x, Carrier)` results and of `self` in the carrier's
+    /// methods). Declared instances reify as their declared name, so
+    /// constructor results unify with `---@return <Class>` (#73).
+    is_instance: bool,
     /// The value flowed somewhere analysis cannot see (argument to an
     /// unmodeled call). Suppresses `LB0306`.
     escaped: bool,
@@ -268,6 +274,10 @@ struct Infer<'a> {
     shape_of_expr: HashMap<(BodyId, ExprId), usize>,
     /// Carrier shape → its shared instance shape.
     instances: HashMap<usize, usize>,
+    /// Declared name → the carrier shape bound to that declaration, so an
+    /// annotated instance value (`---@return Circle`) still resolves
+    /// methods and inferred extensions through the carrier (#73).
+    declared_carriers: HashMap<String, usize>,
     funcs: HashMap<BodyId, FuncData>,
     /// Flow state: binding → current inferred type (flat across bodies).
     state: HashMap<BindingId, ITy>,
@@ -336,6 +346,7 @@ impl Infer<'_> {
         self.shapes.push(ShapeData {
             metatable: Some(carrier),
             declared: self.shapes[carrier].declared.clone(),
+            is_instance: true,
             ..ShapeData::default()
         });
         self.instances.insert(carrier, id);
@@ -471,6 +482,16 @@ impl Infer<'_> {
     /// (nearest definition wins), skipping `__`-metafields. Cycles cut off
     /// with the catch-all table shape.
     fn reify_shape(&mut self, id: usize) -> Ty {
+        // A declared *instance* shape reifies as its declared name: the
+        // result of `setmetatable(x, Carrier)` (and `self` in the carrier's
+        // methods) IS the declared class/struct at annotated boundaries, so
+        // constructors satisfy `---@return <Class>` (#73).
+        if self.shapes[id].is_instance
+            && let Some(name) = self.shapes[id].declared.clone()
+            && self.env.resolve_named(&name).is_some()
+        {
+            return Ty::Named(name);
+        }
         if let Some(ty) = self.memo.get(&id) {
             return ty.clone();
         }
@@ -573,17 +594,13 @@ impl Infer<'_> {
             if !seen.insert(s) {
                 break;
             }
-            if let Some(ity) = self.shapes[s].fields.get(name) {
-                return Lookup::Found(ity.clone());
-            }
-            let data = &self.shapes[s];
-            if data.escaped || data.meta_unknown || !data.indexers.is_empty() {
-                provable = false;
-            }
-            if let Some(class) = data.declared.clone() {
+            if let Some(class) = self.shapes[s].declared.clone() {
                 // Declared carriers are governed by their declaration:
-                // fields resolve through it, absences defer to its own
-                // diagnostics (LB0303 / LB2002).
+                // declared fields resolve at their DECLARED types (an
+                // inferred constructor value never shadows the declaration
+                // — `self.side` is `integer` when the struct says so, #73),
+                // inferred extensions fill in the rest, and absences defer
+                // to the declaration's own diagnostics (LB0303 / LB2002).
                 provable = false;
                 if let Some(shape) = self.env.class_shape(&class)
                     && let Some(field) = shape.fields.get(name)
@@ -595,6 +612,13 @@ impl Infer<'_> {
                     };
                     return Lookup::Found(ITy::Ty(ty));
                 }
+            }
+            if let Some(ity) = self.shapes[s].fields.get(name) {
+                return Lookup::Found(ity.clone());
+            }
+            let data = &self.shapes[s];
+            if data.escaped || data.meta_unknown || !data.indexers.is_empty() {
+                provable = false;
             }
             if let Some(meta) = self.shapes[s].metatable {
                 match self.shapes[meta].fields.get("__index") {
@@ -637,10 +661,28 @@ impl Infer<'_> {
                 }
                 Lookup::Absent { provable: false }
             }
-            Ty::Named(class) => match self.env.resolve_named(class) {
-                Some(resolved) => self.lookup_ty_field(&resolved, name),
-                None => Lookup::Opaque,
-            },
+            Ty::Named(class) => {
+                let outcome = self
+                    .env
+                    .resolve_named(class)
+                    .map(|resolved| self.lookup_ty_field(&resolved, name));
+                if let Some(Lookup::Found(ity)) = outcome {
+                    return Lookup::Found(ity);
+                }
+                // An annotated instance (`---@return Circle`) still
+                // resolves methods and inferred extensions through the
+                // declared carrier's shared instance shape (#73).
+                if let Some(&carrier) = self.declared_carriers.get(class.as_str()) {
+                    let instance = self.instance_of(carrier);
+                    if let Lookup::Found(ity) = self.lookup_shape_field(instance, name) {
+                        return Lookup::Found(ity);
+                    }
+                }
+                match outcome {
+                    Some(_) => Lookup::Absent { provable: false },
+                    None => Lookup::Opaque,
+                }
+            }
             Ty::Union(members) => {
                 let mut found: Vec<ITy> = Vec::new();
                 for member in members.clone() {
@@ -944,7 +986,9 @@ impl Infer<'_> {
         {
             let name = name.to_string();
             if let Some(ITy::Shape(id)) = self.state.get(&local.binding) {
-                self.shapes[*id].declared = Some(name);
+                let id = *id;
+                self.shapes[id].declared = Some(name.clone());
+                self.declared_carriers.insert(name, id);
             }
         }
     }

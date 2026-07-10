@@ -431,6 +431,14 @@ impl Checker<'_> {
             Expr::Table(table) => self.table_literal_ty(table),
             Expr::Function(_) => Ty::Function(Box::new(FunctionTy::opaque())),
             Expr::Call(call) => {
+                // `setmetatable(t, Carrier)` is modeled by inference — the
+                // result is the carrier's *instance* — so the ambient
+                // `---@return table` signature must not mask it: a
+                // constructor returning `setmetatable(...)` then satisfies
+                // `---@return <Class>` (#73).
+                if self.is_global_setmetatable(call) {
+                    return Ty::Unknown;
+                }
                 let sig = call.callee().and_then(|c| self.callee_sig(&c));
                 match sig {
                     Some(sig) if sig.has_return_annotation => {
@@ -533,6 +541,16 @@ impl Checker<'_> {
             shape.array = Some(Ty::union(items));
         }
         Ty::Table(Box::new(shape))
+    }
+
+    /// Whether a call invokes the global `setmetatable` builtin (a local
+    /// of the same name shadows it).
+    fn is_global_setmetatable(&self, call: &CallExpr) -> bool {
+        matches!(
+            call.callee(),
+            Some(Expr::Name(name))
+                if name.name().is_some_and(|t| t.text() == "setmetatable")
+        ) && self.lookup("setmetatable").is_none()
     }
 
     /// The function signature an expression evaluates to, when known.

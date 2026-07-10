@@ -1,0 +1,41 @@
+id = "luabox"
+name = "luabox"
+version = "0.1.0"
+schema_version = 1
+authors = ["luabox"]
+description = "Lua + .luab shape-file support via the luabox language server: typecheck, hover, goto-definition, completion, document symbols, formatting and semantic highlighting."
+repository = "https://gitlab.beluga-sirius.ts.net/flying-dice/luabox"
+
+# The luabox language server. `languages` lists every language it serves:
+#   - "Lua"          — Zed's built-in Lua language. Declaring the server here
+#                      makes it available for Lua automatically (a language's
+#                      default server list implicitly includes the "..."
+#                      wildcard), alongside any other Lua server — no user
+#                      settings edit and no languages/lua/ override required.
+#   - "LuaBox Shape" — the .luab shape DSL contributed by this extension
+#                      (see languages/luabox-shape/config.toml).
+# The binary is resolved in src/lib.rs (settings override, then PATH).
+[language_servers.luabox]
+name = "luabox"
+languages = ["Lua", "LuaBox Shape"]
+
+# Tree-sitter grammar for the .luab shape DSL.
+#
+# Zed fetches grammars from a git repository at a fixed rev (a repo + rev is
+# MANDATORY — there is no "compile from a plain local directory" option). The
+# grammar lives in this self-hosted monorepo under `tree-sitter-luab/`, so:
+#   - `repository` points at the repo,
+#   - `path` selects the grammar subdirectory,
+#   - `rev` MUST be an actual pushed commit SHA. Update it to the commit that
+#     contains the current tree-sitter-luab/ after every grammar change.
+#
+# Local development: install this directory as a dev extension
+# (Extensions ▸ Install Dev Extension) and point `repository` at a local git
+# checkout via a file:// URL — but it must still be a committed rev, e.g.
+#   repository = "file:///c/Users/you/Projects/luabox"
+#   path = "tree-sitter-luab"
+#   rev = "<local commit sha>"
+[grammars.luab]
+repository = "https://gitlab.beluga-sirius.ts.net/flying-dice/luabox"
+path = "tree-sitter-luab"
+rev = "0000000000000000000000000000000000000000"

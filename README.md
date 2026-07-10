@@ -81,7 +81,8 @@ They live under [`editors/`](editors/):
 |---|---|---|
 | VS Code | [`editors/vscode/`](editors/vscode/) | First-class TypeScript extension; ships a `.luab` shape grammar. `npm install && npm run compile`, then `npx @vscode/vsce package` for a `.vsix`. |
 | Neovim | [`editors/nvim/`](editors/nvim/) | `require("luabox").setup()` (Neovim 0.11+ native LSP; lspconfig fallback included). Adds `.luab` filetype detection. |
-| JetBrains | [`editors/jetbrains.md`](editors/jetbrains.md) | Via LSP4IJ (all editions) or the native LSP API (Ultimate/plugin authors). |
+| JetBrains | [`editors/jetbrains/`](editors/jetbrains/) | Gradle/Kotlin plugin using the native LSP API (IntelliJ IDEA Ultimate 2024.2+). `./gradlew buildPlugin`, then install-from-disk. LSP4IJ route documented for Community editions. |
+| Zed | [`editors/zed/`](editors/zed/) | Rust/WASM extension; registers the server for Lua + `.luab` and ships a tree-sitter grammar ([`tree-sitter-luab/`](tree-sitter-luab/)). `cargo build --target wasm32-wasip2 --release`, then install as a dev extension. |
 
 All three resolve the `luabox` binary from `PATH` (overridable per editor) and
 launch it as `luabox lsp`. Build the binary first with `cargo build --release`.
