@@ -1,31 +1,5 @@
 [
   {
-    "type": "_item",
-    "named": true,
-    "subtypes": [
-      {
-        "type": "impl_declaration",
-        "named": true
-      },
-      {
-        "type": "struct_definition",
-        "named": true
-      },
-      {
-        "type": "trait_definition",
-        "named": true
-      },
-      {
-        "type": "type_alias",
-        "named": true
-      },
-      {
-        "type": "use_declaration",
-        "named": true
-      }
-    ]
-  },
-  {
     "type": "_type",
     "named": true,
     "subtypes": [
@@ -38,11 +12,23 @@
         "named": true
       },
       {
+        "type": "intersection_type",
+        "named": true
+      },
+      {
+        "type": "object_type",
+        "named": true
+      },
+      {
         "type": "optional_type",
         "named": true
       },
       {
         "type": "parenthesized_type",
+        "named": true
+      },
+      {
+        "type": "qualified_type",
         "named": true
       },
       {
@@ -82,47 +68,24 @@
     }
   },
   {
-    "type": "function_signature",
+    "type": "function_type",
     "named": true,
     "fields": {
-      "name": {
+      "return": {
         "multiple": false,
         "required": true,
         "types": [
           {
-            "type": "identifier",
+            "type": "_type",
             "named": true
           }
         ]
       }
     },
     "children": {
-      "multiple": true,
+      "multiple": false,
       "required": true,
       "types": [
-        {
-          "type": "parameters",
-          "named": true
-        },
-        {
-          "type": "return_type",
-          "named": true
-        }
-      ]
-    }
-  },
-  {
-    "type": "function_type",
-    "named": true,
-    "fields": {},
-    "children": {
-      "multiple": true,
-      "required": true,
-      "types": [
-        {
-          "type": "_type",
-          "named": true
-        },
         {
           "type": "parameters",
           "named": true
@@ -159,16 +122,6 @@
           }
         ]
       }
-    },
-    "children": {
-      "multiple": true,
-      "required": false,
-      "types": [
-        {
-          "type": "type_identifier",
-          "named": true
-        }
-      ]
     }
   },
   {
@@ -195,6 +148,10 @@
         "required": true,
         "types": [
           {
+            "type": "qualified_type",
+            "named": true
+          },
+          {
             "type": "type_identifier",
             "named": true
           }
@@ -213,30 +170,70 @@
     }
   },
   {
-    "type": "impl_declaration",
+    "type": "intersection_type",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "_type",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "method",
     "named": true,
     "fields": {
-      "type": {
+      "name": {
         "multiple": false,
         "required": true,
         "types": [
           {
-            "type": "type_identifier",
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "return": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "_type",
             "named": true
           }
         ]
       }
     },
     "children": {
-      "multiple": true,
+      "multiple": false,
       "required": true,
       "types": [
         {
-          "type": "generic_arguments",
+          "type": "parameters",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "object_type",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "field",
           "named": true
         },
         {
-          "type": "type_identifier",
+          "type": "method",
           "named": true
         }
       ]
@@ -313,7 +310,7 @@
     "named": true,
     "fields": {},
     "children": {
-      "multiple": false,
+      "multiple": true,
       "required": true,
       "types": [
         {
@@ -324,7 +321,7 @@
     }
   },
   {
-    "type": "path",
+    "type": "qualified_type",
     "named": true,
     "fields": {},
     "children": {
@@ -332,22 +329,7 @@
       "required": true,
       "types": [
         {
-          "type": "identifier",
-          "named": true
-        }
-      ]
-    }
-  },
-  {
-    "type": "return_type",
-    "named": true,
-    "fields": {},
-    "children": {
-      "multiple": true,
-      "required": true,
-      "types": [
-        {
-          "type": "_type",
+          "type": "type_identifier",
           "named": true
         }
       ]
@@ -363,127 +345,14 @@
       "required": false,
       "types": [
         {
-          "type": "_item",
+          "type": "type_definition",
           "named": true
         }
       ]
     }
   },
   {
-    "type": "struct_body",
-    "named": true,
-    "fields": {},
-    "children": {
-      "multiple": true,
-      "required": false,
-      "types": [
-        {
-          "type": "field",
-          "named": true
-        },
-        {
-          "type": "open_marker",
-          "named": true
-        }
-      ]
-    }
-  },
-  {
-    "type": "struct_definition",
-    "named": true,
-    "fields": {
-      "name": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "type_identifier",
-            "named": true
-          }
-        ]
-      }
-    },
-    "children": {
-      "multiple": true,
-      "required": true,
-      "types": [
-        {
-          "type": "generic_parameters",
-          "named": true
-        },
-        {
-          "type": "struct_body",
-          "named": true
-        }
-      ]
-    }
-  },
-  {
-    "type": "supertraits",
-    "named": true,
-    "fields": {},
-    "children": {
-      "multiple": true,
-      "required": true,
-      "types": [
-        {
-          "type": "type_identifier",
-          "named": true
-        }
-      ]
-    }
-  },
-  {
-    "type": "trait_body",
-    "named": true,
-    "fields": {},
-    "children": {
-      "multiple": true,
-      "required": false,
-      "types": [
-        {
-          "type": "function_signature",
-          "named": true
-        }
-      ]
-    }
-  },
-  {
-    "type": "trait_definition",
-    "named": true,
-    "fields": {
-      "name": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "type_identifier",
-            "named": true
-          }
-        ]
-      }
-    },
-    "children": {
-      "multiple": true,
-      "required": true,
-      "types": [
-        {
-          "type": "generic_parameters",
-          "named": true
-        },
-        {
-          "type": "supertraits",
-          "named": true
-        },
-        {
-          "type": "trait_body",
-          "named": true
-        }
-      ]
-    }
-  },
-  {
-    "type": "type_alias",
+    "type": "type_definition",
     "named": true,
     "fields": {
       "name": {
@@ -508,9 +377,13 @@
       }
     },
     "children": {
-      "multiple": false,
+      "multiple": true,
       "required": false,
       "types": [
+        {
+          "type": "export_modifier",
+          "named": true
+        },
         {
           "type": "generic_parameters",
           "named": true
@@ -534,20 +407,8 @@
     }
   },
   {
-    "type": "use_declaration",
-    "named": true,
-    "fields": {
-      "path": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "path",
-            "named": true
-          }
-        ]
-      }
-    }
+    "type": "&",
+    "named": false
   },
   {
     "type": "(",
@@ -558,15 +419,7 @@
     "named": false
   },
   {
-    "type": "+",
-    "named": false
-  },
-  {
     "type": ",",
-    "named": false
-  },
-  {
-    "type": "->",
     "named": false
   },
   {
@@ -578,15 +431,15 @@
     "named": false
   },
   {
-    "type": ";",
-    "named": false
-  },
-  {
     "type": "<",
     "named": false
   },
   {
     "type": "=",
+    "named": false
+  },
+  {
+    "type": "=>",
     "named": false
   },
   {
@@ -599,50 +452,27 @@
   },
   {
     "type": "block_comment",
-    "named": true,
-    "extra": true
+    "named": true
   },
   {
     "type": "doc_comment",
-    "named": true,
-    "extra": true
+    "named": true
   },
   {
-    "type": "fn",
-    "named": false
-  },
-  {
-    "type": "for",
-    "named": false
+    "type": "export_modifier",
+    "named": true
   },
   {
     "type": "identifier",
     "named": true
   },
   {
-    "type": "impl",
-    "named": false
-  },
-  {
     "type": "line_comment",
-    "named": true,
-    "extra": true
-  },
-  {
-    "type": "open_marker",
     "named": true
   },
   {
     "type": "self",
     "named": true
-  },
-  {
-    "type": "struct",
-    "named": false
-  },
-  {
-    "type": "trait",
-    "named": false
   },
   {
     "type": "type",
@@ -651,10 +481,6 @@
   {
     "type": "type_identifier",
     "named": true
-  },
-  {
-    "type": "use",
-    "named": false
   },
   {
     "type": "{",

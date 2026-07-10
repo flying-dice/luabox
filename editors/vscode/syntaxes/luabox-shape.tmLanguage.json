@@ -5,8 +5,9 @@
   "patterns": [
     { "include": "#comments" },
     { "include": "#doc-comments" },
-    { "include": "#keywords" },
     { "include": "#declarations" },
+    { "include": "#keywords" },
+    { "include": "#methods" },
     { "include": "#types" },
     { "include": "#operators" },
     { "include": "#punctuation" }
@@ -29,42 +30,35 @@
         }
       ]
     },
+    "declarations": {
+      "patterns": [
+        {
+          "match": "\\b(?:(export)\\s+)?(type)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.control.luabox-shape" },
+            "2": { "name": "keyword.control.luabox-shape" },
+            "3": { "name": "entity.name.type.luabox-shape" }
+          }
+        }
+      ]
+    },
     "keywords": {
       "patterns": [
         {
           "name": "keyword.control.luabox-shape",
-          "match": "\\b(struct|trait|impl|type|use|for|fn)\\b"
+          "match": "\\b(export|type)\\b"
         },
         {
           "name": "variable.language.self.luabox-shape",
-          "match": "\\b(self|Self)\\b"
+          "match": "\\bself\\b"
         }
       ]
     },
-    "declarations": {
+    "methods": {
       "patterns": [
         {
-          "match": "\\b(struct|trait|type)\\s+([A-Za-z_][A-Za-z0-9_]*)",
-          "captures": {
-            "1": { "name": "keyword.control.luabox-shape" },
-            "2": { "name": "entity.name.type.luabox-shape" }
-          }
-        },
-        {
-          "match": "\\b(impl)\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s+(for)\\s+([A-Za-z_][A-Za-z0-9_]*))?",
-          "captures": {
-            "1": { "name": "keyword.control.luabox-shape" },
-            "2": { "name": "entity.name.type.luabox-shape" },
-            "3": { "name": "keyword.control.luabox-shape" },
-            "4": { "name": "entity.name.type.luabox-shape" }
-          }
-        },
-        {
-          "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
-          "captures": {
-            "1": { "name": "keyword.control.luabox-shape" },
-            "2": { "name": "entity.name.function.luabox-shape" }
-          }
+          "name": "entity.name.function.luabox-shape",
+          "match": "\\b([a-z_][A-Za-z0-9_]*)(?=\\s*\\()"
         }
       ]
     },
@@ -72,7 +66,7 @@
       "patterns": [
         {
           "name": "support.type.primitive.luabox-shape",
-          "match": "\\b(number|integer|string|boolean|unknown|nil)\\b"
+          "match": "\\b(number|integer|string|boolean|unknown|any|nil)\\b"
         },
         {
           "name": "support.type.builtin.luabox-shape",
@@ -88,7 +82,7 @@
       "patterns": [
         {
           "name": "keyword.operator.type.luabox-shape",
-          "match": "->|\\?|\\||\\+|\\.\\.|:|="
+          "match": "=>|\\?|\\||&|:|="
         }
       ]
     },
@@ -108,7 +102,7 @@
         },
         {
           "name": "punctuation.separator.luabox-shape",
-          "match": "[,;]"
+          "match": "[,.]"
         }
       ]
     }

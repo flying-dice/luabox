@@ -1,0 +1,3 @@
+type F = (x?: number) => string
+type M = { split(self): (A, B) }
+type U = A & B | C?

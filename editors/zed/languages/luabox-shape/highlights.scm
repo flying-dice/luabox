@@ -1,4 +1,4 @@
-; Syntax highlighting for the luabox `.luab` shape DSL.
+; Syntax highlighting for the luabox `.luab` shape DSL (SHAPES-V2.md).
 ;
 ; Capture names are drawn from Zed's theme-recognized set
 ; (https://zed.dev/docs/extensions/languages#syntax-highlighting): note
@@ -12,44 +12,36 @@
 
 ; === Keywords =========================================================
 [
-  "struct"
-  "trait"
-  "impl"
-  "for"
-  "fn"
   "type"
-  "use"
 ] @keyword
+
+(export_modifier) @keyword
 
 (self) @variable.special
 
 ; === Types ============================================================
-; Primitive + builtin container/sugar types (SHAPES.md §3 vocabulary).
+; Primitive + builtin container/sugar types (SHAPES-V2.md vocabulary).
 ((type_identifier) @type.builtin
   (#any-of? @type.builtin
-    "number" "integer" "string" "boolean" "unknown" "nil"
-    "Vec" "HashMap" "Option" "Result" "Self"))
+    "number" "integer" "string" "boolean" "unknown" "any" "nil"
+    "Vec" "HashMap" "Option" "Result"))
 
-; Everything else in type position is a user-declared type.
+; Everything else in type position is a user-declared type (including each
+; segment of a qualified reference like `love.graphics.Canvas`).
 ((type_identifier) @type
   (#not-any-of? @type
-    "number" "integer" "string" "boolean" "unknown" "nil"
-    "Vec" "HashMap" "Option" "Result" "Self"))
+    "number" "integer" "string" "boolean" "unknown" "any" "nil"
+    "Vec" "HashMap" "Option" "Result"))
 
 ; === Members ==========================================================
 (field
   name: (identifier) @property)
 
-(function_signature
-  name: (identifier) @function)
+(method
+  name: (identifier) @function.method)
 
 (parameter
   name: (identifier) @variable.parameter)
-
-; Module path in `use <name>;` — `@variable` is Zed-theme-recognized (Zed has
-; no `@namespace`); it still reads as an imported module name.
-(path
-  (identifier) @variable)
 
 ; === Comments =========================================================
 [
@@ -61,14 +53,12 @@
 
 ; === Operators & punctuation =========================================
 [
-  "->"
+  "=>"
   "?"
   "|"
-  "+"
+  "&"
   "="
 ] @operator
-
-(open_marker) @operator
 
 [
   "{"
@@ -81,7 +71,6 @@
 
 [
   ","
-  ";"
   ":"
   "."
 ] @punctuation.delimiter

@@ -17,7 +17,7 @@ symbols, formatting and semantic highlighting for both `.lua` sources and
   standard token types/modifiers, and `vscode-languageclient` requests them
   automatically — no theme configuration needed. Locals vs globals,
   parameters, LuaCATS `---@` annotation comments, and `.luab`
-  structs/traits/generics all render distinctly.
+  types/members/generics all render distinctly.
 - A `luabox-shape` language definition for `.luab` files with a TextMate grammar
   (Rust-like `struct` / `trait` / `impl` / `fn` keywords + Lua-ish types) and a
   comment/bracket language configuration.

@@ -3,7 +3,7 @@ package com.luabox
 import com.intellij.lang.Language
 
 /**
- * The `.luab` shape DSL language (SHAPES.md). Registered so the platform (and
+ * The `.luab` shape-module language (SHAPES-V2.md). Registered so the platform (and
  * the LSP client) can key features off a real [Language] rather than a bare
  * file extension. Plain Lua keeps its own language id (`Lua`) — we never
  * redefine it here.

@@ -1,47 +1,15 @@
-/// 2D geometry primitives and the shapes they satisfy.
-///
-/// A `.luab` shape module: analyser-only, never on the require path.
+/// 2D geometry primitives.
+type Point = { x: number, y: number, label?: string }
+type Circle = { radius: number }
+type Pair<T> = { first: T, second: T }
 
-use geometry;
-
-/// A point in 2D space. `label` is optional (the `?` suffix).
-struct Point {
-    x: number,
-    y: number,
-    label: string?,
+export type Shape = {
+    area(self): number,
+    perimeter(self): number,
 }
 
-/// A homogeneous pair — a tiny generic container.
-struct Pair<T> {
-    first: T,
-    second: T,
+export type Drawable = Shape & {
+    draw(self, surface: Surface),
 }
 
-struct Kv<K: Hash + Eq, V> {
-    m: HashMap<K, V>,
-}
-
-struct Bag {
-    n: number,
-    ..
-}
-
-struct Empty {}
-
-/// Anything with an area and a perimeter.
-trait Shape {
-    fn area(self) -> number;
-    fn perimeter(self) -> number;
-}
-
-trait Drawable: Shape + Sized {
-    fn draw(self, surface: Surface) -> string;
-    fn split(self) -> A, B;
-}
-
-type Points = Vec<Point>;
-type Handler = fn(event: string) -> boolean;
-type Maybe = number | string | boolean;
-
-impl Shape for Circle;
-impl Shape + Drawable for Square;
+export type Canvas = love.graphics.Canvas

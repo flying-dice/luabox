@@ -1,8 +1,8 @@
 # tree-sitter-luab
 
-Tree-sitter grammar for the luabox `.luab` **shape DSL** (Rust-style
-`struct` / `trait` / `impl` declarations, analyser-only — see
-[`SHAPES.md`](../SHAPES.md) §3).
+Tree-sitter grammar for the luabox `.luab` **shape modules**
+(TypeScript-adjacent `type` declarations, analyser-only — see
+[`SHAPES-V2.md`](../SHAPES-V2.md)).
 
 It exists to give tree-sitter hosts (Zed, Neovim, Helix, …) syntax
 highlighting and structural selection for `.luab`. It is **not** the language's
@@ -10,21 +10,24 @@ source of truth — the hand-written rowan grammar in
 [`crates/luabox-syntax/src/shape/`](../crates/luabox-syntax/src/shape) is. This
 grammar mirrors it.
 
-## Coverage (SHAPES.md §3)
+## Coverage (SHAPES-V2.md)
 
-- Items: `struct`, `trait`, `impl` (incl. the `impl A + B for C;` trait-sum
-  sugar), `type` alias, `use`.
-- Structs: fields, optional `?` types, the `..` open marker, empty bodies.
-- Generics: declaration params with bounds (`<K: Hash + Eq, V>`), use-site args
-  (`Vec<T>`, `HashMap<K, V>`).
-- Traits: supertraits (`trait D: Shape + Sized`), `fn` signatures with `self`,
-  typed params, and multi-return (`-> A, B`).
-- Types: named/builtin, generic application, optional `T?`, union `A | B`,
-  function types `fn(x: A) -> R`, parenthesised.
+- The single item form: `export? type Name<T, ...> = <type-expr>` — no item
+  terminators; declarations are self-delimiting.
+- Object types: fields (`name?: T`), method members (`area(self): number`)
+  with `self`/named/optional parameters.
+- Generics: unbounded declaration params (`<T>`, `<K, V>`), use-site args
+  (`Pair<number>`, `geometry.Pair<T>`).
+- Types: named references — bare or fully qualified (`love.graphics.Canvas`)
+  — generic application, optional `T?`, intersection `A & B`, union `A | B`,
+  function types `(x: A) => R`, parenthesised groups and multi-return lists
+  `(A, B)`.
 - Comments: `//` line, `///` doc (own node), `/* */` block.
 
-The bundled fixture [`test/fixtures/spec_example.luab`](test/fixtures/spec_example.luab)
-exercises all of the above and parses with zero errors.
+The bundled fixtures
+[`test/fixtures/spec_example.luab`](test/fixtures/spec_example.luab) and
+[`test/fixtures/edge_cases.luab`](test/fixtures/edge_cases.luab) exercise all
+of the above and parse with zero errors.
 
 ## Develop
 
@@ -32,7 +35,7 @@ exercises all of the above and parses with zero errors.
 # Generate the parser (writes src/parser.c, src/grammar.json, src/node-types.json)
 npx tree-sitter-cli generate
 
-# Parse the fixture (should show no ERROR / MISSING nodes)
+# Parse the fixtures (should show no ERROR / MISSING nodes)
 npx tree-sitter-cli parse test/fixtures/spec_example.luab
 
 # Check the highlight query against the fixture
@@ -46,8 +49,8 @@ npx tree-sitter-cli query queries/highlights.scm test/fixtures/spec_example.luab
 
 `queries/highlights.scm` uses captures from Zed's theme-recognized set (also
 standard tree-sitter): `@keyword`, `@type`, `@type.builtin`, `@property`,
-`@function`, `@variable.parameter`, `@variable.special` (for `self`),
-`@variable`, `@comment`, `@comment.doc`, `@operator`, `@punctuation.bracket`,
+`@function.method`, `@variable.parameter`, `@variable.special` (for `self`),
+`@comment`, `@comment.doc`, `@operator`, `@punctuation.bracket`,
 `@punctuation.delimiter`. Builtin vs user types are split with
 `#any-of?`/`#not-any-of?` so the two `type_identifier` rules never overlap.
 

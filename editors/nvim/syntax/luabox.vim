@@ -8,33 +8,32 @@ if exists("b:current_syntax")
   finish
 endif
 
-" --- Keywords -------------------------------------------------------------
-syn keyword lbKeyword struct trait impl for fn type use
+" --- Keywords (SHAPES-V2.md: the single `export? type` item form) ----------
+syn keyword lbKeyword export type
 syn keyword lbSelf self
 
 " --- Types ----------------------------------------------------------------
 " Builtin/primitive type names.
-syn keyword lbBuiltinType number integer string boolean table any nil
-" User types read as capitalised identifiers (structs, traits, aliases,
-" single-letter generics like T).
+syn keyword lbBuiltinType number integer string boolean unknown any nil
+" User types read as capitalised identifiers (declared types, generics like
+" T, and each segment of a qualified reference).
 syn match lbType "\<[A-Z][A-Za-z0-9_]*\>"
 
 " --- Declarations ---------------------------------------------------------
-" A trait-fn name: `fn area(...)`.
-syn match lbFunction "\<fn\s\+\zs[A-Za-z_][A-Za-z0-9_]*\>"
-" A field or parameter name before `:` (lowercase, so generic bounds like
-" `T: Ord` keep their type colour).
-syn match lbField "\<[a-z_][A-Za-z0-9_]*\>\ze\s*:"
+" A method member name: `area(self): number`.
+syn match lbFunction "\<[a-z_][A-Za-z0-9_]*\>\ze\s*("
+" A field or parameter name before `:` / `?:`.
+syn match lbField "\<[a-z_][A-Za-z0-9_]*\>\ze?\=\s*:"
 
 " --- Operators & generics --------------------------------------------------
 syn match lbAngle "[<>]"
-syn match lbOperator "->\||\|?\|+\|=\|\.\."
+syn match lbOperator "=>\||\|?\|&\|="
 
 " --- Comments ---------------------------------------------------------------
 " Order matters: `///` doc comments are defined after `//` so they win.
 syn region lbComment start="//" end="$" contains=@Spell
 syn region lbDocComment start="///" end="$" contains=@Spell
-" `/* */` blocks nest (SHAPES.md), hence the self-containment.
+" `/* */` blocks nest (SHAPES-V2.md), hence the self-containment.
 syn region lbBlockComment start="/\*" end="\*/" contains=lbBlockComment,@Spell
 
 " --- Default highlight links -------------------------------------------------

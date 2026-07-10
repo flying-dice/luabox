@@ -68,7 +68,7 @@ Once `editors/nvim` is on the runtimepath, these work even before calling
 
 - `ftdetect/luabox.vim` — detects `*.luab` as the `luabox` filetype.
 - `syntax/luabox.vim` — classic Vim syntax highlighting for `.luab`:
-  keywords (`struct`/`trait`/`impl`/`fn`/`type`/`use`/`self`), type names,
+  keywords (`export`/`type`/`self`), type names,
   field/parameter names, generics, operators, `//` + `/* */` comments and
   `///` doc comments.
 - `ftplugin/luabox.vim` — `commentstring=// %s` and `///` -aware `comments`.
@@ -92,7 +92,7 @@ Once `editors/nvim` is on the runtimepath, these work even before calling
 
 - **Semantic tokens** are applied automatically by Neovim 0.9+ when the
   server attaches — locals vs globals, parameters, LuaCATS `---@` annotation
-  comments, and `.luab` structs/traits/generics all get distinct (standard)
+  comments, and `.luab` types/members/generics all get distinct (standard)
   token types, so any colorscheme with LSP semantic-token support works. Set
   `vim.lsp.semantic_tokens.enable(false, { bufnr = 0 })` (0.12+) or detach
   the server to fall back to the static syntax file.
