@@ -9,6 +9,13 @@ rust-version.workspace = true
 
 [dependencies]
 luabox-db.workspace = true
+luabox-diag.workspace = true
+lsp-server.workspace = true
+lsp-types.workspace = true
+crossbeam-channel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
 
 [lints]
 workspace = true

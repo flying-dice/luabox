@@ -5,6 +5,8 @@
 
 mod check_cmd;
 mod fmt_cmd;
+mod lint_cmd;
+mod lsp_cmd;
 mod scaffold;
 
 use std::path::PathBuf;
@@ -160,7 +162,7 @@ fn main() -> anyhow::Result<()> {
         Command::Check { target, format } => {
             check_cmd::run(&std::env::current_dir()?, target.as_deref(), &format)
         }
-        Command::Lint { .. } => unimplemented("lint", "P1"),
+        Command::Lint { fix } => lint_cmd::run(&std::env::current_dir()?, fix),
         Command::Fmt { check } => fmt_cmd::run(&std::env::current_dir()?, check),
         Command::Build { .. } => unimplemented("build", "P3"),
         Command::Bundle { .. } => unimplemented("bundle", "P3"),
@@ -169,7 +171,7 @@ fn main() -> anyhow::Result<()> {
         Command::Run { .. } => unimplemented("run", "P4"),
         Command::Doc { .. } => unimplemented("doc", "P5"),
         Command::Publish => unimplemented("publish", "P2"),
-        Command::Lsp => unimplemented("lsp", "P1"),
+        Command::Lsp => lsp_cmd::run(),
         Command::Toolchain { .. } => unimplemented("toolchain", "P4"),
         Command::Vendor => unimplemented("vendor", "P2"),
         Command::Audit => unimplemented("audit", "P5"),

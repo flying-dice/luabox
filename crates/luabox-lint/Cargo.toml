@@ -1,0 +1,18 @@
+[package]
+name = "luabox-lint"
+description = "luabox: type-informed lint rules over the shared analysis (clippy analog)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+luabox-syntax.workspace = true
+luabox-hir.workspace = true
+luabox-types.workspace = true
+luabox-diag.workspace = true
+rowan.workspace = true
+
+[lints]
+workspace = true
