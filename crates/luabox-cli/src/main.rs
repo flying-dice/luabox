@@ -3,9 +3,11 @@
 //! Thin frontend over the bounded-context crates: owns UX, argument parsing,
 //! and diagnostic rendering; none of the domain logic.
 
+mod audit_cmd;
 mod bench_cmd;
 mod build_cmd;
 mod bundle_cmd;
+mod publish_cmd;
 mod check_cmd;
 mod deps_cmd;
 mod fmt_cmd;
@@ -258,7 +260,7 @@ fn main() -> anyhow::Result<()> {
         Command::Bench => bench_cmd::run(&std::env::current_dir()?),
         Command::Run { script, args } => run_cmd::run(&std::env::current_dir()?, &script, &args),
         Command::Doc { .. } => unimplemented("doc", "P5"),
-        Command::Publish => unimplemented("publish", "P2"),
+        Command::Publish => publish_cmd::run(&std::env::current_dir()?),
         Command::Lsp { .. } => lsp_cmd::run(),
         Command::Toolchain { action } => {
             let cwd = std::env::current_dir()?;
@@ -271,7 +273,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Vendor => deps_cmd::vendor(&std::env::current_dir()?),
-        Command::Audit => unimplemented("audit", "P5"),
+        Command::Audit => audit_cmd::run(&std::env::current_dir()?),
         Command::Explain { code } => {
             let parsed: luabox_diag::Code = code.parse().map_err(|_| {
                 anyhow::anyhow!("`{code}` is not a valid diagnostic code; codes look like LB0421")
