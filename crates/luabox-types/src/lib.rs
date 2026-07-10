@@ -185,6 +185,7 @@ pub fn check_file_shaped(
             file,
             strictness == Strictness::Strict,
             &inference.expr_types,
+            &inference.carrier_final,
         ));
         diags.extend(inference.diags);
         inferred_types = inference.expr_types;

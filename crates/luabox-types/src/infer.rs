@@ -90,6 +90,12 @@ pub(crate) struct Outcome {
     /// `obj:area(3, 4)` both record under `area`). Positional unions,
     /// widened; the cross-file half of call-site parameter seeding.
     pub(crate) outgoing_calls: HashMap<String, Vec<Ty>>,
+    /// Final accumulated structural type of each `---@type` carrier local
+    /// (`local X = {}` extended by later `X.f = ...` / `function X:m()`),
+    /// keyed by the `local` statement's byte range. The whole-carrier shape
+    /// the checker's deferred `---@type` conformance check runs against
+    /// (SHAPES-V2.md).
+    pub(crate) carrier_final: HashMap<Key, Ty>,
 }
 
 /// Cross-file inputs to display-mode inference, assembled by the analysis
@@ -158,6 +164,7 @@ pub(crate) fn run(
         hir,
         file,
         severity,
+        strict,
         pass: 0,
         seed_params,
         externals,
@@ -165,6 +172,8 @@ pub(crate) fn run(
         shape_of_expr: HashMap::new(),
         instances: HashMap::new(),
         declared_carriers: HashMap::new(),
+        carrier_locals: HashMap::new(),
+        carrier_keys: HashSet::new(),
         funcs: HashMap::new(),
         param_seeds: HashMap::new(),
         outgoing: HashMap::new(),
@@ -199,6 +208,18 @@ pub(crate) fn run(
         .filter(|data| data.returns_set)
         .and_then(|data| data.returns.first().cloned())
         .map(|ity| infer.reify(&ity));
+    // The final accumulated shape of every carrier local, snapshotted after
+    // both passes so later `X.f = ...` / `function X:m()` extensions are all
+    // in (SHAPES-V2.md whole-carrier conformance).
+    let carriers: Vec<(Key, BindingId)> =
+        infer.carrier_locals.iter().map(|(k, v)| (*k, *v)).collect();
+    let mut carrier_final = HashMap::new();
+    for (key, binding) in carriers {
+        if let Some(ity) = infer.state.get(&binding).cloned() {
+            let ty = infer.reify(&ity);
+            carrier_final.insert(key, ty);
+        }
+    }
     Outcome {
         expr_types: infer.expr_types,
         diags: infer.diags,
@@ -206,6 +227,7 @@ pub(crate) fn run(
         fn_returns,
         module_export,
         outgoing_calls: infer.outgoing,
+        carrier_final,
     }
 }
 
@@ -361,6 +383,8 @@ struct Infer<'a> {
     hir: &'a LoweredFile,
     file: &'a str,
     severity: Severity,
+    /// Strict mode (drives assignability inside carrier classification).
+    strict: bool,
     /// 0 = build shapes, 1 = emit diagnostics + publish types.
     pass: u8,
     /// Seed unannotated parameters from call-site argument types
@@ -378,6 +402,15 @@ struct Infer<'a> {
     /// annotated instance value (`---@return Circle`) still resolves
     /// methods and inferred extensions through the carrier (#73).
     declared_carriers: HashMap<String, usize>,
+    /// `---@type` carrier locals (`local X = {}` whose object annotation is
+    /// satisfied only by later extension), keyed by the `local` statement's
+    /// byte range → the carrier binding. Their final shape is published as
+    /// [`Outcome::carrier_final`] for the deferred conformance check.
+    carrier_locals: HashMap<Key, BindingId>,
+    /// The statement keys classified as carriers in pass 0, reused verbatim
+    /// in pass 1 so the keep-the-shape decision (rather than freeze to the
+    /// annotated type) is identical across passes.
+    carrier_keys: HashSet<Key>,
     funcs: HashMap<BodyId, FuncData>,
     /// Running union of argument types observed at call sites, per
     /// parameter binding. Persists across passes: pass 0 collects, pass 1
@@ -1104,8 +1137,24 @@ impl Infer<'_> {
             self.eval_values(body, init, Some(names.len()))
         };
 
+        // A `---@type T` carrier — `local X = {}` whose single object
+        // annotation is currently unsatisfied *only* by missing members (a
+        // carrier still being built). Keep the inferred shape rather than
+        // freezing the binding to `T`, so later `X.f = ...` / `function X:m()`
+        // extend it; its final shape is published for the checker's deferred
+        // whole-carrier conformance check (SHAPES-V2.md).
+        let is_carrier = key.is_some_and(|k| {
+            self.classify_carrier(body, k, names, init, declared_tys.as_deref(), &values)
+        });
+
         for (i, local) in names.iter().enumerate() {
-            if let Some(ty) = declared_tys.as_ref().and_then(|t| t.get(i)) {
+            if is_carrier && i == 0 {
+                let ity = values.first().cloned().unwrap_or(ITy::Ty(Ty::Nil));
+                self.state.insert(local.binding, ity);
+                if let Some(k) = key {
+                    self.carrier_locals.insert(k, local.binding);
+                }
+            } else if let Some(ty) = declared_tys.as_ref().and_then(|t| t.get(i)) {
                 self.declared.insert(local.binding);
                 self.state.insert(local.binding, ITy::Ty(ty.clone()));
             } else if i == 0 && sig.is_some() {
@@ -1132,6 +1181,46 @@ impl Infer<'_> {
                 self.declared_carriers.insert(name, id);
             }
         }
+    }
+
+    /// Whether a `local X = {…}` is a `---@type T` carrier (single name,
+    /// single object annotation, table-constructor init whose immediate
+    /// conformance to `T` fails *only* by missing members). Pass 0 computes
+    /// and records the decision in [`Self::carrier_keys`]; pass 1 replays it
+    /// verbatim so the keep-the-shape choice is identical across passes and
+    /// no partial reification poisons the shape memo.
+    fn classify_carrier(
+        &mut self,
+        body: BodyId,
+        key: Key,
+        names: &[luabox_hir::LocalBinding],
+        init: &[ExprId],
+        declared_tys: Option<&[Ty]>,
+        values: &[ITy],
+    ) -> bool {
+        if self.pass == 1 {
+            return self.carrier_keys.contains(&key);
+        }
+        let carrier = names.len() == 1
+            && init.len() == 1
+            && matches!(self.body(body).expr(init[0]), Expr::Table { .. })
+            && match (declared_tys, values.first()) {
+                (Some([target]), Some(&ITy::Shape(id))) => {
+                    let target = target.clone();
+                    match self.reify_shape(id) {
+                        Ty::Table(lit) => matches!(
+                            crate::assign::classify_literal(self.env, self.strict, &lit, &target),
+                            Some(crate::assign::LiteralConformance::MissingOnly)
+                        ),
+                        _ => false,
+                    }
+                }
+                _ => false,
+            };
+        if carrier {
+            self.carrier_keys.insert(key);
+        }
+        carrier
     }
 
     fn walk_assign(&mut self, body: BodyId, stmt: StmtId, targets: &[ExprId], values: &[ExprId]) {

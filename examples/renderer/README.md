@@ -10,7 +10,7 @@ renderer/
 ├── luabox.toml           # [dependencies] geometry = { path = "../geometry" }
 ├── luabox.lock           # committed — this is an app, not a library
 ├── shapes/render.luab    # our own `type Square`
-├── src/square.lua        # carrier + `---@type geometry.Drawable` assertion
+├── src/square.lua        # carrier with top `---@type geometry.Drawable`
 └── src/main.lua          # draws a square with `luabox run start`
 ```
 
@@ -31,16 +31,19 @@ geometry's manifest names a type entrypoint (`[types] entry =
 "shapes/geometry.luab"`). Its `export type` declarations mount here under the
 package name — `geometry.Shape`, `geometry.Drawable` — with **no import**:
 the scope is ambient (SHAPES-V2.md). We declare our own `type Square` in
-`shapes/render.luab` and assert conformance positionally in `src/square.lua`:
+`shapes/render.luab` and put the conformance on the carrier declaration in
+`src/square.lua`:
 
 ```lua
 ---@type geometry.Drawable
-local _ = Square
+local Square = {}
 ```
 
-Because `Drawable = Shape & { draw(self): string }` is an intersection,
-that single assertion carries the whole obligation — **area + perimeter +
-draw**. Drop any one and `luabox check` reports the gap, naming the member.
+Because `Drawable = Shape & { draw(self): string }` is an intersection, that
+single annotation verifies the whole accumulated carrier — **area + perimeter
++ draw** (plus `my_static`), across every method added anywhere in the file.
+Drop any one and `luabox check` reports the gap at the annotation, naming the
+member.
 The type declares `side: integer`, so `string.rep("#", self.side)` in `draw`
 typechecks against the stdlib's `integer` count parameter, and the
 constructor's declared `---@return render.Square` is satisfied by its

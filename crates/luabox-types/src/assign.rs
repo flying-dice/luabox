@@ -279,6 +279,76 @@ pub(crate) fn explain_mismatch(
     }
 }
 
+/// How a table *literal* immediately conforms to a target object type — the
+/// discriminator behind whole-carrier `---@type` deferral (SHAPES-V2.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiteralConformance {
+    /// Every required member present and correctly typed, no undeclared keys.
+    Conforms,
+    /// The *only* gap is missing required members — a carrier still being
+    /// built. Whole-carrier conformance is deferred to the final shape.
+    MissingOnly,
+    /// A present member has the wrong type, or a sealed target rejects an
+    /// undeclared key — a real mistake, reported immediately (never deferred).
+    Other,
+}
+
+/// Classify a table literal's immediate conformance to `target`, resolved to
+/// its object shape. `None` when `target` is not an object type (no deferral
+/// question to answer). Mirrors [`super::check`]'s literal-freshness split:
+/// missing required fields, mismatched present fields, and undeclared keys
+/// (excess) on a closed target.
+pub(crate) fn classify_literal(
+    env: &TypeEnv,
+    strict: bool,
+    literal: &TableTy,
+    target: &Ty,
+) -> Option<LiteralConformance> {
+    let target = resolve_table(env, target)?;
+    let mut missing = false;
+    let mut other = false;
+    for (name, field) in &target.fields {
+        match literal.fields.get(name) {
+            None => {
+                if !field.optional && !field.ty.admits_nil() {
+                    missing = true;
+                }
+            }
+            Some(actual) => {
+                let mut expected = field.ty.clone();
+                if field.optional {
+                    expected = expected.optional();
+                }
+                if !assignable(env, strict, &actual.ty, &expected) {
+                    other = true;
+                }
+            }
+        }
+    }
+    // Undeclared keys the closed target neither declares nor reaches by an
+    // indexer are freshness violations (excess) — an immediate error.
+    for name in literal.fields.keys() {
+        if target.fields.contains_key(name) {
+            continue;
+        }
+        let key = Ty::StringLit(name.clone());
+        if !target
+            .indexers
+            .iter()
+            .any(|(k, _)| assignable(env, strict, &key, k))
+        {
+            other = true;
+        }
+    }
+    Some(if other {
+        LiteralConformance::Other
+    } else if missing {
+        LiteralConformance::MissingOnly
+    } else {
+        LiteralConformance::Conforms
+    })
+}
+
 /// Resolve a type to its structural table shape, unwrapping `T?` optionals
 /// and following `Ty::Named` through the environment.
 fn resolve_table(env: &TypeEnv, ty: &Ty) -> Option<TableTy> {

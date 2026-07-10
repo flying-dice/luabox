@@ -25,7 +25,7 @@ use luabox_syntax::lua::ast::{
 };
 use luabox_syntax::lua::{self, SyntaxNode};
 
-use crate::assign::{assignable, is_integral_literal};
+use crate::assign::{LiteralConformance, assignable, classify_literal, is_integral_literal};
 use crate::env::{self, TypeEnv};
 use crate::ty::{FieldTy, FunctionTy, TableTy, Ty};
 
@@ -50,6 +50,7 @@ pub(crate) fn run(
     file: &str,
     strict: bool,
     inferred: &HashMap<(usize, usize), Ty>,
+    carrier_final: &HashMap<(usize, usize), Ty>,
 ) -> Vec<Diagnostic> {
     let severity = if strict {
         Severity::Error
@@ -62,6 +63,8 @@ pub(crate) fn run(
         strict,
         severity,
         inferred,
+        carrier_final,
+        deferred_carriers: Vec::new(),
         diags: Vec::new(),
         scopes: vec![HashMap::new()],
         ret_stack: Vec::new(),
@@ -92,6 +95,7 @@ pub(crate) fn run(
     if let Some(block) = tree.block() {
         checker.visit_block(&block);
     }
+    checker.check_deferred_carriers();
 
     let mut diags = checker.diags;
     diags.sort_by_key(|d| d.primary_label().map_or(0, |l| l.span.range.start));
@@ -114,6 +118,18 @@ enum Slot {
     Ty(Ty, Range<usize>),
 }
 
+/// A `---@type T` carrier whose whole-carrier conformance was deferred: its
+/// immediate initializer literal was missing members only, so the check runs
+/// at end-of-walk against the final accumulated shape (SHAPES-V2.md).
+struct DeferredCarrier {
+    /// The declared object/shape type the carrier must satisfy.
+    target: Ty,
+    /// The `local` statement's byte range — the key into `carrier_final`.
+    decl_key: (usize, usize),
+    /// The `---@type` annotation span the diagnostic is attributed to.
+    span: Range<usize>,
+}
+
 struct Checker<'a> {
     env: &'a TypeEnv,
     file: &'a str,
@@ -122,6 +138,11 @@ struct Checker<'a> {
     /// Inference results by byte range (rich table inference, SPEC.md §3):
     /// the fallback for expressions annotations cannot type.
     inferred: &'a HashMap<(usize, usize), Ty>,
+    /// Final accumulated shape of each `---@type` carrier local, keyed by the
+    /// `local` statement's byte range (SHAPES-V2.md whole-carrier deferral).
+    carrier_final: &'a HashMap<(usize, usize), Ty>,
+    /// Carriers whose conformance is deferred to `check_deferred_carriers`.
+    deferred_carriers: Vec<DeferredCarrier>,
     diags: Vec<Diagnostic>,
     scopes: Vec<HashMap<String, Binding>>,
     /// Expected returns of the enclosing function(s); `None` = unannotated.
@@ -332,6 +353,31 @@ impl Checker<'_> {
         if let Some(types) = &types {
             for (i, expected) in types.iter().enumerate() {
                 if let Some(value) = values.get(i) {
+                    // A single `---@type T` object annotation on a
+                    // table-constructor `local X = {}` whose literal is
+                    // missing members *only* is a carrier being built: defer
+                    // its whole-carrier conformance to the final accumulated
+                    // shape (SHAPES-V2.md), suppressing the immediate missing
+                    // -field error. Mismatched present members and excess keys
+                    // (freshness) are *not* deferred — they report now.
+                    if i == 0
+                        && types.len() == 1
+                        && let Expr::Table(table) = value
+                        && let Ty::Table(lit) = self.table_literal_ty(table)
+                        && classify_literal(self.env, self.strict, &lit, expected)
+                            == Some(LiteralConformance::MissingOnly)
+                    {
+                        let span = self
+                            .env
+                            .typed_local_span(key)
+                            .unwrap_or_else(|| range(local.syntax()));
+                        self.deferred_carriers.push(DeferredCarrier {
+                            target: expected.clone(),
+                            decl_key: key,
+                            span,
+                        });
+                        continue;
+                    }
                     self.check_slot(&Slot::Expr(value.clone()), expected, TYPE_MISMATCH);
                 }
             }
@@ -350,6 +396,41 @@ impl Checker<'_> {
                 };
                 self.bind(name, ty, false);
             }
+        }
+    }
+
+    /// Run every deferred `---@type` carrier conformance obligation against
+    /// the binding's final accumulated shape (SHAPES-V2.md). The diagnostic
+    /// is attributed to the `---@type` annotation, carries the same
+    /// member-naming detail as an immediate mismatch, and cross-references the
+    /// `.luab` declaration site (#80). A carrier whose accumulated shape
+    /// satisfies the type produces nothing.
+    fn check_deferred_carriers(&mut self) {
+        for carrier in std::mem::take(&mut self.deferred_carriers) {
+            let Some(found) = self.carrier_final.get(&carrier.decl_key).cloned() else {
+                continue; // inference published no final shape (e.g. off)
+            };
+            if self.assignable(&found, &carrier.target) {
+                continue;
+            }
+            let detail =
+                crate::assign::explain_mismatch(self.env, self.strict, &found, &carrier.target)
+                    .map_or(String::new(), |d| format!(": {d}"));
+            let expected_name = match &carrier.target {
+                Ty::Named(name) => Some(name.as_str()),
+                _ => None,
+            };
+            self.report_conformance(
+                TYPE_MISMATCH,
+                carrier.span.clone(),
+                format!(
+                    "type mismatch: expected `{}`, found `{found}`{detail}",
+                    carrier.target
+                ),
+                format!("expected `{}`", carrier.target),
+                None,
+                expected_name,
+            );
         }
     }
 

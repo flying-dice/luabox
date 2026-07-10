@@ -4,8 +4,13 @@
 -- where the instance literal is checked against the type (try removing
 -- `radius` from the literal to see the error); it also ties the carrier to
 -- the instance type, so `self` in the methods below types as `geometry.Circle`
--- and `self.radius` resolves as its declared `number`. The test suite asserts
--- Shape conformance positionally with a plain `---@type geometry.Shape`.
+-- and `self.radius` resolves as its declared `number`.
+--
+-- The `---@type geometry.Shape` on the declaration verifies the whole
+-- accumulated carrier (area, perimeter, my_static) against Shape — deferred to
+-- everything Circle becomes, not the empty `{}`. Delete any member and
+-- `luabox check` names it here.
+---@type geometry.Shape
 local Circle = {}
 Circle.__index = Circle
 
@@ -19,16 +24,17 @@ function Circle:perimeter()
     return 2 * math.pi * self.radius
 end
 
+-- The static member of geometry.Shape: no `self`, written with `.` and
+-- called as `Circle.my_static()`. All these shapes live in 2D.
+---@return number
+function Circle.my_static()
+    return 2
+end
+
 ---@param radius number
 ---@return geometry.Circle
 function Circle.new(radius)
     return setmetatable({ radius = radius }, Circle)
 end
-
--- Positional conformance assertion (SHAPES-V2.md): a `---@type` binding is
--- an assertion by construction. Delete `Circle:perimeter` above and this is
--- the line where `luabox check` reports it — naming the missing member.
----@type geometry.Shape
-local _ = Circle
 
 return Circle

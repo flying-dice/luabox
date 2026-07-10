@@ -9,7 +9,10 @@ Feature: Sealed object checking (positional)
     Given a shape module "geometry" declaring type Point = { x: number, y: number }
     And a Lua file binding a table { x = 0 } with ---@type geometry.Point
     When I run "luabox check"
-    Then diagnostic LB0302 is reported naming field "y"
+    # A `---@type` object annotation on a table constructor defers whole-carrier
+    # conformance to the final value; still missing `y`, it errors at the
+    # annotation (LB0300) naming the member (SHAPES-V2.md).
+    Then diagnostic LB0300 is reported naming field "y"
     And the command fails
 
   Scenario: unknown key on sealed object rejected

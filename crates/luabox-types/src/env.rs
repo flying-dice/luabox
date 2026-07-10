@@ -57,6 +57,10 @@ pub struct TypeEnv {
     functions: BTreeMap<String, FunctionTy>,
     /// `---@type` annotations keyed by their target `local` statement.
     typed_locals: HashMap<Target, Vec<Ty>>,
+    /// The source span of each `---@type` annotation, keyed by its target
+    /// `local` statement — the anchor a deferred whole-carrier conformance
+    /// error points at (SHAPES-V2.md).
+    typed_local_spans: HashMap<Target, std::ops::Range<usize>>,
     /// Function signatures keyed by their target statement (for return
     /// checking inside the body).
     fn_sigs: HashMap<Target, FunctionTy>,
@@ -320,6 +324,7 @@ impl TypeEnv {
         let mut params: Vec<&ParamTag> = Vec::new();
         let mut returns: Vec<&ReturnTag> = Vec::new();
         let mut types: Option<Vec<Ty>> = None;
+        let mut type_span: Option<std::ops::Range<usize>> = None;
         let mut overloads: Vec<FunctionTy> = Vec::new();
         let mut casts: Vec<CastEntry> = Vec::new();
 
@@ -375,6 +380,7 @@ impl TypeEnv {
                 Tag::Return(r) => returns.push(r),
                 Tag::Type(t) => {
                     types = Some(t.types.iter().map(|ty| lowerer.lower(ty)).collect());
+                    type_span = Some(t.span.start..t.span.end);
                 }
                 Tag::Enum(e) if !e.name.is_empty() => {
                     let def = enum_def(e, item.target, root);
@@ -403,6 +409,9 @@ impl TypeEnv {
         }
         if let (Some(types), Some(target)) = (types, target) {
             self.typed_locals.insert(target, types);
+            if let Some(span) = type_span {
+                self.typed_local_spans.insert(target, span);
+            }
         }
     }
 
@@ -646,6 +655,11 @@ impl TypeEnv {
 
     pub(crate) fn typed_local(&self, target: Target) -> Option<&[Ty]> {
         self.typed_locals.get(&target).map(Vec::as_slice)
+    }
+
+    /// The source span of the `---@type` annotation on a `local` statement.
+    pub(crate) fn typed_local_span(&self, target: Target) -> Option<std::ops::Range<usize>> {
+        self.typed_local_spans.get(&target).cloned()
     }
 
     pub(crate) fn fn_sig(&self, target: Target) -> Option<&FunctionTy> {

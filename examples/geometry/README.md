@@ -10,8 +10,8 @@ consumed through the **standard annotation positions** (`---@type` /
 geometry/
 ├── luabox.toml               # [types] entry — the published type surface
 ├── shapes/geometry.luab      # type declarations, an intersection, a generic
-├── src/circle.lua            # Shape carrier + positional assertion
-├── src/rect.lua              # Shape carrier + positional assertion
+├── src/circle.lua            # Shape carrier (top ---@type conformance)
+├── src/rect.lua              # Shape carrier (top ---@type conformance)
 ├── src/shapes_data.lua       # ---@type bindings + sealed-checking demo
 └── tests/geometry_test.lua
 ```
@@ -35,10 +35,11 @@ geometry/
      every non-optional field present, no undeclared keys.
    - `---@return geometry.Circle` on a constructor checks the
      `setmetatable(literal, Circle)` result at the return position.
-   - `---@type geometry.Shape` on a carrier binding is a **conformance
-     assertion by construction** — conformance is structural and positional,
-     so the general mechanism covers the special case. No `impl`, no
-     `---@impl`.
+   - `---@type geometry.Shape` on a carrier declaration (`local Circle = {}`)
+     verifies the **whole accumulated carrier** — every method and static
+     added anywhere in the file — against Shape. Conformance is structural and
+     positional, so the general mechanism covers the special case. No `impl`,
+     no `---@impl`, no throwaway trailing assertion.
 
 4. **Check it.** `luabox check` runs both front-ends — LuaCATS annotations and
    `.luab` types — through one type IR.
@@ -66,8 +67,8 @@ Add an undeclared key and you get the dual diagnostic:
 error[LB0303]: unknown field `z`
 ```
 
-Delete `Circle:perimeter` and the positional conformance assertion in
-`src/circle.lua` fires, naming the member:
+Delete `Circle:perimeter` and the whole-carrier `---@type geometry.Shape`
+conformance in `src/circle.lua` fires at the annotation, naming the member:
 
 ```
 error[LB0300]: type mismatch: expected `geometry.Shape`, found

@@ -43,7 +43,7 @@ Feature: .luab type distribution across package boundaries
       return p
       """
     When I run "luabox check"
-    Then diagnostic LB0302 is reported naming field "y"
+    Then diagnostic LB0300 is reported naming field "y"
     And the command fails
 
   Scenario: an installed dependency's type surface in lua_modules resolves
@@ -82,7 +82,7 @@ Feature: .luab type distribution across package boundaries
       return p
       """
     When I run "luabox check"
-    Then diagnostic LB0302 is reported naming field "y"
+    Then diagnostic LB0300 is reported naming field "y"
     And the command fails
 
   Scenario: a type the entrypoint does not export stays private

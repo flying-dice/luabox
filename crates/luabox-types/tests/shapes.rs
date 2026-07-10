@@ -282,11 +282,14 @@ fn lb0305_suggests_fq_name_for_typoed_namespace() {
 #[test]
 fn conformance_mismatch_labels_the_luab_declaration_site() {
     let f = geometry_fixture();
+    // `local p = { x = 0 }` is missing `y` only, so whole-carrier conformance
+    // defers to the final shape (still missing `y`) and reports LB0300 at the
+    // `---@type` annotation — carrying the `.luab` declaration-site label.
     let diags = f.check("---@type geometry.Point\nlocal p = { x = 0 }\nreturn p\n");
     let diag = diags
         .iter()
-        .find(|d| d.code.to_string() == "LB0302")
-        .expect("missing-field diagnostic expected");
+        .find(|d| d.code.to_string() == "LB0300")
+        .expect("missing-member diagnostic expected");
     assert!(
         diag.labels.iter().any(|l| !l.primary
             && l.message == "type declared here"
@@ -729,4 +732,123 @@ fn sealed_unknown_key_read_currently_lenient() {
     let f = geometry_fixture();
     let diags = f.check("---@type geometry.Point\nlocal p = { x = 0, y = 1 }\nreturn p.z\n");
     assert!(diags.is_empty(), "{diags:?}");
+}
+
+// === Top `---@type` whole-carrier conformance (deferred) ====================
+//
+// The idiomatic v2 carrier moves `---@type geometry.Shape` up onto the
+// `local Circle = {}` declaration and drops the throwaway trailing
+// `local _ = Circle`. The empty literal is missing every member, so the
+// conformance obligation defers to the *final accumulated* carrier shape.
+
+#[test]
+fn top_type_annotation_verifies_accumulated_carrier() {
+    let f = geometry_fixture();
+    // Annotation on top, methods below, NO trailing `local _`. The carrier
+    // becomes a `geometry.Shape` across the whole file — strict-clean.
+    let src = "---@type geometry.Shape\n\
+               local Circle = {}\nCircle.__index = Circle\n\
+               ---@return number\nfunction Circle:area() return 1 end\n\
+               ---@return number\nfunction Circle:perimeter() return 2 end\n\
+               return Circle\n";
+    let diags = f.check(src);
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn top_type_annotation_reports_missing_member_at_annotation() {
+    let f = geometry_fixture();
+    // Same idiom, `perimeter` omitted: LB0300 at the `---@type` line, naming
+    // the missing member.
+    let src = "---@type geometry.Shape\n\
+               local Circle = {}\nCircle.__index = Circle\n\
+               ---@return number\nfunction Circle:area() return 1 end\n\
+               return Circle\n";
+    let diags = f.check(src);
+    let diag = diags
+        .iter()
+        .find(|d| d.code.to_string() == "LB0300")
+        .expect("LB0300 expected");
+    assert!(
+        diag.message.contains("perimeter"),
+        "the message must name `perimeter`: {diag:?}"
+    );
+    let primary = diag.primary_label().expect("primary label");
+    assert!(
+        src[primary.span.range.clone()].contains("geometry.Shape"),
+        "primary span must be the `---@type` annotation: {:?}",
+        &src[primary.span.range.clone()]
+    );
+}
+
+#[test]
+fn top_type_annotation_reports_wrong_member_type() {
+    let f = geometry_fixture();
+    // `perimeter` is annotated `---@return string`: the deferred check catches
+    // the type mismatch, not just missing members.
+    let src = "---@type geometry.Shape\n\
+               local Circle = {}\nCircle.__index = Circle\n\
+               ---@return number\nfunction Circle:area() return 1 end\n\
+               ---@return string\nfunction Circle:perimeter() return \"x\" end\n\
+               return Circle\n";
+    let diags = f.check(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code.to_string() == "LB0300" && d.message.contains("perimeter")),
+        "the mismatch must name `perimeter`: {diags:?}"
+    );
+}
+
+#[test]
+fn complete_data_literal_still_checked_immediately() {
+    let f = geometry_fixture();
+    // A complete data literal conforms at the declaration — nothing deferred.
+    let ok = "---@type geometry.Point\nlocal p = { x = 0, y = 0 }\nreturn p\n";
+    assert!(f.check(ok).is_empty(), "{:?}", f.check(ok));
+    // An excess key is a freshness violation reported at the literal, NOT
+    // deferred (deferring would hide a real mistake).
+    let bad = "---@type geometry.Point\nlocal p = { x = 0, y = 0, z = 0 }\nreturn p\n";
+    let diags = f.check(bad);
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code.to_string() == "LB0303" && d.message.contains('z')),
+        "excess `z` must fire at the literal: {diags:?}"
+    );
+}
+
+#[test]
+fn data_literal_missing_field_still_errors_if_never_extended() {
+    let f = geometry_fixture();
+    // Missing `y`, never extended: the deferred check runs against the final
+    // (still-incomplete) shape and errors — the diagnostic just moves to the
+    // annotation.
+    let src = "---@type geometry.Point\nlocal p = { x = 0 }\nreturn p\n";
+    let diags = f.check(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code.to_string() == "LB0300" && d.message.contains('y')),
+        "missing `y` must still error, naming `y`: {diags:?}"
+    );
+}
+
+#[test]
+fn self_tie_and_top_annotation_coexist() {
+    let f = carrier_fixture();
+    // A carrier declared BOTH via `---@type geometry.Shape` at the top AND a
+    // constructor returning `geometry.Circle`: `self.radius` still types as
+    // the declared field (so the `---@return number` methods pass), and the
+    // whole-carrier conformance does not double-report.
+    let src = "---@type geometry.Shape\n\
+               local Circle = {}\nCircle.__index = Circle\n\
+               ---@return number\nfunction Circle:area() return self.radius end\n\
+               ---@return number\nfunction Circle:perimeter() return self.radius end\n\
+               ---@param radius number\n---@return geometry.Circle\n\
+               function Circle.new(radius)\n\
+                   return setmetatable({ radius = radius }, Circle)\n\
+               end\n\
+               return Circle\n";
+    assert!(f.check(src).is_empty(), "{:?}", f.check(src));
 }

@@ -24,7 +24,8 @@ local dimensions = { first = 640, second = 480 }
 --
 --   ---@type geometry.Point
 --   local missing = { x = 0 }
---       -- error[LB0302]: missing required field `y` in table literal
+--       -- error[LB0300]: type mismatch: expected `geometry.Point` ...
+--       --                missing `y` (checked against the final value)
 --
 --   ---@type geometry.Point
 --   local extra = { x = 0, y = 0, z = 0 }
