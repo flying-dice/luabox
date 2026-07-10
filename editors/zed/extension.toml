@@ -38,4 +38,4 @@ languages = ["Lua", "LuaBox Shape"]
 [grammars.luab]
 repository = "https://gitlab.beluga-sirius.ts.net/flying-dice/luabox"
 path = "tree-sitter-luab"
-rev = "e421ce1f9e1243df28b6c83688f9c2f363ed41fa"
+rev = "c77f9e9745f21ce818e950add1880e73cc20cc63"
