@@ -3,10 +3,10 @@
 //!
 //! - **LuaCATS annotations** in `.lua` files (`luabox_syntax::luacats`):
 //!   classes (+fields), functions (`@param`/`@return`), aliases, enums,
-//!   plain doc lines, `@deprecated`, `---@impl` conformance assertions.
-//! - **`.luab` shape declarations** (`luabox_syntax::shape`): structs
-//!   (fields, sealed/open), traits (fns, supertraits), impls, type
-//!   aliases — each with its `///` doc comments.
+//!   plain doc lines, `@deprecated`.
+//! - **`.luab` type declarations** (`luabox_syntax::shape`, SHAPES-V2.md):
+//!   object types with fields/methods, intersections, generics — each with
+//!   its `---` doc comments.
 //!
 //! Types are captured as *rendered strings* (the same source-ish rendering
 //! the LSP hover uses); cross-linking happens later in the renderer via one
@@ -801,10 +801,10 @@ pub fn render_shape_type(ty: &ShapeTypeRef) -> String {
     }
 }
 
-/// `///` doc comments indexed by the source offset of the token they
-/// precede. Doc comments are trivia in the `.luab` tree (SHAPES.md §2), so
+/// `---` doc comments indexed by the source offset of the token they
+/// precede. Doc comments are trivia in the `.luab` tree (SHAPES-V2.md), so
 /// they are collected from the token stream rather than the node structure:
-/// a run of `///` lines separated by single newlines, ending directly above
+/// a run of `---` lines separated by single newlines, ending directly above
 /// the item (no blank line), documents that item.
 struct DocComments {
     /// `(kind, start, end, newline_count, text)` for every token, in order.
@@ -851,7 +851,7 @@ impl DocComments {
             match kind {
                 ShapeSyntaxKind::WHITESPACE if *newlines <= 1 => {}
                 ShapeSyntaxKind::DOC_COMMENT => {
-                    let body = text.strip_prefix("///").unwrap_or(text);
+                    let body = text.strip_prefix("---").unwrap_or(text);
                     lines.push(body.strip_prefix(' ').unwrap_or(body));
                 }
                 _ => break,
@@ -1013,14 +1013,14 @@ mod tests {
     fn shape_types_members_and_docs() {
         let sm = shape_module(
             "geometry",
-            "/// A 2D point.\n\
-             /// Immutable.\n\
-             type Point = {\n    /// Horizontal.\n    x: number,\n    y?: number,\n}\n\
+            "--- A 2D point.\n\
+             --- Immutable.\n\
+             type Point = {\n    --- Horizontal.\n    x: number,\n    y?: number,\n}\n\
              \n\
              type Bag<T> = { items: T }\n\
              \n\
-             /// Things with an area.\n\
-             export type Shape = {\n    /// The enclosed area.\n    area(self): number,\n}\n\
+             --- Things with an area.\n\
+             export type Shape = {\n    --- The enclosed area.\n    area(self): number,\n}\n\
              \n\
              export type Drawable = Shape & { draw(self): string }\n\
              \n\
@@ -1056,7 +1056,7 @@ mod tests {
 
     #[test]
     fn blank_line_detaches_shape_docs() {
-        let sm = shape_module("m", "/// Stray comment.\n\ntype Point = { x: number }\n");
+        let sm = shape_module("m", "--- Stray comment.\n\ntype Point = { x: number }\n");
         assert_eq!(sm.types[0].docs, "");
     }
 

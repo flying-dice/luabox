@@ -49,7 +49,7 @@ Feature: luabox doc — static documentation site
     Given a project with edition "5.4"
     And a file "src/geometry.luab" containing:
       """
-      /// A 2D point.
+      --- A 2D point.
       type Point = {
           x: number,
           y: number,
@@ -84,9 +84,9 @@ Feature: luabox doc — static documentation site
     Given a project with edition "5.4"
     And a file "src/geometry.luab" containing:
       """
-      /// Things with an area.
+      --- Things with an area.
       export type Shape = {
-          /// The enclosed area.
+          --- The enclosed area.
           area(self): number,
       }
       """

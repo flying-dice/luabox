@@ -333,9 +333,9 @@ type A = {
 
     #[test]
     fn doc_comment_stays_with_item() {
-        let src = "/// A point.\ntype Point={x:number}";
+        let src = "--- A point.\ntype Point={x:number}";
         let expected = "\
-/// A point.
+--- A point.
 type Point = {
     x: number,
 }
@@ -345,9 +345,9 @@ type Point = {
 
     #[test]
     fn member_doc_comment_preserved() {
-        let src = "type P={\n/// the x coord\nx:number,\ny:number}";
+        let src = "type P={\n--- the x coord\nx:number,\ny:number}";
         let out = format(src);
-        assert!(out.contains("/// the x coord"), "got: {out}");
+        assert!(out.contains("--- the x coord"), "got: {out}");
         assert!(out.contains("    x: number,"), "got: {out}");
     }
 

@@ -919,7 +919,7 @@ mod tests {
         );
         let shapes = model::shape_module(
             "geometry",
-            "/// A 2D point.\ntype Point = { x: number, y: number }\n\
+            "--- A 2D point.\ntype Point = { x: number, y: number }\n\
              export type Shape = {\n    area(self): number,\n}\n",
         );
         DocModel {

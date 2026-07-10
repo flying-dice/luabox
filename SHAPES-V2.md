@@ -45,6 +45,12 @@ params       := param ("," param)*
 param        := "self" | NAME "?"? ":" type_expr
 ```
 
+**Comments follow Lua conventions**, not the host-agnostic Rust style v1
+used: `--` line comments, `---` doc comments (harvested for hover and
+`luabox doc`; `----…` demotes to a plain comment, as in LuaCATS), and
+`--[[ ... ]]` / `--[=[ ... ]=]` long-bracket block comments. `.luab` files
+sit inside Lua projects; their comments should read like Lua.
+
 Deleted from v1: `struct`, `trait`, `impl`, `use` items; supertrait clauses
 (`trait Drawable: Shape` becomes intersection). Example, full v1 spec module
 in v2 syntax:

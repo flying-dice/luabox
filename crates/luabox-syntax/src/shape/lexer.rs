@@ -57,7 +57,7 @@ impl Lexer<'_> {
                 }
                 self.push(ShapeSyntaxKind::WHITESPACE, start);
             }
-            b'/' => self.slash(start),
+            b'-' if self.peek(1) == Some(b'-') => self.dash_comment(start),
             b'A'..=b'Z' | b'a'..=b'z' | b'_' => self.ident_or_keyword(start),
             b'=' if self.peek(1) == Some(b'>') => {
                 self.pos += 2;
@@ -67,52 +67,57 @@ impl Lexer<'_> {
         }
     }
 
-    /// `//` line comment, `///` doc comment (`////…` demotes back to plain,
-    /// as in Rust), or `/* */` block comment with nesting. A lone `/` is an
-    /// ERROR — the grammar has no division.
-    fn slash(&mut self, start: usize) {
-        match self.peek(1) {
-            Some(b'/') => {
-                let doc = self.peek(2) == Some(b'/') && self.peek(3) != Some(b'/');
-                while !matches!(self.peek(0), None | Some(b'\n')) {
-                    self.pos += 1;
-                }
-                let kind = if doc {
-                    ShapeSyntaxKind::DOC_COMMENT
-                } else {
-                    ShapeSyntaxKind::COMMENT
-                };
-                self.push(kind, start);
+    /// Lua-convention comments (SHAPES-V2.md): `--` line comment, `---` doc
+    /// comment (`----…` demotes back to plain, as LuaCATS does), or a
+    /// `--[[ ]]` / `--[=[ ]=]` long-bracket block comment. A lone `-` is an
+    /// ERROR — the grammar has no minus.
+    fn dash_comment(&mut self, start: usize) {
+        // `--[=*[` opens a long-bracket block comment.
+        if self.peek(2) == Some(b'[') {
+            let mut level = 0usize;
+            while self.peek(3 + level) == Some(b'=') {
+                level += 1;
             }
-            Some(b'*') => {
-                self.pos += 2;
-                let mut depth = 1usize;
-                while depth > 0 {
-                    match (self.peek(0), self.peek(1)) {
-                        (None, _) => break, // unterminated: ERROR to EOF
-                        (Some(b'/'), Some(b'*')) => {
-                            depth += 1;
-                            self.pos += 2;
-                        }
-                        (Some(b'*'), Some(b'/')) => {
-                            depth -= 1;
-                            self.pos += 2;
-                        }
-                        _ => self.pos += 1,
-                    }
-                }
-                let kind = if depth == 0 {
+            if self.peek(3 + level) == Some(b'[') {
+                self.pos += 4 + level;
+                let kind = if self.skip_to_long_close(level) {
                     ShapeSyntaxKind::COMMENT
                 } else {
-                    ShapeSyntaxKind::ERROR
+                    ShapeSyntaxKind::ERROR // unterminated: ERROR to EOF
                 };
                 self.push(kind, start);
-            }
-            _ => {
-                self.pos += 1;
-                self.push(ShapeSyntaxKind::ERROR, start);
+                return;
             }
         }
+        let doc = self.peek(2) == Some(b'-') && self.peek(3) != Some(b'-');
+        while !matches!(self.peek(0), None | Some(b'\n')) {
+            self.pos += 1;
+        }
+        let kind = if doc {
+            ShapeSyntaxKind::DOC_COMMENT
+        } else {
+            ShapeSyntaxKind::COMMENT
+        };
+        self.push(kind, start);
+    }
+
+    /// Advance past the matching `]=*]` of a level-`level` long bracket.
+    /// Returns `false` (cursor at EOF) when unterminated.
+    fn skip_to_long_close(&mut self, level: usize) -> bool {
+        while self.pos < self.bytes.len() {
+            if self.bytes[self.pos] == b']' {
+                let mut eq = 0usize;
+                while self.peek(1 + eq) == Some(b'=') {
+                    eq += 1;
+                }
+                if eq == level && self.peek(1 + eq) == Some(b']') {
+                    self.pos += 2 + eq;
+                    return true;
+                }
+            }
+            self.pos += 1;
+        }
+        false
     }
 
     fn ident_or_keyword(&mut self, start: usize) {
@@ -189,7 +194,7 @@ mod tests {
     #[test]
     fn spec_example_lexes_clean() {
         let src = r"
-/// 2D geometry primitives.
+--- 2D geometry primitives.
 type Point = { x: number, y: number, label?: string }
 type Circle = { radius: number }
 type Pair<T> = { first: T, second: T }
@@ -271,13 +276,20 @@ export type Drawable = Shape & {
 
     #[test]
     fn comments() {
-        assert_eq!(kinds("// plain"), vec![COMMENT]);
-        assert_eq!(kinds("/// doc"), vec![DOC_COMMENT]);
-        // //// is a plain comment again, as in Rust
-        assert_eq!(kinds("//// rule"), vec![COMMENT]);
-        assert_eq!(kinds("/* a /* nested */ b */"), vec![COMMENT]);
+        // Lua conventions (SHAPES-V2.md): `--` line, `---` doc, `--[[ ]]`
+        // long-bracket blocks.
+        assert_eq!(kinds("-- plain"), vec![COMMENT]);
+        assert_eq!(kinds("--- doc"), vec![DOC_COMMENT]);
+        // ---- is a plain comment again, as in LuaCATS
+        assert_eq!(kinds("---- rule"), vec![COMMENT]);
+        assert_eq!(kinds("--[[ a ]] b"), vec![COMMENT, WHITESPACE, IDENT]);
+        // levelled long brackets contain unlevelled closers
+        assert_eq!(kinds("--[=[ a ]] b ]=]"), vec![COMMENT]);
         // unterminated block comment is an ERROR to EOF
-        assert_eq!(kinds("/* open"), vec![ERROR]);
+        assert_eq!(kinds("--[[ open"), vec![ERROR]);
+        assert_eq!(kinds("--[=[ open ]]"), vec![ERROR]);
+        // `--[` without a matching bracket is a plain line comment
+        assert_eq!(kinds("--[ not a block"), vec![COMMENT]);
     }
 
     #[test]
@@ -295,9 +307,11 @@ export type Drawable = Shape & {
         // no numbers or strings in the grammar
         assert_eq!(nontrivia("x: 5"), vec![IDENT, COLON, ERROR]);
         assert_eq!(kinds("£"), vec![ERROR]);
-        // lone slash, minus, and the retired thin arrow are errors
+        // lone slash, lone minus, and the retired thin arrow are errors
         assert_eq!(nontrivia("a / b"), vec![IDENT, ERROR, IDENT]);
         assert_eq!(nontrivia("a - b"), vec![IDENT, ERROR, IDENT]);
         assert_eq!(nontrivia("-> x"), vec![ERROR, R_ANGLE, IDENT]);
+        // Rust-style v1 comments no longer lex as comments
+        assert_eq!(nontrivia("// x"), vec![ERROR, ERROR, IDENT]);
     }
 }

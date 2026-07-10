@@ -55,7 +55,7 @@ require("luabox").setup({
 `setup()`:
 
 - registers `.luab` as the `luabox` filetype (`vim.filetype.add`),
-- sets the shape comment string to `// %s` for that filetype,
+- sets the shape comment string to `-- %s` for that filetype,
 - defines and enables the `luabox` LSP server (`vim.lsp.config` + `vim.lsp.enable`).
 
 The server is launched as `luabox lsp` (LSP over stdio; there is no `--stdio`
@@ -69,9 +69,9 @@ Once `editors/nvim` is on the runtimepath, these work even before calling
 - `ftdetect/luabox.vim` — detects `*.luab` as the `luabox` filetype.
 - `syntax/luabox.vim` — classic Vim syntax highlighting for `.luab`:
   keywords (`export`/`type`/`self`), type names,
-  field/parameter names, generics, operators, `//` + `/* */` comments and
-  `///` doc comments.
-- `ftplugin/luabox.vim` — `commentstring=// %s` and `///` -aware `comments`.
+  field/parameter names, generics, operators, `--` + `--[[ ]]` comments and
+  `---` doc comments.
+- `ftplugin/luabox.vim` — `commentstring=-- %s` and `---`-aware `comments`.
 
 ## Formatting and semantic tokens (via the LSP)
 
@@ -105,7 +105,7 @@ If you use nvim-lspconfig, copy the snippet at the bottom of `lua/luabox.lua`:
 vim.filetype.add({ extension = { luab = "luabox" } })
 vim.api.nvim_create_autocmd("FileType", {
   pattern = "luabox",
-  callback = function() vim.bo.commentstring = "// %s" end,
+  callback = function() vim.bo.commentstring = "-- %s" end,
 })
 
 local lspconfig = require("lspconfig")

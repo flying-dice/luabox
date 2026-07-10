@@ -15,18 +15,22 @@
   "repository": {
     "doc-comments": {
       "name": "comment.line.documentation.luabox-shape",
-      "match": "///.*$"
+      "match": "---(?!-).*$"
     },
     "comments": {
       "patterns": [
         {
-          "name": "comment.line.double-slash.luabox-shape",
-          "match": "//(?!/).*$"
+          "name": "comment.block.luabox-shape",
+          "begin": "--\\[(=*)\\[",
+          "end": "\\]\\1\\]"
         },
         {
-          "name": "comment.block.luabox-shape",
-          "begin": "/\\*",
-          "end": "\\*/"
+          "name": "comment.line.double-dash.luabox-shape",
+          "match": "--(?!-).*$"
+        },
+        {
+          "name": "comment.line.double-dash.luabox-shape",
+          "match": "----.*$"
         }
       ]
     },

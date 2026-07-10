@@ -29,12 +29,12 @@ syn match lbField "\<[a-z_][A-Za-z0-9_]*\>\ze?\=\s*:"
 syn match lbAngle "[<>]"
 syn match lbOperator "=>\||\|?\|&\|="
 
-" --- Comments ---------------------------------------------------------------
-" Order matters: `///` doc comments are defined after `//` so they win.
-syn region lbComment start="//" end="$" contains=@Spell
-syn region lbDocComment start="///" end="$" contains=@Spell
-" `/* */` blocks nest (SHAPES-V2.md), hence the self-containment.
-syn region lbBlockComment start="/\*" end="\*/" contains=lbBlockComment,@Spell
+" --- Comments (Lua conventions, SHAPES-V2.md) --------------------------------
+" Order matters: `---` doc comments are defined after `--` so they win.
+syn region lbComment start="--" end="$" contains=@Spell
+syn region lbDocComment start="---" end="$" contains=@Spell
+" `--[[ ]]` long-bracket blocks (any `=` level).
+syn region lbBlockComment start="--\[\z(=*\)\[" end="\]\z1\]" contains=@Spell
 
 " --- Default highlight links -------------------------------------------------
 hi def link lbKeyword      Keyword

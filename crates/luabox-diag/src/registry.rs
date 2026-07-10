@@ -1007,12 +1007,12 @@ fully-qualified name must be declared exactly once. Two modules declaring
 the same name is this error at both sites — never a silent merge.
 
 ```typescript
-// shapes/geometry.luab        → declares geometry.Point
+-- shapes/geometry.luab        → declares geometry.Point
 type Point = { x: number }
 ```
 
 ```typescript
-// shapes2/geometry.luab       → also declares geometry.Point: LB2005
+-- shapes2/geometry.luab       → also declares geometry.Point: LB2005
 type Point = { y: number }
 ```
 
@@ -1031,15 +1031,15 @@ short name that belongs to *another* module (references outside the
 declaring module are fully qualified — SHAPES-V2.md).
 
 ```typescript
-// shapes/geometry.luab
+-- shapes/geometry.luab
 type Pair<T> = { first: T, second: T }
 ```
 
 ```typescript
-// shapes/other.luab
-type Bad     = geometry.Pair<number, string>  // LB2007: expected 1 argument
-type AlsoBad = Pair<number>                   // LB2007: not declared here —
-                                              // did you mean `geometry.Pair`?
+-- shapes/other.luab
+type Bad     = geometry.Pair<number, string>  -- LB2007: expected 1 argument
+type AlsoBad = Pair<number>                   -- LB2007: not declared here —
+                                              -- did you mean `geometry.Pair`?
 ```
 
 Fix the argument count, or qualify the reference with its module namespace
@@ -1056,9 +1056,9 @@ live in `.lua`; conformance is positional, checked wherever a value meets an
 annotated position.
 
 ```typescript
-// geometry.luab
+-- geometry.luab
 type Shape = {
-    area(self): number { return 1 },   // LB2010
+    area(self): number { return 1 },   -- LB2010
 }
 ```
 

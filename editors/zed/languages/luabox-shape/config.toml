@@ -1,7 +1,7 @@
 name = "LuaBox Shape"
 grammar = "luab"
 path_suffixes = ["luab"]
-line_comments = ["// "]
+line_comments = ["-- "]
 
 # Auto-close pairs for the shape DSL.
 brackets = [

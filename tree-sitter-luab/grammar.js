@@ -158,19 +158,22 @@ module.exports = grammar({
 
     identifier: (_) => /[A-Za-z_][A-Za-z0-9_]*/,
 
-    // `// ...` line comment (matches the whole line).
-    line_comment: (_) => token(/\/\/[^\n]*/),
+    // `-- ...` line comment (Lua conventions, SHAPES-V2.md).
+    line_comment: (_) => token(/--[^\n]*/),
 
-    // `/// ...` doc comment — three slashes, incl. the empty `///` line. Given
-    // higher precedence so `///` wins over `//`. (`////+` is highlighted as a
-    // doc comment here; the rowan lexer demotes it to a plain comment — a
-    // cosmetic-only divergence, documented in the README.)
-    doc_comment: (_) => token(prec(1, /\/\/\/[^\n]*/)),
+    // `--- ...` doc comment — three dashes, incl. the empty `---` line.
+    // Given higher precedence so `---` wins over `--`. (`----+` is
+    // highlighted as a doc comment here; the rowan lexer demotes it to a
+    // plain comment, as LuaCATS does — a cosmetic-only divergence,
+    // documented in the README.)
+    doc_comment: (_) => token(prec(1, /---[^\n]*/)),
 
-    // `/* ... */` — tree-sitter's regex engine can't nest; this matches a
-    // single (non-nested) block. The Rust lexer nests; highlighting-wise the
-    // difference is invisible.
+    // `--[[ ... ]]` — level-0 long-bracket block comment. The rowan lexer
+    // accepts any `=` level (`--[=[ ]=]`); tree-sitter's regex tokenizer
+    // can't match balanced levels without an external scanner, so only
+    // level 0 highlights as a block here (documented in the README). Given
+    // precedence 2 so `--[[` wins over both `--` and `---`.
     block_comment: (_) =>
-      token(seq("/*", /[^*]*\*+([^/*][^*]*\*+)*/, "/")),
+      token(prec(2, seq("--[[", /[^\]]*\]+([^\]][^\]]*\]+)*/, "]"))),
   },
 });

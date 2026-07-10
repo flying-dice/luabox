@@ -1,45 +1,45 @@
-/// 2D geometry primitives and the shapes they satisfy.
-///
-/// This is a `.luab` shape module: TypeScript-adjacent type declarations in
-/// a separate file, analyser-only, never on the require path and never in
-/// build output. There are no imports and no binding tags — every module
-/// under `[types] shape-paths` is ambient, addressed by its fully-qualified
-/// name (`geometry.Point`), and plain Lua consumes these types through the
-/// standard annotation positions (`---@type` / `---@param` / `---@return`).
-/// A point in 2D space. `label` is optional (the `?` suffix).
+--- 2D geometry primitives and the shapes they satisfy.
+---
+--- This is a `.luab` shape module: TypeScript-adjacent type declarations in
+--- a separate file, analyser-only, never on the require path and never in
+--- build output. There are no imports and no binding tags — every module
+--- under `[types] shape-paths` is ambient, addressed by its fully-qualified
+--- name (`geometry.Point`), and plain Lua consumes these types through the
+--- standard annotation positions (`---@type` / `---@param` / `---@return`).
+--- A point in 2D space. `label` is optional (the `?` suffix).
 export type Point = {
     x: number,
     y: number,
     label?: string,
 }
 
-/// A circle defined by its radius.
+--- A circle defined by its radius.
 export type Circle = {
     radius: number,
 }
 
-/// An axis-aligned rectangle.
+--- An axis-aligned rectangle.
 export type Rect = {
     width: number,
     height: number,
 }
 
-/// A homogeneous pair — a tiny generic container, monomorphised per use site.
+--- A homogeneous pair — a tiny generic container, monomorphised per use site.
 export type Pair<T> = {
     first: T,
     second: T,
 }
 
-/// Anything with an area and a perimeter. Conformance is structural and
-/// positional: a value is a Shape wherever a Shape is demanded — there is
-/// no `impl` declaration to write (SHAPES-V2.md).
+--- Anything with an area and a perimeter. Conformance is structural and
+--- positional: a value is a Shape wherever a Shape is demanded — there is
+--- no `impl` declaration to write (SHAPES-V2.md).
 export type Shape = {
     area(self): number,
     perimeter(self): number,
 }
 
-/// A Shape that can also render itself as text. The intersection makes the
-/// obligation explicit: a Drawable carries every Shape member plus `draw`.
+--- A Shape that can also render itself as text. The intersection makes the
+--- obligation explicit: a Drawable carries every Shape member plus `draw`.
 export type Drawable = Shape & {
     draw(self): string,
 }

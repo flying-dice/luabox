@@ -8,9 +8,10 @@ syntax_kinds! {
     ShapeSyntaxKind {
         // === Trivia ===
         WHITESPACE,
-        /// `//` line comment or `/* ... */` block comment (nesting allowed).
+        /// `--` line comment or `--[[ ... ]]` long-bracket block comment
+        /// (Lua conventions, any `=` level).
         COMMENT,
-        /// `///` doc comment — trivia in the tree, but harvested for hover
+        /// `---` doc comment — trivia in the tree, but harvested for hover
         /// and `luabox doc`.
         DOC_COMMENT,
 

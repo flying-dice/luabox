@@ -22,7 +22,8 @@ grammar mirrors it.
   — generic application, optional `T?`, intersection `A & B`, union `A | B`,
   function types `(x: A) => R`, parenthesised groups and multi-return lists
   `(A, B)`.
-- Comments: `//` line, `///` doc (own node), `/* */` block.
+- Comments (Lua conventions): `--` line, `---` doc (own node), `--[[ ]]`
+  block.
 
 The bundled fixtures
 [`test/fixtures/spec_example.luab`](test/fixtures/spec_example.luab) and
@@ -56,8 +57,10 @@ standard tree-sitter): `@keyword`, `@type`, `@type.builtin`, `@property`,
 
 ## Known deviations from the rowan parser
 
-- **Nested block comments**: the rowan lexer nests `/* /* */ */`; tree-sitter's
-  regex tokenizer matches a single (non-nested) block. Highlighting is
-  unaffected in practice.
-- **`////`+**: four-plus slashes are highlighted here as a doc comment; the
-  rowan lexer demotes them to a plain comment (cosmetic only).
+- **Long-bracket levels**: the rowan lexer accepts any `=` level
+  (`--[=[ ]=]`); tree-sitter's regex tokenizer can't match balanced levels
+  without an external scanner, so only level-0 `--[[ ]]` highlights as a
+  block here.
+- **`----`+**: four-plus dashes are highlighted here as a doc comment; the
+  rowan lexer demotes them to a plain comment, as LuaCATS does (cosmetic
+  only).

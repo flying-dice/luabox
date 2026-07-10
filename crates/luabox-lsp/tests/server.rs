@@ -978,7 +978,7 @@ fn semantic_token_columns_and_lengths_are_utf16() {
 #[test]
 fn lb_semantic_tokens_classify_shape_declarations() {
     let source = "\
-/// A closed shape.
+--- A closed shape.
 export type Shape = {
     area(self): number,
 }
