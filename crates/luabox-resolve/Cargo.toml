@@ -11,6 +11,8 @@ rust-version.workspace = true
 serde.workspace = true
 toml_edit.workspace = true
 anyhow.workspace = true
+pubgrub.workspace = true
+semver.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

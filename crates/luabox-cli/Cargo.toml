@@ -22,6 +22,7 @@ luabox-lint.workspace = true
 luabox-lsp.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+notify.workspace = true
 rayon.workspace = true
 rowan.workspace = true
 
