@@ -9,11 +9,17 @@ out = "dist"
 
 [types]
 strict = true
-shape-paths = ["shapes"]
+# Ambient LuaCATS definitions, resolved from defs/ under THIS package's own
+# root only (see defs/geometry.d.lua for why geometry's classes are
+# hand-vendored here rather than referenced from the dependency).
+defs = ["geometry", "render"]
 
 [dependencies]
 # A path dependency on the sibling library. Run `luabox install` once to
-# resolve it into luabox.lock (committed — this is an application).
+# resolve it into luabox.lock (committed — this is an application). Note:
+# this dependency is still needed at runtime (`require`) and for
+# `luabox install`/lockfile purposes — it does NOT make geometry's LuaCATS
+# types ambient here (see defs/geometry.d.lua).
 geometry = { path = "../geometry" }
 
 [tasks]

@@ -34,8 +34,17 @@ describe("shape data", function()
         assert.equal("top-right", data.corner.label)
     end)
 
-    it("a generic Pair holds both members", function()
+    it("a Pair holds both members", function()
         assert.equal(640, data.dimensions.first)
         assert.equal(480, data.dimensions.second)
+    end)
+
+    it("a point may carry its coordinate unit", function()
+        assert.equal("px", data.corner.unit)
+    end)
+
+    it("ShapeKind enum members round-trip through describe_kind", function()
+        assert.equal("a circle", data.describe_kind(data.ShapeKind.Circle))
+        assert.equal("a rect", data.describe_kind(data.ShapeKind.Rect))
     end)
 end)

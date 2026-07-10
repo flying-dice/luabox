@@ -1,0 +1,93 @@
+---@meta
+-- 2D geometry primitives and the shapes they satisfy — LuaCATS ambient
+-- definitions.
+--
+-- This is a `.d.lua` definition package: a `---@meta` module wired in via
+-- `[types] defs = ["geometry"]` in luabox.toml (the file stem `geometry`
+-- names the package, same mechanism as `love-asteroids-lite`'s
+-- `defs/love2d.d.lua`). Every type declared here is ambient to this
+-- package's own files — no imports, addressed by plain name.
+--
+-- This project previously used `.luab` shape modules (TypeScript-adjacent
+-- `type` declarations with structural, sealed conformance checking). The
+-- `.luab` subsystem is unaffected and still lives at `shapes/*.luab`
+-- elsewhere in the codebase — this example just demonstrates the idiomatic
+-- LuaCATS/`.d.lua` path instead, so the two front-ends can be compared
+-- honestly. See ../README.md for what that comparison found.
+
+--- A point in 2D space. `label` is an optional caption; `unit` is an
+--- optional coordinate unit (see the `geometry.Unit` alias below).
+---@class geometry.Point
+---@field x number
+---@field y number
+---@field label? string
+---@field unit? geometry.Unit
+
+--- Anything with an area and a perimeter, described as a method-shaped
+--- `---@class` (an "interface" by convention — nothing stops a table from
+--- being declared to extend it without implementing any of these).
+---
+--- NOTE (gap): this is NOT a sealed/verified contract the way a `.luab`
+--- shape's `export type Shape` is. luabox does not check that a carrier
+--- claiming `: geometry.Shape` actually implements `area`/`perimeter`/
+--- `my_static` — see the carriers in ../src/circle.lua and ../src/rect.lua
+--- for a concrete, verified demonstration. Conformance checking for
+--- LuaCATS classes lands with the `.luab` drop epic (#84 etc.).
+---@class geometry.Shape
+---@field area fun(self): number
+---@field perimeter fun(self): number
+---@field my_static fun(): number
+
+--- A Shape that can also render itself as text. Declared as an extension
+--- (`: geometry.Shape`) rather than a `.luab`-style intersection — same
+--- idea, LuaCATS spelling.
+---@class geometry.Drawable : geometry.Shape
+---@field draw fun(self): string
+
+--- The circle carrier's declared shape. The concrete carrier in
+--- ../src/circle.lua reopens this same class name on `local Circle = {}`;
+--- luabox merges the two declarations, so `self.radius` there resolves to
+--- `number` from the `---@field` below even though circle.lua repeats only
+--- the class name and its `: geometry.Shape` extension.
+---@class geometry.Circle : geometry.Shape
+---@field radius number
+
+--- The rect carrier's declared shape (see geometry.Circle above).
+---@class geometry.Rect : geometry.Shape
+---@field width number
+---@field height number
+
+-- A homogeneous pair — the `.luab` original had a real generic `Pair<T>`.
+-- Under LuaCATS, generic `---@class<T>` is BROKEN today. In an ordinary
+-- checked `.lua` file, the moment a `---@field` references the type
+-- parameter, luabox reports it as an unresolved type name:
+--
+--   ---@class Box<T>
+--   ---@field value T
+--                   ^ error[LB0305]: unknown type name `T` in annotation
+--
+-- (verified against the real binary — see the mission report). Left
+-- commented here so the project stays green; uncomment to reproduce in a
+-- regular src/*.lua file. Note the sharper, quieter finding: writing the
+-- SAME declaration in a `---@meta` defs file *as this one* does NOT raise
+-- that diagnostic at all — ambient/defs content isn't self-validated for
+-- unknown type names the way an ordinary checked file is. But the gap does
+-- not go away: a field typed by the unresolved parameter still silently
+-- becomes `unknown` wherever it's read downstream (e.g. annotate a literal
+-- `---@type geometry.Pair<number>` and read `.first` back — it types as
+-- `unknown`, not `number`). So a generic declared here would fail *more*
+-- quietly than one declared in your own code: no error, just a silently
+-- broken field type. Generics land with the .luab drop epic (#84 etc.);
+-- until then, write one non-generic class per concrete pairing:
+--
+-- ---@class Box<T>
+-- ---@field value T
+
+---@class geometry.Pair
+---@field first number
+---@field second number
+
+--- The unit a coordinate or label is expressed in — a closed string-literal
+--- union. `---@alias` IS enforced: passing anything outside the union at an
+--- annotated position is a real `luabox check` error (see ../src/shapes_data.lua).
+---@alias geometry.Unit "px"|"pt"

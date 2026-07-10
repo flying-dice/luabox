@@ -9,10 +9,10 @@ out = "dist"
 
 [types]
 strict = true
-shape-paths = ["shapes"]
-# The type entrypoint (TS-style): the `export type` declarations in this file
-# form the package's published surface. A dependent addresses them under the
-# package name — `geometry.Shape`, `geometry.Point` (see ../renderer).
-entry = "shapes/geometry.luab"
+# Ambient LuaCATS definitions: resolves defs/geometry.d.lua by its file stem
+# (the same mechanism love-asteroids-lite uses for defs/love2d.d.lua). No
+# `.luab` shape modules here — see ../README.md for why, and what that swap
+# costs today.
+defs = ["geometry"]
 
 [dependencies]

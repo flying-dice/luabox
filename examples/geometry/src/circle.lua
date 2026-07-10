@@ -1,16 +1,22 @@
--- Circle is a class carrier: a table with an __index metatable whose methods
--- make it a `geometry.Shape` *structurally* — there is no binding tag and no
--- conformance declaration. The constructor's `---@return geometry.Circle` is
--- where the instance literal is checked against the type (try removing
--- `radius` from the literal to see the error); it also ties the carrier to
--- the instance type, so `self` in the methods below types as `geometry.Circle`
--- and `self.radius` resolves as its declared `number`.
+-- Circle is a class carrier: a table with an __index metatable, typed with
+-- plain LuaCATS. `---@class geometry.Circle : geometry.Shape` reopens the
+-- class declared in ../defs/geometry.d.lua (`radius: number`, extends
+-- Shape) — luabox merges the two declarations by name, so `self.radius`
+-- below resolves to `number` even though this file repeats only the class
+-- name and its extension, not the field. `self` inside `:` methods is
+-- inferred as `geometry.Circle` through the `__index` metatable chain, no
+-- extra annotation needed (SPEC.md).
 --
--- The `---@type geometry.Shape` on the declaration verifies the whole
--- accumulated carrier (area, perimeter, my_static) against Shape — deferred to
--- everything Circle becomes, not the empty `{}`. Delete any member and
--- `luabox check` names it here.
----@type geometry.Shape
+-- NOTE (gap): the `: geometry.Shape` here is NOT verified. luabox does not
+-- check that Circle actually implements area/perimeter/my_static — comment
+-- out `Circle:perimeter` below and run `luabox check`: it still reports
+-- 0 errors. A rigorous checker would report something like:
+--   error: `geometry.Circle` does not satisfy `geometry.Shape`: missing `perimeter`
+-- Today it passes silently. This is the trade luabox's `.luab` shape modules
+-- exist to avoid (structural conformance IS checked there — see ../renderer
+-- for the .luab-era version of this same example, and the mission report
+-- for the exact commands used to confirm this gap against the real binary).
+---@class geometry.Circle : geometry.Shape
 local Circle = {}
 Circle.__index = Circle
 
@@ -23,6 +29,12 @@ end
 function Circle:perimeter()
     return 2 * math.pi * self.radius
 end
+
+-- Also NOTE (gap): field access is permissive on a declared class. Uncomment
+-- the line below — `self.nope` is not declared on geometry.Circle or
+-- geometry.Shape anywhere — and `luabox check` still reports 0 errors:
+--
+--   print(self.nope)
 
 -- The static member of geometry.Shape: no `self`, written with `.` and
 -- called as `Circle.my_static()`. All these shapes live in 2D.

@@ -41,6 +41,16 @@ cd packages/core     && luabox test
 cd packages/cli-tool && luabox run start   # prints "2 + 3 = 5"
 ```
 
+## A generic-attempt, for completeness
+
+`core.first_or` carries a `---@generic T` annotation — included so the
+example set has at least one real `---@generic` **function** (distinct from
+`../geometry`'s generic **class** attempt). It's a live demonstration of the
+same underlying gap: `T` doesn't actually flow through to the return type
+(it lowers to `unknown`), so nothing here relies on it for real type safety.
+See `../geometry/README.md` for the exact `luabox check` error text this
+produces once you try to pin the result to a concrete type.
+
 ## Why a workspace
 
 - **One lockfile, one resolution.** Members share dependency versions.

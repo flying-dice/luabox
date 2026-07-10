@@ -1,11 +1,7 @@
--- Rect: the second Shape carrier. Same idiom as circle.lua — plain Lua,
--- standard annotations, structural conformance checked wherever a
--- `geometry.Shape` is demanded.
---
--- The `---@type geometry.Shape` verifies the whole accumulated carrier (area,
--- perimeter, my_static) against Shape — deferred to everything Rect becomes,
--- not the empty `{}`.
----@type geometry.Shape
+-- Rect: the second Shape carrier. Same idiom as circle.lua — plain LuaCATS,
+-- the class reopened from ../defs/geometry.d.lua so `self.width`/
+-- `self.height` resolve to `number` without repeating the fields here.
+---@class geometry.Rect : geometry.Shape
 local Rect = {}
 Rect.__index = Rect
 

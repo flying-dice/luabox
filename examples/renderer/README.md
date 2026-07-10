@@ -1,17 +1,18 @@
 # renderer
 
-Consumes the `../geometry` library across a **package boundary** and
-conforms to geometry's `Drawable` type with its own carrier. An application
+Depends on `../geometry` across a **package boundary** and (attempts to)
+conform to its `Drawable` type with its own carrier. An application
 (`edition = "5.1"`, so it runs end-to-end on a stock Lua 5.1) that draws
 ASCII shapes to stdout.
 
 ```
 renderer/
-├── luabox.toml           # [dependencies] geometry = { path = "../geometry" }
-├── luabox.lock           # committed — this is an app, not a library
-├── shapes/render.luab    # our own `type Square`
-├── src/square.lua        # carrier with top `---@type geometry.Drawable`
-└── src/main.lua          # draws a square with `luabox run start`
+├── luabox.toml            # [dependencies] geometry = { path = "../geometry" }
+├── luabox.lock             # committed — this is an app, not a library
+├── defs/geometry.d.lua     # VENDORED STOPGAP — see below
+├── defs/render.d.lua       # our own render.Square : geometry.Drawable
+├── src/square.lua          # carrier with top ---@class render.Square : geometry.Drawable
+└── src/main.lua            # draws a square with `luabox run start`
 ```
 
 ## Install first
@@ -22,35 +23,68 @@ The dependency must be resolved before checking or running:
 luabox install      # writes luabox.lock; the path dep is used in place
 ```
 
-`luabox.lock` is committed here because renderer is an application. (Libraries
-like `../geometry` don't commit a lockfile.)
+`luabox.lock` is committed here because renderer is an application.
 
-## Crossing the package boundary
+## Cross-package LuaCATS typing — the key finding
 
-geometry's manifest names a type entrypoint (`[types] entry =
-"shapes/geometry.luab"`). Its `export type` declarations mount here under the
-package name — `geometry.Shape`, `geometry.Drawable` — with **no import**:
-the scope is ambient (SHAPES-V2.md). We declare our own `type Square` in
-`shapes/render.luab` and put the conformance on the carrier declaration in
-`src/square.lua`:
+This example used to be typed with `.luab` shape modules, where a
+dependency's exported types are automatically ambient in a consuming
+package (`[types] entry`/`shape-paths`, resolved via
+`resolve_dep_shape_exports` — SHAPES-V2.md). **Plain LuaCATS has no
+equivalent mechanism today.** This was verified directly against the real
+binary while converting this example, not assumed:
+
+- A `---@class` declared in a dependency's own `.lua` source is invisible in
+  a consumer, under any name (qualified or not) — even after `luabox
+  install` resolves the path dependency into `luabox.lock`.
+  `---@type <name>` at the consumer reports `error[LB0305]: unknown type
+  name` regardless.
+- Calling a cross-package function *does* run at runtime (`require` still
+  works — this is a type-checking gap, not a module-resolution one), but
+  the checker does not carry its declared parameter/return types across the
+  boundary: a call that would be flagged as a type mismatch **inside** the
+  dependency's own package checks clean when made from a consumer, because
+  the checker never resolved the callee's signature at all.
+- `[types] defs` — the mechanism this project now uses for its own local
+  types — is explicitly local: it resolves entries *only* from
+  `<this project's root>/defs/`, never into a dependency's tree (confirmed
+  by reading `resolve_project_defs` in `luabox-cli`, and by testing: pointing
+  a consumer's `defs` list at a name that only exists in a dependency's
+  `defs/` produces `error[LB1002]: cannot resolve definition package`).
+
+**The stopgap used here:** `defs/geometry.d.lua` is a hand-duplicated,
+explicitly-labeled copy of the two classes renderer needs
+(`geometry.Shape`, `geometry.Drawable`) from `../geometry/defs/geometry.d.lua`.
+It is **not** kept in sync automatically — a real project doing this would
+need a manual process (or code generation) to detect drift. Read the
+comment at the top of that file for a sharper related finding: an
+`---@class X : Y` extends-clause where `Y` doesn't resolve to anything is
+**silently accepted with no diagnostic at all** — stricter positions
+(`---@type`, `---@param`, `---@field`) do raise `LB0305` for an unresolved
+name, but the extends-clause does not. Practically, that means this
+vendored file isn't even strictly required for `luabox check` to pass here
+— but omitting it would leave `geometry.Drawable` referring to nothing,
+which is worse than a stopgap; it would just be decorative.
+
+## What this means for the carrier
+
+`src/square.lua` declares:
 
 ```lua
----@type geometry.Drawable
+---@class render.Square : geometry.Drawable
 local Square = {}
 ```
 
-Because `Drawable = Shape & { draw(self): string }` is an intersection, that
-single annotation verifies the whole accumulated carrier — **area + perimeter
-+ draw** (plus `my_static`), across every method added anywhere in the file.
-Drop any one and `luabox check` reports the gap at the annotation, naming the
-member.
-The type declares `side: integer`, so `string.rep("#", self.side)` in `draw`
-typechecks against the stdlib's `integer` count parameter, and the
-constructor's declared `---@return render.Square` is satisfied by its
-`setmetatable({ side = side }, Square)` result.
+Because `geometry.Drawable`'s definition (vendored, not shared) extends
+`geometry.Shape`, this single annotation is checked... except it isn't,
+really — see `../geometry/README.md`'s "silently permissive" section.
+Conformance to `Drawable` (area + perimeter + my_static + draw) is not
+verified here any more than it is inside `../geometry` itself. This example
+implements all four members anyway, because that's what a real Drawable
+should do — but `luabox check` would not have told us if we hadn't.
 
 ```sh
-luabox check        # 0 errors — cross-package types resolve and seal
+luabox check        # 0 errors — but see the caveats above
 luabox fmt --check
 luabox lint
 luabox test
@@ -70,7 +104,10 @@ area = 16, perimeter = 16
 
 ## Contrast with geometry
 
-- `../geometry` **declares and exports** the types (via `[types] entry`).
-- `renderer` **consumes** them by fully-qualified name and adds a new
-  conformer (`Square`) — structural conformance working across a
-  dependency edge.
+- `../geometry` declares its types in its own ambient `[types] defs`
+  package — nothing is "exported" to dependents in the `.luab` sense.
+- `renderer` cannot address `../geometry`'s types directly; it vendors a
+  hand-synced copy instead. This is the honest cost of dropping `.luab`'s
+  cross-package shape export for plain LuaCATS today. If/when the `.luab`
+  drop epic lands equivalent cross-package sharing for LuaCATS, this
+  vendored file should be deleted in favor of it.

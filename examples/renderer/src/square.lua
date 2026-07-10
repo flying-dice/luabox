@@ -1,11 +1,17 @@
--- Square: our Drawable carrier. The Drawable type comes from the geometry
--- dependency's exported surface (`geometry.Drawable`) — no import needed,
--- the scope is ambient (SHAPES-V2.md).
+-- Square: our Drawable carrier. `geometry.Drawable` comes from the vendored
+-- copy in defs/geometry.d.lua (a stopgap for a real gap — see that file and
+-- the project README: cross-package LuaCATS type sharing doesn't work
+-- today, unlike `.luab` shape modules).
 --
--- Drawable = geometry.Shape & { draw }, so the `---@type geometry.Drawable`
--- on the declaration verifies the whole accumulated carrier — area, perimeter,
--- my_static, and draw — against everything Square becomes, not the empty `{}`.
----@type geometry.Drawable
+-- `---@class render.Square : geometry.Drawable` reopens the class declared
+-- in defs/render.d.lua (`side: integer`, extends Drawable) — same
+-- merge-by-name idiom as ../geometry/src/circle.lua.
+--
+-- NOTE (gap): as with geometry's carriers, this `: geometry.Drawable` is
+-- NOT verified — luabox does not check that Square actually implements
+-- area/perimeter/my_static/draw. See ../geometry/README.md for a live,
+-- verified demonstration of that gap (delete a method, 0 errors).
+---@class render.Square : geometry.Drawable
 local Square = {}
 Square.__index = Square
 

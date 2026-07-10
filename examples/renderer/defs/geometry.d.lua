@@ -1,0 +1,56 @@
+---@meta
+-- STOPGAP — HAND-VENDORED, NOT AUTO-SYNCED.
+--
+-- Cross-package LuaCATS type sharing does NOT work today (verified against
+-- the real binary while building this example — see ../README.md for the
+-- full account). A `---@class` declared in a dependency's source, or in a
+-- dependency's own `[types] defs` def-package, is not ambient to a
+-- consuming package: `[types] defs` entries resolve ONLY from
+-- `<this project's root>/defs/`, never into a dependency's tree, even for a
+-- `path` dependency that `luabox install` has already resolved into
+-- luabox.lock. Referencing an unresolved cross-package name at a
+-- `---@type`/`---@param`/`---@field` position (a real type-checking
+-- position) produces:
+--
+--   error[LB0305]: unknown type name `geometry.Drawable` in annotation
+--
+-- (confirmed earlier in this same investigation with a plain, non-Drawable
+-- cross-package class — see the mission report).
+--
+-- A sharper and quieter finding, specific to this file: an EXTENDS-clause
+-- reference (the `: geometry.Drawable` in defs/render.d.lua's
+-- `---@class render.Square : geometry.Drawable`) does NOT trigger LB0305
+-- even when the name is completely unresolved — confirmed by temporarily
+-- deleting this file and its `defs` manifest entry entirely: `luabox check`
+-- still reported 0 errors. Extends-clause targets are apparently never
+-- validated at all, which is a stricter form of the "conformance isn't
+-- checked" gap documented in ../geometry/README.md: it's not just that
+-- `geometry.Shape`'s members go unverified, it's that the named supertype
+-- doesn't even have to exist.
+--
+-- So this file is not strictly load-bearing for `luabox check` to pass —
+-- but leaving it out would make `geometry.Drawable` a name that resolves to
+-- nothing anywhere in this project, which is worse than a stopgap: it would
+-- be purely decorative. This file is a hand-duplicated copy of the subset
+-- of ../../geometry/defs/geometry.d.lua that renderer actually needs
+-- (`geometry.Shape`, `geometry.Drawable`), kept so the annotation means
+-- something. It is NOT kept in sync automatically: if geometry's real
+-- definitions change, this copy has to be updated by hand, and nothing
+-- will warn you if it drifts. That is the honest, current state of
+-- cross-package LuaCATS typing in luabox.
+--
+-- Contrast with `.luab` shape modules, which solve exactly this problem
+-- already: a dependency's `[types] shape-paths`/`entry` IS mounted ambiently
+-- in a consuming package (SHAPES-V2.md, resolved via
+-- `resolve_dep_shape_exports` in luabox-cli). This project used to be typed
+-- that way before this conversion — see git history on this file's former
+-- path (`shapes/render.luab`) and ../geometry's for the .luab-era version of
+-- this same pairing, which needed no vendored copy at all.
+
+---@class geometry.Shape
+---@field area fun(self): number
+---@field perimeter fun(self): number
+---@field my_static fun(): number
+
+---@class geometry.Drawable : geometry.Shape
+---@field draw fun(self): string

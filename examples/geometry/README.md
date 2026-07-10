@@ -1,93 +1,138 @@
 # geometry
 
-The `.luab` shape-module flagship. A library (`edition = "5.4"`) whose types
-live in a **shape module** — TypeScript-adjacent `type` declarations in a
-separate `.luab` file — while the implementations live in ordinary Lua,
-consumed through the **standard annotation positions** (`---@type` /
-`---@param` / `---@return`). No imports, no binding tags (SHAPES-V2.md).
+The LuaCATS/`.d.lua` flagship. A library (`edition = "5.4"`) whose types live
+in an ambient **definition package** — a `---@meta` file resolved by
+`[types] defs` — while the implementations are ordinary Lua, annotated with
+stock LuaLS tags (`---@class` / `---@field` / `---@param` / `---@return` /
+`---@alias` / `---@enum`). No imports, no shape DSL.
+
+> This example previously used `.luab` shape modules (TypeScript-adjacent
+> `type` declarations with sealed, structural conformance checking). The
+> `.luab` subsystem hasn't gone anywhere — it still lives elsewhere in the
+> codebase, ahead of a planned wider drop. This conversion exists to show,
+> honestly, what the plain-LuaCATS path looks like **today**: what works,
+> what's silently permissive, and what's outright broken. Read to the end —
+> some of this will surprise you.
 
 ```
 geometry/
-├── luabox.toml               # [types] entry — the published type surface
-├── shapes/geometry.luab      # type declarations, an intersection, a generic
-├── src/circle.lua            # Shape carrier (top ---@type conformance)
-├── src/rect.lua              # Shape carrier (top ---@type conformance)
-├── src/shapes_data.lua       # ---@type bindings + sealed-checking demo
+├── luabox.toml               # [types] defs = ["geometry"]
+├── defs/geometry.d.lua        # ---@meta ambient class/alias declarations
+├── src/circle.lua             # Shape carrier (class re-opened from defs)
+├── src/rect.lua                # Shape carrier (class re-opened from defs)
+├── src/shapes_data.lua         # ---@type literals, sealing, alias, enum demo
 └── tests/geometry_test.lua
 ```
 
-## The shape workflow
+## The LuaCATS workflow
 
-1. **Declare types in `.luab`.** `shapes/geometry.luab` declares object types
-   (`Point`, `Circle`, `Rect`), a generic `Pair<T>`, a method-set type
-   `Shape`, and an intersection `Drawable = Shape & { draw(self): string }`.
-   It has no bodies — the parser rejects them ("implementations live in
-   .lua"). It is analyser-only: never required at runtime, never emitted by
-   `build`/`bundle`.
+1. **Declare types in a `.d.lua` def package.** `defs/geometry.d.lua` is a
+   `---@meta` module declaring `geometry.Point`, the interface-shaped
+   `geometry.Shape`, `geometry.Drawable : geometry.Shape`, the carrier
+   classes `geometry.Circle`/`geometry.Rect`, and the `geometry.Unit` alias.
+   It's wired in with `[types] defs = ["geometry"]` — the file stem
+   `geometry` resolves to `defs/geometry.d.lua` (same mechanism
+   `love-asteroids-lite` uses for `defs/love2d.d.lua`).
 
-2. **Point the manifest at it.** `[types] shape-paths = ["shapes"]` makes
-   every module under `shapes/` **ambient**: its types are addressable from
-   any file by fully-qualified name, derived from the module's path —
-   `shapes/geometry.luab` declares `geometry.Point`, `geometry.Shape`, …
+2. **Re-open the class where it's implemented.** `src/circle.lua` declares
+   `---@class geometry.Circle : geometry.Shape` again on `local Circle = {}`.
+   luabox merges declarations of the same class name, so `self.radius`
+   resolves to `number` from the field declared in the `.d.lua` file even
+   though circle.lua doesn't repeat it. `self` inside `:` methods is
+   inferred through the `__index` metatable chain — no extra annotation.
 
-3. **Consume through standard annotations.** There is nothing new to learn:
-   - `---@type geometry.Point` on a table literal **sealed-checks** it:
-     every non-optional field present, no undeclared keys.
-   - `---@return geometry.Circle` on a constructor checks the
-     `setmetatable(literal, Circle)` result at the return position.
-   - `---@type geometry.Shape` on a carrier declaration (`local Circle = {}`)
-     verifies the **whole accumulated carrier** — every method and static
-     added anywhere in the file — against Shape. Conformance is structural and
-     positional, so the general mechanism covers the special case. No `impl`,
-     no `---@impl`, no throwaway trailing assertion.
+3. **Consume through standard annotations.** `---@type geometry.Point` on a
+   table literal, `---@param`/`---@return` on functions — nothing new.
 
-4. **Check it.** `luabox check` runs both front-ends — LuaCATS annotations and
-   `.luab` types — through one type IR.
+4. **Check it.**
 
 ```sh
-luabox check        # 0 errors across .lua + .luab
-luabox fmt --check  # .luab files are formatted too (4-space, trailing commas)
-luabox lint
-luabox test         # exercises the Circle/Rect/Point API on your Lua runtime
+luabox check        # 0 errors across 4 files
+luabox fmt --check   # 5 files formatted
+luabox lint          # 0 errors, 0 warnings
+luabox test          # 9 passing tests
 ```
 
-## Sealed checking (what *would* error)
+## What actually works (verified against the real binary)
 
-Object types are sealed. `src/shapes_data.lua` keeps these as commented
-illustrations so the project stays green. Bind `local p = { x = 0 }` to
-`geometry.Point` and `luabox check` reports:
+- **`---@class` + `---@field`, `---@param`/`---@return`.** Full support,
+  same as any LuaLS-aware editor.
+- **Literal sealing.** `---@type geometry.Point` on a table literal enforces
+  every non-optional field present and rejects unknown keys — `LB0300`
+  ("missing `y`") / `LB0303` ("unknown field `z`"). This is **not** a
+  `.luab`-only feature: a plain LuaCATS `---@class` under `[types] strict =
+  true` gets the identical treatment. (LuaLS treats this as a soft
+  `missing-fields` warning in most editors; here it's a real `check` error.)
+  See the commented block in `src/shapes_data.lua`.
+- **`---@alias` and `---@enum`.** Both are fully enforced. `geometry.Unit =
+  "px"|"pt"` rejects any other string at an annotated position
+  (`error[LB0300]: type mismatch: expected \`"px"|"pt"\`, found \`"cm"\``);
+  `geometry.ShapeKind` (an `---@enum` over a real runtime table) rejects any
+  value that isn't one of its members the same way.
+- **`T[]` / `table<K,V>`.** Both check element/value types precisely
+  (verified in the mission's scratch experiments, not shown in this
+  project's own files, but exercised — see the mission report).
+- **`---@meta` ambient globals**, including framework/DLL-style ones — see
+  `../love-asteroids-lite/defs/love2d.d.lua` for that pattern; this
+  project's own `defs/geometry.d.lua` is the same mechanism applied to a
+  library's own types rather than a third-party API.
 
-```
-error[LB0302]: missing required field `y` in table literal
-```
+## What is silently permissive (verified, not avoided)
 
-Add an undeclared key and you get the dual diagnostic:
+- **Inheritance/conformance is NOT checked.** `---@class geometry.Circle :
+  geometry.Shape` is never verified against `geometry.Shape`'s members.
+  `src/circle.lua` and `src/rect.lua` carry a NOTE (gap) at the top of each
+  showing this precisely: comment out `Circle:perimeter` entirely and
+  `luabox check` still reports **0 errors** — confirmed against this exact
+  file (temporarily, then reverted) while building this example. A rigorous
+  checker would report something like:
+  ```
+  error: `geometry.Circle` does not satisfy `geometry.Shape`: missing `perimeter`
+  ```
+  Today, nothing does. This is precisely what `.luab` shape modules exist to
+  guarantee (their structural conformance IS checked, member-by-member) —
+  see `../renderer`'s history for the `.luab`-era version of this contrast.
+- **Field access is permissive.** `self.nope` inside a `geometry.Circle`
+  method — a field declared nowhere on `geometry.Circle` or
+  `geometry.Shape` — is not flagged either. Also confirmed live against this
+  example (temporarily, then reverted); see the commented-out line in
+  `src/circle.lua`.
 
-```
-error[LB0303]: unknown field `z`
-```
+## What is outright broken
 
-Delete `Circle:perimeter` and the whole-carrier `---@type geometry.Shape`
-conformance in `src/circle.lua` fires at the annotation, naming the member:
+- **Generic `---@class<T>`.** The moment a `---@field` (or any annotation)
+  actually references the class's type parameter, luabox reports it as an
+  unresolved name:
+  ```
+  error[LB0305]: unknown type name `T` in annotation
+  ```
+  `defs/geometry.d.lua` keeps a real, commented-out `geometry.Pair<T>`
+  reaching exactly this error (uncomment it in an ordinary `src/*.lua` file
+  to reproduce — see the comment for the sharper nuance: the identical
+  declaration placed in a `.d.lua` def file does *not* raise this
+  diagnostic at all, because ambient/defs content isn't self-validated the
+  way an ordinary checked file is; but the parameterized field still
+  silently resolves to `unknown` wherever it's read downstream, so the type
+  safety is gone either way — just without a diagnostic pointing at the
+  cause). `src/shapes_data.lua` uses a concrete, non-generic `geometry.Pair`
+  instead — the actual, working-today alternative.
+- **`---@generic` function type parameters lower to `unknown`.** A
+  `---@generic T` / `---@param value T` / `---@return T` identity function's
+  return value doesn't retain the argument's real type — it becomes the
+  literal type `unknown`, which then fails against *any* concrete
+  annotation:
+  ```
+  error[LB0300]: type mismatch: expected `number`, found `unknown`
+  ```
+  (Confirmed in the mission's scratch experiments; not exercised inside this
+  project's own files because there's no natural call site for it here —
+  see `../renderer` and the mission report for where a generic function
+  would otherwise have been reached for.)
 
-```
-error[LB0300]: type mismatch: expected `geometry.Shape`, found
-`{ area: fun(): number, ... }`: missing `perimeter`
-```
+Conformance checking and real generics are both slated to land with the
+`.luab` drop epic (#84 etc.) — until then, this is the accurate picture.
 
-## Exporting types to dependents
-
-`[types] entry = "shapes/geometry.luab"` names the **type entrypoint**
-(TS-style, like package.json `"types"`): its `export type` declarations form
-this package's published surface, mounted under the package name. A
-downstream package that depends on this one addresses them as
-`geometry.Shape`, `geometry.Point` — same names, no import. See
-`../renderer`, which declares its own type and asserts it is a
-`geometry.Drawable`.
-
-## Constructors under strict types
-
-`Circle.new(radius)` is plain Lua with standard annotations:
+## Constructors under LuaCATS
 
 ```lua
 ---@param radius number
@@ -97,7 +142,7 @@ function Circle.new(radius)
 end
 ```
 
-The `---@param` type flows into the body (so `radius` is a `number` inside
-the literal), and the `setmetatable(literal, Circle)` result is checked
-against the declared `---@return geometry.Circle` — the return position is
-where the instance literal meets the type.
+The `---@param` type flows into the body; the `setmetatable(literal,
+Circle)` result is checked against the declared `---@return geometry.Circle`
+— literal freshness (sealing) applies at that return position exactly as it
+does at a `---@type` binding.

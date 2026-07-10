@@ -1,0 +1,15 @@
+---@meta
+-- Renderer-local types.
+--
+-- No imports: `geometry.Drawable` comes from the vendored, hand-synced copy
+-- in defs/geometry.d.lua (see that file for why a copy exists instead of a
+-- reference to ../../geometry's own definitions — cross-package LuaCATS
+-- sharing doesn't work today).
+--
+-- A filled square rendered as ASCII art. The side is a cell count, so it is
+-- an `integer` — `string.rep("#", self.side)` typechecks against the
+-- stdlib's `integer` count parameter. The concrete carrier in
+-- src/square.lua reopens this class name, same merge-by-name idiom as
+-- ../geometry/src/circle.lua.
+---@class render.Square : geometry.Drawable
+---@field side integer

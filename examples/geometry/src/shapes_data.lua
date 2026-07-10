@@ -1,20 +1,30 @@
--- Plain data consuming `.luab` types through the standard annotation
--- positions. The scope is ambient: no imports, types addressed by their
--- fully-qualified names (SHAPES-V2.md).
+-- Plain data annotated with LuaCATS `---@type`. The classes come from
+-- ../defs/geometry.d.lua (ambient via `[types] defs = ["geometry"]`) — no
+-- imports, addressed by plain name.
 
 -- A Point is plain data — no methods. `---@type geometry.Point` checks the
--- literal against the sealed object type: every non-optional field must be
+-- literal against the declared class: every non-optional field must be
 -- present, and no unknown keys are allowed.
+--
+-- This "sealing" behaviour is NOT a `.luab`-only feature: a plain LuaCATS
+-- `---@class` under `[types] strict = true` gets the same literal checks
+-- (verified against the real binary — see the mission report). The
+-- `LuaLS`-style `missing-fields`/excess-field lints most editors treat as
+-- soft warnings are here real `luabox check` errors.
 ---@type geometry.Point
 local origin = { x = 0, y = 0 }
 
--- The optional `label` field (declared `label?: string`) may be provided or
--- omitted.
+-- The optional `label` and `unit` fields may be provided or omitted.
+-- `unit` is typed `geometry.Unit` — a closed `---@alias` union
+-- (`"px"|"pt"`) — and IS enforced: see the commented-out bad value below.
 ---@type geometry.Point
-local corner = { x = 1, y = 1, label = "top-right" }
+local corner = { x = 1, y = 1, label = "top-right", unit = "px" }
 
--- Pair<T> is generic, monomorphised at the use site.
----@type geometry.Pair<number>
+-- geometry.Pair is a concrete, monomorphised pair type (see the NOTE (gap)
+-- in ../defs/geometry.d.lua about why this isn't `geometry.Pair<number>`
+-- today — generic `---@class<T>` is broken the moment the parameter is
+-- actually used in a field).
+---@type geometry.Pair
 local dimensions = { first = 640, second = 480 }
 
 -- ---------------------------------------------------------------------------
@@ -24,13 +34,45 @@ local dimensions = { first = 640, second = 480 }
 --
 --   ---@type geometry.Point
 --   local missing = { x = 0 }
---       -- error[LB0300]: type mismatch: expected `geometry.Point` ...
---       --                missing `y` (checked against the final value)
+--       -- error[LB0300]: type mismatch: expected `geometry.Point`, found
+--       --                `{ x: 0 }`: missing `y`
 --
 --   ---@type geometry.Point
 --   local extra = { x = 0, y = 0, z = 0 }
---       -- error[LB0303]: unknown field `z` (geometry.Point does not
---       --                declare it)
+--       -- error[LB0303]: unknown field `z` in table literal
+--
+--   ---@type geometry.Point
+--   local bad_unit = { x = 0, y = 0, unit = "cm" }
+--       -- error[LB0300]: type mismatch: expected `"px"|"pt"`, found `"cm"`
+--       -- (the alias union IS enforced — this is a real error, not a gap)
 -- ---------------------------------------------------------------------------
 
-return { origin = origin, corner = corner, dimensions = dimensions }
+-- geometry.ShapeKind: a real runtime table tagged `---@enum`, demonstrating
+-- that construct too. Enum member values ARE type-checked at annotated
+-- positions (see tests/geometry_test.lua).
+---@enum geometry.ShapeKind
+local ShapeKind = { Circle = "circle", Rect = "rect" }
+
+---Describe a shape kind as a short phrase. Demonstrates `---@param`/
+---`---@return` alongside the enum.
+---
+-- Incidental finding: `"a " .. kind` (concatenating a string literal
+-- directly with an `---@enum`-typed value) infers as `unknown`, not
+-- `string`, and fails the `---@return string` check below even though
+-- every enum member is itself a string. `tostring(kind)` sidesteps it (its
+-- stdlib return type is a plain `string`, unaffected by the enum). Not one
+-- of the three named gaps in the mission report, but discovered building
+-- this example — worth knowing if you hit the same thing.
+---@param kind geometry.ShapeKind
+---@return string
+local function describe_kind(kind)
+    return "a " .. tostring(kind)
+end
+
+return {
+    origin = origin,
+    corner = corner,
+    dimensions = dimensions,
+    ShapeKind = ShapeKind,
+    describe_kind = describe_kind,
+}
