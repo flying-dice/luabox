@@ -3,11 +3,14 @@
 //! Thin frontend over the bounded-context crates: owns UX, argument parsing,
 //! and diagnostic rendering; none of the domain logic.
 
+mod build_cmd;
 mod check_cmd;
+mod deps_cmd;
 mod fmt_cmd;
 mod lint_cmd;
 mod lsp_cmd;
 mod scaffold;
+mod test_cmd;
 mod watch;
 
 use std::path::PathBuf;
@@ -168,10 +171,12 @@ fn main() -> anyhow::Result<()> {
         Command::New {
             name, lib, edition, ..
         } => scaffold::new(&std::env::current_dir()?, &name, lib, &edition),
-        Command::Add { .. } => unimplemented("add", "P2"),
-        Command::Remove { .. } => unimplemented("remove", "P2"),
-        Command::Install => unimplemented("install", "P2"),
-        Command::Update { .. } => unimplemented("update", "P2"),
+        Command::Add { package, dev } => deps_cmd::add(&std::env::current_dir()?, &package, dev),
+        Command::Remove { package } => deps_cmd::remove(&std::env::current_dir()?, &package),
+        Command::Install => deps_cmd::install(&std::env::current_dir()?),
+        Command::Update { package } => {
+            deps_cmd::update(&std::env::current_dir()?, package.as_deref())
+        }
         Command::Check {
             target,
             format,
@@ -179,16 +184,29 @@ fn main() -> anyhow::Result<()> {
         } => check_cmd::run(&std::env::current_dir()?, target.as_deref(), &format, watch),
         Command::Lint { fix } => lint_cmd::run(&std::env::current_dir()?, fix),
         Command::Fmt { check, watch } => fmt_cmd::run(&std::env::current_dir()?, check, watch),
-        Command::Build { .. } => unimplemented("build", "P3"),
+        Command::Build { target, out } => build_cmd::run(
+            &std::env::current_dir()?,
+            target.as_deref(),
+            out.as_deref(),
+        ),
         Command::Bundle { .. } => unimplemented("bundle", "P3"),
-        Command::Test { .. } => unimplemented("test", "P4"),
+        Command::Test {
+            pattern,
+            watch,
+            coverage,
+        } => test_cmd::run(
+            &std::env::current_dir()?,
+            pattern.as_deref(),
+            watch,
+            coverage,
+        ),
         Command::Bench => unimplemented("bench", "P4"),
         Command::Run { .. } => unimplemented("run", "P4"),
         Command::Doc { .. } => unimplemented("doc", "P5"),
         Command::Publish => unimplemented("publish", "P2"),
         Command::Lsp { .. } => lsp_cmd::run(),
         Command::Toolchain { .. } => unimplemented("toolchain", "P4"),
-        Command::Vendor => unimplemented("vendor", "P2"),
+        Command::Vendor => deps_cmd::vendor(&std::env::current_dir()?),
         Command::Audit => unimplemented("audit", "P5"),
         Command::Explain { code } => {
             let parsed: luabox_diag::Code = code.parse().map_err(|_| {
