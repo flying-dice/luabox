@@ -1,0 +1,50 @@
+[package]
+name = "luabox-syntax-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# Its own workspace: nested inside the main repo but not a member of the
+# root virtual workspace (root Cargo.toml excludes "fuzz"). See
+# https://rust-fuzz.github.io/book/cargo-fuzz/setup.html
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.luabox-syntax]
+path = "../crates/luabox-syntax"
+
+[[bin]]
+name = "lua_parse"
+path = "fuzz_targets/lua_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lua_fmt"
+path = "fuzz_targets/lua_fmt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "shape_parse"
+path = "fuzz_targets/shape_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "luacats"
+path = "fuzz_targets/luacats.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

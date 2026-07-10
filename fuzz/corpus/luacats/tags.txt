@@ -1,0 +1,12 @@
+---@class (exact) mod.Cat : Base<string>
+---@field [string] integer
+---@param opt? string
+---@return string name # a description
+---@type integer, string
+---@alias Color
+---| '"red"' # the red one
+---| '"green"'
+---@generic K : table<string, number>, V
+---@overload fun(a: integer): string
+---@cast x +integer, -string, boolean
+---@enum (key) Flags
