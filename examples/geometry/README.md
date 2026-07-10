@@ -28,7 +28,10 @@ geometry/
 3. **Bind Lua to shapes with tags:**
    - `---@use geometry` — import the shape module (file top).
    - `---@struct Point` — bind a table literal to a struct. The literal is
-     **sealed-checked** against the fields.
+     **sealed-checked** against the fields. On a class *carrier*
+     (`---@struct Circle` on `local Circle = {}`), constructor
+     `setmetatable(literal, Circle)` calls are sealed-checked too, and
+     their result types as a `Circle` instance.
    - `---@impl Shape for Circle` — assert conformance. Every trait fn must be
      present with a compatible signature; `:` vs `.` receivers must match
      `self`; extra inherent methods are fine.
@@ -79,9 +82,22 @@ A downstream package that depends on this one can then `---@use geometry` and
 get the same sealed checking across the package boundary. See `../renderer`,
 which consumes these shapes and implements `Drawable` for its own type.
 
-## A note on constructors and strict types
+## Constructors under strict types
 
-`Circle.new(radius)` is bound through `---@impl` (not `---@struct`), so its
-`setmetatable` call is not sealed against the struct — that keeps ordinary
-parameterised constructors ergonomic. The sealed-literal checks are best
-shown on concrete data literals, which is exactly what `shapes_data.lua` does.
+`Circle.new(radius)` is written the way a Rust developer would write it:
+
+```lua
+---@param radius number
+---@return Circle
+function Circle.new(radius)
+    return setmetatable({ radius = radius }, Circle)
+end
+```
+
+Because the carrier is bound with `---@struct Circle`, the checker knows
+three things at once: the `---@param` type flows into the body (so
+`radius` is a `number` inside the literal), the `setmetatable` literal is
+sealed-checked against the struct's fields, and the *result* of
+`setmetatable(literal, Circle)` is a `Circle` instance — so it unifies
+with the declared `---@return Circle`. Inside `:` methods, `self` gets the
+struct's instance type: `self.radius` is the declared `number`.

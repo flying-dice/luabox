@@ -6,9 +6,11 @@
 /// boundary. We declare our own struct and assert it is Drawable.
 use geometry;
 
-/// A filled square rendered as ASCII art.
+/// A filled square rendered as ASCII art. The side is a cell count, so it
+/// is an `integer` — and `string.rep("#", self.side)` typechecks against
+/// the stdlib's `integer` count parameter.
 struct Square {
-    side: number,
+    side: integer,
 }
 
 // Square is Drawable. Because `Drawable: Shape`, this also requires Square to

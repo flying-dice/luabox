@@ -1099,3 +1099,104 @@ fn no_tags_means_no_shape_machinery() {
     // No .luab files anywhere; a file without tags must be silent.
     assert!(f.check("local x = 1\nprint(x)\n").is_empty());
 }
+
+// === Carrier constructors & `self` typing (#73) =============================
+
+/// A carrier bound with `---@struct`, an annotated constructor, and `:`
+/// methods — the idiomatic OOP form the dogfooded examples use.
+fn square_fixture() -> Fixture {
+    let f = Fixture::new();
+    f.write("src/render.luab", "struct Square { side: integer }\n");
+    f
+}
+
+const SQUARE_CARRIER: &str = "\
+---@use render
+
+---@param n integer
+local function wanti(n) end
+---@param s string
+local function wants(s) end
+
+---@struct Square
+local Square = {}
+Square.__index = Square
+
+function Square:grow()
+  wanti(self.side)
+end
+
+---@param side integer
+---@return Square
+function Square.new(side)
+  return setmetatable({ side = side }, Square)
+end
+";
+
+#[test]
+fn struct_carrier_constructor_checks_clean_in_strict() {
+    let f = square_fixture();
+    let diags = f.check_at(SQUARE_CARRIER, Strictness::Strict);
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn annotated_param_flows_into_the_sealed_constructor_literal() {
+    // `side` annotated as `string` no longer satisfies the struct's
+    // `integer` field — the parameter's type reaches the literal.
+    let f = square_fixture();
+    let src = SQUARE_CARRIER.replace("---@param side integer", "---@param side string");
+    let diags = f.check_at(&src, Strictness::Strict);
+    let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
+    assert!(codes.contains(&"LB0300".to_string()), "{diags:?}");
+}
+
+#[test]
+fn constructor_literal_stays_sealed_against_the_struct() {
+    let f = square_fixture();
+    let src = SQUARE_CARRIER.replace(
+        "setmetatable({ side = side }, Square)",
+        "setmetatable({ side = side, colour = 1 }, Square)",
+    );
+    let diags = f.check_at(src.as_str(), Strictness::Strict);
+    let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
+    assert_eq!(codes, vec!["LB2002"], "{diags:?}");
+}
+
+#[test]
+fn wrong_struct_constructor_return_still_errors() {
+    let f = square_fixture();
+    let src = SQUARE_CARRIER.replace(
+        "return setmetatable({ side = side }, Square)",
+        "return side",
+    );
+    let diags = f.check_at(src.as_str(), Strictness::Strict);
+    let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
+    assert_eq!(codes, vec!["LB0304"], "{diags:?}");
+}
+
+#[test]
+fn self_field_uses_the_declared_struct_type() {
+    // Positive is covered by `struct_carrier_constructor_checks_clean_in_strict`
+    // (`wanti(self.side)` with `side: integer`); negative: the declared
+    // integer is NOT a string.
+    let f = square_fixture();
+    let src = SQUARE_CARRIER.replace("wanti(self.side)", "wants(self.side)");
+    let diags = f.check_at(src.as_str(), Strictness::Strict);
+    let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
+    assert_eq!(codes, vec!["LB0300"], "{diags:?}");
+}
+
+#[test]
+fn annotated_instance_exposes_declared_fields_and_methods() {
+    let f = square_fixture();
+    let src = format!(
+        "{SQUARE_CARRIER}
+local sq = Square.new(3)
+wanti(sq.side)
+sq:grow()
+"
+    );
+    let diags = f.check_at(&src, Strictness::Strict);
+    assert!(diags.is_empty(), "{diags:?}");
+}

@@ -401,6 +401,11 @@ impl Checker<'_> {
     /// falling back to the inference engine's published type (rich table
     /// inference, SPEC.md §3) when annotations say nothing.
     fn expr_ty(&self, expr: &Expr) -> Ty {
+        // An inline `--[[@as T]]` cast is authoritative for the expression
+        // it directly follows.
+        if let Some(ty) = self.env.as_cast_at(range(expr.syntax()).end) {
+            return ty.clone();
+        }
         // Name references prefer the flow-sensitive inferred type: for
         // annotated bindings it *starts* from the annotation
         // (authoritative) and only ever refines it (narrowing), and for

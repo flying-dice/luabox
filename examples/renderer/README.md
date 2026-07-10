@@ -33,10 +33,14 @@ geometry's manifest exports its shape module with `[types] shapes =
 even though they were declared in a different package. We then declare our own
 `struct Square` and assert `impl Drawable for Square;`.
 
-In `src/square.lua`, `---@impl Drawable for Square` binds the carrier. Because
-`Drawable: Shape` (Shape is a supertrait), `luabox check` requires Square to
-implement **area + perimeter + draw** — the full obligation across both
-traits. Drop any one and check reports the gap.
+In `src/square.lua`, `---@struct Square` + `---@impl Drawable for Square`
+bind the carrier. Because `Drawable: Shape` (Shape is a supertrait),
+`luabox check` requires Square to implement **area + perimeter + draw** —
+the full obligation across both traits. Drop any one and check reports the
+gap. The struct declares `side: integer`, so inside the methods `self.side`
+types as `integer` — which is exactly what `string.rep("#", self.side)` in
+`draw` requires — and the constructor's declared `---@return Square` is
+satisfied by its `setmetatable({ side = side }, Square)` result.
 
 ```sh
 luabox check        # 0 errors — cross-package shapes resolve and seal

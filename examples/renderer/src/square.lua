@@ -6,6 +6,10 @@
 
 -- Square implements Drawable. The trait's supertrait is Shape, so we must also
 -- provide area + perimeter — `luabox check` enforces the whole obligation.
+-- `---@struct Square` binds the carrier to the struct: `self.side` types as
+-- the declared `integer`, and the constructor's `setmetatable` literal is
+-- sealed-checked against the struct's fields.
+---@struct Square
 ---@impl Drawable for Square
 local Square = {}
 Square.__index = Square
@@ -21,16 +25,13 @@ end
 function Square:draw()
     local rows = {}
     for _row = 1, self.side do
-        local cells = {}
-        for _col = 1, self.side do
-            cells[#cells + 1] = "#"
-        end
-        rows[#rows + 1] = table.concat(cells)
+        rows[#rows + 1] = string.rep("#", self.side)
     end
     return table.concat(rows, "\n")
 end
 
----@param side number
+---@param side integer
+---@return Square
 function Square.new(side)
     return setmetatable({ side = side }, Square)
 end

@@ -535,6 +535,219 @@ end
         assert_eq!(strict_codes(src), vec!["LB0304"]);
     }
 
+    // --- name-based `@param` binding (#74) --------------------------------
+
+    #[test]
+    fn partial_param_annotations_bind_by_name() {
+        // Annotating only params 2..5 of a 6-param function must not shift
+        // the tags onto the wrong positions (#74's exact repro).
+        let src = "\
+---@param b string
+---@param c boolean
+---@param d integer
+---@param e string
+local function f(a, b, c, d, e, g)
+  return a, b, c, d, e, g
+end
+f(1, \"s\", true, 2, \"t\", 3)
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+        // And a call violating the *named* params errors per slot.
+        let bad = src.replace(
+            "f(1, \"s\", true, 2, \"t\", 3)",
+            "f(1, true, \"s\", 2.5, 2, 3)",
+        );
+        assert_eq!(
+            strict_codes(&bad),
+            vec!["LB0300", "LB0300", "LB0300", "LB0300"]
+        );
+    }
+
+    #[test]
+    fn out_of_order_param_tags_bind_by_name() {
+        let src = "\
+---@param b string
+---@param a number
+local function f(a, b) end
+f(1, \"s\")
+f(\"s\", 1)
+";
+        assert_eq!(strict_codes(src), vec!["LB0300", "LB0300"]);
+    }
+
+    #[test]
+    fn vararg_param_tag_binds_regardless_of_position() {
+        let src = "\
+---@param ... string
+---@param a number
+local function f(a, ...) end
+f(1, \"x\", \"y\")
+f(1, \"x\", 2)
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn duplicate_param_tag_names_first_wins() {
+        let src = "\
+---@param a number
+---@param a string
+local function f(a) end
+f(1)
+f(\"x\")
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn param_tag_naming_no_parameter_is_unbound() {
+        // TODO(P2): LuaLS warns here; today the tag is silently unbound and
+        // the parameter stays permissive `unknown`.
+        let src = "\
+---@param sied number
+local function f(side)
+  return side
+end
+f(1)
+f(\"anything\")
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    // --- constructor returns through `setmetatable` (#73) ------------------
+
+    /// Strict check with the Lua 5.4 stdlib ambient layer (its
+    /// `setmetatable` signature must not mask inference).
+    fn strict_codes_ambient(src: &str) -> Vec<String> {
+        let parse = lua::parse(src, lua::Dialect::Lua54);
+        assert_eq!(parse.errors(), &[], "fixture must parse cleanly");
+        check_file_shaped(
+            &parse,
+            "test.lua",
+            Strictness::Strict,
+            None,
+            Some(stdlib_defs(lua::Dialect::Lua54)),
+        )
+        .iter()
+        .map(|d| d.code.to_string())
+        .collect()
+    }
+
+    const CIRCLE_CLASS: &str = "\
+---@class Circle
+---@field radius number
+local Circle = {}
+Circle.__index = Circle
+
+function Circle:area()
+  return self.radius * self.radius
+end
+";
+
+    #[test]
+    fn constructor_setmetatable_satisfies_declared_class_return() {
+        let src = format!(
+            "{CIRCLE_CLASS}
+---@param radius number
+---@return Circle
+function Circle.new(radius)
+  return setmetatable({{ radius = radius }}, Circle)
+end
+"
+        );
+        assert_eq!(strict_codes_ambient(&src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn wrong_constructor_return_still_errors() {
+        // Returning something that is NOT the declared class must stay an
+        // error: a plain number...
+        let src = format!(
+            "{CIRCLE_CLASS}
+---@return Circle
+function Circle.new()
+  return 42
+end
+"
+        );
+        assert_eq!(strict_codes_ambient(&src), vec!["LB0304"]);
+        // ...and an instance of an unrelated class missing the fields.
+        let src = format!(
+            "{CIRCLE_CLASS}
+---@class Empty
+local Empty = {{}}
+Empty.__index = Empty
+
+---@return Circle
+function Circle.new()
+  return setmetatable({{}}, Empty)
+end
+"
+        );
+        assert_eq!(strict_codes_ambient(&src), vec!["LB0304"]);
+    }
+
+    #[test]
+    fn annotated_instance_resolves_declared_fields_and_methods() {
+        let src = format!(
+            "{CIRCLE_CLASS}
+---@param radius number
+---@return Circle
+function Circle.new(radius)
+  return setmetatable({{ radius = radius }}, Circle)
+end
+
+---@param n number
+local function wantn(n) end
+
+local c = Circle.new(2)
+wantn(c.radius)
+wantn(c:area())
+"
+        );
+        assert_eq!(strict_codes_ambient(&src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn self_in_class_methods_uses_declared_field_types() {
+        // The declaration wins over the inferred constructor value: `count`
+        // is declared `integer`, so `string.rep` (integer count) accepts it
+        // even though the constructor stored a plain `number` param.
+        let src = "\
+---@class Banner
+---@field count integer
+local Banner = {}
+Banner.__index = Banner
+
+function Banner:draw()
+  return string.rep(\"#\", self.count)
+end
+
+---@param count integer
+---@return Banner
+function Banner.new(count)
+  return setmetatable({ count = count }, Banner)
+end
+";
+        assert_eq!(strict_codes_ambient(src), Vec::<String>::new());
+        // Negative: a declared `string` field stays a string — arithmetic
+        // consumers of it error.
+        let bad = "\
+---@param n number
+local function wantn(n) end
+
+---@class Tag
+---@field label string
+local Tag = {}
+Tag.__index = Tag
+
+function Tag:size()
+  wantn(self.label)
+end
+";
+        assert_eq!(strict_codes_ambient(bad), vec!["LB0300"]);
+    }
+
     // --- enums, aliases, LB0305 -----------------------------------------
 
     #[test]

@@ -746,6 +746,37 @@ fn harvest_block_before_nested_statement() {
     assert_eq!(&src[target.start..target.end], "local y = 2");
 }
 
+// === Inline `--[[@as T]]` casts ===
+
+#[test]
+fn harvest_inline_as_finds_long_bracket_casts() {
+    let src =
+        "local u = SOME_GLOBAL --[[@as number]]\nlocal v = other() --[==[@as string|nil]==]\n";
+    let parse = lua_parse(src, Dialect::Lua54);
+    let casts = harvest_inline_as(&parse);
+    assert_eq!(casts.len(), 2);
+    let (name, _) = named_of(&casts[0].ty);
+    assert_eq!(name, "number");
+    assert_eq!(
+        &src[casts[0].span.start..casts[0].span.end],
+        "--[[@as number]]"
+    );
+    assert!(matches!(casts[1].ty.kind, TypeExprKind::Union(_)));
+}
+
+#[test]
+fn harvest_inline_as_ignores_other_comments() {
+    let src = "\
+local a = 1 -- @as number is a line comment, not a cast
+--[[ plain block comment ]]
+---@as doc-comment form is not the inline syntax
+--[[@asymmetric]] local b = 2
+local c = 3 --[[@as]]
+";
+    let parse = lua_parse(src, Dialect::Lua54);
+    assert!(harvest_inline_as(&parse).is_empty());
+}
+
 // === Property test: no panic over arbitrary `---@` line soup ===
 
 proptest! {

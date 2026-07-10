@@ -177,6 +177,24 @@ impl TypeEnv {
                 .collect();
             env.absorb_block(item, &mut lowerer, &root);
         }
+        // Inline `--[[@as T]]` casts: anchor each to the end offset of the
+        // expression it directly follows (skipping back over whitespace).
+        let inline_as = luacats::harvest_inline_as(parse);
+        if !inline_as.is_empty() {
+            lowerer.generics.clear();
+            let text = root.text().to_string();
+            let bytes = text.as_bytes();
+            for cast in inline_as {
+                let ty = lowerer.lower(&cast.ty);
+                let mut anchor = cast.span.start.min(bytes.len());
+                while anchor > 0 && bytes[anchor - 1].is_ascii_whitespace() {
+                    anchor -= 1;
+                }
+                if anchor > 0 {
+                    env.as_casts.insert(anchor, ty);
+                }
+            }
+        }
         env.unknown_names = std::mem::take(&mut lowerer.unknown_names);
         env
     }
@@ -359,11 +377,17 @@ impl TypeEnv {
                         overloads.push(*func);
                     }
                 }
+                Tag::Cast(c) if !c.var.is_empty() => casts.push(lower_cast(c, lowerer)),
                 _ => {}
             }
         }
 
         let target = item.target.map(|span| (span.start, span.end));
+        if let Some(target) = target
+            && !casts.is_empty()
+        {
+            self.casts.entry(target).or_default().append(&mut casts);
+        }
         if (!params.is_empty() || !returns.is_empty() || !overloads.is_empty())
             && let Some(target) = target
         {
@@ -584,6 +608,29 @@ impl TypeEnv {
     /// The `---@class`/`---@struct` name bound to a statement, if any.
     pub(crate) fn declared_target(&self, target: Target) -> Option<&str> {
         self.declared_targets.get(&target).map(String::as_str)
+    }
+
+    /// The `---@cast` overrides attached to a statement, if any.
+    pub(crate) fn casts_at(&self, target: Target) -> Option<&[CastEntry]> {
+        self.casts.get(&target).map(Vec::as_slice)
+    }
+
+    /// The inline `--[[@as T]]` cast anchored to an expression ending at
+    /// `end_offset`, if any.
+    pub(crate) fn as_cast_at(&self, end_offset: usize) -> Option<&Ty> {
+        self.as_casts.get(&end_offset)
+    }
+}
+
+/// Lower one `---@cast` tag's operation list.
+fn lower_cast(tag: &luacats::CastTag, lowerer: &mut Lowerer<'_>) -> CastEntry {
+    CastEntry {
+        var: tag.var.clone(),
+        ops: tag
+            .ops
+            .iter()
+            .map(|op| (op.kind, lowerer.lower(&op.ty)))
+            .collect(),
     }
 }
 
