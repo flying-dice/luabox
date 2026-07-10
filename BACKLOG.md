@@ -29,6 +29,14 @@ Strictness (exceed luals):
   Enforce `---@class` conformance (`: Interface`, `__index`-aware)
 - [#103](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/103)
   `undefined-global` diagnostic (typo'd/unknown global reads)
+- [#90](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/90)
+  Strictness for un-shaped LuaCATS code (SPEC §19)
+
+`.luab` removal (a *consequence* of reaching the gate, not a precondition):
+
+- [#109](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/109)
+  `.luab` subsystem removal (absorbs #83/#88/#89/#98 and the `.luab` bits of
+  #91/#102)
 
 Blockers:
 
@@ -67,23 +75,16 @@ Release-needed:
 _None open — the SHAPES-V2 checker-quality and LSP waves are landed
 (#77–#82 closed)._
 
-## Icebox
+## Icebox (post-launch)
 
-- [#83](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/83)
-  `[types] rename` for colliding dependency namespaces
 - [#85](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/85)
   Cross-file `require` resolution
 - [#86](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/86)
-  Overload-aware call results and tuple types
+  Overload-aware call results and tuple types (LuaCATS parity polish)
 - [#87](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/87)
-  Docs: conformers listing on type pages
-- [#88](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/88)
-  tree-sitter parity for levelled long brackets
-- [#89](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/89)
-  v1 → v2 shapes migration tooling (`luabox fix`)
-- [#90](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/90)
-  Strictness for un-shaped LuaCATS code (SPEC §19)
+  Docgen: list `---@class` implementors of an interface (post-#107)
 - [#91](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/91)
-  SHAPES-V2 housekeeping (cache key, Zed rev, watch.rs, completion gating)
-- [#104](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/104)
-  Typing globals from the `.luab` surface (or document defs as the mechanism)
+  watch.rs env-flakiness (make robust or gate)
+
+_Closed as inconsistent with the north star: #83 (folded into #108), #88,
+#89, #98, #104. See DIRECTION.md._
