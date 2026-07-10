@@ -774,6 +774,114 @@ fn lb_goto_and_hover_resolve_type_names() {
     client.shutdown();
 }
 
+// === SHAPES-V2 ambient package scope (goto/hover/completion) ============
+
+const SHAPES_MANIFEST: &str = "\
+[package]
+name = \"demo\"
+version = \"0.1.0\"
+edition = \"5.4\"
+
+[types]
+shape-paths = [\"shapes\"]
+";
+
+const GEOMETRY_LUAB: &str = "\
+--- A 2D point.
+type Point = { x: number, y: number }
+";
+
+#[test]
+fn lua_annotation_goto_and_hover_resolve_shape_types() {
+    let client = start(&[
+        ("luabox.toml", SHAPES_MANIFEST),
+        ("shapes/geometry.luab", GEOMETRY_LUAB),
+    ]);
+    let uri = client.uri("main.lua");
+    let source = "---@type geometry.Point\nlocal p = nil\nprint(p)\n";
+    client.open(&uri, source);
+    let mut client = client;
+    // Cursor inside `geometry` (the first segment of the dotted reference,
+    // not the declared name itself) still resolves the whole path.
+    let location = client.definition(&uri, 0, 12).expect("definition");
+    assert!(
+        location.uri.as_str().ends_with("shapes/geometry.luab"),
+        "{}",
+        location.uri.as_str()
+    );
+    // The `Point` name token in `type Point = { ... }` on line 1.
+    assert_eq!(location.range, range((1, 5), (1, 10)));
+
+    let hover = client.hover(&uri, 0, 12).expect("hover");
+    let text = hover_text(&hover);
+    assert!(text.contains("type Point"), "{text}");
+    assert!(text.contains("A 2D point."), "{text}");
+    client.shutdown();
+}
+
+#[test]
+fn lb_cross_file_goto_resolves_qualified_reference() {
+    let render = "type Canvas = { origin: geometry.Point }\n";
+    let client = start(&[
+        ("luabox.toml", SHAPES_MANIFEST),
+        ("shapes/geometry.luab", GEOMETRY_LUAB),
+        ("shapes/render.luab", render),
+    ]);
+    let uri = client.uri("shapes/render.luab");
+    client.open(&uri, render);
+    let mut client = client;
+    // Cursor inside `geometry`, the qualifying segment of `geometry.Point`.
+    let location = client.definition(&uri, 0, 27).expect("definition");
+    assert!(
+        location.uri.as_str().ends_with("shapes/geometry.luab"),
+        "{}",
+        location.uri.as_str()
+    );
+    assert_eq!(location.range, range((1, 5), (1, 10)));
+    client.shutdown();
+}
+
+#[test]
+fn lua_annotation_completion_offers_scope_type_names() {
+    let client = start(&[
+        ("luabox.toml", SHAPES_MANIFEST),
+        ("shapes/geometry.luab", GEOMETRY_LUAB),
+    ]);
+    let uri = client.uri("main.lua");
+    let source = "---@type \nlocal p = nil\n";
+    client.open(&uri, source);
+    let mut client = client;
+    // Cursor right after `---@type `, nothing typed yet.
+    let items = client.complete(&uri, 0, 9);
+    let point = items
+        .iter()
+        .find(|i| i.label == "geometry.Point")
+        .unwrap_or_else(|| panic!("expected `geometry.Point`, got {items:?}"));
+    assert_eq!(point.kind, Some(CompletionItemKind::CLASS));
+    client.shutdown();
+}
+
+#[test]
+fn lb_completion_offers_builtins_and_siblings() {
+    let client = start(&[]);
+    let uri = client.uri("shapes.luab");
+    let source = "type Point = { x: number, y: number }\ntype Pair = \n";
+    client.open(&uri, source);
+    let mut client = client;
+    let items = client.complete(&uri, 1, 12);
+    let number = items
+        .iter()
+        .find(|i| i.label == "number")
+        .unwrap_or_else(|| panic!("expected builtin `number`, got {items:?}"));
+    assert_eq!(number.kind, Some(CompletionItemKind::KEYWORD));
+    let point = items
+        .iter()
+        .find(|i| i.label == "Point")
+        .unwrap_or_else(|| panic!("expected sibling `Point`, got {items:?}"));
+    assert_eq!(point.kind, Some(CompletionItemKind::CLASS));
+    client.shutdown();
+}
+
 // === Formatting ==========================================================
 
 /// Un-canonical spacing/indentation that still parses cleanly.

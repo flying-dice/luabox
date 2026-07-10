@@ -381,18 +381,38 @@ impl Server {
             let text = self.lb_text(&path)?.to_string();
             let index = LineIndex::new(text);
             let offset = index.offset(position);
-            let (range, decl) = luab::definition(index.text(), offset)?;
-            return Some(Hover {
-                contents: lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
-                    kind: lsp_types::MarkupKind::Markdown,
-                    value: format!("```\n{}\n```", decl.trim()),
-                }),
-                range: Some(index.range(usize::from(range.start())..usize::from(range.end()))),
-            });
+            if let Some((range, decl)) = luab::definition(index.text(), offset) {
+                return Some(code_hover(
+                    &decl,
+                    index.range(usize::from(range.start())..usize::from(range.end())),
+                ));
+            }
+            // Not declared in this file: try the ambient package scope
+            // (SHAPES-V2.md), FQ or sibling-short (this module's namespace).
+            let scope = self.shape_scope();
+            let (fq, anchor) = self.lb_resolve_fq(&path, index.text(), offset, &scope)?;
+            let decl = luab::resolve_scoped(&scope, &self.root, &fq, |p| self.lb_text_owned(p))?;
+            return Some(code_hover(
+                &decl.source,
+                index.range(usize::from(anchor.start())..usize::from(anchor.end())),
+            ));
         }
         let sema = self.sema(&path)?;
         let offset = sema.index.offset(position);
-        hover::hover(&sema, offset)
+        if let Some(hover) = hover::hover(&sema, offset) {
+            return Some(hover);
+        }
+        // A `---@type`/`---@param`/`---@return` position naming a `.luab`
+        // shape type (SHAPES-V2.md): zero new tags, so this is a fallback
+        // over the annotation's own doc-comment text, not a distinct tag.
+        let (name, anchor) = luab::dotted_ident_in_lua_comment(&sema.root, offset)?;
+        let scope = self.shape_scope();
+        let decl = luab::resolve_scoped(&scope, &self.root, &name, |p| self.lb_text_owned(p))?;
+        Some(code_hover(
+            &decl.source,
+            sema.index
+                .range(usize::from(anchor.start())..usize::from(anchor.end())),
+        ))
     }
 
     fn definition(&self, uri: &Uri, position: lsp_types::Position) -> Option<Location> {
@@ -401,15 +421,26 @@ impl Server {
             let text = self.lb_text(&path)?.to_string();
             let index = LineIndex::new(text);
             let offset = index.offset(position);
-            let (range, _) = luab::definition(index.text(), offset)?;
-            return Some(Location {
-                uri: path_to_uri(&path),
-                range: index.range(usize::from(range.start())..usize::from(range.end())),
-            });
+            if let Some((range, _)) = luab::definition(index.text(), offset) {
+                return Some(Location {
+                    uri: path_to_uri(&path),
+                    range: index.range(usize::from(range.start())..usize::from(range.end())),
+                });
+            }
+            let scope = self.shape_scope();
+            let (fq, _) = self.lb_resolve_fq(&path, index.text(), offset, &scope)?;
+            let decl = luab::resolve_scoped(&scope, &self.root, &fq, |p| self.lb_text_owned(p))?;
+            return Some(Self::location_for(&decl));
         }
         let sema = self.sema(&path)?;
         let offset = sema.index.offset(position);
-        goto_def::goto_definition(&sema, offset, &self.root)
+        if let Some(location) = goto_def::goto_definition(&sema, offset, &self.root) {
+            return Some(location);
+        }
+        let (name, _) = luab::dotted_ident_in_lua_comment(&sema.root, offset)?;
+        let scope = self.shape_scope();
+        let decl = luab::resolve_scoped(&scope, &self.root, &name, |p| self.lb_text_owned(p))?;
+        Some(Self::location_for(&decl))
     }
 
     fn completion(
@@ -419,11 +450,56 @@ impl Server {
     ) -> Option<Vec<lsp_types::CompletionItem>> {
         let path = uri_to_path(uri)?;
         if is_lb(&path) {
-            return None;
+            let text = self.lb_text(&path)?.to_string();
+            let scope = self.shape_scope();
+            return Some(luab::completion(&text, &scope));
         }
         let sema = self.sema(&path)?;
         let offset = sema.index.offset(position);
-        Some(completion::completion(&sema, offset))
+        let scope = self.shape_scope();
+        Some(completion::completion(&sema, offset, &scope.types))
+    }
+
+    /// The ambient `.luab` package scope (SHAPES-V2.md), built (or fetched)
+    /// from the current shape store — the same scope `.lua` diagnostics
+    /// check against.
+    fn shape_scope(&self) -> std::sync::Arc<luabox_types::shape::ShapeScope> {
+        self.shape_store
+            .package_scope(&self.shape_paths, &self.dependencies)
+    }
+
+    /// Resolve the type reference under the cursor in a `.luab` file to a
+    /// fully-qualified scope name, plus the reference's own range (the
+    /// hover/goto anchor in the *current* document): a dotted reference is
+    /// tried as-written; an undotted one falls back to this file's own
+    /// namespace (`namespace.name`) — the sibling-short-name convention
+    /// (SHAPES-V2.md: "inside the declaring `.luab`, sibling references are
+    /// short").
+    fn lb_resolve_fq(
+        &self,
+        path: &Path,
+        text: &str,
+        offset: usize,
+        scope: &luabox_types::shape::ShapeScope,
+    ) -> Option<(String, rowan::TextRange)> {
+        let (dotted, range) = luab::dotted_ref_at(text, offset)?;
+        if dotted.contains('.') {
+            return scope.has_type(&dotted).then_some((dotted, range));
+        }
+        let ns = luab::namespace_of(&self.shape_paths, path);
+        let fq = luab::fq_name(&ns, &dotted);
+        scope.has_type(&fq).then_some((fq, range))
+    }
+
+    /// A [`Location`] for a scope-resolved declaration: a fresh
+    /// [`LineIndex`] over its (possibly different-file) text.
+    fn location_for(decl: &luab::ScopedDecl) -> Location {
+        let index = LineIndex::new(decl.text.clone());
+        Location {
+            uri: path_to_uri(&decl.file),
+            range: index
+                .range(usize::from(decl.name_range.start())..usize::from(decl.name_range.end())),
+        }
     }
 
     fn document_symbols(&self, uri: &Uri) -> Option<Vec<lsp_types::DocumentSymbol>> {
@@ -495,6 +571,13 @@ impl Server {
             .get(path)
             .or_else(|| self.lb_disk.get(path))
             .map(String::as_str)
+    }
+
+    /// [`Self::lb_text`], owned — the shape of `read_text` closures that
+    /// [`luab::resolve_scoped`] needs to read an arbitrary (possibly
+    /// different-file) `.luab` text.
+    fn lb_text_owned(&self, path: &Path) -> Option<String> {
+        self.lb_text(path).map(str::to_string)
     }
 
     // === Notifications ====================================================
@@ -627,6 +710,18 @@ impl Server {
 
 fn is_lb(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("luab")
+}
+
+/// A hover reply rendering `source` as a plain code block (no language tag —
+/// `.luab` is analyser-only, never a real Lua dialect) at `range`.
+fn code_hover(source: &str, range: lsp_types::Range) -> Hover {
+    Hover {
+        contents: lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
+            kind: lsp_types::MarkupKind::Markdown,
+            value: format!("```\n{}\n```", source.trim()),
+        }),
+        range: Some(range),
+    }
 }
 
 /// Extract a request's id and params, or surface a protocol error.
