@@ -239,6 +239,49 @@ fn carrier_missing_method_fails_positionally() {
 }
 
 #[test]
+fn carrier_with_wrong_return_type_fails() {
+    let f = geometry_fixture();
+    // `area` is annotated `---@return string` — it does not satisfy the
+    // `area(self): number` member. `perimeter` is correct, so the sole
+    // mismatch is `area`.
+    let src = "local Circle = {}\nCircle.__index = Circle\n\
+               ---@return string\nfunction Circle:area() return \"x\" end\n\
+               ---@return number\nfunction Circle:perimeter() return 2 end\n\
+               ---@type geometry.Shape\nlocal s = Circle\nreturn s\n";
+    let diags = f.check(src);
+    assert!(!diags.is_empty(), "wrong `area` return must be diagnosed");
+    assert!(
+        diags.iter().any(|d| d.message.contains("area")),
+        "the mismatch must name `area`: {diags:?}"
+    );
+}
+
+#[test]
+fn carrier_method_extra_required_param_fails_but_fewer_passes() {
+    let f = geometry_fixture();
+    // A required parameter beyond the `area(self): number` signature: a
+    // `Shape` caller (`s:area()`) never supplies it, so it does not conform.
+    let extra = "local C = {}\nC.__index = C\n\
+                 ---@param scale number\n---@return number\n\
+                 function C:area(scale) return scale end\n\
+                 ---@return number\nfunction C:perimeter() return 2 end\n\
+                 ---@type geometry.Shape\nlocal s = C\nreturn s\n";
+    let diags = f.check(extra);
+    assert!(
+        diags.iter().any(|d| d.message.contains("area")),
+        "extra required `area` parameter must be diagnosed: {diags:?}"
+    );
+
+    // Fewer parameters than the target is always safe (Lua drops extra
+    // arguments): the plain `self`-only methods conform.
+    let fewer = "local C = {}\nC.__index = C\n\
+                 ---@return number\nfunction C:area() return 1 end\n\
+                 ---@return number\nfunction C:perimeter() return 2 end\n\
+                 ---@type geometry.Shape\nlocal s = C\nreturn s\n";
+    assert!(f.check(fewer).is_empty(), "{:?}", f.check(fewer));
+}
+
+#[test]
 fn intersection_requires_all_members() {
     let f = geometry_fixture();
     let ok = "local C = {}\nC.__index = C\n\

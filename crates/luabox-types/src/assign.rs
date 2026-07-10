@@ -15,13 +15,16 @@
 //!   "unknown field" diagnostic (LB0303) is only raised for table
 //!   *literals* checked against a class shape (LuaLS behaviour), by the
 //!   checker — plain assignability stays width-based.
-//! - Function-to-function is always accepted — TODO(P1): parameter
-//!   contravariance / return covariance.
+//! - Function-to-function is real subtyping: parameters are contravariant
+//!   (with Lua call semantics — a value may declare fewer parameters, never
+//!   more *required* ones), returns are covariant. `unknown` parameters and
+//!   unannotated returns stay lenient in both directions; `FunctionTy::opaque`
+//!   is universally assignable. See [`Ctx::check_function`].
 //! - Named-vs-named comparisons are coinductive (recursive classes
 //!   terminate via a seen-pair set).
 
 use crate::env::TypeEnv;
-use crate::ty::{TableTy, Ty};
+use crate::ty::{FunctionTy, TableTy, Ty};
 
 /// Whether `value` may flow into a slot of type `target`.
 pub fn assignable(env: &TypeEnv, strict: bool, value: &Ty, target: &Ty) -> bool {
@@ -88,18 +91,103 @@ impl Ctx<'_> {
         match (value, target) {
             // Identical primitives / literals.
             (v, t) if v == t => true,
-            // Literal subtyping — plus integer -> number widening and,
-            // TODO(P1) function subtyping (param contravariance, return
-            // covariance): any function satisfies a function slot for now.
+            // Literal subtyping plus integer -> number widening.
             (Ty::BoolLit(_), Ty::Boolean)
             | (Ty::StringLit(_), Ty::String)
-            | (Ty::NumberLit(_) | Ty::Integer, Ty::Number)
-            | (Ty::Function(_), Ty::Function(_)) => true,
+            | (Ty::NumberLit(_) | Ty::Integer, Ty::Number) => true,
             (Ty::NumberLit(text), Ty::Integer) => is_integral_literal(text),
             (Ty::NumberLit(a), Ty::NumberLit(b)) => numeric_eq(a, b),
+            (Ty::Function(v), Ty::Function(t)) => self.check_function(v, t),
             (Ty::Table(v), Ty::Table(t)) => self.check_table(v, t),
             _ => false,
         }
+    }
+
+    /// Function subtyping: the `value` function may flow where a `target`
+    /// function is demanded. Contravariant parameters, covariant returns,
+    /// Lua call semantics. The value fits if its primary signature fits or
+    /// any of its overloads fits the target's primary (target overloads are
+    /// ignored — conservative).
+    fn check_function(&mut self, value: &FunctionTy, target: &FunctionTy) -> bool {
+        if self.check_function_sig(value, target) {
+            return true;
+        }
+        value
+            .overloads
+            .iter()
+            .any(|overload| self.check_function_sig(overload, target))
+    }
+
+    /// One value signature against the target's primary signature.
+    fn check_function_sig(&mut self, value: &FunctionTy, target: &FunctionTy) -> bool {
+        // Parameters are contravariant: for each positional parameter the
+        // value declares, the corresponding target parameter (its fixed
+        // parameter, else its vararg element) must be assignable *to* the
+        // value's parameter (target -> value). `unknown` parameters are
+        // lenient in both directions regardless of strict mode.
+        for (i, vparam) in value.params.iter().enumerate() {
+            let Some(tty) = target
+                .params
+                .get(i)
+                .map(|p| &p.ty)
+                .or(target.varargs.as_ref())
+            else {
+                continue;
+            };
+            if lenient_param(&vparam.ty) || lenient_param(tty) {
+                continue;
+            }
+            if !self.check(tty, &vparam.ty) {
+                return false;
+            }
+        }
+        // The value must not *require* more than the target supplies. Lua
+        // silently drops extra call arguments, so the value declaring fewer
+        // (or optional / nil-admitting) parameters is safe; a required value
+        // parameter beyond the target's fixed arity — with no target vararg
+        // to feed it — is not.
+        if target.varargs.is_none() {
+            for vparam in value.params.iter().skip(target.params.len()) {
+                if !vparam.optional && !vparam.ty.admits_nil() {
+                    return false;
+                }
+            }
+        }
+        // A value vararg absorbs any target parameters past the value's fixed
+        // list: each must be assignable to the vararg element (an `unknown` /
+        // `any` element accepts everything).
+        if let Some(velem) = &value.varargs
+            && !lenient_param(velem)
+        {
+            for tparam in target.params.iter().skip(value.params.len()) {
+                if !self.check(&tparam.ty, velem) {
+                    return false;
+                }
+            }
+        }
+        // Returns are covariant. An unannotated value (`has_return_annotation
+        // == false`) is not checked — mirrors the checker's stance that
+        // returns without `---@return` are unconstrained. Extra value returns
+        // are ignored (Lua callers drop them); a target return the value does
+        // not provide must admit nil, unless the target return list is
+        // open-ended (`returns_vararg`).
+        if value.has_return_annotation {
+            for (i, tret) in target.returns.iter().enumerate() {
+                match value.returns.get(i) {
+                    Some(vret) => {
+                        if !self.check(vret, tret) {
+                            return false;
+                        }
+                    }
+                    None => {
+                        if !target.returns_vararg && !tret.admits_nil() {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Structural width subtyping for tables.
@@ -211,6 +299,13 @@ fn resolve_table(env: &TypeEnv, ty: &Ty) -> Option<TableTy> {
     }
 }
 
+/// A function parameter that never constrains conformance: `unknown`
+/// (unannotated Lua) and `any` are lenient in both directions, at every
+/// strictness.
+fn lenient_param(ty: &Ty) -> bool {
+    matches!(ty, Ty::Unknown | Ty::Any)
+}
+
 /// Whether a number-literal's text denotes an integer value.
 pub(crate) fn is_integral_literal(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
@@ -241,7 +336,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::ty::{FieldTy, FunctionTy, TableTy};
+    use crate::ty::{FieldTy, FunctionTy, ParamTy, TableTy};
 
     fn env() -> TypeEnv {
         TypeEnv::default()
@@ -383,12 +478,187 @@ mod tests {
         ok(&Ty::Table(Box::default()), &strings);
     }
 
+    /// Build a function type: `(name, type, optional)` params, return types,
+    /// and whether a `---@return` was written.
+    fn func(params: &[(&str, Ty, bool)], returns: &[Ty], has_return: bool) -> Ty {
+        Ty::Function(Box::new(FunctionTy {
+            params: params
+                .iter()
+                .map(|(name, ty, optional)| ParamTy {
+                    name: (*name).to_string(),
+                    ty: ty.clone(),
+                    optional: *optional,
+                })
+                .collect(),
+            returns: returns.to_vec(),
+            has_return_annotation: has_return,
+            ..FunctionTy::default()
+        }))
+    }
+
     #[test]
-    fn functions_are_mutually_assignable_mvp() {
+    fn functions_are_not_other_types() {
         let f = Ty::Function(Box::new(FunctionTy::opaque()));
-        let g = Ty::Function(Box::default());
-        ok(&f, &g);
         no(&f, &Ty::Number);
         no(&Ty::Number, &f);
+    }
+
+    #[test]
+    fn function_param_contravariance() {
+        // A wider value parameter accepts the target's narrower one.
+        ok(
+            &func(&[("x", Ty::Number, false)], &[], false),
+            &func(&[("x", Ty::Integer, false)], &[], false),
+        );
+        // A narrower value parameter cannot accept the target's wider one.
+        no(
+            &func(&[("x", Ty::Integer, false)], &[], false),
+            &func(&[("x", Ty::Number, false)], &[], false),
+        );
+    }
+
+    #[test]
+    fn function_fewer_value_params_ok() {
+        // Lua ignores extra call arguments: the value may take fewer.
+        ok(
+            &func(&[], &[], false),
+            &func(&[("self", Ty::Named("C".into()), false)], &[], false),
+        );
+    }
+
+    #[test]
+    fn function_extra_required_value_param_fails() {
+        // A required value parameter beyond the target's arity is unsafe.
+        no(
+            &func(
+                &[("a", Ty::Number, false), ("b", Ty::Number, false)],
+                &[],
+                false,
+            ),
+            &func(&[("a", Ty::Number, false)], &[], false),
+        );
+        // …but an *optional* extra value parameter is fine.
+        ok(
+            &func(
+                &[("a", Ty::Number, false), ("b", Ty::Number, true)],
+                &[],
+                false,
+            ),
+            &func(&[("a", Ty::Number, false)], &[], false),
+        );
+    }
+
+    #[test]
+    fn function_return_covariance() {
+        // string is not a number in return position.
+        no(
+            &func(&[], &[Ty::String], true),
+            &func(&[], &[Ty::Number], true),
+        );
+        // A literal return widens to the target's primitive.
+        ok(
+            &func(&[], &[Ty::NumberLit("2".into())], true),
+            &func(&[], &[Ty::Number], true),
+        );
+    }
+
+    #[test]
+    fn function_unannotated_returns_are_lenient() {
+        // Without `---@return`, the value's returns are not checked.
+        ok(
+            &func(&[], &[Ty::String], false),
+            &func(&[], &[Ty::Number], true),
+        );
+    }
+
+    #[test]
+    fn function_missing_target_return_must_admit_nil() {
+        // The value provides no second return; the target's must admit nil.
+        ok(
+            &func(&[], &[Ty::Number], true),
+            &func(&[], &[Ty::Number, Ty::Number.optional()], true),
+        );
+        no(
+            &func(&[], &[Ty::Number], true),
+            &func(&[], &[Ty::Number, Ty::String], true),
+        );
+    }
+
+    #[test]
+    fn function_varargs() {
+        // A value vararg must accept the target's excess fixed parameters.
+        ok(
+            &Ty::Function(Box::new(FunctionTy {
+                varargs: Some(Ty::Number),
+                ..FunctionTy::default()
+            })),
+            &func(
+                &[("a", Ty::Number, false), ("b", Ty::Integer, false)],
+                &[],
+                false,
+            ),
+        );
+        no(
+            &Ty::Function(Box::new(FunctionTy {
+                varargs: Some(Ty::String),
+                ..FunctionTy::default()
+            })),
+            &func(&[("a", Ty::Number, false)], &[], false),
+        );
+        // An `any` vararg accepts anything; a required value param past the
+        // target arity is absorbed by the target's own vararg.
+        ok(
+            &Ty::Function(Box::new(FunctionTy {
+                varargs: Some(Ty::Any),
+                ..FunctionTy::default()
+            })),
+            &func(&[("a", Ty::String, false)], &[], false),
+        );
+        ok(
+            &func(&[("a", Ty::Number, false)], &[], false),
+            &Ty::Function(Box::new(FunctionTy {
+                varargs: Some(Ty::Any),
+                ..FunctionTy::default()
+            })),
+        );
+    }
+
+    #[test]
+    fn opaque_function_is_universal() {
+        let opaque = Ty::Function(Box::new(FunctionTy::opaque()));
+        let concrete = func(&[("x", Ty::Number, false)], &[Ty::String], true);
+        ok(&opaque, &concrete);
+        ok(&concrete, &opaque);
+        ok(&opaque, &Ty::Function(Box::default()));
+    }
+
+    #[test]
+    fn function_overload_fallback() {
+        // The primary returns string (fails); an overload returns number.
+        let value = Ty::Function(Box::new(FunctionTy {
+            returns: vec![Ty::String],
+            has_return_annotation: true,
+            overloads: vec![FunctionTy {
+                returns: vec![Ty::Number],
+                has_return_annotation: true,
+                ..FunctionTy::default()
+            }],
+            ..FunctionTy::default()
+        }));
+        ok(&value, &func(&[], &[Ty::Number], true));
+    }
+
+    #[test]
+    fn function_unknown_params_are_lenient_both_ways() {
+        // An unannotated (unknown) value parameter accepts any target param.
+        ok(
+            &func(&[("x", Ty::Unknown, false)], &[], false),
+            &func(&[("x", Ty::Number, false)], &[], false),
+        );
+        // An unknown *target* parameter is lenient even in strict mode.
+        ok(
+            &func(&[("x", Ty::Number, false)], &[], false),
+            &func(&[("x", Ty::Unknown, false)], &[], false),
+        );
     }
 }

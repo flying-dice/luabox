@@ -16,6 +16,13 @@ Feature: Positional structural conformance
     Then diagnostic LB0300 is reported listing "perimeter"
     And the command fails
 
+  Scenario: method signature mismatch diagnosed
+    Given type Shape with methods area and perimeter
+    And a carrier table whose area method returns a string asserted as geometry.Shape
+    When I run "luabox check"
+    Then diagnostic LB0300 is reported listing "area"
+    And the command fails
+
   Scenario: intersection requires members from every part
     Given type Drawable = Shape & draw in "geometry.luab"
     And a carrier table defining area and perimeter asserted as geometry.Drawable

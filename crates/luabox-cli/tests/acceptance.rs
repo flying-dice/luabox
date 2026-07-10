@@ -380,6 +380,20 @@ fn carrier_with_inherent_helper(
     );
 }
 
+#[given(regex = r"^a carrier table whose (\w+) method returns a string asserted as ([\w.]+)$")]
+fn carrier_wrong_return(world: &mut AcceptanceWorld, method: String, asserted: String) {
+    ensure_shape_manifest(world);
+    // `method` is mis-annotated `---@return string`; `perimeter` is correct,
+    // so the sole signature mismatch names `method`.
+    let source = format!(
+        "local Circle = {{}}\nCircle.__index = Circle\n\
+         \n---@return string\nfunction Circle:{method}()\n  return \"x\"\nend\n\
+         \n---@return number\nfunction Circle:perimeter()\n  return 1\nend\n\
+         \n---@type {asserted}\nlocal s = Circle\nreturn s\n"
+    );
+    write_file(world, "src/main.lua", &source);
+}
+
 #[given("a ---@class annotated table asserted as geometry.Shape")]
 fn class_table_asserted(world: &mut AcceptanceWorld) {
     ensure_shape_manifest(world);
