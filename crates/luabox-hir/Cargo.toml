@@ -9,6 +9,10 @@ rust-version.workspace = true
 
 [dependencies]
 luabox-syntax.workspace = true
+rowan.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true
