@@ -27,23 +27,19 @@ jobs:
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
 
-  # SPEC.md §16.1 — perf gates are CI-blocking once the corpus and harness
-  # exist. Until then this job only proves the release binary builds and
-  # records cold-start time for the record; flip continue-on-error off when
-  # the real gate lands.
+  # SPEC.md §16.1 — perf gates are CI-blocking: cold start < 50 ms, and
+  # (until `luabox check` lands, ticket #6) a `fmt --check` throughput
+  # proxy on a ~100-kLOC synthetic corpus < 2 s warm. See
+  # scripts/perf-gate.sh for the harness and how to flip on the real
+  # `check` gate.
   perf-gates:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.92.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p luabox-cli
-      - name: Cold-start smoke (target < 50 ms)
-        run: |
-          start=$(date +%s%N)
-          ./target/release/luabox --version
-          end=$(date +%s%N)
-          echo "cold start: $(( (end - start) / 1000000 )) ms"
+        with:
+          key: perf-gates
+      - run: bash scripts/perf-gate.sh

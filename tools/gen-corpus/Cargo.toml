@@ -1,0 +1,18 @@
+# Standalone: not a member of the root workspace (root Cargo.toml excludes
+# `tools/*`). This empty table tells Cargo to stop walking up and treat
+# this directory as its own workspace root.
+[workspace]
+
+[package]
+name = "gen-corpus"
+description = "Standalone helper: deterministically generates a synthetic idiomatic-Lua corpus for the perf-gate harness (SPEC.md §16.1). Not part of the luabox workspace — see the root Cargo.toml `[workspace] exclude`."
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "gen-corpus"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
