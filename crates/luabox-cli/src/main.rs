@@ -3,6 +3,7 @@
 //! Thin frontend over the bounded-context crates: owns UX, argument parsing,
 //! and diagnostic rendering; none of the domain logic.
 
+mod fmt_cmd;
 mod scaffold;
 
 use std::path::PathBuf;
@@ -154,7 +155,7 @@ fn main() -> anyhow::Result<()> {
         Command::Update { .. } => unimplemented("update", "P2"),
         Command::Check { .. } => unimplemented("check", "P0"),
         Command::Lint { .. } => unimplemented("lint", "P1"),
-        Command::Fmt { .. } => unimplemented("fmt", "P0"),
+        Command::Fmt { check } => fmt_cmd::run(&std::env::current_dir()?, check),
         Command::Build { .. } => unimplemented("build", "P3"),
         Command::Bundle { .. } => unimplemented("bundle", "P3"),
         Command::Test { .. } => unimplemented("test", "P4"),

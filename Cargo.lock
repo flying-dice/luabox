@@ -629,6 +629,7 @@ dependencies = [
  "clap",
  "cucumber",
  "luabox-diag",
+ "luabox-resolve",
  "luabox-syntax",
  "tempfile",
  "tokio",

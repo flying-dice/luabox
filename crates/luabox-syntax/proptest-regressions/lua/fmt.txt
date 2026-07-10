@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bd259e2d7477d1176ae08809f4623f0cbd3d306fc94585cc0bfbbf1a476ad693 # shrinks to src = "if a:a(((a + 2.5 * a .. 2.5) + t * (a + 2.5 * a .. 2.5) .. t)) then f((obj)[obj]) elseif function(x) return a(a,1) end then g() else h() end do break end\n\n-- a note --[[ block\ncomment ]]"
+cc 6e9901dcd2b401aa8f16322bad76595f3bd2f5587bb0ab62d10c419324370999 # shrinks to src = "function ns.a(a, ...) return not ((a)[[[long \n string]]]) end"
+cc f8c71c3caa4bb5c5a3a35fa6a95d6550a7fce81f011233c7c33afea969730356 # shrinks to index = 1, at = Index(9585072901045159174), action = 0, snippet = ";"

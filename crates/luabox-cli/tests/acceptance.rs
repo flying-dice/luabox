@@ -8,6 +8,7 @@
 
 use std::process::Output;
 
+use cucumber::gherkin::Step;
 use cucumber::{World, given, then, when};
 
 #[derive(Debug, World)]
@@ -92,6 +93,39 @@ fn file_contains(world: &mut AcceptanceWorld, path: String, needle: String) {
     assert!(
         content.contains(&needle),
         "`{path}` does not contain `{needle}`; content:\n{content}"
+    );
+}
+
+/// The step's docstring, normalized: the leading newline after `"""` is
+/// stripped and exactly one trailing newline is guaranteed — matching the
+/// formatter's final-newline convention so `equals:` comparisons are exact.
+fn docstring(step: &Step) -> String {
+    let raw = step
+        .docstring
+        .as_deref()
+        .expect("this step requires a docstring (\"\"\" … \"\"\")");
+    let body = raw.strip_prefix('\n').unwrap_or(raw);
+    format!("{}\n", body.trim_end_matches(['\n', '\r']))
+}
+
+#[given(expr = "a file {string} containing:")]
+fn file_containing(world: &mut AcceptanceWorld, path: String, step: &Step) {
+    let full = world.dir.path().join(&path);
+    if let Some(parent) = full.parent() {
+        std::fs::create_dir_all(parent).expect("failed to create parent directories");
+    }
+    std::fs::write(&full, docstring(step)).unwrap_or_else(|e| panic!("cannot write `{path}`: {e}"));
+}
+
+#[then(expr = "{string} equals:")]
+fn file_equals(world: &mut AcceptanceWorld, path: String, step: &Step) {
+    let full = world.dir.path().join(&path);
+    let actual =
+        std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("cannot read `{path}`: {e}"));
+    let expected = docstring(step);
+    assert_eq!(
+        actual, expected,
+        "`{path}` does not match the expected content"
     );
 }
 
