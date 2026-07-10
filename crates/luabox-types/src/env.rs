@@ -170,6 +170,11 @@ impl TypeEnv {
                 .collect();
             env.absorb_block(item, &mut lowerer, &root);
         }
+        // SHAPES-V2 `self` typing: tie each shape-typed constructor's carrier
+        // to its instance type, so `self` in the carrier's methods resolves
+        // as the shape — mirroring the `---@class` carrier association an
+        // explicit tag would set (an explicit `---@class` still wins).
+        env.tie_shape_carriers(items, &root);
         // Inline `--[[@as T]]` casts: anchor each to the end offset of the
         // expression it directly follows (skipping back over whitespace).
         let inline_as = luacats::harvest_inline_as(parse);
@@ -388,6 +393,7 @@ impl TypeEnv {
     /// Build a [`FunctionTy`] from `@param`/`@return` tags, reconcile it
     /// with the target function's AST parameter list, and register it under
     /// the function's name.
+    #[allow(clippy::too_many_lines)]
     fn attach_function(
         &mut self,
         params: &[&ParamTag],
@@ -473,6 +479,11 @@ impl TypeEnv {
         //
         // TODO(P2): tags naming no parameter are silently unbound today
         // (LuaLS warns); surface a diagnostic for them.
+        // A `:` method's implicit `self` is absent from the AST parameter
+        // list; keep an explicit `---@param self T` tag so inference can
+        // honor it (the standard-LuaCATS `self` fallback, SHAPES-V2.md).
+        let is_method =
+            matches!(&stmt, Stmt::FunctionDecl(f) if f.name().is_some_and(|n| n.is_method()));
         if let Some(list) = param_list {
             let mut ast_names: Vec<String> = Vec::new();
             let mut ast_vararg = false;
@@ -501,6 +512,12 @@ impl TypeEnv {
                     }),
                 }
             }
+            if is_method
+                && let Some(pos) = tag_params.iter().position(|p| p.name == "self")
+                && !used[pos]
+            {
+                func.params.insert(0, tag_params[pos].clone());
+            }
             if ast_vararg && func.varargs.is_none() {
                 func.varargs = Some(Ty::Unknown);
             }
@@ -514,6 +531,42 @@ impl TypeEnv {
             self.functions.insert(name, func.clone());
         }
         self.fn_sigs.insert(target, func);
+    }
+
+    /// SHAPES-V2 `self` typing: for each shape-typed constructor
+    /// (`---@return <fq>` whose first return is a `.luab` object type) whose
+    /// body is `return setmetatable(<expr>, <Ident>)`, bind `<Ident>`'s
+    /// carrier `local` to the instance type `<fq>`. Inference then resolves
+    /// `self` in the carrier's methods through the shape, exactly as a
+    /// `---@class` carrier does. An explicit declaration on the carrier wins;
+    /// among shape constructors, the first in source order wins.
+    fn tie_shape_carriers(&mut self, items: &[luacats::AnnotatedItem], root: &SyntaxNode) {
+        let mut ties: Vec<(Target, String)> = Vec::new();
+        for item in items {
+            let Some(span) = item.target else { continue };
+            let target = (span.start, span.end);
+            let Some(sig) = self.fn_sigs.get(&target) else {
+                continue;
+            };
+            let Some(Ty::Named(fq)) = sig.returns.first() else {
+                continue;
+            };
+            if !self.shape_structs.contains_key(fq) {
+                continue;
+            }
+            let fq = fq.clone();
+            let Some(carrier) = stmt_at(root, target).and_then(|stmt| setmetatable_carrier(&stmt))
+            else {
+                continue;
+            };
+            let Some(carrier_stmt) = carrier_local(root, &carrier, target.0) else {
+                continue;
+            };
+            ties.push((carrier_stmt, fq));
+        }
+        for (target, fq) in ties {
+            self.declared_targets.entry(target).or_insert(fq);
+        }
     }
 
     // --- lookups -----------------------------------------------------
@@ -610,6 +663,66 @@ fn lower_cast(tag: &luacats::CastTag, lowerer: &mut Lowerer<'_>) -> CastEntry {
             .map(|op| (op.kind, lowerer.lower(&op.ty)))
             .collect(),
     }
+}
+
+/// The metatable identifier of a function whose body directly returns
+/// `setmetatable(<expr>, <Ident>)` (the SHAPES-V2 constructor idiom).
+/// Nested closures are not inspected — a constructor's `setmetatable` return
+/// is a top-level statement of its own body.
+fn setmetatable_carrier(stmt: &Stmt) -> Option<String> {
+    let block = match stmt {
+        Stmt::FunctionDecl(f) => f.body(),
+        Stmt::LocalFunction(f) => f.body(),
+        Stmt::Local(l) => match l.values()?.exprs().next()? {
+            Expr::Function(f) => f.body(),
+            _ => None,
+        },
+        _ => None,
+    }?;
+    for stmt in block.stmts() {
+        let Stmt::Return(ret) = stmt else { continue };
+        let Some(Expr::Call(call)) = ret.exprs().and_then(|list| list.exprs().next()) else {
+            continue;
+        };
+        let Some(Expr::Name(callee)) = call.callee() else {
+            continue;
+        };
+        if callee.name().is_none_or(|t| t.text() != "setmetatable") {
+            continue;
+        }
+        let Some(args) = call.args().and_then(|a| a.expr_list()) else {
+            continue;
+        };
+        if let Some(Expr::Name(meta)) = args.exprs().nth(1)
+            && let Some(name) = meta.name()
+        {
+            return Some(name.text().to_string());
+        }
+    }
+    None
+}
+
+/// The top-level `local <name> = ...` statement nearest before `before`
+/// (byte offset). File-local carriers only — no scope construction.
+fn carrier_local(root: &SyntaxNode, name: &str, before: usize) -> Option<Target> {
+    let block = lua::ast::SourceFile::cast(root.clone())?.block()?;
+    let mut best: Option<Target> = None;
+    for stmt in block.stmts() {
+        let Stmt::Local(local) = &stmt else { continue };
+        let declares = local
+            .names()
+            .filter_map(|n| n.name())
+            .any(|t| t.text() == name);
+        if !declares {
+            continue;
+        }
+        let range = stmt.syntax().text_range();
+        let span = (usize::from(range.start()), usize::from(range.end()));
+        if span.0 < before && best.is_none_or(|b| span.0 > b.0) {
+            best = Some(span);
+        }
+    }
+    best
 }
 
 /// The innermost statement whose range is exactly `target`.

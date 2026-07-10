@@ -404,6 +404,129 @@ fn sibling_short_names_resolve_within_module() {
     assert!(!f.check(bad).is_empty(), "nested Point missing `y`");
 }
 
+// === `self` typing: constructor tie to the instance shape (SHAPES-V2.md) ====
+
+/// A shape module with two concrete instance types and a Shape trait: the
+/// carrier idiom's target types.
+fn carrier_fixture() -> Fixture {
+    let mut f = Fixture::new();
+    f.add_shape_path("shapes");
+    f.write(
+        "shapes/geometry.luab",
+        "export type Circle = { radius: number }\n\
+         export type Widget = { size: integer }\n\
+         export type Shape = {\n\
+             area(self): number,\n\
+             perimeter(self): number,\n\
+         }\n",
+    );
+    f
+}
+
+#[test]
+fn self_types_as_shape_instance_in_carrier_methods() {
+    let f = carrier_fixture();
+    // `setmetatable({...}, Circle)` under `---@return geometry.Circle` ties
+    // the carrier to `geometry.Circle`, so `self.radius` in a method resolves
+    // as the declared `number`: a `number` consumer accepts it, a `string`
+    // consumer does not — exactly one mismatch. Were `self` untyped
+    // (`unknown`), the `number` consumer would fail too (two mismatches).
+    let src = "---@param n number\nlocal function wantn(n) end\n\
+               ---@param s string\nlocal function wants(s) end\n\
+               local Circle = {}\nCircle.__index = Circle\n\
+               function Circle:probe()\n\
+                   wantn(self.radius)\n\
+                   wants(self.radius)\n\
+               end\n\
+               ---@param radius number\n---@return geometry.Circle\n\
+               function Circle.new(radius)\n\
+                   return setmetatable({ radius = radius }, Circle)\n\
+               end\n\
+               return Circle\n";
+    let codes: Vec<String> = f.check(src).iter().map(|d| d.code.to_string()).collect();
+    assert_eq!(codes, vec!["LB0300"], "{:?}", f.check(src));
+}
+
+#[test]
+fn self_declared_field_type_governs_over_constructor() {
+    let f = carrier_fixture();
+    // The tie is to the DECLARED shape, not the constructor value: `size` is
+    // declared `integer`, so an `integer` consumer of `self.size` passes
+    // strict even though the constructor stored a plain `number` param.
+    // Without the tie `self.size` would infer `number` and fail — this is
+    // the tie's proof (number is not assignable to integer).
+    let src = "---@param n integer\nlocal function wanti(n) end\n\
+               local Widget = {}\nWidget.__index = Widget\n\
+               function Widget:probe()\n    wanti(self.size)\nend\n\
+               ---@param size number\n---@return geometry.Widget\n\
+               function Widget.new(size)\n\
+                   return setmetatable({ size = size }, Widget)\n\
+               end\n\
+               return Widget\n";
+    assert!(f.check(src).is_empty(), "{:?}", f.check(src));
+}
+
+#[test]
+fn full_carrier_idiom_passes_strict() {
+    let f = carrier_fixture();
+    // Constructor + methods + positional `---@type geometry.Shape`
+    // assertion: the idiomatic v2 carrier is strict-clean end to end.
+    let src = "local Circle = {}\nCircle.__index = Circle\n\
+               ---@return number\nfunction Circle:area()\n\
+                   return self.radius * self.radius\nend\n\
+               ---@return number\nfunction Circle:perimeter()\n\
+                   return self.radius + self.radius\nend\n\
+               ---@param radius number\n---@return geometry.Circle\n\
+               function Circle.new(radius)\n\
+                   return setmetatable({ radius = radius }, Circle)\n\
+               end\n\
+               ---@type geometry.Shape\nlocal _ = Circle\nreturn Circle\n";
+    assert!(f.check(src).is_empty(), "{:?}", f.check(src));
+}
+
+#[test]
+fn explicit_self_fallback_matches_with_or_without_tie() {
+    let f = carrier_fixture();
+    // The standard-LuaCATS explicit fallback `---@param self T` types `self`
+    // on its own — identically whether or not a constructor supplies the tie.
+    let method = "---@param self geometry.Circle\n---@return number\n\
+                  function Circle:area()\n    return self.radius * self.radius\nend\n";
+    let with_ctor = format!(
+        "local Circle = {{}}\nCircle.__index = Circle\n{method}\
+         ---@param radius number\n---@return geometry.Circle\n\
+         function Circle.new(radius)\n\
+             return setmetatable({{ radius = radius }}, Circle)\nend\n\
+         return Circle\n"
+    );
+    let without_ctor =
+        format!("local Circle = {{}}\nCircle.__index = Circle\n{method}return Circle\n");
+    assert!(f.check(&with_ctor).is_empty(), "{:?}", f.check(&with_ctor));
+    assert!(
+        f.check(&without_ctor).is_empty(),
+        "explicit self must type `self` with no constructor: {:?}",
+        f.check(&without_ctor)
+    );
+}
+
+#[test]
+fn explicit_class_on_carrier_wins_over_shape_tie() {
+    let f = carrier_fixture();
+    // An explicit `---@class` on the carrier declares the instance type; the
+    // shape tie must defer. `tag` exists only on the class, so `self.tag`
+    // resolves (as `string`) only if the class governs `self` — a shape-tied
+    // `self` would have no `tag` and the read would be flagged.
+    let src = "---@param s string\nlocal function wants(s) end\n\
+               ---@class Local\n---@field radius number\n---@field tag string\n\
+               local Circle = {}\nCircle.__index = Circle\n\
+               function Circle:probe()\n    wants(self.tag)\nend\n\
+               ---@param radius number\n---@return geometry.Circle\n\
+               function Circle.new(radius)\n\
+                   return setmetatable({ radius = radius, tag = \"x\" }, Circle)\n\
+               end\n\
+               return Circle\n";
+    assert!(f.check(src).is_empty(), "{:?}", f.check(src));
+}
+
 // === Result convention (unchanged in v2) ====================================
 
 #[test]

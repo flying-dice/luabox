@@ -917,7 +917,18 @@ impl Infer<'_> {
         for &param in &params {
             let binding = self.binding(param);
             let ity = if binding.kind == BindingKind::SelfParam {
-                self_ty.cloned().unwrap_or_else(ITy::unknown)
+                // An explicit `---@param self T` is authoritative; otherwise
+                // the metatable-inferred instance type (the constructor tie).
+                if let Some(p) = sig.and_then(|s| s.params.iter().find(|p| p.name == "self")) {
+                    let ty = if p.optional {
+                        p.ty.clone().optional()
+                    } else {
+                        p.ty.clone()
+                    };
+                    ITy::Ty(ty)
+                } else {
+                    self_ty.cloned().unwrap_or_else(ITy::unknown)
+                }
             } else if let Some(p) = sig.and_then(|s| {
                 let name = &self.binding(param).name;
                 s.params.iter().find(|p| &p.name == name)

@@ -2,7 +2,9 @@
 -- make it a `geometry.Shape` *structurally* — there is no binding tag and no
 -- conformance declaration. The constructor's `---@return geometry.Circle` is
 -- where the instance literal is checked against the type (try removing
--- `radius` from the literal to see the error), and the test suite asserts
+-- `radius` from the literal to see the error); it also ties the carrier to
+-- the instance type, so `self` in the methods below types as `geometry.Circle`
+-- and `self.radius` resolves as its declared `number`. The test suite asserts
 -- Shape conformance positionally with a plain `---@type geometry.Shape`.
 local Circle = {}
 Circle.__index = Circle
