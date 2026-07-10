@@ -27,15 +27,18 @@
 //! - **Semantic tokens** — full-document, standard-types-only legend, for
 //!   both `.lua` (HIR-resolved locals vs globals, LuaCATS doc comments) and
 //!   `.luab` (see [`semantic_tokens`]).
+//! - **Inlay hints** — the rich table inference's binding types rendered
+//!   after unannotated declarations (see [`inlay_hints`]).
 //!
-//! The remaining SPEC §8 surface (find-refs, rename, inlay hints, code
-//! actions, signature help, call hierarchy, TCP transport) is P4 polish.
+//! The remaining SPEC §8 surface (find-refs, rename, code actions,
+//! signature help, call hierarchy, TCP transport) is P4 polish.
 
 mod completion;
 mod diagnostics;
 mod fmt;
 mod goto_def;
 mod hover;
+mod inlay_hints;
 mod line_index;
 mod luab;
 mod sema;

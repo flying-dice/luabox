@@ -34,6 +34,7 @@ pub mod ty;
 pub use assign::assignable;
 pub use defs::{Ambient, combined as combined_defs, stdlib as stdlib_defs};
 pub use env::TypeEnv;
+pub use infer::{ExternalTypes, InferredBinding, InferredReturn};
 pub use shape::{DepShapeExport, ShapeOptions, ShapeStore};
 
 use luabox_diag::Diagnostic;
@@ -67,6 +68,60 @@ impl Strictness {
         } else {
             Strictness::Warn
         }
+    }
+}
+
+/// The display-inference surface behind editor inlay hints: every named
+/// binding's final inferred type, every unannotated function's inferred
+/// return types, and the cross-file exchange surface (the module's export
+/// type + observed outgoing call arguments).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DisplayTypes {
+    /// Every binding's reified type at its declaration range.
+    pub bindings: Vec<InferredBinding>,
+    /// Inferred returns per unannotated function, keyed by source range.
+    pub returns: Vec<InferredReturn>,
+    /// The inferred type of the chunk's `return` value — what a dependent
+    /// file's `require` of this module evaluates to.
+    pub module_export: Option<ty::Ty>,
+    /// Argument types observed at calls of functions this file does not
+    /// define, keyed by terminal callee name — parameter seeds for the
+    /// files this one requires.
+    pub outgoing_calls: std::collections::HashMap<String, Vec<ty::Ty>>,
+}
+
+/// Run the rich table inference in *display mode* over one parsed file —
+/// the editor inlay-hint surface.
+///
+/// Same inference as [`check_file`] (annotations stay authoritative;
+/// `ambient` merges definition-package globals beneath the file's own
+/// declarations, exactly as in [`check_file_shaped`]) with two additions:
+///
+/// - **Call-site parameter seeding** — an unannotated parameter takes the
+///   union of the argument types observed at the function's call sites, so
+///   bodies of unannotated functions type through.
+/// - **Cross-file inputs** (`externals`) — `require("mod")` evaluates to
+///   the target module's export type, and exported functions' parameters
+///   seed from dependent files' observed call arguments.
+///
+/// Display-only — the checker never sees seeded types, so no diagnostic
+/// can arise from them.
+#[must_use]
+pub fn infer_display_types(
+    parse: &lua::Parse,
+    file: &str,
+    ambient: Option<&Ambient>,
+    externals: Option<&ExternalTypes>,
+) -> DisplayTypes {
+    let items = luacats::harvest(parse);
+    let env = TypeEnv::build_from_items(parse, &items, None, ambient);
+    let lowered = luabox_hir::lower(parse);
+    let outcome = infer::run(&lowered, &env, file, false, true, externals);
+    DisplayTypes {
+        bindings: outcome.binding_types,
+        returns: outcome.fn_returns,
+        module_export: outcome.module_export,
+        outgoing_calls: outcome.outgoing_calls,
     }
 }
 
@@ -122,7 +177,14 @@ pub fn check_file_shaped(
         // always win), and inference contributes its own diagnostics
         // (LB0306) at the same strictness-mapped severity.
         let lowered = luabox_hir::lower(parse);
-        let inference = infer::run(&lowered, &env, file, strictness == Strictness::Strict);
+        let inference = infer::run(
+            &lowered,
+            &env,
+            file,
+            strictness == Strictness::Strict,
+            false,
+            None,
+        );
         diags.extend(check::run(
             parse,
             &env,

@@ -11,19 +11,19 @@ use lsp_types::notification::{
     Notification as _, PublishDiagnostics,
 };
 use lsp_types::request::{
-    Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, RangeFormatting,
-    Request as _, SemanticTokensFullRequest, Shutdown,
+    Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest,
+    InlayHintRequest, RangeFormatting, Request as _, SemanticTokensFullRequest, Shutdown,
 };
 use lsp_types::{
     CompletionItemKind, CompletionParams, CompletionResponse, DiagnosticSeverity,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DocumentFormattingParams, DocumentRangeFormattingParams, DocumentSymbolParams,
     DocumentSymbolResponse, FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse,
-    HoverContents, HoverParams, InitializeParams, NumberOrString, PartialResultParams, Position,
-    PublishDiagnosticsParams, Range, SemanticToken, SemanticTokensParams, SemanticTokensResult,
-    SymbolKind, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, TextEdit, Uri, VersionedTextDocumentIdentifier,
-    WorkDoneProgressParams, WorkspaceFolder,
+    HoverContents, HoverParams, InitializeParams, InlayHint, InlayHintLabel, InlayHintParams,
+    NumberOrString, PartialResultParams, Position, PublishDiagnosticsParams, Range, SemanticToken,
+    SemanticTokensParams, SemanticTokensResult, SymbolKind, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, TextEdit, Uri,
+    VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceFolder,
 };
 use tempfile::TempDir;
 
@@ -256,6 +256,15 @@ impl TestClient {
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
         })
+    }
+
+    fn inlay_hints(&mut self, uri: &Uri, range: Range) -> Vec<InlayHint> {
+        self.request::<InlayHintRequest>(InlayHintParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        })
+        .unwrap_or_default()
     }
 
     fn semantic_tokens(&mut self, uri: &Uri) -> Vec<SemanticToken> {
@@ -1042,6 +1051,276 @@ fn lb_semantic_tokens_survive_parse_errors() {
 }
 
 // === Project bootstrap ===================================================
+
+// === Inlay hints =========================================================
+
+/// The plain string label of a hint.
+fn hint_label(hint: &InlayHint) -> &str {
+    match &hint.label {
+        InlayHintLabel::String(label) => label,
+        other @ InlayHintLabel::LabelParts(_) => panic!("expected a string label, got {other:?}"),
+    }
+}
+
+/// The hint whose position is exactly `(line, character)`.
+fn hint_at(hints: &[InlayHint], line: u32, character: u32) -> &InlayHint {
+    hints
+        .iter()
+        .find(|h| h.position == Position::new(line, character))
+        .unwrap_or_else(|| panic!("no hint at ({line}, {character}) in {hints:?}"))
+}
+
+#[test]
+fn initialize_advertises_inlay_hints() {
+    let client = start(&[]);
+    assert_eq!(
+        client.init_result["capabilities"]["inlayHintProvider"],
+        true
+    );
+    client.shutdown();
+}
+
+#[test]
+fn inlay_hints_show_inferred_types_for_unannotated_locals() {
+    let source = "\
+local count = 42
+local greeting = \"hi\"
+local flag = true
+for i = 1, 10 do
+  print(i)
+end
+";
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, source);
+    let mut client = client;
+    let hints = client.inlay_hints(&uri, range((0, 0), (6, 0)));
+    assert_eq!(hint_label(hint_at(&hints, 0, 11)), ": integer"); // count
+    assert_eq!(hint_label(hint_at(&hints, 1, 14)), ": string"); // greeting
+    assert_eq!(hint_label(hint_at(&hints, 2, 10)), ": boolean"); // flag
+    assert_eq!(hint_label(hint_at(&hints, 3, 5)), ": integer"); // for i
+    client.shutdown();
+}
+
+#[test]
+fn inlay_hints_show_inferred_table_shapes() {
+    let source = "\
+local point = { x = 1, y = 2 }
+";
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, source);
+    let mut client = client;
+    let hints = client.inlay_hints(&uri, range((0, 0), (1, 0)));
+    assert_eq!(
+        hint_label(hint_at(&hints, 0, 11)),
+        ": { x: integer, y: integer }"
+    );
+    client.shutdown();
+}
+
+#[test]
+fn inlay_hints_render_annotated_types_inline() {
+    let source = "\
+---@param width number
+---@param height number
+---@return number
+local function area(width, height)
+  return width * height
+end
+---@type number
+local n = 1
+";
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, source);
+    let mut client = client;
+    let hints = client.inlay_hints(&uri, range((0, 0), (8, 0)));
+    // The annotations live in the doc block; the signature still hints.
+    assert_eq!(hint_label(hint_at(&hints, 3, 25)), ": number"); // width
+    assert_eq!(hint_label(hint_at(&hints, 3, 33)), ": number"); // height
+    assert_eq!(hint_label(hint_at(&hints, 3, 34)), ": number"); // returns
+    assert_eq!(hint_label(hint_at(&hints, 7, 7)), ": number"); // n
+    client.shutdown();
+}
+
+#[test]
+fn inlay_hints_render_annotated_returns_verbatim() {
+    // `Rect` is not declared in this file (a `.luab` shape or cross-file
+    // class): the return hint must still render the annotation text.
+    let source = "\
+local Rect = {}
+Rect.__index = Rect
+
+---@param width number
+---@param height number
+---@return Rect
+function Rect.new(width, height)
+  return setmetatable({ width = width, height = height }, Rect)
+end
+";
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, source);
+    let mut client = client;
+    let hints = client.inlay_hints(&uri, range((0, 0), (9, 0)));
+    assert_eq!(hint_label(hint_at(&hints, 6, 32)), ": Rect"); // returns
+    assert_eq!(hint_label(hint_at(&hints, 6, 23)), ": number"); // width
+    client.shutdown();
+}
+
+#[test]
+fn inlay_hints_skip_function_names_and_unknowns() {
+    let source = "\
+local function helper()
+  return 1
+end
+local result = helper()
+";
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, source);
+    let mut client = client;
+    let hints = client.inlay_hints(&uri, range((0, 0), (4, 0)));
+    // The function *name* gets no binding hint, but the parameter list
+    // gets a return-type hint...
+    assert!(
+        !hints.iter().any(|h| h.position == Position::new(0, 21)),
+        "local function name must not get a binding hint: {hints:?}"
+    );
+    assert_eq!(hint_label(hint_at(&hints, 0, 23)), ": integer");
+    // ...and the inferred call result flows into the local.
+    assert_eq!(hint_label(hint_at(&hints, 3, 12)), ": integer");
+    client.shutdown();
+}
+
+#[test]
+fn inlay_hints_seed_params_from_call_sites() {
+    let source = "\
+local function area(w, h)
+  local result = w * h
+  return result
+end
+local a = area(3, 4)
+";
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, source);
+    let mut client = client;
+    let hints = client.inlay_hints(&uri, range((0, 0), (5, 0)));
+    assert_eq!(hint_label(hint_at(&hints, 0, 21)), ": integer"); // w
+    assert_eq!(hint_label(hint_at(&hints, 0, 24)), ": integer"); // h
+    assert_eq!(hint_label(hint_at(&hints, 0, 25)), ": integer"); // returns
+    assert_eq!(hint_label(hint_at(&hints, 1, 14)), ": integer"); // result
+    assert_eq!(hint_label(hint_at(&hints, 4, 7)), ": integer"); // a
+    client.shutdown();
+}
+
+#[test]
+fn inlay_hints_type_self_through_the_index_idiom() {
+    let source = "\
+local Circle = {}
+Circle.__index = Circle
+
+function Circle.new(radius)
+  return setmetatable({ radius = radius }, Circle)
+end
+
+function Circle:area()
+  local r = self.radius
+  return r * r
+end
+
+local c = Circle.new(2)
+";
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, source);
+    let mut client = client;
+    let hints = client.inlay_hints(&uri, range((0, 0), (13, 0)));
+    assert_eq!(hint_label(hint_at(&hints, 3, 26)), ": integer"); // radius param
+    assert_eq!(hint_label(hint_at(&hints, 8, 9)), ": integer"); // r = self.radius
+    assert_eq!(hint_label(hint_at(&hints, 7, 22)), ": integer"); // area returns
+    client.shutdown();
+}
+
+#[test]
+fn inlay_hints_show_multi_value_returns() {
+    let source = "\
+local function pair()
+  return 1, \"x\"
+end
+";
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, source);
+    let mut client = client;
+    let hints = client.inlay_hints(&uri, range((0, 0), (3, 0)));
+    assert_eq!(hint_label(hint_at(&hints, 0, 21)), ": integer, string");
+    client.shutdown();
+}
+
+#[test]
+fn inlay_hints_respect_the_requested_range() {
+    let source = "\
+local first = 1
+local second = 2
+";
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, source);
+    let mut client = client;
+    let hints = client.inlay_hints(&uri, range((1, 0), (2, 0)));
+    assert!(
+        hints.iter().all(|h| h.position.line == 1),
+        "only line 1 hints expected: {hints:?}"
+    );
+    client.shutdown();
+}
+
+#[test]
+fn inlay_hints_cross_file_params_and_require_results() {
+    let geometry = "\
+local M = {}
+
+function M.area(w, h)
+  local result = w * h
+  return result
+end
+
+return M
+";
+    let main = "\
+local geo = require(\"geometry\")
+local a = geo.area(3, 4)
+";
+    let client = start(&[("geometry.lua", geometry), ("main.lua", main)]);
+    let geo_uri = client.uri("geometry.lua");
+    let main_uri = client.uri("main.lua");
+    let mut client = client;
+
+    // geometry.lua: params seeded from main.lua's call site.
+    let hints = client.inlay_hints(&geo_uri, range((0, 0), (8, 0)));
+    assert_eq!(hint_label(hint_at(&hints, 2, 17)), ": integer"); // w
+    assert_eq!(hint_label(hint_at(&hints, 2, 20)), ": integer"); // h
+    assert_eq!(hint_label(hint_at(&hints, 2, 21)), ": integer"); // returns
+    assert_eq!(hint_label(hint_at(&hints, 3, 14)), ": integer"); // result
+
+    // main.lua: the require result is the module table, and the call
+    // result types through the exported function's inferred returns.
+    let hints = client.inlay_hints(&main_uri, range((0, 0), (2, 0)));
+    assert!(
+        hint_label(hint_at(&hints, 0, 9)).contains("area: fun("),
+        "{hints:?}"
+    );
+    assert_eq!(hint_label(hint_at(&hints, 1, 7)), ": integer"); // a
+
+    // Editing the dependent invalidates the dependency's hints.
+    client.change(&main_uri, "local geo = require(\"geometry\")\nlocal a = geo.area(\"s\", 4)\n");
+    let hints = client.inlay_hints(&geo_uri, range((0, 0), (8, 0)));
+    assert_eq!(hint_label(hint_at(&hints, 2, 17)), ": string"); // w reseeded
+    client.shutdown();
+}
 
 #[test]
 fn bootstrapped_files_answer_requests_without_open() {

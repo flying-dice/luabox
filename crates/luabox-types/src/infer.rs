@@ -73,14 +73,81 @@ pub(crate) struct Outcome {
     pub(crate) expr_types: HashMap<Key, Ty>,
     /// Inference's own diagnostics (`LB0306`).
     pub(crate) diags: Vec<Diagnostic>,
-    /// Final reified type of every binding (test/debug surface — the
-    /// "bare `table` never appears" acceptance check walks this).
-    #[cfg_attr(not(test), allow(dead_code, reason = "consumed by the test surface"))]
-    pub(crate) binding_types: Vec<(String, Ty)>,
+    /// Final reified type of every binding, in declaration order (the
+    /// [`crate::infer_display_types`] surface behind editor inlay hints;
+    /// the "bare `table` never appears" acceptance check walks it too).
+    pub(crate) binding_types: Vec<InferredBinding>,
+    /// Inferred return types of every unannotated function, keyed by the
+    /// function's source range (the [`crate::infer_display_types`] surface
+    /// behind editor return-type hints).
+    pub(crate) fn_returns: Vec<InferredReturn>,
+    /// The reified type of the chunk's first `return` value — the module's
+    /// export surface, consumed by *other* files' display inference to type
+    /// their `require` results.
+    pub(crate) module_export: Option<Ty>,
+    /// Argument types observed at calls of functions this file does *not*
+    /// define, keyed by the callee's terminal name (`M.area(3, 4)` and
+    /// `obj:area(3, 4)` both record under `area`). Positional unions,
+    /// widened; the cross-file half of call-site parameter seeding.
+    pub(crate) outgoing_calls: HashMap<String, Vec<Ty>>,
+}
+
+/// Cross-file inputs to display-mode inference, assembled by the analysis
+/// layer from the *other* files of the project.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ExternalTypes {
+    /// Module string → the target file's inferred export type
+    /// ([`Outcome::module_export`] of the resolved file): what
+    /// `require("mod")` evaluates to.
+    pub requires: HashMap<String, Ty>,
+    /// Function name → positional argument types observed at call sites in
+    /// dependent files ([`Outcome::outgoing_calls`] of every file that
+    /// requires this one): seeds for this file's exported functions.
+    pub fn_param_seeds: HashMap<String, Vec<Ty>>,
+}
+
+/// One binding's final inferred type: the declaration-site name range plus
+/// the reified type. What editors render as an inlay hint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferredBinding {
+    /// The binding's name.
+    pub name: String,
+    /// What introduced the binding (local / param / for-var ...).
+    pub kind: BindingKind,
+    /// The byte range of the name token at the declaration site.
+    pub range: std::ops::Range<usize>,
+    /// The reified inferred type.
+    pub ty: Ty,
+}
+
+/// The inferred return types of one function without a `---@return`
+/// annotation, keyed by the byte range of the whole function
+/// (declaration statement or `function` expression).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferredReturn {
+    /// The byte range of the function in the source.
+    pub range: std::ops::Range<usize>,
+    /// The reified positional return types (unioned across `return`
+    /// statements, padded with `nil`).
+    pub returns: Vec<Ty>,
 }
 
 /// Run inference over one lowered file.
-pub(crate) fn run(hir: &LoweredFile, env: &TypeEnv, file: &str, strict: bool) -> Outcome {
+///
+/// `seed_params` turns on call-site parameter inference: an unannotated
+/// parameter takes the union of the (widened) argument types observed at
+/// the function's call sites during the first pass. `externals` carries the
+/// cross-file half (require exports + dependent files' call args). Both are
+/// display-only — the checker runs without them, so neither can manufacture
+/// diagnostics.
+pub(crate) fn run(
+    hir: &LoweredFile,
+    env: &TypeEnv,
+    file: &str,
+    strict: bool,
+    seed_params: bool,
+    externals: Option<&ExternalTypes>,
+) -> Outcome {
     let severity = if strict {
         Severity::Error
     } else {
@@ -92,11 +159,15 @@ pub(crate) fn run(hir: &LoweredFile, env: &TypeEnv, file: &str, strict: bool) ->
         file,
         severity,
         pass: 0,
+        seed_params,
+        externals,
         shapes: Vec::new(),
         shape_of_expr: HashMap::new(),
         instances: HashMap::new(),
         declared_carriers: HashMap::new(),
         funcs: HashMap::new(),
+        param_seeds: HashMap::new(),
+        outgoing: HashMap::new(),
         state: HashMap::new(),
         declared: HashSet::new(),
         globals: HashMap::new(),
@@ -113,13 +184,28 @@ pub(crate) fn run(hir: &LoweredFile, env: &TypeEnv, file: &str, strict: bool) ->
     for (id, binding) in hir.bindings() {
         if let Some(ity) = infer.state.get(&id).cloned() {
             let ty = infer.reify(&ity);
-            binding_types.push((binding.name.clone(), ty));
+            binding_types.push(InferredBinding {
+                name: binding.name.clone(),
+                kind: binding.kind,
+                range: usize::from(binding.range.start())..usize::from(binding.range.end()),
+                ty,
+            });
         }
     }
+    let fn_returns = infer.collect_fn_returns();
+    let module_export = infer
+        .funcs
+        .get(&hir.chunk())
+        .filter(|data| data.returns_set)
+        .and_then(|data| data.returns.first().cloned())
+        .map(|ity| infer.reify(&ity));
     Outcome {
         expr_types: infer.expr_types,
         diags: infer.diags,
         binding_types,
+        fn_returns,
+        module_export,
+        outgoing_calls: infer.outgoing,
     }
 }
 
@@ -277,6 +363,12 @@ struct Infer<'a> {
     severity: Severity,
     /// 0 = build shapes, 1 = emit diagnostics + publish types.
     pass: u8,
+    /// Seed unannotated parameters from call-site argument types
+    /// (display-only inference; see [`run`]).
+    seed_params: bool,
+    /// Cross-file inputs (require exports + dependents' call args), when
+    /// the analysis layer supplied them. Display-only.
+    externals: Option<&'a ExternalTypes>,
     shapes: Vec<ShapeData>,
     /// Constructor site → shape, so pass 2 reuses pass 1's identities.
     shape_of_expr: HashMap<(BodyId, ExprId), usize>,
@@ -287,8 +379,16 @@ struct Infer<'a> {
     /// methods and inferred extensions through the carrier (#73).
     declared_carriers: HashMap<String, usize>,
     funcs: HashMap<BodyId, FuncData>,
+    /// Running union of argument types observed at call sites, per
+    /// parameter binding. Persists across passes: pass 0 collects, pass 1
+    /// walks bodies with the seeds applied (the bounded fixpoint's one
+    /// extra step). Only read when [`Self::seed_params`] is on.
+    param_seeds: HashMap<BindingId, ITy>,
     /// Flow state: binding → current inferred type (flat across bodies).
     state: HashMap<BindingId, ITy>,
+    /// Argument types observed at calls of functions not defined in this
+    /// file, keyed by terminal callee name (see [`Outcome::outgoing_calls`]).
+    outgoing: HashMap<String, Vec<Ty>>,
     /// Bindings with an authoritative annotated type (never overwritten).
     declared: HashSet<BindingId>,
     globals: HashMap<String, ITy>,
@@ -481,7 +581,10 @@ impl Infer<'_> {
             varargs,
             returns,
             returns_vararg: false,
-            has_return_annotation: false,
+            // In display mode the inferred returns are the signature: a
+            // dependent file calling this exported function gets them. The
+            // checker (seed_params off) keeps the conservative `false`.
+            has_return_annotation: returns_set && self.seed_params,
             overloads: Vec::new(),
         }
     }
@@ -825,6 +928,13 @@ impl Infer<'_> {
                     p.ty.clone()
                 };
                 ITy::Ty(ty)
+            } else if self.seed_params {
+                // Call-site inference: the union of argument types the
+                // previous pass observed for this parameter.
+                self.param_seeds
+                    .get(&param)
+                    .cloned()
+                    .unwrap_or_else(ITy::unknown)
             } else {
                 ITy::unknown()
             };
@@ -864,6 +974,17 @@ impl Infer<'_> {
                         self.state
                             .insert(binding, ITy::Ty(Ty::Function(Box::new(sig.clone()))));
                         self.declared.insert(binding);
+                    }
+                    // Cross-file seeding by name (covers locals re-exported
+                    // via `return { f = f }`).
+                    if let Some(externals) = self.externals
+                        && let Some(seeds) = externals
+                            .fn_param_seeds
+                            .get(&self.binding(binding).name)
+                            .cloned()
+                    {
+                        let itys: Vec<ITy> = seeds.into_iter().map(ITy::Ty).collect();
+                        self.record_arg_seeds(fn_body, &itys, false);
                     }
                     self.walk_body(fn_body, sig.as_ref(), None);
                     if sig.is_none() {
@@ -1027,6 +1148,19 @@ impl Infer<'_> {
                 }
                 _ => None,
             };
+            // Cross-file seeding: dependent files' observed call args for
+            // this function's name, merged before the body walks.
+            if let Some(externals) = self.externals {
+                let exported_name = match &resolved {
+                    Target::Field { name, .. } | Target::Global(name) => Some(name.as_str()),
+                    _ => None,
+                };
+                if let Some(seeds) = exported_name.and_then(|n| externals.fn_param_seeds.get(n))
+                {
+                    let itys: Vec<ITy> = seeds.iter().cloned().map(ITy::Ty).collect();
+                    self.record_arg_seeds(fn_body, &itys, takes_self);
+                }
+            }
             self.walk_body(fn_body, sig.as_ref(), self_ty.as_ref());
             let ity = match sig {
                 Some(sig) => ITy::Ty(Ty::Function(Box::new(sig))),
@@ -1802,6 +1936,25 @@ impl Infer<'_> {
             let name = name.clone();
             match name.as_str() {
                 "setmetatable" => return (vec![self.eval_setmetatable(body, &args)], false),
+                "require" => {
+                    for &arg in &args {
+                        self.eval(body, arg);
+                    }
+                    // Display mode with cross-file inputs: a static
+                    // `require("mod")` evaluates to the target module's
+                    // inferred export type.
+                    if let (Some(externals), Some(key)) =
+                        (self.externals, self.expr_range(body, expr))
+                        && let Some(edge) = self.hir.requires().iter().find(|edge| {
+                            (usize::from(edge.range.start()), usize::from(edge.range.end()))
+                                == key
+                        })
+                        && let Some(ty) = externals.requires.get(&edge.module)
+                    {
+                        return (vec![ITy::Ty(ty.clone())], false);
+                    }
+                    return (vec![ITy::unknown()], true);
+                }
                 "pairs" | "ipairs" | "next" | "rawget" | "rawequal" | "rawlen" | "tostring"
                 | "tonumber" | "select" | "unpack" => {
                     // Read-only stdlib: arguments do not escape, but the
@@ -1838,11 +1991,132 @@ impl Infer<'_> {
         }
 
         let callee_ity = self.eval(body, callee);
+        let mut arg_itys: Vec<ITy> = Vec::with_capacity(args.len());
         for &arg in &args {
             let ity = self.eval(body, arg);
             self.mark_escaped(&ity);
+            arg_itys.push(ity);
+        }
+        match &callee_ity {
+            ITy::Func(fn_body) => self.record_arg_seeds(*fn_body, &arg_itys, false),
+            // Not a function this file defines: record the args by callee
+            // name for dependents-side parameter seeding (`M.f(...)`).
+            _ => {
+                if let Some(name) = self.callee_name(body, callee) {
+                    self.record_outgoing(&name, &arg_itys);
+                }
+            }
         }
         self.returns_of(&callee_ity)
+    }
+
+    /// The terminal name of a callee expression: `f` for a plain name,
+    /// `f` for `M.f` / `M["f"]` (any base). `None` for computed callees.
+    fn callee_name(&self, body: BodyId, callee: ExprId) -> Option<String> {
+        match self.body(body).expr(callee) {
+            Expr::Name(name) => Some(name.clone()),
+            Expr::Index { index, .. } => match self.body(body).expr(*index) {
+                Expr::Literal(Literal::String(s)) => s.as_str().map(str::to_string),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Record one observed call of a function this file does not define:
+    /// positional argument types, widened and unioned across call sites.
+    /// Second pass only (its types are the refined ones).
+    fn record_outgoing(&mut self, name: &str, args: &[ITy]) {
+        if self.pass != 1 || args.is_empty() {
+            return;
+        }
+        let tys: Vec<Ty> = args.iter().map(|a| self.reify(a).widened()).collect();
+        let entry = self.outgoing.entry(name.to_string()).or_default();
+        for (i, ty) in tys.into_iter().enumerate() {
+            if matches!(ty, Ty::Unknown) {
+                continue;
+            }
+            while entry.len() <= i {
+                entry.push(Ty::Unknown);
+            }
+            entry[i] = if matches!(entry[i], Ty::Unknown) {
+                ty
+            } else {
+                Ty::union(vec![entry[i].clone(), ty])
+            };
+        }
+    }
+
+    /// Record call-site argument types against a file-local function's
+    /// parameter bindings (positional; `skip_self` shifts past the implicit
+    /// `self` of a `:` call). Fixed types are widened — a parameter is a
+    /// general slot, not the one literal a caller happened to pass.
+    fn record_arg_seeds(&mut self, fn_body: BodyId, args: &[ITy], skip_self: bool) {
+        let params = self.body(fn_body).params.clone();
+        let params = if skip_self
+            && params
+                .first()
+                .is_some_and(|&p| self.binding(p).kind == BindingKind::SelfParam)
+        {
+            &params[1..]
+        } else {
+            &params[..]
+        };
+        for (&param, arg) in params.iter().zip(args) {
+            if arg.is_unknown() {
+                continue;
+            }
+            let seed = match arg {
+                ITy::Ty(ty) => ITy::Ty(ty.widened()),
+                other => other.clone(),
+            };
+            let merged = match self.param_seeds.get(&param) {
+                Some(existing) => ity_union(vec![existing.clone(), seed]),
+                None => seed,
+            };
+            self.param_seeds.insert(param, merged);
+        }
+    }
+
+    /// The inferred returns of every function *without* a `---@return`,
+    /// keyed by the function's source range (the display surface behind
+    /// editor return-type hints). Annotated functions are the editor's
+    /// job: it renders the annotation text verbatim, which survives type
+    /// names the per-file environment cannot resolve (`.luab` shapes,
+    /// cross-file classes).
+    fn collect_fn_returns(&mut self) -> Vec<InferredReturn> {
+        let mut out = Vec::new();
+        for (body_id, body) in self.hir.bodies() {
+            for (expr_id, expr) in body.exprs() {
+                let Expr::Function(fn_body) = expr else {
+                    continue;
+                };
+                let Some(range) = self.hir.source_map().range(HirId::expr(body_id, expr_id))
+                else {
+                    continue;
+                };
+                let Some(data) = self.funcs.get(fn_body) else {
+                    continue;
+                };
+                if data.sig.as_ref().is_some_and(|s| s.has_return_annotation)
+                    || !data.returns_set
+                    || data.returns.is_empty()
+                {
+                    continue;
+                }
+                let itys = data.returns.clone();
+                let returns: Vec<Ty> = itys.iter().map(|ity| self.reify(ity)).collect();
+                if returns.iter().all(|ty| matches!(ty, Ty::Unknown)) {
+                    continue;
+                }
+                out.push(InferredReturn {
+                    range: usize::from(range.start())..usize::from(range.end()),
+                    returns,
+                });
+            }
+        }
+        out.sort_by_key(|r| (r.range.start, r.range.end));
+        out
     }
 
     /// `setmetatable(t, M)`: merge `t`'s shape into the shared instance
@@ -1916,19 +2190,31 @@ impl Infer<'_> {
             return (Vec::new(), true);
         };
         let recv = self.eval(body, receiver);
+        let mut arg_itys: Vec<ITy> = Vec::with_capacity(args.len());
         for &arg in &args {
             let ity = self.eval(body, arg);
             self.mark_escaped(&ity);
+            arg_itys.push(ity);
         }
         match self.lookup_field(&recv, &method) {
-            Lookup::Found(f) => self.returns_of(&f),
+            Lookup::Found(f) => {
+                match &f {
+                    ITy::Func(fn_body) => self.record_arg_seeds(*fn_body, &arg_itys, true),
+                    _ => self.record_outgoing(&method, &arg_itys),
+                }
+                self.returns_of(&f)
+            }
             Lookup::Absent { provable } => {
                 if provable {
                     self.report_absent(body, expr, &method);
                 }
+                self.record_outgoing(&method, &arg_itys);
                 (vec![ITy::unknown()], true)
             }
-            Lookup::Opaque => (vec![ITy::unknown()], true),
+            Lookup::Opaque => {
+                self.record_outgoing(&method, &arg_itys);
+                (vec![ITy::unknown()], true)
+            }
         }
     }
 
@@ -2281,15 +2567,30 @@ mod tests {
         assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
         let env = TypeEnv::build(&parsed);
         let lowered = luabox_hir::lower(&parsed);
-        run(&lowered, &env, "test.lua", true)
+        run(&lowered, &env, "test.lua", true, false, None)
+    }
+
+    /// Like [`outcome`], with call-site parameter seeding on (the
+    /// display-mode inference behind inlay hints).
+    fn display_outcome(source: &str) -> Outcome {
+        display_outcome_ext(source, None)
+    }
+
+    /// Display-mode inference with cross-file inputs.
+    fn display_outcome_ext(source: &str, externals: Option<&ExternalTypes>) -> Outcome {
+        let parsed = parse(source, Dialect::Lua54);
+        assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
+        let env = TypeEnv::build(&parsed);
+        let lowered = luabox_hir::lower(&parsed);
+        run(&lowered, &env, "test.lua", true, true, externals)
     }
 
     fn binding_ty(outcome: &Outcome, name: &str) -> Ty {
         outcome
             .binding_types
             .iter()
-            .find(|(n, _)| n == name)
-            .map_or_else(|| panic!("no binding named `{name}`"), |(_, ty)| ty.clone())
+            .find(|b| b.name == name)
+            .map_or_else(|| panic!("no binding named `{name}`"), |b| b.ty.clone())
     }
 
     fn codes(source: &str, strictness: Strictness) -> Vec<String> {
@@ -2891,8 +3192,236 @@ end
             );
         }
         // And no binding of any kind reifies to the opaque catch-all.
-        for (name, ty) in &out.binding_types {
-            assert_ne!(ty.to_string(), "table", "binding `{name}` is bare table");
+        for b in &out.binding_types {
+            assert_ne!(b.ty.to_string(), "table", "binding `{}` is bare table", b.name);
         }
+    }
+
+    // --- display mode: call-site parameter seeding + return surface -------
+
+    #[test]
+    fn display_mode_seeds_params_from_call_sites() {
+        let src = "\
+local function area(w, h)
+  local result = w * h
+  return result
+end
+local a = area(3, 4)
+";
+        let out = display_outcome(src);
+        assert_eq!(binding_ty(&out, "w").to_string(), "integer");
+        assert_eq!(binding_ty(&out, "h").to_string(), "integer");
+        assert_eq!(binding_ty(&out, "result").to_string(), "integer");
+        assert_eq!(binding_ty(&out, "a").to_string(), "integer");
+    }
+
+    #[test]
+    fn display_mode_unions_multiple_call_sites() {
+        let src = "\
+local function id(x)
+  return x
+end
+id(1)
+id(\"s\")
+";
+        let out = display_outcome(src);
+        assert_eq!(binding_ty(&out, "x").to_string(), "integer|string");
+    }
+
+    #[test]
+    fn display_mode_seeds_method_args_past_self() {
+        let src = "\
+local Greeter = {}
+Greeter.__index = Greeter
+
+function Greeter:greet(name)
+  return name
+end
+
+local g = setmetatable({}, Greeter)
+g:greet(\"world\")
+";
+        let out = display_outcome(src);
+        assert_eq!(binding_ty(&out, "name").to_string(), "string");
+    }
+
+    #[test]
+    fn display_mode_flows_constructor_args_into_self_fields() {
+        let src = "\
+local Circle = {}
+Circle.__index = Circle
+
+function Circle.new(radius)
+  return setmetatable({ radius = radius }, Circle)
+end
+
+function Circle:area()
+  local r = self.radius
+  return r * r
+end
+
+local c = Circle.new(2)
+";
+        let out = display_outcome(src);
+        assert_eq!(binding_ty(&out, "radius").to_string(), "integer");
+        assert_eq!(binding_ty(&out, "r").to_string(), "integer");
+    }
+
+    #[test]
+    fn display_mode_publishes_function_returns() {
+        let src = "\
+local function pair()
+  return 1, \"x\"
+end
+";
+        let out = display_outcome(src);
+        assert_eq!(out.fn_returns.len(), 1, "{:?}", out.fn_returns);
+        let rendered: Vec<String> = out.fn_returns[0]
+            .returns
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(rendered, vec!["1", "\"x\""]);
+        // The range covers the function in the source.
+        assert_eq!(
+            &src[out.fn_returns[0].range.clone()].lines().next(),
+            &Some("local function pair()")
+        );
+    }
+
+    #[test]
+    fn display_mode_leaves_annotated_returns_to_the_editor() {
+        // The editor renders `---@return` annotations verbatim (their type
+        // names may not resolve in the per-file env); inference publishes
+        // returns only for unannotated functions.
+        let src = "\
+---@return integer
+local function one()
+  return 1
+end
+";
+        let out = display_outcome(src);
+        assert!(out.fn_returns.is_empty(), "{:?}", out.fn_returns);
+    }
+
+    // --- display mode: cross-file (externals) ------------------------------
+
+    #[test]
+    fn module_export_is_the_chunk_return_type() {
+        let src = "\
+local M = {}
+
+function M.area(w, h)
+  return w * h
+end
+
+return M
+";
+        let out = display_outcome(src);
+        let export = out.module_export.expect("module export");
+        let rendered = export.to_string();
+        assert!(
+            rendered.contains("area: fun(w"),
+            "export should carry the function: {rendered}"
+        );
+    }
+
+    #[test]
+    fn external_seeds_type_exported_function_params() {
+        let src = "\
+local M = {}
+
+function M.area(w, h)
+  local result = w * h
+  return result
+end
+
+return M
+";
+        let mut externals = ExternalTypes::default();
+        externals
+            .fn_param_seeds
+            .insert("area".to_string(), vec![Ty::Integer, Ty::Number]);
+        let out = display_outcome_ext(src, Some(&externals));
+        assert_eq!(binding_ty(&out, "w").to_string(), "integer");
+        assert_eq!(binding_ty(&out, "h").to_string(), "number");
+        assert_eq!(binding_ty(&out, "result").to_string(), "number");
+    }
+
+    #[test]
+    fn external_seeds_reach_local_functions_by_name() {
+        let src = "\
+local function helper(x)
+  return x
+end
+return { helper = helper }
+";
+        let mut externals = ExternalTypes::default();
+        externals
+            .fn_param_seeds
+            .insert("helper".to_string(), vec![Ty::String]);
+        let out = display_outcome_ext(src, Some(&externals));
+        assert_eq!(binding_ty(&out, "x").to_string(), "string");
+    }
+
+    #[test]
+    fn require_evaluates_to_the_external_export() {
+        let src = "\
+local M = require(\"geometry\")
+local a = M.area(3, 4)
+M.area(3.5, 2)
+";
+        // The export of \"geometry\": a table with an `area` function whose
+        // inferred returns are published (display mode).
+        let export = Ty::Table(Box::new(crate::ty::TableTy {
+            fields: [(
+                "area".to_string(),
+                FieldTy {
+                    ty: Ty::Function(Box::new(FunctionTy {
+                        params: vec![
+                            ParamTy {
+                                name: "w".to_string(),
+                                ty: Ty::Number,
+                                optional: false,
+                            },
+                            ParamTy {
+                                name: "h".to_string(),
+                                ty: Ty::Number,
+                                optional: false,
+                            },
+                        ],
+                        returns: vec![Ty::Number],
+                        has_return_annotation: true,
+                        ..FunctionTy::default()
+                    })),
+                    optional: false,
+                },
+            )]
+            .into(),
+            ..crate::ty::TableTy::default()
+        }));
+        let mut externals = ExternalTypes::default();
+        externals.requires.insert("geometry".to_string(), export);
+        let out = display_outcome_ext(src, Some(&externals));
+        // `M` is the module table, and the call result types through.
+        assert!(binding_ty(&out, "M").to_string().contains("area: fun("));
+        assert_eq!(binding_ty(&out, "a").to_string(), "number");
+        // And the calls were recorded as outgoing args for the dependency.
+        let seeds = out.outgoing_calls.get("area").expect("outgoing");
+        assert_eq!(seeds[0].to_string(), "integer|number");
+        assert_eq!(seeds[1].to_string(), "integer");
+    }
+
+    #[test]
+    fn check_mode_never_seeds_params() {
+        let src = "\
+local function area(w, h)
+  return w * h
+end
+local a = area(3, 4)
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "w").to_string(), "unknown");
+        assert_eq!(binding_ty(&out, "h").to_string(), "unknown");
     }
 }

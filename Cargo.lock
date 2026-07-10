@@ -921,6 +921,7 @@ dependencies = [
  "luabox-hir",
  "luabox-resolve",
  "luabox-syntax",
+ "luabox-types",
  "rowan",
  "serde",
  "serde_json",

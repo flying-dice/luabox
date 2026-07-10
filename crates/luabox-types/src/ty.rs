@@ -187,6 +187,66 @@ impl Ty {
             _ => false,
         }
     }
+
+    /// Widen literal types to their primitives (`42` → `integer`, `1.5` →
+    /// `number`, `"hi"` → `string`, `true` → `boolean`), recursively through
+    /// unions, tables, and function signatures. Display-oriented: a binding
+    /// initialised from a literal reads as its general type (`1|2` collapses
+    /// to `integer`); checking always uses the precise types.
+    #[must_use]
+    pub fn widened(&self) -> Ty {
+        match self {
+            Ty::BoolLit(_) => Ty::Boolean,
+            Ty::NumberLit(text) => {
+                if crate::assign::is_integral_literal(text) {
+                    Ty::Integer
+                } else {
+                    Ty::Number
+                }
+            }
+            Ty::StringLit(_) => Ty::String,
+            Ty::Union(members) => Ty::union(members.iter().map(Ty::widened).collect()),
+            Ty::Table(table) => Ty::Table(Box::new(TableTy {
+                fields: table
+                    .fields
+                    .iter()
+                    .map(|(name, field)| {
+                        (
+                            name.clone(),
+                            FieldTy {
+                                ty: field.ty.widened(),
+                                optional: field.optional,
+                            },
+                        )
+                    })
+                    .collect(),
+                indexers: table
+                    .indexers
+                    .iter()
+                    .map(|(k, v)| (k.widened(), v.widened()))
+                    .collect(),
+                array: table.array.as_ref().map(Ty::widened),
+                sealed: table.sealed,
+            })),
+            Ty::Function(func) => Ty::Function(Box::new(FunctionTy {
+                params: func
+                    .params
+                    .iter()
+                    .map(|p| ParamTy {
+                        name: p.name.clone(),
+                        ty: p.ty.widened(),
+                        optional: p.optional,
+                    })
+                    .collect(),
+                varargs: func.varargs.as_ref().map(Ty::widened),
+                returns: func.returns.iter().map(Ty::widened).collect(),
+                returns_vararg: func.returns_vararg,
+                has_return_annotation: func.has_return_annotation,
+                overloads: func.overloads.clone(),
+            })),
+            other => other.clone(),
+        }
+    }
 }
 
 impl fmt::Display for Ty {

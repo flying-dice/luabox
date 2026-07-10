@@ -14,11 +14,18 @@
 //! (via [`Db::push_log`]) so tests can prove which queries re-ran after an
 //! edit.
 
-use luabox_types::{TypeEnv, check_file};
+use std::collections::HashMap;
+use std::path::Path;
+
+use luabox_types::ty::Ty;
+use luabox_types::{ExternalTypes, TypeEnv, check_file, infer_display_types, stdlib_defs};
 
 use crate::db::Db;
 use crate::input::{Project, SourceFile};
-use crate::value::{Annotations, Diagnostics, LoweredHandle, ParsedModule, TypeEnvHandle};
+use crate::value::{
+    Annotations, BindingTypes, Diagnostics, LoweredHandle, ModuleExport, OutgoingCalls,
+    ParsedModule, TypeEnvHandle,
+};
 
 /// Parse a file into a lossless syntax tree.
 ///
@@ -64,6 +71,159 @@ pub fn lower(db: &dyn Db, file: SourceFile) -> LoweredHandle {
     db.push_log(format!("lower({})", display(db, file)));
     let parsed = parse(db, file);
     LoweredHandle::new(luabox_hir::lower(parsed.parse()))
+}
+
+/// The outgoing-call arguments of one file: what it passes, by callee
+/// name, to functions it does not define — the parameter seeds it
+/// contributes to the files it requires. Computed *standalone* (no
+/// cross-file inputs; depends only on this file's parse), which is what
+/// keeps the cross-file query graph acyclic under require cycles.
+#[salsa::tracked]
+pub fn outgoing_calls(db: &dyn Db, file: SourceFile) -> OutgoingCalls {
+    db.push_log(format!("outgoing_calls({})", display(db, file)));
+    let parsed = parse(db, file);
+    let name = display(db, file);
+    let ambient = stdlib_defs(file.dialect(db));
+    OutgoingCalls::new(infer_display_types(parsed.parse(), &name, Some(ambient), None).outgoing_calls)
+}
+
+/// The inferred module export of one file (the chunk's `return` value),
+/// with its exported functions' parameters seeded from dependent files'
+/// observed call arguments — so exported signatures carry real parameter
+/// *and* return types. The file's own requires are not followed (their
+/// exports would recurse); acyclic because [`outgoing_calls`] is
+/// standalone.
+#[salsa::tracked]
+pub fn module_export(db: &dyn Db, file: SourceFile, project: Project) -> ModuleExport {
+    db.push_log(format!("module_export({})", display(db, file)));
+    let parsed = parse(db, file);
+    let name = display(db, file);
+    let ambient = stdlib_defs(file.dialect(db));
+    let externals = ExternalTypes {
+        requires: HashMap::new(),
+        fn_param_seeds: dependent_seeds(db, file, project),
+    };
+    ModuleExport::new(
+        infer_display_types(parsed.parse(), &name, Some(ambient), Some(&externals)).module_export,
+    )
+}
+
+/// The display-mode inference for one file — the LSP inlay-hint surface:
+/// binding types and inferred function returns, with call-site parameter
+/// seeding, the file's require exports in scope, and exported functions'
+/// parameters seeded from every dependent file's observed call arguments.
+/// The stdlib definition layer for the file's dialect is merged beneath
+/// the file's own annotations.
+#[salsa::tracked]
+pub fn binding_types(db: &dyn Db, file: SourceFile, project: Project) -> BindingTypes {
+    db.push_log(format!("binding_types({})", display(db, file)));
+    let parsed = parse(db, file);
+    let name = display(db, file);
+    let ambient = stdlib_defs(file.dialect(db));
+    let externals = ExternalTypes {
+        requires: require_exports(db, file, project),
+        fn_param_seeds: dependent_seeds(db, file, project),
+    };
+    BindingTypes::new(infer_display_types(
+        parsed.parse(),
+        &name,
+        Some(ambient),
+        Some(&externals),
+    ))
+}
+
+/// Module string → export type, for every static `require` in `file` that
+/// resolves to a project file.
+fn require_exports(db: &dyn Db, file: SourceFile, project: Project) -> HashMap<String, Ty> {
+    let mut map = HashMap::new();
+    for edge in lower(db, file).file().requires() {
+        if let Some(target) = resolve_require(db, project, &edge.module)
+            && target != file
+            && let Some(ty) = module_export(db, target, project).ty()
+        {
+            map.insert(edge.module.clone(), ty.clone());
+        }
+    }
+    map
+}
+
+/// Parameter seeds for `file`'s exported functions: the positional
+/// argument-type unions observed in every project file that requires it.
+fn dependent_seeds(db: &dyn Db, file: SourceFile, project: Project) -> HashMap<String, Vec<Ty>> {
+    let mut seeds: HashMap<String, Vec<Ty>> = HashMap::new();
+    for &other in project.files(db) {
+        if other == file {
+            continue;
+        }
+        let requires_me = lower(db, other)
+            .file()
+            .requires()
+            .iter()
+            .any(|edge| resolve_require(db, project, &edge.module) == Some(file));
+        if !requires_me {
+            continue;
+        }
+        for (name, tys) in outgoing_calls(db, other).calls() {
+            let entry = seeds.entry(name.clone()).or_default();
+            for (i, ty) in tys.iter().enumerate() {
+                if matches!(ty, Ty::Unknown) {
+                    continue;
+                }
+                while entry.len() <= i {
+                    entry.push(Ty::Unknown);
+                }
+                entry[i] = if matches!(entry[i], Ty::Unknown) {
+                    ty.clone()
+                } else {
+                    Ty::union(vec![entry[i].clone(), ty.clone()])
+                };
+            }
+        }
+    }
+    seeds
+}
+
+/// Resolve a `require` module string to a project file by path suffix:
+/// `"a.b"` matches `**/a/b.lua` or `**/a/b/init.lua`.
+fn resolve_require(db: &dyn Db, project: Project, module: &str) -> Option<SourceFile> {
+    let segments: Vec<&str> = module.split('.').collect();
+    if segments.is_empty() || segments.iter().any(|s| s.is_empty()) {
+        return None;
+    }
+    project
+        .files(db)
+        .iter()
+        .find(|&&file| path_matches(file.path(db), &segments))
+        .copied()
+}
+
+/// Whether `path`'s trailing components spell the module `segments` (as
+/// `a/b.lua` or `a/b/init.lua`).
+fn path_matches(path: &Path, segments: &[&str]) -> bool {
+    let comps: Vec<String> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let direct: Vec<String> = segments
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            if i == segments.len() - 1 {
+                format!("{s}.lua")
+            } else {
+                (*s).to_string()
+            }
+        })
+        .collect();
+    if comps.len() >= direct.len() && comps[comps.len() - direct.len()..] == direct[..] {
+        return true;
+    }
+    let init: Vec<String> = segments
+        .iter()
+        .map(|s| (*s).to_string())
+        .chain(std::iter::once("init.lua".to_string()))
+        .collect();
+    comps.len() >= init.len() && comps[comps.len() - init.len()..] == init[..]
 }
 
 /// Typecheck a file against its own annotations at the project strictness.

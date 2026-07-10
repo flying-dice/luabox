@@ -50,8 +50,14 @@ mod vfs;
 pub use db::{Db, RootDatabase};
 pub use host::{Analysis, AnalysisHost, Change};
 pub use input::{Project, SourceFile};
-pub use query::{annotations, diagnostics, lower, parse, project_diagnostics, type_env};
-pub use value::{Annotations, Diagnostics, LoweredHandle, ParsedModule, TypeEnvHandle};
+pub use query::{
+    annotations, binding_types, diagnostics, lower, module_export, outgoing_calls, parse,
+    project_diagnostics, type_env,
+};
+pub use value::{
+    Annotations, BindingTypes, Diagnostics, LoweredHandle, ModuleExport, OutgoingCalls,
+    ParsedModule, TypeEnvHandle,
+};
 pub use vfs::{FileId, Vfs};
 
 // Re-export the upstream vocabulary consumers configure the host with, so a

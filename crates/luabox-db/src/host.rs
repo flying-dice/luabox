@@ -22,7 +22,7 @@ use salsa::Setter;
 use crate::db::RootDatabase;
 use crate::input::{Project, SourceFile};
 use crate::query;
-use crate::value::{Annotations, LoweredHandle, ParsedModule, TypeEnvHandle};
+use crate::value::{Annotations, BindingTypes, LoweredHandle, ParsedModule, TypeEnvHandle};
 use crate::vfs::{FileId, Vfs};
 
 /// One atomic edit to apply to the world. Batch several with
@@ -234,6 +234,14 @@ impl Analysis {
     pub fn lower(&self, path: &Path) -> Option<LoweredHandle> {
         let file = *self.files.get(path)?;
         Some(query::lower(&self.db, file))
+    }
+
+    /// The display-mode inference for `path` — the inlay-hint surface
+    /// (binding types + inferred returns, cross-file aware).
+    #[must_use]
+    pub fn binding_types(&self, path: &Path) -> Option<BindingTypes> {
+        let file = *self.files.get(path)?;
+        Some(query::binding_types(&self.db, file, self.project))
     }
 
     /// The current effective text of `path` (overlay when set, disk

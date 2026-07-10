@@ -4,14 +4,28 @@
 //! Mirrors `luabox check`'s three passes over one memoized parse, converted
 //! to LSP ranges through the file's [`LineIndex`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
 use luabox_db::Analysis;
 use luabox_syntax::lua::{Dialect, validate};
 use luabox_syntax::shape;
+use luabox_types::{
+    DepShapeExport, ShapeOptions, ShapeStore, Strictness, check_file_shaped, stdlib_defs,
+};
 
 use crate::line_index::LineIndex;
+
+/// The project's shape-resolution context, mirroring what `luabox check`
+/// passes to [`check_file_shaped`] (SHAPES.md §6): the shared parse-cache
+/// store plus the manifest's `[types] shape-paths` and shape-exporting
+/// dependencies. Owned by the server; rebuilt when a `.luab` file changes.
+pub struct ShapeCtx<'a> {
+    pub store: &'a ShapeStore,
+    pub shape_paths: &'a [PathBuf],
+    pub dependencies: &'a [DepShapeExport],
+    pub strictness: Strictness,
+}
 
 /// Diagnostics for one `.lua` file known to `analysis`, plus the line index
 /// used to convert them. `None` when the file is unknown.
@@ -20,6 +34,7 @@ pub fn lua_diagnostics(
     analysis: &Analysis,
     path: &Path,
     dialect: Dialect,
+    shapes: &ShapeCtx<'_>,
 ) -> Option<Vec<Diagnostic>> {
     let text = analysis.file_text(path)?;
     let index = LineIndex::new(text);
@@ -48,8 +63,25 @@ pub fn lua_diagnostics(
         ));
     }
 
-    // 3. Type diagnostics (annotation-driven, per-file).
-    for diag in analysis.diagnostics(path)? {
+    // 3. Types + shape bindings — the same shaped pass as `luabox check`
+    // (SHAPES.md §4–§6), so `---@use`d structs/traits resolve identically
+    // in the editor and in CI. The span file name is dropped on conversion
+    // (LSP diagnostics are already per-document), so the lossy path is fine.
+    let rel = path.to_string_lossy();
+    let file_dir = path.parent().unwrap_or(Path::new(""));
+    let opts = ShapeOptions {
+        store: shapes.store,
+        file_dir,
+        shape_paths: shapes.shape_paths,
+        dependencies: shapes.dependencies,
+    };
+    for diag in check_file_shaped(
+        parsed.parse(),
+        &rel,
+        shapes.strictness,
+        Some(&opts),
+        Some(stdlib_defs(dialect)),
+    ) {
         let range = diag
             .primary_label()
             .map_or(0..0, |label| label.span.range.clone());

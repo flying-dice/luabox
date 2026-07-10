@@ -24,23 +24,27 @@ use lsp_types::notification::{
     PublishDiagnostics,
 };
 use lsp_types::request::{
-    Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, RangeFormatting,
-    Request as _, SemanticTokensFullRequest,
+    Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest,
+    InlayHintRequest, RangeFormatting, Request as _, SemanticTokensFullRequest,
 };
 use lsp_types::{
     CompletionOptions, CompletionResponse, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DocumentSymbolResponse, GotoDefinitionResponse, Hover,
-    HoverProviderCapability, InitializeParams, InitializeResult, Location, OneOf,
+    HoverProviderCapability, InitializeParams, InitializeResult, InlayHint, Location, OneOf,
     PublishDiagnosticsParams, SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions,
     SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri,
 };
 use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
+use luabox_resolve::manifest::{Dependency, Manifest};
+use luabox_types::{DepShapeExport, ShapeStore};
 
 use crate::line_index::LineIndex;
 use crate::sema::FileSema;
 use crate::uri::{path_to_uri, uri_to_path};
-use crate::{completion, diagnostics, fmt, goto_def, hover, luab, semantic_tokens, symbols};
+use crate::{
+    completion, diagnostics, fmt, goto_def, hover, inlay_hints, luab, semantic_tokens, symbols,
+};
 
 /// Run the server over stdio until the client sends `shutdown`/`exit`.
 /// A leading `--stdio` argument, which editors commonly pass, is harmless:
@@ -78,12 +82,14 @@ pub fn run(connection: Connection) -> anyhow::Result<()> {
 /// The capabilities advertised at initialize: full sync, hover, definition,
 /// completion triggered on `.`/`:`, document symbols, whole-document and
 /// range formatting (range formats the whole document — see [`crate::fmt`]),
-/// and semantic tokens (full) with a standard-types-only legend.
+/// semantic tokens (full) with a standard-types-only legend, and inlay
+/// hints (inferred binding types, see [`crate::inlay_hints`]).
 fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         definition_provider: Some(OneOf::Left(true)),
+        inlay_hint_provider: Some(OneOf::Left(true)),
         completion_provider: Some(CompletionOptions {
             trigger_characters: Some(vec![".".to_string(), ":".to_string()]),
             ..CompletionOptions::default()
@@ -124,6 +130,10 @@ struct ProjectConfig {
     strictness: Strictness,
     /// The manifest's `[build] out` directory, skipped when walking.
     out_dir: Option<PathBuf>,
+    /// `[types] shape-paths`, absolute, in manifest order (SHAPES.md §6).
+    shape_paths: Vec<PathBuf>,
+    /// Dependencies that export shape modules (SHAPES.md §6, tier 3).
+    dependencies: Vec<DepShapeExport>,
 }
 
 impl ProjectConfig {
@@ -132,11 +142,13 @@ impl ProjectConfig {
             dialect: Dialect::Lua54,
             strictness: Strictness::Warn,
             out_dir: None,
+            shape_paths: Vec::new(),
+            dependencies: Vec::new(),
         };
         let Ok(text) = fs::read_to_string(root.join("luabox.toml")) else {
             return defaults;
         };
-        let Ok(manifest) = luabox_resolve::manifest::Manifest::parse(&text) else {
+        let Ok(manifest) = Manifest::parse(&text) else {
             eprintln!("luabox-lsp: invalid luabox.toml; using defaults (5.4, warn)");
             return defaults;
         };
@@ -144,8 +156,54 @@ impl ProjectConfig {
             dialect: Dialect::from_manifest_id(&manifest.package.edition).unwrap_or(Dialect::Lua54),
             strictness: Strictness::from_manifest_flag(manifest.types.strict),
             out_dir: Some(root.join(&manifest.build.out)),
+            shape_paths: manifest
+                .types
+                .shape_paths
+                .iter()
+                .map(|p| root.join(p))
+                .collect(),
+            dependencies: resolve_dep_shape_exports(root, &manifest),
         }
     }
+}
+
+/// Build the dependency shape-export table for resolution tier 3
+/// (SHAPES.md §6). Mirrors `check_cmd::resolve_dep_shape_exports` in the
+/// CLI — the two frontends currently each own this manifest join;
+/// unify if a third consumer appears.
+fn resolve_dep_shape_exports(root: &Path, manifest: &Manifest) -> Vec<DepShapeExport> {
+    let mut exports = Vec::new();
+    for (name, dep) in manifest
+        .dependencies
+        .iter()
+        .chain(&manifest.dev_dependencies)
+    {
+        let dep_root = match dep {
+            Dependency::Path(p) => root.join(p.path.replace('\\', "/")),
+            _ => root.join("lua_modules").join(name),
+        };
+        let Ok(text) = fs::read_to_string(dep_root.join("luabox.toml")) else {
+            continue;
+        };
+        let Ok(dep_manifest) = Manifest::parse(&text) else {
+            continue;
+        };
+        if dep_manifest.types.shapes.is_empty() {
+            continue;
+        }
+        exports.push(DepShapeExport {
+            name: name.clone(),
+            shape_paths: dep_manifest
+                .types
+                .shape_paths
+                .iter()
+                .map(|p| dep_root.join(p))
+                .collect(),
+            exported: dep_manifest.types.shapes.clone(),
+            root: dep_root,
+        });
+    }
+    exports
 }
 
 /// The server state: the analysis host plus `.luab` texts (which never enter
@@ -155,10 +213,23 @@ struct Server {
     host: AnalysisHost,
     root: PathBuf,
     dialect: Dialect,
+    strictness: Strictness,
     out_dir: Option<PathBuf>,
     /// Effective text of `.luab` files: overlay (open buffers) over disk.
     lb_overlay: HashMap<PathBuf, String>,
     lb_disk: HashMap<PathBuf, String>,
+    /// `[types] shape-paths`, absolute (SHAPES.md §6, tier 2).
+    shape_paths: Vec<PathBuf>,
+    /// Shape-exporting dependencies (SHAPES.md §6, tier 3).
+    dependencies: Vec<DepShapeExport>,
+    /// Shape-module parse cache for the shaped type pass. The store reads
+    /// from disk, so it is dropped and rebuilt whenever a `.luab` buffer
+    /// changes (the IDE auto-saves; unsaved shape edits are eventually
+    /// consistent, not instant).
+    shape_store: ShapeStore,
+    /// `.lua` documents currently open in the editor, so a `.luab` change
+    /// can republish exactly the diagnostics a user can see.
+    open_lua: HashMap<PathBuf, Uri>,
 }
 
 impl Server {
@@ -167,11 +238,16 @@ impl Server {
         Self {
             connection,
             host: AnalysisHost::new(config.dialect, config.strictness),
+            shape_store: ShapeStore::new(root.clone()),
             root,
             dialect: config.dialect,
+            strictness: config.strictness,
             out_dir: config.out_dir,
             lb_overlay: HashMap::new(),
             lb_disk: HashMap::new(),
+            shape_paths: config.shape_paths,
+            dependencies: config.dependencies,
+            open_lua: HashMap::new(),
         }
     }
 
@@ -284,6 +360,11 @@ impl Server {
                 let result = self.semantic_tokens(&params.text_document.uri);
                 Response::new_ok(id, result)
             }
+            InlayHintRequest::METHOD => {
+                let (id, params) = cast_request::<InlayHintRequest>(req)?;
+                let result = self.inlay_hints(&params.text_document.uri, params.range);
+                Response::new_ok(id, result)
+            }
             _ => Response::new_err(
                 req.id,
                 ErrorCode::MethodNotFound as i32,
@@ -383,6 +464,28 @@ impl Server {
         }))
     }
 
+    /// Inlay hints for the visible `range` of a `.lua` document: the
+    /// display-mode inference's binding types and inferred function
+    /// returns (see [`crate::inlay_hints`]).
+    fn inlay_hints(&self, uri: &Uri, range: lsp_types::Range) -> Option<Vec<InlayHint>> {
+        let path = uri_to_path(uri)?;
+        if is_lb(&path) {
+            return None;
+        }
+        let snapshot = self.host.snapshot();
+        let sema = FileSema::new(&snapshot, &path)?;
+        let inferred = snapshot.binding_types(&path)?;
+        let start = sema.index.offset(range.start);
+        let end = sema.index.offset(range.end);
+        Some(inlay_hints::inlay_hints(
+            &sema,
+            inferred.bindings(),
+            inferred.fn_returns(),
+            start,
+            end,
+        ))
+    }
+
     fn sema(&self, path: &Path) -> Option<FileSema> {
         FileSema::new(&self.host.snapshot(), path)
     }
@@ -429,13 +532,31 @@ impl Server {
         if is_lb(&path) {
             let diags = diagnostics::lb_diagnostics(&text);
             self.lb_overlay.insert(path, text);
-            return self.publish(uri, diags);
+            self.publish(uri, diags)?;
+            return self.refresh_shapes();
         }
         self.host.apply_change(Change::SetOverlay {
             path: path.clone(),
             text,
         });
+        self.open_lua.insert(path.clone(), uri.clone());
         self.publish_lua(uri, &path)
+    }
+
+    /// A `.luab` module changed: drop the disk-backed parse cache and
+    /// republish every open `.lua` document, whose shape bindings may now
+    /// resolve differently.
+    fn refresh_shapes(&mut self) -> anyhow::Result<()> {
+        self.shape_store = ShapeStore::new(self.root.clone());
+        let open: Vec<(PathBuf, Uri)> = self
+            .open_lua
+            .iter()
+            .map(|(p, u)| (p.clone(), u.clone()))
+            .collect();
+        for (path, uri) in open {
+            self.publish_lua(&uri, &path)?;
+        }
+        Ok(())
     }
 
     /// didClose: drop the overlay, refreshing the disk layer first (the file
@@ -450,11 +571,14 @@ impl Server {
             if let Ok(text) = fs::read_to_string(&path) {
                 let diags = diagnostics::lb_diagnostics(&text);
                 self.lb_disk.insert(path, text);
-                return self.publish(uri, diags);
+                self.publish(uri, diags)?;
+            } else {
+                self.lb_disk.remove(&path);
+                self.publish(uri, Vec::new())?;
             }
-            self.lb_disk.remove(&path);
-            return self.publish(uri, Vec::new());
+            return self.refresh_shapes();
         }
+        self.open_lua.remove(&path);
         if let Ok(text) = fs::read_to_string(&path) {
             self.host.apply_change(Change::SetFileText {
                 path: path.clone(),
@@ -474,7 +598,14 @@ impl Server {
     /// snapshot.
     fn publish_lua(&mut self, uri: &Uri, path: &Path) -> anyhow::Result<()> {
         let analysis: Analysis = self.host.snapshot();
-        let diags = diagnostics::lua_diagnostics(&analysis, path, self.dialect).unwrap_or_default();
+        let shapes = diagnostics::ShapeCtx {
+            store: &self.shape_store,
+            shape_paths: &self.shape_paths,
+            dependencies: &self.dependencies,
+            strictness: self.strictness,
+        };
+        let diags = diagnostics::lua_diagnostics(&analysis, path, self.dialect, &shapes)
+            .unwrap_or_default();
         self.publish(uri, diags)
     }
 

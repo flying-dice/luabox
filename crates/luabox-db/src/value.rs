@@ -24,7 +24,8 @@ use luabox_diag::Diagnostic;
 use luabox_hir::LoweredFile;
 use luabox_syntax::lua;
 use luabox_syntax::luacats::AnnotatedItem;
-use luabox_types::TypeEnv;
+use luabox_types::ty::Ty;
+use luabox_types::{DisplayTypes, InferredBinding, InferredReturn, TypeEnv};
 
 /// Replace `*old` with `new` when they differ, reporting whether it changed.
 ///
@@ -142,6 +143,90 @@ impl Diagnostics {
 
 // SAFETY: fully-owned `Arc` payload; replacement via `PartialEq`.
 unsafe impl salsa::Update for Diagnostics {
+    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
+        // SAFETY: forwarded from the `Update` contract.
+        unsafe { replace_if_ne(old_pointer, new_value) }
+    }
+}
+
+/// The memoized display-mode inference for one file — the LSP inlay-hint
+/// surface ([`luabox_types::infer_display_types`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindingTypes(Arc<DisplayTypes>);
+
+impl BindingTypes {
+    pub(crate) fn new(types: DisplayTypes) -> Self {
+        Self(Arc::new(types))
+    }
+
+    /// Every binding's final inferred type, in declaration order.
+    #[must_use]
+    pub fn bindings(&self) -> &[InferredBinding] {
+        &self.0.bindings
+    }
+
+    /// Inferred returns per unannotated function, keyed by source range.
+    #[must_use]
+    pub fn fn_returns(&self) -> &[InferredReturn] {
+        &self.0.returns
+    }
+}
+
+/// The memoized inferred module export of one file — what a dependent
+/// file's `require` of this module evaluates to. Computed standalone (the
+/// file's own requires are not followed), so the cross-file query graph
+/// stays acyclic even when modules require each other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleExport(Arc<Option<Ty>>);
+
+impl ModuleExport {
+    pub(crate) fn new(ty: Option<Ty>) -> Self {
+        Self(Arc::new(ty))
+    }
+
+    /// The inferred export type, when the chunk returns a value.
+    #[must_use]
+    pub fn ty(&self) -> Option<&Ty> {
+        self.0.as_ref().as_ref()
+    }
+}
+
+// SAFETY: fully-owned `Arc` payload; replacement via `PartialEq`.
+unsafe impl salsa::Update for ModuleExport {
+    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
+        // SAFETY: forwarded from the `Update` contract.
+        unsafe { replace_if_ne(old_pointer, new_value) }
+    }
+}
+
+/// The memoized outgoing-call arguments of one file: what it passes to
+/// functions it does not define, keyed by terminal callee name — the
+/// parameter seeds it contributes to the files it requires.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutgoingCalls(Arc<std::collections::HashMap<String, Vec<Ty>>>);
+
+impl OutgoingCalls {
+    pub(crate) fn new(calls: std::collections::HashMap<String, Vec<Ty>>) -> Self {
+        Self(Arc::new(calls))
+    }
+
+    /// Callee name → positional argument-type unions.
+    #[must_use]
+    pub fn calls(&self) -> &std::collections::HashMap<String, Vec<Ty>> {
+        &self.0
+    }
+}
+
+// SAFETY: fully-owned `Arc` payload; replacement via `PartialEq`.
+unsafe impl salsa::Update for OutgoingCalls {
+    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
+        // SAFETY: forwarded from the `Update` contract.
+        unsafe { replace_if_ne(old_pointer, new_value) }
+    }
+}
+
+// SAFETY: fully-owned `Arc` payload; replacement via `PartialEq`.
+unsafe impl salsa::Update for BindingTypes {
     unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
         // SAFETY: forwarded from the `Update` contract.
         unsafe { replace_if_ne(old_pointer, new_value) }
