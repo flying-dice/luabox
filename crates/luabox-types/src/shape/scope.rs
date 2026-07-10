@@ -286,6 +286,7 @@ pub(crate) fn build_scope(
             .map(|m| m.namespace.clone())
             .collect::<Vec<_>>(),
         stack: Vec::new(),
+        range_stack: Vec::new(),
         diags: Vec::new(),
     };
     for module in modules {
@@ -302,9 +303,11 @@ pub(crate) fn build_scope(
             {
                 continue;
             }
+            ctx.range_stack.push(def.range.clone());
             let ty = def.ty.as_ref().map_or(Ty::Unknown, |t| {
                 ctx.lower_rhs(t, &module.namespace, &def.generics, &fq, &module.file)
             });
+            ctx.range_stack.pop();
             scope.types.insert(
                 fq.clone(),
                 TypeShape {
@@ -340,7 +343,20 @@ struct LowerCtx<'a> {
     /// Monomorphisation stack (cycle guard for recursive generic types —
     /// a cycle collapses to `unknown`).
     stack: Vec<String>,
+    /// Declaration range of the type currently being lowered — the fallback
+    /// span for a diagnostic about a member with no range of its own (e.g. an
+    /// intersection member that is neither `Named` nor `Object`). Pushed at
+    /// every point lowering begins on a (possibly different) declaration's
+    /// right-hand side; mirrors the `file` threaded alongside it.
+    range_stack: Vec<Range<usize>>,
     diags: Vec<Diagnostic>,
+}
+
+impl LowerCtx<'_> {
+    /// The declaration range to blame when a member carries none of its own.
+    fn current_range(&self) -> Range<usize> {
+        self.range_stack.last().cloned().unwrap_or(0..0)
+    }
 }
 
 impl LowerCtx<'_> {
@@ -488,6 +504,20 @@ impl LowerCtx<'_> {
                 _ => None,
             };
             let Some(table) = resolved else {
+                // The member itself carries a range when it is `Named`/
+                // `Object`; anything else (a primitive, a union, ...) falls
+                // back to the enclosing declaration's range.
+                let range = member_range(member).unwrap_or_else(|| self.current_range());
+                self.diags.push(
+                    Diagnostic::error(
+                        Code::new(BAD_INSTANTIATION),
+                        format!(
+                            "intersection member `{}` is not an object type",
+                            render_raw_ty(member)
+                        ),
+                    )
+                    .with_label(Label::primary(Span::new(file, range), "not an object type")),
+                );
                 return Ty::Unknown;
             };
             for (name, field) in table.fields {
@@ -510,12 +540,14 @@ impl LowerCtx<'_> {
         }
         let ns = fq.rsplit_once('.').map_or("", |(ns, _)| ns);
         self.stack.push(fq.to_string());
+        self.range_stack.push(def.range.clone());
         let lowered = def.ty.as_ref().map(|t| {
             // Members merged out of a named type keep *their* declaring
             // type as the `self` receiver — `Drawable = Shape & {...}`
             // methods from Shape still take a Shape.
             self.lower_rhs(t, ns, &def.generics, fq, def_file)
         });
+        self.range_stack.pop();
         self.stack.pop();
         match lowered {
             Some(Ty::Table(t)) => Some(*t),
@@ -691,11 +723,14 @@ impl LowerCtx<'_> {
         let def_ns = fq.rsplit_once('.').map_or("", |(ns, _)| ns);
         let def_generics = def.generics.clone();
         let def_ty = def.ty.clone();
+        let def_range = def.range.clone();
         let (_, def_file) = self.index.get(&fq).copied().expect("indexed above");
         self.stack.push(fq.clone());
+        self.range_stack.push(def_range);
         let template = def_ty.as_ref().map_or(Ty::Unknown, |t| {
             self.lower_rhs(t, def_ns, &def_generics, &fq, def_file)
         });
+        self.range_stack.pop();
         self.stack.pop();
         let mut map = BTreeMap::new();
         for (i, param) in def_generics.iter().enumerate() {
@@ -705,5 +740,35 @@ impl LowerCtx<'_> {
             );
         }
         subst_ty(&template, &map)
+    }
+}
+
+/// The written-source range of a `RawTy`, when it carries one of its own
+/// (`Named`/`Object`) — `None` for compositions (`Optional`/`Union`/
+/// `Intersection`/`Fn`) and `Error`, which don't.
+fn member_range(raw: &RawTy) -> Option<Range<usize>> {
+    match raw {
+        RawTy::Named { range, .. } | RawTy::Object { range, .. } => Some(range.clone()),
+        _ => None,
+    }
+}
+
+/// A short rendering of a `RawTy` for diagnostics naming an offending
+/// intersection member.
+fn render_raw_ty(raw: &RawTy) -> String {
+    match raw {
+        RawTy::Named { name, args, .. } => {
+            if args.is_empty() {
+                name.clone()
+            } else {
+                format!("{name}<...>")
+            }
+        }
+        RawTy::Object { .. } => "{ ... }".to_string(),
+        RawTy::Optional(inner) => format!("{}?", render_raw_ty(inner)),
+        RawTy::Union(_) => "a union type".to_string(),
+        RawTy::Intersection(_) => "an intersection type".to_string(),
+        RawTy::Fn { .. } => "a function type".to_string(),
+        RawTy::Error => "<error>".to_string(),
     }
 }

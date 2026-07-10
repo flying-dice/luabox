@@ -36,6 +36,10 @@ const MISSING_FIELD: u16 = 302;
 const UNKNOWN_FIELD: u16 = 303;
 const RETURN_MISMATCH: u16 = 304;
 const UNKNOWN_TYPE_NAME: u16 = 305;
+/// Bad `.luab` type instantiation or reference, reached from a standard
+/// LuaCATS annotation site (SHAPES-V2.md; shared with the `.luab`-file-level
+/// diagnostic of the same code, `luabox-types/src/shape/scope.rs`).
+const BAD_INSTANTIATION: u16 = 2007;
 
 /// Run the checker over one parsed file. `inferred` carries the
 /// inference engine's expression types keyed by byte range — consulted
@@ -64,11 +68,23 @@ pub(crate) fn run(
     };
 
     for (name, span) in &typeenv.unknown_names {
-        checker.report(
+        let candidates = typeenv.shape_name_candidates(name);
+        let note = (!candidates.is_empty())
+            .then(|| format!("did you mean `{}`?", candidates.join("` or `")));
+        checker.report_full(
             UNKNOWN_TYPE_NAME,
             span.start..span.end,
             format!("unknown type name `{name}` in annotation"),
             "not a built-in, `---@class`, `---@alias`, or `---@enum` name".to_string(),
+            note,
+        );
+    }
+    for (message, span) in &typeenv.shape_ref_errors {
+        checker.report(
+            BAD_INSTANTIATION,
+            span.start..span.end,
+            message.clone(),
+            "bad `.luab` type instantiation".to_string(),
         );
     }
 
@@ -127,10 +143,34 @@ impl Checker<'_> {
         label: String,
         note: Option<String>,
     ) {
+        self.report_conformance(code, range, message, label, note, None);
+    }
+
+    /// Like [`Checker::report_full`], plus a secondary label at the `.luab`
+    /// declaration site of `expected_name` when it names an in-scope shape
+    /// type — the "type declared here" cross-reference a v1 impl-completeness
+    /// error would have shown (#80).
+    fn report_conformance(
+        &mut self,
+        code: u16,
+        range: Range<usize>,
+        message: String,
+        label: String,
+        note: Option<String>,
+        expected_name: Option<&str>,
+    ) {
         let mut diag = Diagnostic::new(Code::new(code), self.severity, message)
             .with_label(Label::primary(Span::new(self.file, range), label));
         if let Some(note) = note {
             diag = diag.with_note(note);
+        }
+        if let Some((decl_file, decl_range)) =
+            expected_name.and_then(|name| self.env.shape_decl_site(name))
+        {
+            diag = diag.with_label(Label::secondary(
+                Span::new(decl_file.to_string(), decl_range),
+                "type declared here",
+            ));
         }
         self.diags.push(diag);
     }
@@ -204,6 +244,9 @@ impl Checker<'_> {
                         && let Some(value) = values.get(i)
                     {
                         self.check_slot(&Slot::Expr(value.clone()), &binding.ty, TYPE_MISMATCH);
+                    }
+                    if let Expr::Field(field) = target {
+                        self.check_sealed_field_write(field);
                     }
                     self.visit_expr(target);
                 }
@@ -742,13 +785,63 @@ impl Checker<'_> {
             // the message must carry what a v1 impl-check would have said).
             let detail = crate::assign::explain_mismatch(self.env, self.strict, &found, expected)
                 .map_or(String::new(), |d| format!(": {d}"));
-            self.report(
+            let expected_name = match expected {
+                Ty::Named(name) => Some(name.as_str()),
+                _ => None,
+            };
+            self.report_conformance(
                 mismatch_code,
                 slot_range(slot),
                 format!("{noun}: expected `{expected}`, found `{found}`{detail}"),
                 format!("expected `{expected}`"),
+                None,
+                expected_name,
             );
         }
+    }
+
+    /// A write to a field a *sealed* `.luab` shape does not declare
+    /// (`p.z = 1` where `p`'s type is a sealed shape lacking `z`) — the
+    /// write-side counterpart of table-literal freshness (SHAPES-V2.md;
+    /// #82). Silent when the base's type is unknown, not table-shaped, or
+    /// not sealed (a plain LuaCATS class stays width-open on writes, as
+    /// assignability already does).
+    fn check_sealed_field_write(&mut self, field: &lua::ast::FieldExpr) {
+        let (Some(base), Some(member)) = (field.base(), field.field_name()) else {
+            return;
+        };
+        let base_ty = self.expr_ty(&base);
+        let Some((class, shape)) = self.table_shape(&base_ty) else {
+            return;
+        };
+        if !shape.sealed || shape.fields.contains_key(member.text()) {
+            return;
+        }
+        let key_ty = Ty::StringLit(member.text().to_string());
+        if shape
+            .indexers
+            .iter()
+            .any(|(key, _)| self.assignable(&key_ty, key))
+        {
+            return;
+        }
+        let r = member.text_range();
+        self.report_conformance(
+            UNKNOWN_FIELD,
+            usize::from(r.start())..usize::from(r.end()),
+            format!("unknown field `{}` in assignment", member.text()),
+            class.as_deref().map_or_else(
+                || "the expected table type declares no such field".to_string(),
+                |c| {
+                    format!(
+                        "`{c}` declares no field `{}` and has no indexer",
+                        member.text()
+                    )
+                },
+            ),
+            None,
+            class.as_deref(),
+        );
     }
 
     /// Resolve an expected type to a checkable table shape (unwrapping a
@@ -816,12 +909,13 @@ impl Checker<'_> {
         // Missing required fields — one diagnostic each, naming the field.
         for (name, field) in &shape.fields {
             if !field.optional && !field.ty.admits_nil() && !present.contains_key(name) {
-                self.report_full(
+                self.report_conformance(
                     MISSING_FIELD,
                     range(table.syntax()),
                     format!("missing required field `{name}` in table literal"),
                     format!("expected field `{name}` of type `{}`", field.ty),
                     declared_by.clone(),
+                    class,
                 );
             }
         }

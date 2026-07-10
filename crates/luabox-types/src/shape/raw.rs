@@ -125,6 +125,7 @@ pub(crate) fn parse_module(source: &str, file: String, namespace: String) -> Raw
         return module;
     };
     let root: ast::ShapeFile = root;
+    let mut errors = Vec::new();
     for item in root.items() {
         let Some(name) = item.name() else { continue };
         module.types.push(RawTypeDef {
@@ -134,17 +135,21 @@ pub(crate) fn parse_module(source: &str, file: String, namespace: String) -> Raw
                 .generic_params()
                 .map(|g| g.params().filter_map(|p| p.name()).collect())
                 .unwrap_or_default(),
-            ty: item.ty().as_ref().map(convert_ty),
+            ty: item.ty().as_ref().map(|t| convert_ty(t, &mut errors)),
             range: node_range(ast::AstNode::syntax(&item)),
         });
     }
+    module.errors.append(&mut errors);
     module
 }
 
 /// Convert a parameter list: whether the first parameter is `self`, plus the
 /// remaining named parameters. An optional parameter (`x?: T`) folds into an
 /// [`RawTy::Optional`] parameter type.
-fn convert_params(list: Option<ast::ParamList>) -> (bool, Vec<(String, RawTy)>) {
+fn convert_params(
+    list: Option<ast::ParamList>,
+    errors: &mut Vec<RawError>,
+) -> (bool, Vec<(String, RawTy)>) {
     let mut has_self = false;
     let mut params = Vec::new();
     if let Some(list) = list {
@@ -152,7 +157,10 @@ fn convert_params(list: Option<ast::ParamList>) -> (bool, Vec<(String, RawTy)>) 
             if param.is_self() {
                 has_self = true;
             } else if let Some(name) = param.name() {
-                let mut ty = param.ty().as_ref().map_or(RawTy::Error, convert_ty);
+                let mut ty = param
+                    .ty()
+                    .as_ref()
+                    .map_or(RawTy::Error, |t| convert_ty(t, errors));
                 if param.optional() && !matches!(ty, RawTy::Optional(_)) {
                     ty = RawTy::Optional(Box::new(ty));
                 }
@@ -164,7 +172,7 @@ fn convert_params(list: Option<ast::ParamList>) -> (bool, Vec<(String, RawTy)>) 
 }
 
 /// A return position: nothing, one type, or a parenthesised multi-return.
-fn convert_returns(ret: Option<&ast::TypeRef>) -> Vec<RawTy> {
+fn convert_returns(ret: Option<&ast::TypeRef>, errors: &mut Vec<RawError>) -> Vec<RawTy> {
     match ret {
         None => Vec::new(),
         Some(ast::TypeRef::Paren(p)) => {
@@ -172,20 +180,20 @@ fn convert_returns(ret: Option<&ast::TypeRef>) -> Vec<RawTy> {
             if inners.is_empty() {
                 vec![RawTy::Error]
             } else {
-                inners.iter().map(convert_ty).collect()
+                inners.iter().map(|t| convert_ty(t, errors)).collect()
             }
         }
-        Some(other) => vec![convert_ty(other)],
+        Some(other) => vec![convert_ty(other, errors)],
     }
 }
 
-fn convert_ty(ty: &ast::TypeRef) -> RawTy {
+fn convert_ty(ty: &ast::TypeRef, errors: &mut Vec<RawError>) -> RawTy {
     match ty {
         ast::TypeRef::Named(named) => RawTy::Named {
             name: named.path(),
             args: named
                 .args()
-                .map(|a| a.args().map(|t| convert_ty(&t)).collect())
+                .map(|a| a.args().map(|t| convert_ty(&t, errors)).collect())
                 .unwrap_or_default(),
             range: node_range(ast::AstNode::syntax(ty)),
         },
@@ -196,7 +204,10 @@ fn convert_ty(ty: &ast::TypeRef) -> RawTy {
                 match member {
                     ast::Member::Field(f) => {
                         let Some(name) = f.name() else { continue };
-                        let mut fty = f.ty().as_ref().map_or(RawTy::Error, convert_ty);
+                        let mut fty = f
+                            .ty()
+                            .as_ref()
+                            .map_or(RawTy::Error, |t| convert_ty(t, errors));
                         if f.optional() && !matches!(fty, RawTy::Optional(_)) {
                             fty = RawTy::Optional(Box::new(fty));
                         }
@@ -204,12 +215,12 @@ fn convert_ty(ty: &ast::TypeRef) -> RawTy {
                     }
                     ast::Member::Method(m) => {
                         let Some(name) = m.name() else { continue };
-                        let (has_self, params) = convert_params(m.params());
+                        let (has_self, params) = convert_params(m.params(), errors);
                         methods.push(RawMethod {
                             name,
                             has_self,
                             params,
-                            returns: convert_returns(m.ret().as_ref()),
+                            returns: convert_returns(m.ret().as_ref(), errors),
                             range: node_range(ast::AstNode::syntax(&m)),
                         });
                     }
@@ -222,21 +233,38 @@ fn convert_ty(ty: &ast::TypeRef) -> RawTy {
             }
         }
         ast::TypeRef::Optional(opt) => RawTy::Optional(Box::new(
-            opt.inner().as_ref().map_or(RawTy::Error, convert_ty),
+            opt.inner()
+                .as_ref()
+                .map_or(RawTy::Error, |t| convert_ty(t, errors)),
         )),
         ast::TypeRef::Union(union) => {
-            RawTy::Union(union.members().map(|m| convert_ty(&m)).collect())
+            RawTy::Union(union.members().map(|m| convert_ty(&m, errors)).collect())
         }
         ast::TypeRef::Intersection(inter) => {
-            RawTy::Intersection(inter.members().map(|m| convert_ty(&m)).collect())
+            RawTy::Intersection(inter.members().map(|m| convert_ty(&m, errors)).collect())
         }
         ast::TypeRef::Fn(func) => {
-            let (_, params) = convert_params(func.params());
+            let (_, params) = convert_params(func.params(), errors);
             RawTy::Fn {
                 params,
-                returns: convert_returns(func.ret().as_ref()),
+                returns: convert_returns(func.ret().as_ref(), errors),
             }
         }
-        ast::TypeRef::Paren(paren) => paren.inner().as_ref().map_or(RawTy::Error, convert_ty),
+        ast::TypeRef::Paren(paren) => {
+            let inners: Vec<ast::TypeRef> = paren.inners().collect();
+            match inners.as_slice() {
+                [] => RawTy::Error,
+                [single] => convert_ty(single, errors),
+                _ => {
+                    errors.push(RawError {
+                        code: Some("LB2007"),
+                        message: "a multi-return list `(A, B)` is only legal in return position"
+                            .to_string(),
+                        range: node_range(ast::AstNode::syntax(ty)),
+                    });
+                    RawTy::Error
+                }
+            }
+        }
     }
 }

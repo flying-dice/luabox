@@ -5,11 +5,6 @@ The backlog lives as issues on
 (labels: `in-flight`, `ready`, `icebox`, `shapes-v2`). This file is an
 index only — the issues carry the user stories and acceptance criteria.
 
-## In flight
-
-- [#77](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/77)
-  Typed `self` in shape carriers (constructor tie)
-
 ## Ready
 
 - [#78](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/78)

@@ -1045,6 +1045,11 @@ type AlsoBad = Pair<number>                   -- LB2007: not declared here —
 Fix the argument count, or qualify the reference with its module namespace
 (`geometry.Pair<number>`). Sibling references within the declaring module
 stay short; everything else is fully qualified.
+
+The same arity and non-generic-instantiation checks also fire at a standard
+LuaCATS annotation site (`---@type geometry.Pair<number, string>`) — a `.lua`
+file naming a `.luab` generic type gets this error exactly as a `.luab`
+declaration would.
 ";
 
 const LB2010: &str = "\

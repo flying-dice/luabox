@@ -40,6 +40,10 @@ pub(crate) struct Lowerer<'a> {
     stack: Vec<String>,
     /// `(name, span)` of every reference to an undeclared type name.
     pub unknown_names: Vec<(String, Span)>,
+    /// `(message, span)` of every bad `.luab` generic instantiation reached
+    /// from a LuaCATS annotation site (wrong arity, or type arguments given
+    /// to a non-generic shape type) — surfaced as `LB2007`.
+    pub shape_ref_errors: Vec<(String, Span)>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -50,6 +54,7 @@ impl<'a> Lowerer<'a> {
             generics: HashSet::new(),
             stack: Vec::new(),
             unknown_names: Vec::new(),
+            shape_ref_errors: Vec::new(),
         }
     }
 
@@ -101,6 +106,12 @@ impl<'a> Lowerer<'a> {
             && let Some(shape) = scope.get(name)
         {
             if shape.params.is_empty() {
+                if !args.is_empty() {
+                    self.shape_ref_errors.push((
+                        format!("`{name}` is not generic but was given type arguments"),
+                        span,
+                    ));
+                }
                 return match &shape.ty {
                     // Concrete object types stay nominal (resolved
                     // structurally via the environment); alias-like RHS
@@ -109,13 +120,17 @@ impl<'a> Lowerer<'a> {
                     other => other.clone(),
                 };
             }
-            // Monomorphise a template use site. Lenient on arity —
-            // TODO(P1): surface arity errors at the annotation site.
+            // Monomorphise a template use site. `instantiate` itself reports
+            // a wrong non-zero arity via the `diags` sink — recovered here as
+            // a `(message, span)` pair anchored to this annotation site
+            // rather than the throwaway file/range `instantiate` was given.
             let args: Vec<Ty> = args.iter().map(|a| self.lower(a)).collect();
-            let mut scratch = Vec::new();
-            return scope
-                .instantiate(name, &args, "", 0..0, &mut scratch)
-                .unwrap_or(Ty::Unknown);
+            let mut diags = Vec::new();
+            let result = scope.instantiate(name, &args, "", 0..0, &mut diags);
+            if let Some(diag) = diags.into_iter().next() {
+                self.shape_ref_errors.push((diag.message, span));
+            }
+            return result.unwrap_or(Ty::Unknown);
         }
         self.unknown_names.push((name.to_string(), span));
         Ty::Unknown

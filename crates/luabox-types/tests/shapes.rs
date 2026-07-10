@@ -211,6 +211,109 @@ fn generic_instantiation_checks_fields() {
     assert!(!f.check(bad).is_empty(), "string is not T=number");
 }
 
+// === Generic arity errors at LuaCATS annotation sites (#78) =================
+
+#[test]
+fn wrong_generic_arity_at_annotation_site_is_lb2007() {
+    let f = geometry_fixture();
+    let diags = f.check(
+        "---@type geometry.Pair<number, string>\nlocal p = { first = 1, second = 2 }\nreturn p\n",
+    );
+    assert!(
+        diags.iter().any(|d| d.code.to_string() == "LB2007"
+            && d.message.contains("wrong number")
+            && d.message.contains("expected 1, found 2")),
+        "{diags:?}"
+    );
+}
+
+#[test]
+fn type_arguments_on_non_generic_shape_at_annotation_site_is_lb2007() {
+    let f = geometry_fixture();
+    let diags = f.check("---@type geometry.Point<number>\nlocal p = { x = 0, y = 1 }\nreturn p\n");
+    assert!(
+        diags.iter().any(|d| d.code.to_string() == "LB2007"
+            && d.message.contains("not generic")
+            && d.message.contains("geometry.Point")),
+        "{diags:?}"
+    );
+}
+
+// === LB0305 fully-qualified-name suggestions (#79) ==========================
+
+#[test]
+fn lb0305_suggests_fq_name_for_bare_short_name() {
+    let f = geometry_fixture();
+    let diags = f.check("---@type Point\nlocal p = { x = 0, y = 1 }\nreturn p\n");
+    let lb0305 = diags
+        .iter()
+        .find(|d| d.code.to_string() == "LB0305")
+        .expect("LB0305 expected");
+    assert!(
+        lb0305
+            .notes
+            .iter()
+            .any(|n| n.contains("did you mean `geometry.Point`?")),
+        "{lb0305:?}"
+    );
+}
+
+#[test]
+fn lb0305_suggests_fq_name_for_typoed_namespace() {
+    let f = geometry_fixture();
+    // `geomtry.Point` — a typo'd namespace whose last segment (`Point`)
+    // still matches a declared shape.
+    let diags = f.check("---@type geomtry.Point\nlocal p = { x = 0, y = 1 }\nreturn p\n");
+    let lb0305 = diags
+        .iter()
+        .find(|d| d.code.to_string() == "LB0305")
+        .expect("LB0305 expected");
+    assert!(
+        lb0305
+            .notes
+            .iter()
+            .any(|n| n.contains("did you mean `geometry.Point`?")),
+        "{lb0305:?}"
+    );
+}
+
+// === Declaration-site labels on conformance errors (#80) ====================
+
+#[test]
+fn conformance_mismatch_labels_the_luab_declaration_site() {
+    let f = geometry_fixture();
+    let diags = f.check("---@type geometry.Point\nlocal p = { x = 0 }\nreturn p\n");
+    let diag = diags
+        .iter()
+        .find(|d| d.code.to_string() == "LB0302")
+        .expect("missing-field diagnostic expected");
+    assert!(
+        diag.labels.iter().any(|l| !l.primary
+            && l.message == "type declared here"
+            && l.span.file == "shapes/geometry.luab"),
+        "{diag:?}"
+    );
+}
+
+#[test]
+fn type_mismatch_against_shape_labels_the_luab_declaration_site() {
+    let f = geometry_fixture();
+    // A whole-value mismatch (not a table literal): the assignability
+    // failure must still point back at `geometry.Point`'s declaration.
+    let src = "---@type string\nlocal s = \"x\"\n---@type geometry.Point\nlocal p = s\nreturn p\n";
+    let diags = f.check(src);
+    let diag = diags
+        .iter()
+        .find(|d| d.code.to_string() == "LB0300")
+        .expect("type-mismatch diagnostic expected");
+    assert!(
+        diag.labels.iter().any(|l| !l.primary
+            && l.message == "type declared here"
+            && l.span.file == "shapes/geometry.luab"),
+        "{diag:?}"
+    );
+}
+
 // === Positional conformance: methods and intersections =====================
 
 #[test]
@@ -388,6 +491,48 @@ fn lb2007_wrong_arity_and_qualification_hint() {
     );
 }
 
+// === Lenient `.luab` edges now diagnosed (#81) ==============================
+
+#[test]
+fn multi_return_paren_outside_return_position_is_lb2007() {
+    let f = Fixture::new();
+    f.write("shapes/bad.luab", "type Bad = (number, string)\n");
+    let diags = f.check_lb("shapes/bad.luab");
+    assert!(
+        diags.iter().any(|d| d.code.to_string() == "LB2007"
+            && d.message.contains("only legal in return position")),
+        "{diags:?}"
+    );
+}
+
+#[test]
+fn multi_return_paren_in_return_position_stays_clean() {
+    let f = Fixture::new();
+    f.write(
+        "shapes/ok.luab",
+        "type T = { split(self): (number, string) }\n",
+    );
+    let diags = f.check_lb("shapes/ok.luab");
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn intersection_member_not_an_object_type_is_lb2007() {
+    let mut f = Fixture::new();
+    f.add_shape_path("shapes");
+    f.write(
+        "shapes/bad.luab",
+        "export type Shape = { area(self): number }\ntype Bad = Shape & number\n",
+    );
+    let diags = f.check_lb("shapes/bad.luab");
+    assert!(
+        diags.iter().any(|d| d.code.to_string() == "LB2007"
+            && d.message.contains("intersection member")
+            && d.message.contains("not an object type")),
+        "{diags:?}"
+    );
+}
+
 #[test]
 fn sibling_short_names_resolve_within_module() {
     let mut f = Fixture::new();
@@ -541,5 +686,47 @@ fn result_in_return_position_is_pair() {
               ---@return string?, string?\nfunction R:read() return \"data\", nil end\n\
               ---@type io.Reader\nlocal r = R\nreturn r\n";
     let diags = f.check(ok);
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+// === Sealed-key semantics beyond literals (#82) =============================
+//
+// Literal freshness (`sealed_freshness_rejects_unknown_field`) already pins
+// the constructor-literal case. These pin the two other places a sealed
+// key can be touched on an already-typed value: a field *write* and a field
+// *read*.
+
+#[test]
+fn sealed_unknown_key_write_is_lb0303() {
+    let f = geometry_fixture();
+    let diags = f.check("---@type geometry.Point\nlocal p = { x = 0, y = 1 }\np.z = 1\nreturn p\n");
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code.to_string() == "LB0303" && d.message.contains('z')),
+        "a write to an undeclared key on a sealed shape must be diagnosed: {diags:?}"
+    );
+}
+
+#[test]
+fn sealed_declared_key_write_stays_clean() {
+    let f = geometry_fixture();
+    // The counterpart: writing an already-declared key is unremarkable.
+    let diags = f.check("---@type geometry.Point\nlocal p = { x = 0, y = 1 }\np.x = 2\nreturn p\n");
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn sealed_unknown_key_read_currently_lenient() {
+    // Pinned as lenient (#82): a read of an undeclared key on a sealed
+    // shape-typed value (`p.z`) is not diagnosed today. Reads flow through
+    // `Checker::field_ty`, which only ever *finds* a field in the shape or
+    // falls back to `unknown` — there is no "prove the field is absent"
+    // path the way literal freshness proves excess. Enforcing it needs the
+    // same deeper provable-absence reasoning `LB0306` uses for locally
+    // inferred tables, which this ticket does not extend to `.luab`-typed
+    // values. Tracked as future work, not a regression.
+    let f = geometry_fixture();
+    let diags = f.check("---@type geometry.Point\nlocal p = { x = 0, y = 1 }\nreturn p.z\n");
     assert!(diags.is_empty(), "{diags:?}");
 }

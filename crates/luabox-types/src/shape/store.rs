@@ -27,6 +27,7 @@ use super::scope::{ShapeScope, TypeShape, build_scope, fq_name};
 
 const SYNTAX_ERROR: u16 = 1;
 const BODY_IN_LB: u16 = 2010;
+const BAD_INSTANTIATION: u16 = 2007;
 
 /// A dependency that may export a type surface to the current project.
 /// Built by the CLI from the project manifest plus each dependency's own
@@ -266,6 +267,7 @@ impl ShapeStore {
         for err in &module.errors {
             let code = match err.code {
                 Some("LB2010") => Code::new(BODY_IN_LB),
+                Some("LB2007") => Code::new(BAD_INSTANTIATION),
                 _ => Code::new(SYNTAX_ERROR),
             };
             diags.push(

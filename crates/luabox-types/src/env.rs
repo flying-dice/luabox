@@ -76,6 +76,16 @@ pub struct TypeEnv {
     as_casts: HashMap<usize, Ty>,
     /// References to undeclared type names (LB0305): `(name, span)`.
     pub(crate) unknown_names: Vec<(String, luacats::Span)>,
+    /// Bad `.luab` generic instantiations reached from an annotation site
+    /// (LB2007): `(message, span)`.
+    pub(crate) shape_ref_errors: Vec<(String, luacats::Span)>,
+    /// Every fully-qualified `.luab` shape type name in scope — the
+    /// candidate list LB0305 draws its "did you mean" hint from (#79).
+    shape_names: Vec<String>,
+    /// FQ shape type name → (declaring file, declaration byte range), so a
+    /// conformance error at an annotation site can attach a secondary label
+    /// at the declaration (#80).
+    shape_decl_sites: BTreeMap<String, (String, std::ops::Range<usize>)>,
 }
 
 impl TypeEnv {
@@ -153,6 +163,11 @@ impl TypeEnv {
                     env.shape_structs.insert(name.clone(), (**table).clone());
                 }
             }
+            env.shape_names = scope.types.keys().cloned().collect();
+            for (name, shape) in &scope.types {
+                env.shape_decl_sites
+                    .insert(name.clone(), (shape.file.clone(), shape.range.clone()));
+            }
         }
         let mut lowerer = Lowerer::new(&decl);
         lowerer.shape_scope = shapes;
@@ -194,6 +209,7 @@ impl TypeEnv {
             }
         }
         env.unknown_names = std::mem::take(&mut lowerer.unknown_names);
+        env.shape_ref_errors = std::mem::take(&mut lowerer.shape_ref_errors);
         env
     }
 
@@ -650,6 +666,30 @@ impl TypeEnv {
     /// `end_offset`, if any.
     pub(crate) fn as_cast_at(&self, end_offset: usize) -> Option<&Ty> {
         self.as_casts.get(&end_offset)
+    }
+
+    /// The `.luab` declaration site of a fully-qualified shape type name:
+    /// its declaring file and byte range (#80's "type declared here" label).
+    pub(crate) fn shape_decl_site(&self, name: &str) -> Option<(&str, std::ops::Range<usize>)> {
+        self.shape_decl_sites
+            .get(name)
+            .map(|(file, range)| (file.as_str(), range.clone()))
+    }
+
+    /// Fully-qualified shape names whose *last* dotted segment matches
+    /// `name`'s last segment — the LB0305 "did you mean" candidate list
+    /// (#79): covers both a bare short name (`Point`) and a typo'd
+    /// namespace (`geomtry.Point`). Capped at 3, in FQ-name order.
+    pub(crate) fn shape_name_candidates(&self, name: &str) -> Vec<String> {
+        let last = name.rsplit('.').next().unwrap_or(name);
+        let mut candidates: Vec<String> = self
+            .shape_names
+            .iter()
+            .filter(|fq| fq.rsplit('.').next() == Some(last))
+            .cloned()
+            .collect();
+        candidates.truncate(3);
+        candidates
     }
 }
 
