@@ -39,6 +39,10 @@ pub(crate) struct EnumDef {
 pub struct TypeEnv {
     classes: BTreeMap<String, ClassDef>,
     enums: BTreeMap<String, EnumDef>,
+    /// `.lb` structs in scope (via `---@use`): sealed structural shapes.
+    shape_structs: BTreeMap<String, TableTy>,
+    /// `.lb` traits in scope: interfaces as method-set tables.
+    shape_traits: BTreeMap<String, TableTy>,
     /// Annotated functions by (dotted) name — `f`, `M.helper`.
     functions: BTreeMap<String, FunctionTy>,
     /// `---@type` annotations keyed by their target `local` statement.
@@ -55,8 +59,20 @@ impl TypeEnv {
     #[must_use]
     pub fn build(parse: &lua::Parse) -> TypeEnv {
         let items = luacats::harvest(parse);
+        Self::build_from_items(parse, &items, None)
+    }
+
+    /// Build the environment from pre-harvested annotations, optionally
+    /// with `.lb` shapes in scope (interop: shape structs/traits/aliases
+    /// become referenceable from LuaCATS annotations, and resolvable
+    /// through [`TypeEnv::resolve_named`] / [`TypeEnv::class_shape`]).
+    pub(crate) fn build_from_items(
+        parse: &lua::Parse,
+        items: &[luacats::AnnotatedItem],
+        shapes: Option<&crate::shape::ShapeScope>,
+    ) -> TypeEnv {
         let mut decl = Declared::default();
-        for item in &items {
+        for item in items {
             for tag in &item.block.tags {
                 match tag {
                     Tag::Class(c) if !c.name.is_empty() => {
@@ -74,9 +90,29 @@ impl TypeEnv {
         }
 
         let mut env = TypeEnv::default();
+        if let Some(scope) = shapes {
+            for (name, shape) in &scope.structs {
+                decl.shape_names.insert(name.clone());
+                if shape.params.is_empty() {
+                    env.shape_structs.insert(name.clone(), shape.table.clone());
+                }
+            }
+            for (name, trait_shape) in &scope.traits {
+                decl.shape_names.insert(name.clone());
+                env.shape_traits
+                    .insert(name.clone(), trait_table(trait_shape));
+            }
+            for (name, alias) in &scope.aliases {
+                if alias.params.is_empty() {
+                    decl.shape_aliases.insert(name.clone(), alias.ty.clone());
+                } else {
+                    decl.shape_names.insert(name.clone());
+                }
+            }
+        }
         let mut lowerer = Lowerer::new(&decl);
         let root = parse.syntax();
-        for item in &items {
+        for item in items {
             lowerer.generics = item
                 .block
                 .tags
@@ -279,15 +315,28 @@ impl TypeEnv {
     // --- lookups -----------------------------------------------------
 
     /// The merged structural shape of a class: parents first (depth-first),
-    /// own members overriding, with a cycle guard.
+    /// own members overriding, with a cycle guard. `.lb` structs and
+    /// traits in scope resolve here too (one checker, one IR).
     pub(crate) fn class_shape(&self, name: &str) -> Option<TableTy> {
         if !self.classes.contains_key(name) {
+            if let Some(table) = self.shape_structs.get(name) {
+                return Some(table.clone());
+            }
+            if let Some(table) = self.shape_traits.get(name) {
+                return Some(table.clone());
+            }
             return None;
         }
         let mut shape = TableTy::default();
         let mut seen = HashSet::new();
         self.collect_class(name, &mut shape, &mut seen);
         Some(shape)
+    }
+
+    /// Whether the file declares a `---@class` of this name (used by the
+    /// shape checker's `---@impl` interop path).
+    pub(crate) fn has_class(&self, name: &str) -> bool {
+        self.classes.contains_key(name)
     }
 
     fn collect_class(&self, name: &str, shape: &mut TableTy, seen: &mut HashSet<String>) {
@@ -311,7 +360,8 @@ impl TypeEnv {
     }
 
     /// Resolve a [`Ty::Named`] reference to its structural type: a class
-    /// becomes its table shape, an enum the union of its member values.
+    /// (or `.lb` struct/trait) becomes its table shape, an enum the union
+    /// of its member values.
     pub(crate) fn resolve_named(&self, name: &str) -> Option<Ty> {
         if let Some(shape) = self.class_shape(name) {
             return Some(Ty::Table(Box::new(shape)));
@@ -330,6 +380,29 @@ impl TypeEnv {
     pub(crate) fn fn_sig(&self, target: Target) -> Option<&FunctionTy> {
         self.fn_sigs.get(&target)
     }
+}
+
+/// A trait as a structural interface: its functions become fields typed as
+/// functions (the `self` receiver is dropped — Lua method-call syntax
+/// supplies it).
+fn trait_table(trait_shape: &crate::shape::TraitShape) -> TableTy {
+    let mut table = TableTy::default();
+    for (name, sig) in &trait_shape.fns {
+        let func = crate::ty::FunctionTy {
+            params: sig.params.clone(),
+            returns: sig.returns.clone(),
+            has_return_annotation: true,
+            ..crate::ty::FunctionTy::default()
+        };
+        table.fields.insert(
+            name.clone(),
+            FieldTy {
+                ty: Ty::Function(Box::new(func)),
+                optional: false,
+            },
+        );
+    }
+    table
 }
 
 /// The innermost statement whose range is exactly `target`.

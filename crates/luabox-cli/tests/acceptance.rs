@@ -213,6 +213,222 @@ fn no_dialect_diagnostic(world: &mut AcceptanceWorld) {
     }
 }
 
+// --- shape fixtures (shapes/*.feature) ------------------------------------
+
+/// Write a file under the scenario project, creating parent directories.
+fn write_file(world: &AcceptanceWorld, rel: &str, content: &str) {
+    let full = world.dir.path().join(rel);
+    if let Some(parent) = full.parent() {
+        std::fs::create_dir_all(parent).expect("failed to create parent directories");
+    }
+    std::fs::write(&full, content).unwrap_or_else(|e| panic!("cannot write `{rel}`: {e}"));
+}
+
+#[given(regex = r#"^a shape module "(\w+)" declaring (.+)$"#)]
+fn shape_module_declaring(world: &mut AcceptanceWorld, name: String, decl: String) {
+    write_file(world, &format!("src/{name}.lb"), &format!("{decl}\n"));
+}
+
+#[given(regex = r"^a Lua file binding a table (\{.*\}) with ---@struct (\w+)$")]
+fn lua_file_binding_table(world: &mut AcceptanceWorld, table: String, struct_name: String) {
+    let source = format!("---@use geometry\n\n---@struct {struct_name}\nlocal value = {table}\n");
+    write_file(world, "src/main.lua", &source);
+}
+
+#[given(regex = r"^trait Shape with fns (\w+) and (\w+)$")]
+fn trait_shape_with_fns(world: &mut AcceptanceWorld, first: String, second: String) {
+    let module = format!(
+        "struct Circle {{ }}\n\
+         trait Shape {{\n    fn {first}(self) -> number;\n    fn {second}(self) -> number;\n}}\n"
+    );
+    write_file(world, "src/geometry.lb", &module);
+}
+
+#[given(regex = r"^trait Shape with fn area\(self\) -> number$")]
+fn trait_shape_with_area(world: &mut AcceptanceWorld) {
+    write_file(
+        world,
+        "src/geometry.lb",
+        "struct Circle { }\ntrait Shape {\n    fn area(self) -> number;\n}\n",
+    );
+}
+
+#[given(regex = r#"^trait Drawable: Shape in "geometry\.lb"$"#)]
+fn trait_drawable_supertrait(world: &mut AcceptanceWorld) {
+    write_file(
+        world,
+        "src/geometry.lb",
+        "struct Circle { }\n\
+         trait Shape {\n    fn area(self) -> number;\n}\n\
+         trait Drawable: Shape {\n    fn draw(self);\n}\n",
+    );
+}
+
+#[given(regex = r#"^trait Shape in "geometry\.lb"$"#)]
+fn trait_shape_in_geometry(world: &mut AcceptanceWorld) {
+    write_file(
+        world,
+        "src/geometry.lb",
+        "trait Shape {\n    fn area(self) -> number;\n}\n",
+    );
+}
+
+#[given(regex = r#"^struct Point in "geometry\.lb"$"#)]
+fn struct_point_in_geometry(world: &mut AcceptanceWorld) {
+    write_file(
+        world,
+        "src/geometry.lb",
+        "struct Point { x: number, y: number }\n",
+    );
+}
+
+/// The common carrier preamble: `---@struct Circle` bound to a class table.
+const CARRIER_PREAMBLE: &str = "\
+---@use geometry
+
+---@struct Circle
+local Circle = {}
+Circle.__index = Circle
+";
+
+#[given(regex = r"^a carrier table with ---@impl Shape for Circle defining only (\w+)$")]
+fn carrier_defining_only(world: &mut AcceptanceWorld, only: String) {
+    let source = format!(
+        "{CARRIER_PREAMBLE}\n---@impl Shape for Circle\nfunction Circle:{only}()\n  return 1\nend\n"
+    );
+    write_file(world, "src/main.lua", &source);
+}
+
+#[given("a carrier table with ---@impl Shape for Circle whose area returns a string")]
+fn carrier_area_returns_string(world: &mut AcceptanceWorld) {
+    let source = format!(
+        "{CARRIER_PREAMBLE}\n\
+         ---@impl Shape for Circle\n\
+         ---@return string\n\
+         function Circle:area()\n  return \"round\"\nend\n"
+    );
+    write_file(world, "src/main.lua", &source);
+}
+
+#[given("a carrier table with ---@impl Drawable for Circle but no Shape impl")]
+fn carrier_drawable_without_shape(world: &mut AcceptanceWorld) {
+    let source =
+        format!("{CARRIER_PREAMBLE}\n---@impl Drawable for Circle\nfunction Circle:draw()\nend\n");
+    write_file(world, "src/main.lua", &source);
+}
+
+#[given("a carrier table with ---@impl Shape for Circle defining area and an inherent helper")]
+fn carrier_with_inherent_helper(world: &mut AcceptanceWorld) {
+    let source = format!(
+        "{CARRIER_PREAMBLE}\n\
+         ---@impl Shape for Circle\n\
+         function Circle:area()\n  return 1\nend\n\
+         \n\
+         function Circle:helper()\n  return 2\nend\n"
+    );
+    write_file(world, "src/main.lua", &source);
+}
+
+#[given("a ---@class annotated table with ---@impl Shape for Square")]
+fn class_table_with_impl(world: &mut AcceptanceWorld) {
+    let source = "\
+---@use geometry
+
+---@class Square
+---@field side number
+local Square = {}
+Square.__index = Square
+
+---@impl Shape for Square
+function Square:area()
+  return self.side * self.side
+end
+";
+    write_file(world, "src/main.lua", source);
+}
+
+#[given("a Lua function annotated ---@param p Point reading p.x")]
+fn lua_function_reading_point(world: &mut AcceptanceWorld) {
+    let source = "\
+---@use geometry
+
+---@param p Point
+---@return number
+local function get_x(p)
+  return p.x
+end
+
+get_x({ x = 1, y = 2 })
+";
+    write_file(world, "src/main.lua", source);
+}
+
+#[given("a Lua file with ---@use missing_module")]
+fn lua_file_with_missing_use(world: &mut AcceptanceWorld) {
+    write_file(world, "src/main.lua", "---@use missing_module\n");
+}
+
+#[given("a shape module containing a fn with a body")]
+fn shape_module_with_body(world: &mut AcceptanceWorld) {
+    write_file(
+        world,
+        "src/bad.lb",
+        "trait Shape {\n    fn area(self) -> number { return 1 }\n}\n",
+    );
+}
+
+#[then(expr = "diagnostic {word} is reported naming field {string}")]
+#[then(expr = "diagnostic {word} is reported naming key {string}")]
+#[then(expr = "diagnostic {word} is reported listing {string}")]
+fn diagnostic_reported_naming(world: &mut AcceptanceWorld, code: String, name: String) {
+    let stdout = world.stdout();
+    assert!(
+        stdout.contains(&code),
+        "expected diagnostic `{code}`; stdout:\n{stdout}\nstderr:\n{}",
+        world.stderr()
+    );
+    let quoted = format!("`{name}`");
+    assert!(
+        stdout.contains(&quoted),
+        "expected `{code}` to name {quoted}; stdout:\n{stdout}"
+    );
+}
+
+#[then(expr = "diagnostic {word} is reported with both spans")]
+fn diagnostic_with_both_spans(world: &mut AcceptanceWorld, code: String) {
+    let stdout = world.stdout();
+    assert!(
+        stdout.contains(&code),
+        "expected diagnostic `{code}`; stdout:\n{stdout}\nstderr:\n{}",
+        world.stderr()
+    );
+    for file in ["main.lua", "geometry.lb"] {
+        assert!(
+            stdout.contains(file),
+            "expected `{code}` to show a span in `{file}`; stdout:\n{stdout}"
+        );
+    }
+}
+
+#[then("zero shape diagnostics are reported")]
+fn zero_shape_diagnostics(world: &mut AcceptanceWorld) {
+    let output = format!("{}\n{}", world.stdout(), world.stderr());
+    assert!(
+        !output.contains("LB2"),
+        "expected no LB2xxx diagnostics; output:\n{output}"
+    );
+}
+
+#[then("zero diagnostics are reported")]
+fn zero_diagnostics(world: &mut AcceptanceWorld) {
+    let stdout = world.stdout();
+    assert!(
+        !stdout.contains("LB"),
+        "expected no diagnostics at all; stdout:\n{stdout}\nstderr:\n{}",
+        world.stderr()
+    );
+}
+
 #[then("stdout is valid JSON")]
 fn stdout_is_valid_json(world: &mut AcceptanceWorld) {
     let stdout = world.stdout();

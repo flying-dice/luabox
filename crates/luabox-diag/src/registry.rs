@@ -482,94 +482,255 @@ typed paradigm with its own owner and toolchain; luabox's typed story is the
 const LB2001: &str = "\
 # LB2001: missing non-optional field on shape-bound literal
 
-A table bound to a struct with `---@struct` (or produced by
-`setmetatable(literal, Carrier)`) omits a field the struct declares as
-non-optional. Structs are *sealed*: every non-`?` field must be present.
+A table bound to a struct with `---@struct` (or passed to
+`setmetatable(literal, Carrier)` where the carrier is struct-bound) omits a
+field the struct declares as non-optional. Structs are *sealed* (SHAPES.md
+§5): every field not marked `?` must be present.
+
+```rust
+// geometry.lb
+struct Point { x: number, y: number, label: string? }
+```
+
+```lua
+---@use geometry
+
+---@struct Point
+local p = { x = 0 }        -- LB2001: missing non-optional field `y`
+                           -- (`label` may be omitted: it is `string?`)
+```
+
+Shape rules are hard errors at every strictness level — the `---@struct`
+binding is itself the opt-in.
 
 Add the missing field, or mark it optional in the `.lb` declaration
 (`field: T?`).
-
-Reserved code — the shape checker that emits it lands in P1. See SHAPES.md §5.
 ";
 
 const LB2002: &str = "\
 # LB2002: unknown key on sealed shape
 
-A read or write used a key the struct does not declare. Sealed structs reject
-unknown keys. To allow extra keys, open the struct with `..` in its `.lb`
-declaration (extras then type as `unknown`).
+A table literal, field read, or field write used a key the struct does not
+declare. Sealed structs reject unknown keys outright (SHAPES.md §5).
 
-Reserved code — the shape checker that emits it lands in P1. See SHAPES.md §5.
+```rust
+// geometry.lb
+struct Point { x: number, y: number }
+struct Bag { n: number, .. }          // `..` opens the shape
+```
+
+```lua
+---@use geometry
+
+---@struct Point
+local p = { x = 0, y = 0, z = 0 }   -- LB2002: unknown key `z`
+p.w = 1                             -- LB2002: unknown key `w`
+print(p.v)                          -- LB2002: unknown key `v`
+
+---@struct Bag
+local b = { n = 1, extra = true }   -- fine: Bag is open, extras are `unknown`
+```
+
+Remove the key, add the field to the struct, or open the struct with `..`
+(extra keys then type as `unknown`). Carrier method names (`function
+Point:magnitude()`) and `__`-prefixed metafields are always allowed.
 ";
 
 const LB2003: &str = "\
 # LB2003: incomplete `---@impl`
 
-An `---@impl Trait for Struct` carrier does not define every function the trait
-requires. The diagnostic lists the missing functions; a fix-it can generate
-stubs for them.
+An `---@impl Trait for Struct` carrier does not define every function the
+trait requires. The diagnostic lists all missing functions.
 
-Reserved code — the shape checker that emits it lands in P1. See SHAPES.md §5.
+```rust
+// geometry.lb
+trait Shape {
+    fn area(self) -> number;
+    fn perimeter(self) -> number;
+}
+struct Circle { radius: number }
+```
+
+```lua
+---@use geometry
+
+---@struct Circle
+local Circle = {}
+Circle.__index = Circle
+
+---@impl Shape for Circle           -- LB2003: missing `perimeter`
+function Circle:area()
+  return math.pi * self.radius ^ 2
+end
+```
+
+Define the listed functions on the same carrier (`function Circle:perimeter()
+... end`). Extra inherent methods beyond the trait are always fine.
 ";
 
 const LB2004: &str = "\
 # LB2004: impl signature mismatch
 
-A function on an `---@impl` carrier does not match the trait signature:
-parameters are contravariant, returns covariant, and a `:` vs `.` receiver
-must agree with `self`. Both the trait and the implementation spans are shown.
+A function on an `---@impl` carrier does not match the trait's declared
+signature. Parameters are contravariant (the implementation must accept
+everything the trait promises callers may pass), returns are covariant (the
+implementation must return something the trait's return type accepts), and
+the `:` vs `.` receiver must agree with `self` in the trait. Both spans are
+shown: the implementation and the trait declaration.
 
-Reserved code — the shape checker that emits it lands in P1. See SHAPES.md §5.
+```rust
+// geometry.lb
+trait Shape {
+    fn area(self) -> number;
+}
+struct Circle { radius: number }
+```
+
+```lua
+---@use geometry
+
+---@struct Circle
+local Circle = {}
+Circle.__index = Circle
+
+---@impl Shape for Circle
+---@return string
+function Circle:area()             -- LB2004: expected return `number`,
+  return \"round\"                   --         found `string`
+end
+```
+
+Also raised when the arity differs, when a parameter type cannot accept the
+trait's, and when a `self` trait function is declared with `.` (or vice
+versa). A `.`-declared function with an explicit leading `self` parameter
+counts as taking `self`. `Result<T, E>` in a trait return position means the
+multi-return pair `(T?, E?)` — annotate the implementation `---@return T?,
+E?` (SHAPES.md §12.1).
 ";
 
 const LB2005: &str = "\
 # LB2005: unresolved `---@use` module
 
-A `---@use <module>` (or a `use` inside a `.lb` file) names a shape module that
-could not be resolved. Resolution tries, in order: a sibling `<name>.lb`, the
-`[types] shape-paths` directories, then dependency-exported shapes (SHAPES.md
-§6). Same-tier ambiguity is also an error.
+A `---@use <module>` (or a `use` inside a `.lb` file) names a shape module
+that could not be resolved. Resolution tries, first hit wins (SHAPES.md §6):
 
-Reserved code — the shape checker that emits it lands in P1. See SHAPES.md §5.
+1. a sibling `<module>.lb` next to the using file;
+2. the `[types] shape-paths` directories from `luabox.toml`, in order —
+   more than one hit *within* this tier is an ambiguity, also this error;
+3. dependency-exported shapes (`[types] shapes` in the dependency's
+   manifest) — **not searched yet**; that tier lands in P2.
+
+```lua
+---@use geometry     -- LB2005 if no geometry.lb is found in tiers 1–2
+```
+
+Create the `.lb` file next to the using file, add its directory to
+`[types] shape-paths`, or fix the spelling. For an ambiguity, remove or
+rename one of the competing files (the diagnostic lists the candidates).
 ";
 
 const LB2006: &str = "\
 # LB2006: `---@struct` names an undeclared struct
 
-A `---@struct <Name>` annotation refers to a struct that no in-scope shape
-module declares. Check the name and that the module is imported with `---@use`.
+A `---@struct <Name>` (or the trait/struct in an `---@impl`) refers to a
+name that no shape module in scope declares.
 
-Reserved code — the shape checker that emits it lands in P1. See SHAPES.md §5.
+```rust
+// geometry.lb
+struct Point { x: number, y: number }
+```
+
+```lua
+---@use geometry
+
+---@struct Piont      -- LB2006: undeclared struct (typo)
+local p = { x = 0, y = 0 }
+```
+
+Check the spelling, and check the declaring module is imported with
+`---@use`. For `---@impl T for S`, `S` may also be a `---@class` declared in
+the same file (LuaCATS interop) — but `T` must be a `.lb` trait.
 ";
 
 const LB2007: &str = "\
 # LB2007: generic bound unsatisfied
 
-A generic shape was instantiated with a type argument that does not satisfy the
-declared bound. Generics are monomorphised per use site and bound violations
-are reported at the call, rustc-style.
+A generic shape was instantiated with a type argument that does not satisfy
+the parameter's declared bound. Generics are monomorphised per use site and
+violations are reported at the use site, rustc-style (SHAPES.md §5).
 
-Reserved code — the shape checker that emits it lands in P1. See SHAPES.md §5.
+```rust
+// geometry.lb
+trait Shape { fn area(self) -> number; }
+struct Circle { radius: number }
+impl Shape for Circle;
+
+struct Holder<T: Shape> { value: T }
+struct Ok  { h: Holder<Circle> }   // fine: impl Shape for Circle
+struct Bad { h: Holder<number> }   // LB2007: `number` is not `Shape`
+```
+
+The same check runs at `.lua` binding sites (`---@struct Holder<number>`).
+Conformance comes from an `impl Bound for Arg;` assertion in a shape module
+in scope. Also raised for a wrong number of type arguments.
 ";
 
 const LB2008: &str = "\
 # LB2008: supertrait conformance missing
 
-An `impl` for a trait with supertraits (`trait Drawable: Shape`) requires the
-carrier to also conform to every supertrait. Add the missing `---@impl` for the
-supertrait on the same carrier.
+An `---@impl` of a trait with supertraits (`trait Drawable: Shape`) requires
+the carrier to conform to every supertrait as well, on the same carrier.
 
-Reserved code — the shape checker that emits it lands in P1. See SHAPES.md §5.
+```rust
+// geometry.lb
+trait Shape    { fn area(self) -> number; }
+trait Drawable: Shape { fn draw(self); }
+struct Circle  { radius: number }
+```
+
+```lua
+---@use geometry
+
+---@struct Circle
+local Circle = {}
+Circle.__index = Circle
+
+---@impl Drawable for Circle       -- LB2008: `Shape` conformance missing
+function Circle:draw() end
+```
+
+Add `---@impl Shape for Circle` (with its required functions) to the same
+carrier, or assert `impl Shape for Circle;` in a `.lb` module.
 ";
 
 const LB2010: &str = "\
 # LB2010: body in `.lb` file
 
-A `.lb` file contains a body or expression. Shape files are declaration-only:
-no bodies, no expressions. Implementations live in `.lua` and bind with
-`---@impl`.
+A `.lb` shape file contains a function body. Shape files are
+declaration-only — no bodies, no expressions (SHAPES.md §3). Implementations
+live in `.lua` and bind with `---@impl`.
 
-Reserved code — the shape parser that emits it lands in P1. See SHAPES.md §5.
+```rust
+// geometry.lb
+trait Shape {
+    fn area(self) -> number { return 1 }   // LB2010
+}
+```
+
+Write the signature only, terminated with `;`:
+
+```rust
+trait Shape {
+    fn area(self) -> number;
+}
+```
+
+and implement it in Lua:
+
+```lua
+---@impl Shape for Circle
+function Circle:area() return math.pi * self.radius ^ 2 end
+```
 ";
 
 #[cfg(test)]

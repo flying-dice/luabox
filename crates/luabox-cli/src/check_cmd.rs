@@ -11,7 +11,15 @@
 //!    Duplicate findings (same code, same range) are reported once.
 //! 3. **Typecheck** (annotation-driven, per-file environment; cross-file
 //!    `require` resolution is P1) at the manifest's strictness:
-//!    `[types] strict = true` → strict (errors), otherwise warn.
+//!    `[types] strict = true` → strict (errors), otherwise warn — plus
+//!    `.lb` shape bindings (`---@use`/`---@struct`/`---@impl`, SHAPES.md),
+//!    whose `LB2xxx` rules are hard errors at every strictness.
+//!
+//! `.lb` shape modules are checked too: parse errors (including `LB2010`
+//! body rejection) and shape-level diagnostics (`LB2005`/`LB2007`) carry
+//! the `.lb` file and spans. Shape resolution uses the file's directory
+//! (sibling tier) plus the manifest's `[types] shape-paths`; parsed
+//! modules are cached in a store shared across the rayon workers.
 //!
 //! Output goes to stdout in the chosen format; a `check: N errors, M
 //! warnings in K files` summary goes to stderr. The exit code is nonzero
@@ -26,7 +34,7 @@ use anyhow::{Context, bail};
 use luabox_diag::{Code, Diagnostic, Format, Label, Severity, Span, render};
 use luabox_resolve::manifest::Manifest;
 use luabox_syntax::{Dialect, lua};
-use luabox_types::Strictness;
+use luabox_types::{ShapeOptions, ShapeStore, Strictness};
 use rayon::prelude::*;
 
 /// Execute `luabox check` from `cwd`.
@@ -48,34 +56,63 @@ pub fn run(cwd: &Path, target: Option<&str>, format: &str) -> anyhow::Result<()>
         target_dialect = Some(dialect);
     }
 
-    let files = collect_lua_files(&project)?;
+    let (lua_files, lb_files) = collect_files(&project)?;
+    // Shape modules are parsed once and cached across workers.
+    let store = ShapeStore::new(project.root.clone());
     // SPEC.md §16: rayon per-module. Files are independent (cross-file
     // resolution is P1); collecting per-file Vecs preserves source order.
-    let per_file: Vec<anyhow::Result<Vec<Diagnostic>>> = files
+    let per_file: Vec<anyhow::Result<Vec<Diagnostic>>> = lua_files
         .par_iter()
         .map(|path| {
             let rel = display_rel(path, &project.root);
             let source =
                 fs::read_to_string(path).with_context(|| format!("cannot read `{rel}`"))?;
             let mut diags = Vec::new();
-            check_one(&source, &rel, &project, target_dialect, &mut diags);
+            check_one(
+                &source,
+                &rel,
+                path,
+                &project,
+                target_dialect,
+                &store,
+                &mut diags,
+            );
             Ok(diags)
         })
         .collect();
+    // `.lb` shape files get their own pass: parse errors (LB2010, LB0001)
+    // plus shape-level diagnostics attributed to the declaring file.
+    let per_lb: Vec<anyhow::Result<Vec<Diagnostic>>> = lb_files
+        .par_iter()
+        .map(|path| {
+            let rel = display_rel(path, &project.root);
+            let source =
+                fs::read_to_string(path).with_context(|| format!("cannot read `{rel}`"))?;
+            Ok(store.check_lb_file(path, &source, &project.shape_paths))
+        })
+        .collect();
     let mut diags: Vec<Diagnostic> = Vec::new();
-    for result in per_file {
+    for result in per_file.into_iter().chain(per_lb) {
         diags.extend(result?);
     }
 
-    finish(&diags, format, &project.root, files.len())
+    finish(
+        &diags,
+        format,
+        &project.root,
+        lua_files.len() + lb_files.len(),
+    )
 }
 
 /// All three passes for one file.
+#[allow(clippy::too_many_arguments)]
 fn check_one(
     source: &str,
     rel: &str,
+    path: &Path,
     project: &Project,
     target: Option<Dialect>,
+    store: &ShapeStore,
     diags: &mut Vec<Diagnostic>,
 ) {
     let parse = lua::parse(source, project.dialect);
@@ -118,8 +155,21 @@ fn check_one(
         }
     }
 
-    // 3. Types.
-    diags.extend(luabox_types::check_file(&parse, rel, project.strictness));
+    // 3. Types + shape bindings (SHAPES.md §4–§6). Shape resolution needs
+    // the file's own directory (sibling tier) plus the manifest's
+    // `[types] shape-paths`.
+    let file_dir = path.parent().unwrap_or(&project.root);
+    let opts = ShapeOptions {
+        store,
+        file_dir,
+        shape_paths: &project.shape_paths,
+    };
+    diags.extend(luabox_types::check_file_shaped(
+        &parse,
+        rel,
+        project.strictness,
+        Some(&opts),
+    ));
 }
 
 /// Render, summarize, and translate error count into the exit code.
@@ -175,6 +225,8 @@ struct Project {
     dialect: Dialect,
     strictness: Strictness,
     out_dir: Option<PathBuf>,
+    /// `[types] shape-paths`, absolute, in manifest order (SHAPES.md §6).
+    shape_paths: Vec<PathBuf>,
 }
 
 /// Find the project: nearest `luabox.toml` walking up from `cwd`
@@ -207,6 +259,12 @@ fn discover(cwd: &Path) -> anyhow::Result<Project> {
                 dialect,
                 strictness: Strictness::from_manifest_flag(manifest.types.strict),
                 out_dir: Some(current.join(&manifest.build.out)),
+                shape_paths: manifest
+                    .types
+                    .shape_paths
+                    .iter()
+                    .map(|p| current.join(p))
+                    .collect(),
             });
         }
         dir = current.parent();
@@ -216,19 +274,25 @@ fn discover(cwd: &Path) -> anyhow::Result<Project> {
         dialect: Dialect::Lua54,
         strictness: Strictness::Warn,
         out_dir: None,
+        shape_paths: Vec::new(),
     })
 }
 
-/// All `*.lua` files under the project root, deterministic order, skipping
-/// dot-directories and the build output directory. (`.lb` shape modules
-/// are checked by the P1 shape checker, not here.)
-fn collect_lua_files(project: &Project) -> anyhow::Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    walk(&project.root, project, &mut files)?;
-    Ok(files)
+/// All `*.lua` and `*.lb` files under the project root, deterministic
+/// order, skipping dot-directories and the build output directory.
+fn collect_files(project: &Project) -> anyhow::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let mut lua = Vec::new();
+    let mut lb = Vec::new();
+    walk(&project.root, project, &mut lua, &mut lb)?;
+    Ok((lua, lb))
 }
 
-fn walk(dir: &Path, project: &Project, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+fn walk(
+    dir: &Path,
+    project: &Project,
+    lua: &mut Vec<PathBuf>,
+    lb: &mut Vec<PathBuf>,
+) -> anyhow::Result<()> {
     let mut entries: Vec<_> = fs::read_dir(dir)
         .with_context(|| format!("cannot read directory `{}`", dir.display()))?
         .collect::<Result<_, _>>()
@@ -240,10 +304,14 @@ fn walk(dir: &Path, project: &Project, files: &mut Vec<PathBuf>) -> anyhow::Resu
         if path.is_dir() {
             let is_out = project.out_dir.as_deref() == Some(path.as_path());
             if !hidden && !is_out {
-                walk(&path, project, files)?;
+                walk(&path, project, lua, lb)?;
             }
-        } else if !hidden && path.extension().and_then(|e| e.to_str()) == Some("lua") {
-            files.push(path);
+        } else if !hidden {
+            match path.extension().and_then(|e| e.to_str()) {
+                Some("lua") => lua.push(path),
+                Some("lb") => lb.push(path),
+                _ => {}
+            }
         }
     }
     Ok(())

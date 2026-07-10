@@ -1,4 +1,3 @@
-@wip
 Feature: Sealed shape checking
   SHAPES.md §5 — structs are sealed: missing non-optional fields and unknown
   keys are hard errors at every strictness level; `..` opens the shape.

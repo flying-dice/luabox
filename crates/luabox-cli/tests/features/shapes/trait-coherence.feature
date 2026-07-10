@@ -1,4 +1,3 @@
-@wip
 Feature: Trait coherence
   SHAPES.md §5 — ---@impl enforces completeness and signature compatibility;
   supertraits must be conformed on the same carrier.

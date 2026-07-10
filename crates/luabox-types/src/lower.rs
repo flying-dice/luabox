@@ -16,12 +16,18 @@ use luabox_syntax::luacats::{
 use crate::ty::{FieldTy, FunctionTy, ParamTy, TableTy, Ty};
 
 /// The type names a file declares, collected before lowering so forward
-/// references resolve.
+/// references resolve. Shape names imported via `---@use` participate so
+/// LuaCATS annotations can reference `.lb` structs/traits (interop,
+/// SHAPES.md §3) without tripping LB0305.
 #[derive(Debug, Default)]
 pub(crate) struct Declared {
     pub classes: BTreeSet<String>,
     pub enums: BTreeSet<String>,
     pub aliases: BTreeMap<String, AliasTag>,
+    /// `.lb` struct/trait names in scope — lower to [`Ty::Named`].
+    pub shape_names: BTreeSet<String>,
+    /// Concrete `.lb` aliases in scope — pre-lowered, substituted inline.
+    pub shape_aliases: BTreeMap<String, Ty>,
 }
 
 /// Lowers [`TypeExpr`]s against a set of declared names, recording every
@@ -88,6 +94,12 @@ impl<'a> Lowerer<'a> {
         }
         if self.decl.classes.contains(name) || self.decl.enums.contains(name) {
             // TODO(P1): generic classes — `args` are ignored for now.
+            return Ty::Named(name.to_string());
+        }
+        if let Some(ty) = self.decl.shape_aliases.get(name) {
+            return ty.clone();
+        }
+        if self.decl.shape_names.contains(name) {
             return Ty::Named(name.to_string());
         }
         self.unknown_names.push((name.to_string(), span));

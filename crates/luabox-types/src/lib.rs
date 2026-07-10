@@ -26,13 +26,15 @@ mod assign;
 mod check;
 mod env;
 mod lower;
+pub mod shape;
 pub mod ty;
 
 pub use assign::assignable;
 pub use env::TypeEnv;
+pub use shape::{ShapeOptions, ShapeStore};
 
 use luabox_diag::Diagnostic;
-use luabox_syntax::lua;
+use luabox_syntax::{lua, luacats};
 
 /// The strictness ladder (SPEC.md §3): `none` → `warn` → `strict`.
 ///
@@ -65,18 +67,60 @@ impl Strictness {
     }
 }
 
-/// Typecheck one parsed file against its own annotations.
+/// Typecheck one parsed file against its own annotations (no `.lb` shape
+/// resolution — see [`check_file_shaped`]).
 ///
 /// `file` names the file in diagnostic spans. Cross-file `require`
 /// resolution is P1 — every file is checked against a per-file
 /// environment.
 #[must_use]
 pub fn check_file(parse: &lua::Parse, file: &str, strictness: Strictness) -> Vec<Diagnostic> {
-    if strictness == Strictness::None {
-        return Vec::new();
+    check_file_shaped(parse, file, strictness, None)
+}
+
+/// Typecheck one parsed file, resolving `---@use`/`---@struct`/`---@impl`
+/// shape bindings when `shapes` is provided (SHAPES.md §4–§6).
+///
+/// Shape rules (`LB2xxx`) are **hard errors at every strictness level**,
+/// including `none` — the binding tags are themselves the opt-in, so the
+/// strictness ladder only governs the ordinary `LB03xx` diagnostics.
+/// Files that use no shape tags never touch the shape machinery
+/// (zero-cost, SHAPES.md invariant 4).
+#[must_use]
+pub fn check_file_shaped(
+    parse: &lua::Parse,
+    file: &str,
+    strictness: Strictness,
+    shapes: Option<&ShapeOptions<'_>>,
+) -> Vec<Diagnostic> {
+    let items = luacats::harvest(parse);
+
+    let mut diags: Vec<Diagnostic> = Vec::new();
+    let scope = match shapes {
+        Some(opts) if shape::uses_shapes(&items) => {
+            let (scope, use_diags) = shape::resolve_uses(&items, opts, file);
+            diags.extend(use_diags);
+            Some(scope)
+        }
+        _ => None,
+    };
+
+    let env = TypeEnv::build_from_items(parse, &items, scope.as_ref());
+    if strictness != Strictness::None {
+        diags.extend(check::run(
+            parse,
+            &env,
+            file,
+            strictness == Strictness::Strict,
+        ));
     }
-    let env = TypeEnv::build(parse);
-    check::run(parse, &env, file, strictness == Strictness::Strict)
+    if let Some(scope) = &scope {
+        diags.extend(shape::check_bindings(
+            parse, &items, scope, &env, file, strictness,
+        ));
+    }
+    diags.sort_by_key(|d| d.primary_label().map_or(0, |l| l.span.range.start));
+    diags
 }
 
 #[cfg(test)]

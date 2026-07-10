@@ -1,4 +1,3 @@
-@wip
 Feature: Ecosystem interop
   SHAPES.md §3 — two type front-ends, one IR. Interop between LuaCATS
   annotations and .lb shapes is total.

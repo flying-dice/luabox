@@ -190,6 +190,6 @@ P0+: `.lb` grammar + parser + fmt (additive, no Lua-checking dependency). P1: IR
 
 ## 12. Open questions (escalate, don't guess)
 
-1. `Result<T,E>` as `(T?, E?)` loses the exactly-one invariant — accept convention at P1, revisit sum types post-P3?
+1. **Resolved (P1, ticket #66):** `Result<T,E>` as `(T?, E?)` loses the exactly-one invariant — convention **accepted at P1** as proposed; revisit sum types post-P3. Implemented: in return position `Result<T,E>` lowers to the multi-return pair `(T?, E?)` (a conforming impl annotates `---@return T?, E?`); outside return position it degrades to `T | E | nil`.
 2. Trait default method bodies — banned in v1; `default fn` + base-table convention later?
 3. `impl Shape + Drawable for Circle;` sugar — decide at parser review.

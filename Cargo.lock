@@ -773,6 +773,7 @@ dependencies = [
  "luabox-diag",
  "luabox-hir",
  "luabox-syntax",
+ "tempfile",
 ]
 
 [[package]]

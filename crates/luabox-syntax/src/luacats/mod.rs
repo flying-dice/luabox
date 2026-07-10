@@ -252,6 +252,38 @@ pub struct UnknownTag {
     pub span: Span,
 }
 
+/// luabox `---@use <module>` — import a `.lb` shape module (SHAPES.md §4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UseTag {
+    /// The (possibly dotted) module path.
+    pub module: String,
+    pub span: Span,
+}
+
+/// luabox `---@struct <Struct>` — bind the following value to a `.lb`
+/// struct (SHAPES.md §4). Generic use sites (`---@struct Pair<number>`)
+/// keep their argument list as raw text; the shape checker parses it with
+/// the shape type grammar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructTag {
+    /// The struct name (without generic arguments).
+    pub name: String,
+    /// Raw text inside `<...>`, when the use site is generic.
+    pub args: Option<String>,
+    pub span: Span,
+}
+
+/// luabox `---@impl <Trait> for <Struct>` — conformance assertion
+/// (SHAPES.md §4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImplTag {
+    /// The trait being implemented.
+    pub trait_name: String,
+    /// The struct (or LuaCATS class) implementing it.
+    pub struct_name: String,
+    pub span: Span,
+}
+
 /// A single parsed `---@` tag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Tag {
@@ -276,6 +308,12 @@ pub enum Tag {
     Package(SimpleTag),
     Operator(OperatorTag),
     Vararg(VarargTag),
+    /// luabox shape import (`---@use`).
+    Use(UseTag),
+    /// luabox struct binding (`---@struct`).
+    Struct(StructTag),
+    /// luabox trait conformance (`---@impl`).
+    Impl(ImplTag),
     Unknown(UnknownTag),
 }
 
@@ -306,6 +344,9 @@ impl Tag {
             | Tag::Version(t)
             | Tag::Source(t)
             | Tag::Package(t) => t.span,
+            Tag::Use(t) => t.span,
+            Tag::Struct(t) => t.span,
+            Tag::Impl(t) => t.span,
             Tag::Unknown(t) => t.span,
         }
     }
@@ -451,6 +492,9 @@ fn parse_tag(
             ty: parse_one_type(body, base, errors),
             span,
         }),
+        "use" => Tag::Use(parse_use(body, base, span)),
+        "struct" => Tag::Struct(parse_struct(body, base, span)),
+        "impl" => Tag::Impl(parse_impl(body, base, span)),
         "see" => Tag::See(simple(body, span)),
         "deprecated" => Tag::Deprecated(simple(body, span)),
         "nodiscard" => Tag::Nodiscard(simple(body, span)),
@@ -816,6 +860,53 @@ fn parse_enum(body: &str, base: usize, span: Span) -> EnumTag {
     };
     let name = take_name(s, base).map_or_else(String::new, |(n, ..)| n);
     EnumTag { key, name, span }
+}
+
+/// `---@use <module>` — the module path is the first name-like word.
+fn parse_use(body: &str, base: usize, span: Span) -> UseTag {
+    let module = take_name(body, base).map_or_else(String::new, |(n, ..)| n);
+    UseTag { module, span }
+}
+
+/// `---@struct <Name>[<Args>]` — the name plus the raw generic-argument
+/// text (the shape checker parses arguments with the shape grammar).
+fn parse_struct(body: &str, base: usize, span: Span) -> StructTag {
+    let (name, rest, _) = take_name(body, base).unwrap_or_else(|| (String::new(), body, base));
+    let rest = rest.trim_start();
+    let args = rest.strip_prefix('<').and_then(|inner| {
+        // Take up to the matching top-level `>` (nested generics balance).
+        let mut depth = 1usize;
+        for (i, ch) in inner.char_indices() {
+            match ch {
+                '<' => depth += 1,
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(inner[..i].trim().to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    });
+    StructTag { name, args, span }
+}
+
+/// `---@impl <Trait> for <Struct>`.
+fn parse_impl(body: &str, base: usize, span: Span) -> ImplTag {
+    let (trait_name, rest, rest_base) =
+        take_name(body, base).unwrap_or_else(|| (String::new(), body, base));
+    let (rest, rest_base) = lstrip(rest, rest_base);
+    let struct_name = rest
+        .strip_prefix("for")
+        .and_then(|after| take_name(after, rest_base + 3))
+        .map_or_else(String::new, |(n, ..)| n);
+    ImplTag {
+        trait_name,
+        struct_name,
+        span,
+    }
 }
 
 fn parse_operator(
