@@ -275,3 +275,11 @@ crates/
 - Registry namespaces flat vs scoped `@org/pkg`. Proposal: scoped.
 - C-module story beyond prebuilt artifacts: out of scope until P5+.
 - Verify `luabox` unclaimed (crates.io, GitHub, luarocks, npm) before any public artifact.
+  **Checked 2026-07 (ticket #10):** free on crates.io/npm/PyPI/Homebrew — claim placeholder
+  crates before any public artifact. **Taken on LuaRocks** (active terminal library by
+  Sylviettee/SovietKitsune) — the bare name is unavailable in exactly the ecosystem the §6
+  bridge targets; strengthens the scoped-namespace proposal. `github.com/luabox` handle is
+  squatted (dormant since 2018) — pick a fallback org. **`lb` alias:** collides with Debian
+  `live-build`'s `/usr/bin/lb` and is squatted on npm/PyPI/crates.io — recommend shipping it
+  as a documented shell alias, not an installed binary. Decisions pending: LuaRocks name
+  strategy, `lb` shipping mode.
