@@ -824,7 +824,13 @@ dependencies = [
 name = "luabox-bundle"
 version = "0.1.0"
 dependencies = [
+ "luabox-hir",
  "luabox-lower",
+ "luabox-syntax",
+ "rowan",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -834,6 +840,7 @@ dependencies = [
  "anyhow",
  "clap",
  "cucumber",
+ "luabox-bundle",
  "luabox-diag",
  "luabox-lint",
  "luabox-lower",
@@ -849,6 +856,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "toml_edit",
 ]
 
 [[package]]

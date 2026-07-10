@@ -88,6 +88,37 @@ pub struct Lowered {
 /// floats targeting 5.1) are left untouched here and surface via the
 /// caller's residual validation of the output under `to`.
 pub fn lower(source: &str, from: Dialect, to: Dialect) -> Result<Lowered, Vec<LowerDiagnostic>> {
+    lower_impl(source, from, to, true)
+}
+
+/// Like [`lower`], but the returned text carries **no** `__luabox_rt`
+/// prelude even when helpers are used ([`Lowered::polyfills`] still lists
+/// them). For callers that hoist one shared prelude over many lowered
+/// files — the bundler dedupes the prelude across all modules of a bundle
+/// and emits it once at bundle top via [`rt_prelude`].
+pub fn lower_bare(
+    source: &str,
+    from: Dialect,
+    to: Dialect,
+) -> Result<Lowered, Vec<LowerDiagnostic>> {
+    lower_impl(source, from, to, false)
+}
+
+/// Render the `__luabox_rt` prelude a set of helpers needs, or `None` when
+/// the set is empty (zero-cost invariant). The bundler pairs this with
+/// [`lower_bare`]: lower every module bare, union their helper sets
+/// ([`Helper::from_name`] round-trips [`Lowered::polyfills`]), emit one
+/// prelude. `from`/`to` select the backend exactly as [`lower`] does.
+pub fn rt_prelude(used: &BTreeSet<Helper>, from: Dialect, to: Dialect) -> Option<String> {
+    polyfill::prelude(used, from, to)
+}
+
+fn lower_impl(
+    source: &str,
+    from: Dialect,
+    to: Dialect,
+    with_prelude: bool,
+) -> Result<Lowered, Vec<LowerDiagnostic>> {
     if from == to {
         return Ok(Lowered {
             text: source.to_owned(),
@@ -127,7 +158,7 @@ pub fn lower(source: &str, from: Dialect, to: Dialect) -> Result<Lowered, Vec<Lo
     }
 
     let mut text = edit::apply(source, edits);
-    if let Some(prelude) = polyfill::prelude(&ctx.helpers, from, to) {
+    if with_prelude && let Some(prelude) = polyfill::prelude(&ctx.helpers, from, to) {
         text.insert_str(0, &prelude);
     }
     Ok(Lowered {

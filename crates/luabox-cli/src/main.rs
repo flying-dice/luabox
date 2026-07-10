@@ -176,6 +176,14 @@ enum Command {
     Audit,
     /// Explain a diagnostic code (e.g. LB0421)
     Explain { code: String },
+    /// Rewrite bundle line references in a traceback via its .lua.map
+    Unmap {
+        /// Path to the bundle; the map is read from `<bundle>.map`
+        bundle: PathBuf,
+        /// Traceback text (joined with spaces); read from stdin when omitted
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        traceback: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -252,11 +260,16 @@ fn main() -> anyhow::Result<()> {
         Command::Doc { .. } => unimplemented("doc", "P5"),
         Command::Publish => unimplemented("publish", "P2"),
         Command::Lsp { .. } => lsp_cmd::run(),
-        Command::Toolchain { action } => match action {
-            Some(ToolchainAction::Install { version }) => toolchain_cmd::install(&version),
-            Some(ToolchainAction::Pin { version }) => toolchain_cmd::pin(&version),
-            Some(ToolchainAction::List) | None => toolchain_cmd::list(),
-        },
+        Command::Toolchain { action } => {
+            let cwd = std::env::current_dir()?;
+            match action {
+                Some(ToolchainAction::Install { version }) => {
+                    toolchain_cmd::install(&cwd, &version)
+                }
+                Some(ToolchainAction::Pin { version }) => toolchain_cmd::pin(&cwd, &version),
+                Some(ToolchainAction::List) | None => toolchain_cmd::list(&cwd),
+            }
+        }
         Command::Vendor => deps_cmd::vendor(&std::env::current_dir()?),
         Command::Audit => unimplemented("audit", "P5"),
         Command::Explain { code } => {
@@ -270,6 +283,14 @@ fn main() -> anyhow::Result<()> {
                 }
                 None => bail!("no such diagnostic code `{parsed}`; codes look like LB0421"),
             }
+        }
+        Command::Unmap { bundle, traceback } => {
+            let text = if traceback.is_empty() {
+                None
+            } else {
+                Some(traceback.join(" "))
+            };
+            bundle_cmd::unmap(&std::env::current_dir()?, &bundle, text.as_deref())
         }
     }
 }

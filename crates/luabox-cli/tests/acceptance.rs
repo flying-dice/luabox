@@ -738,3 +738,241 @@ fn build_output_matches_stash(world: &mut AcceptanceWorld) {
         );
     }
 }
+
+// --- run (execution/run.feature — #28) ------------------------------------
+//
+// Task scenarios use shell builtins (`echo`, `exit`) that behave the same
+// under `cmd /C` and `sh -c`, so they need no OS-specific fixture. The
+// script scenarios reuse the "fake Lua runtime" idea from
+// execution/test.feature, but with `run`-specific fakes: one that echoes
+// its argv (to prove args pass through to the script invocation), one that
+// always fails (to prove the script's exit code propagates).
+
+#[then(expr = "stdout does not contain {string}")]
+fn stdout_does_not_contain(world: &mut AcceptanceWorld, needle: String) {
+    let stdout = world.stdout();
+    assert!(
+        !stdout.contains(&needle),
+        "stdout should not contain `{needle}`; stdout:\n{stdout}"
+    );
+}
+
+/// A fake Lua runtime that echoes all of its arguments (script path plus
+/// any extra `args`) to stdout, prefixed so it's unambiguous in assertions,
+/// then exits 0.
+#[given("a fake Lua runtime that echoes its arguments")]
+fn fake_lua_runtime_echoes_args(world: &mut AcceptanceWorld) {
+    let script = "@echo off\r\necho RAN: %*\r\nexit /b 0\r\n";
+    std::fs::write(world.dir.path().join("fake_echo_runtime.bat"), script)
+        .expect("failed to write fake echo runtime");
+}
+
+/// A fake Lua runtime that always exits nonzero, regardless of arguments —
+/// used to prove a script's failure propagates to `luabox run`'s own exit
+/// code.
+#[given("a fake Lua runtime that always fails")]
+fn fake_lua_runtime_always_fails(world: &mut AcceptanceWorld) {
+    let script = "@echo off\r\necho FAILED\r\nexit /b 1\r\n";
+    std::fs::write(world.dir.path().join("fake_failing_runtime.bat"), script)
+        .expect("failed to write fake failing runtime");
+}
+
+#[when(expr = "I run {string} with the echo runtime")]
+fn run_with_echo_runtime(world: &mut AcceptanceWorld, command: String) {
+    let fake = world.dir.path().join("fake_echo_runtime.bat");
+    run_command_with_env(
+        world,
+        &command,
+        &[(
+            "LUABOX_LUA".to_string(),
+            fake.to_string_lossy().into_owned(),
+        )],
+    );
+}
+
+#[when(expr = "I run {string} with the failing runtime")]
+fn run_with_failing_runtime(world: &mut AcceptanceWorld, command: String) {
+    let fake = world.dir.path().join("fake_failing_runtime.bat");
+    run_command_with_env(
+        world,
+        &command,
+        &[(
+            "LUABOX_LUA".to_string(),
+            fake.to_string_lossy().into_owned(),
+        )],
+    );
+}
+
+// --- bench (execution/bench.feature — #26) --------------------------------
+//
+// Hermetic, mirroring the "fake Lua runtime" idea from execution/test.feature:
+// a `.bat` shim (pointed at via `LUABOX_LUA`) echoes each bench file, which
+// is authored here as raw `LUABOX_BENCH_*` protocol. Unlike the test
+// runtime's bat, this one always exits 0 — benches never fail the build, so
+// there is no pass/fail signal to encode. `luabox bench` resolves *every*
+// runtime on PATH (`resolve_matrix`), so the fake runtime shows up in the
+// comparison table labeled `LUABOX_LUA` (matching `resolve_matrix`'s label
+// for the override), alongside any real Lua that happens to be on the host's
+// PATH — assertions below only check `stdout contains`, so a real
+// interpreter's harmless load-error row for these non-Lua fixture files
+// doesn't affect them.
+
+/// A fake Lua runtime for `luabox bench`: echoes the bench file (`%2`,
+/// already containing protocol lines) and always exits 0.
+#[given("a fake bench runtime")]
+fn fake_bench_runtime(world: &mut AcceptanceWorld) {
+    let script = "@echo off\r\ntype \"%~2\"\r\nexit /b 0\r\n";
+    std::fs::write(world.dir.path().join("fake_bench_runtime.bat"), script)
+        .expect("failed to write fake bench runtime");
+}
+
+/// A bench file authored as raw protocol: one bench reporting the given
+/// comma-separated ns/iter samples as separate `RESULT` batches.
+#[given(expr = "a bench file {string} with bench {string} producing samples {string}")]
+fn bench_file_with_samples(
+    world: &mut AcceptanceWorld,
+    path: String,
+    name: String,
+    samples: String,
+) {
+    use std::fmt::Write as _;
+    let mut proto = format!("LUABOX_BENCH_BEGIN\t{name}\n");
+    for sample in samples.split(',') {
+        let _ = writeln!(proto, "LUABOX_BENCH_RESULT\t{name}\t{sample}");
+    }
+    proto.push_str("LUABOX_BENCH_DONE\t1\n");
+    write_file(world, &path, &proto);
+}
+
+#[when(expr = "I run {string} with the fake bench runtime")]
+fn run_with_fake_bench_runtime(world: &mut AcceptanceWorld, command: String) {
+    let fake = world.dir.path().join("fake_bench_runtime.bat");
+    run_command_with_env(
+        world,
+        &command,
+        &[(
+            "LUABOX_LUA".to_string(),
+            fake.to_string_lossy().into_owned(),
+        )],
+    );
+}
+
+// --- toolchain (execution/toolchain.feature — #27) ------------------------
+//
+// Hermetic: no network, no real Lua. A scenario-local index
+// (`LUABOX_TOOLCHAIN_INDEX`) points the installer at a `.tar.gz` fixture
+// whose "interpreter" is a `.cmd` shim behaving exactly like the test
+// runner's fake runtime; toolchains install into a scenario-local directory
+// (`LUABOX_TOOLCHAINS`). The correct fixture checksum comes from
+// `luabox-store` (a normal dependency, available to integration tests).
+
+/// The index platform key for this host — must mirror
+/// `toolchain_cmd::current_platform`.
+fn toolchain_platform() -> String {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    format!("{}-{arch}", std::env::consts::OS)
+}
+
+/// Build the `.tar.gz` fixture runtime and write `index.toml` mapping
+/// `<id>-<platform>` at it. When `correct` is false the recorded checksum is
+/// wrong, so an install must reject the archive.
+fn write_toolchain_index(world: &AcceptanceWorld, id: &str, correct: bool) {
+    // A `.cmd` shim that behaves like the test runner's fake runtime: echo
+    // the test file (argv 2) and fail iff it carries a FAIL line.
+    let shim = "@echo off\r\n\
+        type \"%~2\"\r\n\
+        findstr /C:\"LUABOX_TEST_FAIL\" \"%~2\" >nul\r\n\
+        if not errorlevel 1 exit /b 1\r\n\
+        exit /b 0\r\n";
+    let fixture_src = world.dir.path().join(".fixture-src");
+    std::fs::create_dir_all(&fixture_src).expect("failed to create fixture source dir");
+    std::fs::write(fixture_src.join("lua.cmd"), shim).expect("failed to write fixture shim");
+
+    let archive = world.dir.path().join("fixture.tar.gz");
+    let status = std::process::Command::new("tar")
+        .arg("-czf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&fixture_src)
+        .arg("lua.cmd")
+        .status()
+        .expect("failed to run tar to build the fixture archive");
+    assert!(status.success(), "tar failed to build the fixture archive");
+
+    let sha = if correct {
+        luabox_store::hash_file(&archive).expect("failed to hash the fixture archive")
+    } else {
+        "0".repeat(64)
+    };
+    let key = format!("{id}-{}", toolchain_platform());
+    let url = archive.to_string_lossy().replace('\\', "/");
+    let index = format!("[toolchain.\"{key}\"]\nurl = \"{url}\"\nsha256 = \"{sha}\"\n");
+    std::fs::write(world.dir.path().join("index.toml"), index)
+        .expect("failed to write toolchain index");
+}
+
+#[given(expr = "a toolchain index offering {string} with a working runtime")]
+fn toolchain_index_working(world: &mut AcceptanceWorld, id: String) {
+    write_toolchain_index(world, &id, true);
+}
+
+#[given(expr = "a corrupt toolchain index offering {string}")]
+fn toolchain_index_corrupt(world: &mut AcceptanceWorld, id: String) {
+    write_toolchain_index(world, &id, false);
+}
+
+/// Run a `luabox …` command with the hermetic toolchain environment: a
+/// scenario-local toolchains directory and index. Deliberately does not set
+/// `LUABOX_LUA`, so a pinned toolchain is what resolution finds.
+#[when(expr = "I run {string} with the toolchain env")]
+fn run_with_toolchain_env(world: &mut AcceptanceWorld, command: String) {
+    let toolchains = world.dir.path().join(".toolchains");
+    let index = world.dir.path().join("index.toml");
+    run_command_with_env(
+        world,
+        &command,
+        &[
+            (
+                "LUABOX_TOOLCHAINS".to_string(),
+                toolchains.to_string_lossy().into_owned(),
+            ),
+            (
+                "LUABOX_TOOLCHAIN_INDEX".to_string(),
+                index.to_string_lossy().into_owned(),
+            ),
+        ],
+    );
+}
+
+// --- bundler fixtures (emit/bundle.feature — #24) ---------------------------
+
+#[then(expr = "{string} contains exactly {int} occurrence of {string}")]
+fn file_contains_exactly(world: &mut AcceptanceWorld, path: String, count: usize, needle: String) {
+    let full = world.dir.path().join(&path);
+    let content =
+        std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("cannot read `{path}`: {e}"));
+    let found = content.matches(&needle).count();
+    assert_eq!(
+        found, count,
+        "`{path}` contains {found} occurrence(s) of `{needle}`, expected {count}; content:\n{content}"
+    );
+}
+
+/// Drive `luabox unmap` against the last line of an emitted bundle — the
+/// entry chunk is inlined last, so that line always maps to a module file
+/// without the scenario hardcoding bundle-internal line numbers.
+#[when(expr = "I unmap the last bundle line of {string}")]
+fn unmap_last_bundle_line(world: &mut AcceptanceWorld, path: String) {
+    let full = world.dir.path().join(&path);
+    let content =
+        std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("cannot read `{path}`: {e}"));
+    let last = content.lines().count();
+    run_command(
+        world,
+        format!("luabox unmap {path} {path}:{last}: synthetic-error"),
+    );
+}

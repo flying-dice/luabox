@@ -71,7 +71,7 @@ fn run_once(cwd: &Path, pattern: Option<&str>, matrix: bool) -> anyhow::Result<(
         root: &project.root,
     };
 
-    let runtimes = resolve_runtimes(&project.edition, matrix)?;
+    let runtimes = resolve_runtimes(&project.edition, &project.root, matrix)?;
     let reports: Vec<RuntimeReport> = runtimes
         .iter()
         .map(|runtime| run_suite(runtime, &opts))
@@ -93,14 +93,14 @@ fn run_once(cwd: &Path, pattern: Option<&str>, matrix: bool) -> anyhow::Result<(
 /// Resolve the runtime(s) to run against. `--matrix` probes every Lua on
 /// PATH (noting what's missing and warning if fewer than two are present);
 /// otherwise a single runtime is resolved from the edition / `LUABOX_LUA`.
-fn resolve_runtimes(edition: &str, matrix: bool) -> anyhow::Result<Vec<RuntimeSpec>> {
+fn resolve_runtimes(edition: &str, root: &Path, matrix: bool) -> anyhow::Result<Vec<RuntimeSpec>> {
     if matrix {
         let resolution = resolve_matrix();
         if resolution.found.is_empty() {
             bail!(
                 "--matrix found no Lua runtimes on PATH (probed 5.1/5.2/5.3/5.4/luajit/lua). \
-                 Install at least one, or set LUABOX_LUA; managed toolchains arrive with \
-                 `luabox toolchain` (#27)"
+                 Install at least one with `luabox toolchain install`, put a Lua on PATH, \
+                 or set LUABOX_LUA"
             );
         }
         if !resolution.missing.is_empty() {
@@ -119,7 +119,7 @@ fn resolve_runtimes(edition: &str, matrix: bool) -> anyhow::Result<Vec<RuntimeSp
         }
         Ok(resolution.found)
     } else {
-        let runtime = resolve_default(edition).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let runtime = resolve_default(edition, root).map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(vec![runtime])
     }
 }

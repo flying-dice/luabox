@@ -1,0 +1,27 @@
+# Built-in toolchain index (#27, SPEC.md §12).
+#
+# Maps "<id>-<platform>" to a downloadable runtime archive and its SHA-256.
+# `luabox toolchain install <id>` looks up "<id>-<current-platform>" here, and
+# in any index named by LUABOX_TOOLCHAIN_INDEX (whose entries override these).
+#
+# There is no single official binary host for Lua. Windows entries point at
+# LuaBinaries on SourceForge (the canonical-ish prebuilt distribution); the
+# `/download` suffix hits SourceForge's mirror redirector, which `curl -L`
+# follows. Archives are extracted with `tar -xf` (see toolchain_cmd.rs) — on
+# Windows the system `bsdtar` (C:\Windows\System32\tar.exe) unpacks `.zip`.
+#
+# `url` may also be a local filesystem path or a `file://` URL, which is how
+# the hermetic tests point the installer at fixture archives without a network.
+#
+# Platform ids: "<os>-<arch>", e.g. windows-x64, linux-x64, macos-arm64.
+# Verified downloading 2026-07 (ticket #27). Non-Windows prebuilt hosting is
+# best-effort and intentionally left to per-release index updates rather than
+# fragile hardcoded URLs.
+
+[toolchain."5.4-windows-x64"]
+url = "https://sourceforge.net/projects/luabinaries/files/5.4.2/Tools%20Executables/lua-5.4.2_Win64_bin.zip/download"
+sha256 = "5f1e1385ed95a3643f7ed67c4f3767942b2f0f388b66f63e5667e9c3d96293f5"
+
+[toolchain."5.1-windows-x64"]
+url = "https://sourceforge.net/projects/luabinaries/files/5.1.5/Tools%20Executables/lua-5.1.5_Win64_bin.zip/download"
+sha256 = "5f34cf7d40a20a587ea351482a4207d93b92ef6f1983e910a13338253819fe93"

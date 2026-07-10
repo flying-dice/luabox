@@ -41,5 +41,11 @@ pub use protocol::{CaseResult, Outcome, ParsedRun};
 pub use report::{Summary, render};
 pub use runner::{FileOutcome, RuntimeReport, SuiteOptions, run_suite};
 pub use runtime::{
-    MatrixResolution, ResolveError, RuntimeSpec, candidate_names, resolve_default, resolve_matrix,
+    MatrixResolution, PIN_FILE, ResolveError, RuntimeSpec, candidate_names, installed_toolchains,
+    read_pin, resolve_default, resolve_matrix, toolchain_interpreter, toolchains_dir,
 };
+
+// `bench` (SPEC.md §11, ticket #26) is a self-contained sibling of the
+// modules above — discovery, protocol, statistics, runner and rendering
+// all live in that one module; see its doc comment for the full picture.
+pub mod bench;

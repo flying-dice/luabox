@@ -8,7 +8,15 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+luabox-syntax.workspace = true
+luabox-hir.workspace = true
 luabox-lower.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rowan.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

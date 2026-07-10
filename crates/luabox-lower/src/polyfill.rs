@@ -100,6 +100,31 @@ impl Helper {
         }
     }
 
+    /// The inverse of [`Helper::name`] — lets callers round-trip the
+    /// [`crate::Lowered::polyfills`] name list back into helpers (the
+    /// bundler unions per-module sets before rendering one shared prelude
+    /// via [`crate::rt_prelude`]).
+    pub fn from_name(name: &str) -> Option<Self> {
+        const ALL: [Helper; 15] = [
+            Helper::Band,
+            Helper::Bor,
+            Helper::Bxor,
+            Helper::Bnot,
+            Helper::Shl,
+            Helper::Shr,
+            Helper::CloseScope,
+            Helper::Tobit,
+            Helper::Lshift,
+            Helper::Rshift,
+            Helper::Arshift,
+            Helper::Rol,
+            Helper::Ror,
+            Helper::Bswap,
+            Helper::Tohex,
+        ];
+        ALL.into_iter().find(|h| h.name() == name)
+    }
+
     /// Every helper the LuaJIT `bit` module maps onto — what a rewritten
     /// `require("bit")` pulls in wholesale (member-level tree-shaking is
     /// impossible once the module table escapes into a local).
