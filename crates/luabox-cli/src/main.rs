@@ -9,9 +9,11 @@ mod build_cmd;
 mod bundle_cmd;
 mod check_cmd;
 mod deps_cmd;
+mod doc_cmd;
 mod fmt_cmd;
 mod lint_cmd;
 mod lsp_cmd;
+mod modes;
 mod publish_cmd;
 mod run_cmd;
 mod scaffold;
@@ -130,6 +132,10 @@ enum Command {
         minify: bool,
         #[arg(long)]
         sourcemap: bool,
+        /// Embedding mode: plain (default), love, nvim-plugin; overrides
+        /// `[build] mode`
+        #[arg(long)]
+        mode: Option<String>,
     },
     /// Run tests on the configured runtime(s)
     Test {
@@ -203,6 +209,9 @@ enum ToolchainAction {
     List,
 }
 
+// A pure one-arm-per-subcommand dispatcher: length tracks the CLI surface,
+// not complexity.
+#[allow(clippy::too_many_lines)]
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -247,9 +256,16 @@ fn main() -> anyhow::Result<()> {
         Command::Build { target, out } => {
             build_cmd::run(&std::env::current_dir()?, target.as_deref(), out.as_deref())
         }
-        Command::Bundle { minify, sourcemap } => {
-            bundle_cmd::run(&std::env::current_dir()?, minify, sourcemap)
-        }
+        Command::Bundle {
+            minify,
+            sourcemap,
+            mode,
+        } => bundle_cmd::run(
+            &std::env::current_dir()?,
+            minify,
+            sourcemap,
+            mode.as_deref(),
+        ),
         Command::Test {
             pattern,
             watch,
@@ -264,7 +280,7 @@ fn main() -> anyhow::Result<()> {
         ),
         Command::Bench => bench_cmd::run(&std::env::current_dir()?),
         Command::Run { script, args } => run_cmd::run(&std::env::current_dir()?, &script, &args),
-        Command::Doc { .. } => unimplemented("doc", "P5"),
+        Command::Doc { open } => doc_cmd::run(&std::env::current_dir()?, open),
         Command::Publish { yank } => publish_cmd::run(&std::env::current_dir()?, yank.as_deref()),
         Command::Lsp { .. } => lsp_cmd::run(),
         Command::Toolchain { action } => {
@@ -300,8 +316,4 @@ fn main() -> anyhow::Result<()> {
             bundle_cmd::unmap(&std::env::current_dir()?, &bundle, text.as_deref())
         }
     }
-}
-
-fn unimplemented(command: &str, phase: &str) -> anyhow::Result<()> {
-    bail!("`luabox {command}` is not implemented yet — planned for {phase} (see SPEC.md §18)")
 }

@@ -1,0 +1,85 @@
+# Differential execution of lowered output vs source on real runtimes
+# (SPEC.md §16.1/§16.2, ticket #23). Merge-blocking: no continue-on-error —
+# any MISMATCH / LOWER-ERR fails the job. Missing interpreters only SKIP
+# their pairs (the harness prints which), so an apt package disappearing
+# degrades coverage loudly-but-green rather than breaking the build.
+name: Differential
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/luabox-lower/**"
+      - "crates/luabox-syntax/**"
+      - "crates/luabox-hir/**"
+      - "crates/luabox-test/**"
+      - "corpus/differ/**"
+      - "tools/differ/**"
+      - ".github/workflows/differential.yml"
+  pull_request:
+    paths:
+      - "crates/luabox-lower/**"
+      - "crates/luabox-syntax/**"
+      - "crates/luabox-hir/**"
+      - "crates/luabox-test/**"
+      - "corpus/differ/**"
+      - "tools/differ/**"
+      - ".github/workflows/differential.yml"
+  schedule:
+    # Weekly sweep (Mon 05:17 UTC) so runtime/apt drift is noticed even when
+    # nothing in the lowering path changes.
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  differential:
+    # ubuntu-22.04 (jammy), not -latest: jammy's universe carries ALL five
+    # runtimes (lua5.1, lua5.2, lua5.3, lua5.4, luajit) — lua5.2 was dropped
+    # from later Debian/Ubuntu releases, and the 5.2 legs of the matrix
+    # (bit32 polyfill backend, _ENV source dialect) are exactly the ones we
+    # don't want silently skipped. Each package installs best-effort with a
+    # loud warning so a future archive change degrades to documented SKIPs.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lua runtimes (5.1, 5.2, 5.3, 5.4, LuaJIT)
+        run: |
+          sudo apt-get update
+          for pkg in lua5.1 lua5.2 lua5.3 lua5.4 luajit; do
+            if ! sudo apt-get install -y "$pkg"; then
+              echo "::warning::apt package $pkg is unavailable on this runner; its differential pairs will be SKIPPED"
+            fi
+          done
+          echo "--- resolved interpreters ---"
+          for bin in lua5.1 lua5.2 lua5.3 lua5.4 luajit; do
+            if command -v "$bin" >/dev/null 2>&1; then
+              "$bin" -v 2>&1 | head -n 1
+            else
+              echo "missing: $bin"
+            fi
+          done
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: differential
+          workspaces: tools/differ
+
+      # The harness links luabox-lower/-syntax/-test by path, so this build
+      # also compiles the lowering crates under -Dwarnings.
+      - name: Build differ (and the lowering crates it links)
+        run: cargo build --release --manifest-path tools/differ/Cargo.toml
+
+      - name: Differ unit tests
+        run: cargo test --release --manifest-path tools/differ/Cargo.toml
+
+      - name: Differential corpus sweep (blocking)
+        run: cargo run --release --manifest-path tools/differ/Cargo.toml -- --corpus corpus/differ --verbose

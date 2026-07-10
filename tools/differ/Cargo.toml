@@ -1,0 +1,34 @@
+# Standalone: not a member of the root workspace (root Cargo.toml excludes
+# `tools/*`). The empty `[workspace]` table stops Cargo walking up and makes
+# this directory its own workspace root, exactly like tools/gen-corpus.
+#
+# The path dependencies reach *into* the main workspace's crates. Those crates
+# use `field.workspace = true` inheritance; Cargo resolves that against their
+# own owning workspace (the repo root), independent of this tool's workspace —
+# a supported cross-workspace path-dependency arrangement.
+[workspace]
+
+[package]
+name = "differ"
+description = "Standalone harness for SPEC.md §16.1/§16.2 differential execution: runs a corpus program on its source-dialect runtime, lowers it with luabox-lower, runs the lowered output on each target-dialect runtime, and compares stdout / exit code / error class. Not part of the luabox workspace — see the root Cargo.toml `[workspace] exclude`."
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "differ"
+path = "src/main.rs"
+
+[dependencies]
+# Linked by path (the ticket brief): the harness lowers in-process rather than
+# shelling out to the `luabox` CLI, so a lowering change is exercised the
+# instant this tool is rebuilt.
+luabox-lower = { path = "../../crates/luabox-lower" }
+luabox-syntax = { path = "../../crates/luabox-syntax" }
+# Reuse the blessed PATH runtime resolution (candidate names + PATHEXT) rather
+# than re-implementing it — luabox-test owns runtime acquisition (SPEC.md §16).
+luabox-test = { path = "../../crates/luabox-test" }
+regex = "1"
+
+[lints.rust]
+unsafe_code = "forbid"

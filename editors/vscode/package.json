@@ -1,0 +1,95 @@
+{
+  "name": "luabox",
+  "displayName": "luabox",
+  "description": "luabox language support: typecheck, lint, hover, goto-def and completion for Lua and .lb shape files, powered by `luabox lsp`.",
+  "version": "0.1.0",
+  "publisher": "luabox",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "keywords": [
+    "lua",
+    "luabox",
+    "lsp",
+    "shape",
+    "typecheck"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/luabox/luabox.git",
+    "directory": "editors/vscode"
+  },
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:lua",
+    "onLanguage:luabox-shape"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "luabox-shape",
+        "aliases": [
+          "luabox shape",
+          "luabox-shape",
+          "lb"
+        ],
+        "extensions": [
+          ".lb"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "luabox-shape",
+        "scopeName": "source.luabox-shape",
+        "path": "./syntaxes/luabox-shape.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "luabox.restartServer",
+        "title": "luabox: Restart Language Server"
+      }
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "luabox",
+      "properties": {
+        "luabox.path": {
+          "type": "string",
+          "default": "luabox",
+          "description": "Path to the `luabox` executable. When left as a bare name it is resolved on PATH. The language server is launched as `<path> lsp`."
+        },
+        "luabox.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Trace the communication between VS Code and the luabox language server."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}

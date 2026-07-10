@@ -44,3 +44,18 @@ cargo clippy --workspace --all-targets
 Acceptance tests are Gherkin feature files under
 `crates/luabox-cli/tests/features/` driving the real binary against temp-dir
 fixture projects — the executable spec (SPEC.md §16.2).
+
+## Editor setup
+
+Editor integrations wrap the `luabox lsp` stdio language server (diagnostics,
+hover, goto-definition, completion, document symbols; `.lua` and `.lb` files).
+They live under [`editors/`](editors/):
+
+| Editor | Path | Notes |
+|---|---|---|
+| VS Code | [`editors/vscode/`](editors/vscode/) | First-class TypeScript extension; ships a `.lb` shape grammar. `npm install && npm run compile`, then `npx @vscode/vsce package` for a `.vsix`. |
+| Neovim | [`editors/nvim/`](editors/nvim/) | `require("luabox").setup()` (Neovim 0.11+ native LSP; lspconfig fallback included). Adds `.lb` filetype detection. |
+| JetBrains | [`editors/jetbrains.md`](editors/jetbrains.md) | Via LSP4IJ (all editions) or the native LSP API (Ultimate/plugin authors). |
+
+All three resolve the `luabox` binary from `PATH` (overridable per editor) and
+launch it as `luabox lsp`. Build the binary first with `cargo build --release`.

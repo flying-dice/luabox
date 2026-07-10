@@ -42,9 +42,3 @@ Feature: Project scaffolding — luabox init / luabox new
     Then the command succeeds
     And the file "my-tool/luabox.toml" exists
     And "my-tool/luabox.toml" contains 'name = "my-tool"'
-
-  Scenario: unimplemented commands say which phase ships them
-    Given an empty directory
-    When I run "luabox doc"
-    Then the command fails
-    And stderr contains "not implemented"

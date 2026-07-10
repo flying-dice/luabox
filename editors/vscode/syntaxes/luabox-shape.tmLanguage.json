@@ -1,0 +1,116 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "luabox shape",
+  "scopeName": "source.luabox-shape",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#doc-comments" },
+    { "include": "#keywords" },
+    { "include": "#declarations" },
+    { "include": "#types" },
+    { "include": "#operators" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+    "doc-comments": {
+      "name": "comment.line.documentation.luabox-shape",
+      "match": "///.*$"
+    },
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.luabox-shape",
+          "match": "//(?!/).*$"
+        },
+        {
+          "name": "comment.block.luabox-shape",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.luabox-shape",
+          "match": "\\b(struct|trait|impl|type|use|for|fn)\\b"
+        },
+        {
+          "name": "variable.language.self.luabox-shape",
+          "match": "\\b(self|Self)\\b"
+        }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "match": "\\b(struct|trait|type)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.control.luabox-shape" },
+            "2": { "name": "entity.name.type.luabox-shape" }
+          }
+        },
+        {
+          "match": "\\b(impl)\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s+(for)\\s+([A-Za-z_][A-Za-z0-9_]*))?",
+          "captures": {
+            "1": { "name": "keyword.control.luabox-shape" },
+            "2": { "name": "entity.name.type.luabox-shape" },
+            "3": { "name": "keyword.control.luabox-shape" },
+            "4": { "name": "entity.name.type.luabox-shape" }
+          }
+        },
+        {
+          "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.control.luabox-shape" },
+            "2": { "name": "entity.name.function.luabox-shape" }
+          }
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "support.type.primitive.luabox-shape",
+          "match": "\\b(number|integer|string|boolean|unknown|nil)\\b"
+        },
+        {
+          "name": "support.type.builtin.luabox-shape",
+          "match": "\\b(Vec|HashMap|Option|Result)\\b"
+        },
+        {
+          "name": "entity.name.type.luabox-shape",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.type.luabox-shape",
+          "match": "->|\\?|\\||\\+|\\.\\.|:|="
+        }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.brackets.angle.luabox-shape",
+          "match": "[<>]"
+        },
+        {
+          "name": "punctuation.brackets.curly.luabox-shape",
+          "match": "[{}]"
+        },
+        {
+          "name": "punctuation.brackets.round.luabox-shape",
+          "match": "[()]"
+        },
+        {
+          "name": "punctuation.separator.luabox-shape",
+          "match": "[,;]"
+        }
+      ]
+    }
+  }
+}

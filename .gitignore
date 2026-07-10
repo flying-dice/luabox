@@ -1,2 +1,3 @@
 /target
 tools/gen-corpus/target/
+tools/differ/target/

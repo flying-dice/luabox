@@ -11,8 +11,8 @@ use toml_edit::{ImDocument, Item, Table, TableLike};
 
 use super::error::ManifestError;
 use super::model::{
-    ALLOWED_DIALECTS, Build, Dependency, GitDependency, LINT_TIERS, Lint, LintLevel, Manifest,
-    Package, PathDependency, TaskValue, Types, Workspace, WorkspaceDependency,
+    ALLOWED_BUNDLE_MODES, ALLOWED_DIALECTS, Build, Dependency, GitDependency, LINT_TIERS, Lint,
+    LintLevel, Manifest, Package, PathDependency, TaskValue, Types, Workspace, WorkspaceDependency,
 };
 
 const TOP_LEVEL_KEYS: &[&str] = &[
@@ -35,7 +35,7 @@ const PACKAGE_KEYS: &[&str] = &[
     "lua-versions",
     "min-luabox-version",
 ];
-const BUILD_KEYS: &[&str] = &["target", "out"];
+const BUILD_KEYS: &[&str] = &["target", "out", "mode"];
 const TYPES_KEYS: &[&str] = &["strict", "defs", "shape-paths", "shapes"];
 const WORKSPACE_KEYS: &[&str] = &["members"];
 const DEPENDENCY_KEYS: &[&str] = &[
@@ -415,6 +415,7 @@ fn parse_build(root: &Table, edition_fallback: &str, errors: &mut Vec<ManifestEr
         return Build {
             target: edition_fallback.to_owned(),
             out: "dist".to_owned(),
+            mode: "plain".to_owned(),
         };
     };
     check_unknown_keys(table, "[build] key", BUILD_KEYS, errors);
@@ -426,7 +427,19 @@ fn parse_build(root: &Table, edition_fallback: &str, errors: &mut Vec<ManifestEr
     }
     let out = get_string(table, "build", "out", false, errors).unwrap_or_else(|| "dist".to_owned());
 
-    Build { target, out }
+    let mode =
+        get_string(table, "build", "mode", false, errors).unwrap_or_else(|| "plain".to_owned());
+    if !mode.is_empty() && !ALLOWED_BUNDLE_MODES.contains(&mode.as_str()) {
+        errors.push(ManifestError::new(
+            format!(
+                "invalid build.mode `{mode}` (valid: {})",
+                ALLOWED_BUNDLE_MODES.join(", ")
+            ),
+            item_span(table, "mode"),
+        ));
+    }
+
+    Build { target, out, mode }
 }
 
 fn parse_types(root: &Table, errors: &mut Vec<ManifestError>) -> Types {

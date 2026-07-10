@@ -171,7 +171,7 @@ fn pure_51_backend_uses_bitpair_core() {
 #[test]
 fn luajit_target_backend_wraps_bit_library() {
     let lowered = lower("x = a & b\n", Dialect::Lua53, Dialect::LuaJit).expect("lower");
-    assert!(lowered.text.contains("return bit.band(a, b) % 0x100000000"));
+    assert!(lowered.text.contains("return bit.band(a, b) % 4294967296"));
 }
 
 #[test]

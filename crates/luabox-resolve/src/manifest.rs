@@ -22,8 +22,8 @@ mod workspace;
 
 pub use error::ManifestError;
 pub use model::{
-    ALLOWED_DIALECTS, Build, Dependency, GitDependency, LINT_TIERS, Lint, LintLevel, Manifest,
-    Package, PathDependency, TaskValue, Types, Workspace, WorkspaceDependency,
+    ALLOWED_BUNDLE_MODES, ALLOWED_DIALECTS, Build, Dependency, GitDependency, LINT_TIERS, Lint,
+    LintLevel, Manifest, Package, PathDependency, TaskValue, Types, Workspace, WorkspaceDependency,
 };
 
 #[cfg(test)]
@@ -117,6 +117,7 @@ mod tests {
 
         assert_eq!(manifest.build.target, "5.1", "target defaults to edition");
         assert_eq!(manifest.build.out, "dist");
+        assert_eq!(manifest.build.mode, "plain", "mode defaults to plain");
         assert!(!manifest.types.strict);
         assert!(manifest.types.defs.is_empty());
         assert!(manifest.dependencies.is_empty());
@@ -192,6 +193,36 @@ mod tests {
         )
         .unwrap_err();
         assert!(errors.iter().any(|e| e.message.contains("build.target")));
+    }
+
+    #[test]
+    fn build_mode_accepts_love_and_nvim_plugin() {
+        for mode in ["love", "nvim-plugin"] {
+            let manifest = Manifest::parse(&format!(
+                "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[build]\nmode = \"{mode}\"\n"
+            ))
+            .unwrap_or_else(|e| panic!("mode `{mode}` should be valid: {e:?}"));
+            assert_eq!(manifest.build.mode, mode);
+        }
+    }
+
+    #[test]
+    fn invalid_build_mode_lists_allowed_set() {
+        let errors = Manifest::parse(
+            "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[build]\nmode = \"roblox\"\n",
+        )
+        .unwrap_err();
+        let msg = errors
+            .iter()
+            .find(|e| e.message.contains("build.mode"))
+            .expect("build.mode error present");
+        for mode in ALLOWED_BUNDLE_MODES {
+            assert!(
+                msg.message.contains(mode),
+                "{} should mention {mode}",
+                msg.message
+            );
+        }
     }
 
     #[test]

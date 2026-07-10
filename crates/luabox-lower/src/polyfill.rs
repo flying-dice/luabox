@@ -183,8 +183,8 @@ pub(crate) fn prelude(used: &BTreeSet<Helper>, from: Dialect, to: Dialect) -> Op
 
 /// The private bit-by-bit combiner shared by pure `band`/`bor`/`bxor`.
 const BITPAIR: &str = "  local function bitpair(a, b, f)
-    a = a % 0x100000000
-    b = b % 0x100000000
+    a = a % 4294967296
+    b = b % 4294967296
     local r, p = 0, 1
     for _ = 1, 32 do
       if f(a % 2, b % 2) then
@@ -200,9 +200,9 @@ const BITPAIR: &str = "  local function bitpair(a, b, f)
 
 /// The private signed-32-bit normalizer for the LuaJIT-source family.
 const TOBIT32: &str = "  local function tobit32(x)
-    x = x % 0x100000000
+    x = x % 4294967296
     if x >= 0x80000000 then
-      x = x - 0x100000000
+      x = x - 4294967296
     end
     return x
   end
@@ -242,41 +242,41 @@ fn bitjit_family(helper: Helper) -> &'static str {
     match helper {
         Helper::Band => {
             "  function M.band(a, b)
-    return bit.band(a, b) % 0x100000000
+    return bit.band(a, b) % 4294967296
   end
 "
         }
         Helper::Bor => {
             "  function M.bor(a, b)
-    return bit.bor(a, b) % 0x100000000
+    return bit.bor(a, b) % 4294967296
   end
 "
         }
         Helper::Bxor => {
             "  function M.bxor(a, b)
-    return bit.bxor(a, b) % 0x100000000
+    return bit.bxor(a, b) % 4294967296
   end
 "
         }
         Helper::Bnot => {
             "  function M.bnot(a)
-    return bit.bnot(a) % 0x100000000
+    return bit.bnot(a) % 4294967296
   end
 "
         }
         Helper::Shl => {
             "  function M.shl(a, n)
     if n <= -32 or n >= 32 then return 0 end
-    if n < 0 then return math.floor((a % 0x100000000) / 2 ^ -n) end
-    return bit.lshift(a, n) % 0x100000000
+    if n < 0 then return math.floor((a % 4294967296) / 2 ^ -n) end
+    return bit.lshift(a, n) % 4294967296
   end
 "
         }
         Helper::Shr => {
             "  function M.shr(a, n)
     if n <= -32 or n >= 32 then return 0 end
-    if n < 0 then return ((a % 0x100000000) * 2 ^ -n) % 0x100000000 end
-    return bit.rshift(a, n) % 0x100000000
+    if n < 0 then return ((a % 4294967296) * 2 ^ -n) % 4294967296 end
+    return bit.rshift(a, n) % 4294967296
   end
 "
         }
@@ -307,23 +307,23 @@ fn pure_family(helper: Helper) -> &'static str {
         }
         Helper::Bnot => {
             "  function M.bnot(a)
-    return 0xFFFFFFFF - a % 0x100000000
+    return 0xFFFFFFFF - a % 4294967296
   end
 "
         }
         Helper::Shl => {
             "  function M.shl(a, n)
     if n <= -32 or n >= 32 then return 0 end
-    if n < 0 then return math.floor((a % 0x100000000) / 2 ^ -n) end
-    return ((a % 0x100000000) * 2 ^ n) % 0x100000000
+    if n < 0 then return math.floor((a % 4294967296) / 2 ^ -n) end
+    return ((a % 4294967296) * 2 ^ n) % 4294967296
   end
 "
         }
         Helper::Shr => {
             "  function M.shr(a, n)
     if n <= -32 or n >= 32 then return 0 end
-    if n < 0 then return ((a % 0x100000000) * 2 ^ -n) % 0x100000000 end
-    return math.floor((a % 0x100000000) / 2 ^ n)
+    if n < 0 then return ((a % 4294967296) * 2 ^ -n) % 4294967296 end
+    return math.floor((a % 4294967296) / 2 ^ n)
   end
 "
         }
@@ -356,7 +356,7 @@ fn jit_family(helper: Helper) -> &'static str {
         }
         Helper::Bnot => {
             "  function M.bnot(a)
-    return tobit32(0xFFFFFFFF - a % 0x100000000)
+    return tobit32(0xFFFFFFFF - a % 4294967296)
   end
 "
         }
@@ -368,23 +368,23 @@ fn jit_family(helper: Helper) -> &'static str {
         }
         Helper::Lshift => {
             "  function M.lshift(a, n)
-    return tobit32((a % 0x100000000) * 2 ^ (n % 32) % 0x100000000)
+    return tobit32((a % 4294967296) * 2 ^ (n % 32) % 4294967296)
   end
 "
         }
         Helper::Rshift => {
             "  function M.rshift(a, n)
-    return tobit32(math.floor((a % 0x100000000) / 2 ^ (n % 32)))
+    return tobit32(math.floor((a % 4294967296) / 2 ^ (n % 32)))
   end
 "
         }
         Helper::Arshift => {
             "  function M.arshift(a, n)
-    a = a % 0x100000000
+    a = a % 4294967296
     n = n % 32
     local r = math.floor(a / 2 ^ n)
     if a >= 0x80000000 and n > 0 then
-      r = r + 0x100000000 - 2 ^ (32 - n)
+      r = r + 4294967296 - 2 ^ (32 - n)
     end
     return tobit32(r)
   end
@@ -392,9 +392,9 @@ fn jit_family(helper: Helper) -> &'static str {
         }
         Helper::Rol => {
             "  function M.rol(a, n)
-    a = a % 0x100000000
+    a = a % 4294967296
     n = n % 32
-    return tobit32((a * 2 ^ n) % 0x100000000 + math.floor(a / 2 ^ (32 - n)))
+    return tobit32((a * 2 ^ n) % 4294967296 + math.floor(a / 2 ^ (32 - n)))
   end
 "
         }
@@ -406,7 +406,7 @@ fn jit_family(helper: Helper) -> &'static str {
         }
         Helper::Bswap => {
             "  function M.bswap(a)
-    a = a % 0x100000000
+    a = a % 4294967296
     local b0 = a % 256
     local b1 = math.floor(a / 256) % 256
     local b2 = math.floor(a / 65536) % 256
@@ -423,7 +423,7 @@ fn jit_family(helper: Helper) -> &'static str {
       n = -n
       spec = \"X\"
     end
-    return string.sub(string.format(\"%0\" .. n .. spec, x % 0x100000000), -n)
+    return string.sub(string.format(\"%0\" .. n .. spec, x % 4294967296), -n)
   end
 "
         }

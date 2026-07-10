@@ -1152,3 +1152,114 @@ fn install_real_rock(world: &mut AcceptanceWorld, spec: String) {
         )],
     );
 }
+
+// --- bundler embedding modes (emit/modes.feature — #32) --------------------
+//
+// `love` mode packages a `.love` (zip) archive; verifying its contents
+// hermetically needs an archive-listing tool. `tar -tf` reads zip archives
+// fine when `tar` resolves to a libarchive (`bsdtar`) build — the default
+// `tar` on macOS, and the `tar.exe` Windows ships in `System32` — but not
+// when it resolves to GNU tar (e.g. Git for Windows' `tar.exe`, which may
+// sit earlier on `PATH`), which cannot read zip at all. `archive_listing`
+// tries a small chain of tools so the scenario stays hermetic and green
+// regardless of which `tar` `PATH` happens to resolve to.
+
+/// Lists the entries of a zip-format archive (a `.love` file). Tries `tar`
+/// as found on `PATH`, then (Windows only) the System32 `tar.exe`
+/// explicitly, then `python3`/`python -m zipfile -l` as a last resort.
+/// Panics with all attempted tools named if none of them work — a louder
+/// failure than a false pass.
+fn archive_listing(path: &std::path::Path) -> String {
+    let path_str = path.to_string_lossy().into_owned();
+    let mut attempts: Vec<std::process::Command> = Vec::new();
+
+    let mut tar = std::process::Command::new("tar");
+    tar.args(["-tf", &path_str]);
+    attempts.push(tar);
+
+    if cfg!(windows) {
+        let mut system32_tar = std::process::Command::new(r"C:\Windows\System32\tar.exe");
+        system32_tar.args(["-tf", &path_str]);
+        attempts.push(system32_tar);
+    }
+
+    for python in ["python3", "python"] {
+        let mut cmd = std::process::Command::new(python);
+        cmd.args(["-m", "zipfile", "-l", &path_str]);
+        attempts.push(cmd);
+    }
+
+    for mut cmd in attempts {
+        if let Ok(output) = cmd.output()
+            && output.status.success()
+        {
+            return String::from_utf8_lossy(&output.stdout).into_owned();
+        }
+    }
+    panic!(
+        "cannot list the contents of `{}`: no working archive-listing tool found \
+         (tried `tar`, the Windows System32 `tar.exe`, `python3 -m zipfile`, \
+         `python -m zipfile`)",
+        path.display()
+    );
+}
+
+#[then(expr = "the archive {string} contains {string}")]
+fn archive_contains(world: &mut AcceptanceWorld, path: String, needle: String) {
+    let full = world.dir.path().join(&path);
+    let listing = archive_listing(&full);
+    assert!(
+        listing.contains(&needle),
+        "archive `{path}` does not list `{needle}`; listing:\n{listing}"
+    );
+}
+
+/// Write a manifest with `[build] target` and `[build] mode` (SPEC.md §7,
+/// ticket #32).
+fn write_manifest_with_target_and_mode(
+    world: &AcceptanceWorld,
+    edition: &str,
+    target: &str,
+    mode: &str,
+    description: Option<&str>,
+) {
+    let description_line = description
+        .map(|d| format!("description = \"{d}\"\n"))
+        .unwrap_or_default();
+    let manifest = format!(
+        "[package]\n\
+         name = \"fixture\"\n\
+         version = \"0.1.0\"\n\
+         edition = \"{edition}\"\n\
+         {description_line}\
+         \n\
+         [build]\n\
+         target = \"{target}\"\n\
+         mode = \"{mode}\"\n"
+    );
+    std::fs::write(world.dir.path().join("luabox.toml"), manifest)
+        .expect("failed to write luabox.toml");
+}
+
+#[given(expr = "a project with edition {string} targeting {string} using mode {string}")]
+fn project_with_edition_target_and_mode(
+    world: &mut AcceptanceWorld,
+    edition: String,
+    target: String,
+    mode: String,
+) {
+    write_manifest_with_target_and_mode(world, &edition, &target, &mode, None);
+}
+
+#[given(
+    expr = "a project with edition {string} targeting {string} using mode {string} and description {string}"
+)]
+fn project_with_edition_target_mode_and_description(
+    world: &mut AcceptanceWorld,
+    edition: String,
+    target: String,
+    mode: String,
+    description: String,
+) {
+    write_manifest_with_target_and_mode(world, &edition, &target, &mode, Some(&description));
+}

@@ -11,6 +11,11 @@ use serde::Serialize;
 /// string-only allow-list, not a dependency on `luabox-syntax::Dialect`.
 pub const ALLOWED_DIALECTS: &[&str] = &["5.1", "5.2", "5.3", "5.4", "luajit"];
 
+/// Bundler embedding modes for `[build] mode` (SPEC.md §7): `plain` (a bare
+/// chunk, the default), `love` (LÖVE `.love` packaging), and `nvim-plugin`
+/// (a Neovim `lua/<name>/init.lua` runtimepath layout).
+pub const ALLOWED_BUNDLE_MODES: &[&str] = &["plain", "love", "nvim-plugin"];
+
 /// `[package]` (SPEC.md §5, §6, §15).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -39,6 +44,9 @@ pub struct Build {
     pub target: String,
     /// Output directory. Defaults to `"dist"`.
     pub out: String,
+    /// Bundler embedding mode (SPEC.md §7). Defaults to `"plain"`. One of
+    /// [`ALLOWED_BUNDLE_MODES`]; `luabox bundle --mode` overrides it.
+    pub mode: String,
 }
 
 /// `[types]` (SPEC.md §5, SHAPES.md §6).
