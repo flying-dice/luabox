@@ -282,16 +282,35 @@ fn validate_dialect(
     }
 }
 
+/// Validates a package name: a plain segment (`penlight`), or a scoped
+/// `@org/pkg` form (SPEC.md §19 — registry namespaces, scoped proposal).
 fn validate_package_name(name: &str) -> Option<String> {
     if name.is_empty() {
         return Some("`package.name` must not be empty".to_owned());
     }
-    if name.starts_with(|c: char| c.is_ascii_digit()) {
+    if let Some(rest) = name.strip_prefix('@') {
+        let Some((scope, pkg)) = rest.split_once('/') else {
+            return Some(format!(
+                "`package.name` \"{name}\" is scoped but not of the form `@scope/name`"
+            ));
+        };
+        return validate_name_segment(name, scope).or_else(|| validate_name_segment(name, pkg));
+    }
+    validate_name_segment(name, name)
+}
+
+fn validate_name_segment(name: &str, segment: &str) -> Option<String> {
+    if segment.is_empty() {
+        return Some(format!(
+            "`package.name` \"{name}\" must not have an empty scope or name segment"
+        ));
+    }
+    if segment.starts_with(|c: char| c.is_ascii_digit()) {
         return Some(format!(
             "`package.name` \"{name}\" must not start with a digit"
         ));
     }
-    if !name
+    if !segment
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {

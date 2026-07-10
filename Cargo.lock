@@ -918,6 +918,7 @@ name = "luabox-resolve"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "proptest",
  "pubgrub",
  "semver",
  "serde",
