@@ -1194,6 +1194,39 @@ local a = geo.area(3, 4)
 }
 
 #[test]
+fn cross_file_alias_name_resolves_and_enforces_in_editor() {
+    // `Id` is declared only in ids.lua; main.lua names it in a `---@param`.
+    // Aliases are workspace-global (#110), so the misuse is diagnosed in the
+    // editor exactly as under `luabox check` — editor/CI parity, riding the
+    // same `Ambient::with_project_types` path as workspace-global classes.
+    let ids = "---@alias Id string\nlocal M = {}\nreturn M\n";
+    let main = "\
+---@param x Id
+local function use(x) end
+use(42)
+";
+    let client = start(&[("ids.lua", ids), ("main.lua", main)]);
+    let main_uri = client.uri("main.lua");
+    let diags = client.open(&main_uri, main);
+    assert!(
+        diags.iter().any(|d| code_of(d) == "LB0300"),
+        "cross-file alias misuse must be diagnosed in the editor: {diags:?}"
+    );
+    // A genuinely undeclared type name still trips LB0305 — workspace aliases
+    // don't mask real unknown-type errors.
+    let unknown = "\
+---@param x Nope
+local function use(x) end
+";
+    let diags = client.change(&main_uri, unknown);
+    assert!(
+        diags.iter().any(|d| code_of(d) == "LB0305"),
+        "an undeclared type name is still LB0305: {diags:?}"
+    );
+    client.shutdown();
+}
+
+#[test]
 fn bootstrapped_files_answer_requests_without_open() {
     // main.lua is on disk but never opened: hover still works because the
     // bootstrap walked the tree into the analysis host.

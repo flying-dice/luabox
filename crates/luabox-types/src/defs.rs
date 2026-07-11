@@ -88,11 +88,11 @@ impl Ambient {
     }
 
     /// A new ambient layer: this one plus the workspace-global
-    /// `---@class`/`---@enum` declarations collected from every checked
-    /// project source file (luals parity: classes are workspace-global, so a
-    /// class declared in any project file — including its
-    /// `function Class:method` member attachments — is nameable and
-    /// resolvable from every other file).
+    /// `---@class`/`---@enum`/`---@alias` declarations collected from every
+    /// checked project source file (luals parity: classes, enums, and
+    /// aliases are workspace-global, so a name declared in any project file —
+    /// including a class's `function Class:method` member attachments — is
+    /// nameable and resolvable from every other file).
     ///
     /// Merge semantics (luals merges duplicate class declarations' fields):
     /// a class this layer does not declare is inserted whole; a class both
@@ -100,20 +100,37 @@ impl Ambient {
     /// attachments union, with this layer (defs — the published surface,
     /// #108 winner-first) winning any same-name member collision. A member
     /// attached by a carrier never shadows a `---@field` declaration.
-    /// Enums merge first-wins. Global names are untouched, so the
+    /// Enums and aliases merge first-wins: this layer's defs win a name
+    /// collision, and among project files the first to declare a name wins
+    /// (deterministic — `files` is iterated in the caller's stable file
+    /// order). luals treats a duplicate alias definition as a warning and
+    /// keeps one; luabox keeps the first deterministically, mirroring the
+    /// enum rule (#110). Global names are untouched, so the
     /// `undefined-global` lint baseline is unchanged.
+    ///
+    /// Project aliases are carried into the new layer's alias map raw and
+    /// expanded lazily by each consuming file's lowerer (see
+    /// [`crate::env::FileTypes`]), so a cross-file alias body referencing
+    /// another workspace-global alias or class resolves at the use site and a
+    /// cyclic alias terminates via the lowerer's cycle guard.
     #[must_use]
     pub fn with_project_types<'a>(
         &self,
         files: impl IntoIterator<Item = &'a crate::env::FileTypes>,
     ) -> Ambient {
         let mut env = self.env.clone_surface();
+        let mut aliases = self.aliases.clone();
         for file in files {
             env.merge_file_types(file);
+            for (name, alias) in file.aliases() {
+                // Defs (already seeded) win; among project files the first
+                // declarer of a name wins — first-wins, mirroring enums.
+                aliases.entry(name.clone()).or_insert_with(|| alias.clone());
+            }
         }
         Ambient {
             env,
-            aliases: self.aliases.clone(),
+            aliases,
             global_names: self.global_names.clone(),
         }
     }

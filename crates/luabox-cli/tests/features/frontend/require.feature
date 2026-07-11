@@ -267,3 +267,66 @@ Feature: luabox check — cross-file require resolution (#85)
     When I run "luabox check"
     Then the command fails
     And stdout contains "LB0300"
+
+  # --- cross-file `---@alias` naming (#110) ---------------------------------
+
+  Scenario: an `---@alias` declared in another file is named and enforced in a consumer
+    Given a strict project with edition "5.4"
+    And a file "src/ids.lua" containing:
+      """
+      ---@alias Id string
+      local M = {}
+      return M
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param x Id
+      local function use(x) end
+      use(42)
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0300"
+
+  Scenario: a cross-file `---@alias` used correctly is clean
+    Given a strict project with edition "5.4"
+    And a file "src/ids.lua" containing:
+      """
+      ---@alias Id string
+      local M = {}
+      return M
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param x Id
+      local function use(x) end
+      use("ok")
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stderr contains "check: 0 errors, 0 warnings"
+
+  Scenario: a cross-file `---@alias` of a workspace-global class resolves to the class
+    Given a strict project with edition "5.4"
+    And a file "src/widget.lua" containing:
+      """
+      ---@class Widget
+      ---@field id number
+      local M = {}
+      return M
+      """
+    And a file "src/handles.lua" containing:
+      """
+      ---@alias Handle Widget
+      local M = {}
+      return M
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param h Handle
+      local function use(h) end
+      use({})
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0302"

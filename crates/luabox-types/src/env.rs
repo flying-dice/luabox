@@ -66,28 +66,39 @@ pub(crate) struct CastEntry {
 /// contributes (luals parity: `---@class` declarations are
 /// workspace-global): its `---@class` definitions — parents, `---@field`
 /// members, and carrier member attachments (`function Class:method` etc.)
-/// — plus its `---@enum` definitions. Collected per file by
-/// [`crate::module_surface`] and merged beneath every other file's
-/// declarations via [`crate::Ambient::with_project_types`].
+/// — plus its `---@enum` definitions and its `---@alias` declarations.
+/// Collected per file by [`crate::module_surface`] and merged beneath every
+/// other file's declarations via [`crate::Ambient::with_project_types`].
+///
+/// Aliases are carried **raw** (the harvested [`AliasTag`], not a lowered
+/// [`Ty`]) exactly as the ambient definition layer carries them: an alias
+/// body is only expanded at *lowering* time, inside the consuming file where
+/// every workspace-global class/enum/alias it might reference is already in
+/// scope. This defers cross-file alias expansion to the one place all the
+/// names resolve, and reuses the lowerer's existing cycle guard so a
+/// self-referential or mutually-referential alias across files terminates
+/// (collapsing to `unknown`) rather than looping (#110).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FileTypes {
     pub(crate) classes: BTreeMap<String, ClassDef>,
     pub(crate) enums: BTreeMap<String, EnumDef>,
+    pub(crate) aliases: BTreeMap<String, AliasTag>,
 }
 
 impl FileTypes {
     /// Whether this file contributes nothing to the workspace surface.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.classes.is_empty() && self.enums.is_empty()
+        self.classes.is_empty() && self.enums.is_empty() && self.aliases.is_empty()
     }
 
-    /// Collect the file's own `---@class`/`---@enum` declarations out of its
-    /// built environment, folding each class carrier's reified member
-    /// attachments (from inference, `carriers`: class name → reified carrier
-    /// shape) into the class's `methods` map. Only names the file itself
-    /// declares are collected — ambient (defs/stdlib) declarations seeded
-    /// into `env` are not re-exported.
+    /// Collect the file's own `---@class`/`---@enum`/`---@alias` declarations
+    /// out of its built environment, folding each class carrier's reified
+    /// member attachments (from inference, `carriers`: class name → reified
+    /// carrier shape) into the class's `methods` map. Only names the file
+    /// itself declares are collected — ambient (defs/stdlib) declarations
+    /// seeded into `env` are not re-exported. Aliases are collected raw from
+    /// the harvested tags (expansion is deferred to each consumer's lowerer).
     pub(crate) fn collect(
         items: &[luacats::AnnotatedItem],
         env: &TypeEnv,
@@ -113,11 +124,22 @@ impl FileTypes {
                             out.enums.insert(e.name.clone(), def.clone());
                         }
                     }
+                    Tag::Alias(a) if !a.name.is_empty() => {
+                        out.aliases.insert(a.name.clone(), a.clone());
+                    }
                     _ => {}
                 }
             }
         }
         out
+    }
+
+    /// The `---@alias` declarations this file contributes to the workspace
+    /// (name → raw [`AliasTag`]) — folded into the ambient alias map by
+    /// [`crate::Ambient::with_project_types`] so a consumer file can name
+    /// them (#110).
+    pub(crate) fn aliases(&self) -> &BTreeMap<String, AliasTag> {
+        &self.aliases
     }
 }
 

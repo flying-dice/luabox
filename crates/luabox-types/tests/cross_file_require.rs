@@ -389,3 +389,199 @@ local a = c:bogus()
 ";
     assert_eq!(codes(&check(misuse, &ambient, &requires)), vec!["LB0306"]);
 }
+
+// --- cross-file `---@alias` naming (#110) ----------------------------------
+//
+// An `---@alias` declared in one project file is nameable from a consumer's
+// annotation, exactly like a workspace-global `---@class`/`---@enum` (#85).
+// The alias is carried raw into the merged ambient by
+// [`Ambient::with_project_types`] and expanded lazily by each consumer's
+// lowerer, so cross-file alias-of-alias and alias-of-class resolve at the use
+// site and cyclic aliases terminate via the lowerer's cycle guard.
+
+/// The workspace-global surface a module file contributes (no `require`
+/// registry needed — alias names resolve through the merged ambient, not a
+/// module return value). Unlike [`surface`], this does not demand an export,
+/// so an alias-only file (which has no `return`) is fine.
+fn file_types(src: &str, ambient: &Ambient) -> FileTypes {
+    let parsed = parse(src, Dialect::Lua54);
+    assert_eq!(parsed.errors(), &[], "module fixture must parse cleanly");
+    module_surface(&parsed, "mod.lua", Some(ambient)).types
+}
+
+#[test]
+fn cross_file_alias_resolves_and_enforces() {
+    let base = stdlib();
+    // `Id` is declared ONLY in the other file; the consumer names it in a
+    // `---@param` with no `require` of its own.
+    let types = file_types("---@alias Id string\n", base);
+    let ambient = base.with_project_types([&types]);
+
+    let ok = "\
+---@param x Id
+local function use(x) end
+use(\"hello\")
+";
+    assert_eq!(
+        codes(&check(ok, &ambient, &HashMap::new())),
+        Vec::<String>::new()
+    );
+    // Misuse per the alias's underlying type (`string`) is LB0300 at the
+    // consumer's call site — the alias resolved AND enforces.
+    let bad = "\
+---@param x Id
+local function use(x) end
+use(42)
+";
+    assert_eq!(
+        codes(&check(bad, &ambient, &HashMap::new())),
+        vec!["LB0300"]
+    );
+}
+
+#[test]
+fn cross_file_alias_of_alias() {
+    let base = stdlib();
+    // File 1 declares the base alias; file 2 declares an alias *of* it. The
+    // consumer names only the second — expansion chains across both files.
+    let t1 = file_types("---@alias Name string\n", base);
+    let t2 = file_types("---@alias Label Name\n", base);
+    let ambient = base.with_project_types([&t1, &t2]);
+
+    let ok = "\
+---@param x Label
+local function use(x) end
+use(\"n\")
+";
+    assert_eq!(
+        codes(&check(ok, &ambient, &HashMap::new())),
+        Vec::<String>::new()
+    );
+    let bad = "\
+---@param x Label
+local function use(x) end
+use(1)
+";
+    assert_eq!(
+        codes(&check(bad, &ambient, &HashMap::new())),
+        vec!["LB0300"]
+    );
+}
+
+#[test]
+fn cross_file_alias_referencing_workspace_class() {
+    let base = stdlib();
+    // The class lives in one file, the alias-of-the-class in another: both
+    // are workspace-global, so the alias body resolves the class name.
+    let t_class = file_types("---@class Widget\n---@field id number\n", base);
+    let t_alias = file_types("---@alias Handle Widget\n", base);
+    let ambient = base.with_project_types([&t_class, &t_alias]);
+
+    // A well-formed literal in a `Handle` position satisfies the class.
+    let ok = "\
+---@param h Handle
+local function use(h) end
+use({ id = 1 })
+";
+    assert_eq!(
+        codes(&check(ok, &ambient, &HashMap::new())),
+        Vec::<String>::new()
+    );
+    // A literal missing the class's required field still errors — proof the
+    // alias resolved to the class shape, not to `unknown`.
+    let bad = "\
+---@param h Handle
+local function use(h) end
+use({})
+";
+    assert_eq!(
+        codes(&check(bad, &ambient, &HashMap::new())),
+        vec!["LB0302"]
+    );
+}
+
+#[test]
+fn same_name_alias_in_two_files_deterministic_winner() {
+    let base = stdlib();
+    // Two files declare `Id` differently. `with_project_types` is first-wins
+    // among project files (mirroring the enum rule): the FIRST in iteration
+    // order wins, deterministically — no crash on the collision.
+    let t_string = file_types("---@alias Id string\n", base);
+    let t_number = file_types("---@alias Id number\n", base);
+
+    let use_string = "\
+---@param x Id
+local function use(x) end
+use(\"s\")
+";
+    let use_number = "\
+---@param x Id
+local function use(x) end
+use(1)
+";
+
+    // string-file first → `Id` is `string` workspace-wide.
+    let ambient = base.with_project_types([&t_string, &t_number]);
+    assert_eq!(
+        codes(&check(use_string, &ambient, &HashMap::new())),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        codes(&check(use_number, &ambient, &HashMap::new())),
+        vec!["LB0300"]
+    );
+
+    // Reverse the order → the winner flips deterministically.
+    let ambient2 = base.with_project_types([&t_number, &t_string]);
+    assert_eq!(
+        codes(&check(use_number, &ambient2, &HashMap::new())),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        codes(&check(use_string, &ambient2, &HashMap::new())),
+        vec!["LB0300"]
+    );
+}
+
+#[test]
+fn cyclic_alias_across_files_terminates() {
+    let base = stdlib();
+    // `Cy1` references `Cy2` and `Cy2` references `Cy1` — a cross-file cycle.
+    // The lowerer's cycle guard collapses the recursion to `unknown` (exactly
+    // the same-file cyclic-alias behavior), so checking terminates with no
+    // hang and no crash — and crucially, neither name trips LB0305 (both are
+    // known aliases, just self-referential).
+    let ta = file_types("---@alias Cy1 Cy2|number\n", base);
+    let tb = file_types("---@alias Cy2 Cy1|string\n", base);
+    let ambient = base.with_project_types([&ta, &tb]);
+
+    let consumer = "\
+---@param x Cy1
+local function use(x) end
+use(1)
+";
+    let found = codes(&check(consumer, &ambient, &HashMap::new()));
+    assert!(
+        !found.contains(&"LB0305".to_string()),
+        "cyclic alias must resolve as a known alias, not an unknown name: {found:?}"
+    );
+}
+
+#[test]
+fn unresolved_alias_name_still_lb0305() {
+    let base = stdlib();
+    // A workspace-global alias exists, but the consumer names a DIFFERENT,
+    // undeclared type — still LB0305 (workspace aliases don't mask genuine
+    // unknown-type errors).
+    let types = file_types("---@alias Id string\n", base);
+    let ambient = base.with_project_types([&types]);
+
+    let consumer = "\
+---@param x Nope
+local function use(x) end
+";
+    assert_eq!(
+        codes(&check(consumer, &ambient, &HashMap::new())),
+        vec!["LB0305"]
+    );
+}
