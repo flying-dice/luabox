@@ -1,18 +1,13 @@
-//! Completion: in a LuaCATS type-annotation position (`---@type`,
-//! `---@param <name> `, `---@return`), the ambient `.luab` package scope's
-//! fully-qualified type names (SHAPES-V2.md); after `.`/`:` on a receiver
-//! with a known class type, its fields and methods; otherwise scope-visible
-//! locals, file-declared globals/functions, and keywords. Deduplicated and
-//! sorted.
+//! Completion: after `.`/`:` on a receiver with a known class type, its
+//! fields and methods; otherwise scope-visible locals, file-declared
+//! globals/functions, and keywords. Deduplicated and sorted.
 
 use std::collections::BTreeMap;
 
 use lsp_types::{CompletionItem, CompletionItemKind};
 use luabox_hir::BindingKind;
 use luabox_syntax::luacats::FieldKey;
-use luabox_types::shape::TypeShape;
 
-use crate::luab;
 use crate::sema::{self, FileSema};
 
 /// Lua keywords offered in plain (non-member) positions.
@@ -21,17 +16,9 @@ const KEYWORDS: &[&str] = &[
     "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
 ];
 
-/// Compute completions at `offset` (the cursor's byte offset). `shape_types`
-/// is the ambient package scope's declarations, by fully-qualified name.
+/// Compute completions at `offset` (the cursor's byte offset).
 #[must_use]
-pub fn completion(
-    sema: &FileSema,
-    offset: usize,
-    shape_types: &BTreeMap<String, TypeShape>,
-) -> Vec<CompletionItem> {
-    if luab::in_lua_type_position(&sema.root, offset) {
-        return shape_type_items(shape_types);
-    }
+pub fn completion(sema: &FileSema, offset: usize) -> Vec<CompletionItem> {
     let text = sema.index.text();
     let bytes = text.as_bytes();
     let offset = offset.min(bytes.len());
@@ -169,18 +156,4 @@ fn scope_items(sema: &FileSema, offset: usize, items: &mut BTreeMap<String, Comp
 
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
-}
-
-/// Completion items for the ambient package scope's type names, offered in
-/// LuaCATS annotation positions (`---@type`, `---@param`, `---@return`).
-fn shape_type_items(shape_types: &BTreeMap<String, TypeShape>) -> Vec<CompletionItem> {
-    shape_types
-        .keys()
-        .map(|name| CompletionItem {
-            label: name.clone(),
-            kind: Some(CompletionItemKind::CLASS),
-            detail: Some(format!("type {name}")),
-            ..CompletionItem::default()
-        })
-        .collect()
 }

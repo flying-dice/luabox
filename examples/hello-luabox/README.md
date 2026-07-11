@@ -41,5 +41,5 @@ also run the script directly: `luabox run src/main.lua`.
 
 ## Where to go next
 
-`../geometry` introduces the `.luab` shape DSL. See `../README.md` for the
-full learning path.
+`../geometry` introduces LuaCATS classes and a `.d.lua` def package. See
+`../README.md` for the full learning path.

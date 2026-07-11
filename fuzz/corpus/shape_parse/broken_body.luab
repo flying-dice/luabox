@@ -1,1 +1,0 @@
-struct A { x: number } @@@ !! 42 struct B { y: number }

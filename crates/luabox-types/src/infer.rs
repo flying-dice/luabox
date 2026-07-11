@@ -42,8 +42,8 @@
 //! *fully known*: never for shapes that escaped into unanalyzed code
 //! (arguments to unmodeled calls), shapes with indexers or dynamic-key
 //! writes, shapes whose metatable is unresolved, or carriers bound to a
-//! `---@class`/`.luab` struct (their declarations govern instead). Unknown
-//! stays `unknown` — never `any`.
+//! `---@class` (its declaration governs instead). Unknown stays `unknown` —
+//! never `any`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -93,8 +93,8 @@ pub(crate) struct Outcome {
     /// Final accumulated structural type of each `---@type` carrier local
     /// (`local X = {}` extended by later `X.f = ...` / `function X:m()`),
     /// keyed by the `local` statement's byte range. The whole-carrier shape
-    /// the checker's deferred `---@type` conformance check runs against
-    /// (SHAPES-V2.md). `---@class Name : Parent` carriers publish their
+    /// the checker's deferred `---@type` conformance check runs against.
+    /// `---@class Name : Parent` carriers publish their
     /// reified accumulated shape here too, keyed by the `local` statement, so
     /// the checker can verify `: Interface` conformance (#107).
     pub(crate) carrier_final: HashMap<Key, Ty>,
@@ -219,7 +219,7 @@ pub(crate) fn run(
         .map(|ity| infer.reify(&ity));
     // The final accumulated shape of every carrier local, snapshotted after
     // both passes so later `X.f = ...` / `function X:m()` extensions are all
-    // in (SHAPES-V2.md whole-carrier conformance).
+    // in (whole-carrier conformance).
     let carriers: Vec<(Key, BindingId)> =
         infer.carrier_locals.iter().map(|(k, v)| (*k, *v)).collect();
     let mut carrier_final = HashMap::new();
@@ -338,7 +338,7 @@ struct ShapeData {
     /// `setmetatable` was called with an untracked metatable — field
     /// lookups can no longer be proven absent.
     meta_unknown: bool,
-    /// The `---@class`/`.luab` struct name bound to this table's declaration,
+    /// The `---@class` name bound to this table's declaration,
     /// when any. Field lookups consult the declaration; `LB0306` defers to
     /// the declaration's own diagnostics.
     declared: Option<String>,
@@ -820,9 +820,8 @@ impl Infer<'_> {
                         return Lookup::Found(ITy::Ty(ty));
                     }
                     // Absence is diagnosable only for a real LuaCATS `---@class`
-                    // with no indexer/array part. A `.luab`-struct carrier stays
-                    // lenient (#82; DIRECTION.md parks the shape DSL), as does a
-                    // dynamic-access class.
+                    // with no indexer/array part. A dynamic-access class stays
+                    // lenient.
                     if self.env.is_class(&class)
                         && shape.indexers.is_empty()
                         && shape.array.is_none()
@@ -910,9 +909,9 @@ impl Infer<'_> {
                     }
                 }
                 // Absent on a declared class → luals `undefined-field` (#90),
-                // provable only for a real LuaCATS `---@class` (not a `.luab`
-                // struct, #82) with no indexer/array part (dynamic access) and
-                // that resolved to a table (not an enum union).
+                // provable only for a real LuaCATS `---@class` with no
+                // indexer/array part (dynamic access) and that resolved to a
+                // table (not an enum union).
                 let dynamic = match &resolved {
                     Ty::Table(t) => !t.indexers.is_empty() || t.array.is_some(),
                     _ => true,
@@ -1238,7 +1237,7 @@ impl Infer<'_> {
         // carrier still being built). Keep the inferred shape rather than
         // freezing the binding to `T`, so later `X.f = ...` / `function X:m()`
         // extend it; its final shape is published for the checker's deferred
-        // whole-carrier conformance check (SHAPES-V2.md).
+        // whole-carrier conformance check.
         let is_carrier = key.is_some_and(|k| {
             self.classify_carrier(body, k, names, init, declared_tys.as_deref(), &values)
         });
@@ -2450,8 +2449,7 @@ impl Infer<'_> {
     /// keyed by the function's source range (the display surface behind
     /// editor return-type hints). Annotated functions are the editor's
     /// job: it renders the annotation text verbatim, which survives type
-    /// names the per-file environment cannot resolve (`.luab` shapes,
-    /// cross-file classes).
+    /// names the per-file environment cannot resolve (cross-file classes).
     fn collect_fn_returns(&mut self) -> Vec<InferredReturn> {
         let mut out = Vec::new();
         for (body_id, body) in self.hir.bodies() {

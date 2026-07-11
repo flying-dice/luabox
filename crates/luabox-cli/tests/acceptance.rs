@@ -242,7 +242,7 @@ fn no_dialect_diagnostic(world: &mut AcceptanceWorld) {
     }
 }
 
-// --- shape fixtures (shapes/*.feature) ------------------------------------
+// --- fixture helpers ------------------------------------------------------
 
 /// Write a file under the scenario project, creating parent directories.
 fn write_file(world: &AcceptanceWorld, rel: &str, content: &str) {
@@ -251,193 +251,6 @@ fn write_file(world: &AcceptanceWorld, rel: &str, content: &str) {
         std::fs::create_dir_all(parent).expect("failed to create parent directories");
     }
     std::fs::write(&full, content).unwrap_or_else(|e| panic!("cannot write `{rel}`: {e}"));
-}
-
-/// The manifest every step-built shape fixture shares: strict types (so
-/// positional conformance errors are hard) and `shapes/` as the ambient
-/// shape path (SHAPES-V2.md — the scope is ambient, there are no imports).
-fn ensure_shape_manifest(world: &AcceptanceWorld) {
-    if world.dir.path().join("luabox.toml").is_file() {
-        return;
-    }
-    write_file(
-        world,
-        "luabox.toml",
-        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n\n\
-         [types]\nstrict = true\nshape-paths = [\"shapes\"]\n",
-    );
-}
-
-#[given(regex = r#"^a shape module "(\w+)" declaring (.+)$"#)]
-fn shape_module_declaring(world: &mut AcceptanceWorld, name: String, decl: String) {
-    ensure_shape_manifest(world);
-    write_file(world, &format!("shapes/{name}.luab"), &format!("{decl}\n"));
-}
-
-#[given(regex = r"^a Lua file binding a table (\{.*\}) with ---@type ([\w.]+)$")]
-fn lua_file_binding_table(world: &mut AcceptanceWorld, table: String, type_name: String) {
-    ensure_shape_manifest(world);
-    let source = format!("---@type {type_name}\nlocal value = {table}\nreturn value\n");
-    write_file(world, "src/main.lua", &source);
-}
-
-#[given(regex = r"^type Shape with methods (\w+) and (\w+)$")]
-fn type_shape_with_methods(world: &mut AcceptanceWorld, first: String, second: String) {
-    ensure_shape_manifest(world);
-    let module = format!(
-        "export type Shape = {{\n    {first}(self): number,\n    {second}(self): number,\n}}\n"
-    );
-    write_file(world, "shapes/geometry.luab", &module);
-}
-
-#[given(regex = r#"^type Drawable = Shape & draw in "geometry\.luab"$"#)]
-fn type_drawable_intersection(world: &mut AcceptanceWorld) {
-    ensure_shape_manifest(world);
-    write_file(
-        world,
-        "shapes/geometry.luab",
-        "export type Shape = {\n    area(self): number,\n    perimeter(self): number,\n}\n\
-         export type Drawable = Shape & { draw(self): string }\n",
-    );
-}
-
-#[given(regex = r#"^type Shape in "geometry\.luab"$"#)]
-fn type_shape_in_geometry(world: &mut AcceptanceWorld) {
-    ensure_shape_manifest(world);
-    write_file(
-        world,
-        "shapes/geometry.luab",
-        "export type Shape = {\n    area(self): number,\n}\n",
-    );
-}
-
-#[given(regex = r#"^type Point in "geometry\.luab"$"#)]
-fn type_point_in_geometry(world: &mut AcceptanceWorld) {
-    ensure_shape_manifest(world);
-    write_file(
-        world,
-        "shapes/geometry.luab",
-        "type Point = { x: number, y: number }\n",
-    );
-}
-
-/// A carrier class table with the given `:`-methods, positionally asserted
-/// against `asserted` via a `---@type` binding — the v2 idiom for a local
-/// conformance check (SHAPES-V2.md: the general mechanism covers the
-/// special case; no dedicated tag exists).
-fn carrier_asserted(methods: &[&str], asserted: &str) -> String {
-    use std::fmt::Write as _;
-    let mut src = String::from("local Circle = {}\nCircle.__index = Circle\n");
-    for m in methods {
-        let _ = write!(
-            src,
-            "\n---@return number\nfunction Circle:{m}()\n  return 1\nend\n"
-        );
-    }
-    let _ = write!(src, "\n---@type {asserted}\nlocal s = Circle\nreturn s\n");
-    src
-}
-
-#[given(regex = r"^a carrier table defining only (\w+) asserted as ([\w.]+)$")]
-fn carrier_defining_only(world: &mut AcceptanceWorld, only: String, asserted: String) {
-    ensure_shape_manifest(world);
-    write_file(
-        world,
-        "src/main.lua",
-        &carrier_asserted(&[&only], &asserted),
-    );
-}
-
-#[given(regex = r"^a carrier table defining (\w+) and (\w+) asserted as ([\w.]+)$")]
-fn carrier_defining_two(
-    world: &mut AcceptanceWorld,
-    first: String,
-    second: String,
-    asserted: String,
-) {
-    ensure_shape_manifest(world);
-    write_file(
-        world,
-        "src/main.lua",
-        &carrier_asserted(&[&first, &second], &asserted),
-    );
-}
-
-#[given(
-    regex = r"^a carrier table defining (\w+), (\w+) and an inherent helper asserted as ([\w.]+)$"
-)]
-fn carrier_with_inherent_helper(
-    world: &mut AcceptanceWorld,
-    first: String,
-    second: String,
-    asserted: String,
-) {
-    ensure_shape_manifest(world);
-    write_file(
-        world,
-        "src/main.lua",
-        &carrier_asserted(&[&first, &second, "helper"], &asserted),
-    );
-}
-
-#[given(regex = r"^a carrier table whose (\w+) method returns a string asserted as ([\w.]+)$")]
-fn carrier_wrong_return(world: &mut AcceptanceWorld, method: String, asserted: String) {
-    ensure_shape_manifest(world);
-    // `method` is mis-annotated `---@return string`; `perimeter` is correct,
-    // so the sole signature mismatch names `method`.
-    let source = format!(
-        "local Circle = {{}}\nCircle.__index = Circle\n\
-         \n---@return string\nfunction Circle:{method}()\n  return \"x\"\nend\n\
-         \n---@return number\nfunction Circle:perimeter()\n  return 1\nend\n\
-         \n---@type {asserted}\nlocal s = Circle\nreturn s\n"
-    );
-    write_file(world, "src/main.lua", &source);
-}
-
-#[given("a ---@class annotated table asserted as geometry.Shape")]
-fn class_table_asserted(world: &mut AcceptanceWorld) {
-    ensure_shape_manifest(world);
-    let source = "\
----@class Square
----@field side number
-local Square = {}
-Square.__index = Square
-
----@return number
-function Square:area()
-  return self.side * self.side
-end
-
----@type geometry.Shape
-local s = Square
-return s
-";
-    write_file(world, "src/main.lua", source);
-}
-
-#[given("a Lua function annotated ---@param p geometry.Point reading p.x")]
-fn lua_function_reading_point(world: &mut AcceptanceWorld) {
-    ensure_shape_manifest(world);
-    let source = "\
----@param p geometry.Point
----@return number
-local function get_x(p)
-  return p.x
-end
-
-return get_x({ x = 1, y = 2 })
-";
-    write_file(world, "src/main.lua", source);
-}
-
-#[given("a shape module containing a method with a body")]
-fn shape_module_with_body(world: &mut AcceptanceWorld) {
-    ensure_shape_manifest(world);
-    write_file(
-        world,
-        "shapes/bad.luab",
-        "type Shape = {\n    area(self): number { return 1 },\n}\n",
-    );
 }
 
 #[then(expr = "diagnostic {word} is reported naming field {string}")]
@@ -454,31 +267,6 @@ fn diagnostic_reported_naming(world: &mut AcceptanceWorld, code: String, name: S
     assert!(
         stdout.contains(&quoted),
         "expected `{code}` to name {quoted}; stdout:\n{stdout}"
-    );
-}
-
-#[then(expr = "diagnostic {word} is reported with both spans")]
-fn diagnostic_with_both_spans(world: &mut AcceptanceWorld, code: String) {
-    let stdout = world.stdout();
-    assert!(
-        stdout.contains(&code),
-        "expected diagnostic `{code}`; stdout:\n{stdout}\nstderr:\n{}",
-        world.stderr()
-    );
-    for file in ["main.lua", "geometry.luab"] {
-        assert!(
-            stdout.contains(file),
-            "expected `{code}` to show a span in `{file}`; stdout:\n{stdout}"
-        );
-    }
-}
-
-#[then("zero shape diagnostics are reported")]
-fn zero_shape_diagnostics(world: &mut AcceptanceWorld) {
-    let output = format!("{}\n{}", world.stdout(), world.stderr());
-    assert!(
-        !output.contains("LB2"),
-        "expected no LB2xxx diagnostics; output:\n{output}"
     );
 }
 
@@ -651,7 +439,7 @@ fn run_with_env(world: &mut AcceptanceWorld, command: String, env: String) {
     run_command_with_env(world, &command, &[(key.to_string(), value.to_string())]);
 }
 
-// --- build fixtures (emit/build.feature, shapes/lb-files.feature — #22) ----
+// --- build fixtures (emit/build.feature — #22) ----------------------------
 
 /// Write a manifest with a `[build] target` (SPEC.md §5).
 fn write_manifest_with_target(world: &AcceptanceWorld, edition: &str, target: &str, strict: bool) {
@@ -725,52 +513,6 @@ fn emitted_output_contains_no(world: &mut AcceptanceWorld, needle: String) {
         assert!(
             !content.contains(&needle),
             "`{}` contains `{needle}`:\n{content}",
-            file.display()
-        );
-    }
-}
-
-/// Snapshot the build output into a hidden dir (skipped by the file walk)
-/// so a later build of the same project can be compared byte-for-byte —
-/// SHAPES.md §1 invariant 1: `.luab` shapes never affect emitted output.
-#[then("I stash the build output")]
-fn stash_build_output(world: &mut AcceptanceWorld) {
-    let dist = world.dir.path().join("dist");
-    let stash = world.dir.path().join(".luabox-stash");
-    for file in files_under(&dist) {
-        let rel = file.strip_prefix(&dist).expect("under dist");
-        let stashed = stash.join(rel);
-        if let Some(parent) = stashed.parent() {
-            std::fs::create_dir_all(parent).expect("failed to create stash directories");
-        }
-        std::fs::copy(&file, &stashed).expect("failed to stash build output");
-    }
-    std::fs::remove_dir_all(&dist).expect("failed to clear dist for the next build");
-}
-
-#[then("the build output is byte-identical to the stashed output")]
-fn build_output_matches_stash(world: &mut AcceptanceWorld) {
-    let dist = world.dir.path().join("dist");
-    let stash = world.dir.path().join(".luabox-stash");
-    let rel = |base: &std::path::Path, files: Vec<std::path::PathBuf>| {
-        files
-            .into_iter()
-            .map(|f| f.strip_prefix(base).expect("under base").to_path_buf())
-            .collect::<Vec<_>>()
-    };
-    let dist_files = rel(&dist, files_under(&dist));
-    let stash_files = rel(&stash, files_under(&stash));
-    assert_eq!(
-        dist_files, stash_files,
-        "build output file sets differ with and without shapes"
-    );
-    for file in dist_files {
-        let now = std::fs::read(dist.join(&file)).expect("cannot read dist file");
-        let before = std::fs::read(stash.join(&file)).expect("cannot read stashed file");
-        assert_eq!(
-            now,
-            before,
-            "`{}` differs between builds with and without shapes",
             file.display()
         );
     }

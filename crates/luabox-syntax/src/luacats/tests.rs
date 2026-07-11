@@ -381,13 +381,13 @@ fn simple_tags() {
 }
 
 #[test]
-fn retired_shape_tags_parse_as_unknown() {
-    // SHAPES-V2.md: the v1 binding tags are gone from the vocabulary. They
-    // parse as Unknown — surfaced to v1 users, never silently accepted.
+fn unrecognised_tags_parse_as_unknown() {
+    // Tags outside the recognised LuaCATS vocabulary parse as Unknown —
+    // surfaced to the user, never silently accepted.
     for src in [
         "---@use geometry",
         "---@struct Point",
-        "---@impl Shape for Circle",
+        "---@impl Widget for Circle",
     ] {
         let Tag::Unknown(u) = one_tag(src) else {
             panic!("retired tag must parse as Unknown: {src}")

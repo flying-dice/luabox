@@ -1,7 +1,6 @@
 //! `luabox fmt [--check] [--watch]` — canonical formatting for a whole
 //! project (SPEC.md §10): every `**/*.lua` under the package in the
-//! manifest's edition, plus every `**/*.luab` shape module via the shape
-//! formatter.
+//! manifest's edition.
 //!
 //! Project discovery walks up from the working directory to the nearest
 //! `luabox.toml` (cargo-style) and skips the `[build] out` directory —
@@ -19,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use luabox_resolve::manifest::Manifest;
-use luabox_syntax::{Dialect, lua, shape};
+use luabox_syntax::{Dialect, lua};
 
 /// Execute `luabox fmt` from `cwd`. In `--check` mode nothing is written;
 /// the command fails listing every file that would change. With `watch`,
@@ -53,10 +52,7 @@ fn run_once(cwd: &Path, check: bool) -> anyhow::Result<()> {
     for path in &files {
         let source = fs::read_to_string(path)
             .with_context(|| format!("cannot read `{}`", display_rel(path, &project.root)))?;
-        let formatted = match path.extension().and_then(|e| e.to_str()) {
-            Some("lua") => lua::fmt::format(&source, project.dialect),
-            _ => shape::format(&source),
-        };
+        let formatted = lua::fmt::format(&source, project.dialect);
         if formatted != source {
             if !check {
                 fs::write(path, formatted).with_context(|| {
@@ -136,7 +132,7 @@ fn discover(cwd: &Path) -> anyhow::Result<Project> {
     })
 }
 
-/// All `*.lua` / `*.luab` files under the project root, deterministic order,
+/// All `*.lua` files under the project root, deterministic order,
 /// skipping dot-directories and the build output directory.
 fn collect_source_files(project: &Project) -> anyhow::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
@@ -159,12 +155,7 @@ fn walk(dir: &Path, project: &Project, files: &mut Vec<PathBuf>) -> anyhow::Resu
             if !hidden && !is_out {
                 walk(&path, project, files)?;
             }
-        } else if !hidden
-            && matches!(
-                path.extension().and_then(|e| e.to_str()),
-                Some("lua" | "luab")
-            )
-        {
+        } else if !hidden && path.extension().and_then(|e| e.to_str()) == Some("lua") {
             files.push(path);
         }
     }

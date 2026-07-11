@@ -11,14 +11,6 @@
     <depends>com.intellij.modules.lsp</depends>
 
     <extensions defaultExtensionNs="com.intellij">
-        <!-- `.luab` shape file type, backed by the LuaBox language. -->
-        <fileType
-                name="LuaBox"
-                implementationClass="com.luabox.LuaboxFileType"
-                fieldName="INSTANCE"
-                language="LuaBox"
-                extensions="luab"/>
-
         <!-- `.lua` sources, backed by the namespaced luabox.Lua language:
              first-class file type instead of plain text + marketplace
              plugin suggestions. -->
@@ -35,7 +27,7 @@
                 language="luabox.Lua"
                 implementationClass="com.luabox.LuaSyntaxHighlighterFactory"/>
 
-        <!-- Start `luabox lsp` for .lua and .luab files. -->
+        <!-- Start `luabox lsp` for .lua files. -->
         <platform.lsp.serverSupportProvider
                 implementation="com.luabox.LuaboxLspServerSupportProvider"/>
 

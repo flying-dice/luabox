@@ -33,13 +33,6 @@ doc = false
 bench = false
 
 [[bin]]
-name = "shape_parse"
-path = "fuzz_targets/shape_parse.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "luacats"
 path = "fuzz_targets/luacats.rs"
 test = false

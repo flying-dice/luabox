@@ -231,9 +231,8 @@ impl Ctx<'_> {
 
 /// A short human explanation of why `value` does not fit `target`, when
 /// both resolve to table shapes: the missing required members, then the
-/// members whose types mismatch (SHAPES-V2.md: assignability errors must
-/// name the members, not just the types). `None` when there is no
-/// table-level story to tell.
+/// members whose types mismatch (assignability errors name the members, not
+/// just the types). `None` when there is no table-level story to tell.
 pub(crate) fn explain_mismatch(
     env: &TypeEnv,
     strict: bool,
@@ -280,7 +279,7 @@ pub(crate) fn explain_mismatch(
 }
 
 /// How a table *literal* immediately conforms to a target object type — the
-/// discriminator behind whole-carrier `---@type` deferral (SHAPES-V2.md).
+/// discriminator behind whole-carrier `---@type` deferral.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LiteralConformance {
     /// Every required member present and correctly typed, no undeclared keys.
@@ -288,7 +287,7 @@ pub(crate) enum LiteralConformance {
     /// The *only* gap is missing required members — a carrier still being
     /// built. Whole-carrier conformance is deferred to the final shape.
     MissingOnly,
-    /// A present member has the wrong type, or a sealed target rejects an
+    /// A present member has the wrong type, or a closed target rejects an
     /// undeclared key — a real mistake, reported immediately (never deferred).
     Other,
 }

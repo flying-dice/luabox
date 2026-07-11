@@ -1,7 +1,7 @@
 # Type-system direction (decision record)
 
-Status: **accepted** (2026-07-11). Supersedes the direction of
-[SHAPES-V2.md](SHAPES-V2.md) (the `.luab` shape DSL).
+Status: **accepted** (2026-07-11). Supersedes the earlier `.luab` shape DSL
+direction (SHAPES-V2, removed under #109).
 
 ## North star
 
@@ -69,7 +69,8 @@ fields untyped, **[#106]** call return not propagated to unannotated locals.
    Initial-public-release milestone).
 3. **Go live** at feature parity + strictness.
 4. Remove `.luab` (subsystem, tree-sitter grammar, editor `.luab` support,
-   SHAPES-V2.md) once nothing depends on it.
+   SHAPES-V2.md) once nothing depends on it. **Done (#109): the `.luab`
+   subsystem was removed.**
 5. **Post-launch:** add luabox keyword extensions on the LuaCATS base.
 
 ## Non-goals (for now)

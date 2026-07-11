@@ -736,152 +736,6 @@ end
     client.shutdown();
 }
 
-// === .luab shape files =====================================================
-
-#[test]
-fn lb_files_publish_shape_parse_errors() {
-    let client = start(&[]);
-    let uri = client.uri("shapes.luab");
-    // A method with a body: rejected at parse time with LB2010.
-    let source = "type Shape = {\n    area(self): number { return 1 },\n}\n";
-    let diags = client.open(&uri, source);
-    assert!(
-        diags.iter().any(|d| code_of(d) == "LB2010"),
-        "expected LB2010, got {diags:?}"
-    );
-    // A clean edit clears them.
-    let clean = "type Shape = {\n    area(self): number,\n}\n";
-    assert!(client.change(&uri, clean).is_empty());
-    client.shutdown();
-}
-
-#[test]
-fn lb_goto_and_hover_resolve_type_names() {
-    let client = start(&[]);
-    let uri = client.uri("shapes.luab");
-    let source = "type Point = { x: number, y: number }\ntype Pair = Point\n";
-    client.open(&uri, source);
-    let mut client = client;
-    // `Point` on line 1 (the alias RHS) → the declaration on line 0.
-    let location = client.definition(&uri, 1, 14).expect("definition");
-    assert_eq!(location.range, range((0, 5), (0, 10)));
-    let hover = client.hover(&uri, 1, 14).expect("hover");
-    assert!(
-        hover_text(&hover).contains("type Point"),
-        "{}",
-        hover_text(&hover)
-    );
-    client.shutdown();
-}
-
-// === SHAPES-V2 ambient package scope (goto/hover/completion) ============
-
-const SHAPES_MANIFEST: &str = "\
-[package]
-name = \"demo\"
-version = \"0.1.0\"
-edition = \"5.4\"
-
-[types]
-shape-paths = [\"shapes\"]
-";
-
-const GEOMETRY_LUAB: &str = "\
---- A 2D point.
-type Point = { x: number, y: number }
-";
-
-#[test]
-fn lua_annotation_goto_and_hover_resolve_shape_types() {
-    let client = start(&[
-        ("luabox.toml", SHAPES_MANIFEST),
-        ("shapes/geometry.luab", GEOMETRY_LUAB),
-    ]);
-    let uri = client.uri("main.lua");
-    let source = "---@type geometry.Point\nlocal p = nil\nprint(p)\n";
-    client.open(&uri, source);
-    let mut client = client;
-    // Cursor inside `geometry` (the first segment of the dotted reference,
-    // not the declared name itself) still resolves the whole path.
-    let location = client.definition(&uri, 0, 12).expect("definition");
-    assert!(
-        location.uri.as_str().ends_with("shapes/geometry.luab"),
-        "{}",
-        location.uri.as_str()
-    );
-    // The `Point` name token in `type Point = { ... }` on line 1.
-    assert_eq!(location.range, range((1, 5), (1, 10)));
-
-    let hover = client.hover(&uri, 0, 12).expect("hover");
-    let text = hover_text(&hover);
-    assert!(text.contains("type Point"), "{text}");
-    assert!(text.contains("A 2D point."), "{text}");
-    client.shutdown();
-}
-
-#[test]
-fn lb_cross_file_goto_resolves_qualified_reference() {
-    let render = "type Canvas = { origin: geometry.Point }\n";
-    let client = start(&[
-        ("luabox.toml", SHAPES_MANIFEST),
-        ("shapes/geometry.luab", GEOMETRY_LUAB),
-        ("shapes/render.luab", render),
-    ]);
-    let uri = client.uri("shapes/render.luab");
-    client.open(&uri, render);
-    let mut client = client;
-    // Cursor inside `geometry`, the qualifying segment of `geometry.Point`.
-    let location = client.definition(&uri, 0, 27).expect("definition");
-    assert!(
-        location.uri.as_str().ends_with("shapes/geometry.luab"),
-        "{}",
-        location.uri.as_str()
-    );
-    assert_eq!(location.range, range((1, 5), (1, 10)));
-    client.shutdown();
-}
-
-#[test]
-fn lua_annotation_completion_offers_scope_type_names() {
-    let client = start(&[
-        ("luabox.toml", SHAPES_MANIFEST),
-        ("shapes/geometry.luab", GEOMETRY_LUAB),
-    ]);
-    let uri = client.uri("main.lua");
-    let source = "---@type \nlocal p = nil\n";
-    client.open(&uri, source);
-    let mut client = client;
-    // Cursor right after `---@type `, nothing typed yet.
-    let items = client.complete(&uri, 0, 9);
-    let point = items
-        .iter()
-        .find(|i| i.label == "geometry.Point")
-        .unwrap_or_else(|| panic!("expected `geometry.Point`, got {items:?}"));
-    assert_eq!(point.kind, Some(CompletionItemKind::CLASS));
-    client.shutdown();
-}
-
-#[test]
-fn lb_completion_offers_builtins_and_siblings() {
-    let client = start(&[]);
-    let uri = client.uri("shapes.luab");
-    let source = "type Point = { x: number, y: number }\ntype Pair = \n";
-    client.open(&uri, source);
-    let mut client = client;
-    let items = client.complete(&uri, 1, 12);
-    let number = items
-        .iter()
-        .find(|i| i.label == "number")
-        .unwrap_or_else(|| panic!("expected builtin `number`, got {items:?}"));
-    assert_eq!(number.kind, Some(CompletionItemKind::KEYWORD));
-    let point = items
-        .iter()
-        .find(|i| i.label == "Point")
-        .unwrap_or_else(|| panic!("expected sibling `Point`, got {items:?}"));
-    assert_eq!(point.kind, Some(CompletionItemKind::CLASS));
-    client.shutdown();
-}
-
 // === Formatting ==========================================================
 
 /// Un-canonical spacing/indentation that still parses cleanly.
@@ -953,25 +807,6 @@ fn formatting_parse_error_document_returns_no_edits() {
     let uri = client.uri("broken.lua");
     client.open(&uri, "local = 1\n");
     let mut client = client;
-    let edits = client.formatting(&uri).expect("edits");
-    assert!(edits.is_empty(), "{edits:?}");
-    client.shutdown();
-}
-
-#[test]
-fn lb_formatting_matches_shape_formatter() {
-    let source = "type Point = {x: number, y: number}\n";
-    let client = start(&[]);
-    let uri = client.uri("shapes.luab");
-    client.open(&uri, source);
-    let mut client = client;
-    let edits = client.formatting(&uri).expect("edits");
-    assert_eq!(edits.len(), 1, "{edits:?}");
-    let canonical = luabox_syntax::shape::format(source);
-    assert_ne!(canonical, source, "fixture must not already be canonical");
-    assert_eq!(edits[0].new_text, canonical);
-    // A parse-error .luab document yields no edits.
-    client.change(&uri, "type = {\n");
     let edits = client.formatting(&uri).expect("edits");
     assert!(edits.is_empty(), "{edits:?}");
     client.shutdown();
@@ -1083,76 +918,6 @@ fn semantic_token_columns_and_lengths_are_utf16() {
     client.shutdown();
 }
 
-#[test]
-fn lb_semantic_tokens_classify_shape_declarations() {
-    let source = "\
---- A closed shape.
-export type Shape = {
-    area(self): number,
-}
-type Circle = { radius: number }
-type Pair<T> = { first: T }
-";
-    let client = start(&[]);
-    let uri = client.uri("shapes.luab");
-    client.open(&uri, source);
-    let mut client = client;
-    let data = client.semantic_tokens(&uri);
-    let tokens = client.decode_tokens(&data);
-
-    // `///` doc comment vs keywords.
-    let doc = token_at(&tokens, 0, 0);
-    assert_eq!(doc.token_type, "comment");
-    assert!(
-        doc.modifiers.contains(&"documentation".to_string()),
-        "{doc:?}"
-    );
-    assert_eq!(token_at(&tokens, 1, 0).token_type, "keyword"); // export
-    assert_eq!(token_at(&tokens, 1, 7).token_type, "keyword"); // type
-
-    // The declared name is a type declaration.
-    let shape = token_at(&tokens, 1, 12);
-    assert_eq!(shape.token_type, "type");
-    assert!(
-        shape.modifiers.contains(&"declaration".to_string()),
-        "{shape:?}"
-    );
-
-    // Method member: method, `self` keyword, return type.
-    assert_eq!(token_at(&tokens, 2, 4).token_type, "method"); // area
-    assert_eq!(token_at(&tokens, 2, 9).token_type, "keyword"); // self
-    assert_eq!(token_at(&tokens, 2, 16).token_type, "type"); // number
-
-    // Field name and field type.
-    assert_eq!(token_at(&tokens, 4, 16).token_type, "property"); // radius
-    assert_eq!(token_at(&tokens, 4, 24).token_type, "type"); // number
-
-    // Generics: `T` declares a type parameter and its use resolves to it.
-    let generic = token_at(&tokens, 5, 10);
-    assert_eq!(generic.token_type, "typeParameter");
-    assert!(
-        generic.modifiers.contains(&"declaration".to_string()),
-        "{generic:?}"
-    );
-    assert_eq!(token_at(&tokens, 5, 24).token_type, "typeParameter"); // first: T
-    client.shutdown();
-}
-
-#[test]
-fn lb_semantic_tokens_survive_parse_errors() {
-    // The shape tree is lossless: broken input still highlights.
-    let source = "type Shape = {\n    area(self): number { return 1 },\n}\n";
-    let client = start(&[]);
-    let uri = client.uri("shapes.luab");
-    client.open(&uri, source);
-    let mut client = client;
-    let data = client.semantic_tokens(&uri);
-    let tokens = client.decode_tokens(&data);
-    assert!(!tokens.is_empty());
-    assert_eq!(token_at(&tokens, 1, 4).token_type, "method"); // area
-    client.shutdown();
-}
-
 // === Project bootstrap ===================================================
 
 // === Inlay hints =========================================================
@@ -1249,8 +1014,8 @@ local n = 1
 
 #[test]
 fn inlay_hints_render_annotated_returns_verbatim() {
-    // `Rect` is not declared in this file (a `.luab` shape or cross-file
-    // class): the return hint must still render the annotation text.
+    // `Rect` is not declared in this file (a cross-file class): the return
+    // hint must still render the annotation text.
     let source = "\
 local Rect = {}
 Rect.__index = Rect

@@ -1,8 +1,7 @@
 //! Monomorphisation engine for LuaCATS generics ([#84]).
 //!
 //! Two operations, shared by every generic front-end (generic `---@class<T>`
-//! references, `---@generic` functions, and the `.luab` templates in
-//! [`crate::shape`], which call in here so nothing duplicates):
+//! references and `---@generic` functions):
 //!
 //! - [`subst_ty`] substitutes `Ty::Named(param)` placeholders through tables,
 //!   functions, and unions — the machinery a generic *reference* uses to

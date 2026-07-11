@@ -13,7 +13,6 @@
 //! - **Diagnostics**: pushed via `textDocument/publishDiagnostics` after
 //!   every open/change/close, computed from a fresh [`Analysis`] snapshot.
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -37,14 +36,11 @@ use lsp_types::{
 };
 use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
 use luabox_resolve::manifest::{Dependency, Manifest};
-use luabox_types::{Ambient, DepShapeExport, ShapeStore, combined_defs};
+use luabox_types::{Ambient, combined_defs};
 
-use crate::line_index::LineIndex;
 use crate::sema::FileSema;
-use crate::uri::{path_to_uri, uri_to_path};
-use crate::{
-    completion, diagnostics, fmt, goto_def, hover, inlay_hints, luab, semantic_tokens, symbols,
-};
+use crate::uri::uri_to_path;
+use crate::{completion, diagnostics, fmt, goto_def, hover, inlay_hints, semantic_tokens, symbols};
 
 /// Run the server over stdio until the client sends `shutdown`/`exit`.
 /// A leading `--stdio` argument, which editors commonly pass, is harmless:
@@ -130,10 +126,6 @@ struct ProjectConfig {
     strictness: Strictness,
     /// The manifest's `[build] out` directory, skipped when walking.
     out_dir: Option<PathBuf>,
-    /// `[types] shape-paths`, absolute, in manifest order (SHAPES.md §6).
-    shape_paths: Vec<PathBuf>,
-    /// Dependencies that export shape modules (SHAPES.md §6, tier 3).
-    dependencies: Vec<DepShapeExport>,
     /// Ambient definition-package sources, winner-first (SPEC.md §3, #108):
     /// the project's own `[types] defs` then each direct dependency's defs
     /// (the luals `workspace.library` model), so the editor's ambient scope
@@ -148,8 +140,6 @@ impl ProjectConfig {
             dialect: Dialect::Lua54,
             strictness: Strictness::Warn,
             out_dir: None,
-            shape_paths: Vec::new(),
-            dependencies: Vec::new(),
             def_sources: Vec::new(),
         };
         let Ok(text) = fs::read_to_string(root.join("luabox.toml")) else {
@@ -163,13 +153,6 @@ impl ProjectConfig {
             dialect: Dialect::from_manifest_id(&manifest.package.edition).unwrap_or(Dialect::Lua54),
             strictness: Strictness::from_manifest_flag(manifest.types.strict),
             out_dir: Some(root.join(&manifest.build.out)),
-            shape_paths: manifest
-                .types
-                .shape_paths
-                .iter()
-                .map(|p| root.join(p))
-                .collect(),
-            dependencies: resolve_dep_shape_exports(root, &manifest),
             def_sources: ambient_def_sources(root, &manifest),
         }
     }
@@ -241,7 +224,7 @@ fn load_defs_from(defs_dir: &Path, names: &[String], out: &mut Vec<String>) {
 }
 
 /// Collect every `*.d.lua` file under `dir`, recursively (mirrors the CLI's
-/// helper of the same shape).
+/// helper of the same name).
 fn collect_d_lua(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -261,47 +244,7 @@ fn collect_d_lua(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Build the dependency type-export surfaces (SHAPES-V2.md): each
-/// dependency's `[types] entry` names the `.luab` whose `export type`
-/// declarations mount under the dependency's package name. Mirrors
-/// `check_cmd::resolve_dep_shape_exports` in the CLI — the two frontends
-/// currently each own this manifest join; unify if a third consumer appears.
-fn resolve_dep_shape_exports(root: &Path, manifest: &Manifest) -> Vec<DepShapeExport> {
-    let mut exports = Vec::new();
-    for (name, dep) in manifest
-        .dependencies
-        .iter()
-        .chain(&manifest.dev_dependencies)
-    {
-        let dep_root = match dep {
-            Dependency::Path(p) => root.join(p.path.replace('\\', "/")),
-            _ => root.join("lua_modules").join(name),
-        };
-        let Ok(text) = fs::read_to_string(dep_root.join("luabox.toml")) else {
-            continue;
-        };
-        let Ok(dep_manifest) = Manifest::parse(&text) else {
-            continue;
-        };
-        let Some(entry) = &dep_manifest.types.entry else {
-            continue;
-        };
-        exports.push(DepShapeExport {
-            name: name.clone(),
-            entry: Some(dep_root.join(entry.replace('\\', "/"))),
-            shape_paths: dep_manifest
-                .types
-                .shape_paths
-                .iter()
-                .map(|p| dep_root.join(p))
-                .collect(),
-        });
-    }
-    exports
-}
-
-/// The server state: the analysis host plus `.luab` texts (which never enter
-/// the Lua host — they are parsed with the shape grammar on demand).
+/// The server state: the analysis host over the project's `.lua` files.
 struct Server {
     connection: Connection,
     host: AnalysisHost,
@@ -309,25 +252,10 @@ struct Server {
     dialect: Dialect,
     strictness: Strictness,
     out_dir: Option<PathBuf>,
-    /// Effective text of `.luab` files: overlay (open buffers) over disk.
-    lb_overlay: HashMap<PathBuf, String>,
-    lb_disk: HashMap<PathBuf, String>,
-    /// `[types] shape-paths`, absolute (SHAPES.md §6, tier 2).
-    shape_paths: Vec<PathBuf>,
-    /// Shape-exporting dependencies (SHAPES.md §6, tier 3).
-    dependencies: Vec<DepShapeExport>,
     /// The ambient definition-package layer (dialect stdlib + project defs +
     /// dependency defs, #108), built once at startup so the editor's type
     /// resolution matches `luabox check`.
     ambient: Ambient,
-    /// Shape-module parse cache for the shaped type pass. The store reads
-    /// from disk, so it is dropped and rebuilt whenever a `.luab` buffer
-    /// changes (the IDE auto-saves; unsaved shape edits are eventually
-    /// consistent, not instant).
-    shape_store: ShapeStore,
-    /// `.lua` documents currently open in the editor, so a `.luab` change
-    /// can republish exactly the diagnostics a user can see.
-    open_lua: HashMap<PathBuf, Uri>,
 }
 
 impl Server {
@@ -337,23 +265,16 @@ impl Server {
         Self {
             connection,
             host: AnalysisHost::new(config.dialect, config.strictness),
-            shape_store: ShapeStore::new(root.clone()),
             root,
             dialect: config.dialect,
             strictness: config.strictness,
             out_dir: config.out_dir,
-            lb_overlay: HashMap::new(),
-            lb_disk: HashMap::new(),
-            shape_paths: config.shape_paths,
-            dependencies: config.dependencies,
             ambient,
-            open_lua: HashMap::new(),
         }
     }
 
     /// Load every `.lua` file under the root into the host (so
-    /// `project_diagnostics` and cross-file goto have the full picture) and
-    /// remember `.luab` texts.
+    /// `project_diagnostics` and cross-file goto have the full picture).
     fn bootstrap(&mut self) {
         let mut stack = vec![self.root.clone()];
         while let Some(dir) = stack.pop() {
@@ -372,22 +293,14 @@ impl Server {
                     }
                     continue;
                 }
-                match path.extension().and_then(|e| e.to_str()) {
-                    Some("lua") => {
-                        if let Ok(text) = fs::read_to_string(&path) {
-                            self.host.apply_change(Change::SetFileText {
-                                path,
-                                dialect: self.dialect,
-                                text,
-                            });
-                        }
-                    }
-                    Some("luab") => {
-                        if let Ok(text) = fs::read_to_string(&path) {
-                            self.lb_disk.insert(path, text);
-                        }
-                    }
-                    _ => {}
+                if path.extension().and_then(|e| e.to_str()) == Some("lua")
+                    && let Ok(text) = fs::read_to_string(&path)
+                {
+                    self.host.apply_change(Change::SetFileText {
+                        path,
+                        dialect: self.dialect,
+                        text,
+                    });
                 }
             }
         }
@@ -477,70 +390,16 @@ impl Server {
 
     fn hover(&self, uri: &Uri, position: lsp_types::Position) -> Option<Hover> {
         let path = uri_to_path(uri)?;
-        if is_lb(&path) {
-            let text = self.lb_text(&path)?.to_string();
-            let index = LineIndex::new(text);
-            let offset = index.offset(position);
-            if let Some((range, decl)) = luab::definition(index.text(), offset) {
-                return Some(code_hover(
-                    &decl,
-                    index.range(usize::from(range.start())..usize::from(range.end())),
-                ));
-            }
-            // Not declared in this file: try the ambient package scope
-            // (SHAPES-V2.md), FQ or sibling-short (this module's namespace).
-            let scope = self.shape_scope();
-            let (fq, anchor) = self.lb_resolve_fq(&path, index.text(), offset, &scope)?;
-            let decl = luab::resolve_scoped(&scope, &self.root, &fq, |p| self.lb_text_owned(p))?;
-            return Some(code_hover(
-                &decl.source,
-                index.range(usize::from(anchor.start())..usize::from(anchor.end())),
-            ));
-        }
         let sema = self.sema(&path)?;
         let offset = sema.index.offset(position);
-        if let Some(hover) = hover::hover(&sema, offset) {
-            return Some(hover);
-        }
-        // A `---@type`/`---@param`/`---@return` position naming a `.luab`
-        // shape type (SHAPES-V2.md): zero new tags, so this is a fallback
-        // over the annotation's own doc-comment text, not a distinct tag.
-        let (name, anchor) = luab::dotted_ident_in_lua_comment(&sema.root, offset)?;
-        let scope = self.shape_scope();
-        let decl = luab::resolve_scoped(&scope, &self.root, &name, |p| self.lb_text_owned(p))?;
-        Some(code_hover(
-            &decl.source,
-            sema.index
-                .range(usize::from(anchor.start())..usize::from(anchor.end())),
-        ))
+        hover::hover(&sema, offset)
     }
 
     fn definition(&self, uri: &Uri, position: lsp_types::Position) -> Option<Location> {
         let path = uri_to_path(uri)?;
-        if is_lb(&path) {
-            let text = self.lb_text(&path)?.to_string();
-            let index = LineIndex::new(text);
-            let offset = index.offset(position);
-            if let Some((range, _)) = luab::definition(index.text(), offset) {
-                return Some(Location {
-                    uri: path_to_uri(&path),
-                    range: index.range(usize::from(range.start())..usize::from(range.end())),
-                });
-            }
-            let scope = self.shape_scope();
-            let (fq, _) = self.lb_resolve_fq(&path, index.text(), offset, &scope)?;
-            let decl = luab::resolve_scoped(&scope, &self.root, &fq, |p| self.lb_text_owned(p))?;
-            return Some(Self::location_for(&decl));
-        }
         let sema = self.sema(&path)?;
         let offset = sema.index.offset(position);
-        if let Some(location) = goto_def::goto_definition(&sema, offset, &self.root) {
-            return Some(location);
-        }
-        let (name, _) = luab::dotted_ident_in_lua_comment(&sema.root, offset)?;
-        let scope = self.shape_scope();
-        let decl = luab::resolve_scoped(&scope, &self.root, &name, |p| self.lb_text_owned(p))?;
-        Some(Self::location_for(&decl))
+        goto_def::goto_definition(&sema, offset, &self.root)
     }
 
     fn completion(
@@ -549,64 +408,13 @@ impl Server {
         position: lsp_types::Position,
     ) -> Option<Vec<lsp_types::CompletionItem>> {
         let path = uri_to_path(uri)?;
-        if is_lb(&path) {
-            let text = self.lb_text(&path)?.to_string();
-            let scope = self.shape_scope();
-            return Some(luab::completion(&text, &scope));
-        }
         let sema = self.sema(&path)?;
         let offset = sema.index.offset(position);
-        let scope = self.shape_scope();
-        Some(completion::completion(&sema, offset, &scope.types))
-    }
-
-    /// The ambient `.luab` package scope (SHAPES-V2.md), built (or fetched)
-    /// from the current shape store — the same scope `.lua` diagnostics
-    /// check against.
-    fn shape_scope(&self) -> std::sync::Arc<luabox_types::shape::ShapeScope> {
-        self.shape_store
-            .package_scope(&self.shape_paths, &self.dependencies)
-    }
-
-    /// Resolve the type reference under the cursor in a `.luab` file to a
-    /// fully-qualified scope name, plus the reference's own range (the
-    /// hover/goto anchor in the *current* document): a dotted reference is
-    /// tried as-written; an undotted one falls back to this file's own
-    /// namespace (`namespace.name`) — the sibling-short-name convention
-    /// (SHAPES-V2.md: "inside the declaring `.luab`, sibling references are
-    /// short").
-    fn lb_resolve_fq(
-        &self,
-        path: &Path,
-        text: &str,
-        offset: usize,
-        scope: &luabox_types::shape::ShapeScope,
-    ) -> Option<(String, rowan::TextRange)> {
-        let (dotted, range) = luab::dotted_ref_at(text, offset)?;
-        if dotted.contains('.') {
-            return scope.has_type(&dotted).then_some((dotted, range));
-        }
-        let ns = luab::namespace_of(&self.shape_paths, path);
-        let fq = luab::fq_name(&ns, &dotted);
-        scope.has_type(&fq).then_some((fq, range))
-    }
-
-    /// A [`Location`] for a scope-resolved declaration: a fresh
-    /// [`LineIndex`] over its (possibly different-file) text.
-    fn location_for(decl: &luab::ScopedDecl) -> Location {
-        let index = LineIndex::new(decl.text.clone());
-        Location {
-            uri: path_to_uri(&decl.file),
-            range: index
-                .range(usize::from(decl.name_range.start())..usize::from(decl.name_range.end())),
-        }
+        Some(completion::completion(&sema, offset))
     }
 
     fn document_symbols(&self, uri: &Uri) -> Option<Vec<lsp_types::DocumentSymbol>> {
         let path = uri_to_path(uri)?;
-        if is_lb(&path) {
-            return None;
-        }
         let sema = self.sema(&path)?;
         Some(symbols::document_symbols(&sema))
     }
@@ -617,11 +425,6 @@ impl Server {
     /// "return input unchanged" guarantee, which must not become an error.
     fn formatting(&self, uri: &Uri) -> Option<Vec<TextEdit>> {
         let path = uri_to_path(uri)?;
-        if is_lb(&path) {
-            let text = self.lb_text(&path)?;
-            let formatted = luabox_syntax::shape::format(text);
-            return Some(fmt::full_document_edits(text, &formatted));
-        }
         let text = self.host.snapshot().file_text(&path)?;
         let formatted = luabox_syntax::lua::fmt::format(&text, self.dialect);
         Some(fmt::full_document_edits(&text, &formatted))
@@ -629,11 +432,7 @@ impl Server {
 
     fn semantic_tokens(&self, uri: &Uri) -> Option<SemanticTokensResult> {
         let path = uri_to_path(uri)?;
-        let data = if is_lb(&path) {
-            semantic_tokens::lb_tokens(self.lb_text(&path)?)
-        } else {
-            semantic_tokens::lua_tokens(&self.sema(&path)?)
-        };
+        let data = semantic_tokens::lua_tokens(&self.sema(&path)?);
         Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,
             data,
@@ -645,9 +444,6 @@ impl Server {
     /// returns (see [`crate::inlay_hints`]).
     fn inlay_hints(&self, uri: &Uri, range: lsp_types::Range) -> Option<Vec<InlayHint>> {
         let path = uri_to_path(uri)?;
-        if is_lb(&path) {
-            return None;
-        }
         let snapshot = self.host.snapshot();
         let sema = FileSema::new(&snapshot, &path)?;
         let inferred = snapshot.binding_types(&path)?;
@@ -664,20 +460,6 @@ impl Server {
 
     fn sema(&self, path: &Path) -> Option<FileSema> {
         FileSema::new(&self.host.snapshot(), path)
-    }
-
-    fn lb_text(&self, path: &Path) -> Option<&str> {
-        self.lb_overlay
-            .get(path)
-            .or_else(|| self.lb_disk.get(path))
-            .map(String::as_str)
-    }
-
-    /// [`Self::lb_text`], owned — the shape of `read_text` closures that
-    /// [`luab::resolve_scoped`] needs to read an arbitrary (possibly
-    /// different-file) `.luab` text.
-    fn lb_text_owned(&self, path: &Path) -> Option<String> {
-        self.lb_text(path).map(str::to_string)
     }
 
     // === Notifications ====================================================
@@ -712,34 +494,11 @@ impl Server {
         let Some(path) = uri_to_path(uri) else {
             return Ok(());
         };
-        if is_lb(&path) {
-            let diags = diagnostics::lb_diagnostics(&text);
-            self.lb_overlay.insert(path, text);
-            self.publish(uri, diags)?;
-            return self.refresh_shapes();
-        }
         self.host.apply_change(Change::SetOverlay {
             path: path.clone(),
             text,
         });
-        self.open_lua.insert(path.clone(), uri.clone());
         self.publish_lua(uri, &path)
-    }
-
-    /// A `.luab` module changed: drop the disk-backed parse cache and
-    /// republish every open `.lua` document, whose shape bindings may now
-    /// resolve differently.
-    fn refresh_shapes(&mut self) -> anyhow::Result<()> {
-        self.shape_store = ShapeStore::new(self.root.clone());
-        let open: Vec<(PathBuf, Uri)> = self
-            .open_lua
-            .iter()
-            .map(|(p, u)| (p.clone(), u.clone()))
-            .collect();
-        for (path, uri) in open {
-            self.publish_lua(&uri, &path)?;
-        }
-        Ok(())
     }
 
     /// didClose: drop the overlay, refreshing the disk layer first (the file
@@ -749,19 +508,6 @@ impl Server {
         let Some(path) = uri_to_path(uri) else {
             return Ok(());
         };
-        if is_lb(&path) {
-            self.lb_overlay.remove(&path);
-            if let Ok(text) = fs::read_to_string(&path) {
-                let diags = diagnostics::lb_diagnostics(&text);
-                self.lb_disk.insert(path, text);
-                self.publish(uri, diags)?;
-            } else {
-                self.lb_disk.remove(&path);
-                self.publish(uri, Vec::new())?;
-            }
-            return self.refresh_shapes();
-        }
-        self.open_lua.remove(&path);
         if let Ok(text) = fs::read_to_string(&path) {
             self.host.apply_change(Change::SetFileText {
                 path: path.clone(),
@@ -781,15 +527,12 @@ impl Server {
     /// snapshot.
     fn publish_lua(&mut self, uri: &Uri, path: &Path) -> anyhow::Result<()> {
         let analysis: Analysis = self.host.snapshot();
-        let shapes = diagnostics::ShapeCtx {
-            store: &self.shape_store,
-            shape_paths: &self.shape_paths,
-            dependencies: &self.dependencies,
+        let ctx = diagnostics::CheckCtx {
             strictness: self.strictness,
             ambient: &self.ambient,
         };
-        let diags = diagnostics::lua_diagnostics(&analysis, path, self.dialect, &shapes)
-            .unwrap_or_default();
+        let diags =
+            diagnostics::lua_diagnostics(&analysis, path, self.dialect, &ctx).unwrap_or_default();
         self.publish(uri, diags)
     }
 
@@ -806,22 +549,6 @@ impl Server {
                 params,
             )))?;
         Ok(())
-    }
-}
-
-fn is_lb(path: &Path) -> bool {
-    path.extension().and_then(|e| e.to_str()) == Some("luab")
-}
-
-/// A hover reply rendering `source` as a plain code block (no language tag —
-/// `.luab` is analyser-only, never a real Lua dialect) at `range`.
-fn code_hover(source: &str, range: lsp_types::Range) -> Hover {
-    Hover {
-        contents: lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
-            kind: lsp_types::MarkupKind::Markdown,
-            value: format!("```\n{}\n```", source.trim()),
-        }),
-        range: Some(range),
     }
 }
 

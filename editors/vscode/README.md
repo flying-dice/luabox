@@ -3,24 +3,19 @@
 First-class VS Code support for the [luabox](https://github.com/luabox/luabox)
 Lua toolchain. This extension is a thin wrapper around the `luabox lsp`
 language server: typecheck, lint, hover, goto-definition, completion, document
-symbols, formatting and semantic highlighting for both `.lua` sources and
-`.luab` shape files.
+symbols, formatting and semantic highlighting for `.lua` sources.
 
 ## What it provides
 
 - Launches `luabox lsp` (stdio) via `vscode-languageclient` and attaches it to
-  `lua` and `luabox-shape` (`.luab`) documents.
+  `lua` documents.
 - **Formatting** (`Format Document`, and `Format Selection` with
   whole-document MVP semantics) via the canonical luabox formatters — see
   [Formatting](#formatting) below.
 - **Semantic highlighting**: the server advertises semantic tokens with only
   standard token types/modifiers, and `vscode-languageclient` requests them
   automatically — no theme configuration needed. Locals vs globals,
-  parameters, LuaCATS `---@` annotation comments, and `.luab`
-  types/members/generics all render distinctly.
-- A `luabox-shape` language definition for `.luab` files with a TextMate grammar
-  (Rust-like `struct` / `trait` / `impl` / `fn` keywords + Lua-ish types) and a
-  comment/bracket language configuration.
+  parameters and LuaCATS `---@` annotation comments all render distinctly.
 - A `luabox.path` setting to point at a specific `luabox` binary.
 - A `luabox: Restart Language Server` command (`luabox.restartServer`).
 
@@ -38,22 +33,11 @@ symbols, formatting and semantic highlighting for both `.lua` sources and
 
 ## Formatting
 
-The server provides document (and range) formatting for both languages:
-`.lua` is formatted in the canonical luabox style for the project's edition
-(SPEC §10), `.luab` in the canonical shape style. The formatter never destroys
-code — a document with parse errors is simply left unchanged. Range
-formatting has MVP semantics: the whole document is formatted (the canonical
-formatter is whole-file by design).
-
-For `.luab` files this extension is the only formatter, but make it explicit —
-and opt into format-on-save — in your `settings.json`:
-
-```jsonc
-"[luabox-shape]": {
-  "editor.defaultFormatter": "luabox.luabox",
-  "editor.formatOnSave": true
-},
-```
+The server provides document (and range) formatting for `.lua`: it is
+formatted in the canonical luabox style for the project's edition (SPEC §10).
+The formatter never destroys code — a document with parse errors is simply
+left unchanged. Range formatting has MVP semantics: the whole document is
+formatted (the canonical formatter is whole-file by design).
 
 For `.lua` files other Lua extensions may also register formatters, so pick
 luabox explicitly if you want it:
@@ -85,7 +69,7 @@ npm run compile          # tsc -> ./out/extension.js
 ### Run in the Extension Development Host
 
 Open `editors/vscode` in VS Code and press <kbd>F5</kbd> (Run Extension). A new
-window opens with the extension loaded; open a `.lua` or `.luab` file to activate
+window opens with the extension loaded; open a `.lua` file to activate
 the server.
 
 ### Package a `.vsix`

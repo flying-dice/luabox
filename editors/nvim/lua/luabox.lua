@@ -1,16 +1,13 @@
 -- luabox — Neovim integration
 -- ============================================================================
--- Wires the `luabox lsp` language server into Neovim and teaches the editor
--- about `.luab` shape files (filetype + `//` comment string).
+-- Wires the `luabox lsp` language server into Neovim for `.lua` files.
 --
 -- Requires a `luabox` binary on your PATH (or set `opts.cmd` below). Build it
 -- from the repo root with `cargo build --release` (binary: target/release/luabox).
 --
 -- This file lives in a regular Neovim plugin layout (editors/nvim is the
--- plugin root: lua/, syntax/, ftdetect/, ftplugin/), so `editors/nvim` can be
--- put on the runtimepath directly — via a plugin manager or `:packadd`. The
--- syntax/ftdetect files give `.luab` buffers fallback highlighting even before
--- (or without) `setup()`; the LSP's semantic tokens layer on top.
+-- plugin root: lua/), so `editors/nvim` can be put on the runtimepath
+-- directly — via a plugin manager or `:packadd`.
 --
 -- Usage (Neovim 0.11+, no plugins needed):
 --
@@ -20,7 +17,7 @@
 --
 --     require("luabox").setup({
 --       cmd = { "/abs/path/to/luabox", "lsp" },
---       filetypes = { "lua", "luabox" },
+--       filetypes = { "lua" },
 --     })
 --
 -- lspconfig users: see the fallback snippet at the bottom of this file.
@@ -30,37 +27,16 @@ local M = {}
 
 --- @class luabox.Opts
 --- @field cmd?        string[]  Command to launch the server. Default {"luabox","lsp"}.
---- @field filetypes?  string[]  Filetypes to attach to. Default {"lua","luabox"}.
+--- @field filetypes?  string[]  Filetypes to attach to. Default {"lua"}.
 --- @field root_markers? string[] Project root markers. Default {"luabox.toml",".git"}.
 --- @field settings?   table     Server settings forwarded to the LSP.
-
---- Register `.luab` filetype detection and the shape comment string.
-local function register_filetype()
-  -- `.luab` files are the luabox shape DSL, not Lua. Give them their own filetype.
-  vim.filetype.add({
-    extension = {
-      luab = "luabox",
-    },
-  })
-
-  -- Shape files use `//` line comments and `/* */` blocks.
-  vim.api.nvim_create_autocmd("FileType", {
-    pattern = "luabox",
-    callback = function()
-      vim.bo.commentstring = "// %s"
-    end,
-    desc = "luabox shape comment string",
-  })
-end
 
 --- @param opts? luabox.Opts
 function M.setup(opts)
   opts = opts or {}
   local cmd = opts.cmd or { "luabox", "lsp" }
-  local filetypes = opts.filetypes or { "lua", "luabox" }
+  local filetypes = opts.filetypes or { "lua" }
   local root_markers = opts.root_markers or { "luabox.toml", ".git" }
-
-  register_filetype()
 
   -- Neovim 0.11+ native LSP API. `vim.lsp.config` defines the server under a
   -- name; `vim.lsp.enable` activates it for its filetypes.
@@ -88,13 +64,6 @@ return M
 -- ============================================================================
 -- Do NOT require this file for the snippet below — copy it into your config.
 --
---   -- `.luab` filetype + comment string
---   vim.filetype.add({ extension = { luab = "luabox" } })
---   vim.api.nvim_create_autocmd("FileType", {
---     pattern = "luabox",
---     callback = function() vim.bo.commentstring = "// %s" end,
---   })
---
 --   -- Register a custom server with lspconfig
 --   local lspconfig = require("lspconfig")
 --   local configs = require("lspconfig.configs")
@@ -102,7 +71,7 @@ return M
 --     configs.luabox = {
 --       default_config = {
 --         cmd = { "luabox", "lsp" },
---         filetypes = { "lua", "luabox" },
+--         filetypes = { "lua" },
 --         root_dir = lspconfig.util.root_pattern("luabox.toml", ".git"),
 --         settings = {},
 --       },

@@ -31,8 +31,8 @@ pub(crate) struct Declared {
 /// lowered shape of its own `---@field`s, with each `T` kept as a
 /// `Ty::Named(T)` placeholder. A reference `Name<number>` instantiates this
 /// by substituting the type arguments (`#84`, design (a): the reference
-/// lowers directly to the substituted `Ty::Table`, mirroring `.luab`
-/// templates — `Ty::Named` stays a bare string).
+/// lowers directly to the substituted `Ty::Table` — `Ty::Named` stays a bare
+/// string).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GenericClass {
     pub params: Vec<String>,
@@ -41,14 +41,8 @@ pub(crate) struct GenericClass {
 
 /// Lowers [`TypeExpr`]s against a set of declared names, recording every
 /// reference to an undeclared type (surfaced as LB0305).
-///
-/// `.luab` types resolve through the ambient package scope (SHAPES-V2.md):
-/// any standard annotation position may name any fully-qualified shape type
-/// — there are no imports and no shape-specific tags.
 pub(crate) struct Lowerer<'a> {
     decl: &'a Declared,
-    /// The ambient `.luab` package scope, when the project has one.
-    pub shape_scope: Option<&'a crate::shape::ShapeScope>,
     /// Generic parameter names currently in scope (`---@generic T` and a
     /// generic class's own `<T>` params). These lower to `Ty::Named(name)`
     /// placeholders that substitution later replaces — never LB0305.
@@ -60,22 +54,16 @@ pub(crate) struct Lowerer<'a> {
     stack: Vec<String>,
     /// `(name, span)` of every reference to an undeclared type name.
     pub unknown_names: Vec<(String, Span)>,
-    /// `(message, span)` of every bad `.luab` generic instantiation reached
-    /// from a LuaCATS annotation site (wrong arity, or type arguments given
-    /// to a non-generic shape type) — surfaced as `LB2007`.
-    pub shape_ref_errors: Vec<(String, Span)>,
 }
 
 impl<'a> Lowerer<'a> {
     pub fn new(decl: &'a Declared) -> Self {
         Lowerer {
             decl,
-            shape_scope: None,
             generics: HashSet::new(),
             generic_classes: BTreeMap::new(),
             stack: Vec::new(),
             unknown_names: Vec::new(),
-            shape_ref_errors: Vec::new(),
         }
     }
 
@@ -159,36 +147,6 @@ impl<'a> Lowerer<'a> {
                 return subst_ty(&Ty::Table(Box::new(gc.template.clone())), &map);
             }
             return Ty::Named(name.to_string());
-        }
-        if let Some(scope) = self.shape_scope
-            && let Some(shape) = scope.get(name)
-        {
-            if shape.params.is_empty() {
-                if !args.is_empty() {
-                    self.shape_ref_errors.push((
-                        format!("`{name}` is not generic but was given type arguments"),
-                        span,
-                    ));
-                }
-                return match &shape.ty {
-                    // Concrete object types stay nominal (resolved
-                    // structurally via the environment); alias-like RHS
-                    // expands inline.
-                    Ty::Table(_) => Ty::Named(name.to_string()),
-                    other => other.clone(),
-                };
-            }
-            // Monomorphise a template use site. `instantiate` itself reports
-            // a wrong non-zero arity via the `diags` sink — recovered here as
-            // a `(message, span)` pair anchored to this annotation site
-            // rather than the throwaway file/range `instantiate` was given.
-            let args: Vec<Ty> = args.iter().map(|a| self.lower(a)).collect();
-            let mut diags = Vec::new();
-            let result = scope.instantiate(name, &args, "", 0..0, &mut diags);
-            if let Some(diag) = diags.into_iter().next() {
-                self.shape_ref_errors.push((diag.message, span));
-            }
-            return result.unwrap_or(Ty::Unknown);
         }
         self.unknown_names.push((name.to_string(), span));
         Ty::Unknown

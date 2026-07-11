@@ -1,14 +1,12 @@
 //! `luabox doc [--open]` — a static documentation site from LuaCATS
-//! annotations and `.luab` shape declarations (SPEC.md §13).
+//! annotations (SPEC.md §13).
 //!
 //! Pipeline:
 //!
 //! 1. **Discover** the project (nearest `luabox.toml`, like `luabox check`)
-//!    and walk its `.lua` and `.luab` files, plus any `.luab` modules under the
-//!    manifest's `[types] shape-paths`.
+//!    and walk its `.lua` files.
 //! 2. **Harvest** the model (`doc_cmd::model`): per-file modules with
-//!    functions/classes/aliases/enums from the LuaCATS harvest, per-file
-//!    shape modules with their `type` declarations and `///` docs.
+//!    functions/classes/aliases/enums from the LuaCATS harvest.
 //! 3. **Render** (`doc_cmd::render`) a zero-install static site into
 //!    `<root>/doc/` (a sibling of the `[build] out` directory): one page
 //!    per module and per class/type, an index with a client-side search
@@ -27,7 +25,7 @@ mod render;
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Context;
 use luabox_resolve::manifest::Manifest;
@@ -38,15 +36,8 @@ use model::DocModel;
 /// Execute `luabox doc` from `cwd`.
 pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
     let project = check_cmd::discover(cwd)?;
-    let (lua_files, lb_files) = check_cmd::collect_files(&project)?;
-    let (package, shape_paths) = manifest_facts(&project.root);
-
-    // `.luab` modules: project files plus the manifest's shape-paths tiers,
-    // deduplicated (a shape path inside the project root is walked twice).
-    let mut lb_set: BTreeSet<PathBuf> = lb_files.into_iter().collect();
-    for dir in &shape_paths {
-        collect_lb(dir, &mut lb_set);
-    }
+    let lua_files = check_cmd::collect_files(&project)?;
+    let package = manifest_facts(&project.root);
 
     let mut modules = Vec::new();
     for path in &lua_files {
@@ -57,22 +48,7 @@ pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
     }
     harvest_def_modules(&project, &mut modules);
 
-    let mut shape_modules = Vec::new();
-    for path in &lb_set {
-        let rel = check_cmd::display_rel(path, &project.root);
-        let source = fs::read_to_string(path).with_context(|| format!("cannot read `{rel}`"))?;
-        // A module's namespace derives from its path under the shape-path
-        // that contains it (SHAPES-V2.md); files outside every shape-path
-        // fall back to the file stem.
-        let name = shape_namespace(path, &shape_paths);
-        shape_modules.push(model::shape_module(&name, &source));
-    }
-
-    let model = DocModel {
-        package,
-        modules,
-        shape_modules,
-    };
+    let model = DocModel { package, modules };
 
     let out_dir = project.root.join("doc");
     fs::create_dir_all(&out_dir)
@@ -149,9 +125,9 @@ fn def_module_name(file: &str) -> String {
     stem.strip_suffix(".d.lua").unwrap_or(stem).to_string()
 }
 
-/// The package name and absolute shape-path directories from the manifest
-/// (defaults when the project is manifest-less).
-fn manifest_facts(root: &Path) -> (String, Vec<PathBuf>) {
+/// The package name from the manifest (a default when the project is
+/// manifest-less).
+fn manifest_facts(root: &Path) -> String {
     let fallback = || {
         root.file_name().map_or_else(
             || "package".to_string(),
@@ -159,53 +135,12 @@ fn manifest_facts(root: &Path) -> (String, Vec<PathBuf>) {
         )
     };
     let Ok(text) = fs::read_to_string(root.join("luabox.toml")) else {
-        return (fallback(), Vec::new());
+        return fallback();
     };
     let Ok(manifest) = Manifest::parse(&text) else {
-        return (fallback(), Vec::new());
+        return fallback();
     };
-    let shape_paths = manifest
-        .types
-        .shape_paths
-        .iter()
-        .map(|p| root.join(p))
-        .collect();
-    (manifest.package.name, shape_paths)
-}
-
-/// A shape module's dotted namespace: its path relative to the shape-path
-/// directory that contains it, dots for separators, `.luab` stripped
-/// (`shapes/love/graphics.luab` → `love.graphics`).
-fn shape_namespace(path: &Path, shape_paths: &[PathBuf]) -> String {
-    let rel = shape_paths
-        .iter()
-        .find_map(|dir| path.strip_prefix(dir).ok())
-        .unwrap_or_else(|| Path::new(path.file_name().unwrap_or_default()));
-    let mut parts: Vec<String> = rel
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
-    if let Some(last) = parts.last_mut()
-        && let Some(stem) = last.strip_suffix(".luab")
-    {
-        *last = stem.to_string();
-    }
-    parts.join(".")
-}
-
-/// Collect every `.luab` file under `dir`, recursively, into `out`.
-fn collect_lb(dir: &Path, out: &mut BTreeSet<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_lb(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("luab") {
-            out.insert(path);
-        }
-    }
+    manifest.package.name
 }
 
 /// Open `index` in the platform's default browser. Best-effort: a failure

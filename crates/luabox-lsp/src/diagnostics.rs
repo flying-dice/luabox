@@ -1,31 +1,22 @@
 //! Per-file diagnostics for publishing: parse errors, dialect legality, and
-//! type diagnostics for `.lua`; shape parse errors for `.luab`.
+//! type diagnostics for `.lua` files.
 //!
 //! Mirrors `luabox check`'s three passes over one memoized parse, converted
 //! to LSP ranges through the file's [`LineIndex`].
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
 use luabox_db::Analysis;
 use luabox_syntax::lua::{Dialect, validate};
-use luabox_syntax::shape;
-use luabox_types::{
-    Ambient, DepShapeExport, ShapeOptions, ShapeStore, Strictness, check_file_shaped,
-};
+use luabox_types::{Ambient, Strictness, check_file_with_ambient};
 
 use crate::line_index::LineIndex;
 
-/// The project's shape-resolution context, mirroring what `luabox check`
-/// passes to [`check_file_shaped`] (SHAPES.md §6): the shared parse-cache
-/// store plus the manifest's `[types] shape-paths` and shape-exporting
-/// dependencies, and the ambient definition-package layer (stdlib + project
-/// defs + dependency defs, #108). Owned by the server; rebuilt when a `.luab`
-/// file changes.
-pub struct ShapeCtx<'a> {
-    pub store: &'a ShapeStore,
-    pub shape_paths: &'a [PathBuf],
-    pub dependencies: &'a [DepShapeExport],
+/// The project's type-checking context: the strictness and the ambient
+/// definition-package layer (stdlib + project defs + dependency defs, #108).
+/// Owned by the server.
+pub struct CheckCtx<'a> {
     pub strictness: Strictness,
     /// The ambient layer to check against — the editor's counterpart of the
     /// CLI's `combined_defs_checked` ambient, so a dependency's classes resolve
@@ -40,7 +31,7 @@ pub fn lua_diagnostics(
     analysis: &Analysis,
     path: &Path,
     dialect: Dialect,
-    shapes: &ShapeCtx<'_>,
+    ctx: &CheckCtx<'_>,
 ) -> Option<Vec<Diagnostic>> {
     let text = analysis.file_text(path)?;
     let index = LineIndex::new(text);
@@ -69,24 +60,12 @@ pub fn lua_diagnostics(
         ));
     }
 
-    // 3. Types with the ambient `.luab` package scope — the same shaped
-    // pass as `luabox check` (SHAPES-V2.md), so fully-qualified shape types
-    // resolve identically in the editor and in CI. The span file name is
-    // dropped on conversion (LSP diagnostics are already per-document), so
-    // the lossy path is fine.
+    // 3. Types against the ambient definition-package layer — the same pass
+    // as `luabox check`, so classes resolve identically in the editor and in
+    // CI. The span file name is dropped on conversion (LSP diagnostics are
+    // already per-document), so the lossy path is fine.
     let rel = path.to_string_lossy();
-    let opts = ShapeOptions {
-        store: shapes.store,
-        shape_paths: shapes.shape_paths,
-        dependencies: shapes.dependencies,
-    };
-    for diag in check_file_shaped(
-        parsed.parse(),
-        &rel,
-        shapes.strictness,
-        Some(&opts),
-        Some(shapes.ambient),
-    ) {
+    for diag in check_file_with_ambient(parsed.parse(), &rel, ctx.strictness, Some(ctx.ambient)) {
         let range = diag
             .primary_label()
             .map_or(0..0, |label| label.span.range.clone());
@@ -111,26 +90,6 @@ pub fn lua_diagnostics(
     }
 
     Some(out)
-}
-
-/// Diagnostics for one `.luab` shape file: its parse errors (including the
-/// `LB2010` body rejection), straight from `shape::parse` over `text`.
-#[must_use]
-pub fn lb_diagnostics(text: &str) -> Vec<Diagnostic> {
-    let index = LineIndex::new(text);
-    shape::parse(text)
-        .errors()
-        .iter()
-        .map(|err| {
-            diagnostic(
-                &index,
-                usize::from(err.range.start())..usize::from(err.range.end()),
-                DiagnosticSeverity::ERROR,
-                err.code.unwrap_or("LB0001"),
-                err.message.clone(),
-            )
-        })
-        .collect()
 }
 
 fn diagnostic(

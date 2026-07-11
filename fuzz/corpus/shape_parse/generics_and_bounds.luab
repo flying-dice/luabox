@@ -1,6 +1,0 @@
-struct Kv<K: Hash + Eq, V> { m: HashMap<K, V> }
-trait Drawable: Shape + Sized { fn draw(self, s: Surface); }
-trait Multi { fn split(self) -> A, B; }
-impl Shape + Drawable for Circle;
-struct Bag { n: number, .. }
-struct Empty {}

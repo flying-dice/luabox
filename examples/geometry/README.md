@@ -4,15 +4,12 @@ The LuaCATS/`.d.lua` flagship. A library (`edition = "5.4"`) whose types live
 in an ambient **definition package** — a `---@meta` file resolved by
 `[types] defs` — while the implementations are ordinary Lua, annotated with
 stock LuaLS tags (`---@class` / `---@field` / `---@param` / `---@return` /
-`---@alias` / `---@enum`). No imports, no shape DSL.
+`---@alias` / `---@enum`). No imports.
 
-> This example previously used `.luab` shape modules (TypeScript-adjacent
-> `type` declarations with sealed, structural conformance checking). The
-> `.luab` subsystem hasn't gone anywhere — it still lives elsewhere in the
-> codebase, ahead of a planned wider drop. This conversion exists to show,
-> honestly, what the plain-LuaCATS path looks like **today**: what works,
-> what luabox now enforces *more strictly* than lua-language-server, and what
-> is still out of reach. Read to the end — some of this will surprise you.
+> This example documents, honestly, what LuaCATS gives you **today**: what
+> works, what luabox enforces *more strictly* than lua-language-server, and
+> what is still out of reach. Read to the end — some of this will surprise
+> you.
 
 ```
 geometry/
@@ -80,8 +77,8 @@ luabox test          # 9 passing tests
   it is flagged the same way (`member \`area\` has the wrong type`). The check
   is `__index`-aware: a subclass that inherits a concrete base method through
   its metatable chain is **not** told to re-implement it, so classic
-  inheritance stays clean. This is exactly the structural conformance the
-  `.luab` shape modules used to be needed for — now on the plain-LuaCATS path.
+  inheritance stays clean. This is real structural conformance: an interface
+  carrier that lies about implementing the interface is caught at `check` time.
 - **Field reads ARE checked** (#90 — luals `undefined-field`, ridden one
   notch stricter). Reading a field a declared class does not provide —
   `self.nope` inside a `geometry.Circle` method, or `p.nope` on a `---@type
@@ -106,9 +103,8 @@ luabox test          # 9 passing tests
   dynamic access opts out with `---@diagnostic disable: undefined-field`.
 - **Literal sealing.** `---@type geometry.Point` on a table literal enforces
   every non-optional field present and rejects unknown keys — `LB0300`
-  ("missing `y`") / `LB0303` ("unknown field `z`"). This is **not** a
-  `.luab`-only feature: a plain LuaCATS `---@class` under `[types] strict =
-  true` gets the identical treatment. (LuaLS treats this as a soft
+  ("missing `y`") / `LB0303` ("unknown field `z`") — for any LuaCATS
+  `---@class` under `[types] strict = true`. (LuaLS treats this as a soft
   `missing-fields` warning in most editors; here it's a real `check` error.)
   See the commented block in `src/shapes_data.lua`.
 - **`---@alias` and `---@enum`.** Both are fully enforced. `geometry.Unit =

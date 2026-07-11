@@ -37,7 +37,7 @@ pub struct DefFile {
 
 /// A parsed, lowered definition-package layer: the ambient environment plus
 /// the `---@alias`es it declares (so a consuming file's lowerer can expand
-/// them). Passed by reference to [`crate::check_file_shaped`].
+/// them). Passed by reference to [`crate::check_file_with_ambient`].
 #[derive(Debug)]
 pub struct Ambient {
     pub(crate) env: TypeEnv,
@@ -439,7 +439,7 @@ mod tests {
         let ambient = stdlib(dialect);
         let parse = lua::parse(src, dialect);
         assert_eq!(parse.errors(), &[], "fixture must parse cleanly");
-        crate::check_file_shaped(&parse, "test.lua", strictness, None, Some(ambient))
+        crate::check_file_with_ambient(&parse, "test.lua", strictness, Some(ambient))
             .iter()
             .map(|d| d.code.to_string())
             .collect()
@@ -601,11 +601,10 @@ f(math.pi)
         );
         // Deterministic winner: the first (project-local) `Widget` — field `a`.
         let parse = lua::parse("---@type Widget\nlocal w = { a = 1 }\n", Dialect::Lua54);
-        let clean = crate::check_file_shaped(
+        let clean = crate::check_file_with_ambient(
             &parse,
             "t.lua",
             crate::Strictness::Strict,
-            None,
             Some(&ambient),
         );
         assert!(
@@ -613,11 +612,10 @@ f(math.pi)
             "project decl (field `a`) must win: {clean:?}"
         );
         let parse = lua::parse("---@type Widget\nlocal w = { b = 1 }\n", Dialect::Lua54);
-        let loser = crate::check_file_shaped(
+        let loser = crate::check_file_with_ambient(
             &parse,
             "t.lua",
             crate::Strictness::Strict,
-            None,
             Some(&ambient),
         );
         assert!(
@@ -651,11 +649,10 @@ f(math.pi)
         ];
         let ambient = combined(Dialect::Lua54, &extra);
         let parse = lua::parse("love_setup(1)\nprint(\"still stdlib\")\n", Dialect::Lua54);
-        let diags = crate::check_file_shaped(
+        let diags = crate::check_file_with_ambient(
             &parse,
             "test.lua",
             crate::Strictness::Strict,
-            None,
             Some(&ambient),
         );
         let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();

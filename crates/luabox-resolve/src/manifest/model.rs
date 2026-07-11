@@ -49,7 +49,7 @@ pub struct Build {
     pub mode: String,
 }
 
-/// `[types]` (SPEC.md §5, SHAPES-V2.md).
+/// `[types]` (SPEC.md §5).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Types {
@@ -57,15 +57,6 @@ pub struct Types {
     /// Ambient definition packages (`*.d.lua` / `---@meta` modules).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub defs: Vec<String>,
-    /// `.luab` shape directories — every module under these is ambient to
-    /// the package, namespaced by its path (SHAPES-V2.md).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub shape_paths: Vec<String>,
-    /// The type entrypoint (TS-style, like package.json `"types"`): the
-    /// `.luab` file whose `export type` declarations form this package's
-    /// published surface for dependents. `None` exports nothing.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub entry: Option<String>,
 }
 
 /// One `[dependencies]` / `[dev-dependencies]` entry.

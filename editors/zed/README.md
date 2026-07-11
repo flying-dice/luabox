@@ -1,12 +1,8 @@
 # luabox for Zed
 
-A [Zed](https://zed.dev) extension that adds:
-
-- the **luabox language server** (`luabox lsp`) for both Lua and `.luab` shape
-  files — typecheck, hover, goto-definition, completion, document symbols,
-  formatting and semantic highlighting; and
-- a **`LuaBox Shape` language** for `.luab` files, with a tree-sitter grammar
-  and syntax highlighting.
+A [Zed](https://zed.dev) extension that adds the **luabox language server**
+(`luabox lsp`) for Lua files — typecheck, hover, goto-definition, completion,
+document symbols, formatting and semantic highlighting.
 
 ## Requirements
 
@@ -68,15 +64,6 @@ runs `luabox lsp`.
 2. In Zed: **Extensions ▸ Install Dev Extension**, and select this
    `editors/zed` directory.
 
-> **Grammar note.** Zed fetches tree-sitter grammars from a **git repository at
-> a fixed rev** — a repo + rev is mandatory; there is no "build from a plain
-> local folder" mode. The `.luab` grammar lives in this monorepo under
-> [`tree-sitter-luab/`](../../tree-sitter-luab), referenced from
-> `extension.toml` via `repository` + `path = "tree-sitter-luab"` + `rev`.
-> **The `rev` must be a real pushed commit SHA** — update it after every
-> grammar change. For local dev, point `repository` at a `file://` URL of your
-> local checkout (still at a committed rev).
-
 ## Publishing to the Zed extension registry
 
 Extensions are published by PR to
@@ -99,9 +86,8 @@ Extensions are published by PR to
    it. Update later with `git submodule update --remote` + a version bump PR.
 
 Because this repo is self-hosted on a tailnet, publishing to the public
-registry additionally requires mirroring both this extension **and** the
-`tree-sitter-luab` grammar to public git hosts and updating the `repository`
-URLs in `extension.toml`.
+registry additionally requires mirroring this extension to a public git host
+and updating the `repository` URL in `extension.toml`.
 
 ## References
 

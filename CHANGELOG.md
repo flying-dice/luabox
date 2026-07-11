@@ -22,11 +22,11 @@ still open before this tag is actually cut.
 One static binary, one crate per bounded context (SPEC.md §16):
 
 - `init` / `new` — scaffold a project (`--lib`/`--bin`, `--edition`).
-- `check` — typecheck: LuaCATS annotations + `.luab` shapes, rich table/OOP
+- `check` — typecheck: LuaCATS annotations, rich table/OOP
   inference, dialect legality against `--target`, `--watch`,
   `--format json|sarif|github|gitlab`.
 - `lint` — 8 type-informed rules, `---@luabox-ignore`, `--fix`.
-- `fmt` — canonical formatter for `.lua` + `.luab`, `--check`/`--watch`.
+- `fmt` — canonical formatter for `.lua`, `--check`/`--watch`.
 - `build` — lower `edition → target` (goto, bitops, `<close>`/`<const>`,
   `_ENV`, integer/float semantics) with tree-shaken polyfills.
 - `bundle` — single-file bundle, `--minify`, `--sourcemap` + `unmap`,
@@ -44,29 +44,24 @@ One static binary, one crate per bounded context (SPEC.md §16):
 - `publish` / `audit` — registry publish with yank; advisory-DB audit.
 - `toolchain` — install/pin/list managed Lua runtimes.
 - `lsp` — language server: diagnostics, hover, goto, completion, symbols.
-- `doc` — static docs generated from annotations + shapes.
+- `doc` — static docs generated from annotations.
 - `explain LBnnnn` — rustc-style diagnostic pages.
 
 ### Type checking
 
 Types come from full LuaCATS annotation support (`---@class`, `---@field`,
 `---@param`, `---@return`, `---@generic`, `---@alias`, `---@enum`,
-`---@meta` definition packages) plus `.luab` shape modules — an
-analyser-only, TypeScript-adjacent `type` layer over untyped Lua — sharing
-one type IR. Rich table inference is unconditional: tables never degrade to
-a bare `table` type, shapes are inferred from constructors and subsequent
-assignments, and idiomatic `setmetatable`/`__index` OOP resolves without
-annotations.
+`---@meta` definition packages) — the one and only type format. Rich table
+inference is unconditional: tables never degrade to a bare `table` type,
+per-field shapes are inferred from constructors and subsequent assignments,
+and idiomatic `setmetatable`/`__index` OOP resolves without annotations.
 
-The accepted forward direction (see [DIRECTION.md](DIRECTION.md), decided
-2026-07-11) is **LuaCATS-native strict checking**: LuaCATS becomes the one
-type format, luabox verifies it more strictly than lua-language-server
-(real generics, cross-package type sharing, `---@class` conformance,
-undefined-global detection), and the `.luab` shape DSL is parked/dropped
-once that front-end reaches feature parity. That migration is in progress,
-not finished — see the parity/strictness items tracked in BACKLOG.md
-(#84, #90, #103, #107, #108) and the `.luab` removal that follows
-(#109). This release still ships both front-ends.
+The direction (see [DIRECTION.md](DIRECTION.md), decided 2026-07-11) is
+**LuaCATS-native strict checking**: luabox verifies what lua-language-server
+declares but trusts — real generics, cross-package type sharing, `---@class`
+conformance, undefined-global detection. Those parity/strictness items are
+still landing before this tag is cut — see BACKLOG.md
+(#84, #90, #103, #107, #108).
 
 ### Dialects & lowering
 
@@ -88,8 +83,7 @@ with `check`/`lint`/`fmt`. Four editor integrations wrap it:
   fallback.
 - JetBrains (`editors/jetbrains/`) — Gradle/Kotlin plugin on the native LSP
   API (2024.2+), LSP4IJ documented for Community editions.
-- Zed (`editors/zed/`) — Rust/WASM extension with its own tree-sitter
-  grammar for `.luab`.
+- Zed (`editors/zed/`) — Rust/WASM extension.
 
 ### Release machinery
 

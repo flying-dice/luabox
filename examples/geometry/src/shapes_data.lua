@@ -6,11 +6,10 @@
 -- literal against the declared class: every non-optional field must be
 -- present, and no unknown keys are allowed.
 --
--- This "sealing" behaviour is NOT a `.luab`-only feature: a plain LuaCATS
--- `---@class` under `[types] strict = true` gets the same literal checks
--- (verified against the real binary — see the mission report). The
--- `LuaLS`-style `missing-fields`/excess-field lints most editors treat as
--- soft warnings are here real `luabox check` errors.
+-- Under `[types] strict = true` these literal checks are enforced (verified
+-- against the real binary — see the mission report). The `LuaLS`-style
+-- `missing-fields`/excess-field lints most editors treat as soft warnings
+-- are here real `luabox check` errors.
 ---@type geometry.Point
 local origin = { x = 0, y = 0 }
 

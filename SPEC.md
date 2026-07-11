@@ -3,23 +3,22 @@
 **Name:** `luabox`. CLI binary: `luabox`, alias `lb`.
 **One-line:** cargo + rustup + rust-analyzer + bun, for Lua. Not a runtime. Ever.
 
-The `.luab` shape DSL is specified in [SHAPES.md](SHAPES.md). Until the cucumber feature files
-exist for a behaviour, this text is the sole source of truth; from then on the feature files
-govern.
+Until the cucumber feature files exist for a behaviour, this text is the sole source of truth;
+from then on the feature files govern.
 
 ## 1. Vision
 
 - One static binary. Zero-install-friction (curl | sh, brew, scoop, mise). Written in Rust.
 - Bun's ethos: one tool, instant startup, batteries included, obscene speed.
 - Rust's ethos: correctness-first, one blessed workflow, first-class diagnostics, stability guarantees.
-- Type system: `.luab` shape modules (TypeScript-adjacent `type` declarations, [SHAPES-V2.md](SHAPES-V2.md)) layered over untyped Lua, with full LuaCATS (LuaLS/sumneko) annotation compatibility — both front-ends, one IR.
+- Type system: full LuaCATS (LuaLS/sumneko) annotations layered over untyped Lua — one type IR, checked more strictly than lua-language-server.
 - Runtimes are pluggable externals (`lua5.1`, `lua5.4`, `luajit`, love2d, OpenResty, Neovim). Luabox compiles/checks/bundles *for* them, never *is* them.
 
 ### Non-goals
 
 - No interpreter/VM. No REPL beyond delegating to a configured runtime.
-- Full LuaCATS (`---@class` etc.) support is non-negotiable — existing annotated codebases check day one. The `.luab` shape modules are an additional analyser-only front-end into the same type IR, never a replacement.
-- **Luau: explicitly out of scope.** Alternative typed paradigm with its own owner and toolchain (Roblox, luau-lsp). Luabox's typed story is `.luab` shape modules over untyped Lua. Scope decision, not an oversight.
+- Full LuaCATS (`---@class` etc.) support is non-negotiable — existing annotated codebases check day one.
+- **Luau: explicitly out of scope.** Alternative typed paradigm with its own owner and toolchain (Roblox, luau-lsp). Luabox's typed story is LuaCATS annotations over untyped Lua. Scope decision, not an oversight.
 - No LuaRocks replacement-by-fiat — interop first, supersede by being better.
 
 ## 2. Supported dialects & targets
@@ -56,15 +55,14 @@ Luau: out of scope (§1). No parse, no check, no lowering.
 - **Source of truth:** LuaLS annotations (`---@class`, `---@field`, `---@param`, `---@return`, `---@generic`, `---@alias`, `---@overload`, `---@type`, `---@cast`, `---@enum`, `---@meta`). Full dialect compatibility.
 - **Definition packages:** `@types/*`-style. `*.d.lua` files (`---@meta` modules) distributed via registry. Runtime API defs shipped for: 5.1–5.4 stdlib, LuaJIT ext, LÖVE, Neovim, OpenResty.
 - Strictness ladder (per-package, per-file override): `none` → `warn` → `strict` (untyped = `unknown`, not `any`).
-- Inference: bidirectional, flow-sensitive narrowing (`if type(x) == "string"`), literal types, generics with constraints. Match/exceed LuaLS on annotated Lua; `.luab` shape modules add the rigor LuaLS lacks.
+- Inference: bidirectional, flow-sensitive narrowing (`if type(x) == "string"`), literal types, generics with constraints. Match/exceed LuaLS on annotated Lua, adding the rigor LuaLS lacks.
 - **Rich table inference — hard requirement.** Tables never degrade to a bare `table` type. The IR models table *shapes* structurally, and inference maintains them without annotations:
   - Per-field shapes from table constructors and subsequent assignments (`t.x = 1` extends/refines the shape; sealed vs unsealed per strictness level).
   - Array part vs hash part vs mixed distinguished; element types for `t[i]`, and `pairs`/`ipairs`/`next` iteration typed from the shape.
   - Metatable semantics: `setmetatable`/`__index` chains (table and function forms) resolve field lookup, so idiomatic OOP (`Class.__index = Class`, `:` methods, inheritance chains) types correctly without annotations.
   - Literal-keyed indexing narrows (`t["x"]` ≡ `t.x`); dynamic keys fall back to indexer types, not `any`.
-  - Inferred shapes unify with declared `---@class`/`---@field` and `.luab` object types: missing/excess-field diagnostics per strictness level, width subtyping for function arguments.
+  - Inferred shapes unify with declared `---@class`/`---@field`: missing/excess-field diagnostics per strictness level, width subtyping for function arguments.
 - `luabox check` = standalone typecheck, CI-grade, machine-readable output (JSON, SARIF, GitHub/GitLab annotations).
-- Shapes: see [SHAPES-V2.md](SHAPES-V2.md). Analyser-only, sealed semantics, positional structural conformance, coexists with LuaCATS in one IR.
 
 ## 4. CLI surface
 
@@ -110,7 +108,6 @@ out = "dist"
 [types]
 strict = true
 defs = ["love2d"]           # ambient definition packages
-shape-paths = ["shapes/"]   # ambient .luab dirs (SHAPES-V2.md)
 
 [dependencies]
 penlight = "1.14"
@@ -185,12 +182,12 @@ members = ["packages/*"]
 
 ## 13. Docs
 
-- `luabox doc`: static site from annotations + shape declarations; search, cross-linked types, doc examples run under `luabox test --doc`. Registry auto-hosts per version (docs.rs analog).
+- `luabox doc`: static site from annotations; search, cross-linked types, doc examples run under `luabox test --doc`. Registry auto-hosts per version (docs.rs analog).
 
 ## 14. Diagnostics culture
 
 - Every error coded (`LB0421`), `luabox explain` page, span-rich rendering with labels/suggestions. Machine formats: JSON, SARIF, GitHub Actions, GitLab Code Quality.
-- Diagnostic block `LB2xxx` reserved for `.luab` file diagnostics (SHAPES-V2.md); positional conformance reports through the ordinary `LB03xx` codes.
+- Conformance diagnostics report through the ordinary `LB03xx` codes.
 
 ## 15. Stability & governance
 
@@ -204,9 +201,9 @@ Cargo workspace, one crate per bounded context. Boundary-only communication (pub
 
 ```
 crates/
-  luabox-syntax      lossless parser: Lua dialects (feature-flagged) + .luab shape grammar
+  luabox-syntax      lossless parser: Lua dialects (feature-flagged)
   luabox-hir         desugared IR, name resolution
-  luabox-types       unified type IR (LuaCATS ⊕ shapes), inference engine
+  luabox-types       LuaCATS type IR, inference engine
   luabox-db          salsa incremental database (shared: check/lint/lsp/fmt)
   luabox-lower       target lowering + polyfill injection (the tsc bit)
   luabox-bundle      require-graph, tree-shake, minify, sourcemaps
@@ -219,9 +216,9 @@ crates/
 
 | Context | Crates | Owns | Boundary contract |
 |---|---|---|---|
-| Syntax | `luabox-syntax` | grammars (Lua + shape), lossless trees, dialect gating | tree types + parse API |
+| Syntax | `luabox-syntax` | Lua grammar, lossless trees, dialect gating | tree types + parse API |
 | Semantics | `luabox-hir`, `luabox-types`, `luabox-db` | name resolution, type IR, inference, incremental queries | salsa DB traits |
-| Emit | `luabox-lower`, `luabox-bundle` | lowering, polyfills, require-graph, sourcemaps | checked HIR in, bytes out; shape-blind |
+| Emit | `luabox-lower`, `luabox-bundle` | lowering, polyfills, require-graph, sourcemaps | checked HIR in, bytes out; type-blind |
 | Distribution | `luabox-resolve`, `luabox-store` | manifests, solver, lockfile, CAS, luarocks bridge | package graph API; never parses syntax |
 | Execution | `luabox-test`, toolchain mgr | runtime acquisition, matrix, coverage | runtime handle; only context spawning runtimes |
 | Frontend | `luabox-cli`, `luabox-lsp` | UX, protocol, diagnostics rendering | consumes all, owns none |
@@ -252,7 +249,7 @@ crates/
 | selene / luacheck | lint | type-aware rules, autofix |
 | StyLua | fmt | same tree as analysis, style-compatible |
 | darklua | dialect transforms (Luau-centric) | full 5.x matrix, semantics-preservation guarantees |
-| Luau / luau-lsp | typed Lua paradigm | deliberately not competed with — luabox types untyped Lua via `.luab` |
+| Luau / luau-lsp | typed Lua paradigm | deliberately not competed with — luabox types untyped Lua via LuaCATS |
 | busted | test | zero-config, runtime matrix, own-emit coverage |
 | aftman / rokit / hererocks | toolchains | integrated, manifest-pinned |
 | tsc | target lowering | the model, applied to the Lua dialect lattice |
@@ -261,16 +258,16 @@ crates/
 
 ## 18. Phasing
 
-1. **P0 — Core:** Lua parser (all dialects) + `.luab` grammar module, `luabox.toml`, `init/fmt/check` (LuaCATS subset), CLI skeleton. Formatter ships first.
-2. **P1 — Types & LSP:** full inference, salsa DB, shape checking (sealed + coherence), cross-front-end interop, LSP completion/hover/diagnostics/goto.
-3. **P2 — Packages:** resolver, store, lockfile, luarocks bridge, `add/install/publish`, registry MVP, `.luab` in package artifacts.
+1. **P0 — Core:** Lua parser (all dialects), `luabox.toml`, `init/fmt/check` (LuaCATS subset), CLI skeleton. Formatter ships first.
+2. **P1 — Types & LSP:** full inference, salsa DB, conformance checking, LSP completion/hover/diagnostics/goto.
+3. **P2 — Packages:** resolver, store, lockfile, luarocks bridge, `add/install/publish`, registry MVP.
 4. **P3 — Build:** lowering matrix, bundler, sourcemaps.
-5. **P4 — Runner-adjacent:** test matrix, bench, toolchain manager, coverage, LSP shape polish.
+5. **P4 — Runner-adjacent:** test matrix, bench, toolchain manager, coverage, LSP polish.
 6. **P5 — Ecosystem:** doc hosting, audit DB, editor extensions, LÖVE/Neovim embedding.
 
 ## 19. Open questions (escalate, don't guess)
 
-- **Decided (#90):** Strictness for field access on LuaCATS code follows the *declaration boundary*, not a sealed-vs-open guess. A value whose type is a **declared `---@class`** (in-file, def-package, or cross-package via `---@meta` #108; including `self` in a class method and `---@type Class` locals) gets full field checking on the ordinary strictness ladder: a field the class does not declare — no `---@field` (own or inherited through the parent chain), no indexer, no inherent carrier method — is flagged on **read** (`LB0306`, luals `undefined-field`) and on **write** (`LB0303`, luals `inject-field`). Un-annotated code stays `unknown`-lenient: a plain inferred table or an `unknown`/`any` value invents no obligation — a declaration is the precondition. A class with an indexer declares dynamic access and stays open. This matches luals' `undefined-field`/`inject-field` behavior, and rides the ladder one notch stricter: a **warning** in warn mode, an **error** in strict (luals always warns). Suppressible with `---@diagnostic disable: undefined-field`. (v2 note: positional shape conformance rides the same ladder — the v1 "always hard errors" stance died with the binding tags.)
+- **Decided (#90):** Strictness for field access on LuaCATS code follows the *declaration boundary*, not a sealed-vs-open guess. A value whose type is a **declared `---@class`** (in-file, def-package, or cross-package via `---@meta` #108; including `self` in a class method and `---@type Class` locals) gets full field checking on the ordinary strictness ladder: a field the class does not declare — no `---@field` (own or inherited through the parent chain), no indexer, no inherent carrier method — is flagged on **read** (`LB0306`, luals `undefined-field`) and on **write** (`LB0303`, luals `inject-field`). Un-annotated code stays `unknown`-lenient: a plain inferred table or an `unknown`/`any` value invents no obligation — a declaration is the precondition. A class with an indexer declares dynamic access and stays open. This matches luals' `undefined-field`/`inject-field` behavior, and rides the ladder one notch stricter: a **warning** in warn mode, an **error** in strict (luals always warns). Suppressible with `---@diagnostic disable: undefined-field`. `---@class` conformance rides the same ladder — a warning in warn mode, an error in strict.
 - Integer/float divergence loudness targeting 5.1. Proposal: error in `strict`, warn otherwise.
 - Registry namespaces flat vs scoped `@org/pkg`. Proposal: scoped.
 - C-module story beyond prebuilt artifacts: out of scope until P5+.

@@ -6,14 +6,8 @@
 -- `[types] defs = ["geometry"]` in luabox.toml (the file stem `geometry`
 -- names the package, same mechanism as `love-asteroids-lite`'s
 -- `defs/love2d.d.lua`). Every type declared here is ambient to this
--- package's own files — no imports, addressed by plain name.
---
--- This project previously used `.luab` shape modules (TypeScript-adjacent
--- `type` declarations with structural, sealed conformance checking). The
--- `.luab` subsystem is unaffected and still lives at `shapes/*.luab`
--- elsewhere in the codebase — this example just demonstrates the idiomatic
--- LuaCATS/`.d.lua` path instead, so the two front-ends can be compared
--- honestly. See ../README.md for what that comparison found.
+-- package's own files — no imports, addressed by plain name. See
+-- ../README.md for a tour of the LuaCATS features this example exercises.
 
 --- A point in 2D space. `label` is an optional caption; `unit` is an
 --- optional coordinate unit (see the `geometry.Unit` alias below).
@@ -26,12 +20,11 @@
 --- Anything with an area and a perimeter, described as a method-shaped
 --- `---@class` (an "interface" by convention).
 ---
---- CONFORMANCE (#107): this IS now a verified contract. A carrier declaring
+--- CONFORMANCE (#107): this IS a verified contract. A carrier declaring
 --- `: geometry.Shape` (see ../src/circle.lua and ../src/rect.lua) must
 --- actually implement `area`/`perimeter`/`my_static` with compatible
 --- signatures, or `luabox check` reports LB0300 at the carrier's `---@class`
---- annotation — the structural conformance a `.luab` shape's `export type
---- Shape` used to be needed for, now on the plain-LuaCATS path. (Declaring
+--- annotation — real structural conformance on the LuaCATS path. (Declaring
 --- the interface here in the `---@meta` def carries no obligation of its own:
 --- defs are contracts, not carriers.)
 ---@class geometry.Shape
@@ -40,8 +33,7 @@
 ---@field my_static fun(): number
 
 --- A Shape that can also render itself as text. Declared as an extension
---- (`: geometry.Shape`) rather than a `.luab`-style intersection — same
---- idea, LuaCATS spelling.
+--- (`: geometry.Shape`).
 ---@class geometry.Drawable : geometry.Shape
 ---@field draw fun(self): string
 

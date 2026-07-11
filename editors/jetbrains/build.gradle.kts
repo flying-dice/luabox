@@ -31,7 +31,7 @@ repositories {
 dependencies {
     intellijPlatform {
         // Target IntelliJ IDEA 2025.3 — the first release where the native
-        // LSP API (incl. the semantic tokens that drive all .luab/.lua
+        // LSP API (incl. the semantic tokens that drive all .lua
         // highlighting) is available to ALL users, not just licensed
         // Ultimate: in the unified 2025.2 installer the sandbox boots in
         // free mode with `com.intellij.modules.lsp` disabled, so the plugin
@@ -46,14 +46,14 @@ intellijPlatform {
         name = "luabox"
         version = project.version.toString()
         description =
-            "Lua + .luab shape-file support for JetBrains IDEs via the luabox " +
+            "Lua support for JetBrains IDEs via the luabox " +
             "language server (typecheck, hover, goto-definition, completion, " +
             "document symbols, formatting, semantic highlighting)."
 
         ideaVersion {
             // 2025.3+: first build where `com.intellij.modules.lsp` is
             // available in every edition/mode (LSP semantic tokens drive
-            // .luab/.lua highlighting).
+            // .lua highlighting).
             sinceBuild = "253"
             untilBuild = provider { null }
         }

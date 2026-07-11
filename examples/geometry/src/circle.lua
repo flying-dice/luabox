@@ -17,9 +17,8 @@
 --    |    ^^^ expected member `perimeter` of type `fun(self: unknown): number`
 -- The check is `__index`-aware, so a subclass inheriting a concrete base
 -- method through its metatable chain is not wrongly asked to re-implement it.
--- This is the structural conformance luabox's `.luab` shape modules used to
--- be needed for — now on the plain-LuaCATS path (verified against the real
--- binary while building this example).
+-- This is real structural conformance on the LuaCATS path (verified against
+-- the real binary while building this example).
 ---@class geometry.Circle : geometry.Shape
 local Circle = {}
 Circle.__index = Circle

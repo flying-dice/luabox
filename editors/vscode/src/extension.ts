@@ -27,9 +27,9 @@ function buildClient(): LanguageClient {
   };
 
   const clientOptions: LanguageClientOptions = {
-    // Attach to plain Lua *and* .luab shape files. We deliberately do NOT declare
-    // the `lua` language (avoids clobbering other Lua extensions' grammars) and
-    // only select documents by language id here.
+    // Attach to plain Lua files. We deliberately do NOT declare the `lua`
+    // language (avoids clobbering other Lua extensions' grammars) and only
+    // select documents by language id here.
     //
     // This selector also scopes the capabilities the server advertises:
     // vscode-languageclient negotiates formatting, range formatting and
@@ -37,14 +37,9 @@ function buildClient(): LanguageClient {
     // providers for exactly these documents. The server's semantic-token
     // legend uses only standard token types/modifiers, so themes work
     // without `semanticTokenScopes` contributions.
-    documentSelector: [
-      { scheme: "file", language: "lua" },
-      { scheme: "file", language: "luabox-shape" },
-    ],
+    documentSelector: [{ scheme: "file", language: "lua" }],
     synchronize: {
-      fileEvents: vscode.workspace.createFileSystemWatcher(
-        "**/*.{lua,luab,toml}"
-      ),
+      fileEvents: vscode.workspace.createFileSystemWatcher("**/*.{lua,toml}"),
     },
   };
 

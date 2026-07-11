@@ -80,9 +80,9 @@ pub fn inlay_hints(
         hints.push(hint(sema, offset, format!(": {}", rendered.join(", "))));
     }
     // Annotated functions: render the `---@return` tags verbatim (their
-    // type names may not resolve in the per-file environment — `.luab`
-    // shapes, cross-file classes — but the annotation text is exact).
-    // Inference skips these functions, so the two sources never overlap.
+    // type names may not resolve in the per-file environment — cross-file
+    // classes — but the annotation text is exact). Inference skips these
+    // functions, so the two sources never overlap.
     for item in sema.items() {
         let Some(target) = item.target else {
             continue;

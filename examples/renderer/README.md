@@ -59,8 +59,7 @@ losing declaration and the project-local declaration wins.
 > Historical note: this example used to hand-vendor a copy of geometry's
 > classes in `defs/geometry.d.lua` with a "cross-package sharing doesn't work"
 > stopgap comment. That file is gone — #108 makes the dependency's own defs
-> reach renderer automatically, which is what a `.luab`-era `[types] entry`
-> export did before the LuaCATS conversion.
+> reach renderer automatically.
 
 ## The carrier
 

@@ -1,8 +1,8 @@
-//! LSP formatting over the shipped canonical formatters (SPEC.md §10):
+//! LSP formatting over the shipped canonical formatter (SPEC.md §10):
 //! `.lua` through [`luabox_syntax::lua::fmt::format`] with the project's
-//! edition, `.luab` through [`luabox_syntax::shape::format`].
+//! edition.
 //!
-//! Both formatters guarantee they never destroy code — inputs that do not
+//! The formatter guarantees it never destroys code — inputs that do not
 //! parse cleanly come back unchanged — so a formatting request on a broken
 //! document yields **no edits**, never an error response.
 //!

@@ -28,11 +28,7 @@ Work through them top to bottom; each introduces one new idea.
    fields, aliases, enums, literal sealing), what it silently lets through
    (inheritance/conformance, arbitrary field access, cross-package type
    sharing), and what's outright broken (generic classes and generic
-   functions). **Note:** luabox also has a separate `.luab` shape-module
-   subsystem (TypeScript-adjacent `type` declarations with real structural
-   conformance checking, SHAPES-V2.md) — it's unrelated to this pair of
-   examples and unaffected by them; these two just show the plain-LuaCATS
-   path on its own terms.
+   functions).
 3. **`legacy-inifile`** is a second, simpler pure-LuaCATS library — no
    inheritance, no generics, just `---@class`/`---@param`/`---@return` in
    warn mode. It shows luabox meeting existing code where it is.

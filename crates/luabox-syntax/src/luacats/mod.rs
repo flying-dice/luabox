@@ -258,11 +258,8 @@ pub struct UnknownTag {
 
 /// A single parsed `---@` tag.
 ///
-/// SHAPES-V2.md: there are no shape-specific tags. `.luab` types are
-/// consumed through the standard positions (`---@type` / `---@param` /
-/// `---@return` / `---@field`); the retired v1 tags (`---@use`,
-/// `---@struct`, `---@impl`) parse as [`Tag::Unknown`], which surfaces the
-/// migration to v1 users instead of silently accepting dead syntax.
+/// Any tag outside the recognised LuaCATS vocabulary parses as
+/// [`Tag::Unknown`] rather than being silently dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Tag {
     Class(ClassTag),

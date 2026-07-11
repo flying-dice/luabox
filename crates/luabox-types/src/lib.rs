@@ -1,9 +1,9 @@
 //! Unified type IR and checker — **Semantics** bounded context
 //! (SPEC.md §3, §16).
 //!
-//! One internal type IR fed (eventually) by two front-ends: LuaCATS
-//! annotations (`---@class` etc., full compatibility non-negotiable) and
-//! the `.luab` shape DSL (SHAPES.md). One checker, no parallel type system.
+//! One internal type IR fed by the LuaCATS annotation front-end (`---@class`
+//! etc., full compatibility non-negotiable) — the one and only type format
+//! (DIRECTION.md). One checker, no parallel type system.
 //!
 //! **P0 scope (this crate today):** the annotation-driven subset behind
 //! `luabox check` — types come from LuaCATS annotations and literals only.
@@ -16,8 +16,8 @@
 //!
 //! **P1 (TODO):** bidirectional inference, flow-sensitive narrowing,
 //! metatable/`__index` resolution, method calls, generics as real type
-//! variables, cross-file `require` resolution over the salsa DB, `.luab`
-//! shape checking, function subtyping.
+//! variables, cross-file `require` resolution over the salsa DB, function
+//! subtyping.
 //!
 //! Diagnostics carry `LB03xx` codes registered in `luabox-diag` (this
 //! crate depends on it the way rustc crates depend on `rustc_errors`).
@@ -30,7 +30,6 @@ mod env;
 mod generics;
 mod infer;
 mod lower;
-pub mod shape;
 pub mod ty;
 
 pub use assign::assignable;
@@ -40,7 +39,6 @@ pub use defs::{
 };
 pub use env::TypeEnv;
 pub use infer::{ExternalTypes, InferredBinding, InferredReturn};
-pub use shape::{DepShapeExport, ShapeOptions, ShapeStore};
 
 use luabox_diag::Diagnostic;
 use luabox_syntax::{lua, luacats};
@@ -100,7 +98,8 @@ pub struct DisplayTypes {
 ///
 /// Same inference as [`check_file`] (annotations stay authoritative;
 /// `ambient` merges definition-package globals beneath the file's own
-/// declarations, exactly as in [`check_file_shaped`]) with two additions:
+/// declarations, exactly as in [`check_file_with_ambient`]) with two
+/// additions:
 ///
 /// - **Call-site parameter seeding** — an unannotated parameter takes the
 ///   union of the argument types observed at the function's call sites, so
@@ -119,7 +118,7 @@ pub fn infer_display_types(
     externals: Option<&ExternalTypes>,
 ) -> DisplayTypes {
     let items = luacats::harvest(parse);
-    let env = TypeEnv::build_from_items(parse, &items, None, ambient);
+    let env = TypeEnv::build_from_items(parse, &items, ambient);
     let lowered = luabox_hir::lower(parse);
     let outcome = infer::run(&lowered, &env, file, false, true, externals);
     DisplayTypes {
@@ -130,37 +129,28 @@ pub fn infer_display_types(
     }
 }
 
-/// Typecheck one parsed file against its own annotations (no `.luab` shape
-/// resolution — see [`check_file_shaped`]).
+/// Typecheck one parsed file against its own annotations.
 ///
 /// `file` names the file in diagnostic spans. Cross-file `require`
 /// resolution is P1 — every file is checked against a per-file
 /// environment.
 #[must_use]
 pub fn check_file(parse: &lua::Parse, file: &str, strictness: Strictness) -> Vec<Diagnostic> {
-    check_file_shaped(parse, file, strictness, None, None)
+    check_file_with_ambient(parse, file, strictness, None)
 }
 
-/// Typecheck one parsed file with the ambient `.luab` package scope in
-/// reach when `shapes` is provided (SHAPES-V2.md).
-///
-/// There are no shape tags and no imports: `.luab` types resolve in the
-/// standard annotation positions by fully-qualified name, and conformance
-/// is positional — a value is checked against a shape type exactly where
-/// one is demanded. The scope is built once per store and shared, so a
-/// file that never names a shape type pays a lookup miss, not scope
-/// construction (the v2 zero-cost invariant).
+/// Typecheck one parsed file with an ambient definition-package layer in
+/// reach.
 ///
 /// `ambient` is the definition-package layer selected by the project
 /// `edition` ([`stdlib_defs`] / [`combined_defs`]): its stdlib globals and
 /// module tables become visible to both the checker and inference, merged
 /// beneath the file's own declarations (SPEC.md §3).
 #[must_use]
-pub fn check_file_shaped(
+pub fn check_file_with_ambient(
     parse: &lua::Parse,
     file: &str,
     strictness: Strictness,
-    shapes: Option<&ShapeOptions<'_>>,
     ambient: Option<&Ambient>,
 ) -> Vec<Diagnostic> {
     let items = luacats::harvest(parse);
@@ -175,9 +165,8 @@ pub fn check_file_shaped(
     });
 
     let mut diags: Vec<Diagnostic> = Vec::new();
-    let scope = shapes.map(ShapeOptions::scope);
 
-    let env = TypeEnv::build_from_items(parse, &items, scope.as_deref(), ambient);
+    let env = TypeEnv::build_from_items(parse, &items, ambient);
     let mut inferred_types = std::collections::HashMap::new();
     if strictness != Strictness::None {
         // Rich table inference (SPEC.md §3) runs first: the checker uses
@@ -702,11 +691,10 @@ f(\"anything\")
     fn strict_codes_ambient(src: &str) -> Vec<String> {
         let parse = lua::parse(src, lua::Dialect::Lua54);
         assert_eq!(parse.errors(), &[], "fixture must parse cleanly");
-        check_file_shaped(
+        check_file_with_ambient(
             &parse,
             "test.lua",
             Strictness::Strict,
-            None,
             Some(stdlib_defs(lua::Dialect::Lua54)),
         )
         .iter()

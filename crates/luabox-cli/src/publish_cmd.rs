@@ -10,10 +10,9 @@
 //!    coverage of the public API is *advisory*: public functions in `src/`
 //!    without `---@param`/`---@return` annotations are listed as a warning,
 //!    never a failure (MVP; SPEC.md §6 wants this fatal eventually).
-//! 2. **Pack.** The package tree — `luabox.toml`, `README*`, everything
-//!    under `src/`, and any `.luab` shape modules — is staged, excluding
-//!    build output (`[build] out`, default `dist/`), `lua_modules/`,
-//!    `vendor/`, and dot-files/dirs.
+//! 2. **Pack.** The package tree — `luabox.toml`, `README*`, and everything
+//!    under `src/` — is staged, excluding build output (`[build] out`,
+//!    default `dist/`), `lua_modules/`, `vendor/`, and dot-files/dirs.
 //! 3. **Hash.** The staged tree is interned into the content-addressed
 //!    store (`Store::put_tree`); its tree hash becomes the index line's
 //!    `checksum` (`sha256:…`) — the exact value `luabox install` recomputes
@@ -129,7 +128,7 @@ fn publish(project: &Project, registry: &Registry, name: &str) -> anyhow::Result
     let tree_dir = staging.path().join("tree");
     let files = stage_package_tree(project, &tree_dir)?;
     if files == 0 {
-        bail!("nothing to publish: no `src/` sources, `.luab` modules, or README found");
+        bail!("nothing to publish: no `src/` sources or README found");
     }
 
     let store = Store::open(deps_cmd::store_root()?);
@@ -242,10 +241,9 @@ fn run_test_gate(project: &Project) -> anyhow::Result<()> {
 
 // --- packaging ---------------------------------------------------------------
 
-/// Copy the publishable tree into `dest`: `luabox.toml`, root `README*`,
-/// everything under `src/`, and any `.luab` shape modules — excluding the
-/// build output dir, `lua_modules/`, `vendor/`, and dot-files/dirs.
-/// Returns the number of files staged.
+/// Copy the publishable tree into `dest`: `luabox.toml`, root `README*`, and
+/// everything under `src/` — excluding the build output dir, `lua_modules/`,
+/// `vendor/`, and dot-files/dirs. Returns the number of files staged.
 fn stage_package_tree(project: &Project, dest: &Path) -> anyhow::Result<usize> {
     let out_dir_name = project.manifest.build.out.clone();
     let mut staged = 0usize;
@@ -290,12 +288,7 @@ fn stage_package_tree(project: &Project, dest: &Path) -> anyhow::Result<usize> {
 /// Whether a (non-excluded) file belongs in the published tree.
 fn should_publish_file(rel: &Path, name: &str) -> bool {
     let top_level = rel.components().count() == 1;
-    let is_lb = rel
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("luab"));
-    (top_level && (name == "luabox.toml" || name.starts_with("README")))
-        || rel.starts_with("src")
-        || is_lb
+    (top_level && (name == "luabox.toml" || name.starts_with("README"))) || rel.starts_with("src")
 }
 
 // --- annotation coverage (advisory gate) --------------------------------------
@@ -457,7 +450,9 @@ return M
             Path::new("src/deep/init.lua"),
             "init.lua"
         ));
-        assert!(should_publish_file(
+        // Non-`src/` sources (and the retired `.luab` extension) are not
+        // published.
+        assert!(!should_publish_file(
             Path::new("shapes/geometry.luab"),
             "geometry.luab"
         ));

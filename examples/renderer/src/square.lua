@@ -1,7 +1,7 @@
 -- Square: our Drawable carrier. `geometry.Drawable` comes from the vendored
 -- copy in defs/geometry.d.lua (a stopgap for a real gap — see that file and
 -- the project README: cross-package LuaCATS type sharing doesn't work
--- today, unlike `.luab` shape modules).
+-- today).
 --
 -- `---@class render.Square : geometry.Drawable` reopens the class declared
 -- in defs/render.d.lua (`side: integer`, extends Drawable) — same

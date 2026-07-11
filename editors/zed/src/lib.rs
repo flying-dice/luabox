@@ -1,8 +1,8 @@
 //! Zed extension for luabox.
 //!
-//! Registers the `luabox lsp` stdio language server for Lua and `.luab` shape
-//! files. The binary is resolved from the user's LSP settings (a `binary.path`
-//! override) and otherwise from the worktree `PATH`.
+//! Registers the `luabox lsp` stdio language server for Lua files. The binary
+//! is resolved from the user's LSP settings (a `binary.path` override) and
+//! otherwise from the worktree `PATH`.
 //!
 //! API verified against zed_extension_api 0.7 (docs.rs) and the Zed extension
 //! docs (zed.dev/docs/extensions).

@@ -30,7 +30,7 @@ internal class LuaboxLspServerSupportProvider : LspServerSupportProvider {
 
 /**
  * Project-wide descriptor: one `luabox lsp` process per project, serving all
- * `.lua` and `.luab` files. The binary is resolved from the plugin settings
+ * `.lua` files. The binary is resolved from the plugin settings
  * (see [LuaboxSettings]); a blank setting falls back to `luabox` on PATH.
  */
 internal class LuaboxLspServerDescriptor(project: Project) :
@@ -46,6 +46,6 @@ internal class LuaboxLspServerDescriptor(project: Project) :
     }
 }
 
-/** `.lua` sources and `.luab` shape files are both served by luabox. */
+/** `.lua` sources are served by luabox. */
 private fun isLuaboxFile(file: VirtualFile): Boolean =
-    file.extension == "lua" || file.extension == "luab"
+    file.extension == "lua"

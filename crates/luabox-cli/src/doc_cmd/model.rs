@@ -1,12 +1,7 @@
 //! The documentation model (SPEC.md §13): a renderer-independent view of
-//! everything `luabox doc` documents, extracted from two producers:
-//!
-//! - **LuaCATS annotations** in `.lua` files (`luabox_syntax::luacats`):
-//!   classes (+fields), functions (`@param`/`@return`), aliases, enums,
-//!   plain doc lines, `@deprecated`.
-//! - **`.luab` type declarations** (`luabox_syntax::shape`, SHAPES-V2.md):
-//!   object types with fields/methods, intersections, generics — each with
-//!   its `---` doc comments.
+//! everything `luabox doc` documents, from **LuaCATS annotations** in `.lua`
+//! files (`luabox_syntax::luacats`): classes (+fields), functions
+//! (`@param`/`@return`), aliases, enums, plain doc lines, `@deprecated`.
 //!
 //! Types are captured as *rendered strings* (the same source-ish rendering
 //! the LSP hover uses); cross-linking happens later in the renderer via one
@@ -16,8 +11,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use luabox_syntax::lua::ast::{self, AstNode};
 use luabox_syntax::lua::{self, SyntaxKind, SyntaxNode};
-use luabox_syntax::shape::ast::{AstNode as ShapeAstNode, ShapeFile, TypeRef as ShapeTypeRef};
-use luabox_syntax::shape::{self, ShapeSyntaxKind};
 use luabox_syntax::{Dialect, luacats};
 
 /// The whole documented surface of one project.
@@ -27,8 +20,6 @@ pub struct DocModel {
     pub package: String,
     /// One entry per project `.lua` file, in walk order.
     pub modules: Vec<Module>,
-    /// One entry per `.luab` shape module, in walk order.
-    pub shape_modules: Vec<ShapeModule>,
 }
 
 /// One documented `.lua` file.
@@ -146,53 +137,6 @@ pub struct EnumDoc {
     pub docs: String,
 }
 
-/// One documented `.luab` shape module (SHAPES-V2.md).
-#[derive(Debug)]
-pub struct ShapeModule {
-    /// The module's dotted namespace, derived from its path under
-    /// `[types] shape-paths`.
-    pub name: String,
-    pub types: Vec<TypeDoc>,
-}
-
-/// A `.luab` `type` declaration — the only item form in v2.
-#[derive(Debug)]
-pub struct TypeDoc {
-    pub name: String,
-    /// Whether the declaration carries `export`.
-    pub export: bool,
-    /// Generic parameter names (v2 generics carry no bounds).
-    pub generics: Vec<String>,
-    /// Rendered right-hand side for alias-like declarations
-    /// (`geometry.Point`, `number?`, `(a: A) => R`); empty when the
-    /// members lists carry an object body.
-    pub rhs: String,
-    /// The named base types of an intersection (`Shape` in
-    /// `Shape & { ... }`).
-    pub bases: Vec<String>,
-    pub fields: Vec<ShapeFieldDoc>,
-    pub methods: Vec<ShapeMethodDoc>,
-    pub docs: String,
-}
-
-/// One field of a `.luab` object type. Nil-optionality is part of the
-/// rendered type (`number?`), not a separate flag.
-#[derive(Debug)]
-pub struct ShapeFieldDoc {
-    pub name: String,
-    pub ty: String,
-    pub docs: String,
-}
-
-/// One method member of a `.luab` object type.
-#[derive(Debug)]
-pub struct ShapeMethodDoc {
-    pub name: String,
-    /// Rendered signature: `area(self): number`.
-    pub sig: String,
-    pub docs: String,
-}
-
 // === Module naming ========================================================
 
 /// Derive the dotted module name from a root-relative path:
@@ -200,10 +144,7 @@ pub struct ShapeMethodDoc {
 /// prefix is stripped; a trailing `.init` collapses onto its directory).
 pub fn module_name(rel: &str) -> String {
     let path = rel.strip_prefix("src/").unwrap_or(rel);
-    let path = path
-        .strip_suffix(".lua")
-        .or_else(|| path.strip_suffix(".luab"))
-        .unwrap_or(path);
+    let path = path.strip_suffix(".lua").unwrap_or(path);
     let dotted = path.replace('/', ".");
     match dotted.strip_suffix(".init") {
         Some(parent) => parent.to_string(),
@@ -626,242 +567,6 @@ pub fn render_type(ty: &luacats::TypeExpr) -> String {
     }
 }
 
-// === Shape extraction =====================================================
-
-/// Extract the documentation model of one `.luab` shape module.
-pub fn shape_module(name: &str, source: &str) -> ShapeModule {
-    let parse = shape::parse(source);
-    let root = parse.syntax();
-    let docs = DocComments::index(&root);
-
-    let mut module = ShapeModule {
-        name: name.to_string(),
-        types: Vec::new(),
-    };
-    let Some(file) = ShapeFile::cast(root) else {
-        return module;
-    };
-    for item in file.items() {
-        let Some(name) = item.name() else { continue };
-        let mut doc = TypeDoc {
-            docs: docs.before(item.syntax()),
-            export: item.is_export(),
-            generics: generic_display(item.generic_params()),
-            rhs: String::new(),
-            bases: Vec::new(),
-            fields: Vec::new(),
-            methods: Vec::new(),
-            name,
-        };
-        match item.ty() {
-            Some(ShapeTypeRef::Object(obj)) => absorb_members(&mut doc, &obj, &docs),
-            Some(ShapeTypeRef::Intersection(inter)) => {
-                for member in inter.members() {
-                    match member {
-                        ShapeTypeRef::Object(obj) => absorb_members(&mut doc, &obj, &docs),
-                        other => doc.bases.push(render_shape_type(&other)),
-                    }
-                }
-            }
-            Some(other) => doc.rhs = render_shape_type(&other),
-            None => {}
-        }
-        module.types.push(doc);
-    }
-    module
-}
-
-/// Fold one object body's members into a [`TypeDoc`].
-fn absorb_members(
-    doc: &mut TypeDoc,
-    obj: &luabox_syntax::shape::ast::ObjectType,
-    docs: &DocComments,
-) {
-    for member in obj.members() {
-        match member {
-            luabox_syntax::shape::ast::Member::Field(f) => doc.fields.push(ShapeFieldDoc {
-                docs: docs.before(f.syntax()),
-                ty: {
-                    let base = f.ty().as_ref().map(render_shape_type).unwrap_or_default();
-                    if f.optional() && !base.ends_with('?') {
-                        format!("{base}?")
-                    } else {
-                        base
-                    }
-                },
-                name: f.name().unwrap_or_default(),
-            }),
-            luabox_syntax::shape::ast::Member::Method(m) => {
-                let Some(name) = m.name() else { continue };
-                let params = render_shape_params(m.params());
-                let mut sig = format!("{name}({})", params.join(", "));
-                if let Some(ret) = m.ret() {
-                    sig.push_str(": ");
-                    sig.push_str(&render_shape_type(&ret));
-                }
-                doc.methods.push(ShapeMethodDoc {
-                    docs: docs.before(m.syntax()),
-                    name,
-                    sig,
-                });
-            }
-        }
-    }
-}
-
-/// Render a parameter list as display strings (`self`, `a: number`).
-fn render_shape_params(list: Option<luabox_syntax::shape::ast::ParamList>) -> Vec<String> {
-    let Some(list) = list else {
-        return Vec::new();
-    };
-    list.params()
-        .map(|p| {
-            if p.is_self() {
-                "self".to_string()
-            } else {
-                let ty = p.ty().as_ref().map(render_shape_type).unwrap_or_default();
-                format!("{}: {ty}", p.name().unwrap_or_default())
-            }
-        })
-        .collect()
-}
-
-fn generic_display(params: Option<luabox_syntax::shape::ast::GenericParams>) -> Vec<String> {
-    let Some(params) = params else {
-        return Vec::new();
-    };
-    params.params().filter_map(|p| p.name()).collect()
-}
-
-/// Render a `.luab` type expression back to source-ish text (SHAPES-V2.md
-/// grammar).
-pub fn render_shape_type(ty: &ShapeTypeRef) -> String {
-    match ty {
-        ShapeTypeRef::Named(named) => {
-            let name = named.path();
-            match named.args() {
-                Some(args) => {
-                    let args: Vec<String> = args.args().map(|a| render_shape_type(&a)).collect();
-                    format!("{name}<{}>", args.join(", "))
-                }
-                None => name,
-            }
-        }
-        ShapeTypeRef::Object(obj) => {
-            let members: Vec<String> = obj
-                .members()
-                .map(|m| match m {
-                    luabox_syntax::shape::ast::Member::Field(f) => format!(
-                        "{}{}: {}",
-                        f.name().unwrap_or_default(),
-                        if f.optional() { "?" } else { "" },
-                        f.ty().as_ref().map(render_shape_type).unwrap_or_default()
-                    ),
-                    luabox_syntax::shape::ast::Member::Method(m) => {
-                        let params = render_shape_params(m.params());
-                        let ret = m
-                            .ret()
-                            .map_or_else(String::new, |r| format!(": {}", render_shape_type(&r)));
-                        format!(
-                            "{}({}){ret}",
-                            m.name().unwrap_or_default(),
-                            params.join(", ")
-                        )
-                    }
-                })
-                .collect();
-            format!("{{ {} }}", members.join(", "))
-        }
-        ShapeTypeRef::Optional(opt) => match opt.inner() {
-            Some(inner) => format!("{}?", render_shape_type(&inner)),
-            None => "?".to_string(),
-        },
-        ShapeTypeRef::Union(union) => union
-            .members()
-            .map(|m| render_shape_type(&m))
-            .collect::<Vec<_>>()
-            .join(" | "),
-        ShapeTypeRef::Intersection(inter) => inter
-            .members()
-            .map(|m| render_shape_type(&m))
-            .collect::<Vec<_>>()
-            .join(" & "),
-        ShapeTypeRef::Fn(func) => {
-            let params = render_shape_params(func.params());
-            let ret = func.ret().map_or_else(
-                || " => ()".to_string(),
-                |r| format!(" => {}", render_shape_type(&r)),
-            );
-            format!("({}){ret}", params.join(", "))
-        }
-        ShapeTypeRef::Paren(paren) => {
-            let inners: Vec<String> = paren.inners().map(|t| render_shape_type(&t)).collect();
-            format!("({})", inners.join(", "))
-        }
-    }
-}
-
-/// `---` doc comments indexed by the source offset of the token they
-/// precede. Doc comments are trivia in the `.luab` tree (SHAPES-V2.md), so
-/// they are collected from the token stream rather than the node structure:
-/// a run of `---` lines separated by single newlines, ending directly above
-/// the item (no blank line), documents that item.
-struct DocComments {
-    /// `(kind, start, end, newline_count, text)` for every token, in order.
-    tokens: Vec<(ShapeSyntaxKind, usize, usize, usize, String)>,
-}
-
-impl DocComments {
-    fn index(root: &shape::ShapeSyntaxNode) -> Self {
-        let tokens = root
-            .descendants_with_tokens()
-            .filter_map(rowan::NodeOrToken::into_token)
-            .map(|t| {
-                let r = t.text_range();
-                let text = t.text().to_string();
-                let newlines = text.bytes().filter(|&b| b == b'\n').count();
-                (
-                    t.kind(),
-                    usize::from(r.start()),
-                    usize::from(r.end()),
-                    newlines,
-                    text,
-                )
-            })
-            .collect();
-        Self { tokens }
-    }
-
-    /// The doc text attached to the node — the `///` run directly above its
-    /// first significant token.
-    fn before(&self, node: &shape::ShapeSyntaxNode) -> String {
-        let Some(start) = node
-            .descendants_with_tokens()
-            .filter_map(rowan::NodeOrToken::into_token)
-            .find(|t| !t.kind().is_trivia())
-            .map(|t| usize::from(t.text_range().start()))
-        else {
-            return String::new();
-        };
-        let mut lines: Vec<&str> = Vec::new();
-        let upto = self
-            .tokens
-            .partition_point(|&(_, _, end, _, _)| end <= start);
-        for (kind, _, _, newlines, text) in self.tokens[..upto].iter().rev() {
-            match kind {
-                ShapeSyntaxKind::WHITESPACE if *newlines <= 1 => {}
-                ShapeSyntaxKind::DOC_COMMENT => {
-                    let body = text.strip_prefix("---").unwrap_or(text);
-                    lines.push(body.strip_prefix(' ').unwrap_or(body));
-                }
-                _ => break,
-            }
-        }
-        lines.reverse();
-        lines.join("\n")
-    }
-}
-
 // === Cross-class queries ==================================================
 
 /// All classes of the model, by name (later declarations shadow earlier
@@ -930,7 +635,7 @@ pub fn implementors(model: &DocModel) -> BTreeMap<String, Vec<String>> {
 /// (LuaCATS has no interface-vs-class split, so this is a heuristic, not a
 /// declared fact): every one of its `@field`s is function-typed and there is
 /// at least one, i.e. it reads like a method-only interface
-/// (`---@field area fun(self): number`, SHAPES.md's old "Shape" idiom).
+/// (`---@field area fun(self): number`).
 /// Anything else — including a class with no fields at all — gets the more
 /// neutral "Subclasses", matching rustdoc's trait-vs-struct split without
 /// having to fake a distinction LuaCATS doesn't carry.
@@ -1049,63 +754,11 @@ mod tests {
     }
 
     #[test]
-    fn shape_types_members_and_docs() {
-        let sm = shape_module(
-            "geometry",
-            "--- A 2D point.\n\
-             --- Immutable.\n\
-             type Point = {\n    --- Horizontal.\n    x: number,\n    y?: number,\n}\n\
-             \n\
-             type Bag<T> = { items: T }\n\
-             \n\
-             --- Things with an area.\n\
-             export type Shape = {\n    --- The enclosed area.\n    area(self): number,\n}\n\
-             \n\
-             export type Drawable = Shape & { draw(self): string }\n\
-             \n\
-             type Pair<T> = (a: T) => T\n",
-        );
-        assert_eq!(sm.types.len(), 5);
-        let point = &sm.types[0];
-        assert_eq!(point.name, "Point");
-        assert!(!point.export);
-        assert_eq!(point.docs, "A 2D point.\nImmutable.");
-        assert_eq!(point.fields.len(), 2);
-        assert_eq!(point.fields[0].name, "x");
-        assert_eq!(point.fields[0].ty, "number");
-        assert_eq!(point.fields[0].docs, "Horizontal.");
-        assert_eq!(point.fields[1].ty, "number?");
-        let bag = &sm.types[1];
-        assert_eq!(bag.generics, vec!["T".to_string()]);
-
-        let shape = &sm.types[2];
-        assert!(shape.export);
-        assert_eq!(shape.methods.len(), 1);
-        assert_eq!(shape.methods[0].sig, "area(self): number");
-        assert_eq!(shape.methods[0].docs, "The enclosed area.");
-
-        let drawable = &sm.types[3];
-        assert_eq!(drawable.bases, vec!["Shape".to_string()]);
-        assert_eq!(drawable.methods.len(), 1);
-        assert_eq!(drawable.methods[0].sig, "draw(self): string");
-
-        let pair = &sm.types[4];
-        assert_eq!(pair.rhs, "(a: T) => T");
-    }
-
-    #[test]
-    fn blank_line_detaches_shape_docs() {
-        let sm = shape_module("m", "--- Stray comment.\n\ntype Point = { x: number }\n");
-        assert_eq!(sm.types[0].docs, "");
-    }
-
-    #[test]
     fn module_name_derivation() {
         assert_eq!(module_name("src/main.lua"), "main");
         assert_eq!(module_name("src/geometry/circle.lua"), "geometry.circle");
         assert_eq!(module_name("src/geometry/init.lua"), "geometry");
         assert_eq!(module_name("lib/util.lua"), "lib.util");
-        assert_eq!(module_name("src/geometry.luab"), "geometry");
     }
 
     #[test]
@@ -1120,7 +773,6 @@ mod tests {
         let model = DocModel {
             package: "p".to_string(),
             modules: vec![m],
-            shape_modules: Vec::new(),
         };
         let classes = classes_by_name(&model);
         let leaf = classes["Leaf"];
@@ -1146,7 +798,6 @@ mod tests {
         let model = DocModel {
             package: "p".to_string(),
             modules: vec![m],
-            shape_modules: Vec::new(),
         };
         let map = implementors(&model);
         assert_eq!(

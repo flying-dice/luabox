@@ -54,16 +54,13 @@ pub(crate) struct CastEntry {
 pub struct TypeEnv {
     classes: BTreeMap<String, ClassDef>,
     enums: BTreeMap<String, EnumDef>,
-    /// Ambient `.luab` types with structural table bodies, by FQ name:
-    /// sealed shapes `Ty::Named` references resolve to (SHAPES-V2.md).
-    shape_structs: BTreeMap<String, TableTy>,
     /// Annotated functions by (dotted) name — `f`, `M.helper`.
     functions: BTreeMap<String, FunctionTy>,
     /// `---@type` annotations keyed by their target `local` statement.
     typed_locals: HashMap<Target, Vec<Ty>>,
     /// The source span of each `---@type` annotation, keyed by its target
     /// `local` statement — the anchor a deferred whole-carrier conformance
-    /// error points at (SHAPES-V2.md).
+    /// error points at.
     typed_local_spans: HashMap<Target, std::ops::Range<usize>>,
     /// Function signatures keyed by their target statement (for return
     /// checking inside the body).
@@ -94,16 +91,6 @@ pub struct TypeEnv {
     as_casts: HashMap<usize, Ty>,
     /// References to undeclared type names (LB0305): `(name, span)`.
     pub(crate) unknown_names: Vec<(String, luacats::Span)>,
-    /// Bad `.luab` generic instantiations reached from an annotation site
-    /// (LB2007): `(message, span)`.
-    pub(crate) shape_ref_errors: Vec<(String, luacats::Span)>,
-    /// Every fully-qualified `.luab` shape type name in scope — the
-    /// candidate list LB0305 draws its "did you mean" hint from (#79).
-    shape_names: Vec<String>,
-    /// FQ shape type name → (declaring file, declaration byte range), so a
-    /// conformance error at an annotation site can attach a secondary label
-    /// at the declaration (#80).
-    shape_decl_sites: BTreeMap<String, (String, std::ops::Range<usize>)>,
 }
 
 impl TypeEnv {
@@ -111,13 +98,10 @@ impl TypeEnv {
     #[must_use]
     pub fn build(parse: &lua::Parse) -> TypeEnv {
         let items = luacats::harvest(parse);
-        Self::build_from_items(parse, &items, None, None)
+        Self::build_from_items(parse, &items, None)
     }
 
-    /// Build the environment from pre-harvested annotations, optionally
-    /// with `.luab` shapes in scope (interop: shape structs/traits/aliases
-    /// become referenceable from LuaCATS annotations, and resolvable
-    /// through [`TypeEnv::resolve_named`] / [`TypeEnv::class_shape`]).
+    /// Build the environment from pre-harvested annotations.
     ///
     /// `ambient` is the definition-package layer (stdlib + project `defs`,
     /// [`crate::defs::Ambient`]) merged *beneath* the file's own
@@ -127,7 +111,6 @@ impl TypeEnv {
     pub(crate) fn build_from_items(
         parse: &lua::Parse,
         items: &[luacats::AnnotatedItem],
-        shapes: Option<&crate::shape::ShapeScope>,
         ambient: Option<&crate::defs::Ambient>,
     ) -> TypeEnv {
         let mut decl = Declared::default();
@@ -170,26 +153,7 @@ impl TypeEnv {
             env.functions = ambient.env.functions.clone();
             env.global_types = ambient.env.global_types.clone();
         }
-        if let Some(scope) = shapes {
-            // Concrete object types resolve nominally: seed their sealed
-            // structural tables so `Ty::Named(fq)` resolves through
-            // `class_shape`/`resolve_named`. Templates and alias-like types
-            // are handled at the lowerer (monomorphised / expanded inline).
-            for (name, shape) in &scope.types {
-                if shape.params.is_empty()
-                    && let crate::ty::Ty::Table(table) = &shape.ty
-                {
-                    env.shape_structs.insert(name.clone(), (**table).clone());
-                }
-            }
-            env.shape_names = scope.types.keys().cloned().collect();
-            for (name, shape) in &scope.types {
-                env.shape_decl_sites
-                    .insert(name.clone(), (shape.file.clone(), shape.range.clone()));
-            }
-        }
         let mut lowerer = Lowerer::new(&decl);
-        lowerer.shape_scope = shapes;
         // Build generic `---@class Name<T>` templates before the main pass so
         // references (`Name<number>`) resolve regardless of declaration order,
         // and ambient generic classes are reachable too (#84).
@@ -199,11 +163,6 @@ impl TypeEnv {
             lowerer.generics = block_generics(item);
             env.absorb_block(item, &mut lowerer, &root);
         }
-        // SHAPES-V2 `self` typing: tie each shape-typed constructor's carrier
-        // to its instance type, so `self` in the carrier's methods resolves
-        // as the shape — mirroring the `---@class` carrier association an
-        // explicit tag would set (an explicit `---@class` still wins).
-        env.tie_shape_carriers(items, &root);
         // Inline `--[[@as T]]` casts: anchor each to the end offset of the
         // expression it directly follows (skipping back over whitespace).
         let inline_as = luacats::harvest_inline_as(parse);
@@ -223,7 +182,6 @@ impl TypeEnv {
             }
         }
         env.unknown_names = std::mem::take(&mut lowerer.unknown_names);
-        env.shape_ref_errors = std::mem::take(&mut lowerer.shape_ref_errors);
         env
     }
 
@@ -481,7 +439,7 @@ impl TypeEnv {
                         })
                         .collect();
                     // Validate each parent reference: lowering a `: Base` that
-                    // no class/alias/enum/shape declares records an unknown
+                    // no class/alias/enum declares records an unknown
                     // name at the parent's own span → LB0305 (#107). Forward
                     // references and defs/ambient parents already sit in the
                     // lowerer's declared-name universe, so they do not fire.
@@ -669,7 +627,7 @@ impl TypeEnv {
         // (LuaLS warns); surface a diagnostic for them.
         // A `:` method's implicit `self` is absent from the AST parameter
         // list; keep an explicit `---@param self T` tag so inference can
-        // honor it (the standard-LuaCATS `self` fallback, SHAPES-V2.md).
+        // honor it (the standard-LuaCATS `self` fallback).
         let is_method =
             matches!(&stmt, Stmt::FunctionDecl(f) if f.name().is_some_and(|n| n.is_method()));
         if let Some(list) = param_list {
@@ -721,52 +679,12 @@ impl TypeEnv {
         self.fn_sigs.insert(target, func);
     }
 
-    /// SHAPES-V2 `self` typing: for each shape-typed constructor
-    /// (`---@return <fq>` whose first return is a `.luab` object type) whose
-    /// body is `return setmetatable(<expr>, <Ident>)`, bind `<Ident>`'s
-    /// carrier `local` to the instance type `<fq>`. Inference then resolves
-    /// `self` in the carrier's methods through the shape, exactly as a
-    /// `---@class` carrier does. An explicit declaration on the carrier wins;
-    /// among shape constructors, the first in source order wins.
-    fn tie_shape_carriers(&mut self, items: &[luacats::AnnotatedItem], root: &SyntaxNode) {
-        let mut ties: Vec<(Target, String)> = Vec::new();
-        for item in items {
-            let Some(span) = item.target else { continue };
-            let target = (span.start, span.end);
-            let Some(sig) = self.fn_sigs.get(&target) else {
-                continue;
-            };
-            let Some(Ty::Named(fq)) = sig.returns.first() else {
-                continue;
-            };
-            if !self.shape_structs.contains_key(fq) {
-                continue;
-            }
-            let fq = fq.clone();
-            let Some(carrier) = stmt_at(root, target).and_then(|stmt| setmetatable_carrier(&stmt))
-            else {
-                continue;
-            };
-            let Some(carrier_stmt) = carrier_local(root, &carrier, target.0) else {
-                continue;
-            };
-            ties.push((carrier_stmt, fq));
-        }
-        for (target, fq) in ties {
-            self.declared_targets.entry(target).or_insert(fq);
-        }
-    }
-
     // --- lookups -----------------------------------------------------
 
     /// The merged structural shape of a class: parents first (depth-first),
-    /// own members overriding, with a cycle guard. `.luab` structs and
-    /// traits in scope resolve here too (one checker, one IR).
+    /// own members overriding, with a cycle guard.
     pub(crate) fn class_shape(&self, name: &str) -> Option<TableTy> {
         if !self.classes.contains_key(name) {
-            if let Some(table) = self.shape_structs.get(name) {
-                return Some(table.clone());
-            }
             return None;
         }
         let mut shape = TableTy::default();
@@ -796,8 +714,7 @@ impl TypeEnv {
     }
 
     /// Resolve a [`Ty::Named`] reference to its structural type: a class
-    /// (or `.luab` struct/trait) becomes its table shape, an enum the union
-    /// of its member values.
+    /// becomes its table shape, an enum the union of its member values.
     pub(crate) fn resolve_named(&self, name: &str) -> Option<Ty> {
         if let Some(shape) = self.class_shape(name) {
             return Some(Ty::Table(Box::new(shape)));
@@ -853,10 +770,8 @@ impl TypeEnv {
     }
 
     /// Whether `name` is a LuaCATS `---@class` (in-file, def-package, or
-    /// cross-package) — as opposed to a `.luab` struct/trait, which also
-    /// resolves through [`TypeEnv::class_shape`] but is the parked shape DSL
-    /// (DIRECTION.md). The `undefined-field` read rule (#90) fires only for
-    /// real classes; `.luab`-typed reads stay lenient (#82).
+    /// cross-package). The `undefined-field` read rule (#90) fires only for
+    /// real classes.
     pub(crate) fn is_class(&self, name: &str) -> bool {
         self.classes.contains_key(name)
     }
@@ -880,30 +795,6 @@ impl TypeEnv {
     /// `end_offset`, if any.
     pub(crate) fn as_cast_at(&self, end_offset: usize) -> Option<&Ty> {
         self.as_casts.get(&end_offset)
-    }
-
-    /// The `.luab` declaration site of a fully-qualified shape type name:
-    /// its declaring file and byte range (#80's "type declared here" label).
-    pub(crate) fn shape_decl_site(&self, name: &str) -> Option<(&str, std::ops::Range<usize>)> {
-        self.shape_decl_sites
-            .get(name)
-            .map(|(file, range)| (file.as_str(), range.clone()))
-    }
-
-    /// Fully-qualified shape names whose *last* dotted segment matches
-    /// `name`'s last segment — the LB0305 "did you mean" candidate list
-    /// (#79): covers both a bare short name (`Point`) and a typo'd
-    /// namespace (`geomtry.Point`). Capped at 3, in FQ-name order.
-    pub(crate) fn shape_name_candidates(&self, name: &str) -> Vec<String> {
-        let last = name.rsplit('.').next().unwrap_or(name);
-        let mut candidates: Vec<String> = self
-            .shape_names
-            .iter()
-            .filter(|fq| fq.rsplit('.').next() == Some(last))
-            .cloned()
-            .collect();
-        candidates.truncate(3);
-        candidates
     }
 }
 
@@ -1033,66 +924,6 @@ fn lower_cast(tag: &luacats::CastTag, lowerer: &mut Lowerer<'_>) -> CastEntry {
             .map(|op| (op.kind, lowerer.lower(&op.ty)))
             .collect(),
     }
-}
-
-/// The metatable identifier of a function whose body directly returns
-/// `setmetatable(<expr>, <Ident>)` (the SHAPES-V2 constructor idiom).
-/// Nested closures are not inspected — a constructor's `setmetatable` return
-/// is a top-level statement of its own body.
-fn setmetatable_carrier(stmt: &Stmt) -> Option<String> {
-    let block = match stmt {
-        Stmt::FunctionDecl(f) => f.body(),
-        Stmt::LocalFunction(f) => f.body(),
-        Stmt::Local(l) => match l.values()?.exprs().next()? {
-            Expr::Function(f) => f.body(),
-            _ => None,
-        },
-        _ => None,
-    }?;
-    for stmt in block.stmts() {
-        let Stmt::Return(ret) = stmt else { continue };
-        let Some(Expr::Call(call)) = ret.exprs().and_then(|list| list.exprs().next()) else {
-            continue;
-        };
-        let Some(Expr::Name(callee)) = call.callee() else {
-            continue;
-        };
-        if callee.name().is_none_or(|t| t.text() != "setmetatable") {
-            continue;
-        }
-        let Some(args) = call.args().and_then(|a| a.expr_list()) else {
-            continue;
-        };
-        if let Some(Expr::Name(meta)) = args.exprs().nth(1)
-            && let Some(name) = meta.name()
-        {
-            return Some(name.text().to_string());
-        }
-    }
-    None
-}
-
-/// The top-level `local <name> = ...` statement nearest before `before`
-/// (byte offset). File-local carriers only — no scope construction.
-fn carrier_local(root: &SyntaxNode, name: &str, before: usize) -> Option<Target> {
-    let block = lua::ast::SourceFile::cast(root.clone())?.block()?;
-    let mut best: Option<Target> = None;
-    for stmt in block.stmts() {
-        let Stmt::Local(local) = &stmt else { continue };
-        let declares = local
-            .names()
-            .filter_map(|n| n.name())
-            .any(|t| t.text() == name);
-        if !declares {
-            continue;
-        }
-        let range = stmt.syntax().text_range();
-        let span = (usize::from(range.start()), usize::from(range.end()));
-        if span.0 < before && best.is_none_or(|b| span.0 > b.0) {
-            best = Some(span);
-        }
-    }
-    best
 }
 
 /// The innermost statement whose range is exactly `target`.

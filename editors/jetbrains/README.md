@@ -3,11 +3,11 @@
 A JetBrains plugin that wires the `luabox lsp` stdio language server into
 IntelliJ-based IDEs through the platform's **native LSP API**
 (`com.intellij.platform.lsp`): diagnostics, hover, goto-definition, completion,
-document symbols, formatting and semantic highlighting for `.lua` sources and
-`.luab` shape files.
+document symbols, formatting and semantic highlighting for `.lua` sources.
 
-It also registers a `LuaBox` file type for `.luab` (with its own icon) so the
-shape DSL is a first-class language rather than plain text.
+It also registers a `Lua (luabox)` file type for `.lua` (with its own icon and
+base lexical highlighting) so Lua is a first-class language rather than plain
+text.
 
 > **Edition requirement.** The native LSP API ships in **Ultimate-tier** IDEs
 > (IntelliJ IDEA Ultimate, WebStorm, PyCharm Professional, GoLand, …) from
@@ -49,7 +49,7 @@ build downloads the IntelliJ Platform (~1 GB), so it takes a while.
 ```
 
 Launches a scratch IntelliJ IDEA Ultimate with the plugin loaded; open a `.lua`
-or `.luab` file to start the server.
+file to start the server.
 
 ## Install from disk
 
@@ -68,12 +68,13 @@ installation (`luabox.xml`).
 
 | File | Role |
 |---|---|
-| `LuaboxLspServerSupportProvider.kt` | `LspServerSupportProvider` — starts `luabox lsp` when a `.lua`/`.luab` file opens; `ProjectWideLspServerDescriptor` builds the command line. |
-| `LuaboxFileType.kt` / `LuaboxLanguage.kt` | `.luab` file type + `LuaBox` language. |
+| `LuaboxLspServerSupportProvider.kt` | `LspServerSupportProvider` — starts `luabox lsp` when a `.lua` file opens; `ProjectWideLspServerDescriptor` builds the command line. |
+| `LuaFileType.kt` / `LuaLanguage.kt` | `.lua` file type + namespaced `luabox.Lua` language. |
+| `LuaHighlighting.kt` | base lexical highlighting for `.lua` (LSP semantic tokens overlay on top). |
 | `LuaboxSettings.kt` | `PersistentStateComponent` holding the binary path. |
 | `LuaboxConfigurable.kt` | the Settings ▸ Tools ▸ luabox panel. |
 | `resources/META-INF/plugin.xml` | extension-point registrations. |
-| `resources/icons/luabox.svg` | 16×16 `.luab` file icon. |
+| `resources/icons/luabox.svg` | 16×16 `.lua` file icon. |
 
 ## Alternative: LSP4IJ (Community editions)
 
@@ -88,14 +89,9 @@ editions where the native LSP API is unavailable. No plugin build required.
    - **Name**: `luabox`
    - **Command**: `luabox lsp` (use an absolute path if `luabox` is not on the
      IDE's `PATH`, e.g. `C:\path\to\luabox.exe lsp`).
-3. **Mappings** tab — add file-name patterns `*.lua` and `*.luab`.
-4. **Apply**, then open a `.lua`/`.luab` file. The **LSP Consoles** tool window
+3. **Mappings** tab — add the file-name pattern `*.lua`.
+4. **Apply**, then open a `.lua` file. The **LSP Consoles** tool window
    shows traffic for troubleshooting.
-
-> `.luab` has no built-in JetBrains file type under LSP4IJ. Under *Settings ▸
-> Editor ▸ File Types* register the pattern `*.luab` (with `//` line and
-> `/* */` block comments) so the editor opens it as text; LSP4IJ then supplies
-> the language features.
 
 ## Publishing to the JetBrains Marketplace
 

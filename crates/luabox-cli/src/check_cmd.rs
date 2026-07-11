@@ -11,15 +11,7 @@
 //!    Duplicate findings (same code, same range) are reported once.
 //! 3. **Typecheck** (annotation-driven, per-file environment; cross-file
 //!    `require` resolution is P1) at the manifest's strictness:
-//!    `[types] strict = true` → strict (errors), otherwise warn — plus
-//!    `.luab` shape bindings (`---@use`/`---@struct`/`---@impl`, SHAPES.md),
-//!    whose `LB2xxx` rules are hard errors at every strictness.
-//!
-//! `.luab` shape modules are checked too: parse errors (including `LB2010`
-//! body rejection) and shape-level diagnostics (`LB2005`/`LB2007`) carry
-//! the `.luab` file and spans. Shape resolution uses the file's directory
-//! (sibling tier) plus the manifest's `[types] shape-paths`; parsed
-//! modules are cached in a store shared across the rayon workers.
+//!    `[types] strict = true` → strict (errors), otherwise warn.
 //!
 //! Output goes to stdout in the chosen format; a `check: N errors, M
 //! warnings in K files` summary goes to stderr. The exit code is nonzero
@@ -38,10 +30,7 @@ use anyhow::{Context, bail};
 use luabox_diag::{Code, Diagnostic, Format, Label, Severity, Span, render};
 use luabox_resolve::manifest::{Dependency, Manifest};
 use luabox_syntax::{Dialect, lua};
-use luabox_types::{
-    Ambient, DefFile, DepShapeExport, ShapeOptions, ShapeStore, Strictness, combined_defs_checked,
-    stdlib_defs,
-};
+use luabox_types::{Ambient, DefFile, Strictness, combined_defs_checked, stdlib_defs};
 use rayon::prelude::*;
 
 /// Execute `luabox check` from `cwd`. With `watch`, the check reruns on
@@ -55,8 +44,8 @@ pub fn run(cwd: &Path, target: Option<&str>, format: &str, watch: bool) -> anyho
     if watch {
         // Discover once up front purely to get a root/out-dir to watch;
         // `run_once` rediscovers the project fresh on every rerun, so a
-        // manifest edit (edition, strictness, shape paths) takes effect
-        // on the very next rerun without any extra plumbing here.
+        // manifest edit (edition, strictness) takes effect on the very
+        // next rerun without any extra plumbing here.
         let project = discover(cwd)?;
         let cwd = cwd.to_path_buf();
         let target = target.map(str::to_owned);
@@ -100,7 +89,7 @@ pub(crate) fn run_once(
         target_dialect = Some(dialect);
     }
 
-    let (lua_files, lb_files) = collect_files(&project)?;
+    let lua_files = collect_files(&project)?;
     // Definition packages (SPEC.md §3): the dialect stdlib layer, plus any
     // project-local `[types] defs` resolved from `<root>/defs/`, plus each
     // direct dependency's own `[types] defs` — the luals `workspace.library`
@@ -122,8 +111,6 @@ pub(crate) fn run_once(
         .as_ref()
         .unwrap_or_else(|| stdlib_defs(project.dialect));
 
-    // Shape modules are parsed once and cached across workers.
-    let store = ShapeStore::new(project.root.clone());
     // SPEC.md §16: rayon per-module. Files are independent (cross-file
     // resolution is P1); collecting per-file Vecs preserves source order.
     let per_file: Vec<anyhow::Result<Vec<Diagnostic>>> = lua_files
@@ -133,50 +120,24 @@ pub(crate) fn run_once(
             let source =
                 fs::read_to_string(path).with_context(|| format!("cannot read `{rel}`"))?;
             let mut diags = Vec::new();
-            check_one(
-                &source,
-                &rel,
-                &project,
-                target_dialect,
-                &store,
-                ambient,
-                &mut diags,
-            );
+            check_one(&source, &rel, &project, target_dialect, ambient, &mut diags);
             Ok(diags)
         })
         .collect();
-    // `.luab` shape files get their own pass: parse errors (LB2010, LB0001)
-    // plus shape-level diagnostics attributed to the declaring file.
-    let per_lb: Vec<anyhow::Result<Vec<Diagnostic>>> = lb_files
-        .par_iter()
-        .map(|path| {
-            let rel = display_rel(path, &project.root);
-            let source =
-                fs::read_to_string(path).with_context(|| format!("cannot read `{rel}`"))?;
-            Ok(store.check_lb_file(path, &source, &project.shape_paths, &project.dependencies))
-        })
-        .collect();
     let mut diags: Vec<Diagnostic> = def_diags;
-    for result in per_file.into_iter().chain(per_lb) {
+    for result in per_file {
         diags.extend(result?);
     }
 
-    finish(
-        &diags,
-        format,
-        &project.root,
-        lua_files.len() + lb_files.len(),
-    )
+    finish(&diags, format, &project.root, lua_files.len())
 }
 
 /// All three passes for one file.
-#[allow(clippy::too_many_arguments)]
 fn check_one(
     source: &str,
     rel: &str,
     project: &Project,
     target: Option<Dialect>,
-    store: &ShapeStore,
     ambient: &Ambient,
     diags: &mut Vec<Diagnostic>,
 ) {
@@ -220,19 +181,11 @@ fn check_one(
         }
     }
 
-    // 3. Types with the ambient `.luab` package scope (SHAPES-V2.md):
-    // every module under the manifest's `[types] shape-paths` plus each
-    // dependency's exported surface, no imports.
-    let opts = ShapeOptions {
-        store,
-        shape_paths: &project.shape_paths,
-        dependencies: &project.dependencies,
-    };
-    diags.extend(luabox_types::check_file_shaped(
+    // 3. Types against the ambient definition-package layer (SPEC.md §3).
+    diags.extend(luabox_types::check_file_with_ambient(
         &parse,
         rel,
         project.strictness,
-        Some(&opts),
         Some(ambient),
     ));
 }
@@ -293,11 +246,6 @@ pub(crate) struct Project {
     /// `[build] target` — the dialect you ship (SPEC.md §2.1, §5); defaults
     /// to the edition. Consumed by `crate::build_cmd`.
     pub(crate) build_target: Dialect,
-    /// `[types] shape-paths`, absolute, in manifest order (SHAPES.md §6).
-    shape_paths: Vec<PathBuf>,
-    /// Dependencies that export shape modules (SHAPES.md §6, tier 3), each
-    /// with its package root and its own `[types] shapes`/`shape-paths`.
-    dependencies: Vec<DepShapeExport>,
     /// `[types] defs`, ambient definition packages resolved from the
     /// project-local `defs/` directory (SPEC.md §3, §5). `pub(crate)` so
     /// `doc_cmd` can resolve the same def files it uses for type-checking
@@ -350,13 +298,6 @@ pub(crate) fn discover(cwd: &Path) -> anyhow::Result<Project> {
                 strictness: Strictness::from_manifest_flag(manifest.types.strict),
                 out_dir: Some(current.join(&manifest.build.out)),
                 build_target,
-                shape_paths: manifest
-                    .types
-                    .shape_paths
-                    .iter()
-                    .map(|p| current.join(p))
-                    .collect(),
-                dependencies: resolve_dep_shape_exports(current, &manifest),
                 defs: manifest.types.defs.clone(),
                 dep_defs: resolve_dep_defs(current, &manifest),
             });
@@ -369,55 +310,9 @@ pub(crate) fn discover(cwd: &Path) -> anyhow::Result<Project> {
         strictness: Strictness::Warn,
         out_dir: None,
         build_target: Dialect::Lua54,
-        shape_paths: Vec::new(),
-        dependencies: Vec::new(),
         defs: Vec::new(),
         dep_defs: Vec::new(),
     })
-}
-
-/// Build the dependency shape-export table for resolution tier 3 (SHAPES.md
-/// §6): for each declared dependency, locate its package root (a path
-/// dependency in place at its `path`, every other kind under
-/// `lua_modules/<name>/`) and read that dependency's *own* `[types] shapes`
-/// and `[types] shape-paths` from its manifest. Only dependencies that
-/// actually export shape modules contribute an entry; a dependency with no
-/// manifest on disk (uninstalled, or a source kind whose root cannot be
-/// located here) or no `[types] entry` simply exports nothing and is
-/// skipped. `.luab` sources are never parsed here — only the manifest is
-/// read (distribution ships `.luab` opaquely).
-fn resolve_dep_shape_exports(root: &Path, manifest: &Manifest) -> Vec<DepShapeExport> {
-    let mut exports = Vec::new();
-    for (name, dep) in manifest
-        .dependencies
-        .iter()
-        .chain(&manifest.dev_dependencies)
-    {
-        let dep_root = match dep {
-            Dependency::Path(p) => root.join(p.path.replace('\\', "/")),
-            _ => root.join("lua_modules").join(name),
-        };
-        let Ok(text) = fs::read_to_string(dep_root.join("luabox.toml")) else {
-            continue;
-        };
-        let Ok(dep_manifest) = Manifest::parse(&text) else {
-            continue;
-        };
-        let Some(entry) = &dep_manifest.types.entry else {
-            continue;
-        };
-        exports.push(DepShapeExport {
-            name: name.clone(),
-            entry: Some(dep_root.join(entry.replace('\\', "/"))),
-            shape_paths: dep_manifest
-                .types
-                .shape_paths
-                .iter()
-                .map(|p| dep_root.join(p))
-                .collect(),
-        });
-    }
-    exports
 }
 
 /// Resolve `[types] defs` entries against the project-local `defs/`
@@ -491,7 +386,7 @@ pub(crate) fn resolve_project_defs(
 /// dependency with no manifest on disk (uninstalled, or a source kind whose
 /// root cannot be located here) or no `[types] defs` simply contributes
 /// nothing. Resolution is one level deep only: a dependency's *own*
-/// dependencies' defs do not transit (matching `.luab`'s one-level precedent).
+/// dependencies' defs do not transit.
 ///
 /// Shared with `lint_cmd` (its `undefined-global` known-globals baseline must
 /// count dependency defs' globals too, #103/#108).
@@ -580,21 +475,15 @@ fn collect_d_lua(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// All `*.lua` and `*.luab` files under the project root, deterministic
-/// order, skipping dot-directories and the build output directory.
-pub(crate) fn collect_files(project: &Project) -> anyhow::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+/// All `*.lua` files under the project root, deterministic order, skipping
+/// dot-directories and the build output directory.
+pub(crate) fn collect_files(project: &Project) -> anyhow::Result<Vec<PathBuf>> {
     let mut lua = Vec::new();
-    let mut lb = Vec::new();
-    walk(&project.root, project, &mut lua, &mut lb)?;
-    Ok((lua, lb))
+    walk(&project.root, project, &mut lua)?;
+    Ok(lua)
 }
 
-fn walk(
-    dir: &Path,
-    project: &Project,
-    lua: &mut Vec<PathBuf>,
-    lb: &mut Vec<PathBuf>,
-) -> anyhow::Result<()> {
+fn walk(dir: &Path, project: &Project, lua: &mut Vec<PathBuf>) -> anyhow::Result<()> {
     let mut entries: Vec<_> = fs::read_dir(dir)
         .with_context(|| format!("cannot read directory `{}`", dir.display()))?
         .collect::<Result<_, _>>()
@@ -606,17 +495,16 @@ fn walk(
         if path.is_dir() {
             let is_out = project.out_dir.as_deref() == Some(path.as_path());
             if !hidden && !is_out {
-                walk(&path, project, lua, lb)?;
+                walk(&path, project, lua)?;
             }
         } else if !hidden {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            match path.extension().and_then(|e| e.to_str()) {
-                // `*.d.lua` are `---@meta` definition files (ambient type
-                // surfaces), never checked as project source.
-                Some("lua") if !name.ends_with(".d.lua") => lua.push(path),
-                Some("luab") => lb.push(path),
-                _ => {}
+            // `*.d.lua` are `---@meta` definition files (ambient type
+            // surfaces), never checked as project source.
+            if path.extension().and_then(|e| e.to_str()) == Some("lua") && !name.ends_with(".d.lua")
+            {
+                lua.push(path);
             }
         }
     }

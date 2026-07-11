@@ -1,6 +1,6 @@
 [package]
 name = "luabox-syntax"
-description = "luabox: lossless syntax trees for Lua dialects and the .luab shape DSL (Syntax context)"
+description = "luabox: lossless syntax trees for Lua dialects (Syntax context)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

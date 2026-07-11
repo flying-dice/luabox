@@ -11,9 +11,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 ///
 /// - `0xxx` — core / syntax: lexer, parser, generic frontend errors.
 /// - `1xxx` — manifest / config: `luabox.toml`, editions, workspace layout.
-/// - `2xxx` — shapes: the `.luab` DSL (SHAPES.md §5).
 ///
-/// Blocks `3xxx` and above are unassigned and reserved for later contexts
+/// Blocks `2xxx` and above are unassigned and reserved for later contexts
 /// (types, lint, lowering, resolver, ...). Internally the code is stored as a
 /// number so its rendering (`LB{:04}`) is always canonical.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

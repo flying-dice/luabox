@@ -64,22 +64,6 @@ Feature: Canonical formatting — luabox fmt
     Then the command succeeds
     And stdout contains "all formatted"
 
-  Scenario: .luab shape modules are formatted too
-    Given an empty directory
-    And a file "shapes/point.luab" containing:
-      """
-      type   Point={x:number,y:number}
-      """
-    When I run "luabox fmt"
-    Then the command succeeds
-    And "shapes/point.luab" equals:
-      """
-      type Point = {
-          x: number,
-          y: number,
-      }
-      """
-
   Scenario: broken Lua is left untouched
     Given an empty directory
     And a file "broken.lua" containing:

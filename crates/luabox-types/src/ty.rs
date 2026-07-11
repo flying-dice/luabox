@@ -72,10 +72,6 @@ pub struct TableTy {
     pub indexers: Vec<(Ty, Ty)>,
     /// The array-part element type (`T[]`).
     pub array: Option<Ty>,
-    /// Whether this table is a *sealed* `.luab` object shape (SHAPES-V2.md):
-    /// literals checked against it get freshness diagnostics for undeclared
-    /// keys (`LB0303`). LuaCATS tables are never sealed.
-    pub sealed: bool,
 }
 
 /// One `---@generic T[: Constraint]` type parameter of a [`FunctionTy`].
@@ -243,7 +239,6 @@ impl Ty {
                     .map(|(k, v)| (k.widened(), v.widened()))
                     .collect(),
                 array: table.array.as_ref().map(Ty::widened),
-                sealed: table.sealed,
             })),
             Ty::Function(func) => Ty::Function(Box::new(FunctionTy {
                 params: func

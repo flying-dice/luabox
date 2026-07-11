@@ -1,9 +1,7 @@
 //! The static registry of known diagnostic codes and their explain pages.
 //!
 //! Each entry carries a short `title` and a Markdown `explain` page surfaced
-//! by `luabox explain <code>`. The `LB2xxx` shape codes (SHAPES.md §5) are
-//! *reserved* here — the checker that emits them lands in P1 — so their
-//! explain text documents the condition and points at the shape spec.
+//! by `luabox explain <code>`.
 
 use crate::code::Code;
 
@@ -194,21 +192,6 @@ static REGISTRY: &[Entry] = &[
         code: Code::new(1100),
         title: "known security advisory affects a locked dependency",
         explain: LB1100,
-    },
-    Entry {
-        code: Code::new(2005),
-        title: "duplicate `.luab` type declaration",
-        explain: LB2005,
-    },
-    Entry {
-        code: Code::new(2007),
-        title: "bad `.luab` type instantiation or reference",
-        explain: LB2007,
-    },
-    Entry {
-        code: Code::new(2010),
-        title: "method body in `.luab` file",
-        explain: LB2010,
     },
 ];
 
@@ -594,9 +577,8 @@ end
 
 The check stays silent when the shape is not fully known: tables that
 escape into unanalyzed code (arguments to unknown functions, global
-writes), tables with dynamic-key writes or indexer types, tables whose
-metatable/`__index` cannot be resolved, and `.luab`-struct-typed values
-(the parked shape DSL, DIRECTION.md) never produce this diagnostic.
+writes), tables with dynamic-key writes or indexer types, and tables whose
+metatable/`__index` cannot be resolved never produce this diagnostic.
 
 Fix the spelling, declare the field, or — to acknowledge a genuinely
 dynamic access — add `---@diagnostic disable: undefined-field` (also
@@ -1076,8 +1058,8 @@ const LB1001: &str = "\
 The value supplied is none of these.
 
 Note: **Luau is intentionally out of scope** (SPEC.md §1). It is a separate
-typed paradigm with its own owner and toolchain; luabox's typed story is the
-`.luab` shape DSL layered over untyped Lua, so `luau` is not a valid edition.
+typed paradigm with its own owner and toolchain; luabox's typed story is
+strict LuaCATS checking over untyped Lua, so `luau` is not a valid edition.
 ";
 
 const LB1002: &str = "\
@@ -1132,98 +1114,6 @@ package is used — accept the risk consciously; there is no in-manifest
 suppression for this code yet (SPEC.md §19).
 ";
 
-const LB2005: &str = "\
-# LB2005: duplicate `.luab` type declaration
-
-The package type scope is *ambient* (SHAPES-V2.md): every `.luab` module
-under `[types] shape-paths` is loaded, namespaced by its path, and every
-fully-qualified name must be declared exactly once. Two modules declaring
-the same name is this error at both sites — never a silent merge.
-
-```typescript
--- shapes/geometry.luab        → declares geometry.Point
-type Point = { x: number }
-```
-
-```typescript
--- shapes2/geometry.luab       → also declares geometry.Point: LB2005
-type Point = { y: number }
-```
-
-Rename one declaration or remove the duplicate. A *local* declaration that
-shadows a type exported by a dependency is a warning under this code
-(adding a dependency must not break names the package already owned) — the
-local declaration wins.
-";
-
-const LB2007: &str = "\
-# LB2007: bad `.luab` type instantiation or reference
-
-A `.luab` type reference is malformed: a generic type instantiated with the
-wrong number of arguments, type arguments given to a non-generic type, or a
-short name that belongs to *another* module (references outside the
-declaring module are fully qualified — SHAPES-V2.md).
-
-```typescript
--- shapes/geometry.luab
-type Pair<T> = { first: T, second: T }
-```
-
-```typescript
--- shapes/other.luab
-type Bad     = geometry.Pair<number, string>  -- LB2007: expected 1 argument
-type AlsoBad = Pair<number>                   -- LB2007: not declared here —
-                                              -- did you mean `geometry.Pair`?
-```
-
-Fix the argument count, or qualify the reference with its module namespace
-(`geometry.Pair<number>`). Sibling references within the declaring module
-stay short; everything else is fully qualified.
-
-The same arity and non-generic-instantiation checks also fire at a standard
-LuaCATS annotation site (`---@type geometry.Pair<number, string>`) — a `.lua`
-file naming a `.luab` generic type gets this error exactly as a `.luab`
-declaration would.
-";
-
-const LB2010: &str = "\
-# LB2010: method body in `.luab` file
-
-A `.luab` shape file contains a method body. Shape files are
-declaration-only — no bodies, no expressions (SHAPES-V2.md). Implementations
-live in `.lua`; conformance is positional, checked wherever a value meets an
-annotated position.
-
-```typescript
--- geometry.luab
-type Shape = {
-    area(self): number { return 1 },   -- LB2010
-}
-```
-
-Write the signature only:
-
-```typescript
-type Shape = {
-    area(self): number,
-}
-```
-
-and implement it in Lua, asserting conformance with a standard annotation
-where you want the check to fire:
-
-```lua
-local Circle = {}
-Circle.__index = Circle
-
----@return number
-function Circle:area() return math.pi * self.radius ^ 2 end
-
----@type geometry.Shape
-local as_shape = Circle
-```
-";
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1234,7 +1124,7 @@ mod tests {
             "LB0001", "LB0010", "LB0011", "LB0012", "LB0013", "LB0014", "LB0015", "LB0016",
             "LB0300", "LB0301", "LB0302", "LB0303", "LB0304", "LB0305", "LB0306", "LB0307",
             "LB0500", "LB0501", "LB0502", "LB0503", "LB0504", "LB0505", "LB0506", "LB0507",
-            "LB0508", "LB0509", "LB1001", "LB1100", "LB2005", "LB2007", "LB2010",
+            "LB0508", "LB0509", "LB1001", "LB1100",
         ] {
             let code: Code = raw.parse().unwrap();
             assert!(explain(&code).is_some(), "{raw} missing from registry");

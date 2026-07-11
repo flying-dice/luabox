@@ -1,7 +1,7 @@
 {
   "name": "luabox",
   "displayName": "luabox",
-  "description": "luabox language support: typecheck, lint, hover, goto-def and completion for Lua and .luab shape files, powered by `luabox lsp`.",
+  "description": "luabox language support: typecheck, lint, hover, goto-def and completion for Lua, powered by `luabox lsp`.",
   "version": "0.1.0",
   "publisher": "luabox",
   "license": "MIT",
@@ -16,7 +16,6 @@
     "lua",
     "luabox",
     "lsp",
-    "shape",
     "typecheck"
   ],
   "repository": {
@@ -29,27 +28,6 @@
     "onLanguage:lua"
   ],
   "contributes": {
-    "languages": [
-      {
-        "id": "luabox-shape",
-        "aliases": [
-          "luabox shape",
-          "luabox-shape",
-          "luab"
-        ],
-        "extensions": [
-          ".luab"
-        ],
-        "configuration": "./language-configuration.json"
-      }
-    ],
-    "grammars": [
-      {
-        "language": "luabox-shape",
-        "scopeName": "source.luabox-shape",
-        "path": "./syntaxes/luabox-shape.tmLanguage.json"
-      }
-    ],
     "commands": [
       {
         "command": "luabox.restartServer",

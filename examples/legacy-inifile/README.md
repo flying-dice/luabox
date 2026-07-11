@@ -1,9 +1,9 @@
 # legacy-inifile
 
-A pure-**LuaCATS** library: no `.luab` shapes at all. This is what an existing,
-idiomatic Lua 5.1 codebase looks like when luabox checks it — proving the
-"annotated Lua checks day one" promise. Contrast it with `../geometry`, which
-layers the `.luab` shape DSL on top of the same type IR.
+A pure-**LuaCATS** library. This is what an existing, idiomatic Lua 5.1
+codebase looks like when luabox checks it — proving the "annotated Lua checks
+day one" promise. Contrast it with `../geometry`, which pushes LuaCATS
+further — class inheritance, conformance, and generics.
 
 ```
 legacy-inifile/
@@ -45,20 +45,3 @@ This example deliberately shows both suppression mechanisms:
    carries `---@luabox-ignore unused-local reserved for the planned
    duplicate-key mode`. The reason is required — a bare `---@luabox-ignore` is
    itself a diagnostic (`LB0500`).
-
-## LuaCATS vs. shapes — when to reach for which
-
-| | LuaCATS (`---@class`) | `.luab` shape modules |
-|---|---|---|
-| Lives in | `.lua` comments | separate `.luab` files (SHAPES-V2.md) |
-| Sealing | width/optional per strictness | **sealed** object types — literal freshness at annotated positions |
-| Conformance | ad-hoc | structural + positional, member-naming errors |
-| Naming | global class names | ambient fully-qualified names (`geometry.Point`) |
-| Editor support | every LuaLS editor | luabox-aware tooling |
-| Best for | existing code, gradual typing | new libraries wanting a curated, exported type surface |
-
-Both compile to one IR and interoperate freely — a `.luab` type is usable in
-any `---@param`/`---@type`/`---@return`, and a `---@class` table satisfies a
-`.luab` type wherever one is demanded. Use LuaCATS to adopt luabox on what you
-already have; add shape modules where you want TypeScript-grade guarantees
-and a published type surface (`export type` + `[types] entry`).

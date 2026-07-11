@@ -4,11 +4,10 @@
 
 One static binary that is the package manager, typechecker, linter, formatter,
 bundler, test runner, LSP server, and toolchain manager for every Lua dialect
-(5.1–5.4, LuaJIT). Types come from full LuaCATS annotation support plus
-`.luab` shape modules — TypeScript-adjacent `type` declarations checked
-structurally over untyped Lua, analyser-only. See [SPEC.md](SPEC.md) and
-[SHAPES-V2.md](SHAPES-V2.md) for the full design. Luau is explicitly out of
-scope.
+(5.1–5.4, LuaJIT). Types come from full LuaCATS annotation support —
+checked structurally over untyped Lua, more strictly than
+lua-language-server. See [SPEC.md](SPEC.md) for the full design. Luau is
+explicitly out of scope.
 
 ## Status
 
@@ -53,8 +52,8 @@ cargo build --release            # target/release/luabox
 | | |
 |---|---|
 | `init` / `new` | scaffold a project (`--lib`, `--edition 5.1..5.4\|luajit`) |
-| `check` | typecheck: LuaCATS + `.luab` shapes + rich inference, dialect legality, `--target`, `--watch`, `--format json\|sarif\|github\|gitlab` |
-| `fmt` | canonical formatter for `.lua` + `.luab` (`--check`, `--watch`) |
+| `check` | typecheck: LuaCATS + rich inference, dialect legality, `--target`, `--watch`, `--format json\|sarif\|github\|gitlab` |
+| `fmt` | canonical formatter for `.lua` (`--check`, `--watch`) |
 | `lint` | 8 type-informed rules, `---@luabox-ignore`, `--fix` |
 | `build` | lower `edition → target` (goto, bitops, `<close>`, `_ENV`, …) with tree-shaken polyfills |
 | `bundle` | single-file bundle, `--minify`, `--sourcemap` + `unmap`, `--mode love\|nvim-plugin` |
@@ -64,7 +63,7 @@ cargo build --release            # target/release/luabox
 | `run` | `[tasks]` entries or scripts via the resolved runtime |
 | `toolchain` | install/pin/list managed Lua runtimes |
 | `lsp` | language server: diagnostics, hover, goto, completion, symbols |
-| `doc` | static docs from annotations + shapes |
+| `doc` | static docs from annotations |
 | `explain LBnnnn` | rustc-style diagnostic pages |
 
 ## Layout
@@ -73,9 +72,9 @@ Cargo workspace, one crate per bounded context (SPEC.md §16):
 
 | Crate | Owns |
 |---|---|
-| `luabox-syntax` | lossless parser: Lua dialects + `.luab` shape grammar |
+| `luabox-syntax` | lossless parser: Lua dialects |
 | `luabox-hir` | desugared IR, name resolution |
-| `luabox-types` | unified type IR (LuaCATS ⊕ shapes), inference |
+| `luabox-types` | LuaCATS type IR, inference |
 | `luabox-db` | incremental query database |
 | `luabox-lower` | target lowering + polyfills |
 | `luabox-bundle` | require-graph, tree-shake, minify, sourcemaps |
@@ -126,15 +125,15 @@ scope.
 ## Editor setup
 
 Editor integrations wrap the `luabox lsp` stdio language server (diagnostics,
-hover, goto-definition, completion, document symbols; `.lua` and `.luab` files).
+hover, goto-definition, completion, document symbols; `.lua` files).
 They live under [`editors/`](editors/):
 
 | Editor | Path | Notes |
 |---|---|---|
-| VS Code | [`editors/vscode/`](editors/vscode/) | First-class TypeScript extension; ships a `.luab` shape grammar. `npm install && npm run compile`, then `npx @vscode/vsce package` for a `.vsix`. |
-| Neovim | [`editors/nvim/`](editors/nvim/) | `require("luabox").setup()` (Neovim 0.11+ native LSP; lspconfig fallback included). Adds `.luab` filetype detection. |
+| VS Code | [`editors/vscode/`](editors/vscode/) | First-class TypeScript extension. `npm install && npm run compile`, then `npx @vscode/vsce package` for a `.vsix`. |
+| Neovim | [`editors/nvim/`](editors/nvim/) | `require("luabox").setup()` (Neovim 0.11+ native LSP; lspconfig fallback included). |
 | JetBrains | [`editors/jetbrains/`](editors/jetbrains/) | Gradle/Kotlin plugin using the native LSP API (IntelliJ IDEA Ultimate 2024.2+). `./gradlew buildPlugin`, then install-from-disk. LSP4IJ route documented for Community editions. |
-| Zed | [`editors/zed/`](editors/zed/) | Rust/WASM extension; registers the server for Lua + `.luab` and ships a tree-sitter grammar ([`tree-sitter-luab/`](tree-sitter-luab/)). `cargo build --target wasm32-wasip2 --release`, then install as a dev extension. |
+| Zed | [`editors/zed/`](editors/zed/) | Rust/WASM extension; registers the server for Lua. `cargo build --target wasm32-wasip2 --release`, then install as a dev extension. |
 
 All three resolve the `luabox` binary from `PATH` (overridable per editor) and
 launch it as `luabox lsp`. Build the binary first with `cargo build --release`.
