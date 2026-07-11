@@ -44,6 +44,85 @@ Feature: luabox doc — static documentation site
     And "doc/class.Circle.html" contains "radius"
     And "doc/class.Circle.html" contains "Fields inherited from"
     And "doc/class.Circle.html" contains "id"
+    And "doc/class.Circle.html" does not contain "Subclasses"
+    And "doc/class.Circle.html" does not contain "Implementors"
+
+  Scenario: parent class page lists its subclasses (#87)
+    Given a project with edition "5.4"
+    And a file "src/shapes.lua" containing:
+      """
+      ---@class Shape
+      ---@field id integer
+      local Shape = {}
+
+      --- A circle.
+      ---@class Circle: Shape
+      local Circle = {}
+
+      ---@class Rect: Shape
+      local Rect = {}
+
+      ---@class Lonely
+      local Lonely = {}
+      """
+    When I run "luabox doc"
+    Then the command succeeds
+    And "doc/class.Shape.html" contains "<h2>Subclasses</h2>"
+    And "doc/class.Shape.html" contains 'href="class.Circle.html"'
+    And "doc/class.Shape.html" contains 'href="class.Rect.html"'
+    And "doc/class.Lonely.html" does not contain "Subclasses"
+    And "doc/class.Lonely.html" does not contain "Implementors"
+
+  Scenario: an all-function-typed parent is headed "Implementors" instead
+    Given a project with edition "5.4"
+    And a file "src/shapes.lua" containing:
+      """
+      ---@class Shape
+      ---@field area fun(self): number
+      ---@field perimeter fun(self): number
+      local Shape = {}
+
+      ---@class Circle: Shape
+      local Circle = {}
+      """
+    When I run "luabox doc"
+    Then the command succeeds
+    And "doc/class.Shape.html" contains "<h2>Implementors</h2>"
+    And "doc/class.Shape.html" does not contain "<h2>Subclasses</h2>"
+
+  Scenario: an interface declared only in a `.d.lua` def still gets a page and lists implementors
+    Given a file "defs/geometry.d.lua" containing:
+      """
+      ---@meta
+      ---@class geometry.Shape
+      ---@field area fun(self): number
+      """
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      defs = ["geometry"]
+      """
+    And a file "src/circle.lua" containing:
+      """
+      ---@class geometry.Circle: geometry.Shape
+      local Circle = {}
+
+      ---@return number
+      function Circle:area()
+        return 0
+      end
+      """
+    When I run "luabox doc"
+    Then the command succeeds
+    And the file "doc/class.geometry.Shape.html" exists
+    And "doc/class.geometry.Shape.html" contains "<h2>Implementors</h2>"
+    And "doc/class.geometry.Shape.html" contains 'href="class.geometry.Circle.html"'
 
   Scenario: .luab type page renders fields and docs
     Given a project with edition "5.4"

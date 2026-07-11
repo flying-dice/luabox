@@ -299,14 +299,17 @@ pub(crate) struct Project {
     /// with its package root and its own `[types] shapes`/`shape-paths`.
     dependencies: Vec<DepShapeExport>,
     /// `[types] defs`, ambient definition packages resolved from the
-    /// project-local `defs/` directory (SPEC.md §3, §5).
-    defs: Vec<String>,
+    /// project-local `defs/` directory (SPEC.md §3, §5). `pub(crate)` so
+    /// `doc_cmd` can resolve the same def files it uses for type-checking
+    /// when harvesting classes for documentation (#87).
+    pub(crate) defs: Vec<String>,
     /// Definition files each direct dependency contributes to *this* project's
     /// ambient scope (#108, the luals `workspace.library` model): each direct
     /// dependency's own `[types] defs`, resolved from that dependency's
     /// `defs/` directory, in dependency-name-alphabetical order. Loaded into
     /// the same ambient layer as the project's own defs, after them.
-    dep_defs: Vec<DefFile>,
+    /// `pub(crate)` for the same reason as `defs` above.
+    pub(crate) dep_defs: Vec<DefFile>,
 }
 
 /// Find the project: nearest `luabox.toml` walking up from `cwd`
@@ -422,7 +425,15 @@ fn resolve_dep_shape_exports(root: &Path, manifest: &Manifest) -> Vec<DepShapeEx
 /// `defs/<name>/` (SPEC.md §3 — registry-distributed packages are P2+).
 /// Returns the resolved def files (each carrying a root-relative label for
 /// diagnostics) plus a diagnostic per unresolvable entry.
-fn resolve_project_defs(root: &Path, names: &[String]) -> (Vec<DefFile>, Vec<Diagnostic>) {
+///
+/// `pub(crate)`: `doc_cmd` reuses this to harvest classes declared in
+/// `---@meta` def files onto their own doc pages (#87) — the same
+/// resolution `check_once` uses for type-checking, so the two stay in sync
+/// with no duplicated logic.
+pub(crate) fn resolve_project_defs(
+    root: &Path,
+    names: &[String],
+) -> (Vec<DefFile>, Vec<Diagnostic>) {
     let mut defs = Vec::new();
     let mut diags = Vec::new();
     let defs_dir = root.join("defs");

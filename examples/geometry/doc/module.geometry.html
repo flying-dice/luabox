@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Class geometry.Rect</title>
+<title>Module geometry</title>
 <style>
 :root {
   color-scheme: light dark;
@@ -101,54 +101,18 @@ ul.item-list .summary { margin-left: .8em; color: var(--muted); font-size: .9rem
 </ul>
 </nav>
 <main>
-<h1>Class <code>geometry.Rect</code></h1>
-<p>extends <a href="class.geometry.Shape.html">geometry.Shape</a></p>
-<h3>Fields inherited from <a href="class.geometry.Shape.html">geometry.Shape</a></h3>
-<table class="fields">
-<tr><th>Field</th><th>Type</th><th></th></tr>
-<tr><td>area</td><td>fun(self): number</td><td class="muted"></td></tr>
-<tr><td>perimeter</td><td>fun(self): number</td><td class="muted"></td></tr>
-<tr><td>my_static</td><td>fun(): number</td><td class="muted"></td></tr>
-</table>
-<h2>Methods</h2>
-<div class="item" id="fn.Rect-area">
-<pre class="sig">function Rect:area(): number</pre>
-<h3>Returns</h3>
-<dl class="params">
-<dt>number</dt>
-<dd></dd>
-</dl>
-</div>
-<div class="item" id="fn.Rect-perimeter">
-<pre class="sig">function Rect:perimeter(): number</pre>
-<h3>Returns</h3>
-<dl class="params">
-<dt>number</dt>
-<dd></dd>
-</dl>
-</div>
-<div class="item" id="fn.Rect.my_static">
-<pre class="sig">function Rect.my_static(): number</pre>
-<h3>Returns</h3>
-<dl class="params">
-<dt>number</dt>
-<dd></dd>
-</dl>
-</div>
-<div class="item" id="fn.Rect.new">
-<pre class="sig">function Rect.new(width: number, height: number): <a href="class.geometry.Rect.html">geometry.Rect</a></pre>
-<h3>Parameters</h3>
-<dl class="params">
-<dt>width: number</dt>
-<dd></dd>
-<dt>height: number</dt>
-<dd></dd>
-</dl>
-<h3>Returns</h3>
-<dl class="params">
-<dt><a href="class.geometry.Rect.html">geometry.Rect</a></dt>
-<dd></dd>
-</dl>
+<h1>Module <code>geometry</code></h1>
+<h2>Classes</h2>
+<ul class="item-list">
+<li><a href="class.geometry.Point.html">geometry.Point</a><span class="summary">A point in 2D space. `label` is an optional caption; `unit` is an</span></li>
+<li><a href="class.geometry.Shape.html">geometry.Shape</a><span class="summary">Anything with an area and a perimeter, described as a method-shaped</span></li>
+<li><a href="class.geometry.Drawable.html">geometry.Drawable</a><span class="summary">A Shape that can also render itself as text. Declared as an extension</span></li>
+<li><a href="class.geometry.Pair.html">geometry.Pair</a></li>
+</ul>
+<h2>Aliases</h2>
+<div class="item" id="alias.geometry.Unit">
+<pre class="sig">alias geometry.Unit = &quot;px&quot;|&quot;pt&quot;</pre>
+<p>The unit a coordinate or label is expressed in — a closed string-literal union. <code>---@alias</code> IS enforced: passing anything outside the union at an annotated position is a real <code>luabox check</code> error (see ../src/shapes_data.lua).</p>
 </div>
 </main>
 </body>

@@ -55,6 +55,7 @@ pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
         let name = model::module_name(&rel);
         modules.push(model::lua_module(&name, &source, project.dialect));
     }
+    harvest_def_modules(&project, &mut modules);
 
     let mut shape_modules = Vec::new();
     for path in &lb_set {
@@ -91,6 +92,61 @@ pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
         open_in_browser(&out_dir.join("index.html"));
     }
     Ok(())
+}
+
+/// Fold `---@meta` def-file classes into `modules` so an interface that
+/// lives only in a def (never reopened by a real carrier — SPEC.md §3's
+/// `[types] defs`, e.g. `examples/geometry`'s `geometry.Shape`) still gets a
+/// `class.<name>.html` page and can show implementors (#87).
+///
+/// `check_cmd::collect_files` deliberately excludes `*.d.lua` from the
+/// project's own `.lua` files (they are ambient, not project source), so
+/// without this step those classes are invisible to `luabox doc` — the gap
+/// this task set out to close. The def files are resolved with the exact
+/// same `check_cmd::resolve_project_defs`/`dep_defs` the typechecker uses,
+/// so "does this class have a page" tracks "is this class ambient" exactly.
+///
+/// A def file's `---@class` can also be the same class a real module
+/// reopens (`geometry.Circle` in both `defs/geometry.d.lua` and
+/// `src/circle.lua`, merged by the typechecker but *not* by this doc
+/// model — `model::classes_by_name`'s documented MVP gap). Giving both
+/// declarations a `class.Circle.html` page would silently let one clobber
+/// the other when pages are written by file name, so a class already known
+/// by name (from a real module, or an earlier def file) is dropped here
+/// instead: the real carrier's page — richer, with methods — wins, and the
+/// def only contributes classes with no carrier of their own.
+fn harvest_def_modules(project: &check_cmd::Project, modules: &mut Vec<model::Module>) {
+    let mut known: BTreeSet<String> = modules
+        .iter()
+        .flat_map(|m| m.classes.iter().map(|c| c.name.clone()))
+        .collect();
+
+    let (mut defs, _diags) = check_cmd::resolve_project_defs(&project.root, &project.defs);
+    defs.extend(project.dep_defs.iter().cloned());
+
+    for def in &defs {
+        let name = def_module_name(&def.file);
+        let mut module = model::lua_module(&name, &def.text, project.dialect);
+        module.classes.retain(|c| known.insert(c.name.clone()));
+        if !module.classes.is_empty()
+            || !module.aliases.is_empty()
+            || !module.enums.is_empty()
+            || !module.functions.is_empty()
+        {
+            modules.push(module);
+        }
+    }
+}
+
+/// A def file's display label (`defs/geometry.d.lua`, or a
+/// dependency-prefixed `geometry/defs/geometry.d.lua`) to a doc module name:
+/// the last path segment, `.d.lua` stripped. A directory-style def package
+/// (`defs/<name>/*.lua`, multiple files) collapses every file in it to its
+/// own stem, dropping the shared directory name — an accepted MVP gap, same
+/// spirit as `classes_by_name`'s "later declaration wins".
+fn def_module_name(file: &str) -> String {
+    let stem = file.rsplit('/').next().unwrap_or(file);
+    stem.strip_suffix(".d.lua").unwrap_or(stem).to_string()
 }
 
 /// The package name and absolute shape-path directories from the manifest

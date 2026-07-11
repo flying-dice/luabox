@@ -25,6 +25,9 @@ pub fn pages(model: &DocModel) -> Vec<(String, String)> {
     let links = build_links(model);
     let sidebar = sidebar_html(model);
     let classes = model::classes_by_name(model);
+    // Computed once over the whole model (model::implementors' doc comment)
+    // so a parent declared in one module sees children declared in another.
+    let implementors = model::implementors(model);
 
     let mut out = vec![("index.html".to_string(), index_page(model, &sidebar))];
     for module in &model.modules {
@@ -35,7 +38,7 @@ pub fn pages(model: &DocModel) -> Vec<(String, String)> {
         for class in &module.classes {
             out.push((
                 class_file(&class.name),
-                class_page(class, &classes, &links, &sidebar),
+                class_page(class, &classes, &implementors, &links, &sidebar),
             ));
         }
     }
@@ -738,6 +741,7 @@ fn field_table(rows: &[(String, String, String)], links: &Links) -> String {
 fn class_page(
     class: &ClassDoc,
     classes: &BTreeMap<&str, &ClassDoc>,
+    implementors: &BTreeMap<String, Vec<String>>,
     links: &Links,
     sidebar: &str,
 ) -> String {
@@ -802,6 +806,26 @@ fn class_page(
         for method in &class.methods {
             content.push_str(&function_html(method, links));
         }
+    }
+
+    if let Some(children) = implementors.get(&class.name)
+        && !children.is_empty()
+    {
+        let heading = if model::is_interface(class) {
+            "Implementors"
+        } else {
+            "Subclasses"
+        };
+        let _ = writeln!(content, "<h2>{heading}</h2>\n<ul class=\"item-list\">");
+        for child in children {
+            let _ = writeln!(
+                content,
+                "<li><a href=\"{}\">{}</a></li>",
+                escape(&class_file(child)),
+                escape(child)
+            );
+        }
+        content.push_str("</ul>\n");
     }
 
     page(&format!("Class {}", class.name), sidebar, &content)
@@ -1032,5 +1056,100 @@ mod tests {
             .1;
         assert!(shape.contains("area(self): number"));
         assert!(shape.contains("export"));
+    }
+
+    /// Model for the reverse-listing tests (issue #87): `Shape` is a
+    /// method-only interface (all fields function-typed) extended by
+    /// `Circle` and `Rect`; `Base` is an ordinary data class extended by
+    /// `Mid`; `Lonely` has no children at all.
+    fn implementors_fixture_model() -> DocModel {
+        let module = model::lua_module(
+            "shapes",
+            "---@class Shape\n\
+             ---@field area fun(self): number\n\
+             local Shape = {}\n\
+             \n\
+             --- A circle.\n\
+             ---@class Circle: Shape\n\
+             ---@field radius number\n\
+             local Circle = {}\n\
+             \n\
+             ---@class Rect: Shape\n\
+             local Rect = {}\n\
+             \n\
+             ---@class Base\n\
+             ---@field id integer\n\
+             local Base = {}\n\
+             \n\
+             ---@class Mid: Base\n\
+             local Mid = {}\n\
+             \n\
+             ---@class Lonely\n\
+             local Lonely = {}\n",
+            Dialect::Lua54,
+        );
+        DocModel {
+            package: "fixture".to_string(),
+            modules: vec![module],
+            shape_modules: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn parent_page_lists_its_children_under_implementors() {
+        let model = implementors_fixture_model();
+        let pages = pages(&model);
+        let shape = &pages
+            .iter()
+            .find(|(name, _)| name == "class.Shape.html")
+            .expect("class page")
+            .1;
+        assert!(shape.contains("<h2>Implementors</h2>"));
+        assert!(shape.contains("href=\"class.Circle.html\""));
+        assert!(shape.contains("href=\"class.Rect.html\""));
+        assert!(!shape.contains("<h2>Subclasses</h2>"));
+    }
+
+    #[test]
+    fn ordinary_parent_page_uses_the_subclasses_heading() {
+        let model = implementors_fixture_model();
+        let pages = pages(&model);
+        let base = &pages
+            .iter()
+            .find(|(name, _)| name == "class.Base.html")
+            .expect("class page")
+            .1;
+        assert!(base.contains("<h2>Subclasses</h2>"));
+        assert!(base.contains("href=\"class.Mid.html\""));
+        assert!(!base.contains("<h2>Implementors</h2>"));
+    }
+
+    #[test]
+    fn child_page_still_shows_its_own_extends_line() {
+        let model = implementors_fixture_model();
+        let pages = pages(&model);
+        let circle = &pages
+            .iter()
+            .find(|(name, _)| name == "class.Circle.html")
+            .expect("class page")
+            .1;
+        assert!(circle.contains("extends"));
+        assert!(circle.contains("href=\"class.Shape.html\">Shape</a>"));
+        // Circle itself has no children — no empty reverse-listing section.
+        assert!(!circle.contains("<h2>Subclasses</h2>"));
+        assert!(!circle.contains("<h2>Implementors</h2>"));
+    }
+
+    #[test]
+    fn class_with_no_children_shows_no_reverse_listing_section() {
+        let model = implementors_fixture_model();
+        let pages = pages(&model);
+        let lonely = &pages
+            .iter()
+            .find(|(name, _)| name == "class.Lonely.html")
+            .expect("class page")
+            .1;
+        assert!(!lonely.contains("<h2>Subclasses</h2>"));
+        assert!(!lonely.contains("<h2>Implementors</h2>"));
     }
 }

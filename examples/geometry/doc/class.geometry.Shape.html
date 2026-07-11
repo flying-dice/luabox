@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Class geometry.Rect</title>
+<title>Class geometry.Shape</title>
 <style>
 :root {
   color-scheme: light dark;
@@ -101,55 +101,22 @@ ul.item-list .summary { margin-left: .8em; color: var(--muted); font-size: .9rem
 </ul>
 </nav>
 <main>
-<h1>Class <code>geometry.Rect</code></h1>
-<p>extends <a href="class.geometry.Shape.html">geometry.Shape</a></p>
-<h3>Fields inherited from <a href="class.geometry.Shape.html">geometry.Shape</a></h3>
+<h1>Class <code>geometry.Shape</code></h1>
+<p>Anything with an area and a perimeter, described as a method-shaped <code>---@class</code> (an &quot;interface&quot; by convention).</p>
+<p>CONFORMANCE (#107): this IS now a verified contract. A carrier declaring <code>: geometry.Shape</code> (see ../src/circle.lua and ../src/rect.lua) must actually implement <code>area</code>/<code>perimeter</code>/<code>my_static</code> with compatible signatures, or <code>luabox check</code> reports LB0300 at the carrier&#39;s <code>---@class</code> annotation — the structural conformance a <code>.luab</code> shape&#39;s <code>export type Shape</code> used to be needed for, now on the plain-LuaCATS path. (Declaring the interface here in the <code>---@meta</code> def carries no obligation of its own: defs are contracts, not carriers.)</p>
+<h2>Fields</h2>
 <table class="fields">
 <tr><th>Field</th><th>Type</th><th></th></tr>
 <tr><td>area</td><td>fun(self): number</td><td class="muted"></td></tr>
 <tr><td>perimeter</td><td>fun(self): number</td><td class="muted"></td></tr>
 <tr><td>my_static</td><td>fun(): number</td><td class="muted"></td></tr>
 </table>
-<h2>Methods</h2>
-<div class="item" id="fn.Rect-area">
-<pre class="sig">function Rect:area(): number</pre>
-<h3>Returns</h3>
-<dl class="params">
-<dt>number</dt>
-<dd></dd>
-</dl>
-</div>
-<div class="item" id="fn.Rect-perimeter">
-<pre class="sig">function Rect:perimeter(): number</pre>
-<h3>Returns</h3>
-<dl class="params">
-<dt>number</dt>
-<dd></dd>
-</dl>
-</div>
-<div class="item" id="fn.Rect.my_static">
-<pre class="sig">function Rect.my_static(): number</pre>
-<h3>Returns</h3>
-<dl class="params">
-<dt>number</dt>
-<dd></dd>
-</dl>
-</div>
-<div class="item" id="fn.Rect.new">
-<pre class="sig">function Rect.new(width: number, height: number): <a href="class.geometry.Rect.html">geometry.Rect</a></pre>
-<h3>Parameters</h3>
-<dl class="params">
-<dt>width: number</dt>
-<dd></dd>
-<dt>height: number</dt>
-<dd></dd>
-</dl>
-<h3>Returns</h3>
-<dl class="params">
-<dt><a href="class.geometry.Rect.html">geometry.Rect</a></dt>
-<dd></dd>
-</dl>
-</div>
+<h2>Implementors</h2>
+<ul class="item-list">
+<li><a href="class.geometry.Circle.html">geometry.Circle</a></li>
+<li><a href="class.geometry.Drawable.html">geometry.Drawable</a></li>
+<li><a href="class.geometry.Rect.html">geometry.Rect</a></li>
+</ul>
 </main>
 </body>
 </html>

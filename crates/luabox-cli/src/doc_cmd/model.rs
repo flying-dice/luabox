@@ -12,7 +12,7 @@
 //! the LSP hover uses); cross-linking happens later in the renderer via one
 //! global name table, so the model stays plain data.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use luabox_syntax::lua::ast::{self, AstNode};
 use luabox_syntax::lua::{self, SyntaxKind, SyntaxNode};
@@ -903,6 +903,45 @@ pub fn inherited_fields<'a>(
     out
 }
 
+/// The reverse of [`ClassDoc::parents`] (issue #87): every class's declared
+/// parent gains that class back as a subclass/implementor, computed once
+/// after every module is harvested (so a parent declared in one module and
+/// extended in another still sees the edge). Names, not [`ClassDoc`]
+/// references — the renderer already has one global name table (`Links`)
+/// to turn a name into a link, and a name is all a parent page needs to
+/// list a child that may live in a different module.
+pub fn implementors(model: &DocModel) -> BTreeMap<String, Vec<String>> {
+    let mut map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for module in &model.modules {
+        for class in &module.classes {
+            for parent in &class.parents {
+                map.entry(parent.clone())
+                    .or_default()
+                    .insert(class.name.clone());
+            }
+        }
+    }
+    map.into_iter()
+        .map(|(parent, children)| (parent, children.into_iter().collect()))
+        .collect()
+}
+
+/// Whether `class`'s page should head its reverse listing "Implementors"
+/// (LuaCATS has no interface-vs-class split, so this is a heuristic, not a
+/// declared fact): every one of its `@field`s is function-typed and there is
+/// at least one, i.e. it reads like a method-only interface
+/// (`---@field area fun(self): number`, SHAPES.md's old "Shape" idiom).
+/// Anything else — including a class with no fields at all — gets the more
+/// neutral "Subclasses", matching rustdoc's trait-vs-struct split without
+/// having to fake a distinction LuaCATS doesn't carry.
+pub fn is_interface(class: &ClassDoc) -> bool {
+    !class.fields.is_empty()
+        && class
+            .fields
+            .iter()
+            .all(|f| f.ty.trim_start().starts_with("fun("))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1091,5 +1130,47 @@ mod tests {
         assert_eq!(inherited[0].1[0].name, "label");
         assert_eq!(inherited[1].0, "Base");
         assert_eq!(inherited[1].1[0].name, "id");
+    }
+
+    #[test]
+    fn implementors_collects_children_by_parent_name() {
+        let m = module(
+            "---@class Shape\nlocal Shape = {}\n\
+             \n\
+             ---@class Circle: Shape\nlocal Circle = {}\n\
+             \n\
+             ---@class Rect: Shape\nlocal Rect = {}\n\
+             \n\
+             ---@class Lonely\nlocal Lonely = {}\n",
+        );
+        let model = DocModel {
+            package: "p".to_string(),
+            modules: vec![m],
+            shape_modules: Vec::new(),
+        };
+        let map = implementors(&model);
+        assert_eq!(
+            map.get("Shape"),
+            Some(&vec!["Circle".to_string(), "Rect".to_string()])
+        );
+        assert!(!map.contains_key("Lonely"));
+        assert!(!map.contains_key("Circle"));
+    }
+
+    #[test]
+    fn is_interface_true_only_for_all_function_typed_fields() {
+        let m = module(
+            "---@class Shape\n---@field area fun(self): number\n---@field perimeter fun(self): number\nlocal Shape = {}\n\
+             \n\
+             ---@class Base\n---@field id integer\nlocal Base = {}\n\
+             \n\
+             ---@class Empty\nlocal Empty = {}\n\
+             \n\
+             ---@class Mixed\n---@field id integer\n---@field area fun(self): number\nlocal Mixed = {}\n",
+        );
+        assert!(is_interface(&m.classes[0]));
+        assert!(!is_interface(&m.classes[1]));
+        assert!(!is_interface(&m.classes[2]));
+        assert!(!is_interface(&m.classes[3]));
     }
 }
