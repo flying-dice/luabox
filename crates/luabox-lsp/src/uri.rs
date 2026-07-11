@@ -124,7 +124,14 @@ mod tests {
 
     #[test]
     fn windows_path_roundtrips() {
-        let path = PathBuf::from(r"C:\Users\dev\proj\main.lua");
+        // A backslash spelling only denotes a Windows path on Windows; on
+        // Unix it is a single filename, so drive the same roundtrip with
+        // the forward-slash spelling there.
+        let path = if cfg!(windows) {
+            PathBuf::from(r"C:\Users\dev\proj\main.lua")
+        } else {
+            PathBuf::from("C:/Users/dev/proj/main.lua")
+        };
         let uri = path_to_uri(&path);
         assert_eq!(uri.as_str(), "file:///C:/Users/dev/proj/main.lua");
         assert_eq!(uri_to_path(&uri).unwrap(), path);

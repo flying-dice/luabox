@@ -1,6 +1,6 @@
 //! Integration tests for the runner, driven two ways:
 //!
-//!   * a **fake runtime** — a `.bat` shim that just echoes each test file's
+//!   * a **fake runtime** — a `.bat`/`sh` shim that just echoes each test file's
 //!     contents (which we author as raw protocol) and exits nonzero when it
 //!     sees a FAIL line. This proves discovery/aggregation/exit-code/
 //!     parallel handling **hermetically**, with no Lua required.
@@ -18,24 +18,44 @@ use luabox_test::run_suite;
 use luabox_test::runner::{RuntimeReport, SuiteOptions};
 use luabox_test::runtime::{RuntimeSpec, find_on_path};
 
-/// Write a `.bat` fake runtime into `dir` and return a `RuntimeSpec` for it.
-/// The runner appends `<harness> <testfile>`; the bat ignores the harness
-/// (`%1`), echoes the test file (`%2`, already containing protocol lines),
-/// and exits 1 if that file contains a FAIL line.
+/// Write a fake runtime shim into `dir` and return a `RuntimeSpec` for it —
+/// a `.bat` on Windows, a `#!/bin/sh` script elsewhere. The runner appends
+/// `<harness> <testfile>`; the shim ignores the harness (arg 1), echoes the
+/// test file (arg 2, already containing protocol lines), and exits 1 if that
+/// file contains a FAIL line.
 fn fake_runtime(dir: &Path) -> RuntimeSpec {
-    let bat = dir.join("fake_runtime.bat");
-    let script = "@echo off\r\n\
-        type \"%~2\"\r\n\
-        findstr /C:\"LUABOX_TEST_FAIL\" \"%~2\" >nul\r\n\
-        if not errorlevel 1 exit /b 1\r\n\
-        exit /b 0\r\n";
-    std::fs::write(&bat, script).unwrap();
+    let shim = if cfg!(windows) {
+        let bat = dir.join("fake_runtime.bat");
+        let script = "@echo off\r\n\
+            type \"%~2\"\r\n\
+            findstr /C:\"LUABOX_TEST_FAIL\" \"%~2\" >nul\r\n\
+            if not errorlevel 1 exit /b 1\r\n\
+            exit /b 0\r\n";
+        std::fs::write(&bat, script).unwrap();
+        bat
+    } else {
+        let sh = dir.join("fake_runtime.sh");
+        let script =
+            "#!/bin/sh\ncat \"$2\"\nif grep -q LUABOX_TEST_FAIL \"$2\"; then exit 1; fi\nexit 0\n";
+        std::fs::write(&sh, script).unwrap();
+        make_executable(&sh);
+        sh
+    };
     RuntimeSpec {
         label: "fake".to_string(),
-        program: bat.to_string_lossy().into_owned(),
+        program: shim.to_string_lossy().into_owned(),
         args: Vec::new(),
     }
 }
+
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) {}
 
 /// A protocol test file with a single passing case.
 fn passing_file(name: &str) -> String {

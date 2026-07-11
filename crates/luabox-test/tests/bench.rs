@@ -1,7 +1,7 @@
 //! Integration tests for the bench runner, driven two ways (mirrors
 //! `tests/runner.rs`):
 //!
-//!   * a **fake runtime** — a `.bat` shim that echoes each bench file's
+//!   * a **fake runtime** — a `.bat`/`sh` shim that echoes each bench file's
 //!     contents (authored as raw `LUABOX_BENCH_*` protocol) and always
 //!     exits 0. Proves discovery/aggregation/stats **hermetically**, with
 //!     no Lua required.
@@ -14,20 +14,37 @@ use std::path::{Path, PathBuf};
 use luabox_test::bench::{FileOutcome, RuntimeReport, SuiteOptions, discover, render, run_suite};
 use luabox_test::runtime::{RuntimeSpec, find_on_path};
 
-/// Write a `.bat` fake runtime into `dir` and return a `RuntimeSpec` for
-/// it. The runner appends `<harness> <benchfile>`; the bat ignores the
-/// harness (`%1`), echoes the bench file (`%2`, already containing
-/// protocol lines) and always exits 0 — benches never fail the build.
+/// Write a fake runtime shim into `dir` and return a `RuntimeSpec` for it —
+/// a `.bat` on Windows, a `#!/bin/sh` script elsewhere. The runner appends
+/// `<harness> <benchfile>`; the shim ignores the harness (arg 1), echoes the
+/// bench file (arg 2, already containing protocol lines) and always exits
+/// 0 — benches never fail the build.
 fn fake_runtime(dir: &Path) -> RuntimeSpec {
-    let bat = dir.join("fake_bench_runtime.bat");
-    let script = "@echo off\r\ntype \"%~2\"\r\nexit /b 0\r\n";
-    std::fs::write(&bat, script).unwrap();
+    let shim = if cfg!(windows) {
+        let bat = dir.join("fake_bench_runtime.bat");
+        std::fs::write(&bat, "@echo off\r\ntype \"%~2\"\r\nexit /b 0\r\n").unwrap();
+        bat
+    } else {
+        let sh = dir.join("fake_bench_runtime.sh");
+        std::fs::write(&sh, "#!/bin/sh\ncat \"$2\"\nexit 0\n").unwrap();
+        make_executable(&sh);
+        sh
+    };
     RuntimeSpec {
         label: "fake".to_string(),
-        program: bat.to_string_lossy().into_owned(),
+        program: shim.to_string_lossy().into_owned(),
         args: Vec::new(),
     }
 }
+
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) {}
 
 /// A protocol bench file with one bench reporting the given ns/iter
 /// samples.
