@@ -13,8 +13,8 @@ use luabox_syntax::luacats::{
     self, AliasTag, CastKind, FieldKey, ParamTag, ReturnTag, Tag, TypeExprKind,
 };
 
-use crate::lower::{Declared, Lowerer};
-use crate::ty::{FieldTy, FunctionTy, ParamTy, TableTy, Ty};
+use crate::lower::{Declared, GenericClass, Lowerer};
+use crate::ty::{FieldTy, FunctionTy, ParamTy, TableTy, Ty, TypeParam};
 
 /// A statement's byte range, used to key annotations to their target.
 pub(crate) type Target = (usize, usize);
@@ -26,6 +26,10 @@ pub(crate) struct ClassDef {
     pub parents: Vec<String>,
     pub fields: BTreeMap<String, FieldTy>,
     pub indexers: Vec<(Ty, Ty)>,
+    /// Generic type-parameter names from `---@class Name<T>` — empty for a
+    /// plain class. A reference `Name<arg>` monomorphises the class shape by
+    /// substituting these (#84).
+    pub params: Vec<String>,
 }
 
 /// A declared `---@enum`: member name → value type, plus the union of all
@@ -119,6 +123,7 @@ impl TypeEnv {
     /// [`crate::defs::Ambient`]) merged *beneath* the file's own
     /// declarations: its classes/enums/functions/globals seed the
     /// environment first, so a same-named file declaration shadows them.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn build_from_items(
         parse: &lua::Parse,
         items: &[luacats::AnnotatedItem],
@@ -185,18 +190,13 @@ impl TypeEnv {
         }
         let mut lowerer = Lowerer::new(&decl);
         lowerer.shape_scope = shapes;
+        // Build generic `---@class Name<T>` templates before the main pass so
+        // references (`Name<number>`) resolve regardless of declaration order,
+        // and ambient generic classes are reachable too (#84).
+        lowerer.generic_classes = collect_generic_classes(items, ambient, &mut lowerer);
         let root = parse.syntax();
         for item in items {
-            lowerer.generics = item
-                .block
-                .tags
-                .iter()
-                .filter_map(|tag| match tag {
-                    Tag::Generic(g) => Some(g.params.iter().map(|p| p.name.clone())),
-                    _ => None,
-                })
-                .flatten()
-                .collect();
+            lowerer.generics = block_generics(item);
             env.absorb_block(item, &mut lowerer, &root);
         }
         // SHAPES-V2 `self` typing: tie each shape-typed constructor's carrier
@@ -267,16 +267,7 @@ impl TypeEnv {
             let mut file_env = TypeEnv::default();
             let mut lowerer = Lowerer::new(&decl);
             for item in items {
-                lowerer.generics = item
-                    .block
-                    .tags
-                    .iter()
-                    .filter_map(|tag| match tag {
-                        Tag::Generic(g) => Some(g.params.iter().map(|p| p.name.clone())),
-                        _ => None,
-                    })
-                    .flatten()
-                    .collect();
+                lowerer.generics = block_generics(item);
                 file_env.absorb_block(item, &mut lowerer, &root);
             }
             file_env.collect_global_types(&root);
@@ -324,6 +315,7 @@ impl TypeEnv {
 
     /// Process one annotation block: class/field members, function
     /// signatures, `---@type` locals, and enums.
+    #[allow(clippy::too_many_lines)]
     fn absorb_block(
         &mut self,
         item: &luacats::AnnotatedItem,
@@ -337,6 +329,7 @@ impl TypeEnv {
         let mut type_span: Option<std::ops::Range<usize>> = None;
         let mut overloads: Vec<FunctionTy> = Vec::new();
         let mut casts: Vec<CastEntry> = Vec::new();
+        let mut fn_generics: Vec<TypeParam> = Vec::new();
 
         for tag in &item.block.tags {
             match tag {
@@ -361,6 +354,7 @@ impl TypeEnv {
                         c.name.clone(),
                         ClassDef {
                             parents,
+                            params: c.params.clone(),
                             ..ClassDef::default()
                         },
                     );
@@ -414,6 +408,14 @@ impl TypeEnv {
                     }
                 }
                 Tag::Cast(c) if !c.var.is_empty() => casts.push(lower_cast(c, lowerer)),
+                Tag::Generic(g) => {
+                    for p in &g.params {
+                        fn_generics.push(TypeParam {
+                            name: p.name.clone(),
+                            constraint: p.constraint.as_ref().map(|c| lowerer.lower(c)),
+                        });
+                    }
+                }
                 _ => {}
             }
         }
@@ -427,7 +429,12 @@ impl TypeEnv {
         if (!params.is_empty() || !returns.is_empty() || !overloads.is_empty())
             && let Some(target) = target
         {
-            self.attach_function(&params, &returns, overloads, target, lowerer, root);
+            let func = FunctionTy {
+                overloads,
+                generics: fn_generics,
+                ..FunctionTy::default()
+            };
+            self.attach_function(&params, &returns, func, target, lowerer, root);
         }
         if let (Some(types), Some(target)) = (types, target) {
             self.typed_locals.insert(target, types);
@@ -445,15 +452,11 @@ impl TypeEnv {
         &mut self,
         params: &[&ParamTag],
         returns: &[&ReturnTag],
-        overloads: Vec<FunctionTy>,
+        mut func: FunctionTy,
         target: Target,
         lowerer: &mut Lowerer<'_>,
         root: &SyntaxNode,
     ) {
-        let mut func = FunctionTy {
-            overloads,
-            ..FunctionTy::default()
-        };
         // Lower every tag up front (unknown type names must be reported even
         // for tags that end up unbound); non-vararg tags are *reconciled by
         // name* against the AST parameter list below.
@@ -755,6 +758,112 @@ impl TypeEnv {
         candidates.truncate(3);
         candidates
     }
+}
+
+/// The generic type-variable names in scope for one annotation block:
+/// `---@generic T` parameters plus any `---@class Name<T>`'s own `<T>`
+/// params. Both lower to `Ty::Named` placeholders rather than tripping
+/// LB0305 (#84).
+fn block_generics(item: &luacats::AnnotatedItem) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for tag in &item.block.tags {
+        match tag {
+            Tag::Generic(g) => names.extend(g.params.iter().map(|p| p.name.clone())),
+            Tag::Class(c) => names.extend(c.params.iter().cloned()),
+            _ => {}
+        }
+    }
+    names
+}
+
+/// Build the generic `---@class Name<T>` templates the lowerer instantiates at
+/// reference sites: file-declared classes (their `---@field` bodies lowered
+/// with the params in scope) and ambient generic classes (already lowered with
+/// placeholders in the definition package). Parent fields are not folded into
+/// the template — field-level substitution through the class's own declared
+/// fields is the bar (#84); inherited generic fields are deliberately shallow.
+fn collect_generic_classes(
+    items: &[luacats::AnnotatedItem],
+    ambient: Option<&crate::defs::Ambient>,
+    lowerer: &mut Lowerer<'_>,
+) -> BTreeMap<String, GenericClass> {
+    let mut out: BTreeMap<String, GenericClass> = BTreeMap::new();
+    if let Some(ambient) = ambient {
+        for (name, def) in &ambient.env.classes {
+            if def.params.is_empty() {
+                continue;
+            }
+            out.insert(
+                name.clone(),
+                GenericClass {
+                    params: def.params.clone(),
+                    template: TableTy {
+                        fields: def.fields.clone(),
+                        indexers: def.indexers.clone(),
+                        ..TableTy::default()
+                    },
+                },
+            );
+        }
+    }
+    for item in items {
+        for tag in &item.block.tags {
+            let Tag::Class(c) = tag else { continue };
+            if c.params.is_empty() || c.name.is_empty() {
+                continue;
+            }
+            let template = lower_class_template(&item.block.tags, &c.name, &c.params, lowerer);
+            out.insert(
+                c.name.clone(),
+                GenericClass {
+                    params: c.params.clone(),
+                    template,
+                },
+            );
+        }
+    }
+    out
+}
+
+/// Lower one generic class's own `---@field`s into a template table, with its
+/// `<T>` params in scope so each `T` becomes a `Ty::Named(T)` placeholder.
+/// Fields between the class's tag and the next `---@class` in the block belong
+/// to it (mirrors [`TypeEnv::absorb_block`]'s `current_class` tracking).
+fn lower_class_template(
+    tags: &[Tag],
+    class_name: &str,
+    params: &[String],
+    lowerer: &mut Lowerer<'_>,
+) -> TableTy {
+    let saved = std::mem::replace(&mut lowerer.generics, params.iter().cloned().collect());
+    let mut table = TableTy::default();
+    let mut active = false;
+    for tag in tags {
+        match tag {
+            Tag::Class(c) => active = c.name == class_name,
+            Tag::Field(f) if active => {
+                let ty = lowerer.lower(&f.ty);
+                match &f.key {
+                    FieldKey::Name(name) => {
+                        table.fields.insert(
+                            name.clone(),
+                            FieldTy {
+                                ty,
+                                optional: f.optional,
+                            },
+                        );
+                    }
+                    FieldKey::Indexer(key) => {
+                        let key = lowerer.lower(key);
+                        table.indexers.push((key, ty));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    lowerer.generics = saved;
+    table
 }
 
 /// Lower one `---@cast` tag's operation list.

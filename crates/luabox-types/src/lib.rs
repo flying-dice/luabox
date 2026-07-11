@@ -26,6 +26,7 @@ mod assign;
 mod check;
 mod defs;
 mod env;
+mod generics;
 mod infer;
 mod lower;
 pub mod shape;

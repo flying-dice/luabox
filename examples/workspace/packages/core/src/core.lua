@@ -20,12 +20,15 @@ end
 
 ---Return the first element of `list`, or `default` if it is empty.
 ---
----NOTE (gap): `---@generic` function type parameters are broken today — `T`
----does not flow through to the return type the way it should. `first_or`'s
----result actually types as `unknown`, not `T`, so a caller that pins the
----result to a concrete `---@type` gets a real (if confusing) type error —
----see ../../../geometry/README.md for the exact `luabox check` messages
----this produces, verified against the real binary.
+---This is a REAL `---@generic` function (#84): wherever its signature is in
+---scope, `T` is inferred from the argument types at the call site and flows
+---through to the return type — `first_or({ 1, 2 }, 0)` types as `number`,
+---`first_or(names, "?")` as `string`. Pin the result to a concrete `---@type`
+---and it checks. This matches lua-language-server's `---@generic` semantics
+---(ecosystem parity, verified against the real binary — see
+---../../../geometry/README.md). (Cross-*package* signature sharing is a
+---separate epic (#108); across packages the result is still `unknown` until
+---that lands. Generic inference itself is done.)
 ---@generic T
 ---@param list T[]
 ---@param default T

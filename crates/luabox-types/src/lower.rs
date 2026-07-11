@@ -3,9 +3,11 @@
 //!
 //! Aliases are expanded here (with a cycle guard: a self-referential alias
 //! collapses to `unknown`); classes and enums stay as [`Ty::Named`]
-//! references resolved through the environment. Generic parameters in scope
-//! (`---@generic T`) lower to `unknown` — TODO(P1): real type variables
-//! with constraint solving.
+//! references resolved through the environment. Generic type variables in
+//! scope (`---@generic T` and a generic class's own `<T>` params) lower to
+//! `Ty::Named(T)` placeholders that the monomorphisation engine
+//! ([`crate::generics`]) substitutes; a generic `---@class Name<T>` reference
+//! (`Name<number>`) lowers directly to the substituted table (#84).
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -13,6 +15,7 @@ use luabox_syntax::luacats::{
     AliasTag, FunParam, FunReturn, Span, TableField, TypeExpr, TypeExprKind,
 };
 
+use crate::generics::subst_ty;
 use crate::ty::{FieldTy, FunctionTy, ParamTy, TableTy, Ty};
 
 /// The type names a file declares, collected before lowering so forward
@@ -22,6 +25,18 @@ pub(crate) struct Declared {
     pub classes: BTreeSet<String>,
     pub enums: BTreeSet<String>,
     pub aliases: BTreeMap<String, AliasTag>,
+}
+
+/// A generic `---@class Name<T>`'s template: its parameter names and the
+/// lowered shape of its own `---@field`s, with each `T` kept as a
+/// `Ty::Named(T)` placeholder. A reference `Name<number>` instantiates this
+/// by substituting the type arguments (`#84`, design (a): the reference
+/// lowers directly to the substituted `Ty::Table`, mirroring `.luab`
+/// templates — `Ty::Named` stays a bare string).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GenericClass {
+    pub params: Vec<String>,
+    pub template: TableTy,
 }
 
 /// Lowers [`TypeExpr`]s against a set of declared names, recording every
@@ -34,8 +49,13 @@ pub(crate) struct Lowerer<'a> {
     decl: &'a Declared,
     /// The ambient `.luab` package scope, when the project has one.
     pub shape_scope: Option<&'a crate::shape::ShapeScope>,
-    /// Generic parameter names currently in scope (lower to `unknown`).
+    /// Generic parameter names currently in scope (`---@generic T` and a
+    /// generic class's own `<T>` params). These lower to `Ty::Named(name)`
+    /// placeholders that substitution later replaces — never LB0305.
     pub generics: HashSet<String>,
+    /// Generic `---@class Name<T>` templates, by name — built before the main
+    /// lowering pass so references resolve regardless of declaration order.
+    pub generic_classes: BTreeMap<String, GenericClass>,
     /// Alias-expansion stack (cycle guard).
     stack: Vec<String>,
     /// `(name, span)` of every reference to an undeclared type name.
@@ -52,6 +72,7 @@ impl<'a> Lowerer<'a> {
             decl,
             shape_scope: None,
             generics: HashSet::new(),
+            generic_classes: BTreeMap::new(),
             stack: Vec::new(),
             unknown_names: Vec::new(),
             shape_ref_errors: Vec::new(),
@@ -82,15 +103,27 @@ impl<'a> Lowerer<'a> {
             TypeExprKind::NumberLit(text) => Ty::NumberLit(text.clone()),
             TypeExprKind::BoolLit(value) => Ty::BoolLit(*value),
             TypeExprKind::Paren(inner) => self.lower(inner),
-            // A backtick capture is a generic marker — TODO(P1); a
-            // malformed type already carries a LuaCATS parse error.
-            TypeExprKind::Backtick(_) | TypeExprKind::Error => Ty::Unknown,
+            // A backtick capture (`` `T` ``) in a generic function's `---@param`
+            // captures the type *named by* the argument. In scope it lowers to
+            // a distinguished `Ty::Named("`T`")` placeholder that call-site
+            // inference recognises (#84); out of scope it is inert `unknown`.
+            TypeExprKind::Backtick(name) => {
+                if self.generics.contains(name) {
+                    Ty::Named(format!("`{name}`"))
+                } else {
+                    Ty::Unknown
+                }
+            }
+            // A malformed type already carries a LuaCATS parse error.
+            TypeExprKind::Error => Ty::Unknown,
         }
     }
 
     fn lower_named(&mut self, name: &str, args: &[TypeExpr], span: Span) -> Ty {
         if self.generics.contains(name) {
-            return Ty::Unknown; // TODO(P1): generic type variables
+            // A type variable in scope: keep it as a placeholder the
+            // substitution engine resolves (never LB0305).
+            return Ty::Named(name.to_string());
         }
         if let Some(ty) = self.lower_builtin(name, args) {
             return ty;
@@ -99,7 +132,21 @@ impl<'a> Lowerer<'a> {
             return self.expand_alias(name);
         }
         if self.decl.classes.contains(name) || self.decl.enums.contains(name) {
-            // TODO(P1): generic classes — `args` are ignored for now.
+            // A generic `---@class Name<T>`: monomorphise the template at the
+            // reference site (#84). A bare reference (no args) is lenient —
+            // missing arguments become `unknown`, matching luals.
+            if let Some(gc) = self.generic_classes.get(name) {
+                let gc = gc.clone();
+                let arg_tys: Vec<Ty> = args.iter().map(|a| self.lower(a)).collect();
+                let mut map = BTreeMap::new();
+                for (i, param) in gc.params.iter().enumerate() {
+                    map.insert(
+                        param.clone(),
+                        arg_tys.get(i).cloned().unwrap_or(Ty::Unknown),
+                    );
+                }
+                return subst_ty(&Ty::Table(Box::new(gc.template.clone())), &map);
+            }
             return Ty::Named(name.to_string());
         }
         if let Some(scope) = self.shape_scope
@@ -366,13 +413,15 @@ mod tests {
     }
 
     #[test]
-    fn generic_param_lowers_to_unknown_without_lb0305() {
+    fn generic_param_lowers_to_placeholder_without_lb0305() {
         let decl = Declared::default();
         let mut lowerer = Lowerer::new(&decl);
         lowerer.generics.insert("T".to_string());
         let mut parser = TypeParser::new("T", 0);
         let expr = parser.parse_type();
-        assert_eq!(lowerer.lower(&expr), Ty::Unknown);
+        // A type variable in scope stays a `Ty::Named` placeholder (which the
+        // substitution engine resolves) — and never trips LB0305.
+        assert_eq!(lowerer.lower(&expr), Ty::Named("T".to_string()));
         assert!(lowerer.unknown_names.is_empty());
     }
 

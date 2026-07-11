@@ -58,35 +58,19 @@
 ---@field width number
 ---@field height number
 
--- A homogeneous pair — the `.luab` original had a real generic `Pair<T>`.
--- Under LuaCATS, generic `---@class<T>` is BROKEN today. In an ordinary
--- checked `.lua` file, the moment a `---@field` references the type
--- parameter, luabox reports it as an unresolved type name:
---
---   ---@class Box<T>
---   ---@field value T
---                   ^ error[LB0305]: unknown type name `T` in annotation
---
--- (verified against the real binary — see the mission report). Left
--- commented here so the project stays green; uncomment to reproduce in a
--- regular src/*.lua file. Note the sharper, quieter finding: writing the
--- SAME declaration in a `---@meta` defs file *as this one* does NOT raise
--- that diagnostic at all — ambient/defs content isn't self-validated for
--- unknown type names the way an ordinary checked file is. But the gap does
--- not go away: a field typed by the unresolved parameter still silently
--- becomes `unknown` wherever it's read downstream (e.g. annotate a literal
--- `---@type geometry.Pair<number>` and read `.first` back — it types as
--- `unknown`, not `number`). So a generic declared here would fail *more*
--- quietly than one declared in your own code: no error, just a silently
--- broken field type. Generics land with the .luab drop epic (#84 etc.);
--- until then, write one non-generic class per concrete pairing:
---
--- ---@class Box<T>
--- ---@field value T
-
----@class geometry.Pair
----@field first number
----@field second number
+-- A homogeneous pair — a REAL generic `---@class<T>` (#84). Both fields are
+-- typed by the parameter `T`, and a reference substitutes it per use site:
+-- `---@type geometry.Pair<number>` gives `first`/`second` the type `number`,
+-- `geometry.Pair<string>` gives them `string`, and nesting works
+-- (`geometry.Pair<geometry.Pair<number>>`). See ../src/shapes_data.lua for a
+-- typed instance and ../README.md for the exact `luabox check` error a misuse
+-- produces, verified against the real binary. (This matches
+-- lua-language-server's generic-class semantics — ecosystem parity, not a
+-- luabox extension. A bare `geometry.Pair` with no type arguments stays
+-- lenient, exactly as luals treats it.)
+---@class geometry.Pair<T>
+---@field first T
+---@field second T
 
 --- The unit a coordinate or label is expressed in — a closed string-literal
 --- union. `---@alias` IS enforced: passing anything outside the union at an

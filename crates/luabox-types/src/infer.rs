@@ -653,6 +653,7 @@ impl Infer<'_> {
             // checker (seed_params off) keeps the conservative `false`.
             has_return_annotation: returns_set && self.seed_params,
             overloads: Vec::new(),
+            generics: Vec::new(),
         }
     }
 
@@ -2147,7 +2148,32 @@ impl Infer<'_> {
                 }
             }
         }
+        // A generic function (`---@generic T`): infer the type variables from
+        // the argument types and substitute into the returns, so an
+        // unannotated binding of the call result gets the flowed type (#84 —
+        // `local n = id(5)` types `n` as `integer`).
+        if let Some(sig) = self.generic_sig_of(&callee_ity) {
+            let reified: Vec<Ty> = arg_itys.iter().map(|a| self.reify(a)).collect();
+            let map = crate::generics::infer_call(&sig, &reified);
+            let sig = crate::generics::subst_function(&sig, &map);
+            return (
+                sig.returns.iter().cloned().map(ITy::Ty).collect(),
+                sig.returns_vararg,
+            );
+        }
         self.returns_of(&callee_ity)
+    }
+
+    /// The annotated signature of a generic callee (`---@generic` with a
+    /// `---@return`), for call-site monomorphisation. `None` for non-generic
+    /// or unannotated callees (they follow the ordinary [`Self::returns_of`]).
+    fn generic_sig_of(&self, callee: &ITy) -> Option<FunctionTy> {
+        let sig = match callee {
+            ITy::Ty(Ty::Function(sig)) => Some((**sig).clone()),
+            ITy::Func(body) => self.funcs.get(body).and_then(|d| d.sig.clone()),
+            _ => None,
+        }?;
+        (!sig.generics.is_empty() && sig.has_return_annotation).then_some(sig)
     }
 
     /// The terminal name of a callee expression: `f` for a plain name,

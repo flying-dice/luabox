@@ -117,7 +117,7 @@ impl ShapeScope {
         for (i, param) in shape.params.iter().enumerate() {
             map.insert(param.clone(), args.get(i).cloned().unwrap_or(Ty::Unknown));
         }
-        Some(subst_ty(&shape.ty, &map))
+        Some(crate::generics::subst_ty(&shape.ty, &map))
     }
 
     /// Deep-expand [`Ty::Named`] scope references into structural types —
@@ -181,39 +181,6 @@ impl ShapeScope {
             _ => ty.clone(),
         }
     }
-}
-
-/// Substitute `Ty::Named(param)` placeholders throughout a type.
-pub(crate) fn subst_ty(ty: &Ty, map: &BTreeMap<String, Ty>) -> Ty {
-    match ty {
-        Ty::Named(name) => map.get(name).cloned().unwrap_or_else(|| ty.clone()),
-        Ty::Union(members) => Ty::union(members.iter().map(|m| subst_ty(m, map)).collect()),
-        Ty::Table(table) => Ty::Table(Box::new(subst_table(table, map))),
-        Ty::Function(func) => {
-            let mut func = (**func).clone();
-            for param in &mut func.params {
-                param.ty = subst_ty(&param.ty, map);
-            }
-            func.varargs = func.varargs.as_ref().map(|v| subst_ty(v, map));
-            func.returns = func.returns.iter().map(|r| subst_ty(r, map)).collect();
-            Ty::Function(Box::new(func))
-        }
-        _ => ty.clone(),
-    }
-}
-
-fn subst_table(table: &TableTy, map: &BTreeMap<String, Ty>) -> TableTy {
-    let mut out = table.clone();
-    for field in out.fields.values_mut() {
-        field.ty = subst_ty(&field.ty, map);
-    }
-    out.indexers = out
-        .indexers
-        .iter()
-        .map(|(k, v)| (subst_ty(k, map), subst_ty(v, map)))
-        .collect();
-    out.array = out.array.as_ref().map(|a| subst_ty(a, map));
-    out
 }
 
 /// Build the ambient package scope: `modules` are the package's own shape
@@ -739,7 +706,7 @@ impl LowerCtx<'_> {
                 lowered_args.get(i).cloned().unwrap_or(Ty::Unknown),
             );
         }
-        subst_ty(&template, &map)
+        crate::generics::subst_ty(&template, &map)
     }
 }
 

@@ -41,15 +41,21 @@ cd packages/core     && luabox test
 cd packages/cli-tool && luabox run start   # prints "2 + 3 = 5"
 ```
 
-## A generic-attempt, for completeness
+## A real `---@generic` function
 
-`core.first_or` carries a `---@generic T` annotation — included so the
-example set has at least one real `---@generic` **function** (distinct from
-`../geometry`'s generic **class** attempt). It's a live demonstration of the
-same underlying gap: `T` doesn't actually flow through to the return type
-(it lowers to `unknown`), so nothing here relies on it for real type safety.
-See `../geometry/README.md` for the exact `luabox check` error text this
-produces once you try to pin the result to a concrete type.
+`core.first_or` carries a `---@generic T` annotation — the example set's
+`---@generic` **function** (distinct from `../geometry`'s generic **class**).
+It now works (#84): `T` is inferred from the argument types at each call site
+and flows through to the return type, so `first_or({ 1, 2 }, 0)` types as
+`number` and `first_or(names, "?")` as `string`. Within any file that can see
+its signature, pinning the result to a concrete `---@type` checks, and a
+`default` whose type disagrees with the list element is a real `luabox check`
+error. Matched to lua-language-server's semantics — see
+`../geometry/README.md` for the full generics writeup and error text.
+
+(Cross-*package* signature sharing is a separate epic (#108): a generic
+called from another package still resolves to `unknown` until that lands.
+Generic inference itself is complete.)
 
 ## Why a workspace
 

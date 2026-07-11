@@ -78,6 +78,20 @@ pub struct TableTy {
     pub sealed: bool,
 }
 
+/// One `---@generic T[: Constraint]` type parameter of a [`FunctionTy`].
+///
+/// The name is a placeholder captured as [`Ty::Named`] in the signature's
+/// parameter and return types; call-site inference binds it and substitutes
+/// (see [`crate::generics`]). `constraint`, when present, is checked against
+/// the inferred binding (luals's bounded generics).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeParam {
+    /// The type-variable name (`T`).
+    pub name: String,
+    /// An optional `: Constraint` bound the inferred binding must satisfy.
+    pub constraint: Option<Ty>,
+}
+
 /// One parameter of a [`FunctionTy`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamTy {
@@ -109,6 +123,10 @@ pub struct FunctionTy {
     /// primary governs the inferred result type (TODO(P1): pick the
     /// matching overload's return).
     pub overloads: Vec<FunctionTy>,
+    /// `---@generic T[: C]` type parameters. When non-empty the `params` and
+    /// `returns` carry `Ty::Named(param)` placeholders that call-site
+    /// inference binds and substitutes ([`crate::generics::infer_call`]).
+    pub generics: Vec<TypeParam>,
 }
 
 impl FunctionTy {
@@ -242,6 +260,7 @@ impl Ty {
                 returns_vararg: func.returns_vararg,
                 has_return_annotation: func.has_return_annotation,
                 overloads: func.overloads.clone(),
+                generics: func.generics.clone(),
             })),
             other => other.clone(),
         }

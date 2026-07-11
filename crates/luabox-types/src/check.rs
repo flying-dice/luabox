@@ -780,7 +780,14 @@ impl Checker<'_> {
                 }
                 let sig = call.callee().and_then(|c| self.callee_sig(&c));
                 match sig {
-                    Some(sig) if sig.has_return_annotation => {
+                    Some(mut sig) if sig.has_return_annotation => {
+                        // Monomorphise a generic call so its result reflects
+                        // the inferred type arguments (#84).
+                        if !sig.generics.is_empty() {
+                            let arg_tys = self.call_arg_tys(call);
+                            let map = crate::generics::infer_call(&sig, &arg_tys);
+                            sig = crate::generics::subst_function(&sig, &map);
+                        }
                         sig.returns.first().cloned().unwrap_or(Ty::Nil)
                     }
                     _ => Ty::Unknown,
@@ -912,6 +919,57 @@ impl Checker<'_> {
         }
     }
 
+    /// The type of one supplied call slot (annotation/inference derived).
+    fn slot_ty(&self, slot: &Slot) -> Ty {
+        match slot {
+            Slot::Expr(expr) => self.expr_ty(expr),
+            Slot::Ty(ty, _) => ty.clone(),
+        }
+    }
+
+    /// The positional argument types of a call — for generic inference on a
+    /// call used as a value (nested/argument position).
+    fn call_arg_tys(&self, call: &CallExpr) -> Vec<Ty> {
+        let (slots, string_arg) = call_slots(call);
+        let mut tys: Vec<Ty> = slots.iter().map(|s| self.slot_ty(s)).collect();
+        if let Some((ty, _)) = string_arg {
+            tys.push(ty);
+        }
+        tys
+    }
+
+    /// Verify each `---@generic T : Constraint` bound against T's inferred
+    /// binding (luals bounded generics). A violation reports the standard
+    /// argument type-mismatch (LB0300) at the first argument that fixes T.
+    fn check_generic_constraints(
+        &mut self,
+        sig: &FunctionTy,
+        map: &std::collections::BTreeMap<String, Ty>,
+        slots: &[Slot],
+    ) {
+        for g in &sig.generics {
+            let (Some(constraint), Some(bound)) = (&g.constraint, map.get(&g.name)) else {
+                continue;
+            };
+            if self.assignable(bound, constraint) {
+                continue;
+            }
+            let Some(i) = sig.params.iter().position(|p| ty_mentions(&p.ty, &g.name)) else {
+                continue;
+            };
+            let Some(slot) = slots.get(i) else { continue };
+            self.report(
+                TYPE_MISMATCH,
+                slot_range(slot),
+                format!(
+                    "type mismatch: type argument `{}` = `{bound}` does not satisfy constraint `{constraint}`",
+                    g.name
+                ),
+                format!("expected a value assignable to `{constraint}`"),
+            );
+        }
+    }
+
     // --- rule a: call sites ---------------------------------------------
 
     /// Whether `sig` accepts this argument list — a non-reporting predicate
@@ -950,7 +1008,7 @@ impl Checker<'_> {
     }
 
     fn check_call(&mut self, call: &CallExpr) {
-        let Some(sig) = call.callee().and_then(|c| self.callee_sig(&c)) else {
+        let Some(mut sig) = call.callee().and_then(|c| self.callee_sig(&c)) else {
             return;
         };
         let (mut slots, string_arg) = call_slots(call);
@@ -958,6 +1016,16 @@ impl Checker<'_> {
             slots.push(Slot::Ty(ty, range));
         }
         let open_ended = self.expand_last(&mut slots);
+
+        // A generic function (`---@generic T`): infer the type variables from
+        // the argument types, verify any constraints, then monomorphise the
+        // signature so arg/return checking runs against the bound types (#84).
+        if !sig.generics.is_empty() {
+            let arg_tys: Vec<Ty> = slots.iter().map(|s| self.slot_ty(s)).collect();
+            let map = crate::generics::infer_call(&sig, &arg_tys);
+            self.check_generic_constraints(&sig, &map, &slots);
+            sig = crate::generics::subst_function(&sig, &map);
+        }
 
         // Overloaded stdlib functions (e.g. `tonumber`, `table.insert`): a
         // call is accepted when it matches the primary signature *or* any
@@ -1377,6 +1445,28 @@ fn dotted_name(expr: &Expr) -> Option<String> {
             Some(format!("{base}.{}", field.field_name()?.text()))
         }
         _ => None,
+    }
+}
+
+/// Whether a (possibly nested) type mentions the generic variable `name` —
+/// either as `Ty::Named(name)` or the backtick capture spelling `` `name` ``.
+fn ty_mentions(ty: &Ty, name: &str) -> bool {
+    match ty {
+        Ty::Named(n) => n == name || n.trim_matches('`') == name,
+        Ty::Union(members) => members.iter().any(|m| ty_mentions(m, name)),
+        Ty::Table(table) => {
+            table.fields.values().any(|f| ty_mentions(&f.ty, name))
+                || table.array.as_ref().is_some_and(|a| ty_mentions(a, name))
+                || table
+                    .indexers
+                    .iter()
+                    .any(|(k, v)| ty_mentions(k, name) || ty_mentions(v, name))
+        }
+        Ty::Function(func) => {
+            func.params.iter().any(|p| ty_mentions(&p.ty, name))
+                || func.returns.iter().any(|r| ty_mentions(r, name))
+        }
+        _ => false,
     }
 }
 

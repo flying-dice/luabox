@@ -96,11 +96,15 @@ pub enum CastKind {
     Replace,
 }
 
-/// `---@class [(exact)] Name[: Parent1, Parent2]`.
+/// `---@class [(exact)] Name[<T[, U...]>][: Parent1, Parent2]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassTag {
     pub exact: bool,
     pub name: String,
+    /// Generic type-parameter names from `Name<T, U>` — empty for a plain
+    /// class. Usable in the class's own `---@field` types, and substituted
+    /// when the class is referenced with type arguments (`Name<number>`).
+    pub params: Vec<String>,
     pub parents: Vec<TypeExpr>,
     pub span: Span,
 }
@@ -557,6 +561,8 @@ fn parse_class(body: &str, base: usize, span: Span, errors: &mut Vec<LuaCatsErro
         s = stripped;
     }
     let (name, rest, rest_base) = take_name(s, base).unwrap_or_else(|| (String::new(), s, base));
+    // Generic parameter list `<T[, U...]>` directly after the name.
+    let (params, rest, rest_base) = take_class_params(rest, rest_base);
     let mut parents = Vec::new();
     let (rest, rest_base) = lstrip(rest, rest_base);
     if let Some(after) = rest.strip_prefix(':') {
@@ -572,9 +578,32 @@ fn parse_class(body: &str, base: usize, span: Span, errors: &mut Vec<LuaCatsErro
     ClassTag {
         exact,
         name,
+        params,
         parents,
         span,
     }
+}
+
+/// Read an optional `<T[, U...]>` type-parameter list immediately following a
+/// class name. Constraints (`<T: C>`) are tolerated but only the parameter
+/// name is kept — matching how the names are used as placeholders. Returns
+/// the parameter names, the remaining slice, and its base offset.
+fn take_class_params(rest: &str, rest_base: usize) -> (Vec<String>, &str, usize) {
+    let Some(inner) = rest.strip_prefix('<') else {
+        return (Vec::new(), rest, rest_base);
+    };
+    let Some(close) = inner.find('>') else {
+        return (Vec::new(), rest, rest_base);
+    };
+    let params = inner[..close]
+        .split(',')
+        .filter_map(|part| {
+            let name = part.split(':').next().unwrap_or(part).trim();
+            (!name.is_empty()).then(|| name.to_string())
+        })
+        .collect();
+    let consumed = 1 + close + 1; // `<` + body + `>`
+    (params, &rest[consumed..], rest_base + consumed)
 }
 
 fn parse_field(body: &str, base: usize, span: Span, errors: &mut Vec<LuaCatsError>) -> FieldTag {

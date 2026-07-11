@@ -104,40 +104,40 @@ luabox test          # 9 passing tests
   example (temporarily, then reverted); see the commented-out line in
   `src/circle.lua`.
 
-## What is outright broken
+## Generics — now real (#84)
 
-- **Generic `---@class<T>`.** The moment a `---@field` (or any annotation)
-  actually references the class's type parameter, luabox reports it as an
-  unresolved name:
-  ```
-  error[LB0305]: unknown type name `T` in annotation
-  ```
-  `defs/geometry.d.lua` keeps a real, commented-out `geometry.Pair<T>`
-  reaching exactly this error (uncomment it in an ordinary `src/*.lua` file
-  to reproduce — see the comment for the sharper nuance: the identical
-  declaration placed in a `.d.lua` def file does *not* raise this
-  diagnostic at all, because ambient/defs content isn't self-validated the
-  way an ordinary checked file is; but the parameterized field still
-  silently resolves to `unknown` wherever it's read downstream, so the type
-  safety is gone either way — just without a diagnostic pointing at the
-  cause). `src/shapes_data.lua` uses a concrete, non-generic `geometry.Pair`
-  instead — the actual, working-today alternative.
-- **`---@generic` function type parameters lower to `unknown`.** A
-  `---@generic T` / `---@param value T` / `---@return T` identity function's
-  return value doesn't retain the argument's real type — it becomes the
-  literal type `unknown`, which then fails against *any* concrete
-  annotation:
-  ```
-  error[LB0300]: type mismatch: expected `number`, found `unknown`
-  ```
-  (Confirmed in the mission's scratch experiments; not exercised inside this
-  project's own files because there's no natural call site for it here —
-  see `../renderer` and the mission report for where a generic function
-  would otherwise have been reached for.)
+Both generic forms luals supports are implemented here, matched to luals
+semantics (ecosystem parity, not a luabox invention):
 
-`: Interface` conformance is now checked (see above); real generics are
-still slated to land with the `.luab` drop epic (#84 etc.) — until then,
-this is the accurate picture.
+- **Generic `---@class<T>`.** `defs/geometry.d.lua` declares a real
+  `geometry.Pair<T>` with `first`/`second` both typed `T`. A reference
+  substitutes the type argument per use site: `src/shapes_data.lua` pins
+  `---@type geometry.Pair<number>`, so both fields are checked as numbers.
+  Put a string in one and it is a real `luabox check` error:
+  ```
+  error[LB0300]: type mismatch: expected `number`, found `"two"`
+    --> src/shapes_data.lua
+    |
+    | local bad = { first = 1, second = "two" }
+    |                                   ^^^^^ expected `number`
+  ```
+  Referencing `T` in a `---@field` no longer trips `LB0305`; a bare
+  `geometry.Pair` with no type arguments stays lenient (parameters become
+  `unknown`), exactly as luals treats it; and nesting works
+  (`geometry.Pair<geometry.Pair<number>>`).
+- **`---@generic` functions.** `T` is inferred from the argument types at the
+  call site (first-binding-wins, luals-style) and substituted into the
+  return type, so `local n = id(5)` types `n` as `integer` and using it
+  where a string is required errors. Bounded parameters (`---@generic T :
+  Shape`) are checked: a binding that does not satisfy the constraint reports
+  `LB0300` at the argument. A backtick capture (`` ---@param cls `T` ``) binds
+  `T` to the class *named by* a string-literal argument — the generic
+  constructor idiom. See `../workspace/packages/core/src/core.lua` for a
+  `---@generic` function (`first_or`) in a real module.
+
+`: Interface` conformance is also checked (see above). Cross-*package* type
+sharing (a dependency's signatures visible in a consumer) is a separate epic
+(#108); within a file that can see a generic's signature, inference is done.
 
 ## Constructors under LuaCATS
 

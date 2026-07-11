@@ -20,11 +20,11 @@ local origin = { x = 0, y = 0 }
 ---@type geometry.Point
 local corner = { x = 1, y = 1, label = "top-right", unit = "px" }
 
--- geometry.Pair is a concrete, monomorphised pair type (see the NOTE (gap)
--- in ../defs/geometry.d.lua about why this isn't `geometry.Pair<number>`
--- today — generic `---@class<T>` is broken the moment the parameter is
--- actually used in a field).
----@type geometry.Pair
+-- geometry.Pair is a REAL generic class (#84): `geometry.Pair<number>`
+-- substitutes `number` for the parameter `T`, so both `first` and `second`
+-- are checked as numbers here. A string in either field would be a real
+-- `luabox check` error (see ../README.md for the exact message).
+---@type geometry.Pair<number>
 local dimensions = { first = 640, second = 480 }
 
 -- ---------------------------------------------------------------------------
