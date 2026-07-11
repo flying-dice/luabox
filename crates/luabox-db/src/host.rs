@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use luabox_diag::Diagnostic;
 use luabox_syntax::lua::{self, Dialect};
 use luabox_types::Strictness;
+use luabox_types::ty::Ty;
 use salsa::Setter;
 
 use crate::db::RootDatabase;
@@ -242,6 +243,27 @@ impl Analysis {
     pub fn binding_types(&self, path: &Path) -> Option<BindingTypes> {
         let file = *self.files.get(path)?;
         Some(query::binding_types(&self.db, file, self.project))
+    }
+
+    /// The check-mode `require`-export registry for `path` (#85): each
+    /// `require("mod")` module string this file names, mapped to the
+    /// resolved target module's export type, for
+    /// [`luabox_types::check_file_with_requires`]. `None` if the file is
+    /// unknown; an empty map if it resolves no project requires.
+    #[must_use]
+    pub fn require_exports(&self, path: &Path) -> Option<HashMap<String, Ty>> {
+        let file = *self.files.get(path)?;
+        Some(query::require_exports_checked(&self.db, file, self.project))
+    }
+
+    /// Every project file's workspace-global class/enum contribution (#85,
+    /// luals parity: a class declared in any checked file — including its
+    /// `function Class:method` member attachments — resolves from every
+    /// other file). Merge them beneath an ambient layer with
+    /// [`luabox_types::Ambient::with_project_types`].
+    #[must_use]
+    pub fn project_types(&self) -> Vec<luabox_types::FileTypes> {
+        query::project_types_checked(&self.db, self.project)
     }
 
     /// The current effective text of `path` (overlay when set, disk

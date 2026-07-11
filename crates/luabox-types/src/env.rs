@@ -2,8 +2,11 @@
 //!
 //! Built in two passes over [`luacats::harvest`] output: first collect the
 //! *names* of classes/aliases/enums (so forward references resolve), then
-//! lower every annotation body against them. Cross-file `require`
-//! resolution is P1 — the environment is strictly per file for now.
+//! lower every annotation body against them. The environment is strictly
+//! per file (cross-file *class/alias/enum* sharing is the ambient
+//! definition layer's job — #108); cross-file `require` *values* are typed
+//! separately, by threading a module-export registry into inference rather
+//! than into this environment (see [`crate::check_file_with_requires`], #85).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -21,7 +24,7 @@ pub(crate) type Target = (usize, usize);
 
 /// A declared `---@class`: parents plus *own* members (inherited members
 /// are merged on demand by [`TypeEnv::class_shape`]).
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct ClassDef {
     pub parents: Vec<String>,
     pub fields: BTreeMap<String, FieldTy>,
@@ -30,11 +33,21 @@ pub(crate) struct ClassDef {
     /// plain class. A reference `Name<arg>` monomorphises the class shape by
     /// substituting these (#84).
     pub params: Vec<String>,
+    /// Members attached to the class *carrier* by statements —
+    /// `function Class:method()`, `function Class.fn()`, `Class.const = v` —
+    /// as collected from the declaring project file (luals parity:
+    /// `---@class` declarations and their member attachments are
+    /// workspace-global). They resolve on reads and method calls exactly
+    /// like `---@field` members ([`TypeEnv::class_shape`] folds them in) but
+    /// carry **no table-literal obligation**: luals's `missing-fields` only
+    /// requires `---@field`-declared members, so the literal classifiers
+    /// skip these (see [`TypeEnv::class_method_names`]).
+    pub methods: BTreeMap<String, FieldTy>,
 }
 
 /// A declared `---@enum`: member name → value type, plus the union of all
 /// member values (what the enum *type* accepts).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EnumDef {
     pub members: BTreeMap<String, Ty>,
     pub value_union: Ty,
@@ -47,6 +60,65 @@ pub(crate) struct EnumDef {
 pub(crate) struct CastEntry {
     pub var: String,
     pub ops: Vec<(CastKind, Ty)>,
+}
+
+/// The workspace-global type surface one checked project source file
+/// contributes (luals parity: `---@class` declarations are
+/// workspace-global): its `---@class` definitions — parents, `---@field`
+/// members, and carrier member attachments (`function Class:method` etc.)
+/// — plus its `---@enum` definitions. Collected per file by
+/// [`crate::module_surface`] and merged beneath every other file's
+/// declarations via [`crate::Ambient::with_project_types`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FileTypes {
+    pub(crate) classes: BTreeMap<String, ClassDef>,
+    pub(crate) enums: BTreeMap<String, EnumDef>,
+}
+
+impl FileTypes {
+    /// Whether this file contributes nothing to the workspace surface.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.classes.is_empty() && self.enums.is_empty()
+    }
+
+    /// Collect the file's own `---@class`/`---@enum` declarations out of its
+    /// built environment, folding each class carrier's reified member
+    /// attachments (from inference, `carriers`: class name → reified carrier
+    /// shape) into the class's `methods` map. Only names the file itself
+    /// declares are collected — ambient (defs/stdlib) declarations seeded
+    /// into `env` are not re-exported.
+    pub(crate) fn collect(
+        items: &[luacats::AnnotatedItem],
+        env: &TypeEnv,
+        carriers: &HashMap<String, Ty>,
+    ) -> FileTypes {
+        let mut out = FileTypes::default();
+        for item in items {
+            for tag in &item.block.tags {
+                match tag {
+                    Tag::Class(c) if !c.name.is_empty() => {
+                        let mut def = env.classes.get(&c.name).cloned().unwrap_or_default();
+                        if let Some(Ty::Table(carrier)) = carriers.get(&c.name) {
+                            for (member, field) in &carrier.fields {
+                                if !def.fields.contains_key(member) {
+                                    def.methods.insert(member.clone(), field.clone());
+                                }
+                            }
+                        }
+                        out.classes.insert(c.name.clone(), def);
+                    }
+                    Tag::Enum(e) if !e.name.is_empty() => {
+                        if let Some(def) = env.enums.get(&e.name) {
+                            out.enums.insert(e.name.clone(), def.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Everything the annotations of one file declare.
@@ -244,6 +316,69 @@ impl TypeEnv {
             env.unknown_names.append(&mut lowerer.unknown_names.clone());
         }
         (env, aliases)
+    }
+
+    /// Clone the name-keyed ambient surface of this environment — the four
+    /// maps [`Self::build_from_items`] seeds a file's environment from
+    /// (classes, enums, functions, global types). Range-keyed per-file maps
+    /// are irrelevant to an ambient layer and stay empty. Used by
+    /// [`crate::Ambient::with_project_types`] to derive a merged layer
+    /// without mutating the shared base.
+    pub(crate) fn clone_surface(&self) -> TypeEnv {
+        TypeEnv {
+            classes: self.classes.clone(),
+            enums: self.enums.clone(),
+            functions: self.functions.clone(),
+            global_types: self.global_types.clone(),
+            ..TypeEnv::default()
+        }
+    }
+
+    /// Merge one project file's workspace-global declarations beneath this
+    /// (ambient) environment. See [`crate::Ambient::with_project_types`] for
+    /// the semantics: absent classes insert whole; present classes merge
+    /// member-wise with the existing (defs) declaration winning same-name
+    /// collisions, and a carrier attachment never shadowing a `---@field`;
+    /// enums merge first-wins.
+    pub(crate) fn merge_file_types(&mut self, file: &FileTypes) {
+        for (name, def) in &file.classes {
+            match self.classes.get_mut(name) {
+                None => {
+                    self.classes.insert(name.clone(), def.clone());
+                }
+                Some(existing) => {
+                    for parent in &def.parents {
+                        if !existing.parents.contains(parent) {
+                            existing.parents.push(parent.clone());
+                        }
+                    }
+                    for (field, ty) in &def.fields {
+                        existing
+                            .fields
+                            .entry(field.clone())
+                            .or_insert_with(|| ty.clone());
+                    }
+                    for (member, ty) in &def.methods {
+                        if !existing.fields.contains_key(member) {
+                            existing
+                                .methods
+                                .entry(member.clone())
+                                .or_insert_with(|| ty.clone());
+                        }
+                    }
+                    for indexer in &def.indexers {
+                        if !existing.indexers.contains(indexer) {
+                            existing.indexers.push(indexer.clone());
+                        }
+                    }
+                }
+            }
+        }
+        for (name, def) in &file.enums {
+            self.enums
+                .entry(name.clone())
+                .or_insert_with(|| def.clone());
+        }
     }
 
     /// Bind module tables (`math = {}` under `---@class mathlib`) and scalar
@@ -703,10 +838,40 @@ impl TypeEnv {
         for parent in &def.parents {
             self.collect_class(parent, shape, seen);
         }
+        // Carrier-attached members first, then `---@field` declarations —
+        // both override inherited members, and a declaration wins over a
+        // same-name attachment (annotations are authoritative).
+        for (member, ty) in &def.methods {
+            shape.fields.insert(member.clone(), ty.clone());
+        }
         for (field, ty) in &def.fields {
             shape.fields.insert(field.clone(), ty.clone());
         }
         shape.indexers.extend(def.indexers.iter().cloned());
+    }
+
+    /// The member names of `name`'s shape that are carrier attachments
+    /// (`function Class:method()` et al.) rather than `---@field`
+    /// declarations, across the parent chain. These resolve on reads but
+    /// carry no table-literal obligation (luals `missing-fields` parity) —
+    /// the literal classifiers exclude them from the required set.
+    pub(crate) fn class_method_names(&self, name: &str) -> HashSet<String> {
+        let mut methods = HashSet::new();
+        let mut declared = HashSet::new();
+        let mut stack = vec![name.to_string()];
+        let mut seen = HashSet::new();
+        while let Some(class) = stack.pop() {
+            if !seen.insert(class.clone()) {
+                continue;
+            }
+            let Some(def) = self.classes.get(&class) else {
+                continue;
+            };
+            methods.extend(def.methods.keys().cloned());
+            declared.extend(def.fields.keys().cloned());
+            stack.extend(def.parents.iter().cloned());
+        }
+        &methods - &declared
     }
 
     pub(crate) fn enum_member(&self, enum_name: &str, member: &str) -> Option<&Ty> {

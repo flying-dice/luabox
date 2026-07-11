@@ -9,9 +9,10 @@
 //!    `--target`, against the ship target too (that is what `--target`
 //!    means before lowering exists: "would this source be legal there?").
 //!    Duplicate findings (same code, same range) are reported once.
-//! 3. **Typecheck** (annotation-driven, per-file environment; cross-file
-//!    `require` resolution is P1) at the manifest's strictness:
-//!    `[types] strict = true` → strict (errors), otherwise warn.
+//! 3. **Typecheck** (annotation-driven, against the ambient definition
+//!    layer, with each file's cross-file `require` exports in reach — #85)
+//!    at the manifest's strictness: `[types] strict = true` → strict
+//!    (errors), otherwise warn.
 //!
 //! Output goes to stdout in the chosen format; a `check: N errors, M
 //! warnings in K files` summary goes to stderr. The exit code is nonzero
@@ -22,7 +23,7 @@
 //! loop instead of a one-shot check — see `crate::watch` for the debounce
 //! and filtering rules.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -30,6 +31,7 @@ use anyhow::{Context, bail};
 use luabox_diag::{Code, Diagnostic, Format, Label, Severity, Span, render};
 use luabox_resolve::manifest::{Dependency, Manifest};
 use luabox_syntax::{Dialect, lua};
+use luabox_types::ty::Ty;
 use luabox_types::{Ambient, DefFile, Strictness, combined_defs_checked, stdlib_defs};
 use rayon::prelude::*;
 
@@ -111,8 +113,41 @@ pub(crate) fn run_once(
         .as_ref()
         .unwrap_or_else(|| stdlib_defs(project.dialect));
 
-    // SPEC.md §16: rayon per-module. Files are independent (cross-file
-    // resolution is P1); collecting per-file Vecs preserves source order.
+    // Cross-file pre-pass (#85): reify every project file's surface up
+    // front — its `require`-export type (keyed by canonical path) plus its
+    // workspace-global `---@class`/`---@enum` declarations (luals parity:
+    // classes declared in any checked file, including their
+    // `function Class:method` member attachments, are nameable and
+    // resolvable from every other file). Exports are check-mode
+    // (annotations authoritative, no call-site seeding) and a module's own
+    // requires are left unresolved, so the registry is acyclic and
+    // cycle-tolerant. Resolution reuses the bundler's exact `require`
+    // path-mapping ([`luabox_bundle::resolve_module`]).
+    let surfaces: Vec<(PathBuf, luabox_types::ModuleSurface)> = lua_files
+        .par_iter()
+        .filter_map(|path| {
+            let source = fs::read_to_string(path).ok()?;
+            let parse = lua::parse(&source, project.dialect);
+            let rel = display_rel(path, &project.root);
+            Some((
+                canonical(path),
+                luabox_types::module_surface(&parse, &rel, Some(ambient)),
+            ))
+        })
+        .collect();
+    let exports: HashMap<PathBuf, Ty> = surfaces
+        .iter()
+        .filter_map(|(path, surface)| Some((path.clone(), surface.export.clone()?)))
+        .collect();
+    // The project-wide ambient: defs + every file's workspace-global
+    // classes/enums, merged (defs win same-name member collisions; luals
+    // merges duplicate class declarations' fields rather than dropping).
+    let ambient = ambient.with_project_types(surfaces.iter().map(|(_, s)| &s.types));
+    let ambient = &ambient;
+
+    // SPEC.md §16: rayon per-module. Each file is checked against the
+    // shared project ambient plus its own resolved `require` exports;
+    // collecting per-file Vecs preserves source order.
     let per_file: Vec<anyhow::Result<Vec<Diagnostic>>> = lua_files
         .par_iter()
         .map(|path| {
@@ -120,7 +155,15 @@ pub(crate) fn run_once(
             let source =
                 fs::read_to_string(path).with_context(|| format!("cannot read `{rel}`"))?;
             let mut diags = Vec::new();
-            check_one(&source, &rel, &project, target_dialect, ambient, &mut diags);
+            check_one(
+                &source,
+                &rel,
+                &project,
+                target_dialect,
+                ambient,
+                &exports,
+                &mut diags,
+            );
             Ok(diags)
         })
         .collect();
@@ -133,12 +176,17 @@ pub(crate) fn run_once(
 }
 
 /// All three passes for one file.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the check pipeline threads its shared context"
+)]
 fn check_one(
     source: &str,
     rel: &str,
     project: &Project,
     target: Option<Dialect>,
     ambient: &Ambient,
+    exports: &HashMap<PathBuf, Ty>,
     diags: &mut Vec<Diagnostic>,
 ) {
     let parse = lua::parse(source, project.dialect);
@@ -181,13 +229,45 @@ fn check_one(
         }
     }
 
-    // 3. Types against the ambient definition-package layer (SPEC.md §3).
-    diags.extend(luabox_types::check_file_with_ambient(
+    // 3. Types against the ambient definition-package layer (SPEC.md §3),
+    // with this file's resolved `require` exports in reach (#85).
+    let requires = resolve_requires(&parse, &project.root, exports);
+    diags.extend(luabox_types::check_file_with_requires(
         &parse,
         rel,
         project.strictness,
         Some(ambient),
+        &requires,
     ));
+}
+
+/// Map each static `require("mod")` in `parse` to the export type of the
+/// project file it resolves to, using the bundler's `require` path-mapping.
+/// Requires that resolve outside the project (dependencies, external
+/// runtime modules) have no entry in `exports` and are simply skipped —
+/// their types come from ambient `[types] defs` (#108), not the module
+/// return value.
+fn resolve_requires(
+    parse: &lua::Parse,
+    root: &Path,
+    exports: &HashMap<PathBuf, Ty>,
+) -> HashMap<String, Ty> {
+    let mut requires = HashMap::new();
+    for module in luabox_types::module_requires(parse) {
+        if let Some(target) = luabox_bundle::resolve_module(root, &module)
+            && let Some(ty) = exports.get(&target)
+        {
+            requires.insert(module, ty.clone());
+        }
+    }
+    requires
+}
+
+/// Canonicalize a path for identity comparison against
+/// [`luabox_bundle::resolve_module`]'s canonicalized results; fall back to
+/// the raw path when the file cannot be canonicalized.
+fn canonical(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Render, summarize, and translate error count into the exit code.

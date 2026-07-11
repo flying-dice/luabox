@@ -241,12 +241,13 @@ pub(crate) fn explain_mismatch(
 ) -> Option<String> {
     let value_table = resolve_table(env, value)?;
     let target_table = resolve_table(env, target)?;
+    let attached = attached_member_names(env, target);
     let mut missing: Vec<String> = Vec::new();
     let mut wrong: Vec<String> = Vec::new();
     for (name, field) in &target_table.fields {
         match value_table.fields.get(name) {
             None => {
-                if !field.optional && !field.ty.admits_nil() {
+                if !field.optional && !field.ty.admits_nil() && !attached.contains(name) {
                     missing.push(format!("`{name}`"));
                 }
             }
@@ -303,13 +304,14 @@ pub(crate) fn classify_literal(
     literal: &TableTy,
     target: &Ty,
 ) -> Option<LiteralConformance> {
+    let attached = attached_member_names(env, target);
     let target = resolve_table(env, target)?;
     let mut missing = false;
     let mut other = false;
     for (name, field) in &target.fields {
         match literal.fields.get(name) {
             None => {
-                if !field.optional && !field.ty.admits_nil() {
+                if !field.optional && !field.ty.admits_nil() && !attached.contains(name) {
                     missing = true;
                 }
             }
@@ -346,6 +348,25 @@ pub(crate) fn classify_literal(
     } else {
         LiteralConformance::Conforms
     })
+}
+
+/// The carrier-attached member names of a (possibly named) target type —
+/// the members [`TypeEnv::class_method_names`] exempts from table-literal
+/// obligations (luals `missing-fields` parity). Empty for structural
+/// targets; unions defer to their non-`nil` named member, mirroring
+/// [`resolve_table`]'s unwrapping.
+fn attached_member_names(env: &TypeEnv, ty: &Ty) -> std::collections::HashSet<String> {
+    match ty {
+        Ty::Named(name) => env.class_method_names(name),
+        Ty::Union(members) => {
+            let non_nil: Vec<&Ty> = members.iter().filter(|m| **m != Ty::Nil).collect();
+            match non_nil[..] {
+                [single] => attached_member_names(env, single),
+                _ => std::collections::HashSet::new(),
+            }
+        }
+        _ => std::collections::HashSet::new(),
+    }
 }
 
 /// Resolve a type to its structural table shape, unwrapping `T?` optionals

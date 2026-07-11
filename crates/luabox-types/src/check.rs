@@ -1200,8 +1200,19 @@ impl Checker<'_> {
         let declared_by = class.map(|c| format!("declared by `---@class {c}`"));
 
         // Missing required fields — one diagnostic each, naming the field.
+        // Carrier member attachments (`function Class:method` collected from
+        // the declaring file) resolve on reads but carry no literal
+        // obligation (luals `missing-fields` parity — only `---@field`
+        // declarations are required).
+        let attached = class
+            .map(|c| self.env.class_method_names(c))
+            .unwrap_or_default();
         for (name, field) in &shape.fields {
-            if !field.optional && !field.ty.admits_nil() && !present.contains_key(name) {
+            if !field.optional
+                && !field.ty.admits_nil()
+                && !present.contains_key(name)
+                && !attached.contains(name)
+            {
                 self.report_full(
                     MISSING_FIELD,
                     range(table.syntax()),

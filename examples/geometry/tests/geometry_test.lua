@@ -1,5 +1,16 @@
 package.path = "src/?.lua;" .. package.path
 
+-- CROSS-FILE REQUIRE (#85): each `require` below is typed from the required
+-- module's annotations, so this test file is checked with the same rigor as
+-- the modules themselves. `Circle`/`Rect` are their carriers' export tables;
+-- `Circle.new(2)` types as `geometry.Circle` (its `---@return`), so
+-- `Circle.new(2):area()` resolves the inherited `geometry.Shape` method and
+-- types as `number`. A method the class does not declare —
+-- `Circle.new(2):nonexistent()` — is a real `luabox check` error (LB0306) at
+-- the call site here, not silently `unknown` (verified against the binary,
+-- then reverted). Likewise `data.origin.x` and `data.ShapeKind.Circle` below
+-- type through `shapes_data`'s export. The module `return` value evaluates to
+-- the required file's export type, matching lua-language-server.
 local Circle = require("circle")
 local Rect = require("rect")
 local data = require("shapes_data")

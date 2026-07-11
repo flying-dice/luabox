@@ -87,6 +87,37 @@ impl Ambient {
         &self.global_names
     }
 
+    /// A new ambient layer: this one plus the workspace-global
+    /// `---@class`/`---@enum` declarations collected from every checked
+    /// project source file (luals parity: classes are workspace-global, so a
+    /// class declared in any project file — including its
+    /// `function Class:method` member attachments — is nameable and
+    /// resolvable from every other file).
+    ///
+    /// Merge semantics (luals merges duplicate class declarations' fields):
+    /// a class this layer does not declare is inserted whole; a class both
+    /// declare merges member-wise — parents union, `---@field`s and
+    /// attachments union, with this layer (defs — the published surface,
+    /// #108 winner-first) winning any same-name member collision. A member
+    /// attached by a carrier never shadows a `---@field` declaration.
+    /// Enums merge first-wins. Global names are untouched, so the
+    /// `undefined-global` lint baseline is unchanged.
+    #[must_use]
+    pub fn with_project_types<'a>(
+        &self,
+        files: impl IntoIterator<Item = &'a crate::env::FileTypes>,
+    ) -> Ambient {
+        let mut env = self.env.clone_surface();
+        for file in files {
+            env.merge_file_types(file);
+        }
+        Ambient {
+            env,
+            aliases: self.aliases.clone(),
+            global_names: self.global_names.clone(),
+        }
+    }
+
     /// Undeclared type names referenced by the definition files themselves —
     /// a self-consistency check for the shipped packages (should be empty).
     #[cfg(test)]

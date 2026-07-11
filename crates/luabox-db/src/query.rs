@@ -23,8 +23,8 @@ use luabox_types::{ExternalTypes, TypeEnv, check_file, infer_display_types, stdl
 use crate::db::Db;
 use crate::input::{Project, SourceFile};
 use crate::value::{
-    Annotations, BindingTypes, Diagnostics, LoweredHandle, ModuleExport, OutgoingCalls,
-    ParsedModule, TypeEnvHandle,
+    Annotations, BindingTypes, Diagnostics, LoweredHandle, ModuleExport, ModuleSurfaceChecked,
+    OutgoingCalls, ParsedModule, TypeEnvHandle,
 };
 
 /// Parse a file into a lossless syntax tree.
@@ -132,6 +132,64 @@ pub fn binding_types(db: &dyn Db, file: SourceFile, project: Project) -> Binding
         Some(ambient),
         Some(&externals),
     ))
+}
+
+/// The **check-mode** module surface of one file (#85): the type a
+/// consumer's `require` of this module evaluates to for type *checking* —
+/// annotations authoritative, no call-site parameter seeding (unlike
+/// [`module_export`], the display-mode inlay-hint surface, which seeds
+/// exported functions' parameters from dependents' call sites) — plus the
+/// file's workspace-global `---@class`/`---@enum` declarations (luals
+/// parity: classes declared in any checked file, including their
+/// `function Class:method` member attachments, resolve from every other
+/// file). The file's own requires are not followed, so the cross-file
+/// graph stays acyclic even when modules require each other. Depends only
+/// on the file's parse (and dialect), not on `Project`.
+#[salsa::tracked]
+pub fn module_surface_checked(db: &dyn Db, file: SourceFile) -> ModuleSurfaceChecked {
+    db.push_log(format!("module_surface_checked({})", display(db, file)));
+    let parsed = parse(db, file);
+    let name = display(db, file);
+    let ambient = stdlib_defs(file.dialect(db));
+    ModuleSurfaceChecked::new(luabox_types::module_surface(
+        parsed.parse(),
+        &name,
+        Some(ambient),
+    ))
+}
+
+/// Module string → **check-mode** export type, for every static `require`
+/// in `file` that resolves to another project file — the registry
+/// [`luabox_types::check_file_with_requires`] threads into checking so a
+/// consumer types its `require` results from the module's annotations (#85).
+pub(crate) fn require_exports_checked(
+    db: &dyn Db,
+    file: SourceFile,
+    project: Project,
+) -> HashMap<String, Ty> {
+    let mut map = HashMap::new();
+    for edge in lower(db, file).file().requires() {
+        if let Some(target) = resolve_require(db, project, &edge.module)
+            && target != file
+            && let Some(ty) = module_surface_checked(db, target).export()
+        {
+            map.insert(edge.module.clone(), ty.clone());
+        }
+    }
+    map
+}
+
+/// Every project file's workspace-global class/enum contribution — the
+/// input [`luabox_types::Ambient::with_project_types`] merges beneath each
+/// file's own declarations so a class declared anywhere in the project
+/// resolves everywhere (luals parity, #85).
+pub(crate) fn project_types_checked(db: &dyn Db, project: Project) -> Vec<luabox_types::FileTypes> {
+    project
+        .files(db)
+        .iter()
+        .map(|&file| module_surface_checked(db, file).types().clone())
+        .filter(|types| !types.is_empty())
+        .collect()
 }
 
 /// Module string → export type, for every static `require` in `file` that

@@ -156,9 +156,18 @@ sharing — a dependency's ambient defs (classes, aliases, enums, and
 def-declared global APIs) visible and checked in a consumer — now works too
 (#108, the luals `workspace.library` model): geometry's own `[types] defs` are
 its published type surface, and `../renderer` conforms to `geometry.Drawable`
-across the package boundary with no vendored copy. Typing a
-`local m = require("geometry")` module *return* value is still a separate epic
-(#85).
+across the package boundary with no vendored copy.
+
+Cross-*file* `require` resolution now works as well (#85): a
+`local Circle = require("circle")` in `tests/geometry_test.lua` is typed from
+`src/circle.lua`'s annotations, so `Circle.new(2):area()` types through and a
+method the class does not declare — `Circle.new(2):nonexistent()` — is a real
+`luabox check` error (`LB0306`) reported at the test's call site, not silently
+`unknown`. The module's `return` value evaluates to the required file's export
+type (matching lua-language-server), so conformance-style assertions work in
+consumer and test files, not just the defining file. (Requires that resolve
+nowhere stay `unknown` and raise no diagnostic; the bundler is where an
+unresolvable static `require` is a hard error.)
 
 ## Constructors under LuaCATS
 

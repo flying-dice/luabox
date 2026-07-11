@@ -9,7 +9,7 @@ use std::path::Path;
 use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
 use luabox_db::Analysis;
 use luabox_syntax::lua::{Dialect, validate};
-use luabox_types::{Ambient, Strictness, check_file_with_ambient};
+use luabox_types::{Ambient, Strictness, check_file_with_requires};
 
 use crate::line_index::LineIndex;
 
@@ -62,10 +62,24 @@ pub fn lua_diagnostics(
 
     // 3. Types against the ambient definition-package layer — the same pass
     // as `luabox check`, so classes resolve identically in the editor and in
-    // CI. The span file name is dropped on conversion (LSP diagnostics are
-    // already per-document), so the lossy path is fine.
+    // CI. The file's cross-file `require` exports are in reach (#85), so a
+    // `require("mod")` result types from the module's annotations in the
+    // editor exactly as under `luabox check`; the project's workspace-global
+    // classes (declared in any checked file, member attachments included —
+    // luals parity) merge beneath the defs layer the same way `check_cmd`
+    // merges them. The span file name is dropped on conversion (LSP
+    // diagnostics are already per-document), so the lossy path is fine.
     let rel = path.to_string_lossy();
-    for diag in check_file_with_ambient(parsed.parse(), &rel, ctx.strictness, Some(ctx.ambient)) {
+    let requires = analysis.require_exports(path).unwrap_or_default();
+    let project_types = analysis.project_types();
+    let ambient = ctx.ambient.with_project_types(&project_types);
+    for diag in check_file_with_requires(
+        parsed.parse(),
+        &rel,
+        ctx.strictness,
+        Some(&ambient),
+        &requires,
+    ) {
         let range = diag
             .primary_label()
             .map_or(0..0, |label| label.span.range.clone());

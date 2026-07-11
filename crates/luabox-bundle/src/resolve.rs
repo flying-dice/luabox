@@ -30,7 +30,12 @@ use std::path::{Path, PathBuf};
 
 /// Resolve `module` against the project rooted at `root`. `None` means
 /// "external": no file in the project or its `lua_modules/` provides it.
-pub(crate) fn resolve(root: &Path, module: &str) -> Option<PathBuf> {
+///
+/// Re-exported as [`crate::resolve_module`] so front-ends that need the
+/// bundler's exact `require` path-mapping (e.g. `luabox check`'s cross-file
+/// type resolution, #85) share this one algorithm rather than re-deriving
+/// it.
+pub fn resolve(root: &Path, module: &str) -> Option<PathBuf> {
     // Reject shapes that cannot be a module name (empty segments) or that
     // would escape the project tree (`..`, absolute-ish names).
     if module.is_empty() || module.split('.').any(|seg| seg.is_empty() || seg == "..") {

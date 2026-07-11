@@ -14,10 +14,25 @@
 //! table inference (SPEC.md §3 hard requirement) extends this IR instead
 //! of replacing it.
 //!
+//! **Cross-file `require` + workspace-global classes:** [`module_surface`]
+//! reifies a file's chunk `return` type (annotations authoritative, no
+//! call-site seeding, own requires left unresolved so the graph stays
+//! acyclic under cycles) together with the file's workspace-global
+//! `---@class`/`---@enum` declarations — luals parity: a class declared in
+//! any checked file, including its `function Class:method` member
+//! attachments, is nameable and resolvable from every other file
+//! ([`Ambient::with_project_types`]). [`check_file_with_requires`] threads
+//! a `require`-string → export-type registry into checking, so
+//! `local M = require("mod")` types `M` from the required module's
+//! annotations — conformance assertions work in consumer files, not just
+//! the defining file (#85). The CLI (`check_cmd`) and LSP
+//! (`lua_diagnostics`) each build the registry + merged ambient from the
+//! project source set, reusing the bundler's / salsa DB's `require`
+//! path-mapping.
+//!
 //! **P1 (TODO):** bidirectional inference, flow-sensitive narrowing,
 //! metatable/`__index` resolution, method calls, generics as real type
-//! variables, cross-file `require` resolution over the salsa DB, function
-//! subtyping.
+//! variables, function subtyping.
 //!
 //! Diagnostics carry `LB03xx` codes registered in `luabox-diag` (this
 //! crate depends on it the way rustc crates depend on `rustc_errors`).
@@ -37,11 +52,14 @@ pub use defs::{
     Ambient, DefFile, combined as combined_defs, combined_checked as combined_defs_checked,
     stdlib as stdlib_defs,
 };
-pub use env::TypeEnv;
+pub use env::{FileTypes, TypeEnv};
 pub use infer::{ExternalTypes, InferredBinding, InferredReturn};
+
+use std::collections::HashMap;
 
 use luabox_diag::Diagnostic;
 use luabox_syntax::{lua, luacats};
+use ty::Ty;
 
 /// The strictness ladder (SPEC.md §3): `none` → `warn` → `strict`.
 ///
@@ -129,11 +147,72 @@ pub fn infer_display_types(
     }
 }
 
+/// One project file's cross-file type surface, in **check mode** (#85).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ModuleSurface {
+    /// The type a `require` of this file evaluates to: the reified type of
+    /// the chunk's top-level `return` expression. `None` when the chunk has
+    /// no `return` value.
+    pub export: Option<Ty>,
+    /// The workspace-global `---@class`/`---@enum` declarations this file
+    /// contributes (luals parity: a class declared in any checked project
+    /// file — including its `function Class:method` member attachments — is
+    /// nameable and resolvable from every other file). Merged into every
+    /// file's ambient scope via [`Ambient::with_project_types`].
+    pub types: FileTypes,
+}
+
+/// Compute one file's [`ModuleSurface`]: the reified `require`-export type
+/// plus the workspace-global class/enum declarations.
+///
+/// Mirrors what luals resolves a `require("mod")` call to — the module
+/// file's `return` type — but computed for the *checker*, so:
+///
+/// - **annotations are authoritative** and there is **no call-site
+///   parameter seeding** (unlike the display-mode export behind inlay
+///   hints): an unannotated exported function's parameters stay `unknown`,
+///   never a guessed type, so a consumer's checks never rest on inference
+///   about *other* files' call sites; and
+/// - the file's **own** `require`s are left unresolved (`unknown`), which is
+///   what keeps the cross-file registry acyclic and cycle-tolerant — a
+///   `require` cycle resolves each participant against a partner computed
+///   without following back.
+///
+/// `ambient` is the same definition-package layer
+/// [`check_file_with_ambient`] uses (needed to model e.g. `setmetatable`
+/// inside the module); named types the surface mentions are carried by name
+/// and resolved in the *consumer's* environment.
+#[must_use]
+pub fn module_surface(parse: &lua::Parse, file: &str, ambient: Option<&Ambient>) -> ModuleSurface {
+    let items = luacats::harvest(parse);
+    let env = TypeEnv::build_from_items(parse, &items, ambient);
+    let lowered = luabox_hir::lower(parse);
+    let outcome = infer::run(&lowered, &env, file, true, false, None);
+    let types = FileTypes::collect(&items, &env, &outcome.carrier_class_final);
+    ModuleSurface {
+        export: outcome.module_export,
+        types,
+    }
+}
+
+/// The static `require` module strings this file names, in source order —
+/// the keys a cross-file export registry is built over. Dynamic
+/// (non-literal) requires are excluded (they are unresolvable and the
+/// bundler hard-errors on them at build time).
+#[must_use]
+pub fn module_requires(parse: &lua::Parse) -> Vec<String> {
+    luabox_hir::lower(parse)
+        .requires()
+        .iter()
+        .map(|edge| edge.module.clone())
+        .collect()
+}
+
 /// Typecheck one parsed file against its own annotations.
 ///
 /// `file` names the file in diagnostic spans. Cross-file `require`
-/// resolution is P1 — every file is checked against a per-file
-/// environment.
+/// resolution is available through [`check_file_with_requires`]; this
+/// entry point resolves no requires.
 #[must_use]
 pub fn check_file(parse: &lua::Parse, file: &str, strictness: Strictness) -> Vec<Diagnostic> {
     check_file_with_ambient(parse, file, strictness, None)
@@ -153,6 +232,32 @@ pub fn check_file_with_ambient(
     strictness: Strictness,
     ambient: Option<&Ambient>,
 ) -> Vec<Diagnostic> {
+    check_file_with_requires(parse, file, strictness, ambient, &HashMap::new())
+}
+
+/// Typecheck one parsed file with an ambient definition-package layer AND a
+/// cross-file `require`-export registry in reach (#85).
+///
+/// `requires` maps each `require("mod")` module string this file names to
+/// the resolved target module's [`module_export`] type. A `require` whose
+/// string is absent from the map (unresolved — a file not in the project,
+/// or an external/runtime module) evaluates to `unknown`, exactly as
+/// before, and raises no diagnostic of its own (luals does not error on an
+/// unresolved `require`; the bundler is where an unresolvable static
+/// `require` becomes a hard error).
+///
+/// The registry only feeds `require` resolution: it never enables
+/// call-site parameter seeding, so no diagnostic can arise from inference
+/// about other files' call sites — only from the required module's own
+/// annotations flowing into this file at its use sites.
+#[must_use]
+pub fn check_file_with_requires<S: std::hash::BuildHasher>(
+    parse: &lua::Parse,
+    file: &str,
+    strictness: Strictness,
+    ambient: Option<&Ambient>,
+    requires: &HashMap<String, Ty, S>,
+) -> Vec<Diagnostic> {
     let items = luacats::harvest(parse);
     // A `---@meta` definition package: its `---@class` declarations are
     // contracts, not carriers, so no `: Interface` conformance runs inside it
@@ -167,6 +272,26 @@ pub fn check_file_with_ambient(
     let mut diags: Vec<Diagnostic> = Vec::new();
 
     let env = TypeEnv::build_from_items(parse, &items, ambient);
+    // A resolved `require`-export registry (#85) reaches inference through
+    // the display-mode `externals` channel, but with call-site parameter
+    // seeding OFF (`fn_param_seeds` empty, `seed_params` false below): only
+    // `require("mod")` resolution is enabled, which is sound for checking
+    // because a module's export type is annotation-authoritative. The empty
+    // registry stays `None`, so a file with no resolved requires checks
+    // byte-for-byte as before.
+    let externals = if requires.is_empty() {
+        None
+    } else {
+        Some(ExternalTypes {
+            // Re-collect into the default-hasher map `ExternalTypes` holds
+            // (the caller's map may use any `BuildHasher`).
+            requires: requires
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            fn_param_seeds: HashMap::new(),
+        })
+    };
     let mut inferred_types = std::collections::HashMap::new();
     if strictness != Strictness::None {
         // Rich table inference (SPEC.md §3) runs first: the checker uses
@@ -180,7 +305,7 @@ pub fn check_file_with_ambient(
             file,
             strictness == Strictness::Strict,
             false,
-            None,
+            externals.as_ref(),
         );
         diags.extend(check::run(
             parse,
@@ -212,6 +337,31 @@ pub fn check_file_with_ambient(
                     )
             });
         }
+    }
+
+    // Collapse cascades: an undefined-field read (LB0306) makes the
+    // expression `unknown`, and that `unknown` then mismatches wherever the
+    // value flows (LB0300 at an annotated boundary spanning the same
+    // expression). One mistake, one diagnostic — keep the specific LB0306
+    // and drop the LB0300 whose reported range contains it.
+    let absent_ranges: Vec<std::ops::Range<usize>> = diags
+        .iter()
+        .filter(|d| d.code.to_string() == "LB0306")
+        .filter_map(|d| d.primary_label().map(|l| l.span.range.clone()))
+        .collect();
+    if !absent_ranges.is_empty() {
+        diags.retain(|d| {
+            if d.code.to_string() != "LB0300" {
+                return true;
+            }
+            let Some(label) = d.primary_label() else {
+                return true;
+            };
+            let range = &label.span.range;
+            !absent_ranges
+                .iter()
+                .any(|a| range.start <= a.start && a.end <= range.end)
+        });
     }
 
     diags.sort_by_key(|d| d.primary_label().map_or(0, |l| l.span.range.start));

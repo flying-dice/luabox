@@ -51,12 +51,12 @@ pub use db::{Db, RootDatabase};
 pub use host::{Analysis, AnalysisHost, Change};
 pub use input::{Project, SourceFile};
 pub use query::{
-    annotations, binding_types, diagnostics, lower, module_export, outgoing_calls, parse,
-    project_diagnostics, type_env,
+    annotations, binding_types, diagnostics, lower, module_export, module_surface_checked,
+    outgoing_calls, parse, project_diagnostics, type_env,
 };
 pub use value::{
-    Annotations, BindingTypes, Diagnostics, LoweredHandle, ModuleExport, OutgoingCalls,
-    ParsedModule, TypeEnvHandle,
+    Annotations, BindingTypes, Diagnostics, LoweredHandle, ModuleExport, ModuleSurfaceChecked,
+    OutgoingCalls, ParsedModule, TypeEnvHandle,
 };
 pub use vfs::{FileId, Vfs};
 

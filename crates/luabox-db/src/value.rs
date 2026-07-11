@@ -172,6 +172,43 @@ impl BindingTypes {
     }
 }
 
+/// The memoized **check-mode** module surface of one file (#85): the
+/// `require`-export type a consumer's `require` of this module evaluates
+/// to for type checking, plus the file's workspace-global
+/// `---@class`/`---@enum` declarations (luals parity: classes declared in
+/// any checked file, including their member attachments, resolve from
+/// every other file). Computed standalone (the file's own requires are not
+/// followed), so the cross-file query graph stays acyclic even when
+/// modules require each other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleSurfaceChecked(Arc<luabox_types::ModuleSurface>);
+
+impl ModuleSurfaceChecked {
+    pub(crate) fn new(surface: luabox_types::ModuleSurface) -> Self {
+        Self(Arc::new(surface))
+    }
+
+    /// The check-mode export type, when the chunk returns a value.
+    #[must_use]
+    pub fn export(&self) -> Option<&Ty> {
+        self.0.export.as_ref()
+    }
+
+    /// The file's workspace-global class/enum declarations.
+    #[must_use]
+    pub fn types(&self) -> &luabox_types::FileTypes {
+        &self.0.types
+    }
+}
+
+// SAFETY: fully-owned `Arc` payload; replacement via `PartialEq`.
+unsafe impl salsa::Update for ModuleSurfaceChecked {
+    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
+        // SAFETY: forwarded from the `Update` contract.
+        unsafe { replace_if_ne(old_pointer, new_value) }
+    }
+}
+
 /// The memoized inferred module export of one file — what a dependent
 /// file's `require` of this module evaluates to. Computed standalone (the
 /// file's own requires are not followed), so the cross-file query graph
