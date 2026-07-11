@@ -102,6 +102,11 @@ pub struct ParamTy {
 /// A function signature from `---@param` / `---@return` annotations (or a
 /// `fun(...)` type expression).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag models a distinct, independent LuaCATS annotation \
+              (vararg return, return-annotation presence, @deprecated, @nodiscard)"
+)]
 pub struct FunctionTy {
     /// Positional parameters, in order.
     pub params: Vec<ParamTy>,
@@ -123,6 +128,16 @@ pub struct FunctionTy {
     /// `returns` carry `Ty::Named(param)` placeholders that call-site
     /// inference binds and substitutes ([`crate::generics::infer_call`]).
     pub generics: Vec<TypeParam>,
+    /// Whether the function carries `---@deprecated` — every use site is
+    /// reported (`LB0308`, luals `deprecated`). The flag rides the type IR so
+    /// it reaches call sites cross-file (workspace-global members) and through
+    /// `[types] defs` packages via the same ambient/`FileTypes` merges the
+    /// signature itself travels through (#111).
+    pub deprecated: bool,
+    /// Whether the function carries `---@nodiscard` — discarding its return in
+    /// a bare call statement is reported (`LB0309`, luals `discard-returns`,
+    /// #112).
+    pub nodiscard: bool,
 }
 
 impl FunctionTy {
@@ -256,6 +271,8 @@ impl Ty {
                 has_return_annotation: func.has_return_annotation,
                 overloads: func.overloads.clone(),
                 generics: func.generics.clone(),
+                deprecated: func.deprecated,
+                nodiscard: func.nodiscard,
             })),
             other => other.clone(),
         }

@@ -49,8 +49,8 @@ pub mod ty;
 
 pub use assign::assignable;
 pub use defs::{
-    Ambient, DefFile, combined as combined_defs, combined_checked as combined_defs_checked,
-    stdlib as stdlib_defs,
+    Ambient, DefFile, alias_collisions, combined as combined_defs,
+    combined_checked as combined_defs_checked, stdlib as stdlib_defs,
 };
 pub use env::{FileTypes, TypeEnv};
 pub use infer::{ExternalTypes, InferredBinding, InferredReturn};
@@ -318,23 +318,35 @@ pub fn check_file_with_requires<S: std::hash::BuildHasher>(
             &inference.carrier_class_final,
         ));
         diags.extend(inference.diags);
+        // Duplicate `---@field` on one class (luals `duplicate-doc-field`,
+        // LB0311) — a per-file doc-consistency finding, so it is emitted here
+        // alongside the type diagnostics and suppressed under `None` like them.
+        diags.extend(check::duplicate_doc_fields(&items, file));
         inferred_types = inference.expr_types;
     }
     let _ = inferred_types;
 
-    // Honor luals' `---@diagnostic disable: undefined-field` for the
-    // undefined-field read rule (LB0306, #90). Scoped to this one rule; see
-    // `directive.rs` for why it does not reuse the linter's engine.
-    if diags.iter().any(|d| d.code.to_string() == "LB0306") {
+    // Honor luals' `---@diagnostic disable*: <rule>` for the checker
+    // diagnostics that carry a luals rule name (`undefined-field` → LB0306,
+    // `deprecated` → LB0308, `discard-returns` → LB0309, `duplicate-doc-field`
+    // → LB0311). One scan serves them all; see `directive.rs` for why it does
+    // not reuse the linter's engine.
+    if diags
+        .iter()
+        .any(|d| directive::rule_for_code(&d.code.to_string()).is_some())
+    {
         let source = parse.syntax().text().to_string();
-        let sup = directive::UndefinedFieldSuppression::scan(&source);
+        let sup = directive::DirectiveScan::scan(&source);
         if sup.any() {
             diags.retain(|d| {
-                d.code.to_string() != "LB0306"
-                    || !sup.suppresses(
-                        d.primary_label()
-                            .map_or(0, |l| directive::line_of(&source, l.span.range.start)),
-                    )
+                let code = d.code.to_string();
+                let Some(rule) = directive::rule_for_code(&code) else {
+                    return true;
+                };
+                let line = d
+                    .primary_label()
+                    .map_or(0, |l| directive::line_of(&source, l.span.range.start));
+                !sup.suppresses(rule, line)
             });
         }
     }
@@ -1100,5 +1112,300 @@ f(\"no\")
         let label = diags[0].primary_label().expect("primary label");
         assert_eq!(label.span.file, "test.lua");
         assert_eq!(&src[label.span.range.clone()], "\"no\"");
+    }
+
+    // --- #111 `---@deprecated` (LB0308) --------------------------------------
+
+    fn ambient_codes(src: &str, defs: &[&str]) -> Vec<String> {
+        let ambient = crate::defs::Ambient::build(defs);
+        let parse = parse(src, Dialect::Lua54);
+        assert_eq!(parse.errors(), &[], "fixture must parse cleanly");
+        check_file_with_ambient(&parse, "test.lua", Strictness::Warn, Some(&ambient))
+            .iter()
+            .map(|d| d.code.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn deprecated_local_function_call_flagged() {
+        let src = "\
+---@deprecated
+local function old() end
+old()
+";
+        assert_eq!(codes(src, Strictness::Warn), vec!["LB0308"]);
+    }
+
+    #[test]
+    fn deprecated_dotted_function_call_flagged() {
+        let src = "\
+local M = {}
+---@deprecated
+function M.legacy() end
+M.legacy()
+";
+        assert_eq!(codes(src, Strictness::Warn), vec!["LB0308"]);
+    }
+
+    #[test]
+    fn deprecated_value_reference_flagged() {
+        let src = "\
+---@deprecated
+local function old() end
+local alias = old
+";
+        // Referencing (not just calling) a deprecated function is a use.
+        assert_eq!(codes(src, Strictness::Warn), vec!["LB0308"]);
+    }
+
+    #[test]
+    fn deprecated_declaration_site_not_flagged() {
+        let src = "\
+---@deprecated
+local function old() end
+";
+        // The declaration itself is never flagged — only uses are.
+        assert_eq!(codes(src, Strictness::Warn), Vec::<String>::new());
+    }
+
+    #[test]
+    fn deprecated_is_warning_even_under_strict() {
+        let src = "\
+---@deprecated
+local function old() end
+old()
+";
+        let diags = check(src, Strictness::Strict);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, Severity::Warning);
+        assert_eq!(diags[0].code.to_string(), "LB0308");
+    }
+
+    #[test]
+    fn deprecated_does_not_add_arity_errors() {
+        // A bare `---@deprecated` block must not enable arity checking on an
+        // otherwise unannotated function.
+        let src = "\
+---@deprecated
+local function old(a, b) end
+old(1, 2, 3, 4)
+";
+        assert_eq!(codes(src, Strictness::Warn), vec!["LB0308"]);
+    }
+
+    #[test]
+    fn deprecated_suppressed_by_directive() {
+        let src = "\
+---@deprecated
+local function old() end
+---@diagnostic disable-next-line: deprecated
+old()
+";
+        assert_eq!(codes(src, Strictness::Warn), Vec::<String>::new());
+    }
+
+    #[test]
+    fn deprecated_suppressed_file_wide() {
+        let src = "\
+---@diagnostic disable: deprecated
+---@deprecated
+local function old() end
+old()
+old()
+";
+        assert_eq!(codes(src, Strictness::Warn), Vec::<String>::new());
+    }
+
+    #[test]
+    fn deprecated_cross_file_via_defs() {
+        let defs = "\
+---@meta
+---@deprecated
+function oldGlobal() end
+";
+        let src = "oldGlobal()\n";
+        assert_eq!(ambient_codes(src, &[defs]), vec!["LB0308"]);
+    }
+
+    #[test]
+    fn non_deprecated_call_is_clean() {
+        let src = "\
+local function ok() end
+ok()
+";
+        assert_eq!(codes(src, Strictness::Warn), Vec::<String>::new());
+    }
+
+    #[test]
+    fn deprecated_cross_file_via_require() {
+        // `Api.old` is deprecated in the required module; the flag rides the
+        // module's export type into the consumer and flags the use site.
+        let api = parse(
+            "local Api = {}\n---@deprecated\nfunction Api.old() end\nreturn Api\n",
+            Dialect::Lua54,
+        );
+        let export = module_surface(&api, "api.lua", None)
+            .export
+            .expect("module exports a table");
+        let mut requires = HashMap::new();
+        requires.insert("api".to_string(), export);
+        let main = parse("local Api = require(\"api\")\nApi.old()\n", Dialect::Lua54);
+        let diags = check_file_with_requires(&main, "main.lua", Strictness::Warn, None, &requires);
+        let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
+        assert_eq!(codes, vec!["LB0308"]);
+    }
+
+    // --- #112 `---@nodiscard` (LB0309) ---------------------------------------
+
+    #[test]
+    fn nodiscard_bare_call_flagged() {
+        let src = "\
+---@nodiscard
+---@return boolean
+local function save() return true end
+save()
+";
+        assert_eq!(codes(src, Strictness::Warn), vec!["LB0309"]);
+    }
+
+    #[test]
+    fn nodiscard_bound_result_is_clean() {
+        let src = "\
+---@nodiscard
+---@return boolean
+local function save() return true end
+local ok = save()
+";
+        assert_eq!(codes(src, Strictness::Warn), Vec::<String>::new());
+    }
+
+    #[test]
+    fn nodiscard_used_in_expression_is_clean() {
+        let src = "\
+---@nodiscard
+---@return boolean
+local function save() return true end
+if save() then end
+";
+        assert_eq!(codes(src, Strictness::Warn), Vec::<String>::new());
+    }
+
+    #[test]
+    fn nodiscard_suppressed_by_directive() {
+        let src = "\
+---@nodiscard
+---@return boolean
+local function save() return true end
+---@diagnostic disable-next-line: discard-returns
+save()
+";
+        assert_eq!(codes(src, Strictness::Warn), Vec::<String>::new());
+    }
+
+    #[test]
+    fn nodiscard_cross_file_via_defs() {
+        let defs = "\
+---@meta
+---@nodiscard
+---@return boolean
+function mustUse() end
+";
+        let src = "mustUse()\n";
+        assert_eq!(ambient_codes(src, &[defs]), vec!["LB0309"]);
+    }
+
+    /// The `require`-export registry for a single module, for the cross-file
+    /// nodiscard tests (mirrors [`deprecated_cross_file_via_require`]).
+    fn require_registry(module: &str, src: &str) -> HashMap<String, Ty> {
+        let parse = parse(src, Dialect::Lua54);
+        assert_eq!(parse.errors(), &[], "fixture must parse cleanly");
+        let export = module_surface(&parse, "mod.lua", None)
+            .export
+            .expect("module exports a table");
+        let mut requires = HashMap::new();
+        requires.insert(module.to_string(), export);
+        requires
+    }
+
+    #[test]
+    fn nodiscard_cross_file_via_require() {
+        // `old.important` is nodiscard in the required module; the flag rides
+        // the module's export type into the consumer, so a bare call statement
+        // in the consumer is a discard (#112 parity with LB0308's reach).
+        let requires = require_registry(
+            "old",
+            "local M = {}\n---@nodiscard\n---@return number\nfunction M.important() return 2 end\nreturn M\n",
+        );
+        let main = parse(
+            "local old = require(\"old\")\nold.important()\n",
+            Dialect::Lua54,
+        );
+        let diags = check_file_with_requires(&main, "main.lua", Strictness::Warn, None, &requires);
+        let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
+        assert_eq!(codes, vec!["LB0309"]);
+    }
+
+    #[test]
+    fn nodiscard_cross_file_via_require_bound_is_clean() {
+        // Binding the result accepts it — no discard, exactly as same-file.
+        let requires = require_registry(
+            "old",
+            "local M = {}\n---@nodiscard\n---@return number\nfunction M.important() return 2 end\nreturn M\n",
+        );
+        let main = parse(
+            "local old = require(\"old\")\nlocal n = old.important()\nprint(n)\n",
+            Dialect::Lua54,
+        );
+        let diags = check_file_with_requires(&main, "main.lua", Strictness::Warn, None, &requires);
+        let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
+        assert_eq!(codes, Vec::<String>::new());
+    }
+
+    // --- #113 duplicate-doc-field (LB0311) -----------------------------------
+
+    #[test]
+    fn duplicate_doc_field_flagged() {
+        let src = "\
+---@class Point
+---@field x number
+---@field y number
+---@field x integer
+local Point = {}
+";
+        assert_eq!(codes(src, Strictness::Warn), vec!["LB0311"]);
+    }
+
+    #[test]
+    fn distinct_fields_are_clean() {
+        let src = "\
+---@class Point
+---@field x number
+---@field y number
+local Point = {}
+";
+        assert_eq!(codes(src, Strictness::Warn), Vec::<String>::new());
+    }
+
+    #[test]
+    fn duplicate_doc_field_suppressed_by_directive() {
+        let src = "\
+---@class Point
+---@field x number
+---@diagnostic disable-next-line: duplicate-doc-field
+---@field x integer
+local Point = {}
+";
+        assert_eq!(codes(src, Strictness::Warn), Vec::<String>::new());
+    }
+
+    #[test]
+    fn duplicate_doc_field_not_under_none() {
+        let src = "\
+---@class Point
+---@field x number
+---@field x integer
+local Point = {}
+";
+        assert_eq!(codes(src, Strictness::None), Vec::<String>::new());
     }
 }

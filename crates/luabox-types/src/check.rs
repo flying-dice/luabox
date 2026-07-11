@@ -36,6 +36,10 @@ const MISSING_FIELD: u16 = 302;
 const UNKNOWN_FIELD: u16 = 303;
 const RETURN_MISMATCH: u16 = 304;
 const UNKNOWN_TYPE_NAME: u16 = 305;
+/// Use of a `---@deprecated` symbol (luals `deprecated`, #111).
+const DEPRECATED: u16 = 308;
+/// Discarded return of a `---@nodiscard` call (luals `discard-returns`, #112).
+const DISCARD_RETURNS: u16 = 309;
 
 /// Run the checker over one parsed file. `inferred` carries the
 /// inference engine's expression types keyed by byte range — consulted
@@ -189,6 +193,17 @@ impl Checker<'_> {
         self.diags.push(diag);
     }
 
+    /// Report at a fixed `Warning` severity, regardless of the strictness
+    /// ladder. `---@deprecated` and `---@nodiscard` findings are advisory:
+    /// luals keeps them `Warning` in every mode (they never escalate to an
+    /// error the way a real type mismatch does), so luabox mirrors that.
+    fn report_warning(&mut self, code: u16, range: Range<usize>, message: String, label: String) {
+        self.diags.push(
+            Diagnostic::new(Code::new(code), Severity::Warning, message)
+                .with_label(Label::primary(Span::new(self.file, range), label)),
+        );
+    }
+
     fn assignable(&self, value: &Ty, target: &Ty) -> bool {
         assignable(self.env, self.strict, value, target)
     }
@@ -259,7 +274,7 @@ impl Checker<'_> {
                     {
                         self.check_slot(&Slot::Expr(value.clone()), &binding.ty, TYPE_MISMATCH);
                     }
-                    self.visit_expr(target);
+                    self.visit_target(target);
                 }
                 for value in &values {
                     self.visit_expr(value);
@@ -273,7 +288,12 @@ impl Checker<'_> {
                 }
                 self.check_return(ret);
             }
-            Stmt::Call(call) => self.visit_opt_expr(call.expr()),
+            Stmt::Call(call) => {
+                if let Some(Expr::Call(inner)) = call.expr() {
+                    self.check_discard(&inner);
+                }
+                self.visit_opt_expr(call.expr());
+            }
             Stmt::Do(stmt) => self.visit_opt_block(stmt.body()),
             Stmt::While(stmt) => {
                 self.visit_opt_expr(stmt.condition());
@@ -665,9 +685,113 @@ impl Checker<'_> {
                 self.visit_opt_expr(index.base());
                 self.visit_opt_expr(index.index());
             }
-            Expr::Field(field) => self.visit_opt_expr(field.base()),
-            Expr::Name(_) | Expr::Literal(_) | Expr::Vararg(_) => {}
+            Expr::Field(field) => {
+                self.note_deprecated_read(expr);
+                self.visit_opt_expr(field.base());
+            }
+            Expr::Name(_) => self.note_deprecated_read(expr),
+            Expr::Literal(_) | Expr::Vararg(_) => {}
         }
+    }
+
+    /// Visit an assignment *target* (LHS): its base/index sub-expressions are
+    /// reads, but the target name/field itself is a write and never triggers a
+    /// `---@deprecated` use finding. Mirrors the read traversal of
+    /// [`Checker::visit_expr`] minus the outer deprecation check.
+    fn visit_target(&mut self, target: &Expr) {
+        match target {
+            Expr::Name(_) => {}
+            Expr::Field(field) => self.visit_opt_expr(field.base()),
+            Expr::Index(index) => {
+                self.visit_opt_expr(index.base());
+                self.visit_opt_expr(index.index());
+            }
+            other => self.visit_expr(other),
+        }
+    }
+
+    /// Report `LB0308` when `expr` reads a `---@deprecated` function — a bare
+    /// name bound to (or globally naming) a deprecated function, or a dotted
+    /// `M.f` naming one (luals `deprecated`, #111). Call sites are covered
+    /// automatically: a call visits its callee through this path, so `f()`,
+    /// `M.f()`, and a plain value reference `local g = f` all report exactly
+    /// once. Write targets go through [`Checker::visit_target`] instead and are
+    /// never flagged (the declaration site is not a use).
+    fn note_deprecated_read(&mut self, expr: &Expr) {
+        let (deprecated, name) = match expr {
+            Expr::Name(n) => {
+                let Some(ident) = n.name() else { return };
+                let text = ident.text();
+                let dep = match self.lookup(text) {
+                    Some(Binding {
+                        ty: Ty::Function(f),
+                        ..
+                    }) => f.deprecated,
+                    // A shadowing non-function local means the name no longer
+                    // refers to the deprecated function.
+                    Some(_) => false,
+                    None => self.env.function(text).is_some_and(|f| f.deprecated),
+                };
+                (dep, text.to_string())
+            }
+            Expr::Field(_) => {
+                let Some(dotted) = dotted_name(expr) else {
+                    return;
+                };
+                // A dotted callable declared in this file's env (`function M.f`,
+                // an ambient defs function) is the direct hit; otherwise fall
+                // back to the *resolved field type* so a deprecated function
+                // reached as a field of a typed receiver — e.g. a `require`d
+                // module's member, or a class field typed `fun(...)` — is still
+                // flagged. The field path only ever reports when the resolved
+                // type is a deprecated function, so it never false-positives.
+                let dep = self.env.function(&dotted).is_some_and(|f| f.deprecated)
+                    || matches!(self.expr_ty(expr), Ty::Function(f) if f.deprecated);
+                (dep, dotted)
+            }
+            _ => return,
+        };
+        if deprecated {
+            self.report_warning(
+                DEPRECATED,
+                range(expr.syntax()),
+                format!("use of deprecated `{name}`"),
+                format!("`{name}` is marked `---@deprecated`"),
+            );
+        }
+    }
+
+    /// Report `LB0309` when a bare call statement discards the return of a
+    /// `---@nodiscard` function (luals `discard-returns`, #112). Only a
+    /// statement-position call is a discard — a call bound to a local, used in
+    /// a larger expression, or passed as an argument keeps its value and is
+    /// accepted, matching luals.
+    fn check_discard(&mut self, call: &CallExpr) {
+        let Some(callee) = call.callee() else {
+            return;
+        };
+        // Env-registered callables (`function M.f` in this file, ambient defs
+        // functions) resolve through `callee_sig`; otherwise fall back to the
+        // *resolved type* of the callee expression, so a nodiscard function
+        // reached as a field of a typed receiver — e.g. a `require`d module's
+        // member — is still flagged. Same two-step lookup as the `deprecated`
+        // read check ([`Checker::note_deprecated_read`]): the sibling flag
+        // rides the identical `FunctionTy`, so both must consult both paths.
+        let nodiscard = self.callee_sig(&callee).is_some_and(|sig| sig.nodiscard)
+            || matches!(self.expr_ty(&callee), Ty::Function(f) if f.nodiscard);
+        if !nodiscard {
+            return;
+        }
+        let name = call
+            .callee()
+            .and_then(|c| dotted_name(&c))
+            .map_or_else(|| "function".to_string(), |n| format!("`{n}`"));
+        self.report_warning(
+            DISCARD_RETURNS,
+            range(call.syntax()),
+            format!("return value of {name} is discarded"),
+            "this call is annotated `---@nodiscard`; its result must be used".to_string(),
+        );
     }
 
     fn visit_arg_exprs(&mut self, args: Option<lua::ast::ArgList>) {
@@ -1356,6 +1480,60 @@ impl Checker<'_> {
             }
         }
     }
+}
+
+/// Detect a `---@field` name declared more than once for the same
+/// `---@class` in this file — luals `duplicate-doc-field` (`LB0311`, #113).
+///
+/// Scoped to a single file: the same declarations checked standalone or in a
+/// project yield the same finding, so the CLI and the LSP agree. The first
+/// declaration of a name wins (its type is the one the checker uses); every
+/// later `---@field` of that name on the same class is reported at its own
+/// span, with a note pointing back. Indexer fields (`---@field [K] V`) are not
+/// named and never collide.
+pub(crate) fn duplicate_doc_fields(
+    items: &[luabox_syntax::luacats::AnnotatedItem],
+    file: &str,
+) -> Vec<Diagnostic> {
+    use luabox_syntax::luacats::{FieldKey, Tag};
+
+    let mut seen: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut diags = Vec::new();
+    for item in items {
+        // Fields belong to the most recent `---@class` in the same block
+        // (mirrors `TypeEnv::absorb_block`'s `current_class` tracking); the
+        // seen-set is keyed by class *name* so a class split across blocks in
+        // one file still collides.
+        let mut current: Option<String> = None;
+        for tag in &item.block.tags {
+            match tag {
+                Tag::Class(c) if !c.name.is_empty() => current = Some(c.name.clone()),
+                Tag::Field(f) => {
+                    let (Some(class), FieldKey::Name(name)) = (current.as_ref(), &f.key) else {
+                        continue;
+                    };
+                    if !seen.entry(class.clone()).or_default().insert(name.clone()) {
+                        diags.push(
+                            Diagnostic::new(
+                                Code::new(311),
+                                Severity::Warning,
+                                format!("duplicate field `{name}` on class `{class}`"),
+                            )
+                            .with_label(Label::primary(
+                                Span::new(file, f.span.start..f.span.end),
+                                format!("`{name}` is already declared on `{class}`"),
+                            ))
+                            .with_note(
+                                "the first declaration wins; remove or rename this one".to_string(),
+                            ),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    diags
 }
 
 // --- helpers -------------------------------------------------------------

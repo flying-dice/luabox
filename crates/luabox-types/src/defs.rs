@@ -374,6 +374,95 @@ fn class_collisions(defs: &[DefFile]) -> Vec<Diagnostic> {
     diags
 }
 
+/// Detect `---@alias` names declared by more than one source across the
+/// project — luals `duplicate-doc-alias` (`LB0310`, #113).
+///
+/// This is the alias counterpart of [`class_collisions`], but reaches project
+/// *source* files too: after #110 a same-name `---@alias` in two project files
+/// resolves silently first-wins, and this restores luals's warning at the
+/// losing site. The winner order matches the runtime resolution
+/// ([`Ambient::with_project_types`]): every `[types] defs` source in `defs`
+/// (winner-first) is considered first — an ambient alias always wins — then the
+/// project files in `project`'s stable order. The first source to declare a
+/// name owns it and is never reported; each later declaration yields an
+/// `LB0310` warning naming the file that already declared it.
+///
+/// Deliberately excludes the dialect stdlib layer (like `class_collisions`):
+/// only the explicit `[types] defs` and project files participate, so a project
+/// alias never collides with a hidden stdlib name.
+#[must_use]
+pub fn alias_collisions(
+    defs: &[DefFile],
+    project: &[(String, &crate::env::FileTypes)],
+) -> Vec<Diagnostic> {
+    let mut owner: BTreeMap<String, String> = BTreeMap::new();
+    let mut diags = Vec::new();
+    // `[types] defs` sources first — winner-first, so an ambient alias owns the
+    // name and any project redeclaration below loses to it.
+    for def in defs {
+        let parse = lua::parse(&def.text, Dialect::Lua54);
+        let items = luacats::harvest(&parse);
+        let mut claimed_here: HashSet<String> = HashSet::new();
+        for item in &items {
+            for tag in &item.block.tags {
+                let Tag::Alias(alias) = tag else { continue };
+                if alias.name.is_empty() || !claimed_here.insert(alias.name.clone()) {
+                    continue;
+                }
+                report_alias(
+                    &mut owner,
+                    &mut diags,
+                    &alias.name,
+                    &def.file,
+                    alias.span.start..alias.span.end,
+                );
+            }
+        }
+    }
+    // Project files, in the caller's stable order: the first to declare a name
+    // (that no def already owns) wins; the rest lose.
+    for (label, types) in project {
+        for (name, alias) in types.aliases() {
+            report_alias(
+                &mut owner,
+                &mut diags,
+                name,
+                label,
+                alias.span.start..alias.span.end,
+            );
+        }
+    }
+    diags
+}
+
+/// Claim `name` for `file` if unclaimed, else emit an `LB0310` at `span`
+/// pointing back at the owner.
+fn report_alias(
+    owner: &mut BTreeMap<String, String>,
+    diags: &mut Vec<Diagnostic>,
+    name: &str,
+    file: &str,
+    span: std::ops::Range<usize>,
+) {
+    if let Some(first) = owner.get(name) {
+        diags.push(
+            Diagnostic::warning(
+                Code::new(310),
+                format!("alias `{name}` is declared more than once"),
+            )
+            .with_label(Label::primary(
+                Span::new(file.to_string(), span),
+                "duplicate declaration here",
+            ))
+            .with_note(format!(
+                "first declared in `{first}`; that declaration wins"
+            )),
+        );
+    } else {
+        owner.insert(name.to_string(), file.to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,6 +759,53 @@ f(math.pi)
             !loser.is_empty(),
             "dependency decl (field `b`) must have lost"
         );
+    }
+
+    // --- duplicate-doc-alias (#113) -------------------------------------
+
+    fn file_types(src: &str) -> crate::env::FileTypes {
+        crate::module_surface(&lua::parse(src, Dialect::Lua54), "x.lua", None).types
+    }
+
+    #[test]
+    fn alias_collision_across_project_files_first_wins() {
+        let a = file_types("---@alias Id integer\n");
+        let b = file_types("---@alias Id string\n");
+        let diags = alias_collisions(&[], &[("a.lua".to_string(), &a), ("b.lua".to_string(), &b)]);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code.to_string(), "LB0310");
+        assert_eq!(diags[0].severity, luabox_diag::Severity::Warning);
+        // The second file (stable order) loses; the first is named in the note.
+        let label = diags[0].primary_label().expect("primary label");
+        assert_eq!(label.span.file, "b.lua");
+        assert!(
+            diags[0].notes.iter().any(|n| n.contains("a.lua")),
+            "note names the winner: {:?}",
+            diags[0].notes
+        );
+    }
+
+    #[test]
+    fn alias_defs_win_over_project() {
+        let defs = vec![DefFile {
+            file: "defs/ids.d.lua".to_string(),
+            text: "---@meta\n---@alias Id integer\n".to_string(),
+        }];
+        let proj = file_types("---@alias Id string\n");
+        let diags = alias_collisions(&defs, &[("p.lua".to_string(), &proj)]);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code.to_string(), "LB0310");
+        let label = diags[0].primary_label().expect("primary label");
+        assert_eq!(label.span.file, "p.lua", "the project decl loses to defs");
+        assert!(diags[0].notes.iter().any(|n| n.contains("defs/ids.d.lua")));
+    }
+
+    #[test]
+    fn distinct_aliases_no_collision() {
+        let a = file_types("---@alias Id integer\n");
+        let b = file_types("---@alias Name string\n");
+        let diags = alias_collisions(&[], &[("a.lua".to_string(), &a), ("b.lua".to_string(), &b)]);
+        assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]

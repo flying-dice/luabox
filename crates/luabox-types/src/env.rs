@@ -583,9 +583,16 @@ impl TypeEnv {
         let mut overloads: Vec<FunctionTy> = Vec::new();
         let mut casts: Vec<CastEntry> = Vec::new();
         let mut fn_generics: Vec<TypeParam> = Vec::new();
+        // `---@deprecated` / `---@nodiscard` attach to the whole doc block, so
+        // a block that annotates a function carries them onto that function's
+        // signature (#111, #112). Scanned alongside the other tags.
+        let mut deprecated = false;
+        let mut nodiscard = false;
 
         for tag in &item.block.tags {
             match tag {
+                Tag::Deprecated(_) => deprecated = true,
+                Tag::Nodiscard(_) => nodiscard = true,
                 Tag::Class(c) if !c.name.is_empty() => {
                     let parents = c
                         .parents
@@ -679,14 +686,28 @@ impl TypeEnv {
         {
             self.casts.entry(target).or_default().append(&mut casts);
         }
-        if (!params.is_empty() || !returns.is_empty() || !overloads.is_empty())
+        // A bare `---@deprecated`/`---@nodiscard` block (no `---@param`/
+        // `---@return`) must still attach a signature so the flag reaches the
+        // function's use sites; `attach_function` no-ops on non-function
+        // targets, so deprecating a `---@class` carrier is harmless here.
+        let has_sig_tags = !params.is_empty() || !returns.is_empty() || !overloads.is_empty();
+        if (has_sig_tags || deprecated || nodiscard)
             && let Some(target) = target
         {
-            let func = FunctionTy {
+            let mut func = FunctionTy {
                 overloads,
                 generics: fn_generics,
+                deprecated,
+                nodiscard,
                 ..FunctionTy::default()
             };
+            // With no signature tags the block contributes only the flag:
+            // stay fully arity/type-permissive (an unannotated function is
+            // never arity-checked), so `---@deprecated` alone never manufactures
+            // an `LB0301`/`LB0300`.
+            if !has_sig_tags {
+                func.varargs = Some(Ty::Any);
+            }
             self.attach_function(&params, &returns, func, target, lowerer, root);
         }
         if let (Some(types), Some(target)) = (types, target) {

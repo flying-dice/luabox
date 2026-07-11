@@ -677,6 +677,9 @@ impl Infer<'_> {
             has_return_annotation: returns_set && self.seed_params,
             overloads: Vec::new(),
             generics: Vec::new(),
+            // Inferred (unannotated) functions carry no doc-comment flags.
+            deprecated: false,
+            nodiscard: false,
         }
     }
 

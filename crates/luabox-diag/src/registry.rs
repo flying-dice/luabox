@@ -99,6 +99,26 @@ static REGISTRY: &[Entry] = &[
         explain: LB0307,
     },
     Entry {
+        code: Code::new(308),
+        title: "use of a deprecated symbol (deprecated)",
+        explain: LB0308,
+    },
+    Entry {
+        code: Code::new(309),
+        title: "discarded return of a `---@nodiscard` call (discard-returns)",
+        explain: LB0309,
+    },
+    Entry {
+        code: Code::new(310),
+        title: "alias declared more than once (duplicate-doc-alias)",
+        explain: LB0310,
+    },
+    Entry {
+        code: Code::new(311),
+        title: "duplicate field on a class (duplicate-doc-field)",
+        explain: LB0311,
+    },
+    Entry {
         code: Code::new(500),
         title: "malformed `---@luabox-ignore`",
         explain: LB0500,
@@ -621,6 +641,146 @@ hand-vendored copy of a dependency's types) delete the copy and let the
 dependency's own defs reach you automatically.
 ";
 
+const LB0308: &str = "\
+# LB0308: use of a deprecated symbol (deprecated)
+
+A symbol annotated `---@deprecated` is used. This is
+lua-language-server's `deprecated` diagnostic: a **warning** at every *use*
+site, never at the declaration itself. luals surfaces it identically (a
+warning, with editors striking the name through).
+
+```lua
+---@deprecated
+local function oldApi() end
+
+oldApi()   -- LB0308: use of deprecated `oldApi`
+```
+
+It fires wherever a `---@deprecated` **function** is referenced — a call, a
+plain value reference, an argument — for a `local function`, a global
+`function`, or a dotted `function M.f` / `function Class.f`. The annotation
+travels across files: a deprecated function declared in a `[types] defs`
+package (or any workspace-shared surface) is flagged at its use sites in
+consuming files, exactly as luals resolves it.
+
+The declaration site is never flagged — only uses are. Writes are not uses:
+assigning *to* the name (`M.f = ...`) is not reported.
+
+**Suppression** — the LuaCATS directive luals itself recognises:
+
+```lua
+---@diagnostic disable: deprecated
+oldApi()   -- not flagged (file-wide)
+
+---@diagnostic disable-next-line: deprecated
+oldApi()   -- not flagged, this line only
+```
+
+Migrate to the replacement the deprecation notice names, or — if the use is
+deliberate — suppress it with the directive above.
+
+**Not yet covered:** `:` method calls (`obj:m()`) and field-level
+deprecation are not resolved by the P0 checker, which does not yet type
+method receivers; a deprecated method reached through a colon call is not
+flagged.
+";
+
+const LB0309: &str = "\
+# LB0309: discarded return of a `---@nodiscard` call (discard-returns)
+
+A function annotated `---@nodiscard` is called as a bare statement, throwing
+its return value away. This is lua-language-server's `discard-returns`
+diagnostic (a **warning**): `---@nodiscard` promises the return matters —
+an error code, a new value, a handle you must keep — so ignoring it is
+almost always a bug.
+
+```lua
+---@nodiscard
+---@return boolean ok
+local function saveState() return true end
+
+saveState()          -- LB0309: return value of `saveState` is discarded
+local ok = saveState()   -- fine: the result is used
+```
+
+Only a **statement-position** call is a discard. A call whose result is
+bound to a local, used inside a larger expression, or passed as an argument
+keeps the value and is accepted — matching luals. The annotation reaches
+across files and `[types] defs` packages the same way the signature does.
+
+**Suppression:**
+
+```lua
+---@diagnostic disable-next-line: discard-returns
+saveState()   -- not flagged, this line only
+```
+
+Use the return value (bind it, even to `local _ = saveState()`), or suppress
+the diagnostic if the discard is genuinely intended.
+";
+
+const LB0310: &str = "\
+# LB0310: alias declared more than once (duplicate-doc-alias)
+
+A `---@alias` name is declared by more than one source in the project. This
+is lua-language-server's `duplicate-doc-alias` diagnostic (a **warning**).
+`---@class`, `---@enum`, and `---@alias` names are workspace-global (luals
+parity): an alias declared in any project file is nameable from every other,
+so two files declaring the same alias name is a genuine collision.
+
+```lua
+-- a.lua
+---@alias Id integer
+
+-- b.lua
+---@alias Id string   -- LB0310: `Id` already declared in `a.lua`
+```
+
+**Deterministic winner.** The resolution order is unchanged from how the
+checker already picks the surviving alias: every `[types] defs` source is
+considered first (an ambient alias always wins), then the project files in a
+stable path order. The **first** declaration of a name wins — its body is the
+one the checker expands — and every later declaration is reported here,
+naming the file that already owns the name.
+
+Rename one alias, or drop the duplicate. Like the `LB0307` cross-package
+class collision, this is a project-wide finding computed once over the whole
+source set (not in a single file's check), so a file checked on its own never
+reports it.
+";
+
+const LB0311: &str = "\
+# LB0311: duplicate field on a class (duplicate-doc-field)
+
+A `---@field` name is declared more than once for the same `---@class`. This
+is lua-language-server's `duplicate-doc-field` diagnostic (a **warning**).
+
+```lua
+---@class Point
+---@field x number
+---@field y number
+---@field x integer   -- LB0311: `x` is already declared on `Point`
+```
+
+The **first** declaration wins — its type is the one the checker uses — and
+each later `---@field` of the same name is reported at its own line. Indexer
+fields (`---@field [string] T`) are unnamed and never collide.
+
+This is a per-file finding: the same class declaration flags the same
+duplicate whether the file is checked on its own or as part of a project, so
+`luabox check` and the editor agree.
+
+**Suppression:**
+
+```lua
+---@diagnostic disable-next-line: duplicate-doc-field
+---@field x integer   -- not flagged
+```
+
+Remove the redundant `---@field`, or rename it if two distinct fields were
+intended.
+";
+
 const LB0500: &str = "\
 # LB0500: malformed `---@luabox-ignore`
 
@@ -1123,8 +1283,8 @@ mod tests {
         for raw in [
             "LB0001", "LB0010", "LB0011", "LB0012", "LB0013", "LB0014", "LB0015", "LB0016",
             "LB0300", "LB0301", "LB0302", "LB0303", "LB0304", "LB0305", "LB0306", "LB0307",
-            "LB0500", "LB0501", "LB0502", "LB0503", "LB0504", "LB0505", "LB0506", "LB0507",
-            "LB0508", "LB0509", "LB1001", "LB1100",
+            "LB0308", "LB0309", "LB0310", "LB0311", "LB0500", "LB0501", "LB0502", "LB0503",
+            "LB0504", "LB0505", "LB0506", "LB0507", "LB0508", "LB0509", "LB1001", "LB1100",
         ] {
             let code: Code = raw.parse().unwrap();
             assert!(explain(&code).is_some(), "{raw} missing from registry");

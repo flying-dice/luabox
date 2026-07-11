@@ -123,7 +123,7 @@ pub(crate) fn run_once(
     // requires are left unresolved, so the registry is acyclic and
     // cycle-tolerant. Resolution reuses the bundler's exact `require`
     // path-mapping ([`luabox_bundle::resolve_module`]).
-    let surfaces: Vec<(PathBuf, luabox_types::ModuleSurface)> = lua_files
+    let surfaces: Vec<(PathBuf, String, luabox_types::ModuleSurface)> = lua_files
         .par_iter()
         .filter_map(|path| {
             let source = fs::read_to_string(path).ok()?;
@@ -131,18 +131,31 @@ pub(crate) fn run_once(
             let rel = display_rel(path, &project.root);
             Some((
                 canonical(path),
+                rel.clone(),
                 luabox_types::module_surface(&parse, &rel, Some(ambient)),
             ))
         })
         .collect();
     let exports: HashMap<PathBuf, Ty> = surfaces
         .iter()
-        .filter_map(|(path, surface)| Some((path.clone(), surface.export.clone()?)))
+        .filter_map(|(path, _rel, surface)| Some((path.clone(), surface.export.clone()?)))
         .collect();
+    // Duplicate `---@alias` across project files / `[types] defs` (luals
+    // `duplicate-doc-alias`, LB0310, #113): a project-assembly finding — like
+    // the LB0307 class collisions above — computed over the whole source set,
+    // never in the per-file check, so a file checked standalone and in-project
+    // stays consistent. Winner order matches `with_project_types`.
+    def_diags.extend(luabox_types::alias_collisions(
+        &all_defs,
+        &surfaces
+            .iter()
+            .map(|(_, rel, s)| (rel.clone(), &s.types))
+            .collect::<Vec<_>>(),
+    ));
     // The project-wide ambient: defs + every file's workspace-global
     // classes/enums, merged (defs win same-name member collisions; luals
     // merges duplicate class declarations' fields rather than dropping).
-    let ambient = ambient.with_project_types(surfaces.iter().map(|(_, s)| &s.types));
+    let ambient = ambient.with_project_types(surfaces.iter().map(|(_, _, s)| &s.types));
     let ambient = &ambient;
 
     // SPEC.md §16: rayon per-module. Each file is checked against the

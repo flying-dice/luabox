@@ -15,15 +15,12 @@ Where an item has a tracking issue, it is linked.
 `---@class`, `---@enum`, and `---@alias` names are all workspace-global: an
 alias declared in any project file is nameable and enforced from every other
 file (luals parity), so no `require()` and no `[types] defs` package is needed
-to share an alias by name. Two residual behaviors differ from lua-language-server
-and are worth knowing:
+to share an alias by name. A same-name `---@alias` declared in more than one
+project file (or shadowing a `[types] defs` alias) now warns as
+`duplicate-doc-alias` (`LB0310`) at the losing site, matching luals, while the
+deterministic first-wins winner is unchanged. One residual behavior still
+differs from lua-language-server and is worth knowing:
 
-- **Duplicate aliases are silently resolved, not warned.** When two project
-  files declare the same alias name, luabox keeps the first deterministically
-  (project files in stable path order; an ambient `[types] defs` alias always
-  wins over a project one) and does **not** emit a duplicate-declaration
-  warning. luals reports a `duplicate-doc-alias` diagnostic; luabox does not
-  (yet) — cross-package `---@class` collisions still warn as `LB0307`.
 - **A cyclic alias collapses to `unknown` instead of being reported.** A
   self- or mutually-referential alias (`---@alias A B` / `---@alias B A`,
   across files or within one) terminates safely — the recursive edge lowers to
@@ -39,17 +36,22 @@ are accepted and ignored rather than rejected:
 | Tag | Status in `check` / `lint` |
 |---|---|
 | `---@operator` | Parsed; operator-overload result types are not applied during inference. |
-| `---@nodiscard` | Parsed; discarding the annotated return is not diagnosed. |
-| `---@deprecated` | Parsed; using a deprecated symbol is not diagnosed (it is surfaced by `luabox doc`). |
 | `---@async` | Parsed; no async/await checking. |
 | `---@vararg` (legacy standalone form) | Parsed; the legacy standalone tag is not wired to inference (the `---@param ...` form is the modern spelling). |
 | `---@version`, `---@source`, `---@see`, `---@package` | Metadata; ignored by checking (some surface in `luabox doc`). |
 
 Tags that **are** enforced today: `---@class` (incl. `: Parent` conformance),
-`---@field`, `---@param`, `---@return`, `---@type`, `---@alias` (same-file,
-defs, and cross-file by name), `---@generic`, `---@enum`, `---@overload`,
-`---@cast`, `---@meta`,
-`---@diagnostic` (lint suppression), and inline `--[[@as T]]`.
+`---@field` (incl. `duplicate-doc-field`), `---@param`, `---@return`,
+`---@type`, `---@alias` (same-file, defs, and cross-file by name, incl.
+`duplicate-doc-alias`), `---@generic`, `---@enum`, `---@overload`, `---@cast`,
+`---@meta`, `---@deprecated` (use sites diagnosed, luals `deprecated`),
+`---@nodiscard` (discarded returns diagnosed, luals `discard-returns`),
+`---@diagnostic` (lint + checker suppression), and inline `--[[@as T]]`.
+
+Two edges of `---@deprecated` are not yet covered: a `:` method call
+(`obj:m()`) and a class type used as an annotation — the P0 checker does not
+resolve method receivers, so a deprecated method reached through a colon call
+is not flagged.
 
 ## Tooling
 
