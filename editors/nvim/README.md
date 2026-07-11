@@ -9,8 +9,28 @@ symbols, formatting and semantic tokens for `.lua` sources.
 - **Neovim 0.11+** for the native `vim.lsp.config` / `vim.lsp.enable` API.
   (An nvim-lspconfig fallback for older versions is included in
   `lua/luabox.lua`.)
-- A `luabox` binary on your `PATH` (or point `cmd` at it). Build from the repo
-  root with `cargo build --release` → `target/release/luabox`.
+- A `luabox` binary on your `PATH` (or point `cmd` at it). Get it via the
+  install script rather than building from source — see [Getting the
+  `luabox` binary](#getting-the-luabox-binary) below.
+
+## Getting the `luabox` binary
+
+From a released build, run the install script for your platform (see the
+repo root [`RELEASING.md`](../../RELEASING.md) for how releases are cut):
+
+```sh
+# Linux / macOS
+curl -fsSL https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/raw/main/scripts/install.sh | bash
+```
+
+```powershell
+# Windows
+irm https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/raw/main/scripts/install.ps1 | iex
+```
+
+Both scripts fetch the latest tagged GitLab Release's binary asset and place
+it on `PATH`. Until the first `v*` tag is pushed, both print a
+`cargo install --git` source-build fallback instead.
 
 ## Install
 
@@ -106,3 +126,13 @@ lspconfig.luabox.setup({})
 - The `.lua` filetype is Neovim's built-in; we only *attach* the luabox server
   to it and never redefine its syntax, so existing Lua highlighting/plugins
   are untouched.
+
+## For maintainers: distribution
+
+There is no build/package step — `editors/nvim` *is* the distributable (a
+plain Neovim plugin directory). To publish it as its own installable repo
+(e.g. for `lazy.nvim`/`packer` users who don't want the whole luabox
+monorepo as a dependency), mirror `editors/nvim`'s contents to a standalone
+git repo (e.g. `luabox/luabox.nvim`) and point users at
+`{ "luabox/luabox.nvim" }` instead of a local `dir =`. No token or manual
+publish step is required beyond hosting the repo somewhere reachable.

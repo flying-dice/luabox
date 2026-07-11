@@ -6,9 +6,30 @@ document symbols, formatting and semantic highlighting.
 
 ## Requirements
 
-- A `luabox` binary on your `PATH` (build it from the repo root with
-  `cargo build --release`; binary: `target/release/luabox`), or a path set in
-  Zed settings (below). The server is launched as `luabox lsp`.
+- A `luabox` binary on your `PATH`, or a path set in Zed settings (below).
+  The server is launched as `luabox lsp`. Get the binary via the install
+  script rather than building from source — see [Getting the `luabox`
+  binary](#getting-the-luabox-binary) below.
+
+## Getting the `luabox` binary
+
+From a released build, run the install script for your platform (see the
+repo root [`RELEASING.md`](../../RELEASING.md) for how releases are cut):
+
+```sh
+# Linux / macOS
+curl -fsSL https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/raw/main/scripts/install.sh | bash
+```
+
+```powershell
+# Windows
+irm https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/raw/main/scripts/install.ps1 | iex
+```
+
+Both scripts fetch the latest tagged GitLab Release's binary asset and place
+it on `PATH` (override the install directory with `LUABOX_INSTALL_DIR` /
+`-InstallDir`). Until the first `v*` tag is pushed, both print a
+`cargo install --git` source-build fallback instead.
 
 ## How it attaches to Lua
 
@@ -51,7 +72,12 @@ Point Zed at a specific `luabox` binary (and/or override the args) in
 Without an override the extension resolves `luabox` on the worktree `PATH` and
 runs `luabox lsp`.
 
-## Install as a dev extension
+## Install the extension
+
+Zed does not yet have a published registry entry for this extension (see
+[Publishing to the Zed extension registry](#publishing-to-the-zed-extension-registry)
+for the residual steps), so for now install it as a **dev extension** from a
+local checkout:
 
 1. Build the wasm (sanity check — Zed also compiles it on install):
 

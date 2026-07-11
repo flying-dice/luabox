@@ -26,10 +26,45 @@ symbols, formatting and semantic highlighting for `.lua` sources.
 
 ## Requirements
 
-- A `luabox` binary on your `PATH` (or configured via `luabox.path`).
-  Build it from the repo root with `cargo build --release`; the binary lands at
-  `target/release/luabox` (a `lb` alias is created by the packaging scripts).
+- A `luabox` binary on your `PATH` (or configured via `luabox.path`). The
+  normal way to get one is the install script — see [Getting the `luabox`
+  binary](#getting-the-luabox-binary) below. Building from source
+  (`cargo build --release`) is only needed if you're developing luabox
+  itself.
 - VS Code `^1.85.0`.
+
+## Getting the `luabox` binary
+
+From a released build, run the install script for your platform (see the
+repo root [`RELEASING.md`](../../RELEASING.md) for how releases are cut):
+
+```sh
+# Linux / macOS
+curl -fsSL https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/raw/main/scripts/install.sh | bash
+```
+
+```powershell
+# Windows
+irm https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/raw/main/scripts/install.ps1 | iex
+```
+
+Both scripts fetch the latest tagged GitLab Release's binary asset and place
+it on `PATH` (`~/.local/bin` on Linux/macOS, `%USERPROFILE%\.cargo\bin` on
+Windows by default — override with `LUABOX_INSTALL_DIR`/`-InstallDir`). Until
+the first `v*` tag is pushed, both scripts detect the missing release and
+print a `cargo install --git` fallback instead.
+
+Then install this extension itself — see [Installing the extension](#installing-the-extension).
+
+## Installing the extension
+
+- **From a release**: download the `.vsix` attached to the GitLab release (or
+  build one yourself — see [Package a `.vsix`](#package-a-vsix)) and run
+  `code --install-extension luabox-<version>.vsix`, or use **Extensions ▸ … ▸
+  Install from VSIX** in the UI.
+- **From the Marketplace / Open VSX**: not yet published — see
+  [Publishing to the Marketplace](#publishing-to-the-marketplace) for the
+  residual manual steps.
 
 ## Formatting
 
@@ -58,11 +93,17 @@ luabox explicitly if you want it:
 | `luabox.path` | `luabox` | Path to the `luabox` executable. A bare name is resolved on `PATH`. The server is launched as `<path> lsp`. |
 | `luabox.trace.server` | `off` | Trace LSP traffic (`off` / `messages` / `verbose`). |
 
-## Build from source
+## For maintainers: building and packaging
+
+The rest of this section is for people building the extension itself, not
+end users (who should follow [Getting the `luabox` binary](#getting-the-luabox-binary)
+and [Installing the extension](#installing-the-extension) above).
+
+### Build from source
 
 ```sh
 cd editors/vscode
-npm install
+npm ci                    # or: npm install
 npm run compile          # tsc -> ./out/extension.js
 ```
 

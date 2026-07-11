@@ -2,8 +2,9 @@
 -- ============================================================================
 -- Wires the `luabox lsp` language server into Neovim for `.lua` files.
 --
--- Requires a `luabox` binary on your PATH (or set `opts.cmd` below). Build it
--- from the repo root with `cargo build --release` (binary: target/release/luabox).
+-- Requires a `luabox` binary on your PATH (or set `opts.cmd` below). Get one
+-- via scripts/install.sh / scripts/install.ps1 at the repo root — see
+-- editors/nvim/README.md for details.
 --
 -- This file lives in a regular Neovim plugin layout (editors/nvim is the
 -- plugin root: lua/), so `editors/nvim` can be put on the runtimepath

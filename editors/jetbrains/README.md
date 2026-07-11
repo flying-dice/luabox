@@ -19,21 +19,44 @@ text.
 ## Requirements
 
 - A `luabox` binary on your `PATH`, or a path set in
-  **Settings ▸ Tools ▸ luabox**. Build it from the repo root with
-  `cargo build --release` (binary: `target/release/luabox`). The server is
-  launched as `<path> lsp`.
-- To build the plugin: **JDK 17+** (the IntelliJ Platform Gradle Plugin 2.x and
-  IDE 2024.2 require it — Java 8 will not work).
+  **Settings ▸ Tools ▸ luabox**. Get it via the install script rather than
+  building from source — see [Getting the `luabox` binary](#getting-the-luabox-binary)
+  below. The server is launched as `<path> lsp`.
+- To build the *plugin itself* (not required if you're just installing a
+  released zip): **JDK 17+** on `PATH`/`JAVA_HOME` (the IntelliJ Platform
+  Gradle Plugin 2.x and IDE 2024.2 require it — Gradle refuses to run at all
+  under JDK 8).
 
-## Build
+## Getting the `luabox` binary
+
+From a released build, run the install script for your platform (see the
+repo root [`RELEASING.md`](../../RELEASING.md) for how releases are cut):
+
+```sh
+# Linux / macOS
+curl -fsSL https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/raw/main/scripts/install.sh | bash
+```
+
+```powershell
+# Windows
+irm https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/raw/main/scripts/install.ps1 | iex
+```
+
+Both scripts fetch the latest tagged GitLab Release's binary asset and place
+it on `PATH`. Until the first `v*` tag is pushed, both print a
+`cargo install --git` source-build fallback instead.
+
+## For maintainers: building the plugin
 
 ```sh
 cd editors/jetbrains
 ./gradlew buildPlugin        # Windows: gradlew.bat buildPlugin
 ```
 
-The distributable lands at `build/distributions/luabox-0.1.0.zip`. The first
-build downloads the IntelliJ Platform (~1 GB), so it takes a while.
+The distributable lands at `build/distributions/luabox-jetbrains-0.1.0.zip`.
+The first build downloads the IntelliJ Platform (~1 GB), so it takes a while,
+and requires **JDK 17+** on `PATH`/`JAVA_HOME` (Gradle itself refuses to run
+under JDK 8).
 
 > **Wrapper bootstrap.** This repo commits `gradle/wrapper/gradle-wrapper.properties`
 > and the `gradlew` / `gradlew.bat` launchers, but not the binary
@@ -54,7 +77,10 @@ file to start the server.
 ## Install from disk
 
 1. **Settings ▸ Plugins ▸ ⚙ ▸ Install Plugin from Disk…**
-2. Select `build/distributions/luabox-0.1.0.zip`.
+2. Select `build/distributions/luabox-jetbrains-0.1.0.zip` (either your own
+   build, or the zip attached to a GitLab release once one exists — see
+   [Publishing to the JetBrains Marketplace](#publishing-to-the-jetbrains-marketplace)
+   below for the residual manual steps).
 3. Restart the IDE.
 4. Ensure `luabox` is on `PATH` or set its path in **Settings ▸ Tools ▸ luabox**.
 
