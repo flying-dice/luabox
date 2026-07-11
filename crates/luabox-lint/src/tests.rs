@@ -6,8 +6,24 @@ use luabox_syntax::Dialect;
 
 use crate::{LintConfig, LintOutcome, apply_fixes, lint_source};
 
+/// The Lua 5.4 stdlib's known-global names — every test lints against this
+/// baseline, exactly as `luabox lint` does via `luabox_types::stdlib_defs`
+/// (ticket #103): otherwise every fixture calling `print`/`string.format`/
+/// `setmetatable`/... would spuriously trip `undefined-global`.
 fn lint(source: &str, config: &LintConfig) -> LintOutcome {
-    lint_source("test.lua", source, Dialect::Lua54, config)
+    let known = luabox_types::stdlib_defs(Dialect::Lua54).global_names();
+    lint_source("test.lua", source, Dialect::Lua54, config, known)
+}
+
+/// Like [`lint`] but with an explicit known-globals set, for
+/// `undefined-global`'s own tests (which want to control the baseline
+/// directly rather than pull in the whole stdlib).
+fn lint_with_globals(
+    source: &str,
+    config: &LintConfig,
+    known_globals: &std::collections::HashSet<String>,
+) -> LintOutcome {
+    lint_source("test.lua", source, Dialect::Lua54, config, known_globals)
 }
 
 /// The set of diagnostic codes emitted, sorted (deduped).
@@ -143,6 +159,128 @@ fn allowlisted_global_is_silenced() {
     let mut c = LintConfig::new();
     c.allow_global("vim");
     assert!(!has("vim = 1\n", &c, "LB0504"));
+}
+
+// --- undefined-global (LB0509, suspicious, ticket #103) --------------------
+
+#[test]
+fn typo_read_fires() {
+    // `prnit` is the exact repro from ticket #103.
+    assert!(default_codes("prnit(1)\n").contains(&"LB0509".to_owned()));
+}
+
+#[test]
+fn stdlib_read_is_clean() {
+    assert_eq!(
+        default_codes("print(\"hi\")\nreturn math.floor(1.5)\n"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn allowlisted_global_read_is_clean() {
+    let mut c = LintConfig::new();
+    c.allow_global("vim");
+    assert!(!has("vim.notify(\"hi\")\n", &c, "LB0509"));
+}
+
+#[test]
+fn file_assigned_global_read_is_clean() {
+    // `foo = 1` makes the file self-defining; the later read is fine (the
+    // assignment itself is `global-write`'s business, LB0504).
+    let src = "foo = 1\nprint(foo)\n";
+    assert!(!has(src, &LintConfig::new(), "LB0509"));
+    assert!(has(src, &LintConfig::new(), "LB0504"));
+}
+
+#[test]
+fn assignment_target_itself_is_not_flagged_as_a_read() {
+    // The bare-name target of `counter = 0` is a write, not a read — only
+    // `global-write` (LB0504) fires here, never LB0509.
+    assert!(!default_codes("counter = 0\n").contains(&"LB0509".to_owned()));
+}
+
+#[test]
+fn field_write_base_is_still_a_read() {
+    // `t.x = 1` reads `t` (it must already exist to be indexed into) even
+    // though the write itself isn't a bare-name target `global-write` flags.
+    assert!(default_codes("t.x = 1\n").contains(&"LB0509".to_owned()));
+}
+
+#[test]
+fn meta_file_is_exempt() {
+    let src = "---@meta\nlove = {}\nfunction love.graphics.line() end\n";
+    assert!(!default_codes(src).contains(&"LB0509".to_owned()));
+}
+
+#[test]
+fn luabox_ignore_suppresses() {
+    let src = "---@luabox-ignore undefined-global vendor global\nprnit(1)\n";
+    assert!(!default_codes(src).contains(&"LB0509".to_owned()));
+}
+
+#[test]
+fn diagnostic_disable_suppresses() {
+    let src = "---@diagnostic disable: undefined-global\nprnit(1)\n";
+    assert!(!default_codes(src).contains(&"LB0509".to_owned()));
+}
+
+#[test]
+fn diagnostic_disable_next_line_suppresses_only_that_line() {
+    let src = "---@diagnostic disable-next-line: undefined-global\nprnit(1)\nprnit(2)\n";
+    let out = lint(src, &LintConfig::new());
+    let lb0509_lines: Vec<usize> = out
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.to_string() == "LB0509")
+        .filter_map(|d| d.primary_label().map(|l| l.span.range.start))
+        .collect();
+    // Only the second `prnit` call (unsuppressed) is reported.
+    assert_eq!(lb0509_lines.len(), 1, "{:?}", out.diagnostics);
+    assert!(src[lb0509_lines[0]..].starts_with("prnit(2)"));
+}
+
+#[test]
+fn diagnostic_disable_does_not_touch_unrelated_names() {
+    // `disable: undefined-field` isn't a rule we map — `prnit` still fires.
+    let src = "---@diagnostic disable: undefined-field\nprnit(1)\n";
+    assert!(default_codes(src).contains(&"LB0509".to_owned()));
+}
+
+#[test]
+fn did_you_mean_hint_present_for_close_typo() {
+    let out = lint("prnit(1)\n", &LintConfig::new());
+    let finding = out
+        .diagnostics
+        .iter()
+        .find(|d| d.code.to_string() == "LB0509")
+        .expect("LB0509 finding");
+    assert!(
+        finding
+            .notes
+            .iter()
+            .any(|n| n.contains("did you mean `print`")),
+        "{:?}",
+        finding.notes
+    );
+}
+
+#[test]
+fn project_defs_global_is_known() {
+    // Without `love` in the known-globals set, the read fires...
+    let src = "love.graphics.line()\n";
+    assert!(has(src, &LintConfig::new(), "LB0509"));
+    // ...but a project `[types] defs` package naming it (mirrored here by
+    // an explicit known-globals set, the way `lint_cmd` builds one from
+    // `defs/love2d.d.lua`) clears it.
+    let mut known = std::collections::HashSet::new();
+    known.insert("love".to_owned());
+    let out = lint_with_globals(src, &LintConfig::new(), &known);
+    assert!(
+        out.diagnostics
+            .iter()
+            .all(|d| d.code.to_string() != "LB0509")
+    );
 }
 
 // --- `---@meta` definition-file policy (LB0504 + LB0501, ticket #76) -------
@@ -467,7 +605,7 @@ return M
 fn corpus_has_no_serious_findings_and_no_panic() {
     let out = lint(CORPUS, &LintConfig::new());
     let serious = [
-        "LB0001", "LB0500", "LB0503", "LB0504", "LB0505", "LB0506", "LB0507", "LB0508",
+        "LB0001", "LB0500", "LB0503", "LB0504", "LB0505", "LB0506", "LB0507", "LB0508", "LB0509",
     ];
     for diag in &out.diagnostics {
         let code = diag.code.to_string();

@@ -13,9 +13,10 @@
 //! of the stdlib set: the frontend resolves them to sources and calls
 //! [`combined`]. Registry-distributed defs are P2+.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::OnceLock;
 
+use luabox_hir::{Expr, ExprId, HirId, Resolution, Stmt};
 use luabox_syntax::lua::{self, Dialect};
 use luabox_syntax::luacats::{self, AliasTag, AnnotatedItem};
 
@@ -28,6 +29,16 @@ use crate::env::TypeEnv;
 pub struct Ambient {
     pub(crate) env: TypeEnv,
     pub(crate) aliases: BTreeMap<String, AliasTag>,
+    /// Every top-level global name this definition package declares (module
+    /// tables like `math`, scalar globals like `_VERSION`, and bare
+    /// functions like `print`) — the `undefined-global` lint's read-only
+    /// name-enumeration surface (ticket #103). `TypeEnv` only exposes
+    /// by-name lookups (`function`/`global_type`), not enumeration, so this
+    /// is harvested independently by lowering each source through
+    /// `luabox-hir` and collecting every assignment target that resolves to
+    /// a bare global (dotted targets like `function math.abs() end` count
+    /// their *first* segment, `math`).
+    global_names: HashSet<String>,
 }
 
 impl Ambient {
@@ -45,7 +56,22 @@ impl Ambient {
             })
             .collect();
         let (env, aliases) = TypeEnv::build_ambient(&files);
-        Ambient { env, aliases }
+        let mut global_names = HashSet::new();
+        for (parse, _) in &files {
+            global_names.extend(declared_global_names(parse));
+        }
+        Ambient {
+            env,
+            aliases,
+            global_names,
+        }
+    }
+
+    /// Every top-level global name this ambient layer declares — the
+    /// `undefined-global` lint's known-globals surface (ticket #103).
+    #[must_use]
+    pub fn global_names(&self) -> &HashSet<String> {
+        &self.global_names
     }
 
     /// Undeclared type names referenced by the definition files themselves —
@@ -73,6 +99,41 @@ impl Ambient {
     }
 }
 
+/// Every top-level global name a `.d.lua` source declares: the base name of
+/// every assignment target that resolves to a global, anywhere in the file
+/// (mirroring `luabox-lint`'s `global-write` detection). A dotted target —
+/// `function math.abs(x) end` desugars to an assignment to `math.abs` —
+/// contributes only its first segment (`math`), the name that must already
+/// exist as a global for the declaration to make sense.
+fn declared_global_names(parse: &lua::Parse) -> HashSet<String> {
+    let lowered = luabox_hir::lower(parse);
+    let mut names = HashSet::new();
+    for (body_id, body) in lowered.bodies() {
+        for (_, stmt) in body.stmts() {
+            let Stmt::Assign { targets, .. } = stmt else {
+                continue;
+            };
+            for &target in targets {
+                let base = base_expr(body, target);
+                let hir = HirId::expr(body_id, base);
+                if let Some(Resolution::Global(name)) = lowered.resolution(hir) {
+                    names.insert(name.clone());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Walk an assignment target's `Expr::Index` chain (`a.b.c` desugars to
+/// nested `Index` nodes) down to its innermost base expression.
+fn base_expr(body: &luabox_hir::Body, mut id: ExprId) -> ExprId {
+    while let Expr::Index { base, .. } = body.expr(id) {
+        id = *base;
+    }
+    id
+}
+
 /// The embedded `.d.lua` sources for one dialect, in a stable order.
 fn sources(dialect: Dialect) -> &'static [&'static str] {
     match dialect {
@@ -85,6 +146,7 @@ fn sources(dialect: Dialect) -> &'static [&'static str] {
             include_str!("../../../assets/defs/lua51/os.d.lua"),
             include_str!("../../../assets/defs/lua51/coroutine.d.lua"),
             include_str!("../../../assets/defs/lua51/debug.d.lua"),
+            include_str!("../../../assets/defs/lua51/package.d.lua"),
         ],
         Dialect::Lua52 => &[
             include_str!("../../../assets/defs/lua52/basic.d.lua"),
@@ -96,6 +158,7 @@ fn sources(dialect: Dialect) -> &'static [&'static str] {
             include_str!("../../../assets/defs/lua52/coroutine.d.lua"),
             include_str!("../../../assets/defs/lua52/debug.d.lua"),
             include_str!("../../../assets/defs/lua52/bit32.d.lua"),
+            include_str!("../../../assets/defs/lua52/package.d.lua"),
         ],
         Dialect::Lua53 => &[
             include_str!("../../../assets/defs/lua53/basic.d.lua"),
@@ -107,6 +170,7 @@ fn sources(dialect: Dialect) -> &'static [&'static str] {
             include_str!("../../../assets/defs/lua53/coroutine.d.lua"),
             include_str!("../../../assets/defs/lua53/debug.d.lua"),
             include_str!("../../../assets/defs/lua53/utf8.d.lua"),
+            include_str!("../../../assets/defs/lua53/package.d.lua"),
         ],
         Dialect::Lua54 => &[
             include_str!("../../../assets/defs/lua54/basic.d.lua"),
@@ -118,6 +182,7 @@ fn sources(dialect: Dialect) -> &'static [&'static str] {
             include_str!("../../../assets/defs/lua54/coroutine.d.lua"),
             include_str!("../../../assets/defs/lua54/debug.d.lua"),
             include_str!("../../../assets/defs/lua54/utf8.d.lua"),
+            include_str!("../../../assets/defs/lua54/package.d.lua"),
         ],
         Dialect::LuaJit => &[
             include_str!("../../../assets/defs/luajit/basic.d.lua"),
@@ -128,6 +193,7 @@ fn sources(dialect: Dialect) -> &'static [&'static str] {
             include_str!("../../../assets/defs/luajit/os.d.lua"),
             include_str!("../../../assets/defs/luajit/coroutine.d.lua"),
             include_str!("../../../assets/defs/luajit/debug.d.lua"),
+            include_str!("../../../assets/defs/luajit/package.d.lua"),
             include_str!("../../../assets/defs/luajit/bit.d.lua"),
             include_str!("../../../assets/defs/luajit/jit.d.lua"),
         ],
@@ -186,6 +252,29 @@ mod tests {
                 ambient.unknown_names()
             );
         }
+    }
+
+    #[test]
+    fn global_names_enumerates_top_level_declarations() {
+        // Module tables and scalar globals, keyed by their own top-level
+        // name — not the dotted stdlib functions they carry.
+        let names = stdlib(Dialect::Lua54).global_names();
+        for expected in [
+            "print", "assert", "pairs", "math", "string", "_G", "_VERSION",
+        ] {
+            assert!(names.contains(expected), "missing `{expected}`: {names:?}");
+        }
+        // `math.abs` is a stdlib function, not itself a top-level global.
+        assert!(!names.contains("math.abs"));
+    }
+
+    #[test]
+    fn global_names_include_project_defs() {
+        let extra = vec!["---@meta\nlove = {}\nfunction love.load() end\n".to_string()];
+        let ambient = combined(Dialect::Lua54, &extra);
+        assert!(ambient.global_names().contains("love"));
+        // The stdlib set is still layered in underneath.
+        assert!(ambient.global_names().contains("print"));
     }
 
     #[test]

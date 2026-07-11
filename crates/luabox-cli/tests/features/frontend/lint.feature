@@ -101,3 +101,32 @@ Feature: luabox lint — type-informed lint rules (clippy analog)
     When I run "luabox lint"
     Then the command succeeds
     And stderr contains "0 errors, 0 warnings"
+
+  Scenario: a typo'd global read is flagged as undefined-global
+    Given a file "src/main.lua" containing:
+      """
+      prnit("hello")
+      """
+    When I run "luabox lint"
+    Then the command succeeds
+    And stdout contains "LB0509"
+    And stdout contains "undefined-global"
+
+  Scenario: a [lint] globals allow-list entry silences undefined-global
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [lint]
+      globals = ["acme"]
+      """
+    And a file "src/main.lua" containing:
+      """
+      acme.init()
+      """
+    When I run "luabox lint"
+    Then the command succeeds
+    And stderr contains "0 errors, 0 warnings"

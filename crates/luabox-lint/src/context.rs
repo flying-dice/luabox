@@ -106,6 +106,13 @@ pub struct LintContext<'a> {
     pub facts: &'a TypeFacts,
     /// Effective lint configuration (for rules that consult it).
     pub config: &'a LintConfig,
+    /// Every global name the project considers "known" — the dialect
+    /// stdlib plus any `[types] defs` packages (SPEC.md §3), resolved by the
+    /// Frontend the same way `luabox check` builds its `Ambient` layer. The
+    /// `undefined-global` rule's read-only baseline (ticket #103); the
+    /// `[lint] globals` allow-list is a separate, per-rule check via
+    /// [`LintConfig::is_allowed_global`].
+    pub known_globals: &'a HashSet<String>,
     /// Shared binding use-index.
     pub uses: UseIndex,
 }
@@ -120,6 +127,7 @@ impl<'a> LintContext<'a> {
         lowered: &'a LoweredFile,
         facts: &'a TypeFacts,
         config: &'a LintConfig,
+        known_globals: &'a HashSet<String>,
     ) -> Self {
         Self {
             file,
@@ -128,6 +136,7 @@ impl<'a> LintContext<'a> {
             lowered,
             facts,
             config,
+            known_globals,
             uses: UseIndex::build(lowered),
         }
     }

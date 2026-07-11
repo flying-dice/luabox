@@ -6,6 +6,7 @@ mod global_write;
 mod nil_compare;
 mod pairs_on_array;
 mod shadowed_local;
+mod undefined_global;
 mod unused_local;
 mod unused_param;
 
@@ -19,6 +20,7 @@ pub fn rules() -> Vec<Box<dyn Rule>> {
         Box::new(unused_param::UnusedParam),
         Box::new(shadowed_local::ShadowedLocal),
         Box::new(global_write::GlobalWrite),
+        Box::new(undefined_global::UndefinedGlobal),
         Box::new(nil_compare::NilCompare),
         Box::new(concat_in_loop::ConcatInLoop),
         Box::new(pairs_on_array::PairsOnArray),

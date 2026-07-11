@@ -40,6 +40,7 @@ pub use facts::TypeFacts;
 pub use rule::{Rule, Tier};
 pub use rules::rules;
 
+use std::collections::HashSet;
 use std::ops::Range;
 
 use luabox_diag::{Code, Diagnostic, Label, Severity, Span, Suggestion};
@@ -74,8 +75,24 @@ pub struct LintOutcome {
 }
 
 /// Lint one Lua source string.
+///
+/// `known_globals` is the project's known-global baseline — the dialect
+/// stdlib plus any `[types] defs` packages (SPEC.md §3) — built by the
+/// caller the same way `luabox check` builds its `Ambient` layer (see
+/// `luabox-cli`'s `lint_cmd::known_globals`). It feeds the `undefined-global`
+/// rule; the `[lint] globals` allow-list is separate and lives on `config`.
 #[must_use]
-pub fn lint_source(file: &str, source: &str, dialect: Dialect, config: &LintConfig) -> LintOutcome {
+#[allow(
+    clippy::implicit_hasher,
+    reason = "internal API — every caller passes a plain `HashSet<String>`, never a custom hasher"
+)]
+pub fn lint_source(
+    file: &str,
+    source: &str,
+    dialect: Dialect,
+    config: &LintConfig,
+    known_globals: &HashSet<String>,
+) -> LintOutcome {
     let parse = lua::parse(source, dialect);
     let mut diagnostics = Vec::new();
     let mut fixes = Vec::new();
@@ -93,7 +110,15 @@ pub fn lint_source(file: &str, source: &str, dialect: Dialect, config: &LintConf
     let lowered = lower(&parse);
     let facts = TypeFacts::build(&parse, &lowered);
     let suppress = Suppressions::collect(&parse, source);
-    let ctx = LintContext::new(file, source, &parse, &lowered, &facts, config);
+    let ctx = LintContext::new(
+        file,
+        source,
+        &parse,
+        &lowered,
+        &facts,
+        config,
+        known_globals,
+    );
 
     for rule in rules() {
         let Some(severity) = config.effective(rule.as_ref()).severity() else {

@@ -141,6 +141,11 @@ static REGISTRY: &[Entry] = &[
         explain: LB0508,
     },
     Entry {
+        code: Code::new(509),
+        title: "read of an undefined global (undefined-global)",
+        explain: LB0509,
+    },
+    Entry {
         code: Code::new(601),
         title: "irreducible `goto`",
         explain: LB0601,
@@ -758,6 +763,56 @@ Fill in the body, invert the condition and move the code, or delete the
 branch. A single explanatory comment suppresses the lint.
 ";
 
+const LB0509: &str = "\
+# LB0509: read of an undefined global (undefined-global)
+
+A name resolves to a global (no `local` is in scope) at a **read** position —
+a call, an argument, the right-hand side of an expression — and that global
+is not one of: the dialect's real stdlib, an ambient `[types] defs` package,
+a name this same file itself assigns somewhere (self-defining), or an entry
+in `[lint] globals`. Suspicious tier: this is luals' `undefined-global`
+finding — usually a typo that silently reads `nil` instead of erroring, since
+Lua has no \"unbound name\" error for globals.
+
+```lua
+prnit(\"hello\")   -- LB0509: read of undefined global `prnit`
+                  -- (did you mean `print`?)
+```
+
+Three ways to fix it:
+
+```lua
+print(\"hello\")                 -- fix the typo
+
+---@meta
+-- defs/acme.d.lua
+acme = {}                      -- or: declare it via a defs package
+```
+
+```toml
+[lint]
+globals = [\"acme\"]             -- or: tell the linter it's intentional
+```
+
+Assigning the name anywhere in the same file also clears the finding — a
+file that does `foo = 1` and later reads `foo` is self-defining; the
+assignment itself is `global-write`'s business (LB0504), not this rule's.
+
+**`---@meta` definition files are exempt** (declaring ambient globals is
+such a file's entire purpose, same as `global-write` — ticket #76).
+
+**Suppression:** `---@luabox-ignore undefined-global <reason>`, or the
+LuaCATS directive luals itself recognises:
+
+```lua
+---@diagnostic disable: undefined-global
+prnit(\"hello\")   -- not flagged
+
+---@diagnostic disable-next-line: undefined-global
+prnit(\"hello\")   -- not flagged, this line only
+```
+";
+
 const LB0601: &str = "\
 # LB0601: irreducible `goto`
 
@@ -1100,7 +1155,7 @@ mod tests {
             "LB0001", "LB0010", "LB0011", "LB0012", "LB0013", "LB0014", "LB0015", "LB0016",
             "LB0300", "LB0301", "LB0302", "LB0303", "LB0304", "LB0305", "LB0306", "LB0500",
             "LB0501", "LB0502", "LB0503", "LB0504", "LB0505", "LB0506", "LB0507", "LB0508",
-            "LB1001", "LB1100", "LB2005", "LB2007", "LB2010",
+            "LB0509", "LB1001", "LB1100", "LB2005", "LB2007", "LB2010",
         ] {
             let code: Code = raw.parse().unwrap();
             assert!(explain(&code).is_some(), "{raw} missing from registry");

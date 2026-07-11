@@ -11,7 +11,19 @@
 //! non-overlapping), re-linting each file until it converges. A file with parse
 //! errors is never rewritten. A `lint: N errors, M warnings in K files` summary
 //! goes to stderr.
+//!
+//! **Known globals** (ticket #103, `undefined-global`): the dialect stdlib
+//! plus any `[types] defs` packages, resolved from `defs/` the same way
+//! `luabox check` builds its `Ambient` layer (see
+//! `luabox-cli::check_cmd::resolve_project_defs`, duplicated here in
+//! miniature — the two commands don't share a `Project` type). Test files —
+//! anything `luabox test` would also discover (SPEC.md §11:
+//! `*_test.lua`/`*.test.lua`/anything under `tests/`) — additionally see the
+//! embedded test harness's own globals (`describe`, `it`, `before_each`,
+//! `after_each`, `test`), since `crates/luabox-test/src/harness.lua` genuinely
+//! injects them as globals at run time before `dofile`-ing the test file.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -20,10 +32,18 @@ use luabox_diag::{Diagnostic, Format, Severity, render};
 use luabox_lint::{LintConfig, apply_fixes, lint_source};
 use luabox_resolve::manifest::{Lint, LintLevel, Manifest};
 use luabox_syntax::Dialect;
+use luabox_types::{Ambient, combined_defs, stdlib_defs};
 use rayon::prelude::*;
 
 /// The most fix passes to run per file before giving up on convergence.
 const MAX_FIX_PASSES: usize = 8;
+
+/// Globals the embedded test harness (`crates/luabox-test/src/harness.lua`)
+/// genuinely injects before `dofile`-ing a test file: the busted-compatible
+/// `describe`/`it`/`before_each`/`after_each` plus the native flat `test`.
+/// `assert` is not listed — it's already stdlib, the harness only replaces
+/// its value, not its name.
+const TEST_HARNESS_GLOBALS: [&str; 5] = ["describe", "it", "before_each", "after_each", "test"];
 
 /// Execute `luabox lint` from `cwd`.
 pub fn run(cwd: &Path, fix: bool) -> anyhow::Result<()> {
@@ -71,15 +91,30 @@ fn lint_one(path: &Path, project: &Project, fix: bool) -> anyhow::Result<FileRes
     let rel = display_rel(path, &project.root);
     let original = fs::read_to_string(path).with_context(|| format!("cannot read `{rel}`"))?;
 
+    // `undefined-global` (ticket #103): the project's known-globals baseline,
+    // widened with the embedded test harness's own globals for files
+    // `luabox test` would itself discover — those genuinely are globals at
+    // run time (`harness.lua` assigns `describe`/`it`/... before `dofile`-ing
+    // the test file), just never declared in a `.d.lua` defs package.
+    let is_test_file = is_test_file(&rel);
+    let mut known_owned;
+    let known_globals: &HashSet<String> = if is_test_file {
+        known_owned = project.known_globals.clone();
+        known_owned.extend(TEST_HARNESS_GLOBALS.iter().map(|s| (*s).to_owned()));
+        &known_owned
+    } else {
+        &project.known_globals
+    };
+
     let mut source = original.clone();
-    let mut outcome = lint_source(&rel, &source, project.dialect, &project.lint);
+    let mut outcome = lint_source(&rel, &source, project.dialect, &project.lint, known_globals);
 
     // Never rewrite a file with parse errors.
     if fix && !outcome.had_parse_errors {
         let mut passes = 0;
         while !outcome.fixes.is_empty() && passes < MAX_FIX_PASSES {
             source = apply_fixes(&source, &outcome.fixes);
-            outcome = lint_source(&rel, &source, project.dialect, &project.lint);
+            outcome = lint_source(&rel, &source, project.dialect, &project.lint, known_globals);
             passes += 1;
         }
     }
@@ -136,6 +171,12 @@ struct Project {
     dialect: Dialect,
     out_dir: Option<PathBuf>,
     lint: LintConfig,
+    /// `undefined-global`'s known-globals baseline (ticket #103): the
+    /// dialect stdlib, plus any `[types] defs` packages resolved from
+    /// `defs/` — the same `Ambient` layer `luabox check` builds, so a
+    /// project's ambient LuaCATS globals (`love`, project-specific
+    /// `.d.lua` packages, ...) don't spuriously trip the lint.
+    known_globals: HashSet<String>,
 }
 
 /// Find the project: nearest `luabox.toml` walking up from `cwd`, or a
@@ -162,11 +203,13 @@ fn discover(cwd: &Path) -> anyhow::Result<Project> {
                     manifest_path.display()
                 );
             };
+            let known_globals = known_globals(dialect, current, &manifest.types.defs);
             return Ok(Project {
                 root: current.to_path_buf(),
                 dialect,
                 out_dir: Some(current.join(&manifest.build.out)),
                 lint: build_config(&manifest.lint),
+                known_globals,
             });
         }
         dir = current.parent();
@@ -176,7 +219,66 @@ fn discover(cwd: &Path) -> anyhow::Result<Project> {
         dialect: Dialect::Lua54,
         out_dir: None,
         lint: LintConfig::new(),
+        known_globals: stdlib_defs(Dialect::Lua54).global_names().clone(),
     })
+}
+
+/// The `undefined-global` known-globals baseline for one project: the
+/// dialect stdlib, widened with any `[types] defs` packages resolved from
+/// `<root>/defs/` (SPEC.md §3) — mirrors `check_cmd::resolve_project_defs`
+/// in miniature (same `defs/<name>.d.lua` / `defs/<name>/*.d.lua`
+/// resolution rules), since the two commands don't share a `Project` type.
+/// An entry that fails to resolve is silently skipped here — `luabox check`
+/// is the command that reports `LB1002` for a bad `[types] defs` entry;
+/// `lint` just falls back to the stdlib-only baseline for that entry.
+fn known_globals(dialect: Dialect, root: &Path, defs: &[String]) -> HashSet<String> {
+    if defs.is_empty() {
+        return stdlib_defs(dialect).global_names().clone();
+    }
+    let mut sources = Vec::new();
+    let defs_dir = root.join("defs");
+    for name in defs {
+        let single = defs_dir.join(format!("{name}.d.lua"));
+        if single.is_file()
+            && let Ok(text) = fs::read_to_string(&single)
+        {
+            sources.push(text);
+        }
+        let dir = defs_dir.join(name);
+        if dir.is_dir() {
+            let mut files = Vec::new();
+            collect_d_lua(&dir, &mut files);
+            files.sort();
+            for file in files {
+                if let Ok(text) = fs::read_to_string(&file) {
+                    sources.push(text);
+                }
+            }
+        }
+    }
+    let ambient: Ambient = combined_defs(dialect, &sources);
+    ambient.global_names().clone()
+}
+
+/// Collect every `*.d.lua` file under `dir`, recursively (mirrors
+/// `check_cmd`'s helper of the same shape).
+fn collect_d_lua(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_d_lua(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("lua")
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".d.lua"))
+        {
+            out.push(path);
+        }
+    }
 }
 
 /// Translate the manifest `[lint]` table into a [`LintConfig`].
@@ -235,4 +337,17 @@ fn walk(dir: &Path, project: &Project, lua: &mut Vec<PathBuf>) -> anyhow::Result
 fn display_rel(path: &Path, root: &Path) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path);
     rel.to_string_lossy().replace('\\', "/")
+}
+
+/// Whether `rel` (a root-relative, forward-slash path) is a file `luabox
+/// test` would itself discover (SPEC.md §11: `*_test.lua`, `*.test.lua`, or
+/// anything under a `tests/` directory) — mirrors
+/// `luabox_test::discovery::is_test_file` exactly, just fed a path string
+/// instead of a directory walk, since `lint`'s own file collection already
+/// has one.
+fn is_test_file(rel: &str) -> bool {
+    let mut segments = rel.split('/');
+    let name = segments.next_back().unwrap_or(rel);
+    let in_tests = segments.any(|seg| seg == "tests");
+    luabox_test::discovery::is_test_file(name, in_tests)
 }
