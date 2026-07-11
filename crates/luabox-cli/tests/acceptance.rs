@@ -253,6 +253,58 @@ fn write_file(world: &AcceptanceWorld, rel: &str, content: &str) {
     std::fs::write(&full, content).unwrap_or_else(|e| panic!("cannot write `{rel}`: {e}"));
 }
 
+// --- fake-runtime shims (platform-conditional) ----------------------------
+//
+// Several execution scenarios (test/run/bench/toolchain) drive `luabox`
+// against a *fake* Lua interpreter — a tiny script wired through `LUABOX_LUA`
+// (or installed as a toolchain interpreter) that speaks the runner protocol
+// without a real Lua. That script must be native to the host: a Windows batch
+// file (`.bat`/`.cmd`, dispatched by extension) or a POSIX `sh` script (a
+// `#!/bin/sh` shebang plus the executable bit, spawned directly the way the
+// runner spawns a resolved interpreter). These helpers keep the writer and
+// reader steps agreeing on the path and mode per platform.
+
+/// The platform path for a fake-runtime shim with the given stem: a Windows
+/// batch file (`.bat`) or a POSIX shell script (`.sh`).
+fn shim_path(world: &AcceptanceWorld, stem: &str) -> std::path::PathBuf {
+    let name = if cfg!(windows) {
+        format!("{stem}.bat")
+    } else {
+        format!("{stem}.sh")
+    };
+    world.dir.path().join(name)
+}
+
+/// Write a fake-runtime shim: the Windows batch body on Windows, the POSIX
+/// `sh` body elsewhere, marking it executable on Unix so it can be spawned
+/// directly (as `luabox` spawns a resolved interpreter).
+fn write_shim(path: &std::path::Path, windows_body: &str, unix_body: &str) {
+    let body = if cfg!(windows) {
+        windows_body
+    } else {
+        unix_body
+    };
+    std::fs::write(path, body)
+        .unwrap_or_else(|e| panic!("cannot write shim `{}`: {e}", path.display()));
+    make_executable(path);
+}
+
+/// Mark `path` executable (Unix only; a no-op on Windows, where execution is
+/// selected by file extension, not a mode bit).
+#[cfg(unix)]
+fn make_executable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut perms = std::fs::metadata(path)
+        .unwrap_or_else(|e| panic!("cannot stat `{}`: {e}", path.display()))
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms)
+        .unwrap_or_else(|e| panic!("cannot chmod `{}`: {e}", path.display()));
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &std::path::Path) {}
+
 #[then(expr = "diagnostic {word} is reported naming field {string}")]
 #[then(expr = "diagnostic {word} is reported naming key {string}")]
 #[then(expr = "diagnostic {word} is reported listing {string}")]
@@ -396,18 +448,21 @@ fn test_file_protocol(name: &str, message: Option<&str>) -> String {
     }
 }
 
-/// The fake runtime: a `.bat` that echoes the given test file (`%2`) and
+/// The fake runtime: a shim that echoes the given test file (argv 2) and
 /// exits nonzero if it contains a FAIL line. The runner spawns it as
-/// `<bat> <harness> <test_file>`, so `%2` is always the test file.
+/// `<shim> <harness> <test_file>`, so argv 2 is always the test file.
 #[given("a fake Lua runtime")]
 fn fake_lua_runtime(world: &mut AcceptanceWorld) {
-    let script = "@echo off\r\n\
+    let windows = "@echo off\r\n\
         type \"%~2\"\r\n\
         findstr /C:\"LUABOX_TEST_FAIL\" \"%~2\" >nul\r\n\
         if not errorlevel 1 exit /b 1\r\n\
         exit /b 0\r\n";
-    std::fs::write(world.dir.path().join("fake_runtime.bat"), script)
-        .expect("failed to write fake runtime");
+    let unix = "#!/bin/sh\n\
+        cat \"$2\"\n\
+        if grep -q LUABOX_TEST_FAIL \"$2\"; then exit 1; fi\n\
+        exit 0\n";
+    write_shim(&shim_path(world, "fake_runtime"), windows, unix);
 }
 
 #[given(expr = "a passing test file {string} with test {string}")]
@@ -422,7 +477,7 @@ fn failing_test_file(world: &mut AcceptanceWorld, path: String, name: String, me
 
 #[when(expr = "I run {string} with the fake runtime")]
 fn run_with_fake_runtime(world: &mut AcceptanceWorld, command: String) {
-    let fake = world.dir.path().join("fake_runtime.bat");
+    let fake = shim_path(world, "fake_runtime");
     run_command_with_env(
         world,
         &command,
@@ -541,9 +596,9 @@ fn stdout_does_not_contain(world: &mut AcceptanceWorld, needle: String) {
 /// then exits 0.
 #[given("a fake Lua runtime that echoes its arguments")]
 fn fake_lua_runtime_echoes_args(world: &mut AcceptanceWorld) {
-    let script = "@echo off\r\necho RAN: %*\r\nexit /b 0\r\n";
-    std::fs::write(world.dir.path().join("fake_echo_runtime.bat"), script)
-        .expect("failed to write fake echo runtime");
+    let windows = "@echo off\r\necho RAN: %*\r\nexit /b 0\r\n";
+    let unix = "#!/bin/sh\necho \"RAN: $@\"\nexit 0\n";
+    write_shim(&shim_path(world, "fake_echo_runtime"), windows, unix);
 }
 
 /// A fake Lua runtime that always exits nonzero, regardless of arguments —
@@ -551,14 +606,14 @@ fn fake_lua_runtime_echoes_args(world: &mut AcceptanceWorld) {
 /// code.
 #[given("a fake Lua runtime that always fails")]
 fn fake_lua_runtime_always_fails(world: &mut AcceptanceWorld) {
-    let script = "@echo off\r\necho FAILED\r\nexit /b 1\r\n";
-    std::fs::write(world.dir.path().join("fake_failing_runtime.bat"), script)
-        .expect("failed to write fake failing runtime");
+    let windows = "@echo off\r\necho FAILED\r\nexit /b 1\r\n";
+    let unix = "#!/bin/sh\necho FAILED\nexit 1\n";
+    write_shim(&shim_path(world, "fake_failing_runtime"), windows, unix);
 }
 
 #[when(expr = "I run {string} with the echo runtime")]
 fn run_with_echo_runtime(world: &mut AcceptanceWorld, command: String) {
-    let fake = world.dir.path().join("fake_echo_runtime.bat");
+    let fake = shim_path(world, "fake_echo_runtime");
     run_command_with_env(
         world,
         &command,
@@ -571,7 +626,7 @@ fn run_with_echo_runtime(world: &mut AcceptanceWorld, command: String) {
 
 #[when(expr = "I run {string} with the failing runtime")]
 fn run_with_failing_runtime(world: &mut AcceptanceWorld, command: String) {
-    let fake = world.dir.path().join("fake_failing_runtime.bat");
+    let fake = shim_path(world, "fake_failing_runtime");
     run_command_with_env(
         world,
         &command,
@@ -600,9 +655,9 @@ fn run_with_failing_runtime(world: &mut AcceptanceWorld, command: String) {
 /// already containing protocol lines) and always exits 0.
 #[given("a fake bench runtime")]
 fn fake_bench_runtime(world: &mut AcceptanceWorld) {
-    let script = "@echo off\r\ntype \"%~2\"\r\nexit /b 0\r\n";
-    std::fs::write(world.dir.path().join("fake_bench_runtime.bat"), script)
-        .expect("failed to write fake bench runtime");
+    let windows = "@echo off\r\ntype \"%~2\"\r\nexit /b 0\r\n";
+    let unix = "#!/bin/sh\ncat \"$2\"\nexit 0\n";
+    write_shim(&shim_path(world, "fake_bench_runtime"), windows, unix);
 }
 
 /// A bench file authored as raw protocol: one bench reporting the given
@@ -625,7 +680,7 @@ fn bench_file_with_samples(
 
 #[when(expr = "I run {string} with the fake bench runtime")]
 fn run_with_fake_bench_runtime(world: &mut AcceptanceWorld, command: String) {
-    let fake = world.dir.path().join("fake_bench_runtime.bat");
+    let fake = shim_path(world, "fake_bench_runtime");
     run_command_with_env(
         world,
         &command,
@@ -660,16 +715,36 @@ fn toolchain_platform() -> String {
 /// `<id>-<platform>` at it. When `correct` is false the recorded checksum is
 /// wrong, so an install must reject the archive.
 fn write_toolchain_index(world: &AcceptanceWorld, id: &str, correct: bool) {
-    // A `.cmd` shim that behaves like the test runner's fake runtime: echo
-    // the test file (argv 2) and fail iff it carries a FAIL line.
-    let shim = "@echo off\r\n\
-        type \"%~2\"\r\n\
-        findstr /C:\"LUABOX_TEST_FAIL\" \"%~2\" >nul\r\n\
-        if not errorlevel 1 exit /b 1\r\n\
-        exit /b 0\r\n";
+    // A shim that behaves like the test runner's fake runtime: echo the test
+    // file (argv 2) and fail iff it carries a FAIL line. Named so the
+    // toolchain interpreter search (`luabox_test::runtime`) finds it on this
+    // platform — `lua.cmd`, dispatched via PATHEXT, on Windows; a plain,
+    // executable `lua` (no extension) on Unix. The executable bit is set
+    // before archiving so `tar` records mode 0755 and extraction restores it
+    // (the installer's `tar -xf` preserves modes), letting the runner spawn it.
+    let (interp_name, shim) = if cfg!(windows) {
+        (
+            "lua.cmd",
+            "@echo off\r\n\
+             type \"%~2\"\r\n\
+             findstr /C:\"LUABOX_TEST_FAIL\" \"%~2\" >nul\r\n\
+             if not errorlevel 1 exit /b 1\r\n\
+             exit /b 0\r\n",
+        )
+    } else {
+        (
+            "lua",
+            "#!/bin/sh\n\
+             cat \"$2\"\n\
+             if grep -q LUABOX_TEST_FAIL \"$2\"; then exit 1; fi\n\
+             exit 0\n",
+        )
+    };
     let fixture_src = world.dir.path().join(".fixture-src");
     std::fs::create_dir_all(&fixture_src).expect("failed to create fixture source dir");
-    std::fs::write(fixture_src.join("lua.cmd"), shim).expect("failed to write fixture shim");
+    let interp_path = fixture_src.join(interp_name);
+    std::fs::write(&interp_path, shim).expect("failed to write fixture shim");
+    make_executable(&interp_path);
 
     let archive = world.dir.path().join("fixture.tar.gz");
     let status = std::process::Command::new("tar")
@@ -677,7 +752,7 @@ fn write_toolchain_index(world: &AcceptanceWorld, id: &str, correct: bool) {
         .arg(&archive)
         .arg("-C")
         .arg(&fixture_src)
-        .arg("lua.cmd")
+        .arg(interp_name)
         .status()
         .expect("failed to run tar to build the fixture archive");
     assert!(status.success(), "tar failed to build the fixture archive");
