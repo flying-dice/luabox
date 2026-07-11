@@ -1,0 +1,199 @@
+# GitLab CI for the canonical remote
+# (gitlab.beluga-sirius.ts.net:flying-dice/luabox). Mirrors
+# .github/workflows/ci.yml's `check` job (fmt/clippy/test); GitHub Actions
+# stays the belt-and-braces runner for that job until this pipeline has
+# proven itself. See ticket #94.
+#
+# Divergence from .github/workflows/ci.yml (intentional, noted here rather
+# than silently dropped):
+#   - No `os` matrix for `check`/`test` — this pipeline runs on whatever
+#     Linux shared runner the instance provides. Windows/macOS coverage
+#     lives only in the `release` stage's build jobs below (allow_failure,
+#     runner-tag gated), not as a check gate.
+#   - `perf-gates` (scripts/perf-gate.sh) and `examples` (scripts/examples.sh)
+#     are not mirrored. Both need a stable, unshared runner (perf budgets)
+#     and/or a provisioned Lua 5.1 + unzip toolchain (examples); GitHub
+#     Actions remains their home until the instance has a runner that can
+#     promise both. Tracked as a follow-up, not an oversight.
+
+stages:
+  - check
+  - test
+  - release
+
+variables:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+  # Cache-friendly: keep cargo's registry/git checkouts inside the project
+  # dir so the `cache:` key below actually covers them.
+  CARGO_HOME: ${CI_PROJECT_DIR}/.cargo
+
+default:
+  # rust-version in Cargo.toml (workspace.package) is 1.92; keep this in
+  # lockstep with that and with the `dtolnay/rust-toolchain` pin in
+  # .github/workflows/ci.yml.
+  image: rust:1.92
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - .cargo/registry/cache
+      - .cargo/registry/index
+      - target
+  before_script:
+    - rustc --version && cargo --version
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_TAG =~ /^v/'
+
+# check/test jobs run for MRs and pushes to main only (not tag pipelines —
+# a tag is cut from an already-green main, so re-running check/test there
+# just burns CI minutes; the release stage below is tag-only instead).
+.check_rules: &check_rules
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+fmt:
+  stage: check
+  <<: *check_rules
+  script:
+    - rustup component add rustfmt
+    - cargo fmt --all --check
+
+clippy:
+  stage: check
+  <<: *check_rules
+  script:
+    - rustup component add clippy
+    - cargo clippy --workspace --all-targets -- -D warnings
+
+# `cargo test --workspace` needs no external Lua runtime for this to be
+# green: the cucumber acceptance suite (crates/luabox-cli/tests/acceptance.rs)
+# spawns the real luabox binary against temp-dir fixtures and gates its own
+# runtime-dependent scenarios rather than requiring one at the CI level —
+# `@git`-tagged scenarios skip when the `git` CLI is missing (checked at
+# `main()` startup via `AcceptanceWorld::filter_run`), and scenarios that
+# exercise a real Lua use a fake `.bat`/echo shim wired through `LUABOX_LUA`
+# instead of a real interpreter (see execution/test.feature and friends).
+# Anything that truly needs a real interpreter (luabox-test's own
+# integration tests) sits "behind a runtime probe" per that file's comments
+# and no-ops without one. So: no `apt-get install lua5.1` here, unlike the
+# GitHub Actions `examples` job, which deliberately drives real example
+# projects end to end.
+test:
+  stage: test
+  <<: *check_rules
+  script:
+    - cargo test --workspace
+
+# --- release -----------------------------------------------------------
+# Triggered on `v*` tags only (see workflow: rules above — this whole
+# pipeline only runs for tag pipelines when the tag matches ^v). Produces
+# a Linux release binary plus a GitLab Release with notes lifted from
+# CHANGELOG.md. See RELEASING.md for the human-side process this
+# automates.
+
+.release_rules: &release_rules
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v/'
+
+build-linux:
+  stage: release
+  <<: *release_rules
+  script:
+    - cargo build --release --workspace
+    - mkdir -p dist
+    - cp target/release/luabox dist/luabox-x86_64-linux
+  artifacts:
+    paths:
+      - dist/luabox-x86_64-linux
+    expire_in: never
+
+# Windows/macOS release builds: structured to run, but `allow_failure: true`
+# and runner-tagged, because this GitLab instance is not guaranteed to have
+# Windows/macOS runners registered. Whoever wires those up for real needs to:
+#   1. Register a runner tagged `windows` (Windows Server, MSVC toolchain,
+#      rustup preinstalled) and/or `macos` (universal, rustup preinstalled).
+#   2. Drop the `allow_failure: true` once that runner is confirmed healthy.
+#   3. These jobs deliberately don't set `image:` — a Windows/macOS runner
+#      is almost always a shell executor (native VM/host), where `image:`
+#      is ignored, rather than the Docker executor `check`/`test` use via
+#      the top-level `default: image: rust:1.92`. If the registered runner
+#      instead uses a Docker executor with Windows containers, add an
+#      explicit `image:` override here.
+#   4. `mkdir -p`/`cp` below assume a bash-capable shell (Git Bash/WSL on
+#      the Windows runner). Swap to PowerShell (`New-Item`/`Copy-Item`) if
+#      the runner's shell executor is `pwsh`/`powershell` instead.
+build-windows:
+  stage: release
+  <<: *release_rules
+  tags: [windows]
+  allow_failure: true
+  script:
+    - cargo build --release --workspace
+    - mkdir -p dist
+    - cp target/release/luabox.exe dist/luabox-x86_64-windows.exe
+  artifacts:
+    paths:
+      - dist/luabox-x86_64-windows.exe
+    expire_in: never
+
+build-macos:
+  stage: release
+  <<: *release_rules
+  tags: [macos]
+  allow_failure: true
+  script:
+    - cargo build --release --workspace
+    - mkdir -p dist
+    - cp target/release/luabox dist/luabox-x86_64-macos
+  artifacts:
+    paths:
+      - dist/luabox-x86_64-macos
+    expire_in: never
+
+# Attaches whatever `dist/luabox-*` artifacts the build jobs above produced
+# (at minimum build-linux's, which is not allow_failure) to a GitLab
+# Release, with notes pulled from the matching CHANGELOG.md entry.
+release:
+  stage: release
+  <<: *release_rules
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - job: build-linux
+      artifacts: true
+    - job: build-windows
+      artifacts: true
+      optional: true
+    - job: build-macos
+      artifacts: true
+      optional: true
+  script:
+    - apk add --no-cache gawk
+    - version="${CI_COMMIT_TAG#v}"
+    # Extract the `## [x.y.z]` section from CHANGELOG.md as the release
+    # notes body (Keep a Changelog format — see CHANGELOG.md/RELEASING.md).
+    - >
+      awk -v ver="$version" '
+        BEGIN { found = 0 }
+        /^## \[/ {
+          if (found) exit
+          if ($0 ~ "\\[" ver "\\]") { found = 1; next }
+        }
+        found { print }
+      ' CHANGELOG.md > release-notes.md
+    - test -s release-notes.md || echo "(no CHANGELOG.md entry found for ${version})" > release-notes.md
+    - cat release-notes.md
+  release:
+    tag_name: $CI_COMMIT_TAG
+    name: "luabox $CI_COMMIT_TAG"
+    description: release-notes.md
+    assets:
+      links:
+        - name: luabox-x86_64-linux
+          url: "${CI_PROJECT_URL}/-/jobs/${CI_JOB_ID}/artifacts/raw/dist/luabox-x86_64-linux"

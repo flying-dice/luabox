@@ -16,9 +16,35 @@ scope.
 executable spec is 167 cucumber scenarios driving the real binary, perf gates
 (cold start < 50 ms, `check` on 100 kLOC < 1 s warm) block CI, and lowering is
 verified by differential execution against real runtimes in CI. Not yet
-published to any registry; build from source.
+published to any package registry (crates.io, Homebrew, etc.) — install a
+prebuilt binary or build from source.
+
+## Install
+
+Prebuilt binaries are attached to tagged GitLab releases
+(`v*`, built by `.gitlab-ci.yml`'s `release` stage — see
+[RELEASING.md](RELEASING.md)):
 
 ```sh
+# Linux / macOS
+curl -fsSL https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/raw/main/scripts/install.sh | bash
+```
+
+```powershell
+# Windows
+irm https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/raw/main/scripts/install.ps1 | iex
+```
+
+Both scripts fetch the latest release from the GitLab releases API and fail
+with a clear message (rather than silently doing nothing) if no release has
+been tagged yet.
+
+Until a release exists, or if you just want the tip of `main`, build from
+source:
+
+```sh
+cargo install --git ssh://git@gitlab.beluga-sirius.ts.net/flying-dice/luabox.git luabox-cli
+# or, from a checkout:
 cargo build --release            # target/release/luabox
 ```
 
@@ -72,6 +98,31 @@ Acceptance tests are Gherkin feature files under
 `crates/luabox-cli/tests/features/` driving the real binary against temp-dir
 fixture projects — the executable spec (SPEC.md §16.2).
 
+## Dependencies & registries in 0.1
+
+0.1 ships dependency resolution without a hosted registry. Supported
+dependency kinds today: path, git (`rev`/`tag`/`branch`), and the LuaRocks
+bridge (`luarocks/*` specs). Registry-kind dependencies also work, but only
+against a registry *you* point at — there is no first-party hosted default
+yet (that's post-0.1; SPEC.md §6).
+
+A registry is any writable root: a plain directory or a `file://` URL. Point
+`luabox add`/`install`/`update` and `luabox publish` at one by setting
+`LUABOX_REGISTRY` to that root. `https://` registries are supported for
+resolving/installing but are read-only in this MVP — `luabox publish`
+requires a directory or `file://` root it can write to.
+
+```sh
+export LUABOX_REGISTRY=file:///path/to/a/registry   # or a plain directory
+luabox add somelib@1.2                              # resolves against it
+luabox publish                                      # publishes to it
+```
+
+Without `LUABOX_REGISTRY` set, registry-kind specs (`luabox add pkg@1.0`)
+and `luabox publish` fail with setup guidance rather than silently doing
+nothing. A hosted, first-party registry is planned but not part of the 0.1
+scope.
+
 ## Editor setup
 
 Editor integrations wrap the `luabox lsp` stdio language server (diagnostics,
@@ -87,3 +138,7 @@ They live under [`editors/`](editors/):
 
 All three resolve the `luabox` binary from `PATH` (overridable per editor) and
 launch it as `luabox lsp`. Build the binary first with `cargo build --release`.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -10,8 +10,10 @@
 //!
 //! `--watch` reuses the shared watch driver (`crate::watch`): a rerun on
 //! every debounced source/manifest change, forever, a failing rerun
-//! reported but not fatal. `--coverage` is a later slice of this phase
-//! (SPEC.md §11) and currently only prints a note.
+//! reported but not fatal. `--coverage` (source-map-aware instrumentation,
+//! SPEC.md §11) isn't built yet; the flag is accepted only so it fails
+//! loudly with a clear error rather than silently running without it —
+//! see `run` below. It's hidden from `--help` accordingly.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,10 +35,9 @@ pub fn run(
     matrix: bool,
 ) -> anyhow::Result<()> {
     if coverage {
-        eprintln!(
-            "note: --coverage is not implemented yet (source-map-aware \
-             instrumentation is a later slice of SPEC.md §11); running \
-             without coverage."
+        bail!(
+            "--coverage is not implemented yet (SPEC.md §11); track progress \
+             at the project backlog"
         );
     }
 

@@ -148,8 +148,9 @@ enum Command {
         /// Run the suite against every Lua runtime found on PATH
         #[arg(long)]
         matrix: bool,
-        /// Collect coverage (not implemented yet — see SPEC.md §11)
-        #[arg(long)]
+        /// Experimental, unimplemented: collect coverage. Currently only
+        /// errors out — see SPEC.md §11.
+        #[arg(long, hide = true)]
         coverage: bool,
     },
     /// Run statistical benchmarks across runtimes
