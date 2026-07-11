@@ -271,12 +271,18 @@ impl TypeEnv {
                 file_env.absorb_block(item, &mut lowerer, &root);
             }
             file_env.collect_global_types(&root);
-            // Name-keyed maps merge without collision across files (byte
-            // ranges would — hence the per-file lowering above).
-            env.classes.append(&mut file_env.classes);
-            env.enums.append(&mut file_env.enums);
-            env.functions.append(&mut file_env.functions);
-            env.global_types.append(&mut file_env.global_types);
+            // Name-keyed maps merge *first-wins*: definition files are supplied
+            // in winner-first order (stdlib base, then project-local defs, then
+            // dependency defs alphabetically — #108's `workspace.library`
+            // precedence), so an earlier source's declaration of a name is kept
+            // and a later duplicate is dropped. The collision itself is
+            // reported separately (`LB0307`); here we only pick the winner. The
+            // stdlib layer never collides across its own files, so this is a
+            // no-op for the cached stdlib path.
+            merge_keep_first(&mut env.classes, file_env.classes);
+            merge_keep_first(&mut env.enums, file_env.enums);
+            merge_keep_first(&mut env.functions, file_env.functions);
+            merge_keep_first(&mut env.global_types, file_env.global_types);
             env.unknown_names.append(&mut lowerer.unknown_names.clone());
         }
         (env, aliases)
@@ -757,6 +763,16 @@ impl TypeEnv {
             .collect();
         candidates.truncate(3);
         candidates
+    }
+}
+
+/// Merge `from` into `into` keeping the value already present on a key
+/// collision (first-wins) — the `workspace.library` precedence for merging
+/// definition-package layers (#108). Contrast [`BTreeMap::append`], which is
+/// last-wins.
+fn merge_keep_first<V>(into: &mut BTreeMap<String, V>, from: BTreeMap<String, V>) {
+    for (key, value) in from {
+        into.entry(key).or_insert(value);
     }
 }
 

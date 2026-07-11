@@ -203,7 +203,7 @@ fn discover(cwd: &Path) -> anyhow::Result<Project> {
                     manifest_path.display()
                 );
             };
-            let known_globals = known_globals(dialect, current, &manifest.types.defs);
+            let known_globals = known_globals(dialect, current, &manifest);
             return Ok(Project {
                 root: current.to_path_buf(),
                 dialect,
@@ -225,19 +225,19 @@ fn discover(cwd: &Path) -> anyhow::Result<Project> {
 
 /// The `undefined-global` known-globals baseline for one project: the
 /// dialect stdlib, widened with any `[types] defs` packages resolved from
-/// `<root>/defs/` (SPEC.md §3) — mirrors `check_cmd::resolve_project_defs`
-/// in miniature (same `defs/<name>.d.lua` / `defs/<name>/*.d.lua`
-/// resolution rules), since the two commands don't share a `Project` type.
-/// An entry that fails to resolve is silently skipped here — `luabox check`
-/// is the command that reports `LB1002` for a bad `[types] defs` entry;
-/// `lint` just falls back to the stdlib-only baseline for that entry.
-fn known_globals(dialect: Dialect, root: &Path, defs: &[String]) -> HashSet<String> {
-    if defs.is_empty() {
-        return stdlib_defs(dialect).global_names().clone();
-    }
+/// `<root>/defs/` (SPEC.md §3) *and* every direct dependency's own `[types]
+/// defs` (#108, the luals `workspace.library` model — a dependency's ambient
+/// globals must not spuriously trip the consumer's `undefined-global`).
+/// Mirrors `check_cmd::resolve_project_defs` in miniature (same resolution
+/// rules), and reuses `check_cmd::resolve_dep_defs` for the dependency side,
+/// since the two commands don't share a `Project` type. A project-defs entry
+/// that fails to resolve is silently skipped here — `luabox check` is the
+/// command that reports `LB1002`; `lint` falls back to the stdlib-only
+/// baseline for that entry.
+fn known_globals(dialect: Dialect, root: &Path, manifest: &Manifest) -> HashSet<String> {
     let mut sources = Vec::new();
     let defs_dir = root.join("defs");
-    for name in defs {
+    for name in &manifest.types.defs {
         let single = defs_dir.join(format!("{name}.d.lua"));
         if single.is_file()
             && let Ok(text) = fs::read_to_string(&single)
@@ -255,6 +255,12 @@ fn known_globals(dialect: Dialect, root: &Path, defs: &[String]) -> HashSet<Stri
                 }
             }
         }
+    }
+    for dep_def in crate::check_cmd::resolve_dep_defs(root, manifest) {
+        sources.push(dep_def.text);
+    }
+    if sources.is_empty() {
+        return stdlib_defs(dialect).global_names().clone();
     }
     let ambient: Ambient = combined_defs(dialect, &sources);
     ambient.global_names().clone()

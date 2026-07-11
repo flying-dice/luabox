@@ -96,6 +96,11 @@ static REGISTRY: &[Entry] = &[
         explain: LB0306,
     },
     Entry {
+        code: Code::new(307),
+        title: "class declared by more than one definition package",
+        explain: LB0307,
+    },
+    Entry {
         code: Code::new(500),
         title: "malformed `---@luabox-ignore`",
         explain: LB0500,
@@ -558,6 +563,42 @@ carriers checked against a `---@class` or `.luab` type (those are governed
 by their declarations — `LB0302`/`LB0303`) never produce this diagnostic.
 
 Fix the spelling, or assign the field somewhere the checker can see.
+";
+
+const LB0307: &str = "\
+# LB0307: class declared by more than one definition package
+
+A `---@class` of the same name is declared by more than one package's
+`[types] defs` in scope. luabox shares LuaCATS types across a package
+boundary the way lua-language-server shares a `workspace.library`: a
+dependency's own `[types] defs` files join the consuming package's ambient
+scope automatically (#108), and class names are a single global namespace
+across the workspace and its libraries — there is no per-package
+namespacing.
+
+Where luals silently merges duplicate `---@class` declarations, luabox is
+stricter: two packages declaring the same class name is a warning at the
+second (losing) declaration, never a silent merge of conflicting fields.
+
+```lua
+-- <consumer>/defs/geometry.d.lua
+---@class geometry.Point
+---@field x number
+
+-- <dependency>/defs/geometry.d.lua   → also declares geometry.Point: LB0307
+---@class geometry.Point
+---@field y number
+```
+
+**Deterministic winner.** Project-local defs are loaded first (the consumer
+wins), then each direct dependency's defs alphabetically by dependency name.
+The *first* declaration in that order wins — its fields are the ones the
+checker uses — and every later declaration of the same name is reported
+here, naming the file that already declared it.
+
+Rename one class, drop the duplicate def entry, or (if the duplicate is a
+hand-vendored copy of a dependency's types) delete the copy and let the
+dependency's own defs reach you automatically.
 ";
 
 const LB0500: &str = "\
@@ -1153,9 +1194,9 @@ mod tests {
     fn seeded_codes_are_all_present() {
         for raw in [
             "LB0001", "LB0010", "LB0011", "LB0012", "LB0013", "LB0014", "LB0015", "LB0016",
-            "LB0300", "LB0301", "LB0302", "LB0303", "LB0304", "LB0305", "LB0306", "LB0500",
-            "LB0501", "LB0502", "LB0503", "LB0504", "LB0505", "LB0506", "LB0507", "LB0508",
-            "LB0509", "LB1001", "LB1100", "LB2005", "LB2007", "LB2010",
+            "LB0300", "LB0301", "LB0302", "LB0303", "LB0304", "LB0305", "LB0306", "LB0307",
+            "LB0500", "LB0501", "LB0502", "LB0503", "LB0504", "LB0505", "LB0506", "LB0507",
+            "LB0508", "LB0509", "LB1001", "LB1100", "LB2005", "LB2007", "LB2010",
         ] {
             let code: Code = raw.parse().unwrap();
             assert!(explain(&code).is_some(), "{raw} missing from registry");

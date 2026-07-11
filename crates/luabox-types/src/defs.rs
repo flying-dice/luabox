@@ -16,11 +16,24 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::OnceLock;
 
+use luabox_diag::{Code, Diagnostic, Label, Span};
 use luabox_hir::{Expr, ExprId, HirId, Resolution, Stmt};
 use luabox_syntax::lua::{self, Dialect};
-use luabox_syntax::luacats::{self, AliasTag, AnnotatedItem};
+use luabox_syntax::luacats::{self, AliasTag, AnnotatedItem, Tag};
 
 use crate::env::TypeEnv;
+
+/// A definition-package source paired with the file it was read from — the
+/// unit cross-package collision reporting (`LB0307`, #108) attributes to.
+#[derive(Debug, Clone)]
+pub struct DefFile {
+    /// A display label for the declaring file (e.g. `defs/geometry.d.lua`, or
+    /// `<dep>/defs/geometry.d.lua` for a dependency's def) — the name a
+    /// collision diagnostic prints.
+    pub file: String,
+    /// The `.d.lua` source text.
+    pub text: String,
+}
 
 /// A parsed, lowered definition-package layer: the ambient environment plus
 /// the `---@alias`es it declares (so a consuming file's lowerer can expand
@@ -236,6 +249,81 @@ pub fn combined(dialect: Dialect, extra: &[String]) -> Ambient {
         all.push(src.as_str());
     }
     Ambient::build(&all)
+}
+
+/// Build the ambient layer combining the dialect stdlib with attributed
+/// project-local and dependency definition files (`[types] defs`), and report
+/// cross-package `---@class` name collisions (`LB0307`, #108).
+///
+/// This is the manifest-native form of luals's `workspace.library` model: a
+/// dependency's own `[types] defs` files join the consumer's ambient scope, so
+/// their `---@class` declarations become referenceable and checkable across
+/// the package boundary. Class names are a single global namespace (as in
+/// luals), but where luals silently merges duplicate declarations, luabox
+/// emits a warning at every declaration after the first.
+///
+/// **Order is precedence.** Callers pass `defs` in winner-first order —
+/// project-local defs first (the consumer wins), then each direct dependency
+/// alphabetically. The first source to declare a class name wins: its fields
+/// are the ones [`TypeEnv`] resolves, and every later declaration of that name
+/// yields an `LB0307` warning naming the file that already declared it.
+#[must_use]
+pub fn combined_checked(dialect: Dialect, defs: &[DefFile]) -> (Ambient, Vec<Diagnostic>) {
+    let mut all: Vec<&str> = sources(dialect).to_vec();
+    for def in defs {
+        all.push(def.text.as_str());
+    }
+    let ambient = Ambient::build(&all);
+    (ambient, class_collisions(defs))
+}
+
+/// Detect `---@class` names declared by more than one `.d.lua` in `defs`,
+/// producing an `LB0307` warning at each declaration after the first. The
+/// first declarer (earliest in `defs`, which is winner-first order) wins and
+/// is never reported; each later duplicate points at the file that already
+/// owns the name. Only cross-*file* duplicates are reported — a file that
+/// declares a class once (the norm) and the trusted stdlib layer are never
+/// involved.
+fn class_collisions(defs: &[DefFile]) -> Vec<Diagnostic> {
+    let mut owner: BTreeMap<String, String> = BTreeMap::new();
+    let mut diags = Vec::new();
+    for def in defs {
+        let parse = lua::parse(&def.text, Dialect::Lua54);
+        let items = luacats::harvest(&parse);
+        // A class name may only be *claimed* once per file even if the same
+        // file repeats it; dedup within-file so an intra-file repeat does not
+        // masquerade as a cross-package collision.
+        let mut claimed_here: HashSet<String> = HashSet::new();
+        for item in &items {
+            for tag in &item.block.tags {
+                let Tag::Class(class) = tag else { continue };
+                if class.name.is_empty() || !claimed_here.insert(class.name.clone()) {
+                    continue;
+                }
+                if let Some(first) = owner.get(&class.name) {
+                    diags.push(
+                        Diagnostic::warning(
+                            Code::new(307),
+                            format!(
+                                "class `{}` is declared by more than one definition package",
+                                class.name
+                            ),
+                        )
+                        .with_label(Label::primary(
+                            Span::new(def.file.clone(), class.span.start..class.span.end),
+                            "duplicate declaration here",
+                        ))
+                        .with_note(format!(
+                            "first declared in `{first}`; that declaration wins"
+                        )),
+                    );
+                } else {
+                    owner.insert(class.name.clone(), def.file.clone());
+                }
+            }
+        }
+    }
+    diags
 }
 
 #[cfg(test)]
@@ -483,6 +571,75 @@ f(math.pi)
             strict(Dialect::Lua54, "local x = bit32.band(1, 2)\n"),
             Vec::<String>::new()
         );
+    }
+
+    // --- cross-package class collisions (#108) ---------------------------
+
+    #[test]
+    fn combined_checked_reports_collision_and_first_wins() {
+        let defs = vec![
+            DefFile {
+                file: "defs/a.d.lua".to_string(),
+                text: "---@meta\n---@class Widget\n---@field a number\n".to_string(),
+            },
+            DefFile {
+                file: "dep/defs/b.d.lua".to_string(),
+                text: "---@meta\n---@class Widget\n---@field b number\n".to_string(),
+            },
+        ];
+        let (ambient, diags) = combined_checked(Dialect::Lua54, &defs);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code.to_string(), "LB0307");
+        assert_eq!(diags[0].severity, luabox_diag::Severity::Warning);
+        // Loser at the span, winner named in the note.
+        let label = diags[0].primary_label().expect("primary label");
+        assert_eq!(label.span.file, "dep/defs/b.d.lua");
+        assert!(
+            diags[0].notes.iter().any(|n| n.contains("defs/a.d.lua")),
+            "note names the winner: {:?}",
+            diags[0].notes
+        );
+        // Deterministic winner: the first (project-local) `Widget` — field `a`.
+        let parse = lua::parse("---@type Widget\nlocal w = { a = 1 }\n", Dialect::Lua54);
+        let clean = crate::check_file_shaped(
+            &parse,
+            "t.lua",
+            crate::Strictness::Strict,
+            None,
+            Some(&ambient),
+        );
+        assert!(
+            clean.is_empty(),
+            "project decl (field `a`) must win: {clean:?}"
+        );
+        let parse = lua::parse("---@type Widget\nlocal w = { b = 1 }\n", Dialect::Lua54);
+        let loser = crate::check_file_shaped(
+            &parse,
+            "t.lua",
+            crate::Strictness::Strict,
+            None,
+            Some(&ambient),
+        );
+        assert!(
+            !loser.is_empty(),
+            "dependency decl (field `b`) must have lost"
+        );
+    }
+
+    #[test]
+    fn combined_checked_distinct_classes_no_collision() {
+        let defs = vec![
+            DefFile {
+                file: "a.d.lua".to_string(),
+                text: "---@meta\n---@class Alpha\n---@field a number\n".to_string(),
+            },
+            DefFile {
+                file: "b.d.lua".to_string(),
+                text: "---@meta\n---@class Beta\n---@field b number\n".to_string(),
+            },
+        ];
+        let (_ambient, diags) = combined_checked(Dialect::Lua54, &defs);
+        assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]

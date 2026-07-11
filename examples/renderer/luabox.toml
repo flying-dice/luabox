@@ -10,16 +10,19 @@ out = "dist"
 [types]
 strict = true
 # Ambient LuaCATS definitions, resolved from defs/ under THIS package's own
-# root only (see defs/geometry.d.lua for why geometry's classes are
-# hand-vendored here rather than referenced from the dependency).
-defs = ["geometry", "render"]
+# root. Only `render` is local now: `geometry`'s classes
+# (geometry.Shape/Drawable/...) reach this package automatically through the
+# path dependency below, the luals `workspace.library` model (#108). No
+# hand-vendored copy of geometry's types is needed any more — see README.md.
+defs = ["render"]
 
 [dependencies]
 # A path dependency on the sibling library. Run `luabox install` once to
-# resolve it into luabox.lock (committed — this is an application). Note:
-# this dependency is still needed at runtime (`require`) and for
-# `luabox install`/lockfile purposes — it does NOT make geometry's LuaCATS
-# types ambient here (see defs/geometry.d.lua).
+# resolve it into luabox.lock (committed — this is an application). Because
+# geometry's own manifest publishes `[types] defs = ["geometry"]`, depending
+# on it here makes geometry's LuaCATS classes ambient in this package
+# automatically (the luals workspace-library model) — that is what lets
+# `---@class render.Square : geometry.Drawable` resolve and be checked.
 geometry = { path = "../geometry" }
 
 [tasks]

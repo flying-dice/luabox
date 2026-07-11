@@ -34,6 +34,12 @@ geometry/
    `geometry` resolves to `defs/geometry.d.lua` (same mechanism
    `love-asteroids-lite` uses for `defs/love2d.d.lua`).
 
+   **These defs are geometry's published type surface.** Because they are
+   declared in `[types] defs`, any package that *depends* on geometry gets
+   them ambiently too (the luals `workspace.library` model, #108) — see
+   `../renderer`, which conforms to `geometry.Drawable` across the package
+   boundary with no vendored copy.
+
 2. **Re-open the class where it's implemented.** `src/circle.lua` declares
    `---@class geometry.Circle : geometry.Shape` again on `local Circle = {}`.
    luabox merges declarations of the same class name, so `self.radius`
@@ -136,8 +142,13 @@ semantics (ecosystem parity, not a luabox invention):
   `---@generic` function (`first_or`) in a real module.
 
 `: Interface` conformance is also checked (see above). Cross-*package* type
-sharing (a dependency's signatures visible in a consumer) is a separate epic
-(#108); within a file that can see a generic's signature, inference is done.
+sharing — a dependency's ambient defs (classes, aliases, enums, and
+def-declared global APIs) visible and checked in a consumer — now works too
+(#108, the luals `workspace.library` model): geometry's own `[types] defs` are
+its published type surface, and `../renderer` conforms to `geometry.Drawable`
+across the package boundary with no vendored copy. Typing a
+`local m = require("geometry")` module *return* value is still a separate epic
+(#85).
 
 ## Constructors under LuaCATS
 

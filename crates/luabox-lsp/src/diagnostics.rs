@@ -11,7 +11,7 @@ use luabox_db::Analysis;
 use luabox_syntax::lua::{Dialect, validate};
 use luabox_syntax::shape;
 use luabox_types::{
-    DepShapeExport, ShapeOptions, ShapeStore, Strictness, check_file_shaped, stdlib_defs,
+    Ambient, DepShapeExport, ShapeOptions, ShapeStore, Strictness, check_file_shaped,
 };
 
 use crate::line_index::LineIndex;
@@ -19,12 +19,18 @@ use crate::line_index::LineIndex;
 /// The project's shape-resolution context, mirroring what `luabox check`
 /// passes to [`check_file_shaped`] (SHAPES.md §6): the shared parse-cache
 /// store plus the manifest's `[types] shape-paths` and shape-exporting
-/// dependencies. Owned by the server; rebuilt when a `.luab` file changes.
+/// dependencies, and the ambient definition-package layer (stdlib + project
+/// defs + dependency defs, #108). Owned by the server; rebuilt when a `.luab`
+/// file changes.
 pub struct ShapeCtx<'a> {
     pub store: &'a ShapeStore,
     pub shape_paths: &'a [PathBuf],
     pub dependencies: &'a [DepShapeExport],
     pub strictness: Strictness,
+    /// The ambient layer to check against — the editor's counterpart of the
+    /// CLI's `combined_defs_checked` ambient, so a dependency's classes resolve
+    /// in the editor exactly as they do under `luabox check`.
+    pub ambient: &'a Ambient,
 }
 
 /// Diagnostics for one `.lua` file known to `analysis`, plus the line index
@@ -79,7 +85,7 @@ pub fn lua_diagnostics(
         &rel,
         shapes.strictness,
         Some(&opts),
-        Some(stdlib_defs(dialect)),
+        Some(shapes.ambient),
     ) {
         let range = diag
             .primary_label()

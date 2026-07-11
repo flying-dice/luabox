@@ -37,7 +37,7 @@ use lsp_types::{
 };
 use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
 use luabox_resolve::manifest::{Dependency, Manifest};
-use luabox_types::{DepShapeExport, ShapeStore};
+use luabox_types::{Ambient, DepShapeExport, ShapeStore, combined_defs};
 
 use crate::line_index::LineIndex;
 use crate::sema::FileSema;
@@ -134,6 +134,12 @@ struct ProjectConfig {
     shape_paths: Vec<PathBuf>,
     /// Dependencies that export shape modules (SHAPES.md §6, tier 3).
     dependencies: Vec<DepShapeExport>,
+    /// Ambient definition-package sources, winner-first (SPEC.md §3, #108):
+    /// the project's own `[types] defs` then each direct dependency's defs
+    /// (the luals `workspace.library` model), so the editor's ambient scope
+    /// matches `luabox check`'s. Combined with the dialect stdlib into the
+    /// server's [`Ambient`].
+    def_sources: Vec<String>,
 }
 
 impl ProjectConfig {
@@ -144,6 +150,7 @@ impl ProjectConfig {
             out_dir: None,
             shape_paths: Vec::new(),
             dependencies: Vec::new(),
+            def_sources: Vec::new(),
         };
         let Ok(text) = fs::read_to_string(root.join("luabox.toml")) else {
             return defaults;
@@ -163,6 +170,93 @@ impl ProjectConfig {
                 .map(|p| root.join(p))
                 .collect(),
             dependencies: resolve_dep_shape_exports(root, &manifest),
+            def_sources: ambient_def_sources(root, &manifest),
+        }
+    }
+}
+
+/// Resolve the ambient definition-package sources for a project, winner-first
+/// (SPEC.md §3, #108): the project's own `[types] defs` from `<root>/defs/`,
+/// then every direct dependency's own `[types] defs` from that dependency's
+/// `defs/` (the luals `workspace.library` model). Mirrors
+/// `check_cmd::resolve_project_defs` + `resolve_dep_defs` in the CLI — the LSP
+/// crate cannot depend on `luabox-cli`, so this join is duplicated here the
+/// same way `resolve_dep_shape_exports` already is. The editor and CI thus
+/// build the same ambient scope. Cross-package class collisions (`LB0307`) are
+/// a project-wide, check-time concern and are not surfaced per file here.
+fn ambient_def_sources(root: &Path, manifest: &Manifest) -> Vec<String> {
+    let mut sources = Vec::new();
+    load_defs_from(&root.join("defs"), &manifest.types.defs, &mut sources);
+
+    // `[dependencies]` + `[dev-dependencies]`, alphabetical by name (the
+    // deterministic winner order), one level deep only.
+    let mut deps: Vec<(&String, &Dependency)> = manifest
+        .dependencies
+        .iter()
+        .chain(&manifest.dev_dependencies)
+        .collect();
+    deps.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, dep) in deps {
+        let dep_root = match dep {
+            Dependency::Path(p) => root.join(p.path.replace('\\', "/")),
+            _ => root.join("lua_modules").join(name),
+        };
+        let Ok(text) = fs::read_to_string(dep_root.join("luabox.toml")) else {
+            continue;
+        };
+        let Ok(dep_manifest) = Manifest::parse(&text) else {
+            continue;
+        };
+        load_defs_from(
+            &dep_root.join("defs"),
+            &dep_manifest.types.defs,
+            &mut sources,
+        );
+    }
+    sources
+}
+
+/// Append the `.d.lua` texts for each `[types] defs` entry resolved against
+/// `defs_dir` (`<name>.d.lua`, or every `*.d.lua` under `<name>/`), sorted.
+fn load_defs_from(defs_dir: &Path, names: &[String], out: &mut Vec<String>) {
+    for name in names {
+        let single = defs_dir.join(format!("{name}.d.lua"));
+        if single.is_file()
+            && let Ok(text) = fs::read_to_string(&single)
+        {
+            out.push(text);
+        }
+        let dir = defs_dir.join(name);
+        if dir.is_dir() {
+            let mut files = Vec::new();
+            collect_d_lua(&dir, &mut files);
+            files.sort();
+            for file in files {
+                if let Ok(text) = fs::read_to_string(&file) {
+                    out.push(text);
+                }
+            }
+        }
+    }
+}
+
+/// Collect every `*.d.lua` file under `dir`, recursively (mirrors the CLI's
+/// helper of the same shape).
+fn collect_d_lua(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_d_lua(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("lua")
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".d.lua"))
+        {
+            out.push(path);
         }
     }
 }
@@ -222,6 +316,10 @@ struct Server {
     shape_paths: Vec<PathBuf>,
     /// Shape-exporting dependencies (SHAPES.md §6, tier 3).
     dependencies: Vec<DepShapeExport>,
+    /// The ambient definition-package layer (dialect stdlib + project defs +
+    /// dependency defs, #108), built once at startup so the editor's type
+    /// resolution matches `luabox check`.
+    ambient: Ambient,
     /// Shape-module parse cache for the shaped type pass. The store reads
     /// from disk, so it is dropped and rebuilt whenever a `.luab` buffer
     /// changes (the IDE auto-saves; unsaved shape edits are eventually
@@ -235,6 +333,7 @@ struct Server {
 impl Server {
     fn new(connection: Connection, root: PathBuf) -> Self {
         let config = ProjectConfig::discover(&root);
+        let ambient = combined_defs(config.dialect, &config.def_sources);
         Self {
             connection,
             host: AnalysisHost::new(config.dialect, config.strictness),
@@ -247,6 +346,7 @@ impl Server {
             lb_disk: HashMap::new(),
             shape_paths: config.shape_paths,
             dependencies: config.dependencies,
+            ambient,
             open_lua: HashMap::new(),
         }
     }
@@ -686,6 +786,7 @@ impl Server {
             shape_paths: &self.shape_paths,
             dependencies: &self.dependencies,
             strictness: self.strictness,
+            ambient: &self.ambient,
         };
         let diags = diagnostics::lua_diagnostics(&analysis, path, self.dialect, &shapes)
             .unwrap_or_default();

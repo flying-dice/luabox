@@ -39,7 +39,8 @@ use luabox_diag::{Code, Diagnostic, Format, Label, Severity, Span, render};
 use luabox_resolve::manifest::{Dependency, Manifest};
 use luabox_syntax::{Dialect, lua};
 use luabox_types::{
-    Ambient, DepShapeExport, ShapeOptions, ShapeStore, Strictness, combined_defs, stdlib_defs,
+    Ambient, DefFile, DepShapeExport, ShapeOptions, ShapeStore, Strictness, combined_defs_checked,
+    stdlib_defs,
 };
 use rayon::prelude::*;
 
@@ -101,14 +102,21 @@ pub(crate) fn run_once(
 
     let (lua_files, lb_files) = collect_files(&project)?;
     // Definition packages (SPEC.md §3): the dialect stdlib layer, plus any
-    // project-local `[types] defs` resolved from `<root>/defs/`. Built once
-    // and shared by reference across the rayon workers; the stdlib-only case
-    // reuses a process-lifetime cache (perf gate: paid once).
-    let (def_sources, def_diags) = resolve_project_defs(&project.root, &project.defs);
-    let ambient_owned: Option<Ambient> = if project.defs.is_empty() {
+    // project-local `[types] defs` resolved from `<root>/defs/`, plus each
+    // direct dependency's own `[types] defs` — the luals `workspace.library`
+    // model (#108): a dependency's def files join the consumer's ambient
+    // scope. Winner-first order (project defs, then dependencies
+    // alphabetically); `combined_defs_checked` reports cross-package class
+    // collisions (`LB0307`). Built once and shared by reference across the
+    // rayon workers; the no-defs case reuses a process-lifetime cache.
+    let (mut all_defs, mut def_diags) = resolve_project_defs(&project.root, &project.defs);
+    all_defs.extend(project.dep_defs.iter().cloned());
+    let ambient_owned: Option<Ambient> = if all_defs.is_empty() {
         None
     } else {
-        Some(combined_defs(project.dialect, &def_sources))
+        let (ambient, collisions) = combined_defs_checked(project.dialect, &all_defs);
+        def_diags.extend(collisions);
+        Some(ambient)
     };
     let ambient: &Ambient = ambient_owned
         .as_ref()
@@ -293,6 +301,12 @@ pub(crate) struct Project {
     /// `[types] defs`, ambient definition packages resolved from the
     /// project-local `defs/` directory (SPEC.md §3, §5).
     defs: Vec<String>,
+    /// Definition files each direct dependency contributes to *this* project's
+    /// ambient scope (#108, the luals `workspace.library` model): each direct
+    /// dependency's own `[types] defs`, resolved from that dependency's
+    /// `defs/` directory, in dependency-name-alphabetical order. Loaded into
+    /// the same ambient layer as the project's own defs, after them.
+    dep_defs: Vec<DefFile>,
 }
 
 /// Find the project: nearest `luabox.toml` walking up from `cwd`
@@ -341,6 +355,7 @@ pub(crate) fn discover(cwd: &Path) -> anyhow::Result<Project> {
                     .collect(),
                 dependencies: resolve_dep_shape_exports(current, &manifest),
                 defs: manifest.types.defs.clone(),
+                dep_defs: resolve_dep_defs(current, &manifest),
             });
         }
         dir = current.parent();
@@ -354,6 +369,7 @@ pub(crate) fn discover(cwd: &Path) -> anyhow::Result<Project> {
         shape_paths: Vec::new(),
         dependencies: Vec::new(),
         defs: Vec::new(),
+        dep_defs: Vec::new(),
     })
 }
 
@@ -404,9 +420,10 @@ fn resolve_dep_shape_exports(root: &Path, manifest: &Manifest) -> Vec<DepShapeEx
 /// Resolve `[types] defs` entries against the project-local `defs/`
 /// directory: each name loads `defs/<name>.d.lua` or every `*.d.lua` under
 /// `defs/<name>/` (SPEC.md §3 — registry-distributed packages are P2+).
-/// Returns the concatenated sources plus a diagnostic per unresolvable entry.
-fn resolve_project_defs(root: &Path, names: &[String]) -> (Vec<String>, Vec<Diagnostic>) {
-    let mut sources = Vec::new();
+/// Returns the resolved def files (each carrying a root-relative label for
+/// diagnostics) plus a diagnostic per unresolvable entry.
+fn resolve_project_defs(root: &Path, names: &[String]) -> (Vec<DefFile>, Vec<Diagnostic>) {
+    let mut defs = Vec::new();
     let mut diags = Vec::new();
     let defs_dir = root.join("defs");
     for name in names {
@@ -416,7 +433,10 @@ fn resolve_project_defs(root: &Path, names: &[String]) -> (Vec<String>, Vec<Diag
         if single.is_file()
             && let Ok(text) = fs::read_to_string(&single)
         {
-            sources.push(text);
+            defs.push(DefFile {
+                file: display_rel(&single, root),
+                text,
+            });
             found = true;
         }
         if dir.is_dir() {
@@ -425,7 +445,10 @@ fn resolve_project_defs(root: &Path, names: &[String]) -> (Vec<String>, Vec<Diag
             files.sort();
             for file in files {
                 if let Ok(text) = fs::read_to_string(&file) {
-                    sources.push(text);
+                    defs.push(DefFile {
+                        file: display_rel(&file, root),
+                        text,
+                    });
                     found = true;
                 }
             }
@@ -444,7 +467,86 @@ fn resolve_project_defs(root: &Path, names: &[String]) -> (Vec<String>, Vec<Diag
             );
         }
     }
-    (sources, diags)
+    (defs, diags)
+}
+
+/// Resolve the def files each DIRECT dependency contributes to the consuming
+/// project's ambient scope (#108, the luals `workspace.library` model). For
+/// each direct dependency (`[dependencies]` + `[dev-dependencies]`) in
+/// alphabetical name order — the deterministic collision-winner order — locate
+/// its package root (a path dependency in place at its `path`, every other
+/// kind under `lua_modules/<name>/`), read that dependency's *own* `[types]
+/// defs`, and load those files from the dependency's `defs/` directory. A
+/// dependency with no manifest on disk (uninstalled, or a source kind whose
+/// root cannot be located here) or no `[types] defs` simply contributes
+/// nothing. Resolution is one level deep only: a dependency's *own*
+/// dependencies' defs do not transit (matching `.luab`'s one-level precedent).
+///
+/// Shared with `lint_cmd` (its `undefined-global` known-globals baseline must
+/// count dependency defs' globals too, #103/#108).
+pub(crate) fn resolve_dep_defs(root: &Path, manifest: &Manifest) -> Vec<DefFile> {
+    // `[dependencies]` and `[dev-dependencies]` are each `BTreeMap`s (already
+    // name-sorted); merge them into one name-sorted list so the winner order
+    // is a single alphabetical sweep across both.
+    let mut deps: Vec<(&String, &Dependency)> = manifest
+        .dependencies
+        .iter()
+        .chain(&manifest.dev_dependencies)
+        .collect();
+    deps.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut out = Vec::new();
+    for (name, dep) in deps {
+        let dep_root = match dep {
+            Dependency::Path(p) => root.join(p.path.replace('\\', "/")),
+            _ => root.join("lua_modules").join(name),
+        };
+        let Ok(text) = fs::read_to_string(dep_root.join("luabox.toml")) else {
+            continue;
+        };
+        let Ok(dep_manifest) = Manifest::parse(&text) else {
+            continue;
+        };
+        let defs_dir = dep_root.join("defs");
+        for def_name in &dep_manifest.types.defs {
+            let single = defs_dir.join(format!("{def_name}.d.lua"));
+            if single.is_file()
+                && let Ok(text) = fs::read_to_string(&single)
+            {
+                out.push(DefFile {
+                    file: dep_def_label(name, &single, &dep_root),
+                    text,
+                });
+            }
+            let dir = defs_dir.join(def_name);
+            if dir.is_dir() {
+                let mut files = Vec::new();
+                collect_d_lua(&dir, &mut files);
+                files.sort();
+                for file in files {
+                    if let Ok(text) = fs::read_to_string(&file) {
+                        out.push(DefFile {
+                            file: dep_def_label(name, &file, &dep_root),
+                            text,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A readable, deterministic label for a dependency-contributed def file: the
+/// dependency name plus the file's path within the dependency
+/// (`<dep>/defs/<name>.d.lua`), forward-slashed for cross-platform stability.
+fn dep_def_label(dep_name: &str, file: &Path, dep_root: &Path) -> String {
+    let rel = file
+        .strip_prefix(dep_root)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .replace('\\', "/");
+    format!("{dep_name}/{rel}")
 }
 
 /// Collect every `*.d.lua` file under `dir`, recursively.

@@ -33,7 +33,10 @@ pub mod shape;
 pub mod ty;
 
 pub use assign::assignable;
-pub use defs::{Ambient, combined as combined_defs, stdlib as stdlib_defs};
+pub use defs::{
+    Ambient, DefFile, combined as combined_defs, combined_checked as combined_defs_checked,
+    stdlib as stdlib_defs,
+};
 pub use env::TypeEnv;
 pub use infer::{ExternalTypes, InferredBinding, InferredReturn};
 pub use shape::{DepShapeExport, ShapeOptions, ShapeStore};

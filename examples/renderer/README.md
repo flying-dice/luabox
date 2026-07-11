@@ -1,15 +1,13 @@
 # renderer
 
-Depends on `../geometry` across a **package boundary** and (attempts to)
-conform to its `Drawable` type with its own carrier. An application
-(`edition = "5.1"`, so it runs end-to-end on a stock Lua 5.1) that draws
-ASCII shapes to stdout.
+Depends on `../geometry` across a **package boundary** and conforms to its
+`Drawable` type with its own carrier. An application (`edition = "5.1"`, so it
+runs end-to-end on a stock Lua 5.1) that draws ASCII shapes to stdout.
 
 ```
 renderer/
 ├── luabox.toml            # [dependencies] geometry = { path = "../geometry" }
 ├── luabox.lock             # committed — this is an app, not a library
-├── defs/geometry.d.lua     # VENDORED STOPGAP — see below
 ├── defs/render.d.lua       # our own render.Square : geometry.Drawable
 ├── src/square.lua          # carrier with top ---@class render.Square : geometry.Drawable
 └── src/main.lua            # draws a square with `luabox run start`
@@ -25,53 +23,46 @@ luabox install      # writes luabox.lock; the path dep is used in place
 
 `luabox.lock` is committed here because renderer is an application.
 
-## Cross-package LuaCATS typing — the key finding
+## Cross-package LuaCATS typing — the library model (#108)
 
-This example used to be typed with `.luab` shape modules, where a
-dependency's exported types are automatically ambient in a consuming
-package (`[types] entry`/`shape-paths`, resolved via
-`resolve_dep_shape_exports` — SHAPES-V2.md). **Plain LuaCATS has no
-equivalent mechanism today.** This was verified directly against the real
-binary while converting this example, not assumed:
+luabox shares LuaCATS types across a package boundary the way
+lua-language-server shares a **`workspace.library`**: a dependency's own
+`[types] defs` files join the consuming package's ambient scope automatically.
+`../geometry`'s manifest publishes `[types] defs = ["geometry"]`, so simply
+depending on `geometry` here makes every class it declares
+(`geometry.Shape`, `geometry.Drawable`, `geometry.Point`, ...) referenceable
+and checkable in renderer — no imports, no `require`-for-types, and **no
+hand-vendored copy**. Class names are a single global namespace across the
+workspace and its libraries, exactly as in luals; `geometry.Drawable` resolves
+here the same way a local class would.
 
-- A `---@class` declared in a dependency's own `.lua` source is invisible in
-  a consumer, under any name (qualified or not) — even after `luabox
-  install` resolves the path dependency into `luabox.lock`.
-  `---@type <name>` at the consumer reports `error[LB0305]: unknown type
-  name` regardless.
-- Calling a cross-package function *does* run at runtime (`require` still
-  works — this is a type-checking gap, not a module-resolution one), but
-  the checker does not carry its declared parameter/return types across the
-  boundary: a call that would be flagged as a type mismatch **inside** the
-  dependency's own package checks clean when made from a consumer, because
-  the checker never resolved the callee's signature at all.
-- `[types] defs` — the mechanism this project now uses for its own local
-  types — is explicitly local: it resolves entries *only* from
-  `<this project's root>/defs/`, never into a dependency's tree (confirmed
-  by reading `resolve_project_defs` in `luabox-cli`, and by testing: pointing
-  a consumer's `defs` list at a name that only exists in a dependency's
-  `defs/` produces `error[LB1002]: cannot resolve definition package`).
+Resolution walks **direct** dependencies only, one level deep (a dependency's
+*own* dependencies' defs do not transit — matching the manifest resolver's
+precedent). If two packages in scope declared the same class name, luabox is
+stricter than luals's silent merge: it reports `LB0307` (a warning) at the
+losing declaration and the project-local declaration wins.
 
-**The stopgap used here:** `defs/geometry.d.lua` is a hand-duplicated,
-explicitly-labeled copy of the two classes renderer needs
-(`geometry.Shape`, `geometry.Drawable`) from `../geometry/defs/geometry.d.lua`.
-It is **not** kept in sync automatically — a real project doing this would
-need a manual process (or code generation) to detect drift. But it IS now
-strictly required for `luabox check` to pass: as of #107 an `---@class X :
-Y` extends-clause where `Y` doesn't resolve raises `LB0305` at the parent
-reference, exactly like the stricter positions (`---@type`, `---@param`,
-`---@field`) always did. Delete this vendored file (and its `defs` manifest
-entry) and `src/square.lua`'s `: geometry.Drawable` reports:
+### What this does — and doesn't — carry across the boundary
 
-```
-error[LB0305]: unknown type name `geometry.Drawable` in annotation
-   --> src/square.lua:16:27
-   |
-16 | ---@class render.Square : geometry.Drawable
-   |                           ^^^^^^^^^^^^^^^^^ not a built-in, `---@class`, `---@alias`, or `---@enum` name
-```
+- **Does:** a dependency's `---@class`/`---@alias`/`---@enum` become
+  referenceable (`---@class render.Square : geometry.Drawable`,
+  `---@type geometry.Point`), and a dependency's def-declared **global/module
+  API** (e.g. `function geometry.point(x, y)` on a global table) is called
+  with full param/return checking — the same way the stdlib and `love2d` defs
+  already are.
+- **Doesn't:** it does **not** type a `local geo = require("geometry")` module
+  *return* value. Cross-file `require` resolution is a separate epic (#85);
+  the value from `require` is still `unknown` to the checker. This example
+  types the shared **declarations** (the interface renderer conforms to), not
+  a required module handle.
 
-## What this means for the carrier
+> Historical note: this example used to hand-vendor a copy of geometry's
+> classes in `defs/geometry.d.lua` with a "cross-package sharing doesn't work"
+> stopgap comment. That file is gone — #108 makes the dependency's own defs
+> reach renderer automatically, which is what a `.luab`-era `[types] entry`
+> export did before the LuaCATS conversion.
+
+## The carrier
 
 `src/square.lua` declares:
 
@@ -80,16 +71,23 @@ error[LB0305]: unknown type name `geometry.Drawable` in annotation
 local Square = {}
 ```
 
-Because `geometry.Drawable`'s definition (vendored, not shared) extends
-`geometry.Shape`, this single annotation is checked — and as of #107 the
-conformance to `Drawable` (area + perimeter + my_static + draw) IS verified
-here, exactly as it is inside `../geometry`. This example implements all
+`geometry.Drawable` (and its parent `geometry.Shape`) are ambient here through
+the dependency, so this single annotation is checked: conformance to
+`Drawable` (`area` + `perimeter` + `my_static` + `draw`) IS verified in
+renderer, exactly as it is inside `../geometry`. This example implements all
 four members; delete any one and `luabox check` reports `LB0300` at the
-`---@class` line (`missing member \`draw\``, etc.) — see
-`../geometry/README.md` for the exact error format.
+`---@class` line, e.g.:
+
+```
+error[LB0300]: `render.Square` does not satisfy `geometry.Drawable`: missing member `draw`
+   --> src/square.lua:...:4
+   |
+   | ---@class render.Square : geometry.Drawable
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected member `draw` of type `fun(self: unknown): string`
+```
 
 ```sh
-luabox check        # 0 errors — conformance and extends-clauses verified
+luabox check        # 0 errors — cross-package conformance verified
 luabox fmt --check
 luabox lint
 luabox test
@@ -109,10 +107,10 @@ area = 16, perimeter = 16
 
 ## Contrast with geometry
 
-- `../geometry` declares its types in its own ambient `[types] defs`
-  package — nothing is "exported" to dependents in the `.luab` sense.
-- `renderer` cannot address `../geometry`'s types directly; it vendors a
-  hand-synced copy instead. This is the honest cost of dropping `.luab`'s
-  cross-package shape export for plain LuaCATS today. If/when the `.luab`
-  drop epic lands equivalent cross-package sharing for LuaCATS, this
-  vendored file should be deleted in favor of it.
+- `../geometry` declares its types in its own ambient `[types] defs` package.
+  Those defs are its **published type surface**: any package that depends on
+  geometry gets them ambiently, the luals workspace-library model.
+- `renderer` addresses `../geometry`'s types directly by their qualified names
+  — no copy, no re-declaration. `defs/render.d.lua` holds only renderer's own
+  `render.Square`, declared as an extension of the dependency's
+  `geometry.Drawable`.

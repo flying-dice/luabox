@@ -1,10 +1,12 @@
 ---@meta
 -- Renderer-local types.
 --
--- No imports: `geometry.Drawable` comes from the vendored, hand-synced copy
--- in defs/geometry.d.lua (see that file for why a copy exists instead of a
--- reference to ../../geometry's own definitions — cross-package LuaCATS
--- sharing doesn't work today).
+-- No imports and no vendored copy: `geometry.Drawable` is ambient here
+-- because renderer depends on the `geometry` package, whose own
+-- `[types] defs = ["geometry"]` publishes those classes into every dependent's
+-- ambient scope (the luals `workspace.library` model, #108). The class names
+-- live in one global namespace across the workspace and its libraries, so
+-- `geometry.Drawable` resolves exactly as a local class would.
 --
 -- A filled square rendered as ASCII art. The side is a cell count, so it is
 -- an `integer` — `string.rep("#", self.side)` typechecks against the
