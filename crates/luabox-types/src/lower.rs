@@ -91,12 +91,23 @@ impl<'a> Lowerer<'a> {
             TypeExprKind::Union(members) => {
                 Ty::union(members.iter().map(|m| self.lower(m)).collect())
             }
-            // TODO(P1): real tuple types; for now a tuple is an array of the
-            // member union.
-            TypeExprKind::Tuple(members) => Ty::Table(Box::new(TableTy {
-                array: Some(Ty::union(members.iter().map(|m| self.lower(m)).collect())),
-                ..TableTy::default()
-            })),
+            // A tuple `[T1, T2, ...]` is a fixed-position table: member `i`
+            // lives at integer key `i` (1-based), modeled as an integer-literal
+            // indexer so `t[1]` reads back `T1` and a literal in tuple-typed
+            // position is checked per position (#86). Reading past the end is
+            // lenient (luals) — no `array` part, so a missing position is
+            // `unknown`, never a hard error.
+            TypeExprKind::Tuple(members) => {
+                let indexers = members
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| (Ty::NumberLit((i + 1).to_string()), self.lower(m)))
+                    .collect();
+                Ty::Table(Box::new(TableTy {
+                    indexers,
+                    ..TableTy::default()
+                }))
+            }
             TypeExprKind::Table(fields) => self.lower_table(fields),
             TypeExprKind::Fun { params, returns } => self.lower_fun(params, returns),
             TypeExprKind::StringLit(raw) => Ty::StringLit(unquote(raw)),

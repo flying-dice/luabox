@@ -292,6 +292,16 @@ impl TypeEnv {
     /// globals (`_VERSION` under `---@type string`) to their declared types,
     /// so field reads like `math.pi` and `_VERSION` resolve. Called once per
     /// definition file, before its range-keyed maps are merged away.
+    ///
+    /// Also folds def-declared *value* fields on global tables
+    /// (`zlib.version = "1.3.1"` with a `---@type string`, or a bare typed
+    /// literal) into the base table's shape — the class shape when the base is
+    /// `---@class`-declared, or the structural table registered for a plain
+    /// `zlib = {}` (the dominant def style) — so `zlib.version` reads back as
+    /// its declared/literal type. Function fields already register by dotted
+    /// name, but scalar fields had no home before (#105). Statements are
+    /// visited in document order, so an intermediate `mylib.sub = {}` folds
+    /// before the nested `mylib.sub.const = ...` that resolves through it.
     fn collect_global_types(&mut self, root: &SyntaxNode) {
         for node in root.descendants() {
             let Some(Stmt::Assign(assign)) = Stmt::cast(node.clone()) else {
@@ -301,21 +311,143 @@ impl TypeEnv {
                 .targets()
                 .map(|t| t.exprs().collect())
                 .unwrap_or_default();
-            let [Expr::Name(name)] = &targets[..] else {
-                continue; // only simple single-name globals: `NAME = ...`
+            let [target] = &targets[..] else {
+                continue; // only single-target assignments carry a type here
             };
-            let Some(name) = name.name() else { continue };
             let range = node.text_range();
             let key = (usize::from(range.start()), usize::from(range.end()));
-            if let Some(class) = self.declared_targets.get(&key) {
-                self.global_types
-                    .insert(name.text().to_string(), Ty::Named(class.clone()));
-            } else if let Some(types) = self.typed_locals.get(&key)
-                && let Some(ty) = types.first()
-            {
-                self.global_types
-                    .insert(name.text().to_string(), ty.clone());
+            match target {
+                Expr::Name(name) => {
+                    let Some(name) = name.name() else { continue };
+                    if let Some(class) = self.declared_targets.get(&key) {
+                        self.global_types
+                            .insert(name.text().to_string(), Ty::Named(class.clone()));
+                    } else if let Some(types) = self.typed_locals.get(&key)
+                        && let Some(ty) = types.first()
+                    {
+                        self.global_types
+                            .insert(name.text().to_string(), ty.clone());
+                    } else if is_table_constructor(&assign) {
+                        // A *plain* global table (`love = {}`, no `---@class`
+                        // — the dominant def style): register an empty
+                        // structural table so later dotted value-field
+                        // assignments fold into it (#105). `or_insert` keeps
+                        // already-folded fields if the name is (unusually)
+                        // assigned twice.
+                        self.global_types
+                            .entry(name.text().to_string())
+                            .or_insert_with(|| Ty::Table(Box::default()));
+                    }
+                }
+                Expr::Field(field) => {
+                    let (Some(field_name), Some(base)) = (field.field_name(), field.base()) else {
+                        continue;
+                    };
+                    let Some(ty) = self.field_value_ty(&assign, key) else {
+                        continue;
+                    };
+                    // A `---@class`-declared base folds into the class shape; a
+                    // plain-table base folds into the structural table stored in
+                    // `global_types` (nested paths walk intermediate table
+                    // fields either way).
+                    if let Some(class) = self.resolve_path_class(&base) {
+                        if let Some(def) = self.classes.get_mut(&class) {
+                            def.fields
+                                .entry(field_name.text().to_string())
+                                .or_insert(FieldTy {
+                                    ty,
+                                    optional: false,
+                                });
+                        }
+                    } else if let Some(table) = self.resolve_path_table_mut(&base) {
+                        table
+                            .fields
+                            .entry(field_name.text().to_string())
+                            .or_insert(FieldTy {
+                                ty,
+                                optional: false,
+                            });
+                    }
+                }
+                _ => {}
             }
+        }
+    }
+
+    /// The declared or literal-widened type written to a global-table value
+    /// field: a `---@class`/`---@type` on the assignment first, else the
+    /// widened type of a bare literal right-hand side (`= "1.3.1"` → `string`,
+    /// matching luals), else an empty structural table for a bare `= {}`
+    /// sub-table (so deeper `mylib.sub.const = ...` assignments fold through
+    /// it). `None` when nothing types the field.
+    fn field_value_ty(&self, assign: &lua::ast::AssignStmt, key: Target) -> Option<Ty> {
+        if let Some(class) = self.declared_targets.get(&key) {
+            return Some(Ty::Named(class.clone()));
+        }
+        if let Some(ty) = self.typed_locals.get(&key).and_then(|t| t.first()) {
+            return Some(ty.clone());
+        }
+        let value = assign.values().and_then(|v| v.exprs().next())?;
+        if matches!(value, Expr::Table(_)) {
+            return Some(Ty::Table(Box::default()));
+        }
+        literal_ty(&value).map(|t| t.widened())
+    }
+
+    /// Resolve a dotted global-table path to the mutable structural table it
+    /// names: `zlib` → the plain (`---@class`-less) `zlib = {}` table stored
+    /// in `global_types`; `zlib.sub` → its nested table field. `None` when the
+    /// path is not a plain-table chain — class-declared bases fold through
+    /// [`Self::resolve_path_class`] instead.
+    fn resolve_path_table_mut(&mut self, expr: &Expr) -> Option<&mut TableTy> {
+        let mut segments: Vec<String> = Vec::new();
+        let mut cur = expr.clone();
+        let base = loop {
+            match cur {
+                Expr::Name(name) => break name.name()?.text().to_string(),
+                Expr::Field(field) => {
+                    segments.push(field.field_name()?.text().to_string());
+                    cur = field.base()?;
+                }
+                _ => return None,
+            }
+        };
+        segments.reverse();
+        let mut table = match self.global_types.get_mut(&base)? {
+            Ty::Table(table) => table.as_mut(),
+            _ => return None,
+        };
+        for segment in &segments {
+            table = match &mut table.fields.get_mut(segment)?.ty {
+                Ty::Table(next) => next.as_mut(),
+                _ => return None,
+            };
+        }
+        Some(table)
+    }
+
+    /// Resolve a dotted global-table path to the `---@class` name it is
+    /// declared as: `zlib` via its global binding, `mylib.sub` by walking the
+    /// intermediate class's field type. `None` for paths that do not bottom
+    /// out at a class-typed global table.
+    fn resolve_path_class(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Name(name) => match self.global_types.get(name.name()?.text()) {
+                Some(Ty::Named(class)) => Some(class.clone()),
+                _ => None,
+            },
+            Expr::Field(field) => {
+                let base_class = self.resolve_path_class(&field.base()?)?;
+                let member = field.field_name()?;
+                match self.classes.get(&base_class)?.fields.get(member.text()) {
+                    Some(FieldTy {
+                        ty: Ty::Named(class),
+                        ..
+                    }) => Some(class.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
         }
     }
 
@@ -1002,6 +1134,15 @@ fn enum_table(local: &LocalStmt) -> Option<lua::ast::TableExpr> {
         Expr::Table(table) => Some(table),
         _ => None,
     }
+}
+
+/// Whether an assignment's (first) right-hand side is a table constructor —
+/// the `NAME = {}` def idiom that declares a plain global module table (#105).
+fn is_table_constructor(assign: &lua::ast::AssignStmt) -> bool {
+    matches!(
+        assign.values().and_then(|v| v.exprs().next()),
+        Some(Expr::Table(_))
+    )
 }
 
 /// The literal type of a literal expression, if it is one.

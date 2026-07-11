@@ -1942,7 +1942,18 @@ impl Infer<'_> {
                 }
                 None => ITy::unknown(),
             },
-            Expr::Literal(Literal::Number(_)) => self.elem_ty(&recv),
+            Expr::Literal(Literal::Number(num)) => {
+                // A fixed-position tuple (`---@type [string, number]`): `t[1]`
+                // reads back the type at that position; past the end is lenient
+                // (#86). Non-tuple receivers fall through to array/indexer.
+                if let luabox_hir::Number::Int(idx) = num
+                    && let Some(ty) = tuple_index(&recv, idx)
+                {
+                    ty
+                } else {
+                    self.elem_ty(&recv)
+                }
+            }
             _ => {
                 let key = self.eval(body, index);
                 let key_ty = self.reify(&key);
@@ -2131,7 +2142,19 @@ impl Infer<'_> {
             }
         }
 
-        let callee_ity = self.eval(body, callee);
+        let mut callee_ity = self.eval(body, callee);
+        // A dotted callee whose signature lives only in the ambient/defs
+        // registry (`string.rep`, a defs-global `mylib.f`): the base table's
+        // shape carries no such field (defs register dotted functions by name,
+        // not as class members), so the callee evaluates to `unknown` and the
+        // call result never reaches an unannotated binding. Resolve the
+        // declared signature by dotted name so its returns propagate (#106).
+        if callee_ity.is_unknown()
+            && let Some(dotted) = self.dotted_callee(body, callee)
+            && let Some(sig) = self.env.function(&dotted)
+        {
+            callee_ity = ITy::Ty(Ty::Function(Box::new(sig.clone())));
+        }
         let mut arg_itys: Vec<ITy> = Vec::with_capacity(args.len());
         for &arg in &args {
             let ity = self.eval(body, arg);
@@ -2161,7 +2184,81 @@ impl Infer<'_> {
                 sig.returns_vararg,
             );
         }
+        // Overload-aware result: if the callee's primary signature does not
+        // accept the arguments but an `---@overload` does, the call yields the
+        // matching overload's returns (first match wins, luals-style, #86).
+        if let Some(returns) = self.overloaded_returns(&callee_ity, &arg_itys) {
+            return returns;
+        }
         self.returns_of(&callee_ity)
+    }
+
+    /// The returns of the first `---@overload` that accepts the arguments when
+    /// the primary signature does not — the value-position complement of the
+    /// checker's overload acceptance (#86). `None` when the callee has no
+    /// overloads or the primary already accepts (ordinary [`Self::returns_of`]).
+    fn overloaded_returns(
+        &mut self,
+        callee_ity: &ITy,
+        arg_itys: &[ITy],
+    ) -> Option<(Vec<ITy>, bool)> {
+        let sig = self.callee_function_ty(callee_ity)?;
+        if sig.overloads.is_empty() {
+            return None;
+        }
+        let reified_args: Vec<Ty> = arg_itys.iter().map(|a| self.reify(a)).collect();
+        if self.sig_accepts(&sig, &reified_args) {
+            return None;
+        }
+        let overload = sig
+            .overloads
+            .iter()
+            .find(|o| self.sig_accepts(o, &reified_args))?;
+        Some((
+            overload.returns.iter().cloned().map(ITy::Ty).collect(),
+            overload.returns_vararg,
+        ))
+    }
+
+    /// The declared signature a callee value carries, if any — an annotated
+    /// function type or a file-local function with a `---@param`/`---@return`
+    /// signature. Used to consult `---@overload`s at the call site (#86).
+    fn callee_function_ty(&self, callee: &ITy) -> Option<FunctionTy> {
+        match callee {
+            ITy::Ty(Ty::Function(sig)) => Some((**sig).clone()),
+            ITy::Func(body) => self.funcs.get(body).and_then(|d| d.sig.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether `sig` accepts these (reified, positional) argument types —
+    /// inference's non-reporting mirror of the checker's `call_accepts`,
+    /// governing `---@overload` selection for call results (#86).
+    fn sig_accepts(&self, sig: &FunctionTy, args: &[Ty]) -> bool {
+        let supplied = args.len();
+        if supplied < sig.required_params() {
+            return false;
+        }
+        if supplied > sig.params.len() && sig.varargs.is_none() {
+            return false;
+        }
+        for (i, arg) in args.iter().enumerate() {
+            let expected = if let Some(param) = sig.params.get(i) {
+                if param.optional {
+                    param.ty.clone().optional()
+                } else {
+                    param.ty.clone()
+                }
+            } else if let Some(varargs) = &sig.varargs {
+                varargs.clone()
+            } else {
+                continue;
+            };
+            if !crate::assign::assignable(self.env, self.strict, arg, &expected) {
+                return false;
+            }
+        }
+        true
     }
 
     /// The annotated signature of a generic callee (`---@generic` with a
@@ -2174,6 +2271,29 @@ impl Infer<'_> {
             _ => None,
         }?;
         (!sig.generics.is_empty() && sig.has_return_annotation).then_some(sig)
+    }
+
+    /// The fully-dotted name of a callee rooted at a *global* name
+    /// (`string.rep` → `"string.rep"`), for looking its declared signature up
+    /// in the ambient/defs function registry (#106). `None` when the callee is
+    /// computed, indexed by a non-string-literal, or rooted at a local binding
+    /// (a local shadows any same-named registry function).
+    fn dotted_callee(&self, body: BodyId, callee: ExprId) -> Option<String> {
+        match self.body(body).expr(callee) {
+            Expr::Name(name) => match self.resolution(body, callee) {
+                Some(Resolution::Global(_)) | None => Some(name.clone()),
+                _ => None,
+            },
+            Expr::Index { base, index, .. } => {
+                let seg = match self.body(body).expr(*index) {
+                    Expr::Literal(Literal::String(s)) => s.as_str()?.to_string(),
+                    _ => return None,
+                };
+                let base = self.dotted_callee(body, *base)?;
+                Some(format!("{base}.{seg}"))
+            }
+            _ => None,
+        }
     }
 
     /// The terminal name of a callee expression: `f` for a plain name,
@@ -2622,6 +2742,29 @@ fn render_number(n: &luabox_hir::Number) -> String {
             }
         }
     }
+}
+
+/// A fixed-position tuple read: the type at integer position `idx` (1-based)
+/// of a tuple-typed receiver (a table whose integer positions are modeled as
+/// `NumberLit` indexers, #86). `Some(unknown)` when the receiver is a tuple
+/// but `idx` is past its end (lenient, luals-style); `None` when the receiver
+/// is not a tuple (ordinary array/indexer read).
+fn tuple_index(recv: &ITy, idx: i64) -> Option<ITy> {
+    let ITy::Ty(Ty::Table(table)) = recv else {
+        return None;
+    };
+    let mut is_tuple = false;
+    for (key, value) in &table.indexers {
+        let Ty::NumberLit(n) = key else { continue };
+        if !crate::assign::is_integral_literal(n) {
+            continue;
+        }
+        is_tuple = true;
+        if n.parse::<i64>().ok() == Some(idx) {
+            return Some(ITy::Ty(value.clone()));
+        }
+    }
+    is_tuple.then(ITy::unknown)
 }
 
 fn integerish(ty: &Ty) -> bool {

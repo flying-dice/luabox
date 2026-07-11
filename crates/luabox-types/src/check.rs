@@ -780,7 +780,14 @@ impl Checker<'_> {
                 }
                 let sig = call.callee().and_then(|c| self.callee_sig(&c));
                 match sig {
-                    Some(mut sig) if sig.has_return_annotation => {
+                    Some(sig) if sig.has_return_annotation || !sig.overloads.is_empty() => {
+                        // When the primary does not accept the arguments but an
+                        // `---@overload` does, the call's result type is that
+                        // overload's return (first match wins, luals-style, #86).
+                        let mut sig = self.resolve_call_overload(sig, call);
+                        if !sig.has_return_annotation {
+                            return Ty::Unknown;
+                        }
                         // Monomorphise a generic call so its result reflects
                         // the inferred type arguments (#84).
                         if !sig.generics.is_empty() {
@@ -971,6 +978,31 @@ impl Checker<'_> {
     }
 
     // --- rule a: call sites ---------------------------------------------
+
+    /// Pick the signature whose *returns* govern a call's result type: the
+    /// primary when it accepts the supplied arguments, otherwise the first
+    /// `---@overload` that does, otherwise the primary unchanged (its
+    /// diagnostics fire elsewhere). This is the value-position complement of
+    /// [`Checker::check_call`]'s overload acceptance (#86).
+    fn resolve_call_overload(&self, sig: FunctionTy, call: &CallExpr) -> FunctionTy {
+        if sig.overloads.is_empty() {
+            return sig;
+        }
+        let (mut slots, string_arg) = call_slots(call);
+        if let Some((ty, range)) = string_arg {
+            slots.push(Slot::Ty(ty, range));
+        }
+        let open_ended = self.expand_last(&mut slots);
+        if self.call_accepts(&sig, &slots, open_ended) {
+            return sig;
+        }
+        for overload in &sig.overloads {
+            if self.call_accepts(overload, &slots, open_ended) {
+                return overload.clone();
+            }
+        }
+        sig
+    }
 
     /// Whether `sig` accepts this argument list — a non-reporting predicate
     /// used to resolve `---@overload` candidates. Mirrors the arity and
@@ -1319,6 +1351,28 @@ impl Checker<'_> {
                 ),
                 declared_by.clone(),
             );
+        }
+
+        // A fixed-position tuple target (`[string, number]`, modeled as
+        // integer-literal indexers): each positional item is checked against
+        // its own position; items past the tuple's end are lenient (#86).
+        let positional: Vec<(usize, Ty)> = shape
+            .indexers
+            .iter()
+            .filter_map(|(key, value)| match key {
+                Ty::NumberLit(n) if is_integral_literal(n) => {
+                    n.parse::<usize>().ok().map(|i| (i, value.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        if !positional.is_empty() {
+            for (i, item) in items.into_iter().enumerate() {
+                if let Some((_, ty)) = positional.iter().find(|(pos, _)| *pos == i + 1) {
+                    self.check_slot(&Slot::Expr(item), ty, TYPE_MISMATCH);
+                }
+            }
+            return;
         }
 
         // Array items against the array part / an integer-keyed indexer.
