@@ -7,84 +7,39 @@ index only — the issues carry the user stories and acceptance criteria.
 
 ## Initial public release (milestone)
 
-The toolchain is feature-complete; these are the release-machinery gaps
-between "code-complete on a branch" and "a stranger can install and trust
-it." **Blockers** must land before the first public release.
+**The launch gate is complete.** Everything in
+[DIRECTION.md](DIRECTION.md)'s parity + strictness tracks landed and was
+probe-verified: generics (#84), cross-package type sharing (#108),
+`---@class` conformance (#107), undefined-global (#103), undefined-field
+strictness (#90), plus cross-file `require` typing with workspace-global
+classes (#85). The `.luab` subsystem is removed (#109). Release
+machinery landed: LICENSE (#92), CI config (#94), CHANGELOG + release
+process (#97), coverage gated honestly (#100), registry story decided
+(#101), def scalar fields (#105), call-return propagation (#106),
+editor packaging (#102, publish steps residual).
 
-**Feature-parity + strictness (launch gate)** — the LuaCATS front-end must
-verify everything luals does (parity, so interop is real) plus luabox's
-strictness (the edge), before launch. See [DIRECTION.md](DIRECTION.md). All
-verified missing today by the example conversion (commit `a01684b`).
+### Still open
 
-Parity (match luals):
-
-- [#84](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/84)
-  Real generic type variables + generic classes in LuaCATS
-- [#108](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/108)
-  Cross-package LuaCATS type sharing
-
-Strictness (exceed luals):
-
-- [#107](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/107)
-  Enforce `---@class` conformance (`: Interface`, `__index`-aware)
-- [#103](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/103)
-  `undefined-global` diagnostic (typo'd/unknown global reads)
-- [#90](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/90)
-  Strictness for un-shaped LuaCATS code (SPEC §19)
-
-`.luab` removal (a *consequence* of reaching the gate, not a precondition):
-
-- [#109](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/109)
-  `.luab` subsystem removal (absorbs #83/#88/#89/#98 and the `.luab` bits of
-  #91/#102)
-
-Blockers:
-
-- [#92](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/92)
-  LICENSE file (MIT) at the repo root
 - [#93](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/93)
-  Merge `shapes-v2` to `main` and push (14 commits unpushed)
-- [#94](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/94)
-  CI on the canonical GitLab remote (only GitHub Actions exists today)
+  Merge `shapes-v2` to `main` and push — the final step of this pass.
 - [#95](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/95)
-  End-user installation: prebuilt binaries + one-line install
-
-Release-needed:
-
+  End-user installation: prebuilt binaries — needs the first `v*` tag to
+  exercise the CI release stage; install scripts are in place.
 - [#96](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/96)
-  README end-user quickstart
-- [#97](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/97)
-  CHANGELOG and version/tag/release process
-- [#98](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/98)
-  Rename `SHAPES-V2.md` → `SHAPES.md` (retire the migration name)
+  README end-user quickstart — in progress.
 - [#99](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/99)
-  Known limitations (0.1) documented honestly
-- [#100](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/100)
-  `luabox test --coverage`: implement or gate honestly
-- [#101](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/101)
-  Registry story for 0.1 (path/git/luarocks/`file://` vs hosted)
+  Known limitations (0.1) documented honestly — in progress.
 - [#102](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/102)
-  Distribute the editor integrations
-- [#105](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/105)
-  Def-declared scalar fields on global tables aren't typed
-- [#106](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/106)
-  Call return type not propagated to an unannotated local (`local p = f()`)
+  Distribute the editor integrations — packaging done; open for the
+  credential-gated publish steps (Marketplace/Open VSX tokens, JetBrains
+  signing, Zed registry mirror, release attachments).
 
-## Ready
+## Post-launch
 
-_None open — the SHAPES-V2 checker-quality and LSP waves are landed
-(#77–#82 closed)._
+- [#110](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/110)
+  Cross-file `---@alias` naming (classes/enums are workspace-global
+  since #85; aliases still need defs or same-file).
 
-## Icebox (post-launch)
-
-- [#85](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/85)
-  Cross-file `require` resolution
-- [#86](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/86)
-  Overload-aware call results and tuple types (LuaCATS parity polish)
-- [#87](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/87)
-  Docgen: list `---@class` implementors of an interface (post-#107)
-- [#91](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/91)
-  watch.rs env-flakiness (make robust or gate)
-
-_Closed as inconsistent with the north star: #83 (folded into #108), #88,
-#89, #98, #104. See DIRECTION.md._
+_Everything else is closed. #83/#88/#89/#98/#104 were closed as
+inconsistent with the north star; #85/#86/#87/#90/#91 graduated from the
+icebox and shipped. See DIRECTION.md for the decision record._
