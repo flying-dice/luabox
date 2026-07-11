@@ -92,7 +92,7 @@ static REGISTRY: &[Entry] = &[
     },
     Entry {
         code: Code::new(306),
-        title: "field not found on inferred table shape",
+        title: "undefined field read",
         explain: LB0306,
     },
     Entry {
@@ -531,14 +531,49 @@ its own declarations. The unresolved type is treated as `unknown`.
 ";
 
 const LB0306: &str = "\
-# LB0306: field not found on inferred table shape
+# LB0306: undefined field read
 
 A field read (or `:` method call) names a key that provably does not exist
-on a locally-constructed table. Rich table inference (SPEC.md §3) tracks
-the *shape* of every table built in the file — constructor entries, later
-`t.x = v` assignments, `function T.f()` / `function T:m()` declarations,
-and `setmetatable`/`__index` chains — so a read that none of those supply
-is a typo, not a dynamic lookup.
+on the receiver's type. This is lua-language-server's `undefined-field`,
+raised on the strictness ladder (SPEC.md §3, §19): a **warning** in warn
+mode, an **error** in strict — stricter than luals, which always warns.
+
+It fires in two situations, both requiring the absence to be *provable*.
+
+## 1. Declared `---@class` values
+
+Reading a field a value's declared class does not provide — no matching
+`---@field` (own or inherited through the parent chain), no indexer, and no
+inherent method on the carrier. The receiver may be `self` inside a class
+method, a `---@type Class` local, a `---@return Class` constructor result,
+or a cross-package class shared through a dependency's `---@meta` defs.
+
+```lua
+---@class geometry.Point
+---@field x number
+---@field y number
+local Point = {}
+Point.__index = Point
+
+function Point:shift()
+  return self.nope   -- LB0306: undefined field `nope` on `geometry.Point`
+end
+```
+
+This is the strictness answer for annotated code (SPEC.md §19): a
+declaration is the precondition. Un-annotated code invents no obligation —
+a value of `unknown`/`any` type, or a plain structural table from
+inference, is never flagged. A class with an indexer (`---@field [string]
+T`) declares dynamic access, so any string key is admissible. Writes are
+`LB0303`'s business (luals' `inject-field`), not this rule.
+
+## 2. Inferred table shapes
+
+Rich table inference (SPEC.md §3) tracks the *shape* of every table built
+in the file — constructor entries, later `t.x = v` assignments, `function
+T.f()` / `function T:m()` declarations, and `setmetatable`/`__index`
+chains — so a read that none of those supply is a typo, not a dynamic
+lookup.
 
 ```lua
 local Circle = {}
@@ -555,14 +590,17 @@ function Circle:area()
 end
 ```
 
-The check is deliberately conservative. It stays silent when the shape is
-not fully known: tables that escape into unanalyzed code (arguments to
-unknown functions, global writes), tables with dynamic-key writes or
-indexer types, tables whose metatable/`__index` cannot be resolved, and
-carriers checked against a `---@class` or `.luab` type (those are governed
-by their declarations — `LB0302`/`LB0303`) never produce this diagnostic.
+## Conservatism
 
-Fix the spelling, or assign the field somewhere the checker can see.
+The check stays silent when the shape is not fully known: tables that
+escape into unanalyzed code (arguments to unknown functions, global
+writes), tables with dynamic-key writes or indexer types, tables whose
+metatable/`__index` cannot be resolved, and `.luab`-struct-typed values
+(the parked shape DSL, DIRECTION.md) never produce this diagnostic.
+
+Fix the spelling, declare the field, or — to acknowledge a genuinely
+dynamic access — add `---@diagnostic disable: undefined-field` (also
+`disable-line` / `disable-next-line`).
 ";
 
 const LB0307: &str = "\

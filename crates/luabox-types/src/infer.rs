@@ -371,8 +371,14 @@ enum Lookup {
     Found(ITy),
     /// The field is absent; `provable` means the whole shape (and its
     /// metatable chain) is fully known, so the absence is a diagnosis.
+    /// `declared` names the `---@class` the receiver resolved to when the
+    /// absence is on a *declared* shape (`self` in a class method, a
+    /// `---@type Class` value) — the luals `undefined-field` case (#90),
+    /// distinguished from an inferred table so the message can name the
+    /// class and point at its declaration.
     Absent {
         provable: bool,
+        declared: Option<String>,
     },
     /// The receiver is not a table we can inspect.
     Opaque,
@@ -584,24 +590,41 @@ impl Infer<'_> {
         }
     }
 
-    fn report_absent(&mut self, body: BodyId, expr: ExprId, name: &str) {
+    /// Report an absent-field read (`LB0306`). When `declared` names the
+    /// `---@class` the receiver resolved to, the message is luals'
+    /// `undefined-field` phrasing and — where the class is declared in this
+    /// file — carries a "declared here" secondary label (#90). For an
+    /// inferred table it keeps the constructor/metatable phrasing.
+    fn report_absent(&mut self, body: BodyId, expr: ExprId, name: &str, declared: Option<&str>) {
         if self.pass != 1 {
             return;
         }
         let Some((start, end)) = self.expr_range(body, expr) else {
             return;
         };
-        self.diags.push(
-            Diagnostic::new(
-                Code::new(FIELD_NOT_FOUND),
-                self.severity,
+        let (message, label) = match declared {
+            Some(class) => (
+                format!("undefined field `{name}` on `{class}`"),
+                format!("`{class}` declares no field `{name}`"),
+            ),
+            None => (
                 format!("cannot find field `{name}` on this table"),
-            )
-            .with_label(Label::primary(
-                Span::new(self.file, start..end),
-                format!("`{name}` is not defined by the table's constructor, assignments, or metatable chain"),
-            )),
-        );
+                format!(
+                    "`{name}` is not defined by the table's constructor, assignments, or metatable chain"
+                ),
+            ),
+        };
+        let mut diag = Diagnostic::new(Code::new(FIELD_NOT_FOUND), self.severity, message)
+            .with_label(Label::primary(Span::new(self.file, start..end), label));
+        if let Some(class) = declared
+            && let Some(range) = self.env.class_decl_span(class)
+        {
+            diag = diag.with_label(Label::secondary(
+                Span::new(self.file.to_string(), range),
+                format!("`{class}` declared here"),
+            ));
+        }
+        self.diags.push(diag);
     }
 
     // --- reification -----------------------------------------------------
@@ -767,6 +790,9 @@ impl Infer<'_> {
 
     fn lookup_shape_field(&mut self, id: usize, name: &str) -> Lookup {
         let mut provable = true;
+        // The `---@class` the receiver resolved to (the outermost declared
+        // shape in the chain), for the luals `undefined-field` message (#90).
+        let mut declared_class: Option<String> = None;
         let mut cur = Some(id);
         let mut seen: HashSet<usize> = HashSet::new();
         while let Some(s) = cur {
@@ -778,18 +804,36 @@ impl Infer<'_> {
                 // declared fields resolve at their DECLARED types (an
                 // inferred constructor value never shadows the declaration
                 // — `self.side` is `integer` when the struct says so, #73),
-                // inferred extensions fill in the rest, and absences defer
-                // to the declaration's own diagnostics (LB0302 / LB0303).
-                provable = false;
-                if let Some(shape) = self.env.class_shape(&class)
-                    && let Some(field) = shape.fields.get(name)
-                {
-                    let ty = if field.optional {
-                        field.ty.clone().optional()
+                // inferred extensions and carrier methods fill in the rest.
+                // A field the declaration, its parent chain, the carrier's
+                // methods, and inferred extensions all lack is a genuine
+                // undefined-field read (#90) — provable UNLESS the class
+                // declares an indexer / array part (dynamic access is
+                // declared, so any string key is admissible).
+                if let Some(shape) = self.env.class_shape(&class) {
+                    if let Some(field) = shape.fields.get(name) {
+                        let ty = if field.optional {
+                            field.ty.clone().optional()
+                        } else {
+                            field.ty.clone()
+                        };
+                        return Lookup::Found(ITy::Ty(ty));
+                    }
+                    // Absence is diagnosable only for a real LuaCATS `---@class`
+                    // with no indexer/array part. A `.luab`-struct carrier stays
+                    // lenient (#82; DIRECTION.md parks the shape DSL), as does a
+                    // dynamic-access class.
+                    if self.env.is_class(&class)
+                        && shape.indexers.is_empty()
+                        && shape.array.is_none()
+                    {
+                        declared_class.get_or_insert(class);
                     } else {
-                        field.ty.clone()
-                    };
-                    return Lookup::Found(ITy::Ty(ty));
+                        provable = false;
+                    }
+                } else {
+                    // An alias / non-resolvable declared name: stay lenient.
+                    provable = false;
                 }
             }
             if let Some(ity) = self.shapes[s].fields.get(name) {
@@ -818,7 +862,10 @@ impl Infer<'_> {
             }
             cur = None;
         }
-        Lookup::Absent { provable }
+        Lookup::Absent {
+            provable,
+            declared: declared_class,
+        }
     }
 
     fn lookup_ty_field(&mut self, ty: &Ty, name: &str) -> Lookup {
@@ -838,28 +885,42 @@ impl Infer<'_> {
                         return Lookup::Found(ITy::Ty(v.clone()));
                     }
                 }
-                Lookup::Absent { provable: false }
+                // A plain structural table (inferred, or a `---@type {...}`
+                // literal shape) stays lenient: un-annotated code invents no
+                // undefined-field obligation (#90). Only a *named* class does.
+                Lookup::Absent {
+                    provable: false,
+                    declared: None,
+                }
             }
             Ty::Named(class) => {
-                let outcome = self
-                    .env
-                    .resolve_named(class)
-                    .map(|resolved| self.lookup_ty_field(&resolved, name));
-                if let Some(Lookup::Found(ity)) = outcome {
+                let Some(resolved) = self.env.resolve_named(class) else {
+                    return Lookup::Opaque;
+                };
+                if let Lookup::Found(ity) = self.lookup_ty_field(&resolved, name) {
                     return Lookup::Found(ity);
                 }
-                // An annotated instance (`---@return Circle`) still
-                // resolves methods and inferred extensions through the
-                // declared carrier's shared instance shape (#73).
+                // An annotated instance (`---@return Circle`, `---@type
+                // Circle`) still resolves methods and inferred extensions
+                // through the declared carrier's shared instance shape (#73).
                 if let Some(&carrier) = self.declared_carriers.get(class.as_str()) {
                     let instance = self.instance_of(carrier);
                     if let Lookup::Found(ity) = self.lookup_shape_field(instance, name) {
                         return Lookup::Found(ity);
                     }
                 }
-                match outcome {
-                    Some(_) => Lookup::Absent { provable: false },
-                    None => Lookup::Opaque,
+                // Absent on a declared class → luals `undefined-field` (#90),
+                // provable only for a real LuaCATS `---@class` (not a `.luab`
+                // struct, #82) with no indexer/array part (dynamic access) and
+                // that resolved to a table (not an enum union).
+                let dynamic = match &resolved {
+                    Ty::Table(t) => !t.indexers.is_empty() || t.array.is_some(),
+                    _ => true,
+                };
+                let provable = self.env.is_class(class) && !dynamic;
+                Lookup::Absent {
+                    provable,
+                    declared: provable.then(|| class.clone()),
                 }
             }
             Ty::Union(members) => {
@@ -1931,11 +1992,32 @@ impl Infer<'_> {
                     let name = name.to_string();
                     match self.lookup_field(&recv, &name) {
                         Lookup::Found(ity) => ity,
-                        Lookup::Absent { provable } => {
-                            if provable {
-                                self.report_absent(body, expr, &name);
+                        Lookup::Absent { provable, declared } => {
+                            // A global-rooted dotted read of a *declared module
+                            // table* (`string.rep`, `table.insert`, a
+                            // version-gated `string.pack`) is a library-member
+                            // access, not an undefined field: a module's members
+                            // register as dotted registry functions, not
+                            // `---@field`s, so they are absent from the module
+                            // class's shape whether or not they are declared.
+                            // Resolve the function when known, else treat the
+                            // member as an unknown module value — never a
+                            // diagnostic. The #90 undefined-field rule targets
+                            // typed *values* (locals, params, `self`), handled
+                            // in the `else` arm.
+                            if declared.is_some()
+                                && let Some(dotted) = self.dotted_callee(body, expr)
+                            {
+                                match self.env.function(&dotted) {
+                                    Some(sig) => ITy::Ty(Ty::Function(Box::new(sig.clone()))),
+                                    None => ITy::unknown(),
+                                }
+                            } else {
+                                if provable {
+                                    self.report_absent(body, expr, &name, declared.as_deref());
+                                }
+                                ITy::unknown()
                             }
-                            ITy::unknown()
                         }
                         Lookup::Opaque => ITy::unknown(),
                     }
@@ -2489,9 +2571,9 @@ impl Infer<'_> {
                 }
                 self.returns_of(&f)
             }
-            Lookup::Absent { provable } => {
+            Lookup::Absent { provable, declared } => {
                 if provable {
-                    self.report_absent(body, expr, &method);
+                    self.report_absent(body, expr, &method, declared.as_deref());
                 }
                 self.record_outgoing(&method, &arg_itys);
                 (vec![ITy::unknown()], true)
@@ -3069,7 +3151,10 @@ return v
     }
 
     #[test]
-    fn class_bound_carrier_defers_to_declaration() {
+    fn self_read_of_undeclared_field_is_undefined_field() {
+        // `self.size` types from the class (a declared field); `self.whatever`
+        // is declared nowhere on `Thing` — reading it is luals'
+        // `undefined-field` (#90), now enforced on the strictness ladder.
         let src = format!(
             "{WANTS}\
 ---@class Thing
@@ -3084,9 +3169,16 @@ function Thing:grow()
 end
 "
         );
-        // `self.size` types from the class; `self.whatever` is governed by
-        // the declaration, not LB0306.
-        assert_eq!(strict_codes(&src), Vec::<String>::new());
+        let diags = check_file(&parse(&src, Dialect::Lua54), "test.lua", Strictness::Strict);
+        assert_eq!(
+            diags.iter().map(|d| d.code.to_string()).collect::<Vec<_>>(),
+            vec!["LB0306"]
+        );
+        assert!(
+            diags[0].message.contains("`whatever`") && diags[0].message.contains("`Thing`"),
+            "message names field and class: {}",
+            diags[0].message
+        );
     }
 
     // --- iteration ------------------------------------------------------

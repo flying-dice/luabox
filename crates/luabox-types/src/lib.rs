@@ -25,6 +25,7 @@
 mod assign;
 mod check;
 mod defs;
+mod directive;
 mod env;
 mod generics;
 mod infer;
@@ -206,6 +207,24 @@ pub fn check_file_shaped(
         inferred_types = inference.expr_types;
     }
     let _ = inferred_types;
+
+    // Honor luals' `---@diagnostic disable: undefined-field` for the
+    // undefined-field read rule (LB0306, #90). Scoped to this one rule; see
+    // `directive.rs` for why it does not reuse the linter's engine.
+    if diags.iter().any(|d| d.code.to_string() == "LB0306") {
+        let source = parse.syntax().text().to_string();
+        let sup = directive::UndefinedFieldSuppression::scan(&source);
+        if sup.any() {
+            diags.retain(|d| {
+                d.code.to_string() != "LB0306"
+                    || !sup.suppresses(
+                        d.primary_label()
+                            .map_or(0, |l| directive::line_of(&source, l.span.range.start)),
+                    )
+            });
+        }
+    }
+
     diags.sort_by_key(|d| d.primary_label().map_or(0, |l| l.span.range.start));
     diags
 }

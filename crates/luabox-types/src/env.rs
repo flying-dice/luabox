@@ -852,6 +852,15 @@ impl TypeEnv {
         self.classes.get(name).map(|def| def.parents.as_slice())
     }
 
+    /// Whether `name` is a LuaCATS `---@class` (in-file, def-package, or
+    /// cross-package) — as opposed to a `.luab` struct/trait, which also
+    /// resolves through [`TypeEnv::class_shape`] but is the parked shape DSL
+    /// (DIRECTION.md). The `undefined-field` read rule (#90) fires only for
+    /// real classes; `.luab`-typed reads stay lenient (#82).
+    pub(crate) fn is_class(&self, name: &str) -> bool {
+        self.classes.contains_key(name)
+    }
+
     /// Whether `name` declares `field` as one of its *own* `---@field`s (as
     /// opposed to inheriting it) — the set a conformance obligation excludes,
     /// since a re-declared member is governed by the class's own declaration

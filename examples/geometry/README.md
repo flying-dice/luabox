@@ -11,8 +11,8 @@ stock LuaLS tags (`---@class` / `---@field` / `---@param` / `---@return` /
 > `.luab` subsystem hasn't gone anywhere — it still lives elsewhere in the
 > codebase, ahead of a planned wider drop. This conversion exists to show,
 > honestly, what the plain-LuaCATS path looks like **today**: what works,
-> what's silently permissive, and what's outright broken. Read to the end —
-> some of this will surprise you.
+> what luabox now enforces *more strictly* than lua-language-server, and what
+> is still out of reach. Read to the end — some of this will surprise you.
 
 ```
 geometry/
@@ -82,6 +82,28 @@ luabox test          # 9 passing tests
   its metatable chain is **not** told to re-implement it, so classic
   inheritance stays clean. This is exactly the structural conformance the
   `.luab` shape modules used to be needed for — now on the plain-LuaCATS path.
+- **Field reads ARE checked** (#90 — luals `undefined-field`, ridden one
+  notch stricter). Reading a field a declared class does not provide —
+  `self.nope` inside a `geometry.Circle` method, or `p.nope` on a `---@type
+  geometry.Point` local — is a real `check` error under `strict` (a warning
+  in warn mode; luals always warns). Add `local _ = self.nope` to
+  `Circle:area` in `src/circle.lua` and `luabox check` reports (reproduced
+  against this exact file, then reverted):
+  ```
+  error[LB0306]: undefined field `nope` on `geometry.Circle`
+     --> src/circle.lua:29:15
+     |
+  29 |     local _ = self.nope
+     |               ^^^^^^^^^ `geometry.Circle` declares no field `nope`
+     --> src/circle.lua:23:4
+     |
+  23 | ---@class geometry.Circle : geometry.Shape
+     |    --------------------------------------- `geometry.Circle` declared here
+  ```
+  The obligation follows the *declaration*: inherited fields (through the
+  parent chain), inherent carrier methods, and classes with an indexer all
+  stay clean, while un-annotated code invents no obligation. A genuinely
+  dynamic access opts out with `---@diagnostic disable: undefined-field`.
 - **Literal sealing.** `---@type geometry.Point` on a table literal enforces
   every non-optional field present and rejects unknown keys — `LB0300`
   ("missing `y`") / `LB0303` ("unknown field `z`"). This is **not** a
@@ -101,14 +123,6 @@ luabox test          # 9 passing tests
   `../love-asteroids-lite/defs/love2d.d.lua` for that pattern; this
   project's own `defs/geometry.d.lua` is the same mechanism applied to a
   library's own types rather than a third-party API.
-
-## What is silently permissive (verified, not avoided)
-
-- **Field access is permissive.** `self.nope` inside a `geometry.Circle`
-  method — a field declared nowhere on `geometry.Circle` or
-  `geometry.Shape` — is not flagged either. Also confirmed live against this
-  example (temporarily, then reverted); see the commented-out line in
-  `src/circle.lua`.
 
 ## Generics — now real (#84)
 

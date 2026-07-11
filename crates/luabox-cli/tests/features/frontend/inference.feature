@@ -128,3 +128,75 @@ Feature: rich table inference — tables never degrade to bare `table`
     When I run "luabox check"
     Then the command succeeds
     And stdout contains "warning[LB0306]"
+
+  Scenario: reading an undeclared field on a declared class is undefined-field (#90)
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+      ---@field y number
+      local Point = {}
+      Point.__index = Point
+
+      function Point:shift()
+        return self.nope
+      end
+      """
+    When I run "luabox check"
+    Then the command fails
+    And diagnostic LB0306 is reported naming field "nope"
+    And stdout contains "undefined field `nope` on `Point`"
+
+  Scenario: a `---@type Class` local's undeclared field read is undefined-field
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+      ---@field y number
+
+      ---@type Point
+      local p = { x = 1, y = 2 }
+      local ok = p.x
+      local bad = p.nope
+      print(ok, bad)
+      """
+    When I run "luabox check"
+    Then the command fails
+    And diagnostic LB0306 is reported naming field "nope"
+
+  Scenario: `---@diagnostic disable: undefined-field` suppresses the read rule
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@diagnostic disable: undefined-field
+      ---@class Point
+      ---@field x number
+      local Point = {}
+      Point.__index = Point
+
+      function Point:shift()
+        return self.nope
+      end
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And zero diagnostics are reported
+
+  Scenario: a class with an indexer stays open to undeclared field reads
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Bag
+      ---@field size number
+      ---@field [string] boolean
+
+      ---@type Bag
+      local b = { size = 1 }
+      local x = b.anything
+      print(x)
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And zero diagnostics are reported

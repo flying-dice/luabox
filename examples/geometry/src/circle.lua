@@ -34,11 +34,22 @@ function Circle:perimeter()
     return 2 * math.pi * self.radius
 end
 
--- Also NOTE (gap): field access is permissive on a declared class. Uncomment
--- the line below — `self.nope` is not declared on geometry.Circle or
--- geometry.Shape anywhere — and `luabox check` still reports 0 errors:
---
---   print(self.nope)
+-- FIELD READS (#90): reads are checked too. `self.nope` — a field declared
+-- nowhere on geometry.Circle or geometry.Shape — is luals' `undefined-field`,
+-- an error under `strict`. Add `local _ = self.nope` inside `Circle:area`
+-- above and `luabox check` reports (reproduced against this exact file, then
+-- reverted):
+--   error[LB0306]: undefined field `nope` on `geometry.Circle`
+--      --> src/circle.lua:29:15
+--      |
+--   29 |     local _ = self.nope
+--      |               ^^^^^^^^^ `geometry.Circle` declares no field `nope`
+--      --> src/circle.lua:23:4
+--      |
+--   23 | ---@class geometry.Circle : geometry.Shape
+--      |    --------------------------------------- `geometry.Circle` declared here
+-- A class with an indexer (`---@field [string] T`) stays open; a genuinely
+-- dynamic read can opt out with `---@diagnostic disable: undefined-field`.
 
 -- The static member of geometry.Shape: no `self`, written with `.` and
 -- called as `Circle.my_static()`. All these shapes live in 2D.

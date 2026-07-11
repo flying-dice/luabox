@@ -364,3 +364,39 @@ fn dependency_globals_are_known_to_lint() {
         "the dependency global must be known (only the typo is flagged); stdout:\n{so}"
     );
 }
+
+// (h) reading a field a dependency class does not declare is `undefined-field`
+//     (LB0306, #90) — the strictness rule fires identically for cross-package
+//     classes resolved through the dependency's def package.
+#[test]
+fn reading_undeclared_field_on_dep_class_is_undefined_field() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = temp.path();
+    write_geometry_dep(temp);
+    write_consumer_manifest(temp, &[]);
+    // Construct through the dep's declared constructor so the value's type is
+    // `geometry.Point` without any table-literal conformance noise.
+    write(
+        temp,
+        "app/src/main.lua",
+        "local p = geometry.point(1, 2)\n\
+         local good = p.x\nlocal bad = p.nope\nreturn { good, bad }\n",
+    );
+    let out = run(&temp.join("app"), &["check"]);
+    let so = stdout(&out);
+    assert!(
+        !out.status.success(),
+        "expected failure; stderr:\n{}",
+        stderr(&out)
+    );
+    assert!(so.contains("LB0306"), "expected LB0306; stdout:\n{so}");
+    assert!(
+        so.contains("nope"),
+        "should name the missing field; stdout:\n{so}"
+    );
+    // The dep class must resolve — not an unknown-type-name error.
+    assert!(
+        !so.contains("LB0305"),
+        "geometry.Point must resolve; stdout:\n{so}"
+    );
+}

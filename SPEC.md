@@ -270,7 +270,7 @@ crates/
 
 ## 19. Open questions (escalate, don't guess)
 
-- Strictness semantics for un-shaped LuaCATS code in `strict` mode. Proposal: sealed-leaning warnings. (v2 note: positional shape conformance rides the ordinary strictness ladder — the v1 "always hard errors" stance died with the binding tags.)
+- **Decided (#90):** Strictness for field access on LuaCATS code follows the *declaration boundary*, not a sealed-vs-open guess. A value whose type is a **declared `---@class`** (in-file, def-package, or cross-package via `---@meta` #108; including `self` in a class method and `---@type Class` locals) gets full field checking on the ordinary strictness ladder: a field the class does not declare — no `---@field` (own or inherited through the parent chain), no indexer, no inherent carrier method — is flagged on **read** (`LB0306`, luals `undefined-field`) and on **write** (`LB0303`, luals `inject-field`). Un-annotated code stays `unknown`-lenient: a plain inferred table or an `unknown`/`any` value invents no obligation — a declaration is the precondition. A class with an indexer declares dynamic access and stays open. This matches luals' `undefined-field`/`inject-field` behavior, and rides the ladder one notch stricter: a **warning** in warn mode, an **error** in strict (luals always warns). Suppressible with `---@diagnostic disable: undefined-field`. (v2 note: positional shape conformance rides the same ladder — the v1 "always hard errors" stance died with the binding tags.)
 - Integer/float divergence loudness targeting 5.1. Proposal: error in `strict`, warn otherwise.
 - Registry namespaces flat vs scoped `@org/pkg`. Proposal: scoped.
 - C-module story beyond prebuilt artifacts: out of scope until P5+.
