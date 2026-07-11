@@ -10,18 +10,24 @@
 //! lists; this test is only responsible for proving the real OS watcher +
 //! debounce loop wiring works end to end.
 //!
-//! ## Flakiness
+//! ## Flakiness (issue #91 — root-caused and fixed)
 //!
-//! Real filesystem event delivery timing is inherently less deterministic
-//! than the pure logic it feeds: Windows' `ReadDirectoryChangesW` backend
-//! (what `notify`'s recommended watcher uses here) can coalesce or delay
-//! events under system load, and CI runners in particular can be slow to
-//! schedule the child process at all. The timeouts below are deliberately
-//! generous (15s to observe the first run, 20s to observe the rerun), and
-//! the assertion only requires *a* rerun header to appear — not a specific
-//! line count or timing. If this still proves flaky in a given CI
-//! environment, the fix is to widen the timeouts further or gate the test
-//! behind an env var, not to make the assertion stricter.
+//! This test used to fail intermittently, and the failure was NOT random
+//! event-delivery latency: `watch::run` armed the OS watcher only *after*
+//! the first run had already printed `watch: ok`. This test (correctly)
+//! treats that line as "the watcher is installed" and writes immediately,
+//! so on a loaded machine the rewrite could land in the gap before
+//! `notify` had issued `ReadDirectoryChangesW` — an event that is then
+//! lost forever, no timeout wide enough to see it. Reproduced
+//! deterministically by inserting a 400ms sleep in that gap (3/3
+//! failures); fixed by arming the watcher *before* the first run, which
+//! makes `watch: ok` a true synchronization barrier (`Watcher::watch`
+//! only returns once the OS watch is registered).
+//!
+//! What remains genuinely timing-dependent is only *how long* delivery
+//! takes, never *whether* it happens, so the timeouts below stay generous
+//! (15s for the first run, 20s for the rerun) and the assertion only
+//! requires *a* rerun header — not a specific line count or timing.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};

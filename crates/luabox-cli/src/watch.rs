@@ -81,8 +81,6 @@ pub fn run(
     out_dir: Option<&Path>,
     mut on_change: impl FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    report(on_change());
-
     let (tx, rx) = mpsc::channel::<Event>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
         if let Ok(event) = res {
@@ -92,7 +90,29 @@ pub fn run(
             let _ = tx.send(event);
         }
     })?;
+    // Arm the watcher *before* the first run, not after. `Watcher::watch`
+    // blocks until the OS has genuinely registered the watch (on Windows,
+    // until `ReadDirectoryChangesW` has actually been issued — see
+    // notify's `ReadDirectoryChangesWatcher::watch_inner`/`add_watch`), so
+    // once it returns, a change made anywhere from this point on is
+    // guaranteed to be observed. Watching only *after* the first run (as
+    // this used to) left a gap between "the caller sees `watch: ok`
+    // printed" and "the watcher actually exists" — a change landing in
+    // that gap (an editor, or `tests/watch.rs`) would silently never
+    // trigger a rerun. This is exactly the race that made the integration
+    // test flaky under load: reproduced deterministically by inserting an
+    // artificial delay in that old gap (3/3 failures), and gone once the
+    // order below was fixed.
     watcher.watch(root, RecursiveMode::Recursive)?;
+
+    let result = on_change();
+    // The run above may itself have touched watched files (`fmt --watch`
+    // rewrites in place), and the watcher was already armed to catch
+    // exactly that. Drain those self-inflicted events before reporting
+    // the run as done, so they aren't mistaken for a user edit made
+    // afterwards and don't trigger a spurious immediate rerun.
+    drain_self_inflicted(&rx);
+    report(result);
 
     loop {
         let Ok(first) = rx.recv() else {
@@ -118,6 +138,17 @@ pub fn run(
         println!("--- watching: rerun ({} files changed) ---", batch.len());
         report(on_change());
     }
+}
+
+/// Wait out a full [`DEBOUNCE_WINDOW`] of silence on `rx`, resetting on
+/// every event received, so that any events already queued (or arriving
+/// shortly after) are consumed without triggering anything. Unlike the
+/// batching in [`run`]'s own loop (anchored to the first event, not
+/// sliding — see the module docs), this must fully settle before treating
+/// later events as real changes, since it exists to swallow a run's own
+/// side effects rather than to group a burst of unrelated ones.
+fn drain_self_inflicted(rx: &mpsc::Receiver<Event>) {
+    while rx.recv_timeout(DEBOUNCE_WINDOW).is_ok() {}
 }
 
 /// Print a run's outcome. Errors from `on_change` are reported, not
