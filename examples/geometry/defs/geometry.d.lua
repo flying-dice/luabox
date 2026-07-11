@@ -11,11 +11,21 @@
 
 --- A point in 2D space. `label` is an optional caption; `unit` is an
 --- optional coordinate unit (see the `geometry.Unit` alias below).
+---
+--- OPERATOR OVERLOADS (#114): a Point adds and subtracts componentwise, so
+--- `p + q` and `p - q` are declared to yield another `geometry.Point`. luabox
+--- APPLIES these during inference (luals parity): the result of `+`/`-` on two
+--- points types as `geometry.Point` — not `unknown` — so binding it to a
+--- `---@type geometry.Point` checks clean and misusing it (feeding the result
+--- to a `string`, say) is a real `luabox check` error. See
+--- ../src/shapes_data.lua for a typed use.
 ---@class geometry.Point
 ---@field x number
 ---@field y number
 ---@field label? string
 ---@field unit? geometry.Unit
+---@operator add(geometry.Point): geometry.Point
+---@operator sub(geometry.Point): geometry.Point
 
 --- Anything with an area and a perimeter, described as a method-shaped
 --- `---@class` (an "interface" by convention).

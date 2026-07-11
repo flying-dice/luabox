@@ -17,7 +17,7 @@ use luabox_syntax::luacats::{
 };
 
 use crate::lower::{Declared, GenericClass, Lowerer};
-use crate::ty::{FieldTy, FunctionTy, ParamTy, TableTy, Ty, TypeParam};
+use crate::ty::{FieldTy, FunctionTy, OperatorSig, ParamTy, TableTy, Ty, TypeParam};
 
 /// A statement's byte range, used to key annotations to their target.
 pub(crate) type Target = (usize, usize);
@@ -43,6 +43,14 @@ pub(crate) struct ClassDef {
     /// requires `---@field`-declared members, so the literal classifiers
     /// skip these (see [`TypeEnv::class_method_names`]).
     pub methods: BTreeMap<String, FieldTy>,
+    /// `---@operator <op>[(<input>)]: <result>` overloads declared on the
+    /// class, keyed by operator name (`add`, `sub`, `unm`, `len`, ...). A key
+    /// maps to every overload of that operator in declaration order; inference
+    /// picks the first whose `input` accepts the other operand (#114). Like
+    /// `---@field`s these ride the workspace-global class surface, so an
+    /// operator declared on a class in one file applies wherever the class is
+    /// used (cross-file / defs-package).
+    pub operators: BTreeMap<String, Vec<OperatorSig>>,
 }
 
 /// A declared `---@enum`: member name → value type, plus the union of all
@@ -393,6 +401,14 @@ impl TypeEnv {
                             existing.indexers.push(indexer.clone());
                         }
                     }
+                    for (op, sigs) in &def.operators {
+                        let slot = existing.operators.entry(op.clone()).or_default();
+                        for sig in sigs {
+                            if !slot.contains(sig) {
+                                slot.push(sig.clone());
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -651,6 +667,21 @@ impl TypeEnv {
                             class.indexers.push((key, ty));
                         }
                     }
+                }
+                Tag::Operator(o) if !o.op.is_empty() => {
+                    let Some(class) = current_class
+                        .as_ref()
+                        .and_then(|name| self.classes.get_mut(name))
+                    else {
+                        continue; // a stray @operator outside a @class block
+                    };
+                    let input = o.input.as_ref().map(|t| lowerer.lower(t));
+                    let result = lowerer.lower(&o.result);
+                    class
+                        .operators
+                        .entry(o.op.clone())
+                        .or_default()
+                        .push(OperatorSig { input, result });
                 }
                 Tag::Param(p) => params.push(p),
                 Tag::Return(r) => returns.push(r),
@@ -915,6 +946,39 @@ impl TypeEnv {
             stack.extend(def.parents.iter().cloned());
         }
         &methods - &declared
+    }
+
+    /// Every `---@operator <op>` overload in scope for a class, own
+    /// declarations first then inherited (depth-first over the parent chain),
+    /// in declaration order — the sequence inference scans for the first
+    /// overload whose parameter accepts the other operand (#114). Own
+    /// operators precede inherited ones so a subclass override wins.
+    pub(crate) fn class_operators(&self, name: &str, op: &str) -> Vec<OperatorSig> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        self.collect_operators(name, op, &mut out, &mut seen);
+        out
+    }
+
+    fn collect_operators(
+        &self,
+        name: &str,
+        op: &str,
+        out: &mut Vec<OperatorSig>,
+        seen: &mut HashSet<String>,
+    ) {
+        if !seen.insert(name.to_string()) {
+            return;
+        }
+        let Some(def) = self.classes.get(name) else {
+            return;
+        };
+        if let Some(sigs) = def.operators.get(op) {
+            out.extend(sigs.iter().cloned());
+        }
+        for parent in &def.parents {
+            self.collect_operators(parent, op, out, seen);
+        }
     }
 
     pub(crate) fn enum_member(&self, enum_name: &str, member: &str) -> Option<&Ty> {

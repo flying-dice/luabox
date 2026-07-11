@@ -988,6 +988,30 @@ local point = { x = 1, y = 2 }
 }
 
 #[test]
+fn inlay_hints_show_operator_overload_results() {
+    // A `---@operator` result types the operator expression: an unannotated
+    // local bound to `a + b` (both `Vec`) hints as `: Vec`, not `: unknown`
+    // (#114). Proves the overload rides the same shared inference the LSP uses.
+    let source = "\
+---@class Vec
+---@operator add(Vec): Vec
+
+---@type Vec
+local a
+---@type Vec
+local b
+local c = a + b
+";
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, source);
+    let mut client = client;
+    let hints = client.inlay_hints(&uri, range((0, 0), (8, 0)));
+    assert_eq!(hint_label(hint_at(&hints, 7, 7)), ": Vec"); // c
+    client.shutdown();
+}
+
+#[test]
 fn inlay_hints_render_annotated_types_inline() {
     let source = "\
 ---@param width number

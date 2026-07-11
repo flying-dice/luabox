@@ -200,3 +200,44 @@ Feature: rich table inference — tables never degrade to bare `table`
     When I run "luabox check"
     Then the command succeeds
     And zero diagnostics are reported
+
+  Scenario: a declared `---@operator` result types an expression (#114)
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Vec
+      ---@operator add(Vec): Vec
+      ---@operator mul(number): Vec
+
+      ---@type Vec
+      local a
+      ---@type Vec
+      local b
+      ---@type Vec
+      local sum = a + b
+      ---@type Vec
+      local scaled = 2 * a
+      print(sum, scaled)
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And zero diagnostics are reported
+
+  Scenario: misusing a `---@operator` result is caught (#114)
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Vec
+      ---@operator add(Vec): Vec
+
+      ---@type Vec
+      local a
+      ---@type Vec
+      local b
+      ---@type string
+      local s = a + b
+      print(s)
+      """
+    When I run "luabox check"
+    Then the command fails
+    And diagnostic LB0300 is reported

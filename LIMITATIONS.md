@@ -35,7 +35,6 @@ are accepted and ignored rather than rejected:
 
 | Tag | Status in `check` / `lint` |
 |---|---|
-| `---@operator` | Parsed; operator-overload result types are not applied during inference. |
 | `---@async` | Parsed; no async/await checking. |
 | `---@vararg` (legacy standalone form) | Parsed; the legacy standalone tag is not wired to inference (the `---@param ...` form is the modern spelling). |
 | `---@version`, `---@source`, `---@see`, `---@package` | Metadata; ignored by checking (some surface in `luabox doc`). |
@@ -46,12 +45,22 @@ Tags that **are** enforced today: `---@class` (incl. `: Parent` conformance),
 `duplicate-doc-alias`), `---@generic`, `---@enum`, `---@overload`, `---@cast`,
 `---@meta`, `---@deprecated` (use sites diagnosed, luals `deprecated`),
 `---@nodiscard` (discarded returns diagnosed, luals `discard-returns`),
+`---@operator` (overload result types applied during inference, luals parity),
 `---@diagnostic` (lint + checker suppression), and inline `--[[@as T]]`.
 
 Two edges of `---@deprecated` are not yet covered: a `:` method call
 (`obj:m()`) and a class type used as an annotation — the P0 checker does not
 resolve method receivers, so a deprecated method reached through a colon call
 is not flagged.
+
+One edge of `---@operator` is out of scope: **`---@operator call` (making a
+value callable) is parsed but not applied.** The overload mechanism types
+binary/unary operator *expressions* (`a + b`, `-v`, `#v`); making a class
+value itself callable would hook the call-evaluation path instead and does not
+fall out of the same mechanism, so it is deferred. Every other operator luals
+supports (`add`, `sub`, `mul`, `div`, `mod`, `pow`, `idiv`, `concat`, `band`,
+`bor`, `bxor`, `shl`, `shr`, `unm`, `bnot`, `len`) applies, including
+right-operand dispatch and overload selection by parameter type.
 
 ## Tooling
 

@@ -19,6 +19,16 @@ local origin = { x = 0, y = 0 }
 ---@type geometry.Point
 local corner = { x = 1, y = 1, label = "top-right", unit = "px" }
 
+-- OPERATOR OVERLOADS (#114): `geometry.Point` declares `---@operator add`
+-- (see ../defs/geometry.d.lua), so `corner + origin` types as a
+-- `geometry.Point` and binds cleanly to the annotated local below. If the
+-- overload were not applied the expression would degrade to `unknown` and
+-- `unknown -> geometry.Point` would error under `strict` — a clean check
+-- proves the declared result flowed. Rebinding it to a `---@type string`
+-- would be a real `luabox check` LB0300 (verified against the real binary).
+---@type geometry.Point
+local translated = corner + origin
+
 -- geometry.Pair is a REAL generic class (#84): `geometry.Pair<number>`
 -- substitutes `number` for the parameter `T`, so both `first` and `second`
 -- are checked as numbers here. A string in either field would be a real
@@ -71,6 +81,7 @@ end
 return {
     origin = origin,
     corner = corner,
+    translated = translated,
     dimensions = dimensions,
     ShapeKind = ShapeKind,
     describe_kind = describe_kind,

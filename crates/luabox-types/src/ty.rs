@@ -52,6 +52,21 @@ pub enum Ty {
     Table(Box<TableTy>),
 }
 
+/// One `---@operator <op>[(<input>)]: <result>` overload declared on a
+/// `---@class` block (#114). Binary operators carry an `input` (the type of
+/// the *other* operand the overload matches on); unary operators (`unm`,
+/// `bnot`, `len`) carry `None`. luals applies these during inference: an
+/// operator expression on an annotated class takes the declared `result`
+/// type rather than degrading to `unknown`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorSig {
+    /// The declared parameter type (`Vec` in `add(Vec)`) matched against the
+    /// other operand; `None` for a unary operator.
+    pub input: Option<Ty>,
+    /// The result type of the operator expression.
+    pub result: Ty,
+}
+
 /// One named field of a [`TableTy`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldTy {

@@ -1960,7 +1960,14 @@ impl Infer<'_> {
                 let operand_ty = self.eval(body, operand);
                 match op {
                     UnOp::Not => ITy::Ty(Ty::Boolean),
-                    UnOp::Len => ITy::Ty(Ty::Integer),
+                    UnOp::Len => {
+                        // `#x` is `integer` unless the operand's class declares
+                        // `---@operator len: T`, in which case it takes `T`
+                        // (luals parity, #114).
+                        let ty = self.reify(&operand_ty);
+                        self.operator_result(&ty, "len", None)
+                            .map_or_else(|| ITy::Ty(Ty::Integer), ITy::Ty)
+                    }
                     UnOp::Neg => {
                         let ty = self.reify(&operand_ty);
                         if integerish(&ty) {
@@ -1968,7 +1975,8 @@ impl Infer<'_> {
                         } else if numberish(&ty) {
                             ITy::Ty(Ty::Number)
                         } else {
-                            ITy::unknown()
+                            self.operator_result(&ty, "unm", None)
+                                .map_or_else(ITy::unknown, ITy::Ty)
                         }
                     }
                     UnOp::BNot => {
@@ -1976,7 +1984,8 @@ impl Infer<'_> {
                         if numberish(&ty) {
                             ITy::Ty(Ty::Integer)
                         } else {
-                            ITy::unknown()
+                            self.operator_result(&ty, "bnot", None)
+                                .map_or_else(ITy::unknown, ITy::Ty)
                         }
                     }
                 }
@@ -2120,7 +2129,7 @@ impl Infer<'_> {
                 if stringish(&lt) && stringish(&rt) {
                     ITy::Ty(Ty::String)
                 } else {
-                    ITy::unknown()
+                    self.operator_binary(op, &lt, &rt)
                 }
             }
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod | BinOp::IDiv => {
@@ -2131,7 +2140,7 @@ impl Infer<'_> {
                 } else if numberish(&lt) && numberish(&rt) {
                     ITy::Ty(Ty::Number)
                 } else {
-                    ITy::unknown()
+                    self.operator_binary(op, &lt, &rt)
                 }
             }
             BinOp::Div | BinOp::Pow => {
@@ -2140,7 +2149,7 @@ impl Infer<'_> {
                 if numberish(&lt) && numberish(&rt) {
                     ITy::Ty(Ty::Number)
                 } else {
-                    ITy::unknown()
+                    self.operator_binary(op, &lt, &rt)
                 }
             }
             BinOp::BAnd | BinOp::BOr | BinOp::BXor | BinOp::Shl | BinOp::Shr => {
@@ -2149,10 +2158,52 @@ impl Infer<'_> {
                 if numberish(&lt) && numberish(&rt) {
                     ITy::Ty(Ty::Integer)
                 } else {
-                    ITy::unknown()
+                    self.operator_binary(op, &lt, &rt)
                 }
             }
         }
+    }
+
+    /// Apply a `---@operator` overload to a binary expression whose operands
+    /// are not primitive numbers/strings (#114). Mirrors Lua's metamethod
+    /// dispatch: the LEFT operand's class is consulted first, then the RIGHT
+    /// operand's (the reversed case — e.g. `scalar * Vec` resolving through
+    /// `Vec`'s `mul` overload). The declared result type replaces what would
+    /// otherwise be `unknown`; with no matching operator the behavior is
+    /// unchanged (`unknown`). luals's exact right-operand rule is not
+    /// separately documented, so this follows Lua's runtime left-then-right
+    /// metamethod order.
+    fn operator_binary(&self, op: BinOp, lt: &Ty, rt: &Ty) -> ITy {
+        let Some(name) = binop_operator_name(op) else {
+            return ITy::unknown();
+        };
+        self.operator_result(lt, name, Some(rt))
+            .or_else(|| self.operator_result(rt, name, Some(lt)))
+            .map_or_else(ITy::unknown, ITy::Ty)
+    }
+
+    /// The result type of `op` on a class operand, if the (possibly inherited)
+    /// class declares a matching `---@operator`. For a binary operator `other`
+    /// is the type of the opposite operand and the first overload whose
+    /// declared parameter accepts it wins (first-match, mirroring `---@overload`
+    /// selection, #86). For a unary operator `other` is `None` and the
+    /// no-parameter overload is used.
+    fn operator_result(&self, ty: &Ty, op: &str, other: Option<&Ty>) -> Option<Ty> {
+        let Ty::Named(class) = ty else {
+            return None;
+        };
+        for sig in self.env.class_operators(class, op) {
+            match (&sig.input, other) {
+                (Some(input), Some(other)) => {
+                    if crate::assign::assignable(self.env, false, other, input) {
+                        return Some(sig.result.clone());
+                    }
+                }
+                (None, None) => return Some(sig.result.clone()),
+                _ => {}
+            }
+        }
+        None
     }
 
     // --- calls -----------------------------------------------------------
@@ -2848,6 +2899,36 @@ fn tuple_index(recv: &ITy, idx: i64) -> Option<ITy> {
         }
     }
     is_tuple.then(ITy::unknown)
+}
+
+/// The `---@operator` name a binary operator dispatches to (`+` → `add`,
+/// `..` → `concat`, ...), matching luals's operator vocabulary (#114).
+/// Logical (`and`/`or`) and comparison operators have no overload and return
+/// `None`.
+fn binop_operator_name(op: BinOp) -> Option<&'static str> {
+    Some(match op {
+        BinOp::Add => "add",
+        BinOp::Sub => "sub",
+        BinOp::Mul => "mul",
+        BinOp::Div => "div",
+        BinOp::Mod => "mod",
+        BinOp::Pow => "pow",
+        BinOp::IDiv => "idiv",
+        BinOp::Concat => "concat",
+        BinOp::BAnd => "band",
+        BinOp::BOr => "bor",
+        BinOp::BXor => "bxor",
+        BinOp::Shl => "shl",
+        BinOp::Shr => "shr",
+        BinOp::And
+        | BinOp::Or
+        | BinOp::Eq
+        | BinOp::Ne
+        | BinOp::Lt
+        | BinOp::Le
+        | BinOp::Gt
+        | BinOp::Ge => return None,
+    })
 }
 
 fn integerish(ty: &Ty) -> bool {
@@ -3829,5 +3910,187 @@ local a = area(3, 4)
         let out = outcome(src);
         assert_eq!(binding_ty(&out, "w").to_string(), "unknown");
         assert_eq!(binding_ty(&out, "h").to_string(), "unknown");
+    }
+
+    // --- `---@operator` overloads (#114) ----------------------------------
+
+    const VEC: &str = "\
+---@class Vec
+---@operator add(Vec): Vec
+---@operator sub(Vec): Vec
+---@operator mul(number): Vec
+---@operator unm: Vec
+---@operator len: integer
+";
+
+    #[test]
+    fn binary_operator_types_the_result() {
+        let src = format!(
+            "{VEC}\
+---@type Vec
+local a
+---@type Vec
+local b
+local c = a + b
+"
+        );
+        let out = outcome(&src);
+        // Without the overload `a + b` would degrade to `unknown`; luals (and
+        // now luabox) types it as the declared result `Vec`.
+        assert_eq!(binding_ty(&out, "c").to_string(), "Vec");
+    }
+
+    #[test]
+    fn reversed_operand_dispatch_consults_right_class() {
+        // `2 * v`: the LEFT operand is a plain number with no `mul` overload,
+        // so dispatch falls to the RIGHT operand's class (Lua metamethod
+        // order). Vec's `mul(number): Vec` matches with the number as its arg.
+        let src = format!(
+            "{VEC}\
+---@type Vec
+local v
+local scaled = 2 * v
+"
+        );
+        let out = outcome(&src);
+        assert_eq!(binding_ty(&out, "scaled").to_string(), "Vec");
+    }
+
+    #[test]
+    fn overloaded_operator_selects_by_param_type() {
+        let src = "\
+---@class Poly
+---@operator add(Poly): Poly
+---@operator add(number): number
+
+---@type Poly
+local p
+---@type Poly
+local q
+local same = p + q
+local shifted = p + 1
+";
+        let out = outcome(src);
+        // First overload (param `Poly`) matches `p + q`.
+        assert_eq!(binding_ty(&out, "same").to_string(), "Poly");
+        // Second overload (param `number`) matches `p + 1`.
+        assert_eq!(binding_ty(&out, "shifted").to_string(), "number");
+    }
+
+    #[test]
+    fn unary_unm_and_len_operators_apply() {
+        let src = format!(
+            "{VEC}\
+---@type Vec
+local v
+local neg = -v
+local n = #v
+"
+        );
+        let out = outcome(&src);
+        assert_eq!(binding_ty(&out, "neg").to_string(), "Vec");
+        // `len` is declared `integer` here (the default too, but this proves
+        // the overload path returns the declared type).
+        assert_eq!(binding_ty(&out, "n").to_string(), "integer");
+    }
+
+    #[test]
+    fn len_operator_can_override_the_default_integer() {
+        let src = "\
+---@class Sized
+---@operator len: string
+
+---@type Sized
+local s
+local m = #s
+";
+        let out = outcome(src);
+        // A declared `len` result replaces the built-in `integer` for `#`.
+        assert_eq!(binding_ty(&out, "m").to_string(), "string");
+    }
+
+    #[test]
+    fn undeclared_operator_preserves_unknown() {
+        // A class with no `---@operator` behaves as before: the operator
+        // expression degrades to `unknown` (no invented diagnostic).
+        let src = "\
+---@class Bare
+
+---@type Bare
+local a
+---@type Bare
+local b
+local c = a + b
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "c").to_string(), "unknown");
+    }
+
+    #[test]
+    fn operator_result_is_checked_against_annotations() {
+        // Correct usage types clean under strict (proves the result is `Vec`,
+        // not `unknown` — `unknown -> Vec` would itself error under strict).
+        let ok = format!(
+            "{VEC}\
+---@type Vec
+local a
+---@type Vec
+local b
+---@type Vec
+local c = a + b
+"
+        );
+        assert_eq!(strict_codes(&ok), Vec::<String>::new());
+
+        // Misusing the result is caught: `Vec + Vec` is not a `string`.
+        let bad = format!(
+            "{VEC}\
+---@type Vec
+local a
+---@type Vec
+local b
+---@type string
+local s = a + b
+"
+        );
+        assert_eq!(strict_codes(&bad), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn operator_inherited_from_parent_class() {
+        // `---@operator` rides the class surface like `---@field`s: a subclass
+        // inherits its parent's operators.
+        let src = "\
+---@class Base
+---@operator add(Base): Base
+
+---@class Derived : Base
+
+---@type Derived
+local a
+---@type Base
+local b
+local c = a + b
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "c").to_string(), "Base");
+    }
+
+    #[test]
+    fn primitive_operator_inference_unregressed() {
+        // The overload path must never disturb primitive operator typing.
+        let src = "\
+local i = 1 + 2
+local f = 1.5 + 2
+local d = 3 / 2
+local s = \"a\" .. \"b\"
+local b = 1 & 2
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "i").to_string(), "integer");
+        assert_eq!(binding_ty(&out, "f").to_string(), "number");
+        assert_eq!(binding_ty(&out, "d").to_string(), "number");
+        assert_eq!(binding_ty(&out, "s").to_string(), "string");
+        assert_eq!(binding_ty(&out, "b").to_string(), "integer");
     }
 }
