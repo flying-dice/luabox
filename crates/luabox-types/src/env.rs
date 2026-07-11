@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use luabox_syntax::lua::ast::{AstNode, Expr, LocalStmt, Stmt};
 use luabox_syntax::lua::{self, SyntaxKind, SyntaxNode};
 use luabox_syntax::luacats::{
-    self, AliasTag, CastKind, FieldKey, ParamTag, ReturnTag, Tag, TypeExprKind,
+    self, AliasTag, CastKind, FieldKey, FieldScope, ParamTag, ReturnTag, Tag, TypeExprKind,
 };
 
 use crate::lower::{Declared, GenericClass, Lowerer};
@@ -51,6 +51,18 @@ pub(crate) struct ClassDef {
     /// operator declared on a class in one file applies wherever the class is
     /// used (cross-file / defs-package).
     pub operators: BTreeMap<String, Vec<OperatorSig>>,
+    /// Non-public member visibility (luals `invisible`, #115): member name →
+    /// its declared scope, recorded only for `private` / `protected` /
+    /// `package` members (a public member has no entry). Populated from
+    /// `---@field <scope> name` modifiers and from standalone `---@private` /
+    /// `---@protected` / `---@package` doc blocks on `function Class:method`
+    /// declarations. Like `---@field`s these ride the workspace-global class
+    /// surface, so a member's visibility declared on a class in one file is
+    /// enforced wherever the class is used (cross-file / defs-package). The
+    /// *owner* of a restricted member is the class this map lives on; a
+    /// subclass re-declaring the member as a plain `---@field` (no scope)
+    /// overrides it back to public (see [`TypeEnv::member_visibility`]).
+    pub visibility: BTreeMap<String, FieldScope>,
 }
 
 /// A declared `---@enum`: member name → value type, plus the union of all
@@ -193,6 +205,12 @@ pub struct TypeEnv {
     as_casts: HashMap<usize, Ty>,
     /// References to undeclared type names (LB0305): `(name, span)`.
     pub(crate) unknown_names: Vec<(String, luacats::Span)>,
+    /// The `---@class` names declared by *this* file's own annotations (not
+    /// the ambient/defs layer seeded beneath). The `package`-visibility test
+    /// (luals `invisible`, #115): a `package` member is accessible only in the
+    /// file that declares its class, so an access is in-package iff the owner
+    /// class is one this file declares.
+    local_classes: HashSet<String>,
 }
 
 impl TypeEnv {
@@ -265,6 +283,20 @@ impl TypeEnv {
             lowerer.generics = block_generics(item);
             env.absorb_block(item, &mut lowerer, &root);
         }
+        // The classes this file itself declares (the `package`-visibility test,
+        // #115) and the standalone `---@private`/`---@protected`/`---@package`
+        // visibility on `function Class:method` doc blocks, resolved once every
+        // class in the file is known.
+        for item in items {
+            for tag in &item.block.tags {
+                if let Tag::Class(c) = tag
+                    && !c.name.is_empty()
+                {
+                    env.local_classes.insert(c.name.clone());
+                }
+            }
+        }
+        env.absorb_standalone_visibility(items, &root);
         // Inline `--[[@as T]]` casts: anchor each to the end offset of the
         // expression it directly follows (skipping back over whitespace).
         let inline_as = luacats::harvest_inline_as(parse);
@@ -408,6 +440,9 @@ impl TypeEnv {
                                 slot.push(sig.clone());
                             }
                         }
+                    }
+                    for (member, scope) in &def.visibility {
+                        existing.visibility.entry(member.clone()).or_insert(*scope);
                     }
                 }
             }
@@ -661,6 +696,19 @@ impl TypeEnv {
                                     optional: f.optional,
                                 },
                             );
+                            // Record a non-public `---@field <scope>` modifier
+                            // for the visibility check (#115). A plain (public)
+                            // field is left out of the map — and clears any
+                            // inherited restriction — so a later same-name
+                            // public re-declaration reads as public.
+                            match f.scope {
+                                Some(FieldScope::Public) | None => {
+                                    class.visibility.remove(name);
+                                }
+                                Some(scope) => {
+                                    class.visibility.insert(name.clone(), scope);
+                                }
+                            }
                         }
                         FieldKey::Indexer(key) => {
                             let key = lowerer.lower(key);
@@ -745,6 +793,69 @@ impl TypeEnv {
             self.typed_locals.insert(target, types);
             if let Some(span) = type_span {
                 self.typed_local_spans.insert(target, span);
+            }
+        }
+    }
+
+    /// Record the standalone `---@private` / `---@protected` / `---@package`
+    /// visibility declared on `function Class:method` (or `function
+    /// Class.member`) doc blocks (#115). The `---@field <scope>` modifier form
+    /// is handled inline in [`Self::absorb_block`]; this covers the tag-above-a-
+    /// method form luals also accepts.
+    ///
+    /// The carrier *variable* a method attaches to (`function M:m()`) need not
+    /// share the `---@class` name (`---@class Animal local M = {}`), so a
+    /// variable→class map is built first from every class carrier's declaring
+    /// statement, then each method block's first path segment is resolved
+    /// through it. A block that also carries a `---@class` is skipped (the tag
+    /// then documents the class, not a member). Unresolvable carriers are left
+    /// alone — the conservative direction (no false `invisible`).
+    fn absorb_standalone_visibility(
+        &mut self,
+        items: &[luacats::AnnotatedItem],
+        root: &SyntaxNode,
+    ) {
+        let mut var_to_class: HashMap<String, String> = HashMap::new();
+        for item in items {
+            for tag in &item.block.tags {
+                let Tag::Class(c) = tag else { continue };
+                if c.name.is_empty() {
+                    continue;
+                }
+                // The class name is itself a valid carrier reference
+                // (`function Animal:m()` where `Animal` is the class).
+                var_to_class.insert(c.name.clone(), c.name.clone());
+                if let Some(span) = item.target
+                    && let Some(name) =
+                        stmt_at(root, (span.start, span.end)).and_then(|s| carrier_var_name(&s))
+                {
+                    var_to_class.insert(name, c.name.clone());
+                }
+            }
+        }
+
+        for item in items {
+            // A block documenting a class is not a member visibility block.
+            if item.block.tags.iter().any(|t| matches!(t, Tag::Class(_))) {
+                continue;
+            }
+            let Some(scope) = item.block.tags.iter().find_map(standalone_scope) else {
+                continue;
+            };
+            let Some(span) = item.target else { continue };
+            let Some(Stmt::FunctionDecl(f)) = stmt_at(root, (span.start, span.end)) else {
+                continue;
+            };
+            let Some(fname) = f.name() else { continue };
+            let segments: Vec<String> = fname.segments().map(|s| s.text().to_string()).collect();
+            let [carrier, .., member] = segments.as_slice() else {
+                continue;
+            };
+            let Some(class) = var_to_class.get(carrier) else {
+                continue;
+            };
+            if let Some(def) = self.classes.get_mut(class) {
+                def.visibility.insert(member.clone(), scope);
             }
         }
     }
@@ -1058,6 +1169,66 @@ impl TypeEnv {
             .is_some_and(|def| def.fields.contains_key(field))
     }
 
+    /// The visibility of `member` as seen through `class`, plus the class that
+    /// *owns* (declares) the restriction — the luals `invisible` lookup (#115).
+    /// `None` when the member is public (no restriction anywhere the resolution
+    /// reaches). Resolution walks own declarations first, then parents: the
+    /// nearest declaration wins, so a subclass that re-declares an inherited
+    /// restricted member as a plain `---@field` (recorded as *not* in
+    /// `visibility`, but present in `fields`) overrides it back to public.
+    pub(crate) fn member_visibility(
+        &self,
+        class: &str,
+        member: &str,
+    ) -> Option<(FieldScope, String)> {
+        let mut stack = vec![class.to_string()];
+        let mut seen = HashSet::new();
+        while let Some(name) = stack.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let Some(def) = self.classes.get(&name) else {
+                continue;
+            };
+            if let Some(scope) = def.visibility.get(member) {
+                return Some((*scope, name));
+            }
+            // A plain (public) re-declaration of the member here shadows any
+            // parent restriction — resolution stops, member is public.
+            if def.fields.contains_key(member) || def.methods.contains_key(member) {
+                return None;
+            }
+            stack.extend(def.parents.iter().cloned());
+        }
+        None
+    }
+
+    /// Whether `class` is `ancestor` or transitively extends it (`---@class
+    /// Child : ancestor`) — the `protected` reachability test (#115).
+    pub(crate) fn is_subclass(&self, class: &str, ancestor: &str) -> bool {
+        let mut stack = vec![class.to_string()];
+        let mut seen = HashSet::new();
+        while let Some(name) = stack.pop() {
+            if name == ancestor {
+                return true;
+            }
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            if let Some(def) = self.classes.get(&name) {
+                stack.extend(def.parents.iter().cloned());
+            }
+        }
+        false
+    }
+
+    /// Whether `class` is declared by *this* file's own annotations (the
+    /// `package`-visibility test — a `package` member is reachable only in the
+    /// file that declares its owner class, #115).
+    pub(crate) fn declares_class_locally(&self, class: &str) -> bool {
+        self.local_classes.contains(class)
+    }
+
     /// The `---@cast` overrides attached to a statement, if any.
     pub(crate) fn casts_at(&self, target: Target) -> Option<&[CastEntry]> {
         self.casts.get(&target).map(Vec::as_slice)
@@ -1195,6 +1366,31 @@ fn lower_cast(tag: &luacats::CastTag, lowerer: &mut Lowerer<'_>) -> CastEntry {
             .iter()
             .map(|op| (op.kind, lowerer.lower(&op.ty)))
             .collect(),
+    }
+}
+
+/// The scope a standalone `---@private` / `---@protected` / `---@package` tag
+/// declares, or `None` for any other tag (#115).
+fn standalone_scope(tag: &Tag) -> Option<FieldScope> {
+    match tag {
+        Tag::Private(_) => Some(FieldScope::Private),
+        Tag::Protected(_) => Some(FieldScope::Protected),
+        Tag::Package(_) => Some(FieldScope::Package),
+        _ => None,
+    }
+}
+
+/// The variable a `---@class` carrier statement binds, so a method attached to
+/// it (`function M:m()`) can be mapped back to the class (#115): the first name
+/// of a `local M = {}`, or the sole `Name` target of an `M = {}` assignment.
+fn carrier_var_name(stmt: &Stmt) -> Option<String> {
+    match stmt {
+        Stmt::Local(local) => Some(local.names().next()?.name()?.text().to_string()),
+        Stmt::Assign(assign) => match assign.targets()?.exprs().next()? {
+            Expr::Name(name) => Some(name.name()?.text().to_string()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

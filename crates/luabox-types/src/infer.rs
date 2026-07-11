@@ -58,8 +58,11 @@ use luabox_syntax::luacats;
 use crate::env::TypeEnv;
 use crate::ty::{FieldTy, FunctionTy, ParamTy, TableTy, Ty};
 
-/// Diagnostic code emitted here (block `LB03xx` — Semantics).
+/// Diagnostic codes emitted here (block `LB03xx` — Semantics).
 const FIELD_NOT_FOUND: u16 = 306;
+/// Access of a `---@private`/`---@protected`/`---@package` member from outside
+/// its visibility scope (luals `invisible`, #115).
+const INVISIBLE: u16 = 312;
 
 /// A byte range key, matching the annotation checker's convention.
 type Key = (usize, usize);
@@ -193,6 +196,7 @@ pub(crate) fn run(
         diags: Vec::new(),
         memo: HashMap::new(),
         reify_stack: Vec::new(),
+        class_ctx: Vec::new(),
     };
     infer.run_pass();
     infer.pass = 1;
@@ -469,6 +473,16 @@ struct Infer<'a> {
     diags: Vec<Diagnostic>,
     memo: HashMap<usize, Ty>,
     reify_stack: Vec<usize>,
+    /// The stack of enclosing `---@class` method contexts (#115): the class a
+    /// carrier method (`function C:m()` / `function C.m()`) is attached to,
+    /// pushed while its body is walked. An access `recv.member` is "inside the
+    /// class" — the luals `getEnvClass` determination — when the owner of a
+    /// restricted `member` is present in this stack (or, for `protected`, a
+    /// superclass of an entry). Kept as a stack, not a single slot, so a nested
+    /// closure inside a method still counts as inside the class (a deliberate
+    /// widening over luals's nearest-function rule, in the conservative
+    /// no-false-positive direction).
+    class_ctx: Vec<String>,
 }
 
 impl Infer<'_> {
@@ -622,6 +636,107 @@ impl Infer<'_> {
             diag = diag.with_label(Label::secondary(
                 Span::new(self.file.to_string(), range),
                 format!("`{class}` declared here"),
+            ));
+        }
+        self.diags.push(diag);
+    }
+
+    // --- member visibility (luals `invisible`, #115) ---------------------
+
+    /// The single `---@class` a receiver value resolves to, if any: a
+    /// `Ty::Named` class, or an inference shape whose (metatable-chained)
+    /// declaration names a class. `None` for anything else (a union, a plain
+    /// table, `unknown`) — the conservative direction, so visibility is only
+    /// ever judged against an unambiguous class receiver.
+    fn receiver_class(&self, recv: &ITy) -> Option<String> {
+        match recv {
+            ITy::Ty(Ty::Named(class)) if self.env.is_class(class) => Some(class.clone()),
+            ITy::Shape(id) => self.shape_declared_class(*id),
+            _ => None,
+        }
+    }
+
+    /// The declared `---@class` name of a shape, following the `__index` chain
+    /// (the receiver-side of [`Self::receiver_class`], reused to name the
+    /// enclosing class of a carrier method).
+    fn shape_declared_class(&self, id: usize) -> Option<String> {
+        let mut cur = Some(id);
+        let mut seen = HashSet::new();
+        while let Some(s) = cur {
+            if !seen.insert(s) {
+                break;
+            }
+            if let Some(class) = &self.shapes[s].declared
+                && self.env.is_class(class)
+            {
+                return Some(class.clone());
+            }
+            cur = self.index_delegate(s);
+        }
+        None
+    }
+
+    /// Check an access `recv.member` (or `recv:member()`) against the member's
+    /// declared visibility and report `invisible` (`LB0312`) when it is not
+    /// reachable from here (#115). `recv_class` is the receiver's resolved
+    /// class; a public member (or one on a non-restricting class) is silent.
+    fn check_visibility(&mut self, body: BodyId, expr: ExprId, recv_class: &str, member: &str) {
+        if self.pass != 1 {
+            return;
+        }
+        let Some((scope, owner)) = self.env.member_visibility(recv_class, member) else {
+            return;
+        };
+        let allowed = match scope {
+            luacats::FieldScope::Public => return,
+            // Private: only the owning class's own methods.
+            luacats::FieldScope::Private => self.class_ctx.iter().any(|c| c == &owner),
+            // Protected: the owning class or any subclass method.
+            luacats::FieldScope::Protected => self
+                .class_ctx
+                .iter()
+                .any(|c| c == &owner || self.env.is_subclass(c, &owner)),
+            // Package: anywhere in the file that declares the owning class.
+            luacats::FieldScope::Package => self.env.declares_class_locally(&owner),
+        };
+        if !allowed {
+            self.report_invisible(body, expr, member, &owner, scope);
+        }
+    }
+
+    /// Report an `invisible` access (`LB0312`). Follows the strictness ladder
+    /// like its sibling `undefined-field` (`LB0306`) — a warning in warn mode,
+    /// an error in strict — which is stricter than luals (always a warning).
+    fn report_invisible(
+        &mut self,
+        body: BodyId,
+        expr: ExprId,
+        member: &str,
+        owner: &str,
+        scope: luacats::FieldScope,
+    ) {
+        let Some((start, end)) = self.expr_range(body, expr) else {
+            return;
+        };
+        let (kind, reach) = match scope {
+            luacats::FieldScope::Private => ("private", "its own class"),
+            luacats::FieldScope::Protected => ("protected", "its class and subclasses"),
+            luacats::FieldScope::Package => ("package", "the file that declares its class"),
+            luacats::FieldScope::Public => return,
+        };
+        let mut diag = Diagnostic::new(
+            Code::new(INVISIBLE),
+            self.severity,
+            format!("cannot access {kind} member `{member}` of `{owner}` here"),
+        )
+        .with_label(Label::primary(
+            Span::new(self.file, start..end),
+            format!("`{member}` is {kind} to `{owner}` — accessible only from {reach}"),
+        ));
+        if let Some(range) = self.env.class_decl_span(owner) {
+            diag = diag.with_label(Label::secondary(
+                Span::new(self.file.to_string(), range),
+                format!("`{owner}` declared here"),
             ));
         }
         self.diags.push(diag);
@@ -1363,7 +1478,21 @@ impl Infer<'_> {
                     self.record_arg_seeds(fn_body, &itys, takes_self);
                 }
             }
+            // Track the enclosing `---@class` while the method body walks, so
+            // an access to a restricted member of that class resolves as
+            // "inside the class" (luals `getEnvClass`, #115). Covers both `:`
+            // methods and `.` functions carried by a declared class.
+            let enclosing = match &resolved {
+                Target::Field { shape: Some(c), .. } => self.shape_declared_class(*c),
+                _ => None,
+            };
+            if let Some(class) = &enclosing {
+                self.class_ctx.push(class.clone());
+            }
             self.walk_body(fn_body, sig.as_ref(), self_ty.as_ref());
+            if enclosing.is_some() {
+                self.class_ctx.pop();
+            }
             let ity = match sig {
                 Some(sig) => ITy::Ty(Ty::Function(Box::new(sig))),
                 None => ITy::Func(fn_body),
@@ -2002,7 +2131,12 @@ impl Infer<'_> {
                 Some(name) => {
                     let name = name.to_string();
                     match self.lookup_field(&recv, &name) {
-                        Lookup::Found(ity) => ity,
+                        Lookup::Found(ity) => {
+                            if let Some(class) = self.receiver_class(&recv) {
+                                self.check_visibility(body, expr, &class, &name);
+                            }
+                            ity
+                        }
                         Lookup::Absent { provable, declared } => {
                             // A global-rooted dotted read of a *declared module
                             // table* (`string.rep`, `table.insert`, a
@@ -2617,6 +2751,9 @@ impl Infer<'_> {
         }
         match self.lookup_field(&recv, &method) {
             Lookup::Found(f) => {
+                if let Some(class) = self.receiver_class(&recv) {
+                    self.check_visibility(body, expr, &class, &method);
+                }
                 match &f {
                     ITy::Func(fn_body) => self.record_arg_seeds(*fn_body, &arg_itys, true),
                     _ => self.record_outgoing(&method, &arg_itys),

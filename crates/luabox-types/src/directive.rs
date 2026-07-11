@@ -1,7 +1,7 @@
 //! Minimal checker-side `---@diagnostic disable*: <rule>` handling for the
 //! type diagnostics that carry a luals rule name (`undefined-field` → `LB0306`,
 //! `deprecated` → `LB0308`, `discard-returns` → `LB0309`, `duplicate-doc-field`
-//! → `LB0311`).
+//! → `LB0311`, `invisible` → `LB0312`).
 //!
 //! luabox has no general checker-side `---@diagnostic` engine yet — the only
 //! other directive infrastructure lives in `luabox-lint` (`suppress.rs`), scoped
@@ -23,6 +23,7 @@ const KNOWN_RULES: &[&str] = &[
     "deprecated",
     "discard-returns",
     "duplicate-doc-field",
+    "invisible",
 ];
 
 /// The luals rule name that maps onto a checker `LBnnnn` code, or `None` when
@@ -33,6 +34,7 @@ pub(crate) fn rule_for_code(code: &str) -> Option<&'static str> {
         "LB0308" => Some("deprecated"),
         "LB0309" => Some("discard-returns"),
         "LB0311" => Some("duplicate-doc-field"),
+        "LB0312" => Some("invisible"),
         // LB0310 (duplicate-doc-alias) is a project-assembly finding, like the
         // LB0307 class collision — it never flows through this per-file filter,
         // so it has no entry here.
@@ -180,6 +182,7 @@ mod tests {
         assert_eq!(rule_for_code("LB0308"), Some("deprecated"));
         assert_eq!(rule_for_code("LB0309"), Some("discard-returns"));
         assert_eq!(rule_for_code("LB0311"), Some("duplicate-doc-field"));
+        assert_eq!(rule_for_code("LB0312"), Some("invisible"));
         assert_eq!(rule_for_code("LB0300"), None);
     }
 }

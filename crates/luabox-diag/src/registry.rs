@@ -119,6 +119,11 @@ static REGISTRY: &[Entry] = &[
         explain: LB0311,
     },
     Entry {
+        code: Code::new(312),
+        title: "access of a non-public member (invisible)",
+        explain: LB0312,
+    },
+    Entry {
         code: Code::new(500),
         title: "malformed `---@luabox-ignore`",
         explain: LB0500,
@@ -781,6 +786,70 @@ Remove the redundant `---@field`, or rename it if two distinct fields were
 intended.
 ";
 
+const LB0312: &str = "\
+# LB0312: access of a non-public member (invisible)
+
+A field read or `:` method call names a member marked `---@private`,
+`---@protected`, or `---@package`, from a place its visibility does not
+reach. This is lua-language-server's `invisible` diagnostic. luals always
+warns; luabox raises it on the strictness ladder like its sibling
+`undefined-field` (`LB0306`) — a **warning** in warn mode, an **error** in
+strict.
+
+Visibility is declared either as a `---@field` modifier or as a standalone
+tag on a `function Class:method` doc block:
+
+```lua
+---@class Account
+---@field private balance number
+local Account = {}
+Account.__index = Account
+
+---@private
+function Account:_recompute() end
+
+function Account:deposit(n)
+  self.balance = self.balance + n   -- fine: inside Account's own method
+  self:_recompute()                 -- fine
+end
+
+---@type Account
+local a = getAccount()
+print(a.balance)   -- LB0312: `balance` is private to `Account`
+a:_recompute()     -- LB0312: `_recompute` is private to `Account`
+```
+
+The three levels match luals:
+
+- **`private`** — reachable only from the owning class's own methods.
+- **`protected`** — reachable from the owning class *and its subclasses*
+  (`---@class Child : Parent`).
+- **`package`** — reachable only from the file that declares the owning
+  class.
+
+A restricted member is still a *real* member, so accessing it is this
+diagnostic, never `undefined-field` (`LB0306`) — exactly one finding fires,
+the specific one. A subclass that re-declares an inherited restricted member
+as a plain `---@field` (no scope) opens it back up to public.
+
+**Conservatism.** \"Inside the class\" is judged from the enclosing carrier
+method: an access resolves as in-class when it sits inside a `function
+Class:method` / `function Class.fn` body of the owning class (or, for
+`protected`, a subclass). A nested closure inside such a method still counts
+as inside. Where the receiver's class cannot be resolved unambiguously (a
+union, a plain inferred table), no `invisible` is raised.
+
+**Suppression** — the LuaCATS directive luals recognises:
+
+```lua
+---@diagnostic disable-next-line: invisible
+print(a.balance)   -- not flagged, this line only
+```
+
+Access the member through the class's public API, or — if the access is
+deliberate — suppress it with the directive above.
+";
+
 const LB0500: &str = "\
 # LB0500: malformed `---@luabox-ignore`
 
@@ -1283,8 +1352,9 @@ mod tests {
         for raw in [
             "LB0001", "LB0010", "LB0011", "LB0012", "LB0013", "LB0014", "LB0015", "LB0016",
             "LB0300", "LB0301", "LB0302", "LB0303", "LB0304", "LB0305", "LB0306", "LB0307",
-            "LB0308", "LB0309", "LB0310", "LB0311", "LB0500", "LB0501", "LB0502", "LB0503",
-            "LB0504", "LB0505", "LB0506", "LB0507", "LB0508", "LB0509", "LB1001", "LB1100",
+            "LB0308", "LB0309", "LB0310", "LB0311", "LB0312", "LB0500", "LB0501", "LB0502",
+            "LB0503", "LB0504", "LB0505", "LB0506", "LB0507", "LB0508", "LB0509", "LB1001",
+            "LB1100",
         ] {
             let code: Code = raw.parse().unwrap();
             assert!(explain(&code).is_some(), "{raw} missing from registry");

@@ -37,7 +37,7 @@ are accepted and ignored rather than rejected:
 |---|---|
 | `---@async` | Parsed; no async/await checking. |
 | `---@vararg` (legacy standalone form) | Parsed; the legacy standalone tag is not wired to inference (the `---@param ...` form is the modern spelling). |
-| `---@version`, `---@source`, `---@see`, `---@package` | Metadata; ignored by checking (some surface in `luabox doc`). |
+| `---@version`, `---@source`, `---@see` | Metadata; ignored by checking (some surface in `luabox doc`). |
 
 Tags that **are** enforced today: `---@class` (incl. `: Parent` conformance),
 `---@field` (incl. `duplicate-doc-field`), `---@param`, `---@return`,
@@ -46,7 +46,21 @@ Tags that **are** enforced today: `---@class` (incl. `: Parent` conformance),
 `---@meta`, `---@deprecated` (use sites diagnosed, luals `deprecated`),
 `---@nodiscard` (discarded returns diagnosed, luals `discard-returns`),
 `---@operator` (overload result types applied during inference, luals parity),
+`---@private` / `---@protected` / `---@package` (member visibility enforced,
+luals `invisible` — `LB0312`, both the `---@field <scope>` modifier and the
+standalone tag on a `function Class:method` doc block),
 `---@diagnostic` (lint + checker suppression), and inline `--[[@as T]]`.
+
+One edge of member visibility (`LB0312`) is deliberately conservative. Whether
+an access is "inside the class" is judged from the enclosing **carrier method**
+(`function Class:method` / `function Class.fn`), matching luals's environment
+rule; and `---@package` scopes to the file that declares the member's **class**
+(so a class split across files treats every declaring file as in-package). Where
+the receiver's class cannot be resolved to a single `---@class` — a union, or a
+plain inferred table — no `invisible` is raised, keeping false positives out at
+the cost of a few false negatives. The standalone tag is associated to its class
+through the `function Carrier:method` path; a visibility tag on a bare
+`Carrier.method = function() … end` assignment is not yet wired.
 
 Two edges of `---@deprecated` are not yet covered: a `:` method call
 (`obj:m()`) and a class type used as an annotation — the P0 checker does not

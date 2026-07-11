@@ -365,6 +365,8 @@ fn simple_tags() {
     assert!(matches!(one_tag("---@nodiscard"), Tag::Nodiscard(_)));
     assert!(matches!(one_tag("---@async"), Tag::Async(_)));
     assert!(matches!(one_tag("---@package"), Tag::Package(_)));
+    assert!(matches!(one_tag("---@private"), Tag::Private(_)));
+    assert!(matches!(one_tag("---@protected"), Tag::Protected(_)));
     let Tag::See(s) = one_tag("---@see foo.bar") else {
         panic!()
     };

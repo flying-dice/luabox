@@ -1408,4 +1408,283 @@ local Point = {}
 ";
         assert_eq!(codes(src, Strictness::None), Vec::<String>::new());
     }
+
+    // --- #115 field visibility (LB0312 invisible) ----------------------------
+
+    #[test]
+    fn private_field_clean_inside_own_method() {
+        // A `---@field private` read from the owning class's own method is
+        // allowed — the receiver is `self`, whose class is the enclosing one.
+        let src = "\
+---@class Account
+---@field private balance number
+local Account = {}
+Account.__index = Account
+
+function Account:total()
+  return self.balance
+end
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn private_field_blocked_outside() {
+        // The same read from a plain function is `invisible` — and it is
+        // LB0312, not LB0306: the member exists, it is just not visible.
+        let src = "\
+---@class Account
+---@field private balance number
+local Account = {}
+Account.__index = Account
+
+---@param a Account
+local function show(a)
+  return a.balance
+end
+";
+        assert_eq!(strict_codes(src), vec!["LB0312"]);
+    }
+
+    #[test]
+    fn private_is_warning_in_warn_mode() {
+        let src = "\
+---@class Account
+---@field private balance number
+local Account = {}
+
+---@param a Account
+local function show(a)
+  return a.balance
+end
+";
+        let diags = check(src, Strictness::Warn);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code.to_string(), "LB0312");
+        assert_eq!(diags[0].severity, Severity::Warning);
+        // ...and an error under strict (stricter than luals, like LB0306).
+        assert_eq!(check(src, Strictness::Strict)[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn protected_clean_in_subclass_blocked_elsewhere() {
+        let src = "\
+---@class Base
+---@field protected token? string
+local Base = {}
+Base.__index = Base
+
+---@class Child : Base
+local Child = {}
+Child.__index = Child
+
+function Child:reveal()
+  return self.token
+end
+
+---@param b Base
+local function leak(b)
+  return b.token
+end
+";
+        assert_eq!(strict_codes(src), vec!["LB0312"]);
+    }
+
+    #[test]
+    fn private_not_visible_in_subclass() {
+        // luals: private is same-class-only — a subclass method cannot read a
+        // private parent member (protected would).
+        let src = "\
+---@class Base
+---@field private secret? string
+local Base = {}
+Base.__index = Base
+
+---@class Child : Base
+local Child = {}
+Child.__index = Child
+
+function Child:peek()
+  return self.secret
+end
+";
+        assert_eq!(strict_codes(src), vec!["LB0312"]);
+    }
+
+    #[test]
+    fn package_clean_same_file() {
+        let src = "\
+---@class Config
+---@field package secret string
+local Config = {}
+Config.__index = Config
+
+---@param c Config
+local function read(c)
+  return c.secret
+end
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn package_blocked_cross_file_via_defs() {
+        // The class (and its `package` member) is declared in a `---@meta` defs
+        // package; the consumer file is a different file, so the member is
+        // invisible there.
+        let defs = "\
+---@meta
+---@class Config
+---@field package secret string
+";
+        let src = "\
+---@param c Config
+local function read(c)
+  return c.secret
+end
+";
+        assert_eq!(ambient_codes(src, &[defs]), vec!["LB0312"]);
+    }
+
+    #[test]
+    fn private_suppressed_by_directive() {
+        let src = "\
+---@class Account
+---@field private balance number
+local Account = {}
+
+---@param a Account
+local function show(a)
+  ---@diagnostic disable-next-line: invisible
+  return a.balance
+end
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn private_suppressed_file_wide() {
+        let src = "\
+---@diagnostic disable: invisible
+---@class Account
+---@field private balance number
+local Account = {}
+
+---@param a Account
+local function show(a)
+  return a.balance
+end
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn standalone_private_on_method() {
+        // The tag-above-a-method form: `---@private function Class:m()`. The
+        // method is reachable from the class's own methods, invisible outside.
+        let src = "\
+---@class Widget
+local Widget = {}
+Widget.__index = Widget
+
+---@private
+function Widget:_init() end
+
+function Widget:render()
+  self:_init()
+end
+
+---@param w Widget
+local function use(w)
+  w:_init()
+end
+";
+        assert_eq!(strict_codes(src), vec!["LB0312"]);
+    }
+
+    #[test]
+    fn visible_public_sibling_is_clean() {
+        // A public member alongside a private one is never flagged.
+        let src = "\
+---@class Account
+---@field private balance number
+---@field owner string
+local Account = {}
+
+---@param a Account
+local function show(a)
+  return a.owner
+end
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn public_redeclaration_in_subclass_reopens_member() {
+        // A subclass re-declaring an inherited private member as a plain
+        // `---@field` opens it back to public (nearest declaration wins).
+        let src = "\
+---@class Base
+---@field private tag? string
+local Base = {}
+
+---@class Child : Base
+---@field tag? string
+local Child = {}
+
+---@param c Child
+local function read(c)
+  return c.tag
+end
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn private_cross_file_via_workspace_global_class() {
+        // A `---@class` (with a private member) declared in one project file is
+        // workspace-global — nameable and enforced from another file. Its
+        // visibility rides the shared class surface: the private member is
+        // invisible in the consumer, which is not one of the class's methods.
+        let producer = parse(
+            "---@class Foo\n---@field private secret number\nlocal Foo = {}\nreturn Foo\n",
+            Dialect::Lua54,
+        );
+        let surface = module_surface(&producer, "foo.lua", None);
+        let ambient = crate::defs::Ambient::build(&[]).with_project_types([&surface.types]);
+        let consumer = parse(
+            "---@param f Foo\nlocal function read(f)\n  return f.secret\nend\n",
+            Dialect::Lua54,
+        );
+        let diags = check_file_with_ambient(
+            &consumer,
+            "consumer.lua",
+            Strictness::Strict,
+            Some(&ambient),
+        );
+        let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
+        assert_eq!(codes, vec!["LB0312"]);
+    }
+
+    #[test]
+    fn private_blocked_on_inferred_instance_receiver() {
+        // The idiomatic case: a constructor result (an inference *instance*
+        // shape, not an annotated `---@type`) still resolves its class, so a
+        // private read on it from module scope is `invisible`.
+        let src = "\
+---@class Circle
+---@field private radius number
+local Circle = {}
+Circle.__index = Circle
+
+---@return Circle
+function Circle.new()
+  return setmetatable({ radius = 1 }, Circle)
+end
+
+local c = Circle.new()
+print(c.radius)
+";
+        assert_eq!(strict_codes_ambient(src), vec!["LB0312"]);
+    }
 }

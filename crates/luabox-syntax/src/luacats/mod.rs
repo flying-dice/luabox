@@ -241,7 +241,8 @@ pub struct VarargTag {
 }
 
 /// A tag parsed only for its free-text remainder: `@see`, `@deprecated`,
-/// `@nodiscard`, `@async`, `@diagnostic`, `@version`, `@source`, `@package`.
+/// `@nodiscard`, `@async`, `@diagnostic`, `@version`, `@source`, `@package`,
+/// `@private`, `@protected`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimpleTag {
     pub text: Option<String>,
@@ -281,6 +282,14 @@ pub enum Tag {
     Version(SimpleTag),
     Source(SimpleTag),
     Package(SimpleTag),
+    /// Standalone `---@private` on a `function Class:method` (or `.field`)
+    /// doc block — the member is visible only within the same class (#115).
+    /// The `---@field private name` modifier form parses into
+    /// [`FieldTag::scope`] instead.
+    Private(SimpleTag),
+    /// Standalone `---@protected` — visible within the same class and its
+    /// subclasses (#115).
+    Protected(SimpleTag),
     Operator(OperatorTag),
     Vararg(VarargTag),
     Unknown(UnknownTag),
@@ -312,7 +321,9 @@ impl Tag {
             | Tag::Diagnostic(t)
             | Tag::Version(t)
             | Tag::Source(t)
-            | Tag::Package(t) => t.span,
+            | Tag::Package(t)
+            | Tag::Private(t)
+            | Tag::Protected(t) => t.span,
             Tag::Unknown(t) => t.span,
         }
     }
@@ -478,6 +489,8 @@ fn parse_tag(
         "version" => Tag::Version(simple(body, span)),
         "source" => Tag::Source(simple(body, span)),
         "package" => Tag::Package(simple(body, span)),
+        "private" => Tag::Private(simple(body, span)),
+        "protected" => Tag::Protected(simple(body, span)),
         _ => Tag::Unknown(UnknownTag {
             tag: word.to_string(),
             text: text_or_none(body),
