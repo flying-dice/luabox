@@ -24,15 +24,16 @@
 ---@field unit? geometry.Unit
 
 --- Anything with an area and a perimeter, described as a method-shaped
---- `---@class` (an "interface" by convention — nothing stops a table from
---- being declared to extend it without implementing any of these).
+--- `---@class` (an "interface" by convention).
 ---
---- NOTE (gap): this is NOT a sealed/verified contract the way a `.luab`
---- shape's `export type Shape` is. luabox does not check that a carrier
---- claiming `: geometry.Shape` actually implements `area`/`perimeter`/
---- `my_static` — see the carriers in ../src/circle.lua and ../src/rect.lua
---- for a concrete, verified demonstration. Conformance checking for
---- LuaCATS classes lands with the `.luab` drop epic (#84 etc.).
+--- CONFORMANCE (#107): this IS now a verified contract. A carrier declaring
+--- `: geometry.Shape` (see ../src/circle.lua and ../src/rect.lua) must
+--- actually implement `area`/`perimeter`/`my_static` with compatible
+--- signatures, or `luabox check` reports LB0300 at the carrier's `---@class`
+--- annotation — the structural conformance a `.luab` shape's `export type
+--- Shape` used to be needed for, now on the plain-LuaCATS path. (Declaring
+--- the interface here in the `---@meta` def carries no obligation of its own:
+--- defs are contracts, not carriers.)
 ---@class geometry.Shape
 ---@field area fun(self): number
 ---@field perimeter fun(self): number

@@ -7,10 +7,12 @@
 -- in defs/render.d.lua (`side: integer`, extends Drawable) — same
 -- merge-by-name idiom as ../geometry/src/circle.lua.
 --
--- NOTE (gap): as with geometry's carriers, this `: geometry.Drawable` is
--- NOT verified — luabox does not check that Square actually implements
--- area/perimeter/my_static/draw. See ../geometry/README.md for a live,
--- verified demonstration of that gap (delete a method, 0 errors).
+-- CONFORMANCE (#107): as with geometry's carriers, this `: geometry.Drawable`
+-- IS now verified — luabox checks that Square provides every member the
+-- Drawable interface chain declares (area/perimeter/my_static from
+-- geometry.Shape, plus draw) with compatible signatures. Delete one and
+-- `luabox check` reports LB0300 at this `---@class` line. See
+-- ../geometry/README.md for the exact error text.
 ---@class render.Square : geometry.Drawable
 local Square = {}
 Square.__index = Square

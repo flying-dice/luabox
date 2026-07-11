@@ -159,6 +159,15 @@ pub fn check_file_shaped(
     ambient: Option<&Ambient>,
 ) -> Vec<Diagnostic> {
     let items = luacats::harvest(parse);
+    // A `---@meta` definition package: its `---@class` declarations are
+    // contracts, not carriers, so no `: Interface` conformance runs inside it
+    // (#107).
+    let is_meta = items.iter().any(|it| {
+        it.block
+            .tags
+            .iter()
+            .any(|t| matches!(t, luacats::Tag::Meta(_)))
+    });
 
     let mut diags: Vec<Diagnostic> = Vec::new();
     let scope = shapes.map(ShapeOptions::scope);
@@ -184,8 +193,10 @@ pub fn check_file_shaped(
             &env,
             file,
             strictness == Strictness::Strict,
+            is_meta,
             &inference.expr_types,
             &inference.carrier_final,
+            &inference.carrier_class_final,
         ));
         diags.extend(inference.diags);
         inferred_types = inference.expr_types;

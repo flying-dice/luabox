@@ -16,7 +16,7 @@
 //! source in strict mode (SPEC.md §3). No inference beyond literals:
 //! TODO(P1) bidirectional inference, narrowing, metatables, method calls.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use luabox_diag::{Code, Diagnostic, Label, Severity, Span};
@@ -44,13 +44,16 @@ const BAD_INSTANTIATION: u16 = 2007;
 /// Run the checker over one parsed file. `inferred` carries the
 /// inference engine's expression types keyed by byte range — consulted
 /// where annotations are absent (annotations always win).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     parse: &lua::Parse,
     typeenv: &TypeEnv,
     file: &str,
     strict: bool,
+    is_meta: bool,
     inferred: &HashMap<(usize, usize), Ty>,
     carrier_final: &HashMap<(usize, usize), Ty>,
+    carrier_class_final: &HashMap<String, Ty>,
 ) -> Vec<Diagnostic> {
     let severity = if strict {
         Severity::Error
@@ -62,9 +65,12 @@ pub(crate) fn run(
         file,
         strict,
         severity,
+        is_meta,
         inferred,
         carrier_final,
+        carrier_class_final,
         deferred_carriers: Vec::new(),
+        class_obligations: Vec::new(),
         diags: Vec::new(),
         scopes: vec![HashMap::new()],
         ret_stack: Vec::new(),
@@ -96,6 +102,7 @@ pub(crate) fn run(
         checker.visit_block(&block);
     }
     checker.check_deferred_carriers();
+    checker.check_class_conformance();
 
     let mut diags = checker.diags;
     diags.sort_by_key(|d| d.primary_label().map_or(0, |l| l.span.range.start));
@@ -130,19 +137,44 @@ struct DeferredCarrier {
     span: Range<usize>,
 }
 
+/// A `---@class Name : Parent` carrier whose `: Interface` conformance is
+/// verified at end-of-walk against its final accumulated shape (#107). The
+/// obligation is the merged shape of its parent classes; the diagnostic is
+/// attributed to the `---@class` tag.
+struct ClassObligation {
+    /// The declared class name bound to the carrier statement.
+    name: String,
+    /// The carrier `local` statement's byte range — the key into
+    /// `carrier_final`.
+    decl_key: (usize, usize),
+    /// The `---@class` tag span the diagnostic is attributed to.
+    span: Range<usize>,
+}
+
 struct Checker<'a> {
     env: &'a TypeEnv,
     file: &'a str,
     strict: bool,
     severity: Severity,
+    /// This file is a `---@meta` definition package: its `---@class`
+    /// declarations are contracts, not carriers, so no conformance
+    /// obligation runs inside it (#107).
+    is_meta: bool,
     /// Inference results by byte range (rich table inference, SPEC.md §3):
     /// the fallback for expressions annotations cannot type.
     inferred: &'a HashMap<(usize, usize), Ty>,
     /// Final accumulated shape of each `---@type` carrier local, keyed by the
     /// `local` statement's byte range (SHAPES-V2.md whole-carrier deferral).
+    /// `---@class` carriers publish their reified shape here too (#107).
     carrier_final: &'a HashMap<(usize, usize), Ty>,
+    /// Reified accumulated shape of every `---@class` carrier keyed by class
+    /// name — the parent-carrier fallback for `: Interface` conformance (#107).
+    carrier_class_final: &'a HashMap<String, Ty>,
     /// Carriers whose conformance is deferred to `check_deferred_carriers`.
     deferred_carriers: Vec<DeferredCarrier>,
+    /// `---@class Name : Parent` obligations, verified by
+    /// `check_class_conformance` (#107).
+    class_obligations: Vec<ClassObligation>,
     diags: Vec<Diagnostic>,
     scopes: Vec<HashMap<String, Binding>>,
     /// Expected returns of the enclosing function(s); `None` = unannotated.
@@ -327,6 +359,25 @@ impl Checker<'_> {
     /// the names they define).
     fn visit_local(&mut self, local: &lua::ast::LocalStmt) {
         let key = range_key(local.syntax());
+        // A `---@class Name : Parent` bound to this carrier `local` incurs a
+        // conformance obligation (#107): defer it to the final accumulated
+        // shape. Skipped inside `---@meta` defs (declarations, not carriers)
+        // and for parentless classes (nothing to conform to).
+        if !self.is_meta
+            && let Some(name) = self.env.declared_target(key)
+            && self.env.class_parents(name).is_some_and(|p| !p.is_empty())
+        {
+            let name = name.to_string();
+            let span = self
+                .env
+                .class_tag_span(key)
+                .unwrap_or_else(|| range(local.syntax()));
+            self.class_obligations.push(ClassObligation {
+                name,
+                decl_key: key,
+                span,
+            });
+        }
         let types: Option<Vec<Ty>> = self.env.typed_local(key).map(<[Ty]>::to_vec);
         let sig = self.env.fn_sig(key).cloned();
         let names: Vec<String> = local
@@ -432,6 +483,165 @@ impl Checker<'_> {
                 expected_name,
             );
         }
+    }
+
+    /// Verify each `---@class Name : Parent` carrier against the interface(s)
+    /// it declares it extends (#107) — the strictness luals declares but does
+    /// not check.
+    ///
+    /// The obligation is every member the parent chain declares (the merged
+    /// [`TypeEnv::class_shape`] of each parent), *excluding* members `Name`
+    /// re-declares as its own `---@field` (those are governed by `Name`'s own
+    /// declaration). Each obliged member must be satisfied by the carrier's
+    /// FINAL accumulated shape. The rule, precisely — a member is satisfied
+    /// when it is:
+    ///
+    /// - **(a) provided by the carrier** — `function X:m()` / `X.f = ...`,
+    ///   *plus* anything inherited through a `setmetatable(X, { __index =
+    ///   Base })` chain, which [`infer::reify_shape`] already folds into the
+    ///   reified `carrier_final` shape. A provided member's type is checked
+    ///   against the parent's declaration via [`Checker::assignable`]
+    ///   (function subtyping absorbs `self`/receiver looseness); a mismatch is
+    ///   reported.
+    /// - **(b) inherited from a parent carrier** defined in this file and
+    ///   reachable through the class's parent chain — the fallback that
+    ///   covers the `X.__index = Base` idiom, whose delegation the carrier's
+    ///   own reified shape does not fold in. The inherited implementation is
+    ///   the base's concern, so its signature is not re-checked here.
+    /// - **(c) optional / nil-admitting in the parent** — no obligation.
+    ///
+    /// Only a member satisfied by none of these is reported missing. This is
+    /// what keeps classic inheritance from being wrongly flagged: a subclass
+    /// that inherits a concrete base method (idiom (a) or (b)) is silent.
+    fn check_class_conformance(&mut self) {
+        for ob in std::mem::take(&mut self.class_obligations) {
+            let Some(Ty::Table(provided)) = self.carrier_final.get(&ob.decl_key).cloned() else {
+                continue; // inference published no final shape (e.g. off)
+            };
+            let Some(parents) = self.env.class_parents(&ob.name) else {
+                continue;
+            };
+            let parents: Vec<String> = parents.to_vec();
+            // Members already handled — dedup across a diamond of parents.
+            let mut seen: HashSet<String> = HashSet::new();
+            for parent in &parents {
+                let Some(pshape) = self.env.class_shape(parent) else {
+                    continue;
+                };
+                for (member, field) in &pshape.fields {
+                    if !seen.insert(member.clone()) {
+                        continue;
+                    }
+                    // A member `Name` re-declares is its own declaration's
+                    // responsibility, not an inherited obligation.
+                    if self.env.class_declares_own(&ob.name, member) {
+                        continue;
+                    }
+                    // Optional / nil-admitting members impose no obligation.
+                    if field.optional || field.ty.admits_nil() {
+                        continue;
+                    }
+                    self.check_class_member(&ob, parent, member, field, &provided);
+                }
+            }
+        }
+    }
+
+    /// Check one obliged member against the carrier's final shape. See
+    /// [`Checker::check_class_conformance`] for the rule.
+    fn check_class_member(
+        &mut self,
+        ob: &ClassObligation,
+        parent: &str,
+        member: &str,
+        field: &FieldTy,
+        provided: &TableTy,
+    ) {
+        // (a) provided on the carrier (own members + `setmetatable` chain).
+        if let Some(actual) = provided.fields.get(member) {
+            let expected = if field.optional {
+                field.ty.clone().optional()
+            } else {
+                field.ty.clone()
+            };
+            if !self.assignable(&actual.ty, &expected) {
+                let detail =
+                    crate::assign::explain_mismatch(self.env, self.strict, &actual.ty, &expected)
+                        .map_or(String::new(), |d| format!(": {d}"));
+                self.report_class_conformance(
+                    ob.span.clone(),
+                    format!(
+                        "`{}` does not satisfy `{parent}`: member `{member}` has the wrong type",
+                        ob.name
+                    ),
+                    format!("expected `{expected}`, found `{}`{detail}", actual.ty),
+                    parent,
+                );
+            }
+            return;
+        }
+        // (b) inherited from a parent carrier in this file (the `X.__index =
+        //     Base` chain the reified carrier shape does not fold in).
+        if self.member_on_parent_carrier(&ob.name, member) {
+            return;
+        }
+        // (c) missing entirely.
+        self.report_class_conformance(
+            ob.span.clone(),
+            format!(
+                "`{}` does not satisfy `{parent}`: missing member `{member}`",
+                ob.name
+            ),
+            format!("expected member `{member}` of type `{}`", field.ty),
+            parent,
+        );
+    }
+
+    /// Whether `member` is defined on any parent carrier of `class` in this
+    /// file, walking the parent chain transitively. The parent-carrier
+    /// fallback of [`Checker::check_class_conformance`].
+    fn member_on_parent_carrier(&self, class: &str, member: &str) -> bool {
+        let mut stack: Vec<String> = self
+            .env
+            .class_parents(class)
+            .map(<[String]>::to_vec)
+            .unwrap_or_default();
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some(parent) = stack.pop() {
+            if !seen.insert(parent.clone()) {
+                continue;
+            }
+            if let Some(Ty::Table(shape)) = self.carrier_class_final.get(&parent)
+                && shape.fields.contains_key(member)
+            {
+                return true;
+            }
+            if let Some(grandparents) = self.env.class_parents(&parent) {
+                stack.extend(grandparents.iter().cloned());
+            }
+        }
+        false
+    }
+
+    /// Report an LB0300 `: Interface` conformance failure at the `---@class`
+    /// tag, with a "declared here" secondary label at the parent's in-file
+    /// declaration when it has one (ambient/defs parents have none) (#107).
+    fn report_class_conformance(
+        &mut self,
+        span: Range<usize>,
+        message: String,
+        label: String,
+        parent: &str,
+    ) {
+        let mut diag = Diagnostic::new(Code::new(TYPE_MISMATCH), self.severity, message)
+            .with_label(Label::primary(Span::new(self.file, span), label));
+        if let Some(range) = self.env.class_decl_span(parent) {
+            diag = diag.with_label(Label::secondary(
+                Span::new(self.file.to_string(), range),
+                format!("`{parent}` declared here"),
+            ));
+        }
+        self.diags.push(diag);
     }
 
     /// Enter a function body: parameters bound to their annotated types,

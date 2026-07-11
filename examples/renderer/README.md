@@ -56,15 +56,20 @@ binary while converting this example, not assumed:
 explicitly-labeled copy of the two classes renderer needs
 (`geometry.Shape`, `geometry.Drawable`) from `../geometry/defs/geometry.d.lua`.
 It is **not** kept in sync automatically — a real project doing this would
-need a manual process (or code generation) to detect drift. Read the
-comment at the top of that file for a sharper related finding: an
-`---@class X : Y` extends-clause where `Y` doesn't resolve to anything is
-**silently accepted with no diagnostic at all** — stricter positions
-(`---@type`, `---@param`, `---@field`) do raise `LB0305` for an unresolved
-name, but the extends-clause does not. Practically, that means this
-vendored file isn't even strictly required for `luabox check` to pass here
-— but omitting it would leave `geometry.Drawable` referring to nothing,
-which is worse than a stopgap; it would just be decorative.
+need a manual process (or code generation) to detect drift. But it IS now
+strictly required for `luabox check` to pass: as of #107 an `---@class X :
+Y` extends-clause where `Y` doesn't resolve raises `LB0305` at the parent
+reference, exactly like the stricter positions (`---@type`, `---@param`,
+`---@field`) always did. Delete this vendored file (and its `defs` manifest
+entry) and `src/square.lua`'s `: geometry.Drawable` reports:
+
+```
+error[LB0305]: unknown type name `geometry.Drawable` in annotation
+   --> src/square.lua:16:27
+   |
+16 | ---@class render.Square : geometry.Drawable
+   |                           ^^^^^^^^^^^^^^^^^ not a built-in, `---@class`, `---@alias`, or `---@enum` name
+```
 
 ## What this means for the carrier
 
@@ -76,15 +81,15 @@ local Square = {}
 ```
 
 Because `geometry.Drawable`'s definition (vendored, not shared) extends
-`geometry.Shape`, this single annotation is checked... except it isn't,
-really — see `../geometry/README.md`'s "silently permissive" section.
-Conformance to `Drawable` (area + perimeter + my_static + draw) is not
-verified here any more than it is inside `../geometry` itself. This example
-implements all four members anyway, because that's what a real Drawable
-should do — but `luabox check` would not have told us if we hadn't.
+`geometry.Shape`, this single annotation is checked — and as of #107 the
+conformance to `Drawable` (area + perimeter + my_static + draw) IS verified
+here, exactly as it is inside `../geometry`. This example implements all
+four members; delete any one and `luabox check` reports `LB0300` at the
+`---@class` line (`missing member \`draw\``, etc.) — see
+`../geometry/README.md` for the exact error format.
 
 ```sh
-luabox check        # 0 errors — but see the caveats above
+luabox check        # 0 errors — conformance and extends-clauses verified
 luabox fmt --check
 luabox lint
 luabox test

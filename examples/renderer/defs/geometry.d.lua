@@ -17,16 +17,16 @@
 -- (confirmed earlier in this same investigation with a plain, non-Drawable
 -- cross-package class — see the mission report).
 --
--- A sharper and quieter finding, specific to this file: an EXTENDS-clause
--- reference (the `: geometry.Drawable` in defs/render.d.lua's
--- `---@class render.Square : geometry.Drawable`) does NOT trigger LB0305
--- even when the name is completely unresolved — confirmed by temporarily
--- deleting this file and its `defs` manifest entry entirely: `luabox check`
--- still reported 0 errors. Extends-clause targets are apparently never
--- validated at all, which is a stricter form of the "conformance isn't
--- checked" gap documented in ../geometry/README.md: it's not just that
--- `geometry.Shape`'s members go unverified, it's that the named supertype
--- doesn't even have to exist.
+-- As of #107, an EXTENDS-clause reference in a CHECKED file (the `:
+-- geometry.Drawable` in ../src/square.lua's `---@class render.Square :
+-- geometry.Drawable`) DOES trigger LB0305 when the name is unresolved —
+-- confirmed by temporarily deleting this file and its `defs` manifest entry:
+-- `luabox check` then reports `error[LB0305]: unknown type name
+-- `geometry.Drawable`` at the parent reference in src/square.lua. So this
+-- vendored copy is now load-bearing for `luabox check` to pass, and
+-- `geometry.Shape`'s members are verified against the carrier too (the
+-- conformance gap documented in earlier revisions of ../geometry/README.md
+-- is closed).
 --
 -- So this file is not strictly load-bearing for `luabox check` to pass —
 -- but leaving it out would make `geometry.Drawable` a name that resolves to

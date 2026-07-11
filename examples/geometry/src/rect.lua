@@ -1,6 +1,11 @@
 -- Rect: the second Shape carrier. Same idiom as circle.lua — plain LuaCATS,
 -- the class reopened from ../defs/geometry.d.lua so `self.width`/
 -- `self.height` resolve to `number` without repeating the fields here.
+--
+-- CONFORMANCE (#107): `: geometry.Shape` is verified here too — Rect must
+-- provide area/perimeter/my_static with compatible signatures, or `luabox
+-- check` reports LB0300 at this `---@class` line (see circle.lua for the
+-- exact error text).
 ---@class geometry.Rect : geometry.Shape
 local Rect = {}
 Rect.__index = Rect

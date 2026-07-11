@@ -68,6 +68,16 @@ pub struct TypeEnv {
     /// annotate (the carrier `local`). Inference uses this to associate a
     /// locally-constructed table with its declaration.
     declared_targets: HashMap<Target, String>,
+    /// The `---@class` tag span keyed by the carrier statement it annotates —
+    /// the anchor a `: Interface` conformance error (LB0300) points at
+    /// (mirrors [`Self::typed_local_spans`] for the `---@type` path). #107.
+    class_tag_spans: HashMap<Target, std::ops::Range<usize>>,
+    /// The `---@class` tag span keyed by the class *name*, for classes
+    /// declared in *this* file — the secondary "declared here" label a
+    /// conformance error attaches to the parent it names (#107). Only
+    /// same-file classes are recorded; ambient/defs parents have no in-file
+    /// span to point at.
+    class_decl_spans: BTreeMap<String, std::ops::Range<usize>>,
     /// Ambient / global values by name: stdlib module tables (`string`,
     /// `math`, ...) and scalar globals (`_VERSION`) declared by definition
     /// packages (`---@meta` `.d.lua`). Populated only for the ambient
@@ -339,6 +349,14 @@ impl TypeEnv {
                             _ => None,
                         })
                         .collect();
+                    // Validate each parent reference: lowering a `: Base` that
+                    // no class/alias/enum/shape declares records an unknown
+                    // name at the parent's own span → LB0305 (#107). Forward
+                    // references and defs/ambient parents already sit in the
+                    // lowerer's declared-name universe, so they do not fire.
+                    for parent in &c.parents {
+                        lowerer.lower(parent);
+                    }
                     self.classes.insert(
                         c.name.clone(),
                         ClassDef {
@@ -347,9 +365,13 @@ impl TypeEnv {
                         },
                     );
                     current_class = Some(c.name.clone());
+                    self.class_decl_spans
+                        .insert(c.name.clone(), c.span.start..c.span.end);
                     if let Some(span) = item.target {
                         self.declared_targets
                             .insert((span.start, span.end), c.name.clone());
+                        self.class_tag_spans
+                            .insert((span.start, span.end), c.span.start..c.span.end);
                     }
                 }
                 Tag::Field(f) => {
@@ -669,6 +691,34 @@ impl TypeEnv {
     /// The `---@class`/`---@struct` name bound to a statement, if any.
     pub(crate) fn declared_target(&self, target: Target) -> Option<&str> {
         self.declared_targets.get(&target).map(String::as_str)
+    }
+
+    /// The `---@class` tag span on the carrier statement `target` — the
+    /// anchor a `: Interface` conformance error points at (#107).
+    pub(crate) fn class_tag_span(&self, target: Target) -> Option<std::ops::Range<usize>> {
+        self.class_tag_spans.get(&target).cloned()
+    }
+
+    /// The in-file `---@class` tag span of `name`, when it is declared in the
+    /// file under check — the "declared here" secondary label for a parent a
+    /// conformance error names (#107). `None` for ambient/defs classes.
+    pub(crate) fn class_decl_span(&self, name: &str) -> Option<std::ops::Range<usize>> {
+        self.class_decl_spans.get(name).cloned()
+    }
+
+    /// The declared parents of a `---@class`, in declaration order.
+    pub(crate) fn class_parents(&self, name: &str) -> Option<&[String]> {
+        self.classes.get(name).map(|def| def.parents.as_slice())
+    }
+
+    /// Whether `name` declares `field` as one of its *own* `---@field`s (as
+    /// opposed to inheriting it) — the set a conformance obligation excludes,
+    /// since a re-declared member is governed by the class's own declaration
+    /// rather than the parent's (#107).
+    pub(crate) fn class_declares_own(&self, name: &str, field: &str) -> bool {
+        self.classes
+            .get(name)
+            .is_some_and(|def| def.fields.contains_key(field))
     }
 
     /// The `---@cast` overrides attached to a statement, if any.

@@ -94,8 +94,16 @@ pub(crate) struct Outcome {
     /// (`local X = {}` extended by later `X.f = ...` / `function X:m()`),
     /// keyed by the `local` statement's byte range. The whole-carrier shape
     /// the checker's deferred `---@type` conformance check runs against
-    /// (SHAPES-V2.md).
+    /// (SHAPES-V2.md). `---@class Name : Parent` carriers publish their
+    /// reified accumulated shape here too, keyed by the `local` statement, so
+    /// the checker can verify `: Interface` conformance (#107).
     pub(crate) carrier_final: HashMap<Key, Ty>,
+    /// Reified accumulated shape of every `---@class` carrier, keyed by the
+    /// class *name* — the parent-carrier lookup the `: Interface` conformance
+    /// check consults so a member inherited from a same-file base carrier via
+    /// a `Child.__index = Base` chain (which the carrier's own reified shape
+    /// does not fold in) is still counted as provided (#107).
+    pub(crate) carrier_class_final: HashMap<String, Ty>,
 }
 
 /// Cross-file inputs to display-mode inference, assembled by the analysis
@@ -173,6 +181,7 @@ pub(crate) fn run(
         instances: HashMap::new(),
         declared_carriers: HashMap::new(),
         carrier_locals: HashMap::new(),
+        class_carrier_locals: HashMap::new(),
         carrier_keys: HashSet::new(),
         funcs: HashMap::new(),
         param_seeds: HashMap::new(),
@@ -220,6 +229,25 @@ pub(crate) fn run(
             carrier_final.insert(key, ty);
         }
     }
+    // `---@class` carriers publish their final reified shape twice: keyed by
+    // the `local` statement (so the checker can attribute an obligation to the
+    // exact carrier) and by class name (the parent-carrier fallback). The
+    // reified shape folds in `setmetatable(X, { __index = Base })`-style
+    // inheritance via `reify_shape`'s `__index` walk; the name-keyed map
+    // covers the `X.__index = Base` chain the carrier's own shape omits (#107).
+    let class_carriers: Vec<(Key, BindingId, String)> = infer
+        .class_carrier_locals
+        .iter()
+        .map(|(k, (b, n))| (*k, *b, n.clone()))
+        .collect();
+    let mut carrier_class_final = HashMap::new();
+    for (key, binding, name) in class_carriers {
+        if let Some(ity) = infer.state.get(&binding).cloned() {
+            let ty = infer.reify(&ity);
+            carrier_final.entry(key).or_insert_with(|| ty.clone());
+            carrier_class_final.insert(name, ty);
+        }
+    }
     Outcome {
         expr_types: infer.expr_types,
         diags: infer.diags,
@@ -228,6 +256,7 @@ pub(crate) fn run(
         module_export,
         outgoing_calls: infer.outgoing,
         carrier_final,
+        carrier_class_final,
     }
 }
 
@@ -407,6 +436,11 @@ struct Infer<'a> {
     /// byte range → the carrier binding. Their final shape is published as
     /// [`Outcome::carrier_final`] for the deferred conformance check.
     carrier_locals: HashMap<Key, BindingId>,
+    /// `---@class Name : ...` carriers (`local X = {}` tagged with a class
+    /// that has parents), keyed by the `local` statement's byte range → the
+    /// carrier binding, plus the class name. Their final reified shape feeds
+    /// the checker's `: Interface` conformance check (#107).
+    class_carrier_locals: HashMap<Key, (BindingId, String)>,
     /// The statement keys classified as carriers in pass 0, reused verbatim
     /// in pass 1 so the keep-the-shape decision (rather than freeze to the
     /// annotated type) is identical across passes.
@@ -1178,7 +1212,12 @@ impl Infer<'_> {
             if let Some(ITy::Shape(id)) = self.state.get(&local.binding) {
                 let id = *id;
                 self.shapes[id].declared = Some(name.clone());
-                self.declared_carriers.insert(name, id);
+                self.declared_carriers.insert(name.clone(), id);
+                // A `---@class Name : Parent` carrier: record it so its final
+                // reified shape can be checked for `: Interface` conformance
+                // (#107). Parentless classes carry no obligation, so the
+                // checker skips them; recording them here is harmless.
+                self.class_carrier_locals.insert(key, (local.binding, name));
             }
         }
     }

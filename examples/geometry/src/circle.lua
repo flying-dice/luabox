@@ -7,15 +7,19 @@
 -- inferred as `geometry.Circle` through the `__index` metatable chain, no
 -- extra annotation needed (SPEC.md).
 --
--- NOTE (gap): the `: geometry.Shape` here is NOT verified. luabox does not
--- check that Circle actually implements area/perimeter/my_static — comment
--- out `Circle:perimeter` below and run `luabox check`: it still reports
--- 0 errors. A rigorous checker would report something like:
---   error: `geometry.Circle` does not satisfy `geometry.Shape`: missing `perimeter`
--- Today it passes silently. This is the trade luabox's `.luab` shape modules
--- exist to avoid (structural conformance IS checked there — see ../renderer
--- for the .luab-era version of this same example, and the mission report
--- for the exact commands used to confirm this gap against the real binary).
+-- CONFORMANCE (#107): the `: geometry.Shape` here IS verified. luabox checks
+-- that this carrier provides every member geometry.Shape declares
+-- (area/perimeter/my_static) with a compatible signature — comment out
+-- `Circle:perimeter` below and run `luabox check` and it now reports:
+--   error[LB0300]: `geometry.Circle` does not satisfy `geometry.Shape`: missing member `perimeter`
+--    --> src/circle.lua:19:4
+--    | ---@class geometry.Circle : geometry.Shape
+--    |    ^^^ expected member `perimeter` of type `fun(self: unknown): number`
+-- The check is `__index`-aware, so a subclass inheriting a concrete base
+-- method through its metatable chain is not wrongly asked to re-implement it.
+-- This is the structural conformance luabox's `.luab` shape modules used to
+-- be needed for — now on the plain-LuaCATS path (verified against the real
+-- binary while building this example).
 ---@class geometry.Circle : geometry.Shape
 local Circle = {}
 Circle.__index = Circle

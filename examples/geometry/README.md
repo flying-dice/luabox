@@ -57,6 +57,25 @@ luabox test          # 9 passing tests
 
 - **`---@class` + `---@field`, `---@param`/`---@return`.** Full support,
   same as any LuaLS-aware editor.
+- **`: Interface` conformance IS verified** (#107 — the strictness luals
+  declares but trusts). A `---@class geometry.Circle : geometry.Shape`
+  carrier must actually provide every member `geometry.Shape` declares, with
+  a compatible signature. Delete `Circle:perimeter` from `src/circle.lua`
+  and `luabox check` now reports (reproduced against this exact file, then
+  reverted):
+  ```
+  error[LB0300]: `geometry.Circle` does not satisfy `geometry.Shape`: missing member `perimeter`
+     --> src/circle.lua:19:4
+     |
+  19 | ---@class geometry.Circle : geometry.Shape
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected member `perimeter` of type `fun(self: unknown): number`
+  ```
+  Give a member the wrong type (e.g. `Circle:area` returning a `string`) and
+  it is flagged the same way (`member \`area\` has the wrong type`). The check
+  is `__index`-aware: a subclass that inherits a concrete base method through
+  its metatable chain is **not** told to re-implement it, so classic
+  inheritance stays clean. This is exactly the structural conformance the
+  `.luab` shape modules used to be needed for — now on the plain-LuaCATS path.
 - **Literal sealing.** `---@type geometry.Point` on a table literal enforces
   every non-optional field present and rejects unknown keys — `LB0300`
   ("missing `y`") / `LB0303` ("unknown field `z`"). This is **not** a
@@ -79,19 +98,6 @@ luabox test          # 9 passing tests
 
 ## What is silently permissive (verified, not avoided)
 
-- **Inheritance/conformance is NOT checked.** `---@class geometry.Circle :
-  geometry.Shape` is never verified against `geometry.Shape`'s members.
-  `src/circle.lua` and `src/rect.lua` carry a NOTE (gap) at the top of each
-  showing this precisely: comment out `Circle:perimeter` entirely and
-  `luabox check` still reports **0 errors** — confirmed against this exact
-  file (temporarily, then reverted) while building this example. A rigorous
-  checker would report something like:
-  ```
-  error: `geometry.Circle` does not satisfy `geometry.Shape`: missing `perimeter`
-  ```
-  Today, nothing does. This is precisely what `.luab` shape modules exist to
-  guarantee (their structural conformance IS checked, member-by-member) —
-  see `../renderer`'s history for the `.luab`-era version of this contrast.
 - **Field access is permissive.** `self.nope` inside a `geometry.Circle`
   method — a field declared nowhere on `geometry.Circle` or
   `geometry.Shape` — is not flagged either. Also confirmed live against this
@@ -129,8 +135,9 @@ luabox test          # 9 passing tests
   see `../renderer` and the mission report for where a generic function
   would otherwise have been reached for.)
 
-Conformance checking and real generics are both slated to land with the
-`.luab` drop epic (#84 etc.) — until then, this is the accurate picture.
+`: Interface` conformance is now checked (see above); real generics are
+still slated to land with the `.luab` drop epic (#84 etc.) — until then,
+this is the accurate picture.
 
 ## Constructors under LuaCATS
 
