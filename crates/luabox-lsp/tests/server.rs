@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId};
 use lsp_types::notification::{
-    DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Exit, Initialized,
-    Notification as _, PublishDiagnostics,
+    DidChangeConfiguration, DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument,
+    DidOpenTextDocument, Exit, Initialized, Notification as _, Progress, PublishDiagnostics,
 };
 use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
@@ -21,21 +21,23 @@ use lsp_types::request::{
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
-    CodeActionContext, CodeActionKind, CodeActionOrCommand, CodeActionParams, CompletionItemKind,
-    CompletionParams, CompletionResponse, DiagnosticSeverity, DidChangeTextDocumentParams,
+    ClientCapabilities, CodeActionContext, CodeActionKind, CodeActionOrCommand, CodeActionParams,
+    CompletionItemKind, CompletionParams, CompletionResponse, DiagnosticSeverity,
+    DidChangeConfigurationParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
     DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
-    DocumentRangeFormattingParams, DocumentSymbolParams, DocumentSymbolResponse, FoldingRange,
-    FoldingRangeKind, FoldingRangeParams, FormattingOptions, GotoDefinitionParams,
-    GotoDefinitionResponse, HoverContents, HoverParams, InitializeParams, InlayHint,
-    InlayHintLabel, InlayHintParams, NumberOrString, ParameterLabel, PartialResultParams, Position,
-    PrepareRenameResponse, PublishDiagnosticsParams, Range, ReferenceContext, ReferenceParams,
-    RenameParams, SelectionRange, SelectionRangeParams, SemanticToken, SemanticTokensParams,
+    DocumentRangeFormattingParams, DocumentSymbolParams, DocumentSymbolResponse, FileChangeType,
+    FileEvent, FoldingRange, FoldingRangeKind, FoldingRangeParams, FormattingOptions,
+    GotoDefinitionParams, GotoDefinitionResponse, HoverContents, HoverParams, InitializeParams,
+    InlayHint, InlayHintLabel, InlayHintParams, NumberOrString, ParameterLabel,
+    PartialResultParams, Position, PrepareRenameResponse, ProgressParams, ProgressParamsValue,
+    PublishDiagnosticsParams, Range, ReferenceContext, ReferenceParams, RenameParams,
+    SelectionRange, SelectionRangeParams, SemanticToken, SemanticTokensParams,
     SemanticTokensResult, SignatureHelp, SignatureHelpParams, SymbolInformation, SymbolKind,
     TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, TextEdit, Uri, VersionedTextDocumentIdentifier,
-    WorkDoneProgressParams, WorkspaceEdit, WorkspaceFolder, WorkspaceSymbolParams,
-    WorkspaceSymbolResponse,
+    WindowClientCapabilities, WorkDoneProgress, WorkDoneProgressParams, WorkspaceEdit,
+    WorkspaceFolder, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use tempfile::TempDir;
 
@@ -53,6 +55,13 @@ struct TestClient {
 /// Create a project on disk, start the server on an in-memory connection,
 /// and complete the initialize handshake.
 fn start(files: &[(&str, &str)]) -> TestClient {
+    start_with(files, ClientCapabilities::default())
+}
+
+/// Like [`start`], but with explicit client capabilities — used to opt into
+/// optional protocol features (e.g. work-done progress) that are off by
+/// default in the plain harness.
+fn start_with(files: &[(&str, &str)], capabilities: ClientCapabilities) -> TestClient {
     let dir = TempDir::new().expect("tempdir");
     let root = dir.path().canonicalize().expect("canonicalize");
     for (rel, text) in files {
@@ -73,6 +82,7 @@ fn start(files: &[(&str, &str)]) -> TestClient {
             uri: root_uri,
             name: "test".to_string(),
         }]),
+        capabilities,
         ..InitializeParams::default()
     };
     let mut client = TestClient {
@@ -182,6 +192,65 @@ impl TestClient {
             }],
         });
         self.wait_diagnostics(uri)
+    }
+
+    /// Send an incremental (ranged) change batch and return the resulting
+    /// diagnostics. Each change is relative to the state after the previous.
+    fn change_incremental(
+        &self,
+        uri: &Uri,
+        changes: Vec<TextDocumentContentChangeEvent>,
+    ) -> Vec<lsp_types::Diagnostic> {
+        self.notify::<DidChangeTextDocument>(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: uri.clone(),
+                version: 2,
+            },
+            content_changes: changes,
+        });
+        self.wait_diagnostics(uri)
+    }
+
+    /// Notify `workspace/didChangeConfiguration` (the settings payload is
+    /// unused — the server re-reads `luabox.toml` from disk).
+    fn notify_config_changed(&self) {
+        self.notify::<DidChangeConfiguration>(DidChangeConfigurationParams {
+            settings: serde_json::Value::Null,
+        });
+    }
+
+    /// Notify `workspace/didChangeWatchedFiles` that `rel` changed on disk.
+    fn notify_watched_change(&self, rel: &str) {
+        self.notify::<DidChangeWatchedFiles>(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: self.uri(rel),
+                typ: FileChangeType::CHANGED,
+            }],
+        });
+    }
+
+    /// Collect the `$/progress` notification kinds ("begin"/"report"/"end")
+    /// until (and including) the terminating "end".
+    fn drain_progress(&self) -> Vec<&'static str> {
+        let mut kinds = Vec::new();
+        loop {
+            if let Message::Notification(not) = self.recv()
+                && not.method == Progress::METHOD
+            {
+                let params: ProgressParams =
+                    serde_json::from_value(not.params).expect("decode progress");
+                let ProgressParamsValue::WorkDone(value) = params.value;
+                let kind = match value {
+                    WorkDoneProgress::Begin(_) => "begin",
+                    WorkDoneProgress::Report(_) => "report",
+                    WorkDoneProgress::End(_) => "end",
+                };
+                kinds.push(kind);
+                if kind == "end" {
+                    return kinds;
+                }
+            }
+        }
     }
 
     fn close(&self, uri: &Uri) -> Vec<lsp_types::Diagnostic> {
@@ -569,6 +638,15 @@ fn range(start: (u32, u32), end: (u32, u32)) -> Range {
     }
 }
 
+/// A ranged `didChange` content change replacing `[start, end)` with `text`.
+fn ranged_change(start: (u32, u32), end: (u32, u32), text: &str) -> TextDocumentContentChangeEvent {
+    TextDocumentContentChangeEvent {
+        range: Some(range(start, end)),
+        range_length: None,
+        text: text.to_string(),
+    }
+}
+
 /// The source text covered by an LSP range (UTF-16 positions → bytes via the
 /// same line index the server uses), for asserting an edit is name-precise.
 fn edit_text(source: &str, range: Range) -> &str {
@@ -642,9 +720,9 @@ f(1)
 fn initialize_advertises_tranche_one_capabilities() {
     let client = start(&[]);
     let caps = &client.init_result["capabilities"];
-    // Full sync (documented tranche-1 choice), hover, definition,
-    // documentSymbol, and completion triggered by `.` / `:`.
-    assert_eq!(caps["textDocumentSync"], 1);
+    // Incremental sync (kind 2), hover, definition, documentSymbol, and
+    // completion triggered by `.` / `:`.
+    assert_eq!(caps["textDocumentSync"], 2);
     assert_eq!(caps["hoverProvider"], true);
     assert_eq!(caps["definitionProvider"], true);
     assert_eq!(caps["documentSymbolProvider"], true);
@@ -2659,6 +2737,175 @@ fn incoming_calls_group_top_level_calls_under_a_module_item() {
     assert_eq!(calls[0].from.kind, SymbolKind::MODULE);
     assert!(calls[0].from.name.ends_with("b.lua"), "{calls:?}");
     assert_eq!(calls[0].from_ranges, vec![range((0, 0), (0, 5))]);
+    client.shutdown();
+}
+
+// === Protocol maturity: incremental sync =================================
+
+#[test]
+fn initialize_advertises_incremental_sync() {
+    let client = start(&[]);
+    // Kind 2 is `TextDocumentSyncKind::INCREMENTAL`.
+    assert_eq!(client.init_result["capabilities"]["textDocumentSync"], 2);
+    client.shutdown();
+}
+
+#[test]
+fn incremental_ranged_insert_introduces_error_at_precise_range() {
+    // Open a clean document, then splice `"no"` over the `1` in `f(1)`. The
+    // resulting `f("no")` must diagnose at exactly the spliced span, proving
+    // the ranged insert landed at the right byte offset.
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    assert!(client.open(&uri, TYPE_OK).is_empty());
+    let diags = client.change_incremental(&uri, vec![ranged_change((2, 2), (2, 3), "\"no\"")]);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(code_of(&diags[0]), "LB0300");
+    assert_eq!(diags[0].range, range((2, 2), (2, 6)));
+    client.shutdown();
+}
+
+#[test]
+fn incremental_ranged_deletion_removes_a_whole_line() {
+    // A document with an offending call on line 2 and a valid one on line 3;
+    // deleting line 2 (a cross-line-boundary range) must clear the diagnostic.
+    let src = "\
+---@param n number
+local function f(n) end
+f(\"no\")
+f(1)
+";
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    assert_eq!(client.open(&uri, src).len(), 1);
+    // Delete line 2 entirely: (2,0)..(3,0) → "".
+    let diags = client.change_incremental(&uri, vec![ranged_change((2, 0), (3, 0), "")]);
+    assert!(diags.is_empty(), "{diags:?}");
+    client.shutdown();
+}
+
+#[test]
+fn incremental_batch_applies_changes_in_dependent_order() {
+    // Two changes in one batch: the first inserts a blank line at the top
+    // (shifting everything down one line), the second edits at line 3 — a
+    // coordinate that only exists *after* the first change. Applying against
+    // the original text would map line 3 wrongly.
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    assert!(client.open(&uri, TYPE_OK).is_empty());
+    let diags = client.change_incremental(
+        &uri,
+        vec![
+            ranged_change((0, 0), (0, 0), "\n"),
+            ranged_change((3, 2), (3, 3), "\"no\""),
+        ],
+    );
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(code_of(&diags[0]), "LB0300");
+    // `f("no")` is now on line 3 (pushed down by the inserted blank line).
+    assert_eq!(diags[0].range, range((3, 2), (3, 6)));
+    client.shutdown();
+}
+
+#[test]
+fn incremental_full_replace_swaps_whole_document() {
+    // A change with no range replaces the entire buffer.
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    assert!(client.open(&uri, TYPE_OK).is_empty());
+    let diags = client.change_incremental(
+        &uri,
+        vec![TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: TYPE_ERROR.to_string(),
+        }],
+    );
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(code_of(&diags[0]), "LB0300");
+    client.shutdown();
+}
+
+// === Protocol maturity: work-done progress ===============================
+
+#[test]
+fn bootstrap_reports_work_done_progress_when_supported() {
+    // A client that advertises window.workDoneProgress gets a begin/report/end
+    // progress sequence for the startup workspace index.
+    let caps = ClientCapabilities {
+        window: Some(WindowClientCapabilities {
+            work_done_progress: Some(true),
+            ..WindowClientCapabilities::default()
+        }),
+        ..ClientCapabilities::default()
+    };
+    let client = start_with(&[("a.lua", "return {}\n")], caps);
+    let kinds = client.drain_progress();
+    assert_eq!(kinds.first(), Some(&"begin"), "{kinds:?}");
+    assert_eq!(kinds.last(), Some(&"end"), "{kinds:?}");
+    assert!(kinds.contains(&"report"), "{kinds:?}");
+    client.shutdown();
+}
+
+// === Protocol maturity: didChangeConfiguration ===========================
+
+#[test]
+fn did_change_configuration_reloads_strictness() {
+    // No manifest → warn. Open a type error and see a warning. Then write a
+    // strict manifest and notify configuration change: the same open buffer's
+    // diagnostic is republished as an error, without a restart.
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let diags = client.open(&uri, TYPE_ERROR);
+    assert_eq!(diags[0].severity, Some(DiagnosticSeverity::WARNING));
+
+    let manifest = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n\n[types]\nstrict = true\n";
+    std::fs::write(client.root.join("luabox.toml"), manifest).expect("write manifest");
+    client.notify_config_changed();
+
+    let diags = client.wait_diagnostics(&uri);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
+    client.shutdown();
+}
+
+// === Protocol maturity: didChangeWatchedFiles ============================
+
+#[test]
+fn did_change_watched_files_reloads_external_edit() {
+    // A file that is on disk but never opened; an external edit introduces an
+    // error, and the watched-files notification makes the server re-read it and
+    // republish diagnostics.
+    let client = start(&[("mod.lua", TYPE_OK)]);
+    let uri = client.uri("mod.lua");
+    std::fs::write(client.root.join("mod.lua"), TYPE_ERROR).expect("rewrite mod.lua");
+    client.notify_watched_change("mod.lua");
+    let diags = client.wait_diagnostics(&uri);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(code_of(&diags[0]), "LB0300");
+    client.shutdown();
+}
+
+#[test]
+fn did_change_watched_files_reloads_manifest() {
+    // Editing `luabox.toml` externally reloads config and republishes open
+    // documents — flipping strict turns an open warning into an error.
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let diags = client.open(&uri, TYPE_ERROR);
+    assert_eq!(diags[0].severity, Some(DiagnosticSeverity::WARNING));
+
+    let manifest = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n\n[types]\nstrict = true\n";
+    std::fs::write(client.root.join("luabox.toml"), manifest).expect("write manifest");
+    client.notify::<DidChangeWatchedFiles>(DidChangeWatchedFilesParams {
+        changes: vec![FileEvent {
+            uri: client.uri("luabox.toml"),
+            typ: FileChangeType::CHANGED,
+        }],
+    });
+
+    let diags = client.wait_diagnostics(&uri);
+    assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
     client.shutdown();
 }
 

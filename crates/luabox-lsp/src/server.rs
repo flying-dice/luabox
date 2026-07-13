@@ -3,47 +3,53 @@
 //!
 //! # Protocol choices (tranche 1)
 //!
-//! - **Sync**: `textDocumentSync` is **Full** — every `didChange` carries the
-//!   whole buffer, which maps 1:1 onto the analysis host's
-//!   `SetOverlay { text }`. Incremental sync is a later optimisation; the
-//!   salsa layer already avoids re-analysing unaffected files.
+//! - **Sync**: `textDocumentSync` is **Incremental** — each `didChange`
+//!   carries a batch of ranged edits, applied in order against the current
+//!   overlay text (see [`apply_content_changes`]) to produce the new buffer,
+//!   which then maps onto the analysis host's `SetOverlay { text }`. The salsa
+//!   layer already avoids re-analysing unaffected files.
 //! - **Positions**: UTF-16 (the protocol default; no `positionEncoding`
 //!   negotiation), converted at the boundary by
 //!   [`LineIndex`](crate::line_index::LineIndex).
 //! - **Diagnostics**: pushed via `textDocument/publishDiagnostics` after
 //!   every open/change/close, computed from a fresh [`Analysis`] snapshot.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use lsp_types::notification::{
-    DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Notification as _,
-    PublishDiagnostics,
+    DidChangeConfiguration, DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument,
+    DidOpenTextDocument, Notification as _, Progress, PublishDiagnostics,
 };
 use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
     CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest,
     FoldingRangeRequest, Formatting, GotoDefinition, GotoImplementation, GotoTypeDefinition,
-    HoverRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting, References, Rename,
-    Request as _, SelectionRangeRequest, SemanticTokensFullRequest, SignatureHelpRequest,
-    WorkspaceSymbolRequest,
+    HoverRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting, References,
+    RegisterCapability, Rename, Request as _, SelectionRangeRequest, SemanticTokensFullRequest,
+    SignatureHelpRequest, WorkDoneProgressCreate, WorkspaceSymbolRequest,
 };
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyItem, CallHierarchyOutgoingCall,
     CallHierarchyServerCapability, CodeAction, CodeActionKind, CodeActionOrCommand,
     CodeActionProviderCapability, CompletionOptions, CompletionResponse,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentHighlight, DocumentSymbolResponse, FoldingRange, FoldingRangeProviderCapability,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DocumentHighlight, DocumentSymbolResponse, FileChangeType,
+    FileSystemWatcher, FoldingRange, FoldingRangeProviderCapability, GlobPattern,
     GotoDefinitionResponse, Hover, HoverProviderCapability, ImplementationProviderCapability,
     InitializeParams, InitializeResult, InlayHint, Location, OneOf, PrepareRenameResponse,
-    PublishDiagnosticsParams, RenameOptions, SelectionRange, SelectionRangeProviderCapability,
+    ProgressParams, ProgressParamsValue, ProgressToken, PublishDiagnosticsParams, Registration,
+    RegistrationParams, RenameOptions, SelectionRange, SelectionRangeProviderCapability,
     SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensResult,
     SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelp,
-    SignatureHelpOptions, SymbolInformation, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextEdit, TypeDefinitionProviderCapability, Uri, WorkspaceEdit, WorkspaceSymbolResponse,
+    SignatureHelpOptions, SymbolInformation, TextDocumentContentChangeEvent,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, TypeDefinitionProviderCapability,
+    Uri, WorkDoneProgress, WorkDoneProgressBegin, WorkDoneProgressCreateParams,
+    WorkDoneProgressEnd, WorkDoneProgressReport, WorkspaceEdit, WorkspaceSymbolResponse,
 };
 use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
 use luabox_lint::{LintConfig, lint_source};
@@ -84,15 +90,34 @@ pub fn run(connection: Connection) -> anyhow::Result<()> {
     };
     connection.initialize_finish(id, serde_json::to_value(result)?)?;
 
+    // Client capabilities that gate optional protocol features: work-done
+    // progress for the bootstrap index, and dynamic file-watcher registration.
+    let work_done_progress = params
+        .capabilities
+        .window
+        .as_ref()
+        .and_then(|w| w.work_done_progress)
+        .unwrap_or(false);
+    let watch_files = params
+        .capabilities
+        .workspace
+        .as_ref()
+        .and_then(|w| w.did_change_watched_files.as_ref())
+        .and_then(|d| d.dynamic_registration)
+        .unwrap_or(false);
+
     let root = root_path(&params)
         .or_else(|| std::env::current_dir().ok())
         .context("cannot determine a workspace root")?;
     let mut server = Server::new(connection, root);
-    server.bootstrap();
+    if watch_files {
+        server.register_file_watchers();
+    }
+    server.bootstrap(work_done_progress);
     server.main_loop()
 }
 
-/// The capabilities advertised at initialize: full sync, hover, definition,
+/// The capabilities advertised at initialize: incremental sync, hover, definition,
 /// completion triggered on `.`/`:`, document symbols, whole-document and
 /// range formatting (range formats the whole document — see [`crate::fmt`]),
 /// semantic tokens (full) with a standard-types-only legend, inlay hints
@@ -108,7 +133,9 @@ pub fn run(connection: Connection) -> anyhow::Result<()> {
 /// see [`crate::call_hierarchy`]).
 fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
-        text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+        text_document_sync: Some(TextDocumentSyncCapability::Kind(
+            TextDocumentSyncKind::INCREMENTAL,
+        )),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         definition_provider: Some(OneOf::Left(true)),
         signature_help_provider: Some(SignatureHelpOptions {
@@ -348,6 +375,10 @@ struct Server {
     /// `luabox lint` derives it, so the `undefined-global` rule sees the same
     /// globals in the editor as under the CLI.
     known_globals: HashSet<String>,
+    /// The currently open documents (by path → URI), tracked from
+    /// didOpen/didClose so a `workspace/didChangeConfiguration` can republish
+    /// diagnostics for every open buffer after a settings change.
+    open_docs: HashMap<PathBuf, Uri>,
 }
 
 impl Server {
@@ -365,12 +396,125 @@ impl Server {
             ambient,
             lint: config.lint,
             known_globals,
+            open_docs: HashMap::new(),
+        }
+    }
+
+    /// Re-read `luabox.toml` and rebuild every cached setting derived from it —
+    /// `strictness`, `lint`, the ambient definition layer, and the
+    /// `known_globals` baseline — so a `workspace/didChangeConfiguration` (or a
+    /// watched-file edit to the manifest) takes effect without a restart. The
+    /// host's project strictness is updated in lock-step, and a dialect change
+    /// re-parses every known file under the new dialect. Diagnostics for open
+    /// documents are then republished so the change is reflected immediately.
+    fn reload_config(&mut self) -> anyhow::Result<()> {
+        let config = ProjectConfig::discover(&self.root);
+        let ambient = combined_defs(config.dialect, &config.def_sources);
+        self.known_globals = ambient.global_names().clone();
+        self.ambient = ambient;
+        self.lint = config.lint;
+        self.strictness = config.strictness;
+        self.out_dir = config.out_dir;
+        self.host
+            .apply_change(Change::SetStrictness(config.strictness));
+        if config.dialect != self.dialect {
+            self.dialect = config.dialect;
+            let paths: Vec<PathBuf> = self
+                .host
+                .snapshot()
+                .files()
+                .map(Path::to_path_buf)
+                .collect();
+            for path in paths {
+                self.host.apply_change(Change::SetDialect {
+                    path,
+                    dialect: config.dialect,
+                });
+            }
+        }
+        self.republish_open_docs()
+    }
+
+    /// Republish diagnostics for every currently open document from a fresh
+    /// snapshot — used after a configuration reload changes the cached
+    /// strictness/lint/ambient so the visible diagnostics reflect it.
+    fn republish_open_docs(&mut self) -> anyhow::Result<()> {
+        for (path, uri) in self.open_docs.clone() {
+            self.publish_lua(&uri, &path)?;
+        }
+        Ok(())
+    }
+
+    /// Ask the client (dynamic registration) to watch the project's `.lua`
+    /// files and `luabox.toml`, so external edits arrive as
+    /// `workspace/didChangeWatchedFiles`. Only sent when the client advertised
+    /// `workspace.didChangeWatchedFiles.dynamicRegistration`.
+    fn register_file_watchers(&self) {
+        let options = DidChangeWatchedFilesRegistrationOptions {
+            watchers: ["**/*.lua", "**/luabox.toml"]
+                .into_iter()
+                .map(|glob| FileSystemWatcher {
+                    glob_pattern: GlobPattern::String(glob.to_string()),
+                    kind: None,
+                })
+                .collect(),
+        };
+        let registration = Registration {
+            id: "luabox-watch-files".to_string(),
+            method: DidChangeWatchedFiles::METHOD.to_string(),
+            register_options: serde_json::to_value(options).ok(),
+        };
+        let params = RegistrationParams {
+            registrations: vec![registration],
+        };
+        if let Ok(value) = serde_json::to_value(params) {
+            let _ = self.connection.sender.send(Message::Request(Request::new(
+                RequestId::from("luabox-register-watchers".to_string()),
+                RegisterCapability::METHOD.to_string(),
+                value,
+            )));
         }
     }
 
     /// Load every `.lua` file under the root into the host (so
     /// `project_diagnostics` and cross-file goto have the full picture).
-    fn bootstrap(&mut self) {
+    ///
+    /// When the client supports work-done progress (`progress`), the index is
+    /// wrapped in a server-created `$/progress` token — begin, a report per
+    /// file loaded, then end — so a large workspace shows a progress indicator
+    /// at startup instead of an unexplained pause.
+    fn bootstrap(&mut self, progress: bool) {
+        let files = self.collect_lua_files();
+        let token = progress.then(|| self.begin_progress(files.len()));
+
+        for (i, path) in files.into_iter().enumerate() {
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.host.apply_change(Change::SetFileText {
+                path,
+                dialect: self.dialect,
+                text,
+            });
+            if let Some(token) = &token {
+                self.report_progress(token, i + 1, &name);
+            }
+        }
+
+        if let Some(token) = &token {
+            self.send_progress(token, WorkDoneProgress::End(WorkDoneProgressEnd::default()));
+        }
+    }
+
+    /// Walk the workspace tree and collect every non-hidden `.lua` file path,
+    /// skipping the manifest's `[build] out` directory (the same traversal the
+    /// eager index and `luabox check` use).
+    fn collect_lua_files(&self) -> Vec<PathBuf> {
+        let mut files = Vec::new();
         let mut stack = vec![self.root.clone()];
         while let Some(dir) = stack.pop() {
             let Ok(entries) = fs::read_dir(&dir) else {
@@ -388,17 +532,64 @@ impl Server {
                     }
                     continue;
                 }
-                if path.extension().and_then(|e| e.to_str()) == Some("lua")
-                    && let Ok(text) = fs::read_to_string(&path)
-                {
-                    self.host.apply_change(Change::SetFileText {
-                        path,
-                        dialect: self.dialect,
-                        text,
-                    });
+                if path.extension().and_then(|e| e.to_str()) == Some("lua") {
+                    files.push(path);
                 }
             }
         }
+        files
+    }
+
+    /// Create the bootstrap progress token on the client and send `begin`.
+    fn begin_progress(&self, total: usize) -> ProgressToken {
+        let token = ProgressToken::String("luabox/bootstrap".to_string());
+        let create = WorkDoneProgressCreateParams {
+            token: token.clone(),
+        };
+        if let Ok(value) = serde_json::to_value(create) {
+            let _ = self.connection.sender.send(Message::Request(Request::new(
+                RequestId::from("luabox-bootstrap-progress".to_string()),
+                WorkDoneProgressCreate::METHOD.to_string(),
+                value,
+            )));
+        }
+        self.send_progress(
+            &token,
+            WorkDoneProgress::Begin(WorkDoneProgressBegin {
+                title: "Indexing workspace".to_string(),
+                message: Some(format!("0/{total} files")),
+                percentage: Some(0),
+                ..WorkDoneProgressBegin::default()
+            }),
+        );
+        token
+    }
+
+    /// Send a `report` for the bootstrap index after loading file `done` of the
+    /// batch (1-based), named `name`.
+    fn report_progress(&self, token: &ProgressToken, done: usize, name: &str) {
+        self.send_progress(
+            token,
+            WorkDoneProgress::Report(WorkDoneProgressReport {
+                message: Some(format!("{done} files ({name})")),
+                ..WorkDoneProgressReport::default()
+            }),
+        );
+    }
+
+    /// Send one `$/progress` notification under `token`.
+    fn send_progress(&self, token: &ProgressToken, value: WorkDoneProgress) {
+        let params = ProgressParams {
+            token: token.clone(),
+            value: ProgressParamsValue::WorkDone(value),
+        };
+        let _ = self
+            .connection
+            .sender
+            .send(Message::Notification(Notification::new(
+                Progress::METHOD.to_string(),
+                params,
+            )));
     }
 
     fn main_loop(&mut self) -> anyhow::Result<()> {
@@ -927,22 +1118,88 @@ impl Server {
             DidOpenTextDocument::METHOD => {
                 let params: DidOpenTextDocumentParams = serde_json::from_value(not.params)?;
                 let uri = params.text_document.uri;
+                if let Some(path) = uri_to_path(&uri) {
+                    self.open_docs.insert(path, uri.clone());
+                }
                 self.set_text(&uri, params.text_document.text)?;
             }
             DidChangeTextDocument::METHOD => {
                 let params: DidChangeTextDocumentParams = serde_json::from_value(not.params)?;
-                // Full sync: the last change is the whole new buffer.
-                if let Some(change) = params.content_changes.into_iter().next_back() {
-                    self.set_text(&params.text_document.uri, change.text)?;
-                }
+                let uri = params.text_document.uri;
+                // Incremental sync: apply each ranged edit in order against the
+                // current overlay/disk text to rebuild the new buffer.
+                let Some(path) = uri_to_path(&uri) else {
+                    return Ok(());
+                };
+                let current = self.host.snapshot().file_text(&path).unwrap_or_default();
+                let text = apply_content_changes(current, params.content_changes);
+                self.set_text(&uri, text)?;
             }
             DidCloseTextDocument::METHOD => {
                 let params: DidCloseTextDocumentParams = serde_json::from_value(not.params)?;
+                if let Some(path) = uri_to_path(&params.text_document.uri) {
+                    self.open_docs.remove(&path);
+                }
                 self.close(&params.text_document.uri)?;
+            }
+            DidChangeConfiguration::METHOD => {
+                // A settings change may alter dialect/strictness/lint/defs;
+                // re-read the manifest and republish every open document.
+                self.reload_config()?;
+            }
+            DidChangeWatchedFiles::METHOD => {
+                let params: DidChangeWatchedFilesParams = serde_json::from_value(not.params)?;
+                self.watched_files_changed(&params)?;
             }
             // `textDocument/didSave` is a deliberate no-op — the overlay is
             // already the saved content. Everything else is ignored.
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Handle `workspace/didChangeWatchedFiles`: re-read each changed `.lua`
+    /// file from disk into the host (so an external edit invalidates the
+    /// analysis) and, if `luabox.toml` changed, reload the project config. A
+    /// deleted `.lua` file cannot be read, so its overlay/disk text is left as
+    /// is — a subsequent open will refresh it. Diagnostics for any changed file
+    /// that is currently open are republished; a manifest change republishes
+    /// every open document via [`Self::reload_config`].
+    fn watched_files_changed(
+        &mut self,
+        params: &DidChangeWatchedFilesParams,
+    ) -> anyhow::Result<()> {
+        let mut reload = false;
+        for event in &params.changes {
+            let Some(path) = uri_to_path(&event.uri) else {
+                continue;
+            };
+            if path.file_name().and_then(|n| n.to_str()) == Some("luabox.toml") {
+                reload = true;
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("lua") {
+                continue;
+            }
+            if event.typ == FileChangeType::DELETED {
+                continue;
+            }
+            if let Ok(text) = fs::read_to_string(&path) {
+                self.host.apply_change(Change::SetFileText {
+                    path: path.clone(),
+                    dialect: self.dialect,
+                    text,
+                });
+                // Republish only if the file is not shadowed by an editor
+                // overlay — an open buffer's diagnostics come from the overlay,
+                // not disk, so re-reading disk changes nothing visible there.
+                if !self.open_docs.contains_key(&path) {
+                    self.publish_lua(&event.uri, &path)?;
+                }
+            }
+        }
+        if reload {
+            self.reload_config()?;
         }
         Ok(())
     }
@@ -1012,6 +1269,44 @@ impl Server {
     }
 }
 
+/// Apply a batch of `didChange` content changes to `text` in order, returning
+/// the resulting document text.
+///
+/// Each change is relative to the state produced by the previous one, so the
+/// working text is rebuilt (and re-indexed) between changes:
+///
+/// - a change with a `range` splices its `text` over that range — the range's
+///   UTF-16 `(line, character)` endpoints are mapped to byte offsets through a
+///   fresh [`LineIndex`] over the *current* working text, so multi-byte
+///   characters and offset shifts from earlier changes resolve correctly;
+/// - a change with no `range` (full-replace) replaces the whole document.
+///
+/// This is the incremental-sync core, factored out so it is unit-testable
+/// independently of the server loop.
+fn apply_content_changes(text: String, changes: Vec<TextDocumentContentChangeEvent>) -> String {
+    let mut text = text;
+    for change in changes {
+        match change.range {
+            Some(range) => {
+                let index = LineIndex::new(text);
+                let start = index.offset(range.start);
+                // A malformed range with `end` before `start` would panic the
+                // splice; clamp defensively (LSP guarantees start <= end).
+                let end = index.offset(range.end).max(start);
+                let current = index.text();
+                let mut next =
+                    String::with_capacity(current.len() - (end - start) + change.text.len());
+                next.push_str(&current[..start]);
+                next.push_str(&change.text);
+                next.push_str(&current[end..]);
+                text = next;
+            }
+            None => text = change.text,
+        }
+    }
+    text
+}
+
 /// Extract a request's id and params, or surface a protocol error.
 fn cast_request<R: lsp_types::request::Request>(
     req: Request,
@@ -1038,4 +1333,101 @@ fn workspace_symbol_key(info: &SymbolInformation) -> (String, String, u32, u32, 
         info.location.range.end.line,
         info.location.range.end.character,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use lsp_types::{Position, Range, TextDocumentContentChangeEvent};
+
+    use super::apply_content_changes;
+
+    /// A ranged change replacing `[start, end)` with `text`.
+    fn edit(start: (u32, u32), end: (u32, u32), text: &str) -> TextDocumentContentChangeEvent {
+        TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: Position::new(start.0, start.1),
+                end: Position::new(end.0, end.1),
+            }),
+            range_length: None,
+            text: text.to_string(),
+        }
+    }
+
+    /// A full-replace change (no range).
+    fn full(text: &str) -> TextDocumentContentChangeEvent {
+        TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn ranged_insert_splices_at_offset() {
+        // Insert `X` between `ab` and `cd` (a zero-width range at col 2).
+        let out = apply_content_changes("abcd".to_string(), vec![edit((0, 2), (0, 2), "X")]);
+        assert_eq!(out, "abXcd");
+    }
+
+    #[test]
+    fn ranged_deletion_removes_span() {
+        // Delete `bc` from `abcd` (cols 1..3, empty replacement).
+        let out = apply_content_changes("abcd".to_string(), vec![edit((0, 1), (0, 3), "")]);
+        assert_eq!(out, "ad");
+    }
+
+    #[test]
+    fn ranged_replacement_across_lines() {
+        // Replace from line 0 col 1 through line 1 col 1 with `Z`.
+        let out = apply_content_changes("abc\ndef".to_string(), vec![edit((0, 1), (1, 1), "Z")]);
+        assert_eq!(out, "aZef");
+    }
+
+    #[test]
+    fn insert_at_end_of_document() {
+        let out = apply_content_changes("abc".to_string(), vec![edit((0, 3), (0, 3), "de")]);
+        assert_eq!(out, "abcde");
+    }
+
+    #[test]
+    fn insert_into_empty_document() {
+        let out = apply_content_changes(String::new(), vec![edit((0, 0), (0, 0), "hi")]);
+        assert_eq!(out, "hi");
+    }
+
+    #[test]
+    fn multi_change_batch_applies_in_order() {
+        // First insert `123 ` at the start, then, against the *new* text,
+        // append `!` at what is now column 8 (`123 wxyz`). The second change's
+        // offsets must be relative to the result of the first.
+        let out = apply_content_changes(
+            "wxyz".to_string(),
+            vec![edit((0, 0), (0, 0), "123 "), edit((0, 8), (0, 8), "!")],
+        );
+        assert_eq!(out, "123 wxyz!");
+    }
+
+    #[test]
+    fn full_replace_ignores_prior_text() {
+        let out = apply_content_changes("old content".to_string(), vec![full("brand new")]);
+        assert_eq!(out, "brand new");
+    }
+
+    #[test]
+    fn full_replace_then_ranged_edit() {
+        // A full replace resets the buffer, then a ranged edit applies to it.
+        let out = apply_content_changes(
+            "old".to_string(),
+            vec![full("hello"), edit((0, 5), (0, 5), " world")],
+        );
+        assert_eq!(out, "hello world");
+    }
+
+    #[test]
+    fn ranged_edit_maps_utf16_columns() {
+        // `😀` is 4 bytes but 2 UTF-16 units; inserting after it must land at
+        // the right byte offset, not treat the column as a byte index.
+        let out = apply_content_changes("😀ab".to_string(), vec![edit((0, 2), (0, 2), "-")]);
+        assert_eq!(out, "😀-ab");
+    }
 }
