@@ -1105,6 +1105,19 @@ impl TypeEnv {
         self.enums.get(enum_name)?.members.get(member)
     }
 
+    /// The members of a declared `---@enum`, as `(member name, value type)`
+    /// pairs in declaration-stable order — the finite domain the exhaustiveness
+    /// check (`LB0315`) enumerates. `None` when `name` is not an enum.
+    pub(crate) fn enum_members(&self, name: &str) -> Option<Vec<(String, Ty)>> {
+        let def = self.enums.get(name)?;
+        Some(
+            def.members
+                .iter()
+                .map(|(member, ty)| (member.clone(), ty.clone()))
+                .collect(),
+        )
+    }
+
     /// Resolve a [`Ty::Named`] reference to its structural type: a class
     /// becomes its table shape, an enum the union of its member values.
     pub(crate) fn resolve_named(&self, name: &str) -> Option<Ty> {

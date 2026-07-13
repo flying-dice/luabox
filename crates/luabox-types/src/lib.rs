@@ -1296,6 +1296,197 @@ set_level(\"nope\")
         assert_eq!(strict_codes(src), vec!["LB0300"]);
     }
 
+    // --- LB0315: union/enum exhaustiveness ------------------------------
+
+    #[test]
+    fn nonexhaustive_union_if_is_flagged() {
+        // `s : "a"|"b"|"c"`, only "a"/"b" handled, no else -> LB0315 naming "c".
+        let src = "\
+---@alias Color \"a\"|\"b\"|\"c\"
+---@param s Color
+local function f(s)
+  if s == \"a\" then
+    return 1
+  elseif s == \"b\" then
+    return 2
+  end
+end
+";
+        let diags = check(src, Strictness::Strict);
+        let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
+        assert_eq!(codes, vec!["LB0315"]);
+        assert!(
+            diags[0].message.contains("`\"c\"`"),
+            "message should name the uncovered member: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn exhaustive_union_if_is_clean() {
+        let src = "\
+---@alias Color \"a\"|\"b\"|\"c\"
+---@param s Color
+local function f(s)
+  if s == \"a\" then
+    return 1
+  elseif s == \"b\" then
+    return 2
+  elseif s == \"c\" then
+    return 3
+  end
+end
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn union_if_with_else_is_clean() {
+        let src = "\
+---@alias Color \"a\"|\"b\"|\"c\"
+---@param s Color
+local function f(s)
+  if s == \"a\" then
+    return 1
+  elseif s == \"b\" then
+    return 2
+  else
+    return 0
+  end
+end
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn open_type_discriminant_is_never_flagged() {
+        // A `string` discriminant is open-ended — never an exhaustiveness site.
+        let src = "\
+---@param s string
+local function f(s)
+  if s == \"a\" then
+    return 1
+  elseif s == \"b\" then
+    return 2
+  end
+end
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn union_containing_a_nonliteral_is_never_flagged() {
+        // `"a"|"b"|string` is not finite: the `string` member opens it up.
+        let src = "\
+---@alias Loose \"a\"|\"b\"|string
+---@param s Loose
+local function f(s)
+  if s == \"a\" then
+    return 1
+  elseif s == \"b\" then
+    return 2
+  end
+end
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn reversed_operand_order_is_analysed() {
+        // `"a" == s` reads the same as `s == "a"`.
+        let src = "\
+---@alias Color \"a\"|\"b\"|\"c\"
+---@param s Color
+local function f(s)
+  if \"a\" == s then
+    return 1
+  elseif \"b\" == s then
+    return 2
+  end
+end
+";
+        assert_eq!(strict_codes(src), vec!["LB0315"]);
+    }
+
+    #[test]
+    fn compound_branch_condition_bails() {
+        // A non-`==`-literal branch aborts the analysis — no false positive.
+        let src = "\
+---@alias Color \"a\"|\"b\"|\"c\"
+---@param s Color
+---@param ready boolean
+local function f(s, ready)
+  if s == \"a\" then
+    return 1
+  elseif s == \"b\" and ready then
+    return 2
+  end
+end
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn nonexhaustive_enum_if_is_flagged() {
+        let src = "\
+---@enum Dir
+local Dir = { up = 1, down = 2, left = 3 }
+---@param d Dir
+local function step(d)
+  if d == Dir.up then
+    return 1
+  elseif d == Dir.down then
+    return 2
+  end
+end
+";
+        let diags = check(src, Strictness::Strict);
+        let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
+        assert_eq!(codes, vec!["LB0315"]);
+        assert!(
+            diags[0].message.contains("`Dir.left`"),
+            "message should name the uncovered enum member: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn exhaustive_enum_if_is_clean() {
+        let src = "\
+---@enum Dir
+local Dir = { up = 1, down = 2 }
+---@param d Dir
+local function step(d)
+  if d == Dir.up then
+    return 1
+  elseif d == Dir.down then
+    return 2
+  end
+end
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn nonexhaustive_if_warns_in_warn_mode() {
+        // Rides the strictness ladder: a warning in warn mode.
+        let src = "\
+---@alias Color \"a\"|\"b\"|\"c\"
+---@param s Color
+local function f(s)
+  if s == \"a\" then
+    return 1
+  elseif s == \"b\" then
+    return 2
+  end
+end
+";
+        let diags = check(src, Strictness::Warn);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code.to_string(), "LB0315");
+        assert_eq!(diags[0].severity, Severity::Warning);
+    }
+
     #[test]
     fn generic_alias_substitutes() {
         // #117: `Pair<number>` monomorphises `{ first: T, second: T }`, so the

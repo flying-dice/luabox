@@ -134,6 +134,11 @@ static REGISTRY: &[Entry] = &[
         explain: LB0314,
     },
     Entry {
+        code: Code::new(315),
+        title: "non-exhaustive `if` on a finite type",
+        explain: LB0315,
+    },
+    Entry {
         code: Code::new(500),
         title: "malformed `---@luabox-ignore`",
         explain: LB0500,
@@ -934,6 +939,69 @@ the recursive occurrence — a `---@class`/`---@enum` reference, `table`, or
 special-case recursion that happens to route through an alias name.
 ";
 
+const LB0315: &str = "\
+# LB0315: non-exhaustive `if` on a finite type
+
+An `if`/`elseif` chain dispatches on a variable of a **finite** type — a union
+of literal types (`\"a\"|\"b\"|\"c\"`, often through a `---@alias`) or an
+`---@enum` — matches only *some* of its members, and has **no `else`** branch.
+This is the discriminated-union exhaustiveness check lua-language-server
+performs: covering every case makes adding a new variant surface the sites that
+forgot to handle it. It rides the strictness ladder like its checker siblings: a
+**warning** in warn mode, an **error** in strict.
+
+```lua
+---@alias Color \"r\"|\"g\"|\"b\"
+
+---@param c Color
+local function name(c)
+  if c == \"r\" then
+    return \"red\"
+  elseif c == \"g\" then
+    return \"green\"
+  end                 -- LB0315: `\"b\"` not handled (and no `else`)
+end
+```
+
+An `---@enum` discriminant is enumerated the same way, its uncovered cases named
+`Enum.member`:
+
+```lua
+---@enum Dir
+local Dir = { up = 1, down = 2, left = 3, right = 4 }
+
+---@param d Dir
+local function step(d)
+  if d == Dir.up then
+  elseif d == Dir.down then
+  end                 -- LB0315: `Dir.left`, `Dir.right` not handled
+end
+```
+
+## When it fires — and when it stays silent
+
+The analysis is deliberately narrow, so a false positive is never risked:
+
+- **Every** branch must be exactly `x == <literal>` (or `<literal> == x`) on the
+  **same** discriminant `x`. A branch that is anything else — a compound
+  `and`/`or` condition, a different variable, a call, a comparison against a
+  value outside the finite domain — aborts the analysis and nothing is reported.
+- An **`else`** clause makes the chain exhaustive by construction: never flagged.
+- Covering **every** member is exhaustive: never flagged.
+- If the discriminant's type is **open-ended** — `string`, `number`, `unknown`,
+  `any`, or any union that contains a non-literal member — the chain is not a
+  finite dispatch and is never flagged.
+
+## Deferred
+
+Two related shapes are intentionally **out of scope** for now: table-dispatch
+exhaustiveness (a `{ [case] = handler }` lookup instead of an `if` chain), and
+`and`/`or` compound branch conditions. Only the simple `==`-chain is analysed.
+
+Handle the missing members, or add an `else` clause to acknowledge the chain is
+intentionally partial.
+";
+
 const LB0500: &str = "\
 # LB0500: malformed `---@luabox-ignore`
 
@@ -1436,9 +1504,9 @@ mod tests {
         for raw in [
             "LB0001", "LB0010", "LB0011", "LB0012", "LB0013", "LB0014", "LB0015", "LB0016",
             "LB0300", "LB0301", "LB0302", "LB0303", "LB0304", "LB0305", "LB0306", "LB0307",
-            "LB0308", "LB0309", "LB0310", "LB0311", "LB0312", "LB0313", "LB0314", "LB0500",
-            "LB0501", "LB0502", "LB0503", "LB0504", "LB0505", "LB0506", "LB0507", "LB0508",
-            "LB0509", "LB1001", "LB1100",
+            "LB0308", "LB0309", "LB0310", "LB0311", "LB0312", "LB0313", "LB0314", "LB0315",
+            "LB0500", "LB0501", "LB0502", "LB0503", "LB0504", "LB0505", "LB0506", "LB0507",
+            "LB0508", "LB0509", "LB1001", "LB1100",
         ] {
             let code: Code = raw.parse().unwrap();
             assert!(explain(&code).is_some(), "{raw} missing from registry");
