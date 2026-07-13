@@ -12,7 +12,7 @@ use lsp_types::notification::{
 };
 use lsp_types::request::{
     Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, InlayHintRequest,
-    RangeFormatting, Request as _, SemanticTokensFullRequest, Shutdown,
+    RangeFormatting, References, Request as _, SemanticTokensFullRequest, Shutdown,
 };
 use lsp_types::{
     CompletionItemKind, CompletionParams, CompletionResponse, DiagnosticSeverity,
@@ -20,10 +20,11 @@ use lsp_types::{
     DocumentFormattingParams, DocumentRangeFormattingParams, DocumentSymbolParams,
     DocumentSymbolResponse, FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse,
     HoverContents, HoverParams, InitializeParams, InlayHint, InlayHintLabel, InlayHintParams,
-    NumberOrString, PartialResultParams, Position, PublishDiagnosticsParams, Range, SemanticToken,
-    SemanticTokensParams, SemanticTokensResult, SymbolKind, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, TextEdit, Uri,
-    VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceFolder,
+    NumberOrString, PartialResultParams, Position, PublishDiagnosticsParams, Range,
+    ReferenceContext, ReferenceParams, SemanticToken, SemanticTokensParams, SemanticTokensResult,
+    SymbolKind, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, TextEdit, Uri, VersionedTextDocumentIdentifier,
+    WorkDoneProgressParams, WorkspaceFolder,
 };
 use tempfile::TempDir;
 
@@ -202,6 +203,27 @@ impl TestClient {
             GotoDefinitionResponse::Scalar(location) => Some(location),
             other => panic!("expected a scalar location, got {other:?}"),
         }
+    }
+
+    fn references(
+        &mut self,
+        uri: &Uri,
+        line: u32,
+        character: u32,
+        include_declaration: bool,
+    ) -> Vec<lsp_types::Location> {
+        self.request::<References>(ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line, character },
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+            context: ReferenceContext {
+                include_declaration,
+            },
+        })
+        .unwrap_or_default()
     }
 
     fn complete(&mut self, uri: &Uri, line: u32, character: u32) -> Vec<lsp_types::CompletionItem> {
@@ -605,6 +627,83 @@ print(p.x)
     let location = client.definition(&uri, 5, 8).expect("definition");
     // The `@field x number` tag is on line 1.
     assert_eq!(location.range.start.line, 1);
+    client.shutdown();
+}
+
+// === Find references =====================================================
+
+#[test]
+fn initialize_advertises_references() {
+    let client = start(&[]);
+    assert_eq!(
+        client.init_result["capabilities"]["referencesProvider"],
+        true
+    );
+    client.shutdown();
+}
+
+#[test]
+fn references_of_local_honor_include_declaration() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(
+        &uri,
+        "local value = 1\nprint(value)\nreturn value + value\n",
+    );
+    let mut client = client;
+    // Cursor on `value` inside `print(value)` (line 1).
+    let with = client.references(&uri, 1, 8, true);
+    // The declaration plus three uses, all in this file.
+    assert_eq!(with.len(), 4, "{with:?}");
+    assert!(with.iter().all(|l| l.uri.as_str() == uri.as_str()));
+    assert!(
+        with.iter().any(|l| l.range == range((0, 6), (0, 11))),
+        "declaration expected: {with:?}"
+    );
+
+    let without = client.references(&uri, 1, 8, false);
+    assert_eq!(without.len(), 3, "{without:?}");
+    assert!(
+        !without.iter().any(|l| l.range == range((0, 6), (0, 11))),
+        "declaration must be excluded: {without:?}"
+    );
+    client.shutdown();
+}
+
+#[test]
+fn references_of_global_function_span_files() {
+    let client = start(&[
+        ("a.lua", "function greet() return 1 end\n"),
+        ("b.lua", "greet()\ngreet()\n"),
+    ]);
+    let a_uri = client.uri("a.lua");
+    let b_uri = client.uri("b.lua");
+    let mut client = client;
+    // Cursor on the first `greet` call in b.lua.
+    let with = client.references(&b_uri, 0, 0, true);
+    // The declaration in a.lua plus two call sites in b.lua.
+    assert_eq!(with.len(), 3, "{with:?}");
+    assert_eq!(
+        with.iter()
+            .filter(|l| l.uri.as_str() == a_uri.as_str())
+            .count(),
+        1,
+        "declaration in a.lua: {with:?}"
+    );
+    assert_eq!(
+        with.iter()
+            .filter(|l| l.uri.as_str() == b_uri.as_str())
+            .count(),
+        2,
+        "two uses in b.lua: {with:?}"
+    );
+
+    let without = client.references(&b_uri, 0, 0, false);
+    assert_eq!(without.len(), 2, "{without:?}");
+    assert!(
+        without.iter().all(|l| l.uri.as_str() == b_uri.as_str()),
+        "only uses remain: {without:?}"
+    );
     client.shutdown();
 }
 

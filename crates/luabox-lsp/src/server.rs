@@ -24,7 +24,7 @@ use lsp_types::notification::{
 };
 use lsp_types::request::{
     Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, InlayHintRequest,
-    RangeFormatting, Request as _, SemanticTokensFullRequest,
+    RangeFormatting, References, Request as _, SemanticTokensFullRequest,
 };
 use lsp_types::{
     CompletionOptions, CompletionResponse, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
@@ -40,7 +40,10 @@ use luabox_types::{Ambient, combined_defs};
 
 use crate::sema::FileSema;
 use crate::uri::uri_to_path;
-use crate::{completion, diagnostics, fmt, goto_def, hover, inlay_hints, semantic_tokens, symbols};
+use crate::{
+    completion, diagnostics, fmt, goto_def, hover, inlay_hints, references, semantic_tokens,
+    symbols,
+};
 
 /// Run the server over stdio until the client sends `shutdown`/`exit`.
 /// A leading `--stdio` argument, which editors commonly pass, is harmless:
@@ -85,6 +88,7 @@ fn server_capabilities() -> ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         definition_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Left(true)),
         inlay_hint_provider: Some(OneOf::Left(true)),
         completion_provider: Some(CompletionOptions {
             trigger_characters: Some(vec![".".to_string(), ":".to_string()]),
@@ -340,6 +344,16 @@ impl Server {
                     .map(GotoDefinitionResponse::Scalar);
                 Response::new_ok(id, result)
             }
+            References::METHOD => {
+                let (id, params) = cast_request::<References>(req)?;
+                let doc = params.text_document_position;
+                let result = self.references(
+                    &doc.text_document.uri,
+                    doc.position,
+                    params.context.include_declaration,
+                );
+                Response::new_ok(id, result)
+            }
             Completion::METHOD => {
                 let (id, params) = cast_request::<Completion>(req)?;
                 let doc = params.text_document_position;
@@ -400,6 +414,22 @@ impl Server {
         let sema = self.sema(&path)?;
         let offset = sema.index.offset(position);
         goto_def::goto_definition(&sema, offset, &self.root)
+    }
+
+    /// All references to the symbol at `position`. Locals/upvalues are found in
+    /// the file itself; globals and class members are searched across every
+    /// file the snapshot knows about, reusing one snapshot for the whole scan.
+    fn references(
+        &self,
+        uri: &Uri,
+        position: lsp_types::Position,
+        include_declaration: bool,
+    ) -> Option<Vec<Location>> {
+        let path = uri_to_path(uri)?;
+        let snapshot = self.host.snapshot();
+        let sema = FileSema::new(&snapshot, &path)?;
+        let offset = sema.index.offset(position);
+        references::references(&snapshot, &sema, offset, include_declaration)
     }
 
     fn completion(

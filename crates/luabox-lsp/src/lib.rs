@@ -39,6 +39,7 @@ mod goto_def;
 mod hover;
 mod inlay_hints;
 mod line_index;
+mod references;
 mod sema;
 mod semantic_tokens;
 mod server;
