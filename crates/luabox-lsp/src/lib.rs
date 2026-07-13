@@ -28,9 +28,12 @@
 //!   [`semantic_tokens`]).
 //! - **Inlay hints** — the rich table inference's binding types rendered
 //!   after unannotated declarations (see [`inlay_hints`]).
+//! - **Signature help** — the callee's resolved signature(s) while the
+//!   cursor sits inside a call's argument list, with the active parameter
+//!   and `---@overload` alternates (see [`signature_help`]).
 //!
-//! The remaining SPEC §8 surface (find-refs, rename, code actions,
-//! signature help, call hierarchy, TCP transport) is P4 polish.
+//! The remaining SPEC §8 surface (find-refs, rename, code actions, call
+//! hierarchy, TCP transport) is P4 polish.
 
 mod completion;
 mod diagnostics;
@@ -49,6 +52,7 @@ mod selection_range;
 mod sema;
 mod semantic_tokens;
 mod server;
+mod signature_help;
 mod symbols;
 mod uri;
 

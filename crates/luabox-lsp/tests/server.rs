@@ -14,7 +14,7 @@ use lsp_types::request::{
     CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest,
     FoldingRangeRequest, Formatting, GotoDefinition, GotoImplementation, GotoTypeDefinition,
     HoverRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting, References, Rename,
-    Request as _, SelectionRangeRequest, SemanticTokensFullRequest, Shutdown,
+    Request as _, SelectionRangeRequest, SemanticTokensFullRequest, Shutdown, SignatureHelpRequest,
     WorkspaceSymbolRequest,
 };
 use lsp_types::{
@@ -25,13 +25,14 @@ use lsp_types::{
     DocumentRangeFormattingParams, DocumentSymbolParams, DocumentSymbolResponse, FoldingRange,
     FoldingRangeKind, FoldingRangeParams, FormattingOptions, GotoDefinitionParams,
     GotoDefinitionResponse, HoverContents, HoverParams, InitializeParams, InlayHint,
-    InlayHintLabel, InlayHintParams, NumberOrString, PartialResultParams, Position,
+    InlayHintLabel, InlayHintParams, NumberOrString, ParameterLabel, PartialResultParams, Position,
     PrepareRenameResponse, PublishDiagnosticsParams, Range, ReferenceContext, ReferenceParams,
     RenameParams, SelectionRange, SelectionRangeParams, SemanticToken, SemanticTokensParams,
-    SemanticTokensResult, SymbolInformation, SymbolKind, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, TextEdit, Uri,
-    VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceEdit, WorkspaceFolder,
-    WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    SemanticTokensResult, SignatureHelp, SignatureHelpParams, SymbolInformation, SymbolKind,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, TextEdit, Uri, VersionedTextDocumentIdentifier,
+    WorkDoneProgressParams, WorkspaceEdit, WorkspaceFolder, WorkspaceSymbolParams,
+    WorkspaceSymbolResponse,
 };
 use tempfile::TempDir;
 
@@ -194,6 +195,17 @@ impl TestClient {
                 position: Position { line, character },
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
+        })
+    }
+
+    fn signature_help(&mut self, uri: &Uri, line: u32, character: u32) -> Option<SignatureHelp> {
+        self.request::<SignatureHelpRequest>(SignatureHelpParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line, character },
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            context: None,
         })
     }
 
@@ -2071,6 +2083,148 @@ fn initialize_advertises_code_actions() {
         client.init_result["capabilities"]["codeActionProvider"],
         true
     );
+    client.shutdown();
+}
+
+// === Signature help ======================================================
+
+#[test]
+fn initialize_advertises_signature_help() {
+    let client = start(&[]);
+    let caps = &client.init_result["capabilities"];
+    assert_eq!(
+        caps["signatureHelpProvider"]["triggerCharacters"],
+        serde_json::json!(["(", ","])
+    );
+    assert_eq!(
+        caps["signatureHelpProvider"]["retriggerCharacters"],
+        serde_json::json!([","])
+    );
+    client.shutdown();
+}
+
+#[test]
+fn signature_help_inside_a_call_shows_params_and_docs() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let source = "\
+---@param a number the first arg
+---@param b string
+local function f(a, b) end
+f(1, 2)
+";
+    client.open(&uri, source);
+    let mut client = client;
+    // Cursor right after `f(` on the last line.
+    let help = client.signature_help(&uri, 3, 2).expect("signature help");
+    assert_eq!(help.signatures.len(), 1);
+    let sig = &help.signatures[0];
+    assert_eq!(sig.label, "f(a: number, b: string)");
+    assert_eq!(help.active_parameter, Some(0));
+    assert_eq!(sig.active_parameter, Some(0));
+    let params = sig.parameters.as_ref().expect("parameters");
+    assert_eq!(params.len(), 2);
+    match &params[0].label {
+        ParameterLabel::LabelOffsets([start, end]) => {
+            assert_eq!(&sig.label[*start as usize..*end as usize], "a: number");
+        }
+        other @ ParameterLabel::Simple(_) => panic!("expected label offsets, got {other:?}"),
+    }
+    let doc = match params[0].documentation.as_ref().expect("param doc") {
+        lsp_types::Documentation::MarkupContent(m) => m.value.clone(),
+        other @ lsp_types::Documentation::String(_) => {
+            panic!("expected markup documentation, got {other:?}")
+        }
+    };
+    assert!(doc.contains("the first arg"), "{doc}");
+    client.shutdown();
+}
+
+#[test]
+fn signature_help_active_parameter_advances_across_a_comma() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let source = "\
+---@param a number
+---@param b string
+local function f(a, b) end
+f(1, 2)
+";
+    client.open(&uri, source);
+    let mut client = client;
+    // Cursor right after the comma on `f(1, 2)`.
+    let help = client.signature_help(&uri, 3, 4).expect("signature help");
+    assert_eq!(help.active_parameter, Some(1));
+    client.shutdown();
+}
+
+#[test]
+fn signature_help_clamps_to_the_last_declared_parameter() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let source = "\
+---@param a number
+local function f(a) end
+f(1, 2, 3)
+";
+    client.open(&uri, source);
+    let mut client = client;
+    // Cursor after the third argument; only one parameter is declared.
+    let help = client.signature_help(&uri, 2, 8).expect("signature help");
+    assert_eq!(help.active_parameter, Some(0));
+    client.shutdown();
+}
+
+#[test]
+fn signature_help_on_a_method_call_resolves_via_class_fields() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let source = "\
+---@class Point
+---@field translate fun(dx: number, dy: number): Point
+
+---@type Point
+local p = nil
+p:translate(1, 2)
+";
+    client.open(&uri, source);
+    let mut client = client;
+    // Cursor right after `translate(` on the last line.
+    let help = client.signature_help(&uri, 5, 12).expect("signature help");
+    assert_eq!(help.signatures.len(), 1);
+    assert_eq!(
+        help.signatures[0].label,
+        "Point:translate(dx: number, dy: number): Point"
+    );
+    assert_eq!(help.active_parameter, Some(0));
+    client.shutdown();
+}
+
+#[test]
+fn signature_help_on_an_overloaded_function_returns_every_signature() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let source = "\
+---@param a number
+---@overload fun(a: string): boolean
+local function f(a) end
+f(1)
+";
+    client.open(&uri, source);
+    let mut client = client;
+    let help = client.signature_help(&uri, 3, 2).expect("signature help");
+    let labels: Vec<&str> = help.signatures.iter().map(|s| s.label.as_str()).collect();
+    assert_eq!(labels, vec!["f(a: number)", "f(a: string): boolean"]);
+    client.shutdown();
+}
+
+#[test]
+fn signature_help_outside_any_call_is_none() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, "local x = 1\n");
+    let mut client = client;
+    assert!(client.signature_help(&uri, 0, 8).is_none());
     client.shutdown();
 }
 

@@ -27,7 +27,8 @@ use lsp_types::request::{
     CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest,
     FoldingRangeRequest, Formatting, GotoDefinition, GotoImplementation, GotoTypeDefinition,
     HoverRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting, References, Rename,
-    Request as _, SelectionRangeRequest, SemanticTokensFullRequest, WorkspaceSymbolRequest,
+    Request as _, SelectionRangeRequest, SemanticTokensFullRequest, SignatureHelpRequest,
+    WorkspaceSymbolRequest,
 };
 use lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionProviderCapability,
@@ -38,9 +39,9 @@ use lsp_types::{
     OneOf, PrepareRenameResponse, PublishDiagnosticsParams, RenameOptions, SelectionRange,
     SelectionRangeProviderCapability, SemanticTokens, SemanticTokensFullOptions,
     SemanticTokensOptions, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, ServerInfo, SymbolInformation, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextEdit, TypeDefinitionProviderCapability, Uri, WorkspaceEdit,
-    WorkspaceSymbolResponse,
+    ServerCapabilities, ServerInfo, SignatureHelp, SignatureHelpOptions, SymbolInformation,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, TypeDefinitionProviderCapability,
+    Uri, WorkspaceEdit, WorkspaceSymbolResponse,
 };
 use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
 use luabox_lint::{LintConfig, lint_source};
@@ -52,7 +53,8 @@ use crate::sema::FileSema;
 use crate::uri::uri_to_path;
 use crate::{
     completion, diagnostics, document_highlight, fmt, folding, goto_def, goto_impl, goto_type,
-    hover, inlay_hints, references, rename, selection_range, semantic_tokens, symbols,
+    hover, inlay_hints, references, rename, selection_range, semantic_tokens, signature_help,
+    symbols,
 };
 
 /// Run the server over stdio until the client sends `shutdown`/`exit`.
@@ -97,13 +99,20 @@ pub fn run(connection: Connection) -> anyhow::Result<()> {
 /// see [`crate::document_highlight`]), folding ranges (see [`crate::folding`]),
 /// selection ranges (see [`crate::selection_range`]), workspace symbols
 /// (fuzzy, case-insensitive name search across every file, see
-/// [`crate::symbols::workspace_symbols`]), and quick-fix code actions for
-/// machine-applicable lint fixes (see [`Server::code_actions`]).
+/// [`crate::symbols::workspace_symbols`]), quick-fix code actions for
+/// machine-applicable lint fixes (see [`Server::code_actions`]), and
+/// signature help triggered on `(`/`,` and retriggered on `,` (see
+/// [`crate::signature_help`]).
 fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         definition_provider: Some(OneOf::Left(true)),
+        signature_help_provider: Some(SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+            retrigger_characters: Some(vec![",".to_string()]),
+            ..SignatureHelpOptions::default()
+        }),
         // Goto type-definition (value → its `---@class`/`---@alias`/`---@enum`,
         // see [`crate::goto_type`]) and goto-implementation (interface class →
         // its subclasses, see [`crate::goto_impl`]).
@@ -527,6 +536,12 @@ impl Server {
                 let result = self.code_actions(&params.text_document.uri, params.range);
                 Response::new_ok(id, result)
             }
+            SignatureHelpRequest::METHOD => {
+                let (id, params) = cast_request::<SignatureHelpRequest>(req)?;
+                let doc = params.text_document_position_params;
+                let result = self.signature_help(&doc.text_document.uri, doc.position);
+                Response::new_ok(id, result)
+            }
             _ => Response::new_err(
                 req.id,
                 ErrorCode::MethodNotFound as i32,
@@ -542,6 +557,15 @@ impl Server {
         let sema = self.sema(&path)?;
         let offset = sema.index.offset(position);
         hover::hover(&sema, offset)
+    }
+
+    /// The callee's resolved signature(s) while `position` sits inside a
+    /// call's argument list (see [`crate::signature_help`]).
+    fn signature_help(&self, uri: &Uri, position: lsp_types::Position) -> Option<SignatureHelp> {
+        let path = uri_to_path(uri)?;
+        let sema = self.sema(&path)?;
+        let offset = sema.index.offset(position);
+        signature_help::signature_help(&sema, offset)
     }
 
     fn definition(&self, uri: &Uri, position: lsp_types::Position) -> Option<Location> {

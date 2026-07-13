@@ -18,7 +18,8 @@ use luabox_hir::{Binding, BindingId, Expr as HirExpr, HirId, Resolution};
 use luabox_syntax::lua::ast::{self, AstNode};
 use luabox_syntax::lua::{SyntaxKind, SyntaxNode, SyntaxToken};
 use luabox_syntax::luacats::{
-    AnnotatedItem, ClassTag, FieldKey, FieldTag, Tag, TypeExpr, TypeExprKind,
+    AnnotatedItem, ClassTag, FieldKey, FieldTag, FunParam, FunReturn, ParamTag, Tag, TypeExpr,
+    TypeExprKind,
 };
 use rowan::{TextRange, TextSize, TokenAtOffset};
 
@@ -56,6 +57,29 @@ pub struct FnInfo {
     pub sig: String,
     /// Joined doc lines from the annotation block, if any.
     pub docs: String,
+    /// Structured parameters (AST names merged with `---@param` types/docs).
+    /// `sig` above is the same data pre-rendered to one string for hover and
+    /// completion; [`crate::signature_help`] needs the per-parameter
+    /// breakdown (and per-parameter doc lines, which the rendered string
+    /// drops), so both are kept.
+    pub params: Vec<SigParam>,
+    /// Rendered `---@return` types, in declaration order.
+    pub returns: Vec<TypeExpr>,
+    /// `---@overload` alternate signatures. Each is a `fun(...)` type
+    /// expression, so its parameters carry no `---@param`-style doc lines.
+    pub overloads: Vec<(Vec<SigParam>, Vec<TypeExpr>)>,
+}
+
+/// One parameter of a resolved signature: its declared/annotated name, type,
+/// optionality, and `---@param` doc line where one is attached. Shared by
+/// [`FnInfo::params`]/[`FnInfo::overloads`] and by
+/// [`crate::signature_help`]'s class-field (`fun(...)`-typed method) route.
+pub struct SigParam {
+    pub name: String,
+    pub ty: Option<TypeExpr>,
+    pub optional: bool,
+    pub vararg: bool,
+    pub doc: Option<String>,
 }
 
 impl FileSema {
@@ -375,6 +399,9 @@ impl FileSema {
             out.push(FnInfo {
                 sig: render_signature(&name, params.as_ref(), item),
                 docs: item.map(docs_of).unwrap_or_default(),
+                params: collect_sig_params(params.as_ref(), item),
+                returns: collect_returns(item),
+                overloads: collect_overloads(item),
                 name,
                 decl_range: decl_token.text_range(),
             });
@@ -493,6 +520,18 @@ pub fn is_function_type(ty: &TypeExpr) -> bool {
     }
 }
 
+/// A function type's parameters and returns, peeling `?`/parens — the
+/// `fun(...)` shape a class field/method (`---@field m fun(dx: number): T`)
+/// declares its signature with, for [`crate::signature_help`].
+#[must_use]
+pub fn as_function_type(ty: &TypeExpr) -> Option<(&[FunParam], &[FunReturn])> {
+    match &ty.kind {
+        TypeExprKind::Fun { params, returns } => Some((params, returns)),
+        TypeExprKind::Optional(inner) | TypeExprKind::Paren(inner) => as_function_type(inner),
+        _ => None,
+    }
+}
+
 /// The display name and name token of a `function a.b:c` declaration.
 fn function_decl_name(decl: &ast::FunctionDeclStmt) -> Option<(String, SyntaxToken)> {
     let name = decl.name()?;
@@ -562,6 +601,87 @@ fn render_signature(
         sig.push_str(&returns.join(", "));
     }
     sig
+}
+
+/// The structured parameter list for [`FnInfo::params`]/overloads: the AST
+/// parameter names merged with their `---@param` type/doc, in the same
+/// pairing `render_signature` uses (by name, with `...` for the vararg).
+fn collect_sig_params(
+    params: Option<&ast::ParamList>,
+    item: Option<&AnnotatedItem>,
+) -> Vec<SigParam> {
+    let mut tags: HashMap<&str, &ParamTag> = HashMap::new();
+    if let Some(item) = item {
+        for tag in &item.block.tags {
+            if let Tag::Param(p) = tag {
+                tags.insert(p.name.as_str(), p);
+            }
+        }
+    }
+    let Some(list) = params else {
+        return Vec::new();
+    };
+    list.params()
+        .filter_map(|param| {
+            let name = if param.is_vararg() {
+                "...".to_string()
+            } else {
+                param.name()?.text().to_string()
+            };
+            let tag = tags.get(name.as_str());
+            Some(SigParam {
+                name,
+                ty: tag.map(|t| t.ty.clone()),
+                optional: tag.is_some_and(|t| t.optional),
+                vararg: param.is_vararg(),
+                doc: tag.and_then(|t| t.desc.clone()),
+            })
+        })
+        .collect()
+}
+
+/// Every `---@return` type across the item's block, in declaration order
+/// (mirrors the loop in `render_signature`, structured instead of rendered).
+fn collect_returns(item: Option<&AnnotatedItem>) -> Vec<TypeExpr> {
+    let Some(item) = item else { return Vec::new() };
+    let mut out = Vec::new();
+    for tag in &item.block.tags {
+        if let Tag::Return(r) = tag {
+            out.extend(r.items.iter().map(|i| i.ty.clone()));
+        }
+    }
+    out
+}
+
+/// Every `---@overload fun(...)` on the item, as a structured parameter/return
+/// pair (a non-`fun` overload type is a malformed annotation and is skipped).
+fn collect_overloads(item: Option<&AnnotatedItem>) -> Vec<(Vec<SigParam>, Vec<TypeExpr>)> {
+    let Some(item) = item else { return Vec::new() };
+    item.block
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let Tag::Overload(o) = tag else { return None };
+            let (params, returns) = as_function_type(&o.ty)?;
+            Some((
+                params.iter().map(fun_param_to_sig).collect(),
+                returns.iter().map(|r| r.ty.clone()).collect(),
+            ))
+        })
+        .collect()
+}
+
+/// A `fun(...)` type's parameter has no `---@param`-style doc line. Public:
+/// also used by [`crate::signature_help`] for the class-field method route.
+#[must_use]
+pub fn fun_param_to_sig(p: &FunParam) -> SigParam {
+    SigParam {
+        name: p.name.clone(),
+        ty: p.ty.clone(),
+        optional: p.optional,
+        vararg: p.vararg,
+        doc: None,
+    }
 }
 
 /// Render a LuaCATS type expression back to source-ish text.
