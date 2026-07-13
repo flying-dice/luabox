@@ -62,10 +62,14 @@ the cost of a few false negatives. The standalone tag is associated to its class
 through the `function Carrier:method` path; a visibility tag on a bare
 `Carrier.method = function() … end` assignment is not yet wired.
 
-Two edges of `---@deprecated` are not yet covered: a `:` method call
-(`obj:m()`) and a class type used as an annotation — the P0 checker does not
-resolve method receivers, so a deprecated method reached through a colon call
-is not flagged.
+A `:` method call whose receiver resolves (through inference) to a single
+declared `---@class` is now argument-checked against the method's signature and
+flags a `---@deprecated` method at the call site (#118), the same as a
+dotted/free call. Resolution is deliberately conservative: when the receiver is
+not a single declared class — an unknown/`any`/union receiver, a plain inferred
+table, an unannotated method, or an unresolved metatable — the `:` call is left
+unchecked (no false positives). One `---@deprecated` edge remains uncovered: a
+class type used purely as an annotation (not through a value use site).
 
 One edge of `---@operator` is out of scope: **`---@operator call` (making a
 value callable) is parsed but not applied.** The overload mechanism types

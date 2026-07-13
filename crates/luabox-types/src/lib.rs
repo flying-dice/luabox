@@ -314,6 +314,7 @@ pub fn check_file_with_requires<S: std::hash::BuildHasher>(
             strictness == Strictness::Strict,
             is_meta,
             &inference.expr_types,
+            &inference.method_sigs,
             &inference.carrier_final,
             &inference.carrier_class_final,
         ));
@@ -977,6 +978,200 @@ function Tag:size()
 end
 ";
         assert_eq!(strict_codes_ambient(bad), vec!["LB0300"]);
+    }
+
+    // --- #118 `:` method-call checking through class shapes ------------------
+
+    /// A class carrying a typed method and a `---@deprecated` method, plus a
+    /// `---@return Class` constructor — the shared fixture for the `:`-call
+    /// resolution tests.
+    const WIDGET_CLASS: &str = "\
+---@class Widget
+---@field size number
+local Widget = {}
+Widget.__index = Widget
+
+---@param w number
+---@return number
+function Widget:resize(w)
+  return w
+end
+
+---@deprecated
+function Widget:legacy() end
+
+---@param n number
+---@return Widget
+function Widget.new(n)
+  return setmetatable({ size = n }, Widget)
+end
+";
+
+    #[test]
+    fn method_call_wrong_arg_type_flagged() {
+        let src = format!(
+            "{WIDGET_CLASS}
+local w = Widget.new(1)
+w:resize(\"nope\")
+"
+        );
+        assert_eq!(strict_codes_ambient(&src), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn method_call_correct_arg_is_clean() {
+        let src = format!(
+            "{WIDGET_CLASS}
+local w = Widget.new(1)
+w:resize(2)
+"
+        );
+        assert_eq!(strict_codes_ambient(&src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn method_call_wrong_arity_flagged() {
+        // The implicit `self` is not counted: `resize` takes one explicit
+        // argument, so zero and two both mis-arity (LB0301).
+        let src = format!(
+            "{WIDGET_CLASS}
+local w = Widget.new(1)
+w:resize()
+w:resize(2, 3)
+"
+        );
+        assert_eq!(strict_codes_ambient(&src), vec!["LB0301", "LB0301"]);
+    }
+
+    #[test]
+    fn deprecated_method_call_flagged() {
+        let src = format!(
+            "{WIDGET_CLASS}
+local w = Widget.new(1)
+w:legacy()
+"
+        );
+        assert_eq!(strict_codes_ambient(&src), vec!["LB0308"]);
+    }
+
+    #[test]
+    fn deprecated_method_call_is_warning_even_under_strict() {
+        let src = format!(
+            "{WIDGET_CLASS}
+local w = Widget.new(1)
+w:legacy()
+"
+        );
+        let parse = lua::parse(&src, lua::Dialect::Lua54);
+        assert_eq!(parse.errors(), &[], "fixture must parse cleanly");
+        let diags = check_file_with_ambient(
+            &parse,
+            "test.lua",
+            Strictness::Strict,
+            Some(stdlib_defs(lua::Dialect::Lua54)),
+        );
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code.to_string(), "LB0308");
+        assert_eq!(diags[0].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn method_call_via_self_resolves_and_checks() {
+        // Inside a method, `self` resolves to the declared class: a wrong-typed
+        // `self:resize(...)` is checked, and `self:legacy()` flags deprecation.
+        let src = format!(
+            "{WIDGET_CLASS}
+function Widget:grow()
+  self:resize(\"bad\")
+  self:legacy()
+end
+"
+        );
+        assert_eq!(strict_codes_ambient(&src), vec!["LB0300", "LB0308"]);
+    }
+
+    #[test]
+    fn method_call_via_typed_local_resolves() {
+        let src = format!(
+            "{WIDGET_CLASS}
+---@type Widget
+local w
+w:resize(\"bad\")
+"
+        );
+        assert_eq!(strict_codes_ambient(&src), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn method_call_inherited_through_parent_resolves() {
+        // A subclass instance reaches the parent's typed method through the
+        // `__index` chain: `Derived` indexes into `Base`, so `d:resize(...)`
+        // resolves to `Base.resize` and its argument is checked.
+        let src = "\
+---@class Base
+local Base = {}
+Base.__index = Base
+
+---@param w number
+function Base:resize(w) end
+
+---@class Derived : Base
+local Derived = setmetatable({}, { __index = Base })
+Derived.__index = Derived
+
+---@return Derived
+function Derived.new()
+  return setmetatable({}, Derived)
+end
+
+local d = Derived.new()
+d:resize(\"bad\")
+";
+        assert_eq!(strict_codes_ambient(src), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn method_call_unknown_receiver_is_silent() {
+        // An `any`/unknown receiver resolves to no class: nothing is reported,
+        // even with an obviously wrong argument (mandatory conservatism).
+        let src = format!(
+            "{WIDGET_CLASS}
+---@param x any
+local function use(x)
+  x:resize(\"whatever\")
+end
+"
+        );
+        assert_eq!(strict_codes_ambient(&src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn method_call_plain_table_receiver_is_silent() {
+        // A plain inferred table with no declared class carries no method
+        // signature: the `:` call is not checked.
+        let src = "\
+local t = {}
+function t.thing(a, b) return a end
+t:thing(1)
+";
+        assert_eq!(strict_codes_ambient(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn method_call_unknown_method_adds_no_arg_finding() {
+        // A method the class does not declare resolves to no signature, so the
+        // argument checker stays silent — it manufactures no arity/type
+        // finding. Inference's own `undefined-field` rule (#90, LB0306) owns
+        // the "no such method" finding; the `:`-call arg check adds nothing.
+        let src = format!(
+            "{WIDGET_CLASS}
+local w = Widget.new(1)
+w:nonexistent(1, 2, 3)
+"
+        );
+        let codes = strict_codes_ambient(&src);
+        assert_eq!(codes, vec!["LB0306"]);
+        assert!(!codes.iter().any(|c| c == "LB0300" || c == "LB0301"));
     }
 
     // --- enums, aliases, LB0305 -----------------------------------------

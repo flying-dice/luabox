@@ -8,20 +8,25 @@
 //!    literals, table constructors (checked *field-by-field* against the
 //!    parameter's structural shape), `---@type` locals, references to
 //!    annotated functions, and calls to annotated functions (their first
-//!    return; a call in last position expands to all returns).
+//!    return; a call in last position expands to all returns). A `:` method
+//!    call whose receiver resolves (through inference) to a declared
+//!    `---@class` is checked against the method's signature the same way —
+//!    its *explicit* arguments (minus the implicit `self`) against the
+//!    method's parameters.
 //! b. **Assignments** to `---@type` locals.
 //! c. **Returns** inside functions carrying `---@return`: count + types.
 //!
 //! Everything unannotated is `unknown` — permissive in warn mode, an error
 //! source in strict mode (SPEC.md §3). No inference beyond literals:
-//! TODO(P1) bidirectional inference, narrowing, metatables, method calls.
+//! TODO(P1) bidirectional inference, narrowing, metatables.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use luabox_diag::{Code, Diagnostic, Label, Severity, Span};
 use luabox_syntax::lua::ast::{
-    AstNode, Block, CallExpr, Expr, ParamList, ReturnStmt, SourceFile, Stmt, TableExpr,
+    ArgList, AstNode, Block, CallExpr, Expr, MethodCallExpr, ParamList, ReturnStmt, SourceFile,
+    Stmt, TableExpr,
 };
 use luabox_syntax::lua::{self, SyntaxNode};
 
@@ -54,6 +59,7 @@ pub(crate) fn run(
     strict: bool,
     is_meta: bool,
     inferred: &HashMap<(usize, usize), Ty>,
+    method_sigs: &HashMap<(usize, usize), FunctionTy>,
     carrier_final: &HashMap<(usize, usize), Ty>,
     carrier_class_final: &HashMap<String, Ty>,
 ) -> Vec<Diagnostic> {
@@ -69,6 +75,7 @@ pub(crate) fn run(
         severity,
         is_meta,
         inferred,
+        method_sigs,
         carrier_final,
         carrier_class_final,
         deferred_carriers: Vec::new(),
@@ -170,6 +177,12 @@ struct Checker<'a> {
     /// Inference results by byte range (rich table inference, SPEC.md §3):
     /// the fallback for expressions annotations cannot type.
     inferred: &'a HashMap<(usize, usize), Ty>,
+    /// Resolved `:` method-call signatures keyed by the method-call
+    /// expression's byte range — inference's method resolution (#118). Present
+    /// only when the receiver resolved to a declared `---@class` and the method
+    /// is an annotated function; the checker argument-checks the call against
+    /// it and reports nothing when it is absent (conservatism).
+    method_sigs: &'a HashMap<(usize, usize), FunctionTy>,
     /// Final accumulated shape of each `---@type` carrier local, keyed by the
     /// `local` statement's byte range (whole-carrier deferral).
     /// `---@class` carriers publish their reified shape here too (#107).
@@ -674,7 +687,7 @@ impl Checker<'_> {
                 self.visit_arg_exprs(call.args());
             }
             Expr::MethodCall(call) => {
-                // TODO(P1): resolve method receivers through class shapes.
+                self.check_method_call(call);
                 self.visit_opt_expr(call.receiver());
                 self.visit_arg_exprs(call.args());
             }
@@ -1134,7 +1147,7 @@ impl Checker<'_> {
     }
 
     fn check_call(&mut self, call: &CallExpr) {
-        let Some(mut sig) = call.callee().and_then(|c| self.callee_sig(&c)) else {
+        let Some(sig) = call.callee().and_then(|c| self.callee_sig(&c)) else {
             return;
         };
         let (mut slots, string_arg) = call_slots(call);
@@ -1142,14 +1155,73 @@ impl Checker<'_> {
             slots.push(Slot::Ty(ty, range));
         }
         let open_ended = self.expand_last(&mut slots);
+        self.check_arg_slots(sig, &slots, open_ended, range(call.syntax()));
+    }
 
+    /// Check a `:` method call against its resolved method signature. The
+    /// inference engine resolves the receiver through class shapes /
+    /// `__index` / `self`, and publishes the method's signature keyed by the
+    /// call's byte range *only* when the receiver is a declared `---@class`
+    /// and the member is an annotated function ([`Checker::method_sigs`]) —
+    /// so this is a strict no-op for an unknown/`any`/union receiver, a plain
+    /// inferred table with no declared class, an unannotated method, or an
+    /// unresolved metatable (SPEC §19 conservatism; no false positives).
+    ///
+    /// When a signature is present, the call's *explicit* arguments (the
+    /// implicit `self` stripped from the signature) are checked exactly like a
+    /// dotted/free call through the same [`Checker::check_arg_slots`] path, and
+    /// a `---@deprecated` method is flagged at its name span (luals
+    /// `deprecated`, LB0308).
+    fn check_method_call(&mut self, call: &MethodCallExpr) {
+        let Some(sig) = self.method_sigs.get(&range_key(call.syntax())) else {
+            return;
+        };
+        let mut sig = sig.clone();
+        // The implicit `self` receiver is never an explicit argument. It only
+        // appears in the signature when declared with an explicit
+        // `---@param self T` or reified from an unannotated body; drop it so the
+        // parameters line up with the supplied arguments.
+        if sig.params.first().is_some_and(|p| p.name == "self") {
+            sig.params.remove(0);
+        }
+        if sig.deprecated
+            && let Some(method) = call.method_name()
+        {
+            let r = method.text_range();
+            self.report_warning(
+                DEPRECATED,
+                usize::from(r.start())..usize::from(r.end()),
+                format!("use of deprecated `{}`", method.text()),
+                format!("`{}` is marked `---@deprecated`", method.text()),
+            );
+        }
+        let (mut slots, string_arg) = arg_slots(call.args());
+        if let Some((ty, range)) = string_arg {
+            slots.push(Slot::Ty(ty, range));
+        }
+        let open_ended = self.expand_last(&mut slots);
+        self.check_arg_slots(sig, &slots, open_ended, range(call.syntax()));
+    }
+
+    /// Arity- and type-check a resolved call: shared by dotted/free calls
+    /// ([`Checker::check_call`]) and `:` method calls
+    /// ([`Checker::check_method_call`]). `slots` are the already-collected
+    /// argument slots (with any trailing multi-value expansion applied);
+    /// `call_range` anchors the too-few-arguments diagnostic.
+    fn check_arg_slots(
+        &mut self,
+        mut sig: FunctionTy,
+        slots: &[Slot],
+        open_ended: bool,
+        call_range: Range<usize>,
+    ) {
         // A generic function (`---@generic T`): infer the type variables from
         // the argument types, verify any constraints, then monomorphise the
         // signature so arg/return checking runs against the bound types (#84).
         if !sig.generics.is_empty() {
             let arg_tys: Vec<Ty> = slots.iter().map(|s| self.slot_ty(s)).collect();
             let map = crate::generics::infer_call(&sig, &arg_tys);
-            self.check_generic_constraints(&sig, &map, &slots);
+            self.check_generic_constraints(&sig, &map, slots);
             sig = crate::generics::subst_function(&sig, &map);
         }
 
@@ -1158,11 +1230,11 @@ impl Checker<'_> {
         // `---@overload`. Only when none match do we report against the
         // primary (TODO(P1): pick and report the closest overload).
         if !sig.overloads.is_empty()
-            && (self.call_accepts(&sig, &slots, open_ended)
+            && (self.call_accepts(&sig, slots, open_ended)
                 || sig
                     .overloads
                     .iter()
-                    .any(|o| self.call_accepts(o, &slots, open_ended)))
+                    .any(|o| self.call_accepts(o, slots, open_ended)))
         {
             return;
         }
@@ -1170,7 +1242,6 @@ impl Checker<'_> {
         let supplied = slots.len();
         let required = sig.required_params();
         let max = sig.params.len();
-        let call_range = range(call.syntax());
 
         if supplied < required && !open_ended {
             let least = if max > required || sig.varargs.is_some() {
@@ -1564,7 +1635,14 @@ fn range(node: &SyntaxNode) -> Range<usize> {
 /// Collect a call's argument slots: a parenthesised list, a sole table
 /// constructor (`f{ ... }`), or a sole string (`f"s"`).
 fn call_slots(call: &CallExpr) -> (Vec<Slot>, Option<(Ty, Range<usize>)>) {
-    let Some(args) = call.args() else {
+    arg_slots(call.args())
+}
+
+/// Collect the argument slots of an [`ArgList`] — the shared core behind
+/// [`call_slots`] and the `:` method-call path (both take the same
+/// parenthesised-list / sole-table / sole-string argument forms).
+fn arg_slots(args: Option<ArgList>) -> (Vec<Slot>, Option<(Ty, Range<usize>)>) {
+    let Some(args) = args else {
         return (Vec::new(), None);
     };
     if let Some(list) = args.expr_list() {

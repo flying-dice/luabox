@@ -74,6 +74,14 @@ pub(crate) struct Outcome {
     /// annotation checker cannot type itself are published; `unknown`
     /// results are omitted.
     pub(crate) expr_types: HashMap<Key, Ty>,
+    /// The resolved function signature of a `:` method call, keyed by the
+    /// method-call expression's byte range. Published only when the receiver
+    /// resolves to a concrete field whose type is a function — the engine's
+    /// method resolution the annotation checker consumes to argument-check the
+    /// call (#118). The signature is as-declared (including its `self`
+    /// parameter, if any, and `---@deprecated`); the checker strips the
+    /// implicit `self` before matching explicit arguments.
+    pub(crate) method_sigs: HashMap<Key, FunctionTy>,
     /// Inference's own diagnostics (`LB0306`).
     pub(crate) diags: Vec<Diagnostic>,
     /// Final reified type of every binding, in declaration order (the
@@ -193,6 +201,7 @@ pub(crate) fn run(
         declared: HashSet::new(),
         globals: HashMap::new(),
         expr_types: HashMap::new(),
+        method_sigs: HashMap::new(),
         diags: Vec::new(),
         memo: HashMap::new(),
         reify_stack: Vec::new(),
@@ -254,6 +263,7 @@ pub(crate) fn run(
     }
     Outcome {
         expr_types: infer.expr_types,
+        method_sigs: infer.method_sigs,
         diags: infer.diags,
         binding_types,
         fn_returns,
@@ -470,6 +480,7 @@ struct Infer<'a> {
     declared: HashSet<BindingId>,
     globals: HashMap<String, ITy>,
     expr_types: HashMap<Key, Ty>,
+    method_sigs: HashMap<Key, FunctionTy>,
     diags: Vec<Diagnostic>,
     memo: HashMap<usize, Ty>,
     reify_stack: Vec<usize>,
@@ -2751,8 +2762,28 @@ impl Infer<'_> {
         }
         match self.lookup_field(&recv, &method) {
             Lookup::Found(f) => {
-                if let Some(class) = self.receiver_class(&recv) {
-                    self.check_visibility(body, expr, &class, &method);
+                let recv_class = self.receiver_class(&recv);
+                if let Some(class) = &recv_class {
+                    self.check_visibility(body, expr, class, &method);
+                }
+                // Publish the resolved method signature so the annotation
+                // checker can argument-check the `:` call (#118). Gated on:
+                //  - the receiver resolving to a declared `---@class` — a plain
+                //    inferred table's method carries no checkable contract;
+                //  - the resolved member being an *annotated* function value
+                //    (a `---@field m fun(...)` or a `function C:m` carrying a
+                //    `---@param`/`---@return`/`---@deprecated` signature). An
+                //    unannotated method reifies to a `fun` with `unknown`
+                //    parameters and would manufacture arity errors, so — exactly
+                //    as an unannotated free function is never arity-checked — it
+                //    is left unpublished (mandatory conservatism).
+                // Only pass 1's resolution is published, matching `expr_types`.
+                if self.pass == 1
+                    && recv_class.is_some()
+                    && let ITy::Ty(Ty::Function(sig)) = &f
+                    && let Some(key) = self.expr_range(body, expr)
+                {
+                    self.method_sigs.insert(key, (**sig).clone());
                 }
                 match &f {
                     ITy::Func(fn_body) => self.record_arg_seeds(*fn_body, &arg_itys, true),
