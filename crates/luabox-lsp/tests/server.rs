@@ -12,7 +12,8 @@ use lsp_types::notification::{
 };
 use lsp_types::request::{
     Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, InlayHintRequest,
-    RangeFormatting, References, Request as _, SemanticTokensFullRequest, Shutdown,
+    PrepareRenameRequest, RangeFormatting, References, Rename, Request as _,
+    SemanticTokensFullRequest, Shutdown,
 };
 use lsp_types::{
     CompletionItemKind, CompletionParams, CompletionResponse, DiagnosticSeverity,
@@ -20,11 +21,11 @@ use lsp_types::{
     DocumentFormattingParams, DocumentRangeFormattingParams, DocumentSymbolParams,
     DocumentSymbolResponse, FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse,
     HoverContents, HoverParams, InitializeParams, InlayHint, InlayHintLabel, InlayHintParams,
-    NumberOrString, PartialResultParams, Position, PublishDiagnosticsParams, Range,
-    ReferenceContext, ReferenceParams, SemanticToken, SemanticTokensParams, SemanticTokensResult,
-    SymbolKind, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, TextEdit, Uri, VersionedTextDocumentIdentifier,
-    WorkDoneProgressParams, WorkspaceFolder,
+    NumberOrString, PartialResultParams, Position, PrepareRenameResponse, PublishDiagnosticsParams,
+    Range, ReferenceContext, ReferenceParams, RenameParams, SemanticToken, SemanticTokensParams,
+    SemanticTokensResult, SymbolKind, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, TextEdit, Uri, VersionedTextDocumentIdentifier,
+    WorkDoneProgressParams, WorkspaceEdit, WorkspaceFolder,
 };
 use tempfile::TempDir;
 
@@ -226,6 +227,35 @@ impl TestClient {
         .unwrap_or_default()
     }
 
+    fn rename(
+        &mut self,
+        uri: &Uri,
+        line: u32,
+        character: u32,
+        new_name: &str,
+    ) -> Option<WorkspaceEdit> {
+        self.request::<Rename>(RenameParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line, character },
+            },
+            new_name: new_name.to_string(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        })
+    }
+
+    fn prepare_rename(
+        &mut self,
+        uri: &Uri,
+        line: u32,
+        character: u32,
+    ) -> Option<PrepareRenameResponse> {
+        self.request::<PrepareRenameRequest>(TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            position: Position { line, character },
+        })
+    }
+
     fn complete(&mut self, uri: &Uri, line: u32, character: u32) -> Vec<lsp_types::CompletionItem> {
         let response = self.request::<Completion>(CompletionParams {
             text_document_position: TextDocumentPositionParams {
@@ -386,6 +416,46 @@ fn range(start: (u32, u32), end: (u32, u32)) -> Range {
         start: Position::new(start.0, start.1),
         end: Position::new(end.0, end.1),
     }
+}
+
+/// The source text covered by an LSP range (UTF-16 positions → bytes via the
+/// same line index the server uses), for asserting an edit is name-precise.
+fn edit_text(source: &str, range: Range) -> &str {
+    let index = luabox_lsp::LineIndex::new(source);
+    let start = index.offset(range.start);
+    let end = index.offset(range.end);
+    &source[start..end]
+}
+
+/// Assert every edit in `changes` sets text `new` over a range that spans
+/// exactly `old` in its file, returning the total edit count. Files are matched
+/// to edits by URI suffix. This is the correctness invariant: a rename edit
+/// must replace the bare identifier, never a wider span.
+#[allow(clippy::mutable_key_type, reason = "Uri key matches WorkspaceEdit")]
+fn assert_edits_are(
+    changes: &WorkspaceEdit,
+    files: &[(&str, &str)],
+    old: &str,
+    new: &str,
+) -> usize {
+    let map = changes.changes.as_ref().expect("changes");
+    let mut total = 0;
+    for (uri, edits) in map {
+        let source = files
+            .iter()
+            .find(|(rel, _)| uri.as_str().ends_with(rel))
+            .map_or_else(|| panic!("no source for {uri:?}"), |(_, s)| *s);
+        for edit in edits {
+            assert_eq!(edit.new_text, new, "{edit:?}");
+            assert_eq!(
+                edit_text(source, edit.range),
+                old,
+                "edit range must be exactly `{old}` in {uri:?}: {edit:?}"
+            );
+            total += 1;
+        }
+    }
+    total
 }
 
 fn hover_text(hover: &lsp_types::Hover) -> &str {
@@ -704,6 +774,105 @@ fn references_of_global_function_span_files() {
         without.iter().all(|l| l.uri.as_str() == b_uri.as_str()),
         "only uses remain: {without:?}"
     );
+    client.shutdown();
+}
+
+// === Rename ==============================================================
+
+#[test]
+fn initialize_advertises_rename_with_prepare() {
+    let client = start(&[]);
+    // `renameProvider` is the options object, so prepareRename is advertised.
+    assert_eq!(
+        client.init_result["capabilities"]["renameProvider"]["prepareProvider"],
+        true
+    );
+    client.shutdown();
+}
+
+#[test]
+fn rename_local_updates_every_use_and_declaration_name_precise() {
+    let src = "local value = 1\nprint(value)\nreturn value + value\n";
+    let files = &[("main.lua", src)];
+    let client = start(files);
+    let uri = client.uri("main.lua");
+    client.open(&uri, src);
+    let mut client = client;
+    // Cursor on `value` inside `print(value)` (line 1).
+    let edit = client.rename(&uri, 1, 8, "amount").expect("rename");
+    // One file, declaration plus three uses, each replacing exactly `value`.
+    assert_eq!(edit.changes.as_ref().unwrap().len(), 1, "{edit:?}");
+    assert_eq!(assert_edits_are(&edit, files, "value", "amount"), 4);
+    client.shutdown();
+}
+
+#[test]
+fn rename_global_function_across_two_files() {
+    let files = &[
+        ("a.lua", "function greet() return 1 end\n"),
+        ("b.lua", "greet()\ngreet()\n"),
+    ];
+    let client = start(files);
+    let b_uri = client.uri("b.lua");
+    let mut client = client;
+    // Cursor on the first `greet` call in b.lua.
+    let edit = client.rename(&b_uri, 0, 0, "hello").expect("rename");
+    // Two files: the declaration in a.lua plus two calls in b.lua.
+    assert_eq!(edit.changes.as_ref().unwrap().len(), 2, "{edit:?}");
+    assert_eq!(assert_edits_are(&edit, files, "greet", "hello"), 3);
+    client.shutdown();
+}
+
+#[test]
+fn rename_class_field_across_files_narrows_field_annotation() {
+    // The `---@field x number` declaration must be narrowed to `x`, never the
+    // whole annotation line.
+    let files = &[
+        ("point.lua", "---@class Point\n---@field x number\n"),
+        (
+            "use.lua",
+            "---@type Point\nlocal p = nil\nprint(p.x)\nprint(p.x)\n",
+        ),
+    ];
+    let client = start(files);
+    let use_uri = client.uri("use.lua");
+    let mut client = client;
+    // Cursor on the `x` of the first `p.x` (line 2, `print(p.x)` → col 8).
+    let edit = client.rename(&use_uri, 2, 8, "col").expect("rename");
+    // Two files: the `@field` decl in point.lua plus two accesses in use.lua.
+    assert_eq!(edit.changes.as_ref().unwrap().len(), 2, "{edit:?}");
+    assert_eq!(assert_edits_are(&edit, files, "x", "col"), 3);
+    client.shutdown();
+}
+
+#[test]
+fn prepare_rename_returns_the_identifier_range() {
+    let src = "local value = 1\nprint(value)\n";
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, src);
+    let mut client = client;
+    // Cursor inside `value` in `print(value)`.
+    let response = client.prepare_rename(&uri, 1, 8).expect("prepare");
+    match response {
+        PrepareRenameResponse::Range(selected) => {
+            // `value` on line 1, columns 6..11 — the identifier, nothing wider.
+            assert_eq!(selected, range((1, 6), (1, 11)));
+        }
+        other => panic!("expected a bare range, got {other:?}"),
+    }
+    client.shutdown();
+}
+
+#[test]
+fn prepare_rename_on_a_non_symbol_returns_none() {
+    let src = "local value = 1\n";
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, src);
+    let mut client = client;
+    // Cursor on the numeric literal `1` — not a renameable symbol.
+    assert!(client.prepare_rename(&uri, 0, 14).is_none());
     client.shutdown();
 }
 

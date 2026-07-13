@@ -24,15 +24,17 @@ use lsp_types::notification::{
 };
 use lsp_types::request::{
     Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, InlayHintRequest,
-    RangeFormatting, References, Request as _, SemanticTokensFullRequest,
+    PrepareRenameRequest, RangeFormatting, References, Rename, Request as _,
+    SemanticTokensFullRequest,
 };
 use lsp_types::{
     CompletionOptions, CompletionResponse, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DocumentSymbolResponse, GotoDefinitionResponse, Hover,
     HoverProviderCapability, InitializeParams, InitializeResult, InlayHint, Location, OneOf,
-    PublishDiagnosticsParams, SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions,
-    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri,
+    PrepareRenameResponse, PublishDiagnosticsParams, RenameOptions, SemanticTokens,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
 };
 use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
 use luabox_resolve::manifest::{Dependency, Manifest};
@@ -41,8 +43,8 @@ use luabox_types::{Ambient, combined_defs};
 use crate::sema::FileSema;
 use crate::uri::uri_to_path;
 use crate::{
-    completion, diagnostics, fmt, goto_def, hover, inlay_hints, references, semantic_tokens,
-    symbols,
+    completion, diagnostics, fmt, goto_def, hover, inlay_hints, references, rename,
+    semantic_tokens, symbols,
 };
 
 /// Run the server over stdio until the client sends `shutdown`/`exit`.
@@ -81,14 +83,21 @@ pub fn run(connection: Connection) -> anyhow::Result<()> {
 /// The capabilities advertised at initialize: full sync, hover, definition,
 /// completion triggered on `.`/`:`, document symbols, whole-document and
 /// range formatting (range formats the whole document — see [`crate::fmt`]),
-/// semantic tokens (full) with a standard-types-only legend, and inlay
-/// hints (inferred binding types, see [`crate::inlay_hints`]).
+/// semantic tokens (full) with a standard-types-only legend, inlay hints
+/// (inferred binding types, see [`crate::inlay_hints`]), and rename with
+/// prepare support (see [`crate::rename`]).
 fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         definition_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
+        // `prepare_provider` advertises textDocument/prepareRename, so the
+        // editor pre-selects the identifier before prompting for a new name.
+        rename_provider: Some(OneOf::Right(RenameOptions {
+            prepare_provider: Some(true),
+            work_done_progress_options: lsp_types::WorkDoneProgressOptions::default(),
+        })),
         inlay_hint_provider: Some(OneOf::Left(true)),
         completion_provider: Some(CompletionOptions {
             trigger_characters: Some(vec![".".to_string(), ":".to_string()]),
@@ -354,6 +363,17 @@ impl Server {
                 );
                 Response::new_ok(id, result)
             }
+            Rename::METHOD => {
+                let (id, params) = cast_request::<Rename>(req)?;
+                let doc = params.text_document_position;
+                let result = self.rename(&doc.text_document.uri, doc.position, &params.new_name);
+                Response::new_ok(id, result)
+            }
+            PrepareRenameRequest::METHOD => {
+                let (id, params) = cast_request::<PrepareRenameRequest>(req)?;
+                let result = self.prepare_rename(&params.text_document.uri, params.position);
+                Response::new_ok(id, result)
+            }
             Completion::METHOD => {
                 let (id, params) = cast_request::<Completion>(req)?;
                 let doc = params.text_document_position;
@@ -430,6 +450,37 @@ impl Server {
         let sema = FileSema::new(&snapshot, &path)?;
         let offset = sema.index.offset(position);
         references::references(&snapshot, &sema, offset, include_declaration)
+    }
+
+    /// A [`WorkspaceEdit`] renaming the symbol at `position` to `new_name`,
+    /// touching every reference and its declaration across the workspace
+    /// (reusing the same reference finder, then narrowing each edit to the bare
+    /// identifier token; see [`crate::rename`]).
+    fn rename(
+        &self,
+        uri: &Uri,
+        position: lsp_types::Position,
+        new_name: &str,
+    ) -> Option<WorkspaceEdit> {
+        let path = uri_to_path(uri)?;
+        let snapshot = self.host.snapshot();
+        let sema = FileSema::new(&snapshot, &path)?;
+        let offset = sema.index.offset(position);
+        rename::rename(&snapshot, &sema, offset, new_name)
+    }
+
+    /// The identifier range under `position` for the editor to pre-select, or
+    /// `None` when the position is not a renameable symbol.
+    fn prepare_rename(
+        &self,
+        uri: &Uri,
+        position: lsp_types::Position,
+    ) -> Option<PrepareRenameResponse> {
+        let path = uri_to_path(uri)?;
+        let snapshot = self.host.snapshot();
+        let sema = FileSema::new(&snapshot, &path)?;
+        let offset = sema.index.offset(position);
+        rename::prepare_rename(&snapshot, &sema, offset).map(PrepareRenameResponse::Range)
     }
 
     fn completion(

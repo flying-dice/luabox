@@ -40,6 +40,7 @@ mod hover;
 mod inlay_hints;
 mod line_index;
 mod references;
+mod rename;
 mod sema;
 mod semantic_tokens;
 mod server;
