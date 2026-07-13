@@ -205,6 +205,8 @@ pub struct TypeEnv {
     as_casts: HashMap<usize, Ty>,
     /// References to undeclared type names (LB0305): `(name, span)`.
     pub(crate) unknown_names: Vec<(String, luacats::Span)>,
+    /// Generic references whose `<...>` argument count is wrong (LB0313, #117).
+    pub(crate) arity_errors: Vec<crate::lower::ArityError>,
     /// The `---@class` names declared by *this* file's own annotations (not
     /// the ambient/defs layer seeded beneath). The `package`-visibility test
     /// (luals `invisible`, #115): a `package` member is accessible only in the
@@ -316,6 +318,7 @@ impl TypeEnv {
             }
         }
         env.unknown_names = std::mem::take(&mut lowerer.unknown_names);
+        env.arity_errors = std::mem::take(&mut lowerer.arity_errors);
         env
     }
 
@@ -376,6 +379,7 @@ impl TypeEnv {
             merge_keep_first(&mut env.functions, file_env.functions);
             merge_keep_first(&mut env.global_types, file_env.global_types);
             env.unknown_names.append(&mut lowerer.unknown_names.clone());
+            env.arity_errors.append(&mut lowerer.arity_errors.clone());
         }
         (env, aliases)
     }

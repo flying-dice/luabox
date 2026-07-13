@@ -1011,6 +1011,73 @@ run(\"medium\")
     }
 
     #[test]
+    fn alias_multiline_literal_quote_forms() {
+        // #116: the multiline `---|` member forms `'"x"'`, `"x"`, and `'x'`
+        // all denote the literal value `x` — the wrapping quotes are syntax,
+        // not content — so every valid call is accepted and only the odd one
+        // out is rejected.
+        let src = "\
+---@alias Level
+---| '\"debug\"' # verbose
+---| \"info\"
+---| 'warn'
+
+---@param l Level
+local function set_level(l) end
+set_level(\"debug\")
+set_level(\"info\")
+set_level(\"warn\")
+set_level(\"nope\")
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn generic_alias_substitutes() {
+        // #117: `Pair<number>` monomorphises `{ first: T, second: T }`, so the
+        // string `second` is caught against `number`.
+        let src = "\
+---@alias Pair<T> { first: T, second: T }
+---@type Pair<number>
+local bad = { first = 1, second = \"two\" }
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn generic_alias_valid_instantiation() {
+        let src = "\
+---@alias Pair<T> { first: T, second: T }
+---@type Pair<number>
+local ok = { first = 1, second = 2 }
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn generic_alias_bare_reference_is_lenient() {
+        // A bare `Pair` (no `<...>`) resolves its params to `unknown` — no
+        // arity error, no field checking — matching luals and generic classes.
+        let src = "\
+---@alias Pair<T> { first: T, second: T }
+---@type Pair
+local anything = { first = 1, second = \"two\" }
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn generic_alias_arity_mismatch_reported() {
+        // #117: an explicit `<...>` list of the wrong length is LB0313.
+        let src = "\
+---@alias Pair<T> { first: T, second: T }
+---@type Pair<number, string>
+local x = { first = 1, second = 2 }
+";
+        assert_eq!(strict_codes(src), vec!["LB0313"]);
+    }
+
+    #[test]
     fn unknown_type_name_reported() {
         let src = "\
 ---@param x Wibble

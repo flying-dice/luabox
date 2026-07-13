@@ -27,6 +27,18 @@ pub(crate) struct Declared {
     pub aliases: BTreeMap<String, AliasTag>,
 }
 
+/// A generic reference (`Name<A, B>`) whose explicit type-argument count does
+/// not match the template's parameter count — surfaced as LB0313 (#117). A
+/// bare `Name` (no `<...>`) is never an arity error: its missing arguments
+/// resolve leniently to `unknown`, matching luals and the generic-class path.
+#[derive(Debug, Clone)]
+pub(crate) struct ArityError {
+    pub name: String,
+    pub expected: usize,
+    pub got: usize,
+    pub span: Span,
+}
+
 /// A generic `---@class Name<T>`'s template: its parameter names and the
 /// lowered shape of its own `---@field`s, with each `T` kept as a
 /// `Ty::Named(T)` placeholder. A reference `Name<number>` instantiates this
@@ -54,6 +66,8 @@ pub(crate) struct Lowerer<'a> {
     stack: Vec<String>,
     /// `(name, span)` of every reference to an undeclared type name.
     pub unknown_names: Vec<(String, Span)>,
+    /// Generic references whose `<...>` argument count is wrong (LB0313, #117).
+    pub arity_errors: Vec<ArityError>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -64,6 +78,7 @@ impl<'a> Lowerer<'a> {
             generic_classes: BTreeMap::new(),
             stack: Vec::new(),
             unknown_names: Vec::new(),
+            arity_errors: Vec::new(),
         }
     }
 
@@ -128,7 +143,7 @@ impl<'a> Lowerer<'a> {
             return ty;
         }
         if self.decl.aliases.contains_key(name) {
-            return self.expand_alias(name);
+            return self.expand_alias(name, args, span);
         }
         if self.decl.classes.contains(name) || self.decl.enums.contains(name) {
             // A generic `---@class Name<T>`: monomorphise the template at the
@@ -184,7 +199,13 @@ impl<'a> Lowerer<'a> {
 
     /// Expand an alias body, guarding against cycles (`A = B`, `B = A`
     /// collapses to `unknown` rather than recursing forever).
-    fn expand_alias(&mut self, name: &str) -> Ty {
+    ///
+    /// A generic alias (`---@alias Name<T> …`) monomorphises like a generic
+    /// class (#117): its body is lowered with the `<T>` params in scope (each
+    /// `T` becoming a `Ty::Named` placeholder), then the reference-site type
+    /// arguments are substituted in. `args`/`span` come from the reference
+    /// site (`Name<number>`); a plain alias ignores both.
+    fn expand_alias(&mut self, name: &str, args: &[TypeExpr], span: Span) -> Ty {
         if self.stack.iter().any(|n| n == name) {
             return Ty::Unknown;
         }
@@ -192,6 +213,31 @@ impl<'a> Lowerer<'a> {
             return Ty::Unknown;
         };
         let alias = alias.clone();
+        let generic = !alias.params.is_empty();
+        // Lower the reference-site arguments in the *outer* scope, before the
+        // alias's own params shadow it. An explicit `<...>` list whose length
+        // differs from the parameter count is a generic-arity error; a bare
+        // `Name` (empty `args`) stays lenient.
+        let arg_tys: Vec<Ty> = if generic {
+            if !args.is_empty() && args.len() != alias.params.len() {
+                self.arity_errors.push(ArityError {
+                    name: name.to_string(),
+                    expected: alias.params.len(),
+                    got: args.len(),
+                    span,
+                });
+            }
+            args.iter().map(|a| self.lower(a)).collect()
+        } else {
+            Vec::new()
+        };
+        // Lower the body with the alias's params in scope (so each `T` is a
+        // placeholder, never LB0305).
+        let saved = generic.then(|| {
+            let mut scope = self.generics.clone();
+            scope.extend(alias.params.iter().cloned());
+            std::mem::replace(&mut self.generics, scope)
+        });
         self.stack.push(name.to_string());
         let mut members: Vec<Ty> = Vec::new();
         if let Some(ty) = &alias.ty {
@@ -201,7 +247,26 @@ impl<'a> Lowerer<'a> {
             members.push(self.lower(&member.ty));
         }
         self.stack.pop();
-        Ty::union(members)
+        if let Some(saved) = saved {
+            self.generics = saved;
+        }
+        let body = Ty::union(members);
+        if generic {
+            let map: BTreeMap<String, Ty> = alias
+                .params
+                .iter()
+                .enumerate()
+                .map(|(i, param)| {
+                    (
+                        param.clone(),
+                        arg_tys.get(i).cloned().unwrap_or(Ty::Unknown),
+                    )
+                })
+                .collect();
+            subst_ty(&body, &map)
+        } else {
+            body
+        }
     }
 
     fn lower_table(&mut self, fields: &[TableField]) -> Ty {
@@ -257,13 +322,31 @@ impl<'a> Lowerer<'a> {
 
 /// Strip the quotes from a string-literal type's raw text. Escape sequences
 /// are kept verbatim (MVP; literal-type comparison is textual).
-fn unquote(raw: &str) -> String {
+/// Strip one matching quote pair (`"x"` / `'x'`) from `raw`, returning the
+/// inner text and whether a pair was removed.
+fn strip_quote_pair(raw: &str) -> (&str, bool) {
     let bytes = raw.as_bytes();
     if bytes.len() >= 2
         && (bytes[0] == b'"' || bytes[0] == b'\'')
         && bytes[bytes.len() - 1] == bytes[0]
     {
-        raw[1..raw.len() - 1].to_string()
+        (&raw[1..raw.len() - 1], true)
+    } else {
+        (raw, false)
+    }
+}
+
+/// Unwrap a LuaCATS string-literal token to its value. luals accepts `"x"`,
+/// `'x'`, and the nested `'"x"'` / `"'x'"` form ubiquitous in `---|` enum
+/// members — all denote the literal value `x`. The wrapping quotes are
+/// syntax, not content, so we peel the outer pair and, when the remainder is
+/// itself a complete quoted literal, the inner pair too (one extra level, the
+/// only nesting luals recognises; see #116).
+fn unquote(raw: &str) -> String {
+    let (inner, stripped) = strip_quote_pair(raw);
+    if stripped {
+        let (inner2, _) = strip_quote_pair(inner);
+        inner2.to_string()
     } else {
         raw.to_string()
     }
@@ -403,6 +486,7 @@ mod tests {
             "Switch".to_string(),
             AliasTag {
                 name: "Switch".to_string(),
+                params: Vec::new(),
                 ty: Some(body),
                 members: Vec::new(),
                 span: Span::new(0, 0),
@@ -415,6 +499,7 @@ mod tests {
             "Loop".to_string(),
             AliasTag {
                 name: "Loop".to_string(),
+                params: Vec::new(),
                 ty: Some(loop_body),
                 members: Vec::new(),
                 span: Span::new(0, 0),

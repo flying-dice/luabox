@@ -36,6 +36,8 @@ const MISSING_FIELD: u16 = 302;
 const UNKNOWN_FIELD: u16 = 303;
 const RETURN_MISMATCH: u16 = 304;
 const UNKNOWN_TYPE_NAME: u16 = 305;
+/// Wrong number of generic type arguments (`Name<A, B>` vs its params, #117).
+const GENERIC_ARITY: u16 = 313;
 /// Use of a `---@deprecated` symbol (luals `deprecated`, #111).
 const DEPRECATED: u16 = 308;
 /// Discarded return of a `---@nodiscard` call (luals `discard-returns`, #112).
@@ -82,6 +84,22 @@ pub(crate) fn run(
             span.start..span.end,
             format!("unknown type name `{name}` in annotation"),
             "not a built-in, `---@class`, `---@alias`, or `---@enum` name".to_string(),
+            None,
+        );
+    }
+
+    for err in &typeenv.arity_errors {
+        let (n, params, args) = (&err.name, err.expected, err.got);
+        let plural = |n: usize| if n == 1 { "" } else { "s" };
+        checker.report_full(
+            GENERIC_ARITY,
+            err.span.start..err.span.end,
+            format!(
+                "`{n}` takes {params} type argument{}, but {args} {} supplied",
+                plural(params),
+                if args == 1 { "was" } else { "were" },
+            ),
+            format!("expected {params} type argument{}", plural(params)),
             None,
         );
     }

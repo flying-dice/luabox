@@ -167,6 +167,10 @@ pub struct AliasMember {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AliasTag {
     pub name: String,
+    /// Generic type parameters from a `---@alias Name<T[, U...]>` header,
+    /// substituted at each reference site (`Name<number>`). Empty for a plain
+    /// alias.
+    pub params: Vec<String>,
     pub ty: Option<TypeExpr>,
     pub members: Vec<AliasMember>,
     pub span: Span,
@@ -762,6 +766,10 @@ fn parse_type_tag(body: &str, base: usize, span: Span, errors: &mut Vec<LuaCatsE
 fn parse_alias(body: &str, base: usize, span: Span, errors: &mut Vec<LuaCatsError>) -> AliasTag {
     let (name, rest, rest_base) =
         take_name(body, base).unwrap_or_else(|| (String::new(), body, base));
+    // Generic parameter list `<T[, U...]>` directly after the name — a generic
+    // alias whose `T`s substitute at reference sites (#117), mirroring
+    // `parse_class`'s `<T>` handling.
+    let (params, rest, rest_base) = take_class_params(rest, rest_base);
     let (rest, rest_base) = lstrip(rest, rest_base);
     let ty = if rest.is_empty() {
         None
@@ -773,6 +781,7 @@ fn parse_alias(body: &str, base: usize, span: Span, errors: &mut Vec<LuaCatsErro
     };
     AliasTag {
         name,
+        params,
         ty,
         members: Vec::new(),
         span,

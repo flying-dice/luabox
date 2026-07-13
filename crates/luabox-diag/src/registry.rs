@@ -124,6 +124,11 @@ static REGISTRY: &[Entry] = &[
         explain: LB0312,
     },
     Entry {
+        code: Code::new(313),
+        title: "wrong number of generic type arguments",
+        explain: LB0313,
+    },
+    Entry {
         code: Code::new(500),
         title: "malformed `---@luabox-ignore`",
         explain: LB0500,
@@ -850,6 +855,35 @@ Access the member through the class's public API, or — if the access is
 deliberate — suppress it with the directive above.
 ";
 
+const LB0313: &str = "\
+# LB0313: wrong number of generic type arguments
+
+A reference to a generic `---@alias Name<T>` supplies an explicit `<...>`
+type-argument list whose length does not match the alias's parameter count.
+
+```lua
+---@alias Pair<T> { first: T, second: T }
+
+---@type Pair<number>          -- fine: one argument for one parameter
+---@type Pair<number, string>  -- LB0313: `Pair` takes 1 type argument, but 2 were supplied
+```
+
+Generic aliases monomorphise at each reference site: `Pair<number>`
+substitutes `number` for `T` and checks the body (`{ first: number, second:
+number }`), so a value like `{ first = 1, second = \"two\" }` is caught. An
+argument count that cannot be matched to the parameters leaves the
+substitution ambiguous, so it is reported here — riding the strictness ladder
+like its sibling `LB0305`: a **warning** in warn mode, an **error** in strict.
+
+A **bare** reference with no `<...>` (`---@type Pair`) is deliberately
+lenient — its missing arguments resolve to `unknown`, matching luals and the
+generic-`---@class` path — so only an explicit, mis-sized argument list is
+flagged.
+
+Supply exactly one type argument per declared parameter, or drop the `<...>`
+list entirely to accept the lenient `unknown` instantiation.
+";
+
 const LB0500: &str = "\
 # LB0500: malformed `---@luabox-ignore`
 
@@ -1352,9 +1386,9 @@ mod tests {
         for raw in [
             "LB0001", "LB0010", "LB0011", "LB0012", "LB0013", "LB0014", "LB0015", "LB0016",
             "LB0300", "LB0301", "LB0302", "LB0303", "LB0304", "LB0305", "LB0306", "LB0307",
-            "LB0308", "LB0309", "LB0310", "LB0311", "LB0312", "LB0500", "LB0501", "LB0502",
-            "LB0503", "LB0504", "LB0505", "LB0506", "LB0507", "LB0508", "LB0509", "LB1001",
-            "LB1100",
+            "LB0308", "LB0309", "LB0310", "LB0311", "LB0312", "LB0313", "LB0500", "LB0501",
+            "LB0502", "LB0503", "LB0504", "LB0505", "LB0506", "LB0507", "LB0508", "LB0509",
+            "LB1001", "LB1100",
         ] {
             let code: Code = raw.parse().unwrap();
             assert!(explain(&code).is_some(), "{raw} missing from registry");
