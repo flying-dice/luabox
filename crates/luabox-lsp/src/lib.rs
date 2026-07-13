@@ -34,13 +34,16 @@
 
 mod completion;
 mod diagnostics;
+mod document_highlight;
 mod fmt;
+mod folding;
 mod goto_def;
 mod hover;
 mod inlay_hints;
 mod line_index;
 mod references;
 mod rename;
+mod selection_range;
 mod sema;
 mod semantic_tokens;
 mod server;

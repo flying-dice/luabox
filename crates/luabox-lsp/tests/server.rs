@@ -11,18 +11,20 @@ use lsp_types::notification::{
     Notification as _, PublishDiagnostics,
 };
 use lsp_types::request::{
-    Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, InlayHintRequest,
-    PrepareRenameRequest, RangeFormatting, References, Rename, Request as _,
-    SemanticTokensFullRequest, Shutdown,
+    Completion, DocumentHighlightRequest, DocumentSymbolRequest, FoldingRangeRequest, Formatting,
+    GotoDefinition, HoverRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting,
+    References, Rename, Request as _, SelectionRangeRequest, SemanticTokensFullRequest, Shutdown,
 };
 use lsp_types::{
     CompletionItemKind, CompletionParams, CompletionResponse, DiagnosticSeverity,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentFormattingParams, DocumentRangeFormattingParams, DocumentSymbolParams,
-    DocumentSymbolResponse, FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse,
-    HoverContents, HoverParams, InitializeParams, InlayHint, InlayHintLabel, InlayHintParams,
-    NumberOrString, PartialResultParams, Position, PrepareRenameResponse, PublishDiagnosticsParams,
-    Range, ReferenceContext, ReferenceParams, RenameParams, SemanticToken, SemanticTokensParams,
+    DocumentFormattingParams, DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
+    DocumentRangeFormattingParams, DocumentSymbolParams, DocumentSymbolResponse, FoldingRange,
+    FoldingRangeKind, FoldingRangeParams, FormattingOptions, GotoDefinitionParams,
+    GotoDefinitionResponse, HoverContents, HoverParams, InitializeParams, InlayHint,
+    InlayHintLabel, InlayHintParams, NumberOrString, PartialResultParams, Position,
+    PrepareRenameResponse, PublishDiagnosticsParams, Range, ReferenceContext, ReferenceParams,
+    RenameParams, SelectionRange, SelectionRangeParams, SemanticToken, SemanticTokensParams,
     SemanticTokensResult, SymbolKind, TextDocumentContentChangeEvent, TextDocumentIdentifier,
     TextDocumentItem, TextDocumentPositionParams, TextEdit, Uri, VersionedTextDocumentIdentifier,
     WorkDoneProgressParams, WorkspaceEdit, WorkspaceFolder,
@@ -283,6 +285,42 @@ impl TestClient {
             Some(DocumentSymbolResponse::Nested(symbols)) => symbols,
             other => panic!("expected nested symbols, got {other:?}"),
         }
+    }
+
+    fn document_highlight(
+        &mut self,
+        uri: &Uri,
+        line: u32,
+        character: u32,
+    ) -> Vec<DocumentHighlight> {
+        self.request::<DocumentHighlightRequest>(DocumentHighlightParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line, character },
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        })
+        .unwrap_or_default()
+    }
+
+    fn folding_ranges(&mut self, uri: &Uri) -> Vec<FoldingRange> {
+        self.request::<FoldingRangeRequest>(FoldingRangeParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        })
+        .unwrap_or_default()
+    }
+
+    fn selection_ranges(&mut self, uri: &Uri, positions: Vec<Position>) -> Vec<SelectionRange> {
+        self.request::<SelectionRangeRequest>(SelectionRangeParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            positions,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        })
+        .unwrap_or_default()
     }
 
     fn formatting(&mut self, uri: &Uri) -> Option<Vec<TextEdit>> {
@@ -1001,6 +1039,174 @@ end
     assert_eq!(top.kind, SymbolKind::VARIABLE);
     // `inner` is nested, not top-level.
     assert!(!names.contains(&"inner"), "{names:?}");
+    client.shutdown();
+}
+
+// === Document highlight ==================================================
+
+#[test]
+fn initialize_advertises_document_highlight() {
+    let client = start(&[]);
+    assert_eq!(
+        client.init_result["capabilities"]["documentHighlightProvider"],
+        true
+    );
+    client.shutdown();
+}
+
+#[test]
+fn document_highlight_distinguishes_read_and_write() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let source = "local x = 1\nx = 2\nprint(x)\n";
+    client.open(&uri, source);
+    let mut client = client;
+    // Cursor on the declaration.
+    let hits = client.document_highlight(&uri, 0, 6);
+    assert_eq!(hits.len(), 3, "{hits:?}");
+    let kind_on_line = |line: u32| {
+        hits.iter()
+            .find(|h| h.range.start.line == line)
+            .unwrap_or_else(|| panic!("no highlight on line {line}: {hits:?}"))
+            .kind
+    };
+    assert_eq!(kind_on_line(0), Some(DocumentHighlightKind::WRITE)); // declaration
+    assert_eq!(kind_on_line(1), Some(DocumentHighlightKind::WRITE)); // reassignment
+    assert_eq!(kind_on_line(2), Some(DocumentHighlightKind::READ)); // print(x)
+    client.shutdown();
+}
+
+#[test]
+fn document_highlight_is_scoped_to_the_current_file() {
+    let client = start(&[
+        ("a.lua", "function greet() return 1 end\n"),
+        ("b.lua", "greet()\ngreet()\n"),
+    ]);
+    let b_uri = client.uri("b.lua");
+    client.open(&b_uri, "greet()\ngreet()\n");
+    let mut client = client;
+    let hits = client.document_highlight(&b_uri, 0, 0);
+    // Two calls in b.lua; the declaration in a.lua never appears.
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    assert!(
+        hits.iter()
+            .all(|h| h.kind == Some(DocumentHighlightKind::READ)),
+        "{hits:?}"
+    );
+    client.shutdown();
+}
+
+// === Folding ranges =======================================================
+
+#[test]
+fn initialize_advertises_folding_ranges() {
+    let client = start(&[]);
+    assert_eq!(
+        client.init_result["capabilities"]["foldingRangeProvider"],
+        true
+    );
+    client.shutdown();
+}
+
+#[test]
+fn folding_covers_a_function_body_and_a_multiline_table() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let source = "\
+local function f()
+  return 1
+end
+local t = {
+  1,
+  2,
+}
+";
+    client.open(&uri, source);
+    let mut client = client;
+    let ranges = client.folding_ranges(&uri);
+    assert!(
+        ranges
+            .iter()
+            .any(|r| r.start_line == 0 && r.end_line == 2 && r.kind.is_none()),
+        "function body fold missing: {ranges:?}"
+    );
+    assert!(
+        ranges
+            .iter()
+            .any(|r| r.start_line == 3 && r.end_line == 6 && r.kind.is_none()),
+        "table fold missing: {ranges:?}"
+    );
+    client.shutdown();
+}
+
+#[test]
+fn folding_marks_multiline_comments_with_the_comment_kind() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let source = "--[[\nlong comment\n]]\nlocal x = 1\n";
+    client.open(&uri, source);
+    let mut client = client;
+    let ranges = client.folding_ranges(&uri);
+    let comment = ranges
+        .iter()
+        .find(|r| r.kind == Some(FoldingRangeKind::Comment))
+        .unwrap_or_else(|| panic!("no comment fold: {ranges:?}"));
+    assert_eq!((comment.start_line, comment.end_line), (0, 2));
+    client.shutdown();
+}
+
+// === Selection ranges =====================================================
+
+#[test]
+fn initialize_advertises_selection_ranges() {
+    let client = start(&[]);
+    assert_eq!(
+        client.init_result["capabilities"]["selectionRangeProvider"],
+        true
+    );
+    client.shutdown();
+}
+
+#[test]
+fn selection_range_expands_from_token_out_through_ancestors() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let source = "local x = 1 + 2\n";
+    client.open(&uri, source);
+    let mut client = client;
+    // Cursor inside the `1` literal (columns 10..11).
+    let result = client.selection_ranges(&uri, vec![Position::new(0, 10)]);
+    assert_eq!(result.len(), 1, "{result:?}");
+    let mut ranges = vec![result[0].range];
+    let mut parent = result[0].parent.as_deref();
+    while let Some(p) = parent {
+        ranges.push(p.range);
+        parent = p.parent.as_deref();
+    }
+    // Innermost is the `1` token; each step widens, up to the whole file.
+    assert_eq!(ranges[0], range((0, 10), (0, 11)));
+    assert!(ranges.contains(&range((0, 10), (0, 15))), "{ranges:?}"); // `1 + 2`
+    assert_eq!(*ranges.last().unwrap(), range((0, 0), (1, 0)));
+    for pair in ranges.windows(2) {
+        assert!(
+            pair[1].start <= pair[0].start && pair[0].end <= pair[1].end && pair[1] != pair[0],
+            "{ranges:?}"
+        );
+    }
+    client.shutdown();
+}
+
+#[test]
+fn selection_range_returns_one_result_per_position_in_order() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let source = "local a = 1\nlocal b = 2\n";
+    client.open(&uri, source);
+    let mut client = client;
+    let result = client.selection_ranges(&uri, vec![Position::new(0, 6), Position::new(1, 6)]);
+    assert_eq!(result.len(), 2, "{result:?}");
+    assert_eq!(result[0].range.start, Position::new(0, 6));
+    assert_eq!(result[1].range.start, Position::new(1, 6));
     client.shutdown();
 }
 

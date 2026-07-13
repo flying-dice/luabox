@@ -23,16 +23,17 @@ use lsp_types::notification::{
     PublishDiagnostics,
 };
 use lsp_types::request::{
-    Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, InlayHintRequest,
-    PrepareRenameRequest, RangeFormatting, References, Rename, Request as _,
-    SemanticTokensFullRequest,
+    Completion, DocumentHighlightRequest, DocumentSymbolRequest, FoldingRangeRequest, Formatting,
+    GotoDefinition, HoverRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting,
+    References, Rename, Request as _, SelectionRangeRequest, SemanticTokensFullRequest,
 };
 use lsp_types::{
     CompletionOptions, CompletionResponse, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentSymbolResponse, GotoDefinitionResponse, Hover,
-    HoverProviderCapability, InitializeParams, InitializeResult, InlayHint, Location, OneOf,
-    PrepareRenameResponse, PublishDiagnosticsParams, RenameOptions, SemanticTokens,
-    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensResult,
+    DidOpenTextDocumentParams, DocumentHighlight, DocumentSymbolResponse, FoldingRange,
+    FoldingRangeProviderCapability, GotoDefinitionResponse, Hover, HoverProviderCapability,
+    InitializeParams, InitializeResult, InlayHint, Location, OneOf, PrepareRenameResponse,
+    PublishDiagnosticsParams, RenameOptions, SelectionRange, SelectionRangeProviderCapability,
+    SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensResult,
     SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
     TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
 };
@@ -43,8 +44,8 @@ use luabox_types::{Ambient, combined_defs};
 use crate::sema::FileSema;
 use crate::uri::uri_to_path;
 use crate::{
-    completion, diagnostics, fmt, goto_def, hover, inlay_hints, references, rename,
-    semantic_tokens, symbols,
+    completion, diagnostics, document_highlight, fmt, folding, goto_def, hover, inlay_hints,
+    references, rename, selection_range, semantic_tokens, symbols,
 };
 
 /// Run the server over stdio until the client sends `shutdown`/`exit`.
@@ -84,8 +85,10 @@ pub fn run(connection: Connection) -> anyhow::Result<()> {
 /// completion triggered on `.`/`:`, document symbols, whole-document and
 /// range formatting (range formats the whole document — see [`crate::fmt`]),
 /// semantic tokens (full) with a standard-types-only legend, inlay hints
-/// (inferred binding types, see [`crate::inlay_hints`]), and rename with
-/// prepare support (see [`crate::rename`]).
+/// (inferred binding types, see [`crate::inlay_hints`]), rename with prepare
+/// support (see [`crate::rename`]), document highlight (read/write tagged,
+/// see [`crate::document_highlight`]), folding ranges (see [`crate::folding`]),
+/// and selection ranges (see [`crate::selection_range`]).
 fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
@@ -104,8 +107,11 @@ fn server_capabilities() -> ServerCapabilities {
             ..CompletionOptions::default()
         }),
         document_symbol_provider: Some(OneOf::Left(true)),
+        document_highlight_provider: Some(OneOf::Left(true)),
         document_formatting_provider: Some(OneOf::Left(true)),
         document_range_formatting_provider: Some(OneOf::Left(true)),
+        folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+        selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
         semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
             SemanticTokensOptions {
                 legend: semantic_tokens::legend(),
@@ -389,6 +395,22 @@ impl Server {
                     .map(DocumentSymbolResponse::Nested);
                 Response::new_ok(id, result)
             }
+            DocumentHighlightRequest::METHOD => {
+                let (id, params) = cast_request::<DocumentHighlightRequest>(req)?;
+                let doc = params.text_document_position_params;
+                let result = self.document_highlight(&doc.text_document.uri, doc.position);
+                Response::new_ok(id, result)
+            }
+            FoldingRangeRequest::METHOD => {
+                let (id, params) = cast_request::<FoldingRangeRequest>(req)?;
+                let result = self.folding_ranges(&params.text_document.uri);
+                Response::new_ok(id, result)
+            }
+            SelectionRangeRequest::METHOD => {
+                let (id, params) = cast_request::<SelectionRangeRequest>(req)?;
+                let result = self.selection_ranges(&params.text_document.uri, &params.positions);
+                Response::new_ok(id, result)
+            }
             Formatting::METHOD => {
                 let (id, params) = cast_request::<Formatting>(req)?;
                 let result = self.formatting(&params.text_document.uri);
@@ -498,6 +520,42 @@ impl Server {
         let path = uri_to_path(uri)?;
         let sema = self.sema(&path)?;
         Some(symbols::document_symbols(&sema))
+    }
+
+    /// Every occurrence of the symbol at `position` in this file, tagged read
+    /// or write (see [`crate::document_highlight`]); reuses [`references`]'
+    /// classification, narrowed to the current file.
+    fn document_highlight(
+        &self,
+        uri: &Uri,
+        position: lsp_types::Position,
+    ) -> Option<Vec<DocumentHighlight>> {
+        let path = uri_to_path(uri)?;
+        let snapshot = self.host.snapshot();
+        let sema = FileSema::new(&snapshot, &path)?;
+        let offset = sema.index.offset(position);
+        document_highlight::document_highlight(&snapshot, &sema, offset)
+    }
+
+    /// Folding regions for one file: blocks, table constructors, and comment
+    /// runs (see [`crate::folding`]) — pure syntax-tree geometry, no
+    /// semantic analysis needed.
+    fn folding_ranges(&self, uri: &Uri) -> Option<Vec<FoldingRange>> {
+        let path = uri_to_path(uri)?;
+        let sema = self.sema(&path)?;
+        Some(folding::folding_ranges(&sema))
+    }
+
+    /// The syntax-tree expand chain for each requested position (see
+    /// [`crate::selection_range`]).
+    fn selection_ranges(
+        &self,
+        uri: &Uri,
+        positions: &[lsp_types::Position],
+    ) -> Option<Vec<SelectionRange>> {
+        let path = uri_to_path(uri)?;
+        let sema = self.sema(&path)?;
+        Some(selection_range::selection_ranges(&sema, positions))
     }
 
     /// Full-document formatting; also serves range requests (MVP semantics,
