@@ -14,6 +14,7 @@ luabox-syntax.workspace = true
 luabox-hir.workspace = true
 luabox-types.workspace = true
 luabox-resolve.workspace = true
+luabox-lint.workspace = true
 rowan.workspace = true
 lsp-server.workspace = true
 lsp-types.workspace = true

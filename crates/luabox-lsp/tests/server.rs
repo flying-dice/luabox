@@ -11,15 +11,16 @@ use lsp_types::notification::{
     Notification as _, PublishDiagnostics,
 };
 use lsp_types::request::{
-    Completion, DocumentHighlightRequest, DocumentSymbolRequest, FoldingRangeRequest, Formatting,
-    GotoDefinition, HoverRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting,
-    References, Rename, Request as _, SelectionRangeRequest, SemanticTokensFullRequest, Shutdown,
-    WorkspaceSymbolRequest,
+    CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest,
+    FoldingRangeRequest, Formatting, GotoDefinition, HoverRequest, InlayHintRequest,
+    PrepareRenameRequest, RangeFormatting, References, Rename, Request as _, SelectionRangeRequest,
+    SemanticTokensFullRequest, Shutdown, WorkspaceSymbolRequest,
 };
 use lsp_types::{
-    CompletionItemKind, CompletionParams, CompletionResponse, DiagnosticSeverity,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentFormattingParams, DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
+    CodeActionContext, CodeActionKind, CodeActionOrCommand, CodeActionParams, CompletionItemKind,
+    CompletionParams, CompletionResponse, DiagnosticSeverity, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
+    DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
     DocumentRangeFormattingParams, DocumentSymbolParams, DocumentSymbolResponse, FoldingRange,
     FoldingRangeKind, FoldingRangeParams, FormattingOptions, GotoDefinitionParams,
     GotoDefinitionResponse, HoverContents, HoverParams, InitializeParams, InlayHint,
@@ -368,6 +369,17 @@ impl TestClient {
             text_document: TextDocumentIdentifier { uri: uri.clone() },
             range,
             work_done_progress_params: WorkDoneProgressParams::default(),
+        })
+        .unwrap_or_default()
+    }
+
+    fn code_actions(&mut self, uri: &Uri, range: Range) -> Vec<CodeActionOrCommand> {
+        self.request::<CodeActionRequest>(CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range,
+            context: CodeActionContext::default(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
         })
         .unwrap_or_default()
     }
@@ -1801,6 +1813,104 @@ local function use(x) end
     assert!(
         diags.iter().any(|d| code_of(d) == "LB0305"),
         "an undeclared type name is still LB0305: {diags:?}"
+    );
+    client.shutdown();
+}
+
+// === Lint diagnostics and quick-fixes ====================================
+
+#[test]
+fn open_with_unused_local_publishes_lint_diagnostic() {
+    // `luabox lint`'s `unused-local` (LB0501, style/warn) surfaces as an
+    // editor diagnostic alongside the type passes, tagged with the distinct
+    // `luabox-lint` source so it's distinguishable from type diagnostics.
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let diags = client.open(&uri, "local unused = 1\n");
+    let lint = diags
+        .iter()
+        .find(|d| code_of(d) == "LB0501")
+        .unwrap_or_else(|| panic!("expected an LB0501 lint diagnostic: {diags:?}"));
+    assert_eq!(lint.severity, Some(DiagnosticSeverity::WARNING));
+    assert_eq!(lint.source.as_deref(), Some("luabox-lint"));
+    // The binding `unused` on line 0, columns 6..12.
+    assert_eq!(lint.range, range((0, 6), (0, 12)));
+    client.shutdown();
+}
+
+#[test]
+fn luabox_ignore_suppresses_a_lint_diagnostic() {
+    // A well-formed `---@luabox-ignore <rule> <reason>` on the finding's line
+    // suppresses it — `lint_source` applies suppression internally, so the
+    // editor honours it exactly as the CLI does.
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let diags = client.open(
+        &uri,
+        "local unused = 1 ---@luabox-ignore unused-local intentional\n",
+    );
+    assert!(
+        !diags.iter().any(|d| code_of(d) == "LB0501"),
+        "the ignore comment must suppress LB0501: {diags:?}"
+    );
+    client.shutdown();
+}
+
+#[test]
+#[allow(
+    clippy::mutable_key_type,
+    reason = "WorkspaceEdit keys its edits by Uri throughout these tests"
+)]
+fn code_action_offers_a_quickfix_for_a_fixable_lint() {
+    // The `unused-local` fix renames the binding to `_name`; it must be offered
+    // as a `quickfix` code action carrying the edit and referencing the lint
+    // diagnostic it resolves.
+    let src = "local unused = 1\n";
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, src);
+    let mut client = client;
+    // Request actions over the whole first line.
+    let actions = client.code_actions(&uri, range((0, 0), (0, 16)));
+    let action = actions
+        .iter()
+        .find_map(|a| match a {
+            CodeActionOrCommand::CodeAction(action) => Some(action),
+            CodeActionOrCommand::Command(_) => None,
+        })
+        .unwrap_or_else(|| panic!("expected a code action: {actions:?}"));
+    assert_eq!(action.kind, Some(CodeActionKind::QUICKFIX));
+
+    // The quick-fix references the diagnostic it resolves.
+    let referenced = action.diagnostics.as_ref().expect("referenced diagnostics");
+    assert_eq!(referenced.len(), 1, "{referenced:?}");
+    assert_eq!(code_of(&referenced[0]), "LB0501");
+
+    // ...and its edit renames exactly `unused` → `_unused`.
+    let changes = action
+        .edit
+        .as_ref()
+        .expect("edit")
+        .changes
+        .as_ref()
+        .unwrap();
+    let edits = changes
+        .iter()
+        .find(|(u, _)| u.as_str() == uri.as_str())
+        .map(|(_, e)| e)
+        .expect("edits for the file");
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert_eq!(edits[0].range, range((0, 6), (0, 12)));
+    assert_eq!(edits[0].new_text, "_unused");
+    client.shutdown();
+}
+
+#[test]
+fn initialize_advertises_code_actions() {
+    let client = start(&[]);
+    assert_eq!(
+        client.init_result["capabilities"]["codeActionProvider"],
+        true
     );
     client.shutdown();
 }

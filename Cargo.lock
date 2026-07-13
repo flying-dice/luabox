@@ -919,6 +919,7 @@ dependencies = [
  "luabox-db",
  "luabox-diag",
  "luabox-hir",
+ "luabox-lint",
  "luabox-resolve",
  "luabox-syntax",
  "luabox-types",

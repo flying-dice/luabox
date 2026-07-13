@@ -24,12 +24,13 @@ use lsp_types::notification::{
     PublishDiagnostics,
 };
 use lsp_types::request::{
-    Completion, DocumentHighlightRequest, DocumentSymbolRequest, FoldingRangeRequest, Formatting,
-    GotoDefinition, HoverRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting,
-    References, Rename, Request as _, SelectionRangeRequest, SemanticTokensFullRequest,
-    WorkspaceSymbolRequest,
+    CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest,
+    FoldingRangeRequest, Formatting, GotoDefinition, HoverRequest, InlayHintRequest,
+    PrepareRenameRequest, RangeFormatting, References, Rename, Request as _, SelectionRangeRequest,
+    SemanticTokensFullRequest, WorkspaceSymbolRequest,
 };
 use lsp_types::{
+    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionProviderCapability,
     CompletionOptions, CompletionResponse, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DocumentHighlight, DocumentSymbolResponse, FoldingRange,
     FoldingRangeProviderCapability, GotoDefinitionResponse, Hover, HoverProviderCapability,
@@ -41,9 +42,11 @@ use lsp_types::{
     WorkspaceSymbolResponse,
 };
 use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
-use luabox_resolve::manifest::{Dependency, Manifest};
+use luabox_lint::{LintConfig, lint_source};
+use luabox_resolve::manifest::{Dependency, Lint, LintLevel, Manifest};
 use luabox_types::{Ambient, combined_defs};
 
+use crate::line_index::LineIndex;
 use crate::sema::FileSema;
 use crate::uri::uri_to_path;
 use crate::{
@@ -91,9 +94,10 @@ pub fn run(connection: Connection) -> anyhow::Result<()> {
 /// (inferred binding types, see [`crate::inlay_hints`]), rename with prepare
 /// support (see [`crate::rename`]), document highlight (read/write tagged,
 /// see [`crate::document_highlight`]), folding ranges (see [`crate::folding`]),
-/// selection ranges (see [`crate::selection_range`]), and workspace symbols
+/// selection ranges (see [`crate::selection_range`]), workspace symbols
 /// (fuzzy, case-insensitive name search across every file, see
-/// [`crate::symbols::workspace_symbols`]).
+/// [`crate::symbols::workspace_symbols`]), and quick-fix code actions for
+/// machine-applicable lint fixes (see [`Server::code_actions`]).
 fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
@@ -118,6 +122,8 @@ fn server_capabilities() -> ServerCapabilities {
         document_range_formatting_provider: Some(OneOf::Left(true)),
         folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
         selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+        // Quick-fixes for machine-applicable lint fixes (SPEC.md §8/§9).
+        code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
             SemanticTokensOptions {
                 legend: semantic_tokens::legend(),
@@ -157,6 +163,10 @@ struct ProjectConfig {
     /// matches `luabox check`'s. Combined with the dialect stdlib into the
     /// server's [`Ambient`].
     def_sources: Vec<String>,
+    /// The resolved `[lint]` configuration (tiers/rules/allowed globals),
+    /// built from `manifest.lint` the same way `luabox lint` builds it, so the
+    /// editor honours the project's lint config exactly as the CLI does.
+    lint: LintConfig,
 }
 
 impl ProjectConfig {
@@ -166,6 +176,7 @@ impl ProjectConfig {
             strictness: Strictness::Warn,
             out_dir: None,
             def_sources: Vec::new(),
+            lint: LintConfig::new(),
         };
         let Ok(text) = fs::read_to_string(root.join("luabox.toml")) else {
             return defaults;
@@ -179,7 +190,36 @@ impl ProjectConfig {
             strictness: Strictness::from_manifest_flag(manifest.types.strict),
             out_dir: Some(root.join(&manifest.build.out)),
             def_sources: ambient_def_sources(root, &manifest),
+            lint: build_lint_config(&manifest.lint),
         }
+    }
+}
+
+/// Translate the manifest `[lint]` table into a [`LintConfig`] — the id-level
+/// then tier-level overrides plus the `global-write` allow-list. Mirrors
+/// `luabox-cli::lint_cmd::build_config`; the LSP crate cannot depend on
+/// `luabox-cli`, so this is duplicated the same way `ambient_def_sources` is.
+fn build_lint_config(lint: &Lint) -> LintConfig {
+    let mut config = LintConfig::new();
+    for name in &lint.globals {
+        config.allow_global(name.clone());
+    }
+    for (tier, level) in &lint.tiers {
+        config.set_tier(tier, lint_level_keyword(*level));
+    }
+    for (rule, level) in &lint.rules {
+        config.set_rule(rule, lint_level_keyword(*level));
+    }
+    config
+}
+
+/// The `LintConfig` level keyword for a manifest [`LintLevel`] (mirrors
+/// `lint_cmd::level_keyword`).
+fn lint_level_keyword(level: LintLevel) -> &'static str {
+    match level {
+        LintLevel::Allow => "allow",
+        LintLevel::Warn => "warn",
+        LintLevel::Deny => "deny",
     }
 }
 
@@ -281,12 +321,21 @@ struct Server {
     /// dependency defs, #108), built once at startup so the editor's type
     /// resolution matches `luabox check`.
     ambient: Ambient,
+    /// The resolved `[lint]` configuration, driving the lint pass in
+    /// [`Self::publish_lua`] and the quick-fixes in [`Self::code_actions`].
+    lint: LintConfig,
+    /// The `undefined-global` known-globals baseline (dialect stdlib + project
+    /// and dependency defs), derived from [`Self::ambient`] the same way
+    /// `luabox lint` derives it, so the `undefined-global` rule sees the same
+    /// globals in the editor as under the CLI.
+    known_globals: HashSet<String>,
 }
 
 impl Server {
     fn new(connection: Connection, root: PathBuf) -> Self {
         let config = ProjectConfig::discover(&root);
         let ambient = combined_defs(config.dialect, &config.def_sources);
+        let known_globals = ambient.global_names().clone();
         Self {
             connection,
             host: AnalysisHost::new(config.dialect, config.strictness),
@@ -295,6 +344,8 @@ impl Server {
             strictness: config.strictness,
             out_dir: config.out_dir,
             ambient,
+            lint: config.lint,
+            known_globals,
         }
     }
 
@@ -349,6 +400,10 @@ impl Server {
 
     // === Requests =========================================================
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "a flat per-method dispatch table — one arm per LSP request, each a few lines"
+    )]
     fn handle_request(&mut self, req: Request) -> anyhow::Result<()> {
         let response = match req.method.as_str() {
             HoverRequest::METHOD => {
@@ -443,6 +498,11 @@ impl Server {
             InlayHintRequest::METHOD => {
                 let (id, params) = cast_request::<InlayHintRequest>(req)?;
                 let result = self.inlay_hints(&params.text_document.uri, params.range);
+                Response::new_ok(id, result)
+            }
+            CodeActionRequest::METHOD => {
+                let (id, params) = cast_request::<CodeActionRequest>(req)?;
+                let result = self.code_actions(&params.text_document.uri, params.range);
                 Response::new_ok(id, result)
             }
             _ => Response::new_err(
@@ -635,6 +695,74 @@ impl Server {
         ))
     }
 
+    /// Quick-fix code actions for the requested `range`: run the lint engine
+    /// on the file and offer each machine-applicable fix whose byte-range
+    /// overlaps the request as a `quickfix`, carrying the `WorkspaceEdit` and
+    /// the lint diagnostic it resolves. Uses the same lint config and known
+    /// globals as [`Self::publish_lua`], and converts the referenced diagnostic
+    /// with the same helper, so the action's diagnostic is byte-identical to
+    /// the published one (the editor can pair them). `Some(vec![])` when the
+    /// file is known but nothing applies.
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "WorkspaceEdit keys its edits by Uri; the lint's interior-mutability concern does not affect Uri's hash"
+    )]
+    fn code_actions(&self, uri: &Uri, range: lsp_types::Range) -> Option<Vec<CodeActionOrCommand>> {
+        let path = uri_to_path(uri)?;
+        let text = self.host.snapshot().file_text(&path)?;
+        let index = LineIndex::new(text);
+        let rel = path.to_string_lossy();
+        let outcome = lint_source(
+            &rel,
+            index.text(),
+            self.dialect,
+            &self.lint,
+            &self.known_globals,
+        );
+
+        let start = index.offset(range.start);
+        let end = index.offset(range.end);
+        let mut actions = Vec::new();
+        for fix in &outcome.fixes {
+            // Inclusive overlap so a bare caret at either edge still offers it.
+            if fix.range.end < start || fix.range.start > end {
+                continue;
+            }
+            // The originating diagnostic carries the same edit as a suggestion
+            // (`lint_source` mirrors every machine-applicable fix into both),
+            // so match on it to reference the exact published diagnostic and to
+            // title the action with the rule's own fix message.
+            let source_diag = outcome.diagnostics.iter().find(|d| {
+                d.suggestions
+                    .iter()
+                    .any(|s| s.span.range == fix.range && s.replacement == fix.replacement)
+            });
+            let title = source_diag
+                .and_then(|d| d.suggestions.iter().find(|s| s.span.range == fix.range))
+                .map_or_else(|| "Apply lint fix".to_string(), |s| s.message.clone());
+            let mut changes = std::collections::HashMap::new();
+            changes.insert(
+                uri.clone(),
+                vec![TextEdit {
+                    range: index.range(fix.range.clone()),
+                    new_text: fix.replacement.clone(),
+                }],
+            );
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title,
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: source_diag
+                    .map(|d| vec![diagnostics::convert(&index, d, diagnostics::LINT_SOURCE)]),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    ..WorkspaceEdit::default()
+                }),
+                ..CodeAction::default()
+            }));
+        }
+        Some(actions)
+    }
+
     fn sema(&self, path: &Path) -> Option<FileSema> {
         FileSema::new(&self.host.snapshot(), path)
     }
@@ -707,6 +835,8 @@ impl Server {
         let ctx = diagnostics::CheckCtx {
             strictness: self.strictness,
             ambient: &self.ambient,
+            lint: &self.lint,
+            known_globals: &self.known_globals,
         };
         let diags =
             diagnostics::lua_diagnostics(&analysis, path, self.dialect, &ctx).unwrap_or_default();
