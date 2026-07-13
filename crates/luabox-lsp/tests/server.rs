@@ -1232,6 +1232,129 @@ fn plain_completion_offers_locals_functions_and_keywords() {
     client.shutdown();
 }
 
+/// A module returning a table with one exported function `<name>`.
+fn module_exporting(name: &str) -> String {
+    format!("local M = {{}}\nfunction M.{name}() end\nreturn M\n")
+}
+
+/// The single `additionalTextEdits` insert of an auto-require completion item.
+fn require_edit(item: &lsp_types::CompletionItem) -> &TextEdit {
+    let edits = item
+        .additional_text_edits
+        .as_ref()
+        .expect("auto-require item carries an additionalTextEdits");
+    assert_eq!(edits.len(), 1, "one require insert: {edits:?}");
+    &edits[0]
+}
+
+#[test]
+fn auto_require_completion_inserts_require_for_nested_module() {
+    // `a/b/c.lua` exports `greet`; completing `gr` in an unrelated file offers
+    // it with a require insert for the reversed module path `a.b.c`.
+    let client = start(&[("a/b/c.lua", &module_exporting("greet"))]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, "gr\n");
+    let mut client = client;
+
+    let items = client.complete(&uri, 0, 2);
+    let greet = items
+        .iter()
+        .find(|i| i.label == "greet")
+        .expect("auto-require greet item");
+    assert_eq!(greet.kind, Some(CompletionItemKind::FUNCTION));
+    assert_eq!(greet.detail.as_deref(), Some("Auto import from \"a.b.c\""));
+    let edit = require_edit(greet);
+    assert_eq!(edit.new_text, "local greet = require(\"a.b.c\").greet\n");
+    // A zero-width insert at the very top of the file.
+    assert_eq!(edit.range, range((0, 0), (0, 0)));
+
+    // Existing plain completions are still present alongside auto-require.
+    assert!(items.iter().any(|i| i.label == "local"), "{items:?}");
+    client.shutdown();
+}
+
+#[test]
+fn auto_require_completion_uses_init_module_path() {
+    // `foo/init.lua` reverses to the module `foo`, not `foo.init`.
+    let client = start(&[("foo/init.lua", &module_exporting("bar"))]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, "ba\n");
+    let mut client = client;
+
+    let items = client.complete(&uri, 0, 2);
+    let bar = items
+        .iter()
+        .find(|i| i.label == "bar")
+        .expect("auto-require bar item");
+    assert_eq!(
+        require_edit(bar).new_text,
+        "local bar = require(\"foo\").bar\n"
+    );
+    client.shutdown();
+}
+
+#[test]
+fn auto_require_places_insert_after_existing_requires() {
+    // A new require lands on its own line after the last existing require.
+    let client = start(&[
+        ("dep.lua", &module_exporting("helper")),
+        ("a/b/c.lua", &module_exporting("greet")),
+    ]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, "local d = require(\"dep\")\ngr\n");
+    let mut client = client;
+
+    let items = client.complete(&uri, 1, 2);
+    let greet = items
+        .iter()
+        .find(|i| i.label == "greet")
+        .expect("auto-require greet item");
+    let edit = require_edit(greet);
+    assert_eq!(edit.new_text, "local greet = require(\"a.b.c\").greet\n");
+    // Inserted at the start of line 1 (right after the existing require line).
+    assert_eq!(edit.range, range((1, 0), (1, 0)));
+    client.shutdown();
+}
+
+#[test]
+fn auto_require_not_offered_when_module_already_required() {
+    // The module is already required under a different local name, so no
+    // auto-require is offered for its exports.
+    let client = start(&[("a/b/c.lua", &module_exporting("greet"))]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, "local m = require(\"a.b.c\")\ngr\n");
+    let mut client = client;
+
+    let items = client.complete(&uri, 1, 2);
+    assert!(
+        !items.iter().any(|i| i.label == "greet"),
+        "already-required module must not be auto-imported: {items:?}"
+    );
+    client.shutdown();
+}
+
+#[test]
+fn auto_require_not_offered_when_name_already_in_scope() {
+    // A local named `greet` already binds the name; the scope item wins and
+    // carries no require insert.
+    let client = start(&[("a/b/c.lua", &module_exporting("greet"))]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, "local greet = 1\ngr\n");
+    let mut client = client;
+
+    let items = client.complete(&uri, 1, 2);
+    let greet = items
+        .iter()
+        .find(|i| i.label == "greet")
+        .expect("the in-scope local greet");
+    assert_eq!(greet.kind, Some(CompletionItemKind::VARIABLE));
+    assert!(
+        greet.additional_text_edits.is_none(),
+        "in-scope local must not gain a require insert: {greet:?}"
+    );
+    client.shutdown();
+}
+
 // === Document symbols ====================================================
 
 #[test]

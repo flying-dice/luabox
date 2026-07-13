@@ -202,6 +202,13 @@ impl FileSema {
             .max_by_key(|b| b.range.start())
     }
 
+    /// Every static `require("...")` edge in the file (literal-argument
+    /// requires), for enumerating what this file already imports.
+    #[must_use]
+    pub fn requires(&self) -> &[luabox_hir::RequireEdge] {
+        self.lowered.file().requires()
+    }
+
     /// The static `require("...")` edge whose call range contains `offset`.
     #[must_use]
     pub fn require_at(&self, offset: usize) -> Option<&luabox_hir::RequireEdge> {

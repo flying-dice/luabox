@@ -23,7 +23,9 @@ use salsa::Setter;
 use crate::db::RootDatabase;
 use crate::input::{Project, SourceFile};
 use crate::query;
-use crate::value::{Annotations, BindingTypes, LoweredHandle, ParsedModule, TypeEnvHandle};
+use crate::value::{
+    Annotations, BindingTypes, LoweredHandle, ModuleExport, ParsedModule, TypeEnvHandle,
+};
 use crate::vfs::{FileId, Vfs};
 
 /// One atomic edit to apply to the world. Batch several with
@@ -243,6 +245,18 @@ impl Analysis {
     pub fn binding_types(&self, path: &Path) -> Option<BindingTypes> {
         let file = *self.files.get(path)?;
         Some(query::binding_types(&self.db, file, self.project))
+    }
+
+    /// The inferred **module export** of `path` — what a dependent file's
+    /// `require` of this module evaluates to (the display-mode surface, with
+    /// exported functions' parameters seeded from observed call sites). The
+    /// LSP reads this to enumerate a module's exported names for auto-require
+    /// import completion. `None` if the file is unknown; the wrapped
+    /// [`ModuleExport::ty`] is `None` when the chunk returns no value.
+    #[must_use]
+    pub fn module_export(&self, path: &Path) -> Option<ModuleExport> {
+        let file = *self.files.get(path)?;
+        Some(query::module_export(&self.db, file, self.project))
     }
 
     /// The check-mode `require`-export registry for `path` (#85): each

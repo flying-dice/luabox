@@ -697,15 +697,20 @@ impl Server {
         rename::prepare_rename(&snapshot, &sema, offset).map(PrepareRenameResponse::Range)
     }
 
+    /// Completions at `position`: scope/member items plus auto-require imports
+    /// (see [`crate::completion`]). Reuses one snapshot for the whole pass —
+    /// the auto-require enumeration reads every workspace file's memoized
+    /// module export.
     fn completion(
         &self,
         uri: &Uri,
         position: lsp_types::Position,
     ) -> Option<Vec<lsp_types::CompletionItem>> {
         let path = uri_to_path(uri)?;
-        let sema = self.sema(&path)?;
+        let snapshot = self.host.snapshot();
+        let sema = FileSema::new(&snapshot, &path)?;
         let offset = sema.index.offset(position);
-        Some(completion::completion(&sema, offset))
+        Some(completion::completion(&sema, offset, &snapshot, &self.root))
     }
 
     fn document_symbols(&self, uri: &Uri) -> Option<Vec<lsp_types::DocumentSymbol>> {
