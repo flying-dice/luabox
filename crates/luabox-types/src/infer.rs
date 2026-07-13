@@ -196,6 +196,7 @@ pub(crate) fn run(
         carrier_keys: HashSet::new(),
         funcs: HashMap::new(),
         param_seeds: HashMap::new(),
+        ctx_param_seeds: HashMap::new(),
         outgoing: HashMap::new(),
         state: HashMap::new(),
         declared: HashSet::new(),
@@ -471,6 +472,20 @@ struct Infer<'a> {
     /// walks bodies with the seeds applied (the bounded fixpoint's one
     /// extra step). Only read when [`Self::seed_params`] is on.
     param_seeds: HashMap<BindingId, ITy>,
+    /// Contextual (bidirectional) parameter types (#120): the parameter
+    /// bindings of a function *literal* written in a position whose EXPECTED
+    /// type is a `fun(...)` — a call argument matched to a `---@param cb
+    /// fun(...)`, or the initializer of a `---@type fun(...)` local. Each
+    /// param takes the expected function type's corresponding parameter type
+    /// so the lambda body type-checks against it with no per-parameter
+    /// annotation. Unlike [`Self::param_seeds`] (observed-call, display-only)
+    /// this is **annotation-derived**, so it is consulted on the *check* path
+    /// too — the whole point is that the checker sees the lambda params typed.
+    /// A parameter the lambda annotates itself (`---@param`) is left out
+    /// (annotations are authoritative, SPEC §3). Populated immediately before
+    /// the lambda body is walked; keyed by file-global binding id, so the
+    /// value is deterministic and identical across both passes.
+    ctx_param_seeds: HashMap<BindingId, ITy>,
     /// Flow state: binding → current inferred type (flat across bodies).
     state: HashMap<BindingId, ITy>,
     /// Argument types observed at calls of functions not defined in this
@@ -1196,6 +1211,15 @@ impl Infer<'_> {
                     p.ty.clone()
                 };
                 ITy::Ty(ty)
+            } else if let Some(seed) = self.ctx_param_seeds.get(&param).cloned() {
+                // Contextual (bidirectional) typing (#120): this unannotated
+                // parameter's type comes from the expected `fun(...)` at the
+                // lambda's position (call argument / `---@type fun` target).
+                // Annotation-derived, so it feeds the checker (it is consulted
+                // whether or not `seed_params` is on). The lambda's own
+                // `---@param` (the `sig` branch above) wins — an annotated
+                // parameter is never recorded here.
+                seed
             } else if self.seed_params {
                 // Call-site inference: the union of argument types the
                 // previous pass observed for this parameter.
@@ -1358,6 +1382,17 @@ impl Infer<'_> {
             self.walk_body(fn_body, Some(sig), None);
             vec![ITy::Ty(Ty::Function(Box::new(sig.clone())))]
         } else {
+            // Contextual typing (#120): a `---@type fun(...)` on the local
+            // seeds the function-literal initializer's parameters from the
+            // expected function type before its body is walked (the `sig`
+            // branch above already covers a `---@param`-annotated initializer,
+            // whose annotation wins). Only fires when the target is a bare
+            // `fun(...)`; a non-function `---@type` leaves the lambda untyped.
+            if let (Some((_, fn_expr)), Some([expected])) = (fn_init, declared_tys.as_deref())
+                && matches!(expected, Ty::Function(_))
+            {
+                self.seed_contextual_params(body, fn_expr, expected);
+            }
             self.eval_values(body, init, Some(names.len()))
         };
 
@@ -2435,6 +2470,12 @@ impl Infer<'_> {
         {
             callee_ity = ITy::Ty(Ty::Function(Box::new(sig.clone())));
         }
+        // Contextual typing (#120): a function-literal argument matched to a
+        // `---@param cb fun(...)` takes the expected function type's parameter
+        // types for its own parameters, so its body checks against them. Seed
+        // BEFORE evaluating the args — the lambda body is walked during that
+        // evaluation, so the seeds must already be in place.
+        self.seed_call_contextual(body, &callee_ity, &args);
         let mut arg_itys: Vec<ITy> = Vec::with_capacity(args.len());
         for &arg in &args {
             let ity = self.eval(body, arg);
@@ -2677,6 +2718,99 @@ impl Infer<'_> {
                 None => seed,
             };
             self.param_seeds.insert(param, merged);
+        }
+    }
+
+    /// Contextually type function-literal arguments of a call from the
+    /// callee's expected parameter types (bidirectional typing, #120). For
+    /// each argument that is a function literal and whose matching parameter
+    /// of the callee's declared signature is a `fun(...)` type, seed the
+    /// lambda's own parameters from that expected function type
+    /// ([`Self::seed_contextual_params`]).
+    ///
+    /// Conservative by construction:
+    ///  - `callee_function_ty` yields `None` for an unannotated / `unknown` /
+    ///    `any` / plain-table callee, so no expected type ⇒ no seeding
+    ///    (behavior exactly as before);
+    ///  - a generic callee (`---@generic`) is skipped — its callback parameter
+    ///    types carry unbound placeholders, and generic callback inference is
+    ///    a documented follow-up, not part of this core;
+    ///  - only a parameter whose type is literally `fun(...)` seeds anything.
+    fn seed_call_contextual(&mut self, body: BodyId, callee_ity: &ITy, args: &[ExprId]) {
+        let Some(sig) = self.callee_function_ty(callee_ity) else {
+            return;
+        };
+        // Generic callbacks are deferred (#120): seeding placeholder types
+        // would be meaningless. Leave them entirely to today's behavior.
+        if !sig.generics.is_empty() {
+            return;
+        }
+        for (i, &arg) in args.iter().enumerate() {
+            if !matches!(self.body(body).expr(arg), Expr::Function(_)) {
+                continue;
+            }
+            let Some(param) = sig.params.get(i) else {
+                continue;
+            };
+            if matches!(param.ty, Ty::Function(_)) {
+                let expected = param.ty.clone();
+                self.seed_contextual_params(body, arg, &expected);
+            }
+        }
+    }
+
+    /// Record contextual parameter seeds for one function-literal expression
+    /// from an expected `fun(...)` type (#120): the literal's `i`-th parameter
+    /// takes the expected function type's `i`-th parameter type, so the body
+    /// checks against it without a per-parameter annotation. A parameter the
+    /// lambda annotates itself (`---@param`) is skipped — annotations are
+    /// authoritative (SPEC §3) and are applied through the ordinary `sig`
+    /// path. An expected parameter typed `unknown`/`any` seeds nothing (stays
+    /// as today). No effect when `expected` is not a function type or `fn_expr`
+    /// is not a function literal.
+    fn seed_contextual_params(&mut self, body: BodyId, fn_expr: ExprId, expected: &Ty) {
+        let Expr::Function(fn_body) = self.body(body).expr(fn_expr) else {
+            return;
+        };
+        let fn_body = *fn_body;
+        let Ty::Function(expected_fn) = expected else {
+            return;
+        };
+        let expected_fn = expected_fn.clone();
+        // The lambda's own `---@param` signature, when the harvester attached
+        // one to this expression — authoritative, so those parameters are left
+        // unseeded and the contextual type never overrides them.
+        let own_sig = self
+            .expr_range(body, fn_expr)
+            .and_then(|k| self.env.fn_sig(k))
+            .cloned();
+        // A function *literal* (`function(...)`) never carries an implicit
+        // `self`, so parameters line up positionally with the expected type's.
+        let params = self.body(fn_body).params.clone();
+        for (i, &param) in params.iter().enumerate() {
+            let binding = self.binding(param);
+            if binding.kind == BindingKind::SelfParam {
+                continue;
+            }
+            let name = binding.name.clone();
+            if own_sig
+                .as_ref()
+                .is_some_and(|s| s.params.iter().any(|p| p.name == name))
+            {
+                continue;
+            }
+            let Some(expected_param) = expected_fn.params.get(i) else {
+                continue;
+            };
+            if matches!(expected_param.ty, Ty::Unknown | Ty::Any) {
+                continue;
+            }
+            let ty = if expected_param.optional {
+                expected_param.ty.clone().optional()
+            } else {
+                expected_param.ty.clone()
+            };
+            self.ctx_param_seeds.insert(param, ITy::Ty(ty));
         }
     }
 

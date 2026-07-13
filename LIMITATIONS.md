@@ -83,6 +83,34 @@ conservative: an unknown/`any`/union callee or a plain table (no declared class,
 or a class with no `call` operator) is left exactly as before — no synthesized
 signature and no new diagnostic.
 
+### Bidirectional / contextual typing (#120)
+
+A function *literal* written where a `fun(...)` type is expected now takes that
+expected type's parameter types for its own parameters, so its body checks with
+no per-parameter annotation — the canonical bidirectional win (like typing a
+callback's parameters from the callback type). Two positions are covered:
+
+- **call argument** — `higher(function(w) ... end)` where `higher` declares
+  `---@param cb fun(w: Widget)` types `w` as `Widget` inside the lambda, so a
+  bad field read (`w.nofield`) is flagged (`LB0306`) and misusing `w` where a
+  concrete type is expected behaves as if `w` had that type; and
+- **`---@type` assignment** — `---@type fun(x: number): number` on a
+  `local f = function(x) ... end` types `x` as `number`.
+
+Conservative by construction: with no expected function type — an unannotated
+callee/target, an `unknown`/`any` expected type, or a non-function expected type
+— the parameters stay `unknown` exactly as before and no new diagnostic arises.
+An explicit `---@param`/inline annotation on the lambda's parameter wins over
+the contextual type (annotations are authoritative, SPEC §3).
+
+Deferred (follow-ups, not yet done): propagating an expected type *into* a table
+literal to infer the literal's own type (field-by-field checking of a table
+literal against a `---@class` parameter already works); contextual typing of
+`return` expressions beyond `---@return` checking; nested/transitive
+propagation through multiple call layers; and overload-driven expected types and
+generic callback inference (a generic callee is deliberately skipped — its
+callback parameters carry unbound placeholders that are never guessed).
+
 ## Tooling
 
 ### `luabox test --coverage` is not implemented (#100)

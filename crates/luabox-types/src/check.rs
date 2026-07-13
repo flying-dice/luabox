@@ -17,8 +17,19 @@
 //! c. **Returns** inside functions carrying `---@return`: count + types.
 //!
 //! Everything unannotated is `unknown` — permissive in warn mode, an error
-//! source in strict mode (SPEC.md §3). No inference beyond literals:
-//! TODO(P1) bidirectional inference, narrowing, metatables.
+//! source in strict mode (SPEC.md §3). Rich table inference, flow narrowing,
+//! and metatable/`__index` resolution live in [`crate::infer`]; the checker
+//! consults their published types wherever annotations are silent.
+//!
+//! **Bidirectional / contextual typing (#120):** a function *literal* written
+//! where a `fun(...)` type is expected — a call argument matched to a
+//! `---@param cb fun(...)`, or the initializer of a `---@type fun(...)` local —
+//! takes that expected type's parameter types for its own parameters, seeded
+//! by [`crate::infer`] before the lambda body is walked, so the body checks
+//! against them with no per-parameter annotation. Deferred (TODO(P1)):
+//! contextual inference of a table literal's own type from context, contextual
+//! `return` typing beyond `---@return` checking, and generic/overload-driven
+//! expected types (generic callbacks are explicitly skipped, never guessed).
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;

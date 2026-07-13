@@ -30,9 +30,18 @@
 //! project source set, reusing the bundler's / salsa DB's `require`
 //! path-mapping.
 //!
-//! **P1 (TODO):** bidirectional inference, flow-sensitive narrowing,
-//! metatable/`__index` resolution, method calls, generics as real type
-//! variables, function subtyping.
+//! **Bidirectional / contextual typing (#120):** a function-literal
+//! parameter takes its type from the expected `fun(...)` at a call-argument
+//! (`---@param cb fun(...)`) or `---@type fun(...)` position, so the lambda
+//! body checks with no per-parameter annotation. Conservative: no expected
+//! function type (unannotated callee, `unknown`/`any`/non-function expected)
+//! leaves the parameter `unknown` exactly as before, and an explicit
+//! `---@param` on the lambda wins. Deferred: table-literal expected-type
+//! propagation, contextual `return` typing, nested/transitive propagation,
+//! and overload-driven or generic callback inference.
+//!
+//! **P1 (TODO):** contextual typing of the deferred cases above, generics as
+//! real type variables, function subtyping.
 //!
 //! Diagnostics carry `LB03xx` codes registered in `luabox-diag` (this
 //! crate depends on it the way rustc crates depend on `rustc_errors`).
@@ -2426,5 +2435,129 @@ local p = P
 local r = p(1, 2, 3)
 ";
         assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    // --- rule: contextual / bidirectional typing (#120) ----------------
+
+    #[test]
+    fn contextual_param_from_callback_flags_bad_field() {
+        // A function-literal argument matched to a `---@param cb fun(w: Widget)`
+        // types `w` as `Widget` with no annotation, so a bad field read inside
+        // the lambda is flagged (LB0306) — the canonical bidirectional win.
+        let src = "\
+---@class Widget
+---@field name string
+
+---@param cb fun(w: Widget)
+local function higher(cb) end
+
+higher(function(w) return w.nofield end)
+";
+        assert_eq!(strict_codes(src), vec!["LB0306"]);
+    }
+
+    #[test]
+    fn contextual_param_from_callback_correct_field_is_clean() {
+        // The same shape, accessing a real field: `w` is `Widget`, `w.name`
+        // resolves, nothing is flagged.
+        let src = "\
+---@class Widget
+---@field name string
+
+---@param cb fun(w: Widget)
+local function higher(cb) end
+
+higher(function(w) return w.name end)
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn contextual_param_unannotated_callee_is_unchanged() {
+        // An UNANNOTATED higher-order function's callback parameter has no
+        // expected type: `w` stays `unknown`, so the bad field read raises
+        // nothing (conservatism, AC #3 — behavior exactly as before).
+        let src = "\
+---@class Widget
+---@field name string
+
+local function higher(cb) end
+
+higher(function(w) return w.nofield end)
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn contextual_param_from_typed_local_seeds_lambda() {
+        // A `---@type fun(w: Widget)` on a local seeds its function-literal
+        // initializer's parameter, so the lambda body checks against Widget.
+        let bad = "\
+---@class Widget
+---@field name string
+
+---@type fun(w: Widget)
+local f = function(w) return w.nofield end
+";
+        assert_eq!(strict_codes(bad), vec!["LB0306"]);
+
+        let good = "\
+---@class Widget
+---@field name string
+
+---@type fun(w: Widget)
+local f = function(w) return w.name end
+";
+        assert_eq!(strict_codes(good), Vec::<String>::new());
+    }
+
+    #[test]
+    fn contextual_return_typed_param_is_usable() {
+        // `---@type fun(x: number): number` seeds `x` as `number`; a numeric
+        // use inside the body checks, and misusing the result where a string
+        // is expected is flagged — the param and return carry their types.
+        let src = "\
+---@type fun(x: number): number
+local f = function(x) return x + 1 end
+
+---@param s string
+local function needs_string(s) end
+needs_string(f(2))
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn explicit_lambda_annotation_overrides_contextual() {
+        // An explicit `---@param` on the lambda is authoritative (SPEC §3):
+        // it wins over the contextual `fun(w: Widget)`, so `w` is `any` here
+        // and the field read is NOT flagged. Were the contextual type to leak
+        // through, `w.nofield` on `Widget` would raise LB0306.
+        let src = "\
+---@class Widget
+---@field name string
+
+---@type fun(w: Widget)
+---@param w any
+local f = function(w) return w.nofield end
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn contextual_param_non_function_expected_is_unchanged() {
+        // A `---@type` whose target is not a function type never seeds a
+        // lambda parameter (there is no expected function type to draw from).
+        let src = "\
+---@class Widget
+---@field name string
+
+---@type Widget
+local w = { name = \"x\" }
+local n = w.nofield
+";
+        // The only diagnostic is the direct bad-field read on `w`, proving no
+        // contextual machinery misfired.
+        assert_eq!(strict_codes(src), vec!["LB0306"]);
     }
 }
