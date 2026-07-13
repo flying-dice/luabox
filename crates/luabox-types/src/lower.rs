@@ -151,6 +151,17 @@ impl<'a> Lowerer<'a> {
             // missing arguments become `unknown`, matching luals.
             if let Some(gc) = self.generic_classes.get(name) {
                 let gc = gc.clone();
+                // An explicit `<...>` list of the wrong length is a
+                // generic-arity error (LB0313, #124), the same rule generic
+                // aliases carry (#117); a bare `Name` stays lenient.
+                if !args.is_empty() && args.len() != gc.params.len() {
+                    self.arity_errors.push(ArityError {
+                        name: name.to_string(),
+                        expected: gc.params.len(),
+                        got: args.len(),
+                        span,
+                    });
+                }
                 let arg_tys: Vec<Ty> = args.iter().map(|a| self.lower(a)).collect();
                 let mut map = BTreeMap::new();
                 for (i, param) in gc.params.iter().enumerate() {

@@ -858,27 +858,32 @@ deliberate — suppress it with the directive above.
 const LB0313: &str = "\
 # LB0313: wrong number of generic type arguments
 
-A reference to a generic `---@alias Name<T>` supplies an explicit `<...>`
-type-argument list whose length does not match the alias's parameter count.
+A reference to a generic `---@alias Name<T>` or `---@class Name<T>` supplies an
+explicit `<...>` type-argument list whose length does not match the type's
+parameter count.
 
 ```lua
 ---@alias Pair<T> { first: T, second: T }
 
 ---@type Pair<number>          -- fine: one argument for one parameter
 ---@type Pair<number, string>  -- LB0313: `Pair` takes 1 type argument, but 2 were supplied
+
+---@class Box<T>
+---@field value T
+
+---@type Box<number, string>   -- LB0313: `Box` takes 1 type argument, but 2 were supplied
 ```
 
-Generic aliases monomorphise at each reference site: `Pair<number>`
-substitutes `number` for `T` and checks the body (`{ first: number, second:
-number }`), so a value like `{ first = 1, second = \"two\" }` is caught. An
-argument count that cannot be matched to the parameters leaves the
-substitution ambiguous, so it is reported here — riding the strictness ladder
-like its sibling `LB0305`: a **warning** in warn mode, an **error** in strict.
+Generic types monomorphise at each reference site: `Pair<number>` substitutes
+`number` for `T` and checks the body (`{ first: number, second: number }`), so
+a value like `{ first = 1, second = \"two\" }` is caught. An argument count
+that cannot be matched to the parameters leaves the substitution ambiguous, so
+it is reported here — riding the strictness ladder like its sibling `LB0305`: a
+**warning** in warn mode, an **error** in strict.
 
-A **bare** reference with no `<...>` (`---@type Pair`) is deliberately
-lenient — its missing arguments resolve to `unknown`, matching luals and the
-generic-`---@class` path — so only an explicit, mis-sized argument list is
-flagged.
+A **bare** reference with no `<...>` (`---@type Pair` / `---@type Box`) is
+deliberately lenient — its missing arguments resolve to `unknown`, matching
+luals — so only an explicit, mis-sized argument list is flagged.
 
 Supply exactly one type argument per declared parameter, or drop the `<...>`
 list entirely to accept the lenient `unknown` instantiation.

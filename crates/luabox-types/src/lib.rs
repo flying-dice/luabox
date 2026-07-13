@@ -1273,6 +1273,37 @@ local x = { first = 1, second = 2 }
     }
 
     #[test]
+    fn generic_class_arity_mismatch_reported() {
+        // #124: LB0313 extends to generic `---@class Name<T>` references — an
+        // explicit `<...>` list of the wrong length is flagged. The initializer
+        // matches the substituted shape so only the arity finding remains.
+        let src = "\
+---@class Box<T>
+---@field value T
+
+---@type Box<number, string>
+local b = { value = 1 }
+";
+        assert_eq!(strict_codes(src), vec!["LB0313"]);
+    }
+
+    #[test]
+    fn generic_class_bare_and_correct_arity_are_clean() {
+        // A correct-arity reference and a bare reference (no `<...>`) both pass.
+        let src = "\
+---@class Box<T>
+---@field value T
+
+---@type Box<number>
+local ok = { value = 1 }
+
+---@type Box
+local bare = { value = 2 }
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
     fn unknown_type_name_reported() {
         let src = "\
 ---@param x Wibble
