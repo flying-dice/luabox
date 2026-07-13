@@ -16,16 +16,14 @@ Where an item has a tracking issue, it is linked.
 alias declared in any project file is nameable and enforced from every other
 file (luals parity), so no `require()` and no `[types] defs` package is needed
 to share an alias by name. A same-name `---@alias` declared in more than one
-project file (or shadowing a `[types] defs` alias) now warns as
+project file (or shadowing a `[types] defs` alias) warns as
 `duplicate-doc-alias` (`LB0310`) at the losing site, matching luals, while the
-deterministic first-wins winner is unchanged. One residual behavior still
-differs from lua-language-server and is worth knowing:
-
-- **A cyclic alias collapses to `unknown` instead of being reported.** A
-  self- or mutually-referential alias (`---@alias A B` / `---@alias B A`,
-  across files or within one) terminates safely — the recursive edge lowers to
-  `unknown` — but luabox emits no diagnostic for the cycle, where luals flags
-  it. This matches luabox's existing same-file cyclic-alias behavior.
+deterministic first-wins winner is unchanged. A self- or mutually-referential
+alias (`---@alias A B` / `---@alias B A`, across files or within one, or a
+bare `---@alias A A`) is reported as `LB0314`, at the alias's own declaration
+— once per checked file that references it, however many places in that file
+do — the recursive edge itself still terminates safely, lowering to
+`unknown` rather than recursing, matching luals' `cyclic-alias` diagnostic.
 
 ### LuaCATS tags that parse but are not yet enforced
 

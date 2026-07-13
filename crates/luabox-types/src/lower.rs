@@ -1,9 +1,11 @@
 //! Lowering LuaCATS type expressions ([`TypeExpr`]) into the type IR
 //! ([`Ty`]).
 //!
-//! Aliases are expanded here (with a cycle guard: a self-referential alias
-//! collapses to `unknown`); classes and enums stay as [`Ty::Named`]
-//! references resolved through the environment. Generic type variables in
+//! Aliases are expanded here (with a cycle guard: a self- or
+//! mutually-referential alias collapses to `unknown` rather than recursing,
+//! and the cycle itself is reported once as LB0314, #123); classes and enums
+//! stay as [`Ty::Named`] references resolved through the environment.
+//! Generic type variables in
 //! scope (`---@generic T` and a generic class's own `<T>` params) lower to
 //! `Ty::Named(T)` placeholders that the monomorphisation engine
 //! ([`crate::generics`]) substitutes; a generic `---@class Name<T>` reference
@@ -39,6 +41,20 @@ pub(crate) struct ArityError {
     pub span: Span,
 }
 
+/// A self- or mutually-referential `---@alias` cycle (`---@alias A A`, or
+/// `---@alias A B` + `---@alias B A`, across files or within one) caught by
+/// `expand_alias`'s cycle guard — surfaced as LB0314 (#123). `span` is the
+/// *declaration* span of the cyclic alias (`self.decl.aliases[name].span`),
+/// not the reference site: luals flags the alias itself, not each place it is
+/// used, and a given cyclic alias may be hit from many reference sites (each
+/// pushes its own entry here; the checker dedups by name so exactly one
+/// diagnostic survives per cyclic alias).
+#[derive(Debug, Clone)]
+pub(crate) struct CyclicAlias {
+    pub name: String,
+    pub span: Span,
+}
+
 /// A generic `---@class Name<T>`'s template: its parameter names and the
 /// lowered shape of its own `---@field`s, with each `T` kept as a
 /// `Ty::Named(T)` placeholder. A reference `Name<number>` instantiates this
@@ -68,6 +84,8 @@ pub(crate) struct Lowerer<'a> {
     pub unknown_names: Vec<(String, Span)>,
     /// Generic references whose `<...>` argument count is wrong (LB0313, #117).
     pub arity_errors: Vec<ArityError>,
+    /// Cyclic aliases caught by the `expand_alias` cycle guard (LB0314, #123).
+    pub cyclic_aliases: Vec<CyclicAlias>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -79,6 +97,7 @@ impl<'a> Lowerer<'a> {
             stack: Vec::new(),
             unknown_names: Vec::new(),
             arity_errors: Vec::new(),
+            cyclic_aliases: Vec::new(),
         }
     }
 
@@ -209,7 +228,8 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Expand an alias body, guarding against cycles (`A = B`, `B = A`
-    /// collapses to `unknown` rather than recursing forever).
+    /// collapses to `unknown` rather than recursing forever — the cycle
+    /// itself is recorded in `cyclic_aliases`, LB0314, #123).
     ///
     /// A generic alias (`---@alias Name<T> …`) monomorphises like a generic
     /// class (#117): its body is lowered with the `<T>` params in scope (each
@@ -218,6 +238,16 @@ impl<'a> Lowerer<'a> {
     /// site (`Name<number>`); a plain alias ignores both.
     fn expand_alias(&mut self, name: &str, args: &[TypeExpr], span: Span) -> Ty {
         if self.stack.iter().any(|n| n == name) {
+            // Self- or mutually-referential: expanding further would recurse
+            // forever, so the edge collapses to `unknown` (safe termination,
+            // unchanged) — but report the cycle at the alias's own
+            // declaration (LB0314, #123), luals parity.
+            if let Some(alias) = self.decl.aliases.get(name) {
+                self.cyclic_aliases.push(CyclicAlias {
+                    name: name.to_string(),
+                    span: alias.span,
+                });
+            }
             return Ty::Unknown;
         }
         let Some(alias) = self.decl.aliases.get(name) else {

@@ -129,6 +129,11 @@ static REGISTRY: &[Entry] = &[
         explain: LB0313,
     },
     Entry {
+        code: Code::new(314),
+        title: "recursive alias (cyclic-alias)",
+        explain: LB0314,
+    },
+    Entry {
         code: Code::new(500),
         title: "malformed `---@luabox-ignore`",
         explain: LB0500,
@@ -889,6 +894,46 @@ Supply exactly one type argument per declared parameter, or drop the `<...>`
 list entirely to accept the lenient `unknown` instantiation.
 ";
 
+const LB0314: &str = "\
+# LB0314: recursive alias (cyclic-alias)
+
+A `---@alias` refers to itself, either directly or through a chain of other
+aliases — the same shape lua-language-server's `circular-doc-type` /
+`cyclic-alias` check flags.
+
+```lua
+---@alias Bad Bad
+---@type Bad   -- LB0314: `Bad` is a cyclic `---@alias`
+
+---@alias A B
+---@alias B A
+---@type A     -- LB0314: `A` is a cyclic `---@alias`
+```
+
+Like an unreferenced `---@class` or `---@alias`, a cyclic alias is only
+checked where it is actually used — a declaration nobody references never
+gets expanded, so it never trips the cycle guard. Within one checked file,
+each alias name in a cycle that *is* referenced is reported exactly **once**,
+at its own declaration, however many call sites (or other aliases) route
+through it. `---@class`, `---@enum`, and `---@alias` names are
+workspace-global (#110), so a cycle formed across two project files (or a
+project file and a `[types] defs` package) is caught the same way as one
+written in a single file.
+
+**The recursive edge still terminates safely.** Expanding a cyclic alias does
+not hang the checker: the edge that would recurse forever lowers to
+`unknown` (matching luals' fallback) — LB0314 exists so that resolution is
+reported, not silent. This rides the strictness ladder like its sibling
+`LB0313`: a **warning** in warn mode, an **error** in strict.
+
+Break the cycle: give the alias a body that does not, directly or through
+another alias, name itself again. A type that is genuinely self-referential
+(a JSON-like value, a linked-list node) still needs a non-alias anchor for
+the recursive occurrence — a `---@class`/`---@enum` reference, `table`, or
+`any` — since luabox (like this diagnostic's namesake in luals) does not
+special-case recursion that happens to route through an alias name.
+";
+
 const LB0500: &str = "\
 # LB0500: malformed `---@luabox-ignore`
 
@@ -1391,9 +1436,9 @@ mod tests {
         for raw in [
             "LB0001", "LB0010", "LB0011", "LB0012", "LB0013", "LB0014", "LB0015", "LB0016",
             "LB0300", "LB0301", "LB0302", "LB0303", "LB0304", "LB0305", "LB0306", "LB0307",
-            "LB0308", "LB0309", "LB0310", "LB0311", "LB0312", "LB0313", "LB0500", "LB0501",
-            "LB0502", "LB0503", "LB0504", "LB0505", "LB0506", "LB0507", "LB0508", "LB0509",
-            "LB1001", "LB1100",
+            "LB0308", "LB0309", "LB0310", "LB0311", "LB0312", "LB0313", "LB0314", "LB0500",
+            "LB0501", "LB0502", "LB0503", "LB0504", "LB0505", "LB0506", "LB0507", "LB0508",
+            "LB0509", "LB1001", "LB1100",
         ] {
             let code: Code = raw.parse().unwrap();
             assert!(explain(&code).is_some(), "{raw} missing from registry");

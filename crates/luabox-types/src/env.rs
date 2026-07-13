@@ -207,6 +207,8 @@ pub struct TypeEnv {
     pub(crate) unknown_names: Vec<(String, luacats::Span)>,
     /// Generic references whose `<...>` argument count is wrong (LB0313, #117).
     pub(crate) arity_errors: Vec<crate::lower::ArityError>,
+    /// Cyclic aliases caught by the lowerer's cycle guard (LB0314, #123).
+    pub(crate) cyclic_aliases: Vec<crate::lower::CyclicAlias>,
     /// The `---@class` names declared by *this* file's own annotations (not
     /// the ambient/defs layer seeded beneath). The `package`-visibility test
     /// (luals `invisible`, #115): a `package` member is accessible only in the
@@ -319,6 +321,7 @@ impl TypeEnv {
         }
         env.unknown_names = std::mem::take(&mut lowerer.unknown_names);
         env.arity_errors = std::mem::take(&mut lowerer.arity_errors);
+        env.cyclic_aliases = std::mem::take(&mut lowerer.cyclic_aliases);
         env
     }
 
@@ -380,6 +383,8 @@ impl TypeEnv {
             merge_keep_first(&mut env.global_types, file_env.global_types);
             env.unknown_names.append(&mut lowerer.unknown_names.clone());
             env.arity_errors.append(&mut lowerer.arity_errors.clone());
+            env.cyclic_aliases
+                .append(&mut lowerer.cyclic_aliases.clone());
         }
         (env, aliases)
     }

@@ -43,6 +43,8 @@ const RETURN_MISMATCH: u16 = 304;
 const UNKNOWN_TYPE_NAME: u16 = 305;
 /// Wrong number of generic type arguments (`Name<A, B>` vs its params, #117).
 const GENERIC_ARITY: u16 = 313;
+/// A self- or mutually-referential `---@alias` cycle (luals parity, #123).
+const CYCLIC_ALIAS: u16 = 314;
 /// Use of a `---@deprecated` symbol (luals `deprecated`, #111).
 const DEPRECATED: u16 = 308;
 /// Discarded return of a `---@nodiscard` call (luals `discard-returns`, #112).
@@ -108,6 +110,26 @@ pub(crate) fn run(
             ),
             format!("expected {params} type argument{}", plural(params)),
             None,
+        );
+    }
+
+    // A cyclic alias may be hit from many reference sites (each expansion
+    // that walks back onto it pushes its own entry, `lower.rs`'s
+    // `expand_alias`) — dedup by name so exactly one LB0314 survives per
+    // cyclic alias, never one per reference (#123).
+    let mut seen_cyclic_aliases: HashSet<&str> = HashSet::new();
+    for err in &typeenv.cyclic_aliases {
+        if !seen_cyclic_aliases.insert(err.name.as_str()) {
+            continue;
+        }
+        checker.report_full(
+            CYCLIC_ALIAS,
+            err.span.start..err.span.end,
+            format!("`{}` is a cyclic `---@alias`", err.name),
+            "refers to itself, directly or through other aliases".to_string(),
+            Some(
+                "a cyclic alias resolves to `unknown` at the recursive edge; break the cycle so the alias terminates in a concrete type".to_string(),
+            ),
         );
     }
 

@@ -1303,6 +1303,71 @@ local bare = { value = 2 }
         assert_eq!(strict_codes(src), Vec::<String>::new());
     }
 
+    // --- #123 cyclic `---@alias` (LB0314) ------------------------------------
+
+    #[test]
+    fn direct_cyclic_alias_reported_once() {
+        // `---@alias Loop Loop` can never terminate expanding into something
+        // real (`expand_alias`'s cycle guard collapses it to `unknown`), so
+        // it is LB0314 — reported once even though two annotations reference
+        // it (never once per reference site).
+        let src = "\
+---@alias Loop Loop
+---@param a Loop
+---@param b Loop
+local function f(a, b) end
+";
+        assert_eq!(strict_codes(src), vec!["LB0314"]);
+    }
+
+    #[test]
+    fn mutual_cyclic_alias_reported() {
+        // `---@alias A B` + `---@alias B A`: neither alias ever bottoms out,
+        // so expanding the referenced one (`A`) trips the cycle guard.
+        let src = "\
+---@alias A B
+---@alias B A
+---@param x A
+local function f(x) end
+";
+        assert_eq!(strict_codes(src), vec!["LB0314"]);
+    }
+
+    #[test]
+    fn non_cyclic_alias_is_clean() {
+        // The safe-termination and reporting changes must not touch an
+        // ordinary alias used in a `---@param`.
+        let src = "\
+---@alias Status \"on\"|\"off\"
+---@param s Status
+local function f(s) end
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn cyclic_alias_across_files_reported() {
+        // #110: `---@alias` names are workspace-global, so a cycle formed
+        // between two project files' aliases is caught the same way as one
+        // written in a single file — mirrors the `LB0312` cross-file test's
+        // `module_surface` + `with_project_types` harness.
+        let a = parse("---@alias A B\n", Dialect::Lua54);
+        let a_surface = module_surface(&a, "a.lua", None);
+        let b = parse("---@alias B A\n", Dialect::Lua54);
+        let b_surface = module_surface(&b, "b.lua", None);
+        let ambient = crate::defs::Ambient::build(&[])
+            .with_project_types([&a_surface.types, &b_surface.types]);
+        let consumer = parse("---@param x A\nlocal function f(x) end\n", Dialect::Lua54);
+        let diags = check_file_with_ambient(
+            &consumer,
+            "consumer.lua",
+            Strictness::Strict,
+            Some(&ambient),
+        );
+        let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
+        assert_eq!(codes, vec!["LB0314"]);
+    }
+
     #[test]
     fn unknown_type_name_reported() {
         let src = "\

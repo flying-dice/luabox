@@ -549,8 +549,9 @@ fn cyclic_alias_across_files_terminates() {
     // `Cy1` references `Cy2` and `Cy2` references `Cy1` — a cross-file cycle.
     // The lowerer's cycle guard collapses the recursion to `unknown` (exactly
     // the same-file cyclic-alias behavior), so checking terminates with no
-    // hang and no crash — and crucially, neither name trips LB0305 (both are
-    // known aliases, just self-referential).
+    // hang and no crash — neither name trips LB0305 (both are known aliases,
+    // just self-referential) — and the cycle itself is now reported (LB0314,
+    // #123) once, at `Cy1`'s own declaration, not at the `use(1)` call site.
     let ta = file_types("---@alias Cy1 Cy2|number\n", base);
     let tb = file_types("---@alias Cy2 Cy1|string\n", base);
     let ambient = base.with_project_types([&ta, &tb]);
@@ -565,6 +566,7 @@ use(1)
         !found.contains(&"LB0305".to_string()),
         "cyclic alias must resolve as a known alias, not an unknown name: {found:?}"
     );
+    assert_eq!(found, vec!["LB0314"]);
 }
 
 #[test]
