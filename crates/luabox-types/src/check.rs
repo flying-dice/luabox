@@ -1168,6 +1168,60 @@ impl Checker<'_> {
         true
     }
 
+    /// When a call matches neither the primary signature nor any
+    /// `---@overload`, choose the candidate to report against so the
+    /// diagnostic names the signature the caller most plausibly meant rather
+    /// than blindly the primary (AC #3, #119). Candidates — the primary
+    /// followed by the overloads as declared — are ranked by, in order:
+    ///
+    /// 1. *arity fit*: a candidate whose parameter arity can accommodate the
+    ///    supplied argument count (within `[required, max]`, or any count at
+    ///    least `required` when it accepts `...`) outranks one that cannot;
+    /// 2. *type fit*: among those, the one with the most supplied positional
+    ///    arguments assignable to their corresponding parameter;
+    /// 3. *declaration order*: a stable tie-break — the primary is ranked
+    ///    first, so an equally-scored field preserves reporting against it.
+    fn closest_overload(&self, sig: &FunctionTy, slots: &[Slot], open_ended: bool) -> FunctionTy {
+        let supplied = slots.len();
+        let score = |cand: &FunctionTy| -> (bool, usize) {
+            let required = cand.required_params();
+            let arity_fit = (supplied >= required || open_ended)
+                && (supplied <= cand.params.len() || cand.varargs.is_some());
+            let type_fit = slots
+                .iter()
+                .enumerate()
+                .filter(|(i, slot)| {
+                    let expected = if let Some(param) = cand.params.get(*i) {
+                        if param.optional {
+                            param.ty.clone().optional()
+                        } else {
+                            param.ty.clone()
+                        }
+                    } else if let Some(varargs) = &cand.varargs {
+                        varargs.clone()
+                    } else {
+                        return false;
+                    };
+                    self.assignable(&self.slot_ty(slot), &expected)
+                })
+                .count();
+            (arity_fit, type_fit)
+        };
+
+        let mut best = sig.clone();
+        let mut best_score = score(sig);
+        for overload in &sig.overloads {
+            let overload_score = score(overload);
+            // Strict `>` keeps the earliest candidate on a tie (declaration
+            // order), so the primary wins when nothing scores better.
+            if overload_score > best_score {
+                best_score = overload_score;
+                best = overload.clone();
+            }
+        }
+        best
+    }
+
     fn check_call(&mut self, call: &CallExpr) {
         let Some(sig) = call.callee().and_then(|c| self.callee_sig(&c)) else {
             return;
@@ -1247,18 +1301,22 @@ impl Checker<'_> {
             sig = crate::generics::subst_function(&sig, &map);
         }
 
-        // Overloaded stdlib functions (e.g. `tonumber`, `table.insert`): a
-        // call is accepted when it matches the primary signature *or* any
-        // `---@overload`. Only when none match do we report against the
-        // primary (TODO(P1): pick and report the closest overload).
-        if !sig.overloads.is_empty()
-            && (self.call_accepts(&sig, slots, open_ended)
+        // Overloaded functions (e.g. stdlib `tonumber`, `table.insert`, or an
+        // annotated `fun` carrying `---@overload`s): a call is accepted when it
+        // matches the primary signature *or* any `---@overload`.
+        if !sig.overloads.is_empty() {
+            if self.call_accepts(&sig, slots, open_ended)
                 || sig
                     .overloads
                     .iter()
-                    .any(|o| self.call_accepts(o, slots, open_ended)))
-        {
-            return;
+                    .any(|o| self.call_accepts(o, slots, open_ended))
+            {
+                return;
+            }
+            // None accept: report against the closest candidate so the
+            // diagnostic refers to the signature the caller most plausibly
+            // meant, not blindly the primary (AC #3, #119).
+            sig = self.closest_overload(&sig, slots, open_ended);
         }
 
         let supplied = slots.len();

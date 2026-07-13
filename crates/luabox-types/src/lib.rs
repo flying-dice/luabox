@@ -443,6 +443,75 @@ f(1, 2, 3)
     }
 
     #[test]
+    fn overload_return_type_flows_to_call_result() {
+        // Locks the already-working #86 behaviour: the matching `---@overload`
+        // governs the call's result type. `f("hi")` matches the string
+        // overload => `string`, satisfying a `string` parameter cleanly; the
+        // primary-matching `f(1)` yields `number` and misuses it.
+        let ok = "\
+---@overload fun(x: string): string
+---@param x number
+---@return number
+local function f(x) end
+---@param s string
+local function want(s) end
+want(f(\"hi\"))
+";
+        assert_eq!(strict_codes(ok), Vec::<String>::new());
+        let bad = "\
+---@overload fun(x: string): string
+---@param x number
+---@return number
+local function f(x) end
+---@param s string
+local function want(s) end
+want(f(1))
+";
+        assert_eq!(strict_codes(bad), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn call_matching_an_overload_is_clean() {
+        // The 2-arg string overload accepts `f("x", "y")`; no diagnostic even
+        // though the primary is a 1-arg number form.
+        let src = "\
+---@overload fun(a: string, b: string)
+---@param a number
+local function f(a) end
+f(\"x\", \"y\")
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn no_match_reports_against_closest_overload() {
+        // Primary `fun(a: number)`, overload `fun(a: string, b: string)`. The
+        // 2-arg call `f("x", 42)` fits the overload's arity and its first arg,
+        // so it is reported against the overload (`expected string` on the
+        // second arg) rather than the primary (which would say "takes 1
+        // argument").
+        let src = "\
+---@overload fun(a: string, b: string)
+---@param a number
+local function f(a) end
+f(\"x\", 42)
+";
+        let diags = check(src, Strictness::Strict);
+        assert_eq!(
+            diags.iter().map(|d| d.code.to_string()).collect::<Vec<_>>(),
+            vec!["LB0300"],
+            "should be a type mismatch against the overload, not an arity error"
+        );
+        let diag = &diags[0];
+        assert!(
+            diag.message.contains("expected `string`"),
+            "message should refer to the string overload's param: {}",
+            diag.message
+        );
+        assert_eq!(diag.labels[0].message, "expected `string`");
+    }
+
+    #[test]
     fn optional_params_and_varargs_relax_arity() {
         let src = "\
 ---@param a number
