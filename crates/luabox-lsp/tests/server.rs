@@ -14,6 +14,7 @@ use lsp_types::request::{
     Completion, DocumentHighlightRequest, DocumentSymbolRequest, FoldingRangeRequest, Formatting,
     GotoDefinition, HoverRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting,
     References, Rename, Request as _, SelectionRangeRequest, SemanticTokensFullRequest, Shutdown,
+    WorkspaceSymbolRequest,
 };
 use lsp_types::{
     CompletionItemKind, CompletionParams, CompletionResponse, DiagnosticSeverity,
@@ -25,9 +26,10 @@ use lsp_types::{
     InlayHintLabel, InlayHintParams, NumberOrString, PartialResultParams, Position,
     PrepareRenameResponse, PublishDiagnosticsParams, Range, ReferenceContext, ReferenceParams,
     RenameParams, SelectionRange, SelectionRangeParams, SemanticToken, SemanticTokensParams,
-    SemanticTokensResult, SymbolKind, TextDocumentContentChangeEvent, TextDocumentIdentifier,
-    TextDocumentItem, TextDocumentPositionParams, TextEdit, Uri, VersionedTextDocumentIdentifier,
-    WorkDoneProgressParams, WorkspaceEdit, WorkspaceFolder,
+    SemanticTokensResult, SymbolInformation, SymbolKind, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, TextEdit, Uri,
+    VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceEdit, WorkspaceFolder,
+    WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use tempfile::TempDir;
 
@@ -284,6 +286,19 @@ impl TestClient {
         match response {
             Some(DocumentSymbolResponse::Nested(symbols)) => symbols,
             other => panic!("expected nested symbols, got {other:?}"),
+        }
+    }
+
+    fn workspace_symbols(&mut self, query: &str) -> Vec<SymbolInformation> {
+        let response = self.request::<WorkspaceSymbolRequest>(WorkspaceSymbolParams {
+            query: query.to_string(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        });
+        match response {
+            Some(WorkspaceSymbolResponse::Flat(symbols)) => symbols,
+            Some(other) => panic!("expected a flat symbol list, got {other:?}"),
+            None => Vec::new(),
         }
     }
 
@@ -1039,6 +1054,72 @@ end
     assert_eq!(top.kind, SymbolKind::VARIABLE);
     // `inner` is nested, not top-level.
     assert!(!names.contains(&"inner"), "{names:?}");
+    client.shutdown();
+}
+
+// === Workspace symbols ====================================================
+
+#[test]
+fn initialize_advertises_workspace_symbols() {
+    let client = start(&[]);
+    assert_eq!(
+        client.init_result["capabilities"]["workspaceSymbolProvider"],
+        true
+    );
+    client.shutdown();
+}
+
+#[test]
+fn workspace_symbols_match_a_class_and_a_function_across_two_files() {
+    let files = &[
+        ("shapes.lua", "---@class Shape\n---@field kind string\n"),
+        ("main.lua", "function computeArea() return 1 end\n"),
+    ];
+    let client = start(files);
+    let shapes_uri = client.uri("shapes.lua");
+    let main_uri = client.uri("main.lua");
+    client.open(&shapes_uri, files[0].1);
+    client.open(&main_uri, files[1].1);
+    let mut client = client;
+
+    let results = client.workspace_symbols("");
+    let names: Vec<&str> = results.iter().map(|s| s.name.as_str()).collect();
+    assert!(names.contains(&"Shape"), "{names:?}");
+    assert!(names.contains(&"kind"), "{names:?}");
+    assert!(names.contains(&"computeArea"), "{names:?}");
+
+    let shape = results.iter().find(|s| s.name == "Shape").unwrap();
+    assert_eq!(shape.kind, SymbolKind::CLASS);
+    assert_eq!(shape.location.uri.as_str(), shapes_uri.as_str());
+    let func = results.iter().find(|s| s.name == "computeArea").unwrap();
+    assert_eq!(func.kind, SymbolKind::FUNCTION);
+    assert_eq!(func.location.uri.as_str(), main_uri.as_str());
+    client.shutdown();
+}
+
+#[test]
+fn workspace_symbols_query_is_case_insensitive() {
+    let client = start(&[("main.lua", "function computeArea() return 1 end\n")]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, "function computeArea() return 1 end\n");
+    let mut client = client;
+    let results = client.workspace_symbols("COMPUTEAREA");
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(results[0].name, "computeArea");
+    client.shutdown();
+}
+
+#[test]
+fn workspace_symbols_non_matching_query_returns_empty() {
+    let client = start(&[("main.lua", "function computeArea() return 1 end\n")]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, "function computeArea() return 1 end\n");
+    let mut client = client;
+    assert!(
+        client
+            .workspace_symbols("zzz_definitely_not_a_symbol")
+            .is_empty()
+    );
     client.shutdown();
 }
 

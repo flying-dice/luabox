@@ -1,13 +1,21 @@
 //! Document symbols: functions (including nested ones, as children of their
 //! container), top-level locals, and `---@class` declarations from the
 //! annotation harvest.
+//!
+//! [`workspace_symbols`] is the flat, cross-file counterpart used by
+//! `workspace/symbol` (#131): it reuses [`document_symbols`]' derivation
+//! (rather than re-walking the syntax tree) and flattens the resulting tree,
+//! then adds `---@alias`/`---@enum` declarations, which are workspace-global
+//! (#110) and so are not part of the per-file document-symbol tree.
 
-use lsp_types::{DocumentSymbol, SymbolKind};
+use lsp_types::{DocumentSymbol, Location, SymbolInformation, SymbolKind, Uri};
 use luabox_syntax::lua::ast::{self, AstNode};
 use luabox_syntax::lua::{SyntaxKind, SyntaxNode};
+use luabox_syntax::luacats::Tag;
 use rowan::TextRange;
 
 use crate::sema::FileSema;
+use crate::uri::path_to_uri;
 
 /// The hierarchical symbol tree for one file.
 #[must_use]
@@ -49,6 +57,93 @@ pub fn document_symbols(sema: &FileSema) -> Vec<DocumentSymbol> {
             .cmp(&(b.range.start.line, b.range.start.character))
     });
     out
+}
+
+/// Every symbol in `sema` matching `query` — case-insensitive substring, an
+/// empty query matches everything — the per-file search space for
+/// `workspace/symbol`: everything [`document_symbols`] finds (functions,
+/// including nested ones, top-level locals, and `---@class` declarations with
+/// their fields), flattened, plus `---@alias` and `---@enum` declarations.
+///
+/// `---@alias` renders as `SymbolKind::INTERFACE`: LuaCATS aliases are a named
+/// type definition, and the LSP has no dedicated "type alias" kind, so
+/// `INTERFACE` (rather than e.g. `TYPE_PARAMETER`, which means something
+/// narrower — a generic parameter) is the closest fit, matching what
+/// `lua-language-server` itself advertises for aliases.
+#[must_use]
+pub fn workspace_symbols(sema: &FileSema, query: &str) -> Vec<SymbolInformation> {
+    let uri = path_to_uri(&sema.path);
+    let query = query.to_lowercase();
+    let mut out = Vec::new();
+    flatten(&document_symbols(sema), &uri, &query, &mut out);
+    for item in sema.items() {
+        for tag in &item.block.tags {
+            match tag {
+                Tag::Alias(a) if !a.name.is_empty() && name_matches(&a.name, &query) => {
+                    out.push(symbol_information(
+                        a.name.clone(),
+                        SymbolKind::INTERFACE,
+                        Location {
+                            uri: uri.clone(),
+                            range: sema.index.range(a.span.start..a.span.end),
+                        },
+                    ));
+                }
+                Tag::Enum(e) if !e.name.is_empty() && name_matches(&e.name, &query) => {
+                    out.push(symbol_information(
+                        e.name.clone(),
+                        SymbolKind::ENUM,
+                        Location {
+                            uri: uri.clone(),
+                            range: sema.index.range(e.span.start..e.span.end),
+                        },
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// Depth-first flatten of a document-symbol tree into `SymbolInformation`,
+/// keeping only names matching `query` (already lower-cased).
+fn flatten(symbols: &[DocumentSymbol], uri: &Uri, query: &str, out: &mut Vec<SymbolInformation>) {
+    for sym in symbols {
+        if name_matches(&sym.name, query) {
+            out.push(symbol_information(
+                sym.name.clone(),
+                sym.kind,
+                Location {
+                    uri: uri.clone(),
+                    range: sym.range,
+                },
+            ));
+        }
+        if let Some(children) = &sym.children {
+            flatten(children, uri, query, out);
+        }
+    }
+}
+
+/// Case-insensitive substring match; `query` must already be lower-cased.
+fn name_matches(name: &str, query: &str) -> bool {
+    query.is_empty() || name.to_lowercase().contains(query)
+}
+
+#[allow(
+    deprecated,
+    reason = "SymbolInformation::deprecated must be initialised"
+)]
+fn symbol_information(name: String, kind: SymbolKind, location: Location) -> SymbolInformation {
+    SymbolInformation {
+        name,
+        kind,
+        tags: None,
+        deprecated: None,
+        location,
+        container_name: None,
+    }
 }
 
 /// Collect symbols under `node`. `top_level` gates plain locals: only the
@@ -175,5 +270,77 @@ fn symbol(
         range,
         selection_range,
         children: (!children.is_empty()).then_some(children),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use luabox_db::{AnalysisHost, Change, Dialect, Strictness};
+
+    /// Build a single-file `FileSema` for `text` at an absolute test path.
+    fn sema(text: &str) -> FileSema {
+        let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
+        let path = if cfg!(windows) {
+            std::path::PathBuf::from(r"C:\ws\main.lua")
+        } else {
+            std::path::PathBuf::from("/ws/main.lua")
+        };
+        host.apply_change(Change::SetFileText {
+            path: path.clone(),
+            dialect: Dialect::Lua54,
+            text: text.to_string(),
+        });
+        FileSema::new(&host.snapshot(), &path).expect("sema")
+    }
+
+    #[test]
+    fn covers_classes_fields_functions_aliases_and_enums() {
+        let source = "\
+---@class Shape
+---@field kind string
+
+---@alias Id string
+
+---@enum Direction
+
+function M.helper() end
+";
+        let sema = sema(source);
+        let symbols = workspace_symbols(&sema, "");
+        let by_name = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing `{name}` in {symbols:?}"))
+        };
+        assert_eq!(by_name("Shape").kind, SymbolKind::CLASS);
+        assert_eq!(by_name("kind").kind, SymbolKind::FIELD);
+        assert_eq!(by_name("Id").kind, SymbolKind::INTERFACE);
+        assert_eq!(by_name("Direction").kind, SymbolKind::ENUM);
+        assert_eq!(by_name("M.helper").kind, SymbolKind::FUNCTION);
+    }
+
+    #[test]
+    fn query_matches_case_insensitively_as_a_substring() {
+        let sema = sema("---@class Shape\nlocal top = 1\n");
+        let symbols = workspace_symbols(&sema, "sha");
+        assert_eq!(symbols.len(), 1, "{symbols:?}");
+        assert_eq!(symbols[0].name, "Shape");
+    }
+
+    #[test]
+    fn non_matching_query_returns_empty() {
+        let sema = sema("---@class Shape\nlocal top = 1\n");
+        assert!(workspace_symbols(&sema, "zzz_no_such_symbol").is_empty());
+    }
+
+    #[test]
+    fn nested_functions_are_flattened_into_the_results() {
+        let sema = sema("local function outer()\n  local function inner() end\nend\n");
+        let symbols = workspace_symbols(&sema, "inner");
+        assert_eq!(symbols.len(), 1, "{symbols:?}");
+        assert_eq!(symbols[0].name, "inner");
+        assert_eq!(symbols[0].kind, SymbolKind::FUNCTION);
     }
 }

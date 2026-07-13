@@ -13,6 +13,7 @@
 //! - **Diagnostics**: pushed via `textDocument/publishDiagnostics` after
 //!   every open/change/close, computed from a fresh [`Analysis`] snapshot.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -26,6 +27,7 @@ use lsp_types::request::{
     Completion, DocumentHighlightRequest, DocumentSymbolRequest, FoldingRangeRequest, Formatting,
     GotoDefinition, HoverRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting,
     References, Rename, Request as _, SelectionRangeRequest, SemanticTokensFullRequest,
+    WorkspaceSymbolRequest,
 };
 use lsp_types::{
     CompletionOptions, CompletionResponse, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
@@ -34,8 +36,9 @@ use lsp_types::{
     InitializeParams, InitializeResult, InlayHint, Location, OneOf, PrepareRenameResponse,
     PublishDiagnosticsParams, RenameOptions, SelectionRange, SelectionRangeProviderCapability,
     SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SymbolInformation,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
+    WorkspaceSymbolResponse,
 };
 use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
 use luabox_resolve::manifest::{Dependency, Manifest};
@@ -88,13 +91,16 @@ pub fn run(connection: Connection) -> anyhow::Result<()> {
 /// (inferred binding types, see [`crate::inlay_hints`]), rename with prepare
 /// support (see [`crate::rename`]), document highlight (read/write tagged,
 /// see [`crate::document_highlight`]), folding ranges (see [`crate::folding`]),
-/// and selection ranges (see [`crate::selection_range`]).
+/// selection ranges (see [`crate::selection_range`]), and workspace symbols
+/// (fuzzy, case-insensitive name search across every file, see
+/// [`crate::symbols::workspace_symbols`]).
 fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         definition_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
+        workspace_symbol_provider: Some(OneOf::Left(true)),
         // `prepare_provider` advertises textDocument/prepareRename, so the
         // editor pre-selects the identifier before prompting for a new name.
         rename_provider: Some(OneOf::Right(RenameOptions {
@@ -395,6 +401,11 @@ impl Server {
                     .map(DocumentSymbolResponse::Nested);
                 Response::new_ok(id, result)
             }
+            WorkspaceSymbolRequest::METHOD => {
+                let (id, params) = cast_request::<WorkspaceSymbolRequest>(req)?;
+                let result = WorkspaceSymbolResponse::Flat(self.workspace_symbols(&params.query));
+                Response::new_ok(id, Some(result))
+            }
             DocumentHighlightRequest::METHOD => {
                 let (id, params) = cast_request::<DocumentHighlightRequest>(req)?;
                 let doc = params.text_document_position_params;
@@ -520,6 +531,33 @@ impl Server {
         let path = uri_to_path(uri)?;
         let sema = self.sema(&path)?;
         Some(symbols::document_symbols(&sema))
+    }
+
+    /// Fuzzy (case-insensitive substring) search for `query` across every
+    /// `.lua` file the analysis snapshot knows about, reusing one snapshot
+    /// for the whole scan (mirrors [`Self::references`]): classes, functions,
+    /// fields/methods, and aliases/enums (see
+    /// [`symbols::workspace_symbols`]). Results are deduplicated by name and
+    /// location, sorted for a deterministic response, then capped at
+    /// [`WORKSPACE_SYMBOL_LIMIT`] — an empty query would otherwise return
+    /// every symbol in the workspace.
+    fn workspace_symbols(&self, query: &str) -> Vec<SymbolInformation> {
+        let snapshot = self.host.snapshot();
+        let mut out: Vec<SymbolInformation> = Vec::new();
+        let mut seen = HashSet::new();
+        for path in snapshot.files() {
+            let Some(sema) = FileSema::new(&snapshot, path) else {
+                continue;
+            };
+            for info in symbols::workspace_symbols(&sema, query) {
+                if seen.insert(workspace_symbol_key(&info)) {
+                    out.push(info);
+                }
+            }
+        }
+        out.sort_by_key(workspace_symbol_key);
+        out.truncate(WORKSPACE_SYMBOL_LIMIT);
+        out
     }
 
     /// Every occurrence of the symbol at `position` in this file, tagged read
@@ -697,4 +735,24 @@ fn cast_request<R: lsp_types::request::Request>(
 ) -> anyhow::Result<(RequestId, R::Params)> {
     req.extract(R::METHOD)
         .map_err(|e| anyhow::anyhow!("malformed `{}` request: {e:?}", R::METHOD))
+}
+
+/// The cap on [`Server::workspace_symbols`]'s response: generous for any real
+/// project, small enough that an empty (match-everything) query over a huge
+/// workspace still returns promptly.
+const WORKSPACE_SYMBOL_LIMIT: usize = 500;
+
+/// A total order/dedup key over a workspace symbol: name, then location
+/// (file, then range) — mirrors `references::key` over [`Location`]s. Owned
+/// (rather than borrowing from `info`) so it can be used both to populate the
+/// dedup set and, afterwards, to sort the same `info` values it was built from.
+fn workspace_symbol_key(info: &SymbolInformation) -> (String, String, u32, u32, u32, u32) {
+    (
+        info.name.clone(),
+        info.location.uri.as_str().to_string(),
+        info.location.range.start.line,
+        info.location.range.start.character,
+        info.location.range.end.line,
+        info.location.range.end.character,
+    )
 }
