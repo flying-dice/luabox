@@ -35,6 +35,7 @@
 //! The remaining SPEC §8 surface (find-refs, rename, code actions, call
 //! hierarchy, TCP transport) is P4 polish.
 
+mod call_hierarchy;
 mod completion;
 mod diagnostics;
 mod document_highlight;

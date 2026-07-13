@@ -24,6 +24,7 @@ use lsp_types::notification::{
     PublishDiagnostics,
 };
 use lsp_types::request::{
+    CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
     CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest,
     FoldingRangeRequest, Formatting, GotoDefinition, GotoImplementation, GotoTypeDefinition,
     HoverRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting, References, Rename,
@@ -31,17 +32,18 @@ use lsp_types::request::{
     WorkspaceSymbolRequest,
 };
 use lsp_types::{
-    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionProviderCapability,
-    CompletionOptions, CompletionResponse, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentHighlight, DocumentSymbolResponse, FoldingRange,
-    FoldingRangeProviderCapability, GotoDefinitionResponse, Hover, HoverProviderCapability,
-    ImplementationProviderCapability, InitializeParams, InitializeResult, InlayHint, Location,
-    OneOf, PrepareRenameResponse, PublishDiagnosticsParams, RenameOptions, SelectionRange,
-    SelectionRangeProviderCapability, SemanticTokens, SemanticTokensFullOptions,
-    SemanticTokensOptions, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, ServerInfo, SignatureHelp, SignatureHelpOptions, SymbolInformation,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, TypeDefinitionProviderCapability,
-    Uri, WorkspaceEdit, WorkspaceSymbolResponse,
+    CallHierarchyIncomingCall, CallHierarchyItem, CallHierarchyOutgoingCall,
+    CallHierarchyServerCapability, CodeAction, CodeActionKind, CodeActionOrCommand,
+    CodeActionProviderCapability, CompletionOptions, CompletionResponse,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DocumentHighlight, DocumentSymbolResponse, FoldingRange, FoldingRangeProviderCapability,
+    GotoDefinitionResponse, Hover, HoverProviderCapability, ImplementationProviderCapability,
+    InitializeParams, InitializeResult, InlayHint, Location, OneOf, PrepareRenameResponse,
+    PublishDiagnosticsParams, RenameOptions, SelectionRange, SelectionRangeProviderCapability,
+    SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelp,
+    SignatureHelpOptions, SymbolInformation, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextEdit, TypeDefinitionProviderCapability, Uri, WorkspaceEdit, WorkspaceSymbolResponse,
 };
 use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
 use luabox_lint::{LintConfig, lint_source};
@@ -52,9 +54,9 @@ use crate::line_index::LineIndex;
 use crate::sema::FileSema;
 use crate::uri::uri_to_path;
 use crate::{
-    completion, diagnostics, document_highlight, fmt, folding, goto_def, goto_impl, goto_type,
-    hover, inlay_hints, references, rename, selection_range, semantic_tokens, signature_help,
-    symbols,
+    call_hierarchy, completion, diagnostics, document_highlight, fmt, folding, goto_def, goto_impl,
+    goto_type, hover, inlay_hints, references, rename, selection_range, semantic_tokens,
+    signature_help, symbols,
 };
 
 /// Run the server over stdio until the client sends `shutdown`/`exit`.
@@ -100,9 +102,10 @@ pub fn run(connection: Connection) -> anyhow::Result<()> {
 /// selection ranges (see [`crate::selection_range`]), workspace symbols
 /// (fuzzy, case-insensitive name search across every file, see
 /// [`crate::symbols::workspace_symbols`]), quick-fix code actions for
-/// machine-applicable lint fixes (see [`Server::code_actions`]), and
-/// signature help triggered on `(`/`,` and retriggered on `,` (see
-/// [`crate::signature_help`]).
+/// machine-applicable lint fixes (see [`Server::code_actions`]), signature
+/// help triggered on `(`/`,` and retriggered on `,` (see
+/// [`crate::signature_help`]), and call hierarchy (prepare/incoming/outgoing,
+/// see [`crate::call_hierarchy`]).
 fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
@@ -137,6 +140,7 @@ fn server_capabilities() -> ServerCapabilities {
         document_range_formatting_provider: Some(OneOf::Left(true)),
         folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
         selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+        call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
         // Quick-fixes for machine-applicable lint fixes (SPEC.md §8/§9).
         code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
@@ -542,6 +546,22 @@ impl Server {
                 let result = self.signature_help(&doc.text_document.uri, doc.position);
                 Response::new_ok(id, result)
             }
+            CallHierarchyPrepare::METHOD => {
+                let (id, params) = cast_request::<CallHierarchyPrepare>(req)?;
+                let doc = params.text_document_position_params;
+                let result = self.prepare_call_hierarchy(&doc.text_document.uri, doc.position);
+                Response::new_ok(id, result)
+            }
+            CallHierarchyIncomingCalls::METHOD => {
+                let (id, params) = cast_request::<CallHierarchyIncomingCalls>(req)?;
+                let result = self.incoming_calls(&params.item);
+                Response::new_ok(id, result)
+            }
+            CallHierarchyOutgoingCalls::METHOD => {
+                let (id, params) = cast_request::<CallHierarchyOutgoingCalls>(req)?;
+                let result = self.outgoing_calls(&params.item);
+                Response::new_ok(id, result)
+            }
             _ => Response::new_err(
                 req.id,
                 ErrorCode::MethodNotFound as i32,
@@ -566,6 +586,39 @@ impl Server {
         let sema = self.sema(&path)?;
         let offset = sema.index.offset(position);
         signature_help::signature_help(&sema, offset)
+    }
+
+    /// The call-hierarchy item for the function the cursor names at `position`
+    /// — a declaration or a call site (see [`crate::call_hierarchy`]). Reuses
+    /// one snapshot for the whole resolution.
+    fn prepare_call_hierarchy(
+        &self,
+        uri: &Uri,
+        position: lsp_types::Position,
+    ) -> Option<Vec<CallHierarchyItem>> {
+        let path = uri_to_path(uri)?;
+        let snapshot = self.host.snapshot();
+        let sema = FileSema::new(&snapshot, &path)?;
+        let offset = sema.index.offset(position);
+        call_hierarchy::prepare(&snapshot, &sema, offset)
+    }
+
+    /// The call sites across the workspace that call `item`, grouped by their
+    /// enclosing function (see [`crate::call_hierarchy`]).
+    fn incoming_calls(&self, item: &CallHierarchyItem) -> Option<Vec<CallHierarchyIncomingCall>> {
+        let path = uri_to_path(&item.uri)?;
+        let snapshot = self.host.snapshot();
+        let sema = FileSema::new(&snapshot, &path)?;
+        Some(call_hierarchy::incoming_calls(&snapshot, &sema, item))
+    }
+
+    /// The functions called within `item`'s body (see
+    /// [`crate::call_hierarchy`]).
+    fn outgoing_calls(&self, item: &CallHierarchyItem) -> Option<Vec<CallHierarchyOutgoingCall>> {
+        let path = uri_to_path(&item.uri)?;
+        let snapshot = self.host.snapshot();
+        let sema = FileSema::new(&snapshot, &path)?;
+        Some(call_hierarchy::outgoing_calls(&snapshot, &sema, item))
     }
 
     fn definition(&self, uri: &Uri, position: lsp_types::Position) -> Option<Location> {

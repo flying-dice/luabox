@@ -11,6 +11,7 @@ use lsp_types::notification::{
     Notification as _, PublishDiagnostics,
 };
 use lsp_types::request::{
+    CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
     CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest,
     FoldingRangeRequest, Formatting, GotoDefinition, GotoImplementation, GotoTypeDefinition,
     HoverRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting, References, Rename,
@@ -18,6 +19,8 @@ use lsp_types::request::{
     WorkspaceSymbolRequest,
 };
 use lsp_types::{
+    CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
+    CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
     CodeActionContext, CodeActionKind, CodeActionOrCommand, CodeActionParams, CompletionItemKind,
     CompletionParams, CompletionResponse, DiagnosticSeverity, DidChangeTextDocumentParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
@@ -207,6 +210,40 @@ impl TestClient {
             work_done_progress_params: WorkDoneProgressParams::default(),
             context: None,
         })
+    }
+
+    fn prepare_call_hierarchy(
+        &mut self,
+        uri: &Uri,
+        line: u32,
+        character: u32,
+    ) -> Vec<CallHierarchyItem> {
+        self.request::<CallHierarchyPrepare>(CallHierarchyPrepareParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line, character },
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        })
+        .unwrap_or_default()
+    }
+
+    fn incoming_calls(&mut self, item: CallHierarchyItem) -> Vec<CallHierarchyIncomingCall> {
+        self.request::<CallHierarchyIncomingCalls>(CallHierarchyIncomingCallsParams {
+            item,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        })
+        .unwrap_or_default()
+    }
+
+    fn outgoing_calls(&mut self, item: CallHierarchyItem) -> Vec<CallHierarchyOutgoingCall> {
+        self.request::<CallHierarchyOutgoingCalls>(CallHierarchyOutgoingCallsParams {
+            item,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        })
+        .unwrap_or_default()
     }
 
     fn definition(&mut self, uri: &Uri, line: u32, character: u32) -> Option<lsp_types::Location> {
@@ -2225,6 +2262,119 @@ fn signature_help_outside_any_call_is_none() {
     client.open(&uri, "local x = 1\n");
     let mut client = client;
     assert!(client.signature_help(&uri, 0, 8).is_none());
+    client.shutdown();
+}
+
+// === Call hierarchy ======================================================
+
+#[test]
+fn initialize_advertises_call_hierarchy() {
+    let client = start(&[]);
+    assert_eq!(
+        client.init_result["capabilities"]["callHierarchyProvider"],
+        true
+    );
+    client.shutdown();
+}
+
+#[test]
+fn prepare_call_hierarchy_returns_the_function_item() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let source = "local function greet() end\ngreet()\n";
+    client.open(&uri, source);
+    let mut client = client;
+    // Cursor on the `greet` declaration name (line 0).
+    let items = client.prepare_call_hierarchy(&uri, 0, 16);
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0].name, "greet");
+    assert_eq!(items[0].kind, SymbolKind::FUNCTION);
+    assert_eq!(items[0].uri.as_str(), uri.as_str());
+    // The selection range is the name; the full range covers the statement.
+    assert_eq!(items[0].selection_range, range((0, 15), (0, 20)));
+    assert_eq!(items[0].range.start, Position::new(0, 0));
+
+    // Preparing on the call site resolves to the same declaration.
+    let from_call = client.prepare_call_hierarchy(&uri, 1, 0);
+    assert_eq!(from_call.len(), 1, "{from_call:?}");
+    assert_eq!(from_call[0].selection_range, items[0].selection_range);
+    client.shutdown();
+}
+
+#[test]
+fn outgoing_calls_lists_callees_within_a_function() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let source = "\
+local function a() end
+local function b() end
+local function caller()
+  a()
+  b()
+  a()
+end
+";
+    client.open(&uri, source);
+    let mut client = client;
+    // Prepare on `caller` (line 2).
+    let item = client.prepare_call_hierarchy(&uri, 2, 16)[0].clone();
+    let calls = client.outgoing_calls(item);
+    let names: Vec<&str> = calls.iter().map(|c| c.to.name.as_str()).collect();
+    assert_eq!(names, vec!["a", "b"], "{calls:?}");
+    // `a` is called twice (lines 3 and 5), `b` once (line 4).
+    let a = calls.iter().find(|c| c.to.name == "a").unwrap();
+    assert_eq!(a.from_ranges.len(), 2, "{a:?}");
+    assert_eq!(a.from_ranges[0], range((3, 2), (3, 3)));
+    assert_eq!(a.from_ranges[1], range((5, 2), (5, 3)));
+    let b = calls.iter().find(|c| c.to.name == "b").unwrap();
+    assert_eq!(b.from_ranges, vec![range((4, 2), (4, 3))]);
+    client.shutdown();
+}
+
+#[test]
+fn incoming_calls_finds_callers_across_two_files() {
+    let files = &[
+        ("a.lua", "function greet() return 1 end\n"),
+        (
+            "b.lua",
+            "local function useGreet()\n  greet()\n  greet()\nend\n",
+        ),
+    ];
+    let client = start(files);
+    let a_uri = client.uri("a.lua");
+    let b_uri = client.uri("b.lua");
+    let mut client = client;
+    // Prepare on the `greet` declaration in a.lua, then request incoming.
+    let item = client.prepare_call_hierarchy(&a_uri, 0, 10)[0].clone();
+    let calls = client.incoming_calls(item);
+    assert_eq!(calls.len(), 1, "one caller: {calls:?}");
+    assert_eq!(calls[0].from.name, "useGreet");
+    assert_eq!(calls[0].from.uri.as_str(), b_uri.as_str());
+    // Both call sites in b.lua are collected, at their name-token ranges.
+    assert_eq!(
+        calls[0].from_ranges,
+        vec![range((1, 2), (1, 7)), range((2, 2), (2, 7))],
+        "{calls:?}"
+    );
+    client.shutdown();
+}
+
+#[test]
+fn incoming_calls_group_top_level_calls_under_a_module_item() {
+    let files = &[
+        ("a.lua", "function greet() return 1 end\n"),
+        ("b.lua", "greet()\n"),
+    ];
+    let client = start(files);
+    let a_uri = client.uri("a.lua");
+    let mut client = client;
+    let item = client.prepare_call_hierarchy(&a_uri, 0, 10)[0].clone();
+    let calls = client.incoming_calls(item);
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    // A top-level call is attributed to a synthetic module item.
+    assert_eq!(calls[0].from.kind, SymbolKind::MODULE);
+    assert!(calls[0].from.name.ends_with("b.lua"), "{calls:?}");
+    assert_eq!(calls[0].from_ranges, vec![range((0, 0), (0, 5))]);
     client.shutdown();
 }
 
