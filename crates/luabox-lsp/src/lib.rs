@@ -36,6 +36,7 @@
 //! hierarchy, TCP transport) is P4 polish.
 
 mod call_hierarchy;
+mod code_action;
 mod completion;
 mod diagnostics;
 mod document_highlight;

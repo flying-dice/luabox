@@ -2246,6 +2246,167 @@ fn initialize_advertises_code_actions() {
     client.shutdown();
 }
 
+// === Type-driven code actions (#129) =====================================
+
+/// The `CodeAction`s (not `Command`s) among a code-action response.
+fn actions_only(actions: &[CodeActionOrCommand]) -> Vec<&lsp_types::CodeAction> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            CodeActionOrCommand::CodeAction(a) => Some(a),
+            CodeActionOrCommand::Command(_) => None,
+        })
+        .collect()
+}
+
+/// The sole single-file `TextEdit` list of an action.
+#[allow(clippy::mutable_key_type, reason = "Uri key matches WorkspaceEdit")]
+fn action_edits(action: &lsp_types::CodeAction) -> &[TextEdit] {
+    action
+        .edit
+        .as_ref()
+        .expect("edit")
+        .changes
+        .as_ref()
+        .expect("changes")
+        .values()
+        .next()
+        .expect("one file")
+}
+
+/// A source that types a table literal missing a required field `y`, yielding
+/// an `LB0302` on the `{ x = 1 }` constructor.
+const MISSING_FIELD: &str = "\
+---@class Point
+---@field x number
+---@field y number
+
+---@param p Point
+local function use(p) end
+use({ x = 1 })
+";
+
+#[test]
+fn code_action_add_missing_field_offers_typed_quickfix() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let diags = client.open(&uri, MISSING_FIELD);
+    assert!(
+        diags.iter().any(|d| code_of(d) == "LB0302"),
+        "expected an LB0302: {diags:?}"
+    );
+    let mut client = client;
+    // Request over the `{ x = 1 }` constructor on line 6.
+    let actions = client.code_actions(&uri, range((6, 4), (6, 13)));
+    let action = actions_only(&actions)
+        .into_iter()
+        .find(|a| a.title == "Add missing field `y`")
+        .unwrap_or_else(|| panic!("expected add-missing-field: {actions:?}"));
+    assert_eq!(action.kind, Some(CodeActionKind::QUICKFIX));
+    // References the LB0302 it resolves.
+    let referenced = action.diagnostics.as_ref().expect("referenced diagnostics");
+    assert_eq!(code_of(&referenced[0]), "LB0302");
+    // Inserts a `y = nil, -- TODO` stub.
+    let edits = action_edits(action);
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert!(edits[0].new_text.contains("y = nil, -- TODO"), "{edits:?}");
+    client.shutdown();
+}
+
+#[test]
+fn code_action_annotate_local_from_inference() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, "local n = 42\nprint(n)\n");
+    let mut client = client;
+    let actions = client.code_actions(&uri, range((0, 0), (0, 11)));
+    let action = actions_only(&actions)
+        .into_iter()
+        .find(|a| a.title == "Annotate `n` with inferred type")
+        .unwrap_or_else(|| panic!("expected annotate action: {actions:?}"));
+    assert_eq!(action.kind, Some(CodeActionKind::REFACTOR_REWRITE));
+    let edits = action_edits(action);
+    assert_eq!(edits[0].new_text, "---@type integer\n");
+    // Inserted at the top of the local's line.
+    assert_eq!(edits[0].range, range((0, 0), (0, 0)));
+    client.shutdown();
+}
+
+#[test]
+fn code_action_annotate_local_absent_when_annotated() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, "---@type number\nlocal n = 42\nprint(n)\n");
+    let mut client = client;
+    let actions = client.code_actions(&uri, range((1, 0), (1, 11)));
+    assert!(
+        !actions_only(&actions)
+            .iter()
+            .any(|a| a.title.starts_with("Annotate")),
+        "already-annotated local must not offer annotate: {actions:?}"
+    );
+    client.shutdown();
+}
+
+#[test]
+fn code_action_generate_class_from_literal() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(
+        &uri,
+        "local cfg = { count = 1, label = \"x\" }\nprint(cfg)\n",
+    );
+    let mut client = client;
+    let actions = client.code_actions(&uri, range((0, 0), (0, 5)));
+    let action = actions_only(&actions)
+        .into_iter()
+        .find(|a| a.title == "Generate `---@class Cfg` from table literal")
+        .unwrap_or_else(|| panic!("expected generate-class action: {actions:?}"));
+    assert_eq!(action.kind, Some(CodeActionKind::REFACTOR_REWRITE));
+    let text = &action_edits(action)[0].new_text;
+    assert!(text.contains("---@class Cfg"), "{text}");
+    assert!(text.contains("---@field count integer"), "{text}");
+    assert!(text.contains("---@field label string"), "{text}");
+    client.shutdown();
+}
+
+#[test]
+fn code_action_colon_to_dot_convert() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, "function T:m(x) end\n");
+    let mut client = client;
+    // Cursor on the method name.
+    let actions = client.code_actions(&uri, range((0, 9), (0, 12)));
+    let action = actions_only(&actions)
+        .into_iter()
+        .find(|a| a.title.starts_with("Convert `:` method"))
+        .unwrap_or_else(|| panic!("expected colon→dot convert: {actions:?}"));
+    assert_eq!(action.kind, Some(CodeActionKind::REFACTOR_REWRITE));
+    // Two edits: `:` → `.` and a prepended `self, `.
+    let edits = action_edits(action);
+    assert_eq!(edits.len(), 2, "{edits:?}");
+    assert!(edits.iter().any(|e| e.new_text == "."), "{edits:?}");
+    assert!(edits.iter().any(|e| e.new_text == "self, "), "{edits:?}");
+    client.shutdown();
+}
+
+#[test]
+fn code_action_dot_convert_absent_without_self() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, "function T.m(x) end\n");
+    let mut client = client;
+    let actions = client.code_actions(&uri, range((0, 9), (0, 12)));
+    assert!(
+        !actions_only(&actions)
+            .iter()
+            .any(|a| a.title.starts_with("Convert")),
+        "a dotted function without a self param is not convertible: {actions:?}"
+    );
+    client.shutdown();
+}
+
 // === Signature help ======================================================
 
 #[test]

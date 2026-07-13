@@ -54,9 +54,9 @@ use crate::line_index::LineIndex;
 use crate::sema::FileSema;
 use crate::uri::uri_to_path;
 use crate::{
-    call_hierarchy, completion, diagnostics, document_highlight, fmt, folding, goto_def, goto_impl,
-    goto_type, hover, inlay_hints, references, rename, selection_range, semantic_tokens,
-    signature_help, symbols,
+    call_hierarchy, code_action, completion, diagnostics, document_highlight, fmt, folding,
+    goto_def, goto_impl, goto_type, hover, inlay_hints, references, rename, selection_range,
+    semantic_tokens, signature_help, symbols,
 };
 
 /// Run the server over stdio until the client sends `shutdown`/`exit`.
@@ -835,7 +835,8 @@ impl Server {
     )]
     fn code_actions(&self, uri: &Uri, range: lsp_types::Range) -> Option<Vec<CodeActionOrCommand>> {
         let path = uri_to_path(uri)?;
-        let text = self.host.snapshot().file_text(&path)?;
+        let snapshot = self.host.snapshot();
+        let text = snapshot.file_text(&path)?;
         let index = LineIndex::new(text);
         let rel = path.to_string_lossy();
         let outcome = lint_source(
@@ -885,6 +886,32 @@ impl Server {
                 }),
                 ..CodeAction::default()
             }));
+        }
+
+        // Type-driven quick-fixes and refactors (#129), gathered alongside the
+        // lint fixes above from the same request. The per-file semantic view
+        // supplies the AST/annotations; the display inference supplies binding
+        // types; the type diagnostics (recomputed with the same helper and
+        // context as `publish_lua`, so an `LB0302` offered on a quick-fix is
+        // byte-identical to the published one) drive add-missing-field.
+        if let Some(sema) = FileSema::new(&snapshot, &path) {
+            let inferred = snapshot.binding_types(&path);
+            let ctx = diagnostics::CheckCtx {
+                strictness: self.strictness,
+                ambient: &self.ambient,
+                lint: &self.lint,
+                known_globals: &self.known_globals,
+            };
+            let type_diags = diagnostics::lua_diagnostics(&snapshot, &path, self.dialect, &ctx)
+                .unwrap_or_default();
+            actions.extend(code_action::type_actions(
+                &sema,
+                inferred.as_ref(),
+                &type_diags,
+                uri,
+                start,
+                end,
+            ));
         }
         Some(actions)
     }
