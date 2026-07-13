@@ -69,14 +69,19 @@ table, an unannotated method, or an unresolved metatable — the `:` call is lef
 unchecked (no false positives). One `---@deprecated` edge remains uncovered: a
 class type used purely as an annotation (not through a value use site).
 
-One edge of `---@operator` is out of scope: **`---@operator call` (making a
-value callable) is parsed but not applied.** The overload mechanism types
-binary/unary operator *expressions* (`a + b`, `-v`, `#v`); making a class
-value itself callable would hook the call-evaluation path instead and does not
-fall out of the same mechanism, so it is deferred. Every other operator luals
-supports (`add`, `sub`, `mul`, `div`, `mod`, `pow`, `idiv`, `concat`, `band`,
-`bor`, `bxor`, `shl`, `shr`, `unm`, `bnot`, `len`) applies, including
-right-operand dispatch and overload selection by parameter type.
+Every operator luals supports applies. Binary/unary operator *expressions*
+(`add`, `sub`, `mul`, `div`, `mod`, `pow`, `idiv`, `concat`, `band`, `bor`,
+`bxor`, `shl`, `shr`, `unm`, `bnot`, `len`) are typed on the operator-expression
+path, including right-operand dispatch and overload selection by parameter type.
+`---@operator call` hooks the call-evaluation path instead (#122): a value whose
+type resolves to a single declared `---@class` (through inheritance) declaring a
+`call` overload is itself callable — `obj(arg)` checks the argument against the
+operator's input type and takes its declared result type, flowing into
+assignments, returns, and further checks. A no-input `call: R` operator accepts
+any arguments; multiple `call` overloads select by argument type. Resolution is
+conservative: an unknown/`any`/union callee or a plain table (no declared class,
+or a class with no `call` operator) is left exactly as before — no synthesized
+signature and no new diagnostic.
 
 ## Tooling
 

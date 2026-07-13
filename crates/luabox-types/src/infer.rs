@@ -2470,7 +2470,43 @@ impl Infer<'_> {
         if let Some(returns) = self.overloaded_returns(&callee_ity, &arg_itys) {
             return returns;
         }
+        // A value whose type is a declared `---@class` with a `---@operator
+        // call` overload is callable — the operator's declared result is the
+        // call's result type (LB0122).
+        if let Some(returns) = self.class_call_returns(&callee_ity, &arg_itys) {
+            return returns;
+        }
         self.returns_of(&callee_ity)
+    }
+
+    /// The result of calling a value whose type resolves to a declared
+    /// `---@class` carrying a `---@operator call` overload (LB0122). When the
+    /// class declares several `call` overloads, the one whose declared input
+    /// accepts the first argument wins (first-match, mirroring binary-operator
+    /// selection in [`Self::operator_result`]); a no-input `call` operator
+    /// accepts any arguments. `None` for any other callee, leaving the
+    /// ordinary [`Self::returns_of`] path untouched (conservative: no
+    /// unknown / `any` / union / plain-table callee manufactures a result).
+    fn class_call_returns(&mut self, callee: &ITy, arg_itys: &[ITy]) -> Option<(Vec<ITy>, bool)> {
+        let Ty::Named(class) = self.reify(callee) else {
+            return None;
+        };
+        let sigs = self.env.class_operators(&class, "call");
+        if sigs.is_empty() {
+            return None;
+        }
+        let first_arg = arg_itys.first().map(|a| self.reify(a));
+        let chosen = sigs
+            .iter()
+            .find(|sig| match (&sig.input, &first_arg) {
+                (None, _) => true,
+                (Some(input), Some(arg)) => {
+                    crate::assign::assignable(self.env, self.strict, arg, input)
+                }
+                (Some(_), None) => false,
+            })
+            .unwrap_or(&sigs[0]);
+        Some((vec![ITy::Ty(chosen.result.clone())], false))
     }
 
     /// The returns of the first `---@overload` that accepts the arguments when
@@ -4242,6 +4278,90 @@ local c = a + b
 ";
         let out = outcome(src);
         assert_eq!(binding_ty(&out, "c").to_string(), "Base");
+    }
+
+    // --- `---@operator call` — callable class values (#122) ---------------
+
+    #[test]
+    fn call_operator_makes_a_value_callable_and_types_the_result() {
+        // `obj(42)` on a class declaring `---@operator call(number): string`
+        // yields the declared result `string` — flowing into an unannotated
+        // binding (the inlay-hint path).
+        let src = "\
+---@class Callable
+---@operator call(number): string
+local M = {}
+---@type Callable
+local obj = M
+local r = obj(42)
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "r").to_string(), "string");
+    }
+
+    #[test]
+    fn no_input_call_operator_result_types() {
+        // A no-paren `call: T` operator accepts any arguments and yields `T`.
+        let src = "\
+---@class NoIn
+---@operator call: boolean
+local N = {}
+---@type NoIn
+local n = N
+local a = n()
+local b = n(1, \"two\")
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "a").to_string(), "boolean");
+        assert_eq!(binding_ty(&out, "b").to_string(), "boolean");
+    }
+
+    #[test]
+    fn overloaded_call_operator_selects_by_arg_type() {
+        let src = "\
+---@class Multi
+---@operator call(number): string
+---@operator call(boolean): integer
+local Mu = {}
+---@type Multi
+local m = Mu
+local s = m(1)
+local i = m(true)
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "s").to_string(), "string");
+        assert_eq!(binding_ty(&out, "i").to_string(), "integer");
+    }
+
+    #[test]
+    fn call_operator_inherited_from_parent_class() {
+        let src = "\
+---@class Base
+---@operator call(string): integer
+local B = {}
+---@class Derived : Base
+local D = {}
+---@type Derived
+local d = D
+local i = d(\"hi\")
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "i").to_string(), "integer");
+    }
+
+    #[test]
+    fn call_on_class_without_call_operator_is_unchanged() {
+        // A class with no `call` operator is not callable: the result degrades
+        // to `unknown` exactly as before (no invented result type).
+        let src = "\
+---@class Plain
+local P = {}
+---@type Plain
+local p = P
+local r = p(1)
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "r").to_string(), "unknown");
     }
 
     #[test]

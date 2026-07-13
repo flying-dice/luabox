@@ -32,7 +32,7 @@ use luabox_syntax::lua::{self, SyntaxNode};
 
 use crate::assign::{LiteralConformance, assignable, classify_literal, is_integral_literal};
 use crate::env::{self, TypeEnv};
-use crate::ty::{FieldTy, FunctionTy, TableTy, Ty};
+use crate::ty::{FieldTy, FunctionTy, OperatorSig, ParamTy, TableTy, Ty};
 
 /// Diagnostic codes emitted here (block `LB03xx` — Semantics).
 const TYPE_MISMATCH: u16 = 300;
@@ -1039,20 +1039,50 @@ impl Checker<'_> {
     fn callee_sig(&self, callee: &Expr) -> Option<FunctionTy> {
         match callee {
             Expr::Name(name) => {
-                let name = name.name()?;
-                if let Some(Binding {
-                    ty: Ty::Function(f),
-                    ..
-                }) = self.lookup(name.text())
-                {
-                    return Some((**f).clone());
+                if let Some(text) = name.name() {
+                    if let Some(Binding {
+                        ty: Ty::Function(f),
+                        ..
+                    }) = self.lookup(text.text())
+                    {
+                        return Some((**f).clone());
+                    }
+                    if let Some(f) = self.env.function(text.text()) {
+                        return Some(f.clone());
+                    }
                 }
-                self.env.function(name.text()).cloned()
             }
-            Expr::Field(_) => self.env.function(&dotted_name(callee)?).cloned(),
-            Expr::Paren(paren) => self.callee_sig(&paren.inner()?),
-            _ => None,
+            Expr::Field(_) => {
+                if let Some(f) = dotted_name(callee).and_then(|n| self.env.function(&n)) {
+                    return Some(f.clone());
+                }
+            }
+            Expr::Paren(paren) => return self.callee_sig(&paren.inner()?),
+            _ => {}
         }
+        // Fallback: a value whose *type* resolves to a declared `---@class`
+        // carrying a `---@operator call` overload is itself callable — the
+        // operator's signature governs argument and result checking (LB0122).
+        self.class_call_sig(callee)
+    }
+
+    /// A callable [`FunctionTy`] synthesized from the `---@operator call`
+    /// overload(s) on the callee's class type (LB0122). Conservative: fires
+    /// only when the callee's type resolves to a single declared `---@class`
+    /// (through inheritance) that declares at least one `call` operator —
+    /// unknown / `any` / union / plain-table callees yield `None`, leaving
+    /// call handling exactly as before (no false positives). Multiple `call`
+    /// overloads become the primary + `---@overload`s, so the existing
+    /// overload-acceptance path selects the matching one and governs the
+    /// result type.
+    fn class_call_sig(&self, callee: &Expr) -> Option<FunctionTy> {
+        let Ty::Named(class) = self.expr_ty(callee) else {
+            return None;
+        };
+        let mut sigs = self.env.class_operators(&class, "call").into_iter();
+        let mut fun = operator_call_fn(&sigs.next()?);
+        fun.overloads = sigs.map(|s| operator_call_fn(&s)).collect();
+        Some(fun)
     }
 
     /// The type of one supplied call slot (annotation/inference derived).
@@ -1765,6 +1795,33 @@ fn dotted_name(expr: &Expr) -> Option<String> {
             Some(format!("{base}.{}", field.field_name()?.text()))
         }
         _ => None,
+    }
+}
+
+/// A callable signature synthesized from a single `---@operator call`
+/// overload (LB0122): `call(P): R` becomes `fun(P): R` (one required
+/// parameter), while a no-input `call: R` becomes `fun(...): R` — a
+/// permissive vararg so the operator accepts any arguments. The synthesized
+/// signature carries `has_return_annotation`, so the result type `R` flows
+/// through the ordinary call-result path into assignments and further checks.
+fn operator_call_fn(sig: &OperatorSig) -> FunctionTy {
+    let (params, varargs) = match &sig.input {
+        Some(input) => (
+            vec![ParamTy {
+                name: "arg".to_string(),
+                ty: input.clone(),
+                optional: false,
+            }],
+            None,
+        ),
+        None => (Vec::new(), Some(Ty::Any)),
+    };
+    FunctionTy {
+        params,
+        varargs,
+        returns: vec![sig.result.clone()],
+        has_return_annotation: true,
+        ..FunctionTy::default()
     }
 }
 
