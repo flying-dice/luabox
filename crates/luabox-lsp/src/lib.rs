@@ -38,6 +38,8 @@ mod document_highlight;
 mod fmt;
 mod folding;
 mod goto_def;
+mod goto_impl;
+mod goto_type;
 mod hover;
 mod inlay_hints;
 mod line_index;

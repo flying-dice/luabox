@@ -12,9 +12,10 @@ use lsp_types::notification::{
 };
 use lsp_types::request::{
     CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest,
-    FoldingRangeRequest, Formatting, GotoDefinition, HoverRequest, InlayHintRequest,
-    PrepareRenameRequest, RangeFormatting, References, Rename, Request as _, SelectionRangeRequest,
-    SemanticTokensFullRequest, Shutdown, WorkspaceSymbolRequest,
+    FoldingRangeRequest, Formatting, GotoDefinition, GotoImplementation, GotoTypeDefinition,
+    HoverRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting, References, Rename,
+    Request as _, SelectionRangeRequest, SemanticTokensFullRequest, Shutdown,
+    WorkspaceSymbolRequest,
 };
 use lsp_types::{
     CodeActionContext, CodeActionKind, CodeActionOrCommand, CodeActionParams, CompletionItemKind,
@@ -208,6 +209,42 @@ impl TestClient {
         match response {
             GotoDefinitionResponse::Scalar(location) => Some(location),
             other => panic!("expected a scalar location, got {other:?}"),
+        }
+    }
+
+    fn type_definition(
+        &mut self,
+        uri: &Uri,
+        line: u32,
+        character: u32,
+    ) -> Option<lsp_types::Location> {
+        let response = self.request::<GotoTypeDefinition>(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line, character },
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        })?;
+        match response {
+            GotoDefinitionResponse::Scalar(location) => Some(location),
+            other => panic!("expected a scalar location, got {other:?}"),
+        }
+    }
+
+    fn implementation(&mut self, uri: &Uri, line: u32, character: u32) -> Vec<lsp_types::Location> {
+        let response = self.request::<GotoImplementation>(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line, character },
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        });
+        match response {
+            Some(GotoDefinitionResponse::Array(locations)) => locations,
+            None => Vec::new(),
+            other => panic!("expected a location array, got {other:?}"),
         }
     }
 
@@ -762,6 +799,128 @@ print(p.x)
     let location = client.definition(&uri, 5, 8).expect("definition");
     // The `@field x number` tag is on line 1.
     assert_eq!(location.range.start.line, 1);
+    client.shutdown();
+}
+
+// === Goto type-definition ================================================
+
+#[test]
+fn initialize_advertises_type_definition_and_implementation() {
+    let client = start(&[]);
+    let caps = &client.init_result["capabilities"];
+    assert_eq!(caps["typeDefinitionProvider"], true);
+    assert_eq!(caps["implementationProvider"], true);
+    client.shutdown();
+}
+
+#[test]
+fn type_definition_on_typed_local_jumps_to_class() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let source = "\
+---@class Point
+---@field x number
+
+---@type Point
+local p = nil
+print(p)
+";
+    client.open(&uri, source);
+    let mut client = client;
+    // Cursor on `p` inside `print(p)` (line 5, `print(` is 6 chars).
+    let location = client.type_definition(&uri, 5, 6).expect("type definition");
+    assert_eq!(location.uri.as_str(), uri.as_str());
+    // The `---@class Point` tag is on line 0.
+    assert_eq!(location.range.start.line, 0, "{location:?}");
+    client.shutdown();
+}
+
+#[test]
+fn type_definition_on_alias_typed_local_jumps_to_alias() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let source = "\
+---@alias Id string
+
+---@type Id
+local key = nil
+print(key)
+";
+    client.open(&uri, source);
+    let mut client = client;
+    // Cursor on `key` inside `print(key)` (line 4).
+    let location = client.type_definition(&uri, 4, 6).expect("type definition");
+    // The `---@alias Id` tag is on line 0.
+    assert_eq!(location.range.start.line, 0, "{location:?}");
+    client.shutdown();
+}
+
+#[test]
+fn type_definition_on_primitive_typed_local_is_none() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, "---@type number\nlocal n = 1\nprint(n)\n");
+    let mut client = client;
+    // Cursor on `n` inside `print(n)` (line 2) — a primitive has no declaration.
+    assert!(client.type_definition(&uri, 2, 6).is_none());
+    client.shutdown();
+}
+
+#[test]
+fn type_definition_crosses_files_to_the_class() {
+    let client = start(&[
+        ("point.lua", "---@class Point\n---@field x number\n"),
+        ("main.lua", "---@type Point\nlocal p = nil\nprint(p)\n"),
+    ]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, "---@type Point\nlocal p = nil\nprint(p)\n");
+    let mut client = client;
+    // Cursor on `p` inside `print(p)` (line 2).
+    let location = client.type_definition(&uri, 2, 6).expect("type definition");
+    assert!(
+        location.uri.as_str().ends_with("point.lua"),
+        "{}",
+        location.uri.as_str()
+    );
+    client.shutdown();
+}
+
+// === Goto implementation =================================================
+
+#[test]
+fn implementation_on_interface_returns_subclasses_across_files() {
+    let client = start(&[
+        ("base.lua", "---@class Base\n---@field id number\n"),
+        ("derived.lua", "---@class Derived : Base\n"),
+        ("other.lua", "---@class Other : Base\n"),
+    ]);
+    let base_uri = client.uri("base.lua");
+    client.open(&base_uri, "---@class Base\n---@field id number\n");
+    let mut client = client;
+    // Cursor on the `---@class Base` line (line 0, on `Base`).
+    let impls = client.implementation(&base_uri, 0, 10);
+    assert_eq!(impls.len(), 2, "{impls:?}");
+    assert!(
+        impls
+            .iter()
+            .any(|l| l.uri.as_str().ends_with("derived.lua")),
+        "{impls:?}"
+    );
+    assert!(
+        impls.iter().any(|l| l.uri.as_str().ends_with("other.lua")),
+        "{impls:?}"
+    );
+    client.shutdown();
+}
+
+#[test]
+fn implementation_on_interface_without_subclasses_is_empty() {
+    let client = start(&[("base.lua", "---@class Base\n")]);
+    let base_uri = client.uri("base.lua");
+    client.open(&base_uri, "---@class Base\n");
+    let mut client = client;
+    let impls = client.implementation(&base_uri, 0, 10);
+    assert!(impls.is_empty(), "{impls:?}");
     client.shutdown();
 }
 

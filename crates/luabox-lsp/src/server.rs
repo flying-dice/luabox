@@ -25,20 +25,21 @@ use lsp_types::notification::{
 };
 use lsp_types::request::{
     CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest,
-    FoldingRangeRequest, Formatting, GotoDefinition, HoverRequest, InlayHintRequest,
-    PrepareRenameRequest, RangeFormatting, References, Rename, Request as _, SelectionRangeRequest,
-    SemanticTokensFullRequest, WorkspaceSymbolRequest,
+    FoldingRangeRequest, Formatting, GotoDefinition, GotoImplementation, GotoTypeDefinition,
+    HoverRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting, References, Rename,
+    Request as _, SelectionRangeRequest, SemanticTokensFullRequest, WorkspaceSymbolRequest,
 };
 use lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionProviderCapability,
     CompletionOptions, CompletionResponse, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DocumentHighlight, DocumentSymbolResponse, FoldingRange,
     FoldingRangeProviderCapability, GotoDefinitionResponse, Hover, HoverProviderCapability,
-    InitializeParams, InitializeResult, InlayHint, Location, OneOf, PrepareRenameResponse,
-    PublishDiagnosticsParams, RenameOptions, SelectionRange, SelectionRangeProviderCapability,
-    SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SymbolInformation,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
+    ImplementationProviderCapability, InitializeParams, InitializeResult, InlayHint, Location,
+    OneOf, PrepareRenameResponse, PublishDiagnosticsParams, RenameOptions, SelectionRange,
+    SelectionRangeProviderCapability, SemanticTokens, SemanticTokensFullOptions,
+    SemanticTokensOptions, SemanticTokensResult, SemanticTokensServerCapabilities,
+    ServerCapabilities, ServerInfo, SymbolInformation, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextEdit, TypeDefinitionProviderCapability, Uri, WorkspaceEdit,
     WorkspaceSymbolResponse,
 };
 use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
@@ -50,8 +51,8 @@ use crate::line_index::LineIndex;
 use crate::sema::FileSema;
 use crate::uri::uri_to_path;
 use crate::{
-    completion, diagnostics, document_highlight, fmt, folding, goto_def, hover, inlay_hints,
-    references, rename, selection_range, semantic_tokens, symbols,
+    completion, diagnostics, document_highlight, fmt, folding, goto_def, goto_impl, goto_type,
+    hover, inlay_hints, references, rename, selection_range, semantic_tokens, symbols,
 };
 
 /// Run the server over stdio until the client sends `shutdown`/`exit`.
@@ -103,6 +104,11 @@ fn server_capabilities() -> ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         definition_provider: Some(OneOf::Left(true)),
+        // Goto type-definition (value → its `---@class`/`---@alias`/`---@enum`,
+        // see [`crate::goto_type`]) and goto-implementation (interface class →
+        // its subclasses, see [`crate::goto_impl`]).
+        type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
+        implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
         references_provider: Some(OneOf::Left(true)),
         workspace_symbol_provider: Some(OneOf::Left(true)),
         // `prepare_provider` advertises textDocument/prepareRename, so the
@@ -420,6 +426,22 @@ impl Server {
                     .map(GotoDefinitionResponse::Scalar);
                 Response::new_ok(id, result)
             }
+            GotoTypeDefinition::METHOD => {
+                let (id, params) = cast_request::<GotoTypeDefinition>(req)?;
+                let doc = params.text_document_position_params;
+                let result = self
+                    .type_definition(&doc.text_document.uri, doc.position)
+                    .map(GotoDefinitionResponse::Scalar);
+                Response::new_ok(id, result)
+            }
+            GotoImplementation::METHOD => {
+                let (id, params) = cast_request::<GotoImplementation>(req)?;
+                let doc = params.text_document_position_params;
+                let result = self
+                    .implementation(&doc.text_document.uri, doc.position)
+                    .map(GotoDefinitionResponse::Array);
+                Response::new_ok(id, result)
+            }
             References::METHOD => {
                 let (id, params) = cast_request::<References>(req)?;
                 let doc = params.text_document_position;
@@ -527,6 +549,28 @@ impl Server {
         let sema = self.sema(&path)?;
         let offset = sema.index.offset(position);
         goto_def::goto_definition(&sema, offset, &self.root)
+    }
+
+    /// The declaration of the type carried by the value at `position`: its
+    /// `---@class`/`---@alias`/`---@enum`, searched workspace-wide (declarations
+    /// are workspace-global). Reuses one snapshot for the whole scan.
+    fn type_definition(&self, uri: &Uri, position: lsp_types::Position) -> Option<Location> {
+        let path = uri_to_path(uri)?;
+        let snapshot = self.host.snapshot();
+        let sema = FileSema::new(&snapshot, &path)?;
+        let offset = sema.index.offset(position);
+        goto_type::goto_type_definition(&snapshot, &sema, offset)
+    }
+
+    /// Every implementor of the `---@class` at `position`: each workspace class
+    /// that lists it as a parent (see [`crate::goto_impl`]). Reuses one snapshot
+    /// for the whole cross-file scan.
+    fn implementation(&self, uri: &Uri, position: lsp_types::Position) -> Option<Vec<Location>> {
+        let path = uri_to_path(uri)?;
+        let snapshot = self.host.snapshot();
+        let sema = FileSema::new(&snapshot, &path)?;
+        let offset = sema.index.offset(position);
+        goto_impl::goto_implementation(&snapshot, &sema, offset)
     }
 
     /// All references to the symbol at `position`. Locals/upvalues are found in

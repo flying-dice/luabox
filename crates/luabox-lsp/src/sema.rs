@@ -474,7 +474,8 @@ pub fn docs_of(item: &AnnotatedItem) -> String {
 }
 
 /// The underlying named type of an annotated type, peeling `?`/parens.
-fn named_of(ty: &TypeExpr) -> Option<String> {
+#[must_use]
+pub fn named_of(ty: &TypeExpr) -> Option<String> {
     match &ty.kind {
         TypeExprKind::Named { name, .. } => Some(name.clone()),
         TypeExprKind::Optional(inner) | TypeExprKind::Paren(inner) => named_of(inner),
