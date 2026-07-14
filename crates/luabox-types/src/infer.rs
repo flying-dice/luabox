@@ -475,7 +475,11 @@ struct Infer<'a> {
     /// Contextual (bidirectional) parameter types (#120): the parameter
     /// bindings of a function *literal* written in a position whose EXPECTED
     /// type is a `fun(...)` — a call argument matched to a `---@param cb
-    /// fun(...)`, or the initializer of a `---@type fun(...)` local. Each
+    /// fun(...)`, the initializer of a `---@type fun(...)` local, a `---@return
+    /// fun(...)` return expression, or a function-valued field of a
+    /// contextually-typed table literal — including layers reached
+    /// transitively through an expected `fun(a): fun(b)` return type or a
+    /// nested table field (all seeded by [`Self::seed_contextual`]). Each
     /// param takes the expected function type's corresponding parameter type
     /// so the lambda body type-checks against it with no per-parameter
     /// annotation. Unlike [`Self::param_seeds`] (observed-call, display-only)
@@ -1291,6 +1295,27 @@ impl Infer<'_> {
                 self.eval(body, expr);
             }
             Stmt::Return(exprs) => {
+                // Contextual typing of return expressions (#120 follow-up):
+                // the enclosing function's declared `---@return` types seed
+                // returned function/table literals before they are walked, the
+                // same way `---@type` seeds an initializer — luals types a
+                // returned node against the function's return `infer`
+                // (`script/vm/compiler.lua`). Fires only for a function with a
+                // declared signature; a contextually-typed lambda (no declared
+                // sig of its own) has its returns seeded transitively by
+                // `seed_returns` at the point its parameters are seeded.
+                if let Some(returns) = self
+                    .funcs
+                    .get(&body)
+                    .and_then(|d| d.sig.as_ref().map(|s| s.returns.clone()))
+                {
+                    for (i, &e) in exprs.iter().enumerate() {
+                        if let Some(exp) = returns.get(i) {
+                            let exp = exp.clone();
+                            self.seed_contextual(body, e, &exp);
+                        }
+                    }
+                }
                 let values = self.eval_values(body, &exprs, None);
                 let data = self.funcs.entry(body).or_default();
                 for (i, value) in values.into_iter().enumerate() {
@@ -1384,16 +1409,21 @@ impl Infer<'_> {
             self.walk_body(fn_body, Some(sig), None);
             vec![ITy::Ty(Ty::Function(Box::new(sig.clone())))]
         } else {
-            // Contextual typing (#120): a `---@type fun(...)` on the local
-            // seeds the function-literal initializer's parameters from the
-            // expected function type before its body is walked (the `sig`
-            // branch above already covers a `---@param`-annotated initializer,
-            // whose annotation wins). Only fires when the target is a bare
-            // `fun(...)`; a non-function `---@type` leaves the lambda untyped.
-            if let (Some((_, fn_expr)), Some([expected])) = (fn_init, declared_tys.as_deref())
-                && matches!(expected, Ty::Function(_))
-            {
-                self.seed_contextual_params(body, fn_expr, expected);
+            // Contextual typing (#120 + follow-ups): a `---@type T` on the
+            // local seeds its initializer against `T` before the value is
+            // walked (the `sig` branch above already covers a
+            // `---@param`-annotated initializer, whose annotation wins). A
+            // `fun(...)` target types a function-literal initializer's
+            // parameters; a `---@class`/table target types a table-literal
+            // initializer's function-valued fields and nested table fields. A
+            // non-matching `---@type` leaves the initializer untyped.
+            if let Some(tys) = declared_tys.as_deref() {
+                for (i, ty) in tys.iter().enumerate() {
+                    if let Some(&e) = init.get(i) {
+                        let ty = ty.clone();
+                        self.seed_contextual(body, e, &ty);
+                    }
+                }
             }
             self.eval_values(body, init, Some(names.len()))
         };
@@ -2723,12 +2753,13 @@ impl Infer<'_> {
         }
     }
 
-    /// Contextually type function-literal arguments of a call from the
-    /// callee's expected parameter types (bidirectional typing, #120). For
-    /// each argument that is a function literal and whose matching parameter
-    /// of the callee's declared signature is a `fun(...)` type, seed the
-    /// lambda's own parameters from that expected function type
-    /// ([`Self::seed_contextual_params`]).
+    /// Contextually type a call's arguments from the callee's declared
+    /// parameter types (bidirectional typing, #120 + follow-ups). Each
+    /// argument is seeded against its matching parameter through the recursive
+    /// [`Self::seed_contextual`], so a function-literal argument takes its
+    /// expected `fun(...)` parameter types, and a table-literal argument's
+    /// function-valued fields (and nested table fields) take the expected
+    /// class's declared field types.
     ///
     /// Conservative by construction:
     ///  - `callee_function_ty` yields `None` for an unannotated / `unknown` /
@@ -2737,7 +2768,9 @@ impl Infer<'_> {
     ///  - a generic callee (`---@generic`) is skipped — its callback parameter
     ///    types carry unbound placeholders, and generic callback inference is
     ///    a documented follow-up, not part of this core;
-    ///  - only a parameter whose type is literally `fun(...)` seeds anything.
+    ///  - [`Self::seed_contextual`] only acts where the expected type's own
+    ///    structure directs it (a `fun(...)` for a lambda, a `---@class`/table
+    ///    for a table literal); anything else seeds nothing.
     fn seed_call_contextual(&mut self, body: BodyId, callee_ity: &ITy, args: &[ExprId]) {
         let Some(sig) = self.callee_function_ty(callee_ity) else {
             return;
@@ -2748,16 +2781,76 @@ impl Infer<'_> {
             return;
         }
         for (i, &arg) in args.iter().enumerate() {
-            if !matches!(self.body(body).expr(arg), Expr::Function(_)) {
-                continue;
-            }
             let Some(param) = sig.params.get(i) else {
                 continue;
             };
-            if matches!(param.ty, Ty::Function(_)) {
-                let expected = param.ty.clone();
-                self.seed_contextual_params(body, arg, &expected);
+            let expected = param.ty.clone();
+            self.seed_contextual(body, arg, &expected);
+        }
+    }
+
+    /// Recursively seed contextual (bidirectional) types from an `expected`
+    /// type into an expression, following the expected type's own structure.
+    /// This mirrors luals `script/vm/compiler.lua`, which lazily compiles a
+    /// node against its expected (`infer`) type and recurses through nested
+    /// callbacks and table fields (`compileNode` / `compileByNode`). Two
+    /// expression shapes carry context:
+    ///
+    ///  - a **function literal** against an expected `fun(...)`: its parameters
+    ///    take the expected parameter types (so the body checks with no
+    ///    per-parameter annotation), and — following the expected *return*
+    ///    type — a returned function/table literal is seeded transitively, so
+    ///    an `outer(function(a) return function(b) ... end end)` against
+    ///    `---@param cb fun(a: A): fun(b: B)` types both `a` and `b` (#120
+    ///    nested/transitive follow-up);
+    ///  - a **table literal** against an expected `---@class`/table: each field
+    ///    the class declares is seeded against that field's declared type, so a
+    ///    function-valued field's literal takes the field's `fun` parameter
+    ///    types and a nested table-literal field takes the field's class type
+    ///    (contextual typing *into* a table literal, #120 follow-up).
+    ///
+    /// Bounded by the expected type's structure — never guessing. An
+    /// `unknown`/`any`/non-matching expected type seeds nothing, exactly as
+    /// today.
+    fn seed_contextual(&mut self, body: BodyId, expr: ExprId, expected: &Ty) {
+        match self.body(body).expr(expr).clone() {
+            Expr::Function(fn_body) => {
+                let Ty::Function(expected_fn) = expected else {
+                    return;
+                };
+                let expected_fn = expected_fn.clone();
+                self.seed_lambda_params(body, expr, fn_body, &expected_fn);
+                // Follow the expected return type into returned literals —
+                // nested/transitive propagation through further callback or
+                // table layers.
+                self.seed_returns(fn_body, &expected_fn.returns);
             }
+            Expr::Table { entries } => {
+                let Some(shape) = self.expected_shape(expected) else {
+                    return;
+                };
+                for entry in &entries {
+                    let (name, value) = match entry {
+                        TableEntry::Named { name, value } => (Some(name.clone()), *value),
+                        TableEntry::Keyed { key, value } => {
+                            let name = match self.body(body).expr(*key) {
+                                Expr::Literal(Literal::String(s)) => s.as_str().map(str::to_string),
+                                _ => None,
+                            };
+                            (name, *value)
+                        }
+                        TableEntry::Positional(_) => continue,
+                    };
+                    let Some(name) = name else {
+                        continue;
+                    };
+                    if let Some(field) = shape.fields.get(&name) {
+                        let fty = field.ty.clone();
+                        self.seed_contextual(body, value, &fty);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2767,18 +2860,14 @@ impl Infer<'_> {
     /// checks against it without a per-parameter annotation. A parameter the
     /// lambda annotates itself (`---@param`) is skipped — annotations are
     /// authoritative (SPEC §3) and are applied through the ordinary `sig`
-    /// path. An expected parameter typed `unknown`/`any` seeds nothing (stays
-    /// as today). No effect when `expected` is not a function type or `fn_expr`
-    /// is not a function literal.
-    fn seed_contextual_params(&mut self, body: BodyId, fn_expr: ExprId, expected: &Ty) {
-        let Expr::Function(fn_body) = self.body(body).expr(fn_expr) else {
-            return;
-        };
-        let fn_body = *fn_body;
-        let Ty::Function(expected_fn) = expected else {
-            return;
-        };
-        let expected_fn = expected_fn.clone();
+    /// path. An expected parameter typed `unknown`/`any` seeds nothing.
+    fn seed_lambda_params(
+        &mut self,
+        body: BodyId,
+        fn_expr: ExprId,
+        fn_body: BodyId,
+        expected_fn: &FunctionTy,
+    ) {
         // The lambda's own `---@param` signature, when the harvester attached
         // one to this expression — authoritative, so those parameters are left
         // unseeded and the contextual type never overrides them.
@@ -2813,6 +2902,76 @@ impl Infer<'_> {
                 expected_param.ty.clone()
             };
             self.ctx_param_seeds.insert(param, ITy::Ty(ty));
+        }
+    }
+
+    /// Seed the function/table literals a body `return`s from the enclosing
+    /// (expected) return types — the transitive step that carries a
+    /// `fun(...): fun(...)` expected type into a returned nested lambda, and a
+    /// `---@return <Class>` into a returned table literal's fields. Descends
+    /// through control-flow blocks but not into nested closures (whose returns
+    /// belong to those closures).
+    fn seed_returns(&mut self, fn_body: BodyId, expected: &[Ty]) {
+        if expected.is_empty() {
+            return;
+        }
+        let block = self.body(fn_body).block.clone();
+        let mut rets: Vec<Vec<ExprId>> = Vec::new();
+        self.collect_returns(fn_body, &block, &mut rets);
+        for ret in rets {
+            for (i, &e) in ret.iter().enumerate() {
+                if let Some(exp) = expected.get(i) {
+                    let exp = exp.clone();
+                    self.seed_contextual(fn_body, e, &exp);
+                }
+            }
+        }
+    }
+
+    /// Collect the expression lists of every `return` that belongs to `body`,
+    /// descending through control-flow blocks but never into nested function
+    /// literals.
+    fn collect_returns(&self, body: BodyId, block: &Block, out: &mut Vec<Vec<ExprId>>) {
+        for &stmt in &block.stmts {
+            match self.body(body).stmt(stmt) {
+                Stmt::Return(exprs) => out.push(exprs.clone()),
+                Stmt::If {
+                    branches,
+                    else_block,
+                } => {
+                    for br in branches {
+                        self.collect_returns(body, &br.block, out);
+                    }
+                    if let Some(b) = else_block {
+                        self.collect_returns(body, b, out);
+                    }
+                }
+                Stmt::While { body: b, .. }
+                | Stmt::Repeat { body: b, .. }
+                | Stmt::NumericFor { body: b, .. }
+                | Stmt::GenericFor { body: b, .. }
+                | Stmt::Do { body: b } => self.collect_returns(body, b, out),
+                _ => {}
+            }
+        }
+    }
+
+    /// Resolve an expected type to a single class/table field shape (mirrors
+    /// the checker's `table_shape`), unwrapping a `T?`/`T|nil` optional. A
+    /// union of two or more real members has no single expected shape, so it
+    /// seeds nothing (conservative).
+    fn expected_shape(&self, expected: &Ty) -> Option<TableTy> {
+        match expected {
+            Ty::Named(name) => self.env.class_shape(name),
+            Ty::Table(t) => Some((**t).clone()),
+            Ty::Union(members) => {
+                let non_nil: Vec<&Ty> = members.iter().filter(|m| **m != Ty::Nil).collect();
+                match non_nil[..] {
+                    [single] => self.expected_shape(single),
+                    _ => None,
+                }
+            }
+            _ => None,
         }
     }
 

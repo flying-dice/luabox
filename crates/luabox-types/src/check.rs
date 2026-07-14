@@ -26,10 +26,14 @@
 //! `---@param cb fun(...)`, or the initializer of a `---@type fun(...)` local —
 //! takes that expected type's parameter types for its own parameters, seeded
 //! by [`crate::infer`] before the lambda body is walked, so the body checks
-//! against them with no per-parameter annotation. Deferred (TODO(P1)):
-//! contextual inference of a table literal's own type from context, contextual
-//! `return` typing beyond `---@return` checking, and generic/overload-driven
-//! expected types (generic callbacks are explicitly skipped, never guessed).
+//! against them with no per-parameter annotation. This now extends
+//! transitively (`infer::seed_contextual`): an expected `---@class` flows into
+//! a table literal so a function-valued field's lambda is typed, a `---@return`
+//! type contextually types the returned literal, and nested callback/table
+//! layers propagate (matching luals `script/vm/compiler.lua`). Still deferred
+//! (TODO(P1)): generic/overload-driven expected types — a generic callback is
+//! explicitly skipped, never guessed. The checker's own field-by-field literal
+//! diagnostics (LB0302/LB0303/LB0304) are unchanged by the seeding.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;

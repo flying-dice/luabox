@@ -103,13 +103,27 @@ callee/target, an `unknown`/`any` expected type, or a non-function expected type
 An explicit `---@param`/inline annotation on the lambda's parameter wins over
 the contextual type (annotations are authoritative, SPEC §3).
 
-Deferred (follow-ups, not yet done): propagating an expected type *into* a table
-literal to infer the literal's own type (field-by-field checking of a table
-literal against a `---@class` parameter already works); contextual typing of
-`return` expressions beyond `---@return` checking; nested/transitive
-propagation through multiple call layers; and overload-driven expected types and
+The expected type now also propagates *into* literals and through nested
+layers, matching luals (`script/vm/compiler.lua`, which lazily compiles a node
+against its expected type):
+
+- **into a table literal** — an expected `---@class` (at a `---@type` local, a
+  `---@param` argument, or a `---@return` position) types a function-valued
+  field's lambda from the field's declared `fun(...)`, so a bad field read
+  inside it is flagged; a nested table-literal field takes its declared class
+  type. The field-by-field literal diagnostics against the class are unchanged;
+- **`return` position** — a `---@return fun(...)` contextually types the
+  returned function literal's parameters the same way `---@type` does, and a
+  `---@return <Class>` types a returned table literal's fields; and
+- **nested/transitive** — an expected `fun(a: A): fun(b: B)` types both the
+  outer and the returned inner lambda's parameters.
+
+Still deferred (follow-ups, not yet done): overload-driven expected types and
 generic callback inference (a generic callee is deliberately skipped — its
-callback parameters carry unbound placeholders that are never guessed).
+callback parameters carry unbound placeholders that are never guessed). A layer
+with no expected type — e.g. a lambda passed to an *unannotated* parameter — is
+never typed: propagation follows the expected-type structure and never invents
+one.
 
 ## Tooling
 

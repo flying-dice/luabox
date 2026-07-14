@@ -36,11 +36,15 @@
 //! body checks with no per-parameter annotation. Conservative: no expected
 //! function type (unannotated callee, `unknown`/`any`/non-function expected)
 //! leaves the parameter `unknown` exactly as before, and an explicit
-//! `---@param` on the lambda wins. Deferred: table-literal expected-type
-//! propagation, contextual `return` typing, nested/transitive propagation,
-//! and overload-driven or generic callback inference.
+//! `---@param` on the lambda wins. The expected type also now propagates
+//! transitively: into a table literal (a function-valued field's lambda takes
+//! the field's `fun(...)` type; a nested table field takes its declared
+//! class), through `return` position (a `---@return` type contextually types
+//! the returned literal), and across nested callback layers
+//! (`fun(a): fun(b)` types both). Still deferred: overload-driven or generic
+//! callback inference (a generic callback is skipped, never guessed).
 //!
-//! **P1 (TODO):** contextual typing of the deferred cases above, generics as
+//! **P1 (TODO):** overload/generic-driven contextual typing, generics as
 //! real type variables, function subtyping.
 //!
 //! Diagnostics carry `LB03xx` codes registered in `luabox-diag` (this
@@ -3005,5 +3009,247 @@ local n = w.nofield
         // The only diagnostic is the direct bad-field read on `w`, proving no
         // contextual machinery misfired.
         assert_eq!(strict_codes(src), vec!["LB0306"]);
+    }
+
+    // --- follow-ups: expected type INTO literals, return position, nesting ---
+    //
+    // luals reference: `script/vm/compiler.lua` compiles a node lazily against
+    // its expected (`infer`) type — flowing an expected class into a table
+    // constructor and an expected `fun(...)` into a returned closure, recursing
+    // through nested callback and table layers. luabox mirrors this in
+    // `infer::seed_contextual` (+ `seed_returns`), keeping the checker's
+    // field-by-field literal diagnostics (LB0302/LB0303/LB0304) intact.
+
+    #[test]
+    fn contextual_class_into_typed_local_function_field() {
+        // (A) An expected `---@class` flows into a `---@type` table literal: a
+        // function-valued field's lambda takes the field's declared `fun(...)`
+        // parameter types, so a bad field read inside it is flagged.
+        let bad = "\
+---@class Event
+---@field x number
+---@class Widget
+---@field onclick fun(e: Event)
+
+---@type Widget
+local w = { onclick = function(e) return e.nofield end }
+";
+        assert_eq!(strict_codes(bad), vec!["LB0306"]);
+
+        let good = "\
+---@class Event
+---@field x number
+---@class Widget
+---@field onclick fun(e: Event)
+
+---@type Widget
+local w = { onclick = function(e) return e.x end }
+";
+        assert_eq!(strict_codes(good), Vec::<String>::new());
+    }
+
+    #[test]
+    fn contextual_class_into_param_literal_keeps_field_checks() {
+        // (A) The same flow at a `---@param p Widget` call argument, AND the
+        // literal's own field-compatibility diagnostics still fire: `name` is
+        // missing (LB0302) while the seeded `e` inside `onclick` flags the bad
+        // read (LB0306) — the contextual type does not weaken the field check.
+        let src = "\
+---@class Event
+---@field x number
+---@class Widget
+---@field name string
+---@field onclick fun(e: Event)
+
+---@param p Widget
+local function f(p) end
+
+f({ onclick = function(e) return e.nofield end })
+";
+        assert_eq!(strict_codes(src), vec!["LB0302", "LB0306"]);
+    }
+
+    #[test]
+    fn contextual_bad_literal_field_still_diagnosed() {
+        // (A) A structurally bad literal at a class parameter is still flagged
+        // field-by-field (missing required + undeclared key), unchanged.
+        let src = "\
+---@class Widget
+---@field name string
+
+---@param p Widget
+local function f(p) end
+
+f({ nope = 1 })
+";
+        assert_eq!(strict_codes(src), vec!["LB0302", "LB0303"]);
+    }
+
+    #[test]
+    fn contextual_non_single_class_expected_seeds_nothing() {
+        // (A) An `any` expected type — and a two-member union with no single
+        // expected shape — seed nothing: the lambda parameter stays `unknown`
+        // and the bad read is NOT flagged (conservatism, unchanged behavior).
+        let any_expected = "\
+---@class Event
+---@field x number
+---@class Widget
+---@field onclick fun(e: Event)
+
+---@type any
+local w = { onclick = function(e) return e.nofield end }
+";
+        assert_eq!(strict_codes(any_expected), Vec::<String>::new());
+
+        let union_expected = "\
+---@class Event
+---@field x number
+---@class W1
+---@field onclick fun(e: Event)
+---@class W2
+---@field onclick fun(e: Event)
+
+---@param p W1|W2
+local function f(p) end
+
+f({ onclick = function(e) return e.nofield end })
+";
+        assert_eq!(strict_codes(union_expected), Vec::<String>::new());
+    }
+
+    #[test]
+    fn contextual_return_seeds_returned_lambda() {
+        // (B) A `---@return fun(w: Widget)` contextually types the returned
+        // function literal's parameter, so a bad field read inside it is
+        // flagged — the return-position analogue of the callback-argument win.
+        let bad = "\
+---@class Widget
+---@field name string
+
+---@return fun(w: Widget)
+local function make()
+  return function(w) return w.nofield end
+end
+";
+        assert_eq!(strict_codes(bad), vec!["LB0306"]);
+
+        let good = "\
+---@class Widget
+---@field name string
+
+---@return fun(w: Widget)
+local function make()
+  return function(w) return w.name end
+end
+";
+        assert_eq!(strict_codes(good), Vec::<String>::new());
+    }
+
+    #[test]
+    fn contextual_return_seeds_returned_table_function_field() {
+        // (B, composes with A) A `---@return Widget` flows the class into the
+        // returned table literal, typing its `onclick` field's lambda param.
+        let src = "\
+---@class Event
+---@field x number
+---@class Widget
+---@field name string
+---@field onclick fun(e: Event)
+
+---@return Widget
+local function make()
+  return { name = \"x\", onclick = function(e) return e.nofield end }
+end
+";
+        assert_eq!(strict_codes(src), vec!["LB0306"]);
+    }
+
+    #[test]
+    fn contextual_return_bad_literal_still_diagnosed() {
+        // (B) A returned literal that does not satisfy the declared class is
+        // still flagged by the checker's return field check (missing field).
+        let src = "\
+---@class Widget
+---@field name string
+---@field size number
+
+---@return Widget
+local function make()
+  return { name = \"x\" }
+end
+";
+        assert_eq!(strict_codes(src), vec!["LB0302"]);
+    }
+
+    #[test]
+    fn contextual_nested_lambda_two_levels() {
+        // (C) `outer(function(a) return function(b) ... end end)` against
+        // `---@param cb fun(x: A): fun(y: B)` types BOTH layers: the inner
+        // `y` takes `B` transitively through the expected return type.
+        let inner = "\
+---@class A
+---@field a number
+---@class B
+---@field b number
+
+---@param cb fun(x: A): fun(y: B)
+local function outer(cb) end
+
+outer(function(x) return function(y) return y.nofield end end)
+";
+        assert_eq!(strict_codes(inner), vec!["LB0306"]);
+
+        // The outer layer is still typed too (one-level win preserved).
+        let outer_layer = "\
+---@class A
+---@field a number
+---@class B
+---@field b number
+
+---@param cb fun(x: A): fun(y: B)
+local function outer(cb) end
+
+outer(function(x) return function(y) return x.nofield end end)
+";
+        assert_eq!(strict_codes(outer_layer), vec!["LB0306"]);
+    }
+
+    #[test]
+    fn contextual_nested_table_literal_field() {
+        // (C, composes with A) A table literal nested inside another
+        // contextually-typed table literal takes the outer field's declared
+        // class type, so the innermost function field's lambda is typed.
+        let src = "\
+---@class Event
+---@field x number
+---@class Panel
+---@field onclick fun(e: Event)
+---@class Widget
+---@field panel Panel
+
+---@type Widget
+local w = { panel = { onclick = function(e) return e.nofield end } }
+";
+        assert_eq!(strict_codes(src), vec!["LB0306"]);
+    }
+
+    #[test]
+    fn contextual_unannotated_intermediary_stays_untyped() {
+        // (C) A layer luals would NOT type — a lambda passed to an UNANNOTATED
+        // parameter `g` — carries no expected type, so its own `x` stays
+        // `unknown` and the bad read is not flagged. Propagation follows the
+        // expected-type structure only; it never invents one.
+        let src = "\
+---@class A
+---@field a number
+
+---@param cb fun(x: A)
+local function outer(cb) end
+
+local function passthru(g)
+  g(function(x) return x.nofield end)
+end
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
     }
 }
