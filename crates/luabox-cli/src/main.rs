@@ -11,13 +11,16 @@ mod check_cmd;
 mod deps_cmd;
 mod doc_cmd;
 mod fmt_cmd;
+mod github;
 mod lint_cmd;
 mod lsp_cmd;
 mod modes;
+mod outdated_cmd;
 mod project;
 mod publish_cmd;
 mod run_cmd;
 mod scaffold;
+mod search_cmd;
 mod test_cmd;
 mod toolchain_cmd;
 mod upgrade_cmd;
@@ -88,6 +91,21 @@ enum Command {
     },
     /// Remove a dependency from luabox.toml
     Remove { package: String },
+    /// Search GitHub for luabox packages (repos with topic `luabox` and a
+    /// root luabox.toml)
+    Search {
+        /// Optional terms, matched against repo name/description/README
+        query: Option<String>,
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Report git dependencies behind their repo's latest GitHub release
+    Outdated {
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
     /// Resolve and fetch dependencies (lockfile-driven)
     Install,
     /// Update dependencies within manifest constraints
@@ -252,6 +270,8 @@ fn main() -> anyhow::Result<()> {
             },
         ),
         Command::Remove { package } => deps_cmd::remove(&std::env::current_dir()?, &package),
+        Command::Search { query, format } => search_cmd::run(query.as_deref(), &format),
+        Command::Outdated { format } => outdated_cmd::run(&std::env::current_dir()?, &format),
         Command::Install => deps_cmd::install(&std::env::current_dir()?),
         Command::Update { package } => {
             deps_cmd::update(&std::env::current_dir()?, package.as_deref())

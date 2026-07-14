@@ -261,6 +261,62 @@ start = \"luabox run src/main.lua\"
     }
 
     #[test]
+    fn set_dependency_entry_repins_git_tag_in_place() {
+        // The `luabox update` re-pin: rewrite a git dep's `tag` to the latest
+        // release, preserving the URL, any other keys, and comments elsewhere.
+        use crate::manifest::{Dependency, GitDependency};
+
+        let src = "\
+# keep me
+[package]
+name = \"app\"
+version = \"1.0.0\"
+edition = \"5.4\"
+
+[dependencies]
+promise = { git = \"https://github.com/o/promise\", tag = \"v0.1.0\" } # pinned
+";
+        let mut manifest = Manifest::parse(src).expect("valid manifest");
+        let current = match manifest.dependencies.get("promise") {
+            Some(Dependency::Git(git)) => git.clone(),
+            other => panic!("expected a git dependency, got {other:?}"),
+        };
+        assert_eq!(current.tag.as_deref(), Some("v0.1.0"));
+
+        manifest.set_dependency_entry(
+            "promise",
+            &Dependency::Git(GitDependency {
+                tag: Some("v0.2.0".to_owned()),
+                ..current
+            }),
+            false,
+        );
+
+        let out = manifest.to_string();
+        assert!(out.contains("tag = \"v0.2.0\""), "{out}");
+        assert!(!out.contains("v0.1.0"), "{out}");
+        // The URL, the surrounding comment, and unrelated content survive.
+        assert!(
+            out.contains("git = \"https://github.com/o/promise\""),
+            "{out}"
+        );
+        assert!(out.contains("# pinned"), "{out}");
+        assert!(out.contains("# keep me"), "{out}");
+
+        let reparsed = Manifest::parse(&out).expect("re-pinned manifest still valid");
+        assert_eq!(
+            reparsed.dependencies.get("promise"),
+            Some(&Dependency::Git(GitDependency {
+                git: "https://github.com/o/promise".to_owned(),
+                rev: None,
+                tag: Some("v0.2.0".to_owned()),
+                branch: None,
+                version: None,
+            }))
+        );
+    }
+
+    #[test]
     fn set_dependency_entry_dev_moves_between_tables() {
         let mut manifest = Manifest::parse(SRC).expect("valid manifest");
         manifest.set_dependency_entry(

@@ -32,6 +32,10 @@ rowan.workspace = true
 toml_edit.workspace = true
 tempfile.workspace = true
 sha2.workspace = true
+serde.workspace = true
+# GitHub-as-registry discovery (`search`/`outdated`): parse API JSON and emit
+# the frozen GUI contract — never by hand-scanning (`string_slice` is denied).
+serde_json.workspace = true
 # `luabox upgrade` self-replace: renames the running exe out of the way on
 # Windows (see upgrade_cmd.rs).
 self-replace.workspace = true
@@ -40,7 +44,6 @@ self-replace.workspace = true
 cucumber.workspace = true
 tokio.workspace = true
 tempfile.workspace = true
-serde_json.workspace = true
 
 [[test]]
 name = "acceptance"

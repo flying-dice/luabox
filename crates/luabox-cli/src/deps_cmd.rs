@@ -150,14 +150,110 @@ pub fn install(cwd: &Path) -> anyhow::Result<()> {
     sync(&project, &LockUse::Full, false)
 }
 
-/// `luabox update [pkg]`: re-resolve ignoring the lock (or just `pkg`'s
-/// pin), refreshing mutable git references.
+/// `luabox update [pkg]`: re-pin git dependencies to their repo's latest
+/// GitHub release tag, then re-resolve ignoring the lock (or just `pkg`'s pin),
+/// refreshing mutable git references.
+///
+/// The re-pin is the GUI "Update" button's clean call: a **tag**-pinned git dep
+/// is rewritten (`Manifest::set_dependency_entry`, comment-preserving) to the
+/// latest release tag of its GitHub repo. A dep pinned by `rev`/`branch` is
+/// left untouched — switching its pin kind silently would be surprising — and
+/// says so. Non-git deps are untouched by the re-pin and follow the ordinary
+/// re-resolve.
 pub fn update(cwd: &Path, package: Option<&str>) -> anyhow::Result<()> {
-    let project = discover(cwd)?;
+    let mut project = discover(cwd)?;
+    let token = crate::github::token();
+    repin_git_tags(&mut project, package, token.as_deref())?;
     match package {
         None => sync(&project, &LockUse::Ignore, true),
         Some(name) => sync(&project, &LockUse::Without(name.to_owned()), true),
     }
+}
+
+/// A git dependency and which table it lives in — the unit `repin_git_tags`
+/// rewrites.
+struct GitTarget {
+    name: String,
+    dev: bool,
+    git: GitDependency,
+}
+
+/// Re-pins tag-pinned git dependencies (all of them, or just `only` when named)
+/// to their GitHub repo's latest release tag, writing `luabox.toml` in place.
+/// Prints one line per dependency it considered. Returns the names re-pinned.
+fn repin_git_tags(
+    project: &mut Project,
+    only: Option<&str>,
+    token: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    let mut targets = Vec::new();
+    for (dev, table) in [
+        (false, &project.manifest.dependencies),
+        (true, &project.manifest.dev_dependencies),
+    ] {
+        for (name, dep) in table {
+            if only.is_some_and(|wanted| wanted != name) {
+                continue;
+            }
+            if let Dependency::Git(git) = dep {
+                targets.push(GitTarget {
+                    name: name.clone(),
+                    dev,
+                    git: git.clone(),
+                });
+            }
+        }
+    }
+
+    let mut repinned = Vec::new();
+    for target in targets {
+        let Some(tag) = &target.git.tag else {
+            println!(
+                "leaving `{}`: pinned by {}, not a tag — re-pin manually to change it",
+                target.name,
+                if target.git.rev.is_some() {
+                    "rev"
+                } else {
+                    "branch"
+                }
+            );
+            continue;
+        };
+        let Some(repo) = crate::github::parse_github_repo(&target.git.git) else {
+            println!(
+                "leaving `{}`: `{}` is not a GitHub repo — cannot look up its latest release",
+                target.name, target.git.git
+            );
+            continue;
+        };
+        let Some(latest) = crate::github::latest_release_tag(&repo, token)? else {
+            println!(
+                "leaving `{}`: `{repo}` has no releases or tags",
+                target.name
+            );
+            continue;
+        };
+        if &latest == tag {
+            println!("`{}` is already at the latest release {tag}", target.name);
+            continue;
+        }
+
+        let updated = GitDependency {
+            tag: Some(latest.clone()),
+            ..target.git.clone()
+        };
+        project
+            .manifest
+            .set_dependency_entry(&target.name, &Dependency::Git(updated), target.dev);
+        println!("re-pinned `{}` {tag} -> {latest}", target.name);
+        repinned.push(target.name);
+    }
+
+    if !repinned.is_empty() {
+        fs::write(&project.manifest_path, project.manifest.to_string())
+            .with_context(|| format!("cannot write `{}`", project.manifest_path.display()))?;
+    }
+    Ok(repinned)
 }
 
 /// `luabox vendor`: writable copies of every non-path dependency under
