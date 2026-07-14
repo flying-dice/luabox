@@ -822,7 +822,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-bundle"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "luabox-hir",
  "luabox-lower",
@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -863,7 +863,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-db"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "luabox-bundle",
  "luabox-diag",
@@ -875,7 +875,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-diag"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -883,7 +883,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-hir"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "luabox-syntax",
  "proptest",
@@ -892,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-lint"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "luabox-diag",
  "luabox-hir",
@@ -903,7 +903,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-lower"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "luabox-hir",
  "luabox-syntax",
@@ -913,7 +913,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-lsp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -935,7 +935,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-resolve"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "luabox-syntax",
@@ -950,7 +950,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "sha2",
  "tempfile",
@@ -958,7 +958,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-syntax"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "proptest",
  "rowan",
@@ -966,7 +966,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-test"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "rayon",
@@ -975,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-types"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "luabox-diag",
  "luabox-hir",

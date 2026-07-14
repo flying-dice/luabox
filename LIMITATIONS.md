@@ -166,15 +166,15 @@ configured. Set LUABOX_REGISTRY to your registry's location …
 
 ### Editor extensions are not on marketplaces yet (#102)
 
-The VS Code integration is packaged and the `.vsix` is attached to every
-[GitHub release](https://github.com/flying-dice/luabox/releases), so you can
-install it today — but it is not yet published to the VS Code Marketplace or
-Open VSX. Grab the `.vsix` from the latest release (or build it per the README
-under [`editors/vscode/`](editors/vscode/)) and install it into VS Code. The
-Marketplace/Open VSX upload is the only residual step and is pending a
-publisher account/token this repo doesn't hold. (JetBrains, Neovim, and Zed
-integrations were removed for now — any LSP client can still be pointed at
-`luabox lsp` manually.)
+The editor integrations live in their own repos and ship installable
+artifacts from their own releases — the VS Code `.vsix` from
+[flying-dice/luabox-vscode](https://github.com/flying-dice/luabox-vscode)
+(install via `code --install-extension`), the JetBrains plugin `.zip` from
+[flying-dice/luabox-jetbrains](https://github.com/flying-dice/luabox-jetbrains)
+(install from disk) — but neither is published to its marketplace yet
+(VS Code Marketplace / Open VSX / JetBrains Marketplace). Those uploads are
+the only residual steps and are pending publisher accounts/tokens this repo
+doesn't hold. Any other editor can point its LSP client at `luabox lsp`.
 
 ### Prebuilt binaries (#95 — shipped)
 

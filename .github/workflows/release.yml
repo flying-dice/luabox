@@ -1,10 +1,10 @@
 name: release
 
 # Cut a GitHub Release for a pushed `v*` tag: publish the release (notes lifted
-# from CHANGELOG.md), build the cross-platform `luabox` binaries + the VS Code
-# extension .vsix, attach them with SHA256SUMS and the install scripts, smoke
-# the just-uploaded artifacts on all three OSes, and only then mark the release
-# `--latest`.
+# from CHANGELOG.md), build the cross-platform `luabox` binaries, attach them
+# with SHA256SUMS and the install scripts, smoke the just-uploaded artifacts on
+# all three OSes, and only then mark the release `--latest`. (The VS Code
+# extension lives in flying-dice/luabox-vscode and releases its own .vsix.)
 #
 # Everything happens in this ONE workflow run, triggered by the tag push — not
 # via an `on: release` trigger. A release created here with GITHUB_TOKEN would
@@ -30,7 +30,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Publish the release up front so the build/vsix/publish/smoke jobs have a
+  # Publish the release up front so the build/publish/smoke jobs have a
   # target to attach to and download from. Deliberately NOT marked latest yet
   # (`--latest=false`) — that is gated behind `smoke` and done by `mark-latest`,
   # so a release only goes live after its freshly-built artifacts install and
@@ -121,38 +121,15 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # Package the VS Code extension. Required: the user drag-and-drops this .vsix
-  # into the VS Code Marketplace. The extension is versioned independently of
-  # the CLI (its own package.json version), so the file is `luabox-<extver>.vsix`,
-  # not tied to $TAG.
-  vsix:
-    name: Package VS Code extension
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: editors/vscode
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: editors/vscode/package-lock.json
-      - run: npm ci
-      - run: npm run compile
-      - run: npx @vscode/vsce package
-      - uses: actions/upload-artifact@v4
-        with:
-          name: luabox-vsix
-          path: editors/vscode/*.vsix
-          if-no-files-found: error
+  # The VS Code extension lives in its own repo (flying-dice/luabox-vscode)
+  # and ships its .vsix from that repo's releases — no vsix job here.
 
-  # Checksum the binaries + vsix and attach them, SHA256SUMS, and the install
+  # Checksum the binaries and attach them, SHA256SUMS, and the install
   # scripts to the release. Does NOT mark the release latest — that is gated
   # behind `smoke` and performed by `mark-latest`.
   publish:
     name: Upload assets
-    needs: [create-release, build, vsix]
+    needs: [create-release, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -168,15 +145,12 @@ jobs:
       - name: Generate checksums
         run: |
           cd dist
-          # Checksum the archives and the vsix explicitly. `luabox-*.vsix` also
-          # matches `luabox-*`, so listing the archive globs + the vsix keeps
-          # each asset in SHA256SUMS exactly once.
-          sha256sum luabox-*.tar.gz luabox-*.zip *.vsix > SHA256SUMS
+          sha256sum luabox-*.tar.gz luabox-*.zip > SHA256SUMS
           cat SHA256SUMS
       - name: Upload assets to release
         run: |
           gh release upload "$TAG" \
-            dist/luabox-*.tar.gz dist/luabox-*.zip dist/*.vsix dist/SHA256SUMS \
+            dist/luabox-*.tar.gz dist/luabox-*.zip dist/SHA256SUMS \
             scripts/install.sh scripts/install.ps1 \
             --clobber
 
@@ -650,7 +624,7 @@ jobs:
       # Gate 1 — asset-completeness. Last line of defense before go-live:
       # fetch the release's ACTUAL asset list and assert exactly the expected
       # set is present. Failure mode: `build` uses fail-fast:false, so a single
-      # silently-skipped OS build (or a dropped vsix upload) can leave the whole
+      # silently-skipped OS build can leave the whole
       # pipeline green while an asset is missing — users on that OS then get a
       # 404 from the installer. This catches it before the release is latest.
       - name: Assert the release has the complete asset set
@@ -670,23 +644,19 @@ jobs:
               missing=1
             fi
           done
-          # Exactly one luabox-*.vsix (its version is independent of the tag).
-          vsix_count="$(printf '%s\n' "$names" | grep -cE '^luabox-.*\.vsix$' || true)"
-          if [ "$vsix_count" -ne 1 ]; then
-            echo "error: expected exactly one luabox-*.vsix, found $vsix_count" >&2
-            missing=1
-          fi
-          # And no stray extras: the exact set is 6 fixed names + 1 vsix = 7.
+          # And no stray extras: the exact set is the 6 fixed names. (The VS
+          # Code extension lives in flying-dice/luabox-vscode and ships its
+          # .vsix from that repo's own releases.)
           total="$(printf '%s\n' "$names" | grep -c . || true)"
-          if [ "$total" -ne 7 ]; then
-            echo "error: expected exactly 7 assets, found $total" >&2
+          if [ "$total" -ne 6 ]; then
+            echo "error: expected exactly 6 assets, found $total" >&2
             missing=1
           fi
           [ "$missing" -eq 0 ] || { echo "asset-completeness gate failed" >&2; exit 1; }
 
       # Gate 2 — independent integrity re-verification. Freshly download every
-      # binary + the vsix + SHA256SUMS straight from the published release and
-      # run `sha256sum -c`. Failure mode: a truncated/corrupted upload, or a
+      # binary + SHA256SUMS straight from the published release and run
+      # `sha256sum -c`. Failure mode: a truncated/corrupted upload, or a
       # SHA256SUMS computed from different bytes than were actually attached,
       # would pass the per-job upload but hand users a checksum that does not
       # match the file they download. This proves published sums == published
@@ -698,41 +668,10 @@ jobs:
           gh release download "$TAG" \
             --pattern 'luabox-*.tar.gz' \
             --pattern 'luabox-*.zip' \
-            --pattern 'luabox-*.vsix' \
             --pattern 'SHA256SUMS'
           echo "--- SHA256SUMS ---"; cat SHA256SUMS
           # -c exits non-zero if any listed file is missing or its hash differs.
           sha256sum -c SHA256SUMS
-
-      # Gate 3 — vsix structural check. Failure mode: a truncated/empty vsix
-      # still matches its own (broken) checksum, so it sails through Gate 2 yet
-      # is useless in VS Code. Unzip it and assert the extension manifest names
-      # "luabox" with a version and that the compiled entry point is inside.
-      - name: Validate the .vsix structure
-        run: |
-          set -euo pipefail
-          work="$(mktemp -d)"; cd "$work"
-          gh release download "$TAG" --pattern 'luabox-*.vsix'
-          vsix="$(ls luabox-*.vsix)"
-          mkdir ext && (cd ext && unzip -q "../$vsix")
-          # VSIX packages lay the extension out under extension/.
-          pkg="ext/extension/package.json"
-          test -f "$pkg" || { echo "error: $pkg missing from vsix" >&2; exit 1; }
-          python3 - "$pkg" ext/extension <<'PY'
-          import json, os, sys
-          pkg_path, ext_root = sys.argv[1], sys.argv[2]
-          with open(pkg_path, encoding="utf-8") as f:
-              pkg = json.load(f)
-          if pkg.get("name") != "luabox":
-              sys.exit("error: vsix package.json name = %r, expected 'luabox'" % (pkg.get("name"),))
-          if not pkg.get("version"):
-              sys.exit("error: vsix package.json has no version")
-          main = pkg.get("main", "./out/extension.js")
-          entry = os.path.join(ext_root, main.lstrip("./").replace("/", os.sep))
-          if not os.path.isfile(entry):
-              sys.exit("error: compiled entry %s not found in vsix (%s)" % (main, entry))
-          print("vsix OK: %s v%s, entry %s present" % (pkg["name"], pkg["version"], main))
-          PY
 
       - name: Mark latest (go live)
         run: gh release edit "$TAG" --latest

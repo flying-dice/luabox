@@ -10,6 +10,19 @@ spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
 
 Nothing yet — changes land here between releases.
 
+## [0.1.2] - 2026-07-14
+
+### Changed
+
+- The VS Code extension moved to its own repository,
+  [flying-dice/luabox-vscode](https://github.com/flying-dice/luabox-vscode)
+  (full history preserved), releasing its `.vsix` independently; a JetBrains
+  plugin now lives at
+  [flying-dice/luabox-jetbrains](https://github.com/flying-dice/luabox-jetbrains).
+  This repo's releases carry the CLI binaries, `SHA256SUMS`, and the install
+  scripts (six assets); the release gate's vsix checks moved to the
+  extension repo's own pipeline.
+
 ## [0.1.1] - 2026-07-14
 
 ### Added

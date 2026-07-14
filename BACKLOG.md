@@ -35,10 +35,13 @@ in v0.1.0.
 ### Still open
 
 - [#102](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/102)
-  Distribute the editor integrations — reduced to VS Code only for now; the
-  `.vsix` now ships as a GitHub release asset, so install works today. Open
-  only for the residual credential-gated Marketplace/Open VSX upload, which
-  needs the publisher account/token this environment doesn't hold.
+  Distribute the editor integrations — VS Code and JetBrains now live in
+  their own repos ([luabox-vscode](https://github.com/flying-dice/luabox-vscode),
+  [luabox-jetbrains](https://github.com/flying-dice/luabox-jetbrains)) with
+  their own release pipelines shipping installable artifacts. Open only for
+  the residual credential-gated marketplace uploads (VS Code Marketplace /
+  Open VSX / JetBrains Marketplace), which need publisher accounts/tokens
+  this environment doesn't hold.
 
 ### Closed by this release
 

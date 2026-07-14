@@ -80,7 +80,7 @@ demo.
 
 ## Install
 
-Prebuilt binaries and the VS Code `.vsix` are attached to every tagged
+Prebuilt binaries are attached to every tagged
 [GitHub release](https://github.com/flying-dice/luabox/releases) (`v*`, built
 by [`.github/workflows/release.yml`](.github/workflows/release.yml) — see
 [RELEASING.md](RELEASING.md)). The one-line installers fetch the latest one:
@@ -96,8 +96,8 @@ irm https://raw.githubusercontent.com/flying-dice/luabox/main/scripts/install.ps
 ```
 
 Each release ships prebuilt binaries for **Linux x86_64**, **macOS Apple
-Silicon**, and **Windows x86_64**, plus the VS Code extension `.vsix`, with
-`SHA256SUMS` alongside them.
+Silicon**, and **Windows x86_64**, with `SHA256SUMS` alongside them. Already
+installed? `luabox upgrade` self-updates from the latest release.
 
 To build from source instead — or to track the tip of `main`:
 
@@ -131,29 +131,30 @@ See [DIRECTION.md](DIRECTION.md) for the governing decision record and
 
 ## Editor setup
 
-The VS Code extension ([`editors/vscode/`](editors/vscode/)) wraps the
-`luabox lsp` stdio language server (diagnostics with quick-fixes, completion
-with auto-require imports, hover, goto definition/type-definition/
-implementation, find-references, rename, document & workspace symbols,
-signature help, call hierarchy, inlay hints, semantic tokens, formatting,
-folding and selection ranges; `.lua` files). It is a TypeScript extension:
-`npm install && npm run compile`, then `npx @vscode/vsce package` for a
-`.vsix`.
+Editor integrations live in their own repos and release independently:
 
-It resolves the `luabox` binary from `PATH` (overridable via settings) and
-launches it as `luabox lsp`. It is not on the Marketplace yet
-([#102](LIMITATIONS.md#editor-extensions-are-not-on-marketplaces-yet-102)) —
-install the `.vsix` attached to each GitHub release (or build your own per its
-README). Other editors (Neovim,
-JetBrains, Zed) can point any LSP client at `luabox lsp`; dedicated
-integrations may return later.
+| Editor | Repo | Install |
+|---|---|---|
+| VS Code | [flying-dice/luabox-vscode](https://github.com/flying-dice/luabox-vscode) | `.vsix` from that repo's releases → `code --install-extension` |
+| JetBrains | [flying-dice/luabox-jetbrains](https://github.com/flying-dice/luabox-jetbrains) | plugin `.zip` from that repo's releases → install from disk |
+
+Both wrap the `luabox lsp` stdio language server (diagnostics with
+quick-fixes, completion with auto-require imports, hover, goto
+definition/type-definition/implementation, find-references, rename, document
+& workspace symbols, signature help, call hierarchy, inlay hints, semantic
+tokens, formatting, folding and selection ranges; `.lua` files), resolving
+the `luabox` binary from `PATH` (overridable in settings). Neither is on its
+marketplace yet
+([#102](LIMITATIONS.md#editor-extensions-are-not-on-marketplaces-yet-102)).
+Any other editor can point its LSP client at `luabox lsp`.
 
 ## Limitations
 
 luabox 0.1 is alpha software — `test`/`bench` are deprecated (luabox is a
-toolchain, not a runtime), there is no hosted package registry, and the VS Code
-extension is not yet on the Marketplace/Open VSX (the `.vsix` ships as a release
-asset). The full LuaCATS tag vocabulary is enforced. Every remaining gap is
+toolchain, not a runtime), there is no hosted package registry, and the editor
+extensions are not yet on their marketplaces (each ships installable artifacts
+from its own repo's releases). The full LuaCATS tag vocabulary is enforced.
+Every remaining gap is
 documented honestly in
 [**LIMITATIONS.md**](LIMITATIONS.md). Read it before you rely on luabox for
 anything load-bearing.
@@ -237,8 +238,9 @@ fixture projects — the executable spec (SPEC.md §16.2).
 **0.1.0** — released 2026-07-14, the full command surface works end to end.
 Alpha quality: the executable spec drives the real binary through cucumber
 scenarios, perf gates block CI, and lowering is verified by differential
-execution against real runtimes in CI. Prebuilt binaries and the VS Code
-`.vsix` are attached to each [GitHub release](https://github.com/flying-dice/luabox/releases);
+execution against real runtimes in CI. Prebuilt binaries are attached to each
+[GitHub release](https://github.com/flying-dice/luabox/releases); editor
+extensions release from their own repos;
 not yet published to a package registry (crates.io, Homebrew, etc.). Luau is
 explicitly out of scope. See [LIMITATIONS.md](LIMITATIONS.md) for known gaps.
 

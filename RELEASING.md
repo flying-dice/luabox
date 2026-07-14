@@ -1,7 +1,7 @@
 # Releasing luabox
 
-The process for cutting a tagged release, from a green `main` to binaries and
-the VS Code `.vsix` attached to a GitHub Release. The public home is
+The process for cutting a tagged release, from a green `main` to binaries
+attached to a GitHub Release. The public home is
 <https://github.com/flying-dice/luabox> (`github` remote); the tailnet GitLab
 remains the private origin for internal CI. See [CHANGELOG.md](CHANGELOG.md)
 for the format releases are documented in, and
@@ -42,9 +42,8 @@ automation this process drives.
    - Creates a GitHub Release with the matching `CHANGELOG.md` section as
      the notes body.
    - Builds the release binaries — Linux x86_64, macOS Apple Silicon, and
-     Windows x86_64 — plus the VS Code `.vsix`, computes `SHA256SUMS`, and
-     uploads all of them (with the `scripts/install.*` one-liners) as
-     release assets.
+     Windows x86_64 — computes `SHA256SUMS`, and uploads them (with the
+     `scripts/install.*` one-liners) as release assets.
    - **Smoke-installs** the freshly published binary on all three OSes via
      the one-line installers, and **only then marks the release as
      `latest`.** A release that fails any of the three smoke installs does
@@ -55,45 +54,25 @@ automation this process drives.
    for the new release, its assets, and that it is marked latest;
    spot-check `scripts/install.sh`/`scripts/install.ps1` resolve and install
    it.
-8. **Publish the extension (manual).** The `.vsix` release asset is what
-   gets drag-and-dropped into the VS Code Marketplace publisher portal —
-   see [Editor extensions](#editor-extensions) below. This step needs
-   Jonathan's publisher account and is not automatable from this repo.
-
 ## Editor extensions
 
-The VS Code extension under `editors/vscode/` wraps the released `luabox`
-binary (`luabox lsp`, stdio). It is versioned independently of the CLI/LSP
-crate version today (it pins its own `0.1.0` in `package.json`) — bump its
-version by hand when its own code changes, not automatically off the
-workspace `version`.
+The editor integrations live in their own repos, version independently, and
+cut their own releases — nothing in this repo's release process builds or
+attaches them:
 
-### Packaging
+- **VS Code**: <https://github.com/flying-dice/luabox-vscode> — its release
+  workflow packages the `.vsix` and attaches it to that repo's releases.
+  The `.vsix` is what gets drag-and-dropped into the VS Code Marketplace
+  publisher portal (<https://marketplace.visualstudio.com/manage>), or
+  `npx ovsx publish`'d to Open VSX — both need Jonathan's publisher
+  account/token.
+- **JetBrains**: <https://github.com/flying-dice/luabox-jetbrains> — its
+  release workflow builds the plugin `.zip` for install-from-disk;
+  JetBrains Marketplace publishing likewise needs a vendor account/token.
 
-| Editor | Command | Output |
-| --- | --- | --- |
-| VS Code | `cd editors/vscode && npm ci && npx @vscode/vsce package` | `editors/vscode/luabox-<version>.vsix` |
-
-The release workflow runs this packaging step for you: `release.yml` builds
-the `.vsix` and attaches it to the GitHub Release alongside the CLI/LSP
-binaries. Run the command by hand only for a local build outside the release
-flow.
-
-### Residual manual steps (not automatable without credentials this repo doesn't hold)
-
-The `.vsix` now ships automatically as a GitHub release asset, so no manual
-attachment is needed. What remains requires a publisher account/token that
-isn't available in this environment:
-
-1. **VS Code Marketplace**: take the `.vsix` from the GitHub release and
-   drag-and-drop it into the publisher portal at
-   <https://marketplace.visualstudio.com/manage> (create the `luabox`
-   publisher there first). The CLI path is equivalent: mint an Azure DevOps
-   PAT with **Marketplace ▸ Manage** scope, then
-   `npx @vscode/vsce login luabox && npx @vscode/vsce publish` from
-   `editors/vscode`. See `editors/vscode/README.md#publishing-to-the-marketplace`.
-2. **Open VSX** (VSCodium/Cursor/Gitpod): `npx ovsx publish` with an Open VSX
-   access token, same `.vsix`.
+Cut extension releases when *their* code changes; a toolchain release does
+not require an extension release (the extensions track the `luabox` binary
+on PATH, whatever its version).
 
 ## SemVer policy for 0.x
 
