@@ -69,6 +69,7 @@
 //!   [`Store::read_package_manifest`]) and calls [`Store::materialize`] to
 //!   link the tree into `node_modules`-equivalent project storage.
 
+mod error;
 mod hash;
 mod json;
 mod lock;
@@ -76,6 +77,7 @@ mod manifest;
 mod object;
 mod store;
 
+pub use error::StoreError;
 pub use hash::{hash_bytes, hash_file, hash_reader};
 pub use manifest::{FileEntry, TreeManifest};
 pub use store::{

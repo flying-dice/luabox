@@ -25,7 +25,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result, bail};
+use crate::error::{IoResultExt, StoreError};
 
 /// A held gc lock. Dropping it releases (deletes) the lock file.
 #[derive(Debug)]
@@ -39,10 +39,10 @@ impl GcLock {
     ///
     /// # Errors
     /// Fails if another live collector holds the lock, or on unexpected I/O.
-    pub(crate) fn acquire(lock_path: PathBuf, stale_after: Duration) -> Result<Self> {
+    pub(crate) fn acquire(lock_path: PathBuf, stale_after: Duration) -> Result<Self, StoreError> {
         if let Some(parent) = lock_path.parent() {
             fs::create_dir_all(parent)
-                .with_context(|| format!("creating store dir {}", parent.display()))?;
+                .io_context(|| format!("creating store dir {}", parent.display()))?;
         }
         match Self::try_create(&lock_path) {
             Ok(()) => Ok(Self { path: lock_path }),
@@ -50,18 +50,16 @@ impl GcLock {
                 if Self::is_stale(&lock_path, stale_after) {
                     // Steal: remove the orphaned lock and retry exactly once.
                     let _ = fs::remove_file(&lock_path);
-                    Self::try_create(&lock_path).with_context(|| "re-acquiring stale gc lock")?;
+                    Self::try_create(&lock_path)
+                        .io_context(|| "re-acquiring stale gc lock".to_string())?;
                     Ok(Self { path: lock_path })
                 } else {
-                    bail!(
-                        "another luabox gc holds {} — refusing to run concurrently",
-                        lock_path.display()
-                    );
+                    Err(StoreError::GcLocked {
+                        path: lock_path.display().to_string(),
+                    })
                 }
             }
-            Err(err) => {
-                Err(err).with_context(|| format!("creating gc lock {}", lock_path.display()))
-            }
+            Err(err) => Err(err).io_context(|| format!("creating gc lock {}", lock_path.display())),
         }
     }
 

@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use crate::error::{IoResultExt, StoreError};
 
 /// Monotonic tie-breaker so temp names are unique within a process.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -71,9 +71,16 @@ impl ObjectStore {
     ///
     /// `executable` records the Unix executable bit onto the stored object so
     /// hard-linked materializations inherit it.
-    pub(crate) fn put_file(&self, src: &Path, hash: &str, executable: bool) -> Result<PutOutcome> {
+    pub(crate) fn put_file(
+        &self,
+        src: &Path,
+        hash: &str,
+        executable: bool,
+    ) -> Result<PutOutcome, StoreError> {
         if hash.len() < 3 {
-            bail!("refusing to store object with implausibly short hash {hash:?}");
+            return Err(StoreError::InvalidHash {
+                hash: hash.to_string(),
+            });
         }
         let dst = self.object_path(hash);
         if dst.exists() {
@@ -81,16 +88,16 @@ impl ObjectStore {
         }
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)
-                .with_context(|| format!("creating object dir {}", parent.display()))?;
+                .io_context(|| format!("creating object dir {}", parent.display()))?;
         }
         fs::create_dir_all(&self.tmp_dir)
-            .with_context(|| format!("creating temp dir {}", self.tmp_dir.display()))?;
+            .io_context(|| format!("creating temp dir {}", self.tmp_dir.display()))?;
 
         let tmp = self.temp_path(hash);
         fs::copy(src, &tmp)
-            .with_context(|| format!("staging {} -> {}", src.display(), tmp.display()))?;
+            .io_context(|| format!("staging {} -> {}", src.display(), tmp.display()))?;
         set_object_perms(&tmp, executable)
-            .with_context(|| format!("sealing temp object {}", tmp.display()))?;
+            .io_context(|| format!("sealing temp object {}", tmp.display()))?;
 
         match fs::rename(&tmp, &dst) {
             Ok(()) => Ok(PutOutcome::Created),
@@ -101,7 +108,7 @@ impl ObjectStore {
                 if dst.exists() {
                     Ok(PutOutcome::Existed)
                 } else {
-                    Err(err).with_context(|| format!("committing object {}", dst.display()))
+                    Err(err).io_context(|| format!("committing object {}", dst.display()))
                 }
             }
         }

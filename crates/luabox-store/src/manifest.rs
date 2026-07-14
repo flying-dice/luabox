@@ -12,6 +12,7 @@
 //! trees always produce the same manifest hash regardless of how they were
 //! walked.
 
+use crate::error::StoreError;
 use crate::hash::hash_bytes;
 use crate::json::{self, Json};
 
@@ -102,29 +103,25 @@ impl TreeManifest {
     ///
     /// # Errors
     /// Fails on malformed JSON, an unknown schema version, missing fields, or a
-    /// tree-hash mismatch.
-    // TODO: clean-code - 0.60 - IDIOM: stringly-typed public error — a third
-    // error strategy inside one crate (anyhow + String + io::Result). Fold
-    // into the StoreError enum proposed in store.rs (MissingField,
-    // SchemaVersion, TreeHashMismatch variants) so failures are matchable.
-    pub fn from_json(text: &str) -> Result<Self, String> {
-        let doc = json::parse(text)?;
+    /// tree-hash mismatch — as the matchable [`StoreError`] variant for each.
+    pub fn from_json(text: &str) -> Result<Self, StoreError> {
+        let doc = json::parse(text).map_err(|message| StoreError::InvalidManifest { message })?;
         let version = doc
             .get("version")
             .and_then(Json::as_u64)
-            .ok_or("missing 'version'")?;
+            .ok_or_else(|| missing("version", false))?;
         if version != SCHEMA_VERSION {
-            return Err(format!("unsupported manifest schema version {version}"));
+            return Err(StoreError::SchemaVersion { found: version });
         }
         let stored_hash = doc
             .get("tree_hash")
             .and_then(Json::as_str)
-            .ok_or("missing 'tree_hash'")?
+            .ok_or_else(|| missing("tree_hash", false))?
             .to_string();
         let raw = doc
             .get("entries")
             .and_then(Json::as_array)
-            .ok_or("missing 'entries'")?;
+            .ok_or_else(|| missing("entries", false))?;
         let mut entries = Vec::with_capacity(raw.len());
         for item in raw {
             entries.push(FileEntry {
@@ -133,29 +130,37 @@ impl TreeManifest {
                 executable: item
                     .get("executable")
                     .and_then(Json::as_bool)
-                    .ok_or("entry missing 'executable'")?,
+                    .ok_or_else(|| missing("executable", true))?,
                 size: item
                     .get("size")
                     .and_then(Json::as_u64)
-                    .ok_or("entry missing 'size'")?,
+                    .ok_or_else(|| missing("size", true))?,
             });
         }
         let manifest = Self::from_entries(entries);
         if manifest.tree_hash != stored_hash {
-            return Err(format!(
-                "manifest tree-hash mismatch: stored {stored_hash}, computed {}",
-                manifest.tree_hash
-            ));
+            return Err(StoreError::TreeHashMismatch {
+                stored: stored_hash,
+                computed: manifest.tree_hash,
+            });
         }
         Ok(manifest)
     }
 }
 
-fn field_str(item: &Json, key: &str) -> Result<String, String> {
+/// A [`StoreError::MissingField`] for `field` (an entry field when `entry`).
+fn missing(field: &str, entry: bool) -> StoreError {
+    StoreError::MissingField {
+        field: field.to_string(),
+        entry,
+    }
+}
+
+fn field_str(item: &Json, key: &str) -> Result<String, StoreError> {
     item.get(key)
         .and_then(Json::as_str)
         .map(str::to_string)
-        .ok_or_else(|| format!("entry missing '{key}'"))
+        .ok_or_else(|| missing(key, true))
 }
 
 /// Canonical encoding hashed to form the tree hash.

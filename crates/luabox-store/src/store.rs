@@ -12,8 +12,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
-
+use crate::error::{IoResultExt, StoreError};
 use crate::hash::hash_file;
 use crate::lock::GcLock;
 use crate::manifest::{FileEntry, TreeManifest};
@@ -136,12 +135,6 @@ pub struct Store {
     packages_dir: PathBuf,
 }
 
-// TODO: clean-code - 0.75 - IDIOM: this library crate leaks anyhow::Result
-// across its public API (put_tree/verify/stats/gc/read_package_manifest) —
-// the lone workspace outlier; siblings define typed error enums
-// (ProviderError, BundleError, ParseError). Define a StoreError enum and
-// fold manifest.rs's stringly Result<_, String> parse errors into it; keep
-// anyhow in the CLI binary only.
 impl Store {
     /// Open (or lazily create) a store under `root`.
     ///
@@ -185,21 +178,18 @@ impl Store {
     ///
     /// # Errors
     /// Fails on I/O errors, or if any path is not valid UTF-8.
-    pub fn put_tree(&self, dir: impl AsRef<Path>) -> Result<TreeManifest> {
+    pub fn put_tree(&self, dir: impl AsRef<Path>) -> Result<TreeManifest, StoreError> {
         let dir = dir.as_ref();
         let mut files = Vec::new();
-        collect_files(dir, dir, &mut files)
-            .with_context(|| format!("walking {}", dir.display()))?;
+        collect_files(dir, dir, &mut files)?;
 
         let mut entries = Vec::with_capacity(files.len());
         for (abs, rel) in files {
             let meta =
-                fs::symlink_metadata(&abs).with_context(|| format!("stat {}", abs.display()))?;
+                fs::symlink_metadata(&abs).io_context(|| format!("stat {}", abs.display()))?;
             let executable = is_executable(&meta);
-            let hash = hash_file(&abs).with_context(|| format!("hashing {}", abs.display()))?;
-            self.objects
-                .put_file(&abs, &hash, executable)
-                .with_context(|| format!("interning {}", abs.display()))?;
+            let hash = hash_file(&abs).io_context(|| format!("hashing {}", abs.display()))?;
+            self.objects.put_file(&abs, &hash, executable)?;
             entries.push(FileEntry {
                 path: rel,
                 hash,
@@ -228,22 +218,21 @@ impl Store {
         manifest: &TreeManifest,
         dest_dir: impl AsRef<Path>,
         mode: LinkMode,
-    ) -> Result<MaterializeReport> {
+    ) -> Result<MaterializeReport, StoreError> {
         let dest = dest_dir.as_ref();
         let mut report = MaterializeReport::default();
         for entry in &manifest.entries {
             let object = self.objects.object_path(&entry.hash);
             if !object.exists() {
-                bail!(
-                    "object {} for {} is missing from the store",
-                    entry.hash,
-                    entry.path
-                );
+                return Err(StoreError::MissingObject {
+                    hash: entry.hash.clone(),
+                    path: entry.path.clone(),
+                });
             }
             let target = join_relative(dest, &entry.path)?;
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {}", parent.display()))?;
+                    .io_context(|| format!("creating {}", parent.display()))?;
             }
             replace_existing(&target)?;
             place(&object, &target, entry.executable, mode, &mut report)?;
@@ -262,7 +251,7 @@ impl Store {
     /// # Errors
     /// Fails only on unexpected I/O while reading an object (not on the
     /// corruption it is looking for — that is reported in the returned vec).
-    pub fn verify(&self, manifest: &TreeManifest) -> Result<Vec<CorruptEntry>> {
+    pub fn verify(&self, manifest: &TreeManifest) -> Result<Vec<CorruptEntry>, StoreError> {
         let mut corrupt = Vec::new();
         for hash in manifest.object_hashes() {
             let object = self.objects.object_path(hash);
@@ -280,7 +269,7 @@ impl Store {
                 continue;
             }
             let found = hash_file(&object)
-                .with_context(|| format!("re-hashing object {}", object.display()))?;
+                .io_context(|| format!("re-hashing object {}", object.display()))?;
             if found != hash {
                 corrupt.push(CorruptEntry {
                     hash: hash.to_string(),
@@ -298,7 +287,7 @@ impl Store {
     ///
     /// # Errors
     /// Fails on I/O while walking the object tree.
-    pub fn stats(&self) -> Result<StoreStats> {
+    pub fn stats(&self) -> Result<StoreStats, StoreError> {
         let mut stats = StoreStats::default();
         self.for_each_object(|_hash, _path, size| {
             stats.objects += 1;
@@ -316,7 +305,7 @@ impl Store {
     ///
     /// # Errors
     /// Fails if another `gc` holds the lock, or on I/O.
-    pub fn gc(&self, live: &[TreeManifest]) -> Result<GcReport> {
+    pub fn gc(&self, live: &[TreeManifest]) -> Result<GcReport, StoreError> {
         self.gc_with_options(live, GcOptions::default())
     }
 
@@ -337,9 +326,12 @@ impl Store {
     ///
     /// # Errors
     /// Fails if another `gc` holds the lock, or on I/O.
-    pub fn gc_with_options(&self, live: &[TreeManifest], options: GcOptions) -> Result<GcReport> {
-        let _lock = GcLock::acquire(self.root.join("gc.lock"), GC_LOCK_STALE_AFTER)
-            .context("acquiring gc lock")?;
+    pub fn gc_with_options(
+        &self,
+        live: &[TreeManifest],
+        options: GcOptions,
+    ) -> Result<GcReport, StoreError> {
+        let _lock = GcLock::acquire(self.root.join("gc.lock"), GC_LOCK_STALE_AFTER)?;
 
         let mut live_set = std::collections::HashSet::new();
         for manifest in live {
@@ -370,7 +362,10 @@ impl Store {
                     // Raced with another remover; nothing to reclaim.
                 }
                 Err(err) => {
-                    return Err(err).with_context(|| format!("collecting {}", path.display()));
+                    return Err(StoreError::Io {
+                        context: format!("collecting {}", path.display()),
+                        message: err.to_string(),
+                    });
                 }
             }
         }
@@ -391,14 +386,13 @@ impl Store {
         name: &str,
         version: &str,
         manifest: &TreeManifest,
-    ) -> Result<PathBuf> {
+    ) -> Result<PathBuf, StoreError> {
         let dir = self.packages_dir.join(name).join(version);
-        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        fs::create_dir_all(&dir).io_context(|| format!("creating {}", dir.display()))?;
         let path = dir.join(format!("{}.json", manifest.tree_hash));
         let tmp = dir.join(format!("{}.json.tmp", manifest.tree_hash));
-        fs::write(&tmp, manifest.to_json())
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        fs::rename(&tmp, &path).with_context(|| format!("committing {}", path.display()))?;
+        fs::write(&tmp, manifest.to_json()).io_context(|| format!("writing {}", tmp.display()))?;
+        fs::rename(&tmp, &path).io_context(|| format!("committing {}", path.display()))?;
         Ok(path)
     }
 
@@ -406,24 +400,31 @@ impl Store {
     ///
     /// # Errors
     /// Fails on I/O or if the file is not a valid, self-consistent manifest.
-    pub fn read_package_manifest(&self, path: impl AsRef<Path>) -> Result<TreeManifest> {
+    pub fn read_package_manifest(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<TreeManifest, StoreError> {
         let path = path.as_ref();
-        let text =
-            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        TreeManifest::from_json(&text)
-            .map_err(|e| anyhow!("parsing manifest {}: {e}", path.display()))
+        let text = fs::read_to_string(path).io_context(|| format!("reading {}", path.display()))?;
+        TreeManifest::from_json(&text).map_err(|source| StoreError::ManifestFile {
+            path: path.to_path_buf(),
+            source: Box::new(source),
+        })
     }
 
     // --- internals -------------------------------------------------------
 
     /// Invoke `f(hash, object_path, size)` for every object in the store.
-    fn for_each_object(&self, mut f: impl FnMut(&str, &Path, u64)) -> Result<()> {
+    fn for_each_object(&self, mut f: impl FnMut(&str, &Path, u64)) -> Result<(), StoreError> {
         let objects_dir = self.objects.objects_dir();
         let prefixes = match fs::read_dir(objects_dir) {
             Ok(rd) => rd,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(err) => {
-                return Err(err).with_context(|| format!("reading {}", objects_dir.display()));
+                return Err(StoreError::Io {
+                    context: format!("reading {}", objects_dir.display()),
+                    message: err.to_string(),
+                });
             }
         };
         for prefix in prefixes {
@@ -465,8 +466,12 @@ impl Store {
 // --- free helpers --------------------------------------------------------
 
 /// Recursively collect regular files under `dir`, as `(absolute, rel-slash)`.
-fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, String)>) -> Result<()> {
-    for entry in fs::read_dir(dir)? {
+fn collect_files(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<(PathBuf, String)>,
+) -> Result<(), StoreError> {
+    for entry in fs::read_dir(dir).io_context(|| format!("walking {}", dir.display()))? {
         let entry = entry?;
         let file_type = entry.file_type()?;
         let path = entry.path();
@@ -475,7 +480,9 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, String)>) -> R
         } else if file_type.is_file() {
             let rel = path
                 .strip_prefix(root)
-                .map_err(|_| anyhow!("path {} escaped tree root", path.display()))?;
+                .map_err(|_| StoreError::InvalidPath {
+                    message: format!("path {} escaped tree root", path.display()),
+                })?;
             out.push((path.clone(), rel_to_slash(rel)?));
         }
         // Symlinks (and other exotic file types) are intentionally skipped.
@@ -484,29 +491,35 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, String)>) -> R
 }
 
 /// Render a relative path as a `/`-separated string, erroring on non-UTF-8.
-fn rel_to_slash(rel: &Path) -> Result<String> {
+fn rel_to_slash(rel: &Path) -> Result<String, StoreError> {
     let mut parts = Vec::new();
     for component in rel.components() {
         match component {
             Component::Normal(part) => {
-                let text = part
-                    .to_str()
-                    .ok_or_else(|| anyhow!("non-UTF-8 path component in {}", rel.display()))?;
+                let text = part.to_str().ok_or_else(|| StoreError::InvalidPath {
+                    message: format!("non-UTF-8 path component in {}", rel.display()),
+                })?;
                 parts.push(text);
             }
             Component::CurDir => {}
-            _ => bail!("unexpected path component in {}", rel.display()),
+            _ => {
+                return Err(StoreError::InvalidPath {
+                    message: format!("unexpected path component in {}", rel.display()),
+                });
+            }
         }
     }
     Ok(parts.join("/"))
 }
 
 /// Turn a manifest's `/`-separated relative path into a real path under `dest`.
-fn join_relative(dest: &Path, rel: &str) -> Result<PathBuf> {
+fn join_relative(dest: &Path, rel: &str) -> Result<PathBuf, StoreError> {
     let mut path = dest.to_path_buf();
     for part in rel.split('/') {
         if part.is_empty() || part == "." || part == ".." {
-            bail!("refusing to materialize suspicious path {rel:?}");
+            return Err(StoreError::InvalidPath {
+                message: format!("refusing to materialize suspicious path {rel:?}"),
+            });
         }
         path.push(part);
     }
@@ -514,11 +527,11 @@ fn join_relative(dest: &Path, rel: &str) -> Result<PathBuf> {
 }
 
 /// Delete an existing target so a fresh link/copy can take its place.
-fn replace_existing(target: &Path) -> Result<()> {
+fn replace_existing(target: &Path) -> Result<(), StoreError> {
     match object::remove_file(target) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err).with_context(|| format!("replacing {}", target.display())),
+        Err(err) => Err(err).io_context(|| format!("replacing {}", target.display())),
     }
 }
 
@@ -529,7 +542,7 @@ fn place(
     executable: bool,
     mode: LinkMode,
     report: &mut MaterializeReport,
-) -> Result<()> {
+) -> Result<(), StoreError> {
     match mode {
         LinkMode::Copy => {
             copy_object(object, target, executable)?;
@@ -542,7 +555,7 @@ fn place(
                 report.copied += 1;
             }
             Err(err) => {
-                return Err(err).with_context(|| {
+                return Err(err).io_context(|| {
                     format!("hard-linking {} -> {}", object.display(), target.display())
                 });
             }
@@ -560,11 +573,11 @@ fn place(
 }
 
 /// Copy an object into place as a writable project file.
-fn copy_object(object: &Path, target: &Path, executable: bool) -> Result<()> {
+fn copy_object(object: &Path, target: &Path, executable: bool) -> Result<(), StoreError> {
     fs::copy(object, target)
-        .with_context(|| format!("copying {} -> {}", object.display(), target.display()))?;
+        .io_context(|| format!("copying {} -> {}", object.display(), target.display()))?;
     object::set_writable_perms(target, executable)
-        .with_context(|| format!("setting permissions on {}", target.display()))?;
+        .io_context(|| format!("setting permissions on {}", target.display()))?;
     Ok(())
 }
 
