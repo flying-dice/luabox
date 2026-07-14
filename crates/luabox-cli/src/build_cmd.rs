@@ -27,7 +27,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use luabox_diag::{Code, Diagnostic, Format, Label, Severity, Span, render};
+use luabox_diag::{Code, Diagnostic, Format, Label, Span};
 use luabox_lower::LowerDiagnostic;
 use luabox_syntax::{Dialect, lua};
 use rayon::prelude::*;
@@ -97,17 +97,7 @@ pub fn run(cwd: &Path, target: Option<&str>, out: Option<&Path>) -> anyhow::Resu
     for result in results {
         diags.extend(result?);
     }
-    let root = project.root.clone();
-    let lookup = move |file: &str| fs::read_to_string(root.join(file)).ok();
-    let rendered = render(&diags, Format::Human, &lookup);
-    if !rendered.is_empty() {
-        println!("{rendered}");
-    }
-
-    let errors = diags
-        .iter()
-        .filter(|d| d.severity == Severity::Error)
-        .count();
+    let errors = crate::project::render_diagnostics(&diags, Format::Human, &project.root).errors;
     if errors > 0 {
         bail!("build failed with {errors} error(s)");
     }

@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail};
 use luabox_syntax::{Dialect, lua};
 
+use crate::project::display_rel;
+
 /// Execute `luabox fmt` from `cwd`. In `--check` mode nothing is written;
 /// the command fails listing every file that would change. With `watch`,
 /// it reruns on every debounced, filtered filesystem change under the
@@ -144,10 +146,4 @@ fn walk(dir: &Path, project: &Project, files: &mut Vec<PathBuf>) -> anyhow::Resu
         }
     }
     Ok(())
-}
-
-/// Root-relative path with forward slashes — stable output across platforms.
-fn display_rel(path: &Path, root: &Path) -> String {
-    let rel = path.strip_prefix(root).unwrap_or(path);
-    rel.to_string_lossy().replace('\\', "/")
 }

@@ -31,7 +31,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use luabox_diag::{Code, Diagnostic, Format, Severity, render};
+use luabox_diag::{Code, Diagnostic, Format, Severity};
 use luabox_resolve::advisory::{AdvisoryDb, AdvisorySeverity, Finding};
 use luabox_resolve::{LOCKFILE_NAME, Lockfile};
 
@@ -64,19 +64,10 @@ pub fn run(cwd: &Path) -> anyhow::Result<()> {
     let findings = db.check(&lockfile);
     let diags: Vec<Diagnostic> = findings.iter().map(finding_to_diagnostic).collect();
 
-    let output = render(&diags, Format::Human, &|_| None);
-    if !output.is_empty() {
-        println!("{output}");
-    }
-
-    let errors = diags
-        .iter()
-        .filter(|d| d.severity == Severity::Error)
-        .count();
-    let warns = diags
-        .iter()
-        .filter(|d| d.severity == Severity::Warning)
-        .count();
+    // Findings carry no source labels, so the root-based lookup is never
+    // invoked — rendering is identical to a no-op lookup.
+    let counts = crate::project::render_diagnostics(&diags, Format::Human, &root);
+    let (errors, warns) = (counts.errors, counts.warnings);
     println!(
         "audit: {} advisory(ies) loaded, {} finding(s) ({errors} error, {warns} warning) \
          against {} locked package(s)",

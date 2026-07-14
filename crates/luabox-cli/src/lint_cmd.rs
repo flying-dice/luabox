@@ -28,7 +28,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use luabox_diag::{Diagnostic, Format, Severity, render};
+use luabox_diag::{Diagnostic, Format};
 use luabox_lint::{LintConfig, apply_fixes, lint_source};
 use luabox_resolve::manifest::{Lint, LintLevel, Manifest};
 use luabox_syntax::Dialect;
@@ -140,21 +140,8 @@ fn finish(
     fixed_files: usize,
     fix: bool,
 ) -> anyhow::Result<()> {
-    let root_buf = root.to_path_buf();
-    let lookup = move |file: &str| fs::read_to_string(root_buf.join(file)).ok();
-    let output = render(diags, Format::Human, &lookup);
-    if !output.is_empty() {
-        println!("{output}");
-    }
-
-    let errors = diags
-        .iter()
-        .filter(|d| d.severity == Severity::Error)
-        .count();
-    let warnings = diags
-        .iter()
-        .filter(|d| d.severity == Severity::Warning)
-        .count();
+    let counts = crate::project::render_diagnostics(diags, Format::Human, root);
+    let (errors, warnings) = (counts.errors, counts.warnings);
     if fix {
         eprintln!(
             "lint: {errors} errors, {warnings} warnings in {file_count} files ({fixed_files} fixed)"

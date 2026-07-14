@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use luabox_bundle::{BundleMap, BundleRequest, unmap_traceback};
-use luabox_diag::{Code, Diagnostic, Format, Label, Severity, Span, render};
+use luabox_diag::{Code, Diagnostic, Format, Label, Span};
 use luabox_resolve::manifest::Manifest;
 
 use crate::check_cmd;
@@ -150,13 +150,7 @@ fn render_warnings(bundle: &luabox_bundle::Bundle, root: &Path) -> anyhow::Resul
             diag.with_label(Label::primary(Span::new(file, range), "lowered here"))
         })
         .collect();
-    let root = root.to_path_buf();
-    let lookup = move |file: &str| fs::read_to_string(root.join(file)).ok();
-    let rendered = render(&diags, Format::Human, &lookup);
-    if !rendered.is_empty() {
-        println!("{rendered}");
-    }
-    if diags.iter().any(|d| d.severity == Severity::Error) {
+    if crate::project::render_diagnostics(&diags, Format::Human, root).errors > 0 {
         bail!("bundle failed");
     }
     Ok(())

@@ -28,7 +28,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use luabox_diag::{Code, Diagnostic, Format, Label, Severity, Span, render};
+use luabox_diag::{Code, Diagnostic, Format, Label, Span};
 use luabox_resolve::manifest::{Dependency, Manifest};
 use luabox_syntax::{Dialect, lua};
 use luabox_types::ty::Ty;
@@ -294,35 +294,19 @@ fn canonical(path: &Path) -> PathBuf {
 }
 
 /// Render, summarize, and translate error count into the exit code.
-// TODO: clean-code - 0.60 - DRY: this render + source-lookup closure +
-// count + summary + bail epilogue is duplicated in lint_cmd.rs (finish) and
-// inlined again in build_cmd.rs, bundle_cmd.rs, and audit_cmd.rs; the
-// lookup closure `move |file| fs::read_to_string(root.join(file)).ok()` is
-// verbatim in four of them. Extract one shared diagnostics-finish helper.
 fn finish(
     diags: &[Diagnostic],
     format: Format,
     root: &Path,
     file_count: usize,
 ) -> anyhow::Result<()> {
-    let root = root.to_path_buf();
-    let lookup = move |file: &str| fs::read_to_string(root.join(file)).ok();
-    let output = render(diags, format, &lookup);
-    if !output.is_empty() {
-        println!("{output}");
-    }
-
-    let errors = diags
-        .iter()
-        .filter(|d| d.severity == Severity::Error)
-        .count();
-    let warnings = diags
-        .iter()
-        .filter(|d| d.severity == Severity::Warning)
-        .count();
-    eprintln!("check: {errors} errors, {warnings} warnings in {file_count} files");
-    if errors > 0 {
-        bail!("check failed with {errors} error(s)");
+    let counts = crate::project::render_diagnostics(diags, format, root);
+    eprintln!(
+        "check: {} errors, {} warnings in {file_count} files",
+        counts.errors, counts.warnings
+    );
+    if counts.errors > 0 {
+        bail!("check failed with {} error(s)", counts.errors);
     }
     Ok(())
 }

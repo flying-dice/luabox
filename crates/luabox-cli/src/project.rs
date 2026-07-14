@@ -23,6 +23,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use luabox_diag::{Diagnostic, Format, Severity, render};
 use luabox_resolve::manifest::Manifest;
 
 /// Walk up from `cwd` (cargo-style) to the nearest directory containing a
@@ -155,4 +156,43 @@ fn walk(
 pub(crate) fn display_rel(path: &Path, root: &Path) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path);
     rel.to_string_lossy().replace('\\', "/")
+}
+
+/// Error/warning tallies from a diagnostic set, returned by
+/// [`render_diagnostics`] so each command can shape its own summary line and
+/// exit semantics — those genuinely differ (`check`/`lint` summarize to
+/// stderr and fail on any error; `build`/`bundle` print a success report only;
+/// `audit` has its own finding-count wording).
+pub(crate) struct DiagCounts {
+    pub(crate) errors: usize,
+    pub(crate) warnings: usize,
+}
+
+/// The diagnostics epilogue every project command shares: render `diags` in
+/// `format` — resolving source snippets from files under `root` — print the
+/// rendered frames to stdout when non-empty, and tally severities.
+///
+/// This is the common core the five reporting commands duplicated; the parts
+/// that genuinely vary (the summary line's wording/shape, whether it prints on
+/// success only or always, the bail message and exit code) stay in each
+/// command, driven by the returned [`DiagCounts`]. `audit` folds in too: its
+/// findings carry no labels, so the root-based lookup is never invoked and the
+/// output is identical to its former no-op lookup.
+pub(crate) fn render_diagnostics(diags: &[Diagnostic], format: Format, root: &Path) -> DiagCounts {
+    let root = root.to_path_buf();
+    let lookup = move |file: &str| fs::read_to_string(root.join(file)).ok();
+    let output = render(diags, format, &lookup);
+    if !output.is_empty() {
+        println!("{output}");
+    }
+    DiagCounts {
+        errors: diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .count(),
+        warnings: diags
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .count(),
+    }
 }
