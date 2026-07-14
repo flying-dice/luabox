@@ -14,7 +14,7 @@ use luabox_types::{Strictness, check_file};
 fn diags(source: &str, strictness: Strictness) -> Vec<luabox_diag::Diagnostic> {
     let parsed = parse(source, Dialect::Lua54);
     assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
-    check_file(&parsed, "test.lua", strictness)
+    check_file(&parsed, "test.lua", strictness, Dialect::Lua54)
 }
 
 fn strict_codes(source: &str) -> Vec<String> {

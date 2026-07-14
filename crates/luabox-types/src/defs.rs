@@ -576,7 +576,7 @@ mod tests {
         let ambient = stdlib(dialect);
         let parse = lua::parse(src, dialect);
         assert_eq!(parse.errors(), &[], "fixture must parse cleanly");
-        crate::check_file_with_ambient(&parse, "test.lua", strictness, Some(ambient))
+        crate::check_file_with_ambient(&parse, "test.lua", strictness, dialect, Some(ambient))
             .iter()
             .map(|d| d.code.to_string())
             .collect()
@@ -742,6 +742,7 @@ f(math.pi)
             &parse,
             "t.lua",
             crate::Strictness::Strict,
+            Dialect::Lua54,
             Some(&ambient),
         );
         assert!(
@@ -753,6 +754,7 @@ f(math.pi)
             &parse,
             "t.lua",
             crate::Strictness::Strict,
+            Dialect::Lua54,
             Some(&ambient),
         );
         assert!(
@@ -837,6 +839,7 @@ f(math.pi)
             &parse,
             "test.lua",
             crate::Strictness::Strict,
+            Dialect::Lua54,
             Some(&ambient),
         );
         let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();

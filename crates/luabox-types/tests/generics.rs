@@ -10,7 +10,7 @@ use luabox_types::{Strictness, check_file};
 fn check(source: &str) -> Vec<Diagnostic> {
     let parsed = parse(source, Dialect::Lua54);
     assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
-    check_file(&parsed, "test.lua", Strictness::Strict)
+    check_file(&parsed, "test.lua", Strictness::Strict, Dialect::Lua54)
 }
 
 fn codes(source: &str) -> Vec<String> {

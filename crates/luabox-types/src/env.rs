@@ -665,12 +665,23 @@ impl TypeEnv {
         let mut deprecated = false;
         let mut nodiscard = false;
         let mut is_async = false;
+        // `---@version` rides the same block→signature path as `---@deprecated`
+        // (luals has no dedicated version diagnostic — see [`crate::version`]).
+        // Parsed out of the raw `SimpleTag` body; an empty/unrecognised body
+        // yields `None` and gates nothing.
+        let mut version: Option<crate::version::VersionReq> = None;
 
         for tag in &item.block.tags {
             match tag {
                 Tag::Deprecated(_) => deprecated = true,
                 Tag::Nodiscard(_) => nodiscard = true,
                 Tag::Async(_) => is_async = true,
+                Tag::Version(v) => {
+                    version = v
+                        .text
+                        .as_deref()
+                        .and_then(crate::version::VersionReq::parse);
+                }
                 Tag::Class(c) if !c.name.is_empty() => {
                     let parents = c
                         .parents
@@ -799,7 +810,7 @@ impl TypeEnv {
         // targets, so deprecating a `---@class` carrier is harmless here.
         let has_sig_tags =
             !params.is_empty() || !returns.is_empty() || !overloads.is_empty() || vararg.is_some();
-        if (has_sig_tags || deprecated || nodiscard || is_async)
+        if (has_sig_tags || deprecated || nodiscard || is_async || version.is_some())
             && let Some(target) = target
         {
             let mut func = FunctionTy {
@@ -808,6 +819,7 @@ impl TypeEnv {
                 deprecated,
                 nodiscard,
                 is_async,
+                version,
                 ..FunctionTy::default()
             };
             // With no signature tags the block contributes only the flag:

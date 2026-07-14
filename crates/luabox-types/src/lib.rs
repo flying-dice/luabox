@@ -55,6 +55,7 @@ mod generics;
 mod infer;
 mod lower;
 pub mod ty;
+mod version;
 
 pub use assign::assignable;
 pub use defs::{
@@ -63,6 +64,7 @@ pub use defs::{
 };
 pub use env::{FileTypes, TypeEnv};
 pub use infer::{ExternalTypes, InferredBinding, InferredReturn};
+pub use version::VersionReq;
 
 use std::collections::HashMap;
 
@@ -222,9 +224,17 @@ pub fn module_requires(parse: &lua::Parse) -> Vec<String> {
 /// `file` names the file in diagnostic spans. Cross-file `require`
 /// resolution is available through [`check_file_with_requires`]; this
 /// entry point resolves no requires.
+///
+/// `edition` is the project Lua version (manifest `edition`) — the version a
+/// `---@version` predicate is matched against ([`VersionReq`]).
 #[must_use]
-pub fn check_file(parse: &lua::Parse, file: &str, strictness: Strictness) -> Vec<Diagnostic> {
-    check_file_with_ambient(parse, file, strictness, None)
+pub fn check_file(
+    parse: &lua::Parse,
+    file: &str,
+    strictness: Strictness,
+    edition: lua::Dialect,
+) -> Vec<Diagnostic> {
+    check_file_with_ambient(parse, file, strictness, edition, None)
 }
 
 /// Typecheck one parsed file with an ambient definition-package layer in
@@ -239,9 +249,10 @@ pub fn check_file_with_ambient(
     parse: &lua::Parse,
     file: &str,
     strictness: Strictness,
+    edition: lua::Dialect,
     ambient: Option<&Ambient>,
 ) -> Vec<Diagnostic> {
-    check_file_with_requires(parse, file, strictness, ambient, &HashMap::new())
+    check_file_with_requires(parse, file, strictness, edition, ambient, &HashMap::new())
 }
 
 /// Typecheck one parsed file with an ambient definition-package layer AND a
@@ -264,6 +275,7 @@ pub fn check_file_with_requires<S: std::hash::BuildHasher>(
     parse: &lua::Parse,
     file: &str,
     strictness: Strictness,
+    edition: lua::Dialect,
     ambient: Option<&Ambient>,
     requires: &HashMap<String, Ty, S>,
 ) -> Vec<Diagnostic> {
@@ -322,6 +334,7 @@ pub fn check_file_with_requires<S: std::hash::BuildHasher>(
             file,
             strictness == Strictness::Strict,
             is_meta,
+            edition,
             &inference.expr_types,
             &inference.method_sigs,
             &inference.carrier_final,
@@ -400,7 +413,7 @@ mod tests {
     fn check(source: &str, strictness: Strictness) -> Vec<Diagnostic> {
         let parse = parse(source, Dialect::Lua54);
         assert_eq!(parse.errors(), &[], "fixture must parse cleanly");
-        check_file(&parse, "test.lua", strictness)
+        check_file(&parse, "test.lua", strictness, Dialect::Lua54)
     }
 
     fn codes(source: &str, strictness: Strictness) -> Vec<String> {
@@ -1010,6 +1023,7 @@ f(\"anything\")
             &parse,
             "test.lua",
             Strictness::Strict,
+            lua::Dialect::Lua54,
             Some(stdlib_defs(lua::Dialect::Lua54)),
         )
         .iter()
@@ -1220,6 +1234,7 @@ w:legacy()
             &parse,
             "test.lua",
             Strictness::Strict,
+            lua::Dialect::Lua54,
             Some(stdlib_defs(lua::Dialect::Lua54)),
         );
         assert_eq!(diags.len(), 1);
@@ -1705,6 +1720,7 @@ local function f(s) end
             &consumer,
             "consumer.lua",
             Strictness::Strict,
+            Dialect::Lua54,
             Some(&ambient),
         );
         let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
@@ -1821,10 +1837,16 @@ f(\"no\")
         let ambient = crate::defs::Ambient::build(defs);
         let parse = parse(src, Dialect::Lua54);
         assert_eq!(parse.errors(), &[], "fixture must parse cleanly");
-        check_file_with_ambient(&parse, "test.lua", Strictness::Warn, Some(&ambient))
-            .iter()
-            .map(|d| d.code.to_string())
-            .collect()
+        check_file_with_ambient(
+            &parse,
+            "test.lua",
+            Strictness::Warn,
+            Dialect::Lua54,
+            Some(&ambient),
+        )
+        .iter()
+        .map(|d| d.code.to_string())
+        .collect()
     }
 
     #[test]
@@ -1951,7 +1973,14 @@ ok()
         let mut requires = HashMap::new();
         requires.insert("api".to_string(), export);
         let main = parse("local Api = require(\"api\")\nApi.old()\n", Dialect::Lua54);
-        let diags = check_file_with_requires(&main, "main.lua", Strictness::Warn, None, &requires);
+        let diags = check_file_with_requires(
+            &main,
+            "main.lua",
+            Strictness::Warn,
+            Dialect::Lua54,
+            None,
+            &requires,
+        );
         let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
         assert_eq!(codes, vec!["LB0308"]);
     }
@@ -2041,7 +2070,14 @@ function mustUse() end
             "local old = require(\"old\")\nold.important()\n",
             Dialect::Lua54,
         );
-        let diags = check_file_with_requires(&main, "main.lua", Strictness::Warn, None, &requires);
+        let diags = check_file_with_requires(
+            &main,
+            "main.lua",
+            Strictness::Warn,
+            Dialect::Lua54,
+            None,
+            &requires,
+        );
         let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
         assert_eq!(codes, vec!["LB0309"]);
     }
@@ -2057,7 +2093,14 @@ function mustUse() end
             "local old = require(\"old\")\nlocal n = old.important()\nprint(n)\n",
             Dialect::Lua54,
         );
-        let diags = check_file_with_requires(&main, "main.lua", Strictness::Warn, None, &requires);
+        let diags = check_file_with_requires(
+            &main,
+            "main.lua",
+            Strictness::Warn,
+            Dialect::Lua54,
+            None,
+            &requires,
+        );
         let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
         assert_eq!(codes, Vec::<String>::new());
     }
@@ -2537,6 +2580,7 @@ end
             &consumer,
             "consumer.lua",
             Strictness::Strict,
+            Dialect::Lua54,
             Some(&ambient),
         );
         let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();

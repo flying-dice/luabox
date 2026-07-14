@@ -822,6 +822,7 @@ impl Infer<'_> {
             deprecated: false,
             nodiscard: false,
             is_async: false,
+            version: None,
         }
     }
 
@@ -3407,7 +3408,7 @@ mod tests {
     fn codes(source: &str, strictness: Strictness) -> Vec<String> {
         let parsed = parse(source, Dialect::Lua54);
         assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
-        check_file(&parsed, "test.lua", strictness)
+        check_file(&parsed, "test.lua", strictness, Dialect::Lua54)
             .iter()
             .map(|d| d.code.to_string())
             .collect()
@@ -3525,7 +3526,7 @@ local a = c:area()
         assert_eq!(strict_codes(&src), vec!["LB0306"]);
         // Warn mode downgrades to a warning.
         let parsed = parse(&src, Dialect::Lua54);
-        let diags = check_file(&parsed, "test.lua", Strictness::Warn);
+        let diags = check_file(&parsed, "test.lua", Strictness::Warn, Dialect::Lua54);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].severity, luabox_diag::Severity::Warning);
     }
@@ -3590,7 +3591,12 @@ function Thing:grow()
 end
 "
         );
-        let diags = check_file(&parse(&src, Dialect::Lua54), "test.lua", Strictness::Strict);
+        let diags = check_file(
+            &parse(&src, Dialect::Lua54),
+            "test.lua",
+            Strictness::Strict,
+            Dialect::Lua54,
+        );
         assert_eq!(
             diags.iter().map(|d| d.code.to_string()).collect::<Vec<_>>(),
             vec!["LB0306"]

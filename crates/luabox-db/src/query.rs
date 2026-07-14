@@ -296,7 +296,12 @@ pub fn diagnostics(db: &dyn Db, file: SourceFile, project: Project) -> Diagnosti
     db.push_log(format!("diagnostics({})", display(db, file)));
     let parsed = parse(db, file);
     let name = display(db, file);
-    Diagnostics::new(check_file(parsed.parse(), &name, project.strictness(db)))
+    Diagnostics::new(check_file(
+        parsed.parse(),
+        &name,
+        project.strictness(db),
+        file.dialect(db),
+    ))
 }
 
 /// Aggregate every file's diagnostics into one project-wide set.

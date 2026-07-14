@@ -52,7 +52,7 @@ fn diagnostics_parity_with_check_file() {
 
     // Exactly what a direct check_file over the same source produces.
     let parse = lua::parse(BAD, Dialect::Lua54);
-    let want = check_file(&parse, "a.lua", Strictness::Strict);
+    let want = check_file(&parse, "a.lua", Strictness::Strict, Dialect::Lua54);
 
     assert_eq!(got, want);
     assert_eq!(got.len(), 1);

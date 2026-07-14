@@ -249,6 +249,7 @@ fn check_one(
         &parse,
         rel,
         project.strictness,
+        project.dialect,
         Some(ambient),
         &requires,
     ));

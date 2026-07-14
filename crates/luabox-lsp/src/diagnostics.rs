@@ -95,6 +95,7 @@ pub fn lua_diagnostics(
         parsed.parse(),
         &rel,
         ctx.strictness,
+        dialect,
         Some(&ambient),
         &requires,
     ) {

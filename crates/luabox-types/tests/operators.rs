@@ -38,6 +38,7 @@ fn check(src: &str, ambient: &Ambient) -> Vec<String> {
         &parsed,
         "consumer.lua",
         Strictness::Strict,
+        Dialect::Lua54,
         Some(ambient),
         &HashMap::<String, Ty>::new(),
     )

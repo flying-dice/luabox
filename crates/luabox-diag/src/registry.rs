@@ -704,6 +704,29 @@ oldApi()   -- not flagged, this line only
 Migrate to the replacement the deprecation notice names, or — if the use is
 deliberate — suppress it with the directive above.
 
+**`---@version` rides this diagnostic.** luals has no separate version
+diagnostic: a symbol whose `---@version` set excludes the project `edition`
+is treated as deprecated at its use sites, with a version-specific message.
+luabox mirrors this on LB0308.
+
+```lua
+---@version 5.2
+local function legacy() end
+
+legacy()   -- under edition 5.4:
+           -- LB0308: `legacy` is defined in `5.2`, current is `5.4`
+```
+
+The predicate is the LuaCATS grammar: comma-separated entries, each an
+optional `>` (this version and higher) or `<` (this version and lower) then
+`5.1`..`5.4` or `JIT`. The valid set spans the ordered numeric versions
+`5.1 < 5.2 < 5.3 < 5.4`, and — per luals — if Lua 5.1 is valid, LuaJIT is too.
+A symbol whose set **includes** the configured edition is untouched. Because
+it is the same `deprecated` rule, `---@diagnostic disable: deprecated`
+suppresses it, and the predicate travels across files (a `[types] defs`
+member restricted to an earlier version, e.g. `bit32.*`, is flagged wherever
+it is used under a newer edition).
+
 **Not yet covered:** `:` method calls (`obj:m()`) and field-level
 deprecation are not resolved by the P0 checker, which does not yet type
 method receivers; a deprecated method reached through a colon call is not

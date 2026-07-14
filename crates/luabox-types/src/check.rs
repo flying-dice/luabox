@@ -44,6 +44,7 @@ use luabox_syntax::lua::{self, SyntaxNode};
 use crate::assign::{LiteralConformance, assignable, classify_literal, is_integral_literal};
 use crate::env::{self, TypeEnv};
 use crate::ty::{FieldTy, FunctionTy, OperatorSig, ParamTy, TableTy, Ty};
+use crate::version::VersionReq;
 
 /// Diagnostic codes emitted here (block `LB03xx` — Semantics).
 const TYPE_MISMATCH: u16 = 300;
@@ -77,6 +78,7 @@ pub(crate) fn run(
     file: &str,
     strict: bool,
     is_meta: bool,
+    edition: lua::Dialect,
     inferred: &HashMap<(usize, usize), Ty>,
     method_sigs: &HashMap<(usize, usize), FunctionTy>,
     carrier_final: &HashMap<(usize, usize), Ty>,
@@ -93,6 +95,7 @@ pub(crate) fn run(
         strict,
         severity,
         is_meta,
+        edition,
         inferred,
         method_sigs,
         carrier_final,
@@ -222,6 +225,11 @@ struct Checker<'a> {
     /// declarations are contracts, not carriers, so no conformance
     /// obligation runs inside it (#107).
     is_meta: bool,
+    /// The project `edition` (manifest `edition`, the parse dialect) — the
+    /// configured Lua version a `---@version` predicate is matched against
+    /// (luals `Lua.runtime.version`). A use of a symbol whose predicate
+    /// excludes this edition reports `LB0308` (luals `deprecated`).
+    edition: lua::Dialect,
     /// Inference results by byte range (rich table inference, SPEC.md §3):
     /// the fallback for expressions annotations cannot type.
     inferred: &'a HashMap<(usize, usize), Ty>,
@@ -862,21 +870,24 @@ impl Checker<'_> {
     /// once. Write targets go through [`Checker::visit_target`] instead and are
     /// never flagged (the declaration site is not a use).
     fn note_deprecated_read(&mut self, expr: &Expr) {
-        let (deprecated, name) = match expr {
+        let (deprecated, bad_version, name) = match expr {
             Expr::Name(n) => {
                 let Some(ident) = n.name() else { return };
                 let text = ident.text();
-                let dep = match self.lookup(text) {
+                let (dep, ver) = match self.lookup(text) {
                     Some(Binding {
                         ty: Ty::Function(f),
                         ..
-                    }) => f.deprecated,
+                    }) => (f.deprecated, self.version_excluded(f)),
                     // A shadowing non-function local means the name no longer
-                    // refers to the deprecated function.
-                    Some(_) => false,
-                    None => self.env.function(text).is_some_and(|f| f.deprecated),
+                    // refers to the deprecated/version-gated function.
+                    Some(_) => (false, None),
+                    None => match self.env.function(text) {
+                        Some(f) => (f.deprecated, self.version_excluded(f)),
+                        None => (false, None),
+                    },
                 };
-                (dep, text.to_string())
+                (dep, ver, text.to_string())
             }
             Expr::Field(_) => {
                 let Some(dotted) = dotted_name(expr) else {
@@ -884,17 +895,28 @@ impl Checker<'_> {
                 };
                 // A dotted callable declared in this file's env (`function M.f`,
                 // an ambient defs function) is the direct hit; otherwise fall
-                // back to the *resolved field type* so a deprecated function
-                // reached as a field of a typed receiver — e.g. a `require`d
-                // module's member, or a class field typed `fun(...)` — is still
-                // flagged. The field path only ever reports when the resolved
-                // type is a deprecated function, so it never false-positives.
-                let dep = self.env.function(&dotted).is_some_and(|f| f.deprecated)
+                // back to the *resolved field type* so a deprecated /
+                // version-gated function reached as a field of a typed receiver
+                // — e.g. a `require`d module's member, or an ambient
+                // `---@version`-restricted library member like `bit32.band` — is
+                // still flagged. The field path only ever reports when the
+                // resolved type carries the flag, so it never false-positives.
+                let env_sig = self.env.function(&dotted);
+                let dep = env_sig.is_some_and(|f| f.deprecated)
                     || matches!(self.expr_ty(expr), Ty::Function(f) if f.deprecated);
-                (dep, dotted)
+                let ver = env_sig.and_then(|f| self.version_excluded(f)).or_else(|| {
+                    match self.expr_ty(expr) {
+                        Ty::Function(f) => self.version_excluded(&f),
+                        _ => None,
+                    }
+                });
+                (dep, ver, dotted)
             }
             _ => return,
         };
+        // `---@deprecated` takes precedence over a `---@version` mismatch when a
+        // symbol carries both, matching luals (`getDeprecated` returns the first
+        // matching `bindDoc`, and both surface as the same `deprecated` code).
         if deprecated {
             self.report_warning(
                 DEPRECATED,
@@ -902,7 +924,33 @@ impl Checker<'_> {
                 format!("use of deprecated `{name}`"),
                 format!("`{name}` is marked `---@deprecated`"),
             );
+        } else if let Some(req) = bad_version {
+            self.report_version(range(expr.syntax()), &name, &req);
         }
+    }
+
+    /// The `---@version` predicate of `sig` when it *excludes* the project
+    /// edition — the trigger for the version-specific `LB0308`. Returns an
+    /// owned clone so callers can then take `&mut self` to report.
+    fn version_excluded(&self, sig: &FunctionTy) -> Option<VersionReq> {
+        sig.version
+            .as_ref()
+            .filter(|v| !v.includes(self.edition))
+            .cloned()
+    }
+
+    /// Report the version-specific `LB0308` (luals `deprecated` with the
+    /// `defined in …, current is …` message shape): the symbol's
+    /// `---@version` excludes the project edition.
+    fn report_version(&mut self, range: Range<usize>, name: &str, req: &VersionReq) {
+        let versions = req.display_list();
+        let current = self.edition.manifest_id();
+        self.report_warning(
+            DEPRECATED,
+            range,
+            format!("`{name}` is defined in `{versions}`, current is `{current}`"),
+            format!("`{name}` is not available in edition `{current}`"),
+        );
     }
 
     /// Report `LB0309` when a bare call statement discards the return of a
@@ -1569,6 +1617,15 @@ impl Checker<'_> {
                 usize::from(r.start())..usize::from(r.end()),
                 format!("use of deprecated `{}`", method.text()),
                 format!("`{}` is marked `---@deprecated`", method.text()),
+            );
+        } else if let Some(req) = self.version_excluded(&sig)
+            && let Some(method) = call.method_name()
+        {
+            let r = method.text_range();
+            self.report_version(
+                usize::from(r.start())..usize::from(r.end()),
+                method.text(),
+                &req,
             );
         }
         // `await-in-sync` (LB0316): a `:`-method resolved to an `---@async`

@@ -163,6 +163,16 @@ pub struct FunctionTy {
     /// default there (`config/template.lua`: `awaitPropagate >> false`), so
     /// only an explicit `---@async` tag sets this — matching luals's default.
     pub is_async: bool,
+    /// The function's `---@version` predicate, when annotated. When it excludes
+    /// the project `edition`, every use site is reported (`LB0308`, luals
+    /// `deprecated` with the `defined in …, current is …` message): luals has
+    /// no dedicated version diagnostic — `---@version` rides `deprecated`
+    /// (`script/vm/doc.lua` `getDeprecated`). Like `deprecated`, the predicate
+    /// rides the type IR so it reaches call sites cross-file and through
+    /// `[types] defs` packages (e.g. a `---@version 5.2`-restricted `bit32`
+    /// member) via the same ambient/`FileTypes` merges the signature travels
+    /// through.
+    pub version: Option<crate::version::VersionReq>,
 }
 
 impl FunctionTy {
@@ -299,6 +309,7 @@ impl Ty {
                 deprecated: func.deprecated,
                 nodiscard: func.nodiscard,
                 is_async: func.is_async,
+                version: func.version.clone(),
             })),
             other => other.clone(),
         }

@@ -19,6 +19,7 @@ fn ambient_codes(src: &str, defs: &[String]) -> Vec<String> {
         &parsed,
         "test.lua",
         Strictness::Strict,
+        Dialect::Lua54,
         Some(&ambient),
     ))
 }
@@ -27,7 +28,12 @@ fn ambient_codes(src: &str, defs: &[String]) -> Vec<String> {
 fn strict_codes(src: &str) -> Vec<String> {
     let parsed = parse(src, Dialect::Lua54);
     assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
-    codes(&check_file(&parsed, "test.lua", Strictness::Strict))
+    codes(&check_file(
+        &parsed,
+        "test.lua",
+        Strictness::Strict,
+        Dialect::Lua54,
+    ))
 }
 
 /// Warn-mode codes against the stdlib (plus extra defs) — `unknown` is
@@ -41,6 +47,7 @@ fn warn_ambient_codes(src: &str, defs: &[String]) -> Vec<String> {
         &parsed,
         "test.lua",
         Strictness::Warn,
+        Dialect::Lua54,
         Some(&ambient),
     ))
 }
