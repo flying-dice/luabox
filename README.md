@@ -131,28 +131,27 @@ See [DIRECTION.md](DIRECTION.md) for the governing decision record and
 
 ## Editor setup
 
-Editor integrations wrap the `luabox lsp` stdio language server (diagnostics,
-hover, goto-definition, completion, document symbols; `.lua` files). They live
-under [`editors/`](editors/):
+The VS Code extension ([`editors/vscode/`](editors/vscode/)) wraps the
+`luabox lsp` stdio language server (diagnostics with quick-fixes, completion
+with auto-require imports, hover, goto definition/type-definition/
+implementation, find-references, rename, document & workspace symbols,
+signature help, call hierarchy, inlay hints, semantic tokens, formatting,
+folding and selection ranges; `.lua` files). It is a TypeScript extension:
+`npm install && npm run compile`, then `npx @vscode/vsce package` for a
+`.vsix`.
 
-| Editor | Path | Notes |
-|---|---|---|
-| VS Code | [`editors/vscode/`](editors/vscode/) | First-class TypeScript extension. `npm install && npm run compile`, then `npx @vscode/vsce package` for a `.vsix`. |
-| Neovim | [`editors/nvim/`](editors/nvim/) | `require("luabox").setup()` (Neovim 0.11+ native LSP; lspconfig fallback included). |
-| JetBrains | [`editors/jetbrains/`](editors/jetbrains/) | Gradle/Kotlin plugin using the native LSP API (IntelliJ IDEA Ultimate 2024.2+). `./gradlew buildPlugin`, then install-from-disk. LSP4IJ route documented for Community editions. |
-| Zed | [`editors/zed/`](editors/zed/) | Rust/WASM extension; registers the server for Lua. `cargo build --target wasm32-wasip2 --release`, then install as a dev extension. |
-
-All of them resolve the `luabox` binary from `PATH` (overridable per editor)
-and launch it as `luabox lsp`. None are on their marketplaces yet
+It resolves the `luabox` binary from `PATH` (overridable via settings) and
+launches it as `luabox lsp`. It is not on the Marketplace yet
 ([#102](LIMITATIONS.md#editor-extensions-are-not-on-marketplaces-yet-102)) —
-install from the built `.vsix` / plugin `.zip` / dev-extension per each
-editor's README.
+install from the built `.vsix` per its README. Other editors (Neovim,
+JetBrains, Zed) can point any LSP client at `luabox lsp`; dedicated
+integrations may return later.
 
 ## Limitations
 
-luabox 0.1 is alpha software with real gaps — `---@alias` names are not visible
-across files, `test --coverage` is not implemented, there is no hosted package
-registry, and a few LuaCATS tags parse but are not yet enforced. Every one is
+luabox 0.1 is alpha software with real gaps — `test --coverage` is not
+implemented, there is no hosted package registry, and a few LuaCATS tags parse
+but are not yet enforced. Every one is
 documented honestly, with its tracking issue, in
 [**LIMITATIONS.md**](LIMITATIONS.md). Read it before you rely on luabox for
 anything load-bearing.
@@ -174,7 +173,7 @@ anything load-bearing.
 | `publish` / `audit` | registry publish with yank; advisory-DB audit |
 | `run` | `[tasks]` entries or scripts via the resolved runtime |
 | `toolchain` | install/pin/list managed Lua runtimes |
-| `lsp` | language server: diagnostics, hover, goto, completion, symbols |
+| `lsp` | language server: diagnostics + quick-fixes, completion (auto-require), hover, goto def/type/impl, references, rename, symbols, signature help, call hierarchy, inlay hints, semantic tokens, formatting |
 | `doc` | static docs from annotations |
 | `explain LBnnnn` | rustc-style diagnostic pages |
 

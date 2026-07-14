@@ -10,7 +10,7 @@ Where an item has a tracking issue, it is linked.
 
 ## Type system
 
-### `---@alias` cross-file edge cases (#110)
+### `---@alias` cross-file semantics (shipped — #110 closed; edge-case notes)
 
 `---@class`, `---@enum`, and `---@alias` names are all workspace-global: an
 alias declared in any project file is nameable and enforced from every other
@@ -147,10 +147,11 @@ configured. Set LUABOX_REGISTRY to your registry's location …
 
 ### Editor extensions are not on marketplaces yet (#102)
 
-The VS Code, JetBrains, Neovim, and Zed integrations are packaged but not yet
-published to the VS Code Marketplace, Open VSX, the JetBrains Marketplace, or
-the Zed registry. Install from the built `.vsix` / plugin `.zip` / dev-extension
-as described in each editor's README under [`editors/`](editors/).
+The VS Code integration is packaged but not yet published to the VS Code
+Marketplace or Open VSX. Install from the built `.vsix` as described in its
+README under [`editors/vscode/`](editors/vscode/). (JetBrains, Neovim, and
+Zed integrations were removed for now — any LSP client can still be pointed
+at `luabox lsp` manually.)
 
 ### Prebuilt binaries arrive with the first tagged release (#95)
 

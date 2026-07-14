@@ -43,7 +43,7 @@ One static binary, one crate per bounded context (SPEC.md §16):
   post-0.1).
 - `publish` / `audit` — registry publish with yank; advisory-DB audit.
 - `toolchain` — install/pin/list managed Lua runtimes.
-- `lsp` — language server: diagnostics, hover, goto, completion, symbols.
+- `lsp` — language server (see "LSP & editor integrations" below).
 - `doc` — static docs generated from annotations.
 - `explain LBnnnn` — rustc-style diagnostic pages.
 
@@ -59,9 +59,19 @@ and idiomatic `setmetatable`/`__index` OOP resolves without annotations.
 The direction (see [DIRECTION.md](DIRECTION.md), decided 2026-07-11) is
 **LuaCATS-native strict checking**: luabox verifies what lua-language-server
 declares but trusts — real generics, cross-package type sharing, `---@class`
-conformance, undefined-global detection. Those parity/strictness items are
-still landing before this tag is cut — see BACKLOG.md
-(#84, #90, #103, #107, #108).
+conformance, undefined-global detection. All of those parity/strictness
+items landed and were probe-verified (#84, #90, #103, #107, #108), followed
+by a checker-deepening wave: workspace-global `---@alias` with cyclic-alias
+diagnosis (LB0314, #110/#123), alias parity — nested literal unquoting and
+generic aliases (#116, #117) — `:`-method-call receiver resolution through
+class shapes (#118), unmatched overloaded calls reported against the
+closest overload (#119), contextual (bidirectional) typing of
+function-literal parameters (#120), union exhaustiveness for `if`/`elseif`
+chains (LB0315, #121), `---@operator call` (#122), generic-arity checking
+for generic `---@class<T>` (LB0313, #124), member visibility
+`---@private`/`---@protected`/`---@package` (LB0312), `---@operator`
+overloads in inference, and `deprecated`/`discard-returns`/duplicate-doc
+diagnostics (luals parity).
 
 ### Dialects & lowering
 
@@ -74,16 +84,21 @@ injected only where used. Luau is explicitly out of scope.
 
 ### LSP & editor integrations
 
-`luabox lsp` (stdio) provides diagnostics, hover, goto-definition,
-completion, and document symbols over a salsa-incremental database shared
-with `check`/`lint`/`fmt`. Four editor integrations wrap it:
+`luabox lsp` (stdio) is a full-featured language server over a
+salsa-incremental database shared with `check`/`lint`/`fmt`: diagnostics
+(type + lint) with quick-fixes and autofixes, completion with auto-require
+import (#134), hover, goto definition/type-definition/implementation
+(#132), find-references (#125), rename with prepareRename (#126),
+document & workspace symbols (#131), signature help (#127), type-driven
+code actions (#129), call hierarchy (#130), document highlight, folding
+and selection ranges (#133), inlay hints, semantic tokens, document and
+range formatting, plus protocol maturity — incremental sync, config
+reload, file watching, and progress reporting (#135).
 
-- VS Code (`editors/vscode/`) — first-class TypeScript extension.
-- Neovim (`editors/nvim/`) — native LSP config (0.11+) with lspconfig
-  fallback.
-- JetBrains (`editors/jetbrains/`) — Gradle/Kotlin plugin on the native LSP
-  API (2024.2+), LSP4IJ documented for Community editions.
-- Zed (`editors/zed/`) — Rust/WASM extension.
+One editor integration wraps it: VS Code (`editors/vscode/`), a
+first-class TypeScript extension. (Neovim, JetBrains, and Zed
+integrations were removed for now — any LSP client can be pointed at
+`luabox lsp` manually.)
 
 ### Release machinery
 
@@ -98,4 +113,3 @@ process this changelog is part of (see RELEASING.md).
 - No hosted first-party dependency registry; `LUABOX_REGISTRY` must point
   at a writable directory or `file://` root.
 - `luabox test --coverage` is not implemented.
-- The LuaCATS-strictness launch gate (see above) is still in progress.

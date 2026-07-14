@@ -50,25 +50,21 @@ for the automation this process drives.
 
 ## Editor extensions
 
-The four editor integrations under `editors/` (VS Code, Zed, JetBrains,
-Neovim) all wrap the same released `luabox` binary (`luabox lsp`, stdio).
-They are versioned independently of the CLI/LSP crate version today (each
-pins its own `0.1.0` in its own manifest) — bump each editor's version
-manifest by hand when its own code changes, not automatically off the
+The VS Code extension under `editors/vscode/` wraps the released `luabox`
+binary (`luabox lsp`, stdio). It is versioned independently of the CLI/LSP
+crate version today (it pins its own `0.1.0` in `package.json`) — bump its
+version by hand when its own code changes, not automatically off the
 workspace `version`.
 
-### Packaging each integration
+### Packaging
 
 | Editor | Command | Output |
 | --- | --- | --- |
 | VS Code | `cd editors/vscode && npm ci && npx @vscode/vsce package` | `editors/vscode/luabox-<version>.vsix` |
-| JetBrains | `cd editors/jetbrains && ./gradlew buildPlugin` (`gradlew.bat` on Windows; needs **JDK 17+** on `PATH`/`JAVA_HOME`) | `editors/jetbrains/build/distributions/luabox-jetbrains-<version>.zip` |
-| Zed | `cd editors/zed && rustup target add wasm32-wasip2 && cargo build --target wasm32-wasip2 --release` | sanity-checks the wasm compiles (Zed itself rebuilds it from source on install — there is no separate packaged artifact to ship) |
-| Neovim | none — `editors/nvim` *is* the distributable | n/a |
 
-None of this is wired into `.gitlab-ci.yml` yet: the `release` stage builds
-and attaches only the Rust CLI/LSP binaries. Packaging the editor
-integrations above is a manual step today.
+This is not wired into `.gitlab-ci.yml` yet: the `release` stage builds
+and attaches only the Rust CLI/LSP binaries. Packaging the extension is a
+manual step today.
 
 ### Residual manual steps (not automatable without credentials this repo doesn't hold)
 
@@ -87,27 +83,6 @@ available in this environment:
    automatically, upload `editors/vscode/luabox-<version>.vsix` as a release
    asset by hand (GitLab Releases UI, or `release-cli` with an extra
    `--assets-link`) after the tag pipeline in [Process](#process) finishes.
-4. **JetBrains Marketplace**: claim a vendor at
-   <https://plugins.jetbrains.com/>, generate a permanent Marketplace token,
-   configure `intellijPlatform { signing { … }; publishing { token = … } }`
-   in `editors/jetbrains/build.gradle.kts` (certificate + key for signing,
-   read from environment variables, not committed), then
-   `./gradlew signPlugin publishPlugin`. First submissions are manually
-   reviewed by JetBrains before appearing in the Marketplace. See
-   `editors/jetbrains/README.md#publishing-to-the-jetbrains-marketplace`.
-   Attaching the plugin zip to the GitLab release itself (for the
-   "install from disk" path) is the same manual-upload story as step 3.
-5. **Zed extension registry**: this repo is self-hosted on a tailnet, so
-   before the PR in `zed-industries/extensions` (adding this extension as a
-   submodule to their `extensions.toml`) is even possible, `editors/zed`
-   needs mirroring to a **public** git host (with a top-level license file)
-   and `extension.toml`'s `repository` field updated to match. See
-   `editors/zed/README.md#publishing-to-the-zed-extension-registry` for the
-   full submodule/PR sequence.
-6. **Neovim**: no registry to publish to — if a standalone
-   `luabox/luabox.nvim` repo is wanted (so plugin-manager users don't pull
-   the whole monorepo), mirror `editors/nvim`'s contents there. No token
-   required, just hosting.
 
 ## SemVer policy for 0.x
 

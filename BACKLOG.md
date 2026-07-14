@@ -16,29 +16,38 @@ classes (#85). The `.luab` subsystem is removed (#109). Release
 machinery landed: LICENSE (#92), CI config (#94), CHANGELOG + release
 process (#97), coverage gated honestly (#100), registry story decided
 (#101), def scalar fields (#105), call-return propagation (#106),
-editor packaging (#102, publish steps residual).
+editor packaging (#102, publish steps residual). `shapes-v2` is merged
+to `main` and pushed (#93); the end-user README quickstart (#96) and
+LIMITATIONS.md (#99) shipped.
+
+Two follow-up waves also landed and closed (2026-07-13/14): the checker
+deepening pass — workspace-global `---@alias` incl. cyclic diagnosis
+(#110, #123), alias parity (#116, #117), `:`-call receiver resolution
+(#118), closest-overload reporting (#119), contextual typing (#120),
+union exhaustiveness LB0315 (#121), `---@operator call` (#122), generic
+class arity (#124) — and the LSP feature build-out: find-references,
+rename, workspace symbols, signature help, goto type-def/impl, lint
+diagnostics + autofixes, code actions, call hierarchy, document
+highlight/folding/selection ranges, auto-require import completion, and
+protocol maturity (#125–#135).
 
 ### Still open
 
-- [#93](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/93)
-  Merge `shapes-v2` to `main` and push — the final step of this pass.
 - [#95](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/95)
   End-user installation: prebuilt binaries — needs the first `v*` tag to
   exercise the CI release stage; install scripts are in place.
-- [#96](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/96)
-  README end-user quickstart — in progress.
-- [#99](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/99)
-  Known limitations (0.1) documented honestly — in progress.
 - [#102](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/102)
-  Distribute the editor integrations — packaging done; open for the
-  credential-gated publish steps (Marketplace/Open VSX tokens, JetBrains
-  signing, Zed registry mirror, release attachments).
+  Distribute the editor integrations — reduced to VS Code only for now;
+  packaging done; open for the credential-gated publish steps
+  (Marketplace/Open VSX tokens, release attachments).
 
 ## Post-launch
 
-- [#110](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/110)
-  Cross-file `---@alias` naming (classes/enums are workspace-global
-  since #85; aliases still need defs or same-file).
+- [#136](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/136)
+  Test runner: execute doc examples as tests (`luabox test --doc`).
+- [#137](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/137)
+  Registry UX: `luabox search` + `login`/auth — needs the hosted-registry
+  work (adjacent to #95).
 
 _Everything else is closed. #83/#88/#89/#98/#104 were closed as
 inconsistent with the north star; #85/#86/#87/#90/#91 graduated from the
