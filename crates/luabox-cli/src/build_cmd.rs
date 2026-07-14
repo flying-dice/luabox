@@ -69,13 +69,14 @@ pub fn run(cwd: &Path, target: Option<&str>, out: Option<&Path>) -> anyhow::Resu
     // build output even when `--out` overrides the manifest.
     let mut project = check_cmd::discover(cwd)?;
     project.out_dir = Some(out_dir.clone());
-    let lua_files = check_cmd::collect_files(&project)?;
+    let lua_files =
+        crate::project::collect_lua_files(&project.root, project.out_dir.as_deref(), true)?;
 
     let edition = project.dialect;
     let results: Vec<anyhow::Result<Vec<Diagnostic>>> = lua_files
         .par_iter()
         .map(|path| {
-            let rel = check_cmd::display_rel(path, &project.root);
+            let rel = crate::project::display_rel(path, &project.root);
             let source =
                 fs::read_to_string(path).with_context(|| format!("cannot read `{rel}`"))?;
             let (output, diags) = lower_one(&source, &rel, edition, target);
@@ -110,7 +111,7 @@ pub fn run(cwd: &Path, target: Option<&str>, out: Option<&Path>) -> anyhow::Resu
     if errors > 0 {
         bail!("build failed with {errors} error(s)");
     }
-    let out_display = check_cmd::display_rel(&out_dir, &project.root);
+    let out_display = crate::project::display_rel(&out_dir, &project.root);
     println!(
         "build: {} files emitted to {} ({} -> {})",
         lua_files.len(),

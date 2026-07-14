@@ -35,6 +35,8 @@ use luabox_syntax::Dialect;
 use luabox_types::{Ambient, combined_defs, stdlib_defs};
 use rayon::prelude::*;
 
+use crate::project::{collect_lua_files, display_rel};
+
 /// The most fix passes to run per file before giving up on convergence.
 const MAX_FIX_PASSES: usize = 8;
 
@@ -48,7 +50,7 @@ const TEST_HARNESS_GLOBALS: [&str; 5] = ["describe", "it", "before_each", "after
 /// Execute `luabox lint` from `cwd`.
 pub fn run(cwd: &Path, fix: bool) -> anyhow::Result<()> {
     let project = discover(cwd)?;
-    let files = collect_files(&project)?;
+    let files = collect_lua_files(&project.root, project.out_dir.as_deref(), false)?;
 
     // SPEC.md §16: rayon per file — files are independent.
     let per_file: Vec<anyhow::Result<FileResult>> = files
@@ -293,41 +295,6 @@ fn level_keyword(level: LintLevel) -> &'static str {
         LintLevel::Warn => "warn",
         LintLevel::Deny => "deny",
     }
-}
-
-/// All `*.lua` files under the project root, deterministic order, skipping
-/// dot-directories and the build output directory.
-fn collect_files(project: &Project) -> anyhow::Result<Vec<PathBuf>> {
-    let mut lua = Vec::new();
-    walk(&project.root, project, &mut lua)?;
-    Ok(lua)
-}
-
-fn walk(dir: &Path, project: &Project, lua: &mut Vec<PathBuf>) -> anyhow::Result<()> {
-    let mut entries: Vec<_> = fs::read_dir(dir)
-        .with_context(|| format!("cannot read directory `{}`", dir.display()))?
-        .collect::<Result<_, _>>()
-        .with_context(|| format!("cannot read directory `{}`", dir.display()))?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        let path = entry.path();
-        let hidden = entry.file_name().to_string_lossy().starts_with('.');
-        if path.is_dir() {
-            let is_out = project.out_dir.as_deref() == Some(path.as_path());
-            if !hidden && !is_out {
-                walk(&path, project, lua)?;
-            }
-        } else if !hidden && path.extension().and_then(|e| e.to_str()) == Some("lua") {
-            lua.push(path);
-        }
-    }
-    Ok(())
-}
-
-/// Root-relative path with forward slashes — stable output across platforms.
-fn display_rel(path: &Path, root: &Path) -> String {
-    let rel = path.strip_prefix(root).unwrap_or(path);
-    rel.to_string_lossy().replace('\\', "/")
 }
 
 /// Whether `rel` (a root-relative, forward-slash path) is a file `luabox

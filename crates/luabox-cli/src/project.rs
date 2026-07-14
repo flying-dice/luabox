@@ -97,3 +97,62 @@ fn no_manifest_error(cwd: &Path) -> anyhow::Error {
         cwd.display()
     )
 }
+
+/// All `*.lua` files under `root`, in deterministic order — entries sorted by
+/// file name at each directory level, walked depth-first — skipping
+/// dot-directories and the build output directory (`out_dir`, when set).
+///
+/// `exclude_d_lua` is the sole behavioral knob between the project-source
+/// commands and `lint`: with it set, `*.d.lua` files are omitted, because they
+/// are `---@meta` definition files (ambient type surfaces), never checked as
+/// project source — so `check`/`build`/`doc` pass `true`. `lint` passes
+/// `false`, since it lints those files too.
+pub(crate) fn collect_lua_files(
+    root: &Path,
+    out_dir: Option<&Path>,
+    exclude_d_lua: bool,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut lua = Vec::new();
+    walk(root, out_dir, exclude_d_lua, &mut lua)?;
+    Ok(lua)
+}
+
+fn walk(
+    dir: &Path,
+    out_dir: Option<&Path>,
+    exclude_d_lua: bool,
+    lua: &mut Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    let mut entries: Vec<_> = fs::read_dir(dir)
+        .with_context(|| format!("cannot read directory `{}`", dir.display()))?
+        .collect::<Result<_, _>>()
+        .with_context(|| format!("cannot read directory `{}`", dir.display()))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let hidden = entry.file_name().to_string_lossy().starts_with('.');
+        if path.is_dir() {
+            let is_out = out_dir == Some(path.as_path());
+            if !hidden && !is_out {
+                walk(&path, out_dir, exclude_d_lua, lua)?;
+            }
+        } else if !hidden {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // `*.d.lua` are `---@meta` definition files (ambient type
+            // surfaces), never checked as project source.
+            if path.extension().and_then(|e| e.to_str()) == Some("lua")
+                && !(exclude_d_lua && name.ends_with(".d.lua"))
+            {
+                lua.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Root-relative path with forward slashes — stable output across platforms.
+pub(crate) fn display_rel(path: &Path, root: &Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    rel.to_string_lossy().replace('\\', "/")
+}

@@ -35,6 +35,8 @@ use luabox_types::ty::Ty;
 use luabox_types::{Ambient, DefFile, Strictness, combined_defs_checked, stdlib_defs};
 use rayon::prelude::*;
 
+use crate::project::{collect_lua_files, display_rel};
+
 /// Execute `luabox check` from `cwd`. With `watch`, the check reruns on
 /// every debounced, filtered filesystem change under the project root
 /// (`crate::watch`) until interrupted (Ctrl-C); a failing rerun is
@@ -98,7 +100,7 @@ pub(crate) fn run_once(
         target_dialect = Some(dialect);
     }
 
-    let lua_files = collect_files(&project)?;
+    let lua_files = collect_lua_files(&project.root, project.out_dir.as_deref(), true)?;
     // Definition packages (SPEC.md §3): the dialect stdlib layer, plus any
     // project-local `[types] defs` resolved from `<root>/defs/`, plus each
     // direct dependency's own `[types] defs` — the luals `workspace.library`
@@ -565,50 +567,4 @@ fn collect_d_lua(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
-}
-
-/// All `*.lua` files under the project root, deterministic order, skipping
-/// dot-directories and the build output directory.
-// TODO: clean-code - 0.70 - DRY: lint_cmd.rs re-implements this walk +
-// display_rel near-verbatim (~26 lines; display_rel byte-identical) even
-// though this copy is already pub(crate) and reused by build_cmd/doc_cmd.
-// Its sole divergence (.d.lua exclusion) is a parameter, not a fork.
-pub(crate) fn collect_files(project: &Project) -> anyhow::Result<Vec<PathBuf>> {
-    let mut lua = Vec::new();
-    walk(&project.root, project, &mut lua)?;
-    Ok(lua)
-}
-
-fn walk(dir: &Path, project: &Project, lua: &mut Vec<PathBuf>) -> anyhow::Result<()> {
-    let mut entries: Vec<_> = fs::read_dir(dir)
-        .with_context(|| format!("cannot read directory `{}`", dir.display()))?
-        .collect::<Result<_, _>>()
-        .with_context(|| format!("cannot read directory `{}`", dir.display()))?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        let path = entry.path();
-        let hidden = entry.file_name().to_string_lossy().starts_with('.');
-        if path.is_dir() {
-            let is_out = project.out_dir.as_deref() == Some(path.as_path());
-            if !hidden && !is_out {
-                walk(&path, project, lua)?;
-            }
-        } else if !hidden {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            // `*.d.lua` are `---@meta` definition files (ambient type
-            // surfaces), never checked as project source.
-            if path.extension().and_then(|e| e.to_str()) == Some("lua") && !name.ends_with(".d.lua")
-            {
-                lua.push(path);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Root-relative path with forward slashes — stable output across platforms.
-pub(crate) fn display_rel(path: &Path, root: &Path) -> String {
-    let rel = path.strip_prefix(root).unwrap_or(path);
-    rel.to_string_lossy().replace('\\', "/")
 }

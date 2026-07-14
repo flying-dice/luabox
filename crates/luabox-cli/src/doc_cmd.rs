@@ -36,12 +36,13 @@ use model::DocModel;
 /// Execute `luabox doc` from `cwd`.
 pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
     let project = check_cmd::discover(cwd)?;
-    let lua_files = check_cmd::collect_files(&project)?;
+    let lua_files =
+        crate::project::collect_lua_files(&project.root, project.out_dir.as_deref(), true)?;
     let package = manifest_facts(&project.root);
 
     let mut modules = Vec::new();
     for path in &lua_files {
-        let rel = check_cmd::display_rel(path, &project.root);
+        let rel = crate::project::display_rel(path, &project.root);
         let source = fs::read_to_string(path).with_context(|| format!("cannot read `{rel}`"))?;
         let name = model::module_name(&rel);
         modules.push(model::lua_module(&name, &source, project.dialect));
@@ -61,7 +62,7 @@ pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
     eprintln!(
         "doc: generated {} pages into `{}`",
         pages.len(),
-        check_cmd::display_rel(&out_dir, &project.root)
+        crate::project::display_rel(&out_dir, &project.root)
     );
 
     if open {
@@ -75,7 +76,7 @@ pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
 /// `[types] defs`, e.g. `examples/geometry`'s `geometry.Shape`) still gets a
 /// `class.<name>.html` page and can show implementors (#87).
 ///
-/// `check_cmd::collect_files` deliberately excludes `*.d.lua` from the
+/// `project::collect_lua_files` (with `exclude_d_lua`) deliberately excludes `*.d.lua` from the
 /// project's own `.lua` files (they are ambient, not project source), so
 /// without this step those classes are invisible to `luabox doc` — the gap
 /// this task set out to close. The def files are resolved with the exact

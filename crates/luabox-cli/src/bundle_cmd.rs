@@ -118,7 +118,7 @@ pub fn run(cwd: &Path, minify: bool, sourcemap: bool, mode: Option<&str>) -> any
     println!(
         "bundle: {} module(s) inlined into {} ({} -> {}){}{}{}",
         bundle.modules,
-        check_cmd::display_rel(&destination, &project.root),
+        crate::project::display_rel(&destination, &project.root),
         project.dialect.manifest_id(),
         project.build_target.manifest_id(),
         if minify { ", minified" } else { "" },
