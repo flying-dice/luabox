@@ -185,9 +185,16 @@ jobs:
   # resolution, since the release is deliberately not latest yet), assert it
   # runs and reports the tag version, then scaffold a probe project and assert
   # `luabox check` flags a deliberate type error (LB0300) non-zero and passes a
-  # clean file. All three legs must pass before the release goes live. No token:
-  # release-download URLs are public. (luabox has no self-upgrade command, so —
-  # unlike pseudoscript's smoke — there is no upgrade leg.)
+  # clean file. Then a battery of hardening probes a real user would hit:
+  #   - `luabox lsp` answers an `initialize` handshake (the whole VS Code
+  #     extension is dead if it doesn't),
+  #   - functional surfaces (`--help`, `explain`, `fmt --check`, `lint`, `doc`),
+  #   - the binary's own self-replace (`luabox upgrade <tag>`), plus its
+  #     negative (a nonexistent tag must fail non-zero),
+  #   - the installer into a path CONTAINING A SPACE (quoting bugs), plus its
+  #     negative (a nonexistent version must fail non-zero, not silently pass).
+  # All three legs must pass before the release goes live. No token:
+  # release-download URLs are public.
   smoke:
     name: Smoke ${{ matrix.os }}
     needs: publish
@@ -281,6 +288,128 @@ jobs:
           LUA
           luabox check
 
+          # Exercise self-replace on this OS: re-install the same tag via the
+          # binary's own upgrade command, then prove it still runs.
+          luabox upgrade "${TAG}"
+          luabox --version
+
+          # ── Upgrade negative probe ─────────────────────────────────────
+          # Failure mode: a self-update that silently "succeeds" on a
+          # nonexistent target would leave users convinced they upgraded when
+          # they did not. Run under `if` so set -e does not abort on the
+          # expected failure.
+          if luabox upgrade "v0.0.0-does-not-exist"; then
+            echo "error: 'luabox upgrade' succeeded for a nonexistent version" >&2
+            exit 1
+          fi
+          echo "negative upgrade probe: correctly failed"
+
+          # ── Negative install probe ─────────────────────────────────────
+          # Failure mode: install.sh silently exiting 0 when the pinned release
+          # does not exist would ship a broken install path. The script itself
+          # downloads fine (it is our real tag asset); the pinned nonexistent
+          # VERSION must make it exit non-zero.
+          if curl -fsSL "https://github.com/${REPO}/releases/download/${TAG}/install.sh" \
+            | LUABOX_VERSION="v0.0.0-does-not-exist" bash; then
+            echo "error: install.sh succeeded for a nonexistent version" >&2
+            exit 1
+          fi
+          echo "negative install probe: install.sh correctly failed"
+
+          # ── Install-dir-with-spaces leg ────────────────────────────────
+          # Failure mode: an unquoted $INSTALL_DIR / mkdir / mv in install.sh
+          # word-splits on a space and drops the binary in the wrong place (or
+          # fails). Re-install into a path with a space and assert the exe
+          # landed and runs from there.
+          spaced_dir="$(mktemp -d)/luabox smoke dir"
+          curl -fsSL "https://github.com/${REPO}/releases/download/${TAG}/install.sh" \
+            | LUABOX_INSTALL_DIR="$spaced_dir" LUABOX_VERSION="${TAG}" bash
+          if [ ! -x "$spaced_dir/luabox" ]; then
+            echo "error: install.sh did not place an executable in a spaced dir" >&2
+            exit 1
+          fi
+          "$spaced_dir/luabox" --version
+
+          # ── Broader functional probes ──────────────────────────────────
+          # Cheap, deterministic exercises of surfaces users hit daily. Failure
+          # mode: a build where the top-level CLI, the explain registry, or the
+          # fmt/lint/doc pipelines are broken would still pass the check probe.
+          luabox --help >/dev/null                       # must exit 0
+          explain_out="$(luabox explain LB0300)"
+          if ! printf '%s' "$explain_out" | grep -qi 'type mismatch'; then
+            echo "error: 'luabox explain LB0300' missing 'type mismatch'" >&2
+            printf '%s\n' "$explain_out" >&2
+            exit 1
+          fi
+          # Scaffold a fresh (canonical) project so the fmt/lint/doc probes test
+          # the tools, not this script's hand-written whitespace.
+          clean="$(mktemp -d)/clean"
+          mkdir -p "$clean"
+          (cd "$clean" && luabox init)
+          cd "$clean"
+          luabox fmt          # canonicalize in place, then assert idempotency:
+          luabox fmt --check  # must exit 0 on already-formatted sources
+          luabox lint         # must exit 0 on a clean project
+          luabox doc          # must exit 0 and produce doc/index.html
+          if [ ! -f doc/index.html ]; then
+            echo "error: 'luabox doc' produced no doc/index.html" >&2
+            exit 1
+          fi
+
+          # ── LSP handshake smoke ────────────────────────────────────────
+          # Failure mode: the VS Code extension is worthless if `luabox lsp`
+          # does not answer. Spawn it, send a Content-Length-framed initialize,
+          # and assert the reply advertises "capabilities". A 15s hard cap means
+          # a hung server FAILS the job instead of hanging it.
+          lsp_py="$(mktemp)"
+          cat > "$lsp_py" <<'PY'
+          import json, subprocess, sys, threading
+          exe = sys.argv[1]
+          p = subprocess.Popen([exe, "lsp"], stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+          def frame(obj):
+              b = json.dumps(obj).encode("utf-8")
+              return b"Content-Length: %d\r\n\r\n" % len(b) + b
+          def send(obj):
+              p.stdin.write(frame(obj)); p.stdin.flush()
+          def read_message(s):
+              hdr = b""
+              while b"\r\n\r\n" not in hdr:
+                  c = s.read(1)
+                  if not c:
+                      return None
+                  hdr += c
+              n = None
+              for line in hdr.split(b"\r\n"):
+                  if line.lower().startswith(b"content-length:"):
+                      n = int(line.split(b":", 1)[1].strip())
+              return s.read(n) if n is not None else None
+          out = {}
+          def work():
+              try:
+                  send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {"processId": None, "rootUri": None, "capabilities": {}}})
+                  out["body"] = read_message(p.stdout)
+              except Exception as e:
+                  out["err"] = repr(e)
+          t = threading.Thread(target=work); t.daemon = True; t.start(); t.join(15)
+          if t.is_alive():
+              p.kill(); sys.exit("error: luabox lsp initialize timed out (hung server)")
+          if out.get("err"):
+              p.kill(); sys.exit("error: luabox lsp handshake failed: " + out["err"])
+          body = out.get("body")
+          if not body or b'"capabilities"' not in body:
+              p.kill(); sys.exit("error: initialize reply missing capabilities: %r" % (body,))
+          print("LSP OK:", body[:120])
+          try:
+              send({"jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": None})
+              send({"jsonrpc": "2.0", "method": "exit"})
+              p.wait(timeout=5)
+          except Exception:
+              p.kill()
+          PY
+          python3 "$lsp_py" "$(command -v luabox)"
+
       # Windows: run the uploaded install.ps1 pinned to the tag, then exercise
       # the binary and a probe project.
       - name: Smoke (windows)
@@ -320,9 +449,18 @@ jobs:
           # PSReadLine, whose 2.0 DLL embeds a stub of
           # System.Runtime.InteropServices.RuntimeInformation that shadows the
           # real type — an arch-detection failure class the file-based run above
-          # cannot catch.
-          "`$env:LUABOX_VERSION = '$tag'; Get-Content -Raw '$ps1' | iex" | powershell.exe -NoProfile -
-          if ($LASTEXITCODE -ne 0) { Write-Error "REPL-mode (5.1) install failed"; exit 1 }
+          # cannot catch. This pass ALSO installs into a path CONTAINING A SPACE
+          # (highest-risk on Windows). Failure mode: an unquoted $InstallDir /
+          # Join-Path in install.ps1 would drop the exe or fail here, not in
+          # prod. The remaining probes then run from this spaced install.
+          $spacedDir = Join-Path $env:RUNNER_TEMP "luabox smoke dir"
+          "`$env:LUABOX_INSTALL_DIR = '$spacedDir'; `$env:LUABOX_VERSION = '$tag'; Get-Content -Raw '$ps1' | iex" | powershell.exe -NoProfile -
+          if ($LASTEXITCODE -ne 0) { Write-Error "REPL-mode (5.1) spaced-dir install failed"; exit 1 }
+          $spacedExe = Join-Path $spacedDir "luabox.exe"
+          if (-not (Test-Path $spacedExe)) { Write-Error "install.ps1 did not produce $spacedExe (spaced dir)"; exit 1 }
+          & $spacedExe --version   # exe must launch from a path with a space
+          if ($LASTEXITCODE -ne 0) { Write-Error "luabox.exe failed to run from a spaced dir"; exit 1 }
+          $binDir = $spacedDir
           $env:PATH = "$binDir;$env:PATH"
 
           # Version must match the tag (strip leading 'v').
@@ -379,6 +517,121 @@ jobs:
           luabox check
           if ($LASTEXITCODE -ne 0) { Write-Error "'luabox check' failed on a clean project"; exit 1 }
 
+          # Exercise self-replace on Windows (the rename-aside path): re-install
+          # the same tag via the binary's own upgrade command.
+          luabox upgrade $env:TAG
+          if ($LASTEXITCODE -ne 0) { Write-Error "luabox upgrade failed"; exit 1 }
+
+          # Binary still works after self-replace.
+          luabox --version
+          if ($LASTEXITCODE -ne 0) { Write-Error "luabox --version failed post-upgrade"; exit 1 }
+
+          # ── Upgrade negative probe ─────────────────────────────────────
+          # Failure mode: a self-update that silently "succeeds" on a
+          # nonexistent target convinces users they upgraded when they did not.
+          # Tolerate BOTH a non-zero exit and a thrown terminating error (pwsh
+          # 7.4 can turn a native command's stderr + non-zero exit into a throw
+          # under $ErrorActionPreference=Stop).
+          $upFailed = $false
+          try {
+            luabox upgrade "v0.0.0-does-not-exist" 2>&1 | Out-String | Write-Host
+            if ($LASTEXITCODE -ne 0) { $upFailed = $true }
+          } catch { $upFailed = $true }
+          if (-not $upFailed) { Write-Error "'luabox upgrade' succeeded for a nonexistent version"; exit 1 }
+          Write-Host "negative upgrade probe: correctly failed"
+
+          # ── Negative install probe ─────────────────────────────────────
+          # Failure mode: install.ps1 silently exiting 0 when the pinned release
+          # does not exist would ship a broken install path. Run in a CHILD
+          # process so its `exit 1` yields a clean $LASTEXITCODE and the expected
+          # failure does not trip $ErrorActionPreference=Stop in this step.
+          "`$env:LUABOX_VERSION = 'v0.0.0-does-not-exist'; & '$ps1'" | powershell.exe -NoProfile -
+          if ($LASTEXITCODE -eq 0) { Write-Error "install.ps1 succeeded for a nonexistent version"; exit 1 }
+          Write-Host "negative install probe: install.ps1 correctly failed with exit $LASTEXITCODE"
+
+          # ── Broader functional probes ──────────────────────────────────
+          # Cheap, deterministic exercises of surfaces users hit daily. Failure
+          # mode: a build where the top-level CLI, the explain registry, or the
+          # fmt/lint/doc pipelines are broken would still pass the check probe.
+          luabox --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Error "'luabox --help' exited $LASTEXITCODE"; exit 1 }
+          $explainOut = (luabox explain LB0300 | Out-String)
+          if ($explainOut -notmatch "type mismatch") { Write-Error "'luabox explain LB0300' missing 'type mismatch'"; Write-Host $explainOut; exit 1 }
+          # Scaffold a fresh (canonical) project so fmt/lint/doc test the tools,
+          # not this script's hand-written whitespace.
+          $clean = Join-Path $env:RUNNER_TEMP "clean-proj"
+          New-Item -ItemType Directory -Force -Path $clean | Out-Null
+          Set-Location $clean
+          luabox init
+          if ($LASTEXITCODE -ne 0) { Write-Error "luabox init failed"; exit 1 }
+          luabox fmt          # canonicalize in place, then assert idempotency:
+          if ($LASTEXITCODE -ne 0) { Write-Error "luabox fmt failed"; exit 1 }
+          luabox fmt --check  # must exit 0 on already-formatted sources
+          if ($LASTEXITCODE -ne 0) { Write-Error "'luabox fmt --check' failed on canonical sources"; exit 1 }
+          luabox lint         # must exit 0 on a clean project
+          if ($LASTEXITCODE -ne 0) { Write-Error "'luabox lint' failed on a clean project"; exit 1 }
+          luabox doc          # must exit 0 and produce doc/index.html
+          if ($LASTEXITCODE -ne 0) { Write-Error "'luabox doc' failed"; exit 1 }
+          if (-not (Test-Path (Join-Path $clean "doc\index.html"))) { Write-Error "'luabox doc' produced no doc/index.html"; exit 1 }
+
+          # ── LSP handshake smoke ────────────────────────────────────────
+          # Failure mode: the VS Code extension is worthless if `luabox lsp`
+          # does not answer. Spawn it, send a Content-Length-framed initialize,
+          # and assert the reply advertises "capabilities". Python's buffered
+          # binary pipes (not shell pipes) keep Windows stdio byte-exact; a 15s
+          # hard cap means a hung server FAILS the job instead of hanging it.
+          $lspPy = Join-Path $env:RUNNER_TEMP "lsp_smoke.py"
+          @'
+          import json, subprocess, sys, threading
+          exe = sys.argv[1]
+          p = subprocess.Popen([exe, "lsp"], stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+          def frame(obj):
+              b = json.dumps(obj).encode("utf-8")
+              return b"Content-Length: %d\r\n\r\n" % len(b) + b
+          def send(obj):
+              p.stdin.write(frame(obj)); p.stdin.flush()
+          def read_message(s):
+              hdr = b""
+              while b"\r\n\r\n" not in hdr:
+                  c = s.read(1)
+                  if not c:
+                      return None
+                  hdr += c
+              n = None
+              for line in hdr.split(b"\r\n"):
+                  if line.lower().startswith(b"content-length:"):
+                      n = int(line.split(b":", 1)[1].strip())
+              return s.read(n) if n is not None else None
+          out = {}
+          def work():
+              try:
+                  send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {"processId": None, "rootUri": None, "capabilities": {}}})
+                  out["body"] = read_message(p.stdout)
+              except Exception as e:
+                  out["err"] = repr(e)
+          t = threading.Thread(target=work); t.daemon = True; t.start(); t.join(15)
+          if t.is_alive():
+              p.kill(); sys.exit("error: luabox lsp initialize timed out (hung server)")
+          if out.get("err"):
+              p.kill(); sys.exit("error: luabox lsp handshake failed: " + out["err"])
+          body = out.get("body")
+          if not body or b'"capabilities"' not in body:
+              p.kill(); sys.exit("error: initialize reply missing capabilities: %r" % (body,))
+          print("LSP OK:", body[:120])
+          try:
+              send({"jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": None})
+              send({"jsonrpc": "2.0", "method": "exit"})
+              p.wait(timeout=5)
+          except Exception:
+              p.kill()
+          '@ | Set-Content -Path $lspPy -Encoding utf8
+          $py = if (Get-Command python3 -ErrorAction SilentlyContinue) { "python3" } elseif (Get-Command python -ErrorAction SilentlyContinue) { "python" } else { $null }
+          if (-not $py) { Write-Error "no python interpreter available for the LSP smoke"; exit 1 }
+          & $py $lspPy $spacedExe
+          if ($LASTEXITCODE -ne 0) { Write-Error "LSP handshake smoke failed"; exit 1 }
+
   # Go-live: mark the release latest, only reachable if all three smoke legs
   # passed. A failed smoke skips this, so the release stays not-latest and the
   # pipeline is red.
@@ -394,5 +647,92 @@ jobs:
       GH_REPO: ${{ github.repository }}
       TAG: ${{ github.ref_name }}
     steps:
+      # Gate 1 — asset-completeness. Last line of defense before go-live:
+      # fetch the release's ACTUAL asset list and assert exactly the expected
+      # set is present. Failure mode: `build` uses fail-fast:false, so a single
+      # silently-skipped OS build (or a dropped vsix upload) can leave the whole
+      # pipeline green while an asset is missing — users on that OS then get a
+      # 404 from the installer. This catches it before the release is latest.
+      - name: Assert the release has the complete asset set
+        run: |
+          set -euo pipefail
+          names="$(gh api "repos/${GH_REPO}/releases/tags/${TAG}" --jq '.assets[].name' | sort)"
+          echo "assets present:"; printf '%s\n' "$names"
+          missing=0
+          # 3 binaries + SHA256SUMS + both install scripts, by exact name.
+          for want in \
+            luabox-x86_64-unknown-linux-gnu.tar.gz \
+            luabox-aarch64-apple-darwin.tar.gz \
+            luabox-x86_64-pc-windows-msvc.zip \
+            SHA256SUMS install.sh install.ps1; do
+            if ! printf '%s\n' "$names" | grep -qxF "$want"; then
+              echo "error: missing required asset: $want" >&2
+              missing=1
+            fi
+          done
+          # Exactly one luabox-*.vsix (its version is independent of the tag).
+          vsix_count="$(printf '%s\n' "$names" | grep -cE '^luabox-.*\.vsix$' || true)"
+          if [ "$vsix_count" -ne 1 ]; then
+            echo "error: expected exactly one luabox-*.vsix, found $vsix_count" >&2
+            missing=1
+          fi
+          # And no stray extras: the exact set is 6 fixed names + 1 vsix = 7.
+          total="$(printf '%s\n' "$names" | grep -c . || true)"
+          if [ "$total" -ne 7 ]; then
+            echo "error: expected exactly 7 assets, found $total" >&2
+            missing=1
+          fi
+          [ "$missing" -eq 0 ] || { echo "asset-completeness gate failed" >&2; exit 1; }
+
+      # Gate 2 — independent integrity re-verification. Freshly download every
+      # binary + the vsix + SHA256SUMS straight from the published release and
+      # run `sha256sum -c`. Failure mode: a truncated/corrupted upload, or a
+      # SHA256SUMS computed from different bytes than were actually attached,
+      # would pass the per-job upload but hand users a checksum that does not
+      # match the file they download. This proves published sums == published
+      # bytes, independent of the upload path.
+      - name: Re-verify published checksums against freshly downloaded assets
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"; cd "$work"
+          gh release download "$TAG" \
+            --pattern 'luabox-*.tar.gz' \
+            --pattern 'luabox-*.zip' \
+            --pattern 'luabox-*.vsix' \
+            --pattern 'SHA256SUMS'
+          echo "--- SHA256SUMS ---"; cat SHA256SUMS
+          # -c exits non-zero if any listed file is missing or its hash differs.
+          sha256sum -c SHA256SUMS
+
+      # Gate 3 — vsix structural check. Failure mode: a truncated/empty vsix
+      # still matches its own (broken) checksum, so it sails through Gate 2 yet
+      # is useless in VS Code. Unzip it and assert the extension manifest names
+      # "luabox" with a version and that the compiled entry point is inside.
+      - name: Validate the .vsix structure
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"; cd "$work"
+          gh release download "$TAG" --pattern 'luabox-*.vsix'
+          vsix="$(ls luabox-*.vsix)"
+          mkdir ext && (cd ext && unzip -q "../$vsix")
+          # VSIX packages lay the extension out under extension/.
+          pkg="ext/extension/package.json"
+          test -f "$pkg" || { echo "error: $pkg missing from vsix" >&2; exit 1; }
+          python3 - "$pkg" ext/extension <<'PY'
+          import json, os, sys
+          pkg_path, ext_root = sys.argv[1], sys.argv[2]
+          with open(pkg_path, encoding="utf-8") as f:
+              pkg = json.load(f)
+          if pkg.get("name") != "luabox":
+              sys.exit("error: vsix package.json name = %r, expected 'luabox'" % (pkg.get("name"),))
+          if not pkg.get("version"):
+              sys.exit("error: vsix package.json has no version")
+          main = pkg.get("main", "./out/extension.js")
+          entry = os.path.join(ext_root, main.lstrip("./").replace("/", os.sep))
+          if not os.path.isfile(entry):
+              sys.exit("error: compiled entry %s not found in vsix (%s)" % (main, entry))
+          print("vsix OK: %s v%s, entry %s present" % (pkg["name"], pkg["version"], main))
+          PY
+
       - name: Mark latest (go live)
         run: gh release edit "$TAG" --latest
