@@ -253,22 +253,7 @@ impl TypeEnv {
                 decl.aliases.insert(name.clone(), alias.clone());
             }
         }
-        for item in items {
-            for tag in &item.block.tags {
-                match tag {
-                    Tag::Class(c) if !c.name.is_empty() => {
-                        decl.classes.insert(c.name.clone());
-                    }
-                    Tag::Alias(a) if !a.name.is_empty() => {
-                        decl.aliases.insert(a.name.clone(), a.clone());
-                    }
-                    Tag::Enum(e) if !e.name.is_empty() => {
-                        decl.enums.insert(e.name.clone());
-                    }
-                    _ => {}
-                }
-            }
-        }
+        decl.absorb_tags(items);
 
         let mut env = TypeEnv::default();
         // Seed the ambient declarations beneath the file's own.
@@ -339,25 +324,8 @@ impl TypeEnv {
         files: &[(lua::Parse, Vec<luacats::AnnotatedItem>)],
     ) -> (TypeEnv, BTreeMap<String, AliasTag>) {
         let mut decl = Declared::default();
-        let mut aliases: BTreeMap<String, AliasTag> = BTreeMap::new();
         for (_, items) in files {
-            for item in items {
-                for tag in &item.block.tags {
-                    match tag {
-                        Tag::Class(c) if !c.name.is_empty() => {
-                            decl.classes.insert(c.name.clone());
-                        }
-                        Tag::Alias(a) if !a.name.is_empty() => {
-                            decl.aliases.insert(a.name.clone(), a.clone());
-                            aliases.insert(a.name.clone(), a.clone());
-                        }
-                        Tag::Enum(e) if !e.name.is_empty() => {
-                            decl.enums.insert(e.name.clone());
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            decl.absorb_tags(items);
         }
 
         let mut env = TypeEnv::default();
@@ -387,7 +355,9 @@ impl TypeEnv {
             env.cyclic_aliases
                 .append(&mut lowerer.cyclic_aliases.clone());
         }
-        (env, aliases)
+        // The declared-name universe already holds every ambient alias raw;
+        // hand that map back rather than maintaining a second copy.
+        (env, decl.aliases)
     }
 
     /// Clone the name-keyed ambient surface of this environment — the four

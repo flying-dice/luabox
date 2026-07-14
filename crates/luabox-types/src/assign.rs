@@ -26,11 +26,41 @@
 use crate::env::TypeEnv;
 use crate::ty::{FunctionTy, TableTy, Ty};
 
+/// How exactly a value must fit its target slot — the assignability knob the
+/// strictness ladder's strict flag selects. Distinct from [`crate::Strictness`]
+/// (which also has a `None` level that never reaches assignability): here the
+/// only question is whether `unknown` is treated as `any` (loose) or as a
+/// genuine unknown that does not flow into a typed slot (strict).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exactness {
+    /// Warn mode: `unknown` is assignable both ways, undeclared names pass.
+    Loose,
+    /// Strict mode: `unknown -> T` is a mismatch, undeclared value names fail.
+    Strict,
+}
+
+impl Exactness {
+    /// The exactness the strictness ladder's boolean strict flag selects.
+    #[must_use]
+    pub(crate) fn from_strict(strict: bool) -> Self {
+        if strict {
+            Exactness::Strict
+        } else {
+            Exactness::Loose
+        }
+    }
+
+    /// Whether this is the strict end of the ladder.
+    fn is_strict(self) -> bool {
+        matches!(self, Exactness::Strict)
+    }
+}
+
 /// Whether `value` may flow into a slot of type `target`.
-pub fn assignable(env: &TypeEnv, strict: bool, value: &Ty, target: &Ty) -> bool {
+pub fn assignable(env: &TypeEnv, exact: Exactness, value: &Ty, target: &Ty) -> bool {
     Ctx {
         env,
-        strict,
+        exact,
         seen: Vec::new(),
     }
     .check(value, target)
@@ -38,7 +68,7 @@ pub fn assignable(env: &TypeEnv, strict: bool, value: &Ty, target: &Ty) -> bool 
 
 struct Ctx<'a> {
     env: &'a TypeEnv,
-    strict: bool,
+    exact: Exactness,
     /// Named-vs-named pairs already in flight (coinduction guard).
     seen: Vec<(String, String)>,
 }
@@ -51,7 +81,7 @@ impl Ctx<'_> {
             return true;
         }
         if matches!(value, Ty::Unknown) {
-            return !self.strict;
+            return !self.exact.is_strict();
         }
 
         // Same-name fast path + coinduction guard for recursive classes.
@@ -78,7 +108,7 @@ impl Ctx<'_> {
         if let Ty::Named(name) = value {
             return match self.env.resolve_named(name) {
                 Some(resolved) => self.check(&resolved, target),
-                None => !self.strict, // undeclared: treated as unknown
+                None => !self.exact.is_strict(), // undeclared: treated as unknown
             };
         }
         if let Ty::Named(name) = target {
@@ -235,7 +265,7 @@ impl Ctx<'_> {
 /// just the types). `None` when there is no table-level story to tell.
 pub(crate) fn explain_mismatch(
     env: &TypeEnv,
-    strict: bool,
+    exact: Exactness,
     value: &Ty,
     target: &Ty,
 ) -> Option<String> {
@@ -256,7 +286,7 @@ pub(crate) fn explain_mismatch(
                 if field.optional {
                     expected = expected.optional();
                 }
-                if !assignable(env, strict, &actual.ty, &expected) {
+                if !assignable(env, exact, &actual.ty, &expected) {
                     wrong.push(format!(
                         "`{name}` (expected `{expected}`, found `{}`)",
                         actual.ty
@@ -300,7 +330,7 @@ pub(crate) enum LiteralConformance {
 /// (excess) on a closed target.
 pub(crate) fn classify_literal(
     env: &TypeEnv,
-    strict: bool,
+    exact: Exactness,
     literal: &TableTy,
     target: &Ty,
 ) -> Option<LiteralConformance> {
@@ -320,7 +350,7 @@ pub(crate) fn classify_literal(
                 if field.optional {
                     expected = expected.optional();
                 }
-                if !assignable(env, strict, &actual.ty, &expected) {
+                if !assignable(env, exact, &actual.ty, &expected) {
                     other = true;
                 }
             }
@@ -336,7 +366,7 @@ pub(crate) fn classify_literal(
         if !target
             .indexers
             .iter()
-            .any(|(k, _)| assignable(env, strict, &key, k))
+            .any(|(k, _)| assignable(env, exact, &key, k))
         {
             other = true;
         }
@@ -434,14 +464,14 @@ mod tests {
 
     fn ok(value: &Ty, target: &Ty) {
         assert!(
-            assignable(&env(), true, value, target),
+            assignable(&env(), Exactness::Strict, value, target),
             "{value} should be assignable to {target}"
         );
     }
 
     fn no(value: &Ty, target: &Ty) {
         assert!(
-            !assignable(&env(), true, value, target),
+            !assignable(&env(), Exactness::Strict, value, target),
             "{value} should NOT be assignable to {target}"
         );
     }
@@ -477,7 +507,12 @@ mod tests {
         no(&Ty::Unknown, &Ty::Number);
         ok(&Ty::Number, &Ty::Unknown);
         // Warn: both ways.
-        assert!(assignable(&env(), false, &Ty::Unknown, &Ty::Number));
+        assert!(assignable(
+            &env(),
+            Exactness::Loose,
+            &Ty::Unknown,
+            &Ty::Number
+        ));
     }
 
     #[test]

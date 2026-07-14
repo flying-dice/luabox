@@ -32,7 +32,7 @@ use luabox_diag::{Code, Diagnostic, Format, Label, Span};
 use luabox_resolve::manifest::{Dependency, Manifest};
 use luabox_syntax::{Dialect, lua};
 use luabox_types::ty::Ty;
-use luabox_types::{Ambient, DefFile, Strictness, combined_defs_checked, stdlib_defs};
+use luabox_types::{Ambient, DefFile, Strictness, build_ambient_checked, stdlib_defs};
 use rayon::prelude::*;
 
 use crate::project::{collect_lua_files, display_rel};
@@ -106,7 +106,7 @@ pub(crate) fn run_once(
     // direct dependency's own `[types] defs` — the luals `workspace.library`
     // model (#108): a dependency's def files join the consumer's ambient
     // scope. Winner-first order (project defs, then dependencies
-    // alphabetically); `combined_defs_checked` reports cross-package class
+    // alphabetically); `build_ambient_checked` reports cross-package class
     // collisions (`LB0307`). Built once and shared by reference across the
     // rayon workers; the no-defs case reuses a process-lifetime cache.
     let (mut all_defs, mut def_diags) = resolve_project_defs(&project.root, &project.defs);
@@ -114,7 +114,7 @@ pub(crate) fn run_once(
     let ambient_owned: Option<Ambient> = if all_defs.is_empty() {
         None
     } else {
-        let (ambient, collisions) = combined_defs_checked(project.dialect, &all_defs);
+        let (ambient, collisions) = build_ambient_checked(project.dialect, &all_defs);
         def_diags.extend(collisions);
         Some(ambient)
     };

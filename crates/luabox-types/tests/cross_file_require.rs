@@ -23,7 +23,7 @@ use luabox_diag::Diagnostic;
 use luabox_syntax::lua::{Dialect, parse};
 use luabox_types::ty::Ty;
 use luabox_types::{
-    Ambient, FileTypes, Strictness, check_file_with_requires, combined_defs, module_surface,
+    Ambient, FileTypes, Strictness, build_ambient, check_file_with_requires, module_surface,
     stdlib_defs,
 };
 
@@ -146,7 +146,7 @@ return Shape
 ";
 
 fn shape_ambient() -> Ambient {
-    combined_defs(Dialect::Lua54, &[SHAPE_DEF.to_string()])
+    build_ambient(Dialect::Lua54, &[SHAPE_DEF.to_string()])
 }
 
 #[test]
@@ -375,7 +375,7 @@ fn defs_and_inline_class_merge_members_without_duplicates() {
     // Probe B: `Circle` is declared BOTH by an ambient def and by the
     // module file. Members must merge (luals merges duplicate class
     // declarations' fields) — nothing drops, nothing double-reports.
-    let base = combined_defs(Dialect::Lua54, &[CIRCLE_DEF.to_string()]);
+    let base = build_ambient(Dialect::Lua54, &[CIRCLE_DEF.to_string()]);
     let (export, types) = surface(INLINE_CIRCLE, &base);
     let ambient = base.with_project_types([&types]);
     let mut requires = HashMap::new();

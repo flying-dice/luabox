@@ -11,7 +11,7 @@
 //!
 //! Project-local packages named in `[types] defs` (SPEC.md §5) layer on top
 //! of the stdlib set: the frontend resolves them to sources and calls
-//! [`combined`]. Registry-distributed defs are P2+.
+//! [`build_ambient`]. Registry-distributed defs are P2+.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::OnceLock;
@@ -284,7 +284,7 @@ pub fn stdlib(dialect: Dialect) -> &'static Ambient {
 /// sources vary per project; the stdlib portion is small and shared by
 /// value here.
 #[must_use]
-pub fn combined(dialect: Dialect, extra: &[String]) -> Ambient {
+pub fn build_ambient(dialect: Dialect, extra: &[String]) -> Ambient {
     if extra.is_empty() {
         // Common case: reuse the cached stdlib set by cloning nothing —
         // callers hold `&Ambient`, so hand back a fresh build only when
@@ -316,7 +316,7 @@ pub fn combined(dialect: Dialect, extra: &[String]) -> Ambient {
 /// are the ones [`TypeEnv`] resolves, and every later declaration of that name
 /// yields an `LB0307` warning naming the file that already declared it.
 #[must_use]
-pub fn combined_checked(dialect: Dialect, defs: &[DefFile]) -> (Ambient, Vec<Diagnostic>) {
+pub fn build_ambient_checked(dialect: Dialect, defs: &[DefFile]) -> (Ambient, Vec<Diagnostic>) {
     let mut all: Vec<&str> = sources(dialect).to_vec();
     for def in defs {
         all.push(def.text.as_str());
@@ -496,7 +496,7 @@ mod tests {
     #[test]
     fn global_names_include_project_defs() {
         let extra = vec!["---@meta\nlove = {}\nfunction love.load() end\n".to_string()];
-        let ambient = combined(Dialect::Lua54, &extra);
+        let ambient = build_ambient(Dialect::Lua54, &extra);
         assert!(ambient.global_names().contains("love"));
         // The stdlib set is still layered in underneath.
         assert!(ambient.global_names().contains("print"));
@@ -713,7 +713,7 @@ f(math.pi)
     // --- cross-package class collisions (#108) ---------------------------
 
     #[test]
-    fn combined_checked_reports_collision_and_first_wins() {
+    fn build_ambient_checked_reports_collision_and_first_wins() {
         let defs = vec![
             DefFile {
                 file: "defs/a.d.lua".to_string(),
@@ -724,7 +724,7 @@ f(math.pi)
                 text: "---@meta\n---@class Widget\n---@field b number\n".to_string(),
             },
         ];
-        let (ambient, diags) = combined_checked(Dialect::Lua54, &defs);
+        let (ambient, diags) = build_ambient_checked(Dialect::Lua54, &defs);
         assert_eq!(diags.len(), 1, "{diags:?}");
         assert_eq!(diags[0].code.to_string(), "LB0307");
         assert_eq!(diags[0].severity, luabox_diag::Severity::Warning);
@@ -811,7 +811,7 @@ f(math.pi)
     }
 
     #[test]
-    fn combined_checked_distinct_classes_no_collision() {
+    fn build_ambient_checked_distinct_classes_no_collision() {
         let defs = vec![
             DefFile {
                 file: "a.d.lua".to_string(),
@@ -822,7 +822,7 @@ f(math.pi)
                 text: "---@meta\n---@class Beta\n---@field b number\n".to_string(),
             },
         ];
-        let (_ambient, diags) = combined_checked(Dialect::Lua54, &defs);
+        let (_ambient, diags) = build_ambient_checked(Dialect::Lua54, &defs);
         assert!(diags.is_empty(), "{diags:?}");
     }
 
@@ -833,7 +833,7 @@ f(math.pi)
             "---@meta\n---@param name string\n---@return boolean\nfunction love_setup(name) end\n"
                 .to_string(),
         ];
-        let ambient = combined(Dialect::Lua54, &extra);
+        let ambient = build_ambient(Dialect::Lua54, &extra);
         let parse = lua::parse("love_setup(1)\nprint(\"still stdlib\")\n", Dialect::Lua54);
         let diags = crate::check_file_with_ambient(
             &parse,

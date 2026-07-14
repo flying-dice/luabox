@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use luabox_syntax::lua::{Dialect, parse};
 use luabox_types::ty::Ty;
 use luabox_types::{
-    Ambient, FileTypes, Strictness, check_file_with_requires, combined_defs, module_surface,
+    Ambient, FileTypes, Strictness, build_ambient, check_file_with_requires, module_surface,
     stdlib_defs,
 };
 
@@ -129,7 +129,7 @@ const VEC_DEF: &str = "\
 fn operator_applies_through_defs_package() {
     // `Vec` and its `add` operator come from a `[types] defs` package. A
     // consumer using `a + b` and binding the result to `Vec` checks clean.
-    let ambient = combined_defs(Dialect::Lua54, &[VEC_DEF.to_string()]);
+    let ambient = build_ambient(Dialect::Lua54, &[VEC_DEF.to_string()]);
     let consumer = "\
 ---@type Vec
 local a
@@ -143,7 +143,7 @@ local c = a + b
 
 #[test]
 fn operator_result_misuse_flagged_through_defs_package() {
-    let ambient = combined_defs(Dialect::Lua54, &[VEC_DEF.to_string()]);
+    let ambient = build_ambient(Dialect::Lua54, &[VEC_DEF.to_string()]);
     let consumer = "\
 ---@type Vec
 local a

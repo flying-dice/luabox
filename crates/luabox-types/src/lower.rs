@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use luabox_syntax::luacats::{
-    AliasTag, FunParam, FunReturn, Span, TableField, TypeExpr, TypeExprKind,
+    AliasTag, AnnotatedItem, FunParam, FunReturn, Span, TableField, Tag, TypeExpr, TypeExprKind,
 };
 
 use crate::generics::subst_ty;
@@ -27,6 +27,33 @@ pub(crate) struct Declared {
     pub classes: BTreeSet<String>,
     pub enums: BTreeSet<String>,
     pub aliases: BTreeMap<String, AliasTag>,
+}
+
+impl Declared {
+    /// Register every named `---@class`/`---@enum`/`---@alias` tag in `items`
+    /// into the declared-name universe (aliases keep their raw tag for later
+    /// expansion). The one classification loop shared by the per-file and
+    /// ambient environment builders (`env.rs`); [`crate::env::FileTypes::collect`]
+    /// classifies the same three tags but does per-kind work beyond name
+    /// registration, so it is not folded in here.
+    pub(crate) fn absorb_tags(&mut self, items: &[AnnotatedItem]) {
+        for item in items {
+            for tag in &item.block.tags {
+                match tag {
+                    Tag::Class(c) if !c.name.is_empty() => {
+                        self.classes.insert(c.name.clone());
+                    }
+                    Tag::Alias(a) if !a.name.is_empty() => {
+                        self.aliases.insert(a.name.clone(), a.clone());
+                    }
+                    Tag::Enum(e) if !e.name.is_empty() => {
+                        self.enums.insert(e.name.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 /// A generic reference (`Name<A, B>`) whose explicit type-argument count does

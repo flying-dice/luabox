@@ -45,7 +45,9 @@ use luabox_syntax::lua::ast::{
 };
 use luabox_syntax::lua::{self, SyntaxNode};
 
-use crate::assign::{LiteralConformance, assignable, classify_literal, is_integral_literal};
+use crate::assign::{
+    Exactness, LiteralConformance, assignable, classify_literal, is_integral_literal,
+};
 use crate::env::{self, TypeEnv};
 use crate::ty::{FieldTy, FunctionTy, OperatorSig, ParamTy, TableTy, Ty};
 use crate::version::VersionReq;
@@ -72,10 +74,30 @@ const DISCARD_RETURNS: u16 = 309;
 /// `await-in-sync`).
 const AWAIT_IN_SYNC: u16 = 316;
 
-/// Run the checker over one parsed file. `inferred` carries the
-/// inference engine's expression types keyed by byte range — consulted
-/// where annotations are absent (annotations always win).
-#[allow(clippy::too_many_arguments)]
+/// A borrowed view over the four [`crate::infer::Outcome`] fields the checker
+/// consults, built by [`crate::infer::Outcome::view`]. Passing one view keeps
+/// the checker decoupled from inference's display-only surface (bindings,
+/// returns, module export, outgoing calls) — it reads only these four.
+#[derive(Clone, Copy)]
+pub(crate) struct InferenceView<'a> {
+    /// Reified expression types keyed by byte range — the fallback for
+    /// expressions annotations cannot type ([`crate::infer::Outcome::expr_types`]).
+    pub expr_types: &'a HashMap<(usize, usize), Ty>,
+    /// Resolved `:` method-call signatures keyed by the call's byte range
+    /// ([`crate::infer::Outcome::method_sigs`]).
+    pub method_sigs: &'a HashMap<(usize, usize), FunctionTy>,
+    /// Final accumulated shape of each `---@type`/`---@class` carrier local,
+    /// keyed by the `local` statement's byte range
+    /// ([`crate::infer::Outcome::carrier_final`]).
+    pub carrier_final: &'a HashMap<(usize, usize), Ty>,
+    /// Reified accumulated `---@class` carrier shapes keyed by class name
+    /// ([`crate::infer::Outcome::carrier_class_final`]).
+    pub carrier_class_final: &'a HashMap<String, Ty>,
+}
+
+/// Run the checker over one parsed file. `inference` is the borrowed view over
+/// the inference engine's results — consulted where annotations are absent
+/// (annotations always win).
 pub(crate) fn run(
     parse: &lua::Parse,
     typeenv: &TypeEnv,
@@ -83,10 +105,7 @@ pub(crate) fn run(
     strict: bool,
     is_meta: bool,
     edition: lua::Dialect,
-    inferred: &HashMap<(usize, usize), Ty>,
-    method_sigs: &HashMap<(usize, usize), FunctionTy>,
-    carrier_final: &HashMap<(usize, usize), Ty>,
-    carrier_class_final: &HashMap<String, Ty>,
+    inference: InferenceView<'_>,
 ) -> Vec<Diagnostic> {
     let severity = if strict {
         Severity::Error
@@ -100,10 +119,10 @@ pub(crate) fn run(
         severity,
         is_meta,
         edition,
-        inferred,
-        method_sigs,
-        carrier_final,
-        carrier_class_final,
+        inferred: inference.expr_types,
+        method_sigs: inference.method_sigs,
+        carrier_final: inference.carrier_final,
+        carrier_class_final: inference.carrier_class_final,
         deferred_carriers: Vec::new(),
         class_obligations: Vec::new(),
         diags: Vec::new(),
@@ -301,7 +320,7 @@ impl Checker<'_> {
     }
 
     fn assignable(&self, value: &Ty, target: &Ty) -> bool {
-        assignable(self.env, self.strict, value, target)
+        assignable(self.env, Exactness::from_strict(self.strict), value, target)
     }
 
     fn bind(&mut self, name: &str, ty: Ty, checked: bool) {
@@ -490,8 +509,12 @@ impl Checker<'_> {
                         && types.len() == 1
                         && let Expr::Table(table) = value
                         && let Ty::Table(lit) = self.table_literal_ty(table)
-                        && classify_literal(self.env, self.strict, &lit, expected)
-                            == Some(LiteralConformance::MissingOnly)
+                        && classify_literal(
+                            self.env,
+                            Exactness::from_strict(self.strict),
+                            &lit,
+                            expected,
+                        ) == Some(LiteralConformance::MissingOnly)
                     {
                         let span = self
                             .env
@@ -538,9 +561,13 @@ impl Checker<'_> {
             if self.assignable(&found, &carrier.target) {
                 continue;
             }
-            let detail =
-                crate::assign::explain_mismatch(self.env, self.strict, &found, &carrier.target)
-                    .map_or(String::new(), |d| format!(": {d}"));
+            let detail = crate::assign::explain_mismatch(
+                self.env,
+                Exactness::from_strict(self.strict),
+                &found,
+                &carrier.target,
+            )
+            .map_or(String::new(), |d| format!(": {d}"));
             self.report_full(
                 TYPE_MISMATCH,
                 carrier.span.clone(),
@@ -634,9 +661,13 @@ impl Checker<'_> {
                 field.ty.clone()
             };
             if !self.assignable(&actual.ty, &expected) {
-                let detail =
-                    crate::assign::explain_mismatch(self.env, self.strict, &actual.ty, &expected)
-                        .map_or(String::new(), |d| format!(": {d}"));
+                let detail = crate::assign::explain_mismatch(
+                    self.env,
+                    Exactness::from_strict(self.strict),
+                    &actual.ty,
+                    &expected,
+                )
+                .map_or(String::new(), |d| format!(": {d}"));
                 self.report_class_conformance(
                     ob.span.clone(),
                     format!(
@@ -1806,8 +1837,13 @@ impl Checker<'_> {
             };
             // Name the offending members when both sides are table-shaped, so
             // the message carries which member is at fault.
-            let detail = crate::assign::explain_mismatch(self.env, self.strict, &found, expected)
-                .map_or(String::new(), |d| format!(": {d}"));
+            let detail = crate::assign::explain_mismatch(
+                self.env,
+                Exactness::from_strict(self.strict),
+                &found,
+                expected,
+            )
+            .map_or(String::new(), |d| format!(": {d}"));
             self.report_full(
                 mismatch_code,
                 slot_range(slot),

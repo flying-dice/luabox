@@ -61,11 +61,15 @@ mod lower;
 pub mod ty;
 mod version;
 
-pub use assign::assignable;
+pub use assign::{Exactness, assignable};
 pub use defs::{
-    Ambient, DefFile, alias_collisions, combined as combined_defs,
-    combined_checked as combined_defs_checked, stdlib as stdlib_defs,
+    Ambient, DefFile, alias_collisions, build_ambient, build_ambient_checked, stdlib as stdlib_defs,
 };
+// Back-compat alias: `luabox-lsp` (`server.rs`) and `luabox-cli`'s lint command
+// (`lint_cmd.rs`) still call `combined_defs`. Kept as a thin re-export delegating
+// to `build_ambient` so those crates compile unchanged; remove once they migrate.
+// TODO(follow-up): migrate luabox-lsp + lint_cmd to `build_ambient` and drop this.
+pub use defs::build_ambient as combined_defs;
 pub use env::{FileTypes, TypeEnv};
 pub use infer::{ExternalTypes, InferredBinding, InferredReturn};
 pub use version::VersionReq;
@@ -245,7 +249,7 @@ pub fn check_file(
 /// reach.
 ///
 /// `ambient` is the definition-package layer selected by the project
-/// `edition` ([`stdlib_defs`] / [`combined_defs`]): its stdlib globals and
+/// `edition` ([`stdlib_defs`] / [`build_ambient`]): its stdlib globals and
 /// module tables become visible to both the checker and inference, merged
 /// beneath the file's own declarations (SPEC.md §3).
 #[must_use]
@@ -339,10 +343,7 @@ pub fn check_file_with_requires<S: std::hash::BuildHasher>(
             strictness == Strictness::Strict,
             is_meta,
             edition,
-            &inference.expr_types,
-            &inference.method_sigs,
-            &inference.carrier_final,
-            &inference.carrier_class_final,
+            inference.view(),
         ));
         diags.extend(inference.diags);
         // Duplicate `---@field` on one class (luals `duplicate-doc-field`,

@@ -12,7 +12,7 @@
 
 use luabox_diag::{Diagnostic, Severity};
 use luabox_syntax::lua::{Dialect, parse};
-use luabox_types::{Strictness, check_file, check_file_with_ambient, combined_defs};
+use luabox_types::{Strictness, build_ambient, check_file, check_file_with_ambient};
 
 /// Warn-mode diagnostics for a self-contained file under `edition`.
 fn diags(src: &str, edition: Dialect) -> Vec<Diagnostic> {
@@ -34,7 +34,7 @@ fn ambient_codes(src: &str, defs: &[&str], edition: Dialect) -> Vec<String> {
     let parsed = parse(src, edition);
     assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
     let defs_owned: Vec<String> = defs.iter().map(|s| (*s).to_string()).collect();
-    let ambient = combined_defs(edition, &defs_owned);
+    let ambient = build_ambient(edition, &defs_owned);
     check_file_with_ambient(
         &parsed,
         "test.lua",

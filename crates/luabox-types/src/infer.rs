@@ -1,7 +1,7 @@
 //! Rich table inference over the HIR (SPEC.md §3 — hard requirement).
 //!
 //! Tables never degrade to a bare `table` type: every table constructed in
-//! the file gets an identity-tracked *shape* ([`ShapeData`]) that later
+//! the file gets an identity-tracked *shape* ([`InferredShape`]) that later
 //! statements extend — constructor entries, `t.x = v` assignments,
 //! `function T.f()` / `function T:m()` declarations, and
 //! `setmetatable`/`__index` chains — so idiomatic Lua OOP
@@ -115,6 +115,19 @@ pub(crate) struct Outcome {
     /// a `Child.__index = Base` chain (which the carrier's own reified shape
     /// does not fold in) is still counted as provided (#107).
     pub(crate) carrier_class_final: HashMap<String, Ty>,
+}
+
+impl Outcome {
+    /// The borrowed view of just the four fields the annotation checker reads
+    /// ([`crate::check::run`]), leaving the display-only surface untouched.
+    pub(crate) fn view(&self) -> crate::check::InferenceView<'_> {
+        crate::check::InferenceView {
+            expr_types: &self.expr_types,
+            method_sigs: &self.method_sigs,
+            carrier_final: &self.carrier_final,
+            carrier_class_final: &self.carrier_class_final,
+        }
+    }
 }
 
 /// Cross-file inputs to display-mode inference, assembled by the analysis
@@ -287,7 +300,7 @@ enum ITy {
     /// A locally-constructed table, identity-tracked so later assignments
     /// extend it everywhere it flows.
     Shape(usize),
-    /// An unannotated function literal; its signature lives in [`FuncData`].
+    /// An unannotated function literal; its signature lives in [`InferredFn`].
     Func(BodyId),
     /// A flattened, deduplicated union (at least two members, no nested
     /// unions).
@@ -345,7 +358,7 @@ fn ity_members(ity: &ITy) -> Vec<ITy> {
 
 /// The mutable inferred shape of one locally-constructed table.
 #[derive(Debug, Default)]
-struct ShapeData {
+struct InferredShape {
     /// Named fields, union-extended by constructors and assignments.
     fields: BTreeMap<String, ITy>,
     /// Array-part element candidates (deduplicated).
@@ -373,7 +386,7 @@ struct ShapeData {
 
 /// The inferred signature of one function body.
 #[derive(Debug, Default)]
-struct FuncData {
+struct InferredFn {
     /// The annotated signature, when one exists — authoritative.
     sig: Option<FunctionTy>,
     /// Inferred positional returns (union across `return` statements,
@@ -447,7 +460,7 @@ struct Infer<'a> {
     /// Cross-file inputs (require exports + dependents' call args), when
     /// the analysis layer supplied them. Display-only.
     externals: Option<&'a ExternalTypes>,
-    shapes: Vec<ShapeData>,
+    shapes: Vec<InferredShape>,
     /// Constructor site → shape, so pass 2 reuses pass 1's identities.
     shape_of_expr: HashMap<(BodyId, ExprId), usize>,
     /// Carrier shape → its shared instance shape.
@@ -470,7 +483,7 @@ struct Infer<'a> {
     /// in pass 1 so the keep-the-shape decision (rather than freeze to the
     /// annotated type) is identical across passes.
     carrier_keys: HashSet<Key>,
-    funcs: HashMap<BodyId, FuncData>,
+    funcs: HashMap<BodyId, InferredFn>,
     /// Running union of argument types observed at call sites, per
     /// parameter binding. Persists across passes: pass 0 collects, pass 1
     /// walks bodies with the seeds applied (the bounded fixpoint's one
@@ -561,7 +574,7 @@ impl Infer<'_> {
             return id;
         }
         let id = self.shapes.len();
-        self.shapes.push(ShapeData::default());
+        self.shapes.push(InferredShape::default());
         self.shape_of_expr.insert((body, expr), id);
         id
     }
@@ -572,11 +585,11 @@ impl Infer<'_> {
             return id;
         }
         let id = self.shapes.len();
-        self.shapes.push(ShapeData {
+        self.shapes.push(InferredShape {
             metatable: Some(carrier),
             declared: self.shapes[carrier].declared.clone(),
             is_instance: true,
-            ..ShapeData::default()
+            ..InferredShape::default()
         });
         self.instances.insert(carrier, id);
         id
@@ -1034,7 +1047,8 @@ impl Infer<'_> {
                 }
                 let key = Ty::StringLit(name.to_string());
                 for (k, v) in &table.indexers {
-                    if crate::assign::assignable(self.env, false, &key, k) {
+                    if crate::assign::assignable(self.env, crate::assign::Exactness::Loose, &key, k)
+                    {
                         return Lookup::Found(ITy::Ty(v.clone()));
                     }
                 }
@@ -1513,7 +1527,12 @@ impl Infer<'_> {
                     let target = target.clone();
                     match self.reify_shape(id) {
                         Ty::Table(lit) => matches!(
-                            crate::assign::classify_literal(self.env, self.strict, &lit, &target),
+                            crate::assign::classify_literal(
+                                self.env,
+                                crate::assign::Exactness::from_strict(self.strict),
+                                &lit,
+                                &target
+                            ),
                             Some(crate::assign::LiteralConformance::MissingOnly)
                         ),
                         _ => false,
@@ -2081,7 +2100,12 @@ impl Infer<'_> {
                 Pred::Lit(lit) => match &member {
                     ITy::Ty(Ty::Unknown | Ty::Any) => kept.push(ITy::Ty(lit.clone())),
                     ITy::Ty(ty) => {
-                        if crate::assign::assignable(self.env, false, lit, ty) {
+                        if crate::assign::assignable(
+                            self.env,
+                            crate::assign::Exactness::Loose,
+                            lit,
+                            ty,
+                        ) {
                             kept.push(ITy::Ty(lit.clone()));
                         }
                     }
@@ -2415,7 +2439,12 @@ impl Infer<'_> {
         for sig in self.env.class_operators(class, op) {
             match (&sig.input, other) {
                 (Some(input), Some(other)) => {
-                    if crate::assign::assignable(self.env, false, other, input) {
+                    if crate::assign::assignable(
+                        self.env,
+                        crate::assign::Exactness::Loose,
+                        other,
+                        input,
+                    ) {
                         return Some(sig.result.clone());
                     }
                 }
@@ -2581,9 +2610,12 @@ impl Infer<'_> {
             .iter()
             .find(|sig| match (&sig.input, &first_arg) {
                 (None, _) => true,
-                (Some(input), Some(arg)) => {
-                    crate::assign::assignable(self.env, self.strict, arg, input)
-                }
+                (Some(input), Some(arg)) => crate::assign::assignable(
+                    self.env,
+                    crate::assign::Exactness::from_strict(self.strict),
+                    arg,
+                    input,
+                ),
                 (Some(_), None) => false,
             })
             .unwrap_or(&sigs[0]);
@@ -2651,7 +2683,12 @@ impl Infer<'_> {
             } else {
                 continue;
             };
-            if !crate::assign::assignable(self.env, self.strict, arg, &expected) {
+            if !crate::assign::assignable(
+                self.env,
+                crate::assign::Exactness::from_strict(self.strict),
+                arg,
+                &expected,
+            ) {
                 return false;
             }
         }

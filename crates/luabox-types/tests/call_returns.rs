@@ -7,14 +7,14 @@
 
 use luabox_diag::Diagnostic;
 use luabox_syntax::lua::{Dialect, parse};
-use luabox_types::{Strictness, check_file, check_file_with_ambient, combined_defs};
+use luabox_types::{Strictness, build_ambient, check_file, check_file_with_ambient};
 
 /// Strict-mode diagnostic codes for a file checked against the stdlib (plus
 /// any extra `.d.lua` sources) ambient layer.
 fn ambient_codes(src: &str, defs: &[String]) -> Vec<String> {
     let parsed = parse(src, Dialect::Lua54);
     assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
-    let ambient = combined_defs(Dialect::Lua54, defs);
+    let ambient = build_ambient(Dialect::Lua54, defs);
     codes(&check_file_with_ambient(
         &parsed,
         "test.lua",
@@ -42,7 +42,7 @@ fn strict_codes(src: &str) -> Vec<String> {
 fn warn_ambient_codes(src: &str, defs: &[String]) -> Vec<String> {
     let parsed = parse(src, Dialect::Lua54);
     assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
-    let ambient = combined_defs(Dialect::Lua54, defs);
+    let ambient = build_ambient(Dialect::Lua54, defs);
     codes(&check_file_with_ambient(
         &parsed,
         "test.lua",
