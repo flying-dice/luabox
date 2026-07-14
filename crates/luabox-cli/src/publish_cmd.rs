@@ -227,7 +227,7 @@ fn run_test_gate(project: &Project) -> anyhow::Result<()> {
         root: &project.root,
     };
     let report = run_suite(&runtime, &opts);
-    let (text, summary) = luabox_test::render(&[report], false);
+    let (text, summary) = luabox_test::render(&[report], luabox_test::Layout::Flat);
     print!("{text}");
     if summary.failed > 0 {
         bail!(

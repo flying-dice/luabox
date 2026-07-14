@@ -87,7 +87,12 @@ fn run_once(cwd: &Path, pattern: Option<&str>, matrix: bool) -> anyhow::Result<(
         .map(|runtime| run_suite(runtime, &opts))
         .collect();
 
-    let (text, summary) = luabox_test::render(&reports, matrix);
+    let layout = if matrix {
+        luabox_test::Layout::Matrix
+    } else {
+        luabox_test::Layout::Flat
+    };
+    let (text, summary) = luabox_test::render(&reports, layout);
     print!("{text}");
 
     if summary.failed > 0 {
