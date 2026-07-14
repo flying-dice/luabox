@@ -14,6 +14,7 @@ mod fmt_cmd;
 mod lint_cmd;
 mod lsp_cmd;
 mod modes;
+mod project;
 mod publish_cmd;
 mod run_cmd;
 mod scaffold;

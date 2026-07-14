@@ -369,61 +369,41 @@ pub(crate) struct Project {
 /// Find the project: nearest `luabox.toml` walking up from `cwd`
 /// (cargo-style), or a manifest-less default rooted at `cwd` (Lua 5.4,
 /// warn mode — least surprise).
-// TODO: clean-code - 0.85 - DRY: eight near-identical `discover(cwd)`
-// functions re-implement this walk-up-to-luabox.toml + read + parse +
-// error-render block (bench_cmd, deps_cmd, fmt_cmd, lint_cmd, run_cmd,
-// test_cmd, audit_cmd). Only the returned Project view differs. Extract one
-// shared manifest-discovery helper returning (root, Manifest) and let each
-// command build its own view on top.
 pub(crate) fn discover(cwd: &Path) -> anyhow::Result<Project> {
-    let mut dir = Some(cwd);
-    while let Some(current) = dir {
-        let manifest_path = current.join("luabox.toml");
-        if manifest_path.is_file() {
-            let text = fs::read_to_string(&manifest_path)
-                .with_context(|| format!("cannot read `{}`", manifest_path.display()))?;
-            let manifest = Manifest::parse(&text).map_err(|errors| {
-                let rendered = errors
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                anyhow::anyhow!("invalid `{}`:\n{rendered}", manifest_path.display())
-            })?;
-            let Some(dialect) = Dialect::from_manifest_id(&manifest.package.edition) else {
-                bail!(
-                    "unknown edition `{}` in `{}` (see `luabox explain LB1001`)",
-                    manifest.package.edition,
-                    manifest_path.display()
-                );
-            };
-            let Some(build_target) = Dialect::from_manifest_id(&manifest.build.target) else {
-                bail!(
-                    "unknown build target `{}` in `{}` (see `luabox explain LB1001`)",
-                    manifest.build.target,
-                    manifest_path.display()
-                );
-            };
-            return Ok(Project {
-                root: current.to_path_buf(),
-                dialect,
-                strictness: Strictness::from_manifest_flag(manifest.types.strict),
-                out_dir: Some(current.join(&manifest.build.out)),
-                build_target,
-                defs: manifest.types.defs.clone(),
-                dep_defs: resolve_dep_defs(current, &manifest),
-            });
-        }
-        dir = current.parent();
-    }
+    let Some((root, manifest)) = crate::project::discover_manifest(cwd)? else {
+        return Ok(Project {
+            root: cwd.to_path_buf(),
+            dialect: Dialect::Lua54,
+            strictness: Strictness::Warn,
+            out_dir: None,
+            build_target: Dialect::Lua54,
+            defs: Vec::new(),
+            dep_defs: Vec::new(),
+        });
+    };
+    let manifest_path = root.join("luabox.toml");
+    let Some(dialect) = Dialect::from_manifest_id(&manifest.package.edition) else {
+        bail!(
+            "unknown edition `{}` in `{}` (see `luabox explain LB1001`)",
+            manifest.package.edition,
+            manifest_path.display()
+        );
+    };
+    let Some(build_target) = Dialect::from_manifest_id(&manifest.build.target) else {
+        bail!(
+            "unknown build target `{}` in `{}` (see `luabox explain LB1001`)",
+            manifest.build.target,
+            manifest_path.display()
+        );
+    };
     Ok(Project {
-        root: cwd.to_path_buf(),
-        dialect: Dialect::Lua54,
-        strictness: Strictness::Warn,
-        out_dir: None,
-        build_target: Dialect::Lua54,
-        defs: Vec::new(),
-        dep_defs: Vec::new(),
+        root: root.clone(),
+        dialect,
+        strictness: Strictness::from_manifest_flag(manifest.types.strict),
+        out_dir: Some(root.join(&manifest.build.out)),
+        build_target,
+        defs: manifest.types.defs.clone(),
+        dep_defs: resolve_dep_defs(&root, &manifest),
     })
 }
 

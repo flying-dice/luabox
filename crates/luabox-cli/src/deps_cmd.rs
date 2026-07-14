@@ -608,32 +608,12 @@ pub(crate) fn create_tar(dir: &Path, archive: &Path) -> anyhow::Result<()> {
 /// commands (unlike `check`) require a manifest — there is nothing to
 /// resolve without one.
 pub(crate) fn discover(cwd: &Path) -> anyhow::Result<Project> {
-    let mut dir = Some(cwd);
-    while let Some(current) = dir {
-        let manifest_path = current.join("luabox.toml");
-        if manifest_path.is_file() {
-            let text = fs::read_to_string(&manifest_path)
-                .with_context(|| format!("cannot read `{}`", manifest_path.display()))?;
-            let manifest = Manifest::parse(&text).map_err(|errors| {
-                let rendered = errors
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                anyhow!("invalid `{}`:\n{rendered}", manifest_path.display())
-            })?;
-            return Ok(Project {
-                root: current.to_path_buf(),
-                manifest_path,
-                manifest,
-            });
-        }
-        dir = current.parent();
-    }
-    bail!(
-        "no `luabox.toml` found in `{}` or any parent directory — run `luabox init` first",
-        cwd.display()
-    )
+    let (root, manifest) = crate::project::discover_required(cwd)?;
+    Ok(Project {
+        manifest_path: root.join("luabox.toml"),
+        root,
+        manifest,
+    })
 }
 
 /// The content-addressed store root: `LUABOX_STORE` env override, else

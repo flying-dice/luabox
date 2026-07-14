@@ -22,11 +22,9 @@
 //! fails loudly with a clear error rather than silently running without
 //! it — see `run` below. It's hidden from `--help` accordingly.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, bail};
-use luabox_resolve::manifest::Manifest;
+use anyhow::bail;
 use luabox_test::runner::SuiteOptions;
 use luabox_test::runtime::{RuntimeSpec, resolve_default, resolve_matrix};
 use luabox_test::{RuntimeReport, run_suite};
@@ -147,31 +145,16 @@ struct Project {
 /// manifest-less default rooted at `cwd` (edition 5.4 — least surprise,
 /// matching `luabox check`).
 fn discover(cwd: &Path) -> anyhow::Result<Project> {
-    let mut dir = Some(cwd);
-    while let Some(current) = dir {
-        let manifest_path = current.join("luabox.toml");
-        if manifest_path.is_file() {
-            let text = fs::read_to_string(&manifest_path)
-                .with_context(|| format!("cannot read `{}`", manifest_path.display()))?;
-            let manifest = Manifest::parse(&text).map_err(|errors| {
-                let rendered = errors
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                anyhow::anyhow!("invalid `{}`:\n{rendered}", manifest_path.display())
-            })?;
-            return Ok(Project {
-                root: current.to_path_buf(),
-                edition: manifest.package.edition.clone(),
-                out_dir: Some(current.join(&manifest.build.out)),
-            });
-        }
-        dir = current.parent();
+    match crate::project::discover_manifest(cwd)? {
+        Some((root, manifest)) => Ok(Project {
+            edition: manifest.package.edition.clone(),
+            out_dir: Some(root.join(&manifest.build.out)),
+            root,
+        }),
+        None => Ok(Project {
+            root: cwd.to_path_buf(),
+            edition: "5.4".to_string(),
+            out_dir: None,
+        }),
     }
-    Ok(Project {
-        root: cwd.to_path_buf(),
-        edition: "5.4".to_string(),
-        out_dir: None,
-    })
 }

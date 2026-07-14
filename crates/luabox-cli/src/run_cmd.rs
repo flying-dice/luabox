@@ -54,12 +54,11 @@
 //! to spawn anything further and reports the loop instead of hanging.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 use anyhow::{Context, bail};
-use luabox_resolve::manifest::{Manifest, TaskValue};
+use luabox_resolve::manifest::TaskValue;
 use luabox_test::runtime::{RuntimeSpec, find_on_path, resolve_default};
 
 /// Nesting cap for `LUABOX_RUN_DEPTH` (see the module doc's "Recursion
@@ -325,33 +324,18 @@ struct Project {
 /// manifest-less default rooted at `cwd` (edition 5.4, no tasks — matching
 /// `luabox test`'s `discover`).
 fn discover(cwd: &Path) -> anyhow::Result<Project> {
-    let mut dir = Some(cwd);
-    while let Some(current) = dir {
-        let manifest_path = current.join("luabox.toml");
-        if manifest_path.is_file() {
-            let text = fs::read_to_string(&manifest_path)
-                .with_context(|| format!("cannot read `{}`", manifest_path.display()))?;
-            let manifest = Manifest::parse(&text).map_err(|errors| {
-                let rendered = errors
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                anyhow::anyhow!("invalid `{}`:\n{rendered}", manifest_path.display())
-            })?;
-            return Ok(Project {
-                root: current.to_path_buf(),
-                edition: manifest.package.edition.clone(),
-                tasks: manifest.tasks.clone(),
-            });
-        }
-        dir = current.parent();
+    match crate::project::discover_manifest(cwd)? {
+        Some((root, manifest)) => Ok(Project {
+            root,
+            edition: manifest.package.edition.clone(),
+            tasks: manifest.tasks.clone(),
+        }),
+        None => Ok(Project {
+            root: cwd.to_path_buf(),
+            edition: "5.4".to_string(),
+            tasks: BTreeMap::new(),
+        }),
     }
-    Ok(Project {
-        root: cwd.to_path_buf(),
-        edition: "5.4".to_string(),
-        tasks: BTreeMap::new(),
-    })
 }
 
 #[cfg(test)]

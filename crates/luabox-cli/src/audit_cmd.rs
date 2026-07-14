@@ -131,17 +131,7 @@ fn finding_to_diagnostic(finding: &Finding) -> Diagnostic {
 /// `deps_cmd::discover`. Auditing needs a project root to find
 /// `luabox.lock`; a manifest-less directory has nothing to audit.
 fn discover(cwd: &Path) -> anyhow::Result<PathBuf> {
-    let mut dir = Some(cwd);
-    while let Some(current) = dir {
-        if current.join("luabox.toml").is_file() {
-            return Ok(current.to_path_buf());
-        }
-        dir = current.parent();
-    }
-    bail!(
-        "no `luabox.toml` found in `{}` or any parent directory — run `luabox init` first",
-        cwd.display()
-    )
+    crate::project::require_root(cwd)
 }
 
 /// Resolves the advisory database directory: `LUABOX_ADVISORY_DB` if it

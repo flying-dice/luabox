@@ -19,11 +19,8 @@
 //! grouped by bench name so every runtime's numbers for a given bench sit
 //! together.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::Context;
-use luabox_resolve::manifest::Manifest;
 use luabox_test::bench::{self, SuiteOptions};
 use luabox_test::runtime::resolve_matrix;
 
@@ -96,29 +93,14 @@ struct Project {
 /// manifest-less default rooted at `cwd` (mirrors `luabox test`'s
 /// discovery in `test_cmd.rs`).
 fn discover(cwd: &Path) -> anyhow::Result<Project> {
-    let mut dir = Some(cwd);
-    while let Some(current) = dir {
-        let manifest_path = current.join("luabox.toml");
-        if manifest_path.is_file() {
-            let text = fs::read_to_string(&manifest_path)
-                .with_context(|| format!("cannot read `{}`", manifest_path.display()))?;
-            let manifest = Manifest::parse(&text).map_err(|errors| {
-                let rendered = errors
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                anyhow::anyhow!("invalid `{}`:\n{rendered}", manifest_path.display())
-            })?;
-            return Ok(Project {
-                root: current.to_path_buf(),
-                out_dir: Some(current.join(&manifest.build.out)),
-            });
-        }
-        dir = current.parent();
+    match crate::project::discover_manifest(cwd)? {
+        Some((root, manifest)) => Ok(Project {
+            out_dir: Some(root.join(&manifest.build.out)),
+            root,
+        }),
+        None => Ok(Project {
+            root: cwd.to_path_buf(),
+            out_dir: None,
+        }),
     }
-    Ok(Project {
-        root: cwd.to_path_buf(),
-        out_dir: None,
-    })
 }

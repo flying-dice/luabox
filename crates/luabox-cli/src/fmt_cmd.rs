@@ -17,7 +17,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use luabox_resolve::manifest::Manifest;
 use luabox_syntax::{Dialect, lua};
 
 /// Execute `luabox fmt` from `cwd`. In `--check` mode nothing is written;
@@ -96,39 +95,24 @@ struct Project {
 /// Find the project: nearest `luabox.toml` walking up from `cwd`, or a
 /// manifest-less default rooted at `cwd`.
 fn discover(cwd: &Path) -> anyhow::Result<Project> {
-    let mut dir = Some(cwd);
-    while let Some(current) = dir {
-        let manifest_path = current.join("luabox.toml");
-        if manifest_path.is_file() {
-            let text = fs::read_to_string(&manifest_path)
-                .with_context(|| format!("cannot read `{}`", manifest_path.display()))?;
-            let manifest = Manifest::parse(&text).map_err(|errors| {
-                let rendered = errors
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                anyhow::anyhow!("invalid `{}`:\n{rendered}", manifest_path.display())
-            })?;
-            let Some(dialect) = Dialect::from_manifest_id(&manifest.package.edition) else {
-                bail!(
-                    "unknown edition `{}` in `{}`",
-                    manifest.package.edition,
-                    manifest_path.display()
-                );
-            };
-            return Ok(Project {
-                root: current.to_path_buf(),
-                dialect,
-                out_dir: Some(current.join(&manifest.build.out)),
-            });
-        }
-        dir = current.parent();
-    }
+    let Some((root, manifest)) = crate::project::discover_manifest(cwd)? else {
+        return Ok(Project {
+            root: cwd.to_path_buf(),
+            dialect: Dialect::Lua54,
+            out_dir: None,
+        });
+    };
+    let Some(dialect) = Dialect::from_manifest_id(&manifest.package.edition) else {
+        bail!(
+            "unknown edition `{}` in `{}`",
+            manifest.package.edition,
+            root.join("luabox.toml").display()
+        );
+    };
     Ok(Project {
-        root: cwd.to_path_buf(),
-        dialect: Dialect::Lua54,
-        out_dir: None,
+        out_dir: Some(root.join(&manifest.build.out)),
+        root,
+        dialect,
     })
 }
 

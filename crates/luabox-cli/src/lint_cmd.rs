@@ -182,44 +182,29 @@ struct Project {
 /// Find the project: nearest `luabox.toml` walking up from `cwd`, or a
 /// manifest-less default rooted at `cwd` (Lua 5.4, empty lint config).
 fn discover(cwd: &Path) -> anyhow::Result<Project> {
-    let mut dir = Some(cwd);
-    while let Some(current) = dir {
-        let manifest_path = current.join("luabox.toml");
-        if manifest_path.is_file() {
-            let text = fs::read_to_string(&manifest_path)
-                .with_context(|| format!("cannot read `{}`", manifest_path.display()))?;
-            let manifest = Manifest::parse(&text).map_err(|errors| {
-                let rendered = errors
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                anyhow::anyhow!("invalid `{}`:\n{rendered}", manifest_path.display())
-            })?;
-            let Some(dialect) = Dialect::from_manifest_id(&manifest.package.edition) else {
-                bail!(
-                    "unknown edition `{}` in `{}` (see `luabox explain LB1001`)",
-                    manifest.package.edition,
-                    manifest_path.display()
-                );
-            };
-            let known_globals = known_globals(dialect, current, &manifest);
-            return Ok(Project {
-                root: current.to_path_buf(),
-                dialect,
-                out_dir: Some(current.join(&manifest.build.out)),
-                lint: build_config(&manifest.lint),
-                known_globals,
-            });
-        }
-        dir = current.parent();
-    }
+    let Some((root, manifest)) = crate::project::discover_manifest(cwd)? else {
+        return Ok(Project {
+            root: cwd.to_path_buf(),
+            dialect: Dialect::Lua54,
+            out_dir: None,
+            lint: LintConfig::new(),
+            known_globals: stdlib_defs(Dialect::Lua54).global_names().clone(),
+        });
+    };
+    let Some(dialect) = Dialect::from_manifest_id(&manifest.package.edition) else {
+        bail!(
+            "unknown edition `{}` in `{}` (see `luabox explain LB1001`)",
+            manifest.package.edition,
+            root.join("luabox.toml").display()
+        );
+    };
+    let known_globals = known_globals(dialect, &root, &manifest);
     Ok(Project {
-        root: cwd.to_path_buf(),
-        dialect: Dialect::Lua54,
-        out_dir: None,
-        lint: LintConfig::new(),
-        known_globals: stdlib_defs(Dialect::Lua54).global_names().clone(),
+        out_dir: Some(root.join(&manifest.build.out)),
+        dialect,
+        lint: build_config(&manifest.lint),
+        known_globals,
+        root,
     })
 }
 
