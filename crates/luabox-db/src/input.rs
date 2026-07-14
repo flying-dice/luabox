@@ -39,4 +39,12 @@ pub struct Project {
     /// Every file in the project.
     #[returns(ref)]
     pub files: Vec<SourceFile>,
+    /// The project root that anchors `require` resolution (SPEC.md §7): module
+    /// strings resolve against `<root>/…` and `<root>/src/…` exactly as the
+    /// bundler / `luabox check` resolve them on disk (see
+    /// [`luabox_bundle::resolve_candidates`]). Empty when unset — a rootless
+    /// host then anchors at the empty path, which is what the bare-relative-path
+    /// unit tests (`a.lua`, `b.lua`) expect.
+    #[returns(ref)]
+    pub root: PathBuf,
 }

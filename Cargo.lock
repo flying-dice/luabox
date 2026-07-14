@@ -863,6 +863,7 @@ dependencies = [
 name = "luabox-db"
 version = "0.1.0"
 dependencies = [
+ "luabox-bundle",
  "luabox-diag",
  "luabox-hir",
  "luabox-syntax",

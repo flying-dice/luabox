@@ -36,10 +36,35 @@ use std::path::{Path, PathBuf};
 /// type resolution, #85) share this one algorithm rather than re-deriving
 /// it.
 pub fn resolve(root: &Path, module: &str) -> Option<PathBuf> {
+    resolve_candidates(root, module)
+        .into_iter()
+        .find(|c| c.is_file())
+        .map(|c| c.canonicalize().unwrap_or(c))
+}
+
+/// The ordered candidate file paths `module` may resolve to under `root`, in
+/// SPEC.md §7 priority order (project root, then `src/`, then the
+/// `lua_modules/<pkg>/` tree — `src/` first). Empty when `module` is not a
+/// legal module name (empty, or a segment that is empty or `..`).
+///
+/// This is the single source of the resolution *ordering*. Two front-ends
+/// consume it with different existence tests, and therefore can never disagree
+/// on which file a `require` names:
+///
+/// - [`resolve`] (this crate's bundler and `luabox check`) picks the first
+///   candidate that exists on disk;
+/// - the incremental database (`luabox-db`, behind the LSP) picks the first
+///   candidate present in its in-memory project file set.
+///
+/// Before this was shared, `luabox-db` approximated resolution by trailing-path
+/// suffix match, so a module buried at `lib/util/helper.lua` was reachable as
+/// `require("helper")` in the editor but not under `luabox check` — the exact
+/// silent divergence this factoring makes structurally impossible.
+pub fn resolve_candidates(root: &Path, module: &str) -> Vec<PathBuf> {
     // Reject shapes that cannot be a module name (empty segments) or that
     // would escape the project tree (`..`, absolute-ish names).
     if module.is_empty() || module.split('.').any(|seg| seg.is_empty() || seg == "..") {
-        return None;
+        return Vec::new();
     }
 
     let rel = module.replace('.', "/");
@@ -69,7 +94,4 @@ pub fn resolve(root: &Path, module: &str) -> Option<PathBuf> {
     }
 
     candidates
-        .into_iter()
-        .find(|c| c.is_file())
-        .map(|c| c.canonicalize().unwrap_or(c))
 }

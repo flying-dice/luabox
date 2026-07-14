@@ -79,7 +79,7 @@ impl AnalysisHost {
     #[must_use]
     pub fn new(default_dialect: Dialect, strictness: Strictness) -> Self {
         let db = RootDatabase::default();
-        let project = Project::new(&db, strictness, Vec::new());
+        let project = Project::new(&db, strictness, Vec::new(), PathBuf::new());
         Self {
             db,
             vfs: Vfs::new(),
@@ -87,6 +87,18 @@ impl AnalysisHost {
             project,
             default_dialect,
         }
+    }
+
+    /// Set the project root that anchors `require` resolution (SPEC.md §7).
+    ///
+    /// A rootless host resolves `require` against the empty path (fine for the
+    /// bare-relative-path unit tests); a real front-end — the LSP server —
+    /// calls this once at startup with the workspace root so module strings
+    /// resolve against `<root>/…` and `<root>/src/…` exactly as `luabox check`
+    /// resolves them on disk. One root, one resolution ordering, editor and CI
+    /// in lockstep.
+    pub fn set_root(&mut self, root: PathBuf) {
+        self.project.set_root(&mut self.db).to(root);
     }
 
     /// The read-only VFS (path interning, overlay state).

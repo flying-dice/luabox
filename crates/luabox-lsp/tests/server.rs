@@ -2424,6 +2424,63 @@ local function use(x) end
     client.shutdown();
 }
 
+#[test]
+fn require_resolution_matches_bundle_semantics_not_path_suffix() {
+    // Regression guard for the check-vs-LSP resolution seam. `require` must
+    // resolve exactly as `luabox check` does — the bundler's SPEC.md §7
+    // path-mapping (project root and `src/` only) — NOT by trailing-path
+    // suffix match. A module buried at `lib/util/helper.lua` is unreachable as
+    // `require("helper")` (bundle probes `helper.lua`/`src/helper.lua`), so its
+    // class must not flow into the consumer; a correctly placed `src/geom.lua`
+    // does. The old suffix-matching db query resolved BOTH, publishing a
+    // spurious second diagnostic that `luabox check` never reports.
+    let module = "\
+---@class {C}
+local {C} = {}
+{C}.__index = {C}
+---@return {C}
+function {C}.new() return setmetatable({}, {C}) end
+---@return number
+function {C}:area() return 1 end
+return {C}
+";
+    let geom = module.replace("{C}", "Geo");
+    let helper = module.replace("{C}", "Help");
+    let main = "\
+local geom = require(\"geom\")
+local g = geom.new()
+local _a = g:bogus()
+
+local helper = require(\"helper\")
+local h = helper.new()
+local _b = h:bogus()
+";
+    let client = start(&[
+        ("src/geom.lua", geom.as_str()),
+        ("lib/util/helper.lua", helper.as_str()),
+        ("main.lua", main),
+    ]);
+    let main_uri = client.uri("main.lua");
+    let diags = client.open(&main_uri, main);
+    let bogus: Vec<_> = diags.iter().filter(|d| code_of(d) == "LB0306").collect();
+    // Exactly one LB0306, on `g:bogus()` (line 2, 0-based), from the resolvable
+    // `src/geom.lua`. `require("helper")` resolves nowhere under bundle parity,
+    // so `h:bogus()` (line 6) stays `unknown` and clean — identical to
+    // `luabox check` over the same tree.
+    assert_eq!(
+        bogus.len(),
+        1,
+        "require must resolve like the bundler (root/src only), not by path \
+         suffix — a deep lib/util/helper.lua is not require(\"helper\"): {diags:?}"
+    );
+    assert_eq!(
+        bogus[0].range.start.line, 2,
+        "the sole LB0306 must be on g:bogus(): {:?}",
+        bogus[0]
+    );
+    client.shutdown();
+}
+
 // === Lint diagnostics and quick-fixes ====================================
 
 #[test]

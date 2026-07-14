@@ -12,6 +12,7 @@ luabox-diag.workspace = true
 luabox-syntax.workspace = true
 luabox-hir.workspace = true
 luabox-types.workspace = true
+luabox-bundle.workspace = true
 salsa.workspace = true
 
 [dev-dependencies]

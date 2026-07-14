@@ -15,7 +15,6 @@
 //! edit.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use luabox_types::ty::Ty;
 use luabox_types::{ExternalTypes, TypeEnv, check_file, infer_display_types, stdlib_defs};
@@ -243,47 +242,25 @@ fn dependent_seeds(db: &dyn Db, file: SourceFile, project: Project) -> HashMap<S
     seeds
 }
 
-/// Resolve a `require` module string to a project file by path suffix:
-/// `"a.b"` matches `**/a/b.lua` or `**/a/b/init.lua`.
+/// Resolve a `require` module string to a project file using the bundler's
+/// exact SPEC.md §7 path-mapping ([`luabox_bundle::resolve_candidates`]) over
+/// the in-memory project file set — the *same* resolution ordering
+/// `luabox check` applies on disk, so the editor and CI never disagree on which
+/// file `require("a.b")` names. `Project::root` anchors the candidate paths
+/// (`<root>/a/b.lua`, `<root>/src/a/b.lua`, …); the first candidate that is a
+/// known project file wins. Path equality is component-wise, so `/` vs `\`
+/// separators are irrelevant.
 fn resolve_require(db: &dyn Db, project: Project, module: &str) -> Option<SourceFile> {
-    let segments: Vec<&str> = module.split('.').collect();
-    if segments.is_empty() || segments.iter().any(|s| s.is_empty()) {
-        return None;
-    }
-    project
-        .files(db)
-        .iter()
-        .find(|&&file| path_matches(file.path(db), &segments))
-        .copied()
-}
-
-/// Whether `path`'s trailing components spell the module `segments` (as
-/// `a/b.lua` or `a/b/init.lua`).
-fn path_matches(path: &Path, segments: &[&str]) -> bool {
-    let comps: Vec<String> = path
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
-    let direct: Vec<String> = segments
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            if i == segments.len() - 1 {
-                format!("{s}.lua")
-            } else {
-                (*s).to_string()
-            }
+    let root = project.root(db);
+    let files = project.files(db);
+    luabox_bundle::resolve_candidates(root, module)
+        .into_iter()
+        .find_map(|cand| {
+            files
+                .iter()
+                .copied()
+                .find(|file| file.path(db).as_path() == cand.as_path())
         })
-        .collect();
-    if comps.len() >= direct.len() && comps[comps.len() - direct.len()..] == direct[..] {
-        return true;
-    }
-    let init: Vec<String> = segments
-        .iter()
-        .map(|s| (*s).to_string())
-        .chain(std::iter::once("init.lua".to_string()))
-        .collect();
-    comps.len() >= init.len() && comps[comps.len() - init.len()..] == init[..]
 }
 
 /// Typecheck a file against its own annotations at the project strictness.

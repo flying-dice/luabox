@@ -65,13 +65,13 @@ pub fn run(cwd: &Path, target: Option<&str>, format: &str, watch: bool) -> anyho
 /// check-first gate of `luabox build` (`crate::build_cmd`), which passes
 /// its chosen out directory as `skip_out` so previously emitted output is
 /// never checked as project source even under a custom `--out`.
-// TODO: clean-code - 0.70 - BOUNDARY: this re-implements the cross-file
-// check pipeline that luabox-db (the documented Semantics seam behind
-// check/lint/LSP) already provides — and the two have diverged: db resolves
-// require("a.b") by path-suffix match (query.rs resolve_require) while this
-// path uses luabox_bundle::resolve_module, so `luabox check` and LSP
-// diagnostics can silently disagree. Route the CLI through luabox-db so
-// require-resolution and project-surface assembly change in one place.
+// Require-resolution is single-sourced through [`luabox_bundle::resolve_module`]
+// (SPEC.md §7): this CLI path resolves against the filesystem, and luabox-db —
+// the Semantics seam behind the LSP — resolves the same candidate ordering
+// ([`luabox_bundle::resolve_candidates`]) over its in-memory file set. The two
+// front-ends therefore cannot disagree on which file a `require` names (the
+// prior db path-suffix approximation is gone). Surface assembly likewise flows
+// through the one `luabox_types::module_surface` producer on both sides.
 pub(crate) fn run_once(
     cwd: &Path,
     target: Option<&str>,

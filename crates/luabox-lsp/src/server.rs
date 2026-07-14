@@ -386,9 +386,14 @@ impl Server {
         let config = ProjectConfig::discover(&root);
         let ambient = combined_defs(config.dialect, &config.def_sources);
         let known_globals = ambient.global_names().clone();
+        let mut host = AnalysisHost::new(config.dialect, config.strictness);
+        // Anchor the db's `require` resolution at the workspace root so module
+        // strings resolve exactly as `luabox check` resolves them on disk (the
+        // bundler's SPEC.md §7 path-mapping) — editor and CI in lockstep.
+        host.set_root(root.clone());
         Self {
             connection,
-            host: AnalysisHost::new(config.dialect, config.strictness),
+            host,
             root,
             dialect: config.dialect,
             strictness: config.strictness,

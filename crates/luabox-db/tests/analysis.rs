@@ -256,6 +256,45 @@ fn lower_exposes_name_resolution_and_is_memoized() {
 }
 
 #[test]
+fn require_resolution_uses_bundle_path_mapping_not_suffix() {
+    // The db resolves `require` with the bundler's SPEC.md §7 path-mapping
+    // (project root and `src/` only), the *same* ordering `luabox check` uses
+    // on disk — not by trailing-path suffix. A module correctly placed at
+    // `src/geom.lua` resolves as `require("geom")`; one buried at
+    // `lib/util/helper.lua` does NOT resolve as `require("helper")`. The old
+    // suffix match wrongly resolved the buried file, so the editor saw a
+    // require the CLI never did. Requires a project root (the LSP sets one).
+    let module = "\
+local M = {}
+---@return number
+function M.area() return 1 end
+return M
+";
+    let main = "local geom = require(\"geom\")\nlocal helper = require(\"helper\")\n";
+    let mut host = host();
+    host.set_root(PathBuf::from("/proj"));
+    host.apply_changes([
+        set("/proj/src/geom.lua", module),
+        set("/proj/lib/util/helper.lua", module),
+        set("/proj/main.lua", main),
+    ]);
+
+    let reqs = host
+        .snapshot()
+        .require_exports(Path::new("/proj/main.lua"))
+        .unwrap();
+    assert!(
+        reqs.contains_key("geom"),
+        "src/geom.lua must resolve as require(\"geom\"): {reqs:?}"
+    );
+    assert!(
+        !reqs.contains_key("helper"),
+        "a deep lib/util/helper.lua must NOT resolve as require(\"helper\") \
+         (bundle parity, not path-suffix): {reqs:?}"
+    );
+}
+
+#[test]
 fn file_text_and_files_reflect_the_effective_content() {
     let mut host = host();
     host.apply_change(set("a.lua", GOOD));
