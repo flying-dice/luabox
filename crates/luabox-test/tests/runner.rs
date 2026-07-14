@@ -111,7 +111,7 @@ fn fake_runtime_aggregates_pass_and_fail() {
     assert_eq!(report.failed(), 1, "one case should fail");
 
     // The failure message must survive to the report.
-    let (text, summary) = luabox_test::render(&[report], false);
+    let (text, summary) = luabox_test::render(&[report], luabox_test::Layout::Flat);
     assert!(text.contains("PASS alpha ok"), "text:\n{text}");
     assert!(text.contains("FAIL beta broke"), "text:\n{text}");
     assert!(text.contains("expected 1 but got 2"), "text:\n{text}");
@@ -136,7 +136,7 @@ fn fake_runtime_all_passing_is_ok() {
     let report = run_suite(&runtime, &opts);
     assert_eq!(report.passed(), 2);
     assert_eq!(report.failed(), 0);
-    let (_text, summary) = luabox_test::render(&[report], false);
+    let (_text, summary) = luabox_test::render(&[report], luabox_test::Layout::Flat);
     assert!(summary.is_ok());
 }
 

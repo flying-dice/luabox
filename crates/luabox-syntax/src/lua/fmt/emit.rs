@@ -21,7 +21,10 @@ use rowan::NodeOrToken;
 
 use super::strings::normalize_quotes;
 use super::{Indent, LineEnding, Options};
-#[allow(clippy::enum_glob_use)]
+#[allow(
+    clippy::enum_glob_use,
+    reason = "glob-importing the SyntaxKind variants keeps the emitter's match arms readable"
+)]
 use crate::lua::SyntaxKind::{self, *};
 use crate::lua::{SyntaxElement, SyntaxNode, SyntaxToken};
 

@@ -8,7 +8,10 @@
 //! breaks, and statement-level junk is swallowed into `ERROR_NODE`s until a
 //! token that can start a statement (or close a block) comes up.
 
-#[allow(clippy::enum_glob_use)]
+#[allow(
+    clippy::enum_glob_use,
+    reason = "glob-importing the SyntaxKind variants keeps the grammar's match arms readable"
+)]
 use super::SyntaxKind::{self, *};
 use super::parser::{MAX_DEPTH, Parser};
 

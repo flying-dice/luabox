@@ -20,7 +20,7 @@ mod strings;
 
 use super::{Dialect, SyntaxKind, lex, parse};
 
-/// Formatting options — the six from SPEC.md §10, nothing more.
+/// Formatting options — the layout knobs from SPEC.md §10, nothing more.
 /// `Options::default()` is the canonical luabox style.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -31,10 +31,6 @@ pub struct Options {
     pub indent: Indent,
     /// String-quote preference. Default: double quotes where the value allows.
     pub quotes: Quotes,
-    /// Call-parenthesis handling. Only [`CallParens::Input`] exists today:
-    /// the semantics guarantee forbids adding or removing tokens, so
-    /// `f "x"` and `f { x }` keep their shape.
-    pub call_parens: CallParens,
     /// Add a trailing comma to the last field of multi-line tables. Default true.
     pub trailing_table_comma: bool,
     /// Line ending for emitted line breaks. Default LF.
@@ -47,7 +43,6 @@ impl Default for Options {
             width: 120,
             indent: Indent::Spaces(4),
             quotes: Quotes::AutoPreferDouble,
-            call_parens: CallParens::Input,
             trailing_table_comma: true,
             line_ending: LineEnding::Lf,
         }
@@ -68,15 +63,6 @@ pub enum Indent {
 pub enum Quotes {
     AutoPreferDouble,
     AutoPreferSingle,
-}
-
-/// Call-parenthesis styles. Adding/removing parentheses around call
-/// arguments changes the token stream, which the semantics guarantee
-/// (see module docs) rules out — so the input's shape is always kept.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CallParens {
-    #[default]
-    Input,
 }
 
 /// Line-ending style for emitted line breaks. Raw line breaks *inside*

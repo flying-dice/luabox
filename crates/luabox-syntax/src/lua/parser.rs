@@ -397,7 +397,10 @@ fn text_size(offset: usize) -> TextSize {
 
 /// Human-readable token name for `expected …` diagnostics.
 fn describe(kind: SyntaxKind) -> &'static str {
-    #[allow(clippy::enum_glob_use)]
+    #[allow(
+        clippy::enum_glob_use,
+        reason = "glob-importing the SyntaxKind variants keeps the match arms below readable"
+    )]
     use SyntaxKind::*;
     match kind {
         IDENT => "a name",

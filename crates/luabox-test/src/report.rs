@@ -24,11 +24,21 @@ impl Summary {
     }
 }
 
-/// Render `reports` to a human report plus the aggregate [`Summary`]. When
-/// `matrix` is true each runtime gets its own headed block and per-runtime
-/// subtotal; otherwise a single flat listing is produced.
+/// How [`render`] lays out multiple runtimes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// Each runtime gets its own headed block and per-runtime subtotal.
+    Matrix,
+    /// A single flat listing across all runtimes.
+    Flat,
+}
+
+/// Render `reports` to a human report plus the aggregate [`Summary`]. In
+/// [`Layout::Matrix`] each runtime gets its own headed block and per-runtime
+/// subtotal; [`Layout::Flat`] produces a single flat listing.
 #[must_use]
-pub fn render(reports: &[RuntimeReport], matrix: bool) -> (String, Summary) {
+pub fn render(reports: &[RuntimeReport], layout: Layout) -> (String, Summary) {
+    let matrix = matches!(layout, Layout::Matrix);
     let mut out = String::new();
     let mut summary = Summary::default();
 
@@ -96,7 +106,7 @@ fn render_report_body(out: &mut String, report: &RuntimeReport) {
 
 #[cfg(test)]
 mod tests {
-    use super::render;
+    use super::{Layout, render};
     use crate::protocol::{CaseResult, Outcome};
     use crate::runner::{FileOutcome, RuntimeReport};
     use crate::runtime::RuntimeSpec;
@@ -132,7 +142,7 @@ mod tests {
 
     #[test]
     fn flat_report_lists_cases_and_summary() {
-        let (text, summary) = render(&[report()], false);
+        let (text, summary) = render(&[report()], Layout::Flat);
         assert!(text.contains("PASS adds numbers"));
         assert!(text.contains("FAIL divides numbers"));
         assert!(text.contains("expected 2 but got 3"));
@@ -144,7 +154,7 @@ mod tests {
 
     #[test]
     fn matrix_report_groups_per_runtime() {
-        let (text, summary) = render(&[report()], true);
+        let (text, summary) = render(&[report()], Layout::Matrix);
         assert!(text.contains("== runtime 5.4 (Lua 5.4) =="));
         assert!(text.contains("5.4: 1 passed; 1 failed"));
         assert_eq!(summary.failed, 1);
@@ -161,7 +171,7 @@ mod tests {
                 error: Some("syntax error near '='".to_string()),
             }],
         };
-        let (text, summary) = render(&[report], false);
+        let (text, summary) = render(&[report], Layout::Flat);
         assert!(text.contains("ERROR tests/broken_test.lua"));
         assert!(text.contains("syntax error near '='"));
         assert_eq!(summary.failed, 1);

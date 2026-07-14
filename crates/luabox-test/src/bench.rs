@@ -284,7 +284,10 @@ pub fn stats(samples: &BenchSamples) -> BenchStats {
     let mut sorted = samples.batches_ns.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "n is a small sample count; f64 represents it exactly"
+    )]
     let mean = sorted.iter().sum::<f64>() / n as f64;
 
     let median = if n % 2 == 1 {
@@ -294,7 +297,10 @@ pub fn stats(samples: &BenchSamples) -> BenchStats {
     };
 
     let stddev = if n > 1 {
-        #[allow(clippy::cast_precision_loss)]
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "n is a small sample count; f64 represents it exactly"
+        )]
         let variance = sorted.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
         variance.sqrt()
     } else {

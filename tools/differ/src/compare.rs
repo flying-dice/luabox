@@ -68,13 +68,6 @@ pub enum Verdict {
     Mismatch(Vec<Axis>),
 }
 
-impl Verdict {
-    #[cfg_attr(not(test), allow(dead_code, reason = "asserted in the compare tests"))]
-    pub fn is_match(&self) -> bool {
-        matches!(self, Verdict::Match)
-    }
-}
-
 /// Normalize stdout: line endings only. Everything else about stdout is
 /// load-bearing and compared verbatim.
 pub fn normalize_stdout(s: &str) -> String {
@@ -153,6 +146,12 @@ pub fn compare(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl Verdict {
+        fn is_match(&self) -> bool {
+            matches!(self, Verdict::Match)
+        }
+    }
 
     fn ok(stdout: &str) -> ExecResult {
         ExecResult {

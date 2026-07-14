@@ -38,7 +38,7 @@ pub const HARNESS_SOURCE: &str = include_str!("harness.lua");
 
 pub use discovery::discover;
 pub use protocol::{CaseResult, Outcome, ParsedRun};
-pub use report::{Summary, render};
+pub use report::{Layout, Summary, render};
 pub use runner::{FileOutcome, RuntimeReport, SuiteOptions, run_suite};
 pub use runtime::{
     MatrixResolution, PIN_FILE, ResolveError, RuntimeSpec, candidate_names, installed_toolchains,
