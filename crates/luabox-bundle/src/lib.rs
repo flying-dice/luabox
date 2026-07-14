@@ -129,6 +129,10 @@ pub enum BundleError {
     DynamicRequires(Vec<DynamicRequireSite>),
     /// A bundled module requires the entry module itself.
     EntryRequired { file: String, module: String },
+    /// A `.lua.map` sourcemap payload is not valid JSON.
+    SourceMap(String),
+    /// A `.lua.map` sourcemap declares a version this luabox cannot read.
+    SourceMapVersion(u32),
     /// An internal invariant broke (minify or bundle output failed the
     /// mechanical reparse check) — a bundler bug, not a user error.
     Internal(String),
@@ -167,6 +171,11 @@ impl fmt::Display for BundleError {
                 f,
                 "`{file}` requires \"{module}\", which is the entry module; bundling an \
                  entry that is itself required is not supported yet"
+            ),
+            BundleError::SourceMap(message) => write!(f, "invalid .lua.map: {message}"),
+            BundleError::SourceMapVersion(version) => write!(
+                f,
+                "unsupported .lua.map version {version} (this luabox reads version 1)"
             ),
             BundleError::Internal(message) => write!(f, "internal bundler error: {message}"),
         }

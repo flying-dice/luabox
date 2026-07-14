@@ -55,17 +55,11 @@ impl BundleMap {
     }
 
     /// Parse the on-disk JSON form.
-    // TODO: clean-code - 0.55 - IDIOM: stringly-typed public error on a crate
-    // that already defines BundleError and uses it correctly everywhere else.
-    // Make these two failures BundleError (or SourceMapError) variants so the
-    // public API is consistent and matchable.
-    pub fn from_json(text: &str) -> Result<Self, String> {
-        let map: Self = serde_json::from_str(text).map_err(|e| format!("invalid .lua.map: {e}"))?;
+    pub fn from_json(text: &str) -> Result<Self, crate::BundleError> {
+        let map: Self =
+            serde_json::from_str(text).map_err(|e| crate::BundleError::SourceMap(e.to_string()))?;
         if map.version != 1 {
-            return Err(format!(
-                "unsupported .lua.map version {} (this luabox reads version 1)",
-                map.version
-            ));
+            return Err(crate::BundleError::SourceMapVersion(map.version));
         }
         Ok(map)
     }
