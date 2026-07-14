@@ -54,7 +54,7 @@ use lsp_types::{
 use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
 use luabox_lint::{LintConfig, lint_source};
 use luabox_resolve::manifest::{Dependency, Lint, LintLevel, Manifest};
-use luabox_types::{Ambient, combined_defs};
+use luabox_types::{Ambient, build_ambient};
 
 use crate::line_index::LineIndex;
 use crate::sema::FileSema;
@@ -384,7 +384,7 @@ struct Server {
 impl Server {
     fn new(connection: Connection, root: PathBuf) -> Self {
         let config = ProjectConfig::discover(&root);
-        let ambient = combined_defs(config.dialect, &config.def_sources);
+        let ambient = build_ambient(config.dialect, &config.def_sources);
         let known_globals = ambient.global_names().clone();
         let mut host = AnalysisHost::new(config.dialect, config.strictness);
         // Anchor the db's `require` resolution at the workspace root so module
@@ -414,7 +414,7 @@ impl Server {
     /// documents are then republished so the change is reflected immediately.
     fn reload_config(&mut self) -> anyhow::Result<()> {
         let config = ProjectConfig::discover(&self.root);
-        let ambient = combined_defs(config.dialect, &config.def_sources);
+        let ambient = build_ambient(config.dialect, &config.def_sources);
         self.known_globals = ambient.global_names().clone();
         self.ambient = ambient;
         self.lint = config.lint;

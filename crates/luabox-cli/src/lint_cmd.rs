@@ -32,7 +32,7 @@ use luabox_diag::{Diagnostic, Format};
 use luabox_lint::{LintConfig, apply_fixes, lint_source};
 use luabox_resolve::manifest::{Lint, LintLevel, Manifest};
 use luabox_syntax::Dialect;
-use luabox_types::{Ambient, combined_defs, stdlib_defs};
+use luabox_types::{Ambient, build_ambient, stdlib_defs};
 use rayon::prelude::*;
 
 use crate::project::{collect_lua_files, display_rel};
@@ -236,7 +236,7 @@ fn known_globals(dialect: Dialect, root: &Path, manifest: &Manifest) -> HashSet<
     if sources.is_empty() {
         return stdlib_defs(dialect).global_names().clone();
     }
-    let ambient: Ambient = combined_defs(dialect, &sources);
+    let ambient: Ambient = build_ambient(dialect, &sources);
     ambient.global_names().clone()
 }
 

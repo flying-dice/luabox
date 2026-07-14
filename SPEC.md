@@ -165,7 +165,7 @@ members = ["packages/*"]
 
 ## 10. Formatter
 
-- StyLua-compatible default; max ~6 options (width, indent, quotes, call-parens, trailing comma, EOL).
+- StyLua-compatible default; max ~5 options (width, indent, quotes, trailing comma, EOL). (A call-parens option was dropped: the formatter's token-preservation guarantee makes a non-default value unimplementable.)
 - Range formatting, format-on-save, `--check` for CI, idempotent, version-pinned in lockfile.
 
 ## 11. Test runner & bench

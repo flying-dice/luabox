@@ -65,11 +65,6 @@ pub use assign::{Exactness, assignable};
 pub use defs::{
     Ambient, DefFile, alias_collisions, build_ambient, build_ambient_checked, stdlib as stdlib_defs,
 };
-// Back-compat alias: `luabox-lsp` (`server.rs`) and `luabox-cli`'s lint command
-// (`lint_cmd.rs`) still call `combined_defs`. Kept as a thin re-export delegating
-// to `build_ambient` so those crates compile unchanged; remove once they migrate.
-// TODO(follow-up): migrate luabox-lsp + lint_cmd to `build_ambient` and drop this.
-pub use defs::build_ambient as combined_defs;
 pub use env::{FileTypes, TypeEnv};
 pub use infer::{ExternalTypes, InferredBinding, InferredReturn};
 pub use version::VersionReq;

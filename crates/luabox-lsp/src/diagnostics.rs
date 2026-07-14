@@ -31,7 +31,7 @@ pub(crate) const LINT_SOURCE: &str = "luabox-lint";
 pub struct CheckCtx<'a> {
     pub strictness: Strictness,
     /// The ambient layer to check against — the editor's counterpart of the
-    /// CLI's `combined_defs_checked` ambient, so a dependency's classes resolve
+    /// CLI's `build_ambient_checked` ambient, so a dependency's classes resolve
     /// in the editor exactly as they do under `luabox check`.
     pub ambient: &'a Ambient,
     /// The resolved `[lint]` configuration (tiers/rules/allowed globals), built
