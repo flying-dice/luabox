@@ -174,6 +174,7 @@ anything load-bearing.
 | `test` / `bench` | **deprecated** — luabox is a toolchain, not a runtime; code coupled to its deployment environment (LÖVE, Neovim, OpenResty, …) can't be faithfully executed on a bare interpreter. Both warn and are slated for removal; use the environment's own tooling |
 | `add` / `remove` / `install` / `update` / `vendor` | PubGrub resolver, `luabox.lock`, CAS store with hard-link installs; path/git/workspace/registry deps. `update <name>` re-pins a git dep to its repo's latest release tag |
 | `search` / `outdated` | discover luabox packages on GitHub (topic `luabox` + a root `luabox.toml`) and report git deps behind their latest release; `--format json\|text` |
+| `login` / `logout` / `whoami` | sign in to GitHub via the browser (OAuth device flow), storing the token encrypted in the OS keychain; sign out; show the signed-in identity. `login`/`whoami` take `--format json\|text` |
 | `publish` / `audit` | registry publish with yank; advisory-DB audit |
 | `run` | `[tasks]` entries or scripts via the resolved runtime |
 | `toolchain` | install/pin/list managed Lua runtimes |
@@ -224,10 +225,42 @@ editors pass `json` for a stable contract). `outdated` always exits 0 — it is 
 report. `update <name>` re-pins a **tag**-pinned git dependency to the latest
 release tag of its GitHub repo; a `rev`/`branch` pin is left untouched.
 
-GitHub requests honor a token from `LUABOX_GITHUB_TOKEN` (else `GITHUB_TOKEN`),
+GitHub requests honor an authentication token (see **Authentication** below),
 sent as `Authorization: Bearer …`, which raises the anonymous 60 req/hr search
 limit to 5000/hr. Everything works without a token, just against the lower
 anonymous limit.
+
+### Authentication
+
+Sign in to GitHub through the browser — no Personal Access Token to paste:
+
+```sh
+luabox login        # opens the browser, prints a device code, stores a token
+luabox whoami       # -> your GitHub login (and where the token came from)
+luabox logout       # removes the stored token
+```
+
+`luabox login` runs the OAuth 2.0 **device flow**: it shows a short `user_code`
+and a verification URL (and best-effort opens your browser), you approve there,
+and the resulting token is stored **encrypted at rest in your OS keychain**
+(macOS Keychain, Windows Credential Manager, Linux Secret Service). No scope is
+requested — an unscoped token already lifts the rate limit (least privilege).
+`luabox search`/`outdated`/`update` then use it automatically.
+
+`login` and `whoami` accept `--format json` (newline-delimited events for
+`login`; one object for `whoami`) — that is what the editor extensions'
+"Sign in with GitHub" buttons drive.
+
+Token precedence for every GitHub request is:
+
+```
+LUABOX_GITHUB_TOKEN  →  GITHUB_TOKEN  →  keychain (from `luabox login`)  →  anonymous
+```
+
+Environment variables win over the keychain, so CI and one-off overrides are
+always honored. On a headless box with no keychain (common in CI), `luabox
+login` can't store the token and tells you to set `LUABOX_GITHUB_TOKEN`
+instead; nothing crashes.
 
 ## Project layout (for contributors)
 

@@ -10,6 +10,33 @@ spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
 
 Nothing yet — changes land here between releases.
 
+## [0.1.4] - 2026-07-14
+
+### Added
+
+- `luabox login [--format text|json]` — sign in to GitHub through the browser
+  via the OAuth 2.0 Device Authorization Grant (RFC 8628). No scope is
+  requested (an unscoped token already lifts the API rate limit; least
+  privilege). `luabox` prints a `user_code` and verification URL, best-effort
+  opens your browser, polls until you authorize, then stores the token
+  **encrypted at rest in the OS keychain** (macOS Keychain, Windows Credential
+  Manager, Linux Secret Service). `--format json` emits newline-delimited
+  events (`prompt`, then `success`/`error`) for the editor extensions'
+  "Sign in with GitHub" buttons to consume. This **supersedes pasting a
+  Personal Access Token** into `LUABOX_GITHUB_TOKEN` — though that env var
+  still works and still takes precedence.
+- `luabox logout` — delete the stored token from the OS keychain (idempotent).
+- `luabox whoami [--format text|json]` — report the signed-in GitHub login and
+  where its token came from (`keychain`/`env`), or "not signed in" (always
+  exits 0).
+- `luabox search`/`outdated` (and `update`'s re-pin) now transparently use a
+  keychain-stored token after `luabox login`, with no env var set. Token
+  precedence is `LUABOX_GITHUB_TOKEN` → `GITHUB_TOKEN` → keychain → anonymous
+  (env wins so CI and one-off overrides are always honored). A keychain that
+  cannot be reached (headless/CI boxes with no secret service) degrades
+  gracefully: `login` points you at `LUABOX_GITHUB_TOKEN` instead of crashing,
+  and token lookup silently falls through to the env vars.
+
 ## [0.1.3] - 2026-07-14
 
 ### Added
