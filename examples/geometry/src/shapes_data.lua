@@ -26,6 +26,18 @@ local corner = { x = 1, y = 1, label = "top-right", unit = "px" }
 -- `unknown -> geometry.Point` would error under `strict` — a clean check
 -- proves the declared result flowed. Rebinding it to a `---@type string`
 -- would be a real `luabox check` LB0300 (verified against the real binary).
+--
+-- The declared overload is the *static* half; real Lua still needs a
+-- metamethod to execute `+`. Attaching it after the literals bind keeps the
+-- literal-vs-class checks above exactly as they are.
+local point_mt = {
+    __add = function(a, b)
+        return setmetatable({ x = a.x + b.x, y = a.y + b.y }, getmetatable(a))
+    end,
+}
+setmetatable(origin, point_mt)
+setmetatable(corner, point_mt)
+
 ---@type geometry.Point
 local translated = corner + origin
 
