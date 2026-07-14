@@ -1,8 +1,0 @@
-.gradle/
-build/
-# IntelliJ Platform Gradle Plugin sandbox / caches
-.intellijPlatform/
-# IDE project metadata
-.idea/
-*.iml
-out/

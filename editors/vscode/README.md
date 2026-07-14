@@ -1,9 +1,13 @@
 # luabox for VS Code
 
-First-class VS Code support for the [luabox](https://github.com/luabox/luabox)
-Lua toolchain. This extension is a thin wrapper around the `luabox lsp`
-language server: typecheck, lint, hover, goto-definition, completion, document
-symbols, formatting and semantic highlighting for `.lua` sources.
+First-class VS Code support for the
+[luabox](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox) Lua
+toolchain. This extension is a thin wrapper around the `luabox lsp`
+language server: typecheck + lint diagnostics with quick-fixes, hover,
+completion (incl. auto-require imports), goto definition/type-definition/
+implementation, find-references, rename, symbols, signature help, call
+hierarchy, inlay hints, formatting and semantic highlighting for `.lua`
+sources.
 
 ## What it provides
 

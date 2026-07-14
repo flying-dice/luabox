@@ -1,5 +1,0 @@
-/target/
-*.wasm
-# Zed compiles the grammar + extension on install; the built wasm is not committed.
-grammars/
-extension.wasm

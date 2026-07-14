@@ -1,9 +1,0 @@
-<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <!-- luabox .lua file-type icon: a "box" holding code ({ }). -->
-  <rect x="1" y="1" width="14" height="14" rx="3" fill="#6D5AE6"/>
-  <path d="M6.4 4.2c-1.15 0-1.7.5-1.7 1.6v1.1c0 .55-.25.85-.85.85v1.5c.6 0 .85.3.85.85v1.1c0 1.1.55 1.6 1.7 1.6"
-        stroke="#FFFFFF" stroke-width="1.1" stroke-linecap="round" fill="none"/>
-  <path d="M9.6 4.2c1.15 0 1.7.5 1.7 1.6v1.1c0 .55.25.85.85.85v1.5c-.6 0-.85.3-.85.85v1.1c0 1.1-.55 1.6-1.7 1.6"
-        stroke="#FFFFFF" stroke-width="1.1" stroke-linecap="round" fill="none"/>
-  <circle cx="8" cy="8" r="1" fill="#FFFFFF"/>
-</svg>
