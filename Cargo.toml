@@ -4,7 +4,7 @@ members = ["crates/*"]
 exclude = ["tools/*", "fuzz"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/flying-dice/luabox"
@@ -13,18 +13,18 @@ rust-version = "1.92"
 [workspace.dependencies]
 # Intra-workspace (bounded contexts — see SPEC.md §16; luabox-diag is a
 # cross-cutting support crate like rustc_errors, not a bounded context)
-luabox-diag = { path = "crates/luabox-diag", version = "0.1.0" }
-luabox-syntax = { path = "crates/luabox-syntax", version = "0.1.0" }
-luabox-hir = { path = "crates/luabox-hir", version = "0.1.0" }
-luabox-types = { path = "crates/luabox-types", version = "0.1.0" }
-luabox-db = { path = "crates/luabox-db", version = "0.1.0" }
-luabox-lower = { path = "crates/luabox-lower", version = "0.1.0" }
-luabox-bundle = { path = "crates/luabox-bundle", version = "0.1.0" }
-luabox-resolve = { path = "crates/luabox-resolve", version = "0.1.0" }
-luabox-store = { path = "crates/luabox-store", version = "0.1.0" }
-luabox-lint = { path = "crates/luabox-lint", version = "0.1.0" }
-luabox-lsp = { path = "crates/luabox-lsp", version = "0.1.0" }
-luabox-test = { path = "crates/luabox-test", version = "0.1.0" }
+luabox-diag = { path = "crates/luabox-diag", version = "0.1.1" }
+luabox-syntax = { path = "crates/luabox-syntax", version = "0.1.1" }
+luabox-hir = { path = "crates/luabox-hir", version = "0.1.1" }
+luabox-types = { path = "crates/luabox-types", version = "0.1.1" }
+luabox-db = { path = "crates/luabox-db", version = "0.1.1" }
+luabox-lower = { path = "crates/luabox-lower", version = "0.1.1" }
+luabox-bundle = { path = "crates/luabox-bundle", version = "0.1.1" }
+luabox-resolve = { path = "crates/luabox-resolve", version = "0.1.1" }
+luabox-store = { path = "crates/luabox-store", version = "0.1.1" }
+luabox-lint = { path = "crates/luabox-lint", version = "0.1.1" }
+luabox-lsp = { path = "crates/luabox-lsp", version = "0.1.1" }
+luabox-test = { path = "crates/luabox-test", version = "0.1.1" }
 
 # External
 rowan = "0.16"
@@ -40,6 +40,7 @@ crossbeam-channel = "0.5"
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1"
 rayon = "1"
+self-replace = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml_edit = { version = "0.22", features = ["serde"] }

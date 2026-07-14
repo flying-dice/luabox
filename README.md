@@ -175,6 +175,7 @@ anything load-bearing.
 | `publish` / `audit` | registry publish with yank; advisory-DB audit |
 | `run` | `[tasks]` entries or scripts via the resolved runtime |
 | `toolchain` | install/pin/list managed Lua runtimes |
+| `upgrade` | self-update from GitHub releases (`luabox upgrade` for latest, or a specific `v0.1.1`), checksum-verified |
 | `lsp` | language server: diagnostics + quick-fixes, completion (auto-require), hover, goto def/type/impl, references, rename, symbols, signature help, call hierarchy, inlay hints, semantic tokens, formatting |
 | `doc` | static docs from annotations |
 | `explain LBnnnn` | rustc-style diagnostic pages |

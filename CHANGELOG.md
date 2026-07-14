@@ -10,6 +10,18 @@ spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
 
 Nothing yet — changes land here between releases.
 
+## [0.1.1] - 2026-07-14
+
+### Added
+
+- `luabox upgrade [VERSION]` — replace the running binary with a GitHub
+  release build: resolves the latest tag (or installs the given one),
+  downloads the platform asset, verifies it against the release's
+  `SHA256SUMS`, and self-replaces in place (on Windows via the
+  rename-aside dance, since a running executable cannot be overwritten).
+  The release pipeline's smoke gate now exercises the upgrade on all
+  three OSes before a release goes `latest`.
+
 ## [0.1.0] - 2026-07-14
 
 The first public release: the full command surface works end to end against
