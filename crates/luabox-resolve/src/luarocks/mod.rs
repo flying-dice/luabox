@@ -454,7 +454,7 @@ impl PackageProvider for LuaRocksProvider {
                 // `lua` is the interpreter, not a rock: handled as metadata.
                 continue;
             }
-            let requirement = translate_constraint(constraints).requirement;
+            let requirement = translate_constraint(constraints);
             deps.insert(
                 format!("{LUAROCKS_PREFIX}{name}"),
                 Dependency::Version(requirement),
@@ -532,7 +532,7 @@ fn lua_dialects(spec: &Rockspec) -> Vec<String> {
     let Some(constraints) = lua_constraint else {
         return Vec::new();
     };
-    let Ok(req) = VersionReq::parse(&translate_constraint(constraints).requirement) else {
+    let Ok(req) = VersionReq::parse(&translate_constraint(constraints)) else {
         return Vec::new();
     };
     let mut out = Vec::new();

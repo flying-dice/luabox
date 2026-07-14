@@ -39,49 +39,9 @@
 //! so it is expanded to explicit `>=`/`<` comparators here.
 //!
 //! `~=`/`!=` (not-equal) has no single-comparator semver form; rather than
-//! fail resolution on a rarely used operator it is widened to "any version"
-//! and reported as lossy. Callers may surface [`Lossiness`] as a warning.
+//! fail resolution on a rarely used operator it is widened to "any version".
 
 use semver::Version;
-
-/// A translated constraint plus any information lost in translation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Translated {
-    /// A Cargo-style requirement string (parseable by
-    /// [`semver::VersionReq`]). `*` means "any version".
-    pub requirement: String,
-    /// Non-empty when the translation could not be represented faithfully.
-    pub lossiness: Vec<Lossiness>,
-}
-
-/// A specific way a LuaRocks constraint could not be represented in semver.
-// TODO: clean-code - 0.55 - KISS: speculative warning infrastructure with no
-// consumer — ExtraComponentDropped is never constructed (the flag feeding it
-// is discarded), and Translated.lossiness is read only by tests; both
-// production call sites take .requirement and drop .lossiness. Either
-// surface it as a real warning or strip it and return a plain String.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Lossiness {
-    /// A `~=`/`!=` (not-equal) constraint was widened to any version.
-    NotEqualWidened { operand: String },
-    /// A version component beyond the third was dropped.
-    ExtraComponentDropped { version: String },
-}
-
-impl std::fmt::Display for Lossiness {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotEqualWidened { operand } => write!(
-                f,
-                "the `~=`/`!=` constraint on `{operand}` has no semver equivalent and was widened to any version"
-            ),
-            Self::ExtraComponentDropped { version } => write!(
-                f,
-                "version `{version}` has more than three components; the extras were dropped"
-            ),
-        }
-    }
-}
 
 /// Translates a LuaRocks version string into a semver [`Version`], or `None`
 /// when it has no numeric leading component (e.g. `scm`, `dev`).
@@ -90,22 +50,20 @@ impl std::fmt::Display for Lossiness {
 /// dropped (see the module docs).
 #[must_use]
 pub fn translate_version(luarocks: &str) -> Option<Version> {
-    let (components, _extra) = version_components(luarocks)?;
+    let components = version_components(luarocks)?;
     Some(Version::new(components[0], components[1], components[2]))
 }
 
-/// Parses the numeric `[major, minor, patch]` of a LuaRocks version (padding
-/// with zeros), returning it plus whether extra components were dropped.
+/// Parses the numeric `[major, minor, patch]` of a LuaRocks version, padding
+/// missing components with zeros and dropping any 4th-and-beyond components.
 ///
 /// Returns `None` when the version has no leading numeric component.
-fn version_components(luarocks: &str) -> Option<([u64; 3], bool)> {
+fn version_components(luarocks: &str) -> Option<[u64; 3]> {
     // Drop the `-ROCKREV` packaging suffix if present.
     let core = luarocks.split('-').next().unwrap_or(luarocks);
-    let mut parts = core.split('.');
     let mut out = [0u64; 3];
-    let mut count = 0usize;
     let mut had_numeric = false;
-    for (i, part) in parts.by_ref().enumerate() {
+    for (i, part) in core.split('.').enumerate() {
         let Ok(number) = part.parse::<u64>() else {
             // First component must be numeric; a non-numeric first part
             // (e.g. `scm`) has no semver image.
@@ -117,37 +75,27 @@ fn version_components(luarocks: &str) -> Option<([u64; 3], bool)> {
         had_numeric = true;
         if i < 3 {
             out[i] = number;
-            count = i + 1;
         } else {
             // A 4th+ numeric component: dropped.
-            return Some((out, true));
+            return Some(out);
         }
     }
-    if !had_numeric {
-        return None;
-    }
-    let _ = count;
-    Some((out, false))
+    had_numeric.then_some(out)
 }
 
 /// Translates a full LuaRocks constraint list (the part of a dependency
 /// string after the rock name, e.g. `">= 1.0, < 2.0"`) into a Cargo
-/// requirement string.
+/// requirement string. `*` means "any version".
 ///
 /// An empty constraint (`""`) means "any version" → `*`.
 #[must_use]
-pub fn translate_constraint(constraints: &str) -> Translated {
+pub fn translate_constraint(constraints: &str) -> String {
     let trimmed = constraints.trim();
     if trimmed.is_empty() {
-        return Translated {
-            requirement: "*".to_owned(),
-            lossiness: Vec::new(),
-        };
+        return "*".to_owned();
     }
 
     let mut comparators: Vec<String> = Vec::new();
-    let mut lossiness: Vec<Lossiness> = Vec::new();
-    let mut any = false;
 
     for raw in trimmed.split(',') {
         let piece = raw.trim();
@@ -156,31 +104,22 @@ pub fn translate_constraint(constraints: &str) -> Translated {
         }
         match translate_one(piece) {
             OneConstraint::Comparators(mut cs) => comparators.append(&mut cs),
-            OneConstraint::Any(loss) => {
-                any = true;
-                if let Some(loss) = loss {
-                    lossiness.push(loss);
-                }
-            }
+            // A `~=`/`!=` sub-constraint widens to "any"; it contributes no
+            // comparator, so if nothing else narrows the requirement it stays `*`.
+            OneConstraint::Any => {}
         }
     }
 
-    // If any sub-constraint widened to "any" and nothing else narrowed it,
-    // the whole requirement is any.
-    let requirement = if comparators.is_empty() || (any && comparators.is_empty()) {
+    if comparators.is_empty() {
         "*".to_owned()
     } else {
         comparators.join(", ")
-    };
-    Translated {
-        requirement,
-        lossiness,
     }
 }
 
 enum OneConstraint {
     Comparators(Vec<String>),
-    Any(Option<Lossiness>),
+    Any,
 }
 
 fn translate_one(piece: &str) -> OneConstraint {
@@ -192,9 +131,7 @@ fn translate_one(piece: &str) -> OneConstraint {
     match op {
         ">=" | ">" | "<=" | "<" => OneConstraint::Comparators(vec![format!("{op}{version}")]),
         "==" | "=" | "" => OneConstraint::Comparators(vec![format!("={version}")]),
-        "~=" | "!=" => OneConstraint::Any(Some(Lossiness::NotEqualWidened {
-            operand: operand.to_owned(),
-        })),
+        "~=" | "!=" => OneConstraint::Any,
         "~>" => OneConstraint::Comparators(pessimistic(version)),
         _ => {
             // Unknown operator: be conservative and pin exactly.
@@ -287,13 +224,11 @@ mod tests {
         ];
         for (input, expected) in cases {
             let got = translate_constraint(input);
-            assert_eq!(got.requirement, expected, "constraint `{input}`");
+            assert_eq!(got, expected, "constraint `{input}`");
             assert!(
-                VersionReq::parse(&got.requirement).is_ok(),
-                "produced req `{}` for `{input}` must parse",
-                got.requirement
+                VersionReq::parse(&got).is_ok(),
+                "produced req `{got}` for `{input}` must parse"
             );
-            assert!(got.lossiness.is_empty(), "`{input}` should be lossless");
         }
     }
 
@@ -301,41 +236,33 @@ mod tests {
     fn pessimistic_is_a_prefix_match() {
         // ~> 2.5 matches 2.5.x but not 2.6.
         let got = translate_constraint("~> 2.5");
-        assert_eq!(got.requirement, ">=2.5.0, <2.6.0");
-        let req = VersionReq::parse(&got.requirement).unwrap();
+        assert_eq!(got, ">=2.5.0, <2.6.0");
+        let req = VersionReq::parse(&got).unwrap();
         assert!(req.matches(&Version::new(2, 5, 0)));
         assert!(req.matches(&Version::new(2, 5, 9)));
         assert!(!req.matches(&Version::new(2, 6, 0)));
 
         // ~> 2.5.3 matches only 2.5.3.
         let got = translate_constraint("~> 2.5.3");
-        assert_eq!(got.requirement, ">=2.5.3, <2.5.4");
-        let req = VersionReq::parse(&got.requirement).unwrap();
+        assert_eq!(got, ">=2.5.3, <2.5.4");
+        let req = VersionReq::parse(&got).unwrap();
         assert!(req.matches(&Version::new(2, 5, 3)));
         assert!(!req.matches(&Version::new(2, 5, 4)));
 
         // ~> 2 matches 2.x.x but not 3.
         let got = translate_constraint("~> 2");
-        assert_eq!(got.requirement, ">=2.0.0, <3.0.0");
+        assert_eq!(got, ">=2.0.0, <3.0.0");
     }
 
     #[test]
-    fn not_equal_is_lossy_and_widens() {
-        let got = translate_constraint("~= 1.0");
-        assert_eq!(got.requirement, "*");
-        assert_eq!(
-            got.lossiness,
-            vec![Lossiness::NotEqualWidened {
-                operand: "1.0".to_owned()
-            }]
-        );
-        let got = translate_constraint("!= 2.3");
-        assert_eq!(got.requirement, "*");
-        assert_eq!(got.lossiness.len(), 1);
+    fn not_equal_widens_to_any() {
+        // `~=`/`!=` have no semver equivalent and widen to "any version".
+        assert_eq!(translate_constraint("~= 1.0"), "*");
+        assert_eq!(translate_constraint("!= 2.3"), "*");
     }
 
     #[test]
     fn constraint_operand_rock_revision_stripped() {
-        assert_eq!(translate_constraint(">= 1.4.1-3").requirement, ">=1.4.1");
+        assert_eq!(translate_constraint(">= 1.4.1-3"), ">=1.4.1");
     }
 }
