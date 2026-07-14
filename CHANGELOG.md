@@ -70,9 +70,20 @@ closest overload (#119), contextual (bidirectional) typing of
 function-literal parameters (#120), union exhaustiveness for `if`/`elseif`
 chains (LB0315, #121), `---@operator call` (#122), generic-arity checking
 for generic `---@class<T>` (LB0313, #124), member visibility
-`---@private`/`---@protected`/`---@package` (LB0312), `---@operator`
+`---@private`/`---@protected`/`---@package` (LB0312, incl. bare
+`Carrier.method = fn` assignment carriers), `---@operator`
 overloads in inference, and `deprecated`/`discard-returns`/duplicate-doc
 diagnostics (luals parity).
+
+With that, the **full LuaCATS tag vocabulary is enforced** — the last
+parsed-but-ignored tags now check: legacy `---@vararg` (wired to inference,
+unioning with `---@param ...` per luals), `---@async` (luals `await-in-sync`,
+LB0316; the main chunk counts as async), `---@version` (edition gating at
+use sites riding the `deprecated` diagnostic, with luals's `>`/`<`/`JIT`
+grammar and 5.1⇒LuaJIT rule), `---@source` (goto-definition redirect), and
+`---@see` (hover + docgen "See also"). Contextual typing also deepened:
+expected types flow into table literals, `return` positions, and nested
+function-literal layers (luals `compileNode` parity).
 
 ### Dialects & lowering
 

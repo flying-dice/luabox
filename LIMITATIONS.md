@@ -25,29 +25,35 @@ bare `---@alias A A`) is reported as `LB0314`, at the alias's own declaration
 do — the recursive edge itself still terminates safely, lowering to
 `unknown` rather than recursing, matching luals' `cyclic-alias` diagnostic.
 
-### LuaCATS tags that parse but are not yet enforced
+### LuaCATS tags: the full vocabulary is enforced
 
-luabox parses the full LuaCATS tag vocabulary (so annotated code and definition
-packages load unchanged), but a few tags do not yet influence checking. They
-are accepted and ignored rather than rejected:
-
-| Tag | Status in `check` / `lint` |
-|---|---|
-| `---@async` | Parsed; no async/await checking. |
-| `---@vararg` (legacy standalone form) | Parsed; the legacy standalone tag is not wired to inference (the `---@param ...` form is the modern spelling). |
-| `---@version`, `---@source`, `---@see` | Metadata; ignored by checking (some surface in `luabox doc`). |
-
-Tags that **are** enforced today: `---@class` (incl. `: Parent` conformance),
-`---@field` (incl. `duplicate-doc-field`), `---@param`, `---@return`,
-`---@type`, `---@alias` (same-file, defs, and cross-file by name, incl.
+Every LuaCATS tag now influences checking, navigation, or docs — nothing is
+parsed-but-ignored: `---@class` (incl. `: Parent` conformance), `---@field`
+(incl. `duplicate-doc-field`), `---@param`, `---@return`, `---@type`,
+`---@alias` (same-file, defs, and cross-file by name, incl.
 `duplicate-doc-alias`), `---@generic`, `---@enum`, `---@overload`, `---@cast`,
 `---@meta`, `---@deprecated` (use sites diagnosed, luals `deprecated`),
 `---@nodiscard` (discarded returns diagnosed, luals `discard-returns`),
 `---@operator` (overload result types applied during inference, luals parity),
 `---@private` / `---@protected` / `---@package` (member visibility enforced,
-luals `invisible` — `LB0312`, both the `---@field <scope>` modifier and the
-standalone tag on a `function Class:method` doc block),
-`---@diagnostic` (lint + checker suppression), and inline `--[[@as T]]`.
+luals `invisible` — `LB0312`, via the `---@field <scope>` modifier, the
+standalone tag on a `function Class:method` block, and on a bare
+`Carrier.method = function() … end` assignment), `---@diagnostic` (lint +
+checker suppression), inline `--[[@as T]]`, `---@vararg` (the legacy spelling
+of `---@param ... T`; both on one block union, matching luals), `---@async`
+(calls from non-async functions warn as luals `await-in-sync`, `LB0316`;
+top-level calls are fine — the main chunk is an async context),
+`---@version` (a symbol whose version set excludes the project `edition`
+warns at use sites as luals does, riding the `deprecated` diagnostic —
+`>5.2`/`JIT`/comma lists, and 5.1 implies LuaJIT), `---@source`
+(goto-definition redirects to the annotated location), and `---@see`
+(rendered in hover and as linked "See also" sections in `luabox doc`).
+
+Deliberate parity boundaries (luals behaves the same way): async-ness never
+*propagates* (only an explicit `---@async` tag counts, matching luals's
+default `awaitPropagate = false`), and using a `---@deprecated` class purely
+as a type annotation is not flagged — luals's `deprecated` diagnostic also
+fires only on value/call use sites.
 
 One edge of member visibility (`LB0312`) is deliberately conservative. Whether
 an access is "inside the class" is judged from the enclosing **carrier method**
@@ -56,9 +62,7 @@ rule; and `---@package` scopes to the file that declares the member's **class**
 (so a class split across files treats every declaring file as in-package). Where
 the receiver's class cannot be resolved to a single `---@class` — a union, or a
 plain inferred table — no `invisible` is raised, keeping false positives out at
-the cost of a few false negatives. The standalone tag is associated to its class
-through the `function Carrier:method` path; a visibility tag on a bare
-`Carrier.method = function() … end` assignment is not yet wired.
+the cost of a few false negatives.
 
 A `:` method call whose receiver resolves (through inference) to a single
 declared `---@class` is now argument-checked against the method's signature and
@@ -66,8 +70,9 @@ flags a `---@deprecated` method at the call site (#118), the same as a
 dotted/free call. Resolution is deliberately conservative: when the receiver is
 not a single declared class — an unknown/`any`/union receiver, a plain inferred
 table, an unannotated method, or an unresolved metatable — the `:` call is left
-unchecked (no false positives). One `---@deprecated` edge remains uncovered: a
-class type used purely as an annotation (not through a value use site).
+unchecked (no false positives). A `---@deprecated` class used purely as a type
+annotation (not through a value use site) is not flagged — deliberate luals
+parity; its `deprecated` diagnostic also fires only on value/call use sites.
 
 Every operator luals supports applies. Binary/unary operator *expressions*
 (`add`, `sub`, `mul`, `div`, `mod`, `pow`, `idiv`, `concat`, `band`, `bor`,

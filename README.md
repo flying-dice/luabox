@@ -149,10 +149,10 @@ integrations may return later.
 
 ## Limitations
 
-luabox 0.1 is alpha software with real gaps — `test --coverage` is not
-implemented, there is no hosted package registry, and a few LuaCATS tags parse
-but are not yet enforced. Every one is
-documented honestly, with its tracking issue, in
+luabox 0.1 is alpha software — `test`/`bench` are deprecated (luabox is a
+toolchain, not a runtime), there is no hosted package registry, and prebuilt
+binaries/marketplace listings await the first tagged release. The full LuaCATS
+tag vocabulary is enforced. Every remaining gap is documented honestly in
 [**LIMITATIONS.md**](LIMITATIONS.md). Read it before you rely on luabox for
 anything load-bearing.
 
