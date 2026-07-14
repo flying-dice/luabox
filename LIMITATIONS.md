@@ -166,21 +166,29 @@ configured. Set LUABOX_REGISTRY to your registry's location …
 
 ### Editor extensions are not on marketplaces yet (#102)
 
-The VS Code integration is packaged but not yet published to the VS Code
-Marketplace or Open VSX. Install from the built `.vsix` as described in its
-README under [`editors/vscode/`](editors/vscode/). (JetBrains, Neovim, and
-Zed integrations were removed for now — any LSP client can still be pointed
-at `luabox lsp` manually.)
+The VS Code integration is packaged and the `.vsix` is attached to every
+[GitHub release](https://github.com/flying-dice/luabox/releases), so you can
+install it today — but it is not yet published to the VS Code Marketplace or
+Open VSX. Grab the `.vsix` from the latest release (or build it per the README
+under [`editors/vscode/`](editors/vscode/)) and install it into VS Code. The
+Marketplace/Open VSX upload is the only residual step and is pending a
+publisher account/token this repo doesn't hold. (JetBrains, Neovim, and Zed
+integrations were removed for now — any LSP client can still be pointed at
+`luabox lsp` manually.)
 
-### Prebuilt binaries arrive with the first tagged release (#95)
+### Prebuilt binaries (#95 — shipped)
 
-The install scripts ([`scripts/install.sh`](scripts/install.sh),
-[`scripts/install.ps1`](scripts/install.ps1)) download a prebuilt binary from
-the latest GitLab release. Until the first `v*` tag is published there are no
-release assets, so the scripts detect this and exit with a pointer to the
-build-from-source fallback (`cargo install --git … luabox-cli`). They do **not**
-build from source themselves — they fetch a release binary or tell you how to
-build one.
+Prebuilt binaries ship as of v0.1.0. Every `v*` tag publishes a
+[GitHub release](https://github.com/flying-dice/luabox/releases) with binaries
+for Linux x86_64, macOS Apple Silicon, and Windows x86_64 (plus `SHA256SUMS`),
+and the release goes `latest` only after those binaries pass a smoke install on
+all three OSes. The install scripts
+([`scripts/install.sh`](scripts/install.sh),
+[`scripts/install.ps1`](scripts/install.ps1)) download the binary for your
+platform from the latest release; they do **not** build from source — if you
+want that, use `cargo install --git https://github.com/flying-dice/luabox luabox-cli`.
+The remaining gap is only reach: not yet on crates.io, Homebrew, or other
+package managers.
 
 ## Stability expectation for 0.x
 

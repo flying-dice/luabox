@@ -7,7 +7,7 @@ exclude = ["tools/*", "fuzz"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://gitlab.beluga-sirius.ts.net/flying-dice/luabox"
+repository = "https://github.com/flying-dice/luabox"
 rust-version = "1.92"
 
 [workspace.dependencies]

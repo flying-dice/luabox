@@ -29,17 +29,24 @@ class arity (#124) — and the LSP feature build-out: find-references,
 rename, workspace symbols, signature help, goto type-def/impl, lint
 diagnostics + autofixes, code actions, call hierarchy, document
 highlight/folding/selection ranges, auto-require import completion, and
-protocol maturity (#125–#135).
+protocol maturity (#125–#135). The VS Code status bar item (#138) lands
+in v0.1.0.
 
 ### Still open
 
-- [#95](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/95)
-  End-user installation: prebuilt binaries — needs the first `v*` tag to
-  exercise the CI release stage; install scripts are in place.
 - [#102](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/102)
-  Distribute the editor integrations — reduced to VS Code only for now;
-  packaging done; open for the credential-gated publish steps
-  (Marketplace/Open VSX tokens, release attachments).
+  Distribute the editor integrations — reduced to VS Code only for now; the
+  `.vsix` now ships as a GitHub release asset, so install works today. Open
+  only for the residual credential-gated Marketplace/Open VSX upload, which
+  needs the publisher account/token this environment doesn't hold.
+
+### Closed by this release
+
+- [#95](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/95)
+  End-user installation: prebuilt binaries — done. The v0.1.0 `v*` tag
+  exercised the GitHub release pipeline end to end; prebuilt binaries for
+  Linux/macOS/Windows now ship as smoke-gated release assets and the install
+  scripts resolve them.
 
 ## Post-launch
 

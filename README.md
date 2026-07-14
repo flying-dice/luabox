@@ -80,32 +80,32 @@ demo.
 
 ## Install
 
-Prebuilt binaries are attached to tagged GitLab releases (`v*`, built by
-`.gitlab-ci.yml`'s `release` stage — see [RELEASING.md](RELEASING.md)). The
-install scripts fetch the latest one:
+Prebuilt binaries and the VS Code `.vsix` are attached to every tagged
+[GitHub release](https://github.com/flying-dice/luabox/releases) (`v*`, built
+by [`.github/workflows/release.yml`](.github/workflows/release.yml) — see
+[RELEASING.md](RELEASING.md)). The one-line installers fetch the latest one:
 
 ```sh
 # Linux / macOS
-curl -fsSL https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/raw/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/flying-dice/luabox/main/scripts/install.sh | bash
 ```
 
 ```powershell
 # Windows
-irm https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/raw/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/flying-dice/luabox/main/scripts/install.ps1 | iex
 ```
 
-Prebuilt binaries land with the first tagged release (#95). Until then — or if
-you just want the tip of `main` — the scripts point you at building from
-source:
+Each release ships prebuilt binaries for **Linux x86_64**, **macOS Apple
+Silicon**, and **Windows x86_64**, plus the VS Code extension `.vsix`, with
+`SHA256SUMS` alongside them.
+
+To build from source instead — or to track the tip of `main`:
 
 ```sh
-cargo install --git ssh://git@gitlab.beluga-sirius.ts.net/flying-dice/luabox.git luabox-cli
+cargo install --git https://github.com/flying-dice/luabox luabox-cli
 # or, from a checkout:
 cargo build --release            # target/release/luabox
 ```
-
-Both scripts fetch from the GitLab releases API and fail with a clear message
-(rather than silently doing nothing) if no release has been tagged yet.
 
 ## Why luabox
 
@@ -143,16 +143,18 @@ folding and selection ranges; `.lua` files). It is a TypeScript extension:
 It resolves the `luabox` binary from `PATH` (overridable via settings) and
 launches it as `luabox lsp`. It is not on the Marketplace yet
 ([#102](LIMITATIONS.md#editor-extensions-are-not-on-marketplaces-yet-102)) —
-install from the built `.vsix` per its README. Other editors (Neovim,
+install the `.vsix` attached to each GitHub release (or build your own per its
+README). Other editors (Neovim,
 JetBrains, Zed) can point any LSP client at `luabox lsp`; dedicated
 integrations may return later.
 
 ## Limitations
 
 luabox 0.1 is alpha software — `test`/`bench` are deprecated (luabox is a
-toolchain, not a runtime), there is no hosted package registry, and prebuilt
-binaries/marketplace listings await the first tagged release. The full LuaCATS
-tag vocabulary is enforced. Every remaining gap is documented honestly in
+toolchain, not a runtime), there is no hosted package registry, and the VS Code
+extension is not yet on the Marketplace/Open VSX (the `.vsix` ships as a release
+asset). The full LuaCATS tag vocabulary is enforced. Every remaining gap is
+documented honestly in
 [**LIMITATIONS.md**](LIMITATIONS.md). Read it before you rely on luabox for
 anything load-bearing.
 
@@ -231,12 +233,13 @@ fixture projects — the executable spec (SPEC.md §16.2).
 
 ## Status
 
-**0.1.0** — the full command surface works end to end. Alpha quality: the
-executable spec drives the real binary through cucumber scenarios, perf gates
-block CI, and lowering is verified by differential execution against real
-runtimes in CI. Not yet published to any package registry (crates.io, Homebrew,
-etc.) — install a prebuilt binary or build from source. Luau is explicitly out
-of scope. See [LIMITATIONS.md](LIMITATIONS.md) for known gaps.
+**0.1.0** — released 2026-07-14, the full command surface works end to end.
+Alpha quality: the executable spec drives the real binary through cucumber
+scenarios, perf gates block CI, and lowering is verified by differential
+execution against real runtimes in CI. Prebuilt binaries and the VS Code
+`.vsix` are attached to each [GitHub release](https://github.com/flying-dice/luabox/releases);
+not yet published to a package registry (crates.io, Homebrew, etc.). Luau is
+explicitly out of scope. See [LIMITATIONS.md](LIMITATIONS.md) for known gaps.
 
 ## License
 

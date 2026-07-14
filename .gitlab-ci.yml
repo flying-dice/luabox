@@ -1,15 +1,17 @@
-# GitLab CI for the canonical remote
-# (gitlab.beluga-sirius.ts.net:flying-dice/luabox). Mirrors
-# .github/workflows/ci.yml's `check` job (fmt/clippy/test); GitHub Actions
-# stays the belt-and-braces runner for that job until this pipeline has
-# proven itself. See ticket #94.
+# GitLab CI for the private origin
+# (gitlab.beluga-sirius.ts.net:flying-dice/luabox). Internal check/test only.
+# Mirrors .github/workflows/ci.yml's `check` job (fmt/clippy/test).
+#
+# Releases are NOT cut here: the release pipeline of record is
+# .github/workflows/release.yml on the public GitHub remote
+# (github.com/flying-dice/luabox) — tag build + binaries + .vsix + SHA256SUMS
+# + smoke-gated go-live. See RELEASING.md. See ticket #94.
 #
 # Divergence from .github/workflows/ci.yml (intentional, noted here rather
 # than silently dropped):
 #   - No `os` matrix for `check`/`test` — this pipeline runs on whatever
 #     Linux shared runner the instance provides. Windows/macOS coverage
-#     lives only in the `release` stage's build jobs below (allow_failure,
-#     runner-tag gated), not as a check gate.
+#     lives on GitHub Actions, not as a check gate here.
 #   - `perf-gates` (scripts/perf-gate.sh) and `examples` (scripts/examples.sh)
 #     are not mirrored. Both need a stable, unshared runner (perf budgets)
 #     and/or a provisioned Lua 5.1 + unzip toolchain (examples); GitHub
@@ -19,7 +21,6 @@
 stages:
   - check
   - test
-  - release
 
 variables:
   CARGO_TERM_COLOR: always
@@ -48,11 +49,9 @@ workflow:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == "main"'
-    - if: '$CI_COMMIT_TAG =~ /^v/'
 
-# check/test jobs run for MRs and pushes to main only (not tag pipelines —
-# a tag is cut from an already-green main, so re-running check/test there
-# just burns CI minutes; the release stage below is tag-only instead).
+# check/test jobs run for MRs and pushes to main. Tag pipelines are handled
+# by GitHub Actions (.github/workflows/release.yml), not here.
 .check_rules: &check_rules
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
@@ -91,109 +90,6 @@ test:
   script:
     - cargo test --workspace
 
-# --- release -----------------------------------------------------------
-# Triggered on `v*` tags only (see workflow: rules above — this whole
-# pipeline only runs for tag pipelines when the tag matches ^v). Produces
-# a Linux release binary plus a GitLab Release with notes lifted from
-# CHANGELOG.md. See RELEASING.md for the human-side process this
-# automates.
-
-.release_rules: &release_rules
-  rules:
-    - if: '$CI_COMMIT_TAG =~ /^v/'
-
-build-linux:
-  stage: release
-  <<: *release_rules
-  script:
-    - cargo build --release --workspace
-    - mkdir -p dist
-    - cp target/release/luabox dist/luabox-x86_64-linux
-  artifacts:
-    paths:
-      - dist/luabox-x86_64-linux
-    expire_in: never
-
-# Windows/macOS release builds: structured to run, but `allow_failure: true`
-# and runner-tagged, because this GitLab instance is not guaranteed to have
-# Windows/macOS runners registered. Whoever wires those up for real needs to:
-#   1. Register a runner tagged `windows` (Windows Server, MSVC toolchain,
-#      rustup preinstalled) and/or `macos` (universal, rustup preinstalled).
-#   2. Drop the `allow_failure: true` once that runner is confirmed healthy.
-#   3. These jobs deliberately don't set `image:` — a Windows/macOS runner
-#      is almost always a shell executor (native VM/host), where `image:`
-#      is ignored, rather than the Docker executor `check`/`test` use via
-#      the top-level `default: image: rust:1.92`. If the registered runner
-#      instead uses a Docker executor with Windows containers, add an
-#      explicit `image:` override here.
-#   4. `mkdir -p`/`cp` below assume a bash-capable shell (Git Bash/WSL on
-#      the Windows runner). Swap to PowerShell (`New-Item`/`Copy-Item`) if
-#      the runner's shell executor is `pwsh`/`powershell` instead.
-build-windows:
-  stage: release
-  <<: *release_rules
-  tags: [windows]
-  allow_failure: true
-  script:
-    - cargo build --release --workspace
-    - mkdir -p dist
-    - cp target/release/luabox.exe dist/luabox-x86_64-windows.exe
-  artifacts:
-    paths:
-      - dist/luabox-x86_64-windows.exe
-    expire_in: never
-
-build-macos:
-  stage: release
-  <<: *release_rules
-  tags: [macos]
-  allow_failure: true
-  script:
-    - cargo build --release --workspace
-    - mkdir -p dist
-    - cp target/release/luabox dist/luabox-x86_64-macos
-  artifacts:
-    paths:
-      - dist/luabox-x86_64-macos
-    expire_in: never
-
-# Attaches whatever `dist/luabox-*` artifacts the build jobs above produced
-# (at minimum build-linux's, which is not allow_failure) to a GitLab
-# Release, with notes pulled from the matching CHANGELOG.md entry.
-release:
-  stage: release
-  <<: *release_rules
-  image: registry.gitlab.com/gitlab-org/release-cli:latest
-  needs:
-    - job: build-linux
-      artifacts: true
-    - job: build-windows
-      artifacts: true
-      optional: true
-    - job: build-macos
-      artifacts: true
-      optional: true
-  script:
-    - apk add --no-cache gawk
-    - version="${CI_COMMIT_TAG#v}"
-    # Extract the `## [x.y.z]` section from CHANGELOG.md as the release
-    # notes body (Keep a Changelog format — see CHANGELOG.md/RELEASING.md).
-    - >
-      awk -v ver="$version" '
-        BEGIN { found = 0 }
-        /^## \[/ {
-          if (found) exit
-          if ($0 ~ "\\[" ver "\\]") { found = 1; next }
-        }
-        found { print }
-      ' CHANGELOG.md > release-notes.md
-    - test -s release-notes.md || echo "(no CHANGELOG.md entry found for ${version})" > release-notes.md
-    - cat release-notes.md
-  release:
-    tag_name: $CI_COMMIT_TAG
-    name: "luabox $CI_COMMIT_TAG"
-    description: release-notes.md
-    assets:
-      links:
-        - name: luabox-x86_64-linux
-          url: "${CI_PROJECT_URL}/-/jobs/${CI_JOB_ID}/artifacts/raw/dist/luabox-x86_64-linux"
+# Release automation intentionally lives on GitHub, not here — the release
+# pipeline of record is .github/workflows/release.yml (tag build + binaries +
+# .vsix + SHA256SUMS + smoke-gated go-live). See RELEASING.md.

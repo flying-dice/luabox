@@ -10,12 +10,12 @@ spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
 
 Nothing yet — changes land here between releases.
 
-## [0.1.0] - drafted, unreleased
+## [0.1.0] - 2026-07-14
 
 The first public release: the full command surface works end to end against
 real Lua sources, driven by an executable spec of cucumber scenarios. Alpha
-quality — see the caveats below and [BACKLOG.md](BACKLOG.md) for what's
-still open before this tag is actually cut.
+quality — see the caveats below and [BACKLOG.md](BACKLOG.md) for what remains
+open post-launch.
 
 ### Toolchain
 
@@ -105,18 +105,46 @@ document & workspace symbols (#131), signature help (#127), type-driven
 code actions (#129), call hierarchy (#130), document highlight, folding
 and selection ranges (#133), inlay hints, semantic tokens, document and
 range formatting, plus protocol maturity — incremental sync, config
-reload, file watching, and progress reporting (#135).
+reload, file watching, and progress reporting (#135). `require`
+resolution is single-sourced across `check`, `bundle`, and the LSP, so
+goto-definition on a `require(...)` lands on the same module the checker
+and bundler resolve.
 
 One editor integration wraps it: VS Code (`editors/vscode/`), a
 first-class TypeScript extension. (Neovim, JetBrains, and Zed
 integrations were removed for now — any LSP client can be pointed at
 `luabox lsp` manually.)
 
+### Reliability
+
+Restriction-class clippy lints (`unwrap`/`expect`/`panic`/`string_slice`)
+are enforced on production code, and the panics they surfaced are fixed:
+UTF-8-boundary slicing in the `add` spec parser and in docgen, unbounded
+JSON nesting (now depth-limited), and integer overflows in
+`---@version` arithmetic and the content-addressed store. Malformed input
+now yields a diagnostic rather than aborting. Alongside this, a
+clean-code/idiomatic-Rust drawdown consolidated duplicated logic —
+project discovery, the Lua file walker, manifest parsing, the
+diagnostics-render epilogue, and require resolution — behind single
+shared helpers, and replaced ad-hoc `anyhow`/`String` errors with typed
+error enums in the store and bundle crates.
+
 ### Release machinery
 
-LICENSE (MIT), GitLab CI on the canonical remote (check/test/release
-stages), one-line install scripts for Linux/macOS/Windows, and the release
-process this changelog is part of (see RELEASING.md).
+LICENSE (MIT), CI on GitHub Actions (`.github/workflows/ci.yml`) mirrored by
+an internal GitLab pipeline for check/test, one-line install scripts for
+Linux/macOS/Windows, and the release process this changelog is part of (see
+RELEASING.md).
+
+### Distribution
+
+Shipped as [GitHub releases](https://github.com/flying-dice/luabox/releases):
+each `v*` tag builds prebuilt binaries (Linux x86_64, macOS Apple Silicon,
+Windows x86_64) and the VS Code `.vsix`, publishes them with `SHA256SUMS` and
+the one-line installers as release assets, then **smoke-installs on all three
+OSes before marking the release `latest`** — a release that fails any smoke
+install does not go live. Marketplace/Open VSX publishing of the `.vsix`
+remains a manual, credential-gated follow-up (#102).
 
 ### Known limitations
 
