@@ -31,6 +31,10 @@ rayon.workspace = true
 rowan.workspace = true
 toml_edit.workspace = true
 tempfile.workspace = true
+sha2.workspace = true
+# `luabox upgrade` self-replace: renames the running exe out of the way on
+# Windows (see upgrade_cmd.rs).
+self-replace.workspace = true
 
 [dev-dependencies]
 cucumber.workspace = true

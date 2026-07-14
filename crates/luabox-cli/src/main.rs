@@ -20,6 +20,7 @@ mod run_cmd;
 mod scaffold;
 mod test_cmd;
 mod toolchain_cmd;
+mod upgrade_cmd;
 mod watch;
 
 use std::path::PathBuf;
@@ -191,6 +192,11 @@ enum Command {
     Vendor,
     /// Check dependencies against the advisory database
     Audit,
+    /// Replace this binary with a GitHub release build (default: latest)
+    Upgrade {
+        /// Release version to install (e.g. 0.1.0 or v0.1.0); default: latest
+        version: Option<String>,
+    },
     /// Explain a diagnostic code (e.g. LB0421)
     Explain { code: String },
     /// Rewrite bundle line references in a traceback via its .lua.map
@@ -297,6 +303,7 @@ fn main() -> anyhow::Result<()> {
                 Some(ToolchainAction::List) | None => toolchain_cmd::list(&cwd),
             }
         }
+        Command::Upgrade { version } => upgrade_cmd::run(version),
         Command::Vendor => deps_cmd::vendor(&std::env::current_dir()?),
         Command::Audit => audit_cmd::run(&std::env::current_dir()?),
         Command::Explain { code } => {

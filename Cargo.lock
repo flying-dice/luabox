@@ -822,7 +822,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-bundle"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "luabox-hir",
  "luabox-lower",
@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -853,7 +853,9 @@ dependencies = [
  "notify",
  "rayon",
  "rowan",
+ "self-replace",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "toml_edit",
@@ -861,7 +863,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-db"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "luabox-bundle",
  "luabox-diag",
@@ -873,7 +875,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-diag"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -881,7 +883,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-hir"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "luabox-syntax",
  "proptest",
@@ -890,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-lint"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "luabox-diag",
  "luabox-hir",
@@ -901,7 +903,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-lower"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "luabox-hir",
  "luabox-syntax",
@@ -911,7 +913,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-lsp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -933,7 +935,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-resolve"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "luabox-syntax",
@@ -948,7 +950,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sha2",
  "tempfile",
@@ -956,7 +958,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-syntax"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proptest",
  "rowan",
@@ -964,7 +966,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-test"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "rayon",
@@ -973,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-types"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "luabox-diag",
  "luabox-hir",
@@ -1483,6 +1485,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "self-replace"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03ec815b5eab420ab893f63393878d89c90fdd94c0bcc44c07abb8ad95552fb7"
+dependencies = [
+ "fastrand",
+ "tempfile",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1932,6 +1945,15 @@ name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-sys"
+version = "0.52.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
+dependencies = [
+ "windows-targets 0.52.6",
+]
 
 [[package]]
 name = "windows-sys"
