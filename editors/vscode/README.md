@@ -1,7 +1,7 @@
 # luabox for VS Code
 
 First-class VS Code support for the
-[luabox](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox) Lua
+[luabox](https://github.com/flying-dice/luabox) Lua
 toolchain. This extension is a thin wrapper around the `luabox lsp`
 language server: typecheck + lint diagnostics with quick-fixes, hover,
 completion (incl. auto-require imports), goto definition/type-definition/
@@ -44,28 +44,27 @@ repo root [`RELEASING.md`](../../RELEASING.md) for how releases are cut):
 
 ```sh
 # Linux / macOS
-curl -fsSL https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/raw/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/flying-dice/luabox/main/scripts/install.sh | bash
 ```
 
 ```powershell
 # Windows
-irm https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/raw/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/flying-dice/luabox/main/scripts/install.ps1 | iex
 ```
 
-Both scripts fetch the latest tagged GitLab Release's binary asset and place
-it on `PATH` (`~/.local/bin` on Linux/macOS, `%USERPROFILE%\.cargo\bin` on
-Windows by default — override with `LUABOX_INSTALL_DIR`/`-InstallDir`). Until
-the first `v*` tag is pushed, both scripts detect the missing release and
-print a `cargo install --git` fallback instead.
+Both scripts fetch the latest tagged GitHub Release's binary asset, verify it
+against the release's `SHA256SUMS`, and install it to `~/.luabox/bin`
+(Linux/macOS) or `%USERPROFILE%\.luabox\bin` (Windows) by default — override
+with `LUABOX_INSTALL_DIR`, or pin a release with `LUABOX_VERSION=vX.Y.Z`.
 
 Then install this extension itself — see [Installing the extension](#installing-the-extension).
 
 ## Installing the extension
 
-- **From a release**: download the `.vsix` attached to the GitLab release (or
-  build one yourself — see [Package a `.vsix`](#package-a-vsix)) and run
-  `code --install-extension luabox-<version>.vsix`, or use **Extensions ▸ … ▸
-  Install from VSIX** in the UI.
+- **From a release**: the packaged `.vsix` is attached to each GitHub release —
+  download it (or build one yourself — see [Package a `.vsix`](#package-a-vsix))
+  and run `code --install-extension luabox-<version>.vsix`, or use
+  **Extensions ▸ … ▸ Install from VSIX** in the UI.
 - **From the Marketplace / Open VSX**: not yet published — see
   [Publishing to the Marketplace](#publishing-to-the-marketplace) for the
   residual manual steps.
