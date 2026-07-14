@@ -904,13 +904,10 @@ impl TypeEnv {
 
     /// Build a [`FunctionTy`] from `@param`/`@return` tags, reconcile it
     /// with the target function's AST parameter list, and register it under
-    /// the function's name.
-    // TODO: clean-code - 0.52 - SRP: does three jobs in one body — lowers
-    // @param/@return/@vararg tags into a FunctionTy, extracts the callable
-    // name+param-list by matching on the AST statement kind, and reconciles
-    // tags-by-name against the real AST parameter list. Split into
-    // lower-tags / resolve-target / reconcile helpers.
-    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    /// the function's name. Orchestration only: [`lower_signature_tags`]
+    /// lowers the tags, [`resolve_callable_target`] finds the name and AST
+    /// parameter list, [`reconcile_params`] binds the two together.
+    #[allow(clippy::too_many_arguments)]
     fn attach_function(
         &mut self,
         params: &[&ParamTag],
@@ -921,138 +918,20 @@ impl TypeEnv {
         lowerer: &mut Lowerer<'_>,
         root: &SyntaxNode,
     ) {
-        // Lower every tag up front (unknown type names must be reported even
-        // for tags that end up unbound); non-vararg tags are *reconciled by
-        // name* against the AST parameter list below.
-        let mut tag_params: Vec<ParamTy> = Vec::new();
-        for param in params {
-            let ty = lowerer.lower(&param.ty);
-            if param.vararg {
-                func.varargs = Some(ty);
-            } else {
-                tag_params.push(ParamTy {
-                    name: param.name.clone(),
-                    ty,
-                    optional: param.optional,
-                });
-            }
-        }
-        // Legacy `---@vararg Type`. luals precedent (see the comment
-        // in `absorb_block`): a `---@vararg` and a `---@param ... Type` on
-        // the same block both bind to the AST `...` node and their types are
-        // merged, so union rather than overwrite — this covers both a
-        // `---@vararg` next to a `---@param ...` and several `---@vararg`
-        // tags on one block (each is one more bound doc in luals).
-        for v in varargs_tags {
-            let ty = lowerer.lower(&v.ty);
-            func.varargs = Some(match func.varargs.take() {
-                Some(existing) => Ty::union(vec![existing, ty]),
-                None => ty,
-            });
-        }
-        func.has_return_annotation = !returns.is_empty();
-        for tag in returns {
-            for it in &tag.items {
-                if it.vararg {
-                    func.returns_vararg = true;
-                }
-                func.returns.push(lowerer.lower(&it.ty));
-            }
-        }
+        let tag_params = lower_signature_tags(&mut func, params, returns, varargs_tags, lowerer);
 
         let Some(stmt) = stmt_at(root, target) else {
             return;
         };
-        let (name, param_list) = match &stmt {
-            Stmt::LocalFunction(f) => (f.name().map(|t| t.text().to_string()), f.param_list()),
-            Stmt::FunctionDecl(f) => {
-                let name = f.name().and_then(|n| {
-                    // Methods (`function M:m()`) have an implicit `self`
-                    // parameter — TODO(P1): resolve method calls; skipped
-                    // from the callable map for now.
-                    if n.is_method() {
-                        None
-                    } else {
-                        let joined: Vec<String> =
-                            n.segments().map(|s| s.text().to_string()).collect();
-                        Some(joined.join("."))
-                    }
-                });
-                (name, f.param_list())
-            }
-            Stmt::Local(l) => {
-                let value = l.values().and_then(|v| v.exprs().next());
-                let Some(Expr::Function(f)) = value else {
-                    return;
-                };
-                (
-                    l.names()
-                        .next()
-                        .and_then(|n| n.name())
-                        .map(|t| t.text().to_string()),
-                    f.param_list(),
-                )
-            }
-            _ => return,
+        let Some((name, param_list)) = resolve_callable_target(&stmt) else {
+            return;
         };
-
-        // Reconcile with the real parameter list: `@param` tags bind to the
-        // parameter of the *same name* (names are mandatory in the tag
-        // syntax), so a partially-annotated function never misassociates a
-        // tag with the wrong position. Unannotated parameters become
-        // optional `unknown` (permissive — partial annotation must not
-        // manufacture arity errors), and an unannotated `...` still lifts
-        // the arity ceiling.
-        //
-        // TODO(P2): tags naming no parameter are silently unbound today
-        // (LuaLS warns); surface a diagnostic for them.
         // A `:` method's implicit `self` is absent from the AST parameter
-        // list; keep an explicit `---@param self T` tag so inference can
-        // honor it (the standard-LuaCATS `self` fallback).
+        // list; [`reconcile_params`] restores it from an explicit
+        // `---@param self T` tag, so the callable kind is decided here.
         let is_method =
             matches!(&stmt, Stmt::FunctionDecl(f) if f.name().is_some_and(|n| n.is_method()));
-        if let Some(list) = param_list {
-            let mut ast_names: Vec<String> = Vec::new();
-            let mut ast_vararg = false;
-            for p in list.params() {
-                if p.is_vararg() {
-                    ast_vararg = true;
-                } else if let Some(name) = p.name() {
-                    ast_names.push(name.text().to_string());
-                }
-            }
-            let mut used = vec![false; tag_params.len()];
-            for name in &ast_names {
-                let tag = tag_params
-                    .iter()
-                    .enumerate()
-                    .find(|(i, tag)| !used[*i] && &tag.name == name);
-                match tag {
-                    Some((i, tag)) => {
-                        func.params.push(tag.clone());
-                        used[i] = true;
-                    }
-                    None => func.params.push(ParamTy {
-                        name: name.clone(),
-                        ty: Ty::Unknown,
-                        optional: true,
-                    }),
-                }
-            }
-            if is_method
-                && let Some(pos) = tag_params.iter().position(|p| p.name == "self")
-                && !used[pos]
-            {
-                func.params.insert(0, tag_params[pos].clone());
-            }
-            if ast_vararg && func.varargs.is_none() {
-                func.varargs = Some(Ty::Unknown);
-            }
-        } else {
-            // No AST parameter list to reconcile against (malformed source):
-            // fall back to tag order.
-            func.params = tag_params;
-        }
+        reconcile_params(&mut func, tag_params, param_list, is_method);
 
         if let Some(name) = name {
             self.functions.insert(name, func.clone());
@@ -1312,6 +1191,161 @@ impl TypeEnv {
     /// `end_offset`, if any.
     pub(crate) fn as_cast_at(&self, end_offset: usize) -> Option<&Ty> {
         self.as_casts.get(&end_offset)
+    }
+}
+
+/// Lower a function block's `@param`/`@return`/`@vararg` tags into `func`,
+/// returning the non-vararg `@param` tags as [`ParamTy`]s for reconciliation
+/// against the AST parameter list ([`reconcile_params`]).
+fn lower_signature_tags(
+    func: &mut FunctionTy,
+    params: &[&ParamTag],
+    returns: &[&ReturnTag],
+    varargs_tags: &[&VarargTag],
+    lowerer: &mut Lowerer<'_>,
+) -> Vec<ParamTy> {
+    // Lower every tag up front (unknown type names must be reported even
+    // for tags that end up unbound); non-vararg tags are *reconciled by
+    // name* against the AST parameter list below.
+    let mut tag_params: Vec<ParamTy> = Vec::new();
+    for param in params {
+        let ty = lowerer.lower(&param.ty);
+        if param.vararg {
+            func.varargs = Some(ty);
+        } else {
+            tag_params.push(ParamTy {
+                name: param.name.clone(),
+                ty,
+                optional: param.optional,
+            });
+        }
+    }
+    // Legacy `---@vararg Type`. luals precedent (see the comment
+    // in `absorb_block`): a `---@vararg` and a `---@param ... Type` on
+    // the same block both bind to the AST `...` node and their types are
+    // merged, so union rather than overwrite — this covers both a
+    // `---@vararg` next to a `---@param ...` and several `---@vararg`
+    // tags on one block (each is one more bound doc in luals).
+    for v in varargs_tags {
+        let ty = lowerer.lower(&v.ty);
+        func.varargs = Some(match func.varargs.take() {
+            Some(existing) => Ty::union(vec![existing, ty]),
+            None => ty,
+        });
+    }
+    func.has_return_annotation = !returns.is_empty();
+    for tag in returns {
+        for it in &tag.items {
+            if it.vararg {
+                func.returns_vararg = true;
+            }
+            func.returns.push(lowerer.lower(&it.ty));
+        }
+    }
+    tag_params
+}
+
+/// Extract the callable's registered name (dotted, `None` for an anonymous or
+/// method target) and its AST parameter list from the statement it annotates.
+/// `None` when the target is not a function definition at all — there is then
+/// nothing to attach a signature to.
+fn resolve_callable_target(stmt: &Stmt) -> Option<(Option<String>, Option<lua::ast::ParamList>)> {
+    match stmt {
+        Stmt::LocalFunction(f) => Some((f.name().map(|t| t.text().to_string()), f.param_list())),
+        Stmt::FunctionDecl(f) => {
+            let name = f.name().and_then(|n| {
+                // Methods (`function M:m()`) have an implicit `self`
+                // parameter — TODO(P1): resolve method calls; skipped
+                // from the callable map for now.
+                if n.is_method() {
+                    None
+                } else {
+                    let joined: Vec<String> = n.segments().map(|s| s.text().to_string()).collect();
+                    Some(joined.join("."))
+                }
+            });
+            Some((name, f.param_list()))
+        }
+        Stmt::Local(l) => {
+            let value = l.values().and_then(|v| v.exprs().next());
+            let Some(Expr::Function(f)) = value else {
+                return None;
+            };
+            Some((
+                l.names()
+                    .next()
+                    .and_then(|n| n.name())
+                    .map(|t| t.text().to_string()),
+                f.param_list(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Reconcile the lowered `@param` tags against the target's real AST parameter
+/// list, writing the final ordered parameters (and any vararg ceiling) onto
+/// `func`.
+fn reconcile_params(
+    func: &mut FunctionTy,
+    tag_params: Vec<ParamTy>,
+    param_list: Option<lua::ast::ParamList>,
+    is_method: bool,
+) {
+    // Reconcile with the real parameter list: `@param` tags bind to the
+    // parameter of the *same name* (names are mandatory in the tag
+    // syntax), so a partially-annotated function never misassociates a
+    // tag with the wrong position. Unannotated parameters become
+    // optional `unknown` (permissive — partial annotation must not
+    // manufacture arity errors), and an unannotated `...` still lifts
+    // the arity ceiling.
+    //
+    // TODO(P2): tags naming no parameter are silently unbound today
+    // (LuaLS warns); surface a diagnostic for them.
+    if let Some(list) = param_list {
+        let mut ast_names: Vec<String> = Vec::new();
+        let mut ast_vararg = false;
+        for p in list.params() {
+            if p.is_vararg() {
+                ast_vararg = true;
+            } else if let Some(name) = p.name() {
+                ast_names.push(name.text().to_string());
+            }
+        }
+        let mut used = vec![false; tag_params.len()];
+        for name in &ast_names {
+            let tag = tag_params
+                .iter()
+                .enumerate()
+                .find(|(i, tag)| !used[*i] && &tag.name == name);
+            match tag {
+                Some((i, tag)) => {
+                    func.params.push(tag.clone());
+                    used[i] = true;
+                }
+                None => func.params.push(ParamTy {
+                    name: name.clone(),
+                    ty: Ty::Unknown,
+                    optional: true,
+                }),
+            }
+        }
+        // A `:` method's implicit `self` is absent from the AST parameter
+        // list; keep an explicit `---@param self T` tag so inference can
+        // honor it (the standard-LuaCATS `self` fallback).
+        if is_method
+            && let Some(pos) = tag_params.iter().position(|p| p.name == "self")
+            && !used[pos]
+        {
+            func.params.insert(0, tag_params[pos].clone());
+        }
+        if ast_vararg && func.varargs.is_none() {
+            func.varargs = Some(Ty::Unknown);
+        }
+    } else {
+        // No AST parameter list to reconcile against (malformed source):
+        // fall back to tag order.
+        func.params = tag_params;
     }
 }
 
