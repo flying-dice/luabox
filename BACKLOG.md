@@ -44,7 +44,9 @@ protocol maturity (#125–#135).
 ## Post-launch
 
 - [#136](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/136)
-  Test runner: execute doc examples as tests (`luabox test --doc`).
+  Test runner: execute doc examples as tests (`luabox test --doc`) —
+  **moot**: `luabox test` was deprecated 2026-07-14 (toolchain, not a
+  runtime); close on GitLab.
 - [#137](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/137)
   Registry UX: `luabox search` + `login`/auth — needs the hosted-registry
   work (adjacent to #95).

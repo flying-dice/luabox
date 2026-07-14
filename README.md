@@ -73,8 +73,8 @@ lint: 0 errors, 0 warnings in 1 files
 ```
 
 That is the whole loop — one binary for check, run, format, and lint, no build
-config. `run` and `test` execute on a Lua runtime found on `PATH` or installed
-via `luabox toolchain`. See [`examples/`](examples/) for larger, real projects —
+config. `run` executes on a Lua runtime found on `PATH` or installed via
+`luabox toolchain`. See [`examples/`](examples/) for larger, real projects —
 a LÖVE game, a multi-package workspace, and a 5.4-to-5.1 cross-version lowering
 demo.
 
@@ -168,7 +168,7 @@ anything load-bearing.
 | `lint` | type-informed rules, `---@luabox-ignore`, per-rule `[lint]` levels |
 | `build` | lower `edition → target` (goto, bitops, `<close>`, `_ENV`, …) with tree-shaken polyfills |
 | `bundle` | single-file bundle, `--minify`, `--sourcemap` + `unmap`, `--mode love\|nvim-plugin` |
-| `test` / `bench` | zero-config runner (busted-compatible), `--matrix` across runtimes; criterion-lite bench |
+| `test` / `bench` | **deprecated** — luabox is a toolchain, not a runtime; code coupled to its deployment environment (LÖVE, Neovim, OpenResty, …) can't be faithfully executed on a bare interpreter. Both warn and are slated for removal; use the environment's own tooling |
 | `add` / `remove` / `install` / `update` / `vendor` | PubGrub resolver, `luabox.lock`, CAS store with hard-link installs; path/git/workspace/registry deps |
 | `publish` / `audit` | registry publish with yank; advisory-DB audit |
 | `run` | `[tasks]` entries or scripts via the resolved runtime |

@@ -31,10 +31,11 @@ One static binary, one crate per bounded context (SPEC.md §16):
   `_ENV`, integer/float semantics) with tree-shaken polyfills.
 - `bundle` — single-file bundle, `--minify`, `--sourcemap` + `unmap`,
   `--mode love|nvim-plugin`.
-- `test` / `bench` — zero-config, busted-compatible runner, `--matrix`
-  across runtimes; criterion-lite benchmarks. `--coverage` is accepted but
-  not implemented yet and errors out rather than silently no-opping (see
-  BACKLOG.md #100).
+- `test` / `bench` — **deprecated at 0.1**: luabox is a toolchain, not a
+  runtime, and code coupled to its deployment environment (LÖVE, Neovim,
+  OpenResty, …) cannot be faithfully executed on a bare interpreter. Both
+  still work for what they can run but warn on every invocation and are
+  slated for removal; `--coverage` errors out and will not be implemented.
 - `run` — `[tasks]` entries or scripts via the resolved runtime.
 - `add` / `remove` / `install` / `update` / `vendor` — PubGrub resolver,
   `luabox.lock`, content-addressed store with hard-link installs;

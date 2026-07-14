@@ -170,9 +170,17 @@ members = ["packages/*"]
 
 ## 11. Test runner & bench
 
+> **Deprecated (2026-07-14).** luabox is a toolchain, not a runtime: most
+> real Lua code is coupled to the environment it deploys into (LÖVE, Neovim,
+> OpenResty, an embedded VM), which a bare-interpreter harness cannot
+> faithfully execute. `luabox test`/`luabox bench` warn on invocation and
+> are slated for removal; the unbuilt items below (snapshots, coverage,
+> reporters) will not be built. Testing belongs to the deployment
+> environment's own tooling.
+
 - Zero-config discovery (`*_test.lua`, `*.test.lua`, `tests/`); busted-compatible shim + native flat API.
-- `luabox test --matrix`: one suite against 5.1/5.4/luajit in parallel — killer feature for cross-version library authors.
-- Watch, filtering, snapshots, coverage (source-map-aware instrumentation), JUnit/JSON reporters.
+- `luabox test --matrix`: one suite against 5.1/5.4/luajit in parallel.
+- Watch, filtering.
 - `luabox bench`: criterion-style statistical benchmarking across runtimes.
 
 ## 12. Toolchain manager (rustup analog)

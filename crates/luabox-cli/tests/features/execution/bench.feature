@@ -1,7 +1,11 @@
-Feature: luabox bench — criterion-style benchmarking across runtimes (SPEC.md §11)
+Feature: luabox bench — criterion-style benchmarking across runtimes (deprecated)
   Zero-config discovery (`*_bench.lua`, `*.bench.lua`, `bench/`), driving the
   embedded bench harness against every Lua runtime found on PATH. Benches
   never fail the build: the command always exits 0.
+
+  Deprecated for the same reason as `luabox test`: code coupled to its
+  deployment environment cannot be faithfully executed on a bare
+  interpreter. Warns on every invocation; slated for removal.
 
   These scenarios are hermetic: they never require a real Lua. A "fake bench
   runtime" (a tiny `.bat` shim pointed at via `LUABOX_LUA`) echoes each bench
@@ -9,6 +13,12 @@ Feature: luabox bench — criterion-style benchmarking across runtimes (SPEC.md 
   the stats table are exercised without an interpreter installed. The real
   harness (adaptive batching, `os.clock()` timing) is proven end-to-end by
   the `luabox-test` integration tests, behind a runtime probe.
+
+  Scenario: every invocation warns that the command is deprecated
+    Given a fake bench runtime
+    When I run "luabox bench" with the fake bench runtime
+    Then the command succeeds
+    And stderr contains "`luabox bench` is deprecated"
 
   Scenario: discovers a bench file and reports its stats via the fake runtime
     Given a fake bench runtime

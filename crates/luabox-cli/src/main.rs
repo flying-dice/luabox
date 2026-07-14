@@ -137,7 +137,8 @@ enum Command {
         #[arg(long)]
         mode: Option<String>,
     },
-    /// Run tests on the configured runtime(s)
+    /// [deprecated] Run tests on the configured runtime(s) — test with your
+    /// deployment environment's own tooling instead
     Test {
         /// Substring filter: matched against test file paths, else test names
         pattern: Option<String>,
@@ -148,12 +149,13 @@ enum Command {
         /// Run the suite against every Lua runtime found on PATH
         #[arg(long)]
         matrix: bool,
-        /// Experimental, unimplemented: collect coverage. Currently only
-        /// errors out — see SPEC.md §11.
+        /// Unimplemented and will not be added (`luabox test` is deprecated);
+        /// errors out
         #[arg(long, hide = true)]
         coverage: bool,
     },
-    /// Run statistical benchmarks across runtimes
+    /// [deprecated] Run statistical benchmarks across runtimes — benchmark in
+    /// your deployment environment instead
     Bench,
     /// Run a script or a [tasks] entry via the configured runtime
     Run {

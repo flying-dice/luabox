@@ -113,15 +113,15 @@ callback parameters carry unbound placeholders that are never guessed).
 
 ## Tooling
 
-### `luabox test --coverage` is not implemented (#100)
+### `luabox test` and `luabox bench` are deprecated
 
-The test runner works; the `--coverage` flag is gated and exits with a clear
-message rather than reporting bogus numbers:
-
-```
-$ luabox test --coverage
-Error: --coverage is not implemented yet (SPEC.md §11); track progress at the project backlog
-```
+luabox is a toolchain, not a runtime: most real Lua code is coupled to the
+environment it deploys into (LÖVE, Neovim, OpenResty, a game engine's
+embedded VM, …), and a bare-interpreter harness cannot faithfully execute
+it. Both commands keep working for the code they *can* run, but warn on
+every invocation and are slated for removal — test and benchmark with the
+deployment environment's own tooling (e.g. busted under the target host).
+`--coverage` errors out and will not be implemented.
 
 ### Dependencies: no hosted registry in 0.1 (#101)
 

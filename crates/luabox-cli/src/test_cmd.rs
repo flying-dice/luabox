@@ -1,5 +1,12 @@
-//! `luabox test [pattern] [--watch] [--matrix] [--coverage]` — the built-in
-//! test runner (SPEC.md §11).
+//! `luabox test [pattern] [--watch] [--matrix]` — the built-in test runner.
+//!
+//! **Deprecated.** luabox is a toolchain, not a runtime: most real Lua code
+//! is coupled to the environment it deploys into (LÖVE, Neovim, OpenResty,
+//! a game engine's embedded VM, …), and a bare-runtime harness cannot
+//! faithfully execute it. The command keeps working for the code it *can*
+//! run, but warns on every invocation and is slated for removal; test with
+//! the deployment environment's own tooling (e.g. busted under the target
+//! host).
 //!
 //! Zero-config: discovers `*_test.lua` / `*.test.lua` / anything under
 //! `tests/`, resolves a Lua runtime from the manifest `edition` (or the
@@ -34,10 +41,17 @@ pub fn run(
     coverage: bool,
     matrix: bool,
 ) -> anyhow::Result<()> {
+    eprintln!(
+        "warning: `luabox test` is deprecated and will be removed: luabox is a \
+         toolchain, not a runtime — code coupled to its deployment environment \
+         (LÖVE, Neovim, OpenResty, …) cannot be faithfully executed here. Use \
+         the deployment environment's own test tooling (e.g. busted) instead."
+    );
+
     if coverage {
         bail!(
-            "--coverage is not implemented yet (SPEC.md §11); track progress \
-             at the project backlog"
+            "--coverage is not implemented and will not be: `luabox test` is \
+             deprecated (run `luabox test` for details)"
         );
     }
 

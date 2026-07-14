@@ -1,5 +1,10 @@
 //! `luabox bench` — criterion-style statistical benchmarking across
-//! runtimes (SPEC.md §11, ticket #26).
+//! runtimes (ticket #26).
+//!
+//! **Deprecated**, for the same reason as `luabox test` (see `test_cmd`):
+//! luabox is a toolchain, not a runtime, and code coupled to its deployment
+//! environment cannot be faithfully executed on a bare interpreter. Warns on
+//! every invocation; slated for removal.
 //!
 //! Zero-config: discovers `*_bench.lua` / `*.bench.lua` / anything under
 //! `bench/`, resolves **every** Lua runtime found on `PATH` (plus
@@ -26,6 +31,12 @@ use luabox_test::runtime::resolve_matrix;
 /// path — a per-file or per-bench failure is reported in the table, not as
 /// a nonzero exit (SPEC.md §11: benches don't fail builds).
 pub fn run(cwd: &Path) -> anyhow::Result<()> {
+    eprintln!(
+        "warning: `luabox bench` is deprecated and will be removed: luabox is a \
+         toolchain, not a runtime — code coupled to its deployment environment \
+         cannot be faithfully executed here."
+    );
+
     let project = discover(cwd)?;
     let files = bench::discover(&project.root, project.out_dir.as_deref());
 
