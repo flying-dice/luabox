@@ -10,6 +10,35 @@ spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
 
 Nothing yet — changes land here between releases.
 
+## [0.1.3] - 2026-07-14
+
+### Added
+
+- `luabox search [QUERY] [--format json|text]` — discover luabox packages on
+  GitHub. luabox has no hosted registry (SPEC.md §6): a **package** is a public
+  GitHub repo carrying the topic `luabox` **and** a root `luabox.toml`. Search
+  finds candidates by topic, filters to those with a root manifest (excluding
+  the toolchain/editor repos, which carry the topic but ship no manifest),
+  reads each `[package] name`, and reports the latest release tag to pin. The
+  `--format json` output is a stable contract the editor GUIs consume.
+- `luabox outdated [--format json|text]` — report each dependency against the
+  latest GitHub release of its repo. A tag-pinned git dependency is flagged
+  outdated when a newer release tag exists; non-git deps and rev/branch pins
+  are listed without a false "outdated" verdict. Always exits 0 (a report, not
+  a gate). Also emits a stable `--format json` contract.
+- `luabox update <name>` now **re-pins** a tag-pinned git dependency to its
+  GitHub repo's latest release tag (comment-preserving `luabox.toml` surgery)
+  before re-resolving; `luabox update` with no name re-pins every tag-pinned
+  git dependency. A dependency pinned by `rev`/`branch` is left untouched (its
+  pin kind is never switched silently) with a note.
+
+  Together these give editors an npm-like dependency UX — discover, see
+  what's outdated, and update with one click — over GitHub-as-registry,
+  addressing the discovery half of #137 without a hosted registry. GitHub
+  requests honor `LUABOX_GITHUB_TOKEN` (else `GITHUB_TOKEN`) as a bearer token,
+  raising the anonymous 60 req/hr search limit to 5000/hr; everything degrades
+  gracefully without one.
+
 ## [0.1.2] - 2026-07-14
 
 ### Changed

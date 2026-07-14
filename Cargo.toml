@@ -4,7 +4,7 @@ members = ["crates/*"]
 exclude = ["tools/*", "fuzz"]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/flying-dice/luabox"
@@ -13,18 +13,18 @@ rust-version = "1.92"
 [workspace.dependencies]
 # Intra-workspace (bounded contexts — see SPEC.md §16; luabox-diag is a
 # cross-cutting support crate like rustc_errors, not a bounded context)
-luabox-diag = { path = "crates/luabox-diag", version = "0.1.2" }
-luabox-syntax = { path = "crates/luabox-syntax", version = "0.1.2" }
-luabox-hir = { path = "crates/luabox-hir", version = "0.1.2" }
-luabox-types = { path = "crates/luabox-types", version = "0.1.2" }
-luabox-db = { path = "crates/luabox-db", version = "0.1.2" }
-luabox-lower = { path = "crates/luabox-lower", version = "0.1.2" }
-luabox-bundle = { path = "crates/luabox-bundle", version = "0.1.2" }
-luabox-resolve = { path = "crates/luabox-resolve", version = "0.1.2" }
-luabox-store = { path = "crates/luabox-store", version = "0.1.2" }
-luabox-lint = { path = "crates/luabox-lint", version = "0.1.2" }
-luabox-lsp = { path = "crates/luabox-lsp", version = "0.1.2" }
-luabox-test = { path = "crates/luabox-test", version = "0.1.2" }
+luabox-diag = { path = "crates/luabox-diag", version = "0.1.3" }
+luabox-syntax = { path = "crates/luabox-syntax", version = "0.1.3" }
+luabox-hir = { path = "crates/luabox-hir", version = "0.1.3" }
+luabox-types = { path = "crates/luabox-types", version = "0.1.3" }
+luabox-db = { path = "crates/luabox-db", version = "0.1.3" }
+luabox-lower = { path = "crates/luabox-lower", version = "0.1.3" }
+luabox-bundle = { path = "crates/luabox-bundle", version = "0.1.3" }
+luabox-resolve = { path = "crates/luabox-resolve", version = "0.1.3" }
+luabox-store = { path = "crates/luabox-store", version = "0.1.3" }
+luabox-lint = { path = "crates/luabox-lint", version = "0.1.3" }
+luabox-lsp = { path = "crates/luabox-lsp", version = "0.1.3" }
+luabox-test = { path = "crates/luabox-test", version = "0.1.3" }
 
 # External
 rowan = "0.16"

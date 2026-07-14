@@ -172,7 +172,8 @@ anything load-bearing.
 | `build` | lower `edition → target` (goto, bitops, `<close>`, `_ENV`, …) with tree-shaken polyfills |
 | `bundle` | single-file bundle, `--minify`, `--sourcemap` + `unmap`, `--mode love\|nvim-plugin` |
 | `test` / `bench` | **deprecated** — luabox is a toolchain, not a runtime; code coupled to its deployment environment (LÖVE, Neovim, OpenResty, …) can't be faithfully executed on a bare interpreter. Both warn and are slated for removal; use the environment's own tooling |
-| `add` / `remove` / `install` / `update` / `vendor` | PubGrub resolver, `luabox.lock`, CAS store with hard-link installs; path/git/workspace/registry deps |
+| `add` / `remove` / `install` / `update` / `vendor` | PubGrub resolver, `luabox.lock`, CAS store with hard-link installs; path/git/workspace/registry deps. `update <name>` re-pins a git dep to its repo's latest release tag |
+| `search` / `outdated` | discover luabox packages on GitHub (topic `luabox` + a root `luabox.toml`) and report git deps behind their latest release; `--format json\|text` |
 | `publish` / `audit` | registry publish with yank; advisory-DB audit |
 | `run` | `[tasks]` entries or scripts via the resolved runtime |
 | `toolchain` | install/pin/list managed Lua runtimes |
@@ -203,6 +204,30 @@ luabox publish                                      # publishes to it
 
 Without `LUABOX_REGISTRY` set, registry-kind specs (`luabox add pkg@1.0`) and
 `luabox publish` fail with setup guidance rather than silently doing nothing.
+
+### Discovering & managing dependencies
+
+With no hosted registry, **GitHub is the discovery surface**. A luabox
+*package* is any public GitHub repo that carries the topic `luabox` **and** a
+root `luabox.toml`; installing one is a git dependency pinned to its latest
+release tag.
+
+```sh
+luabox search json          # public repos: topic:luabox + a root luabox.toml
+luabox add cool-lib --git https://github.com/owner/cool-lib --tag v1.2.0
+luabox outdated             # which git deps are behind their latest release?
+luabox update cool-lib      # re-pin cool-lib to its repo's latest release tag
+```
+
+`search` and `outdated` take `--format json|text` (`text` is the default;
+editors pass `json` for a stable contract). `outdated` always exits 0 — it is a
+report. `update <name>` re-pins a **tag**-pinned git dependency to the latest
+release tag of its GitHub repo; a `rev`/`branch` pin is left untouched.
+
+GitHub requests honor a token from `LUABOX_GITHUB_TOKEN` (else `GITHUB_TOKEN`),
+sent as `Authorization: Bearer …`, which raises the anonymous 60 req/hr search
+limit to 5000/hr. Everything works without a token, just against the lower
+anonymous limit.
 
 ## Project layout (for contributors)
 
