@@ -43,7 +43,11 @@ self-replace.workspace = true
 # GitHub token storage (`luabox login`): the OS keychain, encrypted at rest.
 # keyring v3 ships no backend by default, so the real platform store is
 # selected per-target — Windows Credential Manager, macOS Keychain, Linux
-# Secret Service (pure-Rust crypto, no OpenSSL). See keychain.rs.
+# Secret Service. Linux uses the *async* (zbus) backend with pure-Rust crypto
+# and the async-io runtime: it is 100% Rust with NO C dependency, so building
+# luabox on Linux (CI or `cargo install`) never needs libdbus/pkg-config. The
+# `sync-secret-service` feature would pull dbus-secret-service → libdbus-sys
+# (a C library) and break the build on stock runners. See keychain.rs.
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
 
@@ -51,7 +55,7 @@ keyring = { version = "3", features = ["windows-native"] }
 keyring = { version = "3", features = ["apple-native"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+keyring = { version = "3", features = ["async-secret-service", "crypto-rust", "async-io"] }
 
 [dev-dependencies]
 cucumber.workspace = true
