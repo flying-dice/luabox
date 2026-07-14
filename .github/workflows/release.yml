@@ -262,6 +262,15 @@ jobs:
           LUA
           luabox check
 
+          # Auth status with no token/keychain on a fresh runner: `whoami`
+          # must report not-signed-in and exit 0 (a status query, no network).
+          who="$(luabox whoami)"
+          echo "whoami: $who"
+          if [ "$who" != "not signed in" ]; then
+            echo "error: 'luabox whoami' = '$who', expected 'not signed in'" >&2
+            exit 1
+          fi
+
           # Exercise self-replace on this OS: re-install the same tag via the
           # binary's own upgrade command, then prove it still runs.
           luabox upgrade "${TAG}"
@@ -490,6 +499,12 @@ jobs:
           "@ | Set-Content -Path (Join-Path $work "src\main.lua") -Encoding utf8
           luabox check
           if ($LASTEXITCODE -ne 0) { Write-Error "'luabox check' failed on a clean project"; exit 1 }
+
+          # Auth status with no token/keychain on a fresh runner: `whoami` must
+          # report not-signed-in and exit 0 (a status query, no network).
+          $who = (luabox whoami)
+          Write-Host "whoami: $who"
+          if ($who -ne "not signed in") { Write-Error "'luabox whoami' = '$who', expected 'not signed in'"; exit 1 }
 
           # Exercise self-replace on Windows (the rename-aside path): re-install
           # the same tag via the binary's own upgrade command.
