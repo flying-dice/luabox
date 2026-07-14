@@ -136,6 +136,7 @@ pub(crate) fn parse(input: &str) -> Result<Json, String> {
     let mut p = Parser {
         bytes: input.as_bytes(),
         pos: 0,
+        depth: 0,
     };
     p.skip_ws();
     let value = p.value()?;
@@ -146,9 +147,19 @@ pub(crate) fn parse(input: &str) -> Result<Json, String> {
     Ok(value)
 }
 
+/// Maximum object/array nesting the parser will descend into. A corrupt or
+/// hostile on-disk manifest with thousands of `[[[[…` would otherwise recurse
+/// until the stack overflows (an abort, not a catchable error); this bound
+/// turns that into an ordinary parse error. Real manifests nest only a couple
+/// of levels (`{ entries: [ { … } ] }`), so 128 is generous.
+const MAX_DEPTH: usize = 128;
+
 struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    /// Current object/array nesting depth, bounded by [`MAX_DEPTH`] so a
+    /// deeply nested payload cannot overflow the stack via `value` recursion.
+    depth: usize,
 }
 
 impl Parser<'_> {
@@ -174,14 +185,33 @@ impl Parser<'_> {
     fn value(&mut self) -> Result<Json, String> {
         self.skip_ws();
         match self.peek() {
-            Some(b'{') => self.object(),
-            Some(b'[') => self.array(),
+            Some(b'{') => self.nested(Self::object),
+            Some(b'[') => self.nested(Self::array),
             Some(b'"') => Ok(Json::Str(self.string()?)),
             Some(b't' | b'f') => self.boolean(),
             Some(b'n') => self.null(),
             Some(c) if c.is_ascii_digit() => self.number(),
             _ => Err(format!("unexpected token at byte {}", self.pos)),
         }
+    }
+
+    /// Parse a container (`object`/`array`) one nesting level deeper, rejecting
+    /// input that would recurse past [`MAX_DEPTH`]. On the error path `depth` is
+    /// left as-is: the parse is aborted whole, so restoring it would be moot.
+    fn nested(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> Result<Json, String>,
+    ) -> Result<Json, String> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(format!(
+                "nesting too deep (over {MAX_DEPTH} levels) at byte {}",
+                self.pos
+            ));
+        }
+        let value = parse(self)?;
+        self.depth -= 1;
+        Ok(value)
     }
 
     fn object(&mut self) -> Result<Json, String> {
@@ -365,5 +395,25 @@ mod tests {
     #[test]
     fn rejects_floats_outside_the_subset() {
         assert!(parse("1.5").is_err());
+    }
+
+    #[test]
+    fn rejects_pathologically_nested_input_without_overflowing() {
+        // A corrupt manifest of thousands of open brackets must fail as an
+        // ordinary parse error, never a stack overflow. (Unbalanced is fine —
+        // the depth guard trips long before the closing brackets matter.)
+        let payload = "[".repeat(10_000);
+        let err = parse(&payload).unwrap_err();
+        assert!(err.contains("nesting too deep"), "got: {err}");
+    }
+
+    #[test]
+    fn accepts_nesting_up_to_the_limit() {
+        // 128 levels of array is exactly at the bound and must still parse.
+        let doc = format!("{}{}", "[".repeat(128), "]".repeat(128));
+        assert!(parse(&doc).is_ok());
+        // One level past the bound is rejected.
+        let too_deep = format!("{}{}", "[".repeat(129), "]".repeat(129));
+        assert!(parse(&too_deep).is_err());
     }
 }

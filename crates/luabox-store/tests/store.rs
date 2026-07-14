@@ -154,16 +154,15 @@ fn hardlink_materialization_links_without_copy_fallback() {
     write_file(&src, "a.lua", b"aaaa");
     write_file(&src, "b/c.lua", b"cccc");
 
-    // Store and dest share the temp-dir volume, so hard links must succeed.
+    // Store and dest share the temp-dir volume, so under `Auto` every file
+    // must hard-link — the copy fallback never trips.
     let store = Store::open(tmp.path().join("store"));
     let manifest = store.put_tree(&src).unwrap();
 
     let dest = tmp.path().join("linked");
-    let report = store
-        .materialize(&manifest, &dest, LinkMode::HardLink)
-        .unwrap();
+    let report = store.materialize(&manifest, &dest, LinkMode::Auto).unwrap();
 
-    // Proof of linking: every file linked, nothing fell back to a copy.
+    // Proof of linking: the report shows every file linked, nothing copied.
     assert_eq!(report.hard_linked, 2);
     assert_eq!(report.copied, 0);
     assert_eq!(read_tree(&src), read_tree(&dest));

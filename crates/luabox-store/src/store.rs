@@ -30,16 +30,14 @@ const GC_LOCK_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 /// How a materialized project file is linked back to its store object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LinkMode {
-    /// Prefer a hard link; fall back to a copy only when the platform reports
-    /// linking as impossible for this pair (cross-device, or a filesystem that
-    /// does not support hard links). Any *other* I/O error is surfaced, not
-    /// masked. Hard-linked files share the object's read-only bit.
-    HardLink,
     /// Always copy. The copy is writable — this is the escape hatch for code
     /// that needs to mutate installed files.
     Copy,
-    /// Best-effort default: hard link, and fall back to a copy on *any* link
-    /// failure. Reserved to grow reflink support without an API change.
+    /// Best-effort default (the bun/pnpm model, SPEC.md §6): hard link, and
+    /// fall back to a copy on *any* link failure — cross-device, an
+    /// unsupported filesystem, or any other I/O error. A hard-linked file
+    /// shares the object's read-only bit; a fallback copy is writable.
+    /// Reserved to grow reflink support without an API change.
     #[default]
     Auto,
 }
@@ -210,9 +208,9 @@ impl Store {
     /// first to distinguish missing from corrupt).
     ///
     /// # Errors
-    /// Fails if an object is missing, on I/O errors, or — under
-    /// [`LinkMode::HardLink`] — on a hard-link failure that is not a
-    /// recoverable cross-device/unsupported condition.
+    /// Fails if an object is missing or on I/O errors. Hard-link failures are
+    /// never surfaced: both [`LinkMode`] variants fall back to a writable copy
+    /// (see the enum docs), so only a failing *copy* aborts materialization.
     pub fn materialize(
         &self,
         manifest: &TreeManifest,
@@ -548,18 +546,6 @@ fn place(
             copy_object(object, target, executable)?;
             report.copied += 1;
         }
-        LinkMode::HardLink => match fs::hard_link(object, target) {
-            Ok(()) => report.hard_linked += 1,
-            Err(err) if link_error_is_recoverable(&err) => {
-                copy_object(object, target, executable)?;
-                report.copied += 1;
-            }
-            Err(err) => {
-                return Err(err).io_context(|| {
-                    format!("hard-linking {} -> {}", object.display(), target.display())
-                });
-            }
-        },
         LinkMode::Auto => {
             if fs::hard_link(object, target).is_ok() {
                 report.hard_linked += 1;
@@ -600,36 +586,4 @@ fn is_executable(meta: &fs::Metadata) -> bool {
 #[cfg(not(unix))]
 fn is_executable(_meta: &fs::Metadata) -> bool {
     false
-}
-
-/// Known cross-device / unsupported-operation error codes: a hard link that
-/// fails with one of these is expected and falls back to a copy.
-#[cfg(unix)]
-const RECOVERABLE_LINK_ERRNOS: &[i32] = &[
-    1,  // EPERM — filesystem forbids hard links
-    18, // EXDEV — cross-device link
-    31, // EMLINK — link count exhausted
-    38, // ENOSYS — not implemented
-    95, // EOPNOTSUPP — unsupported on this filesystem
-];
-
-#[cfg(windows)]
-const RECOVERABLE_LINK_ERRNOS: &[i32] = &[
-    1,   // ERROR_INVALID_FUNCTION — volume/fs cannot hard link
-    5,   // ERROR_ACCESS_DENIED
-    17,  // ERROR_NOT_SAME_DEVICE — cross-volume link
-    50,  // ERROR_NOT_SUPPORTED
-    120, // ERROR_CALL_NOT_IMPLEMENTED
-];
-
-#[cfg(not(any(unix, windows)))]
-const RECOVERABLE_LINK_ERRNOS: &[i32] = &[];
-
-/// Whether a hard-link error should transparently fall back to copying.
-fn link_error_is_recoverable(err: &io::Error) -> bool {
-    if err.kind() == io::ErrorKind::Unsupported {
-        return true;
-    }
-    err.raw_os_error()
-        .is_some_and(|code| RECOVERABLE_LINK_ERRNOS.contains(&code))
 }

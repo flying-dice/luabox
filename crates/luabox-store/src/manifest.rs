@@ -62,6 +62,16 @@ impl TreeManifest {
         self.entries.iter().map(|e| e.size).sum()
     }
 
+    /// The tree hash rendered in the registry/lockfile wire format:
+    /// `sha256:<hex>`. This is the single place the `sha256:` algorithm prefix
+    /// is spelled, so callers reconciling a store tree against a registry index
+    /// checksum (`luabox install`) compare through here rather than re-`format!`
+    /// the prefix at each site.
+    #[must_use]
+    pub fn checksum_string(&self) -> String {
+        format!("sha256:{}", self.tree_hash)
+    }
+
     /// The set of distinct object hashes this tree references. A tree can
     /// reference the same object twice (two identical files at different
     /// paths), so this deduplicates.
@@ -243,5 +253,11 @@ mod tests {
     fn object_hashes_are_deduplicated() {
         let m = TreeManifest::from_entries(vec![entry("a", "11"), entry("b", "11")]);
         assert_eq!(m.object_hashes(), vec!["11"]);
+    }
+
+    #[test]
+    fn checksum_string_prefixes_the_tree_hash() {
+        let m = TreeManifest::from_entries(vec![entry("a", "11")]);
+        assert_eq!(m.checksum_string(), format!("sha256:{}", m.tree_hash));
     }
 }

@@ -19,6 +19,7 @@
 //! differ (some commands don't parse the edition at all; the ones that do
 //! word the error differently).
 
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -150,6 +151,25 @@ fn walk(
         }
     }
     Ok(())
+}
+
+/// The user's home directory from the environment: `$HOME` (unix) /
+/// `%USERPROFILE%` (windows), whichever is set to a non-empty value first.
+///
+/// Deliberately an env-only probe — luabox-store's design forbids a
+/// directory-discovery dependency, so the CLI locates `~/.luabox/...` this way.
+/// The two callers wrap this with their own divergent contracts: `deps_cmd`
+/// turns `None` into a hard error (nowhere to put the store), while `audit_cmd`
+/// treats `None` as "the default database path can't be checked" and carries on.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    for var in ["HOME", "USERPROFILE"] {
+        if let Ok(dir) = env::var(var)
+            && !dir.trim().is_empty()
+        {
+            return Some(PathBuf::from(dir));
+        }
+    }
+    None
 }
 
 /// Root-relative path with forward slashes — stable output across platforms.

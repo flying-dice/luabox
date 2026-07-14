@@ -471,7 +471,7 @@ fn materialize(
         if matches!(package.source, Source::Registry)
             && let Some(expected) = &package.checksum
         {
-            let actual = format!("sha256:{}", tree.tree_hash);
+            let actual = tree.checksum_string();
             if &actual != expected {
                 bail!(
                     "checksum mismatch for `{}@{}`: the registry index says \
@@ -627,17 +627,14 @@ pub(crate) fn store_root() -> anyhow::Result<PathBuf> {
     Ok(home_dir()?.join(".luabox").join("store"))
 }
 
-/// `$HOME` (unix) / `%USERPROFILE%` (windows) — no directory-discovery
-/// dependency, per luabox-store's design.
+/// The home directory, or a hard error: the dependency commands must land the
+/// store *somewhere*, so a missing home (with no `LUABOX_STORE` override) is
+/// fatal. Wraps the shared env probe ([`crate::project::home_dir`]); `audit`
+/// wraps the same probe with the opposite, non-fatal contract.
 fn home_dir() -> anyhow::Result<PathBuf> {
-    for var in ["HOME", "USERPROFILE"] {
-        if let Ok(dir) = env::var(var)
-            && !dir.trim().is_empty()
-        {
-            return Ok(PathBuf::from(dir));
-        }
-    }
-    bail!("cannot locate a home directory (set HOME, USERPROFILE, or LUABOX_STORE)")
+    crate::project::home_dir().ok_or_else(|| {
+        anyhow!("cannot locate a home directory (set HOME, USERPROFILE, or LUABOX_STORE)")
+    })
 }
 
 /// Splits `name[@version]`. The leading char is exempt so scoped names
@@ -676,7 +673,12 @@ fn remove_all_force(path: &Path) -> io::Result<()> {
     } else {
         if meta.permissions().readonly() {
             let mut perms = meta.permissions();
-            #[allow(clippy::permissions_set_readonly_false)]
+            #[allow(
+                clippy::permissions_set_readonly_false,
+                reason = "store hard-links inherit the object's read-only bit and Windows \
+                          refuses to remove read-only files; the attribute is cleared only \
+                          to delete the file on the very next line"
+            )]
             perms.set_readonly(false);
             fs::set_permissions(path, perms)?;
         }

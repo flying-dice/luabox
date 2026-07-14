@@ -25,15 +25,6 @@ use crate::error::{IoResultExt, StoreError};
 /// Monotonic tie-breaker so temp names are unique within a process.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Outcome of putting an object: was it freshly written, or already present?
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PutOutcome {
-    /// The object was written by this call.
-    Created,
-    /// The object already existed; this call deduplicated against it.
-    Existed,
-}
-
 /// Content-addressed object storage rooted at a store directory.
 #[derive(Debug, Clone)]
 pub(crate) struct ObjectStore {
@@ -76,7 +67,7 @@ impl ObjectStore {
         src: &Path,
         hash: &str,
         executable: bool,
-    ) -> Result<PutOutcome, StoreError> {
+    ) -> Result<(), StoreError> {
         if hash.len() < 3 {
             return Err(StoreError::InvalidHash {
                 hash: hash.to_string(),
@@ -84,7 +75,7 @@ impl ObjectStore {
         }
         let dst = self.object_path(hash);
         if dst.exists() {
-            return Ok(PutOutcome::Existed);
+            return Ok(());
         }
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)
@@ -100,13 +91,13 @@ impl ObjectStore {
             .io_context(|| format!("sealing temp object {}", tmp.display()))?;
 
         match fs::rename(&tmp, &dst) {
-            Ok(()) => Ok(PutOutcome::Created),
+            Ok(()) => Ok(()),
             Err(err) => {
                 // Either another writer won the race (dst now exists — fine, the
                 // content is identical) or the rename genuinely failed.
                 let _ = remove_file(&tmp);
                 if dst.exists() {
-                    Ok(PutOutcome::Existed)
+                    Ok(())
                 } else {
                     Err(err).io_context(|| format!("committing object {}", dst.display()))
                 }
@@ -155,7 +146,12 @@ pub(crate) fn set_writable_perms(path: &Path, executable: bool) -> io::Result<()
 /// read-only file attribute; the world-writable concern the lint raises applies
 /// only to Unix, which uses the mode-based branch above.
 #[cfg(not(unix))]
-#[allow(clippy::permissions_set_readonly_false)]
+#[allow(
+    clippy::permissions_set_readonly_false,
+    reason = "clearing the read-only attribute is the intended Windows operation here; \
+              the world-writable concern the lint raises is Unix-only and handled by the \
+              mode-based branch above"
+)]
 pub(crate) fn set_writable_perms(path: &Path, _executable: bool) -> io::Result<()> {
     let mut perms = fs::metadata(path)?.permissions();
     if perms.readonly() {
@@ -187,7 +183,12 @@ pub(crate) fn remove_file(path: &Path) -> io::Result<()> {
 /// this branch is effectively unreached there; the momentary world-writable
 /// window the lint warns about is closed immediately by the delete that
 /// follows, hence the targeted allow.
-#[allow(clippy::permissions_set_readonly_false)]
+#[allow(
+    clippy::permissions_set_readonly_false,
+    reason = "Windows refuses to remove a read-only file, so the attribute must be cleared \
+              before the delete; the momentary writable window is closed immediately by the \
+              remove that follows"
+)]
 fn clear_readonly(path: &Path) -> io::Result<()> {
     let mut perms = fs::metadata(path)?.permissions();
     if perms.readonly() {

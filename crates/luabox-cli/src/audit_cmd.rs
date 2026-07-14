@@ -138,22 +138,10 @@ fn advisory_db_dir() -> Option<PathBuf> {
         let path = PathBuf::from(dir);
         return path.is_dir().then_some(path);
     }
-    let home = home_dir()?;
+    // A missing home is not an error here (unlike `deps_cmd::home_dir`): it
+    // just means the default database location can't be checked, which folds
+    // into "no database configured".
+    let home = crate::project::home_dir()?;
     let default = home.join(".luabox").join("advisory-db");
     default.is_dir().then_some(default)
-}
-
-/// `$HOME` (unix) / `%USERPROFILE%` (windows). Unlike `deps_cmd::home_dir`,
-/// a missing home directory is not an error here — it just means the
-/// default database location cannot be checked, which folds into "no
-/// database configured".
-fn home_dir() -> Option<PathBuf> {
-    for var in ["HOME", "USERPROFILE"] {
-        if let Ok(dir) = env::var(var)
-            && !dir.trim().is_empty()
-        {
-            return Some(PathBuf::from(dir));
-        }
-    }
-    None
 }
