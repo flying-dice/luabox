@@ -24,7 +24,11 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets
+      # Belt-and-braces: the workspace declares [workspace.lints.clippy] with
+      # `all`/`pedantic` at warn, but env RUSTFLAGS=-Dwarnings only denies
+      # *rustc* warnings — clippy's own lints need `-- -D warnings` to become
+      # hard errors, otherwise a pedantic finding passes CI silently.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
   # SPEC.md §16.1 — perf gates are CI-blocking: cold start < 50 ms, and

@@ -1,128 +1,184 @@
-#!/usr/bin/env bash
-# Install the latest luabox release binary from the canonical GitLab
-# instance (gitlab.beluga-sirius.ts.net:flying-dice/luabox) — Linux/macOS.
-# Windows counterpart: scripts/install.ps1.
+#!/bin/bash
+# Install script for luabox.
+# Usage: curl -fsSL https://raw.githubusercontent.com/flying-dice/luabox/main/scripts/install.sh | bash
 #
-# Usage:
-#   curl -fsSL https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/raw/main/scripts/install.sh | bash
-#   # or, checked out locally:
-#   bash scripts/install.sh
-#
-# Env overrides:
-#   LUABOX_INSTALL_DIR   where to place the binary (default: ~/.local/bin)
-#
-# Until the first `v*` tag exists (see RELEASING.md), the GitLab releases
-# API has nothing to serve; this script detects that and errors out with a
-# pointer to the `cargo install --git` fallback below. That means this
-# script cannot be end-to-end verified until the first tag lands — it's
-# written defensively (every external command's exit status checked) but
-# the "happy path" download-and-verify is unproven in CI today.
-set -eu
+# Environment variables:
+#   LUABOX_INSTALL_DIR  — where to install (default: ~/.luabox/bin)
+#   LUABOX_VERSION      — version tag to install (default: latest)
 
-GITLAB_HOST="gitlab.beluga-sirius.ts.net"
-PROJECT_PATH="flying-dice/luabox"
-PROJECT_PATH_ENCODED="flying-dice%2Fluabox"
-API_BASE="https://${GITLAB_HOST}/api/v4/projects/${PROJECT_PATH_ENCODED}"
-INSTALL_DIR="${LUABOX_INSTALL_DIR:-$HOME/.local/bin}"
+set -euo pipefail
 
-log() { printf '==> %s\n' "$*"; }
-err() { printf 'error: %s\n' "$*" >&2; }
-warn() { printf 'warning: %s\n' "$*" >&2; }
+REPO="flying-dice/luabox"
+BINARY="luabox"
+INSTALL_DIR="${LUABOX_INSTALL_DIR:-$HOME/.luabox/bin}"
+VERSION="${LUABOX_VERSION:-latest}"
 
-fallback_hint() {
-    cat >&2 <<EOF
+detect_platform() {
+    local os arch target
 
-No published release was found. Until the first v* tag lands (see
-RELEASING.md), install straight from source instead:
+    os="$(uname -s)"
+    arch="$(uname -m)"
 
-    cargo install --git ssh://git@${GITLAB_HOST}/${PROJECT_PATH}.git luabox-cli
+    case "$os" in
+        Linux)  os="unknown-linux-gnu" ;;
+        Darwin) os="apple-darwin" ;;
+        *)
+            echo "error: unsupported OS: $os" >&2
+            echo "       use the PowerShell script on Windows" >&2
+            exit 1
+            ;;
+    esac
 
-(requires an SSH key registered with the GitLab instance, and a Rust
-toolchain — see https://rustup.rs).
-EOF
+    case "$arch" in
+        x86_64|amd64)   arch="x86_64" ;;
+        aarch64|arm64)   arch="aarch64" ;;
+        *)
+            echo "error: unsupported architecture: $arch" >&2
+            exit 1
+            ;;
+    esac
+
+    target="${arch}-${os}"
+
+    # Only targets with a prebuilt release asset are supported.
+    case "$target" in
+        x86_64-unknown-linux-gnu|aarch64-apple-darwin) ;;
+        x86_64-apple-darwin)
+            echo "error: no prebuilt binary for Intel macOS" >&2
+            echo "       build from source: cargo install --git https://github.com/$REPO luabox-cli" >&2
+            exit 1
+            ;;
+        aarch64-unknown-linux-gnu)
+            echo "error: no prebuilt binary for aarch64 Linux" >&2
+            echo "       build from source: cargo install --git https://github.com/$REPO luabox-cli" >&2
+            exit 1
+            ;;
+        *)
+            echo "error: no prebuilt binary for $target" >&2
+            echo "       build from source: cargo install --git https://github.com/$REPO luabox-cli" >&2
+            exit 1
+            ;;
+    esac
+
+    echo "$target"
 }
 
-need() {
-    command -v "$1" >/dev/null 2>&1 || { err "'$1' is required but not found on PATH"; exit 1; }
+resolve_version() {
+    if [ "$VERSION" = "latest" ]; then
+        VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+            | grep '"tag_name"' \
+            | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
+        if [ -z "$VERSION" ]; then
+            echo "error: could not resolve latest version" >&2
+            echo "       are there any releases for $REPO yet?" >&2
+            exit 1
+        fi
+    fi
+    echo "$VERSION"
 }
 
-need curl
-
-os="$(uname -s)"
-arch="$(uname -m)"
-case "$os" in
-    Linux) platform="linux" ;;
-    Darwin) platform="macos" ;;
-    *)
-        err "unsupported OS '${os}' — this script covers Linux and macOS only. On Windows, use scripts/install.ps1."
+# Download a URL to a file, exiting with an optional hint on failure.
+download_file() {
+    local url="$1" dest="$2" hint="${3:-}"
+    if ! curl -fsSL "$url" -o "$dest"; then
+        echo "error: download failed: $url" >&2
+        [ -n "$hint" ] && echo "       $hint" >&2
         exit 1
-        ;;
-esac
-case "$arch" in
-    x86_64 | amd64) ;;
-    *)
-        err "unsupported architecture '${arch}' — only x86_64 release binaries are published today."
+    fi
+}
+
+# Verify a downloaded artifact against the release's SHA256SUMS asset.
+verify_checksum() {
+    local file="$1" name="$2" ver="$3" dir="$4" sums_url expected actual
+
+    sums_url="https://github.com/$REPO/releases/download/${ver}/SHA256SUMS"
+
+    echo "  Verifying checksum ..."
+    download_file "$sums_url" "$dir/SHA256SUMS" "is there a release $ver?"
+
+    expected="$(awk -v f="$name" '$2 == f { print $1 }' "$dir/SHA256SUMS")"
+    if [ -z "$expected" ]; then
+        echo "error: no checksum listed for $name" >&2
         exit 1
-        ;;
-esac
-asset_name="luabox-x86_64-${platform}"
+    fi
 
-log "looking up the latest release for ${PROJECT_PATH} on ${GITLAB_HOST}..."
-release_json="$(curl -fsSL "${API_BASE}/releases/permalink/latest" 2>/dev/null || true)"
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual="$(sha256sum "$file" | awk '{ print $1 }')"
+    elif command -v shasum >/dev/null 2>&1; then
+        actual="$(shasum -a 256 "$file" | awk '{ print $1 }')"
+    else
+        echo "error: no SHA-256 tool found (need sha256sum or shasum)" >&2
+        exit 1
+    fi
 
-if [ -z "$release_json" ] || ! printf '%s' "$release_json" | grep -q '"tag_name"'; then
-    err "no release found at ${API_BASE}/releases/permalink/latest"
-    fallback_hint
-    exit 1
-fi
+    if [ "$expected" != "$actual" ]; then
+        echo "error: checksum mismatch for $name" >&2
+        echo "       expected: $expected" >&2
+        echo "       actual:   $actual" >&2
+        exit 1
+    fi
+}
 
-# Scrape the asset URL out of the release JSON without a JSON-parser
-# dependency (curl + grep/sed is all this needs to promise): GitLab's
-# release payload nests assets at .assets.links[] as {"name": ..., "url":
-# ...} objects. Splitting on `}` isolates one object per line so a
-# name-then-url grep pair can't cross into a neighboring asset.
-asset_url="$(
-    printf '%s' "$release_json" \
-        | tr '}' '\n' \
-        | grep "\"name\":[[:space:]]*\"${asset_name}\"" \
-        | grep -o '"url"[[:space:]]*:[[:space:]]*"[^"]*"' \
-        | head -n1 \
-        | sed -E 's/.*"url"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/'
-)"
+# Print PATH setup guidance, unless INSTALL_DIR is already on PATH.
+print_path_hint() {
+    case ":$PATH:" in
+        *":$INSTALL_DIR:"*) return ;;
+    esac
 
-if [ -z "$asset_url" ]; then
-    tag="$(printf '%s' "$release_json" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | sed -E 's/.*:[[:space:]]*"([^"]*)".*/\1/')"
-    err "release ${tag:-<unknown>} has no '${asset_name}' asset"
-    fallback_hint
-    exit 1
-fi
+    local shell_name
+    shell_name="$(basename "${SHELL:-}")"
+    echo ""
+    echo "Add to your PATH:"
+    echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
+    echo ""
+    echo "Or add to your shell profile:"
+    case "$shell_name" in
+        zsh)  echo "  echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.zshrc" ;;
+        bash) echo "  echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.bashrc" ;;
+        fish) echo "  fish_add_path $INSTALL_DIR" ;;
+        *)    echo "  echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.\${SHELL}rc" ;;
+    esac
+}
 
-log "found asset: ${asset_url}"
+# Temp dir is script-global, not `local` to main: the EXIT trap below runs after
+# main returns, where a function-local would be out of scope and `set -u` would
+# abort the trap (unbound variable) — leaking the dir and exiting non-zero.
+tmp_dir=""
 
-tmp_bin="$(mktemp)"
-cleanup() { rm -f "$tmp_bin"; }
-trap cleanup EXIT
+main() {
+    local target version artifact_name download_url
 
-log "downloading..."
-curl -fsSL "$asset_url" -o "$tmp_bin"
-chmod +x "$tmp_bin"
+    echo "Installing luabox..."
 
-mkdir -p "$INSTALL_DIR"
-dest="${INSTALL_DIR}/luabox"
-mv "$tmp_bin" "$dest"
-trap - EXIT
+    target="$(detect_platform)"
+    version="$(resolve_version)"
+    artifact_name="luabox-${target}"
 
-log "installed to ${dest}"
+    echo "  Platform: $target"
+    echo "  Version:  $version"
+    echo "  Install:  $INSTALL_DIR"
 
-case ":${PATH}:" in
-    *":${INSTALL_DIR}:"*) ;;
-    *) warn "${INSTALL_DIR} is not on PATH; add it to your shell profile (e.g. export PATH=\"${INSTALL_DIR}:\$PATH\")" ;;
-esac
+    download_url="https://github.com/$REPO/releases/download/${version}/${artifact_name}.tar.gz"
 
-log "verifying..."
-if "$dest" --version; then
-    log "luabox installed successfully."
-else
-    err "installed binary at ${dest} failed to run '--version' — the download may be corrupt or for the wrong platform"
-    exit 1
-fi
+    tmp_dir="$(mktemp -d)"
+    trap 'rm -rf "${tmp_dir:-}"' EXIT
+
+    echo "  Downloading $download_url ..."
+    download_file "$download_url" "$tmp_dir/archive.tar.gz" \
+        "check that version '$version' has a release asset for '$target'"
+
+    verify_checksum "$tmp_dir/archive.tar.gz" "${artifact_name}.tar.gz" "$version" "$tmp_dir"
+
+    tar -xzf "$tmp_dir/archive.tar.gz" -C "$tmp_dir"
+
+    mkdir -p "$INSTALL_DIR"
+    mv "$tmp_dir/$BINARY" "$INSTALL_DIR/$BINARY"
+    chmod +x "$INSTALL_DIR/$BINARY"
+
+    echo ""
+    echo "luabox $version installed to $INSTALL_DIR/$BINARY"
+
+    print_path_hint
+}
+
+main

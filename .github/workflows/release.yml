@@ -1,0 +1,388 @@
+name: release
+
+# Cut a GitHub Release for a pushed `v*` tag: publish the release (notes lifted
+# from CHANGELOG.md), build the cross-platform `luabox` binaries + the VS Code
+# extension .vsix, attach them with SHA256SUMS and the install scripts, smoke
+# the just-uploaded artifacts on all three OSes, and only then mark the release
+# `--latest`.
+#
+# Everything happens in this ONE workflow run, triggered by the tag push — not
+# via an `on: release` trigger. A release created here with GITHUB_TOKEN would
+# NOT fire a downstream `release: published` workflow (GitHub suppresses
+# token-raised events), so the whole pipeline is chained by `needs:` instead.
+#
+# The install scripts (scripts/install.sh, scripts/install.ps1) download
+# `luabox-<target>.{tar.gz,zip}` from a release pinned by LUABOX_VERSION, so
+# attaching these assets and — after smoke passes — marking the release latest
+# is what makes `curl … | bash` / `irm … | iex` work.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+# Never run two release pipelines for the same tag concurrently; do not cancel
+# an in-flight one (a half-published release is worse than a slow one).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Publish the release up front so the build/vsix/publish/smoke jobs have a
+  # target to attach to and download from. Deliberately NOT marked latest yet
+  # (`--latest=false`) — that is gated behind `smoke` and done by `mark-latest`,
+  # so a release only goes live after its freshly-built artifacts install and
+  # run on all three OSes. `--draft=false` so smoke can download the uploaded
+  # install script from the public release-download URL.
+  create-release:
+    name: Create release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          version="${TAG#v}"
+          # Print the `## [x.y.z] - DATE` block (Keep a Changelog format — see
+          # CHANGELOG.md / RELEASING.md) up to the next `## [` header.
+          awk -v ver="$version" '
+            BEGIN { found = 0 }
+            /^## \[/ {
+              if (found) exit
+              if ($0 ~ "\\[" ver "\\]") { found = 1; next }
+            }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md || echo "(no CHANGELOG.md entry found for ${version})" > release-notes.md
+          echo "--- release notes ---"
+          cat release-notes.md
+      - name: Create the GitHub Release (not latest yet)
+        run: |
+          gh release create "$TAG" \
+            --title "luabox $TAG" \
+            --notes-file release-notes.md \
+            --draft=false \
+            --latest=false
+
+  # Build native release binaries for the tagged commit. Runner arch is
+  # load-bearing: macos-latest is Apple Silicon (aarch64-apple-darwin). Intel
+  # macOS (x86_64-apple-darwin) is not shipped — keep it out of the installer too.
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-latest   # Apple Silicon only
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+      # Match rust-toolchain.toml (1.92.0) and the repo's other workflows.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # `--locked`: build from the committed Cargo.lock exactly, so a release
+      # binary is bit-reproducible against the tagged tree and never silently
+      # picks up a newer transitive dep.
+      - name: Build
+        run: cargo build --release --locked -p luabox-cli --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          mkdir -p dist
+          tar -czf "dist/luabox-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" luabox
+      - name: Package (windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "target/${{ matrix.target }}/release/luabox.exe" -DestinationPath "dist/luabox-${{ matrix.target }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: luabox-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Package the VS Code extension. Required: the user drag-and-drops this .vsix
+  # into the VS Code Marketplace. The extension is versioned independently of
+  # the CLI (its own package.json version), so the file is `luabox-<extver>.vsix`,
+  # not tied to $TAG.
+  vsix:
+    name: Package VS Code extension
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+      - run: npm ci
+      - run: npm run compile
+      - run: npx @vscode/vsce package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: luabox-vsix
+          path: editors/vscode/*.vsix
+          if-no-files-found: error
+
+  # Checksum the binaries + vsix and attach them, SHA256SUMS, and the install
+  # scripts to the release. Does NOT mark the release latest — that is gated
+  # behind `smoke` and performed by `mark-latest`.
+  publish:
+    name: Upload assets
+    needs: [create-release, build, vsix]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        run: |
+          cd dist
+          # Checksum the archives and the vsix explicitly. `luabox-*.vsix` also
+          # matches `luabox-*`, so listing the archive globs + the vsix keeps
+          # each asset in SHA256SUMS exactly once.
+          sha256sum luabox-*.tar.gz luabox-*.zip *.vsix > SHA256SUMS
+          cat SHA256SUMS
+      - name: Upload assets to release
+        run: |
+          gh release upload "$TAG" \
+            dist/luabox-*.tar.gz dist/luabox-*.zip dist/*.vsix dist/SHA256SUMS \
+            scripts/install.sh scripts/install.ps1 \
+            --clobber
+
+  # Gate: on each OS, install the just-uploaded binary via the just-uploaded
+  # install script (pinned to the tag via LUABOX_VERSION — no `latest`
+  # resolution, since the release is deliberately not latest yet), assert it
+  # runs and reports the tag version, then scaffold a probe project and assert
+  # `luabox check` flags a deliberate type error (LB0300) non-zero and passes a
+  # clean file. All three legs must pass before the release goes live. No token:
+  # release-download URLs are public. (luabox has no self-upgrade command, so —
+  # unlike pseudoscript's smoke — there is no upgrade leg.)
+  smoke:
+    name: Smoke ${{ matrix.os }}
+    needs: publish
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            shell: bash
+          - os: macos-latest
+            shell: bash
+          - os: windows-latest
+            shell: pwsh
+    steps:
+      # Unix (Linux + macOS): run the uploaded install.sh pinned to the tag,
+      # then exercise the binary and a probe project.
+      - name: Smoke (unix)
+        if: matrix.shell == 'bash'
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Install via the uploaded install.sh asset, pinned to the tag.
+          # LUABOX_VERSION=<tag> pins the release (no /releases/latest lookup).
+          curl -fsSL "https://github.com/${REPO}/releases/download/${TAG}/install.sh" \
+            | LUABOX_VERSION="${TAG}" bash
+
+          # install.sh installs to $HOME/.luabox/bin by default.
+          export PATH="$HOME/.luabox/bin:$PATH"
+
+          # Version must match the tag (strip leading 'v': v0.1.0 -> "0.1.0").
+          ver_out="$(luabox --version)"
+          echo "version: $ver_out"
+          expected="${TAG#v}"
+          if ! printf '%s' "$ver_out" | grep -qE "(^| )${expected}( |$)"; then
+            echo "error: 'luabox --version' = '$ver_out', expected to contain '$expected'" >&2
+            exit 1
+          fi
+
+          # Scaffold a probe project with a deliberate type error.
+          work="$(mktemp -d)"
+          mkdir -p "$work/src"
+          cat > "$work/luabox.toml" <<'TOML'
+          [package]
+          name = "smoke"
+          version = "0.1.0"
+          edition = "5.4"
+          TOML
+          cat > "$work/src/main.lua" <<'LUA'
+          ---@param name string
+          ---@return string
+          local function greet(name)
+              return "Hello, " .. name .. "!"
+          end
+
+          print(greet(42))
+          LUA
+          cd "$work"
+
+          # The deliberate type error must fail `luabox check` non-zero, with
+          # LB0300 (type mismatch) in the output.
+          if check_out="$(luabox check 2>&1)"; then
+            echo "$check_out"
+            echo "error: 'luabox check' passed on a type-error project (expected failure)" >&2
+            exit 1
+          fi
+          echo "$check_out"
+          if ! printf '%s' "$check_out" | grep -q 'LB0300'; then
+            echo "error: expected LB0300 in 'luabox check' output" >&2
+            exit 1
+          fi
+
+          # Fix the error: a clean file must pass (exit 0).
+          cat > src/main.lua <<'LUA'
+          ---@param name string
+          ---@return string
+          local function greet(name)
+              return "Hello, " .. name .. "!"
+          end
+
+          print(greet("world"))
+          LUA
+          luabox check
+
+      # Windows: run the uploaded install.ps1 pinned to the tag, then exercise
+      # the binary and a probe project.
+      - name: Smoke (windows)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $ProgressPreference = "SilentlyContinue"
+
+          $tag  = $env:TAG
+          $repo = $env:REPO
+
+          # Download the uploaded install.ps1 to a file and run it (file-based, so
+          # a script parse error surfaces clearly and the shipped env-var path is
+          # used).
+          $ps1 = Join-Path $env:RUNNER_TEMP "install.ps1"
+          Invoke-WebRequest -Uri "https://github.com/$repo/releases/download/$tag/install.ps1" `
+            -OutFile $ps1 -UseBasicParsing
+
+          # Run the installer. install.ps1 is a PowerShell script (not an external
+          # exe), so $LASTEXITCODE is unreliable after `& $ps1`; rely on
+          # $ErrorActionPreference=Stop for throws and assert the binary landed.
+          $env:LUABOX_VERSION = $tag
+          & $ps1
+
+          # install.ps1 installs to $env:USERPROFILE\.luabox\bin by default.
+          $binDir = Join-Path $env:USERPROFILE ".luabox\bin"
+          $exe = Join-Path $binDir "luabox.exe"
+          if (-not (Test-Path $exe)) { Write-Error "install.ps1 did not produce $exe"; exit 1 }
+
+          # Re-run the installer the way users invoke it: `irm | iex` in an
+          # interactive Windows PowerShell 5.1 console. REPL mode loads
+          # PSReadLine, whose 2.0 DLL embeds a stub of
+          # System.Runtime.InteropServices.RuntimeInformation that shadows the
+          # real type — an arch-detection failure class the file-based run above
+          # cannot catch.
+          "`$env:LUABOX_VERSION = '$tag'; Get-Content -Raw '$ps1' | iex" | powershell.exe -NoProfile -
+          if ($LASTEXITCODE -ne 0) { Write-Error "REPL-mode (5.1) install failed"; exit 1 }
+          $env:PATH = "$binDir;$env:PATH"
+
+          # Version must match the tag (strip leading 'v').
+          $verOut   = (luabox --version)
+          Write-Host "version: $verOut"
+          $expected = $tag.TrimStart('v')
+          if ($verOut -notmatch "(^|\s)$([regex]::Escape($expected))(\s|`$)") {
+            Write-Error "'luabox --version' = '$verOut', expected to contain '$expected'"
+            exit 1
+          }
+
+          # Scaffold a probe project with a deliberate type error.
+          $work = Join-Path $env:RUNNER_TEMP "smoke-proj"
+          New-Item -ItemType Directory -Force -Path (Join-Path $work "src") | Out-Null
+          @"
+          [package]
+          name = "smoke"
+          version = "0.1.0"
+          edition = "5.4"
+          "@ | Set-Content -Path (Join-Path $work "luabox.toml") -Encoding utf8
+          @"
+          ---@param name string
+          ---@return string
+          local function greet(name)
+              return "Hello, " .. name .. "!"
+          end
+
+          print(greet(42))
+          "@ | Set-Content -Path (Join-Path $work "src\main.lua") -Encoding utf8
+          Set-Location $work
+
+          # The deliberate type error must fail `luabox check` non-zero, with
+          # LB0300 in the output.
+          $checkOut = (luabox check 2>&1 | Out-String)
+          Write-Host $checkOut
+          if ($LASTEXITCODE -eq 0) { Write-Error "'luabox check' passed on a type-error project (expected failure)"; exit 1 }
+          if ($checkOut -notmatch "LB0300") { Write-Error "expected LB0300 in 'luabox check' output"; exit 1 }
+
+          # Fix the error: a clean file must pass (exit 0).
+          @"
+          ---@param name string
+          ---@return string
+          local function greet(name)
+              return "Hello, " .. name .. "!"
+          end
+
+          print(greet("world"))
+          "@ | Set-Content -Path (Join-Path $work "src\main.lua") -Encoding utf8
+          luabox check
+          if ($LASTEXITCODE -ne 0) { Write-Error "'luabox check' failed on a clean project"; exit 1 }
+
+  # Go-live: mark the release latest, only reachable if all three smoke legs
+  # passed. A failed smoke skips this, so the release stays not-latest and the
+  # pipeline is red.
+  mark-latest:
+    name: Mark release latest
+    needs: smoke
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # No checkout in this job, so tell gh which repo to act on.
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Mark latest (go live)
+        run: gh release edit "$TAG" --latest
