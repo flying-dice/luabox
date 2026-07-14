@@ -380,7 +380,11 @@ fn remove_all_force(path: &Path) -> io::Result<()> {
     } else {
         if meta.permissions().readonly() {
             let mut perms = meta.permissions();
-            #[allow(clippy::permissions_set_readonly_false)]
+            #[allow(
+                clippy::permissions_set_readonly_false,
+                reason = "clearing the read-only bit is exactly the intent: git packs objects \
+                          read-only and they must be writable to delete on Windows"
+            )]
             perms.set_readonly(false);
             fs::set_permissions(path, perms)?;
         }

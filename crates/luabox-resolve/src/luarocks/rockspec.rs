@@ -544,7 +544,11 @@ fn lua_format(fmt: &str, args: &[Value]) -> Value {
                 let Some(Value::Num(n)) = args.get(arg_index) else {
                     return Value::Unknown;
                 };
-                #[allow(clippy::cast_possible_truncation)]
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "`%d`/`%i` mirror Lua's integer coercion of the number argument; \
+                              truncation to i64 is the intended formatting behaviour"
+                )]
                 let _ = write!(out, "{}", *n as i64);
                 arg_index += 1;
             }
@@ -552,7 +556,12 @@ fn lua_format(fmt: &str, args: &[Value]) -> Value {
                 let Some(Value::Num(n)) = args.get(arg_index) else {
                     return Value::Unknown;
                 };
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "`%x` mirrors Lua's unsigned-integer hex coercion of the number \
+                              argument; truncation and sign loss are the intended behaviour"
+                )]
                 let _ = write!(out, "{:x}", *n as i64 as u64);
                 arg_index += 1;
             }
@@ -626,7 +635,11 @@ fn decode_long_bracket(text: &str) -> Option<String> {
 fn decode_number(text: &str) -> Option<f64> {
     let text = text.trim();
     if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-        #[allow(clippy::cast_precision_loss)]
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "hex integer literals in rockspec fields are small magnitudes that \
+                      convert to f64 without meaningful precision loss"
+        )]
         return i64::from_str_radix(hex, 16).ok().map(|n| n as f64);
     }
     text.parse::<f64>().ok()
@@ -636,7 +649,11 @@ fn decode_number(text: &str) -> Option<f64> {
 /// integer-valued cases rockspecs actually concatenate.
 fn format_lua_number(n: f64) -> String {
     if n.fract() == 0.0 && n.is_finite() {
-        #[allow(clippy::cast_possible_truncation)]
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "guarded by the `fract() == 0.0 && is_finite()` check above, so the \
+                      integer-valued number casts to i64 exactly"
+        )]
         return format!("{}", n as i64);
     }
     format!("{n}")

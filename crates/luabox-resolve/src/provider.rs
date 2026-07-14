@@ -157,6 +157,13 @@ pub enum ProviderError {
         path: PathBuf,
         message: String,
     },
+    /// A shelled-out subprocess (`git`/`curl`/`tar`) failed to start or
+    /// exited non-zero — a network or external-tool failure, distinct from
+    /// local filesystem [`Io`](Self::Io).
+    External {
+        command: String,
+        message: String,
+    },
     InvalidManifest {
         path: PathBuf,
         message: String,
@@ -205,6 +212,15 @@ impl fmt::Display for ProviderError {
             }
             Self::Io { path, message } => {
                 write!(f, "failed to read `{}`: {message}", display_path(path))
+            }
+            // `message` already names the failing `command` and its cause
+            // (curl/git/tar stderr); the `command` field is kept for
+            // programmatic discrimination of which tool failed.
+            Self::External {
+                command: _,
+                message,
+            } => {
+                write!(f, "{message}")
             }
             Self::InvalidManifest { path, message } => {
                 write!(f, "invalid manifest `{}`: {message}", display_path(path))

@@ -157,7 +157,7 @@ impl LuaRocksProvider {
         let source_root = self.fetch_source(rock, &luarocks_version, &spec)?;
         remove_all_force(&tree_dir).map_err(|e| io(&tree_dir, &format!("clear tree: {e}")))?;
         fs::create_dir_all(&tree_dir).map_err(|e| io(&tree_dir, &format!("create tree: {e}")))?;
-        build_module_tree(&source_root, &spec, &tree_dir).map_err(|e| io(&tree_dir, &e))?;
+        build_module_tree(&source_root, &spec, &tree_dir)?;
         fs::write(tree_dir.join(".luabox-fetched"), b"")
             .map_err(|e| io(&tree_dir, &format!("mark fetched: {e}")))?;
         Ok(tree_dir)
@@ -247,7 +247,7 @@ impl LuaRocksProvider {
             return Ok(text);
         }
         let url = format!("{}/{file_name}", self.base_url);
-        let text = curl_text(&url).map_err(|e| io(&cached, &e))?;
+        let text = curl_text(&url)?;
         if let Some(parent) = cached.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -263,7 +263,7 @@ impl LuaRocksProvider {
             text
         } else {
             let url = format!("{}/manifest.json", self.base_url);
-            let text = curl_text(&url).map_err(|e| io(&manifest_path, &e))?;
+            let text = curl_text(&url)?;
             if let Some(parent) = manifest_path.parent() {
                 let _ = fs::create_dir_all(parent);
             }
@@ -368,7 +368,7 @@ fn fetch_git(url: &str, spec: &Rockspec, dest: &Path) -> Result<(), ProviderErro
     args.push(url.to_owned());
     args.push(dest.to_string_lossy().into_owned());
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run("git", &arg_refs, dest).map_err(|e| io(dest, &e))?;
+    run("git", &arg_refs, dest)?;
     // Drop `.git` so the tree is store-ready (git objects are read-only).
     remove_all_force(&dest.join(".git")).map_err(|e| io(dest, &format!("strip .git: {e}")))?;
     Ok(())
@@ -392,8 +392,7 @@ fn fetch_archive(url: &str, dest: &Path) -> Result<(), ProviderError> {
             url,
         ],
         dest,
-    )
-    .map_err(|e| io(dest, &e))?;
+    )?;
     let tar = tar_program();
     run(
         &tar.to_string_lossy(),
@@ -404,8 +403,7 @@ fn fetch_archive(url: &str, dest: &Path) -> Result<(), ProviderError> {
             &dest.to_string_lossy(),
         ],
         dest,
-    )
-    .map_err(|e| io(dest, &e))?;
+    )?;
     let _ = fs::remove_file(&archive);
     Ok(())
 }
@@ -415,6 +413,14 @@ fn io(path: &Path, message: &str) -> ProviderError {
     ProviderError::Io {
         path: path.to_path_buf(),
         message: message.to_owned(),
+    }
+}
+
+/// A [`ProviderError::External`] naming the tool that failed and the reason.
+fn external(command: &str, message: String) -> ProviderError {
+    ProviderError::External {
+        command: command.to_owned(),
+        message,
     }
 }
 
@@ -454,7 +460,14 @@ impl PackageProvider for LuaRocksProvider {
                 // `lua` is the interpreter, not a rock: handled as metadata.
                 continue;
             }
-            let requirement = translate_constraint(constraints);
+            let requirement = translate_constraint(constraints).map_err(|message| {
+                ProviderError::InvalidRequirement {
+                    dependent: format!("{LUAROCKS_PREFIX}{rock}"),
+                    dependency: format!("{LUAROCKS_PREFIX}{name}"),
+                    requirement: constraints.trim().to_owned(),
+                    message,
+                }
+            })?;
             deps.insert(
                 format!("{LUAROCKS_PREFIX}{name}"),
                 Dependency::Version(requirement),
@@ -532,7 +545,10 @@ fn lua_dialects(spec: &Rockspec) -> Vec<String> {
     let Some(constraints) = lua_constraint else {
         return Vec::new();
     };
-    let Ok(req) = VersionReq::parse(&translate_constraint(constraints)) else {
+    let Ok(requirement) = translate_constraint(constraints) else {
+        return Vec::new();
+    };
+    let Ok(req) = VersionReq::parse(&requirement) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -617,7 +633,11 @@ fn single_subdir(dir: &Path) -> Option<PathBuf> {
 /// `modname = "path.lua"` entry is copied to `dest/<modname→slashes>.lua`.
 /// With no usable module map, fall back to the conventional layout: `lua/`,
 /// then `src/`, then the source root itself.
-fn build_module_tree(source_root: &Path, spec: &Rockspec, dest: &Path) -> Result<(), String> {
+fn build_module_tree(
+    source_root: &Path,
+    spec: &Rockspec,
+    dest: &Path,
+) -> Result<(), ProviderError> {
     let lua_modules: Vec<(&String, &String)> = spec
         .build
         .modules
@@ -647,21 +667,26 @@ fn build_module_tree(source_root: &Path, spec: &Rockspec, dest: &Path) -> Result
     copy_tree(source_root, dest)
 }
 
-fn copy_file(from: &Path, to: &Path) -> Result<(), String> {
+fn copy_file(from: &Path, to: &Path) -> Result<(), ProviderError> {
     if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("create `{}`: {e}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .map_err(|e| io(parent, &format!("create `{}`: {e}", parent.display())))?;
     }
-    fs::copy(from, to)
-        .map(|_| ())
-        .map_err(|e| format!("copy `{}` -> `{}`: {e}", from.display(), to.display()))
+    fs::copy(from, to).map(|_| ()).map_err(|e| {
+        io(
+            to,
+            &format!("copy `{}` -> `{}`: {e}", from.display(), to.display()),
+        )
+    })
 }
 
 /// Recursively copies `src` into `dst`, skipping VCS/metadata noise.
-fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
-    fs::create_dir_all(dst).map_err(|e| format!("create `{}`: {e}", dst.display()))?;
-    let entries = fs::read_dir(src).map_err(|e| format!("read `{}`: {e}", src.display()))?;
+fn copy_tree(src: &Path, dst: &Path) -> Result<(), ProviderError> {
+    fs::create_dir_all(dst).map_err(|e| io(dst, &format!("create `{}`: {e}", dst.display())))?;
+    let entries =
+        fs::read_dir(src).map_err(|e| io(src, &format!("read `{}`: {e}", src.display())))?;
     for entry in entries {
-        let entry = entry.map_err(|e| format!("read entry: {e}"))?;
+        let entry = entry.map_err(|e| io(src, &format!("read entry: {e}")))?;
         let name = entry.file_name();
         if matches!(name.to_str(), Some(".git" | ".luabox-fetched")) {
             continue;
@@ -711,35 +736,46 @@ fn tar_program() -> PathBuf {
     PathBuf::from("tar")
 }
 
-/// Runs a command, returning `Ok(())` on success or a message with stderr.
-fn run(program: &str, args: &[&str], cwd: &Path) -> Result<(), String> {
+/// Runs a subprocess (`git`/`tar`), mapping a spawn failure or non-zero exit
+/// to [`ProviderError::External`] so it reads as the tool/network failure it
+/// is, not a local I/O error.
+fn run(program: &str, args: &[&str], cwd: &Path) -> Result<(), ProviderError> {
     let output = Command::new(program)
         .args(args)
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()
-        .map_err(|e| format!("cannot run `{program}`: {e}"))?;
+        .map_err(|e| external(program, format!("cannot run `{program}`: {e}")))?;
     if output.status.success() {
         Ok(())
     } else {
-        Err(format!(
-            "`{program} {}` failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
+        Err(external(
+            program,
+            format!(
+                "`{program} {}` failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
         ))
     }
 }
 
-/// `curl -fsSL` fetching a URL's body as text.
-fn curl_text(url: &str) -> Result<String, String> {
-    let output = Command::new("curl")
-        .args(["-fsSL", "--max-time", "120", url])
-        .output()
-        .map_err(|e| format!("cannot run `curl` (needed to reach {url}): {e}"))?;
+/// `curl -fsSL` fetching a URL's body as text, via the shared [`crate::http`]
+/// transport. Network/tool failures surface as [`ProviderError::External`].
+fn curl_text(url: &str) -> Result<String, ProviderError> {
+    let output = crate::http::get(url, 120, true).map_err(|e| {
+        external(
+            "curl",
+            format!("cannot run `curl` (needed to reach {url}): {e}"),
+        )
+    })?;
     if !output.status.success() {
-        return Err(format!(
-            "`curl` failed for {url}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+        return Err(external(
+            "curl",
+            format!(
+                "`curl` failed for {url}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -761,7 +797,11 @@ fn remove_all_force(path: &Path) -> io::Result<()> {
     } else {
         if meta.permissions().readonly() {
             let mut perms = meta.permissions();
-            #[allow(clippy::permissions_set_readonly_false)]
+            #[allow(
+                clippy::permissions_set_readonly_false,
+                reason = "clearing the read-only bit is exactly the intent: git packs objects \
+                          read-only and they must be writable to delete on Windows"
+            )]
             perms.set_readonly(false);
             fs::set_permissions(path, perms)?;
         }

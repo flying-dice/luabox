@@ -50,6 +50,23 @@ fn plain(major: u64, minor: u64, patch: u64) -> Version {
     Version::new(major, minor, patch)
 }
 
+/// Increments a version component, refusing versions so large that forming
+/// the `+1` upper bound would overflow `u64`.
+///
+/// Every `^`/`~`/`=`/`<=`/`>` bound in this module is built from a
+/// neighbouring version whose leftmost varying component is one greater than
+/// the requirement's (`^1.2.3` → `<2.0.0`, `~1.2` → `<1.3.0`, …). A component
+/// of `u64::MAX` makes that `+1` overflow. Such a value is not a real release
+/// — it only arrives from an adversarial manifest or registry entry — so this
+/// rejects it with a parse error rather than panicking (debug) or wrapping to
+/// a nonsensical range (release). The error flows out through
+/// [`req_to_ranges`]'s `Result`.
+fn bump(component: u64) -> Result<u64, String> {
+    component.checked_add(1).ok_or_else(|| {
+        format!("version component {component} is too large to form a requirement bound")
+    })
+}
+
 /// The fully-specified version a comparator names (requires minor + patch).
 fn base_version(c: &Comparator) -> Version {
     Version {
@@ -82,14 +99,14 @@ fn comparator_to_ranges(c: &Comparator) -> Result<VersionRanges, String> {
         Op::Exact | Op::Wildcard => match (c.minor, c.patch) {
             (Some(_), Some(_)) => Ranges::singleton(base_version(c)),
             (Some(minor), None) => {
-                Ranges::between(plain(major, minor, 0), sentinel(major, minor + 1, 0))
+                Ranges::between(plain(major, minor, 0), sentinel(major, bump(minor)?, 0))
             }
-            (None, _) => Ranges::between(plain(major, 0, 0), sentinel(major + 1, 0, 0)),
+            (None, _) => Ranges::between(plain(major, 0, 0), sentinel(bump(major)?, 0, 0)),
         },
         Op::Greater => match (c.minor, c.patch) {
             (Some(_), Some(_)) => Ranges::strictly_higher_than(base_version(c)),
-            (Some(minor), None) => Ranges::higher_than(plain(major, minor + 1, 0)),
-            (None, _) => Ranges::higher_than(plain(major + 1, 0, 0)),
+            (Some(minor), None) => Ranges::higher_than(plain(major, bump(minor)?, 0)),
+            (None, _) => Ranges::higher_than(plain(bump(major)?, 0, 0)),
         },
         Op::GreaterEq => match (c.minor, c.patch) {
             (Some(_), Some(_)) => Ranges::higher_than(base_version(c)),
@@ -109,39 +126,39 @@ fn comparator_to_ranges(c: &Comparator) -> Result<VersionRanges, String> {
         },
         Op::LessEq => match (c.minor, c.patch) {
             (Some(_), Some(_)) => Ranges::lower_than(base_version(c)),
-            (Some(minor), None) => Ranges::strictly_lower_than(sentinel(major, minor + 1, 0)),
-            (None, _) => Ranges::strictly_lower_than(sentinel(major + 1, 0, 0)),
+            (Some(minor), None) => Ranges::strictly_lower_than(sentinel(major, bump(minor)?, 0)),
+            (None, _) => Ranges::strictly_lower_than(sentinel(bump(major)?, 0, 0)),
         },
         Op::Tilde => match (c.minor, c.patch) {
             (Some(minor), Some(_)) => {
-                Ranges::between(base_version(c), sentinel(major, minor + 1, 0))
+                Ranges::between(base_version(c), sentinel(major, bump(minor)?, 0))
             }
             (Some(minor), None) => {
-                Ranges::between(plain(major, minor, 0), sentinel(major, minor + 1, 0))
+                Ranges::between(plain(major, minor, 0), sentinel(major, bump(minor)?, 0))
             }
-            (None, _) => Ranges::between(plain(major, 0, 0), sentinel(major + 1, 0, 0)),
+            (None, _) => Ranges::between(plain(major, 0, 0), sentinel(bump(major)?, 0, 0)),
         },
         // Caret: compatible within the leftmost non-zero component.
         Op::Caret => match (c.minor, c.patch) {
             (Some(minor), Some(patch)) => {
                 let upper = if major > 0 {
-                    sentinel(major + 1, 0, 0)
+                    sentinel(bump(major)?, 0, 0)
                 } else if minor > 0 {
-                    sentinel(0, minor + 1, 0)
+                    sentinel(0, bump(minor)?, 0)
                 } else {
-                    sentinel(0, 0, patch + 1)
+                    sentinel(0, 0, bump(patch)?)
                 };
                 Ranges::between(base_version(c), upper)
             }
             (Some(minor), None) => {
                 let upper = if major > 0 {
-                    sentinel(major + 1, 0, 0)
+                    sentinel(bump(major)?, 0, 0)
                 } else {
-                    sentinel(0, minor + 1, 0)
+                    sentinel(0, bump(minor)?, 0)
                 };
                 Ranges::between(plain(major, minor, 0), upper)
             }
-            (None, _) => Ranges::between(plain(major, 0, 0), sentinel(major + 1, 0, 0)),
+            (None, _) => Ranges::between(plain(major, 0, 0), sentinel(bump(major)?, 0, 0)),
         },
         // `semver::Op` is non-exhaustive; refuse rather than mis-resolve.
         op => return Err(format!("unsupported version-requirement operator {op:?}")),
@@ -380,6 +397,52 @@ mod tests {
         assert!(version_matches(&r, &v("1.7.9")));
         assert!(!version_matches(&r, &v("1.8.0")));
         assert!(!version_matches(&r, &v("1.2.2")));
+    }
+
+    #[test]
+    fn u64_max_components_error_instead_of_overflowing() {
+        // `u64::MAX` (2^64 - 1) as a version component makes the `+1` upper
+        // bound overflow. An adversarial manifest/registry could ship these;
+        // they must surface as an error, never a debug panic or a wrapped
+        // (nonsensical) range. One case per `+1`-bearing operator family:
+        // bare (caret default), caret, tilde, and the comparison forms.
+        // The overflow triggers only when the component that gets `+1`'d is
+        // itself the ceiling, so `max` sits in the bumped position each time.
+        let max = u64::MAX; // 18446744073709551615
+        let overflowing = [
+            format!("{max}"),         // bare -> ^ default, major+1
+            format!("^{max}.1.0"),    // caret, major+1
+            format!("^0.{max}.0"),    // caret zero-major, minor+1
+            format!("^0.0.{max}"),    // caret zero-minor, patch+1
+            format!("~{max}"),        // tilde, major+1
+            format!("~{max}.{max}"),  // tilde, minor+1
+            format!("={max}"),        // exact major -> major+1 upper
+            format!("={max}.{max}"),  // exact major.minor -> minor+1 upper
+            format!("{max}.*"),       // wildcard major -> major+1 upper
+            format!("{max}.{max}.*"), // wildcard major.minor -> minor+1 upper
+            format!(">{max}"),        // greater major -> major+1 lower
+            format!(">{max}.{max}"),  // greater major.minor -> minor+1 lower
+            format!("<={max}"),       // less-eq major -> major+1 upper
+            format!("<={max}.{max}"), // less-eq major.minor -> minor+1 upper
+        ];
+        for text in overflowing {
+            let req = VersionReq::parse(&text).expect("valid req");
+            let err = req_to_ranges(&req).expect_err(&format!("`{text}` must error, not overflow"));
+            assert!(
+                err.contains("too large"),
+                "`{text}` should report an oversized component, got `{err}`"
+            );
+        }
+
+        // One below the ceiling still forms a valid bound (only true overflow
+        // is rejected, not merely-large versions).
+        let ok = u64::MAX - 1;
+        assert!(req_to_ranges(&VersionReq::parse(&format!("^{ok}.0.0")).unwrap()).is_ok());
+        // Operator forms that never build a `+1` bound are unaffected even at
+        // the ceiling.
+        assert!(req_to_ranges(&VersionReq::parse(&format!(">={max}")).unwrap()).is_ok());
+        assert!(req_to_ranges(&VersionReq::parse(&format!("<{max}")).unwrap()).is_ok());
+        assert!(req_to_ranges(&VersionReq::parse(&format!("={max}.2.3")).unwrap()).is_ok());
     }
 
     #[test]

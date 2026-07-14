@@ -88,11 +88,15 @@ fn version_components(luarocks: &str) -> Option<[u64; 3]> {
 /// requirement string. `*` means "any version".
 ///
 /// An empty constraint (`""`) means "any version" → `*`.
-#[must_use]
-pub fn translate_constraint(constraints: &str) -> String {
+///
+/// # Errors
+/// Errors only on an absurd operand — a version component so large that the
+/// `~>` prefix bound would overflow `u64` (see [`pessimistic`]); such values
+/// only arrive from an adversarial rockspec, never a real release.
+pub fn translate_constraint(constraints: &str) -> Result<String, String> {
     let trimmed = constraints.trim();
     if trimmed.is_empty() {
-        return "*".to_owned();
+        return Ok("*".to_owned());
     }
 
     let mut comparators: Vec<String> = Vec::new();
@@ -102,7 +106,7 @@ pub fn translate_constraint(constraints: &str) -> String {
         if piece.is_empty() {
             continue;
         }
-        match translate_one(piece) {
+        match translate_one(piece)? {
             OneConstraint::Comparators(mut cs) => comparators.append(&mut cs),
             // A `~=`/`!=` sub-constraint widens to "any"; it contributes no
             // comparator, so if nothing else narrows the requirement it stays `*`.
@@ -110,11 +114,11 @@ pub fn translate_constraint(constraints: &str) -> String {
         }
     }
 
-    if comparators.is_empty() {
+    Ok(if comparators.is_empty() {
         "*".to_owned()
     } else {
         comparators.join(", ")
-    }
+    })
 }
 
 enum OneConstraint {
@@ -122,22 +126,22 @@ enum OneConstraint {
     Any,
 }
 
-fn translate_one(piece: &str) -> OneConstraint {
+fn translate_one(piece: &str) -> Result<OneConstraint, String> {
     let (op, operand) = split_operator(piece);
     let operand = operand.trim();
     // Strip a rock revision from the operand version.
     let version = operand.split('-').next().unwrap_or(operand).trim();
 
-    match op {
+    Ok(match op {
         ">=" | ">" | "<=" | "<" => OneConstraint::Comparators(vec![format!("{op}{version}")]),
         "==" | "=" | "" => OneConstraint::Comparators(vec![format!("={version}")]),
         "~=" | "!=" => OneConstraint::Any,
-        "~>" => OneConstraint::Comparators(pessimistic(version)),
+        "~>" => OneConstraint::Comparators(pessimistic(version)?),
         _ => {
             // Unknown operator: be conservative and pin exactly.
             OneConstraint::Comparators(vec![format!("={version}")])
         }
-    }
+    })
 }
 
 /// Splits a leading run of operator characters (`<>=~!`) off a constraint
@@ -153,14 +157,14 @@ fn split_operator(piece: &str) -> (&str, &str) {
 
 /// Expands the LuaRocks pessimistic operator `~> v` into explicit
 /// `>=`/`<` comparators (prefix match — see module docs).
-fn pessimistic(version: &str) -> Vec<String> {
+fn pessimistic(version: &str) -> Result<Vec<String>, String> {
     let core = version.split('-').next().unwrap_or(version);
     let numeric: Vec<u64> = core
         .split('.')
         .map(|p| p.parse::<u64>().unwrap_or(0))
         .collect();
     if numeric.is_empty() {
-        return vec![format!("={version}")];
+        return Ok(vec![format!("={version}")]);
     }
     // Lower bound: the version as written, padded to three components.
     let mut lower = numeric.clone();
@@ -170,15 +174,23 @@ fn pessimistic(version: &str) -> Vec<String> {
     let lower = format!("{}.{}.{}", lower[0], lower[1], lower[2]);
 
     // Upper bound: increment the last *written* component, zero the rest.
+    // A last component of `u64::MAX` (only ever from an adversarial rockspec,
+    // not a real release) would overflow this `+1`; reject it with a parse
+    // error rather than panicking, mirroring the semver-range bound handling.
     let mut upper = numeric.clone();
     let last = upper.len() - 1;
-    upper[last] += 1;
+    upper[last] = upper[last].checked_add(1).ok_or_else(|| {
+        format!(
+            "version component {} is too large to form a `~>` bound",
+            upper[last]
+        )
+    })?;
     while upper.len() < 3 {
         upper.push(0);
     }
     let upper = format!("{}.{}.{}", upper[0], upper[1], upper[2]);
 
-    vec![format!(">={lower}"), format!("<{upper}")]
+    Ok(vec![format!(">={lower}"), format!("<{upper}")])
 }
 
 #[cfg(test)]
@@ -223,7 +235,7 @@ mod tests {
             (">= 1.0, < 2.0", ">=1.0, <2.0"),
         ];
         for (input, expected) in cases {
-            let got = translate_constraint(input);
+            let got = translate_constraint(input).expect("valid constraint");
             assert_eq!(got, expected, "constraint `{input}`");
             assert!(
                 VersionReq::parse(&got).is_ok(),
@@ -235,7 +247,7 @@ mod tests {
     #[test]
     fn pessimistic_is_a_prefix_match() {
         // ~> 2.5 matches 2.5.x but not 2.6.
-        let got = translate_constraint("~> 2.5");
+        let got = translate_constraint("~> 2.5").expect("valid constraint");
         assert_eq!(got, ">=2.5.0, <2.6.0");
         let req = VersionReq::parse(&got).unwrap();
         assert!(req.matches(&Version::new(2, 5, 0)));
@@ -243,26 +255,52 @@ mod tests {
         assert!(!req.matches(&Version::new(2, 6, 0)));
 
         // ~> 2.5.3 matches only 2.5.3.
-        let got = translate_constraint("~> 2.5.3");
+        let got = translate_constraint("~> 2.5.3").expect("valid constraint");
         assert_eq!(got, ">=2.5.3, <2.5.4");
         let req = VersionReq::parse(&got).unwrap();
         assert!(req.matches(&Version::new(2, 5, 3)));
         assert!(!req.matches(&Version::new(2, 5, 4)));
 
         // ~> 2 matches 2.x.x but not 3.
-        let got = translate_constraint("~> 2");
+        let got = translate_constraint("~> 2").expect("valid constraint");
         assert_eq!(got, ">=2.0.0, <3.0.0");
+    }
+
+    #[test]
+    fn pessimistic_u64_max_errors_instead_of_overflowing() {
+        // `~> 18446744073709551615` (u64::MAX) from an adversarial rockspec
+        // would overflow the `+1` upper bound; it must error, not panic.
+        let max = u64::MAX;
+        for input in [
+            format!("~> {max}"),     // last written = major = MAX
+            format!("~> 1.{max}"),   // last written = minor = MAX
+            format!("~> 1.2.{max}"), // last written = patch = MAX
+            format!("~> {max}-1"),   // with a rock revision suffix
+        ] {
+            let err = translate_constraint(&input)
+                .expect_err(&format!("`{input}` must error, not overflow"));
+            assert!(
+                err.contains("too large"),
+                "`{input}` should report an oversized component, got `{err}`"
+            );
+        }
+        // One below the ceiling still translates cleanly.
+        let ok = u64::MAX - 1;
+        assert_eq!(
+            translate_constraint(&format!("~> {ok}")).expect("valid constraint"),
+            format!(">={ok}.0.0, <{max}.0.0")
+        );
     }
 
     #[test]
     fn not_equal_widens_to_any() {
         // `~=`/`!=` have no semver equivalent and widen to "any version".
-        assert_eq!(translate_constraint("~= 1.0"), "*");
-        assert_eq!(translate_constraint("!= 2.3"), "*");
+        assert_eq!(translate_constraint("~= 1.0").unwrap(), "*");
+        assert_eq!(translate_constraint("!= 2.3").unwrap(), "*");
     }
 
     #[test]
     fn constraint_operand_rock_revision_stripped() {
-        assert_eq!(translate_constraint(">= 1.4.1-3"), ">=1.4.1");
+        assert_eq!(translate_constraint(">= 1.4.1-3").unwrap(), ">=1.4.1");
     }
 }

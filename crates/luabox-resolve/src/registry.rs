@@ -60,7 +60,6 @@ use std::fs;
 use std::io;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -351,15 +350,12 @@ impl Registry {
             Root::Http(base) => {
                 let url = format!("{base}/{rel}");
                 let dest = staging.join(format!("{version}.tar"));
-                let status = Command::new("curl")
-                    .args(["-fsSL", "--max-time", "300", "-o"])
-                    .arg(&dest)
-                    .arg(&url)
-                    .status()
-                    .map_err(|e| RegistryError::Http {
+                let status = crate::http::download(&url, &dest, 300, true).map_err(|e| {
+                    RegistryError::Http {
                         url: url.clone(),
                         message: format!("failed to run `curl`: {e}"),
-                    })?;
+                    }
+                })?;
                 if !status.success() {
                     return Err(RegistryError::Http {
                         url,
@@ -474,14 +470,10 @@ fn write_parent_dirs(path: &Path) -> Result<(), RegistryError> {
 /// (curl exit 22 — typically 404: package not in the index); hard error on
 /// anything else. Best-effort HTTP, mirroring the toolchain installer.
 fn http_get_text(url: &str) -> Result<Option<String>, RegistryError> {
-    let output = Command::new("curl")
-        .args(["-fsS", "--max-time", "60"])
-        .arg(url)
-        .output()
-        .map_err(|e| RegistryError::Http {
-            url: url.to_owned(),
-            message: format!("failed to run `curl`: {e}"),
-        })?;
+    let output = crate::http::get(url, 60, false).map_err(|e| RegistryError::Http {
+        url: url.to_owned(),
+        message: format!("failed to run `curl`: {e}"),
+    })?;
     if output.status.success() {
         return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
     }

@@ -21,6 +21,7 @@
 
 pub mod advisory;
 pub mod git_provider;
+mod http;
 pub mod lockfile;
 pub mod luarocks;
 pub mod manifest;
