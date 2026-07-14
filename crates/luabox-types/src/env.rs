@@ -885,19 +885,17 @@ impl TypeEnv {
                 continue;
             };
             let Some(span) = item.target else { continue };
-            let Some(Stmt::FunctionDecl(f)) = stmt_at(root, (span.start, span.end)) else {
+            let Some(stmt) = stmt_at(root, (span.start, span.end)) else {
                 continue;
             };
-            let Some(fname) = f.name() else { continue };
-            let segments: Vec<String> = fname.segments().map(|s| s.text().to_string()).collect();
-            let [carrier, .., member] = segments.as_slice() else {
+            let Some((carrier, member)) = visibility_carrier_member(&stmt) else {
                 continue;
             };
-            let Some(class) = var_to_class.get(carrier) else {
+            let Some(class) = var_to_class.get(&carrier) else {
                 continue;
             };
             if let Some(def) = self.classes.get_mut(class) {
-                def.visibility.insert(member.clone(), scope);
+                def.visibility.insert(member, scope);
             }
         }
     }
@@ -1458,6 +1456,48 @@ fn carrier_var_name(stmt: &Stmt) -> Option<String> {
             Expr::Name(name) => Some(name.name()?.text().to_string()),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+/// The `(carrier, member)` a standalone `---@private`/`---@protected`/
+/// `---@package` tag targets (#115): either a `function Carrier.member()` /
+/// `function Carrier:method()` declaration, or a single-target
+/// `Carrier.member = <value>` field assignment. The assignment form mirrors
+/// luals, which resolves the class from the assignment base variable
+/// (`script/vm/visible.lua` `getParentClass` → `vm.getDefinedClass(uri,
+/// source.node)` for `setfield`/`setindex` nodes), so `---@private` on
+/// `Carrier.method = function() end` associates `method` with `Carrier`'s
+/// class. Conservative: multi-target assignments (`a.x, b.y = f, g`) and
+/// non-field targets stay unwired — no false `invisible`.
+fn visibility_carrier_member(stmt: &Stmt) -> Option<(String, String)> {
+    match stmt {
+        Stmt::FunctionDecl(f) => {
+            let segments: Vec<String> =
+                f.name()?.segments().map(|s| s.text().to_string()).collect();
+            let [carrier, .., member] = segments.as_slice() else {
+                return None;
+            };
+            Some((carrier.clone(), member.clone()))
+        }
+        Stmt::Assign(assign) => {
+            let target_list = assign.targets()?;
+            let mut targets = target_list.exprs();
+            let first = targets.next()?;
+            // Single-target only — `a.x, b.y = f, g` stays unwired.
+            if targets.next().is_some() {
+                return None;
+            }
+            let Expr::Field(field) = first else {
+                return None;
+            };
+            let Expr::Name(base) = field.base()? else {
+                return None;
+            };
+            let carrier = base.name()?.text().to_string();
+            let member = field.field_name()?.text().to_string();
+            Some((carrier, member))
+        }
         _ => None,
     }
 }

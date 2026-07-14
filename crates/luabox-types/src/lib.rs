@@ -2609,6 +2609,158 @@ print(c.radius)
         assert_eq!(strict_codes_ambient(src), vec!["LB0312"]);
     }
 
+    #[test]
+    fn standalone_private_on_bare_assign_carrier_blocked_outside() {
+        // The bare-assignment carrier form: `---@private Carrier.method =
+        // function() end`. luals resolves the class from the assignment base
+        // (`vm.getDefinedClass` on the `setfield` node), so the member is
+        // private to the class and invisible outside its methods.
+        let src = "\
+---@class Widget
+local Widget = {}
+Widget.__index = Widget
+
+---@private
+Widget.reset = function() end
+
+---@param w Widget
+local function use(w)
+  return w.reset
+end
+";
+        assert_eq!(strict_codes(src), vec!["LB0312"]);
+    }
+
+    #[test]
+    fn standalone_private_on_bare_assign_carrier_clean_inside() {
+        // Read from inside a `:` method of the same class — the enclosing class
+        // context makes the private member visible (clean).
+        let src = "\
+---@class Widget
+local Widget = {}
+Widget.__index = Widget
+
+---@private
+Widget.reset = function() end
+
+function Widget:render()
+  return self.reset
+end
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn standalone_private_from_inside_bare_assigned_method() {
+        // Item 2 (access side): a method itself *defined* via the bare-assign
+        // carrier form (`Widget.render = function(self) ... end`) that reads a
+        // private member of its own class is judged in-class (clean). Both the
+        // `function Widget:m()` and `Widget.m = function()` forms desugar to the
+        // same HIR assignment, so the enclosing-class judgment is symmetric.
+        let src = "\
+---@class Widget
+local Widget = {}
+Widget.__index = Widget
+
+---@private
+Widget.reset = function() end
+
+---@param self Widget
+Widget.render = function(self)
+  return self.reset
+end
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn standalone_protected_on_bare_assign_carrier() {
+        // `---@protected` variant: readable in the owning class's own method,
+        // invisible from an unrelated function.
+        let src = "\
+---@class Widget
+local Widget = {}
+Widget.__index = Widget
+
+---@protected
+Widget.token = function() end
+
+function Widget:reveal()
+  return self.token
+end
+
+---@param w Widget
+local function leak(w)
+  return w.token
+end
+";
+        assert_eq!(strict_codes(src), vec!["LB0312"]);
+    }
+
+    #[test]
+    fn standalone_package_on_bare_assign_carrier() {
+        // `---@package` variant: accessible anywhere in the file that declares
+        // the class (clean same-file).
+        let src = "\
+---@class Config
+local Config = {}
+Config.__index = Config
+
+---@package
+Config.secret = function() end
+
+---@param c Config
+local function read(c)
+  return c.secret
+end
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn standalone_visibility_multi_target_assign_not_wired() {
+        // Conservative: a visibility tag above a multi-target assignment
+        // (`a.x, b.y = f, g`) is *not* wired — the base of a member does not
+        // resolve to a single class, so nothing is marked private and the
+        // outside read stays clean (no false `invisible`).
+        let src = "\
+---@class Widget
+local Widget = {}
+Widget.__index = Widget
+
+local other = {}
+
+---@private
+Widget.reset, other.y = function() end, 1
+
+---@param w Widget
+local function use(w)
+  return w.reset
+end
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn standalone_visibility_on_non_carrier_base_unaffected() {
+        // A bare assignment whose base is not a declared class carrier: the tag
+        // finds no class to attach to, so nothing is marked private and the read
+        // stays clean (no false `invisible`).
+        let src = "\
+---@class Widget
+local Widget = {}
+Widget.__index = Widget
+
+local plain = {}
+
+---@private
+plain.reset = function() end
+
+local x = plain.reset
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
     // --- #122 callable classes (`---@operator call`) -------------------------
 
     const CALLABLE: &str = "\
