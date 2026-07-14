@@ -42,7 +42,10 @@ mod tests {
     /// the spec's actual example — no hand-transcription to drift out of
     /// sync.
     fn spec_manifest_example() -> String {
-        let spec = include_str!("../../../SPEC.md");
+        // Normalize CRLF first: a Windows checkout with core.autocrlf=true
+        // (GitHub's windows runners) hands include_str! CRLF text, and the
+        // exact "```toml\n" fence match would miss the trailing \r.
+        let spec = include_str!("../../../SPEC.md").replace("\r\n", "\n");
         let heading = spec
             .find("## 5. Project manifest")
             .expect("SPEC.md §5 heading present");

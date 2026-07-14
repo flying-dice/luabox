@@ -1,0 +1,12 @@
+# Normalize to LF in the repository and on checkout, on every platform.
+# Tests read repo files verbatim (e.g. SPEC.md's fenced manifest example,
+# Lua fixtures with byte-precise diagnostics spans), so a CRLF checkout —
+# GitHub's Windows runners default to core.autocrlf=true — must not change
+# file contents.
+* text=auto eol=lf
+
+# Binary / generated assets: never normalize.
+*.png binary
+*.gif binary
+*.ico binary
+*.vsix binary
