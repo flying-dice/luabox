@@ -33,7 +33,7 @@ use crate::lockfile::{LockedPackage, LockedSource, Lockfile};
 use crate::manifest::{Dependency, Manifest};
 use crate::provider::{
     GitReference, PackageId, PackageProvider, ProviderError, Source, normalize_path,
-    relative_display,
+    parse_manifest_at, relative_display,
 };
 use crate::report::ResolveReportFormatter;
 use crate::semver_ranges::{VersionRanges, req_to_ranges, version_matches};
@@ -475,14 +475,7 @@ fn workspace_member_map(
             path: file.clone(),
             message: e.to_string(),
         })?;
-        let manifest = Manifest::parse(&text).map_err(|errors| ProviderError::InvalidManifest {
-            path: file,
-            message: errors
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("; "),
-        })?;
+        let manifest = parse_manifest_at(&file, &text)?;
         members.insert(manifest.package.name.clone(), normalize_path(&dir));
     }
     Ok(members)

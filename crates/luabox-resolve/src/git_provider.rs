@@ -46,7 +46,7 @@ use semver::Version;
 
 use crate::manifest::{Dependency, Manifest};
 use crate::provider::{
-    GitReference, PackageId, PackageMeta, PackageProvider, ProviderError, Source,
+    GitReference, PackageId, PackageMeta, PackageProvider, ProviderError, Source, parse_manifest_at,
 };
 
 /// Name of the file that records a cache entry's resolved commit.
@@ -131,14 +131,7 @@ impl GitProvider {
             path: manifest_path.clone(),
             message: format!("git dependency has no readable luabox.toml: {e}"),
         })?;
-        let manifest = Manifest::parse(&text).map_err(|errors| ProviderError::InvalidManifest {
-            path: manifest_path,
-            message: errors
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("; "),
-        })?;
+        let manifest = parse_manifest_at(&manifest_path, &text)?;
 
         let entry = Entry { checkout, manifest };
         self.entries.borrow_mut().insert(key, entry.clone());

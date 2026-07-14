@@ -255,6 +255,21 @@ impl fmt::Display for ProviderError {
 
 impl std::error::Error for ProviderError {}
 
+/// Parses the `luabox.toml` text read from `path`, wrapping any validation
+/// errors as a single [`ProviderError::InvalidManifest`] whose message joins
+/// every collected error. `path` is used only for diagnostics; the caller
+/// owns reading the file (so each source can report its own read failure).
+pub(crate) fn parse_manifest_at(path: &Path, text: &str) -> Result<Manifest, ProviderError> {
+    Manifest::parse(text).map_err(|errors| ProviderError::InvalidManifest {
+        path: path.to_path_buf(),
+        message: errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; "),
+    })
+}
+
 /// The seam between the solver and package metadata storage (SPEC.md §6).
 ///
 /// Implementations must be *deterministic*: identical inputs must produce
@@ -311,23 +326,11 @@ impl PathProvider {
         let mut cache = self.manifests.borrow_mut();
         if !cache.contains_key(path) {
             let file = path.join("luabox.toml");
-            // TODO: clean-code - 0.55 - DRY: this read-luabox.toml + parse +
-            // wrap-into-ProviderError::{Io,InvalidManifest} block is repeated
-            // in solver.rs and git_provider.rs. Extract one
-            // parse_manifest_at(path) -> Result<Manifest, ProviderError>.
             let text = std::fs::read_to_string(&file).map_err(|e| ProviderError::Io {
                 path: file.clone(),
                 message: e.to_string(),
             })?;
-            let manifest =
-                Manifest::parse(&text).map_err(|errors| ProviderError::InvalidManifest {
-                    path: file.clone(),
-                    message: errors
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("; "),
-                })?;
+            let manifest = parse_manifest_at(&file, &text)?;
             cache.insert(path.clone(), manifest);
         }
         let manifest = &cache[path];
