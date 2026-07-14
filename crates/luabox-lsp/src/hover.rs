@@ -1,5 +1,7 @@
 //! Hover: the identifier under the cursor rendered as a `lua` code block
-//! (binding type, function signature, class field) plus its LuaCATS doc text.
+//! (binding type, function signature, class field) plus its LuaCATS doc text
+//! and the block's `---@see` references (rendered as LuaLS does: a single
+//! `See: x` line, or a `See:` header with `  * x` bullets when several).
 
 use lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind};
 use luabox_hir::{BindingKind, Resolution};
@@ -21,7 +23,7 @@ pub fn hover(sema: &FileSema, offset: usize) -> Option<Hover> {
         .into_iter()
         .find(|f| f.decl_range == token_range)
     {
-        return Some(reply(&info.sig, &info.docs, token_range, sema));
+        return Some(reply(&info.sig, &info.docs, &info.sees, token_range, sema));
     }
 
     // 2. A field / method access on a receiver with a known class type.
@@ -45,7 +47,7 @@ pub fn hover(sema: &FileSema, offset: usize) -> Option<Hover> {
                 .into_iter()
                 .find(|f| f.decl_range == binding.range)
         {
-            return Some(reply(&info.sig, &info.docs, token_range, sema));
+            return Some(reply(&info.sig, &info.docs, &info.sees, token_range, sema));
         }
         let rendered_ty = sema
             .binding_type(binding)
@@ -56,11 +58,10 @@ pub fn hover(sema: &FileSema, offset: usize) -> Option<Hover> {
             _ => "local",
         };
         let code = format!("{keyword} {}: {rendered_ty}", binding.name);
-        let docs = sema
-            .item_covering(binding.range)
-            .map(sema::docs_of)
-            .unwrap_or_default();
-        return Some(reply(&code, &docs, token_range, sema));
+        let item = sema.item_covering(binding.range);
+        let docs = item.map(sema::docs_of).unwrap_or_default();
+        let sees = item.map(sema::sees_of).unwrap_or_default();
+        return Some(reply(&code, &docs, &sees, token_range, sema));
     }
 
     None
@@ -109,35 +110,46 @@ fn member_hover(sema: &FileSema, token: &luabox_syntax::lua::SyntaxToken) -> Opt
             sema::render_type(&field.ty)
         );
         let docs = field.desc.clone().unwrap_or_default();
-        return Some(reply(&code, &docs, member.text_range(), sema));
+        return Some(reply(&code, &docs, &[], member.text_range(), sema));
     }
 
     // Fallback: an annotated dotted function `M.helper`.
     let dotted = format!("{}.{}", recv_token.text(), member.text());
     let info = sema.functions().into_iter().find(|f| f.name == dotted)?;
-    Some(reply(&info.sig, &info.docs, member.text_range(), sema))
+    Some(reply(
+        &info.sig,
+        &info.docs,
+        &info.sees,
+        member.text_range(),
+        sema,
+    ))
 }
 
 /// Hover for a global name: an annotated/declared function or a class name.
 fn global_hover(sema: &FileSema, name: &str, token_range: TextRange) -> Option<Hover> {
     if let Some(info) = sema.functions().into_iter().find(|f| f.name == name) {
-        return Some(reply(&info.sig, &info.docs, token_range, sema));
+        return Some(reply(&info.sig, &info.docs, &info.sees, token_range, sema));
     }
     let classes = sema.classes();
     let info = classes.get(name)?;
     Some(reply(
         &format!("class {name}"),
         &info.docs,
+        &info.sees,
         token_range,
         sema,
     ))
 }
 
-fn reply(code: &str, docs: &str, range: TextRange, sema: &FileSema) -> Hover {
+fn reply(code: &str, docs: &str, sees: &[String], range: TextRange, sema: &FileSema) -> Hover {
     let mut value = format!("```lua\n{code}\n```");
     if !docs.is_empty() {
         value.push_str("\n\n");
         value.push_str(docs);
+    }
+    if !sees.is_empty() {
+        value.push_str("\n\n");
+        value.push_str(&see_lines(sees));
     }
     Hover {
         contents: HoverContents::Markup(MarkupContent {
@@ -148,5 +160,22 @@ fn reply(code: &str, docs: &str, range: TextRange, sema: &FileSema) -> Hover {
             sema.index
                 .range(usize::from(range.start())..usize::from(range.end())),
         ),
+    }
+}
+
+/// Render `---@see` references the way LuaLS's hover does
+/// (`core/hover/description.lua`, `lookUpDocSees`): one reference inline,
+/// several as an indented bullet list.
+fn see_lines(sees: &[String]) -> String {
+    match sees {
+        [only] => format!("See: {only}"),
+        many => {
+            let mut out = String::from("See:");
+            for see in many {
+                out.push_str("\n  * ");
+                out.push_str(see);
+            }
+            out
+        }
     }
 }

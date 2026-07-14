@@ -49,6 +49,8 @@ pub struct FunctionDoc {
     pub docs: String,
     /// Whether the block carries `@deprecated`.
     pub deprecated: bool,
+    /// `@see` references, in declaration order.
+    pub sees: Vec<String>,
 }
 
 impl FunctionDoc {
@@ -103,6 +105,8 @@ pub struct ClassDoc {
     /// Functions declared as `Class:m` / `Class.m` in the same module.
     pub methods: Vec<FunctionDoc>,
     pub docs: String,
+    /// `@see` references, in declaration order.
+    pub sees: Vec<String>,
 }
 
 /// One `@field` of a class.
@@ -234,7 +238,20 @@ fn class_doc(tag: &luacats::ClassTag, block: &luacats::AnnotationBlock, docs: St
         fields,
         methods: Vec::new(),
         docs,
+        sees: sees_of(block),
     }
+}
+
+/// The `@see` references of a block, in declaration order.
+fn sees_of(block: &luacats::AnnotationBlock) -> Vec<String> {
+    block
+        .tags
+        .iter()
+        .filter_map(|t| match t {
+            luacats::Tag::See(tag) => tag.text.clone(),
+            _ => None,
+        })
+        .collect()
 }
 
 fn field_doc(field: &luacats::FieldTag) -> FieldDoc {
@@ -490,6 +507,7 @@ fn function_doc(
         returns,
         docs: item.map(|i| docs_of(&i.block, source)).unwrap_or_default(),
         deprecated,
+        sees: item.map(|i| sees_of(&i.block)).unwrap_or_default(),
     }
 }
 
@@ -751,6 +769,24 @@ mod tests {
     fn deprecated_is_flagged() {
         let m = module("---@deprecated use add2\nlocal function add()\nend\n");
         assert!(m.functions[0].deprecated);
+    }
+
+    #[test]
+    fn see_references_are_harvested_for_functions_and_classes() {
+        let m = module(
+            "---@see other.frob compare with\n\
+             ---@see Point\n\
+             local function frob()\nend\n\
+             \n\
+             ---@class Point\n\
+             ---@see geometry.Vec\n\
+             local Point = {}\n",
+        );
+        assert_eq!(
+            m.functions[0].sees,
+            vec!["other.frob compare with".to_string(), "Point".to_string()]
+        );
+        assert_eq!(m.classes[0].sees, vec!["geometry.Vec".to_string()]);
     }
 
     #[test]

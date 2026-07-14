@@ -875,6 +875,45 @@ print(p.x)
     client.shutdown();
 }
 
+#[test]
+fn hover_shows_single_see_reference_inline() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let source = "---Frobnicates.\n---@see other.frob\nlocal function frob() end\nfrob()\n";
+    client.open(&uri, source);
+    let mut client = client;
+    // Hover over the call site.
+    let hover = client.hover(&uri, 3, 1).expect("hover");
+    let text = hover_text(&hover);
+    assert!(text.contains("Frobnicates."), "{text}");
+    // One reference renders inline, LuaLS-style.
+    assert!(text.contains("See: other.frob"), "{text}");
+    client.shutdown();
+}
+
+#[test]
+fn hover_lists_multiple_see_references() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let source = "\
+---@see first.helper
+---@see second.helper explains the trick
+local function frob() end
+frob()
+";
+    client.open(&uri, source);
+    let mut client = client;
+    let hover = client.hover(&uri, 3, 1).expect("hover");
+    let text = hover_text(&hover);
+    assert!(text.contains("See:"), "{text}");
+    assert!(text.contains("* first.helper"), "{text}");
+    assert!(
+        text.contains("* second.helper explains the trick"),
+        "{text}"
+    );
+    client.shutdown();
+}
+
 // === Goto definition =====================================================
 
 #[test]
@@ -926,6 +965,77 @@ print(p.x)
     let location = client.definition(&uri, 5, 8).expect("definition");
     // The `@field x number` tag is on line 1.
     assert_eq!(location.range.start.line, 1);
+    client.shutdown();
+}
+
+#[test]
+fn goto_definition_redirects_via_source_annotation_with_line_and_col() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let source = "\
+---@source native/impl.c:12:4
+function ffi_call() end
+ffi_call()
+";
+    client.open(&uri, source);
+    let mut client = client;
+    // Goto-def on the use: redirected to the `@source` location instead of
+    // the declaration. The relative path resolves against the annotated
+    // file's directory; the target need not exist (LuaLS does not check).
+    let location = client.definition(&uri, 2, 1).expect("definition");
+    assert!(
+        location.uri.as_str().ends_with("native/impl.c"),
+        "{}",
+        location.uri.as_str()
+    );
+    // `:12:4` is a 1-based line and 0-based column (LuaLS `line - 1, char`).
+    assert_eq!(location.range.start, Position::new(11, 4));
+    assert_eq!(location.range.end, location.range.start);
+    client.shutdown();
+}
+
+#[test]
+fn goto_definition_source_redirect_without_line_targets_file_start() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let source = "---@source native/impl.c\nlocal function f() end\nf()\n";
+    client.open(&uri, source);
+    let mut client = client;
+    let location = client.definition(&uri, 2, 0).expect("definition");
+    assert!(
+        location.uri.as_str().ends_with("native/impl.c"),
+        "{}",
+        location.uri.as_str()
+    );
+    // No `:line` defaults to line 1 / column 0 → position (0, 0).
+    assert_eq!(location.range.start, Position::new(0, 0));
+    client.shutdown();
+}
+
+#[test]
+fn goto_definition_on_field_redirects_via_class_block_source() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let source = "\
+---@source native/point.c:3
+---@class Point
+---@field x number
+
+---@type Point
+local p = nil
+print(p.x)
+";
+    client.open(&uri, source);
+    let mut client = client;
+    // A `@source` in the class block redirects field jumps too (LuaLS
+    // `jump-source.lua` handles `doc.field.name` via the block's source).
+    let location = client.definition(&uri, 6, 8).expect("definition");
+    assert!(
+        location.uri.as_str().ends_with("native/point.c"),
+        "{}",
+        location.uri.as_str()
+    );
+    assert_eq!(location.range.start, Position::new(2, 0));
     client.shutdown();
 }
 

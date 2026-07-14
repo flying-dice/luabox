@@ -562,7 +562,22 @@ fn function_html(func: &FunctionDoc, links: &Links) -> String {
         }
         html.push_str("</dl>\n");
     }
+    html.push_str(&see_also_html(&func.sees, links));
     html.push_str("</div>\n");
+    html
+}
+
+/// The `@see` references as a "See also" section (any reference that names a
+/// documented type links to its page); empty when there are none.
+fn see_also_html(sees: &[String], links: &Links) -> String {
+    if sees.is_empty() {
+        return String::new();
+    }
+    let mut html = String::from("<h3>See also</h3>\n<ul class=\"item-list\">\n");
+    for see in sees {
+        let _ = writeln!(html, "<li>{}</li>", link_types(see, links));
+    }
+    html.push_str("</ul>\n");
     html
 }
 
@@ -681,6 +696,7 @@ fn class_page(
         let _ = writeln!(content, "<p>extends {}</p>", parents.join(", "));
     }
     content.push_str(&markdown::to_html(&class.docs));
+    content.push_str(&see_also_html(&class.sees, links));
 
     if !class.fields.is_empty() {
         content.push_str("<h2>Fields</h2>\n");
@@ -936,6 +952,44 @@ mod tests {
         // Circle itself has no children — no empty reverse-listing section.
         assert!(!circle.contains("<h2>Subclasses</h2>"));
         assert!(!circle.contains("<h2>Implementors</h2>"));
+    }
+
+    #[test]
+    fn see_references_render_as_a_linked_see_also_section() {
+        let module = model::lua_module(
+            "main",
+            "--- Distance.\n\
+             ---@see Point the receiver type\n\
+             local function dist(p)\n  return 0\nend\n\
+             \n\
+             ---@class Point\n\
+             ---@see dist\n\
+             local Point = {}\n",
+            Dialect::Lua54,
+        );
+        let model = DocModel {
+            package: "fixture".to_string(),
+            modules: vec![module],
+        };
+        let pages = pages(&model);
+        let module_page = &pages
+            .iter()
+            .find(|(name, _)| name == "module.main.html")
+            .expect("module page")
+            .1;
+        assert!(module_page.contains("<h3>See also</h3>"), "{module_page}");
+        // The reference names a documented class, so it links to its page.
+        assert!(
+            module_page.contains("<a href=\"class.Point.html\">Point</a> the receiver type"),
+            "{module_page}"
+        );
+        let class_page = &pages
+            .iter()
+            .find(|(name, _)| name == "class.Point.html")
+            .expect("class page")
+            .1;
+        assert!(class_page.contains("<h3>See also</h3>"), "{class_page}");
+        assert!(class_page.contains("<li>dist</li>"), "{class_page}");
     }
 
     #[test]

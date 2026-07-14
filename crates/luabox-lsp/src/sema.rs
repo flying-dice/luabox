@@ -45,6 +45,8 @@ pub struct ClassInfo<'a> {
     pub fields: Vec<&'a FieldTag>,
     /// The block's plain doc lines, joined.
     pub docs: String,
+    /// The block's `---@see` references, in declaration order.
+    pub sees: Vec<String>,
 }
 
 /// One function declaration: AST facts enriched with its annotation block.
@@ -68,6 +70,8 @@ pub struct FnInfo {
     /// `---@overload` alternate signatures. Each is a `fun(...)` type
     /// expression, so its parameters carry no `---@param`-style doc lines.
     pub overloads: Vec<(Vec<SigParam>, Vec<TypeExpr>)>,
+    /// `---@see` references from the annotation block, in declaration order.
+    pub sees: Vec<String>,
 }
 
 /// One parameter of a resolved signature: its declared/annotated name, type,
@@ -237,6 +241,7 @@ impl FileSema {
                                 tag: c,
                                 fields: Vec::new(),
                                 docs: docs_of(item),
+                                sees: sees_of(item),
                             },
                         );
                     }
@@ -284,6 +289,31 @@ impl FileSema {
                 })
             })
             .min_by_key(|item| item.target.map_or(usize::MAX, |t| t.end - t.start))
+    }
+
+    /// The `---@source` location text governing `range`: the tag of the
+    /// annotation block whose *target statement* contains the range (a
+    /// declaration site), or whose *block span* contains it (a `@field`/
+    /// `@class` tag site inside the block itself) — the two shapes LuaLS's
+    /// `core/jump-source.lua` redirects (`bindDocs` and `parent.source`).
+    #[must_use]
+    pub fn source_tag_covering(&self, range: TextRange) -> Option<&str> {
+        let (start, end) = (usize::from(range.start()), usize::from(range.end()));
+        self.items()
+            .iter()
+            .filter(|item| {
+                let in_target = item
+                    .target
+                    .is_some_and(|t| t.start <= start && end <= t.end);
+                let s = item.block.span;
+                in_target || (s.start <= start && end <= s.end)
+            })
+            .find_map(|item| {
+                item.block.tags.iter().find_map(|tag| match tag {
+                    Tag::Source(t) => t.text.as_deref(),
+                    _ => None,
+                })
+            })
     }
 
     /// The annotated type of a binding: an `---@type` on its `local`
@@ -409,6 +439,7 @@ impl FileSema {
                 params: collect_sig_params(params.as_ref(), item),
                 returns: collect_returns(item),
                 overloads: collect_overloads(item),
+                sees: item.map(sees_of).unwrap_or_default(),
                 name,
                 decl_range: decl_token.text_range(),
             });
@@ -494,6 +525,20 @@ fn collect_fields<'a>(
             out.push((field_name.clone(), (field, name.to_string())));
         }
     }
+}
+
+/// The `---@see` references of an annotation block, in declaration order
+/// (multiple `@see` tags are allowed; empty-bodied ones are skipped).
+#[must_use]
+pub fn sees_of(item: &AnnotatedItem) -> Vec<String> {
+    item.block
+        .tags
+        .iter()
+        .filter_map(|tag| match tag {
+            Tag::See(t) => t.text.clone(),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The joined plain doc lines of an annotation block.
