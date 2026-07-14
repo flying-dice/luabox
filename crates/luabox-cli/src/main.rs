@@ -4,6 +4,7 @@
 //! and diagnostic rendering; none of the domain logic.
 
 mod audit_cmd;
+mod auth_cmd;
 mod bench_cmd;
 mod build_cmd;
 mod bundle_cmd;
@@ -12,6 +13,7 @@ mod deps_cmd;
 mod doc_cmd;
 mod fmt_cmd;
 mod github;
+mod keychain;
 mod lint_cmd;
 mod lsp_cmd;
 mod modes;
@@ -102,6 +104,21 @@ enum Command {
     },
     /// Report git dependencies behind their repo's latest GitHub release
     Outdated {
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Sign in to GitHub via the browser (OAuth device flow); stores the token
+    /// encrypted in the OS keychain
+    Login {
+        /// Output format: text (default) or json (newline-delimited events)
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Delete the stored GitHub token from the OS keychain
+    Logout,
+    /// Show the signed-in GitHub identity, if any
+    Whoami {
         /// Output format: text (default) or json
         #[arg(long, default_value = "text")]
         format: String,
@@ -272,6 +289,9 @@ fn main() -> anyhow::Result<()> {
         Command::Remove { package } => deps_cmd::remove(&std::env::current_dir()?, &package),
         Command::Search { query, format } => search_cmd::run(query.as_deref(), &format),
         Command::Outdated { format } => outdated_cmd::run(&std::env::current_dir()?, &format),
+        Command::Login { format } => auth_cmd::login(&format),
+        Command::Logout => auth_cmd::logout(),
+        Command::Whoami { format } => auth_cmd::whoami(&format),
         Command::Install => deps_cmd::install(&std::env::current_dir()?),
         Command::Update { package } => {
             deps_cmd::update(&std::env::current_dir()?, package.as_deref())

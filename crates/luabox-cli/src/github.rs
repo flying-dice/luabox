@@ -76,6 +76,12 @@ struct Release {
     tag_name: String,
 }
 
+/// The one field of `GET /user` we read — the authenticated login.
+#[derive(Debug, Deserialize)]
+struct User {
+    login: String,
+}
+
 /// One entry of `GET /repos/{o}/{r}/tags`.
 #[derive(Debug, Deserialize)]
 struct Tag {
@@ -88,17 +94,68 @@ struct HttpResponse {
     body: String,
 }
 
-/// The token to authenticate GitHub requests with, or `None` (anonymous).
-/// `LUABOX_GITHUB_TOKEN` wins over `GITHUB_TOKEN`; blank values are ignored.
-pub(crate) fn token() -> Option<String> {
-    for var in ["LUABOX_GITHUB_TOKEN", "GITHUB_TOKEN"] {
-        if let Ok(value) = env::var(var)
-            && !value.trim().is_empty()
-        {
-            return Some(value);
+/// Where an authentication token came from, for `luabox whoami` to report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TokenSource {
+    /// A `LUABOX_GITHUB_TOKEN` / `GITHUB_TOKEN` environment variable.
+    Env,
+    /// The OS keychain, populated by `luabox login`.
+    Keychain,
+}
+
+impl TokenSource {
+    /// The stable `--format json` label (`"env"` / `"keychain"`).
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            TokenSource::Env => "env",
+            TokenSource::Keychain => "keychain",
         }
     }
+}
+
+/// Pure token-precedence resolution: `LUABOX_GITHUB_TOKEN` env wins, then
+/// `GITHUB_TOKEN` env, then a keychain-stored token; blank values are ignored
+/// at every level (an env var set to whitespace does not mask the keychain).
+/// Env beats the keychain so CI and one-off overrides are always honored.
+fn resolve_token(
+    luabox_env: Option<&str>,
+    github_env: Option<&str>,
+    keychain: Option<&str>,
+) -> Option<(String, TokenSource)> {
+    for candidate in [luabox_env, github_env] {
+        if let Some(value) = candidate
+            && !value.trim().is_empty()
+        {
+            return Some((value.to_owned(), TokenSource::Env));
+        }
+    }
+    if let Some(value) = keychain
+        && !value.trim().is_empty()
+    {
+        return Some((value.to_owned(), TokenSource::Keychain));
+    }
     None
+}
+
+/// The token to authenticate GitHub requests with and where it came from, or
+/// `None` (anonymous). Reads the two env vars, then the OS keychain; a keychain
+/// that cannot be reached is treated as "no stored token" (never fatal).
+pub(crate) fn token_with_source() -> Option<(String, TokenSource)> {
+    let luabox_env = env::var("LUABOX_GITHUB_TOKEN").ok();
+    let github_env = env::var("GITHUB_TOKEN").ok();
+    // A keychain read that errors (unavailable store) degrades to `None`.
+    let keychain = crate::keychain::retrieve().ok().flatten();
+    resolve_token(
+        luabox_env.as_deref(),
+        github_env.as_deref(),
+        keychain.as_deref(),
+    )
+}
+
+/// The token to authenticate GitHub requests with, or `None` (anonymous).
+/// `LUABOX_GITHUB_TOKEN` wins over `GITHUB_TOKEN`, then the keychain.
+pub(crate) fn token() -> Option<String> {
+    token_with_source().map(|(token, _)| token)
 }
 
 /// `curl` `url`, returning the HTTP status and body. GitHub API headers are
@@ -229,7 +286,26 @@ pub(crate) fn latest_release_tag(full_name: &str, token: Option<&str>) -> Result
     }
 }
 
+/// The authenticated user's login from `GET /user` (used by `luabox login`'s
+/// final confirmation and by `luabox whoami`). Requires a valid `token`.
+pub(crate) fn authenticated_login(token: &str) -> Result<String> {
+    let url = "https://api.github.com/user";
+    let response = http_get(url, Some(token))?;
+    if response.status != 200 {
+        return Err(api_error(url, &response, true));
+    }
+    parse_user_login(&response.body)
+        .with_context(|| format!("{url} response was not the expected JSON shape"))
+}
+
 // --- pure parsing (unit-tested; no IO) --------------------------------------
+
+/// Extract the `login` from a `GET /user` body (`None` if absent/malformed).
+fn parse_user_login(json: &str) -> Option<String> {
+    serde_json::from_str::<User>(json)
+        .ok()
+        .map(|user| user.login)
+}
 
 /// Parse a `GET /search/repositories` body into its items and total count.
 fn parse_search(json: &str) -> Result<SearchResponse> {
@@ -280,8 +356,63 @@ pub(crate) fn parse_github_repo(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_first_tag, parse_github_repo, parse_latest_release, parse_package_name, parse_search,
+        TokenSource, parse_first_tag, parse_github_repo, parse_latest_release, parse_package_name,
+        parse_search, parse_user_login, resolve_token,
     };
+
+    #[test]
+    fn parses_user_login() {
+        let json = r#"{"login":"octocat","id":1,"type":"User"}"#;
+        assert_eq!(parse_user_login(json).as_deref(), Some("octocat"));
+    }
+
+    #[test]
+    fn malformed_user_body_is_none() {
+        assert_eq!(parse_user_login(r#"{"message":"Bad credentials"}"#), None);
+    }
+
+    #[test]
+    fn env_token_wins_over_keychain() {
+        let resolved = resolve_token(Some("env-tok"), None, Some("kc-tok"));
+        assert_eq!(resolved, Some(("env-tok".to_owned(), TokenSource::Env)));
+    }
+
+    #[test]
+    fn luabox_env_wins_over_github_env() {
+        let resolved = resolve_token(Some("luabox"), Some("github"), None);
+        assert_eq!(resolved, Some(("luabox".to_owned(), TokenSource::Env)));
+    }
+
+    #[test]
+    fn github_env_used_when_luabox_absent() {
+        let resolved = resolve_token(None, Some("github"), Some("kc"));
+        assert_eq!(resolved, Some(("github".to_owned(), TokenSource::Env)));
+    }
+
+    #[test]
+    fn blank_env_does_not_mask_keychain() {
+        // An env var set to whitespace is ignored, so the keychain token wins.
+        let resolved = resolve_token(Some("   "), Some(""), Some("kc-tok"));
+        assert_eq!(resolved, Some(("kc-tok".to_owned(), TokenSource::Keychain)));
+    }
+
+    #[test]
+    fn keychain_used_when_no_env() {
+        let resolved = resolve_token(None, None, Some("kc-tok"));
+        assert_eq!(resolved, Some(("kc-tok".to_owned(), TokenSource::Keychain)));
+    }
+
+    #[test]
+    fn no_token_anywhere_is_anonymous() {
+        assert_eq!(resolve_token(None, None, None), None);
+        assert_eq!(resolve_token(Some(""), Some("  "), Some("")), None);
+    }
+
+    #[test]
+    fn token_source_labels_are_stable() {
+        assert_eq!(TokenSource::Env.label(), "env");
+        assert_eq!(TokenSource::Keychain.label(), "keychain");
+    }
 
     #[test]
     fn parses_search_items_and_total() {
