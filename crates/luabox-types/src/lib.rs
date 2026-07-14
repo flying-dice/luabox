@@ -898,6 +898,80 @@ f(1, \"x\", 2)
         assert_eq!(strict_codes(src), vec!["LB0300"]);
     }
 
+    // --- legacy `---@vararg Type` (deprecated EmmyLua spelling of
+    // `---@param ... Type`) ---------------------------------------------
+
+    #[test]
+    fn legacy_vararg_tag_lowers_into_func_varargs() {
+        // Direct check of the wiring in `TypeEnv::attach_function` (env.rs):
+        // a bare `---@vararg Type` must populate `FunctionTy::varargs`
+        // exactly like `---@param ... Type` does.
+        let src = "\
+---@vararg number
+local function f(...) end
+";
+        let parsed = parse(src, Dialect::Lua54);
+        assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
+        let env = TypeEnv::build(&parsed);
+        let func = env.function("f").expect("f should have a signature");
+        assert_eq!(func.varargs, Some(crate::ty::Ty::Number));
+        assert!(func.params.is_empty());
+    }
+
+    #[test]
+    fn legacy_vararg_tag_alone_types_dots() {
+        // `---@vararg string` alone must type `...` exactly like
+        // `---@param ... string` would: extra call args are checked against
+        // it, so a non-string extra arg is a type mismatch.
+        let src = "\
+---@vararg string
+local function f(...) end
+f(\"x\", \"y\")
+f(\"x\", 2)
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn legacy_vararg_tag_with_fixed_params() {
+        // `---@vararg` combines with ordinary `---@param` tags on fixed
+        // (non-vararg) parameters just like the modern `---@param ...` form
+        // does in `vararg_param_tag_binds_regardless_of_position` above.
+        let src = "\
+---@param a number
+---@vararg string
+local function f(a, ...) end
+f(1, \"x\", \"y\")
+f(1, \"x\", 2)
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
+    #[test]
+    fn legacy_vararg_tag_and_param_dots_union_per_luals() {
+        // luals precedent (lua-language-server, `script/vm/compiler.lua`,
+        // the `'...'`-source case): it loops over every doc bound to the AST
+        // vararg node — `script/parser/luadoc.lua`'s `bindDoc` binds *both* a
+        // `doc.vararg` tag and a `doc.param` tag whose `param[1] == '...'` to
+        // that same source — and calls `vm.setNode(source, ...)` for each
+        // one. `vm.setNode` without a `cover` argument *merges* (unions) into
+        // the existing node rather than overwriting it (`script/vm/node.lua`,
+        // `vm.setNode`). So when a block carries both a legacy `---@vararg`
+        // and a modern `---@param ...`, luals's effective vararg type is the
+        // union of the two — not "last tag wins" and not "param form wins".
+        // We match that: string|number here, so a `boolean` extra arg is the
+        // only misuse.
+        let src = "\
+---@vararg string
+---@param ... number
+local function f(...) end
+f(\"x\")
+f(1)
+f(true)
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
     #[test]
     fn duplicate_param_tag_names_first_wins() {
         let src = "\

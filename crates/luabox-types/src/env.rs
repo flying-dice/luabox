@@ -14,6 +14,7 @@ use luabox_syntax::lua::ast::{AstNode, Expr, LocalStmt, Stmt};
 use luabox_syntax::lua::{self, SyntaxKind, SyntaxNode};
 use luabox_syntax::luacats::{
     self, AliasTag, CastKind, FieldKey, FieldScope, ParamTag, ReturnTag, Tag, TypeExprKind,
+    VarargTag,
 };
 
 use crate::lower::{Declared, GenericClass, Lowerer};
@@ -638,6 +639,16 @@ impl TypeEnv {
         let mut current_class: Option<String> = None;
         let mut params: Vec<&ParamTag> = Vec::new();
         let mut returns: Vec<&ReturnTag> = Vec::new();
+        // Legacy `---@vararg Type`: the deprecated EmmyLua spelling of
+        // `---@param ... Type`. luals binds both a `doc.vararg` tag and a
+        // `doc.param` `...` tag onto the same AST vararg source and merges
+        // (unions) every bound doc's type via `vm.setNode` — see
+        // `script/vm/compiler.lua`'s `'...'` case, which loops over
+        // `source.bindDocs` and calls `vm.setNode` (additive, not `cover`)
+        // for each `doc.vararg`/`doc.param` match. So when both a `---@vararg`
+        // and a `---@param ...` tag appear on the same block, the resulting
+        // vararg element type is their union, not "last tag wins".
+        let mut vararg: Option<&VarargTag> = None;
         let mut types: Option<Vec<Ty>> = None;
         let mut type_span: Option<std::ops::Range<usize>> = None;
         let mut overloads: Vec<FunctionTy> = Vec::new();
@@ -764,6 +775,7 @@ impl TypeEnv {
                         });
                     }
                 }
+                Tag::Vararg(v) => vararg = Some(v),
                 _ => {}
             }
         }
@@ -778,7 +790,8 @@ impl TypeEnv {
         // `---@return`) must still attach a signature so the flag reaches the
         // function's use sites; `attach_function` no-ops on non-function
         // targets, so deprecating a `---@class` carrier is harmless here.
-        let has_sig_tags = !params.is_empty() || !returns.is_empty() || !overloads.is_empty();
+        let has_sig_tags =
+            !params.is_empty() || !returns.is_empty() || !overloads.is_empty() || vararg.is_some();
         if (has_sig_tags || deprecated || nodiscard)
             && let Some(target) = target
         {
@@ -796,7 +809,7 @@ impl TypeEnv {
             if !has_sig_tags {
                 func.varargs = Some(Ty::Any);
             }
-            self.attach_function(&params, &returns, func, target, lowerer, root);
+            self.attach_function(&params, &returns, vararg, func, target, lowerer, root);
         }
         if let (Some(types), Some(target)) = (types, target) {
             self.typed_locals.insert(target, types);
@@ -872,11 +885,12 @@ impl TypeEnv {
     /// Build a [`FunctionTy`] from `@param`/`@return` tags, reconcile it
     /// with the target function's AST parameter list, and register it under
     /// the function's name.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn attach_function(
         &mut self,
         params: &[&ParamTag],
         returns: &[&ReturnTag],
+        vararg: Option<&VarargTag>,
         mut func: FunctionTy,
         target: Target,
         lowerer: &mut Lowerer<'_>,
@@ -897,6 +911,18 @@ impl TypeEnv {
                     optional: param.optional,
                 });
             }
+        }
+        // Legacy `---@vararg Type`. luals precedent (see the comment
+        // in `absorb_block`): a `---@vararg` and a `---@param ... Type` on
+        // the same block both bind to the AST `...` node and their types are
+        // merged, so union rather than overwrite when a `---@param ...` tag
+        // already produced a varargs type.
+        if let Some(v) = vararg {
+            let ty = lowerer.lower(&v.ty);
+            func.varargs = Some(match func.varargs.take() {
+                Some(existing) => Ty::union(vec![existing, ty]),
+                None => ty,
+            });
         }
         func.has_return_annotation = !returns.is_empty();
         for tag in returns {
