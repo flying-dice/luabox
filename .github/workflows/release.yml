@@ -239,6 +239,11 @@ jobs:
           name = "smoke"
           version = "0.1.0"
           edition = "5.4"
+
+          # Strict mode makes LB0300 an error (nonzero exit); without it the
+          # type mismatch is a warning and `luabox check` exits 0.
+          [types]
+          strict = true
           TOML
           cat > "$work/src/main.lua" <<'LUA'
           ---@param name string
@@ -337,6 +342,11 @@ jobs:
           name = "smoke"
           version = "0.1.0"
           edition = "5.4"
+
+          # Strict mode makes LB0300 an error (nonzero exit); without it the
+          # type mismatch is a warning and luabox check exits 0.
+          [types]
+          strict = true
           "@ | Set-Content -Path (Join-Path $work "luabox.toml") -Encoding utf8
           @"
           ---@param name string
