@@ -648,7 +648,7 @@ impl TypeEnv {
         // for each `doc.vararg`/`doc.param` match. So when both a `---@vararg`
         // and a `---@param ...` tag appear on the same block, the resulting
         // vararg element type is their union, not "last tag wins".
-        let mut vararg: Option<&VarargTag> = None;
+        let mut varargs: Vec<&VarargTag> = Vec::new();
         let mut types: Option<Vec<Ty>> = None;
         let mut type_span: Option<std::ops::Range<usize>> = None;
         let mut overloads: Vec<FunctionTy> = Vec::new();
@@ -793,7 +793,7 @@ impl TypeEnv {
                         });
                     }
                 }
-                Tag::Vararg(v) => vararg = Some(v),
+                Tag::Vararg(v) => varargs.push(v),
                 _ => {}
             }
         }
@@ -808,8 +808,10 @@ impl TypeEnv {
         // `---@return`) must still attach a signature so the flag reaches the
         // function's use sites; `attach_function` no-ops on non-function
         // targets, so deprecating a `---@class` carrier is harmless here.
-        let has_sig_tags =
-            !params.is_empty() || !returns.is_empty() || !overloads.is_empty() || vararg.is_some();
+        let has_sig_tags = !params.is_empty()
+            || !returns.is_empty()
+            || !overloads.is_empty()
+            || !varargs.is_empty();
         if (has_sig_tags || deprecated || nodiscard || is_async || version.is_some())
             && let Some(target) = target
         {
@@ -829,7 +831,7 @@ impl TypeEnv {
             if !has_sig_tags {
                 func.varargs = Some(Ty::Any);
             }
-            self.attach_function(&params, &returns, vararg, func, target, lowerer, root);
+            self.attach_function(&params, &returns, &varargs, func, target, lowerer, root);
         }
         if let (Some(types), Some(target)) = (types, target) {
             self.typed_locals.insert(target, types);
@@ -908,7 +910,7 @@ impl TypeEnv {
         &mut self,
         params: &[&ParamTag],
         returns: &[&ReturnTag],
-        vararg: Option<&VarargTag>,
+        varargs_tags: &[&VarargTag],
         mut func: FunctionTy,
         target: Target,
         lowerer: &mut Lowerer<'_>,
@@ -933,9 +935,10 @@ impl TypeEnv {
         // Legacy `---@vararg Type`. luals precedent (see the comment
         // in `absorb_block`): a `---@vararg` and a `---@param ... Type` on
         // the same block both bind to the AST `...` node and their types are
-        // merged, so union rather than overwrite when a `---@param ...` tag
-        // already produced a varargs type.
-        if let Some(v) = vararg {
+        // merged, so union rather than overwrite — this covers both a
+        // `---@vararg` next to a `---@param ...` and several `---@vararg`
+        // tags on one block (each is one more bound doc in luals).
+        for v in varargs_tags {
             let ty = lowerer.lower(&v.ty);
             func.varargs = Some(match func.varargs.take() {
                 Some(existing) => Ty::union(vec![existing, ty]),

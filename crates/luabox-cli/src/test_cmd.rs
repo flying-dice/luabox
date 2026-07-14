@@ -17,10 +17,10 @@
 //!
 //! `--watch` reuses the shared watch driver (`crate::watch`): a rerun on
 //! every debounced source/manifest change, forever, a failing rerun
-//! reported but not fatal. `--coverage` (source-map-aware instrumentation,
-//! SPEC.md §11) isn't built yet; the flag is accepted only so it fails
-//! loudly with a clear error rather than silently running without it —
-//! see `run` below. It's hidden from `--help` accordingly.
+//! reported but not fatal. `--coverage` is not implemented and — with the
+//! command deprecated — never will be; the flag is accepted only so it
+//! fails loudly with a clear error rather than silently running without
+//! it — see `run` below. It's hidden from `--help` accordingly.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,10 +49,7 @@ pub fn run(
     );
 
     if coverage {
-        bail!(
-            "--coverage is not implemented and will not be: `luabox test` is \
-             deprecated (run `luabox test` for details)"
-        );
+        bail!("--coverage is not implemented and will not be: `luabox test` is deprecated");
     }
 
     if watch {

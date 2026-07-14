@@ -1569,6 +1569,19 @@ impl Checker<'_> {
 
     fn check_call(&mut self, call: &CallExpr) {
         let Some(sig) = call.callee().and_then(|c| self.callee_sig(&c)) else {
+            // `callee_sig` does not resolve members of `require`d modules; the
+            // resolved expression type does (the same fallback
+            // [`Checker::note_deprecated_read`] uses for the sibling
+            // `deprecated`/`version` flags), so an `---@async` function
+            // reached as a required module's member still flags
+            // `await-in-sync` (LB0316).
+            if let Some(callee) = call.callee()
+                && let Ty::Function(f) = self.expr_ty(&callee)
+                && f.is_async
+            {
+                let name = dotted_name(&callee);
+                self.check_await_in_sync(true, name.as_deref(), range(callee.syntax()));
+            }
             return;
         };
         // `await-in-sync` (LB0316): flag an `---@async` callee reached from a

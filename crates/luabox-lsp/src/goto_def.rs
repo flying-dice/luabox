@@ -162,10 +162,14 @@ fn source_redirect(sema: &FileSema, range: TextRange) -> Option<Location> {
     })
 }
 
-/// Split `path[:line[:col]]` exactly like LuaLS's
+/// Split `path[:line[:col]]` following LuaLS's
 /// `fullSource:match('^(.-):?(%d*):?(%d*)$')` — up to two all-digit suffix
 /// segments peel off the end (first is the 1-based line, second the 0-based
 /// column), so drive letters (`C:/x.c`) and `scheme://` prefixes survive.
+/// One deliberate divergence: LuaLS's optional colons let it eat trailing
+/// digits with *no* separator (`file2` → path `file`, line 2); here a digit
+/// segment only peels across an explicit `:`, so `---@source 123` stays the
+/// path `123` — the saner reading of a pathological input.
 fn parse_source_location(text: &str) -> (String, u32, u32) {
     let mut rest = text;
     let mut nums: Vec<&str> = Vec::new();

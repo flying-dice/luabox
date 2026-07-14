@@ -1013,6 +1013,86 @@ fn goto_definition_source_redirect_without_line_targets_file_start() {
 }
 
 #[test]
+fn source_redirect_does_not_leak_to_locals_inside_annotated_function() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    // `x` is declared *inside* the `@source`-annotated function; its
+    // goto-def must resolve to the local declaration, not `impl.c` — the
+    // block's tag governs only the names its own target statement declares.
+    let source = "\
+---@source native/impl.c:9
+local function f()
+  local x = 1
+  return x
+end
+f()
+";
+    client.open(&uri, source);
+    let mut client = client;
+    let location = client.definition(&uri, 3, 9).expect("definition");
+    assert!(
+        location.uri.as_str().ends_with("main.lua"),
+        "{}",
+        location.uri.as_str()
+    );
+    assert_eq!(location.range.start.line, 2);
+    client.shutdown();
+}
+
+#[test]
+fn source_redirect_does_not_leak_to_nested_functions() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    // `inner` is un-annotated; the outer function's `@source` must not
+    // hijack its goto-def.
+    let source = "\
+---@source native/outer.c:1
+local function outer()
+  local function inner() end
+  inner()
+end
+outer()
+";
+    client.open(&uri, source);
+    let mut client = client;
+    let location = client.definition(&uri, 3, 3).expect("definition");
+    assert!(
+        location.uri.as_str().ends_with("main.lua"),
+        "{}",
+        location.uri.as_str()
+    );
+    assert_eq!(location.range.start.line, 2);
+    client.shutdown();
+}
+
+#[test]
+fn nested_annotated_functions_redirect_to_their_own_source() {
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    // Both annotated: the inner declaration's own `@source` wins for the
+    // inner name (document order must not pick the outer item).
+    let source = "\
+---@source native/outer.c:1
+local function outer()
+  ---@source native/inner.c:2
+  local function inner() end
+  inner()
+end
+outer()
+";
+    client.open(&uri, source);
+    let mut client = client;
+    let location = client.definition(&uri, 4, 3).expect("definition");
+    assert!(
+        location.uri.as_str().ends_with("native/inner.c"),
+        "{}",
+        location.uri.as_str()
+    );
+    assert_eq!(location.range.start, Position::new(1, 0));
+    client.shutdown();
+}
+
+#[test]
 fn goto_definition_on_field_redirects_via_class_block_source() {
     let client = start(&[]);
     let uri = client.uri("main.lua");

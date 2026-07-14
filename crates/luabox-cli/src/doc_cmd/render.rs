@@ -96,6 +96,14 @@ pub fn build_links(model: &DocModel) -> Links {
 /// names a documented type in a link. Identifiers inside string-literal
 /// types (`"north"`) are never linked; unresolved names render plain.
 pub fn link_types(rendered: &str, links: &Links) -> String {
+    // Advances one full UTF-8 character (escaped) and returns its byte
+    // length. `---@see` routes free prose through here, so the scanner must
+    // never slice a single byte out of a multi-byte character.
+    fn push_char(out: &mut String, s: &str, i: usize) -> usize {
+        let n = s[i..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&escape(&s[i..i + n]));
+        n
+    }
     let mut out = String::with_capacity(rendered.len());
     let bytes = rendered.as_bytes();
     let mut i = 0;
@@ -103,11 +111,10 @@ pub fn link_types(rendered: &str, links: &Links) -> String {
     while i < bytes.len() {
         let b = bytes[i];
         if let Some(delim) = in_str {
-            out.push_str(&escape(&rendered[i..=i]));
+            i += push_char(&mut out, rendered, i);
             if b == delim {
                 in_str = None;
             }
-            i += 1;
         } else if b == b'"' || b == b'\'' {
             in_str = Some(b);
             out.push_str(&escape(&rendered[i..=i]));
@@ -133,8 +140,7 @@ pub fn link_types(rendered: &str, links: &Links) -> String {
             }
             out.push_str(&escape(&rendered[end..i]));
         } else {
-            out.push_str(&escape(&rendered[i..=i]));
-            i += 1;
+            i += push_char(&mut out, rendered, i);
         }
     }
     out
@@ -808,6 +814,25 @@ mod tests {
             Some("class.Point.html")
         );
         assert!(!links.contains_key("number"));
+    }
+
+    #[test]
+    fn link_types_survives_non_ascii_prose() {
+        // `@see` routes free prose through `link_types`; multi-byte
+        // characters (em-dashes, accented letters, CJK) must pass through
+        // whole, never sliced byte-wise (this used to panic on a char
+        // boundary).
+        let mut links = Links::new();
+        links.insert("Point".to_string(), "class.Point.html".to_string());
+        let html = link_types("Point — the receiver’s ünïcode 座標", &links);
+        assert!(
+            html.contains("<a href=\"class.Point.html\">Point</a>"),
+            "{html}"
+        );
+        assert!(html.contains("— the receiver’s ünïcode 座標"), "{html}");
+        // Inside a string literal too (the other byte-wise arm).
+        let html = link_types("\"héllo—wörld\"", &links);
+        assert!(html.contains("héllo—wörld"), "{html}");
     }
 
     #[test]

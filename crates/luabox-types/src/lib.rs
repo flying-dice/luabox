@@ -1989,6 +1989,54 @@ ok()
         assert_eq!(codes, vec!["LB0308"]);
     }
 
+    #[test]
+    fn async_cross_file_via_require() {
+        // `Api.fetch` is `---@async` in the required module; the flag rides
+        // the module's export type into the consumer, so calling it from a
+        // sync function flags LB0316 (`callee_sig` cannot resolve required
+        // members — the `check_call` fallback through the resolved
+        // expression type covers this, like `deprecated`/`version` do).
+        let api = parse(
+            "local Api = {}\n---@async\nfunction Api.fetch() end\nreturn Api\n",
+            Dialect::Lua54,
+        );
+        let export = module_surface(&api, "api.lua", None)
+            .export
+            .expect("module exports a table");
+        let mut requires = HashMap::new();
+        requires.insert("api".to_string(), export);
+        let main = parse(
+            "local Api = require(\"api\")\nlocal function sync()\n  Api.fetch()\nend\n",
+            Dialect::Lua54,
+        );
+        let diags = check_file_with_requires(
+            &main,
+            "main.lua",
+            Strictness::Warn,
+            Dialect::Lua54,
+            None,
+            &requires,
+        );
+        let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
+        assert_eq!(codes, vec!["LB0316"]);
+    }
+
+    #[test]
+    fn multiple_vararg_tags_union_per_luals() {
+        // Two legacy `---@vararg` tags on one block are two bound docs in
+        // luals, and every bound doc merges into the `...` node — so their
+        // types union, exactly like a `---@vararg` next to a `---@param ...`.
+        let src = "\
+---@vararg number
+---@vararg string
+local function f(...) end
+f(1)
+f(\"x\")
+f(true)
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"]);
+    }
+
     // --- #112 `---@nodiscard` (LB0309) ---------------------------------------
 
     #[test]

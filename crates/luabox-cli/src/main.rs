@@ -30,7 +30,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "luabox",
     version,
-    about = "Unified Lua toolchain: package manager, typechecker, linter, formatter, bundler, test runner, LSP. Not a runtime."
+    about = "Unified Lua toolchain: package manager, typechecker, linter, formatter, bundler, LSP. Not a runtime."
 )]
 struct Cli {
     #[command(subcommand)]

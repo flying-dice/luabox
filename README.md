@@ -1,7 +1,7 @@
 # luabox
 
 **A cargo-style toolchain for Lua.** One static binary that gives Lua the
-workflow Rust developers expect — `check`, `lint`, `fmt`, `test`, `run`,
+workflow Rust developers expect — `check`, `lint`, `fmt`, `run`,
 `build`, `doc`, `publish` — with a type checker that speaks stock
 [LuaCATS](https://luals.github.io/wiki/annotations/) annotations (the
 lua-language-server dialect) but *verifies* what luals only trusts:

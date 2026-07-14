@@ -78,8 +78,8 @@ luabox lint [--fix]                                   clippy analog
 luabox fmt [--check]                                  canonical formatter
 luabox build [--target <t>] [--out dir]               lower + emit
 luabox bundle [--minify] [--sourcemap]                single-file emit
-luabox test [pattern] [--watch] [--coverage]          built-in runner
-luabox bench                                          built-in benchmarks
+luabox test [pattern] [--watch]                       built-in runner (deprecated, §11)
+luabox bench                                          built-in benchmarks (deprecated, §11)
 luabox run <script|task>                              run via configured runtime / tasks
 luabox doc [--open]                                   docs from annotations
 luabox publish                                        registry publish
@@ -154,7 +154,7 @@ members = ["packages/*"]
 - Lossless rowan trees (comments preserved) — one parser feeds fmt/lint/fixes/refactors.
 - Error-resilient parsing; VFS over disk + editor overlays; background workspace index, mmap persistent cache.
 - Features: type-driven completion + auto-require import, postfix snippets; hover with rendered types/docs; goto def/type-def/impl (metatable `__index` resolved); find-refs; workspace rename (string-require-aware); inlay hints; semantic tokens; code actions (annotate from inference, extract/inline, `.`↔`:` convert, generate `---@class` from literal, sort requires, add missing fields); streamed diagnostics with quick-fixes; call hierarchy; signature help; on-type formatting.
-- `--stdio` + TCP; first-class VS Code extension; Neovim builtin-LSP config; JetBrains via LSP API.
+- `--stdio` + TCP; first-class VS Code extension (other editors point their own LSP client at `luabox lsp`).
 
 ## 9. Linter (clippy analog)
 

@@ -292,28 +292,80 @@ impl FileSema {
     }
 
     /// The `---@source` location text governing `range`: the tag of the
-    /// annotation block whose *target statement* contains the range (a
-    /// declaration site), or whose *block span* contains it (a `@field`/
-    /// `@class` tag site inside the block itself) — the two shapes LuaLS's
-    /// `core/jump-source.lua` redirects (`bindDocs` and `parent.source`).
+    /// annotation block whose *block span* contains the range (a `@field`/
+    /// `@class` tag site inside the block itself), or whose target statement
+    /// *declares* the range as one of its own names — the two shapes LuaLS's
+    /// `core/jump-source.lua` redirects (`parent.source` and `bindDocs`).
+    ///
+    /// The declaration arm is exact on purpose: a block binds to the one
+    /// statement after it, so its `@source` governs only the names that
+    /// statement declares. Mere containment would leak the redirect to every
+    /// binding *inside* an annotated function's body.
     #[must_use]
     pub fn source_tag_covering(&self, range: TextRange) -> Option<&str> {
+        fn source_text(item: &AnnotatedItem) -> Option<&str> {
+            item.block.tags.iter().find_map(|tag| match tag {
+                Tag::Source(t) => t.text.as_deref(),
+                _ => None,
+            })
+        }
         let (start, end) = (usize::from(range.start()), usize::from(range.end()));
+        // Tag-site arm: the queried range sits inside the block itself.
+        let tag_site = self
+            .items()
+            .iter()
+            .filter(|item| {
+                let s = item.block.span;
+                s.start <= start && end <= s.end
+            })
+            .find_map(source_text);
+        if tag_site.is_some() {
+            return tag_site;
+        }
+        // Declaration arm: the range must be a name the target itself declares.
         self.items()
             .iter()
             .filter(|item| {
-                let in_target = item
-                    .target
-                    .is_some_and(|t| t.start <= start && end <= t.end);
-                let s = item.block.span;
-                in_target || (s.start <= start && end <= s.end)
+                item.target
+                    .is_some_and(|t| t.start <= start && end <= t.end)
             })
-            .find_map(|item| {
-                item.block.tags.iter().find_map(|tag| match tag {
-                    Tag::Source(t) => t.text.as_deref(),
-                    _ => None,
+            .filter(|item| self.target_decl_names(item).into_iter().any(|r| r == range))
+            .find_map(|item| source_text(item))
+    }
+
+    /// The name-token ranges *declared by* an item's target statement: the
+    /// segments of a `function a.b.c()` name, or the names of a `local`
+    /// statement (including `local function f`).
+    fn target_decl_names(&self, item: &AnnotatedItem) -> Vec<TextRange> {
+        let Some(t) = item.target else {
+            return Vec::new();
+        };
+        let Some(node) = self.root.descendants().find(|n| {
+            usize::from(n.text_range().start()) == t.start
+                && usize::from(n.text_range().end()) == t.end
+        }) else {
+            return Vec::new();
+        };
+        match node.kind() {
+            SyntaxKind::FUNCTION_DECL_STMT => ast::FunctionDeclStmt::cast(node)
+                .and_then(|decl| decl.name())
+                .map(|name| name.segments().map(|s| s.text_range()).collect())
+                .unwrap_or_default(),
+            SyntaxKind::LOCAL_FUNCTION_STMT => ast::LocalFunctionStmt::cast(node)
+                .and_then(|decl| decl.name())
+                .map(|tok| vec![tok.text_range()])
+                .unwrap_or_default(),
+            SyntaxKind::LOCAL_STMT => ast::LocalStmt::cast(node)
+                .map(|local| {
+                    local
+                        .names()
+                        .filter_map(|n| n.name())
+                        .map(|tok| tok.text_range())
+                        .collect()
                 })
-            })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
     }
 
     /// The annotated type of a binding: an `---@type` on its `local`
