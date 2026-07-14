@@ -48,7 +48,7 @@ enum TargetKey {
 /// the name token (selection range), the whole statement (full range), and
 /// the function node whose body is scanned for outgoing calls / used to
 /// attribute a call to its enclosing function.
-struct FnDecl {
+struct HierarchyNode {
     display: String,
     key: TargetKey,
     /// The name region for cursor hit-testing (the whole `FunctionName` node,
@@ -66,8 +66,8 @@ struct FnDecl {
 /// Every named function declaration in the file. Mirrors the declaration
 /// forms [`crate::sema::FileSema::functions`] walks, keeping the AST nodes
 /// call hierarchy needs (body to scan, name node to hit-test) which the
-/// rendered `FnInfo` drops.
-fn fn_decls(sema: &FileSema) -> Vec<FnDecl> {
+/// rendered [`crate::sema::FnDecl`] drops.
+fn fn_decls(sema: &FileSema) -> Vec<HierarchyNode> {
     let mut out = Vec::new();
     for node in sema.root.descendants() {
         match node.kind() {
@@ -97,7 +97,7 @@ fn fn_decls(sema: &FileSema) -> Vec<FnDecl> {
                         .join(".");
                     (dotted.clone(), TargetKey::Named(dotted))
                 };
-                out.push(FnDecl {
+                out.push(HierarchyNode {
                     display,
                     key,
                     name_node: name.syntax().text_range(),
@@ -111,7 +111,7 @@ fn fn_decls(sema: &FileSema) -> Vec<FnDecl> {
                     continue;
                 };
                 let Some(token) = decl.name() else { continue };
-                out.push(FnDecl {
+                out.push(HierarchyNode {
                     display: token.text().to_string(),
                     key: TargetKey::Named(token.text().to_string()),
                     name_node: token.text_range(),
@@ -131,7 +131,7 @@ fn fn_decls(sema: &FileSema) -> Vec<FnDecl> {
                 let Some(token) = local.names().next().and_then(|n| n.name()) else {
                     continue;
                 };
-                out.push(FnDecl {
+                out.push(HierarchyNode {
                     display: token.text().to_string(),
                     key: TargetKey::Named(token.text().to_string()),
                     name_node: token.text_range(),
@@ -198,7 +198,7 @@ fn dotted_path(expr: &ast::Expr) -> Option<String> {
 
 /// The nearest enclosing declared function of `node` (the caller), or `None`
 /// for a call at file top level (or inside only anonymous closures).
-fn enclosing_decl<'a>(decls: &'a [FnDecl], node: &SyntaxNode) -> Option<&'a FnDecl> {
+fn enclosing_decl<'a>(decls: &'a [HierarchyNode], node: &SyntaxNode) -> Option<&'a HierarchyNode> {
     node.ancestors()
         .find_map(|anc| decls.iter().find(|d| d.fn_node == anc))
 }
@@ -218,7 +218,7 @@ fn covers(range: TextRange, offset: usize) -> bool {
 /// Build a [`CallHierarchyItem`] for a declaration in `sema`'s file. The
 /// `data` field carries the resolved display name so incoming/outgoing can
 /// reconstruct the target without re-resolving from a position.
-fn item_for_decl(sema: &FileSema, decl: &FnDecl) -> CallHierarchyItem {
+fn item_for_decl(sema: &FileSema, decl: &HierarchyNode) -> CallHierarchyItem {
     CallHierarchyItem {
         name: decl.display.clone(),
         kind: SymbolKind::FUNCTION,

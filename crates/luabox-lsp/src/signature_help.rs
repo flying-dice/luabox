@@ -226,7 +226,7 @@ fn resolve_method_signatures(
 /// declaration named `name` (bare `f`, dotted `M.helper`, or `Class:method`).
 fn signatures_from_functions(sema: &FileSema, name: &str) -> Option<Vec<Signature>> {
     let info = sema.functions().into_iter().find(|f| f.name == name)?;
-    let sema::FnInfo {
+    let sema::FnDecl {
         name,
         docs,
         params,

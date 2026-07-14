@@ -138,16 +138,6 @@ impl Diagnostic {
         Self::new(code, Severity::Warning, message)
     }
 
-    /// A note-severity diagnostic.
-    pub fn note(code: Code, message: impl Into<String>) -> Self {
-        Self::new(code, Severity::Note, message)
-    }
-
-    /// A help-severity diagnostic.
-    pub fn help(code: Code, message: impl Into<String>) -> Self {
-        Self::new(code, Severity::Help, message)
-    }
-
     /// Attach a label.
     #[must_use]
     pub fn with_label(mut self, label: Label) -> Self {

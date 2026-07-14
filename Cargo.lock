@@ -917,6 +917,7 @@ dependencies = [
  "crossbeam-channel",
  "lsp-server",
  "lsp-types",
+ "luabox-bundle",
  "luabox-db",
  "luabox-diag",
  "luabox-hir",

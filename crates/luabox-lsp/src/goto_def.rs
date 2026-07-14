@@ -24,7 +24,8 @@ use crate::uri::path_to_uri;
 /// `project_root` anchors `require` module resolution.
 #[must_use]
 pub fn goto_definition(sema: &FileSema, offset: usize, project_root: &Path) -> Option<Location> {
-    // 1. `require("mod")` → the module file (best-effort, project-relative).
+    // 1. `require("mod")` → the module file, resolved through the bundler's
+    //    shared candidate search (project root, `src/`, then `lua_modules/`).
     if let Some(edge) = sema.require_at(offset) {
         let module = edge.module.clone();
         return resolve_module(project_root, &module).map(|path| Location {
@@ -221,15 +222,19 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
-/// Resolve `a.b.c` to `<root>/a/b/c.lua` or `<root>/a/b/c/init.lua`.
+/// Resolve `module` to its file through the bundler's shared candidate
+/// ordering ([`luabox_bundle::resolve_candidates`], SPEC.md §7: project root,
+/// then `src/`, then the `lua_modules/<pkg>/` tree), picking the first
+/// candidate that exists on disk — exactly the bundler's `resolve`.
+///
+/// This is the workspace's single source of truth for `require` resolution
+/// (the same algorithm `luabox check` and the bundler use), so goto-def can
+/// never disagree with them: a module under `src/` or a dependency now jumps
+/// where the build would actually load it from.
 fn resolve_module(root: &Path, module: &str) -> Option<PathBuf> {
-    let rel: PathBuf = module.split('.').collect();
-    let direct = root.join(&rel).with_extension("lua");
-    if direct.is_file() {
-        return Some(direct);
-    }
-    let init = root.join(&rel).join("init.lua");
-    init.is_file().then_some(init)
+    luabox_bundle::resolve_candidates(root, module)
+        .into_iter()
+        .find(|candidate| candidate.is_file())
 }
 
 #[cfg(test)]

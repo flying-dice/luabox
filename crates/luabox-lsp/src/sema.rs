@@ -38,7 +38,7 @@ pub struct FileSema {
 }
 
 /// A `---@class` declaration harvested from the file.
-pub struct ClassInfo<'a> {
+pub struct ClassDecl<'a> {
     /// The `@class` tag itself.
     pub tag: &'a ClassTag,
     /// Its own `@field` tags, in declaration order.
@@ -50,7 +50,7 @@ pub struct ClassInfo<'a> {
 }
 
 /// One function declaration: AST facts enriched with its annotation block.
-pub struct FnInfo {
+pub struct FnDecl {
     /// Display name: `f`, `M.helper`, `Class:method`.
     pub name: String,
     /// The range of the name token at the declaration site.
@@ -76,7 +76,7 @@ pub struct FnInfo {
 
 /// One parameter of a resolved signature: its declared/annotated name, type,
 /// optionality, and `---@param` doc line where one is attached. Shared by
-/// [`FnInfo::params`]/[`FnInfo::overloads`] and by
+/// [`FnDecl::params`]/[`FnDecl::overloads`] and by
 /// [`crate::signature_help`]'s class-field (`fun(...)`-typed method) route.
 pub struct SigParam {
     pub name: String,
@@ -227,7 +227,7 @@ impl FileSema {
 
     /// Every `---@class` in the file, by name.
     #[must_use]
-    pub fn classes(&self) -> HashMap<&str, ClassInfo<'_>> {
+    pub fn classes(&self) -> HashMap<&str, ClassDecl<'_>> {
         let mut out = HashMap::new();
         for item in self.items() {
             let mut current: Option<&str> = None;
@@ -237,7 +237,7 @@ impl FileSema {
                         current = Some(&c.name);
                         out.insert(
                             c.name.as_str(),
-                            ClassInfo {
+                            ClassDecl {
                                 tag: c,
                                 fields: Vec::new(),
                                 docs: docs_of(item),
@@ -438,7 +438,7 @@ impl FileSema {
     /// `function C:m`, `local function h`, `local f = function`), enriched
     /// with its annotation block when one is attached.
     #[must_use]
-    pub fn functions(&self) -> Vec<FnInfo> {
+    pub fn functions(&self) -> Vec<FnDecl> {
         let mut out = Vec::new();
         for node in self.root.descendants() {
             let (name, decl_token, params, stmt_range) = match node.kind() {
@@ -485,7 +485,7 @@ impl FileSema {
                 _ => continue,
             };
             let item = self.item_covering_exact(stmt_range);
-            out.push(FnInfo {
+            out.push(FnDecl {
                 sig: render_signature(&name, params.as_ref(), item),
                 docs: item.map(docs_of).unwrap_or_default(),
                 params: collect_sig_params(params.as_ref(), item),
@@ -553,7 +553,7 @@ fn contains(range: TextRange, offset: usize) -> bool {
 }
 
 fn collect_fields<'a>(
-    classes: &HashMap<&str, ClassInfo<'a>>,
+    classes: &HashMap<&str, ClassDecl<'a>>,
     name: &str,
     seen: &mut HashSet<String>,
     out: &mut Vec<(String, (&'a FieldTag, String))>,
@@ -707,7 +707,7 @@ fn render_signature(
     sig
 }
 
-/// The structured parameter list for [`FnInfo::params`]/overloads: the AST
+/// The structured parameter list for [`FnDecl::params`]/overloads: the AST
 /// parameter names merged with their `---@param` type/doc, in the same
 /// pairing `render_signature` uses (by name, with `...` for the vararg).
 fn collect_sig_params(

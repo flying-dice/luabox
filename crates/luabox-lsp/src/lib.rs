@@ -7,6 +7,16 @@
 //! notifications, and per-request [`Analysis`](luabox_db::Analysis)
 //! snapshots. No async runtime.
 //!
+//! # Error contract
+//!
+//! This is a driver crate: its public entry points ([`run`], [`run_stdio`])
+//! and internal handlers return [`anyhow::Result`] deliberately. Errors here
+//! are transport- and mainloop-level failures that abort the server rather
+//! than values a caller inspects and recovers from, so a single opaque error
+//! type with rich context is the right contract — a bespoke public error enum
+//! would buy no caller anything. Library crates in the workspace keep their
+//! typed errors; the buck stops at this application boundary.
+//!
 //! # Tranche 1 features (this crate today)
 //!
 //! - **Streamed diagnostics** — parse errors, dialect legality, and type

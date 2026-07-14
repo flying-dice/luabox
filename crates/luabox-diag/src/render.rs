@@ -161,8 +161,6 @@ fn sarif_level(severity: Severity) -> &'static str {
     match severity {
         Severity::Error => "error",
         Severity::Warning => "warning",
-        // SARIF has no "help"; both map to "note".
-        Severity::Note | Severity::Help => "note",
     }
 }
 
@@ -236,7 +234,6 @@ fn github_command(severity: Severity) -> &'static str {
     match severity {
         Severity::Error => "error",
         Severity::Warning => "warning",
-        Severity::Note | Severity::Help => "notice",
     }
 }
 
@@ -279,7 +276,6 @@ fn gitlab_severity(severity: Severity) -> &'static str {
     match severity {
         Severity::Error => "major",
         Severity::Warning => "minor",
-        Severity::Note | Severity::Help => "info",
     }
 }
 

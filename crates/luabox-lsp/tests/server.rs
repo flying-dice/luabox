@@ -957,6 +957,29 @@ fn goto_definition_resolves_require_to_module_file() {
 }
 
 #[test]
+fn goto_definition_resolves_require_to_module_under_src() {
+    // A module that lives under `src/` (not the project root) must still
+    // resolve. goto-def now shares the bundler's SPEC.md §7 candidate search
+    // (`luabox_bundle::resolve_candidates`), which probes `src/` after the
+    // root; the old root-only resolver missed this entirely.
+    let client = start(&[
+        ("src/helpers.lua", "return {}\n"),
+        ("main.lua", "local h = require(\"helpers\")\n"),
+    ]);
+    let uri = client.uri("main.lua");
+    client.open(&uri, "local h = require(\"helpers\")\n");
+    let mut client = client;
+    // Aim inside the require string.
+    let location = client.definition(&uri, 0, 22).expect("definition");
+    assert!(
+        location.uri.as_str().ends_with("src/helpers.lua"),
+        "{}",
+        location.uri.as_str()
+    );
+    client.shutdown();
+}
+
+#[test]
 fn goto_definition_on_class_field_jumps_to_field_annotation() {
     let client = start(&[]);
     let uri = client.uri("main.lua");

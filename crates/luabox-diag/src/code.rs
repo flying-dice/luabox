@@ -105,10 +105,6 @@ pub enum Severity {
     Error,
     /// A warning: suspicious but not fatal.
     Warning,
-    /// An informational note, usually attached to another diagnostic.
-    Note,
-    /// A suggestion for how to proceed.
-    Help,
 }
 
 impl Severity {
@@ -118,8 +114,6 @@ impl Severity {
         match self {
             Self::Error => "error",
             Self::Warning => "warning",
-            Self::Note => "note",
-            Self::Help => "help",
         }
     }
 }

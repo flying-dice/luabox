@@ -134,8 +134,6 @@ pub(crate) fn convert(
     let severity = match diag.severity {
         luabox_diag::Severity::Error => DiagnosticSeverity::ERROR,
         luabox_diag::Severity::Warning => DiagnosticSeverity::WARNING,
-        luabox_diag::Severity::Note => DiagnosticSeverity::INFORMATION,
-        luabox_diag::Severity::Help => DiagnosticSeverity::HINT,
     };
     let mut message = diag.message.clone();
     for note in &diag.notes {
