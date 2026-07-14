@@ -113,7 +113,12 @@ impl IndexEntry {
     /// Never in practice: serializing this plain data type cannot fail.
     #[must_use]
     pub fn to_json_line(&self) -> String {
-        serde_json::to_string(self).expect("IndexEntry serialization cannot fail")
+        #[expect(
+            clippy::expect_used,
+            reason = "IndexEntry is a plain data struct of String/Vec/bool fields; serde_json serialization cannot fail"
+        )]
+        let line = serde_json::to_string(self).expect("IndexEntry serialization cannot fail");
+        line
     }
 
     /// Parse one index line.

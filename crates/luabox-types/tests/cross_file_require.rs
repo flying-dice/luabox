@@ -1,3 +1,10 @@
+// test code — panics document assumptions
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice
+)]
 //! Cross-file `require` resolution (#85): a `require("mod")` result is typed
 //! from the required module's annotations, so conformance-style usage works
 //! in consumer/test files, not just the module's own file.

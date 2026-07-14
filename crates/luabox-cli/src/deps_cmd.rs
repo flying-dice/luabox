@@ -663,17 +663,20 @@ fn home_dir() -> anyhow::Result<PathBuf> {
 /// Splits `name[@version]`. The leading char is exempt so scoped names
 /// (`@org/pkg`) keep their sigil.
 fn split_spec(spec: &str) -> anyhow::Result<(String, Option<String>)> {
-    if spec.is_empty() {
+    let mut chars = spec.chars();
+    let Some(first) = chars.next() else {
         bail!("invalid package spec ``; expected `name` or `name@version`");
-    }
-    let Some(at) = spec[1..].rfind('@').map(|i| i + 1) else {
+    };
+    // Skip the leading char (char-safely — it may be a multi-byte sigil such
+    // as `@`) and treat the last `@` in the remainder as the version
+    // separator, so `@org/pkg` keeps its scope sigil.
+    let Some((name_tail, version)) = chars.as_str().rsplit_once('@') else {
         return Ok((spec.to_owned(), None));
     };
-    let (name, version) = (&spec[..at], &spec[at + 1..]);
-    if name.is_empty() || version.is_empty() {
+    if version.is_empty() {
         bail!("invalid package spec `{spec}`; expected `name` or `name@version`");
     }
-    Ok((name.to_owned(), Some(version.to_owned())))
+    Ok((format!("{first}{name_tail}"), Some(version.to_owned())))
 }
 
 /// `remove_dir_all` that also deletes read-only files (store hard-links
@@ -721,5 +724,18 @@ mod tests {
             ("@org/pkg".to_owned(), Some("^2".to_owned()))
         );
         assert!(split_spec("pkg@").is_err());
+    }
+
+    #[test]
+    fn split_spec_multibyte_first_char() {
+        // A spec whose first character is multi-byte UTF-8 must not panic on a
+        // char boundary (regression: the leading char was sliced as one byte).
+        assert_eq!(split_spec("é").unwrap(), ("é".to_owned(), None));
+        assert_eq!(
+            split_spec("état@1.0").unwrap(),
+            ("état".to_owned(), Some("1.0".to_owned()))
+        );
+        assert_eq!(split_spec("你好").unwrap(), ("你好".to_owned(), None));
+        assert!(split_spec("").is_err());
     }
 }

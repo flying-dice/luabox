@@ -1,3 +1,10 @@
+// test code — panics document assumptions
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice
+)]
 //! `---@class Impl : Interface` conformance (#107) — pure LuaCATS.
 //!
 //! luals declares `: Shape` but trusts it; luabox verifies the carrier

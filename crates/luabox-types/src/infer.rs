@@ -306,6 +306,10 @@ impl ITy {
 
 /// Union of inference types: flatten, dedup, and drop `unknown` when any
 /// concrete member is present (optimistic — unannotated code must check).
+#[expect(
+    clippy::expect_used,
+    reason = "reached only in the `flat.len() == 1` match arm, so `pop` always yields the single element"
+)]
 fn ity_union(members: Vec<ITy>) -> ITy {
     let mut flat: Vec<ITy> = Vec::new();
     let push = |ity: ITy, flat: &mut Vec<ITy>| {
@@ -1450,6 +1454,10 @@ impl Infer<'_> {
                 self.state.insert(local.binding, ITy::Ty(ty.clone()));
             } else if i == 0 && sig.is_some() {
                 self.declared.insert(local.binding);
+                #[expect(
+                    clippy::expect_used,
+                    reason = "this arm is guarded by `sig.is_some()`, so the clone is always Some"
+                )]
                 self.state.insert(
                     local.binding,
                     ITy::Ty(Ty::Function(Box::new(sig.clone().expect("sig present")))),
@@ -3151,6 +3159,10 @@ impl Infer<'_> {
             }
             ITy::Func(fn_body) => match self.funcs.get(fn_body) {
                 Some(data) if data.sig.as_ref().is_some_and(|s| s.has_return_annotation) => {
+                    #[expect(
+                        clippy::expect_used,
+                        reason = "the arm guard already established `data.sig` is Some"
+                    )]
                     let sig = data.sig.as_ref().expect("checked above");
                     (
                         sig.returns.iter().cloned().map(ITy::Ty).collect(),
@@ -3527,6 +3539,13 @@ fn narrow_type_is(member: &ITy, name: &str) -> Option<ITy> {
 }
 
 #[cfg(test)]
+// test code — panics document assumptions
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice
+)]
 mod tests {
     use luabox_syntax::lua::{Dialect, parse};
 

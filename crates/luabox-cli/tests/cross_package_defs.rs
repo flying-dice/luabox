@@ -15,6 +15,14 @@
 //! declarations* — it does NOT type `local geo = require("geometry")` module
 //! returns, which is cross-file `require` resolution (#85), out of scope.
 
+// test code — panics document assumptions
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice
+)]
+
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};

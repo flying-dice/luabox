@@ -80,11 +80,12 @@ pub(crate) fn to_html(md: &str) -> String {
 
 /// The item text of an `N. item` ordered-list line, if it is one.
 fn ordered_item(line: &str) -> Option<&str> {
-    let digits = line.chars().take_while(char::is_ascii_digit).count();
-    if digits == 0 {
+    let rest = line.trim_start_matches(|c: char| c.is_ascii_digit());
+    if rest.len() == line.len() {
+        // No leading digits.
         return None;
     }
-    line[digits..].strip_prefix(". ")
+    rest.strip_prefix(". ")
 }
 
 fn flush_all(out: &mut String, para: &mut Vec<String>, ul: &mut Vec<String>, ol: &mut Vec<String>) {
@@ -137,15 +138,15 @@ fn inline(text: &str) -> String {
     let escaped = escape(text);
     let mut out = String::with_capacity(escaped.len());
     let mut rest = escaped.as_str();
-    while let Some(open) = rest.find('`') {
-        let Some(close) = rest[open + 1..].find('`') else {
+    while let Some((before, after)) = rest.split_once('`') {
+        let Some((code, tail)) = after.split_once('`') else {
             break;
         };
-        out.push_str(&rest[..open]);
+        out.push_str(before);
         out.push_str("<code>");
-        out.push_str(&rest[open + 1..open + 1 + close]);
+        out.push_str(code);
         out.push_str("</code>");
-        rest = &rest[open + close + 2..];
+        rest = tail;
     }
     out.push_str(rest);
     out

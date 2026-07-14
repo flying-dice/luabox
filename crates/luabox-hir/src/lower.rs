@@ -78,16 +78,28 @@ impl Lowerer {
 
     // === Body / scope bookkeeping ===
 
+    #[expect(
+        clippy::expect_used,
+        reason = "lower() opens the chunk body before any lowering and finish_body pops it only at the very end, so a body is always open while nodes are lowered"
+    )]
     fn cur_body(&self) -> BodyId {
         *self.body_stack.last().expect("no open body")
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "every bodies slot is filled with Some at start_body and never taken/cleared, so the slot for any minted BodyId is always present"
+    )]
     fn body_mut(&mut self, id: BodyId) -> &mut Body {
         self.bodies[id.raw() as usize]
             .as_mut()
             .expect("body present")
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "every bodies slot is filled with Some at start_body and never taken/cleared, so the slot for any minted BodyId is always present"
+    )]
     fn body_ref(&self, id: BodyId) -> &Body {
         self.bodies[id.raw() as usize]
             .as_ref()
@@ -96,6 +108,10 @@ impl Lowerer {
 
     /// Reserve a fresh body id, push it as the current function, and open its
     /// root scope (which will hold the parameters).
+    #[expect(
+        clippy::expect_used,
+        reason = "bodies grows one entry per function; reaching 2^32 bodies would exhaust memory long before this conversion could fail"
+    )]
     fn start_body(&mut self, parent: Option<BodyId>) -> BodyId {
         let raw = u32::try_from(self.bodies.len()).expect("body count overflowed u32");
         let id = BodyId::from_raw(raw);
@@ -140,6 +156,10 @@ impl Lowerer {
 
     // === Bindings & resolution ===
 
+    #[expect(
+        clippy::expect_used,
+        reason = "start_body pushes the parameter scope before any binding is declared, so a scope is always open here"
+    )]
     fn declare_binding(&mut self, name: String, kind: BindingKind, range: TextRange) -> BindingId {
         let body = self.cur_body();
         let id = self.bindings.alloc(Binding {
@@ -187,6 +207,10 @@ impl Lowerer {
 
     /// Number of function boundaries between `from` (current) and its ancestor
     /// `to`, i.e. the upvalue depth (1 = immediately enclosing function).
+    #[expect(
+        clippy::expect_used,
+        reason = "callers pass the current body and the body owning a binding found in an enclosing scope; both are lexical ancestors and therefore on body_stack"
+    )]
     fn function_depth(&self, from: BodyId, to: BodyId) -> u32 {
         let pos = |target: BodyId| {
             self.body_stack
@@ -676,6 +700,10 @@ impl Lowerer {
 
     // === Finalization ===
 
+    #[expect(
+        clippy::expect_used,
+        reason = "every bodies slot is filled with Some at start_body and never taken/cleared, so all slots are populated at finalization"
+    )]
     fn finish(mut self, chunk: BodyId) -> LoweredFile {
         let mut bodies = Arena::new();
         for body in self.bodies.drain(..) {

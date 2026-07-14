@@ -1,3 +1,10 @@
+// test code — panics document assumptions
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice
+)]
 //! Unit tests: each rule (firing / non-firing / type-informed negative),
 //! suppression, config precedence, fix idempotence, and a corpus sweep.
 

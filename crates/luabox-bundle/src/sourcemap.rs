@@ -46,10 +46,19 @@ impl BundleMap {
         reason = "plain data struct; serde_json serialization cannot fail"
     )]
     pub fn to_json(&self) -> String {
-        serde_json::to_string(self).expect("BundleMap serialization cannot fail")
+        #[expect(
+            clippy::expect_used,
+            reason = "BundleMap is a plain data struct; serde_json serialization cannot fail"
+        )]
+        let json = serde_json::to_string(self).expect("BundleMap serialization cannot fail");
+        json
     }
 
     /// Parse the on-disk JSON form.
+    // TODO: clean-code - 0.55 - IDIOM: stringly-typed public error on a crate
+    // that already defines BundleError and uses it correctly everywhere else.
+    // Make these two failures BundleError (or SourceMapError) variants so the
+    // public API is consistent and matchable.
     pub fn from_json(text: &str) -> Result<Self, String> {
         let map: Self = serde_json::from_str(text).map_err(|e| format!("invalid .lua.map: {e}"))?;
         if map.version != 1 {
@@ -109,11 +118,12 @@ pub fn unmap_traceback(map: &BundleMap, names: &[String], traceback: &str) -> St
                 continue 'scan;
             }
         }
-        let Some(ch) = rest.chars().next() else {
+        let mut chars = rest.chars();
+        let Some(ch) = chars.next() else {
             break;
         };
         out.push(ch);
-        rest = &rest[ch.len_utf8()..];
+        rest = chars.as_str();
     }
     out
 }
@@ -126,8 +136,11 @@ fn split_line_suffix(tail: &str) -> Option<(u32, &str)> {
     if digits == 0 {
         return None;
     }
-    let line: u32 = tail[..digits].parse().ok()?;
-    Some((line, &tail[digits..]))
+    // `digits` counts leading ASCII digit bytes, so it lands on a char
+    // boundary — `split_at` cannot panic here.
+    let (num, rest) = tail.split_at(digits);
+    let line: u32 = num.parse().ok()?;
+    Some((line, rest))
 }
 
 #[cfg(test)]

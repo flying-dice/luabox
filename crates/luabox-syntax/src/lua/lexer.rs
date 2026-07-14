@@ -55,6 +55,10 @@ impl Lexer<'_> {
     }
 
     fn push(&mut self, kind: SyntaxKind, start: usize) {
+        #[expect(
+            clippy::expect_used,
+            reason = "token length (pos - start) is bounded by input length; source offsets are modelled as rowan u32 TextSize crate-wide, so >4 GiB input is out of scope"
+        )]
         let len = u32::try_from(self.pos - start).expect("token longer than u32::MAX bytes");
         debug_assert!(len > 0, "zero-length token");
         self.tokens.push(Token { kind, len });
@@ -269,6 +273,10 @@ impl Lexer<'_> {
         }
     }
 
+    #[expect(
+        clippy::string_slice,
+        reason = "start began on an ASCII ident byte and the loop advances only over ASCII [A-Za-z0-9_], so both ends are char boundaries"
+    )]
     fn ident_or_keyword(&mut self, start: usize) {
         while matches!(
             self.peek(0),
@@ -304,6 +312,10 @@ impl Lexer<'_> {
         self.push(kind, start);
     }
 
+    #[expect(
+        clippy::string_slice,
+        reason = "start is a between-token position, which the lexer only ever leaves on a char boundary; the open-ended slice reads the next whole char"
+    )]
     fn symbol(&mut self, start: usize, b: u8) {
         let (kind, len) = match (b, self.peek(1)) {
             (b'/', Some(b'/')) => (SyntaxKind::SLASH_SLASH, 2),
@@ -347,6 +359,13 @@ impl Lexer<'_> {
 }
 
 #[cfg(test)]
+// test code — panics document assumptions
+#[allow(
+    clippy::string_slice,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 mod tests {
     use super::*;
     use SyntaxKind::*;

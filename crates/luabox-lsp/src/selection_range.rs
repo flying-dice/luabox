@@ -70,6 +70,10 @@ fn build_chain(sema: &FileSema, ranges: &[TextRange]) -> SelectionRange {
             parent: node.map(Box::new),
         });
     }
+    #[expect(
+        clippy::expect_used,
+        reason = "the sole caller seeds `ranges` with the token's own range, so the loop runs at least once and `node` is Some"
+    )]
     node.expect("ranges always holds at least the token's own range")
 }
 

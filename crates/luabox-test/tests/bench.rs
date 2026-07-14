@@ -9,6 +9,14 @@
 //!     suite measuring a real loop, run end-to-end. Skipped (with a
 //!     printed note) when no Lua is installed.
 
+// test code — panics document assumptions
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice
+)]
+
 use std::path::{Path, PathBuf};
 
 use luabox_test::bench::{FileOutcome, RuntimeReport, SuiteOptions, discover, render, run_suite};

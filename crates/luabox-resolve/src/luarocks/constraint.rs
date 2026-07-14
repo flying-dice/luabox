@@ -55,6 +55,11 @@ pub struct Translated {
 }
 
 /// A specific way a LuaRocks constraint could not be represented in semver.
+// TODO: clean-code - 0.55 - KISS: speculative warning infrastructure with no
+// consumer — ExtraComponentDropped is never constructed (the flag feeding it
+// is discarded), and Translated.lossiness is read only by tests; both
+// production call sites take .requirement and drop .lossiness. Either
+// surface it as a real warning or strip it and return a plain String.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Lossiness {
     /// A `~=`/`!=` (not-equal) constraint was widened to any version.
@@ -204,7 +209,9 @@ fn split_operator(piece: &str) -> (&str, &str) {
     let end = piece
         .find(|c: char| !matches!(c, '<' | '>' | '=' | '~' | '!'))
         .unwrap_or(piece.len());
-    (&piece[..end], &piece[end..])
+    // `end` is a byte index returned by `str::find` (or the string length),
+    // so it always lands on a char boundary.
+    piece.split_at(end)
 }
 
 /// Expands the LuaRocks pessimistic operator `~> v` into explicit

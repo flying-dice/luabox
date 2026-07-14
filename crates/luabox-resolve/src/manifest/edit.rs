@@ -58,6 +58,10 @@ impl Manifest {
         if !deps_item.is_table_like() {
             *deps_item = Item::Table(Table::new());
         }
+        #[expect(
+            clippy::expect_used,
+            reason = "the preceding block replaces deps_item with a Table unless it is already table-like, so as_table_like_mut cannot be None here"
+        )]
         let deps_table = deps_item
             .as_table_like_mut()
             .expect("just ensured this item is table-like");

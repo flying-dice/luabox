@@ -30,6 +30,10 @@ pub(crate) fn insert(edits: &mut Vec<Edit>, offset: TextSize, text: String) {
 /// Apply the edits to `source`. Replacement ranges must be disjoint (the
 /// rules guarantee this; violations are a lowering bug and are dropped in
 /// release builds after a debug assertion).
+#[expect(
+    clippy::string_slice,
+    reason = "edit offsets are TextRange byte positions from the syntax tree over `source`, so they always fall on char boundaries and within bounds; overlaps are dropped above"
+)]
 pub(crate) fn apply(source: &str, mut edits: Vec<Edit>) -> String {
     edits.sort_by_key(|e| (e.range.start(), e.range.end(), e.seq));
     let mut out = String::with_capacity(source.len());

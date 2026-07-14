@@ -260,6 +260,11 @@ fn location_bytes(sema: &FileSema, start: usize, end: usize) -> Location {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::string_slice,
+    reason = "test code — panics document assumptions"
+)]
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};

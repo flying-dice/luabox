@@ -905,6 +905,11 @@ impl TypeEnv {
     /// Build a [`FunctionTy`] from `@param`/`@return` tags, reconcile it
     /// with the target function's AST parameter list, and register it under
     /// the function's name.
+    // TODO: clean-code - 0.52 - SRP: does three jobs in one body — lowers
+    // @param/@return/@vararg tags into a FunctionTy, extracts the callable
+    // name+param-list by matching on the AST statement kind, and reconciles
+    // tags-by-name against the real AST parameter list. Split into
+    // lower-tags / resolve-target / reconcile helpers.
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn attach_function(
         &mut self,
@@ -1583,6 +1588,10 @@ pub(crate) fn literal_ty(expr: &Expr) -> Option<Ty> {
 /// Strip the delimiters from a Lua string literal (quotes or long
 /// brackets). Escape sequences are kept verbatim (MVP: literal-type
 /// comparison is textual).
+#[expect(
+    clippy::string_slice,
+    reason = "both slices are bounded by ASCII delimiters verified on the byte array first (quotes at [0]/[len-1], or `[==[`/`]==]` long brackets), so the indices are char boundaries within bounds"
+)]
 pub(crate) fn unquote_lua(raw: &str) -> String {
     let bytes = raw.as_bytes();
     if bytes.len() >= 2

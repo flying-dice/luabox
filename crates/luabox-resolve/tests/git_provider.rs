@@ -2,6 +2,14 @@
 //! repositories created in temp dirs — no network. Each test skips
 //! gracefully (with a note) when `git` is not on `PATH`.
 
+// test code — panics document assumptions
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice
+)]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

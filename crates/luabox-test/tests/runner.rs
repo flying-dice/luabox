@@ -11,6 +11,14 @@
 //! The fake runtime works because `RuntimeSpec` is fully injectable: the
 //! runner only ever spawns `<program> <args…> <harness> <file>`.
 
+// test code — panics document assumptions
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice
+)]
+
 use std::path::{Path, PathBuf};
 
 use luabox_test::protocol::Outcome;

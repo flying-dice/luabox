@@ -206,6 +206,10 @@ impl NameGen {
         for token in lua::lex(text, dialect) {
             let end = offset + token.len as usize;
             if token.kind == SyntaxKind::IDENT {
+                #[expect(
+                    clippy::string_slice,
+                    reason = "offset..end are consecutive lexer token byte spans that tile `text`, so they land on char boundaries"
+                )]
                 forbidden.insert(text[offset..end].to_owned());
             }
             offset = end;
@@ -247,6 +251,10 @@ fn collapse(text: &str, dialect: Dialect) -> String {
     let mut prev: Option<(SyntaxKind, &str)> = None;
     for token in lua::lex(text, dialect) {
         let end = offset + token.len as usize;
+        #[expect(
+            clippy::string_slice,
+            reason = "offset..end are consecutive lexer token byte spans that tile `text`, so they land on char boundaries"
+        )]
         let slice = &text[offset..end];
         offset = end;
         if token.kind.is_trivia() {

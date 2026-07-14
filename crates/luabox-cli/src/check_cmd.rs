@@ -65,6 +65,13 @@ pub fn run(cwd: &Path, target: Option<&str>, format: &str, watch: bool) -> anyho
 /// check-first gate of `luabox build` (`crate::build_cmd`), which passes
 /// its chosen out directory as `skip_out` so previously emitted output is
 /// never checked as project source even under a custom `--out`.
+// TODO: clean-code - 0.70 - BOUNDARY: this re-implements the cross-file
+// check pipeline that luabox-db (the documented Semantics seam behind
+// check/lint/LSP) already provides — and the two have diverged: db resolves
+// require("a.b") by path-suffix match (query.rs resolve_require) while this
+// path uses luabox_bundle::resolve_module, so `luabox check` and LSP
+// diagnostics can silently disagree. Route the CLI through luabox-db so
+// require-resolution and project-surface assembly change in one place.
 pub(crate) fn run_once(
     cwd: &Path,
     target: Option<&str>,
@@ -285,6 +292,11 @@ fn canonical(path: &Path) -> PathBuf {
 }
 
 /// Render, summarize, and translate error count into the exit code.
+// TODO: clean-code - 0.60 - DRY: this render + source-lookup closure +
+// count + summary + bail epilogue is duplicated in lint_cmd.rs (finish) and
+// inlined again in build_cmd.rs, bundle_cmd.rs, and audit_cmd.rs; the
+// lookup closure `move |file| fs::read_to_string(root.join(file)).ok()` is
+// verbatim in four of them. Extract one shared diagnostics-finish helper.
 fn finish(
     diags: &[Diagnostic],
     format: Format,
@@ -357,6 +369,12 @@ pub(crate) struct Project {
 /// Find the project: nearest `luabox.toml` walking up from `cwd`
 /// (cargo-style), or a manifest-less default rooted at `cwd` (Lua 5.4,
 /// warn mode — least surprise).
+// TODO: clean-code - 0.85 - DRY: eight near-identical `discover(cwd)`
+// functions re-implement this walk-up-to-luabox.toml + read + parse +
+// error-render block (bench_cmd, deps_cmd, fmt_cmd, lint_cmd, run_cmd,
+// test_cmd, audit_cmd). Only the returned Project view differs. Extract one
+// shared manifest-discovery helper returning (root, Manifest) and let each
+// command build its own view on top.
 pub(crate) fn discover(cwd: &Path) -> anyhow::Result<Project> {
     let mut dir = Some(cwd);
     while let Some(current) = dir {
@@ -571,6 +589,10 @@ fn collect_d_lua(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// All `*.lua` files under the project root, deterministic order, skipping
 /// dot-directories and the build output directory.
+// TODO: clean-code - 0.70 - DRY: lint_cmd.rs re-implements this walk +
+// display_rel near-verbatim (~26 lines; display_rel byte-identical) even
+// though this copy is already pub(crate) and reused by build_cmd/doc_cmd.
+// Its sole divergence (.d.lua exclusion) is a parameter, not a fork.
 pub(crate) fn collect_files(project: &Project) -> anyhow::Result<Vec<PathBuf>> {
     let mut lua = Vec::new();
     walk(&project.root, project, &mut lua)?;

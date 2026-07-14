@@ -1,3 +1,10 @@
 # Proper nouns clippy::doc_markdown should not demand backticks for.
 # ".." keeps clippy's built-in default list.
 doc-valid-idents = ["LuaJIT", "LuaLS", "LuaCATS", "LuaRocks", "PubGrub", "OpenResty", ".."]
+
+# unwrap/expect/panic are idiomatic in test code — they document the test's
+# assumptions. The restriction lints in [workspace.lints.clippy] target
+# production paths only.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

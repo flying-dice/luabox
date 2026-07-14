@@ -8,6 +8,14 @@
 //! - **Soundness**: every solution respects every requirement
 //!   ([`verify_resolution`]).
 
+// test code — panics document assumptions
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice
+)]
+
 use std::fmt::Write as _;
 use std::path::Path;
 

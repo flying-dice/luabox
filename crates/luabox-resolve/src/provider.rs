@@ -311,6 +311,10 @@ impl PathProvider {
         let mut cache = self.manifests.borrow_mut();
         if !cache.contains_key(path) {
             let file = path.join("luabox.toml");
+            // TODO: clean-code - 0.55 - DRY: this read-luabox.toml + parse +
+            // wrap-into-ProviderError::{Io,InvalidManifest} block is repeated
+            // in solver.rs and git_provider.rs. Extract one
+            // parse_manifest_at(path) -> Result<Manifest, ProviderError>.
             let text = std::fs::read_to_string(&file).map_err(|e| ProviderError::Io {
                 path: file.clone(),
                 message: e.to_string(),
@@ -453,9 +457,14 @@ impl StaticProvider {
             .iter()
             .map(|(dep, req)| ((*dep).to_owned(), Dependency::Version((*req).to_owned())))
             .collect();
+        #[expect(
+            clippy::expect_used,
+            reason = "StaticProvider is an in-memory test-support universe; callers pass version literals"
+        )]
+        let version = Version::parse(version).expect("StaticProvider::add: valid semver version");
         self.add_package(
             PackageId::registry(name),
-            Version::parse(version).expect("StaticProvider::add: valid semver version"),
+            version,
             dependencies,
             PackageMeta {
                 lua_versions: lua_versions.iter().map(|s| (*s).to_owned()).collect(),

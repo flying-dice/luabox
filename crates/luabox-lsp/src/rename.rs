@@ -118,6 +118,10 @@ fn narrow(slice: &str, name: &str) -> Option<(usize, usize)> {
             .find(|c: char| !is_ident_char(c))
             .map_or(slice.len(), |i| i + 1);
     }
+    #[expect(
+        clippy::string_slice,
+        reason = "from is 0, slice.len(), or the boundary after the leading `@tag` word — always a char boundary"
+    )]
     while let Some(rel) = slice[from..].find(name) {
         let s = from + rel;
         let e = s + name.len();
@@ -153,6 +157,12 @@ fn range_key(edit: &TextEdit) -> (u32, u32, u32, u32) {
 #[allow(
     clippy::mutable_key_type,
     reason = "WorkspaceEdit keys its edits by Uri throughout these tests"
+)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice,
+    reason = "test code — panics document assumptions"
 )]
 mod tests {
     use super::*;

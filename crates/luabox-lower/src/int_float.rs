@@ -77,6 +77,10 @@ pub(crate) fn run(root: &SyntaxNode, ctx: &mut Ctx<'_>) {
 
 /// A `string.format(<literal containing %d>, ...)` call → the format
 /// string's range.
+#[expect(
+    clippy::string_slice,
+    reason = "`pos` is the byte index of an ASCII '%' from `find`, so `pos + 1` is a char boundary within bounds"
+)]
 fn format_d_call(node: &SyntaxNode) -> Option<rowan::TextRange> {
     if node.kind() != SyntaxKind::CALL_EXPR {
         return None;

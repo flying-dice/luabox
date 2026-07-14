@@ -51,6 +51,10 @@ impl LineIndex {
             .partition_point(|&start| start <= offset)
             .saturating_sub(1);
         let line_start = self.line_starts[line];
+        #[expect(
+            clippy::string_slice,
+            reason = "offset is clamped to a char boundary above; line_start follows a `\\n` byte, so both are valid boundaries"
+        )]
         let col_utf16: usize = self.text[line_start..offset]
             .chars()
             .map(char::len_utf16)
@@ -74,6 +78,10 @@ impl LineIndex {
             .line_starts
             .get(line + 1)
             .map_or(self.text.len(), |&next| next - 1);
+        #[expect(
+            clippy::string_slice,
+            reason = "line_start and line_end come from the `\\n`-delimited line-start table, so both are char boundaries"
+        )]
         let line_text = &self.text[line_start..line_end];
 
         let mut units_left = position.character as usize;

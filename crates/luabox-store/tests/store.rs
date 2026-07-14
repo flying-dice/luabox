@@ -4,6 +4,14 @@
 //! the materialization target share one volume — a precondition for hard links
 //! on NTFS (and the platform tests exercise that path directly).
 
+// test code — panics document assumptions
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice
+)]
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};

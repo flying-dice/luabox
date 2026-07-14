@@ -74,6 +74,10 @@ impl Suppressions {
             };
             let range = to_range(token.text_range());
 
+            #[expect(
+                clippy::string_slice,
+                reason = "`pos` is `text.find(MARKER)` and MARKER is ASCII, so `pos + MARKER.len()` is a char boundary within bounds"
+            )]
             let rest = text[pos + MARKER.len()..]
                 .trim_end_matches([']', '='])
                 .trim();
@@ -130,6 +134,10 @@ impl Suppressions {
     /// / `disable-line` are recognised. Widen this once a second rule needs
     /// the richer form.
     fn collect_diagnostic_directive(&mut self, text: &str, marker_pos: usize, comment_line: usize) {
+        #[expect(
+            clippy::string_slice,
+            reason = "`marker_pos` is `text.find(DIAGNOSTIC_MARKER)` and the marker is ASCII, so `marker_pos + DIAGNOSTIC_MARKER.len()` is a char boundary within bounds"
+        )]
         let rest = text[marker_pos + DIAGNOSTIC_MARKER.len()..]
             .trim_end_matches([']', '='])
             .trim();
@@ -160,8 +168,9 @@ impl Suppressions {
 /// The 1-based line number of a byte offset.
 #[must_use]
 pub fn line_of(source: &str, offset: usize) -> usize {
-    1 + source[..offset.min(source.len())]
+    1 + source
         .bytes()
+        .take(offset.min(source.len()))
         .filter(|&b| b == b'\n')
         .count()
 }

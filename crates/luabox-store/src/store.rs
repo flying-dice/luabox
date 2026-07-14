@@ -136,6 +136,12 @@ pub struct Store {
     packages_dir: PathBuf,
 }
 
+// TODO: clean-code - 0.75 - IDIOM: this library crate leaks anyhow::Result
+// across its public API (put_tree/verify/stats/gc/read_package_manifest) —
+// the lone workspace outlier; siblings define typed error enums
+// (ProviderError, BundleError, ParseError). Define a StoreError enum and
+// fold manifest.rs's stringly Result<_, String> parse errors into it; keep
+// anyhow in the CLI binary only.
 impl Store {
     /// Open (or lazily create) a store under `root`.
     ///

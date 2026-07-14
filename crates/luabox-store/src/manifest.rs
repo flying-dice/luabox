@@ -103,6 +103,10 @@ impl TreeManifest {
     /// # Errors
     /// Fails on malformed JSON, an unknown schema version, missing fields, or a
     /// tree-hash mismatch.
+    // TODO: clean-code - 0.60 - IDIOM: stringly-typed public error — a third
+    // error strategy inside one crate (anyhow + String + io::Result). Fold
+    // into the StoreError enum proposed in store.rs (MissingField,
+    // SchemaVersion, TreeHashMismatch variants) so failures are matchable.
     pub fn from_json(text: &str) -> Result<Self, String> {
         let doc = json::parse(text)?;
         let version = doc

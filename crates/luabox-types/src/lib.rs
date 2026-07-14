@@ -408,6 +408,13 @@ pub fn check_file_with_requires<S: std::hash::BuildHasher>(
 }
 
 #[cfg(test)]
+// test code — panics document assumptions
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice
+)]
 mod tests {
     use luabox_diag::Severity;
     use luabox_syntax::lua::{Dialect, parse};

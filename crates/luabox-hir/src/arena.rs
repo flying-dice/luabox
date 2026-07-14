@@ -88,6 +88,10 @@ impl<T> Arena<T> {
     ///
     /// # Panics
     /// If the arena would exceed `u32::MAX` elements.
+    #[expect(
+        clippy::expect_used,
+        reason = "len is the only growth path and is bounded by u32::MAX; a Vec of 2^32 elements would exhaust memory long before this conversion could fail"
+    )]
     pub fn alloc(&mut self, value: T) -> Idx<T> {
         let raw = u32::try_from(self.data.len()).expect("arena index overflowed u32");
         self.data.push(value);
@@ -106,6 +110,10 @@ impl<T> Arena<T> {
     #[allow(
         clippy::missing_panics_doc,
         reason = "alloc already enforces len <= u32::MAX; the conversion cannot fail"
+    )]
+    #[expect(
+        clippy::expect_used,
+        reason = "enumerate indices are < data.len(), which alloc bounded to <= u32::MAX, so the conversion cannot fail"
     )]
     pub fn iter(&self) -> impl Iterator<Item = (Idx<T>, &T)> {
         self.data.iter().enumerate().map(|(i, v)| {

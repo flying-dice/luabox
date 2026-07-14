@@ -187,6 +187,10 @@ impl Walker<'_> {
 
     /// Declare a name in the current (top) frame, flagging a shadow of any
     /// enclosing frame first.
+    #[expect(
+        clippy::expect_used,
+        reason = "declare only runs while walking a block, and walk_block pushes a frame before visiting any statement, so the stack is never empty here"
+    )]
     fn declare(&mut self, binding: BindingId) {
         let decl = self.lowered.binding(binding);
         if decl.name.is_empty() {

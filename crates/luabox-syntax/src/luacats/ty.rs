@@ -190,6 +190,10 @@ fn scan_dots(bytes: &[u8], i: &mut usize) -> Tok {
     }
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "the loop only exits at an ASCII quote (i past it) or at bytes.len(); the transient mid-char position after a `\\` skip is never sliced, so start..i is boundary-safe (fuzzed)"
+)]
 fn scan_quoted(text: &str, bytes: &[u8], i: &mut usize, quote: u8) -> Tok {
     let start = *i;
     *i += 1;
@@ -207,6 +211,10 @@ fn scan_quoted(text: &str, bytes: &[u8], i: &mut usize, quote: u8) -> Tok {
     Tok::Str(text[start..*i].to_string())
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "start is just past the ASCII opening backtick and the loop stops at the ASCII closing backtick or bytes.len(), so both ends are char boundaries"
+)]
 fn scan_backtick(text: &str, bytes: &[u8], i: &mut usize) -> Tok {
     let start = *i + 1;
     *i += 1;
@@ -220,6 +228,10 @@ fn scan_backtick(text: &str, bytes: &[u8], i: &mut usize) -> Tok {
     Tok::Backtick(inner)
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "the loop consumes whole multi-byte chars (all bytes >= 0x80) and stops only at an ASCII non-ident byte, so start..i lands on char boundaries"
+)]
 fn scan_ident(text: &str, bytes: &[u8], i: &mut usize) -> Tok {
     let start = *i;
     while *i < bytes.len() {
@@ -233,6 +245,10 @@ fn scan_ident(text: &str, bytes: &[u8], i: &mut usize) -> Tok {
     Tok::Ident(text[start..*i].to_string())
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "the loop advances only over ASCII alphanumerics/'.'/'_' and stops at the first other byte (multi-byte lead bytes are >= 0x80, hence terminators), so start..i is boundary-safe"
+)]
 fn scan_number(text: &str, bytes: &[u8], i: &mut usize) -> Tok {
     let start = *i;
     while *i < bytes.len() {
@@ -257,6 +273,10 @@ pub struct TypeParser {
     errors: Vec<LuaCatsError>,
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "each bump().expect(...) here is guarded by a preceding at()/peek()/nth()/match on the current token, so a token is provably present"
+)]
 impl TypeParser {
     /// Build a parser over `text`, whose tokens carry file-absolute spans
     /// offset by `base`.

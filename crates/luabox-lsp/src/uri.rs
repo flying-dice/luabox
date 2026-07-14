@@ -25,6 +25,10 @@ pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     // `file:///C:/x` has path `/C:/x` — strip the leading slash before a
     // drive letter and uppercase the letter for stable map keys.
     let bytes = decoded.as_bytes();
+    #[expect(
+        clippy::string_slice,
+        reason = "the guard proves byte 0 is `/` and byte 1 is ASCII, so byte offset 1 (and s[0..1]) are ASCII char boundaries"
+    )]
     if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
         let mut s = decoded[1..].to_string();
         s.replace_range(0..1, &s[0..1].to_ascii_uppercase());

@@ -5,6 +5,13 @@
 
 // Cucumber step functions receive owned captures by signature contract.
 #![allow(clippy::needless_pass_by_value)]
+// test code — panics document assumptions
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice
+)]
 
 use std::process::Output;
 

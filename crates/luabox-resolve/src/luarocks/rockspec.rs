@@ -577,7 +577,11 @@ fn decode_string(text: &str) -> Option<String> {
     if first != b'"' && first != b'\'' {
         return None;
     }
-    let inner = &text[1..text.len().checked_sub(1)?];
+    // A well-formed literal is `"..."`/`'...'` (both quotes ASCII, so the
+    // byte indices land on char boundaries). `get` rather than direct slicing
+    // keeps a malformed single-quote token (e.g. an unterminated string from
+    // adversarial rockspec input) from panicking — it decodes to `None`.
+    let inner = text.get(1..text.len().checked_sub(1)?)?;
     let mut out = String::new();
     let mut chars = inner.chars();
     while let Some(c) = chars.next() {

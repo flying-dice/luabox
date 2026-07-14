@@ -2,6 +2,14 @@
 //! dep kinds, version preference, lockfile behaviour, and cargo-style
 //! conflict reports. CLI wiring (`luabox install/add`) is ticket #21.
 
+// test code — panics document assumptions
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice
+)]
+
 use std::path::Path;
 
 use luabox_resolve::{

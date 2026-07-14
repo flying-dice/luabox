@@ -67,6 +67,10 @@ impl Vfs {
         if let Some(&id) = self.ids.get(&path) {
             return id;
         }
+        #[expect(
+            clippy::expect_used,
+            reason = "interning more than u32::MAX distinct paths is unreachable; documented in # Panics"
+        )]
         let id = FileId(u32::try_from(self.paths.len()).expect("more than u32::MAX files"));
         self.paths.push(path.clone());
         self.ids.insert(path, id);
@@ -149,10 +153,18 @@ impl Vfs {
     /// # Panics
     ///
     /// Panics only if more than `u32::MAX` distinct paths were interned.
+    #[expect(
+        clippy::expect_used,
+        reason = "index i < paths.len() <= u32::MAX by construction; documented in # Panics"
+    )]
     pub fn ids(&self) -> impl Iterator<Item = FileId> + '_ {
         (0..self.paths.len()).map(|i| FileId(u32::try_from(i).expect("more than u32::MAX files")))
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "FileId is only minted by intern(), which always inserts a matching FileState"
+    )]
     fn state_mut(&mut self, id: FileId) -> &mut FileState {
         self.states.get_mut(&id).expect("file id not interned")
     }

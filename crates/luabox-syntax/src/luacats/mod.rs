@@ -19,6 +19,13 @@
 mod ty;
 
 #[cfg(test)]
+// test code — panics document assumptions
+#[allow(
+    clippy::string_slice,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 mod tests;
 
 pub use ty::{FunParam, FunReturn, TableField, TypeExpr, TypeExprKind, TypeParser};
@@ -423,6 +430,10 @@ fn doc_lines(text: &str, block_offset: usize) -> Vec<PhysLine<'_>> {
 
 /// Iterate lines of `text` (split on `\n`, trailing `\r` left in the slice),
 /// yielding each line and its byte offset within `text`.
+#[expect(
+    clippy::string_slice,
+    reason = "start follows an ASCII '\\n' and end sits on the ASCII '\\n'/'\\r', so both offsets are char boundaries"
+)]
 fn split_keep_offsets(text: &str) -> Vec<(&str, usize)> {
     let mut out = Vec::new();
     let mut start = 0usize;
@@ -450,6 +461,10 @@ fn lstrip(s: &str, base: usize) -> (&str, usize) {
 
 /// Split `@word body` (the slice after `@`): the tag word, the body, and the
 /// body's absolute offset.
+#[expect(
+    clippy::string_slice,
+    reason = "end comes from str::find with a char predicate (or rest.len()), so it is a char boundary"
+)]
 fn split_tag_word(rest: &str, base: usize) -> (&str, &str, usize) {
     let end = rest
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
@@ -535,6 +550,10 @@ fn trailing_desc(body: &str, base: usize, parser: &TypeParser) -> Option<String>
 
 /// Read a leading name: `...`, or a run of identifier/`.` characters. Returns
 /// the name, the remaining slice, and its base offset.
+#[expect(
+    clippy::string_slice,
+    reason = "end comes from str::find with a char predicate (or s.len()), so it is a char boundary"
+)]
 fn take_name(s: &str, base: usize) -> Option<(String, &str, usize)> {
     let (s, base) = lstrip(s, base);
     if let Some(rest) = s.strip_prefix("...") {
@@ -550,6 +569,10 @@ fn take_name(s: &str, base: usize) -> Option<(String, &str, usize)> {
 }
 
 /// The first whitespace-delimited word of `s`.
+#[expect(
+    clippy::string_slice,
+    reason = "end comes from str::find with a char predicate (or s.len()), so it is a char boundary"
+)]
 fn peek_word(s: &str) -> &str {
     let s = s.trim_start();
     let end = s
@@ -602,6 +625,10 @@ fn parse_class(body: &str, base: usize, span: Span, errors: &mut Vec<LuaCatsErro
 /// class name. Constraints (`<T: C>`) are tolerated but only the parameter
 /// name is kept — matching how the names are used as placeholders. Returns
 /// the parameter names, the remaining slice, and its base offset.
+#[expect(
+    clippy::string_slice,
+    reason = "close = inner.find('>') (ASCII), and consumed spans the ASCII '<'...'>' pair, so inner[..close] and rest[consumed..] are boundary-safe"
+)]
 fn take_class_params(rest: &str, rest_base: usize) -> (Vec<String>, &str, usize) {
     let Some(inner) = rest.strip_prefix('<') else {
         return (Vec::new(), rest, rest_base);
@@ -620,6 +647,10 @@ fn take_class_params(rest: &str, rest_base: usize) -> (Vec<String>, &str, usize)
     (params, &rest[consumed..], rest_base + consumed)
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "idx = s.find(word) + word.len() where word is a prefix slice of s, so idx is a char boundary"
+)]
 fn parse_field(body: &str, base: usize, span: Span, errors: &mut Vec<LuaCatsError>) -> FieldTag {
     let (s, base) = lstrip(body, base);
     let mut scope = None;
@@ -678,6 +709,10 @@ fn scope_of(word: &str) -> Option<FieldScope> {
 
 /// Match a leading `[ ... ]` (balanced), returning the inner slice, the rest,
 /// and their base offsets.
+#[expect(
+    clippy::string_slice,
+    reason = "index 1 follows the ASCII '[' and i sits on the matching ASCII ']', so s[1..i] and s[i+1..] are boundary-safe"
+)]
 fn split_bracket(s: &str, base: usize) -> Option<(&str, usize, &str, usize)> {
     let bytes = s.as_bytes();
     if bytes.first() != Some(&b'[') {
@@ -954,6 +989,10 @@ pub fn harvest_inline_as(parse: &lua::Parse) -> Vec<InlineAs> {
 /// The body of a closed `--[[ ... ]]` long-bracket comment together with
 /// its byte offset within the token text; `None` for line comments and
 /// unterminated blocks.
+#[expect(
+    clippy::string_slice,
+    reason = "level counts leading ASCII '=' bytes, so rest[level..] starts on a char boundary"
+)]
 fn long_comment_body(text: &str) -> Option<(&str, usize)> {
     let rest = text.strip_prefix("--")?.strip_prefix('[')?;
     let level = rest.bytes().take_while(|&b| b == b'=').count();

@@ -1,3 +1,10 @@
+// test code — panics document assumptions
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice
+)]
 //! Exact-output tests for the lowering matrix (SPEC.md §2.1): every rule's
 //! rewrite is asserted byte-for-byte, plus tree-shaking, diagnostics, and
 //! idempotence invariants. Semantics arguments live in each rule module's

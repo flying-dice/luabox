@@ -4,6 +4,14 @@
 //! verification against `lua` when it is on `PATH` (skipped gracefully
 //! otherwise; CI provides it via the toolchain work, ticket #23).
 
+// test code — panics document assumptions
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice
+)]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

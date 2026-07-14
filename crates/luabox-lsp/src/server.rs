@@ -1287,6 +1287,10 @@ fn apply_content_changes(text: String, changes: Vec<TextDocumentContentChangeEve
     let mut text = text;
     for change in changes {
         match change.range {
+            #[expect(
+                clippy::string_slice,
+                reason = "start and end are LineIndex byte offsets (char boundaries, <= len); end is clamped >= start, so both splice slices are valid"
+            )]
             Some(range) => {
                 let index = LineIndex::new(text);
                 let start = index.offset(range.start);

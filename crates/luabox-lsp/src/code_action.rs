@@ -135,6 +135,10 @@ fn missing_field_edit(
     }
 
     let stmt_indent = line_indent(src, usize::from(open.text_range().start()));
+    #[expect(
+        clippy::string_slice,
+        reason = "open_end and close_start are rowan token offsets (char boundaries) and close_start >= open_end is checked above"
+    )]
     let body = &src[open_end..close_start];
 
     // Field indent: reuse an existing field's line indent when the table is
@@ -197,6 +201,10 @@ fn annotate_local(
     let src = sema.index.text();
     let stmt_start = usize::from(local.syntax().text_range().start());
     let ls = line_start(src, stmt_start);
+    #[expect(
+        clippy::string_slice,
+        reason = "stmt_start is a rowan range start and ls follows a `\\n` byte, so both are char boundaries"
+    )]
     let indent = &src[ls..stmt_start];
     let new_text = format!("{indent}---@type {ty}\n");
     out.push(edit_action(
@@ -265,6 +273,10 @@ fn generate_class(
     let src = sema.index.text();
     let stmt_start = usize::from(local.syntax().text_range().start());
     let ls = line_start(src, stmt_start);
+    #[expect(
+        clippy::string_slice,
+        reason = "stmt_start is a rowan range start and ls follows a `\\n` byte, so both are char boundaries"
+    )]
     let indent = &src[ls..stmt_start];
     let mut block = format!("{indent}---@class {class}\n");
     for (name, value) in &named {
@@ -518,6 +530,10 @@ fn capitalize(name: &str) -> String {
 
 /// The field name inside the first pair of backticks on the first line of a
 /// diagnostic message (`missing required field `y` ...` → `y`).
+#[expect(
+    clippy::string_slice,
+    reason = "open and close index an ASCII backtick, so `open + 1` and `..close` are char boundaries"
+)]
 fn first_backtick(message: &str) -> Option<String> {
     let line = message.lines().next()?;
     let open = line.find('`')?;
@@ -561,11 +577,19 @@ fn token_range(token: &SyntaxToken) -> std::ops::Range<usize> {
 }
 
 /// The byte offset of the start of the line containing `offset`.
+#[expect(
+    clippy::string_slice,
+    reason = "callers pass rowan-derived byte offsets, which are char boundaries"
+)]
 fn line_start(src: &str, offset: usize) -> usize {
     src[..offset].rfind('\n').map_or(0, |i| i + 1)
 }
 
 /// The leading whitespace (indentation) of the line containing `offset`.
+#[expect(
+    clippy::string_slice,
+    reason = "ls is a line start (follows a `\\n` byte or 0), so it is a char boundary"
+)]
 fn line_indent(src: &str, offset: usize) -> &str {
     let ls = line_start(src, offset);
     let rest = &src[ls..];

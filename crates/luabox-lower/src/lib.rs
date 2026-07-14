@@ -249,6 +249,10 @@ impl<'a> Ctx<'a> {
     /// text between the preceding newline and `offset` is all whitespace
     /// (i.e. the construct starts its line); empty otherwise. Used to keep
     /// inserted wrapper lines aligned with the statements they wrap.
+    #[expect(
+        clippy::string_slice,
+        reason = "`offset` is a TextSize from the syntax tree over `self.source` (a char boundary within bounds); `line_start` is one past an ASCII '\\n', also a char boundary"
+    )]
     pub(crate) fn indent_at(&self, offset: rowan::TextSize) -> &'a str {
         let upto = &self.source[..usize::from(offset)];
         let line_start = upto.rfind('\n').map_or(0, |i| i + 1);

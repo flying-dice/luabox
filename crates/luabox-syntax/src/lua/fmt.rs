@@ -123,6 +123,10 @@ fn comments_preserved(root: &super::SyntaxNode, out: &str) -> bool {
 }
 
 /// The non-trivia `(kind, text)` stream of `text`.
+#[expect(
+    clippy::string_slice,
+    reason = "offset/end accumulate lexer token lengths, which tile the input exactly on char boundaries"
+)]
 fn significant_tokens(text: &str, dialect: Dialect) -> Vec<(SyntaxKind, &str)> {
     let mut out = Vec::new();
     let mut offset = 0usize;
@@ -191,6 +195,13 @@ fn token_text_equal(kind: SyntaxKind, a: &str, b: &str) -> bool {
 }
 
 #[cfg(test)]
+// test code — panics document assumptions
+#[allow(
+    clippy::string_slice,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 mod tests {
     use super::*;
 
@@ -630,6 +641,13 @@ mod tests {
 }
 
 #[cfg(test)]
+// test code — panics document assumptions
+#[allow(
+    clippy::string_slice,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 mod proptests {
     use super::*;
     use proptest::prelude::*;

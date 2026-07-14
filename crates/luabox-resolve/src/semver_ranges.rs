@@ -32,11 +32,16 @@ pub(crate) type VersionRanges = Ranges<Version>;
 /// The `-0` sentinel: the smallest possible pre-release of a triple, used
 /// as an exclusive bound that also excludes that triple's pre-releases.
 fn sentinel(major: u64, minor: u64, patch: u64) -> Version {
+    #[expect(
+        clippy::expect_used,
+        reason = "`0` is a compile-time-constant valid pre-release identifier"
+    )]
+    let pre = Prerelease::new("0").expect("`0` is a valid pre-release");
     Version {
         major,
         minor,
         patch,
-        pre: Prerelease::new("0").expect("`0` is a valid pre-release"),
+        pre,
         build: BuildMetadata::EMPTY,
     }
 }

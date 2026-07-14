@@ -2,6 +2,14 @@
 //! [`lsp_server::Connection::memory`] — full initialize handshake, document
 //! lifecycle, published diagnostics, and every tranche-1 request.
 
+// test code — panics document assumptions
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice
+)]
+
 use std::path::PathBuf;
 use std::time::Duration;
 

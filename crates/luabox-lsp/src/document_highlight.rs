@@ -75,6 +75,11 @@ fn is_assign_target(expr_node: &SyntaxNode) -> bool {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::string_slice,
+    reason = "test code — panics document assumptions"
+)]
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};

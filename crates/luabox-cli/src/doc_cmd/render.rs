@@ -95,6 +95,13 @@ pub fn build_links(model: &DocModel) -> Links {
 /// Escape a rendered type string into HTML, wrapping every identifier that
 /// names a documented type in a link. Identifiers inside string-literal
 /// types (`"north"`) are never linked; unresolved names render plain.
+#[expect(
+    clippy::string_slice,
+    reason = "hand-rolled UTF-8 scanner: `i` only ever advances by whole \
+              characters (push_char steps by len_utf8) and every other index \
+              (start/end, i..=i on `\"`/`'`, the name run) lands on ASCII \
+              bytes, so all slices sit on char boundaries"
+)]
 pub fn link_types(rendered: &str, links: &Links) -> String {
     // Advances one full UTF-8 character (escaped) and returns its byte
     // length. `---@see` routes free prose through here, so the scanner must

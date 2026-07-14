@@ -1,3 +1,10 @@
+// test code — panics document assumptions
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice
+)]
 //! Real LuaCATS generics end-to-end (#84): generic `---@class<T>` references,
 //! `---@generic` functions with call-site inference, backtick capture, and
 //! bounded (`: Constraint`) type parameters — checked through the public

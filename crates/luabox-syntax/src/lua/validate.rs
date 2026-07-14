@@ -208,6 +208,10 @@ fn check_string_escapes(
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "offset/len index within a lexed string token; all offsets fit rowan's u32 TextSize, so >4 GiB input is out of scope"
+)]
 fn push_escape_error(
     errors: &mut Vec<DialectError>,
     code: &'static str,

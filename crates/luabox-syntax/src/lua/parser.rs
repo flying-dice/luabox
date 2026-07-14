@@ -203,6 +203,10 @@ impl<'a> Parser<'a> {
     }
 
     /// Text of the next non-trivia token (empty at end of input).
+    #[expect(
+        clippy::string_slice,
+        reason = "token (start, end) spans accumulate lexer token lengths, which tile the input on char boundaries"
+    )]
     pub(super) fn current_text(&self) -> &str {
         let i = self.skip_trivia_from(self.pos);
         self.tokens
@@ -219,6 +223,10 @@ impl<'a> Parser<'a> {
         }
     }
 
+    #[expect(
+        clippy::string_slice,
+        reason = "token (start, end) spans accumulate lexer token lengths, which tile the input on char boundaries"
+    )]
     fn push_token(&mut self) {
         let (kind, start, end) = self.tokens[self.pos];
         self.builder
@@ -303,6 +311,10 @@ impl<'a> Parser<'a> {
 
     pub(super) fn finish_node(&mut self) {
         self.builder.finish_node();
+        #[expect(
+            clippy::expect_used,
+            reason = "every finish_node is structurally paired with a prior start_node/start_node_at that pushed onto open_nodes"
+        )]
         let first_child = self
             .open_nodes
             .pop()
@@ -375,6 +387,10 @@ impl<'a> Parser<'a> {
 
 /// Offsets are bounded by rowan's `u32` text sizes; the lexer already
 /// enforces per-token bounds, so this only guards pathological >4 GiB input.
+#[expect(
+    clippy::expect_used,
+    reason = "rowan models text offsets as u32 TextSize; the whole syntax tree is built on that bound, so >4 GiB input is out of scope"
+)]
 fn text_size(offset: usize) -> TextSize {
     TextSize::try_from(offset).expect("input larger than 4 GiB")
 }
@@ -447,6 +463,13 @@ fn describe(kind: SyntaxKind) -> &'static str {
 }
 
 #[cfg(test)]
+// test code — panics document assumptions
+#[allow(
+    clippy::string_slice,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 mod tests {
     use super::*;
     use crate::lua::ast::{self, AstNode};

@@ -15,6 +15,10 @@ use super::Quotes;
 /// quote pass through untouched. A string whose content contains the
 /// preferred quote (raw or escaped) keeps its original delimiters, so no
 /// escape ever needs to be *added*.
+#[expect(
+    clippy::string_slice,
+    reason = "text is verified to open and close with a single-byte ASCII quote (len >= 2), so index 1 and len-1 are char boundaries"
+)]
 pub(super) fn normalize_quotes(text: &str, style: Quotes) -> Option<String> {
     let (preferred, other) = match style {
         Quotes::AutoPreferDouble => ('"', '\''),

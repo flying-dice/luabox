@@ -365,6 +365,10 @@ impl<'a> Lowerer<'a> {
 /// are kept verbatim (MVP; literal-type comparison is textual).
 /// Strip one matching quote pair (`"x"` / `'x'`) from `raw`, returning the
 /// inner text and whether a pair was removed.
+#[expect(
+    clippy::string_slice,
+    reason = "the slice is guarded by ASCII quote bytes verified at [0] and [len-1] on the byte array, so indices 1 and len-1 are char boundaries within bounds"
+)]
 fn strip_quote_pair(raw: &str) -> (&str, bool) {
     let bytes = raw.as_bytes();
     if bytes.len() >= 2

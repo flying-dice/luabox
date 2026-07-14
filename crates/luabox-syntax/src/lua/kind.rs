@@ -133,6 +133,10 @@ impl rowan::Language for LuaLanguage {
     type Kind = SyntaxKind;
 
     fn kind_from_raw(raw: rowan::SyntaxKind) -> SyntaxKind {
+        #[expect(
+            clippy::expect_used,
+            reason = "rowan only ever passes back raw values produced by kind_to_raw (kind as u16), so from_u16 always round-trips"
+        )]
         SyntaxKind::from_u16(raw.0).expect("invalid SyntaxKind raw value")
     }
 

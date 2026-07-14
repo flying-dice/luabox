@@ -27,6 +27,13 @@ pub use model::{
 };
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice,
+    reason = "test code — panics document assumptions"
+)]
 mod tests {
     use super::*;
 

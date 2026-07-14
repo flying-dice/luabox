@@ -237,6 +237,10 @@ pub fn bundle(req: &BundleRequest<'_>) -> Result<Bundle, BundleError> {
                 pending.push((new_index, edges));
                 new_index
             };
+            #[expect(
+                clippy::expect_used,
+                reason = "only the entry module (index 0) has no name; dependency targets are always loaded with Some(name)"
+            )]
             let canonical_name = modules[target]
                 .name
                 .clone()
@@ -385,6 +389,10 @@ fn emit(req: &BundleRequest<'_>, modules: &[Module]) -> (String, BundleMap) {
     if modules.len() > 1 {
         out.raw(SHIM);
         for module in &modules[1..] {
+            #[expect(
+                clippy::expect_used,
+                reason = "iterating modules[1..] skips the entry module; every remaining module carries Some(name)"
+            )]
             let name = module.name.as_deref().expect("non-entry module has a key");
             out.raw(&format!(
                 "__luabox_modules[{}] = function(...)\n",
@@ -524,6 +532,10 @@ fn quote(name: &str) -> String {
 
 /// 1-based line of a byte offset.
 fn line_of(text: &str, offset: rowan::TextSize) -> u32 {
-    let upto = &text[..usize::from(offset).min(text.len())];
-    u32::try_from(upto.bytes().filter(|&b| b == b'\n').count() + 1).unwrap_or(u32::MAX)
+    // Count newlines over the byte prefix directly: works for any clamped
+    // offset (no char-boundary requirement) and avoids slicing `text` as a
+    // `str`.
+    let end = usize::from(offset).min(text.len());
+    let newlines = text.bytes().take(end).filter(|&b| b == b'\n').count();
+    u32::try_from(newlines + 1).unwrap_or(u32::MAX)
 }

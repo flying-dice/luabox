@@ -1,3 +1,10 @@
+// test code — panics document assumptions
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice
+)]
 //! Boundary tests for `luabox_hir::lower`: desugarings, name resolution,
 //! `require` extraction, literal decoding, goto/label resolution, and the
 //! source-map roundtrip — all through the public API only (no token kinds).

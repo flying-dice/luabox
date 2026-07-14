@@ -58,6 +58,10 @@ pub fn completion(
         scope_items(sema, offset, &mut items);
         // Auto-require runs after scope items so names already in scope
         // (present in `items`) are left untouched.
+        #[expect(
+            clippy::string_slice,
+            reason = "offset is a LineIndex byte offset (a char boundary); start walks back over ASCII identifier bytes, so it is one too"
+        )]
         let prefix = &text[start..offset];
         auto_require_items(sema, offset, prefix, analysis, project_root, &mut items);
     }
@@ -80,6 +84,10 @@ fn member_items(
     if recv_start == dot_offset {
         return;
     }
+    #[expect(
+        clippy::string_slice,
+        reason = "dot_offset indexes an ASCII `.`/`:` and recv_start walks back over ASCII identifier bytes, so both are char boundaries"
+    )]
     let receiver = &text[recv_start..dot_offset];
     let Some(class) = sema.class_of_name(receiver, recv_start) else {
         return;
@@ -288,6 +296,10 @@ fn require_insertion_offset(sema: &FileSema, text: &str) -> usize {
         .map(|e| usize::from(e.range.end()))
         .max()
     {
+        #[expect(
+            clippy::string_slice,
+            reason = "end is a rowan range end, which always lands on a char boundary"
+        )]
         return match text[end..].find('\n') {
             Some(rel) => end + rel + 1,
             None => text.len(),
@@ -334,6 +346,11 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+// test code — panics document assumptions
+#[allow(
+    clippy::string_slice,
+    reason = "test code — panics document assumptions"
+)]
 #[cfg(test)]
 mod tests {
     use std::path::Path;
