@@ -139,6 +139,11 @@ static REGISTRY: &[Entry] = &[
         explain: LB0315,
     },
     Entry {
+        code: Code::new(316),
+        title: "call to an `---@async` function in a sync context (await-in-sync)",
+        explain: LB0316,
+    },
+    Entry {
         code: Code::new(500),
         title: "malformed `---@luabox-ignore`",
         explain: LB0500,
@@ -1002,6 +1007,62 @@ Handle the missing members, or add an `else` clause to acknowledge the chain is
 intentionally partial.
 ";
 
+const LB0316: &str = "\
+# LB0316: call to an `---@async` function in a sync context (await-in-sync)
+
+A function annotated `---@async` is called from an enclosing function that is
+**not** itself `---@async`. This is lua-language-server's `await-in-sync`
+diagnostic (a **warning**): `---@async` marks a function that yields — it may
+only be awaited from another async function, so calling it from synchronous
+code is almost always a mistake.
+
+```lua
+---@async
+local function fetch() end
+
+---@async
+local function loadAll()
+  fetch()   -- fine: the caller is `---@async`
+end
+
+local function main()
+  fetch()   -- LB0316: call to async `fetch` in a non-async function
+end
+```
+
+**The main chunk is async.** Following luals exactly, the file's top level
+(the main chunk) counts as an async context, so a top-level call to an async
+function is **not** flagged:
+
+```lua
+---@async
+local function fetch() end
+
+fetch()   -- fine: the main chunk is async
+```
+
+luals resolves a call's enclosing scope with `guide.getParentFunction`, which
+returns the nearest `function` *or* `main`, and its `vm.isAsync` returns true
+for the `main` chunk — so only calls nested inside a non-async *function* are
+reported. The annotation reaches across files and `[types] defs` packages the
+same way the signature does.
+
+**Only an explicit `---@async` tag counts.** luals can also *propagate*
+async-ness (an unmarked function that calls an async one becomes async) under
+`Lua.hint.awaitPropagate`, but that is **off by default** — luabox mirrors the
+default, so only a directly `---@async`-tagged callee triggers this.
+
+**Suppression** — the LuaCATS directive luals recognises:
+
+```lua
+---@diagnostic disable-next-line: await-in-sync
+fetch()   -- not flagged, this line only
+```
+
+Mark the enclosing function `---@async`, move the call into an async function,
+or suppress the diagnostic if the call is genuinely synchronous-safe.
+";
+
 const LB0500: &str = "\
 # LB0500: malformed `---@luabox-ignore`
 
@@ -1505,8 +1566,8 @@ mod tests {
             "LB0001", "LB0010", "LB0011", "LB0012", "LB0013", "LB0014", "LB0015", "LB0016",
             "LB0300", "LB0301", "LB0302", "LB0303", "LB0304", "LB0305", "LB0306", "LB0307",
             "LB0308", "LB0309", "LB0310", "LB0311", "LB0312", "LB0313", "LB0314", "LB0315",
-            "LB0500", "LB0501", "LB0502", "LB0503", "LB0504", "LB0505", "LB0506", "LB0507",
-            "LB0508", "LB0509", "LB1001", "LB1100",
+            "LB0316", "LB0500", "LB0501", "LB0502", "LB0503", "LB0504", "LB0505", "LB0506",
+            "LB0507", "LB0508", "LB0509", "LB1001", "LB1100",
         ] {
             let code: Code = raw.parse().unwrap();
             assert!(explain(&code).is_some(), "{raw} missing from registry");

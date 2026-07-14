@@ -63,6 +63,9 @@ const NON_EXHAUSTIVE_IF: u16 = 315;
 const DEPRECATED: u16 = 308;
 /// Discarded return of a `---@nodiscard` call (luals `discard-returns`, #112).
 const DISCARD_RETURNS: u16 = 309;
+/// Call to a `---@async` function from a non-async enclosing function (luals
+/// `await-in-sync`).
+const AWAIT_IN_SYNC: u16 = 316;
 
 /// Run the checker over one parsed file. `inferred` carries the
 /// inference engine's expression types keyed by byte range — consulted
@@ -99,6 +102,15 @@ pub(crate) fn run(
         diags: Vec::new(),
         scopes: vec![HashMap::new()],
         ret_stack: Vec::new(),
+        // The `await-in-sync` context stack (LB0316). The bottom frame is the
+        // main chunk, which luals treats as *async*: `script/vm/doc.lua`'s
+        // local `isAsync` returns `true` for `value.type == 'main'`, and
+        // `script/core/diagnostics/await-in-sync.lua` resolves a call's
+        // enclosing scope with `guide.getParentFunction`, which returns the
+        // nearest `function` *or* `main` (`script/parser/guide.lua`). So a
+        // top-level call — whose enclosing scope is the main chunk — is never
+        // flagged. Each function body pushes its own async-ness.
+        async_ctx: vec![true],
     };
 
     for (name, span) in &typeenv.unknown_names {
@@ -235,6 +247,11 @@ struct Checker<'a> {
     scopes: Vec<HashMap<String, Binding>>,
     /// Expected returns of the enclosing function(s); `None` = unannotated.
     ret_stack: Vec<Option<FunctionTy>>,
+    /// The `await-in-sync` async-context stack (LB0316): whether the innermost
+    /// enclosing function is `---@async`. The bottom frame is the main chunk,
+    /// which luals treats as async (see [`run`]); each function body pushes its
+    /// own async-ness in [`Checker::visit_function_body`].
+    async_ctx: Vec<bool>,
 }
 
 impl Checker<'_> {
@@ -710,10 +727,69 @@ impl Checker<'_> {
                 }
             }
         }
+        // Push this function's async-ness for the `await-in-sync` check
+        // (LB0316). An unannotated body (`sig` is `None`, e.g. an anonymous
+        // closure) is *not* async — matching luals, where async is set only by
+        // an explicit `---@async` tag under the default `awaitPropagate = false`.
+        self.async_ctx
+            .push(sig.as_ref().is_some_and(|s| s.is_async));
         self.ret_stack.push(sig);
         self.visit_opt_block(body);
         self.ret_stack.pop();
+        self.async_ctx.pop();
         self.scopes.pop();
+    }
+
+    /// Whether the innermost enclosing function is an async context — the
+    /// `await-in-sync` guard (LB0316). Top-level (main chunk) is async.
+    fn in_async_context(&self) -> bool {
+        *self.async_ctx.last().unwrap_or(&true)
+    }
+
+    /// Report `LB0316` when an `---@async` function is called from a non-async
+    /// enclosing function — luals's `await-in-sync`. This mirrors
+    /// `script/core/diagnostics/await-in-sync.lua`: for every call whose
+    /// enclosing function (`guide.getParentFunction`) is not async
+    /// (`vm.isAsync`), and whose target is async (`vm.isAsyncCall`), it emits
+    /// `DIAG_AWAIT_IN_SYNC` ("Async function can only be called in async
+    /// function."). We resolve the callee's async-ness from its `FunctionTy`
+    /// flag (set from the `---@async` tag).
+    ///
+    /// **Severity / default.** luals registers `await-in-sync` at
+    /// `severity = 'Warning'` but `status = 'None'` (disabled by default) in
+    /// `script/proto/diagnostic.lua`. luabox surfaces it — like its
+    /// luals-Warning-parity siblings `deprecated` (LB0308) and
+    /// `discard-returns` (LB0309) — at a **fixed `Warning`**, never escalating
+    /// on the strictness ladder (`report_warning`).
+    ///
+    /// **Out of scope (documented luals behaviour we do not model).** luals's
+    /// `vm.isAsyncCall` also treats a call as async when an `---@async fun()`
+    /// argument is passed to a parameter the callee itself invokes
+    /// (`isLinkedCall`), and — under `Lua.hint.awaitPropagate` (off by
+    /// default) — propagates async-ness to functions that merely *call* async
+    /// ones. Neither the `async fun()` type-modifier spelling (which luals
+    /// parses in `script/parser/luadoc.lua`) nor propagation is handled here;
+    /// only the direct `---@async`-tagged callee is flagged, matching luals's
+    /// default configuration.
+    fn check_await_in_sync(
+        &mut self,
+        callee_is_async: bool,
+        name: Option<&str>,
+        span: Range<usize>,
+    ) {
+        if !callee_is_async || self.in_async_context() {
+            return;
+        }
+        let what = name.map_or_else(
+            || "an async function".to_string(),
+            |n| format!("async `{n}`"),
+        );
+        self.report_warning(
+            AWAIT_IN_SYNC,
+            span,
+            format!("call to {what} in a non-async function"),
+            "mark the enclosing function `---@async`, or move the call into one".to_string(),
+        );
     }
 
     fn visit_expr(&mut self, expr: &Expr) {
@@ -1443,6 +1519,13 @@ impl Checker<'_> {
         let Some(sig) = call.callee().and_then(|c| self.callee_sig(&c)) else {
             return;
         };
+        // `await-in-sync` (LB0316): flag an `---@async` callee reached from a
+        // non-async enclosing function. Anchored at the callee expression, as
+        // luals anchors at `source.node` (the called function).
+        if let Some(callee) = call.callee() {
+            let name = dotted_name(&callee);
+            self.check_await_in_sync(sig.is_async, name.as_deref(), range(callee.syntax()));
+        }
         let (mut slots, string_arg) = call_slots(call);
         if let Some((ty, range)) = string_arg {
             slots.push(Slot::Ty(ty, range));
@@ -1486,6 +1569,20 @@ impl Checker<'_> {
                 usize::from(r.start())..usize::from(r.end()),
                 format!("use of deprecated `{}`", method.text()),
                 format!("`{}` is marked `---@deprecated`", method.text()),
+            );
+        }
+        // `await-in-sync` (LB0316): a `:`-method resolved to an `---@async`
+        // signature, called from a non-async enclosing function. Anchored at
+        // the method name.
+        if sig.is_async
+            && let Some(method) = call.method_name()
+        {
+            let r = method.text_range();
+            let name = method.text().to_string();
+            self.check_await_in_sync(
+                true,
+                Some(&name),
+                usize::from(r.start())..usize::from(r.end()),
             );
         }
         let (mut slots, string_arg) = arg_slots(call.args());

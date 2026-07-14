@@ -821,6 +821,7 @@ impl Infer<'_> {
             // Inferred (unannotated) functions carry no doc-comment flags.
             deprecated: false,
             nodiscard: false,
+            is_async: false,
         }
     }
 

@@ -24,6 +24,7 @@ const KNOWN_RULES: &[&str] = &[
     "discard-returns",
     "duplicate-doc-field",
     "invisible",
+    "await-in-sync",
 ];
 
 /// The luals rule name that maps onto a checker `LBnnnn` code, or `None` when
@@ -35,6 +36,7 @@ pub(crate) fn rule_for_code(code: &str) -> Option<&'static str> {
         "LB0309" => Some("discard-returns"),
         "LB0311" => Some("duplicate-doc-field"),
         "LB0312" => Some("invisible"),
+        "LB0316" => Some("await-in-sync"),
         // LB0310 (duplicate-doc-alias) is a project-assembly finding, like the
         // LB0307 class collision — it never flows through this per-file filter,
         // so it has no entry here.

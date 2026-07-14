@@ -120,7 +120,7 @@ pub struct ParamTy {
 #[allow(
     clippy::struct_excessive_bools,
     reason = "each flag models a distinct, independent LuaCATS annotation \
-              (vararg return, return-annotation presence, @deprecated, @nodiscard)"
+              (vararg return, return-annotation presence, @deprecated, @nodiscard, @async)"
 )]
 pub struct FunctionTy {
     /// Positional parameters, in order.
@@ -153,6 +153,16 @@ pub struct FunctionTy {
     /// a bare call statement is reported (`LB0309`, luals `discard-returns`,
     /// #112).
     pub nodiscard: bool,
+    /// Whether the function carries `---@async` — calling it from a *non-async*
+    /// enclosing function is reported (`LB0316`, luals `await-in-sync`). Like
+    /// `deprecated`/`nodiscard`, the flag rides the type IR so it reaches call
+    /// sites cross-file (workspace-global members) and through `[types] defs`
+    /// packages via the same ambient/`FileTypes` merges the signature travels
+    /// through. luals's `async` propagation (an unmarked function that *calls*
+    /// an async one becoming async, `Lua.hint.awaitPropagate`) is off by
+    /// default there (`config/template.lua`: `awaitPropagate >> false`), so
+    /// only an explicit `---@async` tag sets this — matching luals's default.
+    pub is_async: bool,
 }
 
 impl FunctionTy {
@@ -288,6 +298,7 @@ impl Ty {
                 generics: func.generics.clone(),
                 deprecated: func.deprecated,
                 nodiscard: func.nodiscard,
+                is_async: func.is_async,
             })),
             other => other.clone(),
         }

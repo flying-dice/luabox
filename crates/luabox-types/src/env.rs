@@ -654,16 +654,23 @@ impl TypeEnv {
         let mut overloads: Vec<FunctionTy> = Vec::new();
         let mut casts: Vec<CastEntry> = Vec::new();
         let mut fn_generics: Vec<TypeParam> = Vec::new();
-        // `---@deprecated` / `---@nodiscard` attach to the whole doc block, so
-        // a block that annotates a function carries them onto that function's
-        // signature (#111, #112). Scanned alongside the other tags.
+        // `---@deprecated` / `---@nodiscard` / `---@async` attach to the whole
+        // doc block, so a block that annotates a function carries them onto
+        // that function's signature (#111, #112). Scanned alongside the other
+        // tags. `---@async` drives the `await-in-sync` call-site check
+        // (LB0316): luals decides a `function` is async iff any of its
+        // `bindDocs` is a `doc.async` tag (`script/vm/doc.lua`'s local
+        // `isAsync`: `for _, doc in ipairs(value.bindDocs) do if doc.type ==
+        // 'doc.async' then value._async = true`).
         let mut deprecated = false;
         let mut nodiscard = false;
+        let mut is_async = false;
 
         for tag in &item.block.tags {
             match tag {
                 Tag::Deprecated(_) => deprecated = true,
                 Tag::Nodiscard(_) => nodiscard = true,
+                Tag::Async(_) => is_async = true,
                 Tag::Class(c) if !c.name.is_empty() => {
                     let parents = c
                         .parents
@@ -792,7 +799,7 @@ impl TypeEnv {
         // targets, so deprecating a `---@class` carrier is harmless here.
         let has_sig_tags =
             !params.is_empty() || !returns.is_empty() || !overloads.is_empty() || vararg.is_some();
-        if (has_sig_tags || deprecated || nodiscard)
+        if (has_sig_tags || deprecated || nodiscard || is_async)
             && let Some(target) = target
         {
             let mut func = FunctionTy {
@@ -800,12 +807,13 @@ impl TypeEnv {
                 generics: fn_generics,
                 deprecated,
                 nodiscard,
+                is_async,
                 ..FunctionTy::default()
             };
             // With no signature tags the block contributes only the flag:
             // stay fully arity/type-permissive (an unannotated function is
-            // never arity-checked), so `---@deprecated` alone never manufactures
-            // an `LB0301`/`LB0300`.
+            // never arity-checked), so `---@deprecated`/`---@async` alone never
+            // manufactures an `LB0301`/`LB0300`.
             if !has_sig_tags {
                 func.varargs = Some(Ty::Any);
             }

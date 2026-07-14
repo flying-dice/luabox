@@ -2062,6 +2062,182 @@ function mustUse() end
         assert_eq!(codes, Vec::<String>::new());
     }
 
+    // --- `---@async` await-in-sync (LB0316) ----------------------------------
+    //
+    // luals precedent: `script/core/diagnostics/await-in-sync.lua` flags a call
+    // to an async function (`vm.isAsyncCall`) whose enclosing function
+    // (`guide.getParentFunction`) is not async (`vm.isAsync`). A function is
+    // async iff a `bindDocs` entry is `doc.async` (`script/vm/doc.lua`). The
+    // main chunk is async (`vm.isAsync` returns true for `type == 'main'`), so
+    // a top-level async call is not flagged. Default severity Warning, and
+    // status None (disabled by default) in `script/proto/diagnostic.lua` —
+    // luabox surfaces it at a fixed Warning like its siblings LB0308/LB0309.
+
+    #[test]
+    fn async_call_in_sync_function_flagged() {
+        let src = "\
+---@async
+local function fetch() end
+local function sync()
+  fetch()
+end
+";
+        assert_eq!(codes(src, Strictness::Warn), vec!["LB0316"]);
+    }
+
+    #[test]
+    fn async_call_in_async_function_is_clean() {
+        let src = "\
+---@async
+local function fetch() end
+---@async
+local function loadAll()
+  fetch()
+end
+";
+        assert_eq!(codes(src, Strictness::Warn), Vec::<String>::new());
+    }
+
+    #[test]
+    fn async_call_at_top_level_is_clean() {
+        // The main chunk is an async context in luals, so a top-level call to
+        // an async function is not flagged.
+        let src = "\
+---@async
+local function fetch() end
+fetch()
+";
+        assert_eq!(codes(src, Strictness::Warn), Vec::<String>::new());
+    }
+
+    #[test]
+    fn async_call_in_nested_sync_closure_flagged() {
+        // A closure nested inside an async function is itself sync (unannotated),
+        // so an async call within it is flagged — the *nearest* enclosing
+        // function governs, matching `guide.getParentFunction`.
+        let src = "\
+---@async
+local function fetch() end
+---@async
+local function loadAll()
+  local cb = function()
+    fetch()
+  end
+  cb()
+end
+";
+        assert_eq!(codes(src, Strictness::Warn), vec!["LB0316"]);
+    }
+
+    #[test]
+    fn async_dotted_call_flagged() {
+        let src = "\
+local M = {}
+---@async
+function M.fetch() end
+local function sync()
+  M.fetch()
+end
+";
+        assert_eq!(codes(src, Strictness::Warn), vec!["LB0316"]);
+    }
+
+    #[test]
+    fn async_method_call_flagged() {
+        // A `:`-method resolved to an `---@async` signature, called from a
+        // non-async function.
+        let src = "\
+---@class Client
+local Client = {}
+Client.__index = Client
+
+---@async
+function Client:fetch() end
+
+---@return Client
+function Client.new()
+  return setmetatable({}, Client)
+end
+
+local function sync()
+  local c = Client.new()
+  c:fetch()
+end
+";
+        assert_eq!(strict_codes_ambient(src), vec!["LB0316"]);
+    }
+
+    #[test]
+    fn non_async_call_is_clean() {
+        // A callee with no `---@async` tag is never flagged, in any context.
+        let src = "\
+local function plain() end
+local function sync()
+  plain()
+end
+";
+        assert_eq!(codes(src, Strictness::Warn), Vec::<String>::new());
+    }
+
+    #[test]
+    fn async_in_sync_is_warning_even_under_strict() {
+        // luals-Warning parity: LB0316 stays a Warning under strict mode, never
+        // escalating on the strictness ladder (like LB0308/LB0309).
+        let src = "\
+---@async
+local function fetch() end
+local function sync()
+  fetch()
+end
+";
+        let diags = check(src, Strictness::Strict);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code.to_string(), "LB0316");
+        assert_eq!(diags[0].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn async_in_sync_suppressed_by_directive() {
+        let src = "\
+---@async
+local function fetch() end
+local function sync()
+  ---@diagnostic disable-next-line: await-in-sync
+  fetch()
+end
+";
+        assert_eq!(codes(src, Strictness::Warn), Vec::<String>::new());
+    }
+
+    #[test]
+    fn async_cross_file_via_defs() {
+        // The `---@async` flag rides the signature through a `[types] defs`
+        // package, so a sync call to a def-declared async function is flagged.
+        let defs = "\
+---@meta
+---@async
+function fetchGlobal() end
+";
+        let src = "\
+local function sync()
+  fetchGlobal()
+end
+";
+        assert_eq!(ambient_codes(src, &[defs]), vec!["LB0316"]);
+    }
+
+    #[test]
+    fn async_bare_tag_adds_no_arity_error() {
+        // A bare `---@async` block (no `---@param`/`---@return`) must not enable
+        // arity checking on the function it annotates.
+        let src = "\
+---@async
+local function fetch(a, b) end
+fetch(1)
+";
+        assert_eq!(codes(src, Strictness::Warn), Vec::<String>::new());
+    }
+
     // --- #113 duplicate-doc-field (LB0311) -----------------------------------
 
     #[test]
