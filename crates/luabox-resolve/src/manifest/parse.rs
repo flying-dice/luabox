@@ -12,7 +12,8 @@ use toml_edit::{ImDocument, Item, Table, TableLike};
 use super::error::ManifestError;
 use super::model::{
     ALLOWED_BUNDLE_MODES, ALLOWED_DIALECTS, Build, Dependency, GitDependency, LINT_TIERS, Lint,
-    LintLevel, Manifest, Package, PathDependency, TaskValue, Types, Workspace, WorkspaceDependency,
+    LintLevel, Manifest, Package, PathDependency, TaskValue, Types, UrlDependency, Workspace,
+    WorkspaceDependency,
 };
 
 const TOP_LEVEL_KEYS: &[&str] = &[
@@ -44,6 +45,8 @@ const DEPENDENCY_KEYS: &[&str] = &[
     "tag",
     "branch",
     "path",
+    "url",
+    "sha256",
     "workspace",
     "version",
 ];
@@ -555,6 +558,8 @@ fn parse_dependency(
 
     let git = get_string(table, &ctx, "git", false, errors);
     let path = get_string(table, &ctx, "path", false, errors);
+    let url = get_string(table, &ctx, "url", false, errors);
+    let sha256 = get_string(table, &ctx, "sha256", false, errors);
     let has_workspace_key = table.get("workspace").is_some();
     let workspace_flag = if has_workspace_key {
         get_bool(table, &ctx, "workspace", false, errors)
@@ -566,21 +571,52 @@ fn parse_dependency(
     let tag = get_string(table, &ctx, "tag", false, errors);
     let branch = get_string(table, &ctx, "branch", false, errors);
 
-    let kinds_present =
-        usize::from(git.is_some()) + usize::from(path.is_some()) + usize::from(has_workspace_key);
+    let kinds_present = usize::from(git.is_some())
+        + usize::from(path.is_some())
+        + usize::from(url.is_some())
+        + usize::from(has_workspace_key);
     if kinds_present == 0 {
         errors.push(ManifestError::new(
-            format!("`{ctx}` must specify one of `git`, `path`, or `workspace = true`"),
+            format!("`{ctx}` must specify one of `git`, `path`, `url`, or `workspace = true`"),
             item.span(),
         ));
         return None;
     }
     if kinds_present > 1 {
         errors.push(ManifestError::new(
-            format!("`{ctx}` must specify only one of `git`, `path`, or `workspace = true`"),
+            format!("`{ctx}` must specify only one of `git`, `path`, `url`, or `workspace = true`"),
             item.span(),
         ));
         return None;
+    }
+
+    if let Some(url) = url {
+        // Integrity is non-negotiable: an http(s) tarball source must pin its
+        // SHA-256, so a `url` with no `sha256` is a hard error, never a silent
+        // unverified fetch (SPEC.md §6).
+        let Some(sha256) = sha256 else {
+            errors.push(ManifestError::new(
+                format!(
+                    "`{ctx}` has a `url` source but no `sha256` — an http(s) tarball dependency \
+                     must pin its SHA-256 digest for integrity"
+                ),
+                item.span(),
+            ));
+            return None;
+        };
+        return Some(Dependency::Url(UrlDependency {
+            url,
+            sha256,
+            version,
+        }));
+    }
+    if let Some(span) = table.get("sha256").and_then(Item::span) {
+        // A `sha256` with no `url` is meaningless — flag it rather than
+        // silently ignore it.
+        errors.push(ManifestError::new(
+            format!("`{ctx}.sha256` is only valid alongside a `url` source"),
+            Some(span),
+        ));
     }
 
     if let Some(git) = git {

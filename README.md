@@ -210,8 +210,15 @@ dependencies = { "lua >= 5.4", "lpeg >= 1.0" }   # resolved from luarocks.org
 edition = "5.4"
 
 [dependencies]
-mylib = { path = "../mylib" }                     # a source dependency
+mylib = { path = "../mylib" }                     # a path source dependency
+gitlib = { git = "https://github.com/owner/gitlib", tag = "v1.2.0" }
+tarball = { url = "https://example.com/pkg.tar.gz", sha256 = "…" }  # bun-style, pinned by digest
 ```
+
+The `url` source is a bun-style http(s) (or `file://`/local) tarball pinned by
+its SHA-256: the digest is captured once at `luabox add --url` time and verified
+before extraction on every install after, so a corrupt or tampered download
+installs nothing.
 
 `luabox install`/`update` resolve the merged graph (rockspec registry deps +
 luabox.toml source deps) with the PubGrub solver, write `luabox.lock`, and
@@ -237,6 +244,7 @@ luabox add penlight@1.14    # a lower bound: writes "penlight >= 1.14"
 luabox add busted --dev     # a test-only dep → the rockspec's test_dependencies
 luabox remove penlight      # delete the entry from the rockspec + re-sync
 luabox add cool-lib --git https://github.com/owner/cool-lib --tag v1.2.0
+luabox add tarball --url https://example.com/pkg.tar.gz  # captures & pins its sha256
 luabox outdated             # which deps are behind their latest version?
 luabox update cool-lib      # re-pin cool-lib to its repo's latest release tag
 ```

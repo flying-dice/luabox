@@ -10,6 +10,18 @@ spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
 
 ### Added
 
+- **http(s) tarball dependencies (`url` source)**
+  ([#2](https://github.com/flying-dice/luabox/issues/2)) — a bun-style
+  `pkg = { url = "https://…/pkg.tar.gz", sha256 = "…" }` source in `luabox.toml`.
+  `luabox add <name> --url <tarball>` fetches the archive, captures its SHA-256,
+  and writes `{ url, sha256 }` — the digest is pinned once at add time and
+  verified **before extraction** on every install after, so a corrupt or
+  tampered download installs nothing (a clear error names the expected and
+  actual digests). Tarballs are fetched with `curl` and unpacked with `tar`
+  (no new crates); `file://` and local paths are supported for offline/hermetic
+  use. The verified tree is cached under `<store>/url/`, so a second resolve is
+  offline, and the digest is recorded in `luabox.lock` as `url+<url>`. `--url`
+  conflicts with `--git`/`--path`.
 - **`luabox add`/`remove` edit the rockspec for registry dependencies**
   ([#2](https://github.com/flying-dice/luabox/issues/2)) — `luabox add <rock>`
   now edits your project's `*.rockspec` the way `pnpm add` edits

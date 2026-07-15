@@ -23,7 +23,8 @@ mod workspace;
 pub use error::ManifestError;
 pub use model::{
     ALLOWED_BUNDLE_MODES, ALLOWED_DIALECTS, Build, Dependency, GitDependency, LINT_TIERS, Lint,
-    LintLevel, Manifest, Package, PathDependency, TaskValue, Types, Workspace, WorkspaceDependency,
+    LintLevel, Manifest, Package, PathDependency, TaskValue, Types, UrlDependency, Workspace,
+    WorkspaceDependency,
 };
 
 #[cfg(test)]
@@ -350,6 +351,40 @@ mod tests {
             manifest.dependencies.get("e"),
             Some(Dependency::Workspace(_))
         ));
+    }
+
+    #[test]
+    fn url_dependency_parses_with_its_digest() {
+        let src = "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[dependencies]\nu = { url = \"https://example.com/u.tar.gz\", sha256 = \"abc123\" }\n";
+        let manifest = Manifest::parse(src).expect("valid manifest");
+        match manifest.dependencies.get("u") {
+            Some(Dependency::Url(url)) => {
+                assert_eq!(url.url, "https://example.com/u.tar.gz");
+                assert_eq!(url.sha256, "abc123");
+                assert_eq!(url.version, None);
+            }
+            other => panic!("expected url dep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn url_dependency_without_sha256_is_rejected() {
+        let src = "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[dependencies]\nu = { url = \"https://example.com/u.tar.gz\" }\n";
+        let errors = Manifest::parse(src).unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.message.contains("sha256")),
+            "a url source with no sha256 must be a hard error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn sha256_without_a_url_source_is_rejected() {
+        let src = "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[dependencies]\nbad = { path = \"../d\", sha256 = \"abc\" }\n";
+        let errors = Manifest::parse(src).unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.message.contains("sha256")),
+            "a lone sha256 must be flagged: {errors:?}"
+        );
     }
 
     #[test]

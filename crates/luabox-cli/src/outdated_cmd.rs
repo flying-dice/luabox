@@ -157,6 +157,8 @@ fn report_for(
             })
         }
         Dependency::Path(_) => Ok(plain(name, "path")),
+        // A url tarball is pinned by sha256 — immutable content, never outdated.
+        Dependency::Url(_) => Ok(plain(name, "url")),
         Dependency::Workspace(_) => Ok(plain(name, "workspace")),
         Dependency::Git(git) => {
             // The current pin: a tag is comparable to release tags; a rev or

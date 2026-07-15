@@ -125,12 +125,12 @@ members = ["packages/*"]
 
 ## 6. Package manager
 
-luabox follows the pnpm/bun model: **[luarocks.org](https://luarocks.org) is the registry**, and the **rockspec is the package manifest**. A project's `*.rockspec` owns its name, version, and registry dependencies (its `dependencies`/`test_dependencies`, bare rock names in LuaRocks constraint syntax, translated to semver). `luabox.toml` is tool configuration (edition, build, types, tasks) plus the source dependencies a rockspec cannot express — `path`, `git`, and `workspace` entries; a version-requirement dependency there is an error pointing at the rockspec. There is no first-party registry.
+luabox follows the pnpm/bun model: **[luarocks.org](https://luarocks.org) is the registry**, and the **rockspec is the package manifest**. A project's `*.rockspec` owns its name, version, and registry dependencies (its `dependencies`/`test_dependencies`, bare rock names in LuaRocks constraint syntax, translated to semver). `luabox.toml` is tool configuration (edition, build, types, tasks) plus the source dependencies a rockspec cannot express — `path`, `git`, `url` (a bun-style tarball pinned by `sha256`), and `workspace` entries; a version-requirement dependency there is an error pointing at the rockspec. There is no first-party registry.
 
 - **Resolution:** full semver, PubGrub solver (cargo-quality conflict messages).
 - **Registry:** luarocks.org, bridged transparently by reading rockspecs statically (no `luarocks` CLI needed); `LUABOX_LUAROCKS_MIRROR` points resolution at a local mirror for hermetic/offline installs.
 - **Store:** global content-addressed cache (`~/.luabox/store`), hard-link/reflink into projects (bun/pnpm model).
-- Dep kinds: registry (rockspec), git (rev/tag/branch), path, workspace.
+- Dep kinds: registry (rockspec), git (rev/tag/branch), url (http(s)/local tarball pinned by sha256, verified before extraction — bun-style), path, workspace.
 - Packages declare `lua-versions = ["5.1", "5.4"]`; resolver refuses incompatible graphs or selects pre-lowered published variants.
 - C modules: **declared, not built** — pure-Lua rocks only; a C/native rock is rejected with a clear error. Luabox is not a C build system.
 

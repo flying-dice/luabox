@@ -30,6 +30,7 @@ pub mod provider;
 mod report;
 mod semver_ranges;
 pub mod solver;
+pub mod url_provider;
 
 pub use git_provider::{GitCheckout, GitProvider};
 pub use lockfile::{
@@ -43,3 +44,4 @@ pub use provider::{
     StackedProvider, StaticProvider,
 };
 pub use solver::{Resolution, ResolveError, ResolvedPackage, resolve, verify_resolution};
+pub use url_provider::UrlProvider;

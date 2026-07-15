@@ -143,6 +143,14 @@ impl Context<'_> {
                     self.optional_req(dependent, name, git.version.as_deref())?,
                 ))
             }
+            Dependency::Url(url_dep) => Ok((
+                PkgKey::Pkg(PackageId::url(
+                    name,
+                    url_dep.url.clone(),
+                    url_dep.sha256.clone(),
+                )),
+                self.optional_req(dependent, name, url_dep.version.as_deref())?,
+            )),
             Dependency::Path(path_dep) => {
                 // Path deps resolve relative to the *dependent's* directory.
                 let base = self.dependent_dir(dependent).ok_or_else(|| {
@@ -568,6 +576,7 @@ fn build_resolution(
                     None => format!("{url}#{reference}"),
                 },
             },
+            Source::Url { url, .. } => LockedSource::Url { url: url.clone() },
         };
         packages.push(ResolvedPackage {
             name: id.name.clone(),

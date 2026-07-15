@@ -396,6 +396,34 @@ fn git_repository_at(world: &mut AcceptanceWorld, repo: String, name: String, ve
     git_in(&dir, &["tag", &format!("v{version}")]);
 }
 
+/// Build a `.tar.gz` fixture at `archive` (relative to the project root)
+/// containing a single flat file, so the extracted tree root is the package
+/// root. Used by the url-source scenarios (distribution/url.feature).
+#[given(expr = "a tarball fixture {string} exporting file {string}")]
+fn tarball_fixture(world: &mut AcceptanceWorld, archive: String, file: String) {
+    let src = world.dir.path().join(".url-fixture-src");
+    std::fs::create_dir_all(&src).expect("create fixture source dir");
+    std::fs::write(src.join(&file), format!("return \"{file}\"\n")).expect("write fixture file");
+    let archive_path = world.dir.path().join(&archive);
+    let status = std::process::Command::new("tar")
+        .arg("-czf")
+        .arg(&archive_path)
+        .arg("-C")
+        .arg(&src)
+        .arg(&file)
+        .status()
+        .expect("failed to run tar to build the tarball fixture");
+    assert!(status.success(), "tar failed to build the tarball fixture");
+}
+
+/// Delete a file under the project root — used to prove a second install is
+/// offline (the cached tarball must be reused without the source).
+#[given(expr = "I delete the file {string}")]
+fn delete_file(world: &mut AcceptanceWorld, path: String) {
+    let full = world.dir.path().join(&path);
+    std::fs::remove_file(&full).unwrap_or_else(|e| panic!("cannot delete `{path}`: {e}"));
+}
+
 #[then("stdout is valid JSON")]
 fn stdout_is_valid_json(world: &mut AcceptanceWorld) {
     let stdout = world.stdout();

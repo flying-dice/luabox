@@ -73,11 +73,14 @@ enum Command {
         #[arg(long)]
         dev: bool,
         /// Add as a path dependency rooted at this directory
-        #[arg(long, conflicts_with = "git")]
+        #[arg(long, conflicts_with_all = ["git", "url"])]
         path: Option<String>,
         /// Add as a git dependency at this URL
-        #[arg(long)]
+        #[arg(long, conflicts_with = "url")]
         git: Option<String>,
+        /// Add as an http(s) tarball dependency (its sha256 is captured now)
+        #[arg(long)]
+        url: Option<String>,
         /// Pin the git dependency to a commit
         #[arg(long, requires = "git", conflicts_with_all = ["tag", "branch"])]
         rev: Option<String>,
@@ -239,6 +242,7 @@ fn main() -> anyhow::Result<()> {
             dev,
             path,
             git,
+            url,
             rev,
             tag,
             branch,
@@ -249,6 +253,7 @@ fn main() -> anyhow::Result<()> {
                 dev,
                 path,
                 git,
+                url,
                 rev,
                 tag,
                 branch,

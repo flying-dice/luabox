@@ -137,6 +137,13 @@ fn dependency_value(dep: &Dependency) -> Value {
                 table.insert("version", version.as_str().into());
             }
         }
+        Dependency::Url(url) => {
+            table.insert("url", url.url.as_str().into());
+            table.insert("sha256", url.sha256.as_str().into());
+            if let Some(version) = &url.version {
+                table.insert("version", version.as_str().into());
+            }
+        }
         Dependency::Workspace(ws) => {
             table.insert("workspace", true.into());
             if let Some(version) = &ws.version {
@@ -258,6 +265,33 @@ start = \"luabox run src/main.lua\"
         let reparsed = Manifest::parse(&out).expect("edited manifest still valid");
         assert_eq!(reparsed.dependencies, manifest.dependencies);
         assert_eq!(reparsed.dev_dependencies, manifest.dev_dependencies);
+    }
+
+    #[test]
+    fn set_dependency_entry_writes_a_url_source() {
+        use crate::manifest::{Dependency, UrlDependency};
+
+        let mut manifest = Manifest::parse(SRC).expect("valid manifest");
+        manifest.set_dependency_entry(
+            "tarball",
+            &Dependency::Url(UrlDependency {
+                url: "https://example.com/pkg.tar.gz".to_owned(),
+                sha256: "abc123".to_owned(),
+                version: None,
+            }),
+            false,
+        );
+
+        let out = manifest.to_string();
+        assert!(
+            out.contains(
+                "tarball = { url = \"https://example.com/pkg.tar.gz\", sha256 = \"abc123\" }"
+            ),
+            "{out}"
+        );
+        // Round-trips back through the parser with the same typed view.
+        let reparsed = Manifest::parse(&out).expect("edited manifest still valid");
+        assert_eq!(reparsed.dependencies, manifest.dependencies);
     }
 
     #[test]

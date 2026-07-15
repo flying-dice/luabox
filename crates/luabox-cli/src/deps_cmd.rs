@@ -15,14 +15,14 @@
 //!
 //! - **add** — comment-preserving `luabox.toml` edit
 //!   (`Manifest::set_dependency_entry`) for `--path <dir>` /
-//!   `--git <url> [--rev|--tag|--branch]` sources, then an install. A bare
-//!   registry spec (`luabox add penlight@1.14`) now belongs in the rockspec;
-//!   editing the rockspec arrives in a later wave, so it errors with that
-//!   guidance for now.
+//!   `--git <url> [--rev|--tag|--branch]` / `--url <tarball>` sources, then an
+//!   install. `--url` fetches the tarball, captures its sha256, and writes
+//!   `{ url, sha256 }` (bun-style: the digest is pinned at add time). A bare
+//!   registry spec (`luabox add penlight@1.14`) belongs in the rockspec.
 //! - **remove** — comment-preserving edit (`Manifest::remove_dependency`)
 //!   plus a re-install, so `luabox.lock` and `lua_modules/` drop the entry.
 //! - **install** — resolve (respecting an existing `luabox.lock` for
-//!   minimal churn) over `PathProvider` + `GitProvider` +
+//!   minimal churn) over `PathProvider` + `GitProvider` + `UrlProvider` +
 //!   `LuaRocksProvider`, write the lockfile, and materialize every non-path
 //!   package from the content-addressed store into `lua_modules/<name>/`.
 //!   Idempotent: when the lockfile and `lua_modules` are already current it
@@ -54,10 +54,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow, bail};
 use luabox_resolve::luarocks::rockspec::{self, Rockspec};
 use luabox_resolve::luarocks::{dependency_from_spec, rockspec_edit};
-use luabox_resolve::manifest::{Dependency, GitDependency, PathDependency};
+use luabox_resolve::manifest::{Dependency, GitDependency, PathDependency, UrlDependency};
 use luabox_resolve::{
     GitProvider, LOCKFILE_NAME, Lockfile, LuaRocksProvider, Manifest, PackageId, PackageProvider,
-    PathProvider, ProviderError, Resolution, ResolveError, Source, StackedProvider,
+    PathProvider, ProviderError, Resolution, ResolveError, Source, StackedProvider, UrlProvider,
     effective_manifest, resolve,
 };
 use luabox_store::{LinkMode, Store};
@@ -78,6 +78,8 @@ pub struct AddOptions {
     pub path: Option<String>,
     /// Add as a git dependency at this URL.
     pub git: Option<String>,
+    /// Add as an http(s)/local tarball dependency (sha256 captured at add time).
+    pub url: Option<String>,
     pub rev: Option<String>,
     pub tag: Option<String>,
     pub branch: Option<String>,
@@ -89,9 +91,9 @@ pub struct AddOptions {
 pub fn add(cwd: &Path, opts: &AddOptions) -> anyhow::Result<()> {
     let (name, version) = split_spec(&opts.package)?;
 
-    // A bare spec (no `--path`/`--git`) is a luarocks.org dependency — those
-    // live in the rockspec now.
-    if opts.git.is_none() && opts.path.is_none() {
+    // A bare spec (no `--path`/`--git`/`--url`) is a luarocks.org dependency —
+    // those live in the rockspec now.
+    if opts.git.is_none() && opts.path.is_none() && opts.url.is_none() {
         return add_registry(cwd, &name, version.as_deref(), opts.dev);
     }
 
@@ -108,6 +110,15 @@ pub fn add(cwd: &Path, opts: &AddOptions) -> anyhow::Result<()> {
         Dependency::Path(PathDependency {
             // Manifest paths are conventionally forward-slashed.
             path: path.replace('\\', "/"),
+            version: version.clone(),
+        })
+    } else if let Some(url) = &opts.url {
+        // Bun-style: fetch the tarball once now and capture its sha256, so the
+        // digest is pinned in `luabox.toml` and verified on every install after.
+        let sha256 = capture_url_digest(url)?;
+        Dependency::Url(UrlDependency {
+            url: url.clone(),
+            sha256,
             version: version.clone(),
         })
     } else {
@@ -127,6 +138,15 @@ pub fn add(cwd: &Path, opts: &AddOptions) -> anyhow::Result<()> {
     println!("added `{name}` to [{table}]");
 
     sync(&project, &LockUse::Full, false)
+}
+
+/// Fetches the tarball at `url` and returns its SHA-256 — the digest
+/// `luabox add --url` pins into `luabox.toml`. A local/`file://` source is
+/// hashed in place; an http(s) source is downloaded to a temp dir first.
+fn capture_url_digest(url: &str) -> anyhow::Result<String> {
+    let staging = tempfile::tempdir().context("cannot create a temp dir to fetch the tarball")?;
+    UrlProvider::digest_of(url, staging.path())
+        .map_err(|e| anyhow!("cannot fetch `{url}` to capture its sha256: {e}"))
 }
 
 /// `luabox add <name>[@req] [--dev]` for a registry (luarocks.org) rock:
@@ -412,15 +432,24 @@ pub fn vendor(cwd: &Path) -> anyhow::Result<()> {
 
     let store = Store::open(store_root()?);
     let git = GitProvider::new(store.root().join("git"));
+    let url = UrlProvider::new(store.root().join("url"));
     let paths = PathProvider::new();
     let luarocks = LuaRocksProvider::from_env(store.root().join("luarocks"));
     let lock = read_lockfile(&project, &LockUse::Full)?;
-    let providers: Vec<&dyn luabox_resolve::PackageProvider> = vec![&paths, &git, &luarocks];
+    let providers: Vec<&dyn luabox_resolve::PackageProvider> = vec![&paths, &git, &url, &luarocks];
     let stacked = StackedProvider::new(providers);
     let resolution = run_resolve(&manifest, &project.root, &stacked, lock.as_ref())?;
 
     let vendor_dir = project.root.join(VENDOR_DIR);
-    let vendored = materialize(&resolution, &store, &git, &luarocks, &vendor_dir, LinkMode::Copy)?;
+    let vendored = materialize(
+        &resolution,
+        &store,
+        &git,
+        &url,
+        &luarocks,
+        &vendor_dir,
+        LinkMode::Copy,
+    )?;
     if vendored.is_empty() {
         println!(
             "nothing to vendor: every dependency is a path/workspace dependency (used in place)"
@@ -488,9 +517,10 @@ fn sync(project: &Project, lock_use: &LockUse, refresh_git: bool) -> anyhow::Res
 
     let store = Store::open(store_root()?);
     let git = GitProvider::new(store.root().join("git")).with_refresh(refresh_git);
+    let url = UrlProvider::new(store.root().join("url"));
     let paths = PathProvider::new();
     let luarocks = LuaRocksProvider::from_env(store.root().join("luarocks"));
-    let providers: Vec<&dyn luabox_resolve::PackageProvider> = vec![&paths, &git, &luarocks];
+    let providers: Vec<&dyn luabox_resolve::PackageProvider> = vec![&paths, &git, &url, &luarocks];
     let stacked = StackedProvider::new(providers);
     let resolution = run_resolve(&manifest, &project.root, &stacked, lock.as_ref())?;
 
@@ -510,7 +540,15 @@ fn sync(project: &Project, lock_use: &LockUse, refresh_git: bool) -> anyhow::Res
             .with_context(|| format!("cannot write `{}`", lock_path.display()))?;
     }
 
-    let installed = materialize(&resolution, &store, &git, &luarocks, &modules_dir, LinkMode::Auto)?;
+    let installed = materialize(
+        &resolution,
+        &store,
+        &git,
+        &url,
+        &luarocks,
+        &modules_dir,
+        LinkMode::Auto,
+    )?;
     prune_stale_modules(&resolution, &modules_dir)?;
 
     let path_count = resolution
@@ -578,6 +616,7 @@ fn materialize(
     resolution: &Resolution,
     store: &Store,
     git: &GitProvider,
+    url: &UrlProvider,
     luarocks: &LuaRocksProvider,
     dest_root: &Path,
     mode: LinkMode,
@@ -591,6 +630,14 @@ fn materialize(
                     .map_err(|e| anyhow!("fetching `{}`: {e}", package.name))?
                     .dir
             }
+            // An http(s)/local tarball: fetch + verify + extract (the sha256 is
+            // enforced before extraction, SPEC.md §6).
+            Source::Url {
+                url: tarball_url,
+                sha256,
+            } => url
+                .tree(tarball_url, sha256)
+                .map_err(|e| anyhow!("fetching `{}`: {e}", package.name))?,
             // A registry package is a luarocks.org rock: fetch its laid-out
             // module tree (SPEC.md §6).
             Source::Registry => luarocks

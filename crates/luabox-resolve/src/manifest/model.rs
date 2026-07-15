@@ -72,6 +72,9 @@ pub enum Dependency {
     Git(GitDependency),
     /// `pkg = { path = "…" }`
     Path(PathDependency),
+    /// `pkg = { url = "…", sha256 = "…" }` — an http(s) (or `file://`/local)
+    /// tarball, pinned by its SHA-256.
+    Url(UrlDependency),
     /// `pkg = { workspace = true }`
     Workspace(WorkspaceDependency),
 }
@@ -94,6 +97,18 @@ pub struct GitDependency {
 #[serde(rename_all = "kebab-case")]
 pub struct PathDependency {
     pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+/// `pkg = { url = "…", sha256 = "…" }` — an http(s) tarball dependency
+/// (SPEC.md §6). `sha256` is REQUIRED: integrity is non-negotiable, so a `url`
+/// source with no digest is a parse error, never a silent unverified fetch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct UrlDependency {
+    pub url: String,
+    pub sha256: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
 }

@@ -50,6 +50,9 @@ pub enum LockedSource {
     /// (falling back to the symbolic reference for providers that cannot
     /// pin one).
     Git { spec: String },
+    /// An http(s)/local tarball source, recorded as `url+<url>`. The
+    /// integrity digest travels in the entry's `checksum` (`sha256:…`).
+    Url { url: String },
     /// A path/workspace dependency, root-relative with forward slashes.
     Path { path: String },
 }
@@ -59,6 +62,7 @@ impl fmt::Display for LockedSource {
         match self {
             Self::Registry => write!(f, "registry"),
             Self::Git { spec } => write!(f, "git+{spec}"),
+            Self::Url { url } => write!(f, "url+{url}"),
             Self::Path { path } => write!(f, "path+{path}"),
         }
     }
@@ -72,13 +76,17 @@ impl LockedSource {
             Ok(Self::Git {
                 spec: spec.to_owned(),
             })
+        } else if let Some(url) = text.strip_prefix("url+") {
+            Ok(Self::Url {
+                url: url.to_owned(),
+            })
         } else if let Some(path) = text.strip_prefix("path+") {
             Ok(Self::Path {
                 path: path.to_owned(),
             })
         } else {
             Err(LockfileError::new(format!(
-                "unknown package source `{text}` (expected `registry`, `git+…`, or `path+…`)"
+                "unknown package source `{text}` (expected `registry`, `git+…`, `url+…`, or `path+…`)"
             )))
         }
     }
@@ -378,6 +386,9 @@ checksum = \"sha256:beef\"
         for source in [
             LockedSource::Git {
                 spec: "https://example.com/r.git#abc123".to_owned(),
+            },
+            LockedSource::Url {
+                url: "https://example.com/mylib-1.0.tar.gz".to_owned(),
             },
             LockedSource::Path {
                 path: "../sibling".to_owned(),

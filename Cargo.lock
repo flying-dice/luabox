@@ -1355,6 +1355,7 @@ name = "luabox-resolve"
 version = "0.1.4"
 dependencies = [
  "anyhow",
+ "luabox-store",
  "luabox-syntax",
  "proptest",
  "pubgrub",

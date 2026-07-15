@@ -1,13 +1,15 @@
 //! Package metadata sources for the resolver (SPEC.md §6).
 //!
 //! [`PackageProvider`] is the boundary between the PubGrub solver and
-//! wherever package metadata physically lives. Three implementations ship
+//! wherever package metadata physically lives. These implementations ship
 //! today:
 //!
 //! - [`PathProvider`] — path/workspace dependencies, read from each
 //!   dependency's `luabox.toml` on disk.
 //! - [`crate::GitProvider`] — git dependencies, fetched with the `git` CLI
 //!   into a local cache (see `git_provider`).
+//! - [`crate::UrlProvider`] — http(s)/local tarball dependencies, fetched with
+//!   `curl` + `tar` and pinned by SHA-256 (see `url_provider`).
 //! - [`StaticProvider`] — an in-memory package universe for tests and
 //!   benchmarks.
 //!
@@ -45,6 +47,10 @@ pub enum Source {
         url: String,
         reference: GitReference,
     },
+    /// An http(s) (or `file://`/local) tarball, pinned by its SHA-256 and
+    /// fetched by [`crate::UrlProvider`]. Both fields are part of package
+    /// identity: a different url or digest is a different package.
+    Url { url: String, sha256: String },
 }
 
 /// Which ref a git dependency pins (SPEC.md §6: rev/tag/branch).
@@ -102,6 +108,17 @@ impl PackageId {
             },
         }
     }
+
+    #[must_use]
+    pub fn url(name: impl Into<String>, url: impl Into<String>, sha256: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            source: Source::Url {
+                url: url.into(),
+                sha256: sha256.into(),
+            },
+        }
+    }
 }
 
 impl fmt::Display for PackageId {
@@ -116,6 +133,9 @@ impl fmt::Display for PackageId {
             }
             Source::Git { url, reference } => {
                 write!(f, "{} ({url}#{reference})", self.name)
+            }
+            Source::Url { url, .. } => {
+                write!(f, "{} ({url})", self.name)
             }
         }
     }
@@ -167,6 +187,14 @@ pub enum ProviderError {
     External {
         command: String,
         message: String,
+    },
+    /// A fetched url tarball's SHA-256 did not match the digest pinned in the
+    /// manifest — a corrupt or tampered download. Nothing is installed
+    /// ([`crate::UrlProvider`]).
+    IntegrityMismatch {
+        url: String,
+        expected: String,
+        actual: String,
     },
     InvalidManifest {
         path: PathBuf,
@@ -226,6 +254,15 @@ impl fmt::Display for ProviderError {
             } => {
                 write!(f, "{message}")
             }
+            Self::IntegrityMismatch {
+                url,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "integrity check failed for `{url}`: expected sha256 {expected}, got {actual}. \
+                 Refusing to install a corrupt or tampered archive"
+            ),
             Self::InvalidManifest { path, message } => {
                 write!(f, "invalid manifest `{}`: {message}", display_path(path))
             }
