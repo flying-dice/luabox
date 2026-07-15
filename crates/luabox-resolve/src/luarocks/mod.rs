@@ -315,7 +315,10 @@ impl LuaRocksProvider {
         }
         let manifest = self.load_manifest()?;
         let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        if let Some(repository) = manifest.get("repository").and_then(serde_json::Value::as_object) {
+        if let Some(repository) = manifest
+            .get("repository")
+            .and_then(serde_json::Value::as_object)
+        {
             for (rock, versions) in repository {
                 let list = versions
                     .as_object()

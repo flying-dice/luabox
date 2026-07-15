@@ -109,8 +109,12 @@ impl UrlProvider {
     /// Fails when the source cannot be fetched or hashed.
     pub fn digest_of(url: &str, staging: &Path) -> Result<String, ProviderError> {
         let archive = obtain(url, staging)?;
-        luabox_store::hash_file(&archive)
-            .map_err(|e| io(&archive, &format!("cannot hash url dependency archive: {e}")))
+        luabox_store::hash_file(&archive).map_err(|e| {
+            io(
+                &archive,
+                &format!("cannot hash url dependency archive: {e}"),
+            )
+        })
     }
 
     /// Loads (or fetches) the entry for `(url, sha256)`.
@@ -173,8 +177,12 @@ impl UrlProvider {
         };
 
         // Verify BEFORE extraction: a digest mismatch installs nothing.
-        let digest = luabox_store::hash_file(&archive)
-            .map_err(|e| io(&archive, &format!("cannot hash url dependency archive: {e}")))?;
+        let digest = luabox_store::hash_file(&archive).map_err(|e| {
+            io(
+                &archive,
+                &format!("cannot hash url dependency archive: {e}"),
+            )
+        })?;
         if !digest.eq_ignore_ascii_case(sha256) {
             remove_all_force(&slot).ok();
             return Err(ProviderError::IntegrityMismatch {
@@ -328,7 +336,12 @@ fn obtain(url: &str, staging: &Path) -> Result<PathBuf, ProviderError> {
         .arg(&archive)
         .arg(url)
         .output()
-        .map_err(|e| external("curl", format!("cannot run `curl` (needed to reach {url}): {e}")))?;
+        .map_err(|e| {
+            external(
+                "curl",
+                format!("cannot run `curl` (needed to reach {url}): {e}"),
+            )
+        })?;
     if !output.status.success() {
         return Err(external(
             "curl",
@@ -353,7 +366,10 @@ fn extract(archive: &Path, dest: &Path) -> Result<(), ProviderError> {
         .map_err(|e| {
             external(
                 &tar.to_string_lossy(),
-                format!("cannot run `tar` (needed to unpack {}): {e}", archive.display()),
+                format!(
+                    "cannot run `tar` (needed to unpack {}): {e}",
+                    archive.display()
+                ),
             )
         })?;
     if !output.status.success() {
@@ -560,7 +576,10 @@ mod tests {
             "expected an integrity mismatch, got {err:?}"
         );
         let message = err.to_string();
-        assert!(message.contains(&bad), "names the expected digest: {message}");
+        assert!(
+            message.contains(&bad),
+            "names the expected digest: {message}"
+        );
         // Nothing left behind after a rejected fetch.
         for entry in fs::read_dir(&cache).into_iter().flatten().flatten() {
             assert!(

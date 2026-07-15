@@ -51,10 +51,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, anyhow, bail};
 use crate::runtime::{
     PIN_FILE, installed_toolchains, luarocks_bin, read_pin, toolchain_interpreter, toolchains_dir,
 };
+use anyhow::{Context, Result, anyhow, bail};
 
 /// The index shipped in the binary. Updated per release (see the file header).
 const BUILTIN_INDEX: &str = include_str!("toolchain_index.toml");
@@ -307,9 +307,14 @@ fn install_luarocks_into(dest: &Path, index: &Index, platform: &str) -> Result<b
         return Ok(false);
     };
 
-    let download = tempfile::tempdir().context("cannot create a temp dir for the luarocks download")?;
-    let archive = obtain(&entry.url, download.path())
-        .with_context(|| format!("cannot fetch luarocks for `{platform}` from `{}`", entry.url))?;
+    let download =
+        tempfile::tempdir().context("cannot create a temp dir for the luarocks download")?;
+    let archive = obtain(&entry.url, download.path()).with_context(|| {
+        format!(
+            "cannot fetch luarocks for `{platform}` from `{}`",
+            entry.url
+        )
+    })?;
 
     let digest = luabox_store::hash_file(&archive)
         .with_context(|| format!("cannot hash `{}`", archive.display()))?;
@@ -385,7 +390,10 @@ pub fn install(_cwd: &Path, id: &str) -> Result<()> {
     let index = load_index()?;
     let dest = install_into(&dir, &index, id, &platform)?;
     if already {
-        println!("toolchain `{id}` is already installed at {}", dest.display());
+        println!(
+            "toolchain `{id}` is already installed at {}",
+            dest.display()
+        );
     } else {
         println!("installed toolchain `{id}` to {}", dest.display());
     }
@@ -393,7 +401,10 @@ pub fn install(_cwd: &Path, id: &str) -> Result<()> {
     // Provision (or back-fill) luarocks. Absence of an index entry is a
     // warning, never a failure: the interpreter alone is a usable toolchain.
     if install_luarocks_into(&dest, &index, &platform)? {
-        println!("  luarocks provisioned at {}", dest.join("luarocks").display());
+        println!(
+            "  luarocks provisioned at {}",
+            dest.join("luarocks").display()
+        );
     } else {
         eprintln!(
             "warning: toolchain `{id}` installed without luarocks; \

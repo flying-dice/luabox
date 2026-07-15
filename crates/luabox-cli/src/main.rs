@@ -360,9 +360,7 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Upgrade { version } => upgrade_cmd::run(version),
         Command::Vendor => deps_cmd::vendor(&std::env::current_dir()?),
-        Command::Publish { dry_run } => {
-            publish_cmd::run(&std::env::current_dir()?, dry_run)
-        }
+        Command::Publish { dry_run } => publish_cmd::run(&std::env::current_dir()?, dry_run),
         Command::Explain { code } => {
             let parsed: luabox_diag::Code = code.parse().map_err(|_| {
                 anyhow::anyhow!("`{code}` is not a valid diagnostic code; codes look like LB0421")

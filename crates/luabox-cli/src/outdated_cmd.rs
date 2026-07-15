@@ -151,7 +151,9 @@ fn report_for(
                 url: None,
                 // Prefer the concrete locked version; fall back to the version
                 // requirement when the project has not been installed yet.
-                current: current.map(Version::to_string).or_else(|| Some(req.clone())),
+                current: current
+                    .map(Version::to_string)
+                    .or_else(|| Some(req.clone())),
                 latest: latest.map(|version| version.to_string()),
                 outdated,
             })

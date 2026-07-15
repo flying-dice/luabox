@@ -82,9 +82,7 @@ fn lists_translated_versions_from_a_mirror() {
     let provider = provider(&tmp.path().join("cache"), &mirror);
 
     // Registry packages are keyed by bare rock name (no prefix).
-    let versions = provider
-        .list_versions(&PackageId::registry("a"))
-        .unwrap();
+    let versions = provider.list_versions(&PackageId::registry("a")).unwrap();
     assert_eq!(versions, vec![Version::new(1, 0, 0)]);
 
     // A path/git source is not this provider's job (falls through).
@@ -180,21 +178,17 @@ fn resolve_bridges_a_rock_and_its_transitive_dependency() {
     let spec = luabox_resolve::luarocks::rockspec::read(
         "package = \"app\"\nversion = \"0.1.0-1\"\ndependencies = { \"a >= 1.0\" }\n",
     );
-    let effective = luabox_resolve::effective_manifest(&manifest, Some(&spec))
-        .expect("merge succeeds");
+    let effective =
+        luabox_resolve::effective_manifest(&manifest, Some(&spec)).expect("merge succeeds");
 
-    let resolution =
-        resolve(&effective, tmp.path(), &provider, None).expect("resolve succeeds");
+    let resolution = resolve(&effective, tmp.path(), &provider, None).expect("resolve succeeds");
     let names: Vec<&str> = resolution
         .packages
         .iter()
         .map(|p| p.name.as_str())
         .collect();
     assert!(names.contains(&"a"), "{names:?}");
-    assert!(
-        names.contains(&"b"),
-        "transitive rock missing: {names:?}"
-    );
+    assert!(names.contains(&"b"), "transitive rock missing: {names:?}");
 }
 
 /// A one-rock hermetic mirror: `oldrock-1.0-1`, a pure-Lua builtin whose
@@ -257,8 +251,7 @@ fn rockspec_lua_range_becomes_a_family_set_and_gates_the_target() {
     let target_51 = Manifest::parse("[package]\nedition = \"5.1\"\n").expect("manifest parses");
     let effective_51 =
         luabox_resolve::effective_manifest(&target_51, Some(&spec)).expect("merge succeeds");
-    let resolution =
-        resolve(&effective_51, tmp.path(), &provider, None).expect("resolves for 5.1");
+    let resolution = resolve(&effective_51, tmp.path(), &provider, None).expect("resolves for 5.1");
     assert!(
         resolution.packages.iter().any(|p| p.name == "oldrock"),
         "oldrock should resolve for a 5.1 target"

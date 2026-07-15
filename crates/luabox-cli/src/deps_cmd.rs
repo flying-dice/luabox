@@ -152,12 +152,7 @@ fn capture_url_digest(url: &str) -> anyhow::Result<String> {
 /// `luabox add <name>[@req] [--dev]` for a registry (luarocks.org) rock:
 /// resolve the constraint to write, splice it into the rockspec's
 /// `dependencies` / `test_dependencies` table comment-preservingly, then sync.
-fn add_registry(
-    cwd: &Path,
-    name: &str,
-    version: Option<&str>,
-    dev: bool,
-) -> anyhow::Result<()> {
+fn add_registry(cwd: &Path, name: &str, version: Option<&str>, dev: bool) -> anyhow::Result<()> {
     let project = discover(cwd)?;
     let Some(rockspec_path) = project.rockspec_path.clone() else {
         bail!("{}", no_rockspec_message(name));
@@ -227,9 +222,7 @@ fn unknown_rock_error(name: &str, error: &ProviderError) -> anyhow::Error {
 }
 
 fn unknown_rock_error_plain(name: &str) -> anyhow::Error {
-    anyhow!(
-        "no rock named `{name}` on luarocks.org — check the name with `luabox search {name}`"
-    )
+    anyhow!("no rock named `{name}` on luarocks.org — check the name with `luabox search {name}`")
 }
 
 /// The error shown when a registry `add` finds no rockspec to edit: a rockspec
@@ -281,8 +274,8 @@ fn remove_from_rockspec(cwd: &Path, project: &Project, package: &str) -> anyhow:
     let Some(path) = project.rockspec_path.clone() else {
         bail!("internal error: the rockspec declares `{package}` but its path is unknown");
     };
-    let text = fs::read_to_string(&path)
-        .with_context(|| format!("cannot read `{}`", path.display()))?;
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("cannot read `{}`", path.display()))?;
     let (edited, _dev) = rockspec_edit::remove_dependency(&text, package)
         .ok_or_else(|| anyhow!("`{package}` not found in `{}`", path.display()))?;
     fs::write(&path, &edited).with_context(|| format!("cannot write `{}`", path.display()))?;

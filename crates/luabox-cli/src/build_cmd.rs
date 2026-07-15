@@ -465,9 +465,10 @@ fn emit_plain(
             fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create `{}`", parent.display()))?;
         }
-        let name = out_path
-            .file_name()
-            .map_or_else(|| "bundle.lua".to_owned(), |n| n.to_string_lossy().into_owned());
+        let name = out_path.file_name().map_or_else(
+            || "bundle.lua".to_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
         let bundle = bundle_one(root, entry, &name, edition, target, minify, sourcemap)?;
         fs::write(&out_path, &bundle.text)
             .with_context(|| format!("cannot write `{}`", out_path.display()))?;
@@ -534,12 +535,8 @@ fn emit_nvim(ctx: &EmitCtx<'_>) -> anyhow::Result<()> {
         ctx.minify,
         ctx.sourcemap,
     )?;
-    let plugin_root = modes::emit_nvim_plugin(
-        ctx.out_dir,
-        ctx.package_name,
-        &bundle.text,
-        ctx.description,
-    )?;
+    let plugin_root =
+        modes::emit_nvim_plugin(ctx.out_dir, ctx.package_name, &bundle.text, ctx.description)?;
     if let Some(map) = &bundle.map {
         let map_path = plugin_root
             .join("lua")
@@ -555,7 +552,11 @@ fn emit_nvim(ctx: &EmitCtx<'_>) -> anyhow::Result<()> {
         ctx.edition.manifest_id(),
         ctx.target.manifest_id(),
         if ctx.minify { ", minified" } else { "" },
-        if ctx.sourcemap { ", with sourcemap" } else { "" },
+        if ctx.sourcemap {
+            ", with sourcemap"
+        } else {
+            ""
+        },
     );
     Ok(())
 }

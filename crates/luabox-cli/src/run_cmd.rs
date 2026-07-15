@@ -267,7 +267,10 @@ impl ToolchainEnv {
 /// and `rocks_trees` (where rocks land — here a single project-local tree, the
 /// `--tree lua_modules` semantics). Paths are emitted with forward slashes so
 /// the Lua string literals need no escaping on Windows.
-fn write_luarocks_config(toolchain_dir: &Path, root: &Path) -> Option<(PathBuf, tempfile::TempDir)> {
+fn write_luarocks_config(
+    toolchain_dir: &Path,
+    root: &Path,
+) -> Option<(PathBuf, tempfile::TempDir)> {
     let interp = toolchain_interpreter(toolchain_dir)?;
     luarocks_bin(toolchain_dir)?; // only wire a config when luarocks exists
     let bindir = interp.parent().unwrap_or(toolchain_dir);
@@ -383,15 +386,13 @@ fn run_script(
         .current_dir(cwd)
         .env("LUABOX_RUN_DEPTH", run_depth.to_string());
     env.apply(&mut cmd);
-    let status = cmd
-        .status()
-        .with_context(|| {
-            format!(
-                "failed to spawn `{}` to run `{}`",
-                runtime.program,
-                script.display()
-            )
-        })?;
+    let status = cmd.status().with_context(|| {
+        format!(
+            "failed to spawn `{}` to run `{}`",
+            runtime.program,
+            script.display()
+        )
+    })?;
     Ok(status.into())
 }
 

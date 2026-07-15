@@ -56,7 +56,11 @@ impl Fixture {
         fs::create_dir_all(&toolchain).unwrap();
         write_interpreter(&toolchain);
         // The toolchain's own luarocks, provisioned under `luarocks/`.
-        write_shim(&toolchain.join("luarocks"), "luarocks", "TOOLCHAIN-LUAROCKS");
+        write_shim(
+            &toolchain.join("luarocks"),
+            "luarocks",
+            "TOOLCHAIN-LUAROCKS",
+        );
         // A decoy on the system PATH that must lose to the toolchain's.
         write_shim(&root.path().join("decoy"), "luarocks", "DECOY-PATH");
         fs::create_dir_all(root.path().join("proj")).unwrap();

@@ -104,7 +104,9 @@ fn validate(spec: &Rockspec, file_name: &str) -> Result<Upload> {
         .package
         .clone()
         .filter(|p| !p.trim().is_empty())
-        .ok_or_else(|| anyhow!("the rockspec has no `package` field; add `package = \"<name>\"`"))?;
+        .ok_or_else(|| {
+            anyhow!("the rockspec has no `package` field; add `package = \"<name>\"`")
+        })?;
     let version = spec
         .version
         .clone()
@@ -256,7 +258,12 @@ fn upload_rockspec(base_url: &str, key: &str, rockspec_path: &Path, upload: &Upl
     let output = Command::new("curl")
         .args(upload_args(&url, rockspec_path))
         .output()
-        .map_err(|e| anyhow!("running `curl` to upload the rockspec: {}", redact(&e.to_string(), key)))?;
+        .map_err(|e| {
+            anyhow!(
+                "running `curl` to upload the rockspec: {}",
+                redact(&e.to_string(), key)
+            )
+        })?;
     if !output.status.success() {
         bail!(
             "`curl` failed to upload the rockspec (exit {}): {}",
@@ -400,7 +407,11 @@ mod tests {
 
     #[test]
     fn validate_accepts_canonical_filename() {
-        let s = spec("app", "0.1.0-1", Some("git+https://example.invalid/app.git"));
+        let s = spec(
+            "app",
+            "0.1.0-1",
+            Some("git+https://example.invalid/app.git"),
+        );
         let upload = validate(&s, "app-0.1.0-1.rockspec").expect("valid");
         assert_eq!(upload.package, "app");
         assert_eq!(upload.version, "0.1.0-1");
@@ -408,7 +419,11 @@ mod tests {
 
     #[test]
     fn validate_rejects_filename_mismatch() {
-        let s = spec("app", "0.1.0-1", Some("git+https://example.invalid/app.git"));
+        let s = spec(
+            "app",
+            "0.1.0-1",
+            Some("git+https://example.invalid/app.git"),
+        );
         let err = validate(&s, "app-0.2.0-1.rockspec").expect_err("mismatch");
         let text = err.to_string();
         assert!(text.contains("app-0.1.0-1.rockspec"), "{text}");
@@ -535,7 +550,8 @@ mod tests {
 
     #[test]
     fn error_response_surfaces_server_message() {
-        let outcome = parse_upload_response(409, r#"{"errors":["Version 0.1.0-1 already exists"]}"#);
+        let outcome =
+            parse_upload_response(409, r#"{"errors":["Version 0.1.0-1 already exists"]}"#);
         assert_eq!(
             outcome,
             UploadOutcome::Err("Version 0.1.0-1 already exists".to_owned())

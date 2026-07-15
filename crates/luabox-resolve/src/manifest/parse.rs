@@ -37,7 +37,14 @@ const PACKAGE_KEYS: &[&str] = &[
     "min-luabox-version",
 ];
 const BUILD_KEYS: &[&str] = &[
-    "target", "out", "mode", "entry", "outfile", "bundle", "sourcemap", "minify",
+    "target",
+    "out",
+    "mode",
+    "entry",
+    "outfile",
+    "bundle",
+    "sourcemap",
+    "minify",
 ];
 const TYPES_KEYS: &[&str] = &["strict", "defs"];
 const WORKSPACE_KEYS: &[&str] = &["members"];

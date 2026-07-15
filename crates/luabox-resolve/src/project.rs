@@ -52,7 +52,11 @@ impl std::fmt::Display for ProjectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RegistryDepInToml { name, dev } => {
-                let table = if *dev { "dev-dependencies" } else { "dependencies" };
+                let table = if *dev {
+                    "dev-dependencies"
+                } else {
+                    "dependencies"
+                };
                 write!(
                     f,
                     "`{name}` is a version-requirement dependency in `luabox.toml` \
@@ -60,11 +64,19 @@ impl std::fmt::Display for ProjectError {
                      rockspec (luarocks.org is the registry, pnpm-style). \
                      Move `{name}` to the rockspec's `{}` and keep only path/git \
                      dependencies in `luabox.toml`",
-                    if *dev { "test_dependencies" } else { "dependencies" }
+                    if *dev {
+                        "test_dependencies"
+                    } else {
+                        "dependencies"
+                    }
                 )
             }
             Self::NameCollision { name, dev } => {
-                let table = if *dev { "dev-dependencies" } else { "dependencies" };
+                let table = if *dev {
+                    "dev-dependencies"
+                } else {
+                    "dependencies"
+                };
                 write!(
                     f,
                     "`{name}` is declared both as a registry dependency in the rockspec \
@@ -79,10 +91,9 @@ impl std::fmt::Display for ProjectError {
                 f,
                 "the project's rockspec declares no readable `package` name"
             ),
-            Self::MissingVersion => write!(
-                f,
-                "the project's rockspec declares no readable `version`"
-            ),
+            Self::MissingVersion => {
+                write!(f, "the project's rockspec declares no readable `version`")
+            }
             Self::InvalidRockspecVersion { version } => write!(
                 f,
                 "the rockspec `version` \"{version}\" has no semver form (SCM/dev \
@@ -142,8 +153,10 @@ pub fn effective_manifest(
     if let Some(spec) = rockspec {
         eff.package.name = spec.package.clone().ok_or(ProjectError::MissingName)?;
         let raw_version = spec.version.clone().ok_or(ProjectError::MissingVersion)?;
-        let version = translate_version(&raw_version)
-            .ok_or(ProjectError::InvalidRockspecVersion { version: raw_version })?;
+        let version =
+            translate_version(&raw_version).ok_or(ProjectError::InvalidRockspecVersion {
+                version: raw_version,
+            })?;
         eff.package.version = version.to_string();
 
         merge_registry_deps(&spec.dependencies, &mut eff.dependencies, false)?;
@@ -220,7 +233,9 @@ mod tests {
         let manifest = toml(
             "[package]\nedition = \"5.4\"\n\n[dependencies]\nlocal-lib = { path = \"../local-lib\" }\n",
         );
-        let spec = rockspec::read("package = \"app\"\nversion = \"0.1.0-1\"\ndependencies = { \"lpeg\" }\n");
+        let spec = rockspec::read(
+            "package = \"app\"\nversion = \"0.1.0-1\"\ndependencies = { \"lpeg\" }\n",
+        );
         let eff = effective_manifest(&manifest, Some(&spec)).unwrap();
         assert!(matches!(
             eff.dependencies.get("local-lib"),
@@ -234,7 +249,9 @@ mod tests {
 
     #[test]
     fn version_dep_in_toml_is_a_hard_error() {
-        let manifest = toml("[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n\n[dependencies]\npenlight = \"1.14\"\n");
+        let manifest = toml(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n\n[dependencies]\npenlight = \"1.14\"\n",
+        );
         let err = effective_manifest(&manifest, None).unwrap_err();
         assert!(matches!(err, ProjectError::RegistryDepInToml { .. }));
         assert!(err.to_string().contains("rockspec"));
@@ -245,7 +262,9 @@ mod tests {
         let manifest = toml(
             "[package]\nedition = \"5.4\"\n\n[dependencies]\nlpeg = { git = \"https://example/lpeg\" }\n",
         );
-        let spec = rockspec::read("package = \"app\"\nversion = \"1.0-1\"\ndependencies = { \"lpeg >= 1.0\" }\n");
+        let spec = rockspec::read(
+            "package = \"app\"\nversion = \"1.0-1\"\ndependencies = { \"lpeg >= 1.0\" }\n",
+        );
         let err = effective_manifest(&manifest, Some(&spec)).unwrap_err();
         assert!(matches!(err, ProjectError::NameCollision { .. }));
     }

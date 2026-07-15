@@ -35,9 +35,7 @@
     reason = "indices are CST char-boundary offsets or ASCII-byte scan positions"
 )]
 
-use luabox_syntax::lua::ast::{
-    AssignStmt, AstNode, Expr, SourceFile, Stmt, TableExpr, TableField,
-};
+use luabox_syntax::lua::ast::{AssignStmt, AstNode, Expr, SourceFile, Stmt, TableExpr, TableField};
 use luabox_syntax::lua::{Dialect, parse};
 
 /// Adds (or updates) registry dependency `name` with `constraint` (a LuaRocks
@@ -170,10 +168,7 @@ fn value_table(assign: &AssignStmt) -> Option<TableExpr> {
 fn table_interior(table: &TableExpr) -> (usize, usize) {
     let range = table.syntax().text_range();
     // `{` and `}` are single ASCII bytes, so the interior is `start+1 ..= end-1`.
-    (
-        usize::from(range.start()) + 1,
-        usize::from(range.end()) - 1,
-    )
+    (usize::from(range.start()) + 1, usize::from(range.end()) - 1)
 }
 
 /// The positional entries of a dependency table, in source order.
@@ -329,7 +324,9 @@ fn table_insert_anchor(text: &str, file: &SourceFile) -> usize {
     };
     let mut anchor: Option<usize> = None;
     for stmt in block.stmts() {
-        let Stmt::Assign(assign) = &stmt else { continue };
+        let Stmt::Assign(assign) = &stmt else {
+            continue;
+        };
         let Some(name) = single_name_target(assign) else {
             continue;
         };
@@ -452,7 +449,11 @@ fn line_end(text: &str, from: usize, limit: usize) -> usize {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic, reason = "tests document assumptions")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "tests document assumptions"
+)]
 mod tests {
     use super::*;
 
@@ -466,7 +467,8 @@ mod tests {
 
     #[test]
     fn add_inserts_into_a_multiline_trailing_comma_table() {
-        let src = "package = \"app\"\nversion = \"0.1.0-1\"\ndependencies = {\n   \"lua >= 5.1\",\n}\n";
+        let src =
+            "package = \"app\"\nversion = \"0.1.0-1\"\ndependencies = {\n   \"lua >= 5.1\",\n}\n";
         let out = add(src, "penlight", ">= 1.14.0");
         assert_eq!(
             out,
@@ -478,14 +480,20 @@ mod tests {
     fn add_matches_indentation_and_quote_style() {
         let src = "dependencies = {\n\t'lua >= 5.1',\n}\n";
         let out = add(src, "lpeg", ">= 1.0");
-        assert_eq!(out, "dependencies = {\n\t'lua >= 5.1',\n\t'lpeg >= 1.0',\n}\n");
+        assert_eq!(
+            out,
+            "dependencies = {\n\t'lua >= 5.1',\n\t'lpeg >= 1.0',\n}\n"
+        );
     }
 
     #[test]
     fn add_no_trailing_comma_table_commas_previous_and_omits_own() {
         let src = "dependencies = {\n   \"lua >= 5.1\"\n}\n";
         let out = add(src, "lpeg", ">= 1.0");
-        assert_eq!(out, "dependencies = {\n   \"lua >= 5.1\",\n   \"lpeg >= 1.0\"\n}\n");
+        assert_eq!(
+            out,
+            "dependencies = {\n   \"lua >= 5.1\",\n   \"lpeg >= 1.0\"\n}\n"
+        );
     }
 
     #[test]
@@ -548,7 +556,8 @@ mod tests {
 
     #[test]
     fn dev_add_creates_test_dependencies_when_absent() {
-        let src = "package = \"app\"\nversion = \"0.1.0-1\"\ndependencies = {\n   \"lua >= 5.1\",\n}\n";
+        let src =
+            "package = \"app\"\nversion = \"0.1.0-1\"\ndependencies = {\n   \"lua >= 5.1\",\n}\n";
         let out = add_dev(src, "busted", ">= 2.0");
         assert_eq!(
             out,
