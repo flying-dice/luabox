@@ -316,7 +316,6 @@ enum LockUse {
 }
 
 /// A discovered project: nearest ancestor directory holding `luabox.toml`.
-/// Shared with `luabox publish` (`crate::publish_cmd`).
 pub(crate) struct Project {
     pub(crate) root: PathBuf,
     pub(crate) manifest_path: PathBuf,
@@ -629,7 +628,7 @@ fn prune_stale_modules(resolution: &Resolution, modules_dir: &Path) -> anyhow::R
     Ok(())
 }
 
-// --- tar transport (shared with `luabox publish`) ---------------------------
+// --- tar transport -----------------------------------------------------------
 
 /// `tar` to shell out to. On Windows, prefer the system `bsdtar` so a
 /// git-shipped GNU tar on PATH doesn't shadow it (mirrors the toolchain
@@ -665,33 +664,6 @@ pub(crate) fn extract_tar(archive: &Path, dest: &Path) -> anyhow::Result<()> {
         bail!(
             "`tar -xf` failed to unpack `{}` (exit {})",
             archive.display(),
-            status.code().unwrap_or(-1)
-        );
-    }
-    Ok(())
-}
-
-/// Pack the contents of `dir` (not the directory itself) into `archive`
-/// with `tar -cf` — the artifact format `luabox publish` uploads.
-pub(crate) fn create_tar(dir: &Path, archive: &Path) -> anyhow::Result<()> {
-    let tar = tar_program();
-    let status = Command::new(&tar)
-        .arg("-cf")
-        .arg(archive)
-        .arg("-C")
-        .arg(dir)
-        .arg(".")
-        .status()
-        .with_context(|| {
-            format!(
-                "failed to run `{}` — publishing needs `tar` on PATH",
-                tar.display()
-            )
-        })?;
-    if !status.success() {
-        bail!(
-            "`tar -cf` failed to pack `{}` (exit {})",
-            dir.display(),
             status.code().unwrap_or(-1)
         );
     }

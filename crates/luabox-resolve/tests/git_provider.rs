@@ -48,7 +48,7 @@ fn commit_all(dir: &Path, message: &str) -> String {
         dir,
         &[
             "-c",
-            "user.name=luabox-test",
+            "user.name=luabox-ci",
             "-c",
             "user.email=test@example.com",
             "-c",

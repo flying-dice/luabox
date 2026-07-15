@@ -104,7 +104,7 @@ mod tests {
             Some(&TaskValue::Multiple(vec![
                 "luabox check".to_owned(),
                 "luabox lint".to_owned(),
-                "luabox test".to_owned(),
+                "luabox fmt --check".to_owned(),
             ]))
         );
 

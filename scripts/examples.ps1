@@ -25,9 +25,9 @@ $luabox = (Resolve-Path $luabox).Path
 # Put the binary on PATH so `[tasks]` that call `luabox` resolve.
 $env:PATH = (Split-Path -Parent $luabox) + [IO.Path]::PathSeparator + $env:PATH
 
-# Find a Lua interpreter for test/run steps. All example test suites and the
-# timemachine output are Lua 5.1-compatible, so one interpreter set via
-# LUABOX_LUA drives every edition deterministically.
+# Find a Lua interpreter for run steps. All locally-run example output
+# (including timemachine's lowered bundle) is Lua 5.1-compatible, so one
+# interpreter set via LUABOX_LUA drives every edition deterministically.
 $lua = $null
 foreach ($cand in @('lua', 'lua5.4', 'lua54', 'lua5.3', 'lua5.1', 'lua51', 'luajit')) {
     $found = Get-Command $cand -ErrorAction SilentlyContinue
@@ -37,7 +37,7 @@ if ($lua) {
     $env:LUABOX_LUA = $lua
     Write-Host "==> using Lua runtime: $lua"
 } else {
-    Write-Host "==> no Lua runtime on PATH — test/run steps will be skipped (not a failure)"
+    Write-Host "==> no Lua runtime on PATH — run steps will be skipped (not a failure)"
 }
 
 $script:fails = 0
@@ -60,31 +60,23 @@ function Gate() {
     Step 'lint'        $luabox @('lint')
 }
 
-function RunTests() {
-    if (-not $lua) { Write-Host '    skip test (no Lua runtime)'; return }
-    Step 'test' $luabox @('test')
-}
-
 function Section($name) { Write-Host ''; Write-Host "== $name ==" }
 
 # 1. hello-luabox
 Section 'hello-luabox'
 Set-Location (Join-Path $examples 'hello-luabox')
 Gate
-RunTests
 
 # 2. geometry
 Section 'geometry'
 Set-Location (Join-Path $examples 'geometry')
 Gate
-RunTests
 
 # 3. renderer (path dep — install first)
 Section 'renderer'
 Set-Location (Join-Path $examples 'renderer')
 Step 'install' $luabox @('install')
 Gate
-RunTests
 if ($lua) {
     $out = & $luabox run src/main.lua 2>&1 | Out-String
     if ($LASTEXITCODE -eq 0 -and $out -match 'area = 16') { Pass 'run (draws a square)' }
@@ -95,7 +87,6 @@ if ($lua) {
 Section 'legacy-inifile'
 Set-Location (Join-Path $examples 'legacy-inifile')
 Gate
-RunTests
 
 # 5. timemachine (build + bundle + run lowered output on Lua 5.1)
 Section 'timemachine'
@@ -131,16 +122,12 @@ try {
     Fail '.love contains main.lua + conf.lua' $_.Exception.Message
 }
 
-# 7. workspace (check fans out; test a member)
+# 7. workspace (check fans out; gate a member standalone)
 Section 'workspace'
 Set-Location (Join-Path $examples 'workspace')
 Gate
-if ($lua) {
-    Set-Location (Join-Path $examples 'workspace/packages/core')
-    Step 'test (core member)' $luabox @('test')
-} else {
-    Write-Host '    skip test (no Lua runtime)'
-}
+Set-Location (Join-Path $examples 'workspace/packages/core')
+Step 'check (core member)' $luabox @('check')
 
 Write-Host ''
 if ($script:fails -eq 0) {

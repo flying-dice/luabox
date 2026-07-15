@@ -3,9 +3,7 @@
 //! Thin frontend over the bounded-context crates: owns UX, argument parsing,
 //! and diagnostic rendering; none of the domain logic.
 
-mod audit_cmd;
 mod auth_cmd;
-mod bench_cmd;
 mod build_cmd;
 mod bundle_cmd;
 mod check_cmd;
@@ -19,11 +17,10 @@ mod lsp_cmd;
 mod modes;
 mod outdated_cmd;
 mod project;
-mod publish_cmd;
 mod run_cmd;
+mod runtime;
 mod scaffold;
 mod search_cmd;
-mod test_cmd;
 mod toolchain_cmd;
 mod upgrade_cmd;
 mod watch;
@@ -174,26 +171,6 @@ enum Command {
         #[arg(long)]
         mode: Option<String>,
     },
-    /// [deprecated] Run tests on the configured runtime(s) — test with your
-    /// deployment environment's own tooling instead
-    Test {
-        /// Substring filter: matched against test file paths, else test names
-        pattern: Option<String>,
-        /// Rerun on every source/manifest change until interrupted (Ctrl-C);
-        /// a failing run is reported but does not stop watching
-        #[arg(long)]
-        watch: bool,
-        /// Run the suite against every Lua runtime found on PATH
-        #[arg(long)]
-        matrix: bool,
-        /// Unimplemented and will not be added (`luabox test` is deprecated);
-        /// errors out
-        #[arg(long, hide = true)]
-        coverage: bool,
-    },
-    /// [deprecated] Run statistical benchmarks across runtimes — benchmark in
-    /// your deployment environment instead
-    Bench,
     /// Run a script or a [tasks] entry via the configured runtime
     Run {
         script: String,
@@ -204,13 +181,6 @@ enum Command {
     Doc {
         #[arg(long)]
         open: bool,
-    },
-    /// Publish the package to the registry
-    Publish {
-        /// Yank a published version: hidden from new resolutions, still
-        /// restorable from existing lockfiles, never deleted
-        #[arg(long, value_name = "VERSION")]
-        yank: Option<String>,
     },
     /// Start the language server (stdio)
     Lsp {
@@ -225,8 +195,6 @@ enum Command {
     },
     /// Vendor dependencies into the source tree
     Vendor,
-    /// Check dependencies against the advisory database
-    Audit,
     /// Replace this binary with a GitHub release build (default: latest)
     Upgrade {
         /// Release version to install (e.g. 0.1.0 or v0.1.0); default: latest
@@ -316,22 +284,8 @@ fn main() -> anyhow::Result<()> {
             sourcemap,
             mode.as_deref(),
         ),
-        Command::Test {
-            pattern,
-            watch,
-            matrix,
-            coverage,
-        } => test_cmd::run(
-            &std::env::current_dir()?,
-            pattern.as_deref(),
-            watch,
-            coverage,
-            matrix,
-        ),
-        Command::Bench => bench_cmd::run(&std::env::current_dir()?),
         Command::Run { script, args } => run_cmd::run(&std::env::current_dir()?, &script, &args),
         Command::Doc { open } => doc_cmd::run(&std::env::current_dir()?, open),
-        Command::Publish { yank } => publish_cmd::run(&std::env::current_dir()?, yank.as_deref()),
         Command::Lsp { .. } => lsp_cmd::run(),
         Command::Toolchain { action } => {
             let cwd = std::env::current_dir()?;
@@ -345,7 +299,6 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Upgrade { version } => upgrade_cmd::run(version),
         Command::Vendor => deps_cmd::vendor(&std::env::current_dir()?),
-        Command::Audit => audit_cmd::run(&std::env::current_dir()?),
         Command::Explain { code } => {
             let parsed: luabox_diag::Code = code.parse().map_err(|_| {
                 anyhow::anyhow!("`{code}` is not a valid diagnostic code; codes look like LB0421")

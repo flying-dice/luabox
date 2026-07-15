@@ -19,7 +19,6 @@
 //! Status: manifest parsing/editing, solver, lockfile, and git fetching
 //! landed. Registry client and luarocks bridge are P2 follow-ups (#19/#20).
 
-pub mod advisory;
 pub mod git_provider;
 mod http;
 pub mod lockfile;

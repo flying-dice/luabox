@@ -8,7 +8,21 @@ spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
 
 ## [Unreleased]
 
-Nothing yet — changes land here between releases.
+### Removed
+
+- **`luabox test` and `luabox bench`** ([#1](https://github.com/flying-dice/luabox/issues/1))
+  — luabox is a toolchain, not a runtime; code coupled to its deployment
+  environment (LÖVE, Neovim, OpenResty, …) can't be faithfully executed on a
+  bare interpreter, so testing/benchmarking belong to the deployment
+  environment's own tooling.
+- **`luabox publish`** ([#2](https://github.com/flying-dice/luabox/issues/2))
+  — first-party registry publishing is deferred; it returns in a later
+  version. Resolving and installing from a registry are unchanged.
+- **`luabox audit`** ([#1](https://github.com/flying-dice/luabox/issues/1))
+  — the advisory-database check and its bundled advisory DB are removed; there
+  was no hosted advisory feed to make it useful.
+- The **`luabox-test` crate** is deleted; its runtime-resolution module (used
+  by `luabox run` and `luabox toolchain`) moved into `luabox-cli`.
 
 ## [0.1.4] - 2026-07-14
 

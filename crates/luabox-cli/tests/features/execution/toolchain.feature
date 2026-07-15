@@ -44,13 +44,16 @@ Feature: luabox toolchain — the runtime manager (SPEC.md §12)
     Then the command succeeds
     And stdout contains "(pinned)"
 
-  Scenario: a pinned toolchain runs the test suite with no Lua on PATH
+  Scenario: a pinned toolchain resolves for `luabox run` with no Lua on PATH
     Given a toolchain index offering "5.4" with a working runtime
-    And a passing test file "ok_test.lua" with test "works"
+    And a file "hello.lua" containing:
+      """
+      print("hello from the pinned toolchain")
+      """
     When I run "luabox toolchain install 5.4" with the toolchain env
     Then the command succeeds
     When I run "luabox toolchain pin 5.4" with the toolchain env
     Then the command succeeds
-    When I run "luabox test" with the toolchain env
+    When I run "luabox run hello.lua" with the toolchain env
     Then the command succeeds
-    And stdout contains "test result: ok"
+    And stdout contains "hello.lua"

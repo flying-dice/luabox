@@ -78,8 +78,6 @@ luabox lint [--fix]                                   clippy analog
 luabox fmt [--check]                                  canonical formatter
 luabox build [--target <t>] [--out dir]               lower + emit
 luabox bundle [--minify] [--sourcemap]                single-file emit
-luabox test [pattern] [--watch]                       built-in runner (deprecated, §11)
-luabox bench                                          built-in benchmarks (deprecated, §11)
 luabox run <script|task>                              run via configured runtime / tasks
 luabox doc [--open]                                   docs from annotations
 luabox publish                                        registry publish
@@ -90,7 +88,7 @@ luabox audit                                          advisory DB check
 luabox explain LB0xxx                                 rustc-style diagnostic docs
 ```
 
-Every command cold-starts < 50 ms; watch mode on check/test/build; `luabox run` resolves package tasks then `$PATH`.
+Every command cold-starts < 50 ms; watch mode on check/fmt; `luabox run` resolves package tasks then `$PATH`.
 
 ## 5. Project manifest — `luabox.toml`
 
@@ -118,7 +116,7 @@ busted-compat = "1.0"
 
 [tasks]
 start = "luabox run src/main.lua"
-ci = ["luabox check", "luabox lint", "luabox test"]
+ci = ["luabox check", "luabox lint", "luabox fmt --check"]
 
 [workspace]
 members = ["packages/*"]
@@ -170,13 +168,13 @@ members = ["packages/*"]
 
 ## 11. Test runner & bench
 
-> **Deprecated (2026-07-14).** luabox is a toolchain, not a runtime: most
-> real Lua code is coupled to the environment it deploys into (LÖVE, Neovim,
-> OpenResty, an embedded VM), which a bare-interpreter harness cannot
-> faithfully execute. `luabox test`/`luabox bench` warn on invocation and
-> are slated for removal; the unbuilt items below (snapshots, coverage,
-> reporters) will not be built. Testing belongs to the deployment
-> environment's own tooling.
+> **Removed (2026-07-15, [flying-dice/luabox#1](https://github.com/flying-dice/luabox/issues/1)).**
+> luabox is a toolchain, not a runtime: most real Lua code is coupled to the
+> environment it deploys into (LÖVE, Neovim, OpenResty, an embedded VM), which
+> a bare-interpreter harness cannot faithfully execute. `luabox test` and
+> `luabox bench` (and the unbuilt snapshot/coverage/reporter items below) have
+> been removed outright. Testing belongs to the deployment environment's own
+> tooling. The historical design is retained below for context.
 
 - Zero-config discovery (`*_test.lua`, `*.test.lua`, `tests/`); busted-compatible shim + native flat API.
 - `luabox test --matrix`: one suite against 5.1/5.4/luajit in parallel.
@@ -186,11 +184,11 @@ members = ["packages/*"]
 ## 12. Toolchain manager (rustup analog)
 
 - `luabox toolchain install 5.4.6` / `luajit-2.1` — prebuilt runtimes into `~/.luabox/toolchains`.
-- Manifest pins runtime for run/test; `luabox-toolchain.toml` override. An acquirer of runtimes, never a runtime.
+- Manifest pins runtime for `luabox run`; `luabox-toolchain.toml` override. An acquirer of runtimes, never a runtime.
 
 ## 13. Docs
 
-- `luabox doc`: static site from annotations; search, cross-linked types, doc examples run under `luabox test --doc`. Registry auto-hosts per version (docs.rs analog).
+- `luabox doc`: static site from annotations; search, cross-linked types. (Doc examples as tested blocks died with the test runner, #1.) Registry auto-hosts per version (docs.rs analog).
 
 ## 14. Diagnostics culture
 
@@ -218,7 +216,6 @@ crates/
   luabox-resolve     PubGrub solver, registry + luarocks bridge
   luabox-store       CAS cache, fetch, verify
   luabox-lsp         server over luabox-db
-  luabox-test        runner, matrix orchestration, coverage
   luabox-cli         thin frontend
 ```
 
@@ -228,7 +225,7 @@ crates/
 | Semantics | `luabox-hir`, `luabox-types`, `luabox-db` | name resolution, type IR, inference, incremental queries | salsa DB traits |
 | Emit | `luabox-lower`, `luabox-bundle` | lowering, polyfills, require-graph, sourcemaps | checked HIR in, bytes out; type-blind |
 | Distribution | `luabox-resolve`, `luabox-store` | manifests, solver, lockfile, CAS, luarocks bridge | package graph API; never parses syntax |
-| Execution | `luabox-test`, toolchain mgr | runtime acquisition, matrix, coverage | runtime handle; only context spawning runtimes |
+| Execution | toolchain mgr + runtime resolution (in `luabox-cli`) | runtime acquisition | runtime handle; only context spawning runtimes |
 | Frontend | `luabox-cli`, `luabox-lsp` | UX, protocol, diagnostics rendering | consumes all, owns none |
 
 ### 16.1 Implementation — Rust

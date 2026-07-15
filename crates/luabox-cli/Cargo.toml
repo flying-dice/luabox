@@ -23,7 +23,6 @@ luabox-lsp.workspace = true
 luabox-lower.workspace = true
 luabox-bundle.workspace = true
 luabox-store.workspace = true
-luabox-test.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 notify.workspace = true

@@ -24,7 +24,6 @@ luabox-resolve = { path = "crates/luabox-resolve", version = "0.1.4" }
 luabox-store = { path = "crates/luabox-store", version = "0.1.4" }
 luabox-lint = { path = "crates/luabox-lint", version = "0.1.4" }
 luabox-lsp = { path = "crates/luabox-lsp", version = "0.1.4" }
-luabox-test = { path = "crates/luabox-test", version = "0.1.4" }
 
 # External
 rowan = "0.16"

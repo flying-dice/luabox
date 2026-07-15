@@ -249,17 +249,6 @@ fn no_dialect_diagnostic(world: &mut AcceptanceWorld) {
     }
 }
 
-// --- fixture helpers ------------------------------------------------------
-
-/// Write a file under the scenario project, creating parent directories.
-fn write_file(world: &AcceptanceWorld, rel: &str, content: &str) {
-    let full = world.dir.path().join(rel);
-    if let Some(parent) = full.parent() {
-        std::fs::create_dir_all(parent).expect("failed to create parent directories");
-    }
-    std::fs::write(&full, content).unwrap_or_else(|e| panic!("cannot write `{rel}`: {e}"));
-}
-
 // --- fake-runtime shims (platform-conditional) ----------------------------
 //
 // Several execution scenarios (test/run/bench/toolchain) drive `luabox`
@@ -381,7 +370,7 @@ fn git_repository_at(world: &mut AcceptanceWorld, repo: String, name: String, ve
         &dir,
         &[
             "-c",
-            "user.name=luabox-test",
+            "user.name=luabox-ci",
             "-c",
             "user.email=test@example.com",
             "-c",
@@ -422,12 +411,12 @@ async fn main() {
     .await;
 }
 
-// --- test runner (execution/test.feature) --------------------------------
+// --- environment-threading helper -----------------------------------------
 //
-// These steps drive `luabox test` hermetically, with no real Lua: a fake
-// `.bat` runtime (pointed at via `LUABOX_LUA`) echoes each test file, which
-// is authored as raw runner protocol (TAB-separated fields). Appended after
-// `main` (item order is irrelevant to the cucumber macro registration).
+// `run_command_with_env` mirrors the base `run_command` step but threads a
+// custom environment through — shared by the run, toolchain, and luarocks
+// scenarios below. Appended after `main` (item order is irrelevant to the
+// cucumber macro registration).
 
 /// Run a `luabox …` command with extra environment variables set. Mirrors
 /// the base `run_command` step but threads a custom environment through.
@@ -441,64 +430,6 @@ fn run_command_with_env(world: &mut AcceptanceWorld, command: &str, envs: &[(Str
         cmd.env(key, value);
     }
     world.output = Some(cmd.output().expect("failed to spawn luabox"));
-}
-
-/// The fake runtime protocol lines for one single-case file.
-fn test_file_protocol(name: &str, message: Option<&str>) -> String {
-    match message {
-        None => {
-            format!("LUABOX_TEST_BEGIN\t{name}\nLUABOX_TEST_PASS\t{name}\nLUABOX_TEST_DONE\t1\t0\n")
-        }
-        Some(msg) => format!(
-            "LUABOX_TEST_BEGIN\t{name}\nLUABOX_TEST_FAIL\t{name}\t{msg}\nLUABOX_TEST_DONE\t0\t1\n"
-        ),
-    }
-}
-
-/// The fake runtime: a shim that echoes the given test file (argv 2) and
-/// exits nonzero if it contains a FAIL line. The runner spawns it as
-/// `<shim> <harness> <test_file>`, so argv 2 is always the test file.
-#[given("a fake Lua runtime")]
-fn fake_lua_runtime(world: &mut AcceptanceWorld) {
-    let windows = "@echo off\r\n\
-        type \"%~2\"\r\n\
-        findstr /C:\"LUABOX_TEST_FAIL\" \"%~2\" >nul\r\n\
-        if not errorlevel 1 exit /b 1\r\n\
-        exit /b 0\r\n";
-    let unix = "#!/bin/sh\n\
-        cat \"$2\"\n\
-        if grep -q LUABOX_TEST_FAIL \"$2\"; then exit 1; fi\n\
-        exit 0\n";
-    write_shim(&shim_path(world, "fake_runtime"), windows, unix);
-}
-
-#[given(expr = "a passing test file {string} with test {string}")]
-fn passing_test_file(world: &mut AcceptanceWorld, path: String, name: String) {
-    write_file(world, &path, &test_file_protocol(&name, None));
-}
-
-#[given(expr = "a failing test file {string} with test {string} failing with {string}")]
-fn failing_test_file(world: &mut AcceptanceWorld, path: String, name: String, message: String) {
-    write_file(world, &path, &test_file_protocol(&name, Some(&message)));
-}
-
-#[when(expr = "I run {string} with the fake runtime")]
-fn run_with_fake_runtime(world: &mut AcceptanceWorld, command: String) {
-    let fake = shim_path(world, "fake_runtime");
-    run_command_with_env(
-        world,
-        &command,
-        &[(
-            "LUABOX_LUA".to_string(),
-            fake.to_string_lossy().into_owned(),
-        )],
-    );
-}
-
-#[when(expr = "I run {string} with env {string}")]
-fn run_with_env(world: &mut AcceptanceWorld, command: String, env: String) {
-    let (key, value) = env.split_once('=').expect("env must be KEY=VALUE");
-    run_command_with_env(world, &command, &[(key.to_string(), value.to_string())]);
 }
 
 // --- build fixtures (emit/build.feature — #22) ----------------------------
@@ -644,60 +575,6 @@ fn run_with_failing_runtime(world: &mut AcceptanceWorld, command: String) {
     );
 }
 
-// --- bench (execution/bench.feature — #26) --------------------------------
-//
-// Hermetic, mirroring the "fake Lua runtime" idea from execution/test.feature:
-// a `.bat` shim (pointed at via `LUABOX_LUA`) echoes each bench file, which
-// is authored here as raw `LUABOX_BENCH_*` protocol. Unlike the test
-// runtime's bat, this one always exits 0 — benches never fail the build, so
-// there is no pass/fail signal to encode. `luabox bench` resolves *every*
-// runtime on PATH (`resolve_matrix`), so the fake runtime shows up in the
-// comparison table labeled `LUABOX_LUA` (matching `resolve_matrix`'s label
-// for the override), alongside any real Lua that happens to be on the host's
-// PATH — assertions below only check `stdout contains`, so a real
-// interpreter's harmless load-error row for these non-Lua fixture files
-// doesn't affect them.
-
-/// A fake Lua runtime for `luabox bench`: echoes the bench file (`%2`,
-/// already containing protocol lines) and always exits 0.
-#[given("a fake bench runtime")]
-fn fake_bench_runtime(world: &mut AcceptanceWorld) {
-    let windows = "@echo off\r\ntype \"%~2\"\r\nexit /b 0\r\n";
-    let unix = "#!/bin/sh\ncat \"$2\"\nexit 0\n";
-    write_shim(&shim_path(world, "fake_bench_runtime"), windows, unix);
-}
-
-/// A bench file authored as raw protocol: one bench reporting the given
-/// comma-separated ns/iter samples as separate `RESULT` batches.
-#[given(expr = "a bench file {string} with bench {string} producing samples {string}")]
-fn bench_file_with_samples(
-    world: &mut AcceptanceWorld,
-    path: String,
-    name: String,
-    samples: String,
-) {
-    use std::fmt::Write as _;
-    let mut proto = format!("LUABOX_BENCH_BEGIN\t{name}\n");
-    for sample in samples.split(',') {
-        let _ = writeln!(proto, "LUABOX_BENCH_RESULT\t{name}\t{sample}");
-    }
-    proto.push_str("LUABOX_BENCH_DONE\t1\n");
-    write_file(world, &path, &proto);
-}
-
-#[when(expr = "I run {string} with the fake bench runtime")]
-fn run_with_fake_bench_runtime(world: &mut AcceptanceWorld, command: String) {
-    let fake = shim_path(world, "fake_bench_runtime");
-    run_command_with_env(
-        world,
-        &command,
-        &[(
-            "LUABOX_LUA".to_string(),
-            fake.to_string_lossy().into_owned(),
-        )],
-    );
-}
-
 // --- toolchain (execution/toolchain.feature — #27) ------------------------
 //
 // Hermetic: no network, no real Lua. A scenario-local index
@@ -722,30 +599,18 @@ fn toolchain_platform() -> String {
 /// `<id>-<platform>` at it. When `correct` is false the recorded checksum is
 /// wrong, so an install must reject the archive.
 fn write_toolchain_index(world: &AcceptanceWorld, id: &str, correct: bool) {
-    // A shim that behaves like the test runner's fake runtime: echo the test
-    // file (argv 2) and fail iff it carries a FAIL line. Named so the
-    // toolchain interpreter search (`luabox_test::runtime`) finds it on this
-    // platform — `lua.cmd`, dispatched via PATHEXT, on Windows; a plain,
-    // executable `lua` (no extension) on Unix. The executable bit is set
-    // before archiving so `tar` records mode 0755 and extraction restores it
-    // (the installer's `tar -xf` preserves modes), letting the runner spawn it.
+    // A fake interpreter that simply echoes its arguments (the script path
+    // `luabox run` hands it) and exits 0 — enough to prove a pinned toolchain
+    // is what resolution spawns. Named so the toolchain interpreter search
+    // finds it on this platform — `lua.cmd`, dispatched via PATHEXT, on
+    // Windows; a plain, executable `lua` (no extension) on Unix. The
+    // executable bit is set before archiving so `tar` records mode 0755 and
+    // extraction restores it (the installer's `tar -xf` preserves modes),
+    // letting the runner spawn it.
     let (interp_name, shim) = if cfg!(windows) {
-        (
-            "lua.cmd",
-            "@echo off\r\n\
-             type \"%~2\"\r\n\
-             findstr /C:\"LUABOX_TEST_FAIL\" \"%~2\" >nul\r\n\
-             if not errorlevel 1 exit /b 1\r\n\
-             exit /b 0\r\n",
-        )
+        ("lua.cmd", "@echo off\r\necho RAN %*\r\nexit /b 0\r\n")
     } else {
-        (
-            "lua",
-            "#!/bin/sh\n\
-             cat \"$2\"\n\
-             if grep -q LUABOX_TEST_FAIL \"$2\"; then exit 1; fi\n\
-             exit 0\n",
-        )
+        ("lua", "#!/bin/sh\necho \"RAN $@\"\nexit 0\n")
     };
     let fixture_src = world.dir.path().join(".fixture-src");
     std::fs::create_dir_all(&fixture_src).expect("failed to create fixture source dir");
@@ -836,45 +701,6 @@ fn unmap_last_bundle_line(world: &mut AcceptanceWorld, path: String) {
         world,
         format!("luabox unmap {path} {path}:{last}: synthetic-error"),
     );
-}
-
-// --- registry (distribution/registry.feature — #20) ------------------------
-//
-// Hermetic: LUABOX_REGISTRY points at a scenario-local directory registry
-// (".registry" under the scenario dir) and LUABOX_STORE at the scenario
-// store. Publisher and consumer projects are sibling subdirectories, so one
-// scenario can publish from "pkg" and install from "app".
-
-/// Run a `luabox …` command from a subdirectory of the scenario dir,
-/// optionally with the scenario-local registry configured.
-fn run_luabox_in_dir(world: &mut AcceptanceWorld, command: &str, dir: &str, registry: bool) {
-    let command = world.subst(command);
-    let mut parts = command.split_whitespace();
-    let program = parts.next().expect("empty command");
-    assert_eq!(program, "luabox", "scenarios drive the luabox binary only");
-    let cwd = world.dir.path().join(dir);
-    std::fs::create_dir_all(&cwd).expect("failed to create the project directory");
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_luabox"));
-    cmd.args(parts)
-        .current_dir(&cwd)
-        .env("LUABOX_STORE", world.dir.path().join(".luabox-store"))
-        // Hermetic either way: the host's registry never leaks in.
-        .env_remove("LUABOX_REGISTRY");
-    if registry {
-        cmd.env("LUABOX_REGISTRY", world.dir.path().join(".registry"));
-    }
-    world.output = Some(cmd.output().expect("failed to spawn luabox"));
-}
-
-#[given(expr = "I run {string} in {string} against the registry")]
-#[when(expr = "I run {string} in {string} against the registry")]
-fn run_in_dir_against_registry(world: &mut AcceptanceWorld, command: String, dir: String) {
-    run_luabox_in_dir(world, &command, &dir, true);
-}
-
-#[when(expr = "I run {string} in {string} without a registry")]
-fn run_in_dir_without_registry(world: &mut AcceptanceWorld, command: String, dir: String) {
-    run_luabox_in_dir(world, &command, &dir, false);
 }
 
 // --- luarocks bridge (distribution/luarocks.feature — #19) -----------------

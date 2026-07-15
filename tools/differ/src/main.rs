@@ -9,8 +9,9 @@
 //! 3. runs the **lowered** output on the `to`-dialect runtime,
 //! 4. compares stdout (exact), exit code, and error class (see [`compare`]).
 //!
-//! Runtimes are resolved by candidate binary names on `PATH`
-//! ([`luabox_test::runtime`]). A pair whose source **or** target runtime is
+//! Runtimes are resolved by candidate binary names on `PATH` (a small
+//! self-contained probe, [`candidate_names`] + [`find_on_path`]). A pair whose
+//! source **or** target runtime is
 //! absent is **skipped with a note** — never a failure — so the harness runs
 //! partially on a machine with only some Lua versions installed (the full
 //! matrix runs in CI). The process exits non-zero if any pair **mismatched**
@@ -34,6 +35,55 @@ use std::time::Duration;
 use luabox_syntax::Dialect;
 
 use compare::{Axis, Verdict};
+
+/// Candidate interpreter binary names for a dialect's manifest id, in
+/// priority order (self-contained copy of the CLI's PATH-probe rules — this
+/// tool is not a workspace member and cannot depend on the `luabox` binary).
+fn candidate_names(edition: &str) -> Vec<String> {
+    let names: &[&str] = match edition {
+        "5.1" => &["lua5.1", "lua51", "lua"],
+        "5.2" => &["lua5.2", "lua52", "lua"],
+        "5.3" => &["lua5.3", "lua53", "lua"],
+        "5.4" => &["lua5.4", "lua54", "lua"],
+        "luajit" => &["luajit"],
+        _ => &["lua"],
+    };
+    names.iter().map(|s| (*s).to_string()).collect()
+}
+
+/// Resolve a bare interpreter `name` on `PATH`, honoring `PATHEXT` on Windows.
+/// Returns the resolved path if a matching executable exists.
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    let exts = path_exts();
+    for dir in std::env::split_paths(&path_var) {
+        for ext in &exts {
+            let candidate = dir.join(format!("{name}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Executable extensions to try for a bare name: `[""]` on Unix; the
+/// `PATHEXT` list (lower-cased, plus the empty extension) on Windows.
+fn path_exts() -> Vec<String> {
+    if cfg!(windows) {
+        let raw = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.BAT;.CMD;.COM".to_string());
+        let mut exts = vec![String::new()];
+        for ext in raw.split(';') {
+            let ext = ext.trim();
+            if !ext.is_empty() {
+                exts.push(ext.to_ascii_lowercase());
+            }
+        }
+        exts
+    } else {
+        vec![String::new()]
+    }
+}
 
 /// One resolved run configuration.
 struct Args {
@@ -181,9 +231,9 @@ impl Runtimes {
             return hit.clone();
         }
         let label = dialect.manifest_id();
-        let resolved = luabox_test::runtime::candidate_names(label)
+        let resolved = candidate_names(label)
             .into_iter()
-            .filter_map(|name| luabox_test::runtime::find_on_path(&name))
+            .filter_map(|name| find_on_path(&name))
             .map(|p| p.to_string_lossy().into_owned())
             .find(|p| verify_version(p, dialect));
         self.cache.insert(dialect, resolved.clone());

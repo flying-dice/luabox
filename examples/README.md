@@ -8,7 +8,7 @@ Work through them top to bottom; each introduces one new idea.
 
 | # | Example | Edition → target | Demonstrates |
 |---|---------|------------------|--------------|
-| 1 | [hello-luabox](hello-luabox/) | 5.4 | The 60-second tour: `init` → `check` → `fmt` → `lint` → `test` → `run`, one annotated function, `[tasks]` |
+| 1 | [hello-luabox](hello-luabox/) | 5.4 | The 60-second tour: `init` → `check` → `fmt` → `lint` → `run`, one annotated function, `[tasks]` |
 | 2 | [geometry](geometry/) | 5.4 | **LuaCATS classes + a `.d.lua` def package**: `---@class`/`---@field` inheritance, enforced `: Interface` conformance, `---@alias`, `---@enum`, generic classes, and fully-typed `require()` in the test file |
 | 3 | [renderer](renderer/) | 5.1 | **Consuming types across a package boundary** (path dependency, `[types] defs`): the dependency's classes are visible and *checked* in the consumer — a missing `Drawable` member is an error here |
 | 4 | [legacy-inifile](legacy-inifile/) | 5.1 | **Pure LuaCATS** (`---@class`/`---@param`/`---@return`), warn mode, `[lint]` allowlist + `---@luabox-ignore` |
@@ -46,17 +46,16 @@ Each directory has its own `README.md` with the exact commands to try. With
 
 ```sh
 cd examples/hello-luabox
-luabox check && luabox fmt --check && luabox lint && luabox test
+luabox check && luabox fmt --check && luabox lint
 ```
 
-`luabox test` and `luabox run` need a Lua interpreter on your PATH (or
-`LUABOX_LUA` set). Examples 1–7 that run locally do so on **Lua 5.1**;
-`timemachine` writes 5.4 and *ships* 5.1, so its lowered output also runs on
-Lua 5.1.
+`luabox run` needs a Lua interpreter on your PATH (or `LUABOX_LUA` set).
+Examples that run locally do so on **Lua 5.1**; `timemachine` writes 5.4 and
+*ships* 5.1, so its lowered output also runs on Lua 5.1.
 
 ## Keeping them green
 
 `scripts/examples.ps1` (Windows) and `scripts/examples.sh` (Linux/macOS) run
 the full gate — check, fmt, lint, plus per-example extras (install, build,
-bundle, `.love` packaging, and tests where a matching runtime exists). CI runs
-the bash script on every push.
+bundle, `.love` packaging, and run steps where a matching runtime exists). CI
+runs the bash script on every push.

@@ -89,7 +89,6 @@ error[LB0300]: `render.Square` does not satisfy `geometry.Drawable`: missing mem
 luabox check        # 0 errors — cross-package conformance verified
 luabox fmt --check
 luabox lint
-luabox test
 luabox run start    # → draws a 4x4 square of '#'
 ```
 

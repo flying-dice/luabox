@@ -25,9 +25,6 @@ path = "src/main.rs"
 # instant this tool is rebuilt.
 luabox-lower = { path = "../../crates/luabox-lower" }
 luabox-syntax = { path = "../../crates/luabox-syntax" }
-# Reuse the blessed PATH runtime resolution (candidate names + PATHEXT) rather
-# than re-implementing it — luabox-test owns runtime acquisition (SPEC.md §16).
-luabox-test = { path = "../../crates/luabox-test" }
 regex = "1"
 
 [lints.rust]

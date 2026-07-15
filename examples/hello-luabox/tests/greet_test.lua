@@ -1,6 +1,6 @@
--- Tests run on whatever Lua interpreter `luabox test` resolves (your PATH
--- lua, a pinned toolchain, or LUABOX_LUA). We make src/ requirable by
--- prepending it to package.path — the runner launches from the project root.
+-- Written busted-style; run with your deployment environment's own test
+-- tooling (e.g. `busted` from the project root). We make src/ requirable by
+-- prepending it to package.path.
 package.path = "src/?.lua;" .. package.path
 
 local hello = require("main")

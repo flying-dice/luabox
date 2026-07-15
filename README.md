@@ -2,7 +2,7 @@
 
 **A cargo-style toolchain for Lua.** One static binary that gives Lua the
 workflow Rust developers expect — `check`, `lint`, `fmt`, `run`,
-`build`, `doc`, `publish` — with a type checker that speaks stock
+`build`, `doc` — with a type checker that speaks stock
 [LuaCATS](https://luals.github.io/wiki/annotations/) annotations (the
 lua-language-server dialect) but *verifies* what luals only trusts:
 `---@class` conformance, `---@generic` generics, and types shared across
@@ -150,10 +150,10 @@ Any other editor can point its LSP client at `luabox lsp`.
 
 ## Limitations
 
-luabox 0.1 is alpha software — `test`/`bench` are deprecated (luabox is a
-toolchain, not a runtime), there is no hosted package registry, and the editor
-extensions are not yet on their marketplaces (each ships installable artifacts
-from its own repo's releases). The full LuaCATS tag vocabulary is enforced.
+luabox 0.1 is alpha software — there is no hosted package registry, and the
+editor extensions are not yet on their marketplaces (each ships installable
+artifacts from its own repo's releases). The full LuaCATS tag vocabulary is
+enforced.
 Every remaining gap is
 documented honestly in
 [**LIMITATIONS.md**](LIMITATIONS.md). Read it before you rely on luabox for
@@ -171,11 +171,9 @@ anything load-bearing.
 | `lint` | type-informed rules, `---@luabox-ignore`, per-rule `[lint]` levels |
 | `build` | lower `edition → target` (goto, bitops, `<close>`, `_ENV`, …) with tree-shaken polyfills |
 | `bundle` | single-file bundle, `--minify`, `--sourcemap` + `unmap`, `--mode love\|nvim-plugin` |
-| `test` / `bench` | **deprecated** — luabox is a toolchain, not a runtime; code coupled to its deployment environment (LÖVE, Neovim, OpenResty, …) can't be faithfully executed on a bare interpreter. Both warn and are slated for removal; use the environment's own tooling |
 | `add` / `remove` / `install` / `update` / `vendor` | PubGrub resolver, `luabox.lock`, CAS store with hard-link installs; path/git/workspace/registry deps. `update <name>` re-pins a git dep to its repo's latest release tag |
 | `search` / `outdated` | discover luabox packages on GitHub (topic `luabox` + a root `luabox.toml`) and report git deps behind their latest release; `--format json\|text` |
 | `login` / `logout` / `whoami` | sign in to GitHub via the browser (OAuth device flow), storing the token encrypted in the OS keychain; sign out; show the signed-in identity. `login`/`whoami` take `--format json\|text` |
-| `publish` / `audit` | registry publish with yank; advisory-DB audit |
 | `run` | `[tasks]` entries or scripts via the resolved runtime |
 | `toolchain` | install/pin/list managed Lua runtimes |
 | `upgrade` | self-update from GitHub releases (`luabox upgrade` for latest, or a specific `v0.1.1`), checksum-verified |
@@ -191,20 +189,19 @@ dependency kinds today are **path**, **git** (`rev`/`tag`/`branch`),
 registry you point at. There is no first-party hosted default
 ([#101](LIMITATIONS.md#dependencies-no-hosted-registry-in-01-101)).
 
-A registry is any writable root: a plain directory or a `file://` URL. Point
-`luabox add`/`install`/`update` and `luabox publish` at one by setting
-`LUABOX_REGISTRY` to that root. `https://` registries are supported for
-resolving/installing but are read-only in this MVP — `luabox publish`
-requires a directory or `file://` root it can write to.
+A registry is any readable root: a plain directory, a `file://` URL, or an
+`https://` registry. Point `luabox add`/`install`/`update` at one by setting
+`LUABOX_REGISTRY` to that root.
 
 ```sh
 export LUABOX_REGISTRY=file:///path/to/a/registry   # or a plain directory
 luabox add somelib@1.2                              # resolves against it
-luabox publish                                      # publishes to it
 ```
 
-Without `LUABOX_REGISTRY` set, registry-kind specs (`luabox add pkg@1.0`) and
-`luabox publish` fail with setup guidance rather than silently doing nothing.
+Without `LUABOX_REGISTRY` set, registry-kind specs (`luabox add pkg@1.0`) fail
+with setup guidance rather than silently doing nothing. Publishing to a
+registry is not part of this release — it returns in a later version
+([flying-dice/luabox#2](https://github.com/flying-dice/luabox/issues/2)).
 
 ### Discovering & managing dependencies
 
@@ -277,7 +274,6 @@ Cargo workspace, one crate per bounded context (SPEC.md §16):
 | `luabox-resolve` | PubGrub solver, registry + luarocks bridge |
 | `luabox-store` | content-addressed cache |
 | `luabox-lsp` | language server |
-| `luabox-test` | test runner, runtime matrix |
 | `luabox-cli` | the `luabox` binary |
 
 ```sh

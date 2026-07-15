@@ -11,8 +11,8 @@
 //! 2. **Script path** — else, if `script` names an existing `.lua` file
 //!    (relative to `cwd`, or absolute), it is run as
 //!    `<runtime> <script> <args...>`, where `<runtime>` is resolved from the
-//!    manifest `edition` the same way `luabox test` does
-//!    (`luabox_test::runtime::resolve_default`, honoring `LUABOX_LUA`).
+//!    manifest `edition` via [`crate::runtime::resolve_default`] (honoring the
+//!    project pin, `LUABOX_LUA`, managed toolchains, then `PATH`).
 //!    A bare script with no manifest in scope is fine — only tasks require
 //!    one (an empty `[tasks]` table just means step 1 never matches).
 //! 3. **`$PATH` fallback** — else `script` is probed as a bare executable
@@ -59,7 +59,8 @@ use std::process::{Command, ExitStatus};
 
 use anyhow::{Context, bail};
 use luabox_resolve::manifest::TaskValue;
-use luabox_test::runtime::{RuntimeSpec, find_on_path, resolve_default};
+
+use crate::runtime::{RuntimeSpec, find_on_path, resolve_default};
 
 /// Nesting cap for `LUABOX_RUN_DEPTH` (see the module doc's "Recursion
 /// guard" section). 32 is generous for any legitimate task graph while
@@ -321,8 +322,7 @@ struct Project {
 }
 
 /// Find the project: nearest `luabox.toml` walking up from `cwd`, or a
-/// manifest-less default rooted at `cwd` (edition 5.4, no tasks — matching
-/// `luabox test`'s `discover`).
+/// manifest-less default rooted at `cwd` (edition 5.4, no tasks).
 fn discover(cwd: &Path) -> anyhow::Result<Project> {
     match crate::project::discover_manifest(cwd)? {
         Some((root, manifest)) => Ok(Project {

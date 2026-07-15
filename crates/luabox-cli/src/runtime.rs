@@ -2,7 +2,7 @@
 //!
 //! Luabox is never a runtime — it *acquires* one. With the toolchain manager
 //! (#27) landed, resolution consults managed toolchains **before** `PATH`.
-//! The single-runtime order for `luabox test` / `luabox run` is:
+//! The single-runtime order for `luabox run` is:
 //!
 //!   1. **Project pin** — the nearest `luabox-toolchain.toml` (walking up from
 //!      the project root) names a toolchain id; that toolchain wins outright.
@@ -13,10 +13,6 @@
 //!   3. **Managed toolchains** — a toolchain in `~/.luabox/toolchains`
 //!      (`LUABOX_TOOLCHAINS` override) whose id matches the manifest edition.
 //!   4. **`PATH`** — the edition's candidate binary names, probed in order.
-//!
-//! `--matrix` ignores the edition and probes the whole known set
-//! (`5.1/5.2/5.3/5.4/luajit` plus a generic `lua`), degrading gracefully to
-//! whatever is installed.
 //!
 //! ## For `luabox run` (#28)
 //!
@@ -41,7 +37,7 @@ const TOOLCHAIN_INTERP_NAMES: &[&str] = &[
 ];
 
 /// A resolved way to launch a Lua runtime: `program` plus any fixed leading
-/// `args`. The runner appends the harness path and one test file.
+/// `args`. The runner appends the script path and its arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeSpec {
     /// Human label for reports (e.g. `"5.4"`, `"luajit"`, `"LUABOX_LUA"`,
@@ -126,8 +122,8 @@ struct ResolveInputs {
     override_value: Option<String>,
 }
 
-/// Resolve the single runtime `luabox test` / `luabox run` should use for
-/// `edition`, rooted at `root` (the project root, for the pin lookup).
+/// Resolve the single runtime `luabox run` should use for `edition`, rooted at
+/// `root` (the project root, for the pin lookup).
 ///
 /// This is the blessed entry point — see the module docs for the full order.
 pub fn resolve_default(edition: &str, root: &Path) -> Result<RuntimeSpec, ResolveError> {
@@ -318,71 +314,6 @@ fn parse_pin(text: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// The `(label, candidate names)` set probed by `--matrix`, in report order.
-const MATRIX_LABELS: &[(&str, &[&str])] = &[
-    ("5.1", &["lua5.1", "lua51"]),
-    ("5.2", &["lua5.2", "lua52"]),
-    ("5.3", &["lua5.3", "lua53"]),
-    ("5.4", &["lua5.4", "lua54"]),
-    ("luajit", &["luajit"]),
-    ("lua", &["lua"]),
-];
-
-/// The outcome of probing the whole matrix: the runtimes that were found,
-/// and the labels that weren't (for a "what's missing" note).
-#[derive(Debug, Clone, Default)]
-pub struct MatrixResolution {
-    pub found: Vec<RuntimeSpec>,
-    pub missing: Vec<String>,
-}
-
-/// Probe every known runtime for `--matrix`. If `LUABOX_LUA` is set it is
-/// added as an extra entry (so a hermetic fake runtime can drive the matrix
-/// too). Runtimes resolving to the same executable path are de-duplicated,
-/// so `lua` pointing at the same binary as `lua5.1` isn't run twice.
-#[must_use]
-pub fn resolve_matrix() -> MatrixResolution {
-    let mut resolution = MatrixResolution::default();
-    let mut seen_paths: Vec<PathBuf> = Vec::new();
-
-    if let Some(value) = env_override()
-        && let Some(resolved) = find_on_path(&value)
-    {
-        seen_paths.push(resolved);
-        resolution.found.push(RuntimeSpec {
-            label: "LUABOX_LUA".to_string(),
-            program: value,
-            args: Vec::new(),
-        });
-    }
-
-    for (label, names) in MATRIX_LABELS {
-        let mut hit = None;
-        for name in *names {
-            if let Some(resolved) = find_on_path(name) {
-                hit = Some((name, resolved));
-                break;
-            }
-        }
-        match hit {
-            Some((_name, resolved)) if !seen_paths.contains(&resolved) => {
-                resolution.found.push(RuntimeSpec {
-                    label: (*label).to_string(),
-                    // Resolved path, not the bare name — see `resolve_core`.
-                    program: resolved.to_string_lossy().into_owned(),
-                    args: Vec::new(),
-                });
-                seen_paths.push(resolved);
-            }
-            // Found but a duplicate binary: don't list as missing either.
-            Some(_) => {}
-            None => resolution.missing.push((*label).to_string()),
-        }
-    }
-
-    resolution
 }
 
 fn env_override() -> Option<String> {

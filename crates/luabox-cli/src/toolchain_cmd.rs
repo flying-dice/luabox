@@ -5,9 +5,9 @@
 //! prebuilt Lua interpreter, verifies its SHA-256, and unpacks it into
 //! `~/.luabox/toolchains/<id>/` (`LUABOX_TOOLCHAINS` override). `pin` records a
 //! project's chosen toolchain in `luabox-toolchain.toml`; `list` reports what
-//! is installed and which is pinned. Runtime *resolution* — how `luabox test`
-//! and `luabox run` pick an interpreter, honoring the pin before PATH — lives
-//! in `luabox-test`'s [`runtime`](luabox_test::runtime) module.
+//! is installed and which is pinned. Runtime *resolution* — how `luabox run`
+//! picks an interpreter, honoring the pin before PATH — lives in the
+//! [`runtime`](crate::runtime) module.
 //!
 //! ## The index
 //!
@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
-use luabox_test::runtime::{
+use crate::runtime::{
     PIN_FILE, installed_toolchains, read_pin, toolchain_interpreter, toolchains_dir,
 };
 
@@ -331,7 +331,7 @@ pub fn list(cwd: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{Index, current_platform, install_into};
-    use luabox_test::runtime::toolchain_interpreter;
+    use crate::runtime::toolchain_interpreter;
     use std::path::Path;
     use std::process::Command;
 

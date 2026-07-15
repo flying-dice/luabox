@@ -16,12 +16,12 @@
 //! plus any `[types] defs` packages, resolved from `defs/` the same way
 //! `luabox check` builds its `Ambient` layer (see
 //! `luabox-cli::check_cmd::resolve_project_defs`, duplicated here in
-//! miniature — the two commands don't share a `Project` type). Test files —
-//! anything `luabox test` would also discover (SPEC.md §11:
-//! `*_test.lua`/`*.test.lua`/anything under `tests/`) — additionally see the
-//! embedded test harness's own globals (`describe`, `it`, `before_each`,
-//! `after_each`, `test`), since `crates/luabox-test/src/harness.lua` genuinely
-//! injects them as globals at run time before `dofile`-ing the test file.
+//! miniature — the two commands don't share a `Project` type). Test files
+//! (SPEC.md §11: `*_test.lua`/`*.test.lua`/anything under `tests/`)
+//! additionally see the conventional busted-style test globals (`describe`,
+//! `it`, `before_each`, `after_each`, `test`), which a test framework injects
+//! as globals at run time — so a test file using them doesn't spuriously trip
+//! `undefined-global`.
 
 use std::collections::HashSet;
 use std::fs;
@@ -40,11 +40,9 @@ use crate::project::{collect_lua_files, display_rel};
 /// The most fix passes to run per file before giving up on convergence.
 const MAX_FIX_PASSES: usize = 8;
 
-/// Globals the embedded test harness (`crates/luabox-test/src/harness.lua`)
-/// genuinely injects before `dofile`-ing a test file: the busted-compatible
-/// `describe`/`it`/`before_each`/`after_each` plus the native flat `test`.
-/// `assert` is not listed — it's already stdlib, the harness only replaces
-/// its value, not its name.
+/// Conventional busted-style test globals a test framework injects before
+/// running a test file: `describe`/`it`/`before_each`/`after_each` plus the
+/// native flat `test`. `assert` is not listed — it's already stdlib.
 const TEST_HARNESS_GLOBALS: [&str; 5] = ["describe", "it", "before_each", "after_each", "test"];
 
 /// Execute `luabox lint` from `cwd`.
@@ -94,10 +92,10 @@ fn lint_one(path: &Path, project: &Project, fix: bool) -> anyhow::Result<FileRes
     let original = fs::read_to_string(path).with_context(|| format!("cannot read `{rel}`"))?;
 
     // `undefined-global` (ticket #103): the project's known-globals baseline,
-    // widened with the embedded test harness's own globals for files
-    // `luabox test` would itself discover — those genuinely are globals at
-    // run time (`harness.lua` assigns `describe`/`it`/... before `dofile`-ing
-    // the test file), just never declared in a `.d.lua` defs package.
+    // widened with the conventional busted-style test globals for test files
+    // (`*_test.lua`/`*.test.lua`/under `tests/`) — a test framework injects
+    // `describe`/`it`/... as run-time globals, though they're never declared
+    // in a `.d.lua` defs package.
     let is_test_file = is_test_file(&rel);
     let mut known_owned;
     let known_globals: &HashSet<String> = if is_test_file {
@@ -284,15 +282,19 @@ fn level_keyword(level: LintLevel) -> &'static str {
     }
 }
 
-/// Whether `rel` (a root-relative, forward-slash path) is a file `luabox
-/// test` would itself discover (SPEC.md §11: `*_test.lua`, `*.test.lua`, or
-/// anything under a `tests/` directory) — mirrors
-/// `luabox_test::discovery::is_test_file` exactly, just fed a path string
-/// instead of a directory walk, since `lint`'s own file collection already
-/// has one.
+/// Whether `rel` (a root-relative, forward-slash path) is a test file
+/// (SPEC.md §11: `*_test.lua`, `*.test.lua`, or anything under a `tests/`
+/// directory). `*.d.lua` definition files are never tests, even under
+/// `tests/`.
 fn is_test_file(rel: &str) -> bool {
     let mut segments = rel.split('/');
     let name = segments.next_back().unwrap_or(rel);
     let in_tests = segments.any(|seg| seg == "tests");
-    luabox_test::discovery::is_test_file(name, in_tests)
+    let is_lua = Path::new(name)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("lua"));
+    if !is_lua || name.ends_with(".d.lua") {
+        return false;
+    }
+    in_tests || name.ends_with("_test.lua") || name.ends_with(".test.lua")
 }

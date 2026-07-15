@@ -1264,7 +1264,6 @@ dependencies = [
  "luabox-resolve",
  "luabox-store",
  "luabox-syntax",
- "luabox-test",
  "luabox-types",
  "notify",
  "rayon",
@@ -1379,15 +1378,6 @@ version = "0.1.4"
 dependencies = [
  "proptest",
  "rowan",
-]
-
-[[package]]
-name = "luabox-test"
-version = "0.1.4"
-dependencies = [
- "anyhow",
- "rayon",
- "tempfile",
 ]
 
 [[package]]

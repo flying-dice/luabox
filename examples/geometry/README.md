@@ -53,7 +53,6 @@ geometry/
 luabox check        # 0 errors across 4 files
 luabox fmt --check   # 5 files formatted
 luabox lint          # 0 errors, 0 warnings
-luabox test          # 9 passing tests
 ```
 
 ## What actually works (verified against the real binary)

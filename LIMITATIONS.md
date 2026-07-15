@@ -132,16 +132,6 @@ one.
 
 ## Tooling
 
-### `luabox test` and `luabox bench` are deprecated
-
-luabox is a toolchain, not a runtime: most real Lua code is coupled to the
-environment it deploys into (LÖVE, Neovim, OpenResty, a game engine's
-embedded VM, …), and a bare-interpreter harness cannot faithfully execute
-it. Both commands keep working for the code they *can* run, but warn on
-every invocation and are slated for removal — test and benchmark with the
-deployment environment's own tooling (e.g. busted under the target host).
-`--coverage` errors out and will not be implemented.
-
 ### Dependencies: no hosted registry in 0.1 (#101)
 
 `[dependencies]` entries in `luabox.toml` may be:

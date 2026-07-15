@@ -15,9 +15,8 @@
 //! 4. `--open` launches the generated `index.html` in the default browser.
 //!
 //! Doc text renders through the minimal markdown renderer
-//! (`doc_cmd::markdown`). Running doc examples as tested blocks under
-//! `luabox test --doc` (SPEC.md §13) is *not* implemented yet; fenced code
-//! blocks in doc text render as plain code.
+//! (`doc_cmd::markdown`). Running doc examples as tested blocks is *not*
+//! implemented; fenced code blocks in doc text render as plain code.
 
 mod markdown;
 mod model;

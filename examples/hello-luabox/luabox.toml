@@ -12,6 +12,6 @@ strict = true
 
 [tasks]
 start = "luabox run src/main.lua"
-ci = ["luabox check", "luabox lint", "luabox test"]
+ci = ["luabox check", "luabox lint", "luabox fmt --check"]
 
 [dependencies]

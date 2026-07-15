@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Keep the examples green. For every project under examples/ this runs the
 # core gate (check, fmt --check, lint) plus per-example extras (install,
-# build, bundle, .love packaging, and tests where a Lua runtime is present).
-# Exits non-zero on the first real failure.
+# build, bundle, .love packaging, and run steps where a Lua runtime is
+# present). Exits non-zero on the first real failure.
 #
 # Usage: bash scripts/examples.sh
 # Honours $LUABOX (path to the luabox binary); defaults to target/release/luabox.
@@ -22,9 +22,9 @@ fi
 # Put the binary on PATH so `[tasks]` that call `luabox` resolve.
 export PATH="$(dirname "$LUABOX"):$PATH"
 
-# Find a Lua interpreter for test/run steps. All example test suites and the
-# timemachine output are Lua 5.1-compatible, so a single interpreter set via
-# LUABOX_LUA drives every edition deterministically.
+# Find a Lua interpreter for run steps. All locally-run example output
+# (including timemachine's lowered bundle) is Lua 5.1-compatible, so a single
+# interpreter set via LUABOX_LUA drives every edition deterministically.
 # We store the bare interpreter *name* (not the resolved path): luabox and the
 # shell both resolve it via PATH, and on Windows/Git-Bash that lets `.exe` be
 # appended — a resolved extensionless path would not open.
@@ -39,7 +39,7 @@ if [ -n "$LUA" ]; then
     export LUABOX_LUA="$LUA"
     echo "==> using Lua runtime: $LUA ($(command -v "$LUA"))"
 else
-    echo "==> no Lua runtime on PATH — test/run steps will be skipped (not a failure)"
+    echo "==> no Lua runtime on PATH — run steps will be skipped (not a failure)"
 fi
 
 fails=0
@@ -65,35 +65,23 @@ gate() {
     run "lint"         -- "$LUABOX" lint
 }
 
-# run_tests <dir>: run `luabox test` only when a runtime is available.
-run_tests() {
-    if [ -z "$LUA" ]; then
-        echo "    skip test (no Lua runtime)"
-        return
-    fi
-    run "test" -- "$LUABOX" test
-}
-
 section() { echo; echo "== $1 =="; }
 
 # 1. hello-luabox --------------------------------------------------------------
 section "hello-luabox"
 cd "$examples/hello-luabox"
 gate .
-run_tests .
 
 # 2. geometry ------------------------------------------------------------------
 section "geometry"
 cd "$examples/geometry"
 gate .
-run_tests .
 
 # 3. renderer (path dep — install first) --------------------------------------
 section "renderer"
 cd "$examples/renderer"
 run "install" -- "$LUABOX" install
 gate .
-run_tests .
 if [ -n "$LUA" ]; then
     if "$LUABOX" run src/main.lua >/tmp/lb_ex_out 2>&1 && grep -q "area = 16" /tmp/lb_ex_out; then
         pass "run (draws a square)"
@@ -106,7 +94,6 @@ fi
 section "legacy-inifile"
 cd "$examples/legacy-inifile"
 gate .
-run_tests .
 
 # 5. timemachine (build + bundle + run lowered output on Lua 5.1) -------------
 section "timemachine"
@@ -136,16 +123,12 @@ else
     fail ".love contains main.lua + conf.lua"; sed 's/^/         | /' /tmp/lb_ex_out >&2
 fi
 
-# 7. workspace (check fans out; test a member) --------------------------------
+# 7. workspace (check fans out; gate a member standalone) ---------------------
 section "workspace"
 cd "$examples/workspace"
 gate .
-if [ -n "$LUA" ]; then
-    cd "$examples/workspace/packages/core"
-    run "test (core member)" -- "$LUABOX" test
-else
-    echo "    skip test (no Lua runtime)"
-fi
+cd "$examples/workspace/packages/core"
+run "check (core member)" -- "$LUABOX" check
 
 echo
 if [ "$fails" -eq 0 ]; then

@@ -1,10 +1,8 @@
 Feature: luabox doc — static documentation site
   SPEC.md §13: `luabox doc` generates a static site into `doc/` from
   LuaCATS annotations — search, cross-linked types, one page per module and
-  per class/struct/trait, no external assets. Doc examples running under
-  `luabox test --doc` are not
-  implemented yet. `--open` (launching a browser) is deliberately not
-  scenario-tested.
+  per class/struct/trait, no external assets. `--open` (launching a browser)
+  is deliberately not scenario-tested.
 
   Scenario: generates an index listing a documented function
     Given a project with edition "5.4"

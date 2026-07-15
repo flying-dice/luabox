@@ -29,7 +29,6 @@ then flip `strict = true` when you're ready for CI-grade enforcement.
 luabox check        # 0 errors, 0 warnings — annotations line up
 luabox fmt --check
 luabox lint         # 0 errors, 0 warnings
-luabox test
 ```
 
 ## Two ways to silence a lint

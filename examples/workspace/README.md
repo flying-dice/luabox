@@ -33,11 +33,11 @@ graph inside the workspace.
 
 ## Working in a single member
 
-Each package is a normal luabox project. `cd` into one to run its tests or
+Each package is a normal luabox project. `cd` into one to run its checks or
 its tasks:
 
 ```sh
-cd packages/core     && luabox test
+cd packages/core     && luabox check
 cd packages/cli-tool && luabox run start   # prints "2 + 3 = 5"
 ```
 
