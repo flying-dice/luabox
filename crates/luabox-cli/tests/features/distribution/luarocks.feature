@@ -65,6 +65,144 @@ Feature: luarocks.org registry
     And stderr contains "luasocket"
     And stderr contains "C/native module"
 
+  Scenario: add writes the rockspec, installs, and locks the rock
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      edition = "5.4"
+      """
+    And a file "app-0.1.0-1.rockspec" containing:
+      """
+      package = "app"
+      version = "0.1.0-1"
+      dependencies = {
+         "lua >= 5.1",
+      }
+      """
+    And a luarocks mirror providing pure-Lua rock "greet" at "1.0"
+    When I run "luabox add greet" against the luarocks mirror
+    Then the command succeeds
+    And "app-0.1.0-1.rockspec" contains "greet >= 1.0.0"
+    And "app-0.1.0-1.rockspec" contains "lua >= 5.1"
+    And "luabox.lock" contains 'name = "greet"'
+    And the file "lua_modules/greet/greet.lua" exists
+
+  Scenario: add with an explicit version writes a lower-bound constraint
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      edition = "5.4"
+      """
+    And a file "app-0.1.0-1.rockspec" containing:
+      """
+      package = "app"
+      version = "0.1.0-1"
+      dependencies = {
+         "lua >= 5.1",
+      }
+      """
+    And a luarocks mirror providing pure-Lua rock "greet" at "1.0"
+    When I run "luabox add greet@1.0" against the luarocks mirror
+    Then the command succeeds
+    And "app-0.1.0-1.rockspec" contains "greet >= 1.0"
+
+  Scenario: add --dev creates and targets test_dependencies
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      edition = "5.4"
+      """
+    And a file "app-0.1.0-1.rockspec" containing:
+      """
+      package = "app"
+      version = "0.1.0-1"
+      dependencies = {
+         "lua >= 5.1",
+      }
+      """
+    And a luarocks mirror providing pure-Lua rock "greet" at "1.0"
+    When I run "luabox add greet --dev" against the luarocks mirror
+    Then the command succeeds
+    And "app-0.1.0-1.rockspec" contains "test_dependencies = {"
+    And "app-0.1.0-1.rockspec" contains "greet >= 1.0.0"
+
+  Scenario: add of an unknown rock errors helpfully without touching the rockspec
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      edition = "5.4"
+      """
+    And a file "app-0.1.0-1.rockspec" containing:
+      """
+      package = "app"
+      version = "0.1.0-1"
+      dependencies = {
+         "lua >= 5.1",
+      }
+      """
+    And a luarocks mirror providing pure-Lua rock "greet" at "1.0"
+    When I run "luabox add nosuchrock" against the luarocks mirror
+    Then the command fails
+    And stderr contains "luabox search nosuchrock"
+    And "app-0.1.0-1.rockspec" does not contain "nosuchrock"
+
+  Scenario: remove deletes the entry and drops the module after sync
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      edition = "5.4"
+      """
+    And a file "app-0.1.0-1.rockspec" containing:
+      """
+      package = "app"
+      version = "0.1.0-1"
+      dependencies = {
+         "lua >= 5.1",
+         "greet >= 1.0",
+      }
+      """
+    And a luarocks mirror providing pure-Lua rock "greet" at "1.0"
+    And I run "luabox install" against the luarocks mirror
+    When I run "luabox remove greet" against the luarocks mirror
+    Then the command succeeds
+    And "app-0.1.0-1.rockspec" does not contain "greet"
+    And "app-0.1.0-1.rockspec" contains "lua >= 5.1"
+    And the file "lua_modules/greet/greet.lua" does not exist
+
+  Scenario: a rockspec with comments survives an add/remove round-trip byte-identical
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      edition = "5.4"
+      """
+    And a file "app-0.1.0-1.rockspec" containing:
+      """
+      -- app package manifest
+      package = "app"
+      version = "0.1.0-1"
+
+      dependencies = {
+         "lua >= 5.1",     -- interpreter pin
+         "greet >= 1.0",
+      }
+      """
+    And a luarocks mirror providing pure-Lua rock "greet" at "1.0"
+    And a luarocks mirror providing pure-Lua rock "penlight" at "1.14.0"
+    And I run "luabox add penlight" against the luarocks mirror
+    When I run "luabox remove penlight" against the luarocks mirror
+    Then the command succeeds
+    And "app-0.1.0-1.rockspec" equals:
+      """
+      -- app package manifest
+      package = "app"
+      version = "0.1.0-1"
+
+      dependencies = {
+         "lua >= 5.1",     -- interpreter pin
+         "greet >= 1.0",
+      }
+      """
+
   @network
   Scenario: a real pure-Lua rock resolves and installs from luarocks.org
     Given a file "luabox.toml" containing:

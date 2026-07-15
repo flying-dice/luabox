@@ -10,6 +10,23 @@ spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
 
 ### Added
 
+- **`luabox add`/`remove` edit the rockspec for registry dependencies**
+  ([#2](https://github.com/flying-dice/luabox/issues/2)) — `luabox add <rock>`
+  now edits your project's `*.rockspec` the way `pnpm add` edits
+  `package.json`. It resolves the rock on luarocks.org and splices one entry
+  into the `dependencies` table (or `test_dependencies` with `--dev`, created if
+  absent), then runs the usual resolve + install (`luabox.lock` +
+  `lua_modules/`). A bare `add penlight` pins `>= <latest>`; `add penlight@1.14`
+  writes `>= 1.14` and `add penlight@=1.14` writes `== 1.14`; a name already
+  listed has its constraint updated in place. `luabox remove <rock>` deletes
+  exactly that entry. The edits are **comment-preserving and CST-guided** (the
+  lossless Lua parser locates the table and each entry's byte span): every byte
+  outside the touched entry — comments, blank lines, indentation, quote style,
+  and the `lua >= X.Y` pin — survives an add/remove round-trip byte-identical.
+  An unknown rock errors with a `luabox search` hint before the file is touched;
+  a registry add in a project with no rockspec explains how to scaffold one.
+  `--path`/`--git` adds still edit `luabox.toml` (source deps a rockspec cannot
+  express).
 - **The rockspec is the package manifest** ([#2](https://github.com/flying-dice/luabox/issues/2))
   — luabox adopts the pnpm/bun model. A project's root `*.rockspec` supplies
   the package **name**, **version**, and **registry dependencies** (its

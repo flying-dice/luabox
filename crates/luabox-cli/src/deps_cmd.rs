@@ -53,10 +53,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow, bail};
 use luabox_resolve::luarocks::rockspec::{self, Rockspec};
+use luabox_resolve::luarocks::{dependency_from_spec, rockspec_edit};
 use luabox_resolve::manifest::{Dependency, GitDependency, PathDependency};
 use luabox_resolve::{
-    GitProvider, LOCKFILE_NAME, Lockfile, LuaRocksProvider, Manifest, PackageId, PathProvider,
-    Resolution, ResolveError, Source, StackedProvider, effective_manifest, resolve,
+    GitProvider, LOCKFILE_NAME, Lockfile, LuaRocksProvider, Manifest, PackageId, PackageProvider,
+    PathProvider, ProviderError, Resolution, ResolveError, Source, StackedProvider,
+    effective_manifest, resolve,
 };
 use luabox_store::{LinkMode, Store};
 
@@ -81,11 +83,19 @@ pub struct AddOptions {
     pub branch: Option<String>,
 }
 
-/// `luabox add`: manifest edit + install.
+/// `luabox add`: a `--path`/`--git` add edits `luabox.toml`; a bare registry
+/// add edits the project's rockspec (pnpm-style, SPEC.md §6). Either way the
+/// edit is comment-preserving, and an install follows.
 pub fn add(cwd: &Path, opts: &AddOptions) -> anyhow::Result<()> {
-    let mut project = discover(cwd)?;
     let (name, version) = split_spec(&opts.package)?;
 
+    // A bare spec (no `--path`/`--git`) is a luarocks.org dependency — those
+    // live in the rockspec now.
+    if opts.git.is_none() && opts.path.is_none() {
+        return add_registry(cwd, &name, version.as_deref(), opts.dev);
+    }
+
+    let mut project = discover(cwd)?;
     let dep = if let Some(url) = &opts.git {
         Dependency::Git(GitDependency {
             git: url.clone(),
@@ -101,16 +111,9 @@ pub fn add(cwd: &Path, opts: &AddOptions) -> anyhow::Result<()> {
             version: version.clone(),
         })
     } else {
-        // A bare registry spec is a luarocks.org dependency, and those live
-        // in the project's rockspec now (pnpm-style, SPEC.md §6). Editing the
-        // rockspec from `luabox add` lands in a later wave; until then,
-        // declare it in the rockspec by hand.
-        bail!(
-            "`{name}` is a registry (luarocks.org) dependency — declare it in your \
-             project's rockspec `dependencies` for now (rockspec editing from \
-             `luabox add` arrives in a later wave). `--path <dir>` and \
-             `--git <url>` dependencies are written to `luabox.toml` and work today"
-        );
+        // Unreachable: a bare (registry) spec returned above. Re-dispatch
+        // rather than panic to keep the branch total.
+        return add_registry(cwd, &name, version.as_deref(), opts.dev);
     };
 
     project.manifest.set_dependency_entry(&name, &dep, opts.dev);
@@ -126,20 +129,166 @@ pub fn add(cwd: &Path, opts: &AddOptions) -> anyhow::Result<()> {
     sync(&project, &LockUse::Full, false)
 }
 
-/// `luabox remove`: manifest edit + re-install (lockfile updated).
-pub fn remove(cwd: &Path, package: &str) -> anyhow::Result<()> {
-    let mut project = discover(cwd)?;
-    if !project.manifest.remove_dependency(package) {
-        bail!(
-            "no dependency named `{package}` in `{}`",
-            project.manifest_path.display()
-        );
+/// `luabox add <name>[@req] [--dev]` for a registry (luarocks.org) rock:
+/// resolve the constraint to write, splice it into the rockspec's
+/// `dependencies` / `test_dependencies` table comment-preservingly, then sync.
+fn add_registry(
+    cwd: &Path,
+    name: &str,
+    version: Option<&str>,
+    dev: bool,
+) -> anyhow::Result<()> {
+    let project = discover(cwd)?;
+    let Some(rockspec_path) = project.rockspec_path.clone() else {
+        bail!("{}", no_rockspec_message(name));
+    };
+
+    let luarocks = LuaRocksProvider::from_env(store_root()?.join("luarocks"));
+    let constraint = registry_constraint(name, version, &luarocks)?;
+
+    let text = fs::read_to_string(&rockspec_path)
+        .with_context(|| format!("cannot read `{}`", rockspec_path.display()))?;
+    let edited = rockspec_edit::add_dependency(&text, dev, name, &constraint)
+        .map_err(|message| anyhow!("cannot edit `{}`: {message}", rockspec_path.display()))?;
+    fs::write(&rockspec_path, &edited)
+        .with_context(|| format!("cannot write `{}`", rockspec_path.display()))?;
+
+    let table = if dev {
+        "test_dependencies"
+    } else {
+        "dependencies"
+    };
+    println!("added `{name} {constraint}` to the rockspec {table}");
+
+    // Re-discover so the sync resolves against the edited rockspec.
+    let project = discover(cwd)?;
+    sync(&project, &LockUse::Full, false)
+}
+
+/// The LuaRocks constraint to write for `name`. An explicit `req` becomes
+/// `>= req` (or `== req` for a leading `=`, i.e. `name@=1.2`); no `req` looks
+/// up the rock's latest version on luarocks.org and writes `>= <latest>`. The
+/// rock's existence is verified either way, so an unknown rock errors helpfully
+/// before the file is touched.
+fn registry_constraint(
+    name: &str,
+    version: Option<&str>,
+    luarocks: &LuaRocksProvider,
+) -> anyhow::Result<String> {
+    let available = luarocks
+        .list_versions(&PackageId::registry(name))
+        .map_err(|e| unknown_rock_error(name, &e))?;
+    if available.is_empty() {
+        return Err(unknown_rock_error_plain(name));
     }
+    match version {
+        Some(req) if req.starts_with('=') => {
+            Ok(format!("== {}", req.trim_start_matches('=').trim()))
+        }
+        Some(req) => Ok(format!(">= {}", req.trim())),
+        None => available
+            .into_iter()
+            .max()
+            .map(|latest| format!(">= {latest}"))
+            .ok_or_else(|| unknown_rock_error_plain(name)),
+    }
+}
+
+/// A helpful "unknown rock" error steering the user at `luabox search`, for a
+/// provider error that means the rock is not on luarocks.org (other provider
+/// errors — a broken mirror, say — propagate verbatim).
+fn unknown_rock_error(name: &str, error: &ProviderError) -> anyhow::Error {
+    match error {
+        ProviderError::UnknownPackage { .. } | ProviderError::VersionNotFound { .. } => {
+            unknown_rock_error_plain(name)
+        }
+        other => anyhow!("{other}"),
+    }
+}
+
+fn unknown_rock_error_plain(name: &str) -> anyhow::Error {
+    anyhow!(
+        "no rock named `{name}` on luarocks.org — check the name with `luabox search {name}`"
+    )
+}
+
+/// The error shown when a registry `add` finds no rockspec to edit: a rockspec
+/// is the package manifest, so scaffold one (or drop in the minimal template).
+fn no_rockspec_message(name: &str) -> String {
+    format!(
+        "this project has no `*.rockspec`, so there is nowhere to record the registry \
+         dependency `{name}`. The rockspec is luabox's package manifest (SPEC.md §6). \
+         Run `luabox init` to scaffold one, or add a minimal `<name>-<version>.rockspec` \
+         next to `luabox.toml`:\n\n\
+         package = \"<name>\"\n\
+         version = \"0.1.0-1\"\n\
+         source = {{ url = \"git+https://github.com/OWNER/<name>.git\" }}\n\
+         dependencies = {{\n   \"lua >= 5.1\",\n}}\n\
+         build = {{ type = \"builtin\", modules = {{}} }}"
+    )
+}
+
+/// `luabox remove`: delete a dependency from wherever it is declared — a
+/// registry dep from the rockspec, a `path`/`git` dep from `luabox.toml` — then
+/// re-install so `luabox.lock` and `lua_modules/` drop it.
+pub fn remove(cwd: &Path, package: &str) -> anyhow::Result<()> {
+    let project = discover(cwd)?;
+    let in_rockspec = project
+        .rockspec
+        .as_ref()
+        .is_some_and(|spec| rockspec_declares(spec, package));
+    let in_toml = project.manifest.dependencies.contains_key(package)
+        || project.manifest.dev_dependencies.contains_key(package);
+
+    match (in_rockspec, in_toml) {
+        (true, true) => bail!(
+            "`{package}` is declared as a registry dependency in the rockspec *and* as a \
+             path/git dependency in `luabox.toml` — a package has exactly one source. \
+             Remove the one you did not mean by editing that file directly"
+        ),
+        (true, false) => remove_from_rockspec(cwd, &project, package),
+        (false, true) => remove_from_toml(project, package),
+        (false, false) => bail!(
+            "no dependency named `{package}` in the rockspec or `{}`",
+            project.manifest_path.display()
+        ),
+    }
+}
+
+/// Delete a registry dependency from the rockspec (comment-preserving), then
+/// re-sync against the edited rockspec.
+fn remove_from_rockspec(cwd: &Path, project: &Project, package: &str) -> anyhow::Result<()> {
+    let Some(path) = project.rockspec_path.clone() else {
+        bail!("internal error: the rockspec declares `{package}` but its path is unknown");
+    };
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("cannot read `{}`", path.display()))?;
+    let (edited, _dev) = rockspec_edit::remove_dependency(&text, package)
+        .ok_or_else(|| anyhow!("`{package}` not found in `{}`", path.display()))?;
+    fs::write(&path, &edited).with_context(|| format!("cannot write `{}`", path.display()))?;
+    println!("removed `{package}` from the rockspec");
+
+    let project = discover(cwd)?;
+    sync(&project, &LockUse::Full, false)
+}
+
+/// Delete a `path`/`git` dependency from `luabox.toml` (comment-preserving),
+/// then re-sync.
+fn remove_from_toml(mut project: Project, package: &str) -> anyhow::Result<()> {
+    project.manifest.remove_dependency(package);
     fs::write(&project.manifest_path, project.manifest.to_string())
         .with_context(|| format!("cannot write `{}`", project.manifest_path.display()))?;
     println!("removed `{package}`");
-
     sync(&project, &LockUse::Full, false)
+}
+
+/// Whether the rockspec declares `name` as a (non-`lua`) registry dependency in
+/// either `dependencies` or `test_dependencies`.
+fn rockspec_declares(spec: &Rockspec, name: &str) -> bool {
+    spec.dependencies
+        .iter()
+        .chain(&spec.test_dependencies)
+        .any(|entry| matches!(dependency_from_spec(entry), Ok(Some((n, _))) if n == name))
 }
 
 /// `luabox install`: resolve against the existing lockfile (minimal churn),
@@ -311,6 +460,9 @@ pub(crate) struct Project {
     /// The project's parsed `*.rockspec` (package name/version + registry
     /// deps), when the root has exactly one.
     pub(crate) rockspec: Option<Rockspec>,
+    /// The path of that rockspec, for comment-preserving edits (`luabox
+    /// add`/`remove` on registry deps). `Some` exactly when `rockspec` is.
+    pub(crate) rockspec_path: Option<PathBuf>,
 }
 
 impl Project {
@@ -506,10 +658,15 @@ fn prune_stale_modules(resolution: &Resolution, modules_dir: &Path) -> anyhow::R
 /// resolve without one.
 pub(crate) fn discover(cwd: &Path) -> anyhow::Result<Project> {
     let (root, manifest) = crate::project::discover_required(cwd)?;
-    let rockspec = discover_rockspec(&root)?;
+    let found = discover_rockspec(&root)?;
+    let (rockspec_path, rockspec) = match found {
+        Some((path, spec)) => (Some(path), Some(spec)),
+        None => (None, None),
+    };
     Ok(Project {
         manifest_path: root.join("luabox.toml"),
         rockspec,
+        rockspec_path,
         root,
         manifest,
     })
@@ -518,7 +675,7 @@ pub(crate) fn discover(cwd: &Path) -> anyhow::Result<Project> {
 /// The project's rockspec package manifest: the sole `<root>/*.rockspec`,
 /// parsed statically. `None` when there is none; more than one is an error
 /// (the project's package identity would be ambiguous).
-fn discover_rockspec(root: &Path) -> anyhow::Result<Option<Rockspec>> {
+fn discover_rockspec(root: &Path) -> anyhow::Result<Option<(PathBuf, Rockspec)>> {
     let mut found: Vec<PathBuf> = Vec::new();
     for entry in fs::read_dir(root).with_context(|| format!("reading `{}`", root.display()))? {
         let path = entry?.path();
@@ -532,7 +689,7 @@ fn discover_rockspec(root: &Path) -> anyhow::Result<Option<Rockspec>> {
         [path] => {
             let text = fs::read_to_string(path)
                 .with_context(|| format!("cannot read `{}`", path.display()))?;
-            Ok(Some(rockspec::read(&text)))
+            Ok(Some((path.clone(), rockspec::read(&text))))
         }
         many => {
             let names: Vec<String> = many

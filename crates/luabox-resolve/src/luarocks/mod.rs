@@ -43,6 +43,7 @@
 
 pub mod constraint;
 pub mod rockspec;
+pub mod rockspec_edit;
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;

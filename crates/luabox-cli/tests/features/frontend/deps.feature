@@ -119,7 +119,7 @@ Feature: Dependency management
     Then the command fails
     And stderr contains "rockspec"
 
-  Scenario: add without --path or --git points to the rockspec
+  Scenario: a registry add with no rockspec tells the user to scaffold one
     Given a file "luabox.toml" containing:
       """
       [package]
@@ -130,6 +130,7 @@ Feature: Dependency management
     When I run "luabox add penlight@1.14"
     Then the command fails
     And stderr contains "rockspec"
+    And stderr contains "luabox init"
     And "luabox.toml" does not contain "penlight"
 
   @git

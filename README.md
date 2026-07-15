@@ -171,7 +171,7 @@ anything load-bearing.
 | `lint` | type-informed rules, `---@luabox-ignore`, per-rule `[lint]` levels |
 | `build` | lower `edition → target` (goto, bitops, `<close>`, `_ENV`, …) with tree-shaken polyfills |
 | `bundle` | single-file bundle, `--minify`, `--sourcemap` + `unmap`, `--mode love\|nvim-plugin` |
-| `add` / `remove` / `install` / `update` / `vendor` | PubGrub resolver, `luabox.lock`, CAS store with hard-link installs. Registry deps (luarocks.org) live in the rockspec; `add`/`remove` manage `path`/`git`/`workspace` sources in `luabox.toml`. `update <name>` re-pins a git dep to its repo's latest release tag |
+| `add` / `remove` / `install` / `update` / `vendor` | PubGrub resolver, `luabox.lock`, CAS store with hard-link installs. `add <rock>` / `remove <rock>` edit the rockspec's `dependencies` (`--dev` → `test_dependencies`) comment-preservingly; `--path`/`--git` manage source deps in `luabox.toml`. `update <name>` re-pins a git dep to its repo's latest release tag |
 | `search` / `outdated` | search luarocks.org (the registry) for rocks by name, and report dependencies behind their latest version (registry rocks vs. luarocks.org, git deps vs. their repo's latest GitHub release); `--format json\|text` |
 | `login` / `logout` / `whoami` | sign in to GitHub via the browser (OAuth device flow), storing the token encrypted in the OS keychain; sign out; show the signed-in identity. Authenticates git-source operations (`outdated`/`update` release probing) — registry reads are anonymous. `login`/`whoami` take `--format json\|text` |
 | `run` | `[tasks]` entries or scripts via the resolved runtime |
@@ -232,10 +232,32 @@ release tag.
 ```sh
 luabox search penlight      # rocks on luarocks.org whose name contains "penlight"
 luabox search               # the first 50 rocks by name (the registry is large)
+luabox add penlight         # add the latest penlight to the rockspec + install
+luabox add penlight@1.14    # a lower bound: writes "penlight >= 1.14"
+luabox add busted --dev     # a test-only dep → the rockspec's test_dependencies
+luabox remove penlight      # delete the entry from the rockspec + re-sync
 luabox add cool-lib --git https://github.com/owner/cool-lib --tag v1.2.0
 luabox outdated             # which deps are behind their latest version?
 luabox update cool-lib      # re-pin cool-lib to its repo's latest release tag
 ```
+
+`luabox add <rock>` edits your **rockspec** the way `pnpm add` edits
+`package.json`: it resolves the rock on luarocks.org, splices one entry into the
+`dependencies` table (or `test_dependencies` with `--dev`), and re-installs.
+The edit is surgical — indentation, quote style, comments, and the `lua >= X.Y`
+pin are all preserved, and only the touched line changes:
+
+```diff
+ dependencies = {
+    "lua >= 5.4",
++   "penlight >= 1.14.0",
+ }
+```
+
+An explicit `add penlight@1.14` writes `>= 1.14` (`@=1.14` for an exact `== 1.14`);
+a bare `add penlight` looks up and pins `>= <latest>`. `remove <rock>` deletes
+exactly that entry. A `--path`/`--git` add still edits `luabox.toml`, since those
+source dependencies a rockspec cannot express.
 
 `search` and `outdated` take `--format json|text` (`text` is the default;
 editors pass `json` for a stable contract — `{"results":[…]}` and
