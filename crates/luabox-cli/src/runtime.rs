@@ -20,6 +20,17 @@
 //! resolution — call it with the edition and the project root; it threads the
 //! pin lookup, the `LUABOX_LUA` override, managed toolchains and `PATH` in the
 //! order above. Do not re-implement any leg of it.
+//!
+//! ## Toolchain-first executable resolution (#3)
+//!
+//! nvm-style, `luabox run` also resolves *bare executables* (`lua`,
+//! `luarocks`, …) from the pinned toolchain before the system `PATH` — the
+//! `node_modules/.bin`-first analog. [`pinned_toolchain_dir`] locates the
+//! installed toolchain a project pins; [`find_in_toolchain`] probes its bin
+//! directories (the toolchain root, `bin/`, and the provisioned `luarocks/`
+//! subdir) for a named executable; [`luarocks_bin`] finds the luarocks the
+//! toolchain provisioned (#3, [`toolchain_cmd`](crate::toolchain_cmd)). When a
+//! project pins no toolchain these all return `None` and behavior is unchanged.
 
 use std::path::{Path, PathBuf};
 
@@ -274,6 +285,62 @@ pub fn toolchain_interpreter(dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// The luarocks executable a toolchain provisioned into its `luarocks/`
+/// sub-directory (#3), if present. Searches `<dir>/luarocks/` and
+/// `<dir>/luarocks/bin/` for a `luarocks` binary (`PATHEXT` supplies the
+/// extension on Windows — `.exe` for the real all-in-one build, `.cmd`/`.bat`
+/// for the hermetic test shim). `None` when the toolchain has no luarocks.
+#[must_use]
+pub fn luarocks_bin(toolchain_dir: &Path) -> Option<PathBuf> {
+    let root = toolchain_dir.join("luarocks");
+    let exts = path_exts();
+    for base in [root.clone(), root.join("bin")] {
+        for ext in &exts {
+            let candidate = base.join(format!("luarocks{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// The installed toolchain directory a project pins, or `None` when there is
+/// no pin, no toolchains root, or the pinned toolchain isn't installed. The
+/// seam `luabox run` uses to prepend a pinned toolchain's bin directories to a
+/// child's `PATH` and to resolve bare executables toolchain-first (#3).
+#[must_use]
+pub fn pinned_toolchain_dir(root: &Path) -> Option<PathBuf> {
+    let (id, _) = read_pin(root)?;
+    let dir = toolchains_dir()?.join(id);
+    toolchain_interpreter(&dir).is_some().then_some(dir)
+}
+
+/// The directories inside a toolchain that hold spawnable executables, in
+/// probe order: the toolchain root and its `bin/`, then the provisioned
+/// `luarocks/` and its `bin/`. The basis of both [`find_in_toolchain`] and the
+/// `PATH` prefix `luabox run` injects into its children.
+#[must_use]
+pub fn toolchain_bin_dirs(toolchain_dir: &Path) -> Vec<PathBuf> {
+    let luarocks = toolchain_dir.join("luarocks");
+    vec![
+        toolchain_dir.to_path_buf(),
+        toolchain_dir.join("bin"),
+        luarocks.clone(),
+        luarocks.join("bin"),
+    ]
+}
+
+/// Resolve a bare executable `name` inside a pinned toolchain — the
+/// toolchain-first leg of `luabox run`'s `$PATH` fallback (#3). Probes
+/// [`toolchain_bin_dirs`] with the platform's executable extensions, returning
+/// the first hit. `None` means the toolchain doesn't carry it, so the caller
+/// falls back to the system `PATH` ([`find_on_path`]).
+#[must_use]
+pub fn find_in_toolchain(toolchain_dir: &Path, name: &str) -> Option<PathBuf> {
+    find_in_dirs(name, &toolchain_bin_dirs(toolchain_dir), &path_exts())
+}
+
 /// Read the nearest `luabox-toolchain.toml` walking up from `start`, returning
 /// the pinned toolchain id and the file it came from.
 #[must_use]
@@ -378,9 +445,9 @@ pub fn find_in_dirs(name: &str, dirs: &[PathBuf], exts: &[String]) -> Option<Pat
 #[cfg(test)]
 mod tests {
     use super::{
-        ResolveError, ResolveInputs, candidate_names, find_in_dirs, find_on_path,
-        installed_toolchains, matches_edition, parse_pin, read_pin, resolve_core,
-        toolchain_interpreter,
+        ResolveError, ResolveInputs, candidate_names, find_in_dirs, find_in_toolchain,
+        find_on_path, installed_toolchains, luarocks_bin, matches_edition, parse_pin, read_pin,
+        resolve_core, toolchain_interpreter,
     };
     use std::fs;
     use std::path::Path;
@@ -542,6 +609,38 @@ mod tests {
         fs::write(dir.path().join("bin").join(name), "").unwrap();
         assert!(toolchain_interpreter(dir.path()).is_some());
         assert!(toolchain_interpreter(&dir.path().join("missing")).is_none());
+    }
+
+    #[test]
+    fn luarocks_bin_finds_the_provisioned_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        // No luarocks yet.
+        assert!(luarocks_bin(dir.path()).is_none());
+        // Provision a fake luarocks under `luarocks/`.
+        let lr = dir.path().join("luarocks");
+        fs::create_dir_all(&lr).unwrap();
+        let name = if cfg!(windows) {
+            "luarocks.cmd"
+        } else {
+            "luarocks"
+        };
+        fs::write(lr.join(name), "").unwrap();
+        assert!(luarocks_bin(dir.path()).is_some());
+    }
+
+    #[test]
+    fn find_in_toolchain_probes_root_and_luarocks_subdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = if cfg!(windows) { ".cmd" } else { "" };
+        // `lua` lives at the toolchain root; `luarocks` in the subdir.
+        fs::write(dir.path().join(format!("lua{ext}")), "").unwrap();
+        let lr = dir.path().join("luarocks");
+        fs::create_dir_all(&lr).unwrap();
+        fs::write(lr.join(format!("luarocks{ext}")), "").unwrap();
+
+        assert!(find_in_toolchain(dir.path(), "lua").is_some());
+        assert!(find_in_toolchain(dir.path(), "luarocks").is_some());
+        assert!(find_in_toolchain(dir.path(), "nope").is_none());
     }
 
     #[test]

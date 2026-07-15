@@ -11,13 +11,34 @@
 //!
 //! ## The index
 //!
-//! What is installable is described by a small TOML *index* mapping
-//! `"<id>-<platform>"` to `{ url, sha256 }`. A built-in index
-//! ([`BUILTIN_INDEX`]) ships in the binary with verified Windows entries and is
-//! updated per release; `LUABOX_TOOLCHAIN_INDEX` names an additional index
-//! (a local path, a `file://` URL, or an `http(s)` URL) whose entries override
-//! the built-ins. `url` values may themselves be local paths / `file://` URLs,
-//! which is how the hermetic tests install fixture archives with no network.
+//! What is installable is described by a small TOML *index* with two tables:
+//! `[toolchain]` maps `"<id>-<platform>"` → `{ url, sha256 }` (the interpreter),
+//! and `[luarocks]` maps `"<platform>"` → `{ url, sha256 }` (the matching
+//! luarocks, one per platform). A built-in index ([`BUILTIN_INDEX`]) ships in
+//! the binary with verified Windows entries and is updated per release;
+//! `LUABOX_TOOLCHAIN_INDEX` names an additional index (a local path, a
+//! `file://` URL, or an `http(s)` URL) whose entries override the built-ins.
+//! `url` values may themselves be local paths / `file://` URLs, which is how the
+//! hermetic tests install fixture archives with no network.
+//!
+//! ## luarocks provisioning (#3)
+//!
+//! nvm-style — installing a runtime installs a working luarocks alongside it,
+//! so users get a correctly-configured real luarocks without fighting its
+//! setup (the documented C-rock escape hatch, #6). `luabox toolchain install
+//! <id>` extracts the platform's `[luarocks]` archive into
+//! `<toolchains>/<id>/luarocks/` (verified SHA-256, single wrapper directory
+//! flattened). When the index carries no luarocks entry for the platform the
+//! install still succeeds with a warning — the interpreter alone is installed.
+//!
+//! The pinned pair is *wired together at spawn time* by [`run`](crate::run_cmd),
+//! not baked at install: `luabox run` prepends the toolchain's bin directories
+//! (interpreter dir + `luarocks/`) to a child's `PATH` and points
+//! `LUAROCKS_CONFIG` at a generated config selecting the toolchain interpreter
+//! and a project-local `lua_modules` tree. Environment injection is the
+//! portable mechanism luarocks honors on every platform (no per-install config
+//! rewriting, no absolute paths frozen into the toolchain). See
+//! [`run_cmd`](crate::run_cmd) for the config the generator emits.
 //!
 //! ## Extraction
 //!
@@ -32,7 +53,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use crate::runtime::{
-    PIN_FILE, installed_toolchains, read_pin, toolchain_interpreter, toolchains_dir,
+    PIN_FILE, installed_toolchains, luarocks_bin, read_pin, toolchain_interpreter, toolchains_dir,
 };
 
 /// The index shipped in the binary. Updated per release (see the file header).
@@ -44,9 +65,12 @@ struct IndexEntry {
     sha256: String,
 }
 
-/// A parsed toolchain index: `"<id>-<platform>"` → [`IndexEntry`].
+/// A parsed toolchain index: `[toolchain]` keyed by `"<id>-<platform>"` (the
+/// interpreter), and `[luarocks]` keyed by `"<platform>"` (the luarocks
+/// provisioned alongside it, #3).
 struct Index {
     entries: BTreeMap<String, IndexEntry>,
+    luarocks: BTreeMap<String, IndexEntry>,
 }
 
 impl Index {
@@ -54,34 +78,47 @@ impl Index {
     fn parse(text: &str) -> Result<Self> {
         let doc: toml_edit::DocumentMut =
             text.parse().context("toolchain index is not valid TOML")?;
-        let mut entries = BTreeMap::new();
-        if let Some(item) = doc.get("toolchain") {
-            let table = item
-                .as_table_like()
-                .ok_or_else(|| anyhow!("`toolchain` must be a table of entries"))?;
-            for (key, value) in table.iter() {
-                let entry = value
-                    .as_table_like()
-                    .ok_or_else(|| anyhow!("index entry `{key}` must be a table"))?;
-                let url = entry
-                    .get("url")
-                    .and_then(|i| i.as_str())
-                    .ok_or_else(|| anyhow!("index entry `{key}` is missing a string `url`"))?;
-                let sha256 = entry
-                    .get("sha256")
-                    .and_then(|i| i.as_str())
-                    .ok_or_else(|| anyhow!("index entry `{key}` is missing a string `sha256`"))?;
-                entries.insert(
-                    key.to_string(),
-                    IndexEntry {
-                        url: url.to_string(),
-                        sha256: sha256.to_string(),
-                    },
-                );
-            }
-        }
-        Ok(Self { entries })
+        Ok(Self {
+            entries: parse_entry_table(&doc, "toolchain")?,
+            luarocks: parse_entry_table(&doc, "luarocks")?,
+        })
     }
+}
+
+/// Parse one `{ url, sha256 }` entry table (`[toolchain]` or `[luarocks]`)
+/// from the index document; an absent table is an empty map.
+fn parse_entry_table(
+    doc: &toml_edit::DocumentMut,
+    name: &str,
+) -> Result<BTreeMap<String, IndexEntry>> {
+    let mut entries = BTreeMap::new();
+    let Some(item) = doc.get(name) else {
+        return Ok(entries);
+    };
+    let table = item
+        .as_table_like()
+        .ok_or_else(|| anyhow!("`{name}` must be a table of entries"))?;
+    for (key, value) in table.iter() {
+        let entry = value
+            .as_table_like()
+            .ok_or_else(|| anyhow!("index entry `{key}` must be a table"))?;
+        let url = entry
+            .get("url")
+            .and_then(|i| i.as_str())
+            .ok_or_else(|| anyhow!("index entry `{key}` is missing a string `url`"))?;
+        let sha256 = entry
+            .get("sha256")
+            .and_then(|i| i.as_str())
+            .ok_or_else(|| anyhow!("index entry `{key}` is missing a string `sha256`"))?;
+        entries.insert(
+            key.to_string(),
+            IndexEntry {
+                url: url.to_string(),
+                sha256: sha256.to_string(),
+            },
+        );
+    }
+    Ok(entries)
 }
 
 /// The current platform id used to key the index: `"<os>-<arch>"`.
@@ -109,6 +146,7 @@ fn load_index() -> Result<Index> {
         let extra =
             Index::parse(&text).with_context(|| format!("toolchain index `{src}` is malformed"))?;
         index.entries.extend(extra.entries);
+        index.luarocks.extend(extra.luarocks);
     }
     Ok(index)
 }
@@ -255,6 +293,79 @@ fn install_into(dir: &Path, index: &Index, id: &str, platform: &str) -> Result<P
     Ok(dest)
 }
 
+/// Provision luarocks (#3) into `<dest>/luarocks/` from `index`'s `[luarocks]`
+/// entry for `platform`, verifying its SHA-256 and flattening the single
+/// wrapper directory the archive commonly extracts into (the Windows all-in-one
+/// zip wraps in `luarocks-<ver>-windows-64/`). Returns `Ok(true)` when luarocks
+/// was installed (or already present), `Ok(false)` when the index has no entry
+/// for the platform — a warn-not-fail condition the caller reports.
+fn install_luarocks_into(dest: &Path, index: &Index, platform: &str) -> Result<bool> {
+    if luarocks_bin(dest).is_some() {
+        return Ok(true); // already provisioned — idempotent
+    }
+    let Some(entry) = index.luarocks.get(platform) else {
+        return Ok(false);
+    };
+
+    let download = tempfile::tempdir().context("cannot create a temp dir for the luarocks download")?;
+    let archive = obtain(&entry.url, download.path())
+        .with_context(|| format!("cannot fetch luarocks for `{platform}` from `{}`", entry.url))?;
+
+    let digest = luabox_store::hash_file(&archive)
+        .with_context(|| format!("cannot hash `{}`", archive.display()))?;
+    if !digest.eq_ignore_ascii_case(&entry.sha256) {
+        bail!(
+            "checksum mismatch for luarocks (`{platform}`): expected {}, got {digest}. \
+             Refusing to install a corrupt or tampered archive",
+            entry.sha256
+        );
+    }
+
+    // Extract into a hidden staging dir *under `dest`* (same volume as the
+    // final `luarocks/`, so the rename is atomic), then flatten & swap it in.
+    let staging = dest.join(".luarocks.staging");
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging).ok();
+    }
+    std::fs::create_dir_all(&staging)
+        .with_context(|| format!("cannot create staging dir `{}`", staging.display()))?;
+    extract(&archive, &staging)?;
+
+    let payload = flatten_single_subdir(&staging);
+    let lr_dir = dest.join("luarocks");
+    if lr_dir.exists() {
+        std::fs::remove_dir_all(&lr_dir).ok();
+    }
+    std::fs::rename(&payload, &lr_dir)
+        .with_context(|| format!("cannot move luarocks into `{}`", lr_dir.display()))?;
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging).ok();
+    }
+
+    if luarocks_bin(dest).is_none() {
+        std::fs::remove_dir_all(&lr_dir).ok();
+        bail!("luarocks archive for `{platform}` contained no `luarocks` executable");
+    }
+    Ok(true)
+}
+
+/// The sole sub-directory of `dir` when it holds exactly one entry and that
+/// entry is a directory (the common single-wrapper archive layout), else `dir`
+/// itself. Lets [`install_luarocks_into`] hoist `luarocks.exe` out of the
+/// Windows zip's `luarocks-<ver>-windows-64/` wrapper.
+fn flatten_single_subdir(dir: &Path) -> PathBuf {
+    let Ok(mut entries) = std::fs::read_dir(dir).map(Iterator::flatten) else {
+        return dir.to_path_buf();
+    };
+    let Some(first) = entries.next().map(|e| e.path()) else {
+        return dir.to_path_buf();
+    };
+    if entries.next().is_some() || !first.is_dir() {
+        return dir.to_path_buf();
+    }
+    first
+}
+
 /// The managed-toolchains root, or a clear error if no home can be located.
 fn require_toolchains_dir() -> Result<PathBuf> {
     toolchains_dir().ok_or_else(|| {
@@ -264,20 +375,31 @@ fn require_toolchains_dir() -> Result<PathBuf> {
     })
 }
 
-/// `luabox toolchain install <id>`.
+/// `luabox toolchain install <id>` — install the interpreter and, nvm-style,
+/// provision a matching luarocks alongside it (#3).
 pub fn install(_cwd: &Path, id: &str) -> Result<()> {
     let dir = require_toolchains_dir()?;
-    let dest = dir.join(id);
-    if toolchain_interpreter(&dest).is_some() {
-        println!(
-            "toolchain `{id}` is already installed at {}",
-            dest.display()
-        );
-        return Ok(());
-    }
+    let platform = current_platform();
+    let already = toolchain_interpreter(&dir.join(id)).is_some();
+
     let index = load_index()?;
-    let dest = install_into(&dir, &index, id, &current_platform())?;
-    println!("installed toolchain `{id}` to {}", dest.display());
+    let dest = install_into(&dir, &index, id, &platform)?;
+    if already {
+        println!("toolchain `{id}` is already installed at {}", dest.display());
+    } else {
+        println!("installed toolchain `{id}` to {}", dest.display());
+    }
+
+    // Provision (or back-fill) luarocks. Absence of an index entry is a
+    // warning, never a failure: the interpreter alone is a usable toolchain.
+    if install_luarocks_into(&dest, &index, &platform)? {
+        println!("  luarocks provisioned at {}", dest.join("luarocks").display());
+    } else {
+        eprintln!(
+            "warning: toolchain `{id}` installed without luarocks; \
+             no index entry for `{platform}`"
+        );
+    }
     Ok(())
 }
 
@@ -330,8 +452,8 @@ pub fn list(cwd: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Index, current_platform, install_into};
-    use crate::runtime::toolchain_interpreter;
+    use super::{Index, current_platform, install_into, install_luarocks_into};
+    use crate::runtime::{luarocks_bin, toolchain_interpreter};
     use std::path::Path;
     use std::process::Command;
 
@@ -342,16 +464,39 @@ mod tests {
         let src = tempfile::tempdir().unwrap();
         let name = if cfg!(windows) { "lua.cmd" } else { "lua" };
         std::fs::write(src.path().join(name), "@echo off\r\n").unwrap();
+        tar_czf(archive, src.path(), name);
+        luabox_store::hash_file(archive).unwrap()
+    }
+
+    /// Build a `.tar.gz` luarocks fixture at `archive`: a fake `luarocks` shim
+    /// nested inside a single wrapper directory (mirroring the real Windows
+    /// all-in-one zip's `luarocks-<ver>-windows-64/` layout), so the install
+    /// path exercises wrapper flattening. Returns its SHA-256.
+    fn make_luarocks_fixture(archive: &Path) -> String {
+        let src = tempfile::tempdir().unwrap();
+        let wrapper = src.path().join("luarocks-x-wrapper");
+        std::fs::create_dir_all(&wrapper).unwrap();
+        let name = if cfg!(windows) {
+            "luarocks.cmd"
+        } else {
+            "luarocks"
+        };
+        std::fs::write(wrapper.join(name), "@echo off\r\n").unwrap();
+        tar_czf(archive, src.path(), "luarocks-x-wrapper");
+        luabox_store::hash_file(archive).unwrap()
+    }
+
+    /// `tar -czf <archive> -C <root> <member>`.
+    fn tar_czf(archive: &Path, root: &Path, member: &str) {
         let status = Command::new("tar")
             .arg("-czf")
             .arg(archive)
             .arg("-C")
-            .arg(src.path())
-            .arg(name)
+            .arg(root)
+            .arg(member)
             .status()
             .expect("tar must be available to build the fixture");
         assert!(status.success(), "tar failed to build the fixture archive");
-        luabox_store::hash_file(archive).unwrap()
     }
 
     /// A one-entry index whose `url` is the local fixture archive.
@@ -360,6 +505,25 @@ mod tests {
         let toml = format!(
             "[toolchain.\"{key}\"]\nurl = \"{}\"\nsha256 = \"{sha256}\"\n",
             archive.display().to_string().replace('\\', "/")
+        );
+        Index::parse(&toml).unwrap()
+    }
+
+    /// An index carrying both a toolchain and a luarocks fixture for this
+    /// platform (luarocks keyed by bare platform).
+    fn index_with_luarocks(
+        id: &str,
+        tc_archive: &Path,
+        tc_sha: &str,
+        lr_archive: &Path,
+        lr_sha: &str,
+    ) -> Index {
+        let platform = current_platform();
+        let toml = format!(
+            "[toolchain.\"{id}-{platform}\"]\nurl = \"{}\"\nsha256 = \"{tc_sha}\"\n\
+             [luarocks.\"{platform}\"]\nurl = \"{}\"\nsha256 = \"{lr_sha}\"\n",
+            tc_archive.display().to_string().replace('\\', "/"),
+            lr_archive.display().to_string().replace('\\', "/"),
         );
         Index::parse(&toml).unwrap()
     }
@@ -404,5 +568,59 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = install_into(dir.path(), &index, "5.4", &current_platform()).unwrap_err();
         assert!(err.to_string().contains("no toolchain `5.4`"), "{err}");
+    }
+
+    #[test]
+    fn install_provisions_luarocks_flattening_the_wrapper() {
+        let root = tempfile::tempdir().unwrap();
+        let tc = root.path().join("lua.tar.gz");
+        let tc_sha = make_fixture(&tc);
+        let lr = root.path().join("luarocks.tar.gz");
+        let lr_sha = make_luarocks_fixture(&lr);
+        let index = index_with_luarocks("5.4", &tc, &tc_sha, &lr, &lr_sha);
+
+        let dir = root.path().join("toolchains");
+        let dest = install_into(&dir, &index, "5.4", &current_platform()).unwrap();
+
+        // luarocks not there until provisioned...
+        assert!(luarocks_bin(&dest).is_none());
+        assert!(install_luarocks_into(&dest, &index, &current_platform()).unwrap());
+        // ...and the wrapper dir was flattened so `luarocks/luarocks` resolves.
+        assert!(luarocks_bin(&dest).is_some());
+
+        // Idempotent: a second call is a no-op that still reports success.
+        assert!(install_luarocks_into(&dest, &index, &current_platform()).unwrap());
+    }
+
+    #[test]
+    fn luarocks_absent_from_index_is_warn_not_fail() {
+        let root = tempfile::tempdir().unwrap();
+        let tc = root.path().join("lua.tar.gz");
+        let tc_sha = make_fixture(&tc);
+        // Index has the interpreter but no [luarocks] entry.
+        let index = index_for("5.4", &tc, &tc_sha);
+
+        let dir = root.path().join("toolchains");
+        let dest = install_into(&dir, &index, "5.4", &current_platform()).unwrap();
+        // Not a failure — returns false, installs nothing.
+        assert!(!install_luarocks_into(&dest, &index, &current_platform()).unwrap());
+        assert!(luarocks_bin(&dest).is_none());
+    }
+
+    #[test]
+    fn corrupt_luarocks_checksum_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let tc = root.path().join("lua.tar.gz");
+        let tc_sha = make_fixture(&tc);
+        let lr = root.path().join("luarocks.tar.gz");
+        make_luarocks_fixture(&lr);
+        let bad = "0".repeat(64);
+        let index = index_with_luarocks("5.4", &tc, &tc_sha, &lr, &bad);
+
+        let dir = root.path().join("toolchains");
+        let dest = install_into(&dir, &index, "5.4", &current_platform()).unwrap();
+        let err = install_luarocks_into(&dest, &index, &current_platform()).unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+        assert!(luarocks_bin(&dest).is_none());
     }
 }

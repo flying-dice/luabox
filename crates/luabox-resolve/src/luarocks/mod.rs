@@ -669,7 +669,9 @@ fn classify(rock: &str, version: &str, spec: &Rockspec) -> Result<(), ProviderEr
             message: format!(
                 "luarocks rock `{rock}` {version} is a C/native module ({why}); \
                  luabox does not build C modules — only pure-Lua rocks are supported \
-                 by the luarocks bridge (SPEC.md §6)"
+                 by the luarocks bridge (SPEC.md §6). Native rocks are phase 2 (#6); \
+                 in the meantime install it with the toolchain's own luarocks: \
+                 `luabox run luarocks -- install {rock}`"
             ),
         })
     };
@@ -1052,6 +1054,11 @@ mod tests {
         assert!(text.contains("luasocket"), "{text}");
         assert!(text.contains("C/native module"), "{text}");
         assert!(text.contains("make"), "{text}");
+        // The escape hatch points at the toolchain's own luarocks (#3, #6).
+        assert!(
+            text.contains("luabox run luarocks -- install luasocket"),
+            "{text}"
+        );
     }
 
     #[test]

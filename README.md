@@ -6,7 +6,10 @@ workflow Rust developers expect — `check`, `lint`, `fmt`, `run`,
 [LuaCATS](https://luals.github.io/wiki/annotations/) annotations (the
 lua-language-server dialect) but *verifies* what luals only trusts:
 `---@class` conformance, `---@generic` generics, and types shared across
-modules and packages. Works with Lua 5.1–5.4 and LuaJIT. **Not a runtime.**
+modules and packages. Works with Lua 5.1–5.4 and LuaJIT. It **acquires** Lua
+runtimes — nvm/rustup for Lua: `luabox toolchain` installs and pins
+interpreters (and a matching luarocks) that `run` spawns. It is never a runtime
+itself. **Not a runtime.**
 
 ## Quickstart
 
@@ -73,8 +76,12 @@ lint: 0 errors, 0 warnings in 1 files
 ```
 
 That is the whole loop — one binary for check, run, format, and lint, no build
-config. `run` executes on a Lua runtime found on `PATH` or installed via
-`luabox toolchain`. See [`examples/`](examples/) for larger, real projects —
+config. `run` executes on the runtime the project pins via `luabox toolchain`,
+falling back to a Lua on `PATH`. When a toolchain is pinned, `run` also resolves
+bare executables — `lua`, `luarocks` — from the toolchain first, so
+`luabox run luarocks -- install <rock>` reaches the toolchain's own luarocks
+(the `node_modules/.bin`-first model). See [`examples/`](examples/) for larger,
+real projects —
 a LÖVE game, a multi-package workspace, and a 5.4-to-5.1 cross-version lowering
 demo.
 
@@ -175,8 +182,8 @@ anything load-bearing.
 | `publish` | upload the authored rockspec to luarocks.org (`--dry-run` to preview). Gates on a valid canonically-named rockspec, a green `check`, and pure-Lua-only; needs an API key (`login --luarocks`) |
 | `search` / `outdated` | search luarocks.org (the registry) for rocks by name, and report dependencies behind their latest version (registry rocks vs. luarocks.org, git deps vs. their repo's latest GitHub release); `--format json\|text` |
 | `login` / `logout` / `whoami` | sign in to GitHub via the browser (OAuth device flow), storing the token encrypted in the OS keychain; sign out; show the signed-in identity. Authenticates git-source operations (`outdated`/`update` release probing) — registry reads are anonymous. `login --luarocks` stores a luarocks.org API key for `publish`. `login`/`whoami` take `--format json\|text` |
-| `run` | `[tasks]` entries or scripts via the resolved runtime |
-| `toolchain` | install/pin/list managed Lua runtimes |
+| `run` | `[tasks]` entries or scripts via the pinned runtime. Bare executables (and `[tasks]` shells) resolve from the pinned toolchain's bin dirs — including its provisioned luarocks — before the system `$PATH` (npm-run/`node_modules/.bin` semantics); the `$PATH` fallback is kept with that purpose. `run luarocks -- install <rock>` is the C-rock escape hatch |
+| `toolchain` | acquire managed Lua runtimes (nvm for Lua): install/pin/list. `install <id>` provisions a matching luarocks alongside the interpreter, wired to it and a project-local `lua_modules` tree |
 | `upgrade` | self-update from GitHub releases (`luabox upgrade` for latest, or a specific `v0.1.1`), checksum-verified |
 | `lsp` | language server: diagnostics + quick-fixes, completion (auto-require), hover, goto def/type/impl, references, rename, symbols, signature help, call hierarchy, inlay hints, semantic tokens, formatting |
 | `doc` | static docs from annotations |

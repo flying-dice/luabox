@@ -16,15 +16,35 @@
 //!    A bare script with no manifest in scope is fine — only tasks require
 //!    one (an empty `[tasks]` table just means step 1 never matches).
 //! 3. **`$PATH` fallback** — else `script` is probed as a bare executable
-//!    name on `PATH` and, if found, run directly with `args` as its argv
-//!    (no shell). If none of the three resolve, the error lists the
-//!    project's available task names so a typo is obvious.
+//!    name. This fallback is **kept with a purpose** (#3): it is not a worse
+//!    `foo`, it is `npm run` resolving `node_modules/.bin` first. When the
+//!    project pins a toolchain, its bin directories (the toolchain root and the
+//!    provisioned `luarocks/`) are probed **before** the system `PATH`, so
+//!    `luabox run luarocks -- install <rock>` hits the pinned, correctly-wired
+//!    luarocks rather than whatever is on the system. The resolved executable
+//!    is run directly with `args` as its argv (no shell). If none of the three
+//!    resolve, the error lists the project's available task names.
 //!
 //! Extra `args` (everything after `script` on the command line) pass
 //! through in all three cases. For a task, they're appended — shell-quoted
 //! — to *every* command the task runs (documented behavior: a task is one
 //! named unit of work, so args apply to the whole unit, not just its last
 //! step).
+//!
+//! ## Pinned-toolchain environment (#3)
+//!
+//! nvm-style, **every** child `luabox run` spawns — task shells, scripts, and
+//! `$PATH` executables — inherits the pinned toolchain's wiring:
+//!
+//! - **`PATH`** is prefixed with the toolchain's bin directories, so a
+//!   `[tasks]` entry invoking bare `lua`/`luarocks` hits the pinned pair.
+//! - **`LUAROCKS_CONFIG`** points at a generated config selecting the toolchain
+//!   interpreter and a project-local `lua_modules` rock tree — environment
+//!   injection is the portable mechanism luarocks honors everywhere (see
+//!   [`write_luarocks_config`]). Generated only when the toolchain provisioned
+//!   luarocks; regenerated per `run` invocation, never frozen into the install.
+//!
+//! With no pin in scope this wiring is empty and behavior is unchanged.
 //!
 //! ## Shell handling
 //!
@@ -60,7 +80,10 @@ use std::process::{Command, ExitStatus};
 use anyhow::{Context, bail};
 use luabox_resolve::manifest::TaskValue;
 
-use crate::runtime::{RuntimeSpec, find_on_path, resolve_default};
+use crate::runtime::{
+    self, RuntimeSpec, find_on_path, luarocks_bin, resolve_default, toolchain_bin_dirs,
+    toolchain_interpreter,
+};
 
 /// Nesting cap for `LUABOX_RUN_DEPTH` (see the module doc's "Recursion
 /// guard" section). 32 is generous for any legitimate task graph while
@@ -79,15 +102,20 @@ pub fn run(cwd: &Path, script: &str, args: &[String]) -> anyhow::Result<()> {
     let project = discover(cwd)?;
     let resolution = resolve(&project.tasks, cwd, script, Path::is_file);
 
+    // The pinned toolchain (if any) drives both bare-executable resolution and
+    // the environment every spawned child inherits — nvm-style (#3).
+    let pinned = runtime::pinned_toolchain_dir(&project.root);
+    let env = ToolchainEnv::for_toolchain(pinned.as_deref(), &project.root);
+
     let outcome = match resolution {
-        Resolution::Task(task) => run_task(cwd, task, args, child_depth)?,
+        Resolution::Task(task) => run_task(cwd, task, args, child_depth, &env)?,
         Resolution::Script(path) => {
             let runtime = resolve_default(&project.edition, &project.root)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            run_script(cwd, &runtime, &path, args, child_depth)?
+            run_script(cwd, &runtime, &path, args, child_depth, &env)?
         }
-        Resolution::PathExecutable => match find_on_path(script) {
-            Some(resolved) => run_path_executable(cwd, &resolved, args, child_depth)?,
+        Resolution::PathExecutable => match resolve_executable(pinned.as_deref(), script) {
+            Some(resolved) => run_path_executable(cwd, &resolved, args, child_depth, &env)?,
             None => return Err(unknown_name_error(script, &project.tasks)),
         },
     };
@@ -136,6 +164,15 @@ fn resolve<'a>(
     Resolution::PathExecutable
 }
 
+/// Resolve a bare executable `name` for the `$PATH` fallback, toolchain-first
+/// (#3): a pinned toolchain's bin directories are probed before the system
+/// `PATH` (the `node_modules/.bin`-first analog). `None` when nothing matches.
+fn resolve_executable(pinned: Option<&Path>, name: &str) -> Option<PathBuf> {
+    pinned
+        .and_then(|dir| runtime::find_in_toolchain(dir, name))
+        .or_else(|| find_on_path(name))
+}
+
 /// `name` resolved against `cwd` (absolute paths pass through untouched).
 fn resolve_script_path(cwd: &Path, name: &str) -> PathBuf {
     let as_path = Path::new(name);
@@ -165,6 +202,98 @@ impl From<ExitStatus> for RunOutcome {
     }
 }
 
+/// The pinned toolchain's contribution to a spawned child's environment (#3):
+/// a `PATH` prefix of the toolchain's bin directories, and a generated
+/// `LUAROCKS_CONFIG` wiring luarocks to the toolchain interpreter and a
+/// project-local tree. Empty (a no-op) when no toolchain is pinned.
+#[derive(Default)]
+struct ToolchainEnv {
+    /// Directories prepended to the child's `PATH`, highest priority first.
+    path_prefix: Vec<PathBuf>,
+    /// Path to the generated `LUAROCKS_CONFIG`, if luarocks was provisioned.
+    luarocks_config: Option<PathBuf>,
+    /// Keeps the generated config file alive for the child's lifetime; dropped
+    /// (and cleaned up) when this `ToolchainEnv` goes out of scope.
+    _config_dir: Option<tempfile::TempDir>,
+}
+
+impl ToolchainEnv {
+    /// Build the environment for `toolchain_dir` (the pinned, installed
+    /// toolchain), rooted at the project `root` for the luarocks tree. `None`
+    /// yields an empty, do-nothing environment.
+    fn for_toolchain(toolchain_dir: Option<&Path>, root: &Path) -> Self {
+        let Some(dir) = toolchain_dir else {
+            return Self::default();
+        };
+        let path_prefix = toolchain_bin_dirs(dir)
+            .into_iter()
+            .filter(|d| d.is_dir())
+            .collect();
+        let (luarocks_config, config_dir) = match write_luarocks_config(dir, root) {
+            Some((path, guard)) => (Some(path), Some(guard)),
+            None => (None, None),
+        };
+        Self {
+            path_prefix,
+            luarocks_config,
+            _config_dir: config_dir,
+        }
+    }
+
+    /// Apply this environment to a command about to be spawned: prepend the
+    /// toolchain bin directories to `PATH` and set `LUAROCKS_CONFIG`.
+    fn apply(&self, cmd: &mut Command) {
+        if !self.path_prefix.is_empty() {
+            let existing = std::env::var_os("PATH").unwrap_or_default();
+            let mut dirs = self.path_prefix.clone();
+            dirs.extend(std::env::split_paths(&existing));
+            if let Ok(joined) = std::env::join_paths(dirs) {
+                cmd.env("PATH", joined);
+            }
+        }
+        if let Some(config) = &self.luarocks_config {
+            cmd.env("LUAROCKS_CONFIG", config);
+        }
+    }
+}
+
+/// Generate a `LUAROCKS_CONFIG` file wiring the toolchain's luarocks to its own
+/// interpreter and a project-local `lua_modules` tree, returning the file path
+/// and the temp dir that owns it. Returns `None` when the toolchain provisioned
+/// no luarocks (nothing to configure) or the file can't be written.
+///
+/// luarocks reads the Lua file named by `LUAROCKS_CONFIG` and honors
+/// `lua_interpreter` / `variables.LUA_*` (which interpreter to build rocks for)
+/// and `rocks_trees` (where rocks land — here a single project-local tree, the
+/// `--tree lua_modules` semantics). Paths are emitted with forward slashes so
+/// the Lua string literals need no escaping on Windows.
+fn write_luarocks_config(toolchain_dir: &Path, root: &Path) -> Option<(PathBuf, tempfile::TempDir)> {
+    let interp = toolchain_interpreter(toolchain_dir)?;
+    luarocks_bin(toolchain_dir)?; // only wire a config when luarocks exists
+    let bindir = interp.parent().unwrap_or(toolchain_dir);
+    let slashed = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    let tree = slashed(&root.join("lua_modules"));
+    let contents = format!(
+        "-- Generated by `luabox run` for the pinned toolchain (#3). Do not edit.\n\
+         lua_interpreter = \"{interp_name}\"\n\
+         variables = {{\n\
+         \x20   LUA_DIR = \"{bindir}\",\n\
+         \x20   LUA_BINDIR = \"{bindir}\",\n\
+         }}\n\
+         rocks_trees = {{\n\
+         \x20   {{ name = \"project\", root = \"{tree}\" }},\n\
+         }}\n",
+        interp_name = interp
+            .file_name()
+            .map_or_else(|| "lua".into(), |n| n.to_string_lossy()),
+        bindir = slashed(bindir),
+    );
+    let dir = tempfile::tempdir().ok()?;
+    let path = dir.path().join("luarocks-config.lua");
+    std::fs::write(&path, contents).ok()?;
+    Some((path, dir))
+}
+
 /// Run a resolved `[tasks]` entry: one command, or a sequence that stops at
 /// the first non-zero exit.
 fn run_task(
@@ -172,12 +301,13 @@ fn run_task(
     task: &TaskValue,
     args: &[String],
     run_depth: u32,
+    env: &ToolchainEnv,
 ) -> anyhow::Result<RunOutcome> {
     match task {
-        TaskValue::Single(command) => run_shell_command(cwd, command, args, run_depth),
+        TaskValue::Single(command) => run_shell_command(cwd, command, args, run_depth, env),
         TaskValue::Multiple(commands) => {
             for command in commands {
-                let outcome = run_shell_command(cwd, command, args, run_depth)?;
+                let outcome = run_shell_command(cwd, command, args, run_depth, env)?;
                 if matches!(outcome, RunOutcome::Failed(_)) {
                     return Ok(outcome);
                 }
@@ -195,6 +325,7 @@ fn run_shell_command(
     command: &str,
     args: &[String],
     run_depth: u32,
+    env: &ToolchainEnv,
 ) -> anyhow::Result<RunOutcome> {
     let full_command = if args.is_empty() {
         command.to_string()
@@ -212,9 +343,10 @@ fn run_shell_command(
         cmd.arg("-c").arg(&full_command);
         cmd
     };
+    cmd.current_dir(cwd)
+        .env("LUABOX_RUN_DEPTH", run_depth.to_string());
+    env.apply(&mut cmd);
     let status = cmd
-        .current_dir(cwd)
-        .env("LUABOX_RUN_DEPTH", run_depth.to_string())
         .status()
         .with_context(|| format!("failed to spawn a shell for task command `{command}`"))?;
     Ok(status.into())
@@ -242,13 +374,16 @@ fn run_script(
     script: &Path,
     args: &[String],
     run_depth: u32,
+    env: &ToolchainEnv,
 ) -> anyhow::Result<RunOutcome> {
-    let status = Command::new(&runtime.program)
-        .args(&runtime.args)
+    let mut cmd = Command::new(&runtime.program);
+    cmd.args(&runtime.args)
         .arg(script)
         .args(args)
         .current_dir(cwd)
-        .env("LUABOX_RUN_DEPTH", run_depth.to_string())
+        .env("LUABOX_RUN_DEPTH", run_depth.to_string());
+    env.apply(&mut cmd);
+    let status = cmd
         .status()
         .with_context(|| {
             format!(
@@ -267,11 +402,14 @@ fn run_path_executable(
     resolved: &Path,
     args: &[String],
     run_depth: u32,
+    env: &ToolchainEnv,
 ) -> anyhow::Result<RunOutcome> {
-    let status = Command::new(resolved)
-        .args(args)
+    let mut cmd = Command::new(resolved);
+    cmd.args(args)
         .current_dir(cwd)
-        .env("LUABOX_RUN_DEPTH", run_depth.to_string())
+        .env("LUABOX_RUN_DEPTH", run_depth.to_string());
+    env.apply(&mut cmd);
+    let status = cmd
         .status()
         .with_context(|| format!("failed to spawn `{}`", resolved.display()))?;
     Ok(status.into())
@@ -341,7 +479,8 @@ fn discover(cwd: &Path) -> anyhow::Result<Project> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Resolution, TaskValue, next_run_depth, quote_for_shell, resolve, resolve_script_path,
+        Resolution, TaskValue, next_run_depth, quote_for_shell, resolve, resolve_executable,
+        resolve_script_path,
     };
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
@@ -422,6 +561,29 @@ mod tests {
     #[test]
     fn a_garbage_depth_value_is_treated_as_the_start() {
         assert_eq!(next_run_depth(Some("not-a-number")).unwrap(), 1);
+    }
+
+    #[test]
+    fn resolve_executable_prefers_the_pinned_toolchain() {
+        // A pinned toolchain that carries `luarocks` in its `luarocks/` subdir
+        // resolves it there — never consulting the system PATH (#3).
+        let dir = tempfile::tempdir().unwrap();
+        let lr = dir.path().join("luarocks");
+        std::fs::create_dir_all(&lr).unwrap();
+        let name = if cfg!(windows) {
+            "luarocks.cmd"
+        } else {
+            "luarocks"
+        };
+        let shim = lr.join(name);
+        std::fs::write(&shim, "").unwrap();
+
+        let hit = resolve_executable(Some(dir.path()), "luarocks");
+        assert_eq!(hit.as_deref(), Some(shim.as_path()));
+
+        // A name the toolchain doesn't carry falls through to the PATH probe;
+        // a name that cannot exist anywhere yields None.
+        assert!(resolve_executable(Some(dir.path()), "luabox-zzz-no-such-exe").is_none());
     }
 
     #[test]

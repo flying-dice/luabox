@@ -183,10 +183,11 @@ luabox follows the pnpm/bun model: **[luarocks.org](https://luarocks.org) is the
 - Watch, filtering.
 - `luabox bench`: criterion-style statistical benchmarking across runtimes.
 
-## 12. Toolchain manager (rustup analog)
+## 12. Toolchain manager (nvm/rustup analog)
 
-- `luabox toolchain install 5.4.6` / `luajit-2.1` — prebuilt runtimes into `~/.luabox/toolchains`.
-- Manifest pins runtime for `luabox run`; `luabox-toolchain.toml` override. An acquirer of runtimes, never a runtime.
+- `luabox toolchain install 5.4.6` / `luajit-2.1` — prebuilt runtimes into `~/.luabox/toolchains`. **An acquirer of runtimes, never a runtime.**
+- nvm-style, `install` also provisions a matching **luarocks** alongside the interpreter (verified SHA-256), so installing a runtime yields a working luarocks — the documented C-rock escape hatch (§6, #6): `luabox run luarocks -- install <rock>`.
+- `luabox-toolchain.toml` pins the project runtime for `luabox run`. When pinned, `run` prepends the toolchain's bin dirs to a child's `PATH` and resolves bare executables (`lua`, `luarocks`) toolchain-first — before `$PATH` — with `LUAROCKS_CONFIG` wiring luarocks to the toolchain interpreter and a project-local `lua_modules` tree (npm-run/`node_modules/.bin` semantics). The bare-`$PATH` fallback is **kept with that purpose**.
 
 ## 13. Docs
 

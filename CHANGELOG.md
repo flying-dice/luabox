@@ -10,6 +10,24 @@ spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
 
 ### Added
 
+- **Toolchain and `run`, reframed as the nvm-style model**
+  ([#3](https://github.com/flying-dice/luabox/issues/3)) — luabox is a toolchain
+  and package manager that **acquires** Lua runtimes (nvm/rustup for Lua), never
+  is one. `luabox toolchain install <id>` now also **provisions a matching
+  luarocks** alongside the interpreter (verified SHA-256, into
+  `<toolchains>/<id>/luarocks/`); when the built-in index carries no luarocks
+  for the platform the install still succeeds with a warning (the built-in index
+  ships a verified Windows luarocks; other platforms are added per release). When
+  a project pins a toolchain, `luabox run` prepends the toolchain's bin
+  directories to every spawned child's `PATH` and resolves bare executables
+  (`lua`, `luarocks`) **toolchain-first**, before the system `$PATH` — the
+  `node_modules/.bin`-first model — with a generated `LUAROCKS_CONFIG` wiring
+  luarocks to the toolchain interpreter and a project-local `lua_modules` tree.
+  The bare-`$PATH` fallback is kept with that purpose. The luarocks bridge's
+  C-rock rejection now points at this escape hatch:
+  `luabox run luarocks -- install <rock>` (native rocks are phase 2,
+  [#6](https://github.com/flying-dice/luabox/issues/6)).
+
 - **Dialect compatibility resolution for dependencies**
   ([#5](https://github.com/flying-dice/luabox/issues/5)) — the resolver now
   gates every dependency on the Lua dialect your build ships. Each package has a

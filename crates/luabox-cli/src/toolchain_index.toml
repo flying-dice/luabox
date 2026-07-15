@@ -25,3 +25,20 @@ sha256 = "5f1e1385ed95a3643f7ed67c4f3767942b2f0f388b66f63e5667e9c3d96293f5"
 [toolchain."5.1-windows-x64"]
 url = "https://sourceforge.net/projects/luabinaries/files/5.1.5/Tools%20Executables/lua-5.1.5_Win64_bin.zip/download"
 sha256 = "5f34cf7d40a20a587ea351482a4207d93b92ef6f1983e910a13338253819fe93"
+
+# luarocks provisioned alongside a runtime (#3), keyed by platform. Installing
+# any toolchain on this platform also extracts this into `<id>/luarocks/`.
+#
+# Windows: the official all-in-one build (a self-contained `luarocks.exe`; no
+# `make` needed). Verified 2026-07-15 by downloading and computing the SHA-256.
+#
+# Unix/macOS: luarocks ships only a source tarball
+# (https://luarocks.org/releases/luarocks-3.11.1.tar.gz, sha256
+# c3fb3d960dffb2b2fe9de7e3cb004dc4d0b34bb3d342578af84f84325c669102) that
+# requires `make` to build — it is NOT a drop-in extract-and-run archive, so it
+# is deliberately omitted here. Adding verified prebuilt luarocks for
+# linux-x64 / macos-x64 / macos-arm64 is part of the per-release index update
+# (absence is a warn-not-fail at install time).
+[luarocks."windows-x64"]
+url = "https://luarocks.org/releases/luarocks-3.11.1-windows-64.zip"
+sha256 = "c71dba3d03e12305e9ccd022c621c8869aba3d124d9249e214aed5c16f3682a3"

@@ -34,7 +34,8 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "luabox",
     version,
-    about = "Unified Lua toolchain: package manager, typechecker, linter, formatter, bundler, LSP. Not a runtime."
+    about = "Unified Lua toolchain and package manager: typechecker, linter, formatter, bundler, LSP. \
+             Acquires Lua runtimes (nvm/rustup for Lua) — never is one."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -193,7 +194,10 @@ enum Command {
         #[arg(long)]
         mode: Option<String>,
     },
-    /// Run a script or a [tasks] entry via the configured runtime
+    /// Run a script or a [tasks] entry via the pinned runtime. Bare
+    /// executables (and [tasks] shells) resolve from the pinned toolchain's
+    /// bin dirs — including its provisioned luarocks — before the system $PATH
+    /// (npm-run/node_modules/.bin semantics); e.g. `run luarocks -- install x`
     Run {
         script: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -210,7 +214,8 @@ enum Command {
         #[arg(long)]
         stdio: bool,
     },
-    /// Manage Lua runtimes (install, pin, list)
+    /// Acquire Lua runtimes (nvm for Lua): install, pin, list. `install` also
+    /// provisions a matching luarocks alongside the interpreter
     Toolchain {
         #[command(subcommand)]
         action: Option<ToolchainAction>,
