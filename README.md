@@ -172,8 +172,9 @@ anything load-bearing.
 | `build` | lower `edition → target` (goto, bitops, `<close>`, `_ENV`, …) with tree-shaken polyfills |
 | `bundle` | single-file bundle, `--minify`, `--sourcemap` + `unmap`, `--mode love\|nvim-plugin` |
 | `add` / `remove` / `install` / `update` / `vendor` | PubGrub resolver, `luabox.lock`, CAS store with hard-link installs. `add <rock>` / `remove <rock>` edit the rockspec's `dependencies` (`--dev` → `test_dependencies`) comment-preservingly; `--path`/`--git` manage source deps in `luabox.toml`. `update <name>` re-pins a git dep to its repo's latest release tag |
+| `publish` | upload the authored rockspec to luarocks.org (`--dry-run` to preview). Gates on a valid canonically-named rockspec, a green `check`, and pure-Lua-only; needs an API key (`login --luarocks`) |
 | `search` / `outdated` | search luarocks.org (the registry) for rocks by name, and report dependencies behind their latest version (registry rocks vs. luarocks.org, git deps vs. their repo's latest GitHub release); `--format json\|text` |
-| `login` / `logout` / `whoami` | sign in to GitHub via the browser (OAuth device flow), storing the token encrypted in the OS keychain; sign out; show the signed-in identity. Authenticates git-source operations (`outdated`/`update` release probing) — registry reads are anonymous. `login`/`whoami` take `--format json\|text` |
+| `login` / `logout` / `whoami` | sign in to GitHub via the browser (OAuth device flow), storing the token encrypted in the OS keychain; sign out; show the signed-in identity. Authenticates git-source operations (`outdated`/`update` release probing) — registry reads are anonymous. `login --luarocks` stores a luarocks.org API key for `publish`. `login`/`whoami` take `--format json\|text` |
 | `run` | `[tasks]` entries or scripts via the resolved runtime |
 | `toolchain` | install/pin/list managed Lua runtimes |
 | `upgrade` | self-update from GitHub releases (`luabox upgrade` for latest, or a specific `v0.1.1`), checksum-verified |
@@ -290,7 +291,7 @@ Sign in to GitHub through the browser — no Personal Access Token to paste:
 ```sh
 luabox login        # opens the browser, prints a device code, stores a token
 luabox whoami       # -> your GitHub login (and where the token came from)
-luabox logout       # removes the stored token
+luabox logout       # removes the stored GitHub token (and any luarocks.org API key)
 ```
 
 `luabox login` runs the OAuth 2.0 **device flow**: it shows a short `user_code`
@@ -316,6 +317,36 @@ Environment variables win over the keychain, so CI and one-off overrides are
 always honored. On a headless box with no keychain (common in CI), `luabox
 login` can't store the token and tells you to set `LUABOX_GITHUB_TOKEN`
 instead; nothing crashes.
+
+## Publishing
+
+luabox follows the pnpm/bun model: **[luarocks.org](https://luarocks.org) is
+the registry**, and your **rockspec is the package manifest**. `luabox publish`
+is a thin proxy that uploads the rockspec you authored (`luabox init`/`new`
+scaffold one; `luabox add`/`remove` edit it) to luarocks.org *verbatim* — it
+compiles and generates nothing.
+
+```sh
+luabox login --luarocks     # once: paste your luarocks.org API key (stored in the keychain)
+luabox publish --dry-run    # preview: prints the rockspec + upload target, no network
+luabox publish              # upload the authored rockspec to luarocks.org
+```
+
+Get an API key from <https://luarocks.org/settings/api-keys>. `luabox login
+--luarocks` reads it from stdin and stores it **encrypted at rest in your OS
+keychain**; `LUABOX_LUAROCKS_API_KEY` overrides it (CI/one-off). The key is
+**never** logged — it is redacted from every echoed command and error.
+
+Before uploading, `publish` gates entirely offline: your project must have a
+single root `*.rockspec` that parses and carries `package`, `version`, and a
+`source.url`; its filename must be the canonical `<package>-<version>.rockspec`;
+`luabox check` must be green; and the rock must be **pure-Lua** (`build.type =
+builtin`, no C sources — luabox is a toolchain, not a C build system). A
+duplicate version or a server-side validation error surfaces luarocks.org's own
+message. Point `publish` at a different server with `LUABOX_LUAROCKS_URL`.
+
+Consumers install your published rock with plain `luarocks install <name>` — no
+luabox required on their side.
 
 ## Project layout (for contributors)
 

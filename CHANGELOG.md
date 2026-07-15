@@ -10,6 +10,34 @@ spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
 
 ### Added
 
+- **`luabox publish` — a proxy that gets you into luarocks.org**
+  ([#2](https://github.com/flying-dice/luabox/issues/2)) — publishing returns,
+  rebuilt on the pnpm/bun model. `luabox publish` uploads the **authored**
+  rockspec (the manifest you wrote — root `<package>-<version>.rockspec`) to
+  luarocks.org *verbatim*; it generates nothing. It gates first (all local, no
+  network): a root rockspec must exist and parse, carry `package`/`version`/a
+  `source.url`, and be canonically named `<package>-<version>.rockspec`;
+  `luabox check` must be green; and the rock must be **pure-Lua** (`build.type
+  = builtin`, no C sources — the same classification the luarocks bridge
+  applies on the way *in*). Then it POSTs the rockspec (multipart
+  `rockspec_file`) to `luarocks.org/api/1/<key>/upload` via `curl` (no HTTP
+  crate), parses the response, and prints the module URL — or surfaces the
+  server's message on a duplicate/validation error. The API key is **never**
+  logged (it is redacted from every echoed command and error). `--dry-run`
+  prints the rockspec and the upload target and exits without touching the
+  network. The base URL is overridable with `LUABOX_LUAROCKS_URL`. Consumers
+  install a published rock with plain `luarocks install <name>` — no luabox
+  required.
+- **`luabox login --luarocks` and API-key storage**
+  ([#2](https://github.com/flying-dice/luabox/issues/2)) — `luabox login
+  --luarocks` reads a luarocks.org API key from stdin (get one at
+  <https://luarocks.org/settings/api-keys>), validates it non-empty, and stores
+  it **encrypted at rest in the OS keychain** (service `luabox`, entry
+  `luarocks-api-key`) for `luabox publish`. `LUABOX_LUAROCKS_API_KEY` overrides
+  the keychain (CI/one-off). `luabox logout` now also clears the stored key, and
+  `luabox whoami --format json` gains an additive `luarocks: bool` field
+  reporting whether a key is configured — the existing GitHub `login`/`whoami`
+  device-flow contract the editor extensions parse is unchanged.
 - **http(s) tarball dependencies (`url` source)**
   ([#2](https://github.com/flying-dice/luabox/issues/2)) — a bun-style
   `pkg = { url = "https://…/pkg.tar.gz", sha256 = "…" }` source in `luabox.toml`.
@@ -102,9 +130,11 @@ spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
   environment (LÖVE, Neovim, OpenResty, …) can't be faithfully executed on a
   bare interpreter, so testing/benchmarking belong to the deployment
   environment's own tooling.
-- **`luabox publish`** ([#2](https://github.com/flying-dice/luabox/issues/2))
-  — first-party registry publishing is deferred; it returns in a later
-  version. Resolving and installing from a registry are unchanged.
+- **The first-party-registry `luabox publish`**
+  ([#2](https://github.com/flying-dice/luabox/issues/2)) — the old publish
+  (pack a tarball, hash it, append a sparse-index line to a first-party
+  registry, with `--yank`) is gone. `luabox publish` now uploads the authored
+  rockspec to luarocks.org instead (see **Added**).
 - **`luabox audit`** ([#1](https://github.com/flying-dice/luabox/issues/1))
   — the advisory-database check and its bundled advisory DB are removed; there
   was no hosted advisory feed to make it useful.

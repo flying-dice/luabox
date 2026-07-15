@@ -83,6 +83,7 @@ luabox doc [--open]                                   docs from annotations
 luabox lsp                                            stdio LSP server
 luabox toolchain [install|pin|list]                   runtime version mgmt (rustup analog)
 luabox vendor                                         vendor deps into tree
+luabox publish [--dry-run]                            upload the rockspec to luarocks.org
 luabox explain LB0xxx                                 rustc-style diagnostic docs
 ```
 
@@ -133,6 +134,7 @@ luabox follows the pnpm/bun model: **[luarocks.org](https://luarocks.org) is the
 - Dep kinds: registry (rockspec), git (rev/tag/branch), url (http(s)/local tarball pinned by sha256, verified before extraction — bun-style), path, workspace.
 - Packages declare `lua-versions = ["5.1", "5.4"]`; resolver refuses incompatible graphs or selects pre-lowered published variants.
 - C modules: **declared, not built** — pure-Lua rocks only; a C/native rock is rejected with a clear error. Luabox is not a C build system.
+- **Publish:** `luabox publish` is a thin proxy that uploads the **authored** rockspec (the manifest you wrote) to luarocks.org — it compiles/generates nothing. It gates on a valid canonically-named rockspec (`package`/`version`/`source.url` present, filename `<package>-<version>.rockspec`), a green `luabox check`, and pure-Lua-only classification, then POSTs the rockspec to `luarocks.org/api/1/<key>/upload` (`--dry-run` previews without uploading). The API key comes from `luabox login --luarocks` (OS keychain) or `LUABOX_LUAROCKS_API_KEY`; consumers install the published rock with plain `luarocks install`.
 
 ## 7. Bundler
 

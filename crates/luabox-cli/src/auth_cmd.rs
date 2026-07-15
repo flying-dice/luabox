@@ -477,47 +477,105 @@ pub fn login(format: &str) -> Result<()> {
     Ok(())
 }
 
-/// `luabox logout` — delete any stored token. Idempotent.
+/// The environment variable overriding the stored luarocks.org API key. Read
+/// by `luabox publish` and `luabox whoami`; wins over the keychain (CI/one-off
+/// overrides), mirroring the GitHub token precedence.
+pub(crate) const LUAROCKS_API_KEY_ENV: &str = "LUABOX_LUAROCKS_API_KEY";
+
+/// `luabox login --luarocks` — store the luarocks.org upload API key in the OS
+/// keychain so `luabox publish` can use it. The key is read from stdin (get it
+/// from <https://luarocks.org/settings/api-keys>), validated non-empty, and
+/// stored encrypted at rest.
+pub fn login_luarocks() -> Result<()> {
+    eprintln!(
+        "Paste your luarocks.org API key (from https://luarocks.org/settings/api-keys), \
+         then press Enter:"
+    );
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .context("reading the API key from stdin")?;
+    let key = line.trim();
+    if key.is_empty() {
+        bail!("no API key entered; nothing was stored");
+    }
+
+    crate::keychain::store_luarocks_key(key).map_err(|err| {
+        anyhow::anyhow!(
+            "couldn't store the luarocks.org API key in the OS keychain ({err}). \
+             Set {LUAROCKS_API_KEY_ENV} in your environment instead to keep using it."
+        )
+    })?;
+    println!("Stored your luarocks.org API key. `luabox publish` will now use it.");
+    Ok(())
+}
+
+/// `luabox logout` — delete any stored token (GitHub) *and* the luarocks.org
+/// API key. Idempotent.
 // Uniform `Result` dispatch signature (like every other command).
 #[allow(clippy::unnecessary_wraps)]
 pub fn logout() -> Result<()> {
     match crate::keychain::delete() {
-        Ok(()) => println!("Signed out (any stored token was removed)."),
+        Ok(()) => println!("Signed out (any stored GitHub token was removed)."),
         // An unreachable keychain means nothing is stored there to remove.
-        Err(_) => println!("No stored token to remove."),
+        Err(_) => println!("No stored GitHub token to remove."),
+    }
+    match crate::keychain::delete_luarocks_key() {
+        Ok(()) => println!("Removed any stored luarocks.org API key."),
+        Err(_) => println!("No stored luarocks.org API key to remove."),
     }
     Ok(())
 }
 
-/// Shape the `whoami --format json` object for a resolved (or absent) identity.
-fn whoami_json(identity: Option<(&str, &str)>) -> String {
+/// Whether a luarocks.org API key is configured: the
+/// [`LUAROCKS_API_KEY_ENV`] env override (non-blank) or a keychain-stored key.
+/// A keychain that cannot be reached is treated as "no key" (never fatal).
+pub(crate) fn luarocks_key_configured() -> bool {
+    if env::var(LUAROCKS_API_KEY_ENV).is_ok_and(|value| !value.trim().is_empty()) {
+        return true;
+    }
+    crate::keychain::retrieve_luarocks_key()
+        .ok()
+        .flatten()
+        .is_some_and(|key| !key.trim().is_empty())
+}
+
+/// Shape the `whoami --format json` object for a resolved (or absent) GitHub
+/// identity. The GitHub `login`/`source` fields are the frozen contract the
+/// editor extensions parse; `luarocks` is an additive boolean reporting
+/// whether a luarocks.org API key is configured (for `luabox publish`).
+fn whoami_json(identity: Option<(&str, &str)>, luarocks: bool) -> String {
     #[derive(Serialize)]
     struct WhoAmI<'a> {
         login: Option<&'a str>,
         source: Option<&'a str>,
+        luarocks: bool,
     }
     let value = match identity {
         Some((login, source)) => WhoAmI {
             login: Some(login),
             source: Some(source),
+            luarocks,
         },
         None => WhoAmI {
             login: None,
             source: None,
+            luarocks,
         },
     };
     serde_json::to_string(&value)
-        .unwrap_or_else(|_| String::from("{\"login\":null,\"source\":null}"))
+        .unwrap_or_else(|_| String::from("{\"login\":null,\"source\":null,\"luarocks\":false}"))
 }
 
 /// `luabox whoami` — report the signed-in GitHub identity, or "not signed in".
 /// Always exits 0 (it is a status query, not a gate).
 pub fn whoami(format: &str) -> Result<()> {
     let format = Format::parse(format)?;
+    let luarocks = luarocks_key_configured();
 
     let Some((token, source)) = crate::github::token_with_source() else {
         match format {
-            Format::Json => println!("{}", whoami_json(None)),
+            Format::Json => println!("{}", whoami_json(None, luarocks)),
             Format::Text => println!("not signed in"),
         }
         return Ok(());
@@ -525,7 +583,7 @@ pub fn whoami(format: &str) -> Result<()> {
 
     let login = crate::github::authenticated_login(&token)?;
     match format {
-        Format::Json => println!("{}", whoami_json(Some((&login, source.label())))),
+        Format::Json => println!("{}", whoami_json(Some((&login, source.label())), luarocks)),
         Format::Text => println!("{login}"),
     }
     Ok(())
@@ -705,13 +763,16 @@ mod tests {
     #[test]
     fn whoami_json_signed_in_and_out() {
         let value: serde_json::Value =
-            serde_json::from_str(&whoami_json(Some(("octocat", "keychain")))).expect("valid");
+            serde_json::from_str(&whoami_json(Some(("octocat", "keychain")), true)).expect("valid");
         assert_eq!(value["login"], "octocat");
         assert_eq!(value["source"], "keychain");
+        assert_eq!(value["luarocks"], true);
 
-        let value: serde_json::Value = serde_json::from_str(&whoami_json(None)).expect("valid");
+        let value: serde_json::Value =
+            serde_json::from_str(&whoami_json(None, false)).expect("valid");
         assert!(value["login"].is_null());
         assert!(value["source"].is_null());
+        assert_eq!(value["luarocks"], false);
     }
 
     // --- end-to-end flow with a mock transport ---------------------------

@@ -17,6 +17,7 @@ mod lsp_cmd;
 mod modes;
 mod outdated_cmd;
 mod project;
+mod publish_cmd;
 mod run_cmd;
 mod runtime;
 mod scaffold;
@@ -109,13 +110,18 @@ enum Command {
         format: String,
     },
     /// Sign in to GitHub via the browser (OAuth device flow); stores the token
-    /// encrypted in the OS keychain
+    /// encrypted in the OS keychain. With `--luarocks`, store a luarocks.org
+    /// upload API key (read from stdin) instead — for `luabox publish`.
     Login {
         /// Output format: text (default) or json (newline-delimited events)
         #[arg(long, default_value = "text")]
         format: String,
+        /// Store a luarocks.org API key (read from stdin) for `luabox publish`
+        #[arg(long)]
+        luarocks: bool,
     },
-    /// Delete the stored GitHub token from the OS keychain
+    /// Delete the stored GitHub token and luarocks.org API key from the OS
+    /// keychain
     Logout,
     /// Show the signed-in GitHub identity, if any
     Whoami {
@@ -198,6 +204,12 @@ enum Command {
     },
     /// Vendor dependencies into the source tree
     Vendor,
+    /// Publish the authored rockspec to luarocks.org
+    Publish {
+        /// Validate and preview the upload without contacting luarocks.org
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Replace this binary with a GitHub release build (default: latest)
     Upgrade {
         /// Release version to install (e.g. 0.1.0 or v0.1.0); default: latest
@@ -262,7 +274,13 @@ fn main() -> anyhow::Result<()> {
         Command::Remove { package } => deps_cmd::remove(&std::env::current_dir()?, &package),
         Command::Search { query, format } => search_cmd::run(query.as_deref(), &format),
         Command::Outdated { format } => outdated_cmd::run(&std::env::current_dir()?, &format),
-        Command::Login { format } => auth_cmd::login(&format),
+        Command::Login { format, luarocks } => {
+            if luarocks {
+                auth_cmd::login_luarocks()
+            } else {
+                auth_cmd::login(&format)
+            }
+        }
         Command::Logout => auth_cmd::logout(),
         Command::Whoami { format } => auth_cmd::whoami(&format),
         Command::Install => deps_cmd::install(&std::env::current_dir()?),
@@ -304,6 +322,9 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Upgrade { version } => upgrade_cmd::run(version),
         Command::Vendor => deps_cmd::vendor(&std::env::current_dir()?),
+        Command::Publish { dry_run } => {
+            publish_cmd::run(&std::env::current_dir()?, dry_run)
+        }
         Command::Explain { code } => {
             let parsed: luabox_diag::Code = code.parse().map_err(|_| {
                 anyhow::anyhow!("`{code}` is not a valid diagnostic code; codes look like LB0421")
