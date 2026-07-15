@@ -148,6 +148,12 @@ pub struct PackageMeta {
     /// SPEC.md §6 `lua-versions`: dialects the package declares itself
     /// compatible with. Empty means compatible with all.
     pub lua_versions: Vec<String>,
+    /// The dialect the package is *written* in (`[package] edition`), when it
+    /// has a declarable one: `Some` for path/git/url packages (their
+    /// `luabox.toml`), `None` for registry rocks (a rockspec has no edition).
+    /// The resolver's lowering escape hatch (#5) lowers this edition to the
+    /// build target when the target is not in [`Self::lua_versions`].
+    pub edition: Option<String>,
     /// Content checksum for the lockfile (`sha256:…`). Plain string here;
     /// verification against the store is #18/#21 integration.
     pub checksum: Option<String>,
@@ -452,6 +458,7 @@ impl PackageProvider for PathProvider {
             }
             Ok(PackageMeta {
                 lua_versions: m.package.lua_versions.clone(),
+                edition: Some(m.package.edition.clone()),
                 checksum: None,
                 pinned: None,
             })
@@ -528,6 +535,9 @@ impl StaticProvider {
             dependencies,
             PackageMeta {
                 lua_versions: lua_versions.iter().map(|s| (*s).to_owned()).collect(),
+                // A registry-style package (a rock) has no declarable edition;
+                // callers needing one use `add_package` with a full `PackageMeta`.
+                edition: None,
                 checksum: checksum.map(str::to_owned),
                 pinned: None,
             },

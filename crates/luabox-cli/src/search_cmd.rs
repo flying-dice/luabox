@@ -9,7 +9,12 @@
 //!
 //! A listing carries no per-rock description: the manifest does not include one
 //! and fetching a rockspec per rock just to list is wasteful (and unfriendly to
-//! offline mirrors), so `description` is honestly `null`.
+//! offline mirrors), so `description` is honestly `null`. For the same reason a
+//! rock's **supported-dialect family set** (#5) is *not* surfaced here: it lives
+//! in the per-version rockspec's `lua` constraint, which the name-index listing
+//! never fetches — adding a rockspec fetch per result would slow every search
+//! for data most callers do not need. It surfaces at resolve time instead
+//! (`LB1003`).
 //!
 //! `--format json` emits the frozen `{"results":[…]}` contract the editor GUIs
 //! are built against; the default `text` renders an aligned table.

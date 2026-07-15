@@ -10,6 +10,21 @@ spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
 
 ### Added
 
+- **Dialect compatibility resolution for dependencies**
+  ([#5](https://github.com/flying-dice/luabox/issues/5)) — the resolver now
+  gates every dependency on the Lua dialect your build ships. Each package has a
+  **family set** of supported dialects (never a range — a range implies a total
+  order LuaJIT breaks): a registry rock's set is translated from its rockspec
+  `lua` constraint (`lua >= 5.1, < 5.4` → `{5.1, 5.2, 5.3}`, plus `luajit`
+  whenever 5.1 is admitted), a path/git package's set is its `luabox.toml`
+  `[package] lua-versions`, and an absent set is unconstrained. A dependency is
+  accepted for the project's `[build] target` (default `edition`) when the
+  target is in its set **or** its own edition is *lowerable* to the target
+  (luabox lowers dependency sources alongside the project's at build time);
+  otherwise resolution fails with the new `explain`-able **`LB1003`**. Luau
+  stays fenced off — it has no lowering path to a PUC target — without being
+  wired anywhere.
+
 - **`luabox publish` — a proxy that gets you into luarocks.org**
   ([#2](https://github.com/flying-dice/luabox/issues/2)) — publishing returns,
   rebuilt on the pnpm/bun model. `luabox publish` uploads the **authored**

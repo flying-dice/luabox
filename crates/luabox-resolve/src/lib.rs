@@ -11,7 +11,10 @@
 //! `luabox.toml`'s tool config + path/git sources ([`project::effective_manifest`]).
 //! Per SPEC.md §16, Distribution "never parses syntax" — `edition`/`target`
 //! are validated as plain strings against a local allow-list, not via
-//! `luabox-syntax`.
+//! `luabox-syntax`. The dialect **compatibility** model ([`dialect`]) is the
+//! one place the resolver reasons over `luabox_syntax::Dialect` as a family
+//! (family sets + lowerability, #5) — it classifies dialects, it does not parse
+//! them.
 //!
 //! Resolution ([`resolve`]) is PubGrub over the [`provider::PackageProvider`]
 //! seam: path/workspace deps resolve from disk, git deps via the
@@ -20,6 +23,7 @@
 //! [`Lockfile`] (`luabox.lock`), and failures render cargo-style conflict
 //! reports via `Display`.
 
+pub mod dialect;
 pub mod git_provider;
 mod http;
 pub mod lockfile;
@@ -32,6 +36,7 @@ mod semver_ranges;
 pub mod solver;
 pub mod url_provider;
 
+pub use dialect::{DialectSet, lowerable};
 pub use git_provider::{GitCheckout, GitProvider};
 pub use lockfile::{
     LOCKFILE_NAME, LOCKFILE_VERSION, LockedPackage, LockedSource, Lockfile, LockfileError,

@@ -560,6 +560,11 @@ impl PackageProvider for LuaRocksProvider {
         classify(rock, &luarocks_version, &spec)?;
         Ok(PackageMeta {
             lua_versions: lua_dialects(&spec),
+            // A rockspec declares no `edition` (the dialect the sources are
+            // written in), so a registry rock offers nothing for the resolver's
+            // lowering escape hatch: it is judged purely on its `lua-versions`
+            // set (#5).
+            edition: None,
             checksum: None,
             pinned: None,
         })

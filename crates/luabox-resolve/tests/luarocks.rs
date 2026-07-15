@@ -197,6 +197,74 @@ fn resolve_bridges_a_rock_and_its_transitive_dependency() {
     );
 }
 
+/// A one-rock hermetic mirror: `oldrock-1.0-1`, a pure-Lua builtin whose
+/// rockspec constrains `lua >= 5.1, < 5.4` — i.e. it supports the
+/// `{5.1, 5.2, 5.3}` family (plus luajit, 5.1-family) but **not** 5.4.
+fn build_boundary_mirror(mirror: &Path) {
+    write(
+        mirror,
+        "oldrock-1.0-1.rockspec",
+        r#"package = "oldrock"
+version = "1.0-1"
+source = { url = "git+https://example.com/oldrock.git" }
+dependencies = {
+  "lua >= 5.1, < 5.4",
+}
+build = {
+  type = "builtin",
+  modules = { oldrock = "oldrock.lua" },
+}
+"#,
+    );
+    write(mirror, "oldrock-1.0-1/oldrock.lua", "return 'oldrock'\n");
+}
+
+/// The ecosystem boundary (#5): a rockspec's `lua` range becomes a family set
+/// at the LuaRocks bridge, and that set gates the project's build target. A
+/// rock supporting `{5.1, 5.2, 5.3}` is rejected for a 5.4-target project with
+/// the `LB1003` diagnostic, and accepted for a 5.1-target project.
+#[test]
+fn rockspec_lua_range_becomes_a_family_set_and_gates_the_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mirror = tmp.path().join("mirror");
+    build_boundary_mirror(&mirror);
+    let provider = provider(&tmp.path().join("cache"), &mirror);
+
+    // The project's rockspec declares the registry dependency (the rockspec is
+    // the package manifest); `luabox.toml` carries only the edition/target.
+    let spec = luabox_resolve::luarocks::rockspec::read(
+        "package = \"app\"\nversion = \"0.1.0-1\"\ndependencies = { \"oldrock >= 1.0\" }\n",
+    );
+
+    // Ships 5.4: 5.4 is not in {5.1, 5.2, 5.3, luajit}, and a rock declares no
+    // lowerable edition, so this is a hard resolution failure (LB1003).
+    let target_54 = Manifest::parse("[package]\nedition = \"5.4\"\n").expect("manifest parses");
+    let effective_54 =
+        luabox_resolve::effective_manifest(&target_54, Some(&spec)).expect("merge succeeds");
+    let err = resolve(&effective_54, tmp.path(), &provider, None).unwrap_err();
+    let report = err.to_string();
+    assert!(report.contains("LB1003"), "expected LB1003, got: {report}");
+    assert!(
+        report.contains("supports Lua 5.1, 5.2, 5.3, luajit"),
+        "expected the translated family set, got: {report}"
+    );
+    assert!(
+        report.contains("the build target is Lua 5.4"),
+        "expected the target named, got: {report}"
+    );
+
+    // Ships 5.1: 5.1 is in the set, so the rock resolves cleanly.
+    let target_51 = Manifest::parse("[package]\nedition = \"5.1\"\n").expect("manifest parses");
+    let effective_51 =
+        luabox_resolve::effective_manifest(&target_51, Some(&spec)).expect("merge succeeds");
+    let resolution =
+        resolve(&effective_51, tmp.path(), &provider, None).expect("resolves for 5.1");
+    assert!(
+        resolution.packages.iter().any(|p| p.name == "oldrock"),
+        "oldrock should resolve for a 5.1 target"
+    );
+}
+
 // --- one live end-to-end test (skips gracefully offline) -----------------
 
 /// Whether luarocks.org is reachable right now.

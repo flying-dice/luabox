@@ -233,6 +233,11 @@ static REGISTRY: &[Entry] = &[
         title: "unresolvable definition package",
         explain: LB1002,
     },
+    Entry {
+        code: Code::new(1003),
+        title: "dependency does not support the build target dialect",
+        explain: LB1003,
+    },
 ];
 
 /// Look up the explain entry for a code, if it is registered.
@@ -1541,6 +1546,39 @@ arrive with the package manager (SPEC.md §3, §6).
 Fix: create the defs file/directory, correct the name, or remove the entry.
 ";
 
+const LB1003: &str = "\
+# LB1003: dependency does not support the build target dialect
+
+Every package declares the Lua dialects it is source-compatible with as an
+explicit **family set** — never a range (a range implies a total order that
+LuaJIT breaks: it is 5.1-plus-extensions, not a point between 5.1 and 5.2).
+A registry rock's set is translated from its rockspec `lua` constraint
+(`lua >= 5.1, < 5.4` admits `{5.1, 5.2, 5.3}`, plus `luajit` whenever `5.1` is
+admitted); a path/git package's set is its `luabox.toml` `[package]
+lua-versions`. An **absent** set is unconstrained — compatible with everything.
+
+A dependency is usable for your project's **`[build] target`** (which defaults
+to `[package] edition`) when **either**:
+
+- the target is in the dependency's declared family set, **or**
+- the dependency's own `edition` can be *lowered* to the target — luabox owns
+  the lowering pipeline and rewrites dependency sources alongside yours at
+  build time.
+
+This error means neither held: the target is not in the set, and the
+dependency offers no lowerable edition (a registry rock declares none, so it is
+judged purely on its set; and Luau — inexpressible as a PUC dialect — has no
+lowering path, which is how it stays fenced off).
+
+Fixes:
+
+- retarget your build to a dialect the dependency supports
+  (`[build] target` / `luabox build --target`);
+- pick a version (or an alternative package) whose set includes your target;
+- if you own the dependency, widen its `lua-versions` set (or its rockspec
+  `lua` constraint) once you have verified it on the target dialect.
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1552,7 +1590,7 @@ mod tests {
             "LB0300", "LB0301", "LB0302", "LB0303", "LB0304", "LB0305", "LB0306", "LB0307",
             "LB0308", "LB0309", "LB0310", "LB0311", "LB0312", "LB0313", "LB0314", "LB0315",
             "LB0316", "LB0500", "LB0501", "LB0502", "LB0503", "LB0504", "LB0505", "LB0506",
-            "LB0507", "LB0508", "LB0509", "LB1001",
+            "LB0507", "LB0508", "LB0509", "LB1001", "LB1003",
         ] {
             let code: Code = raw.parse().unwrap();
             assert!(explain(&code).is_some(), "{raw} missing from registry");

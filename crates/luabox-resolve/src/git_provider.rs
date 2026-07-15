@@ -274,6 +274,7 @@ impl PackageProvider for GitProvider {
             }
             Ok(PackageMeta {
                 lua_versions: entry.manifest.package.lua_versions.clone(),
+                edition: Some(entry.manifest.package.edition.clone()),
                 checksum: None,
                 pinned: Some(entry.checkout.commit.clone()),
             })

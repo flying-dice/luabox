@@ -279,6 +279,9 @@ impl PackageProvider for UrlProvider {
                     .as_ref()
                     .map(|m| m.package.lua_versions.clone())
                     .unwrap_or_default(),
+                // The tarball's `luabox.toml` edition, when it ships one (some
+                // tarballs are bare source with no manifest).
+                edition: entry.manifest.as_ref().map(|m| m.package.edition.clone()),
                 // The pinned digest is the lockfile checksum — content is
                 // addressed by exactly the sha256 the manifest declares.
                 checksum: Some(format!("sha256:{sha256}")),

@@ -29,10 +29,13 @@ use pubgrub::{
 };
 use semver::{Version, VersionReq};
 
+use luabox_syntax::Dialect;
+
+use crate::dialect::{DialectSet, lowerable};
 use crate::lockfile::{LockedPackage, LockedSource, Lockfile};
 use crate::manifest::{Dependency, Manifest};
 use crate::provider::{
-    GitReference, PackageId, PackageProvider, ProviderError, Source, normalize_path,
+    GitReference, PackageId, PackageMeta, PackageProvider, ProviderError, Source, normalize_path,
     parse_manifest_at, relative_display,
 };
 use crate::report::ResolveReportFormatter;
@@ -61,9 +64,11 @@ struct Context<'a> {
     root_dir: PathBuf,
     root_name: String,
     root_version: Version,
-    /// The project's `[package] edition` — every selected package's
-    /// `lua-versions` must admit it (SPEC.md §6).
-    edition: String,
+    /// The project's `[build] target` — the dialect it *ships* (defaults to
+    /// `[package] edition`). Every selected package must be usable for this
+    /// target: the target is in its `lua-versions` family set, or the
+    /// package's own edition lowers to it (SPEC.md §6, #5).
+    target: String,
     root_deps: BTreeMap<String, Dependency>,
     root_dev_deps: BTreeMap<String, Dependency>,
     /// Workspace member name → member directory (for
@@ -216,21 +221,55 @@ impl Context<'_> {
         req_to_ranges(&parsed).map_err(invalid)
     }
 
-    /// The lua-versions incompatibility sentence for a package version, if
-    /// any (SPEC.md §6: empty declaration = compatible with everything).
+    /// The dialect-compatibility incompatibility sentence for a package
+    /// version, if it is not usable for the project's build target
+    /// (SPEC.md §6, flying-dice/luabox#5); `None` when acceptable.
+    ///
+    /// A dependency is acceptable when **either** the build target is admitted
+    /// by its declared family set (unconstrained sets admit every target),
+    /// **or** its own `edition` is lowerable to the target — luabox lowers
+    /// dependency sources alongside the project's at build time. Registry rocks
+    /// carry no edition, so they are judged purely on their `lua-versions` set.
+    ///
+    /// The message is `LB1003`-coded and `luabox explain`-able. `luabox-lower`
+    /// (and thus this crate) does not depend on `luabox-diag`, so the code
+    /// travels as a plain string the CLI maps onto the registered explain page.
     fn lua_incompatibility(
         &self,
         id: &PackageId,
         version: &Version,
-        lua_versions: &[String],
+        meta: &PackageMeta,
     ) -> Option<String> {
-        if lua_versions.is_empty() || lua_versions.iter().any(|v| v == &self.edition) {
+        // A target that is not a known dialect cannot be reasoned about
+        // (shouldn't happen: `[build] target` is validated) — treat as
+        // acceptable rather than invent an incompatibility.
+        let target = Dialect::from_manifest_id(&self.target)?;
+        let set = DialectSet::from_ids(&meta.lua_versions);
+        if set.admits(target) {
             return None;
         }
+        // Escape hatch: luabox can lower the dependency's own edition to the
+        // target. A registry rock (edition `None`) or a family luabox-lower
+        // cannot model (a hypothetical Luau edition) has no path — the fence.
+        if let Some(edition) = meta.edition.as_deref().and_then(Dialect::from_manifest_id)
+            && lowerable(edition, target)
+        {
+            return None;
+        }
+        let tail = match &meta.edition {
+            Some(edition) => format!(
+                ", and its edition (Lua {edition}) has no lowering path to Lua {}",
+                self.target
+            ),
+            None => format!(
+                ", and it declares no edition luabox could lower to Lua {}",
+                self.target
+            ),
+        };
         Some(format!(
-            "{id} {version} supports Lua {} but the project's edition is Lua {}",
-            lua_versions.join(", "),
-            self.edition
+            "LB1003: {id} {version} supports Lua {} but the build target is Lua {}{tail}",
+            set.describe(),
+            self.target,
         ))
     }
 }
@@ -327,10 +366,7 @@ impl DependencyProvider for Adapter<'_> {
     ) -> Result<Dependencies<PkgKey, VersionRanges, String>, ProviderError> {
         if let PkgKey::Pkg(id) = package {
             let meta = self.ctx.provider.metadata(id, version)?;
-            if let Some(reason) = self
-                .ctx
-                .lua_incompatibility(id, version, &meta.lua_versions)
-            {
+            if let Some(reason) = self.ctx.lua_incompatibility(id, version, &meta) {
                 // Surface lua-versions mismatch as a PubGrub incompatibility
                 // so the conflict report explains it.
                 return Ok(Dependencies::Unavailable(reason));
@@ -463,7 +499,7 @@ fn build_context<'a>(
         root_dir: normalize_path(root_dir),
         root_name: root_manifest.package.name.clone(),
         root_version,
-        edition: root_manifest.package.edition.clone(),
+        target: root_manifest.build.target.clone(),
         root_deps: root_manifest.dependencies.clone(),
         root_dev_deps: root_manifest.dev_dependencies.clone(),
         members: workspace_member_map(root_manifest, root_dir)?,
@@ -635,7 +671,7 @@ pub fn verify_resolution(
         if let PkgKey::Pkg(id) = key {
             match ctx.provider.metadata(id, version) {
                 Ok(meta) => {
-                    if let Some(reason) = ctx.lua_incompatibility(id, version, &meta.lua_versions) {
+                    if let Some(reason) = ctx.lua_incompatibility(id, version, &meta) {
                         violations.push(reason);
                     }
                 }

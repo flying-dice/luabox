@@ -163,6 +163,45 @@ fn compatible_lua_versions_pass() {
 }
 
 #[test]
+fn build_target_not_edition_drives_the_dialect_check() {
+    // The compatibility check is against `[build] target`, not `[package]
+    // edition`: a project written in 5.1 but *shipping* 5.4 must reject a
+    // dependency that only supports 5.1 (#5).
+    let mut provider = StaticProvider::new();
+    provider.add_with_lua("only51", "1.0.0", &[], &["5.1"]);
+    let manifest = Manifest::parse(
+        "[package]\nname = \"myapp\"\nversion = \"0.1.0\"\nedition = \"5.1\"\n\n\
+         [build]\ntarget = \"5.4\"\n\n[dependencies]\nonly51 = \"1\"\n",
+    )
+    .expect("valid manifest");
+    let err = resolve(&manifest, Path::new("."), &provider, None).unwrap_err();
+    let report = err.to_string();
+    assert!(report.contains("LB1003"), "{report}");
+    assert!(report.contains("the build target is Lua 5.4"), "{report}");
+}
+
+#[test]
+fn lowerable_edition_is_the_escape_hatch() {
+    // A path dependency written in (and only declaring) 5.4 is still usable by
+    // a 5.1-target project: luabox lowers its sources at build time, so its
+    // edition being lowerable to the target is the escape hatch (#5).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let manifest_text = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"5.1\"\n\n\
+         [dependencies]\nmodern = { path = \"libs/modern\" }\n";
+    write_manifest(root, manifest_text);
+    write_manifest(
+        &root.join("libs/modern"),
+        "[package]\nname = \"modern\"\nversion = \"0.2.0\"\nedition = \"5.4\"\nlua-versions = [\"5.4\"]\n",
+    );
+
+    let manifest = Manifest::parse(manifest_text).expect("valid manifest");
+    let provider = PathProvider::new();
+    let resolution = resolve(&manifest, root, &provider, None).expect("resolves via lowering");
+    assert_eq!(version_of(&resolution, "modern"), v("0.2.0"));
+}
+
+#[test]
 fn dev_dependencies_of_root_participate() {
     let mut provider = StaticProvider::new();
     provider.add("helper", "1.0.0", &[]);
@@ -504,7 +543,7 @@ fn lua_versions_conflict_reads_like_cargo() {
     assert!(matches!(err, ResolveError::NoSolution { .. }));
     assert_eq!(
         err.to_string(),
-        "Because no version of oldlib matches >1.0.0, <2.0.0 and oldlib 1.0.0 supports Lua 5.1, 5.2 but the project's edition is Lua 5.4, oldlib >=1.0.0, <2.0.0 cannot be used.\n\
+        "Because no version of oldlib matches >1.0.0, <2.0.0 and LB1003: oldlib 1.0.0 supports Lua 5.1, 5.2 but the build target is Lua 5.4, and it declares no edition luabox could lower to Lua 5.4, oldlib >=1.0.0, <2.0.0 cannot be used.\n\
          And because myapp depends on oldlib >=1.0.0, <2.0.0, version solving failed."
     );
 }

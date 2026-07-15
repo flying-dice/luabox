@@ -261,6 +261,19 @@ first-party registry, and `LUABOX_REGISTRY` is gone; set
 `LUABOX_LUAROCKS_MIRROR` to a local mirror directory for hermetic/offline
 resolves.
 
+**Dialect compatibility.** Every dependency has a **family set** of the Lua
+dialects it supports — never a range (a range implies an order LuaJIT breaks: it
+is 5.1-plus-extensions, not a point between 5.1 and 5.2). A registry rock's set
+is translated from its rockspec `lua` constraint (`lua >= 5.1, < 5.4` →
+`{5.1, 5.2, 5.3}`, plus `luajit` whenever 5.1 is admitted); a path/git package's
+set is its `luabox.toml` `[package] lua-versions`; an absent set means all
+dialects. A dependency is accepted for your **`[build] target`** (default
+`edition`) when the target is in its set, **or** its own edition is *lowerable*
+to the target — luabox lowers dependency sources alongside yours at build. When
+neither holds, resolution fails with the `explain`-able
+[`LB1003`](https://github.com/flying-dice/luabox/issues/5) (`luabox explain
+LB1003`). Luau is fenced off: it has no lowering path to a PUC target.
+
 ### Discovering & managing dependencies
 
 **luarocks.org is the discovery surface** for registry dependencies. `luabox
