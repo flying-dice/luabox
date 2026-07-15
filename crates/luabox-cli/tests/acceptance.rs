@@ -72,9 +72,9 @@ fn run_command(world: &mut AcceptanceWorld, command: String) {
         // Point dependency commands at a scenario-local store so tests
         // never touch (or pollute) the user's ~/.luabox/store.
         .env("LUABOX_STORE", world.dir.path().join(".luabox-store"))
-        // Hermetic: a registry configured on the host must not leak into
-        // scenarios (registry scenarios opt in via their own steps).
-        .env_remove("LUABOX_REGISTRY")
+        // Hermetic: a luarocks mirror configured on the host must not leak
+        // into scenarios (mirror scenarios opt in via their own steps).
+        .env_remove("LUABOX_LUAROCKS_MIRROR")
         .output()
         .expect("failed to spawn luabox");
     world.output = Some(output);
@@ -105,6 +105,18 @@ fn file_exists(world: &mut AcceptanceWorld, path: String) {
         world.dir.path().join(&path).is_file(),
         "expected `{path}` to exist"
     );
+}
+
+/// Assert the project root has at least one `*.rockspec` — the package
+/// manifest `luabox init`/`new` scaffolds (SPEC.md §6). Used where the
+/// scaffolded name (hence the exact rockspec filename) is not fixed.
+#[then("a rockspec file exists")]
+fn rockspec_file_exists(world: &mut AcceptanceWorld) {
+    let found = std::fs::read_dir(world.dir.path())
+        .expect("read project root")
+        .flatten()
+        .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("rockspec"));
+    assert!(found, "expected a *.rockspec in the project root");
 }
 
 #[then(expr = "{string} contains {string}")]

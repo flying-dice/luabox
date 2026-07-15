@@ -8,8 +8,41 @@ spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
 
 ## [Unreleased]
 
+### Added
+
+- **The rockspec is the package manifest** ([#2](https://github.com/flying-dice/luabox/issues/2))
+  — luabox adopts the pnpm/bun model. A project's root `*.rockspec` supplies
+  the package **name**, **version**, and **registry dependencies** (its
+  `dependencies`/`test_dependencies`, read statically and translated from
+  LuaRocks constraint syntax to semver). `luabox init`/`new` now scaffold a
+  `<name>-0.1.0-1.rockspec` (`rockspec_format = "3.0"`, a `git+…` source-URL
+  placeholder, a `lua >= <edition>` dependency, and a `builtin` build) beside a
+  slimmed `luabox.toml`.
+
+### Changed
+
+- **luarocks.org is the registry; bare rock names resolve there directly**
+  ([#2](https://github.com/flying-dice/luabox/issues/2)) — a bare
+  version-requirement dependency is a luarocks.org lookup, with no `luarocks/`
+  name prefix. `luabox.toml` is now tool configuration (edition, build, types,
+  tasks) plus the `path`/`git`/`workspace` **source** dependencies a rockspec
+  cannot express; the resolver merges the rockspec's registry deps with
+  `luabox.toml`'s source deps. A **version-requirement dependency written in
+  `luabox.toml` is now a hard error** pointing at the rockspec, and a name
+  declared in both manifests is a clear collision error. `[package] name` and
+  `version` are optional in `luabox.toml` (the rockspec owns them); `edition`
+  stays required. Set `LUABOX_LUAROCKS_MIRROR` for hermetic/offline resolves.
+
 ### Removed
 
+- **The first-party registry and `LUABOX_REGISTRY`**
+  ([#2](https://github.com/flying-dice/luabox/issues/2)) — the static-CDN
+  sparse-index registry client (`Registry`, `RegistryProvider`, `IndexEntry`,
+  the `LUABOX_REGISTRY` environment variable) is deleted; luarocks.org is the
+  registry now. `luabox add <pkg>@<version>` without `--path`/`--git` errors
+  with guidance to declare the dependency in the rockspec (rockspec editing
+  from `add` lands in a later wave). The `LB1100` audit advisory diagnostic is
+  unregistered (audit is gone).
 - **`luabox test` and `luabox bench`** ([#1](https://github.com/flying-dice/luabox/issues/1))
   — luabox is a toolchain, not a runtime; code coupled to its deployment
   environment (LÖVE, Neovim, OpenResty, …) can't be faithfully executed on a

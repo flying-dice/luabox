@@ -40,7 +40,7 @@ fn run(dir: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(dir)
         .env("LUABOX_STORE", dir.join(".luabox-store"))
-        .env_remove("LUABOX_REGISTRY")
+        .env_remove("LUABOX_LUAROCKS_MIRROR")
         .output()
         .expect("spawn luabox")
 }

@@ -21,8 +21,15 @@ pub fn init(dir: &Path, lib: bool, edition: &str) -> anyhow::Result<()> {
     }
 
     let name = package_name(dir)?;
-    fs::write(&manifest, manifest_toml(&name, dialect))
+    fs::write(&manifest, manifest_toml(dialect))
         .with_context(|| format!("writing {}", manifest.display()))?;
+
+    // The rockspec is the package manifest (name/version/registry deps),
+    // pnpm-style (SPEC.md §6). Scaffold the conventional
+    // `<name>-<version>-<rockrev>.rockspec` next to luabox.toml.
+    let rockspec_name = format!("{name}-0.1.0-1.rockspec");
+    fs::write(dir.join(&rockspec_name), rockspec(&name, dialect))
+        .with_context(|| format!("writing {rockspec_name}"))?;
 
     let src = dir.join("src");
     fs::create_dir_all(&src).with_context(|| format!("creating {}", src.display()))?;
@@ -77,12 +84,14 @@ fn package_name(dir: &Path) -> anyhow::Result<String> {
     Ok(name)
 }
 
-fn manifest_toml(name: &str, dialect: Dialect) -> String {
+/// The slimmed `luabox.toml`: tool config only (edition, build, types,
+/// tasks). Name, version, and registry dependencies live in the rockspec
+/// (SPEC.md §6), so there is no `[dependencies]` table — `path`/`git`
+/// sources are added under one on demand by `luabox add`.
+fn manifest_toml(dialect: Dialect) -> String {
     let edition = dialect.manifest_id();
     format!(
         r#"[package]
-name = "{name}"
-version = "0.1.0"
 edition = "{edition}"
 
 [build]
@@ -92,7 +101,43 @@ out = "dist"
 [types]
 strict = true
 
-[dependencies]
+[tasks]
+"#
+    )
+}
+
+/// The scaffolded rockspec: the package manifest. `source.url` is a GitHub
+/// placeholder, `dependencies` pins the chosen Lua dialect, and `build` is a
+/// pure-Lua `builtin` with an empty module map to fill in.
+fn rockspec(name: &str, dialect: Dialect) -> String {
+    // luajit is Lua 5.1-compatible; every other edition maps to its own
+    // version number for the `lua` dependency constraint.
+    let lua_version = if matches!(dialect, Dialect::LuaJit) {
+        "5.1"
+    } else {
+        dialect.manifest_id()
+    };
+    format!(
+        r#"rockspec_format = "3.0"
+package = "{name}"
+version = "0.1.0-1"
+
+source = {{
+   -- TODO: point this at your repository before publishing.
+   url = "git+https://github.com/OWNER/{name}.git",
+}}
+
+dependencies = {{
+   "lua >= {lua_version}",
+}}
+
+build = {{
+   type = "builtin",
+   modules = {{
+      -- TODO: map module names to Lua files, e.g.
+      -- ["{name}"] = "src/{name}.lua"
+   }},
+}}
 "#
     )
 }

@@ -11,9 +11,11 @@
 //! - [`StaticProvider`] — an in-memory package universe for tests and
 //!   benchmarks.
 //!
-//! The registry client (sparse index, #20) plugs in behind this same
-//! trait; [`StackedProvider`] chains providers so a project can mix source
-//! kinds in one resolve.
+//! - [`crate::LuaRocksProvider`] — registry dependencies, resolved from
+//!   luarocks.org (or a local mirror) by translating rockspecs.
+//!
+//! [`StackedProvider`] chains providers so a project can mix source kinds in
+//! one resolve.
 //!
 //! Package names are plain strings and deliberately admit both flat
 //! (`penlight`) and scoped (`@org/pkg`, SPEC.md §19) forms.
@@ -31,7 +33,9 @@ use crate::manifest::{Dependency, Manifest};
 /// same name from two sources is two different packages to the solver.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Source {
-    /// The first-party registry (SPEC.md §6). Client lands in #20.
+    /// A registry package — resolved from luarocks.org (the registry, SPEC.md
+    /// §6) by the [`crate::LuaRocksProvider`]. A bare `name = "^1.2"`
+    /// dependency lands here.
     Registry,
     /// A directory on disk containing a `luabox.toml` (path and workspace
     /// dependencies). The path is lexically normalized and absolute.
@@ -557,8 +561,8 @@ impl PackageProvider for StaticProvider {
 
 /// Chains providers: the first one that recognizes the package (does not
 /// answer [`ProviderError::UnsupportedSource`] or
-/// [`ProviderError::UnknownPackage`]) wins. This is how registry (#20),
-/// git (#21), path, and luarocks-bridge providers will compose.
+/// [`ProviderError::UnknownPackage`]) wins. This is how the path, git, and
+/// luarocks.org providers compose in one resolve.
 pub struct StackedProvider<'a> {
     providers: Vec<&'a dyn PackageProvider>,
 }

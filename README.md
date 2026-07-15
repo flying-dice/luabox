@@ -171,7 +171,7 @@ anything load-bearing.
 | `lint` | type-informed rules, `---@luabox-ignore`, per-rule `[lint]` levels |
 | `build` | lower `edition → target` (goto, bitops, `<close>`, `_ENV`, …) with tree-shaken polyfills |
 | `bundle` | single-file bundle, `--minify`, `--sourcemap` + `unmap`, `--mode love\|nvim-plugin` |
-| `add` / `remove` / `install` / `update` / `vendor` | PubGrub resolver, `luabox.lock`, CAS store with hard-link installs; path/git/workspace/registry deps. `update <name>` re-pins a git dep to its repo's latest release tag |
+| `add` / `remove` / `install` / `update` / `vendor` | PubGrub resolver, `luabox.lock`, CAS store with hard-link installs. Registry deps (luarocks.org) live in the rockspec; `add`/`remove` manage `path`/`git`/`workspace` sources in `luabox.toml`. `update <name>` re-pins a git dep to its repo's latest release tag |
 | `search` / `outdated` | discover luabox packages on GitHub (topic `luabox` + a root `luabox.toml`) and report git deps behind their latest release; `--format json\|text` |
 | `login` / `logout` / `whoami` | sign in to GitHub via the browser (OAuth device flow), storing the token encrypted in the OS keychain; sign out; show the signed-in identity. `login`/`whoami` take `--format json\|text` |
 | `run` | `[tasks]` entries or scripts via the resolved runtime |
@@ -181,27 +181,45 @@ anything load-bearing.
 | `doc` | static docs from annotations |
 | `explain LBnnnn` | rustc-style diagnostic pages |
 
-## Dependencies & registries in 0.1
+## Dependencies & registries
 
-0.1 ships dependency resolution without a hosted registry. Supported
-dependency kinds today are **path**, **git** (`rev`/`tag`/`branch`),
-**workspace**, and **version-requirement** dependencies resolved against a
-registry you point at. There is no first-party hosted default
-([#101](LIMITATIONS.md#dependencies-no-hosted-registry-in-01-101)).
+luabox follows the pnpm/bun model:
+[**luarocks.org is the registry**](https://luarocks.org), and the
+**rockspec is the package manifest**
+([flying-dice/luabox#2](https://github.com/flying-dice/luabox/issues/2)).
 
-A registry is any readable root: a plain directory, a `file://` URL, or an
-`https://` registry. Point `luabox add`/`install`/`update` at one by setting
-`LUABOX_REGISTRY` to that root.
+- Your project's `*.rockspec` owns its **name**, **version**, and **registry
+  dependencies** — its `dependencies` (and `test_dependencies`) are bare rock
+  names in LuaRocks constraint syntax (`"lpeg >= 1.0"`), resolved against
+  luarocks.org. `luabox init`/`new` scaffold one for you.
+- `luabox.toml` is **tool configuration** (edition, build, types, tasks) plus
+  the **source** dependencies a rockspec cannot express — `path`, `git`
+  (`rev`/`tag`/`branch`), and `workspace` entries. A version-requirement entry
+  in `luabox.toml` is an error that points you at the rockspec.
 
-```sh
-export LUABOX_REGISTRY=file:///path/to/a/registry   # or a plain directory
-luabox add somelib@1.2                              # resolves against it
+```toml
+# hello-0.1.0-1.rockspec — the package manifest
+package = "hello"
+version = "0.1.0-1"
+dependencies = { "lua >= 5.4", "lpeg >= 1.0" }   # resolved from luarocks.org
 ```
 
-Without `LUABOX_REGISTRY` set, registry-kind specs (`luabox add pkg@1.0`) fail
-with setup guidance rather than silently doing nothing. Publishing to a
-registry is not part of this release — it returns in a later version
-([flying-dice/luabox#2](https://github.com/flying-dice/luabox/issues/2)).
+```toml
+# luabox.toml — tool config + git/path sources
+[package]
+edition = "5.4"
+
+[dependencies]
+mylib = { path = "../mylib" }                     # a source dependency
+```
+
+`luabox install`/`update` resolve the merged graph (rockspec registry deps +
+luabox.toml source deps) with the PubGrub solver, write `luabox.lock`, and
+hard-link packages into `lua_modules/`. C-module rocks are out of scope and
+rejected with a clear error — luabox is not a C build system. There is no
+first-party registry, and `LUABOX_REGISTRY` is gone; set
+`LUABOX_LUAROCKS_MIRROR` to a local mirror directory for hermetic/offline
+resolves.
 
 ### Discovering & managing dependencies
 
@@ -271,7 +289,7 @@ Cargo workspace, one crate per bounded context (SPEC.md §16):
 | `luabox-db` | incremental query database |
 | `luabox-lower` | target lowering + polyfills |
 | `luabox-bundle` | require-graph, tree-shake, minify, sourcemaps |
-| `luabox-resolve` | PubGrub solver, registry + luarocks bridge |
+| `luabox-resolve` | PubGrub solver, luarocks.org bridge, rockspec + `luabox.toml` manifests |
 | `luabox-store` | content-addressed cache |
 | `luabox-lsp` | language server |
 | `luabox-cli` | the `luabox` binary |

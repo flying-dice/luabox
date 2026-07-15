@@ -2,8 +2,8 @@ Feature: Dependency management
   luabox add/remove/install/update/vendor (SPEC.md §4, §6): comment-preserving
   manifest edits, deterministic luabox.lock, store-backed installs into
   lua_modules/. Path deps are used in place; git deps are fetched with the
-  git CLI and pinned to a commit; registry deps resolve from the registry
-  named by LUABOX_REGISTRY (see distribution/registry.feature).
+  git CLI and pinned to a commit; registry deps live in the project's rockspec
+  and resolve from luarocks.org (see distribution/luarocks.feature).
 
   Scenario: add --path writes the dependency and preserves comments
     Given a file "luabox.toml" containing:
@@ -104,7 +104,7 @@ Feature: Dependency management
     And "luabox.toml" contains "# keep me: comments survive luabox remove"
     And "luabox.lock" does not contain "mylib"
 
-  Scenario: a registry dependency needs a configured registry
+  Scenario: a version-requirement dependency in luabox.toml points to the rockspec
     Given a file "luabox.toml" containing:
       """
       [package]
@@ -117,9 +117,9 @@ Feature: Dependency management
       """
     When I run "luabox install"
     Then the command fails
-    And stderr contains "LUABOX_REGISTRY"
+    And stderr contains "rockspec"
 
-  Scenario: add without --path or --git needs a configured registry
+  Scenario: add without --path or --git points to the rockspec
     Given a file "luabox.toml" containing:
       """
       [package]
@@ -129,7 +129,7 @@ Feature: Dependency management
       """
     When I run "luabox add penlight@1.14"
     Then the command fails
-    And stderr contains "LUABOX_REGISTRY"
+    And stderr contains "rockspec"
     And "luabox.toml" does not contain "penlight"
 
   @git

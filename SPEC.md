@@ -80,11 +80,9 @@ luabox build [--target <t>] [--out dir]               lower + emit
 luabox bundle [--minify] [--sourcemap]                single-file emit
 luabox run <script|task>                              run via configured runtime / tasks
 luabox doc [--open]                                   docs from annotations
-luabox publish                                        registry publish
 luabox lsp                                            stdio LSP server
 luabox toolchain [install|pin|list]                   runtime version mgmt (rustup analog)
 luabox vendor                                         vendor deps into tree
-luabox audit                                          advisory DB check
 luabox explain LB0xxx                                 rustc-style diagnostic docs
 ```
 
@@ -127,14 +125,14 @@ members = ["packages/*"]
 
 ## 6. Package manager
 
+luabox follows the pnpm/bun model: **[luarocks.org](https://luarocks.org) is the registry**, and the **rockspec is the package manifest**. A project's `*.rockspec` owns its name, version, and registry dependencies (its `dependencies`/`test_dependencies`, bare rock names in LuaRocks constraint syntax, translated to semver). `luabox.toml` is tool configuration (edition, build, types, tasks) plus the source dependencies a rockspec cannot express — `path`, `git`, and `workspace` entries; a version-requirement dependency there is an error pointing at the rockspec. There is no first-party registry.
+
 - **Resolution:** full semver, PubGrub solver (cargo-quality conflict messages).
-- **Registry:** first-party (static-CDN sparse index) **plus** transparent LuaRocks bridge via rockspec translation.
+- **Registry:** luarocks.org, bridged transparently by reading rockspecs statically (no `luarocks` CLI needed); `LUABOX_LUAROCKS_MIRROR` points resolution at a local mirror for hermetic/offline installs.
 - **Store:** global content-addressed cache (`~/.luabox/store`), hard-link/reflink into projects (bun/pnpm model).
-- Dep kinds: registry, git (rev/tag/branch), path, workspace.
+- Dep kinds: registry (rockspec), git (rev/tag/branch), path, workspace.
 - Packages declare `lua-versions = ["5.1", "5.4"]`; resolver refuses incompatible graphs or selects pre-lowered published variants.
-- `luabox publish`: builds, checks, tests, verifies annotation coverage on public API, signs (sigstore). Yank, no deletion.
-- `luabox audit`: RUSTSEC-analog advisory DB.
-- C modules: **declared, not built** — prebuilt artifacts per runtime/platform; luarocks build fallback with loud warning. Luabox is not a C build system.
+- C modules: **declared, not built** — pure-Lua rocks only; a C/native rock is rejected with a clear error. Luabox is not a C build system.
 
 ## 7. Bundler
 

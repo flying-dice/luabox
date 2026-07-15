@@ -8,7 +8,15 @@ Feature: Project scaffolding — luabox init / luabox new
     Then the command succeeds
     And the file "luabox.toml" exists
     And "luabox.toml" contains 'edition = "5.4"'
+    And "luabox.toml" does not contain "[dependencies]"
+    And a rockspec file exists
     And the file "src/main.lua" exists
+
+  Scenario: a scaffolded project passes check
+    Given an empty directory
+    And I run "luabox init --edition 5.4"
+    When I run "luabox check"
+    Then the command succeeds
 
   Scenario: init a library project
     Given an empty directory
@@ -36,9 +44,12 @@ Feature: Project scaffolding — luabox init / luabox new
     Then the command fails
     And stderr contains "unknown edition"
 
-  Scenario: new scaffolds into a fresh directory
+  Scenario: new scaffolds a slimmed manifest and a rockspec
     Given an empty directory
     When I run "luabox new my-tool"
     Then the command succeeds
     And the file "my-tool/luabox.toml" exists
-    And "my-tool/luabox.toml" contains 'name = "my-tool"'
+    And "my-tool/luabox.toml" contains 'edition = "5.4"'
+    And the file "my-tool/my-tool-0.1.0-1.rockspec" exists
+    And "my-tool/my-tool-0.1.0-1.rockspec" contains 'package = "my-tool"'
+    And "my-tool/my-tool-0.1.0-1.rockspec" contains 'url = "git+https://github.com/OWNER/my-tool.git"'

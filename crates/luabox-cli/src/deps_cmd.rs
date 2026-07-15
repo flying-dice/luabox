@@ -1,26 +1,32 @@
 //! `luabox add/remove/install/update/vendor` — dependency management
 //! (SPEC.md §4, §6).
 //!
+//! # The two manifests
+//!
+//! luabox follows the pnpm/bun model: the project's **rockspec**
+//! (`*.rockspec`) is the package manifest — it owns the package name,
+//! version, and *registry* dependencies (resolved from luarocks.org).
+//! `luabox.toml` is tool config plus the *source* dependencies a rockspec
+//! cannot express (`path`/`git`/`workspace`). Both are discovered together
+//! and fused into one resolvable view by
+//! [`luabox_resolve::effective_manifest`].
+//!
 //! # Command semantics
 //!
 //! - **add** — comment-preserving `luabox.toml` edit
-//!   (`Manifest::set_dependency_entry`), then an install. Sources:
-//!   `--path <dir>`, `--git <url> [--rev|--tag|--branch]`, and registry
-//!   specs (`luabox add penlight@1.14`) when `LUABOX_REGISTRY` names a
-//!   registry (SPEC.md §6; without one, registry specs error with setup
-//!   guidance — there is no hosted default registry yet).
+//!   (`Manifest::set_dependency_entry`) for `--path <dir>` /
+//!   `--git <url> [--rev|--tag|--branch]` sources, then an install. A bare
+//!   registry spec (`luabox add penlight@1.14`) now belongs in the rockspec;
+//!   editing the rockspec arrives in a later wave, so it errors with that
+//!   guidance for now.
 //! - **remove** — comment-preserving edit (`Manifest::remove_dependency`)
 //!   plus a re-install, so `luabox.lock` and `lua_modules/` drop the entry.
 //! - **install** — resolve (respecting an existing `luabox.lock` for
 //!   minimal churn) over `PathProvider` + `GitProvider` +
-//!   `RegistryProvider` (when configured), write the lockfile, and
-//!   materialize every non-path package from the content-addressed store
-//!   into `lua_modules/<name>/`. Registry artifacts are fetched as tars,
-//!   extracted with the `tar` CLI (the toolchain installer's approach),
-//!   interned via `Store::put_tree`, and their tree hash is verified
-//!   against the index `checksum` before anything is materialized.
-//!   Idempotent: when the lockfile and `lua_modules` are already current
-//!   it prints `up to date` and does no work.
+//!   `LuaRocksProvider`, write the lockfile, and materialize every non-path
+//!   package from the content-addressed store into `lua_modules/<name>/`.
+//!   Idempotent: when the lockfile and `lua_modules` are already current it
+//!   prints `up to date` and does no work.
 //! - **update `[pkg]`** — re-resolve ignoring the lockfile (or just
 //!   dropping `pkg`'s pin), re-fetch mutable git refs, rewrite the lock,
 //!   re-materialize.
@@ -44,14 +50,13 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, anyhow, bail};
+use luabox_resolve::luarocks::rockspec::{self, Rockspec};
 use luabox_resolve::manifest::{Dependency, GitDependency, PathDependency};
 use luabox_resolve::{
-    GitProvider, LOCKFILE_NAME, LUAROCKS_PREFIX, Lockfile, LuaRocksProvider, Manifest, PackageId,
-    PathProvider, REGISTRY_ENV, Registry, RegistryProvider, Resolution, ResolveError, Source,
-    StackedProvider, resolve,
+    GitProvider, LOCKFILE_NAME, Lockfile, LuaRocksProvider, Manifest, PackageId, PathProvider,
+    Resolution, ResolveError, Source, StackedProvider, effective_manifest, resolve,
 };
 use luabox_store::{LinkMode, Store};
 
@@ -96,22 +101,16 @@ pub fn add(cwd: &Path, opts: &AddOptions) -> anyhow::Result<()> {
             version: version.clone(),
         })
     } else {
-        let Some(registry) = registry_from_env()? else {
-            bail!(
-                "cannot add `{name}` as a registry dependency: no registry is \
-                 configured. Set {REGISTRY_ENV} to your registry's location (a \
-                 directory, file:// URL, or https:// base — there is no hosted \
-                 default registry yet, SPEC.md §6), or use `--path <dir>` / \
-                 `--git <url>`"
-            );
-        };
-        let req = match version {
-            Some(req) => req,
-            // `luabox add pkg` with no version: default to a caret
-            // requirement on the newest published version, cargo-style.
-            None => default_registry_req(&registry, &name)?,
-        };
-        Dependency::Version(req)
+        // A bare registry spec is a luarocks.org dependency, and those live
+        // in the project's rockspec now (pnpm-style, SPEC.md §6). Editing the
+        // rockspec from `luabox add` lands in a later wave; until then,
+        // declare it in the rockspec by hand.
+        bail!(
+            "`{name}` is a registry (luarocks.org) dependency — declare it in your \
+             project's rockspec `dependencies` for now (rockspec editing from \
+             `luabox add` arrives in a later wave). `--path <dir>` and \
+             `--git <url>` dependencies are written to `luabox.toml` and work today"
+        );
     };
 
     project.manifest.set_dependency_entry(&name, &dep, opts.dev);
@@ -260,32 +259,19 @@ fn repin_git_tags(
 /// `vendor/<name>/`.
 pub fn vendor(cwd: &Path) -> anyhow::Result<()> {
     let project = discover(cwd)?;
-    let registry = registry_from_env()?;
-    ensure_registry_configured(&project.manifest, registry.as_ref())?;
+    let manifest = project.resolved_manifest()?;
 
     let store = Store::open(store_root()?);
     let git = GitProvider::new(store.root().join("git"));
     let paths = PathProvider::new();
     let luarocks = LuaRocksProvider::from_env(store.root().join("luarocks"));
     let lock = read_lockfile(&project, &LockUse::Full)?;
-    let registry_provider = registry_provider_for(registry.as_ref(), lock.as_ref());
-    let mut providers: Vec<&dyn luabox_resolve::PackageProvider> = vec![&paths, &git, &luarocks];
-    if let Some(provider) = &registry_provider {
-        providers.push(provider);
-    }
+    let providers: Vec<&dyn luabox_resolve::PackageProvider> = vec![&paths, &git, &luarocks];
     let stacked = StackedProvider::new(providers);
-    let resolution = run_resolve(&project, &stacked, lock.as_ref())?;
+    let resolution = run_resolve(&manifest, &project.root, &stacked, lock.as_ref())?;
 
     let vendor_dir = project.root.join(VENDOR_DIR);
-    let vendored = materialize(
-        &resolution,
-        &store,
-        &git,
-        &luarocks,
-        registry.as_ref(),
-        &vendor_dir,
-        LinkMode::Copy,
-    )?;
+    let vendored = materialize(&resolution, &store, &git, &luarocks, &vendor_dir, LinkMode::Copy)?;
     if vendored.is_empty() {
         println!(
             "nothing to vendor: every dependency is a path/workspace dependency (used in place)"
@@ -315,19 +301,34 @@ enum LockUse {
     Without(String),
 }
 
-/// A discovered project: nearest ancestor directory holding `luabox.toml`.
+/// A discovered project: nearest ancestor directory holding `luabox.toml`,
+/// plus its rockspec package manifest when one is present.
 pub(crate) struct Project {
     pub(crate) root: PathBuf,
     pub(crate) manifest_path: PathBuf,
+    /// The editable `luabox.toml` (tool config + path/git sources).
     pub(crate) manifest: Manifest,
+    /// The project's parsed `*.rockspec` (package name/version + registry
+    /// deps), when the root has exactly one.
+    pub(crate) rockspec: Option<Rockspec>,
+}
+
+impl Project {
+    /// The single [`Manifest`] the resolver consumes: `luabox.toml` fused with
+    /// the rockspec's name/version/registry deps
+    /// ([`luabox_resolve::effective_manifest`]). A registry dep left in
+    /// `luabox.toml`, or a name declared in both manifests, surfaces here as a
+    /// hard error.
+    fn resolved_manifest(&self) -> anyhow::Result<Manifest> {
+        effective_manifest(&self.manifest, self.rockspec.as_ref()).map_err(|e| anyhow!("{e}"))
+    }
 }
 
 /// Resolve + lock + materialize — the shared body of install/add/remove/
 /// update. Prints `up to date` and does nothing when a `Full` sync finds
 /// the lockfile byte-identical and `lua_modules` complete.
 fn sync(project: &Project, lock_use: &LockUse, refresh_git: bool) -> anyhow::Result<()> {
-    let registry = registry_from_env()?;
-    ensure_registry_configured(&project.manifest, registry.as_ref())?;
+    let manifest = project.resolved_manifest()?;
 
     let lock_path = project.root.join(LOCKFILE_NAME);
     let existing_text = fs::read_to_string(&lock_path).ok();
@@ -337,13 +338,9 @@ fn sync(project: &Project, lock_use: &LockUse, refresh_git: bool) -> anyhow::Res
     let git = GitProvider::new(store.root().join("git")).with_refresh(refresh_git);
     let paths = PathProvider::new();
     let luarocks = LuaRocksProvider::from_env(store.root().join("luarocks"));
-    let registry_provider = registry_provider_for(registry.as_ref(), lock.as_ref());
-    let mut providers: Vec<&dyn luabox_resolve::PackageProvider> = vec![&paths, &git, &luarocks];
-    if let Some(provider) = &registry_provider {
-        providers.push(provider);
-    }
+    let providers: Vec<&dyn luabox_resolve::PackageProvider> = vec![&paths, &git, &luarocks];
     let stacked = StackedProvider::new(providers);
-    let resolution = run_resolve(project, &stacked, lock.as_ref())?;
+    let resolution = run_resolve(&manifest, &project.root, &stacked, lock.as_ref())?;
 
     let new_text = resolution.lockfile.to_toml_string();
     let modules_dir = project.root.join(MODULES_DIR);
@@ -361,15 +358,7 @@ fn sync(project: &Project, lock_use: &LockUse, refresh_git: bool) -> anyhow::Res
             .with_context(|| format!("cannot write `{}`", lock_path.display()))?;
     }
 
-    let installed = materialize(
-        &resolution,
-        &store,
-        &git,
-        &luarocks,
-        registry.as_ref(),
-        &modules_dir,
-        LinkMode::Auto,
-    )?;
+    let installed = materialize(&resolution, &store, &git, &luarocks, &modules_dir, LinkMode::Auto)?;
     prune_stale_modules(&resolution, &modules_dir)?;
 
     let path_count = resolution
@@ -412,116 +401,37 @@ fn read_lockfile(project: &Project, lock_use: &LockUse) -> anyhow::Result<Option
 /// Runs the PubGrub resolve, translating failures into command errors
 /// (conflict reports render via `ResolveError`'s `Display`).
 fn run_resolve(
-    project: &Project,
+    manifest: &Manifest,
+    root: &Path,
     provider: &dyn luabox_resolve::PackageProvider,
     lock: Option<&Lockfile>,
 ) -> anyhow::Result<Resolution> {
-    resolve(&project.manifest, &project.root, provider, lock).map_err(|e| match &e {
+    resolve(manifest, root, provider, lock).map_err(|e| match &e {
         ResolveError::Provider(
             luabox_resolve::ProviderError::UnknownPackage { .. }
             | luabox_resolve::ProviderError::UnsupportedSource { .. },
         ) => anyhow!(
-            "{e}\nnote: registry dependencies resolve from the registry named by \
-             {REGISTRY_ENV}; check that it provides this package (SPEC.md §6)"
+            "{e}\nnote: registry dependencies resolve from luarocks.org (declared in \
+             the project's rockspec); check that it provides this rock (SPEC.md §6)"
         ),
         _ => anyhow!("{e}"),
     })
 }
 
-/// The registry named by `LUABOX_REGISTRY`, if any. `None` simply means no
-/// registry is configured (there is no hosted default yet, SPEC.md §6).
-pub(crate) fn registry_from_env() -> anyhow::Result<Option<Registry>> {
-    match env::var(REGISTRY_ENV) {
-        Ok(spec) if !spec.trim().is_empty() => Ok(Some(Registry::open(&spec)?)),
-        _ => Ok(None),
-    }
-}
-
-/// A [`RegistryProvider`] over `registry`, exempting the lockfile's pins
-/// from yank filtering (so a project whose locked version was yanked
-/// upstream still restores).
-fn registry_provider_for(
-    registry: Option<&Registry>,
-    lock: Option<&Lockfile>,
-) -> Option<RegistryProvider> {
-    registry.map(|registry| {
-        let provider = RegistryProvider::new(registry.clone());
-        match lock {
-            Some(lock) => provider.with_locked(lock),
-            None => provider,
-        }
-    })
-}
-
-/// Registry deps need a configured registry; fail with setup guidance
-/// before resolution produces a cryptic `UnknownPackage`.
-fn ensure_registry_configured(
-    manifest: &Manifest,
-    registry: Option<&Registry>,
-) -> anyhow::Result<()> {
-    if registry.is_some() {
-        return Ok(());
-    }
-    let registry_deps: Vec<&str> = manifest
-        .dependencies
-        .iter()
-        .chain(&manifest.dev_dependencies)
-        // `luarocks/<rock>` version deps resolve through the LuaRocks bridge,
-        // not the first-party registry — they need no `LUABOX_REGISTRY`.
-        .filter(|(name, dep)| {
-            matches!(dep, Dependency::Version(_)) && !name.starts_with(LUAROCKS_PREFIX)
-        })
-        .map(|(name, _)| name.as_str())
-        .collect();
-    if let Some(first) = registry_deps.first() {
-        bail!(
-            "`{first}` is a registry dependency, but no registry is configured. \
-             Set {REGISTRY_ENV} to your registry's location (a directory, \
-             file:// URL, or https:// base — there is no hosted default \
-             registry yet, SPEC.md §6), or use a path/git dependency"
-        );
-    }
-    Ok(())
-}
-
-/// `^<newest published version>` for `luabox add <pkg>` without a version.
-fn default_registry_req(registry: &Registry, name: &str) -> anyhow::Result<String> {
-    use luabox_resolve::PackageProvider as _;
-    let provider = RegistryProvider::new(registry.clone());
-    let versions = provider
-        .list_versions(&PackageId::registry(name))
-        .map_err(|e| {
-            anyhow!(
-                "cannot add `{name}`: {e} (registry: `{}`)",
-                registry.location()
-            )
-        })?;
-    let newest = versions
-        .into_iter()
-        .max()
-        .ok_or_else(|| anyhow!("`{name}` has no non-yanked versions in the registry"))?;
-    Ok(format!("^{newest}"))
-}
-
 /// Interns every non-path package into the store and links it into
 /// `dest_root/<name>/`. Path/workspace packages are used in place and
-/// skipped. Registry packages are fetched from the registry as artifact
-/// tars, extracted, and their tree hash is **verified against the index
-/// checksum** before materializing. Returns the names materialized.
+/// skipped. Registry packages are fetched from luarocks.org (or its mirror)
+/// as a laid-out module tree. Returns the names materialized.
 fn materialize(
     resolution: &Resolution,
     store: &Store,
     git: &GitProvider,
     luarocks: &LuaRocksProvider,
-    registry: Option<&Registry>,
     dest_root: &Path,
     mode: LinkMode,
 ) -> anyhow::Result<Vec<String>> {
     let mut installed = Vec::new();
     for package in &resolution.packages {
-        // Keeps a registry package's extraction dir alive until interned
-        // (dropped — deleted — at the end of the loop iteration).
-        let _staging: tempfile::TempDir;
         let tree_dir = match &package.source {
             Source::Path { .. } => continue,
             Source::Git { url, reference } => {
@@ -529,54 +439,15 @@ fn materialize(
                     .map_err(|e| anyhow!("fetching `{}`: {e}", package.name))?
                     .dir
             }
-            // A `luarocks/<rock>` package rides on `Source::Registry` (the
-            // name prefix routes it to the bridge, SPEC.md §6): fetch the
-            // rock's module tree instead of a registry artifact.
-            Source::Registry if package.name.starts_with(LUAROCKS_PREFIX) => luarocks
+            // A registry package is a luarocks.org rock: fetch its laid-out
+            // module tree (SPEC.md §6).
+            Source::Registry => luarocks
                 .fetch(&PackageId::registry(&package.name), &package.version)
                 .map_err(|e| anyhow!("fetching `{}`: {e}", package.name))?,
-            Source::Registry => {
-                let Some(registry) = registry else {
-                    bail!(
-                        "`{}` is a registry package, but no registry is configured; \
-                         set {REGISTRY_ENV} (SPEC.md §6)",
-                        package.name
-                    );
-                };
-                let staging = tempfile::tempdir()
-                    .context("cannot create a temp dir for the registry artifact")?;
-                let version = package.version.to_string();
-                let tar = registry
-                    .fetch_artifact(&package.name, &version, staging.path())
-                    .map_err(|e| anyhow!("fetching `{}`: {e}", package.name))?;
-                let tree = staging.path().join("tree");
-                _staging = staging;
-                fs::create_dir_all(&tree)
-                    .with_context(|| format!("cannot create `{}`", tree.display()))?;
-                extract_tar(&tar, &tree)
-                    .with_context(|| format!("extracting `{}@{version}`", package.name))?;
-                tree
-            }
         };
         let tree = store
             .put_tree(&tree_dir)
             .with_context(|| format!("interning `{}` into the store", package.name))?;
-        // SPEC.md §6: a registry artifact must hash to the checksum its
-        // index line promised, or nothing is installed.
-        if matches!(package.source, Source::Registry)
-            && let Some(expected) = &package.checksum
-        {
-            let actual = tree.checksum_string();
-            if &actual != expected {
-                bail!(
-                    "checksum mismatch for `{}@{}`: the registry index says \
-                     {expected}, but the artifact hashes to {actual}. Refusing \
-                     to install a corrupt or tampered package",
-                    package.name,
-                    package.version
-                );
-            }
-        }
         store
             .write_package_manifest(&package.name, &package.version.to_string(), &tree)
             .with_context(|| format!("indexing `{}` in the store", package.name))?;
@@ -628,48 +499,6 @@ fn prune_stale_modules(resolution: &Resolution, modules_dir: &Path) -> anyhow::R
     Ok(())
 }
 
-// --- tar transport -----------------------------------------------------------
-
-/// `tar` to shell out to. On Windows, prefer the system `bsdtar` so a
-/// git-shipped GNU tar on PATH doesn't shadow it (mirrors the toolchain
-/// installer — archives are handled by the `tar` CLI, no archive crate).
-pub(crate) fn tar_program() -> PathBuf {
-    if cfg!(windows)
-        && let Ok(root) = env::var("SystemRoot")
-    {
-        let system_tar = Path::new(&root).join("System32").join("tar.exe");
-        if system_tar.is_file() {
-            return system_tar;
-        }
-    }
-    PathBuf::from("tar")
-}
-
-/// Unpack `archive` into `dest` with `tar -xf`.
-pub(crate) fn extract_tar(archive: &Path, dest: &Path) -> anyhow::Result<()> {
-    let tar = tar_program();
-    let status = Command::new(&tar)
-        .arg("-xf")
-        .arg(archive)
-        .arg("-C")
-        .arg(dest)
-        .status()
-        .with_context(|| {
-            format!(
-                "failed to run `{}` — registry artifacts need `tar` on PATH",
-                tar.display()
-            )
-        })?;
-    if !status.success() {
-        bail!(
-            "`tar -xf` failed to unpack `{}` (exit {})",
-            archive.display(),
-            status.code().unwrap_or(-1)
-        );
-    }
-    Ok(())
-}
-
 // --- project discovery and environment -------------------------------------
 
 /// Nearest `luabox.toml` walking up from `cwd`, cargo-style. Dependency
@@ -677,11 +506,46 @@ pub(crate) fn extract_tar(archive: &Path, dest: &Path) -> anyhow::Result<()> {
 /// resolve without one.
 pub(crate) fn discover(cwd: &Path) -> anyhow::Result<Project> {
     let (root, manifest) = crate::project::discover_required(cwd)?;
+    let rockspec = discover_rockspec(&root)?;
     Ok(Project {
         manifest_path: root.join("luabox.toml"),
+        rockspec,
         root,
         manifest,
     })
+}
+
+/// The project's rockspec package manifest: the sole `<root>/*.rockspec`,
+/// parsed statically. `None` when there is none; more than one is an error
+/// (the project's package identity would be ambiguous).
+fn discover_rockspec(root: &Path) -> anyhow::Result<Option<Rockspec>> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    for entry in fs::read_dir(root).with_context(|| format!("reading `{}`", root.display()))? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("rockspec") {
+            found.push(path);
+        }
+    }
+    found.sort();
+    match found.as_slice() {
+        [] => Ok(None),
+        [path] => {
+            let text = fs::read_to_string(path)
+                .with_context(|| format!("cannot read `{}`", path.display()))?;
+            Ok(Some(rockspec::read(&text)))
+        }
+        many => {
+            let names: Vec<String> = many
+                .iter()
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect();
+            bail!(
+                "the project has more than one rockspec ({}) — keep exactly one so the \
+                 package's name and version are unambiguous",
+                names.join(", ")
+            )
+        }
+    }
 }
 
 /// The content-addressed store root: `LUABOX_STORE` env override, else

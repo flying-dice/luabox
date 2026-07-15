@@ -36,6 +36,9 @@ pub struct Rockspec {
     pub source: Source,
     /// Raw LuaRocks dependency strings (`"lpeg >= 1.0"`), in order.
     pub dependencies: Vec<String>,
+    /// Raw LuaRocks `test_dependencies` strings — dev-dependencies of the
+    /// project when a rockspec is used as luabox's package manifest.
+    pub test_dependencies: Vec<String>,
     pub build: Build,
 }
 
@@ -93,16 +96,20 @@ pub fn read(text: &str) -> Rockspec {
         .and_then(Value::as_table)
         .map(read_source)
         .unwrap_or_default();
-    let dependencies = scope
-        .get("dependencies")
-        .and_then(Value::as_table)
-        .map(|t| {
-            t.array
-                .iter()
-                .filter_map(Value::as_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let read_string_array = |key: &str| {
+        scope
+            .get(key)
+            .and_then(Value::as_table)
+            .map(|t| {
+                t.array
+                    .iter()
+                    .filter_map(Value::as_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let dependencies = read_string_array("dependencies");
+    let test_dependencies = read_string_array("test_dependencies");
     let mut build = scope
         .get("build")
         .and_then(Value::as_table)
@@ -119,6 +126,7 @@ pub fn read(text: &str) -> Rockspec {
         version,
         source,
         dependencies,
+        test_dependencies,
         build,
     }
 }
@@ -687,6 +695,7 @@ build = {
         );
         assert_eq!(spec.source.dir.as_deref(), Some("inspect.lua-3.1.3"));
         assert_eq!(spec.dependencies, vec!["lua >= 5.1".to_owned()]);
+        assert!(spec.test_dependencies.is_empty());
         assert_eq!(spec.build.build_type.as_deref(), Some("builtin"));
         assert_eq!(
             spec.build.modules.get("inspect"),
@@ -728,6 +737,22 @@ build = {
             spec.build.modules.get("say"),
             Some(&ModuleSpec::LuaFile("src/say/init.lua".to_owned()))
         );
+    }
+
+    #[test]
+    fn reads_test_dependencies_separately() {
+        let text = r#"
+package = "widget"
+version = "1.0-1"
+dependencies = { "lua >= 5.1", "lpeg >= 1.0" }
+test_dependencies = { "busted >= 2.0" }
+"#;
+        let spec = read(text);
+        assert_eq!(
+            spec.dependencies,
+            vec!["lua >= 5.1".to_owned(), "lpeg >= 1.0".to_owned()]
+        );
+        assert_eq!(spec.test_dependencies, vec!["busted >= 2.0".to_owned()]);
     }
 
     #[test]

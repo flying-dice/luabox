@@ -81,33 +81,34 @@ fn lists_translated_versions_from_a_mirror() {
     build_mirror(&mirror);
     let provider = provider(&tmp.path().join("cache"), &mirror);
 
+    // Registry packages are keyed by bare rock name (no prefix).
     let versions = provider
-        .list_versions(&PackageId::registry("luarocks/a"))
+        .list_versions(&PackageId::registry("a"))
         .unwrap();
     assert_eq!(versions, vec![Version::new(1, 0, 0)]);
 
-    // A non-luarocks package is not this provider's job (falls through).
+    // A path/git source is not this provider's job (falls through).
     assert!(
         provider
-            .list_versions(&PackageId::registry("a"))
+            .list_versions(&PackageId::path("a", "/tmp/a"))
             .is_err_and(|e| matches!(e, luabox_resolve::ProviderError::UnsupportedSource { .. }))
     );
 }
 
 #[test]
-fn dependencies_are_prefixed_and_lua_is_metadata() {
+fn dependencies_are_bare_named_and_lua_is_metadata() {
     let tmp = tempfile::tempdir().unwrap();
     let mirror = tmp.path().join("mirror");
     build_mirror(&mirror);
     let provider = provider(&tmp.path().join("cache"), &mirror);
-    let id = PackageId::registry("luarocks/a");
+    let id = PackageId::registry("a");
     let v = Version::new(1, 0, 0);
 
     let deps = provider.dependencies(&id, &v).unwrap();
-    // `b` is bridged (prefixed); `lua` is NOT a dependency.
-    assert!(deps.contains_key("luarocks/b"), "deps: {deps:?}");
+    // `b` is bridged by its bare name; `lua` is NOT a dependency.
+    assert!(deps.contains_key("b"), "deps: {deps:?}");
     assert!(!deps.keys().any(|k| k.contains("lua ") || k == "lua"));
-    let luabox_resolve::manifest::Dependency::Version(req) = &deps["luarocks/b"] else {
+    let luabox_resolve::manifest::Dependency::Version(req) = &deps["b"] else {
         panic!("expected a version requirement");
     };
     assert_eq!(req, ">=2.0");
@@ -126,13 +127,13 @@ fn fetch_lays_out_the_module_tree() {
 
     // Single top-level module `a`.
     let tree = provider
-        .fetch(&PackageId::registry("luarocks/a"), &Version::new(1, 0, 0))
+        .fetch(&PackageId::registry("a"), &Version::new(1, 0, 0))
         .unwrap();
     assert!(tree.join("a.lua").is_file(), "a.lua missing in {tree:?}");
 
     // Dotted module `b.core` → nested path `b/core.lua`.
     let tree = provider
-        .fetch(&PackageId::registry("luarocks/b"), &Version::new(2, 1, 0))
+        .fetch(&PackageId::registry("b"), &Version::new(2, 1, 0))
         .unwrap();
     assert!(
         tree.join("b").join("core.lua").is_file(),
@@ -159,10 +160,7 @@ build = {
     );
     let provider = provider(&tmp.path().join("cache"), &mirror);
     let err = provider
-        .dependencies(
-            &PackageId::registry("luarocks/luasocket"),
-            &Version::new(3, 0, 0),
-        )
+        .dependencies(&PackageId::registry("luasocket"), &Version::new(3, 0, 0))
         .unwrap_err();
     let text = err.to_string();
     assert!(text.contains("luasocket"), "{text}");
@@ -176,26 +174,25 @@ fn resolve_bridges_a_rock_and_its_transitive_dependency() {
     build_mirror(&mirror);
     let provider = provider(&tmp.path().join("cache"), &mirror);
 
-    let manifest = Manifest::parse(
-        "[package]\n\
-         name = \"app\"\n\
-         version = \"0.1.0\"\n\
-         edition = \"5.4\"\n\
-         \n\
-         [dependencies]\n\
-         \"luarocks/a\" = \"1.0\"\n",
-    )
-    .expect("manifest parses");
+    // A rockspec declares the registry dependency; the rockspec is the
+    // package manifest, merged onto an edition-only luabox.toml.
+    let manifest = Manifest::parse("[package]\nedition = \"5.4\"\n").expect("manifest parses");
+    let spec = luabox_resolve::luarocks::rockspec::read(
+        "package = \"app\"\nversion = \"0.1.0-1\"\ndependencies = { \"a >= 1.0\" }\n",
+    );
+    let effective = luabox_resolve::effective_manifest(&manifest, Some(&spec))
+        .expect("merge succeeds");
 
-    let resolution = resolve(&manifest, tmp.path(), &provider, None).expect("resolve succeeds");
+    let resolution =
+        resolve(&effective, tmp.path(), &provider, None).expect("resolve succeeds");
     let names: Vec<&str> = resolution
         .packages
         .iter()
         .map(|p| p.name.as_str())
         .collect();
-    assert!(names.contains(&"luarocks/a"), "{names:?}");
+    assert!(names.contains(&"a"), "{names:?}");
     assert!(
-        names.contains(&"luarocks/b"),
+        names.contains(&"b"),
         "transitive rock missing: {names:?}"
     );
 }
@@ -226,7 +223,7 @@ fn live_resolve_and_fetch_a_real_pure_lua_rock() {
     let tmp = tempfile::tempdir().unwrap();
     // No mirror: hit the real rocks server, caching under `cache`.
     let provider = LuaRocksProvider::new(tmp.path().join("cache"));
-    let id = PackageId::registry("luarocks/inspect");
+    let id = PackageId::registry("inspect");
 
     let versions = provider.list_versions(&id).expect("list inspect versions");
     assert!(

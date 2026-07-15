@@ -141,11 +141,31 @@ mod tests {
     }
 
     #[test]
-    fn missing_required_package_fields_all_reported_together() {
+    fn missing_edition_is_reported_but_name_version_are_optional() {
+        // `edition` is a tool concern and stays required; `name`/`version`
+        // are optional in `luabox.toml` because the rockspec supplies them
+        // (SPEC.md §6).
         let errors = Manifest::parse("[package]\nlicense = \"MIT\"\n").unwrap_err();
-        assert!(errors.iter().any(|e| e.message.contains("package.name")));
-        assert!(errors.iter().any(|e| e.message.contains("package.version")));
         assert!(errors.iter().any(|e| e.message.contains("package.edition")));
+        assert!(
+            !errors.iter().any(|e| e.message.contains("package.name")),
+            "name is optional now"
+        );
+        assert!(
+            !errors.iter().any(|e| e.message.contains("package.version")),
+            "version is optional now"
+        );
+    }
+
+    #[test]
+    fn package_without_name_or_version_parses() {
+        // The slimmed `luabox.toml` scaffold: edition only, rockspec owns the
+        // rest.
+        let manifest =
+            Manifest::parse("[package]\nedition = \"5.4\"\n").expect("edition-only manifest valid");
+        assert!(manifest.package.name.is_empty());
+        assert!(manifest.package.version.is_empty());
+        assert_eq!(manifest.package.edition, "5.4");
     }
 
     #[test]

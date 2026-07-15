@@ -358,14 +358,18 @@ fn parse_package(root: &Table, errors: &mut Vec<ManifestError>) -> Package {
     };
     check_unknown_keys(table, "[package] key", PACKAGE_KEYS, errors);
 
-    let name = get_string(table, "package", "name", true, errors).unwrap_or_default();
+    // `name` and `version` are optional in `luabox.toml`: the project's
+    // rockspec is the package manifest and supplies them (SPEC.md §6). When
+    // no rockspec is present `luabox.toml` remains the fallback, so a value
+    // that *is* written here is still shape-checked.
+    let name = get_string(table, "package", "name", false, errors).unwrap_or_default();
     if !name.is_empty()
         && let Some(message) = validate_package_name(&name)
     {
         errors.push(ManifestError::new(message, item_span(table, "name")));
     }
 
-    let version = get_string(table, "package", "version", true, errors).unwrap_or_default();
+    let version = get_string(table, "package", "version", false, errors).unwrap_or_default();
     if !version.is_empty() && !looks_like_semver(&version) {
         errors.push(ManifestError::new(
             format!(

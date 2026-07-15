@@ -1,12 +1,12 @@
-//! The transparent LuaRocks bridge (SPEC.md §6).
+//! The luarocks.org bridge — luabox's registry (SPEC.md §6).
 //!
-//! Dependencies written `luarocks/<rock> = "<req>"` in `luabox.toml` resolve
-//! against [luarocks.org](https://luarocks.org) instead of the first-party
-//! registry: the `luarocks/` name prefix routes them here. [`LuaRocksProvider`]
-//! implements the same [`PackageProvider`] seam as the git and registry
-//! providers, so the PubGrub solver never learns rocks are special —
-//! [`StackedProvider`](crate::StackedProvider) simply tries this provider for
-//! any `luarocks/`-prefixed registry package.
+//! luabox follows the pnpm/bun model: [luarocks.org](https://luarocks.org) **is**
+//! the registry. A bare version-requirement dependency (`name = "^1.2"`, carried
+//! as a [`Source::Registry`] package) resolves here — there is no separate
+//! first-party registry. [`LuaRocksProvider`] implements the same
+//! [`PackageProvider`] seam as the git and path providers, so the PubGrub solver
+//! never learns rocks are special — [`StackedProvider`](crate::StackedProvider)
+//! simply routes every `Source::Registry` package to this provider.
 //!
 //! # How a rock becomes a package
 //!
@@ -16,8 +16,8 @@
 //!    one version collapse to one semver, keeping the highest revision.
 //! 2. **Metadata & dependencies** — the per-version *rockspec* (itself a Lua
 //!    file) is fetched and read statically ([`rockspec::read`]). Its
-//!    `dependencies` become `luarocks/<dep>` packages (recursively bridged),
-//!    their LuaRocks constraints translated to semver
+//!    `dependencies` become registry packages by bare name (recursively
+//!    bridged), their LuaRocks constraints translated to semver
 //!    ([`constraint::translate_constraint`]); the special `lua` dependency
 //!    becomes `lua-versions` metadata instead of a package.
 //! 3. **Source** — [`LuaRocksProvider::fetch`] downloads `source.url`
@@ -58,9 +58,6 @@ use crate::provider::{PackageId, PackageMeta, PackageProvider, ProviderError, So
 use constraint::{translate_constraint, translate_version};
 use rockspec::{ModuleSpec, Rockspec};
 
-/// The dependency-name prefix that routes to this provider.
-pub const LUAROCKS_PREFIX: &str = "luarocks/";
-
 /// The environment variable that points the provider at a local mirror
 /// directory instead of the network (hermetic mode).
 pub const MIRROR_ENV: &str = "LUABOX_LUAROCKS_MIRROR";
@@ -74,8 +71,9 @@ struct VersionIndex {
     by_semver: BTreeMap<Version, String>,
 }
 
-/// [`PackageProvider`] for `luarocks/<rock>` packages, backed by
-/// luarocks.org (or a local mirror), caching everything it fetches.
+/// [`PackageProvider`] for registry (luarocks.org) packages, keyed by bare
+/// rock name, backed by luarocks.org (or a local mirror), caching everything
+/// it fetches.
 pub struct LuaRocksProvider {
     /// `<store>/luarocks` — where fetched rockspecs and sources are mirrored.
     cache_dir: PathBuf,
@@ -128,14 +126,16 @@ impl LuaRocksProvider {
         self
     }
 
-    /// Whether `package` is a `luarocks/<rock>` package this provider owns.
+    /// Whether `package` is a registry package this provider owns (any
+    /// [`Source::Registry`] package — a bare rock name on luarocks.org).
     #[must_use]
     pub fn supports(package: &PackageId) -> bool {
         rock_name(package).is_some()
     }
 
-    /// Fetches (or reuses from cache) the module tree for `luarocks/<rock>` at
-    /// `version`, ready to intern into the content-addressed store. This is
+    /// Fetches (or reuses from cache) the module tree for registry rock
+    /// `package` at `version`, ready to intern into the content-addressed
+    /// store. This is
     /// the seam `luabox install` uses after resolution.
     ///
     /// # Errors
@@ -173,7 +173,7 @@ impl LuaRocksProvider {
         let luarocks_versions = self.list_luarocks_versions(rock)?;
         if luarocks_versions.is_empty() {
             return Err(ProviderError::UnknownPackage {
-                package: format!("{LUAROCKS_PREFIX}{rock}"),
+                package: rock.to_owned(),
             });
         }
         let mut index = VersionIndex::default();
@@ -191,7 +191,7 @@ impl LuaRocksProvider {
         }
         if index.by_semver.is_empty() {
             return Err(ProviderError::UnknownPackage {
-                package: format!("{LUAROCKS_PREFIX}{rock}"),
+                package: rock.to_owned(),
             });
         }
         self.versions
@@ -218,7 +218,7 @@ impl LuaRocksProvider {
         let index = self.version_index(rock)?;
         let luarocks_version = index.by_semver.get(version).cloned().ok_or_else(|| {
             ProviderError::VersionNotFound {
-                package: format!("{LUAROCKS_PREFIX}{rock}"),
+                package: rock.to_owned(),
                 version: version.to_string(),
             }
         })?;
@@ -462,16 +462,13 @@ impl PackageProvider for LuaRocksProvider {
             }
             let requirement = translate_constraint(constraints).map_err(|message| {
                 ProviderError::InvalidRequirement {
-                    dependent: format!("{LUAROCKS_PREFIX}{rock}"),
-                    dependency: format!("{LUAROCKS_PREFIX}{name}"),
+                    dependent: rock.to_owned(),
+                    dependency: name.to_owned(),
                     requirement: constraints.trim().to_owned(),
                     message,
                 }
             })?;
-            deps.insert(
-                format!("{LUAROCKS_PREFIX}{name}"),
-                Dependency::Version(requirement),
-            );
+            deps.insert(name.to_owned(), Dependency::Version(requirement));
         }
         Ok(deps)
     }
@@ -496,21 +493,39 @@ impl PackageProvider for LuaRocksProvider {
 // Free functions
 // -------------------------------------------------------------------------
 
-/// The rock name of a `luarocks/<rock>` registry package, or `None`.
+/// The rock name of a registry package (its bare name), or `None` for
+/// non-registry (path/git) sources.
 fn rock_name(package: &PackageId) -> Option<&str> {
-    if !matches!(package.source, Source::Registry) {
-        return None;
-    }
-    package.name.strip_prefix(LUAROCKS_PREFIX)
+    matches!(package.source, Source::Registry).then_some(package.name.as_str())
 }
 
 /// The rock name of a package this provider must own, or
 /// [`ProviderError::UnsupportedSource`] (so [`StackedProvider`] falls through
-/// for non-`luarocks/` packages).
+/// for path/git packages).
 fn require_rock(package: &PackageId) -> Result<&str, ProviderError> {
     rock_name(package).ok_or_else(|| ProviderError::UnsupportedSource {
         package: package.to_string(),
     })
+}
+
+/// Translates one raw LuaRocks dependency string (as found in a rockspec's
+/// `dependencies`/`test_dependencies`, e.g. `"lpeg >= 1.0, < 2.0"`) into a
+/// registry [`Dependency`] keyed by the bare rock name.
+///
+/// Returns `Ok(None)` for the special `lua` interpreter constraint (dialect
+/// metadata, not a rock) and for an empty entry. The rock's LuaRocks
+/// constraint grammar is translated to a Cargo requirement via
+/// [`translate_constraint`].
+///
+/// # Errors
+/// Propagates [`translate_constraint`]'s error for an absurd `~>` operand.
+pub fn dependency_from_spec(spec: &str) -> Result<Option<(String, Dependency)>, String> {
+    let (name, constraints) = parse_dependency_string(spec);
+    if name.is_empty() || name == "lua" {
+        return Ok(None);
+    }
+    let requirement = translate_constraint(constraints)?;
+    Ok(Some((name.to_owned(), Dependency::Version(requirement))))
 }
 
 /// The integer rock revision of a LuaRocks version (`1.4.1-3` → 3), or 0.
@@ -814,19 +829,28 @@ mod tests {
     use super::*;
 
     fn rock_id(name: &str) -> PackageId {
-        PackageId::registry(format!("{LUAROCKS_PREFIX}{name}"))
+        PackageId::registry(name)
     }
 
     #[test]
-    fn recognizes_only_luarocks_registry_packages() {
+    fn recognizes_registry_packages_by_bare_name() {
+        // Every registry package is a luarocks.org rock now (bare name, no
+        // prefix); path/git sources are not this provider's job.
         assert!(LuaRocksProvider::supports(&rock_id("penlight")));
-        assert!(!LuaRocksProvider::supports(&PackageId::registry(
-            "penlight"
-        )));
-        assert!(!LuaRocksProvider::supports(&PackageId::path(
-            "luarocks/x",
-            "/tmp/x"
-        )));
+        assert!(LuaRocksProvider::supports(&PackageId::registry("inspect")));
+        assert!(!LuaRocksProvider::supports(&PackageId::path("x", "/tmp/x")));
+    }
+
+    #[test]
+    fn dependency_from_spec_skips_lua_and_translates() {
+        assert_eq!(dependency_from_spec("lua >= 5.1").unwrap(), None);
+        assert_eq!(dependency_from_spec("").unwrap(), None);
+        let (name, dep) = dependency_from_spec("lpeg >= 1.0, < 2.0").unwrap().unwrap();
+        assert_eq!(name, "lpeg");
+        assert_eq!(dep, Dependency::Version(">=1.0, <2.0".to_owned()));
+        // Namespaced `user/rock` resolves by bare rock name.
+        let (name, _) = dependency_from_spec("hisham/luaposix").unwrap().unwrap();
+        assert_eq!(name, "luaposix");
     }
 
     #[test]

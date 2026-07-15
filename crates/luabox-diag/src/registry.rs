@@ -233,11 +233,6 @@ static REGISTRY: &[Entry] = &[
         title: "unresolvable definition package",
         explain: LB1002,
     },
-    Entry {
-        code: Code::new(1100),
-        title: "known security advisory affects a locked dependency",
-        explain: LB1100,
-    },
 ];
 
 /// Look up the explain entry for a code, if it is registered.
@@ -1546,39 +1541,6 @@ arrive with the package manager (SPEC.md §3, §6).
 Fix: create the defs file/directory, correct the name, or remove the entry.
 ";
 
-const LB1100: &str = "\
-# LB1100: known security advisory affects a locked dependency
-
-`luabox audit` (SPEC.md §6, §14) matched a package pinned in `luabox.lock`
-against a version range a loaded advisory marks as affected — and not
-excluded by a `patched` range, and not withdrawn.
-
-Advisories come from a local, directory-of-TOML-files database (RUSTSEC-
-analog; no hosted feed exists yet): `LUABOX_ADVISORY_DB`, or
-`~/.luabox/advisory-db` if unset. When neither location exists, `luabox
-audit` prints a note and exits `0` — a security check must never fail a
-build merely because no database was ever configured; once a database *is*
-present, findings are judged normally.
-
-Severity maps to how loud this diagnostic is:
-
-- `critical` / `high` → error (nonzero exit).
-- `medium` / `low` → warning (does not fail the command by itself).
-
-```
-$ luabox audit
-error[LB1100]: LBSEC-2026-0001 insecure-pkg 1.0.0: remote code execution (high)
-note: insecure-pkg evaluates untrusted input passed to run()
-note: more info: https://example.com/advisories/LBSEC-2026-0001
-audit: 1 advisory loaded, 1 finding (1 error, 0 warnings) against 1 locked package(s)
-```
-
-Upgrade the dependency to a patched version (`luabox update <pkg>`), pin an
-alternative, or — if the advisory genuinely does not apply to how the
-package is used — accept the risk consciously; there is no in-manifest
-suppression for this code yet (SPEC.md §19).
-";
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1590,7 +1552,7 @@ mod tests {
             "LB0300", "LB0301", "LB0302", "LB0303", "LB0304", "LB0305", "LB0306", "LB0307",
             "LB0308", "LB0309", "LB0310", "LB0311", "LB0312", "LB0313", "LB0314", "LB0315",
             "LB0316", "LB0500", "LB0501", "LB0502", "LB0503", "LB0504", "LB0505", "LB0506",
-            "LB0507", "LB0508", "LB0509", "LB1001", "LB1100",
+            "LB0507", "LB0508", "LB0509", "LB1001",
         ] {
             let code: Code = raw.parse().unwrap();
             assert!(explain(&code).is_some(), "{raw} missing from registry");

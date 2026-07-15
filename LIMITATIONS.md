@@ -132,27 +132,26 @@ one.
 
 ## Tooling
 
-### Dependencies: no hosted registry in 0.1 (#101)
+### Dependencies: luarocks.org is the registry, rockspec is the manifest (#2)
 
-`[dependencies]` entries in `luabox.toml` may be:
+luabox follows the pnpm/bun model:
+[luarocks.org](https://luarocks.org) is the registry and the project's
+`*.rockspec` is the package manifest. Registry dependencies (bare rock names
+in LuaRocks constraint syntax) live in the rockspec's
+`dependencies`/`test_dependencies`; `luabox.toml` carries only the **source**
+dependencies a rockspec cannot express:
 
 - a **path** dependency — `pkg = { path = "../pkg" }`
 - a **git** dependency — `pkg = { git = "…", rev|tag|branch = "…" }`
 - a **workspace** dependency — `pkg = { workspace = true }`
-- a **version requirement** — `pkg = "1.2"` — resolved against a registry you
-  point at yourself.
 
-There is **no hosted, first-party registry** in 0.1. A registry is any root you
-choose — a plain directory, a `file://` URL, or an `https://` base (read-only
-for install) — selected via the `LUABOX_REGISTRY` environment variable.
-Adding a version-requirement dependency with no registry configured fails with
-setup guidance rather than silently doing nothing:
-
-```
-$ luabox add somelib@1.2
-Error: cannot add `somelib` as a registry dependency: no registry is
-configured. Set LUABOX_REGISTRY to your registry's location …
-```
+A version-requirement entry in `luabox.toml` is an error pointing at the
+rockspec. There is **no first-party registry** and no `LUABOX_REGISTRY`; set
+`LUABOX_LUAROCKS_MIRROR` to a local mirror directory for hermetic/offline
+resolves. Only **pure-Lua** rocks are supported — a C/native rock is rejected
+with a clear error (luabox is not a C build system). Editing the rockspec from
+`luabox add` (a bare `luabox add pkg@1.2`) is not wired up yet; declare
+registry dependencies in the rockspec by hand for now.
 
 ### Editor extensions are not on marketplaces yet (#102)
 
