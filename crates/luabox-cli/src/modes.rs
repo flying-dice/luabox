@@ -1,17 +1,17 @@
-//! Bundler embedding modes (SPEC.md §7, ticket #32).
+//! Bundler embedding modes (SPEC.md §7, ticket #32, flying-dice/luabox#4).
 //!
-//! `luabox bundle --mode <mode>` (or `[build] mode` in the manifest) picks
+//! `luabox build --mode <mode>` (or `[build] mode` in the manifest) picks
 //! how the single-file bundle from `luabox_bundle::bundle` is packaged for
 //! its target runtime. All three modes bundle the project exactly the same
-//! way (`bundle_cmd::run` builds the [`luabox_bundle::Bundle`] once); this
-//! module only decides where the resulting text lands on disk and what, if
+//! way (`build_cmd` builds the [`luabox_bundle::Bundle`] once); this module
+//! only decides where the resulting text lands on disk and what, if
 //! anything, goes alongside it.
 //!
 //! - **`plain`** (default): the bundle is written out verbatim as
 //!   `<out>/<name>.lua` — unchanged from before this ticket.
 //! - **`love`**: [LÖVE](https://love2d.org) loads a `.love` archive — a
 //!   plain zip file — and requires a `main.lua` at the archive root
-//!   defining `love.load`/`love.update`/`love.draw`. `luabox bundle --mode
+//!   defining `love.load`/`love.update`/`love.draw`. `luabox build --mode
 //!   love` writes the bundle as that `main.lua` **unmodified**: the bundle
 //!   already inlines the entry chunk last as raw top-level code (SPEC.md
 //!   §7 "single-file emit" — see [`luabox_bundle::bundle`]'s module docs),
@@ -28,7 +28,7 @@
 //!   `.love` at the paths LÖVE's `love.filesystem` expects (relative to
 //!   the archive root).
 //! - **`nvim-plugin`**: Neovim's `runtimepath` plugin convention. `luabox
-//!   bundle --mode nvim-plugin` writes `<out>/<name>/` containing:
+//!   build --mode nvim-plugin` writes `<out>/<name>/` containing:
 //!     - `lua/<name>/init.lua` — the bundle, unmodified. `require("<name>")`
 //!       finds it via Neovim's standard `lua/` runtimepath search, and
 //!       (per the `love` mode note above) sees whatever `src/main.lua`

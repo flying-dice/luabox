@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "5.1"       # LÖVE runs LuaJIT (5.1-compatible)
 
 [build]
-mode = "love"         # `luabox bundle` packages a .love archive
+mode = "love"         # `luabox build` packages a .love archive (mode implies bundling)
 out = "dist"
 
 [types]

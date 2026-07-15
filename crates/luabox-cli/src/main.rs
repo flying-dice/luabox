@@ -5,7 +5,6 @@
 
 mod auth_cmd;
 mod build_cmd;
-mod bundle_cmd;
 mod check_cmd;
 mod deps_cmd;
 mod doc_cmd;
@@ -162,19 +161,33 @@ enum Command {
         #[arg(long)]
         watch: bool,
     },
-    /// Lower to the configured target and emit
+    /// Lower to the configured target and emit — tsc/esbuild-style, driven
+    /// by `[build]` config (flags override every field)
     Build {
+        /// Dialect to lower to (default: `[build] target`, else the edition)
         #[arg(long)]
         target: Option<String>,
+        /// Output directory for tree-mode emit and multi-entry bundles
         #[arg(long)]
         out: Option<PathBuf>,
-    },
-    /// Emit a single-file bundle per entry point
-    Bundle {
+        /// Single-entry bundle output path (illegal with multiple entries)
         #[arg(long)]
-        minify: bool,
+        outfile: Option<PathBuf>,
+        /// Bundle entry point (repeatable); overrides `[build] entry`
+        #[arg(long = "entry")]
+        entry: Vec<PathBuf>,
+        /// Emit a single-file bundle per entry (overrides `[build] bundle`)
+        #[arg(long, conflicts_with = "no_bundle")]
+        bundle: bool,
+        /// Force tree-mode emit even if `[build] bundle = true`
+        #[arg(long = "no-bundle")]
+        no_bundle: bool,
+        /// Emit a `.map` beside each bundle for `luabox unmap`
         #[arg(long)]
         sourcemap: bool,
+        /// Mangle locals/whitespace in each bundle
+        #[arg(long)]
+        minify: bool,
         /// Embedding mode: plain (default), love, nvim-plugin; overrides
         /// `[build] mode`
         #[arg(long)]
@@ -217,9 +230,10 @@ enum Command {
     },
     /// Explain a diagnostic code (e.g. LB0421)
     Explain { code: String },
-    /// Rewrite bundle line references in a traceback via its .lua.map
+    /// Rewrite bundle line references in a traceback back to source, via the
+    /// `<bundle>.map` emitted next to the bundle by `luabox build --sourcemap`
     Unmap {
-        /// Path to the bundle; the map is read from `<bundle>.map`
+        /// Path to the bundle; the map is read from `<bundle>.map` beside it
         bundle: PathBuf,
         /// Traceback text (joined with spaces); read from stdin when omitted
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -294,19 +308,38 @@ fn main() -> anyhow::Result<()> {
         } => check_cmd::run(&std::env::current_dir()?, target.as_deref(), &format, watch),
         Command::Lint { fix } => lint_cmd::run(&std::env::current_dir()?, fix),
         Command::Fmt { check, watch } => fmt_cmd::run(&std::env::current_dir()?, check, watch),
-        Command::Build { target, out } => {
-            build_cmd::run(&std::env::current_dir()?, target.as_deref(), out.as_deref())
-        }
-        Command::Bundle {
-            minify,
+        Command::Build {
+            target,
+            out,
+            outfile,
+            entry,
+            bundle,
+            no_bundle,
             sourcemap,
+            minify,
             mode,
-        } => bundle_cmd::run(
-            &std::env::current_dir()?,
-            minify,
-            sourcemap,
-            mode.as_deref(),
-        ),
+        } => {
+            let bundle = if no_bundle {
+                Some(false)
+            } else if bundle {
+                Some(true)
+            } else {
+                None
+            };
+            build_cmd::run(
+                &std::env::current_dir()?,
+                &build_cmd::BuildOptions {
+                    target,
+                    out,
+                    outfile,
+                    entry,
+                    bundle,
+                    sourcemap,
+                    minify,
+                    mode,
+                },
+            )
+        }
         Command::Run { script, args } => run_cmd::run(&std::env::current_dir()?, &script, &args),
         Command::Doc { open } => doc_cmd::run(&std::env::current_dir()?, open),
         Command::Lsp { .. } => lsp_cmd::run(),
@@ -343,7 +376,7 @@ fn main() -> anyhow::Result<()> {
             } else {
                 Some(traceback.join(" "))
             };
-            bundle_cmd::unmap(&std::env::current_dir()?, &bundle, text.as_deref())
+            build_cmd::unmap(&std::env::current_dir()?, &bundle, text.as_deref())
         }
     }
 }

@@ -40,8 +40,11 @@ luabox lint         # clean — defs/love2d.d.lua is a `---@meta` defs module,
 
 ## Packaging a `.love`
 
+`[build] mode = "love"` makes a bare `luabox build` package the archive (a
+non-`plain` mode implies bundling — no `--bundle` needed):
+
 ```sh
-luabox bundle --mode love
+luabox build
 ```
 
 This produces `dist/asteroids-lite.love` — a zip archive with `main.lua` and

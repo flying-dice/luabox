@@ -36,18 +36,44 @@ pub struct Package {
     pub min_luabox_version: Option<String>,
 }
 
-/// `[build]` (SPEC.md §5).
+/// `[build]` (SPEC.md §5, §7) — the single `luabox build` command's
+/// configuration (flying-dice/luabox#4). CLI flags override every field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Build {
     /// Dialect you ship. Defaults to `[package] edition` when absent.
     pub target: String,
-    /// Output directory. Defaults to `"dist"`.
+    /// Output directory: tree-mode emit and multi-entry bundles land here.
+    /// Defaults to `"dist"`.
     pub out: String,
     /// Bundler embedding mode (SPEC.md §7). Defaults to `"plain"`. One of
-    /// [`ALLOWED_BUNDLE_MODES`]; `luabox bundle --mode` overrides it.
+    /// [`ALLOWED_BUNDLE_MODES`]; `luabox build --mode` overrides it.
     pub mode: String,
+    /// Bundle entry points, one single-file bundle each. Defaults to
+    /// `["src/main.lua"]`. Only consulted when bundling (`bundle = true`, or
+    /// a non-`plain` `mode`).
+    pub entry: Vec<String>,
+    /// Single-entry bundle output path override (esbuild's `--outfile`).
+    /// Valid only with exactly one entry, and never with a non-`plain`
+    /// `mode`. `None` derives each bundle name from its entry basename under
+    /// `out`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outfile: Option<String>,
+    /// Emit one single-file bundle per entry instead of mirroring the source
+    /// tree under `out`. Defaults to `false`. A non-`plain` `mode` implies
+    /// bundling regardless.
+    pub bundle: bool,
+    /// Emit a `.map` alongside each bundle for `luabox unmap`. Defaults to
+    /// `false`. Only meaningful when bundling.
+    pub sourcemap: bool,
+    /// Scope-aware identifier mangling + whitespace collapse on each bundle.
+    /// Defaults to `false`. Only meaningful when bundling.
+    pub minify: bool,
 }
+
+/// The conventional default bundle entry point when `[build] entry` is
+/// absent (binary/script-project convention, SPEC.md §7).
+pub const DEFAULT_ENTRY: &str = "src/main.lua";
 
 /// `[types]` (SPEC.md §5).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]

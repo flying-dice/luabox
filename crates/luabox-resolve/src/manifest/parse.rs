@@ -11,9 +11,9 @@ use toml_edit::{ImDocument, Item, Table, TableLike};
 
 use super::error::ManifestError;
 use super::model::{
-    ALLOWED_BUNDLE_MODES, ALLOWED_DIALECTS, Build, Dependency, GitDependency, LINT_TIERS, Lint,
-    LintLevel, Manifest, Package, PathDependency, TaskValue, Types, UrlDependency, Workspace,
-    WorkspaceDependency,
+    ALLOWED_BUNDLE_MODES, ALLOWED_DIALECTS, Build, DEFAULT_ENTRY, Dependency, GitDependency,
+    LINT_TIERS, Lint, LintLevel, Manifest, Package, PathDependency, TaskValue, Types,
+    UrlDependency, Workspace, WorkspaceDependency,
 };
 
 const TOP_LEVEL_KEYS: &[&str] = &[
@@ -36,7 +36,9 @@ const PACKAGE_KEYS: &[&str] = &[
     "lua-versions",
     "min-luabox-version",
 ];
-const BUILD_KEYS: &[&str] = &["target", "out", "mode"];
+const BUILD_KEYS: &[&str] = &[
+    "target", "out", "mode", "entry", "outfile", "bundle", "sourcemap", "minify",
+];
 const TYPES_KEYS: &[&str] = &["strict", "defs"];
 const WORKSPACE_KEYS: &[&str] = &["members"];
 const DEPENDENCY_KEYS: &[&str] = &[
@@ -423,6 +425,11 @@ fn parse_build(root: &Table, edition_fallback: &str, errors: &mut Vec<ManifestEr
             target: edition_fallback.to_owned(),
             out: "dist".to_owned(),
             mode: "plain".to_owned(),
+            entry: vec![DEFAULT_ENTRY.to_owned()],
+            outfile: None,
+            bundle: false,
+            sourcemap: false,
+            minify: false,
         };
     };
     check_unknown_keys(table, "[build] key", BUILD_KEYS, errors);
@@ -446,7 +453,28 @@ fn parse_build(root: &Table, edition_fallback: &str, errors: &mut Vec<ManifestEr
         ));
     }
 
-    Build { target, out, mode }
+    // `entry` defaults to the conventional single entry point when absent;
+    // an explicit empty list stays empty (a library with nothing to bundle).
+    let entry = if table.get("entry").is_some() {
+        get_string_array(table, "build", "entry", errors)
+    } else {
+        vec![DEFAULT_ENTRY.to_owned()]
+    };
+    let outfile = get_string(table, "build", "outfile", false, errors);
+    let bundle = get_bool(table, "build", "bundle", false, errors);
+    let sourcemap = get_bool(table, "build", "sourcemap", false, errors);
+    let minify = get_bool(table, "build", "minify", false, errors);
+
+    Build {
+        target,
+        out,
+        mode,
+        entry,
+        outfile,
+        bundle,
+        sourcemap,
+        minify,
+    }
 }
 
 fn parse_types(root: &Table, errors: &mut Vec<ManifestError>) -> Types {

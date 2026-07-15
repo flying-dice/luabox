@@ -88,12 +88,14 @@ Section 'legacy-inifile'
 Set-Location (Join-Path $examples 'legacy-inifile')
 Gate
 
-# 5. timemachine (build + bundle + run lowered output on Lua 5.1)
+# 5. timemachine (build tree + bundle + run lowered output on Lua 5.1)
 Section 'timemachine'
 Set-Location (Join-Path $examples 'timemachine')
 Gate
-Step 'build'                       $luabox @('build')
-Step 'bundle --minify --sourcemap' $luabox @('bundle', '--minify', '--sourcemap')
+# Config bundles to dist/timemachine.lua (minified, with a .map); --no-bundle
+# forces the mirrored tree emit under dist/src/ instead.
+Step 'build --no-bundle' $luabox @('build', '--no-bundle')
+Step 'build'             $luabox @('build')
 if ($lua) {
     $out = & $lua dist/timemachine.lua 2>&1 | Out-String
     if ($LASTEXITCODE -eq 0 -and $out -match 'sum\(1\.\.5\) = 15') { Pass 'run lowered bundle on Lua 5.1' }
@@ -106,7 +108,8 @@ if ($lua) {
 Section 'love-asteroids-lite'
 Set-Location (Join-Path $examples 'love-asteroids-lite')
 Gate
-Step 'bundle --mode love' $luabox @('bundle', '--mode', 'love')
+# `[build] mode = "love"` makes a bare `luabox build` package the .love.
+Step 'build (.love via mode=love)' $luabox @('build')
 $lovePath = Join-Path (Get-Location) 'dist/asteroids-lite.love'
 try {
     Add-Type -AssemblyName System.IO.Compression.FileSystem

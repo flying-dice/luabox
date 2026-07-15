@@ -23,19 +23,31 @@ target = "5.1"      # the dialect you ship
 
 ## Build it
 
-```sh
-luabox check                          # typechecks as 5.4
-luabox build                          # lowers 5.4 → 5.1 into dist/src/
-luabox bundle --minify --sourcemap    # single lowered+minified file + .lua.map
+One command, driven by `[build]` — like `tsc`/`esbuild`:
+
+```toml
+[build]
+target  = "5.1"
+bundle  = true
+outfile = "dist/timemachine.lua"
+minify  = true
+sourcemap = true
 ```
 
-`build` mirrors your source tree into `dist/`; `bundle` inlines the require
-graph into one file at `dist/timemachine.lua`. Both lower to the 5.1 target.
+```sh
+luabox check              # typechecks as 5.4
+luabox build              # lowers 5.4 → 5.1, bundles to dist/timemachine.lua (+ .map)
+luabox build --no-bundle  # or: mirror the lowered tree into dist/src/ instead
+```
+
+With `bundle = true` a bare `luabox build` inlines the require graph into one
+lowered+minified file at `dist/timemachine.lua`; `--no-bundle` overrides the
+config to emit the mirrored source tree under `dist/`. Both lower to 5.1.
 
 ## The payoff: run the 5.1 output on real Lua 5.1
 
 ```sh
-luabox bundle
+luabox build
 lua dist/timemachine.lua
 ```
 

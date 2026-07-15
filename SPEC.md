@@ -76,8 +76,10 @@ luabox update [pkg]
 luabox check [--target <t>]                           typecheck
 luabox lint [--fix]                                   clippy analog
 luabox fmt [--check]                                  canonical formatter
-luabox build [--target <t>] [--out dir]               lower + emit
-luabox bundle [--minify] [--sourcemap]                single-file emit
+luabox build [--target <t>] [--out dir] [--outfile f] lower + emit (tsc/esbuild-style)
+             [--entry <p>…] [--bundle|--no-bundle]    — tree emit, or bundle per entry
+             [--sourcemap] [--minify] [--mode <m>]       (driven by [build]; flags override)
+luabox unmap <bundle> [traceback…]                    decode a bundle traceback to source
 luabox run <script|task>                              run via configured runtime / tasks
 luabox doc [--open]                                   docs from annotations
 luabox lsp                                            stdio LSP server
@@ -142,7 +144,7 @@ luabox follows the pnpm/bun model: **[luarocks.org](https://luarocks.org) is the
 - Static `require` graph inlined with lazy init (preserves load order + cycles); dynamic requires diagnosed, allowlist override.
 - Tree-shaking: module-level always; statement-level for provably pure module bodies (`---@luabox-pure` opt-in).
 - Minify: scope-aware identifier mangling, whitespace, constant folding. Property names never mangled.
-- Source maps: `.lua.map` + LSP mapped stack traces; `luabox unmap <traceback>`.
+- Source maps: `luabox build --sourcemap` writes a `.map` next to each bundle; `luabox unmap <bundle> [traceback]` decodes a production traceback back to source (+ LSP mapped stack traces).
 - Profiles: `dev` (readable, asserts kept) / `release` (minified, `---@luabox-assert` stripped).
 - Embedding modes: plain chunk, LÖVE fused, Neovim plugin layout.
 

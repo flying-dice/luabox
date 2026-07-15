@@ -4,8 +4,12 @@ version = "0.1.0"
 edition = "5.4"       # we WRITE modern Lua 5.4
 
 [build]
-target = "5.1"        # we SHIP Lua 5.1 — the compiler lowers the delta
+target = "5.1"                 # we SHIP Lua 5.1 — the compiler lowers the delta
 out = "dist"
+bundle = true                  # `luabox build` inlines the require graph…
+outfile = "dist/timemachine.lua"  # …into this single lowered file
+minify = true                  # mangle locals + collapse whitespace
+sourcemap = true               # emit dist/timemachine.lua.map for `luabox unmap`
 
 [types]
 strict = true

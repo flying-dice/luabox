@@ -78,6 +78,25 @@ spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
 
 ### Changed
 
+- **One `luabox build` command, tsc/esbuild-style — `luabox bundle` is gone**
+  ([#4](https://github.com/flying-dice/luabox/issues/4)) — emit is now a single
+  command configured in `[build]` and overridden by flags, like `tsc`/`esbuild`.
+  `[build]` gains `entry` (bundle entry points, default `["src/main.lua"]`),
+  `outfile` (single-entry output override), `bundle`, `sourcemap`, and `minify`
+  alongside `target`/`out`/`mode`. With `bundle = false` (default) `build`
+  mirrors the lowered source tree under `out`, skipping `*.d.lua`; with `bundle
+  = true` (or any non-`plain` `mode`, which implies bundling) it inlines each
+  entry's require graph into one file — `plain` names each bundle from its entry
+  basename under `out` (or `--outfile` for a single entry), `love` packages a
+  `.love`, `nvim-plugin` writes a runtimepath tree. Output rules are enforced:
+  bundling with a missing entry, `outfile` with multiple entries, and
+  `outfile` + a non-`plain` `mode` are rejected with clear errors; `build` never
+  implicitly cleans `out`. Flags `--target`/`--out`/`--outfile`/`--entry`
+  (repeatable)/`--bundle`/`--no-bundle`/`--sourcemap`/`--minify`/`--mode`
+  override the config. The `luabox bundle` verb is **removed** (now an unknown
+  command); `luabox unmap` survives as build's traceback decoder, its help text
+  corrected to read the `<bundle>.map` beside the bundle and cross-linked from
+  the source-map docs.
 - **luarocks.org is the registry; bare rock names resolve there directly**
   ([#2](https://github.com/flying-dice/luabox/issues/2)) — a bare
   version-requirement dependency is a luarocks.org lookup, with no `luarocks/`

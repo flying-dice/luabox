@@ -22,9 +22,9 @@ mod workspace;
 
 pub use error::ManifestError;
 pub use model::{
-    ALLOWED_BUNDLE_MODES, ALLOWED_DIALECTS, Build, Dependency, GitDependency, LINT_TIERS, Lint,
-    LintLevel, Manifest, Package, PathDependency, TaskValue, Types, UrlDependency, Workspace,
-    WorkspaceDependency,
+    ALLOWED_BUNDLE_MODES, ALLOWED_DIALECTS, Build, DEFAULT_ENTRY, Dependency, GitDependency,
+    LINT_TIERS, Lint, LintLevel, Manifest, Package, PathDependency, TaskValue, Types,
+    UrlDependency, Workspace, WorkspaceDependency,
 };
 
 #[cfg(test)]
@@ -127,6 +127,15 @@ mod tests {
         assert_eq!(manifest.build.target, "5.1", "target defaults to edition");
         assert_eq!(manifest.build.out, "dist");
         assert_eq!(manifest.build.mode, "plain", "mode defaults to plain");
+        assert_eq!(
+            manifest.build.entry,
+            vec!["src/main.lua".to_owned()],
+            "entry defaults to the conventional single entry point"
+        );
+        assert_eq!(manifest.build.outfile, None);
+        assert!(!manifest.build.bundle, "bundle defaults to false");
+        assert!(!manifest.build.sourcemap, "sourcemap defaults to false");
+        assert!(!manifest.build.minify, "minify defaults to false");
         assert!(!manifest.types.strict);
         assert!(manifest.types.defs.is_empty());
         assert!(manifest.dependencies.is_empty());
@@ -252,6 +261,54 @@ mod tests {
                 msg.message
             );
         }
+    }
+
+    #[test]
+    fn build_parses_the_unified_emit_fields() {
+        let manifest = Manifest::parse(
+            "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n\
+             [build]\ntarget = \"5.1\"\nentry = [\"src/a.lua\", \"src/b.lua\"]\n\
+             bundle = true\nsourcemap = true\nminify = true\n",
+        )
+        .expect("valid [build]");
+        assert_eq!(
+            manifest.build.entry,
+            vec!["src/a.lua".to_owned(), "src/b.lua".to_owned()]
+        );
+        assert!(manifest.build.bundle);
+        assert!(manifest.build.sourcemap);
+        assert!(manifest.build.minify);
+        assert_eq!(manifest.build.outfile, None);
+    }
+
+    #[test]
+    fn build_parses_outfile() {
+        let manifest = Manifest::parse(
+            "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n\
+             [build]\nbundle = true\noutfile = \"dist/app.lua\"\n",
+        )
+        .expect("valid [build]");
+        assert_eq!(manifest.build.outfile.as_deref(), Some("dist/app.lua"));
+    }
+
+    #[test]
+    fn build_rejects_non_bool_bundle() {
+        let errors = Manifest::parse(
+            "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n\
+             [build]\nbundle = \"yes\"\n",
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|e| e.message.contains("build.bundle")));
+    }
+
+    #[test]
+    fn build_rejects_unknown_key() {
+        let errors = Manifest::parse(
+            "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n\
+             [build]\nentrypoint = \"src/main.lua\"\n",
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|e| e.message.contains("entrypoint")));
     }
 
     #[test]

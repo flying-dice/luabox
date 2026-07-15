@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Keep the examples green. For every project under examples/ this runs the
 # core gate (check, fmt --check, lint) plus per-example extras (install,
-# build, bundle, .love packaging, and run steps where a Lua runtime is
+# build tree + bundle, .love packaging, and run steps where a Lua runtime is
 # present). Exits non-zero on the first real failure.
 #
 # Usage: bash scripts/examples.sh
@@ -95,12 +95,14 @@ section "legacy-inifile"
 cd "$examples/legacy-inifile"
 gate .
 
-# 5. timemachine (build + bundle + run lowered output on Lua 5.1) -------------
+# 5. timemachine (build tree + bundle + run lowered output on Lua 5.1) --------
 section "timemachine"
 cd "$examples/timemachine"
 gate .
-run "build"                       -- "$LUABOX" build
-run "bundle --minify --sourcemap" -- "$LUABOX" bundle --minify --sourcemap
+# Config bundles to dist/timemachine.lua (minified, with a .map); --no-bundle
+# forces the mirrored tree emit under dist/src/ instead.
+run "build --no-bundle" -- "$LUABOX" build --no-bundle
+run "build"             -- "$LUABOX" build
 if [ -n "$LUA" ]; then
     if "$LUA" dist/timemachine.lua >/tmp/lb_ex_out 2>&1 && grep -q "sum(1..5) = 15" /tmp/lb_ex_out; then
         pass "run lowered bundle on Lua 5.1"
@@ -115,7 +117,8 @@ fi
 section "love-asteroids-lite"
 cd "$examples/love-asteroids-lite"
 gate .
-run "bundle --mode love" -- "$LUABOX" bundle --mode love
+# `[build] mode = "love"` makes a bare `luabox build` package the .love.
+run "build (.love via mode=love)" -- "$LUABOX" build
 if unzip -l dist/asteroids-lite.love >/tmp/lb_ex_out 2>&1 \
     && grep -q "main.lua" /tmp/lb_ex_out && grep -q "conf.lua" /tmp/lb_ex_out; then
     pass ".love contains main.lua + conf.lua"

@@ -506,6 +506,29 @@ fn strict_project_with_edition_and_target(
     write_manifest_with_target(world, &edition, &target, true);
 }
 
+/// Write a manifest with `[build] target` and `bundle = true` — the
+/// config-driven half of the unified `luabox build` (flying-dice/luabox#4),
+/// so a bare `luabox build` bundles and `--no-bundle` can override it.
+#[given(expr = "a project with edition {string} targeting {string} bundling")]
+fn project_with_edition_target_bundling(
+    world: &mut AcceptanceWorld,
+    edition: String,
+    target: String,
+) {
+    let manifest = format!(
+        "[package]\n\
+         name = \"fixture\"\n\
+         version = \"0.1.0\"\n\
+         edition = \"{edition}\"\n\
+         \n\
+         [build]\n\
+         target = \"{target}\"\n\
+         bundle = true\n"
+    );
+    std::fs::write(world.dir.path().join("luabox.toml"), manifest)
+        .expect("failed to write luabox.toml");
+}
+
 #[then(expr = "the file {string} does not exist")]
 fn file_does_not_exist(world: &mut AcceptanceWorld, path: String) {
     assert!(

@@ -169,8 +169,8 @@ anything load-bearing.
 | `check` | typecheck: LuaCATS + rich inference, dialect legality, `--target`, `--watch`, `--format json\|sarif\|github\|gitlab` |
 | `fmt` | canonical formatter for `.lua` (`--check`, `--watch`) |
 | `lint` | type-informed rules, `---@luabox-ignore`, per-rule `[lint]` levels |
-| `build` | lower `edition → target` (goto, bitops, `<close>`, `_ENV`, …) with tree-shaken polyfills |
-| `bundle` | single-file bundle, `--minify`, `--sourcemap` + `unmap`, `--mode love\|nvim-plugin` |
+| `build` | one tsc/esbuild-style emit driven by `[build]`: lower `edition → target` (goto, bitops, `<close>`, `_ENV`, …) with tree-shaken polyfills; `bundle = true` inlines the require graph into one file per `entry` (`--minify`, `--sourcemap`); `mode = love\|nvim-plugin` packages a `.love` / Neovim plugin. Flags (`--target`/`--out`/`--outfile`/`--entry`/`--bundle`/`--no-bundle`/`--sourcemap`/`--minify`/`--mode`) override config |
+| `unmap` | decode a production traceback back to source lines via the `<bundle>.map` that `build --sourcemap` writes next to the bundle |
 | `add` / `remove` / `install` / `update` / `vendor` | PubGrub resolver, `luabox.lock`, CAS store with hard-link installs. `add <rock>` / `remove <rock>` edit the rockspec's `dependencies` (`--dev` → `test_dependencies`) comment-preservingly; `--path`/`--git` manage source deps in `luabox.toml`. `update <name>` re-pins a git dep to its repo's latest release tag |
 | `publish` | upload the authored rockspec to luarocks.org (`--dry-run` to preview). Gates on a valid canonically-named rockspec, a green `check`, and pure-Lua-only; needs an API key (`login --luarocks`) |
 | `search` / `outdated` | search luarocks.org (the registry) for rocks by name, and report dependencies behind their latest version (registry rocks vs. luarocks.org, git deps vs. their repo's latest GitHub release); `--format json\|text` |
@@ -181,6 +181,38 @@ anything load-bearing.
 | `lsp` | language server: diagnostics + quick-fixes, completion (auto-require), hover, goto def/type/impl, references, rename, symbols, signature help, call hierarchy, inlay hints, semantic tokens, formatting |
 | `doc` | static docs from annotations |
 | `explain LBnnnn` | rustc-style diagnostic pages |
+
+### Shipping a bundle: crash-to-source with `unmap`
+
+A minified bundle's tracebacks name the *bundle's* lines, not your source.
+Enable source maps at build time and keep the `.map` around to decode
+production crashes back to their real file and line:
+
+```toml
+[build]
+bundle    = true
+outfile   = "dist/game.lua"
+minify    = true
+sourcemap = true          # writes dist/game.lua.map next to the bundle
+```
+
+```sh
+luabox build              # emits dist/game.lua + dist/game.lua.map
+# ship dist/game.lua to players; keep dist/game.lua.map in your build artifacts
+```
+
+When a player pastes a traceback like `dist/game.lua:842: attempt to index a
+nil value`, pipe it back through `unmap` (map is read from `<bundle>.map` next
+to the bundle):
+
+```sh
+echo 'dist/game.lua:842: attempt to index a nil value' | luabox unmap dist/game.lua
+# → src/player.lua:10: attempt to index a nil value
+```
+
+The traceback can come from stdin (above) or as trailing arguments. The map is
+recorded only at build time, so `sourcemap = true` is what makes this possible
+— there is no way to reconstruct it after the fact.
 
 ## Dependencies & registries
 

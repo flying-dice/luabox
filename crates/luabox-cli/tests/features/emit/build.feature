@@ -1,7 +1,9 @@
-Feature: luabox build — target lowering emit
-  SPEC.md §2.1/§4 (§18 P3): `luabox build` lowers the edition (dialect you
-  write) to the target (dialect you ship) and emits to the out dir. Check
-  runs first — build refuses on check errors.
+Feature: luabox build — target lowering emit (tree mode)
+  SPEC.md §2.1/§4 (§18 P3, flying-dice/luabox#4): in its default tree mode
+  (`bundle = false`, `mode = plain`) `luabox build` lowers the edition
+  (dialect you write) to the target (dialect you ship) and emits every file
+  under the out dir, mirroring the source layout. Check runs first — build
+  refuses on check errors.
 
   Scenario: goto lowered away for a 5.1 target
     Given a project with edition "5.4" targeting "5.1"
