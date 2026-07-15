@@ -3,8 +3,10 @@
 //! Users authenticate through the browser via the OAuth 2.0 **Device
 //! Authorization Grant** (RFC 8628) instead of pasting a Personal Access
 //! Token. The resulting token is stored encrypted at rest in the OS keychain
-//! ([`crate::keychain`]); `search`/`outdated` pick it up transparently
-//! afterwards (see [`crate::github::token_with_source`]).
+//! ([`crate::keychain`]) and authenticates luabox's **git-source** GitHub
+//! operations — `luabox outdated`'s release probing and `luabox update`'s
+//! re-pin — transparently afterwards (see [`crate::github::token_with_source`]).
+//! Registry reads (`luabox search`) are anonymous and never use it.
 //!
 //! ## Device flow, in four steps
 //!

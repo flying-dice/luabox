@@ -172,8 +172,8 @@ anything load-bearing.
 | `build` | lower `edition → target` (goto, bitops, `<close>`, `_ENV`, …) with tree-shaken polyfills |
 | `bundle` | single-file bundle, `--minify`, `--sourcemap` + `unmap`, `--mode love\|nvim-plugin` |
 | `add` / `remove` / `install` / `update` / `vendor` | PubGrub resolver, `luabox.lock`, CAS store with hard-link installs. Registry deps (luarocks.org) live in the rockspec; `add`/`remove` manage `path`/`git`/`workspace` sources in `luabox.toml`. `update <name>` re-pins a git dep to its repo's latest release tag |
-| `search` / `outdated` | discover luabox packages on GitHub (topic `luabox` + a root `luabox.toml`) and report git deps behind their latest release; `--format json\|text` |
-| `login` / `logout` / `whoami` | sign in to GitHub via the browser (OAuth device flow), storing the token encrypted in the OS keychain; sign out; show the signed-in identity. `login`/`whoami` take `--format json\|text` |
+| `search` / `outdated` | search luarocks.org (the registry) for rocks by name, and report dependencies behind their latest version (registry rocks vs. luarocks.org, git deps vs. their repo's latest GitHub release); `--format json\|text` |
+| `login` / `logout` / `whoami` | sign in to GitHub via the browser (OAuth device flow), storing the token encrypted in the OS keychain; sign out; show the signed-in identity. Authenticates git-source operations (`outdated`/`update` release probing) — registry reads are anonymous. `login`/`whoami` take `--format json\|text` |
 | `run` | `[tasks]` entries or scripts via the resolved runtime |
 | `toolchain` | install/pin/list managed Lua runtimes |
 | `upgrade` | self-update from GitHub releases (`luabox upgrade` for latest, or a specific `v0.1.1`), checksum-verified |
@@ -223,27 +223,35 @@ resolves.
 
 ### Discovering & managing dependencies
 
-With no hosted registry, **GitHub is the discovery surface**. A luabox
-*package* is any public GitHub repo that carries the topic `luabox` **and** a
-root `luabox.toml`; installing one is a git dependency pinned to its latest
+**luarocks.org is the discovery surface** for registry dependencies. `luabox
+search` reads luarocks.org's root manifest and matches your query as a
+case-insensitive substring of rock names — an anonymous registry read, no
+GitHub, no token. Git dependencies remain a public GitHub repo pinned to a
 release tag.
 
 ```sh
-luabox search json          # public repos: topic:luabox + a root luabox.toml
+luabox search penlight      # rocks on luarocks.org whose name contains "penlight"
+luabox search               # the first 50 rocks by name (the registry is large)
 luabox add cool-lib --git https://github.com/owner/cool-lib --tag v1.2.0
-luabox outdated             # which git deps are behind their latest release?
+luabox outdated             # which deps are behind their latest version?
 luabox update cool-lib      # re-pin cool-lib to its repo's latest release tag
 ```
 
 `search` and `outdated` take `--format json|text` (`text` is the default;
-editors pass `json` for a stable contract). `outdated` always exits 0 — it is a
-report. `update <name>` re-pins a **tag**-pinned git dependency to the latest
-release tag of its GitHub repo; a `rev`/`branch` pin is left untouched.
+editors pass `json` for a stable contract — `{"results":[…]}` and
+`{"dependencies":[…]}` respectively). `search` reports each rock's highest
+translated semver and its version count. `outdated` compares each **registry**
+rock's locked version against luarocks.org's highest, and each **git** dep's tag
+against its GitHub repo's latest release; it always exits 0 (a report, not a
+gate). `update <name>` re-pins a **tag**-pinned git dependency to the latest
+release tag of its GitHub repo; a `rev`/`branch` pin is left untouched, and
+registry deps are re-resolved within their rockspec constraints.
 
-GitHub requests honor an authentication token (see **Authentication** below),
-sent as `Authorization: Bearer …`, which raises the anonymous 60 req/hr search
-limit to 5000/hr. Everything works without a token, just against the lower
-anonymous limit.
+Set `LUABOX_LUAROCKS_MIRROR` to a local mirror directory to run `search` (and
+resolution) offline/hermetically. The git-source paths (`outdated`'s release
+probing, `update`'s re-pin) honor a GitHub token (see **Authentication**),
+sent as `Authorization: Bearer …`, which raises the anonymous 60 req/hr limit to
+5000/hr; they work without one, just against the lower anonymous limit.
 
 ### Authentication
 
@@ -260,7 +268,9 @@ and a verification URL (and best-effort opens your browser), you approve there,
 and the resulting token is stored **encrypted at rest in your OS keychain**
 (macOS Keychain, Windows Credential Manager, Linux Secret Service). No scope is
 requested — an unscoped token already lifts the rate limit (least privilege).
-`luabox search`/`outdated`/`update` then use it automatically.
+luabox's git-source operations — `luabox outdated`'s release probing and `luabox
+update`'s re-pin — then use it automatically. (`luabox search` is an anonymous
+luarocks.org read and never consults it.)
 
 `login` and `whoami` accept `--format json` (newline-delimited events for
 `login`; one object for `whoami`) — that is what the editor extensions'

@@ -32,6 +32,31 @@ spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
   declared in both manifests is a clear collision error. `[package] name` and
   `version` are optional in `luabox.toml` (the rockspec owns them); `edition`
   stays required. Set `LUABOX_LUAROCKS_MIRROR` for hermetic/offline resolves.
+- **`luabox search` discovers rocks on luarocks.org, not GitHub topics**
+  ([#2](https://github.com/flying-dice/luabox/issues/2)) — search now reads
+  luarocks.org's root `manifest.json` (the same fetch + `<store>/luarocks/`
+  cache + `LUABOX_LUAROCKS_MIRROR` hermetic mode the resolver's bridge uses) and
+  matches the query as a case-insensitive substring of rock names; an empty
+  query lists the first 50 rocks by name. It is an **anonymous** registry read —
+  no GitHub API, no `LUABOX_GITHUB_TOKEN`. The frozen `{"results":[…]}` envelope
+  is unchanged; each item's fields are now `name`, `latest` (highest translated
+  semver, or `null`), `versions` (count of translated versions), and
+  `description` (always `null` — the manifest carries none and a listing never
+  fetches per-rock rockspecs). The GitHub topic-search path (`topic:luabox` +
+  root-`luabox.toml` filtering) is deleted.
+- **`luabox outdated` compares registry deps against luarocks.org**
+  ([#2](https://github.com/flying-dice/luabox/issues/2)) — a rockspec-declared
+  registry dependency is now reported (`kind: "registry"`) with its **locked**
+  version (`current`) against the highest version on luarocks.org (`latest`),
+  flagged `outdated` when a newer one exists. Git deps keep their GitHub-release
+  probing exactly as before (`kind: "git"`, `repo`/`url` populated,
+  `LUABOX_GITHUB_TOKEN` honored); path/workspace deps are listed unchanged. The
+  frozen `{"dependencies":[…]}` envelope and per-item field names are unchanged.
+- **GitHub auth is rescoped to git-source operations only**
+  ([#2](https://github.com/flying-dice/luabox/issues/2)) — `luabox login`'s
+  token now authenticates only `outdated`'s git-release probing and `update`'s
+  re-pin; `luabox search` no longer consults it. Help text and docs updated
+  accordingly.
 
 ### Removed
 

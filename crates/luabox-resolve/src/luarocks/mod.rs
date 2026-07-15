@@ -71,6 +71,18 @@ struct VersionIndex {
     by_semver: BTreeMap<Version, String>,
 }
 
+/// One discovered rock, the unit [`LuaRocksProvider::search`] returns.
+#[derive(Debug, Clone)]
+pub struct RockSummary {
+    /// The bare rock name (a luarocks.org `repository` key).
+    pub name: String,
+    /// The highest translated semver, or `None` when every version is
+    /// non-numeric (`scm`/`dev`/…) and has no semver image.
+    pub latest: Option<Version>,
+    /// How many distinct translated semver versions the rock has.
+    pub version_count: usize,
+}
+
 /// [`PackageProvider`] for registry (luarocks.org) packages, keyed by bare
 /// rock name, backed by luarocks.org (or a local mirror), caching everything
 /// it fetches.
@@ -255,9 +267,24 @@ impl LuaRocksProvider {
         Ok(text)
     }
 
-    /// Network version listing: fetch (and cache) `manifest.json`, read
-    /// `repository[rock]`'s keys.
+    /// Network version listing: read `repository[rock]`'s keys from the
+    /// (cached) `manifest.json`.
     fn network_versions(&self, rock: &str) -> Result<Vec<String>, ProviderError> {
+        let manifest = self.load_manifest()?;
+        let Some(entry) = manifest
+            .get("repository")
+            .and_then(|r| r.get(rock))
+            .and_then(serde_json::Value::as_object)
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(entry.keys().cloned().collect())
+    }
+
+    /// Fetches (and caches under `<cache>/manifest.json`) the luarocks.org root
+    /// `manifest.json`, parsed as JSON. The single fetch+cache seam shared by
+    /// version listing and rock discovery ([`Self::search`]).
+    fn load_manifest(&self) -> Result<serde_json::Value, ProviderError> {
         let manifest_path = self.cache_dir.join("manifest.json");
         let text = if let Ok(text) = fs::read_to_string(&manifest_path) {
             text
@@ -270,19 +297,68 @@ impl LuaRocksProvider {
             let _ = fs::write(&manifest_path, &text);
             text
         };
-        let manifest: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| ProviderError::InvalidManifest {
-                path: manifest_path.clone(),
-                message: format!("luarocks manifest.json is not valid JSON: {e}"),
-            })?;
-        let Some(entry) = manifest
-            .get("repository")
-            .and_then(|r| r.get(rock))
-            .and_then(serde_json::Value::as_object)
-        else {
-            return Ok(Vec::new());
-        };
-        Ok(entry.keys().cloned().collect())
+        serde_json::from_str(&text).map_err(|e| ProviderError::InvalidManifest {
+            path: manifest_path,
+            message: format!("luarocks manifest.json is not valid JSON: {e}"),
+        })
+    }
+
+    /// Every rock the registry knows, keyed by bare rock name, each mapped to
+    /// its raw LuaRocks version strings. Mirror mode enumerates the
+    /// `<rock>-<version>.rockspec` files; network mode reads the root
+    /// `manifest.json`'s `repository` object. The discovery counterpart to
+    /// [`Self::list_luarocks_versions`] (which serves one known rock).
+    fn all_rock_versions(&self) -> Result<BTreeMap<String, Vec<String>>, ProviderError> {
+        if let Some(mirror) = &self.mirror {
+            return Ok(mirror_all_rocks(mirror));
+        }
+        let manifest = self.load_manifest()?;
+        let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        if let Some(repository) = manifest.get("repository").and_then(serde_json::Value::as_object) {
+            for (rock, versions) in repository {
+                let list = versions
+                    .as_object()
+                    .map(|obj| obj.keys().cloned().collect())
+                    .unwrap_or_default();
+                out.insert(rock.clone(), list);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Discovers registry rocks whose bare name contains `query`
+    /// (case-insensitive substring; an empty query matches every rock). Each
+    /// hit carries its highest translated semver ([`Self::latest`](RockSummary::latest))
+    /// and the count of distinct translated versions, name-sorted. Reads the
+    /// same manifest/mirror source the resolver does (network manifest cached
+    /// under `<cache>/manifest.json`); no per-rock rockspec is fetched, so
+    /// descriptions are not available here.
+    ///
+    /// This is the seam `luabox search` is built on.
+    ///
+    /// # Errors
+    /// Propagates a manifest fetch/parse failure (network mode).
+    pub fn search(&self, query: &str) -> Result<Vec<RockSummary>, ProviderError> {
+        let needle = query.trim().to_lowercase();
+        let rocks = self.all_rock_versions()?;
+        let mut out = Vec::new();
+        for (name, raw_versions) in rocks {
+            if !needle.is_empty() && !name.to_lowercase().contains(&needle) {
+                continue;
+            }
+            let mut semvers: Vec<Version> = raw_versions
+                .iter()
+                .filter_map(|v| translate_version(v))
+                .collect();
+            semvers.sort();
+            semvers.dedup();
+            out.push(RockSummary {
+                name,
+                latest: semvers.last().cloned(),
+                version_count: semvers.len(),
+            });
+        }
+        Ok(out)
     }
 
     // --- source fetching --------------------------------------------------
@@ -737,6 +813,47 @@ fn mirror_versions(mirror: &Path, rock: &str) -> Vec<String> {
     out
 }
 
+/// Every rock in a mirror directory, keyed by bare rock name, mapped to its
+/// raw LuaRocks version strings — the mirror-mode counterpart of the network
+/// `manifest.json`'s `repository` object. Enumerates `<rock>-<version>.rockspec`
+/// files (source-tree directories are ignored).
+fn mirror_all_rocks(mirror: &Path) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let Ok(entries) = fs::read_dir(mirror) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some((rock, version)) = split_rockspec_filename(name) {
+            out.entry(rock).or_default().push(version);
+        }
+    }
+    out
+}
+
+/// Splits a `<rock>-<version>.rockspec` file name into `(rock, luarocks_version)`.
+/// The version begins at the first `-` immediately followed by an ASCII digit,
+/// so hyphenated rock names (`lua-cjson-2.1.0-1.rockspec` → `lua-cjson`,
+/// `2.1.0-1`) split correctly. Returns `None` for a name that is not a
+/// rockspec or carries no numeric version. Uses `split_at` on the `-` (an
+/// ASCII byte boundary) — never `string_slice`.
+fn split_rockspec_filename(file: &str) -> Option<(String, String)> {
+    let stem = file.strip_suffix(".rockspec")?;
+    let bytes = stem.as_bytes();
+    for (i, byte) in bytes.iter().enumerate() {
+        if *byte == b'-' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
+            let (rock, rest) = stem.split_at(i);
+            let version = rest.strip_prefix('-').unwrap_or(rest);
+            if rock.is_empty() {
+                return None;
+            }
+            return Some((rock.to_owned(), version.to_owned()));
+        }
+    }
+    None
+}
+
 /// `tar` program to shell out to (Windows: prefer system `bsdtar` so a
 /// git-shipped GNU tar can't shadow it — it can't read `.zip`).
 fn tar_program() -> PathBuf {
@@ -851,6 +968,48 @@ mod tests {
         // Namespaced `user/rock` resolves by bare rock name.
         let (name, _) = dependency_from_spec("hisham/luaposix").unwrap().unwrap();
         assert_eq!(name, "luaposix");
+    }
+
+    #[test]
+    fn rockspec_filename_splits_name_and_version() {
+        assert_eq!(
+            split_rockspec_filename("penlight-1.14.0-1.rockspec"),
+            Some(("penlight".to_owned(), "1.14.0-1".to_owned()))
+        );
+        // A hyphenated rock name splits at the first `-<digit>`, not the first `-`.
+        assert_eq!(
+            split_rockspec_filename("lua-cjson-2.1.0-1.rockspec"),
+            Some(("lua-cjson".to_owned(), "2.1.0-1".to_owned()))
+        );
+        // Not a rockspec, or no numeric version → no split.
+        assert_eq!(split_rockspec_filename("penlight-1.0-1"), None);
+        assert_eq!(split_rockspec_filename("README.md"), None);
+        assert_eq!(split_rockspec_filename("-1.0-1.rockspec"), None);
+    }
+
+    #[test]
+    fn mirror_search_matches_substring_and_reports_latest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for file in [
+            "penlight-1.0-1.rockspec",
+            "penlight-1.5.4-1.rockspec",
+            "inspect-3.1.3-0.rockspec",
+        ] {
+            std::fs::write(dir.path().join(file), b"").expect("write rockspec");
+        }
+        let provider = LuaRocksProvider::new(dir.path().join("cache"))
+            .with_mirror(Some(dir.path().to_path_buf()));
+
+        let hits = provider.search("pen").expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "penlight");
+        assert_eq!(hits[0].latest, Some(Version::new(1, 5, 4)));
+        assert_eq!(hits[0].version_count, 2);
+
+        // Empty query lists every rock, name-sorted.
+        let all = provider.search("").expect("search all");
+        let names: Vec<&str> = all.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["inspect", "penlight"]);
     }
 
     #[test]

@@ -32,8 +32,11 @@ toml_edit.workspace = true
 tempfile.workspace = true
 sha2.workspace = true
 serde.workspace = true
-# GitHub-as-registry discovery (`search`/`outdated`): parse API JSON and emit
-# the frozen GUI contract — never by hand-scanning (`string_slice` is denied).
+# Compare locked vs. latest luarocks.org versions in `luabox outdated`.
+semver.workspace = true
+# `luabox search`/`outdated` emit a frozen JSON contract for the editor GUIs;
+# release probing parses the GitHub API — never by hand-scanning
+# (`string_slice` is denied).
 serde_json.workspace = true
 # `luabox upgrade` self-replace: renames the running exe out of the way on
 # Windows (see upgrade_cmd.rs).

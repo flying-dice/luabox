@@ -319,7 +319,7 @@ impl Project {
     /// ([`luabox_resolve::effective_manifest`]). A registry dep left in
     /// `luabox.toml`, or a name declared in both manifests, surfaces here as a
     /// hard error.
-    fn resolved_manifest(&self) -> anyhow::Result<Manifest> {
+    pub(crate) fn resolved_manifest(&self) -> anyhow::Result<Manifest> {
         effective_manifest(&self.manifest, self.rockspec.as_ref()).map_err(|e| anyhow!("{e}"))
     }
 }

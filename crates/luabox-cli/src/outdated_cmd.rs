@@ -1,18 +1,29 @@
-//! `luabox outdated` — report dependencies behind their latest release.
+//! `luabox outdated` — report dependencies behind their latest available version.
 //!
-//! Reads the project manifest's `[dependencies]` and `[dev-dependencies]` and,
-//! for each **git** dependency on a GitHub repo, compares the pinned tag to the
-//! repo's latest release tag (SPEC.md §6: git deps are luabox's registry-less
-//! install mechanism). Non-git deps are listed with their kind and never marked
-//! outdated. Always exits 0 — it is a report, not a gate.
+//! Reports every dependency of the resolved project (the rockspec's registry
+//! deps fused with `luabox.toml`'s `path`/`git`/`workspace` sources, SPEC.md §6):
 //!
-//! `--format json` emits the frozen contract the editor GUIs are built against;
-//! the default `text` renders a table and a summary.
+//! * **registry** deps (rockspec-declared, resolved from luarocks.org) compare
+//!   the **locked** version (from `luabox.lock`) against the highest version in
+//!   the luarocks manifest — outdated when a newer one exists.
+//! * **git** deps on a GitHub repo compare the pinned tag against the repo's
+//!   latest GitHub release (release probing, anonymous or `LUABOX_GITHUB_TOKEN`).
+//! * **path**/**workspace** deps (and non-GitHub / rev/branch git pins) are
+//!   listed with their kind and never marked outdated.
+//!
+//! Always exits 0 — it is a report, not a gate. `--format json` emits the frozen
+//! `{"dependencies":[…]}` contract the editor GUIs are built against; the
+//! default `text` renders a table and a summary.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Result, bail};
 use luabox_resolve::manifest::Dependency;
+use luabox_resolve::{
+    LOCKFILE_NAME, LockedSource, Lockfile, LuaRocksProvider, PackageId, PackageProvider,
+};
+use semver::Version;
 use serde::Serialize;
 
 use crate::github;
@@ -27,10 +38,11 @@ struct DepReport {
     repo: Option<String>,
     /// The git URL for a git dep, else `null`.
     url: Option<String>,
-    /// The current pin: a git tag/rev/branch, or a registry version req, else
-    /// `null`.
+    /// The current pin: a git tag/rev/branch, or a registry dep's locked
+    /// version (its version requirement when unlocked), else `null`.
     current: Option<String>,
-    /// The repo's latest release tag (git+GitHub only), else `null`.
+    /// The latest available version: a git+GitHub repo's latest release tag, or
+    /// a registry rock's highest luarocks.org version, else `null`.
     latest: Option<String>,
     outdated: bool,
 }
@@ -48,15 +60,19 @@ fn tag_outdated(current: &str, latest: Option<&str>) -> bool {
     matches!(latest, Some(latest) if latest != current)
 }
 
-/// `luabox outdated`: build one report row per manifest dependency, render.
+/// `luabox outdated`: build one report row per resolved dependency, render.
 pub fn run(cwd: &Path, format: &str) -> Result<()> {
     match format {
         "json" | "text" => {}
         other => bail!("unknown --format `{other}`; expected `text` or `json`"),
     }
 
-    let (_root, manifest) = crate::project::discover_required(cwd)?;
+    let project = crate::deps_cmd::discover(cwd)?;
+    // The resolved graph: rockspec registry deps fused with luabox.toml sources.
+    let manifest = project.resolved_manifest()?;
     let token = github::token();
+    let locked = load_locked_registry(&project.root);
+    let luarocks = LuaRocksProvider::from_env(crate::deps_cmd::store_root()?.join("luarocks"));
 
     // `[dependencies]` then `[dev-dependencies]`, each already name-sorted
     // (BTreeMap), so the report order is stable.
@@ -67,7 +83,7 @@ pub fn run(cwd: &Path, format: &str) -> Result<()> {
 
     let mut reports = Vec::new();
     for (name, dep) in deps {
-        reports.push(report_for(name, dep, token.as_deref())?);
+        reports.push(report_for(name, dep, token.as_deref(), &luarocks, &locked)?);
     }
 
     if format == "json" {
@@ -86,19 +102,60 @@ pub fn run(cwd: &Path, format: &str) -> Result<()> {
     Ok(())
 }
 
-/// Builds the report row for one dependency, hitting GitHub only for git deps
-/// on a GitHub repo.
-fn report_for(name: &str, dep: &Dependency, token: Option<&str>) -> Result<DepReport> {
+/// The locked concrete version of every registry package in `luabox.lock`,
+/// keyed by name. A missing or unparseable lockfile yields an empty map (the
+/// report simply has no locked version to compare) — outdated never fails on it.
+fn load_locked_registry(root: &Path) -> BTreeMap<String, Version> {
+    let Ok(text) = std::fs::read_to_string(root.join(LOCKFILE_NAME)) else {
+        return BTreeMap::new();
+    };
+    let Ok(lock) = Lockfile::parse(&text) else {
+        return BTreeMap::new();
+    };
+    lock.packages
+        .into_iter()
+        .filter(|package| matches!(package.source, Some(LockedSource::Registry)))
+        .map(|package| (package.name, package.version))
+        .collect()
+}
+
+/// The highest version of registry rock `name` on luarocks.org (or the mirror),
+/// or `None` when the rock is unknown/unreachable — a report never fails on it.
+fn registry_latest(luarocks: &LuaRocksProvider, name: &str) -> Option<Version> {
+    luarocks
+        .list_versions(&PackageId::registry(name))
+        .ok()
+        .and_then(|versions| versions.into_iter().max())
+}
+
+/// Builds the report row for one dependency, reaching luarocks.org for registry
+/// deps and GitHub only for git deps on a GitHub repo.
+fn report_for(
+    name: &str,
+    dep: &Dependency,
+    token: Option<&str>,
+    luarocks: &LuaRocksProvider,
+    locked: &BTreeMap<String, Version>,
+) -> Result<DepReport> {
     match dep {
-        Dependency::Version(req) => Ok(DepReport {
-            name: name.to_owned(),
-            kind: "registry",
-            repo: None,
-            url: None,
-            current: Some(req.clone()),
-            latest: None,
-            outdated: false,
-        }),
+        Dependency::Version(req) => {
+            // Registry (luarocks.org) dep: compare the locked version against
+            // the highest version the registry offers.
+            let current = locked.get(name);
+            let latest = registry_latest(luarocks, name);
+            let outdated = matches!((current, &latest), (Some(cur), Some(lat)) if lat > cur);
+            Ok(DepReport {
+                name: name.to_owned(),
+                kind: "registry",
+                repo: None,
+                url: None,
+                // Prefer the concrete locked version; fall back to the version
+                // requirement when the project has not been installed yet.
+                current: current.map(Version::to_string).or_else(|| Some(req.clone())),
+                latest: latest.map(|version| version.to_string()),
+                outdated,
+            })
+        }
         Dependency::Path(_) => Ok(plain(name, "path")),
         Dependency::Workspace(_) => Ok(plain(name, "workspace")),
         Dependency::Git(git) => {
@@ -154,7 +211,7 @@ fn plain(name: &str, kind: &'static str) -> DepReport {
 /// The human `text` rendering: a table plus an "N of M are outdated" summary.
 fn render_text(reports: &[DepReport]) {
     if reports.is_empty() {
-        println!("no dependencies declared in luabox.toml");
+        println!("no dependencies declared in luabox.toml or the rockspec");
         return;
     }
 

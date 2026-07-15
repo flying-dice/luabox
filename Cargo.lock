@@ -1269,6 +1269,7 @@ dependencies = [
  "rayon",
  "rowan",
  "self-replace",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

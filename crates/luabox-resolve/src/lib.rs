@@ -35,7 +35,7 @@ pub use git_provider::{GitCheckout, GitProvider};
 pub use lockfile::{
     LOCKFILE_NAME, LOCKFILE_VERSION, LockedPackage, LockedSource, Lockfile, LockfileError,
 };
-pub use luarocks::LuaRocksProvider;
+pub use luarocks::{LuaRocksProvider, RockSummary};
 pub use manifest::{Manifest, ManifestError};
 pub use project::{ProjectError, effective_manifest};
 pub use provider::{

@@ -90,16 +90,16 @@ enum Command {
     },
     /// Remove a dependency from luabox.toml
     Remove { package: String },
-    /// Search GitHub for luabox packages (repos with topic `luabox` and a
-    /// root luabox.toml)
+    /// Search luarocks.org (the registry) for rocks by name
     Search {
-        /// Optional terms, matched against repo name/description/README
+        /// Optional terms, matched as a case-insensitive substring of rock names
         query: Option<String>,
         /// Output format: text (default) or json
         #[arg(long, default_value = "text")]
         format: String,
     },
-    /// Report git dependencies behind their repo's latest GitHub release
+    /// Report dependencies behind their latest version (registry rocks vs.
+    /// luarocks.org; git deps vs. their repo's latest GitHub release)
     Outdated {
         /// Output format: text (default) or json
         #[arg(long, default_value = "text")]
