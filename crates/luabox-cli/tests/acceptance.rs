@@ -771,9 +771,9 @@ fn unmap_last_bundle_line(world: &mut AcceptanceWorld, path: String) {
 // Hermetic scenarios point LUABOX_LUAROCKS_MIRROR at a scenario-local mirror
 // directory (".luarocks-mirror"), pre-populated with `<rock>-<version>.rockspec`
 // files and extracted `<rock>-<version>/` source trees. No network is touched.
-// The one @network scenario resolves a real rock from luarocks.org and is
-// filtered by CI; it also self-skips when the network is unreachable so an
-// offline full-suite run stays green.
+// The one @network scenario resolves a real rock from luarocks.org; it is
+// opt-in via LUABOX_NETWORK_TESTS=1 and self-skips otherwise (and when the
+// network is unreachable), so every default full-suite run is hermetic.
 
 /// The scenario's luarocks mirror directory.
 fn luarocks_mirror(world: &AcceptanceWorld) -> std::path::PathBuf {
@@ -862,25 +862,40 @@ fn run_against_luarocks_mirror(world: &mut AcceptanceWorld, command: String) {
     );
 }
 
-/// @network: resolve+install a real rock from luarocks.org. Self-skips (by
-/// substituting a trivially successful command) when the network is down, so
-/// offline runs stay green; CI filters the @network tag to avoid the network.
+/// @network: resolve+install a real rock from luarocks.org. Opt-in only —
+/// runs when `LUABOX_NETWORK_TESTS=1` is set AND the network is reachable;
+/// otherwise self-skips (by substituting a trivially successful command) so
+/// every default run is hermetic. A reachability probe alone is not enough:
+/// the install fetches from BOTH luarocks.org (manifest/rockspec) and
+/// github.com (the source tarball), and an environment where one host is
+/// proxied but the other is blocked passes a single-host probe and then
+/// fails the real fetch. Probe both, and only when explicitly opted in.
 #[when(expr = "I install {string} from luarocks.org")]
 fn install_real_rock(world: &mut AcceptanceWorld, spec: String) {
-    let reachable = std::process::Command::new("curl")
-        .args([
-            "-fsS",
-            "--max-time",
-            "15",
-            "-o",
-            if cfg!(windows) { "NUL" } else { "/dev/null" },
-            "https://luarocks.org/manifest.json",
-        ])
-        .status()
-        .is_ok_and(|s| s.success());
-    if !reachable {
-        eprintln!("skipping @network scenario: luarocks.org is unreachable");
+    let opted_in = std::env::var("LUABOX_NETWORK_TESTS").is_ok_and(|v| v == "1");
+    let host_reachable = |url: &str| {
+        std::process::Command::new("curl")
+            .args([
+                "-fsS",
+                "--max-time",
+                "15",
+                "-o",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+                url,
+            ])
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    if !opted_in {
+        eprintln!("skipping @network scenario: set LUABOX_NETWORK_TESTS=1 to run it");
         // A trivially successful command so `Then the command succeeds` holds.
+        run_command(world, "luabox --version".to_string());
+        return;
+    }
+    if !host_reachable("https://luarocks.org/manifest.json")
+        || !host_reachable("https://github.com/robots.txt")
+    {
+        eprintln!("skipping @network scenario: luarocks.org or github.com is unreachable");
         run_command(world, "luabox --version".to_string());
         return;
     }

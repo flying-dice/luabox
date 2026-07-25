@@ -31,6 +31,37 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  # Line-coverage gate (cargo-llvm-cov). The workspace sits at ~88% today;
+  # the floor is set a notch below so the gate catches genuine erosion
+  # (a new module landing untested) without flaking on noise. Raise the
+  # floor as coverage rises — never lower it to make a PR pass. The full
+  # per-file report is uploaded as an artifact for inspection.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+          components: llvm-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      # One instrumented test run: the per-file summary table goes to the
+      # job log and the gate fails the job under the floor; the lcov export
+      # below reuses the same profdata without rerunning anything.
+      - run: cargo llvm-cov --workspace --fail-under-lines 85
+      - run: cargo llvm-cov report --lcov --output-path lcov.info
+        if: always()
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-lcov
+          path: lcov.info
+
   # SPEC.md §16.1 — perf gates are CI-blocking: cold start < 50 ms, and
   # (until `luabox check` lands, ticket #6) a `fmt --check` throughput
   # proxy on a ~100-kLOC synthetic corpus < 2 s warm. See
