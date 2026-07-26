@@ -26,8 +26,10 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use anyhow::Context;
+use anyhow::{Context, bail};
+use luabox_diag::{Diagnostic, Format, Label, Span};
 use luabox_resolve::manifest::Manifest;
+use luabox_syntax::lua;
 
 use crate::check_cmd;
 use model::DocModel;
@@ -39,14 +41,63 @@ pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
         crate::project::collect_lua_files(&project.root, project.out_dir.as_deref(), true)?;
     let package = manifest_facts(&project.root);
 
+    // A file that does not parse has no trustworthy harvest — its doc
+    // comments may attach to the wrong (recovered) nodes or vanish with the
+    // broken region. Gate on parse errors exactly like `build` does (#24);
+    // type errors deliberately do NOT gate — docs for imperfect code are
+    // still docs. The gate covers EVERYTHING the harvest reads: project
+    // sources AND the `*.d.lua` defs harvested below — a def file is
+    // nothing but annotations, so a swallowed region there loses
+    // documentation outright.
+    let mut parse_diags = Vec::new();
+    let push_parse_errors = |rel: &str, source: &str, diags: &mut Vec<Diagnostic>| {
+        for err in lua::parse(source, project.dialect).errors() {
+            let range = usize::from(err.range.start())..usize::from(err.range.end());
+            diags.push(
+                Diagnostic::error(check_cmd::code(1), err.message.clone())
+                    .with_label(Label::primary(Span::new(rel, range), "syntax error here")),
+            );
+        }
+    };
+
     let mut modules = Vec::new();
     for path in &lua_files {
         let rel = crate::project::display_rel(path, &project.root);
         let source = fs::read_to_string(path).with_context(|| format!("cannot read `{rel}`"))?;
+        push_parse_errors(&rel, &source, &mut parse_diags);
         let name = model::module_name(&rel);
         modules.push(model::lua_module(&name, &source, project.dialect));
     }
-    harvest_def_modules(&project, &mut modules);
+
+    // Project defs are yours: a broken one gates, because you can fix it.
+    let (mut defs, _diags) = check_cmd::resolve_project_defs(&project.root, &project.defs);
+    for def in &defs {
+        push_parse_errors(&def.file, &def.text, &mut parse_diags);
+    }
+
+    // Dependency defs are someone else's text — the same principle that
+    // keeps vendored rock trees out of the source walk. A broken one is
+    // skipped with a warning instead of blocking the command; refusing
+    // would leave the user hand-editing vendored code to get docs at all.
+    for def in &project.dep_defs {
+        if lua::parse(&def.text, project.dialect).errors().is_empty() {
+            defs.push(def.clone());
+        } else {
+            eprintln!(
+                "doc: skipping dependency def `{}` (does not parse)",
+                def.file
+            );
+        }
+    }
+
+    if !parse_diags.is_empty() {
+        let counts = crate::project::render_diagnostics(&parse_diags, Format::Human, &project.root);
+        bail!(
+            "doc refuses to generate while {} parse error(s) exist",
+            counts.errors
+        );
+    }
+    harvest_def_modules(&project, &defs, &mut modules);
 
     let model = DocModel { package, modules };
 
@@ -91,16 +142,17 @@ pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
 /// by name (from a real module, or an earlier def file) is dropped here
 /// instead: the real carrier's page — richer, with methods — wins, and the
 /// def only contributes classes with no carrier of their own.
-fn harvest_def_modules(project: &check_cmd::Project, modules: &mut Vec<model::Module>) {
+fn harvest_def_modules(
+    project: &check_cmd::Project,
+    defs: &[luabox_types::DefFile],
+    modules: &mut Vec<model::Module>,
+) {
     let mut known: BTreeSet<String> = modules
         .iter()
         .flat_map(|m| m.classes.iter().map(|c| c.name.clone()))
         .collect();
 
-    let (mut defs, _diags) = check_cmd::resolve_project_defs(&project.root, &project.defs);
-    defs.extend(project.dep_defs.iter().cloned());
-
-    for def in &defs {
+    for def in defs {
         let name = def_module_name(&def.file);
         let mut module = model::lua_module(&name, &def.text, project.dialect);
         module.classes.retain(|c| known.insert(c.name.clone()));
@@ -192,6 +244,110 @@ mod tests {
     fn read_doc(root: &Path, page: &str) -> String {
         fs::read_to_string(root.join("doc").join(page))
             .unwrap_or_else(|e| panic!("reading doc/{page}: {e}"))
+    }
+
+    #[test]
+    fn doc_refuses_on_a_parse_error_and_writes_nothing() {
+        // #24: a file that does not parse has no trustworthy harvest — gate
+        // like `build` does instead of generating pages from a broken AST.
+        let tmp = project("broken", "");
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "--[[ never closed\nlocal x = 1\n",
+        );
+
+        let err = run(tmp.path(), false).expect_err("doc must refuse on a parse error");
+        assert!(
+            err.to_string().contains("parse error"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !tmp.path().join("doc").exists(),
+            "no doc/ output on refusal"
+        );
+    }
+
+    #[test]
+    fn doc_refuses_on_a_parse_error_in_a_def_file() {
+        // Review finding on #24's first cut: defs are harvested (they are
+        // nothing but annotations) so they gate too — an unterminated long
+        // comment in a def silently swallowed every class after it.
+        let tmp = project("defbroken", "\n[types]\ndefs = [\"mylib\"]\n");
+        write(tmp.path(), "src/main.lua", "local x = 1\n");
+        write(
+            tmp.path(),
+            "defs/mylib.d.lua",
+            "---@meta\n---@class Before.Thing\n--[[ unterminated swallows the rest\n---@class After.Thing\n",
+        );
+
+        let err = run(tmp.path(), false).expect_err("doc must refuse on a broken def");
+        assert!(
+            err.to_string().contains("parse error"),
+            "unexpected error: {err}"
+        );
+        assert!(!tmp.path().join("doc").exists(), "no doc/ output");
+    }
+
+    #[test]
+    fn a_broken_dependency_def_is_skipped_not_fatal() {
+        // Third-party defs are vendored text — the same principle that keeps
+        // rock trees out of the source walk. A broken dep def must not brick
+        // `doc`; it is skipped (with a stderr warning), while a clean dep
+        // def in the same tree still harvests.
+        let tmp = project(
+            "consumer",
+            "\n[dependencies]\ngeo = \"1.0\"\nutil = \"1.0\"\n",
+        );
+        write(tmp.path(), "src/main.lua", "local x = 1\n");
+        write(
+            tmp.path(),
+            "lua_modules/geo/luabox.toml",
+            "[package]\nedition = \"5.4\"\n\n[types]\ndefs = [\"geo\"]\n",
+        );
+        write(
+            tmp.path(),
+            "lua_modules/geo/defs/geo.d.lua",
+            "---@meta\n---@class Geo.Point\n--[[ unterminated third-party\n",
+        );
+        write(
+            tmp.path(),
+            "lua_modules/util/luabox.toml",
+            "[package]\nedition = \"5.4\"\n\n[types]\ndefs = [\"util\"]\n",
+        );
+        write(
+            tmp.path(),
+            "lua_modules/util/defs/util.d.lua",
+            "---@meta\n---@class Util.Clock\n",
+        );
+
+        run(tmp.path(), false).expect("a broken dep def must not block doc");
+        assert!(
+            read_doc(tmp.path(), "index.html").contains("Util.Clock"),
+            "the clean dep def still harvests"
+        );
+        assert!(
+            !tmp.path().join("doc/class.Geo.Point.html").exists(),
+            "the broken dep def is skipped, not partially harvested"
+        );
+    }
+
+    #[test]
+    fn doc_still_generates_for_type_errors() {
+        // Type errors deliberately do NOT gate: docs for imperfect code are
+        // still docs. Only the parse gate refuses.
+        let tmp = project("imperfect", "\n[types]\nstrict = true\n");
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "---@param n number\n---@return number\nlocal function double(n)\n    return n * 2\nend\n\nprint(double(\"oops\"))\n",
+        );
+
+        run(tmp.path(), false).expect("type errors must not gate doc");
+        assert!(
+            read_doc(tmp.path(), "index.html").contains("imperfect"),
+            "site generated despite the type error"
+        );
     }
 
     const CIRCLE_SOURCE: &str = "\

@@ -310,3 +310,91 @@ Feature: luabox doc — static documentation site
     And the file "doc/class.geometry.Shape.html" exists
     And "doc/class.geometry.Shape.html" contains "<h2>Implementors</h2>"
     And "doc/class.geometry.Shape.html" contains 'href="class.geometry.Circle.html"'
+
+  Scenario: doc refuses on a parse error like build does
+    Given a project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      --[[ never closed
+      local x = 1
+      """
+    When I run "luabox doc"
+    Then the command fails
+    And stdout contains "error[LB0001]"
+    And stderr contains "doc refuses to generate"
+
+  Scenario: doc still generates when the only problems are type errors
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@param n number
+      ---@return number
+      local function double(n)
+        return n * 2
+      end
+
+      print(double("oops"))
+      """
+    When I run "luabox doc"
+    Then the command succeeds
+    And the file "doc/index.html" exists
+
+  Scenario: doc refuses on a parse error in a definition file
+    Given a project with edition "5.4"
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      edition = "5.4"
+
+      [types]
+      defs = ["mylib"]
+      """
+    And a file "src/main.lua" containing:
+      """
+      local x = 1
+      """
+    And a file "defs/mylib.d.lua" containing:
+      """
+      ---@meta
+      ---@class Before.Thing
+      --[[ unterminated swallows the rest
+      ---@class After.Thing
+      """
+    When I run "luabox doc"
+    Then the command fails
+    And stdout contains "error[LB0001]"
+    And stdout contains "mylib.d.lua"
+    And stderr contains "doc refuses to generate"
+
+  Scenario: a broken dependency def is skipped with a warning, not fatal
+    Given a project with edition "5.4"
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      edition = "5.4"
+
+      [dependencies]
+      geo = "1.0"
+      """
+    And a file "src/main.lua" containing:
+      """
+      local x = 1
+      """
+    And a file "lua_modules/geo/luabox.toml" containing:
+      """
+      [package]
+      edition = "5.4"
+
+      [types]
+      defs = ["geo"]
+      """
+    And a file "lua_modules/geo/defs/geo.d.lua" containing:
+      """
+      ---@meta
+      ---@class Geo.Point
+      --[[ unterminated third-party
+      """
+    When I run "luabox doc"
+    Then the command succeeds
+    And stderr contains "skipping dependency def"
+    And the file "doc/index.html" exists

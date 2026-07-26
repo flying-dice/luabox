@@ -80,6 +80,14 @@ so it appears in no version entry.
 
 ### Fixed
 
+- **`luabox doc` refuses to generate while parse errors exist**
+  ([#24](https://github.com/flying-dice/luabox/issues/24)) — a file that
+  does not parse has no trustworthy harvest. One rule: project sources
+  and project defs gate (rendering the `LB0001` diagnostics refused
+  over); a *dependency's* broken def is skipped with a stderr warning
+  and never partially harvested — vendored text cannot brick the
+  command. Type errors never gate: docs for imperfect code are still
+  docs.
 - **`pkg = { version = "1.0" }` now parses as the bare-string form spelled
   longhand** ([#23](https://github.com/flying-dice/luabox/issues/23)). The
   valid-key list always named `version`, but a version-only table was
