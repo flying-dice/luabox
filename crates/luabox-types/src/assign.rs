@@ -786,4 +786,168 @@ mod tests {
             &func(&[("x", Ty::Unknown, false)], &[], false),
         );
     }
+
+    // --- number-literal identity -----------------------------------------
+
+    #[test]
+    fn number_literals_compare_numerically_not_textually() {
+        // `1` and `1.0` are the same value, so the literal types are mutually
+        // assignable even though the source texts differ.
+        ok(&Ty::NumberLit("1".into()), &Ty::NumberLit("1.0".into()));
+        ok(&Ty::NumberLit("1.0".into()), &Ty::NumberLit("1".into()));
+        ok(&Ty::NumberLit("2".into()), &Ty::NumberLit("2".into()));
+        no(&Ty::NumberLit("1".into()), &Ty::NumberLit("2".into()));
+        // A hex literal has no decimal parse; equality falls back to text.
+        ok(&Ty::NumberLit("0x10".into()), &Ty::NumberLit("0x10".into()));
+        no(&Ty::NumberLit("0x10".into()), &Ty::NumberLit("16".into()));
+    }
+
+    // --- indexers ---------------------------------------------------------
+
+    fn indexed(key: Ty, value: Ty) -> Ty {
+        Ty::Table(Box::new(TableTy {
+            indexers: vec![(key, value)],
+            ..TableTy::default()
+        }))
+    }
+
+    #[test]
+    fn indexer_values_must_satisfy_a_reachable_target_indexer() {
+        // Same key domain, wrong value type.
+        no(
+            &indexed(Ty::String, Ty::Number),
+            &indexed(Ty::String, Ty::String),
+        );
+        ok(
+            &indexed(Ty::String, Ty::Integer),
+            &indexed(Ty::String, Ty::Number),
+        );
+        // A value indexer whose keys cannot reach the target's key domain
+        // imposes no obligation.
+        ok(
+            &indexed(Ty::String, Ty::Number),
+            &indexed(Ty::Integer, Ty::String),
+        );
+    }
+
+    #[test]
+    fn optional_target_fields_admit_nil_from_the_value() {
+        let value = table(&[("a", Ty::union(vec![Ty::Number, Ty::Nil]), false)]);
+        let target = table(&[("a", Ty::Number, true)]);
+        ok(&value, &target);
+        // …but a non-optional target field does not.
+        no(&value, &table(&[("a", Ty::Number, false)]));
+    }
+
+    // --- recursion guard --------------------------------------------------
+
+    #[test]
+    fn mutually_recursive_named_classes_terminate() {
+        // `A = { next: B }`, `B = { next: A }`: the coinduction guard must
+        // stop the walk instead of recursing forever.
+        let mut env = TypeEnv::default();
+        env.merge_file_types(&{
+            let parsed = luabox_syntax::lua::parse(
+                "\
+---@class RecA
+---@field next RecB
+---@class RecB
+---@field next RecA
+",
+                luabox_syntax::lua::Dialect::Lua54,
+            );
+            let items = luabox_syntax::luacats::harvest(&parsed);
+            let inner = TypeEnv::build_from_items(&parsed, &items, None);
+            crate::env::FileTypes::collect(&items, &inner, &std::collections::HashMap::new())
+        });
+        assert!(assignable(
+            &env,
+            Exactness::Strict,
+            &Ty::Named("RecA".into()),
+            &Ty::Named("RecB".into())
+        ));
+    }
+
+    #[test]
+    fn an_undeclared_named_value_is_unknown_shaped() {
+        // Strict treats an unresolvable name like `unknown` (an error);
+        // loose accepts it. An undeclared *target* always accepts.
+        let undeclared = Ty::Named("NeverDeclared".into());
+        assert!(!assignable(
+            &env(),
+            Exactness::Strict,
+            &undeclared,
+            &Ty::Number
+        ));
+        assert!(assignable(
+            &env(),
+            Exactness::Loose,
+            &undeclared,
+            &Ty::Number
+        ));
+        assert!(assignable(
+            &env(),
+            Exactness::Strict,
+            &Ty::Number,
+            &undeclared
+        ));
+    }
+
+    // --- mismatch explanations -------------------------------------------
+
+    #[test]
+    fn explain_names_both_missing_and_mismatched_members() {
+        let value = table(&[("a", Ty::String, false)]);
+        let target = table(&[("a", Ty::Number, false), ("b", Ty::Number, false)]);
+        let detail = explain_mismatch(&env(), Exactness::Strict, &value, &target)
+            .expect("a table-level story");
+        assert_eq!(
+            detail,
+            "missing `b`; mismatched `a` (expected `number`, found `string`)"
+        );
+    }
+
+    #[test]
+    fn explain_is_silent_when_the_shapes_agree() {
+        let value = table(&[("a", Ty::Number, false)]);
+        let target = table(&[("a", Ty::Number, false)]);
+        assert_eq!(
+            explain_mismatch(&env(), Exactness::Strict, &value, &target),
+            None
+        );
+    }
+
+    #[test]
+    fn explain_needs_two_table_shapes() {
+        // Non-table operands have no member-level story to tell.
+        assert_eq!(
+            explain_mismatch(&env(), Exactness::Strict, &Ty::Number, &Ty::String),
+            None
+        );
+        // A union of two real members does not unwrap to a single shape.
+        let multi = Ty::union(vec![
+            table(&[("a", Ty::Number, false)]),
+            table(&[("b", Ty::Number, false)]),
+        ]);
+        assert_eq!(
+            explain_mismatch(
+                &env(),
+                Exactness::Strict,
+                &table(&[("a", Ty::String, false)]),
+                &multi
+            ),
+            None
+        );
+        // A `T?` optional *does* unwrap to its single non-nil member.
+        let optional = Ty::union(vec![table(&[("a", Ty::Number, false)]), Ty::Nil]);
+        assert!(
+            explain_mismatch(
+                &env(),
+                Exactness::Strict,
+                &table(&[("a", Ty::String, false)]),
+                &optional
+            )
+            .is_some()
+        );
+    }
 }

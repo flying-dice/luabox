@@ -373,3 +373,226 @@ fn encode(index: &LineIndex, mut raw: Vec<RawToken>) -> Vec<SemanticToken> {
     }
     data
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test code — panics document assumptions"
+)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
+
+    fn analyze(text: &str) -> (Analysis, PathBuf) {
+        let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
+        let path = Path::new(if cfg!(windows) {
+            r"C:\ws\main.lua"
+        } else {
+            "/ws/main.lua"
+        })
+        .to_path_buf();
+        host.apply_change(Change::SetFileText {
+            path: path.clone(),
+            dialect: Dialect::Lua54,
+            text: text.to_string(),
+        });
+        (host.snapshot(), path)
+    }
+
+    /// One token with its delta encoding resolved back to absolute position.
+    #[derive(Debug)]
+    struct Decoded {
+        line: u32,
+        start: u32,
+        length: u32,
+        token_type: u32,
+        modifiers: u32,
+    }
+
+    fn decode(src: &str) -> Vec<Decoded> {
+        let (analysis, path) = analyze(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let (mut line, mut start) = (0, 0);
+        lua_tokens(&sema)
+            .into_iter()
+            .map(|token| {
+                if token.delta_line == 0 {
+                    start += token.delta_start;
+                } else {
+                    line += token.delta_line;
+                    start = token.delta_start;
+                }
+                Decoded {
+                    line,
+                    start,
+                    length: token.length,
+                    token_type: token.token_type,
+                    modifiers: token.token_modifiers_bitset,
+                }
+            })
+            .collect()
+    }
+
+    /// The token starting exactly at `(line, start)`.
+    fn at(tokens: &[Decoded], line: u32, start: u32) -> &Decoded {
+        tokens
+            .iter()
+            .find(|t| t.line == line && t.start == start)
+            .unwrap_or_else(|| panic!("no token at ({line}, {start}) in {tokens:?}"))
+    }
+
+    #[test]
+    fn string_and_number_literals_get_their_own_types() {
+        let tokens = decode("local s = \"hi\"\nlocal n = 12\n");
+        assert_eq!(at(&tokens, 0, 10).token_type, STRING);
+        assert_eq!(at(&tokens, 0, 10).length, 4);
+        assert_eq!(at(&tokens, 1, 10).token_type, NUMBER);
+    }
+
+    #[test]
+    fn a_const_local_is_readonly_and_the_attribute_reads_as_a_keyword() {
+        let tokens = decode("local x <const> = 1\n");
+        let name = at(&tokens, 0, 6);
+        assert_eq!(name.token_type, VARIABLE);
+        assert_eq!(name.modifiers, M_DECLARATION | M_READONLY);
+        // `const` inside `<...>`.
+        assert_eq!(at(&tokens, 0, 9).token_type, KEYWORD);
+    }
+
+    #[test]
+    fn a_plain_local_declaration_is_not_readonly() {
+        let tokens = decode("local y = 1\n");
+        assert_eq!(at(&tokens, 0, 6).modifiers, M_DECLARATION);
+    }
+
+    #[test]
+    fn a_dotted_method_declaration_splits_into_base_property_and_method() {
+        let tokens = decode("function M.sub:go() end\n");
+        assert_eq!(at(&tokens, 0, 9).token_type, VARIABLE);
+        assert_eq!(at(&tokens, 0, 9).modifiers, 0);
+        assert_eq!(at(&tokens, 0, 11).token_type, PROPERTY);
+        let method = at(&tokens, 0, 15);
+        assert_eq!(method.token_type, METHOD);
+        assert_eq!(method.modifiers, M_DECLARATION);
+    }
+
+    #[test]
+    fn a_plain_function_declaration_name_is_a_function() {
+        let tokens = decode("function f() end\n");
+        let name = at(&tokens, 0, 9);
+        assert_eq!(name.token_type, FUNCTION);
+        assert_eq!(name.modifiers, M_DECLARATION);
+    }
+
+    #[test]
+    fn a_local_function_name_and_its_params_are_declarations() {
+        let tokens = decode("local function g(p) return p end\n");
+        let name = at(&tokens, 0, 15);
+        assert_eq!(name.token_type, FUNCTION);
+        assert_eq!(name.modifiers, M_DECLARATION);
+        let param = at(&tokens, 0, 17);
+        assert_eq!(param.token_type, PARAMETER);
+        assert_eq!(param.modifiers, M_DECLARATION);
+        // The *use* of the parameter carries no declaration modifier.
+        let use_site = at(&tokens, 0, 27);
+        assert_eq!(use_site.token_type, PARAMETER);
+        assert_eq!(use_site.modifiers, 0);
+    }
+
+    #[test]
+    fn field_and_method_accesses_are_properties_and_methods() {
+        let tokens = decode("local o = {}\nprint(o.field)\no:method()\n");
+        assert_eq!(at(&tokens, 1, 8).token_type, PROPERTY);
+        assert_eq!(at(&tokens, 2, 2).token_type, METHOD);
+    }
+
+    #[test]
+    fn a_table_constructor_key_is_a_property_declaration() {
+        let tokens = decode("local t = { key = 1 }\n");
+        let key = at(&tokens, 0, 12);
+        assert_eq!(key.token_type, PROPERTY);
+        assert_eq!(key.modifiers, M_DECLARATION);
+    }
+
+    #[test]
+    fn a_label_renders_as_a_variable_declaration() {
+        let tokens = decode("::top::\ngoto top\n");
+        let label = at(&tokens, 0, 2);
+        assert_eq!(label.token_type, VARIABLE);
+        assert_eq!(label.modifiers, M_DECLARATION);
+    }
+
+    #[test]
+    fn for_loop_variables_are_declarations_in_both_loop_forms() {
+        let numeric = decode("for i = 1, 3 do end\n");
+        assert_eq!(at(&numeric, 0, 4).modifiers, M_DECLARATION);
+        assert_eq!(at(&numeric, 0, 4).token_type, VARIABLE);
+
+        let generic = decode("for k, v in pairs({}) do end\n");
+        assert_eq!(at(&generic, 0, 4).modifiers, M_DECLARATION);
+        assert_eq!(at(&generic, 0, 7).modifiers, M_DECLARATION);
+    }
+
+    #[test]
+    fn stdlib_globals_carry_the_default_library_modifier() {
+        let tokens = decode("print(other)\n");
+        assert_eq!(at(&tokens, 0, 0).modifiers, M_STATIC | M_DEFAULT_LIBRARY);
+        assert_eq!(at(&tokens, 0, 6).modifiers, M_STATIC);
+    }
+
+    #[test]
+    fn doc_comments_are_documentation_and_prose_comments_are_not() {
+        let tokens = decode("---@type number\n-- prose\nlocal x = 1\n");
+        assert_eq!(at(&tokens, 0, 0).token_type, COMMENT);
+        assert_eq!(at(&tokens, 0, 0).modifiers, M_DOCUMENTATION);
+        assert_eq!(at(&tokens, 1, 0).token_type, COMMENT);
+        assert_eq!(at(&tokens, 1, 0).modifiers, 0);
+    }
+
+    #[test]
+    fn keywords_and_operators_are_classified_but_delimiters_are_not() {
+        let tokens = decode("local a = 1 + 2\n");
+        assert_eq!(at(&tokens, 0, 0).token_type, KEYWORD);
+        assert_eq!(at(&tokens, 0, 8).token_type, OPERATOR);
+        assert_eq!(at(&tokens, 0, 12).token_type, OPERATOR);
+        // The parentheses of a call are delimiters, not operators.
+        let call = decode("f()\n");
+        assert!(call.iter().all(|t| t.token_type != OPERATOR), "{call:?}");
+    }
+
+    #[test]
+    fn a_multiline_comment_is_split_into_one_token_per_line() {
+        let tokens = decode("--[[first\nsecond\nthird]]\nlocal x = 1\n");
+        let comment_lines: Vec<&Decoded> =
+            tokens.iter().filter(|t| t.token_type == COMMENT).collect();
+        assert_eq!(comment_lines.len(), 3, "{comment_lines:?}");
+        assert_eq!(comment_lines[0].line, 0);
+        assert_eq!(comment_lines[1].line, 1);
+        assert_eq!(comment_lines[1].start, 0);
+        assert_eq!(
+            comment_lines[1].length,
+            u32::try_from("second".len()).unwrap()
+        );
+        assert_eq!(comment_lines[2].line, 2);
+    }
+
+    #[test]
+    fn the_legend_indices_match_the_constants() {
+        let legend = legend();
+        assert_eq!(
+            legend.token_types[PARAMETER as usize],
+            SemanticTokenType::PARAMETER
+        );
+        assert_eq!(
+            legend.token_types[OPERATOR as usize],
+            SemanticTokenType::OPERATOR
+        );
+        assert_eq!(
+            legend.token_modifiers[M_DOCUMENTATION.trailing_zeros() as usize],
+            SemanticTokenModifier::DOCUMENTATION
+        );
+    }
+}

@@ -7,10 +7,14 @@
 //! rather than panicking or silently violating it:
 //! - `format` never panics.
 //! - Idempotence: `format(format(text)) == format(text)`.
-//! - The formatted output always reparses without errors (trivially true
-//!   when `format` bailed out and returned the original text unchanged,
-//!   since `format` only leaves errors in place by returning the input
-//!   verbatim — this only fails if the safety net itself is broken).
+//! - When the input parses cleanly for a dialect, the formatted output
+//!   reparses cleanly for that dialect too. (When the input does NOT
+//!   parse for the dialect, `format`'s safety net returns it verbatim —
+//!   the reparse then reproduces the input's own errors by design, so
+//!   asserting clean reparse unconditionally would reject the net
+//!   working exactly as specified. Found by a corpus seed that is valid
+//!   5.4 but not 5.1: `format(_, Lua51)` bailed verbatim and the
+//!   unconditional assert fired.)
 
 #![no_main]
 
@@ -23,6 +27,8 @@ fuzz_target!(|data: &[u8]| {
     let text: &str = &text;
 
     for dialect in Dialect::ALL {
+        let input_parses_cleanly = parse(text, dialect).errors().is_empty();
+
         let once = fmt::format(text, dialect);
         let twice = fmt::format(&once, dialect);
 
@@ -31,10 +37,17 @@ fuzz_target!(|data: &[u8]| {
             "format not idempotent for dialect {dialect:?}\ninput: {text:?}\nonce: {once:?}"
         );
 
-        let reparsed = parse(&once, dialect);
-        assert!(
-            reparsed.errors().is_empty(),
-            "formatted output failed to reparse cleanly for dialect {dialect:?}\ninput: {text:?}\nonce: {once:?}"
-        );
+        if input_parses_cleanly {
+            let reparsed = parse(&once, dialect);
+            assert!(
+                reparsed.errors().is_empty(),
+                "formatted output failed to reparse cleanly for dialect {dialect:?}\ninput: {text:?}\nonce: {once:?}"
+            );
+        } else {
+            assert_eq!(
+                once, text,
+                "format must return unparseable input verbatim for dialect {dialect:?}\ninput: {text:?}\nonce: {once:?}"
+            );
+        }
     }
 });

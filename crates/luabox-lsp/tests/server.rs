@@ -22,16 +22,17 @@ use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
     CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest,
     FoldingRangeRequest, Formatting, GotoDefinition, GotoImplementation, GotoTypeDefinition,
-    HoverRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting, References, Rename,
-    Request as _, SelectionRangeRequest, SemanticTokensFullRequest, Shutdown, SignatureHelpRequest,
-    WorkspaceSymbolRequest,
+    HoverRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting, References,
+    RegisterCapability, Rename, Request as _, SelectionRangeRequest, SemanticTokensFullRequest,
+    Shutdown, SignatureHelpRequest, WorkspaceSymbolRequest,
 };
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
     ClientCapabilities, CodeActionContext, CodeActionKind, CodeActionOrCommand, CodeActionParams,
     CompletionItemKind, CompletionParams, CompletionResponse, DiagnosticSeverity,
-    DidChangeConfigurationParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidChangeConfigurationParams, DidChangeTextDocumentParams,
+    DidChangeWatchedFilesClientCapabilities, DidChangeWatchedFilesParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
     DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
     DocumentRangeFormattingParams, DocumentSymbolParams, DocumentSymbolResponse, FileChangeType,
@@ -39,13 +40,14 @@ use lsp_types::{
     GotoDefinitionParams, GotoDefinitionResponse, HoverContents, HoverParams, InitializeParams,
     InlayHint, InlayHintLabel, InlayHintParams, NumberOrString, ParameterLabel,
     PartialResultParams, Position, PrepareRenameResponse, ProgressParams, ProgressParamsValue,
-    PublishDiagnosticsParams, Range, ReferenceContext, ReferenceParams, RenameParams,
-    SelectionRange, SelectionRangeParams, SemanticToken, SemanticTokensParams,
+    PublishDiagnosticsParams, Range, ReferenceContext, ReferenceParams, RegistrationParams,
+    RenameParams, SelectionRange, SelectionRangeParams, SemanticToken, SemanticTokensParams,
     SemanticTokensResult, SignatureHelp, SignatureHelpParams, SymbolInformation, SymbolKind,
     TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, TextEdit, Uri, VersionedTextDocumentIdentifier,
-    WindowClientCapabilities, WorkDoneProgress, WorkDoneProgressParams, WorkspaceEdit,
-    WorkspaceFolder, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    WindowClientCapabilities, WorkDoneProgress, WorkDoneProgressParams,
+    WorkspaceClientCapabilities, WorkspaceEdit, WorkspaceFolder, WorkspaceSymbolParams,
+    WorkspaceSymbolResponse,
 };
 use tempfile::TempDir;
 
@@ -145,6 +147,29 @@ impl TestClient {
         }
     }
 
+    /// Like [`Self::wait_response`], but returns the raw response so an error
+    /// reply can be inspected instead of failing the test.
+    fn wait_response_message(&self, id: &RequestId) -> lsp_server::Response {
+        loop {
+            if let Message::Response(resp) = self.recv()
+                && resp.id == *id
+            {
+                return resp;
+            }
+        }
+    }
+
+    /// The next server-to-client request with `method`.
+    fn wait_server_request(&self, method: &str) -> Request {
+        loop {
+            if let Message::Request(req) = self.recv()
+                && req.method == method
+            {
+                return req;
+            }
+        }
+    }
+
     fn request<R: lsp_types::request::Request>(&mut self, params: R::Params) -> R::Result {
         let id = self.send_request_raw(R::METHOD, serde_json::to_value(params).unwrap());
         serde_json::from_value(self.wait_response(&id)).expect("decode response")
@@ -173,6 +198,30 @@ impl TestClient {
                 }
             }
         }
+    }
+
+    /// The next `publishDiagnostics` for *any* document. Messages are handled
+    /// in order, so this pins which document the server published for first.
+    fn next_diagnostics(&self) -> PublishDiagnosticsParams {
+        loop {
+            if let Message::Notification(not) = self.recv()
+                && not.method == PublishDiagnostics::METHOD
+            {
+                return serde_json::from_value(not.params).expect("decode diagnostics");
+            }
+        }
+    }
+
+    /// didOpen without waiting for the resulting diagnostics.
+    fn open_async(&self, uri: &Uri, text: &str) {
+        self.notify::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: "lua".to_string(),
+                version: 1,
+                text: text.to_string(),
+            },
+        });
     }
 
     fn open(&self, uri: &Uri, text: &str) -> Vec<lsp_types::Diagnostic> {
@@ -619,6 +668,33 @@ impl TestClient {
             .expect("server thread panicked")
             .expect("server errored");
     }
+
+    /// Drop the client end without a shutdown handshake: the message loop ends
+    /// when the channel closes and the server must still return cleanly.
+    fn disconnect(self) {
+        let TestClient {
+            conn,
+            server_thread,
+            _dir: dir,
+            ..
+        } = self;
+        drop(conn);
+        server_thread
+            .join()
+            .expect("server thread panicked")
+            .expect("server errored");
+        drop(dir);
+    }
+}
+
+/// A URI the server must refuse to map to a filesystem path.
+fn non_file_uri() -> Uri {
+    <Uri as std::str::FromStr>::from_str("untitled:Untitled-1").expect("uri")
+}
+
+/// A minimal manifest with the given extra tables appended.
+fn manifest_with(extra: &str) -> String {
+    format!("[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n\n{extra}")
 }
 
 /// One absolute, legend-resolved semantic token.
@@ -3201,5 +3277,295 @@ fn bootstrapped_files_answer_requests_without_open() {
         "{}",
         hover_text(&hover)
     );
+    client.shutdown();
+}
+
+// === Protocol maturity: unmapped URIs and unknown methods ================
+
+#[test]
+fn an_unhandled_request_method_answers_method_not_found() {
+    let mut client = start(&[]);
+    let id = client.send_request_raw("textDocument/notARealMethod", serde_json::json!({}));
+    let response = client.wait_response_message(&id);
+    let error = response.error.expect("an error response");
+    // JSON-RPC MethodNotFound.
+    assert_eq!(error.code, -32601);
+    assert!(error.message.contains("notARealMethod"), "{error:?}");
+    client.shutdown();
+}
+
+#[test]
+fn an_unhandled_notification_is_ignored() {
+    // `textDocument/didSave` is a deliberate no-op; the server keeps serving.
+    let client = start(&[]);
+    client
+        .conn
+        .sender
+        .send(Message::Notification(Notification::new(
+            "textDocument/didSave".to_string(),
+            serde_json::json!({ "textDocument": { "uri": client.uri("main.lua") } }),
+        )))
+        .expect("send");
+    let uri = client.uri("main.lua");
+    assert_eq!(client.open(&uri, TYPE_ERROR).len(), 1);
+    client.shutdown();
+}
+
+#[test]
+fn did_open_with_a_non_file_uri_publishes_nothing() {
+    // Messages are handled in order, so the *first* publish proves the
+    // scratch buffer produced none of its own.
+    let client = start(&[]);
+    client.open_async(&non_file_uri(), TYPE_ERROR);
+    let uri = client.uri("main.lua");
+    client.open_async(&uri, TYPE_OK);
+    assert_eq!(client.next_diagnostics().uri.as_str(), uri.as_str());
+    client.shutdown();
+}
+
+#[test]
+fn did_change_with_a_non_file_uri_is_ignored() {
+    let client = start(&[]);
+    client.notify::<DidChangeTextDocument>(DidChangeTextDocumentParams {
+        text_document: VersionedTextDocumentIdentifier {
+            uri: non_file_uri(),
+            version: 2,
+        },
+        content_changes: vec![TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: TYPE_ERROR.to_string(),
+        }],
+    });
+    let uri = client.uri("main.lua");
+    client.open_async(&uri, TYPE_OK);
+    assert_eq!(client.next_diagnostics().uri.as_str(), uri.as_str());
+    client.shutdown();
+}
+
+#[test]
+fn did_close_with_a_non_file_uri_is_ignored() {
+    let client = start(&[]);
+    client.notify::<DidCloseTextDocument>(DidCloseTextDocumentParams {
+        text_document: TextDocumentIdentifier {
+            uri: non_file_uri(),
+        },
+    });
+    let uri = client.uri("main.lua");
+    client.open_async(&uri, TYPE_OK);
+    assert_eq!(client.next_diagnostics().uri.as_str(), uri.as_str());
+    client.shutdown();
+}
+
+#[test]
+fn closing_a_buffer_with_no_disk_backing_clears_its_diagnostics() {
+    // `scratch.lua` was never written to disk, so there is nothing to revert
+    // to: the server publishes an empty list rather than leaving stale marks.
+    let client = start(&[]);
+    let uri = client.uri("scratch.lua");
+    assert_eq!(client.open(&uri, TYPE_ERROR).len(), 1);
+    assert!(client.close(&uri).is_empty());
+    client.shutdown();
+}
+
+// === Protocol maturity: watched-file edge cases ==========================
+
+#[test]
+fn a_watched_change_with_a_non_file_uri_is_ignored() {
+    let client = start(&[]);
+    client.notify::<DidChangeWatchedFiles>(DidChangeWatchedFilesParams {
+        changes: vec![FileEvent {
+            uri: non_file_uri(),
+            typ: FileChangeType::CHANGED,
+        }],
+    });
+    let uri = client.uri("main.lua");
+    client.open_async(&uri, TYPE_OK);
+    assert_eq!(client.next_diagnostics().uri.as_str(), uri.as_str());
+    client.shutdown();
+}
+
+#[test]
+fn a_watched_change_to_a_non_lua_file_is_ignored() {
+    let client = start(&[("notes.txt", "not lua at all\n")]);
+    client.notify_watched_change("notes.txt");
+    let uri = client.uri("main.lua");
+    client.open_async(&uri, TYPE_OK);
+    assert_eq!(client.next_diagnostics().uri.as_str(), uri.as_str());
+    client.shutdown();
+}
+
+#[test]
+fn a_watched_delete_publishes_nothing_for_the_deleted_file() {
+    // A deleted file cannot be re-read; the last known text stays in the
+    // analysis and no diagnostics are published for it.
+    let client = start(&[("mod.lua", TYPE_OK)]);
+    std::fs::remove_file(client.root.join("mod.lua")).expect("remove");
+    client.notify::<DidChangeWatchedFiles>(DidChangeWatchedFilesParams {
+        changes: vec![FileEvent {
+            uri: client.uri("mod.lua"),
+            typ: FileChangeType::DELETED,
+        }],
+    });
+    let uri = client.uri("main.lua");
+    client.open_async(&uri, TYPE_OK);
+    assert_eq!(client.next_diagnostics().uri.as_str(), uri.as_str());
+    client.shutdown();
+}
+
+#[test]
+fn a_watched_change_to_an_open_document_does_not_republish() {
+    // The editor overlay wins over disk, so re-reading disk changes nothing
+    // visible and the server stays quiet for that document.
+    let client = start(&[("mod.lua", TYPE_OK)]);
+    let mod_uri = client.uri("mod.lua");
+    assert_eq!(client.open(&mod_uri, TYPE_ERROR).len(), 1);
+    std::fs::write(client.root.join("mod.lua"), TYPE_OK).expect("rewrite");
+    client.notify_watched_change("mod.lua");
+
+    let other = client.uri("other.lua");
+    client.open_async(&other, TYPE_OK);
+    assert_eq!(client.next_diagnostics().uri.as_str(), other.as_str());
+    client.shutdown();
+}
+
+// === Protocol maturity: dynamic file-watcher registration ================
+
+#[test]
+fn file_watchers_are_registered_when_the_client_supports_it() {
+    let caps = ClientCapabilities {
+        workspace: Some(WorkspaceClientCapabilities {
+            did_change_watched_files: Some(DidChangeWatchedFilesClientCapabilities {
+                dynamic_registration: Some(true),
+                ..DidChangeWatchedFilesClientCapabilities::default()
+            }),
+            ..WorkspaceClientCapabilities::default()
+        }),
+        ..ClientCapabilities::default()
+    };
+    let client = start_with(&[], caps);
+    let request = client.wait_server_request(RegisterCapability::METHOD);
+    let params: RegistrationParams =
+        serde_json::from_value(request.params).expect("decode registrations");
+    assert_eq!(params.registrations.len(), 1);
+    let registration = &params.registrations[0];
+    assert_eq!(registration.method, DidChangeWatchedFiles::METHOD);
+    let options = registration
+        .register_options
+        .as_ref()
+        .expect("register options");
+    let globs: Vec<&str> = options["watchers"]
+        .as_array()
+        .expect("watchers array")
+        .iter()
+        .map(|w| w["globPattern"].as_str().expect("glob"))
+        .collect();
+    assert_eq!(globs, vec!["**/*.lua", "**/luabox.toml"]);
+
+    // Replying to a server request exercises the loop's response arm.
+    client
+        .conn
+        .sender
+        .send(Message::Response(lsp_server::Response::new_ok(
+            request.id,
+            serde_json::Value::Null,
+        )))
+        .expect("send");
+    let uri = client.uri("main.lua");
+    assert_eq!(client.open(&uri, TYPE_ERROR).len(), 1);
+    client.shutdown();
+}
+
+#[test]
+fn no_watchers_are_registered_without_dynamic_registration() {
+    // The default harness advertises nothing, so the first server message is
+    // a publish, never a registration request.
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    client.open_async(&uri, TYPE_OK);
+    match client.recv() {
+        Message::Notification(not) => assert_eq!(not.method, PublishDiagnostics::METHOD),
+        other => panic!("expected diagnostics, got {other:?}"),
+    }
+    client.shutdown();
+}
+
+#[test]
+fn the_server_exits_cleanly_when_the_client_disconnects() {
+    // No shutdown/exit handshake: closing the channel ends the message loop.
+    start(&[]).disconnect();
+}
+
+// === Protocol maturity: manifest-driven reconfiguration ==================
+
+#[test]
+fn changing_the_manifest_edition_reparses_open_documents() {
+    // `<const>` is Lua 5.4 syntax; under 5.1 the same buffer is a parse error.
+    let client = start(&[]);
+    let uri = client.uri("main.lua");
+    let source = "local x <const> = 1\nprint(x)\n";
+    assert!(client.open(&uri, source).is_empty());
+
+    std::fs::write(
+        client.root.join("luabox.toml"),
+        manifest_with("[types]\nstrict = false\n").replace("5.4", "5.1"),
+    )
+    .expect("write manifest");
+    client.notify_config_changed();
+
+    let diags = client.wait_diagnostics(&uri);
+    let gated = diags
+        .iter()
+        .find(|d| code_of(d) == "LB0013")
+        .unwrap_or_else(|| panic!("expected a dialect error under Lua 5.1: {diags:?}"));
+    assert!(gated.message.contains("Lua 5.1"), "{gated:?}");
+    client.shutdown();
+}
+
+#[test]
+fn a_manifest_rule_override_promotes_a_lint_to_an_error() {
+    let client = start(&[(
+        "luabox.toml",
+        &manifest_with("[lint]\nunused-local = \"deny\"\n"),
+    )]);
+    let uri = client.uri("main.lua");
+    let diags = client.open(&uri, "local unused = 1\n");
+    let lint = diags
+        .iter()
+        .find(|d| code_of(d) == "LB0501")
+        .unwrap_or_else(|| panic!("expected LB0501: {diags:?}"));
+    assert_eq!(lint.severity, Some(DiagnosticSeverity::ERROR));
+    client.shutdown();
+}
+
+#[test]
+fn a_manifest_tier_override_silences_a_whole_lint_tier() {
+    let client = start(&[("luabox.toml", &manifest_with("[lint]\nstyle = \"allow\"\n"))]);
+    let uri = client.uri("main.lua");
+    let diags = client.open(&uri, "local unused = 1\n");
+    assert!(
+        !diags.iter().any(|d| code_of(d) == "LB0501"),
+        "the style tier is allowed: {diags:?}"
+    );
+    client.shutdown();
+}
+
+#[test]
+fn the_bootstrap_index_skips_the_build_output_directory() {
+    let client = start(&[
+        ("luabox.toml", &manifest_with("[build]\nout = \"build\"\n")),
+        ("src/lib.lua", "---@class KeptClass\n"),
+        ("build/gen.lua", "---@class GeneratedClass\n"),
+        (".hidden/hid.lua", "---@class HiddenClass\n"),
+    ]);
+    let mut client = client;
+    let names: Vec<String> = client
+        .workspace_symbols("Class")
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert!(names.contains(&"KeptClass".to_string()), "{names:?}");
+    assert!(!names.contains(&"GeneratedClass".to_string()), "{names:?}");
+    assert!(!names.contains(&"HiddenClass".to_string()), "{names:?}");
     client.shutdown();
 }

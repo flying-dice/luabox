@@ -267,6 +267,51 @@ end
     }
 
     #[test]
+    fn a_global_name_has_no_type_definition() {
+        let src = "print(undeclared_global)\n";
+        assert!(run(&[("main.lua", src)], offset_of(src, "undeclared_global")).is_none());
+    }
+
+    #[test]
+    fn self_outside_a_method_has_no_type_definition() {
+        // A dot-declared function has no receiver class to jump to.
+        let src = "---@class Thing\nlocal T = {}\nfunction T.make(self) return self end\n";
+        let offset = src.rfind("self").expect("self") + 1;
+        assert!(run(&[("main.lua", src)], offset).is_none());
+    }
+
+    #[test]
+    fn an_enum_typed_local_jumps_to_the_enum_declaration() {
+        let src = "\
+---@enum Colour
+local Colour = { red = 1 }
+
+---@type Colour
+local c = nil
+print(c)
+";
+        let location = run(
+            &[("main.lua", src)],
+            offset_of(src, "print(c") + "print(".len(),
+        )
+        .expect("type definition");
+        assert_eq!(location.range.start.line, 0);
+    }
+
+    #[test]
+    fn a_type_name_no_file_declares_has_no_type_definition() {
+        let src = "---@type Nowhere\nlocal x = nil\nprint(x)\n";
+        let offset = src.rfind("print(x").expect("use") + "print(".len();
+        assert!(
+            run(
+                &[("main.lua", src), ("other.lua", "---@class Elsewhere\n")],
+                offset
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn primitive_typed_local_has_no_type_definition() {
         let src = "---@type number\nlocal n = 1\nprint(n)\n";
         let offset = offset_of(src, "print(n") + "print(".len();

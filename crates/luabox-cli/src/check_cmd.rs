@@ -253,7 +253,7 @@ fn check_one(
 
     // 3. Types against the ambient definition-package layer (SPEC.md §3),
     // with this file's resolved `require` exports in reach (#85).
-    let requires = resolve_requires(&parse, &project.root, exports);
+    let requires = resolve_requires(&parse, &project.root, project.build_target, exports);
     diags.extend(luabox_types::check_file_with_requires(
         &parse,
         rel,
@@ -270,14 +270,19 @@ fn check_one(
 /// runtime modules) have no entry in `exports` and are simply skipped —
 /// their types come from ambient `[types] defs` (#108), not the module
 /// return value.
+///
+/// `dialect` is the project's `[build] target` (the edition when none is
+/// set): it selects the `lua_modules/share/lua/<X.Y>/` version directory of
+/// a luarocks tree, so `check` looks where the build will.
 fn resolve_requires(
     parse: &lua::Parse,
     root: &Path,
+    dialect: Dialect,
     exports: &HashMap<PathBuf, Ty>,
 ) -> HashMap<String, Ty> {
     let mut requires = HashMap::new();
     for module in luabox_types::module_requires(parse) {
-        if let Some(target) = luabox_bundle::resolve_module(root, &module)
+        if let Some(target) = luabox_bundle::resolve_module(root, &module, dialect)
             && let Some(ty) = exports.get(&target)
         {
             requires.insert(module, ty.clone());
@@ -459,12 +464,13 @@ pub(crate) fn resolve_project_defs(
 /// each direct dependency (`[dependencies]` + `[dev-dependencies]`) in
 /// alphabetical name order — the deterministic collision-winner order — locate
 /// its package root (a path dependency in place at its `path`, every other
-/// kind under `lua_modules/<name>/`), read that dependency's *own* `[types]
-/// defs`, and load those files from the dependency's `defs/` directory. A
-/// dependency with no manifest on disk (uninstalled, or a source kind whose
-/// root cannot be located here) or no `[types] defs` simply contributes
-/// nothing. Resolution is one level deep only: a dependency's *own*
-/// dependencies' defs do not transit.
+/// kind under `lua_modules/<name>/` — the rock tree the user materializes
+/// with luarocks; luabox only reads it), read that dependency's *own*
+/// `[types] defs`, and load those files from the dependency's `defs/`
+/// directory. A dependency with no manifest on disk (not materialized, or a
+/// source kind whose root cannot be located here) or no `[types] defs` simply
+/// contributes nothing. Resolution is one level deep only: a dependency's
+/// *own* dependencies' defs do not transit.
 ///
 /// Shared with `lint_cmd` (its `undefined-global` known-globals baseline must
 /// count dependency defs' globals too, #103/#108).
@@ -550,5 +556,608 @@ fn collect_d_lua(dir: &Path, out: &mut Vec<PathBuf>) {
         {
             out.push(path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // test code — panics document assumptions
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    /// Write `contents` to `root/rel`, creating parent directories.
+    fn write(root: &Path, rel: &str, contents: &str) {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().expect("has a parent")).expect("create parents");
+        fs::write(&path, contents).expect("write file");
+    }
+
+    /// A `luabox.toml` body with the given extra tables appended.
+    fn manifest(edition: &str, extra: &str) -> String {
+        format!(
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"{edition}\"\n{extra}"
+        )
+    }
+
+    /// A project rooted in a fresh tempdir with the given manifest body.
+    fn project(manifest_text: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", manifest_text);
+        tmp
+    }
+
+    // -- format parsing ----------------------------------------------------
+
+    #[test]
+    fn every_documented_output_format_is_accepted() {
+        for (name, expected) in [
+            ("human", Format::Human),
+            ("json", Format::Json),
+            ("sarif", Format::Sarif),
+            ("github", Format::GithubActions),
+            ("gitlab", Format::GitlabCodeQuality),
+        ] {
+            assert_eq!(
+                parse_format(name).expect("accepted"),
+                expected,
+                "for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_output_format_is_rejected_listing_the_valid_ones() {
+        let error = parse_format("xml").unwrap_err().to_string();
+        assert!(error.contains("unknown format `xml`"), "{error}");
+        assert!(
+            error.contains("human, json, sarif, github, or gitlab"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn run_once_rejects_a_bad_format_before_touching_the_filesystem() {
+        // No project, no files — the format is validated first.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(run_once(tmp.path(), None, "yaml", None).is_err());
+    }
+
+    // -- discovery ---------------------------------------------------------
+
+    #[test]
+    fn a_manifest_less_directory_checks_as_lua_54_in_warn_mode() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = discover(tmp.path()).expect("manifest-less default");
+        assert_eq!(project.root, tmp.path().to_path_buf());
+        assert_eq!(project.dialect, Dialect::Lua54);
+        assert_eq!(project.build_target, Dialect::Lua54);
+        assert_eq!(project.strictness, Strictness::Warn);
+        assert!(project.out_dir.is_none());
+        assert!(project.defs.is_empty());
+        assert!(project.dep_defs.is_empty());
+    }
+
+    #[test]
+    fn discover_reads_edition_build_target_out_dir_strictness_and_defs() {
+        let tmp = project(&manifest(
+            "5.1",
+            "\n[build]\ntarget = \"5.4\"\nout = \"build\"\n\n[types]\nstrict = true\ndefs = [\"mylib\"]\n",
+        ));
+        let project = discover(tmp.path()).expect("discovers");
+        assert_eq!(project.dialect, Dialect::Lua51);
+        assert_eq!(project.build_target, Dialect::Lua54);
+        assert_eq!(project.out_dir, Some(tmp.path().join("build")));
+        assert_eq!(project.strictness, Strictness::Strict);
+        assert_eq!(project.defs, vec!["mylib".to_owned()]);
+    }
+
+    #[test]
+    fn the_build_target_defaults_to_the_edition_when_unset() {
+        let tmp = project(&manifest("5.2", ""));
+        let project = discover(tmp.path()).expect("discovers");
+        assert_eq!(project.dialect, Dialect::Lua52);
+        assert_eq!(project.build_target, Dialect::Lua52);
+    }
+
+    #[test]
+    fn discovery_walks_up_from_a_subdirectory_to_the_project_root() {
+        let tmp = project(&manifest("5.4", ""));
+        write(tmp.path(), "src/deep/main.lua", "return 0\n");
+        let project = discover(&tmp.path().join("src").join("deep")).expect("discovers");
+        assert_eq!(project.root, tmp.path().to_path_buf());
+    }
+
+    // -- the one-shot check ------------------------------------------------
+
+    #[test]
+    fn a_clean_project_checks_successfully() {
+        let tmp = project(&manifest("5.4", ""));
+        write(tmp.path(), "src/main.lua", "local x = 1\nprint(x)\n");
+        run_once(tmp.path(), None, "human", None).expect("check passes");
+    }
+
+    #[test]
+    fn an_empty_project_checks_successfully() {
+        let tmp = project(&manifest("5.4", ""));
+        run_once(tmp.path(), None, "human", None).expect("check passes");
+    }
+
+    #[test]
+    fn a_syntax_error_fails_the_check() {
+        let tmp = project(&manifest("5.4", ""));
+        write(tmp.path(), "src/main.lua", "local x = \n");
+        let error = run_once(tmp.path(), None, "human", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("check failed with"), "{error}");
+        assert!(error.contains("error(s)"), "{error}");
+    }
+
+    #[test]
+    fn a_strict_type_error_fails_the_check() {
+        let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "---@param n number\nlocal function double(n)\n  return n * 2\nend\ndouble(\"nope\")\n",
+        );
+        assert!(run_once(tmp.path(), None, "human", None).is_err());
+    }
+
+    #[test]
+    fn the_same_type_mismatch_is_only_a_warning_outside_strict_mode() {
+        let tmp = project(&manifest("5.4", ""));
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "---@param n number\nlocal function double(n)\n  return n * 2\nend\ndouble(\"nope\")\n",
+        );
+        // Warnings never fail the command (module docs, SPEC.md §3).
+        run_once(tmp.path(), None, "human", None).expect("warnings do not fail");
+    }
+
+    #[test]
+    fn an_unknown_target_is_reported_as_a_diagnostic_not_a_bare_error() {
+        let tmp = project(&manifest("5.4", ""));
+        write(tmp.path(), "src/main.lua", "return 0\n");
+        let error = run_once(tmp.path(), Some("5.9"), "human", None)
+            .unwrap_err()
+            .to_string();
+        // LB1001 is rendered like any other diagnostic, then the run fails
+        // with the usual error-count summary.
+        assert!(error.contains("check failed with 1 error(s)"), "{error}");
+    }
+
+    #[test]
+    fn every_valid_target_is_accepted() {
+        let tmp = project(&manifest("5.4", ""));
+        write(tmp.path(), "src/main.lua", "return 0\n");
+        for target in ["5.1", "5.2", "5.3", "5.4", "luajit"] {
+            run_once(tmp.path(), Some(target), "human", None)
+                .unwrap_or_else(|e| panic!("target {target} should check clean: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_construct_illegal_on_the_ship_target_is_reported_only_with_that_target() {
+        let tmp = project(&manifest("5.4", ""));
+        // `goto` is legal in 5.4 (the edition) but not in 5.1.
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "local i = 0\n::top::\ni = i + 1\nif i < 3 then goto top end\n",
+        );
+        run_once(tmp.path(), None, "human", None).expect("legal in the edition");
+        assert!(run_once(tmp.path(), Some("5.1"), "human", None).is_err());
+    }
+
+    #[test]
+    fn a_target_equal_to_the_edition_does_not_duplicate_findings() {
+        let tmp = project(&manifest("5.1", ""));
+        write(tmp.path(), "src/main.lua", "local i = 0\ngoto top\n");
+        let with_target = run_once(tmp.path(), Some("5.1"), "human", None)
+            .unwrap_err()
+            .to_string();
+        let without = run_once(tmp.path(), None, "human", None)
+            .unwrap_err()
+            .to_string();
+        // The edition pass and the target pass are the same dialect: the
+        // finding is reported once, so the error counts match exactly.
+        assert_eq!(with_target, without);
+    }
+
+    #[test]
+    fn diagnostics_render_in_the_requested_machine_format() {
+        for format in ["human", "json", "sarif", "github", "gitlab"] {
+            let tmp = project(&manifest("5.4", ""));
+            write(tmp.path(), "src/main.lua", "local x = \n");
+            let error = run_once(tmp.path(), None, format, None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("check failed"), "for {format}: {error}");
+        }
+    }
+
+    #[test]
+    fn definition_files_are_not_checked_as_project_source() {
+        let tmp = project(&manifest("5.4", ""));
+        // Broken syntax in a `*.d.lua` would fail the check if it were
+        // walked as project source; `*.d.lua` are ambient surfaces instead.
+        write(tmp.path(), "defs/broken.d.lua", "local x = \n");
+        run_once(tmp.path(), None, "human", None).expect("d.lua files are skipped");
+    }
+
+    #[test]
+    fn previously_emitted_build_output_is_skipped_via_skip_out() {
+        let tmp = project(&manifest("5.4", "\n[build]\nout = \"dist\"\n"));
+        write(tmp.path(), "src/main.lua", "return 0\n");
+        write(tmp.path(), "custom-out/main.lua", "local x = \n");
+
+        // The manifest's out dir doesn't cover `custom-out/`, so an
+        // unqualified check sees the broken emitted file...
+        assert!(run_once(tmp.path(), None, "human", None).is_err());
+        // ...but `build` passing its chosen `--out` as `skip_out` does not.
+        let out = tmp.path().join("custom-out");
+        run_once(tmp.path(), None, "human", Some(&out)).expect("emitted output is skipped");
+    }
+
+    #[test]
+    fn a_malformed_manifest_fails_the_check_rather_than_defaulting() {
+        let tmp = project("not = = toml\n");
+        let error = run_once(tmp.path(), None, "human", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("invalid `"), "{error}");
+    }
+
+    #[test]
+    fn a_require_of_a_sibling_module_reaches_that_module_s_export_type() {
+        let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
+        write(
+            tmp.path(),
+            "src/greet.lua",
+            "local M = {}\n\
+             ---@param name string\n\
+             ---@return string\n\
+             function M.hello(name)\n  return \"hi \" .. name\nend\n\
+             return M\n",
+        );
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "local greet = require(\"src.greet\")\nprint(greet.hello(\"world\"))\n",
+        );
+        run_once(tmp.path(), None, "human", None).expect("cross-file require checks clean");
+    }
+
+    // -- `[types] defs` resolution -----------------------------------------
+
+    #[test]
+    fn a_defs_entry_resolves_to_a_single_d_lua_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "defs/mylib.d.lua",
+            "---@meta\n---@class MyLib\nmylib = {}\n",
+        );
+        let (defs, diags) = resolve_project_defs(tmp.path(), &["mylib".to_owned()]);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].file, "defs/mylib.d.lua");
+        assert!(defs[0].text.contains("---@class MyLib"));
+    }
+
+    #[test]
+    fn a_defs_entry_resolves_to_every_d_lua_file_under_a_directory_sorted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "defs/pack/z.d.lua", "---@meta\n");
+        write(tmp.path(), "defs/pack/a.d.lua", "---@meta\n");
+        write(tmp.path(), "defs/pack/nested/m.d.lua", "---@meta\n");
+        // Not a definition file — never picked up.
+        write(tmp.path(), "defs/pack/plain.lua", "return 0\n");
+
+        let (defs, diags) = resolve_project_defs(tmp.path(), &["pack".to_owned()]);
+        assert!(diags.is_empty(), "{diags:?}");
+        let files: Vec<&str> = defs.iter().map(|d| d.file.as_str()).collect();
+        assert_eq!(
+            files,
+            [
+                "defs/pack/a.d.lua",
+                "defs/pack/nested/m.d.lua",
+                "defs/pack/z.d.lua"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_single_file_and_a_directory_of_the_same_name_both_contribute() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "defs/both.d.lua", "---@meta\n");
+        write(tmp.path(), "defs/both/extra.d.lua", "---@meta\n");
+        let (defs, diags) = resolve_project_defs(tmp.path(), &["both".to_owned()]);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(defs.len(), 2);
+    }
+
+    #[test]
+    fn an_unresolvable_defs_entry_is_reported_as_lb1002_with_the_expected_layout() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (defs, diags) = resolve_project_defs(tmp.path(), &["ghost".to_owned()]);
+        assert!(defs.is_empty());
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code.to_string(), "LB1002");
+        assert!(diags[0].message.contains("ghost"), "{}", diags[0].message);
+        let notes = format!("{:?}", diags[0].notes);
+        assert!(notes.contains("defs/ghost.d.lua"), "{notes}");
+        assert!(notes.contains("defs/ghost/"), "{notes}");
+    }
+
+    #[test]
+    fn an_unresolvable_defs_entry_fails_the_check() {
+        let tmp = project(&manifest("5.4", "\n[types]\ndefs = [\"ghost\"]\n"));
+        write(tmp.path(), "src/main.lua", "return 0\n");
+        let error = run_once(tmp.path(), None, "human", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("check failed with 1 error(s)"), "{error}");
+    }
+
+    #[test]
+    fn a_defs_declared_global_is_in_scope_for_the_checked_project() {
+        let tmp = project(&manifest(
+            "5.4",
+            "\n[types]\nstrict = true\ndefs = [\"mylib\"]\n",
+        ));
+        write(
+            tmp.path(),
+            "defs/mylib.d.lua",
+            "---@meta\n\
+             ---@class MyLib\n\
+             ---@field version string\n\
+             mylib = {}\n",
+        );
+        write(tmp.path(), "src/main.lua", "print(mylib.version)\n");
+        run_once(tmp.path(), None, "human", None).expect("the ambient global checks clean");
+    }
+
+    // -- dependency-contributed defs (#108) --------------------------------
+
+    #[test]
+    fn a_path_dependency_contributes_its_own_defs_to_the_consumer() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "luabox.toml",
+            &manifest(
+                "5.4",
+                "\n[dependencies]\ngeometry = { path = \"vendor/geometry\" }\n",
+            ),
+        );
+        write(
+            tmp.path(),
+            "vendor/geometry/luabox.toml",
+            &manifest("5.4", "\n[types]\ndefs = [\"geometry\"]\n"),
+        );
+        write(
+            tmp.path(),
+            "vendor/geometry/defs/geometry.d.lua",
+            "---@meta\n---@class geometry.Shape\n",
+        );
+
+        let manifest = read_manifest_for_test(tmp.path());
+        let defs = resolve_dep_defs(tmp.path(), &manifest);
+        assert_eq!(defs.len(), 1);
+        // The label is dependency-prefixed and forward-slashed.
+        assert_eq!(defs[0].file, "geometry/defs/geometry.d.lua");
+        assert!(defs[0].text.contains("geometry.Shape"));
+    }
+
+    #[test]
+    fn a_non_path_dependency_is_read_from_the_lua_modules_rock_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "luabox.toml",
+            &manifest("5.4", "\n[dependencies]\nlpeg = \"1.0\"\n"),
+        );
+        write(
+            tmp.path(),
+            "lua_modules/lpeg/luabox.toml",
+            &manifest("5.4", "\n[types]\ndefs = [\"lpeg\"]\n"),
+        );
+        write(
+            tmp.path(),
+            "lua_modules/lpeg/defs/lpeg.d.lua",
+            "---@meta\nlpeg = {}\n",
+        );
+
+        let manifest = read_manifest_for_test(tmp.path());
+        let defs = resolve_dep_defs(tmp.path(), &manifest);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].file, "lpeg/defs/lpeg.d.lua");
+    }
+
+    #[test]
+    fn dependency_defs_are_ordered_alphabetically_across_both_dependency_tables() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "luabox.toml",
+            &manifest(
+                "5.4",
+                "\n[dependencies]\nzeta = { path = \"vendor/zeta\" }\n\
+                 \n[dev-dependencies]\nalpha = { path = \"vendor/alpha\" }\n",
+            ),
+        );
+        for name in ["alpha", "zeta"] {
+            write(
+                tmp.path(),
+                &format!("vendor/{name}/luabox.toml"),
+                &manifest("5.4", &format!("\n[types]\ndefs = [\"{name}\"]\n")),
+            );
+            write(
+                tmp.path(),
+                &format!("vendor/{name}/defs/{name}.d.lua"),
+                "---@meta\n",
+            );
+        }
+
+        let manifest = read_manifest_for_test(tmp.path());
+        let files: Vec<String> = resolve_dep_defs(tmp.path(), &manifest)
+            .into_iter()
+            .map(|d| d.file)
+            .collect();
+        assert_eq!(files, ["alpha/defs/alpha.d.lua", "zeta/defs/zeta.d.lua"]);
+    }
+
+    #[test]
+    fn a_dependency_directory_defs_package_contributes_every_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "luabox.toml",
+            &manifest(
+                "5.4",
+                "\n[dependencies]\npack = { path = \"vendor/pack\" }\n",
+            ),
+        );
+        write(
+            tmp.path(),
+            "vendor/pack/luabox.toml",
+            &manifest("5.4", "\n[types]\ndefs = [\"api\"]\n"),
+        );
+        write(tmp.path(), "vendor/pack/defs/api/b.d.lua", "---@meta\n");
+        write(tmp.path(), "vendor/pack/defs/api/a.d.lua", "---@meta\n");
+
+        let manifest = read_manifest_for_test(tmp.path());
+        let files: Vec<String> = resolve_dep_defs(tmp.path(), &manifest)
+            .into_iter()
+            .map(|d| d.file)
+            .collect();
+        assert_eq!(files, ["pack/defs/api/a.d.lua", "pack/defs/api/b.d.lua"]);
+    }
+
+    #[test]
+    fn a_dependency_that_is_not_materialized_contributes_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "luabox.toml",
+            &manifest(
+                "5.4",
+                "\n[dependencies]\nmissing = \"1.0\"\nalso-missing = { path = \"nowhere\" }\n",
+            ),
+        );
+        let manifest = read_manifest_for_test(tmp.path());
+        assert!(resolve_dep_defs(tmp.path(), &manifest).is_empty());
+    }
+
+    #[test]
+    fn a_dependency_with_an_unparseable_manifest_contributes_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "luabox.toml",
+            &manifest(
+                "5.4",
+                "\n[dependencies]\nbroken = { path = \"vendor/broken\" }\n",
+            ),
+        );
+        write(tmp.path(), "vendor/broken/luabox.toml", "= = =\n");
+        write(tmp.path(), "vendor/broken/defs/broken.d.lua", "---@meta\n");
+
+        let manifest = read_manifest_for_test(tmp.path());
+        assert!(resolve_dep_defs(tmp.path(), &manifest).is_empty());
+    }
+
+    #[test]
+    fn dependency_defs_resolution_is_one_level_deep_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "luabox.toml",
+            &manifest("5.4", "\n[dependencies]\nmid = { path = \"vendor/mid\" }\n"),
+        );
+        write(
+            tmp.path(),
+            "vendor/mid/luabox.toml",
+            &manifest(
+                "5.4",
+                "\n[types]\ndefs = [\"mid\"]\n\n[dependencies]\ndeep = { path = \"../deep\" }\n",
+            ),
+        );
+        write(tmp.path(), "vendor/mid/defs/mid.d.lua", "---@meta\n");
+        write(
+            tmp.path(),
+            "vendor/deep/luabox.toml",
+            &manifest("5.4", "\n[types]\ndefs = [\"deep\"]\n"),
+        );
+        write(tmp.path(), "vendor/deep/defs/deep.d.lua", "---@meta\n");
+
+        let manifest = read_manifest_for_test(tmp.path());
+        let files: Vec<String> = resolve_dep_defs(tmp.path(), &manifest)
+            .into_iter()
+            .map(|d| d.file)
+            .collect();
+        // `deep` is a transitive dependency: its defs do not transit.
+        assert_eq!(files, ["mid/defs/mid.d.lua"]);
+    }
+
+    fn read_manifest_for_test(root: &Path) -> Manifest {
+        let text = fs::read_to_string(root.join("luabox.toml")).expect("manifest");
+        Manifest::parse(&text).expect("manifest parses")
+    }
+
+    // -- small helpers -----------------------------------------------------
+
+    #[test]
+    fn dep_def_label_prefixes_the_dependency_name_and_forward_slashes_the_rest() {
+        let dep_root = Path::new("/tmp/proj/vendor/geometry");
+        let file = dep_root.join("defs").join("geometry.d.lua");
+        assert_eq!(
+            dep_def_label("geometry", &file, dep_root),
+            "geometry/defs/geometry.d.lua"
+        );
+    }
+
+    #[test]
+    fn dep_def_label_falls_back_to_the_whole_path_when_it_is_not_under_the_dep_root() {
+        let label = dep_def_label("dep", Path::new("/elsewhere/x.d.lua"), Path::new("/root"));
+        assert_eq!(label, "dep//elsewhere/x.d.lua");
+    }
+
+    #[test]
+    fn collect_d_lua_recurses_and_takes_only_d_lua_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "a.d.lua", "");
+        write(tmp.path(), "plain.lua", "");
+        write(tmp.path(), "notes.txt", "");
+        write(tmp.path(), "nested/b.d.lua", "");
+
+        let mut found = Vec::new();
+        collect_d_lua(tmp.path(), &mut found);
+        found.sort();
+        let rel: Vec<String> = found.iter().map(|p| display_rel(p, tmp.path())).collect();
+        assert_eq!(rel, ["a.d.lua", "nested/b.d.lua"]);
+    }
+
+    #[test]
+    fn collect_d_lua_on_a_missing_directory_yields_nothing() {
+        let mut found = Vec::new();
+        collect_d_lua(Path::new("no-such-directory-xyzzy"), &mut found);
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn canonical_falls_back_to_the_raw_path_for_a_file_that_does_not_exist() {
+        let missing = Path::new("no-such-file-xyzzy.lua");
+        assert_eq!(canonical(missing), missing.to_path_buf());
+    }
+
+    #[test]
+    fn to_range_converts_a_text_range_to_byte_offsets() {
+        let range = rowan::TextRange::new(3.into(), 7.into());
+        assert_eq!(to_range(range), 3..7);
     }
 }

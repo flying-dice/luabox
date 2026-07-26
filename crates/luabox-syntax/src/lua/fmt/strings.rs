@@ -234,6 +234,70 @@ mod tests {
     }
 
     #[test]
+    fn leaves_unterminated_and_dangling_backslash_literals_alone() {
+        // Unterminated (the parse already failed upstream).
+        assert_eq!(normalize_quotes("'abc", Quotes::AutoPreferDouble), None);
+        assert_eq!(normalize_quotes("'", Quotes::AutoPreferDouble), None);
+        // A trailing backslash cannot be re-escaped safely.
+        assert_eq!(normalize_quotes(r"'a\'", Quotes::AutoPreferDouble), None);
+    }
+
+    #[test]
+    fn decode_rejects_unterminated_literals() {
+        assert_eq!(decode_short_string("'"), None);
+        assert_eq!(decode_short_string("'abc"), None);
+        assert_eq!(decode_short_string("\"abc'"), None);
+    }
+
+    #[test]
+    fn decode_handles_the_whole_control_escape_set() {
+        assert_eq!(
+            decode_short_string(r#""\a\b\f\n\r\t\v""#).unwrap(),
+            vec![7, 8, 12, b'\n', b'\r', b'\t', 11]
+        );
+    }
+
+    #[test]
+    fn decode_collapses_escaped_line_breaks_to_one_newline() {
+        assert_eq!(decode_short_string("\"a\\\nb\"").unwrap(), b"a\nb".to_vec());
+        // `\r\n` and `\n\r` after the backslash count as a single break.
+        assert_eq!(
+            decode_short_string("\"a\\\r\nb\"").unwrap(),
+            b"a\nb".to_vec()
+        );
+        assert_eq!(
+            decode_short_string("\"a\\\n\rb\"").unwrap(),
+            b"a\nb".to_vec()
+        );
+        // Two breaks of the *same* kind stay two newlines.
+        assert_eq!(
+            decode_short_string("\"\\\n\nx\"").unwrap(),
+            b"\n\nx".to_vec()
+        );
+    }
+
+    #[test]
+    fn decode_accepts_hex_digits_in_either_case() {
+        assert_eq!(
+            decode_short_string(r#""\xff\xAB\xaB""#).unwrap(),
+            vec![0xff, 0xab, 0xab]
+        );
+    }
+
+    #[test]
+    fn decode_rejects_malformed_hex_and_unicode_escapes() {
+        assert_eq!(decode_short_string(r#""\xg1""#), None, "bad hex digit");
+        assert_eq!(decode_short_string(r#""\uZZ""#), None, "missing '{{'");
+        assert_eq!(decode_short_string(r#""\u{}""#), None, "no digits");
+        assert_eq!(decode_short_string(r#""\u{41""#), None, "unterminated");
+        assert_eq!(
+            decode_short_string(r#""\u{D800}""#),
+            None,
+            "surrogates are not scalar values"
+        );
+    }
+
+    #[test]
     fn decode_handles_standard_escapes() {
         assert_eq!(
             decode_short_string(r#""a\n\t\\\"\'\98""#).unwrap(),

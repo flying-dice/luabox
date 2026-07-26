@@ -684,6 +684,32 @@ mod tests {
         }
     }
 
+    /// Every action `type_actions` offers over the whole file.
+    fn all_actions(src: &str, diags: &[Diagnostic]) -> Vec<CodeAction> {
+        let (analysis, path) = analyze(src);
+        let sema = FileSema::new(&analysis, &path).unwrap();
+        let uri = path_to_uri(&path);
+        let inferred = analysis.binding_types(&path);
+        only_actions(type_actions(
+            &sema,
+            inferred.as_ref(),
+            diags,
+            &uri,
+            0,
+            src.len(),
+        ))
+    }
+
+    /// Just the `add_missing_field` actions for `src` with `diags`.
+    fn missing_field_actions(src: &str, diags: &[Diagnostic]) -> Vec<CodeAction> {
+        let (analysis, path) = analyze(src);
+        let sema = FileSema::new(&analysis, &path).unwrap();
+        let uri = path_to_uri(&path);
+        let mut out = Vec::new();
+        add_missing_field(&sema, diags, &uri, 0, src.len(), &mut out);
+        only_actions(out)
+    }
+
     // --- add-missing-field ---
 
     #[test]
@@ -733,6 +759,62 @@ mod tests {
         assert!(out.is_empty(), "{out:?}");
     }
 
+    #[test]
+    fn add_missing_field_skips_a_diagnostic_outside_the_requested_range() {
+        let src = "local p = { x = 1 }\nlocal q = 2\n";
+        let (analysis, path) = analyze(src);
+        let sema = FileSema::new(&analysis, &path).unwrap();
+        let uri = path_to_uri(&path);
+        let diags = vec![missing_field_diag(src, "y")];
+        let mut out = Vec::new();
+        // The caret sits on line 1, well past the table literal.
+        let start = src.find("local q").unwrap();
+        add_missing_field(&sema, &diags, &uri, start, src.len(), &mut out);
+        assert!(only_actions(out).is_empty());
+    }
+
+    #[test]
+    fn add_missing_field_skips_a_diagnostic_with_no_field_name() {
+        let src = "local p = { x = 1 }\n";
+        let mut diag = missing_field_diag(src, "y");
+        diag.message = "missing required field in table literal".to_string();
+        assert!(missing_field_actions(src, &[diag]).is_empty());
+    }
+
+    #[test]
+    fn add_missing_field_skips_a_diagnostic_of_another_code() {
+        let src = "local p = { x = 1 }\n";
+        let mut diag = missing_field_diag(src, "y");
+        diag.code = Some(NumberOrString::String("LB0300".to_string()));
+        assert!(missing_field_actions(src, &[diag]).is_empty());
+        // A numeric code carries no string to match on either.
+        let mut numeric = missing_field_diag(src, "y");
+        numeric.code = Some(NumberOrString::Number(302));
+        assert!(missing_field_actions(src, &[numeric]).is_empty());
+    }
+
+    #[test]
+    fn add_missing_field_needs_the_span_to_be_a_table_literal() {
+        let src = "local p = 1\n";
+        let diag = Diagnostic {
+            range: range_of(src, 0, src.len() - 1),
+            code: Some(NumberOrString::String("LB0302".to_string())),
+            message: "missing required field `y`".to_string(),
+            ..Diagnostic::default()
+        };
+        assert!(missing_field_actions(src, &[diag]).is_empty());
+    }
+
+    #[test]
+    fn add_missing_field_reuses_an_existing_field_line_indent() {
+        let src = "local p = {\n        x = 1,\n    }\n";
+        let actions = missing_field_actions(src, &[missing_field_diag(src, "y")]);
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        let after = apply(src, &actions[0]);
+        assert!(after.contains("\n        y = nil, -- TODO"), "{after}");
+        assert_parses(&after);
+    }
+
     // --- annotate-local-from-inference ---
 
     #[test]
@@ -767,6 +849,46 @@ mod tests {
         assert!(out.is_empty(), "{out:?}");
     }
 
+    #[test]
+    fn annotate_local_needs_the_display_inference() {
+        let src = "local n = 42\n";
+        let (analysis, path) = analyze(src);
+        let sema = FileSema::new(&analysis, &path).unwrap();
+        let uri = path_to_uri(&path);
+        let mut out = Vec::new();
+        annotate_local(&sema, None, &uri, 0, 5, &mut out);
+        assert!(only_actions(out).is_empty());
+    }
+
+    #[test]
+    fn annotate_local_declines_a_multi_name_local() {
+        // Which name would the single `---@type` line describe?
+        let src = "local a, b = 1, 2\n";
+        let actions = all_actions(src, &[]);
+        assert!(
+            actions.iter().all(|a| !a.title.starts_with("Annotate `")),
+            "{actions:?}"
+        );
+    }
+
+    #[test]
+    fn annotate_local_declines_a_local_with_no_initializer() {
+        let src = "local a\n";
+        let actions = all_actions(src, &[]);
+        assert!(actions.is_empty(), "{actions:?}");
+    }
+
+    #[test]
+    fn annotate_local_declines_an_uninferable_initializer() {
+        // The initializer's type is unknown, so there is nothing to write.
+        let src = "local a = unknown_global()\n";
+        let actions = all_actions(src, &[]);
+        assert!(
+            actions.iter().all(|a| !a.title.starts_with("Annotate `")),
+            "{actions:?}"
+        );
+    }
+
     // --- generate-class-from-literal ---
 
     #[test]
@@ -798,6 +920,61 @@ mod tests {
         let mut out = Vec::new();
         generate_class(&sema, inferred.as_ref(), &uri, 0, 5, &mut out);
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn generate_class_declines_a_table_with_no_named_entries() {
+        // Array items and dynamic keys have no field name to declare.
+        let src = "local list = { 1, 2, [3] = 4 }\n";
+        let (analysis, path) = analyze(src);
+        let sema = FileSema::new(&analysis, &path).unwrap();
+        let inferred = analysis.binding_types(&path);
+        let uri = path_to_uri(&path);
+        let mut out = Vec::new();
+        generate_class(&sema, inferred.as_ref(), &uri, 0, 5, &mut out);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn generate_class_declines_an_already_annotated_local() {
+        let src = "---@class Config\nlocal cfg = { n = 1 }\n";
+        let (analysis, path) = analyze(src);
+        let sema = FileSema::new(&analysis, &path).unwrap();
+        let inferred = analysis.binding_types(&path);
+        let uri = path_to_uri(&path);
+        let mut out = Vec::new();
+        let start = src.find("local cfg").unwrap();
+        generate_class(&sema, inferred.as_ref(), &uri, start, start + 5, &mut out);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn generate_class_falls_back_to_ast_field_types_without_inference() {
+        // With no reified table type, each value's literal kind is guessed.
+        let src = "local cfg = { n = 1, s = \"x\", b = true, z = nil, t = {}, e = f() }\n";
+        let (analysis, path) = analyze(src);
+        let sema = FileSema::new(&analysis, &path).unwrap();
+        let uri = path_to_uri(&path);
+        let mut out = Vec::new();
+        generate_class(&sema, None, &uri, 0, 5, &mut out);
+        let actions = only_actions(out);
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        let after = apply(src, &actions[0]);
+        for expected in [
+            "---@class Cfg",
+            "---@field n number",
+            "---@field s string",
+            "---@field b boolean",
+            "---@field z nil",
+            "---@field t table",
+            "---@field e any",
+        ] {
+            assert!(
+                after.contains(expected),
+                "missing `{expected}` in:\n{after}"
+            );
+        }
+        assert_parses(&after);
     }
 
     // --- dot-colon-convert ---

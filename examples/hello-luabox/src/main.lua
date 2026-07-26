@@ -1,7 +1,7 @@
 -- hello-luabox: the 60-second tour of the toolchain.
 --
 -- One annotated function, checked by `luabox check`, formatted by
--- `luabox fmt`, linted by `luabox lint`, and run by `luabox run`.
+-- `luabox fmt`, and linted by `luabox lint`.
 -- Everything you need to feel the workflow.
 
 --- Build a friendly greeting for `name`.

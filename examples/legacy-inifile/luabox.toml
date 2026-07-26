@@ -17,5 +17,3 @@ strict = false
 # Legacy libraries often publish themselves as a global for backwards compat.
 # Allow that single, deliberate global write instead of fighting it.
 globals = ["inifile"]
-
-[dependencies]

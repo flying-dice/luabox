@@ -8,7 +8,7 @@
 //! ## House divergences from the shared toolchain conventions
 //!
 //! No HTTP crate is linked (SPEC.md §6): downloads shell out to `curl -fsSL`
-//! exactly as [`luabox_resolve`]'s transport and the install scripts do. The
+//! exactly as the install scripts do. The
 //! release archive is unpacked with `tar` — `tar -xzf` for the unix `.tar.gz`
 //! and `tar -xf` for the Windows `.zip` (the bundled `bsdtar` in `System32`
 //! reads zip natively) — so no `zip`/`flate2` crate is pulled in. Only the
@@ -266,8 +266,12 @@ fn set_executable(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
     use super::{
-        archive_ext, bin_in_archive, expected_hash, normalize_tag, parse_tag_name, to_hex, verify,
+        archive_ext, bin_in_archive, current_target, download, expected_hash, extract, http_text,
+        normalize_tag, parse_tag_name, tar_program, to_hex, verify,
     };
     use sha2::{Digest, Sha256};
 
@@ -360,5 +364,250 @@ bbbb  luabox-x86_64-unknown-linux-gnu.tar.gz
 
         let err = verify(&archive, "luabox-x86_64-pc-windows-msvc.zip", "").unwrap_err();
         assert!(err.to_string().contains("no checksum listed"), "{err}");
+    }
+
+    // -----------------------------------------------------------------
+    // Offline coverage of the local halves of the upgrade pipeline. The
+    // live download path (`run`/`install`/`fetch_latest_tag`) needs the
+    // GitHub API and release assets, so it is deliberately left to manual
+    // release verification; everything reachable without the network —
+    // target selection, tar dispatch, archive extraction, permissions —
+    // is exercised here against locally built fixtures.
+    // -----------------------------------------------------------------
+
+    /// Build a release-shaped archive in `dir` containing the given
+    /// top-level entries, using the same `tar` the extractor will use
+    /// (`.tar.gz` on unix, `.zip` via `bsdtar` on Windows).
+    fn make_archive(dir: &Path, entries: &[(&str, &[u8])]) -> PathBuf {
+        let stage = dir.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        for (name, contents) in entries {
+            std::fs::write(stage.join(name), contents).unwrap();
+        }
+
+        let archive = dir.join(format!("luabox-fixture.{}", archive_ext()));
+        let tar = tar_program();
+        let mut command = Command::new(&tar);
+        command.current_dir(&stage);
+        if cfg!(windows) {
+            command.args(["--format", "zip", "-cf"]);
+        } else {
+            command.arg("-czf");
+        }
+        command.arg(&archive);
+        for (name, _) in entries {
+            command.arg(name);
+        }
+        let status = command
+            .status()
+            .unwrap_or_else(|e| panic!("running `{}`: {e}", tar.display()));
+        assert!(status.success(), "packing the fixture archive failed");
+        archive
+    }
+
+    #[test]
+    fn the_running_platform_maps_to_a_prebuilt_target_or_says_why_not() {
+        let expected = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
+            ("macos", "aarch64") => Some("aarch64-apple-darwin"),
+            ("windows", "x86_64") => Some("x86_64-pc-windows-msvc"),
+            _ => None,
+        };
+        if let Some(triple) = expected {
+            assert_eq!(current_target().unwrap(), triple);
+        } else {
+            // An unsupported platform must say so and point at a source
+            // build rather than downloading something wrong.
+            let err = current_target().unwrap_err().to_string();
+            assert!(err.contains("no prebuilt binary"), "{err}");
+            assert!(err.contains("cargo install"), "{err}");
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn the_extractor_uses_plain_tar_off_windows() {
+        assert_eq!(tar_program(), PathBuf::from("tar"));
+    }
+
+    #[test]
+    fn extract_unpacks_the_archive_and_returns_the_binary_at_its_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = make_archive(
+            dir.path(),
+            &[(bin_in_archive(), b"#!/bin/sh\necho luabox\n")],
+        );
+
+        let dest = dir.path().join("unpacked");
+        std::fs::create_dir_all(&dest).unwrap();
+        let bin = extract(&archive, &dest).unwrap();
+
+        assert_eq!(bin, dest.join(bin_in_archive()));
+        assert_eq!(
+            std::fs::read(&bin).unwrap(),
+            b"#!/bin/sh\necho luabox\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn extract_fails_when_the_archive_has_no_luabox_binary_at_its_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = make_archive(dir.path(), &[("README.md", b"not the binary")]);
+
+        let dest = dir.path().join("unpacked");
+        std::fs::create_dir_all(&dest).unwrap();
+        let err = extract(&archive, &dest).unwrap_err().to_string();
+        assert!(err.contains("not found in archive"), "{err}");
+        assert!(err.contains(bin_in_archive()), "{err}");
+    }
+
+    #[test]
+    fn extract_reports_a_corrupt_archive_rather_than_a_missing_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join(format!("luabox-bad.{}", archive_ext()));
+        std::fs::write(&archive, b"this is not an archive at all").unwrap();
+
+        let dest = dir.path().join("unpacked");
+        std::fs::create_dir_all(&dest).unwrap();
+        let err = extract(&archive, &dest).unwrap_err().to_string();
+        assert!(err.contains("failed to unpack"), "{err}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn the_extracted_binary_is_marked_executable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("luabox");
+        std::fs::write(&bin, b"binary").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        super::set_executable(&bin).unwrap();
+        let mode = std::fs::metadata(&bin).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+    }
+
+    /// The transport is `curl` (SPEC.md §6: no HTTP crate is linked). These
+    /// tests drive it over `file://` URLs, so they exercise the real code
+    /// path with no network at all — skipped where `curl` is unavailable,
+    /// since it is a runtime dependency of the command, not of the crate.
+    fn curl_available() -> bool {
+        Command::new("curl").arg("--version").output().is_ok()
+    }
+
+    #[test]
+    fn http_text_returns_the_body_of_a_successful_fetch() {
+        if !curl_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let body = dir.path().join("releases.json");
+        std::fs::write(&body, r#"{"tag_name":"v9.9.9"}"#).unwrap();
+
+        let text = http_text(&format!("file://{}", body.display())).unwrap();
+        assert_eq!(parse_tag_name(&text).as_deref(), Some("v9.9.9"));
+    }
+
+    #[test]
+    fn http_text_fails_loudly_when_the_resource_is_missing() {
+        if !curl_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.json");
+        let err = http_text(&format!("file://{}", missing.display()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`curl` failed for"), "{err}");
+    }
+
+    #[test]
+    fn download_writes_the_fetched_bytes_to_the_destination() {
+        if !curl_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("asset.bin");
+        std::fs::write(&source, b"release bytes").unwrap();
+
+        let dest = dir.path().join("downloaded.bin");
+        download(&format!("file://{}", source.display()), &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"release bytes".to_vec());
+    }
+
+    #[test]
+    fn download_fails_loudly_when_the_asset_is_missing() {
+        if !curl_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let err = download(
+            &format!("file://{}", dir.path().join("nope.bin").display()),
+            &dir.path().join("out.bin"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("`curl` failed for"), "{err}");
+    }
+
+    #[test]
+    fn a_downloaded_archive_verifies_against_a_sha256sums_listing() {
+        // The download → verify handshake end to end, offline: build an
+        // archive, hash it the way the release job does, and check that
+        // `verify` accepts exactly that listing.
+        let dir = tempfile::tempdir().unwrap();
+        let archive = make_archive(dir.path(), &[(bin_in_archive(), b"binary")]);
+        let name = archive
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_owned();
+
+        let digest = to_hex(&Sha256::digest(std::fs::read(&archive).unwrap()));
+        let sums = format!("0000  some-other-asset.tar.gz\n{digest}  {name}\n");
+        verify(&archive, &name, &sums).unwrap();
+    }
+
+    #[test]
+    fn to_hex_pads_every_byte_to_two_lowercase_digits() {
+        assert_eq!(to_hex(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
+        assert_eq!(to_hex(&[]), "");
+    }
+
+    #[test]
+    fn a_checksum_listing_with_blank_and_short_lines_is_tolerated() {
+        let sums = "\n\njustonefield\nabc123  luabox-x86_64-unknown-linux-gnu.tar.gz\n";
+        assert_eq!(
+            expected_hash(sums, "luabox-x86_64-unknown-linux-gnu.tar.gz"),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn a_checksum_is_matched_case_insensitively() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("asset.tar.gz");
+        std::fs::write(&archive, b"bytes").unwrap();
+        let sums = format!(
+            "{}  asset.tar.gz\n",
+            to_hex(&Sha256::digest(b"bytes")).to_uppercase()
+        );
+        verify(&archive, "asset.tar.gz", &sums).unwrap();
+    }
+
+    #[test]
+    fn parse_tag_name_ignores_a_tag_name_shaped_value_before_the_key() {
+        // The scan looks for the key, then the first quoted run after the
+        // colon — a value mentioning the key earlier must not confuse it.
+        let json = r#"{"body":"see tag_name notes","tag_name":"v2.0.0"}"#;
+        assert_eq!(parse_tag_name(json).as_deref(), Some("v2.0.0"));
+    }
+
+    #[test]
+    fn normalize_tag_leaves_a_non_semver_tag_alone_apart_from_the_prefix() {
+        assert_eq!(normalize_tag("nightly"), "vnightly");
+        // Every leading `v` is stripped before the single prefix is added.
+        assert_eq!(normalize_tag("vv1.0.0"), "v1.0.0");
     }
 }

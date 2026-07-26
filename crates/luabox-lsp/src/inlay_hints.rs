@@ -164,3 +164,116 @@ fn elide(mut label: String) -> String {
     label.push('…');
     label
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test code — panics document assumptions"
+)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
+
+    fn analyze(text: &str) -> (Analysis, PathBuf) {
+        let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
+        let path = Path::new(if cfg!(windows) {
+            r"C:\ws\main.lua"
+        } else {
+            "/ws/main.lua"
+        })
+        .to_path_buf();
+        host.apply_change(Change::SetFileText {
+            path: path.clone(),
+            dialect: Dialect::Lua54,
+            text: text.to_string(),
+        });
+        (host.snapshot(), path)
+    }
+
+    /// Hints over the byte range `start..end` of `src`.
+    fn hints_in(src: &str, start: usize, end: usize) -> Vec<InlayHint> {
+        let (analysis, path) = analyze(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let types = analysis.binding_types(&path).expect("binding types");
+        inlay_hints(&sema, types.bindings(), types.fn_returns(), start, end)
+    }
+
+    fn labels(hints: &[InlayHint]) -> Vec<&str> {
+        hints
+            .iter()
+            .map(|h| match &h.label {
+                InlayHintLabel::String(s) => s.as_str(),
+                InlayHintLabel::LabelParts(parts) => {
+                    panic!("expected a string label, got parts {parts:?}")
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hints_outside_the_requested_range_are_dropped() {
+        let src = "\
+local a = 1
+local function f() return 2 end
+---@return string
+local function g() return \"s\" end
+";
+        // The whole file: a binding hint, an inferred return, and the
+        // annotated `---@return`.
+        let all = hints_in(src, 0, src.len());
+        assert!(labels(&all).contains(&": integer"), "{:?}", labels(&all));
+        assert!(labels(&all).len() >= 3, "{:?}", labels(&all));
+
+        // Just the first line: the function hints fall outside.
+        let first_line = src.find('\n').expect("newline");
+        let narrow = hints_in(src, 0, first_line);
+        assert_eq!(labels(&narrow), vec![": integer"], "{:?}", labels(&narrow));
+    }
+
+    #[test]
+    fn an_annotated_return_renders_the_tag_verbatim() {
+        let src = "---@return string\nlocal function g() return \"s\" end\n";
+        let hints = hints_in(src, 0, src.len());
+        assert!(labels(&hints).contains(&": string"), "{:?}", labels(&hints));
+    }
+
+    #[test]
+    fn an_annotation_block_with_no_return_tag_contributes_no_hint() {
+        let src = "---@param n number\nlocal function g(n) end\n";
+        let hints = hints_in(src, 0, src.len());
+        assert!(
+            !labels(&hints).iter().any(|l| l.starts_with(": fun")),
+            "{:?}",
+            labels(&hints)
+        );
+    }
+
+    #[test]
+    fn elide_leaves_a_short_label_alone() {
+        assert_eq!(elide("short".to_string()), "short");
+        let exact = "x".repeat(MAX_LABEL);
+        assert_eq!(elide(exact.clone()), exact);
+    }
+
+    #[test]
+    fn elide_truncates_a_long_label_with_an_ellipsis() {
+        let long = "y".repeat(MAX_LABEL + 10);
+        let out = elide(long);
+        assert_eq!(out.chars().count(), MAX_LABEL + 1);
+        assert!(out.ends_with('…'), "{out}");
+    }
+
+    #[test]
+    fn elide_never_splits_a_multi_byte_character() {
+        // `é` is two bytes; placing one across the budget forces the cut to
+        // walk back to a char boundary.
+        let long = format!("{}é{}", "z".repeat(MAX_LABEL - 1), "z".repeat(20));
+        let out = elide(long);
+        assert!(out.is_char_boundary(out.len() - '…'.len_utf8()), "{out}");
+        assert!(out.ends_with('…'), "{out}");
+        assert!(out.len() <= MAX_LABEL + '…'.len_utf8(), "{out}");
+    }
+}

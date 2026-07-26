@@ -1614,3 +1614,469 @@ pub(crate) fn unquote_lua(raw: &str) -> String {
     }
     raw.to_string()
 }
+
+#[cfg(test)]
+// test code — panics document assumptions
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice
+)]
+mod tests {
+    use luabox_syntax::lua::{Dialect, parse};
+
+    use super::*;
+
+    fn env_of(source: &str) -> TypeEnv {
+        let parsed = parse(source, Dialect::Lua54);
+        assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
+        TypeEnv::build(&parsed)
+    }
+
+    /// The workspace-global surface one source file contributes.
+    fn surface(source: &str) -> FileTypes {
+        let parsed = parse(source, Dialect::Lua54);
+        assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
+        let items = luacats::harvest(&parsed);
+        let env = TypeEnv::build_from_items(&parsed, &items, None);
+        FileTypes::collect(&items, &env, &HashMap::new())
+    }
+
+    // --- string-literal delimiters ---------------------------------------
+
+    #[test]
+    fn unquote_strips_matching_quotes() {
+        assert_eq!(unquote_lua("\"abc\""), "abc");
+        assert_eq!(unquote_lua("'abc'"), "abc");
+        // Escapes are kept verbatim — literal-type comparison is textual.
+        assert_eq!(unquote_lua("\"a\\nb\""), "a\\nb");
+        assert_eq!(unquote_lua("\"\""), "");
+    }
+
+    #[test]
+    fn unquote_strips_long_brackets_at_every_level() {
+        assert_eq!(unquote_lua("[[abc]]"), "abc");
+        assert_eq!(unquote_lua("[=[abc]=]"), "abc");
+        assert_eq!(unquote_lua("[===[abc]===]"), "abc");
+        // A nested `]]` inside a level-1 long string survives.
+        assert_eq!(unquote_lua("[=[a]]b]=]"), "a]]b");
+        assert_eq!(unquote_lua("[[]]"), "");
+    }
+
+    #[test]
+    fn unquote_leaves_unrecognized_text_alone() {
+        // Mismatched or absent delimiters: return the raw text rather than
+        // slicing into something that is not there.
+        assert_eq!(unquote_lua("\"abc'"), "\"abc'");
+        assert_eq!(unquote_lua("[=[abc]==]"), "[=[abc]==]");
+        assert_eq!(unquote_lua("[["), "[[");
+        assert_eq!(unquote_lua(""), "");
+        assert_eq!(unquote_lua("\""), "\"");
+    }
+
+    // --- definition-layer merge order ------------------------------------
+
+    #[test]
+    fn merge_keep_first_is_first_wins() {
+        // The `workspace.library` precedence: the value already present on a
+        // key survives (the opposite of `BTreeMap::append`).
+        let mut into: BTreeMap<String, u8> = BTreeMap::from([("a".into(), 1)]);
+        merge_keep_first(
+            &mut into,
+            BTreeMap::from([("a".into(), 2), ("b".into(), 3)]),
+        );
+        assert_eq!(into, BTreeMap::from([("a".into(), 1), ("b".into(), 3)]));
+    }
+
+    #[test]
+    fn merging_a_file_surface_inserts_classes_absent_from_the_base() {
+        let mut env = TypeEnv::default();
+        env.merge_file_types(&surface("---@class Fresh\n---@field n number\n"));
+        let shape = env.class_shape("Fresh").expect("class merged in whole");
+        assert_eq!(shape.fields["n"].ty, Ty::Number);
+    }
+
+    #[test]
+    fn merging_a_present_class_is_member_wise_with_the_base_winning() {
+        // The base (defs layer) already declares `Both`; the project file
+        // re-declares it with a different `n` and adds `extra`, a parent, an
+        // indexer, an operator and a private member. Base members win on a
+        // collision; everything new is additive.
+        let mut env = TypeEnv::default();
+        env.merge_file_types(&surface(
+            "\
+---@class Parent
+---@class Both
+---@field n number
+",
+        ));
+        env.merge_file_types(&surface(
+            "\
+---@class Other
+---@class Both : Parent, Other
+---@field n string
+---@field extra boolean
+---@field [integer] string
+---@field private hidden number
+---@operator add(Both): Both
+",
+        ));
+        let def = env.classes.get("Both").expect("merged class");
+        // Base's `n` survives; the second declaration's `extra` is added.
+        assert_eq!(def.fields["n"].ty, Ty::Number);
+        assert_eq!(def.fields["extra"].ty, Ty::Boolean);
+        assert_eq!(def.parents, vec!["Parent".to_string(), "Other".to_string()]);
+        assert_eq!(def.indexers, vec![(Ty::Integer, Ty::String)]);
+        assert_eq!(def.operators["add"].len(), 1);
+        assert_eq!(def.visibility.get("hidden"), Some(&FieldScope::Private));
+    }
+
+    #[test]
+    fn merging_repeated_declarations_never_duplicates_parents_or_operators() {
+        let file = surface(
+            "\
+---@class Base
+---@class Dup : Base
+---@field [integer] string
+---@operator add(Dup): Dup
+",
+        );
+        let mut env = TypeEnv::default();
+        env.merge_file_types(&file);
+        env.merge_file_types(&file);
+        let def = env.classes.get("Dup").expect("merged class");
+        assert_eq!(def.parents, vec!["Base".to_string()]);
+        assert_eq!(def.indexers.len(), 1);
+        assert_eq!(def.operators["add"].len(), 1);
+    }
+
+    #[test]
+    fn merging_never_lets_a_carrier_attachment_shadow_a_declared_field() {
+        // `method` is a real `---@field` on the base and only a carrier
+        // attachment on the incoming file: the declared field must win.
+        let mut env = TypeEnv::default();
+        env.merge_file_types(&surface(
+            "\
+---@class Shadow
+---@field method string
+",
+        ));
+        let mut incoming = FileTypes::default();
+        incoming.classes.insert(
+            "Shadow".to_string(),
+            ClassDef {
+                methods: BTreeMap::from([(
+                    "method".to_string(),
+                    FieldTy {
+                        ty: Ty::Boolean,
+                        optional: false,
+                    },
+                )]),
+                ..ClassDef::default()
+            },
+        );
+        env.merge_file_types(&incoming);
+        let def = env.classes.get("Shadow").expect("merged class");
+        assert_eq!(def.fields["method"].ty, Ty::String);
+        assert!(!def.methods.contains_key("method"));
+    }
+
+    #[test]
+    fn merging_adds_carrier_attachments_the_base_does_not_declare() {
+        let mut env = TypeEnv::default();
+        env.merge_file_types(&surface(
+            "\
+---@class Attach
+---@field declared string
+",
+        ));
+        let mut incoming = FileTypes::default();
+        incoming.classes.insert(
+            "Attach".to_string(),
+            ClassDef {
+                methods: BTreeMap::from([(
+                    "extra".to_string(),
+                    FieldTy {
+                        ty: Ty::Boolean,
+                        optional: false,
+                    },
+                )]),
+                ..ClassDef::default()
+            },
+        );
+        env.merge_file_types(&incoming);
+        let def = env.classes.get("Attach").expect("merged class");
+        assert_eq!(def.methods["extra"].ty, Ty::Boolean);
+        // Attachments resolve on reads, folded in beside the declared field.
+        let shape = env.class_shape("Attach").expect("shape");
+        assert_eq!(shape.fields["declared"].ty, Ty::String);
+        assert_eq!(shape.fields["extra"].ty, Ty::Boolean);
+    }
+
+    #[test]
+    fn merging_enums_is_first_wins() {
+        let mut env = TypeEnv::default();
+        env.merge_file_types(&surface(
+            "\
+---@enum Color
+local Color = { red = 1 }
+",
+        ));
+        env.merge_file_types(&surface(
+            "\
+---@enum Color
+local Color = { blue = 2 }
+",
+        ));
+        let members = env.enum_members("Color").expect("enum merged");
+        assert_eq!(
+            members,
+            vec![("red".to_string(), Ty::NumberLit("1".into()))]
+        );
+    }
+
+    #[test]
+    fn a_file_surface_carries_its_enum_definitions() {
+        let types = surface(
+            "\
+---@enum Status
+local Status = { ok = 1, err = 2 }
+return Status
+",
+        );
+        let def = types.enums.get("Status").expect("enum on the surface");
+        assert_eq!(
+            def.members.keys().collect::<Vec<_>>(),
+            vec!["err", "ok"] // BTreeMap order
+        );
+        assert!(!types.is_empty());
+    }
+
+    // --- `---@enum` table shapes -----------------------------------------
+
+    #[test]
+    fn key_mode_enum_takes_its_member_names_as_values() {
+        // `---@enum (key)`: the enum's values are its *keys*, whatever the
+        // table's values are.
+        let env = env_of(
+            "\
+---@enum (key) Mode
+local Mode = { fast = 1, slow = \"two\" }
+",
+        );
+        let members = env.enum_members("Mode").expect("enum declared");
+        assert_eq!(
+            members,
+            vec![
+                ("fast".to_string(), Ty::StringLit("fast".into())),
+                ("slow".to_string(), Ty::StringLit("slow".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn enum_members_with_non_literal_values_stay_unknown() {
+        let env = env_of(
+            "\
+---@enum Computed
+local Computed = { a = 1, b = some_call(), c = { nested = true } }
+",
+        );
+        let members = env.enum_members("Computed").expect("enum declared");
+        assert_eq!(
+            members,
+            vec![
+                ("a".to_string(), Ty::NumberLit("1".into())),
+                ("b".to_string(), Ty::Unknown),
+                ("c".to_string(), Ty::Unknown),
+            ]
+        );
+    }
+
+    #[test]
+    fn enum_on_a_non_table_target_has_no_members() {
+        // `---@enum` must annotate a table constructor; anything else yields
+        // an empty (but declared) enum rather than a panic or a guess.
+        let env = env_of(
+            "\
+---@enum Empty
+local Empty = other_table
+",
+        );
+        assert_eq!(env.enum_members("Empty"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn boolean_and_nil_enum_members_lower_to_literal_types() {
+        let env = env_of(
+            "\
+---@enum Flags
+local Flags = { on = true, off = false, none = nil }
+",
+        );
+        let members = env.enum_members("Flags").expect("enum declared");
+        assert_eq!(
+            members,
+            vec![
+                ("none".to_string(), Ty::Nil),
+                ("off".to_string(), Ty::BoolLit(false)),
+                ("on".to_string(), Ty::BoolLit(true)),
+            ]
+        );
+    }
+
+    // --- carriers & standalone visibility --------------------------------
+
+    #[test]
+    fn a_global_assignment_carrier_maps_back_to_its_class() {
+        // The carrier variable need not share the class name, and `Zoo = {}`
+        // (a global assignment, not a `local`) is a carrier just the same: the
+        // standalone `---@private` on `Zoo.hide` has to land on `Animal`.
+        let env = env_of(
+            "\
+---@class Animal
+Zoo = {}
+---@private
+function Zoo.hide() end
+",
+        );
+        let def = env.classes.get("Animal").expect("class declared");
+        assert_eq!(def.visibility.get("hide"), Some(&FieldScope::Private));
+    }
+
+    #[test]
+    fn a_non_name_assignment_target_is_not_a_carrier() {
+        // `outer.inner = {}` names no single carrier variable, so the class is
+        // declared but no variable maps to it and the standalone tag is
+        // dropped rather than misattributed.
+        let env = env_of(
+            "\
+local outer = {}
+---@class Nested
+outer.inner = {}
+---@private
+function outer.hidden() end
+",
+        );
+        let def = env.classes.get("Nested").expect("class declared");
+        assert!(def.visibility.is_empty(), "{:?}", def.visibility);
+    }
+
+    #[test]
+    fn standalone_visibility_tags_bind_to_dotted_and_assigned_members() {
+        let env = env_of(
+            "\
+---@class Vis
+local Vis = {}
+---@private
+function Vis.hidden() end
+---@protected
+function Vis:guarded() end
+---@package
+Vis.internal = 1
+function Vis.open() end
+",
+        );
+        let def = env.classes.get("Vis").expect("class declared");
+        assert_eq!(def.visibility.get("hidden"), Some(&FieldScope::Private));
+        assert_eq!(def.visibility.get("guarded"), Some(&FieldScope::Protected));
+        assert_eq!(def.visibility.get("internal"), Some(&FieldScope::Package));
+        assert_eq!(def.visibility.get("open"), None);
+    }
+
+    #[test]
+    fn visibility_tags_on_unaddressable_targets_are_dropped() {
+        // Each of these has no `(carrier, member)` pair to bind to, so the
+        // tag is discarded rather than misattributed.
+        let env = env_of(
+            "\
+---@class Drop
+local Drop = {}
+---@private
+function bare() end
+---@private
+Drop = {}
+---@private
+local shadow = 1
+---@private
+Drop[1] = 2
+",
+        );
+        let def = env.classes.get("Drop").expect("class declared");
+        assert!(def.visibility.is_empty(), "{:?}", def.visibility);
+    }
+
+    #[test]
+    fn a_multi_target_assignment_never_carries_a_visibility_tag() {
+        // `a.x, b.y = ...` is deliberately left unwired — the tag would be
+        // ambiguous, so nothing is recorded rather than the wrong thing.
+        let env = env_of(
+            "\
+---@class Multi
+local Multi = {}
+---@private
+Multi.a, Multi.b = 1, 2
+",
+        );
+        let def = env.classes.get("Multi").expect("class declared");
+        assert!(def.visibility.is_empty(), "{:?}", def.visibility);
+    }
+
+    // --- signature reconciliation ----------------------------------------
+
+    #[test]
+    fn an_explicit_param_self_survives_reconciliation() {
+        // A `:` method's `self` is absent from the AST parameter list, so the
+        // explicit `---@param self T` tag has to be re-inserted at position 0
+        // rather than dropped as "unmatched".
+        let env = env_of(
+            "\
+---@class Recv
+local Recv = {}
+---@param self Recv
+---@param n number
+function Recv:m(n) end
+",
+        );
+        // `:` methods are range-keyed, not registered by dotted name.
+        let sig = env
+            .fn_sigs
+            .values()
+            .find(|f| f.params.iter().any(|p| p.name == "n"))
+            .expect("method signature");
+        assert_eq!(sig.params.len(), 2);
+        assert_eq!(sig.params[0].name, "self");
+        assert_eq!(sig.params[0].ty, Ty::Named("Recv".into()));
+        assert_eq!(sig.params[1].name, "n");
+        assert_eq!(sig.params[1].ty, Ty::Number);
+    }
+
+    #[test]
+    fn an_ast_vararg_without_a_tag_becomes_unknown_varargs() {
+        let env = env_of(
+            "\
+---@param a number
+function spread(a, ...) end
+",
+        );
+        let sig = env.function("spread").expect("signature");
+        assert_eq!(sig.varargs, Some(Ty::Unknown));
+    }
+
+    #[test]
+    fn an_undeclared_ast_parameter_is_optional_unknown() {
+        // A parameter with no `---@param` tag must not become a required
+        // `unknown` slot — that would reject every call.
+        let env = env_of(
+            "\
+---@param a number
+function partial(a, b) end
+",
+        );
+        let sig = env.function("partial").expect("signature");
+        assert_eq!(sig.params[1].name, "b");
+        assert_eq!(sig.params[1].ty, Ty::Unknown);
+        assert!(sig.params[1].optional);
+    }
+}

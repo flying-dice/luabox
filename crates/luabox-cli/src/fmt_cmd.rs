@@ -118,32 +118,249 @@ fn discover(cwd: &Path) -> anyhow::Result<Project> {
     })
 }
 
-/// All `*.lua` files under the project root, deterministic order,
-/// skipping dot-directories and the build output directory.
+/// All `*.lua` files under the project root, deterministic order, skipping
+/// dot-directories, the build output directory, and vendored `lua_modules/`
+/// trees.
+///
+/// This is [`crate::project::collect_lua_files`] with `exclude_d_lua` off:
+/// `fmt` formats `*.d.lua` definition files too, unlike `check`/`build`/`doc`,
+/// which never treat them as project source. `fmt` had its own copy of the
+/// walk until the copy and the shared one disagreed about `lua_modules/` —
+/// one skip list, so they cannot drift apart again.
 fn collect_source_files(project: &Project) -> anyhow::Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    walk(&project.root, project, &mut files)?;
-    Ok(files)
+    crate::project::collect_lua_files(&project.root, project.out_dir.as_deref(), false)
 }
 
-fn walk(dir: &Path, project: &Project, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
-    let mut entries: Vec<_> = fs::read_dir(dir)
-        .with_context(|| format!("cannot read directory `{}`", dir.display()))?
-        .collect::<Result<_, _>>()
-        .with_context(|| format!("cannot read directory `{}`", dir.display()))?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        let path = entry.path();
-        let name = entry.file_name();
-        let hidden = name.to_string_lossy().starts_with('.');
-        if path.is_dir() {
-            let is_out = project.out_dir.as_deref() == Some(path.as_path());
-            if !hidden && !is_out {
-                walk(&path, project, files)?;
-            }
-        } else if !hidden && path.extension().and_then(|e| e.to_str()) == Some("lua") {
-            files.push(path);
-        }
+#[cfg(test)]
+mod tests {
+    // test code — panics document assumptions
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    /// Deliberately mis-formatted source, and what `lua::fmt::format`
+    /// canonicalizes it to — computed rather than hard-coded so these tests
+    /// assert `fmt`'s *file handling* (which files, written or not) instead
+    /// of re-asserting the formatter's own rules, which `luabox-syntax` owns.
+    const MESSY: &str = "local    x=1\nprint( x )\n";
+
+    fn canonical(dialect: Dialect) -> String {
+        lua::fmt::format(MESSY, dialect)
     }
-    Ok(())
+
+    fn write(root: &Path, rel: &str, contents: &str) {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().expect("has a parent")).expect("create parents");
+        fs::write(&path, contents).expect("write file");
+    }
+
+    fn manifest(edition: &str, out: &str) -> String {
+        format!(
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"{edition}\"\n\n[build]\nout = \"{out}\"\n"
+        )
+    }
+
+    #[test]
+    fn messy_fixture_is_actually_unformatted() {
+        // Guards every test below: if the formatter ever declared MESSY
+        // canonical, the "rewrites" assertions would pass vacuously.
+        assert_ne!(canonical(Dialect::Lua54), MESSY);
+    }
+
+    #[test]
+    fn run_rewrites_unformatted_sources_in_place() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", &manifest("5.4", "dist"));
+        write(tmp.path(), "src/main.lua", MESSY);
+
+        run(tmp.path(), false, false).expect("fmt succeeds");
+
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("src").join("main.lua")).expect("read back"),
+            canonical(Dialect::Lua54)
+        );
+    }
+
+    #[test]
+    fn run_leaves_already_formatted_sources_untouched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", &manifest("5.4", "dist"));
+        let formatted = canonical(Dialect::Lua54);
+        write(tmp.path(), "src/main.lua", &formatted);
+
+        run(tmp.path(), false, false).expect("fmt succeeds");
+
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("src").join("main.lua")).expect("read back"),
+            formatted
+        );
+    }
+
+    #[test]
+    fn check_mode_fails_without_writing_when_a_file_would_change() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", &manifest("5.4", "dist"));
+        write(tmp.path(), "src/main.lua", MESSY);
+
+        let error = run(tmp.path(), true, false).unwrap_err().to_string();
+        assert!(
+            error.contains("1 of 1 files would be reformatted"),
+            "{error}"
+        );
+        assert!(error.contains("run `luabox fmt`"), "{error}");
+        // --check is read-only: the file on disk is exactly as it was.
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("src").join("main.lua")).expect("read back"),
+            MESSY
+        );
+    }
+
+    #[test]
+    fn check_mode_succeeds_when_every_file_is_already_formatted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", &manifest("5.4", "dist"));
+        write(tmp.path(), "src/main.lua", &canonical(Dialect::Lua54));
+
+        run(tmp.path(), true, false).expect("check passes");
+    }
+
+    #[test]
+    fn check_mode_counts_every_offending_file_in_its_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", &manifest("5.4", "dist"));
+        write(tmp.path(), "src/a.lua", MESSY);
+        write(tmp.path(), "src/b.lua", MESSY);
+        write(tmp.path(), "src/c.lua", &canonical(Dialect::Lua54));
+
+        let error = run(tmp.path(), true, false).unwrap_err().to_string();
+        assert!(
+            error.contains("2 of 3 files would be reformatted"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_manifest_less_directory_is_formatted_as_lua_54() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "main.lua", MESSY);
+
+        let project = discover(tmp.path()).expect("manifest-less default");
+        assert_eq!(project.dialect, Dialect::Lua54);
+        assert_eq!(project.root, tmp.path().to_path_buf());
+        assert!(project.out_dir.is_none());
+
+        run(tmp.path(), false, false).expect("fmt succeeds");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("main.lua")).expect("read back"),
+            canonical(Dialect::Lua54)
+        );
+    }
+
+    #[test]
+    fn the_project_is_discovered_by_walking_up_from_a_subdirectory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", &manifest("5.1", "dist"));
+        write(tmp.path(), "src/main.lua", MESSY);
+
+        // Run from `src/`, format the whole project from its real root.
+        run(&tmp.path().join("src"), false, false).expect("fmt succeeds");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("src").join("main.lua")).expect("read back"),
+            canonical(Dialect::Lua51)
+        );
+    }
+
+    #[test]
+    fn discover_reads_the_edition_and_out_dir_from_the_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", &manifest("luajit", "build"));
+
+        let project = discover(tmp.path()).expect("discovers");
+        assert_eq!(project.dialect, Dialect::LuaJit);
+        assert_eq!(project.out_dir, Some(tmp.path().join("build")));
+    }
+
+    #[test]
+    fn an_unknown_edition_in_the_manifest_is_rejected_naming_the_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", &manifest("5.9", "dist"));
+
+        // `Manifest::parse` owns the edition allow-list, so an unknown
+        // edition never reaches `discover`'s own `from_manifest_id` guard —
+        // it is reported as a manifest validation error instead.
+        let error = run(tmp.path(), false, false).unwrap_err().to_string();
+        assert!(error.starts_with("invalid `"), "{error}");
+        assert!(error.contains("luabox.toml"), "{error}");
+        assert!(error.contains("package.edition `5.9`"), "{error}");
+    }
+
+    #[test]
+    fn a_malformed_manifest_is_an_error_rather_than_a_silent_default() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", "name = = =\n");
+        let error = run(tmp.path(), false, false).unwrap_err().to_string();
+        assert!(error.starts_with("invalid `"), "{error}");
+    }
+
+    #[test]
+    fn the_build_output_directory_and_dot_directories_are_never_formatted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", &manifest("5.4", "dist"));
+        write(tmp.path(), "src/main.lua", &canonical(Dialect::Lua54));
+        write(tmp.path(), "dist/src/main.lua", MESSY);
+        write(tmp.path(), ".cache/stale.lua", MESSY);
+        write(tmp.path(), ".hidden.lua", MESSY);
+
+        // Generated output and hidden state are not sources: --check passes
+        // even though all three would reformat.
+        run(tmp.path(), true, false).expect("check passes");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("dist").join("src").join("main.lua"))
+                .expect("read back"),
+            MESSY
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join(".cache").join("stale.lua")).expect("read back"),
+            MESSY
+        );
+    }
+
+    #[test]
+    fn definition_files_are_formatted_like_any_other_source() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", &manifest("5.4", "dist"));
+        write(tmp.path(), "defs/love.d.lua", MESSY);
+
+        // Unlike `check`/`build`, `fmt` has no reason to skip `*.d.lua`.
+        run(tmp.path(), false, false).expect("fmt succeeds");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("defs").join("love.d.lua")).expect("read back"),
+            canonical(Dialect::Lua54)
+        );
+    }
+
+    #[test]
+    fn collect_source_files_returns_a_deterministic_name_ordered_list() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "z.lua", "");
+        write(tmp.path(), "a.lua", "");
+        write(tmp.path(), "m/inner.lua", "");
+        write(tmp.path(), "notes.md", "");
+
+        let project = discover(tmp.path()).expect("manifest-less default");
+        let files = collect_source_files(&project).expect("collect");
+        let rel: Vec<String> = files
+            .iter()
+            .map(|p| display_rel(p, &project.root))
+            .collect();
+        assert_eq!(rel, ["a.lua", "m/inner.lua", "z.lua"]);
+    }
+
+    #[test]
+    fn an_empty_project_formats_zero_files_successfully() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", &manifest("5.4", "dist"));
+        run(tmp.path(), false, false).expect("fmt succeeds");
+        run(tmp.path(), true, false).expect("check passes");
+    }
 }

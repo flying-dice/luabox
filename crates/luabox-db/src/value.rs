@@ -340,3 +340,284 @@ unsafe impl salsa::Update for LoweredHandle {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test code — panics document assumptions"
+)]
+mod tests {
+    use std::collections::HashMap;
+
+    use luabox_diag::Severity;
+    use luabox_syntax::lua::Dialect;
+    use luabox_syntax::luacats;
+    use luabox_types::{
+        DisplayTypes, ModuleSurface, Strictness, check_file, infer_display_types, module_surface,
+    };
+
+    use super::*;
+
+    const CLEAN: &str = "local x = 1\nreturn x\n";
+    const OTHER: &str = "local y = 2\nreturn y\n";
+    const BAD: &str = "---@param n number\nlocal function f(n) end\nf(\"no\")\n";
+
+    fn parsed(src: &str) -> lua::Parse {
+        lua::parse(src, Dialect::Lua54)
+    }
+
+    /// Drive [`salsa::Update::maybe_update`] the way salsa's memo table does:
+    /// hand it a pointer to the stored value and the freshly recomputed one.
+    /// Returns salsa's "did this change?" answer — `false` means backdate.
+    fn maybe_update<T: salsa::Update>(stored: &mut T, recomputed: T) -> bool {
+        // SAFETY: `stored` is a live, aligned, exclusive reference, which is
+        // exactly the `old_pointer` precondition of the `Update` contract.
+        unsafe { T::maybe_update(std::ptr::from_mut(stored), recomputed) }
+    }
+
+    // --- ParsedModule ------------------------------------------------------
+
+    #[test]
+    fn parsed_module_exposes_the_tree_and_the_recovered_errors() {
+        let module = ParsedModule::new(parsed(CLEAN));
+        assert_eq!(module.errors(), &[]);
+        assert_eq!(module.syntax().text().to_string(), CLEAN);
+        assert_eq!(module.parse().errors(), module.errors());
+
+        // A broken file still yields a tree; the errors ride alongside it.
+        let broken = ParsedModule::new(parsed("local = "));
+        assert!(!broken.errors().is_empty());
+        assert_eq!(broken.syntax().text().to_string(), "local = ");
+    }
+
+    #[test]
+    fn two_independent_parses_of_the_same_text_compare_equal() {
+        // This is what lets salsa backdate a re-parse of unchanged text: the
+        // green trees and error lists match even though the `Arc`s differ.
+        let a = ParsedModule::new(parsed(CLEAN));
+        let b = ParsedModule::new(parsed(CLEAN));
+        assert!(!Arc::ptr_eq(&a.0, &b.0), "distinct allocations");
+        assert_eq!(a, b);
+
+        assert_ne!(a, ParsedModule::new(parsed(OTHER)));
+        // Same tree shape, different error list: still not equal.
+        assert_ne!(
+            ParsedModule::new(parsed("local = ")),
+            ParsedModule::new(parsed(CLEAN))
+        );
+    }
+
+    #[test]
+    fn parsed_module_backdates_an_identical_reparse_and_replaces_a_changed_one() {
+        let mut stored = ParsedModule::new(parsed(CLEAN));
+        assert!(
+            !maybe_update(&mut stored, ParsedModule::new(parsed(CLEAN))),
+            "an identical re-parse must report no change (the firewall)"
+        );
+        assert_eq!(stored.syntax().text().to_string(), CLEAN);
+
+        assert!(maybe_update(&mut stored, ParsedModule::new(parsed(OTHER))));
+        assert_eq!(stored.syntax().text().to_string(), OTHER);
+    }
+
+    // --- Annotations -------------------------------------------------------
+
+    #[test]
+    fn annotations_hold_the_harvest_and_backdate_on_an_equal_reharvest() {
+        let items = luacats::harvest(&parsed(BAD));
+        assert!(!items.is_empty(), "the fixture carries a ---@param block");
+
+        let handle = Annotations::new(items.clone());
+        assert_eq!(handle.items(), items.as_slice());
+
+        let mut stored = Annotations::new(items);
+        assert!(!maybe_update(
+            &mut stored,
+            Annotations::new(luacats::harvest(&parsed(BAD)))
+        ));
+        assert!(maybe_update(&mut stored, Annotations::new(Vec::new())));
+        assert_eq!(stored.items(), &[]);
+    }
+
+    // --- Diagnostics -------------------------------------------------------
+
+    #[test]
+    fn diagnostics_default_is_empty_and_to_vec_clones_out() {
+        let empty = Diagnostics::default();
+        assert_eq!(empty.diagnostics(), &[]);
+        assert_eq!(empty.to_vec(), Vec::new());
+
+        let produced = check_file(&parsed(BAD), "a.lua", Strictness::Strict, Dialect::Lua54);
+        assert_eq!(produced.len(), 1);
+        let handle = Diagnostics::new(produced.clone());
+        assert_eq!(handle.diagnostics(), produced.as_slice());
+        assert_eq!(handle.to_vec(), produced);
+        assert_eq!(handle.diagnostics()[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn diagnostics_backdate_when_a_recheck_produces_the_same_set() {
+        let recheck = || {
+            Diagnostics::new(check_file(
+                &parsed(BAD),
+                "a.lua",
+                Strictness::Strict,
+                Dialect::Lua54,
+            ))
+        };
+
+        let mut stored = recheck();
+        assert!(
+            !maybe_update(&mut stored, recheck()),
+            "an unchanged diagnostic set must not invalidate dependents"
+        );
+        assert!(maybe_update(&mut stored, Diagnostics::default()));
+        assert_eq!(stored.diagnostics(), &[]);
+    }
+
+    // --- BindingTypes / ModuleExport / OutgoingCalls / ModuleSurface -------
+
+    #[test]
+    fn binding_types_expose_bindings_and_returns_separately() {
+        let types = infer_display_types(
+            &parsed("local function f() return 1 end\n"),
+            "a.lua",
+            None,
+            None,
+        );
+        assert!(!types.bindings.is_empty());
+        assert!(!types.returns.is_empty());
+
+        let handle = BindingTypes::new(types.clone());
+        assert_eq!(handle.bindings(), types.bindings.as_slice());
+        assert_eq!(handle.fn_returns(), types.returns.as_slice());
+
+        let mut stored = BindingTypes::new(types);
+        assert!(!maybe_update(
+            &mut stored,
+            BindingTypes::new(infer_display_types(
+                &parsed("local function f() return 1 end\n"),
+                "a.lua",
+                None,
+                None
+            ))
+        ));
+        assert!(maybe_update(
+            &mut stored,
+            BindingTypes::new(DisplayTypes::default())
+        ));
+        assert_eq!(stored.bindings(), &[]);
+        assert_eq!(stored.fn_returns(), &[]);
+    }
+
+    #[test]
+    fn module_export_is_none_for_a_chunk_with_no_return_value() {
+        let exporting =
+            infer_display_types(&parsed("return 42\n"), "m.lua", None, None).module_export;
+        assert!(exporting.is_some(), "`return 42` exports a type");
+
+        assert_eq!(ModuleExport::new(None).ty(), None);
+        let handle = ModuleExport::new(exporting.clone());
+        assert_eq!(handle.ty(), exporting.as_ref());
+
+        let mut stored = ModuleExport::new(exporting.clone());
+        assert!(!maybe_update(&mut stored, ModuleExport::new(exporting)));
+        assert!(maybe_update(&mut stored, ModuleExport::new(None)));
+        assert_eq!(stored.ty(), None);
+    }
+
+    #[test]
+    fn outgoing_calls_key_argument_types_by_callee_name() {
+        let calls = infer_display_types(&parsed("undefined_helper(1)\n"), "a.lua", None, None)
+            .outgoing_calls;
+        assert!(
+            calls.contains_key("undefined_helper"),
+            "an undefined callee is recorded as an outgoing call: {calls:?}"
+        );
+
+        let handle = OutgoingCalls::new(calls.clone());
+        assert_eq!(handle.calls(), &calls);
+
+        let mut stored = OutgoingCalls::new(calls);
+        assert!(!maybe_update(
+            &mut stored,
+            OutgoingCalls::new(
+                infer_display_types(&parsed("undefined_helper(1)\n"), "a.lua", None, None)
+                    .outgoing_calls
+            )
+        ));
+        assert!(maybe_update(
+            &mut stored,
+            OutgoingCalls::new(HashMap::new())
+        ));
+        assert!(stored.calls().is_empty());
+    }
+
+    #[test]
+    fn module_surface_checked_splits_the_export_from_the_declared_types() {
+        let surface = module_surface(
+            &parsed("---@class Point\nlocal M = {}\nreturn M\n"),
+            "m.lua",
+            None,
+        );
+        assert!(surface.export.is_some());
+
+        let handle = ModuleSurfaceChecked::new(surface.clone());
+        assert_eq!(handle.export(), surface.export.as_ref());
+        assert_eq!(handle.types(), &surface.types);
+
+        let mut stored = ModuleSurfaceChecked::new(surface);
+        assert!(!maybe_update(
+            &mut stored,
+            ModuleSurfaceChecked::new(module_surface(
+                &parsed("---@class Point\nlocal M = {}\nreturn M\n"),
+                "m.lua",
+                None
+            ))
+        ));
+        assert!(maybe_update(
+            &mut stored,
+            ModuleSurfaceChecked::new(ModuleSurface::default())
+        ));
+        assert_eq!(stored.export(), None);
+    }
+
+    // --- the two no_eq, Arc-identity handles -------------------------------
+
+    #[test]
+    fn type_env_handle_compares_by_arc_identity_not_by_content() {
+        let handle = TypeEnvHandle::new(TypeEnv::build(&parsed(BAD)));
+        // The handle hands back the env the harvest produced.
+        assert_eq!(
+            format!("{:?}", handle.env()),
+            format!("{:?}", TypeEnv::build(&parsed(BAD)))
+        );
+
+        // Cloning shares the `Arc`, so salsa sees no change…
+        let mut stored = handle.clone();
+        assert!(!maybe_update(&mut stored, handle));
+
+        // …but a freshly built env over the *same* text is a distinct
+        // allocation, and `TypeEnv` cannot be compared, so it always replaces.
+        assert!(maybe_update(
+            &mut stored,
+            TypeEnvHandle::new(TypeEnv::build(&parsed(BAD)))
+        ));
+    }
+
+    #[test]
+    fn lowered_handle_compares_by_arc_identity_not_by_content() {
+        let handle = LoweredHandle::new(luabox_hir::lower(&parsed(CLEAN)));
+        assert_eq!(handle.file().bodies().count(), 1, "just the chunk");
+
+        let mut stored = handle.clone();
+        assert!(!maybe_update(&mut stored, handle));
+
+        assert!(maybe_update(
+            &mut stored,
+            LoweredHandle::new(luabox_hir::lower(&parsed(CLEAN)))
+        ));
+    }
+}

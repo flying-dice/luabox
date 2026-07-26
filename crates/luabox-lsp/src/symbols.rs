@@ -336,6 +336,62 @@ function M.helper() end
     }
 
     #[test]
+    fn an_indexer_field_is_not_a_document_symbol() {
+        let sema = sema("---@class Bag\n---@field [string] number\n---@field size number\n");
+        let class = document_symbols(&sema)
+            .into_iter()
+            .find(|s| s.name == "Bag")
+            .expect("the class symbol");
+        let fields: Vec<String> = class
+            .children
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(fields, vec!["size".to_string()], "{fields:?}");
+    }
+
+    #[test]
+    fn a_colon_declaration_is_a_method_symbol() {
+        let sema = sema("function T:go() end\nfunction T.helper() end\n");
+        let symbols = document_symbols(&sema);
+        let method = symbols.iter().find(|s| s.name == "T:go").expect("method");
+        assert_eq!(method.kind, SymbolKind::METHOD);
+        let dotted = symbols
+            .iter()
+            .find(|s| s.name == "T.helper")
+            .expect("dotted function");
+        assert_eq!(dotted.kind, SymbolKind::FUNCTION);
+    }
+
+    #[test]
+    fn a_top_level_local_is_a_variable_and_a_local_function_expression_is_a_function() {
+        let sema =
+            sema("local a, b = 1, 2\nlocal f = function()\n  local function inner() end\nend\n");
+        let symbols = document_symbols(&sema);
+        let kind_of = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("no `{name}` symbol"))
+                .kind
+        };
+        assert_eq!(kind_of("a"), SymbolKind::VARIABLE);
+        assert_eq!(kind_of("b"), SymbolKind::VARIABLE);
+        assert_eq!(kind_of("f"), SymbolKind::FUNCTION);
+        // The nested declaration hangs off the function-valued local.
+        let f = symbols.iter().find(|s| s.name == "f").expect("f");
+        let children: Vec<String> = f
+            .children
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(children, vec!["inner".to_string()], "{children:?}");
+    }
+
+    #[test]
     fn nested_functions_are_flattened_into_the_results() {
         let sema = sema("local function outer()\n  local function inner() end\nend\n");
         let symbols = workspace_symbols(&sema, "inner");

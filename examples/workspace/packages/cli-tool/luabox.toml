@@ -9,6 +9,3 @@ strict = true
 [dependencies]
 # Path dependency on the sibling workspace member.
 core = { path = "../core" }
-
-[tasks]
-start = "luabox run src/main.lua"

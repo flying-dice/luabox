@@ -17,13 +17,10 @@ strict = true
 defs = ["render"]
 
 [dependencies]
-# A path dependency on the sibling library. Run `luabox install` once to
-# resolve it into luabox.lock (committed — this is an application). Because
-# geometry's own manifest publishes `[types] defs = ["geometry"]`, depending
-# on it here makes geometry's LuaCATS classes ambient in this package
-# automatically (the luals workspace-library model) — that is what lets
-# `---@class render.Square : geometry.Drawable` resolve and be checked.
+# A path dependency on the sibling library, used in place — luabox reads it,
+# it never fetches it. Because geometry's own manifest publishes
+# `[types] defs = ["geometry"]`, depending on it here makes geometry's LuaCATS
+# classes ambient in this package automatically (the luals workspace-library
+# model) — that is what lets `---@class render.Square : geometry.Drawable`
+# resolve and be checked.
 geometry = { path = "../geometry" }
-
-[tasks]
-start = "luabox run src/main.lua"

@@ -3,25 +3,15 @@
 //! Thin frontend over the bounded-context crates: owns UX, argument parsing,
 //! and diagnostic rendering; none of the domain logic.
 
-mod auth_cmd;
 mod build_cmd;
 mod check_cmd;
-mod deps_cmd;
 mod doc_cmd;
 mod fmt_cmd;
-mod github;
-mod keychain;
 mod lint_cmd;
 mod lsp_cmd;
 mod modes;
-mod outdated_cmd;
 mod project;
-mod publish_cmd;
-mod run_cmd;
-mod runtime;
 mod scaffold;
-mod search_cmd;
-mod toolchain_cmd;
 mod upgrade_cmd;
 mod watch;
 
@@ -33,9 +23,13 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "luabox",
+    // Pin the usage-line name: without this clap derives it from argv[0],
+    // which renders as `luabox.exe` on Windows and splits help output (and
+    // everything asserting on it) across platforms.
+    bin_name = "luabox",
     version,
-    about = "Unified Lua toolchain and package manager: typechecker, linter, formatter, bundler, LSP. \
-             Acquires Lua runtimes (nvm/rustup for Lua) — never is one."
+    about = "Unified static Lua toolchain: typechecker, linter, formatter, bundler, LSP. \
+             Consumes a `lua_modules/` rock tree — it never fetches one, and never runs Lua."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -66,73 +60,6 @@ enum Command {
         #[arg(long, default_value = "5.4")]
         edition: String,
     },
-    /// Add a dependency to luabox.toml
-    Add {
-        /// Package spec: name[@version]
-        package: String,
-        /// Add to [dev-dependencies]
-        #[arg(long)]
-        dev: bool,
-        /// Add as a path dependency rooted at this directory
-        #[arg(long, conflicts_with_all = ["git", "url"])]
-        path: Option<String>,
-        /// Add as a git dependency at this URL
-        #[arg(long, conflicts_with = "url")]
-        git: Option<String>,
-        /// Add as an http(s) tarball dependency (its sha256 is captured now)
-        #[arg(long)]
-        url: Option<String>,
-        /// Pin the git dependency to a commit
-        #[arg(long, requires = "git", conflicts_with_all = ["tag", "branch"])]
-        rev: Option<String>,
-        /// Pin the git dependency to a tag
-        #[arg(long, requires = "git", conflicts_with = "branch")]
-        tag: Option<String>,
-        /// Track a branch of the git dependency
-        #[arg(long, requires = "git")]
-        branch: Option<String>,
-    },
-    /// Remove a dependency from luabox.toml
-    Remove { package: String },
-    /// Search luarocks.org (the registry) for rocks by name
-    Search {
-        /// Optional terms, matched as a case-insensitive substring of rock names
-        query: Option<String>,
-        /// Output format: text (default) or json
-        #[arg(long, default_value = "text")]
-        format: String,
-    },
-    /// Report dependencies behind their latest version (registry rocks vs.
-    /// luarocks.org; git deps vs. their repo's latest GitHub release)
-    Outdated {
-        /// Output format: text (default) or json
-        #[arg(long, default_value = "text")]
-        format: String,
-    },
-    /// Sign in to GitHub via the browser (OAuth device flow); stores the token
-    /// encrypted in the OS keychain. With `--luarocks`, store a luarocks.org
-    /// upload API key (read from stdin) instead — for `luabox publish`.
-    Login {
-        /// Output format: text (default) or json (newline-delimited events)
-        #[arg(long, default_value = "text")]
-        format: String,
-        /// Store a luarocks.org API key (read from stdin) for `luabox publish`
-        #[arg(long)]
-        luarocks: bool,
-    },
-    /// Delete the stored GitHub token and luarocks.org API key from the OS
-    /// keychain
-    Logout,
-    /// Show the signed-in GitHub identity, if any
-    Whoami {
-        /// Output format: text (default) or json
-        #[arg(long, default_value = "text")]
-        format: String,
-    },
-    /// Resolve and fetch dependencies (lockfile-driven)
-    Install,
-    /// Update dependencies within manifest constraints
-    Update { package: Option<String> },
     /// Typecheck the project
     Check {
         /// Also validate dialect legality against a ship target
@@ -194,15 +121,6 @@ enum Command {
         #[arg(long)]
         mode: Option<String>,
     },
-    /// Run a script or a [tasks] entry via the pinned runtime. Bare
-    /// executables (and [tasks] shells) resolve from the pinned toolchain's
-    /// bin dirs — including its provisioned luarocks — before the system $PATH
-    /// (npm-run/node_modules/.bin semantics); e.g. `run luarocks -- install x`
-    Run {
-        script: String,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
     /// Generate documentation from annotations
     Doc {
         #[arg(long)]
@@ -213,20 +131,6 @@ enum Command {
         /// Accepted for editor compatibility; stdio is the only transport.
         #[arg(long)]
         stdio: bool,
-    },
-    /// Acquire Lua runtimes (nvm for Lua): install, pin, list. `install` also
-    /// provisions a matching luarocks alongside the interpreter
-    Toolchain {
-        #[command(subcommand)]
-        action: Option<ToolchainAction>,
-    },
-    /// Vendor dependencies into the source tree
-    Vendor,
-    /// Publish the authored rockspec to luarocks.org
-    Publish {
-        /// Validate and preview the upload without contacting luarocks.org
-        #[arg(long)]
-        dry_run: bool,
     },
     /// Replace this binary with a GitHub release build (default: latest)
     Upgrade {
@@ -246,16 +150,6 @@ enum Command {
     },
 }
 
-#[derive(Subcommand)]
-enum ToolchainAction {
-    /// Install a runtime (e.g. 5.4.6, luajit-2.1)
-    Install { version: String },
-    /// Pin the project runtime
-    Pin { version: String },
-    /// List installed runtimes
-    List,
-}
-
 // A pure one-arm-per-subcommand dispatcher: length tracks the CLI surface,
 // not complexity.
 #[allow(clippy::too_many_lines)]
@@ -268,44 +162,6 @@ fn main() -> anyhow::Result<()> {
         Command::New {
             name, lib, edition, ..
         } => scaffold::new(&std::env::current_dir()?, &name, lib, &edition),
-        Command::Add {
-            package,
-            dev,
-            path,
-            git,
-            url,
-            rev,
-            tag,
-            branch,
-        } => deps_cmd::add(
-            &std::env::current_dir()?,
-            &deps_cmd::AddOptions {
-                package,
-                dev,
-                path,
-                git,
-                url,
-                rev,
-                tag,
-                branch,
-            },
-        ),
-        Command::Remove { package } => deps_cmd::remove(&std::env::current_dir()?, &package),
-        Command::Search { query, format } => search_cmd::run(query.as_deref(), &format),
-        Command::Outdated { format } => outdated_cmd::run(&std::env::current_dir()?, &format),
-        Command::Login { format, luarocks } => {
-            if luarocks {
-                auth_cmd::login_luarocks()
-            } else {
-                auth_cmd::login(&format)
-            }
-        }
-        Command::Logout => auth_cmd::logout(),
-        Command::Whoami { format } => auth_cmd::whoami(&format),
-        Command::Install => deps_cmd::install(&std::env::current_dir()?),
-        Command::Update { package } => {
-            deps_cmd::update(&std::env::current_dir()?, package.as_deref())
-        }
         Command::Check {
             target,
             format,
@@ -345,22 +201,9 @@ fn main() -> anyhow::Result<()> {
                 },
             )
         }
-        Command::Run { script, args } => run_cmd::run(&std::env::current_dir()?, &script, &args),
         Command::Doc { open } => doc_cmd::run(&std::env::current_dir()?, open),
         Command::Lsp { .. } => lsp_cmd::run(),
-        Command::Toolchain { action } => {
-            let cwd = std::env::current_dir()?;
-            match action {
-                Some(ToolchainAction::Install { version }) => {
-                    toolchain_cmd::install(&cwd, &version)
-                }
-                Some(ToolchainAction::Pin { version }) => toolchain_cmd::pin(&cwd, &version),
-                Some(ToolchainAction::List) | None => toolchain_cmd::list(&cwd),
-            }
-        }
         Command::Upgrade { version } => upgrade_cmd::run(version),
-        Command::Vendor => deps_cmd::vendor(&std::env::current_dir()?),
-        Command::Publish { dry_run } => publish_cmd::run(&std::env::current_dir()?, dry_run),
         Command::Explain { code } => {
             let parsed: luabox_diag::Code = code.parse().map_err(|_| {
                 anyhow::anyhow!("`{code}` is not a valid diagnostic code; codes look like LB0421")
@@ -380,6 +223,471 @@ fn main() -> anyhow::Result<()> {
                 Some(traceback.join(" "))
             };
             build_cmd::unmap(&std::env::current_dir()?, &bundle, text.as_deref())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // test code — panics document assumptions
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use clap::CommandFactory as _;
+
+    /// Parse an argv (without the leading program name) into a subcommand.
+    fn parse(args: &[&str]) -> Command {
+        let command_line: Vec<&str> = std::iter::once("luabox")
+            .chain(args.iter().copied())
+            .collect();
+        Cli::try_parse_from(command_line)
+            .unwrap_or_else(|e| panic!("`luabox {}` should parse: {e}", args.join(" ")))
+            .command
+    }
+
+    /// Parse an argv expected to be rejected, returning clap's error kind.
+    fn reject(args: &[&str]) -> clap::error::ErrorKind {
+        let command_line: Vec<&str> = std::iter::once("luabox")
+            .chain(args.iter().copied())
+            .collect();
+        Cli::try_parse_from(command_line)
+            .err()
+            .unwrap_or_else(|| panic!("`luabox {}` should be rejected", args.join(" ")))
+            .kind()
+    }
+
+    #[test]
+    fn the_cli_definition_is_internally_consistent() {
+        // clap's own debug assertions catch conflicting/duplicated argument
+        // definitions that only surface at runtime otherwise.
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn a_subcommand_is_required() {
+        // Bare `luabox` prints help rather than doing anything.
+        assert_eq!(
+            reject(&[]),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand,
+            "bare `luabox` must not be a no-op"
+        );
+    }
+
+    #[test]
+    fn an_unknown_subcommand_is_rejected() {
+        assert_eq!(
+            reject(&["frobnicate"]),
+            clap::error::ErrorKind::InvalidSubcommand
+        );
+    }
+
+    #[test]
+    fn the_subcommand_surface_is_exactly_these_eleven() {
+        // The v1 scope cut (DIRECTION.md, 2026-07-26) made luabox a pure
+        // static toolchain: no package manager, no registry client, no
+        // interpreter. This is the whole surface — adding a command (even a
+        // `hide`-ed one, which `get_subcommands` still reports) must be a
+        // deliberate edit here, not a quiet regrowth of a deleted verb.
+        let mut actual: Vec<String> = Cli::command()
+            .get_subcommands()
+            .map(|sub| sub.get_name().to_string())
+            .collect();
+        actual.sort();
+
+        let mut expected = [
+            "build", "check", "doc", "explain", "fmt", "init", "lint", "lsp", "new", "unmap",
+            "upgrade",
+        ];
+        expected.sort_unstable();
+
+        assert_eq!(actual, expected, "the CLI subcommand surface changed");
+        assert_eq!(actual.len(), 11);
+    }
+
+    // -- init / new --------------------------------------------------------
+
+    #[test]
+    fn init_defaults_to_a_binary_project_on_the_current_edition() {
+        let Command::Init { lib, bin, edition } = parse(&["init"]) else {
+            panic!("expected Init");
+        };
+        assert!(!lib);
+        assert!(!bin);
+        assert_eq!(edition, "5.4");
+    }
+
+    #[test]
+    fn init_accepts_lib_bin_and_an_explicit_edition() {
+        let Command::Init { lib, edition, .. } = parse(&["init", "--lib", "--edition", "luajit"])
+        else {
+            panic!("expected Init");
+        };
+        assert!(lib);
+        assert_eq!(edition, "luajit");
+
+        let Command::Init { bin, .. } = parse(&["init", "--bin"]) else {
+            panic!("expected Init");
+        };
+        assert!(bin);
+    }
+
+    #[test]
+    fn init_rejects_lib_and_bin_together() {
+        assert_eq!(
+            reject(&["init", "--lib", "--bin"]),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+    }
+
+    #[test]
+    fn new_requires_a_project_name() {
+        assert_eq!(
+            reject(&["new"]),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn new_takes_a_name_plus_the_same_flags_as_init() {
+        let Command::New {
+            name, lib, edition, ..
+        } = parse(&["new", "mypkg", "--lib", "--edition", "5.1"])
+        else {
+            panic!("expected New");
+        };
+        assert_eq!(name, "mypkg");
+        assert!(lib);
+        assert_eq!(edition, "5.1");
+    }
+
+    #[test]
+    fn new_rejects_lib_and_bin_together() {
+        assert_eq!(
+            reject(&["new", "mypkg", "--lib", "--bin"]),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+    }
+
+    // -- check / lint / fmt ------------------------------------------------
+
+    #[test]
+    fn check_defaults_to_the_human_format_with_no_target_and_no_watch() {
+        let Command::Check {
+            target,
+            format,
+            watch,
+        } = parse(&["check"])
+        else {
+            panic!("expected Check");
+        };
+        assert_eq!(target, None);
+        assert_eq!(format, "human");
+        assert!(!watch);
+    }
+
+    #[test]
+    fn check_accepts_a_target_a_format_and_watch() {
+        let Command::Check {
+            target,
+            format,
+            watch,
+        } = parse(&["check", "--target", "5.1", "--format", "json", "--watch"])
+        else {
+            panic!("expected Check");
+        };
+        assert_eq!(target.as_deref(), Some("5.1"));
+        assert_eq!(format, "json");
+        assert!(watch);
+    }
+
+    #[test]
+    fn check_format_and_target_require_values() {
+        assert_eq!(
+            reject(&["check", "--format"]),
+            clap::error::ErrorKind::InvalidValue
+        );
+        assert_eq!(
+            reject(&["check", "--target"]),
+            clap::error::ErrorKind::InvalidValue
+        );
+    }
+
+    #[test]
+    fn lint_takes_an_optional_fix_flag() {
+        let Command::Lint { fix } = parse(&["lint"]) else {
+            panic!("expected Lint");
+        };
+        assert!(!fix);
+
+        let Command::Lint { fix } = parse(&["lint", "--fix"]) else {
+            panic!("expected Lint");
+        };
+        assert!(fix);
+    }
+
+    #[test]
+    fn fmt_composes_check_and_watch() {
+        let Command::Fmt { check, watch } = parse(&["fmt"]) else {
+            panic!("expected Fmt");
+        };
+        assert!(!check);
+        assert!(!watch);
+
+        let Command::Fmt { check, watch } = parse(&["fmt", "--check", "--watch"]) else {
+            panic!("expected Fmt");
+        };
+        assert!(check);
+        assert!(watch);
+    }
+
+    // -- build -------------------------------------------------------------
+
+    #[test]
+    fn build_defaults_every_knob_to_the_manifest() {
+        let Command::Build {
+            target,
+            out,
+            outfile,
+            entry,
+            bundle,
+            no_bundle,
+            sourcemap,
+            minify,
+            mode,
+        } = parse(&["build"])
+        else {
+            panic!("expected Build");
+        };
+        assert_eq!(target, None);
+        assert_eq!(out, None);
+        assert_eq!(outfile, None);
+        assert!(entry.is_empty());
+        assert!(!bundle);
+        assert!(!no_bundle);
+        assert!(!sourcemap);
+        assert!(!minify);
+        assert_eq!(mode, None);
+    }
+
+    #[test]
+    fn build_entry_is_repeatable_and_order_preserving() {
+        let Command::Build { entry, .. } = parse(&[
+            "build",
+            "--entry",
+            "src/cli.lua",
+            "--entry",
+            "src/worker.lua",
+        ]) else {
+            panic!("expected Build");
+        };
+        assert_eq!(
+            entry,
+            vec![
+                PathBuf::from("src/cli.lua"),
+                PathBuf::from("src/worker.lua")
+            ]
+        );
+    }
+
+    #[test]
+    fn build_accepts_every_override_flag() {
+        let Command::Build {
+            target,
+            out,
+            outfile,
+            sourcemap,
+            minify,
+            mode,
+            ..
+        } = parse(&[
+            "build",
+            "--target",
+            "5.1",
+            "--out",
+            "build",
+            "--outfile",
+            "app.lua",
+            "--sourcemap",
+            "--minify",
+            "--mode",
+            "love",
+        ])
+        else {
+            panic!("expected Build");
+        };
+        assert_eq!(target.as_deref(), Some("5.1"));
+        assert_eq!(out, Some(PathBuf::from("build")));
+        assert_eq!(outfile, Some(PathBuf::from("app.lua")));
+        assert!(sourcemap);
+        assert!(minify);
+        assert_eq!(mode.as_deref(), Some("love"));
+    }
+
+    #[test]
+    fn build_rejects_bundle_and_no_bundle_together() {
+        assert_eq!(
+            reject(&["build", "--bundle", "--no-bundle"]),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+    }
+
+    #[test]
+    fn build_accepts_either_bundle_flag_on_its_own() {
+        let Command::Build {
+            bundle, no_bundle, ..
+        } = parse(&["build", "--bundle"])
+        else {
+            panic!("expected Build");
+        };
+        assert!(bundle);
+        assert!(!no_bundle);
+
+        let Command::Build {
+            bundle, no_bundle, ..
+        } = parse(&["build", "--no-bundle"])
+        else {
+            panic!("expected Build");
+        };
+        assert!(!bundle);
+        assert!(no_bundle);
+    }
+
+    // -- doc / lsp / upgrade / explain -------------------------------------
+
+    #[test]
+    fn doc_takes_an_optional_open_flag() {
+        let Command::Doc { open } = parse(&["doc"]) else {
+            panic!("expected Doc");
+        };
+        assert!(!open);
+
+        let Command::Doc { open } = parse(&["doc", "--open"]) else {
+            panic!("expected Doc");
+        };
+        assert!(open);
+    }
+
+    #[test]
+    fn lsp_accepts_the_editor_compatibility_stdio_flag() {
+        let Command::Lsp { stdio } = parse(&["lsp"]) else {
+            panic!("expected Lsp");
+        };
+        assert!(!stdio);
+
+        let Command::Lsp { stdio } = parse(&["lsp", "--stdio"]) else {
+            panic!("expected Lsp");
+        };
+        assert!(stdio);
+    }
+
+    #[test]
+    fn upgrade_takes_an_optional_version() {
+        let Command::Upgrade { version } = parse(&["upgrade"]) else {
+            panic!("expected Upgrade");
+        };
+        assert_eq!(version, None);
+
+        let Command::Upgrade { version } = parse(&["upgrade", "v0.1.0"]) else {
+            panic!("expected Upgrade");
+        };
+        assert_eq!(version.as_deref(), Some("v0.1.0"));
+    }
+
+    #[test]
+    fn explain_requires_a_diagnostic_code() {
+        assert_eq!(
+            reject(&["explain"]),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        let Command::Explain { code } = parse(&["explain", "LB0421"]) else {
+            panic!("expected Explain");
+        };
+        assert_eq!(code, "LB0421");
+    }
+
+    // -- unmap -------------------------------------------------------------
+
+    #[test]
+    fn unmap_requires_a_bundle_path_and_takes_the_traceback_from_stdin_by_default() {
+        assert_eq!(
+            reject(&["unmap"]),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        let Command::Unmap { bundle, traceback } = parse(&["unmap", "dist/app.lua"]) else {
+            panic!("expected Unmap");
+        };
+        assert_eq!(bundle, PathBuf::from("dist/app.lua"));
+        assert!(traceback.is_empty());
+    }
+
+    #[test]
+    fn unmap_collects_a_trailing_traceback_including_hyphen_leading_words() {
+        // A Lua traceback is free text: `--` and `-e` inside it must not be
+        // mistaken for flags (`trailing_var_arg` + `allow_hyphen_values`).
+        let Command::Unmap { bundle, traceback } = parse(&[
+            "unmap",
+            "dist/app.lua",
+            "stack",
+            "traceback:",
+            "-- in",
+            "function",
+        ]) else {
+            panic!("expected Unmap");
+        };
+        assert_eq!(bundle, PathBuf::from("dist/app.lua"));
+        assert_eq!(
+            traceback,
+            vec![
+                "stack".to_owned(),
+                "traceback:".to_owned(),
+                "-- in".to_owned(),
+                "function".to_owned()
+            ]
+        );
+        // This is exactly what `main` joins back into one traceback string.
+        assert_eq!(traceback.join(" "), "stack traceback: -- in function");
+    }
+
+    // -- help / version ----------------------------------------------------
+
+    #[test]
+    fn the_binary_reports_a_version() {
+        assert_eq!(
+            reject(&["--version"]),
+            clap::error::ErrorKind::DisplayVersion
+        );
+    }
+
+    #[test]
+    fn help_describes_the_toolchain_and_its_lua_modules_contract() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("typechecker"), "{help}");
+        assert!(help.contains("lua_modules/"), "{help}");
+        assert!(help.contains("never runs Lua"), "{help}");
+    }
+
+    #[test]
+    fn every_subcommand_is_reachable_and_documented() {
+        let command = Cli::command();
+        let names: Vec<&str> = command
+            .get_subcommands()
+            .map(clap::Command::get_name)
+            .collect();
+        for expected in [
+            "init", "new", "check", "lint", "fmt", "build", "doc", "lsp", "upgrade", "explain",
+            "unmap",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "`{expected}` is missing: {names:?}"
+            );
+        }
+        for sub in command.get_subcommands() {
+            assert!(
+                sub.get_about().is_some(),
+                "`{}` has no help text",
+                sub.get_name()
+            );
         }
     }
 }

@@ -295,7 +295,7 @@ fn validate_dialect(
 }
 
 /// Validates a package name: a plain segment (`penlight`), or a scoped
-/// `@org/pkg` form (SPEC.md §19 — registry namespaces, scoped proposal).
+/// `@org/pkg` form (SPEC.md §19 — namespaces, scoped proposal).
 fn validate_package_name(name: &str) -> Option<String> {
     if name.is_empty() {
         return Some("`package.name` must not be empty".to_owned());
@@ -336,9 +336,9 @@ fn validate_name_segment(name: &str, segment: &str) -> Option<String> {
 /// Light semver-shaped check: `X.Y.Z` with an optional `-pre-release` and/or
 /// `+build` suffix. Not a full semver parser.
 ///
-/// TODO(P2): adopt a full `semver`-crate validation once the PubGrub
-/// resolver lands (SPEC.md §6) and real version comparison/matching is
-/// needed, not just manifest shape-checking.
+/// Shape-checking is all v1 needs: luabox never compares or matches versions
+/// (it resolves nothing). A full `semver`-crate validation is only warranted
+/// if version *ordering* ever becomes a luabox concern.
 fn looks_like_semver(version: &str) -> bool {
     let core = version.split(['-', '+']).next().unwrap_or(version);
     let parts: Vec<&str> = core.split('.').collect();
@@ -371,9 +371,11 @@ fn parse_package(root: &Table, errors: &mut Vec<ManifestError>) -> Package {
     check_unknown_keys(table, "[package] key", PACKAGE_KEYS, errors);
 
     // `name` and `version` are optional in `luabox.toml`: the project's
-    // rockspec is the package manifest and supplies them (SPEC.md §6). When
-    // no rockspec is present `luabox.toml` remains the fallback, so a value
-    // that *is* written here is still shape-checked.
+    // rockspec is the package manifest luarocks reads and supplies them
+    // (SPEC.md §6). A value that *is* written here is still shape-checked;
+    // the commands that need a name substitute one instead of demanding it
+    // (`luabox-cli::build_cmd::run` falls back to `"bundle"`,
+    // `doc_cmd::manifest_facts` to the project directory name).
     let name = get_string(table, "package", "name", false, errors).unwrap_or_default();
     if !name.is_empty()
         && let Some(message) = validate_package_name(&name)

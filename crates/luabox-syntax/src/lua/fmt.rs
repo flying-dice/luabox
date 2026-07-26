@@ -498,6 +498,34 @@ mod tests {
     }
 
     #[test]
+    fn line_comment_inside_an_expression_forces_a_break() {
+        // A `--` comment owns the rest of its line, so the token that
+        // follows it must start a new one even mid-expression.
+        check("local x = (1 -- why\n)", "local x = (1 -- why\n)\n");
+        check("f(a -- why\n)", "f(a -- why\n)\n");
+    }
+
+    #[test]
+    fn table_with_a_comment_nested_in_a_field_expands() {
+        // The inline probe fails on any comment, even one buried inside a
+        // child node rather than a direct child of the table.
+        check(
+            "local t = { f(1 --[[c]]) }",
+            "local t = {\n    f(1 --[[c]]),\n}\n",
+        );
+    }
+
+    #[test]
+    fn table_holding_a_multi_statement_function_expands() {
+        // The inline probe fails as soon as a nested block needs a line
+        // break, so the table falls back to one field per line.
+        check(
+            "local t = { function() f() g() end }",
+            "local t = {\n    function()\n        f()\n        g()\n    end,\n}\n",
+        );
+    }
+
+    #[test]
     fn comment_only_file() {
         check("-- just a note", "-- just a note\n");
         check("   -- indented note   ", "-- indented note\n");

@@ -34,7 +34,7 @@ checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 
 [[package]]
 name = "luabox-hir"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "luabox-syntax",
  "rowan",
@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-lower"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "luabox-hir",
  "luabox-syntax",
@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "luabox-syntax"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "rowan",
 ]

@@ -53,3 +53,76 @@ Feature: Project scaffolding — luabox init / luabox new
     And the file "my-tool/my-tool-0.1.0-1.rockspec" exists
     And "my-tool/my-tool-0.1.0-1.rockspec" contains 'package = "my-tool"'
     And "my-tool/my-tool-0.1.0-1.rockspec" contains 'url = "git+https://github.com/OWNER/my-tool.git"'
+
+  Scenario: new refuses an existing destination
+    Given an empty directory
+    And I run "luabox new my-tool"
+    When I run "luabox new my-tool"
+    Then the command fails
+    And stderr contains "already exists"
+
+  Scenario: new validates the edition before creating anything
+    Given an empty directory
+    When I run "luabox new my-tool --edition 6.0"
+    Then the command fails
+    And stderr contains "unknown edition"
+    And the file "my-tool/luabox.toml" does not exist
+
+  Scenario: a package name is derived from the directory, lowercased and dashed
+    Given an empty directory
+    When I run "luabox new My_Cool.Lib"
+    Then the command succeeds
+    And the file "My_Cool.Lib/my-cool-lib-0.1.0-1.rockspec" exists
+    And "My_Cool.Lib/my-cool-lib-0.1.0-1.rockspec" contains 'package = "my-cool-lib"'
+
+  Scenario: a name with no alphanumerics yields no package name
+    Given an empty directory
+    # `@@@` and not `...`: Win32 path rules strip trailing dots from path
+    # components, so a `...` directory name never reaches name derivation
+    # on Windows.
+    When I run "luabox new @@@"
+    Then the command fails
+    And stderr contains "cannot derive a package name from directory `@@@`"
+
+  Scenario: a library scaffold turns dashes into a Lua identifier
+    Given an empty directory
+    When I run "luabox new my-tool --lib"
+    Then the command succeeds
+    And the file "my-tool/src/lib.lua" exists
+    And "my-tool/src/lib.lua" contains "local my_tool = {}"
+    And "my-tool/src/lib.lua" contains "function my_tool.hello()"
+    And the file "my-tool/src/main.lua" does not exist
+
+  Scenario: a luajit project pins its rockspec to Lua 5.1
+    Given an empty directory
+    When I run "luabox new jitpkg --edition luajit"
+    Then the command succeeds
+    And "jitpkg/luabox.toml" contains 'edition = "luajit"'
+    And "jitpkg/jitpkg-0.1.0-1.rockspec" contains '"lua >= 5.1"'
+
+  Scenario: --lib and --bin contradict each other
+    Given an empty directory
+    When I run "luabox init --lib --bin"
+    Then the command exits with code 2
+
+  Scenario: init leaves an existing .gitignore alone
+    Given an empty directory
+    And a file ".gitignore" containing:
+      """
+      *.log
+      """
+    When I run "luabox init"
+    Then the command succeeds
+    And ".gitignore" equals:
+      """
+      *.log
+      """
+
+  Scenario: a scaffolded project formats and lints clean
+    Given an empty directory
+    And I run "luabox init --edition 5.4"
+    When I run "luabox fmt --check"
+    Then the command succeeds
+    When I run "luabox lint"
+    Then the command succeeds
+    And stderr contains "0 errors, 0 warnings"

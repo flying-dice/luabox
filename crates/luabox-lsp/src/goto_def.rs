@@ -13,6 +13,7 @@ use std::str::FromStr;
 
 use lsp_types::{Location, Position, Range};
 use luabox_hir::Resolution;
+use luabox_syntax::lua::Dialect;
 use luabox_syntax::lua::SyntaxKind;
 use luabox_syntax::lua::ast::{self, AstNode};
 use rowan::{TextRange, TextSize};
@@ -21,14 +22,21 @@ use crate::sema::FileSema;
 use crate::uri::path_to_uri;
 
 /// Compute the definition location for the symbol at `offset`.
-/// `project_root` anchors `require` module resolution.
+/// `project_root` anchors `require` module resolution, and `dialect` — the
+/// project's edition — selects the `lua_modules/share/lua/<X.Y>/` version
+/// directory of a luarocks tree.
 #[must_use]
-pub fn goto_definition(sema: &FileSema, offset: usize, project_root: &Path) -> Option<Location> {
+pub fn goto_definition(
+    sema: &FileSema,
+    offset: usize,
+    project_root: &Path,
+    dialect: Dialect,
+) -> Option<Location> {
     // 1. `require("mod")` → the module file, resolved through the bundler's
     //    shared candidate search (project root, `src/`, then `lua_modules/`).
     if let Some(edge) = sema.require_at(offset) {
         let module = edge.module.clone();
-        return resolve_module(project_root, &module).map(|path| Location {
+        return resolve_module(project_root, &module, dialect).map(|path| Location {
             uri: path_to_uri(&path),
             range: Range::new(Position::new(0, 0), Position::new(0, 0)),
         });
@@ -224,22 +232,201 @@ fn normalize(path: &Path) -> PathBuf {
 
 /// Resolve `module` to its file through the bundler's shared candidate
 /// ordering ([`luabox_bundle::resolve_candidates`], SPEC.md §7: project root,
-/// then `src/`, then the `lua_modules/<pkg>/` tree), picking the first
+/// then `src/`, then the `lua_modules/` trees — flat and luarocks), picking the first
 /// candidate that exists on disk — exactly the bundler's `resolve`.
 ///
 /// This is the workspace's single source of truth for `require` resolution
 /// (the same algorithm `luabox check` and the bundler use), so goto-def can
 /// never disagree with them: a module under `src/` or a dependency now jumps
 /// where the build would actually load it from.
-fn resolve_module(root: &Path, module: &str) -> Option<PathBuf> {
-    luabox_bundle::resolve_candidates(root, module)
+fn resolve_module(root: &Path, module: &str, dialect: Dialect) -> Option<PathBuf> {
+    luabox_bundle::resolve_candidates(root, module, dialect)
         .into_iter()
         .find(|candidate| candidate.is_file())
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::string_slice,
+    reason = "test code — panics document assumptions"
+)]
 mod tests {
     use super::*;
+
+    use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
+
+    /// The workspace root every test file lives under.
+    fn root() -> PathBuf {
+        PathBuf::from(if cfg!(windows) { r"C:\ws" } else { "/ws" })
+    }
+
+    fn analyze(files: &[(&str, &str)]) -> (Analysis, PathBuf) {
+        let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
+        let mut first = None;
+        for (rel, text) in files {
+            let path = root().join(rel);
+            first.get_or_insert_with(|| path.clone());
+            host.apply_change(Change::SetFileText {
+                path,
+                dialect: Dialect::Lua54,
+                text: (*text).to_string(),
+            });
+        }
+        (host.snapshot(), first.expect("at least one file"))
+    }
+
+    /// Byte offset just inside the `nth` (0-based) occurrence of `needle`.
+    fn offset_of(text: &str, needle: &str, nth: usize) -> usize {
+        let mut from = 0;
+        for _ in 0..nth {
+            from = text[from..].find(needle).expect("occurrence") + from + 1;
+        }
+        text[from..].find(needle).expect("occurrence") + from
+    }
+
+    /// Goto-definition at the `nth` occurrence of `needle` in the first file.
+    fn at(src: &str, needle: &str, nth: usize) -> Option<Location> {
+        let (analysis, path) = analyze(&[("main.lua", src)]);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        goto_definition(&sema, offset_of(src, needle, nth), &root(), Dialect::Lua54)
+    }
+
+    /// The `(line, character)` start of a location.
+    fn start_of(location: &Location) -> (u32, u32) {
+        (location.range.start.line, location.range.start.character)
+    }
+
+    #[test]
+    fn a_global_assignment_target_is_a_definition_site() {
+        let src = "answer = 42
+print(answer)
+";
+        let location = at(src, "answer)", 0).expect("definition");
+        assert_eq!(start_of(&location), (0, 0));
+    }
+
+    #[test]
+    fn a_cursor_on_a_local_declaration_answers_with_itself() {
+        let src = "local thing = 1
+print(thing)
+";
+        let location = at(src, "thing = 1", 0).expect("definition");
+        assert_eq!(start_of(&location), (0, 6));
+    }
+
+    #[test]
+    fn an_identifier_with_no_symbol_has_no_definition() {
+        // A table-constructor key names no binding, global, or member.
+        assert!(at("local t = { key = 1 }\n", "key", 0).is_none());
+    }
+
+    #[test]
+    fn an_undeclared_global_has_no_definition() {
+        assert!(at("print(never_defined)\n", "never_defined", 0).is_none());
+    }
+
+    #[test]
+    fn a_method_call_jumps_to_the_class_field_annotation() {
+        let src = "\
+---@class Greeter
+---@field greet fun(self: Greeter): string
+
+---@type Greeter
+local g = nil
+g:greet()
+";
+        let location = at(src, "greet()", 0).expect("definition");
+        // The `---@field greet` tag site on line 1.
+        assert_eq!(location.range.start.line, 1);
+    }
+
+    #[test]
+    fn a_member_access_on_a_non_name_receiver_has_no_definition() {
+        assert!(at("local v = f().field\n", "field", 0).is_none());
+    }
+
+    #[test]
+    fn a_field_receiver_resolves_to_its_own_binding_not_the_field() {
+        let src = "\
+---@class Point
+---@field x number
+
+---@type Point
+local p = nil
+print(p.x)
+";
+        // Cursor on `p`, not on `x`: the member route must decline.
+        let location = at(src, "p.x", 0).expect("definition");
+        assert_eq!(start_of(&location), (4, 6));
+    }
+
+    #[test]
+    fn a_dotted_function_call_jumps_to_its_declaration() {
+        let src = "\
+local M = {}
+function M.helper(n) return n end
+M.helper(1)
+";
+        let location = at(src, "helper(1)", 0).expect("definition");
+        assert_eq!(start_of(&location), (1, 11));
+    }
+
+    #[test]
+    fn a_source_redirect_uses_a_uri_verbatim() {
+        let src = "---@source file:///opt/impl.c:12:4\nlocal function f() end\nf()\n";
+        let location = at(src, "f()", 0).expect("definition");
+        assert_eq!(location.uri.as_str(), "file:///opt/impl.c");
+        assert_eq!(start_of(&location), (11, 4));
+    }
+
+    #[test]
+    fn a_source_redirect_keeps_an_absolute_path() {
+        let absolute = if cfg!(windows) {
+            r"C:/native/impl.c"
+        } else {
+            "/native/impl.c"
+        };
+        let src = format!("---@source {absolute}:3\nlocal function f() end\nf()\n");
+        let location = at(&src, "f()", 0).expect("definition");
+        assert!(
+            location.uri.as_str().ends_with("/native/impl.c"),
+            "{location:?}"
+        );
+        assert_eq!(start_of(&location), (2, 0));
+    }
+
+    #[test]
+    fn a_source_redirect_resolves_a_relative_path_against_the_file() {
+        let src = "---@source ../native/impl.c\nlocal function f() end\nf()\n";
+        let location = at(src, "f()", 0).expect("definition");
+        assert!(
+            location.uri.as_str().ends_with("/native/impl.c"),
+            "{location:?}"
+        );
+        // Line defaults to 1 → zero-based line 0.
+        assert_eq!(start_of(&location), (0, 0));
+    }
+
+    #[test]
+    fn a_require_string_jumps_to_the_start_of_the_module_file() {
+        // Nothing exists on disk under the fake root, so resolution declines.
+        assert!(at("local m = require(\"other\")\n", "other", 0).is_none());
+    }
+
+    #[test]
+    fn normalize_keeps_a_leading_parent_segment_it_cannot_pop() {
+        // Nothing to pop, so the `..` is preserved verbatim.
+        assert_eq!(
+            normalize(Path::new("../vendor/impl.c")),
+            PathBuf::from("../vendor/impl.c")
+        );
+        // A second `..` then pops the first, lexically.
+        assert_eq!(
+            normalize(Path::new("../../vendor/impl.c")),
+            PathBuf::from("vendor/impl.c")
+        );
+    }
 
     #[test]
     fn source_location_splits_path_line_and_col() {

@@ -1,0 +1,154 @@
+Feature: luabox lsp — published diagnostics
+  SPEC.md §8 — the editor never asks for diagnostics; the server pushes
+  `textDocument/publishDiagnostics` after every open, change, and close.
+  The findings are the ones `luabox check` and `luabox lint` report, with
+  the same codes, severities, and — because the project manifest is read at
+  startup — the same strictness.
+
+  Scenario: opening a file with a type error publishes it at the argument
+    Given a project with edition "5.4"
+    And a file "main.lua" containing:
+      """
+      ---@param n number
+      local function f(n) end
+      f("no")
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the diagnostics for "main.lua" include LB0300
+    And diagnostic LB0300 in "main.lua" spans 2:2 to 2:6
+    And diagnostic LB0300 in "main.lua" comes from "luabox"
+
+  Scenario: a strict project publishes the same mismatch as an error
+    Given a strict project with edition "5.4"
+    And a file "main.lua" containing:
+      """
+      ---@param n number
+      local function f(n) end
+      f("no")
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then diagnostic LB0300 in "main.lua" is an error
+
+  Scenario: without strict types the mismatch is only a warning
+    Given a project with edition "5.4"
+    And a file "main.lua" containing:
+      """
+      ---@param n number
+      local function f(n) end
+      f("no")
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then diagnostic LB0300 in "main.lua" is a warning
+
+  Scenario: an edit that fixes the error clears the diagnostics
+    Given a project with edition "5.4"
+    And a file "main.lua" containing:
+      """
+      ---@param n number
+      local function f(n) end
+      f("no")
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I change "main.lua" to:
+      """
+      ---@param n number
+      local function f(n) end
+      f(1)
+      """
+    Then the diagnostics for "main.lua" are empty
+
+  Scenario: an incremental edit introduces the error at the spliced range
+    Given a project with edition "5.4"
+    And a file "main.lua" containing:
+      """
+      ---@param n number
+      local function f(n) end
+      f(1)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I replace 2:2 through 2:3 of "main.lua" with "'no'"
+    Then the diagnostics for "main.lua" include LB0300
+    And diagnostic LB0300 in "main.lua" spans 2:2 to 2:6
+
+  Scenario: closing a buffer reverts the diagnostics to the file on disk
+    Given a project with edition "5.4"
+    And a file "main.lua" containing:
+      """
+      ---@param n number
+      local function f(n) end
+      f(1)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    And I change "main.lua" to:
+      """
+      ---@param n number
+      local function f(n) end
+      f("no")
+      """
+    When I close "main.lua"
+    Then the diagnostics for "main.lua" are empty
+
+  Scenario: a parse error is published as LB0001
+    Given a project with edition "5.4"
+    And a file "broken.lua" containing:
+      """
+      local = 1
+      """
+    And the language server is running
+    When I open "broken.lua"
+    Then the diagnostics for "broken.lua" include LB0001
+    And diagnostic LB0001 in "broken.lua" is an error
+
+  Scenario: a lint finding is published under its own source
+    Given a project with edition "5.4"
+    And a file "main.lua" containing:
+      """
+      local unused = 1
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the diagnostics for "main.lua" include LB0501
+    And diagnostic LB0501 in "main.lua" is a warning
+    And diagnostic LB0501 in "main.lua" comes from "luabox-lint"
+    And diagnostic LB0501 in "main.lua" spans 0:6 to 0:12
+
+  Scenario: a luabox-ignore comment suppresses the lint finding in the editor
+    Given a project with edition "5.4"
+    And a file "main.lua" containing:
+      """
+      local unused = 1 ---@luabox-ignore unused-local intentional
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the diagnostics for "main.lua" do not include LB0501
+
+  Scenario: using a deprecated function is flagged at the call site
+    Given a project with edition "5.4"
+    And a file "main.lua" containing:
+      """
+      ---@deprecated
+      local function oldApi() end
+
+      oldApi()
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the diagnostics for "main.lua" include LB0308
+    And diagnostic LB0308 in "main.lua" is a warning
+
+  Scenario: the deprecated declaration alone is not flagged
+    Given a project with edition "5.4"
+    And a file "main.lua" containing:
+      """
+      ---@deprecated
+      local function oldApi() end
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the diagnostics for "main.lua" do not include LB0308

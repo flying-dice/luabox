@@ -5,5 +5,3 @@ edition = "5.1"
 
 [types]
 strict = true
-
-[dependencies]

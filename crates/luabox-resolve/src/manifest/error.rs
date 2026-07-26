@@ -100,4 +100,23 @@ mod tests {
         assert_eq!(suggest("versio", &valid), Some("version"));
         assert_eq!(suggest("totally-unrelated-key", &valid), None);
     }
+
+    #[test]
+    fn display_renders_the_message_alone_without_the_span() {
+        let err = ManifestError::new("`package.edition` is required".to_owned(), None);
+        assert_eq!(err.to_string(), "`package.edition` is required");
+
+        // The span is carried for callers, never folded into the text.
+        let spanned = ManifestError::new("bad".to_owned(), Some(3..7));
+        assert_eq!(spanned.to_string(), "bad");
+        assert_eq!(spanned.span, Some(3..7));
+    }
+
+    #[test]
+    fn manifest_error_is_a_std_error() {
+        let err = ManifestError::new("boom".to_owned(), None);
+        let dynamic: &dyn std::error::Error = &err;
+        assert_eq!(dynamic.to_string(), "boom");
+        assert!(dynamic.source().is_none());
+    }
 }

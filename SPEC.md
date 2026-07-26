@@ -6,6 +6,13 @@
 Until the cucumber feature files exist for a behaviour, this text is the sole source of truth;
 from then on the feature files govern.
 
+**Scope note (0.2.0).** The v1 scope cut of 2026-07-26 made luabox a purely static toolchain —
+`init new check lint fmt build doc lsp upgrade explain unmap`. Sections describing dependency
+resolution, publishing, credentials, `run` and `toolchain` are marked *parked post-v1*: they are
+retained as the design for when that scope returns, not as a description of what ships. The
+decision record is [DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26); the removals
+are itemized in [CHANGELOG.md](CHANGELOG.md).
+
 ## 1. Vision
 
 - One static binary. Zero-install-friction (curl | sh, brew, scoop, mise). Written in Rust.
@@ -16,10 +23,10 @@ from then on the feature files govern.
 
 ### Non-goals
 
-- No interpreter/VM. No REPL beyond delegating to a configured runtime.
+- No interpreter/VM. No REPL. [Stronger since 0.2.0: luabox does not spawn a process at all — the "delegate to a configured runtime" escape hatch went with `run`/`toolchain` (§12).]
 - Full LuaCATS (`---@class` etc.) support is non-negotiable — existing annotated codebases check day one.
 - **Luau: explicitly out of scope.** Alternative typed paradigm with its own owner and toolchain (Roblox, luau-lsp). Luabox's typed story is LuaCATS annotations over untyped Lua. Scope decision, not an oversight.
-- No LuaRocks replacement-by-fiat — interop first, supersede by being better.
+- No LuaRocks replacement-by-fiat — interop first, supersede by being better. [v1 goes further — luabox does no package management at all: it *consumes* a `lua_modules/` tree you materialize with luarocks yourself; see §6 and the v1 scope cut in DIRECTION.md.]
 
 ## 2. Supported dialects & targets
 
@@ -53,7 +60,7 @@ Luau: out of scope (§1). No parse, no check, no lowering.
 ## 3. Type system
 
 - **Source of truth:** LuaLS annotations (`---@class`, `---@field`, `---@param`, `---@return`, `---@generic`, `---@alias`, `---@overload`, `---@type`, `---@cast`, `---@enum`, `---@meta`). Full dialect compatibility.
-- **Definition packages:** `@types/*`-style. `*.d.lua` files (`---@meta` modules) distributed via registry. Runtime API defs shipped for: 5.1–5.4 stdlib, LuaJIT ext, LÖVE, Neovim, OpenResty.
+- **Definition packages:** `@types/*`-style. `*.d.lua` files (`---@meta` modules), declared in `[types] defs` and read from the project tree (a dependency's own defs join the consumer's ambient scope over a materialized `lua_modules/`). Runtime API defs for: 5.1–5.4 stdlib, LuaJIT ext, LÖVE, Neovim, OpenResty. [Registry *distribution* of def packages is parked post-v1 — §6.]
 - Strictness ladder (per-package, per-file override): `none` → `warn` → `strict` (untyped = `unknown`, not `any`).
 - Inference: bidirectional, flow-sensitive narrowing (`if type(x) == "string"`), literal types, generics with constraints. Match/exceed LuaLS on annotated Lua, adding the rigor LuaLS lacks.
 - **Rich table inference — hard requirement.** Tables never degrade to a bare `table` type. The IR models table *shapes* structurally, and inference maintains them without annotations:
@@ -68,28 +75,28 @@ Luau: out of scope (§1). No parse, no check, no lowering.
 
 ```
 luabox init [--lib|--bin] [--edition 5.4|5.1|...]    scaffold in cwd
-luabox new <name>                                     scaffold new dir
-luabox add <pkg>[@version] [--dev]                    dep management
-luabox remove <pkg>
-luabox install                                        resolve + fetch (lockfile-driven)
-luabox update [pkg]
-luabox check [--target <t>]                           typecheck
+luabox new <name> [--lib|--bin] [--edition <d>]       scaffold new dir
+luabox check [--target <t>] [--format <f>] [--watch]  typecheck
 luabox lint [--fix]                                   clippy analog
-luabox fmt [--check]                                  canonical formatter
+luabox fmt [--check] [--watch]                        canonical formatter
 luabox build [--target <t>] [--out dir] [--outfile f] lower + emit (tsc/esbuild-style)
              [--entry <p>…] [--bundle|--no-bundle]    — tree emit, or bundle per entry
              [--sourcemap] [--minify] [--mode <m>]       (driven by [build]; flags override)
 luabox unmap <bundle> [traceback…]                    decode a bundle traceback to source
-luabox run <script|task>                              run via configured runtime / tasks
 luabox doc [--open]                                   docs from annotations
-luabox lsp                                            stdio LSP server
-luabox toolchain [install|pin|list]                   runtime version mgmt (rustup analog)
-luabox vendor                                         vendor deps into tree
-luabox publish [--dry-run]                            upload the rockspec to luarocks.org
+luabox lsp [--stdio]                                  stdio LSP server
+luabox upgrade [<version>]                            self-replace with a release build
 luabox explain LB0xxx                                 rustc-style diagnostic docs
 ```
 
-Every command cold-starts < 50 ms; watch mode on check/fmt; `luabox run` resolves package tasks then `$PATH`.
+Every command cold-starts < 50 ms; watch mode on check/fmt.
+
+> **Parked post-v1 (2026-07-26, [DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26)).**
+> This section previously specified `add`/`remove`/`install`/`update`/`vendor`,
+> `search`/`outdated`, `publish`, `login`/`logout`/`whoami`, `run <script|task>`,
+> and `toolchain [install|pin|list]`. They are removed in 0.2.0: v1 is a purely
+> static toolchain that reaches no network, holds no credential, and spawns no
+> process. The subsystems behind them are documented as parked in §6 and §12.
 
 ## 5. Project manifest — `luabox.toml`
 
@@ -108,25 +115,43 @@ out = "dist"
 strict = true
 defs = ["love2d"]           # ambient definition packages
 
-[dependencies]
-penlight = "1.14"
-promise = { git = "https://…", rev = "abc123" }
-
-[dev-dependencies]
-busted-compat = "1.0"
-
-[tasks]
-start = "luabox run src/main.lua"
-ci = ["luabox check", "luabox lint", "luabox fmt --check"]
-
-[workspace]
-members = ["packages/*"]
+[lint]
+pedantic = "warn"           # tier/rule levels: allow | warn | deny
 ```
 
-- **Lockfile:** `luabox.lock` — content-addressed, hashes every artifact, deterministic, text-based.
+- Every table above is live in v1. `[tasks]` and `[workspace]` still *parse*
+  (the model retains them) but nothing consumes them — no task running, no
+  workspace fan-out. Treat those two as inert.
+- `[dependencies]`/`[dev-dependencies]` also parse without driving any
+  resolution — there is no solver, no lockfile, no download (§6). They are
+  *not* inert, though: each entry names a package whose
+  `lua_modules/<name>/luabox.toml` is read for its `[types] defs`, and those
+  definition files join this project's ambient scope (§3, the luals
+  `workspace.library` model). `require` resolution (§7) does not consult the
+  table at all — it searches `lua_modules/` by path, so a rock is requirable
+  and bundlable whether or not it is listed here.
+- **Lockfile:** `luabox.lock` — content-addressed, hashes every artifact,
+  deterministic, text-based. [Parked post-v1 with the solver (§6) — a
+  `luabox.lock` left in a project is ignored.]
 - Workspaces: shared lockfile, path deps, `--workspace` flags, task fan-out.
+  [Parked post-v1 — same decision record.]
 
 ## 6. Package manager
+
+> **Parked post-v1 (2026-07-26, [DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26)).**
+> None of this section ships in 0.2.0: the PubGrub solver, the luarocks bridge,
+> the git/url/path providers, `luabox.lock`, the CAS store and `luabox publish`
+> are removed, along with the dependency dialect-set check — `[package]
+> lua-versions` still parses and `luabox explain LB1003` still documents the
+> rule, but nothing evaluates it. **luabox consumes a rock tree; it does not
+> produce one.** What survives is the *read* side — the `luabox.toml` manifest
+> model and the `lua_modules/` read path, so `require` resolution and cross-package type
+> checking work over a tree you materialize yourself
+> (`luarocks install --tree lua_modules <rock>`, then `luabox check`).
+> The **direction below is unchanged** and is the target for when dependency
+> management returns: luarocks.org is the registry, the rockspec is the package
+> manifest, there is no first-party registry. Only its *scope* is parked; the
+> design is retained here as the specification of that return.
 
 luabox follows the pnpm/bun model: **[luarocks.org](https://luarocks.org) is the registry**, and the **rockspec is the package manifest**. A project's `*.rockspec` owns its name, version, and registry dependencies (its `dependencies`/`test_dependencies`, bare rock names in LuaRocks constraint syntax, translated to semver). `luabox.toml` is tool configuration (edition, build, types, tasks) plus the source dependencies a rockspec cannot express — `path`, `git`, `url` (a bun-style tarball pinned by `sha256`), and `workspace` entries; a version-requirement dependency there is an error pointing at the rockspec. There is no first-party registry.
 
@@ -166,7 +191,7 @@ luabox follows the pnpm/bun model: **[luarocks.org](https://luarocks.org) is the
 ## 10. Formatter
 
 - StyLua-compatible default; max ~5 options (width, indent, quotes, trailing comma, EOL). (A call-parens option was dropped: the formatter's token-preservation guarantee makes a non-default value unimplementable.)
-- Range formatting, format-on-save, `--check` for CI, idempotent, version-pinned in lockfile.
+- Range formatting, format-on-save, `--check` for CI, idempotent. (Style pinning rode the lockfile; with no lockfile in v1 the formatter version is the toolchain's own — see §15.)
 
 ## 11. Test runner & bench
 
@@ -185,13 +210,23 @@ luabox follows the pnpm/bun model: **[luarocks.org](https://luarocks.org) is the
 
 ## 12. Toolchain manager (nvm/rustup analog)
 
+> **Removed (2026-07-26, [DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26),
+> [flying-dice/luabox#11](https://github.com/flying-dice/luabox/issues/11)).**
+> `luabox toolchain` and `luabox run` are gone, and with them the built-in
+> runtime index, the luarocks provisioning, `luabox-toolchain.toml`, and the
+> generated `LUAROCKS_CONFIG`. **luabox acquires nothing and spawns nothing** —
+> the "nvm/rustup for Lua" framing is withdrawn, not deferred. Bring your own
+> interpreter and your own luarocks. The historical design is retained below
+> for context; the C-rock escape hatch it referenced is now plain
+> `luarocks install --tree lua_modules <rock>`.
+
 - `luabox toolchain install 5.4.6` / `luajit-2.1` — prebuilt runtimes into `~/.luabox/toolchains`. **An acquirer of runtimes, never a runtime.**
 - nvm-style, `install` also provisions a matching **luarocks** alongside the interpreter (verified SHA-256), so installing a runtime yields a working luarocks — the documented C-rock escape hatch (§6, #6): `luabox run luarocks -- install <rock>`.
 - `luabox-toolchain.toml` pins the project runtime for `luabox run`. When pinned, `run` prepends the toolchain's bin dirs to a child's `PATH` and resolves bare executables (`lua`, `luarocks`) toolchain-first — before `$PATH` — with `LUAROCKS_CONFIG` wiring luarocks to the toolchain interpreter and a project-local `lua_modules` tree (npm-run/`node_modules/.bin` semantics). The bare-`$PATH` fallback is **kept with that purpose**.
 
 ## 13. Docs
 
-- `luabox doc`: static site from annotations; search, cross-linked types. (Doc examples as tested blocks died with the test runner, #1.) Registry auto-hosts per version (docs.rs analog).
+- `luabox doc`: static site from annotations; search, cross-linked types. (Doc examples as tested blocks died with the test runner, #1.) Registry auto-hosting per version (docs.rs analog) is parked post-v1 with the registry itself (§6); `doc` emits a local site.
 
 ## 14. Diagnostics culture
 
@@ -200,8 +235,8 @@ luabox follows the pnpm/bun model: **[luarocks.org](https://luarocks.org) is the
 
 ## 15. Stability & governance
 
-- Toolchain semver; breaking lint/format changes on major only; edition-style opt-ins.
-- `min-luabox-version` in manifest, resolver-respected.
+- Toolchain semver; breaking lint/format changes on major only; edition-style opt-ins. (0.x looseness is spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).)
+- `min-luabox-version` in manifest — parsed and validated by the manifest model; *enforcement* rode the resolver, so it is inert until dependency management returns (§6).
 - RFC process for language-facing decisions; LuaCATS extensions proposed upstream to LuaLS first.
 
 ## 16. Architecture
@@ -216,24 +251,34 @@ crates/
   luabox-db          salsa incremental database (shared: check/lint/lsp/fmt)
   luabox-lower       target lowering + polyfill injection (the tsc bit)
   luabox-bundle      require-graph, tree-shake, minify, sourcemaps
-  luabox-resolve     PubGrub solver, registry + luarocks bridge
-  luabox-store       CAS cache, fetch, verify
+  luabox-resolve     luabox.toml manifest: typed model, validation, round-trip
   luabox-lsp         server over luabox-db
   luabox-cli         thin frontend
 ```
+
+(`luabox-lint` and `luabox-diag` also exist, split out of Semantics/Frontend
+as the linter and the diagnostic registry grew. **`luabox-store`** — the CAS
+cache, fetch and verify crate — **was deleted in 0.2.0**: it existed only to
+back installs. `luabox-resolve` lost its resolving half (solver, providers,
+lockfile, luarocks bridge, dependency dialect-sets) with it and is now the
+manifest crate only — project discovery lives in `luabox-cli`, and the
+`lua_modules/` read path in `luabox-bundle`'s `require` resolution, consumed
+by `check`/`lint`/the LSP. The name is retained for now; a rename to
+`luabox-manifest` is open. All per
+[DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26).)
 
 | Context | Crates | Owns | Boundary contract |
 |---|---|---|---|
 | Syntax | `luabox-syntax` | Lua grammar, lossless trees, dialect gating | tree types + parse API |
 | Semantics | `luabox-hir`, `luabox-types`, `luabox-db` | name resolution, type IR, inference, incremental queries | salsa DB traits |
 | Emit | `luabox-lower`, `luabox-bundle` | lowering, polyfills, require-graph, sourcemaps | checked HIR in, bytes out; type-blind |
-| Distribution | `luabox-resolve`, `luabox-store` | manifests, solver, lockfile, CAS, luarocks bridge | package graph API; never parses syntax |
-| Execution | toolchain mgr + runtime resolution (in `luabox-cli`) | runtime acquisition | runtime handle; only context spawning runtimes |
+| Distribution | `luabox-resolve` | the `luabox.toml` model, its validation and comment-preserving round-trip (solver, lockfile, CAS and the luarocks bridge are parked — §6) | manifest API; never parses syntax |
+| ~~Execution~~ | — | ~~runtime acquisition~~ | **Context removed in 0.2.0** — luabox spawns no process (§12) |
 | Frontend | `luabox-cli`, `luabox-lsp` | UX, protocol, diagnostics rendering | consumes all, owns none |
 
 ### 16.1 Implementation — Rust
 
-- Key deps: `rowan`, `salsa`, `pubgrub`, `lsp-server` (rust-analyzer's choice over tower-lsp), `rayon`, `notify`, `clap`, `serde`/`toml_edit` (comment-preserving manifest edits).
+- Key deps: `rowan`, `salsa`, `lsp-server` (rust-analyzer's choice over tower-lsp), `rayon`, `notify`, `clap`, `serde`/`toml_edit` (comment-preserving manifest edits).
 - Release: fat LTO, `codegen-units=1`, panic=abort, stripped; musl static Linux, universal macOS, MSVC Windows.
 - CI perf gates (merge-blocking): cold start < 50 ms; `check` 100-kLOC warm < 1 s; LSP keystroke-to-diagnostics < 100 ms p95.
 - Fuzzing: parser + lowering under `cargo-fuzz`; lowering verified by differential execution against real runtimes in CI.
@@ -243,7 +288,7 @@ crates/
 - **Unit** — per crate, boundary-internal, no I/O.
 - **Acceptance — cucumber (`cucumber-rs`)** — primary layer. Every user-facing behaviour maps to a `.feature` file under `tests/features/<context>/`; Gherkin scenarios ARE the executable spec. Step definitions drive the real CLI binary against temp-dir fixtures — black-box. Feature file first, then implementation.
 - **Differential execution** — lowered output vs source on real runtimes, as cucumber `Then` steps + corpus sweep.
-- **Fuzz + property** — `proptest`: lockfile determinism, solver idempotence, `fmt(fmt(x)) == fmt(x)`.
+- **Fuzz + property** — `proptest`: `fmt(fmt(x)) == fmt(x)`, lowering invariants. (Lockfile determinism and solver idempotence went with the solver, §6.)
 - **Perf gates** — §16.1.
 - Discipline: declarative scenarios, one behaviour each; `Scenario Outline` for the dialect × target matrix (§2.1 table = examples tables).
 
@@ -251,7 +296,7 @@ crates/
 
 | Tool | Covers | Luabox delta |
 |---|---|---|
-| LuaRocks | packages | lockfiles, CAS store, solver, speed; bridged not fought |
+| LuaRocks | packages | not competed with in v1 — luabox reads the tree luarocks materializes; lockfiles/CAS/solver are parked (§6), bridged not fought |
 | lux | packages (Rust rewrite) | whole toolchain, not PM only |
 | LuaLS | LSP/types | incremental salsa core, unified with lint/fmt/build |
 | selene / luacheck | lint | type-aware rules, autofix |
@@ -259,26 +304,31 @@ crates/
 | darklua | dialect transforms (Luau-centric) | full 5.x matrix, semantics-preservation guarantees |
 | Luau / luau-lsp | typed Lua paradigm | deliberately not competed with — luabox types untyped Lua via LuaCATS |
 | busted | test | zero-config, runtime matrix, own-emit coverage |
-| aftman / rokit / hererocks | toolchains | integrated, manifest-pinned |
+| aftman / rokit / hererocks | toolchains | no longer a comparison — luabox acquires no runtime (§12) |
 | tsc | target lowering | the model, applied to the Lua dialect lattice |
 | cargo / rustup / rust-analyzer / clippy | everything | the blueprint |
 | bun | DX, speed, one-binary | the temperament |
 
 ## 18. Phasing
 
+> **Re-cut 2026-07-26 ([DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26)).**
+> v1 is P0 + P1 + P3 — the static toolchain. P2 is parked, P4 is dead (its test
+> matrix/bench went with #1, its toolchain manager with #11), and P5 keeps only
+> its non-hosting items.
+
 1. **P0 — Core:** Lua parser (all dialects), `luabox.toml`, `init/fmt/check` (LuaCATS subset), CLI skeleton. Formatter ships first.
 2. **P1 — Types & LSP:** full inference, salsa DB, conformance checking, LSP completion/hover/diagnostics/goto.
-3. **P2 — Packages:** resolver, store, lockfile, luarocks bridge, `add/install/publish`, registry MVP.
+3. ~~**P2 — Packages:**~~ resolver, store, lockfile, luarocks bridge, `add/install/publish`, registry MVP. **[Parked post-v1 — §6.]**
 4. **P3 — Build:** lowering matrix, bundler, sourcemaps.
-5. **P4 — Runner-adjacent:** test matrix, bench, toolchain manager, coverage, LSP polish.
-6. **P5 — Ecosystem:** doc hosting, audit DB, editor extensions, LÖVE/Neovim embedding.
+5. ~~**P4 — Runner-adjacent:**~~ test matrix, bench, toolchain manager, coverage, LSP polish. **[Removed: test/bench §11, toolchain §12. LSP polish continues under P1.]**
+6. **P5 — Ecosystem:** doc hosting *(parked with the registry, §13)*, audit DB *(parked with the registry)*, editor extensions, LÖVE/Neovim embedding.
 
 ## 19. Open questions (escalate, don't guess)
 
 - **Decided (#90):** Strictness for field access on LuaCATS code follows the *declaration boundary*, not a sealed-vs-open guess. A value whose type is a **declared `---@class`** (in-file, def-package, or cross-package via `---@meta` #108; including `self` in a class method and `---@type Class` locals) gets full field checking on the ordinary strictness ladder: a field the class does not declare — no `---@field` (own or inherited through the parent chain), no indexer, no inherent carrier method — is flagged on **read** (`LB0306`, luals `undefined-field`) and on **write** (`LB0303`, luals `inject-field`). Un-annotated code stays `unknown`-lenient: a plain inferred table or an `unknown`/`any` value invents no obligation — a declaration is the precondition. A class with an indexer declares dynamic access and stays open. This matches luals' `undefined-field`/`inject-field` behavior, and rides the ladder one notch stricter: a **warning** in warn mode, an **error** in strict (luals always warns). Suppressible with `---@diagnostic disable: undefined-field`. `---@class` conformance rides the same ladder — a warning in warn mode, an error in strict.
 - Integer/float divergence loudness targeting 5.1. Proposal: error in `strict`, warn otherwise.
-- Registry namespaces flat vs scoped `@org/pkg`. Proposal: scoped.
-- C-module story beyond prebuilt artifacts: out of scope until P5+.
+- Registry namespaces flat vs scoped `@org/pkg`. Proposal: scoped. [Not a v1 question — parked with §6.]
+- C-module story beyond prebuilt artifacts: out of scope. [Moot in v1: luabox builds and fetches nothing. C rocks are the user's luarocks tree's business.]
 - Verify `luabox` unclaimed (crates.io, GitHub, luarocks, npm) before any public artifact.
   **Checked 2026-07 (ticket #10):** free on crates.io/npm/PyPI/Homebrew — claim placeholder
   crates before any public artifact. **Taken on LuaRocks** (active terminal library by
@@ -286,5 +336,6 @@ crates/
   bridge targets; strengthens the scoped-namespace proposal. `github.com/luabox` handle is
   squatted (dormant since 2018) — pick a fallback org. **`lb` alias:** collides with Debian
   `live-build`'s `/usr/bin/lb` and is squatted on npm/PyPI/crates.io — recommend shipping it
-  as a documented shell alias, not an installed binary. Decisions pending: LuaRocks name
-  strategy, `lb` shipping mode.
+  as a documented shell alias, not an installed binary. Decisions pending: `lb` shipping
+  mode. (The LuaRocks name strategy is parked with §6 — v1 publishes nothing to LuaRocks,
+  so the taken name blocks nothing today.)

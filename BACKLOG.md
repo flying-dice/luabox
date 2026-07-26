@@ -5,6 +5,20 @@ The backlog lives as issues on
 (labels: `release`, `blocker`, `icebox`, `shapes-v2`). This file is an
 index only — the issues carry the user stories and acceptance criteria.
 
+## v1 scope cut (2026-07-26)
+
+Dependency management and interpreter execution were cut from v1 by owner
+decision — luabox consumes a rock tree, it does not produce one, and it
+never spawns an interpreter. The decision record is in
+[DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26); the wave is
+tracked on GitHub as flying-dice/luabox#10 (strip
+`add`/`remove`/`install`/`update`/`vendor`, `search`/`outdated`,
+`publish`/auth, the solver/providers/lockfile and `luabox-store`),
+flying-dice/luabox#11 (strip `run`/`toolchain`),
+flying-dice/luabox#12 (docs) and flying-dice/luabox#13 (gate verification
++ coverage-floor ratchet). Every registry-, credential- or runtime-shaped
+item below is **parked post-v1** — not scheduled, not a known gap.
+
 ## Initial public release (milestone)
 
 **The launch gate is complete.** Everything in
@@ -58,8 +72,9 @@ in v0.1.0.
   **moot**: `luabox test` was removed (flying-dice/luabox#1; toolchain, not
   a runtime); close on GitLab.
 - [#137](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/137)
-  Registry UX: `luabox search` + `login`/auth — needs the hosted-registry
-  work (adjacent to #95).
+  Registry UX: `luabox search` + `login`/auth — **parked post-v1** by the
+  scope cut above; those commands no longer exist. The luarocks.org
+  registry *direction* stands for whenever dependency management returns.
 
 _Everything else is closed. #83/#88/#89/#98/#104 were closed as
 inconsistent with the north star; #85/#86/#87/#90/#91 graduated from the

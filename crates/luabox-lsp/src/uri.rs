@@ -170,4 +170,43 @@ mod tests {
         let uri = Uri::from_str("untitled:Untitled-1").unwrap();
         assert_eq!(uri_to_path(&uri), None);
     }
+
+    #[test]
+    fn a_uri_with_an_empty_path_is_rejected() {
+        // `file://host` (authority only, no path) yields nothing to open.
+        let uri = Uri::from_str("file://authority").unwrap();
+        assert_eq!(uri_to_path(&uri), None);
+    }
+
+    #[test]
+    fn lowercase_percent_escapes_decode() {
+        let uri = Uri::from_str("file:///home/dev/a%2eb%2Fc.lua").unwrap();
+        assert_eq!(
+            uri_to_path(&uri).unwrap(),
+            PathBuf::from("/home/dev/a.b/c.lua")
+        );
+    }
+
+    #[test]
+    fn a_malformed_percent_escape_is_left_verbatim() {
+        // `%zz` is not a valid escape and a trailing `%` has no digits after
+        // it: both pass through unchanged rather than corrupting the path.
+        assert_eq!(percent_decode("a%zzb"), "a%zzb");
+        assert_eq!(percent_decode("a%2"), "a%2");
+        assert_eq!(percent_decode("a%"), "a%");
+    }
+
+    #[test]
+    fn an_invalid_utf8_escape_sequence_decodes_lossily() {
+        // A lone continuation byte is not valid UTF-8; the decoder must not
+        // panic, it substitutes the replacement character.
+        assert_eq!(percent_decode("%80"), "\u{FFFD}");
+    }
+
+    #[test]
+    fn a_relative_path_gains_a_leading_slash() {
+        // `path_to_uri` always produces an absolute URI path.
+        let uri = path_to_uri(Path::new("rel/main.lua"));
+        assert_eq!(uri.as_str(), "file:///rel/main.lua");
+    }
 }

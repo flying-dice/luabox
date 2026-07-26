@@ -1,15 +1,15 @@
 # luabox
 
 **A cargo-style toolchain for Lua.** One static binary that gives Lua the
-workflow Rust developers expect — `check`, `lint`, `fmt`, `run`,
-`build`, `doc` — with a type checker that speaks stock
+workflow Rust developers expect — `check`, `lint`, `fmt`, `build`, `doc`,
+`lsp` — with a type checker that speaks stock
 [LuaCATS](https://luals.github.io/wiki/annotations/) annotations (the
 lua-language-server dialect) but *verifies* what luals only trusts:
 `---@class` conformance, `---@generic` generics, and types shared across
-modules and packages. Works with Lua 5.1–5.4 and LuaJIT. It **acquires** Lua
-runtimes — nvm/rustup for Lua: `luabox toolchain` installs and pins
-interpreters (and a matching luarocks) that `run` spawns. It is never a runtime
-itself. **Not a runtime.**
+modules and packages. Works with Lua 5.1–5.4 and LuaJIT. It is a purely
+static toolchain: it **never spawns an interpreter**, and it **consumes** a
+rock tree rather than producing one — you materialize `lua_modules/` with
+luarocks and luabox reads it. **Not a runtime, not a package manager.**
 
 ## Quickstart
 
@@ -61,13 +61,9 @@ $ luabox check
 check: 0 errors, 0 warnings in 1 files
 ```
 
-Run it, format it, lint it:
+Format it, lint it:
 
 ```
-$ luabox run src/main.lua
-Hello, world!
-Hello, luabox!
-
 $ luabox fmt
 formatted 1 files (0 changed)
 
@@ -75,13 +71,10 @@ $ luabox lint
 lint: 0 errors, 0 warnings in 1 files
 ```
 
-That is the whole loop — one binary for check, run, format, and lint, no build
-config. `run` executes on the runtime the project pins via `luabox toolchain`,
-falling back to a Lua on `PATH`. When a toolchain is pinned, `run` also resolves
-bare executables — `lua`, `luarocks` — from the toolchain first, so
-`luabox run luarocks -- install <rock>` reaches the toolchain's own luarocks
-(the `node_modules/.bin`-first model). See [`examples/`](examples/) for larger,
-real projects —
+That is the whole loop — one binary for check, format, and lint, no build
+config, and nothing spawned: luabox reads your sources, it never executes
+them. Run the program with whatever Lua you already have. See
+[`examples/`](examples/) for larger, real projects —
 a LÖVE game, a multi-package workspace, and a 5.4-to-5.1 cross-version lowering
 demo.
 
@@ -157,7 +150,9 @@ Any other editor can point its LSP client at `luabox lsp`.
 
 ## Limitations
 
-luabox 0.1 is alpha software — there is no hosted package registry, and the
+luabox is alpha software — dependency management and running code are
+deliberately out of scope (see
+[DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26)), and the
 editor extensions are not yet on their marketplaces (each ships installable
 artifacts from its own repo's releases). The full LuaCATS tag vocabulary is
 enforced.
@@ -178,12 +173,6 @@ anything load-bearing.
 | `lint` | type-informed rules, `---@luabox-ignore`, per-rule `[lint]` levels |
 | `build` | one tsc/esbuild-style emit driven by `[build]`: lower `edition → target` (goto, bitops, `<close>`, `_ENV`, …) with tree-shaken polyfills; `bundle = true` inlines the require graph into one file per `entry` (`--minify`, `--sourcemap`); `mode = love\|nvim-plugin` packages a `.love` / Neovim plugin. Flags (`--target`/`--out`/`--outfile`/`--entry`/`--bundle`/`--no-bundle`/`--sourcemap`/`--minify`/`--mode`) override config |
 | `unmap` | decode a production traceback back to source lines via the `<bundle>.map` that `build --sourcemap` writes next to the bundle |
-| `add` / `remove` / `install` / `update` / `vendor` | PubGrub resolver, `luabox.lock`, CAS store with hard-link installs. `add <rock>` / `remove <rock>` edit the rockspec's `dependencies` (`--dev` → `test_dependencies`) comment-preservingly; `--path`/`--git` manage source deps in `luabox.toml`. `update <name>` re-pins a git dep to its repo's latest release tag |
-| `publish` | upload the authored rockspec to luarocks.org (`--dry-run` to preview). Gates on a valid canonically-named rockspec, a green `check`, and pure-Lua-only; needs an API key (`login --luarocks`) |
-| `search` / `outdated` | search luarocks.org (the registry) for rocks by name, and report dependencies behind their latest version (registry rocks vs. luarocks.org, git deps vs. their repo's latest GitHub release); `--format json\|text` |
-| `login` / `logout` / `whoami` | sign in to GitHub via the browser (OAuth device flow), storing the token encrypted in the OS keychain; sign out; show the signed-in identity. Authenticates git-source operations (`outdated`/`update` release probing) — registry reads are anonymous. `login --luarocks` stores a luarocks.org API key for `publish`. `login`/`whoami` take `--format json\|text` |
-| `run` | `[tasks]` entries or scripts via the pinned runtime. Bare executables (and `[tasks]` shells) resolve from the pinned toolchain's bin dirs — including its provisioned luarocks — before the system `$PATH` (npm-run/`node_modules/.bin` semantics); the `$PATH` fallback is kept with that purpose. `run luarocks -- install <rock>` is the C-rock escape hatch |
-| `toolchain` | acquire managed Lua runtimes (nvm for Lua): install/pin/list. `install <id>` provisions a matching luarocks alongside the interpreter, wired to it and a project-local `lua_modules` tree |
 | `upgrade` | self-update from GitHub releases (`luabox upgrade` for latest, or a specific `v0.1.1`), checksum-verified |
 | `lsp` | language server: diagnostics + quick-fixes, completion (auto-require), hover, goto def/type/impl, references, rename, symbols, signature help, call hierarchy, inlay hints, semantic tokens, formatting |
 | `doc` | static docs from annotations |
@@ -221,184 +210,45 @@ The traceback can come from stdin (above) or as trailing arguments. The map is
 recorded only at build time, so `sourcemap = true` is what makes this possible
 — there is no way to reconstruct it after the fact.
 
-## Dependencies & registries
+## Using dependencies
 
-luabox follows the pnpm/bun model:
-[**luarocks.org is the registry**](https://luarocks.org), and the
-**rockspec is the package manifest**
-([flying-dice/luabox#2](https://github.com/flying-dice/luabox/issues/2)).
-
-- Your project's `*.rockspec` owns its **name**, **version**, and **registry
-  dependencies** — its `dependencies` (and `test_dependencies`) are bare rock
-  names in LuaRocks constraint syntax (`"lpeg >= 1.0"`), resolved against
-  luarocks.org. `luabox init`/`new` scaffold one for you.
-- `luabox.toml` is **tool configuration** (edition, build, types, tasks) plus
-  the **source** dependencies a rockspec cannot express — `path`, `git`
-  (`rev`/`tag`/`branch`), and `workspace` entries. A version-requirement entry
-  in `luabox.toml` is an error that points you at the rockspec.
-
-```toml
-# hello-0.1.0-1.rockspec — the package manifest
-package = "hello"
-version = "0.1.0-1"
-dependencies = { "lua >= 5.4", "lpeg >= 1.0" }   # resolved from luarocks.org
-```
-
-```toml
-# luabox.toml — tool config + git/path sources
-[package]
-edition = "5.4"
-
-[dependencies]
-mylib = { path = "../mylib" }                     # a path source dependency
-gitlib = { git = "https://github.com/owner/gitlib", tag = "v1.2.0" }
-tarball = { url = "https://example.com/pkg.tar.gz", sha256 = "…" }  # bun-style, pinned by digest
-```
-
-The `url` source is a bun-style http(s) (or `file://`/local) tarball pinned by
-its SHA-256: the digest is captured once at `luabox add --url` time and verified
-before extraction on every install after, so a corrupt or tampered download
-installs nothing.
-
-`luabox install`/`update` resolve the merged graph (rockspec registry deps +
-luabox.toml source deps) with the PubGrub solver, write `luabox.lock`, and
-hard-link packages into `lua_modules/`. C-module rocks are out of scope and
-rejected with a clear error — luabox is not a C build system. There is no
-first-party registry, and `LUABOX_REGISTRY` is gone; set
-`LUABOX_LUAROCKS_MIRROR` to a local mirror directory for hermetic/offline
-resolves.
-
-**Dialect compatibility.** Every dependency has a **family set** of the Lua
-dialects it supports — never a range (a range implies an order LuaJIT breaks: it
-is 5.1-plus-extensions, not a point between 5.1 and 5.2). A registry rock's set
-is translated from its rockspec `lua` constraint (`lua >= 5.1, < 5.4` →
-`{5.1, 5.2, 5.3}`, plus `luajit` whenever 5.1 is admitted); a path/git package's
-set is its `luabox.toml` `[package] lua-versions`; an absent set means all
-dialects. A dependency is accepted for your **`[build] target`** (default
-`edition`) when the target is in its set, **or** its own edition is *lowerable*
-to the target — luabox lowers dependency sources alongside yours at build. When
-neither holds, resolution fails with the `explain`-able
-[`LB1003`](https://github.com/flying-dice/luabox/issues/5) (`luabox explain
-LB1003`). Luau is fenced off: it has no lowering path to a PUC target.
-
-### Discovering & managing dependencies
-
-**luarocks.org is the discovery surface** for registry dependencies. `luabox
-search` reads luarocks.org's root manifest and matches your query as a
-case-insensitive substring of rock names — an anonymous registry read, no
-GitHub, no token. Git dependencies remain a public GitHub repo pinned to a
-release tag.
+luabox **consumes** a rock tree; it does not produce one. Materialize a
+project-local `lua_modules/` with luarocks yourself, and luabox reads it:
 
 ```sh
-luabox search penlight      # rocks on luarocks.org whose name contains "penlight"
-luabox search               # the first 50 rocks by name (the registry is large)
-luabox add penlight         # add the latest penlight to the rockspec + install
-luabox add penlight@1.14    # a lower bound: writes "penlight >= 1.14"
-luabox add busted --dev     # a test-only dep → the rockspec's test_dependencies
-luabox remove penlight      # delete the entry from the rockspec + re-sync
-luabox add cool-lib --git https://github.com/owner/cool-lib --tag v1.2.0
-luabox add tarball --url https://example.com/pkg.tar.gz  # captures & pins its sha256
-luabox outdated             # which deps are behind their latest version?
-luabox update cool-lib      # re-pin cool-lib to its repo's latest release tag
+luarocks install --tree lua_modules penlight
+luabox check                # penlight is requirable, bundlable, and skipped as source
 ```
 
-`luabox add <rock>` edits your **rockspec** the way `pnpm add` edits
-`package.json`: it resolves the rock on luarocks.org, splices one entry into the
-`dependencies` table (or `test_dependencies` with `--dev`), and re-installs.
-The edit is surgical — indentation, quote style, comments, and the `lua >= X.Y`
-pin are all preserved, and only the touched line changes:
+Anything under `lua_modules/` is on the module path for `require` resolution
+and bundling. Both dependency layouts are searched: the luarocks tree
+(`lua_modules/share/lua/<X.Y>/pl/tablex.lua`, where `<X.Y>` is your `[build]
+target` — `5.1` for `luajit`) and the flat `lua_modules/<name>/` layout a
+hand-vendored or sibling package has. A compiled C module
+(`lua_modules/lib/lua/<X.Y>/*.so`) cannot be inlined into a text bundle, so
+`require` calls naming one are left as runtime `require`s — ship the `.so`
+alongside your bundle. `lua_modules/` is never walked as project source:
+`check`, `lint`, `fmt` and `build` skip it whatever it contains.
 
-```diff
- dependencies = {
-    "lua >= 5.4",
-+   "penlight >= 1.14.0",
- }
-```
+**Getting a dependency's *types* needs more than installing it.** All three
+must hold, or the rock is `unknown` to the typechecker:
 
-An explicit `add penlight@1.14` writes `>= 1.14` (`@=1.14` for an exact `== 1.14`);
-a bare `add penlight` looks up and pins `>= <latest>`. `remove <rock>` deletes
-exactly that entry. A `--path`/`--git` add still edits `luabox.toml`, since those
-source dependencies a rockspec cannot express.
+1. a `[dependencies]` (or `[dev-dependencies]`) entry naming the package —
+   the table drives nothing else, but it is the list that gets searched;
+2. a `luabox.toml` for that package with a `[types] defs` key, at
+   `lua_modules/<name>/luabox.toml` (or, for a `path` dependency, at the
+   path you gave) — i.e. the **flat** layout, since a luarocks tree has no
+   per-package `luabox.toml`;
+3. the `defs/` directory it names, holding the `*.d.lua` files.
 
-`search` and `outdated` take `--format json|text` (`text` is the default;
-editors pass `json` for a stable contract — `{"results":[…]}` and
-`{"dependencies":[…]}` respectively). `search` reports each rock's highest
-translated semver and its version count. `outdated` compares each **registry**
-rock's locked version against luarocks.org's highest, and each **git** dep's tag
-against its GitHub repo's latest release; it always exits 0 (a report, not a
-gate). `update <name>` re-pins a **tag**-pinned git dependency to the latest
-release tag of its GitHub repo; a `rev`/`branch` pin is left untouched, and
-registry deps are re-resolved within their rockspec constraints.
+So a plain `luarocks install --tree lua_modules penlight` gives you require
+resolution and bundling, but **not** penlight's types. To type it today,
+write the LuaCATS definitions into your own project's `defs/` and list them
+in your `[types] defs` — the same route as any third-party library.
 
-Set `LUABOX_LUAROCKS_MIRROR` to a local mirror directory to run `search` (and
-resolution) offline/hermetically. The git-source paths (`outdated`'s release
-probing, `update`'s re-pin) honor a GitHub token (see **Authentication**),
-sent as `Authorization: Bearer …`, which raises the anonymous 60 req/hr limit to
-5000/hr; they work without one, just against the lower anonymous limit.
-
-### Authentication
-
-Sign in to GitHub through the browser — no Personal Access Token to paste:
-
-```sh
-luabox login        # opens the browser, prints a device code, stores a token
-luabox whoami       # -> your GitHub login (and where the token came from)
-luabox logout       # removes the stored GitHub token (and any luarocks.org API key)
-```
-
-`luabox login` runs the OAuth 2.0 **device flow**: it shows a short `user_code`
-and a verification URL (and best-effort opens your browser), you approve there,
-and the resulting token is stored **encrypted at rest in your OS keychain**
-(macOS Keychain, Windows Credential Manager, Linux Secret Service). No scope is
-requested — an unscoped token already lifts the rate limit (least privilege).
-luabox's git-source operations — `luabox outdated`'s release probing and `luabox
-update`'s re-pin — then use it automatically. (`luabox search` is an anonymous
-luarocks.org read and never consults it.)
-
-`login` and `whoami` accept `--format json` (newline-delimited events for
-`login`; one object for `whoami`) — that is what the editor extensions'
-"Sign in with GitHub" buttons drive.
-
-Token precedence for every GitHub request is:
-
-```
-LUABOX_GITHUB_TOKEN  →  GITHUB_TOKEN  →  keychain (from `luabox login`)  →  anonymous
-```
-
-Environment variables win over the keychain, so CI and one-off overrides are
-always honored. On a headless box with no keychain (common in CI), `luabox
-login` can't store the token and tells you to set `LUABOX_GITHUB_TOKEN`
-instead; nothing crashes.
-
-## Publishing
-
-luabox follows the pnpm/bun model: **[luarocks.org](https://luarocks.org) is
-the registry**, and your **rockspec is the package manifest**. `luabox publish`
-is a thin proxy that uploads the rockspec you authored (`luabox init`/`new`
-scaffold one; `luabox add`/`remove` edit it) to luarocks.org *verbatim* — it
-compiles and generates nothing.
-
-```sh
-luabox login --luarocks     # once: paste your luarocks.org API key (stored in the keychain)
-luabox publish --dry-run    # preview: prints the rockspec + upload target, no network
-luabox publish              # upload the authored rockspec to luarocks.org
-```
-
-Get an API key from <https://luarocks.org/settings/api-keys>. `luabox login
---luarocks` reads it from stdin and stores it **encrypted at rest in your OS
-keychain**; `LUABOX_LUAROCKS_API_KEY` overrides it (CI/one-off). The key is
-**never** logged — it is redacted from every echoed command and error.
-
-Before uploading, `publish` gates entirely offline: your project must have a
-single root `*.rockspec` that parses and carries `package`, `version`, and a
-`source.url`; its filename must be the canonical `<package>-<version>.rockspec`;
-`luabox check` must be green; and the rock must be **pure-Lua** (`build.type =
-builtin`, no C sources — luabox is a toolchain, not a C build system). A
-duplicate version or a server-side validation error surfaces luarocks.org's own
-message. Point `publish` at a different server with `LUABOX_LUAROCKS_URL`.
-
-Consumers install your published rock with plain `luarocks install <name>` — no
-luabox required on their side.
+Your `*.rockspec` and luarocks own dependency management — there is no
+solver, no lockfile, and no registry client in luabox
+([DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26)).
 
 ## Project layout (for contributors)
 
@@ -412,8 +262,7 @@ Cargo workspace, one crate per bounded context (SPEC.md §16):
 | `luabox-db` | incremental query database |
 | `luabox-lower` | target lowering + polyfills |
 | `luabox-bundle` | require-graph, tree-shake, minify, sourcemaps |
-| `luabox-resolve` | PubGrub solver, luarocks.org bridge, rockspec + `luabox.toml` manifests |
-| `luabox-store` | content-addressed cache |
+| `luabox-resolve` | `luabox.toml` manifest model: validation, round-tripping |
 | `luabox-lsp` | language server |
 | `luabox-cli` | the `luabox` binary |
 
@@ -430,7 +279,9 @@ fixture projects — the executable spec (SPEC.md §16.2).
 
 ## Status
 
-**0.1.0** — released 2026-07-14, the full command surface works end to end.
+**0.2.0** — unreleased; the v1 scope cut (see
+[DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26)). Last
+released: 0.1.4 (2026-07-14). The kept command surface works end to end.
 Alpha quality: the executable spec drives the real binary through cucumber
 scenarios, perf gates block CI, and lowering is verified by differential
 execution against real runtimes in CI. Prebuilt binaries are attached to each

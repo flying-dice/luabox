@@ -327,6 +327,25 @@ mod tests {
     }
 
     #[test]
+    fn narrow_matches_only_a_standalone_identifier() {
+        // An embedded occurrence is rejected; the scan continues past it.
+        assert_eq!(narrow("size_hint = size", "size"), Some((12, 16)));
+        // No standalone occurrence at all.
+        assert_eq!(narrow("resize_it", "size"), None);
+        assert_eq!(narrow("nothing here", "size"), None);
+        // At the very start and the very end of the slice.
+        assert_eq!(narrow("size", "size"), Some((0, 4)));
+    }
+
+    #[test]
+    fn narrow_skips_a_leading_tag_word() {
+        // A field literally named `field` must not match the `@field` tag.
+        assert_eq!(narrow("@field field number", "field"), Some((7, 12)));
+        // A tag word that runs to the end of the slice leaves nothing.
+        assert_eq!(narrow("@field", "field"), None);
+    }
+
+    #[test]
     fn prepare_rename_on_a_non_symbol_is_none() {
         // The cursor sits on a numeric literal, not an identifier.
         let src = "local value = 1\n";

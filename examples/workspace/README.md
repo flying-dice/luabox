@@ -1,7 +1,7 @@
 # workspace
 
-A monorepo: several packages under one tree, sharing a lockfile and checked
-together. The `[workspace]` table lists members by glob.
+A monorepo: several packages under one tree, checked together. The
+`[workspace]` table lists members by glob.
 
 ```
 workspace/
@@ -33,13 +33,15 @@ graph inside the workspace.
 
 ## Working in a single member
 
-Each package is a normal luabox project. `cd` into one to run its checks or
-its tasks:
+Each package is a normal luabox project. `cd` into one to run its checks:
 
 ```sh
 cd packages/core     && luabox check
-cd packages/cli-tool && luabox run start   # prints "2 + 3 = 5"
+cd packages/cli-tool && luabox check
 ```
+
+`packages/cli-tool/src/main.lua` prints `2 + 3 = 5` when handed to a Lua 5.1
+interpreter — luabox checks it, your runtime runs it.
 
 ## A real `---@generic` function
 
@@ -59,7 +61,8 @@ Generic inference itself is complete.)
 
 ## Why a workspace
 
-- **One lockfile, one resolution.** Members share dependency versions.
+- **One tree, one gate.** Every member is checked, formatted and linted by
+  one command from the root.
 - **Path deps between members** without publishing — edit `core`, and
   `cli-tool` sees the change immediately.
 - **Fan-out commands** — check or format the entire repo from the root.

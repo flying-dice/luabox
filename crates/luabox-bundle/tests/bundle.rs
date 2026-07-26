@@ -15,7 +15,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use luabox_bundle::{BundleError, BundleMap, BundleRequest, bundle, unmap_traceback};
+use luabox_bundle::{
+    BundleError, BundleMap, BundleRequest, DynamicRequireSite, bundle, resolve_candidates,
+    unmap_traceback,
+};
+use luabox_lower::{LowerDiagnostic, Severity};
 use luabox_syntax::Dialect;
 
 fn write(root: &Path, rel: &str, content: &str) {
@@ -487,5 +491,489 @@ fn sourcemap_under_minify_keeps_module_granularity() {
     assert!(
         mapped.iter().any(|(f, _)| *f == "src/main.lua"),
         "{mapped:?}"
+    );
+}
+
+// === degenerate graphs ===================================================
+
+#[test]
+fn a_lone_entry_bundles_without_the_module_map_or_shim() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    write(root, "src/main.lua", "print(\"solo\")\n");
+
+    let entry = root.join("src/main.lua");
+    let out = bundle(&request(root, &entry, Dialect::Lua51, Dialect::Lua51)).expect("bundle");
+    assert_eq!(out.modules, 0);
+    // No requires means no module map, no `__luabox_require` shim: the
+    // bundle is the banner plus the entry chunk verbatim.
+    assert!(!out.text.contains("__luabox_modules"), "{}", out.text);
+    assert!(!out.text.contains("__luabox_require"), "{}", out.text);
+    assert_eq!(
+        out.text,
+        "-- bundled by luabox (5.1 -> 5.1)\nprint(\"solo\")\n"
+    );
+}
+
+#[test]
+fn an_empty_module_still_registers_and_maps() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    write(root, "src/main.lua", "print(require(\"blank\"))\n");
+    write(root, "src/blank.lua", "");
+
+    let entry = root.join("src/main.lua");
+    let mut req = request(root, &entry, Dialect::Lua51, Dialect::Lua51);
+    req.sourcemap = true;
+    let out = bundle(&req).expect("bundle");
+    assert_eq!(out.modules, 1);
+    // The empty body contributes no bundle lines at all — registration and
+    // its `end` sit back to back.
+    assert!(
+        out.text
+            .contains("__luabox_modules[\"blank\"] = function(...)\nend\n"),
+        "{}",
+        out.text
+    );
+    let map = BundleMap::from_json(out.map.as_deref().expect("map")).expect("parse map");
+    assert_eq!(map.lines.len(), out.text.lines().count());
+    // The empty module is still a known file, it simply claims no lines.
+    assert_eq!(
+        map.files,
+        vec!["src/blank.lua".to_owned(), "src/main.lua".to_owned()]
+    );
+    assert!(
+        (1..=u32::try_from(map.lines.len()).expect("fits"))
+            .filter_map(|l| map.lookup(l))
+            .all(|(f, _)| f == "src/main.lua"),
+        "an empty module contributes no mapped lines"
+    );
+
+    if let Some(runtime) = lua() {
+        let script = write_bundle(root, &out.text);
+        assert_eq!(run_lua(runtime, &script), "true\n");
+    }
+}
+
+#[test]
+fn one_file_reached_by_two_names_is_bundled_once_under_the_first() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    // `pkg` and `pkg.init` are two require spellings of the same file.
+    write(
+        root,
+        "src/main.lua",
+        "local a = require(\"shared\")\nlocal b = require(\"shared\")\nprint(a, b)\n",
+    );
+    write(root, "src/shared.lua", "return \"once\"\n");
+
+    let entry = root.join("src/main.lua");
+    let out = bundle(&request(root, &entry, Dialect::Lua51, Dialect::Lua51)).expect("bundle");
+    assert_eq!(out.modules, 1, "module identity is the file, not the edge");
+    assert_eq!(
+        out.text
+            .matches("__luabox_modules[\"shared\"] = function(...)")
+            .count(),
+        1,
+        "{}",
+        out.text
+    );
+    assert_eq!(out.text.matches("__luabox_require(\"shared\")").count(), 2);
+}
+
+// === failure paths =======================================================
+
+#[test]
+fn a_missing_entry_file_is_an_io_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let entry = root.join("src/nope.lua");
+    let err =
+        bundle(&request(root, &entry, Dialect::Lua51, Dialect::Lua51)).expect_err("missing entry");
+    let BundleError::Io { path, .. } = &err else {
+        panic!("expected Io, got {err}");
+    };
+    assert!(path.ends_with("src/nope.lua"), "{}", path.display());
+    assert!(err.to_string().starts_with("cannot read `"), "{err}");
+}
+
+#[test]
+fn a_missing_dependency_file_never_reaches_io() {
+    // An unresolvable require is *external*, not an error — the graph walk
+    // simply leaves the call site alone.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    write(root, "src/main.lua", "print(require(\"ghost\"))\n");
+    let entry = root.join("src/main.lua");
+    let out = bundle(&request(root, &entry, Dialect::Lua51, Dialect::Lua51)).expect("bundle");
+    assert_eq!(out.modules, 0);
+    assert!(out.text.contains("require(\"ghost\")"), "{}", out.text);
+}
+
+#[test]
+fn a_module_that_does_not_parse_is_a_parse_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    write(root, "src/main.lua", "print(require(\"broken\"))\n");
+    write(root, "src/broken.lua", "local = = =\n");
+
+    let entry = root.join("src/main.lua");
+    let err = bundle(&request(root, &entry, Dialect::Lua54, Dialect::Lua51))
+        .expect_err("broken module must fail");
+    // A syntax error is caught while *lowering* the module, so it surfaces
+    // as LB0001 through the Lower variant rather than the reparse check.
+    let BundleError::Lower { file, diagnostics } = &err else {
+        panic!("expected Lower, got {err}");
+    };
+    assert_eq!(file, "src/broken.lua");
+    assert!(diagnostics.iter().any(|d| d.code == "LB0001"), "{err}");
+    assert!(
+        err.to_string().contains("cannot lower `src/broken.lua`"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_same_dialect_bundle_still_rejects_a_module_that_does_not_parse() {
+    // `edition == target` makes lowering the identity — no parse happens
+    // there — so the bundler's own parse of each module is what catches it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    write(root, "src/main.lua", "print(require(\"broken\"))\n");
+    write(root, "src/broken.lua", "local = = =\n");
+
+    let entry = root.join("src/main.lua");
+    let err = bundle(&request(root, &entry, Dialect::Lua51, Dialect::Lua51))
+        .expect_err("broken module must fail");
+    let BundleError::Parse { file, message } = &err else {
+        panic!("expected Parse, got {err}");
+    };
+    assert_eq!(file, "src/broken.lua");
+    assert!(!message.is_empty(), "the parser's own message is carried");
+    assert_eq!(err.to_string(), format!("`src/broken.lua`: {message}"));
+}
+
+#[test]
+fn a_module_with_an_irreducible_goto_is_a_lower_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    write(root, "src/main.lua", "print(require(\"jumpy\"))\n");
+    write(
+        root,
+        "src/jumpy.lua",
+        "while true do\n  goto out\nend\n::out::\nreturn 1\n",
+    );
+
+    let entry = root.join("src/main.lua");
+    let err = bundle(&request(root, &entry, Dialect::Lua54, Dialect::Lua51))
+        .expect_err("irreducible goto must fail the bundle");
+    let BundleError::Lower { file, diagnostics } = &err else {
+        panic!("expected Lower, got {err}");
+    };
+    assert_eq!(file, "src/jumpy.lua");
+    assert_eq!(
+        diagnostics.iter().map(|d| d.code).collect::<Vec<_>>(),
+        vec!["LB0601"]
+    );
+    let message = err.to_string();
+    assert!(
+        message.starts_with("cannot lower `src/jumpy.lua` for bundling:"),
+        "{message}"
+    );
+    assert!(
+        message.contains("\n  LB0601: irreducible `goto`"),
+        "{message}"
+    );
+}
+
+#[test]
+fn a_construct_with_no_lowering_rule_fails_residual_validation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    // Hex float literals are 5.2+; nothing lowers them for a 5.1 target, so
+    // they must not ship (same residual check `luabox build` runs).
+    write(root, "src/main.lua", "local x = 0x1p4\nprint(x)\n");
+
+    let entry = root.join("src/main.lua");
+    let err = bundle(&request(root, &entry, Dialect::Lua54, Dialect::Lua51))
+        .expect_err("hex float cannot target 5.1");
+    let BundleError::Parse { file, message } = &err else {
+        panic!("expected Parse, got {err}");
+    };
+    assert_eq!(file, "src/main.lua");
+    assert!(message.contains("not legal under target 5.1"), "{message}");
+    assert!(message.contains("no lowering rule"), "{message}");
+    assert_eq!(err.to_string(), format!("`src/main.lua`: {message}"));
+}
+
+#[test]
+fn dynamic_requires_are_reported_across_modules_in_file_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    write(
+        root,
+        "src/main.lua",
+        "local dep = require(\"dep\")\nlocal m = require(dep.name)\nprint(m)\n",
+    );
+    write(
+        root,
+        "src/dep.lua",
+        "local M = {}\nM.name = \"x\"\nlocal other = require(M.name)\nreturn M\n",
+    );
+
+    let entry = root.join("src/main.lua");
+    let err = bundle(&request(root, &entry, Dialect::Lua51, Dialect::Lua51))
+        .expect_err("dynamic requires must fail");
+    let BundleError::DynamicRequires(sites) = &err else {
+        panic!("expected DynamicRequires, got {err}");
+    };
+    // Sorted by (file, line), so `dep` precedes `main` regardless of the
+    // order the BFS happened to visit them in.
+    assert_eq!(
+        sites,
+        &[
+            DynamicRequireSite {
+                file: "src/dep.lua".to_owned(),
+                line: 3,
+            },
+            DynamicRequireSite {
+                file: "src/main.lua".to_owned(),
+                line: 2,
+            },
+        ]
+    );
+}
+
+// === error rendering =====================================================
+
+#[test]
+fn every_bundle_error_renders_its_own_shape() {
+    let lower_diag = |code: &'static str, message: &str| LowerDiagnostic {
+        code,
+        severity: Severity::Error,
+        message: message.to_owned(),
+        range: rowan::TextRange::new(0.into(), 1.into()),
+    };
+
+    assert_eq!(
+        BundleError::Io {
+            path: PathBuf::from("src/gone.lua"),
+            message: "No such file or directory (os error 2)".to_owned(),
+        }
+        .to_string(),
+        "cannot read `src/gone.lua`: No such file or directory (os error 2)"
+    );
+    assert_eq!(
+        BundleError::Parse {
+            file: "src/a.lua".to_owned(),
+            message: "unexpected token".to_owned(),
+        }
+        .to_string(),
+        "`src/a.lua`: unexpected token"
+    );
+    assert_eq!(
+        BundleError::Lower {
+            file: "src/a.lua".to_owned(),
+            diagnostics: vec![
+                lower_diag("LB0601", "irreducible"),
+                lower_diag("LB0604", "env")
+            ],
+        }
+        .to_string(),
+        "cannot lower `src/a.lua` for bundling:\n  LB0601: irreducible\n  LB0604: env"
+    );
+    assert_eq!(
+        BundleError::EntryRequired {
+            file: "src/x.lua".to_owned(),
+            module: "main".to_owned(),
+        }
+        .to_string(),
+        "`src/x.lua` requires \"main\", which is the entry module; bundling an entry that is \
+         itself required is not supported yet"
+    );
+    assert_eq!(
+        BundleError::SourceMap("expected value at line 1".to_owned()).to_string(),
+        "invalid .lua.map: expected value at line 1"
+    );
+    assert_eq!(
+        BundleError::SourceMapVersion(7).to_string(),
+        "unsupported .lua.map version 7 (this luabox reads version 1)"
+    );
+    assert_eq!(
+        BundleError::Internal("minify broke".to_owned()).to_string(),
+        "internal bundler error: minify broke"
+    );
+
+    // A no-site dynamic-require error still renders the guidance body.
+    let empty = BundleError::DynamicRequires(Vec::new()).to_string();
+    assert!(empty.contains("must be a string literal"), "{empty}");
+    assert!(empty.contains("allow-dynamic"), "{empty}");
+
+    // The trait object is a real `std::error::Error`.
+    let boxed: Box<dyn std::error::Error> = Box::new(BundleError::Internal("boom".to_owned()));
+    assert_eq!(boxed.to_string(), "internal bundler error: boom");
+}
+
+#[test]
+fn source_map_version_and_syntax_are_both_rejected() {
+    let err = BundleMap::from_json("not json at all").expect_err("bad json");
+    assert!(matches!(err, BundleError::SourceMap(_)), "{err}");
+    let err = BundleMap::from_json(r#"{"version":2,"bundle":"x","files":[],"lines":[]}"#)
+        .expect_err("bad version");
+    assert!(matches!(err, BundleError::SourceMapVersion(2)), "{err}");
+}
+
+// === luarocks tree layout ================================================
+
+/// Materialize the shape `luarocks install --tree lua_modules penlight`
+/// leaves behind: Lua sources under `share/lua/<X.Y>/`, a C module under
+/// `lib/lua/<X.Y>/`, rock metadata under `lib/luarocks/rocks-<X.Y>/`.
+fn write_rocks_tree(root: &Path, version: &str) {
+    write(
+        root,
+        &format!("lua_modules/share/lua/{version}/pl/tablex.lua"),
+        "local M = {}\nfunction M.size() return \"from-tablex\" end\nreturn M\n",
+    );
+    write(
+        root,
+        &format!("lua_modules/share/lua/{version}/pl/init.lua"),
+        "return \"from-pl-init\"\n",
+    );
+    write(
+        root,
+        &format!("lua_modules/lib/luarocks/rocks-{version}/penlight/1.13.1-1/rock_manifest"),
+        "rock_manifest = {}\n",
+    );
+    // A C module: on disk it is a shared object, never a `.lua` file.
+    write(root, &format!("lua_modules/lib/lua/{version}/lfs.so"), "");
+}
+
+#[test]
+fn a_luarocks_tree_module_is_inlined_into_the_bundle() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write(
+        root,
+        "src/main.lua",
+        "local tablex = require(\"pl.tablex\")\nprint(tablex.size())\n",
+    );
+    write_rocks_tree(root, "5.1");
+
+    let entry = root.join("src/main.lua");
+    let out = bundle(&request(root, &entry, Dialect::Lua51, Dialect::Lua51)).expect("bundle");
+    assert_eq!(out.modules, 1);
+    assert!(
+        out.text
+            .contains("__luabox_modules[\"pl.tablex\"] = function(...)"),
+        "{}",
+        out.text
+    );
+    assert!(out.text.contains("from-tablex"), "{}", out.text);
+    assert!(
+        out.text.contains("__luabox_require(\"pl.tablex\")"),
+        "{}",
+        out.text
+    );
+}
+
+#[test]
+fn a_luarocks_package_root_resolves_through_its_init_lua() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write(root, "src/main.lua", "print(require(\"pl\"))\n");
+    write_rocks_tree(root, "5.4");
+
+    let entry = root.join("src/main.lua");
+    let out = bundle(&request(root, &entry, Dialect::Lua54, Dialect::Lua54)).expect("bundle");
+    assert_eq!(out.modules, 1);
+    assert!(out.text.contains("from-pl-init"), "{}", out.text);
+}
+
+#[test]
+fn a_luajit_target_reads_the_five_one_rocks_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write(
+        root,
+        "src/main.lua",
+        "local tablex = require(\"pl.tablex\")\nprint(tablex.size())\n",
+    );
+    // luarocks installs LuaJIT rocks under the 5.1 prefix.
+    write_rocks_tree(root, "5.1");
+
+    let entry = root.join("src/main.lua");
+    let out = bundle(&request(root, &entry, Dialect::LuaJit, Dialect::LuaJit)).expect("bundle");
+    assert_eq!(out.modules, 1);
+    assert!(out.text.contains("from-tablex"), "{}", out.text);
+}
+
+#[test]
+fn a_rocks_tree_for_another_version_is_not_this_builds_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write(root, "src/main.lua", "print(require(\"pl.tablex\"))\n");
+    write_rocks_tree(root, "5.4");
+
+    // Targeting 5.1: the 5.4 tree is somebody else's install, so the require
+    // stays external rather than silently inlining a foreign build.
+    let entry = root.join("src/main.lua");
+    let out = bundle(&request(root, &entry, Dialect::Lua51, Dialect::Lua51)).expect("bundle");
+    assert_eq!(out.modules, 0);
+    assert!(out.text.contains("require(\"pl.tablex\")"), "{}", out.text);
+    assert!(!out.text.contains("from-tablex"), "{}", out.text);
+}
+
+#[test]
+fn a_c_module_in_the_rocks_tree_stays_an_external_require() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write(
+        root,
+        "src/main.lua",
+        "local lfs = require(\"lfs\")\nprint(lfs)\n",
+    );
+    write_rocks_tree(root, "5.1");
+
+    // `lib/lua/5.1/lfs.so` cannot be inlined into a text bundle: the bundle
+    // succeeds, inlines nothing, and leaves the runtime `require` in place —
+    // exactly how any unresolved name is treated. No error.
+    let entry = root.join("src/main.lua");
+    let out = bundle(&request(root, &entry, Dialect::Lua51, Dialect::Lua51)).expect("bundle");
+    assert_eq!(out.modules, 0);
+    assert!(out.text.contains("require(\"lfs\")"), "{}", out.text);
+    assert!(
+        !out.text.contains("__luabox_modules[\"lfs\"]"),
+        "{}",
+        out.text
+    );
+}
+
+// === resolution candidates ===============================================
+
+#[test]
+fn illegal_module_names_have_no_candidates() {
+    let root = Path::new("/project");
+    for bad in ["", ".", "a.", ".a", "a..b", "..", "a...b"] {
+        assert!(
+            resolve_candidates(root, bad, Dialect::Lua54).is_empty(),
+            "`{bad}` must not resolve anywhere"
+        );
+    }
+    // A legal name still produces the SPEC §7 ordering.
+    let ok = resolve_candidates(root, "a.b", Dialect::Lua54);
+    assert_eq!(
+        ok,
+        vec![
+            PathBuf::from("/project/a/b.lua"),
+            PathBuf::from("/project/a/b/init.lua"),
+            PathBuf::from("/project/src/a/b.lua"),
+            PathBuf::from("/project/src/a/b/init.lua"),
+            PathBuf::from("/project/lua_modules/a/src/b.lua"),
+            PathBuf::from("/project/lua_modules/a/src/b/init.lua"),
+            PathBuf::from("/project/lua_modules/a/b.lua"),
+            PathBuf::from("/project/lua_modules/a/b/init.lua"),
+            PathBuf::from("/project/lua_modules/share/lua/5.4/a/b.lua"),
+            PathBuf::from("/project/lua_modules/share/lua/5.4/a/b/init.lua"),
+        ]
     );
 }

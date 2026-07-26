@@ -57,3 +57,45 @@ impl Dialect {
         Dialect::LuaJit,
     ];
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_ids_round_trip() {
+        for dialect in Dialect::ALL {
+            let id = dialect.manifest_id();
+            assert_eq!(
+                Dialect::from_manifest_id(id),
+                Some(dialect),
+                "manifest id {id:?} must round-trip"
+            );
+        }
+        assert_eq!(
+            Dialect::ALL.map(Dialect::manifest_id),
+            ["5.1", "5.2", "5.3", "5.4", "luajit"]
+        );
+    }
+
+    #[test]
+    fn unknown_manifest_ids_are_rejected() {
+        // Near-misses must not be silently coerced to a supported dialect.
+        for id in ["", "5.0", "5.5", "5", "LuaJIT", "luau", " 5.4"] {
+            assert_eq!(Dialect::from_manifest_id(id), None, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn goto_is_the_only_grammar_gate() {
+        assert!(!Dialect::Lua51.has_goto());
+        for dialect in [
+            Dialect::Lua52,
+            Dialect::Lua53,
+            Dialect::Lua54,
+            Dialect::LuaJit,
+        ] {
+            assert!(dialect.has_goto(), "{dialect:?}");
+        }
+    }
+}

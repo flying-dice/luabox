@@ -8,17 +8,12 @@
 //!
 //! [`Manifest::parse`] collects *every* validation error in one pass
 //! (SPEC.md §14: batch diagnostics, not fail-fast) and, on success, keeps
-//! the parsed [`toml_edit::DocumentMut`] alongside the typed view so later
-//! edits (`luabox add`/`luabox remove`) preserve comments and formatting —
-//! see [`Manifest::set_dependency`] for the pattern this generalizes to.
-//! [`Manifest::workspace_members`] expands `[workspace] members` globs
-//! (`packages/*`) into concrete member directories, cargo-style.
+//! the parsed [`toml_edit::DocumentMut`] alongside the typed view so the
+//! manifest round-trips byte-identically, comments and formatting intact.
 
-mod edit;
 mod error;
 mod model;
 mod parse;
-mod workspace;
 
 pub use error::ManifestError;
 pub use model::{
@@ -78,43 +73,11 @@ mod tests {
         assert!(manifest.types.strict);
         assert_eq!(manifest.types.defs, vec!["love2d".to_owned()]);
 
-        assert_eq!(
-            manifest.dependencies.get("penlight"),
-            Some(&Dependency::Version("1.14".to_owned()))
-        );
-        match manifest.dependencies.get("promise") {
-            Some(Dependency::Git(git)) => {
-                assert_eq!(git.rev.as_deref(), Some("abc123"));
-                assert_eq!(git.tag, None);
-                assert_eq!(git.branch, None);
-            }
-            other => panic!("expected a git dependency, got {other:?}"),
-        }
-
-        assert_eq!(
-            manifest.dev_dependencies.get("busted-compat"),
-            Some(&Dependency::Version("1.0".to_owned()))
-        );
-
-        assert_eq!(
-            manifest.tasks.get("start"),
-            Some(&TaskValue::Single("luabox run src/main.lua".to_owned()))
-        );
-        assert_eq!(
-            manifest.tasks.get("ci"),
-            Some(&TaskValue::Multiple(vec![
-                "luabox check".to_owned(),
-                "luabox lint".to_owned(),
-                "luabox fmt --check".to_owned(),
-            ]))
-        );
-
-        assert_eq!(
-            manifest.workspace.as_ref().map(|w| w.members.clone()),
-            Some(vec!["packages/*".to_owned()])
-        );
-
-        // Round-trip: an untouched document renders back byte-identical.
+        // The example's optional tables (`[dependencies]`, `[tasks]`,
+        // `[workspace]`) are asserted by the focused tests below against
+        // fixtures this file owns; asserting their *contents* here would pin
+        // the test to SPEC.md's illustrative values. What this test owns is
+        // that the spec's own example parses at all, and round-trips.
         assert_eq!(manifest.to_string(), source);
     }
 
@@ -153,8 +116,8 @@ mod tests {
     #[test]
     fn missing_edition_is_reported_but_name_version_are_optional() {
         // `edition` is a tool concern and stays required; `name`/`version`
-        // are optional in `luabox.toml` because the rockspec supplies them
-        // (SPEC.md §6).
+        // are optional in `luabox.toml` because the rockspec luarocks reads
+        // supplies them (SPEC.md §6).
         let errors = Manifest::parse("[package]\nlicense = \"MIT\"\n").unwrap_err();
         assert!(errors.iter().any(|e| e.message.contains("package.edition")));
         assert!(
@@ -169,8 +132,8 @@ mod tests {
 
     #[test]
     fn package_without_name_or_version_parses() {
-        // The slimmed `luabox.toml` scaffold: edition only, rockspec owns the
-        // rest.
+        // The slimmed `luabox.toml` scaffold: edition only; the rockspec owns
+        // the rest.
         let manifest =
             Manifest::parse("[package]\nedition = \"5.4\"\n").expect("edition-only manifest valid");
         assert!(manifest.package.name.is_empty());
@@ -567,5 +530,198 @@ mod tests {
                 .iter()
                 .any(|e| e.message.contains("must be a level string"))
         );
+    }
+
+    // --- shape errors ------------------------------------------------------
+
+    /// Every error message produced by parsing `src`, for substring assertions.
+    fn errors_for(src: &str) -> Vec<String> {
+        let errors = Manifest::parse(src).unwrap_err();
+        errors.iter().map(|e| e.message.clone()).collect()
+    }
+
+    fn assert_reports(src: &str, needle: &str) {
+        let messages = errors_for(src);
+        assert!(
+            messages.iter().any(|m| m.contains(needle)),
+            "expected an error containing {needle:?}, got {messages:?}"
+        );
+    }
+
+    #[test]
+    fn a_section_that_is_not_a_table_is_reported_per_section() {
+        for section in [
+            "build",
+            "types",
+            "workspace",
+            "lint",
+            "dependencies",
+            "tasks",
+        ] {
+            // The scalar must precede `[package]` to stay a top-level key.
+            let src = format!("{section} = 5\n{PREAMBLE}");
+            assert_reports(&src, &format!("`[{section}]` must be a table"));
+        }
+    }
+
+    #[test]
+    fn a_non_string_scalar_field_names_the_field_it_belongs_to() {
+        assert_reports(
+            &format!("{PREAMBLE}\n[build]\nout = 5\n"),
+            "`build.out` must be a string",
+        );
+        assert_reports(
+            "[package]\nname = 1\nversion = \"1.0.0\"\nedition = \"5.4\"\n",
+            "`package.name` must be a string",
+        );
+    }
+
+    #[test]
+    fn a_string_array_field_rejects_a_bare_string_and_non_string_entries() {
+        assert_reports(
+            &format!("{PREAMBLE}\n[types]\ndefs = \"lib.d.lua\"\n"),
+            "`types.defs` must be an array of strings",
+        );
+        assert_reports(
+            &format!("{PREAMBLE}\n[types]\ndefs = [\"a.d.lua\", 3]\n"),
+            "`types.defs` entries must be strings",
+        );
+    }
+
+    #[test]
+    fn lua_versions_rejects_a_bare_string_and_non_string_entries() {
+        assert_reports(
+            "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\nlua-versions = \"5.1\"\n",
+            "`package.lua-versions` must be an array of strings",
+        );
+        assert_reports(
+            "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\nlua-versions = [\"5.1\", 51]\n",
+            "`package.lua-versions` entries must be strings",
+        );
+    }
+
+    // --- package names -----------------------------------------------------
+
+    #[test]
+    fn an_empty_package_name_is_treated_as_absent_not_invalid() {
+        // `name` is optional (the rockspec supplies it), and `parse_package`
+        // guards the name rules with `!name.is_empty()` — so an explicit empty
+        // string parses and simply carries no name.
+        let manifest =
+            Manifest::parse("[package]\nname = \"\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n")
+                .expect("an empty name is not a validation failure");
+        assert_eq!(manifest.package.name, "");
+    }
+
+    #[test]
+    fn scoped_package_names_parse_and_validate_both_segments() {
+        let ok = Manifest::parse(
+            "[package]\nname = \"@acme/widgets\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n",
+        )
+        .expect("a well-formed scoped name is valid");
+        assert_eq!(ok.package.name, "@acme/widgets");
+
+        // `@` with no `/` is not a scoped name.
+        assert_reports(
+            "[package]\nname = \"@acme\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n",
+            "is scoped but not of the form `@scope/name`",
+        );
+        // Either segment may be empty, and either is caught.
+        assert_reports(
+            "[package]\nname = \"@/widgets\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n",
+            "must not have an empty scope or name segment",
+        );
+        assert_reports(
+            "[package]\nname = \"@acme/\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n",
+            "must not have an empty scope or name segment",
+        );
+        // The per-segment rules still apply inside a scope.
+        assert_reports(
+            "[package]\nname = \"@1acme/widgets\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n",
+            "must not start with a digit",
+        );
+    }
+
+    #[test]
+    fn min_luabox_version_must_look_like_semver() {
+        assert_reports(
+            "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\nmin-luabox-version = \"latest\"\n",
+            "`package.min-luabox-version` \"latest\" doesn't look like semver",
+        );
+    }
+
+    // --- [workspace] -------------------------------------------------------
+
+    #[test]
+    fn workspace_members_parse_and_default_to_empty() {
+        let manifest = Manifest::parse(&format!(
+            "{PREAMBLE}\n[workspace]\nmembers = [\"packages/*\", \"tools/cli\"]\n"
+        ))
+        .expect("valid [workspace]");
+        let workspace = manifest.workspace.expect("[workspace] present");
+        assert_eq!(workspace.members, vec!["packages/*", "tools/cli"]);
+
+        // Present but empty: still a workspace, with no members.
+        let bare = Manifest::parse(&format!("{PREAMBLE}\n[workspace]\n"))
+            .expect("an empty [workspace] is valid");
+        assert_eq!(
+            bare.workspace.expect("[workspace] present").members,
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn unknown_workspace_key_is_reported() {
+        assert_reports(
+            &format!("{PREAMBLE}\n[workspace]\nmemebers = [\"a\"]\n"),
+            "memebers",
+        );
+    }
+
+    // --- dependencies ------------------------------------------------------
+
+    #[test]
+    fn a_dependency_that_is_neither_string_nor_table_is_reported() {
+        assert_reports(
+            &format!("{PREAMBLE}\n[dependencies]\na = 3\n"),
+            "`dependencies.a` must be a version-requirement string or an inline table",
+        );
+        assert_reports(
+            &format!("{PREAMBLE}\n[dev-dependencies]\nb = true\n"),
+            "`dev-dependencies.b` must be a version-requirement string or an inline table",
+        );
+    }
+
+    #[test]
+    fn workspace_dependency_flag_must_be_true() {
+        assert_reports(
+            &format!("{PREAMBLE}\n[dependencies]\na = {{ workspace = false }}\n"),
+            "`dependencies.a.workspace` must be `true`",
+        );
+    }
+
+    // --- [tasks] -----------------------------------------------------------
+
+    #[test]
+    fn a_task_that_is_neither_string_nor_array_is_reported() {
+        assert_reports(
+            &format!("{PREAMBLE}\n[tasks]\nbuild = 7\n"),
+            "`tasks.build` must be a string or an array of strings",
+        );
+    }
+
+    // --- lossless round-trip -----------------------------------------------
+
+    #[test]
+    fn the_backing_document_is_exposed_and_round_trips_byte_identically() {
+        let src =
+            format!("# leading comment\n{PREAMBLE}\n# tasks!\n[tasks]\ntest = \"luabox test\"\n");
+        let manifest = Manifest::parse(&src).expect("valid manifest");
+
+        // `document()` hands back the lossless parse, and `Display` renders it
+        // — comments and formatting intact.
+        assert_eq!(manifest.document().to_string(), src);
+        assert_eq!(manifest.to_string(), src);
+        assert!(manifest.document().get("tasks").is_some());
     }
 }

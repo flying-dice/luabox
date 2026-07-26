@@ -179,3 +179,255 @@ fn see_lines(sees: &[String]) -> String {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::string_slice,
+    clippy::panic,
+    reason = "test code — panics document assumptions"
+)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
+
+    fn analyze(text: &str) -> (Analysis, PathBuf) {
+        let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
+        let path = Path::new(if cfg!(windows) {
+            r"C:\ws\main.lua"
+        } else {
+            "/ws/main.lua"
+        })
+        .to_path_buf();
+        host.apply_change(Change::SetFileText {
+            path: path.clone(),
+            dialect: Dialect::Lua54,
+            text: text.to_string(),
+        });
+        (host.snapshot(), path)
+    }
+
+    /// Byte offset just inside the `nth` (0-based) occurrence of `needle`.
+    fn offset_of(text: &str, needle: &str, nth: usize) -> usize {
+        let mut from = 0;
+        for _ in 0..nth {
+            from = text[from..].find(needle).expect("occurrence") + from + 1;
+        }
+        text[from..].find(needle).expect("occurrence") + from
+    }
+
+    /// The rendered markdown of the hover at the `nth` occurrence of `needle`.
+    fn at(src: &str, needle: &str, nth: usize) -> Option<String> {
+        let (analysis, path) = analyze(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        hover(&sema, offset_of(src, needle, nth)).map(|h| match h.contents {
+            HoverContents::Markup(markup) => markup.value,
+            other => panic!("expected markup hover contents, got {other:?}"),
+        })
+    }
+
+    #[test]
+    fn function_declaration_name_hovers_as_its_signature() {
+        let src = "\
+---Adds one.
+---@param n number
+---@return number
+function bump(n) return n + 1 end
+";
+        // Cursor on the declaration name itself, not a call site.
+        let text = at(src, "bump", 0).expect("hover");
+        assert!(text.contains("function bump(n: number): number"), "{text}");
+        assert!(text.contains("Adds one."), "{text}");
+    }
+
+    #[test]
+    fn global_function_use_hovers_as_its_signature() {
+        let src = "\
+---@param n number
+function bump(n) return n + 1 end
+bump(1)
+";
+        // The use site resolves to a global, routed through `global_hover`.
+        let text = at(src, "bump", 1).expect("hover");
+        assert!(text.contains("function bump(n: number)"), "{text}");
+    }
+
+    #[test]
+    fn global_class_name_hovers_as_a_class() {
+        let src = "\
+---A 2-D point.
+---@class Point
+---@field x number
+
+local alias = Point
+";
+        let text = at(src, "Point", 1).expect("hover");
+        assert!(text.contains("```lua\nclass Point\n```"), "{text}");
+        assert!(text.contains("A 2-D point."), "{text}");
+    }
+
+    #[test]
+    fn unknown_global_has_no_hover() {
+        // A global that is neither a declared function nor a class.
+        assert_eq!(at("print(nothing_here)\n", "nothing_here", 0), None);
+    }
+
+    #[test]
+    fn identifier_that_is_neither_a_name_use_nor_a_binding_has_no_hover() {
+        // A table-constructor key is an identifier with no resolution and no
+        // binding, so every hover route declines.
+        assert_eq!(at("local t = { key = 1 }\n", "key", 0), None);
+    }
+
+    #[test]
+    fn local_declaration_site_hovers_as_its_annotated_type() {
+        let src = "---the answer\n---@type number\nlocal answer = 42\n";
+        // The declaration name has no resolution; `binding_decl_at` answers.
+        let text = at(src, "answer = 42", 0).expect("hover");
+        assert!(text.contains("local answer: number"), "{text}");
+        assert!(text.contains("the answer"), "{text}");
+    }
+
+    #[test]
+    fn unannotated_local_renders_as_unknown() {
+        let src = "local thing = 42\nprint(thing)\n";
+        let text = at(src, "thing", 1).expect("hover");
+        assert!(text.contains("local thing: unknown"), "{text}");
+    }
+
+    #[test]
+    fn parameter_hovers_with_the_param_keyword() {
+        let src = "\
+---@param n number
+local function f(n) return n end
+";
+        let text = at(src, "n) return", 0).expect("hover");
+        assert!(text.contains("(param) n: number"), "{text}");
+    }
+
+    #[test]
+    fn self_parameter_hovers_with_the_param_keyword() {
+        let src = "\
+---@class Greeter
+local G = {}
+function G:greet() return self end
+";
+        let text = at(src, "self", 0).expect("hover");
+        assert!(text.starts_with("```lua\n(param) self:"), "{text}");
+    }
+
+    #[test]
+    fn for_variable_hovers_with_the_for_keyword() {
+        let src = "for i = 1, 10 do print(i) end\n";
+        let text = at(src, "i) end", 0).expect("hover");
+        assert!(text.contains("(for) i: unknown"), "{text}");
+    }
+
+    #[test]
+    fn method_call_name_hovers_as_the_class_field() {
+        let src = "\
+---@class Greeter
+---@field greet fun(self: Greeter): string the greeting
+
+---@type Greeter
+local g = nil
+g:greet()
+";
+        let text = at(src, "greet()", 0).expect("hover");
+        assert!(
+            text.contains("(field) Greeter.greet: fun(self: Greeter): string"),
+            "{text}"
+        );
+        assert!(text.contains("the greeting"), "{text}");
+    }
+
+    #[test]
+    fn optional_class_field_is_marked_with_a_question_mark() {
+        let src = "\
+---@class Config
+---@field debug? boolean
+
+---@type Config
+local cfg = nil
+print(cfg.debug)
+";
+        let text = at(src, "debug)", 0).expect("hover");
+        assert!(text.contains("(field) Config.debug?: boolean"), "{text}");
+    }
+
+    #[test]
+    fn field_receiver_hovers_as_its_own_binding_not_the_field() {
+        let src = "\
+---@class Point
+---@field x number
+
+---@type Point
+local p = nil
+print(p.x)
+";
+        // The cursor is on `p`, not on `x`: the member route must decline.
+        let text = at(src, "p.x", 0).expect("hover");
+        assert!(text.contains("local p: Point"), "{text}");
+    }
+
+    #[test]
+    fn dotted_function_without_a_class_falls_back_to_its_signature() {
+        let src = "\
+local M = {}
+---Helps.
+---@param n number
+---@return string
+function M.helper(n) return tostring(n) end
+M.helper(1)
+";
+        // `M` has no `---@class` type, so the dotted-name fallback answers.
+        let text = at(src, "helper(1)", 0).expect("hover");
+        assert!(
+            text.contains("function M.helper(n: number): string"),
+            "{text}"
+        );
+        assert!(text.contains("Helps."), "{text}");
+    }
+
+    #[test]
+    fn member_access_on_a_non_name_receiver_has_no_hover() {
+        // The receiver is a call expression, not a bare name.
+        assert_eq!(at("local t = f().field\n", "field", 0), None);
+    }
+
+    #[test]
+    fn unknown_field_on_a_known_class_has_no_hover() {
+        let src = "\
+---@class Point
+---@field x number
+
+---@type Point
+local p = nil
+print(p.z)
+";
+        assert_eq!(at(src, "z)", 0), None);
+    }
+
+    #[test]
+    fn hover_range_covers_exactly_the_identifier() {
+        let src = "local answer = 42\nprint(answer)\n";
+        let (analysis, path) = analyze(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let hovered = hover(&sema, offset_of(src, "answer", 1)).expect("hover");
+        let range = hovered.range.expect("range");
+        assert_eq!(range.start, lsp_types::Position::new(1, 6));
+        assert_eq!(range.end, lsp_types::Position::new(1, 12));
+    }
+
+    #[test]
+    fn see_lines_render_one_inline_and_several_as_bullets() {
+        assert_eq!(see_lines(&["a.b".to_string()]), "See: a.b");
+        assert_eq!(
+            see_lines(&["a.b".to_string(), "c.d".to_string()]),
+            "See:\n  * a.b\n  * c.d"
+        );
+        assert_eq!(see_lines(&[]), "See:");
+    }
+}

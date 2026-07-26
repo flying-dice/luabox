@@ -352,10 +352,266 @@ fn is_ident_byte(b: u8) -> bool {
     reason = "test code — panics document assumptions"
 )]
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "test code — panics document assumptions"
+)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    use super::{header_end, module_path};
+    use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
+
+    use super::{CompletionItem, CompletionItemKind, completion};
+    use super::{FileSema, header_end, module_path};
+
+    /// The workspace root every test file lives under.
+    fn root() -> PathBuf {
+        PathBuf::from(if cfg!(windows) { r"C:\ws" } else { "/ws" })
+    }
+
+    fn analyze(files: &[(&str, &str)]) -> (Analysis, PathBuf) {
+        let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
+        let mut first = None;
+        for (rel, text) in files {
+            let path = root().join(rel);
+            first.get_or_insert_with(|| path.clone());
+            host.apply_change(Change::SetFileText {
+                path,
+                dialect: Dialect::Lua54,
+                text: (*text).to_string(),
+            });
+        }
+        (host.snapshot(), first.expect("at least one file"))
+    }
+
+    /// Completions at the byte offset just past `needle` in the first file.
+    fn after(files: &[(&str, &str)], needle: &str) -> Vec<CompletionItem> {
+        let src = files[0].1;
+        let offset = src.find(needle).expect("needle present") + needle.len();
+        let (analysis, path) = analyze(files);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        completion(&sema, offset, &analysis, &root())
+    }
+
+    fn labels(items: &[CompletionItem]) -> Vec<&str> {
+        items.iter().map(|i| i.label.as_str()).collect()
+    }
+
+    fn item<'a>(items: &'a [CompletionItem], label: &str) -> &'a CompletionItem {
+        items
+            .iter()
+            .find(|i| i.label == label)
+            .unwrap_or_else(|| panic!("no `{label}` in {:?}", labels(items)))
+    }
+
+    #[test]
+    fn a_dot_with_no_receiver_offers_nothing() {
+        // A leading `.` has no identifier before it to resolve.
+        let items = after(&[("main.lua", "local x = 1\n.\n")], "\n.");
+        assert!(items.is_empty(), "{:?}", labels(&items));
+    }
+
+    #[test]
+    fn a_receiver_with_no_known_class_offers_nothing() {
+        let items = after(&[("main.lua", "local t = {}\nt.\n")], "t.");
+        assert!(items.is_empty(), "{:?}", labels(&items));
+    }
+
+    #[test]
+    fn a_colon_trigger_offers_only_function_typed_fields() {
+        let src = "\
+---@class Greeter
+---@field name string
+---@field greet fun(self: Greeter): string
+
+---@type Greeter
+local g = nil
+g:
+";
+        let items = after(&[("main.lua", src)], "g:");
+        assert_eq!(labels(&items), vec!["greet"], "{:?}", labels(&items));
+        assert_eq!(items[0].kind, Some(CompletionItemKind::METHOD));
+    }
+
+    #[test]
+    fn a_dot_trigger_offers_fields_and_functions_with_their_types() {
+        let src = "\
+---@class Greeter
+---@field name string
+---@field greet fun(self: Greeter): string
+
+---@type Greeter
+local g = nil
+g.
+";
+        let items = after(&[("main.lua", src)], "g.");
+        assert_eq!(
+            labels(&items),
+            vec!["greet", "name"],
+            "{:?}",
+            labels(&items)
+        );
+        assert_eq!(
+            item(&items, "greet").kind,
+            Some(CompletionItemKind::FUNCTION)
+        );
+        assert_eq!(item(&items, "name").kind, Some(CompletionItemKind::FIELD));
+        assert_eq!(
+            item(&items, "name").detail.as_deref(),
+            Some("Greeter.name: string")
+        );
+    }
+
+    #[test]
+    fn an_indexer_field_key_is_not_offered_as_a_member() {
+        let src = "\
+---@class Bag
+---@field [string] number
+---@field size number
+
+---@type Bag
+local b = nil
+b.
+";
+        let items = after(&[("main.lua", src)], "b.");
+        assert_eq!(labels(&items), vec!["size"], "{:?}", labels(&items));
+    }
+
+    #[test]
+    fn a_concat_operator_is_not_a_member_trigger() {
+        // `..` is concatenation, so scope completion applies, not members.
+        let items = after(&[("main.lua", "local s = \"a\"..\n")], "..");
+        assert!(labels(&items).contains(&"local"), "{:?}", labels(&items));
+    }
+
+    #[test]
+    fn scope_completion_offers_globals_functions_and_keywords() {
+        let src = "\
+answer = 1
+function helper(n) return n end
+function Cls:method() end
+local visible = 2
+
+";
+        let items = after(&[("main.lua", src)], "local visible = 2\n");
+        let names = labels(&items);
+        assert!(names.contains(&"answer"), "{names:?}");
+        assert!(names.contains(&"helper"), "{names:?}");
+        assert!(names.contains(&"visible"), "{names:?}");
+        assert!(names.contains(&"while"), "{names:?}");
+        // A method completes after `:`, never in plain scope.
+        assert!(!names.contains(&"Cls:method"), "{names:?}");
+        assert_eq!(
+            item(&items, "answer").kind,
+            Some(CompletionItemKind::VARIABLE)
+        );
+        assert_eq!(
+            item(&items, "helper").detail.as_deref(),
+            Some("function helper(n)")
+        );
+    }
+
+    #[test]
+    fn auto_require_needs_a_typed_prefix() {
+        // With no prefix the auto-require pass declines outright, so no item
+        // carries an import edit.
+        let files = [
+            ("main.lua", "local x = 1\n\n"),
+            (
+                "lib.lua",
+                "local M = {}\nfunction M.frobnicate() end\nreturn M\n",
+            ),
+        ];
+        let items = after(&files, "local x = 1\n");
+        assert!(
+            items.iter().all(|i| i.additional_text_edits.is_none()),
+            "{:?}",
+            labels(&items)
+        );
+    }
+
+    #[test]
+    fn auto_require_offers_an_unimported_module_export() {
+        let files = [
+            ("main.lua", "local x = 1\nfrob\n"),
+            (
+                "lib.lua",
+                "local M = {}\nfunction M.frobnicate() end\nreturn M\n",
+            ),
+        ];
+        let items = after(&files, "frob");
+        let offered = item(&items, "frobnicate");
+        assert_eq!(offered.kind, Some(CompletionItemKind::FUNCTION));
+        assert_eq!(offered.detail.as_deref(), Some("Auto import from \"lib\""));
+        let edits = offered
+            .additional_text_edits
+            .as_ref()
+            .expect("an import edit");
+        assert_eq!(edits.len(), 1);
+        assert!(
+            edits[0]
+                .new_text
+                .contains("local frobnicate = require(\"lib\").frobnicate"),
+            "{edits:?}"
+        );
+    }
+
+    #[test]
+    fn auto_require_skips_a_module_that_is_already_required() {
+        let files = [
+            ("main.lua", "local lib = require(\"lib\")\nfrob\n"),
+            (
+                "lib.lua",
+                "local M = {}\nfunction M.frobnicate() end\nreturn M\n",
+            ),
+        ];
+        let items = after(&files, "frob");
+        assert!(
+            !labels(&items).contains(&"frobnicate"),
+            "{:?}",
+            labels(&items)
+        );
+    }
+
+    #[test]
+    fn auto_require_skips_a_name_already_visible_in_scope() {
+        let files = [
+            ("main.lua", "local frobnicate = 1\nfrob\n"),
+            (
+                "lib.lua",
+                "local M = {}\nfunction M.frobnicate() end\nreturn M\n",
+            ),
+        ];
+        // Anchor past the declaration: the bare `frob` prefix on line 1.
+        let items = after(&files, "1\nfrob");
+        assert!(
+            item(&items, "frobnicate").additional_text_edits.is_none(),
+            "the in-scope local wins"
+        );
+    }
+
+    #[test]
+    fn auto_require_skips_a_module_with_no_table_export() {
+        let files = [
+            ("main.lua", "local x = 1\nfrob\n"),
+            ("lib.lua", "return 42\n"),
+        ];
+        let items = after(&files, "frob");
+        assert!(
+            items.iter().all(|i| i.additional_text_edits.is_none()),
+            "{:?}",
+            labels(&items)
+        );
+    }
+
+    #[test]
+    fn a_cursor_past_the_end_of_the_file_is_clamped() {
+        let src = "local x = 1\n";
+        let (analysis, path) = analyze(&[("main.lua", src)]);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let items = completion(&sema, src.len() + 500, &analysis, &root());
+        assert!(labels(&items).contains(&"x"), "{:?}", labels(&items));
+    }
 
     #[test]
     fn module_path_reverses_require_resolution() {

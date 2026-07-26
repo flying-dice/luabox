@@ -8,6 +8,13 @@ for the format releases are documented in, and
 [`.github/workflows/release.yml`](.github/workflows/release.yml) for the
 automation this process drives.
 
+Last released: **0.1.4** (2026-07-14). Next up: **0.2.0**, the v1 scope cut —
+a breaking minor under the 0.x policy below, since it removes commands (see
+[DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26)). Nothing in
+this process publishes to a package registry: releases are GitHub Release
+assets plus the install one-liners, and luabox holds no publishing
+credential of its own.
+
 ## Process
 
 1. **Confirm `main` is green.** CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml),
@@ -19,9 +26,10 @@ automation this process drives.
    so `Cargo.lock` picks up the bump.
 3. **Finalize `CHANGELOG.md`.**
    - Move anything sitting under `## [Unreleased]` into a new
-     `## [x.y.z] - YYYY-MM-DD` entry (or, for the first release, replace
-     the `## [0.1.0] - drafted, unreleased` header's suffix with the real
-     date).
+     `## [x.y.z] - YYYY-MM-DD` entry. Where an entry is already drafted
+     ahead of the tag — as `## [0.2.0] - 2026-07-26 (unreleased)` is —
+     drop the `(unreleased)` suffix and correct the date to the release
+     day.
    - Leave `## [Unreleased]` in place, empty, for the next round of
      changes.
    - This section is what the release workflow extracts verbatim as the
@@ -45,8 +53,13 @@ automation this process drives.
      Windows x86_64 — computes `SHA256SUMS`, and uploads them (with the
      `scripts/install.*` one-liners) as release assets.
    - **Smoke-installs** the freshly published binary on all three OSes via
-     the one-line installers, and **only then marks the release as
-     `latest`.** A release that fails any of the three smoke installs does
+     the one-line installers, drives it against a scaffolded probe project
+     (`check` must flag a deliberate LB0300 non-zero and pass a clean
+     file), probes `--help`/`explain`/`fmt --check`/`lint`/`doc`, answers
+     an LSP `initialize` handshake, and exercises `luabox upgrade` plus its
+     failure cases — and **only then marks the release as `latest`.** The
+     smoke legs need no credentials and no sign-in step; release-download
+     URLs are public. A release that fails any of the three smoke legs does
      not go latest — the installers keep resolving the previous good
      release until the failure is fixed and a new tag is cut.
 7. **Verify.** Once the workflow finishes, check the
@@ -54,6 +67,7 @@ automation this process drives.
    for the new release, its assets, and that it is marked latest;
    spot-check `scripts/install.sh`/`scripts/install.ps1` resolve and install
    it.
+
 ## Editor extensions
 
 The editor integrations live in their own repos, version independently, and
@@ -70,24 +84,29 @@ attaches them:
   release workflow builds the plugin `.zip` for install-from-disk;
   JetBrains Marketplace publishing likewise needs a vendor account/token.
 
-Cut extension releases when *their* code changes; a toolchain release does
+Cut extension releases when *their* code changes; a `luabox` release does
 not require an extension release (the extensions track the `luabox` binary
-on PATH, whatever its version).
+on PATH, whatever its version). One exception worth knowing for 0.2.0: the
+extensions' "Sign in with GitHub" affordance lost its backing command with
+`luabox login`, so an extension release is needed to *remove* it — but that
+is an extension-side change, cut on their schedule.
 
 ## SemVer policy for 0.x
 
 Standard SemVer (`https://semver.org`) applies, with the usual 0.x
 looseness made explicit rather than left ambiguous:
 
-- **While the major version is `0`,** minor version bumps (`0.1.0` →
+- **While the major version is `0`,** minor version bumps (`0.1.4` →
   `0.2.0`) may contain breaking changes to:
   - CLI flags and subcommand behavior (`luabox.toml` shape, flag names,
-    default values, output formats).
+    default values, output formats) — **including removing subcommands
+    outright**, which is exactly what 0.2.0 does to the dependency,
+    credential and execution commands.
   - Type-checking semantics — as the LuaCATS-strictness launch gate lands
     (see [DIRECTION.md](DIRECTION.md)), diagnostics that didn't fire
     before may start firing, and vice versa. A 0.x bump is fair warning,
     not a stability promise on checker output.
-  - Patch bumps (`0.1.0` → `0.1.1`) are reserved for backwards-compatible
+  - Patch bumps (`0.2.0` → `0.2.1`) are reserved for backwards-compatible
     fixes only, same as post-1.0 SemVer.
 - **The LuaCATS annotation surface itself is not luabox's to version.**
   `---@class`/`---@field`/etc. follow the upstream lua-language-server

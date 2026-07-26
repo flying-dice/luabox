@@ -12,5 +12,3 @@ strict = true
 # Ambient LuaCATS definitions: resolves defs/geometry.d.lua by its file stem
 # (the same mechanism love-asteroids-lite uses for defs/love2d.d.lua).
 defs = ["geometry"]
-
-[dependencies]

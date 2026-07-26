@@ -1036,4 +1036,192 @@ mod tests {
         assert!(!lonely.contains("<h2>Subclasses</h2>"));
         assert!(!lonely.contains("<h2>Implementors</h2>"));
     }
+
+    /// A model whose single module carries an alias, an enum and a class
+    /// with scoped/optional/inherited fields — the page sections the
+    /// fixture above doesn't reach.
+    fn rich_model() -> DocModel {
+        let module = model::lua_module(
+            "shapes",
+            "--- Shape helpers.\n\
+             \n\
+             --- How a shape is aligned.\n\
+             ---@alias Align\n\
+             ---| \"left\" # towards the start\n\
+             ---| \"right\"\n\
+             \n\
+             ---@alias Scalar number\n\
+             \n\
+             --- Colour codes.\n\
+             ---@enum Colour\n\
+             local Colour = { red = 1 }\n\
+             \n\
+             ---@enum (key) Named\n\
+             local Named = { a = 1 }\n\
+             \n\
+             ---@class Base\n\
+             ---@field id integer the identifier\n\
+             local Base = {}\n\
+             \n\
+             ---@class (exact) Derived: Base\n\
+             ---@field private secret string\n\
+             ---@field maybe? Align\n\
+             local Derived = {}\n\
+             \n\
+             ---@return Scalar\n\
+             function Derived:size()\n  return 1\nend\n",
+            Dialect::Lua54,
+        );
+        DocModel {
+            package: "shapes".to_string(),
+            modules: vec![module],
+        }
+    }
+
+    #[test]
+    fn links_cover_aliases_and_enums_as_module_page_anchors() {
+        let links = build_links(&rich_model());
+        assert_eq!(
+            links.get("Align").map(String::as_str),
+            Some("module.shapes.html#alias.Align")
+        );
+        assert_eq!(
+            links.get("Colour").map(String::as_str),
+            Some("module.shapes.html#enum.Colour")
+        );
+        assert_eq!(
+            links.get("Base").map(String::as_str),
+            Some("class.Base.html")
+        );
+    }
+
+    #[test]
+    fn the_module_page_renders_alias_members_and_enum_key_form() {
+        let model = rich_model();
+        let pages = pages(&model);
+        let module = &pages
+            .iter()
+            .find(|(name, _)| name == "module.shapes.html")
+            .expect("module page")
+            .1;
+
+        assert!(module.contains("<h2>Aliases</h2>"), "{module}");
+        assert!(module.contains("id=\"alias.Align\""), "{module}");
+        assert!(module.contains("towards the start"), "{module}");
+        // The single-line alias form renders its aliased type.
+        assert!(module.contains("alias Scalar = "), "{module}");
+
+        assert!(module.contains("<h2>Enums</h2>"), "{module}");
+        assert!(module.contains("id=\"enum.Colour\""), "{module}");
+        assert!(module.contains("enum Named (key)"), "{module}");
+    }
+
+    #[test]
+    fn a_class_page_shows_exactness_scoped_fields_and_inherited_fields() {
+        let model = rich_model();
+        let pages = pages(&model);
+        let derived = &pages
+            .iter()
+            .find(|(name, _)| name == "class.Derived.html")
+            .expect("class page")
+            .1;
+
+        assert!(derived.contains("exact"), "{derived}");
+        assert!(derived.contains("extends"), "{derived}");
+        // Scope and optionality are rendered into the field name column.
+        assert!(derived.contains("private secret"), "{derived}");
+        assert!(derived.contains("maybe?"), "{derived}");
+        assert!(
+            derived.contains("Fields inherited from"),
+            "the parent's fields must be listed:\n{derived}"
+        );
+        assert!(derived.contains("<h2>Methods</h2>"), "{derived}");
+    }
+
+    #[test]
+    fn every_page_name_is_unique_so_no_page_can_clobber_another() {
+        let model = rich_model();
+        let pages = pages(&model);
+        let mut names: Vec<&str> = pages.iter().map(|(n, _)| n.as_str()).collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count, "duplicate page name in {names:?}");
+        assert!(names.contains(&"index.html"));
+    }
+
+    #[test]
+    fn a_page_name_is_filesystem_safe_even_for_an_awkward_class_name() {
+        // `slug` keeps `.`/`-`/`_` and replaces everything else, so a
+        // generic or namespaced name can never escape the output directory.
+        assert_eq!(slug("geometry.Circle"), "geometry.Circle");
+        assert_eq!(slug("Map<string, number>"), "Map-string--number-");
+        assert_eq!(slug("a/../b"), "a-..-b");
+        assert!(!class_file("a/b").contains('/'));
+    }
+
+    #[test]
+    fn the_search_index_escapes_everything_that_could_break_out_of_a_script_block() {
+        // `json_str` escapes `<` so the payload is safe verbatim inside
+        // `<script>`, plus the usual JSON control characters.
+        let module = model::lua_module(
+            "tricky",
+            "--- Handles </script> and \"quotes\" and a\\backslash.\n\
+             local function f()\nend\n\
+             return f\n",
+            Dialect::Lua54,
+        );
+        let model = DocModel {
+            package: "tricky".to_string(),
+            modules: vec![module],
+        };
+        let json = search_index_json(&model);
+        assert!(!json.contains("</script>"), "{json}");
+        assert!(json.contains("\\u003c"), "{json}");
+        serde_json::from_str::<serde_json::Value>(&json).expect("valid JSON");
+    }
+
+    #[test]
+    fn the_search_index_carries_an_entry_per_alias_enum_and_method() {
+        let json = search_index_json(&rich_model());
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let kinds: Vec<(String, String)> = parsed
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|e| {
+                (
+                    e["name"].as_str().unwrap_or_default().to_owned(),
+                    e["kind"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
+        for expected in [
+            ("shapes", "module"),
+            ("Align", "alias"),
+            ("Colour", "enum"),
+            ("Base", "class"),
+            ("Derived:size", "method"),
+        ] {
+            assert!(
+                kinds
+                    .iter()
+                    .any(|(n, k)| n == expected.0 && k == expected.1),
+                "missing {expected:?} in {kinds:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_model_still_renders_a_usable_index_page() {
+        let model = DocModel {
+            package: "empty".to_string(),
+            modules: Vec::new(),
+        };
+        let pages = pages(&model);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].0, "index.html");
+        assert!(pages[0].1.contains("Package empty"));
+        assert_eq!(search_index_json(&model), "[]");
+    }
 }

@@ -439,4 +439,92 @@ mod tests {
         assert!(out.contains("error[LB0001]: boom"), "{out}");
         assert!(out.contains("missing.lua"), "{out}");
     }
+
+    #[test]
+    fn a_label_with_no_message_renders_a_bare_underline() {
+        let code: Code = "LB0001".parse().unwrap();
+        // With source: the caret row carries no trailing message.
+        let with_source = Diagnostic::error(code, "boom")
+            .with_label(Label::primary(Span::new("main.lua", 18..19), ""));
+        let out = render(&[with_source], Format::Human, &lookup);
+        assert!(out.contains(" --> main.lua:2:7"), "{out}");
+        assert!(out.contains("|       ^\n"), "{out}");
+        assert!(!out.contains("^ "), "no trailing message: {out}");
+
+        // Without source: only the location line, no message line under it.
+        let no_source = Diagnostic::error(code, "boom")
+            .with_label(Label::primary(Span::new("nowhere.lua", 0..3), ""));
+        let out = render(&[no_source], Format::Human, &lookup);
+        assert_eq!(out, "error[LB0001]: boom\n --> nowhere.lua (bytes 0..3)\n");
+    }
+
+    #[test]
+    fn a_diagnostic_with_no_labels_renders_in_every_format() {
+        let code: Code = "LB0001".parse().unwrap();
+        let bare = Diagnostic::warning(code, "no location for this one");
+
+        let human = render(std::slice::from_ref(&bare), Format::Human, &lookup);
+        assert_eq!(human, "warning[LB0001]: no location for this one\n");
+
+        // GitHub Actions: no `file=`/`line=` properties, so no space either.
+        let gha = render(std::slice::from_ref(&bare), Format::GithubActions, &lookup);
+        assert_eq!(gha, "::warning::LB0001: no location for this one\n");
+
+        // GitLab: empty path and a begin line of 0, plus a stable fingerprint
+        // over the label-less identity.
+        let gitlab = render(
+            std::slice::from_ref(&bare),
+            Format::GitlabCodeQuality,
+            &lookup,
+        );
+        let value: serde_json::Value = serde_json::from_str(&gitlab).unwrap();
+        assert_eq!(value[0]["location"]["path"], "");
+        assert_eq!(value[0]["location"]["lines"]["begin"], 0);
+        let fingerprint = value[0]["fingerprint"].as_str().unwrap().to_owned();
+        assert_eq!(fingerprint.len(), 16);
+        let again = render(&[bare], Format::GitlabCodeQuality, &lookup);
+        let value2: serde_json::Value = serde_json::from_str(&again).unwrap();
+        assert_eq!(value2[0]["fingerprint"], fingerprint);
+    }
+
+    #[test]
+    fn a_label_whose_file_has_no_source_falls_back_in_github_actions() {
+        let code: Code = "LB0001".parse().unwrap();
+        // `unknown.lua` is not in the lookup table: the file property is still
+        // emitted, but there is no line/col to compute.
+        let diag = Diagnostic::error(code, "boom")
+            .with_label(Label::primary(Span::new("unknown.lua", 0..3), "here"));
+        let out = render(&[diag], Format::GithubActions, &lookup);
+        assert_eq!(out, "::error file=unknown.lua::LB0001: boom\n");
+    }
+
+    #[test]
+    fn sarif_lists_each_rule_once_however_often_its_code_repeats() {
+        let code: Code = "LB0001".parse().unwrap();
+        let diags = vec![
+            Diagnostic::error(code, "first")
+                .with_label(Label::primary(Span::new("main.lua", 18..19), "a")),
+            Diagnostic::error(code, "second")
+                .with_label(Label::primary(Span::new("main.lua", 12..17), "b")),
+        ];
+        let out = render(&diags, Format::Sarif, &lookup);
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let rules = value["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .unwrap();
+        assert_eq!(rules.len(), 1, "one rule for two same-code results");
+        assert_eq!(rules[0]["id"], "LB0001");
+        assert_eq!(value["runs"][0]["results"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn github_command_messages_escape_reserved_characters() {
+        let code: Code = "LB0001".parse().unwrap();
+        let diag = Diagnostic::error(code, "100% broken\nsecond line\rthird");
+        let out = render(&[diag], Format::GithubActions, &lookup);
+        assert_eq!(
+            out,
+            "::error::LB0001: 100%25 broken%0Asecond line%0Dthird\n"
+        );
+    }
 }

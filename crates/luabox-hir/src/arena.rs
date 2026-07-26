@@ -142,3 +142,97 @@ impl<T> IndexMut<Idx<T>> for Arena<T> {
         &mut self.data[index.raw as usize]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    use super::*;
+
+    fn hash_of<H: Hash>(value: &H) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn alloc_returns_handles_in_allocation_order() {
+        let mut arena = Arena::new();
+        let a = arena.alloc("a");
+        let b = arena.alloc("b");
+        assert_eq!(a.raw(), 0);
+        assert_eq!(b.raw(), 1);
+        assert_eq!(arena[a], "a");
+        assert_eq!(arena[b], "b");
+    }
+
+    #[test]
+    fn a_fresh_arena_is_empty_and_default_matches_new() {
+        let mut arena: Arena<u8> = Arena::default();
+        assert!(arena.is_empty());
+        assert_eq!(arena.len(), 0);
+        assert_eq!(arena.iter().count(), 0);
+
+        arena.alloc(7);
+        assert!(!arena.is_empty());
+        assert_eq!(arena.len(), 1);
+    }
+
+    #[test]
+    fn index_mut_writes_through_the_handle() {
+        let mut arena = Arena::new();
+        let id = arena.alloc(1_u32);
+        arena[id] += 41;
+        assert_eq!(arena[id], 42);
+    }
+
+    #[test]
+    fn iter_pairs_each_value_with_its_own_handle() {
+        let mut arena = Arena::new();
+        let ids: Vec<_> = (0..3).map(|i| arena.alloc(i * 10)).collect();
+        let seen: Vec<_> = arena.iter().map(|(id, v)| (id, *v)).collect();
+        assert_eq!(seen, vec![(ids[0], 0), (ids[1], 10), (ids[2], 20)]);
+    }
+
+    #[test]
+    fn idx_orders_and_hashes_by_its_raw_index() {
+        let mut arena = Arena::new();
+        let a = arena.alloc('a');
+        let b = arena.alloc('b');
+
+        assert!(a < b);
+        assert_eq!(a.cmp(&b), std::cmp::Ordering::Less);
+        assert_eq!(b.cmp(&a), std::cmp::Ordering::Greater);
+        assert_eq!(a.cmp(&a), std::cmp::Ordering::Equal);
+        assert_eq!(a.partial_cmp(&b), Some(std::cmp::Ordering::Less));
+
+        let mut sorted = vec![b, a];
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![a, b]);
+
+        // Equal handles hash equally, which is what the side tables keyed by
+        // `Idx` (source map, resolutions) rely on.
+        assert_eq!(hash_of(&a), hash_of(&Idx::<char>::from_raw(a.raw())));
+        assert_ne!(hash_of(&a), hash_of(&b));
+    }
+
+    #[test]
+    fn idx_is_copy_and_compares_structurally_not_by_identity() {
+        let a = Idx::<u8>::from_raw(3);
+        let copy = a;
+        #[expect(
+            clippy::clone_on_copy,
+            reason = "exercises the hand-written Clone impl"
+        )]
+        let cloned = a.clone();
+        assert_eq!(a, copy);
+        assert_eq!(a, cloned);
+        assert_ne!(a, Idx::<u8>::from_raw(4));
+    }
+
+    #[test]
+    fn idx_debug_shows_the_raw_index_without_the_element_type() {
+        assert_eq!(format!("{:?}", Idx::<String>::from_raw(12)), "Idx(12)");
+    }
+}

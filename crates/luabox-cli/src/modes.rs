@@ -548,6 +548,165 @@ mod tests {
         );
     }
 
+    /// Whether `haystack` contains `needle` as a raw byte run. Zip archives
+    /// store entry names uncompressed in the local file header and central
+    /// directory, so this checks archive membership without depending on any
+    /// particular unzip tool being installed.
+    fn contains_bytes(haystack: &[u8], needle: &str) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|w| w == needle.as_bytes())
+    }
+
+    #[test]
+    fn love_packaging_writes_the_bundle_verbatim_as_the_archive_root_main_lua() {
+        let project = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(project.path().join("src")).expect("mkdir src");
+        fs::write(project.path().join("src").join("main.lua"), "return 0\n").expect("write entry");
+
+        let out = tempfile::tempdir().expect("tempdir");
+        let bundle_text = "function love.draw() end\n";
+        let dest = emit_love(
+            project.path(),
+            out.path(),
+            "mygame",
+            bundle_text,
+            Dialect::Lua54,
+            Dialect::Lua54,
+        )
+        .expect("emit_love succeeds");
+
+        assert_eq!(dest, out.path().join("mygame.love"));
+        let bytes = fs::read(&dest).expect("read the archive");
+        // A zip local file header always starts `PK\x03\x04`.
+        assert_eq!(&bytes[..4], b"PK\x03\x04", "not a zip archive");
+        assert!(contains_bytes(&bytes, "main.lua"));
+    }
+
+    #[test]
+    fn love_packaging_bundles_conf_lua_separately_at_the_archive_root() {
+        let project = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(project.path().join("src")).expect("mkdir src");
+        fs::write(
+            project.path().join("src").join("conf.lua"),
+            "function love.conf(t) t.window.title = \"x\" end\n",
+        )
+        .expect("write conf.lua");
+
+        let out = tempfile::tempdir().expect("tempdir");
+        let dest = emit_love(
+            project.path(),
+            out.path(),
+            "mygame",
+            "return 0\n",
+            Dialect::Lua54,
+            Dialect::Lua54,
+        )
+        .expect("emit_love succeeds");
+
+        // LÖVE runs `conf.lua` in an isolated environment before `main.lua`
+        // loads, so it must be its own archive-root file.
+        let bytes = fs::read(&dest).expect("read the archive");
+        assert!(contains_bytes(&bytes, "conf.lua"));
+        assert!(contains_bytes(&bytes, "main.lua"));
+    }
+
+    #[test]
+    fn love_packaging_copies_the_assets_directory_into_the_archive() {
+        let project = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(project.path().join("assets").join("sfx")).expect("mkdir assets");
+        fs::write(project.path().join("assets").join("logo.txt"), b"logo").expect("write asset");
+        fs::write(
+            project.path().join("assets").join("sfx").join("beep.txt"),
+            b"beep",
+        )
+        .expect("write nested asset");
+
+        let out = tempfile::tempdir().expect("tempdir");
+        let dest = emit_love(
+            project.path(),
+            out.path(),
+            "mygame",
+            "return 0\n",
+            Dialect::Lua54,
+            Dialect::Lua54,
+        )
+        .expect("emit_love succeeds");
+
+        let bytes = fs::read(&dest).expect("read the archive");
+        // Forward-slash entry separators are the ZIP spec and what
+        // `love.filesystem` expects (ticket #75).
+        assert!(contains_bytes(&bytes, "assets/logo.txt"));
+        assert!(contains_bytes(&bytes, "assets/sfx/beep.txt"));
+    }
+
+    #[test]
+    fn love_packaging_creates_the_output_directory_when_it_does_not_exist() {
+        let project = tempfile::tempdir().expect("tempdir");
+        let out = tempfile::tempdir().expect("tempdir");
+        let nested = out.path().join("deep").join("dist");
+
+        let dest = emit_love(
+            project.path(),
+            &nested,
+            "mygame",
+            "return 0\n",
+            Dialect::Lua54,
+            Dialect::Lua54,
+        )
+        .expect("emit_love succeeds");
+        assert!(dest.is_file());
+    }
+
+    #[test]
+    fn zipping_an_empty_staging_directory_is_an_error_naming_the_destination() {
+        let stage = tempfile::tempdir().expect("tempdir");
+        let out = tempfile::tempdir().expect("tempdir");
+        let dest = out.path().join("empty.love");
+
+        let error = zip_directory(stage.path(), &dest).unwrap_err().to_string();
+        assert!(error.contains("nothing to package"), "{error}");
+        assert!(error.contains("empty.love"), "{error}");
+    }
+
+    #[test]
+    fn a_tool_that_is_not_on_path_does_not_probe_as_runnable() {
+        assert!(!which("luabox-definitely-not-a-real-tool-xyzzy"));
+    }
+
+    #[test]
+    fn powershell_quoting_doubles_embedded_single_quotes() {
+        assert_eq!(ps_quote("C:/plain/path"), "'C:/plain/path'");
+        assert_eq!(ps_quote("it's here"), "'it''s here'");
+        assert_eq!(ps_quote(""), "''");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn the_windows_bundled_bsdtar_is_never_located_off_windows() {
+        assert_eq!(system_bsdtar(), None);
+    }
+
+    #[test]
+    fn the_plugin_bootstrap_stub_documents_the_lazy_require_convention() {
+        let stub = plugin_bootstrap_stub("mypkg");
+        assert!(stub.contains("require(\"mypkg\")"), "{stub}");
+        assert!(stub.contains("Does nothing by default"), "{stub}");
+        // Every line is a Lua comment: sourcing it has no side effects.
+        for line in stub.lines().filter(|l| !l.trim().is_empty()) {
+            assert!(line.trim_start().starts_with("--"), "{line}");
+        }
+    }
+
+    #[test]
+    fn the_doc_stub_has_the_tag_header_and_trailing_modeline_helptags_needs() {
+        let doc = doc_stub("mypkg", Some("does things"));
+        assert!(doc.starts_with("*mypkg.txt*"), "{doc}");
+        assert!(doc.contains("*mypkg*"), "{doc}");
+        assert!(doc.contains("======"), "{doc}");
+        assert!(doc.trim_end().ends_with("ft=help:norl:"), "{doc}");
+    }
+
     #[test]
     fn copy_dir_recursive_preserves_nested_structure() {
         let src = tempfile::tempdir().expect("tempdir");

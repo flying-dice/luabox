@@ -31,6 +31,71 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  # Dual line-coverage gates (cargo-llvm-cov), measured as two ISOLATED
+  # suites so each style of testing independently guarantees behaviour:
+  #   - unit: every in-process test (libs, bins, per-crate tests/) with the
+  #     cucumber e2e binaries excluded. Floor 95 (measured 96.9%).
+  #   - e2e: the black-box cucumber suites alone (acceptance +
+  #     lsp_acceptance driving the real binary). Floor 72 (measured 74.6%).
+  # Raise a floor as its number rises — never lower one to make a PR pass.
+  # Each job uploads its lcov as an artifact for inspection.
+  coverage-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+          components: llvm-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage-unit
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - run: >
+          cargo llvm-cov --no-report
+          -p luabox-bundle -p luabox-db -p luabox-diag -p luabox-hir
+          -p luabox-lint -p luabox-lower -p luabox-lsp -p luabox-resolve
+          -p luabox-syntax -p luabox-types
+      - run: >
+          cargo llvm-cov --no-report
+          -p luabox-cli --bins --test cross_package_defs --test watch
+      - run: cargo llvm-cov report --fail-under-lines 95
+      - run: cargo llvm-cov report --lcov --output-path lcov-unit.info
+        if: always()
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-unit-lcov
+          path: lcov-unit.info
+
+  coverage-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+          components: llvm-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage-e2e
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - run: >
+          cargo llvm-cov --no-report
+          -p luabox-cli --test acceptance --test lsp_acceptance
+      - run: cargo llvm-cov report --fail-under-lines 72
+      - run: cargo llvm-cov report --lcov --output-path lcov-e2e.info
+        if: always()
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-e2e-lcov
+          path: lcov-e2e.info
+
   # SPEC.md §16.1 — perf gates are CI-blocking: cold start < 50 ms, and
   # (until `luabox check` lands, ticket #6) a `fmt --check` throughput
   # proxy on a ~100-kLOC synthetic corpus < 2 s warm. See
@@ -55,8 +120,9 @@ jobs:
           LUABOX_PERF_FACTOR: "4.0"
 
   # Every example project under examples/ must pass check + fmt --check + lint
-  # cleanly against the real binary, plus its per-example extras (install,
-  # build, bundle, .love packaging, tests). See scripts/examples.sh.
+  # cleanly against the real binary, plus its per-example extras (build,
+  # bundle, .love packaging) and executing the built bundle on lua5.1. See
+  # scripts/examples.sh.
   examples:
     runs-on: ubuntu-latest
     steps:
@@ -68,6 +134,12 @@ jobs:
         with:
           key: examples
       - run: cargo build --release --bin luabox
-      - name: Install Lua 5.1 and unzip
-        run: sudo apt-get update && sudo apt-get install -y lua5.1 unzip
+      # `unzip` inspects the .love archive. `lua5.1` executes the timemachine
+      # bundle the script just built (a 5.4 source lowered to minified 5.1):
+      # CI executes the compiler's output to verify it, because a compiler
+      # whose emit is never run is only checked against its own opinion of it.
+      # The product itself still never runs Lua — the interpreter belongs to
+      # this harness, and the script SKIPs the run step when it is absent.
+      - name: Install unzip and lua5.1
+        run: sudo apt-get update && sudo apt-get install -y unzip lua5.1
       - run: bash scripts/examples.sh

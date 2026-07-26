@@ -849,3 +849,648 @@ pub fn render_type(ty: &TypeExpr) -> String {
         TypeExprKind::Error => "?".to_string(),
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::string_slice,
+    clippy::panic,
+    reason = "test code — panics document assumptions"
+)]
+mod tests {
+    use super::*;
+
+    use luabox_db::{AnalysisHost, Change, Dialect, Strictness};
+    use luabox_syntax::luacats::Span;
+
+    fn analyze(text: &str) -> (Analysis, PathBuf) {
+        let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
+        let path = Path::new(if cfg!(windows) {
+            r"C:\ws\main.lua"
+        } else {
+            "/ws/main.lua"
+        })
+        .to_path_buf();
+        host.apply_change(Change::SetFileText {
+            path: path.clone(),
+            dialect: Dialect::Lua54,
+            text: text.to_string(),
+        });
+        (host.snapshot(), path)
+    }
+
+    fn sema_of(text: &str) -> (Analysis, PathBuf) {
+        analyze(text)
+    }
+
+    /// Byte offset just inside the `nth` (0-based) occurrence of `needle`.
+    fn offset_of(text: &str, needle: &str, nth: usize) -> usize {
+        let mut from = 0;
+        for _ in 0..nth {
+            from = text[from..].find(needle).expect("occurrence") + from + 1;
+        }
+        text[from..].find(needle).expect("occurrence") + from
+    }
+
+    /// Parse `source` as the type of a `---@type` tag.
+    fn parse_ty(source: &str) -> TypeExpr {
+        let block = luabox_syntax::luacats::parse_block(&format!("---@type {source}"), 0);
+        block
+            .tags
+            .iter()
+            .find_map(|tag| match tag {
+                Tag::Type(t) => t.types.first().cloned(),
+                _ => None,
+            })
+            .expect("a @type tag with one type")
+    }
+
+    /// `---@type T` round-tripped back through [`render_type`].
+    fn round_trip(source: &str) -> String {
+        render_type(&parse_ty(source))
+    }
+
+    // === render_type ======================================================
+
+    #[test]
+    fn render_type_round_trips_every_shape() {
+        assert_eq!(round_trip("string"), "string");
+        assert_eq!(round_trip("table<string, number>"), "table<string, number>");
+        assert_eq!(round_trip("string?"), "string?");
+        assert_eq!(round_trip("string[]"), "string[]");
+        assert_eq!(round_trip("string|number|nil"), "string|number|nil");
+        assert_eq!(round_trip("[string, number]"), "[string, number]");
+        assert_eq!(round_trip("(string)"), "(string)");
+        assert_eq!(round_trip("`T`"), "`T`");
+        assert_eq!(round_trip("true"), "true");
+        assert_eq!(round_trip("false"), "false");
+        assert_eq!(round_trip("42"), "42");
+        assert_eq!(round_trip("\"lit\""), "\"lit\"");
+    }
+
+    #[test]
+    fn render_type_renders_table_literal_fields_and_indexers() {
+        assert_eq!(
+            round_trip("{ name: string, age?: number, [string]: boolean }"),
+            "{ name: string, age?: number, [string]: boolean }"
+        );
+    }
+
+    #[test]
+    fn render_type_renders_function_types_with_params_and_returns() {
+        assert_eq!(round_trip("fun()"), "fun()");
+        assert_eq!(
+            round_trip("fun(a: string, b): boolean"),
+            "fun(a: string, b): boolean"
+        );
+        assert_eq!(
+            round_trip("fun(...: number): boolean, string"),
+            "fun(...: number): boolean, string"
+        );
+    }
+
+    #[test]
+    fn render_type_renders_a_malformed_type_as_a_question_mark() {
+        let ty = TypeExpr {
+            kind: TypeExprKind::Error,
+            span: Span::new(0, 0),
+        };
+        assert_eq!(render_type(&ty), "?");
+    }
+
+    // === Type-expression peeling ==========================================
+
+    #[test]
+    fn named_of_peels_optional_and_parens() {
+        assert_eq!(named_of(&parse_ty("Point")).as_deref(), Some("Point"));
+        assert_eq!(named_of(&parse_ty("Point?")).as_deref(), Some("Point"));
+        assert_eq!(named_of(&parse_ty("(Point)")).as_deref(), Some("Point"));
+        assert_eq!(named_of(&parse_ty("Point[]")), None);
+    }
+
+    #[test]
+    fn is_function_type_peels_optional_and_parens() {
+        assert!(is_function_type(&parse_ty("fun()")));
+        assert!(is_function_type(&parse_ty("fun()?")));
+        assert!(is_function_type(&parse_ty("(fun())")));
+        assert!(!is_function_type(&parse_ty("string")));
+    }
+
+    #[test]
+    fn as_function_type_peels_optional_and_parens() {
+        let ty = parse_ty("(fun(a: string): number)?");
+        let (params, returns) = as_function_type(&ty).expect("a function type");
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, "a");
+        assert_eq!(returns.len(), 1);
+        assert_eq!(as_function_type(&parse_ty("string")), None);
+    }
+
+    // === ident_at =========================================================
+
+    #[test]
+    fn ident_at_past_the_end_of_the_file_is_none() {
+        let src = "local x = 1\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        assert!(sema.ident_at(src.len() + 100).is_none());
+    }
+
+    #[test]
+    fn ident_at_in_an_empty_file_is_none() {
+        let (analysis, path) = sema_of("");
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        assert!(sema.ident_at(0).is_none());
+    }
+
+    #[test]
+    fn ident_at_on_a_non_identifier_token_is_none() {
+        let src = "local x = 1\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        // The `=` operator.
+        assert!(sema.ident_at(offset_of(src, "=", 0)).is_none());
+    }
+
+    #[test]
+    fn ident_at_between_two_tokens_prefers_the_identifier_on_the_left() {
+        let src = "local abc = 1\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        // The boundary right after `abc`.
+        let token = sema.ident_at(offset_of(src, " = 1", 0)).expect("ident");
+        assert_eq!(token.text(), "abc");
+    }
+
+    // === binding_type =====================================================
+
+    #[test]
+    fn binding_type_reads_the_matching_param_annotation() {
+        let src = "---@param n number\n---@param s string\nlocal function f(n, s) end\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let id = sema
+            .binding_decl_at(offset_of(src, "s) end", 0))
+            .expect("binding");
+        let ty = sema.binding_type(sema.binding(id)).expect("type");
+        assert_eq!(render_type(&ty), "string");
+    }
+
+    #[test]
+    fn binding_type_of_an_unannotated_local_is_none() {
+        let src = "---just a doc line\nlocal x = 1\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let id = sema
+            .binding_decl_at(offset_of(src, "x = 1", 0))
+            .expect("binding");
+        assert!(sema.binding_type(sema.binding(id)).is_none());
+    }
+
+    #[test]
+    fn multi_name_type_annotation_matches_names_positionally() {
+        let src = "---@type number, string\nlocal a, b = 1, \"s\"\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let a = sema.binding_decl_at(offset_of(src, "a, b", 0)).expect("a");
+        let b = sema.binding_decl_at(offset_of(src, "b = 1", 0)).expect("b");
+        assert_eq!(
+            render_type(&sema.binding_type(sema.binding(a)).expect("a type")),
+            "number"
+        );
+        assert_eq!(
+            render_type(&sema.binding_type(sema.binding(b)).expect("b type")),
+            "string"
+        );
+    }
+
+    #[test]
+    fn type_annotation_on_a_non_local_statement_falls_back_to_the_first_type() {
+        // The target is a `function` statement, so there is no positional
+        // name index to match against.
+        let src = "---@type number\nfunction f() end\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let id = sema
+            .binding_decl_at(offset_of(src, "f() end", 0))
+            .map(|id| sema.binding(id));
+        // `function f` declares a global, not a binding; the annotation is
+        // still reachable through the covering item.
+        assert!(id.is_none() || sema.binding_type(id.expect("binding")).is_some());
+    }
+
+    // === class_of_binding / class_of_name =================================
+
+    #[test]
+    fn class_of_binding_peels_an_optional_annotation() {
+        let src = "---@class Point\n---@field x number\n\n---@type Point?\nlocal p = nil\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        assert_eq!(
+            sema.class_of_name("p", offset_of(src, "p = nil", 0) + 5)
+                .as_deref(),
+            Some("Point")
+        );
+    }
+
+    #[test]
+    fn class_of_binding_declines_a_type_that_is_not_a_declared_class() {
+        let src = "---@type Missing\nlocal p = nil\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        assert_eq!(sema.class_of_name("p", src.len()), None);
+        assert_eq!(sema.class_of_name("nothing", src.len()), None);
+    }
+
+    // === class_fields =====================================================
+
+    #[test]
+    fn class_fields_collects_parents_first_and_records_the_declaring_class() {
+        let src = "\
+---@class Base
+---@field id number
+
+---@class Derived: Base
+---@field name string
+";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let fields = sema.class_fields("Derived");
+        let rendered: Vec<(String, String)> = fields
+            .iter()
+            .map(|(f, declaring)| {
+                let FieldKey::Name(name) = &f.key else {
+                    panic!("expected a named field, got {:?}", f.key)
+                };
+                let name = name.clone();
+                (name, declaring.clone())
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                ("id".to_string(), "Base".to_string()),
+                ("name".to_string(), "Derived".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn own_field_overrides_an_inherited_one_of_the_same_name() {
+        let src = "\
+---@class Base
+---@field v number
+
+---@class Derived: Base
+---@field v string
+";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let fields = sema.class_fields("Derived");
+        assert_eq!(fields.len(), 1, "{:?}", fields.len());
+        assert_eq!(fields[0].1, "Derived");
+        assert_eq!(render_type(&fields[0].0.ty), "string");
+    }
+
+    #[test]
+    fn class_fields_of_an_undeclared_class_is_empty() {
+        let (analysis, path) = sema_of("---@class Known\n");
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        assert!(sema.class_fields("NotDeclared").is_empty());
+    }
+
+    #[test]
+    fn inheritance_cycles_terminate() {
+        let src = "\
+---@class A: B
+---@field a number
+
+---@class B: A
+---@field b number
+";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        // The cycle guard stops the walk; each field appears exactly once.
+        assert_eq!(sema.class_fields("A").len(), 2);
+        assert_eq!(sema.class_fields("B").len(), 2);
+    }
+
+    #[test]
+    fn a_non_named_parent_is_skipped() {
+        let src = "\
+---@class Odd: { x: number }
+---@field own string
+";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let fields = sema.class_fields("Odd");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].1, "Odd");
+    }
+
+    // === functions() ======================================================
+
+    #[test]
+    fn a_local_assigned_function_expression_is_a_function_declaration() {
+        let src = "\
+---Doubles.
+---@param n number
+---@return number
+local double = function(n) return n * 2 end
+";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let functions = sema.functions();
+        let info = functions
+            .iter()
+            .find(|f| f.name == "double")
+            .expect("`double` is a function declaration");
+        assert_eq!(info.sig, "function double(n: number): number");
+        assert_eq!(info.docs, "Doubles.");
+        assert_eq!(info.params.len(), 1);
+        assert_eq!(info.returns.len(), 1);
+    }
+
+    #[test]
+    fn a_local_assigned_non_function_is_not_a_function_declaration() {
+        let (analysis, path) = sema_of("local t = {}\n");
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        assert!(sema.functions().is_empty());
+    }
+
+    #[test]
+    fn a_method_declaration_renders_with_a_colon() {
+        let src = "function M.sub:go(self) end\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let functions = sema.functions();
+        assert_eq!(functions.len(), 1);
+        assert_eq!(functions[0].name, "M.sub:go");
+    }
+
+    #[test]
+    fn a_dotted_declaration_renders_with_dots() {
+        let src = "function M.sub.go() end\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        assert_eq!(sema.functions()[0].name, "M.sub.go");
+    }
+
+    #[test]
+    fn an_annotated_vararg_renders_its_type_in_the_signature() {
+        let src = "---@param ... number\nfunction sum(...) end\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let functions = sema.functions();
+        assert_eq!(functions[0].sig, "function sum(...: number)");
+        assert_eq!(functions[0].params.len(), 1);
+        assert_eq!(functions[0].params[0].name, "...");
+        assert!(functions[0].params[0].vararg);
+    }
+
+    #[test]
+    fn an_unannotated_vararg_renders_bare() {
+        let src = "function sum(a, ...) end\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let functions = sema.functions();
+        assert_eq!(functions[0].sig, "function sum(a, ...)");
+        assert!(functions[0].params[1].ty.is_none());
+    }
+
+    #[test]
+    fn overloads_are_collected_and_a_non_function_overload_is_skipped() {
+        let src = "\
+---@overload fun(n: number): string
+---@overload string
+function f(a) end
+";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let functions = sema.functions();
+        assert_eq!(functions[0].overloads.len(), 1);
+        let (params, returns) = &functions[0].overloads[0];
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, "n");
+        assert_eq!(returns.len(), 1);
+    }
+
+    // === global_defs ======================================================
+
+    #[test]
+    fn global_defs_lists_function_statements_and_assignment_targets() {
+        let src = "\
+function g() end
+function M.helper() end
+x, y = 1, 2
+local hidden = 3
+t.field = 4
+";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let names: Vec<String> = sema
+            .global_defs()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        // `function M.helper` contributes its *first* segment `M`; `t.field`
+        // is a field expression, not a bare name, so it contributes nothing.
+        assert_eq!(names, vec!["g", "M", "x", "y"]);
+    }
+
+    #[test]
+    fn global_defs_ranges_point_at_the_name_token() {
+        let src = "answer = 42\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let defs = sema.global_defs();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(usize::from(defs[0].1.start()), 0);
+        assert_eq!(usize::from(defs[0].1.end()), "answer".len());
+    }
+
+    // === source_tag_covering ==============================================
+
+    #[test]
+    fn a_source_tag_redirects_each_name_of_its_local_statement() {
+        let src = "---@source impl/native.c:12\nlocal a, b = 1, 2\nprint(a, b)\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        for needle in ["a, b", "b = 1"] {
+            let id = sema
+                .binding_decl_at(offset_of(src, needle, 0))
+                .expect("binding");
+            let range = sema.binding(id).range;
+            assert_eq!(
+                sema.source_tag_covering(range),
+                Some("impl/native.c:12"),
+                "{needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_source_tag_does_not_redirect_an_unrelated_range() {
+        let src = "---@source impl/native.c\nlocal a = 1\nlocal b = 2\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let id = sema
+            .binding_decl_at(offset_of(src, "b = 2", 0))
+            .expect("binding");
+        assert_eq!(sema.source_tag_covering(sema.binding(id).range), None);
+    }
+
+    #[test]
+    fn a_source_tag_redirects_a_local_function_name() {
+        let src = "---@source impl/native.c\nlocal function f() end\nf()\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let id = sema
+            .binding_decl_at(offset_of(src, "f() end", 0))
+            .expect("binding");
+        assert_eq!(
+            sema.source_tag_covering(sema.binding(id).range),
+            Some("impl/native.c")
+        );
+    }
+
+    #[test]
+    fn a_source_tag_on_a_statement_that_declares_nothing_redirects_nothing() {
+        let src = "---@source impl/native.c\nprint(1)\nlocal x = 2\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let id = sema
+            .binding_decl_at(offset_of(src, "x = 2", 0))
+            .expect("binding");
+        assert_eq!(sema.source_tag_covering(sema.binding(id).range), None);
+        let item = sema
+            .items()
+            .iter()
+            .find(|i| i.target.is_some())
+            .expect("an annotated item");
+        assert!(sema.target_decl_names(item).is_empty());
+    }
+
+    #[test]
+    fn a_source_tag_redirects_every_segment_of_a_dotted_function_name() {
+        let src = "---@source impl/native.c\nfunction M.helper() end\nM.helper()\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let functions = sema.functions();
+        assert_eq!(
+            sema.source_tag_covering(functions[0].decl_range),
+            Some("impl/native.c")
+        );
+    }
+
+    // === Misc accessors ===================================================
+
+    #[test]
+    fn requires_and_require_at_agree() {
+        let src = "local m = require(\"other\")\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let edges = sema.requires();
+        assert_eq!(edges.len(), 1);
+        let inside = usize::from(edges[0].range.start()) + 1;
+        assert!(sema.require_at(inside).is_some());
+        assert!(sema.require_at(0).is_none());
+    }
+
+    #[test]
+    fn visible_binding_named_picks_the_nearest_earlier_declaration() {
+        let src = "local x = 1\nlocal x = 2\nprint(x)\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let at_end = sema.visible_binding_named("x", src.len()).expect("binding");
+        // The later shadowing declaration wins.
+        assert_eq!(
+            usize::from(at_end.range.start()),
+            offset_of(src, "x = 2", 0)
+        );
+        // Before any declaration, nothing is visible.
+        assert!(sema.visible_binding_named("x", 0).is_none());
+        assert!(sema.visible_binding_named("nope", src.len()).is_none());
+    }
+
+    #[test]
+    fn stmt_at_exact_requires_an_exact_span_match() {
+        let src = "local x = 1\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        assert!(sema.stmt_at_exact(Span::new(0, 11)).is_some());
+        assert!(sema.stmt_at_exact(Span::new(0, 5)).is_none());
+    }
+
+    #[test]
+    fn file_sema_declines_a_path_the_analysis_does_not_know() {
+        let (analysis, _) = sema_of("local x = 1\n");
+        let missing = Path::new(if cfg!(windows) {
+            r"C:\ws\absent.lua"
+        } else {
+            "/ws/absent.lua"
+        });
+        assert!(FileSema::new(&analysis, missing).is_none());
+    }
+
+    #[test]
+    fn name_resolutions_reports_every_use_in_one_pass() {
+        let src = "local x = 1\nprint(x)\nprint(x)\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let uses = sema.name_resolutions();
+        let locals = uses
+            .iter()
+            .filter(|(_, res)| matches!(res, Resolution::Local(_)))
+            .count();
+        assert_eq!(locals, 2, "{uses:?}");
+        assert!(
+            uses.iter()
+                .any(|(_, res)| matches!(res, Resolution::Global(n) if n == "print"))
+        );
+    }
+
+    #[test]
+    fn resolution_at_outside_any_name_use_is_none() {
+        let src = "local x = 1\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        assert!(sema.resolution_at(offset_of(src, "=", 0)).is_none());
+    }
+
+    #[test]
+    fn docs_and_sees_of_a_detached_block_are_reachable() {
+        let src = "---A note.\n---@see a.b\n---@see c.d\n\nlocal x = 1\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let item = sema
+            .items()
+            .iter()
+            .find(|i| !sees_of(i).is_empty())
+            .expect("an item with @see tags");
+        assert_eq!(docs_of(item), "A note.");
+        assert_eq!(sees_of(item), vec!["a.b".to_string(), "c.d".to_string()]);
+        // A detached block has no target statement, so it declares no names.
+        assert_eq!(item.target, None);
+        assert!(sema.target_decl_names(item).is_empty());
+    }
+
+    #[test]
+    fn item_covering_picks_the_innermost_target() {
+        let src = "---@type number\nlocal x = 1\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let id = sema
+            .binding_decl_at(offset_of(src, "x = 1", 0))
+            .expect("binding");
+        let item = sema
+            .item_covering(sema.binding(id).range)
+            .expect("covering item");
+        assert!(matches!(item.block.tags.first(), Some(Tag::Type(_))));
+        // A range outside every annotated statement is covered by nothing.
+        assert!(
+            sema.item_covering(TextRange::new(TextSize::new(0), TextSize::new(3)))
+                .is_none()
+        );
+    }
+}

@@ -280,4 +280,165 @@ mod tests {
         let map = infer_call(&sig, &[arg]);
         assert_eq!(map.get("T"), Some(&Ty::Boolean));
     }
+
+    // --- substitution through every composite shape -----------------------
+
+    #[test]
+    fn subst_walks_union_members() {
+        // `T?` is `T | nil`: substituting `T = string` yields `string | nil`,
+        // with the non-placeholder member left untouched.
+        let map = BTreeMap::from([("T".to_string(), Ty::String)]);
+        let optional_t = Ty::Union(vec![Ty::Named("T".into()), Ty::Nil]);
+        assert_eq!(
+            subst_ty(&optional_t, &map),
+            Ty::Union(vec![Ty::String, Ty::Nil])
+        );
+    }
+
+    #[test]
+    fn subst_walks_nested_function_types() {
+        // A `fun(x: T): T` *inside* a type position (a callback parameter)
+        // monomorphises through `subst_ty`'s function arm, not just through
+        // `subst_function` at the top level.
+        let map = BTreeMap::from([("T".to_string(), Ty::Integer)]);
+        let callback = Ty::Function(Box::new(FunctionTy {
+            params: vec![ParamTy {
+                name: "x".into(),
+                ty: Ty::Named("T".into()),
+                optional: false,
+            }],
+            returns: vec![Ty::Named("T".into())],
+            varargs: Some(Ty::Named("T".into())),
+            has_return_annotation: true,
+            ..FunctionTy::default()
+        }));
+        let Ty::Function(out) = subst_ty(&callback, &map) else {
+            panic!("expected a function type");
+        };
+        assert_eq!(out.params[0].ty, Ty::Integer);
+        assert_eq!(out.returns, vec![Ty::Integer]);
+        assert_eq!(out.varargs, Some(Ty::Integer));
+    }
+
+    #[test]
+    fn subst_leaves_scalar_types_untouched() {
+        let map = BTreeMap::from([("T".to_string(), Ty::Number)]);
+        for ty in [Ty::String, Ty::Boolean, Ty::Nil, Ty::StringLit("T".into())] {
+            assert_eq!(subst_ty(&ty, &map), ty);
+        }
+    }
+
+    // --- binding sources beyond the fixed parameter list ------------------
+
+    #[test]
+    fn varargs_element_binds_the_type_variable() {
+        // `---@vararg T` (or `fun(...: T)`): arguments past the declared
+        // parameters unify against the varargs element type.
+        let mut sig = generic_fn(&["T"], &[], &[Ty::Named("T".into())]);
+        sig.varargs = Some(Ty::Named("T".into()));
+        let map = infer_call(&sig, &[Ty::StringLit("a".into()), Ty::Integer]);
+        // First match wins and the literal widens.
+        assert_eq!(map.get("T"), Some(&Ty::String));
+    }
+
+    #[test]
+    fn backtick_capture_of_a_non_string_argument_takes_the_value_type() {
+        // `` `T` `` only names a class when the argument is a string literal;
+        // any other argument fixes `T` to that argument's own type verbatim
+        // (no widening on this path).
+        let sig = FunctionTy {
+            generics: vec![TypeParam {
+                name: "T".into(),
+                constraint: None,
+            }],
+            params: vec![ParamTy {
+                name: "name".into(),
+                ty: Ty::Named("`T`".into()),
+                optional: false,
+            }],
+            returns: vec![Ty::Named("T".into())],
+            has_return_annotation: true,
+            ..FunctionTy::default()
+        };
+        let map = infer_call(&sig, &[Ty::Boolean]);
+        assert_eq!(map.get("T"), Some(&Ty::Boolean));
+    }
+
+    #[test]
+    fn unknown_argument_never_binds_the_variable() {
+        // An unannotated argument is `unknown`; binding `T = unknown` would
+        // poison every use of `T`, so the variable stays free and a *later*
+        // concrete argument is free to fix it.
+        let sig = generic_fn(
+            &["T"],
+            &[("a", Ty::Named("T".into())), ("b", Ty::Named("T".into()))],
+            &[Ty::Named("T".into())],
+        );
+        let map = infer_call(&sig, &[Ty::Unknown, Ty::String]);
+        assert_eq!(map.get("T"), Some(&Ty::String));
+
+        // Unknown alone leaves the map empty.
+        let map = infer_call(&sig, &[Ty::Unknown]);
+        assert!(map.is_empty(), "{map:?}");
+    }
+
+    // --- structural unification through indexers and callbacks ------------
+
+    #[test]
+    fn indexer_shaped_unification_binds_key_and_value() {
+        // `table<K, V>` against `table<string, boolean>` binds both variables.
+        let param = Ty::Table(Box::new(TableTy {
+            indexers: vec![(Ty::Named("K".into()), Ty::Named("V".into()))],
+            ..TableTy::default()
+        }));
+        let arg = Ty::Table(Box::new(TableTy {
+            indexers: vec![(Ty::String, Ty::Boolean)],
+            ..TableTy::default()
+        }));
+        let sig = generic_fn(&["K", "V"], &[("t", param)], &[Ty::Named("V".into())]);
+        let map = infer_call(&sig, &[arg]);
+        assert_eq!(map.get("K"), Some(&Ty::String));
+        assert_eq!(map.get("V"), Some(&Ty::Boolean));
+    }
+
+    #[test]
+    fn function_shaped_unification_binds_through_params_and_returns() {
+        // `---@param cb fun(x: T): R` against `fun(x: integer): string`.
+        let param = Ty::Function(Box::new(FunctionTy {
+            params: vec![ParamTy {
+                name: "x".into(),
+                ty: Ty::Named("T".into()),
+                optional: false,
+            }],
+            returns: vec![Ty::Named("R".into())],
+            has_return_annotation: true,
+            ..FunctionTy::default()
+        }));
+        let arg = Ty::Function(Box::new(FunctionTy {
+            params: vec![ParamTy {
+                name: "x".into(),
+                ty: Ty::Integer,
+                optional: false,
+            }],
+            returns: vec![Ty::String],
+            has_return_annotation: true,
+            ..FunctionTy::default()
+        }));
+        let sig = generic_fn(&["T", "R"], &[("cb", param)], &[Ty::Named("R".into())]);
+        let map = infer_call(&sig, &[arg]);
+        assert_eq!(map.get("T"), Some(&Ty::Integer));
+        assert_eq!(map.get("R"), Some(&Ty::String));
+    }
+
+    #[test]
+    fn mismatched_shapes_bind_nothing() {
+        // A table parameter against a scalar argument (and vice versa) falls
+        // through the structural arms without binding — no guessing.
+        let param = Ty::Table(Box::new(TableTy {
+            array: Some(Ty::Named("T".into())),
+            ..TableTy::default()
+        }));
+        let sig = generic_fn(&["T"], &[("xs", param)], &[Ty::Named("T".into())]);
+        assert!(infer_call(&sig, &[Ty::Number]).is_empty());
+    }
 }

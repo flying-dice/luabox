@@ -6,22 +6,18 @@ runs end-to-end on a stock Lua 5.1) that draws ASCII shapes to stdout.
 
 ```
 renderer/
-├── luabox.toml            # [dependencies] geometry = { path = "../geometry" }
-├── luabox.lock             # committed — this is an app, not a library
+├── luabox.toml             # [dependencies] geometry = { path = "../geometry" }
 ├── defs/render.d.lua       # our own render.Square : geometry.Drawable
 ├── src/square.lua          # carrier with top ---@class render.Square : geometry.Drawable
-└── src/main.lua            # draws a square with `luabox run start`
+└── src/main.lua            # draws a square with any Lua 5.1 interpreter
 ```
 
-## Install first
+## No install step
 
-The dependency must be resolved before checking or running:
-
-```sh
-luabox install      # writes luabox.lock; the path dep is used in place
-```
-
-`luabox.lock` is committed here because renderer is an application.
+A `path` dependency is read **in place**, straight off disk: `luabox check`
+resolves `../geometry` with nothing to fetch and nothing to unlock. luabox
+never installs anything — for a registry dependency you would point luarocks
+at `lua_modules/` yourself, and luabox would read that tree the same way.
 
 ## Cross-package LuaCATS typing — the library model (#108)
 
@@ -37,10 +33,10 @@ workspace and its libraries, exactly as in luals; `geometry.Drawable` resolves
 here the same way a local class would.
 
 Resolution walks **direct** dependencies only, one level deep (a dependency's
-*own* dependencies' defs do not transit — matching the manifest resolver's
-precedent). If two packages in scope declared the same class name, luabox is
-stricter than luals's silent merge: it reports `LB0307` (a warning) at the
-losing declaration and the project-local declaration wins.
+*own* dependencies' defs do not transit). If two packages in scope declared
+the same class name, luabox is stricter than luals's silent merge: it reports
+`LB0307` (a warning) at the losing declaration and the project-local
+declaration wins.
 
 ### What this does — and doesn't — carry across the boundary
 
@@ -89,10 +85,10 @@ error[LB0300]: `render.Square` does not satisfy `geometry.Drawable`: missing mem
 luabox check        # 0 errors — cross-package conformance verified
 luabox fmt --check
 luabox lint
-luabox run start    # → draws a 4x4 square of '#'
+lua src/main.lua    # → draws a 4x4 square of '#'
 ```
 
-Expected output of `luabox run start`:
+Expected output of `lua src/main.lua`:
 
 ```
 A 4x4 square:

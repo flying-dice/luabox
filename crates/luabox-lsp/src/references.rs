@@ -304,6 +304,82 @@ mod tests {
         references(&analysis, &target, offset, include).expect("references")
     }
 
+    /// `(line, character)` starts of every returned location.
+    fn starts(locations: &[Location]) -> Vec<(u32, u32)> {
+        locations
+            .iter()
+            .map(|l| (l.range.start.line, l.range.start.character))
+            .collect()
+    }
+
+    #[test]
+    fn a_method_call_name_is_a_member_reference() {
+        let src = "\
+---@class Greeter
+---@field greet fun(self: Greeter): string
+
+---@type Greeter
+local g = nil
+g:greet()
+g.greet(g)
+";
+        // The cursor is on the `greet` of the method call.
+        let hits = run(&[("main.lua", src)], offset_of(src, "greet()", 0), true);
+        // Both the `:` call and the `.` access, plus the `@field` tag site.
+        assert_eq!(hits.len(), 3, "{hits:?}");
+        assert!(starts(&hits).contains(&(1, 3)), "{hits:?}");
+        assert!(starts(&hits).contains(&(5, 2)), "{hits:?}");
+        assert!(starts(&hits).contains(&(6, 2)), "{hits:?}");
+    }
+
+    #[test]
+    fn a_cursor_on_a_dotted_function_declaration_name_targets_the_member() {
+        let src = "\
+local M = {}
+function M.helper() end
+M.helper()
+";
+        // The cursor is on `helper` in the declaration name.
+        let hits = run(
+            &[("main.lua", src)],
+            offset_of(src, "helper() end", 0),
+            true,
+        );
+        assert_eq!(starts(&hits), vec![(1, 11), (2, 2)], "{hits:?}");
+    }
+
+    #[test]
+    fn a_cursor_on_a_plain_function_declaration_name_targets_the_global() {
+        let src = "function top() end\ntop()\ntop()\n";
+        let hits = run(&[("main.lua", src)], offset_of(src, "top", 0), true);
+        assert_eq!(starts(&hits), vec![(0, 9), (1, 0), (2, 0)], "{hits:?}");
+    }
+
+    #[test]
+    fn a_cursor_on_a_local_declaration_finds_its_uses() {
+        let src = "local value = 1\nprint(value)\n";
+        let hits = run(&[("main.lua", src)], offset_of(src, "value", 0), true);
+        assert_eq!(starts(&hits), vec![(0, 6), (1, 6)], "{hits:?}");
+    }
+
+    #[test]
+    fn a_global_assignment_target_counts_as_a_declaration() {
+        let src = "answer = 1\nprint(answer)\n";
+        let with = run(&[("main.lua", src)], offset_of(src, "answer)", 0), true);
+        assert_eq!(starts(&with), vec![(0, 0), (1, 6)], "{with:?}");
+        // Excluding declarations drops the assignment target.
+        let without = run(&[("main.lua", src)], offset_of(src, "answer)", 0), false);
+        assert_eq!(starts(&without), vec![(1, 6)], "{without:?}");
+    }
+
+    #[test]
+    fn a_cursor_on_a_non_symbol_yields_no_references() {
+        let (analysis, path) = analyze(&[("main.lua", "local t = { key = 1 }\n")]);
+        let target = FileSema::new(&analysis, &path).expect("sema");
+        // A table-constructor key resolves to nothing at all.
+        assert!(references(&analysis, &target, 0, true).is_none());
+    }
+
     #[test]
     fn local_uses_are_file_scoped_with_declaration_toggle() {
         let src = "local value = 1\nprint(value)\nreturn value + value\n";

@@ -367,6 +367,62 @@ mod tests {
     }
 
     #[test]
+    fn unparseable_input_is_an_internal_error_not_a_panic() {
+        let err = minify("local = = =\n", Dialect::Lua54).expect_err("must not minify");
+        assert!(err.starts_with("minify input does not parse: "), "{err}");
+    }
+
+    #[test]
+    fn a_label_with_an_exotic_goto_site_keeps_its_name() {
+        // The `goto` statement carries a comment between keyword and label,
+        // so its name token cannot be located textually — consistency over
+        // aggressiveness: definition *and* use keep the original name.
+        let out = minify(
+            "local i = 0\n::top::\ni = i + 1\nif i < 3 then goto --[[hop]] top end\nprint(i)\n",
+            Dialect::Lua54,
+        )
+        .expect("minify");
+        assert!(out.contains("::top::"), "label definition kept: {out}");
+        assert!(out.contains("goto top"), "goto site kept: {out}");
+    }
+
+    #[test]
+    fn fresh_names_skip_identifiers_the_module_already_uses() {
+        // `a` and `b` occur as globals, so the generator must skip past them
+        // when naming the two locals.
+        let out = minify(
+            "local first = a\nlocal second = b\nprint(first, second)\n",
+            Dialect::Lua54,
+        )
+        .expect("minify");
+        assert!(out.starts_with("local c=a"), "{out}");
+        assert!(out.contains("local d=b"), "{out}");
+        assert!(out.contains("print(c,d)"), "{out}");
+    }
+
+    #[test]
+    fn goto_name_range_rejects_non_plain_statements() {
+        let text = "goto top";
+        let whole = TextRange::new(0.into(), 8.into());
+        assert_eq!(
+            goto_name_range(text, whole, "top"),
+            Some(TextRange::new(5.into(), 8.into()))
+        );
+        // Wrong label name / trailing junk between `goto` and the end.
+        assert_eq!(goto_name_range(text, whole, "other"), None);
+        // No separator after the keyword at all.
+        assert_eq!(
+            goto_name_range("gototop", TextRange::new(0.into(), 7.into()), "top"),
+            None
+        );
+        // Not a goto statement.
+        assert_eq!(
+            goto_name_range("break", TextRange::new(0.into(), 5.into()), "top"),
+            None
+        );
+    }
+
+    #[test]
     fn shadowed_locals_get_distinct_names() {
         let out = minify(
             "local v = 1\ndo\n  local v = 2\n  print(v)\nend\nprint(v)\n",

@@ -39,8 +39,6 @@ fn run(dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_luabox"))
         .args(args)
         .current_dir(dir)
-        .env("LUABOX_STORE", dir.join(".luabox-store"))
-        .env_remove("LUABOX_LUAROCKS_MIRROR")
         .output()
         .expect("spawn luabox")
 }

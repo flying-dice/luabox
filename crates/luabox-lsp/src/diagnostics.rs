@@ -166,3 +166,110 @@ fn diagnostic(
         ..Diagnostic::default()
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "test code — panics document assumptions"
+)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    use luabox_db::{AnalysisHost, Change};
+    use luabox_types::build_ambient;
+
+    fn path_for(name: &str) -> PathBuf {
+        Path::new(if cfg!(windows) { r"C:\ws" } else { "/ws" }).join(name)
+    }
+
+    /// Diagnostics for `src` checked as `dialect`.
+    fn diagnostics_for(src: &str, dialect: Dialect) -> Vec<Diagnostic> {
+        let mut host = AnalysisHost::new(dialect, Strictness::Warn);
+        let path = path_for("main.lua");
+        host.apply_change(Change::SetFileText {
+            path: path.clone(),
+            dialect,
+            text: src.to_string(),
+        });
+        let analysis = host.snapshot();
+        let ambient = build_ambient(dialect, &[]);
+        let lint = LintConfig::new();
+        let known_globals = ambient.global_names().clone();
+        let ctx = CheckCtx {
+            strictness: Strictness::Warn,
+            ambient: &ambient,
+            lint: &lint,
+            known_globals: &known_globals,
+        };
+        lua_diagnostics(&analysis, &path, dialect, &ctx).expect("diagnostics")
+    }
+
+    fn codes(diags: &[Diagnostic]) -> Vec<&str> {
+        diags
+            .iter()
+            .filter_map(|d| match &d.code {
+                Some(NumberOrString::String(code)) => Some(code.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_dialect_violation_is_reported_against_the_project_edition() {
+        // `<const>` is Lua 5.4 syntax; the same source is legal there.
+        let src = "local x <const> = 1\nprint(x)\n";
+        let under_51 = diagnostics_for(src, Dialect::Lua51);
+        let gated = under_51
+            .iter()
+            .find(|d| matches!(&d.code, Some(NumberOrString::String(c)) if c == "LB0013"))
+            .unwrap_or_else(|| panic!("expected LB0013: {under_51:?}"));
+        assert_eq!(gated.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(gated.source.as_deref(), Some(TYPE_SOURCE));
+        assert!(gated.message.contains("Lua 5.1"), "{gated:?}");
+
+        assert!(
+            !codes(&diagnostics_for(src, Dialect::Lua54)).contains(&"LB0013"),
+            "legal under 5.4"
+        );
+    }
+
+    #[test]
+    fn a_parse_error_is_reported_with_the_syntax_code() {
+        let diags = diagnostics_for("local = 1\n", Dialect::Lua54);
+        assert!(codes(&diags).contains(&"LB0001"), "{diags:?}");
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(diags[0].source.as_deref(), Some(TYPE_SOURCE));
+    }
+
+    #[test]
+    fn lint_findings_carry_the_lint_source() {
+        let diags = diagnostics_for("local unused = 1\n", Dialect::Lua54);
+        let lint = diags
+            .iter()
+            .find(|d| d.source.as_deref() == Some(LINT_SOURCE))
+            .unwrap_or_else(|| panic!("expected a lint diagnostic: {diags:?}"));
+        assert!(
+            codes(std::slice::from_ref(lint))[0].starts_with("LB05"),
+            "{lint:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_the_analysis_does_not_know_has_no_diagnostics() {
+        let host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
+        let analysis = host.snapshot();
+        let ambient = build_ambient(Dialect::Lua54, &[]);
+        let lint = LintConfig::new();
+        let known_globals = ambient.global_names().clone();
+        let ctx = CheckCtx {
+            strictness: Strictness::Warn,
+            ambient: &ambient,
+            lint: &lint,
+            known_globals: &known_globals,
+        };
+        assert!(
+            lua_diagnostics(&analysis, &path_for("absent.lua"), Dialect::Lua54, &ctx).is_none()
+        );
+    }
+}

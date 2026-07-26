@@ -1,6 +1,6 @@
-# Known limitations (0.1)
+# Known limitations (0.2)
 
-luabox 0.1 checks stock LuaCATS more strictly than lua-language-server, but it
+luabox 0.2 checks stock LuaCATS more strictly than lua-language-server, but it
 is early software. This page lists the gaps a real user is likely to hit in the
 first week — each one verified against the shipping binary — so nothing here is
 a surprise. It is deliberately short: small parser trivia is left out so the
@@ -132,26 +132,42 @@ one.
 
 ## Tooling
 
-### Dependencies: luarocks.org is the registry, rockspec is the manifest (#2)
+### Dependency management and execution are non-goals, not gaps
 
-luabox follows the pnpm/bun model:
-[luarocks.org](https://luarocks.org) is the registry and the project's
-`*.rockspec` is the package manifest. Registry dependencies (bare rock names
-in LuaRocks constraint syntax) live in the rockspec's
-`dependencies`/`test_dependencies`; `luabox.toml` carries only the **source**
-dependencies a rockspec cannot express:
+luabox neither manages dependencies nor runs Lua. There is no resolver, no
+lockfile, no registry client, no publish or sign-in path, and no managed
+interpreter — those are **deliberate v1 non-goals**, not gaps waiting to be
+filled, and nothing here is planned for a later 0.x. The decision record is
+in [DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26)
+(flying-dice/luabox#10, #11).
 
-- a **path** dependency — `pkg = { path = "../pkg" }`
-- a **git** dependency — `pkg = { git = "…", rev|tag|branch = "…" }`
-- a **workspace** dependency — `pkg = { workspace = true }`
+In practice: you materialize a rock tree yourself and luabox reads it.
 
-A version-requirement entry in `luabox.toml` is an error pointing at the
-rockspec. There is **no first-party registry** and no `LUABOX_REGISTRY`; set
-`LUABOX_LUAROCKS_MIRROR` to a local mirror directory for hermetic/offline
-resolves. Only **pure-Lua** rocks are supported — a C/native rock is rejected
-with a clear error (luabox is not a C build system). Editing the rockspec from
-`luabox add` (a bare `luabox add pkg@1.2`) is not wired up yet; declare
-registry dependencies in the rockspec by hand for now.
+```sh
+luarocks install --tree lua_modules penlight
+luabox check
+```
+
+What that tree buys you is `require` resolution and bundling: both the
+luarocks layout (`lua_modules/share/lua/<X.Y>/…`, `<X.Y>` from your `[build]
+target`, `5.1` for `luajit`) and the flat `lua_modules/<name>/` layout are on
+the module path, and `lua_modules/` is never walked as project source.
+
+**Cross-package *types* are narrower than that, and this is the sharp edge.**
+A dependency's LuaCATS definitions reach your use sites only when all three
+hold: (a) a `[dependencies]`/`[dev-dependencies]` entry names the package;
+(b) a `luabox.toml` for it exists at `lua_modules/<name>/luabox.toml` (or at
+the `path` you gave) and sets `[types] defs`; (c) the `defs/` directory it
+names is present. A luarocks tree has no per-package
+`luabox.toml`, so a plain `luarocks install --tree lua_modules penlight`
+gives you resolution and bundling but leaves penlight `unknown` to the
+typechecker. Typed third-party code today therefore means either a
+flat-layout package that ships a `luabox.toml`, or definitions you write into
+your own project's `defs/` and list in your own `[types] defs`. Teaching
+luabox to read a rockspec's own definition files is not planned for 0.x.
+
+Your `*.rockspec` and luarocks own everything else (adding, updating,
+publishing), and you run your program with whatever Lua you already have.
 
 ### Editor extensions are not on marketplaces yet (#102)
 
