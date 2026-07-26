@@ -2,8 +2,7 @@
 tools/gen-corpus/target/
 tools/differ/target/
 
-# Example build artifacts and installed deps (the renderer's luabox.lock is
-# committed deliberately — it is an application).
+# Example build artifacts, and the rock tree a user materializes with luarocks.
 examples/**/dist/
 examples/**/lua_modules/
 

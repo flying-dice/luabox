@@ -8,7 +8,7 @@
 //! ## House divergences from the shared toolchain conventions
 //!
 //! No HTTP crate is linked (SPEC.md §6): downloads shell out to `curl -fsSL`
-//! exactly as [`luabox_resolve`]'s transport and the install scripts do. The
+//! exactly as the install scripts do. The
 //! release archive is unpacked with `tar` — `tar -xzf` for the unix `.tar.gz`
 //! and `tar -xf` for the Windows `.zip` (the bundled `bsdtar` in `System32`
 //! reads zip natively) — so no `zip`/`flate2` crate is pulled in. Only the

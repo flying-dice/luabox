@@ -8,9 +8,9 @@
 //!
 //! [`Manifest::parse`] collects *every* validation error in one pass
 //! (SPEC.md §14: batch diagnostics, not fail-fast) and, on success, keeps
-//! the parsed [`toml_edit::DocumentMut`] alongside the typed view so later
-//! edits (`luabox add`/`luabox remove`) preserve comments and formatting —
-//! see [`Manifest::set_dependency`] for the pattern this generalizes to.
+//! the parsed [`toml_edit::DocumentMut`] alongside the typed view so an edit
+//! preserves comments and formatting — see [`Manifest::set_dependency`] for
+//! the pattern this generalizes to.
 //! [`Manifest::workspace_members`] expands `[workspace] members` globs
 //! (`packages/*`) into concrete member directories, cargo-style.
 
@@ -78,43 +78,11 @@ mod tests {
         assert!(manifest.types.strict);
         assert_eq!(manifest.types.defs, vec!["love2d".to_owned()]);
 
-        assert_eq!(
-            manifest.dependencies.get("penlight"),
-            Some(&Dependency::Version("1.14".to_owned()))
-        );
-        match manifest.dependencies.get("promise") {
-            Some(Dependency::Git(git)) => {
-                assert_eq!(git.rev.as_deref(), Some("abc123"));
-                assert_eq!(git.tag, None);
-                assert_eq!(git.branch, None);
-            }
-            other => panic!("expected a git dependency, got {other:?}"),
-        }
-
-        assert_eq!(
-            manifest.dev_dependencies.get("busted-compat"),
-            Some(&Dependency::Version("1.0".to_owned()))
-        );
-
-        assert_eq!(
-            manifest.tasks.get("start"),
-            Some(&TaskValue::Single("luabox run src/main.lua".to_owned()))
-        );
-        assert_eq!(
-            manifest.tasks.get("ci"),
-            Some(&TaskValue::Multiple(vec![
-                "luabox check".to_owned(),
-                "luabox lint".to_owned(),
-                "luabox fmt --check".to_owned(),
-            ]))
-        );
-
-        assert_eq!(
-            manifest.workspace.as_ref().map(|w| w.members.clone()),
-            Some(vec!["packages/*".to_owned()])
-        );
-
-        // Round-trip: an untouched document renders back byte-identical.
+        // The example's optional tables (`[dependencies]`, `[tasks]`,
+        // `[workspace]`) are asserted by the focused tests below against
+        // fixtures this file owns; asserting their *contents* here would pin
+        // the test to SPEC.md's illustrative values. What this test owns is
+        // that the spec's own example parses at all, and round-trips.
         assert_eq!(manifest.to_string(), source);
     }
 
@@ -153,8 +121,8 @@ mod tests {
     #[test]
     fn missing_edition_is_reported_but_name_version_are_optional() {
         // `edition` is a tool concern and stays required; `name`/`version`
-        // are optional in `luabox.toml` because the rockspec supplies them
-        // (SPEC.md §6).
+        // are optional in `luabox.toml` because the rockspec luarocks reads
+        // supplies them (SPEC.md §6).
         let errors = Manifest::parse("[package]\nlicense = \"MIT\"\n").unwrap_err();
         assert!(errors.iter().any(|e| e.message.contains("package.edition")));
         assert!(
@@ -169,8 +137,8 @@ mod tests {
 
     #[test]
     fn package_without_name_or_version_parses() {
-        // The slimmed `luabox.toml` scaffold: edition only, rockspec owns the
-        // rest.
+        // The slimmed `luabox.toml` scaffold: edition only; the rockspec owns
+        // the rest.
         let manifest =
             Manifest::parse("[package]\nedition = \"5.4\"\n").expect("edition-only manifest valid");
         assert!(manifest.package.name.is_empty());

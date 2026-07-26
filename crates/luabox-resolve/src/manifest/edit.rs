@@ -1,16 +1,19 @@
 //! Comment-preserving manifest edits.
 //!
-//! `toml_edit` was chosen (SPEC.md §16.1) specifically so `luabox add` /
-//! `luabox remove` can mutate a `luabox.toml` in place without disturbing
-//! comments or formatting elsewhere in the file. [`Manifest::set_dependency`]
-//! is the seed for that: a targeted [`toml_edit::DocumentMut`] mutation,
-//! not a full-manifest regeneration.
+//! `toml_edit` was chosen (SPEC.md §16.1) specifically so a tool can mutate a
+//! `luabox.toml` in place without disturbing comments or formatting elsewhere
+//! in the file. [`Manifest::set_dependency`] is the seed for that: a targeted
+//! [`toml_edit::DocumentMut`] mutation, not a full-manifest regeneration.
+//!
+//! Nothing in the v1 CLI edits a manifest — `add`/`remove` were cut with the
+//! rest of dependency management — so this is currently a library-only
+//! surface, kept because it is the manifest model's editing half.
 
 use toml_edit::{InlineTable, Item, Table, Value};
 
 use super::model::{Dependency, Manifest};
 
-/// The two dependency tables `add`/`remove` operate on.
+/// The two dependency tables an edit operates on.
 const DEP_TABLES: [&str; 2] = ["dependencies", "dev-dependencies"];
 
 impl Manifest {
@@ -25,7 +28,7 @@ impl Manifest {
         self.set_dependency_entry(name, &Dependency::Version(req.to_owned()), false);
     }
 
-    /// Add or update a dependency of any kind (`luabox add`), preserving
+    /// Add or update a dependency of any kind, preserving
     /// comments/formatting of everything else in the document — including
     /// any trailing comment on the entry itself, when updating one that
     /// already exists.
@@ -84,8 +87,8 @@ impl Manifest {
         typed.insert(name.to_owned(), dep.clone());
     }
 
-    /// Remove `name` from `[dependencies]` and `[dev-dependencies]`
-    /// (`luabox remove`), preserving comments/formatting of everything
+    /// Remove `name` from `[dependencies]` and `[dev-dependencies]`,
+    /// preserving comments/formatting of everything
     /// else — including the tables themselves, even when they end up
     /// empty. Returns whether an entry was actually removed.
     pub fn remove_dependency(&mut self, name: &str) -> bool {
@@ -109,7 +112,7 @@ impl Manifest {
     }
 }
 
-/// Renders a [`Dependency`] as the TOML value `luabox add` writes: a bare
+/// Renders a [`Dependency`] as the TOML value written back: a bare
 /// requirement string, or an inline table (`{ git = …, tag = … }`) with
 /// keys in the conventional order.
 fn dependency_value(dep: &Dependency) -> Value {
@@ -171,7 +174,7 @@ edition = \"5.4\"
 penlight = \"1.14\" # existing dep comment
 
 [tasks]
-start = \"luabox run src/main.lua\"
+start = \"luabox check\"
 ";
 
     #[test]
@@ -183,7 +186,7 @@ start = \"luabox run src/main.lua\"
         assert!(out.contains("# top-of-file comment, must survive"));
         assert!(out.contains("name = \"my-lib\" # inline comment on name"));
         assert!(out.contains("penlight = \"1.14\" # existing dep comment"));
-        assert!(out.contains("start = \"luabox run src/main.lua\""));
+        assert!(out.contains("start = \"luabox check\""));
         assert!(out.contains("promise = \"2.0\""));
 
         // Round-trips back through the parser with the new dependency present.
@@ -296,7 +299,7 @@ start = \"luabox run src/main.lua\"
 
     #[test]
     fn set_dependency_entry_repins_git_tag_in_place() {
-        // The `luabox update` re-pin: rewrite a git dep's `tag` to the latest
+        // A re-pin: rewrite a git dep's `tag` to the latest
         // release, preserving the URL, any other keys, and comments elsewhere.
         use crate::manifest::{Dependency, GitDependency};
 
@@ -375,7 +378,7 @@ promise = { git = \"https://github.com/o/promise\", tag = \"v0.1.0\" } # pinned
         let out = manifest.to_string();
         assert!(!out.contains("penlight"), "{out}");
         assert!(out.contains("# top-of-file comment, must survive"));
-        assert!(out.contains("start = \"luabox run src/main.lua\""));
+        assert!(out.contains("start = \"luabox check\""));
         Manifest::parse(&out).expect("edited manifest still valid");
     }
 

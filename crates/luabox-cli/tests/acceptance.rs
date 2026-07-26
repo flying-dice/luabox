@@ -44,7 +44,6 @@ impl AcceptanceWorld {
     fn stdout(&self) -> String {
         String::from_utf8_lossy(&self.output().stdout).into_owned()
     }
-
 }
 
 #[given("an empty directory")]
@@ -55,19 +54,12 @@ fn empty_directory(_world: &mut AcceptanceWorld) {
 #[given(expr = "I run {string}")]
 #[when(expr = "I run {string}")]
 fn run_command(world: &mut AcceptanceWorld, command: String) {
-    let command = world.subst(&command);
     let mut parts = command.split_whitespace();
     let program = parts.next().expect("empty command");
     assert_eq!(program, "luabox", "scenarios drive the luabox binary only");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_luabox"))
         .args(parts)
         .current_dir(world.dir.path())
-        // Point dependency commands at a scenario-local store so tests
-        // never touch (or pollute) the user's ~/.luabox/store.
-        .env("LUABOX_STORE", world.dir.path().join(".luabox-store"))
-        // Hermetic: a luarocks mirror configured on the host must not leak
-        // into scenarios (mirror scenarios opt in via their own steps).
-        .env_remove("LUABOX_LUAROCKS_MIRROR")
         .output()
         .expect("failed to spawn luabox");
     world.output = Some(output);
@@ -114,7 +106,6 @@ fn rockspec_file_exists(world: &mut AcceptanceWorld) {
 
 #[then(expr = "{string} contains {string}")]
 fn file_contains(world: &mut AcceptanceWorld, path: String, needle: String) {
-    let needle = world.subst(&needle);
     let full = world.dir.path().join(&path);
     let content =
         std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("cannot read `{path}`: {e}"));
@@ -126,7 +117,6 @@ fn file_contains(world: &mut AcceptanceWorld, path: String, needle: String) {
 
 #[then(expr = "{string} does not contain {string}")]
 fn file_does_not_contain(world: &mut AcceptanceWorld, path: String, needle: String) {
-    let needle = world.subst(&needle);
     let full = world.dir.path().join(&path);
     let content =
         std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("cannot read `{path}`: {e}"));
@@ -154,7 +144,7 @@ fn file_containing(world: &mut AcceptanceWorld, path: String, step: &Step) {
     if let Some(parent) = full.parent() {
         std::fs::create_dir_all(parent).expect("failed to create parent directories");
     }
-    let content = world.subst(&docstring(step));
+    let content = docstring(step);
     std::fs::write(&full, content).unwrap_or_else(|e| panic!("cannot write `{path}`: {e}"));
 }
 
@@ -281,6 +271,7 @@ fn zero_diagnostics(world: &mut AcceptanceWorld) {
     );
 }
 
+/// The machine-readable report contract (`--format json`) must parse.
 #[then("stdout is valid JSON")]
 fn stdout_is_valid_json(world: &mut AcceptanceWorld) {
     let stdout = world.stdout();
@@ -291,19 +282,13 @@ fn stdout_is_valid_json(world: &mut AcceptanceWorld) {
 
 #[tokio::main]
 async fn main() {
-    // @git scenarios drive real (local, hermetic) git repositories; skip
-    // them gracefully where the git CLI is unavailable.
-    let git_available = std::process::Command::new("git")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success());
     // @wip gates feature files written ahead of implementation (spec-first,
     // SPEC.md §16.2). Remove the tag when the behaviour ships.
-    AcceptanceWorld::filter_run("tests/features", move |feature, _rule, scenario| {
+    AcceptanceWorld::filter_run("tests/features", |feature, _rule, scenario| {
         let tagged = |tag: &str| {
             feature.tags.iter().any(|t| t == tag) || scenario.tags.iter().any(|t| t == tag)
         };
-        !tagged("wip") && (git_available || !tagged("git"))
+        !tagged("wip")
     })
     .await;
 }
@@ -409,15 +394,6 @@ fn emitted_output_contains_no(world: &mut AcceptanceWorld, needle: String) {
         );
     }
 }
-
-// --- run (execution/run.feature — #28) ------------------------------------
-//
-// Task scenarios use shell builtins (`echo`, `exit`) that behave the same
-// under `cmd /C` and `sh -c`, so they need no OS-specific fixture. The
-// script scenarios reuse the "fake Lua runtime" idea from
-// execution/test.feature, but with `run`-specific fakes: one that echoes
-// its argv (to prove args pass through to the script invocation), one that
-// always fails (to prove the script's exit code propagates).
 
 #[then(expr = "stdout does not contain {string}")]
 fn stdout_does_not_contain(world: &mut AcceptanceWorld, needle: String) {

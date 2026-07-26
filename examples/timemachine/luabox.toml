@@ -13,5 +13,3 @@ sourcemap = true               # emit dist/timemachine.lua.map for `luabox unmap
 
 [types]
 strict = true
-
-[dependencies]

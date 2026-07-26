@@ -10,5 +10,3 @@ out = "dist"
 [types]
 strict = true
 defs = ["love2d"]     # ambient LÖVE API types from defs/love2d.d.lua
-
-[dependencies]

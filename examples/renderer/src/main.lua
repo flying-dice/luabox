@@ -1,4 +1,4 @@
--- renderer: draw ASCII shapes to stdout. Run it with `luabox run start`.
+-- renderer: draw ASCII shapes to stdout. Run it with any Lua 5.1 interpreter.
 package.path = "src/?.lua;" .. package.path
 
 local Square = require("square")

@@ -459,12 +459,13 @@ pub(crate) fn resolve_project_defs(
 /// each direct dependency (`[dependencies]` + `[dev-dependencies]`) in
 /// alphabetical name order — the deterministic collision-winner order — locate
 /// its package root (a path dependency in place at its `path`, every other
-/// kind under `lua_modules/<name>/`), read that dependency's *own* `[types]
-/// defs`, and load those files from the dependency's `defs/` directory. A
-/// dependency with no manifest on disk (uninstalled, or a source kind whose
-/// root cannot be located here) or no `[types] defs` simply contributes
-/// nothing. Resolution is one level deep only: a dependency's *own*
-/// dependencies' defs do not transit.
+/// kind under `lua_modules/<name>/` — the rock tree the user materializes
+/// with luarocks; luabox only reads it), read that dependency's *own*
+/// `[types] defs`, and load those files from the dependency's `defs/`
+/// directory. A dependency with no manifest on disk (not materialized, or a
+/// source kind whose root cannot be located here) or no `[types] defs` simply
+/// contributes nothing. Resolution is one level deep only: a dependency's
+/// *own* dependencies' defs do not transit.
 ///
 /// Shared with `lint_cmd` (its `undefined-global` known-globals baseline must
 /// count dependency defs' globals too, #103/#108).

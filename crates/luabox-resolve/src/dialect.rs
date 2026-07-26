@@ -1,33 +1,24 @@
-//! Dialect **family sets** — the resolver's compatibility model
+//! Dialect **family sets** — the manifest's compatibility model
 //! (SPEC.md §6, flying-dice/luabox#5).
 //!
 //! A package declares the Lua dialects it is source-compatible with as an
 //! explicit *family set* — **never a range**. A range implies a total order
 //! that LuaJIT breaks: LuaJIT is 5.1-plus-extensions, not a point between 5.1
 //! and 5.2, so `>= 5.1` as an ordered interval is meaningless for it (#5).
-//! The set is the internal resolver model *and* the diagnostic vocabulary; the
-//! LuaRocks bridge is the one boundary where ranges come *in* (a rockspec's
-//! `lua` constraint) and family sets come *out* (see
-//! [`crate::luarocks`]'s `lua_dialects`).
+//! The set is both the internal model and the diagnostic vocabulary.
 //!
 //! # Where a package's set comes from
 //!
-//! In precedence order, funnelled through
-//! [`PackageMeta::lua_versions`](crate::PackageMeta):
-//!
-//! 1. a registry package's rockspec `lua` constraint, translated to the set of
-//!    dialects it admits (`lua-versions` metadata, no `lua` dep → all);
-//! 2. a path/git package's `luabox.toml` `[package] lua-versions`;
-//! 3. otherwise **absent = unconstrained** = every dialect.
+//! A package's `luabox.toml` `[package] lua-versions`; otherwise
+//! **absent = unconstrained** = every dialect.
 //!
 //! # LuaJIT membership
 //!
-//! A rockspec `lua` constraint admits LuaJIT **iff it admits 5.1**, since
-//! LuaJIT is 5.1-family (`lua ~> 5.1` / `lua >= 5.1` is conventionally
-//! LuaJIT-satisfiable). That rule lives in the rockspec→set translation
-//! ([`crate::luarocks`]); this module treats [`Dialect::LuaJit`] as an ordinary
-//! member with no implicit tie to 5.1 (a `luabox.toml` set lists exactly what
-//! it lists).
+//! This module treats [`Dialect::LuaJit`] as an ordinary member with no
+//! implicit tie to 5.1 — a `luabox.toml` set lists exactly what it lists.
+//! (External ecosystems that express the constraint as a range, and for which
+//! `lua >= 5.1` conventionally admits LuaJIT, translate at their own boundary;
+//! nothing in luabox reads such a range.)
 //!
 //! # The Luau fence
 //!
@@ -50,12 +41,12 @@ pub struct DialectSet {
 }
 
 impl DialectSet {
-    /// Build a set from `lua-versions`/rockspec-translated dialect ids
-    /// (`"5.1"`, `"luajit"`, …). Ids no [`Dialect`] recognises — never emitted
-    /// by a validated manifest or the rockspec translation, but possible for a
-    /// hypothetical `"luau"` — are dropped: they name a family this resolver
-    /// cannot model, so they contribute no membership (and the Luau fence in
-    /// [`lowerable`] does the rejecting). An empty result is *unconstrained*.
+    /// Build a set from `lua-versions` dialect ids (`"5.1"`, `"luajit"`, …).
+    /// Ids no [`Dialect`] recognises — never emitted by a validated manifest,
+    /// but possible for a hypothetical `"luau"` — are dropped: they name a
+    /// family this model cannot express, so they contribute no membership (and
+    /// the Luau fence in [`lowerable`] does the rejecting). An empty result is
+    /// *unconstrained*.
     pub fn from_ids<I, S>(ids: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -85,8 +76,8 @@ impl DialectSet {
     }
 
     /// Whether the package is *directly* usable for `target`: unconstrained, or
-    /// `target` is a declared member. (The resolver adds a lowering escape
-    /// hatch on top of this — see [`lowerable`].)
+    /// `target` is a declared member. (The lowering escape hatch sits on top of
+    /// this — see [`lowerable`].)
     #[must_use]
     pub fn admits(&self, target: Dialect) -> bool {
         self.is_unconstrained() || self.contains(target)
@@ -167,8 +158,7 @@ mod tests {
     #[test]
     fn luajit_is_an_ordinary_member_not_tied_to_51() {
         // In a `luabox.toml` set, luajit is exactly what is listed — no
-        // implicit link to 5.1 (that tie lives only in the rockspec
-        // translation).
+        // implicit link to 5.1.
         let jit_only = DialectSet::from_ids(["luajit"]);
         assert!(jit_only.contains(Dialect::LuaJit));
         assert!(!jit_only.contains(Dialect::Lua51));
@@ -179,9 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn the_luarocks_boundary_set() {
-        // `lua >= 5.1, < 5.4` translates to {5.1, 5.2, 5.3, luajit} at the
-        // bridge; here we exercise the PUC members the boundary test relies on.
+    fn a_multi_family_set_admits_only_its_members() {
         let set = DialectSet::from_ids(["5.1", "5.2", "5.3", "luajit"]);
         assert!(set.admits(Dialect::Lua51));
         assert!(!set.admits(Dialect::Lua54));
@@ -189,7 +177,7 @@ mod tests {
 
     #[test]
     fn unknown_ids_like_luau_are_dropped() {
-        // A "luau" id names a family this resolver cannot model: it contributes
+        // A "luau" id names a family this model cannot express: it contributes
         // no membership. (Manifests never produce it — the fence is structural.)
         let set = DialectSet::from_ids(["luau"]);
         assert!(set.is_unconstrained(), "luau contributes nothing");
