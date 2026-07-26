@@ -31,12 +31,15 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
-  # Line-coverage gate (cargo-llvm-cov). The workspace sits at ~88% today;
-  # the floor is set a notch below so the gate catches genuine erosion
-  # (a new module landing untested) without flaking on noise. Raise the
-  # floor as coverage rises — never lower it to make a PR pass. The full
-  # per-file report is uploaded as an artifact for inspection.
-  coverage:
+  # Dual line-coverage gates (cargo-llvm-cov), measured as two ISOLATED
+  # suites so each style of testing independently guarantees behaviour:
+  #   - unit: every in-process test (libs, bins, per-crate tests/) with the
+  #     cucumber e2e binaries excluded. Floor 95 (measured 96.9%).
+  #   - e2e: the black-box cucumber suites alone (acceptance +
+  #     lsp_acceptance driving the real binary). Floor 72 (measured 74.6%).
+  # Raise a floor as its number rises — never lower one to make a PR pass.
+  # Each job uploads its lcov as an artifact for inspection.
+  coverage-unit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -46,21 +49,52 @@ jobs:
           components: llvm-tools
       - uses: Swatinem/rust-cache@v2
         with:
-          key: coverage
+          key: coverage-unit
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
-      # One instrumented test run: the per-file summary table goes to the
-      # job log and the gate fails the job under the floor; the lcov export
-      # below reuses the same profdata without rerunning anything.
-      - run: cargo llvm-cov --workspace --fail-under-lines 85
-      - run: cargo llvm-cov report --lcov --output-path lcov.info
+      - run: >
+          cargo llvm-cov --no-report
+          -p luabox-bundle -p luabox-db -p luabox-diag -p luabox-hir
+          -p luabox-lint -p luabox-lower -p luabox-lsp -p luabox-resolve
+          -p luabox-syntax -p luabox-types
+      - run: >
+          cargo llvm-cov --no-report
+          -p luabox-cli --bins --test cross_package_defs --test watch
+      - run: cargo llvm-cov report --fail-under-lines 95
+      - run: cargo llvm-cov report --lcov --output-path lcov-unit.info
         if: always()
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: coverage-lcov
-          path: lcov.info
+          name: coverage-unit-lcov
+          path: lcov-unit.info
+
+  coverage-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+          components: llvm-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage-e2e
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - run: >
+          cargo llvm-cov --no-report
+          -p luabox-cli --test acceptance --test lsp_acceptance
+      - run: cargo llvm-cov report --fail-under-lines 72
+      - run: cargo llvm-cov report --lcov --output-path lcov-e2e.info
+        if: always()
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-e2e-lcov
+          path: lcov-e2e.info
 
   # SPEC.md §16.1 — perf gates are CI-blocking: cold start < 50 ms, and
   # (until `luabox check` lands, ticket #6) a `fmt --check` throughput

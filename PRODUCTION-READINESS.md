@@ -164,3 +164,47 @@ What A explicitly keeps, because the core needs it:
 4. CHANGELOG entry + minor version bump; the removals are breaking.
 5. Re-run the full gate suite; coverage floor likely rises to ~90 —
    raise the CI floor accordingly.
+
+---
+
+# 0.2.0 sign-off (2026-07-26)
+
+The accepted scope cut is executed, verified, and enforced. Tracked as
+GitHub issues #10–#13; latent bugs surfaced by the coverage waves filed
+as #14 and #15.
+
+## Final state
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all --check` | clean |
+| `cargo clippy --workspace --all-targets -- -D warnings` (pedantic + restriction lints) | clean |
+| Full test suite | **2,012 tests, 0 failures** |
+| E2E (cucumber, black-box, run alone) | 348 CLI scenarios + 82 LSP-over-stdio scenarios, all green; **74.6% line coverage**, CI floor 72 |
+| Unit (all in-process tests, run alone) | ~950 new tests this wave; **96.9% line coverage**, every crate ≥ 92%, CI floor 95 |
+
+The two suites are measured and gated **independently** in CI
+(`coverage-unit`, `coverage-e2e`): social/black-box scenarios pin the
+user-visible contract while mockist/in-process tests pin each crate's
+behaviour, doubling up on the same code from both directions.
+
+## Honest residue (why the numbers are not 100)
+
+- **Unit (96.9%)**: catalogued in the test waves — defensive arms behind
+  validated invariants, `cfg(windows)`-gated zip paths on Linux CI, the
+  live-network upgrade path, real-stdio server bootstrap, and
+  assert-message operands inside passing tests. These are genuinely
+  unreachable in-process on this platform, not untested behaviour.
+- **E2E (74.6%)**: a black-box suite can only enter through the CLI; the
+  remaining lines are internals the binary reaches only on inputs the
+  frontend rejects earlier, plus the same OS/network-gated paths. Every
+  user-facing command, diagnostic family, LSP method, and exit code is
+  scenario-covered.
+
+## Versioning note
+
+The owner asked for this to be "version 0.1.0 at the refined scope".
+Tags v0.1.0–v0.1.4 are already published with release binaries the
+install scripts resolve, so re-issuing 0.1.0 would rewrite shipped
+history. 0.2.0 is that release in substance: the first version at the
+nailed-down scope, with the confidence bar raised.
