@@ -134,9 +134,11 @@ pedantic = "warn"           # tier/rule levels: allow | warn | deny
 > **Parked post-v1 (2026-07-26, [DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26)).**
 > None of this section ships in 0.2.0: the PubGrub solver, the luarocks bridge,
 > the git/url/path providers, `luabox.lock`, the CAS store and `luabox publish`
-> are removed. **luabox consumes a rock tree; it does not produce one.** What
-> survives is the *read* side — the `luabox.toml` manifest model and the
-> `lua_modules/` read path, so `require` resolution and cross-package type
+> are removed, along with the dependency dialect-set check — `[package]
+> lua-versions` still parses and `luabox explain LB1003` still documents the
+> rule, but nothing evaluates it. **luabox consumes a rock tree; it does not
+> produce one.** What survives is the *read* side — the `luabox.toml` manifest
+> model and the `lua_modules/` read path, so `require` resolution and cross-package type
 > checking work over a tree you materialize yourself
 > (`luarocks install --tree lua_modules <rock>`, then `luabox check`).
 > The **direction below is unchanged** and is the target for when dependency
@@ -242,7 +244,7 @@ crates/
   luabox-db          salsa incremental database (shared: check/lint/lsp/fmt)
   luabox-lower       target lowering + polyfill injection (the tsc bit)
   luabox-bundle      require-graph, tree-shake, minify, sourcemaps
-  luabox-resolve     luabox.toml manifest model, project discovery, dialects
+  luabox-resolve     luabox.toml manifest: typed model, validation, round-trip
   luabox-lsp         server over luabox-db
   luabox-cli         thin frontend
 ```
@@ -251,8 +253,11 @@ crates/
 as the linter and the diagnostic registry grew. **`luabox-store`** — the CAS
 cache, fetch and verify crate — **was deleted in 0.2.0**: it existed only to
 back installs. `luabox-resolve` lost its resolving half (solver, providers,
-lockfile, luarocks bridge) with it; the name is retained for now, a rename to
-`luabox-manifest` is open. Both per
+lockfile, luarocks bridge, dependency dialect-sets) with it and is now the
+manifest crate only — project discovery lives in `luabox-cli`, and the
+`lua_modules/` read path in `luabox-bundle`'s `require` resolution, consumed
+by `check`/`lint`/the LSP. The name is retained for now; a rename to
+`luabox-manifest` is open. All per
 [DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26).)
 
 | Context | Crates | Owns | Boundary contract |
@@ -260,7 +265,7 @@ lockfile, luarocks bridge) with it; the name is retained for now, a rename to
 | Syntax | `luabox-syntax` | Lua grammar, lossless trees, dialect gating | tree types + parse API |
 | Semantics | `luabox-hir`, `luabox-types`, `luabox-db` | name resolution, type IR, inference, incremental queries | salsa DB traits |
 | Emit | `luabox-lower`, `luabox-bundle` | lowering, polyfills, require-graph, sourcemaps | checked HIR in, bytes out; type-blind |
-| Distribution | `luabox-resolve` | manifest model, project discovery, dialect sets, the `lua_modules/` read path (solver, lockfile, CAS and the luarocks bridge are parked — §6) | manifest/project API; never parses syntax |
+| Distribution | `luabox-resolve` | the `luabox.toml` model, its validation and comment-preserving round-trip (solver, lockfile, CAS and the luarocks bridge are parked — §6) | manifest API; never parses syntax |
 | ~~Execution~~ | — | ~~runtime acquisition~~ | **Context removed in 0.2.0** — luabox spawns no process (§12) |
 | Frontend | `luabox-cli`, `luabox-lsp` | UX, protocol, diagnostics rendering | consumes all, owns none |
 
