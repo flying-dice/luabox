@@ -50,7 +50,7 @@ pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
     // nothing but annotations, so a swallowed region there loses
     // documentation outright.
     let mut parse_diags = Vec::new();
-    let mut push_parse_errors = |rel: &str, source: &str, diags: &mut Vec<Diagnostic>| {
+    let push_parse_errors = |rel: &str, source: &str, diags: &mut Vec<Diagnostic>| {
         for err in lua::parse(source, project.dialect).errors() {
             let range = usize::from(err.range.start())..usize::from(err.range.end());
             diags.push(
