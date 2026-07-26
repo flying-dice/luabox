@@ -8,17 +8,12 @@
 //!
 //! [`Manifest::parse`] collects *every* validation error in one pass
 //! (SPEC.md §14: batch diagnostics, not fail-fast) and, on success, keeps
-//! the parsed [`toml_edit::DocumentMut`] alongside the typed view so an edit
-//! preserves comments and formatting — see [`Manifest::set_dependency`] for
-//! the pattern this generalizes to.
-//! [`Manifest::workspace_members`] expands `[workspace] members` globs
-//! (`packages/*`) into concrete member directories, cargo-style.
+//! the parsed [`toml_edit::DocumentMut`] alongside the typed view so the
+//! manifest round-trips byte-identically, comments and formatting intact.
 
-mod edit;
 mod error;
 mod model;
 mod parse;
-mod workspace;
 
 pub use error::ManifestError;
 pub use model::{

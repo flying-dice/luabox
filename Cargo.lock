@@ -934,9 +934,7 @@ dependencies = [
 name = "luabox-resolve"
 version = "0.2.0"
 dependencies = [
- "luabox-syntax",
  "serde",
- "tempfile",
  "toml_edit",
 ]
 

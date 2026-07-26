@@ -10,13 +10,6 @@ rust-version.workspace = true
 [dependencies]
 serde.workspace = true
 toml_edit.workspace = true
-# The dialect *compatibility* model ([`dialect`]) classifies
-# `luabox_syntax::Dialect` values as families; it never parses Lua (SPEC.md
-# §16 — Distribution "never parses syntax").
-luabox-syntax.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true
