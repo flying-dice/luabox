@@ -88,7 +88,7 @@ pub struct Types {
 /// One `[dependencies]` / `[dev-dependencies]` entry.
 ///
 /// TOML shape: a bare version-requirement string, or an inline table with
-/// exactly one of `git`, `path`, or `workspace = true`.
+/// exactly one of `git`, `path`, or `url`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum Dependency {
@@ -101,8 +101,6 @@ pub enum Dependency {
     /// `pkg = { url = "…", sha256 = "…" }` — an http(s) (or `file://`/local)
     /// tarball, pinned by its SHA-256.
     Url(UrlDependency),
-    /// `pkg = { workspace = true }`
-    Workspace(WorkspaceDependency),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -137,21 +135,6 @@ pub struct UrlDependency {
     pub sha256: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct WorkspaceDependency {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-}
-
-/// One `[tasks]` entry: a single shell command, or a sequence run in order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(untagged)]
-pub enum TaskValue {
-    Single(String),
-    Multiple(Vec<String>),
 }
 
 /// A lint severity level in `[lint]` (SPEC.md §9): the analog of clippy's
@@ -192,21 +175,11 @@ pub struct Lint {
     pub rules: BTreeMap<String, LintLevel>,
 }
 
-/// `[workspace]` (SPEC.md §5).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct Workspace {
-    /// Member globs. Only a whole-segment `*` wildcard is supported
-    /// (`packages/*`), matching cargo's common case.
-    pub members: Vec<String>,
-}
-
 /// The typed, validated contents of a `luabox.toml`.
 ///
 /// Construct via [`crate::manifest::Manifest::parse`]. Carries the parsed
-/// [`toml_edit::DocumentMut`] alongside the typed view so edits (e.g.
-/// [`crate::manifest::Manifest::set_dependency`]) preserve comments and
-/// formatting for everything they don't touch.
+/// [`toml_edit::DocumentMut`] alongside the typed view so the manifest
+/// round-trips byte-identically, comments and formatting intact.
 #[derive(Debug, Clone)]
 pub struct Manifest {
     pub package: Package,
@@ -214,8 +187,6 @@ pub struct Manifest {
     pub types: Types,
     pub dependencies: BTreeMap<String, Dependency>,
     pub dev_dependencies: BTreeMap<String, Dependency>,
-    pub tasks: BTreeMap<String, TaskValue>,
-    pub workspace: Option<Workspace>,
     /// `[lint]` configuration (SPEC.md §9).
     pub lint: Lint,
     pub(super) document: toml_edit::DocumentMut,

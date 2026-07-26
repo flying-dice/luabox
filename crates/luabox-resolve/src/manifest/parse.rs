@@ -12,18 +12,18 @@ use toml_edit::{ImDocument, Item, Table, TableLike};
 use super::error::ManifestError;
 use super::model::{
     ALLOWED_BUNDLE_MODES, ALLOWED_DIALECTS, Build, DEFAULT_ENTRY, Dependency, GitDependency,
-    LINT_TIERS, Lint, LintLevel, Manifest, Package, PathDependency, TaskValue, Types,
-    UrlDependency, Workspace, WorkspaceDependency,
+    LINT_TIERS, Lint, LintLevel, Manifest, Package, PathDependency, Types, UrlDependency,
 };
 
+// `[tasks]` and `[workspace]` were dropped in 0.2.0 (#18): they only ever
+// served the removed `run` command and the parked solver, so they now get
+// the standard unknown-table error instead of parse-but-ignore.
 const TOP_LEVEL_KEYS: &[&str] = &[
     "package",
     "build",
     "types",
     "dependencies",
     "dev-dependencies",
-    "tasks",
-    "workspace",
     "lint",
 ];
 const LINT_LEVELS: &[&str] = &["allow", "warn", "deny"];
@@ -47,17 +47,8 @@ const BUILD_KEYS: &[&str] = &[
     "minify",
 ];
 const TYPES_KEYS: &[&str] = &["strict", "defs"];
-const WORKSPACE_KEYS: &[&str] = &["members"];
 const DEPENDENCY_KEYS: &[&str] = &[
-    "git",
-    "rev",
-    "tag",
-    "branch",
-    "path",
-    "url",
-    "sha256",
-    "workspace",
-    "version",
+    "git", "rev", "tag", "branch", "path", "url", "sha256", "version",
 ];
 
 impl Manifest {
@@ -86,8 +77,6 @@ impl Manifest {
         let types = parse_types(root, &mut errors);
         let dependencies = parse_dependencies(root, "dependencies", &mut errors);
         let dev_dependencies = parse_dependencies(root, "dev-dependencies", &mut errors);
-        let tasks = parse_tasks(root, &mut errors);
-        let workspace = parse_workspace(root, &mut errors);
         let lint = parse_lint(root, &mut errors);
 
         if errors.is_empty() {
@@ -97,8 +86,6 @@ impl Manifest {
                 types,
                 dependencies,
                 dev_dependencies,
-                tasks,
-                workspace,
                 lint,
                 document: im_document.into_mut(),
             })
@@ -498,14 +485,6 @@ fn parse_types(root: &Table, errors: &mut Vec<ManifestError>) -> Types {
     }
 }
 
-fn parse_workspace(root: &Table, errors: &mut Vec<ManifestError>) -> Option<Workspace> {
-    let table = get_table(root, "workspace", errors)?;
-    check_unknown_keys(table, "[workspace] key", WORKSPACE_KEYS, errors);
-    Some(Workspace {
-        members: get_string_array(table, "workspace", "members", errors),
-    })
-}
-
 /// Parse `[lint]` (SPEC.md §9). `globals` is a string array; every other key
 /// is a level entry (`allow`/`warn`/`deny`) targeting either a tier name
 /// ([`LINT_TIERS`]) or a rule id. Rule ids are open (they live in
@@ -597,31 +576,23 @@ fn parse_dependency(
     let path = get_string(table, &ctx, "path", false, errors);
     let url = get_string(table, &ctx, "url", false, errors);
     let sha256 = get_string(table, &ctx, "sha256", false, errors);
-    let has_workspace_key = table.get("workspace").is_some();
-    let workspace_flag = if has_workspace_key {
-        get_bool(table, &ctx, "workspace", false, errors)
-    } else {
-        false
-    };
     let version = get_string(table, &ctx, "version", false, errors);
     let rev = get_string(table, &ctx, "rev", false, errors);
     let tag = get_string(table, &ctx, "tag", false, errors);
     let branch = get_string(table, &ctx, "branch", false, errors);
 
-    let kinds_present = usize::from(git.is_some())
-        + usize::from(path.is_some())
-        + usize::from(url.is_some())
-        + usize::from(has_workspace_key);
+    let kinds_present =
+        usize::from(git.is_some()) + usize::from(path.is_some()) + usize::from(url.is_some());
     if kinds_present == 0 {
         errors.push(ManifestError::new(
-            format!("`{ctx}` must specify one of `git`, `path`, `url`, or `workspace = true`"),
+            format!("`{ctx}` must specify one of `git`, `path`, or `url`"),
             item.span(),
         ));
         return None;
     }
     if kinds_present > 1 {
         errors.push(ManifestError::new(
-            format!("`{ctx}` must specify only one of `git`, `path`, `url`, or `workspace = true`"),
+            format!("`{ctx}` must specify only one of `git`, `path`, or `url`"),
             item.span(),
         ));
         return None;
@@ -676,53 +647,6 @@ fn parse_dependency(
         }));
     }
 
-    if let Some(path) = path {
-        return Some(Dependency::Path(PathDependency { path, version }));
-    }
-
-    if !workspace_flag {
-        errors.push(ManifestError::new(
-            format!("`{ctx}.workspace` must be `true`"),
-            item_span(table, "workspace"),
-        ));
-        return None;
-    }
-    Some(Dependency::Workspace(WorkspaceDependency { version }))
-}
-
-fn parse_tasks(root: &Table, errors: &mut Vec<ManifestError>) -> BTreeMap<String, TaskValue> {
-    let Some(table) = get_table(root, "tasks", errors) else {
-        return BTreeMap::new();
-    };
-    let mut out = BTreeMap::new();
-    for (name, item) in table.iter() {
-        if let Some(s) = item.as_str() {
-            out.insert(name.to_owned(), TaskValue::Single(s.to_owned()));
-            continue;
-        }
-        if let Some(array) = item.as_array() {
-            let mut commands = Vec::with_capacity(array.len());
-            let mut all_strings = true;
-            for value in array {
-                if let Some(s) = value.as_str() {
-                    commands.push(s.to_owned());
-                } else {
-                    all_strings = false;
-                    errors.push(ManifestError::new(
-                        format!("`tasks.{name}` entries must be strings"),
-                        value.span(),
-                    ));
-                }
-            }
-            if all_strings {
-                out.insert(name.to_owned(), TaskValue::Multiple(commands));
-            }
-            continue;
-        }
-        errors.push(ManifestError::new(
-            format!("`tasks.{name}` must be a string or an array of strings"),
-            item.span(),
-        ));
-    }
-    out
+    // kinds_present == 1 and it wasn't url or git, so it must be path.
+    path.map(|path| Dependency::Path(PathDependency { path, version }))
 }

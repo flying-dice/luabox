@@ -18,8 +18,7 @@ mod parse;
 pub use error::ManifestError;
 pub use model::{
     ALLOWED_BUNDLE_MODES, ALLOWED_DIALECTS, Build, DEFAULT_ENTRY, Dependency, GitDependency,
-    LINT_TIERS, Lint, LintLevel, Manifest, Package, PathDependency, TaskValue, Types,
-    UrlDependency, Workspace, WorkspaceDependency,
+    LINT_TIERS, Lint, LintLevel, Manifest, Package, PathDependency, Types, UrlDependency,
 };
 
 #[cfg(test)]
@@ -73,11 +72,11 @@ mod tests {
         assert!(manifest.types.strict);
         assert_eq!(manifest.types.defs, vec!["love2d".to_owned()]);
 
-        // The example's optional tables (`[dependencies]`, `[tasks]`,
-        // `[workspace]`) are asserted by the focused tests below against
-        // fixtures this file owns; asserting their *contents* here would pin
-        // the test to SPEC.md's illustrative values. What this test owns is
-        // that the spec's own example parses at all, and round-trips.
+        // The example's optional tables (e.g. `[dependencies]`) are asserted
+        // by the focused tests below against fixtures this file owns;
+        // asserting their *contents* here would pin the test to SPEC.md's
+        // illustrative values. What this test owns is that the spec's own
+        // example parses at all, and round-trips.
         assert_eq!(manifest.to_string(), source);
     }
 
@@ -103,8 +102,6 @@ mod tests {
         assert!(manifest.types.defs.is_empty());
         assert!(manifest.dependencies.is_empty());
         assert!(manifest.dev_dependencies.is_empty());
-        assert!(manifest.tasks.is_empty());
-        assert!(manifest.workspace.is_none());
     }
 
     #[test]
@@ -348,7 +345,7 @@ mod tests {
 
     #[test]
     fn dependency_forms_all_parse() {
-        let src = "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[dependencies]\na = \"1.0\"\nb = { git = \"https://example/b\", tag = \"v1\" }\nc = { git = \"https://example/c\", branch = \"main\" }\nd = { path = \"../d\" }\ne = { workspace = true }\n";
+        let src = "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[dependencies]\na = \"1.0\"\nb = { git = \"https://example/b\", tag = \"v1\" }\nc = { git = \"https://example/c\", branch = \"main\" }\nd = { path = \"../d\" }\n";
         let manifest = Manifest::parse(src).expect("valid manifest");
 
         assert_eq!(
@@ -367,10 +364,28 @@ mod tests {
             Some(Dependency::Path(p)) => assert_eq!(p.path, "../d"),
             other => panic!("expected path dep, got {other:?}"),
         }
-        assert!(matches!(
-            manifest.dependencies.get("e"),
-            Some(Dependency::Workspace(_))
-        ));
+    }
+
+    #[test]
+    fn removed_workspace_dependency_form_is_an_error() {
+        // `{ workspace = true }` deps died with `[workspace]` (#18).
+        let src = "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[dependencies]\ne = { workspace = true }\n";
+        let errors = Manifest::parse(src).unwrap_err();
+        assert!(errors.iter().any(|e| e.message.contains("`workspace`")));
+    }
+
+    #[test]
+    fn removed_tasks_and_workspace_tables_are_unknown_table_errors() {
+        // Dropped in 0.2.0 (#18): both only served removed subsystems, so
+        // they get the standard unknown-table error, not parse-but-ignore.
+        for table in ["tasks", "workspace"] {
+            let src = format!("{PREAMBLE}\n[{table}]\nx = \"y\"\n");
+            let errors = Manifest::parse(&src).unwrap_err();
+            assert!(
+                errors.iter().any(|e| e.message.contains(table)),
+                "[{table}] should be an unknown-table error, got {errors:?}"
+            );
+        }
     }
 
     #[test]
@@ -437,32 +452,6 @@ mod tests {
         let src = "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[dependencies]\nbad = { git = \"https://x\", ref = \"a\" }\n";
         let errors = Manifest::parse(src).unwrap_err();
         assert!(errors.iter().any(|e| e.message.contains("`ref`")));
-    }
-
-    #[test]
-    fn task_value_string_and_array_forms() {
-        let manifest = Manifest::parse(
-            "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[tasks]\nsolo = \"echo hi\"\nmulti = [\"echo a\", \"echo b\"]\n",
-        )
-        .expect("valid manifest");
-        assert_eq!(
-            manifest.tasks.get("solo"),
-            Some(&TaskValue::Single("echo hi".to_owned()))
-        );
-        assert_eq!(
-            manifest.tasks.get("multi"),
-            Some(&TaskValue::Multiple(vec![
-                "echo a".to_owned(),
-                "echo b".to_owned()
-            ]))
-        );
-    }
-
-    #[test]
-    fn task_value_rejects_non_string_array_entries() {
-        let src = "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[tasks]\nbad = [1, 2]\n";
-        let errors = Manifest::parse(src).unwrap_err();
-        assert!(errors.iter().any(|e| e.message.contains("tasks.bad")));
     }
 
     #[test]
@@ -550,14 +539,7 @@ mod tests {
 
     #[test]
     fn a_section_that_is_not_a_table_is_reported_per_section() {
-        for section in [
-            "build",
-            "types",
-            "workspace",
-            "lint",
-            "dependencies",
-            "tasks",
-        ] {
+        for section in ["build", "types", "lint", "dependencies"] {
             // The scalar must precede `[package]` to stay a top-level key.
             let src = format!("{section} = 5\n{PREAMBLE}");
             assert_reports(&src, &format!("`[{section}]` must be a table"));
@@ -650,34 +632,6 @@ mod tests {
         );
     }
 
-    // --- [workspace] -------------------------------------------------------
-
-    #[test]
-    fn workspace_members_parse_and_default_to_empty() {
-        let manifest = Manifest::parse(&format!(
-            "{PREAMBLE}\n[workspace]\nmembers = [\"packages/*\", \"tools/cli\"]\n"
-        ))
-        .expect("valid [workspace]");
-        let workspace = manifest.workspace.expect("[workspace] present");
-        assert_eq!(workspace.members, vec!["packages/*", "tools/cli"]);
-
-        // Present but empty: still a workspace, with no members.
-        let bare = Manifest::parse(&format!("{PREAMBLE}\n[workspace]\n"))
-            .expect("an empty [workspace] is valid");
-        assert_eq!(
-            bare.workspace.expect("[workspace] present").members,
-            Vec::<String>::new()
-        );
-    }
-
-    #[test]
-    fn unknown_workspace_key_is_reported() {
-        assert_reports(
-            &format!("{PREAMBLE}\n[workspace]\nmemebers = [\"a\"]\n"),
-            "memebers",
-        );
-    }
-
     // --- dependencies ------------------------------------------------------
 
     #[test]
@@ -692,36 +646,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn workspace_dependency_flag_must_be_true() {
-        assert_reports(
-            &format!("{PREAMBLE}\n[dependencies]\na = {{ workspace = false }}\n"),
-            "`dependencies.a.workspace` must be `true`",
-        );
-    }
-
-    // --- [tasks] -----------------------------------------------------------
-
-    #[test]
-    fn a_task_that_is_neither_string_nor_array_is_reported() {
-        assert_reports(
-            &format!("{PREAMBLE}\n[tasks]\nbuild = 7\n"),
-            "`tasks.build` must be a string or an array of strings",
-        );
-    }
-
     // --- lossless round-trip -----------------------------------------------
 
     #[test]
     fn the_backing_document_is_exposed_and_round_trips_byte_identically() {
-        let src =
-            format!("# leading comment\n{PREAMBLE}\n# tasks!\n[tasks]\ntest = \"luabox test\"\n");
+        let src = format!(
+            "# leading comment\n{PREAMBLE}\n# deps!\n[dependencies]\ngreet = {{ path = \"../greet\" }}\n"
+        );
         let manifest = Manifest::parse(&src).expect("valid manifest");
 
         // `document()` hands back the lossless parse, and `Display` renders it
         // — comments and formatting intact.
         assert_eq!(manifest.document().to_string(), src);
         assert_eq!(manifest.to_string(), src);
-        assert!(manifest.document().get("tasks").is_some());
+        assert!(manifest.document().get("dependencies").is_some());
     }
 }

@@ -1,11 +1,12 @@
 # workspace
 
-A monorepo: several packages under one tree, checked together. The
-`[workspace]` table lists members by glob.
+A monorepo: several packages under one tree, checked together. No manifest
+declaration is needed — the source walk covers nested packages. (The old
+`[workspace]` table was dropped in 0.2.0, #18.)
 
 ```
 workspace/
-├── luabox.toml                     # [workspace] members = ["packages/*"]
+├── luabox.toml                     # root manifest — edition only
 └── packages/
     ├── core/                       # a shared library
     │   ├── luabox.toml
@@ -18,8 +19,8 @@ workspace/
 
 ## Checking across members
 
-The root manifest carries a `[workspace]` table. Running `luabox check` from
-the workspace root walks **every member's** sources in one pass:
+Running `luabox check` from the workspace root walks **every member's**
+sources in one pass:
 
 ```sh
 luabox check        # 0 errors across core + cli-tool

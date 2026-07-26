@@ -21,6 +21,13 @@ so it appears in no version entry.
 
 ### Removed
 
+- **`[tasks]`, `[workspace]`, and `{ workspace = true }` dependencies**
+  ([#18](https://github.com/flying-dice/luabox/issues/18)) — these manifest
+  tables only ever served the removed `run` command and the parked solver,
+  and had been parse-but-inert since the scope cut. They are now the
+  standard unknown-table error with a did-you-mean nudge. Monorepo trees
+  are unaffected: the source walk checks nested packages without any
+  manifest declaration.
 - **`luabox add` / `remove` / `install` / `update` / `vendor`**
   ([#10](https://github.com/flying-dice/luabox/issues/10)) — dependency
   resolution and installation are gone: the PubGrub solver, the
