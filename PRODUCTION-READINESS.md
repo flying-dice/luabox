@@ -58,11 +58,23 @@ as coverage rises; never lower it to make a PR pass.
 
 ---
 
-# Scope evaluation: park dependency management (PROPOSED)
+# Scope evaluation: park dependency management (ACCEPTED 2026-07-26)
 
-Status: **proposed — awaiting owner decision.** If accepted, the
-decision and its rationale move into DIRECTION.md as the record, and
-the execution plan below becomes tickets.
+Status: **accepted — owner decision, 2026-07-26.** Scope went further
+than proposed: `run`/`toolchain` are also stripped, making v1 a pure
+static toolchain (luabox never spawns an interpreter). The decided v1
+surface:
+
+**Strip:** `add`/`remove`/`install`/`update`/`vendor`,
+`search`/`outdated`, `publish`/`auth`/keychain/GitHub device-flow,
+solver + providers + lockfile + CAS store, `run`/`toolchain`.
+
+**Keep:** `check`/`lint`/`fmt`/`lsp`/`explain`, `build` + bundler,
+`doc`, `self-update`, `new`/`init`, `--watch`, and the `lua_modules/`
+read path (cross-package types over a user-materialized tree).
+
+The rationale and execution plan below stand; the decision record
+moves to DIRECTION.md when the cut lands.
 
 ## The question
 
