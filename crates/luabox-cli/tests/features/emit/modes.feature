@@ -139,6 +139,91 @@ Feature: luabox build --mode — embedding modes (LÖVE, Neovim plugin)
     Then the command fails
     And stderr contains "build.mode"
 
+  Scenario: love mode has no place for a sourcemap, so --sourcemap is dropped
+    Given a project with edition "5.1" targeting "5.1" using mode "love"
+    And a file "src/main.lua" containing:
+      """
+      print("hello-from-love")
+      """
+    When I run "luabox build --sourcemap"
+    Then the command succeeds
+    And the file "dist/fixture.love" exists
+    And the file "dist/fixture.love.map" does not exist
+    And stdout does not contain "with sourcemap"
+
+  Scenario: nvim-plugin mode writes the sourcemap beside the bundled module
+    Given a project with edition "5.1" targeting "5.1" using mode "nvim-plugin"
+    And a file "src/main.lua" containing:
+      """
+      return {}
+      """
+    When I run "luabox build --sourcemap"
+    Then the command succeeds
+    And the file "dist/fixture/lua/fixture/init.lua.map" exists
+    And stdout contains "with sourcemap"
+
+  Scenario: the nvim doc stub falls back to a placeholder description
+    Given a project with edition "5.1" targeting "5.1" using mode "nvim-plugin"
+    And a file "src/main.lua" containing:
+      """
+      return {}
+      """
+    When I run "luabox build"
+    Then the command succeeds
+    And "dist/fixture/doc/fixture.txt" contains "(no description)"
+
+  Scenario: the nvim bootstrap stub says the plugin is meant to be lazy-required
+    Given a project with edition "5.1" targeting "5.1" using mode "nvim-plugin"
+    And a file "src/main.lua" containing:
+      """
+      return {}
+      """
+    When I run "luabox build"
+    Then the command succeeds
+    And "dist/fixture/plugin/fixture.lua" contains "bootstrap stub, auto-sourced by Neovim on startup."
+    And "dist/fixture/plugin/fixture.lua" contains 'require("fixture")'
+
+  Scenario: nvim-plugin mode conflicts with outfile too
+    Given a project with edition "5.1" targeting "5.1" using mode "nvim-plugin"
+    And a file "src/main.lua" containing:
+      """
+      return {}
+      """
+    When I run "luabox build --outfile dist/plugin.lua"
+    Then the command fails
+    And stderr contains "outfile"
+    And stderr contains "nvim-plugin"
+
+  Scenario: an embedding mode packages exactly one entry point
+    Given a project with edition "5.1" targeting "5.1" using mode "nvim-plugin"
+    And a file "src/main.lua" containing:
+      """
+      return {}
+      """
+    And a file "src/other.lua" containing:
+      """
+      return {}
+      """
+    When I run "luabox build --entry src/main.lua --entry src/other.lua"
+    Then the command fails
+    And stderr contains "packages a single entry point, but 2 are configured"
+
+  Scenario: a non-plain mode bundles without being asked to
+    Given a project with edition "5.1" targeting "5.1" using mode "nvim-plugin"
+    And a file "src/main.lua" containing:
+      """
+      local helper = require("helper")
+      return helper
+      """
+    And a file "src/helper.lua" containing:
+      """
+      return { name = "helper" }
+      """
+    When I run "luabox build"
+    Then the command succeeds
+    And "dist/fixture/lua/fixture/init.lua" contains "-- bundled by luabox"
+    And "dist/fixture/lua/fixture/init.lua" contains "__luabox_modules"
+
   Scenario: --mode overrides the manifest's [build] mode
     Given a project with edition "5.1" targeting "5.1" using mode "love"
     And a file "src/main.lua" containing:

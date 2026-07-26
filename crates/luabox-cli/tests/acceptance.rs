@@ -59,10 +59,30 @@ fn run_command(world: &mut AcceptanceWorld, command: String) {
     assert_eq!(program, "luabox", "scenarios drive the luabox binary only");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_luabox"))
         .args(parts)
+        // Scenarios assert on stderr text. `anyhow` appends a full stack
+        // backtrace to every `Error:` line when `RUST_BACKTRACE` is set in
+        // the developer's (or CI's) environment, which would leak that
+        // environment into the assertions — pin it off so a scenario reads
+        // the same everywhere.
+        .env("RUST_BACKTRACE", "0")
         .current_dir(world.dir.path())
         .output()
         .expect("failed to spawn luabox");
     world.output = Some(output);
+}
+
+/// Exit codes are part of the CLI contract and are not all the same kind of
+/// failure: clap rejects a malformed invocation with 2, while a command that
+/// ran and reported problems exits 1 (SPEC.md §14).
+#[then(expr = "the command exits with code {int}")]
+fn command_exits_with_code(world: &mut AcceptanceWorld, expected: i32) {
+    let actual = world.output().status.code();
+    assert_eq!(
+        actual,
+        Some(expected),
+        "expected exit code {expected}, got {actual:?}\nstderr: {}",
+        world.stderr()
+    );
 }
 
 #[then("the command succeeds")]
@@ -166,6 +186,15 @@ fn stderr_contains(world: &mut AcceptanceWorld, needle: String) {
     assert!(
         stderr.contains(&needle),
         "stderr does not contain `{needle}`; stderr:\n{stderr}"
+    );
+}
+
+#[then(expr = "stderr does not contain {string}")]
+fn stderr_does_not_contain(world: &mut AcceptanceWorld, needle: String) {
+    let stderr = world.stderr();
+    assert!(
+        !stderr.contains(&needle),
+        "stderr should not contain `{needle}`; stderr:\n{stderr}"
     );
 }
 
@@ -284,11 +313,19 @@ fn stdout_is_valid_json(world: &mut AcceptanceWorld) {
 async fn main() {
     // @wip gates feature files written ahead of implementation (spec-first,
     // SPEC.md §16.2). Remove the tag when the behaviour ships.
+    //
+    // `features/lsp/` is driven by the separate `lsp_acceptance` harness — it
+    // speaks LSP over stdio and needs its own World — so this CLI harness
+    // skips it rather than reporting every one of its steps as unmatched.
     AcceptanceWorld::filter_run("tests/features", |feature, _rule, scenario| {
         let tagged = |tag: &str| {
             feature.tags.iter().any(|t| t == tag) || scenario.tags.iter().any(|t| t == tag)
         };
-        !tagged("wip")
+        let is_lsp = feature
+            .path
+            .as_ref()
+            .is_some_and(|path| path.components().any(|c| c.as_os_str() == "lsp"));
+        !tagged("wip") && !is_lsp
     })
     .await;
 }

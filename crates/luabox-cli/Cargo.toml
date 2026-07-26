@@ -47,5 +47,12 @@ serde_json.workspace = true
 name = "acceptance"
 harness = false
 
+# The LSP acceptance layer: cucumber scenarios that drive `luabox lsp` as a
+# child process and speak JSON-RPC over its stdio, so the editor surface is
+# covered black-box like every other command (SPEC.md §8 + §16.2).
+[[test]]
+name = "lsp_acceptance"
+harness = false
+
 [lints]
 workspace = true
