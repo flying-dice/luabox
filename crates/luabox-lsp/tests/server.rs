@@ -675,7 +675,7 @@ impl TestClient {
         let TestClient {
             conn,
             server_thread,
-            _dir,
+            _dir: dir,
             ..
         } = self;
         drop(conn);
@@ -683,7 +683,7 @@ impl TestClient {
             .join()
             .expect("server thread panicked")
             .expect("server errored");
-        drop(_dir);
+        drop(dir);
     }
 }
 

@@ -572,7 +572,10 @@ mod tests {
         assert_eq!(comment_lines[0].line, 0);
         assert_eq!(comment_lines[1].line, 1);
         assert_eq!(comment_lines[1].start, 0);
-        assert_eq!(comment_lines[1].length, "second".len() as u32);
+        assert_eq!(
+            comment_lines[1].length,
+            u32::try_from("second".len()).unwrap()
+        );
         assert_eq!(comment_lines[2].line, 2);
     }
 

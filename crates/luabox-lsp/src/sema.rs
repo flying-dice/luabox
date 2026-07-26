@@ -853,6 +853,7 @@ pub fn render_type(ty: &TypeExpr) -> String {
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
+    clippy::string_slice,
     clippy::panic,
     reason = "test code — panics document assumptions"
 )]
@@ -1072,7 +1073,7 @@ mod tests {
         let sema = FileSema::new(&analysis, &path).expect("sema");
         let id = sema
             .binding_decl_at(offset_of(src, "f() end", 0))
-            .and_then(|id| Some(sema.binding(id)));
+            .map(|id| sema.binding(id));
         // `function f` declares a global, not a binding; the annotation is
         // still reachable through the covering item.
         assert!(id.is_none() || sema.binding_type(id.expect("binding")).is_some());
@@ -1118,10 +1119,10 @@ mod tests {
         let rendered: Vec<(String, String)> = fields
             .iter()
             .map(|(f, declaring)| {
-                let name = match &f.key {
-                    FieldKey::Name(n) => n.clone(),
-                    other => panic!("expected a named field, got {other:?}"),
+                let FieldKey::Name(name) = &f.key else {
+                    panic!("expected a named field, got {:?}", f.key)
                 };
+                let name = name.clone();
                 (name, declaring.clone())
             })
             .collect();

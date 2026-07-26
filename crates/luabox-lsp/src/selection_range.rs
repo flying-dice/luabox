@@ -152,6 +152,47 @@ mod tests {
     }
 
     #[test]
+    fn a_position_past_the_end_of_the_file_clamps_to_the_last_token() {
+        let src = "local x = 1\n";
+        let (analysis, path) = analyze(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        // Well past the last line: the offset clamps to the file's end.
+        let result = selection_ranges(&sema, &[Position::new(99, 0)]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].range.start, Position::new(0, 11));
+        // It still widens out to the whole file.
+        let outermost = *chain(&result[0]).last().unwrap();
+        assert_eq!(outermost.start, Position::new(0, 0));
+        assert_eq!(outermost.end, Position::new(1, 0));
+    }
+
+    #[test]
+    fn an_empty_file_has_a_single_empty_range() {
+        let (analysis, path) = analyze("");
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let result = selection_ranges(&sema, &[Position::new(0, 0)]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].range.start, Position::new(0, 0));
+        assert_eq!(result[0].range.end, Position::new(0, 0));
+    }
+
+    #[test]
+    fn a_cursor_before_whitespace_selects_the_token_on_its_left() {
+        let src = "local abc = 1\n";
+        let (analysis, path) = analyze(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        // Column 9 is the boundary between `abc` and the following space.
+        let result = selection_ranges(&sema, &[Position::new(0, 9)]);
+        assert_eq!(
+            result[0].range,
+            lsp_types::Range {
+                start: Position::new(0, 6),
+                end: Position::new(0, 9),
+            }
+        );
+    }
+
+    #[test]
     fn one_range_per_requested_position_in_order() {
         let src = "local a = 1\nlocal b = 2\n";
         let (analysis, path) = analyze(src);

@@ -1320,6 +1320,90 @@ mod tests {
         }
     }
 
+    /// Lua 5.3+ floor division: lowering it to 5.1 is legal but warns about
+    /// the integer-semantics divergence, so it is the fixture for the
+    /// warn-tier path through both emit shapes.
+    const FLOOR_DIV: &str = "local x = 7 // 2\nprint(x)\n";
+
+    #[test]
+    fn a_warn_tier_lowering_diagnostic_does_not_block_tree_mode_emit() {
+        let tmp = project("5.4", "\n[build]\ntarget = \"5.1\"\nout = \"dist\"\n");
+        write(tmp.path(), "src/main.lua", FLOOR_DIV);
+
+        run(tmp.path(), &opts()).expect("a warning must not fail the build");
+        let emitted = read(tmp.path(), "dist/src/main.lua");
+        assert!(emitted.contains("math.floor"), "{emitted}");
+    }
+
+    #[test]
+    fn a_warn_tier_lowering_diagnostic_does_not_block_a_bundle() {
+        let tmp = project(
+            "5.4",
+            "\n[build]\ntarget = \"5.1\"\nout = \"dist\"\nbundle = true\n",
+        );
+        write(tmp.path(), "src/main.lua", FLOOR_DIV);
+
+        run(tmp.path(), &opts()).expect("a warning must not fail the bundle");
+        assert!(read(tmp.path(), "dist/main.lua").contains("math.floor"));
+    }
+
+    #[test]
+    fn a_warn_tier_lowering_diagnostic_maps_to_a_warning_not_an_error() {
+        let lowered = luabox_lower::lower(FLOOR_DIV, Dialect::Lua54, Dialect::Lua51)
+            .expect("floor division lowers");
+        assert!(!lowered.warnings.is_empty());
+        let diags = to_diagnostics(&lowered.warnings, "src/main.lua");
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.severity == luabox_diag::Severity::Warning),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_lowering_warning_is_reported_alongside_the_emitted_file() {
+        let (output, diags) = lower_one(FLOOR_DIV, "src/main.lua", Dialect::Lua54, Dialect::Lua51);
+        // Output *and* diagnostics: warnings never suppress the emit.
+        assert!(output.is_some());
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn minify_composes_with_the_packaging_modes() {
+        let tmp = project("5.4", "\n[build]\nout = \"dist\"\nmode = \"nvim-plugin\"\n");
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "local a_very_long_local_name = 1\nreturn a_very_long_local_name\n",
+        );
+
+        run(tmp.path(), &opts()).expect("plain build");
+        let plain = read(tmp.path(), "dist/fixture/lua/fixture/init.lua");
+
+        let options = BuildOptions {
+            minify: true,
+            ..opts()
+        };
+        run(tmp.path(), &options).expect("minified build");
+        let minified = read(tmp.path(), "dist/fixture/lua/fixture/init.lua");
+        assert!(minified.len() < plain.len(), "{minified}");
+    }
+
+    #[test]
+    fn an_empty_package_name_falls_back_to_bundle() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "luabox.toml",
+            "[package]\nname = \"\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n\n[build]\nout = \"dist\"\nmode = \"nvim-plugin\"\n",
+        );
+        write(tmp.path(), "src/main.lua", "return 0\n");
+
+        run(tmp.path(), &opts()).expect("build succeeds");
+        assert!(tmp.path().join("dist").join("bundle").is_dir());
+    }
+
     #[test]
     fn lower_diagnostics_carry_the_file_relative_span_and_severity() {
         let lowered = luabox_lower::lower(

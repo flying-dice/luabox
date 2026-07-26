@@ -1783,6 +1783,38 @@ mod tests {
     }
 
     #[test]
+    fn merging_adds_carrier_attachments_the_base_does_not_declare() {
+        let mut env = TypeEnv::default();
+        env.merge_file_types(&surface(
+            "\
+---@class Attach
+---@field declared string
+",
+        ));
+        let mut incoming = FileTypes::default();
+        incoming.classes.insert(
+            "Attach".to_string(),
+            ClassDef {
+                methods: BTreeMap::from([(
+                    "extra".to_string(),
+                    FieldTy {
+                        ty: Ty::Boolean,
+                        optional: false,
+                    },
+                )]),
+                ..ClassDef::default()
+            },
+        );
+        env.merge_file_types(&incoming);
+        let def = env.classes.get("Attach").expect("merged class");
+        assert_eq!(def.methods["extra"].ty, Ty::Boolean);
+        // Attachments resolve on reads, folded in beside the declared field.
+        let shape = env.class_shape("Attach").expect("shape");
+        assert_eq!(shape.fields["declared"].ty, Ty::String);
+        assert_eq!(shape.fields["extra"].ty, Ty::Boolean);
+    }
+
+    #[test]
     fn merging_enums_is_first_wins() {
         let mut env = TypeEnv::default();
         env.merge_file_types(&surface(
@@ -1951,6 +1983,28 @@ function Vis.open() end
         assert_eq!(def.visibility.get("guarded"), Some(&FieldScope::Protected));
         assert_eq!(def.visibility.get("internal"), Some(&FieldScope::Package));
         assert_eq!(def.visibility.get("open"), None);
+    }
+
+    #[test]
+    fn visibility_tags_on_unaddressable_targets_are_dropped() {
+        // Each of these has no `(carrier, member)` pair to bind to, so the
+        // tag is discarded rather than misattributed.
+        let env = env_of(
+            "\
+---@class Drop
+local Drop = {}
+---@private
+function bare() end
+---@private
+Drop = {}
+---@private
+local shadow = 1
+---@private
+Drop[1] = 2
+",
+        );
+        let def = env.classes.get("Drop").expect("class declared");
+        assert!(def.visibility.is_empty(), "{:?}", def.visibility);
     }
 
     #[test]

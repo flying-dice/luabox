@@ -240,6 +240,7 @@ fn resolve_module(root: &Path, module: &str) -> Option<PathBuf> {
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
+    clippy::string_slice,
     reason = "test code — panics document assumptions"
 )]
 mod tests {

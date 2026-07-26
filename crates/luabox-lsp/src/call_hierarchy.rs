@@ -784,8 +784,10 @@ end
     #[test]
     fn outgoing_calls_for_an_item_this_file_does_not_declare_are_empty() {
         let lib = "function there() end\n";
-        let (analysis, main_path) =
-            analyze(&[("main.lua", "local function here() end\n"), ("lib.lua", lib)]);
+        let (analysis, main_path) = analyze(&[
+            ("main.lua", "local function here() end\n"),
+            ("lib.lua", lib),
+        ]);
         let lib_path = main_path.parent().expect("parent").join("lib.lua");
         let lib_sema = sema_for(&analysis, &lib_path);
         let item =

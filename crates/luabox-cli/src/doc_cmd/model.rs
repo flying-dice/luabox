@@ -943,9 +943,7 @@ mod tests {
 
     #[test]
     fn an_indexer_field_is_named_by_its_bracketed_key_type() {
-        let m = module(
-            "---@class Bag\n---@field [string] number a bucket\nlocal Bag = {}\n",
-        );
+        let m = module("---@class Bag\n---@field [string] number a bucket\nlocal Bag = {}\n");
         let field = &m.classes[0].fields[0];
         assert_eq!(field.name, "[string]");
         assert_eq!(field.ty, "number");
@@ -1038,10 +1036,7 @@ mod tests {
         let m = module(
             "---@return boolean ok\n---@return string? err\nlocal function f()\n  return true\nend\n",
         );
-        assert_eq!(
-            m.functions[0].signature(),
-            "function f(): boolean, string?"
-        );
+        assert_eq!(m.functions[0].signature(), "function f(): boolean, string?");
     }
 
     #[test]

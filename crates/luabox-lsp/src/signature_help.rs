@@ -456,6 +456,120 @@ f(1)
         assert!(signature_help(&sema, offset).is_none());
     }
 
+    /// Signature help just after the `(` of the last occurrence of `call`.
+    fn help_after_open(src: &str, call: &str) -> Option<SignatureHelp> {
+        let (analysis, path) = analyze(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let offset = src.rfind(call).expect("call present") + call.len();
+        signature_help(&sema, offset)
+    }
+
+    #[test]
+    fn a_dotted_call_resolves_via_the_receiver_class_field() {
+        let src = "\
+---@class Api
+---@field send fun(payload: string): boolean sends it
+
+---@type Api
+local api = nil
+api.send(\"x\")
+";
+        let help = help_after_open(src, "api.send(").expect("signature help");
+        assert_eq!(labels(&help), vec!["Api.send(payload: string): boolean"]);
+        assert_eq!(help.active_parameter, Some(0));
+    }
+
+    #[test]
+    fn a_dotted_call_falls_back_to_the_declared_function() {
+        let src = "\
+local M = {}
+---@param n number
+---@return string
+function M.helper(n) return tostring(n) end
+M.helper(1)
+";
+        let help = help_after_open(src, "M.helper(").expect("signature help");
+        assert_eq!(labels(&help), vec!["M.helper(n: number): string"]);
+    }
+
+    #[test]
+    fn a_dotted_call_on_a_non_name_receiver_is_none() {
+        assert!(help_after_open("f().helper(1)\n", "helper(").is_none());
+    }
+
+    #[test]
+    fn a_method_call_on_a_non_name_receiver_is_none() {
+        assert!(help_after_open("f():run(1)\n", "run(").is_none());
+    }
+
+    #[test]
+    fn a_method_call_on_a_receiver_with_no_class_is_none() {
+        let src = "local t = {}\nt:run(1)\n";
+        assert!(help_after_open(src, "run(").is_none());
+    }
+
+    #[test]
+    fn a_table_argument_call_has_no_signature_help() {
+        let src = "\
+---@param a number
+local function f(a) end
+f{1}
+";
+        let (analysis, path) = analyze(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        // Only parenthesised argument lists carry positional structure.
+        let offset = src.rfind("f{1}").expect("call") + "f{".len();
+        assert!(signature_help(&sema, offset).is_none());
+    }
+
+    #[test]
+    fn a_string_argument_call_has_no_signature_help() {
+        let src = "\
+---@param a string
+local function f(a) end
+f\"lit\"
+";
+        let (analysis, path) = analyze(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let offset = src.rfind("f\"lit\"").expect("call") + 2;
+        assert!(signature_help(&sema, offset).is_none());
+    }
+
+    #[test]
+    fn an_unclosed_call_still_shows_help_at_the_very_end() {
+        let src = "\
+---@param a number
+local function f(a) end
+f(
+";
+        let (analysis, path) = analyze(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        // The `)` has not been typed yet; the cursor sits at the node end.
+        let offset = src.rfind("f(").expect("call") + "f(".len();
+        let help = signature_help(&sema, offset).expect("signature help");
+        assert_eq!(labels(&help), vec!["f(a: number)"]);
+    }
+
+    #[test]
+    fn a_call_with_no_parameters_reports_active_parameter_zero() {
+        let src = "local function f() end\nf()\n";
+        let help = help_after_open(src, "f(").expect("signature help");
+        assert_eq!(labels(&help), vec!["f()"]);
+        assert_eq!(help.active_parameter, Some(0));
+        assert_eq!(help.signatures[0].parameters, None);
+    }
+
+    #[test]
+    fn an_untyped_optional_parameter_renders_with_a_bare_question_mark() {
+        let src = "\
+---@overload fun(a?)
+local function f(a) end
+f()
+";
+        let help = help_after_open(src, "f(").expect("signature help");
+        assert!(labels(&help).contains(&"f(a?)"), "{:?}", labels(&help));
+    }
+
     #[test]
     fn nested_call_shows_the_innermost_signature() {
         let src = "\

@@ -183,6 +183,7 @@ fn see_lines(sees: &[String]) -> String {
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
+    clippy::string_slice,
     clippy::panic,
     reason = "test code — panics document assumptions"
 )]

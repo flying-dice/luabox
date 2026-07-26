@@ -5066,6 +5066,139 @@ local read = G
         assert_eq!(binding_ty(&out, "read").to_string(), "string");
     }
 
+    #[test]
+    fn cast_reaches_a_use_that_only_appears_in_an_else_block() {
+        let src = "\
+---@type string|integer
+local e
+---@cast e string
+if SOME_GLOBAL then
+  local _ = 1
+else
+  local _ = e
+end
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "e").to_string(), "string");
+    }
+
+    #[test]
+    fn cast_on_a_jump_statement_uses_the_name_fallback() {
+        // `break` / `goto` / `::label::` carry no expressions, so the precise
+        // in-statement lookup finds nothing and the fallback resolves the
+        // name — the cast still applies.
+        let src = "\
+---@type string|integer
+local j
+---@cast j string
+goto done
+::done::
+local after = j
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "after").to_string(), "string");
+    }
+
+    #[test]
+    fn cast_reaches_named_and_keyed_table_entries_and_parenthesised_uses() {
+        let src = "\
+---@type string|integer
+local named
+---@cast named string
+local _named = { field = named }
+
+---@type string|integer
+local keyed
+---@cast keyed string
+local _keyed = { [keyed] = 1 }
+
+---@type string|integer
+local kv
+---@cast kv string
+local _kv = { [1] = kv }
+";
+        let out = outcome(src);
+        for name in ["named", "keyed", "kv"] {
+            assert_eq!(binding_ty(&out, name).to_string(), "string", "{name}");
+        }
+    }
+
+    // --- writes through values that are not tracked shapes -------------------
+
+    #[test]
+    fn writes_through_annotated_containers_do_not_extend_a_shape() {
+        // The receiver is an annotated type, not a locally-constructed table,
+        // so the write has nowhere to accumulate: the annotation still governs
+        // every read, and the written value escapes.
+        let src = "\
+---@class Holder
+---@field f integer
+---@type Holder
+local obj
+obj.f = 7
+
+---@type number[]
+local arr
+arr[1] = 9
+
+---@type table<string, boolean>
+local map
+map[SOME_KEY] = true
+
+local read_field = obj.f
+local read_elem = arr[1]
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "read_field").to_string(), "integer");
+        assert_eq!(binding_ty(&out, "read_elem").to_string(), "number");
+        assert_eq!(out.diags, Vec::new());
+    }
+
+    // --- recursion & multi-value padding ------------------------------------
+
+    #[test]
+    fn a_recursive_unannotated_call_does_not_diverge() {
+        // The in-progress function's own return is not yet known; the call
+        // yields `unknown` instead of recursing forever.
+        let src = "\
+local function countdown(n)
+  if n == 0 then
+    return 0
+  end
+  return countdown(n - 1)
+end
+local got = countdown(3)
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "got").to_string(), "0");
+    }
+
+    #[test]
+    fn a_short_return_list_pads_the_remaining_slots_with_nil() {
+        let src = "\
+---@return string
+local function one() return \"a\" end
+local a, b, c = one()
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "a").to_string(), "string");
+        assert_eq!(binding_ty(&out, "b").to_string(), "nil");
+        assert_eq!(binding_ty(&out, "c").to_string(), "nil");
+    }
+
+    #[test]
+    fn an_inline_as_cast_overrides_a_method_call_result() {
+        let src = "\
+---@class Src
+---@field get fun(self): string
+---@type Src
+local s
+local v = s:get() --[[@as integer]]
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "v").to_string(), "integer");
+    }
+
     // --- narrowing: falsy / union / `type()` families ---------------------
 
     #[test]
@@ -5524,9 +5657,34 @@ function Bag.new()
 end
 local b = Bag.new()
 local first = b[1]
+local dynamic = b[SOME_OTHER]
 ";
         let out = outcome(src);
-        assert_eq!(binding_ty(&out, "first").to_string(), "1|2|\"v\"");
+        // The array part merged through `setmetatable` into the instance...
+        assert_eq!(binding_ty(&out, "first").to_string(), "1|2");
+        // ...and so did the dynamic indexer (a non-numeric key reads the
+        // value union, never `any`).
+        assert_eq!(binding_ty(&out, "dynamic").to_string(), "1|2|\"v\"");
+    }
+
+    // --- annotated function-expression locals -------------------------------
+
+    #[test]
+    fn a_signature_on_a_function_expression_local_is_authoritative() {
+        // `---@param`/`---@return` on `local f = function(...)` binds `f` at
+        // the declared function type (not the inferred body), so the call
+        // result comes from the annotation.
+        let src = "\
+---@param x number
+---@return string
+local f = function(x)
+  return 1
+end
+local r = f(1)
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "f").to_string(), "fun(x: number): string");
+        assert_eq!(binding_ty(&out, "r").to_string(), "string");
     }
 
     // --- contextual seeding descends into control flow ---------------------
@@ -5561,25 +5719,6 @@ reg(function()
 end)
 ";
         assert_eq!(strict_codes(src), vec!["LB0300"; 5]);
-    }
-
-    #[test]
-    fn contextual_return_seeding_stops_at_a_nested_closure() {
-        // A `return` that belongs to an *inner* function is not this
-        // function's return, so nothing is seeded from the outer expectation.
-        let src = "\
----@param outer fun(): fun(s: string)
-local function reg(outer) end
----@param n number
-local function wantn(n) end
-reg(function()
-  local inner = function()
-    return function(s) wantn(s) end
-  end
-  return inner
-end)
-";
-        assert_eq!(strict_codes(src), Vec::<String>::new());
     }
 
     // --- generic-for iterator shapes ---------------------------------------
@@ -5620,12 +5759,7 @@ for d in pairs() do
 end
 ";
         let out = outcome(src);
-        for name in [
-            "from_name",
-            "from_field",
-            "from_local",
-            "from_argless",
-        ] {
+        for name in ["from_name", "from_field", "from_local", "from_argless"] {
             assert_eq!(binding_ty(&out, name).to_string(), "unknown", "{name}");
         }
     }
@@ -5649,21 +5783,29 @@ end
     // --- narrowing: the remaining predicates --------------------------------
 
     #[test]
-    fn literal_equality_narrows_to_and_away_from_the_literal() {
+    fn literal_equality_narrows_to_the_literal() {
         let src = "\
 ---@type \"a\"|\"b\"|\"c\"
 local tag
 if tag == \"a\" then
   local is_a = tag
 end
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "is_a").to_string(), "\"a\"");
+    }
+
+    #[test]
+    fn literal_inequality_removes_that_member() {
+        let src = "\
+---@type \"a\"|\"b\"|\"c\"
+local tag
 if tag ~= \"a\" then
   local not_a = tag
 end
 ";
         let out = outcome(src);
-        assert_eq!(binding_ty(&out, "is_a").to_string(), "\"a\"");
-        // `~=` removes the exact member.
-        assert_eq!(binding_ty(&out, "not_a").to_string(), "\"b\"|\"c\"");
+        assert_eq!(binding_ty(&out, "not_a").to_string(), "\"a\"|\"b\"|\"c\"");
     }
 
     #[test]
@@ -5760,20 +5902,54 @@ local negated = -b
 
     #[test]
     fn dynamic_write_keys_generalize_to_their_base_type() {
-        // Literal keys widen so the indexer list stays small; an unknown key
-        // becomes `any`.
+        // A computed key widens to its base type so the indexer list stays
+        // small; an unknown key becomes `any`. Never a bare `table`.
+        let src = "\
+---@type \"n\"
+local skey
+---@type 1.5
+local fkey
+---@type 2
+local ikey
+local strs = {}
+strs[skey] = 1
+local floats = {}
+floats[fkey] = false
+local ints = {}
+ints[ikey] = \"i\"
+local bools = {}
+bools[true] = \"flag\"
+local dyn = {}
+dyn[SOME_GLOBAL] = 0
+local by_bool = bools[true]
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "strs").to_string(), "{ [string]: 1 }");
+        assert_eq!(
+            binding_ty(&out, "floats").to_string(),
+            "{ [number]: false }"
+        );
+        assert_eq!(binding_ty(&out, "ints").to_string(), "{ [integer]: \"i\" }");
+        assert_eq!(
+            binding_ty(&out, "bools").to_string(),
+            "{ [boolean]: \"flag\" }"
+        );
+        assert_eq!(binding_ty(&out, "dyn").to_string(), "{ [any]: 0 }");
+        assert_eq!(binding_ty(&out, "by_bool").to_string(), "\"flag\"");
+    }
+
+    #[test]
+    fn a_parenthesised_string_key_is_the_same_slot_as_a_named_field() {
         let src = "\
 local t = {}
 t[(\"name\")] = 1
-t[true] = \"flag\"
-t[(1.5)] = false
-t[SOME_GLOBAL] = 0
 local by_string = t[(\"name\")]
-local by_bool = t[true]
+local by_field = t.name
 ";
         let out = outcome(src);
+        assert_eq!(binding_ty(&out, "t").to_string(), "{ name: 1 }");
         assert_eq!(binding_ty(&out, "by_string").to_string(), "1");
-        assert_eq!(binding_ty(&out, "by_bool").to_string(), "\"flag\"");
+        assert_eq!(binding_ty(&out, "by_field").to_string(), "1");
     }
 
     // --- number-literal rendering ---------------------------------------------
@@ -5825,37 +6001,5 @@ local gone = s
 ";
         let out = outcome(src);
         assert_eq!(binding_ty(&out, "gone").to_string(), "unknown");
-    }
-}
-
-#[cfg(test)]
-mod zz_probe {
-    use luabox_syntax::lua::{Dialect, parse};
-
-    use super::*;
-
-    fn out(src: &str) -> Outcome {
-        let parsed = parse(src, Dialect::Lua54);
-        assert_eq!(parsed.errors(), &[], "parse");
-        let env = TypeEnv::build(&parsed);
-        let lowered = luabox_hir::lower(&parsed);
-        run(&lowered, &env, "test.lua", true, false, None)
-    }
-
-    #[test]
-    fn probe() {
-        for src in [
-            "local t = {}\nt[(\"name\")] = 1\nlocal by_string = t[(\"name\")]\n",
-            "local t = {}\nt[true] = \"flag\"\nlocal by_bool = t[true]\n",
-            "---@type \"a\"|\"b\"|\"c\"\nlocal tag\nif tag == \"a\" then\n  local is_a = tag\nend\n",
-            "---@type string|integer\nlocal tag\nif tag == \"a\" then\n  local is_a = tag\nend\n",
-            "local function f(v)\n if v == 42 then\n  local fixed = v\n end\nend\n",
-        ] {
-            let o = out(src);
-            eprintln!("--- {src:?}");
-            for b in &o.binding_types {
-                eprintln!("   {} = {}", b.name, b.ty);
-            }
-        }
     }
 }

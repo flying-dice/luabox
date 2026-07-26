@@ -446,6 +446,42 @@ fn display_mode_inference_flows_across_a_require_in_both_directions() {
 }
 
 #[test]
+fn parameter_seeds_union_across_callers_and_ignore_unknown_arguments() {
+    const MODULE: &str = "local M = {}\nfunction M.f(x) return x end\nreturn M\n";
+
+    let mut host = host();
+    host.apply_changes([
+        set("m.lua", MODULE),
+        set("a.lua", "local m = require(\"m\")\nm.f(1)\n"),
+        set("b.lua", "local m = require(\"m\")\nm.f(\"s\")\n"),
+        // A third caller passing an undeclared global must not widen the seed.
+        set(
+            "c.lua",
+            "local m = require(\"m\")\nm.f(some_undeclared_global)\n",
+        ),
+    ]);
+
+    let exported = format!(
+        "{:?}",
+        host.snapshot()
+            .module_export(Path::new("m.lua"))
+            .unwrap()
+            .ty()
+            .expect("m.lua exports its table")
+    );
+    // The call sites are folded into one union rather than the last one
+    // winning, and the seed stays concrete.
+    assert!(
+        exported.contains("Union"),
+        "two differently-typed callers union their seeds: {exported}"
+    );
+    assert!(
+        exported.contains("Integer") && exported.contains("String"),
+        "{exported}"
+    );
+}
+
+#[test]
 fn set_root_rebases_require_resolution_and_is_visible_through_the_vfs() {
     let mut host = host();
     host.set_root(PathBuf::from("/workspace"));

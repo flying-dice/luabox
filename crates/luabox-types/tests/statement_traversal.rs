@@ -415,3 +415,133 @@ f(shapes)
     );
     assert_eq!(codes(&src), Vec::<String>::new());
 }
+
+// === typed carriers built from keyed literals ============================
+
+#[test]
+fn a_typed_carrier_literal_reads_its_keyed_fields() {
+    // `["a"] = 1` fills the same slot as `a = 1`, so the literal is "missing
+    // members only" and whole-carrier conformance defers to the final shape —
+    // which `X.b = 2` completes.
+    let src = "\
+---@class Rec
+---@field a number
+---@field b number
+
+---@type Rec
+local X = { [\"a\"] = 1 }
+X.b = 2
+return X
+";
+    assert_eq!(codes(src), Vec::<String>::new());
+}
+
+#[test]
+fn a_typed_carrier_literal_with_a_mistyped_keyed_field_reports_now() {
+    // A *present* member with the wrong type is never deferred.
+    let src = "\
+---@class Rec
+---@field a number
+---@field b number
+
+---@type Rec
+local X = { [\"a\"] = \"wrong\" }
+X.b = 2
+return X
+";
+    // Not deferred: the mismatch reports immediately, alongside the still
+    // missing `b` (the literal is no longer "missing members only").
+    assert_eq!(codes(src), vec!["LB0302", "LB0300"]);
+}
+
+#[test]
+fn integer_and_dynamic_keys_never_fill_a_named_carrier_field() {
+    // `[1] = v` is an array item and a computed key is not checkable: neither
+    // satisfies `---@field a`, so the carrier stays incomplete and the
+    // deferred whole-carrier check reports it.
+    let src = "\
+---@class Rec
+---@field a number
+
+local dyn = \"a\"
+---@type Rec
+local X = { [1] = 5, [dyn] = 6 }
+return X
+";
+    assert_eq!(codes(src), vec!["LB0302"]);
+}
+
+// === string-sugar arguments in value position ============================
+
+#[test]
+fn generic_inference_sees_a_string_sugar_argument() {
+    // `id"text"` in value position: the sugar argument has to reach generic
+    // call-site inference, or `T` would stay unbound and the misuse escape.
+    let src = "\
+---@generic T
+---@param x T
+---@return T
+local function id(x) end
+---@param n number
+local function wantn(n) end
+wantn(id\"text\")
+";
+    assert_eq!(codes(src), vec!["LB0300"]);
+}
+
+#[test]
+fn overload_resolution_sees_a_string_sugar_argument() {
+    // The primary takes a `number`; the string sugar selects the overload, so
+    // the call's result is the overload's `string` return.
+    let src = "\
+---@overload fun(x: string): string
+---@param x number
+---@return number
+local function f(x) end
+---@param n number
+local function wantn(n) end
+wantn(f\"lit\")
+";
+    assert_eq!(codes(src), vec!["LB0300"]);
+}
+
+#[test]
+fn overload_varargs_accept_any_argument_count() {
+    // An `---@overload` declaring `...` accepts an argument list longer than
+    // the primary's fixed arity, and its return governs the result.
+    let src = "\
+---@overload fun(...: string): string
+---@param x number
+---@return number
+local function g(x) end
+---@param n number
+local function wantn(n) end
+wantn(g(\"a\", \"b\"))
+wantn(g(1))
+";
+    // `g("a","b")` picks the vararg overload => `string` => mismatch.
+    // `g(1)` picks the primary => `number` => clean.
+    assert_eq!(codes(src), vec!["LB0300"]);
+}
+
+#[test]
+fn no_matching_overload_reports_against_the_closest_vararg_candidate() {
+    // Neither candidate accepts a boolean; the vararg overload has the better
+    // arity fit, so the diagnostic is reported against it.
+    let src = "\
+---@overload fun(...: string)
+---@param x number
+local function g(x) end
+g(true, false)
+";
+    let diags = check(src);
+    assert_eq!(
+        diags.iter().map(|d| d.code.to_string()).collect::<Vec<_>>(),
+        vec!["LB0300", "LB0300"]
+    );
+    assert!(
+        diags[0].message.contains("`string`"),
+        "reported against the vararg overload: {}",
+        diags[0].message
+    );
+}
