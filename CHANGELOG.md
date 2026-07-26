@@ -82,10 +82,18 @@ so it appears in no version entry.
 
 - **`luabox doc` refuses to generate while parse errors exist**
   ([#24](https://github.com/flying-dice/luabox/issues/24)) — a file that
-  does not parse has no trustworthy harvest, so `doc` now gates on parse
-  errors exactly like `build` does, rendering the `LB0001` diagnostics it
-  refused over. Type errors deliberately do not gate: docs for imperfect
-  code are still docs.
+  does not parse has no trustworthy harvest. One rule: project sources
+  and project defs gate (rendering the `LB0001` diagnostics refused
+  over); a *dependency's* broken def is skipped with a stderr warning
+  and never partially harvested — vendored text cannot brick the
+  command. Type errors never gate: docs for imperfect code are still
+  docs.
+- **`pkg = { version = "1.0" }` now parses as the bare-string form spelled
+  longhand** ([#23](https://github.com/flying-dice/luabox/issues/23)). The
+  valid-key list always named `version`, but a version-only table was
+  rejected with "must specify one of `git`, `path`, or `url`" — the two
+  rules disagreed. A lone git reference or `sha256` still errors, now
+  naming the missing source.
 - **`---@source` redirects no longer vanish for a lone statement**
   ([#14](https://github.com/flying-dice/luabox/issues/14)). When the
   annotated statement was the only one in its block — a one-statement file,
