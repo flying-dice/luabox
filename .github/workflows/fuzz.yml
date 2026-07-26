@@ -28,7 +28,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [lua_parse, lua_fmt, shape_parse, luacats]
+        # shape_parse died with the .luab subsystem (#109) — only these
+        # three targets exist under fuzz/fuzz_targets/.
+        target: [lua_parse, lua_fmt, luacats]
     steps:
       - uses: actions/checkout@v4
 
