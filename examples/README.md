@@ -15,7 +15,7 @@ Work through them top to bottom; each introduces one new idea.
 | 4 | [legacy-inifile](legacy-inifile/) | 5.1 | **Pure LuaCATS** (`---@class`/`---@param`/`---@return`), warn mode, `[lint]` allowlist + `---@luabox-ignore` |
 | 5 | [timemachine](timemachine/) | 5.4 → **5.1** | **Cross-version lowering**: write 5.4 (`goto`, bitops, `<close>`, `//`), `build` + `bundle` to 5.1, and the output runs on stock Lua 5.1 |
 | 6 | [love-asteroids-lite](love-asteroids-lite/) | 5.1 | **LÖVE skeleton**: typing a framework via a `defs` package, `bundle --mode love` → a `.love` archive |
-| 7 | [workspace](workspace/) | 5.1 | **Monorepo**: `[workspace]` members, path deps between packages, checking across the tree |
+| 7 | [workspace](workspace/) | 5.1 | **Monorepo**: nested packages, path deps between them, checking across the tree in one pass |
 
 ## A learning path
 

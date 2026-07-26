@@ -1,9 +1,8 @@
+# A monorepo-style tree: multiple packages under one root. No [workspace]
+# table — that manifest surface was dropped in 0.2.0 (#18) as inert.
+# `luabox check` from here walks every nested package's sources anyway,
+# and each member can also be checked from its own directory.
 [package]
 name = "workspace-root"
 version = "0.1.0"
 edition = "5.1"
-
-# A workspace groups multiple packages under one tree.
-# `luabox check` from here walks every member's sources.
-[workspace]
-members = ["packages/*"]

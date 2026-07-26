@@ -119,9 +119,12 @@ defs = ["love2d"]           # ambient definition packages
 pedantic = "warn"           # tier/rule levels: allow | warn | deny
 ```
 
-- Every table above is live in v1. `[tasks]` and `[workspace]` still *parse*
-  (the model retains them) but nothing consumes them — no task running, no
-  workspace fan-out. Treat those two as inert.
+- Every table above is live in v1. `[tasks]` and `[workspace]` were dropped
+  in 0.2.0 (#18): they only ever served the removed `run` command and the
+  parked solver, so they now get the standard unknown-table error (with the
+  did-you-mean nudge) instead of parse-but-ignore. Monorepo-style trees
+  still check in one pass — the source walk covers nested packages without
+  any manifest declaration.
 - `[dependencies]`/`[dev-dependencies]` also parse without driving any
   resolution — there is no solver, no lockfile, no download (§6). They are
   *not* inert, though: each entry names a package whose
