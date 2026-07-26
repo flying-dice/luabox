@@ -3,25 +3,15 @@
 //! Thin frontend over the bounded-context crates: owns UX, argument parsing,
 //! and diagnostic rendering; none of the domain logic.
 
-mod auth_cmd;
 mod build_cmd;
 mod check_cmd;
-mod deps_cmd;
 mod doc_cmd;
 mod fmt_cmd;
-mod github;
-mod keychain;
 mod lint_cmd;
 mod lsp_cmd;
 mod modes;
-mod outdated_cmd;
 mod project;
-mod publish_cmd;
-mod run_cmd;
-mod runtime;
 mod scaffold;
-mod search_cmd;
-mod toolchain_cmd;
 mod upgrade_cmd;
 mod watch;
 
@@ -34,8 +24,8 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "luabox",
     version,
-    about = "Unified Lua toolchain and package manager: typechecker, linter, formatter, bundler, LSP. \
-             Acquires Lua runtimes (nvm/rustup for Lua) — never is one."
+    about = "Unified static Lua toolchain: typechecker, linter, formatter, bundler, LSP. \
+             Consumes a `lua_modules/` rock tree — it never fetches one, and never runs Lua."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -66,73 +56,6 @@ enum Command {
         #[arg(long, default_value = "5.4")]
         edition: String,
     },
-    /// Add a dependency to luabox.toml
-    Add {
-        /// Package spec: name[@version]
-        package: String,
-        /// Add to [dev-dependencies]
-        #[arg(long)]
-        dev: bool,
-        /// Add as a path dependency rooted at this directory
-        #[arg(long, conflicts_with_all = ["git", "url"])]
-        path: Option<String>,
-        /// Add as a git dependency at this URL
-        #[arg(long, conflicts_with = "url")]
-        git: Option<String>,
-        /// Add as an http(s) tarball dependency (its sha256 is captured now)
-        #[arg(long)]
-        url: Option<String>,
-        /// Pin the git dependency to a commit
-        #[arg(long, requires = "git", conflicts_with_all = ["tag", "branch"])]
-        rev: Option<String>,
-        /// Pin the git dependency to a tag
-        #[arg(long, requires = "git", conflicts_with = "branch")]
-        tag: Option<String>,
-        /// Track a branch of the git dependency
-        #[arg(long, requires = "git")]
-        branch: Option<String>,
-    },
-    /// Remove a dependency from luabox.toml
-    Remove { package: String },
-    /// Search luarocks.org (the registry) for rocks by name
-    Search {
-        /// Optional terms, matched as a case-insensitive substring of rock names
-        query: Option<String>,
-        /// Output format: text (default) or json
-        #[arg(long, default_value = "text")]
-        format: String,
-    },
-    /// Report dependencies behind their latest version (registry rocks vs.
-    /// luarocks.org; git deps vs. their repo's latest GitHub release)
-    Outdated {
-        /// Output format: text (default) or json
-        #[arg(long, default_value = "text")]
-        format: String,
-    },
-    /// Sign in to GitHub via the browser (OAuth device flow); stores the token
-    /// encrypted in the OS keychain. With `--luarocks`, store a luarocks.org
-    /// upload API key (read from stdin) instead — for `luabox publish`.
-    Login {
-        /// Output format: text (default) or json (newline-delimited events)
-        #[arg(long, default_value = "text")]
-        format: String,
-        /// Store a luarocks.org API key (read from stdin) for `luabox publish`
-        #[arg(long)]
-        luarocks: bool,
-    },
-    /// Delete the stored GitHub token and luarocks.org API key from the OS
-    /// keychain
-    Logout,
-    /// Show the signed-in GitHub identity, if any
-    Whoami {
-        /// Output format: text (default) or json
-        #[arg(long, default_value = "text")]
-        format: String,
-    },
-    /// Resolve and fetch dependencies (lockfile-driven)
-    Install,
-    /// Update dependencies within manifest constraints
-    Update { package: Option<String> },
     /// Typecheck the project
     Check {
         /// Also validate dialect legality against a ship target
@@ -194,15 +117,6 @@ enum Command {
         #[arg(long)]
         mode: Option<String>,
     },
-    /// Run a script or a [tasks] entry via the pinned runtime. Bare
-    /// executables (and [tasks] shells) resolve from the pinned toolchain's
-    /// bin dirs — including its provisioned luarocks — before the system $PATH
-    /// (npm-run/node_modules/.bin semantics); e.g. `run luarocks -- install x`
-    Run {
-        script: String,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
     /// Generate documentation from annotations
     Doc {
         #[arg(long)]
@@ -213,20 +127,6 @@ enum Command {
         /// Accepted for editor compatibility; stdio is the only transport.
         #[arg(long)]
         stdio: bool,
-    },
-    /// Acquire Lua runtimes (nvm for Lua): install, pin, list. `install` also
-    /// provisions a matching luarocks alongside the interpreter
-    Toolchain {
-        #[command(subcommand)]
-        action: Option<ToolchainAction>,
-    },
-    /// Vendor dependencies into the source tree
-    Vendor,
-    /// Publish the authored rockspec to luarocks.org
-    Publish {
-        /// Validate and preview the upload without contacting luarocks.org
-        #[arg(long)]
-        dry_run: bool,
     },
     /// Replace this binary with a GitHub release build (default: latest)
     Upgrade {
@@ -246,16 +146,6 @@ enum Command {
     },
 }
 
-#[derive(Subcommand)]
-enum ToolchainAction {
-    /// Install a runtime (e.g. 5.4.6, luajit-2.1)
-    Install { version: String },
-    /// Pin the project runtime
-    Pin { version: String },
-    /// List installed runtimes
-    List,
-}
-
 // A pure one-arm-per-subcommand dispatcher: length tracks the CLI surface,
 // not complexity.
 #[allow(clippy::too_many_lines)]
@@ -268,44 +158,6 @@ fn main() -> anyhow::Result<()> {
         Command::New {
             name, lib, edition, ..
         } => scaffold::new(&std::env::current_dir()?, &name, lib, &edition),
-        Command::Add {
-            package,
-            dev,
-            path,
-            git,
-            url,
-            rev,
-            tag,
-            branch,
-        } => deps_cmd::add(
-            &std::env::current_dir()?,
-            &deps_cmd::AddOptions {
-                package,
-                dev,
-                path,
-                git,
-                url,
-                rev,
-                tag,
-                branch,
-            },
-        ),
-        Command::Remove { package } => deps_cmd::remove(&std::env::current_dir()?, &package),
-        Command::Search { query, format } => search_cmd::run(query.as_deref(), &format),
-        Command::Outdated { format } => outdated_cmd::run(&std::env::current_dir()?, &format),
-        Command::Login { format, luarocks } => {
-            if luarocks {
-                auth_cmd::login_luarocks()
-            } else {
-                auth_cmd::login(&format)
-            }
-        }
-        Command::Logout => auth_cmd::logout(),
-        Command::Whoami { format } => auth_cmd::whoami(&format),
-        Command::Install => deps_cmd::install(&std::env::current_dir()?),
-        Command::Update { package } => {
-            deps_cmd::update(&std::env::current_dir()?, package.as_deref())
-        }
         Command::Check {
             target,
             format,
@@ -345,22 +197,9 @@ fn main() -> anyhow::Result<()> {
                 },
             )
         }
-        Command::Run { script, args } => run_cmd::run(&std::env::current_dir()?, &script, &args),
         Command::Doc { open } => doc_cmd::run(&std::env::current_dir()?, open),
         Command::Lsp { .. } => lsp_cmd::run(),
-        Command::Toolchain { action } => {
-            let cwd = std::env::current_dir()?;
-            match action {
-                Some(ToolchainAction::Install { version }) => {
-                    toolchain_cmd::install(&cwd, &version)
-                }
-                Some(ToolchainAction::Pin { version }) => toolchain_cmd::pin(&cwd, &version),
-                Some(ToolchainAction::List) | None => toolchain_cmd::list(&cwd),
-            }
-        }
         Command::Upgrade { version } => upgrade_cmd::run(version),
-        Command::Vendor => deps_cmd::vendor(&std::env::current_dir()?),
-        Command::Publish { dry_run } => publish_cmd::run(&std::env::current_dir()?, dry_run),
         Command::Explain { code } => {
             let parsed: luabox_diag::Code = code.parse().map_err(|_| {
                 anyhow::anyhow!("`{code}` is not a valid diagnostic code; codes look like LB0421")

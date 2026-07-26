@@ -22,47 +22,26 @@ luabox-lint.workspace = true
 luabox-lsp.workspace = true
 luabox-lower.workspace = true
 luabox-bundle.workspace = true
-luabox-store.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 notify.workspace = true
 rayon.workspace = true
 rowan.workspace = true
-toml_edit.workspace = true
 tempfile.workspace = true
+# `luabox upgrade` verifies the release archive against `SHA256SUMS`
+# in-process (see upgrade_cmd.rs).
 sha2.workspace = true
-serde.workspace = true
-# Compare locked vs. latest luarocks.org versions in `luabox outdated`.
-semver.workspace = true
-# `luabox search`/`outdated` emit a frozen JSON contract for the editor GUIs;
-# release probing parses the GitHub API — never by hand-scanning
-# (`string_slice` is denied).
-serde_json.workspace = true
 # `luabox upgrade` self-replace: renames the running exe out of the way on
 # Windows (see upgrade_cmd.rs).
 self-replace.workspace = true
-
-# GitHub token storage (`luabox login`): the OS keychain, encrypted at rest.
-# keyring v3 ships no backend by default, so the real platform store is
-# selected per-target — Windows Credential Manager, macOS Keychain, Linux
-# Secret Service. Linux uses the *async* (zbus) backend with pure-Rust crypto
-# and the async-io runtime: it is 100% Rust with NO C dependency, so building
-# luabox on Linux (CI or `cargo install`) never needs libdbus/pkg-config. The
-# `sync-secret-service` feature would pull dbus-secret-service → libdbus-sys
-# (a C library) and break the build on stock runners. See keychain.rs.
-[target.'cfg(windows)'.dependencies]
-keyring = { version = "3", features = ["windows-native"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-keyring = { version = "3", features = ["apple-native"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-keyring = { version = "3", features = ["async-secret-service", "crypto-rust", "async-io"] }
 
 [dev-dependencies]
 cucumber.workspace = true
 tokio.workspace = true
 tempfile.workspace = true
+# Tests only: they re-parse the JSON artifacts the commands hand-write
+# (`luabox doc`'s search index, `--format json` output).
+serde_json.workspace = true
 
 [[test]]
 name = "acceptance"
