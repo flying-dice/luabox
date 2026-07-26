@@ -45,22 +45,36 @@ pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
     // comments may attach to the wrong (recovered) nodes or vanish with the
     // broken region. Gate on parse errors exactly like `build` does (#24);
     // type errors deliberately do NOT gate — docs for imperfect code are
-    // still docs.
+    // still docs. The gate covers EVERYTHING the harvest reads: project
+    // sources AND the `*.d.lua` defs harvested below — a def file is
+    // nothing but annotations, so a swallowed region there loses
+    // documentation outright.
     let mut parse_diags = Vec::new();
+    let mut push_parse_errors = |rel: &str, source: &str, diags: &mut Vec<Diagnostic>| {
+        for err in lua::parse(source, project.dialect).errors() {
+            let range = usize::from(err.range.start())..usize::from(err.range.end());
+            diags.push(
+                Diagnostic::error(check_cmd::code(1), err.message.clone())
+                    .with_label(Label::primary(Span::new(rel, range), "syntax error here")),
+            );
+        }
+    };
+
     let mut modules = Vec::new();
     for path in &lua_files {
         let rel = crate::project::display_rel(path, &project.root);
         let source = fs::read_to_string(path).with_context(|| format!("cannot read `{rel}`"))?;
-        for err in lua::parse(&source, project.dialect).errors() {
-            let range = usize::from(err.range.start())..usize::from(err.range.end());
-            parse_diags.push(
-                Diagnostic::error(check_cmd::code(1), err.message.clone())
-                    .with_label(Label::primary(Span::new(&rel, range), "syntax error here")),
-            );
-        }
+        push_parse_errors(&rel, &source, &mut parse_diags);
         let name = model::module_name(&rel);
         modules.push(model::lua_module(&name, &source, project.dialect));
     }
+
+    let (mut defs, _diags) = check_cmd::resolve_project_defs(&project.root, &project.defs);
+    defs.extend(project.dep_defs.iter().cloned());
+    for def in &defs {
+        push_parse_errors(&def.file, &def.text, &mut parse_diags);
+    }
+
     if !parse_diags.is_empty() {
         let counts = crate::project::render_diagnostics(&parse_diags, Format::Human, &project.root);
         bail!(
@@ -68,7 +82,7 @@ pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
             counts.errors
         );
     }
-    harvest_def_modules(&project, &mut modules);
+    harvest_def_modules(&project, &defs, &mut modules);
 
     let model = DocModel { package, modules };
 
@@ -113,16 +127,17 @@ pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
 /// by name (from a real module, or an earlier def file) is dropped here
 /// instead: the real carrier's page — richer, with methods — wins, and the
 /// def only contributes classes with no carrier of their own.
-fn harvest_def_modules(project: &check_cmd::Project, modules: &mut Vec<model::Module>) {
+fn harvest_def_modules(
+    project: &check_cmd::Project,
+    defs: &[luabox_types::DefFile],
+    modules: &mut Vec<model::Module>,
+) {
     let mut known: BTreeSet<String> = modules
         .iter()
         .flat_map(|m| m.classes.iter().map(|c| c.name.clone()))
         .collect();
 
-    let (mut defs, _diags) = check_cmd::resolve_project_defs(&project.root, &project.defs);
-    defs.extend(project.dep_defs.iter().cloned());
-
-    for def in &defs {
+    for def in defs {
         let name = def_module_name(&def.file);
         let mut module = model::lua_module(&name, &def.text, project.dialect);
         module.classes.retain(|c| known.insert(c.name.clone()));
@@ -236,6 +251,27 @@ mod tests {
             !tmp.path().join("doc").exists(),
             "no doc/ output on refusal"
         );
+    }
+
+    #[test]
+    fn doc_refuses_on_a_parse_error_in_a_def_file() {
+        // Review finding on #24's first cut: defs are harvested (they are
+        // nothing but annotations) so they gate too — an unterminated long
+        // comment in a def silently swallowed every class after it.
+        let tmp = project("defbroken", "\n[types]\ndefs = [\"mylib\"]\n");
+        write(tmp.path(), "src/main.lua", "local x = 1\n");
+        write(
+            tmp.path(),
+            "defs/mylib.d.lua",
+            "---@meta\n---@class Before.Thing\n--[[ unterminated swallows the rest\n---@class After.Thing\n",
+        );
+
+        let err = run(tmp.path(), false).expect_err("doc must refuse on a broken def");
+        assert!(
+            err.to_string().contains("parse error"),
+            "unexpected error: {err}"
+        );
+        assert!(!tmp.path().join("doc").exists(), "no doc/ output");
     }
 
     #[test]

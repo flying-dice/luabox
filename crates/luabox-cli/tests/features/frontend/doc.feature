@@ -338,3 +338,30 @@ Feature: luabox doc — static documentation site
     When I run "luabox doc"
     Then the command succeeds
     And the file "doc/index.html" exists
+
+  Scenario: doc refuses on a parse error in a definition file
+    Given a project with edition "5.4"
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      edition = "5.4"
+
+      [types]
+      defs = ["mylib"]
+      """
+    And a file "src/main.lua" containing:
+      """
+      local x = 1
+      """
+    And a file "defs/mylib.d.lua" containing:
+      """
+      ---@meta
+      ---@class Before.Thing
+      --[[ unterminated swallows the rest
+      ---@class After.Thing
+      """
+    When I run "luabox doc"
+    Then the command fails
+    And stdout contains "error[LB0001]"
+    And stdout contains "mylib.d.lua"
+    And stderr contains "doc refuses to generate"
