@@ -336,34 +336,29 @@ impl FileSema {
     /// The name-token ranges *declared by* an item's target statement: the
     /// segments of a `function a.b.c()` name, or the names of a `local`
     /// statement (including `local function f`).
+    ///
+    /// Resolved through [`Self::stmt_at_exact`], which picks the *statement*
+    /// sharing the target's span: a statement that is the only one in its
+    /// block has the same text range as the enclosing `BLOCK`, and the block
+    /// comes first in pre-order — matching it would drop the redirect.
     fn target_decl_names(&self, item: &AnnotatedItem) -> Vec<TextRange> {
         let Some(t) = item.target else {
             return Vec::new();
         };
-        let Some(node) = self.root.descendants().find(|n| {
-            usize::from(n.text_range().start()) == t.start
-                && usize::from(n.text_range().end()) == t.end
-        }) else {
-            return Vec::new();
-        };
-        match node.kind() {
-            SyntaxKind::FUNCTION_DECL_STMT => ast::FunctionDeclStmt::cast(node)
-                .and_then(|decl| decl.name())
+        match self.stmt_at_exact(t) {
+            Some(ast::Stmt::FunctionDecl(decl)) => decl
+                .name()
                 .map(|name| name.segments().map(|s| s.text_range()).collect())
                 .unwrap_or_default(),
-            SyntaxKind::LOCAL_FUNCTION_STMT => ast::LocalFunctionStmt::cast(node)
-                .and_then(|decl| decl.name())
+            Some(ast::Stmt::LocalFunction(decl)) => decl
+                .name()
                 .map(|tok| vec![tok.text_range()])
                 .unwrap_or_default(),
-            SyntaxKind::LOCAL_STMT => ast::LocalStmt::cast(node)
-                .map(|local| {
-                    local
-                        .names()
-                        .filter_map(|n| n.name())
-                        .map(|tok| tok.text_range())
-                        .collect()
-                })
-                .unwrap_or_default(),
+            Some(ast::Stmt::Local(local)) => local
+                .names()
+                .filter_map(|n| n.name())
+                .map(|tok| tok.text_range())
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -1369,6 +1364,67 @@ t.field = 4
             .find(|i| i.target.is_some())
             .expect("an annotated item");
         assert!(sema.target_decl_names(item).is_empty());
+    }
+
+    #[test]
+    fn a_source_tag_redirects_a_statement_that_is_alone_in_the_file() {
+        // The lone statement's range equals the enclosing `BLOCK`'s, and the
+        // block comes first in pre-order — the redirect must survive that.
+        let src = "---@source impl.c\nlocal function f() end\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let id = sema
+            .binding_decl_at(offset_of(src, "f() end", 0))
+            .expect("binding");
+        assert_eq!(
+            sema.source_tag_covering(sema.binding(id).range),
+            Some("impl.c")
+        );
+    }
+
+    #[test]
+    fn a_source_tag_redirects_a_statement_that_is_alone_in_a_function_body() {
+        let src = "local function outer()\n  ---@source impl.c\n  local inner = 1\nend\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let id = sema
+            .binding_decl_at(offset_of(src, "inner = 1", 0))
+            .expect("binding");
+        assert_eq!(
+            sema.source_tag_covering(sema.binding(id).range),
+            Some("impl.c")
+        );
+    }
+
+    #[test]
+    fn a_source_tag_redirects_a_dotted_function_alone_in_a_do_block() {
+        let src = "do\n  ---@source impl.c\n  function M.helper() end\nend\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let functions = sema.functions();
+        assert_eq!(
+            sema.source_tag_covering(functions[0].decl_range),
+            Some("impl.c")
+        );
+    }
+
+    #[test]
+    fn a_source_tag_still_redirects_when_other_statements_follow() {
+        let src = "---@source impl.c\nlocal function f() end\nf()\nlocal g = 2\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let id = sema
+            .binding_decl_at(offset_of(src, "f() end", 0))
+            .expect("binding");
+        assert_eq!(
+            sema.source_tag_covering(sema.binding(id).range),
+            Some("impl.c")
+        );
+        // ... and still leaks to no unannotated neighbour.
+        let other = sema
+            .binding_decl_at(offset_of(src, "g = 2", 0))
+            .expect("binding");
+        assert_eq!(sema.source_tag_covering(sema.binding(other).range), None);
     }
 
     #[test]
