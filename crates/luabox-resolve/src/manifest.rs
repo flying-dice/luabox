@@ -448,9 +448,38 @@ mod tests {
     }
 
     #[test]
-    fn version_only_table_still_rejects_orphan_source_modifiers() {
-        // A git reference or digest without its source stays an error even
-        // when `version` is present — the modifier names the missing source.
+    fn orphan_source_modifiers_name_the_missing_source() {
+        // A git reference or digest without its source names the source it
+        // is missing — uniformly, with or without `version` present.
+        for extra in ["", "version = \"1.0\", "] {
+            let src = format!(
+                "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[dependencies]\nbad = {{ {extra}tag = \"v1\" }}\n"
+            );
+            let errors = Manifest::parse(&src).unwrap_err();
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.message.contains("git reference key but no `git` source")),
+                "extra={extra:?}: {errors:?}"
+            );
+
+            let src = format!(
+                "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[dependencies]\nbad = {{ {extra}sha256 = \"abc\" }}\n"
+            );
+            let errors = Manifest::parse(&src).unwrap_err();
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.message.contains("only valid alongside a `url` source")),
+                "extra={extra:?}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn version_only_table_still_rejects_orphan_source_modifiers_legacy() {
+        // Kept from the first cut of #23: the with-version shape, asserted
+        // directly.
         let git_ref = "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[dependencies]\nbad = { version = \"1.0\", tag = \"v1\" }\n";
         let errors = Manifest::parse(git_ref).unwrap_err();
         assert!(

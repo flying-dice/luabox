@@ -584,27 +584,29 @@ fn parse_dependency(
     let kinds_present =
         usize::from(git.is_some()) + usize::from(path.is_some()) + usize::from(url.is_some());
     if kinds_present == 0 {
-        // No source key: a `version`-only table is the bare-string form
-        // spelled longhand (cargo semantics) — `pkg = { version = "1.0" }`
-        // ≡ `pkg = "1.0"`. Anything else is missing its source (#23).
+        // No source key. An orphan source *modifier* names the source it is
+        // missing — uniformly, whether or not `version` is also present —
+        // before the version-only form is considered.
+        if let Some(span) = table.get("sha256").and_then(Item::span) {
+            errors.push(ManifestError::new(
+                format!("`{ctx}.sha256` is only valid alongside a `url` source"),
+                Some(span),
+            ));
+            return None;
+        }
+        if let Some(span) = ["rev", "tag", "branch"]
+            .iter()
+            .find_map(|key| table.get(key).and_then(Item::span))
+        {
+            errors.push(ManifestError::new(
+                format!("`{ctx}` has a git reference key but no `git` source"),
+                Some(span),
+            ));
+            return None;
+        }
+        // A `version`-only table is the bare-string form spelled longhand
+        // (cargo semantics) — `pkg = { version = "1.0" }` ≡ `pkg = "1.0"`.
         if let Some(version) = version {
-            if let Some(span) = table.get("sha256").and_then(Item::span) {
-                errors.push(ManifestError::new(
-                    format!("`{ctx}.sha256` is only valid alongside a `url` source"),
-                    Some(span),
-                ));
-                return None;
-            }
-            if let Some(span) = ["rev", "tag", "branch"]
-                .iter()
-                .find_map(|key| table.get(key).and_then(Item::span))
-            {
-                errors.push(ManifestError::new(
-                    format!("`{ctx}` has a git reference key but no `git` source"),
-                    Some(span),
-                ));
-                return None;
-            }
             return Some(Dependency::Version(version));
         }
         errors.push(ManifestError::new(
