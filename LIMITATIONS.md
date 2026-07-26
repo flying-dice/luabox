@@ -132,26 +132,25 @@ one.
 
 ## Tooling
 
-### Dependencies: luarocks.org is the registry, rockspec is the manifest (#2)
+### Dependency management and execution are non-goals, not gaps (#10, #11)
 
-luabox follows the pnpm/bun model:
-[luarocks.org](https://luarocks.org) is the registry and the project's
-`*.rockspec` is the package manifest. Registry dependencies (bare rock names
-in LuaRocks constraint syntax) live in the rockspec's
-`dependencies`/`test_dependencies`; `luabox.toml` carries only the **source**
-dependencies a rockspec cannot express:
+luabox neither manages dependencies nor runs Lua. There is no resolver, no
+lockfile, no registry client, no publish or sign-in path, and no managed
+interpreter — those are **deliberate v1 non-goals**, not gaps waiting to be
+filled, and nothing here is planned for a later 0.x. The decision record is
+in [DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26).
 
-- a **path** dependency — `pkg = { path = "../pkg" }`
-- a **git** dependency — `pkg = { git = "…", rev|tag|branch = "…" }`
-- a **workspace** dependency — `pkg = { workspace = true }`
+In practice: you materialize a rock tree yourself and luabox reads it.
 
-A version-requirement entry in `luabox.toml` is an error pointing at the
-rockspec. There is **no first-party registry** and no `LUABOX_REGISTRY`; set
-`LUABOX_LUAROCKS_MIRROR` to a local mirror directory for hermetic/offline
-resolves. Only **pure-Lua** rocks are supported — a C/native rock is rejected
-with a clear error (luabox is not a C build system). Editing the rockspec from
-`luabox add` (a bare `luabox add pkg@1.2`) is not wired up yet; declare
-registry dependencies in the rockspec by hand for now.
+```sh
+luarocks install --tree lua_modules penlight
+luabox check
+```
+
+Cross-package types keep working over that tree — a dependency's LuaCATS
+definitions are visible and checked at your use sites. Your `*.rockspec` and
+luarocks own everything else (adding, updating, publishing), and you run your
+program with whatever Lua you already have.
 
 ### Editor extensions are not on marketplaces yet (#102)
 
