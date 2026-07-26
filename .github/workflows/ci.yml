@@ -64,6 +64,10 @@ jobs:
       - run: cargo llvm-cov report --fail-under-lines 95
       - run: cargo llvm-cov report --lcov --output-path lcov-unit.info
         if: always()
+      # The aggregate floor above can hide a small crate eroding; this
+      # enforces the per-crate invariant the docs claim (every crate >= 92
+      # unit lines — measured min today: luabox-cli 92.5). See #17.
+      - run: python3 scripts/per-crate-coverage.py lcov-unit.info 92
       - uses: actions/upload-artifact@v4
         if: always()
         with:
