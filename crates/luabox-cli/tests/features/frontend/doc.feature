@@ -365,3 +365,36 @@ Feature: luabox doc — static documentation site
     And stdout contains "error[LB0001]"
     And stdout contains "mylib.d.lua"
     And stderr contains "doc refuses to generate"
+
+  Scenario: a broken dependency def is skipped with a warning, not fatal
+    Given a project with edition "5.4"
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      edition = "5.4"
+
+      [dependencies]
+      geo = "1.0"
+      """
+    And a file "src/main.lua" containing:
+      """
+      local x = 1
+      """
+    And a file "lua_modules/geo/luabox.toml" containing:
+      """
+      [package]
+      edition = "5.4"
+
+      [types]
+      defs = ["geo"]
+      """
+    And a file "lua_modules/geo/defs/geo.d.lua" containing:
+      """
+      ---@meta
+      ---@class Geo.Point
+      --[[ unterminated third-party
+      """
+    When I run "luabox doc"
+    Then the command succeeds
+    And stderr contains "skipping dependency def"
+    And the file "doc/index.html" exists

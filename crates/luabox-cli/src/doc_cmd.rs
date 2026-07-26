@@ -69,10 +69,25 @@ pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
         modules.push(model::lua_module(&name, &source, project.dialect));
     }
 
+    // Project defs are yours: a broken one gates, because you can fix it.
     let (mut defs, _diags) = check_cmd::resolve_project_defs(&project.root, &project.defs);
-    defs.extend(project.dep_defs.iter().cloned());
     for def in &defs {
         push_parse_errors(&def.file, &def.text, &mut parse_diags);
+    }
+
+    // Dependency defs are someone else's text — the same principle that
+    // keeps vendored rock trees out of the source walk. A broken one is
+    // skipped with a warning instead of blocking the command; refusing
+    // would leave the user hand-editing vendored code to get docs at all.
+    for def in &project.dep_defs {
+        if lua::parse(&def.text, project.dialect).errors().is_empty() {
+            defs.push(def.clone());
+        } else {
+            eprintln!(
+                "doc: skipping dependency def `{}` (does not parse)",
+                def.file
+            );
+        }
     }
 
     if !parse_diags.is_empty() {
@@ -272,6 +287,49 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(!tmp.path().join("doc").exists(), "no doc/ output");
+    }
+
+    #[test]
+    fn a_broken_dependency_def_is_skipped_not_fatal() {
+        // Third-party defs are vendored text — the same principle that keeps
+        // rock trees out of the source walk. A broken dep def must not brick
+        // `doc`; it is skipped (with a stderr warning), while a clean dep
+        // def in the same tree still harvests.
+        let tmp = project(
+            "consumer",
+            "\n[dependencies]\ngeo = \"1.0\"\nutil = \"1.0\"\n",
+        );
+        write(tmp.path(), "src/main.lua", "local x = 1\n");
+        write(
+            tmp.path(),
+            "lua_modules/geo/luabox.toml",
+            "[package]\nedition = \"5.4\"\n\n[types]\ndefs = [\"geo\"]\n",
+        );
+        write(
+            tmp.path(),
+            "lua_modules/geo/defs/geo.d.lua",
+            "---@meta\n---@class Geo.Point\n--[[ unterminated third-party\n",
+        );
+        write(
+            tmp.path(),
+            "lua_modules/util/luabox.toml",
+            "[package]\nedition = \"5.4\"\n\n[types]\ndefs = [\"util\"]\n",
+        );
+        write(
+            tmp.path(),
+            "lua_modules/util/defs/util.d.lua",
+            "---@meta\n---@class Util.Clock\n",
+        );
+
+        run(tmp.path(), false).expect("a broken dep def must not block doc");
+        assert!(
+            read_doc(tmp.path(), "index.html").contains("Util.Clock"),
+            "the clean dep def still harvests"
+        );
+        assert!(
+            !tmp.path().join("doc/class.Geo.Point.html").exists(),
+            "the broken dep def is skipped, not partially harvested"
+        );
     }
 
     #[test]
