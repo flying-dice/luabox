@@ -251,6 +251,17 @@ struct LspWorld {
     error: Option<Value>,
     /// The call-hierarchy item stashed by a prepare step.
     item: Option<Value>,
+    /// The client's view of each document's text, by relative path — what the
+    /// editor would apply a code action's edits to. Kept in step with the
+    /// `didOpen`/`didChange` steps that own the buffer.
+    docs: HashMap<String, String>,
+    /// The relative paths currently open, in open order: a configuration
+    /// reload republishes exactly these, so a step that triggers one knows
+    /// how many publishes to wait for.
+    open: Vec<String>,
+    /// The document the last `textDocument/codeAction` request named, so an
+    /// "applying the action" step knows which buffer the edits target.
+    action_doc: Option<String>,
     next_id: i64,
 }
 
@@ -267,6 +278,9 @@ impl LspWorld {
             reply: Value::Null,
             error: None,
             item: None,
+            docs: HashMap::new(),
+            open: Vec::new(),
+            action_doc: None,
             next_id: 1,
         }
     }
@@ -417,6 +431,14 @@ impl LspWorld {
             "position": { "line": line, "character": character },
         })
     }
+
+    /// The client-side text of an open document — the buffer an editor would
+    /// apply a code action's edits to.
+    fn doc_text(&self, relative: &str) -> &str {
+        self.docs
+            .get(relative)
+            .unwrap_or_else(|| panic!("`{relative}` is not open, so it has no buffer text"))
+    }
 }
 
 impl Drop for LspWorld {
@@ -450,6 +472,54 @@ fn range(start_line: u32, start_col: u32, end_line: u32, end_col: u32) -> Value 
 /// A diagnostic's `code`, which luabox always reports as an `LBxxxx` string.
 fn code_of(diagnostic: &Value) -> &str {
     diagnostic["code"].as_str().unwrap_or_default()
+}
+
+/// The byte offset an LSP `Position` names in `text`. Positions count UTF-16
+/// code units within a line, so the conversion walks the line's chars rather
+/// than assuming one byte per column — the fixtures with unicode in them
+/// would be off otherwise.
+fn offset_at(text: &str, position: &Value) -> usize {
+    let field = |name: &str| {
+        usize::try_from(position[name].as_u64().unwrap_or_default())
+            .unwrap_or_else(|_| panic!("position `{name}` is out of range: {position}"))
+    };
+    let (line, character) = (field("line"), field("character"));
+    let mut start = 0;
+    for (index, current) in text.split_inclusive('\n').enumerate() {
+        if index == line {
+            let mut units = 0;
+            for (byte, ch) in current.char_indices() {
+                if units >= character {
+                    return start + byte;
+                }
+                units += ch.len_utf16();
+            }
+            return start + current.len();
+        }
+        start += current.len();
+    }
+    text.len()
+}
+
+/// Apply a `TextEdit` list to `text` the way an editor does: highest offset
+/// first, so an earlier edit's range is still valid when it is applied.
+fn apply_edits(text: &str, edits: &[Value]) -> String {
+    let mut edits: Vec<&Value> = edits.iter().collect();
+    edits.sort_by_key(|edit| {
+        std::cmp::Reverse((
+            edit["range"]["start"]["line"].as_u64().unwrap_or_default(),
+            edit["range"]["start"]["character"]
+                .as_u64()
+                .unwrap_or_default(),
+        ))
+    });
+    let mut out = text.to_string();
+    for edit in edits {
+        let start = offset_at(&out, &edit["range"]["start"]);
+        let end = offset_at(&out, &edit["range"]["end"]);
+        out.replace_range(start..end, edit["newText"].as_str().unwrap_or_default());
+    }
+    out
 }
 
 /// The single location a goto-style reply carries, whether the server answered
@@ -552,6 +622,23 @@ fn strict_project_with_edition(world: &mut LspWorld, edition: String) {
     write_manifest(world, &edition, true);
 }
 
+/// A manifest whose `[lint]` section pins one rule, so a scenario can reach a
+/// rule the tier defaults leave off (`unused-param` is pedantic) or silence
+/// one the defaults leave on.
+#[given(expr = "a project with edition {string} and lint rule {string} set to {string}")]
+fn project_with_lint_rule(world: &mut LspWorld, edition: String, rule: String, level: String) {
+    let manifest = format!(
+        "[package]\n\
+         name = \"fixture\"\n\
+         version = \"0.1.0\"\n\
+         edition = \"{edition}\"\n\
+         \n\
+         [lint]\n\
+         {rule} = \"{level}\"\n"
+    );
+    world.write_file("luabox.toml", &manifest);
+}
+
 #[given(expr = "a file {string} containing:")]
 fn file_containing(world: &mut LspWorld, path: String, step: &Step) {
     world.write_file(&path, &docstring(step));
@@ -576,10 +663,14 @@ fn open_document(world: &mut LspWorld, path: String) {
                 "uri": uri,
                 "languageId": "lua",
                 "version": 1,
-                "text": text,
+                "text": text.clone(),
             }
         }),
     );
+    world.docs.insert(path.clone(), text);
+    if !world.open.contains(&path) {
+        world.open.push(path);
+    }
     world.wait_diagnostics(&uri);
 }
 
@@ -587,13 +678,15 @@ fn open_document(world: &mut LspWorld, path: String) {
 #[when(expr = "I change {string} to:")]
 fn change_document(world: &mut LspWorld, path: String, step: &Step) {
     let uri = world.uri(&path);
+    let text = docstring(step);
     world.notify(
         "textDocument/didChange",
         json!({
             "textDocument": { "uri": uri, "version": 2 },
-            "contentChanges": [{ "text": docstring(step) }],
+            "contentChanges": [{ "text": text.clone() }],
         }),
     );
+    world.docs.insert(path, text);
     world.wait_diagnostics(&uri);
 }
 
@@ -628,7 +721,48 @@ fn close_document(world: &mut LspWorld, path: String) {
         "textDocument/didClose",
         json!({ "textDocument": { "uri": uri } }),
     );
+    world.docs.remove(&path);
+    world.open.retain(|open| open != &path);
     world.wait_diagnostics(&uri);
+}
+
+// === Out-of-editor changes (watched files) ===============================
+
+/// An edit made behind the editor's back — the file is rewritten on disk and
+/// the client reports it through `workspace/didChangeWatchedFiles`, exactly
+/// as a real editor's file watcher would. A file that is *not* open gets its
+/// diagnostics republished from the new disk text, so the step blocks for
+/// that publish; an open file is shadowed by its overlay and publishes
+/// nothing, so there is nothing to wait for.
+#[when(expr = "the file {string} changes on disk to:")]
+fn file_changes_on_disk(world: &mut LspWorld, path: String, step: &Step) {
+    world.write_file(&path, &docstring(step));
+    let uri = world.uri(&path);
+    world.notify(
+        "workspace/didChangeWatchedFiles",
+        // `FileChangeType::CHANGED` is 2 in the protocol's numbering.
+        json!({ "changes": [{ "uri": uri, "type": 2 }] }),
+    );
+    if !world.open.contains(&path) {
+        world.wait_diagnostics(&uri);
+    }
+}
+
+/// A manifest rewritten on disk and reported the same way. Reloading the
+/// configuration republishes every open document, so the step blocks until
+/// each one has been republished.
+#[when("the manifest changes on disk to:")]
+fn manifest_changes_on_disk(world: &mut LspWorld, step: &Step) {
+    world.write_file("luabox.toml", &docstring(step));
+    let uri = world.uri("luabox.toml");
+    world.notify(
+        "workspace/didChangeWatchedFiles",
+        json!({ "changes": [{ "uri": uri, "type": 2 }] }),
+    );
+    for path in world.open.clone() {
+        let uri = world.uri(&path);
+        world.wait_diagnostics(&uri);
+    }
 }
 
 // === Handshake ===========================================================
@@ -803,6 +937,38 @@ fn hover_text_contains(world: &mut LspWorld, needle: String) {
     assert!(text.contains(&needle), "hover text:\n{text}");
 }
 
+#[then(expr = "the hover text does not contain {string}")]
+fn hover_text_does_not_contain(world: &mut LspWorld, needle: String) {
+    let text = world.ok_reply()["contents"]["value"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected markup hover contents, got {}", world.reply));
+    assert!(!text.contains(&needle), "hover text:\n{text}");
+}
+
+#[then(expr = "the hover text starts with {string}")]
+fn hover_text_starts_with(world: &mut LspWorld, prefix: String) {
+    let text = world.ok_reply()["contents"]["value"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected markup hover contents, got {}", world.reply));
+    assert!(text.starts_with(&prefix), "hover text:\n{text}");
+}
+
+#[then(expr = "the hover range spans {int}:{int} to {int}:{int}")]
+fn hover_range_spans(
+    world: &mut LspWorld,
+    start_line: u32,
+    start_col: u32,
+    end_line: u32,
+    end_col: u32,
+) {
+    assert_eq!(
+        world.ok_reply()["range"],
+        range(start_line, start_col, end_line, end_col),
+        "hover: {}",
+        world.reply
+    );
+}
+
 // === Completion ==========================================================
 
 #[when(expr = "I request completion at {int}:{int} in {string}")]
@@ -938,6 +1104,35 @@ fn location_starts_on_line(world: &mut LspWorld, line: u32) {
     assert_eq!(
         location["range"]["start"]["line"].as_u64(),
         Some(u64::from(line)),
+        "location: {location}"
+    );
+}
+
+/// A `---@source` redirect can name a location outside the workspace — even
+/// outside the filesystem — so this asserts the URI verbatim rather than
+/// resolving it against the fixture root.
+#[then(expr = "the location URI is {string}")]
+fn location_uri_is(world: &mut LspWorld, expected: String) {
+    let location = single_location(world.ok_reply());
+    assert_eq!(
+        location["uri"].as_str(),
+        Some(expected.as_str()),
+        "location: {location}"
+    );
+}
+
+#[then(expr = "the location spans {int}:{int} to {int}:{int}")]
+fn location_spans(
+    world: &mut LspWorld,
+    start_line: u32,
+    start_col: u32,
+    end_line: u32,
+    end_col: u32,
+) {
+    let location = single_location(world.ok_reply());
+    assert_eq!(
+        location["range"],
+        range(start_line, start_col, end_line, end_col),
         "location: {location}"
     );
 }
@@ -1312,7 +1507,201 @@ fn request_code_actions(world: &mut LspWorld, line: u32, path: String) {
         "range": range(line, 0, line, 200),
         "context": { "diagnostics": [] },
     });
+    world.action_doc = Some(path);
     world.request("textDocument/codeAction", params);
+}
+
+/// A caret rather than a span: the tightest window an editor sends, and the
+/// one that proves the inclusive-overlap test rather than a generous
+/// whole-line box.
+#[when(expr = "I request code actions at {int}:{int} in {string}")]
+fn request_code_actions_at(world: &mut LspWorld, line: u32, character: u32, path: String) {
+    let params = json!({
+        "textDocument": world.text_document(&path),
+        "range": range(line, character, line, character),
+        "context": { "diagnostics": [] },
+    });
+    world.action_doc = Some(path);
+    world.request("textDocument/codeAction", params);
+}
+
+#[when(expr = "I request code actions from {int}:{int} to {int}:{int} in {string}")]
+fn request_code_actions_over(
+    world: &mut LspWorld,
+    start_line: u32,
+    start_col: u32,
+    end_line: u32,
+    end_col: u32,
+    path: String,
+) {
+    let params = json!({
+        "textDocument": world.text_document(&path),
+        "range": range(start_line, start_col, end_line, end_col),
+        "context": { "diagnostics": [] },
+    });
+    world.action_doc = Some(path);
+    world.request("textDocument/codeAction", params);
+}
+
+/// The offered action with exactly this title, or a panic naming every title.
+fn action_titled<'a>(world: &'a LspWorld, title: &str) -> &'a Value {
+    let actions = world.reply_array();
+    actions
+        .iter()
+        .find(|action| action["title"].as_str() == Some(title))
+        .unwrap_or_else(|| {
+            let titles: Vec<&str> = actions
+                .iter()
+                .filter_map(|action| action["title"].as_str())
+                .collect();
+            panic!("no action titled `{title}`; offered: {titles:?}")
+        })
+}
+
+/// The `TextEdit`s an action's `WorkspaceEdit` carries. Every action luabox
+/// offers rewrites the one file the request named, so the changes map has a
+/// single entry — asserted here, since a stray second file would otherwise
+/// vanish into the flattened list.
+fn action_edits<'a>(world: &'a LspWorld, title: &str) -> &'a Vec<Value> {
+    let action = action_titled(world, title);
+    let changes = action["edit"]["changes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("the action `{title}` carries no edit: {action}"));
+    assert_eq!(
+        changes.len(),
+        1,
+        "`{title}` must edit exactly one file: {changes:?}"
+    );
+    changes
+        .values()
+        .next()
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("the action `{title}` carries no text edits: {action}"))
+}
+
+#[then(expr = "an action titled {string} is offered")]
+fn action_is_offered(world: &mut LspWorld, title: String) {
+    let _ = action_titled(world, &title);
+}
+
+#[then(expr = "no action titled {string} is offered")]
+fn no_action_titled_is_offered(world: &mut LspWorld, title: String) {
+    let actions = world.reply_array();
+    assert!(
+        !actions
+            .iter()
+            .any(|action| action["title"].as_str() == Some(&title)),
+        "an action titled `{title}` was unexpectedly offered: {actions:?}"
+    );
+}
+
+#[then(expr = "the offered actions are titled {string}")]
+fn offered_actions_are_titled(world: &mut LspWorld, expected: String) {
+    let titles: Vec<&str> = world
+        .reply_array()
+        .iter()
+        .filter_map(|action| action["title"].as_str())
+        .collect();
+    let expected: Vec<&str> = expected.split(" | ").collect();
+    assert_eq!(titles, expected);
+}
+
+#[then(expr = "the action titled {string} is a {string}")]
+fn action_has_kind(world: &mut LspWorld, title: String, kind: String) {
+    let action = action_titled(world, &title);
+    assert_eq!(action["kind"].as_str(), Some(kind.as_str()), "{action}");
+}
+
+#[then(expr = "the action titled {string} resolves {word}")]
+fn action_resolves(world: &mut LspWorld, title: String, code: String) {
+    let action = action_titled(world, &title);
+    let diagnostics = action["diagnostics"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the action `{title}` references no diagnostic: {action}"));
+    assert!(
+        diagnostics.iter().any(|d| code_of(d) == code),
+        "the action `{title}` does not resolve `{code}`: {diagnostics:?}"
+    );
+}
+
+#[then(expr = "the action titled {string} references no diagnostic")]
+fn action_references_no_diagnostic(world: &mut LspWorld, title: String) {
+    let action = action_titled(world, &title);
+    assert_eq!(
+        action["diagnostics"],
+        Value::Null,
+        "the action `{title}` unexpectedly references a diagnostic: {action}"
+    );
+}
+
+#[then(expr = "the action titled {string} makes {int} edits")]
+fn action_makes_edits(world: &mut LspWorld, title: String, count: usize) {
+    let edits = action_edits(world, &title);
+    assert_eq!(edits.len(), count, "edits of `{title}`: {edits:?}");
+}
+
+#[then(expr = "the action titled {string} edits {string}")]
+fn action_edits_file(world: &mut LspWorld, title: String, path: String) {
+    let expected = world.uri(&path);
+    let action = action_titled(world, &title);
+    let changes = action["edit"]["changes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("the action `{title}` carries no edit: {action}"));
+    assert!(
+        changes.contains_key(&expected),
+        "`{title}` does not edit `{path}`: {changes:?}"
+    );
+}
+
+/// The replacement text of one edit. Its geometry is a separate assertion
+/// (`... spans ...`) so neither step needs a seven-parameter signature.
+#[then(expr = "edit {int} of the action titled {string} writes {string}")]
+fn action_edit_writes(world: &mut LspWorld, index: usize, title: String, text: String) {
+    let edits = action_edits(world, &title);
+    let edit = edits
+        .get(index)
+        .unwrap_or_else(|| panic!("`{title}` has no edit {index}: {edits:?}"));
+    assert_eq!(edit["newText"].as_str(), Some(text.as_str()), "{edit}");
+}
+
+/// A multi-line replacement cannot be written as a Gherkin string, so this
+/// asserts the edit's *geometry* and leaves its text to the applying step.
+#[then(expr = "edit {int} of the action titled {string} spans {int}:{int} to {int}:{int}")]
+fn action_edit_spans(
+    world: &mut LspWorld,
+    index: usize,
+    title: String,
+    start_line: u32,
+    start_col: u32,
+    end_line: u32,
+    end_col: u32,
+) {
+    let edits = action_edits(world, &title);
+    let edit = edits
+        .get(index)
+        .unwrap_or_else(|| panic!("`{title}` has no edit {index}: {edits:?}"));
+    assert_eq!(
+        edit["range"],
+        range(start_line, start_col, end_line, end_col),
+        "{edit}"
+    );
+}
+
+/// The end-to-end assertion an editor's user actually sees: apply the action's
+/// edits to the open buffer and compare the whole resulting file.
+#[then(expr = "applying the action titled {string} produces:")]
+fn applying_action_produces(world: &mut LspWorld, title: String, step: &Step) {
+    let path = world
+        .action_doc
+        .clone()
+        .expect("no code-action request has been made");
+    let before = world.doc_text(&path).to_string();
+    let edits = action_edits(world, &title).clone();
+    assert_eq!(
+        apply_edits(&before, &edits),
+        docstring(step),
+        "applied edit"
+    );
 }
 
 /// The single quick-fix action in the last reply.
@@ -1385,8 +1774,22 @@ fn quickfix_writes(
 fn prepare_call_hierarchy(world: &mut LspWorld, line: u32, character: u32, path: String) {
     let params = world.doc_position(&path, line, character);
     world.request("textDocument/prepareCallHierarchy", params);
-    let items = world.reply_array();
-    world.item = items.first().cloned();
+    // A cursor that names no function answers `null`, not an empty list, so
+    // read the reply defensively — "nothing was prepared" is an outcome
+    // scenarios assert, not a harness failure.
+    world.item = world
+        .ok_reply()
+        .as_array()
+        .and_then(|items| items.first().cloned());
+}
+
+#[then("no call-hierarchy item is prepared")]
+fn no_item_is_prepared(world: &mut LspWorld) {
+    assert!(
+        world.item.is_none(),
+        "a call-hierarchy item was unexpectedly prepared: {}",
+        world.reply
+    );
 }
 
 #[then(expr = "the prepared item is named {string}")]
@@ -1457,6 +1860,51 @@ fn incoming_call_sites(world: &mut LspWorld, name: String, count: usize) {
     assert_eq!(ranges.len(), count, "{call}");
 }
 
+#[then(expr = "the prepared item is in {string}")]
+fn prepared_item_is_in(world: &mut LspWorld, path: String) {
+    let expected = world.uri(&path);
+    let item = world
+        .item
+        .as_ref()
+        .unwrap_or_else(|| panic!("no call-hierarchy item was prepared: {}", world.reply));
+    assert_eq!(item["uri"].as_str(), Some(expected.as_str()), "{item}");
+}
+
+#[then(expr = "the incoming calls are {string}")]
+fn incoming_calls_are(world: &mut LspWorld, expected: String) {
+    let names: Vec<&str> = world
+        .reply_array()
+        .iter()
+        .filter_map(|call| call["from"]["name"].as_str())
+        .collect();
+    let expected: Vec<&str> = expected.split(", ").collect();
+    assert_eq!(names, expected);
+}
+
+/// A call made outside any function is attributed to a synthetic module item
+/// named for the file, so this asserts the grouping is the file itself.
+#[then(expr = "the incoming call from {string} is a module")]
+fn incoming_call_is_a_module(world: &mut LspWorld, name: String) {
+    let calls = world.reply_array();
+    let call = calls
+        .iter()
+        .find(|call| call["from"]["name"].as_str() == Some(&name))
+        .unwrap_or_else(|| panic!("no incoming call from `{name}`: {calls:?}"));
+    // `SymbolKind::MODULE` is 2 in the protocol's numbering.
+    assert_eq!(call["from"]["kind"].as_u64(), Some(2), "{call}");
+}
+
+#[then(expr = "the outgoing call to {string} is in {string}")]
+fn outgoing_call_is_in(world: &mut LspWorld, name: String, path: String) {
+    let uri = world.uri(&path);
+    let calls = world.reply_array();
+    let call = calls
+        .iter()
+        .find(|call| call["to"]["name"].as_str() == Some(&name))
+        .unwrap_or_else(|| panic!("no outgoing call to `{name}`: {calls:?}"));
+    assert_eq!(call["to"]["uri"].as_str(), Some(uri.as_str()), "{call}");
+}
+
 #[then(expr = "the outgoing calls are {string}")]
 fn outgoing_calls_are(world: &mut LspWorld, expected: String) {
     let names: Vec<&str> = world
@@ -1507,6 +1955,35 @@ fn kinded_folding_range_covers(world: &mut LspWorld, kind: String, start: u64, e
             && r["endLine"].as_u64() == Some(end)),
         "no `{kind}` fold covering lines {start}..{end}: {ranges:?}"
     );
+}
+
+#[then(expr = "no folding range covers lines {int} to {int}")]
+fn no_folding_range_covers(world: &mut LspWorld, start: u64, end: u64) {
+    let ranges = world.reply_array();
+    assert!(
+        !ranges
+            .iter()
+            .any(|r| r["startLine"].as_u64() == Some(start) && r["endLine"].as_u64() == Some(end)),
+        "a fold unexpectedly covers lines {start}..{end}: {ranges:?}"
+    );
+}
+
+#[then(expr = "the reply lists {int} folding ranges")]
+fn reply_lists_folding_ranges(world: &mut LspWorld, count: usize) {
+    let ranges = world.reply_array();
+    assert_eq!(ranges.len(), count, "folding ranges: {ranges:?}");
+}
+
+/// Only comment regions carry a `kind`; a code fold must leave it unset so
+/// the editor does not group it with the "fold all comments" command.
+#[then(expr = "the folding range covering lines {int} to {int} has no kind")]
+fn folding_range_has_no_kind(world: &mut LspWorld, start: u64, end: u64) {
+    let ranges = world.reply_array();
+    let fold = ranges
+        .iter()
+        .find(|r| r["startLine"].as_u64() == Some(start) && r["endLine"].as_u64() == Some(end))
+        .unwrap_or_else(|| panic!("no fold covering lines {start}..{end}: {ranges:?}"));
+    assert_eq!(fold["kind"], Value::Null, "{fold}");
 }
 
 #[when(expr = "I request selection ranges at {int}:{int} in {string}")]

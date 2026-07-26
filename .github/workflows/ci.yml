@@ -36,7 +36,9 @@ jobs:
   #   - unit: every in-process test (libs, bins, per-crate tests/) with the
   #     cucumber e2e binaries excluded. Floor 95 (measured 96.9%).
   #   - e2e: the black-box cucumber suites alone (acceptance +
-  #     lsp_acceptance driving the real binary). Floor 72 (measured 74.6%).
+  #     lsp_acceptance driving the real binary). Floor 83 (measured 85.7%
+  #     after the #31 scenario waves; the residue is OS-gated, live-network,
+  #     and internal plumbing no black-box flow can force).
   # Raise a floor as its number rises — never lower one to make a PR pass.
   # Each job uploads its lcov as an artifact for inspection.
   coverage-unit:
@@ -91,7 +93,7 @@ jobs:
       - run: >
           cargo llvm-cov --no-report
           -p luabox-cli --test acceptance --test lsp_acceptance
-      - run: cargo llvm-cov report --fail-under-lines 72
+      - run: cargo llvm-cov report --fail-under-lines 83
       - run: cargo llvm-cov report --lcov --output-path lcov-e2e.info
         if: always()
       - uses: actions/upload-artifact@v4

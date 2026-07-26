@@ -212,6 +212,47 @@ Feature: Cross-dialect lowering transforms
     Then the command succeeds
     And stdout does not contain "LB0606"
 
+  Scenario Outline: the `%d` scan decodes the format string however it is written
+    Given a project with edition "5.4" targeting "5.1"
+    And a Lua file containing 'print(string.format(<format>, 1))'
+    When I run "luabox build"
+    Then the command succeeds
+    And <outcome>
+
+    Examples: quoted with escapes, long-bracket, and every `%d` spelling
+      | format             | outcome                          |
+      | "a\tb %d\n"        | diagnostic LB0606 is reported    |
+      | [[value: %d]]      | diagnostic LB0606 is reported    |
+      | [==[value: %d]==]  | diagnostic LB0606 is reported    |
+      | "%i"               | diagnostic LB0606 is reported    |
+      | "%-5.2d"           | diagnostic LB0606 is reported    |
+      | "plain \65 text"   | stdout does not contain "LB0606" |
+
+  Scenario Outline: the 2^53 heuristic decodes every integer literal form
+    Given a project with edition "5.4" targeting "5.1"
+    And a Lua file containing 'local x = <literal> print(x)'
+    When I run "luabox build"
+    Then the command succeeds
+    And <outcome>
+
+    Examples: hexadecimal and decimal, either side of the boundary
+      | literal            | outcome                        |
+      | 0x20000000000001   | diagnostic LB0606 is reported  |
+      | 0x7FFFFFFFFFFFFFFF | diagnostic LB0606 is reported  |
+      | 9007199254740993   | diagnostic LB0606 is reported  |
+      | 0x20000000000000   | stdout does not contain "LB0606" |
+      | 9007199254740992   | stdout does not contain "LB0606" |
+      | 0xFF               | stdout does not contain "LB0606" |
+      | 1e17               | stdout does not contain "LB0606" |
+      | 1.5e3              | stdout does not contain "LB0606" |
+
+  Scenario: a hex integer beyond 2^53 is named in hex, as the author wrote it
+    Given a project with edition "5.4" targeting "5.1"
+    And a Lua file containing 'local x = 0x7FFFFFFFFFFFFFFF print(x)'
+    When I run "luabox build"
+    Then the command succeeds
+    And stdout contains "the integer literal `0x7FFFFFFFFFFFFFFF` exceeds 2^53"
+
   # --- variable attributes (attribs) --------------------------------------
 
   Scenario: `<const>` is erased at zero cost
@@ -320,6 +361,203 @@ Feature: Cross-dialect lowering transforms
     And "dist/src/main.lua" contains "local limit = 10"
     And "dist/src/main.lua" contains "7 // 2"
     And "dist/src/main.lua" contains "5 & 3"
+
+  Scenario: `function name() end` reassigns a `<const>` just as `name = ...` does
+    Given a project with edition "5.4" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      local greet <const> = function() end
+      function greet() end
+      print(greet)
+      """
+    When I run "luabox build"
+    Then the command fails
+    And diagnostic LB0602 is reported
+    And stdout contains "assignment to constant `greet` (declared `<const>`)"
+
+  Scenario: a nested function assigning the upvalue is still a reassignment
+    Given a project with edition "5.4" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      local x <const> = 1
+      local function g()
+        x = 2
+      end
+      print(g)
+      """
+    When I run "luabox build"
+    Then the command fails
+    And diagnostic LB0602 is reported
+
+  # A `<const>` name re-bound by an inner declaration is a *different*
+  # variable, so assigning to it is not a reassignment of the constant. Each
+  # binding form gets its own scenario: a Scenario Outline cannot be used
+  # here, because Gherkin would read the `<const>` attribute in the docstring
+  # as an Examples placeholder.
+
+  Scenario: a numeric-for variable shadowing the `<const>` name is a fresh binding
+    Given a project with edition "5.4" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      local x <const> = 1
+      for x = 1, 3 do
+        x = x
+      end
+      print(x)
+      """
+    When I run "luabox build"
+    Then the command succeeds
+    And stdout does not contain "LB0602"
+
+  Scenario: a generic-for variable shadowing the `<const>` name is a fresh binding
+    Given a project with edition "5.4" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      local x <const> = 1
+      for x, v in pairs({}) do
+        x = v
+      end
+      print(x)
+      """
+    When I run "luabox build"
+    Then the command succeeds
+    And stdout does not contain "LB0602"
+
+  Scenario: a `local function` shadowing the `<const>` name is a fresh binding
+    Given a project with edition "5.4" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      local x <const> = 1
+      local function x() end
+      print(x)
+      """
+    When I run "luabox build"
+    Then the command succeeds
+    And stdout does not contain "LB0602"
+
+  Scenario: an inner block's own `local` shadows the constant for that block
+    Given a project with edition "5.4" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      local x <const> = 1
+      do
+        local x = 2
+        x = 3
+        print(x)
+      end
+      print(x)
+      """
+    When I run "luabox build"
+    Then the command succeeds
+    And stdout does not contain "LB0602"
+
+  Scenario: a `goto` out of a `<close>` scope cannot cross the wrapper either
+    Given a project with edition "5.4" targeting "5.3"
+    And a file "src/main.lua" containing:
+      """
+      do
+        local h <close> = setmetatable({}, {})
+        goto out
+      end
+      ::out::
+      print(1)
+      """
+    When I run "luabox build"
+    Then the command fails
+    And diagnostic LB0603 is reported
+    And stdout contains "a `goto` that jumps out of the scope"
+
+  Scenario: a `goto` that stays inside the `<close>` scope tail is lowerable
+    Given a project with edition "5.4" targeting "5.3"
+    And a file "src/main.lua" containing:
+      """
+      do
+        local h <close> = setmetatable({}, {})
+        if x then goto skip end
+        print(1)
+        ::skip::
+      end
+      """
+    When I run "luabox build"
+    Then the command succeeds
+    And "dist/src/main.lua" contains "__luabox_rt.close_scope(h, function()"
+
+  Scenario: nested `<close>` scopes each get their own wrapper
+    Given a project with edition "5.4" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      do
+        local a <close> = setmetatable({}, { __close = function() print("a") end })
+        do
+          local b <close> = setmetatable({}, { __close = function() print("b") end })
+          print("inner")
+        end
+      end
+      """
+    When I run "luabox build"
+    Then the command succeeds
+    And "dist/src/main.lua" contains "__luabox_rt.close_scope(a, function()"
+    And "dist/src/main.lua" contains "__luabox_rt.close_scope(b, function()"
+    And the emitted output contains no "<close>"
+
+  Scenario: each lowered `<close>` gets its own lossy-lowering warning
+    Given a project with edition "5.4" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      do
+        local a <close> = setmetatable({}, {})
+        do
+          local b <close> = setmetatable({}, {})
+          print(a, b)
+        end
+      end
+      """
+    When I run "luabox build"
+    Then the command succeeds
+    And stdout contains exactly 2 occurrence of "warning[LB0603]"
+
+  Scenario: a `break` inside a `<close>` scope cannot cross the wrapper boundary
+    Given a project with edition "5.4" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      while true do
+        local h <close> = setmetatable({}, { __close = function() end })
+        break
+      end
+      """
+    When I run "luabox build"
+    Then the command fails
+    And diagnostic LB0603 is reported
+    And stdout contains "the scope tail contains a `break` bound to an outer loop"
+    And stdout contains "cannot cross the pcall wrapper's function boundary"
+
+  Scenario: `<const>` is erased at every nesting depth
+    Given a project with edition "5.4" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      local a <const> = 1
+      do
+        local b <const> = 2
+        print(a + b)
+      end
+      """
+    When I run "luabox build"
+    Then the command succeeds
+    And "dist/src/main.lua" contains "local a = 1"
+    And "dist/src/main.lua" contains "local b = 2"
+    And the emitted output contains no "<const>"
+
+  Scenario: a `<const>` sharing its `local` with a plain name is still erasable
+    Given a project with edition "5.4" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      local a <const>, b = 1, 2
+      return a + b
+      """
+    When I run "luabox build"
+    Then the command succeeds
+    And "dist/src/main.lua" contains "local a, b = 1, 2"
+    And the emitted output contains no "<const>"
 
   # --- _ENV (env) ---------------------------------------------------------
 
@@ -480,6 +718,80 @@ Feature: Cross-dialect lowering transforms
     Then the command succeeds
     And "dist/src/main.lua" contains "goto continue"
 
+  Scenario: a conditional backward goto becomes a repeat/until with the negated test
+    Given a project with edition "5.4" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      local i = 0
+      ::top::
+      i = i + 1
+      if i < 3 then goto top end
+      print(i)
+      """
+    When I run "luabox build"
+    Then the command succeeds
+    And "dist/src/main.lua" contains "until not (i < 3)"
+    And the emitted output contains no "goto"
+
+  Scenario: two forward gotos in one block get separate skip flags
+    Given a project with edition "5.4" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      for i = 1, 3 do
+        if i == 1 then goto a end
+        print(i)
+        ::a::
+        if i == 2 then goto b end
+        print(i * 2)
+        ::b::
+      end
+      """
+    When I run "luabox build"
+    Then the command succeeds
+    And "dist/src/main.lua" contains "local __luabox_skip_1 = false"
+    And "dist/src/main.lua" contains "local __luabox_skip_2 = false"
+    And the emitted output contains no "goto"
+
+  Scenario Outline: the continue pattern is restructured inside any loop
+    Given a project with edition "5.4" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      <header>
+        if x then goto continue end
+        print(1)
+        ::continue::
+      <footer>
+      """
+    When I run "luabox build"
+    Then the command succeeds
+    And "dist/src/main.lua" contains "if not __luabox_skip_1 then"
+    And the emitted output contains no "goto"
+
+    Examples: every loop form, plus the bare chunk
+      | header          | footer     |
+      | for i = 1, 3 do | end        |
+      | while cond do   | end        |
+      | repeat          | until true |
+      | do              | end        |
+
+  Scenario: a goto inside a nested function is restructured in that function's scope
+    Given a project with edition "5.4" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      local function f()
+        for i = 1, 3 do
+          if i == 2 then goto next end
+          print(i)
+          ::next::
+        end
+      end
+      return f
+      """
+    When I run "luabox build"
+    Then the command succeeds
+    And "dist/src/main.lua" contains "local __luabox_skip_1 = false"
+    And the emitted output contains no "goto"
+
   # --- LuaJIT extensions (jit_ext) ----------------------------------------
 
   Scenario: a bit member access is rewritten onto the runtime helper
@@ -540,6 +852,34 @@ Feature: Cross-dialect lowering transforms
     Then the command fails
     And diagnostic LB0605 is reported
     And stdout contains "`bit.frobnicate` has no polyfill"
+
+  Scenario Outline: every LuaJIT number-literal suffix is rejected for a plain target
+    Given a project with edition "luajit" targeting "5.1"
+    And a Lua file containing 'local x = <literal> print(x)'
+    When I run "luabox build"
+    Then the command fails
+    And diagnostic LB0605 is reported
+    And stdout contains "the LuaJIT number literal `<literal>` cannot be lowered"
+
+    Examples: signed, unsigned, hexadecimal, and imaginary cdata boxes
+      | literal  |
+      | 1LL      |
+      | 1ULL     |
+      | 0xFFULL  |
+      | 0x10LL   |
+      | 1i       |
+      | 1.5i     |
+
+  Scenario: a long-bracket module name still resolves the bit require
+    Given a project with edition "luajit" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      local b = require([[bit]])
+      print(b.band(1, 2))
+      """
+    When I run "luabox build"
+    Then the command succeeds
+    And "dist/src/main.lua" contains "__luabox_rt"
 
   Scenario: a 64-bit LuaJIT number literal has no double representation
     Given a project with edition "luajit" targeting "5.1"

@@ -440,3 +440,19 @@ Feature: luabox check — annotation-driven typecheck (P0 MVP)
     When I run "luabox check"
     Then the command succeeds
     And stderr contains "check: 0 errors, 0 warnings in 2 files"
+
+  Scenario: a project without a manifest checks on the default edition
+    Given an empty directory
+    And a file "src/main.lua" containing:
+      """
+      ---@param n number
+      local function double(n)
+        return n * 2
+      end
+
+      double("nope")
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stdout contains "warning[LB0300]"
+    And stderr contains "check: 0 errors, 1 warnings in 1 files"
