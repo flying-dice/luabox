@@ -548,3 +548,58 @@ fn line_of(text: &str, offset: rowan::TextSize) -> u32 {
     let newlines = text.bytes().take(end).filter(|&b| b == b'\n').count();
     u32::try_from(newlines + 1).unwrap_or(u32::MAX)
 }
+
+#[cfg(test)]
+mod tests {
+    // test code — panics document assumptions
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    #[test]
+    fn quote_escapes_everything_lua_would_misread() {
+        assert_eq!(quote("plain.name"), "\"plain.name\"");
+        assert_eq!(quote("say \"hi\""), "\"say \\\"hi\\\"\"");
+        assert_eq!(quote("back\\slash"), "\"back\\\\slash\"");
+        assert_eq!(quote("a\nb"), "\"a\\nb\"");
+        assert_eq!(quote("a\rb"), "\"a\\rb\"");
+        // Other control characters take Lua's decimal `\ddd` escape.
+        assert_eq!(quote("a\tb"), "\"a\\9b\"");
+        assert_eq!(quote("\u{0}"), "\"\\0\"");
+        // Non-ASCII is legal inside a Lua string literal and stays verbatim.
+        assert_eq!(quote("café"), "\"café\"");
+        assert_eq!(quote(""), "\"\"");
+    }
+
+    #[test]
+    fn line_of_is_one_based_and_clamps_out_of_range_offsets() {
+        let text = "one\ntwo\nthree";
+        assert_eq!(line_of(text, 0.into()), 1);
+        assert_eq!(line_of(text, 3.into()), 1, "offset of the newline itself");
+        assert_eq!(line_of(text, 4.into()), 2);
+        assert_eq!(line_of(text, 8.into()), 3);
+        // Past the end clamps to the last line rather than panicking.
+        assert_eq!(line_of(text, 9_999.into()), 3);
+        assert_eq!(line_of("", 0.into()), 1);
+    }
+
+    #[test]
+    fn display_rel_strips_the_root_and_normalizes_separators() {
+        let root = Path::new("/project");
+        assert_eq!(
+            display_rel(Path::new("/project/src/a.lua"), root),
+            "src/a.lua"
+        );
+        // A path outside the root cannot be made relative: kept whole.
+        assert_eq!(
+            display_rel(Path::new("/elsewhere/a.lua"), root),
+            "/elsewhere/a.lua"
+        );
+    }
+
+    #[test]
+    fn canonical_falls_back_to_the_raw_path_when_the_file_is_gone() {
+        let missing = Path::new("/definitely/not/here/a.lua");
+        assert_eq!(canonical(missing), missing.to_path_buf());
+    }
+}

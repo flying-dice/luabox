@@ -1045,6 +1045,397 @@ SOURCE_FILE@0..4
         assert!(!parse.errors().is_empty());
     }
 
+    /// The messages of every error, in order.
+    fn messages(parse: &Parse) -> Vec<&str> {
+        parse.errors().iter().map(|e| e.message.as_str()).collect()
+    }
+
+    #[test]
+    fn unclosed_if_reports_missing_end_at_eof() {
+        let parse = err("if x then");
+        assert_eq!(messages(&parse), ["expected 'end'"]);
+        // The `then` block is still opened, so the tree stays well-formed.
+        let ast::Stmt::If(if_stmt) = first_stmt(&parse) else {
+            panic!("expected an if statement");
+        };
+        assert_eq!(if_stmt.condition().unwrap().syntax().text(), "x");
+        assert_eq!(if_stmt.then_block().unwrap().stmts().count(), 0);
+        // The error points at the empty range past the last token.
+        assert_eq!(parse.errors()[0].range, TextRange::empty(9.into()));
+    }
+
+    #[test]
+    fn duplicate_else_is_reported_once_and_both_clauses_are_kept() {
+        let parse = err("if a then else else end");
+        assert_eq!(messages(&parse), ["duplicate 'else'"]);
+        let ast::Stmt::If(if_stmt) = first_stmt(&parse) else {
+            panic!("expected an if statement");
+        };
+        let else_clauses = if_stmt
+            .syntax()
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::ELSE_CLAUSE)
+            .count();
+        assert_eq!(else_clauses, 2, "{}", parse.debug_dump());
+        // The error is anchored at the *second* `else`.
+        assert_eq!(&"if a then else else end"[15..19], "else");
+        assert_eq!(
+            parse.errors()[0].range,
+            TextRange::new(15.into(), 19.into())
+        );
+    }
+
+    #[test]
+    fn elseif_without_condition_recovers_into_the_clause() {
+        let parse = err("if x then elseif then end");
+        assert_eq!(messages(&parse), ["expected expression"]);
+        let ast::Stmt::If(if_stmt) = first_stmt(&parse) else {
+            panic!("expected an if statement");
+        };
+        let clauses: Vec<_> = if_stmt.elseif_clauses().collect();
+        assert_eq!(clauses.len(), 1);
+        assert!(clauses[0].condition().is_none());
+        assert!(clauses[0].block().is_some());
+    }
+
+    #[test]
+    fn truncated_function_header_reports_param_then_end() {
+        let parse = err("x = function(");
+        assert_eq!(messages(&parse), ["expected a parameter", "expected 'end'"]);
+        // The half-built `function` still lands in a FUNCTION_EXPR with an
+        // open PARAM_LIST and an (empty) body block.
+        let func = parse
+            .syntax()
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::FUNCTION_EXPR)
+            .expect("function expr");
+        assert!(
+            func.children().any(|n| n.kind() == SyntaxKind::PARAM_LIST)
+                && func.children().any(|n| n.kind() == SyntaxKind::BLOCK),
+            "{}",
+            parse.debug_dump()
+        );
+    }
+
+    #[test]
+    fn numeric_for_missing_limit_reports_comma_and_expression() {
+        let parse = err("for i = 1 do end");
+        assert_eq!(messages(&parse), ["expected ','", "expected expression"]);
+        // `do ... end` is still attached to the for, not orphaned.
+        let ast::Stmt::NumericFor(for_stmt) = first_stmt(&parse) else {
+            panic!("expected a numeric for");
+        };
+        assert_eq!(for_stmt.var().unwrap().text(), "i");
+        assert_eq!(for_stmt.start().unwrap().syntax().text(), "1");
+        assert!(for_stmt.end().is_none());
+        assert!(for_stmt.body().is_some());
+    }
+
+    #[test]
+    fn generic_for_without_exprs_keeps_an_empty_expr_list() {
+        let parse = err("for k in do end");
+        assert_eq!(messages(&parse), ["expected expression"]);
+        let ast::Stmt::GenericFor(for_stmt) = first_stmt(&parse) else {
+            panic!("expected a generic for");
+        };
+        assert_eq!(for_stmt.exprs().unwrap().exprs().count(), 0);
+        assert!(for_stmt.body().is_some());
+    }
+
+    #[test]
+    fn unterminated_repeat_reports_until_and_its_condition() {
+        let parse = err("repeat x = 1");
+        assert_eq!(
+            messages(&parse),
+            ["expected 'until'", "expected expression"]
+        );
+        let ast::Stmt::Repeat(repeat) = first_stmt(&parse) else {
+            panic!("expected a repeat");
+        };
+        assert_eq!(repeat.body().unwrap().stmts().count(), 1);
+        assert!(repeat.condition().is_none());
+    }
+
+    #[test]
+    fn bare_label_forms_report_the_missing_pieces() {
+        assert_eq!(messages(&err("::")), ["expected a name", "expected '::'"]);
+        let parse = err("::x");
+        assert_eq!(messages(&parse), ["expected '::'"]);
+        let ast::Stmt::Label(label) = first_stmt(&parse) else {
+            panic!("expected a label");
+        };
+        assert_eq!(label.name().unwrap().text(), "x");
+    }
+
+    #[test]
+    fn goto_without_a_label_name_still_builds_a_goto_stmt() {
+        let parse = err("goto");
+        assert_eq!(messages(&parse), ["expected a name"]);
+        let ast::Stmt::Goto(goto_stmt) = first_stmt(&parse) else {
+            panic!("expected a goto");
+        };
+        assert!(goto_stmt.label().is_none());
+    }
+
+    #[test]
+    fn unclosed_attrib_reports_the_missing_angle_bracket() {
+        let parse = err("local x <const");
+        assert_eq!(messages(&parse), ["expected '>'"]);
+        let ast::Stmt::Local(local) = first_stmt(&parse) else {
+            panic!("expected a local");
+        };
+        assert_eq!(local.names().count(), 1);
+    }
+
+    #[test]
+    fn dangling_field_access_reports_name_and_non_call_statement() {
+        let parse = err("a.b.");
+        assert_eq!(
+            messages(&parse),
+            ["expected a name", "expected assignment or function call"]
+        );
+        // The prefix that *did* parse is kept as nested FIELD_EXPRs.
+        let fields = parse
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::FIELD_EXPR)
+            .count();
+        assert_eq!(fields, 2, "{}", parse.debug_dump());
+    }
+
+    #[test]
+    fn dangling_method_call_reports_name_and_arguments() {
+        let parse = err("a:");
+        assert_eq!(messages(&parse), ["expected a name", "expected arguments"]);
+        assert!(
+            parse
+                .syntax()
+                .descendants()
+                .any(|n| n.kind() == SyntaxKind::METHOD_CALL_EXPR),
+            "{}",
+            parse.debug_dump()
+        );
+    }
+
+    #[test]
+    fn unclosed_call_argument_list_reports_expression_then_paren() {
+        let parse = err("f(a,");
+        assert_eq!(messages(&parse), ["expected expression", "expected ')'"]);
+        let ast::Stmt::Call(call) = first_stmt(&parse) else {
+            panic!("expected a call statement");
+        };
+        let Some(ast::Expr::Call(call_expr)) = call.expr() else {
+            panic!("expected a call expression");
+        };
+        // The one argument that parsed is retained.
+        assert_eq!(
+            call_expr
+                .args()
+                .unwrap()
+                .expr_list()
+                .unwrap()
+                .exprs()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn missing_assignment_target_after_comma_stops_the_target_list() {
+        let parse = err("a, = 1");
+        assert_eq!(messages(&parse), ["expected expression"]);
+        let ast::Stmt::Assign(assign) = first_stmt(&parse) else {
+            panic!("expected an assignment");
+        };
+        // The one target that parsed is kept; the `= 1` still attaches.
+        assert_eq!(assign.targets().unwrap().exprs().count(), 1);
+        assert_eq!(
+            assign
+                .values()
+                .unwrap()
+                .exprs()
+                .next()
+                .unwrap()
+                .syntax()
+                .text(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn stray_comma_after_assignment_becomes_an_error_node() {
+        let parse = err("x = ,");
+        assert_eq!(messages(&parse), ["expected expression", "unexpected ','"]);
+        let error_nodes: Vec<_> = parse
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::ERROR_NODE)
+            .collect();
+        assert_eq!(error_nodes.len(), 1);
+        assert_eq!(error_nodes[0].text(), ",");
+    }
+
+    #[test]
+    fn misplaced_close_paren_after_return_is_recovered_as_a_statement() {
+        // `)` cannot start an expression, so `primary_expr` declines and
+        // `recover_stmt` swallows it — after reporting the return violation.
+        let parse = err("return )");
+        assert_eq!(
+            messages(&parse),
+            ["statement after 'return'", "unexpected ')'"]
+        );
+        assert!(
+            parse
+                .syntax()
+                .descendants()
+                .any(|n| n.kind() == SyntaxKind::ERROR_NODE),
+            "{}",
+            parse.debug_dump()
+        );
+    }
+
+    #[test]
+    fn missing_table_key_value_reports_at_the_closing_brace() {
+        let parse = err("t = {[1] = }");
+        assert_eq!(messages(&parse), ["expected expression"]);
+        let field = parse
+            .syntax()
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::TABLE_KEY_FIELD)
+            .expect("table key field");
+        // The `}` stays outside the field, so the table still closes.
+        assert_eq!(field.text(), "[1] = ");
+    }
+
+    #[test]
+    fn unterminated_long_string_and_long_comment_parse_without_errors() {
+        // The lexer runs an unterminated long bracket to end-of-input; the
+        // parser therefore sees one well-formed STRING / COMMENT token.
+        let parse = ok("x = [[unterminated");
+        let ast::Stmt::Assign(assign) = first_stmt(&parse) else {
+            panic!("expected an assignment");
+        };
+        assert_eq!(
+            assign
+                .values()
+                .unwrap()
+                .exprs()
+                .next()
+                .unwrap()
+                .syntax()
+                .text(),
+            "[[unterminated"
+        );
+        let parse = ok("--[[ unterminated");
+        assert_eq!(parse.tree().block().unwrap().stmts().count(), 0);
+    }
+
+    // === Diagnostic token names ===
+
+    #[test]
+    fn describe_names_every_token_kind_used_in_expected_messages() {
+        use SyntaxKind as K;
+        let table: &[(SyntaxKind, &str)] = &[
+            (K::IDENT, "a name"),
+            (K::NUMBER, "a number"),
+            (K::STRING, "a string"),
+            (K::AND_KW, "'and'"),
+            (K::BREAK_KW, "'break'"),
+            (K::DO_KW, "'do'"),
+            (K::ELSE_KW, "'else'"),
+            (K::ELSEIF_KW, "'elseif'"),
+            (K::END_KW, "'end'"),
+            (K::FALSE_KW, "'false'"),
+            (K::FOR_KW, "'for'"),
+            (K::FUNCTION_KW, "'function'"),
+            (K::GOTO_KW, "'goto'"),
+            (K::IF_KW, "'if'"),
+            (K::IN_KW, "'in'"),
+            (K::LOCAL_KW, "'local'"),
+            (K::NIL_KW, "'nil'"),
+            (K::NOT_KW, "'not'"),
+            (K::OR_KW, "'or'"),
+            (K::REPEAT_KW, "'repeat'"),
+            (K::RETURN_KW, "'return'"),
+            (K::THEN_KW, "'then'"),
+            (K::TRUE_KW, "'true'"),
+            (K::UNTIL_KW, "'until'"),
+            (K::WHILE_KW, "'while'"),
+            (K::PLUS, "'+'"),
+            (K::MINUS, "'-'"),
+            (K::STAR, "'*'"),
+            (K::SLASH, "'/'"),
+            (K::PERCENT, "'%'"),
+            (K::CARET, "'^'"),
+            (K::HASH, "'#'"),
+            (K::AMP, "'&'"),
+            (K::TILDE, "'~'"),
+            (K::PIPE, "'|'"),
+            (K::LT_LT, "'<<'"),
+            (K::GT_GT, "'>>'"),
+            (K::SLASH_SLASH, "'//'"),
+            (K::EQ, "'='"),
+            (K::EQ_EQ, "'=='"),
+            (K::TILDE_EQ, "'~='"),
+            (K::LT_EQ, "'<='"),
+            (K::GT_EQ, "'>='"),
+            (K::LT, "'<'"),
+            (K::GT, "'>'"),
+            (K::L_PAREN, "'('"),
+            (K::R_PAREN, "')'"),
+            (K::L_BRACE, "'{'"),
+            (K::R_BRACE, "'}'"),
+            (K::L_BRACKET, "'['"),
+            (K::R_BRACKET, "']'"),
+            (K::SEMICOLON, "';'"),
+            (K::COLON, "':'"),
+            (K::COLON_COLON, "'::'"),
+            (K::COMMA, "','"),
+            (K::DOT, "'.'"),
+            (K::DOT_DOT, "'..'"),
+            (K::DOT_DOT_DOT, "'...'"),
+        ];
+        for &(kind, label) in table {
+            assert_eq!(describe(kind), label, "wrong name for {kind:?}");
+        }
+    }
+
+    #[test]
+    fn describe_falls_back_for_kinds_that_never_appear_in_diagnostics() {
+        // Trivia, the error token, and node kinds are never `expect`ed, so
+        // they get the generic name rather than a fabricated one.
+        for kind in [
+            SyntaxKind::WHITESPACE,
+            SyntaxKind::COMMENT,
+            SyntaxKind::ERROR,
+            SyntaxKind::SOURCE_FILE,
+            SyntaxKind::BLOCK,
+        ] {
+            assert_eq!(describe(kind), "a token", "{kind:?}");
+        }
+    }
+
+    // === Parse accessors ===
+
+    #[test]
+    fn green_root_is_the_same_tree_as_syntax() {
+        let parse = ok("local x = 1\n");
+        assert_eq!(parse.green(), parse.syntax().green().into_owned());
+        // Cloning the green root is cheap and yields an equal root node.
+        assert_eq!(
+            SyntaxNode::new_root(parse.green()).text().to_string(),
+            "local x = 1\n"
+        );
+    }
+
+    #[test]
+    fn debug_dump_lists_errors_after_the_tree() {
+        let dump = err("do").debug_dump();
+        let (tree, errors) = dump.split_once("error ").expect("an error line");
+        assert!(tree.starts_with("SOURCE_FILE@0..2\n"), "{dump}");
+        assert_eq!(errors, "2..2: expected 'end'\n");
+    }
+
     #[test]
     fn deep_paren_nesting_does_not_overflow() {
         let text = format!("x = {}1{}", "(".repeat(10_000), ")".repeat(10_000));

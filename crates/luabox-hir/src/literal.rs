@@ -369,4 +369,194 @@ mod tests {
     fn unknown_escape_is_undecodable() {
         assert_eq!(decode_string(r"'\q'").value, None);
     }
+
+    // --- numbers -----------------------------------------------------------
+
+    #[test]
+    fn hex_integer_wider_than_64_bits_falls_back_to_float() {
+        // 17 hex digits: `u64::from_str_radix` overflows, so the value is
+        // recovered (lossily) through the hex-float accumulator.
+        let Number::Float(f) = parse_number("0x1FFFFFFFFFFFFFFFF") else {
+            panic!("expected float");
+        };
+        assert!((f - 36_893_488_147_419_103_231.0).abs() / f < 1e-12);
+    }
+
+    #[test]
+    fn hex_float_without_a_p_exponent_is_scaled_by_2_pow_0() {
+        assert_eq!(parse_number("0x1.8"), Number::Float(1.5));
+        assert_eq!(parse_number("0xA."), Number::Float(10.0));
+        assert_eq!(parse_number(".5"), Number::Float(0.5));
+    }
+
+    #[test]
+    fn hex_float_exponent_may_be_negative_or_unparseable() {
+        assert_eq!(parse_number("0x1p-2"), Number::Float(0.25));
+        // A `p` with no digits leaves the exponent at 0 rather than panicking.
+        assert_eq!(parse_number("0x2p"), Number::Float(2.0));
+    }
+
+    #[test]
+    fn luajit_llu_suffix_is_accepted_alongside_ull() {
+        assert_eq!(parse_number("42LLU"), Number::U64(42));
+        assert_eq!(parse_number("0x10llu"), Number::U64(16));
+    }
+
+    #[test]
+    fn luajit_boxed_literals_wrap_rather_than_saturate() {
+        // `parse_uint` reads the magnitude as u64, then `LL` reinterprets the
+        // bit pattern as i64 — 2^63 becomes i64::MIN.
+        assert_eq!(parse_number("9223372036854775808LL"), Number::I64(i64::MIN));
+        assert_eq!(parse_number("0xFFFFFFFFFFFFFFFFULL"), Number::U64(u64::MAX));
+    }
+
+    #[test]
+    fn malformed_numeric_text_degrades_instead_of_panicking() {
+        // The lexer only emits well-formed tokens; these are the residual
+        // fallbacks (`unwrap_or`) that keep lowering total.
+        assert_eq!(parse_number("zzzLL"), Number::I64(0));
+        assert_eq!(parse_number("0xzzULL"), Number::U64(0));
+        assert!(matches!(parse_number("zzi"), Number::Imaginary(v) if v.is_nan()));
+        assert!(matches!(parse_number("1.2.3"), Number::Float(v) if v.is_nan()));
+    }
+
+    #[test]
+    fn surrounding_whitespace_and_case_are_normalized() {
+        assert_eq!(parse_number("  0X1F  "), Number::Int(31));
+        assert_eq!(parse_number("1E2"), Number::Float(100.0));
+    }
+
+    // --- strings: framing --------------------------------------------------
+
+    #[test]
+    fn text_that_is_not_a_string_token_is_undecodable() {
+        assert_eq!(decode_string("").value, None);
+        assert_eq!(decode_string("bare").value, None);
+        assert!(!decode_string("bare").is_long);
+    }
+
+    #[test]
+    fn unterminated_short_string_is_undecodable() {
+        // No closing quote, and a lone quote is too short to have a body.
+        assert_eq!(decode_string("\"abc").value, None);
+        assert_eq!(decode_string("\"").value, None);
+        // Mismatched quote characters do not close the literal either.
+        assert_eq!(decode_string("\"abc'").value, None);
+    }
+
+    #[test]
+    fn malformed_long_bracket_is_undecodable_but_still_marked_long() {
+        // `[=` with no second `[` is not a long-bracket opener.
+        let lit = decode_string("[=abc]=]");
+        assert_eq!(lit.value, None);
+        assert!(lit.is_long);
+        // Opener present but the text is too short to also hold the closer.
+        assert_eq!(decode_string("[[").value, None);
+        assert_eq!(decode_string("[==[").value, None);
+    }
+
+    #[test]
+    fn long_string_drops_exactly_one_leading_line_break() {
+        assert_eq!(decode_string("[[\r\nhi]]").as_str(), Some("hi"));
+        assert_eq!(decode_string("[[\n\rhi]]").as_str(), Some("hi"));
+        assert_eq!(decode_string("[[\rhi]]").as_str(), Some("hi"));
+        // Two newlines of the *same* kind: only the first is dropped.
+        assert_eq!(decode_string("[[\n\nhi]]").as_str(), Some("\nhi"));
+        // Escapes are not interpreted inside long strings.
+        assert_eq!(decode_string(r"[[a\nb]]").as_str(), Some(r"a\nb"));
+        assert_eq!(decode_string("[[]]").as_str(), Some(""));
+    }
+
+    // --- strings: escapes --------------------------------------------------
+
+    #[test]
+    fn control_character_escapes_decode_to_their_bytes() {
+        assert_eq!(
+            decode_string(r#""\a\b\f\n\r\t\v""#).value.unwrap(),
+            vec![7, 8, 12, b'\n', b'\r', b'\t', 11]
+        );
+    }
+
+    #[test]
+    fn quote_and_backslash_escapes_are_literal() {
+        assert_eq!(decode_string(r#""\\\"\'""#).as_str(), Some("\\\"'"));
+        assert_eq!(decode_string(r"'\'inner\''").as_str(), Some("'inner'"));
+    }
+
+    #[test]
+    fn escaped_line_break_yields_one_newline() {
+        // `\` + CRLF (or LFCR) is a single newline, not two.
+        assert_eq!(decode_string("\"a\\\r\nb\"").as_str(), Some("a\nb"));
+        assert_eq!(decode_string("\"a\\\n\rb\"").as_str(), Some("a\nb"));
+        assert_eq!(decode_string("\"a\\\nb\"").as_str(), Some("a\nb"));
+        // Same-kind pair: only the first is consumed by the escape.
+        assert_eq!(decode_string("\"a\\\n\nb\"").as_str(), Some("a\n\nb"));
+    }
+
+    #[test]
+    fn hex_escapes_decode_two_digits() {
+        assert_eq!(decode_string(r#""\x41\x7a""#).as_str(), Some("Az"));
+        // A non-hex digit, or a truncated pair, makes the literal undecodable.
+        assert_eq!(decode_string(r#""\xZZ""#).value, None);
+        assert_eq!(decode_string(r#""\x4""#).value, None);
+        assert_eq!(decode_string(r#""\x""#).value, None);
+    }
+
+    #[test]
+    fn decimal_escapes_take_up_to_three_digits() {
+        assert_eq!(decode_string(r#""\65\066\0""#).value.unwrap(), b"AB\0");
+        // Stops at the first non-digit, so the `x` is kept verbatim.
+        assert_eq!(decode_string(r#""\65x""#).as_str(), Some("Ax"));
+        // > 255 does not fit a byte: undecodable rather than truncated.
+        assert_eq!(decode_string(r#""\256""#).value, None);
+    }
+
+    #[test]
+    fn backslash_z_skips_the_following_whitespace_run() {
+        assert_eq!(decode_string("\"a\\z  \t\r\n  b\"").as_str(), Some("ab"));
+        // Vertical tab and form feed count as skippable whitespace too.
+        assert_eq!(decode_string("\"a\\z\x0b\x0cb\"").as_str(), Some("ab"));
+        // Nothing to skip is fine.
+        assert_eq!(decode_string(r#""a\zb""#).as_str(), Some("ab"));
+    }
+
+    #[test]
+    fn unicode_escapes_encode_as_utf8() {
+        assert_eq!(decode_string(r#""\u{48}\u{49}""#).as_str(), Some("HI"));
+        assert_eq!(decode_string(r#""\u{20AC}""#).as_str(), Some("\u{20ac}"));
+        assert_eq!(
+            decode_string(r#""\u{10FFFF}""#).as_str(),
+            Some("\u{10ffff}")
+        );
+    }
+
+    #[test]
+    fn malformed_unicode_escapes_are_undecodable() {
+        // Missing brace, empty braces, unterminated braces.
+        assert_eq!(decode_string(r#""\u41""#).value, None);
+        assert_eq!(decode_string(r#""\u{}""#).value, None);
+        assert_eq!(decode_string(r#""\u{41""#).value, None);
+        // Non-hex digit inside the braces.
+        assert_eq!(decode_string(r#""\u{4G}""#).value, None);
+        // A surrogate is not a `char`.
+        assert_eq!(decode_string(r#""\u{D800}""#).value, None);
+        // Overflows u32 while accumulating.
+        assert_eq!(decode_string(r#""\u{FFFFFFFFF}""#).value, None);
+    }
+
+    #[test]
+    fn trailing_backslash_at_end_of_body_is_undecodable() {
+        assert_eq!(decode_string("\"abc\\\"").value, None);
+    }
+
+    #[test]
+    fn undecodable_bytes_are_reported_as_such_by_as_str() {
+        // Valid escape sequence, invalid UTF-8: the bytes survive but
+        // `as_str` declines.
+        let lit = decode_string(r#""\xFF""#);
+        assert_eq!(lit.value.as_deref(), Some(&[0xFF][..]));
+        assert_eq!(lit.as_str(), None);
+        // Undecodable literals have no bytes at all.
+        assert_eq!(decode_string(r"'\q'").as_str(), None);
+    }
 }

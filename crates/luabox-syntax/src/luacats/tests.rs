@@ -535,6 +535,101 @@ fn type_paren() {
     assert_eq!(named_of(&inner).0, "string");
 }
 
+#[test]
+fn type_table_fields_may_be_separated_by_semicolons() {
+    let TypeExprKind::Table(fields) = ty("{ a: string; b: number }").kind else {
+        panic!()
+    };
+    assert_eq!(fields.len(), 2);
+    let TableField::Named { name, .. } = &fields[1] else {
+        panic!("second field should be named")
+    };
+    assert_eq!(name, "b");
+}
+
+#[test]
+fn type_string_literal_keeps_escaped_quotes_verbatim() {
+    // The scanner skips `\"` rather than ending the literal there.
+    assert_eq!(
+        ty(r#""a\"b""#).kind,
+        TypeExprKind::StringLit(r#""a\"b""#.to_string())
+    );
+    assert_eq!(
+        ty(r"'a\'b'").kind,
+        TypeExprKind::StringLit(r"'a\'b'".to_string())
+    );
+}
+
+#[test]
+fn type_number_literals_end_at_the_next_delimiter() {
+    let TypeExprKind::Union(m) = ty("1|2").kind else {
+        panic!()
+    };
+    assert_eq!(m[0].kind, TypeExprKind::NumberLit("1".to_string()));
+    assert_eq!(m[1].kind, TypeExprKind::NumberLit("2".to_string()));
+    assert_eq!(m[0].span, Span::new(0, 1));
+}
+
+#[test]
+fn type_fun_params_may_be_unnamed_bare_types() {
+    // A parameter that cannot start with a name is parsed as a bare type.
+    let TypeExprKind::Fun { params, .. } = ty("fun({ a: string }, [integer]): boolean").kind else {
+        panic!()
+    };
+    assert_eq!(params.len(), 2);
+    assert!(params.iter().all(|p| p.name.is_empty() && !p.vararg));
+    assert!(matches!(
+        params[0].ty.as_ref().unwrap().kind,
+        TypeExprKind::Table(_)
+    ));
+    assert!(matches!(
+        params[1].ty.as_ref().unwrap().kind,
+        TypeExprKind::Tuple(_)
+    ));
+}
+
+#[test]
+fn type_fun_vararg_return_is_an_any_marked_vararg() {
+    let TypeExprKind::Fun { returns, .. } = ty("fun(): ...").kind else {
+        panic!()
+    };
+    assert_eq!(returns.len(), 1);
+    assert!(returns[0].vararg);
+    assert!(returns[0].name.is_none());
+    assert_eq!(named_of(&returns[0].ty).0, "any");
+}
+
+#[test]
+fn type_fun_may_have_no_returns_at_all() {
+    // A bare `:` and an empty parenthesised list both yield zero returns.
+    for src in ["fun():", "fun(): ()"] {
+        let TypeExprKind::Fun { returns, .. } = ty(src).kind else {
+            panic!("{src}")
+        };
+        assert!(returns.is_empty(), "{src}");
+    }
+}
+
+#[test]
+fn type_dotted_path_stops_at_a_trailing_dot() {
+    // `a.` leaves the `.` unconsumed rather than inventing a segment.
+    let mut p = TypeParser::new("a.", 0);
+    let t = p.parse_type();
+    assert_eq!(named_of(&t).0, "a");
+    assert_eq!(t.span, Span::new(0, 1));
+    assert!(p.take_errors().is_empty());
+    assert!(!p.at_end(), "the trailing '.' is still pending");
+}
+
+#[test]
+fn take_ident_declines_non_identifier_tokens() {
+    let mut p = TypeParser::new("123", 0);
+    assert_eq!(p.take_ident(), None);
+    assert!(!p.at_end(), "declining must not consume the token");
+    let mut p = TypeParser::new("name rest", 0);
+    assert_eq!(p.take_ident(), Some(("name".to_string(), Span::new(0, 4))));
+}
+
 // === Type expressions: precedence & nesting ===
 
 #[test]
@@ -603,6 +698,117 @@ fn unterminated_table_reports_but_recovers() {
 }
 
 #[test]
+fn empty_and_trailing_pipe_types_report_a_missing_type() {
+    let (t, errs) = ty_err("");
+    assert_eq!(t.kind, TypeExprKind::Error);
+    assert_eq!(errs.len(), 1);
+    assert_eq!(errs[0].message, "expected a type");
+    assert_eq!(errs[0].span, Span::empty(0));
+
+    // A trailing `|` still yields a union whose last member is the error.
+    let (t, errs) = ty_err("string|");
+    let TypeExprKind::Union(m) = t.kind else {
+        panic!("expected a union")
+    };
+    assert_eq!(named_of(&m[0]).0, "string");
+    assert_eq!(m[1].kind, TypeExprKind::Error);
+    assert_eq!(errs.len(), 1);
+    assert_eq!(errs[0].message, "expected a type");
+    assert_eq!(errs[0].span, Span::empty(7));
+}
+
+#[test]
+fn leading_pipe_is_tolerated_without_an_error() {
+    let TypeExprKind::Union(m) = ty("|string|nil").kind else {
+        panic!("expected a union")
+    };
+    assert_eq!(m.len(), 2);
+}
+
+#[test]
+fn lone_minus_reports_and_yields_an_error_node() {
+    let (t, errs) = ty_err("-x");
+    assert_eq!(t.kind, TypeExprKind::Error);
+    assert_eq!(errs.len(), 1);
+    assert_eq!(errs[0].message, "unexpected '-' in type");
+    assert_eq!(errs[0].span, Span::new(0, 1));
+}
+
+#[test]
+fn unclosed_bracketing_reports_one_error_per_construct() {
+    for (src, message, ok) in [
+        (
+            "(string",
+            "expected ')'",
+            &(|t: &TypeExpr| matches!(t.kind, TypeExprKind::Paren(_)))
+                as &dyn Fn(&TypeExpr) -> bool,
+        ),
+        (
+            "[string, number",
+            "expected ']' to close tuple",
+            &|t| matches!(&t.kind, TypeExprKind::Tuple(items) if items.len() == 2),
+        ),
+        (
+            "table<string, number",
+            "expected '>' to close generics",
+            &|t| matches!(&t.kind, TypeExprKind::Named { name, args } if name == "table" && args.len() == 2),
+        ),
+        (
+            "fun(a: string",
+            "expected ')' in fun type",
+            &|t| matches!(&t.kind, TypeExprKind::Fun { params, .. } if params.len() == 1),
+        ),
+        (
+            "fun(): (string",
+            "expected ')' in return list",
+            &|t| matches!(&t.kind, TypeExprKind::Fun { returns, .. } if returns.len() == 1),
+        ),
+    ] {
+        let (t, errs) = ty_err(src);
+        assert_eq!(
+            errs.iter().map(|e| e.message.as_str()).collect::<Vec<_>>(),
+            [message],
+            "for {src:?}"
+        );
+        assert!(ok(&t), "unexpected recovered shape for {src:?}: {t:?}");
+        // The whole construct is still spanned from its opening token.
+        assert_eq!(t.span.start, 0, "for {src:?}");
+    }
+}
+
+#[test]
+fn malformed_table_fields_report_and_keep_parsing() {
+    // Indexer missing its `]`.
+    let (t, errs) = ty_err("{[string: number}");
+    let TypeExprKind::Table(fields) = &t.kind else {
+        panic!("expected a table type")
+    };
+    assert!(matches!(fields[0], TableField::Indexer { .. }));
+    assert_eq!(
+        errs.iter().map(|e| e.message.as_str()).collect::<Vec<_>>(),
+        ["expected ']' in table indexer"]
+    );
+
+    // A field that does not start with a name: the token is consumed so the
+    // loop makes progress, and the following field still parses.
+    let (t, errs) = ty_err("{ 1, ok: string }");
+    let TypeExprKind::Table(fields) = &t.kind else {
+        panic!("expected a table type")
+    };
+    assert_eq!(fields.len(), 1, "{fields:?}");
+    let TableField::Named { name, .. } = &fields[0] else {
+        panic!("expected a named field")
+    };
+    assert_eq!(name, "ok");
+    assert_eq!(errs[0].message, "expected a field name in table type");
+    assert_eq!(errs[0].span, Span::new(2, 3));
+
+    // Missing `:` between field name and type.
+    let (_, errs) = ty_err("{ foo string }");
+    assert_eq!(errs[0].message, "expected ':' in table field");
+}
+
+#[test]
 fn malformed_type_does_not_abort_the_block() {
     // First tag has a broken type; the second must still parse cleanly.
     let b = block("---@type )\n---@param good string ok");
@@ -615,7 +821,125 @@ fn malformed_type_does_not_abort_the_block() {
     assert_eq!(named_of(&p.ty).0, "string");
 }
 
+#[test]
+fn tags_without_a_name_recover_with_an_empty_name() {
+    let Tag::Class(c) = one_tag("---@class") else {
+        panic!()
+    };
+    assert_eq!(c.name, "");
+    assert!(c.parents.is_empty());
+
+    // `:` is not a name character, so the name is empty and the parent list
+    // still parses.
+    let Tag::Class(c) = one_tag("---@class : Animal") else {
+        panic!()
+    };
+    assert_eq!(c.name, "");
+    assert_eq!(named_of(&c.parents[0]).0, "Animal");
+}
+
+#[test]
+fn class_type_params_need_a_closing_angle_bracket() {
+    // Unterminated `<`: the parameter list is dropped rather than guessed.
+    let Tag::Class(c) = one_tag("---@class Foo<T") else {
+        panic!()
+    };
+    assert_eq!(c.name, "Foo");
+    assert!(c.params.is_empty());
+
+    let Tag::Class(c) = one_tag("---@class Foo<T: Base, U>") else {
+        panic!()
+    };
+    assert_eq!(c.params, ["T", "U"]);
+}
+
+#[test]
+fn field_indexer_brackets_nest_and_must_balance() {
+    // Nested `[` inside the key: the *matching* `]` closes the indexer.
+    let Tag::Field(f) = one_tag("---@field [string[]] number") else {
+        panic!()
+    };
+    let FieldKey::Indexer(key) = &f.key else {
+        panic!("expected an indexer key")
+    };
+    assert!(matches!(key.kind, TypeExprKind::Array(_)));
+    assert_eq!(named_of(&f.ty).0, "number");
+
+    // Unbalanced: not an indexer at all, so it falls back to the name form.
+    let b = block("---@field [string number");
+    let Tag::Field(f) = &b.tags[0] else { panic!() };
+    assert_eq!(f.key, FieldKey::Name(String::new()));
+}
+
+#[test]
+fn crlf_line_endings_do_not_leak_into_tag_text() {
+    let text = "---@class Windows\r\n---@field path string a path\r\n";
+    let b = parse_block(text, 0);
+    let Tag::Class(c) = &b.tags[0] else { panic!() };
+    assert_eq!(c.name, "Windows");
+    let Tag::Field(f) = &b.tags[1] else { panic!() };
+    assert_eq!(f.desc.as_deref(), Some("a path"));
+    // The tag span stops before the `\r`.
+    assert_eq!(&text[c.span.start..c.span.end], "@class Windows");
+}
+
 // === Span correctness ===
+
+#[test]
+fn span_len_and_is_empty_track_the_byte_range() {
+    let s = Span::new(3, 10);
+    assert_eq!(s.len(), 7);
+    assert!(!s.is_empty());
+    assert_eq!(Span::empty(4).len(), 0);
+    assert!(Span::empty(4).is_empty());
+    // Degenerate (inverted) spans report zero length rather than underflow.
+    let inverted = Span::new(9, 4);
+    assert_eq!(inverted.len(), 0);
+    assert!(inverted.is_empty());
+}
+
+#[test]
+fn every_tag_kind_reports_the_span_of_its_own_line() {
+    let lines = [
+        "@class C",
+        "@field f string",
+        "@param p string",
+        "@return string",
+        "@type string",
+        "@alias A string",
+        "@generic T",
+        "@overload fun()",
+        "@cast x string",
+        "@enum E",
+        "@meta",
+        "@operator add(C): C",
+        "@vararg string",
+        "@see other",
+        "@deprecated",
+        "@nodiscard",
+        "@async",
+        "@diagnostic disable",
+        "@version 5.4",
+        "@source a.lua",
+        "@package",
+        "@private",
+        "@protected",
+        "@madeup thing",
+    ];
+    let text = lines
+        .iter()
+        .map(|l| format!("---{l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let b = parse_block(&text, 0);
+    assert_eq!(b.tags.len(), lines.len(), "{:?}", b.tags);
+    for (tag, line) in b.tags.iter().zip(lines) {
+        let span = tag.span();
+        assert_eq!(&text[span.start..span.end], line, "wrong span for {tag:?}");
+    }
+    // The last line is the forward-compatibility fallback.
+    assert!(matches!(b.tags[lines.len() - 1], Tag::Unknown(_)));
+}
 
 #[test]
 fn param_spans_are_file_absolute() {

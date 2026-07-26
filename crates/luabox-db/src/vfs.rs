@@ -222,4 +222,63 @@ mod tests {
         vfs.clear_overlay(a);
         assert_eq!(vfs.effective_text(a), None);
     }
+
+    #[test]
+    fn ids_enumerates_every_interned_file_in_interning_order() {
+        let mut vfs = Vfs::new();
+        assert_eq!(vfs.ids().count(), 0);
+
+        let ids: Vec<_> = ["a.lua", "b.lua", "c.lua"]
+            .into_iter()
+            .map(|p| vfs.intern(PathBuf::from(p), Dialect::Lua54))
+            .collect();
+
+        assert_eq!(vfs.ids().collect::<Vec<_>>(), ids);
+        // Re-interning does not append a second id.
+        vfs.intern(PathBuf::from("b.lua"), Dialect::Lua54);
+        assert_eq!(vfs.ids().count(), 3);
+    }
+
+    #[test]
+    fn set_dialect_retargets_an_already_interned_file() {
+        let mut vfs = Vfs::new();
+        let a = vfs.intern(PathBuf::from("a.lua"), Dialect::Lua54);
+        assert_eq!(vfs.dialect(a), Dialect::Lua54);
+
+        vfs.set_dialect(a, Dialect::LuaJit);
+        assert_eq!(vfs.dialect(a), Dialect::LuaJit);
+        // The id and its path are untouched.
+        assert_eq!(vfs.path(a), Path::new("a.lua"));
+    }
+
+    #[test]
+    fn load_from_disk_fills_the_disk_layer_and_propagates_io_errors() {
+        // `CARGO_MANIFEST_DIR` is a compile-time constant, so this reads a
+        // known file without depending on the process's working directory.
+        let mut vfs = Vfs::new();
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let id = vfs.intern(manifest, Dialect::Lua54);
+        assert_eq!(vfs.effective_text(id), None, "nothing read yet");
+
+        vfs.load_from_disk(id)
+            .expect("the crate manifest is readable");
+        let text = vfs.effective_text(id).expect("disk layer populated");
+        assert!(text.contains("name = \"luabox-db\""));
+
+        // An overlay still wins over freshly loaded disk content.
+        vfs.set_overlay(id, "overlaid".into());
+        vfs.load_from_disk(id).expect("re-read succeeds");
+        assert_eq!(vfs.effective_text(id), Some("overlaid"));
+
+        // A missing path surfaces the I/O error rather than a silent empty.
+        let missing = vfs.intern(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("no-such-file.lua"),
+            Dialect::Lua54,
+        );
+        let err = vfs
+            .load_from_disk(missing)
+            .expect_err("a missing file is an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(vfs.effective_text(missing), None);
+    }
 }

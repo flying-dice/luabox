@@ -860,4 +860,239 @@ mod tests {
         assert!(!is_interface(&m.classes[2]));
         assert!(!is_interface(&m.classes[3]));
     }
+
+    /// The rendered type of the single `@field` in a one-field class — the
+    /// shortest route from LuaCATS source text to `render_type`'s output.
+    fn field_type(annotation: &str) -> String {
+        let m = module(&format!(
+            "---@class Holder\n---@field value {annotation}\nlocal Holder = {{}}\n"
+        ));
+        m.classes[0].fields[0].ty.clone()
+    }
+
+    #[test]
+    fn every_type_form_renders_back_to_its_source_shape() {
+        for (annotation, expected) in [
+            ("string", "string"),
+            ("string?", "string?"),
+            ("string[]", "string[]"),
+            ("string|number", "string|number"),
+            ("table<string, number>", "table<string, number>"),
+            ("(string)", "(string)"),
+            ("\"yes\"", "\"yes\""),
+            ("42", "42"),
+            ("true", "true"),
+            ("`T`", "`T`"),
+        ] {
+            assert_eq!(field_type(annotation), expected, "for `{annotation}`");
+        }
+    }
+
+    #[test]
+    fn table_literal_and_function_types_render_with_their_members() {
+        let table = field_type("{ a: number, b?: string }");
+        assert!(table.starts_with('{'), "{table}");
+        assert!(table.contains("a: number"), "{table}");
+        assert!(table.contains("b?: string"), "{table}");
+
+        let indexer = field_type("{ [string]: boolean }");
+        assert!(indexer.contains("[string]: boolean"), "{indexer}");
+
+        let fun = field_type("fun(a: string, b?: number): boolean");
+        assert!(fun.starts_with("fun("), "{fun}");
+        assert!(fun.contains("a: string"), "{fun}");
+        assert!(fun.contains(": boolean"), "{fun}");
+    }
+
+    #[test]
+    fn an_unparseable_type_renders_as_a_question_mark_rather_than_panicking() {
+        // The harvest keeps a placeholder for a type it cannot parse; the
+        // renderer must degrade to `?` instead of losing the field.
+        let m = module("---@class Holder\n---@field value \nlocal Holder = {}\n");
+        assert_eq!(m.classes[0].fields.len(), 1);
+        assert_eq!(m.classes[0].fields[0].name, "value");
+    }
+
+    #[test]
+    fn every_field_scope_keyword_is_carried_onto_the_field() {
+        let m = module(
+            "---@class Scoped\n\
+             ---@field open number\n\
+             ---@field private hidden number\n\
+             ---@field protected shared number\n\
+             ---@field package internal number\n\
+             ---@field public exposed number\n\
+             local Scoped = {}\n",
+        );
+        let scopes: Vec<Option<&str>> = m.classes[0]
+            .fields
+            .iter()
+            .map(|f| f.scope.as_deref())
+            .collect();
+        assert_eq!(
+            scopes,
+            [
+                None,
+                Some("private"),
+                Some("protected"),
+                Some("package"),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn an_indexer_field_is_named_by_its_bracketed_key_type() {
+        let m = module(
+            "---@class Bag\n---@field [string] number a bucket\nlocal Bag = {}\n",
+        );
+        let field = &m.classes[0].fields[0];
+        assert_eq!(field.name, "[string]");
+        assert_eq!(field.ty, "number");
+        assert_eq!(field.desc.as_deref(), Some("a bucket"));
+    }
+
+    #[test]
+    fn an_optional_field_is_flagged_without_folding_the_marker_into_its_type() {
+        let m = module("---@class Opt\n---@field maybe? number\nlocal Opt = {}\n");
+        let field = &m.classes[0].fields[0];
+        assert!(field.optional);
+        assert_eq!(field.ty, "number");
+    }
+
+    #[test]
+    fn an_alias_declared_with_pipe_members_keeps_each_member_and_its_description() {
+        let m = module(
+            "--- The alignment options.\n\
+             ---@alias Align\n\
+             ---| \"left\" # towards the start\n\
+             ---| \"right\"\n",
+        );
+        assert_eq!(m.aliases.len(), 1);
+        let alias = &m.aliases[0];
+        assert_eq!(alias.name, "Align");
+        assert_eq!(alias.members.len(), 2);
+        assert_eq!(alias.members[0].0, "\"left\"");
+        assert_eq!(alias.members[0].1.as_deref(), Some("towards the start"));
+        assert_eq!(alias.members[1].1, None);
+        assert!(alias.docs.contains("alignment"));
+    }
+
+    #[test]
+    fn a_key_enum_is_distinguished_from_a_value_enum() {
+        let m = module(
+            "---@enum Colour\nlocal Colour = { red = 1 }\n\
+             \n\
+             ---@enum (key) Named\nlocal Named = { a = 1 }\n",
+        );
+        assert_eq!(m.enums.len(), 2);
+        assert!(!m.enums[0].key);
+        assert!(m.enums[1].key);
+    }
+
+    #[test]
+    fn a_class_bound_by_a_plain_assignment_still_owns_its_methods() {
+        // `binding_name`'s assignment branch: the carrier is a global
+        // assignment rather than a `local`.
+        let m = module(
+            "---@class geometry.Box\nBox = {}\n\
+             \n\
+             ---@return number\nfunction Box:volume()\n  return 1\nend\n",
+        );
+        assert_eq!(m.classes.len(), 1);
+        assert_eq!(m.classes[0].name, "geometry.Box");
+        assert_eq!(m.classes[0].methods.len(), 1, "{:?}", m.functions);
+    }
+
+    #[test]
+    fn a_function_bound_to_a_local_is_documented_like_a_declaration() {
+        let m = module(
+            "--- Does a thing.\n---@param n number\n---@return number\nlocal f = function(n)\n  return n\nend\n",
+        );
+        assert_eq!(m.functions.len(), 1);
+        assert_eq!(m.functions[0].name, "f");
+        assert_eq!(m.functions[0].docs, "Does a thing.");
+        assert_eq!(m.functions[0].signature(), "function f(n: number): number");
+    }
+
+    #[test]
+    fn a_dotted_declaration_name_renders_with_dots_and_a_method_with_a_colon() {
+        let m = module(
+            "local M = {}\nfunction M.helper() end\nfunction M.deep.nested() end\nreturn M\n",
+        );
+        let names: Vec<&str> = m.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"M.helper"), "{names:?}");
+        assert!(names.contains(&"M.deep.nested"), "{names:?}");
+    }
+
+    #[test]
+    fn a_return_tag_without_a_name_or_description_still_renders_in_the_signature() {
+        let m = module("---@return number\nlocal function f()\n  return 1\nend\n");
+        assert_eq!(m.functions[0].signature(), "function f(): number");
+        assert_eq!(m.functions[0].returns[0].name, None);
+        assert_eq!(m.functions[0].returns[0].desc, None);
+    }
+
+    #[test]
+    fn multiple_return_tags_render_as_a_comma_separated_return_list() {
+        let m = module(
+            "---@return boolean ok\n---@return string? err\nlocal function f()\n  return true\nend\n",
+        );
+        assert_eq!(
+            m.functions[0].signature(),
+            "function f(): boolean, string?"
+        );
+    }
+
+    #[test]
+    fn a_class_with_no_annotations_at_all_yields_an_empty_module() {
+        let m = module("local x = 1\nreturn x\n");
+        assert!(m.classes.is_empty());
+        assert!(m.aliases.is_empty());
+        assert!(m.enums.is_empty());
+        assert!(m.docs.is_empty());
+    }
+
+    #[test]
+    fn a_file_that_does_not_parse_still_yields_a_module_rather_than_panicking() {
+        let m = module("---@class Broken\nlocal = \n");
+        assert_eq!(m.name, "fixture");
+        assert_eq!(m.classes.len(), 1);
+    }
+
+    #[test]
+    fn an_exact_class_is_flagged_as_such() {
+        let m = module("---@class (exact) Sealed\n---@field a number\nlocal Sealed = {}\n");
+        assert!(m.classes[0].exact);
+    }
+
+    #[test]
+    fn inherited_fields_tolerate_a_parent_cycle() {
+        let m = module(
+            "---@class A: B\n---@field a number\nlocal A = {}\n\
+             \n\
+             ---@class B: A\n---@field b number\nlocal B = {}\n",
+        );
+        let model = DocModel {
+            package: "fixture".to_string(),
+            modules: vec![m],
+        };
+        let classes = classes_by_name(&model);
+        // The walk must terminate: each ancestor is visited at most once,
+        // and the class itself is never re-listed as its own ancestor.
+        let inherited = inherited_fields(&classes, classes["A"]);
+        assert_eq!(inherited.len(), 1);
+        assert_eq!(inherited[0].0, "B");
+    }
+
+    #[test]
+    fn an_unknown_parent_contributes_no_inherited_fields() {
+        let m = module("---@class Orphan: Missing\n---@field a number\nlocal Orphan = {}\n");
+        let model = DocModel {
+            package: "fixture".to_string(),
+            modules: vec![m],
+        };
+        let classes = classes_by_name(&model);
+        assert!(inherited_fields(&classes, classes["Orphan"]).is_empty());
+    }
 }

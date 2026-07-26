@@ -10,8 +10,8 @@
 //! source-map roundtrip — all through the public API only (no token kinds).
 
 use luabox_hir::{
-    Attrib, BindingKind, Block, BodyId, Expr, ExprId, HirId, Literal, LoweredFile, Number,
-    Resolution, Stmt, StmtId, TableEntry,
+    Attrib, BinOp, BindingKind, Block, BodyId, Expr, ExprId, HirId, Literal, LoweredFile, Number,
+    Resolution, Stmt, StmtId, TableEntry, UnOp,
 };
 use luabox_syntax::lua::{Dialect, parse};
 
@@ -993,4 +993,158 @@ fn broken_parses_still_lower() {
         assert!(!parse.errors().is_empty(), "fixture should be broken");
         let _file = luabox_hir::lower(&parse);
     }
+}
+
+/// The `BinOp` of the first `Expr::Binary` in the chunk.
+fn only_binop(src: &str) -> BinOp {
+    let file = lowered(src);
+    let body = file.body(file.chunk());
+    body.exprs()
+        .find_map(|(_, e)| match e {
+            Expr::Binary { op, .. } => Some(*op),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no binary expr in {src}"))
+}
+
+/// The `UnOp` of the first `Expr::Unary` in the chunk.
+fn only_unop(src: &str) -> UnOp {
+    let file = lowered(src);
+    let body = file.body(file.chunk());
+    body.exprs()
+        .find_map(|(_, e)| match e {
+            Expr::Unary { op, .. } => Some(*op),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no unary expr in {src}"))
+}
+
+#[test]
+fn every_binary_operator_token_maps_to_its_hir_op() {
+    for (src, want) in [
+        ("x = a + b", BinOp::Add),
+        ("x = a - b", BinOp::Sub),
+        ("x = a * b", BinOp::Mul),
+        ("x = a / b", BinOp::Div),
+        ("x = a // b", BinOp::IDiv),
+        ("x = a % b", BinOp::Mod),
+        ("x = a ^ b", BinOp::Pow),
+        ("x = a .. b", BinOp::Concat),
+        ("x = a == b", BinOp::Eq),
+        ("x = a ~= b", BinOp::Ne),
+        ("x = a < b", BinOp::Lt),
+        ("x = a <= b", BinOp::Le),
+        ("x = a > b", BinOp::Gt),
+        ("x = a >= b", BinOp::Ge),
+        ("x = a and b", BinOp::And),
+        ("x = a or b", BinOp::Or),
+        ("x = a & b", BinOp::BAnd),
+        ("x = a | b", BinOp::BOr),
+        ("x = a ~ b", BinOp::BXor),
+        ("x = a << b", BinOp::Shl),
+        ("x = a >> b", BinOp::Shr),
+    ] {
+        assert_eq!(only_binop(src), want, "lowering {src}");
+    }
+}
+
+#[test]
+fn every_unary_operator_token_maps_to_its_hir_op() {
+    for (src, want) in [
+        ("x = -a", UnOp::Neg),
+        ("x = not a", UnOp::Not),
+        ("x = #a", UnOp::Len),
+        ("x = ~a", UnOp::BNot),
+    ] {
+        assert_eq!(only_unop(src), want, "lowering {src}");
+    }
+}
+
+#[test]
+fn break_lowers_to_a_statement_of_its_own() {
+    let file = lowered("while true do break end");
+    let has_break = file
+        .bodies()
+        .any(|(_, body)| body.stmts().any(|(_, stmt)| matches!(stmt, Stmt::Break)));
+    assert!(has_break, "`break` survives lowering as Stmt::Break");
+}
+
+#[test]
+fn a_call_with_no_argument_list_lowers_to_zero_arguments() {
+    // A recovered method call with no `(...)`: lowering must yield an empty
+    // argument vector rather than panicking.
+    let parse = parse("o:m", Dialect::Lua54);
+    assert!(!parse.errors().is_empty(), "fixture should be broken");
+    let file = luabox_hir::lower(&parse);
+    let body = file.body(file.chunk());
+    let args = body
+        .exprs()
+        .find_map(|(_, e)| match e {
+            Expr::MethodCall { args, .. } => Some(args.clone()),
+            _ => None,
+        })
+        .expect("a method call was recovered");
+    assert!(args.is_empty());
+}
+
+#[test]
+fn an_anonymous_function_statement_lowers_its_target_to_an_error_expr() {
+    // `function() end` as a *statement* has no name path; the assignment
+    // target degrades to `Expr::Error` instead of aborting the lowering.
+    let parse = parse("function() end", Dialect::Lua54);
+    assert!(!parse.errors().is_empty(), "fixture should be broken");
+    let file = luabox_hir::lower(&parse);
+    let body = file.body(file.chunk());
+    assert!(
+        body.exprs().any(|(_, e)| matches!(e, Expr::Error)),
+        "the missing name path becomes Expr::Error"
+    );
+}
+
+#[test]
+fn unterminated_strings_recover_differently_by_bracket_style() {
+    // A short string that never closes is not a STRING token at all — the
+    // parser recovers it as an error node, so nothing lowers.
+    let short = parse("x = \"unterminated", Dialect::Lua54);
+    assert!(!short.errors().is_empty(), "fixture should be broken");
+    let file = luabox_hir::lower(&short);
+    assert!(
+        !file
+            .body(file.chunk())
+            .exprs()
+            .any(|(_, e)| matches!(e, Expr::Literal(_))),
+        "an unterminated short string yields no literal"
+    );
+
+    // An unterminated long bracket *is* lexed as a STRING running to
+    // end-of-file, so it lowers to a literal. `decode_long_string` then
+    // strips a closing bracket's worth of bytes it never actually saw.
+    let long = parse("x = [[unterminated", Dialect::Lua54);
+    let file = luabox_hir::lower(&long);
+    let lit = file
+        .body(file.chunk())
+        .exprs()
+        .find_map(|(_, e)| match e {
+            Expr::Literal(Literal::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .expect("the recovered long string lowers");
+    assert!(lit.is_long);
+    assert_eq!(lit.as_str(), Some("unterminat"));
+}
+
+#[test]
+fn require_that_is_not_a_single_string_literal_is_a_dynamic_require() {
+    // One non-literal argument.
+    let file = lowered("local name = \"m\"\nlocal m = require(name)\n");
+    assert!(
+        file.requires().is_empty(),
+        "a computed module string is not a static edge"
+    );
+    assert_eq!(file.dynamic_requires().len(), 1);
+
+    // Zero arguments, and more than one: neither can name a module either.
+    let file = lowered("require()\nrequire(\"a\", \"b\")\n");
+    assert!(file.requires().is_empty());
+    assert_eq!(file.dynamic_requires().len(), 2);
 }

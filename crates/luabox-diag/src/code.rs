@@ -164,6 +164,42 @@ mod tests {
     }
 
     #[test]
+    fn new_is_the_numeric_constructor_display_agrees_with() {
+        for number in [0u16, 1, 503, 1001, Code::MAX] {
+            let code = Code::new(number);
+            assert_eq!(code.number(), number);
+            assert_eq!(code.to_string(), format!("LB{number:04}"));
+            assert_eq!(code.to_string().parse::<Code>(), Ok(code));
+        }
+        assert_eq!(Code::new(503).block(), 0);
+        assert_eq!(Code::new(1001).block(), 1);
+    }
+
+    #[test]
+    fn debug_shows_the_canonical_spelling_not_the_raw_number() {
+        assert_eq!(format!("{:?}", Code::new(1)), "Code(LB0001)");
+        assert_eq!(format!("{:?}", Code::new(1001)), "Code(LB1001)");
+    }
+
+    #[test]
+    fn the_parse_error_explains_the_expected_shape() {
+        let err = "banana".parse::<Code>().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "not a valid diagnostic code; codes look like LB0421"
+        );
+        // It is a real `std::error::Error`.
+        let boxed: Box<dyn std::error::Error> = Box::new(err);
+        assert!(boxed.to_string().contains("LB0421"));
+    }
+
+    #[test]
+    fn deserializing_a_malformed_code_is_an_error_not_a_panic() {
+        let err = serde_json::from_str::<Code>("\"LB1\"").unwrap_err();
+        assert!(err.to_string().contains("LB0421"), "{err}");
+    }
+
+    #[test]
     fn severity_keywords() {
         assert_eq!(Severity::Error.keyword(), "error");
         assert_eq!(Severity::Warning.keyword(), "warning");

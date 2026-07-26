@@ -316,3 +316,227 @@ fn file_text_and_files_reflect_the_effective_content() {
     let files: Vec<_> = host.snapshot().files().map(Path::to_path_buf).collect();
     assert_eq!(files, vec![PathBuf::from("a.lua")]);
 }
+
+#[test]
+fn every_analysis_accessor_answers_for_a_known_file_and_none_for_an_unknown_one() {
+    const MODULE: &str = "\
+---@class Point
+---@field x number
+local M = {}
+---@return number
+function M.zero() return 0 end
+return M
+";
+
+    let mut host = host();
+    host.apply_change(set("m.lua", MODULE));
+    let snap = host.snapshot();
+    let m = Path::new("m.lua");
+    let missing = Path::new("nope.lua");
+
+    // Syntax surface.
+    assert_eq!(snap.syntax(m).unwrap().text().to_string(), MODULE);
+    assert!(snap.parse(m).unwrap().errors().is_empty());
+
+    // Annotation / type surfaces.
+    assert!(
+        !snap.annotations(m).unwrap().items().is_empty(),
+        "the ---@class block is harvested"
+    );
+    assert!(snap.type_env(m).is_some());
+
+    // HIR surface: one chunk body plus the `M.zero` function body.
+    assert_eq!(snap.lower(m).unwrap().file().bodies().count(), 2);
+
+    // Inference surfaces.
+    assert!(
+        !snap.binding_types(m).unwrap().bindings().is_empty(),
+        "`M` at least is a typed binding"
+    );
+    assert!(
+        snap.module_export(m).unwrap().ty().is_some(),
+        "the chunk returns M, so the module exports a type"
+    );
+    assert!(
+        snap.project_types()
+            .iter()
+            .any(|t| format!("{t:?}").contains("Point")),
+        "the workspace-global class contribution is visible"
+    );
+
+    // Every path-keyed accessor declines an unknown file rather than panicking.
+    assert!(snap.syntax(missing).is_none());
+    assert!(snap.parse(missing).is_none());
+    assert!(snap.annotations(missing).is_none());
+    assert!(snap.type_env(missing).is_none());
+    assert!(snap.lower(missing).is_none());
+    assert!(snap.binding_types(missing).is_none());
+    assert!(snap.module_export(missing).is_none());
+    assert!(snap.require_exports(missing).is_none());
+    assert!(snap.diagnostics(missing).is_none());
+}
+
+#[test]
+fn display_mode_inference_flows_across_a_require_in_both_directions() {
+    // `main.lua` requires `m.lua`, so:
+    //   * downstream — `main.lua`'s binding types see `m.lua`'s export;
+    //   * upstream    — `m.lua`'s exported `M.f` gets its parameter seeded
+    //                   from the `number` argument `main.lua` passes.
+    let mut called = host();
+    called.apply_changes([
+        set(
+            "m.lua",
+            "local M = {}\nfunction M.f(x) return x end\nreturn M\n",
+        ),
+        set("main.lua", "local m = require(\"m\")\nlocal r = m.f(1)\n"),
+    ]);
+
+    let snap = called.snapshot();
+
+    // Downstream: `m` in main.lua is the required module's table, not unknown.
+    let types = snap.binding_types(Path::new("main.lua")).unwrap();
+    let m_binding = types
+        .bindings()
+        .iter()
+        .find(|b| b.name == "m")
+        .expect("`m` is a binding");
+    let rendered = format!("{:?}", m_binding.ty);
+    assert!(
+        rendered.contains('f'),
+        "the required module's `f` member is visible: {rendered}"
+    );
+
+    // Upstream: `M.f` is `function(x) return x end`, so its return type is
+    // only knowable from a caller. The dependent file's `m.f(1)` seeds it.
+    let seeded = format!(
+        "{:?}",
+        snap.module_export(Path::new("m.lua"))
+            .unwrap()
+            .ty()
+            .expect("m.lua exports its table")
+    );
+    assert!(
+        seeded.contains("returns: [Integer]"),
+        "the observed call argument flows into the exported return type: {seeded}"
+    );
+
+    // Drop the call site and the seed disappears — proving it came from the
+    // dependent file, not from `m.lua` alone.
+    let mut uncalled = host();
+    uncalled.apply_changes([
+        set(
+            "m.lua",
+            "local M = {}\nfunction M.f(x) return x end\nreturn M\n",
+        ),
+        set("main.lua", "local m = require(\"m\")\n"),
+    ]);
+    let unseeded = format!(
+        "{:?}",
+        uncalled
+            .snapshot()
+            .module_export(Path::new("m.lua"))
+            .unwrap()
+            .ty()
+            .expect("m.lua exports its table")
+    );
+    assert!(
+        unseeded.contains("returns: [Unknown]"),
+        "with no caller there is nothing to seed from: {unseeded}"
+    );
+}
+
+#[test]
+fn set_root_rebases_require_resolution_and_is_visible_through_the_vfs() {
+    let mut host = host();
+    host.set_root(PathBuf::from("/workspace"));
+    host.apply_changes([
+        set("/workspace/src/util.lua", "local M = {}\nreturn M\n"),
+        set("/workspace/main.lua", "local u = require(\"util\")\n"),
+    ]);
+
+    let snap = host.snapshot();
+    let reqs = snap
+        .require_exports(Path::new("/workspace/main.lua"))
+        .expect("main.lua is known");
+    assert!(
+        reqs.contains_key("util"),
+        "`require(\"util\")` resolves under <root>/src: {reqs:?}"
+    );
+
+    // The read-only VFS reflects the same interned set.
+    assert_eq!(host.vfs().ids().count(), 2);
+    assert!(
+        host.vfs()
+            .file_id(Path::new("/workspace/main.lua"))
+            .is_some()
+    );
+}
+
+#[test]
+fn clearing_an_overlay_reverts_to_disk_and_ignores_unknown_paths() {
+    let mut host = host();
+    host.apply_change(set("a.lua", GOOD));
+    host.apply_change(Change::SetOverlay {
+        path: PathBuf::from("a.lua"),
+        text: BAD.to_owned(),
+    });
+    assert_eq!(
+        host.snapshot()
+            .diagnostics(Path::new("a.lua"))
+            .unwrap()
+            .len(),
+        1
+    );
+
+    host.apply_change(Change::ClearOverlay {
+        path: PathBuf::from("a.lua"),
+    });
+    assert_eq!(
+        host.snapshot().file_text(Path::new("a.lua")).as_deref(),
+        Some(GOOD)
+    );
+    assert!(
+        host.snapshot()
+            .diagnostics(Path::new("a.lua"))
+            .unwrap()
+            .is_empty()
+    );
+
+    // Clearing an overlay on a path the VFS never interned is a no-op, not a
+    // panic and not a new file.
+    host.apply_change(Change::ClearOverlay {
+        path: PathBuf::from("never-seen.lua"),
+    });
+    assert_eq!(host.snapshot().files().count(), 1);
+}
+
+#[test]
+fn set_dialect_reparses_the_file_under_the_new_dialect() {
+    // LuaJIT-only `0x10ULL` is a parse error under 5.4.
+    const JIT_ONLY: &str = "local n = 10ULL\n";
+
+    let mut host = host();
+    host.apply_change(set("a.lua", JIT_ONLY));
+    assert!(
+        !host
+            .snapshot()
+            .parse(Path::new("a.lua"))
+            .unwrap()
+            .errors()
+            .is_empty(),
+        "the LuaJIT suffix does not parse as Lua 5.4"
+    );
+
+    host.apply_change(Change::SetDialect {
+        path: PathBuf::from("a.lua"),
+        dialect: Dialect::LuaJit,
+    });
+    assert!(
+        host.snapshot()
+            .parse(Path::new("a.lua"))
+            .unwrap()
+            .errors()
+            .is_empty(),
+        "under LuaJIT the same source is clean"
+    );
+}

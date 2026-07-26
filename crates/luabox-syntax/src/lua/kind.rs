@@ -144,3 +144,51 @@ impl rowan::Language for LuaLanguage {
         rowan::SyntaxKind(kind as u16)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rowan::Language;
+
+    #[test]
+    fn raw_kinds_round_trip_through_rowan() {
+        // The whole tree relies on this: every kind rowan stores must come
+        // back as the same kind.
+        let mut raw = 0u16;
+        while let Some(kind) = SyntaxKind::from_u16(raw) {
+            assert_eq!(
+                LuaLanguage::kind_from_raw(LuaLanguage::kind_to_raw(kind)),
+                kind
+            );
+            assert_eq!(kind as u16, raw);
+            raw += 1;
+        }
+        // The scan must have covered the whole enum, not stopped at zero.
+        assert!(raw > 50, "only {raw} kinds round-tripped");
+    }
+
+    #[test]
+    fn out_of_range_raw_values_are_rejected() {
+        // `from_u16` is the guard behind `kind_from_raw`'s expect: values
+        // outside the enum must be `None`, never a transmuted kind.
+        assert_eq!(SyntaxKind::from_u16(u16::MAX), None);
+        assert_eq!(
+            SyntaxKind::from_u16(SyntaxKind::TABLE_ITEM_FIELD as u16 + 1),
+            None
+        );
+    }
+
+    #[test]
+    fn only_whitespace_and_comments_are_trivia() {
+        assert!(SyntaxKind::WHITESPACE.is_trivia());
+        assert!(SyntaxKind::COMMENT.is_trivia());
+        for kind in [
+            SyntaxKind::IDENT,
+            SyntaxKind::ERROR,
+            SyntaxKind::SEMICOLON,
+            SyntaxKind::SOURCE_FILE,
+        ] {
+            assert!(!kind.is_trivia(), "{kind:?}");
+        }
+    }
+}

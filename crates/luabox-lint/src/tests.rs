@@ -11,7 +11,7 @@
 use luabox_diag::Severity;
 use luabox_syntax::Dialect;
 
-use crate::{LintConfig, LintOutcome, apply_fixes, lint_source};
+use crate::{Level, LintConfig, LintOutcome, Tier, apply_fixes, lint_source, rules, tier_default};
 
 /// The Lua 5.4 stdlib's known-global names — every test lints against this
 /// baseline, exactly as `luabox lint` does via `luabox_types::stdlib_defs`
@@ -139,6 +139,158 @@ fn same_block_relocal_is_allowed() {
 fn shadowing_a_parameter_fires() {
     let src = "local function f(v)\n  do\n    local v = 2\n    print(v)\n  end\n  return v\nend\nreturn f\n";
     assert!(has(src, &LintConfig::new(), "LB0503"));
+}
+
+/// The `shadowed-local` findings of `src`, as `(message, secondary label)`
+/// pairs in report order.
+fn shadow_findings(src: &str) -> Vec<(String, String)> {
+    lint(src, &LintConfig::new())
+        .diagnostics
+        .into_iter()
+        .filter(|d| d.code.to_string() == "LB0503")
+        .map(|d| {
+            let secondary = d
+                .labels
+                .iter()
+                .find(|l| !l.primary)
+                .map_or_else(String::new, |l| l.message.clone());
+            (d.message, secondary)
+        })
+        .collect()
+}
+
+#[test]
+fn shadow_diagnostic_names_both_declarations() {
+    let src = "local value = 1\ndo\n  local value = 2\n  print(value)\nend\nprint(value)\n";
+    assert_eq!(
+        shadow_findings(src),
+        vec![(
+            "`value` shadows a binding from an enclosing scope".to_owned(),
+            "outer `value` declared here".to_owned(),
+        )]
+    );
+}
+
+#[test]
+fn shadowing_fires_in_every_kind_of_nested_scope() {
+    // if / else, while, repeat-until, numeric for (with a step) and generic
+    // for each open a scope the walker must descend into.
+    for (label, src) in [
+        (
+            "if branch",
+            "local v = 1\nif c then local v = 2 print(v) end\nprint(v)\n",
+        ),
+        (
+            "else branch",
+            "local v = 1\nif c then print(1) else local v = 2 print(v) end\nprint(v)\n",
+        ),
+        (
+            "while body",
+            "local v = 1\nwhile c do local v = 2 print(v) end\nprint(v)\n",
+        ),
+        (
+            "repeat body",
+            "local v = 1\nrepeat local v = 2 until v > 1\nprint(v)\n",
+        ),
+        (
+            "numeric for var",
+            "local v = 1\nfor v = 1, 10, 2 do print(v) end\nprint(v)\n",
+        ),
+        (
+            "generic for var",
+            "local v = 1\nfor v in pairs(t) do print(v) end\nprint(v)\n",
+        ),
+        (
+            "method receiver argument",
+            "local v = 1\nlocal f = obj:m(function() local v = 2 return v end)\nprint(v, f)\n",
+        ),
+        (
+            "table constructor value",
+            "local v = 1\nlocal t = { [k] = function() local v = 2 return v end }\nprint(v, t)\n",
+        ),
+        (
+            "value-truncating parenthesis",
+            "local v = 1\nlocal t = (f(function() local v = 2 return v end))\nprint(v, t)\n",
+        ),
+        (
+            "unary and binary operands",
+            "local v = 1\nlocal t = -g(function() local v = 2 return v end) + 1\nprint(v, t)\n",
+        ),
+    ] {
+        assert!(
+            default_codes(src).contains(&"LB0503".to_owned()),
+            "no shadow reported for {label}: {src}"
+        );
+    }
+}
+
+#[test]
+fn a_parameter_shadowing_an_outer_local_is_registered_silently() {
+    // Parameters are not `local` declarations: they seed the function's frame
+    // without a finding of their own — but they do become the outer binding a
+    // nested `local` can then shadow (see `shadowing_a_parameter_fires`).
+    let src = "local v = 1\nlocal f = function(v) return v end\nprint(v, f)\n";
+    assert!(!default_codes(src).contains(&"LB0503".to_owned()));
+}
+
+#[test]
+fn a_repeat_body_local_is_visible_to_its_until_condition() {
+    // One shared frame for body + `until`, so re-declaring in the `until`'s
+    // own scope is impossible and the body local shadows nothing new.
+    let src = "repeat\n  local v = 1\nuntil v > 0\n";
+    assert!(!default_codes(src).contains(&"LB0503".to_owned()));
+}
+
+#[test]
+fn nameless_error_recovery_bindings_are_skipped_not_shadowed() {
+    // Broken sources still reach the rules (only fixes are withheld). The
+    // bindings the parser recovers have no name, and a nameless binding can
+    // neither shadow nor be shadowed.
+    for src in [
+        "local = 1\ndo local = 2 end\n",
+        "local function f(,) local v = 1 return v end\nreturn f\n",
+    ] {
+        let out = lint(src, &LintConfig::new());
+        assert!(out.had_parse_errors, "{src}");
+        assert!(
+            out.diagnostics
+                .iter()
+                .all(|d| d.code.to_string() != "LB0503"),
+            "{src}: {:?}",
+            out.diagnostics
+        );
+    }
+}
+
+#[test]
+fn a_top_level_local_shadows_nothing() {
+    // The chunk has exactly one enclosing frame (the chunk's own parameter
+    // frame), so nothing above it can be shadowed.
+    let src = "local a = 1\nlocal b = 2\nreturn a + b\n";
+    assert!(!default_codes(src).contains(&"LB0503".to_owned()));
+}
+
+#[test]
+fn shadowing_is_suppressible_like_any_other_finding() {
+    let src = "local v = 1\ndo\n  ---@luabox-ignore shadowed-local intentional inner scope\n  local v = 2\n  print(v)\nend\nprint(v)\n";
+    assert!(!default_codes(src).contains(&"LB0503".to_owned()));
+}
+
+#[test]
+fn control_flow_statements_are_walked_without_incident() {
+    // `break`, `goto` and labels carry no bindings; the walker must step over
+    // them and still find the shadow that follows.
+    let src = "\
+local v = 1
+while c do
+  if a then break end
+  goto continue
+  ::continue::
+  do local v = 2 print(v) end
+end
+print(v)
+";
+    assert!(default_codes(src).contains(&"LB0503".to_owned()), "{src}");
 }
 
 // --- global-write (LB0504, suspicious) -------------------------------------
@@ -359,6 +511,82 @@ fn nil_compare_fix_both_directions() {
     assert!(fixed.contains("if not s then"), "{fixed}");
 }
 
+#[test]
+fn nil_compare_reads_either_operand_order() {
+    let src = "---@param s string\nlocal function f(s)\n  if nil ~= s then return s end\n  return \"\"\nend\nreturn f\n";
+    assert!(has(src, &LintConfig::new(), "LB0505"));
+    let fixed = apply_fixes(src, &lint(src, &LintConfig::new()).fixes);
+    assert!(fixed.contains("if s then"), "{fixed}");
+}
+
+#[test]
+fn nil_compare_needs_a_plain_name_on_the_other_side() {
+    // `t.field ~= nil` and `f() ~= nil` are not name expressions, so there is
+    // no binding to consult and the rule stays silent.
+    for src in [
+        "---@param t table\nlocal function g(t)\n  if t.field ~= nil then return 1 end\n  return 0\nend\nreturn g\n",
+        "---@param t table\nlocal function g(t)\n  if t.f() ~= nil then return 1 end\n  return 0\nend\nreturn g\n",
+    ] {
+        assert!(!has(src, &LintConfig::new(), "LB0505"), "{src}");
+    }
+}
+
+#[test]
+fn nil_compare_follows_the_declared_type_through_its_grammar() {
+    // Optional, union and literal shapes all resolve to "cannot be `false`".
+    for annotation in [
+        "string?",
+        "\"yes\"|\"no\"",
+        "true",
+        "(string)",
+        "42",
+        "fun():number",
+    ] {
+        let src = format!(
+            "---@param s {annotation}\nlocal function f(s)\n  if s ~= nil then return 1 end\n  return 0\nend\nreturn f\n"
+        );
+        assert!(has(&src, &LintConfig::new(), "LB0505"), "{annotation}");
+    }
+    // ...and these can be `false`, so the guard is not redundant.
+    for annotation in [
+        "boolean",
+        "any",
+        "unknown",
+        "false",
+        "boolean|string",
+        "`T`",
+    ] {
+        let src = format!(
+            "---@param s {annotation}\nlocal function f(s)\n  if s ~= nil then return 1 end\n  return 0\nend\nreturn f\n"
+        );
+        assert!(!has(&src, &LintConfig::new(), "LB0505"), "{annotation}");
+    }
+}
+
+#[test]
+fn a_type_annotation_on_a_local_is_harvested_too() {
+    // `---@type` binds positionally to the locals the statement declares.
+    let src = "---@type string, boolean\nlocal name, flag = get()\nif name ~= nil then print(name) end\nif flag ~= nil then print(flag) end\n";
+    let out = lint(src, &LintConfig::new());
+    let hits: Vec<_> = out
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.to_string() == "LB0505")
+        .collect();
+    // Only `name` (string) is redundant-guard material; `flag` is a boolean.
+    assert_eq!(hits.len(), 1, "{:?}", out.diagnostics);
+    assert!(hits[0].message.contains("`name`"), "{}", hits[0].message);
+}
+
+#[test]
+fn an_annotation_block_attached_to_nothing_is_ignored() {
+    // The trailing block has no statement to bind to; harvesting must skip it
+    // instead of mis-attaching the type to an earlier declaration.
+    let src =
+        "---@param s string\nlocal function f(s)\n  return s\nend\nreturn f\n---@param s boolean\n";
+    assert_eq!(default_codes(src), Vec::<String>::new());
+}
+
 // --- concat-in-loop (LB0506, perf) -----------------------------------------
 
 #[test]
@@ -371,6 +599,36 @@ fn concat_in_loop_fires() {
 fn concat_of_loop_local_is_clean() {
     let src = "local function f(n)\n  for i = 1, n do\n    local s = \"\"\n    s = s .. \"x\"\n    print(s)\n  end\nend\nreturn f\n";
     assert!(!has(src, &LintConfig::new(), "LB0506"));
+}
+
+#[test]
+fn concat_outside_any_loop_is_clean() {
+    // No loop in the body at all...
+    let src = "local s = \"\"\ns = s .. \"x\"\nprint(s)\n";
+    assert!(!has(src, &LintConfig::new(), "LB0506"));
+    // ...and a body that *does* have a loop, with the concat outside it.
+    let src = "local s = \"\"\nfor i = 1, 3 do print(i) end\ns = s .. \"x\"\nprint(s)\n";
+    assert!(!has(src, &LintConfig::new(), "LB0506"));
+}
+
+#[test]
+fn concat_in_loop_needs_a_single_self_referential_assignment() {
+    for (label, src) in [
+        (
+            "multi-target assignment",
+            "local s, t = \"\", \"\"\nfor i = 1, 3 do s, t = s .. \"x\", t end\nprint(s, t)\n",
+        ),
+        (
+            "not self-referential",
+            "local s = \"\"\nlocal a, b = \"a\", \"b\"\nfor i = 1, 3 do s = a .. b end\nprint(s)\n",
+        ),
+        (
+            "global accumulator",
+            "for i = 1, 3 do total = total .. \"x\" end\nprint(total)\n",
+        ),
+    ] {
+        assert!(!has(src, &LintConfig::new(), "LB0506"), "{label}: {src}");
+    }
 }
 
 // --- pairs-on-array (LB0507, perf) -----------------------------------------
@@ -393,6 +651,50 @@ fn pairs_on_array_literal_fires_and_fixes() {
     assert!(has(src, &LintConfig::new(), "LB0507"));
     let fixed = apply_fixes(src, &lint(src, &LintConfig::new()).fixes);
     assert!(fixed.contains("ipairs({ 1, 2, 3 })"), "{fixed}");
+}
+
+#[test]
+fn pairs_over_an_integer_keyed_table_type_fires() {
+    let src = "---@param xs table<integer, string>\nlocal function f(xs)\n  for _, x in pairs(xs) do print(x) end\n  return xs\nend\nreturn f\n";
+    assert!(has(src, &LintConfig::new(), "LB0507"));
+}
+
+#[test]
+fn pairs_over_a_parenthesised_array_type_fires() {
+    let src = "---@param xs (number[])\nlocal function f(xs)\n  for _, x in pairs(xs) do print(x) end\n  return xs\nend\nreturn f\n";
+    assert!(has(src, &LintConfig::new(), "LB0507"));
+}
+
+#[test]
+fn pairs_is_only_flagged_on_the_real_global_with_one_array_argument() {
+    for (label, src) in [
+        (
+            "shadowed pairs",
+            "local pairs = myiter\nfor _, x in pairs({ 1, 2 }) do print(x) end\n",
+        ),
+        (
+            "extra argument",
+            "for _, x in pairs({ 1, 2 }, extra) do print(x) end\n",
+        ),
+        (
+            "empty table literal",
+            "for _, x in pairs({}) do print(x) end\n",
+        ),
+        (
+            "keyed table literal",
+            "for k, v in pairs({ a = 1 }) do print(k, v) end\n",
+        ),
+        (
+            "not a name or table literal",
+            "local t = {}\nfor k, v in pairs(t.inner) do print(k, v) end\n",
+        ),
+        (
+            "non-array declared type",
+            "---@param xs fun():number\nlocal function f(xs)\n  for k in pairs(xs) do print(k) end\n  return xs\nend\nreturn f\n",
+        ),
+    ] {
+        assert!(!has(src, &LintConfig::new(), "LB0507"), "{label}: {src}");
+    }
 }
 
 // --- empty-then (LB0508, suspicious) ---------------------------------------
@@ -462,6 +764,30 @@ fn ignore_targets_only_the_named_rule() {
     let src = "---@luabox-ignore unused-local ok\ncounter = 0\n";
     let c = default_codes(src);
     assert!(c.contains(&"LB0504".to_owned()), "{c:?}");
+}
+
+#[test]
+fn a_diagnostic_directive_without_a_colon_is_ignored() {
+    let src = "---@diagnostic disable\nprnit(1)\n";
+    assert!(default_codes(src).contains(&"LB0509".to_owned()));
+}
+
+#[test]
+fn an_unrecognised_diagnostic_action_is_ignored() {
+    let src = "---@diagnostic enable: undefined-global\nprnit(1)\n";
+    assert!(default_codes(src).contains(&"LB0509".to_owned()));
+}
+
+#[test]
+fn a_diagnostic_directive_naming_several_rules_still_maps() {
+    let src = "---@diagnostic disable: undefined-field, undefined-global\nprnit(1)\n";
+    assert!(!default_codes(src).contains(&"LB0509".to_owned()));
+}
+
+#[test]
+fn an_underscore_parameter_is_exempt_from_unused_param() {
+    let src = "local function f(_ignored, used) return used end\nreturn f\n";
+    assert!(!has(src, &pedantic(), "LB0502"));
 }
 
 // --- config precedence -----------------------------------------------------
@@ -543,6 +869,83 @@ fn apply_fixes_is_stable_on_second_run() {
     let first = apply_fixes(src, &lint(src, &LintConfig::new()).fixes);
     let second = apply_fixes(&first, &lint(&first, &LintConfig::new()).fixes);
     assert_eq!(first, second, "fixes should converge");
+}
+
+// --- registry / tier / level vocabulary -------------------------------------
+
+#[test]
+fn every_registered_rule_is_uniquely_identified_and_described() {
+    let registry = rules();
+    assert_eq!(registry.len(), 9, "the SPEC §9 rule set");
+    let mut ids: Vec<&str> = Vec::new();
+    let mut codes: Vec<String> = Vec::new();
+    for rule in &registry {
+        let id = rule.id();
+        assert!(
+            id.chars().all(|c| c.is_ascii_lowercase() || c == '-'),
+            "`{id}` is not kebab-case"
+        );
+        assert!(!rule.description().is_empty(), "`{id}` has no description");
+        assert!(
+            !rule.description().ends_with('.'),
+            "`{id}` description is a phrase, not a sentence"
+        );
+        assert!(!ids.contains(&id), "duplicate rule id `{id}`");
+        let code = rule.code().to_string();
+        assert!(
+            code.starts_with("LB05"),
+            "`{id}` code {code} is outside LB05xx"
+        );
+        assert!(!codes.contains(&code), "duplicate code {code} on `{id}`");
+        // The tier keyword round-trips, so a `[lint]` toggle can name it.
+        assert_eq!(Tier::parse(rule.tier().name()), Some(rule.tier()));
+        ids.push(id);
+        codes.push(code);
+    }
+}
+
+#[test]
+fn every_tier_keyword_round_trips_and_has_a_default_level() {
+    for (tier, keyword, default) in [
+        (Tier::Correctness, "correctness", Level::Deny),
+        (Tier::Suspicious, "suspicious", Level::Warn),
+        (Tier::Perf, "perf", Level::Warn),
+        (Tier::Style, "style", Level::Warn),
+        (Tier::Pedantic, "pedantic", Level::Allow),
+    ] {
+        assert_eq!(tier.name(), keyword);
+        assert_eq!(Tier::parse(keyword), Some(tier));
+        assert_eq!(tier_default(tier), default);
+    }
+    assert_eq!(Tier::parse("correctnes"), None);
+    assert_eq!(Tier::parse(""), None);
+}
+
+#[test]
+fn levels_map_to_severities_and_reject_unknown_keywords() {
+    assert_eq!(Level::parse("allow"), Some(Level::Allow));
+    assert_eq!(Level::parse("warn"), Some(Level::Warn));
+    assert_eq!(Level::parse("deny"), Some(Level::Deny));
+    assert_eq!(Level::parse("forbid"), None);
+    assert_eq!(Level::Allow.severity(), None);
+    assert_eq!(Level::Warn.severity(), Some(Severity::Warning));
+    assert_eq!(Level::Deny.severity(), Some(Severity::Error));
+}
+
+#[test]
+fn unrecognised_config_keywords_are_rejected_without_changing_anything() {
+    let mut c = LintConfig::new();
+    assert!(!c.set_tier("nonsense", "warn"), "unknown tier name");
+    assert!(!c.set_tier("style", "forbid"), "unknown level keyword");
+    assert!(
+        !c.set_rule("unused-local", "forbid"),
+        "unknown level keyword"
+    );
+    // None of the rejected calls took effect: the style default still fires.
+    assert!(has("local x = 1\n", &c, "LB0501"));
+    // An unknown *rule id* is accepted (ids are not validated) but inert.
+    assert!(c.set_rule("no-such-rule", "deny"));
+    assert!(has("local x = 1\n", &c, "LB0501"));
 }
 
 // --- corpus sweep ----------------------------------------------------------

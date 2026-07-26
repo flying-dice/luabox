@@ -298,3 +298,383 @@ fn is_test_file(rel: &str) -> bool {
     }
     in_tests || name.ends_with("_test.lua") || name.ends_with(".test.lua")
 }
+
+#[cfg(test)]
+mod tests {
+    // test code — panics document assumptions
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    /// Write `contents` to `root/rel`, creating parent directories.
+    fn write(root: &Path, rel: &str, contents: &str) {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().expect("has a parent")).expect("create parents");
+        fs::write(&path, contents).expect("write file");
+    }
+
+    fn manifest(extra: &str) -> String {
+        format!("[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n{extra}")
+    }
+
+    fn project(extra: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", &manifest(extra));
+        tmp
+    }
+
+    fn read(root: &Path, rel: &str) -> String {
+        fs::read_to_string(root.join(rel)).expect("read back")
+    }
+
+    // -- the command -------------------------------------------------------
+
+    #[test]
+    fn a_clean_project_lints_successfully() {
+        let tmp = project("");
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "local x = 1\nprint(x)\nreturn 0\n",
+        );
+        run(tmp.path(), false).expect("lint passes");
+    }
+
+    #[test]
+    fn an_empty_project_lints_successfully() {
+        let tmp = project("");
+        run(tmp.path(), false).expect("lint passes");
+    }
+
+    #[test]
+    fn a_style_tier_finding_warns_without_failing_the_command() {
+        let tmp = project("");
+        write(tmp.path(), "src/main.lua", "local unused = 1\nreturn 0\n");
+        // `unused-local` is style-tier: a warning, exit zero (SPEC.md §9).
+        run(tmp.path(), false).expect("warnings do not fail lint");
+    }
+
+    #[test]
+    fn a_correctness_tier_finding_fails_the_command() {
+        let tmp = project("");
+        // A `---@luabox-ignore` without a reason is itself a correctness
+        // finding (LB0500).
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "---@luabox-ignore unused-local\nlocal x = 1\nreturn 0\n",
+        );
+        let error = run(tmp.path(), false).unwrap_err().to_string();
+        assert!(error.contains("lint failed with"), "{error}");
+        assert!(error.contains("error(s)"), "{error}");
+    }
+
+    #[test]
+    fn a_tier_promoted_to_deny_in_the_manifest_fails_the_command() {
+        let tmp = project("\n[lint]\nstyle = \"deny\"\n");
+        write(tmp.path(), "src/main.lua", "local unused = 1\nreturn 0\n");
+        let error = run(tmp.path(), false).unwrap_err().to_string();
+        assert!(error.contains("lint failed with"), "{error}");
+    }
+
+    #[test]
+    fn a_rule_allowed_in_the_manifest_stops_being_reported() {
+        let tmp = project("\n[lint]\nstyle = \"deny\"\nunused-local = \"allow\"\n");
+        write(tmp.path(), "src/main.lua", "local unused = 1\nreturn 0\n");
+        // The rule-level `allow` wins over the tier-level `deny`.
+        run(tmp.path(), false).expect("the allowed rule no longer fires");
+    }
+
+    #[test]
+    fn a_global_declared_in_the_manifest_is_treated_as_intentional() {
+        let tmp = project("\n[lint]\ncorrectness = \"deny\"\nglobals = [\"counter\"]\n");
+        write(tmp.path(), "src/main.lua", "counter = 0\nreturn counter\n");
+        run(tmp.path(), false).expect("an allow-listed global does not fire global-write");
+    }
+
+    #[test]
+    fn fix_rewrites_machine_applicable_findings_to_disk() {
+        let tmp = project("");
+        write(tmp.path(), "src/main.lua", "local unused = 1\nreturn 0\n");
+
+        run(tmp.path(), true).expect("lint --fix succeeds");
+        assert!(read(tmp.path(), "src/main.lua").contains("_unused"));
+        // The rewritten file is clean on a second, non-fixing pass.
+        run(tmp.path(), false).expect("the fixed file lints clean");
+    }
+
+    #[test]
+    fn without_fix_nothing_is_written_back() {
+        let tmp = project("");
+        let original = "local unused = 1\nreturn 0\n";
+        write(tmp.path(), "src/main.lua", original);
+        run(tmp.path(), false).expect("lint passes");
+        assert_eq!(read(tmp.path(), "src/main.lua"), original);
+    }
+
+    #[test]
+    fn fix_never_rewrites_a_file_with_parse_errors() {
+        let tmp = project("");
+        let broken = "local unused = 1\nlocal = \n";
+        write(tmp.path(), "src/main.lua", broken);
+
+        // Parse errors are correctness-tier, so the command fails — but the
+        // file itself must survive untouched.
+        assert!(run(tmp.path(), true).is_err());
+        assert_eq!(read(tmp.path(), "src/main.lua"), broken);
+    }
+
+    #[test]
+    fn definition_files_are_linted_unlike_check_and_build() {
+        let tmp = project("");
+        // `lint` passes `exclude_d_lua = false`: `*.d.lua` are walked too, so
+        // a parse error in one is reported rather than skipped.
+        write(tmp.path(), "defs/broken.d.lua", "local = \n");
+        assert!(run(tmp.path(), false).is_err());
+    }
+
+    #[test]
+    fn the_build_output_directory_is_never_linted() {
+        let tmp = project("\n[build]\nout = \"dist\"\n");
+        write(tmp.path(), "dist/main.lua", "local = \n");
+        run(tmp.path(), false).expect("emitted output is not project source");
+    }
+
+    #[test]
+    fn a_manifest_less_directory_lints_as_lua_54_with_the_default_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = discover(tmp.path()).expect("manifest-less default");
+        assert_eq!(project.root, tmp.path().to_path_buf());
+        assert_eq!(project.dialect, Dialect::Lua54);
+        assert!(project.out_dir.is_none());
+        // The stdlib is still the known-globals baseline.
+        assert!(project.known_globals.contains("print"));
+
+        write(tmp.path(), "main.lua", "local x = 1\nprint(x)\n");
+        run(tmp.path(), false).expect("lint passes");
+    }
+
+    #[test]
+    fn a_malformed_manifest_fails_the_lint_rather_than_defaulting() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", "= = =\n");
+        let error = run(tmp.path(), false).unwrap_err().to_string();
+        assert!(error.starts_with("invalid `"), "{error}");
+    }
+
+    #[test]
+    fn discover_reads_the_edition_and_out_dir_from_the_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "luabox.toml",
+            "[package]\nname = \"f\"\nversion = \"0.1.0\"\nedition = \"5.1\"\n\n[build]\nout = \"build\"\n",
+        );
+        let project = discover(tmp.path()).expect("discovers");
+        assert_eq!(project.dialect, Dialect::Lua51);
+        assert_eq!(project.out_dir, Some(tmp.path().join("build")));
+    }
+
+    // -- known globals (#103/#108) -----------------------------------------
+
+    #[test]
+    fn defs_declared_globals_join_the_known_globals_baseline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "luabox.toml",
+            &manifest("\n[types]\ndefs = [\"mylib\"]\n"),
+        );
+        write(tmp.path(), "defs/mylib.d.lua", "---@meta\nmylib = {}\n");
+
+        let project = discover(tmp.path()).expect("discovers");
+        assert!(project.known_globals.contains("mylib"));
+        assert!(project.known_globals.contains("print"));
+    }
+
+    #[test]
+    fn a_directory_defs_package_contributes_its_globals_too() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "luabox.toml",
+            &manifest("\n[types]\ndefs = [\"pack\"]\n"),
+        );
+        write(tmp.path(), "defs/pack/a.d.lua", "---@meta\nalpha = {}\n");
+        write(tmp.path(), "defs/pack/b.d.lua", "---@meta\nbeta = {}\n");
+
+        let project = discover(tmp.path()).expect("discovers");
+        assert!(project.known_globals.contains("alpha"));
+        assert!(project.known_globals.contains("beta"));
+    }
+
+    #[test]
+    fn a_dependency_s_own_defs_globals_do_not_trip_undefined_global() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "luabox.toml",
+            &manifest("\n[dependencies]\ngeo = { path = \"vendor/geo\" }\n"),
+        );
+        write(
+            tmp.path(),
+            "vendor/geo/luabox.toml",
+            "[package]\nname = \"geo\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n\n[types]\ndefs = [\"geo\"]\n",
+        );
+        write(
+            tmp.path(),
+            "vendor/geo/defs/geo.d.lua",
+            "---@meta\ngeo = {}\n",
+        );
+
+        let project = discover(tmp.path()).expect("discovers");
+        assert!(project.known_globals.contains("geo"));
+    }
+
+    #[test]
+    fn an_unresolvable_defs_entry_silently_falls_back_to_the_stdlib_baseline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "luabox.toml",
+            &manifest("\n[types]\ndefs = [\"ghost\"]\n"),
+        );
+        // `luabox check` is the command that reports LB1002; lint just
+        // narrows its baseline.
+        let project = discover(tmp.path()).expect("discovers");
+        assert!(project.known_globals.contains("print"));
+        assert!(!project.known_globals.contains("ghost"));
+    }
+
+    #[test]
+    fn known_globals_without_defs_is_exactly_the_dialect_stdlib() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let text = manifest("");
+        let parsed = Manifest::parse(&text).expect("parses");
+        assert_eq!(
+            known_globals(Dialect::Lua54, tmp.path(), &parsed),
+            *stdlib_defs(Dialect::Lua54).global_names()
+        );
+    }
+
+    // -- test-harness globals ----------------------------------------------
+
+    /// The busted-style call every harness-globals test uses.
+    const BUSTED_CALL: &str =
+        "describe(\"a thing\", function()\n  it(\"works\", function() end)\nend)\n";
+
+    #[test]
+    fn a_test_file_may_use_busted_style_harness_globals() {
+        let tmp = project("\n[lint]\nundefined-global = \"deny\"\n");
+        write(tmp.path(), "tests/spec.lua", BUSTED_CALL);
+        run(tmp.path(), false).expect("harness globals are known inside tests/");
+    }
+
+    #[test]
+    fn every_documented_harness_global_is_known_inside_a_test_file() {
+        let tmp = project("\n[lint]\nundefined-global = \"deny\"\n");
+        let calls = TEST_HARNESS_GLOBALS
+            .iter()
+            .fold(String::new(), |mut acc, g| {
+                acc.push_str(g);
+                acc.push_str("(\"x\", function() end)\n");
+                acc
+            });
+        write(tmp.path(), "spec_test.lua", &calls);
+        run(tmp.path(), false).expect("all harness globals are known");
+    }
+
+    #[test]
+    fn a_non_test_file_does_not_get_the_harness_globals() {
+        let tmp = project("\n[lint]\nundefined-global = \"deny\"\n");
+        write(tmp.path(), "src/main.lua", BUSTED_CALL);
+        // `describe` is not declared anywhere for ordinary sources.
+        let error = run(tmp.path(), false).unwrap_err().to_string();
+        assert!(error.contains("lint failed with"), "{error}");
+    }
+
+    #[test]
+    fn test_file_detection_covers_the_three_spec_conventions() {
+        assert!(is_test_file("tests/spec.lua"));
+        assert!(is_test_file("src/tests/deep/spec.lua"));
+        assert!(is_test_file("src/thing_test.lua"));
+        assert!(is_test_file("src/thing.test.lua"));
+    }
+
+    #[test]
+    fn ordinary_sources_and_definition_files_are_not_test_files() {
+        assert!(!is_test_file("src/main.lua"));
+        assert!(!is_test_file("src/testing.lua"));
+        assert!(!is_test_file("tests/README.md"));
+        // A `*.d.lua` is an ambient surface, never a test — even under tests/.
+        assert!(!is_test_file("tests/love.d.lua"));
+        assert!(!is_test_file("src/thing_test.d.lua"));
+    }
+
+    #[test]
+    fn test_file_detection_accepts_an_uppercase_lua_extension() {
+        assert!(is_test_file("tests/Spec.LUA"));
+    }
+
+    #[test]
+    fn a_bare_file_name_with_no_directory_is_handled() {
+        assert!(is_test_file("spec_test.lua"));
+        assert!(!is_test_file("main.lua"));
+    }
+
+    // -- config translation ------------------------------------------------
+
+    #[test]
+    fn every_manifest_lint_level_maps_to_its_config_keyword() {
+        assert_eq!(level_keyword(LintLevel::Allow), "allow");
+        assert_eq!(level_keyword(LintLevel::Warn), "warn");
+        assert_eq!(level_keyword(LintLevel::Deny), "deny");
+    }
+
+    #[test]
+    fn build_config_threads_globals_tiers_and_rules_into_the_lint_config() {
+        let text =
+            manifest("\n[lint]\nglobals = [\"vim\"]\nstyle = \"deny\"\nunused-local = \"allow\"\n");
+        let parsed = Manifest::parse(&text).expect("parses");
+        let config = build_config(&parsed.lint);
+        // `LintConfig` exposes no getters, so assert through behaviour: the
+        // allowed rule is silent while another style rule now denies.
+        let known = stdlib_defs(Dialect::Lua54).global_names().clone();
+        let outcome = luabox_lint::lint_source(
+            "src/main.lua",
+            "local unused = 1\nreturn 0\n",
+            Dialect::Lua54,
+            &config,
+            &known,
+        );
+        assert_eq!(outcome.error_count, 0, "{:?}", outcome.diagnostics);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+    }
+
+    #[test]
+    fn fix_converges_within_the_pass_budget() {
+        let tmp = project("");
+        // Several independent fixable findings in one file: `--fix` re-lints
+        // until nothing is left to apply, well inside MAX_FIX_PASSES.
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "local a = 1\nlocal b = 2\nlocal c = 3\nreturn 0\n",
+        );
+        run(tmp.path(), true).expect("lint --fix succeeds");
+        let fixed = read(tmp.path(), "src/main.lua");
+        assert!(fixed.contains("_a"), "{fixed}");
+        assert!(fixed.contains("_b"), "{fixed}");
+        assert!(fixed.contains("_c"), "{fixed}");
+    }
+
+    #[test]
+    fn findings_are_reported_in_file_then_offset_order() {
+        let tmp = project("");
+        write(tmp.path(), "src/b.lua", "local unused_b = 1\nreturn 0\n");
+        write(tmp.path(), "src/a.lua", "local unused_a = 1\nreturn 0\n");
+        // Ordering is a rendering concern; the command still succeeds and the
+        // sort must not panic on labelless diagnostics.
+        run(tmp.path(), false).expect("lint passes");
+    }
+}

@@ -448,6 +448,29 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_exponents_split_off_the_marker() {
+        // `e`/`p` only join the number when digits (with an optional sign)
+        // actually follow; otherwise they lex as a separate identifier.
+        assert_eq!(kinds("1e", Dialect::Lua51), vec![NUMBER, IDENT]);
+        assert_eq!(kinds("1e+", Dialect::Lua51), vec![NUMBER, IDENT, PLUS]);
+        assert_eq!(
+            kinds("1e-x", Dialect::Lua51),
+            vec![NUMBER, IDENT, MINUS, IDENT]
+        );
+        assert_eq!(kinds("1e5", Dialect::Lua51), vec![NUMBER]);
+    }
+
+    #[test]
+    fn luajit_imaginary_suffix_needs_a_word_boundary() {
+        // `i` is a suffix only when nothing identifier-ish follows it.
+        assert_eq!(kinds("42i", Dialect::LuaJit), vec![NUMBER]);
+        assert_eq!(kinds("42i+1", Dialect::LuaJit), vec![NUMBER, PLUS, NUMBER]);
+        assert_eq!(kinds("42ix", Dialect::LuaJit), vec![NUMBER, IDENT]);
+        assert_eq!(kinds("42i9", Dialect::LuaJit), vec![NUMBER, IDENT]);
+        assert_eq!(kinds("42i_", Dialect::LuaJit), vec![NUMBER, IDENT]);
+    }
+
+    #[test]
     fn strings() {
         assert_eq!(kinds(r#""hello""#, Dialect::Lua51), vec![STRING]);
         assert_eq!(kinds(r#""a\"b""#, Dialect::Lua51), vec![STRING]);

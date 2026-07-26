@@ -293,6 +293,31 @@ mod tests {
         assert!(errors.is_empty());
     }
 
+    #[test]
+    fn goto_statement_parsed_elsewhere_is_flagged_against_51() {
+        // Dialect is a *parse-time* parameter only; validating a 5.2+ tree
+        // against 5.1 is what surfaces a real GOTO_STMT to LB0010.
+        let parse = parse("goto top", Dialect::Lua52);
+        let errors = validate(&parse, Dialect::Lua51);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].code, "LB0010");
+        assert!(
+            errors[0].message.contains("a `goto` statement"),
+            "{}",
+            errors[0].message
+        );
+        assert!(errors[0].message.contains("Lua 5.1"));
+        assert_eq!(errors[0].range, rowan::TextRange::new(0.into(), 8.into()));
+    }
+
+    #[test]
+    fn edition_names_match_the_spec_naming() {
+        assert_eq!(
+            Dialect::ALL.map(edition_name),
+            ["Lua 5.1", "Lua 5.2", "Lua 5.3", "Lua 5.4", "LuaJIT"]
+        );
+    }
+
     // === LB0011: integer division `//` ===
 
     #[test]
@@ -453,6 +478,24 @@ mod tests {
             codes_for(r#"x = "a\\z""#, Dialect::Lua51),
             Vec::<&str>::new()
         );
+    }
+
+    #[test]
+    fn long_bracket_strings_have_no_escapes_to_scan() {
+        // `[[...]]` content is literal, so backslash sequences that would be
+        // dialect errors inside a short string must not fire.
+        for dialect in Dialect::ALL {
+            assert_eq!(
+                codes_for("x = [[a\\z b\\x41 c\\u{48}]]", dialect),
+                Vec::<&str>::new(),
+                "{dialect:?}"
+            );
+            assert_eq!(
+                codes_for("x = [==[a\\x41]==]", dialect),
+                Vec::<&str>::new(),
+                "{dialect:?}"
+            );
+        }
     }
 
     #[test]

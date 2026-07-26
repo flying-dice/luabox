@@ -239,9 +239,13 @@ pub(crate) fn partition_batches(
 
 #[cfg(test)]
 mod tests {
-    use super::{DEBOUNCE_WINDOW, filter_and_dedupe, is_relevant, partition_batches};
+    use super::{
+        DEBOUNCE_WINDOW, drain_self_inflicted, filter_and_dedupe, is_relevant, partition_batches,
+        report,
+    };
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
@@ -366,5 +370,61 @@ mod tests {
         let raw = vec![p("/proj/a.lua"), p("/proj/README.md"), p("/proj/.git/HEAD")];
         let out = filter_and_dedupe(raw, root, None);
         assert_eq!(out, vec![p("/proj/a.lua")]);
+    }
+
+    #[test]
+    fn dedupe_of_an_all_irrelevant_batch_is_empty_so_no_rerun_is_triggered() {
+        let root = Path::new("/proj");
+        let raw = vec![p("/proj/README.md"), p("/proj/src/foo.lua~")];
+        assert!(filter_and_dedupe(raw, root, None).is_empty());
+    }
+
+    #[test]
+    fn a_path_outside_the_watch_root_is_still_judged_on_its_own_name() {
+        // `strip_prefix` fails for a path outside the root, so the
+        // dot-component rule is skipped and the extension rule decides.
+        let root = Path::new("/proj");
+        assert!(is_relevant(Path::new("/elsewhere/a.lua"), root, None));
+        assert!(!is_relevant(Path::new("/elsewhere/a.md"), root, None));
+    }
+
+    #[test]
+    fn a_path_with_no_file_name_is_never_relevant() {
+        assert!(!is_relevant(Path::new("/"), Path::new("/proj"), None));
+    }
+
+    #[test]
+    fn draining_returns_immediately_once_the_watcher_channel_is_closed() {
+        let (tx, rx) = mpsc::channel::<notify::Event>();
+        drop(tx);
+        // A disconnected channel must not make the drain wait out a full
+        // debounce window before the first run is reported.
+        let started = Instant::now();
+        drain_self_inflicted(&rx);
+        assert!(started.elapsed() < DEBOUNCE_WINDOW);
+    }
+
+    #[test]
+    fn draining_consumes_events_already_queued_by_the_run_itself() {
+        let (tx, rx) = mpsc::channel::<notify::Event>();
+        // Two self-inflicted events (e.g. `fmt --watch` rewriting files)
+        // are already queued when the run finishes.
+        tx.send(notify::Event::default()).expect("send");
+        tx.send(notify::Event::default()).expect("send");
+        drop(tx);
+
+        drain_self_inflicted(&rx);
+        assert!(
+            rx.try_recv().is_err(),
+            "the queue must be empty so no spurious rerun follows"
+        );
+    }
+
+    #[test]
+    fn reporting_a_run_never_propagates_its_failure() {
+        // A broken rerun must not kill the watcher: `report` swallows the
+        // error after printing it.
+        report(Ok(()));
+        report(Err(anyhow::anyhow!("check failed with 3 error(s)")));
     }
 }

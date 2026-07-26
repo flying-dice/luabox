@@ -1345,10 +1345,23 @@ fn workspace_symbol_key(info: &SymbolInformation) -> (String, String, u32, u32, 
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "test code — panics document assumptions"
+)]
 mod tests {
-    use lsp_types::{Position, Range, TextDocumentContentChangeEvent};
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
-    use super::apply_content_changes;
+    use lsp_types::{Position, Range, TextDocumentContentChangeEvent};
+    use luabox_lint::LintConfig;
+    use luabox_resolve::manifest::{Lint, LintLevel, Manifest};
+    use tempfile::TempDir;
+
+    use super::{
+        ProjectConfig, ambient_def_sources, apply_content_changes, build_lint_config,
+        collect_d_lua, lint_level_keyword, load_defs_from, root_path,
+    };
 
     /// A ranged change replacing `[start, end)` with `text`.
     fn edit(start: (u32, u32), end: (u32, u32), text: &str) -> TextDocumentContentChangeEvent {
@@ -1438,5 +1451,268 @@ mod tests {
         // the right byte offset, not treat the column as a byte index.
         let out = apply_content_changes("😀ab".to_string(), vec![edit((0, 2), (0, 2), "-")]);
         assert_eq!(out, "😀-ab");
+    }
+
+    // === Workspace root ===================================================
+
+    /// Absolute test paths differ per platform; build one under a fake root.
+    fn abs(rel: &str) -> PathBuf {
+        Path::new(if cfg!(windows) { r"C:\ws" } else { "/ws" }).join(rel)
+    }
+
+    #[allow(deprecated, reason = "InitializeParams carries deprecated fields")]
+    fn init_params() -> lsp_types::InitializeParams {
+        lsp_types::InitializeParams::default()
+    }
+
+    #[test]
+    fn workspace_folders_win_over_the_deprecated_root_uri() {
+        let mut params = init_params();
+        params.workspace_folders = Some(vec![lsp_types::WorkspaceFolder {
+            uri: crate::path_to_uri(&abs("folder")),
+            name: "folder".to_string(),
+        }]);
+        #[allow(deprecated, reason = "rootUri is the older-client fallback")]
+        {
+            params.root_uri = Some(crate::path_to_uri(&abs("legacy")));
+        }
+        assert_eq!(root_path(&params), Some(abs("folder")));
+    }
+
+    #[test]
+    fn root_uri_is_the_fallback_when_there_are_no_workspace_folders() {
+        let mut params = init_params();
+        #[allow(deprecated, reason = "rootUri is the older-client fallback")]
+        {
+            params.root_uri = Some(crate::path_to_uri(&abs("legacy")));
+        }
+        assert_eq!(root_path(&params), Some(abs("legacy")));
+    }
+
+    #[test]
+    fn a_non_file_workspace_folder_falls_through_to_the_root_uri() {
+        use std::str::FromStr as _;
+
+        let mut params = init_params();
+        params.workspace_folders = Some(vec![lsp_types::WorkspaceFolder {
+            uri: lsp_types::Uri::from_str("untitled:scratch").expect("uri"),
+            name: "scratch".to_string(),
+        }]);
+        #[allow(deprecated, reason = "rootUri is the older-client fallback")]
+        {
+            params.root_uri = Some(crate::path_to_uri(&abs("legacy")));
+        }
+        assert_eq!(root_path(&params), Some(abs("legacy")));
+    }
+
+    #[test]
+    fn no_folders_and_no_root_uri_means_no_root() {
+        assert_eq!(root_path(&init_params()), None);
+    }
+
+    // === Project configuration ============================================
+
+    #[test]
+    fn a_missing_manifest_yields_the_defaults() {
+        let dir = TempDir::new().expect("tempdir");
+        let config = ProjectConfig::discover(dir.path());
+        assert_eq!(config.dialect, luabox_db::Dialect::Lua54);
+        assert_eq!(config.strictness, luabox_db::Strictness::Warn);
+        assert_eq!(config.out_dir, None);
+        assert!(config.def_sources.is_empty());
+    }
+
+    #[test]
+    fn an_unparseable_manifest_falls_back_to_the_defaults() {
+        let dir = TempDir::new().expect("tempdir");
+        fs::write(dir.path().join("luabox.toml"), "this is not = = toml").expect("write");
+        let config = ProjectConfig::discover(dir.path());
+        assert_eq!(config.dialect, luabox_db::Dialect::Lua54);
+        assert_eq!(config.strictness, luabox_db::Strictness::Warn);
+        assert_eq!(config.out_dir, None);
+    }
+
+    #[test]
+    fn a_manifest_supplies_the_dialect_strictness_and_out_dir() {
+        let dir = TempDir::new().expect("tempdir");
+        fs::write(
+            dir.path().join("luabox.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"5.1\"\n\n[build]\nout = \"build\"\n\n[types]\nstrict = true\n",
+        )
+        .expect("write");
+        let config = ProjectConfig::discover(dir.path());
+        assert_eq!(config.dialect, luabox_db::Dialect::Lua51);
+        assert_eq!(config.strictness, luabox_db::Strictness::Strict);
+        assert_eq!(config.out_dir, Some(dir.path().join("build")));
+    }
+
+    #[test]
+    fn an_unknown_edition_falls_back_to_lua_54() {
+        let dir = TempDir::new().expect("tempdir");
+        fs::write(
+            dir.path().join("luabox.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n",
+        )
+        .expect("write");
+        assert_eq!(
+            ProjectConfig::discover(dir.path()).dialect,
+            luabox_db::Dialect::Lua54
+        );
+    }
+
+    // === Lint configuration ===============================================
+
+    #[test]
+    fn manifest_lint_levels_map_to_config_keywords() {
+        assert_eq!(lint_level_keyword(LintLevel::Allow), "allow");
+        assert_eq!(lint_level_keyword(LintLevel::Warn), "warn");
+        assert_eq!(lint_level_keyword(LintLevel::Deny), "deny");
+    }
+
+    #[test]
+    fn manifest_globals_tiers_and_rules_reach_the_lint_config() {
+        let manifest = Manifest::parse(
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n\n[lint]\nglobals = [\"MY_GLOBAL\"]\nstyle = \"deny\"\nunused-local = \"allow\"\n",
+        )
+        .expect("manifest");
+        let config = build_lint_config(&manifest.lint);
+        assert!(config.is_allowed_global("MY_GLOBAL"));
+        assert!(!config.is_allowed_global("other"));
+        // A tier key lands in `tiers`, anything else in `rules`.
+        assert_eq!(manifest.lint.tiers.get("style"), Some(&LintLevel::Deny));
+        assert_eq!(
+            manifest.lint.rules.get("unused-local"),
+            Some(&LintLevel::Allow)
+        );
+        // Both override names are ones `LintConfig` accepts.
+        let mut probe = LintConfig::new();
+        assert!(probe.set_tier("style", "deny"));
+        assert!(probe.set_rule("unused-local", "allow"));
+    }
+
+    #[test]
+    fn an_empty_lint_table_leaves_the_config_untouched() {
+        let config = build_lint_config(&Lint::default());
+        assert!(!config.is_allowed_global("anything"));
+    }
+
+    // === Ambient definition sources =======================================
+
+    /// Write `text` to `root/rel`, creating parents.
+    fn write(root: &Path, rel: &str, text: &str) {
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("mkdir");
+        }
+        fs::write(path, text).expect("write");
+    }
+
+    fn manifest_of(text: &str) -> Manifest {
+        Manifest::parse(text).expect("manifest")
+    }
+
+    const MANIFEST_HEAD: &str =
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n";
+
+    #[test]
+    fn project_defs_come_before_dependency_defs() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path();
+        write(root, "defs/own.d.lua", "---@meta\n-- own\n");
+        write(
+            root,
+            "vendor/dep/luabox.toml",
+            &format!("{MANIFEST_HEAD}\n[types]\ndefs = [\"dep\"]\n"),
+        );
+        write(root, "vendor/dep/defs/dep.d.lua", "---@meta\n-- dep\n");
+
+        let manifest = manifest_of(&format!(
+            "{MANIFEST_HEAD}\n[types]\ndefs = [\"own\"]\n\n[dependencies]\ndep = {{ path = \"vendor/dep\" }}\n"
+        ));
+        let sources = ambient_def_sources(root, &manifest);
+        assert_eq!(sources.len(), 2, "{sources:?}");
+        assert!(sources[0].contains("-- own"), "{sources:?}");
+        assert!(sources[1].contains("-- dep"), "{sources:?}");
+    }
+
+    #[test]
+    fn a_dependency_without_a_manifest_contributes_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path();
+        // `lua_modules/<name>` is the default location for non-path deps.
+        write(root, "lua_modules/dep/defs/dep.d.lua", "---@meta\n-- dep\n");
+        let manifest = manifest_of(&format!(
+            "{MANIFEST_HEAD}\n[dependencies]\ndep = \"1.0.0\"\n"
+        ));
+        assert!(ambient_def_sources(root, &manifest).is_empty());
+    }
+
+    #[test]
+    fn a_dependency_with_an_unparseable_manifest_is_skipped() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path();
+        write(root, "lua_modules/dep/luabox.toml", "= not toml =");
+        write(root, "lua_modules/dep/defs/dep.d.lua", "---@meta\n-- dep\n");
+        let manifest = manifest_of(&format!(
+            "{MANIFEST_HEAD}\n[dependencies]\ndep = \"1.0.0\"\n"
+        ));
+        assert!(ambient_def_sources(root, &manifest).is_empty());
+    }
+
+    #[test]
+    fn dependency_defs_are_ordered_alphabetically_by_dependency_name() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path();
+        for name in ["zulu", "alpha"] {
+            write(
+                root,
+                &format!("lua_modules/{name}/luabox.toml"),
+                &format!("{MANIFEST_HEAD}\n[types]\ndefs = [\"{name}\"]\n"),
+            );
+            write(
+                root,
+                &format!("lua_modules/{name}/defs/{name}.d.lua"),
+                &format!("---@meta\n-- {name}\n"),
+            );
+        }
+        // `zulu` is a dev-dependency: both tables feed the same sorted list.
+        let manifest = manifest_of(&format!(
+            "{MANIFEST_HEAD}\n[dependencies]\nzulu = \"1.0.0\"\n\n[dev-dependencies]\nalpha = \"1.0.0\"\n"
+        ));
+        let sources = ambient_def_sources(root, &manifest);
+        assert_eq!(sources.len(), 2, "{sources:?}");
+        assert!(sources[0].contains("-- alpha"), "{sources:?}");
+        assert!(sources[1].contains("-- zulu"), "{sources:?}");
+    }
+
+    #[test]
+    fn a_defs_directory_contributes_every_nested_d_lua_file_sorted() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path();
+        write(root, "defs/pkg/a.d.lua", "---@meta\n-- a\n");
+        write(root, "defs/pkg/nested/b.d.lua", "---@meta\n-- b\n");
+        // A plain `.lua` file is not a definition file.
+        write(root, "defs/pkg/ignored.lua", "-- ignored\n");
+        let mut out = Vec::new();
+        load_defs_from(&root.join("defs"), &["pkg".to_string()], &mut out);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out[0].contains("-- a"), "{out:?}");
+        assert!(out[1].contains("-- b"), "{out:?}");
+    }
+
+    #[test]
+    fn a_defs_name_matching_neither_a_file_nor_a_directory_contributes_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut out = Vec::new();
+        load_defs_from(&dir.path().join("defs"), &["absent".to_string()], &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn collect_d_lua_on_a_missing_directory_yields_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut out = Vec::new();
+        collect_d_lua(&dir.path().join("not-here"), &mut out);
+        assert!(out.is_empty());
     }
 }

@@ -12,7 +12,7 @@
 
 use luabox_diag::Diagnostic;
 use luabox_syntax::lua::{Dialect, parse};
-use luabox_types::{Strictness, check_file};
+use luabox_types::{Strictness, build_ambient, check_file, check_file_with_ambient};
 
 fn check(source: &str) -> Vec<Diagnostic> {
     let parsed = parse(source, Dialect::Lua54);
@@ -247,4 +247,92 @@ local c = new(\"Circle\")
 wants(c.radius)
 ";
     assert_eq!(codes(bad), vec!["LB0300"]);
+}
+
+// --- 5. generic classes through a `[types] defs` package ----------------
+
+/// Strict-mode codes for a file checked against an ambient built from `defs`.
+fn ambient_codes(source: &str, defs: &[&str]) -> Vec<String> {
+    let parsed = parse(source, Dialect::Lua54);
+    assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
+    let owned: Vec<String> = defs.iter().map(|s| (*s).to_string()).collect();
+    let ambient = build_ambient(Dialect::Lua54, &owned);
+    check_file_with_ambient(
+        &parsed,
+        "test.lua",
+        Strictness::Strict,
+        Dialect::Lua54,
+        Some(&ambient),
+    )
+    .iter()
+    .map(|d| d.code.to_string())
+    .collect()
+}
+
+const BOX_DEF: &str = "\
+---@meta
+---@class Box<T>
+---@field value T
+";
+
+#[test]
+fn generic_class_declared_in_a_defs_package_instantiates_in_a_consumer() {
+    // The generic template is registered from the *ambient* layer, not from
+    // the consuming file's own annotations.
+    let good = "\
+---@type Box<number>
+local b = { value = 1 }
+";
+    assert_eq!(ambient_codes(good, &[BOX_DEF]), Vec::<String>::new());
+
+    let bad = "\
+---@type Box<number>
+local b = { value = \"x\" }
+";
+    assert_eq!(ambient_codes(bad, &[BOX_DEF]), vec!["LB0300"]);
+}
+
+const MAP_DEF: &str = "\
+---@meta
+---@class Map<K, V>
+---@field [K] V
+";
+
+#[test]
+fn generic_class_indexer_fields_substitute_both_parameters() {
+    // `---@field [K] V` becomes an indexer on the template; both type
+    // parameters must be substituted at the reference site.
+    let good = "\
+---@type Map<string, number>
+local m = { alpha = 1 }
+";
+    assert_eq!(ambient_codes(good, &[MAP_DEF]), Vec::<String>::new());
+
+    // The *value* parameter is enforced...
+    let bad_value = "\
+---@type Map<string, number>
+local m = { alpha = \"one\" }
+";
+    assert_eq!(ambient_codes(bad_value, &[MAP_DEF]), vec!["LB0300"]);
+
+    // ...and so is the *key* parameter: a string key does not match `[integer]`.
+    let bad_key = "\
+---@type Map<integer, number>
+local m = { alpha = 1 }
+";
+    assert_eq!(ambient_codes(bad_key, &[MAP_DEF]), vec!["LB0303"]);
+}
+
+#[test]
+fn locally_declared_generic_class_indexer_fields_substitute() {
+    let src = "\
+---@class Lookup<K, V>
+---@field [K] V
+
+---@type Lookup<string, boolean>
+local ok = { flag = true }
+---@type Lookup<string, boolean>
+local bad = { flag = 1 }
+";
+    assert_eq!(codes(src), vec!["LB0300"]);
 }

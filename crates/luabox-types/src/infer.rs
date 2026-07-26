@@ -4737,4 +4737,1125 @@ local b = 1 & 2
         assert_eq!(binding_ty(&out, "s").to_string(), "string");
         assert_eq!(binding_ty(&out, "b").to_string(), "integer");
     }
+
+    #[test]
+    fn every_binary_operator_dispatches_to_its_declared_overload() {
+        // One `---@operator` per non-comparison binary operator, all on a
+        // class operand so the primitive fast paths cannot apply. Each result
+        // is a *distinct* type, so a mis-mapped operator name would show up as
+        // the wrong result rather than merely `unknown`.
+        let src = "\
+---@class Ops
+---@operator add(Ops): integer
+---@operator sub(Ops): number
+---@operator mul(Ops): string
+---@operator div(Ops): boolean
+---@operator mod(Ops): Ops
+---@operator pow(Ops): integer
+---@operator idiv(Ops): number
+---@operator concat(Ops): string
+---@operator band(Ops): boolean
+---@operator bor(Ops): Ops
+---@operator bxor(Ops): integer
+---@operator shl(Ops): number
+---@operator shr(Ops): string
+
+---@type Ops
+local a
+---@type Ops
+local b
+local r_add = a + b
+local r_sub = a - b
+local r_mul = a * b
+local r_div = a / b
+local r_mod = a % b
+local r_pow = a ^ b
+local r_idiv = a // b
+local r_concat = a .. b
+local r_band = a & b
+local r_bor = a | b
+local r_bxor = a ~ b
+local r_shl = a << b
+local r_shr = a >> b
+";
+        let out = outcome(src);
+        for (binding, expected) in [
+            ("r_add", "integer"),
+            ("r_sub", "number"),
+            ("r_mul", "string"),
+            ("r_div", "boolean"),
+            ("r_mod", "Ops"),
+            ("r_pow", "integer"),
+            ("r_idiv", "number"),
+            ("r_concat", "string"),
+            ("r_band", "boolean"),
+            ("r_bor", "Ops"),
+            ("r_bxor", "integer"),
+            ("r_shl", "number"),
+            ("r_shr", "string"),
+        ] {
+            assert_eq!(binding_ty(&out, binding).to_string(), expected, "{binding}");
+        }
+    }
+
+    #[test]
+    fn comparison_operators_never_consult_overloads() {
+        // `==`/`<`/… are always `boolean`; no `---@operator` lookup happens
+        // (there is no LuaCATS operator name for them).
+        let src = "\
+---@class Cmp
+---@operator add(Cmp): Cmp
+---@type Cmp
+local a
+---@type Cmp
+local b
+local eq = a == b
+local lt = a < b
+local ne = a ~= b
+";
+        let out = outcome(src);
+        for binding in ["eq", "lt", "ne"] {
+            assert_eq!(
+                binding_ty(&out, binding).to_string(),
+                "boolean",
+                "{binding}"
+            );
+        }
+    }
+
+    // --- loops: `while` / `repeat` / `do` ---------------------------------
+
+    #[test]
+    fn while_loop_joins_the_body_state_with_the_entry_state() {
+        // The loop body may run zero times, so a binding reassigned inside it
+        // carries the union of "unentered" and "entered" at the exit.
+        let src = "\
+local acc = 1
+while SOME_GLOBAL do
+  acc = \"text\"
+end
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "acc").to_string(), "\"text\"|1");
+    }
+
+    #[test]
+    fn while_condition_narrows_inside_the_body() {
+        let src = "\
+---@type string|nil
+local s
+while s do
+  local inside = s
+end
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "inside").to_string(), "string");
+    }
+
+    #[test]
+    fn repeat_body_is_walked_before_its_until_condition() {
+        // `repeat` bodies run at least once and the `until` expression is
+        // evaluated in the body's scope — both halves must be typed.
+        let src = "\
+local n = 0
+repeat
+  local point = { x = 1, y = 2 }
+  n = n + 1
+until n > 3
+";
+        let out = outcome(src);
+        let Ty::Table(table) = binding_ty(&out, "point") else {
+            panic!("expected a structural table for `point`");
+        };
+        assert_eq!(table.fields["x"].ty.to_string(), "1");
+        assert_eq!(binding_ty(&out, "n").to_string(), "integer");
+    }
+
+    #[test]
+    fn do_block_statements_are_walked() {
+        let src = "\
+do
+  local scoped = { name = \"x\" }
+  local len = #scoped.name
+end
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "len").to_string(), "integer");
+    }
+
+    #[test]
+    fn returns_inside_loops_and_branches_reach_the_inferred_return() {
+        // `collect_returns` must descend into every nested statement shape, or
+        // a function whose only `return`s live inside control flow would look
+        // like it returns nothing.
+        let src = "\
+local function pick(flag)
+  if flag then
+    return \"a\"
+  end
+  while flag do
+    return 1
+  end
+  repeat
+    return true
+  until true
+  for _ = 1, 2 do
+    return nil
+  end
+  do
+    return \"z\"
+  end
+end
+local got = pick(true)
+";
+        let out = outcome(src);
+        // One member per `return`, in source order — every nested statement
+        // shape contributed.
+        assert_eq!(
+            binding_ty(&out, "got").to_string(),
+            "\"a\"|1|true|nil|\"z\""
+        );
+    }
+
+    // --- `---@cast` target resolution -------------------------------------
+
+    /// A `---@cast` above a statement resolves the variable through a use
+    /// *inside that statement*, whatever statement shape it is.
+    #[test]
+    fn cast_resolves_the_variable_through_every_statement_shape() {
+        let src = "\
+---@type string|integer
+local w
+---@cast w string
+while #w > 0 do
+  break
+end
+
+---@type string|integer
+local r
+---@cast r string
+repeat
+  local _ = r
+until #r == 0
+
+---@type string|integer
+local nf
+---@cast nf integer
+for _ = nf, 10, 1 do
+end
+
+---@type string|integer
+local gf
+---@cast gf string
+for _, _ in ipairs({ gf }) do
+end
+
+---@type string|integer
+local blk
+---@cast blk string
+do
+  local _ = blk
+end
+
+---@type string|integer
+local br
+---@cast br string
+if #br > 0 then
+  local _ = br
+else
+  local _ = br
+end
+
+---@type string|integer
+local sink
+---@type string|integer
+local asg
+---@cast asg string
+sink = asg
+
+---@type string|integer
+local lf
+---@cast lf string
+local function reads_it()
+  return lf
+end
+";
+        let out = outcome(src);
+        for name in ["w", "r", "gf", "blk", "br", "asg", "lf"] {
+            assert_eq!(binding_ty(&out, name).to_string(), "string", "{name}");
+        }
+        assert_eq!(binding_ty(&out, "nf").to_string(), "integer");
+    }
+
+    /// …and through every *expression* shape the use may be buried in.
+    #[test]
+    fn cast_resolves_the_variable_through_every_expression_shape() {
+        let src = "\
+local host = { m = function(self, x) return x end }
+
+---@type string|integer
+local ix
+---@cast ix string
+local _ix = host[ix]
+
+---@type string|integer
+local mc
+---@cast mc string
+local _mc = host:m(mc)
+
+---@type string|integer
+local tb
+---@cast tb string
+local _tb = { tb, keyed = tb, [tb] = 1 }
+
+---@type string|integer
+local bin
+---@cast bin string
+local _bin = bin .. \"!\"
+
+---@type string|integer
+local un
+---@cast un string
+local _un = #un
+
+---@type string|integer
+local par
+---@cast par string
+local _par = (par)
+";
+        let out = outcome(src);
+        for name in ["ix", "mc", "tb", "bin", "un", "par"] {
+            assert_eq!(binding_ty(&out, name).to_string(), "string", "{name}");
+        }
+    }
+
+    #[test]
+    fn cast_falls_back_to_the_most_recent_binding_of_that_name() {
+        // The annotated statement does not mention `v` at all, so the precise
+        // in-statement lookup fails and the approximate fallback picks the
+        // latest binding declared with that name.
+        let src = "\
+---@type string|integer
+local v
+---@type string|integer
+local v
+---@cast v string
+local unrelated = 1
+";
+        let out = outcome(src);
+        let vs: Vec<String> = out
+            .binding_types
+            .iter()
+            .filter(|b| b.name == "v")
+            .map(|b| b.ty.to_string())
+            .collect();
+        // Two `v` bindings: the later one took the cast, the earlier is intact.
+        assert_eq!(vs, vec!["string|integer".to_string(), "string".to_string()]);
+        assert_eq!(binding_ty(&out, "unrelated").to_string(), "1");
+    }
+
+    #[test]
+    fn cast_on_a_global_updates_the_global_table() {
+        // No local of that name exists, so the cast lands on the global slot
+        // and the following read picks it up.
+        let src = "\
+---@cast G string
+local read = G
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "read").to_string(), "string");
+    }
+
+    // --- narrowing: falsy / union / `type()` families ---------------------
+
+    #[test]
+    fn truthiness_narrows_a_declared_union_member_wise() {
+        let src = "\
+---@type string|false|nil
+local u
+if u then
+  local truthy = u
+end
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "truthy").to_string(), "string");
+    }
+
+    #[test]
+    fn falsy_branch_keeps_only_the_falsy_union_members() {
+        let src = "\
+---@type string|nil
+local s
+if not s then
+  local only_nil = s
+end
+---@type boolean|nil
+local b
+if not b then
+  local nil_or_false = b
+end
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "only_nil").to_string(), "nil");
+        assert_eq!(binding_ty(&out, "nil_or_false").to_string(), "nil|false");
+    }
+
+    #[test]
+    fn falsy_branch_of_an_unknown_is_nil_or_false() {
+        let src = "\
+local function f(u)
+  if not u then
+    local falsy = u
+  end
+end
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "falsy").to_string(), "nil|false");
+    }
+
+    #[test]
+    fn negated_or_narrows_both_operands() {
+        // `if not (a or b)` — the *negative* branch of an `or` is the only
+        // place both operands are known falsy.
+        let src = "\
+---@type string|nil
+local a
+---@type string|nil
+local b
+if not (a or b) then
+  local na = a
+  local nb = b
+end
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "na").to_string(), "nil");
+        assert_eq!(binding_ty(&out, "nb").to_string(), "nil");
+    }
+
+    #[test]
+    fn type_call_narrows_every_recognized_type_name() {
+        // `type(x) == "<name>"` on an `unknown` produces that name's base
+        // type; `userdata`/`thread` have no IR base and stay `unknown`.
+        let src = "\
+local function f(v)
+  if type(v) == \"nil\" then
+    local as_nil = v
+  elseif type(v) == \"boolean\" then
+    local as_bool = v
+  elseif type(v) == \"table\" then
+    local as_table = v
+  elseif type(v) == \"function\" then
+    local as_fn = v
+  elseif type(v) == \"userdata\" then
+    local as_ud = v
+  elseif type(v) == \"thread\" then
+    local as_thread = v
+  end
+end
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "as_nil").to_string(), "nil");
+        assert_eq!(binding_ty(&out, "as_bool").to_string(), "boolean");
+        assert_eq!(binding_ty(&out, "as_table").to_string(), "table");
+        assert_eq!(binding_ty(&out, "as_fn").to_string(), "fun(...: any)");
+        assert_eq!(binding_ty(&out, "as_ud").to_string(), "unknown");
+        assert_eq!(binding_ty(&out, "as_thread").to_string(), "unknown");
+    }
+
+    #[test]
+    fn unrecognized_type_name_string_does_not_narrow() {
+        // `type(x) == "Circle"` is not a `type()` result: no predicate at all,
+        // so the value keeps its declared union.
+        let src = "\
+---@type string|integer
+local v
+if type(v) == \"Circle\" then
+  local inside = v
+end
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "inside").to_string(), "string|integer");
+    }
+
+    #[test]
+    fn type_call_narrows_inferred_shapes_and_function_literals() {
+        // The `table`/`function` predicates recognize inference-side shapes
+        // and function literals, not only reified `Ty`s.
+        let src = "\
+local shape = { x = 1 }
+local fn = function() end
+if type(shape) == \"table\" then
+  local kept_shape = shape
+end
+if type(shape) == \"string\" then
+  local dropped_shape = shape
+end
+if type(fn) == \"function\" then
+  local kept_fn = fn
+end
+";
+        let out = outcome(src);
+        let Ty::Table(kept) = binding_ty(&out, "kept_shape") else {
+            panic!("expected the shape to survive the `table` predicate");
+        };
+        assert!(kept.fields.contains_key("x"));
+        // No member survives `type(<table>) == "string"`: the branch is
+        // statically impossible and degrades to the predicate's base type.
+        assert_eq!(binding_ty(&out, "dropped_shape").to_string(), "string");
+        assert_eq!(binding_ty(&out, "kept_fn").to_string(), "fun()");
+    }
+
+    #[test]
+    fn type_call_narrows_annotated_table_and_function_values() {
+        let src = "\
+---@type table
+local t
+if type(t) == \"table\" then
+  local as_table = t
+end
+---@type fun(): integer
+local g
+if type(g) == \"function\" then
+  local as_fn = g
+end
+---@class Boxed
+---@field v integer
+---@type Boxed
+local named
+if type(named) == \"table\" then
+  local as_named = named
+end
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "as_table").to_string(), "table");
+        assert_eq!(binding_ty(&out, "as_fn").to_string(), "fun(): integer");
+        assert_eq!(binding_ty(&out, "as_named").to_string(), "Boxed");
+    }
+
+    // --- field lookup / indexing through unions and named classes ---------
+
+    #[test]
+    fn field_read_on_a_union_of_named_classes_unions_the_results() {
+        let src = "\
+---@class LA
+---@field n integer
+---@class LB
+---@field n string
+---@type LA|LB
+local ab
+local got = ab.n
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "got").to_string(), "integer|string");
+    }
+
+    #[test]
+    fn field_absent_from_one_union_member_is_opaque_not_a_diagnostic() {
+        let src = "\
+---@class HasBoth
+---@field n integer
+---@field extra string
+---@class HasOne
+---@field n integer
+---@type HasBoth|HasOne
+local ab
+local got = ab.extra
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "got").to_string(), "unknown");
+        assert_eq!(out.diags, Vec::new());
+    }
+
+    #[test]
+    fn field_read_on_a_union_of_inferred_shapes_unions_the_results() {
+        let src = "\
+local u
+if SOME_GLOBAL then
+  u = { n = 1 }
+else
+  u = { n = \"s\" }
+end
+local got = u.n
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "got").to_string(), "1|\"s\"");
+    }
+
+    #[test]
+    fn integer_indexing_reads_through_arrays_indexers_and_named_classes() {
+        let src = "\
+---@class Grid
+---@field [integer] string
+
+---@type number[]
+local arr
+---@type table<integer, boolean>
+local map
+---@type Grid
+local grid
+local k = 1 + 1
+local from_arr = arr[k]
+local from_map = map[k]
+local from_grid = grid[k]
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "from_arr").to_string(), "number");
+        assert_eq!(binding_ty(&out, "from_map").to_string(), "boolean");
+        assert_eq!(binding_ty(&out, "from_grid").to_string(), "string");
+    }
+
+    #[test]
+    fn integer_indexing_unions_across_a_union_receiver() {
+        let src = "\
+---@type number[]
+local nums
+---@type string[]
+local strs
+local xs
+if SOME_GLOBAL then
+  xs = nums
+else
+  xs = strs
+end
+local k = 1 + 1
+local elem = xs[k]
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "elem").to_string(), "number|string");
+    }
+
+    #[test]
+    fn integer_indexing_reads_an_inferred_integer_indexer() {
+        // A dynamically-keyed write generalizes the key to `integer`; the
+        // matching read comes back with the written value type, never `any`.
+        let src = "\
+local t = {}
+local k = 1 + 1
+t[k] = \"v\"
+local got = t[k]
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "got").to_string(), "\"v\"");
+    }
+
+    #[test]
+    fn dynamic_key_reads_union_the_values_of_a_named_class() {
+        // A non-numeric dynamic key falls back to the `pairs` value union.
+        let src = "\
+---@class Bag
+---@field a integer
+---@field b string
+
+---@type Bag
+local bag
+---@type string|boolean
+local key
+local got = bag[key]
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "got").to_string(), "integer|string");
+    }
+
+    #[test]
+    fn pairs_over_a_union_receiver_unions_keys_and_values() {
+        let src = "\
+---@type table<string, integer>
+local si
+---@type table<boolean, number>
+local bn
+local m
+if SOME_GLOBAL then
+  m = si
+else
+  m = bn
+end
+for k, v in pairs(m) do
+  local kk = k
+  local vv = v
+end
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "kk").to_string(), "string|boolean");
+        assert_eq!(binding_ty(&out, "vv").to_string(), "integer|number");
+    }
+
+    #[test]
+    fn pairs_over_a_named_class_resolves_through_the_name() {
+        let src = "\
+---@class Named
+---@field a integer
+---@field b integer
+
+---@type Named
+local n
+for k, v in pairs(n) do
+  local nk = k
+  local nv = v
+end
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "nk").to_string(), "string");
+        assert_eq!(binding_ty(&out, "nv").to_string(), "integer");
+    }
+
+    // --- assignment targets ------------------------------------------------
+
+    #[test]
+    fn global_assignment_unions_across_writes() {
+        let src = "\
+GLOBAL_SLOT = 1
+GLOBAL_SLOT = \"two\"
+local read = GLOBAL_SLOT
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "read").to_string(), "1|\"two\"");
+    }
+
+    #[test]
+    fn numeric_index_assignment_extends_the_array_part() {
+        let src = "\
+local t = {}
+t[1] = \"a\"
+t[2] = \"b\"
+local first = t[1]
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "first").to_string(), "\"a\"|\"b\"");
+    }
+
+    #[test]
+    fn upvalue_assignment_unions_with_the_outer_type() {
+        // An assignment through a closure cannot be treated as a
+        // flow-sensitive overwrite of the outer binding: the two possible
+        // values join.
+        let src = "\
+local slot = 1
+local function set()
+  slot = \"text\"
+end
+set()
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "slot").to_string(), "1|\"text\"");
+    }
+
+    #[test]
+    fn assert_narrows_its_first_argument_to_the_truthy_part() {
+        let src = "\
+---@type string|nil
+local s
+local sure = assert(s)
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "sure").to_string(), "string");
+    }
+
+    // --- `undefined-field` provability guards ------------------------------
+
+    #[test]
+    fn a_class_with_an_indexer_never_proves_a_field_absent() {
+        // Dynamic access is *declared*, so any string key is admissible: no
+        // LB0306, and the read stays `unknown` rather than being invented.
+        let src = "\
+---@class Dynamic
+---@field [string] integer
+local D = {}
+function D.probe()
+  return D.whatever
+end
+";
+        let out = outcome(src);
+        assert_eq!(out.diags, Vec::new());
+    }
+
+    #[test]
+    fn an_index_metamethod_function_suspends_provability() {
+        // `__index = function(...)` can synthesise any key, so an absent field
+        // is not provably undefined.
+        let src = "\
+local Proxy = {}
+local obj = setmetatable({}, { __index = function(_, k) return k end })
+local got = obj.anything
+";
+        let out = outcome(src);
+        assert_eq!(out.diags, Vec::new());
+        assert_eq!(binding_ty(&out, "got").to_string(), "unknown");
+    }
+
+    #[test]
+    fn an_untracked_metatable_suspends_provability() {
+        // `setmetatable(t, <unknown>)`: the metatable is not a tracked shape,
+        // so nothing about `t`'s key set is provable any more.
+        let src = "\
+---@class Guarded
+---@field known integer
+local G = {}
+function G.build()
+  local o = setmetatable({ known = 1 }, SOME_GLOBAL)
+  return o.unknown_member
+end
+";
+        let out = outcome(src);
+        assert_eq!(out.diags, Vec::new());
+    }
+
+    #[test]
+    fn setmetatable_with_no_arguments_is_unknown() {
+        let src = "\
+local nothing = setmetatable()
+local scalar = setmetatable(\"str\", {})
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "nothing").to_string(), "unknown");
+        assert_eq!(binding_ty(&out, "scalar").to_string(), "\"str\"");
+    }
+
+    #[test]
+    fn setmetatable_merges_array_and_indexer_parts_into_the_instance() {
+        // The constructed table carries an array part and a dynamic indexer;
+        // both must survive the merge into the class's shared instance shape.
+        let src = "\
+local Bag = {}
+Bag.__index = Bag
+function Bag.new()
+  local o = { 1, 2 }
+  o[SOME_KEY] = \"v\"
+  return setmetatable(o, Bag)
+end
+local b = Bag.new()
+local first = b[1]
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "first").to_string(), "1|2|\"v\"");
+    }
+
+    // --- contextual seeding descends into control flow ---------------------
+
+    #[test]
+    fn contextual_return_seeding_reaches_returns_inside_every_block() {
+        // `collect_returns` must find the `return`s nested in `if`, `while`,
+        // `repeat`, `for` and `do` — each returned lambda then takes the
+        // expected `fun(s: string)` type, so feeding its parameter to a
+        // `number` slot is a mismatch. Five nested returns => five findings.
+        let src = "\
+---@param outer fun(): fun(s: string)
+local function reg(outer) end
+---@param n number
+local function wantn(n) end
+reg(function()
+  if SOME_GLOBAL then
+    return function(s) wantn(s) end
+  end
+  while SOME_GLOBAL do
+    return function(s) wantn(s) end
+  end
+  repeat
+    return function(s) wantn(s) end
+  until true
+  for _ = 1, 2 do
+    return function(s) wantn(s) end
+  end
+  do
+    return function(s) wantn(s) end
+  end
+end)
+";
+        assert_eq!(strict_codes(src), vec!["LB0300"; 5]);
+    }
+
+    #[test]
+    fn contextual_return_seeding_stops_at_a_nested_closure() {
+        // A `return` that belongs to an *inner* function is not this
+        // function's return, so nothing is seeded from the outer expectation.
+        let src = "\
+---@param outer fun(): fun(s: string)
+local function reg(outer) end
+---@param n number
+local function wantn(n) end
+reg(function()
+  local inner = function()
+    return function(s) wantn(s) end
+  end
+  return inner
+end)
+";
+        assert_eq!(strict_codes(src), Vec::<String>::new());
+    }
+
+    // --- generic-for iterator shapes ---------------------------------------
+
+    #[test]
+    fn next_style_iteration_types_both_variables() {
+        let src = "\
+---@type table<string, integer>
+local m
+for k, v in next, m do
+  local kk = k
+  local vv = v
+end
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "kk").to_string(), "string");
+        assert_eq!(binding_ty(&out, "vv").to_string(), "integer");
+    }
+
+    #[test]
+    fn unrecognized_iterator_forms_leave_the_variables_unknown() {
+        // Only the `ipairs`/`pairs`/`next` global forms are modeled; anything
+        // else stays `unknown` rather than being guessed at.
+        let src = "\
+local custom = {}
+local function make() end
+for a in custom do
+  local from_name = a
+end
+for b in custom.iter() do
+  local from_field = b
+end
+for c in make() do
+  local from_local = c
+end
+for d in pairs() do
+  local from_argless = d
+end
+";
+        let out = outcome(src);
+        for name in [
+            "from_name",
+            "from_field",
+            "from_local",
+            "from_argless",
+        ] {
+            assert_eq!(binding_ty(&out, name).to_string(), "unknown", "{name}");
+        }
+    }
+
+    // --- vararg expansion ---------------------------------------------------
+
+    #[test]
+    fn vararg_expands_to_fill_every_requested_slot() {
+        let src = "\
+local function spread(...)
+  local a, b, c = ...
+  return a
+end
+";
+        let out = outcome(src);
+        for name in ["a", "b", "c"] {
+            assert_eq!(binding_ty(&out, name).to_string(), "unknown", "{name}");
+        }
+    }
+
+    // --- narrowing: the remaining predicates --------------------------------
+
+    #[test]
+    fn literal_equality_narrows_to_and_away_from_the_literal() {
+        let src = "\
+---@type \"a\"|\"b\"|\"c\"
+local tag
+if tag == \"a\" then
+  local is_a = tag
+end
+if tag ~= \"a\" then
+  local not_a = tag
+end
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "is_a").to_string(), "\"a\"");
+        // `~=` removes the exact member.
+        assert_eq!(binding_ty(&out, "not_a").to_string(), "\"b\"|\"c\"");
+    }
+
+    #[test]
+    fn literal_equality_on_an_unknown_adopts_the_literal_type() {
+        let src = "\
+local function f(v)
+  if v == 42 then
+    local fixed = v
+  end
+end
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "fixed").to_string(), "42");
+    }
+
+    #[test]
+    fn negated_type_call_keeps_the_other_members() {
+        let src = "\
+---@type string|integer
+local v
+if type(v) ~= \"string\" then
+  local not_string = v
+end
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "not_string").to_string(), "string|integer");
+    }
+
+    #[test]
+    fn nil_equality_narrows_both_ways_on_a_plain_value() {
+        // A non-optional value compared to `nil`: the positive branch is
+        // statically impossible and degrades to `nil`, the negative keeps it.
+        let src = "\
+---@type string
+local s
+if s == nil then
+  local impossible = s
+else
+  local present = s
+end
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "impossible").to_string(), "nil");
+        assert_eq!(binding_ty(&out, "present").to_string(), "string");
+    }
+
+    // --- unary operator overloads -------------------------------------------
+
+    #[test]
+    fn bnot_and_unm_consult_declared_operators() {
+        let src = "\
+---@class Bits
+---@operator bnot: Bits
+---@operator unm: string
+
+---@type Bits
+local b
+local flipped = ~b
+local negated = -b
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "flipped").to_string(), "Bits");
+        assert_eq!(binding_ty(&out, "negated").to_string(), "string");
+    }
+
+    #[test]
+    fn unary_operators_on_numbers_ignore_overloads() {
+        let src = "\
+local i = ~5
+local n = -1.5
+local ni = -7
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "i").to_string(), "integer");
+        assert_eq!(binding_ty(&out, "n").to_string(), "number");
+        assert_eq!(binding_ty(&out, "ni").to_string(), "integer");
+    }
+
+    #[test]
+    fn unary_operators_without_an_overload_stay_unknown() {
+        let src = "\
+---@class Bare
+---@type Bare
+local b
+local flipped = ~b
+local negated = -b
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "flipped").to_string(), "unknown");
+        assert_eq!(binding_ty(&out, "negated").to_string(), "unknown");
+    }
+
+    // --- indexer key generalisation ------------------------------------------
+
+    #[test]
+    fn dynamic_write_keys_generalize_to_their_base_type() {
+        // Literal keys widen so the indexer list stays small; an unknown key
+        // becomes `any`.
+        let src = "\
+local t = {}
+t[(\"name\")] = 1
+t[true] = \"flag\"
+t[(1.5)] = false
+t[SOME_GLOBAL] = 0
+local by_string = t[(\"name\")]
+local by_bool = t[true]
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "by_string").to_string(), "1");
+        assert_eq!(binding_ty(&out, "by_bool").to_string(), "\"flag\"");
+    }
+
+    // --- number-literal rendering ---------------------------------------------
+
+    #[test]
+    fn float_literals_keep_a_decimal_point_or_exponent() {
+        // An integral-valued float must not masquerade as an integer literal.
+        let src = "\
+local plain = 2.0
+local exp = 1e30
+local huge = 1e400
+local frac = 0.5
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "plain").to_string(), "2.0");
+        assert_eq!(
+            binding_ty(&out, "exp").to_string(),
+            "1000000000000000000000000000000.0"
+        );
+        assert_eq!(binding_ty(&out, "huge").to_string(), "inf");
+        assert_eq!(binding_ty(&out, "frac").to_string(), "0.5");
+    }
+
+    // --- `---@cast -T` on inference-side unions ---------------------------------
+
+    #[test]
+    fn cast_minus_removes_a_member_from_an_inferred_union() {
+        let src = "\
+local v
+if SOME_GLOBAL then
+  v = 1
+else
+  v = \"s\"
+end
+---@cast v -integer
+local narrowed = v
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "narrowed").to_string(), "1|\"s\"");
+    }
+
+    #[test]
+    fn cast_minus_that_removes_everything_degrades_to_unknown() {
+        let src = "\
+---@type string
+local s
+---@cast s -string
+local gone = s
+";
+        let out = outcome(src);
+        assert_eq!(binding_ty(&out, "gone").to_string(), "unknown");
+    }
+}
+
+#[cfg(test)]
+mod zz_probe {
+    use luabox_syntax::lua::{Dialect, parse};
+
+    use super::*;
+
+    fn out(src: &str) -> Outcome {
+        let parsed = parse(src, Dialect::Lua54);
+        assert_eq!(parsed.errors(), &[], "parse");
+        let env = TypeEnv::build(&parsed);
+        let lowered = luabox_hir::lower(&parsed);
+        run(&lowered, &env, "test.lua", true, false, None)
+    }
+
+    #[test]
+    fn probe() {
+        for src in [
+            "local t = {}\nt[(\"name\")] = 1\nlocal by_string = t[(\"name\")]\n",
+            "local t = {}\nt[true] = \"flag\"\nlocal by_bool = t[true]\n",
+            "---@type \"a\"|\"b\"|\"c\"\nlocal tag\nif tag == \"a\" then\n  local is_a = tag\nend\n",
+            "---@type string|integer\nlocal tag\nif tag == \"a\" then\n  local is_a = tag\nend\n",
+            "local function f(v)\n if v == 42 then\n  local fixed = v\n end\nend\n",
+        ] {
+            let o = out(src);
+            eprintln!("--- {src:?}");
+            for b in &o.binding_types {
+                eprintln!("   {} = {}", b.name, b.ty);
+            }
+        }
+    }
 }

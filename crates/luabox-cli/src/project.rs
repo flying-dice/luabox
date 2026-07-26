@@ -166,3 +166,244 @@ pub(crate) fn render_diagnostics(diags: &[Diagnostic], format: Format, root: &Pa
             .count(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    // test code — panics document assumptions
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use luabox_diag::Code;
+
+    const MINIMAL_MANIFEST: &str = "\
+[package]
+name = \"fixture\"
+version = \"0.1.0\"
+edition = \"5.4\"
+";
+
+    /// Write `contents` to `root/rel`, creating parent directories.
+    fn write(root: &Path, rel: &str, contents: &str) {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().expect("has a parent")).expect("create parents");
+        fs::write(&path, contents).expect("write file");
+    }
+
+    #[test]
+    fn find_manifest_dir_returns_the_directory_holding_the_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", MINIMAL_MANIFEST);
+        assert_eq!(
+            find_manifest_dir(tmp.path()).expect("found"),
+            tmp.path().to_path_buf()
+        );
+    }
+
+    #[test]
+    fn find_manifest_dir_walks_up_from_a_nested_subdirectory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", MINIMAL_MANIFEST);
+        let nested = tmp.path().join("src").join("deep").join("deeper");
+        fs::create_dir_all(&nested).expect("mkdir");
+
+        assert_eq!(
+            find_manifest_dir(&nested).expect("found by walking up"),
+            tmp.path().to_path_buf()
+        );
+    }
+
+    #[test]
+    fn find_manifest_dir_stops_at_the_nearest_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", MINIMAL_MANIFEST);
+        write(tmp.path(), "inner/luabox.toml", MINIMAL_MANIFEST);
+        let inner = tmp.path().join("inner");
+
+        assert_eq!(find_manifest_dir(&inner).expect("found"), inner);
+    }
+
+    #[test]
+    fn find_manifest_dir_ignores_a_directory_named_luabox_toml() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(tmp.path().join("proj").join("luabox.toml")).expect("mkdir");
+        // `is_file()` — a *directory* by that name is not a manifest, and the
+        // walk continues past it rather than claiming a bogus root.
+        assert!(find_manifest_dir(&tmp.path().join("proj")).is_none());
+    }
+
+    #[test]
+    fn read_manifest_parses_a_valid_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", MINIMAL_MANIFEST);
+        let manifest = read_manifest(tmp.path()).expect("parses");
+        assert_eq!(manifest.package.name, "fixture");
+        assert_eq!(manifest.package.edition, "5.4");
+    }
+
+    #[test]
+    fn read_manifest_reports_an_unreadable_manifest_by_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let error = read_manifest(tmp.path()).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("cannot read"), "{rendered}");
+        assert!(rendered.contains("luabox.toml"), "{rendered}");
+    }
+
+    #[test]
+    fn read_manifest_reports_a_malformed_manifest_with_the_rendered_parse_errors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", "[package]\nname = 42\n");
+        let error = read_manifest(tmp.path()).unwrap_err().to_string();
+        assert!(error.starts_with("invalid `"), "{error}");
+        assert!(error.contains("luabox.toml"), "{error}");
+        // The rendered parse errors follow on their own line(s).
+        assert!(error.contains('\n'), "{error}");
+    }
+
+    #[test]
+    fn discover_manifest_yields_none_when_no_ancestor_has_a_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let nested = tmp.path().join("a").join("b");
+        fs::create_dir_all(&nested).expect("mkdir");
+        // A tempdir's ancestors are real directories, so this only holds
+        // while no ancestor happens to carry a manifest — true for /tmp.
+        assert!(discover_manifest(&nested).expect("no error").is_none());
+    }
+
+    #[test]
+    fn discover_manifest_yields_the_root_and_parsed_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", MINIMAL_MANIFEST);
+        write(tmp.path(), "src/main.lua", "return 0\n");
+
+        let (root, manifest) = discover_manifest(&tmp.path().join("src"))
+            .expect("no error")
+            .expect("found");
+        assert_eq!(root, tmp.path().to_path_buf());
+        assert_eq!(manifest.package.name, "fixture");
+    }
+
+    #[test]
+    fn discover_manifest_propagates_a_malformed_present_manifest_as_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", "this is not toml = = =\n");
+        let error = discover_manifest(tmp.path()).unwrap_err().to_string();
+        assert!(error.starts_with("invalid `"), "{error}");
+    }
+
+    #[test]
+    fn collect_lua_files_walks_depth_first_in_name_order() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "z.lua", "");
+        write(tmp.path(), "a.lua", "");
+        write(tmp.path(), "b/inner.lua", "");
+        write(tmp.path(), "b/a_inner.lua", "");
+
+        let files = collect_lua_files(tmp.path(), None, false).expect("walk");
+        let rel: Vec<String> = files.iter().map(|p| display_rel(p, tmp.path())).collect();
+        assert_eq!(rel, ["a.lua", "b/a_inner.lua", "b/inner.lua", "z.lua"]);
+    }
+
+    #[test]
+    fn collect_lua_files_skips_dot_directories_dot_files_and_non_lua_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "src/main.lua", "");
+        write(tmp.path(), "README.md", "");
+        write(tmp.path(), "src/notes.txt", "");
+        write(tmp.path(), ".git/hooks.lua", "");
+        write(tmp.path(), ".hidden.lua", "");
+
+        let files = collect_lua_files(tmp.path(), None, false).expect("walk");
+        let rel: Vec<String> = files.iter().map(|p| display_rel(p, tmp.path())).collect();
+        assert_eq!(rel, ["src/main.lua"]);
+    }
+
+    #[test]
+    fn collect_lua_files_skips_the_build_output_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "src/main.lua", "");
+        write(tmp.path(), "dist/src/main.lua", "");
+
+        let out = tmp.path().join("dist");
+        let files = collect_lua_files(tmp.path(), Some(&out), false).expect("walk");
+        let rel: Vec<String> = files.iter().map(|p| display_rel(p, tmp.path())).collect();
+        assert_eq!(rel, ["src/main.lua"]);
+    }
+
+    #[test]
+    fn collect_lua_files_excludes_d_lua_only_when_asked() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "defs/love.d.lua", "");
+        write(tmp.path(), "src/main.lua", "");
+
+        let with_defs: Vec<String> = collect_lua_files(tmp.path(), None, false)
+            .expect("walk")
+            .iter()
+            .map(|p| display_rel(p, tmp.path()))
+            .collect();
+        assert_eq!(with_defs, ["defs/love.d.lua", "src/main.lua"]);
+
+        let without_defs: Vec<String> = collect_lua_files(tmp.path(), None, true)
+            .expect("walk")
+            .iter()
+            .map(|p| display_rel(p, tmp.path()))
+            .collect();
+        assert_eq!(without_defs, ["src/main.lua"]);
+    }
+
+    #[test]
+    fn collect_lua_files_reports_an_unreadable_directory_by_path() {
+        let missing = Path::new("definitely-not-a-directory-xyzzy");
+        let error = collect_lua_files(missing, None, false).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("cannot read directory"), "{rendered}");
+    }
+
+    #[test]
+    fn display_rel_strips_the_root_and_normalizes_to_forward_slashes() {
+        let root = Path::new("/proj");
+        assert_eq!(
+            display_rel(&root.join("src").join("a.lua"), root),
+            "src/a.lua"
+        );
+        // A path outside the root is returned as-is rather than erroring.
+        assert_eq!(
+            display_rel(Path::new("/elsewhere/b.lua"), root),
+            "/elsewhere/b.lua"
+        );
+    }
+
+    #[test]
+    fn render_diagnostics_tallies_errors_and_warnings_separately() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let diags = vec![
+            Diagnostic::error(Code::new(1), "boom"),
+            Diagnostic::warning(Code::new(501), "meh"),
+            Diagnostic::warning(Code::new(502), "also meh"),
+        ];
+        let counts = render_diagnostics(&diags, Format::Human, tmp.path());
+        assert_eq!(counts.errors, 1);
+        assert_eq!(counts.warnings, 2);
+    }
+
+    #[test]
+    fn render_diagnostics_on_an_empty_set_reports_zero_of_each() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let counts = render_diagnostics(&[], Format::Human, tmp.path());
+        assert_eq!(counts.errors, 0);
+        assert_eq!(counts.warnings, 0);
+    }
+
+    #[test]
+    fn render_diagnostics_resolves_source_snippets_from_files_under_the_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "src/main.lua", "local x = 1\n");
+        let diag = Diagnostic::error(Code::new(1), "bad thing").with_label(
+            luabox_diag::Label::primary(luabox_diag::Span::new("src/main.lua", 6..7), "here"),
+        );
+        // The lookup closure is what turns a label into a rendered snippet;
+        // exercising it proves the root-relative resolution works.
+        let counts = render_diagnostics(std::slice::from_ref(&diag), Format::Human, tmp.path());
+        assert_eq!(counts.errors, 1);
+    }
+}

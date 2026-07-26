@@ -788,4 +788,100 @@ mod tests {
         assert!(IfStmt::cast(root.clone()).is_none());
         assert!(SourceFile::cast(root).is_some());
     }
+
+    #[test]
+    fn enum_can_cast_covers_exactly_its_variants() {
+        // The generated `can_cast` must agree with the variant set, so
+        // `cast` never has to be tried speculatively.
+        assert!(Stmt::can_cast(SyntaxKind::LOCAL_STMT));
+        assert!(Stmt::can_cast(SyntaxKind::GOTO_STMT));
+        assert!(!Stmt::can_cast(SyntaxKind::NAME_EXPR));
+        assert!(Expr::can_cast(SyntaxKind::NAME_EXPR));
+        assert!(Expr::can_cast(SyntaxKind::METHOD_CALL_EXPR));
+        assert!(!Expr::can_cast(SyntaxKind::BLOCK));
+        assert!(TableField::can_cast(SyntaxKind::TABLE_ITEM_FIELD));
+        assert!(!TableField::can_cast(SyntaxKind::EXPR_LIST));
+    }
+
+    #[test]
+    fn local_function_and_plain_function_name_accessors() {
+        let file = tree("local function helper(a) end function m.n() end");
+        let all = stmts(&file);
+        let Stmt::LocalFunction(local_fn) = &all[0] else {
+            panic!("expected local function");
+        };
+        assert_eq!(local_fn.name().unwrap().text(), "helper");
+        assert_eq!(local_fn.param_list().unwrap().params().count(), 1);
+        assert!(local_fn.body().is_some());
+        // A dotted (non-method) name has no `:` part.
+        let Stmt::FunctionDecl(decl) = &all[1] else {
+            panic!("expected function decl");
+        };
+        let name = decl.name().unwrap();
+        assert!(!name.is_method());
+        assert!(name.method_name().is_none());
+    }
+
+    #[test]
+    fn expression_leaf_accessors() {
+        let file = tree("x = t[k].f");
+        let [Stmt::Assign(assign)] = &stmts(&file)[..] else {
+            panic!("expected assignment");
+        };
+        // Assignment target: a NAME_EXPR.
+        let Some(Expr::Name(target)) = assign.targets().unwrap().exprs().next() else {
+            panic!("expected a name target");
+        };
+        assert_eq!(target.name().unwrap().text(), "x");
+        let Some(Expr::Field(field)) = assign.values().unwrap().exprs().next() else {
+            panic!("expected a field expr");
+        };
+        let Some(Expr::Index(index)) = field.base() else {
+            panic!("expected an index expr");
+        };
+        assert_eq!(index.base().unwrap().syntax().text(), "t");
+        assert_eq!(index.index().unwrap().syntax().text(), "k");
+    }
+
+    #[test]
+    fn literal_and_table_item_accessors() {
+        let file = tree("t = { 'a', nil }");
+        let [Stmt::Assign(assign)] = &stmts(&file)[..] else {
+            panic!("expected assignment");
+        };
+        let Some(Expr::Table(table)) = assign.values().unwrap().exprs().next() else {
+            panic!("expected table");
+        };
+        let items: Vec<_> = table.fields().collect();
+        let texts: Vec<String> = items
+            .iter()
+            .map(|f| {
+                let TableField::Item(item) = f else {
+                    panic!("expected positional items");
+                };
+                let Some(Expr::Literal(lit)) = item.value() else {
+                    panic!("expected a literal value");
+                };
+                lit.token().unwrap().text().to_string()
+            })
+            .collect();
+        assert_eq!(texts, ["'a'", "nil"]);
+    }
+
+    #[test]
+    fn method_call_accessors() {
+        let file = tree("obj:greet(1)");
+        let [Stmt::Call(call)] = &stmts(&file)[..] else {
+            panic!("expected call statement");
+        };
+        let Some(Expr::MethodCall(method)) = call.expr() else {
+            panic!("expected method call");
+        };
+        assert_eq!(method.receiver().unwrap().syntax().text(), "obj");
+        assert_eq!(method.method_name().unwrap().text(), "greet");
+        assert_eq!(
+            method.args().unwrap().expr_list().unwrap().exprs().count(),
+            1
+        );
+    }
 }

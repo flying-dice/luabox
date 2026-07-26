@@ -164,3 +164,292 @@ fn open_in_browser(index: &Path) {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    // test code — panics document assumptions
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    /// Write `contents` to `root/rel`, creating parent directories.
+    fn write(root: &Path, rel: &str, contents: &str) {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().expect("has a parent")).expect("create parents");
+        fs::write(&path, contents).expect("write file");
+    }
+
+    fn manifest(name: &str, extra: &str) -> String {
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n{extra}")
+    }
+
+    fn project(name: &str, extra: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "luabox.toml", &manifest(name, extra));
+        tmp
+    }
+
+    fn read_doc(root: &Path, page: &str) -> String {
+        fs::read_to_string(root.join("doc").join(page))
+            .unwrap_or_else(|e| panic!("reading doc/{page}: {e}"))
+    }
+
+    const CIRCLE_SOURCE: &str = "\
+--- Circle helpers.
+
+---@class geometry.Circle
+---@field radius number the radius
+local Circle = {}
+
+--- Computes the area.
+---@param self geometry.Circle
+---@return number area
+function Circle:area()
+  return 3 * self.radius * self.radius
+end
+
+return Circle
+";
+
+    #[test]
+    fn run_writes_an_index_and_a_page_per_module_and_class() {
+        let tmp = project("geometry", "");
+        write(tmp.path(), "src/circle.lua", CIRCLE_SOURCE);
+
+        run(tmp.path(), false).expect("doc succeeds");
+
+        let index = read_doc(tmp.path(), "index.html");
+        assert!(index.contains("geometry"), "{index}");
+        // Module and class pages are named from the model, not the file.
+        assert!(tmp.path().join("doc").join("module.circle.html").is_file());
+        assert!(
+            tmp.path()
+                .join("doc")
+                .join("class.geometry.Circle.html")
+                .is_file()
+        );
+
+        // Methods hang off the class page, not the module page.
+        let class = read_doc(tmp.path(), "class.geometry.Circle.html");
+        assert!(class.contains("area"), "{class}");
+        assert!(class.contains("radius"), "{class}");
+    }
+
+    #[test]
+    fn the_generated_site_is_self_contained_with_no_external_assets() {
+        let tmp = project("selfcontained", "");
+        write(tmp.path(), "src/main.lua", "--- A module.\nreturn {}\n");
+
+        run(tmp.path(), false).expect("doc succeeds");
+        let index = read_doc(tmp.path(), "index.html");
+        assert!(!index.contains("http://"), "{index}");
+        assert!(!index.contains("https://"), "{index}");
+        assert!(index.contains("<style"), "{index}");
+    }
+
+    #[test]
+    fn the_search_index_embedded_in_the_index_page_is_valid_json() {
+        let tmp = project("searchable", "");
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "--- Adds.\n---@param a number\n---@return number\nlocal function add(a)\n  return a\nend\nreturn add\n",
+        );
+        run(tmp.path(), false).expect("doc succeeds");
+
+        let index = read_doc(tmp.path(), "index.html");
+        let json = index
+            .split_once("id=\"search-index\">")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split_once("</script>"))
+            .map(|(json, _)| json)
+            .expect("the index page embeds a search-index script block");
+        let parsed: serde_json::Value =
+            serde_json::from_str(json).expect("the embedded search index is valid JSON");
+        assert!(
+            parsed
+                .as_array()
+                .expect("an array")
+                .iter()
+                .any(|e| { e.get("name").and_then(serde_json::Value::as_str) == Some("add") })
+        );
+    }
+
+    #[test]
+    fn doc_output_is_written_beside_the_build_output_and_is_never_documented_itself() {
+        let tmp = project("stable", "\n[build]\nout = \"dist\"\n");
+        write(tmp.path(), "src/main.lua", "--- A module.\nreturn {}\n");
+        write(
+            tmp.path(),
+            "dist/src/main.lua",
+            "--- Generated.\nreturn {}\n",
+        );
+
+        run(tmp.path(), false).expect("doc succeeds");
+        // `dist/` is build output, not source: only one module page exists.
+        let pages: Vec<String> = fs::read_dir(tmp.path().join("doc"))
+            .expect("doc dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("module."))
+            .collect();
+        assert_eq!(pages, ["module.main.html"]);
+    }
+
+    #[test]
+    fn rerunning_doc_over_an_existing_site_succeeds() {
+        let tmp = project("idempotent", "");
+        write(tmp.path(), "src/main.lua", "--- A module.\nreturn {}\n");
+        run(tmp.path(), false).expect("first run");
+        run(tmp.path(), false).expect("second run over the existing doc/ dir");
+    }
+
+    #[test]
+    fn an_empty_project_still_generates_a_site() {
+        let tmp = project("empty", "");
+        run(tmp.path(), false).expect("doc succeeds");
+        assert!(tmp.path().join("doc").join("index.html").is_file());
+    }
+
+    #[test]
+    fn a_manifest_less_project_falls_back_to_the_directory_name_as_the_package() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("my-package");
+        fs::create_dir_all(&root).expect("mkdir");
+        write(&root, "main.lua", "--- A module.\nreturn {}\n");
+
+        run(&root, false).expect("doc succeeds");
+        assert!(
+            fs::read_to_string(root.join("doc").join("index.html"))
+                .expect("index")
+                .contains("my-package")
+        );
+    }
+
+    // -- `---@meta` def harvesting (#87) -----------------------------------
+
+    #[test]
+    fn a_class_that_lives_only_in_a_def_file_still_gets_a_page() {
+        let tmp = project("geometry", "\n[types]\ndefs = [\"geometry\"]\n");
+        write(
+            tmp.path(),
+            "defs/geometry.d.lua",
+            "---@meta\n\n--- A shape.\n---@class geometry.Shape\n---@field area fun(): number\n",
+        );
+        write(tmp.path(), "src/main.lua", "return {}\n");
+
+        run(tmp.path(), false).expect("doc succeeds");
+        assert!(
+            tmp.path()
+                .join("doc")
+                .join("class.geometry.Shape.html")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn a_real_carrier_module_wins_the_page_over_a_def_declaring_the_same_class() {
+        let tmp = project("geometry", "\n[types]\ndefs = [\"geometry\"]\n");
+        write(
+            tmp.path(),
+            "defs/geometry.d.lua",
+            "---@meta\n---@class geometry.Circle\n---@field radius number\n",
+        );
+        write(tmp.path(), "src/circle.lua", CIRCLE_SOURCE);
+
+        run(tmp.path(), false).expect("doc succeeds");
+        // Exactly one page for the class, and it is the richer carrier's —
+        // the def's declaration is dropped rather than clobbering it.
+        let page = read_doc(tmp.path(), "class.geometry.Circle.html");
+        assert!(
+            page.contains("area"),
+            "the carrier's method is missing:\n{page}"
+        );
+    }
+
+    #[test]
+    fn a_def_contributing_nothing_new_adds_no_module_page() {
+        let tmp = project("geometry", "\n[types]\ndefs = [\"geometry\"]\n");
+        write(
+            tmp.path(),
+            "defs/geometry.d.lua",
+            "---@meta\n---@class geometry.Circle\n",
+        );
+        write(tmp.path(), "src/circle.lua", CIRCLE_SOURCE);
+
+        run(tmp.path(), false).expect("doc succeeds");
+        assert!(!tmp.path().join("doc").join("module.geometry.html").exists());
+    }
+
+    #[test]
+    fn a_dependency_s_defs_are_harvested_too() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "luabox.toml",
+            &manifest(
+                "consumer",
+                "\n[dependencies]\ngeo = { path = \"vendor/geo\" }\n",
+            ),
+        );
+        write(
+            tmp.path(),
+            "vendor/geo/luabox.toml",
+            &manifest("geo", "\n[types]\ndefs = [\"geo\"]\n"),
+        );
+        write(
+            tmp.path(),
+            "vendor/geo/defs/geo.d.lua",
+            "---@meta\n---@class geo.Vector\n---@field x number\n",
+        );
+        write(tmp.path(), "src/main.lua", "return {}\n");
+
+        run(tmp.path(), false).expect("doc succeeds");
+        assert!(
+            tmp.path()
+                .join("doc")
+                .join("class.geo.Vector.html")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn a_def_module_name_is_the_last_path_segment_with_the_d_lua_suffix_stripped() {
+        assert_eq!(def_module_name("defs/geometry.d.lua"), "geometry");
+        assert_eq!(def_module_name("geometry/defs/geometry.d.lua"), "geometry");
+        // A directory-style def package collapses each file to its own stem.
+        assert_eq!(def_module_name("defs/pack/vec.d.lua"), "vec");
+        // A label with no separators or suffix passes through unchanged.
+        assert_eq!(def_module_name("bare"), "bare");
+    }
+
+    // -- package name resolution -------------------------------------------
+
+    #[test]
+    fn the_package_name_comes_from_the_manifest_when_it_parses() {
+        let tmp = project("from-manifest", "");
+        assert_eq!(manifest_facts(tmp.path()), "from-manifest");
+    }
+
+    #[test]
+    fn the_package_name_falls_back_to_the_directory_without_a_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("dirname-fallback");
+        fs::create_dir_all(&root).expect("mkdir");
+        assert_eq!(manifest_facts(&root), "dirname-fallback");
+    }
+
+    #[test]
+    fn the_package_name_falls_back_to_the_directory_for_a_malformed_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("broken-manifest");
+        fs::create_dir_all(&root).expect("mkdir");
+        write(&root, "luabox.toml", "= = =\n");
+        assert_eq!(manifest_facts(&root), "broken-manifest");
+    }
+
+    #[test]
+    fn a_root_with_no_file_name_falls_back_to_a_placeholder_package_name() {
+        assert_eq!(manifest_facts(Path::new("/")), "package");
+    }
+}

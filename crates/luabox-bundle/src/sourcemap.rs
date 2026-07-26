@@ -184,6 +184,32 @@ mod tests {
     }
 
     #[test]
+    fn a_colon_without_digits_is_not_a_line_reference() {
+        let map = sample();
+        let names = vec!["app.lua".to_string()];
+        // `app.lua: message` and `app.lua:` at EOF must survive untouched —
+        // only `<name>:<digits>` is a location.
+        let out = unmap_traceback(&map, &names, "lua: app.lua: cannot open app.lua:\n");
+        assert_eq!(out, "lua: app.lua: cannot open app.lua:\n");
+        assert_eq!(split_line_suffix(": nope"), None);
+        assert_eq!(split_line_suffix("no colon"), None);
+        assert_eq!(split_line_suffix(":12: rest"), Some((12, ": rest")));
+    }
+
+    #[test]
+    fn empty_and_duplicate_bundle_names_are_ignored() {
+        let map = sample();
+        let names = vec![
+            String::new(),
+            "app.lua".to_string(),
+            "app.lua".to_string(),
+            String::new(),
+        ];
+        let out = unmap_traceback(&map, &names, "app.lua:2: boom");
+        assert_eq!(out, "src/util.lua:1: boom");
+    }
+
+    #[test]
     fn version_gate() {
         let err = BundleMap::from_json(r#"{"version":2,"bundle":"x","files":[],"lines":[]}"#);
         assert!(err.is_err());

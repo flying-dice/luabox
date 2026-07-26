@@ -672,6 +672,150 @@ end
         assert_eq!(run_in[0].from.name, "driver");
     }
 
+    #[test]
+    fn a_local_assigned_function_expression_is_a_hierarchy_node() {
+        let src = "\
+local helper = function() end
+local worker = function()
+  helper()
+end
+worker()
+";
+        let (analysis, path) = analyze(&[("main.lua", src)]);
+        let sema = sema_for(&analysis, &path);
+        let item =
+            prepare(&analysis, &sema, offset_of(src, "worker") + 1).expect("prepare")[0].clone();
+        assert_eq!(item.name, "worker");
+        // Its body is the `function` expression, so its callees are found.
+        let out = outgoing_calls(&analysis, &sema, &item);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].to.name, "helper");
+        // And the top-level `worker()` call is an incoming caller-less hit.
+        let incoming = incoming_calls(&analysis, &sema, &item);
+        assert_eq!(incoming.len(), 1, "{incoming:?}");
+    }
+
+    #[test]
+    fn prepare_resolves_a_call_site_to_a_declaration_in_another_file() {
+        let caller = "helper()\n";
+        let (analysis, path) =
+            analyze(&[("main.lua", caller), ("lib.lua", "function helper() end\n")]);
+        let sema = sema_for(&analysis, &path);
+        let items = prepare(&analysis, &sema, offset_of(caller, "helper") + 1).expect("prepare");
+        assert_eq!(items[0].name, "helper");
+        assert!(items[0].uri.as_str().ends_with("lib.lua"), "{items:?}");
+    }
+
+    #[test]
+    fn prepare_on_a_dotted_call_resolves_the_dotted_declaration() {
+        let src = "\
+local M = {}
+function M.helper() end
+M.helper()
+";
+        let (analysis, path) = analyze(&[("main.lua", src)]);
+        let sema = sema_for(&analysis, &path);
+        // Cursor on the `helper` of the `M.helper()` call.
+        let offset = src.rfind("helper").expect("call") + 1;
+        let items = prepare(&analysis, &sema, offset).expect("prepare");
+        assert_eq!(items[0].name, "M.helper");
+        assert_eq!(items[0].selection_range.start.line, 1);
+    }
+
+    #[test]
+    fn prepare_on_a_field_receiver_is_none() {
+        let src = "\
+local M = {}
+function M.helper() end
+M.helper()
+";
+        let (analysis, path) = analyze(&[("main.lua", src)]);
+        let sema = sema_for(&analysis, &path);
+        // Cursor on the receiver `M` of `M.helper()`, not the member.
+        let offset = src.rfind("M.helper").expect("call");
+        assert!(prepare(&analysis, &sema, offset).is_none());
+    }
+
+    #[test]
+    fn prepare_on_an_identifier_that_names_no_function_is_none() {
+        let src = "local t = { key = 1 }\n";
+        let (analysis, path) = analyze(&[("main.lua", src)]);
+        let sema = sema_for(&analysis, &path);
+        // A table-constructor key is neither a declaration nor a call.
+        assert!(prepare(&analysis, &sema, offset_of(src, "key")).is_none());
+        // And a name that resolves to no declaration anywhere.
+        let unknown = "missing()\n";
+        let (analysis, path) = analyze(&[("other.lua", unknown)]);
+        let sema = sema_for(&analysis, &path);
+        assert!(prepare(&analysis, &sema, offset_of(unknown, "missing")).is_none());
+    }
+
+    #[test]
+    fn a_call_through_an_index_expression_is_not_an_outgoing_call() {
+        let src = "\
+local t = {}
+local function caller()
+  t[1]()
+end
+";
+        let (analysis, path) = analyze(&[("main.lua", src)]);
+        let sema = sema_for(&analysis, &path);
+        let item =
+            prepare(&analysis, &sema, offset_of(src, "caller") + 1).expect("prepare")[0].clone();
+        assert!(outgoing_calls(&analysis, &sema, &item).is_empty());
+    }
+
+    #[test]
+    fn a_call_on_a_computed_base_is_not_a_dotted_target() {
+        let src = "\
+local t = {}
+local function caller()
+  t[1].method()
+end
+";
+        let (analysis, path) = analyze(&[("main.lua", src)]);
+        let sema = sema_for(&analysis, &path);
+        let item =
+            prepare(&analysis, &sema, offset_of(src, "caller") + 1).expect("prepare")[0].clone();
+        // The base is an index expression, so the chain has no dotted name.
+        assert!(outgoing_calls(&analysis, &sema, &item).is_empty());
+    }
+
+    #[test]
+    fn outgoing_calls_for_an_item_this_file_does_not_declare_are_empty() {
+        let lib = "function there() end\n";
+        let (analysis, main_path) =
+            analyze(&[("main.lua", "local function here() end\n"), ("lib.lua", lib)]);
+        let lib_path = main_path.parent().expect("parent").join("lib.lua");
+        let lib_sema = sema_for(&analysis, &lib_path);
+        let item =
+            prepare(&analysis, &lib_sema, offset_of(lib, "there") + 1).expect("prepare")[0].clone();
+        // `main.lua` declares nothing at that selection range.
+        let main_sema = sema_for(&analysis, &main_path);
+        assert!(outgoing_calls(&analysis, &main_sema, &item).is_empty());
+    }
+
+    #[test]
+    fn incoming_callers_are_sorted_by_position() {
+        let src = "\
+local function target() end
+local function beta()
+  target()
+end
+local function alpha()
+  target()
+end
+";
+        let (analysis, path) = analyze(&[("main.lua", src)]);
+        let sema = sema_for(&analysis, &path);
+        let item =
+            prepare(&analysis, &sema, offset_of(src, "target") + 1).expect("prepare")[0].clone();
+        let incoming = incoming_calls(&analysis, &sema, &item);
+        let names: Vec<&str> = incoming.iter().map(|c| c.from.name.as_str()).collect();
+        // Same file, so ordering follows declaration position, not name.
+        assert_eq!(names, vec!["beta", "alpha"], "{incoming:?}");
+    }
+
     fn range(start: (u32, u32), end: (u32, u32)) -> Range {
         Range::new(Position::new(start.0, start.1), Position::new(end.0, end.1))
     }
