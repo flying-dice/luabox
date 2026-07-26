@@ -104,6 +104,18 @@ so it appears in no version entry.
   resolved before resolves elsewhere now. Compiled C modules under
   `lua_modules/lib/lua/<X.Y>/` cannot be inlined into a text bundle and stay
   runtime `require`s, exactly like any other unresolved name.
+- **Unterminated long brackets are reported instead of silently accepted**
+  ([#15](https://github.com/flying-dice/luabox/issues/15)). `x = [[abc` and
+  `--[[ abc` used to lex as a complete string / comment running to
+  end-of-file with no diagnostic, and the string then decoded to `ab` — a
+  closing bracket's worth of bytes stripped that the lexer never saw. Both
+  now produce `LB0001` (`unterminated long string` / `unterminated long
+  comment`) spanning the whole unclosed run, matching how unterminated short
+  strings have always been treated, and no truncated literal reaches the
+  HIR. Unterminated short strings now report `unterminated string` rather
+  than the generic `expected expression`. Files that relied on the old
+  silence now fail `check`; `fmt` returns them unchanged, as it does for any
+  input that does not parse.
 
 ### Migration
 

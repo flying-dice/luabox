@@ -10,10 +10,11 @@
 //! dialect-gated at token level, because they change token *boundaries*,
 //! are the `goto` keyword and LuaJIT number suffixes.
 //!
-//! Unterminated long strings/comments lex to end-of-input with their natural
-//! kind (the validator sees the missing terminator in the text); an
-//! unterminated *short* string becomes an [`SyntaxKind::ERROR`] token ending
-//! at the newline, so the rest of the line still lexes normally.
+//! Every unterminated string form becomes an [`SyntaxKind::ERROR`] token, so
+//! the parser reports it: an unterminated *short* string ends at the newline
+//! (the rest of the line still lexes normally), while an unterminated long
+//! bracket — string or comment — runs to end of input, since nothing after it
+//! could have closed it.
 
 use super::{Dialect, SyntaxKind};
 
@@ -131,9 +132,13 @@ impl Lexer<'_> {
     }
 
     /// Consume `[=*[ ... ]=*]` (opening already verified). Unterminated:
-    /// consumes to end of input, keeping `kind` (validator diagnoses).
+    /// consumes to end of input and becomes an [`SyntaxKind::ERROR`] token
+    /// rather than `kind`, exactly like an unterminated short string — the
+    /// text never was a complete string/comment, and pretending otherwise
+    /// hides the missing terminator from the parser.
     fn long_bracket(&mut self, start: usize, level: usize, kind: SyntaxKind) {
         self.pos += 2 + level; // [=*[
+        let mut terminated = false;
         loop {
             match self.peek(0) {
                 None => break,
@@ -144,6 +149,7 @@ impl Lexer<'_> {
                     }
                     if eqs == level && self.peek(1 + eqs) == Some(b']') {
                         self.pos += 2 + level;
+                        terminated = true;
                         break;
                     }
                     self.pos += 1;
@@ -151,7 +157,7 @@ impl Lexer<'_> {
                 Some(_) => self.pos += 1,
             }
         }
-        self.push(kind, start);
+        self.push(if terminated { kind } else { SyntaxKind::ERROR }, start);
     }
 
     /// `'...'` / `"..."` with escapes. An unescaped newline or end of input
@@ -398,6 +404,7 @@ mod tests {
             "x = 0x1F.8p-2 ~= 1e10 // 3 << 2",
             "::top:: goto top",
             "weird = £ § unterminated'",
+            "x = [[unterminated\n--[==[ nor this",
         ];
         for src in corpus {
             for d in Dialect::ALL {
@@ -486,6 +493,71 @@ mod tests {
                 WHITESPACE, NUMBER
             ]
         );
+    }
+
+    #[test]
+    fn unterminated_long_strings_are_error_tokens() {
+        // No `]]` ever arrives: the token runs to end of input (nothing
+        // after it could have closed it) but is *not* a STRING.
+        assert_eq!(
+            check("x = [[abc", Dialect::Lua51),
+            vec![
+                (IDENT, "x"),
+                (WHITESPACE, " "),
+                (EQ, "="),
+                (WHITESPACE, " "),
+                (ERROR, "[[abc"),
+            ]
+        );
+        // Levelled openers need a matching-level closer; `]]` does not close
+        // `[==[`, so this is still unterminated.
+        assert_eq!(
+            check("x = [==[abc]] more", Dialect::Lua54),
+            vec![
+                (IDENT, "x"),
+                (WHITESPACE, " "),
+                (EQ, "="),
+                (WHITESPACE, " "),
+                (ERROR, "[==[abc]] more"),
+            ]
+        );
+        // A newline does not end a long string the way it ends a short one.
+        assert_eq!(kinds("[[a\nb", Dialect::Lua51), vec![ERROR]);
+    }
+
+    #[test]
+    fn unterminated_long_comments_are_error_tokens() {
+        assert_eq!(
+            check("--[[ oops", Dialect::Lua51),
+            vec![(ERROR, "--[[ oops")]
+        );
+        assert_eq!(
+            check("--[==[ oops ]] still", Dialect::Lua54),
+            vec![(ERROR, "--[==[ oops ]] still")]
+        );
+        // A closed long comment is still ordinary COMMENT trivia.
+        assert_eq!(kinds("--[[ ok ]]", Dialect::Lua51), vec![COMMENT]);
+    }
+
+    #[test]
+    fn input_ending_exactly_at_a_long_bracket_opener() {
+        for (src, expected) in [
+            ("[[", ERROR),
+            ("[==[", ERROR),
+            ("--[[", ERROR),
+            ("--[==[", ERROR),
+        ] {
+            assert_eq!(kinds(src, Dialect::Lua54), vec![expected], "{src:?}");
+        }
+        // Empty-but-closed long brackets are complete tokens.
+        assert_eq!(kinds("[[]]", Dialect::Lua54), vec![STRING]);
+        assert_eq!(kinds("[==[]==]", Dialect::Lua54), vec![STRING]);
+        assert_eq!(kinds("--[[]]", Dialect::Lua54), vec![COMMENT]);
+        // A partial opener is not a long bracket at all.
+        assert_eq!(kinds("[=", Dialect::Lua54), vec![L_BRACKET, EQ]);
+        assert_eq!(kinds("[", Dialect::Lua54), vec![L_BRACKET]);
+        // `]]` alone is just two brackets.
+        assert_eq!(kinds("]]", Dialect::Lua54), vec![R_BRACKET, R_BRACKET]);
     }
 
     #[test]

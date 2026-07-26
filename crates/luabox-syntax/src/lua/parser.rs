@@ -349,12 +349,59 @@ impl<'a> Parser<'a> {
         false
     }
 
+    /// Report that no expression could start at the current token. An
+    /// unterminated literal is named for what it is: it is the reason the
+    /// expression is missing, and quoting its text would splice the rest of
+    /// the line (or file) into the message.
+    pub(super) fn expected_expression(&mut self) {
+        match self.unterminated_literal() {
+            Some(what) => self.error(format!("unterminated {what}")),
+            None => self.error("expected expression"),
+        }
+    }
+
+    /// Message for a token no rule can use here: `unexpected '<text>'`, or
+    /// the named literal when the token is an unterminated one.
+    pub(super) fn unexpected_message(&self) -> String {
+        match self.unterminated_literal() {
+            Some(what) => format!("unterminated {what}"),
+            None => format!("unexpected '{}'", self.current_text()),
+        }
+    }
+
+    /// Which unterminated literal the current token is, if any. The lexer
+    /// emits exactly these as `ERROR` tokens with a literal opener; every
+    /// other `ERROR` token is a stray byte.
+    fn unterminated_literal(&self) -> Option<&'static str> {
+        if !self.at(SyntaxKind::ERROR) {
+            return None;
+        }
+        let text = self.current_text();
+        if text.starts_with("--[") {
+            Some("long comment")
+        } else if text.starts_with('[') {
+            Some("long string")
+        } else if text.starts_with('\'') || text.starts_with('"') {
+            Some("string")
+        } else {
+            None
+        }
+    }
+
     pub(super) fn error(&mut self, message: impl Into<String>) {
         let range = self.current_range();
-        self.errors.push(ParseError {
-            message: message.into(),
-            range,
-        });
+        let message = message.into();
+        // One token can be rejected twice — once by the rule that wanted it,
+        // then again by statement recovery. Saying the same thing about the
+        // same span twice helps nobody.
+        if self
+            .errors
+            .last()
+            .is_some_and(|last| last.range == range && last.message == message)
+        {
+            return;
+        }
+        self.errors.push(ParseError { message, range });
     }
 
     /// Report `message` and consume the current token inside an
@@ -1308,26 +1355,64 @@ SOURCE_FILE@0..4
     }
 
     #[test]
-    fn unterminated_long_string_and_long_comment_parse_without_errors() {
-        // The lexer runs an unterminated long bracket to end-of-input; the
-        // parser therefore sees one well-formed STRING / COMMENT token.
-        let parse = ok("x = [[unterminated");
-        let ast::Stmt::Assign(assign) = first_stmt(&parse) else {
-            panic!("expected an assignment");
-        };
+    fn unterminated_long_string_and_long_comment_are_reported() {
+        // The lexer runs an unterminated long bracket to end-of-input as an
+        // ERROR token, so the parser reports the missing terminator instead
+        // of accepting a string/comment that never closed.
+        let parse = err("x = [[unterminated");
+        assert_eq!(messages(&parse), ["unterminated long string"]);
         assert_eq!(
-            assign
-                .values()
-                .unwrap()
-                .exprs()
-                .next()
-                .unwrap()
-                .syntax()
-                .text(),
-            "[[unterminated"
+            parse.errors()[0].range,
+            TextRange::new(4.into(), 18.into()),
+            "the diagnostic spans the whole unterminated literal"
         );
-        let parse = ok("--[[ unterminated");
-        assert_eq!(parse.tree().block().unwrap().stmts().count(), 0);
+
+        // Levels must match: `]]` leaves a `[==[` open.
+        assert_eq!(
+            messages(&err("x = [==[unterminated]]")),
+            ["unterminated long string"]
+        );
+
+        let parse = err("--[[ unterminated");
+        assert_eq!(messages(&parse), ["unterminated long comment"]);
+        assert_eq!(
+            messages(&err("--[==[ unterminated")),
+            ["unterminated long comment"]
+        );
+
+        // Openers with nothing after them at all.
+        for src in ["[[", "[==[", "--[[", "--[==["] {
+            assert!(
+                !err(src).errors().is_empty(),
+                "{src:?} must be diagnosed, not silently accepted"
+            );
+        }
+
+        // Closed long brackets stay clean.
+        ok("x = [[fine]]");
+        ok("--[==[ fine ]==]");
+    }
+
+    #[test]
+    fn unterminated_short_string_is_named_too() {
+        // Long and short unterminated literals report the same way; only the
+        // extent differs (a short string stops at the newline).
+        assert_eq!(messages(&err("x = 'oops")), ["unterminated string"]);
+        assert_eq!(messages(&err("x = \"oops\ny = 1")), ["unterminated string"]);
+        // A stray byte is an ERROR token too, but not a literal: it keeps the
+        // generic wording and is quoted verbatim.
+        assert_eq!(
+            messages(&err("x = £")),
+            ["expected expression", "unexpected '£'"]
+        );
+    }
+
+    #[test]
+    fn one_diagnostic_per_rejected_token() {
+        // A token rejected by the rule that wanted an expression and again by
+        // statement recovery is reported once, not twice.
+        let parse = err("x = [[oops");
+        assert_eq!(parse.errors().len(), 1, "{}", parse.debug_dump());
     }
 
     // === Diagnostic token names ===

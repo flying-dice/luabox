@@ -1102,25 +1102,31 @@ fn an_anonymous_function_statement_lowers_its_target_to_an_error_expr() {
 }
 
 #[test]
-fn unterminated_strings_recover_differently_by_bracket_style() {
-    // A short string that never closes is not a STRING token at all — the
-    // parser recovers it as an error node, so nothing lowers.
-    let short = parse("x = \"unterminated", Dialect::Lua54);
-    assert!(!short.errors().is_empty(), "fixture should be broken");
-    let file = luabox_hir::lower(&short);
-    assert!(
-        !file
-            .body(file.chunk())
-            .exprs()
-            .any(|(_, e)| matches!(e, Expr::Literal(_))),
-        "an unterminated short string yields no literal"
-    );
+fn unterminated_strings_lower_to_nothing_whatever_the_bracket_style() {
+    // Neither bracket style produces a STRING token when it never closes —
+    // the lexer marks the run as an error the parser recovers into an error
+    // node, so no literal (and in particular no truncated one) reaches HIR.
+    for src in [
+        "x = \"unterminated",
+        "x = [[unterminated",
+        "x = [==[unterminated]]",
+    ] {
+        let parse = parse(src, Dialect::Lua54);
+        assert!(!parse.errors().is_empty(), "{src:?} should be broken");
+        let file = luabox_hir::lower(&parse);
+        assert!(
+            !file
+                .body(file.chunk())
+                .exprs()
+                .any(|(_, e)| matches!(e, Expr::Literal(_))),
+            "{src:?} must not lower to a literal"
+        );
+    }
 
-    // An unterminated long bracket *is* lexed as a STRING running to
-    // end-of-file, so it lowers to a literal. `decode_long_string` then
-    // strips a closing bracket's worth of bytes it never actually saw.
-    let long = parse("x = [[unterminated", Dialect::Lua54);
-    let file = luabox_hir::lower(&long);
+    // A closed long string still lowers, with its content intact.
+    let parse = parse("x = [[terminated]]", Dialect::Lua54);
+    assert!(parse.errors().is_empty());
+    let file = luabox_hir::lower(&parse);
     let lit = file
         .body(file.chunk())
         .exprs()
@@ -1128,9 +1134,9 @@ fn unterminated_strings_recover_differently_by_bracket_style() {
             Expr::Literal(Literal::String(s)) => Some(s.clone()),
             _ => None,
         })
-        .expect("the recovered long string lowers");
+        .expect("the long string lowers");
     assert!(lit.is_long);
-    assert_eq!(lit.as_str(), Some("unterminat"));
+    assert_eq!(lit.as_str(), Some("terminated"));
 }
 
 #[test]

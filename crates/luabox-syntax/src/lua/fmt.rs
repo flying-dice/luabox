@@ -606,6 +606,9 @@ mod tests {
             "x = ",
             "function f( end",
             "x = 'unterminated",
+            "x = [[unterminated",
+            "x = [==[unterminated]]",
+            "local x = 1\n--[[ unterminated\nf()",
             "#!/usr/bin/env lua\nprint(1)",
         ] {
             assert_eq!(fmt(src), src, "broken input must be untouched");
