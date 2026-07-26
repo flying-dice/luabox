@@ -423,13 +423,50 @@ mod tests {
     }
 
     #[test]
-    fn dependency_table_needs_exactly_one_kind() {
-        let src = "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[dependencies]\nbad = { version = \"1.0\" }\n";
+    fn dependency_table_needs_a_source_or_a_version() {
+        // An empty inline table names nothing at all.
+        let src = "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[dependencies]\nbad = {}\n";
         let errors = Manifest::parse(src).unwrap_err();
         assert!(
             errors
                 .iter()
                 .any(|e| e.message.contains("must specify one of"))
+        );
+    }
+
+    #[test]
+    fn version_only_table_is_the_bare_string_form_spelled_longhand() {
+        // #23: `version` is a valid dependency key, so a version-only table
+        // must mean the same thing as `pkg = "1.0"` — not an error that
+        // contradicts the valid-key list.
+        let src = "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[dependencies]\npkg = { version = \"1.0\" }\n";
+        let manifest = Manifest::parse(src).expect("version-only table is valid");
+        assert_eq!(
+            manifest.dependencies.get("pkg"),
+            Some(&Dependency::Version("1.0".to_owned()))
+        );
+    }
+
+    #[test]
+    fn version_only_table_still_rejects_orphan_source_modifiers() {
+        // A git reference or digest without its source stays an error even
+        // when `version` is present — the modifier names the missing source.
+        let git_ref = "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[dependencies]\nbad = { version = \"1.0\", tag = \"v1\" }\n";
+        let errors = Manifest::parse(git_ref).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("git reference key but no `git` source")),
+            "{errors:?}"
+        );
+
+        let digest = "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[dependencies]\nbad = { version = \"1.0\", sha256 = \"abc\" }\n";
+        let errors = Manifest::parse(digest).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("only valid alongside a `url` source")),
+            "{errors:?}"
         );
     }
 

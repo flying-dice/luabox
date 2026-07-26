@@ -80,6 +80,12 @@ so it appears in no version entry.
 
 ### Fixed
 
+- **`pkg = { version = "1.0" }` now parses as the bare-string form spelled
+  longhand** ([#23](https://github.com/flying-dice/luabox/issues/23)). The
+  valid-key list always named `version`, but a version-only table was
+  rejected with "must specify one of `git`, `path`, or `url`" — the two
+  rules disagreed. A lone git reference or `sha256` still errors, now
+  naming the missing source.
 - **`---@source` redirects no longer vanish for a lone statement**
   ([#14](https://github.com/flying-dice/luabox/issues/14)). When the
   annotated statement was the only one in its block — a one-statement file,
