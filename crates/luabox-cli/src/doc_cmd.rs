@@ -26,8 +26,10 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use anyhow::Context;
+use anyhow::{Context, bail};
+use luabox_diag::{Diagnostic, Format, Label, Span};
 use luabox_resolve::manifest::Manifest;
+use luabox_syntax::lua;
 
 use crate::check_cmd;
 use model::DocModel;
@@ -39,12 +41,32 @@ pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
         crate::project::collect_lua_files(&project.root, project.out_dir.as_deref(), true)?;
     let package = manifest_facts(&project.root);
 
+    // A file that does not parse has no trustworthy harvest — its doc
+    // comments may attach to the wrong (recovered) nodes or vanish with the
+    // broken region. Gate on parse errors exactly like `build` does (#24);
+    // type errors deliberately do NOT gate — docs for imperfect code are
+    // still docs.
+    let mut parse_diags = Vec::new();
     let mut modules = Vec::new();
     for path in &lua_files {
         let rel = crate::project::display_rel(path, &project.root);
         let source = fs::read_to_string(path).with_context(|| format!("cannot read `{rel}`"))?;
+        for err in lua::parse(&source, project.dialect).errors() {
+            let range = usize::from(err.range.start())..usize::from(err.range.end());
+            parse_diags.push(
+                Diagnostic::error(check_cmd::code(1), err.message.clone())
+                    .with_label(Label::primary(Span::new(&rel, range), "syntax error here")),
+            );
+        }
         let name = model::module_name(&rel);
         modules.push(model::lua_module(&name, &source, project.dialect));
+    }
+    if !parse_diags.is_empty() {
+        let counts = crate::project::render_diagnostics(&parse_diags, Format::Human, &project.root);
+        bail!(
+            "doc refuses to generate while {} parse error(s) exist",
+            counts.errors
+        );
     }
     harvest_def_modules(&project, &mut modules);
 
@@ -192,6 +214,46 @@ mod tests {
     fn read_doc(root: &Path, page: &str) -> String {
         fs::read_to_string(root.join("doc").join(page))
             .unwrap_or_else(|e| panic!("reading doc/{page}: {e}"))
+    }
+
+    #[test]
+    fn doc_refuses_on_a_parse_error_and_writes_nothing() {
+        // #24: a file that does not parse has no trustworthy harvest — gate
+        // like `build` does instead of generating pages from a broken AST.
+        let tmp = project("broken", "");
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "--[[ never closed\nlocal x = 1\n",
+        );
+
+        let err = run(tmp.path(), false).expect_err("doc must refuse on a parse error");
+        assert!(
+            err.to_string().contains("parse error"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !tmp.path().join("doc").exists(),
+            "no doc/ output on refusal"
+        );
+    }
+
+    #[test]
+    fn doc_still_generates_for_type_errors() {
+        // Type errors deliberately do NOT gate: docs for imperfect code are
+        // still docs. Only the parse gate refuses.
+        let tmp = project("imperfect", "\n[types]\nstrict = true\n");
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "---@param n number\n---@return number\nlocal function double(n)\n    return n * 2\nend\n\nprint(double(\"oops\"))\n",
+        );
+
+        run(tmp.path(), false).expect("type errors must not gate doc");
+        assert!(
+            read_doc(tmp.path(), "index.html").contains("imperfect"),
+            "site generated despite the type error"
+        );
     }
 
     const CIRCLE_SOURCE: &str = "\

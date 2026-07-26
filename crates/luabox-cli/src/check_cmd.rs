@@ -316,7 +316,7 @@ fn finish(
     Ok(())
 }
 
-fn code(number: u16) -> Code {
+pub(crate) fn code(number: u16) -> Code {
     Code::new(number)
 }
 

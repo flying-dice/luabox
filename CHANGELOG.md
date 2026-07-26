@@ -80,6 +80,12 @@ so it appears in no version entry.
 
 ### Fixed
 
+- **`luabox doc` refuses to generate while parse errors exist**
+  ([#24](https://github.com/flying-dice/luabox/issues/24)) — a file that
+  does not parse has no trustworthy harvest, so `doc` now gates on parse
+  errors exactly like `build` does, rendering the `LB0001` diagnostics it
+  refused over. Type errors deliberately do not gate: docs for imperfect
+  code are still docs.
 - **`---@source` redirects no longer vanish for a lone statement**
   ([#14](https://github.com/flying-dice/luabox/issues/14)). When the
   annotated statement was the only one in its block — a one-statement file,

@@ -310,3 +310,31 @@ Feature: luabox doc — static documentation site
     And the file "doc/class.geometry.Shape.html" exists
     And "doc/class.geometry.Shape.html" contains "<h2>Implementors</h2>"
     And "doc/class.geometry.Shape.html" contains 'href="class.geometry.Circle.html"'
+
+  Scenario: doc refuses on a parse error like build does
+    Given a project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      --[[ never closed
+      local x = 1
+      """
+    When I run "luabox doc"
+    Then the command fails
+    And stdout contains "error[LB0001]"
+    And stderr contains "doc refuses to generate"
+
+  Scenario: doc still generates when the only problems are type errors
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@param n number
+      ---@return number
+      local function double(n)
+        return n * 2
+      end
+
+      print(double("oops"))
+      """
+    When I run "luabox doc"
+    Then the command succeeds
+    And the file "doc/index.html" exists
