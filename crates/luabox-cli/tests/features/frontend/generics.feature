@@ -178,3 +178,182 @@ Feature: luabox check — generic annotations
     When I run "luabox check"
     Then the command succeeds
     And stdout contains "warning[LB0313]"
+
+  # --- where the type argument is inferred *from* -------------------------
+
+  Scenario: a type parameter is captured from an array element
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@generic T
+      ---@param items T[]
+      ---@return T
+      local function head(items) end
+
+      ---@param s string
+      local function want(s) end
+
+      want(head({ 1, 2, 3 }))
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0300"
+    And stdout contains "expected `string`, found `integer`"
+
+  Scenario: a type parameter is captured from a table literal's field
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@generic T
+      ---@param box { value: T }
+      ---@return T
+      local function unwrap(box) end
+
+      ---@param s string
+      local function want(s) end
+
+      want(unwrap({ value = 1 }))
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0300"
+    And stdout contains "expected `string`, found `integer`"
+
+  Scenario: a type parameter is captured through a `fun(...)` parameter
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@generic T
+      ---@param f fun(a: T): T
+      ---@param x T
+      ---@return T
+      local function apply(f, x) end
+
+      ---@param s string
+      local function want(s) end
+
+      want(apply(function(n) return n end, 5))
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0300"
+    And stdout contains "expected `string`, found `integer`"
+
+  Scenario: a variadic parameter is bound by the same type argument
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@generic T
+      ---@param first T
+      ---@param ... T
+      ---@return T
+      local function pick(first, ...) end
+
+      pick(1, "x")
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0300"
+    And stdout contains "expected `integer`, found"
+
+  Scenario: a backtick capture turns a string argument into the class it names
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Widget
+      ---@field id number
+
+      ---@generic T
+      ---@param name `T`
+      ---@return T
+      local function new(name) end
+
+      ---@param w Widget
+      local function want(w) end
+
+      want(new("Widget"))
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And zero diagnostics are reported
+
+  Scenario: a backtick capture naming a different class is still a mismatch
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Widget
+      ---@field id number
+      ---@class Gadget
+      ---@field label string
+
+      ---@generic T
+      ---@param name `T`
+      ---@return T
+      local function new(name) end
+
+      ---@param w Widget
+      local function want(w) end
+
+      want(new("Gadget"))
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0300"
+
+  # --- where the type argument is substituted *into* ----------------------
+
+  Scenario: the binding is substituted into a union return
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@generic T
+      ---@param x T
+      ---@return T|nil
+      local function maybe(x) end
+
+      ---@param s string
+      local function want(s) end
+
+      want(maybe(1))
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0300"
+    And stdout contains "expected `string`, found `integer|nil`"
+
+  Scenario: the binding is substituted into a returned function type
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@generic T
+      ---@param x T
+      ---@return fun(): T
+      local function thunk(x) end
+
+      ---@param s string
+      local function want(s) end
+
+      want(thunk(1)())
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0300"
+    And stdout contains "expected `string`, found `integer`"
+
+  Scenario: several type parameters can be declared on one function
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@generic K, V
+      ---@param map { [K]: V }
+      ---@return V
+      local function anyvalue(map) end
+
+      ---@param s string
+      local function want(s) end
+
+      want(anyvalue({ a = 1 }))
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0300"

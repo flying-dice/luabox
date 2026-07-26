@@ -123,3 +123,73 @@ Feature: luabox check — member visibility (#115)
     Then the command succeeds
     And stdout contains "warning[LB0312]"
     And stdout contains "package"
+
+  # --- the assignment declaration form ------------------------------------
+
+  Scenario: `---@private` on a `Carrier.member = function` assignment is wired to the class
+    Given a project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Carrier
+      local Carrier = {}
+      Carrier.__index = Carrier
+
+      ---@private
+      Carrier.secret = function() end
+
+      ---@param c Carrier
+      local function use(c)
+        c.secret()
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stdout contains "LB0312"
+    And stdout contains "cannot access private member `secret` of `Carrier` here"
+
+  Scenario: `---@protected` on the assignment form is wired the same way
+    Given a project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Base
+      local Base = {}
+      Base.__index = Base
+
+      ---@protected
+      Base.helper = function() end
+
+      ---@param b Base
+      local function use(b)
+        b.helper()
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stdout contains "LB0312"
+    And stdout contains "cannot access protected member `helper` of `Base` here"
+
+  Scenario: a multi-target assignment stays unwired rather than guessing a carrier
+    Given a project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class A
+      local A = {}
+      A.__index = A
+      ---@class B
+      local B = {}
+      B.__index = B
+
+      ---@private
+      A.x, B.y = function() end, function() end
+
+      ---@param a A
+      local function use(a)
+        a.x()
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stdout does not contain "LB0312"

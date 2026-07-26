@@ -198,6 +198,11 @@ fn stderr_does_not_contain(world: &mut AcceptanceWorld, needle: String) {
     );
 }
 
+/// Cucumber's `{string}` parameter accepts a `'`-delimited literal as well as
+/// a `"`-delimited one, and keeps backslash escapes verbatim either way — so
+/// an expected message that itself contains `"` (the checker renders string
+/// types and literals with their quotes: ``expected `"on"`, found `"off"` ``)
+/// is written with single quotes rather than escaped double ones.
 #[then(expr = "stdout contains {string}")]
 fn stdout_contains(world: &mut AcceptanceWorld, needle: String) {
     let stdout = world.stdout();
@@ -232,6 +237,23 @@ fn project_with_edition(world: &mut AcceptanceWorld, edition: String) {
 #[given(expr = "a strict project with edition {string}")]
 fn strict_project_with_edition(world: &mut AcceptanceWorld, edition: String) {
     write_manifest(world, &edition, true);
+}
+
+/// A `luabox.toml` built from the smallest valid manifest — `[package]` with
+/// only the required `edition` — plus one caller-supplied line, so the
+/// manifest-validation Examples tables can vary a single key at a time.
+/// `section` names the table the line belongs to; `package` extends the
+/// existing table rather than repeating its header. Captured with a regex so
+/// the line's `"` quotes and TOML braces arrive verbatim.
+#[given(regex = r"^a manifest whose \[([a-z-]+)\] table contains '(.*)'$")]
+fn manifest_section_containing(world: &mut AcceptanceWorld, section: String, line: String) {
+    let manifest = if section == "package" {
+        format!("[package]\nedition = \"5.4\"\n{line}\n")
+    } else {
+        format!("[package]\nedition = \"5.4\"\n\n[{section}]\n{line}\n")
+    };
+    std::fs::write(world.dir.path().join("luabox.toml"), manifest)
+        .expect("failed to write luabox.toml");
 }
 
 /// A one-line Lua source (used by the dialect-legality Examples tables).
@@ -435,6 +457,19 @@ fn emitted_output_contains_no(world: &mut AcceptanceWorld, needle: String) {
             file.display()
         );
     }
+}
+
+/// Counts occurrences in the report rather than asserting mere presence —
+/// the difference between "the lowering warned" and "the lowering warned
+/// once per lowered construct".
+#[then(expr = "stdout contains exactly {int} occurrence of {string}")]
+fn stdout_contains_exactly(world: &mut AcceptanceWorld, count: usize, needle: String) {
+    let stdout = world.stdout();
+    let found = stdout.matches(&needle).count();
+    assert_eq!(
+        found, count,
+        "stdout contains {found} occurrence(s) of `{needle}`, expected {count}; stdout:\n{stdout}"
+    );
 }
 
 #[then(expr = "stdout does not contain {string}")]

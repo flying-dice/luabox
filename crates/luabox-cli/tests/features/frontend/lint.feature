@@ -659,3 +659,192 @@ Feature: luabox lint — type-informed lint rules (clippy analog)
     When I run "luabox lint"
     Then the command succeeds
     And stdout contains "empty-then lint (suspicious); silence with `---@luabox-ignore empty-then <reason>`"
+
+  # --- --fix mechanics ----------------------------------------------------
+
+  Scenario: --fix applies every machine-applicable fix in one run
+    Given a file "src/main.lua" containing:
+      """
+      local unused_one = 1
+      local unused_two = 2
+      return 0
+      """
+    When I run "luabox lint --fix"
+    Then the command succeeds
+    And "src/main.lua" equals:
+      """
+      local _unused_one = 1
+      local _unused_two = 2
+      return 0
+      """
+    And stderr contains "(1 fixed)"
+
+  Scenario: --fix never rewrites a file that does not parse
+    Given a file "src/broken.lua" containing:
+      """
+      local t = { 1, 2
+      """
+    When I run "luabox lint --fix"
+    Then the command fails
+    And stdout contains "LB0001"
+    And "src/broken.lua" equals:
+      """
+      local t = { 1, 2
+      """
+    And stderr contains "(0 fixed)"
+
+  Scenario: --fix reports nothing fixed when every finding is advisory
+    Given a file "src/main.lua" containing:
+      """
+      local parts = ""
+      for i = 1, 10 do
+        parts = parts .. i
+      end
+      return parts
+      """
+    When I run "luabox lint --fix"
+    Then the command succeeds
+    And stderr contains "(0 fixed)"
+
+  Scenario: --fix converges — a second run has nothing left to do
+    Given a file "src/main.lua" containing:
+      """
+      local unused_one = 1
+      return 0
+      """
+    And I run "luabox lint --fix"
+    When I run "luabox lint --fix"
+    Then the command succeeds
+    And stderr contains "(0 fixed)"
+    And "src/main.lua" equals:
+      """
+      local _unused_one = 1
+      return 0
+      """
+
+  # --- the known-globals baseline -----------------------------------------
+
+  Scenario: a test file may use the busted-style harness globals
+    Given a file "tests/spec.lua" containing:
+      """
+      describe("a thing", function()
+        it("works", function() end)
+      end)
+      return 0
+      """
+    When I run "luabox lint"
+    Then the command succeeds
+    And stdout does not contain "LB0509"
+
+  Scenario Outline: the test-file conventions all widen the globals baseline
+    Given a file "<path>" containing:
+      """
+      before_each(function() end)
+      after_each(function() end)
+      test("x", function() end)
+      return 0
+      """
+    When I run "luabox lint"
+    Then the command succeeds
+    And stdout does not contain "LB0509"
+
+    Examples: SPEC.md §11 test-file shapes
+      | path                    |
+      | tests/spec.lua          |
+      | src/tests/deep/spec.lua |
+      | src/thing_test.lua      |
+      | src/thing.test.lua      |
+
+  Scenario: an ordinary source file gets no such exemption
+    Given a file "src/notatest.lua" containing:
+      """
+      describe("a thing", function() end)
+      return 0
+      """
+    When I run "luabox lint"
+    Then the command succeeds
+    And stdout contains "LB0509"
+    And stdout contains "read of undefined global `describe`"
+
+  Scenario: a global declared by a `[types] defs` package is known to lint
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      defs = ["mylib"]
+      """
+    And a file "defs/mylib.d.lua" containing:
+      """
+      ---@meta
+
+      ---@type fun(name: string)
+      ambient_helper = nil
+      """
+    And a file "src/main.lua" containing:
+      """
+      ambient_helper("x")
+      return 0
+      """
+    When I run "luabox lint"
+    Then the command succeeds
+    And stdout does not contain "LB0509"
+
+  Scenario: a defs package may be a directory of `.d.lua` files
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      defs = ["mylib"]
+      """
+    And a file "defs/mylib/one.d.lua" containing:
+      """
+      ---@meta
+
+      ---@type fun()
+      helper_one = nil
+      """
+    And a file "defs/mylib/nested/two.d.lua" containing:
+      """
+      ---@meta
+
+      ---@type fun()
+      helper_two = nil
+      """
+    And a file "src/main.lua" containing:
+      """
+      helper_one()
+      helper_two()
+      return 0
+      """
+    When I run "luabox lint"
+    Then the command succeeds
+    And stdout does not contain "LB0509"
+
+  Scenario: a defs package that cannot be resolved falls back to the stdlib baseline
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      defs = ["missing-package"]
+      """
+    And a file "src/main.lua" containing:
+      """
+      print(pairs)
+      undeclared_thing()
+      return 0
+      """
+    When I run "luabox lint"
+    Then the command succeeds
+    And stdout contains "read of undefined global `undeclared_thing`"

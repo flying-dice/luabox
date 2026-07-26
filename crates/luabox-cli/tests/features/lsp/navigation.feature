@@ -136,3 +136,232 @@ Feature: luabox lsp — goto definition, type definition, and implementation
     And the document "base.lua" is open
     When I request implementations at 0:10 in "base.lua"
     Then the reply is an empty list
+
+  Scenario: definition on a declaration answers with itself
+    Given a file "main.lua" containing:
+      """
+      local value = 1
+      print(value)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request the definition at 0:6 in "main.lua"
+    Then the location is in "main.lua"
+    And the location starts at 0:6
+
+  Scenario: definition on a position that names nothing answers null
+    Given a file "main.lua" containing:
+      """
+      local value = 1
+      print(value)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request the definition at 0:12 in "main.lua"
+    Then the reply is null
+
+  Scenario: definition on a class field jumps to its field annotation
+    Given a file "main.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+
+      ---@type Point
+      local p = nil
+      print(p.x)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request the definition at 5:8 in "main.lua"
+    Then the location is in "main.lua"
+    And the location starts on line 1
+
+  Scenario: definition on a method jumps to the field that declares it
+    Given a file "main.lua" containing:
+      """
+      ---@class Greeter
+      ---@field greet fun(self: Greeter): string
+
+      ---@type Greeter
+      local g = nil
+      g:greet()
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request the definition at 5:3 in "main.lua"
+    Then the location starts on line 1
+
+  Scenario: definition on a dotted function jumps to its declaration
+    Given a file "main.lua" containing:
+      """
+      local M = {}
+      function M.helper() return 1 end
+      M.helper()
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request the definition at 2:3 in "main.lua"
+    Then the location starts on line 1
+
+  Scenario: definition on a global function use jumps to its declaration
+    Given a file "main.lua" containing:
+      """
+      function greet() return 1 end
+      greet()
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request the definition at 1:0 in "main.lua"
+    Then the location starts on line 0
+
+  Scenario: a require resolves through the src directory
+    Given a file "src/util/text.lua" containing:
+      """
+      return {}
+      """
+    And a file "main.lua" containing:
+      """
+      local t = require("util.text")
+      return t
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request the definition at 0:22 in "main.lua"
+    Then the location is in "src/util/text.lua"
+
+  Scenario: a require nothing resolves has no definition
+    Given a file "main.lua" containing:
+      """
+      local missing = require("nope.not_here")
+      return missing
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request the definition at 0:28 in "main.lua"
+    Then the reply is null
+
+  Scenario: a ---@source with no line defaults to the top of the file
+    Given a file "main.lua" containing:
+      """
+      ---@source native/impl.c
+      local function f() end
+      return f
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request the definition at 1:15 in "main.lua"
+    Then the location is in "native/impl.c"
+    And the location spans 0:0 to 0:0
+
+  Scenario: a ---@source line and column both land on the redirect target
+    Given a file "main.lua" containing:
+      """
+      ---@source native/impl.c:12:4
+      local function f() end
+      return f
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request the definition at 1:15 in "main.lua"
+    Then the location is in "native/impl.c"
+    And the location spans 11:4 to 11:4
+
+  Scenario: a ---@source naming a URI is used verbatim
+    Given a file "main.lua" containing:
+      """
+      ---@source https://example.com/lib.lua:3
+      local function f() end
+      return f
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request the definition at 1:15 in "main.lua"
+    Then the location URI is "https://example.com/lib.lua"
+    And the location spans 2:0 to 2:0
+
+  Scenario: type definition follows self to the class its method is declared on
+    Given a file "main.lua" containing:
+      """
+      ---@class G
+      ---@field name string
+
+      local G = {}
+      function G:greet() return self end
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request the type definition at 4:26 in "main.lua"
+    Then the location is in "main.lua"
+    And the location starts on line 0
+
+  Scenario: type definition follows an inferred return type to its class
+    Given a file "main.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+
+      ---@return Point
+      local function make() return nil end
+      local p = make()
+      print(p)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request the type definition at 6:6 in "main.lua"
+    Then the location starts on line 0
+
+  Scenario: type definition jumps from an enum-typed local to the enum
+    Given a file "main.lua" containing:
+      """
+      ---@enum Color
+      local Color = { red = 1 }
+
+      ---@type Color
+      local c = nil
+      print(c)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request the type definition at 5:6 in "main.lua"
+    Then the location starts on line 0
+
+  Scenario: an optional annotation still names the class it wraps
+    Given a file "main.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+
+      ---@type Point?
+      local p = nil
+      print(p)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request the type definition at 5:6 in "main.lua"
+    Then the location starts on line 0
+
+  Scenario: a union names no single type, so there is nowhere to jump
+    Given a file "main.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+
+      ---@type Point|string
+      local p = nil
+      print(p)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request the type definition at 5:6 in "main.lua"
+    Then the reply is null
+
+  Scenario: an unannotated primitive local has no type to jump to
+    Given a file "main.lua" containing:
+      """
+      local n = 1
+      print(n)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request the type definition at 1:6 in "main.lua"
+    Then the reply is null

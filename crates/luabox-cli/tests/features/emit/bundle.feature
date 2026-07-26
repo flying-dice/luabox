@@ -208,3 +208,88 @@ Feature: luabox build — single-file require-graph bundling
     When I run "luabox build --bundle"
     Then the command fails
     And stderr contains "src/main.lua"
+
+  # --- minification (minify) ----------------------------------------------
+
+  Scenario: minification renames locals in declaration order and strips comments
+    Given a project with edition "5.1" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      -- a comment nobody needs at runtime
+      local greeting_text = "hi"
+      local answer_value = 42 -- trailing
+      print(greeting_text, answer_value)
+      """
+    When I run "luabox build --bundle --minify --entry src/main.lua"
+    Then the command succeeds
+    And "dist/main.lua" equals:
+      """
+      -- bundled by luabox (5.1 -> 5.1)
+      local a="hi"local b=42 print(a,b)
+      """
+
+  Scenario: each nested function scope restarts the rename alphabet it can reuse
+    Given a project with edition "5.1" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      local function outer_function(parameter_one)
+        local function inner_function(parameter_two)
+          return parameter_one + parameter_two
+        end
+        return inner_function(1)
+      end
+      print(outer_function(2))
+      """
+    When I run "luabox build --bundle --minify --entry src/main.lua"
+    Then the command succeeds
+    And "dist/main.lua" contains "local function a(b)local function c(d)return b+d end return c(1)end"
+
+  Scenario: the rename alphabet carries into two-character names when it runs out
+    Given a project with edition "5.1" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      local a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14 = 1,2,3,4,5,6,7,8,9,10,11,12,13,14
+      local a15,a16,a17,a18,a19,a20,a21,a22,a23,a24,a25,a26,a27,a28 = 15,16,17,18,19,20,21,22,23,24,25,26,27,28
+      print(a28)
+      """
+    When I run "luabox build --bundle --minify --entry src/main.lua"
+    Then the command succeeds
+    And "dist/main.lua" contains "a0,b0"
+    And "dist/main.lua" contains "print(b0)"
+
+  Scenario: globals and library members are never renamed
+    Given a project with edition "5.1" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      local local_name = 1
+      global_name = 2
+      print(local_name, global_name, string.format("%d", 1))
+      """
+    When I run "luabox build --bundle --minify --entry src/main.lua"
+    Then the command succeeds
+    And "dist/main.lua" contains "global_name=2"
+    And "dist/main.lua" contains "string.format"
+    And "dist/main.lua" does not contain "local_name"
+
+  Scenario: minification is on by default when the manifest asks for it
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.1"
+
+      [build]
+      target = "5.1"
+      bundle = true
+      minify = true
+      """
+    And a file "src/main.lua" containing:
+      """
+      local descriptive_name = 1
+      print(descriptive_name)
+      """
+    When I run "luabox build"
+    Then the command succeeds
+    And stdout contains "minified"
+    And "dist/main.lua" does not contain "descriptive_name"

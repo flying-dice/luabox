@@ -204,3 +204,27 @@ Feature: luabox build — target lowering emit (tree mode)
     Then the command succeeds
     And the file "dist/src/main.lua" exists
     And the file "dist/src/main.lua.map" does not exist
+
+  Scenario: a project without a manifest builds on the defaults
+    Given an empty directory
+    And a file "src/main.lua" containing:
+      """
+      local x = 1
+      print(x)
+      """
+    When I run "luabox build"
+    Then the command succeeds
+    And stdout contains "(5.4 -> 5.4)"
+    And the file "dist/src/main.lua" exists
+
+  Scenario: --target still overrides the defaults when there is no manifest
+    Given an empty directory
+    And a file "src/main.lua" containing:
+      """
+      local x = 1 // 2
+      print(x)
+      """
+    When I run "luabox build --target 5.1"
+    Then the command succeeds
+    And stdout contains "(5.4 -> 5.1)"
+    And "dist/src/main.lua" contains "math.floor"

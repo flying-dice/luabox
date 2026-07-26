@@ -295,3 +295,71 @@ Feature: stdlib definition packages — `---@meta` `.d.lua` ambient types
     When I run "luabox check"
     Then the command fails
     And stdout contains "cannot resolve definition package `nonexistent`"
+
+  Scenario: a defs package may be a directory of `*.d.lua` files, nested included
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      defs = ["mylib"]
+      """
+    And a file "defs/mylib/one.d.lua" containing:
+      """
+      ---@meta
+
+      ---@class Ambient
+      ---@field n number
+      """
+    And a file "defs/mylib/nested/two.d.lua" containing:
+      """
+      ---@meta
+
+      ---@class Other
+      ---@field s string
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@type Ambient
+      local a = { n = 1 }
+      ---@type Other
+      local b = { s = "ok" }
+      return a, b
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And zero diagnostics are reported
+
+  Scenario: a class from a nested defs file is enforced like any other
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      defs = ["mylib"]
+      """
+    And a file "defs/mylib/nested/two.d.lua" containing:
+      """
+      ---@meta
+
+      ---@class Other
+      ---@field s string
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@type Other
+      local b = { s = 2 }
+      return b
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0300"
+    And stdout contains "expected `string`, found `2`"
