@@ -28,6 +28,14 @@ def main() -> int:
         return 2
     lcov_path, floor = sys.argv[1], float(sys.argv[2])
 
+    # Checked before scandir: scandir on a missing dir raises before any
+    # emptiness guard could run, so the friendly message would be dead code.
+    if not os.path.isdir("crates"):
+        print(
+            "no crates/ directory here — run from the repo root",
+            file=sys.stderr,
+        )
+        return 2
     expected = sorted(
         entry.name
         for entry in os.scandir("crates")
@@ -59,8 +67,11 @@ def main() -> int:
 
     failed = []
     for name in expected:
-        if found[name] == 0:
-            state = "0 measured lines" if name in found else "MISSING from tracefile"
+        # Membership BEFORE the defaultdict lookup: found[name] would insert
+        # the key and make the "MISSING" diagnostic unreachable.
+        measured = name in found
+        if found.get(name, 0) == 0:
+            state = "0 measured lines" if measured else "MISSING from tracefile"
             print(f"{name:<20}    --      ({state})  <-- UNMEASURED")
             failed.append(name)
             continue
