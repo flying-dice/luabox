@@ -35,6 +35,18 @@ Feature: luabox lsp — goto definition, type definition, and implementation
     When I request the definition at 0:22 in "main.lua"
     Then the location is in "util/helpers.lua"
 
+  Scenario: definition follows a ---@source redirect on a file's only statement
+    Given a file "main.lua" containing:
+      """
+      ---@source native/impl.c:12
+      local function f() end
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request the definition at 1:15 in "main.lua"
+    Then the location is in "native/impl.c"
+    And the location starts at 11:0
+
   Scenario: type definition jumps from a typed local to its class
     Given a file "main.lua" containing:
       """

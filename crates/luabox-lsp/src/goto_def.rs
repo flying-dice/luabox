@@ -409,6 +409,16 @@ M.helper(1)
     }
 
     #[test]
+    fn a_source_redirect_survives_being_the_only_statement_in_the_file() {
+        // The annotated statement shares its text range with the enclosing
+        // `BLOCK`; goto-def on the declaration must still redirect.
+        let src = "---@source impl.c\nlocal function f() end\n";
+        let location = at(src, "f() end", 0).expect("definition");
+        assert!(location.uri.as_str().ends_with("/impl.c"), "{location:?}");
+        assert_eq!(start_of(&location), (0, 0));
+    }
+
+    #[test]
     fn a_require_string_jumps_to_the_start_of_the_module_file() {
         // Nothing exists on disk under the fake root, so resolution declines.
         assert!(at("local m = require(\"other\")\n", "other", 0).is_none());

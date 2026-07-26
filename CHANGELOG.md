@@ -73,6 +73,13 @@ so it appears in no version entry.
 
 ### Fixed
 
+- **`---@source` redirects no longer vanish for a lone statement**
+  ([#14](https://github.com/flying-dice/luabox/issues/14)). When the
+  annotated statement was the only one in its block — a one-statement file,
+  function body, or `do … end` — the enclosing block node shared its text
+  range and was matched first, so goto-definition silently jumped to the
+  local declaration instead of the annotated location. The target is now
+  resolved to the *statement* at that range.
 - **`lua_modules/` is no longer walked as project source.** `check`, `lint`,
   `fmt` and `build` skip any directory named `lua_modules`, at every depth,
   the same way they skip dot-directories and the build output directory. A
