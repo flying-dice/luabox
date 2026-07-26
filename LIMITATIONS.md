@@ -1,6 +1,6 @@
-# Known limitations (0.1)
+# Known limitations (0.2)
 
-luabox 0.1 checks stock LuaCATS more strictly than lua-language-server, but it
+luabox 0.2 checks stock LuaCATS more strictly than lua-language-server, but it
 is early software. This page lists the gaps a real user is likely to hit in the
 first week — each one verified against the shipping binary — so nothing here is
 a surprise. It is deliberately short: small parser trivia is left out so the
@@ -132,13 +132,14 @@ one.
 
 ## Tooling
 
-### Dependency management and execution are non-goals, not gaps (#10, #11)
+### Dependency management and execution are non-goals, not gaps
 
 luabox neither manages dependencies nor runs Lua. There is no resolver, no
 lockfile, no registry client, no publish or sign-in path, and no managed
 interpreter — those are **deliberate v1 non-goals**, not gaps waiting to be
 filled, and nothing here is planned for a later 0.x. The decision record is
-in [DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26).
+in [DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26)
+(flying-dice/luabox#10, #11).
 
 In practice: you materialize a rock tree yourself and luabox reads it.
 

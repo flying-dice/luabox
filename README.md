@@ -256,7 +256,9 @@ fixture projects — the executable spec (SPEC.md §16.2).
 
 ## Status
 
-**0.1.0** — released 2026-07-14, the full command surface works end to end.
+**0.2.0** — unreleased; the v1 scope cut (see
+[DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26)). Last
+released: 0.1.4 (2026-07-14). The kept command surface works end to end.
 Alpha quality: the executable spec drives the real binary through cucumber
 scenarios, perf gates block CI, and lowering is verified by differential
 execution against real runtimes in CI. Prebuilt binaries are attached to each

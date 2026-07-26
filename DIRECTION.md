@@ -78,3 +78,87 @@ fields untyped, **[#106]** call return not propagated to unannotated locals.
 - A second type file format.
 - New keywords before launch.
 - Nominal/`.luab`-style structural declarations as the authoring surface.
+
+---
+
+# v1 scope cut (accepted 2026-07-26)
+
+Status: **accepted** (2026-07-26), owner decision. Scopes down — but does
+not reverse — the "luarocks.org is the registry" pivot (#2). Tracked as
+flying-dice/luabox#10 (dependency management), #11 (`run`/`toolchain`), #12
+(docs) and #13 (gates); the evidence is the quality baseline in
+[PRODUCTION-READINESS.md](PRODUCTION-READINESS.md).
+
+## North star
+
+**luabox consumes a rock tree; it does not produce one — and it never spawns
+an interpreter.**
+
+v1 is a purely static toolchain: parse, typecheck, lint, format, lower,
+bundle, document, and serve LSP. Everything that reaches the network, holds
+a credential, or starts a process is out.
+
+## What this cuts
+
+- **[#10] dependency management** — `add`/`remove`/`install`/`update`/
+  `vendor`, `search`/`outdated`, `publish`, `login`/`logout`/`whoami`, and
+  behind them the PubGrub solver, the git/url/http/luarocks providers,
+  `luabox.lock`, the rockspec editor, the GitHub device flow, the OS
+  keychain, and the whole `luabox-store` CAS crate.
+- **[#11] execution** — `run` and `toolchain` (interpreter *and* luarocks
+  provisioning). luabox acquires nothing and spawns nothing; the earlier
+  "nvm/rustup for Lua" framing is withdrawn with them.
+
+## Why
+
+The entanglement was favorable — there was a clean amputation line, and the
+core never crossed it. `luabox-lint`, `luabox-lsp` and the frontend commands
+consume only the `luabox.toml` manifest model plus a *materialized*
+`lua_modules/` tree; they never touched the solver, the providers, the
+store, or the luarocks bridge.
+
+The numbers said which side was ready. The core — parser, formatter, linter,
+checker, LSP — sits at **92–95% line coverage**, clean under pedantic clippy,
+driven by a spec-first acceptance suite. The dependency layer was ~17% of
+the workspace carrying the *worst* coverage in it (`deps_cmd` 68.6%,
+`outdated_cmd` 60.1%, `keychain.rs` 40.6%, the providers 71–78%), the entire
+credential surface, and all of the live-network coupling — including the
+suite's only scenario that could fail for environmental rather than product
+reasons. Finishing it competed directly with nailing the core.
+
+Deleting beats hiding. A feature flag or a hidden-command quarantine would
+have kept every cost the cut exists to shed — build/test/clippy time, the
+credential surface, the drag on every refactor that touches shared types —
+while only appearing to shed them. Git history makes deletion as reversible
+as a flag in practice; this repo has done exactly that before (the `.luab`
+subsystem, #109).
+
+## What the seam keeps
+
+Cross-package types are not collateral damage. What survives is the *read*
+side:
+
+- the `luabox.toml` manifest model (`[package]`, `[lints]`, build config),
+  used by every frontend command — `luabox-resolve` slims to
+  manifest/project/dialect;
+- the **`lua_modules/` read path**, so `require` resolution and
+  cross-package type checking keep working over a tree the user materializes
+  themselves: `luarocks install --tree lua_modules <rock>`, then `luabox
+  check`.
+
+Users keep the whole ecosystem; luabox stops being the thing that fetches
+it.
+
+## What still stands
+
+The **luarocks.org-as-registry direction (#2) is unchanged** — only its
+*scope* is parked. If dependency management returns after v1 it returns on
+luarocks.org, with the rockspec as the package manifest, never on a
+first-party registry. Registry UX (#137 and neighbours) is post-v1 by the
+same token.
+
+## Non-goals (v1)
+
+- Resolving, installing, vendoring, or publishing packages.
+- Credential storage, sign-in flows, and authenticated requests.
+- Acquiring, pinning, or spawning a Lua interpreter (or a luarocks).
