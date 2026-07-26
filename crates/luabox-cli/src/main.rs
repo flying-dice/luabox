@@ -23,6 +23,10 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "luabox",
+    // Pin the usage-line name: without this clap derives it from argv[0],
+    // which renders as `luabox.exe` on Windows and splits help output (and
+    // everything asserting on it) across platforms.
+    bin_name = "luabox",
     version,
     about = "Unified static Lua toolchain: typechecker, linter, formatter, bundler, LSP. \
              Consumes a `lua_modules/` rock tree — it never fetches one, and never runs Lua."

@@ -77,9 +77,12 @@ Feature: Project scaffolding — luabox init / luabox new
 
   Scenario: a name with no alphanumerics yields no package name
     Given an empty directory
-    When I run "luabox new ..."
+    # `@@@` and not `...`: Win32 path rules strip trailing dots from path
+    # components, so a `...` directory name never reaches name derivation
+    # on Windows.
+    When I run "luabox new @@@"
     Then the command fails
-    And stderr contains "cannot derive a package name from directory `...`"
+    And stderr contains "cannot derive a package name from directory `@@@`"
 
   Scenario: a library scaffold turns dashes into a Lua identifier
     Given an empty directory
