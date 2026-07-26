@@ -168,6 +168,11 @@ pub fn decode_string(text: &str) -> LitStr {
 ///
 /// Long strings have no escapes; a single leading newline directly after the
 /// opening bracket is dropped (Lua rule).
+///
+/// The closer must actually be there, at the matching level: an unterminated
+/// literal is undecodable (`None`), like an unterminated short string. Taking
+/// the last `2 + level` bytes on faith would silently truncate content the
+/// closing bracket never covered.
 fn decode_long_string(bytes: &[u8]) -> Option<Vec<u8>> {
     // Opening: `[` `=`* `[`.
     let mut level = 0;
@@ -179,10 +184,11 @@ fn decode_long_string(bytes: &[u8]) -> Option<Vec<u8>> {
     }
     let open = 2 + level;
     let close = open;
-    if bytes.len() < open + close {
+    let content_end = bytes.len().checked_sub(close)?;
+    if content_end < open || !closes_at_level(&bytes[content_end..], level) {
         return None;
     }
-    let mut content = &bytes[open..bytes.len() - close];
+    let mut content = &bytes[open..content_end];
     // Drop one leading newline (`\n`, `\r`, `\r\n`, or `\n\r`).
     if let Some((&first, rest)) = content.split_first()
         && (first == b'\n' || first == b'\r')
@@ -195,6 +201,16 @@ fn decode_long_string(bytes: &[u8]) -> Option<Vec<u8>> {
         };
     }
     Some(content.to_vec())
+}
+
+/// Whether `tail` is exactly `]` `=`×`level` `]`.
+fn closes_at_level(tail: &[u8], level: usize) -> bool {
+    tail.len() == 2 + level
+        && tail.first() == Some(&b']')
+        && tail.last() == Some(&b']')
+        && tail
+            .get(1..1 + level)
+            .is_some_and(|eqs| eqs.iter().all(|&b| b == b'='))
 }
 
 /// Decode a short-string body, resolving escapes. Returns `None` on any escape
@@ -453,6 +469,25 @@ mod tests {
         // Opener present but the text is too short to also hold the closer.
         assert_eq!(decode_string("[[").value, None);
         assert_eq!(decode_string("[==[").value, None);
+    }
+
+    #[test]
+    fn unterminated_long_string_is_undecodable_not_truncated() {
+        // The closer has to be there: taking the last `2 + level` bytes on
+        // faith would decode `[[unterminated` as "unterminat".
+        assert_eq!(decode_string("[[unterminated").value, None);
+        assert_eq!(decode_string("[[abc").value, None);
+        assert_eq!(decode_string("[[]").value, None);
+        // Wrong level, and a lone bracket, do not close it either.
+        assert_eq!(decode_string("[==[abc]]").value, None);
+        assert_eq!(decode_string("[==[abc]=]").value, None);
+        assert_eq!(decode_string("[[abc]").value, None);
+        // The matching closer decodes as before.
+        assert_eq!(decode_string("[[abc]]").as_str(), Some("abc"));
+        assert_eq!(decode_string("[==[abc]==]").as_str(), Some("abc"));
+        // A closer that overlaps the opener is not a closer.
+        assert_eq!(decode_string("[=[]=]").as_str(), Some(""));
+        assert_eq!(decode_string("[=[]").value, None);
     }
 
     #[test]

@@ -82,7 +82,7 @@ fn block(p: &mut Parser, top_level: bool) {
             if !top_level {
                 break;
             }
-            p.error_and_bump(format!("unexpected '{}'", p.current_text()));
+            p.error_and_bump(p.unexpected_message());
             continue;
         }
         if kind == SEMICOLON {
@@ -143,7 +143,7 @@ fn statement_inner(p: &mut Parser) -> bool {
 /// Unparseable statement start: swallow tokens into an `ERROR_NODE` until a
 /// statement can start again or the enclosing block can close.
 fn recover_stmt(p: &mut Parser) {
-    p.error(format!("unexpected '{}'", p.current_text()));
+    p.error(p.unexpected_message());
     p.start_node(ERROR_NODE);
     while let Some(kind) = p.current() {
         if can_start_stmt(kind) || is_block_end(kind) {
@@ -390,7 +390,7 @@ fn expr_stmt(p: &mut Parser) {
         p.start_node_at(checkpoint, EXPR_LIST);
         while p.eat(COMMA) {
             if expr_bp(p, 0).is_none() {
-                p.error("expected expression");
+                p.expected_expression();
                 break;
             }
         }
@@ -413,7 +413,7 @@ fn expr_list(p: &mut Parser) {
     p.start_node(EXPR_LIST);
     loop {
         if expr_bp(p, 0).is_none() {
-            p.error("expected expression");
+            p.expected_expression();
             break;
         }
         if !p.eat(COMMA) {
@@ -426,7 +426,7 @@ fn expr_list(p: &mut Parser) {
 /// Required expression; reports when none can start here.
 fn expr(p: &mut Parser) {
     if expr_bp(p, 0).is_none() {
-        p.error("expected expression");
+        p.expected_expression();
     }
 }
 
@@ -478,7 +478,7 @@ fn expr_bp_inner(p: &mut Parser, limit: u8) -> Option<SyntaxKind> {
         p.start_node(PREFIX_EXPR);
         p.bump();
         if expr_bp(p, UNARY_POWER).is_none() {
-            p.error("expected expression");
+            p.expected_expression();
         }
         p.finish_node();
         PREFIX_EXPR
@@ -503,7 +503,7 @@ fn expr_bp_inner(p: &mut Parser, limit: u8) -> Option<SyntaxKind> {
         }
         p.bump(); // the operator
         if expr_bp(p, right).is_none() {
-            p.error("expected expression");
+            p.expected_expression();
         }
         if wrap {
             p.finish_node();
@@ -685,7 +685,7 @@ fn table_expr(p: &mut Parser) {
                 p.error("expected '}'");
                 break;
             }
-            Some(_) => p.error_and_bump(format!("unexpected '{}'", p.current_text())),
+            Some(_) => p.error_and_bump(p.unexpected_message()),
         }
     }
     p.finish_node();
