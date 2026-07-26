@@ -821,7 +821,7 @@ impl Server {
         let path = uri_to_path(uri)?;
         let sema = self.sema(&path)?;
         let offset = sema.index.offset(position);
-        goto_def::goto_definition(&sema, offset, &self.root)
+        goto_def::goto_definition(&sema, offset, &self.root, self.dialect)
     }
 
     /// The declaration of the type carried by the value at `position`: its

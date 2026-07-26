@@ -118,34 +118,17 @@ fn discover(cwd: &Path) -> anyhow::Result<Project> {
     })
 }
 
-/// All `*.lua` files under the project root, deterministic order,
-/// skipping dot-directories and the build output directory.
+/// All `*.lua` files under the project root, deterministic order, skipping
+/// dot-directories, the build output directory, and vendored `lua_modules/`
+/// trees.
+///
+/// This is [`crate::project::collect_lua_files`] with `exclude_d_lua` off:
+/// `fmt` formats `*.d.lua` definition files too, unlike `check`/`build`/`doc`,
+/// which never treat them as project source. `fmt` had its own copy of the
+/// walk until the copy and the shared one disagreed about `lua_modules/` —
+/// one skip list, so they cannot drift apart again.
 fn collect_source_files(project: &Project) -> anyhow::Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    walk(&project.root, project, &mut files)?;
-    Ok(files)
-}
-
-fn walk(dir: &Path, project: &Project, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
-    let mut entries: Vec<_> = fs::read_dir(dir)
-        .with_context(|| format!("cannot read directory `{}`", dir.display()))?
-        .collect::<Result<_, _>>()
-        .with_context(|| format!("cannot read directory `{}`", dir.display()))?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        let path = entry.path();
-        let name = entry.file_name();
-        let hidden = name.to_string_lossy().starts_with('.');
-        if path.is_dir() {
-            let is_out = project.out_dir.as_deref() == Some(path.as_path());
-            if !hidden && !is_out {
-                walk(&path, project, files)?;
-            }
-        } else if !hidden && path.extension().and_then(|e| e.to_str()) == Some("lua") {
-            files.push(path);
-        }
-    }
-    Ok(())
+    crate::project::collect_lua_files(&project.root, project.out_dir.as_deref(), false)
 }
 
 #[cfg(test)]

@@ -119,10 +119,17 @@ defs = ["love2d"]           # ambient definition packages
 pedantic = "warn"           # tier/rule levels: allow | warn | deny
 ```
 
-- Every table above is live in v1. `[dependencies]`/`[dev-dependencies]`,
-  `[tasks]` and `[workspace]` still *parse* (the model retains them) but
-  nothing consumes them — no resolution, no task running, no workspace
-  fan-out. Treat them as inert.
+- Every table above is live in v1. `[tasks]` and `[workspace]` still *parse*
+  (the model retains them) but nothing consumes them — no task running, no
+  workspace fan-out. Treat those two as inert.
+- `[dependencies]`/`[dev-dependencies]` also parse without driving any
+  resolution — there is no solver, no lockfile, no download (§6). They are
+  *not* inert, though: each entry names a package whose
+  `lua_modules/<name>/luabox.toml` is read for its `[types] defs`, and those
+  definition files join this project's ambient scope (§3, the luals
+  `workspace.library` model). `require` resolution (§7) does not consult the
+  table at all — it searches `lua_modules/` by path, so a rock is requirable
+  and bundlable whether or not it is listed here.
 - **Lockfile:** `luabox.lock` — content-addressed, hashes every artifact,
   deterministic, text-based. [Parked post-v1 with the solver (§6) — a
   `luabox.lock` left in a project is ignored.]

@@ -121,7 +121,8 @@ jobs:
 
   # Every example project under examples/ must pass check + fmt --check + lint
   # cleanly against the real binary, plus its per-example extras (build,
-  # bundle, .love packaging). See scripts/examples.sh.
+  # bundle, .love packaging) and executing the built bundle on lua5.1. See
+  # scripts/examples.sh.
   examples:
     runs-on: ubuntu-latest
     steps:
@@ -133,7 +134,12 @@ jobs:
         with:
           key: examples
       - run: cargo build --release --bin luabox
-      # `unzip` inspects the .love archive; luabox itself never runs Lua.
-      - name: Install unzip
-        run: sudo apt-get update && sudo apt-get install -y unzip
+      # `unzip` inspects the .love archive. `lua5.1` executes the timemachine
+      # bundle the script just built (a 5.4 source lowered to minified 5.1):
+      # CI executes the compiler's output to verify it, because a compiler
+      # whose emit is never run is only checked against its own opinion of it.
+      # The product itself still never runs Lua — the interpreter belongs to
+      # this harness, and the script SKIPs the run step when it is absent.
+      - name: Install unzip and lua5.1
+        run: sudo apt-get update && sudo apt-get install -y unzip lua5.1
       - run: bash scripts/examples.sh

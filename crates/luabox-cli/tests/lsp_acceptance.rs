@@ -1655,11 +1655,16 @@ fn no_inlay_hint_at(world: &mut LspWorld, line: u32, character: u32) {
 async fn main() {
     // Mirrors `acceptance.rs`: `@wip` gates feature files written ahead of
     // the behaviour they describe (SPEC.md §16.2).
-    LspWorld::filter_run("tests/features/lsp", |feature, _rule, scenario| {
-        let tagged = |tag: &str| {
-            feature.tags.iter().any(|t| t == tag) || scenario.tags.iter().any(|t| t == tag)
-        };
-        !tagged("wip")
-    })
-    .await;
+    // `fail_on_skipped`: an undefined or ambiguous step is a *failure*,
+    // not a quiet skip. Without it a feature file could describe behaviour
+    // no step definition implements and the suite would still go green.
+    LspWorld::cucumber()
+        .fail_on_skipped()
+        .filter_run_and_exit("tests/features/lsp", |feature, _rule, scenario| {
+            let tagged = |tag: &str| {
+                feature.tags.iter().any(|t| t == tag) || scenario.tags.iter().any(|t| t == tag)
+            };
+            !tagged("wip")
+        })
+        .await;
 }

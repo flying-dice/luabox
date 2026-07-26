@@ -52,9 +52,14 @@ server behind it is tested in `luabox-lsp`.)
 Already present and blocking: fmt/clippy/test on three OSes, perf gates,
 an examples gate driving the real binary, differential execution against
 real interpreters, weekly parser fuzzing, and a smoke-gated release
-pipeline. Added by this assessment: a **line-coverage floor of 85%** in
-CI (`cargo-llvm-cov`, lcov artifact uploaded per run). Raise the floor
-as coverage rises; never lower it to make a PR pass.
+pipeline. Added by this assessment: line-coverage floors in CI
+(`cargo-llvm-cov`, an lcov artifact uploaded per run). A single 85% floor
+was proposed here; what shipped is stricter and split in two, so neither
+style of testing can coast on the other's numbers — **unit** (every
+in-process test, cucumber binaries excluded) with a floor of **95**, and
+**e2e** (the black-box cucumber suites driving the real binary) with a
+floor of **72**. Raise a floor as its number rises; never lower one to
+make a PR pass.
 
 ---
 

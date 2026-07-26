@@ -14,12 +14,18 @@
 //! command, because those differ (some commands don't parse the edition at
 //! all; the ones that do word the error differently).
 
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use luabox_diag::{Diagnostic, Format, Severity, render};
 use luabox_resolve::manifest::Manifest;
+
+/// The project-local dependency tree `luarocks install --tree lua_modules`
+/// writes. Excluded from every first-party source walk (see
+/// [`collect_lua_files`]).
+const VENDOR_DIR: &str = "lua_modules";
 
 /// Walk up from `cwd` (cargo-style) to the nearest directory containing a
 /// `luabox.toml` file. Returns that directory (the project root), or `None`
@@ -71,7 +77,16 @@ pub(crate) fn discover_manifest(cwd: &Path) -> anyhow::Result<Option<(PathBuf, M
 
 /// All `*.lua` files under `root`, in deterministic order — entries sorted by
 /// file name at each directory level, walked depth-first — skipping
-/// dot-directories and the build output directory (`out_dir`, when set).
+/// dot-directories, the build output directory (`out_dir`, when set), and any
+/// directory named `lua_modules`.
+///
+/// `lua_modules/` is *vendored* code, not project source: it is whatever
+/// `luarocks install --tree lua_modules` materialized (README "Using
+/// dependencies"). Walking into it made `luabox check` typecheck rock sources
+/// against the project's own strictness — which fails on any rock that is not
+/// trivially typed, and takes `luabox build` down with it. It is skipped the
+/// same way dot-directories are, at every depth, because a vendored tree can
+/// itself contain one.
 ///
 /// `exclude_d_lua` is the sole behavioral knob between the project-source
 /// commands and `lint`: with it set, `*.d.lua` files are omitted, because they
@@ -104,7 +119,9 @@ fn walk(
         let hidden = entry.file_name().to_string_lossy().starts_with('.');
         if path.is_dir() {
             let is_out = out_dir == Some(path.as_path());
-            if !hidden && !is_out {
+            // Vendored rock trees are never project source, at any depth.
+            let is_vendored = entry.file_name() == OsStr::new(VENDOR_DIR);
+            if !hidden && !is_out && !is_vendored {
                 walk(&path, out_dir, exclude_d_lua, lua)?;
             }
         } else if !hidden {
@@ -328,6 +345,58 @@ edition = \"5.4\"
         let files = collect_lua_files(tmp.path(), Some(&out), false).expect("walk");
         let rel: Vec<String> = files.iter().map(|p| display_rel(p, tmp.path())).collect();
         assert_eq!(rel, ["src/main.lua"]);
+    }
+
+    #[test]
+    fn collect_lua_files_skips_the_vendored_lua_modules_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "src/main.lua", "");
+        // A real `luarocks install --tree lua_modules` layout: Lua modules
+        // under share/lua/<X.Y>/, C modules under lib/lua/<X.Y>/, rock
+        // metadata under lib/luarocks/.
+        write(tmp.path(), "lua_modules/share/lua/5.4/pl/tablex.lua", "");
+        write(tmp.path(), "lua_modules/share/lua/5.4/pl/init.lua", "");
+        write(
+            tmp.path(),
+            "lua_modules/lib/luarocks/rocks-5.4/pl/spec.lua",
+            "",
+        );
+        // …and the older flat layout, which is skipped just the same.
+        write(tmp.path(), "lua_modules/pkg/src/init.lua", "");
+
+        let files = collect_lua_files(tmp.path(), None, false).expect("walk");
+        let rel: Vec<String> = files.iter().map(|p| display_rel(p, tmp.path())).collect();
+        assert_eq!(rel, ["src/main.lua"]);
+    }
+
+    #[test]
+    fn collect_lua_files_skips_a_nested_lua_modules_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "packages/core/src/main.lua", "");
+        // A vendored tree can nest — a workspace member has its own, and a
+        // rock may vendor one in turn. Every depth is skipped.
+        write(tmp.path(), "packages/core/lua_modules/dep/init.lua", "");
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.1/x/lua_modules/inner.lua",
+            "",
+        );
+
+        let files = collect_lua_files(tmp.path(), None, false).expect("walk");
+        let rel: Vec<String> = files.iter().map(|p| display_rel(p, tmp.path())).collect();
+        assert_eq!(rel, ["packages/core/src/main.lua"]);
+    }
+
+    #[test]
+    fn collect_lua_files_keeps_a_file_merely_named_lua_modules() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // The exclusion is by *directory* component; a source file that
+        // happens to be called `lua_modules.lua` is first-party.
+        write(tmp.path(), "src/lua_modules.lua", "");
+
+        let files = collect_lua_files(tmp.path(), None, false).expect("walk");
+        let rel: Vec<String> = files.iter().map(|p| display_rel(p, tmp.path())).collect();
+        assert_eq!(rel, ["src/lua_modules.lua"]);
     }
 
     #[test]

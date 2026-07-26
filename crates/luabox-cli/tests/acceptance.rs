@@ -317,17 +317,22 @@ async fn main() {
     // `features/lsp/` is driven by the separate `lsp_acceptance` harness — it
     // speaks LSP over stdio and needs its own World — so this CLI harness
     // skips it rather than reporting every one of its steps as unmatched.
-    AcceptanceWorld::filter_run("tests/features", |feature, _rule, scenario| {
-        let tagged = |tag: &str| {
-            feature.tags.iter().any(|t| t == tag) || scenario.tags.iter().any(|t| t == tag)
-        };
-        let is_lsp = feature
-            .path
-            .as_ref()
-            .is_some_and(|path| path.components().any(|c| c.as_os_str() == "lsp"));
-        !tagged("wip") && !is_lsp
-    })
-    .await;
+    // `fail_on_skipped`: an undefined or ambiguous step is a *failure*,
+    // not a quiet skip. Without it a feature file could describe behaviour
+    // no step definition implements and the suite would still go green.
+    AcceptanceWorld::cucumber()
+        .fail_on_skipped()
+        .filter_run_and_exit("tests/features", |feature, _rule, scenario| {
+            let tagged = |tag: &str| {
+                feature.tags.iter().any(|t| t == tag) || scenario.tags.iter().any(|t| t == tag)
+            };
+            let is_lsp = feature
+                .path
+                .as_ref()
+                .is_some_and(|path| path.components().any(|c| c.as_os_str() == "lsp"));
+            !tagged("wip") && !is_lsp
+        })
+        .await;
 }
 
 // --- build fixtures (emit/build.feature — #22) ----------------------------

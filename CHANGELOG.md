@@ -64,11 +64,32 @@ so it appears in no version entry.
 
 - The **`luabox.toml` manifest model** (`[package]`, `[lints]`, `[build]`,
   `[types]`) that every frontend command reads.
-- The **`lua_modules/` read path**: `require` resolution and cross-package
-  type checking still work over a rock tree, provided you materialize it.
+- The **`lua_modules/` read path**: `require` resolution, bundling and
+  cross-package type checking still work over a rock tree, provided you
+  materialize it. (Types need more than the tree — see *Fixed* below.)
 - Everything static: `new`/`init`, `check`, `lint`, `fmt`, `build` (+ the
   bundler and its `love`/`nvim-plugin` modes), `unmap`, `doc`, `lsp`,
   `explain`, `upgrade`, and `--watch`.
+
+### Fixed
+
+- **`lua_modules/` is no longer walked as project source.** `check`, `lint`,
+  `fmt` and `build` skip any directory named `lua_modules`, at every depth,
+  the same way they skip dot-directories and the build output directory. A
+  vendored rock tree is whatever luarocks put there; typechecking it against
+  *your* project's strictness failed on any rock that is not trivially typed
+  — and took `luabox build` down with it, since `build` refuses to emit while
+  `check` reports errors. Summaries now count first-party files only.
+- **`require` resolves through a real luarocks tree.** Resolution (and so
+  bundling, `check`'s cross-file types, and the LSP's goto-definition) now
+  searches `lua_modules/share/lua/<X.Y>/a/b/c.lua` and
+  `…/a/b/c/init.lua` — the layout `luarocks install --tree lua_modules`
+  actually writes — where `<X.Y>` is the build target's version directory
+  (`luajit` maps to `5.1`, as luarocks itself does). The flat
+  `lua_modules/<name>/` layout is still searched first, so nothing that
+  resolved before resolves elsewhere now. Compiled C modules under
+  `lua_modules/lib/lua/<X.Y>/` cannot be inlined into a text bundle and stay
+  runtime `require`s, exactly like any other unresolved name.
 
 ### Migration
 
@@ -76,12 +97,17 @@ Materialize the tree with luarocks directly, then point luabox at it:
 
 ```sh
 luarocks install --tree lua_modules penlight
-luabox check          # penlight's types are visible and checked
+luabox check          # penlight is requirable and bundlable
 ```
 
 Declare dependencies in your `*.rockspec` by hand (or with `luarocks`), and
-publish with `luarocks upload`. Nothing about the type checker's view of
-`lua_modules/` changed — only who fills it.
+publish with `luarocks upload`. Note what the tree does and does not give
+you: `require` resolution and bundling come free, but a rock's *types* still
+need a `[dependencies]` entry plus a `lua_modules/<name>/luabox.toml` with
+`[types] defs` — which a luarocks tree does not have. Write the LuaCATS
+definitions into your own `defs/` and list them in your `[types] defs`; see
+[README](README.md#using-dependencies) and
+[LIMITATIONS.md](LIMITATIONS.md#dependency-management-and-execution-are-non-goals-not-gaps).
 
 ## [0.1.4] - 2026-07-14
 

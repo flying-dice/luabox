@@ -217,14 +217,37 @@ project-local `lua_modules/` with luarocks yourself, and luabox reads it:
 
 ```sh
 luarocks install --tree lua_modules penlight
-luabox check                # penlight's types are visible and checked
+luabox check                # penlight is requirable, bundlable, and skipped as source
 ```
 
 Anything under `lua_modules/` is on the module path for `require` resolution
-and cross-package types: a dependency that ships LuaCATS definitions (its
-`[types] defs`) is checked in your code exactly like a local module. Your
-`*.rockspec` and luarocks own dependency management — there is no solver, no
-lockfile, and no registry client in luabox
+and bundling. Both dependency layouts are searched: the luarocks tree
+(`lua_modules/share/lua/<X.Y>/pl/tablex.lua`, where `<X.Y>` is your `[build]
+target` — `5.1` for `luajit`) and the flat `lua_modules/<name>/` layout a
+hand-vendored or sibling package has. A compiled C module
+(`lua_modules/lib/lua/<X.Y>/*.so`) cannot be inlined into a text bundle, so
+`require` calls naming one are left as runtime `require`s — ship the `.so`
+alongside your bundle. `lua_modules/` is never walked as project source:
+`check`, `lint`, `fmt` and `build` skip it whatever it contains.
+
+**Getting a dependency's *types* needs more than installing it.** All three
+must hold, or the rock is `unknown` to the typechecker:
+
+1. a `[dependencies]` (or `[dev-dependencies]`) entry naming the package —
+   the table drives nothing else, but it is the list that gets searched;
+2. a `luabox.toml` for that package with a `[types] defs` key, at
+   `lua_modules/<name>/luabox.toml` (or, for a `path` dependency, at the
+   path you gave) — i.e. the **flat** layout, since a luarocks tree has no
+   per-package `luabox.toml`;
+3. the `defs/` directory it names, holding the `*.d.lua` files.
+
+So a plain `luarocks install --tree lua_modules penlight` gives you require
+resolution and bundling, but **not** penlight's types. To type it today,
+write the LuaCATS definitions into your own project's `defs/` and list them
+in your `[types] defs` — the same route as any third-party library.
+
+Your `*.rockspec` and luarocks own dependency management — there is no
+solver, no lockfile, and no registry client in luabox
 ([DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26)).
 
 ## Project layout (for contributors)

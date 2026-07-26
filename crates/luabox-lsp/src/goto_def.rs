@@ -13,6 +13,7 @@ use std::str::FromStr;
 
 use lsp_types::{Location, Position, Range};
 use luabox_hir::Resolution;
+use luabox_syntax::lua::Dialect;
 use luabox_syntax::lua::SyntaxKind;
 use luabox_syntax::lua::ast::{self, AstNode};
 use rowan::{TextRange, TextSize};
@@ -21,14 +22,21 @@ use crate::sema::FileSema;
 use crate::uri::path_to_uri;
 
 /// Compute the definition location for the symbol at `offset`.
-/// `project_root` anchors `require` module resolution.
+/// `project_root` anchors `require` module resolution, and `dialect` — the
+/// project's edition — selects the `lua_modules/share/lua/<X.Y>/` version
+/// directory of a luarocks tree.
 #[must_use]
-pub fn goto_definition(sema: &FileSema, offset: usize, project_root: &Path) -> Option<Location> {
+pub fn goto_definition(
+    sema: &FileSema,
+    offset: usize,
+    project_root: &Path,
+    dialect: Dialect,
+) -> Option<Location> {
     // 1. `require("mod")` → the module file, resolved through the bundler's
     //    shared candidate search (project root, `src/`, then `lua_modules/`).
     if let Some(edge) = sema.require_at(offset) {
         let module = edge.module.clone();
-        return resolve_module(project_root, &module).map(|path| Location {
+        return resolve_module(project_root, &module, dialect).map(|path| Location {
             uri: path_to_uri(&path),
             range: Range::new(Position::new(0, 0), Position::new(0, 0)),
         });
@@ -224,15 +232,15 @@ fn normalize(path: &Path) -> PathBuf {
 
 /// Resolve `module` to its file through the bundler's shared candidate
 /// ordering ([`luabox_bundle::resolve_candidates`], SPEC.md §7: project root,
-/// then `src/`, then the `lua_modules/<pkg>/` tree), picking the first
+/// then `src/`, then the `lua_modules/` trees — flat and luarocks), picking the first
 /// candidate that exists on disk — exactly the bundler's `resolve`.
 ///
 /// This is the workspace's single source of truth for `require` resolution
 /// (the same algorithm `luabox check` and the bundler use), so goto-def can
 /// never disagree with them: a module under `src/` or a dependency now jumps
 /// where the build would actually load it from.
-fn resolve_module(root: &Path, module: &str) -> Option<PathBuf> {
-    luabox_bundle::resolve_candidates(root, module)
+fn resolve_module(root: &Path, module: &str, dialect: Dialect) -> Option<PathBuf> {
+    luabox_bundle::resolve_candidates(root, module, dialect)
         .into_iter()
         .find(|candidate| candidate.is_file())
 }
@@ -281,7 +289,7 @@ mod tests {
     fn at(src: &str, needle: &str, nth: usize) -> Option<Location> {
         let (analysis, path) = analyze(&[("main.lua", src)]);
         let sema = FileSema::new(&analysis, &path).expect("sema");
-        goto_definition(&sema, offset_of(src, needle, nth), &root())
+        goto_definition(&sema, offset_of(src, needle, nth), &root(), Dialect::Lua54)
     }
 
     /// The `(line, character)` start of a location.

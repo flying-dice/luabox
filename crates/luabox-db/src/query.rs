@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 
+use luabox_syntax::lua::Dialect;
 use luabox_types::ty::Ty;
 use luabox_types::{ExternalTypes, TypeEnv, check_file, infer_display_types, stdlib_defs};
 
@@ -168,7 +169,7 @@ pub(crate) fn require_exports_checked(
 ) -> HashMap<String, Ty> {
     let mut map = HashMap::new();
     for edge in lower(db, file).file().requires() {
-        if let Some(target) = resolve_require(db, project, &edge.module)
+        if let Some(target) = resolve_require(db, project, &edge.module, file.dialect(db))
             && target != file
             && let Some(ty) = module_surface_checked(db, target).export()
         {
@@ -196,7 +197,7 @@ pub(crate) fn project_types_checked(db: &dyn Db, project: Project) -> Vec<luabox
 fn require_exports(db: &dyn Db, file: SourceFile, project: Project) -> HashMap<String, Ty> {
     let mut map = HashMap::new();
     for edge in lower(db, file).file().requires() {
-        if let Some(target) = resolve_require(db, project, &edge.module)
+        if let Some(target) = resolve_require(db, project, &edge.module, file.dialect(db))
             && target != file
             && let Some(ty) = module_export(db, target, project).ty()
         {
@@ -214,11 +215,9 @@ fn dependent_seeds(db: &dyn Db, file: SourceFile, project: Project) -> HashMap<S
         if other == file {
             continue;
         }
-        let requires_me = lower(db, other)
-            .file()
-            .requires()
-            .iter()
-            .any(|edge| resolve_require(db, project, &edge.module) == Some(file));
+        let requires_me = lower(db, other).file().requires().iter().any(|edge| {
+            resolve_require(db, project, &edge.module, other.dialect(db)) == Some(file)
+        });
         if !requires_me {
             continue;
         }
@@ -249,11 +248,17 @@ fn dependent_seeds(db: &dyn Db, file: SourceFile, project: Project) -> HashMap<S
 /// file `require("a.b")` names. `Project::root` anchors the candidate paths
 /// (`<root>/a/b.lua`, `<root>/src/a/b.lua`, …); the first candidate that is a
 /// known project file wins. Path equality is component-wise, so `/` vs `\`
-/// separators are irrelevant.
-fn resolve_require(db: &dyn Db, project: Project, module: &str) -> Option<SourceFile> {
+/// separators are irrelevant. `dialect` — the requiring file's — selects the
+/// `lua_modules/share/lua/<X.Y>/` version directory of a luarocks tree.
+fn resolve_require(
+    db: &dyn Db,
+    project: Project,
+    module: &str,
+    dialect: Dialect,
+) -> Option<SourceFile> {
     let root = project.root(db);
     let files = project.files(db);
-    luabox_bundle::resolve_candidates(root, module)
+    luabox_bundle::resolve_candidates(root, module, dialect)
         .into_iter()
         .find_map(|cand| {
             files

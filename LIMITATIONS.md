@@ -148,10 +148,26 @@ luarocks install --tree lua_modules penlight
 luabox check
 ```
 
-Cross-package types keep working over that tree — a dependency's LuaCATS
-definitions are visible and checked at your use sites. Your `*.rockspec` and
-luarocks own everything else (adding, updating, publishing), and you run your
-program with whatever Lua you already have.
+What that tree buys you is `require` resolution and bundling: both the
+luarocks layout (`lua_modules/share/lua/<X.Y>/…`, `<X.Y>` from your `[build]
+target`, `5.1` for `luajit`) and the flat `lua_modules/<name>/` layout are on
+the module path, and `lua_modules/` is never walked as project source.
+
+**Cross-package *types* are narrower than that, and this is the sharp edge.**
+A dependency's LuaCATS definitions reach your use sites only when all three
+hold: (a) a `[dependencies]`/`[dev-dependencies]` entry names the package;
+(b) a `luabox.toml` for it exists at `lua_modules/<name>/luabox.toml` (or at
+the `path` you gave) and sets `[types] defs`; (c) the `defs/` directory it
+names is present. A luarocks tree has no per-package
+`luabox.toml`, so a plain `luarocks install --tree lua_modules penlight`
+gives you resolution and bundling but leaves penlight `unknown` to the
+typechecker. Typed third-party code today therefore means either a
+flat-layout package that ships a `luabox.toml`, or definitions you write into
+your own project's `defs/` and list in your own `[types] defs`. Teaching
+luabox to read a rockspec's own definition files is not planned for 0.x.
+
+Your `*.rockspec` and luarocks own everything else (adding, updating,
+publishing), and you run your program with whatever Lua you already have.
 
 ### Editor extensions are not on marketplaces yet (#102)
 

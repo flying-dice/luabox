@@ -1,9 +1,13 @@
 #!/usr/bin/env pwsh
 # Keep the examples green (Windows / PowerShell). Mirrors scripts/examples.sh:
 # for every project under examples/ run the core gate (check, fmt --check,
-# lint) plus per-example extras (build tree + bundle, .love packaging). luabox
-# is a static toolchain — nothing here needs a Lua interpreter. Exits non-zero
-# if any step fails.
+# lint) plus per-example extras (build tree + bundle, .love packaging). Exits
+# non-zero if any step fails.
+#
+# luabox itself never runs Lua — it is a static toolchain. The bash script
+# additionally executes the built timemachine bundle under lua5.1 to prove the
+# compiler's output runs; Windows CI has no lua5.1 package, so that step SKIPs
+# here. Parity is deliberate and minimal: same step, same label, no runtime.
 #
 # Usage: pwsh scripts/examples.ps1   (or:  powershell -File scripts\examples.ps1)
 # Honours $env:LUABOX (path to the luabox binary); defaults to
@@ -25,8 +29,22 @@ if (-not (Test-Path $luabox)) {
 }
 $luabox = (Resolve-Path $luabox).Path
 
+# The interpreter the built bundle would be executed under (timemachine's
+# `[build] target` is 5.1). Windows CI installs no Lua, so this is normally
+# empty and the run step SKIPs loudly-but-green — see scripts/examples.sh.
+$lua51 = $null
+foreach ($cand in @('lua5.1', 'lua51')) {
+    if (Get-Command $cand -ErrorAction SilentlyContinue) { $lua51 = $cand; break }
+}
+if ($lua51) {
+    Write-Host "==> executing built output under: $lua51"
+} else {
+    Write-Host '==> SKIP: no lua5.1 on PATH — the built bundle will not be executed'
+}
+
 $script:fails = 0
 function Pass($label) { Write-Host "    ok   $label" }
+function Skip($label) { Write-Host "    SKIP $label" }
 function Fail($label, $output) {
     Write-Host "    FAIL $label" -ForegroundColor Red
     if ($output) { $output -split "`n" | ForEach-Object { Write-Host "         | $_" } }
@@ -67,7 +85,7 @@ Section 'legacy-inifile'
 Set-Location (Join-Path $examples 'legacy-inifile')
 Gate
 
-# 5. timemachine (build tree + bundle)
+# 5. timemachine (build tree + bundle + run the lowered output)
 Section 'timemachine'
 Set-Location (Join-Path $examples 'timemachine')
 Gate
@@ -75,6 +93,17 @@ Gate
 # forces the mirrored tree emit under dist/src/ instead.
 Step 'build --no-bundle' $luabox @('build', '--no-bundle')
 Step 'build'             $luabox @('build')
+# Execute what we just compiled, when a 5.1 interpreter is available.
+if ($lua51) {
+    $out = & $lua51 'dist/timemachine.lua' 2>&1 | Out-String
+    if (($LASTEXITCODE -eq 0) -and ($out -match 'sum\(1\.\.5\) = 15')) {
+        Pass 'run lowered bundle on Lua 5.1'
+    } else {
+        Fail 'run lowered bundle on Lua 5.1' $out
+    }
+} else {
+    Skip 'run lowered bundle on Lua 5.1 (no lua5.1 on PATH)'
+}
 
 # 6. love-asteroids-lite (bundle a .love and inspect its contents)
 Section 'love-asteroids-lite'

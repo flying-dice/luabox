@@ -281,6 +281,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_subcommand_surface_is_exactly_these_eleven() {
+        // The v1 scope cut (DIRECTION.md, 2026-07-26) made luabox a pure
+        // static toolchain: no package manager, no registry client, no
+        // interpreter. This is the whole surface — adding a command (even a
+        // `hide`-ed one, which `get_subcommands` still reports) must be a
+        // deliberate edit here, not a quiet regrowth of a deleted verb.
+        let mut actual: Vec<String> = Cli::command()
+            .get_subcommands()
+            .map(|sub| sub.get_name().to_string())
+            .collect();
+        actual.sort();
+
+        let mut expected = [
+            "build", "check", "doc", "explain", "fmt", "init", "lint", "lsp", "new", "unmap",
+            "upgrade",
+        ];
+        expected.sort_unstable();
+
+        assert_eq!(actual, expected, "the CLI subcommand surface changed");
+        assert_eq!(actual.len(), 11);
+    }
+
     // -- init / new --------------------------------------------------------
 
     #[test]

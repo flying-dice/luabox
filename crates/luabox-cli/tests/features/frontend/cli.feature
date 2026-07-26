@@ -65,6 +65,31 @@ Feature: The luabox command-line surface
     When I run "luabox check"
     Then the command exits with code 0
 
+  Scenario Outline: a command cut from the v1 surface stays gone
+    Given an empty directory
+    When I run "luabox <command>"
+    Then the command exits with code 2
+    And stderr contains "unrecognized subcommand '<command>'"
+
+    # The v1 scope cut (DIRECTION.md, 2026-07-26) made luabox a pure static
+    # toolchain: no package manager, no registry client, no interpreter. Each
+    # of these once existed. Re-adding one — even hidden — fails here.
+    Examples:
+      | command   |
+      | add       |
+      | remove    |
+      | install   |
+      | update    |
+      | vendor    |
+      | search    |
+      | outdated  |
+      | publish   |
+      | login     |
+      | logout    |
+      | whoami    |
+      | run       |
+      | toolchain |
+
   Scenario Outline: every subcommand documents its own flags
     Given an empty directory
     When I run "luabox <command> --help"

@@ -226,7 +226,10 @@ pub fn bundle(req: &BundleRequest<'_>) -> Result<Bundle, BundleError> {
     while let Some((index, edges)) = pending.pop() {
         queue.push(index);
         for (range, name) in edges {
-            let Some(path) = resolve::resolve(req.root, &name) else {
+            // The *target* dialect selects the luarocks version directory: a
+            // rock tree is materialized for the interpreter the bundle ships
+            // against, not for the dialect the sources are written in.
+            let Some(path) = resolve::resolve(req.root, &name, req.target) else {
                 continue; // external: left as a runtime `require`
             };
             if path == entry_path {

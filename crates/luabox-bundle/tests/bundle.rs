@@ -823,6 +823,131 @@ fn source_map_version_and_syntax_are_both_rejected() {
     assert!(matches!(err, BundleError::SourceMapVersion(2)), "{err}");
 }
 
+// === luarocks tree layout ================================================
+
+/// Materialize the shape `luarocks install --tree lua_modules penlight`
+/// leaves behind: Lua sources under `share/lua/<X.Y>/`, a C module under
+/// `lib/lua/<X.Y>/`, rock metadata under `lib/luarocks/rocks-<X.Y>/`.
+fn write_rocks_tree(root: &Path, version: &str) {
+    write(
+        root,
+        &format!("lua_modules/share/lua/{version}/pl/tablex.lua"),
+        "local M = {}\nfunction M.size() return \"from-tablex\" end\nreturn M\n",
+    );
+    write(
+        root,
+        &format!("lua_modules/share/lua/{version}/pl/init.lua"),
+        "return \"from-pl-init\"\n",
+    );
+    write(
+        root,
+        &format!("lua_modules/lib/luarocks/rocks-{version}/penlight/1.13.1-1/rock_manifest"),
+        "rock_manifest = {}\n",
+    );
+    // A C module: on disk it is a shared object, never a `.lua` file.
+    write(root, &format!("lua_modules/lib/lua/{version}/lfs.so"), "");
+}
+
+#[test]
+fn a_luarocks_tree_module_is_inlined_into_the_bundle() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write(
+        root,
+        "src/main.lua",
+        "local tablex = require(\"pl.tablex\")\nprint(tablex.size())\n",
+    );
+    write_rocks_tree(root, "5.1");
+
+    let entry = root.join("src/main.lua");
+    let out = bundle(&request(root, &entry, Dialect::Lua51, Dialect::Lua51)).expect("bundle");
+    assert_eq!(out.modules, 1);
+    assert!(
+        out.text
+            .contains("__luabox_modules[\"pl.tablex\"] = function(...)"),
+        "{}",
+        out.text
+    );
+    assert!(out.text.contains("from-tablex"), "{}", out.text);
+    assert!(
+        out.text.contains("__luabox_require(\"pl.tablex\")"),
+        "{}",
+        out.text
+    );
+}
+
+#[test]
+fn a_luarocks_package_root_resolves_through_its_init_lua() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write(root, "src/main.lua", "print(require(\"pl\"))\n");
+    write_rocks_tree(root, "5.4");
+
+    let entry = root.join("src/main.lua");
+    let out = bundle(&request(root, &entry, Dialect::Lua54, Dialect::Lua54)).expect("bundle");
+    assert_eq!(out.modules, 1);
+    assert!(out.text.contains("from-pl-init"), "{}", out.text);
+}
+
+#[test]
+fn a_luajit_target_reads_the_five_one_rocks_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write(
+        root,
+        "src/main.lua",
+        "local tablex = require(\"pl.tablex\")\nprint(tablex.size())\n",
+    );
+    // luarocks installs LuaJIT rocks under the 5.1 prefix.
+    write_rocks_tree(root, "5.1");
+
+    let entry = root.join("src/main.lua");
+    let out = bundle(&request(root, &entry, Dialect::LuaJit, Dialect::LuaJit)).expect("bundle");
+    assert_eq!(out.modules, 1);
+    assert!(out.text.contains("from-tablex"), "{}", out.text);
+}
+
+#[test]
+fn a_rocks_tree_for_another_version_is_not_this_builds_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write(root, "src/main.lua", "print(require(\"pl.tablex\"))\n");
+    write_rocks_tree(root, "5.4");
+
+    // Targeting 5.1: the 5.4 tree is somebody else's install, so the require
+    // stays external rather than silently inlining a foreign build.
+    let entry = root.join("src/main.lua");
+    let out = bundle(&request(root, &entry, Dialect::Lua51, Dialect::Lua51)).expect("bundle");
+    assert_eq!(out.modules, 0);
+    assert!(out.text.contains("require(\"pl.tablex\")"), "{}", out.text);
+    assert!(!out.text.contains("from-tablex"), "{}", out.text);
+}
+
+#[test]
+fn a_c_module_in_the_rocks_tree_stays_an_external_require() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write(
+        root,
+        "src/main.lua",
+        "local lfs = require(\"lfs\")\nprint(lfs)\n",
+    );
+    write_rocks_tree(root, "5.1");
+
+    // `lib/lua/5.1/lfs.so` cannot be inlined into a text bundle: the bundle
+    // succeeds, inlines nothing, and leaves the runtime `require` in place —
+    // exactly how any unresolved name is treated. No error.
+    let entry = root.join("src/main.lua");
+    let out = bundle(&request(root, &entry, Dialect::Lua51, Dialect::Lua51)).expect("bundle");
+    assert_eq!(out.modules, 0);
+    assert!(out.text.contains("require(\"lfs\")"), "{}", out.text);
+    assert!(
+        !out.text.contains("__luabox_modules[\"lfs\"]"),
+        "{}",
+        out.text
+    );
+}
+
 // === resolution candidates ===============================================
 
 #[test]
@@ -830,12 +955,12 @@ fn illegal_module_names_have_no_candidates() {
     let root = Path::new("/project");
     for bad in ["", ".", "a.", ".a", "a..b", "..", "a...b"] {
         assert!(
-            resolve_candidates(root, bad).is_empty(),
+            resolve_candidates(root, bad, Dialect::Lua54).is_empty(),
             "`{bad}` must not resolve anywhere"
         );
     }
     // A legal name still produces the SPEC §7 ordering.
-    let ok = resolve_candidates(root, "a.b");
+    let ok = resolve_candidates(root, "a.b", Dialect::Lua54);
     assert_eq!(
         ok,
         vec![
@@ -847,6 +972,8 @@ fn illegal_module_names_have_no_candidates() {
             PathBuf::from("/project/lua_modules/a/src/b/init.lua"),
             PathBuf::from("/project/lua_modules/a/b.lua"),
             PathBuf::from("/project/lua_modules/a/b/init.lua"),
+            PathBuf::from("/project/lua_modules/share/lua/5.4/a/b.lua"),
+            PathBuf::from("/project/lua_modules/share/lua/5.4/a/b/init.lua"),
         ]
     );
 }

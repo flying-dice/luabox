@@ -253,7 +253,7 @@ fn check_one(
 
     // 3. Types against the ambient definition-package layer (SPEC.md §3),
     // with this file's resolved `require` exports in reach (#85).
-    let requires = resolve_requires(&parse, &project.root, exports);
+    let requires = resolve_requires(&parse, &project.root, project.build_target, exports);
     diags.extend(luabox_types::check_file_with_requires(
         &parse,
         rel,
@@ -270,14 +270,19 @@ fn check_one(
 /// runtime modules) have no entry in `exports` and are simply skipped —
 /// their types come from ambient `[types] defs` (#108), not the module
 /// return value.
+///
+/// `dialect` is the project's `[build] target` (the edition when none is
+/// set): it selects the `lua_modules/share/lua/<X.Y>/` version directory of
+/// a luarocks tree, so `check` looks where the build will.
 fn resolve_requires(
     parse: &lua::Parse,
     root: &Path,
+    dialect: Dialect,
     exports: &HashMap<PathBuf, Ty>,
 ) -> HashMap<String, Ty> {
     let mut requires = HashMap::new();
     for module in luabox_types::module_requires(parse) {
-        if let Some(target) = luabox_bundle::resolve_module(root, &module)
+        if let Some(target) = luabox_bundle::resolve_module(root, &module, dialect)
             && let Some(ty) = exports.get(&target)
         {
             requires.insert(module, ty.clone());

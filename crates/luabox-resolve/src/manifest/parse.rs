@@ -372,8 +372,10 @@ fn parse_package(root: &Table, errors: &mut Vec<ManifestError>) -> Package {
 
     // `name` and `version` are optional in `luabox.toml`: the project's
     // rockspec is the package manifest luarocks reads and supplies them
-    // (SPEC.md §6). A value that *is* written here is still shape-checked, and
-    // `project::effective_manifest` is where a command demands one.
+    // (SPEC.md §6). A value that *is* written here is still shape-checked;
+    // the commands that need a name substitute one instead of demanding it
+    // (`luabox-cli::build_cmd::run` falls back to `"bundle"`,
+    // `doc_cmd::manifest_facts` to the project directory name).
     let name = get_string(table, "package", "name", false, errors).unwrap_or_default();
     if !name.is_empty()
         && let Some(message) = validate_package_name(&name)
