@@ -18,6 +18,13 @@ use std::process::Output;
 use cucumber::gherkin::Step;
 use cucumber::{World, given, then, when};
 
+/// Fixture writers shared with the `lsp_acceptance` harness. Cucumber binds a
+/// step attribute to one `World`, so the `#[given]` shims below stay here;
+/// only their bodies are shared.
+mod support;
+
+use support::{docstring, package_table, write_file};
+
 #[derive(Debug, World)]
 #[world(init = Self::new)]
 struct AcceptanceWorld {
@@ -160,26 +167,9 @@ fn file_does_not_contain(world: &mut AcceptanceWorld, path: String, needle: Stri
     );
 }
 
-/// The step's docstring, normalized: the leading newline after `"""` is
-/// stripped and exactly one trailing newline is guaranteed — matching the
-/// formatter's final-newline convention so `equals:` comparisons are exact.
-fn docstring(step: &Step) -> String {
-    let raw = step
-        .docstring
-        .as_deref()
-        .expect("this step requires a docstring (\"\"\" … \"\"\")");
-    let body = raw.strip_prefix('\n').unwrap_or(raw);
-    format!("{}\n", body.trim_end_matches(['\n', '\r']))
-}
-
 #[given(expr = "a file {string} containing:")]
 fn file_containing(world: &mut AcceptanceWorld, path: String, step: &Step) {
-    let full = world.dir.path().join(&path);
-    if let Some(parent) = full.parent() {
-        std::fs::create_dir_all(parent).expect("failed to create parent directories");
-    }
-    let content = docstring(step);
-    std::fs::write(&full, content).unwrap_or_else(|e| panic!("cannot write `{path}`: {e}"));
+    write_file(world.dir.path(), &path, &docstring(step));
 }
 
 #[then(expr = "{string} equals:")]
@@ -228,29 +218,14 @@ fn stdout_contains(world: &mut AcceptanceWorld, needle: String) {
 
 // --- project fixtures (check.feature, dialect-validation.feature) --------
 
-/// Write a minimal `luabox.toml` for a scenario project.
-fn write_manifest(world: &AcceptanceWorld, edition: &str, strict: bool) {
-    let manifest = format!(
-        "[package]\n\
-         name = \"fixture\"\n\
-         version = \"0.1.0\"\n\
-         edition = \"{edition}\"\n\
-         \n\
-         [types]\n\
-         strict = {strict}\n"
-    );
-    std::fs::write(world.dir.path().join("luabox.toml"), manifest)
-        .expect("failed to write luabox.toml");
-}
-
 #[given(expr = "a project with edition {string}")]
 fn project_with_edition(world: &mut AcceptanceWorld, edition: String) {
-    write_manifest(world, &edition, false);
+    support::write_manifest(world.dir.path(), &edition, false);
 }
 
 #[given(expr = "a strict project with edition {string}")]
 fn strict_project_with_edition(world: &mut AcceptanceWorld, edition: String) {
-    write_manifest(world, &edition, true);
+    support::write_manifest(world.dir.path(), &edition, true);
 }
 
 /// A `luabox.toml` built from the smallest valid manifest — `[package]` with
@@ -266,8 +241,7 @@ fn manifest_section_containing(world: &mut AcceptanceWorld, section: String, lin
     } else {
         format!("[package]\nedition = \"5.4\"\n\n[{section}]\n{line}\n")
     };
-    std::fs::write(world.dir.path().join("luabox.toml"), manifest)
-        .expect("failed to write luabox.toml");
+    write_file(world.dir.path(), "luabox.toml", &manifest);
 }
 
 /// A one-line Lua source (used by the dialect-legality Examples tables).
@@ -275,10 +249,7 @@ fn manifest_section_containing(world: &mut AcceptanceWorld, section: String, lin
 /// arrive verbatim.
 #[given(regex = r"^a Lua file containing '(.*)'$")]
 fn lua_file_containing(world: &mut AcceptanceWorld, source: String) {
-    let path = world.dir.path().join("src").join("main.lua");
-    std::fs::create_dir_all(path.parent().expect("src parent"))
-        .expect("failed to create src directory");
-    std::fs::write(&path, format!("{source}\n")).expect("failed to write src/main.lua");
+    write_file(world.dir.path(), "src/main.lua", &format!("{source}\n"));
 }
 
 #[then(expr = "diagnostic {word} is reported")]
@@ -376,19 +347,10 @@ async fn main() {
 /// Write a manifest with a `[build] target` (SPEC.md §5).
 fn write_manifest_with_target(world: &AcceptanceWorld, edition: &str, target: &str, strict: bool) {
     let manifest = format!(
-        "[package]\n\
-         name = \"fixture\"\n\
-         version = \"0.1.0\"\n\
-         edition = \"{edition}\"\n\
-         \n\
-         [build]\n\
-         target = \"{target}\"\n\
-         \n\
-         [types]\n\
-         strict = {strict}\n"
+        "{}\n[build]\ntarget = \"{target}\"\n\n[types]\nstrict = {strict}\n",
+        package_table(edition)
     );
-    std::fs::write(world.dir.path().join("luabox.toml"), manifest)
-        .expect("failed to write luabox.toml");
+    write_file(world.dir.path(), "luabox.toml", &manifest);
 }
 
 #[given(expr = "a project with edition {string} targeting {string}")]
@@ -415,17 +377,10 @@ fn project_with_edition_target_bundling(
     target: String,
 ) {
     let manifest = format!(
-        "[package]\n\
-         name = \"fixture\"\n\
-         version = \"0.1.0\"\n\
-         edition = \"{edition}\"\n\
-         \n\
-         [build]\n\
-         target = \"{target}\"\n\
-         bundle = true\n"
+        "{}\n[build]\ntarget = \"{target}\"\nbundle = true\n",
+        package_table(&edition)
     );
-    std::fs::write(world.dir.path().join("luabox.toml"), manifest)
-        .expect("failed to write luabox.toml");
+    write_file(world.dir.path(), "luabox.toml", &manifest);
 }
 
 #[then(expr = "the file {string} does not exist")]
@@ -599,18 +554,10 @@ fn write_manifest_with_target_and_mode(
         .map(|d| format!("description = \"{d}\"\n"))
         .unwrap_or_default();
     let manifest = format!(
-        "[package]\n\
-         name = \"fixture\"\n\
-         version = \"0.1.0\"\n\
-         edition = \"{edition}\"\n\
-         {description_line}\
-         \n\
-         [build]\n\
-         target = \"{target}\"\n\
-         mode = \"{mode}\"\n"
+        "{}{description_line}\n[build]\ntarget = \"{target}\"\nmode = \"{mode}\"\n",
+        package_table(edition)
     );
-    std::fs::write(world.dir.path().join("luabox.toml"), manifest)
-        .expect("failed to write luabox.toml");
+    write_file(world.dir.path(), "luabox.toml", &manifest);
 }
 
 #[given(expr = "a project with edition {string} targeting {string} using mode {string}")]

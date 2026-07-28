@@ -22,7 +22,7 @@ use crate::line_index::LineIndex;
 /// replacement when the text changed, and **no edits** when it did not
 /// (including the formatter's parse-error "return input unchanged" case).
 #[must_use]
-pub fn full_document_edits(original: &str, formatted: &str) -> Vec<TextEdit> {
+pub fn formatting(original: &str, formatted: &str) -> Vec<TextEdit> {
     if original == formatted {
         return Vec::new();
     }

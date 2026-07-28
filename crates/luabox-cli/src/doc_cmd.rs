@@ -221,22 +221,16 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+    use crate::testutil::write;
 
-    /// Write `contents` to `root/rel`, creating parent directories.
-    fn write(root: &Path, rel: &str, contents: &str) {
-        let path = root.join(rel);
-        fs::create_dir_all(path.parent().expect("has a parent")).expect("create parents");
-        fs::write(&path, contents).expect("write file");
-    }
-
+    /// The generated pages are titled from the package name, so these fixtures
+    /// vary the name rather than the edition (always 5.4 here).
     fn manifest(name: &str, extra: &str) -> String {
-        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n{extra}")
+        crate::testutil::manifest_named(name, "5.4", extra)
     }
 
     fn project(name: &str, extra: &str) -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write(tmp.path(), "luabox.toml", &manifest(name, extra));
-        tmp
+        crate::testutil::project_named(name, "5.4", extra)
     }
 
     fn read_doc(root: &Path, page: &str) -> String {

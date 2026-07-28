@@ -461,27 +461,9 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
-
-    /// Write `contents` to `root/rel`, creating parent directories.
-    fn write(root: &Path, rel: &str, contents: &str) {
-        let path = root.join(rel);
-        fs::create_dir_all(path.parent().expect("has a parent")).expect("create parents");
-        fs::write(&path, contents).expect("write file");
-    }
-
-    /// A `luabox.toml` body with the given extra tables appended.
-    fn manifest(edition: &str, extra: &str) -> String {
-        format!(
-            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"{edition}\"\n{extra}"
-        )
-    }
-
-    /// A project rooted in a fresh tempdir with the given manifest body.
-    fn project(manifest_text: &str) -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write(tmp.path(), "luabox.toml", manifest_text);
-        tmp
-    }
+    // These tests vary the manifest body itself (including malformed ones), so
+    // they build the project from the text rather than from `(edition, extra)`.
+    use crate::testutil::{manifest, project_with_manifest as project, write};
 
     // -- format parsing ----------------------------------------------------
 
@@ -514,9 +496,20 @@ mod tests {
 
     #[test]
     fn run_once_rejects_a_bad_format_before_touching_the_filesystem() {
-        // No project, no files — the format is validated first.
+        // No project, no files — the format is validated first, so the failure
+        // is `parse_format`'s own message (not a discovery or walk error) and
+        // the run gets far enough to create nothing.
         let tmp = tempfile::tempdir().expect("tempdir");
-        assert!(run_once(tmp.path(), None, "yaml", None).is_err());
+        let error = run_once(tmp.path(), None, "yaml", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown format `yaml`"), "{error}");
+        let created: Vec<_> = fs::read_dir(tmp.path())
+            .expect("read the project root")
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(created.is_empty(), "the rejected run wrote {created:?}");
     }
 
     // -- discovery ---------------------------------------------------------
@@ -598,7 +591,12 @@ mod tests {
             "src/main.lua",
             "---@param n number\nlocal function double(n)\n  return n * 2\nend\ndouble(\"nope\")\n",
         );
-        assert!(run_once(tmp.path(), None, "human", None).is_err());
+        // Exactly one error — the argument mismatch — and not, say, a second
+        // one from the annotation itself.
+        let error = run_once(tmp.path(), None, "human", None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "check failed with 1 error(s)");
     }
 
     #[test]
@@ -645,7 +643,12 @@ mod tests {
             "local i = 0\n::top::\ni = i + 1\nif i < 3 then goto top end\n",
         );
         run_once(tmp.path(), None, "human", None).expect("legal in the edition");
-        assert!(run_once(tmp.path(), Some("5.1"), "human", None).is_err());
+        // Both 5.1-illegal constructs are reported — the `::top::` label and
+        // the `goto` — each once.
+        let error = run_once(tmp.path(), Some("5.1"), "human", None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "check failed with 2 error(s)");
     }
 
     #[test]
@@ -704,8 +707,12 @@ mod tests {
         write(tmp.path(), "custom-out/main.lua", "local x = \n");
 
         // The manifest's out dir doesn't cover `custom-out/`, so an
-        // unqualified check sees the broken emitted file...
-        assert!(run_once(tmp.path(), None, "human", None).is_err());
+        // unqualified check sees the broken emitted file — and it is that one
+        // file's syntax error it trips on, nothing else...
+        let error = run_once(tmp.path(), None, "human", None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "check failed with 1 error(s)");
         // ...but `build` passing its chosen `--out` as `skip_out` does not.
         let out = tmp.path().join("custom-out");
         run_once(tmp.path(), None, "human", Some(&out)).expect("emitted output is skipped");

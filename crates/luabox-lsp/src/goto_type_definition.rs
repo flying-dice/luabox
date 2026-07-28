@@ -34,11 +34,7 @@ use crate::uri::path_to_uri;
 /// are workspace-global) and the display inference; `target` is the already-built
 /// view of the file under the cursor.
 #[must_use]
-pub fn goto_type_definition(
-    analysis: &Analysis,
-    target: &FileSema,
-    offset: usize,
-) -> Option<Location> {
+pub fn type_definition(analysis: &Analysis, target: &FileSema, offset: usize) -> Option<Location> {
     let name = type_name_at(analysis, target, offset)?;
     declaration_of(analysis, target, &name)
 }
@@ -197,7 +193,7 @@ mod tests {
     fn run(files: &[(&str, &str)], offset: usize) -> Option<Location> {
         let (analysis, path) = analyze(files);
         let target = FileSema::new(&analysis, &path).expect("target sema");
-        goto_type_definition(&analysis, &target, offset)
+        type_definition(&analysis, &target, offset)
     }
 
     #[test]

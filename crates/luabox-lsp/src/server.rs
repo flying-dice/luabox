@@ -62,8 +62,8 @@ use crate::sema::FileSema;
 use crate::uri::uri_to_path;
 use crate::{
     call_hierarchy, code_action, completion, diagnostics, document_highlight, fmt, folding,
-    goto_def, goto_impl, goto_type, hover, inlay_hints, references, rename, selection_range,
-    semantic_tokens, signature_help, symbols,
+    goto_definition, goto_implementation, goto_type_definition, hover, inlay_hints, references,
+    rename, selection_range, semantic_tokens, signature_help, symbols,
 };
 
 /// Run the server over stdio until the client sends `shutdown`/`exit`.
@@ -145,8 +145,9 @@ fn server_capabilities() -> ServerCapabilities {
             ..SignatureHelpOptions::default()
         }),
         // Goto type-definition (value → its `---@class`/`---@alias`/`---@enum`,
-        // see [`crate::goto_type`]) and goto-implementation (interface class →
-        // its subclasses, see [`crate::goto_impl`]).
+        // see [`crate::goto_type_definition`]) and goto-implementation
+        // (interface class → its subclasses, see
+        // [`crate::goto_implementation`]).
         type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
         implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
         references_provider: Some(OneOf::Left(true)),
@@ -694,97 +695,96 @@ impl Server {
         Ok(())
     }
 
-    fn hover(&self, uri: &Uri, position: lsp_types::Position) -> Option<Hover> {
+    /// The analysis snapshot and semantic view for the document `uri` names,
+    /// or `None` when the URI is not a file the analysis knows.
+    ///
+    /// Every handler starts here. The snapshot is *returned alongside* the
+    /// view rather than taken and dropped inside: a handler that also queries
+    /// the workspace (references, rename, the goto family) must see the same
+    /// consistent snapshot the view was built from, and salsa memoization only
+    /// pays off while it is alive.
+    fn file(&self, uri: &Uri) -> Option<(Analysis, FileSema)> {
         let path = uri_to_path(uri)?;
-        let sema = self.sema(&path)?;
+        let snapshot = self.host.snapshot();
+        let sema = FileSema::new(&snapshot, &path)?;
+        Some((snapshot, sema))
+    }
+
+    /// [`Self::file`] plus the byte offset `position` names in that document —
+    /// the prelude of every position-addressed request.
+    fn at(&self, uri: &Uri, position: lsp_types::Position) -> Option<(Analysis, FileSema, usize)> {
+        let (snapshot, sema) = self.file(uri)?;
         let offset = sema.index.offset(position);
+        Some((snapshot, sema, offset))
+    }
+
+    fn hover(&self, uri: &Uri, position: lsp_types::Position) -> Option<Hover> {
+        let (_snapshot, sema, offset) = self.at(uri, position)?;
         hover::hover(&sema, offset)
     }
 
     /// The callee's resolved signature(s) while `position` sits inside a
     /// call's argument list (see [`crate::signature_help`]).
     fn signature_help(&self, uri: &Uri, position: lsp_types::Position) -> Option<SignatureHelp> {
-        let path = uri_to_path(uri)?;
-        let sema = self.sema(&path)?;
-        let offset = sema.index.offset(position);
+        let (_snapshot, sema, offset) = self.at(uri, position)?;
         signature_help::signature_help(&sema, offset)
     }
 
     /// The call-hierarchy item for the function the cursor names at `position`
-    /// — a declaration or a call site (see [`crate::call_hierarchy`]). Reuses
-    /// one snapshot for the whole resolution.
+    /// — a declaration or a call site (see [`crate::call_hierarchy`]).
     fn prepare_call_hierarchy(
         &self,
         uri: &Uri,
         position: lsp_types::Position,
     ) -> Option<Vec<CallHierarchyItem>> {
-        let path = uri_to_path(uri)?;
-        let snapshot = self.host.snapshot();
-        let sema = FileSema::new(&snapshot, &path)?;
-        let offset = sema.index.offset(position);
-        call_hierarchy::prepare(&snapshot, &sema, offset)
+        let (snapshot, sema, offset) = self.at(uri, position)?;
+        call_hierarchy::prepare_call_hierarchy(&snapshot, &sema, offset)
     }
 
     /// The call sites across the workspace that call `item`, grouped by their
     /// enclosing function (see [`crate::call_hierarchy`]).
     fn incoming_calls(&self, item: &CallHierarchyItem) -> Option<Vec<CallHierarchyIncomingCall>> {
-        let path = uri_to_path(&item.uri)?;
-        let snapshot = self.host.snapshot();
-        let sema = FileSema::new(&snapshot, &path)?;
+        let (snapshot, sema) = self.file(&item.uri)?;
         Some(call_hierarchy::incoming_calls(&snapshot, &sema, item))
     }
 
     /// The functions called within `item`'s body (see
     /// [`crate::call_hierarchy`]).
     fn outgoing_calls(&self, item: &CallHierarchyItem) -> Option<Vec<CallHierarchyOutgoingCall>> {
-        let path = uri_to_path(&item.uri)?;
-        let snapshot = self.host.snapshot();
-        let sema = FileSema::new(&snapshot, &path)?;
+        let (snapshot, sema) = self.file(&item.uri)?;
         Some(call_hierarchy::outgoing_calls(&snapshot, &sema, item))
     }
 
     fn definition(&self, uri: &Uri, position: lsp_types::Position) -> Option<Location> {
-        let path = uri_to_path(uri)?;
-        let sema = self.sema(&path)?;
-        let offset = sema.index.offset(position);
-        goto_def::goto_definition(&sema, offset, &self.root, self.dialect)
+        let (_snapshot, sema, offset) = self.at(uri, position)?;
+        goto_definition::definition(&sema, offset, &self.root, self.dialect)
     }
 
     /// The declaration of the type carried by the value at `position`: its
     /// `---@class`/`---@alias`/`---@enum`, searched workspace-wide (declarations
-    /// are workspace-global). Reuses one snapshot for the whole scan.
+    /// are workspace-global).
     fn type_definition(&self, uri: &Uri, position: lsp_types::Position) -> Option<Location> {
-        let path = uri_to_path(uri)?;
-        let snapshot = self.host.snapshot();
-        let sema = FileSema::new(&snapshot, &path)?;
-        let offset = sema.index.offset(position);
-        goto_type::goto_type_definition(&snapshot, &sema, offset)
+        let (snapshot, sema, offset) = self.at(uri, position)?;
+        goto_type_definition::type_definition(&snapshot, &sema, offset)
     }
 
     /// Every implementor of the `---@class` at `position`: each workspace class
-    /// that lists it as a parent (see [`crate::goto_impl`]). Reuses one snapshot
-    /// for the whole cross-file scan.
+    /// that lists it as a parent (see [`crate::goto_implementation`]).
     fn implementation(&self, uri: &Uri, position: lsp_types::Position) -> Option<Vec<Location>> {
-        let path = uri_to_path(uri)?;
-        let snapshot = self.host.snapshot();
-        let sema = FileSema::new(&snapshot, &path)?;
-        let offset = sema.index.offset(position);
-        goto_impl::goto_implementation(&snapshot, &sema, offset)
+        let (snapshot, sema, offset) = self.at(uri, position)?;
+        goto_implementation::implementation(&snapshot, &sema, offset)
     }
 
     /// All references to the symbol at `position`. Locals/upvalues are found in
     /// the file itself; globals and class members are searched across every
-    /// file the snapshot knows about, reusing one snapshot for the whole scan.
+    /// file the snapshot knows about.
     fn references(
         &self,
         uri: &Uri,
         position: lsp_types::Position,
         include_declaration: bool,
     ) -> Option<Vec<Location>> {
-        let path = uri_to_path(uri)?;
-        let snapshot = self.host.snapshot();
-        let sema = FileSema::new(&snapshot, &path)?;
-        let offset = sema.index.offset(position);
+        let (snapshot, sema, offset) = self.at(uri, position)?;
         references::references(&snapshot, &sema, offset, include_declaration)
     }
 
@@ -798,10 +798,7 @@ impl Server {
         position: lsp_types::Position,
         new_name: &str,
     ) -> Option<WorkspaceEdit> {
-        let path = uri_to_path(uri)?;
-        let snapshot = self.host.snapshot();
-        let sema = FileSema::new(&snapshot, &path)?;
-        let offset = sema.index.offset(position);
+        let (snapshot, sema, offset) = self.at(uri, position)?;
         rename::rename(&snapshot, &sema, offset, new_name)
     }
 
@@ -812,38 +809,30 @@ impl Server {
         uri: &Uri,
         position: lsp_types::Position,
     ) -> Option<PrepareRenameResponse> {
-        let path = uri_to_path(uri)?;
-        let snapshot = self.host.snapshot();
-        let sema = FileSema::new(&snapshot, &path)?;
-        let offset = sema.index.offset(position);
+        let (snapshot, sema, offset) = self.at(uri, position)?;
         rename::prepare_rename(&snapshot, &sema, offset).map(PrepareRenameResponse::Range)
     }
 
     /// Completions at `position`: scope/member items plus auto-require imports
-    /// (see [`crate::completion`]). Reuses one snapshot for the whole pass —
-    /// the auto-require enumeration reads every workspace file's memoized
-    /// module export.
+    /// (see [`crate::completion`]) — the auto-require enumeration reads every
+    /// workspace file's memoized module export off the same snapshot.
     fn completion(
         &self,
         uri: &Uri,
         position: lsp_types::Position,
     ) -> Option<Vec<lsp_types::CompletionItem>> {
-        let path = uri_to_path(uri)?;
-        let snapshot = self.host.snapshot();
-        let sema = FileSema::new(&snapshot, &path)?;
-        let offset = sema.index.offset(position);
+        let (snapshot, sema, offset) = self.at(uri, position)?;
         Some(completion::completion(&sema, offset, &snapshot, &self.root))
     }
 
     fn document_symbols(&self, uri: &Uri) -> Option<Vec<lsp_types::DocumentSymbol>> {
-        let path = uri_to_path(uri)?;
-        let sema = self.sema(&path)?;
+        let (_snapshot, sema) = self.file(uri)?;
         Some(symbols::document_symbols(&sema))
     }
 
     /// Fuzzy (case-insensitive substring) search for `query` across every
-    /// `.lua` file the analysis snapshot knows about, reusing one snapshot
-    /// for the whole scan (mirrors [`Self::references`]): classes, functions,
+    /// `.lua` file the analysis snapshot knows about — one snapshot for the
+    /// whole scan, like [`Self::references`]: classes, functions,
     /// fields/methods, and aliases/enums (see
     /// [`symbols::workspace_symbols`]). Results are deduplicated by name and
     /// location, sorted for a deterministic response, then capped at
@@ -876,10 +865,7 @@ impl Server {
         uri: &Uri,
         position: lsp_types::Position,
     ) -> Option<Vec<DocumentHighlight>> {
-        let path = uri_to_path(uri)?;
-        let snapshot = self.host.snapshot();
-        let sema = FileSema::new(&snapshot, &path)?;
-        let offset = sema.index.offset(position);
+        let (snapshot, sema, offset) = self.at(uri, position)?;
         document_highlight::document_highlight(&snapshot, &sema, offset)
     }
 
@@ -887,8 +873,7 @@ impl Server {
     /// runs (see [`crate::folding`]) — pure syntax-tree geometry, no
     /// semantic analysis needed.
     fn folding_ranges(&self, uri: &Uri) -> Option<Vec<FoldingRange>> {
-        let path = uri_to_path(uri)?;
-        let sema = self.sema(&path)?;
+        let (_snapshot, sema) = self.file(uri)?;
         Some(folding::folding_ranges(&sema))
     }
 
@@ -899,8 +884,7 @@ impl Server {
         uri: &Uri,
         positions: &[lsp_types::Position],
     ) -> Option<Vec<SelectionRange>> {
-        let path = uri_to_path(uri)?;
-        let sema = self.sema(&path)?;
+        let (_snapshot, sema) = self.file(uri)?;
         Some(selection_range::selection_ranges(&sema, positions))
     }
 
@@ -909,18 +893,19 @@ impl Server {
     /// when nothing changed — including the formatters' parse-error
     /// "return input unchanged" guarantee, which must not become an error.
     fn formatting(&self, uri: &Uri) -> Option<Vec<TextEdit>> {
+        // The one handler that needs no semantic view: the formatter takes the
+        // text and re-parses it itself.
         let path = uri_to_path(uri)?;
         let text = self.host.snapshot().file_text(&path)?;
         let formatted = luabox_syntax::lua::fmt::format(&text, self.dialect);
-        Some(fmt::full_document_edits(&text, &formatted))
+        Some(fmt::formatting(&text, &formatted))
     }
 
     fn semantic_tokens(&self, uri: &Uri) -> Option<SemanticTokensResult> {
-        let path = uri_to_path(uri)?;
-        let data = semantic_tokens::lua_tokens(&self.sema(&path)?);
+        let (_snapshot, sema) = self.file(uri)?;
         Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,
-            data,
+            data: semantic_tokens::semantic_tokens(&sema),
         }))
     }
 
@@ -928,10 +913,8 @@ impl Server {
     /// display-mode inference's binding types and inferred function
     /// returns (see [`crate::inlay_hints`]).
     fn inlay_hints(&self, uri: &Uri, range: lsp_types::Range) -> Option<Vec<InlayHint>> {
-        let path = uri_to_path(uri)?;
-        let snapshot = self.host.snapshot();
-        let sema = FileSema::new(&snapshot, &path)?;
-        let inferred = snapshot.binding_types(&path)?;
+        let (snapshot, sema) = self.file(uri)?;
+        let inferred = snapshot.binding_types(&sema.path)?;
         let start = sema.index.offset(range.start);
         let end = sema.index.offset(range.end);
         Some(inlay_hints::inlay_hints(
@@ -956,11 +939,9 @@ impl Server {
         reason = "WorkspaceEdit keys its edits by Uri; the lint's interior-mutability concern does not affect Uri's hash"
     )]
     fn code_actions(&self, uri: &Uri, range: lsp_types::Range) -> Option<Vec<CodeActionOrCommand>> {
-        let path = uri_to_path(uri)?;
-        let snapshot = self.host.snapshot();
-        let text = snapshot.file_text(&path)?;
-        let index = LineIndex::new(text);
-        let rel = path.to_string_lossy();
+        let (snapshot, sema) = self.file(uri)?;
+        let index = &sema.index;
+        let rel = sema.path.to_string_lossy();
         let outcome = lint_source(
             &rel,
             index.text(),
@@ -1001,7 +982,7 @@ impl Server {
                 title,
                 kind: Some(CodeActionKind::QUICKFIX),
                 diagnostics: source_diag
-                    .map(|d| vec![diagnostics::convert(&index, d, diagnostics::LINT_SOURCE)]),
+                    .map(|d| vec![diagnostics::convert(index, d, diagnostics::LINT_SOURCE)]),
                 edit: Some(WorkspaceEdit {
                     changes: Some(changes),
                     ..WorkspaceEdit::default()
@@ -1016,30 +997,24 @@ impl Server {
         // types; the type diagnostics (recomputed with the same helper and
         // context as `publish_lua`, so an `LB0302` offered on a quick-fix is
         // byte-identical to the published one) drive add-missing-field.
-        if let Some(sema) = FileSema::new(&snapshot, &path) {
-            let inferred = snapshot.binding_types(&path);
-            let ctx = diagnostics::CheckCtx {
-                strictness: self.strictness,
-                ambient: &self.ambient,
-                lint: &self.lint,
-                known_globals: &self.known_globals,
-            };
-            let type_diags = diagnostics::lua_diagnostics(&snapshot, &path, self.dialect, &ctx)
-                .unwrap_or_default();
-            actions.extend(code_action::type_actions(
-                &sema,
-                inferred.as_ref(),
-                &type_diags,
-                uri,
-                start,
-                end,
-            ));
-        }
+        let inferred = snapshot.binding_types(&sema.path);
+        let ctx = diagnostics::CheckCtx {
+            strictness: self.strictness,
+            ambient: &self.ambient,
+            lint: &self.lint,
+            known_globals: &self.known_globals,
+        };
+        let type_diags =
+            diagnostics::diagnostics(&snapshot, &sema.path, self.dialect, &ctx).unwrap_or_default();
+        actions.extend(code_action::code_actions(
+            &sema,
+            inferred.as_ref(),
+            &type_diags,
+            uri,
+            start,
+            end,
+        ));
         Some(actions)
-    }
-
-    fn sema(&self, path: &Path) -> Option<FileSema> {
-        FileSema::new(&self.host.snapshot(), path)
     }
 
     // === Notifications ====================================================
@@ -1180,7 +1155,7 @@ impl Server {
             known_globals: &self.known_globals,
         };
         let diags =
-            diagnostics::lua_diagnostics(&analysis, path, self.dialect, &ctx).unwrap_or_default();
+            diagnostics::diagnostics(&analysis, path, self.dialect, &ctx).unwrap_or_default();
         self.publish(uri, diags)
     }
 

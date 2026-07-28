@@ -141,6 +141,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+    use crate::testutil::write;
 
     /// Deliberately mis-formatted source, and what `lua::fmt::format`
     /// canonicalizes it to — computed rather than hard-coded so these tests
@@ -152,16 +153,10 @@ mod tests {
         lua::fmt::format(MESSY, dialect)
     }
 
-    fn write(root: &Path, rel: &str, contents: &str) {
-        let path = root.join(rel);
-        fs::create_dir_all(path.parent().expect("has a parent")).expect("create parents");
-        fs::write(&path, contents).expect("write file");
-    }
-
+    /// A manifest whose only extra table is the `[build] out` these tests
+    /// vary — `fmt` skips the emitted tree, so the out dir is the subject.
     fn manifest(edition: &str, out: &str) -> String {
-        format!(
-            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"{edition}\"\n\n[build]\nout = \"{out}\"\n"
-        )
+        crate::testutil::manifest(edition, &format!("\n[build]\nout = \"{out}\"\n"))
     }
 
     #[test]

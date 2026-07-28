@@ -211,7 +211,18 @@ mod tests {
 
     #[test]
     fn version_gate() {
-        let err = BundleMap::from_json(r#"{"version":2,"bundle":"x","files":[],"lines":[]}"#);
-        assert!(err.is_err());
+        // A well-formed payload declaring a version this build cannot read is
+        // rejected as a *version* problem, naming the version it found and the
+        // one it reads — not as malformed JSON.
+        let err = BundleMap::from_json(r#"{"version":2,"bundle":"x","files":[],"lines":[]}"#)
+            .expect_err("version 2 is not readable");
+        assert!(
+            matches!(err, crate::BundleError::SourceMapVersion(2)),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "unsupported .lua.map version 2 (this luabox reads version 1)"
+        );
     }
 }

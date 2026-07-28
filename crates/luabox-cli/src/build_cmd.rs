@@ -657,30 +657,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
-
-    /// Write `contents` to `root/rel`, creating parent directories.
-    fn write(root: &Path, rel: &str, contents: &str) {
-        let path = root.join(rel);
-        fs::create_dir_all(path.parent().expect("has a parent")).expect("create parents");
-        fs::write(&path, contents).expect("write file");
-    }
-
-    fn read(root: &Path, rel: &str) -> String {
-        fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("reading {rel}: {e}"))
-    }
-
-    fn manifest(edition: &str, extra: &str) -> String {
-        format!(
-            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"{edition}\"\n{extra}"
-        )
-    }
-
-    /// A project rooted in a fresh tempdir with `luabox.toml` in place.
-    fn project(edition: &str, extra: &str) -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write(tmp.path(), "luabox.toml", &manifest(edition, extra));
-        tmp
-    }
+    use crate::testutil::{project, read, write};
 
     /// `BuildOptions` with every override unset — the shape `luabox build`
     /// with no flags hands to [`run`].
@@ -1352,22 +1329,29 @@ mod tests {
     fn a_warn_tier_lowering_diagnostic_maps_to_a_warning_not_an_error() {
         let lowered = luabox_lower::lower(FLOOR_DIV, Dialect::Lua54, Dialect::Lua51)
             .expect("floor division lowers");
-        assert!(!lowered.warnings.is_empty());
+        // One warning, about the one `//` in the fixture.
+        assert_eq!(lowered.warnings.len(), 1, "{:?}", lowered.warnings);
         let diags = to_diagnostics(&lowered.warnings, "src/main.lua");
-        assert!(
-            diags
-                .iter()
-                .all(|d| d.severity == luabox_diag::Severity::Warning),
-            "{diags:?}"
-        );
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, luabox_diag::Severity::Warning);
+        assert_eq!(diags[0].code.to_string(), lowered.warnings[0].code);
+        assert_eq!(diags[0].message, lowered.warnings[0].message);
     }
 
     #[test]
     fn a_lowering_warning_is_reported_alongside_the_emitted_file() {
         let (output, diags) = lower_one(FLOOR_DIV, "src/main.lua", Dialect::Lua54, Dialect::Lua51);
-        // Output *and* diagnostics: warnings never suppress the emit.
-        assert!(output.is_some());
-        assert!(!diags.is_empty());
+        // Output *and* diagnostics: warnings never suppress the emit, and the
+        // emitted text is the lowered form rather than the input echoed back.
+        let output = output.expect("a warn-tier lowering still emits");
+        assert!(output.contains("math.floor"), "{output}");
+        assert!(!output.contains("//"), "{output}");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].severity, luabox_diag::Severity::Warning);
+        assert_eq!(
+            diags[0].primary_label().map(|l| l.span.file.as_str()),
+            Some("src/main.lua")
+        );
     }
 
     #[test]
@@ -1498,6 +1482,11 @@ mod tests {
         write(tmp.path(), "dist/main.lua", "return 0\n");
         write(tmp.path(), "dist/main.lua.map", "not json at all");
 
-        assert!(unmap(tmp.path(), Path::new("dist/main.lua"), Some("boom")).is_err());
+        // The map was found and rejected as JSON — a different failure from
+        // the missing-map one above, and it says so.
+        let error = unmap(tmp.path(), Path::new("dist/main.lua"), Some("boom")).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("invalid .lua.map"), "{rendered}");
+        assert!(!rendered.contains("--sourcemap"), "{rendered}");
     }
 }

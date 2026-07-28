@@ -18,7 +18,7 @@ use crate::uri::path_to_uri;
 /// Every implementor of the `---@class` under `offset`: the declaration site of
 /// each workspace class that lists it as a parent.
 #[must_use]
-pub fn goto_implementation(
+pub fn implementation(
     analysis: &Analysis,
     target: &FileSema,
     offset: usize,
@@ -119,7 +119,7 @@ mod tests {
     fn run(files: &[(&str, &str)], offset: usize) -> Option<Vec<Location>> {
         let (analysis, path) = analyze(files);
         let target = FileSema::new(&analysis, &path).expect("target sema");
-        goto_implementation(&analysis, &target, offset)
+        implementation(&analysis, &target, offset)
     }
 
     #[test]

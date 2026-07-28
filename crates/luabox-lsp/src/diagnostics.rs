@@ -45,7 +45,7 @@ pub struct CheckCtx<'a> {
 /// Diagnostics for one `.lua` file known to `analysis`, plus the line index
 /// used to convert them. `None` when the file is unknown.
 #[must_use]
-pub fn lua_diagnostics(
+pub fn diagnostics(
     analysis: &Analysis,
     path: &Path,
     dialect: Dialect,
@@ -202,7 +202,7 @@ mod tests {
             lint: &lint,
             known_globals: &known_globals,
         };
-        lua_diagnostics(&analysis, &path, dialect, &ctx).expect("diagnostics")
+        diagnostics(&analysis, &path, dialect, &ctx).expect("diagnostics")
     }
 
     fn codes(diags: &[Diagnostic]) -> Vec<&str> {
@@ -268,8 +268,6 @@ mod tests {
             lint: &lint,
             known_globals: &known_globals,
         };
-        assert!(
-            lua_diagnostics(&analysis, &path_for("absent.lua"), Dialect::Lua54, &ctx).is_none()
-        );
+        assert!(diagnostics(&analysis, &path_for("absent.lua"), Dialect::Lua54, &ctx).is_none());
     }
 }

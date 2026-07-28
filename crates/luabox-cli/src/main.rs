@@ -12,6 +12,8 @@ mod lsp_cmd;
 mod modes;
 mod project;
 mod scaffold;
+#[cfg(test)]
+mod testutil;
 mod upgrade_cmd;
 mod watch;
 
