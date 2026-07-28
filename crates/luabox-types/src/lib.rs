@@ -26,7 +26,7 @@
 //! `local M = require("mod")` types `M` from the required module's
 //! annotations — conformance assertions work in consumer files, not just
 //! the defining file (#85). The CLI (`check_cmd`) and LSP
-//! (`lua_diagnostics`) each build the registry + merged ambient from the
+//! (`diagnostics`) each build the registry + merged ambient from the
 //! project source set, reusing the bundler's / salsa DB's `require`
 //! path-mapping.
 //!
