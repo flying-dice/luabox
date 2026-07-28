@@ -133,7 +133,12 @@ impl FileTypes {
                         let mut def = env.classes.get(&c.name).cloned().unwrap_or_default();
                         if let Some(Ty::Table(carrier)) = carriers.get(&c.name) {
                             for (member, field) in &carrier.fields {
-                                if !def.fields.contains_key(member) {
+                                // A same-name `---@field` shadows the attachment
+                                // on type, but keeps its use-site tags (#33).
+                                if let Some(declared) = def.fields.get(member) {
+                                    let merged = with_carrier_tags(declared, field);
+                                    def.fields.insert(member.clone(), merged);
+                                } else {
                                     def.methods.insert(member.clone(), field.clone());
                                 }
                             }
@@ -401,7 +406,13 @@ impl TypeEnv {
                             .or_insert_with(|| ty.clone());
                     }
                     for (member, ty) in &def.methods {
-                        if !existing.fields.contains_key(member) {
+                        // As in [`FileTypes::collect`]: the existing `---@field`
+                        // declaration wins on type, but inherits the incoming
+                        // attachment's use-site tags (#33).
+                        if let Some(declared) = existing.fields.get(member) {
+                            let merged = with_carrier_tags(declared, ty);
+                            existing.fields.insert(member.clone(), merged);
+                        } else {
                             existing
                                 .methods
                                 .entry(member.clone())
@@ -1571,6 +1582,39 @@ fn is_table_constructor(assign: &lua::ast::AssignStmt) -> bool {
         assign.values().and_then(|v| v.exprs().next()),
         Some(Expr::Table(_))
     )
+}
+
+/// A declared `---@field` that shadows a same-class carrier attachment, with
+/// the attachment's use-site tags (`---@deprecated`, `---@async`,
+/// `---@version`) folded in.
+///
+/// The `---@field` line stays authoritative for the member's type — parameters,
+/// returns, overloads and generics all come from it — but its `fun(...)` syntax
+/// cannot express those tags, so they only ever live on the carrier
+/// (`---@deprecated` above `function C:m()`). Applied at the two points a
+/// shadowed attachment is otherwise dropped — [`FileTypes::collect`], which
+/// folds a file's carriers into its exported surface, and
+/// [`TypeEnv::merge_file_types`], which folds that surface into the ambient —
+/// so the tags survive into the *consumer* file's class shape. The same-file
+/// half is `crate::infer::Inferencer::carrier_tagged`, which reads the live
+/// carrier shape directly. Non-function members, and attachments carrying no
+/// tags, pass the declaration through unchanged (#33).
+fn with_carrier_tags(declared: &FieldTy, carrier: &FieldTy) -> FieldTy {
+    let (Ty::Function(declared_sig), Ty::Function(carrier_sig)) = (&declared.ty, &carrier.ty)
+    else {
+        return declared.clone();
+    };
+    if !carrier_sig.deprecated && !carrier_sig.is_async && carrier_sig.version.is_none() {
+        return declared.clone();
+    }
+    let mut sig = (**declared_sig).clone();
+    sig.deprecated |= carrier_sig.deprecated;
+    sig.is_async |= carrier_sig.is_async;
+    sig.version = sig.version.or_else(|| carrier_sig.version.clone());
+    FieldTy {
+        ty: Ty::Function(Box::new(sig)),
+        optional: declared.optional,
+    }
 }
 
 /// The literal type of a literal expression, if it is one.

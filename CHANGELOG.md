@@ -97,6 +97,19 @@ so it appears in no version entry.
   and the generic unknown-table error sent readers looking for a misspelling.
   The error for exactly these two names now ends `— removed in 0.2.0, see
   CHANGELOG.md`; every other unknown table is unaffected.
+- **`---@deprecated` and `---@async` on a method carrier now reach `obj:method()`
+  call sites** ([#33](https://github.com/flying-dice/luabox/issues/33)). Two
+  carrier shapes swallowed the tags. A plain prototype table (`local P = {}` +
+  `P.__index = P`, no `---@class`) published no method signature at all, because
+  publication was gated on a declared-class receiver — a gate that belongs to
+  *argument* checking, not to tags the author wrote on the method itself; the
+  gate now governs only argument checking, and `LB0308`/`LB0316` fire for any
+  resolved receiver while a structurally-resolved call stays free of
+  manufactured arity findings. A method that is both `---@field`-declared and
+  defined lost them too: the declaration shadows the carrier, and `fun(...)`
+  syntax has nowhere to write a tag, so the declaration now inherits the
+  carrier's `---@deprecated`/`---@async`/`---@version` while still governing
+  parameters and returns — same-file and across the project surface.
 - **`luabox doc` refuses to generate while parse errors exist**
   ([#24](https://github.com/flying-dice/luabox/issues/24)) — a file that
   does not parse has no trustworthy harvest. One rule: project sources

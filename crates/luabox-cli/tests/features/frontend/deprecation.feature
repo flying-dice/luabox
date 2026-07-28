@@ -47,6 +47,84 @@ Feature: luabox check — luals-parity doc diagnostics (#111, #112, #113)
     Then the command succeeds
     And stdout does not contain "LB0308"
 
+  Scenario: a deprecated method is flagged at a `:` call site
+    Given a project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Widget
+      local Widget = {}
+      Widget.__index = Widget
+
+      ---@deprecated
+      function Widget:legacy() end
+
+      ---@return Widget
+      function Widget.new()
+        return setmetatable({}, Widget)
+      end
+
+      Widget.new():legacy()
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stdout contains "warning[LB0308]"
+    And stdout contains "use of deprecated `legacy`"
+
+  Scenario: a deprecated method on a plain prototype is flagged at a `:` call site
+    Given a project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      local Proto = {}
+      Proto.__index = Proto
+
+      ---@deprecated
+      function Proto:legacy() end
+
+      local p = setmetatable({}, Proto)
+      p:legacy()
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stdout contains "warning[LB0308]"
+    And stdout contains "use of deprecated `legacy`"
+
+  Scenario: a `---@field`-declared method still carries its carrier's `---@deprecated`
+    Given a project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Decl
+      ---@field legacy fun(self: Decl)
+      local Decl = {}
+      Decl.__index = Decl
+
+      ---@deprecated
+      function Decl:legacy() end
+
+      ---@type Decl
+      local d
+      d:legacy()
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stdout contains "warning[LB0308]"
+    And stdout contains "use of deprecated `legacy`"
+
+  Scenario: a method with no deprecation tag keeps the `:` call site clean
+    Given a project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      local Proto = {}
+      Proto.__index = Proto
+
+      function Proto:current() end
+
+      local p = setmetatable({}, Proto)
+      p:current()
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stdout does not contain "LB0308"
+
   Scenario: discarding a nodiscard return is flagged
     Given a project with edition "5.4"
     And a file "src/main.lua" containing:

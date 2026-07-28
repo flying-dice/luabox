@@ -85,7 +85,7 @@ pub(crate) struct InferenceView<'a> {
     pub expr_types: &'a HashMap<(usize, usize), Ty>,
     /// Resolved `:` method-call signatures keyed by the call's byte range
     /// ([`crate::infer::Outcome::method_sigs`]).
-    pub method_sigs: &'a HashMap<(usize, usize), FunctionTy>,
+    pub method_sigs: &'a HashMap<(usize, usize), crate::infer::MethodSig>,
     /// Final accumulated shape of each `---@type`/`---@class` carrier local,
     /// keyed by the `local` statement's byte range
     /// ([`crate::infer::Outcome::carrier_final`]).
@@ -258,10 +258,11 @@ struct Checker<'a> {
     inferred: &'a HashMap<(usize, usize), Ty>,
     /// Resolved `:` method-call signatures keyed by the method-call
     /// expression's byte range — inference's method resolution (#118). Present
-    /// only when the receiver resolved to a declared `---@class` and the method
-    /// is an annotated function; the checker argument-checks the call against
-    /// it and reports nothing when it is absent (conservatism).
-    method_sigs: &'a HashMap<(usize, usize), FunctionTy>,
+    /// only when the method resolved to an annotated function; the checker
+    /// reports its use-site tags, argument-checks the call when
+    /// [`crate::infer::MethodSig::args_checkable`], and reports nothing at all
+    /// when the entry is absent (conservatism).
+    method_sigs: &'a HashMap<(usize, usize), crate::infer::MethodSig>,
     /// Final accumulated shape of each `---@type` carrier local, keyed by the
     /// `local` statement's byte range (whole-carrier deferral).
     /// `---@class` carriers publish their reified shape here too (#107).
@@ -1633,22 +1634,29 @@ impl Checker<'_> {
     /// Check a `:` method call against its resolved method signature. The
     /// inference engine resolves the receiver through class shapes /
     /// `__index` / `self`, and publishes the method's signature keyed by the
-    /// call's byte range *only* when the receiver is a declared `---@class`
-    /// and the member is an annotated function ([`Checker::method_sigs`]) —
-    /// so this is a strict no-op for an unknown/`any`/union receiver, a plain
-    /// inferred table with no declared class, an unannotated method, or an
-    /// unresolved metatable (SPEC §19 conservatism; no false positives).
+    /// call's byte range *only* when the member is an annotated function
+    /// ([`Checker::method_sigs`]) — so this is a strict no-op for an
+    /// unknown/`any`/union receiver, an unannotated method, or an unresolved
+    /// metatable (SPEC §19 conservatism; no false positives).
     ///
-    /// When a signature is present, the call's *explicit* arguments (the
-    /// implicit `self` stripped from the signature) are checked exactly like a
-    /// dotted/free call through the same [`Checker::check_arg_slots`] path, and
-    /// a `---@deprecated` method is flagged at its name span (luals
-    /// `deprecated`, LB0308).
+    /// When a signature is present, the callee's use-site tags are reported at
+    /// the method's name span: `---@deprecated` (luals `deprecated`, LB0308),
+    /// an excluding `---@version`, and `---@async` called from a non-async
+    /// enclosing function (luals `await-in-sync`, LB0316). These hold for every
+    /// resolved receiver, including a plain prototype table with no declared
+    /// `---@class` (#33).
+    ///
+    /// The call's *explicit* arguments (the implicit `self` stripped from the
+    /// signature) are then checked exactly like a dotted/free call through the
+    /// same [`Checker::check_arg_slots`] path — but only for a declared
+    /// `---@class` receiver, whose contract is authoritative
+    /// ([`crate::infer::MethodSig::args_checkable`]).
     fn check_method_call(&mut self, call: &MethodCallExpr) {
-        let Some(sig) = self.method_sigs.get(&range_key(call.syntax())) else {
+        let Some(resolved) = self.method_sigs.get(&range_key(call.syntax())) else {
             return;
         };
-        let mut sig = sig.clone();
+        let args_checkable = resolved.args_checkable;
+        let mut sig = resolved.sig.clone();
         // The implicit `self` receiver is never an explicit argument. It only
         // appears in the signature when declared with an explicit
         // `---@param self T` or reified from an unannotated body; drop it so the
@@ -1689,6 +1697,9 @@ impl Checker<'_> {
                 Some(&name),
                 usize::from(r.start())..usize::from(r.end()),
             );
+        }
+        if !args_checkable {
+            return;
         }
         let (mut slots, string_arg) = arg_slots(call.args());
         if let Some((ty, range)) = string_arg {

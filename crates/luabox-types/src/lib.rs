@@ -541,6 +541,74 @@ f(\"x\", 42)
     }
 
     #[test]
+    fn closest_overload_prefers_the_better_type_fit_at_equal_arity() {
+        // Both candidates are arity-fit for `f(1, true)`, so ranking falls to
+        // type fit: the overload matches one argument (`1` against `number`),
+        // the primary matches none. Reporting against the overload leaves a
+        // single mismatch on the second argument; the primary would have
+        // produced two.
+        let src = "\
+---@param a string
+---@param b string
+---@overload fun(a: number, b: string)
+local function f(a, b) end
+f(1, true)
+";
+        let diags = check(src, Strictness::Strict);
+        assert_eq!(
+            diags.iter().map(|d| d.code.to_string()).collect::<Vec<_>>(),
+            vec!["LB0300"],
+            "only the second argument should mismatch: {diags:?}"
+        );
+        assert_eq!(diags[0].labels[0].message, "expected `string`");
+    }
+
+    #[test]
+    fn closest_overload_keeps_the_primary_on_a_tie() {
+        // Equal arity fit, equal (zero) type fit: the declaration-order
+        // tie-break keeps the primary, so the message names *its* parameter
+        // type, not the overload's.
+        let src = "\
+---@param a string
+---@overload fun(a: number)
+local function f(a) end
+f(true)
+";
+        let diags = check(src, Strictness::Strict);
+        assert_eq!(
+            diags.iter().map(|d| d.code.to_string()).collect::<Vec<_>>(),
+            vec!["LB0300"]
+        );
+        assert_eq!(diags[0].labels[0].message, "expected `string`");
+    }
+
+    #[test]
+    fn closest_overload_arity_fit_outranks_the_primary_entirely() {
+        // The primary cannot take two arguments at all; the overload can. The
+        // reported *code set* changes as a result: against the primary this
+        // would be a type mismatch plus LB0301 ("unexpected extra argument"),
+        // against the overload it is two type mismatches and no arity finding.
+        let src = "\
+---@param a string
+---@overload fun(a: number, b: number)
+local function f(a) end
+f(true, false)
+";
+        let diags = check(src, Strictness::Strict);
+        assert_eq!(
+            diags.iter().map(|d| d.code.to_string()).collect::<Vec<_>>(),
+            vec!["LB0300", "LB0300"],
+            "should report against the 2-arg overload, not the 1-arg primary"
+        );
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.labels[0].message == "expected `number`"),
+            "both labels should name the overload's parameter type: {diags:?}"
+        );
+    }
+
+    #[test]
     fn optional_params_and_varargs_relax_arity() {
         let src = "\
 ---@param a number
@@ -1346,6 +1414,200 @@ w:nonexistent(1, 2, 3)
         let codes = strict_codes_ambient(&src);
         assert_eq!(codes, vec!["LB0306"]);
         assert!(!codes.iter().any(|c| c == "LB0300" || c == "LB0301"));
+    }
+
+    // --- #33 use-site tags on `function Class:method()` carriers -------------
+    //
+    // `---@deprecated` (LB0308) and `---@async` (LB0316) written on a method
+    // carrier must reach `obj:method()` exactly as they do a free or dotted
+    // call. Two carrier shapes used to swallow them: a plain prototype table
+    // (no `---@class`, so no signature was published at all) and a method that
+    // is *both* `---@field`-declared and defined (the declaration shadowed the
+    // carrier the tags live on). Both are covered here, fire and not-fire.
+
+    /// A plain prototype — no `---@class` anywhere — carrying a tagged method
+    /// and an untagged one.
+    const PROTOTYPE_CARRIER: &str = "\
+local Proto = {}
+Proto.__index = Proto
+
+---@deprecated
+function Proto:legacy() end
+
+---@async
+function Proto:fetch() end
+
+---@param n number
+function Proto:resize(n) end
+";
+
+    /// A `---@class` whose methods are *both* `---@field`-declared and defined,
+    /// the declaration shadowing the carrier the tags are written on.
+    const FIELD_DECLARED_CARRIER: &str = "\
+---@class Decl
+---@field legacy fun(self: Decl)
+---@field fetch fun(self: Decl)
+---@field resize fun(self: Decl, n: number)
+local Decl = {}
+Decl.__index = Decl
+
+---@deprecated
+function Decl:legacy() end
+
+---@async
+function Decl:fetch() end
+
+function Decl:resize(n) end
+";
+
+    #[test]
+    fn deprecated_method_on_plain_prototype_flagged() {
+        let src = format!(
+            "{PROTOTYPE_CARRIER}
+local p = setmetatable({{}}, Proto)
+p:legacy()
+"
+        );
+        assert_eq!(strict_codes_ambient(&src), vec!["LB0308"]);
+    }
+
+    #[test]
+    fn untagged_method_on_plain_prototype_is_clean() {
+        let src = format!(
+            "{PROTOTYPE_CARRIER}
+local p = setmetatable({{}}, Proto)
+p:resize(1)
+"
+        );
+        assert_eq!(strict_codes_ambient(&src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn plain_prototype_method_args_stay_unchecked() {
+        // Publishing the signature for its tags must not start argument-checking
+        // a structurally-resolved receiver: a plain prototype has no declared
+        // class, so a wrong-typed or mis-counted argument stays silent exactly
+        // as before (SPEC §19 conservatism). Only the tag is reported.
+        let src = format!(
+            "{PROTOTYPE_CARRIER}
+local p = setmetatable({{}}, Proto)
+p:resize(\"nope\")
+p:resize(1, 2, 3)
+p:legacy(\"unexpected\")
+"
+        );
+        assert_eq!(strict_codes_ambient(&src), vec!["LB0308"]);
+    }
+
+    #[test]
+    fn async_method_on_plain_prototype_flagged() {
+        let src = format!(
+            "{PROTOTYPE_CARRIER}
+local p = setmetatable({{}}, Proto)
+local function sync()
+  p:fetch()
+end
+"
+        );
+        assert_eq!(strict_codes_ambient(&src), vec!["LB0316"]);
+    }
+
+    #[test]
+    fn async_method_on_plain_prototype_in_async_caller_is_clean() {
+        let src = format!(
+            "{PROTOTYPE_CARRIER}
+local p = setmetatable({{}}, Proto)
+---@async
+local function poll()
+  p:fetch()
+end
+"
+        );
+        assert_eq!(strict_codes_ambient(&src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn deprecated_method_declared_as_field_flagged() {
+        let src = format!(
+            "{FIELD_DECLARED_CARRIER}
+---@type Decl
+local d
+d:legacy()
+"
+        );
+        assert_eq!(strict_codes_ambient(&src), vec!["LB0308"]);
+    }
+
+    #[test]
+    fn untagged_method_declared_as_field_is_clean() {
+        let src = format!(
+            "{FIELD_DECLARED_CARRIER}
+---@type Decl
+local d
+d:resize(1)
+"
+        );
+        assert_eq!(strict_codes_ambient(&src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn field_declared_method_keeps_its_declared_signature() {
+        // The tag carry-over must not disturb the `---@field` declaration: its
+        // parameter list still governs, so a wrong-typed argument is LB0300 and
+        // the deprecation is still reported alongside it.
+        let src = format!(
+            "{FIELD_DECLARED_CARRIER}
+---@type Decl
+local d
+d:resize(\"nope\")
+d:legacy()
+"
+        );
+        assert_eq!(strict_codes_ambient(&src), vec!["LB0300", "LB0308"]);
+    }
+
+    #[test]
+    fn async_method_declared_as_field_flagged() {
+        let src = format!(
+            "{FIELD_DECLARED_CARRIER}
+---@type Decl
+local d
+local function sync()
+  d:fetch()
+end
+"
+        );
+        assert_eq!(strict_codes_ambient(&src), vec!["LB0316"]);
+    }
+
+    #[test]
+    fn async_method_declared_as_field_in_async_caller_is_clean() {
+        let src = format!(
+            "{FIELD_DECLARED_CARRIER}
+---@type Decl
+local d
+---@async
+local function poll()
+  d:fetch()
+end
+"
+        );
+        assert_eq!(strict_codes_ambient(&src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn method_tags_reach_a_self_call_through_a_field_declaration() {
+        // The receiver shape route (`self` inside a sibling method) resolves
+        // through the same declared class shape as `---@type Decl`.
+        let src = format!(
+            "{FIELD_DECLARED_CARRIER}
+function Decl:go()
+  self:legacy()
+  self:fetch()
+end
+"
+        );
+        assert_eq!(strict_codes_ambient(&src), vec!["LB0308", "LB0316"]);
     }
 
     // --- enums, aliases, LB0305 -----------------------------------------
