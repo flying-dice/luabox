@@ -1,5 +1,12 @@
 # Production-readiness assessment (2026-07-25)
 
+> **Dated record.** Figures below are as measured at each section's date;
+> `.github/workflows/ci.yml` is authoritative for the current coverage
+> floors, and the suites have grown since sign-off. As of the post-release
+> backlog burn-down (2026-07-26, #19–#32): ~2,045 workspace tests,
+> 669 CLI + 180 LSP black-box scenarios, **e2e 85.7% (floor 83)**,
+> **unit 96.9% (floor 95, per-crate 92 enforced)**.
+
 A point-in-time quality baseline for the workspace, plus the scope
 evaluation it feeds (below). Numbers were measured on `main` at
 `8b6efb5` with the pinned 1.92.0 toolchain; the coverage gate added to
