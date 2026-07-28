@@ -60,5 +60,11 @@ output) to your own Lua: every runnable example here targets **Lua 5.1**, and
 
 `scripts/examples.ps1` (Windows) and `scripts/examples.sh` (Linux/macOS) run
 the full gate — check, fmt, lint, plus per-example extras (build, bundle,
-`.love` packaging). Neither needs a Lua interpreter. CI runs the bash script
+`.love` packaging). One of those steps *does* want a Lua 5.1 interpreter:
+both scripts execute the `timemachine` bundle they just built, because a
+compiler whose output is never run is only checked against its own opinion of
+it. `unzip` is wanted the same way, to inspect the `.love` archive. Those
+tools belong to the harness, not to luabox — with neither on `PATH` the step
+SKIPs loudly and the gate still passes, so a dev box needs nothing installed.
+Linux CI installs both, so there the step always runs. CI runs the bash script
 on every push.

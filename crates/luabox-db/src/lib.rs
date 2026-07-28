@@ -3,9 +3,16 @@
 //!
 //! This crate is luabox's salsa layer: it wraps the shipped producers
 //! ([`luabox_syntax`], [`luabox_hir`], [`luabox_types`]) in memoized queries so
-//! that editing one file re-analyses only what actually depends on it. It is
-//! the shared engine behind `check`, `lint`, `fmt`, and the LSP — SPEC.md §16
-//! names the salsa DB as the Semantics boundary contract.
+//! that editing one file re-analyses only what actually depends on it.
+//!
+//! **Its only consumer today is `luabox-lsp`.** SPEC.md §16 designates the
+//! salsa DB as the shared Semantics engine behind `check`/`lint`/`fmt` as
+//! well, and that is still the intent — but the CLI does not depend on this
+//! crate at all: `check`, `lint` and `fmt` each drive the producers directly,
+//! one batch pass per invocation. That is a real architectural gap, not a
+//! deliberate split — it means the incremental story is proven only through
+//! the editor, and `check --watch` re-analyses from scratch where the LSP
+//! would reuse memoized queries.
 //!
 //! # Layers
 //!
@@ -22,7 +29,7 @@
 //!   store (editor buffers shadow disk).
 //! - **Boundary** — [`AnalysisHost`] (mutable world + `apply_change`) and
 //!   [`Analysis`] (immutable snapshot with `diagnostics`/`parse`/…). The LSP
-//!   (P1, ticket #14) consumes exactly these two types and nothing deeper.
+//!   (P1, GL#14) consumes exactly these two types and nothing deeper.
 //!
 //! # Salsa idiom
 //!

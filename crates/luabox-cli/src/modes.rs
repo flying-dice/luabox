@@ -1,4 +1,4 @@
-//! Bundler embedding modes (SPEC.md §7, ticket #32, flying-dice/luabox#4).
+//! Bundler embedding modes (SPEC.md §7, GL#32, flying-dice/luabox#4).
 //!
 //! `luabox build --mode <mode>` (or `[build] mode` in the manifest) picks
 //! how the single-file bundle from `luabox_bundle::bundle` is packaged for
@@ -55,7 +55,7 @@
 //!
 //! - **Windows**: the system `bsdtar`
 //!   (`%SystemRoot%\System32\tar.exe`, the same trick
-//!   `toolchain_cmd::tar_program` uses — bundled since Windows 10 1809, so
+//!   `upgrade_cmd::tar_program` uses — bundled since Windows 10 1809, so
 //!   present on every supported Windows version) via `tar --format zip -cf`.
 //!   `--format zip` is required explicitly: `-a`'s extension-sniffing
 //!   doesn't recognize `.love`, and silently falls back to a plain POSIX
@@ -279,9 +279,10 @@ fn ps_quote(s: &str) -> String {
 }
 
 /// Locate the Windows-bundled `bsdtar` at `%SystemRoot%\System32\tar.exe`
-/// — the same trick `toolchain_cmd::tar_program` uses to make sure a
-/// git-shipped GNU tar earlier on `PATH` (which cannot create zip archives
-/// at all) doesn't shadow it. Returns `None` on a non-standard Windows
+/// by absolute path, so that a git-shipped GNU tar earlier on `PATH` (which
+/// cannot create zip archives at all) doesn't shadow it — the same trick
+/// `upgrade_cmd::tar_program` uses to unpack a release `.zip`. Returns
+/// `None` on a non-standard Windows
 /// install missing it, in which case the caller falls back to
 /// `Compress-Archive`.
 fn system_bsdtar() -> Option<PathBuf> {

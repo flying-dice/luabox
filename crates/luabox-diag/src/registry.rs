@@ -233,11 +233,6 @@ static REGISTRY: &[Entry] = &[
         title: "unresolvable definition package",
         explain: LB1002,
     },
-    Entry {
-        code: Code::new(1003),
-        title: "dependency does not support the build target dialect",
-        explain: LB1003,
-    },
 ];
 
 /// Look up the explain entry for a code, if it is registered.
@@ -1534,66 +1529,52 @@ const LB1002: &str = "\
 `---@meta` `.d.lua` files that declare types for an environment your code
 runs in (a game engine, an editor API, a framework).
 
-An entry could not be resolved. Today definition packages are project-local:
-an entry `\"love2d\"` must exist as either
+An entry could not be resolved. Definition packages are project-local: an
+entry `\"love2d\"` must exist as either
 
 - `defs/love2d.d.lua`, or
 - `defs/love2d/` containing one or more `.d.lua` files,
 
-relative to the project root. Registry-distributed definition packages
-arrive with the package manager (SPEC.md §3, §6).
+relative to the project root. A dependency's own defs need no entry here —
+they are read from its `lua_modules/<name>/luabox.toml` and join your ambient
+scope automatically.
+
+There is no registry-distributed form of a definition package: dependency
+management is parked post-v1 (SPEC.md §6), so nothing fetches defs on your
+behalf. Vendor the `.d.lua` files into `defs/` yourself.
 
 Fix: create the defs file/directory, correct the name, or remove the entry.
-";
-
-const LB1003: &str = "\
-# LB1003: dependency does not support the build target dialect
-
-Every package declares the Lua dialects it is source-compatible with as an
-explicit **family set** — never a range (a range implies a total order that
-LuaJIT breaks: it is 5.1-plus-extensions, not a point between 5.1 and 5.2).
-A registry rock's set is translated from its rockspec `lua` constraint
-(`lua >= 5.1, < 5.4` admits `{5.1, 5.2, 5.3}`, plus `luajit` whenever `5.1` is
-admitted); a path/git package's set is its `luabox.toml` `[package]
-lua-versions`. An **absent** set is unconstrained — compatible with everything.
-
-A dependency is usable for your project's **`[build] target`** (which defaults
-to `[package] edition`) when **either**:
-
-- the target is in the dependency's declared family set, **or**
-- the dependency's own `edition` can be *lowered* to the target — luabox owns
-  the lowering pipeline and rewrites dependency sources alongside yours at
-  build time.
-
-This error means neither held: the target is not in the set, and the
-dependency offers no lowerable edition (a registry rock declares none, so it is
-judged purely on its set; and Luau — inexpressible as a PUC dialect — has no
-lowering path, which is how it stays fenced off).
-
-Fixes:
-
-- retarget your build to a dialect the dependency supports
-  (`[build] target` / `luabox build --target`);
-- pick a version (or an alternative package) whose set includes your target;
-- if you own the dependency, widen its `lua-versions` set (or its rockspec
-  `lua` constraint) once you have verified it on the target dialect.
 ";
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Every registered code is reachable through the public lookup, by the
+    /// same rendered string a user types at `luabox explain`.
+    ///
+    /// This used to be a hand-written list of code strings, which is exactly
+    /// the kind of assertion that rots: it silently kept asserting `LB1003`
+    /// long after the dialect-set check it documented was deleted, and it
+    /// never noticed that `LB1002` had joined the registry. Driving the loop
+    /// from [`all()`] makes the check complete by construction — a new entry
+    /// is covered the moment it is added, and a removed one takes its
+    /// coverage with it.
     #[test]
-    fn seeded_codes_are_all_present() {
-        for raw in [
-            "LB0001", "LB0010", "LB0011", "LB0012", "LB0013", "LB0014", "LB0015", "LB0016",
-            "LB0300", "LB0301", "LB0302", "LB0303", "LB0304", "LB0305", "LB0306", "LB0307",
-            "LB0308", "LB0309", "LB0310", "LB0311", "LB0312", "LB0313", "LB0314", "LB0315",
-            "LB0316", "LB0500", "LB0501", "LB0502", "LB0503", "LB0504", "LB0505", "LB0506",
-            "LB0507", "LB0508", "LB0509", "LB1001", "LB1003",
-        ] {
-            let code: Code = raw.parse().unwrap();
-            assert!(explain(&code).is_some(), "{raw} missing from registry");
+    fn every_registered_code_is_reachable_by_its_rendered_form() {
+        assert!(!all().is_empty(), "registry is empty");
+        for entry in all() {
+            let rendered = entry.code.to_string();
+            let parsed: Code = rendered
+                .parse()
+                .unwrap_or_else(|_| panic!("{rendered} does not parse back as a code"));
+            assert_eq!(parsed, entry.code, "{rendered} does not round-trip");
+            let found = explain(&parsed)
+                .unwrap_or_else(|| panic!("{rendered} missing from registry lookup"));
+            assert_eq!(
+                found.code, entry.code,
+                "{rendered} resolved to another entry"
+            );
         }
     }
 

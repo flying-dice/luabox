@@ -32,9 +32,11 @@
 //! # What this crate does *not* prove
 //!
 //! Semantics preservation is argued per rule (doc comments) and enforced
-//! mechanically by the reparse-under-target property tests; differential
+//! mechanically by the reparse-under-target property tests. Differential
 //! execution against real runtimes is CI-level (SPEC.md §16.1/§16.2) and
-//! lands with the toolchain manager work (ticket #23).
+//! ships today: `tools/differ` links this crate by path and
+//! `.github/workflows/differential.yml` sweeps `corpus/differ` on five
+//! interpreters as a merge-blocking job (GL#23).
 
 use std::collections::{BTreeSet, HashMap};
 

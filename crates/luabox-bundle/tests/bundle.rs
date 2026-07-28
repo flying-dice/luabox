@@ -2,7 +2,10 @@
 //! semantics, tree-shaking, dynamic-require diagnostics, lowering
 //! integration, minify, and sourcemap round-trips — with real-runtime
 //! verification against `lua` when it is on `PATH` (skipped gracefully
-//! otherwise; CI provides it via the toolchain work, ticket #23).
+//! otherwise). The `check` job that runs this suite installs no interpreter,
+//! so those legs are a local bonus; the merge-blocking real-runtime evidence
+//! is the differential sweep (`tools/differ`, five interpreters — GL#23) and
+//! the `examples` job, which executes a built bundle on `lua5.1`.
 
 // test code — panics document assumptions
 #![allow(
@@ -40,7 +43,7 @@ fn request<'a>(root: &'a Path, entry: &'a Path, from: Dialect, to: Dialect) -> B
     }
 }
 
-/// `lua` from `PATH`, when present (Lua 5.1 in CI/dev per ticket #23).
+/// `lua` from `PATH`, when present (Lua 5.1 in CI/dev per GL#23).
 fn lua() -> Option<&'static str> {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let ok = *AVAILABLE.get_or_init(|| {

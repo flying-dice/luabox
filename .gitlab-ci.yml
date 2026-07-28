@@ -1,11 +1,15 @@
 # GitLab CI for the private origin
 # (gitlab.beluga-sirius.ts.net:flying-dice/luabox). Internal check/test only.
-# Mirrors .github/workflows/ci.yml's `check` job (fmt/clippy/test).
+# Mirrors .github/workflows/ci.yml's `check` job (fmt/clippy/test) and both
+# coverage gates (`coverage-unit`, `coverage-e2e`), including the per-crate
+# floor.
 #
 # Releases are NOT cut here: the release pipeline of record is
 # .github/workflows/release.yml on the public GitHub remote
-# (github.com/flying-dice/luabox) — tag build + binaries + .vsix + SHA256SUMS
-# + smoke-gated go-live. See RELEASING.md. See ticket #94.
+# (github.com/flying-dice/luabox) — tag build + binaries + SHA256SUMS +
+# install scripts + smoke-gated go-live. No editor artifact is built by
+# either remote: luabox-vscode and luabox-jetbrains live in their own repos
+# and release their own .vsix/plugin zip. See RELEASING.md. See GL#94.
 #
 # Divergence from .github/workflows/ci.yml (intentional, noted here rather
 # than silently dropped):
@@ -13,14 +17,22 @@
 #     Linux shared runner the instance provides. Windows/macOS coverage
 #     lives on GitHub Actions, not as a check gate here.
 #   - `perf-gates` (scripts/perf-gate.sh) and `examples` (scripts/examples.sh)
-#     are not mirrored. Both need a stable, unshared runner (perf budgets)
-#     and/or a provisioned Lua 5.1 + unzip toolchain (examples); GitHub
-#     Actions remains their home until the instance has a runner that can
-#     promise both. Tracked as a follow-up, not an oversight.
+#     are not mirrored, for two different reasons that both still hold:
+#     perf-gate.sh asserts wall-clock budgets and needs a stable, unshared
+#     runner to mean anything (LUABOX_PERF_FACTOR can absorb a slow machine,
+#     but not an unpredictable one — a gate that flakes teaches people to
+#     re-run it); examples.sh needs a provisioned `lua5.1` + `unzip`, and the
+#     instance's shared runners are not guaranteed to allow `apt-get`.
+#     GitHub Actions remains their home until the instance has a runner that
+#     can promise both. Tracked as a follow-up, not an oversight.
+#   - The coverage jobs below install cargo-llvm-cov from its upstream
+#     release tarball rather than via `taiki-e/install-action` (an Actions-only
+#     mechanism). Same binary, same version selection (latest), no compile.
 
 stages:
   - check
   - test
+  - coverage
 
 variables:
   CARGO_TERM_COLOR: always
@@ -50,8 +62,8 @@ workflow:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == "main"'
 
-# check/test jobs run for MRs and pushes to main. Tag pipelines are handled
-# by GitHub Actions (.github/workflows/release.yml), not here.
+# check/test/coverage jobs run for MRs and pushes to main. Tag pipelines are
+# handled by GitHub Actions (.github/workflows/release.yml), not here.
 .check_rules: &check_rules
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
@@ -71,25 +83,71 @@ clippy:
     - rustup component add clippy
     - cargo clippy --workspace --all-targets -- -D warnings
 
-# `cargo test --workspace` needs no external Lua runtime for this to be
-# green: the cucumber acceptance suite (crates/luabox-cli/tests/acceptance.rs)
-# spawns the real luabox binary against temp-dir fixtures and gates its own
-# runtime-dependent scenarios rather than requiring one at the CI level —
-# `@git`-tagged scenarios skip when the `git` CLI is missing (checked at
-# `main()` startup via `AcceptanceWorld::filter_run`), and scenarios that
-# exercise a real Lua use a fake `.bat`/echo shim wired through `LUABOX_LUA`
-# instead of a real interpreter (see execution/test.feature and friends).
-# Anything that truly needs a real interpreter (luabox-test's own
-# integration tests) sits "behind a runtime probe" per that file's comments
-# and no-ops without one. So: no `apt-get install lua5.1` here, unlike the
-# GitHub Actions `examples` job, which deliberately drives real example
-# projects end to end.
+# `cargo test --workspace` needs no external Lua runtime for this to be green,
+# because luabox spawns no interpreter and neither does its test suite. The
+# cucumber acceptance suite (crates/luabox-cli/tests/acceptance.rs) drives the
+# real luabox binary against temp-dir fixtures; the only scenarios that would
+# want an interpreter are the bundler's optional real-runtime checks, which
+# probe for `lua` on PATH and skip themselves when it is absent. So: no
+# `apt-get install lua5.1` here, unlike the GitHub Actions `examples` job,
+# which deliberately executes a built bundle to verify the compiler's output.
 test:
   stage: test
   <<: *check_rules
   script:
     - cargo test --workspace
 
-# Release automation intentionally lives on GitHub, not here — the release
-# pipeline of record is .github/workflows/release.yml (tag build + binaries +
-# .vsix + SHA256SUMS + smoke-gated go-live). See RELEASING.md.
+# Dual line-coverage gates, mirroring .github/workflows/ci.yml's coverage-unit
+# and coverage-e2e — same two isolated suites, same floors, same per-crate
+# check. Keep the floors here and there identical: two pipelines disagreeing
+# about the bar is worse than one pipeline not having it.
+#   - unit: every in-process test with the cucumber e2e binaries excluded.
+#     Floor 95.
+#   - e2e:  the black-box cucumber suites alone. Floor 83.
+# Raise a floor as its number rises — never lower one to make an MR pass.
+.coverage_setup: &coverage_setup
+  - rustup component add llvm-tools-preview
+  # Upstream prebuilt; the Actions jobs get the same binary via
+  # taiki-e/install-action, which has no GitLab equivalent.
+  - >
+    curl --proto '=https' --tlsv1.2 -fsSL
+    https://github.com/taiki-e/cargo-llvm-cov/releases/latest/download/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz
+    | tar xzf - -C "$CARGO_HOME/bin"
+  - cargo llvm-cov --version
+
+coverage-unit:
+  stage: coverage
+  <<: *check_rules
+  script:
+    - *coverage_setup
+    # `--workspace --exclude luabox-cli` rather than ci.yml's explicit `-p`
+    # list: it selects exactly the same crates (every library crate) and does
+    # not have to be edited when a crate is added or renamed. The CLI is
+    # measured separately below because only some of its test targets belong
+    # to the unit suite.
+    - cargo llvm-cov --no-report --workspace --exclude luabox-cli
+    - cargo llvm-cov --no-report -p luabox-cli --bins --test cross_package_defs --test watch
+    - cargo llvm-cov report --fail-under-lines 95
+    - cargo llvm-cov report --lcov --output-path lcov-unit.info
+    # The aggregate floor above can hide a small crate eroding; this enforces
+    # the per-crate invariant the docs claim (every crate >= 92 unit lines).
+    # The rust image carries no python3, so install it for this one step.
+    - apt-get update && apt-get install -y --no-install-recommends python3
+    - python3 scripts/per-crate-coverage.py lcov-unit.info 92
+  artifacts:
+    when: always
+    paths:
+      - lcov-unit.info
+
+coverage-e2e:
+  stage: coverage
+  <<: *check_rules
+  script:
+    - *coverage_setup
+    - cargo llvm-cov --no-report -p luabox-cli --test acceptance --test lsp_acceptance
+    - cargo llvm-cov report --fail-under-lines 83
+    - cargo llvm-cov report --lcov --output-path lcov-e2e.info
+  artifacts:
+    when: always
+    paths:
+      - lcov-e2e.info

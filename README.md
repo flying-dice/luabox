@@ -20,12 +20,19 @@ luabox new hello
 cd hello
 ```
 
-`luabox new` scaffolds a project — a `luabox.toml` manifest, a `.gitignore`,
-and `src/main.lua`:
+`luabox new` scaffolds a project — a `luabox.toml` manifest, a
+`hello-0.1.0-1.rockspec`, a `.gitignore`, and `src/main.lua`:
 
 ```
 Created binary project `hello` (edition 5.4)
 ```
+
+The two manifests split by ownership, and neither is generated from the
+other. `luabox.toml` is luabox's own configuration — `edition`, `[build]`,
+`[types]`, `[lint]`. The rockspec is the *ecosystem's* manifest, the one
+luarocks reads: your package's name, version, and dependencies live there,
+so anyone can `luarocks install` your project without luabox. luabox scaffolds
+it and then leaves it alone — it neither edits nor resolves it.
 
 Write an annotated function in `src/main.lua`. The `---@param` / `---@return`
 comments are ordinary LuaCATS — the same annotations lua-language-server reads:
@@ -72,8 +79,8 @@ lint: 0 errors, 0 warnings in 1 files
 ```
 
 That is the whole loop — one binary for check, format, and lint, no build
-config, and nothing spawned: luabox reads your sources, it never executes
-them. Run the program with whatever Lua you already have. See
+config, and no interpreter anywhere: luabox reads your sources, it never
+executes them. Run the program with whatever Lua you already have. See
 [`examples/`](examples/) for larger, real projects —
 a LÖVE game, a multi-package workspace, and a 5.4-to-5.1 cross-version lowering
 demo.
