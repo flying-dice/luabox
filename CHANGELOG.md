@@ -24,8 +24,11 @@ so it appears in no version entry.
 - **`[tasks]`, `[workspace]`, and `{ workspace = true }` dependencies**
   ([#18](https://github.com/flying-dice/luabox/issues/18)) — these manifest
   tables only ever served the removed `run` command and the parked solver,
-  and had been parse-but-inert since the scope cut. They are now the
-  standard unknown-table error with a did-you-mean nudge. Monorepo trees
+  and had been parse-but-inert since the scope cut. They are now an
+  unknown-table error carrying the valid set, the did-you-mean nudge, and —
+  for these two names specifically — `— removed in 0.2.0, see CHANGELOG.md`,
+  so a manifest brought over from 0.1.4 says what happened rather than
+  reading as a typo. Monorepo trees
   are unaffected: the source walk checks nested packages without any
   manifest declaration.
 - **`luabox add` / `remove` / `install` / `update` / `vendor`**
@@ -80,6 +83,20 @@ so it appears in no version entry.
 
 ### Fixed
 
+- **A failure no longer dumps a stack backtrace when `RUST_BACKTRACE` is
+  set.** `main` returned a `Result`, so every `Error:` was rendered by
+  `anyhow`'s `Debug` — which appends the captured frames whenever that
+  variable is exported for something else entirely. Release binaries are
+  stripped, so the dump arrived as pages of `<unknown>` burying the one line
+  that named the problem. luabox now renders the error and its `Caused by:`
+  chain itself. Exit codes are unchanged: 0 on success, 1 on a command that
+  ran and failed, 2 on a malformed invocation.
+- **`[tasks]` and `[workspace]` say they were removed, not just that they are
+  unknown** ([#18](https://github.com/flying-dice/luabox/issues/18)). Both are
+  gone (see *Removed*), but a manifest upgraded from 0.1.4 still carries them,
+  and the generic unknown-table error sent readers looking for a misspelling.
+  The error for exactly these two names now ends `— removed in 0.2.0, see
+  CHANGELOG.md`; every other unknown table is unaffected.
 - **`luabox doc` refuses to generate while parse errors exist**
   ([#24](https://github.com/flying-dice/luabox/issues/24)) — a file that
   does not parse has no trustworthy harvest. One rule: project sources

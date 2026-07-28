@@ -65,6 +65,21 @@ Feature: The luabox command-line surface
     When I run "luabox check"
     Then the command exits with code 0
 
+  Scenario: a failure reports its cause, not a stack backtrace
+    # RUST_BACKTRACE is a debugging knob for the *toolchain's* developers, and
+    # is commonly exported for something else entirely. luabox renders its own
+    # error chain, so a user with it set sees the same diagnostic as everyone
+    # else — never frames from a stripped release binary.
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      edition = "5.9"
+      """
+    When I run "luabox check" with RUST_BACKTRACE set
+    Then the command exits with code 1
+    And stderr contains "invalid package.edition `5.9`"
+    And stderr does not contain "Stack backtrace"
+
   Scenario Outline: a command cut from the v1 surface stays gone
     Given an empty directory
     When I run "luabox <command>"
