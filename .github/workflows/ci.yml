@@ -58,7 +58,7 @@ jobs:
       - run: >
           cargo llvm-cov --no-report
           -p luabox-bundle -p luabox-db -p luabox-diag -p luabox-hir
-          -p luabox-lint -p luabox-lower -p luabox-lsp -p luabox-resolve
+          -p luabox-lint -p luabox-lower -p luabox-lsp -p luabox-manifest
           -p luabox-syntax -p luabox-types
       - run: >
           cargo llvm-cov --no-report

@@ -36,15 +36,19 @@
 //! ## Filtering
 //!
 //! Only sources that can affect the command's outcome trigger a rerun:
-//! `*.lua` and the manifest `luabox.toml`. Everything else is
-//! noise and is ignored by [`is_relevant`]:
-//! - dot-directories and dot-files anywhere under the root (`.git/`,
-//!   `.luabox/`, editor state) — same "hidden" convention `check_cmd`'s
-//!   and `fmt_cmd`'s file walk already use;
-//! - the manifest's `[build]` output directory — generated, not source;
-//! - editor temp/lock files: `*.tmp`, `*~` (Emacs backups), `.#*` (Emacs
-//!   lock files — also covered by the dot-file rule above), and vim's
-//!   `4913` existence-probe file.
+//! `*.lua` and the manifest `luabox.toml`. Everything else is noise and is
+//! ignored by [`is_relevant`], which is `luabox_manifest::layout`'s
+//! first-party-source rule plus one watch-only decoration:
+//! - what the file walk already skips — dot-directories and dot-files
+//!   anywhere under the root (`.git/`, `.luabox/`, editor state), the
+//!   manifest's `[build]` output directory (generated, not source), and
+//!   vendored `lua_modules/` rock trees at every depth. A rerun for a file
+//!   the command would not read is a rerun for nothing;
+//! - **watch-only**: editor temp/lock files — `*.tmp`, `*~` (Emacs backups),
+//!   `.#*` (Emacs lock files — also covered by the dot-file rule above), and
+//!   vim's `4913` existence-probe file. These are a *filesystem-event*
+//!   concern; they never survive long enough for a walk to see them, so the
+//!   shared predicate has no business knowing about them.
 //!
 //! A manifest (`luabox.toml`) change is not special-cased in the filter —
 //! it is deliberately treated as just another relevant file. Re-reading
@@ -58,6 +62,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+use luabox_manifest::layout;
 use notify::{Event, RecursiveMode, Watcher};
 
 /// How long to keep collecting events after the first one in a batch.
@@ -114,30 +119,45 @@ pub fn run(
     drain_self_inflicted(&rx);
     report(result);
 
-    loop {
-        let Ok(first) = rx.recv() else {
-            return Ok(());
-        };
-        let mut raw = first.paths;
-        let deadline = Instant::now() + DEBOUNCE_WINDOW;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match rx.recv_timeout(remaining) {
-                Ok(event) => raw.extend(event.paths),
-                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
-            }
-        }
-
-        let batch = filter_and_dedupe(raw, root, out_dir);
+    while let Some(batch) = next_batch(&rx, root, out_dir) {
         if batch.is_empty() {
             continue;
         }
         println!("--- watching: rerun ({} files changed) ---", batch.len());
         report(on_change());
     }
+    Ok(())
+}
+
+/// Block until the first event arrives, then keep collecting for
+/// [`DEBOUNCE_WINDOW`] measured from *that* event — not a sliding window, see
+/// the module docs — and return the batch's relevant, deduped paths
+/// ([`filter_and_dedupe`]). An empty `Vec` means the whole batch was noise.
+///
+/// `None` once the watcher's channel has closed, which is [`run`]'s only exit.
+///
+/// Split out of [`run`] so the windowing rule can be driven against a real
+/// channel and real time in a unit test — `partition_batches` (test-only)
+/// models the same rule over a synthetic event log, and the two agreeing is
+/// the point.
+fn next_batch(
+    rx: &mpsc::Receiver<Event>,
+    root: &Path,
+    out_dir: Option<&Path>,
+) -> Option<Vec<PathBuf>> {
+    let mut raw = rx.recv().ok()?.paths;
+    let deadline = Instant::now() + DEBOUNCE_WINDOW;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(event) => raw.extend(event.paths),
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    Some(filter_and_dedupe(raw, root, out_dir))
 }
 
 /// Wait out a full [`DEBOUNCE_WINDOW`] of silence on `rx`, resetting on
@@ -171,33 +191,26 @@ fn filter_and_dedupe(raw: Vec<PathBuf>, root: &Path, out_dir: Option<&Path>) -> 
         .collect()
 }
 
-/// Whether a changed path should trigger a rerun: a `.lua` source or
-/// `luabox.toml`, not under a dot-directory/dot-file or the build output
-/// directory, and not an editor temp/lock file.
+/// Whether a changed path should trigger a rerun: a first-party project
+/// source ([`layout::is_project_source`]) or the project's `luabox.toml`, and
+/// not an editor temp/lock file.
+///
+/// The location rules are the file walk's, not this module's — a rerun is only
+/// worth doing for a file the command about to rerun would actually read. The
+/// manifest is the one relevant file that is not *source*: editing it changes
+/// the edition, strictness or `[build] out` the next run reads, so it is
+/// matched on [`layout::is_in_project_tree`] instead.
 pub(crate) fn is_relevant(path: &Path, root: &Path, out_dir: Option<&Path>) -> bool {
-    if let Some(out) = out_dir
-        && path.starts_with(out)
-    {
-        return false;
-    }
-    if let Ok(rel) = path.strip_prefix(root)
-        && rel.components().any(|c| is_dotfile(c.as_os_str()))
-    {
-        return false;
-    }
-
     let Some(name) = path.file_name().and_then(OsStr::to_str) else {
         return false;
     };
     if is_editor_temp(name) {
         return false;
     }
-
-    name == "luabox.toml" || path.extension().and_then(OsStr::to_str) == Some("lua")
-}
-
-fn is_dotfile(component: &OsStr) -> bool {
-    component.to_str().is_some_and(|s| s.starts_with('.'))
+    if name == "luabox.toml" {
+        return layout::is_in_project_tree(path, root, out_dir);
+    }
+    layout::is_project_source(path, root, out_dir)
 }
 
 /// Vim probes whether it can create files in the target directory by
@@ -240,12 +253,20 @@ pub(crate) fn partition_batches(
 #[cfg(test)]
 mod tests {
     use super::{
-        DEBOUNCE_WINDOW, drain_self_inflicted, filter_and_dedupe, is_relevant, partition_batches,
-        report,
+        DEBOUNCE_WINDOW, drain_self_inflicted, filter_and_dedupe, is_relevant, next_batch,
+        partition_batches, report,
     };
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    /// A watcher event naming `paths`, as `notify` would deliver it.
+    fn event(paths: &[&str]) -> notify::Event {
+        notify::Event {
+            paths: paths.iter().map(PathBuf::from).collect(),
+            ..notify::Event::default()
+        }
+    }
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
@@ -305,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn relevant_lua_lb_and_manifest() {
+    fn relevant_lua_and_manifest() {
         let root = Path::new("/proj");
         assert!(is_relevant(Path::new("/proj/src/foo.lua"), root, None));
         assert!(is_relevant(Path::new("/proj/luabox.toml"), root, None));
@@ -315,7 +336,6 @@ mod tests {
     fn irrelevant_extension_ignored() {
         let root = Path::new("/proj");
         assert!(!is_relevant(Path::new("/proj/README.md"), root, None));
-        assert!(!is_relevant(Path::new("/proj/shapes/foo.luab"), root, None));
     }
 
     #[test]
@@ -344,6 +364,34 @@ mod tests {
             Path::new("/proj/src/dist.lua"),
             root,
             Some(out)
+        ));
+    }
+
+    #[test]
+    fn irrelevant_vendored_rock_tree_ignored() {
+        // The commands `--watch` reruns skip `lua_modules/` entirely, so a
+        // `luarocks install` landing files there is not a source change.
+        let root = Path::new("/proj");
+        assert!(!is_relevant(
+            Path::new("/proj/lua_modules/share/lua/5.4/pl/tablex.lua"),
+            root,
+            None
+        ));
+        assert!(!is_relevant(
+            Path::new("/proj/packages/core/lua_modules/dep/init.lua"),
+            root,
+            None
+        ));
+        assert!(!is_relevant(
+            Path::new("/proj/lua_modules/dep/luabox.toml"),
+            root,
+            None
+        ));
+        // The exclusion is by directory component, as in the walk.
+        assert!(is_relevant(
+            Path::new("/proj/src/lua_modules.lua"),
+            root,
+            None
         ));
     }
 
@@ -391,6 +439,63 @@ mod tests {
     #[test]
     fn a_path_with_no_file_name_is_never_relevant() {
         assert!(!is_relevant(Path::new("/"), Path::new("/proj"), None));
+    }
+
+    // --- the live batching loop -------------------------------------------
+    //
+    // `partition_batches` above models the windowing rule over a synthetic
+    // log; these drive the real `next_batch` against a real channel, so the
+    // rule the watcher actually runs is tested, not just the model of it.
+
+    #[test]
+    fn a_burst_of_events_becomes_one_filtered_deduped_batch() {
+        let root = Path::new("/proj");
+        let (tx, rx) = mpsc::channel::<notify::Event>();
+        tx.send(event(&["/proj/a.lua", "/proj/README.md"]))
+            .expect("send");
+        tx.send(event(&["/proj/b.lua", "/proj/a.lua"]))
+            .expect("send");
+        drop(tx);
+
+        // Both sends land inside the window from the first, so they merge;
+        // the noise is dropped and the repeat collapses to first-seen order.
+        let batch = next_batch(&rx, root, None).expect("a batch");
+        assert_eq!(batch, vec![p("/proj/a.lua"), p("/proj/b.lua")]);
+    }
+
+    #[test]
+    fn an_all_noise_batch_comes_back_empty_rather_than_absent() {
+        // `run` distinguishes the two: empty means "no rerun, keep waiting",
+        // `None` means the watcher is gone and `run` returns.
+        let root = Path::new("/proj");
+        let (tx, rx) = mpsc::channel::<notify::Event>();
+        tx.send(event(&["/proj/README.md"])).expect("send");
+        drop(tx);
+        assert_eq!(next_batch(&rx, root, None), Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_closed_channel_ends_the_watch_loop() {
+        let (tx, rx) = mpsc::channel::<notify::Event>();
+        drop(tx);
+        assert_eq!(next_batch(&rx, Path::new("/proj"), None), None);
+    }
+
+    #[test]
+    fn events_arriving_after_the_window_form_a_separate_batch() {
+        let root = Path::new("/proj");
+        let (tx, rx) = mpsc::channel::<notify::Event>();
+        tx.send(event(&["/proj/a.lua"])).expect("send");
+        let sender = std::thread::spawn(move || {
+            // Well past the window from the first event, so this cannot be
+            // absorbed into the batch above.
+            std::thread::sleep(DEBOUNCE_WINDOW * 2);
+            let _ = tx.send(event(&["/proj/b.lua"]));
+        });
+
+        assert_eq!(next_batch(&rx, root, None), Some(vec![p("/proj/a.lua")]));
+        assert_eq!(next_batch(&rx, root, None), Some(vec![p("/proj/b.lua")]));
+        sender.join().expect("sender thread");
     }
 
     #[test]

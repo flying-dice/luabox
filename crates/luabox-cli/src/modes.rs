@@ -88,7 +88,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, bail};
-use luabox_resolve::manifest::ALLOWED_BUNDLE_MODES;
+use luabox_manifest::model::ALLOWED_BUNDLE_MODES;
 use luabox_syntax::Dialect;
 
 /// Fails with a cargo-style message listing the valid modes unless `mode`

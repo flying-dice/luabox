@@ -170,7 +170,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use luabox_resolve::manifest::Manifest;
+    use luabox_manifest::model::Manifest;
 
     /// A scaffolding target directory named `name` inside a fresh tempdir —
     /// the directory name is what `package_name` derives the package from.

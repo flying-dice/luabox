@@ -14,9 +14,9 @@
 //!
 //! **Known globals** (ticket #103, `undefined-global`): the dialect stdlib
 //! plus any `[types] defs` packages, resolved from `defs/` the same way
-//! `luabox check` builds its `Ambient` layer (see
-//! `luabox-cli::check_cmd::resolve_project_defs`, duplicated here in
-//! miniature — the two commands don't share a `Project` type). Test files
+//! `luabox check` builds its `Ambient` layer — one shared walk in
+//! `luabox_manifest::layout`, so the two commands cannot disagree about which
+//! globals a project declares. Test files
 //! (SPEC.md §11: `*_test.lua`/`*.test.lua`/anything under `tests/`)
 //! additionally see the conventional busted-style test globals (`describe`,
 //! `it`, `before_each`, `after_each`, `test`), which a test framework injects
@@ -30,12 +30,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail};
 use luabox_diag::{Diagnostic, Format};
 use luabox_lint::{LintConfig, apply_fixes, lint_source};
-use luabox_resolve::manifest::{Lint, LintLevel, Manifest};
+use luabox_manifest::layout::{self, DefFiles};
+use luabox_manifest::model::{Lint, LintLevel, Manifest};
 use luabox_syntax::Dialect;
 use luabox_types::{Ambient, build_ambient, stdlib_defs};
 use rayon::prelude::*;
 
-use crate::project::{collect_lua_files, display_rel};
+use layout::display_rel;
 
 /// The most fix passes to run per file before giving up on convergence.
 const MAX_FIX_PASSES: usize = 8;
@@ -48,7 +49,8 @@ const TEST_HARNESS_GLOBALS: [&str; 5] = ["describe", "it", "before_each", "after
 /// Execute `luabox lint` from `cwd`.
 pub fn run(cwd: &Path, fix: bool) -> anyhow::Result<()> {
     let project = discover(cwd)?;
-    let files = collect_lua_files(&project.root, project.out_dir.as_deref(), false)?;
+    let files =
+        layout::collect_lua_files(&project.root, project.out_dir.as_deref(), DefFiles::Include)?;
 
     // SPEC.md §16: rayon per file — files are independent.
     let per_file: Vec<anyhow::Result<FileResult>> = files
@@ -169,7 +171,7 @@ struct Project {
 /// Find the project: nearest `luabox.toml` walking up from `cwd`, or a
 /// manifest-less default rooted at `cwd` (Lua 5.4, empty lint config).
 fn discover(cwd: &Path) -> anyhow::Result<Project> {
-    let Some((root, manifest)) = crate::project::discover_manifest(cwd)? else {
+    let Some((root, manifest)) = layout::discover_manifest(cwd)? else {
         return Ok(Project {
             root: cwd.to_path_buf(),
             dialect: Dialect::Lua54,
@@ -200,63 +202,24 @@ fn discover(cwd: &Path) -> anyhow::Result<Project> {
 /// `<root>/defs/` (SPEC.md §3) *and* every direct dependency's own `[types]
 /// defs` (#108, the luals `workspace.library` model — a dependency's ambient
 /// globals must not spuriously trip the consumer's `undefined-global`).
-/// Mirrors `check_cmd::resolve_project_defs` in miniature (same resolution
-/// rules), and reuses `check_cmd::resolve_dep_defs` for the dependency side,
-/// since the two commands don't share a `Project` type. A project-defs entry
-/// that fails to resolve is silently skipped here — `luabox check` is the
-/// command that reports `LB1002`; `lint` falls back to the stdlib-only
-/// baseline for that entry.
+/// Resolution is `luabox_manifest::layout`'s — the same walk `luabox check`
+/// and the LSP run, so all three see one set of ambient globals. Only the
+/// texts matter here (a global is a global, whatever file declared it), so the
+/// labels are dropped. A project-defs entry that fails to resolve is silently
+/// skipped: `luabox check` is the command that reports `LB1002`; `lint` falls
+/// back to the stdlib-only baseline for that entry.
 fn known_globals(dialect: Dialect, root: &Path, manifest: &Manifest) -> HashSet<String> {
-    let mut sources = Vec::new();
-    let defs_dir = root.join("defs");
-    for name in &manifest.types.defs {
-        let single = defs_dir.join(format!("{name}.d.lua"));
-        if single.is_file()
-            && let Ok(text) = fs::read_to_string(&single)
-        {
-            sources.push(text);
-        }
-        let dir = defs_dir.join(name);
-        if dir.is_dir() {
-            let mut files = Vec::new();
-            collect_d_lua(&dir, &mut files);
-            files.sort();
-            for file in files {
-                if let Ok(text) = fs::read_to_string(&file) {
-                    sources.push(text);
-                }
-            }
-        }
-    }
-    for dep_def in crate::check_cmd::resolve_dep_defs(root, manifest) {
-        sources.push(dep_def.text);
-    }
+    let (project_defs, _unresolved) = layout::resolve_project_defs(root, &manifest.types.defs);
+    let sources: Vec<String> = project_defs
+        .into_iter()
+        .chain(layout::resolve_dep_defs(root, manifest))
+        .map(|def| def.text)
+        .collect();
     if sources.is_empty() {
         return stdlib_defs(dialect).global_names().clone();
     }
     let ambient: Ambient = build_ambient(dialect, &sources);
     ambient.global_names().clone()
-}
-
-/// Collect every `*.d.lua` file under `dir`, recursively (mirrors
-/// `check_cmd`'s helper of the same shape).
-fn collect_d_lua(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_d_lua(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("lua")
-            && path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(".d.lua"))
-        {
-            out.push(path);
-        }
-    }
 }
 
 /// Translate the manifest `[lint]` table into a [`LintConfig`].
@@ -427,7 +390,7 @@ mod tests {
     #[test]
     fn definition_files_are_linted_unlike_check_and_build() {
         let tmp = project("");
-        // `lint` passes `exclude_d_lua = false`: `*.d.lua` are walked too, so
+        // `lint` walks with `DefFiles::Include`: `*.d.lua` are walked too, so
         // a parse error in one is reported rather than skipped.
         write(tmp.path(), "defs/broken.d.lua", "local = \n");
         assert!(run(tmp.path(), false).is_err());

@@ -192,6 +192,17 @@ mod tests {
     }
 
     #[test]
+    fn every_html_metacharacter_is_escaped_including_quotes_and_apostrophes() {
+        // The same escaper feeds attribute values, so `"` and `'` matter as
+        // much as the tag characters do.
+        let html = to_html("a & b < c > d \"q\" 'r'");
+        assert_eq!(
+            html,
+            "<p>a &amp; b &lt; c &gt; d &quot;q&quot; &#39;r&#39;</p>\n"
+        );
+    }
+
+    #[test]
     fn unsupported_constructs_render_literally() {
         let html = to_html("# not a heading\n**not bold**");
         assert_eq!(html, "<p># not a heading **not bold**</p>\n");

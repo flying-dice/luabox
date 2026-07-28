@@ -3,7 +3,7 @@
 //! Mirrors clippy's `allow`/`warn`/`deny` ladder. A rule's effective level is
 //! its tier default, overridden by a `[lint]` tier toggle, overridden by a
 //! `[lint]` rule-id entry — most specific wins. The manifest model for
-//! `[lint]` lives in `luabox-resolve`; this crate is fed the already-parsed
+//! `[lint]` lives in `luabox-manifest`; this crate is fed the already-parsed
 //! values (the Frontend translates them) so the Semantics/Frontend layering
 //! stays acyclic (SPEC.md §16).
 

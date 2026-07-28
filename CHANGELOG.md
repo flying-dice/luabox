@@ -160,6 +160,29 @@ so it appears in no version entry.
   than the generic `expected expression`. Files that relied on the old
   silence now fail `check`; `fmt` returns them unchanged, as it does for any
   input that does not parse.
+- **The editor no longer indexes vendored `lua_modules/` trees.** The LSP's
+  workspace index had its own copy of the source walk, and that copy still
+  descended into the rock tree `luarocks install --tree lua_modules`
+  materializes — so workspace symbols, goto-definition and rename saw
+  thousands of vendored symbols that `luabox check` had already stopped
+  looking at. Both now run the one walk (`luabox-manifest`'s), which skips
+  `lua_modules/` at every depth and visits entries in sorted order.
+  **Behaviour change:** symbols that live only inside `lua_modules/` no
+  longer appear in workspace symbol search or goto results — put the types
+  you need in a `defs/` package and list it in `[types] defs`, exactly as
+  `check` requires. `--watch` stops rerunning for `lua_modules/` writes for
+  the same reason: the command it reruns would not read those files.
+
+### Internal (contributors)
+
+- **`luabox-resolve` is now `luabox-manifest`.** The crate lost its resolving
+  half in this release (see *Removed*) and the name outlived it. It also
+  absorbs project *layout* — root discovery, the first-party source walk and
+  `[types] defs` resolution — which `luabox-cli` and `luabox-lsp` had each
+  grown a separate, and separately drifting, copy of. Not published to any
+  registry, so no downstream rename is needed; imports move from
+  `luabox_resolve::manifest::*` to `luabox_manifest::model::*`, with the
+  layout API under `luabox_manifest::layout`.
 
 ### Migration
 
