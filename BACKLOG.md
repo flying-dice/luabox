@@ -1,81 +1,43 @@
 # Backlog
 
-The backlog lives as issues on
-[GitLab](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues)
-(labels: `release`, `blocker`, `icebox`, `shapes-v2`). This file is an
-index only — the issues carry the user stories and acceptance criteria.
+**The backlog is [GitHub issues on `flying-dice/luabox`](https://github.com/flying-dice/luabox/issues).**
+That is the only live tracker. This file is a pointer and a citation
+convention; it holds no work items of its own.
 
-## v1 scope cut (2026-07-26)
+## Citing an issue
 
-Dependency management and interpreter execution were cut from v1 by owner
-decision — luabox consumes a rock tree, it does not produce one, and it
-never spawns an interpreter. The decision record is in
-[DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26); the wave is
-tracked on GitHub as flying-dice/luabox#10 (strip
-`add`/`remove`/`install`/`update`/`vendor`, `search`/`outdated`,
-`publish`/auth, the solver/providers/lockfile and `luabox-store`),
-flying-dice/luabox#11 (strip `run`/`toolchain`),
-flying-dice/luabox#12 (docs) and flying-dice/luabox#13 (gate verification
-+ coverage-floor ratchet). Every registry-, credential- or runtime-shaped
-item below is **parked post-v1** — not scheduled, not a known gap.
+The project moved from a private GitLab instance to GitHub mid-flight, and
+both trackers number from 1 — so a bare `#23` is genuinely ambiguous in
+anything written before the move. The convention, applied wherever the two
+ranges actually collide:
 
-## Initial public release (milestone)
+- **`#N`** — a GitHub issue or PR on `flying-dice/luabox`. This is the
+  default; new references need no prefix.
+- **`GL#NNN`** — a historical GitLab issue, **archived and unreachable**.
+  Kept in comments only where it is the honest provenance of a decision;
+  never as somewhere to go and look.
 
-**The launch gate is complete.** Everything in
-[DIRECTION.md](DIRECTION.md)'s parity + strictness tracks landed and was
-probe-verified: generics (#84), cross-package type sharing (#108),
-`---@class` conformance (#107), undefined-global (#103), undefined-field
-strictness (#90), plus cross-file `require` typing with workspace-global
-classes (#85). The `.luab` subsystem is removed (#109). Release
-machinery landed: LICENSE (#92), CI config (#94), CHANGELOG + release
-process (#97), coverage gated honestly (#100), registry story decided
-(#101), def scalar fields (#105), call-return propagation (#106),
-editor packaging (#102, publish steps residual). `shapes-v2` is merged
-to `main` and pushed (#93); the end-user README quickstart (#96) and
-LIMITATIONS.md (#99) shipped.
+The collision is real today: GitLab #23 was differential execution, GitHub
+#23 is a manifest-parsing rule; GitLab #14 was the LSP tranche, GitHub #14 is
+a `---@source` bug. Anything above the GitHub high-water mark is
+unambiguously GitLab and left bare.
 
-Two follow-up waves also landed and closed (2026-07-13/14): the checker
-deepening pass — workspace-global `---@alias` incl. cyclic diagnosis
-(#110, #123), alias parity (#116, #117), `:`-call receiver resolution
-(#118), closest-overload reporting (#119), contextual typing (#120),
-union exhaustiveness LB0315 (#121), `---@operator call` (#122), generic
-class arity (#124) — and the LSP feature build-out: find-references,
-rename, workspace symbols, signature help, goto type-def/impl, lint
-diagnostics + autofixes, code actions, call hierarchy, document
-highlight/folding/selection ranges, auto-require import completion, and
-protocol maturity (#125–#135). The VS Code status bar item (#138) lands
-in v0.1.0.
+## Archived: the GitLab backlog
 
-### Still open
+The GitLab instance (`gitlab.beluga-sirius.ts.net/flying-dice/luabox`) is
+**archived**. Its issues — the launch-gate milestone, the checker-deepening
+and LSP build-out waves, the `.luab` removal, the release machinery — all
+closed before the move, and their outcomes are recorded where they belong:
+[CHANGELOG.md](CHANGELOG.md) for what shipped, [DIRECTION.md](DIRECTION.md)
+for why. Two items outlived the instance and were re-filed on GitHub rather
+than left behind:
 
-- [#102](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/102)
-  Distribute the editor integrations — VS Code and JetBrains now live in
-  their own repos ([luabox-vscode](https://github.com/flying-dice/luabox-vscode),
-  [luabox-jetbrains](https://github.com/flying-dice/luabox-jetbrains)) with
-  their own release pipelines shipping installable artifacts. Open only for
-  the residual credential-gated marketplace uploads (VS Code Marketplace /
-  Open VSX / JetBrains Marketplace), which need publisher accounts/tokens
-  this environment doesn't hold.
+- Marketplace publication of the editor extensions →
+  [#34](https://github.com/flying-dice/luabox/issues/34) (was GL#102).
+- Registry UX (`search`, `login`/auth) — **parked post-v1** with dependency
+  management itself (was GL#137). Not re-filed: the commands no longer
+  exist, and the luarocks.org direction that would bring them back is
+  recorded in [DIRECTION.md](DIRECTION.md) and SPEC.md §6.
 
-### Closed by this release
-
-- [#95](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/95)
-  End-user installation: prebuilt binaries — done. The v0.1.0 `v*` tag
-  exercised the GitHub release pipeline end to end; prebuilt binaries for
-  Linux/macOS/Windows now ship as smoke-gated release assets and the install
-  scripts resolve them.
-
-## Post-launch
-
-- [#136](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/136)
-  Test runner: execute doc examples as tests (`luabox test --doc`) —
-  **moot**: `luabox test` was removed (flying-dice/luabox#1; toolchain, not
-  a runtime); close on GitLab.
-- [#137](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/issues/137)
-  Registry UX: `luabox search` + `login`/auth — **parked post-v1** by the
-  scope cut above; those commands no longer exist. The luarocks.org
-  registry *direction* stands for whenever dependency management returns.
-
-_Everything else is closed. #83/#88/#89/#98/#104 were closed as
-inconsistent with the north star; #85/#86/#87/#90/#91 graduated from the
-icebox and shipped. See DIRECTION.md for the decision record._
+Nothing else from GitLab is pending. Do not add items here — open a GitHub
+issue.

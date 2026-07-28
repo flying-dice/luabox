@@ -1,6 +1,6 @@
 //! The mechanical semantics net available without real runtimes
-//! (differential execution is ticket #23): for every corpus snippet and
-//! every dialect pair, a successful lowering must produce output that
+//! (differential execution is `tools/differ` in CI, GL#23): for every corpus
+//! snippet and every dialect pair, a successful lowering must produce output that
 //! parses with **zero errors** under the *target* dialect and passes the
 //! target's dialect-legality validation with **zero findings**. Combined
 //! with the exact-output tests this pins both directions: the rewrites are

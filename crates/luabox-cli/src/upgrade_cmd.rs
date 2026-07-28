@@ -5,10 +5,11 @@
 //! the same set of prebuilt targets. With no argument it installs the latest
 //! release; given `0.1.0` or `v0.1.0` it installs that exact tag.
 //!
-//! ## House divergences from the shared toolchain conventions
+//! ## No new dependencies for the self-update path
 //!
-//! No HTTP crate is linked (SPEC.md §6): downloads shell out to `curl -fsSL`
-//! exactly as the install scripts do. The
+//! `upgrade` is the one command that reaches the network, and it earns that
+//! by adding no transport dependency to the workspace: downloads shell out to
+//! `curl -fsSL` exactly as the install scripts do. The
 //! release archive is unpacked with `tar` — `tar -xzf` for the unix `.tar.gz`
 //! and `tar -xf` for the Windows `.zip` (the bundled `bsdtar` in `System32`
 //! reads zip natively) — so no `zip`/`flate2` crate is pulled in. Only the

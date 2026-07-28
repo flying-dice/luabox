@@ -1,5 +1,5 @@
 # Differential execution of lowered output vs source on real runtimes
-# (SPEC.md §16.1/§16.2, ticket #23). Merge-blocking: no continue-on-error —
+# (SPEC.md §16.1/§16.2, GL#23). Merge-blocking: no continue-on-error —
 # any MISMATCH / LOWER-ERR fails the job. Missing interpreters only SKIP
 # their pairs (the harness prints which), so an apt package disappearing
 # degrades coverage loudly-but-green rather than breaking the build.
@@ -13,7 +13,6 @@ on:
       - "crates/luabox-syntax/**"
       - "crates/luabox-hir/**"
       - "crates/luabox-bundle/**"
-      - "crates/luabox-test/**"
       - "corpus/differ/**"
       - "tools/differ/**"
       - ".github/workflows/differential.yml"
@@ -23,7 +22,6 @@ on:
       - "crates/luabox-syntax/**"
       - "crates/luabox-hir/**"
       - "crates/luabox-bundle/**"
-      - "crates/luabox-test/**"
       - "corpus/differ/**"
       - "tools/differ/**"
       - ".github/workflows/differential.yml"
@@ -75,8 +73,8 @@ jobs:
           key: differential
           workspaces: tools/differ
 
-      # The harness links luabox-lower/-syntax/-test by path, so this build
-      # also compiles the lowering crates under -Dwarnings.
+      # The harness links luabox-lower and luabox-syntax by path, so this
+      # build also compiles the lowering crates under -Dwarnings.
       - name: Build differ (and the lowering crates it links)
         run: cargo build --release --manifest-path tools/differ/Cargo.toml
 

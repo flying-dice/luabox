@@ -1,8 +1,11 @@
 Feature: The luabox command-line surface
   SPEC.md §14: `luabox` is a single binary whose subcommands share one
   contract. A malformed invocation is clap's problem and exits 2 with a
-  usage hint; a command that ran and found problems exits 1. Nothing on
-  this surface reaches the network or runs Lua.
+  usage hint; a command that ran and found problems exits 1. No command on
+  this surface runs Lua, resolves or fetches packages, or reads a
+  credential. Two commands do leave the process: `upgrade` replaces the
+  binary from a GitHub release (curl + tar, anonymous, on request) and
+  `doc --open` launches a browser — neither is exercised here.
 
   Scenario: --help lists every subcommand
     Given an empty directory
@@ -89,6 +92,9 @@ Feature: The luabox command-line surface
     # The v1 scope cut (DIRECTION.md, 2026-07-26) made luabox a pure static
     # toolchain: no package manager, no registry client, no interpreter. Each
     # of these once existed. Re-adding one — even hidden — fails here.
+    # `test`/`bench` predate the cut: they were removed at 0.1
+    # (flying-dice/luabox#1) for the same reason the interpreter never
+    # arrived, so they belong in the same fence.
     Examples:
       | command   |
       | add       |
@@ -104,6 +110,8 @@ Feature: The luabox command-line surface
       | whoami    |
       | run       |
       | toolchain |
+      | test      |
+      | bench     |
 
   Scenario Outline: every subcommand documents its own flags
     Given an empty directory

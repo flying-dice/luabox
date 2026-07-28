@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [SemVer](https://semver.org/), with the 0.x caveats
 spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
 
+## [Unreleased]
+
 ## [0.2.0] - 2026-07-26 (unreleased)
 
 **The v1 scope cut — every item below is a breaking change.** luabox is now

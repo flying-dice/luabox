@@ -102,11 +102,18 @@ jobs:
           name: coverage-e2e-lcov
           path: lcov-e2e.info
 
-  # SPEC.md §16.1 — perf gates are CI-blocking: cold start < 50 ms, and
-  # (until `luabox check` lands, ticket #6) a `fmt --check` throughput
-  # proxy on a ~100-kLOC synthetic corpus < 2 s warm. See
-  # scripts/perf-gate.sh for the harness and how to flip on the real
-  # `check` gate.
+  # SPEC.md §16.1 — perf gates are CI-blocking. scripts/perf-gate.sh runs
+  # three, all live, all against a ~100-kLOC synthetic corpus:
+  #   1. cold start          — `luabox --version`, best of N, < 50 ms
+  #   2. `fmt --check` warm  — < 2 s. Once a proxy for (3) while `check` was
+  #      unbuilt (GL#6); kept now as the wider safety net, since it walks the
+  #      whole corpus through the parser and formatter without the checker's
+  #      caching in the way.
+  #   3. `check` warm        — < 1 s. The real gate SPEC §16.1 asks for; live
+  #      since `luabox check` landed, no longer proxied.
+  # The LSP keystroke-to-diagnostics budget in §16.1 is NOT gated here — no
+  # harness drives the protocol yet; SPEC marks it future work.
+  # Every budget is scaled by LUABOX_PERF_FACTOR (set below for this runner).
   perf-gates:
     runs-on: ubuntu-latest
     steps:
