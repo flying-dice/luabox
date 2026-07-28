@@ -377,15 +377,39 @@ mod tests {
     #[test]
     fn removed_tasks_and_workspace_tables_are_unknown_table_errors() {
         // Dropped in 0.2.0 (#18): both only served removed subsystems, so
-        // they get the standard unknown-table error, not parse-but-ignore.
+        // they get the standard unknown-table error, not parse-but-ignore —
+        // with the removal named, since a 0.1.4 manifest carries them across
+        // the upgrade and "unknown" alone reads as a typo.
         for table in ["tasks", "workspace"] {
             let src = format!("{PREAMBLE}\n[{table}]\nx = \"y\"\n");
             let errors = Manifest::parse(&src).unwrap_err();
-            assert!(
-                errors.iter().any(|e| e.message.contains(table)),
-                "[{table}] should be an unknown-table error, got {errors:?}"
+            let error = errors
+                .iter()
+                .find(|e| e.message.contains(table))
+                .unwrap_or_else(|| {
+                    panic!("[{table}] should be an unknown-table error, got {errors:?}")
+                });
+            assert_eq!(
+                error.message,
+                format!(
+                    "unknown top-level table `{table}` (valid: package, build, types, \
+                     dependencies, dev-dependencies, lint) — removed in 0.2.0, see CHANGELOG.md"
+                )
             );
         }
+    }
+
+    #[test]
+    fn an_unknown_top_level_table_that_was_never_real_gets_no_removal_note() {
+        // The nudge is for exactly the two tables 0.2.0 dropped; a plain typo
+        // must not be told it used to work.
+        let errors = Manifest::parse(&format!("{PREAMBLE}\n[typo]\nx = \"y\"\n")).unwrap_err();
+        let error = errors
+            .iter()
+            .find(|e| e.message.contains("typo"))
+            .unwrap_or_else(|| panic!("expected an unknown-table error, got {errors:?}"));
+        assert!(!error.message.contains("removed in"), "{error:?}");
+        assert!(error.message.contains("did you mean `types`?"), "{error:?}");
     }
 
     #[test]
@@ -495,29 +519,6 @@ mod tests {
                 "extra={extra:?}: {errors:?}"
             );
         }
-    }
-
-    #[test]
-    fn version_only_table_still_rejects_orphan_source_modifiers_legacy() {
-        // Kept from the first cut of #23: the with-version shape, asserted
-        // directly.
-        let git_ref = "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[dependencies]\nbad = { version = \"1.0\", tag = \"v1\" }\n";
-        let errors = Manifest::parse(git_ref).unwrap_err();
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.message.contains("git reference key but no `git` source")),
-            "{errors:?}"
-        );
-
-        let digest = "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[dependencies]\nbad = { version = \"1.0\", sha256 = \"abc\" }\n";
-        let errors = Manifest::parse(digest).unwrap_err();
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.message.contains("only valid alongside a `url` source")),
-            "{errors:?}"
-        );
     }
 
     #[test]

@@ -51,24 +51,38 @@ fn empty_directory(_world: &mut AcceptanceWorld) {
     // Each scenario starts with a fresh temp dir; nothing to do.
 }
 
-#[given(expr = "I run {string}")]
-#[when(expr = "I run {string}")]
-fn run_command(world: &mut AcceptanceWorld, command: String) {
+/// Run the `luabox` binary in the scenario's project directory with an
+/// explicit `RUST_BACKTRACE` value.
+///
+/// Scenarios assert on stderr text, so the variable is always set rather than
+/// inherited: whatever the developer (or CI) exports must not leak into the
+/// assertions. `"0"` is the default; the one scenario that pins the
+/// no-backtrace-leak contract sets `"1"` instead.
+fn run_luabox(world: &mut AcceptanceWorld, command: &str, backtrace: &str) {
     let mut parts = command.split_whitespace();
     let program = parts.next().expect("empty command");
     assert_eq!(program, "luabox", "scenarios drive the luabox binary only");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_luabox"))
         .args(parts)
-        // Scenarios assert on stderr text. `anyhow` appends a full stack
-        // backtrace to every `Error:` line when `RUST_BACKTRACE` is set in
-        // the developer's (or CI's) environment, which would leak that
-        // environment into the assertions — pin it off so a scenario reads
-        // the same everywhere.
-        .env("RUST_BACKTRACE", "0")
+        .env("RUST_BACKTRACE", backtrace)
         .current_dir(world.dir.path())
         .output()
         .expect("failed to spawn luabox");
     world.output = Some(output);
+}
+
+#[given(expr = "I run {string}")]
+#[when(expr = "I run {string}")]
+fn run_command(world: &mut AcceptanceWorld, command: String) {
+    run_luabox(world, &command, "0");
+}
+
+/// The same invocation with `RUST_BACKTRACE=1` — the environment a developer
+/// debugging something else already has exported. A failing command must
+/// render the same error chain either way, with no backtrace appended.
+#[when(expr = "I run {string} with RUST_BACKTRACE set")]
+fn run_command_with_backtrace(world: &mut AcceptanceWorld, command: String) {
+    run_luabox(world, &command, "1");
 }
 
 /// Exit codes are part of the CLI contract and are not all the same kind of
@@ -504,9 +518,10 @@ fn unmap_last_bundle_line(world: &mut AcceptanceWorld, path: String) {
     let content =
         std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("cannot read `{path}`: {e}"));
     let last = content.lines().count();
-    run_command(
+    run_luabox(
         world,
-        format!("luabox unmap {path} {path}:{last}: synthetic-error"),
+        &format!("luabox unmap {path} {path}:{last}: synthetic-error"),
+        "0",
     );
 }
 

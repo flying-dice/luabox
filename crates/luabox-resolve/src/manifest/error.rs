@@ -44,6 +44,13 @@ impl ManifestError {
         let _ = write!(message, " (valid: {})", valid.join(", "));
         Self::new(message, span)
     }
+
+    /// Append a trailing note to the message — e.g. why a key that a previous
+    /// release accepted is now unknown.
+    pub(super) fn with_note(mut self, note: &str) -> Self {
+        let _ = write!(self.message, " — {note}");
+        self
+    }
 }
 
 impl fmt::Display for ManifestError {
@@ -110,6 +117,16 @@ mod tests {
         let spanned = ManifestError::new("bad".to_owned(), Some(3..7));
         assert_eq!(spanned.to_string(), "bad");
         assert_eq!(spanned.span, Some(3..7));
+    }
+
+    #[test]
+    fn with_note_appends_to_the_message_it_is_given() {
+        let err = ManifestError::unknown_key("top-level table", "tasks", &["types"], None)
+            .with_note("removed in 0.2.0, see CHANGELOG.md");
+        assert_eq!(
+            err.to_string(),
+            "unknown top-level table `tasks` (valid: types) — removed in 0.2.0, see CHANGELOG.md"
+        );
     }
 
     #[test]

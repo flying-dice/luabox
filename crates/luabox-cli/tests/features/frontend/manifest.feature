@@ -20,6 +20,21 @@ Feature: luabox.toml validation — every problem, reported at once
       | dependencies | foo = { git = "https://x", revision = "a" } | unknown `dependencies.foo` key `revision`                          |
       | lint         | style = "den"                              | unknown lint level for `style` `den`, did you mean `deny`?         |
 
+  Scenario Outline: a table 0.2.0 removed names the removal, not a typo
+    # A 0.1.4 manifest carries these across the upgrade untouched (#18). The
+    # generic unknown-table error would send the reader hunting for a
+    # misspelling; these two never were one.
+    Given a manifest whose [<section>] table contains '<line>'
+    When I run "luabox check"
+    Then the command exits with code 1
+    And stderr contains "unknown top-level table `<section>`"
+    And stderr contains "removed in 0.2.0, see CHANGELOG.md"
+
+    Examples: the two tables the v1 scope cut dropped
+      | section   | line             |
+      | tasks     | test = "busted"  |
+      | workspace | members = ["a"]  |
+
   Scenario Outline: a key holding the wrong TOML type names the type it wants
     Given a manifest whose [<section>] table contains '<line>'
     When I run "luabox check"

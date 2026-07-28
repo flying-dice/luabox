@@ -15,7 +15,9 @@ mod scaffold;
 mod upgrade_cmd;
 mod watch;
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use anyhow::bail;
 use clap::{Parser, Subcommand};
@@ -150,12 +152,65 @@ enum Command {
     },
 }
 
+/// Exit codes are part of the CLI contract (SPEC.md §14): 0 on success, 1
+/// when a command ran and failed, 2 when clap rejects the invocation — that
+/// last path is clap's own, taken inside `Cli::parse` before `run` is
+/// reached, and is untouched here.
+///
+/// `main` returns [`ExitCode`] rather than `anyhow::Result<()>` deliberately.
+/// The `Result` return renders the error with `anyhow`'s `Debug`, which
+/// appends a captured stack backtrace to every failure whenever
+/// `RUST_BACKTRACE` is set in the user's environment — and release builds are
+/// stripped (`Cargo.toml`'s `[profile.release] strip = true`), so those frames
+/// arrive as pages of `<unknown>` telling the user nothing about their
+/// manifest or sources. Rendering the chain here keeps the diagnostic and
+/// drops the noise.
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    match run(cli.command) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprint!("{}", render_error(&error));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The error chain as `anyhow`'s `Debug` renders it — top-level message, then
+/// a `Caused by:` block (numbered once there is more than one source) — minus
+/// the backtrace.
+fn render_error(error: &anyhow::Error) -> String {
+    let mut out = format!("Error: {error}\n");
+    let sources: Vec<String> = error.chain().skip(1).map(ToString::to_string).collect();
+    if sources.is_empty() {
+        return out;
+    }
+    out.push_str("\nCaused by:\n");
+    let numbered = sources.len() > 1;
+    for (index, source) in sources.iter().enumerate() {
+        let lead = if numbered {
+            format!("{index:>4}: ")
+        } else {
+            "    ".to_owned()
+        };
+        let continuation = " ".repeat(lead.len());
+        for (line_number, line) in source.lines().enumerate() {
+            let prefix = if line_number == 0 {
+                &lead
+            } else {
+                &continuation
+            };
+            let _ = writeln!(out, "{prefix}{line}");
+        }
+    }
+    out
+}
+
 // A pure one-arm-per-subcommand dispatcher: length tracks the CLI surface,
 // not complexity.
 #[allow(clippy::too_many_lines)]
-fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    match cli.command {
+fn run(command: Command) -> anyhow::Result<()> {
+    match command {
         Command::Init { lib, edition, .. } => {
             scaffold::init(&std::env::current_dir()?, lib, &edition)
         }
@@ -254,6 +309,54 @@ mod tests {
             .err()
             .unwrap_or_else(|| panic!("`luabox {}` should be rejected", args.join(" ")))
             .kind()
+    }
+
+    // -- error rendering ---------------------------------------------------
+
+    #[test]
+    fn a_bare_error_renders_as_one_error_line() {
+        let rendered = render_error(&anyhow::anyhow!("no such diagnostic code `LB9999`"));
+        assert_eq!(rendered, "Error: no such diagnostic code `LB9999`\n");
+    }
+
+    #[test]
+    fn a_single_source_renders_an_indented_caused_by_block() {
+        let error = anyhow::anyhow!("no such file").context("cannot read `luabox.toml`");
+        assert_eq!(
+            render_error(&error),
+            "Error: cannot read `luabox.toml`\n\nCaused by:\n    no such file\n"
+        );
+    }
+
+    #[test]
+    fn several_sources_are_numbered_outermost_first() {
+        let error = anyhow::anyhow!("connection refused")
+            .context("downloading SHA256SUMS")
+            .context("upgrading to v0.2.0");
+        assert_eq!(
+            render_error(&error),
+            "Error: upgrading to v0.2.0\n\nCaused by:\n   0: downloading SHA256SUMS\n   1: connection refused\n"
+        );
+    }
+
+    #[test]
+    fn a_multi_line_source_keeps_its_lines_under_the_same_indent() {
+        let error = anyhow::anyhow!("first\nsecond").context("invalid `luabox.toml`");
+        assert_eq!(
+            render_error(&error),
+            "Error: invalid `luabox.toml`\n\nCaused by:\n    first\n    second\n"
+        );
+    }
+
+    #[test]
+    fn the_rendering_never_carries_a_backtrace() {
+        // The whole point of rendering the chain by hand: `anyhow`'s `Debug`
+        // appends a `Stack backtrace:` dump whenever `RUST_BACKTRACE` is set,
+        // and a stripped release build renders those frames as `<unknown>`.
+        let error = anyhow::anyhow!("boom").context("while doing the thing");
+        let rendered = render_error(&error);
+        assert!(!rendered.contains("Stack backtrace"), "{rendered}");
+        assert!(!rendered.contains("<unknown>"), "{rendered}");
     }
 
     #[test]

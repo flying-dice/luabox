@@ -15,9 +15,6 @@ use super::model::{
     LINT_TIERS, Lint, LintLevel, Manifest, Package, PathDependency, Types, UrlDependency,
 };
 
-// `[tasks]` and `[workspace]` were dropped in 0.2.0 (#18): they only ever
-// served the removed `run` command and the parked solver, so they now get
-// the standard unknown-table error instead of parse-but-ignore.
 const TOP_LEVEL_KEYS: &[&str] = &[
     "package",
     "build",
@@ -26,6 +23,13 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "dev-dependencies",
     "lint",
 ];
+/// Top-level tables 0.1.4 accepted and 0.2.0 dropped (#18): they only ever
+/// served the removed `run` command and the parked solver. A manifest written
+/// against the old release carries them across the upgrade untouched, so
+/// their unknown-table error also says they *were* real — the did-you-mean
+/// nudge alone would leave the reader hunting for a typo that isn't there.
+const REMOVED_TOP_LEVEL_TABLES: &[&str] = &["tasks", "workspace"];
+const REMOVED_TABLE_NOTE: &str = "removed in 0.2.0, see CHANGELOG.md";
 const LINT_LEVELS: &[&str] = &["allow", "warn", "deny"];
 const PACKAGE_KEYS: &[&str] = &[
     "name",
@@ -70,7 +74,7 @@ impl Manifest {
 
         let mut errors = Vec::new();
         let root = im_document.as_table();
-        check_unknown_keys(root, "top-level table", TOP_LEVEL_KEYS, &mut errors);
+        check_top_level_keys(root, &mut errors);
 
         let package = parse_package(root, &mut errors);
         let build = parse_build(root, &package.edition, &mut errors);
@@ -122,6 +126,23 @@ fn check_unknown_keys(
                 key_span(table, key),
             ));
         }
+    }
+}
+
+/// [`check_unknown_keys`] for the root table, plus the removal nudge for the
+/// two tables 0.2.0 dropped ([`REMOVED_TOP_LEVEL_TABLES`]).
+fn check_top_level_keys(root: &Table, errors: &mut Vec<ManifestError>) {
+    for (key, _) in root {
+        if TOP_LEVEL_KEYS.contains(&key) {
+            continue;
+        }
+        let error =
+            ManifestError::unknown_key("top-level table", key, TOP_LEVEL_KEYS, key_span(root, key));
+        errors.push(if REMOVED_TOP_LEVEL_TABLES.contains(&key) {
+            error.with_note(REMOVED_TABLE_NOTE)
+        } else {
+            error
+        });
     }
 }
 
