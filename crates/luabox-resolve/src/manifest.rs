@@ -435,6 +435,27 @@ mod tests {
     }
 
     #[test]
+    fn version_alongside_a_source_is_recorded_not_dropped() {
+        // #29: the deliberate rule — `version` next to a source key is the
+        // declared version expectation for that sourced package, kept on
+        // the model (reserved for post-v1 resolution), exactly as spelled.
+        let src = "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[dependencies]\ng = { git = \"https://x\", version = \"2.0\" }\np = { path = \"../p\", version = \"3.0\" }\nu = { url = \"https://x/u.tar.gz\", sha256 = \"abc\", version = \"4.0\" }\n";
+        let manifest = Manifest::parse(src).expect("valid manifest");
+        match manifest.dependencies.get("g") {
+            Some(Dependency::Git(d)) => assert_eq!(d.version.as_deref(), Some("2.0")),
+            other => panic!("expected git dep, got {other:?}"),
+        }
+        match manifest.dependencies.get("p") {
+            Some(Dependency::Path(d)) => assert_eq!(d.version.as_deref(), Some("3.0")),
+            other => panic!("expected path dep, got {other:?}"),
+        }
+        match manifest.dependencies.get("u") {
+            Some(Dependency::Url(d)) => assert_eq!(d.version.as_deref(), Some("4.0")),
+            other => panic!("expected url dep, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn version_only_table_is_the_bare_string_form_spelled_longhand() {
         // #23: `version` is a valid dependency key, so a version-only table
         // must mean the same thing as `pkg = "1.0"` — not an error that
