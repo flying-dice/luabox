@@ -103,6 +103,12 @@ pub enum Dependency {
     Url(UrlDependency),
 }
 
+/// `version` alongside a source key (`git`/`path`/`url`) is **recorded, not
+/// dropped** (#29): it is the declared version expectation for the sourced
+/// package, reserved for when resolution returns (post-v1) — like `rev`/
+/// `tag`/`branch`, nothing consumes it today. This is deliberate: the same
+/// key is authoritative in the version-only form (`pkg = { version = … }`
+/// ≡ `pkg = "…"`, #23) and metadata alongside a source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct GitDependency {
