@@ -27,7 +27,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, bail};
-use luabox_diag::{Diagnostic, Format, Label, Span};
+use luabox_diag::{Code, Diagnostic, Format, Label, Span};
 use luabox_manifest::layout::{self, DefFiles};
 use luabox_syntax::lua;
 
@@ -39,7 +39,7 @@ pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
     let project = check_cmd::discover(cwd)?;
     let lua_files =
         layout::collect_lua_files(&project.root, project.out_dir.as_deref(), DefFiles::Exclude)?;
-    let package = manifest_facts(&project.root);
+    let package = package_name(&project);
 
     // A file that does not parse has no trustworthy harvest — its doc
     // comments may attach to the wrong (recovered) nodes or vanish with the
@@ -54,7 +54,7 @@ pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
         for err in lua::parse(source, project.dialect).errors() {
             let range = usize::from(err.range.start())..usize::from(err.range.end());
             diags.push(
-                Diagnostic::error(check_cmd::code(1), err.message.clone())
+                Diagnostic::error(Code::new(1), err.message.clone())
                     .with_label(Label::primary(Span::new(rel, range), "syntax error here")),
             );
         }
@@ -178,19 +178,20 @@ fn def_module_name(file: &str) -> String {
     stem.strip_suffix(".d.lua").unwrap_or(stem).to_string()
 }
 
-/// The package name from the manifest (a default when the project is
-/// manifest-less).
-fn manifest_facts(root: &Path) -> String {
-    let fallback = || {
-        root.file_name().map_or_else(
-            || "package".to_string(),
-            |n| n.to_string_lossy().into_owned(),
-        )
-    };
-    let Ok(manifest) = layout::read_manifest(root) else {
-        return fallback();
-    };
-    manifest.package.name
+/// The name to title the generated site with: `[package] name`, or — when the
+/// manifest omits it (SPEC.md §6: the rockspec is the package manifest) or
+/// there is no manifest — the project directory's own name.
+///
+/// Derived from the project `discover` already produced; `doc` re-read
+/// `luabox.toml` for this one string until #CC-M11.
+fn package_name(project: &check_cmd::Project) -> String {
+    if !project.name.is_empty() {
+        return project.name.clone();
+    }
+    project.root.file_name().map_or_else(
+        || "package".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
 }
 
 /// Open `index` in the platform's default browser. Best-effort: a failure
@@ -580,9 +581,10 @@ return Circle
     // -- package name resolution -------------------------------------------
 
     #[test]
-    fn the_package_name_comes_from_the_manifest_when_it_parses() {
+    fn the_package_name_comes_from_the_manifest_when_it_names_one() {
         let tmp = project("from-manifest", "");
-        assert_eq!(manifest_facts(tmp.path()), "from-manifest");
+        let project = check_cmd::discover(tmp.path()).expect("discovers");
+        assert_eq!(package_name(&project), "from-manifest");
     }
 
     #[test]
@@ -590,20 +592,27 @@ return Circle
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().join("dirname-fallback");
         fs::create_dir_all(&root).expect("mkdir");
-        assert_eq!(manifest_facts(&root), "dirname-fallback");
+        let project = check_cmd::discover(&root).expect("manifest-less default");
+        assert_eq!(package_name(&project), "dirname-fallback");
     }
 
     #[test]
-    fn the_package_name_falls_back_to_the_directory_for_a_malformed_manifest() {
+    fn a_nameless_manifest_falls_back_to_the_directory_too() {
+        // `[package] name` is optional — the rockspec is the package manifest
+        // (SPEC.md §6) — so an edition-only `luabox.toml` still titles its
+        // site after the project directory.
         let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path().join("broken-manifest");
+        let root = tmp.path().join("nameless");
         fs::create_dir_all(&root).expect("mkdir");
-        write(&root, "luabox.toml", "= = =\n");
-        assert_eq!(manifest_facts(&root), "broken-manifest");
+        write(&root, "luabox.toml", "[package]\nedition = \"5.4\"\n");
+        let project = check_cmd::discover(&root).expect("discovers");
+        assert!(project.name.is_empty());
+        assert_eq!(package_name(&project), "nameless");
     }
 
     #[test]
     fn a_root_with_no_file_name_falls_back_to_a_placeholder_package_name() {
-        assert_eq!(manifest_facts(Path::new("/")), "package");
+        let project = check_cmd::discover(Path::new("/")).expect("manifest-less default");
+        assert_eq!(package_name(&project), "package");
     }
 }

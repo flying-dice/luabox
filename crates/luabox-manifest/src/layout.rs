@@ -495,7 +495,7 @@ edition = \"5.4\"
         write(tmp.path(), "luabox.toml", MINIMAL_MANIFEST);
         let manifest = read_manifest(tmp.path()).expect("parses");
         assert_eq!(manifest.package.name, "fixture");
-        assert_eq!(manifest.package.edition, "5.4");
+        assert_eq!(manifest.package.edition, crate::model::DialectId::Lua54);
     }
 
     #[test]

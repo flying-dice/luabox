@@ -11,7 +11,10 @@
 use luabox_diag::Severity;
 use luabox_syntax::Dialect;
 
-use crate::{Level, LintConfig, LintOutcome, Tier, apply_fixes, lint_source, rules, tier_default};
+use crate::{
+    Level, LintConfig, LintLevel, LintOutcome, LintTier, Tier, apply_fixes, lint_source, rules,
+    tier_default,
+};
 
 /// The Lua 5.4 stdlib's known-global names — every test lints against this
 /// baseline, exactly as `luabox lint` does via `luabox_types::stdlib_defs`
@@ -91,7 +94,7 @@ fn unused_local_function_fires() {
 
 fn pedantic() -> LintConfig {
     let mut c = LintConfig::new();
-    assert!(c.set_tier("pedantic", "warn"));
+    c.set_tier(Tier::Pedantic, Level::Warn);
     c
 }
 
@@ -795,29 +798,29 @@ fn an_underscore_parameter_is_exempt_from_unused_param() {
 #[test]
 fn rule_allow_silences() {
     let mut c = LintConfig::new();
-    assert!(c.set_rule("unused-local", "allow"));
+    c.set_rule("unused-local", Level::Allow);
     assert!(!has("local x = 1\n", &c, "LB0501"));
 }
 
 #[test]
 fn tier_toggle_silences() {
     let mut c = LintConfig::new();
-    assert!(c.set_tier("style", "allow"));
+    c.set_tier(Tier::Style, Level::Allow);
     assert!(!has("local x = 1\n", &c, "LB0501"));
 }
 
 #[test]
 fn rule_override_beats_tier() {
     let mut c = LintConfig::new();
-    assert!(c.set_tier("style", "deny"));
-    assert!(c.set_rule("unused-local", "allow"));
+    c.set_tier(Tier::Style, Level::Deny);
+    c.set_rule("unused-local", Level::Allow);
     assert!(!has("local x = 1\n", &c, "LB0501"));
 }
 
 #[test]
 fn deny_tier_raises_error_severity() {
     let mut c = LintConfig::new();
-    assert!(c.set_rule("unused-local", "deny"));
+    c.set_rule("unused-local", Level::Deny);
     let out = lint("local x = 1\n", &c);
     assert!(out.error_count >= 1);
     assert!(
@@ -933,19 +936,37 @@ fn levels_map_to_severities_and_reject_unknown_keywords() {
 }
 
 #[test]
-fn unrecognised_config_keywords_are_rejected_without_changing_anything() {
+fn an_unknown_rule_id_is_accepted_but_inert() {
+    // Rule ids are open — they live with the rules, and a `[lint]` entry for
+    // one this build does not have is not an error (CC-M8: the tier name and
+    // the level are the closed halves, and both are typed now, so there is no
+    // "unrecognised keyword" case left to reject).
     let mut c = LintConfig::new();
-    assert!(!c.set_tier("nonsense", "warn"), "unknown tier name");
-    assert!(!c.set_tier("style", "forbid"), "unknown level keyword");
-    assert!(
-        !c.set_rule("unused-local", "forbid"),
-        "unknown level keyword"
-    );
-    // None of the rejected calls took effect: the style default still fires.
+    c.set_rule("no-such-rule", Level::Deny);
     assert!(has("local x = 1\n", &c, "LB0501"));
-    // An unknown *rule id* is accepted (ids are not validated) but inert.
-    assert!(c.set_rule("no-such-rule", "deny"));
-    assert!(has("local x = 1\n", &c, "LB0501"));
+}
+
+#[test]
+fn the_manifest_lint_vocabulary_maps_onto_this_crate_s_own() {
+    for (manifest_tier, tier) in [
+        (LintTier::Correctness, Tier::Correctness),
+        (LintTier::Suspicious, Tier::Suspicious),
+        (LintTier::Perf, Tier::Perf),
+        (LintTier::Style, Tier::Style),
+        (LintTier::Pedantic, Tier::Pedantic),
+    ] {
+        assert_eq!(Tier::from(manifest_tier), tier);
+        // Both vocabularies spell a tier the same way in `luabox.toml`.
+        assert_eq!(manifest_tier.as_str(), tier.name());
+    }
+    for (manifest_level, level) in [
+        (LintLevel::Allow, Level::Allow),
+        (LintLevel::Warn, Level::Warn),
+        (LintLevel::Deny, Level::Deny),
+    ] {
+        assert_eq!(Level::from(manifest_level), level);
+        assert_eq!(Level::parse(manifest_level.as_str()), Some(level));
+    }
 }
 
 // --- corpus sweep ----------------------------------------------------------

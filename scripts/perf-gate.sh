@@ -4,7 +4,7 @@
 # work, not covered here).
 #
 # Gates: cold start, `fmt --check` throughput (kept as a wider safety
-# net), and the real `check` gate (live since ticket #6).
+# net), and the real `check` gate (live since GL#6).
 #
 # Env:
 #   LUABOX_PERF_FACTOR   float multiplier applied to every budget, for

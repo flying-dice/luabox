@@ -1,7 +1,7 @@
 //! The public boundary: [`AnalysisHost`] (owns the mutable world) and
 //! [`Analysis`] (an immutable snapshot the queries run against).
 //!
-//! This is the exact surface the LSP server (P1, ticket #14) consumes:
+//! This is the exact surface the LSP server (P1, GL#14) consumes:
 //! - the server keeps one [`AnalysisHost`], feeds editor/disk edits in through
 //!   [`AnalysisHost::apply_change`], and
 //! - for each request takes a cheap [`AnalysisHost::snapshot`] and answers from

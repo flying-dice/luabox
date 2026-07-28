@@ -63,6 +63,7 @@ missing_errors_doc = "allow"
 unwrap_used = "warn"
 expect_used = "warn"
 panic = "warn"
+unreachable = "warn" # an abort site is a claim about reachability — prove it or degrade
 todo = "warn"
 unimplemented = "warn"
 dbg_macro = "warn"

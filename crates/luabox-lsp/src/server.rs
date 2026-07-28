@@ -54,7 +54,7 @@ use lsp_types::{
 use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
 use luabox_lint::{LintConfig, lint_source};
 use luabox_manifest::layout::{self, DefFiles};
-use luabox_manifest::model::{Lint, LintLevel, Manifest};
+use luabox_manifest::model::{DialectId, Lint, Manifest};
 use luabox_types::{Ambient, build_ambient};
 
 use crate::line_index::LineIndex;
@@ -233,7 +233,10 @@ impl ProjectConfig {
             return defaults;
         };
         Self {
-            dialect: Dialect::from_manifest_id(&manifest.package.edition).unwrap_or(Dialect::Lua54),
+            // `Manifest::parse` types `[package] edition` as a closed
+            // `DialectId`, so this maps inward exhaustively — there is no
+            // unknown-edition fallback left to take.
+            dialect: syntax_dialect(manifest.package.edition),
             strictness: Strictness::from_manifest_flag(manifest.types.strict),
             out_dir: Some(root.join(&manifest.build.out)),
             def_sources: ambient_def_sources(root, &manifest),
@@ -242,32 +245,40 @@ impl ProjectConfig {
     }
 }
 
+/// The `luabox-syntax` dialect a validated manifest edition names.
+///
+/// Distribution never parses syntax (SPEC.md §16), so `luabox-manifest` cannot
+/// hand out a `Dialect` itself and each frontend owns this exhaustive match —
+/// duplicated with `luabox-cli::dialect::from_manifest` the same way
+/// `build_lint_config` is duplicated with `lint_cmd::build_config`.
+fn syntax_dialect(id: DialectId) -> Dialect {
+    match id {
+        DialectId::Lua51 => Dialect::Lua51,
+        DialectId::Lua52 => Dialect::Lua52,
+        DialectId::Lua53 => Dialect::Lua53,
+        DialectId::Lua54 => Dialect::Lua54,
+        DialectId::LuaJit => Dialect::LuaJit,
+    }
+}
+
 /// Translate the manifest `[lint]` table into a [`LintConfig`] — the id-level
 /// then tier-level overrides plus the `global-write` allow-list. Mirrors
 /// `luabox-cli::lint_cmd::build_config`; the LSP crate cannot depend on
 /// `luabox-cli`, so this is duplicated the same way `ambient_def_sources` is.
+/// The level/tier *translation* is no longer duplicated with it: that is
+/// `luabox-lint`'s single `From` mapping (CC-M8).
 fn build_lint_config(lint: &Lint) -> LintConfig {
     let mut config = LintConfig::new();
     for name in &lint.globals {
         config.allow_global(name.clone());
     }
     for (tier, level) in &lint.tiers {
-        config.set_tier(tier, lint_level_keyword(*level));
+        config.set_tier((*tier).into(), (*level).into());
     }
     for (rule, level) in &lint.rules {
-        config.set_rule(rule, lint_level_keyword(*level));
+        config.set_rule(rule, (*level).into());
     }
     config
-}
-
-/// The `LintConfig` level keyword for a manifest [`LintLevel`] (mirrors
-/// `lint_cmd::level_keyword`).
-fn lint_level_keyword(level: LintLevel) -> &'static str {
-    match level {
-        LintLevel::Allow => "allow",
-        LintLevel::Warn => "warn",
-        LintLevel::Deny => "deny",
-    }
 }
 
 /// Resolve the ambient definition-package sources for a project, winner-first
@@ -1281,12 +1292,11 @@ mod tests {
 
     use lsp_types::{Position, Range, TextDocumentContentChangeEvent};
     use luabox_lint::LintConfig;
-    use luabox_manifest::model::{Lint, LintLevel, Manifest};
+    use luabox_manifest::model::{Lint, LintLevel, LintTier, Manifest};
     use tempfile::TempDir;
 
     use super::{
-        ProjectConfig, ambient_def_sources, apply_content_changes, build_lint_config,
-        lint_level_keyword, root_path,
+        ProjectConfig, ambient_def_sources, apply_content_changes, build_lint_config, root_path,
     };
 
     /// A ranged change replacing `[start, end)` with `text`.
@@ -1489,13 +1499,6 @@ mod tests {
     // === Lint configuration ===============================================
 
     #[test]
-    fn manifest_lint_levels_map_to_config_keywords() {
-        assert_eq!(lint_level_keyword(LintLevel::Allow), "allow");
-        assert_eq!(lint_level_keyword(LintLevel::Warn), "warn");
-        assert_eq!(lint_level_keyword(LintLevel::Deny), "deny");
-    }
-
-    #[test]
     fn manifest_globals_tiers_and_rules_reach_the_lint_config() {
         let manifest = Manifest::parse(
             "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n\n[lint]\nglobals = [\"MY_GLOBAL\"]\nstyle = \"deny\"\nunused-local = \"allow\"\n",
@@ -1505,15 +1508,18 @@ mod tests {
         assert!(config.is_allowed_global("MY_GLOBAL"));
         assert!(!config.is_allowed_global("other"));
         // A tier key lands in `tiers`, anything else in `rules`.
-        assert_eq!(manifest.lint.tiers.get("style"), Some(&LintLevel::Deny));
+        assert_eq!(
+            manifest.lint.tiers.get(&LintTier::Style),
+            Some(&LintLevel::Deny)
+        );
         assert_eq!(
             manifest.lint.rules.get("unused-local"),
             Some(&LintLevel::Allow)
         );
-        // Both override names are ones `LintConfig` accepts.
+        // Both overrides reach the config through the typed setters.
         let mut probe = LintConfig::new();
-        assert!(probe.set_tier("style", "deny"));
-        assert!(probe.set_rule("unused-local", "allow"));
+        probe.set_tier(LintTier::Style.into(), LintLevel::Deny.into());
+        probe.set_rule("unused-local", LintLevel::Allow.into());
     }
 
     #[test]

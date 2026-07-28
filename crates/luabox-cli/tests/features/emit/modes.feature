@@ -116,14 +116,18 @@ Feature: luabox build --mode — embedding modes (LÖVE, Neovim plugin)
     Then the command succeeds
     And "dist/fixture/doc/fixture.txt" contains "a test fixture plugin"
 
-  Scenario: invalid --mode lists the valid modes
+  # Like `--format`, `--mode` is a closed set clap owns, so an unknown one is a
+  # malformed invocation (exit 2) rather than a hand-rolled check inside
+  # `build`. The manifest's `[build] mode` is validated by `Manifest::parse`
+  # against the same vocabulary — see the scenario below.
+  Scenario: invalid --mode is a usage error listing the valid modes
     Given a project with edition "5.1" targeting "5.1"
     And a file "src/main.lua" containing:
       """
       print("hi")
       """
     When I run "luabox build --mode roblox"
-    Then the command fails
+    Then the command exits with code 2
     And stderr contains "roblox"
     And stderr contains "plain"
     And stderr contains "love"

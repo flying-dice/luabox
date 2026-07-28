@@ -148,7 +148,9 @@ impl fmt::Display for BundleError {
             BundleError::Lower { file, diagnostics } => {
                 write!(f, "cannot lower `{file}` for bundling:")?;
                 for d in diagnostics {
-                    write!(f, "\n  {}: {}", d.code, d.message)?;
+                    // `LowerDiagnostic::code` is the bare number; render the
+                    // `LBnnnn` spelling the registry and `luabox explain` use.
+                    write!(f, "\n  LB{:04}: {}", d.code, d.message)?;
                 }
                 Ok(())
             }

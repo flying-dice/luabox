@@ -893,6 +893,7 @@ version = "0.2.0"
 dependencies = [
  "luabox-diag",
  "luabox-hir",
+ "luabox-manifest",
  "luabox-syntax",
  "luabox-types",
  "rowan",

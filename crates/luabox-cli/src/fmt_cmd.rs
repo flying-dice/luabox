@@ -104,17 +104,12 @@ fn discover(cwd: &Path) -> anyhow::Result<Project> {
             out_dir: None,
         });
     };
-    let Some(dialect) = Dialect::from_manifest_id(&manifest.package.edition) else {
-        bail!(
-            "unknown edition `{}` in `{}`",
-            manifest.package.edition,
-            root.join("luabox.toml").display()
-        );
-    };
+    // `Manifest::parse` types `[package] edition` as a `DialectId`, so there
+    // is nothing left to re-validate here (CC-M13).
     Ok(Project {
         out_dir: Some(root.join(&manifest.build.out)),
         root,
-        dialect,
+        dialect: crate::dialect::from_manifest(manifest.package.edition),
     })
 }
 

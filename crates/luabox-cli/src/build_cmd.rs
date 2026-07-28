@@ -42,7 +42,7 @@ use luabox_bundle::{BundleMap, BundleRequest, unmap_traceback};
 use luabox_diag::{Code, Diagnostic, Format, Label, Span};
 use luabox_lower::LowerDiagnostic;
 use luabox_manifest::layout::{self, DefFiles};
-use luabox_manifest::model::{Build, DEFAULT_ENTRY, Manifest};
+use luabox_manifest::model::{Build, BundleMode, DEFAULT_OUT};
 use luabox_syntax::{Dialect, lua};
 use rayon::prelude::*;
 
@@ -67,8 +67,9 @@ pub struct BuildOptions {
     pub sourcemap: bool,
     /// `--minify`: presence ORs with `[build] minify`.
     pub minify: bool,
-    /// `--mode`: embedding mode override.
-    pub mode: Option<String>,
+    /// `--mode`: embedding mode override. Already a valid mode by the time it
+    /// gets here — clap rejects anything else (`crate::ModeArg`).
+    pub mode: Option<BundleMode>,
 }
 
 /// Execute `luabox build` from `cwd`.
@@ -77,27 +78,15 @@ pub struct BuildOptions {
     reason = "the effective-config resolution + output-rule validation reads as one linear pipeline"
 )]
 pub fn run(cwd: &Path, opts: &BuildOptions) -> anyhow::Result<()> {
-    // Validate a `--mode` override as early as possible — a typo shouldn't
-    // wait through discovery/check to be reported.
-    if let Some(m) = &opts.mode {
-        modes::validate(m)?;
-    }
-
-    let project = check_cmd::discover(cwd)?;
-    let manifest = read_manifest(&project.root);
-    let build_cfg: Build = manifest
-        .as_ref()
-        .map_or_else(default_build, |m| m.build.clone());
+    // One discovery for the whole command (CC-M11): `[build]`, the package
+    // name and the description all ride on the `Project`, so nothing below
+    // re-reads `luabox.toml`.
+    let mut project = check_cmd::discover(cwd)?;
+    let build_cfg: &Build = &project.build;
 
     let edition = project.dialect;
     let target = match opts.target.as_deref() {
-        Some(id) => match Dialect::from_manifest_id(id) {
-            Some(dialect) => dialect,
-            None => bail!(
-                "unknown target `{id}`; expected one of: 5.1, 5.2, 5.3, 5.4, luajit \
-                 (see `luabox explain LB1001`)"
-            ),
-        },
+        Some(id) => crate::dialect::parse("target", id)?,
         None => project.build_target,
     };
     let out_dir: PathBuf = match opts.out.as_deref() {
@@ -106,30 +95,19 @@ pub fn run(cwd: &Path, opts: &BuildOptions) -> anyhow::Result<()> {
         None => project
             .out_dir
             .clone()
-            .unwrap_or_else(|| project.root.join("dist")),
+            .unwrap_or_else(|| project.root.join(DEFAULT_OUT)),
     };
 
     // Effective config: flags override `[build]`.
-    let mode = opts.mode.clone().unwrap_or(build_cfg.mode);
+    let mode = opts.mode.unwrap_or(build_cfg.mode);
     let bundle_flag = opts.bundle.unwrap_or(build_cfg.bundle);
     // A non-`plain` mode packages a bundle, so it implies bundling even when
     // `bundle` is left false (the LÖVE / Neovim examples set only `mode`).
-    let do_bundle = bundle_flag || mode != "plain";
+    let do_bundle = bundle_flag || mode != BundleMode::Plain;
     let sourcemap = opts.sourcemap || build_cfg.sourcemap;
     let minify = opts.minify || build_cfg.minify;
-
-    if !do_bundle {
-        // Tree mode ignores the bundle-only knobs (`entry`, `outfile`,
-        // `sourcemap`, `minify`) — there is no require graph to walk.
-        if check_cmd::run_once(cwd, None, "human", Some(&out_dir)).is_err() {
-            bail!("`luabox build` refuses to emit while `luabox check` reports errors");
-        }
-        return emit_tree(cwd, &out_dir, edition, target);
-    }
-
-    // Bundle mode: resolve entries and the output-naming rules.
     let entry_specs: Vec<String> = if opts.entry.is_empty() {
-        build_cfg.entry
+        build_cfg.entry.clone()
     } else {
         opts.entry
             .iter()
@@ -139,8 +117,20 @@ pub fn run(cwd: &Path, opts: &BuildOptions) -> anyhow::Result<()> {
     let outfile: Option<PathBuf> = opts
         .outfile
         .clone()
-        .or_else(|| build_cfg.outfile.map(PathBuf::from));
+        .or_else(|| build_cfg.outfile.clone().map(PathBuf::from));
 
+    // The chosen out dir is what the check gate and the file walk must skip,
+    // even when `--out` overrides the manifest's.
+    project.out_dir = Some(out_dir.clone());
+
+    if !do_bundle {
+        // Tree mode ignores the bundle-only knobs (`entry`, `outfile`,
+        // `sourcemap`, `minify`) — there is no require graph to walk.
+        check_gate(&project)?;
+        return emit_tree(&project, &out_dir, edition, target);
+    }
+
+    // Bundle mode: the output-naming rules.
     if entry_specs.is_empty() {
         bail!(
             "`luabox build` cannot bundle without an entry point: `[build] entry` is empty \
@@ -154,14 +144,14 @@ pub fn run(cwd: &Path, opts: &BuildOptions) -> anyhow::Result<()> {
             entry_specs.len()
         );
     }
-    if outfile.is_some() && mode != "plain" {
+    if outfile.is_some() && mode != BundleMode::Plain {
         bail!(
             "`outfile` conflicts with `mode = \"{mode}\"`: that mode dictates its own output \
              layout (a `.love` archive / a Neovim plugin tree), so an output filename is \
              meaningless — drop one of them"
         );
     }
-    if mode != "plain" && entry_specs.len() != 1 {
+    if mode != BundleMode::Plain && entry_specs.len() != 1 {
         bail!(
             "`mode = \"{mode}\"` packages a single entry point, but {} are configured",
             entry_specs.len()
@@ -183,49 +173,36 @@ pub fn run(cwd: &Path, opts: &BuildOptions) -> anyhow::Result<()> {
     }
 
     // Check gate, exactly as tree mode: refuse to emit on check errors.
-    if check_cmd::run_once(cwd, None, "human", Some(&out_dir)).is_err() {
-        bail!("`luabox build` refuses to emit while `luabox check` reports errors");
-    }
+    check_gate(&project)?;
 
     fs::create_dir_all(&out_dir)
         .with_context(|| format!("cannot create `{}`", out_dir.display()))?;
 
-    let package_name = manifest
-        .as_ref()
-        .map_or_else(|| "bundle".to_owned(), |m| m.package.name.clone());
-    let package_name = if package_name.is_empty() {
-        "bundle".to_owned()
+    // `[package] name` is optional (the rockspec is the package manifest,
+    // SPEC.md §6), so a nameless project bundles as `bundle`.
+    let package_name = if project.name.is_empty() {
+        NAMELESS_BUNDLE
     } else {
-        package_name
+        project.name.as_str()
     };
-    let description = manifest
-        .as_ref()
-        .and_then(|m| m.package.description.clone());
+    let ctx = EmitCtx {
+        root: &project.root,
+        out_dir: &out_dir,
+        edition,
+        target,
+        minify,
+        sourcemap,
+        package_name,
+        description: project.description.as_deref(),
+        entry: &entries[0],
+    };
 
-    match mode.as_str() {
-        "love" => emit_love(&EmitCtx {
-            root: &project.root,
-            out_dir: &out_dir,
-            edition,
-            target,
-            minify,
-            sourcemap,
-            package_name: &package_name,
-            description: description.as_deref(),
-            entry: &entries[0],
-        }),
-        "nvim-plugin" => emit_nvim(&EmitCtx {
-            root: &project.root,
-            out_dir: &out_dir,
-            edition,
-            target,
-            minify,
-            sourcemap,
-            package_name: &package_name,
-            description: description.as_deref(),
-            entry: &entries[0],
-        }),
-        _ => emit_plain(
+    // Exhaustive: a new `BundleMode` variant is a compile error here rather
+    // than silently taking the plain arm (CC-M12).
+    match mode {
+        BundleMode::Love => emit_love(&ctx),
+        BundleMode::NvimPlugin => emit_nvim(&ctx),
+        BundleMode::Plain => emit_plain(
             &project.root,
             &out_dir,
             edition,
@@ -238,19 +215,16 @@ pub fn run(cwd: &Path, opts: &BuildOptions) -> anyhow::Result<()> {
     }
 }
 
-/// The `[build]` defaults for a manifest-less project (mirrors
-/// `Manifest::parse`'s `[build]` fallback).
-fn default_build() -> Build {
-    Build {
-        target: String::new(),
-        out: "dist".to_owned(),
-        mode: "plain".to_owned(),
-        entry: vec![DEFAULT_ENTRY.to_owned()],
-        outfile: None,
-        bundle: false,
-        sourcemap: false,
-        minify: false,
+/// The bundle name a project with no `[package] name` gets.
+const NAMELESS_BUNDLE: &str = "bundle";
+
+/// `luabox build` runs `luabox check` first and refuses to emit while it
+/// reports errors — the same gate for both emit shapes.
+fn check_gate(project: &check_cmd::Project) -> anyhow::Result<()> {
+    if check_cmd::run_once(project, None, Format::Human).is_err() {
+        bail!("`luabox build` refuses to emit while `luabox check` reports errors");
     }
+    Ok(())
 }
 
 /// Resolve an entry spec (from `[build] entry` or `--entry`) against the
@@ -271,11 +245,15 @@ fn resolve_entry(root: &Path, spec: &str) -> PathBuf {
 /// Lower every project `.lua` file `edition → target` and write it under
 /// `out_dir`, mirroring the source layout (SPEC.md §2.1). The check gate has
 /// already passed by the time this runs.
-fn emit_tree(cwd: &Path, out_dir: &Path, edition: Dialect, target: Dialect) -> anyhow::Result<()> {
-    // Re-discover with the chosen out dir so the file walk skips previous
-    // build output even when `--out` overrides the manifest.
-    let mut project = check_cmd::discover(cwd)?;
-    project.out_dir = Some(out_dir.to_path_buf());
+fn emit_tree(
+    project: &check_cmd::Project,
+    out_dir: &Path,
+    edition: Dialect,
+    target: Dialect,
+) -> anyhow::Result<()> {
+    // `project.out_dir` is already the *chosen* out dir (`run` sets it before
+    // the check gate), so the walk skips previous build output even when
+    // `--out` overrides the manifest — without a second discovery.
     let lua_files =
         layout::collect_lua_files(&project.root, project.out_dir.as_deref(), DefFiles::Exclude)?;
 
@@ -354,10 +332,7 @@ fn lower_one(
             }
             for finding in lua::validate::validate(&parse, target) {
                 residual = true;
-                let code: Code = finding
-                    .code
-                    .parse()
-                    .unwrap_or_else(|_| unreachable!("validator emits registered codes"));
+                let code = Code::new(finding.code);
                 diags.push(Diagnostic::error(code, finding.message).with_note(format!(
                     "this construct has no lowering rule for target {}; it remains in the \
                          lowered output of `{rel}`",
@@ -378,10 +353,7 @@ fn to_diagnostics(lower_diags: &[LowerDiagnostic], rel: &str) -> Vec<Diagnostic>
     lower_diags
         .iter()
         .map(|d| {
-            let code: Code = d
-                .code
-                .parse()
-                .unwrap_or_else(|_| unreachable!("luabox-lower emits registered codes"));
+            let code = Code::new(d.code);
             let range = usize::from(d.range.start())..usize::from(d.range.end());
             let diag = match d.severity {
                 luabox_lower::Severity::Error => Diagnostic::error(code, d.message.clone()),
@@ -572,10 +544,7 @@ fn render_warnings(bundle: &luabox_bundle::Bundle, root: &Path) -> anyhow::Resul
         .warnings
         .iter()
         .map(|(file, d)| {
-            let code: Code = d
-                .code
-                .parse()
-                .unwrap_or_else(|_| unreachable!("luabox-lower emits registered codes"));
+            let code = Code::new(d.code);
             let range = usize::from(d.range.start())..usize::from(d.range.end());
             let diag = match d.severity {
                 luabox_lower::Severity::Error => Diagnostic::error(code, d.message.clone()),
@@ -588,14 +557,6 @@ fn render_warnings(bundle: &luabox_bundle::Bundle, root: &Path) -> anyhow::Resul
         bail!("build failed");
     }
     Ok(())
-}
-
-/// Parse the project's `luabox.toml`, when present and valid. `None` for
-/// manifest-less directories or a manifest that fails to parse — the check
-/// gate reports a parse failure loudly before it would matter here.
-fn read_manifest(root: &Path) -> Option<Manifest> {
-    let text = fs::read_to_string(root.join("luabox.toml")).ok()?;
-    Manifest::parse(&text).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -869,19 +830,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_mode_flag_is_rejected_before_any_discovery_happens() {
-        // No manifest, no sources: the mode is validated first, so this fails
-        // for the mode rather than for anything about the project.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let options = BuildOptions {
-            mode: Some("roblox".to_owned()),
-            ..opts()
-        };
-        let error = run(tmp.path(), &options).unwrap_err().to_string();
-        assert!(error.contains("unknown bundle mode `roblox`"), "{error}");
-    }
-
-    #[test]
     fn a_manifest_less_project_builds_with_the_default_config() {
         let tmp = tempfile::tempdir().expect("tempdir");
         write(tmp.path(), "src/main.lua", "return 0\n");
@@ -1077,7 +1025,7 @@ mod tests {
 
         let options = BuildOptions {
             outfile: Some(PathBuf::from("app.lua")),
-            mode: Some("nvim-plugin".to_owned()),
+            mode: Some(BundleMode::NvimPlugin),
             ..opts()
         };
         let error = run(tmp.path(), &options).unwrap_err().to_string();
@@ -1094,7 +1042,7 @@ mod tests {
         write(tmp.path(), "src/b.lua", "return 2\n");
 
         let options = BuildOptions {
-            mode: Some("nvim-plugin".to_owned()),
+            mode: Some(BundleMode::NvimPlugin),
             entry: vec![PathBuf::from("src/a.lua"), PathBuf::from("src/b.lua")],
             ..opts()
         };
@@ -1211,15 +1159,19 @@ mod tests {
     // -- effective configuration -------------------------------------------
 
     #[test]
-    fn the_manifest_less_build_defaults_mirror_the_manifest_fallback() {
-        let build = default_build();
+    fn a_manifest_less_project_builds_with_the_manifest_s_own_defaults() {
+        // `build` no longer keeps its own copy of the `[build]` fallback:
+        // discovery hands it `Build::defaults`, the same constructor
+        // `Manifest::parse` uses when a manifest has no `[build]` table, so
+        // the two cannot drift (CC-M11).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let build = check_cmd::discover(tmp.path()).expect("discovers").build;
+        assert_eq!(
+            build,
+            Build::defaults(luabox_manifest::model::DialectId::Lua54)
+        );
         assert_eq!(build.out, "dist");
-        assert_eq!(build.mode, "plain");
-        assert_eq!(build.entry, vec![DEFAULT_ENTRY.to_owned()]);
-        assert_eq!(build.outfile, None);
-        assert!(!build.bundle);
-        assert!(!build.sourcemap);
-        assert!(!build.minify);
+        assert_eq!(build.mode, BundleMode::Plain);
     }
 
     #[test]
@@ -1245,20 +1197,24 @@ mod tests {
     }
 
     #[test]
-    fn read_manifest_yields_none_for_a_missing_or_malformed_manifest() {
+    fn a_malformed_manifest_fails_the_build_rather_than_silently_defaulting() {
+        // `build` had a second manifest read (`read_manifest`) that swallowed
+        // a parse failure and fell back to the `[build]` defaults; discovery
+        // already reported it first, so deleting that read cannot change what
+        // a user sees here — this pins that it did not.
         let tmp = tempfile::tempdir().expect("tempdir");
-        assert!(read_manifest(tmp.path()).is_none());
-
         write(tmp.path(), "luabox.toml", "= = =\n");
-        assert!(read_manifest(tmp.path()).is_none());
+        let error = run(tmp.path(), &opts()).unwrap_err().to_string();
+        assert!(error.starts_with("invalid `"), "{error}");
     }
 
     #[test]
-    fn read_manifest_yields_the_parsed_manifest_when_it_is_valid() {
-        let tmp = project("5.3", "");
-        let parsed = read_manifest(tmp.path()).expect("parses");
-        assert_eq!(parsed.package.name, "fixture");
-        assert_eq!(parsed.package.edition, "5.3");
+    fn discovery_is_the_only_manifest_read_on_the_build_path() {
+        let tmp = project("5.3", "\n[build]\nmode = \"love\"\n");
+        let project = check_cmd::discover(tmp.path()).expect("discovers");
+        assert_eq!(project.name, "fixture");
+        assert_eq!(project.dialect, Dialect::Lua53);
+        assert_eq!(project.build.mode, BundleMode::Love);
     }
 
     #[test]
@@ -1267,7 +1223,7 @@ mod tests {
         write(tmp.path(), "src/main.lua", "return 0\n");
 
         let options = BuildOptions {
-            mode: Some("nvim-plugin".to_owned()),
+            mode: Some(BundleMode::NvimPlugin),
             ..opts()
         };
         run(tmp.path(), &options).expect("build succeeds");

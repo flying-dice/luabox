@@ -5,6 +5,7 @@
 
 mod build_cmd;
 mod check_cmd;
+mod dialect;
 mod doc_cmd;
 mod fmt_cmd;
 mod lint_cmd;
@@ -20,7 +21,59 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::bail;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use luabox_diag::Format;
+use luabox_manifest::model::BundleMode;
+
+/// `--format`: the closed set of diagnostic renderings (SPEC.md §14).
+///
+/// A CLI-side mirror of [`luabox_diag::Format`], not that type itself: clap's
+/// `ValueEnum` owns the spellings and the "possible values" help/completions,
+/// while `luabox-diag` stays free of a `clap` dependency. Hand-rolled
+/// `parse_format` string matching died with it (CC-M12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum FormatArg {
+    Human,
+    Json,
+    Sarif,
+    Github,
+    Gitlab,
+}
+
+impl From<FormatArg> for Format {
+    fn from(arg: FormatArg) -> Self {
+        match arg {
+            FormatArg::Human => Format::Human,
+            FormatArg::Json => Format::Json,
+            FormatArg::Sarif => Format::Sarif,
+            FormatArg::Github => Format::GithubActions,
+            FormatArg::Gitlab => Format::GitlabCodeQuality,
+        }
+    }
+}
+
+/// `--mode`: the closed set of bundler embedding modes (SPEC.md §7).
+///
+/// The same CLI-side-mirror trick as [`FormatArg`]: clap validates the flag,
+/// and this maps onto the manifest's [`BundleMode`] so a flag-supplied mode
+/// and a `[build] mode` are the same value by the time `build_cmd` sees them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ModeArg {
+    Plain,
+    Love,
+    #[value(name = "nvim-plugin")]
+    NvimPlugin,
+}
+
+impl From<ModeArg> for BundleMode {
+    fn from(arg: ModeArg) -> Self {
+        match arg {
+            ModeArg::Plain => BundleMode::Plain,
+            ModeArg::Love => BundleMode::Love,
+            ModeArg::NvimPlugin => BundleMode::NvimPlugin,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -45,7 +98,8 @@ enum Command {
         /// Scaffold a library (default is a binary/script project)
         #[arg(long, conflicts_with = "bin")]
         lib: bool,
-        /// Scaffold a binary/script project
+        /// Scaffold a binary/script project — the default, so passing it
+        /// only makes that explicit
         #[arg(long)]
         bin: bool,
         /// Dialect you write: 5.1, 5.2, 5.3, 5.4, luajit
@@ -55,10 +109,14 @@ enum Command {
     /// Scaffold a new project in a new directory
     New {
         name: String,
+        /// Scaffold a library (default is a binary/script project)
         #[arg(long, conflicts_with = "bin")]
         lib: bool,
+        /// Scaffold a binary/script project — the default, so passing it
+        /// only makes that explicit
         #[arg(long)]
         bin: bool,
+        /// Dialect you write: 5.1, 5.2, 5.3, 5.4, luajit
         #[arg(long, default_value = "5.4")]
         edition: String,
     },
@@ -67,9 +125,9 @@ enum Command {
         /// Also validate dialect legality against a ship target
         #[arg(long)]
         target: Option<String>,
-        /// Output format: human, json, sarif, github, gitlab
-        #[arg(long, default_value = "human")]
-        format: String,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = FormatArg::Human)]
+        format: FormatArg,
         /// Rerun on every source/manifest change until interrupted (Ctrl-C);
         /// a failing run is reported but does not stop watching
         #[arg(long)]
@@ -118,10 +176,10 @@ enum Command {
         /// Mangle locals/whitespace in each bundle
         #[arg(long)]
         minify: bool,
-        /// Embedding mode: plain (default), love, nvim-plugin; overrides
+        /// Embedding mode (default: `[build] mode`, else plain); overrides
         /// `[build] mode`
-        #[arg(long)]
-        mode: Option<String>,
+        #[arg(long, value_enum)]
+        mode: Option<ModeArg>,
     },
     /// Generate documentation from annotations
     Doc {
@@ -221,7 +279,12 @@ fn run(command: Command) -> anyhow::Result<()> {
             target,
             format,
             watch,
-        } => check_cmd::run(&std::env::current_dir()?, target.as_deref(), &format, watch),
+        } => check_cmd::run(
+            &std::env::current_dir()?,
+            target.as_deref(),
+            format.into(),
+            watch,
+        ),
         Command::Lint { fix } => lint_cmd::run(&std::env::current_dir()?, fix),
         Command::Fmt { check, watch } => fmt_cmd::run(&std::env::current_dir()?, check, watch),
         Command::Build {
@@ -252,7 +315,7 @@ fn run(command: Command) -> anyhow::Result<()> {
                     bundle,
                     sourcemap,
                     minify,
-                    mode,
+                    mode: mode.map(Into::into),
                 },
             )
         }
@@ -405,6 +468,19 @@ mod tests {
 
         assert_eq!(actual, expected, "the CLI subcommand surface changed");
         assert_eq!(actual.len(), 11);
+
+        // ...and every one of them is documented. This used to be a second
+        // test with its own copy of the list above, which asserted that each
+        // name was *present* — something the exact-set comparison already
+        // covers — and then looped for `about`. Only the loop was load-bearing
+        // (LG-N5), so it lives here, next to the set it is about.
+        for sub in Cli::command().get_subcommands() {
+            assert!(
+                sub.get_about().is_some(),
+                "`{}` has no help text",
+                sub.get_name()
+            );
+        }
     }
 
     // -- init / new --------------------------------------------------------
@@ -484,7 +560,7 @@ mod tests {
             panic!("expected Check");
         };
         assert_eq!(target, None);
-        assert_eq!(format, "human");
+        assert_eq!(format, FormatArg::Human);
         assert!(!watch);
     }
 
@@ -499,7 +575,7 @@ mod tests {
             panic!("expected Check");
         };
         assert_eq!(target.as_deref(), Some("5.1"));
-        assert_eq!(format, "json");
+        assert_eq!(format, FormatArg::Json);
         assert!(watch);
     }
 
@@ -623,7 +699,7 @@ mod tests {
         assert_eq!(outfile, Some(PathBuf::from("app.lua")));
         assert!(sourcemap);
         assert!(minify);
-        assert_eq!(mode.as_deref(), Some("love"));
+        assert_eq!(mode, Some(ModeArg::Love));
     }
 
     #[test]
@@ -770,27 +846,25 @@ mod tests {
     }
 
     #[test]
-    fn every_subcommand_is_reachable_and_documented() {
-        let command = Cli::command();
-        let names: Vec<&str> = command
-            .get_subcommands()
-            .map(clap::Command::get_name)
-            .collect();
-        for expected in [
-            "init", "new", "check", "lint", "fmt", "build", "doc", "lsp", "upgrade", "explain",
-            "unmap",
-        ] {
-            assert!(
-                names.contains(&expected),
-                "`{expected}` is missing: {names:?}"
-            );
-        }
-        for sub in command.get_subcommands() {
-            assert!(
-                sub.get_about().is_some(),
-                "`{}` has no help text",
-                sub.get_name()
-            );
+    fn the_bin_flag_documents_itself_as_the_explicit_default() {
+        // `--bin` and no flag at all scaffold the same project, so its help
+        // has to say so — otherwise it reads as the opposite of `--lib`, i.e.
+        // as something you have to pass (LG-N11). Both scaffolding commands
+        // carry the same flag, so both are pinned.
+        for name in ["init", "new"] {
+            let sub = Cli::command()
+                .find_subcommand(name)
+                .expect("subcommand exists")
+                .clone();
+            let help = sub
+                .get_arguments()
+                .find(|a| a.get_id() == "bin")
+                .and_then(clap::Arg::get_help)
+                .map_or_else(
+                    || panic!("`{name} --bin` has help text"),
+                    ToString::to_string,
+                );
+            assert!(help.contains("the default"), "{name}: {help}");
         }
     }
 }

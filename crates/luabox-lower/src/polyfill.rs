@@ -439,6 +439,32 @@ fn jit_family(helper: Helper) -> &'static str {
 /// 5.4's `__close(v, err)` protocol); the error, if any, is re-raised
 /// unmodified (`level 0` keeps the original message intact). `nil`/`false`
 /// handles are ignored exactly as 5.4 ignores them.
+///
+/// # Reachability
+///
+/// [`Helper`] is partitioned by *source* dialect, and [`body`] dispatches on
+/// exactly that partition:
+///
+/// - LuaJIT source → [`jit_family`], which answers every helper
+///   [`Helper::JIT_BIT_MODULE`] contains — and `crate::jit_ext` is the only
+///   thing that inserts those, gated on `Ctx::jit_bit`, which is set only when
+///   the source dialect is LuaJIT.
+/// - 5.3+ source → [`bit32_family`]/[`bitjit_family`]/[`pure_family`], which
+///   answer the six operator helpers (`Band`…`Shr`) the operator rewrites
+///   insert.
+///
+/// `CloseScope` is the one helper *neither* half claims, which is what this
+/// function is for. Anything else arriving here would mean a helper was
+/// inserted by a source family that has no body for it, and the prelude would
+/// be missing a member the emitted code calls — a silently broken artifact,
+/// which is worse than stopping. `every_helper_has_a_body_in_the_family_that_
+/// can_emit_it` pins the partition, so adding a helper to the wrong half fails
+/// a test rather than reaching this arm.
+#[expect(
+    clippy::unreachable,
+    reason = "the source-dialect partition above leaves CloseScope as the only common helper; \
+              a fall-through would emit a prelude missing a member the code calls"
+)]
 fn common_family(helper: Helper) -> &'static str {
     match helper {
         Helper::CloseScope => {
@@ -470,6 +496,56 @@ mod tests {
             prelude(&BTreeSet::new(), Dialect::Lua53, Dialect::Lua51),
             None
         );
+    }
+
+    /// The reachability proof behind `common_family`'s `#[expect]`: each half
+    /// of the source-dialect partition answers every helper *that half can
+    /// insert*, and `CloseScope` — the one helper neither half claims — is the
+    /// only one `common_family` ever sees. Adding a helper to the wrong half
+    /// fails here instead of aborting a build.
+    #[test]
+    fn every_helper_has_a_body_in_the_family_that_can_emit_it() {
+        // 5.3+/`<close>` source: the operator rewrites insert exactly these.
+        for helper in [
+            Helper::Band,
+            Helper::Bor,
+            Helper::Bxor,
+            Helper::Bnot,
+            Helper::Shl,
+            Helper::Shr,
+        ] {
+            for to in [
+                Dialect::Lua51,
+                Dialect::Lua52,
+                Dialect::Lua53,
+                Dialect::LuaJit,
+            ] {
+                assert!(
+                    body(helper, to, false).contains(helper.name()),
+                    "`{}` has no body for target {to:?}",
+                    helper.name()
+                );
+            }
+        }
+        // LuaJIT source: `jit_ext` inserts these, and only when the source
+        // dialect is LuaJIT — so they only ever reach `jit_family`.
+        for helper in Helper::JIT_BIT_MODULE {
+            assert!(
+                body(helper, Dialect::Lua51, true).contains(helper.name()),
+                "`{}` has no LuaJIT-source body",
+                helper.name()
+            );
+        }
+        // `CloseScope` is what `common_family` exists for: no family claims
+        // it, and every family answers it identically.
+        for jit_source in [false, true] {
+            for to in [Dialect::Lua51, Dialect::Lua52, Dialect::LuaJit] {
+                assert_eq!(
+                    body(Helper::CloseScope, to, jit_source),
+                    common_family(Helper::CloseScope)
+                );
+            }
+        }
     }
 
     #[test]

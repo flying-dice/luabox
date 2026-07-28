@@ -629,7 +629,7 @@ fn a_module_that_does_not_parse_is_a_parse_error() {
         panic!("expected Lower, got {err}");
     };
     assert_eq!(file, "src/broken.lua");
-    assert!(diagnostics.iter().any(|d| d.code == "LB0001"), "{err}");
+    assert!(diagnostics.iter().any(|d| d.code == 1), "{err}");
     assert!(
         err.to_string().contains("cannot lower `src/broken.lua`"),
         "{err}"
@@ -676,7 +676,7 @@ fn a_module_with_an_irreducible_goto_is_a_lower_error() {
     assert_eq!(file, "src/jumpy.lua");
     assert_eq!(
         diagnostics.iter().map(|d| d.code).collect::<Vec<_>>(),
-        vec!["LB0601"]
+        vec![601]
     );
     let message = err.to_string();
     assert!(
@@ -751,7 +751,7 @@ fn dynamic_requires_are_reported_across_modules_in_file_order() {
 
 #[test]
 fn every_bundle_error_renders_its_own_shape() {
-    let lower_diag = |code: &'static str, message: &str| LowerDiagnostic {
+    let lower_diag = |code: u16, message: &str| LowerDiagnostic {
         code,
         severity: Severity::Error,
         message: message.to_owned(),
@@ -777,10 +777,7 @@ fn every_bundle_error_renders_its_own_shape() {
     assert_eq!(
         BundleError::Lower {
             file: "src/a.lua".to_owned(),
-            diagnostics: vec![
-                lower_diag("LB0601", "irreducible"),
-                lower_diag("LB0604", "env")
-            ],
+            diagnostics: vec![lower_diag(601, "irreducible"), lower_diag(604, "env")],
         }
         .to_string(),
         "cannot lower `src/a.lua` for bundling:\n  LB0601: irreducible\n  LB0604: env"
