@@ -51,7 +51,7 @@ impl Exactness {
     }
 
     /// Whether this is the strict end of the ladder.
-    fn is_strict(self) -> bool {
+    pub(crate) fn is_strict(self) -> bool {
         matches!(self, Exactness::Strict)
     }
 }
