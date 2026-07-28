@@ -595,3 +595,92 @@ local function use(x) end
         vec!["LB0305"]
     );
 }
+
+// --- cross-file method carrier tags (#33) ----------------------------------
+//
+// `---@deprecated`/`---@async` written on a `function Class:method()` carrier
+// must reach a *consumer* file's `obj:method()` call. The tags ride the class
+// surface through [`Ambient::with_project_types`] like the signature itself —
+// including when the method is also `---@field`-declared, where the
+// declaration shadows the carrier on type but inherits its tags.
+
+/// A class whose tagged methods are declared as `---@field`s *and* defined,
+/// exported for a consumer to require.
+const TAGGED_CLASS_MODULE: &str = "\
+---@class Session
+---@field close fun(self: Session)
+---@field fetch fun(self: Session)
+local Session = {}
+Session.__index = Session
+
+---@deprecated
+function Session:close() end
+
+---@async
+function Session:fetch() end
+
+---@return Session
+function Session.new()
+  return setmetatable({}, Session)
+end
+
+return Session
+";
+
+/// Assemble the merged ambient + registry for [`TAGGED_CLASS_MODULE`] and
+/// strict-check `consumer` against them.
+fn check_tagged(consumer: &str) -> Vec<Diagnostic> {
+    let base = stdlib();
+    let (export, types) = surface(TAGGED_CLASS_MODULE, base);
+    let ambient = base.with_project_types([&types]);
+    let mut requires = HashMap::new();
+    requires.insert("session".to_string(), export);
+    check(consumer, &ambient, &requires)
+}
+
+#[test]
+fn cross_file_deprecated_method_flagged_at_the_consumer() {
+    let consumer = "\
+---@type Session
+local s
+s:close()
+";
+    assert_eq!(codes(&check_tagged(consumer)), vec!["LB0308"]);
+}
+
+#[test]
+fn cross_file_async_method_flagged_at_the_consumer() {
+    let consumer = "\
+---@type Session
+local s
+local function sync()
+  s:fetch()
+end
+";
+    assert_eq!(codes(&check_tagged(consumer)), vec!["LB0316"]);
+}
+
+#[test]
+fn cross_file_async_method_in_an_async_consumer_is_clean() {
+    let consumer = "\
+---@type Session
+local s
+---@async
+local function poll()
+  s:fetch()
+end
+";
+    assert_eq!(codes(&check_tagged(consumer)), Vec::<String>::new());
+}
+
+#[test]
+fn cross_file_method_tags_keep_the_declared_signature() {
+    // The carry-over adds tags only: the `---@field` declaration still governs
+    // arity, so a surplus argument is still LB0301 at the consumer.
+    let consumer = "\
+---@type Session
+local s
+s:close(1)
+";
+    assert_eq!(codes(&check_tagged(consumer)), vec!["LB0308", "LB0301"]);
+}

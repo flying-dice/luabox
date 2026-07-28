@@ -67,6 +67,24 @@ const INVISIBLE: u16 = 312;
 /// A byte range key, matching the annotation checker's convention.
 type Key = (usize, usize);
 
+/// A `:` method call's resolved signature, as published to the annotation
+/// checker by [`Outcome::method_sigs`].
+#[derive(Debug, Clone)]
+pub(crate) struct MethodSig {
+    /// The resolved member's signature, with its implicit `self` (if declared)
+    /// still in place.
+    pub(crate) sig: FunctionTy,
+    /// Whether the call's explicit arguments may be arity- and type-checked
+    /// against `sig`. Only when the receiver resolves to a declared
+    /// `---@class`: a plain inferred table's method is resolved structurally
+    /// and its contract is not authoritative enough to manufacture argument
+    /// errors from (SPEC §19 conservatism). The callee's *use-site tags* —
+    /// `---@deprecated` (LB0308), `---@async` (LB0316), `---@version` — carry
+    /// no such risk: they are what the author wrote on the method itself, so
+    /// they are reported for every resolved receiver (#33).
+    pub(crate) args_checkable: bool,
+}
+
 /// What inference hands back to the checker.
 #[derive(Debug, Default)]
 pub(crate) struct Outcome {
@@ -75,13 +93,14 @@ pub(crate) struct Outcome {
     /// results are omitted.
     pub(crate) expr_types: HashMap<Key, Ty>,
     /// The resolved function signature of a `:` method call, keyed by the
-    /// method-call expression's byte range. Published only when the receiver
+    /// method-call expression's byte range. Published whenever the receiver
     /// resolves to a concrete field whose type is a function — the engine's
-    /// method resolution the annotation checker consumes to argument-check the
-    /// call (#118). The signature is as-declared (including its `self`
-    /// parameter, if any, and `---@deprecated`); the checker strips the
-    /// implicit `self` before matching explicit arguments.
-    pub(crate) method_sigs: HashMap<Key, FunctionTy>,
+    /// method resolution the annotation checker consumes to flag the callee's
+    /// use-site tags and (when [`MethodSig::args_checkable`]) to
+    /// argument-check the call (#118, #33). The signature is as-declared
+    /// (including its `self` parameter, if any, and `---@deprecated`); the
+    /// checker strips the implicit `self` before matching explicit arguments.
+    pub(crate) method_sigs: HashMap<Key, MethodSig>,
     /// Inference's own diagnostics (`LB0306`).
     pub(crate) diags: Vec<Diagnostic>,
     /// Final reified type of every binding, in declaration order (the
@@ -516,7 +535,7 @@ struct Infer<'a> {
     declared: HashSet<BindingId>,
     globals: HashMap<String, ITy>,
     expr_types: HashMap<Key, Ty>,
-    method_sigs: HashMap<Key, FunctionTy>,
+    method_sigs: HashMap<Key, MethodSig>,
     diags: Vec<Diagnostic>,
     memo: HashMap<usize, Ty>,
     reify_stack: Vec<usize>,
@@ -935,6 +954,58 @@ impl Infer<'_> {
 
     // --- field lookup ------------------------------------------------------
 
+    /// Fold a same-file carrier attachment's use-site tags onto a member that
+    /// resolved through its class's *declared* shape.
+    ///
+    /// A `---@field m fun(...)` line is authoritative for the member's type,
+    /// and `class_shape` lets it shadow the `function C:m()` attachment
+    /// accordingly. But `fun(...)` syntax has nowhere to write
+    /// `---@deprecated`/`---@async`/`---@version`: those tags only ever live on
+    /// the carrier. Without carrying them across, declaring a method as a
+    /// `---@field` *and* defining it silently disables LB0308/LB0316 at every
+    /// `c:m()` site (#33). Only the tags travel — parameters, returns,
+    /// overloads and generics stay as declared.
+    ///
+    /// The attachment is read straight off the carrier shape (`local C = {}`,
+    /// which `function C:m()` extends), not through another class-shape
+    /// lookup, so this cannot re-enter the resolution it is refining.
+    fn carrier_tagged(&self, class: &str, name: &str, found: ITy) -> ITy {
+        let ITy::Ty(Ty::Function(sig)) = &found else {
+            return found;
+        };
+        // Already tagged, or no same-file carrier to consult.
+        if sig.deprecated || sig.is_async || sig.version.is_some() {
+            return found;
+        }
+        let Some(&carrier) = self.declared_carriers.get(class) else {
+            return found;
+        };
+        let Some(attached) = self.shapes[carrier].fields.get(name) else {
+            return found;
+        };
+        let Some(tags) = self.tags_of(attached) else {
+            return found;
+        };
+        if !tags.deprecated && !tags.is_async && tags.version.is_none() {
+            return found;
+        }
+        let mut tagged = (**sig).clone();
+        tagged.deprecated = tags.deprecated;
+        tagged.is_async = tags.is_async;
+        tagged.version.clone_from(&tags.version);
+        ITy::Ty(Ty::Function(Box::new(tagged)))
+    }
+
+    /// The declared signature behind a function-valued member, whether it is an
+    /// already-reified type or a body this file defines.
+    fn tags_of<'s>(&'s self, ity: &'s ITy) -> Option<&'s FunctionTy> {
+        match ity {
+            ITy::Ty(Ty::Function(sig)) => Some(sig),
+            ITy::Func(body) => self.funcs.get(body)?.sig.as_ref(),
+            _ => None,
+        }
+    }
+
     /// Look a named field up on a receiver, following the `__index` chain.
     fn lookup_field(&mut self, recv: &ITy, name: &str) -> Lookup {
         match recv {
@@ -984,7 +1055,7 @@ impl Infer<'_> {
                         } else {
                             field.ty.clone()
                         };
-                        return Lookup::Found(ITy::Ty(ty));
+                        return Lookup::Found(self.carrier_tagged(&class, name, ITy::Ty(ty)));
                     }
                     // Absence is diagnosable only for a real LuaCATS `---@class`
                     // with no indexer/array part. A dynamic-access class stays
@@ -1065,7 +1136,7 @@ impl Infer<'_> {
                     return Lookup::Opaque;
                 };
                 if let Lookup::Found(ity) = self.lookup_ty_field(&resolved, name) {
-                    return Lookup::Found(ity);
+                    return Lookup::Found(self.carrier_tagged(class, name, ity));
                 }
                 // An annotated instance (`---@return Circle`, `---@type
                 // Circle`) still resolves methods and inferred extensions
@@ -3143,23 +3214,31 @@ impl Infer<'_> {
                     self.check_visibility(body, expr, class, &method);
                 }
                 // Publish the resolved method signature so the annotation
-                // checker can argument-check the `:` call (#118). Gated on:
-                //  - the receiver resolving to a declared `---@class` — a plain
-                //    inferred table's method carries no checkable contract;
-                //  - the resolved member being an *annotated* function value
-                //    (a `---@field m fun(...)` or a `function C:m` carrying a
-                //    `---@param`/`---@return`/`---@deprecated` signature). An
-                //    unannotated method reifies to a `fun` with `unknown`
-                //    parameters and would manufacture arity errors, so — exactly
-                //    as an unannotated free function is never arity-checked — it
-                //    is left unpublished (mandatory conservatism).
+                // checker can flag the callee's use-site tags and argument-check
+                // the `:` call (#118, #33). Gated on the resolved member being an
+                // *annotated* function value (a `---@field m fun(...)` or a
+                // `function C:m` carrying a `---@param`/`---@return`/
+                // `---@deprecated` signature). An unannotated method reifies to a
+                // `fun` with `unknown` parameters and would manufacture arity
+                // errors, so — exactly as an unannotated free function is never
+                // arity-checked — it is left unpublished (mandatory
+                // conservatism).
+                //
+                // Argument checking additionally requires the receiver to
+                // resolve to a declared `---@class`; the tags do not (see
+                // [`MethodSig::args_checkable`]).
                 // Only pass 1's resolution is published, matching `expr_types`.
                 if self.pass == 1
-                    && recv_class.is_some()
                     && let ITy::Ty(Ty::Function(sig)) = &f
                     && let Some(key) = self.expr_range(body, expr)
                 {
-                    self.method_sigs.insert(key, (**sig).clone());
+                    self.method_sigs.insert(
+                        key,
+                        MethodSig {
+                            sig: (**sig).clone(),
+                            args_checkable: recv_class.is_some(),
+                        },
+                    );
                 }
                 match &f {
                     ITy::Func(fn_body) => self.record_arg_seeds(*fn_body, &arg_itys, true),
