@@ -3,10 +3,13 @@
 //!
 //! Black-box, like `acceptance.rs`: every scenario spawns the real `luabox`
 //! binary with the `lsp` subcommand and speaks LSP JSON-RPC over the child's
-//! stdin/stdout (`Content-Length` framing). Nothing links `luabox-lsp`
-//! directly, so a scenario exercises the whole stack the editor sees —
-//! transport, capability advertisement, salsa analysis host, and the
-//! `luabox-db` queries behind every request.
+//! stdin/stdout (`Content-Length` framing). No scenario calls into
+//! `luabox-lsp`, so it exercises the whole stack the editor sees — transport,
+//! capability advertisement, salsa analysis host, and the `luabox-db` queries
+//! behind every request. The one thing the harness does borrow from the crate
+//! is [`luabox_lsp::path_to_uri`]: file identity is what both sides must agree
+//! on, and a second copy of the percent-encoder here could disagree with the
+//! server's without any scenario noticing.
 //!
 //! Reliability rules the harness enforces:
 //!
@@ -40,6 +43,13 @@ use std::time::{Duration, Instant};
 use cucumber::gherkin::Step;
 use cucumber::{World, given, then, when};
 use serde_json::{Value, json};
+
+/// Fixture writers shared with the `acceptance` harness. Cucumber binds a step
+/// attribute to one `World`, so the `#[given]` shims below stay here; only
+/// their bodies are shared.
+mod support;
+
+use support::{docstring, write_file};
 
 /// How long a step waits for a reply before declaring the server hung.
 /// Generous: a cold `cargo test` run may start dozens of servers at once.
@@ -189,46 +199,11 @@ fn read_frame(reader: &mut BufReader<ChildStdout>) -> Option<Value> {
     serde_json::from_slice(&body).ok()
 }
 
-/// Render a filesystem path as a `file://` URI, percent-encoding everything
-/// outside the URI path charset (mirrors `luabox_lsp::path_to_uri`, which the
-/// server uses for the URIs it hands back).
+/// Render a filesystem path as a `file://` URI — the server's own encoder, so
+/// the URIs a scenario builds are byte-identical to the ones the server hands
+/// back and a mismatch cannot hide behind two copies of the same charset table.
 fn path_to_uri(path: &Path) -> String {
-    use std::fmt::Write as _;
-
-    let path = path.to_string_lossy().replace('\\', "/");
-    let mut uri = String::from("file://");
-    if !path.starts_with('/') {
-        uri.push('/');
-    }
-    for &byte in path.as_bytes() {
-        if byte.is_ascii_alphanumeric()
-            || matches!(
-                byte,
-                b'-' | b'.'
-                    | b'_'
-                    | b'~'
-                    | b'!'
-                    | b'$'
-                    | b'&'
-                    | b'\''
-                    | b'('
-                    | b')'
-                    | b'*'
-                    | b'+'
-                    | b','
-                    | b';'
-                    | b'='
-                    | b':'
-                    | b'@'
-                    | b'/'
-            )
-        {
-            uri.push(byte as char);
-        } else {
-            let _ = write!(uri, "%{byte:02X}");
-        }
-    }
-    uri
+    luabox_lsp::path_to_uri(path).as_str().to_owned()
 }
 
 // === World ===============================================================
@@ -290,11 +265,7 @@ impl LspWorld {
     }
 
     fn write_file(&self, relative: &str, content: &str) {
-        let path = self.root.join(relative);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("failed to create parent directories");
-        }
-        std::fs::write(&path, content).unwrap_or_else(|e| panic!("cannot write `{relative}`: {e}"));
+        write_file(&self.root, relative, content);
     }
 
     /// Spawn the server and complete the `initialize`/`initialized` handshake.
@@ -451,17 +422,6 @@ impl Drop for LspWorld {
 
 // === Shared helpers ======================================================
 
-/// The step's docstring, normalized the same way `acceptance.rs` does: the
-/// leading newline after `"""` stripped, exactly one trailing newline.
-fn docstring(step: &Step) -> String {
-    let raw = step
-        .docstring
-        .as_deref()
-        .expect("this step requires a docstring (\"\"\" … \"\"\")");
-    let body = raw.strip_prefix('\n').unwrap_or(raw);
-    format!("{}\n", body.trim_end_matches(['\n', '\r']))
-}
-
 fn range(start_line: u32, start_col: u32, end_line: u32, end_col: u32) -> Value {
     json!({
         "start": { "line": start_line, "character": start_col },
@@ -599,27 +559,14 @@ fn decode_tokens(world: &LspWorld) -> Vec<DecodedToken> {
 
 // === Project fixtures ====================================================
 
-fn write_manifest(world: &LspWorld, edition: &str, strict: bool) {
-    let manifest = format!(
-        "[package]\n\
-         name = \"fixture\"\n\
-         version = \"0.1.0\"\n\
-         edition = \"{edition}\"\n\
-         \n\
-         [types]\n\
-         strict = {strict}\n"
-    );
-    world.write_file("luabox.toml", &manifest);
-}
-
 #[given(expr = "a project with edition {string}")]
 fn project_with_edition(world: &mut LspWorld, edition: String) {
-    write_manifest(world, &edition, false);
+    support::write_manifest(&world.root, &edition, false);
 }
 
 #[given(expr = "a strict project with edition {string}")]
 fn strict_project_with_edition(world: &mut LspWorld, edition: String) {
-    write_manifest(world, &edition, true);
+    support::write_manifest(&world.root, &edition, true);
 }
 
 /// A manifest whose `[lint]` section pins one rule, so a scenario can reach a
@@ -628,13 +575,8 @@ fn strict_project_with_edition(world: &mut LspWorld, edition: String) {
 #[given(expr = "a project with edition {string} and lint rule {string} set to {string}")]
 fn project_with_lint_rule(world: &mut LspWorld, edition: String, rule: String, level: String) {
     let manifest = format!(
-        "[package]\n\
-         name = \"fixture\"\n\
-         version = \"0.1.0\"\n\
-         edition = \"{edition}\"\n\
-         \n\
-         [lint]\n\
-         {rule} = \"{level}\"\n"
+        "{}\n[lint]\n{rule} = \"{level}\"\n",
+        support::package_table(&edition)
     );
     world.write_file("luabox.toml", &manifest);
 }

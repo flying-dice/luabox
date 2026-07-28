@@ -26,7 +26,7 @@ use crate::uri::path_to_uri;
 /// project's edition — selects the `lua_modules/share/lua/<X.Y>/` version
 /// directory of a luarocks tree.
 #[must_use]
-pub fn goto_definition(
+pub fn definition(
     sema: &FileSema,
     offset: usize,
     project_root: &Path,
@@ -289,7 +289,7 @@ mod tests {
     fn at(src: &str, needle: &str, nth: usize) -> Option<Location> {
         let (analysis, path) = analyze(&[("main.lua", src)]);
         let sema = FileSema::new(&analysis, &path).expect("sema");
-        goto_definition(&sema, offset_of(src, needle, nth), &root(), Dialect::Lua54)
+        definition(&sema, offset_of(src, needle, nth), &root(), Dialect::Lua54)
     }
 
     /// The `(line, character)` start of a location.

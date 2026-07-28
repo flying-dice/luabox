@@ -30,7 +30,8 @@
 //!   upvalues via HIR name resolution, class fields to their `---@field`
 //!   site, functions to their declaration, `require("mod")` to the module
 //!   file; type-definition and implementation resolve against the
-//!   workspace-global class graph (see [`goto_type`], [`goto_impl`]).
+//!   workspace-global class graph (see [`goto_type_definition`],
+//!   [`goto_implementation`]).
 //! - **Find references + rename** — every use of a binding, class or field
 //!   across the workspace ([`references`]), and `prepare`-gated rename
 //!   driving the same resolution ([`rename`]).
@@ -62,6 +63,18 @@
 //!   cursor sits inside a call's argument list, with the active parameter
 //!   and `---@overload` alternates (see [`signature_help`]).
 //!
+//! # Handler naming
+//!
+//! Each handler module exposes one entry point per LSP request it serves,
+//! named for that request's method: the `textDocument/`, `workspace/` and
+//! `callHierarchy/` prefix dropped, converted to snake case, pluralised when
+//! the reply is a list. So `hover::hover`, `goto_definition::definition`,
+//! `folding::folding_ranges`, `call_hierarchy::incoming_calls`. `Server`'s
+//! wrapper for each carries that same name, which is what makes the dispatch
+//! table in `server.rs` readable as the method list it is. Where a module's
+//! name and its entry point's coincide the stutter stands — it is the price of
+//! having one rule rather than a judgement call per module.
+//!
 //! Of the request handlers SPEC §8 asks for, all are dispatched. What is
 //! still outstanding there is transport and trimmings: **TCP** (stdio is the
 //! only transport — [`run_stdio`]; `luabox lsp --stdio` accepts the flag
@@ -77,9 +90,9 @@ mod diagnostics;
 mod document_highlight;
 mod fmt;
 mod folding;
-mod goto_def;
-mod goto_impl;
-mod goto_type;
+mod goto_definition;
+mod goto_implementation;
+mod goto_type_definition;
 mod hover;
 mod inlay_hints;
 mod line_index;

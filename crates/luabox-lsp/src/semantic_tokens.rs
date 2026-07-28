@@ -138,7 +138,7 @@ const LUA_BUILTINS: &[&str] = &[
 
 /// Semantic tokens for one Lua file.
 #[must_use]
-pub fn lua_tokens(sema: &FileSema) -> Vec<SemanticToken> {
+pub fn semantic_tokens(sema: &FileSema) -> Vec<SemanticToken> {
     let names: HashMap<TextRange, (u32, u32)> = sema
         .name_resolutions()
         .into_iter()
@@ -416,7 +416,7 @@ mod tests {
         let (analysis, path) = analyze(src);
         let sema = FileSema::new(&analysis, &path).expect("sema");
         let (mut line, mut start) = (0, 0);
-        lua_tokens(&sema)
+        semantic_tokens(&sema)
             .into_iter()
             .map(|token| {
                 if token.delta_line == 0 {

@@ -44,7 +44,7 @@ use crate::sema::FileSema;
 /// type diagnostics (for add-missing-field's `LB0302`). Returns `[]` when
 /// nothing applies.
 #[must_use]
-pub fn type_actions(
+pub fn code_actions(
     sema: &FileSema,
     inferred: Option<&BindingTypes>,
     type_diags: &[Diagnostic],
@@ -684,13 +684,13 @@ mod tests {
         }
     }
 
-    /// Every action `type_actions` offers over the whole file.
+    /// Every action `code_actions` offers over the whole file.
     fn all_actions(src: &str, diags: &[Diagnostic]) -> Vec<CodeAction> {
         let (analysis, path) = analyze(src);
         let sema = FileSema::new(&analysis, &path).unwrap();
         let uri = path_to_uri(&path);
         let inferred = analysis.binding_types(&path);
-        only_actions(type_actions(
+        only_actions(code_actions(
             &sema,
             inferred.as_ref(),
             diags,

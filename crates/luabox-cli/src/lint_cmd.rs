@@ -268,26 +268,16 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+    use crate::testutil::{read, write};
 
-    /// Write `contents` to `root/rel`, creating parent directories.
-    fn write(root: &Path, rel: &str, contents: &str) {
-        let path = root.join(rel);
-        fs::create_dir_all(path.parent().expect("has a parent")).expect("create parents");
-        fs::write(&path, contents).expect("write file");
-    }
-
+    /// Every lint fixture is a 5.4 project — the dialect is never the subject
+    /// here — so the edition is pinned rather than threaded through each call.
     fn manifest(extra: &str) -> String {
-        format!("[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n{extra}")
+        crate::testutil::manifest("5.4", extra)
     }
 
     fn project(extra: &str) -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write(tmp.path(), "luabox.toml", &manifest(extra));
-        tmp
-    }
-
-    fn read(root: &Path, rel: &str) -> String {
-        fs::read_to_string(root.join(rel)).expect("read back")
+        crate::testutil::project("5.4", extra)
     }
 
     // -- the command -------------------------------------------------------
@@ -381,9 +371,12 @@ mod tests {
         let broken = "local unused = 1\nlocal = \n";
         write(tmp.path(), "src/main.lua", broken);
 
-        // Parse errors are correctness-tier, so the command fails — but the
-        // file itself must survive untouched.
-        assert!(run(tmp.path(), true).is_err());
+        // Parse errors are correctness-tier, so the command fails with the
+        // lint summary (not, say, an io error from a half-written rewrite) —
+        // and the file itself survives byte-for-byte. `local = ` trips the
+        // parser twice: no name, then no expression.
+        let error = run(tmp.path(), true).unwrap_err().to_string();
+        assert_eq!(error, "lint failed with 2 error(s)");
         assert_eq!(read(tmp.path(), "src/main.lua"), broken);
     }
 
@@ -391,9 +384,12 @@ mod tests {
     fn definition_files_are_linted_unlike_check_and_build() {
         let tmp = project("");
         // `lint` walks with `DefFiles::Include`: `*.d.lua` are walked too, so
-        // a parse error in one is reported rather than skipped.
+        // a parse error in one is reported rather than skipped — and it is
+        // the `.d.lua`'s own parse errors (no name, then no expression), from
+        // the only file in the project.
         write(tmp.path(), "defs/broken.d.lua", "local = \n");
-        assert!(run(tmp.path(), false).is_err());
+        let error = run(tmp.path(), false).unwrap_err().to_string();
+        assert_eq!(error, "lint failed with 2 error(s)");
     }
 
     #[test]
