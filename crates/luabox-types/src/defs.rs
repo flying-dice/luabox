@@ -16,11 +16,12 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::OnceLock;
 
-use luabox_diag::{Code, Diagnostic, Label, Span};
+use luabox_diag::{Diagnostic, Label, Span};
 use luabox_hir::{Expr, ExprId, HirId, Resolution, Stmt};
 use luabox_syntax::lua::{self, Dialect};
 use luabox_syntax::luacats::{self, AliasTag, AnnotatedItem, Tag};
 
+use crate::codes::{ALIAS_COLLISION, CLASS_COLLISION};
 use crate::env::TypeEnv;
 
 /// A definition-package source paired with the file it was read from — the
@@ -351,7 +352,7 @@ fn class_collisions(defs: &[DefFile]) -> Vec<Diagnostic> {
                 if let Some(first) = owner.get(&class.name) {
                     diags.push(
                         Diagnostic::warning(
-                            Code::new(307),
+                            CLASS_COLLISION,
                             format!(
                                 "class `{}` is declared by more than one definition package",
                                 class.name
@@ -447,7 +448,7 @@ fn report_alias(
     if let Some(first) = owner.get(name) {
         diags.push(
             Diagnostic::warning(
-                Code::new(310),
+                ALIAS_COLLISION,
                 format!("alias `{name}` is declared more than once"),
             )
             .with_label(Label::primary(

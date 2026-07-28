@@ -13,6 +13,10 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+use luabox_diag::Code;
+
+use crate::codes;
+
 /// The luals rule names the checker recognises in a `---@diagnostic` directive.
 /// A directive naming any other rule is ignored here (it may belong to the
 /// linter, which scans independently). `duplicate-doc-alias` is absent by
@@ -27,16 +31,19 @@ const KNOWN_RULES: &[&str] = &[
     "await-in-sync",
 ];
 
-/// The luals rule name that maps onto a checker `LBnnnn` code, or `None` when
-/// the code carries no `---@diagnostic`-suppressible name.
-pub(crate) fn rule_for_code(code: &str) -> Option<&'static str> {
+/// The luals rule name that maps onto a checker [`Code`], or `None` when the
+/// code carries no `---@diagnostic`-suppressible name.
+///
+/// Takes the `Code` itself, not its rendering: this runs once per diagnostic on
+/// every check, and `Code` equality is an integer compare.
+pub(crate) fn rule_for_code(code: Code) -> Option<&'static str> {
     match code {
-        "LB0306" => Some("undefined-field"),
-        "LB0308" => Some("deprecated"),
-        "LB0309" => Some("discard-returns"),
-        "LB0311" => Some("duplicate-doc-field"),
-        "LB0312" => Some("invisible"),
-        "LB0316" => Some("await-in-sync"),
+        codes::FIELD_NOT_FOUND => Some("undefined-field"),
+        codes::DEPRECATED => Some("deprecated"),
+        codes::DISCARD_RETURNS => Some("discard-returns"),
+        codes::DUPLICATE_DOC_FIELD => Some("duplicate-doc-field"),
+        codes::INVISIBLE => Some("invisible"),
+        codes::AWAIT_IN_SYNC => Some("await-in-sync"),
         // LB0310 (duplicate-doc-alias) is a project-assembly finding, like the
         // LB0307 class collision — it never flows through this per-file filter,
         // so it has no entry here.
@@ -181,11 +188,43 @@ mod tests {
 
     #[test]
     fn code_to_rule_mapping() {
-        assert_eq!(rule_for_code("LB0306"), Some("undefined-field"));
-        assert_eq!(rule_for_code("LB0308"), Some("deprecated"));
-        assert_eq!(rule_for_code("LB0309"), Some("discard-returns"));
-        assert_eq!(rule_for_code("LB0311"), Some("duplicate-doc-field"));
-        assert_eq!(rule_for_code("LB0312"), Some("invisible"));
-        assert_eq!(rule_for_code("LB0300"), None);
+        assert_eq!(
+            rule_for_code(codes::FIELD_NOT_FOUND),
+            Some("undefined-field")
+        );
+        assert_eq!(rule_for_code(codes::DEPRECATED), Some("deprecated"));
+        assert_eq!(
+            rule_for_code(codes::DISCARD_RETURNS),
+            Some("discard-returns")
+        );
+        assert_eq!(
+            rule_for_code(codes::DUPLICATE_DOC_FIELD),
+            Some("duplicate-doc-field")
+        );
+        assert_eq!(rule_for_code(codes::INVISIBLE), Some("invisible"));
+        assert_eq!(rule_for_code(codes::AWAIT_IN_SYNC), Some("await-in-sync"));
+        assert_eq!(rule_for_code(codes::TYPE_MISMATCH), None);
+    }
+
+    /// The `LBnnnn` spellings the mapping is defined in terms of — a guard that
+    /// the `codes` constants keep naming the codes luals' rule names attach to.
+    #[test]
+    fn the_mapped_codes_are_the_documented_ones() {
+        for (code, rule) in [
+            (codes::FIELD_NOT_FOUND, "undefined-field"),
+            (codes::DEPRECATED, "deprecated"),
+            (codes::DISCARD_RETURNS, "discard-returns"),
+            (codes::DUPLICATE_DOC_FIELD, "duplicate-doc-field"),
+            (codes::INVISIBLE, "invisible"),
+            (codes::AWAIT_IN_SYNC, "await-in-sync"),
+        ] {
+            assert_eq!(rule_for_code(code), Some(rule), "{code}");
+        }
+        assert_eq!(codes::FIELD_NOT_FOUND.to_string(), "LB0306");
+        assert_eq!(codes::DEPRECATED.to_string(), "LB0308");
+        assert_eq!(codes::DISCARD_RETURNS.to_string(), "LB0309");
+        assert_eq!(codes::DUPLICATE_DOC_FIELD.to_string(), "LB0311");
+        assert_eq!(codes::INVISIBLE.to_string(), "LB0312");
+        assert_eq!(codes::AWAIT_IN_SYNC.to_string(), "LB0316");
     }
 }
