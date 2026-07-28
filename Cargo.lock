@@ -845,7 +845,7 @@ dependencies = [
  "luabox-lint",
  "luabox-lower",
  "luabox-lsp",
- "luabox-resolve",
+ "luabox-manifest",
  "luabox-syntax",
  "luabox-types",
  "notify",
@@ -921,7 +921,7 @@ dependencies = [
  "luabox-diag",
  "luabox-hir",
  "luabox-lint",
- "luabox-resolve",
+ "luabox-manifest",
  "luabox-syntax",
  "luabox-types",
  "rowan",
@@ -931,10 +931,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "luabox-resolve"
+name = "luabox-manifest"
 version = "0.2.0"
 dependencies = [
- "serde",
+ "tempfile",
  "toml_edit",
 ]
 

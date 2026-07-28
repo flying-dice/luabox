@@ -1,6 +1,6 @@
 [package]
-name = "luabox-resolve"
-description = "luabox: luabox.toml manifest model, validation and round-tripping (Distribution context)"
+name = "luabox-manifest"
+description = "luabox: luabox.toml manifest model, validation and project layout (Distribution context)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,8 +8,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-serde.workspace = true
 toml_edit.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

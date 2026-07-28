@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail};
 use luabox_syntax::{Dialect, lua};
 
-use crate::project::display_rel;
+use luabox_manifest::layout::{self, DefFiles, display_rel};
 
 /// Execute `luabox fmt` from `cwd`. In `--check` mode nothing is written;
 /// the command fails listing every file that would change. With `watch`,
@@ -97,7 +97,7 @@ struct Project {
 /// Find the project: nearest `luabox.toml` walking up from `cwd`, or a
 /// manifest-less default rooted at `cwd`.
 fn discover(cwd: &Path) -> anyhow::Result<Project> {
-    let Some((root, manifest)) = crate::project::discover_manifest(cwd)? else {
+    let Some((root, manifest)) = layout::discover_manifest(cwd)? else {
         return Ok(Project {
             root: cwd.to_path_buf(),
             dialect: Dialect::Lua54,
@@ -122,13 +122,17 @@ fn discover(cwd: &Path) -> anyhow::Result<Project> {
 /// dot-directories, the build output directory, and vendored `lua_modules/`
 /// trees.
 ///
-/// This is [`crate::project::collect_lua_files`] with `exclude_d_lua` off:
-/// `fmt` formats `*.d.lua` definition files too, unlike `check`/`build`/`doc`,
-/// which never treat them as project source. `fmt` had its own copy of the
-/// walk until the copy and the shared one disagreed about `lua_modules/` —
-/// one skip list, so they cannot drift apart again.
+/// This is [`layout::collect_lua_files`] with [`DefFiles::Include`]: `fmt`
+/// formats `*.d.lua` definition files too, unlike `check`/`build`/`doc`, which
+/// never treat them as project source. `fmt` had its own copy of the walk
+/// until the copy and the shared one disagreed about `lua_modules/` — one skip
+/// list, so they cannot drift apart again.
 fn collect_source_files(project: &Project) -> anyhow::Result<Vec<PathBuf>> {
-    crate::project::collect_lua_files(&project.root, project.out_dir.as_deref(), false)
+    Ok(layout::collect_lua_files(
+        &project.root,
+        project.out_dir.as_deref(),
+        DefFiles::Include,
+    )?)
 }
 
 #[cfg(test)]
@@ -165,6 +169,16 @@ mod tests {
         // Guards every test below: if the formatter ever declared MESSY
         // canonical, the "rewrites" assertions would pass vacuously.
         assert_ne!(canonical(Dialect::Lua54), MESSY);
+    }
+
+    #[test]
+    fn a_project_root_that_cannot_be_walked_names_the_directory() {
+        // No manifest anywhere above it, so `fmt` roots a default project at
+        // `cwd` — and then cannot list it. The failure names the directory
+        // rather than reporting an empty, successful format of nothing.
+        let error = run(Path::new("no-such-directory-xyzzy"), false, false).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("cannot read directory"), "{rendered}");
     }
 
     #[test]

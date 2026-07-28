@@ -1,7 +1,7 @@
 //! Manifest validation errors (SPEC.md §5, §14: span-rich diagnostics).
 //!
-//! `luabox-resolve` doesn't depend on `luabox-diag` (Distribution owns the
-//! package-graph API, not diagnostic rendering); this is a minimal,
+//! `luabox-manifest` doesn't depend on `luabox-diag` (Distribution owns the
+//! manifest API, not diagnostic rendering); this is a minimal,
 //! self-contained error type the frontend can later lift into an `LB0xxx`
 //! diagnostic.
 
@@ -21,7 +21,7 @@ pub struct ManifestError {
 }
 
 impl ManifestError {
-    pub(super) fn new(message: impl Into<String>, span: Option<Range<usize>>) -> Self {
+    pub(crate) fn new(message: impl Into<String>, span: Option<Range<usize>>) -> Self {
         Self {
             message: message.into(),
             span,
@@ -31,7 +31,7 @@ impl ManifestError {
     /// An unknown key/table error with a cargo-style "did you mean" nudge
     /// and the full valid set, e.g.:
     /// `unknown [package] key "editon", did you mean "edition"? (valid: name, version, edition, ...)`
-    pub(super) fn unknown_key(
+    pub(crate) fn unknown_key(
         what: &str,
         key: &str,
         valid: &[&str],
@@ -47,7 +47,7 @@ impl ManifestError {
 
     /// Append a trailing note to the message — e.g. why a key that a previous
     /// release accepted is now unknown.
-    pub(super) fn with_note(mut self, note: &str) -> Self {
+    pub(crate) fn with_note(mut self, note: &str) -> Self {
         let _ = write!(self.message, " — {note}");
         self
     }
@@ -63,7 +63,7 @@ impl std::error::Error for ManifestError {}
 
 /// Closest candidate within edit-distance 2, if any (cargo's typo-guard
 /// threshold). Ties broken by declaration order in `candidates`.
-pub(super) fn suggest<'a>(key: &str, candidates: &[&'a str]) -> Option<&'a str> {
+pub(crate) fn suggest<'a>(key: &str, candidates: &[&'a str]) -> Option<&'a str> {
     candidates
         .iter()
         .map(|candidate| (*candidate, levenshtein(key, candidate)))

@@ -1816,6 +1816,38 @@ fn workspace_symbols_match_a_class_and_a_function_across_two_files() {
 }
 
 #[test]
+fn a_vendored_lua_modules_file_is_not_indexed() {
+    // `lua_modules/` is whatever `luarocks install --tree lua_modules`
+    // materialized — vendored code, not project source. The bootstrap index
+    // skips it at every depth, exactly as `luabox check`'s walk does, so the
+    // editor's picture of the workspace is CI's.
+    let mut client = start(&[
+        ("src/main.lua", "function projectSymbol() return 1 end\n"),
+        (
+            "lua_modules/share/lua/5.4/pl/tablex.lua",
+            "function vendoredSymbol() return 1 end\n",
+        ),
+        (
+            "packages/core/lua_modules/dep/init.lua",
+            "function nestedVendoredSymbol() return 1 end\n",
+        ),
+    ]);
+
+    let names: Vec<String> = client
+        .workspace_symbols("")
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert!(names.iter().any(|n| n == "projectSymbol"), "{names:?}");
+    assert!(!names.iter().any(|n| n == "vendoredSymbol"), "{names:?}");
+    assert!(
+        !names.iter().any(|n| n == "nestedVendoredSymbol"),
+        "{names:?}"
+    );
+    client.shutdown();
+}
+
+#[test]
 fn workspace_symbols_query_is_case_insensitive() {
     let client = start(&[("main.lua", "function computeArea() return 1 end\n")]);
     let uri = client.uri("main.lua");

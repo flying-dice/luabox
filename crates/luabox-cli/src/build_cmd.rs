@@ -41,7 +41,8 @@ use anyhow::{Context, bail};
 use luabox_bundle::{BundleMap, BundleRequest, unmap_traceback};
 use luabox_diag::{Code, Diagnostic, Format, Label, Span};
 use luabox_lower::LowerDiagnostic;
-use luabox_resolve::manifest::{Build, DEFAULT_ENTRY, Manifest};
+use luabox_manifest::layout::{self, DefFiles};
+use luabox_manifest::model::{Build, DEFAULT_ENTRY, Manifest};
 use luabox_syntax::{Dialect, lua};
 use rayon::prelude::*;
 
@@ -176,7 +177,7 @@ pub fn run(cwd: &Path, opts: &BuildOptions) -> anyhow::Result<()> {
             bail!(
                 "bundle entry `{spec}` was not found at `{}` — set `[build] entry` (or pass \
                  `--entry`) to your actual entry point(s)",
-                crate::project::display_rel(path, &project.root)
+                layout::display_rel(path, &project.root)
             );
         }
     }
@@ -276,12 +277,12 @@ fn emit_tree(cwd: &Path, out_dir: &Path, edition: Dialect, target: Dialect) -> a
     let mut project = check_cmd::discover(cwd)?;
     project.out_dir = Some(out_dir.to_path_buf());
     let lua_files =
-        crate::project::collect_lua_files(&project.root, project.out_dir.as_deref(), true)?;
+        layout::collect_lua_files(&project.root, project.out_dir.as_deref(), DefFiles::Exclude)?;
 
     let results: Vec<anyhow::Result<Vec<Diagnostic>>> = lua_files
         .par_iter()
         .map(|path| {
-            let rel = crate::project::display_rel(path, &project.root);
+            let rel = layout::display_rel(path, &project.root);
             let source =
                 fs::read_to_string(path).with_context(|| format!("cannot read `{rel}`"))?;
             let (output, diags) = lower_one(&source, &rel, edition, target);
@@ -306,7 +307,7 @@ fn emit_tree(cwd: &Path, out_dir: &Path, edition: Dialect, target: Dialect) -> a
     if errors > 0 {
         bail!("build failed with {errors} error(s)");
     }
-    let out_display = crate::project::display_rel(out_dir, &project.root);
+    let out_display = layout::display_rel(out_dir, &project.root);
     println!(
         "build: {} files emitted to {} ({} -> {})",
         lua_files.len(),
@@ -480,7 +481,7 @@ fn emit_plain(
         println!(
             "build: {} module(s) inlined into {} ({} -> {}){}{}",
             bundle.modules,
-            crate::project::display_rel(&out_path, root),
+            layout::display_rel(&out_path, root),
             edition.manifest_id(),
             target.manifest_id(),
             if minify { ", minified" } else { "" },
@@ -515,7 +516,7 @@ fn emit_love(ctx: &EmitCtx<'_>) -> anyhow::Result<()> {
     println!(
         "build: {} module(s) inlined into {} ({} -> {}){}, packaged as a LÖVE .love archive",
         bundle.modules,
-        crate::project::display_rel(&love_path, ctx.root),
+        layout::display_rel(&love_path, ctx.root),
         ctx.edition.manifest_id(),
         ctx.target.manifest_id(),
         if ctx.minify { ", minified" } else { "" },
@@ -548,7 +549,7 @@ fn emit_nvim(ctx: &EmitCtx<'_>) -> anyhow::Result<()> {
     println!(
         "build: {} module(s) inlined into {} ({} -> {}){}{}, written as a Neovim plugin layout",
         bundle.modules,
-        crate::project::display_rel(&plugin_root, ctx.root),
+        layout::display_rel(&plugin_root, ctx.root),
         ctx.edition.manifest_id(),
         ctx.target.manifest_id(),
         if ctx.minify { ", minified" } else { "" },

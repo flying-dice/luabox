@@ -772,6 +772,18 @@ mod tests {
     }
 
     #[test]
+    fn an_annotation_attaches_to_a_function_bound_by_a_local_assignment() {
+        // `local f = function() end` is a function declaration too — the
+        // annotation targets the *statement*, and the statement binds a
+        // function expression.
+        let m = module("--- Bound.\n---@deprecated\nlocal f = function()\nend\n");
+        assert_eq!(m.functions.len(), 1);
+        assert_eq!(m.functions[0].name, "f");
+        assert!(m.functions[0].deprecated);
+        assert_eq!(m.functions[0].docs, "Bound.");
+    }
+
+    #[test]
     fn see_references_are_harvested_for_functions_and_classes() {
         let m = module(
             "---@see other.frob compare with\n\
@@ -878,6 +890,7 @@ mod tests {
             ("string[]", "string[]"),
             ("string|number", "string|number"),
             ("table<string, number>", "table<string, number>"),
+            ("[string, number]", "[string, number]"),
             ("(string)", "(string)"),
             ("\"yes\"", "\"yes\""),
             ("42", "42"),

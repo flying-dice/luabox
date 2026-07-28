@@ -20,7 +20,7 @@ luabox-types = { path = "crates/luabox-types", version = "0.2.0" }
 luabox-db = { path = "crates/luabox-db", version = "0.2.0" }
 luabox-lower = { path = "crates/luabox-lower", version = "0.2.0" }
 luabox-bundle = { path = "crates/luabox-bundle", version = "0.2.0" }
-luabox-resolve = { path = "crates/luabox-resolve", version = "0.2.0" }
+luabox-manifest = { path = "crates/luabox-manifest", version = "0.2.0" }
 luabox-lint = { path = "crates/luabox-lint", version = "0.2.0" }
 luabox-lsp = { path = "crates/luabox-lsp", version = "0.2.0" }
 

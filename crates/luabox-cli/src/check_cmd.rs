@@ -29,13 +29,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use luabox_diag::{Code, Diagnostic, Format, Label, Span};
-use luabox_resolve::manifest::{Dependency, Manifest};
+use luabox_manifest::layout::{self, DefFiles, DefSource};
+use luabox_manifest::model::Manifest;
 use luabox_syntax::{Dialect, lua};
 use luabox_types::ty::Ty;
 use luabox_types::{Ambient, DefFile, Strictness, build_ambient_checked, stdlib_defs};
 use rayon::prelude::*;
 
-use crate::project::{collect_lua_files, display_rel};
+use layout::display_rel;
 
 /// Execute `luabox check` from `cwd`. With `watch`, the check reruns on
 /// every debounced, filtered filesystem change under the project root
@@ -100,7 +101,8 @@ pub(crate) fn run_once(
         target_dialect = Some(dialect);
     }
 
-    let lua_files = collect_lua_files(&project.root, project.out_dir.as_deref(), true)?;
+    let lua_files =
+        layout::collect_lua_files(&project.root, project.out_dir.as_deref(), DefFiles::Exclude)?;
     // Definition packages (SPEC.md §3): the dialect stdlib layer, plus any
     // project-local `[types] defs` resolved from `<root>/defs/`, plus each
     // direct dependency's own `[types] defs` — the luals `workspace.library`
@@ -361,7 +363,7 @@ pub(crate) struct Project {
 /// (cargo-style), or a manifest-less default rooted at `cwd` (Lua 5.4,
 /// warn mode — least surprise).
 pub(crate) fn discover(cwd: &Path) -> anyhow::Result<Project> {
-    let Some((root, manifest)) = crate::project::discover_manifest(cwd)? else {
+    let Some((root, manifest)) = layout::discover_manifest(cwd)? else {
         return Ok(Project {
             root: cwd.to_path_buf(),
             dialect: Dialect::Lua54,
@@ -398,164 +400,58 @@ pub(crate) fn discover(cwd: &Path) -> anyhow::Result<Project> {
     })
 }
 
-/// Resolve `[types] defs` entries against the project-local `defs/`
-/// directory: each name loads `defs/<name>.d.lua` or every `*.d.lua` under
-/// `defs/<name>/` (SPEC.md §3 — registry-distributed packages are P2+).
-/// Returns the resolved def files (each carrying a root-relative label for
-/// diagnostics) plus a diagnostic per unresolvable entry.
+/// [`layout::resolve_project_defs`] with `check`'s diagnostic for the entries
+/// that resolve to nothing: `LB1002`, naming the two layouts a definition
+/// package may take.
+///
+/// The resolution itself is shared (`lint` and the LSP run the same walk);
+/// what is `check`'s alone is *reporting* an unresolved entry as an error —
+/// `lint` and the editor simply do without those globals.
 ///
 /// `pub(crate)`: `doc_cmd` reuses this to harvest classes declared in
-/// `---@meta` def files onto their own doc pages (#87) — the same
-/// resolution `check_once` uses for type-checking, so the two stay in sync
-/// with no duplicated logic.
+/// `---@meta` def files onto their own doc pages (#87) — the same resolution
+/// the typecheck uses, so the two cannot drift.
 pub(crate) fn resolve_project_defs(
     root: &Path,
     names: &[String],
 ) -> (Vec<DefFile>, Vec<Diagnostic>) {
-    let mut defs = Vec::new();
-    let mut diags = Vec::new();
-    let defs_dir = root.join("defs");
-    for name in names {
-        let single = defs_dir.join(format!("{name}.d.lua"));
-        let dir = defs_dir.join(name);
-        let mut found = false;
-        if single.is_file()
-            && let Ok(text) = fs::read_to_string(&single)
-        {
-            defs.push(DefFile {
-                file: display_rel(&single, root),
-                text,
-            });
-            found = true;
-        }
-        if dir.is_dir() {
-            let mut files = Vec::new();
-            collect_d_lua(&dir, &mut files);
-            files.sort();
-            for file in files {
-                if let Ok(text) = fs::read_to_string(&file) {
-                    defs.push(DefFile {
-                        file: display_rel(&file, root),
-                        text,
-                    });
-                    found = true;
-                }
-            }
-        }
-        if !found {
-            diags.push(
-                Diagnostic::error(
-                    code(1002),
-                    format!(
-                        "cannot resolve definition package `{name}` from `[types] defs`"
-                    ),
-                )
-                .with_note(format!(
-                    "expected `defs/{name}.d.lua` or a `defs/{name}/` directory of `*.d.lua` files under the project root"
-                )),
-            );
-        }
-    }
-    (defs, diags)
+    let (defs, unresolved) = layout::resolve_project_defs(root, names);
+    let diags = unresolved
+        .into_iter()
+        .map(|name| {
+            Diagnostic::error(
+                code(1002),
+                format!("cannot resolve definition package `{name}` from `[types] defs`"),
+            )
+            .with_note(format!(
+                "expected `defs/{name}.d.lua` or a `defs/{name}/` directory of `*.d.lua` files under the project root"
+            ))
+        })
+        .collect();
+    (defs.into_iter().map(def_file).collect(), diags)
 }
 
-/// Resolve the def files each DIRECT dependency contributes to the consuming
-/// project's ambient scope (#108, the luals `workspace.library` model). For
-/// each direct dependency (`[dependencies]` + `[dev-dependencies]`) in
-/// alphabetical name order — the deterministic collision-winner order — locate
-/// its package root (a path dependency in place at its `path`, every other
-/// kind under `lua_modules/<name>/` — the rock tree the user materializes
-/// with luarocks; luabox only reads it), read that dependency's *own*
-/// `[types] defs`, and load those files from the dependency's `defs/`
-/// directory. A dependency with no manifest on disk (not materialized, or a
-/// source kind whose root cannot be located here) or no `[types] defs` simply
-/// contributes nothing. Resolution is one level deep only: a dependency's
-/// *own* dependencies' defs do not transit.
+/// [`layout::resolve_dep_defs`] in the typechecker's own [`DefFile`] shape —
+/// the def files each DIRECT dependency contributes to this project's ambient
+/// scope (#108, the luals `workspace.library` model).
 ///
 /// Shared with `lint_cmd` (its `undefined-global` known-globals baseline must
 /// count dependency defs' globals too, #103/#108).
 pub(crate) fn resolve_dep_defs(root: &Path, manifest: &Manifest) -> Vec<DefFile> {
-    // `[dependencies]` and `[dev-dependencies]` are each `BTreeMap`s (already
-    // name-sorted); merge them into one name-sorted list so the winner order
-    // is a single alphabetical sweep across both.
-    let mut deps: Vec<(&String, &Dependency)> = manifest
-        .dependencies
-        .iter()
-        .chain(&manifest.dev_dependencies)
-        .collect();
-    deps.sort_by(|a, b| a.0.cmp(b.0));
-
-    let mut out = Vec::new();
-    for (name, dep) in deps {
-        let dep_root = match dep {
-            Dependency::Path(p) => root.join(p.path.replace('\\', "/")),
-            _ => root.join("lua_modules").join(name),
-        };
-        let Ok(text) = fs::read_to_string(dep_root.join("luabox.toml")) else {
-            continue;
-        };
-        let Ok(dep_manifest) = Manifest::parse(&text) else {
-            continue;
-        };
-        let defs_dir = dep_root.join("defs");
-        for def_name in &dep_manifest.types.defs {
-            let single = defs_dir.join(format!("{def_name}.d.lua"));
-            if single.is_file()
-                && let Ok(text) = fs::read_to_string(&single)
-            {
-                out.push(DefFile {
-                    file: dep_def_label(name, &single, &dep_root),
-                    text,
-                });
-            }
-            let dir = defs_dir.join(def_name);
-            if dir.is_dir() {
-                let mut files = Vec::new();
-                collect_d_lua(&dir, &mut files);
-                files.sort();
-                for file in files {
-                    if let Ok(text) = fs::read_to_string(&file) {
-                        out.push(DefFile {
-                            file: dep_def_label(name, &file, &dep_root),
-                            text,
-                        });
-                    }
-                }
-            }
-        }
-    }
-    out
+    layout::resolve_dep_defs(root, manifest)
+        .into_iter()
+        .map(def_file)
+        .collect()
 }
 
-/// A readable, deterministic label for a dependency-contributed def file: the
-/// dependency name plus the file's path within the dependency
-/// (`<dep>/defs/<name>.d.lua`), forward-slashed for cross-platform stability.
-fn dep_def_label(dep_name: &str, file: &Path, dep_root: &Path) -> String {
-    let rel = file
-        .strip_prefix(dep_root)
-        .unwrap_or(file)
-        .to_string_lossy()
-        .replace('\\', "/");
-    format!("{dep_name}/{rel}")
-}
-
-/// Collect every `*.d.lua` file under `dir`, recursively.
-fn collect_d_lua(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_d_lua(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("lua")
-            && path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(".d.lua"))
-        {
-            out.push(path);
-        }
+/// A resolved definition file in the typechecker's shape: `luabox-manifest`
+/// owns the layout walk but must not depend on `luabox-types` (SPEC.md §16 —
+/// Distribution never reaches into Semantics), so the label/text pair crosses
+/// the boundary and is re-wrapped here.
+fn def_file(source: DefSource) -> DefFile {
+    DefFile {
+        file: source.label,
+        text: source.text,
     }
 }
 
@@ -768,6 +664,19 @@ mod tests {
     }
 
     #[test]
+    fn a_construct_illegal_in_both_the_edition_and_the_target_is_reported_once() {
+        // Floor division is 5.3+, so a 5.1 project shipping to 5.2 fails
+        // both passes for the same range — the second is deduplicated, so
+        // the reader sees one finding, not the same one twice.
+        let tmp = project(&manifest("5.1", ""));
+        write(tmp.path(), "src/main.lua", "local x = 7 // 2\n");
+        let error = run_once(tmp.path(), Some("5.2"), "human", None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "check failed with 1 error(s)");
+    }
+
+    #[test]
     fn diagnostics_render_in_the_requested_machine_format() {
         for format in ["human", "json", "sarif", "github", "gitlab"] {
             let tmp = project(&manifest("5.4", ""));
@@ -832,6 +741,11 @@ mod tests {
     }
 
     // -- `[types] defs` resolution -----------------------------------------
+    //
+    // The `defs/<name>.d.lua` / `defs/<name>/` resolution itself belongs to
+    // `luabox_manifest::layout` and is tested there; these pin what `check`
+    // adds on top — the `DefFile` shape and the `LB1002` an unresolved entry
+    // becomes.
 
     #[test]
     fn a_defs_entry_resolves_to_a_single_d_lua_file() {
@@ -846,38 +760,6 @@ mod tests {
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].file, "defs/mylib.d.lua");
         assert!(defs[0].text.contains("---@class MyLib"));
-    }
-
-    #[test]
-    fn a_defs_entry_resolves_to_every_d_lua_file_under_a_directory_sorted() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write(tmp.path(), "defs/pack/z.d.lua", "---@meta\n");
-        write(tmp.path(), "defs/pack/a.d.lua", "---@meta\n");
-        write(tmp.path(), "defs/pack/nested/m.d.lua", "---@meta\n");
-        // Not a definition file — never picked up.
-        write(tmp.path(), "defs/pack/plain.lua", "return 0\n");
-
-        let (defs, diags) = resolve_project_defs(tmp.path(), &["pack".to_owned()]);
-        assert!(diags.is_empty(), "{diags:?}");
-        let files: Vec<&str> = defs.iter().map(|d| d.file.as_str()).collect();
-        assert_eq!(
-            files,
-            [
-                "defs/pack/a.d.lua",
-                "defs/pack/nested/m.d.lua",
-                "defs/pack/z.d.lua"
-            ]
-        );
-    }
-
-    #[test]
-    fn a_single_file_and_a_directory_of_the_same_name_both_contribute() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write(tmp.path(), "defs/both.d.lua", "---@meta\n");
-        write(tmp.path(), "defs/both/extra.d.lua", "---@meta\n");
-        let (defs, diags) = resolve_project_defs(tmp.path(), &["both".to_owned()]);
-        assert!(diags.is_empty(), "{diags:?}");
-        assert_eq!(defs.len(), 2);
     }
 
     #[test]
@@ -922,6 +804,11 @@ mod tests {
     }
 
     // -- dependency-contributed defs (#108) --------------------------------
+    //
+    // The resolution rules (rock-tree vs path roots, alphabetical winner
+    // order, one level deep) are `luabox_manifest::layout`'s and are tested
+    // there. What is checked here is the CLI's half: the label and text
+    // arriving intact on a `DefFile` the typechecker can consume.
 
     #[test]
     fn a_path_dependency_contributes_its_own_defs_to_the_consumer() {
@@ -953,201 +840,12 @@ mod tests {
         assert!(defs[0].text.contains("geometry.Shape"));
     }
 
-    #[test]
-    fn a_non_path_dependency_is_read_from_the_lua_modules_rock_tree() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write(
-            tmp.path(),
-            "luabox.toml",
-            &manifest("5.4", "\n[dependencies]\nlpeg = \"1.0\"\n"),
-        );
-        write(
-            tmp.path(),
-            "lua_modules/lpeg/luabox.toml",
-            &manifest("5.4", "\n[types]\ndefs = [\"lpeg\"]\n"),
-        );
-        write(
-            tmp.path(),
-            "lua_modules/lpeg/defs/lpeg.d.lua",
-            "---@meta\nlpeg = {}\n",
-        );
-
-        let manifest = read_manifest_for_test(tmp.path());
-        let defs = resolve_dep_defs(tmp.path(), &manifest);
-        assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0].file, "lpeg/defs/lpeg.d.lua");
-    }
-
-    #[test]
-    fn dependency_defs_are_ordered_alphabetically_across_both_dependency_tables() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write(
-            tmp.path(),
-            "luabox.toml",
-            &manifest(
-                "5.4",
-                "\n[dependencies]\nzeta = { path = \"vendor/zeta\" }\n\
-                 \n[dev-dependencies]\nalpha = { path = \"vendor/alpha\" }\n",
-            ),
-        );
-        for name in ["alpha", "zeta"] {
-            write(
-                tmp.path(),
-                &format!("vendor/{name}/luabox.toml"),
-                &manifest("5.4", &format!("\n[types]\ndefs = [\"{name}\"]\n")),
-            );
-            write(
-                tmp.path(),
-                &format!("vendor/{name}/defs/{name}.d.lua"),
-                "---@meta\n",
-            );
-        }
-
-        let manifest = read_manifest_for_test(tmp.path());
-        let files: Vec<String> = resolve_dep_defs(tmp.path(), &manifest)
-            .into_iter()
-            .map(|d| d.file)
-            .collect();
-        assert_eq!(files, ["alpha/defs/alpha.d.lua", "zeta/defs/zeta.d.lua"]);
-    }
-
-    #[test]
-    fn a_dependency_directory_defs_package_contributes_every_file() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write(
-            tmp.path(),
-            "luabox.toml",
-            &manifest(
-                "5.4",
-                "\n[dependencies]\npack = { path = \"vendor/pack\" }\n",
-            ),
-        );
-        write(
-            tmp.path(),
-            "vendor/pack/luabox.toml",
-            &manifest("5.4", "\n[types]\ndefs = [\"api\"]\n"),
-        );
-        write(tmp.path(), "vendor/pack/defs/api/b.d.lua", "---@meta\n");
-        write(tmp.path(), "vendor/pack/defs/api/a.d.lua", "---@meta\n");
-
-        let manifest = read_manifest_for_test(tmp.path());
-        let files: Vec<String> = resolve_dep_defs(tmp.path(), &manifest)
-            .into_iter()
-            .map(|d| d.file)
-            .collect();
-        assert_eq!(files, ["pack/defs/api/a.d.lua", "pack/defs/api/b.d.lua"]);
-    }
-
-    #[test]
-    fn a_dependency_that_is_not_materialized_contributes_nothing() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write(
-            tmp.path(),
-            "luabox.toml",
-            &manifest(
-                "5.4",
-                "\n[dependencies]\nmissing = \"1.0\"\nalso-missing = { path = \"nowhere\" }\n",
-            ),
-        );
-        let manifest = read_manifest_for_test(tmp.path());
-        assert!(resolve_dep_defs(tmp.path(), &manifest).is_empty());
-    }
-
-    #[test]
-    fn a_dependency_with_an_unparseable_manifest_contributes_nothing() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write(
-            tmp.path(),
-            "luabox.toml",
-            &manifest(
-                "5.4",
-                "\n[dependencies]\nbroken = { path = \"vendor/broken\" }\n",
-            ),
-        );
-        write(tmp.path(), "vendor/broken/luabox.toml", "= = =\n");
-        write(tmp.path(), "vendor/broken/defs/broken.d.lua", "---@meta\n");
-
-        let manifest = read_manifest_for_test(tmp.path());
-        assert!(resolve_dep_defs(tmp.path(), &manifest).is_empty());
-    }
-
-    #[test]
-    fn dependency_defs_resolution_is_one_level_deep_only() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write(
-            tmp.path(),
-            "luabox.toml",
-            &manifest("5.4", "\n[dependencies]\nmid = { path = \"vendor/mid\" }\n"),
-        );
-        write(
-            tmp.path(),
-            "vendor/mid/luabox.toml",
-            &manifest(
-                "5.4",
-                "\n[types]\ndefs = [\"mid\"]\n\n[dependencies]\ndeep = { path = \"../deep\" }\n",
-            ),
-        );
-        write(tmp.path(), "vendor/mid/defs/mid.d.lua", "---@meta\n");
-        write(
-            tmp.path(),
-            "vendor/deep/luabox.toml",
-            &manifest("5.4", "\n[types]\ndefs = [\"deep\"]\n"),
-        );
-        write(tmp.path(), "vendor/deep/defs/deep.d.lua", "---@meta\n");
-
-        let manifest = read_manifest_for_test(tmp.path());
-        let files: Vec<String> = resolve_dep_defs(tmp.path(), &manifest)
-            .into_iter()
-            .map(|d| d.file)
-            .collect();
-        // `deep` is a transitive dependency: its defs do not transit.
-        assert_eq!(files, ["mid/defs/mid.d.lua"]);
-    }
-
     fn read_manifest_for_test(root: &Path) -> Manifest {
         let text = fs::read_to_string(root.join("luabox.toml")).expect("manifest");
         Manifest::parse(&text).expect("manifest parses")
     }
 
     // -- small helpers -----------------------------------------------------
-
-    #[test]
-    fn dep_def_label_prefixes_the_dependency_name_and_forward_slashes_the_rest() {
-        let dep_root = Path::new("/tmp/proj/vendor/geometry");
-        let file = dep_root.join("defs").join("geometry.d.lua");
-        assert_eq!(
-            dep_def_label("geometry", &file, dep_root),
-            "geometry/defs/geometry.d.lua"
-        );
-    }
-
-    #[test]
-    fn dep_def_label_falls_back_to_the_whole_path_when_it_is_not_under_the_dep_root() {
-        let label = dep_def_label("dep", Path::new("/elsewhere/x.d.lua"), Path::new("/root"));
-        assert_eq!(label, "dep//elsewhere/x.d.lua");
-    }
-
-    #[test]
-    fn collect_d_lua_recurses_and_takes_only_d_lua_files() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write(tmp.path(), "a.d.lua", "");
-        write(tmp.path(), "plain.lua", "");
-        write(tmp.path(), "notes.txt", "");
-        write(tmp.path(), "nested/b.d.lua", "");
-
-        let mut found = Vec::new();
-        collect_d_lua(tmp.path(), &mut found);
-        found.sort();
-        let rel: Vec<String> = found.iter().map(|p| display_rel(p, tmp.path())).collect();
-        assert_eq!(rel, ["a.d.lua", "nested/b.d.lua"]);
-    }
-
-    #[test]
-    fn collect_d_lua_on_a_missing_directory_yields_nothing() {
-        let mut found = Vec::new();
-        collect_d_lua(Path::new("no-such-directory-xyzzy"), &mut found);
-        assert!(found.is_empty());
-    }
 
     #[test]
     fn canonical_falls_back_to_the_raw_path_for_a_file_that_does_not_exist() {

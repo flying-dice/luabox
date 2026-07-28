@@ -28,7 +28,7 @@ use std::path::Path;
 
 use anyhow::{Context, bail};
 use luabox_diag::{Diagnostic, Format, Label, Span};
-use luabox_resolve::manifest::Manifest;
+use luabox_manifest::layout::{self, DefFiles};
 use luabox_syntax::lua;
 
 use crate::check_cmd;
@@ -38,7 +38,7 @@ use model::DocModel;
 pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
     let project = check_cmd::discover(cwd)?;
     let lua_files =
-        crate::project::collect_lua_files(&project.root, project.out_dir.as_deref(), true)?;
+        layout::collect_lua_files(&project.root, project.out_dir.as_deref(), DefFiles::Exclude)?;
     let package = manifest_facts(&project.root);
 
     // A file that does not parse has no trustworthy harvest — its doc
@@ -62,7 +62,7 @@ pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
 
     let mut modules = Vec::new();
     for path in &lua_files {
-        let rel = crate::project::display_rel(path, &project.root);
+        let rel = layout::display_rel(path, &project.root);
         let source = fs::read_to_string(path).with_context(|| format!("cannot read `{rel}`"))?;
         push_parse_errors(&rel, &source, &mut parse_diags);
         let name = model::module_name(&rel);
@@ -112,7 +112,7 @@ pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
     eprintln!(
         "doc: generated {} pages into `{}`",
         pages.len(),
-        crate::project::display_rel(&out_dir, &project.root)
+        layout::display_rel(&out_dir, &project.root)
     );
 
     if open {
@@ -126,8 +126,9 @@ pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
 /// `[types] defs`, e.g. `examples/geometry`'s `geometry.Shape`) still gets a
 /// `class.<name>.html` page and can show implementors (#87).
 ///
-/// `project::collect_lua_files` (with `exclude_d_lua`) deliberately excludes `*.d.lua` from the
-/// project's own `.lua` files (they are ambient, not project source), so
+/// `layout::collect_lua_files` with [`DefFiles::Exclude`] deliberately leaves
+/// `*.d.lua` out of the project's own `.lua` files (they are ambient
+/// definition surfaces, not project source), so
 /// without this step those classes are invisible to `luabox doc` — the gap
 /// this task set out to close. The def files are resolved with the exact
 /// same `check_cmd::resolve_project_defs`/`dep_defs` the typechecker uses,
@@ -186,10 +187,7 @@ fn manifest_facts(root: &Path) -> String {
             |n| n.to_string_lossy().into_owned(),
         )
     };
-    let Ok(text) = fs::read_to_string(root.join("luabox.toml")) else {
-        return fallback();
-    };
-    let Ok(manifest) = Manifest::parse(&text) else {
+    let Ok(manifest) = layout::read_manifest(root) else {
         return fallback();
     };
     manifest.package.name

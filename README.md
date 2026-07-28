@@ -269,7 +269,7 @@ Cargo workspace, one crate per bounded context (SPEC.md §16):
 | `luabox-db` | incremental query database |
 | `luabox-lower` | target lowering + polyfills |
 | `luabox-bundle` | require-graph, tree-shake, minify, sourcemaps |
-| `luabox-resolve` | `luabox.toml` manifest model: validation, round-tripping |
+| `luabox-manifest` | `luabox.toml` manifest model + project layout: discovery, source walk, `[types] defs` |
 | `luabox-lsp` | language server |
 | `luabox-cli` | the `luabox` binary |
 
