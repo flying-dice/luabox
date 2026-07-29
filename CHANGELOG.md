@@ -85,6 +85,11 @@ so it appears in no version entry.
 
 ### Fixed
 
+- **Invalid `--format` and `--mode` values are now rejected by the CLI
+  parser itself** — exit 2 with clap's `[possible values: …]` listing,
+  matching every other malformed invocation, instead of exit 1 from deep
+  inside the command. `--edition`/`--target` deliberately keep their
+  domain-level path so `LB1001` stays a machine-readable diagnostic.
 - **A failure no longer dumps a stack backtrace when `RUST_BACKTRACE` is
   set.** `main` returned a `Result`, so every `Error:` was rendered by
   `anyhow`'s `Debug` — which appends the captured frames whenever that
