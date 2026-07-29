@@ -157,9 +157,9 @@ a crash, and the tree stays lossless.
 
 The one place the two disagree is a *flat* operator chain — `a + a + … + a`,
 `"a" .. "a" .. …` — which reference Lua parses iteratively at any length.
-luabox builds one tree node per operator, so a chain longer than 512 terms
-reports `expression too complex`. Machine-generated sources are the only
-realistic way to reach that; hand-written Lua does not.
+luabox builds one tree node per operator, so 511 terms is the longest chain
+that parses: at 512 you get `expression too complex`. Machine-generated
+sources are the only realistic way to reach that; hand-written Lua does not.
 
 ### Human diagnostics window very long source lines
 
