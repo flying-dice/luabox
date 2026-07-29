@@ -151,6 +151,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: perf-gates
+      # The peak-RSS leg SKIPs loudly when python3 is missing — fine on a dev
+      # box, but CI must never run a gate with a leg silently absent. Assert
+      # the tooling up front, the way draft-install-mock does.
+      - name: Assert python3 is available (peak-RSS leg depends on it)
+        run: python3 --version
       # GitHub-hosted runners are ~3x slower and noisier than the dev
       # baseline the budgets were calibrated on (observed: warm check
       # 3145 ms vs the 1000 ms budget). The factor scales every budget;
