@@ -162,7 +162,7 @@ subsystem, #109).
 Cross-package types are not collateral damage. What survives is the *read*
 side:
 
-- the `luabox.toml` manifest model (`[package]`, `[lints]`, build config),
+- the `luabox.toml` manifest model (`[package]`, `[lint]`, build config),
   used by every frontend command — `luabox-resolve` slims to
   manifest/project/dialect;
 - the **`lua_modules/` read path**, so `require` resolution and

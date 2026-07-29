@@ -313,7 +313,7 @@ drifting copy of. The `lua_modules/` read path stays in `luabox-bundle`'s
 ### 16.1 Implementation — Rust
 
 - Key deps: `rowan`, `salsa`, `lsp-server` (rust-analyzer's choice over tower-lsp), `rayon`, `notify`, `clap`, `serde`/`toml_edit` (comment-preserving manifest edits).
-- Release: fat LTO, `codegen-units=1`, panic=abort, stripped; musl static Linux, universal macOS, MSVC Windows.
+- Release: fat LTO, `codegen-units=1`, panic=abort, stripped. Shipped targets: x86_64 glibc Linux, Apple Silicon macOS, MSVC Windows (see `release.yml`; no musl/universal/Intel-macOS builds).
 - CI perf gates (merge-blocking, `scripts/perf-gate.sh`): cold start < 50 ms; `check` 100-kLOC warm < 1 s; plus a `fmt --check` throughput gate on the same corpus, kept as the wider safety net. Budgets scale by `LUABOX_PERF_FACTOR` on shared runners.
 - **LSP keystroke-to-diagnostics < 100 ms p95 is future work** — a target, not a gate. `scripts/perf-gate.sh` measures nothing over the LSP, so no merge blocks on it; it needs a harness that drives `didChange` over the protocol before it can be enforced.
 - Fuzzing: parser + lowering under `cargo-fuzz`; lowering verified by differential execution against real runtimes in CI.

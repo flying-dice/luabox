@@ -199,7 +199,7 @@ enum Command {
         /// Release version to install (e.g. 0.1.0 or v0.1.0); default: latest
         version: Option<String>,
     },
-    /// Explain a diagnostic code (e.g. LB0421)
+    /// Explain a diagnostic code (e.g. LB0300)
     Explain { code: String },
     /// Print the JSON Schema (draft 2020-12) for `luabox.toml`, for editors,
     /// validators and LLM coding assistants
@@ -329,14 +329,14 @@ fn run(command: Command) -> anyhow::Result<()> {
         Command::Upgrade { version } => upgrade_cmd::run(version),
         Command::Explain { code } => {
             let parsed: luabox_diag::Code = code.parse().map_err(|_| {
-                anyhow::anyhow!("`{code}` is not a valid diagnostic code; codes look like LB0421")
+                anyhow::anyhow!("`{code}` is not a valid diagnostic code; codes look like LB0300")
             })?;
             match luabox_diag::explain(&parsed) {
                 Some(entry) => {
                     println!("{}: {}\n\n{}", entry.code, entry.title, entry.explain);
                     Ok(())
                 }
-                None => bail!("no such diagnostic code `{parsed}`; codes look like LB0421"),
+                None => bail!("no such diagnostic code `{parsed}`; codes look like LB0300"),
             }
         }
         // No project, no filesystem, no flags: the schema is embedded in the
@@ -791,10 +791,10 @@ mod tests {
             reject(&["explain"]),
             clap::error::ErrorKind::MissingRequiredArgument
         );
-        let Command::Explain { code } = parse(&["explain", "LB0421"]) else {
+        let Command::Explain { code } = parse(&["explain", "LB0300"]) else {
             panic!("expected Explain");
         };
-        assert_eq!(code, "LB0421");
+        assert_eq!(code, "LB0300");
     }
 
     // -- schema ------------------------------------------------------------

@@ -155,7 +155,7 @@ dependency layer's numbers say it is the part that is not ready, and
 finishing it now competes directly with nailing the core.
 
 What A explicitly keeps, because the core needs it:
-- `luabox.toml` manifest parsing/model (`[package]`, `[lints]`, build
+- `luabox.toml` manifest parsing/model (`[package]`, `[lint]`, build
   config) — used by every frontend command.
 - The `lua_modules/` read path in `check`/`run` — cross-package types
   and module resolution over a tree the user materializes with

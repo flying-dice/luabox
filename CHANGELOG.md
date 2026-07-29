@@ -113,7 +113,7 @@ so it appears in no version entry.
 
 ### Kept — the seam
 
-- The **`luabox.toml` manifest model** (`[package]`, `[lints]`, `[build]`,
+- The **`luabox.toml` manifest model** (`[package]`, `[lint]`, `[build]`,
   `[types]`) that every frontend command reads.
 - The **`lua_modules/` read path**: `require` resolution, bundling and
   cross-package type checking still work over a rock tree, provided you

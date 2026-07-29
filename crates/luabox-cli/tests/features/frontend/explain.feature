@@ -19,7 +19,7 @@ Feature: Diagnostic explain pages — luabox explain
     Given an empty directory
     When I run "luabox explain banana"
     Then the command fails
-    And stderr contains "`banana` is not a valid diagnostic code; codes look like LB0421"
+    And stderr contains "`banana` is not a valid diagnostic code; codes look like LB0300"
 
   Scenario Outline: each diagnostic family has an explain page titled with its code
     Given an empty directory
@@ -62,9 +62,9 @@ Feature: Diagnostic explain pages — luabox explain
 
   Scenario: a well-formed but unregistered code is rejected
     Given an empty directory
-    When I run "luabox explain LB0421"
+    When I run "luabox explain LB9999"
     Then the command fails
-    And stderr contains "no such diagnostic code `LB0421`"
+    And stderr contains "no such diagnostic code `LB9999`"
 
   Scenario: codes are case-sensitive
     Given an empty directory
