@@ -185,9 +185,12 @@ doesn't hold. Any other editor can point its LSP client at `luabox lsp`.
 
 Prebuilt binaries ship as of v0.1.0. Every `v*` tag publishes a
 [GitHub release](https://github.com/flying-dice/luabox/releases) with binaries
-for Linux x86_64, macOS Apple Silicon, and Windows x86_64 (plus `SHA256SUMS`),
-and the release goes `latest` only after those binaries pass a smoke install on
-all three OSes. The install scripts
+for Linux x86_64, macOS Apple Silicon, and Windows x86_64 (plus `SHA256SUMS`).
+The release is created as a **draft** and stays one until, on all three OSes,
+the shipped install script has installed that draft's binary and the full
+black-box acceptance + LSP acceptance suites have passed against the
+*installed* executable; only then does it become a published, `latest` release
+(see [RELEASING.md](RELEASING.md)). The install scripts
 ([`scripts/install.sh`](scripts/install.sh),
 [`scripts/install.ps1`](scripts/install.ps1)) download the binary for your
 platform from the latest release; they do **not** build from source — if you

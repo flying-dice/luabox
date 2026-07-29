@@ -46,27 +46,68 @@ credential of its own.
    The `v` prefix is load-bearing: `release.yml` triggers only on tags
    matching `v*`.
 6. **The release workflow does the rest.** On the `v*` tag,
-   `.github/workflows/release.yml`:
-   - Creates a GitHub Release with the matching `CHANGELOG.md` section as
-     the notes body.
-   - Builds the release binaries — Linux x86_64, macOS Apple Silicon, and
-     Windows x86_64 — computes `SHA256SUMS`, and uploads them (with the
-     `scripts/install.*` one-liners) as release assets.
-   - **Smoke-installs** the freshly published binary on all three OSes via
-     the one-line installers, drives it against a scaffolded probe project
-     (`check` must flag a deliberate LB0300 non-zero and pass a clean
-     file), probes `--help`/`explain`/`fmt --check`/`lint`/`doc`, answers
-     an LSP `initialize` handshake, and exercises `luabox upgrade` plus its
-     failure cases — and **only then marks the release as `latest`.** The
-     smoke legs need no credentials and no sign-in step; release-download
-     URLs are public. A release that fails any of the three smoke legs does
-     not go latest — the installers keep resolving the previous good
-     release until the failure is fixed and a new tag is cut.
+   `.github/workflows/release.yml` runs six chained jobs. The shape matters:
+   the release exists as a **draft** for the whole of it, and only becomes a
+   real release once the artefacts it ships have been installed and fully
+   exercised on every OS.
+
+   1. **Create draft release** — a GitHub Release with the matching
+      `CHANGELOG.md` section as the notes body, created with
+      `--draft=true`. A draft has no public download URLs, is not returned
+      by `/releases/latest`, and is invisible to anyone without repo read
+      access — so a release that fails verification never existed as far as
+      users are concerned.
+   2. **Build** — release binaries for Linux x86_64, macOS Apple Silicon,
+      and Windows x86_64, from the committed `Cargo.lock` (`--locked`).
+   3. **Upload assets** — the three archives, `SHA256SUMS`, and both
+      `scripts/install.*` one-liners, attached to the draft. The installers
+      are attached (not just left in-tree) because the next job downloads
+      them back out: the script that gets tested must be the artefact users
+      will actually fetch.
+   4. **Verify** — *the release gate*, on all three OSes. Each leg pulls
+      `install.sh`/`install.ps1` out of the **draft**, runs it to install the
+      **draft's** binary, asserts `luabox --version` reports the tag, and
+      then runs the **entire black-box e2e suite** — the cucumber
+      `acceptance` and `lsp_acceptance` targets, i.e. the whole executable
+      spec — against that **installed** binary, via `LUABOX_E2E_BIN`. Two
+      installer-only probes ride along, because the e2e suite tests the
+      binary rather than the installer: installing into a directory whose
+      path contains a space, and a pinned nonexistent version having to fail
+      non-zero. On Windows the spaced-dir install also runs through
+      `powershell.exe -NoProfile -` (REPL mode, where PSReadLine's
+      `RuntimeInformation` stub shadows the real type).
+   5. **Publish release (draft → current)** — reachable only if all three
+      verify legs passed. Re-checks the release has exactly the six expected
+      assets, re-downloads every archive and re-runs `sha256sum -c` against
+      the attached `SHA256SUMS`, and then performs the **single**
+      draft→published transition: `gh release edit "$TAG" --draft=false
+      --latest`. This is the moment the release goes live.
+   6. **Post-publish smoke** — the handful of things that can only work once
+      the release is public: the no-token `curl … | bash` / `irm … | iex`
+      one-liners against the real release-download URLs, and
+      `luabox upgrade <tag>` (which resolves *published* releases, so it
+      cannot see a draft) plus its negative. The release is already live
+      when this runs; a failure here rolls nothing back, it just turns the
+      pipeline red so a human can yank the release or cut a fix tag.
+
+   Installing from a draft needs credentials users do not have, so
+   `scripts/install.sh` and `scripts/install.ps1` grew exactly one extra
+   path: when `GITHUB_TOKEN` is set **and** `LUABOX_VERSION` pins a tag, they
+   resolve the release through the authenticated GitHub API (drafts appear
+   only in the *list* endpoint — `releases/tags/<tag>` 404s for a draft) and
+   fetch each asset by id, checksum verification included. `install.sh` needs
+   `jq` on that path. With `GITHUB_TOKEN` unset the scripts behave exactly as
+   they always have; that no-token behaviour is what job 6 proves against the
+   real public URLs. Note the trigger is the bare presence of `GITHUB_TOKEN`,
+   so a developer whose shell exports one (Codespaces, `gh auth` setups) and
+   who also pins `LUABOX_VERSION` will take the API path — unset it to force
+   the public path.
 7. **Verify.** Once the workflow finishes, check the
    [GitHub Releases page](https://github.com/flying-dice/luabox/releases)
-   for the new release, its assets, and that it is marked latest;
-   spot-check `scripts/install.sh`/`scripts/install.ps1` resolve and install
-   it.
+   for the new release: it should no longer be a draft, should carry all six
+   assets, and should be marked latest. If the run went red *before* the
+   publish job, the release is still sitting there as a draft — fix the
+   cause and either delete the draft and re-tag, or re-run the workflow.
 
 ## Editor extensions
 

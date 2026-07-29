@@ -58,8 +58,10 @@ server behind it is tested in `luabox-lsp`.)
 
 Already present and blocking: fmt/clippy/test on three OSes, perf gates,
 an examples gate driving the real binary, differential execution against
-real interpreters, weekly parser fuzzing, and a smoke-gated release
-pipeline. Added by this assessment: line-coverage floors in CI
+real interpreters, weekly parser fuzzing, and a release pipeline that
+holds every release as a draft until the full black-box e2e suite has
+passed against the *installed* artefact on all three OSes. Added by this
+assessment: line-coverage floors in CI
 (`cargo-llvm-cov`, an lcov artifact uploaded per run). A single 85% floor
 was proposed here; what shipped is stricter and split in two, so neither
 style of testing can coast on the other's numbers — **unit** (every

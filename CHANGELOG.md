@@ -191,6 +191,18 @@ so it appears in no version entry.
 
 ### Internal (contributors)
 
+- **Releases are gated on the full e2e suite running against the *installed*
+  binary.** `release.yml` now creates the release as a true **draft**, and on
+  Linux, macOS and Windows it downloads the shipped install script *from that
+  draft*, installs the draft's binary with it, and runs the whole black-box
+  cucumber spec (`acceptance` + `lsp_acceptance`) against that installed
+  executable. Only once all three legs pass does the release go
+  `--draft=false --latest`; a public-URL install and `luabox upgrade` smoke
+  runs afterwards, since neither can see a draft. The suites pick their binary
+  at runtime from `LUABOX_E2E_BIN` (falling back to the cargo-built one), and
+  `scripts/install.{sh,ps1}` gained a `GITHUB_TOKEN`-only path that resolves a
+  draft release through the GitHub API — with no token their behaviour is
+  unchanged. See [RELEASING.md](RELEASING.md).
 - **`luabox-resolve` is now `luabox-manifest`.** The crate lost its resolving
   half in this release (see *Removed*) and the name outlived it. It also
   absorbs project *layout* — root discovery, the first-party source walk and
