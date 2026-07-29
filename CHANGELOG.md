@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [SemVer](https://semver.org/), with the 0.x caveats
-spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
+spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0x).
 
 ## [Unreleased]
 
@@ -144,7 +144,7 @@ spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
   parse identically to `+`), and the nesting budget is 220 — above every
   reference implementation, with measured stack headroom for a debug build on
   a default 2 MiB thread stack. See
-  [LIMITATIONS.md](LIMITATIONS.md#parser-nesting-and-expression-size-limits).
+  [LIMITATIONS.md](docs/03-reference/02-limitations.md#parser-nesting-and-expression-size-limits).
 
 ## [0.2.0] - 2026-07-26 (unreleased)
 
@@ -356,7 +356,7 @@ so it appears in no version entry.
   `scripts/install.{sh,ps1}` gained a CI-only path — explicit
   `LUABOX_DRAFT_INSTALL=1` opt-in plus `GITHUB_TOKEN` — that resolves a draft
   release through the GitHub API; without the opt-in their behaviour is
-  unchanged. See [RELEASING.md](RELEASING.md).
+  unchanged. See [RELEASING.md](docs/02-guides/01-releasing.md).
 - **`luabox-resolve` is now `luabox-manifest`.** The crate lost its resolving
   half in this release (see *Removed*) and the name outlived it. It also
   absorbs project *layout* — root discovery, the first-party source walk and
@@ -382,7 +382,7 @@ need a `[dependencies]` entry plus a `lua_modules/<name>/luabox.toml` with
 `[types] defs` — which a luarocks tree does not have. Write the LuaCATS
 definitions into your own `defs/` and list them in your `[types] defs`; see
 [README](README.md#using-dependencies) and
-[LIMITATIONS.md](LIMITATIONS.md#dependency-management-and-execution-are-non-goals-not-gaps).
+[LIMITATIONS.md](docs/03-reference/02-limitations.md#dependency-management-and-execution-are-non-goals-not-gaps).
 
 ## [0.1.4] - 2026-07-14
 
@@ -469,7 +469,7 @@ definitions into your own `defs/` and list them in your `[types] defs`; see
 
 The first public release: the full command surface works end to end against
 real Lua sources, driven by an executable spec of cucumber scenarios. Alpha
-quality — see the caveats below and [BACKLOG.md](BACKLOG.md) for what remains
+quality — see the caveats below and [BACKLOG.md](docs/04-project/01-backlog.md) for what remains
 open post-launch.
 
 ### Toolchain

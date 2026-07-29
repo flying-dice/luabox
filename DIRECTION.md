@@ -87,7 +87,7 @@ Status: **accepted** (2026-07-26), owner decision. Scopes down — but does
 not reverse — the "luarocks.org is the registry" pivot (#2). Tracked as
 flying-dice/luabox#10 (dependency management), #11 (`run`/`toolchain`), #12
 (docs) and #13 (gates); the evidence is the quality baseline in
-[PRODUCTION-READINESS.md](PRODUCTION-READINESS.md).
+[PRODUCTION-READINESS.md](docs/04-project/02-production-readiness.md).
 
 ## North star
 

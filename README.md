@@ -90,7 +90,7 @@ demo.
 Prebuilt binaries are attached to every tagged
 [GitHub release](https://github.com/flying-dice/luabox/releases) (`v*`, built
 by [`.github/workflows/release.yml`](.github/workflows/release.yml) — see
-[RELEASING.md](RELEASING.md)). The one-line installers fetch the latest one:
+[RELEASING.md](docs/02-guides/01-releasing.md)). The one-line installers fetch the latest one:
 
 ```sh
 # Linux / macOS
@@ -134,7 +134,7 @@ lua-language-server. luabox's edge is that it treats those annotations as
 
 All on stock LuaCATS — there is no second, luabox-specific type file format.
 See [DIRECTION.md](DIRECTION.md) for the governing decision record and
-[SPEC.md](SPEC.md) for the full design.
+[SPEC.md](docs/03-reference/01-spec.md) for the full design.
 
 ## Editor setup
 
@@ -152,7 +152,7 @@ definition/type-definition/implementation, find-references, rename, document
 tokens, formatting, folding and selection ranges; `.lua` files), resolving
 the `luabox` binary from `PATH` (overridable in settings). Neither is on its
 marketplace yet
-([#102](LIMITATIONS.md#editor-extensions-are-not-on-marketplaces-yet-102)).
+([#102](docs/03-reference/02-limitations.md#editor-extensions-are-not-on-marketplaces-yet-102)).
 Any other editor can point its LSP client at `luabox lsp`.
 
 ## Limitations
@@ -165,7 +165,7 @@ artifacts from its own repo's releases). The full LuaCATS tag vocabulary is
 enforced.
 Every remaining gap is
 documented honestly in
-[**LIMITATIONS.md**](LIMITATIONS.md). Read it before you rely on luabox for
+[**LIMITATIONS.md**](docs/03-reference/02-limitations.md). Read it before you rely on luabox for
 anything load-bearing.
 
 ---
@@ -333,7 +333,7 @@ execution against real runtimes in CI. Prebuilt binaries are attached to each
 [GitHub release](https://github.com/flying-dice/luabox/releases); editor
 extensions release from their own repos;
 not yet published to a package registry (crates.io, Homebrew, etc.). Luau is
-explicitly out of scope. See [LIMITATIONS.md](LIMITATIONS.md) for known gaps.
+explicitly out of scope. See [LIMITATIONS.md](docs/03-reference/02-limitations.md) for known gaps.
 
 ## License
 

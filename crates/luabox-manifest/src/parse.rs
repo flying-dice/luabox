@@ -737,7 +737,7 @@ mod tests {
         // Normalize CRLF first: a Windows checkout with core.autocrlf=true
         // (GitHub's windows runners) hands include_str! CRLF text, and the
         // exact "```toml\n" fence match would miss the trailing \r.
-        let spec = include_str!("../../../SPEC.md").replace("\r\n", "\n");
+        let spec = include_str!("../../../docs/03-reference/01-spec.md").replace("\r\n", "\n");
         let heading = spec
             .find("## 5. Project manifest")
             .expect("SPEC.md §5 heading present");
