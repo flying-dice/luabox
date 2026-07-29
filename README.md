@@ -186,6 +186,16 @@ anything load-bearing.
 | `explain LBnnnn` | rustc-style diagnostic pages |
 | `schema` | print the JSON Schema (draft 2020-12) for `luabox.toml` — point an editor, a validator or an LLM at the whole manifest contract |
 
+> **`build --mode love` needs an external zip tool on `PATH`.** A `.love`
+> file *is* a zip archive and luabox carries no zip implementation, so
+> packaging is the one build step that shells out: `zip`, else
+> `python3 -m zipfile`, else `python -m zipfile` on Linux/macOS; the
+> System32 `bsdtar`, else PowerShell's `Compress-Archive`, on Windows. With
+> none of them available the build fails loudly, naming every tool it tried
+> — it never leaves a partial `.love` behind. It archives the output luabox
+> just emitted; no Lua is executed. Every other command, `mode =
+> "nvim-plugin"` included, spawns nothing.
+
 ### Coding assistance for `luabox.toml`: `luabox schema`
 
 `luabox.toml` is described in full by a JSON Schema (draft 2020-12) that the

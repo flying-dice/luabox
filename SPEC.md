@@ -23,7 +23,7 @@ are itemized in [CHANGELOG.md](CHANGELOG.md).
 
 ### Non-goals
 
-- No interpreter/VM. No REPL. [Stronger since 0.2.0: **luabox never spawns an interpreter** — the "delegate to a configured runtime" escape hatch went with `run`/`toolchain` (§12). It is not a claim to spawn *nothing*: two commands shell out, and both are about the toolchain rather than your code. `upgrade` self-replaces the binary via `curl` + `tar` against GitHub releases (§4), and `doc --open` hands the generated `index.html` to the platform's browser opener (§13). Neither loads, resolves, or executes a line of Lua.]
+- No interpreter/VM. No REPL. [Stronger since 0.2.0: **luabox never spawns an interpreter** — the "delegate to a configured runtime" escape hatch went with `run`/`toolchain` (§12). It is not a claim to spawn *nothing*: three commands shell out, and none of them touches your code as code. `upgrade` self-replaces the binary via `curl` + `tar` against GitHub releases (§4), `doc --open` hands the generated `index.html` to the platform's browser opener (§13), and `build --mode love` invokes an external zip tool (`zip`, else `python3`/`python -m zipfile`; on Windows the System32 `bsdtar`, else `Compress-Archive`) to package the build output it just emitted into a `.love` (§7) — failing loudly with the list of tools it tried when none is on `PATH`. None of the three loads, resolves, or executes a line of Lua.]
 - Full LuaCATS (`---@class` etc.) support is non-negotiable — existing annotated codebases check day one.
 - **Luau: explicitly out of scope.** Alternative typed paradigm with its own owner and toolchain (Roblox, luau-lsp). Luabox's typed story is LuaCATS annotations over untyped Lua. Scope decision, not an oversight.
 - No LuaRocks replacement-by-fiat — interop first, supersede by being better. [v1 goes further — luabox does no package management at all: it *consumes* a `lua_modules/` tree you materialize with luarocks yourself; see §6 and the v1 scope cut in DIRECTION.md.]
@@ -201,7 +201,7 @@ luabox follows the pnpm/bun model: **[luarocks.org](https://luarocks.org) is the
 - Minify: scope-aware identifier mangling, whitespace, constant folding. Property names never mangled.
 - Source maps: `luabox build --sourcemap` writes a `.map` next to each bundle; `luabox unmap <bundle> [traceback]` decodes a production traceback back to source (+ LSP mapped stack traces).
 - Profiles: `dev` (readable, asserts kept) / `release` (minified, `---@luabox-assert` stripped).
-- Embedding modes: plain chunk, LÖVE fused, Neovim plugin layout.
+- Embedding modes: plain chunk, LÖVE fused, Neovim plugin layout. `mode = "love"` writes a `.love` — a zip archive — and luabox ships no zip implementation, so this one step spawns an external tool over the staged build output: `zip`, else `python3 -m zipfile`, else `python -m zipfile`; on Windows the System32 `bsdtar`, else PowerShell `Compress-Archive`. With none available the build fails naming every tool it tried, never writing a partial archive. No Lua is executed (§Non-goals).
 
 ## 8. Language server — `luabox lsp` (rust-analyzer mirror)
 
@@ -307,7 +307,7 @@ drifting copy of. The `lua_modules/` read path stays in `luabox-bundle`'s
 | Semantics | `luabox-hir`, `luabox-types`, `luabox-db` | name resolution, type IR, inference, incremental queries | salsa DB traits |
 | Emit | `luabox-lower`, `luabox-bundle` | lowering, polyfills, require-graph, sourcemaps | checked HIR in, bytes out; type-blind |
 | Distribution | `luabox-manifest` | the `luabox.toml` model, its validation and comment-preserving round-trip, plus project layout: root discovery, the first-party source walk, `[types] defs` resolution (solver, lockfile, CAS and the luarocks bridge are parked — §6) | manifest + layout API; never parses syntax |
-| ~~Execution~~ | — | ~~runtime acquisition~~ | **Context removed in 0.2.0** — luabox spawns no process (§12) |
+| ~~Execution~~ | — | ~~runtime acquisition~~ | **Context removed in 0.2.0** — luabox spawns no interpreter (§12); the only child processes left are `upgrade`, `doc --open` and the `--mode love` zip tool (§Non-goals) |
 | Frontend | `luabox-cli`, `luabox-lsp` | UX, protocol, diagnostics rendering | consumes all, owns none |
 
 ### 16.1 Implementation — Rust

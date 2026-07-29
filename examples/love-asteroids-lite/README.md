@@ -47,6 +47,14 @@ non-`plain` mode implies bundling — no `--bundle` needed):
 luabox build
 ```
 
+> **This step needs an external zip tool on `PATH`.** A `.love` file *is* a
+> zip archive and luabox carries no zip implementation, so `mode = "love"` is
+> the one build step that shells out: `zip`, else `python3 -m zipfile`, else
+> `python -m zipfile` on Linux/macOS; the System32 `bsdtar`, else
+> PowerShell's `Compress-Archive`, on Windows. With none of them available
+> the build fails loudly, naming every tool it tried, rather than leaving a
+> partial archive behind. (`unzip` below is only for inspecting the result.)
+
 This produces `dist/asteroids-lite.love` — a zip archive with `main.lua` and
 `conf.lua` at its root and `assets/` copied in verbatim. Verify the contents:
 

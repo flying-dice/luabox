@@ -169,6 +169,20 @@ luabox to read a rockspec's own definition files is not planned for 0.x.
 Your `*.rockspec` and luarocks own everything else (adding, updating,
 publishing), and you run your program with whatever Lua you already have.
 
+### `build --mode love` requires an external zip tool
+
+A `.love` file is a zip archive and luabox carries no zip implementation, so
+`[build] mode = "love"` is the one build step that shells out to a tool it
+does not ship: `zip`, else `python3 -m zipfile`, else `python -m zipfile` on
+Linux/macOS; the System32 `bsdtar`, else PowerShell's `Compress-Archive`, on
+Windows. With none of them on `PATH` the build fails loudly, naming every
+tool it tried — it never writes a partial archive. This does not weaken the
+"never spawns an interpreter" claim: the spawned tool archives the output
+luabox just emitted and executes no Lua. `mode = "nvim-plugin"` and every
+other command need nothing external. The other two commands that leave the
+process are `upgrade` and `doc --open`; see
+[DIRECTION.md](DIRECTION.md#north-star).
+
 ### Editor extensions are not on marketplaces yet (#102)
 
 The editor integrations live in their own repos and ship installable

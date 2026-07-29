@@ -97,13 +97,13 @@ else
   fail=1
 fi
 
-# --- fmt --check throughput proxy gate (warm) -----------------------------
+# --- fmt --check throughput gate (warm) -----------------------------------
 # The corpus is synthetic and not guaranteed to already be in canonical
 # form, so `fmt --check` may legitimately exit nonzero here; that's not a
 # gate failure — only the elapsed time is. The gate would only fail if
 # wall time exceeds the budget.
 echo
-echo "perf-gate: fmt --check throughput proxy on corpus (warm)..."
+echo "perf-gate: fmt --check throughput on corpus (warm)..."
 ( cd "$corpus_dir" && "$luabox_bin" fmt --check >/dev/null 2>&1 ) || true
 start=$(date +%s%N)
 ( cd "$corpus_dir" && "$luabox_bin" fmt --check >/dev/null 2>&1 ) || true
@@ -111,15 +111,15 @@ end=$(date +%s%N)
 fmt_ms=$(( (end - start) / 1000000 ))
 
 if [[ "$fmt_ms" -lt "$fmt_budget" ]]; then
-  echo "PASS fmt --check (warm, proxy for check < 1 s): ${fmt_ms} ms < ${fmt_budget} ms"
+  echo "PASS fmt --check (warm): ${fmt_ms} ms < ${fmt_budget} ms"
 else
-  echo "FAIL fmt --check (warm, proxy for check < 1 s): ${fmt_ms} ms >= ${fmt_budget} ms"
+  echo "FAIL fmt --check (warm): ${fmt_ms} ms >= ${fmt_budget} ms"
   fail=1
 fi
 
 # --- CHECK GATE ------------------------------------------------------------
 # SPEC.md §16.1: `check` on the 100-kLOC corpus < 1 s warm. Live since
-# ticket #6; the fmt --check proxy above stays as a wider safety net.
+# GL#6; the fmt --check gate above stays as the wider safety net.
 check_budget=$(awk -v b="$check_budget_base_ms" -v f="$factor" 'BEGIN { printf "%d", b * f }')
 echo
 echo "perf-gate: check throughput on corpus (warm)..."

@@ -81,7 +81,8 @@ so it appears in no version entry.
   credential and makes no authenticated request — the editor extensions'
   "Sign in with GitHub" flow no longer has a backing command.
 - **`luabox run`** ([#11](https://github.com/flying-dice/luabox/issues/11))
-  — luabox never spawns a process. `[tasks]` entries, the toolchain-first
+  — luabox never spawns an interpreter and never executes your code.
+  `[tasks]` entries, the toolchain-first
   `PATH` resolution (`node_modules/.bin` semantics), and the
   `luabox run luarocks -- install <rock>` escape hatch all go with it.
 - **`luabox toolchain`**
@@ -223,7 +224,12 @@ so it appears in no version entry.
   `module_surface_with_artifacts` / `check_file_with_artifacts` entry points
   that take one; `module_surface`, `check_file_with_requires` and
   `module_requires` are unchanged wrappers, so the LSP and any other consumer
-  need not care. No diagnostic, ordering or summary changes.
+  need not care. No diagnostic, ordering or summary changes. It is not free:
+  reading and parsing once means the per-file artifacts are *retained* across
+  both passes instead of being dropped and rebuilt, and peak RSS on the
+  100-kLOC reference corpus went from 64 MiB to 123 MiB (~1.9×). That is the
+  deliberate trade — memory for I/O and CPU — and the number is here so
+  nobody has to rediscover it from a profiler.
 - **Releases are gated on the full e2e suite running against the *installed*
   binary.** `release.yml` now creates the release as a true **draft**, and on
   Linux, macOS and Windows it downloads the shipped install script *from that

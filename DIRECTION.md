@@ -104,13 +104,20 @@ us to:
    registry client, no downloads on your project's behalf.
 3. **It holds no credential.** No login, no token store, no keychain entry.
 
-Two commands do start a child process, and neither weakens any of the three:
+Three commands do start a child process, and none of them weakens any of the
+three claims:
 
 - **`upgrade`** replaces the running binary with a GitHub release —
   anonymously, via `curl` and `tar`, on explicit request. It is the toolchain
   updating itself, not the toolchain acting on your project.
 - **`doc --open`** hands the `index.html` it just generated to the platform's
   browser opener (`xdg-open`/`open`/`start`).
+- **`build --mode love`** shells out to a zip tool to package the `.love`
+  archive — `zip`, else `python3 -m zipfile`, else `python -m zipfile` on
+  Unix; the System32 `bsdtar`, else PowerShell's `Compress-Archive`, on
+  Windows. It archives the build output luabox just produced, executes no
+  Lua, and when no tool is present it fails loudly naming the ones it tried
+  rather than emitting a half-made archive.
 
 Stating it as "spawns no process at all" was the tidier sentence and the false
 one; the three claims above are what actually holds.

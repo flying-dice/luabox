@@ -3,9 +3,11 @@ Feature: The luabox command-line surface
   contract. A malformed invocation is clap's problem and exits 2 with a
   usage hint; a command that ran and found problems exits 1. No command on
   this surface runs Lua, resolves or fetches packages, or reads a
-  credential. Two commands do leave the process: `upgrade` replaces the
-  binary from a GitHub release (curl + tar, anonymous, on request) and
-  `doc --open` launches a browser — neither is exercised here.
+  credential. Three commands do leave the process: `upgrade` replaces the
+  binary from a GitHub release (curl + tar, anonymous, on request),
+  `doc --open` launches a browser, and `build --mode love` shells out to a
+  zip tool (`zip`/`python -m zipfile`, or `bsdtar`/`Compress-Archive` on
+  Windows) to package the build output — none is exercised here.
 
   Scenario: --help lists every subcommand
     Given an empty directory

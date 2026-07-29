@@ -6,7 +6,7 @@
 
 .DESCRIPTION
     Gates: cold start, `fmt --check` throughput (kept as a wider safety
-    net), and the real `check` gate (live since ticket #6).
+    net), and the real `check` gate (live since GL#6).
 
 .PARAMETER Factor
     Multiplier applied to every budget, for slow/loaded machines
@@ -118,12 +118,12 @@ strict = true
         $fail = $true
     }
 
-    # --- fmt --check throughput proxy gate (warm) --------------------------
+    # --- fmt --check throughput gate (warm) --------------------------------
     # The corpus is synthetic and not guaranteed to already be in
     # canonical form, so `fmt --check` may legitimately exit nonzero here;
     # that's not a gate failure — only the elapsed time is.
     Write-Host ""
-    Write-Host "perf-gate: fmt --check throughput proxy on corpus (warm)..."
+    Write-Host "perf-gate: fmt --check throughput on corpus (warm)..."
     Push-Location $corpusDir
     try {
         & $luaboxBin fmt --check *> $null
@@ -136,15 +136,15 @@ strict = true
     $fmtMs = $sw.Elapsed.TotalMilliseconds
 
     if ($fmtMs -lt $fmtBudget) {
-        Write-Host ("PASS fmt --check (warm, proxy for check < 1 s): {0:N1} ms < {1:N1} ms" -f $fmtMs, $fmtBudget)
+        Write-Host ("PASS fmt --check (warm): {0:N1} ms < {1:N1} ms" -f $fmtMs, $fmtBudget)
     } else {
-        Write-Host ("FAIL fmt --check (warm, proxy for check < 1 s): {0:N1} ms >= {1:N1} ms" -f $fmtMs, $fmtBudget)
+        Write-Host ("FAIL fmt --check (warm): {0:N1} ms >= {1:N1} ms" -f $fmtMs, $fmtBudget)
         $fail = $true
     }
 
     # --- CHECK GATE ----------------------------------------------------------
     # SPEC.md §16.1: `check` on the 100-kLOC corpus < 1 s warm. Live since
-    # ticket #6; the fmt --check proxy above stays as a wider safety net.
+    # GL#6; the fmt --check gate above stays as the wider safety net.
     $checkBudget = $CheckBudgetBaseMs * $Factor
     Write-Host ""
     Write-Host "perf-gate: check throughput on corpus (warm)..."
