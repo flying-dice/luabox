@@ -88,6 +88,18 @@ conservative: an unknown/`any`/union callee or a plain table (no declared class,
 or a class with no `call` operator) is left exactly as before — no synthesized
 signature and no new diagnostic.
 
+### `goto`/label/`break` legality is not diagnosed (#44)
+
+Three programs every reference Lua rejects at load time pass `luabox check`
+and `luabox lint` clean: a `goto` with no visible matching label, a label
+declared twice in the same scope, and `break` outside any loop. Dialect
+legality itself is enforced (`goto` under `edition = "5.1"` reports
+`LB0010`/`LB0001`) — the gap is specifically label/loop *resolution*
+legality. Your interpreter still rejects these at load time; luabox just
+doesn't pre-empt it yet. HIR already resolves each `goto` to its label (or
+none), so this is a planned diagnostic, tracked as
+[#44](https://github.com/flying-dice/luabox/issues/44).
+
 ### Bidirectional / contextual typing (#120)
 
 A function *literal* written where a `fun(...)` type is expected now takes that

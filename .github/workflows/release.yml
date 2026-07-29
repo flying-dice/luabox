@@ -87,8 +87,8 @@ jobs:
       # can be fixed by re-running the workflow, and a bare `gh release create`
       # 422s the moment the draft from the failed run still exists. So:
       #   - no release for this tag  -> create it as a draft;
-      #   - a DRAFT release exists   -> reuse it (publish-release uploads with
-      #                                 `--clobber`, so re-runs overwrite
+      #   - a DRAFT release exists   -> reuse it (the `publish` job uploads
+      #                                 with `--clobber`, so re-runs overwrite
       #                                 assets cleanly);
       #   - a PUBLISHED release      -> fail loudly. Re-running over a live
       #                                 release would silently replace what

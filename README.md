@@ -193,8 +193,10 @@ anything load-bearing.
 > System32 `bsdtar`, else PowerShell's `Compress-Archive`, on Windows. With
 > none of them available the build fails loudly, naming every tool it tried
 > — it never leaves a partial `.love` behind. It archives the output luabox
-> just emitted; no Lua is executed. Every other command, `mode =
-> "nvim-plugin"` included, spawns nothing.
+> just emitted; no Lua is executed. No other build step spawns anything,
+> `mode = "nvim-plugin"` included — across the whole CLI the only commands
+> that start a child process are this packaging step, `upgrade`, and
+> `doc --open` (see [DIRECTION.md](DIRECTION.md)).
 
 ### Coding assistance for `luabox.toml`: `luabox schema`
 
