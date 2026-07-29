@@ -13,6 +13,12 @@
 //! project root is, which files count as first-party source, and where
 //! ambient definition packages come from.
 //!
+//! It also publishes that contract in machine-readable form: [`schema`] is a
+//! complete JSON Schema for `luabox.toml`, printed by `luabox schema` for
+//! editors, validators and LLM coding assistants. A parity suite pins it to
+//! the parser, so the document those tools read can never describe a manifest
+//! the toolchain would reject — or reject one it accepts.
+//!
 //! Per SPEC.md §16, Distribution "never parses syntax": `edition`/`target`
 //! are validated as plain strings against a local allow-list rather than via
 //! `luabox-syntax`, and the layout walk classifies files by path alone.
@@ -21,3 +27,4 @@ pub mod error;
 pub mod layout;
 pub mod model;
 mod parse;
+pub mod schema;

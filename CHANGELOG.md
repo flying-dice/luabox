@@ -8,6 +8,30 @@ spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
 
 ## [Unreleased]
 
+### Added
+
+- **`luabox schema` — the manifest contract, published as a JSON Schema.**
+  The binary now carries a complete draft 2020-12 JSON Schema for
+  `luabox.toml` and prints it to stdout, so editors, validators and LLM
+  coding assistants can read the whole contract:
+  `luabox schema > luabox.schema.json`. It covers every table, key, default,
+  closed vocabulary (`edition`, `build.target`, `build.mode`, lint tiers and
+  levels) and every mutually-exclusive dependency form, each with a prose
+  description. The schema describes the manifest's *data model*: you write
+  TOML, tooling maps it to JSON with the standard mapping and validates that.
+- **A type-checking process that keeps the schema and the parser honest.**
+  The two descriptions of the manifest — the hand-rolled parser and the
+  published schema — are pinned to each other by a parity suite in
+  `luabox-manifest`: the schema's `properties` must equal the parser's key
+  allow-lists table by table, its `enum`s must equal the Rust closed
+  vocabularies variant for variant, its `required` sets must equal what
+  `Manifest::parse` actually demands, every closed table must reject
+  additional properties, and every property must carry a description. On top
+  of that, every `examples/*/luabox.toml` in the repository plus a curated
+  valid/invalid fixture corpus is run through both the schema validator and
+  the parser, and the two must return the same verdict. Adding an example
+  project extends the corpus automatically.
+
 ## [0.2.0] - 2026-07-26 (unreleased)
 
 **The v1 scope cut — every item below is a breaking change.** luabox is now

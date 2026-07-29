@@ -20,7 +20,11 @@ use crate::model::{
     LintLevel, LintTier, Manifest, Package, PathDependency, Types, UrlDependency,
 };
 
-const TOP_LEVEL_KEYS: &[&str] = &[
+// The key allow-lists below are `pub(crate)` for one reason: they are the
+// anchors the JSON Schema parity suite ([`crate::schema`]) compares the
+// published schema's `properties` objects against, so the two descriptions of
+// the manifest contract cannot drift apart.
+pub(crate) const TOP_LEVEL_KEYS: &[&str] = &[
     "package",
     "build",
     "types",
@@ -35,7 +39,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
 /// nudge alone would leave the reader hunting for a typo that isn't there.
 const REMOVED_TOP_LEVEL_TABLES: &[&str] = &["tasks", "workspace"];
 const REMOVED_TABLE_NOTE: &str = "removed in 0.2.0, see CHANGELOG.md";
-const PACKAGE_KEYS: &[&str] = &[
+pub(crate) const PACKAGE_KEYS: &[&str] = &[
     "name",
     "version",
     "edition",
@@ -44,7 +48,7 @@ const PACKAGE_KEYS: &[&str] = &[
     "lua-versions",
     "min-luabox-version",
 ];
-const BUILD_KEYS: &[&str] = &[
+pub(crate) const BUILD_KEYS: &[&str] = &[
     "target",
     "out",
     "mode",
@@ -54,12 +58,12 @@ const BUILD_KEYS: &[&str] = &[
     "sourcemap",
     "minify",
 ];
-const TYPES_KEYS: &[&str] = &["strict", "defs"];
+pub(crate) const TYPES_KEYS: &[&str] = &["strict", "defs"];
 /// The [`DialectId`] a `Package` carries while its `edition` is missing or
 /// invalid. Never observable: `Manifest::parse` has pushed an error by the
 /// time it is used, so it returns `Err` and the `Package` is dropped.
 const EDITION_PLACEHOLDER: DialectId = DialectId::Lua54;
-const DEPENDENCY_KEYS: &[&str] = &[
+pub(crate) const DEPENDENCY_KEYS: &[&str] = &[
     "git", "rev", "tag", "branch", "path", "url", "sha256", "version",
 ];
 

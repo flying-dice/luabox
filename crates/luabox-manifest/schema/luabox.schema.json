@@ -1,0 +1,571 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/flying-dice/luabox/main/crates/luabox-manifest/schema/luabox.schema.json",
+  "title": "luabox.toml",
+  "description": "The complete configuration contract for a luabox project manifest (`luabox.toml`, SPEC.md §5). luabox is a purely static Lua toolchain: it typechecks, lints, formats, lowers and bundles Lua, consumes a `lua_modules/` rock tree materialised by luarocks, and never fetches packages or runs Lua.\n\nTOML→JSON mapping caveat: this schema describes the manifest's *data model*, not its file syntax. You write `luabox.toml` in TOML; editors, validators and other tooling map that TOML to JSON using the standard mapping (tables → objects, arrays → arrays, strings/integers/booleans → their JSON counterparts) and validate the result against this document. Every `[table]` heading below is therefore an object property, and every `key = value` a property of that object.\n\nThis document is emitted verbatim by `luabox schema`, and is kept in lockstep with the hand-written parser (`luabox-manifest`) by a parity test suite: the accepted key sets, the closed value vocabularies, and the required keys can never drift apart from what the toolchain actually accepts.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "package"
+  ],
+  "properties": {
+    "package": {
+      "$ref": "#/$defs/package",
+      "description": "Package identity and the dialect you write (SPEC.md §5, §6, §15). The only required table: a manifest with no `[package]` is rejected."
+    },
+    "build": {
+      "$ref": "#/$defs/build",
+      "description": "Configuration for the single `luabox build` command — the dialect you ship, where output lands, and whether to bundle (SPEC.md §5, §7). Every field has a default, so the table may be omitted entirely; every field is also overridable by a `luabox build` flag."
+    },
+    "types": {
+      "$ref": "#/$defs/types",
+      "description": "Typechecker configuration for `luabox check` (SPEC.md §5): strictness, and the ambient LuaCATS definition packages that join this project's scope."
+    },
+    "dependencies": {
+      "$ref": "#/$defs/dependencyMap",
+      "description": "Packages this project requires at runtime, keyed by package name (SPEC.md §5, §6).\n\nluabox resolves nothing: there is no solver, no lockfile and no download in v1. The table is still read — each entry names a package whose `lua_modules/<name>/luabox.toml` is consulted for its `[types] defs`, so a dependency's ambient LuaCATS definitions join this project's scope (the luals `workspace.library` model). `require` resolution does not consult this table at all: it searches `lua_modules/` by path, so a rock is requirable and bundlable whether or not it is listed here."
+    },
+    "dev-dependencies": {
+      "$ref": "#/$defs/dependencyMap",
+      "description": "Packages needed only for development and tests, keyed by package name. Identical in shape and handling to `dependencies` (SPEC.md §5, §6)."
+    },
+    "lint": {
+      "$ref": "#/$defs/lint",
+      "description": "Lint configuration for `luabox lint` (SPEC.md §9): per-tier and per-rule severity levels, plus the deliberate-global allow-list."
+    }
+  },
+  "$defs": {
+    "dialect": {
+      "type": "string",
+      "title": "Lua dialect",
+      "description": "A Lua dialect luabox understands (SPEC.md §2, §6). `luajit` is the LuaJIT dialect, which is 5.1-compatible with extensions.",
+      "enum": [
+        "5.1",
+        "5.2",
+        "5.3",
+        "5.4",
+        "luajit"
+      ]
+    },
+    "bundleMode": {
+      "type": "string",
+      "title": "Bundler embedding mode",
+      "description": "How `luabox build` packages its output (SPEC.md §7). `plain` writes a bare single-file `.lua` chunk; `love` produces a LÖVE `.love` zip archive; `nvim-plugin` produces a Neovim `runtimepath` plugin tree (`lua/<name>/init.lua`). Any mode other than `plain` implies bundling regardless of `build.bundle`.",
+      "enum": [
+        "plain",
+        "love",
+        "nvim-plugin"
+      ]
+    },
+    "lintLevel": {
+      "type": "string",
+      "title": "Lint severity level",
+      "description": "The severity a lint tier or rule fires at — the analog of clippy's levels (SPEC.md §9). `allow` turns the rule off entirely; `warn` reports it without failing the command; `deny` reports it as an error and fails the command.",
+      "enum": [
+        "allow",
+        "warn",
+        "deny"
+      ]
+    },
+    "semver": {
+      "type": "string",
+      "title": "Semantic version",
+      "description": "A semver-shaped version: `X.Y.Z` where each component is a run of ASCII digits, with an optional `-pre-release` and/or `+build` suffix. luabox shape-checks versions rather than ordering them (it resolves nothing), so anything after the first `-` or `+` is unconstrained.",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+([-+][\\s\\S]*)?$",
+      "examples": [
+        "1.2.0",
+        "0.1.0",
+        "1.2.3-beta.1+build.5"
+      ]
+    },
+    "package": {
+      "type": "object",
+      "title": "[package]",
+      "description": "Package identity (SPEC.md §5, §6, §15). Only `edition` is required here: `name` and `version` are optional in `luabox.toml` because the project's rockspec is the package manifest luarocks reads, and it supplies them. Commands that need a name substitute one (the project directory name, or `bundle`) rather than demanding it.",
+      "additionalProperties": false,
+      "required": [
+        "edition"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "title": "Package name",
+          "description": "The package name: a plain segment (`penlight`), or a scoped `@org/pkg` form (SPEC.md §19). Each segment must be lowercase ASCII alphanumeric or `-`, must not be empty, and must not start with a digit. Optional — the rockspec supplies it — and an empty string is treated as absent.",
+          "pattern": "^$|^[a-z-][a-z0-9-]*$|^@[a-z-][a-z0-9-]*/[a-z-][a-z0-9-]*$",
+          "examples": [
+            "my-lib",
+            "hello-luabox",
+            "@acme/widgets"
+          ]
+        },
+        "version": {
+          "title": "Package version",
+          "description": "This package's own version, semver-shaped (`X.Y.Z` with optional `-pre-release`/`+build`). Optional — the rockspec supplies it — and an empty string is treated as absent.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/semver"
+            },
+            {
+              "const": ""
+            }
+          ],
+          "examples": [
+            "1.2.0",
+            "0.1.0"
+          ]
+        },
+        "edition": {
+          "$ref": "#/$defs/dialect",
+          "title": "Dialect you write",
+          "description": "The Lua dialect this project's sources are written in — the language `luabox check`, `luabox fmt` and `luabox lint` accept. Required: it is the one manifest key the toolchain cannot infer. Also the default for `build.target`, so a project that writes and ships the same dialect need only set this.",
+          "examples": [
+            "5.4",
+            "luajit"
+          ]
+        },
+        "description": {
+          "type": "string",
+          "title": "Package description",
+          "description": "A one-line human description of the package. Metadata only — nothing in the toolchain reads it.",
+          "examples": [
+            "Geometry primitives for 2D games"
+          ]
+        },
+        "license": {
+          "type": "string",
+          "title": "License",
+          "description": "The package's license, conventionally an SPDX identifier. Metadata only — nothing in the toolchain reads it, and it is not validated against the SPDX list.",
+          "examples": [
+            "MIT",
+            "Apache-2.0"
+          ]
+        },
+        "lua-versions": {
+          "type": "array",
+          "title": "Compatible dialects",
+          "description": "The dialects this package declares itself compatible with (SPEC.md §6). Parsed, validated, and inert: an entry that is not a known dialect is a manifest error, but nothing evaluates the list — it fed the dependency dialect-set check, which was parked with the solver. Kept so a manifest written for the return of dependency management still validates.",
+          "items": {
+            "$ref": "#/$defs/dialect"
+          },
+          "default": [],
+          "examples": [
+            [
+              "5.1",
+              "5.4"
+            ]
+          ]
+        },
+        "min-luabox-version": {
+          "$ref": "#/$defs/semver",
+          "title": "Minimum toolchain version",
+          "description": "The minimum luabox toolchain version this package needs (SPEC.md §15). Parsed, validated, and inert: a non-semver string is a manifest error, but nothing enforces the bound — it fed the resolver's toolchain gate, which was parked with the solver.",
+          "examples": [
+            "0.3.0"
+          ]
+        }
+      }
+    },
+    "build": {
+      "type": "object",
+      "title": "[build]",
+      "description": "The `luabox build` configuration (SPEC.md §5, §7): one tsc/esbuild-style emit that lowers `package.edition` to `build.target` (goto, bitwise operators, `<close>`, `_ENV`, …) with tree-shaken polyfills, then either mirrors the source tree under `out` or bundles the require graph into one file per entry. Every `luabox build` flag overrides the matching key here.",
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/dialect",
+          "title": "Dialect you ship",
+          "description": "The Lua dialect `luabox build` lowers to and emits. Defaults to `package.edition` — i.e. no lowering — so set it only when you ship a different dialect than you write. Overridden by `luabox build --target`.",
+          "examples": [
+            "5.1"
+          ]
+        },
+        "out": {
+          "type": "string",
+          "title": "Output directory",
+          "description": "The directory tree-mode emit and multi-entry bundles are written to, relative to the project root. Overridden by `luabox build --out`.",
+          "default": "dist",
+          "examples": [
+            "dist",
+            "build"
+          ]
+        },
+        "mode": {
+          "$ref": "#/$defs/bundleMode",
+          "title": "Embedding mode",
+          "description": "How the build output is packaged (SPEC.md §7). A mode other than `plain` implies bundling and is incompatible with `outfile`. Overridden by `luabox build --mode`.",
+          "default": "plain",
+          "examples": [
+            "love"
+          ]
+        },
+        "entry": {
+          "type": "array",
+          "title": "Bundle entry points",
+          "description": "The bundle entry points, one single-file bundle each, as project-relative paths. Only consulted when bundling (`bundle = true`, or a non-`plain` `mode`). Omit the key to get the conventional single entry point; write an explicit empty list for a library with nothing to bundle. Overridden by repeated `luabox build --entry` flags.",
+          "items": {
+            "type": "string",
+            "description": "A project-relative path to one Lua entry point."
+          },
+          "default": [
+            "src/main.lua"
+          ],
+          "examples": [
+            [
+              "src/main.lua"
+            ],
+            [
+              "src/cli.lua",
+              "src/worker.lua"
+            ]
+          ]
+        },
+        "outfile": {
+          "type": "string",
+          "title": "Single-entry bundle output path",
+          "description": "Write the single bundle to exactly this path (esbuild's `--outfile`), instead of deriving its name from the entry basename under `out`. Valid only with exactly one entry, and never with a non-`plain` `mode`. Overridden by `luabox build --outfile`.",
+          "examples": [
+            "dist/app.lua"
+          ]
+        },
+        "bundle": {
+          "type": "boolean",
+          "title": "Bundle instead of mirroring the tree",
+          "description": "Inline the require graph into one single-file bundle per entry, instead of mirroring the source tree under `out`. A non-`plain` `mode` implies bundling regardless. Overridden by `luabox build --bundle` / `--no-bundle`.",
+          "default": false
+        },
+        "sourcemap": {
+          "type": "boolean",
+          "title": "Emit source maps",
+          "description": "Write a `<bundle>.map` beside each bundle so `luabox unmap` can decode a production traceback back to source lines. Only meaningful when bundling, and only recorded at build time — a map cannot be reconstructed after the fact. Overridden by `luabox build --sourcemap`.",
+          "default": false
+        },
+        "minify": {
+          "type": "boolean",
+          "title": "Minify each bundle",
+          "description": "Scope-aware identifier mangling plus whitespace collapse on each bundle. Only meaningful when bundling. Overridden by `luabox build --minify`.",
+          "default": false
+        }
+      }
+    },
+    "types": {
+      "type": "object",
+      "title": "[types]",
+      "description": "Typechecker configuration for `luabox check` (SPEC.md §5).",
+      "additionalProperties": false,
+      "properties": {
+        "strict": {
+          "type": "boolean",
+          "title": "Strict typechecking",
+          "description": "Report LuaCATS type mismatches as errors rather than warnings. `false` is the friendly on-ramp for an existing annotated codebase: mismatches surface as warnings until you turn the dial.",
+          "default": false
+        },
+        "defs": {
+          "type": "array",
+          "title": "Ambient definition packages",
+          "description": "Ambient LuaCATS definition packages (`*.d.lua` / `---@meta` modules) whose declarations join this project's scope (SPEC.md §3). Each entry is a file stem resolved under this package's own `defs/` directory — `\"love2d\"` resolves `defs/love2d.d.lua`. A dependency that publishes its own `[types] defs` contributes them automatically; you do not list a dependency's defs here.",
+          "items": {
+            "type": "string",
+            "description": "A definition package name — the stem of a `defs/<name>.d.lua` file under this package's root."
+          },
+          "default": [],
+          "examples": [
+            [
+              "love2d"
+            ]
+          ]
+        }
+      }
+    },
+    "dependencyMap": {
+      "type": "object",
+      "title": "Dependency table",
+      "description": "A table of dependencies keyed by package name. Each value is either a bare version-requirement string or an inline table naming exactly one source.",
+      "additionalProperties": {
+        "$ref": "#/$defs/dependency"
+      }
+    },
+    "dependency": {
+      "title": "Dependency",
+      "description": "One `[dependencies]` / `[dev-dependencies]` entry (SPEC.md §6). Either a bare version-requirement string (`pkg = \"1.2.3\"`) or an inline table naming exactly one source — `path`, `git`, or `url` — or, equivalently to the bare string, only a `version`.",
+      "oneOf": [
+        {
+          "type": "string",
+          "title": "Version requirement",
+          "description": "A bare version requirement, e.g. `penlight = \"1.13\"`. Recorded verbatim; nothing resolves or compares it in v1.",
+          "examples": [
+            "1.0",
+            "1.2.3"
+          ]
+        },
+        {
+          "$ref": "#/$defs/dependencyTable"
+        }
+      ]
+    },
+    "dependencyTable": {
+      "type": "object",
+      "title": "Dependency table entry",
+      "description": "An inline-table dependency. Exactly one source key may be present — `path`, `git`, or `url` — or none at all, in which case `version` alone is required and the entry means exactly what the bare-string form means. `sha256` is valid only alongside `url` (and mandatory there); `rev`/`tag`/`branch` require a `git` source, and at most one of the three may be given.",
+      "additionalProperties": false,
+      "properties": {
+        "git": {
+          "type": "string",
+          "title": "Git source",
+          "description": "A git repository URL to take the package from. Pin it with at most one of `rev`, `tag` or `branch`.",
+          "examples": [
+            "https://github.com/flying-dice/luabox"
+          ]
+        },
+        "rev": {
+          "type": "string",
+          "title": "Git revision",
+          "description": "An exact commit to check out. Requires a `git` source, and is mutually exclusive with `tag` and `branch`.",
+          "examples": [
+            "9f2c1ab"
+          ]
+        },
+        "tag": {
+          "type": "string",
+          "title": "Git tag",
+          "description": "A tag to check out. Requires a `git` source, and is mutually exclusive with `rev` and `branch`.",
+          "examples": [
+            "v1.0.0"
+          ]
+        },
+        "branch": {
+          "type": "string",
+          "title": "Git branch",
+          "description": "A branch to track. Requires a `git` source, and is mutually exclusive with `rev` and `tag`.",
+          "examples": [
+            "main"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "title": "Path source",
+          "description": "A filesystem path to a sibling package, read in place — luabox never copies or fetches it. Relative paths are resolved against this manifest's directory. This is how a monorepo-style tree shares a library, and how the depended-on package's `[types] defs` reach this project.",
+          "examples": [
+            "../geometry"
+          ]
+        },
+        "url": {
+          "type": "string",
+          "title": "Tarball source",
+          "description": "An http(s) (or `file://`) tarball to take the package from. Requires `sha256`: integrity is non-negotiable, so a `url` with no digest is a hard error rather than a silent unverified fetch.",
+          "examples": [
+            "https://example.com/pkg-1.0.tar.gz"
+          ]
+        },
+        "sha256": {
+          "type": "string",
+          "title": "Tarball digest",
+          "description": "The SHA-256 digest that pins the `url` tarball. Mandatory alongside `url`, and meaningless — an error — without one.",
+          "examples": [
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          ]
+        },
+        "version": {
+          "type": "string",
+          "title": "Version requirement",
+          "description": "The declared version expectation for this package. On its own it is the bare-string form spelled longhand — `pkg = { version = \"1.0\" }` means exactly `pkg = \"1.0\"`. Alongside a source key it is recorded, not dropped: it is metadata reserved for when resolution returns, like `rev`/`tag`/`branch`.",
+          "examples": [
+            "1.0",
+            "1.2.3"
+          ]
+        }
+      },
+      "oneOf": [
+        {
+          "title": "path source",
+          "description": "A sibling package read in place from the filesystem.",
+          "required": [
+            "path"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "git"
+                ]
+              },
+              {
+                "required": [
+                  "url"
+                ]
+              },
+              {
+                "required": [
+                  "sha256"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "title": "git source",
+          "description": "A git repository, optionally pinned by exactly one of `rev`, `tag` or `branch`.",
+          "required": [
+            "git"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "path"
+                ]
+              },
+              {
+                "required": [
+                  "url"
+                ]
+              },
+              {
+                "required": [
+                  "sha256"
+                ]
+              },
+              {
+                "required": [
+                  "rev",
+                  "tag"
+                ]
+              },
+              {
+                "required": [
+                  "rev",
+                  "branch"
+                ]
+              },
+              {
+                "required": [
+                  "tag",
+                  "branch"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "title": "url source",
+          "description": "An http(s) tarball, pinned by its SHA-256 digest.",
+          "required": [
+            "url",
+            "sha256"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "git"
+                ]
+              },
+              {
+                "required": [
+                  "path"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "title": "version only",
+          "description": "No source at all — the bare version-requirement string spelled longhand.",
+          "required": [
+            "version"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "git"
+                ]
+              },
+              {
+                "required": [
+                  "path"
+                ]
+              },
+              {
+                "required": [
+                  "url"
+                ]
+              },
+              {
+                "required": [
+                  "sha256"
+                ]
+              },
+              {
+                "required": [
+                  "rev"
+                ]
+              },
+              {
+                "required": [
+                  "tag"
+                ]
+              },
+              {
+                "required": [
+                  "branch"
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "lint": {
+      "type": "object",
+      "title": "[lint]",
+      "description": "Lint configuration (SPEC.md §9). Apart from `globals`, every key sets a severity level: the five keys named below are *tier* toggles that move a whole family of rules at once, and any other key is read as a lint rule id (`unused-local`, `global-write`, …). Rule ids are open here — an id that names no known rule is reported by `luabox lint` as LB1004, not by manifest parsing — but the level value is closed to `allow`/`warn`/`deny` either way. A per-rule level beats its tier.",
+      "additionalProperties": {
+        "$ref": "#/$defs/lintLevel",
+        "description": "The level for one lint rule id, e.g. `unused-local = \"allow\"`. Ids live in `luabox lint`; run `luabox explain LB1004` for what happens to an id it does not know."
+      },
+      "properties": {
+        "globals": {
+          "type": "array",
+          "title": "Deliberate globals",
+          "description": "Extra names the `global-write` rule treats as intentional globals rather than accidents — the escape hatch for a library that deliberately publishes itself as a global, or for a host environment's injected names.",
+          "items": {
+            "type": "string",
+            "description": "A global name to accept as deliberate."
+          },
+          "default": [],
+          "examples": [
+            [
+              "vim",
+              "love"
+            ]
+          ]
+        },
+        "correctness": {
+          "$ref": "#/$defs/lintLevel",
+          "title": "correctness tier",
+          "description": "Level for the whole `correctness` tier — rules for code that is outright wrong."
+        },
+        "suspicious": {
+          "$ref": "#/$defs/lintLevel",
+          "title": "suspicious tier",
+          "description": "Level for the whole `suspicious` tier — rules for code that is probably not what was meant."
+        },
+        "perf": {
+          "$ref": "#/$defs/lintLevel",
+          "title": "perf tier",
+          "description": "Level for the whole `perf` tier — rules for avoidably slow constructs."
+        },
+        "style": {
+          "$ref": "#/$defs/lintLevel",
+          "title": "style tier",
+          "description": "Level for the whole `style` tier — rules for idiomatic Lua."
+        },
+        "pedantic": {
+          "$ref": "#/$defs/lintLevel",
+          "title": "pedantic tier",
+          "description": "Level for the whole `pedantic` tier — strict rules that are off or advisory by default."
+        }
+      }
+    }
+  }
+}

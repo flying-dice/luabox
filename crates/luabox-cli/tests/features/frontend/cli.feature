@@ -18,6 +18,7 @@ Feature: The luabox command-line surface
     And stdout contains "build"
     And stdout contains "doc"
     And stdout contains "explain"
+    And stdout contains "schema"
 
   Scenario: --version reports the binary version
     Given an empty directory
@@ -129,3 +130,4 @@ Feature: The luabox command-line surface
       | build   |
       | doc     |
       | explain |
+      | schema  |

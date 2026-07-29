@@ -7,7 +7,7 @@ Until the cucumber feature files exist for a behaviour, this text is the sole so
 from then on the feature files govern.
 
 **Scope note (0.2.0).** The v1 scope cut of 2026-07-26 made luabox a purely static toolchain —
-`init new check lint fmt build doc lsp upgrade explain unmap`. Sections describing dependency
+`init new check lint fmt build doc lsp upgrade explain unmap schema`. Sections describing dependency
 resolution, publishing, credentials, `run` and `toolchain` are marked *parked post-v1*: they are
 retained as the design for when that scope returns, not as a description of what ships. The
 decision record is [DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26); the removals
@@ -87,6 +87,7 @@ luabox doc [--open]                                   docs from annotations
 luabox lsp [--stdio]                                  stdio LSP server
 luabox upgrade [<version>]                            self-replace with a release build
 luabox explain LB0xxx                                 rustc-style diagnostic docs
+luabox schema                                         JSON Schema for luabox.toml (stdout)
 ```
 
 Every command cold-starts < 50 ms; watch mode on check/fmt.
@@ -148,6 +149,16 @@ pedantic = "warn"           # tier/rule levels: allow | warn | deny
   enforces them. Unlike `[tasks]`/`[workspace]`, they name a real property of
   the package rather than a removed command, which is why they were kept
   rather than turned into unknown-key errors.
+- **Published as a JSON Schema.** The whole manifest contract — every table,
+  key, default, closed vocabulary and mutually-exclusive dependency form — is
+  also a draft 2020-12 JSON Schema that `luabox schema` prints to stdout, so
+  editors, validators and LLM coding assistants can read it
+  (`luabox schema > luabox.schema.json`). The schema describes the *data
+  model*: you write TOML, tooling maps it to JSON with the standard mapping
+  and validates that. It cannot drift from the hand-rolled parser — a parity
+  suite pins its `properties`, `enum`s and `required` sets to the parser's own
+  allow-lists and typed vocabularies, and runs every example manifest plus a
+  curated valid/invalid corpus through both, demanding the same verdict.
 - **Lockfile:** `luabox.lock` — content-addressed, hashes every artifact,
   deterministic, text-based. [Parked post-v1 with the solver (§6) — a
   `luabox.lock` left in a project is ignored.]
