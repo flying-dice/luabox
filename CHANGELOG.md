@@ -32,6 +32,20 @@ spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
   the parser, and the two must return the same verdict. Adding an example
   project extends the corpus automatically.
 
+### Fixed
+
+- **A manifest key is never silently inert.** `rev`, `tag` and `branch` pin a
+  *git* checkout, so alongside a `path` or a `url` source they described
+  nothing — and were quietly dropped by both the parser and the published
+  JSON Schema. `{ path = "…", rev = "…" }`, `{ path = "…", tag = "…" }`,
+  `{ path = "…", branch = "…" }` and the same three next to a `url` source
+  are now errors naming the source that *was* found ("has a git reference key
+  but a `path` source"), batched with every other manifest error like the
+  long-standing `sha256`-without-`url` and git-reference-without-`git` rules.
+  The schema's `path source` and `url source` branches exclude the three keys
+  by the same mechanism they already used for `git`/`url`/`sha256`, so an
+  editor flags them before `luabox check` does.
+
 ## [0.2.0] - 2026-07-26 (unreleased)
 
 **The v1 scope cut — every item below is a breaking change.** luabox is now

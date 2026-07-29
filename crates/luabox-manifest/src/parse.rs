@@ -616,36 +616,7 @@ fn parse_dependency(
     let kinds_present =
         usize::from(git.is_some()) + usize::from(path.is_some()) + usize::from(url.is_some());
     if kinds_present == 0 {
-        // No source key. An orphan source *modifier* names the source it is
-        // missing — uniformly, whether or not `version` is also present —
-        // before the version-only form is considered.
-        if let Some(span) = table.get("sha256").and_then(Item::span) {
-            errors.push(ManifestError::new(
-                format!("`{ctx}.sha256` is only valid alongside a `url` source"),
-                Some(span),
-            ));
-            return None;
-        }
-        if let Some(span) = ["rev", "tag", "branch"]
-            .iter()
-            .find_map(|key| table.get(key).and_then(Item::span))
-        {
-            errors.push(ManifestError::new(
-                format!("`{ctx}` has a git reference key but no `git` source"),
-                Some(span),
-            ));
-            return None;
-        }
-        // A `version`-only table is the bare-string form spelled longhand
-        // (cargo semantics) — `pkg = { version = "1.0" }` ≡ `pkg = "1.0"`.
-        if let Some(version) = version {
-            return Some(Dependency::Version(version));
-        }
-        errors.push(ManifestError::new(
-            format!("`{ctx}` must specify one of `git`, `path`, `url`, or `version`"),
-            item.span(),
-        ));
-        return None;
+        return parse_sourceless_dependency(&ctx, item, table, version, errors);
     }
     if kinds_present > 1 {
         errors.push(ManifestError::new(
@@ -653,6 +624,21 @@ fn parse_dependency(
             item.span(),
         ));
         return None;
+    }
+
+    // `rev`/`tag`/`branch` pin a *git* checkout, so alongside a `path` or
+    // `url` source they describe nothing at all. Flag them — the mirror of
+    // the orphan-modifier rule in `parse_sourceless_dependency` and of
+    // `sha256` outside a `url` source: a manifest key is never silently
+    // inert.
+    if git.is_none()
+        && let Some(span) = git_reference_span(table)
+    {
+        let found = if url.is_some() { "url" } else { "path" };
+        errors.push(ManifestError::new(
+            format!("`{ctx}` has a git reference key but a `{found}` source"),
+            Some(span),
+        ));
     }
 
     if let Some(url) = url {
@@ -706,6 +692,54 @@ fn parse_dependency(
 
     // kinds_present == 1 and it wasn't url or git, so it must be path.
     path.map(|path| Dependency::Path(PathDependency { path, version }))
+}
+
+/// The span of the first `rev`/`tag`/`branch` key in a dependency table —
+/// the keys that pin a `git` checkout and mean nothing without one.
+fn git_reference_span(table: &dyn TableLike) -> Option<Range<usize>> {
+    ["rev", "tag", "branch"]
+        .iter()
+        .find_map(|key| table.get(key).and_then(Item::span))
+}
+
+/// A dependency table with no `git`, `path` or `url` key: either the
+/// version-only longhand form, or a source *modifier* left orphaned.
+///
+/// An orphan modifier names the source it is missing — uniformly, whether or
+/// not `version` is also present — before the version-only form is
+/// considered, so `{ version = "1.0", tag = "v1" }` is the missing-`git`
+/// error rather than a silently accepted version requirement.
+fn parse_sourceless_dependency(
+    ctx: &str,
+    item: &Item,
+    table: &dyn TableLike,
+    version: Option<String>,
+    errors: &mut Vec<ManifestError>,
+) -> Option<Dependency> {
+    if let Some(span) = table.get("sha256").and_then(Item::span) {
+        errors.push(ManifestError::new(
+            format!("`{ctx}.sha256` is only valid alongside a `url` source"),
+            Some(span),
+        ));
+        return None;
+    }
+    if let Some(span) = git_reference_span(table) {
+        errors.push(ManifestError::new(
+            format!("`{ctx}` has a git reference key but no `git` source"),
+            Some(span),
+        ));
+        return None;
+    }
+    // A `version`-only table is the bare-string form spelled longhand
+    // (cargo semantics) — `pkg = { version = "1.0" }` ≡ `pkg = "1.0"`.
+    if let Some(version) = version {
+        return Some(Dependency::Version(version));
+    }
+    errors.push(ManifestError::new(
+        format!("`{ctx}` must specify one of `git`, `path`, `url`, or `version`"),
+        item.span(),
+    ));
+    None
 }
 #[cfg(test)]
 #[allow(
@@ -1213,6 +1247,59 @@ mod tests {
                 "extra={extra:?}: {errors:?}"
             );
         }
+    }
+
+    #[test]
+    fn git_reference_keys_are_rejected_alongside_a_non_git_source() {
+        // A `rev`/`tag`/`branch` next to a `path` or `url` source pins
+        // nothing — it must be an error naming the source that *was* found,
+        // never a silently inert key. Every reference key, both sources,
+        // with and without `version`.
+        for extra in ["", "version = \"1.0\", "] {
+            for key in ["rev", "tag", "branch"] {
+                let src = format!(
+                    "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[dependencies]\nbad = {{ {extra}path = \"../p\", {key} = \"x\" }}\n"
+                );
+                let errors = Manifest::parse(&src).unwrap_err();
+                assert!(
+                    errors
+                        .iter()
+                        .any(|e| e.message.contains("git reference key but a `path` source")),
+                    "extra={extra:?} key={key}: {errors:?}"
+                );
+
+                let src = format!(
+                    "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[dependencies]\nbad = {{ {extra}url = \"https://x/u.tar.gz\", sha256 = \"abc\", {key} = \"x\" }}\n"
+                );
+                let errors = Manifest::parse(&src).unwrap_err();
+                assert!(
+                    errors
+                        .iter()
+                        .any(|e| e.message.contains("git reference key but a `url` source")),
+                    "extra={extra:?} key={key}: {errors:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_git_reference_key_is_flagged_even_when_the_url_source_is_also_broken() {
+        // Batch errors: `{ url, rev }` with no `sha256` is two independent
+        // faults and must report both, not stop at the first.
+        let src = "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[dependencies]\nbad = { url = \"https://x/u.tar.gz\", rev = \"9f2c1ab\" }\n";
+        let errors = Manifest::parse(src).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("git reference key but a `url` source")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("has a `url` source but no `sha256`")),
+            "{errors:?}"
+        );
     }
 
     #[test]

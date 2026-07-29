@@ -305,7 +305,7 @@
     "dependencyTable": {
       "type": "object",
       "title": "Dependency table entry",
-      "description": "An inline-table dependency. Exactly one source key may be present — `path`, `git`, or `url` — or none at all, in which case `version` alone is required and the entry means exactly what the bare-string form means. `sha256` is valid only alongside `url` (and mandatory there); `rev`/`tag`/`branch` require a `git` source, and at most one of the three may be given.",
+      "description": "An inline-table dependency. Exactly one source key may be present — `path`, `git`, or `url` — or none at all, in which case `version` alone is required and the entry means exactly what the bare-string form means. `sha256` is valid only alongside `url` (and mandatory there); `rev`/`tag`/`branch` require a `git` source — with no source, or with a `path` or `url` source, they are an error rather than a silently ignored key — and at most one of the three may be given.",
       "additionalProperties": false,
       "properties": {
         "git": {
@@ -397,6 +397,21 @@
                 "required": [
                   "sha256"
                 ]
+              },
+              {
+                "required": [
+                  "rev"
+                ]
+              },
+              {
+                "required": [
+                  "tag"
+                ]
+              },
+              {
+                "required": [
+                  "branch"
+                ]
               }
             ]
           }
@@ -462,6 +477,21 @@
               {
                 "required": [
                   "path"
+                ]
+              },
+              {
+                "required": [
+                  "rev"
+                ]
+              },
+              {
+                "required": [
+                  "tag"
+                ]
+              },
+              {
+                "required": [
+                  "branch"
                 ]
               }
             ]
