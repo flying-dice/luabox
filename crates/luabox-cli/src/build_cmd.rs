@@ -1290,7 +1290,7 @@ mod tests {
         let diags = to_diagnostics(&lowered.warnings, "src/main.lua");
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].severity, luabox_diag::Severity::Warning);
-        assert_eq!(diags[0].code.to_string(), lowered.warnings[0].code);
+        assert_eq!(diags[0].code, Code::new(lowered.warnings[0].code));
         assert_eq!(diags[0].message, lowered.warnings[0].message);
     }
 
