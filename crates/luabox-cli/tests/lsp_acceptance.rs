@@ -11,6 +11,11 @@
 //! on, and a second copy of the percent-encoder here could disagree with the
 //! server's without any scenario noticing.
 //!
+//! Which binary gets spawned is [`support::luabox_bin`]'s call: the cargo-built
+//! one by default, or whatever `LUABOX_E2E_BIN` points at — which is how
+//! `release.yml` runs this suite against the *installed* release artefact
+//! before the draft release is allowed to go live.
+//!
 //! Reliability rules the harness enforces:
 //!
 //! - replies are matched **by request id**, so an interleaved
@@ -49,7 +54,7 @@ use serde_json::{Value, json};
 /// their bodies are shared.
 mod support;
 
-use support::{docstring, write_file};
+use support::{docstring, luabox_bin, write_file};
 
 /// How long a step waits for a reply before declaring the server hung.
 /// Generous: a cold `cargo test` run may start dozens of servers at once.
@@ -75,7 +80,7 @@ struct Server {
 impl Server {
     /// Spawn `luabox lsp` rooted at `root` and start decoding its stdout.
     fn spawn(root: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_luabox"))
+        let mut child = Command::new(luabox_bin())
             .arg("lsp")
             .current_dir(root)
             .stdin(Stdio::piped())

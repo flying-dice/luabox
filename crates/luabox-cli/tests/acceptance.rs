@@ -2,6 +2,11 @@
 //!
 //! Black-box: every scenario drives the real `luabox` binary against a
 //! temp-dir fixture project. No internal API shortcuts.
+//!
+//! Which binary is [`support::luabox_bin`]'s call: the cargo-built one by
+//! default, or whatever `LUABOX_E2E_BIN` points at — which is how `release.yml`
+//! runs this same suite against the binary its install script pulled out of the
+//! draft release, before that release is allowed to go live.
 
 // Cucumber step functions receive owned captures by signature contract.
 #![allow(clippy::needless_pass_by_value)]
@@ -23,7 +28,7 @@ use cucumber::{World, given, then, when};
 /// only their bodies are shared.
 mod support;
 
-use support::{docstring, package_table, write_file};
+use support::{docstring, luabox_bin, package_table, write_file};
 
 #[derive(Debug, World)]
 #[world(init = Self::new)]
@@ -69,7 +74,7 @@ fn run_luabox(world: &mut AcceptanceWorld, command: &str, backtrace: &str) {
     let mut parts = command.split_whitespace();
     let program = parts.next().expect("empty command");
     assert_eq!(program, "luabox", "scenarios drive the luabox binary only");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_luabox"))
+    let output = std::process::Command::new(luabox_bin())
         .args(parts)
         .env("RUST_BACKTRACE", backtrace)
         .current_dir(world.dir.path())
