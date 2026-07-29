@@ -63,7 +63,7 @@ use luabox_hir::{
 
 use crate::assign::Exactness;
 use crate::codes::FIELD_NOT_FOUND;
-use crate::env::TypeEnv;
+use crate::env::{TypeEnv, merge_block_tags};
 use crate::ty::{FunctionTy, Ty};
 
 /// A byte range key, matching the annotation checker's convention.
@@ -874,6 +874,21 @@ impl Infer<'_> {
                         provable = false;
                     }
                     None => {
+                        // An *instance* shape's metatable is the carrier it was
+                        // minted from, and a carrier attachment (`function C:m()`)
+                        // is a member of the class whether or not the author also
+                        // wrote the runtime `C.__index = C` link — luals folds
+                        // `function C:m()` into `---@class C` off the carrier
+                        // binding, with no metatable reasoning at all. Without
+                        // this fall-through the canonical `---@class C` + carrier
+                        // shape (no `__index`) reports LB0306 at every `o:m()`
+                        // and drops the method's `---@deprecated`/`---@async`
+                        // tags (#33 residue). Only *adds* resolutions, so no new
+                        // undefined-field can arise from it.
+                        if self.shapes[s].is_instance {
+                            cur = Some(meta);
+                            continue;
+                        }
                         if self.shapes[meta].escaped || self.shapes[meta].meta_unknown {
                             provable = false;
                         }
@@ -1396,6 +1411,13 @@ impl Infer<'_> {
     }
 
     fn walk_assign(&mut self, body: BodyId, stmt: StmtId, targets: &[ExprId], values: &[ExprId]) {
+        let key = self.stmt_range(body, stmt);
+        // `---@type fun(…)` on an assignment, positional exactly as on a
+        // `local` (`---@type A, B` covers `a, b = …`), so a lone annotation on
+        // a multi-assignment applies to the first target only.
+        let declared_tys: Option<Vec<Ty>> = key
+            .and_then(|k| self.env.typed_local(k))
+            .map(<[Ty]>::to_vec);
         // Desugared method/function declaration: `function T:m() ... end`
         // becomes `T.m = function(self) ... end`. The carrier must be known
         // *before* the body walks so `self` gets the instance shape.
@@ -1403,10 +1425,18 @@ impl Infer<'_> {
             && let Expr::Function(fn_body) = self.body(body).expr(*value)
         {
             let fn_body = *fn_body;
-            let sig = self
-                .stmt_range(body, stmt)
-                .and_then(|key| self.env.fn_sig(key))
-                .cloned();
+            let block_sig = key.and_then(|k| self.env.fn_sig(k)).cloned();
+            // An explicit `---@type fun(…)` is authoritative for the value
+            // (SPEC §3), so it supplies the signature — parameters, returns,
+            // overloads and generics — while the block's own tags
+            // (`---@deprecated`/`---@async`/`---@nodiscard`/`---@version`),
+            // which `fun(…)` syntax cannot express, ride along (#38).
+            // `walk_body` then types the literal's parameters from it, the
+            // same bidirectional rule `---@type` on a `local` follows.
+            let sig = match declared_fn_sig(declared_tys.as_deref(), 0) {
+                Some(declared) => Some(merge_block_tags(declared, block_sig.as_ref())),
+                None => block_sig,
+            };
             let resolved = self.resolve_target(body, *target);
             let takes_self = self
                 .body(fn_body)
@@ -1459,7 +1489,25 @@ impl Infer<'_> {
             .iter()
             .map(|&t| self.resolve_target(body, t))
             .collect();
-        let values = self.eval_values(body, values, Some(targets.len()));
+        // `---@type fun(…)` positions ahead of the walk so a multi-assignment's
+        // function literals take their declared parameter types (#38). Only a
+        // function type over a function literal is covered — a `---@type` in
+        // any other position on an assignment is left exactly as before.
+        for (i, &value) in values.iter().enumerate() {
+            if matches!(self.body(body).expr(value), Expr::Function(_))
+                && let Some(sig) = declared_fn_sig(declared_tys.as_deref(), i)
+            {
+                self.seed_contextual(body, value, &Ty::Function(Box::new(sig)));
+            }
+        }
+        let mut values = self.eval_values(body, values, Some(targets.len()));
+        for (i, value) in values.iter_mut().enumerate() {
+            if matches!(value, ITy::Func(_))
+                && let Some(sig) = declared_fn_sig(declared_tys.as_deref(), i)
+            {
+                *value = ITy::Ty(Ty::Function(Box::new(sig)));
+            }
+        }
         for (target, value) in resolved.into_iter().zip(values) {
             self.assign_into(&target, value);
         }
@@ -1896,6 +1944,19 @@ fn remove_cast_member(ity: &ITy, ty: &Ty) -> ITy {
         ITy::unknown()
     } else {
         ity_union(kept)
+    }
+}
+
+/// The `fun(…)` signature a `---@type` annotation declares for slot `index`
+/// of the statement it annotates, if that slot declares a function type.
+///
+/// `---@type A, B` is positional (one type per assigned name, exactly as on a
+/// `local`), so a lone `---@type fun(…)` above `a, b = f1, f2` declares only
+/// `a` — `b` keeps its inferred type (#38).
+fn declared_fn_sig(declared_tys: Option<&[Ty]>, index: usize) -> Option<FunctionTy> {
+    match declared_tys?.get(index)? {
+        Ty::Function(sig) => Some((**sig).clone()),
+        _ => None,
     }
 }
 

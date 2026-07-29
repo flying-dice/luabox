@@ -40,6 +40,44 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   rule turns on. It is an under-approximation only (no legal program is
   rejected for it) and is recorded in
   [the limitations page](docs/03-reference/02-limitations.md).
+- **`---@type fun(…)` on an assignment now types the function it annotates**
+  ([#38](https://github.com/flying-dice/luabox/issues/38)). `---@deprecated` +
+  `---@type fun(self: C, n: integer)` above `C.m = function(self, n) end`
+  reached nothing: neither the declared signature nor the block's tags landed
+  on the assigned value, so `o:m(…)` was unchecked and the deprecation never
+  surfaced. `Carrier.m = function(…) end` is the assignment spelling of a
+  function definition — luals binds a doc block to the function value there
+  exactly as it does above `function Carrier.m()` — so a doc block now attaches
+  either way it is written: an explicit `---@type fun(…)` is authoritative for
+  the value (SPEC §3) and supplies parameters, returns, overloads and generics,
+  while the block's use-site tags
+  (`---@deprecated`/`---@async`/`---@nodiscard`/`---@version`), which `fun(…)`
+  syntax cannot express, ride along with it. The literal's own parameters are
+  typed from the declared signature, the same bidirectional rule `---@type` on
+  a `local` follows. `---@type A, B` stays positional, so a lone annotation
+  over `a, b = f, g` declares `a` only. A declared signature that disagrees
+  with the literal's parameter list is not itself a diagnostic — luals has no
+  such rule, and the declaration simply governs.
+- **A `---@class` carrier with no `C.__index = C` line no longer loses its
+  methods** ([#33](https://github.com/flying-dice/luabox/issues/33)). The
+  canonical luals shape — `---@class C`, `local C = {}`, `function C:m()`, and
+  no runtime metatable link — reported `LB0306` (undefined field) at every
+  `o:m()` and dropped the method's `---@deprecated`/`---@async` tags with it.
+  An instance's shape reached its carrier only through an explicit `__index`,
+  a runtime-fidelity requirement luals does not make: it folds carrier
+  attachments into the class off the carrier binding. The fall-through only
+  *adds* resolutions, so a genuinely undefined field is still reported and
+  argument checking stays exactly as conservative as before.
+- **Carrier-style members in a `---@meta` defs file are folded into the class**
+  ([#39](https://github.com/flying-dice/luabox/issues/39)). `function
+  Class:method()` (and `function Class.fn()`) inside a definition package
+  reported `LB0306` at every use site: a checked project file gets its carrier
+  attachments folded in by inference, but a defs file is never inferred, so
+  they reached nothing. They are now harvested syntactically — signature,
+  returns, and use-site tags — exactly as luals treats a library file, with a
+  same-name `---@field` staying authoritative on type while inheriting the
+  attachment's tags. An attachment with no doc block still joins the surface,
+  at a fully permissive signature, so nothing is silently dropped.
 
 ## [0.2.0] - 2026-07-29
 

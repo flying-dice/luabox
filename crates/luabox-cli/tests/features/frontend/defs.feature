@@ -363,3 +363,115 @@ Feature: stdlib definition packages — `---@meta` `.d.lua` ambient types
     Then the command fails
     And stdout contains "LB0300"
     And stdout contains "expected `string`, found `2`"
+
+  # --- carrier-style members in a defs file (#39) ---------------------------
+  # `---@field` is the defs convention, but luals makes no distinction: a
+  # `function Class:method()` written in a library file is a member of that
+  # class. A defs file is never inferred, so its carrier attachments are
+  # harvested syntactically — signatures and tags included.
+
+  Scenario: a carrier-style method in a defs file is a member of its class
+    Given a file "defs/game.d.lua" containing:
+      """
+      ---@meta
+
+      ---@class Widget
+      local Widget = {}
+
+      ---@param n integer
+      ---@return string
+      function Widget:render(n) end
+      """
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      defs = ["game"]
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param w Widget
+      local function use(w)
+        return w:render(1)
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stdout does not contain "LB0306"
+    And stderr contains "check: 0 errors, 0 warnings"
+
+  Scenario: a carrier-style method's signature is enforced at the use site
+    Given a file "defs/game.d.lua" containing:
+      """
+      ---@meta
+
+      ---@class Widget
+      local Widget = {}
+
+      ---@param n integer
+      ---@return string
+      function Widget:render(n) end
+      """
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      defs = ["game"]
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param w Widget
+      local function use(w)
+        return w:render("nope")
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "error[LB0300]"
+    And stdout contains "expected `integer`"
+
+  Scenario: a member neither declared nor attached in a defs file is still undefined
+    Given a file "defs/game.d.lua" containing:
+      """
+      ---@meta
+
+      ---@class Widget
+      local Widget = {}
+
+      function Widget:render() end
+      """
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      defs = ["game"]
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param w Widget
+      local function use(w)
+        w:nosuchthing()
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "error[LB0306]"
+    And stdout contains "undefined field `nosuchthing`"

@@ -109,6 +109,82 @@ Feature: luabox check — luals-parity doc diagnostics (#111, #112, #113)
     And stdout contains "warning[LB0308]"
     And stdout contains "use of deprecated `legacy`"
 
+  Scenario: a `---@class` carrier with no `__index` link still carries `---@deprecated` (#33)
+    Given a project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Plain
+      local Plain = {}
+
+      ---@deprecated
+      function Plain:legacy() end
+
+      ---@type Plain
+      local p
+      p:legacy()
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stdout contains "warning[LB0308]"
+    And stdout contains "use of deprecated `legacy`"
+    And stdout does not contain "LB0306"
+
+  Scenario: a `---@type fun(...)` assignment carries `---@deprecated` to a `:` call site (#38)
+    Given a project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Cls
+      local Cls = {}
+
+      ---@deprecated
+      ---@type fun(self: Cls, n: integer)
+      Cls.m = function(self, n) end
+
+      ---@type Cls
+      local o
+      o:m(1)
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stdout contains "warning[LB0308]"
+    And stdout contains "use of deprecated `m`"
+
+  Scenario: a carrier-style method in a defs file carries `---@deprecated` to its use site (#39)
+    Given a file "defs/game.d.lua" containing:
+      """
+      ---@meta
+
+      ---@class Widget
+      local Widget = {}
+
+      ---@deprecated
+      ---@param n integer
+      function Widget:render(n) end
+      """
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      defs = ["game"]
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param w Widget
+      local function use(w)
+        w:render(1)
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stdout contains "warning[LB0308]"
+    And stdout does not contain "LB0306"
+
   Scenario: a method with no deprecation tag keeps the `:` call site clean
     Given a project with edition "5.4"
     And a file "src/main.lua" containing:

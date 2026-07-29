@@ -342,6 +342,9 @@ impl TypeEnv {
                 lowerer.generics = block_generics(item);
                 file_env.absorb_block(item, &mut lowerer, &root);
             }
+            // Definition files are never inferred, so their carrier-style
+            // member definitions are folded into the class surface here (#39).
+            file_env.absorb_carrier_members(items, &root);
             file_env.collect_global_types(&root);
             // Name-keyed maps merge *first-wins*: definition files are supplied
             // in winner-first order (stdlib base, then project-local defs, then
@@ -793,6 +796,16 @@ impl TypeEnv {
             || !returns.is_empty()
             || !overloads.is_empty()
             || !varargs.is_empty();
+        // The block's use-site tags on their own — `fun(…)` syntax has nowhere
+        // to write them, so a `---@type fun(…)` declaration folds them in
+        // ([`merge_block_tags`], #38).
+        let block_tags = FunctionTy {
+            deprecated,
+            nodiscard,
+            is_async,
+            version: version.clone(),
+            ..FunctionTy::default()
+        };
         if (has_sig_tags || deprecated || nodiscard || is_async || version.is_some())
             && let Some(target) = target
         {
@@ -815,10 +828,57 @@ impl TypeEnv {
             self.attach_function(&params, &returns, &varargs, func, target, lowerer, root);
         }
         if let (Some(types), Some(target)) = (types, target) {
+            self.attach_typed_functions(&types, target, root, &block_tags);
             self.typed_locals.insert(target, types);
             if let Some(span) = type_span {
                 self.typed_local_spans.insert(target, span);
             }
+        }
+    }
+
+    /// Register the callables a `---@type fun(…)` declares on an *assignment*
+    /// under their dotted names (#38).
+    ///
+    /// A dotted call (`M.a(…)`) is argument-checked through the by-name
+    /// callable map — the same map `function M.a() end` and
+    /// `---@param`-annotated `M.a = function() end` register into — so an
+    /// explicit `---@type fun(…)` has to land there too, or the declared
+    /// signature reaches the value but never the call site. `---@type A, B` is
+    /// positional, so each target takes the type in its own slot and a lone
+    /// annotation over `a, b = f, g` declares `a` only.
+    ///
+    /// Restricted to a function-*literal* right-hand side: `---@type fun(…)`
+    /// over a call result or a name declares that variable's type without
+    /// defining a callable here, and inference already carries it.
+    fn attach_typed_functions(
+        &mut self,
+        types: &[Ty],
+        target: Target,
+        root: &SyntaxNode,
+        block_tags: &FunctionTy,
+    ) {
+        let Some(Stmt::Assign(assign)) = stmt_at(root, target) else {
+            return;
+        };
+        let Some(target_list) = assign.targets() else {
+            return;
+        };
+        let values: Vec<Expr> = assign
+            .values()
+            .map(|v| v.exprs().collect())
+            .unwrap_or_default();
+        for (i, assigned) in target_list.exprs().enumerate() {
+            let Some(Ty::Function(sig)) = types.get(i) else {
+                continue;
+            };
+            if !matches!(values.get(i), Some(Expr::Function(_))) {
+                continue;
+            }
+            let Some(name) = assign_target_name(&assigned) else {
+                continue;
+            };
+            self.functions
+                .insert(name, merge_block_tags((**sig).clone(), Some(block_tags)));
         }
     }
 
@@ -840,24 +900,7 @@ impl TypeEnv {
         items: &[luacats::AnnotatedItem],
         root: &SyntaxNode,
     ) {
-        let mut var_to_class: HashMap<String, String> = HashMap::new();
-        for item in items {
-            for tag in &item.block.tags {
-                let Tag::Class(c) = tag else { continue };
-                if c.name.is_empty() {
-                    continue;
-                }
-                // The class name is itself a valid carrier reference
-                // (`function Animal:m()` where `Animal` is the class).
-                var_to_class.insert(c.name.clone(), c.name.clone());
-                if let Some(span) = item.target
-                    && let Some(name) =
-                        stmt_at(root, (span.start, span.end)).and_then(|s| carrier_var_name(&s))
-                {
-                    var_to_class.insert(name, c.name.clone());
-                }
-            }
-        }
+        let var_to_class = carrier_var_classes(items, root);
 
         for item in items {
             // A block documenting a class is not a member visibility block.
@@ -879,6 +922,70 @@ impl TypeEnv {
             };
             if let Some(def) = self.classes.get_mut(class) {
                 def.visibility.insert(member, scope);
+            }
+        }
+    }
+
+    /// Fold carrier-style member definitions — `function Class:method(…)` and
+    /// `function Class.fn(…)` — into their class's surface (#39).
+    ///
+    /// A checked *project* file gets this for free: inference walks the carrier
+    /// table and [`FileTypes::collect`] folds the reified shape into the class.
+    /// A `---@meta` definition file is never inferred (it declares, it does not
+    /// compute), so a carrier attachment there previously reached nothing and
+    /// every use site reported `LB0306`. luals makes no such distinction — a
+    /// `function Class:method()` in a library file is a member of `Class`
+    /// wherever it is written — so the same attachments are harvested
+    /// syntactically here, tags and all.
+    ///
+    /// The `---@field` declaration stays authoritative on collision, with the
+    /// attachment's use-site tags folded in exactly as [`with_carrier_tags`]
+    /// does elsewhere (#33). An attachment with no doc block at all still joins
+    /// the surface, at a fully permissive signature — its member *exists*, and
+    /// an unannotated function is never arity-checked.
+    fn absorb_carrier_members(&mut self, items: &[luacats::AnnotatedItem], root: &SyntaxNode) {
+        let var_to_class = carrier_var_classes(items, root);
+        if var_to_class.is_empty() {
+            return;
+        }
+        for node in root.descendants() {
+            let Some(Stmt::FunctionDecl(decl)) = Stmt::cast(node.clone()) else {
+                continue;
+            };
+            let Some(name) = decl.name() else { continue };
+            let segments: Vec<String> = name.segments().map(|s| s.text().to_string()).collect();
+            // One hop only: `function C.a.b()` attaches to the member table
+            // `C.a`, not to `C` — this harvest models class members, not
+            // nested tables. It is not dropped, though: a dotted declaration
+            // is also registered by its full name (`resolve_callable_target`),
+            // which is how the stdlib's `function io.open()` is reached.
+            let [carrier, member] = segments.as_slice() else {
+                continue;
+            };
+            let Some(class) = var_to_class.get(carrier).cloned() else {
+                continue;
+            };
+            let r = node.text_range();
+            let sig = self
+                .fn_sigs
+                .get(&(usize::from(r.start()), usize::from(r.end())))
+                .cloned()
+                .unwrap_or_else(FunctionTy::opaque);
+            let attached = FieldTy {
+                ty: Ty::Function(Box::new(sig)),
+                optional: false,
+            };
+            let Some(def) = self.classes.get_mut(&class) else {
+                continue;
+            };
+            match def.fields.get(member) {
+                Some(declared) => {
+                    let merged = with_carrier_tags(declared, &attached);
+                    def.fields.insert(member.clone(), merged);
+                }
+                None => {
+                    def.methods.insert(member.clone(), attached);
+                }
             }
         }
     }
@@ -1260,6 +1367,40 @@ fn resolve_callable_target(stmt: &Stmt) -> Option<(Option<String>, Option<lua::a
                 f.param_list(),
             ))
         }
+        // `Carrier.m = function(…) end` / `g = function(…) end` — the
+        // assignment spelling of a function definition. luals binds a doc
+        // block's `---@param`/`---@return`/`---@deprecated` to the function
+        // value on the right of a `setfield`/`setglobal` exactly as it does
+        // for `function Carrier.m()`, so the same signature attaches here
+        // (#38). Single-target only, matching [`visibility_carrier_member`]:
+        // `a, b = f, g` has no single function to attach to.
+        Stmt::Assign(assign) => {
+            let target_list = assign.targets()?;
+            let mut targets = target_list.exprs();
+            let target = targets.next()?;
+            if targets.next().is_some() {
+                return None;
+            }
+            let Some(Expr::Function(f)) = assign.values().and_then(|v| v.exprs().next()) else {
+                return None;
+            };
+            Some((assign_target_name(&target), f.param_list()))
+        }
+        _ => None,
+    }
+}
+
+/// The dotted name an assignment target registers a function under —
+/// `f` for `f = …`, `M.helper` for `M.helper = …`. `None` for a computed
+/// (`t[k]`) or otherwise unnameable target, which attaches a signature to the
+/// statement without publishing a by-name callable.
+fn assign_target_name(target: &Expr) -> Option<String> {
+    match target {
+        Expr::Name(name) => Some(name.name()?.text().to_string()),
+        Expr::Field(field) => {
+            let base = assign_target_name(&field.base()?)?;
+            Some(format!("{base}.{}", field.field_name()?.text()))
+        }
         _ => None,
     }
 }
@@ -1469,9 +1610,39 @@ fn standalone_scope(tag: &Tag) -> Option<FieldScope> {
     }
 }
 
-/// The variable a `---@class` carrier statement binds, so a method attached to
-/// it (`function M:m()`) can be mapped back to the class (#115): the first name
-/// of a `local M = {}`, or the sole `Name` target of an `M = {}` assignment.
+/// Map every variable that carries a `---@class` to that class's name, so a
+/// method attached to it (`function M:m()`) can be traced back to the class.
+///
+/// The carrier *variable* need not share the class name (`---@class Animal`
+/// over `local M = {}`), and the class name is itself a valid carrier
+/// reference (`function Animal:m()`), so both spellings are entered. Shared by
+/// the standalone-visibility pass (#115) and the defs carrier-member fold
+/// (#39).
+fn carrier_var_classes(
+    items: &[luacats::AnnotatedItem],
+    root: &SyntaxNode,
+) -> HashMap<String, String> {
+    let mut var_to_class: HashMap<String, String> = HashMap::new();
+    for item in items {
+        for tag in &item.block.tags {
+            let Tag::Class(c) = tag else { continue };
+            if c.name.is_empty() {
+                continue;
+            }
+            var_to_class.insert(c.name.clone(), c.name.clone());
+            if let Some(span) = item.target
+                && let Some(name) =
+                    stmt_at(root, (span.start, span.end)).and_then(|s| carrier_var_name(&s))
+            {
+                var_to_class.insert(name, c.name.clone());
+            }
+        }
+    }
+    var_to_class
+}
+
+/// The variable a `---@class` carrier statement binds: the first name of a
+/// `local M = {}`, or the sole `Name` target of an `M = {}` assignment.
 fn carrier_var_name(stmt: &Stmt) -> Option<String> {
     match stmt {
         Stmt::Local(local) => Some(local.names().next()?.name()?.text().to_string()),
@@ -1582,6 +1753,28 @@ fn is_table_constructor(assign: &lua::ast::AssignStmt) -> bool {
         assign.values().and_then(|v| v.exprs().next()),
         Some(Expr::Table(_))
     )
+}
+
+/// Fold a doc block's use-site tags onto the signature its `---@type fun(…)`
+/// declares.
+///
+/// `---@deprecated`, `---@async`, `---@nodiscard` and `---@version` attach to
+/// the whole block, and `fun(…)` syntax has nowhere to write them, so a block
+/// carrying both an explicit `---@type` and a tag would otherwise publish the
+/// declared shape with the tags stripped (#38). The declared signature stays
+/// authoritative for everything it *can* express — parameters, returns,
+/// overloads and generics.
+pub(crate) fn merge_block_tags(mut declared: FunctionTy, block: Option<&FunctionTy>) -> FunctionTy {
+    let Some(block) = block else {
+        return declared;
+    };
+    declared.deprecated |= block.deprecated;
+    declared.is_async |= block.is_async;
+    declared.nodiscard |= block.nodiscard;
+    if declared.version.is_none() {
+        declared.version.clone_from(&block.version);
+    }
+    declared
 }
 
 /// A declared `---@field` that shadows a same-class carrier attachment, with

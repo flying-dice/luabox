@@ -32,7 +32,9 @@ parsed-but-ignored: `---@class` (incl. `: Parent` conformance), `---@field`
 (incl. `duplicate-doc-field`), `---@param`, `---@return`, `---@type`,
 `---@alias` (same-file, defs, and cross-file by name, incl.
 `duplicate-doc-alias`), `---@generic`, `---@enum`, `---@overload`, `---@cast`,
-`---@meta`, `---@deprecated` (use sites diagnosed, luals `deprecated`),
+`---@meta` (a definition file's `---@field` declarations *and* its
+carrier-style `function Class:method()` definitions both join the class
+surface), `---@deprecated` (use sites diagnosed, luals `deprecated`),
 `---@nodiscard` (discarded returns diagnosed, luals `discard-returns`),
 `---@operator` (overload result types applied during inference, luals parity),
 `---@private` / `---@protected` / `---@package` (member visibility enforced,
@@ -70,9 +72,25 @@ flags a `---@deprecated` method at the call site (#118), the same as a
 dotted/free call. Resolution is deliberately conservative: when the receiver is
 not a single declared class — an unknown/`any`/union receiver, a plain inferred
 table, an unannotated method, or an unresolved metatable — the `:` call is left
-unchecked (no false positives). A `---@deprecated` class used purely as a type
-annotation (not through a value use site) is not flagged — deliberate luals
-parity; its `deprecated` diagnostic also fires only on value/call use sites.
+*argument*-unchecked (no false positives). The callee's own use-site tags carry
+no such risk, so `---@deprecated`/`---@async`/`---@version` on a
+`function Class:method()` reach `obj:method()` for **every** resolved receiver
+(#33) — including a plain prototype with no `---@class`, a method that is both
+`---@field`-declared and defined, a `---@class` carrier with no
+`C.__index = C` link (luals folds carrier attachments into the class off the
+carrier binding, with no metatable reasoning), and a carrier-style member
+defined in a `---@meta` defs file (#39). A `---@deprecated` class used purely
+as a type annotation (not through a value use site) is not flagged —
+deliberate luals parity; its `deprecated` diagnostic also fires only on
+value/call use sites.
+
+Two boundaries here are real and deliberate. A receiver that cannot resolve to
+a single declared class at all — an `any`/unknown parameter, a union, a table
+built behind an unresolved metatable — surfaces nothing: the method it names is
+not known, so there are no tags to report. And a *dotted* call reached through a
+value expression (`w.helper(…)` where `w` is an instance) is not
+argument-checked; dotted callees resolve by name, so only `M.helper(…)` on the
+module table itself is. Both cost false negatives, never false positives.
 
 Every operator luals supports applies. Binary/unary operator *expressions*
 (`add`, `sub`, `mul`, `div`, `mod`, `pow`, `idiv`, `concat`, `band`, `bor`,
@@ -123,13 +141,27 @@ callback's parameters from the callback type). Two positions are covered:
   bad field read (`w.nofield`) is flagged (`LB0306`) and misusing `w` where a
   concrete type is expected behaves as if `w` had that type; and
 - **`---@type` assignment** — `---@type fun(x: number): number` on a
-  `local f = function(x) ... end` types `x` as `number`.
+  `local f = function(x) ... end` types `x` as `number`, and equally on the
+  assignment spelling, `M.f = function(x) ... end` (#38).
 
 Conservative by construction: with no expected function type — an unannotated
 callee/target, an `unknown`/`any` expected type, or a non-function expected type
 — the parameters stay `unknown` exactly as before and no new diagnostic arises.
 An explicit `---@param`/inline annotation on the lambda's parameter wins over
 the contextual type (annotations are authoritative, SPEC §3).
+
+On an assignment the `---@type` is authoritative for the *value* as well, not
+just for the literal's parameters: it supplies the signature call sites are
+checked against, and the block's use-site tags
+(`---@deprecated`/`---@async`/`---@nodiscard`/`---@version`), which `fun(...)`
+syntax has nowhere to write, ride along with it (#38). `---@type A, B` is
+positional exactly as on a `local`, so a lone annotation over `a, b = f, g`
+declares `a` only, and `b` keeps its inferred type. A declared signature that
+disagrees with the literal's own parameter list — extra or missing parameters —
+is **not** diagnosed: luals has no such rule (`---@type` simply covers the
+value's type), so the declaration governs and luabox stays silent. A `---@type`
+over anything other than a function literal on an assignment is unchanged;
+that slot's enforcement lives on the `---@type` local path.
 
 The expected type now also propagates *into* literals and through nested
 layers, matching luals (`script/vm/compiler.lua`, which lazily compiles a node
