@@ -1,8 +1,11 @@
 ---
-column: todo
+column: doing
 labels: [release]
 priority: high
-updatedAt: 2026-07-29T05:20:00.000Z
+agent: claude
+live: true
+status: raising the MR
+updatedAt: 2026-07-29T16:09:00.000Z
 ---
 # Raise the develop → main MR (#43)
 
