@@ -237,7 +237,7 @@ enum Command {
 /// is bounded by the parser (`MAX_DEPTH`), so the budget is a constant of the
 /// design, not of whichever platform or dependency default happens to apply:
 /// the platform main thread is 8 MiB on Linux/macOS but 1 MiB under MSVC
-/// (which a 195-deep source overflowed: STATUS_STACK_OVERFLOW), and an
+/// (which a 195-deep source overflowed: `STATUS_STACK_OVERFLOW`), and an
 /// unconfigured rayon pool hands workers Rust's 2 MiB default — an inherited
 /// margin, not a chosen one.
 const PINNED_STACK_BYTES: usize = 16 * 1024 * 1024;
