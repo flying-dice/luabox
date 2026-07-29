@@ -137,43 +137,98 @@ impl RockSurfaces {
     }
 }
 
-/// Harvest the annotation surfaces of `sources` against `ambient` (the dialect
-/// stdlib plus any explicit `[types] defs`, which is what a rock's own
-/// annotations resolve against).
+/// What one rock source contributes — or why it contributes nothing.
 ///
-/// Order is precedence: `sources` is consumed in the caller's order (the
-/// path-sorted order `luabox_manifest::layout::collect_rock_sources` produces)
-/// and the first file to claim a module name keeps it.
+/// Deriving this is a pure function of the file ([`harvest_file`]); *ordering*
+/// the results is what fixes precedence ([`RockSurfaces::fold`]). Split so a
+/// caller with a thread pool can parallelize the expensive half without
+/// re-implementing — and drifting from — the skip rules.
+#[derive(Debug)]
+pub enum RockFile {
+    /// No LuaCATS annotation anywhere: skipped before parsing (module docs).
+    Unannotated,
+    /// Annotated but did not parse: skipped whole, worth a debug-level note.
+    Unparseable,
+    /// The file's harvested surface.
+    Surface {
+        /// The type a `require` of this file evaluates to, if it returns one.
+        export: Option<Ty>,
+        /// The class/enum/alias declarations it makes.
+        types: FileTypes,
+    },
+}
+
+/// Reduce ONE rock source to its contribution, against `ambient` (the dialect
+/// stdlib plus any explicit `[types] defs` — what a rock's own annotations
+/// resolve against).
 ///
-/// Nothing here can fail and nothing here can diagnose — see the module docs.
+/// Nothing here can fail and nothing here can diagnose: the surface pass
+/// returns a surface, and its diagnostics do not exist to be dropped.
+#[must_use]
+pub fn harvest_file(ambient: &Ambient, source: &RockModule) -> RockFile {
+    if !source.text.contains(ANNOTATION_MARKER) {
+        return RockFile::Unannotated;
+    }
+    let parse = lua::parse(&source.text, HARVEST_DIALECT);
+    if !parse.errors().is_empty() {
+        // A recovered tree is a guess at the file's structure, and a guessed
+        // surface is worse than no surface.
+        return RockFile::Unparseable;
+    }
+    let artifacts = FileArtifacts::new(&parse);
+    let surface = module_surface_with_artifacts(&parse, &source.label, Some(ambient), &artifacts);
+    RockFile::Surface {
+        export: surface.export,
+        types: surface.types,
+    }
+}
+
+impl RockSurfaces {
+    /// Fold per-file results back into one surface set, in the caller's order.
+    ///
+    /// **Order is precedence**: `sources` arrives in the path-sorted order
+    /// `luabox_manifest::layout::collect_rock_sources` produces, and the first
+    /// file to claim a module name keeps it. `files` must be `sources`' results
+    /// in the same order — a shorter or reordered `files` would only mis-rank
+    /// the surfaces, never panic.
+    #[must_use]
+    pub fn fold(sources: &[RockModule], files: Vec<RockFile>) -> RockSurfaces {
+        let mut out = RockSurfaces::default();
+        for (source, file) in sources.iter().zip(files) {
+            match file {
+                RockFile::Unannotated => {}
+                RockFile::Unparseable => out.skipped.push(source.label.clone()),
+                RockFile::Surface { export, types } => {
+                    if let Some(export) = export {
+                        out.by_module
+                            .entry(source.module.clone())
+                            .or_insert_with(|| export.clone());
+                        out.by_path.push((source.path.clone(), export));
+                    }
+                    if !types.is_empty() {
+                        out.types.push(types);
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Harvest the annotation surfaces of `sources` against `ambient`, sequentially
+/// — [`harvest_file`] over each, folded by [`RockSurfaces::fold`].
+///
+/// The convenience form, for a caller with no thread pool (the LSP, which pays
+/// this once at startup). `luabox check` runs the same two halves with its
+/// existing rayon pool between them, and gets the identical result: the fold is
+/// what orders the surfaces, not the order they were computed in.
 #[must_use]
 pub fn harvest(ambient: &Ambient, sources: &[RockModule]) -> RockSurfaces {
-    let mut out = RockSurfaces::default();
-    for source in sources {
-        if !source.text.contains(ANNOTATION_MARKER) {
-            continue;
-        }
-        let parse = lua::parse(&source.text, HARVEST_DIALECT);
-        if !parse.errors().is_empty() {
-            // A recovered tree is a guess at the file's structure, and a
-            // guessed surface is worse than no surface. Note and move on.
-            out.skipped.push(source.label.clone());
-            continue;
-        }
-        let artifacts = FileArtifacts::new(&parse);
-        let surface =
-            module_surface_with_artifacts(&parse, &source.label, Some(ambient), &artifacts);
-        if let Some(export) = surface.export {
-            out.by_module
-                .entry(source.module.clone())
-                .or_insert_with(|| export.clone());
-            out.by_path.push((source.path.clone(), export));
-        }
-        if !surface.types.is_empty() {
-            out.types.push(surface.types);
-        }
-    }
-    out
+    let files = sources
+        .iter()
+        .map(|source| harvest_file(ambient, source))
+        .collect();
+    RockSurfaces::fold(sources, files)
 }
 
 #[cfg(test)]
@@ -299,6 +354,38 @@ return M
         assert!(surfaces.by_path().is_empty());
         assert_eq!(surfaces.types().len(), 1);
         assert!(!surfaces.is_empty());
+    }
+
+    #[test]
+    fn folding_out_of_order_results_never_panics() {
+        // `fold` zips, so a caller that hands back fewer results than sources
+        // (a truncated parallel collect) mis-ranks surfaces at worst.
+        let sources = [rock("a", ANNOTATED), rock("b", ANNOTATED)];
+        let folded = RockSurfaces::fold(&sources, vec![RockFile::Unannotated]);
+        assert!(folded.is_empty());
+    }
+
+    #[test]
+    fn the_sequential_and_split_forms_agree() {
+        let sources = [
+            rock("mylib", ANNOTATED),
+            rock("plain", "return {}\n"),
+            rock("broken", "---@class B\nlocal = = =\n"),
+        ];
+        let sequential = harvest_of(&sources);
+        let split = RockSurfaces::fold(
+            &sources,
+            sources
+                .iter()
+                .map(|s| harvest_file(stdlib_defs(Dialect::Lua54), s))
+                .collect(),
+        );
+        assert_eq!(
+            sequential.by_module().keys().collect::<Vec<_>>(),
+            split.by_module().keys().collect::<Vec<_>>()
+        );
+        assert_eq!(sequential.types().len(), split.types().len());
+        assert_eq!(sequential.skipped(), split.skipped());
     }
 
     #[test]

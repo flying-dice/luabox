@@ -77,7 +77,7 @@ pub use defs::{
 };
 pub use env::{FileTypes, TypeEnv};
 pub use infer::{ExternalTypes, InferredBinding, InferredReturn};
-pub use rocks::{RockModule, RockSurfaces};
+pub use rocks::{RockFile, RockModule, RockSurfaces};
 pub use version::VersionReq;
 
 use std::collections::HashMap;

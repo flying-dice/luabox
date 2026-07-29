@@ -414,7 +414,16 @@ fn harvest_rocks(project: &Project, ambient: &Ambient) -> luabox_types::RockSurf
                 text: source.text,
             })
             .collect();
-    luabox_types::rocks::harvest(ambient, &sources)
+    // Per-file reduction is pure and independent, so it rides the same rayon
+    // pool the source set does — a fully annotated 100-kLOC rock tree is
+    // otherwise the largest single cost in a run. The fold is what orders the
+    // surfaces (path order = precedence), so the parallel and sequential forms
+    // give the identical result.
+    let files: Vec<luabox_types::RockFile> = sources
+        .par_iter()
+        .map(|source| luabox_types::rocks::harvest_file(ambient, source))
+        .collect();
+    luabox_types::RockSurfaces::fold(&sources, files)
 }
 
 /// Canonicalize a path for identity comparison against

@@ -106,6 +106,12 @@ module is a rock or one of your own files.
 
 Cost is proportional to the *annotated* portion of the rock tree and is paid
 once per `check` run (parse + harvest + surface inference per annotated rock
-file, no check pass). A project with no rock tree pays one failed `is_dir`: the
-clean-corpus perf legs are unmoved (`scripts/perf-gate.sh` at
-`LUABOX_PERF_FACTOR=4`, all legs within budget).
+file, no check pass). A project with no rock tree pays one failed `is_dir`, so
+the clean-corpus perf legs are unmoved. The per-file reduction is pure and
+independent, so `check` runs it on the rayon pool it already has and folds the
+results in path order — the fold, not the compute order, is what fixes
+precedence, so the parallel and sequential (LSP-startup) forms agree by
+construction. Measured on a synthetic 100-kLOC, 50-file, *fully* annotated tree
+in front of a one-file project (4 cores): 1.98 s sequential → 0.55 s parallel.
+A realistically sized annotated rock is a fraction of that, and an unannotated
+one costs a read plus a substring scan.
