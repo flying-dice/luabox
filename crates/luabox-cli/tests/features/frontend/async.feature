@@ -168,3 +168,84 @@ Feature: luabox check — `---@async` and await-in-sync (LB0316)
     When I run "luabox check"
     Then the command succeeds
     And stdout does not contain "LB0316"
+
+  Scenario: a `---@class` carrier with no `__index` link still carries `---@async` (#33)
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Plain
+      local Plain = {}
+
+      ---@async
+      function Plain:fetch() end
+
+      ---@type Plain
+      local p
+      local function sync()
+        p:fetch()
+      end
+      return sync
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stdout contains "LB0316"
+    And stdout contains "call to async `fetch` in a non-async function"
+    And stdout does not contain "LB0306"
+
+  Scenario: a `---@type fun(...)` assignment carries `---@async` to a `:` call site (#38)
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Cls
+      local Cls = {}
+
+      ---@async
+      ---@type fun(self: Cls)
+      Cls.fetch = function(self) end
+
+      ---@type Cls
+      local o
+      local function sync()
+        o:fetch()
+      end
+      return sync
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stdout contains "LB0316"
+    And stdout contains "call to async `fetch` in a non-async function"
+
+  Scenario: a carrier-style method in a defs file carries `---@async` to its use site (#39)
+    Given a file "defs/game.d.lua" containing:
+      """
+      ---@meta
+
+      ---@class Widget
+      local Widget = {}
+
+      ---@async
+      function Widget:render() end
+      """
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      defs = ["game"]
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param w Widget
+      local function use(w)
+        w:render()
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stdout contains "LB0316"
+    And stdout does not contain "LB0306"

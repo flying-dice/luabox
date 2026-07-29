@@ -178,3 +178,42 @@ Feature: luabox lsp — published diagnostics
     When I open "main.lua"
     Then the server logged nothing containing "unknown lint rule id"
     And the diagnostics for "main.lua" do not include LB0501
+
+  Scenario: a carrier-style method in a defs file resolves in the editor too (#39)
+    # Diagnostics flow through the same seam as `luabox check`, so the defs
+    # surface an editor sees is the surface the CLI checks: no phantom
+    # `undefined field`, and the method's own tag still publishes.
+    Given a file "defs/game.d.lua" containing:
+      """
+      ---@meta
+
+      ---@class Widget
+      local Widget = {}
+
+      ---@deprecated
+      ---@param n integer
+      function Widget:render(n) end
+      """
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      defs = ["game"]
+      """
+    And a file "main.lua" containing:
+      """
+      ---@param w Widget
+      local function use(w)
+        w:render(1)
+      end
+      return use
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the diagnostics for "main.lua" do not include LB0306
+    And the diagnostics for "main.lua" include LB0308
