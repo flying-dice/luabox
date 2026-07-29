@@ -1,11 +1,8 @@
 ---
-column: doing
+column: done
 labels: [wave, docs]
 priority: high
-agent: opus-13c
-live: true
-status: launching
-updatedAt: 2026-07-29T23:25:00.000Z
+updatedAt: 2026-07-29T23:27:00.000Z
 ---
 # Wave 13c — cross-package types from a bare luarocks tree (#30)
 
@@ -18,3 +15,4 @@ Owner pre-release burn-down; queued behind 13b (shared crates). Design decision 
 - **opus-13c** (2026-07-29T23:25:00.000Z): **Verification.** `cargo test --workspace` 61 suites / 2332 passed / 0 failed; acceptance 813 scenarios (4388 steps), lsp_acceptance 193 scenarios (1399 steps), all passing — 9 new scenarios (6 in `crates/luabox-cli/tests/features/frontend/luarocks-tree.feature`, 3 in `features/lsp/diagnostics.feature`) plus 9 new integration tests on `crates/luabox-cli/tests/cross_package_defs.rs:349` onward. clippy `-D warnings` exit 0, fmt exit 0 (both checked by exit code, not through a pipe). Coverage: aggregate unit 95.56% (floor 95), per-crate min luabox-cli 93.05% (floor 92), e2e 85.14% (floor 83); touched crates luabox-types 96.89 (rocks.rs 99.07), luabox-manifest 96.83, luabox-lsp 97.41, luabox-bundle 96.59. Perf gate at `LUABOX_PERF_FACTOR=2`: all 8 legs pass — cold start 4 ms, fmt 242, check 1131, RSS 123 MiB, lint-heavy 420, check-heavy 978, rendered 197/945; the clean corpus has no rock tree so the harvest costs it one failed `is_dir`.
 - **opus-13c** (2026-07-29T23:25:00.000Z): **Perf finding, fixed mid-wave.** A synthetic 100-kLOC / 50-file *fully annotated* rock tree in front of a one-file project cost 1.98 s per `check` — the harvest was sequential while the source set was already on rayon. Split `harvest` into a pure per-file half (`rocks::harvest_file`) and an ordering fold (`RockSurfaces::fold`), so `check` parallelizes the expensive half and the fold alone fixes precedence; the LSP keeps the sequential convenience form for its one startup pass, and a test pins that the two agree. 1.98 s → 0.55 s on 4 cores. Realistic annotated rocks are a fraction of that; unannotated ones cost a read plus a substring scan.
 - **opus-13c** (2026-07-29T23:25:00.000Z): **Honest limits, now written into the docs rather than left implicit** (README "Using dependencies", docs/03-reference/02-limitations.md:239, spec §3 and §5): an unannotated rock harvests to nothing; a library whose API is a *global* (LÖVE-style) still wants a defs package, because the harvest contributes declarations and export types but not ambient globals; and **argument checking at a rock function's call site does not happen** — `m.f("wrong")` after `local m = require("rock")` is unchecked. That last one is a **pre-existing checker gap for calls through any table or class field, project modules included** (verified against a plain project module and against an explicitly `---@type`-annotated receiver, both silent), not something the harvest introduced or could fix here — a def-declared global API like `geometry.point(…)` still *is* param-checked because it resolves as a dotted ambient function. Worth its own ticket. The rock's `---@return` types do flow, so misusing the result is caught, which is what the acceptance scenarios assert.
+- **claude** (2026-07-29T23:27:00.000Z): Merged to develop (eba79de); post-merge spot-check green (813/813 acceptance, cross_package_defs 17/17 incl. the silent path-order collision test, clippy/fmt clean). Design recorded as decisions/09. The pre-existing call-through-field arg-checking gap 13c uncovered is now issue #46.
