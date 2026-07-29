@@ -40,6 +40,16 @@ on:
   push:
     tags:
       - "v*"
+  # Escape hatch for environments whose git credentials cannot push tag refs
+  # (e.g. a branch-scoped proxy): dispatching with `tag` runs the identical
+  # pipeline, and `gh release create` mints the tag server-side at the
+  # dispatched commit — which must be the release commit on main.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to cut (e.g. v0.2.0)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -64,7 +74,7 @@ jobs:
       contents: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
       - name: Extract release notes from CHANGELOG.md
@@ -114,6 +124,7 @@ jobs:
               ;;
             *)
               gh release create "$TAG" \
+                --target "$GITHUB_SHA" \
                 --title "luabox $TAG" \
                 --notes-file release-notes.md \
                 --draft=true \
@@ -188,7 +199,7 @@ jobs:
       contents: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -262,7 +273,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       LUABOX_DRAFT_INSTALL: "1"
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ inputs.tag || github.ref_name }}
       # Match ci.yml: a warning in the test harness is a build failure.
       RUSTFLAGS: -Dwarnings
     steps:
@@ -471,7 +482,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # No checkout in this job, so tell gh which repo to act on.
       GH_REPO: ${{ github.repository }}
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       # Gate 1 — asset-completeness. Fetch the release's ACTUAL asset list and
       # assert exactly the expected set is present. Failure mode: `build` uses
@@ -577,7 +588,7 @@ jobs:
         if: matrix.shell == 'bash'
         shell: bash
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -627,7 +638,7 @@ jobs:
         if: matrix.shell == 'pwsh'
         shell: pwsh
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
           REPO: ${{ github.repository }}
         run: |
           $ErrorActionPreference = "Stop"
