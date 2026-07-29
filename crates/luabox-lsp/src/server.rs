@@ -17,6 +17,16 @@
 //!   currently a `[lint]` key naming no known rule id — have no URI to hang a
 //!   diagnostic on and go to the client's log pane via `window/logMessage`
 //!   (see [`Server::log_lint_config_problems`]).
+//! - **Malformed input is not fatal**: a message whose params do not fit the
+//!   method's schema — a hover with no `position`, a `didOpen` carrying a
+//!   `file://` URI with an unencoded space (clients do send these; the URI
+//!   grammar rejects them) — is a *client* bug, and taking the editor's
+//!   language server down over one is the worst possible response. A
+//!   **request** is answered with `-32602 InvalidParams` naming the method and
+//!   the deserialization failure (see [`cast_request`]); a **notification**,
+//!   which has nobody to answer, is logged and dropped (see
+//!   [`Server::notification_params`]). Only genuine transport failures — a
+//!   closed stdin, a dead [`Connection`] — end the loop.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -24,10 +34,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
+use lsp_server::{
+    Connection, ErrorCode, ExtractError, Message, Notification, Request, RequestId, Response,
+};
 use lsp_types::notification::{
     DidChangeConfiguration, DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument,
-    DidOpenTextDocument, LogMessage, Notification as _, Progress, PublishDiagnostics,
+    DidOpenTextDocument, Exit, LogMessage, Notification as _, Progress, PublishDiagnostics,
 };
 use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
@@ -41,21 +53,19 @@ use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyItem, CallHierarchyOutgoingCall,
     CallHierarchyServerCapability, CodeAction, CodeActionKind, CodeActionOrCommand,
     CodeActionProviderCapability, CompletionOptions, CompletionResponse,
-    DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
-    DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentHighlight, DocumentSymbolResponse, FileChangeType,
-    FileSystemWatcher, FoldingRange, FoldingRangeProviderCapability, GlobPattern,
-    GotoDefinitionResponse, Hover, HoverProviderCapability, ImplementationProviderCapability,
-    InitializeParams, InitializeResult, InlayHint, Location, LogMessageParams, MessageType, OneOf,
-    PrepareRenameResponse, ProgressParams, ProgressParamsValue, ProgressToken,
-    PublishDiagnosticsParams, Registration, RegistrationParams, RenameOptions, SelectionRange,
-    SelectionRangeProviderCapability, SemanticTokens, SemanticTokensFullOptions,
-    SemanticTokensOptions, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, ServerInfo, SignatureHelp, SignatureHelpOptions, SymbolInformation,
-    TextDocumentContentChangeEvent, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit,
-    TypeDefinitionProviderCapability, Uri, WorkDoneProgress, WorkDoneProgressBegin,
-    WorkDoneProgressCreateParams, WorkDoneProgressEnd, WorkDoneProgressReport, WorkspaceEdit,
-    WorkspaceSymbolResponse,
+    DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions, DocumentHighlight,
+    DocumentSymbolResponse, FileChangeType, FileSystemWatcher, FoldingRange,
+    FoldingRangeProviderCapability, GlobPattern, GotoDefinitionResponse, Hover,
+    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
+    InlayHint, Location, LogMessageParams, MessageType, OneOf, PrepareRenameResponse,
+    ProgressParams, ProgressParamsValue, ProgressToken, PublishDiagnosticsParams, Registration,
+    RegistrationParams, RenameOptions, SelectionRange, SelectionRangeProviderCapability,
+    SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelp,
+    SignatureHelpOptions, SymbolInformation, TextDocumentContentChangeEvent,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, TypeDefinitionProviderCapability,
+    Uri, WorkDoneProgress, WorkDoneProgressBegin, WorkDoneProgressCreateParams,
+    WorkDoneProgressEnd, WorkDoneProgressReport, WorkspaceEdit, WorkspaceSymbolResponse,
 };
 use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
 use luabox_lint::{LintConfig, UnknownRuleId, lint_source};
@@ -87,7 +97,22 @@ pub fn run_stdio() -> anyhow::Result<()> {
 /// bootstrap, then the message loop. Returns after a clean shutdown.
 pub fn run(connection: Connection) -> anyhow::Result<()> {
     let (id, params) = connection.initialize_start()?;
-    let params: InitializeParams = serde_json::from_value(params)?;
+    // Params the handshake cannot decode (a `rootUri` with an unencoded space
+    // is the realistic one) end the session — there is no workspace to serve —
+    // but the client is told so on the id it is blocked on rather than left
+    // waiting for a pipe that just closed.
+    let params: InitializeParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(err) => {
+            let message = format!("malformed `initialize` request: {err}");
+            let _ = connection.sender.send(Message::Response(Response::new_err(
+                id,
+                ErrorCode::InvalidParams as i32,
+                message.clone(),
+            )));
+            anyhow::bail!(message);
+        }
+    };
     let result = InitializeResult {
         capabilities: server_capabilities(),
         server_info: Some(ServerInfo {
@@ -590,11 +615,30 @@ impl Server {
 
     // === Requests =========================================================
 
+    /// Answer one request. Every path produces a response — a result, a
+    /// `MethodNotFound` for a method outside the advertised set, or the
+    /// `InvalidParams` [`cast_request`] hands back for params that do not
+    /// decode — so the client is never left holding an unanswered id. Only
+    /// the send itself can fail, and a dead transport is fatal by design.
+    fn handle_request(&mut self, req: Request) -> anyhow::Result<()> {
+        let response = self
+            .dispatch(req)
+            .unwrap_or_else(|invalid_params| invalid_params);
+        self.connection.sender.send(Message::Response(response))?;
+        Ok(())
+    }
+
+    /// The per-method dispatch table. `Err` carries a ready-to-send
+    /// `InvalidParams` response rather than a fatal error: [`handle_request`]
+    /// sends either arm, so a malformed request costs the client one error
+    /// reply and costs the session nothing.
+    ///
+    /// [`handle_request`]: Self::handle_request
     #[allow(
         clippy::too_many_lines,
         reason = "a flat per-method dispatch table — one arm per LSP request, each a few lines"
     )]
-    fn handle_request(&mut self, req: Request) -> anyhow::Result<()> {
+    fn dispatch(&mut self, req: Request) -> Result<Response, Response> {
         let response = match req.method.as_str() {
             HoverRequest::METHOD => {
                 let (id, params) = cast_request::<HoverRequest>(req)?;
@@ -739,8 +783,7 @@ impl Server {
                 format!("unhandled method `{}`", req.method),
             ),
         };
-        self.connection.sender.send(Message::Response(response))?;
-        Ok(())
+        Ok(response)
     }
 
     /// The analysis snapshot and semantic view for the document `uri` names,
@@ -1067,10 +1110,39 @@ impl Server {
 
     // === Notifications ====================================================
 
+    /// Decode a notification's params, or log the problem and drop it.
+    ///
+    /// A notification carries no id, so there is nobody to answer and the
+    /// protocol forbids replying to one: the client's log pane is the only
+    /// honest channel, and it is where this file's other "your project is
+    /// misconfigured" complaints already go (see
+    /// [`Self::log_lint_config_problems`]). What must *not* happen is the old
+    /// behaviour — propagating the error out of the message loop, so a
+    /// `didOpen` whose URI held an unencoded space (or whose `languageId` the
+    /// client forgot) ended the editor session.
+    fn notification_params<N: lsp_types::notification::Notification>(
+        &self,
+        params: serde_json::Value,
+    ) -> Option<N::Params> {
+        match serde_json::from_value(params) {
+            Ok(params) => Some(params),
+            Err(err) => {
+                self.log_message(
+                    MessageType::ERROR,
+                    format!("ignoring malformed `{}` notification: {err}", N::METHOD),
+                );
+                None
+            }
+        }
+    }
+
     fn handle_notification(&mut self, not: Notification) -> anyhow::Result<()> {
         match not.method.as_str() {
             DidOpenTextDocument::METHOD => {
-                let params: DidOpenTextDocumentParams = serde_json::from_value(not.params)?;
+                let Some(params) = self.notification_params::<DidOpenTextDocument>(not.params)
+                else {
+                    return Ok(());
+                };
                 let uri = params.text_document.uri;
                 if let Some(path) = uri_to_path(&uri) {
                     self.open_docs.insert(path, uri.clone());
@@ -1078,7 +1150,10 @@ impl Server {
                 self.set_text(&uri, params.text_document.text)?;
             }
             DidChangeTextDocument::METHOD => {
-                let params: DidChangeTextDocumentParams = serde_json::from_value(not.params)?;
+                let Some(params) = self.notification_params::<DidChangeTextDocument>(not.params)
+                else {
+                    return Ok(());
+                };
                 let uri = params.text_document.uri;
                 // Incremental sync: apply each ranged edit in order against the
                 // current overlay/disk text to rebuild the new buffer.
@@ -1090,7 +1165,10 @@ impl Server {
                 self.set_text(&uri, text)?;
             }
             DidCloseTextDocument::METHOD => {
-                let params: DidCloseTextDocumentParams = serde_json::from_value(not.params)?;
+                let Some(params) = self.notification_params::<DidCloseTextDocument>(not.params)
+                else {
+                    return Ok(());
+                };
                 if let Some(path) = uri_to_path(&params.text_document.uri) {
                     self.open_docs.remove(&path);
                 }
@@ -1102,8 +1180,21 @@ impl Server {
                 self.reload_config()?;
             }
             DidChangeWatchedFiles::METHOD => {
-                let params: DidChangeWatchedFilesParams = serde_json::from_value(not.params)?;
+                let Some(params) = self.notification_params::<DidChangeWatchedFiles>(not.params)
+                else {
+                    return Ok(());
+                };
                 self.watched_files_changed(&params)?;
+            }
+            // `exit` only reaches this table when it was *not* preceded by
+            // `shutdown`: the ordered pair is consumed inside
+            // `Connection::handle_shutdown`, which waits for the notification
+            // itself. The spec is explicit about the unordered case — the
+            // server exits with code 1 — and this error is how the CLI
+            // frontend reaches that code (`main` maps any `Err` to
+            // `ExitCode::FAILURE`).
+            Exit::METHOD => {
+                anyhow::bail!("received `exit` without a prior `shutdown`");
             }
             // `textDocument/didSave` is a deliberate no-op — the overlay is
             // already the saved content. Everything else is ignored.
@@ -1265,12 +1356,33 @@ fn apply_content_changes(text: String, changes: Vec<TextDocumentContentChangeEve
     text
 }
 
-/// Extract a request's id and params, or surface a protocol error.
+/// Extract a request's id and params, or the JSON-RPC error response to send
+/// in their place.
+///
+/// The failure is a *client* bug — a hover with no `position`, a line number
+/// sent as a string, a `file://` URI the grammar rejects because a space in it
+/// was never percent-encoded — and the protocol has an answer for exactly
+/// that: `-32602 InvalidParams`, naming the method and what would not decode.
+/// This used to return an `anyhow::Error` that propagated out of the message
+/// loop, so one bad message killed the process and left the request the client
+/// was blocked on unanswered forever.
 fn cast_request<R: lsp_types::request::Request>(
     req: Request,
-) -> anyhow::Result<(RequestId, R::Params)> {
-    req.extract(R::METHOD)
-        .map_err(|e| anyhow::anyhow!("malformed `{}` request: {e:?}", R::METHOD))
+) -> Result<(RequestId, R::Params), Response> {
+    // `extract` consumes the request, so keep the id for the error response.
+    let id = req.id.clone();
+    req.extract(R::METHOD).map_err(|err| {
+        let detail = match err {
+            ExtractError::JsonError { error, .. } => error.to_string(),
+            // Unreachable: the caller dispatches on the method first.
+            ExtractError::MethodMismatch(req) => format!("method mismatch (`{}`)", req.method),
+        };
+        Response::new_err(
+            id,
+            ErrorCode::InvalidParams as i32,
+            format!("malformed `{}` request: {detail}", R::METHOD),
+        )
+    })
 }
 
 /// The cap on [`Server::workspace_symbols`]'s response: generous for any real
@@ -1302,12 +1414,18 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    use lsp_server::{Connection, Message, Notification, Request, RequestId};
+    use lsp_types::notification::{DidOpenTextDocument, Notification as _};
+    use lsp_types::request::{HoverRequest, Request as _};
     use lsp_types::{Position, Range, TextDocumentContentChangeEvent};
     use luabox_lint::LintConfig;
     use luabox_manifest::model::{Lint, LintLevel, LintTier, Manifest};
+    use serde_json::{Value, json};
     use tempfile::TempDir;
 
-    use super::{ProjectConfig, ambient_def_sources, apply_content_changes, root_path};
+    use super::{
+        ErrorCode, ProjectConfig, Server, ambient_def_sources, apply_content_changes, root_path,
+    };
 
     /// A ranged change replacing `[start, end)` with `text`.
     fn edit(start: (u32, u32), end: (u32, u32), text: &str) -> TextDocumentContentChangeEvent {
@@ -1691,5 +1809,218 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let manifest = manifest_of(&format!("{MANIFEST_HEAD}\n[types]\ndefs = [\"absent\"]\n"));
         assert!(ambient_def_sources(dir.path(), &manifest).is_empty());
+    }
+
+    // === Malformed messages ===============================================
+    //
+    // The server is spoken to by editors, and editors send nonsense: params
+    // that predate a protocol revision, a URI whose spaces were never
+    // percent-encoded, a `null` where an object belongs. None of it may end
+    // the session. These drive `Server`'s two entry points directly over an
+    // in-memory connection, so the assertions are about the *messages the
+    // client would see*, not about a process that happens to still be alive.
+
+    /// A server on an in-memory connection over an empty project, plus the
+    /// client end of the wire and the tempdir that must outlive both.
+    fn test_server() -> (TempDir, Server, Connection) {
+        let dir = TempDir::new().expect("tempdir");
+        let (server_end, client) = Connection::memory();
+        let server = Server::new(server_end, dir.path().to_path_buf());
+        (dir, server, client)
+    }
+
+    /// Everything the client end has received so far.
+    fn drain(client: &Connection) -> Vec<Message> {
+        std::iter::from_fn(|| client.receiver.try_recv().ok()).collect()
+    }
+
+    /// The single response among `messages`.
+    fn sole_response(messages: &[Message]) -> &lsp_server::Response {
+        let mut responses = messages.iter().filter_map(|m| match m {
+            Message::Response(response) => Some(response),
+            _ => None,
+        });
+        let response = responses.next().expect("the server answered the request");
+        assert!(responses.next().is_none(), "exactly one response");
+        response
+    }
+
+    /// A `textDocument/hover` request carrying `params`.
+    fn hover_request(id: i32, params: Value) -> Request {
+        Request {
+            id: RequestId::from(id),
+            method: HoverRequest::METHOD.to_string(),
+            params,
+        }
+    }
+
+    #[test]
+    fn a_request_whose_params_do_not_decode_is_answered_with_invalid_params() {
+        let (_dir, mut server, client) = test_server();
+        // A hover with no `position` at all: `HoverParams` cannot be built
+        // from it, and the client is blocked on id 1 until somebody says so.
+        let request = hover_request(1, json!({ "textDocument": { "uri": "file:///tmp/a.lua" } }));
+        server
+            .handle_request(request)
+            .expect("a malformed request is not a transport failure");
+
+        let messages = drain(&client);
+        let response = sole_response(&messages);
+        assert_eq!(response.id, RequestId::from(1));
+        let error = response.error.as_ref().expect("an error response");
+        assert_eq!(error.code, ErrorCode::InvalidParams as i32);
+        // The message names the method and what would not decode, so the
+        // client's log says which request it got wrong.
+        assert!(
+            error.message.contains("textDocument/hover"),
+            "{}",
+            error.message
+        );
+        assert!(error.message.contains("position"), "{}", error.message);
+    }
+
+    #[test]
+    fn a_uri_with_an_unencoded_space_is_an_invalid_params_reply_not_a_dead_server() {
+        let (_dir, mut server, client) = test_server();
+        // Real clients emit these: the URI path grammar rejects the raw
+        // space, so `Uri`'s deserializer fails before any handler runs.
+        let request = hover_request(
+            7,
+            json!({
+                "textDocument": { "uri": "file:///tmp/a b.lua" },
+                "position": { "line": 0, "character": 0 },
+            }),
+        );
+        server
+            .handle_request(request)
+            .expect("a malformed URI is not a transport failure");
+        let messages = drain(&client);
+        let error = sole_response(&messages)
+            .error
+            .as_ref()
+            .expect("an error response");
+        assert_eq!(error.code, ErrorCode::InvalidParams as i32);
+    }
+
+    #[test]
+    fn a_well_formed_request_is_still_answered_after_a_malformed_one() {
+        let (_dir, mut server, client) = test_server();
+        server
+            .handle_request(hover_request(1, Value::Null))
+            .expect("malformed");
+        // The whole point: the session survives, so the next request lands.
+        server
+            .handle_request(hover_request(
+                2,
+                json!({
+                    "textDocument": { "uri": "file:///tmp/unknown.lua" },
+                    "position": { "line": 0, "character": 0 },
+                }),
+            ))
+            .expect("well-formed");
+
+        let messages = drain(&client);
+        let responses: Vec<_> = messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::Response(response) => Some(response),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert!(responses[0].error.is_some(), "the first is the error");
+        // An unknown document is `null`, not an error — the request was
+        // answerable and got answered.
+        assert!(responses[1].error.is_none(), "{:?}", responses[1].error);
+        assert_eq!(responses[1].id, RequestId::from(2));
+    }
+
+    /// The `window/logMessage` payloads the server has sent.
+    fn log_messages(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::Notification(not) if not.method == super::LogMessage::METHOD => Some(
+                    not.params["message"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_malformed_notification_is_logged_and_dropped() {
+        let (_dir, mut server, client) = test_server();
+        // `languageId` is required by `TextDocumentItem`; a client that omits
+        // it has nothing to be answered with — notifications carry no id — so
+        // the complaint goes to the log pane and the loop carries on.
+        let notification = Notification {
+            method: DidOpenTextDocument::METHOD.to_string(),
+            params: json!({
+                "textDocument": { "uri": "file:///tmp/a.lua", "version": 1, "text": "" },
+            }),
+        };
+        server
+            .handle_notification(notification)
+            .expect("a malformed notification is not fatal");
+
+        let messages = drain(&client);
+        assert!(
+            messages.iter().all(|m| !matches!(m, Message::Response(_))),
+            "a notification is never answered"
+        );
+        let logged = log_messages(&messages);
+        assert!(
+            logged
+                .iter()
+                .any(|m| m.contains("textDocument/didOpen") && m.contains("languageId")),
+            "{logged:?}"
+        );
+    }
+
+    #[test]
+    fn a_did_open_whose_uri_has_an_unencoded_space_is_logged_and_dropped() {
+        let (_dir, mut server, client) = test_server();
+        let notification = Notification {
+            method: DidOpenTextDocument::METHOD.to_string(),
+            params: json!({
+                "textDocument": {
+                    "uri": "file:///tmp/a b.lua",
+                    "languageId": "lua",
+                    "version": 1,
+                    "text": "local x = 1\n",
+                },
+            }),
+        };
+        server
+            .handle_notification(notification)
+            .expect("a malformed URI is not fatal");
+        let logged = log_messages(&drain(&client));
+        assert!(
+            logged.iter().any(|m| m.contains("textDocument/didOpen")),
+            "{logged:?}"
+        );
+    }
+
+    #[test]
+    fn exit_without_a_prior_shutdown_ends_the_loop_with_an_error() {
+        let (_dir, mut server, _client) = test_server();
+        // The ordered `shutdown` → `exit` pair never reaches this table
+        // (`Connection::handle_shutdown` consumes it), so an `exit` here is
+        // the unordered case the spec assigns exit code 1 — which the CLI
+        // reaches by way of this error.
+        let error = server
+            .handle_notification(Notification {
+                method: super::Exit::METHOD.to_string(),
+                params: Value::Null,
+            })
+            .expect_err("`exit` without `shutdown` is an error");
+        assert!(
+            error.to_string().contains("without a prior `shutdown`"),
+            "{error}"
+        );
     }
 }

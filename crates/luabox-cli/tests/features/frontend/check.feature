@@ -406,6 +406,29 @@ Feature: luabox check — annotation-driven typecheck (P0 MVP)
     And stdout contains "check_name"
     And stdout contains "fingerprint"
 
+  # GitLab places a finding on the merge-request diff by
+  # `location.lines.begin` and drops it when that line is not part of the
+  # diff. A report that pins every finding to line 1 therefore parses, looks
+  # plausible, and annotates nothing — so the lines are asserted per finding.
+  Scenario: --format gitlab places each finding on its own source line
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@param n number
+      local function double(n)
+        return n * 2
+      end
+
+      double("nope")
+      double("also nope")
+      """
+    When I run "luabox check --format gitlab"
+    Then the command fails
+    And stdout is valid JSON
+    And the gitlab report places a finding for "src/main.lua" on line 6
+    And the gitlab report places a finding for "src/main.lua" on line 7
+    And no gitlab finding sits on line 1
+
   # `--format` is a closed set clap owns (a `ValueEnum`), so an unknown one is
   # a malformed invocation — exit 2 with the possible values, like every other
   # bad flag value, rather than a hand-rolled message on the command's own

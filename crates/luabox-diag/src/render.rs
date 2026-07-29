@@ -280,7 +280,15 @@ fn gitlab_severity(severity: Severity) -> &'static str {
 }
 
 /// A stable FNV-1a fingerprint over a diagnostic's identity (code + file +
-/// range). Deterministic across runs and Rust versions.
+/// byte range). Deterministic across runs and Rust versions.
+///
+/// The rendered line number is deliberately *not* an input. GitLab keys a
+/// finding's history (first-seen, resolved) by its fingerprint, so anything
+/// that changes when the rendering changes would resurrect every finding in
+/// the project as brand new. The byte range already pins the diagnostic more
+/// precisely than a line does, and it is the same value whatever the renderer
+/// makes of it — including under the pre-fix renderer, which hardcoded line 1
+/// and never fed it here either.
 fn fingerprint(diag: &Diagnostic) -> String {
     let (file, start, end) = diag.primary_label().map_or_else(
         || (String::new(), 0, 0),
@@ -296,17 +304,35 @@ fn fingerprint(diag: &Diagnostic) -> String {
 }
 
 /// GitLab Code Quality report: a JSON array of issues.
+///
+/// `location.lines.begin` is the **real** 1-based line of the diagnostic's
+/// primary label, resolved through `lookup` exactly as [`render_sarif`]
+/// resolves `startLine`. GitLab places a finding on the merge-request diff by
+/// that line and drops it when the line is not part of the diff, so the
+/// hardcoded `1` this used to emit pinned every finding to the top of the file
+/// and made the format non-functional in a pipeline.
+///
+/// Two fallbacks survive, and neither can move a finding that *does* have a
+/// resolvable line:
+///
+/// - a label whose file the lookup cannot supply keeps `begin: 1` — the path
+///   is still named, and the schema requires a `begin`;
+/// - a diagnostic with no label at all has no file either, and reports the
+///   empty path with `begin: 0`.
+///
+/// The [`fingerprint`] is deliberately *not* line-derived (see its docs), so
+/// this correction does not renumber anybody's existing GitLab findings.
 #[must_use]
-pub fn render_gitlab_code_quality(diags: &[Diagnostic], _lookup: SourceLookup<'_>) -> String {
+pub fn render_gitlab_code_quality(diags: &[Diagnostic], lookup: SourceLookup<'_>) -> String {
     let issues: Vec<_> = diags
         .iter()
         .map(|diag| {
             let (path, begin) = diag.primary_label().map_or_else(
                 || (String::new(), 0),
                 |l| {
-                    // GitLab wants a 1-based line, but without source we fall
-                    // back to a byte-offset-derived begin of 1.
-                    (l.span.file.clone(), 1)
+                    let begin = lookup(&l.span.file)
+                        .map_or(1, |source| line_col(&source, l.span.range.start).0);
+                    (l.span.file.clone(), begin)
                 },
             );
             json!({
@@ -428,6 +454,70 @@ mod tests {
         let again = render(&fixture(), Format::GitlabCodeQuality, &lookup);
         let value2: serde_json::Value = serde_json::from_str(&again).unwrap();
         assert_eq!(value2[0]["fingerprint"], value[0]["fingerprint"]);
+        // And the location carries the label's real line, not a placeholder:
+        // the error sits on line 2 of `main.lua`, the warning on line 1 of
+        // `luabox.toml` — the same lines SARIF reports for the same fixture.
+        assert_eq!(value[0]["location"]["path"], "main.lua");
+        assert_eq!(value[0]["location"]["lines"]["begin"], 2);
+        assert_eq!(value[1]["location"]["path"], "luabox.toml");
+        assert_eq!(value[1]["location"]["lines"]["begin"], 1);
+    }
+
+    /// GitLab hangs a finding off `location.lines.begin` to place it on the
+    /// merge-request diff, so two diagnostics in the same file must report the
+    /// two lines they are actually on. This is the regression: the renderer
+    /// used to discard the lookup and emit `1` for every one of them.
+    #[test]
+    fn gitlab_lines_come_from_the_source_lookup_per_diagnostic() {
+        let code: Code = "LB0001".parse().unwrap();
+        // Line 1 starts at byte 0; line 3 (`print(x)`) starts at byte 22.
+        let diags = vec![
+            Diagnostic::error(code, "first")
+                .with_label(Label::primary(Span::new("main.lua", 6..7), "on line 1")),
+            Diagnostic::error(code, "third")
+                .with_label(Label::primary(Span::new("main.lua", 28..29), "on line 3")),
+        ];
+        let out = render(&diags, Format::GitlabCodeQuality, &lookup);
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value[0]["location"]["lines"]["begin"], 1);
+        assert_eq!(value[1]["location"]["lines"]["begin"], 3);
+        // Different lines, and therefore different findings on the diff.
+        assert_ne!(
+            value[0]["location"]["lines"]["begin"],
+            value[1]["location"]["lines"]["begin"]
+        );
+    }
+
+    /// The fingerprint is the finding's identity in GitLab's history, so it
+    /// must not move when the *rendering* of a location does. It hashes the
+    /// code, file, and byte range — never the line — which is why teaching the
+    /// renderer real line numbers renumbers nobody's existing findings.
+    #[test]
+    fn gitlab_fingerprints_do_not_depend_on_the_rendered_line() {
+        let with_source = render(&fixture(), Format::GitlabCodeQuality, &lookup);
+        // The same diagnostics rendered without any source: the lines fall
+        // back to 1, and the fingerprints must be untouched by that.
+        let without_source = render(&fixture(), Format::GitlabCodeQuality, &|_| None);
+        let a: serde_json::Value = serde_json::from_str(&with_source).unwrap();
+        let b: serde_json::Value = serde_json::from_str(&without_source).unwrap();
+        assert_eq!(a[0]["location"]["lines"]["begin"], 2);
+        assert_eq!(b[0]["location"]["lines"]["begin"], 1);
+        assert_eq!(a[0]["fingerprint"], b[0]["fingerprint"]);
+        assert_eq!(a[1]["fingerprint"], b[1]["fingerprint"]);
+    }
+
+    /// A file the lookup cannot supply still gets a usable issue: the path is
+    /// named and `begin` falls back to 1 rather than vanishing (the schema
+    /// requires it).
+    #[test]
+    fn a_label_whose_file_has_no_source_falls_back_to_line_one_in_gitlab() {
+        let code: Code = "LB0001".parse().unwrap();
+        let diag = Diagnostic::error(code, "boom")
+            .with_label(Label::primary(Span::new("unknown.lua", 400..403), "here"));
+        let out = render(&[diag], Format::GitlabCodeQuality, &lookup);
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value[0]["location"]["path"], "unknown.lua");
+        assert_eq!(value[0]["location"]["lines"]["begin"], 1);
     }
 
     #[test]

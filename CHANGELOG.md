@@ -34,6 +34,39 @@ spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
 
 ### Fixed
 
+- **`check --format gitlab` reports the line each diagnostic is actually on.**
+  The GitLab Code Quality renderer discarded the source lookup it was handed
+  and wrote `location.lines.begin: 1` for every finding. GitLab places a
+  finding on the merge-request diff by that line and drops it when the line is
+  not part of the diff, so the report parsed, looked plausible, and annotated
+  nothing. It now resolves the primary label's real 1-based line through the
+  same lookup SARIF's `startLine` already used; a file the lookup cannot
+  supply still falls back to line 1, and a diagnostic with no label at all
+  still reports the empty path and line 0. Fingerprints are unchanged — they
+  hash the code, file and byte range, never the rendered line — so existing
+  findings keep their identity and history in GitLab rather than all
+  reappearing as new.
+- **`luabox lsp` survives a malformed message instead of dying on it.** Any
+  request or notification whose params did not deserialize became an error
+  that propagated out of the message loop and killed the process with exit 1
+  — leaving the request the editor was blocked on unanswered, and every open
+  buffer without diagnostics, hover or completion until the client noticed the
+  pipe had closed. A hover with no `position`, a `didOpen` missing its
+  `languageId`, a `formatting` with no `options`, and — the one real clients
+  actually emit — a `file://` URI containing an unencoded space were all
+  fatal. A malformed **request** is now answered with the protocol's own
+  `-32602 InvalidParams`, naming the method and what failed to decode, and a
+  malformed **notification**, which has no id to answer, is reported on
+  `window/logMessage` and dropped; either way the server keeps serving. A
+  malformed `initialize` remains terminal — there is no workspace to serve —
+  but the client is now told so on the id it is blocked on. Genuinely fatal
+  conditions stay fatal: a closed stdin or a dead connection still ends the
+  loop.
+- **`luabox lsp` exits 1 on `exit` without a prior `shutdown`.** The LSP spec
+  reserves exit code 0 for the ordered `shutdown`/`exit` handshake and asks
+  for 1 when a client sends `exit` on its own. The lone notification was
+  ignored outright, so the server lingered until its stdin closed and then
+  exited 0.
 - **A manifest key is never silently inert.** `rev`, `tag` and `branch` pin a
   *git* checkout, so alongside a `path` or a `url` source they described
   nothing — and were quietly dropped by both the parser and the published

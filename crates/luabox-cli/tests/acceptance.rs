@@ -321,6 +321,42 @@ fn stdout_is_valid_json(world: &mut AcceptanceWorld) {
     }
 }
 
+/// The issues in a `--format gitlab` report, parsed.
+fn gitlab_issues(stdout: &str) -> Vec<serde_json::Value> {
+    serde_json::from_str(stdout)
+        .unwrap_or_else(|e| panic!("stdout is not a GitLab report: {e}\nstdout:\n{stdout}"))
+}
+
+/// GitLab keys a finding to a place in the merge-request diff through
+/// `location.lines.begin`, so the report has to name the line the diagnostic
+/// is actually on — a contract `stdout contains` cannot express.
+#[then(expr = "the gitlab report places a finding for {string} on line {int}")]
+fn gitlab_finding_on_line(world: &mut AcceptanceWorld, path: String, line: u64) {
+    let stdout = world.stdout();
+    let issues = gitlab_issues(&stdout);
+    assert!(
+        issues.iter().any(|issue| {
+            issue["location"]["path"].as_str() == Some(path.as_str())
+                && issue["location"]["lines"]["begin"].as_u64() == Some(line)
+        }),
+        "no finding for `{path}` on line {line}; stdout:\n{stdout}"
+    );
+}
+
+/// The negative half of the contract: line 1 was the placeholder every finding
+/// used to collapse onto, so a fixture with nothing on line 1 must show none.
+#[then(expr = "no gitlab finding sits on line {int}")]
+fn no_gitlab_finding_on_line(world: &mut AcceptanceWorld, line: u64) {
+    let stdout = world.stdout();
+    let issues = gitlab_issues(&stdout);
+    assert!(
+        !issues
+            .iter()
+            .any(|issue| issue["location"]["lines"]["begin"].as_u64() == Some(line)),
+        "a finding unexpectedly sits on line {line}; stdout:\n{stdout}"
+    );
+}
+
 #[tokio::main]
 async fn main() {
     // @wip gates feature files written ahead of implementation (spec-first,
