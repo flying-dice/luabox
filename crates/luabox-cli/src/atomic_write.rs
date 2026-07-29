@@ -108,7 +108,13 @@ fn copy_permissions(from: &Path, to: &Path) -> io::Result<()> {
 /// read-only flag — copying that alone would be a half-truth. The new file
 /// inherits the directory's ACL, which is what a file created in that
 /// directory gets anyway.
+// The `Result` return mirrors the unix twin so the call site is
+// cfg-free; clippy (rightly) notices this arm can never fail.
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "signature must match the cfg(unix) twin, which is fallible"
+)]
 fn copy_permissions(_from: &Path, _to: &Path) -> io::Result<()> {
     Ok(())
 }
