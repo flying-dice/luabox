@@ -184,6 +184,29 @@ anything load-bearing.
 | `lsp` | language server: diagnostics + quick-fixes, completion (auto-require), hover, goto def/type/impl, references, rename, symbols, signature help, call hierarchy, inlay hints, semantic tokens, formatting |
 | `doc` | static docs from annotations |
 | `explain LBnnnn` | rustc-style diagnostic pages |
+| `schema` | print the JSON Schema (draft 2020-12) for `luabox.toml` — point an editor, a validator or an LLM at the whole manifest contract |
+
+### Coding assistance for `luabox.toml`: `luabox schema`
+
+`luabox.toml` is described in full by a JSON Schema (draft 2020-12) that the
+binary carries — every table, every key, every default, every closed
+vocabulary (`edition`, `build.target`, `build.mode`, lint levels) and every
+mutually-exclusive dependency form, each with a prose description. Write it
+out and point your tooling at it:
+
+```sh
+luabox schema > luabox.schema.json
+```
+
+Editors and validators get completion and inline errors for the manifest; an
+LLM handed that one file can write a correct `luabox.toml` without guessing.
+The schema describes the manifest's *data model* — you write TOML, tooling
+maps it to JSON with the standard mapping and validates that.
+
+It cannot go stale: a parity test suite pins the schema's key sets, enums and
+required fields to the parser's own, and runs every example manifest plus a
+curated valid/invalid corpus through both the schema and `luabox` itself,
+demanding the same verdict from each.
 
 ### Shipping a bundle: crash-to-source with `unmap`
 

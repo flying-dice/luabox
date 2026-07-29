@@ -201,6 +201,9 @@ enum Command {
     },
     /// Explain a diagnostic code (e.g. LB0421)
     Explain { code: String },
+    /// Print the JSON Schema (draft 2020-12) for `luabox.toml`, for editors,
+    /// validators and LLM coding assistants
+    Schema,
     /// Rewrite bundle line references in a traceback back to source, via the
     /// `<bundle>.map` emitted next to the bundle by `luabox build --sourcemap`
     Unmap {
@@ -336,6 +339,14 @@ fn run(command: Command) -> anyhow::Result<()> {
                 None => bail!("no such diagnostic code `{parsed}`; codes look like LB0421"),
             }
         }
+        // No project, no filesystem, no flags: the schema is embedded in the
+        // binary, so this is a `cat` of a compile-time constant. That is the
+        // point — `luabox schema > luabox.schema.json` has to work anywhere,
+        // including in a directory that has no manifest to describe yet.
+        Command::Schema => {
+            println!("{}", luabox_manifest::schema::json_schema().trim_end());
+            Ok(())
+        }
         Command::Unmap { bundle, traceback } => {
             let text = if traceback.is_empty() {
                 None
@@ -450,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn the_subcommand_surface_is_exactly_these_eleven() {
+    fn the_subcommand_surface_is_exactly_these_twelve() {
         // The v1 scope cut (DIRECTION.md, 2026-07-26) made luabox a pure
         // static toolchain: no package manager, no registry client, no
         // interpreter. This is the whole surface — adding a command (even a
@@ -463,13 +474,13 @@ mod tests {
         actual.sort();
 
         let mut expected = [
-            "build", "check", "doc", "explain", "fmt", "init", "lint", "lsp", "new", "unmap",
-            "upgrade",
+            "build", "check", "doc", "explain", "fmt", "init", "lint", "lsp", "new", "schema",
+            "unmap", "upgrade",
         ];
         expected.sort_unstable();
 
         assert_eq!(actual, expected, "the CLI subcommand surface changed");
-        assert_eq!(actual.len(), 11);
+        assert_eq!(actual.len(), 12);
 
         // ...and every one of them is documented. This used to be a second
         // test with its own copy of the list above, which asserted that each
@@ -784,6 +795,33 @@ mod tests {
             panic!("expected Explain");
         };
         assert_eq!(code, "LB0421");
+    }
+
+    // -- schema ------------------------------------------------------------
+
+    #[test]
+    fn schema_takes_no_arguments_at_all() {
+        assert!(matches!(parse(&["schema"]), Command::Schema));
+        assert_eq!(
+            reject(&["schema", "--format", "json"]),
+            clap::error::ErrorKind::UnknownArgument,
+            "`schema` has no flags — it prints one document"
+        );
+    }
+
+    #[test]
+    fn schema_help_says_what_the_document_is_for() {
+        // The help line is the discovery path: someone scanning `--help` for
+        // a way to point their editor or an LLM at the manifest contract has
+        // to recognise this command as it.
+        let about = Cli::command()
+            .find_subcommand("schema")
+            .expect("subcommand exists")
+            .get_about()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert!(about.contains("JSON Schema"), "{about}");
+        assert!(about.contains("luabox.toml"), "{about}");
     }
 
     // -- unmap -------------------------------------------------------------

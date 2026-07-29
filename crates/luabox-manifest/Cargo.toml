@@ -12,6 +12,11 @@ toml_edit.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The schema/parser parity suite (`src/schema.rs`): `serde_json` reads the
+# embedded schema and the TOML→JSON projection of every corpus manifest,
+# `jsonschema` compiles the schema and validates that corpus against it.
+serde_json.workspace = true
+jsonschema.workspace = true
 
 [lints]
 workspace = true
