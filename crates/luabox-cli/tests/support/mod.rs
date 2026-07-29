@@ -11,9 +11,28 @@
 //! This file is a module of each test binary (`mod support;`), not a target of
 //! its own — it is not compiled or counted separately.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use cucumber::gherkin::Step;
+
+/// The `luabox` executable every scenario drives.
+///
+/// Defaults to the binary cargo built for this test target
+/// (`CARGO_BIN_EXE_luabox`) — the only path any local run, `cargo test
+/// --workspace`, or the coverage-e2e job in `ci.yml` ever takes.
+///
+/// A non-empty `LUABOX_E2E_BIN` overrides it, which is what makes these
+/// black-box suites reusable as a *release* gate: `release.yml` installs the
+/// draft release's binary with the shipped install script and points this at
+/// the installed executable, so the artefact users will download is the thing
+/// under test (SPEC.md §16.2 — the scenarios never touch an internal API, so
+/// nothing but the process path has to change).
+pub fn luabox_bin() -> PathBuf {
+    match std::env::var("LUABOX_E2E_BIN") {
+        Ok(path) if !path.is_empty() => PathBuf::from(path),
+        _ => PathBuf::from(env!("CARGO_BIN_EXE_luabox")),
+    }
+}
 
 /// The step's docstring, normalized: the leading newline after `"""` is
 /// stripped and exactly one trailing newline is guaranteed — matching the
