@@ -34,7 +34,11 @@ pub(super) fn emit(root: &SyntaxNode, opts: &Options) -> String {
     let mut emitter = Emitter::new(opts, false);
     emitter.walk_block_like(root);
     let mut out = emitter.out;
-    if !out.is_empty() {
+    // A non-empty file ends with exactly one line ending. Statements never
+    // emit their own, so this normally *is* the final newline — but a file
+    // holding nothing but a `#!` line already got one when the shebang
+    // claimed its line, and must not collect a blank line on top.
+    if !out.is_empty() && !out.ends_with('\n') {
         out.push_str(opts.line_ending.as_str());
     }
     out
@@ -217,6 +221,30 @@ impl<'a> Emitter<'a> {
         });
     }
 
+    /// Emit the file prefix — a UTF-8 BOM and/or a `#!` line — verbatim.
+    ///
+    /// This is content, not layout: reference Lua only honours it at byte 0,
+    /// so it gets no indentation, no spacing rule and no reflow. The shebang
+    /// owns its line, so a hard break follows it (in the configured line
+    /// ending — the token's own trailing `\r`, if any, is dropped so a CRLF
+    /// file does not end up with two).
+    fn file_prefix(&mut self, t: &SyntaxToken) {
+        if self.probe {
+            self.failed = true;
+            return;
+        }
+        self.out.push_str(t.text().trim_end_matches('\r'));
+        if t.kind() == SHEBANG {
+            self.out.push_str(self.opts.line_ending.as_str());
+        }
+        self.col = 0;
+        self.line_has_content = false;
+        self.line_comment_open = false;
+        self.pending_newlines = 0;
+        self.suppress_blank = true;
+        self.prev = None;
+    }
+
     /// Append a formatter-inserted character (trailing table comma).
     fn insert_char(&mut self, c: char) {
         self.out.push(c);
@@ -255,6 +283,8 @@ impl<'a> Emitter<'a> {
                 NodeOrToken::Token(t) => match t.kind() {
                     WHITESPACE => self.pending_newlines += count_newlines(t.text()),
                     COMMENT => self.comment(&t),
+                    // Only ever children of `SOURCE_FILE`, and only first.
+                    BOM | SHEBANG => self.file_prefix(&t),
                     SEMICOLON => {
                         if self.pending_newlines > 0 || !self.line_has_content {
                             self.item_break();

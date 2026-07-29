@@ -19,6 +19,7 @@
 use std::collections::HashSet;
 use std::ops::Range;
 
+use luabox_syntax::LineIndex;
 use luabox_syntax::lua::ast::AstNode as _;
 use luabox_syntax::lua::{self, SyntaxKind};
 
@@ -58,6 +59,9 @@ impl Suppressions {
             .and_then(|b| b.stmts().next())
             .map_or(usize::MAX, |s| usize::from(s.syntax().text_range().start()));
 
+        // One table for the whole file: a per-comment newline count from byte
+        // 0 makes a heavily-annotated file quadratic.
+        let lines = LineIndex::new(source);
         let mut out = Suppressions::default();
         for token in root
             .descendants_with_tokens()
@@ -67,7 +71,7 @@ impl Suppressions {
             let text = token.text();
             let start = usize::from(token.text_range().start());
             if let Some(pos) = text.find(DIAGNOSTIC_MARKER) {
-                out.collect_diagnostic_directive(text, pos, line_of(source, start));
+                out.collect_diagnostic_directive(text, pos, lines.line_of(start));
             }
             let Some(pos) = text.find(MARKER) else {
                 continue;
@@ -102,7 +106,7 @@ impl Suppressions {
                 out.file_rules.insert(rule_id.to_owned());
             } else {
                 out.line_rules
-                    .insert((rule_id.to_owned(), line_of(source, start)));
+                    .insert((rule_id.to_owned(), lines.line_of(start)));
             }
         }
         out
@@ -163,16 +167,6 @@ impl Suppressions {
             _ => {}
         }
     }
-}
-
-/// The 1-based line number of a byte offset.
-#[must_use]
-pub fn line_of(source: &str, offset: usize) -> usize {
-    1 + source
-        .bytes()
-        .take(offset.min(source.len()))
-        .filter(|&b| b == b'\n')
-        .count()
 }
 
 fn to_range(range: rowan::TextRange) -> Range<usize> {

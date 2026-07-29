@@ -128,15 +128,6 @@ impl DirectiveScan {
     }
 }
 
-/// The 1-based line number of a byte offset (mirrors `suppress.rs::line_of`).
-pub(crate) fn line_of(source: &str, offset: usize) -> usize {
-    1 + source
-        .bytes()
-        .take(offset.min(source.len()))
-        .filter(|&b| b == b'\n')
-        .count()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

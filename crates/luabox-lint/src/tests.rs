@@ -761,6 +761,39 @@ fn file_level_ignore_suppresses_all() {
     assert_eq!(default_codes(src), Vec::<String>::new());
 }
 
+/// Line numbers now come from a precomputed line table rather than a newline
+/// count per finding (the O(findings x file size) fix). The inputs where a
+/// line table and a raw newline count could disagree are CRLF endings, a
+/// missing final newline, and offsets far from byte 0 — pin all three
+/// through the behaviour that depends on them.
+#[test]
+fn suppression_lines_survive_crlf_and_a_missing_final_newline() {
+    let late = format!(
+        "{}---@luabox-ignore unused-local late\r\nlocal x = 1",
+        "print(1)\r\n".repeat(200)
+    );
+    for src in [
+        "---@luabox-ignore unused-local crlf\r\nlocal x = 1\r\n",
+        "local x = 1 ---@luabox-ignore unused-local crlf trailing\r\n",
+        "---@luabox-ignore unused-local no final newline\nlocal x = 1",
+        "local x = 1 ---@luabox-ignore unused-local no final newline",
+        &late,
+    ] {
+        assert_eq!(default_codes(src), Vec::<String>::new(), "{src:?}");
+    }
+}
+
+/// The mirror of the test above: an ignore comment that is *not* adjacent to
+/// the finding must still not suppress it, whatever the line endings.
+#[test]
+fn a_distant_ignore_comment_does_not_suppress() {
+    // Not file-level: a statement precedes the comment, so it only covers
+    // its own line and the one below — line 5's finding stays.
+    let src = "print(1)\r\nprint(2)\r\n---@luabox-ignore unused-local too late\r\nprint(3)\r\nlocal y = 2\r\n";
+    let c = default_codes(src);
+    assert!(c.contains(&"LB0501".to_owned()), "{c:?}");
+}
+
 #[test]
 fn ignore_targets_only_the_named_rule() {
     // Suppress unused-local; the global-write finding survives.

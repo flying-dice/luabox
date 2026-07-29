@@ -103,7 +103,7 @@ jobs:
           path: lcov-e2e.info
 
   # SPEC.md §16.1 — perf gates are CI-blocking. scripts/perf-gate.sh runs
-  # three, all live, all against a ~100-kLOC synthetic corpus:
+  # four, all live. (1)–(3) run against a ~100-kLOC synthetic corpus:
   #   1. cold start          — `luabox --version`, best of N, < 50 ms
   #   2. `fmt --check` warm  — < 2 s. Once a proxy for (3) while `check` was
   #      unbuilt (GL#6); kept now as the wider safety net, since it walks the
@@ -111,6 +111,12 @@ jobs:
   #      caching in the way.
   #   3. `check` warm        — < 1 s. The real gate SPEC §16.1 asks for; live
   #      since `luabox check` landed, no longer proxied.
+  #   4. diagnostics-heavy   — `lint` < 1.2 s and `check` < 1.5 s on ONE file
+  #      carrying 20 k suppressed findings. That corpus is separate because
+  #      the one above is clean (`0 errors, 0 warnings`), so (1)–(3) never
+  #      time per-diagnostic work — a blind spot that hid an
+  #      O(diagnostics x file size) line lookup (32 k findings in one file:
+  #      ~32 s to lint; the same file with one finding: 0.35 s).
   # The LSP keystroke-to-diagnostics budget in §16.1 is NOT gated here — no
   # harness drives the protocol yet; SPEC marks it future work.
   # Every budget is scaled by LUABOX_PERF_FACTOR (set below for this runner).

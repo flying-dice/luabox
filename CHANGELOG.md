@@ -78,6 +78,42 @@ spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
   The schema's `path source` and `url source` branches exclude the three keys
   by the same mechanism they already used for `git`/`url`/`sha256`, so an
   editor flags them before `luabox check` does.
+- **`lint` and `check` no longer slow down as a file collects diagnostics.**
+  Every finding resolved its line number by counting newlines from byte 0, so
+  the cost of reporting was O(diagnostics × file size): a single 100-kLOC file
+  with 32 k findings took over three minutes to lint, while the same file with
+  one finding took 0.35 s. Each file now builds one line table and
+  binary-searches it — 20 k suppressed findings in one file went from 15.7 s to
+  0.35 s for `lint`, and from 4.3 s to 0.66 s for `check`. The perf gate was
+  structurally blind to this (its corpus reports `0 errors, 0 warnings`), so it
+  gained a fourth, diagnostics-heavy leg that would have failed by 13× against
+  the old code.
+- **Valid Lua with a `#!` shebang is accepted, in every edition.** Reference
+  Lua has skipped a leading `#` line since 5.0 (`skipcomment`), so an
+  executable script was ordinary source everywhere except here, where
+  `check`/`lint`/`build` rejected it with `unexpected '!'`. The first line of a
+  file that starts with `#` is now lexed as trivia, like a comment, and `fmt`
+  reproduces it byte-exact and stays idempotent. A `#` anywhere below byte 0
+  is still the length operator, and still an error — matching reference Lua
+  exactly.
+- **A UTF-8 byte-order mark is accepted where reference Lua accepts it.** Lua
+  gained `skipBOM` in 5.2, and LuaJIT has it too, so a BOM'd file compiles
+  there and was rejected here in every edition with `unexpected '\u{feff}'`.
+  The mark is now skipped as trivia under 5.2/5.3/5.4/LuaJIT (and preserved
+  byte-exact by `fmt`); under 5.1, which really does reject it, the diagnostic
+  now names it — "file starts with a UTF-8 byte-order mark, which Lua 5.1
+  rejects — save the file without a BOM" — instead of echoing an invisible
+  codepoint.
+- **The parser accepts everything reference Lua accepts.** The nesting budget
+  was 100, well under the ~197 levels of tables/parens/calls/`if`s that
+  `lua5.4` compiles, and a right-associative operator chain spent one level
+  *per term*, so a 100-term `"a" .. "a" .. …` was rejected while the same-length
+  `+` chain was fine. Right-associative chains (`..`, `^`) are now consumed
+  iteratively, at constant depth and with the same limits as `+` (10 000 terms
+  parse identically to `+`), and the nesting budget is 220 — above every
+  reference implementation, with measured stack headroom for a debug build on
+  a default 2 MiB thread stack. See
+  [LIMITATIONS.md](LIMITATIONS.md#parser-nesting-and-expression-size-limits).
 
 ## [0.2.0] - 2026-07-26 (unreleased)
 

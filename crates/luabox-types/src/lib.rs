@@ -73,7 +73,7 @@ pub use version::VersionReq;
 use std::collections::HashMap;
 
 use luabox_diag::Diagnostic;
-use luabox_syntax::{lua, luacats};
+use luabox_syntax::{LineIndex, lua, luacats};
 
 use codes::{FIELD_NOT_FOUND, TYPE_MISMATCH};
 use infer::InferMode;
@@ -450,13 +450,16 @@ pub fn check_file_with_artifacts<S: std::hash::BuildHasher>(
         let source = parse.syntax().text().to_string();
         let sup = directive::DirectiveScan::scan(&source);
         if sup.any() {
+            // One table for the file: a newline count from byte 0 per
+            // diagnostic is O(diagnostics x file size).
+            let lines = LineIndex::new(&source);
             diags.retain(|d| {
                 let Some(rule) = directive::rule_for_code(d.code) else {
                     return true;
                 };
                 let line = d
                     .primary_label()
-                    .map_or(0, |l| directive::line_of(&source, l.span.range.start));
+                    .map_or(0, |l| lines.line_of(l.span.range.start));
                 !sup.suppresses(rule, line)
             });
         }

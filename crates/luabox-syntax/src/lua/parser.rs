@@ -117,9 +117,11 @@ impl Parse {
 ///
 /// The grammar is the union of Lua 5.1–5.4 and LuaJIT; constructs illegal in
 /// `dialect` still parse (a later validation pass diagnoses them). `dialect`
-/// only affects tokenization (`goto` keyword-ness, LuaJIT number suffixes).
+/// only affects tokenization (`goto` keyword-ness, LuaJIT number suffixes)
+/// and whether a leading byte-order mark is legal.
 pub fn parse(text: &str, dialect: Dialect) -> Parse {
     let mut parser = Parser::new(text, dialect);
+    parser.report_illegal_bom(dialect);
     grammar::source_file(&mut parser);
     debug_assert_eq!(
         parser.pos,
@@ -134,7 +136,14 @@ pub fn parse(text: &str, dialect: Dialect) -> Parse {
 
 /// Recursion budget shared by statement and expression nesting; deeper input
 /// degrades into `ERROR_NODE`s instead of overflowing the stack.
-pub(super) const MAX_DEPTH: u32 = 100;
+///
+/// Sized off the reference implementation so the parser accepts everything it
+/// does: `LUAI_MAXCCALLS` (200) makes `lua5.4` reject at 197–198 nested
+/// tables / parens / calls / `not`s / `if`s. The margin above that absorbs the
+/// places our depth accounting differs from `lparser.c`'s. Measured headroom:
+/// a debug build parses at exactly this depth inside a thread with the
+/// default 2 MiB stack (see `parsing_at_the_depth_limit_fits_a_default_stack`).
+pub(super) const MAX_DEPTH: u32 = 220;
 
 /// Tree-height budget. Rowan's green trees drop recursively, so unbounded
 /// height (e.g. a 50k-term `+` chain, one `BIN_EXPR` level per operator)
@@ -357,7 +366,20 @@ impl<'a> Parser<'a> {
     /// reports once per parse when the budget runs out. Callers keep
     /// consuming without wrapping after a `false`.
     pub(super) fn can_wrap(&mut self, marker: Marker) -> bool {
-        if self.subtree_height(marker.child_index) < MAX_HEIGHT {
+        self.can_wrap_nested(marker, 1)
+    }
+
+    /// [`Self::can_wrap`] for a caller that will add `levels` nested nodes at
+    /// `marker` rather than one — a right-associative operator chain wraps one
+    /// `BIN_EXPR` per operator, and only after the whole chain is consumed, so
+    /// its own contribution to the height is not yet visible in the builder.
+    pub(super) fn can_wrap_nested(&mut self, marker: Marker, levels: usize) -> bool {
+        let levels = u32::try_from(levels).unwrap_or(u32::MAX);
+        if self
+            .subtree_height(marker.child_index)
+            .saturating_add(levels)
+            <= MAX_HEIGHT
+        {
             return true;
         }
         if !self.height_reported {
@@ -437,6 +459,30 @@ impl<'a> Parser<'a> {
             self.bump();
             self.finish_node();
         }
+    }
+
+    /// Reject a leading UTF-8 byte-order mark under a dialect that does not
+    /// skip one (5.1 — see [`Dialect::skips_bom`]).
+    ///
+    /// The lexer keeps the BOM as trivia for every dialect so the tree stays
+    /// lossless and the formatter can reproduce it; turning it back into an
+    /// error lives here, where the dialect is known and the mark has a span to
+    /// point at. Naming the mark beats echoing its codepoint: `unexpected
+    /// '\u{feff}'` is invisible in a terminal and unactionable.
+    fn report_illegal_bom(&mut self, dialect: Dialect) {
+        if dialect.skips_bom() {
+            return;
+        }
+        let Some(&(SyntaxKind::BOM, start, end)) = self.tokens.first() else {
+            return;
+        };
+        self.errors.push(ParseError {
+            message: format!(
+                "file starts with a UTF-8 byte-order mark, which Lua {} rejects — save the file without a BOM",
+                dialect.manifest_id()
+            ),
+            range: TextRange::new(text_size(start), text_size(end)),
+        });
     }
 
     /// Nesting-limit bailout: report once per parse, then consume one token
@@ -1576,6 +1622,95 @@ SOURCE_FILE@0..4
         assert_eq!(errors, "2..2: expected 'end'\n");
     }
 
+    // === File prefix: `#!` line and byte-order mark ===
+
+    #[test]
+    fn a_shebang_at_byte_zero_parses_in_every_dialect() {
+        for dialect in Dialect::ALL {
+            for text in [
+                "#!/usr/bin/env lua\nreturn 1\n",
+                "#!/usr/bin/lua -W\nlocal x = 1\nreturn x\n",
+                "# any first line starting with a hash\nreturn 1\n",
+                "#!/usr/bin/env lua",
+                "#!/usr/bin/env lua\r\nreturn 1\r\n",
+            ] {
+                let parse = parse(text, dialect);
+                assert_eq!(
+                    parse.errors(),
+                    &[],
+                    "{text:?} under {dialect:?}\n{}",
+                    parse.debug_dump()
+                );
+                assert_lossless(&parse, text);
+            }
+        }
+    }
+
+    /// Reference Lua only skips a `#` line when it is the *first* thing in
+    /// the file; anywhere else `#` is the length operator. Both `luac5.1` and
+    /// `luac5.4` reject the inputs below, and so must we.
+    #[test]
+    fn a_shebang_below_byte_zero_is_still_an_error() {
+        for text in [
+            "\n#!/usr/bin/env lua\nreturn 1\n",
+            " #!/usr/bin/env lua\nreturn 1\n",
+            "return 1\n#!/usr/bin/env lua\n",
+        ] {
+            let parse = parse(text, Dialect::Lua54);
+            assert!(!parse.errors().is_empty(), "{text:?} must not parse");
+            assert_lossless(&parse, text);
+        }
+    }
+
+    #[test]
+    fn a_leading_bom_parses_where_the_dialect_skips_it() {
+        for dialect in [
+            Dialect::Lua52,
+            Dialect::Lua53,
+            Dialect::Lua54,
+            Dialect::LuaJit,
+        ] {
+            for text in [
+                "\u{feff}return 1\n",
+                "\u{feff}",
+                "\u{feff}#!/usr/bin/env lua\nreturn 1\n",
+            ] {
+                let parse = parse(text, dialect);
+                assert_eq!(parse.errors(), &[], "{text:?} under {dialect:?}");
+                assert_lossless(&parse, text);
+            }
+        }
+    }
+
+    #[test]
+    fn lua_51_rejects_a_leading_bom_by_name() {
+        let text = "\u{feff}return 1\n";
+        let parse = parse(text, Dialect::Lua51);
+        assert_lossless(&parse, text);
+        let [error] = parse.errors() else {
+            panic!("expected exactly one error: {:?}", parse.errors());
+        };
+        assert_eq!(
+            error.message,
+            "file starts with a UTF-8 byte-order mark, which Lua 5.1 rejects — save the file without a BOM"
+        );
+        assert_eq!(error.range, TextRange::new(0.into(), 3.into()));
+        // The old message quoted the raw codepoint; it must not come back.
+        assert!(!error.message.contains('\u{feff}'), "{}", error.message);
+    }
+
+    /// A BOM is only skipped at byte 0 — after a shebang it is an ordinary
+    /// illegal character, in every dialect (as in reference Lua).
+    #[test]
+    fn a_bom_below_byte_zero_is_an_error_everywhere() {
+        for dialect in Dialect::ALL {
+            let text = "#!/usr/bin/env lua\n\u{feff}return 1\n";
+            let parse = parse(text, dialect);
+            assert!(!parse.errors().is_empty(), "{dialect:?}");
+            assert_lossless(&parse, text);
+        }
+    }
+
     #[test]
     fn deep_paren_nesting_does_not_overflow() {
         let text = format!("x = {}1{}", "(".repeat(10_000), ")".repeat(10_000));
@@ -1592,6 +1727,82 @@ SOURCE_FILE@0..4
         assert!(!parse.errors().is_empty());
     }
 
+    /// Nesting depths reference Lua accepts, per construct.
+    ///
+    /// `lua5.4`/`luac5.4` reject at 197–198 of each of these (`LUAI_MAXCCALLS`
+    /// is 200); 5.1 is one deeper. 195 is comfortably inside every reference
+    /// implementation's limit, so [`MAX_DEPTH`] must clear it — that is the
+    /// guarantee LIMITATIONS.md states: anything reference Lua accepts,
+    /// luabox parses.
+    fn nested(construct: &str, n: usize) -> String {
+        match construct {
+            "table" => format!("x = {}{}", "{".repeat(n), "}".repeat(n)),
+            "paren" => format!("x = {}1{}", "(".repeat(n), ")".repeat(n)),
+            "call" => format!("x = {}1{}", "f(".repeat(n), ")".repeat(n)),
+            "not" => format!("x = {}true", "not ".repeat(n)),
+            "if" => format!("{}x = 1 {}", "if c then ".repeat(n), "end ".repeat(n)),
+            "do" => format!("{}x = 1 {}", "do ".repeat(n), "end ".repeat(n)),
+            other => panic!("unknown construct {other}"),
+        }
+    }
+
+    #[test]
+    fn everything_reference_lua_accepts_parses() {
+        for construct in ["table", "paren", "call", "not", "if", "do"] {
+            let text = nested(construct, 195);
+            let parse = parse(&text, Dialect::Lua54);
+            assert_lossless(&parse, &text);
+            assert_eq!(
+                parse.errors(),
+                &[],
+                "195 nested {construct}s must parse (reference Lua rejects at ~197)"
+            );
+        }
+    }
+
+    /// The other half of the contract: past the budget the parser *reports*
+    /// rather than overflowing, and says so once.
+    #[test]
+    fn nesting_past_the_budget_is_reported_not_crashed() {
+        for construct in ["table", "paren", "call", "not", "if", "do"] {
+            let text = nested(construct, MAX_DEPTH as usize + 50);
+            let parse = parse(&text, Dialect::Lua54);
+            assert_lossless(&parse, &text);
+            assert!(
+                parse
+                    .errors()
+                    .iter()
+                    .any(|e| e.message == "nesting limit exceeded"),
+                "{construct}: {:?}",
+                parse.errors()
+            );
+        }
+    }
+
+    /// Headroom proof for [`MAX_DEPTH`]: parsing at exactly the limit must
+    /// fit a *default* thread stack (2 MiB — what the LSP's worker threads
+    /// get, an eighth of the 8 MiB main thread), in a debug build, whose
+    /// frames are several times fatter than release's. If this ever
+    /// overflows, the process aborts and the test fails loudly.
+    #[test]
+    fn parsing_at_the_depth_limit_fits_a_default_stack() {
+        let sources: Vec<String> = ["table", "paren", "call", "not", "if", "do"]
+            .iter()
+            .map(|c| nested(c, MAX_DEPTH as usize))
+            .collect();
+        std::thread::Builder::new()
+            .name("depth-limit".to_owned())
+            .spawn(move || {
+                for text in &sources {
+                    let parse = parse(text, Dialect::Lua54);
+                    assert_lossless(&parse, text);
+                }
+            })
+            .expect("spawn a default-stack thread")
+            .join()
+            .expect("parsing at MAX_DEPTH must not overflow a default stack");
+    }
+
     #[test]
     fn deep_right_assoc_chains_do_not_overflow() {
         for text in [
@@ -1601,6 +1812,62 @@ SOURCE_FILE@0..4
             let parse = parse(&text, Dialect::Lua54);
             assert_lossless(&parse, &text);
         }
+    }
+
+    /// A right-associative chain used to recurse once per term, so it hit
+    /// `MAX_DEPTH` at 100 while the left-associative `+` chain of the same
+    /// length parsed. Both are now bounded by the same thing — the tree-height
+    /// budget — and report the same way.
+    #[test]
+    fn right_associative_chains_behave_like_left_associative_ones() {
+        for n in [200usize, 511, 10_000] {
+            let concat = format!("x = {}\"a\"", "\"a\" .. ".repeat(n));
+            let plus = format!("x = {}1", "1 + ".repeat(n));
+            let (c, p) = (parse(&concat, Dialect::Lua54), parse(&plus, Dialect::Lua54));
+            assert_lossless(&c, &concat);
+            assert_eq!(
+                c.errors()
+                    .iter()
+                    .map(|e| e.message.as_str())
+                    .collect::<Vec<_>>(),
+                p.errors()
+                    .iter()
+                    .map(|e| e.message.as_str())
+                    .collect::<Vec<_>>(),
+                "`..` and `+` chains of {n} terms must report alike"
+            );
+            assert!(
+                !c.errors()
+                    .iter()
+                    .any(|e| e.message == "nesting limit exceeded"),
+                "a chain is not nesting: {:?}",
+                c.errors()
+            );
+        }
+        // `^` is the other right-associative operator.
+        let pow = format!("x = {}2", "2 ^ ".repeat(1_000));
+        assert!(
+            !parse(&pow, Dialect::Lua54)
+                .errors()
+                .iter()
+                .any(|e| e.message == "nesting limit exceeded")
+        );
+    }
+
+    /// Right-nesting is what makes `..` and `^` right-associative; parsing
+    /// the chain in a loop must not quietly flatten it into left nesting.
+    #[test]
+    fn a_long_right_associative_chain_still_nests_to_the_right() {
+        let expr = expr_of("\"a\" .. \"b\" .. \"c\" .. \"d\"");
+        assert_eq!(sexp(&expr), "(.. \"a\" (.. \"b\" (.. \"c\" \"d\")))");
+        assert_eq!(sexp(&expr_of("2 ^ 3 ^ 4")), "(^ 2 (^ 3 4))");
+        // Mixed precedence around the chain still binds as the reference does.
+        assert_eq!(
+            sexp(&expr_of("1 + 2 .. 3 .. 4 == 5")),
+            "(== (.. (+ 1 2) (.. 3 4)) 5)"
+        );
+        assert_eq!(sexp(&expr_of("-2 ^ 2")), "(- (^ 2 2))");
+        assert_eq!(sexp(&expr_of("2 ^ -3 ^ 2")), "(^ 2 (- (^ 3 2)))");
     }
 
     #[test]
@@ -1624,8 +1891,36 @@ SOURCE_FILE@0..4
     // === Property tests ===
 
     const SNIPPETS: &[&str] = &[
-        "end", "then", "(", ")", "==", "local", "..", "[[", "]]", "'", "\"", "0x", "...", "::",
-        "<const>", "--", "\n", "goto", ";", ",", "{", "}", "=", "function", "^", "~",
+        "end",
+        "then",
+        "(",
+        ")",
+        "==",
+        "local",
+        "..",
+        "[[",
+        "]]",
+        "'",
+        "\"",
+        "0x",
+        "...",
+        "::",
+        "<const>",
+        "--",
+        "\n",
+        "goto",
+        ";",
+        ",",
+        "{",
+        "}",
+        "=",
+        "function",
+        "^",
+        "~",
+        // The file prefix, so mutations plant it at byte 0 and elsewhere.
+        "#!/usr/bin/env lua",
+        "#",
+        "\u{feff}",
     ];
 
     /// Splice/delete/truncate at a char boundary near `at`.

@@ -5,11 +5,12 @@
 //! Safety ladder, enforced mechanically on every call:
 //! 1. Inputs that do not parse cleanly are returned **unchanged** — broken
 //!    code is never reformatted.
-//! 2. The output is re-lexed and its non-trivia token stream must match the
-//!    input's (kind + text), modulo exactly two neutral rewrites: short
-//!    strings may change quotes only if their decoded value is identical
-//!    ([`strings`]), and a trailing `,`/`;` directly before a table's `}`
-//!    may appear or disappear.
+//! 2. The output is re-lexed and its non-trivia token stream — plus the file
+//!    prefix (a UTF-8 BOM / `#!` line), which is trivia to the parser but
+//!    content to the formatter — must match the input's (kind + text), modulo
+//!    exactly two neutral rewrites: short strings may change quotes only if
+//!    their decoded value is identical ([`strings`]), and a trailing `,`/`;`
+//!    directly before a table's `}` may appear or disappear.
 //! 3. The output must itself parse cleanly, and every comment must survive.
 //!
 //! If any check fails the input comes back unchanged: a formatter never
@@ -108,7 +109,14 @@ fn comments_preserved(root: &super::SyntaxNode, out: &str) -> bool {
         .all(|t| out.contains(t.text().trim_end()))
 }
 
-/// The non-trivia `(kind, text)` stream of `text`.
+/// The `(kind, text)` stream this formatter must preserve: every non-trivia
+/// token, plus the file prefix (a UTF-8 BOM / `#!` line).
+///
+/// The prefix is trivia to the *parser* — reference Lua skips it before
+/// lexing — but to the formatter it is content that must survive byte-exact,
+/// so it is compared here rather than regenerated like whitespace. Its own
+/// trailing `\r` is not part of that content: the shebang's line ending is
+/// normalized like every other, so it is trimmed before comparing.
 #[expect(
     clippy::string_slice,
     reason = "offset/end accumulate lexer token lengths, which tile the input exactly on char boundaries"
@@ -118,7 +126,9 @@ fn significant_tokens(text: &str, dialect: Dialect) -> Vec<(SyntaxKind, &str)> {
     let mut offset = 0usize;
     for token in lex(text, dialect) {
         let end = offset + token.len as usize;
-        if !token.kind.is_trivia() {
+        if token.kind.is_file_prefix() {
+            out.push((token.kind, text[offset..end].trim_end_matches('\r')));
+        } else if !token.kind.is_trivia() {
             out.push((token.kind, &text[offset..end]));
         }
         offset = end;
@@ -609,10 +619,80 @@ mod tests {
             "x = [[unterminated",
             "x = [==[unterminated]]",
             "local x = 1\n--[[ unterminated\nf()",
-            "#!/usr/bin/env lua\nprint(1)",
         ] {
             assert_eq!(fmt(src), src, "broken input must be untouched");
         }
+    }
+
+    /// A `#!` line at byte 0 is valid Lua — reference Lua has skipped it
+    /// since 5.0 — so it is *not* a broken input: the file formats normally
+    /// and the prefix survives byte-exact.
+    #[test]
+    fn a_shebang_formats_normally_and_survives() {
+        assert_eq!(
+            fmt("#!/usr/bin/env lua\nprint( 1 )"),
+            "#!/usr/bin/env lua\nprint(1)\n"
+        );
+        // Any `#` first line, not just `#!` — that is what `skipcomment` does.
+        assert_eq!(
+            fmt("# not really a shebang\nx=1"),
+            "# not really a shebang\nx = 1\n"
+        );
+        // A file that is *only* a shebang keeps exactly one line ending —
+        // the shebang already claimed its line, so no blank line on top.
+        check("#!/usr/bin/env lua", "#!/usr/bin/env lua\n");
+        check("#!/usr/bin/env lua\n", "#!/usr/bin/env lua\n");
+        check("\u{feff}#!/usr/bin/env lua", "\u{feff}#!/usr/bin/env lua\n");
+        // Blank lines after the shebang collapse like any other run.
+        check(
+            "#!/usr/bin/env lua\n\n\nlocal  x = 1\nreturn x",
+            "#!/usr/bin/env lua\nlocal x = 1\nreturn x\n",
+        );
+        for src in [
+            "#!/usr/bin/env lua\nprint( 1 )",
+            "#!/usr/bin/env lua\n\n\nlocal  x = 1\nreturn x",
+            "#!/usr/bin/env lua",
+        ] {
+            assert!(same_program(src, &fmt(src), Dialect::Lua54), "{src:?}");
+        }
+    }
+
+    /// A leading UTF-8 BOM survives byte-exact where the dialect allows it,
+    /// and a BOM'd file is still returned untouched under 5.1, where it does
+    /// not parse.
+    #[test]
+    fn a_byte_order_mark_survives_where_it_is_legal() {
+        let src = "\u{feff}local  x = 1";
+        assert_eq!(format(src, Dialect::Lua54), "\u{feff}local x = 1\n");
+        assert_eq!(
+            format(&format(src, Dialect::Lua54), Dialect::Lua54),
+            "\u{feff}local x = 1\n",
+            "not idempotent"
+        );
+        // BOM then shebang, the order `lauxlib.c` accepts.
+        assert_eq!(
+            format("\u{feff}#!/usr/bin/env lua\nx=1", Dialect::Lua54),
+            "\u{feff}#!/usr/bin/env lua\nx = 1\n"
+        );
+        // 5.1 rejects the BOM, so the input comes back untouched.
+        assert_eq!(format(src, Dialect::Lua51), src);
+    }
+
+    /// A CRLF shebang keeps exactly one line ending, whichever is configured.
+    #[test]
+    fn a_crlf_shebang_does_not_double_its_line_ending() {
+        assert_eq!(
+            fmt("#!/usr/bin/env lua\r\nx=1\r\n"),
+            "#!/usr/bin/env lua\nx = 1\n"
+        );
+        let crlf = Options {
+            line_ending: LineEnding::Crlf,
+            ..Options::default()
+        };
+        assert_eq!(
+            format_with("#!/usr/bin/env lua\r\nx=1\r\n", Dialect::Lua54, &crlf),
+            "#!/usr/bin/env lua\r\nx = 1\r\n"
+        );
     }
 
     #[test]
