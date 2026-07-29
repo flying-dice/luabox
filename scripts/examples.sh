@@ -9,7 +9,8 @@
 # because a compiler that emits a file nobody ever executes is only checked
 # against its own opinion of the file. The interpreter is a property of the
 # harness, not of the product: with no lua5.1 on PATH the run step SKIPs
-# loudly and the script stays green.
+# loudly and the script stays green. `unzip` — used only to look inside the
+# packaged .love — is treated the same way.
 #
 # Usage: bash scripts/examples.sh
 # Honours $LUABOX (path to the luabox binary); defaults to target/release/luabox.
@@ -43,6 +44,21 @@ if [ -n "$LUA51" ]; then
 else
     echo "==> SKIP: no lua5.1 on PATH — the built bundle will not be executed"
     echo "    (install lua5.1 to run this check locally; CI always runs it)"
+fi
+
+# The archive inspector used to look inside the packaged .love. Like lua5.1
+# it belongs to the harness, not to luabox — luabox builds the .love either
+# way — so with no unzip on PATH the inspection step SKIPs and the gate still
+# passes (examples/README.md says so; this is what makes that true).
+UNZIP=""
+if command -v unzip >/dev/null 2>&1; then
+    UNZIP="unzip"
+fi
+if [ -n "$UNZIP" ]; then
+    echo "==> inspecting packaged archives with: $UNZIP ($(command -v "$UNZIP"))"
+else
+    echo "==> SKIP: no unzip on PATH — the packaged .love will not be inspected"
+    echo "    (install unzip to run this check locally; CI always runs it)"
 fi
 
 fails=0
@@ -118,11 +134,15 @@ cd "$examples/love-asteroids-lite"
 gate .
 # `[build] mode = "love"` makes a bare `luabox build` package the .love.
 run "build (.love via mode=love)" -- "$LUABOX" build
-if unzip -l dist/asteroids-lite.love >/tmp/lb_ex_out 2>&1 \
-    && grep -q "main.lua" /tmp/lb_ex_out && grep -q "conf.lua" /tmp/lb_ex_out; then
-    pass ".love contains main.lua + conf.lua"
+if [ -n "$UNZIP" ]; then
+    if "$UNZIP" -l dist/asteroids-lite.love >/tmp/lb_ex_out 2>&1 \
+        && grep -q "main.lua" /tmp/lb_ex_out && grep -q "conf.lua" /tmp/lb_ex_out; then
+        pass ".love contains main.lua + conf.lua"
+    else
+        fail ".love contains main.lua + conf.lua"; sed 's/^/         | /' /tmp/lb_ex_out >&2
+    fi
 else
-    fail ".love contains main.lua + conf.lua"; sed 's/^/         | /' /tmp/lb_ex_out >&2
+    skip ".love contains main.lua + conf.lua (no unzip on PATH)"
 fi
 
 # 7. workspace (check fans out; gate a member standalone) ---------------------

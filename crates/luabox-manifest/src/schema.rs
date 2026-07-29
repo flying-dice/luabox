@@ -579,6 +579,22 @@ mod tests {
             "[package]\nedition = \"5.4\"\n\n[dependencies]\nbad = { version = \"1.0\", tag = \"v1\" }\n",
         ),
         (
+            "a rev with a path source",
+            "[package]\nedition = \"5.4\"\n\n[dependencies]\nbad = { path = \"../d\", rev = \"9f2c1ab\" }\n",
+        ),
+        (
+            "a branch with a path source",
+            "[package]\nedition = \"5.4\"\n\n[dependencies]\nbad = { path = \"../d\", branch = \"main\" }\n",
+        ),
+        (
+            "a tag with a url source",
+            "[package]\nedition = \"5.4\"\n\n[dependencies]\nbad = { url = \"https://x/u.tar.gz\", sha256 = \"abc\", tag = \"v1\" }\n",
+        ),
+        (
+            "a rev with a url source",
+            "[package]\nedition = \"5.4\"\n\n[dependencies]\nbad = { url = \"https://x/u.tar.gz\", sha256 = \"abc\", rev = \"9f2c1ab\" }\n",
+        ),
+        (
             "the removed `workspace = true` dependency form",
             "[package]\nedition = \"5.4\"\n\n[dependencies]\ne = { workspace = true }\n",
         ),

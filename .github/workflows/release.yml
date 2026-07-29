@@ -83,13 +83,43 @@ jobs:
           test -s release-notes.md || echo "(no CHANGELOG.md entry found for ${version})" > release-notes.md
           echo "--- release notes ---"
           cat release-notes.md
-      - name: Create the GitHub Release as a draft
+      # Idempotent on purpose: RELEASING.md tells a maintainer that a red run
+      # can be fixed by re-running the workflow, and a bare `gh release create`
+      # 422s the moment the draft from the failed run still exists. So:
+      #   - no release for this tag  -> create it as a draft;
+      #   - a DRAFT release exists   -> reuse it (publish-release uploads with
+      #                                 `--clobber`, so re-runs overwrite
+      #                                 assets cleanly);
+      #   - a PUBLISHED release      -> fail loudly. Re-running over a live
+      #                                 release would silently replace what
+      #                                 users already downloaded; that needs a
+      #                                 human, a new tag, or an explicit yank.
+      - name: Create the GitHub Release as a draft (or reuse an existing draft)
         run: |
-          gh release create "$TAG" \
-            --title "luabox $TAG" \
-            --notes-file release-notes.md \
-            --draft=true \
-            --latest=false
+          set -euo pipefail
+          existing=$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null || true)
+          case "$existing" in
+            true)
+              echo "::notice::a draft release for ${TAG} already exists — reusing it (re-run path)"
+              gh release edit "$TAG" \
+                --title "luabox $TAG" \
+                --notes-file release-notes.md \
+                --draft=true \
+                --latest=false
+              ;;
+            false)
+              echo "::error::${TAG} is already PUBLISHED — refusing to republish over a live release." >&2
+              echo "Cut a new tag, or delete/yank the published release deliberately first." >&2
+              exit 1
+              ;;
+            *)
+              gh release create "$TAG" \
+                --title "luabox $TAG" \
+                --notes-file release-notes.md \
+                --draft=true \
+                --latest=false
+              ;;
+          esac
 
   # Build native release binaries for the tagged commit. Runner arch is
   # load-bearing: macos-latest is Apple Silicon (aarch64-apple-darwin). Intel
@@ -501,9 +531,10 @@ jobs:
         run: gh release edit "$TAG" --draft=false --latest
 
   # Everything that can only be exercised once the release is actually public:
-  # the no-token install one-liners against the real release-download URLs, and
-  # the binary's own self-replace, which resolves published releases through
-  # the GitHub API and therefore cannot see a draft.
+  # the no-token install one-liners against the real public URLs — both the
+  # raw.githubusercontent one the README prints and the release-download copy
+  # — and the binary's own self-replace, which resolves published releases
+  # through the GitHub API and therefore cannot see a draft.
   #
   # Honest about what this is: the release is ALREADY LIVE when this runs. A
   # failure here does not roll anything back — it turns the pipeline red so a
@@ -526,9 +557,10 @@ jobs:
           - os: windows-latest
             shell: pwsh
     steps:
-      # No token anywhere in these steps, deliberately: release-download URLs
-      # are public, and the installers must work with nothing in the
-      # environment but LUABOX_VERSION.
+      # No token anywhere in these steps, deliberately: both the
+      # raw.githubusercontent and the release-download URLs are public, and
+      # the installers must work with nothing in the environment but
+      # LUABOX_VERSION.
       - name: Public-path install and upgrade (unix)
         if: matrix.shell == 'bash'
         shell: bash
@@ -538,11 +570,30 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The literal one-liner from the README, pinned to this tag.
-          curl -fsSL "https://github.com/${REPO}/releases/download/${TAG}/install.sh" \
-            | LUABOX_VERSION="${TAG}" bash
+          # Two sources for the same script, both installed from:
+          #
+          #   1. raw.githubusercontent — the URL the README's one-liner
+          #      literally tells users to curl. It serves the tip of `main`,
+          #      which at release time is the commit this tag was cut from,
+          #      so this is what a reader of the README actually gets today.
+          #      Mandatory: it is the documented path.
+          #   2. the release asset attached to this tag — the immutable copy
+          #      the release ships. Cheap to also exercise, and any drift
+          #      between the two surfaces here rather than in a user's shell.
+          #
+          # Both pinned to this tag via LUABOX_VERSION.
+          readme_url="https://raw.githubusercontent.com/${REPO}/main/scripts/install.sh"
+          asset_url="https://github.com/${REPO}/releases/download/${TAG}/install.sh"
           export PATH="$HOME/.luabox/bin:$PATH"
-          luabox --version
+
+          for url in "$readme_url" "$asset_url"; do
+            echo "--- installing from ${url}"
+            rm -rf "$HOME/.luabox"
+            curl -fsSL "$url" | LUABOX_VERSION="${TAG}" bash
+            test -x "$HOME/.luabox/bin/luabox" \
+              || { echo "error: ${url} did not produce ~/.luabox/bin/luabox" >&2; exit 1; }
+            luabox --version
+          done
 
           # Self-replace: re-install the same tag via the binary's own upgrade
           # command (it resolves published releases, so it could not run before
@@ -577,13 +628,29 @@ jobs:
           # The literal `irm | iex` one-liner from the README, pinned to this
           # tag, in a Windows PowerShell 5.1 REPL — the environment real users
           # are in (and where PSReadLine's RuntimeInformation stub bites).
-          $url = "https://github.com/$repo/releases/download/$tag/install.ps1"
-          "`$env:LUABOX_VERSION = '$tag'; irm '$url' | iex" | powershell.exe -NoProfile -
-          if ($LASTEXITCODE -ne 0) { Write-Error "public-path irm|iex install failed"; exit 1 }
-
+          #
+          # Two sources, same script. raw.githubusercontent is the URL the
+          # README hands users; it serves the tip of `main`, which at release
+          # time is the commit this tag was cut from — the mandatory one,
+          # because it is the documented path. The release asset attached to
+          # this tag is the immutable copy, exercised too so drift between
+          # them surfaces here and not in a user's shell.
           $binDir = Join-Path $env:USERPROFILE ".luabox\bin"
           $exe = Join-Path $binDir "luabox.exe"
-          if (-not (Test-Path $exe)) { Write-Error "install.ps1 did not produce $exe"; exit 1 }
+          $urls = @(
+            "https://raw.githubusercontent.com/$repo/main/scripts/install.ps1",
+            "https://github.com/$repo/releases/download/$tag/install.ps1"
+          )
+          foreach ($url in $urls) {
+            Write-Host "--- installing from $url"
+            if (Test-Path (Join-Path $env:USERPROFILE ".luabox")) {
+              Remove-Item -Recurse -Force (Join-Path $env:USERPROFILE ".luabox")
+            }
+            "`$env:LUABOX_VERSION = '$tag'; irm '$url' | iex" | powershell.exe -NoProfile -
+            if ($LASTEXITCODE -ne 0) { Write-Error "public-path irm|iex install failed for $url"; exit 1 }
+            if (-not (Test-Path $exe)) { Write-Error "$url did not produce $exe"; exit 1 }
+          }
+
           $env:PATH = "$binDir;$env:PATH"
           luabox --version
           if ($LASTEXITCODE -ne 0) { Write-Error "luabox --version failed"; exit 1 }

@@ -68,3 +68,11 @@ tools belong to the harness, not to luabox — with neither on `PATH` the step
 SKIPs loudly and the gate still passes, so a dev box needs nothing installed.
 Linux CI installs both, so there the step always runs. CI runs the bash script
 on every push.
+
+One tool is *not* optional, and it belongs to luabox rather than the harness:
+`[build] mode = "love"` writes a zip archive and luabox ships no zip
+implementation, so packaging shells out to `zip`, else `python3 -m zipfile`,
+else `python -m zipfile` (on Windows: the System32 `bsdtar`, else
+PowerShell's `Compress-Archive`). With none of them on `PATH` the `build`
+step fails — loudly, naming what it tried — rather than skipping, because
+that is a real product failure, not a missing inspector.

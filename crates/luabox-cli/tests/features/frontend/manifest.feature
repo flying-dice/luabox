@@ -129,6 +129,9 @@ Feature: luabox.toml validation — every problem, reported at once
       | dependencies     | foo = { git = "https://x", path = "../foo" }        | `dependencies.foo` must specify only one of `git`, `path`, or `url`     |
       | dependencies     | foo = { git = "https://x", rev = "a", tag = "b" }   | `dependencies.foo` must specify at most one of `rev`, `tag`, `branch`   |
       | dependencies     | foo = { path = "../foo", sha256 = "abc" }           | `dependencies.foo.sha256` is only valid alongside a `url` source        |
+      | dependencies     | foo = { path = "../foo", rev = "9f2c1ab" }          | `dependencies.foo` has a git reference key but a `path` source          |
+      | dependencies     | foo = { path = "../foo", branch = "main" }          | `dependencies.foo` has a git reference key but a `path` source          |
+      | dependencies     | foo = { url = "https://x/f.tar.gz", sha256 = "abc", tag = "v1" } | `dependencies.foo` has a git reference key but a `url` source |
       | dependencies     | foo = { git = 5 }                                   | `dependencies.foo.git` must be a string                                 |
       | dev-dependencies | bar = 7                                             | `dev-dependencies.bar` must be a version-requirement string or an inline table |
 
