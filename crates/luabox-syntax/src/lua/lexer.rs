@@ -26,6 +26,9 @@ pub struct Token {
     pub len: u32,
 }
 
+/// The UTF-8 encoding of U+FEFF, the byte-order mark.
+const BOM_BYTES: &[u8] = "\u{feff}".as_bytes();
+
 /// Lex `text` under `dialect`. Never fails: unrecognized bytes become
 /// [`SyntaxKind::ERROR`] tokens and lexing continues.
 pub fn lex(text: &str, dialect: Dialect) -> Vec<Token> {
@@ -36,6 +39,7 @@ pub fn lex(text: &str, dialect: Dialect) -> Vec<Token> {
         dialect,
         tokens: Vec::new(),
     };
+    lexer.file_prefix();
     while lexer.pos < lexer.bytes.len() {
         lexer.next_token();
     }
@@ -63,6 +67,34 @@ impl Lexer<'_> {
         let len = u32::try_from(self.pos - start).expect("token longer than u32::MAX bytes");
         debug_assert!(len > 0, "zero-length token");
         self.tokens.push(Token { kind, len });
+    }
+
+    /// The prefix reference Lua skips before the first real token, at byte 0
+    /// only: a UTF-8 byte-order mark (`skipBOM`, 5.2+ and LuaJIT) and then a
+    /// `#`-led line (`skipcomment`, every version since 5.0). Both become
+    /// trivia tokens in every dialect so the tree stays lossless; whether the
+    /// BOM is *legal* is the parser's call, since only it knows the dialect's
+    /// verdict and can attach a span to it.
+    ///
+    /// The order matters and matches `lauxlib.c`: the BOM comes first, so
+    /// `<BOM>#!/usr/bin/env lua` is a shebang but `#!...\n<BOM>` is not — the
+    /// second BOM is an ordinary (illegal) character, exactly as in reference
+    /// Lua.
+    fn file_prefix(&mut self) {
+        debug_assert_eq!(self.pos, 0, "the file prefix only exists at byte 0");
+        if self.bytes.starts_with(BOM_BYTES) {
+            self.pos += BOM_BYTES.len();
+            self.push(SyntaxKind::BOM, 0);
+        }
+        if self.peek(0) == Some(b'#') {
+            let start = self.pos;
+            // Stop before the newline, like a `--` line comment: the newline
+            // is ordinary whitespace that the next token picks up.
+            while !matches!(self.peek(0), None | Some(b'\n')) {
+                self.pos += 1;
+            }
+            self.push(SyntaxKind::SHEBANG, start);
+        }
     }
 
     fn next_token(&mut self) {
@@ -410,6 +442,67 @@ mod tests {
             for d in Dialect::ALL {
                 check(src, d); // asserts tiling internally
             }
+        }
+    }
+
+    #[test]
+    fn a_hash_first_line_is_shebang_trivia_in_every_dialect() {
+        for d in Dialect::ALL {
+            assert_eq!(
+                check("#!/usr/bin/env lua\nreturn 1", d),
+                vec![
+                    (SHEBANG, "#!/usr/bin/env lua"),
+                    (WHITESPACE, "\n"),
+                    (RETURN_KW, "return"),
+                    (WHITESPACE, " "),
+                    (NUMBER, "1"),
+                ],
+                "{d:?}"
+            );
+            // `skipcomment` skips any `#` first line, not only `#!`.
+            assert_eq!(
+                kinds("# comment\nx", d),
+                vec![SHEBANG, WHITESPACE, IDENT],
+                "{d:?}"
+            );
+            // A file that is nothing but the shebang.
+            assert_eq!(kinds("#!/bin/lua", d), vec![SHEBANG], "{d:?}");
+            // CRLF: the `\r` belongs to the shebang, like a `--` comment's.
+            assert_eq!(check("#!x\r\ny", d)[0], (SHEBANG, "#!x\r"), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn a_hash_anywhere_but_byte_zero_is_the_length_operator() {
+        for d in Dialect::ALL {
+            assert_eq!(
+                kinds("\n#!/usr/bin/env lua", d)[0..2],
+                [WHITESPACE, HASH],
+                "{d:?}"
+            );
+            assert_eq!(kinds("x=#t", d), vec![IDENT, EQ, HASH, IDENT], "{d:?}");
+        }
+    }
+
+    #[test]
+    fn a_leading_bom_is_trivia_in_every_dialect() {
+        // The lexer is dialect-blind here on purpose: 5.1's rejection is the
+        // parser's, so the tree stays lossless in every dialect.
+        for d in Dialect::ALL {
+            assert_eq!(check("\u{feff}return 1", d)[0], (BOM, "\u{feff}"), "{d:?}");
+            // BOM then shebang — the order `lauxlib.c` accepts.
+            assert_eq!(
+                kinds("\u{feff}#!/usr/bin/env lua\nx", d),
+                vec![BOM, SHEBANG, WHITESPACE, IDENT],
+                "{d:?}"
+            );
+            // A BOM anywhere else is an ordinary (illegal) character.
+            assert_eq!(kinds("x\u{feff}", d), vec![IDENT, ERROR], "{d:?}");
+            assert_eq!(
+                kinds("#!x\n\u{feff}", d),
+                vec![SHEBANG, WHITESPACE, ERROR],
+                "{d:?}"
+            );
         }
     }
 

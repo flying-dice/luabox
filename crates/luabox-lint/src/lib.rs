@@ -49,10 +49,10 @@ use std::ops::Range;
 
 use luabox_diag::{Code, Diagnostic, Label, Severity, Span, Suggestion};
 use luabox_hir::lower;
-use luabox_syntax::{Dialect, lua};
+use luabox_syntax::{Dialect, LineIndex, lua};
 
 use context::to_range;
-use suppress::{Suppressions, line_of};
+use suppress::Suppressions;
 
 /// A machine-applicable edit gathered for `--fix`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +114,10 @@ pub fn lint_source(
     let lowered = lower(&parse);
     let facts = TypeFacts::build(&parse, &lowered);
     let suppress = Suppressions::collect(&parse, source);
+    // Built once per file: resolving each finding's line by counting newlines
+    // from byte 0 made linting O(findings x file size) — 32 k findings in one
+    // 100-kLOC file took minutes.
+    let lines = LineIndex::new(source);
     let ctx = LintContext::new(
         file,
         source,
@@ -129,7 +133,7 @@ pub fn lint_source(
             continue;
         };
         for finding in rule.check(&ctx) {
-            let line = line_of(source, finding.range.start);
+            let line = lines.line_of(finding.range.start);
             if suppress.is_suppressed(rule.id(), line) {
                 continue;
             }

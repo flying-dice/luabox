@@ -10,6 +10,16 @@ syntax_kinds! {
         WHITESPACE,
         /// `--` line comment or `--[[ ... ]]` long comment (any bracket level).
         COMMENT,
+        /// A UTF-8 byte-order mark at byte 0. Reference Lua skips it from 5.2
+        /// on (`skipBOM`), as does LuaJIT; 5.1 rejects the file. Lexed as
+        /// trivia in every dialect so the tree stays lossless — the parser
+        /// turns it back into an error where the dialect demands one.
+        BOM,
+        /// A `#`-led first line (`#!/usr/bin/env lua`) at byte 0, up to but
+        /// not including its newline — exactly how a `--` line comment is
+        /// tokenized. Reference Lua has skipped it since 5.0 (`skipcomment`),
+        /// in every version, so it is trivia in every dialect.
+        SHEBANG,
 
         // === Literals & names ===
         IDENT,
@@ -119,8 +129,23 @@ syntax_kinds! {
 
 impl SyntaxKind {
     /// Trivia is preserved in the tree but skipped by the parser proper.
+    ///
+    /// The file prefix reference Lua skips before the first token — a UTF-8
+    /// BOM and a `#!` line — is trivia to the *parser*, but unlike whitespace
+    /// it is content the formatter must reproduce byte-exact; see
+    /// [`SyntaxKind::is_file_prefix`].
     pub fn is_trivia(self) -> bool {
-        matches!(self, SyntaxKind::WHITESPACE | SyntaxKind::COMMENT)
+        matches!(
+            self,
+            SyntaxKind::WHITESPACE | SyntaxKind::COMMENT | SyntaxKind::BOM | SyntaxKind::SHEBANG
+        )
+    }
+
+    /// The trivia that may only appear at the very start of a file: a UTF-8
+    /// byte-order mark and a `#!` line. It carries no layout freedom — the
+    /// formatter reproduces it verbatim rather than regenerating it.
+    pub fn is_file_prefix(self) -> bool {
+        matches!(self, SyntaxKind::BOM | SyntaxKind::SHEBANG)
     }
 }
 
@@ -179,9 +204,15 @@ mod tests {
     }
 
     #[test]
-    fn only_whitespace_and_comments_are_trivia() {
-        assert!(SyntaxKind::WHITESPACE.is_trivia());
-        assert!(SyntaxKind::COMMENT.is_trivia());
+    fn whitespace_comments_and_the_file_prefix_are_trivia() {
+        for kind in [
+            SyntaxKind::WHITESPACE,
+            SyntaxKind::COMMENT,
+            SyntaxKind::BOM,
+            SyntaxKind::SHEBANG,
+        ] {
+            assert!(kind.is_trivia(), "{kind:?}");
+        }
         for kind in [
             SyntaxKind::IDENT,
             SyntaxKind::ERROR,
@@ -189,6 +220,20 @@ mod tests {
             SyntaxKind::SOURCE_FILE,
         ] {
             assert!(!kind.is_trivia(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_bom_and_shebang_are_file_prefix_trivia() {
+        assert!(SyntaxKind::BOM.is_file_prefix());
+        assert!(SyntaxKind::SHEBANG.is_file_prefix());
+        for kind in [
+            SyntaxKind::WHITESPACE,
+            SyntaxKind::COMMENT,
+            SyntaxKind::IDENT,
+            SyntaxKind::SOURCE_FILE,
+        ] {
+            assert!(!kind.is_file_prefix(), "{kind:?}");
         }
     }
 }

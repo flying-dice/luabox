@@ -6,7 +6,14 @@
 
 .DESCRIPTION
     Gates: cold start, `fmt --check` throughput (kept as a wider safety
-    net), and the real `check` gate (live since GL#6).
+    net), the real `check` gate (live since GL#6), and a diagnostics-heavy
+    `lint` + `check` gate.
+
+    Why that fourth gate exists: the ~100-kLOC corpus the first three legs
+    use is *clean* (`check: 0 errors, 0 warnings`), so none of them ever
+    exercises per-diagnostic work. That blind spot hid an
+    O(diagnostics x file size) line lookup: 32 k findings in one file took
+    ~32 s to lint, while the same file with a single finding took 0.35 s.
 
 .PARAMETER Factor
     Multiplier applied to every budget, for slow/loaded machines
@@ -39,6 +46,15 @@ Set-Location $repoRoot
 $ColdStartBudgetBaseMs = 50
 $FmtBudgetBaseMs = 2000
 $CheckBudgetBaseMs = 1000
+# Diagnostics-heavy legs, on one file holding $DiagCorpusFindings findings.
+# Calibrated on the Linux dev baseline (see CHANGELOG "Fixed", wave 8):
+#   lint   357 ms fixed / 14 163 ms with the quadratic lookup restored
+#   check  663 ms fixed /  4 183 ms ditto
+# The budgets sit ~3x above the fixed numbers (headroom for a noisy box, on
+# top of -Factor) and ~3-12x below the broken ones.
+$DiagLintBudgetBaseMs = 1200
+$DiagCheckBudgetBaseMs = 1500
+$DiagCorpusFindings = 20000
 
 $coldStartBudget = $ColdStartBudgetBaseMs * $Factor
 $fmtBudget = $FmtBudgetBaseMs * $Factor
@@ -162,6 +178,107 @@ strict = true
         Write-Host ("PASS check (warm): {0:N1} ms < {1:N1} ms" -f $checkMs, $checkBudget)
     } else {
         Write-Host ("FAIL check (warm): {0:N1} ms >= {1:N1} ms" -f $checkMs, $checkBudget)
+        $fail = $true
+    }
+
+    # --- DIAGNOSTICS-HEAVY GATE ---------------------------------------------
+    # The corpus above is clean, so nothing so far times per-diagnostic
+    # work. These two legs do: one file, $DiagCorpusFindings findings,
+    # every one of them *suppressed*. Suppressing them is deliberate — it
+    # keeps the renderer (which formats one snippet per reported
+    # diagnostic, and is linear in the file for each) out of the
+    # measurement, so what is left is exactly the per-finding bookkeeping
+    # this gate is about. Both commands still compute every finding and
+    # resolve every suppression directive.
+    $diagLintBudget = $DiagLintBudgetBaseMs * $Factor
+    $diagCheckBudget = $DiagCheckBudgetBaseMs * $Factor
+
+    $diagManifest = @'
+[package]
+name = "perf-gate-diagnostics"
+version = "0.0.0"
+edition = "5.4"
+
+[build]
+target = "5.4"
+out = "dist"
+
+[dependencies]
+'@
+    $diagRoot = Join-Path $corpusDir "diagnostics-heavy"
+    foreach ($project in @("lint", "check")) {
+        New-Item -ItemType Directory -Path (Join-Path $diagRoot "$project/src") -Force | Out-Null
+        Set-Content -Path (Join-Path $diagRoot "$project/luabox.toml") -Value $diagManifest -NoNewline
+    }
+
+    Write-Host ""
+    Write-Host "perf-gate: generating diagnostics-heavy corpus ($DiagCorpusFindings findings each) ..."
+
+    # `unused-local` (LB0501) x N, each silenced by its own
+    # `---@luabox-ignore`.
+    $lintLines = [System.Collections.Generic.List[string]]::new()
+    $lintLines.Add("local function main()")
+    for ($i = 0; $i -lt $DiagCorpusFindings; $i++) {
+        $lintLines.Add("    ---@luabox-ignore unused-local perf-gate corpus")
+        $lintLines.Add("    local unused_$i = $i")
+    }
+    $lintLines.Add("end")
+    $lintLines.Add("return main")
+    Set-Content -Path (Join-Path $diagRoot "lint/src/main.lua") -Value $lintLines
+
+    # `undefined-field` (LB0306) x N, silenced file-wide by luals' own
+    # `---@diagnostic disable`, which is the checker's line-keyed path.
+    $checkLines = [System.Collections.Generic.List[string]]::new()
+    $checkLines.Add("---@diagnostic disable: undefined-field")
+    $checkLines.Add("---@class Point")
+    $checkLines.Add("---@field x number")
+    $checkLines.Add("local Point = { x = 1 }")
+    $checkLines.Add("")
+    $checkLines.Add("---@type Point")
+    $checkLines.Add("local p = Point")
+    $checkLines.Add("")
+    for ($i = 0; $i -lt $DiagCorpusFindings; $i++) {
+        $checkLines.Add("local v$i = p.nope$i")
+        $checkLines.Add("print(v$i)")
+    }
+    $checkLines.Add("return p")
+    Set-Content -Path (Join-Path $diagRoot "check/src/main.lua") -Value $checkLines
+
+    Write-Host ""
+    Write-Host "perf-gate: lint on a diagnostics-heavy file (warm)..."
+    Push-Location (Join-Path $diagRoot "lint")
+    try {
+        & $luaboxBin lint *> $null
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        & $luaboxBin lint *> $null
+        $sw.Stop()
+    } finally {
+        Pop-Location
+    }
+    $diagLintMs = $sw.Elapsed.TotalMilliseconds
+    if ($diagLintMs -lt $diagLintBudget) {
+        Write-Host ("PASS lint (diagnostics-heavy): {0:N1} ms < {1:N1} ms" -f $diagLintMs, $diagLintBudget)
+    } else {
+        Write-Host ("FAIL lint (diagnostics-heavy): {0:N1} ms >= {1:N1} ms" -f $diagLintMs, $diagLintBudget)
+        $fail = $true
+    }
+
+    Write-Host ""
+    Write-Host "perf-gate: check on a diagnostics-heavy file (warm)..."
+    Push-Location (Join-Path $diagRoot "check")
+    try {
+        & $luaboxBin check *> $null
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        & $luaboxBin check *> $null
+        $sw.Stop()
+    } finally {
+        Pop-Location
+    }
+    $diagCheckMs = $sw.Elapsed.TotalMilliseconds
+    if ($diagCheckMs -lt $diagCheckBudget) {
+        Write-Host ("PASS check (diagnostics-heavy): {0:N1} ms < {1:N1} ms" -f $diagCheckMs, $diagCheckBudget)
+    } else {
+        Write-Host ("FAIL check (diagnostics-heavy): {0:N1} ms >= {1:N1} ms" -f $diagCheckMs, $diagCheckBudget)
         $fail = $true
     }
 

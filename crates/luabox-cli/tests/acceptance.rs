@@ -257,6 +257,35 @@ fn lua_file_containing(world: &mut AcceptanceWorld, source: String) {
     write_file(world.dir.path(), "src/main.lua", &format!("{source}\n"));
 }
 
+/// A Lua file whose first bytes are a UTF-8 byte-order mark.
+///
+/// The mark gets its own step rather than living in the docstring: written
+/// there it would be an invisible character in the `.feature` file, which
+/// editors and `git` normalization add and strip at will — exactly the kind
+/// of accident these scenarios exist to pin down.
+#[given(expr = "a Lua file with a UTF-8 BOM containing:")]
+fn lua_file_with_bom(world: &mut AcceptanceWorld, step: &Step) {
+    write_file(
+        world.dir.path(),
+        "src/main.lua",
+        &format!("\u{feff}{}", docstring(step)),
+    );
+}
+
+/// The counterpart assertion: the file's content is the docstring with a
+/// leading UTF-8 BOM, byte for byte.
+#[then(expr = "{string} equals, with a leading UTF-8 BOM:")]
+fn file_equals_with_bom(world: &mut AcceptanceWorld, path: String, step: &Step) {
+    let full = world.dir.path().join(&path);
+    let actual =
+        std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("cannot read `{path}`: {e}"));
+    let expected = format!("\u{feff}{}", docstring(step));
+    assert_eq!(
+        actual, expected,
+        "`{path}` does not match the expected content"
+    );
+}
+
 #[then(expr = "diagnostic {word} is reported")]
 fn diagnostic_reported(world: &mut AcceptanceWorld, code: String) {
     let stdout = world.stdout();

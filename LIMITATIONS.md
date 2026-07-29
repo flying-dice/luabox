@@ -144,6 +144,23 @@ one.
 
 ## Tooling
 
+### Parser nesting and expression-size limits
+
+**Anything reference Lua accepts, luabox parses.** The parser bounds its own
+recursion (nesting limit 220, against reference Lua's ~197 — `LUAI_MAXCCALLS`
+is 200) and the height of the trees it builds (512), so pathological input
+degrades into a diagnostic instead of a stack overflow. Both limits sit above
+what `lua5.1`–`lua5.4` and `luac` accept, so no program a reference
+implementation compiles is rejected here for being too deeply nested. Past
+them you get one `nesting limit exceeded` or `expression too complex` — never
+a crash, and the tree stays lossless.
+
+The one place the two disagree is a *flat* operator chain — `a + a + … + a`,
+`"a" .. "a" .. …` — which reference Lua parses iteratively at any length.
+luabox builds one tree node per operator, so a chain longer than 512 terms
+reports `expression too complex`. Machine-generated sources are the only
+realistic way to reach that; hand-written Lua does not.
+
 ### Dependency management and execution are non-goals, not gaps
 
 luabox neither manages dependencies nor runs Lua. There is no resolver, no

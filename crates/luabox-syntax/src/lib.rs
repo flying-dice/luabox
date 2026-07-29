@@ -13,11 +13,18 @@
 //!
 //! Boundary contract: tree types + parse API; nothing above this crate knows
 //! token details.
+//!
+//! One source-text utility rides along: [`LineIndex`], the byte-offset →
+//! line-number table every line-keyed consumer (lint suppression,
+//! `---@diagnostic` directives) needs. It lives here because this is the
+//! lowest crate all of them already depend on.
 
 #[macro_use]
 mod kind_macro;
 
+mod line_index;
 pub mod lua;
 pub mod luacats;
 
+pub use line_index::LineIndex;
 pub use lua::{Dialect, LuaLanguage, Parse, ParseError, SyntaxKind, Token, lex, parse};
