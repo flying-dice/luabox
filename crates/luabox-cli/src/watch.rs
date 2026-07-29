@@ -33,6 +33,17 @@
 //! `tests/watch.rs` integration test, since a live OS watcher can't be
 //! driven by synthetic events.
 //!
+//! The two agreeing is not a claim, it is an **assertion**: `BATCHING_CASES`
+//! (test-only) is one table of timed event logs, and
+//! `the_model_and_the_live_loop_batch_every_case_identically` feeds every case
+//! to *both* — `partition_batches` instantly, [`next_batch`] over a real
+//! channel fed by a sender thread on a stretched window — and requires the same
+//! batches out of each. A model that drifted from the loop it models would be
+//! worse than no model at all, so it has to be caught, not hoped for. (The
+//! window is a parameter of [`next_batch`] for exactly this: the live leg runs
+//! it long enough that scheduler jitter cannot move an event across a boundary.
+//! Production always passes [`DEBOUNCE_WINDOW`].)
+//!
 //! ## Filtering
 //!
 //! Two filters, and both are load-bearing.
@@ -178,7 +189,7 @@ pub fn run(
     let result = on_change();
     report(result);
 
-    while let Some(batch) = next_batch(&rx, root, out_dir) {
+    while let Some(batch) = next_batch(&rx, root, out_dir, DEBOUNCE_WINDOW) {
         if batch.is_empty() {
             continue;
         }
@@ -230,24 +241,30 @@ fn triggers_rerun(kind: EventKind) -> bool {
     }
 }
 
-/// Block until the first event arrives, then keep collecting for
-/// [`DEBOUNCE_WINDOW`] measured from *that* event — not a sliding window, see
-/// the module docs — and return the batch's relevant, deduped paths
-/// ([`filter_and_dedupe`]). An empty `Vec` means the whole batch was noise.
+/// Block until the first event arrives, then keep collecting for `window`
+/// measured from *that* event — not a sliding window, see the module docs —
+/// and return the batch's relevant, deduped paths ([`filter_and_dedupe`]). An
+/// empty `Vec` means the whole batch was noise.
 ///
 /// `None` once the watcher's channel has closed, which is [`run`]'s only exit.
 ///
 /// Split out of [`run`] so the windowing rule can be driven against a real
 /// channel and real time in a unit test — `partition_batches` (test-only)
-/// models the same rule over a synthetic event log, and the two agreeing is
-/// the point.
+/// models the same rule over a synthetic event log, and the parity test named
+/// in the module docs asserts the two agree on every case in one shared table.
+///
+/// `window` is a parameter solely so that parity test can stretch it: the live
+/// leg drives real threads and real sleeps, and a window measured in hundreds
+/// of milliseconds leaves no margin for scheduler jitter. [`run`] always passes
+/// [`DEBOUNCE_WINDOW`], which is the only value that ships.
 fn next_batch(
     rx: &mpsc::Receiver<Event>,
     root: &Path,
     out_dir: Option<&Path>,
+    window: Duration,
 ) -> Option<Vec<PathBuf>> {
     let mut raw = rx.recv().ok()?.paths;
-    let deadline = Instant::now() + DEBOUNCE_WINDOW;
+    let deadline = Instant::now() + window;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -359,9 +376,6 @@ mod tests {
         }
     }
 
-    fn ms(n: u64) -> Duration {
-        Duration::from_millis(n)
-    }
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
     }
@@ -427,54 +441,171 @@ mod tests {
         assert!(triggers_rerun(notify::Event::default().kind));
     }
 
-    #[test]
-    fn partition_single_burst_into_one_batch() {
-        let events = vec![
-            (ms(0), p("a.lua")),
-            (ms(50), p("b.lua")),
-            (ms(190), p("c.lua")),
-        ];
-        let batches = partition_batches(&events, ms(200));
-        assert_eq!(batches, vec![vec![p("a.lua"), p("b.lua"), p("c.lua")]]);
+    // --- the batching rule, modelled and lived ----------------------------
+    //
+    // One table, two consumers. `partition_batches` is the pure model of the
+    // windowing rule; `next_batch` is the loop the watcher actually runs. Both
+    // are driven over `BATCHING_CASES` below and required to agree — see the
+    // module docs for why a silently drifting model is worse than none.
+
+    /// One batching case: a name, the event log as `(offset, path)` pairs in
+    /// *window fractions*, and the batches the rule must produce.
+    ///
+    /// Fractions rather than milliseconds so the same case can be replayed at
+    /// two very different window lengths: instantly by the model at the shipped
+    /// 200 ms, and over real threads and real sleeps by the live leg at a
+    /// stretched window where jitter cannot move an event across a boundary.
+    struct BatchingCase {
+        name: &'static str,
+        events: &'static [(f64, &'static str)],
+        batches: &'static [&'static [&'static str]],
+    }
+
+    /// Every case both the model and the live loop must batch identically.
+    ///
+    /// Offsets sit well inside or well outside the window on purpose: the exact
+    /// boundary is the one instant a real sender thread cannot be aimed at, so
+    /// it is asserted against the model alone
+    /// (`the_model_includes_an_event_landing_exactly_on_the_window`).
+    const BATCHING_CASES: &[BatchingCase] = &[
+        BatchingCase {
+            name: "a burst inside the window is one batch",
+            events: &[
+                (0.0, "/proj/a.lua"),
+                (0.25, "/proj/b.lua"),
+                (0.6, "/proj/c.lua"),
+            ],
+            batches: &[&["/proj/a.lua", "/proj/b.lua", "/proj/c.lua"]],
+        },
+        BatchingCase {
+            name: "events far apart are separate batches",
+            events: &[(0.0, "/proj/a.lua"), (2.0, "/proj/b.lua")],
+            batches: &[&["/proj/a.lua"], &["/proj/b.lua"]],
+        },
+        BatchingCase {
+            // A steady trickle must not extend one batch forever: the window is
+            // anchored to the batch's first event, not to the last one seen.
+            name: "the window is anchored to the batch start, not sliding",
+            events: &[
+                (0.0, "/proj/a.lua"),
+                (0.6, "/proj/b.lua"),
+                (1.4, "/proj/c.lua"),
+            ],
+            batches: &[&["/proj/a.lua", "/proj/b.lua"], &["/proj/c.lua"]],
+        },
+        BatchingCase {
+            name: "a repeated path inside one batch collapses in first-seen order",
+            events: &[
+                (0.0, "/proj/b.lua"),
+                (0.2, "/proj/a.lua"),
+                (0.4, "/proj/b.lua"),
+            ],
+            batches: &[&["/proj/b.lua", "/proj/a.lua"]],
+        },
+        BatchingCase {
+            name: "noise inside a batch is dropped without splitting it",
+            events: &[
+                (0.0, "/proj/a.lua"),
+                (0.2, "/proj/README.md"),
+                (0.4, "/proj/b.lua"),
+            ],
+            batches: &[&["/proj/a.lua", "/proj/b.lua"]],
+        },
+    ];
+
+    /// A case's event log at a concrete window length.
+    fn scaled(case: &BatchingCase, window: Duration) -> Vec<(Duration, PathBuf)> {
+        case.events
+            .iter()
+            .map(|(fraction, path)| (window.mul_f64(*fraction), p(path)))
+            .collect()
+    }
+
+    /// A case's expected batches, as owned paths.
+    fn expected(case: &BatchingCase) -> Vec<Vec<PathBuf>> {
+        case.batches
+            .iter()
+            .map(|batch| batch.iter().map(|path| p(path)).collect())
+            .collect()
+    }
+
+    /// The model's batches for `case`, put through the same relevance filter
+    /// and dedupe the live loop applies — the model windows, it does not
+    /// filter, so this is what makes the two comparable at all.
+    fn modelled(case: &BatchingCase) -> Vec<Vec<PathBuf>> {
+        partition_batches(&scaled(case, DEBOUNCE_WINDOW), DEBOUNCE_WINDOW)
+            .into_iter()
+            .map(|batch| filter_and_dedupe(batch, Path::new("/proj"), None))
+            .collect()
     }
 
     #[test]
-    fn partition_splits_events_far_apart() {
-        let events = vec![(ms(0), p("a.lua")), (ms(500), p("b.lua"))];
-        let batches = partition_batches(&events, ms(200));
-        assert_eq!(batches, vec![vec![p("a.lua")], vec![p("b.lua")]]);
+    fn the_model_batches_every_case_as_documented() {
+        for case in BATCHING_CASES {
+            assert_eq!(modelled(case), expected(case), "{}", case.name);
+        }
     }
 
     #[test]
-    fn partition_window_anchored_to_batch_start_not_sliding() {
-        // A steady trickle every 150ms must not extend one batch forever:
-        // once past t0+200ms, the next event starts a fresh batch even
-        // though it's well within 150ms of the previous event.
-        let events = vec![
-            (ms(0), p("a.lua")),
-            (ms(150), p("b.lua")),
-            (ms(300), p("c.lua")),
-        ];
-        let batches = partition_batches(&events, ms(200));
-        assert_eq!(
-            batches,
-            vec![vec![p("a.lua"), p("b.lua")], vec![p("c.lua")]]
-        );
+    fn the_model_and_the_live_loop_batch_every_case_identically() {
+        // The parity assertion the module docs promise, and the reason the
+        // model is allowed to exist: a pure function nobody checks against the
+        // real loop can drift into describing a watcher that isn't shipped.
+        //
+        // The window is stretched here so a sender thread's jitter (tens of ms
+        // under a loaded runner) cannot move an event across a boundary: every
+        // offset in the table is at least 0.4 windows — 320 ms — clear of one.
+        const LIVE_WINDOW: Duration = Duration::from_millis(800);
+        let root = Path::new("/proj");
+
+        for case in BATCHING_CASES {
+            let (tx, rx) = mpsc::channel::<notify::Event>();
+            let schedule = scaled(case, LIVE_WINDOW);
+            let sender = std::thread::spawn(move || {
+                let start = std::time::Instant::now();
+                for (offset, path) in schedule {
+                    let due = start + offset;
+                    let now = std::time::Instant::now();
+                    if due > now {
+                        std::thread::sleep(due - now);
+                    }
+                    let _ = tx.send(notify::Event {
+                        paths: vec![path],
+                        ..notify::Event::default()
+                    });
+                }
+            });
+
+            let want = modelled(case);
+            let mut lived = Vec::new();
+            for _ in 0..want.len() {
+                lived.push(
+                    next_batch(&rx, root, None, LIVE_WINDOW)
+                        .unwrap_or_else(|| panic!("{}: the channel closed early", case.name)),
+                );
+            }
+            sender.join().expect("sender thread");
+
+            assert_eq!(
+                lived, want,
+                "{}: the live loop and its model disagree",
+                case.name
+            );
+            assert_eq!(lived, expected(case), "{}", case.name);
+        }
     }
 
     #[test]
-    fn partition_boundary_event_at_exact_window_is_included() {
-        let events = vec![(ms(0), p("a.lua")), (ms(200), p("b.lua"))];
-        let batches = partition_batches(&events, ms(200));
-        assert_eq!(batches, vec![vec![p("a.lua"), p("b.lua")]]);
-    }
-
-    #[test]
-    fn partition_matches_production_window_constant() {
-        // Sanity check that DEBOUNCE_WINDOW itself behaves as documented
-        // (200ms), not just an arbitrary `ms(200)` in the tests above.
+    fn the_model_includes_an_event_landing_exactly_on_the_window() {
+        // The one case the live leg above cannot replay: `<= t0 + window` is
+        // inclusive in the model, and a real sender cannot be aimed at an exact
+        // instant. Pinned against the model alone, and against the shipped
+        // constant rather than an arbitrary `ms(200)`.
         let events = vec![(Duration::ZERO, p("a.lua")), (DEBOUNCE_WINDOW, p("b.lua"))];
-        assert_eq!(partition_batches(&events, DEBOUNCE_WINDOW).len(), 1);
+        assert_eq!(
+            partition_batches(&events, DEBOUNCE_WINDOW),
+            vec![vec![p("a.lua"), p("b.lua")]]
+        );
     }
 
     #[test]
@@ -611,7 +742,7 @@ mod tests {
 
         // Both sends land inside the window from the first, so they merge;
         // the noise is dropped and the repeat collapses to first-seen order.
-        let batch = next_batch(&rx, root, None).expect("a batch");
+        let batch = next_batch(&rx, root, None, DEBOUNCE_WINDOW).expect("a batch");
         assert_eq!(batch, vec![p("/proj/a.lua"), p("/proj/b.lua")]);
     }
 
@@ -623,14 +754,20 @@ mod tests {
         let (tx, rx) = mpsc::channel::<notify::Event>();
         tx.send(event(&["/proj/README.md"])).expect("send");
         drop(tx);
-        assert_eq!(next_batch(&rx, root, None), Some(Vec::new()));
+        assert_eq!(
+            next_batch(&rx, root, None, DEBOUNCE_WINDOW),
+            Some(Vec::new())
+        );
     }
 
     #[test]
     fn a_closed_channel_ends_the_watch_loop() {
         let (tx, rx) = mpsc::channel::<notify::Event>();
         drop(tx);
-        assert_eq!(next_batch(&rx, Path::new("/proj"), None), None);
+        assert_eq!(
+            next_batch(&rx, Path::new("/proj"), None, DEBOUNCE_WINDOW),
+            None
+        );
     }
 
     #[test]
@@ -645,8 +782,14 @@ mod tests {
             let _ = tx.send(event(&["/proj/b.lua"]));
         });
 
-        assert_eq!(next_batch(&rx, root, None), Some(vec![p("/proj/a.lua")]));
-        assert_eq!(next_batch(&rx, root, None), Some(vec![p("/proj/b.lua")]));
+        assert_eq!(
+            next_batch(&rx, root, None, DEBOUNCE_WINDOW),
+            Some(vec![p("/proj/a.lua")])
+        );
+        assert_eq!(
+            next_batch(&rx, root, None, DEBOUNCE_WINDOW),
+            Some(vec![p("/proj/b.lua")])
+        );
         sender.join().expect("sender thread");
     }
 
@@ -664,7 +807,7 @@ mod tests {
         drop(tx);
 
         assert_eq!(
-            next_batch(&rx, root, None),
+            next_batch(&rx, root, None, DEBOUNCE_WINDOW),
             Some(vec![p("/proj/broken.lua")]),
             "an edit queued during a run must survive to trigger the next rerun"
         );
