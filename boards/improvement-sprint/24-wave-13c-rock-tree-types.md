@@ -1,8 +1,11 @@
 ---
-column: todo
+column: doing
 labels: [wave, docs]
 priority: high
-updatedAt: 2026-07-29T19:11:00.000Z
+agent: opus-13c
+live: true
+status: launching
+updatedAt: 2026-07-29T22:24:00.000Z
 ---
 # Wave 13c — cross-package types from a bare luarocks tree (#30)
 
