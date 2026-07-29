@@ -19,18 +19,32 @@ spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
   levels) and every mutually-exclusive dependency form, each with a prose
   description. The schema describes the manifest's *data model*: you write
   TOML, tooling maps it to JSON with the standard mapping and validates that.
-- **A type-checking process that keeps the schema and the parser honest.**
-  The two descriptions of the manifest — the hand-rolled parser and the
-  published schema — are pinned to each other by a parity suite in
-  `luabox-manifest`: the schema's `properties` must equal the parser's key
-  allow-lists table by table, its `enum`s must equal the Rust closed
-  vocabularies variant for variant, its `required` sets must equal what
-  `Manifest::parse` actually demands, every closed table must reject
-  additional properties, and every property must carry a description. On top
-  of that, every `examples/*/luabox.toml` in the repository plus a curated
-  valid/invalid fixture corpus is run through both the schema validator and
-  the parser, and the two must return the same verdict. Adding an example
-  project extends the corpus automatically.
+- **The manifest contract is declared once, and both the parser and the
+  published schema are built from it.** `luabox.toml` used to be described
+  twice — by the hand-rolled parser's key allow-lists and by a hand-authored
+  JSON Schema — with a parity suite standing between them to catch the drift.
+  There is now a single declarative table in `luabox-manifest`: each table of
+  the manifest names its keys once, with the value type, whether the key is
+  required, the default the parser applies, and the prose an outside reader
+  needs. `Manifest::parse` builds its allow-lists and its did-you-mean
+  candidates from that table, and `schema/luabox.schema.json` is *generated*
+  from it. A key that exists for one and not the other is no longer a test
+  failure; it cannot be written down. Manifest error messages, the published
+  schema and `luabox schema`'s output are unchanged.
+
+  What a key table cannot say stays hand-written — and stays guarded by
+  tests: the four-branch `oneOf` that makes the dependency source forms
+  mutually exclusive, the semver and package-name patterns, and the `[lint]`
+  open rule-id mapping. Every `examples/*/luabox.toml` in the repository plus
+  a curated valid/invalid fixture corpus still runs through **both** the
+  schema validator and the parser, and the two must return the same verdict,
+  which is what holds those fragments to the parser's hand-coded cross-key
+  rules. Adding an example project extends the corpus automatically. The
+  generated schema file stays checked in, because its `$id` is a URL editors
+  point at and the binary prints the file rather than rendering it at
+  runtime; a test fails when the file drifts from the contract and says how
+  to regenerate it
+  (`LUABOX_BLESS=1 cargo test -p luabox-manifest schema_file_is_current`).
 
 ### Fixed
 
