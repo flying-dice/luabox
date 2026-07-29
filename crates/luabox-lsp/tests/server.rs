@@ -3528,6 +3528,46 @@ fn the_server_exits_cleanly_when_the_client_disconnects() {
     start(&[]).disconnect();
 }
 
+#[test]
+fn a_malformed_initialize_is_refused_on_the_id_the_client_is_waiting_on() {
+    // A `rootUri` the URI grammar rejects — an unencoded space, which a
+    // client whose project lives in `~/my projects` can genuinely emit. The
+    // handshake cannot proceed (there is no workspace to serve), but the
+    // client is blocked on this id, so it is answered rather than left
+    // watching a pipe close.
+    let (server_conn, client) = Connection::memory();
+    let server = std::thread::spawn(move || luabox_lsp::run(server_conn));
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(0),
+            "initialize".to_string(),
+            serde_json::json!({
+                "processId": serde_json::Value::Null,
+                "rootUri": "file:///my projects",
+                "capabilities": {},
+            }),
+        )))
+        .expect("send");
+
+    let response = match client
+        .receiver
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the server answered")
+    {
+        Message::Response(response) => response,
+        other => panic!("expected a response, got {other:?}"),
+    };
+    let error = response.error.expect("an error response");
+    assert_eq!(error.code, lsp_server::ErrorCode::InvalidParams as i32);
+    assert!(error.message.contains("initialize"), "{}", error.message);
+    // And the session ends: an unusable handshake is terminal.
+    assert!(
+        server.join().expect("server thread panicked").is_err(),
+        "a malformed initialize ends the run"
+    );
+}
+
 // === Protocol maturity: manifest-driven reconfiguration ==================
 
 #[test]

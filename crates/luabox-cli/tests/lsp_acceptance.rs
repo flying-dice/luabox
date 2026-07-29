@@ -146,6 +146,28 @@ impl Server {
         }
     }
 
+    /// Wait for the child to exit *on its own* and return its exit code.
+    ///
+    /// Deliberately leaves stdin open, unlike [`Self::stop`]: the scenario
+    /// that uses this asserts the server stopped because of the message it was
+    /// sent, and closing the pipe would end the loop by EOF instead — hiding
+    /// exactly the behaviour under test.
+    fn wait_for_exit(&mut self) -> i32 {
+        let deadline = Instant::now() + EXIT_TIMEOUT;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return status.code().unwrap_or(-1),
+                Ok(None) => {}
+                Err(error) => panic!("cannot wait for the language server: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the language server is still running"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Wait for the child to exit, killing it once [`EXIT_TIMEOUT`] passes.
     fn reap(&mut self) {
         let deadline = Instant::now() + EXIT_TIMEOUT;
@@ -246,6 +268,9 @@ struct LspWorld {
     /// The document the last `textDocument/codeAction` request named, so an
     /// "applying the action" step knows which buffer the edits target.
     action_doc: Option<String>,
+    /// The exit code of a server driven to termination by a scenario (rather
+    /// than by teardown) — the `exit`-without-`shutdown` contract.
+    exit_code: Option<i32>,
     next_id: i64,
 }
 
@@ -266,6 +291,7 @@ impl LspWorld {
             docs: HashMap::new(),
             open: Vec::new(),
             action_doc: None,
+            exit_code: None,
             next_id: 1,
         }
     }
@@ -780,6 +806,103 @@ fn reply_is_error_mentioning(world: &mut LspWorld, needle: String) {
     assert!(
         message.contains(&needle),
         "error message `{message}` does not mention `{needle}`"
+    );
+}
+
+// === Malformed messages ==================================================
+
+/// A hover whose params carry no `position` at all: `HoverParams` cannot be
+/// built from them, so the server has to answer with an error instead of
+/// dying on the way to the handler.
+#[when(expr = "I request a hover for {string} with no position")]
+fn request_hover_without_position(world: &mut LspWorld, path: String) {
+    world.request(
+        "textDocument/hover",
+        json!({ "textDocument": world.text_document(&path) }),
+    );
+}
+
+/// The JSON-RPC error *code*, not just its message: `-32602 InvalidParams` is
+/// the contract a client keys its own error handling off.
+#[then(expr = "the server replies with error code {int}")]
+fn reply_has_error_code(world: &mut LspWorld, expected: i64) {
+    let error = world
+        .error
+        .as_ref()
+        .unwrap_or_else(|| panic!("expected an error reply, got {}", world.reply));
+    assert_eq!(
+        error["code"].as_i64(),
+        Some(expected),
+        "error reply: {error}"
+    );
+}
+
+/// A `didOpen` carrying a URI string the protocol's grammar rejects — an
+/// unencoded space is what real clients emit — so the params fail to decode
+/// before any handler sees them. No diagnostics follow a dropped
+/// notification, so the step does not wait for a publish.
+#[when(expr = "I send a didOpen notification with the raw URI {string}")]
+fn open_with_raw_uri(world: &mut LspWorld, uri: String) {
+    world.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "lua",
+                "version": 1,
+                "text": "local x = 1\n",
+            }
+        }),
+    );
+}
+
+/// The same shape of failure one field over: `languageId` is required by
+/// `TextDocumentItem`, and a client that omits it must not cost the session.
+#[when(expr = "I send a didOpen notification with no languageId for {string}")]
+fn open_without_language_id(world: &mut LspWorld, path: String) {
+    let uri = world.uri(&path);
+    world.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": uri, "version": 1, "text": "local x = 1\n" }
+        }),
+    );
+}
+
+/// A notification has no id to answer, so the client's log pane is the only
+/// place a dropped one can be reported. `MessageType::ERROR` is 1.
+#[then(expr = "the server logged an error containing {string}")]
+fn server_logged_error(world: &mut LspWorld, needle: String) {
+    let logged: Vec<&str> = world
+        .log_messages
+        .iter()
+        .filter(|m| m["type"].as_i64() == Some(1))
+        .filter_map(|m| m["message"].as_str())
+        .collect();
+    assert!(
+        logged.iter().any(|m| m.contains(&needle)),
+        "no logged error contains `{needle}`; logged: {logged:?}"
+    );
+}
+
+/// Take the server out of the world (so teardown does not try to shut an
+/// already-stopped one down), send a bare `exit`, and wait for it to go.
+#[when("I send exit without a prior shutdown")]
+fn exit_without_shutdown(world: &mut LspWorld) {
+    let mut server = world
+        .server
+        .take()
+        .expect("the language server is not running");
+    server.send(&json!({ "jsonrpc": "2.0", "method": "exit", "params": Value::Null }));
+    world.exit_code = Some(server.wait_for_exit());
+}
+
+#[then(expr = "the server process exits with code {int}")]
+fn server_exits_with_code(world: &mut LspWorld, expected: i32) {
+    assert_eq!(
+        world.exit_code,
+        Some(expected),
+        "the language server's exit code"
     );
 }
 
