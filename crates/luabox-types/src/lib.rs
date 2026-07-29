@@ -187,6 +187,41 @@ pub struct ModuleSurface {
     pub types: FileTypes,
 }
 
+/// The two derived artifacts every per-file entry point in this crate needs
+/// from a parse: the harvested LuaCATS annotation blocks and the lowered HIR.
+///
+/// Both are pure functions of the parse, so a caller that runs several entry
+/// points over the *same* file — as `luabox check` does, taking a module's
+/// surface, its `require` inventory, and then checking it — derives them once
+/// and threads them through the `_with_artifacts` entry points instead of
+/// paying for `harvest` + `lower` again per call (CC-M1). The plain entry
+/// points ([`module_surface`], [`check_file_with_requires`],
+/// [`module_requires`]) still exist and simply derive what they need
+/// themselves, so a one-shot caller need not know this type exists.
+#[derive(Debug, Clone)]
+pub struct FileArtifacts {
+    items: Vec<luacats::AnnotatedItem>,
+    lowered: luabox_hir::LoweredFile,
+}
+
+impl FileArtifacts {
+    /// Harvest the annotations and lower the HIR of one parsed file.
+    #[must_use]
+    pub fn new(parse: &lua::Parse) -> Self {
+        Self {
+            items: luacats::harvest(parse),
+            lowered: luabox_hir::lower(parse),
+        }
+    }
+
+    /// This file's static `require` module strings, in source order —
+    /// [`module_requires`] without re-lowering.
+    #[must_use]
+    pub fn requires(&self) -> Vec<String> {
+        requires_of(&self.lowered)
+    }
+}
+
 /// Compute one file's [`ModuleSurface`]: the reified `require`-export type
 /// plus the workspace-global class/enum declarations.
 ///
@@ -209,18 +244,29 @@ pub struct ModuleSurface {
 /// and resolved in the *consumer's* environment.
 #[must_use]
 pub fn module_surface(parse: &lua::Parse, file: &str, ambient: Option<&Ambient>) -> ModuleSurface {
-    let items = luacats::harvest(parse);
-    let env = TypeEnv::build_from_items(parse, &items, ambient);
-    let lowered = luabox_hir::lower(parse);
+    module_surface_with_artifacts(parse, file, ambient, &FileArtifacts::new(parse))
+}
+
+/// [`module_surface`] over already-derived [`FileArtifacts`], for a caller
+/// that also checks the same file and must not harvest and lower it twice.
+#[must_use]
+pub fn module_surface_with_artifacts(
+    parse: &lua::Parse,
+    file: &str,
+    ambient: Option<&Ambient>,
+    artifacts: &FileArtifacts,
+) -> ModuleSurface {
+    let items = &artifacts.items;
+    let env = TypeEnv::build_from_items(parse, items, ambient);
     let outcome = infer::run(
-        &lowered,
+        &artifacts.lowered,
         &env,
         file,
         Exactness::Strict,
         InferMode::Check,
         None,
     );
-    let types = FileTypes::collect(&items, &env, &outcome.carrier_class_final);
+    let types = FileTypes::collect(items, &env, &outcome.carrier_class_final);
     ModuleSurface {
         export: outcome.module_export,
         types,
@@ -233,7 +279,12 @@ pub fn module_surface(parse: &lua::Parse, file: &str, ambient: Option<&Ambient>)
 /// bundler hard-errors on them at build time).
 #[must_use]
 pub fn module_requires(parse: &lua::Parse) -> Vec<String> {
-    luabox_hir::lower(parse)
+    requires_of(&luabox_hir::lower(parse))
+}
+
+/// The shared body of [`module_requires`] and [`FileArtifacts::requires`].
+fn requires_of(lowered: &luabox_hir::LoweredFile) -> Vec<String> {
+    lowered
         .requires()
         .iter()
         .map(|edge| edge.module.clone())
@@ -300,7 +351,31 @@ pub fn check_file_with_requires<S: std::hash::BuildHasher>(
     ambient: Option<&Ambient>,
     requires: &HashMap<String, Ty, S>,
 ) -> Vec<Diagnostic> {
-    let items = luacats::harvest(parse);
+    check_file_with_artifacts(
+        parse,
+        file,
+        strictness,
+        edition,
+        ambient,
+        requires,
+        &FileArtifacts::new(parse),
+    )
+}
+
+/// [`check_file_with_requires`] over already-derived [`FileArtifacts`], for a
+/// caller that also took the file's [`module_surface`] and must not harvest
+/// and lower it twice (CC-M1).
+#[must_use]
+pub fn check_file_with_artifacts<S: std::hash::BuildHasher>(
+    parse: &lua::Parse,
+    file: &str,
+    strictness: Strictness,
+    edition: lua::Dialect,
+    ambient: Option<&Ambient>,
+    requires: &HashMap<String, Ty, S>,
+    artifacts: &FileArtifacts,
+) -> Vec<Diagnostic> {
+    let items = &artifacts.items;
     // A `---@meta` definition package: its `---@class` declarations are
     // contracts, not carriers, so no `: Interface` conformance runs inside it
     // (#107).
@@ -313,7 +388,7 @@ pub fn check_file_with_requires<S: std::hash::BuildHasher>(
 
     let mut diags: Vec<Diagnostic> = Vec::new();
 
-    let env = TypeEnv::build_from_items(parse, &items, ambient);
+    let env = TypeEnv::build_from_items(parse, items, ambient);
     // A resolved `require`-export registry (#85) reaches inference through
     // the display-mode `externals` channel, but with call-site parameter
     // seeding OFF (`fn_param_seeds` empty, `seed_params` false below): only
@@ -339,9 +414,8 @@ pub fn check_file_with_requires<S: std::hash::BuildHasher>(
         // its published types wherever annotations are absent (annotations
         // always win), and inference contributes its own diagnostics
         // (LB0306) at the same strictness-mapped severity.
-        let lowered = luabox_hir::lower(parse);
         let inference = infer::run(
-            &lowered,
+            &artifacts.lowered,
             &env,
             file,
             Exactness::from_strict(strictness == Strictness::Strict),
@@ -361,7 +435,7 @@ pub fn check_file_with_requires<S: std::hash::BuildHasher>(
         // Duplicate `---@field` on one class (luals `duplicate-doc-field`,
         // LB0311) — a per-file doc-consistency finding, so it is emitted here
         // alongside the type diagnostics and suppressed under `None` like them.
-        diags.extend(check::duplicate_doc_fields(&items, file));
+        diags.extend(check::duplicate_doc_fields(items, file));
     }
 
     // Honor luals' `---@diagnostic disable*: <rule>` for the checker

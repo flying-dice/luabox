@@ -19,6 +19,11 @@
 //! iff any Error-severity diagnostic was produced — warnings never fail
 //! the command.
 //!
+//! Each file is read from disk, parsed, harvested and lowered exactly once
+//! per run: the cross-file surface pre-pass and the per-file check share one
+//! set of per-file records (`SourceFile`) rather than each walking the source
+//! set on its own (CC-M1).
+//!
 //! `--watch` (SPEC.md §4) turns this into a long-running rerun-on-change
 //! loop instead of a one-shot check — see `crate::watch` for the debounce
 //! and filtering rules.
@@ -82,7 +87,9 @@ pub fn run(cwd: &Path, target: Option<&str>, format: Format, watch: bool) -> any
 // ([`luabox_bundle::resolve_candidates`]) over its in-memory file set. The two
 // front-ends therefore cannot disagree on which file a `require` names (the
 // prior db path-suffix approximation is gone). Surface assembly likewise flows
-// through the one `luabox_types::module_surface` producer on both sides.
+// through the one `luabox_types::module_surface` producer on both sides — the
+// CLI reaching it through `module_surface_with_artifacts`, which is that same
+// producer handed the harvest + lowering it already has.
 pub(crate) fn run_once(
     project: &Project,
     target: Option<&str>,
@@ -122,6 +129,41 @@ pub(crate) fn run_once(
         .as_ref()
         .unwrap_or_else(|| stdlib_defs(project.dialect));
 
+    // Read and parse the whole source set ONCE (CC-M1). Both halves of the
+    // check — the cross-file surface pre-pass below and the per-file check
+    // after it — used to walk `lua_files` independently, so every file was
+    // read twice, parsed twice, harvested twice and lowered three times over.
+    // They share these records instead, so each of those happens once.
+    //
+    // The price is retention: one syntax tree + HIR per project file stays
+    // live for the length of the run instead of dying with its rayon task.
+    // Measured on the 100-kLOC perf corpus, peak RSS 64 MiB -> 123 MiB, of
+    // which the syntax trees are only ~12 MiB and the HIR + harvested
+    // annotations ~47 MiB — which is why re-parsing in the second pass to
+    // avoid holding the trees (the alternative the audit allowed) is not
+    // worth it: it would give back the read + parse saving to reclaim a fifth
+    // of the memory.
+    let read: Vec<anyhow::Result<SourceFile>> = lua_files
+        .par_iter()
+        .map(|path| {
+            let rel = display_rel(path, &project.root);
+            let source =
+                fs::read_to_string(path).with_context(|| format!("cannot read `{rel}`"))?;
+            let parse = lua::parse(&source, project.dialect);
+            let artifacts = luabox_types::FileArtifacts::new(&parse);
+            Ok(SourceFile {
+                canonical: canonical(path),
+                rel,
+                parse,
+                artifacts,
+            })
+        })
+        .collect();
+    let mut files: Vec<SourceFile> = Vec::with_capacity(read.len());
+    for result in read {
+        files.push(result?);
+    }
+
     // Cross-file pre-pass (#85): reify every project file's surface up
     // front — its `require`-export type (keyed by canonical path) plus its
     // workspace-global `---@class`/`---@enum` declarations (luals parity:
@@ -132,22 +174,21 @@ pub(crate) fn run_once(
     // requires are left unresolved, so the registry is acyclic and
     // cycle-tolerant. Resolution reuses the bundler's exact `require`
     // path-mapping ([`luabox_bundle::resolve_module`]).
-    let surfaces: Vec<(PathBuf, String, luabox_types::ModuleSurface)> = lua_files
+    let surfaces: Vec<luabox_types::ModuleSurface> = files
         .par_iter()
-        .filter_map(|path| {
-            let source = fs::read_to_string(path).ok()?;
-            let parse = lua::parse(&source, project.dialect);
-            let rel = display_rel(path, &project.root);
-            Some((
-                canonical(path),
-                rel.clone(),
-                luabox_types::module_surface(&parse, &rel, Some(ambient)),
-            ))
+        .map(|file| {
+            luabox_types::module_surface_with_artifacts(
+                &file.parse,
+                &file.rel,
+                Some(ambient),
+                &file.artifacts,
+            )
         })
         .collect();
-    let exports: HashMap<PathBuf, Ty> = surfaces
+    let exports: HashMap<PathBuf, Ty> = files
         .iter()
-        .filter_map(|(path, _rel, surface)| Some((path.clone(), surface.export.clone()?)))
+        .zip(&surfaces)
+        .filter_map(|(file, surface)| Some((file.canonical.clone(), surface.export.clone()?)))
         .collect();
     // Duplicate `---@alias` across project files / `[types] defs` (luals
     // `duplicate-doc-alias`, LB0310, #113): a project-assembly finding — like
@@ -156,62 +197,68 @@ pub(crate) fn run_once(
     // stays consistent. Winner order matches `with_project_types`.
     def_diags.extend(luabox_types::alias_collisions(
         &all_defs,
-        &surfaces
+        &files
             .iter()
-            .map(|(_, rel, s)| (rel.clone(), &s.types))
+            .zip(&surfaces)
+            .map(|(file, surface)| (file.rel.clone(), &surface.types))
             .collect::<Vec<_>>(),
     ));
     // The project-wide ambient: defs + every file's workspace-global
     // classes/enums, merged (defs win same-name member collisions; luals
     // merges duplicate class declarations' fields rather than dropping).
-    let ambient = ambient.with_project_types(surfaces.iter().map(|(_, _, s)| &s.types));
+    let ambient = ambient.with_project_types(surfaces.iter().map(|s| &s.types));
     let ambient = &ambient;
 
     // SPEC.md §16: rayon per-module. Each file is checked against the
     // shared project ambient plus its own resolved `require` exports;
     // collecting per-file Vecs preserves source order.
-    let per_file: Vec<anyhow::Result<Vec<Diagnostic>>> = lua_files
+    let per_file: Vec<Vec<Diagnostic>> = files
         .par_iter()
-        .map(|path| {
-            let rel = display_rel(path, &project.root);
-            let source =
-                fs::read_to_string(path).with_context(|| format!("cannot read `{rel}`"))?;
+        .map(|file| {
             let mut diags = Vec::new();
-            check_one(
-                &source,
-                &rel,
-                project,
-                target_dialect,
-                ambient,
-                &exports,
-                &mut diags,
-            );
-            Ok(diags)
+            check_one(file, project, target_dialect, ambient, &exports, &mut diags);
+            diags
         })
         .collect();
     let mut diags: Vec<Diagnostic> = def_diags;
-    for result in per_file {
-        diags.extend(result?);
+    for file_diags in per_file {
+        diags.extend(file_diags);
     }
 
     finish(&diags, format, &project.root, lua_files.len())
 }
 
+/// One project file, read and parsed once: everything both halves of the
+/// check need from it, so neither goes back to disk nor re-derives what the
+/// other already has (CC-M1).
+struct SourceFile {
+    /// The identity [`luabox_bundle::resolve_module`] hands back, so a
+    /// resolved `require` can be matched to the file it names.
+    canonical: PathBuf,
+    /// Project-relative display path — how diagnostics name this file.
+    rel: String,
+    parse: lua::Parse,
+    /// Harvested annotations + lowered HIR, derived once and threaded into
+    /// the surface pass, the `require` inventory, and the check.
+    artifacts: luabox_types::FileArtifacts,
+}
+
 /// All three passes for one file.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the check pipeline threads its shared context"
-)]
 fn check_one(
-    source: &str,
-    rel: &str,
+    file: &SourceFile,
     project: &Project,
     target: Option<Dialect>,
     ambient: &Ambient,
     exports: &HashMap<PathBuf, Ty>,
     diags: &mut Vec<Diagnostic>,
 ) {
-    let parse = lua::parse(source, project.dialect);
+    let SourceFile {
+        rel,
+        parse,
+        artifacts,
+        ..
+    } = file;
+    let rel = rel.as_str();
 
     // 1. Parse errors.
     for err in parse.errors() {
@@ -233,7 +280,7 @@ fn check_one(
     }
     let mut seen: HashSet<(u16, u32, u32)> = HashSet::new();
     for dialect in passes {
-        for err in lua::validate::validate(&parse, dialect) {
+        for err in lua::validate::validate(parse, dialect) {
             let key = (err.code, err.range.start().into(), err.range.end().into());
             if !seen.insert(key) {
                 continue;
@@ -249,18 +296,19 @@ fn check_one(
 
     // 3. Types against the ambient definition-package layer (SPEC.md §3),
     // with this file's resolved `require` exports in reach (#85).
-    let requires = resolve_requires(&parse, &project.root, project.build_target, exports);
-    diags.extend(luabox_types::check_file_with_requires(
-        &parse,
+    let requires = resolve_requires(artifacts, &project.root, project.build_target, exports);
+    diags.extend(luabox_types::check_file_with_artifacts(
+        parse,
         rel,
         project.strictness,
         project.dialect,
         Some(ambient),
         &requires,
+        artifacts,
     ));
 }
 
-/// Map each static `require("mod")` in `parse` to the export type of the
+/// Map each static `require("mod")` the file names to the export type of the
 /// project file it resolves to, using the bundler's `require` path-mapping.
 /// Requires that resolve outside the project (dependencies, external
 /// runtime modules) have no entry in `exports` and are simply skipped —
@@ -271,13 +319,13 @@ fn check_one(
 /// set): it selects the `lua_modules/share/lua/<X.Y>/` version directory of
 /// a luarocks tree, so `check` looks where the build will.
 fn resolve_requires(
-    parse: &lua::Parse,
+    artifacts: &luabox_types::FileArtifacts,
     root: &Path,
     dialect: Dialect,
     exports: &HashMap<PathBuf, Ty>,
 ) -> HashMap<String, Ty> {
     let mut requires = HashMap::new();
-    for module in luabox_types::module_requires(parse) {
+    for module in artifacts.requires() {
         if let Some(target) = luabox_bundle::resolve_module(root, &module, dialect)
             && let Some(ty) = exports.get(&target)
         {
