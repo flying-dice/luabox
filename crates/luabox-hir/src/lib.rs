@@ -32,6 +32,14 @@
 //! | `(expr)` | erased; `Expr::Truncate` kept only around multi-value producers (`(f())`, `(...)`) where the paren truncates to one value |
 //! | `if/elseif/else` | one `Stmt::If` with a flat `Vec` of branches |
 //! | number/string literals | decoded values (`literal::Number`, `literal::LitStr`) — hex, hex floats, LuaJIT suffixes, escapes |
+//!
+//! # Legality
+//!
+//! [`validate::control_flow`] reads the `goto`/label resolution lowering
+//! already performed and reports what reference Lua refuses to load:
+//! an unresolved `goto` (`LB0020`), a repeated label (`LB0021`), and `break`
+//! outside a loop (`LB0022`) — the one pass in this crate that produces
+//! [`luabox_diag::Diagnostic`]s, shared by `check`, `lint` and the LSP.
 
 pub mod arena;
 mod file;
@@ -39,6 +47,7 @@ pub mod hir;
 pub mod literal;
 mod lower;
 mod source_map;
+pub mod validate;
 
 pub use file::LoweredFile;
 pub use hir::{

@@ -23,6 +23,7 @@ pub struct LoweredFile {
     chunk: BodyId,
     source_map: SourceMap,
     resolutions: HashMap<HirId, Resolution>,
+    goto_names: HashMap<HirId, rowan::TextRange>,
     requires: Vec<RequireEdge>,
     dynamic_requires: Vec<DynamicRequire>,
 }
@@ -36,6 +37,7 @@ impl LoweredFile {
         chunk: BodyId,
         source_map: SourceMap,
         resolutions: HashMap<HirId, Resolution>,
+        goto_names: HashMap<HirId, rowan::TextRange>,
         requires: Vec<RequireEdge>,
         dynamic_requires: Vec<DynamicRequire>,
     ) -> Self {
@@ -46,6 +48,7 @@ impl LoweredFile {
             chunk,
             source_map,
             resolutions,
+            goto_names,
             requires,
             dynamic_requires,
         }
@@ -87,6 +90,15 @@ impl LoweredFile {
     /// The `HirId -> TextRange` back-reference table.
     pub fn source_map(&self) -> &SourceMap {
         &self.source_map
+    }
+
+    /// The range of a `goto`'s *name token*, keyed by the goto statement's
+    /// [`HirId`]; `None` for ids that are not `goto` statements.
+    ///
+    /// The source map holds the whole `goto name` statement; this narrower
+    /// range is what an unresolved-label diagnostic underlines.
+    pub fn goto_name_range(&self, id: HirId) -> Option<rowan::TextRange> {
+        self.goto_names.get(&id).copied()
     }
 
     /// Static `require("...")` edges, in source order.

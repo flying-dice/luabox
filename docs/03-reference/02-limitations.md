@@ -88,17 +88,28 @@ conservative: an unknown/`any`/union callee or a plain table (no declared class,
 or a class with no `call` operator) is left exactly as before — no synthesized
 signature and no new diagnostic.
 
-### `goto`/label/`break` legality is not diagnosed (#44)
+### `goto`/label/`break` legality (shipped — #44 closed; one rule left out)
 
-Three programs every reference Lua rejects at load time pass `luabox check`
-and `luabox lint` clean: a `goto` with no visible matching label, a label
-declared twice in the same scope, and `break` outside any loop. Dialect
-legality itself is enforced (`goto` under `edition = "5.1"` reports
-`LB0010`/`LB0001`) — the gap is specifically label/loop *resolution*
-legality. Your interpreter still rejects these at load time; luabox just
-doesn't pre-empt it yet. HIR already resolves each `goto` to its label (or
-none), so this is a planned diagnostic, tracked as
-[#44](https://github.com/flying-dice/luabox/issues/44).
+The three programs every reference Lua rejects at load time are now errors in
+`check`, `lint` and the editor: a `goto` with no visible matching label
+(`LB0020`, with a did-you-mean nudge for a near-miss name), a label already
+defined in scope (`LB0021`), and `break` with no enclosing loop in the same
+function (`LB0022`). The verdicts were built against `luac5.4 -p` and
+`luac5.1 -p` on a 53-program matrix and agree with them cell for cell, with
+the one exception below. Duplicate-label scope follows each edition's own
+rule — Lua 5.4 rejects a nested label shadowing an outer one, 5.2/5.3/LuaJIT
+do not — so luabox never rejects what your `edition`'s compiler accepts.
+
+**Left out on purpose:** reference Lua also rejects a forward `goto` that
+jumps *into* the scope of a local (`goto skip local x = 1 ::skip::` →
+`jumps into the scope of local 'x'`). That rule counts active locals at the
+jump and at the label, with a special case for a label that is the last void
+statement of its block; `;` is erased on lowering, so the HIR cannot express
+"void statement" and the check would be a re-implementation of the reference
+parser rather than a reading of the resolution luabox already has. luabox
+accepts such a program and your interpreter still rejects it at load time.
+This is an under-approximation only — no legal program is ever rejected for
+it.
 
 ### Bidirectional / contextual typing (#120)
 

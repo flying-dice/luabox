@@ -57,6 +57,11 @@ struct Lowerer {
     scopes: Vec<Scope>,
     source_map: SourceMap,
     resolutions: HashMap<HirId, Resolution>,
+    /// The range of each `goto`'s *name token*, keyed by the goto statement's
+    /// [`HirId`] — a side table for the same reason positions always are: HIR
+    /// nodes carry no ranges. `crate::validate` underlines the name, not the
+    /// whole statement, when the label does not resolve.
+    goto_names: HashMap<HirId, TextRange>,
     requires: Vec<RequireEdge>,
     dynamic_requires: Vec<DynamicRequire>,
 }
@@ -71,6 +76,7 @@ impl Lowerer {
             scopes: Vec::new(),
             source_map: SourceMap::default(),
             resolutions: HashMap::new(),
+            goto_names: HashMap::new(),
             requires: Vec::new(),
             dynamic_requires: Vec::new(),
         }
@@ -272,8 +278,11 @@ impl Lowerer {
             }
             ast::Stmt::Break(_) => self.alloc_stmt(Stmt::Break, range),
             ast::Stmt::Goto(goto) => {
-                let (name, _) = token_text(goto.label().as_ref(), range);
-                self.alloc_stmt(Stmt::Goto { name, target: None }, range)
+                let (name, name_range) = token_text(goto.label().as_ref(), range);
+                let id = self.alloc_stmt(Stmt::Goto { name, target: None }, range);
+                let body = self.cur_body();
+                self.goto_names.insert(HirId::stmt(body, id), name_range);
+                id
             }
             ast::Stmt::Label(label) => self.lower_label(label, range),
         }
@@ -717,6 +726,7 @@ impl Lowerer {
             chunk,
             self.source_map,
             self.resolutions,
+            self.goto_names,
             self.requires,
             self.dynamic_requires,
         )
