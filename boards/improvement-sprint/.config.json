@@ -23,6 +23,11 @@
       "color": "#d99a30"
     },
     {
+      "id": "blocked",
+      "name": "Blocked",
+      "color": "#e5534b"
+    },
+    {
       "id": "done",
       "name": "Done",
       "color": "#3fb27f"
