@@ -233,6 +233,30 @@ enum Command {
 /// manifest or sources. Rendering the chain here keeps the diagnostic and
 /// drops the noise.
 fn main() -> ExitCode {
+    // Every command runs on a dedicated thread with an EXPLICIT stack size,
+    // rustc-style, because the main thread's stack is whatever the platform
+    // linker chose: 8 MiB on Linux/macOS but only 1 MiB under MSVC. The
+    // parser bounds its recursion (MAX_DEPTH) and proves at test time that
+    // the whole pipeline fits a 2 MiB thread — a guarantee the Windows MAIN
+    // thread silently broke (a 195-deep source, which reference Lua accepts,
+    // overflowed it: STATUS_STACK_OVERFLOW). Pinning the stack here makes
+    // the headroom identical on every platform instead of an OS default.
+    const MAIN_STACK_BYTES: usize = 16 * 1024 * 1024;
+    let spawned = std::thread::Builder::new()
+        .name("luabox".to_owned())
+        .stack_size(MAIN_STACK_BYTES)
+        .spawn(real_main);
+    match spawned {
+        // A panic on the worker already printed via the default hook; all
+        // that is left to salvage is a failing exit code.
+        Ok(handle) => handle.join().unwrap_or(ExitCode::FAILURE),
+        // If the thread cannot even be spawned, degrade to the plain run —
+        // platform-default stack beats not running at all.
+        Err(_) => real_main(),
+    }
+}
+
+fn real_main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli.command) {
         Ok(()) => ExitCode::SUCCESS,
