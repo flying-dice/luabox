@@ -4,17 +4,55 @@
 //! `Fn(&str) -> Option<String>`, which returns the text of a file so snippets
 //! and line/column can be computed. Callbacks are passed as trait objects so
 //! the renderers stay monomorphisation-free and easy to dispatch over.
+//!
+//! The callback is expensive — the CLI's reads a file off disk — and returns
+//! the text *owned*, so calling it once per label cloned the whole file per
+//! diagnostic. Every renderer therefore goes through [`Sources`], a per-render
+//! cache that calls the lookup once per distinct file and keeps the text
+//! alongside an [`IndexedSource`] line table. That, plus the table replacing
+//! the byte-0 scans that resolved each label's line, is what makes rendering
+//! linear in the diagnostics rather than O(diagnostics x file size).
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use serde_json::json;
 
 use crate::code::Severity;
 use crate::diagnostic::{Diagnostic, Label};
+use crate::line_index::IndexedSource;
 use crate::registry;
 
 /// A source-lookup callback: file name in, whole-file text out.
 pub type SourceLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// The source files one render call needs, fetched and indexed once each.
+///
+/// A miss is cached too (as `None`), so a label naming a file the lookup
+/// cannot supply — a generated path, a file deleted since the diagnostic was
+/// produced — does not re-ask for it once per diagnostic.
+struct Sources<'a> {
+    lookup: SourceLookup<'a>,
+    files: HashMap<String, Option<IndexedSource>>,
+}
+
+impl<'a> Sources<'a> {
+    fn new(lookup: SourceLookup<'a>) -> Self {
+        Sources {
+            lookup,
+            files: HashMap::new(),
+        }
+    }
+
+    /// The indexed text of `file`, or `None` if the lookup cannot supply it.
+    fn get(&mut self, file: &str) -> Option<&IndexedSource> {
+        if !self.files.contains_key(file) {
+            let indexed = (self.lookup)(file).map(IndexedSource::new);
+            self.files.insert(file.to_owned(), indexed);
+        }
+        self.files.get(file).and_then(Option::as_ref)
+    }
+}
 
 /// The machine and human output formats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,29 +81,6 @@ pub fn render(diags: &[Diagnostic], format: Format, lookup: SourceLookup<'_>) ->
     }
 }
 
-/// 1-based line and column for a byte offset in `source`.
-fn line_col(source: &str, offset: usize) -> (usize, usize) {
-    let mut line = 1usize;
-    let mut col = 1usize;
-    for (idx, ch) in source.char_indices() {
-        if idx >= offset {
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
-    }
-    (line, col)
-}
-
-/// The text of a 1-based line, without its terminator.
-fn line_text(source: &str, line: usize) -> &str {
-    source.lines().nth(line.saturating_sub(1)).unwrap_or("")
-}
-
 /// Character length of a byte range, clamped so a zero-width span still shows
 /// one caret.
 fn caret_width(source: &str, range: &std::ops::Range<usize>) -> usize {
@@ -78,17 +93,18 @@ fn caret_width(source: &str, range: &std::ops::Range<usize>) -> usize {
 /// rustc-style plain-text rendering.
 #[must_use]
 pub fn render_human(diags: &[Diagnostic], lookup: SourceLookup<'_>) -> String {
+    let mut sources = Sources::new(lookup);
     let mut out = String::new();
     for (i, diag) in diags.iter().enumerate() {
         if i > 0 {
             out.push('\n');
         }
-        render_one_human(&mut out, diag, lookup);
+        render_one_human(&mut out, diag, &mut sources);
     }
     out
 }
 
-fn render_one_human(out: &mut String, diag: &Diagnostic, lookup: SourceLookup<'_>) {
+fn render_one_human(out: &mut String, diag: &Diagnostic, sources: &mut Sources<'_>) {
     let _ = writeln!(
         out,
         "{}[{}]: {}",
@@ -102,7 +118,7 @@ fn render_one_human(out: &mut String, diag: &Diagnostic, lookup: SourceLookup<'_
     labels.extend(diag.labels.iter().filter(|l| !l.primary));
 
     for label in labels {
-        render_label_human(out, label, lookup);
+        render_label_human(out, label, sources);
     }
 
     for suggestion in &diag.suggestions {
@@ -117,9 +133,9 @@ fn render_one_human(out: &mut String, diag: &Diagnostic, lookup: SourceLookup<'_
     }
 }
 
-fn render_label_human(out: &mut String, label: &Label, lookup: SourceLookup<'_>) {
+fn render_label_human(out: &mut String, label: &Label, sources: &mut Sources<'_>) {
     let file = &label.span.file;
-    let Some(source) = lookup(file) else {
+    let Some(source) = sources.get(file) else {
         // No source available: still report where and what.
         let _ = writeln!(out, " --> {file} (bytes {:?})", label.span.range);
         if !label.message.is_empty() {
@@ -128,13 +144,13 @@ fn render_label_human(out: &mut String, label: &Label, lookup: SourceLookup<'_>)
         return;
     };
 
-    let (line, col) = line_col(&source, label.span.range.start);
-    let text = line_text(&source, line);
+    let (line, col) = source.line_col(label.span.range.start);
+    let text = source.line_text(line);
     let gutter = line.to_string();
     let pad = " ".repeat(gutter.len());
     let caret = if label.primary { '^' } else { '-' };
     let underline: String =
-        std::iter::repeat_n(caret, caret_width(&source, &label.span.range)).collect();
+        std::iter::repeat_n(caret, caret_width(source.text(), &label.span.range)).collect();
     let indent = " ".repeat(col.saturating_sub(1));
 
     let _ = writeln!(out, "{pad} --> {file}:{line}:{col}");
@@ -186,6 +202,7 @@ pub fn render_sarif(diags: &[Diagnostic], lookup: SourceLookup<'_>) -> String {
         rules.push(rule);
     }
 
+    let mut sources = Sources::new(lookup);
     let results: Vec<_> = diags
         .iter()
         .map(|diag| {
@@ -194,7 +211,7 @@ pub fn render_sarif(diags: &[Diagnostic], lookup: SourceLookup<'_>) -> String {
                 "level": sarif_level(diag.severity),
                 "message": { "text": diag.message },
             });
-            if let Some(location) = sarif_location(diag, lookup) {
+            if let Some(location) = sarif_location(diag, &mut sources) {
                 result["locations"] = json!([location]);
             }
             result
@@ -212,11 +229,11 @@ pub fn render_sarif(diags: &[Diagnostic], lookup: SourceLookup<'_>) -> String {
     serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string())
 }
 
-fn sarif_location(diag: &Diagnostic, lookup: SourceLookup<'_>) -> Option<serde_json::Value> {
+fn sarif_location(diag: &Diagnostic, sources: &mut Sources<'_>) -> Option<serde_json::Value> {
     let label = diag.primary_label()?;
     let mut region = json!({});
-    if let Some(source) = lookup(&label.span.file) {
-        let (line, col) = line_col(&source, label.span.range.start);
+    if let Some(source) = sources.get(&label.span.file) {
+        let (line, col) = source.line_col(label.span.range.start);
         region["startLine"] = json!(line);
         region["startColumn"] = json!(col);
     }
@@ -241,14 +258,15 @@ fn github_command(severity: Severity) -> &'static str {
 /// `::error file=...,line=...,col=...::<code> <message>`.
 #[must_use]
 pub fn render_github_actions(diags: &[Diagnostic], lookup: SourceLookup<'_>) -> String {
+    let mut sources = Sources::new(lookup);
     let mut out = String::new();
     for diag in diags {
         let command = github_command(diag.severity);
         let mut props = String::new();
         if let Some(label) = diag.primary_label() {
             let _ = write!(props, "file={}", label.span.file);
-            if let Some(source) = lookup(&label.span.file) {
-                let (line, col) = line_col(&source, label.span.range.start);
+            if let Some(source) = sources.get(&label.span.file) {
+                let (line, col) = source.line_col(label.span.range.start);
                 let _ = write!(props, ",line={line},col={col}");
             }
         }
@@ -324,17 +342,18 @@ fn fingerprint(diag: &Diagnostic) -> String {
 /// this correction does not renumber anybody's existing GitLab findings.
 #[must_use]
 pub fn render_gitlab_code_quality(diags: &[Diagnostic], lookup: SourceLookup<'_>) -> String {
+    let mut sources = Sources::new(lookup);
     let issues: Vec<_> = diags
         .iter()
         .map(|diag| {
-            let (path, begin) = diag.primary_label().map_or_else(
-                || (String::new(), 0),
-                |l| {
-                    let begin = lookup(&l.span.file)
-                        .map_or(1, |source| line_col(&source, l.span.range.start).0);
-                    (l.span.file.clone(), begin)
-                },
-            );
+            let (path, begin) = if let Some(label) = diag.primary_label() {
+                let begin = sources
+                    .get(&label.span.file)
+                    .map_or(1, |source| source.line_col(label.span.range.start).0);
+                (label.span.file.clone(), begin)
+            } else {
+                (String::new(), 0)
+            };
             json!({
                 "description": diag.message,
                 "check_name": diag.code.to_string(),
@@ -605,6 +624,60 @@ mod tests {
         assert_eq!(rules.len(), 1, "one rule for two same-code results");
         assert_eq!(rules[0]["id"], "LB0001");
         assert_eq!(value["runs"][0]["results"].as_array().unwrap().len(), 2);
+    }
+
+    /// The lookup hands back an *owned* `String` and, in the CLI, reads it
+    /// off disk — so calling it once per label cloned the whole file per
+    /// diagnostic. Every renderer that resolves locations must ask for each
+    /// distinct file exactly once per render, however many diagnostics and
+    /// labels point into it. This is the cost the fix removes; assert it
+    /// structurally so it cannot creep back.
+    #[test]
+    fn every_renderer_fetches_each_file_once_per_render() {
+        use std::cell::RefCell;
+
+        let code: Code = "LB0001".parse().unwrap();
+        // Twelve diagnostics across two files, two labels each, plus one
+        // label naming a file the lookup cannot supply (a miss must be
+        // cached too, or it is re-asked once per diagnostic).
+        let diags: Vec<Diagnostic> = (0..12)
+            .map(|i| {
+                Diagnostic::error(code, "boom")
+                    .with_label(Label::primary(Span::new("main.lua", 18..19), "here"))
+                    .with_label(Label::secondary(Span::new("luabox.toml", 0..3), "and here"))
+                    .with_label(Label::secondary(Span::new("gone.lua", i..i + 1), "nowhere"))
+            })
+            .collect();
+
+        for format in [
+            Format::Human,
+            Format::Sarif,
+            Format::GithubActions,
+            Format::GitlabCodeQuality,
+        ] {
+            let asked: RefCell<Vec<String>> = RefCell::new(Vec::new());
+            let counting = |file: &str| {
+                asked.borrow_mut().push(file.to_string());
+                lookup(file)
+            };
+            let _ = render(&diags, format, &counting);
+            let calls = asked.into_inner();
+            let mut distinct = calls.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert_eq!(
+                calls.len(),
+                distinct.len(),
+                "{format:?} asked for {} sources but only {} distinct files are \
+                 involved — the lookup is being re-run per diagnostic: {calls:?}",
+                calls.len(),
+                distinct.len()
+            );
+            assert!(
+                distinct.len() <= 3,
+                "{format:?} touched more files than exist: {distinct:?}"
+            );
+        }
     }
 
     #[test]
