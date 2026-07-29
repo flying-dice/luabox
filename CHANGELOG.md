@@ -8,6 +8,19 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-29
+
+**The v1 scope cut — every item below is a breaking change.** luabox is now
+a purely static toolchain: *it consumes a rock tree, it does not produce
+one, and it never spawns an interpreter.* Dependency management and
+execution are deliberate non-goals, not gaps — the decision record is in
+[DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26)
+([#10](https://github.com/flying-dice/luabox/issues/10),
+[#11](https://github.com/flying-dice/luabox/issues/11)). The unreleased
+dependency-management wave (luarocks registry, `publish`, url tarball deps,
+rockspec editing) is retracted with it — none of it ever reached a release,
+so it appears in no version entry.
+
 ### Added
 
 - **`luabox schema` — the manifest contract, published as a JSON Schema.**
@@ -46,7 +59,175 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   to regenerate it
   (`LUABOX_BLESS=1 cargo test -p luabox-manifest schema_file_is_current`).
 
+### Removed
+
+- **`[tasks]`, `[workspace]`, and `{ workspace = true }` dependencies**
+  ([#18](https://github.com/flying-dice/luabox/issues/18)) — these manifest
+  tables only ever served the removed `run` command and the parked solver,
+  and had been parse-but-inert since the scope cut. They are now an
+  unknown-table error carrying the valid set, the did-you-mean nudge, and —
+  for these two names specifically — `— removed in 0.2.0, see CHANGELOG.md`,
+  so a manifest brought over from 0.1.4 says what happened rather than
+  reading as a typo. Monorepo trees
+  are unaffected: the source walk checks nested packages without any
+  manifest declaration.
+- **`luabox add` / `remove` / `install` / `update` / `vendor`**
+  ([#10](https://github.com/flying-dice/luabox/issues/10)) — dependency
+  resolution and installation are gone: the PubGrub solver, the
+  git/url/http/luarocks providers, `luabox.lock`, the comment-preserving
+  rockspec editor, and the hard-link installs into `lua_modules/`. A
+  `luabox.lock` left in a project is now ignored, and
+  `LUABOX_LUAROCKS_MIRROR` is unrecognized.
+- **`luabox search` / `outdated`**
+  ([#10](https://github.com/flying-dice/luabox/issues/10)) — the
+  luarocks.org discovery reads and the GitHub-release probing, along with
+  their frozen `{"results":[…]}` / `{"dependencies":[…]}` JSON contracts.
+  Editors consuming those contracts lose them with no replacement.
+- **`luabox publish`**
+  ([#10](https://github.com/flying-dice/luabox/issues/10)) — the
+  rockspec upload proxy, its offline gates, and `LUABOX_LUAROCKS_URL`.
+  Publish with `luarocks upload <rockspec>` instead.
+- **`luabox login` / `logout` / `whoami`**
+  ([#10](https://github.com/flying-dice/luabox/issues/10)) — the GitHub
+  OAuth device flow, the OS-keychain storage of the GitHub token and the
+  luarocks.org API key, and the `LUABOX_GITHUB_TOKEN` / `GITHUB_TOKEN` /
+  `LUABOX_LUAROCKS_API_KEY` precedence chain. luabox now stores no
+  credential and makes no authenticated request — the editor extensions'
+  "Sign in with GitHub" flow no longer has a backing command.
+- **`luabox run`** ([#11](https://github.com/flying-dice/luabox/issues/11))
+  — luabox never spawns an interpreter and never executes your code.
+  `[tasks]` entries, the toolchain-first
+  `PATH` resolution (`node_modules/.bin` semantics), and the
+  `luabox run luarocks -- install <rock>` escape hatch all go with it.
+- **`luabox toolchain`**
+  ([#11](https://github.com/flying-dice/luabox/issues/11)) — installing,
+  pinning, and listing managed Lua runtimes, the built-in toolchain index,
+  and the luarocks provisioning (and generated `LUAROCKS_CONFIG`) that came
+  with `toolchain install`. Bring your own interpreter; luabox acquires
+  nothing.
+- **The `luabox-store` crate** — the content-addressed store and its
+  locking existed only to back installs.
+- **The resolving half of `luabox-resolve`** — solver, providers, lockfile,
+  semver ranges, luarocks bridge and solver reporting. The crate slims to
+  the manifest/project/dialect model the frontend commands actually use.
+
+### Kept — the seam
+
+- The **`luabox.toml` manifest model** (`[package]`, `[lint]`, `[build]`,
+  `[types]`) that every frontend command reads.
+- The **`lua_modules/` read path**: `require` resolution, bundling and
+  cross-package type checking still work over a rock tree, provided you
+  materialize it. (Types need more than the tree — see *Fixed* below.)
+- Everything static: `new`/`init`, `check`, `lint`, `fmt`, `build` (+ the
+  bundler and its `love`/`nvim-plugin` modes), `unmap`, `doc`, `lsp`,
+  `explain`, `upgrade`, and `--watch`.
+
 ### Fixed
+
+- **A misspelled `[lint]` key is no longer silently inert** — `unused-locl =
+  "allow"` did nothing and said nothing, because rule ids live in
+  `luabox-lint` and the dependency-free manifest parser cannot check them.
+  The check now runs where the config is consumed: `luabox lint` reports
+  `LB1004` (a warning — the exit code is unchanged) naming the key, and
+  `luabox lsp` logs it via `window/logMessage`. The did-you-mean nudge spans
+  rule ids *and* tier names, so a mistyped tier — which reaches the config as
+  a rule-id override, indistinguishable from one — says ``did you mean
+  `pedantic`?``.
+- **Invalid `--format` and `--mode` values are now rejected by the CLI
+  parser itself** — exit 2 with clap's `[possible values: …]` listing,
+  matching every other malformed invocation, instead of exit 1 from deep
+  inside the command. `--edition`/`--target` deliberately keep their
+  domain-level path so `LB1001` stays a machine-readable diagnostic.
+- **A failure no longer dumps a stack backtrace when `RUST_BACKTRACE` is
+  set.** `main` returned a `Result`, so every `Error:` was rendered by
+  `anyhow`'s `Debug` — which appends the captured frames whenever that
+  variable is exported for something else entirely. Release binaries are
+  stripped, so the dump arrived as pages of `<unknown>` burying the one line
+  that named the problem. luabox now renders the error and its `Caused by:`
+  chain itself. Exit codes are unchanged: 0 on success, 1 on a command that
+  ran and failed, 2 on a malformed invocation.
+- **`[tasks]` and `[workspace]` say they were removed, not just that they are
+  unknown** ([#18](https://github.com/flying-dice/luabox/issues/18)). Both are
+  gone (see *Removed*), but a manifest upgraded from 0.1.4 still carries them,
+  and the generic unknown-table error sent readers looking for a misspelling.
+  The error for exactly these two names now ends `— removed in 0.2.0, see
+  CHANGELOG.md`; every other unknown table is unaffected.
+- **`---@deprecated` and `---@async` on a method carrier now reach `obj:method()`
+  call sites** ([#33](https://github.com/flying-dice/luabox/issues/33)). Two
+  carrier shapes swallowed the tags. A plain prototype table (`local P = {}` +
+  `P.__index = P`, no `---@class`) published no method signature at all, because
+  publication was gated on a declared-class receiver — a gate that belongs to
+  *argument* checking, not to tags the author wrote on the method itself; the
+  gate now governs only argument checking, and `LB0308`/`LB0316` fire for any
+  resolved receiver while a structurally-resolved call stays free of
+  manufactured arity findings. A method that is both `---@field`-declared and
+  defined lost them too: the declaration shadows the carrier, and `fun(...)`
+  syntax has nowhere to write a tag, so the declaration now inherits the
+  carrier's `---@deprecated`/`---@async`/`---@version` while still governing
+  parameters and returns — same-file and across the project surface.
+- **`luabox doc` refuses to generate while parse errors exist**
+  ([#24](https://github.com/flying-dice/luabox/issues/24)) — a file that
+  does not parse has no trustworthy harvest. One rule: project sources
+  and project defs gate (rendering the `LB0001` diagnostics refused
+  over); a *dependency's* broken def is skipped with a stderr warning
+  and never partially harvested — vendored text cannot brick the
+  command. Type errors never gate: docs for imperfect code are still
+  docs.
+- **`pkg = { version = "1.0" }` now parses as the bare-string form spelled
+  longhand** ([#23](https://github.com/flying-dice/luabox/issues/23)). The
+  valid-key list always named `version`, but a version-only table was
+  rejected with "must specify one of `git`, `path`, or `url`" — the two
+  rules disagreed. A lone git reference or `sha256` still errors, now
+  naming the missing source.
+- **`---@source` redirects no longer vanish for a lone statement**
+  ([#14](https://github.com/flying-dice/luabox/issues/14)). When the
+  annotated statement was the only one in its block — a one-statement file,
+  function body, or `do … end` — the enclosing block node shared its text
+  range and was matched first, so goto-definition silently jumped to the
+  local declaration instead of the annotated location. The target is now
+  resolved to the *statement* at that range.
+- **`lua_modules/` is no longer walked as project source.** `check`, `lint`,
+  `fmt` and `build` skip any directory named `lua_modules`, at every depth,
+  the same way they skip dot-directories and the build output directory. A
+  vendored rock tree is whatever luarocks put there; typechecking it against
+  *your* project's strictness failed on any rock that is not trivially typed
+  — and took `luabox build` down with it, since `build` refuses to emit while
+  `check` reports errors. Summaries now count first-party files only.
+- **`require` resolves through a real luarocks tree.** Resolution (and so
+  bundling, `check`'s cross-file types, and the LSP's goto-definition) now
+  searches `lua_modules/share/lua/<X.Y>/a/b/c.lua` and
+  `…/a/b/c/init.lua` — the layout `luarocks install --tree lua_modules`
+  actually writes — where `<X.Y>` is the build target's version directory
+  (`luajit` maps to `5.1`, as luarocks itself does). The flat
+  `lua_modules/<name>/` layout is still searched first, so nothing that
+  resolved before resolves elsewhere now. Compiled C modules under
+  `lua_modules/lib/lua/<X.Y>/` cannot be inlined into a text bundle and stay
+  runtime `require`s, exactly like any other unresolved name.
+- **Unterminated long brackets are reported instead of silently accepted**
+  ([#15](https://github.com/flying-dice/luabox/issues/15)). `x = [[abc` and
+  `--[[ abc` used to lex as a complete string / comment running to
+  end-of-file with no diagnostic, and the string then decoded to `ab` — a
+  closing bracket's worth of bytes stripped that the lexer never saw. Both
+  now produce `LB0001` (`unterminated long string` / `unterminated long
+  comment`) spanning the whole unclosed run, matching how unterminated short
+  strings have always been treated, and no truncated literal reaches the
+  HIR. Unterminated short strings now report `unterminated string` rather
+  than the generic `expected expression`. Files that relied on the old
+  silence now fail `check`; `fmt` returns them unchanged, as it does for any
+  input that does not parse.
+- **The editor no longer indexes vendored `lua_modules/` trees.** The LSP's
+  workspace index had its own copy of the source walk, and that copy still
+  descended into the rock tree `luarocks install --tree lua_modules`
+  materializes — so workspace symbols, goto-definition and rename saw
+  thousands of vendored symbols that `luabox check` had already stopped
+  looking at. Both now run the one walk (`luabox-manifest`'s), which skips
+  `lua_modules/` at every depth and visits entries in sorted order.
+  **Behaviour change:** symbols that live only inside `lua_modules/` no
+  longer appear in workspace symbol search or goto results — put the types
+  you need in a `defs/` package and list it in `[types] defs`, exactly as
+  `check` requires. `--watch` stops rerunning for `lua_modules/` writes for
+  the same reason: the command it reruns would not read those files.
+
 
 - **`--watch` stops rerunning once your edit has settled.** After the first
   change, `luabox check --watch` never went quiet again: it re-ran the command
@@ -249,188 +430,6 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   reference implementation, with measured stack headroom for a debug build on
   a default 2 MiB thread stack. See
   [LIMITATIONS.md](docs/03-reference/02-limitations.md#parser-nesting-and-expression-size-limits).
-
-## [0.2.0] - 2026-07-26 (unreleased)
-
-**The v1 scope cut — every item below is a breaking change.** luabox is now
-a purely static toolchain: *it consumes a rock tree, it does not produce
-one, and it never spawns an interpreter.* Dependency management and
-execution are deliberate non-goals, not gaps — the decision record is in
-[DIRECTION.md](DIRECTION.md#v1-scope-cut-accepted-2026-07-26)
-([#10](https://github.com/flying-dice/luabox/issues/10),
-[#11](https://github.com/flying-dice/luabox/issues/11)). The unreleased
-dependency-management wave (luarocks registry, `publish`, url tarball deps,
-rockspec editing) is retracted with it — none of it ever reached a release,
-so it appears in no version entry.
-
-### Removed
-
-- **`[tasks]`, `[workspace]`, and `{ workspace = true }` dependencies**
-  ([#18](https://github.com/flying-dice/luabox/issues/18)) — these manifest
-  tables only ever served the removed `run` command and the parked solver,
-  and had been parse-but-inert since the scope cut. They are now an
-  unknown-table error carrying the valid set, the did-you-mean nudge, and —
-  for these two names specifically — `— removed in 0.2.0, see CHANGELOG.md`,
-  so a manifest brought over from 0.1.4 says what happened rather than
-  reading as a typo. Monorepo trees
-  are unaffected: the source walk checks nested packages without any
-  manifest declaration.
-- **`luabox add` / `remove` / `install` / `update` / `vendor`**
-  ([#10](https://github.com/flying-dice/luabox/issues/10)) — dependency
-  resolution and installation are gone: the PubGrub solver, the
-  git/url/http/luarocks providers, `luabox.lock`, the comment-preserving
-  rockspec editor, and the hard-link installs into `lua_modules/`. A
-  `luabox.lock` left in a project is now ignored, and
-  `LUABOX_LUAROCKS_MIRROR` is unrecognized.
-- **`luabox search` / `outdated`**
-  ([#10](https://github.com/flying-dice/luabox/issues/10)) — the
-  luarocks.org discovery reads and the GitHub-release probing, along with
-  their frozen `{"results":[…]}` / `{"dependencies":[…]}` JSON contracts.
-  Editors consuming those contracts lose them with no replacement.
-- **`luabox publish`**
-  ([#10](https://github.com/flying-dice/luabox/issues/10)) — the
-  rockspec upload proxy, its offline gates, and `LUABOX_LUAROCKS_URL`.
-  Publish with `luarocks upload <rockspec>` instead.
-- **`luabox login` / `logout` / `whoami`**
-  ([#10](https://github.com/flying-dice/luabox/issues/10)) — the GitHub
-  OAuth device flow, the OS-keychain storage of the GitHub token and the
-  luarocks.org API key, and the `LUABOX_GITHUB_TOKEN` / `GITHUB_TOKEN` /
-  `LUABOX_LUAROCKS_API_KEY` precedence chain. luabox now stores no
-  credential and makes no authenticated request — the editor extensions'
-  "Sign in with GitHub" flow no longer has a backing command.
-- **`luabox run`** ([#11](https://github.com/flying-dice/luabox/issues/11))
-  — luabox never spawns an interpreter and never executes your code.
-  `[tasks]` entries, the toolchain-first
-  `PATH` resolution (`node_modules/.bin` semantics), and the
-  `luabox run luarocks -- install <rock>` escape hatch all go with it.
-- **`luabox toolchain`**
-  ([#11](https://github.com/flying-dice/luabox/issues/11)) — installing,
-  pinning, and listing managed Lua runtimes, the built-in toolchain index,
-  and the luarocks provisioning (and generated `LUAROCKS_CONFIG`) that came
-  with `toolchain install`. Bring your own interpreter; luabox acquires
-  nothing.
-- **The `luabox-store` crate** — the content-addressed store and its
-  locking existed only to back installs.
-- **The resolving half of `luabox-resolve`** — solver, providers, lockfile,
-  semver ranges, luarocks bridge and solver reporting. The crate slims to
-  the manifest/project/dialect model the frontend commands actually use.
-
-### Kept — the seam
-
-- The **`luabox.toml` manifest model** (`[package]`, `[lint]`, `[build]`,
-  `[types]`) that every frontend command reads.
-- The **`lua_modules/` read path**: `require` resolution, bundling and
-  cross-package type checking still work over a rock tree, provided you
-  materialize it. (Types need more than the tree — see *Fixed* below.)
-- Everything static: `new`/`init`, `check`, `lint`, `fmt`, `build` (+ the
-  bundler and its `love`/`nvim-plugin` modes), `unmap`, `doc`, `lsp`,
-  `explain`, `upgrade`, and `--watch`.
-
-### Fixed
-
-- **A misspelled `[lint]` key is no longer silently inert** — `unused-locl =
-  "allow"` did nothing and said nothing, because rule ids live in
-  `luabox-lint` and the dependency-free manifest parser cannot check them.
-  The check now runs where the config is consumed: `luabox lint` reports
-  `LB1004` (a warning — the exit code is unchanged) naming the key, and
-  `luabox lsp` logs it via `window/logMessage`. The did-you-mean nudge spans
-  rule ids *and* tier names, so a mistyped tier — which reaches the config as
-  a rule-id override, indistinguishable from one — says ``did you mean
-  `pedantic`?``.
-- **Invalid `--format` and `--mode` values are now rejected by the CLI
-  parser itself** — exit 2 with clap's `[possible values: …]` listing,
-  matching every other malformed invocation, instead of exit 1 from deep
-  inside the command. `--edition`/`--target` deliberately keep their
-  domain-level path so `LB1001` stays a machine-readable diagnostic.
-- **A failure no longer dumps a stack backtrace when `RUST_BACKTRACE` is
-  set.** `main` returned a `Result`, so every `Error:` was rendered by
-  `anyhow`'s `Debug` — which appends the captured frames whenever that
-  variable is exported for something else entirely. Release binaries are
-  stripped, so the dump arrived as pages of `<unknown>` burying the one line
-  that named the problem. luabox now renders the error and its `Caused by:`
-  chain itself. Exit codes are unchanged: 0 on success, 1 on a command that
-  ran and failed, 2 on a malformed invocation.
-- **`[tasks]` and `[workspace]` say they were removed, not just that they are
-  unknown** ([#18](https://github.com/flying-dice/luabox/issues/18)). Both are
-  gone (see *Removed*), but a manifest upgraded from 0.1.4 still carries them,
-  and the generic unknown-table error sent readers looking for a misspelling.
-  The error for exactly these two names now ends `— removed in 0.2.0, see
-  CHANGELOG.md`; every other unknown table is unaffected.
-- **`---@deprecated` and `---@async` on a method carrier now reach `obj:method()`
-  call sites** ([#33](https://github.com/flying-dice/luabox/issues/33)). Two
-  carrier shapes swallowed the tags. A plain prototype table (`local P = {}` +
-  `P.__index = P`, no `---@class`) published no method signature at all, because
-  publication was gated on a declared-class receiver — a gate that belongs to
-  *argument* checking, not to tags the author wrote on the method itself; the
-  gate now governs only argument checking, and `LB0308`/`LB0316` fire for any
-  resolved receiver while a structurally-resolved call stays free of
-  manufactured arity findings. A method that is both `---@field`-declared and
-  defined lost them too: the declaration shadows the carrier, and `fun(...)`
-  syntax has nowhere to write a tag, so the declaration now inherits the
-  carrier's `---@deprecated`/`---@async`/`---@version` while still governing
-  parameters and returns — same-file and across the project surface.
-- **`luabox doc` refuses to generate while parse errors exist**
-  ([#24](https://github.com/flying-dice/luabox/issues/24)) — a file that
-  does not parse has no trustworthy harvest. One rule: project sources
-  and project defs gate (rendering the `LB0001` diagnostics refused
-  over); a *dependency's* broken def is skipped with a stderr warning
-  and never partially harvested — vendored text cannot brick the
-  command. Type errors never gate: docs for imperfect code are still
-  docs.
-- **`pkg = { version = "1.0" }` now parses as the bare-string form spelled
-  longhand** ([#23](https://github.com/flying-dice/luabox/issues/23)). The
-  valid-key list always named `version`, but a version-only table was
-  rejected with "must specify one of `git`, `path`, or `url`" — the two
-  rules disagreed. A lone git reference or `sha256` still errors, now
-  naming the missing source.
-- **`---@source` redirects no longer vanish for a lone statement**
-  ([#14](https://github.com/flying-dice/luabox/issues/14)). When the
-  annotated statement was the only one in its block — a one-statement file,
-  function body, or `do … end` — the enclosing block node shared its text
-  range and was matched first, so goto-definition silently jumped to the
-  local declaration instead of the annotated location. The target is now
-  resolved to the *statement* at that range.
-- **`lua_modules/` is no longer walked as project source.** `check`, `lint`,
-  `fmt` and `build` skip any directory named `lua_modules`, at every depth,
-  the same way they skip dot-directories and the build output directory. A
-  vendored rock tree is whatever luarocks put there; typechecking it against
-  *your* project's strictness failed on any rock that is not trivially typed
-  — and took `luabox build` down with it, since `build` refuses to emit while
-  `check` reports errors. Summaries now count first-party files only.
-- **`require` resolves through a real luarocks tree.** Resolution (and so
-  bundling, `check`'s cross-file types, and the LSP's goto-definition) now
-  searches `lua_modules/share/lua/<X.Y>/a/b/c.lua` and
-  `…/a/b/c/init.lua` — the layout `luarocks install --tree lua_modules`
-  actually writes — where `<X.Y>` is the build target's version directory
-  (`luajit` maps to `5.1`, as luarocks itself does). The flat
-  `lua_modules/<name>/` layout is still searched first, so nothing that
-  resolved before resolves elsewhere now. Compiled C modules under
-  `lua_modules/lib/lua/<X.Y>/` cannot be inlined into a text bundle and stay
-  runtime `require`s, exactly like any other unresolved name.
-- **Unterminated long brackets are reported instead of silently accepted**
-  ([#15](https://github.com/flying-dice/luabox/issues/15)). `x = [[abc` and
-  `--[[ abc` used to lex as a complete string / comment running to
-  end-of-file with no diagnostic, and the string then decoded to `ab` — a
-  closing bracket's worth of bytes stripped that the lexer never saw. Both
-  now produce `LB0001` (`unterminated long string` / `unterminated long
-  comment`) spanning the whole unclosed run, matching how unterminated short
-  strings have always been treated, and no truncated literal reaches the
-  HIR. Unterminated short strings now report `unterminated string` rather
-  than the generic `expected expression`. Files that relied on the old
-  silence now fail `check`; `fmt` returns them unchanged, as it does for any
-  input that does not parse.
-- **The editor no longer indexes vendored `lua_modules/` trees.** The LSP's
-  workspace index had its own copy of the source walk, and that copy still
-  descended into the rock tree `luarocks install --tree lua_modules`
-  materializes — so workspace symbols, goto-definition and rename saw
-  thousands of vendored symbols that `luabox check` had already stopped
-  looking at. Both now run the one walk (`luabox-manifest`'s), which skips
-  `lua_modules/` at every depth and visits entries in sorted order.
-  **Behaviour change:** symbols that live only inside `lua_modules/` no
-  longer appear in workspace symbol search or goto results — put the types
-  you need in a `defs/` package and list it in `[types] defs`, exactly as
-  `check` requires. `--watch` stops rerunning for `lua_modules/` writes for
-  the same reason: the command it reruns would not read those files.
 
 ### Internal (contributors)
 
