@@ -1,8 +1,11 @@
 ---
-column: todo
+column: doing
 labels: [review-round]
 priority: high
-updatedAt: 2026-07-29T05:50:00.000Z
+agent: opus-reviewer-r5
+live: true
+status: reviewing develop post-wave-10
+updatedAt: 2026-07-29T13:29:00.000Z
 ---
 # Round-5 independent adversarial review
 
