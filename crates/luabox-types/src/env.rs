@@ -448,6 +448,31 @@ impl TypeEnv {
         }
     }
 
+    /// Merge one *implicit* surface — a class/enum set harvested from a
+    /// vendored rock source (#30) — beneath this environment, keeping any name
+    /// already claimed **whole**.
+    ///
+    /// The difference from [`Self::merge_file_types`] is deliberate. Two
+    /// declarations of a class in code the user *wrote* are two halves of one
+    /// intent, so luals (and luabox) union their members. A rock's declaration
+    /// is not the user's: when a project declares `mylib.Point` itself — in
+    /// `[types] defs` or in its own source — it is correcting or replacing what
+    /// the rock says, and unioning the rock's fields back in would defeat the
+    /// escape hatch. So an already-claimed name is left exactly as it is, and
+    /// only unclaimed names are inserted.
+    pub(crate) fn insert_unclaimed_types(&mut self, file: &FileTypes) {
+        for (name, def) in &file.classes {
+            self.classes
+                .entry(name.clone())
+                .or_insert_with(|| def.clone());
+        }
+        for (name, def) in &file.enums {
+            self.enums
+                .entry(name.clone())
+                .or_insert_with(|| def.clone());
+        }
+    }
+
     /// Bind module tables (`math = {}` under `---@class mathlib`) and scalar
     /// globals (`_VERSION` under `---@type string`) to their declared types,
     /// so field reads like `math.pi` and `_VERSION` resolve. Called once per

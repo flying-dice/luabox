@@ -310,14 +310,66 @@ return M
         assert!(surfaces.skipped().is_empty());
     }
 
+    /// Strict-check `src` against the stdlib plus the harvested surfaces of
+    /// `sources`, layered the way `check_cmd` layers them.
+    fn consumer_codes(sources: &[RockModule], src: &str) -> Vec<String> {
+        let surfaces = harvest_of(sources);
+        let ambient = stdlib_defs(Dialect::Lua54)
+            .with_project_types(std::iter::empty())
+            .with_rock_types(surfaces.types());
+        let parse = lua::parse(src, Dialect::Lua54);
+        crate::check_file_with_ambient(
+            &parse,
+            "src/main.lua",
+            crate::Strictness::Strict,
+            Dialect::Lua54,
+            Some(&ambient),
+        )
+        .iter()
+        .map(|d| d.code.to_string())
+        .collect()
+    }
+
     #[test]
     fn a_harvested_class_is_enforced_in_a_consuming_file() {
         // The end-to-end point of #30, at the crate boundary: the rock's class
         // resolves in a consumer's ambient scope and its fields are enforced.
+        assert_eq!(
+            consumer_codes(
+                &[rock("mylib", ANNOTATED)],
+                "---@type mylib.Point\nlocal p = { x = 1, y = \"no\" }\nreturn p\n",
+            ),
+            ["LB0300"]
+        );
+        // …and the same annotation without the rock is an unknown type name.
+        assert_eq!(
+            consumer_codes(
+                &[],
+                "---@type mylib.Point\nlocal p = { x = 1, y = \"no\" }\nreturn p\n",
+            ),
+            ["LB0305"]
+        );
+    }
+
+    #[test]
+    fn with_rock_types_leaves_a_name_a_project_file_already_declared_untouched() {
+        // The project declares `mylib.Point` with only `x`. The rock's
+        // two-field version must not union its `y` back in, or `[types] defs`
+        // would stop being an escape hatch.
         let surfaces = harvest_of(&[rock("mylib", ANNOTATED)]);
-        let ambient = stdlib_defs(Dialect::Lua54).with_project_types(surfaces.types());
+        let project = crate::module_surface(
+            &lua::parse(
+                "---@class mylib.Point\n---@field x number\n",
+                Dialect::Lua54,
+            ),
+            "defs.lua",
+            None,
+        );
+        let ambient = stdlib_defs(Dialect::Lua54)
+            .with_project_types([&project.types])
+            .with_rock_types(surfaces.types());
         let parse = lua::parse(
-            "---@type mylib.Point\nlocal p = { x = 1, y = \"no\" }\nreturn p\n",
+            "---@type mylib.Point\nlocal p = { x = 1 }\nreturn p\n",
             Dialect::Lua54,
         );
         let diags = crate::check_file_with_ambient(
@@ -327,7 +379,73 @@ return M
             Dialect::Lua54,
             Some(&ambient),
         );
-        let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
-        assert_eq!(codes, ["LB0300"], "{diags:?}");
+        assert!(diags.is_empty(), "`x` alone must be complete: {diags:?}");
+    }
+
+    #[test]
+    fn with_rock_types_fills_only_unclaimed_names() {
+        let surfaces = harvest_of(&[
+            rock("a", "---@class shared.Thing\n---@field from_a number\n"),
+            rock("b", "---@class shared.Thing\n---@field from_b number\n"),
+            rock("c", "---@class other.Thing\n---@field n number\n"),
+        ]);
+        // Among rocks it is first-wins too (path-sorted, silently — the user
+        // declared neither side and cannot act on a warning about it).
+        let ambient = stdlib_defs(Dialect::Lua54)
+            .with_project_types(std::iter::empty())
+            .with_rock_types(surfaces.types());
+        let clean = lua::parse(
+            "---@type shared.Thing\nlocal t = { from_a = 1 }\nreturn t\n",
+            Dialect::Lua54,
+        );
+        assert!(
+            crate::check_file_with_ambient(
+                &clean,
+                "m.lua",
+                crate::Strictness::Strict,
+                Dialect::Lua54,
+                Some(&ambient),
+            )
+            .is_empty(),
+            "the first rock's declaration wins"
+        );
+        // The unrelated name from the third rock is present too.
+        let other = lua::parse(
+            "---@type other.Thing\nlocal t = { n = 1 }\nreturn t\n",
+            Dialect::Lua54,
+        );
+        assert!(
+            crate::check_file_with_ambient(
+                &other,
+                "m.lua",
+                crate::Strictness::Strict,
+                Dialect::Lua54,
+                Some(&ambient),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_harvested_alias_is_expandable_in_a_consuming_file() {
+        assert_eq!(
+            consumer_codes(
+                &[rock("ids", "---@alias rock.Id integer\n")],
+                "---@param id rock.Id\nlocal function f(id) end\nf(\"no\")\nreturn f\n",
+            ),
+            ["LB0300"]
+        );
+    }
+
+    #[test]
+    fn a_harvested_enum_is_nameable_in_a_consuming_file() {
+        let codes = consumer_codes(
+            &[rock(
+                "modes",
+                "---@enum rock.Mode\nlocal Mode = { read = 1, write = 2 }\nreturn Mode\n",
+            )],
+            "---@type rock.Mode\nlocal m = 1\nreturn m\n",
+        );
+        assert!(!codes.contains(&"LB0305".to_owned()), "{codes:?}");
     }
 }

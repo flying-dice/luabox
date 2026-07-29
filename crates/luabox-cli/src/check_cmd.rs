@@ -135,6 +135,17 @@ pub(crate) fn run_once(
         .as_ref()
         .unwrap_or_else(|| stdlib_defs(project.dialect));
 
+    // Types from a bare luarocks tree (#30). A rock's installed sources under
+    // `lua_modules/share/lua/<X.Y>/` are ordinary annotated Lua; their LuaCATS
+    // surfaces — classes/enums/aliases plus each module's `require`-export type
+    // — join this project's scope with no manifest declaration at all, which is
+    // the whole point: `luarocks install --tree lua_modules <rock>` now buys
+    // types as well as resolution and bundling. Surface-only and
+    // ambient-relaxed: nothing here checks a vendored body or can produce a
+    // diagnostic (`luabox_types::rocks`). The version directory is the one the
+    // build resolves against, so `check` looks where the build will.
+    let rocks = harvest_rocks(project, ambient);
+
     // Read and parse the whole source set ONCE (CC-M1). Both halves of the
     // check — the cross-file surface pre-pass below and the per-file check
     // after it — used to walk `lua_files` independently, so every file was
@@ -191,11 +202,18 @@ pub(crate) fn run_once(
             )
         })
         .collect();
-    let exports: HashMap<PathBuf, Ty> = files
+    let mut exports: HashMap<PathBuf, Ty> = files
         .iter()
         .zip(&surfaces)
         .filter_map(|(file, surface)| Some((file.canonical.clone(), surface.export.clone()?)))
         .collect();
+    // Rock exports join the same path-keyed registry (#30). Keying by path (not
+    // by module name) is what keeps precedence exact: `resolve_requires` asks
+    // the bundler which *file* a `require` names, and a project file that
+    // shadows a rock module is the file it returns.
+    for (path, export) in rocks.by_path() {
+        exports.entry(canonical(path)).or_insert(export.clone());
+    }
     // Duplicate `---@alias` across project files / `[types] defs` (luals
     // `duplicate-doc-alias`, LB0310, #113): a project-assembly finding — like
     // the LB0307 class collisions above — computed over the whole source set,
@@ -211,8 +229,16 @@ pub(crate) fn run_once(
     ));
     // The project-wide ambient: defs + every file's workspace-global
     // classes/enums, merged (defs win same-name member collisions; luals
-    // merges duplicate class declarations' fields rather than dropping).
-    let ambient = ambient.with_project_types(surfaces.iter().map(|s| &s.types));
+    // merges duplicate class declarations' fields rather than dropping),
+    // then the harvested rock surfaces (#30) LAST — explicit beats implicit,
+    // so a rock's declaration only fills a name neither the defs layer nor any
+    // project file claimed. Rock surfaces are deliberately absent from the
+    // `LB0307`/`LB0310` collision reports above: the user declared neither side
+    // of a rock-vs-rock name clash and cannot act on it, and #30 is about a
+    // tree that needs no configuration at all.
+    let ambient = ambient
+        .with_project_types(surfaces.iter().map(|s| &s.types))
+        .with_rock_types(rocks.types());
     let ambient = &ambient;
 
     // SPEC.md §16: rayon per-module. Each file is checked against the
@@ -358,6 +384,37 @@ fn resolve_requires(
         }
     }
     requires
+}
+
+/// Harvest the type surfaces of the project's vendored luarocks tree, if it has
+/// one (#30) — [`luabox_types::rocks::harvest`] over
+/// [`layout::collect_rock_sources`].
+///
+/// The version directory is chosen by `[build] target` (the edition when unset),
+/// exactly as [`resolve_requires`] chooses it, so the tree `check` harvests is
+/// the tree the build resolves against. A project with no
+/// `lua_modules/share/lua/<X.Y>/` directory pays one failed `is_dir` and gets an
+/// empty result — the flat `lua_modules/<name>/` layout keeps its existing
+/// `[dependencies]` + `[types] defs` path untouched.
+///
+/// A rock source that did not parse is dropped silently here — `check`'s output
+/// is the project's findings and a vendored file the user did not write has no
+/// business in it. The skipped labels are still reported where a debug-level
+/// note belongs: the LSP names them in its log pane (`crate::lsp_cmd` →
+/// `luabox_lsp`).
+fn harvest_rocks(project: &Project, ambient: &Ambient) -> luabox_types::RockSurfaces {
+    let version_dir = luabox_bundle::rocks_version_dir(project.build_target);
+    let sources: Vec<luabox_types::RockModule> =
+        layout::collect_rock_sources(&project.root, version_dir)
+            .into_iter()
+            .map(|source| luabox_types::RockModule {
+                module: source.module,
+                label: source.label,
+                path: source.path,
+                text: source.text,
+            })
+            .collect();
+    luabox_types::rocks::harvest(ambient, &sources)
 }
 
 /// Canonicalize a path for identity comparison against
@@ -876,6 +933,169 @@ mod tests {
         // The label is dependency-prefixed and forward-slashed.
         assert_eq!(defs[0].file, "geometry/defs/geometry.d.lua");
         assert!(defs[0].text.contains("geometry.Shape"));
+    }
+
+    // -- types harvested from a bare luarocks tree (#30) --------------------
+    //
+    // The tree walk is `luabox_manifest::layout`'s and the surface harvest is
+    // `luabox_types::rocks`'; both are tested there. These pin what `check`
+    // adds: the wiring — no manifest declaration needed, project-side
+    // declarations winning, and a rock body never being checked.
+
+    /// An annotated rock installed the way luarocks installs one.
+    const ROCK: &str = "\
+---@class mylib.Point
+---@field x number
+---@field y number
+
+local M = {}
+
+---@param x number
+---@param y number
+---@return mylib.Point
+function M.point(x, y)
+  return { x = x, y = y }
+end
+
+return M
+";
+
+    #[test]
+    fn a_bare_rock_tree_types_a_require_with_no_manifest_declaration() {
+        let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
+        write(tmp.path(), "lua_modules/share/lua/5.4/mylib/init.lua", ROCK);
+        // No `[dependencies]`, no `[types] defs`, no `lua_modules/mylib/luabox.toml`.
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "local mylib = require(\"mylib\")\nlocal p = mylib.point(1, 2)\nreturn p.x\n",
+        );
+        check(tmp.path(), None, Format::Human).expect("rock types resolve and check clean");
+    }
+
+    #[test]
+    fn misusing_a_harvested_rock_type_is_reported_in_the_consumer() {
+        let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
+        write(tmp.path(), "lua_modules/share/lua/5.4/mylib/init.lua", ROCK);
+        // The rock's `---@return mylib.Point` flows through the `require`, so
+        // both misuses are the consumer's: a field the rock's class does not
+        // declare, and the class where a string is wanted.
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "local mylib = require(\"mylib\")\n\
+             local p = mylib.point(1, 2)\n\
+             ---@param s string\n\
+             local function want(s) end\n\
+             want(p)\n\
+             return p.nope\n",
+        );
+        let error = check(tmp.path(), None, Format::Human)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "check failed with 2 error(s)");
+    }
+
+    #[test]
+    fn a_type_error_inside_a_rock_source_is_never_a_project_diagnostic() {
+        let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
+        // Annotated (so it *is* harvested) and wrong (so it would fail if it
+        // were checked): the rock misuses its own signature.
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/mylib/init.lua",
+            &format!("{ROCK}\n---@type mylib.Point\nlocal bad = {{ x = \"nope\" }}\n"),
+        );
+        write(tmp.path(), "src/main.lua", "return 1\n");
+        check(tmp.path(), None, Format::Human).expect("vendored bodies are never checked");
+    }
+
+    #[test]
+    fn an_unparseable_rock_source_is_skipped_silently() {
+        let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/broken/init.lua",
+            "---@class broken.Thing\nlocal = = =\n",
+        );
+        write(tmp.path(), "src/main.lua", "return 1\n");
+        check(tmp.path(), None, Format::Human).expect("a broken rock cannot fail the project");
+    }
+
+    #[test]
+    fn an_explicit_defs_declaration_wins_a_collision_with_a_harvested_rock_class() {
+        let tmp = project(&manifest(
+            "5.4",
+            "\n[types]\nstrict = true\ndefs = [\"mylib\"]\n",
+        ));
+        write(tmp.path(), "lua_modules/share/lua/5.4/mylib/init.lua", ROCK);
+        // The project's own def declares `mylib.Point` with only `x`. If the
+        // rock's two-field version won, `{ x = 1 }` would be missing `y`.
+        write(
+            tmp.path(),
+            "defs/mylib.d.lua",
+            "---@meta\n---@class mylib.Point\n---@field x number\n",
+        );
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "---@type mylib.Point\nlocal p = { x = 1 }\nreturn p\n",
+        );
+        check(tmp.path(), None, Format::Human).expect("explicit defs win — `x` alone is complete");
+    }
+
+    #[test]
+    fn a_rock_tree_for_another_version_directory_is_not_harvested() {
+        let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
+        // Installed for 5.1; this project targets 5.4, so the tree is not
+        // this build's and `require` would not resolve into it either.
+        write(tmp.path(), "lua_modules/share/lua/5.1/mylib/init.lua", ROCK);
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "---@type mylib.Point\nlocal p = { x = 1, y = 2 }\nreturn p\n",
+        );
+        let error = check(tmp.path(), None, Format::Human)
+            .unwrap_err()
+            .to_string();
+        // LB0305 — the class is undeclared, exactly as before #30.
+        assert!(error.contains("check failed with"), "{error}");
+    }
+
+    #[test]
+    fn an_explicit_dependencies_entry_alongside_a_rock_tree_neither_breaks_nor_doubles() {
+        let tmp = project(&manifest(
+            "5.4",
+            "\n[types]\nstrict = true\n\n[dependencies]\nmylib = \"1.0\"\n",
+        ));
+        write(tmp.path(), "lua_modules/share/lua/5.4/mylib/init.lua", ROCK);
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "---@type mylib.Point\nlocal p = { x = 1, y = 2 }\nreturn p\n",
+        );
+        // The entry finds no `lua_modules/mylib/luabox.toml`, so it contributes
+        // no defs; the harvest supplies the class once. No LB0307.
+        check(tmp.path(), None, Format::Human).expect("declared dependency plus harvest is clean");
+    }
+
+    #[test]
+    fn a_project_file_shadowing_a_rock_module_keeps_its_own_export_type() {
+        let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
+        write(tmp.path(), "lua_modules/share/lua/5.4/mylib.lua", ROCK);
+        // `<root>/src/mylib.lua` is earlier in the resolution order than the
+        // rock tree, so `require("mylib")` is this file — with no `point`.
+        write(
+            tmp.path(),
+            "src/mylib.lua",
+            "local M = {}\n---@return string\nfunction M.shadow() return \"me\" end\nreturn M\n",
+        );
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "local mylib = require(\"mylib\")\nreturn mylib.shadow()\n",
+        );
+        check(tmp.path(), None, Format::Human).expect("the project file wins resolution");
     }
 
     fn read_manifest_for_test(root: &Path) -> Manifest {
