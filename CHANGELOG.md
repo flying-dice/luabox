@@ -90,6 +90,12 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   output is read in full still reports its real exit code, and a genuine write
   failure (a full disk on `luabox schema > luabox.schema.json`) is still an
   error, now reported as one line on stderr and exit 1 rather than a panic.
+  `luabox lsp` gets the opposite policy for the same defect: its two stderr
+  log lines used to abort the whole language server the moment a client had
+  closed the log pipe (an editor restart, a torn-down output pane) while the
+  user's `luabox.toml` happened to be mid-edit and invalid — a long-running
+  server must *survive* a dead log pipe, so it now drops the message and
+  keeps serving instead of exiting at all.
 - **Diagnostics on very long lines are fast to report, and readable.** A file
   with one enormous line — minified or generated source — made reporting
   quadratic all over again, because a label's *column* was counted by walking

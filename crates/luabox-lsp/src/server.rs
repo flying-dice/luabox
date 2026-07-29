@@ -31,6 +31,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -81,6 +82,19 @@ use crate::{
     goto_definition, goto_implementation, goto_type_definition, hover, inlay_hints, references,
     rename, selection_range, semantic_tokens, signature_help, symbols,
 };
+
+/// Best-effort stderr logging for a long-running server.
+///
+/// `eprintln!` panics when the write fails, and the release profile is
+/// `panic = "abort"` — so a client that closed our stderr (editor restart, a
+/// torn-down log pane, a client that never captured it) would take the whole
+/// language server down with SIGABRT the moment we tried to log. A dead log
+/// pipe must never kill the server: the message is dropped instead. (The
+/// CLI's emit seam exits 0 on a departed reader; that policy would be wrong
+/// here — an LSP must keep serving.)
+fn log_to_stderr(message: &str) {
+    let _ = writeln!(std::io::stderr(), "{message}");
+}
 
 /// Run the server over stdio until the client sends `shutdown`/`exit`.
 /// A leading `--stdio` argument, which editors commonly pass, is harmless:
@@ -266,7 +280,7 @@ impl ProjectConfig {
             return defaults;
         };
         let Ok(manifest) = Manifest::parse(&text) else {
-            eprintln!("luabox-lsp: invalid luabox.toml; using defaults (5.4, warn)");
+            log_to_stderr("luabox-lsp: invalid luabox.toml; using defaults (5.4, warn)");
             return defaults;
         };
         // One `[lint]` translation for the whole workspace (`luabox-lint`'s),
@@ -540,7 +554,7 @@ impl Server {
     fn collect_lua_files(&self) -> Vec<PathBuf> {
         layout::collect_lua_files(&self.root, self.out_dir.as_deref(), DefFiles::Include)
             .unwrap_or_else(|err| {
-                eprintln!("luabox-lsp: cannot index workspace: {err}");
+                log_to_stderr(&format!("luabox-lsp: cannot index workspace: {err}"));
                 Vec::new()
             })
     }
