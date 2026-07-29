@@ -277,6 +277,18 @@ jobs:
         with:
           key: release-verify-${{ matrix.os }}
 
+      # install.sh's draft path parses the release LISTING with jq — a draft is
+      # not returned by `releases/tags/<tag>`, so it has to be matched by
+      # tag_name across pages, and an asset id is not something to pull out of
+      # JSON with grep. The installer fails fast and loudly without jq; this
+      # step means the gate can never reach it unprepared, and a runner image
+      # that dropped jq is a red step with an obvious cause rather than an
+      # install failure several round-trips in.
+      - name: Assert jq is available (install.sh's draft path needs it)
+        if: matrix.shell == 'bash'
+        shell: bash
+        run: jq --version
+
       # ── Install from the draft (unix) ────────────────────────────────────
       - name: Install from the draft release (unix)
         if: matrix.shell == 'bash'

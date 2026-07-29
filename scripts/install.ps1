@@ -7,6 +7,14 @@
 #   LUABOX_DRAFT_INSTALL - CI only; set to 1 to install from a draft release
 #                          (needs GITHUB_TOKEN and a pinned LUABOX_VERSION)
 #   GITHUB_TOKEN         - CI only; see "draft-release path" below
+#   LUABOX_API_BASE      - CI only; base URL of the GitHub REST API
+#                          (default https://api.github.com). Mirrors the same
+#                          override in scripts/install.sh, which exists so the
+#                          draft path can be pointed at a mock server and
+#                          exercised on every push rather than first being
+#                          discovered by a real tag (the `draft-install-mock`
+#                          job in .github/workflows/ci.yml). It changes nothing
+#                          for a real install.
 
 $ErrorActionPreference = "Stop"
 
@@ -38,6 +46,14 @@ $Version = if ($env:LUABOX_VERSION) {
     "latest"
 }
 
+# CI-only, and the counterpart of install.sh's `API_BASE`. Documented at the
+# top; unset for every real install, which is the whole of its risk surface.
+$ApiBase = if ($env:LUABOX_API_BASE) {
+    $env:LUABOX_API_BASE.TrimEnd("/")
+} else {
+    "https://api.github.com"
+}
+
 # --- draft-release path -----------------------------------------------------
 # A GitHub *draft* release has no public release-download URLs, so the ordinary
 # path below cannot see one. The release pipeline needs exactly that: it must
@@ -66,7 +82,7 @@ if ($UseApi) {
 function Resolve-Version {
     if ($Version -eq "latest") {
         try {
-            $release = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest"
+            $release = Invoke-RestMethod "$ApiBase/repos/$Repo/releases/latest"
         } catch {
             Fail "Could not resolve latest version - are there any releases for $Repo yet?"
         }
@@ -113,7 +129,7 @@ function Get-AssetId($Tag, $Name) {
     # API's default representation is the JSON we want anyway.
     $headers = @{ "Authorization" = "Bearer $Token" }
     for ($page = 1; $page -le 5; $page++) {
-        $url = "https://api.github.com/repos/$Repo/releases?per_page=100&page=$page"
+        $url = "$ApiBase/repos/$Repo/releases?per_page=100&page=$page"
         try {
             # @(...) so a single-element response still behaves like a list.
             $releases = @(Invoke-RestMethod -Uri $url -Headers $headers -UserAgent "luabox-install")
@@ -150,7 +166,7 @@ function Get-ApiAsset($Tag, $Name, $Dest) {
     #     two competing auth mechanisms. So the redirect is followed by hand,
     #     unauthenticated (this is what `curl -L` does for install.sh).
     $request = [System.Net.HttpWebRequest]::Create(
-        "https://api.github.com/repos/$Repo/releases/assets/$id")
+        "$ApiBase/repos/$Repo/releases/assets/$id")
     $request.Method = "GET"
     $request.Accept = "application/octet-stream"
     $request.UserAgent = "luabox-install"
