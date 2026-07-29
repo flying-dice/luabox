@@ -16,11 +16,16 @@
 //!   directory are excluded by both.
 //! * **Which types** — [`resolve_project_defs`] and [`resolve_dep_defs`]
 //!   locate the `*.d.lua` ambient definition files the project and its direct
-//!   dependencies contribute (#108, the luals `workspace.library` model).
+//!   dependencies contribute (#108, the luals `workspace.library` model), and
+//!   [`collect_rock_sources`] enumerates the *installed rock sources* of a
+//!   luarocks tree whose LuaCATS annotations Semantics harvests for their
+//!   type surfaces (#30).
 //!
 //! Layout is classification by *path*: Distribution never parses syntax
 //! (SPEC.md §16), so nothing here reads a Lua file's contents to decide what
-//! it is. Diagnostics are the frontend's job too — an unresolvable `[types]
+//! it is — [`collect_rock_sources`] hands every rock source's text back
+//! unjudged, and whether a given one carries usable annotations is Semantics'
+//! call. Diagnostics are the frontend's job too — an unresolvable `[types]
 //! defs` entry comes back as a name, not an `LB1002`.
 
 use std::ffi::OsStr;
@@ -387,6 +392,124 @@ fn load_defs_package(
 /// (`<dep>/defs/<name>.d.lua`), forward-slashed for cross-platform stability.
 fn dep_def_label(dep_name: &str, file: &Path, dep_root: &Path) -> String {
     format!("{dep_name}/{}", display_rel(file, dep_root))
+}
+
+// ---------------------------------------------------------------------
+// Installed rock sources (the luarocks-tree type harvest, #30)
+// ---------------------------------------------------------------------
+
+/// One Lua source file installed in a luarocks tree, as the type harvest sees
+/// it (#30).
+///
+/// Not a [`DefSource`]: a def file is an ambient `---@meta` *declaration*
+/// package named by a manifest, while this is ordinary vendored code that also
+/// happens to carry annotations, and it answers to a `require` name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RockSource {
+    /// The dotted `require` name this file answers to — its path under the
+    /// version directory, `/` → `.`, with a trailing `init` dropped
+    /// (`pl/tablex.lua` → `pl.tablex`, `pl/init.lua` → `pl`), i.e. the name
+    /// `luabox_bundle::resolve_module` maps back to this same file.
+    pub module: String,
+    /// How diagnostics and debug notes name this file: its root-relative
+    /// path, forward-slashed.
+    pub label: String,
+    /// The file on disk — the identity a resolved `require` is matched against.
+    pub path: PathBuf,
+    /// The file's contents, handed back unjudged (see the module docs).
+    pub text: String,
+}
+
+/// The `lua_modules/share/lua/<version_dir>/` directory a luarocks tree
+/// installs pure-Lua modules into — where `require` resolution looks
+/// (`luabox_bundle::resolve_candidates`) and therefore where the type harvest
+/// reads. `version_dir` is `luabox_bundle::rocks_version_dir`'s answer for the
+/// dialect in play (`"5.4"`, `"5.1"` for LuaJIT).
+#[must_use]
+pub fn rock_tree_dir(root: &Path, version_dir: &str) -> PathBuf {
+    root.join(VENDOR_DIR)
+        .join("share")
+        .join("lua")
+        .join(version_dir)
+}
+
+/// Every `*.lua` file installed under [`rock_tree_dir`], read, in path-sorted
+/// order — the deterministic collision-winner order for the type harvest (#30).
+///
+/// Empty when the project has no luarocks tree for this version directory,
+/// which is the scope guard: the harvest requires the versioned
+/// `share/lua/<X.Y>/` layout, and the flat `lua_modules/<name>/` layout keeps
+/// its existing `[dependencies]` + `[types] defs` path untouched.
+///
+/// Nothing here fails: an unreadable directory or file simply contributes
+/// nothing. A vendored tree is not the project's code, and a permissions
+/// problem inside it must never turn into a diagnostic about the project.
+#[must_use]
+pub fn collect_rock_sources(root: &Path, version_dir: &str) -> Vec<RockSource> {
+    let base = rock_tree_dir(root, version_dir);
+    if !base.is_dir() {
+        return Vec::new();
+    }
+    let mut files = Vec::new();
+    collect_rock_lua(&base, &mut files);
+    files.sort();
+    files
+        .into_iter()
+        .filter_map(|path| {
+            let module = rock_module_name(&path, &base)?;
+            let text = fs::read_to_string(&path).ok()?;
+            Some(RockSource {
+                module,
+                label: display_rel(&path, root),
+                path,
+                text,
+            })
+        })
+        .collect()
+}
+
+/// Collect every `*.lua` file under `dir`, recursively. Unlike
+/// [`collect_d_lua`] this takes *all* Lua files: a rock's annotations live in
+/// its ordinary sources, which is the whole point of #30.
+fn collect_rock_lua(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rock_lua(&path, out);
+        } else if path.extension().and_then(OsStr::to_str) == Some("lua") {
+            out.push(path);
+        }
+    }
+}
+
+/// The dotted `require` name a rock source answers to: its path relative to
+/// the version directory `base`, without the `.lua` extension, `/` → `.`, and
+/// with a trailing `init` segment dropped (`pl/init.lua` → `pl`) — the inverse
+/// of `luabox_bundle::resolve_candidates`' luarocks-tree mapping.
+///
+/// `None` for a path outside `base` or one whose components are not UTF-8: a
+/// name that cannot be spelled cannot be `require`d either.
+fn rock_module_name(path: &Path, base: &Path) -> Option<String> {
+    let rel = path.strip_prefix(base).ok()?;
+    let mut segments: Vec<&str> = Vec::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(name) => segments.push(name.to_str()?),
+            _ => return None,
+        }
+    }
+    let last = segments.pop()?;
+    let stem = last.strip_suffix(".lua")?;
+    // `pl/init.lua` is `require "pl"`; a bare `init.lua` at the tree root has
+    // no parent to name it, so it keeps its own.
+    let names_its_parent = stem == "init" && !segments.is_empty();
+    if !names_its_parent {
+        segments.push(stem);
+    }
+    Some(segments.join("."))
 }
 
 /// Collect every `*.d.lua` file under `dir`, recursively. An unreadable
@@ -1019,6 +1142,131 @@ edition = \"5.4\"
     fn dep_def_label_falls_back_to_the_whole_path_when_it_is_not_under_the_dep_root() {
         let label = dep_def_label("dep", Path::new("/elsewhere/x.d.lua"), Path::new("/root"));
         assert_eq!(label, "dep//elsewhere/x.d.lua");
+    }
+
+    // --- installed rock sources (#30) -------------------------------------
+
+    #[test]
+    fn rock_tree_dir_names_the_versioned_share_directory() {
+        assert_eq!(
+            rock_tree_dir(Path::new("/proj"), "5.4"),
+            Path::new("/proj/lua_modules/share/lua/5.4")
+        );
+    }
+
+    #[test]
+    fn collect_rock_sources_yields_module_names_labels_and_text_path_sorted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/pl/tablex.lua",
+            "---@meta-ish\nreturn 1\n",
+        );
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/pl/init.lua",
+            "return 2\n",
+        );
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/inifile.lua",
+            "return 3\n",
+        );
+
+        let rocks = collect_rock_sources(tmp.path(), "5.4");
+        let named: Vec<(&str, &str)> = rocks
+            .iter()
+            .map(|r| (r.module.as_str(), r.label.as_str()))
+            .collect();
+        // Path-sorted — the deterministic first-wins order the harvest relies on.
+        assert_eq!(
+            named,
+            [
+                ("inifile", "lua_modules/share/lua/5.4/inifile.lua"),
+                ("pl", "lua_modules/share/lua/5.4/pl/init.lua"),
+                ("pl.tablex", "lua_modules/share/lua/5.4/pl/tablex.lua"),
+            ]
+        );
+        assert_eq!(rocks[0].text, "return 3\n");
+        assert_eq!(
+            rocks[0].path,
+            tmp.path().join("lua_modules/share/lua/5.4/inifile.lua")
+        );
+    }
+
+    #[test]
+    fn collect_rock_sources_is_empty_without_a_versioned_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // The flat layout keeps its existing defs-based path: no harvest.
+        write(tmp.path(), "lua_modules/pkg/src/init.lua", "return 1\n");
+        // …and so does a tree installed for another interpreter version.
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.1/legacy.lua",
+            "return 1\n",
+        );
+        assert!(collect_rock_sources(tmp.path(), "5.4").is_empty());
+    }
+
+    #[test]
+    fn collect_rock_sources_ignores_non_lua_files_and_c_modules() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "lua_modules/share/lua/5.4/ok.lua", "return 1\n");
+        write(tmp.path(), "lua_modules/share/lua/5.4/README.md", "hi\n");
+        write(tmp.path(), "lua_modules/lib/lua/5.4/lfs.so", "binary\n");
+        write(
+            tmp.path(),
+            "lua_modules/lib/luarocks/rocks-5.4/pl/spec.lua",
+            "return 1\n",
+        );
+
+        let modules: Vec<String> = collect_rock_sources(tmp.path(), "5.4")
+            .into_iter()
+            .map(|r| r.module)
+            .collect();
+        assert_eq!(modules, ["ok"]);
+    }
+
+    #[test]
+    fn collect_rock_sources_takes_a_deeply_nested_module() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/a/b/c/d.lua",
+            "return 1\n",
+        );
+        let rocks = collect_rock_sources(tmp.path(), "5.4");
+        assert_eq!(rocks.len(), 1);
+        assert_eq!(rocks[0].module, "a.b.c.d");
+    }
+
+    #[test]
+    fn a_bare_init_lua_at_the_tree_root_keeps_its_own_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/init.lua",
+            "return 1\n",
+        );
+        let rocks = collect_rock_sources(tmp.path(), "5.4");
+        // Nothing to name it after — the `init` drop needs a parent segment.
+        assert_eq!(rocks[0].module, "init");
+    }
+
+    #[test]
+    fn rock_module_name_rejects_a_path_outside_the_tree_or_a_non_lua_file() {
+        let base = Path::new("/proj/lua_modules/share/lua/5.4");
+        assert!(rock_module_name(Path::new("/elsewhere/x.lua"), base).is_none());
+        assert!(rock_module_name(&base.join("notes.txt"), base).is_none());
+        // The base itself has no trailing file segment to name.
+        assert!(rock_module_name(base, base).is_none());
+    }
+
+    #[test]
+    fn collect_rock_lua_on_a_missing_directory_yields_nothing() {
+        let mut found = Vec::new();
+        collect_rock_lua(Path::new("no-such-rock-tree-xyzzy"), &mut found);
+        assert!(found.is_empty());
     }
 
     #[test]

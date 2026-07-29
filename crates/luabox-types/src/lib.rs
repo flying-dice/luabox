@@ -30,6 +30,14 @@
 //! project source set, reusing the bundler's / salsa DB's `require`
 //! path-mapping.
 //!
+//! **Types from a bare luarocks tree (#30):** [`rocks::harvest`] reads the
+//! LuaCATS annotations a rock's *installed sources* already carry
+//! (`lua_modules/share/lua/<X.Y>/**.lua`) for their class/enum/alias
+//! declarations and `require`-export types, so `luarocks install --tree
+//! lua_modules <rock>` yields visible, enforced signatures with no manifest
+//! declaration at all. Ambient-relaxed and surface-only: vendored bodies are
+//! never checked, and a rock file that does not parse is skipped silently.
+//!
 //! **Bidirectional / contextual typing (#120):** a function-literal
 //! parameter takes its type from the expected `fun(...)` at a call-argument
 //! (`---@param cb fun(...)`) or `---@type fun(...)` position, so the lambda
@@ -59,6 +67,7 @@ mod env;
 mod generics;
 mod infer;
 mod lower;
+pub mod rocks;
 pub mod ty;
 mod version;
 
@@ -68,6 +77,7 @@ pub use defs::{
 };
 pub use env::{FileTypes, TypeEnv};
 pub use infer::{ExternalTypes, InferredBinding, InferredReturn};
+pub use rocks::{RockModule, RockSurfaces};
 pub use version::VersionReq;
 
 use std::collections::HashMap;
