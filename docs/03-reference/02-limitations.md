@@ -236,23 +236,54 @@ luarocks install --tree lua_modules penlight
 luabox check
 ```
 
-What that tree buys you is `require` resolution and bundling: both the
-luarocks layout (`lua_modules/share/lua/<X.Y>/…`, `<X.Y>` from your `[build]
-target`, `5.1` for `luajit`) and the flat `lua_modules/<name>/` layout are on
-the module path, and `lua_modules/` is never walked as project source.
+What that tree buys you is `require` resolution, bundling **and types**: both
+the luarocks layout (`lua_modules/share/lua/<X.Y>/…`, `<X.Y>` from your
+`[build] target`, `5.1` for `luajit`) and the flat `lua_modules/<name>/` layout
+are on the module path, `lua_modules/` is never walked as project source, and a
+luarocks tree's installed sources are read for their LuaCATS surfaces (#30,
+[decisions/09](../../decisions/09-rock-tree-type-harvest.md)).
 
-**Cross-package *types* are narrower than that, and this is the sharp edge.**
-A dependency's LuaCATS definitions reach your use sites only when all three
-hold: (a) a `[dependencies]`/`[dev-dependencies]` entry names the package;
-(b) a `luabox.toml` for it exists at `lua_modules/<name>/luabox.toml` (or at
-the `path` you gave) and sets `[types] defs`; (c) the `defs/` directory it
-names is present. A luarocks tree has no per-package
-`luabox.toml`, so a plain `luarocks install --tree lua_modules penlight`
-gives you resolution and bundling but leaves penlight `unknown` to the
-typechecker. Typed third-party code today therefore means either a
-flat-layout package that ships a `luabox.toml`, or definitions you write into
-your own project's `defs/` and list in your own `[types] defs`. Teaching
-luabox to read a rockspec's own definition files is not planned for 0.x.
+**Cross-package types from a bare tree used to be the sharp edge. It is
+gone.** A rock's `---@class`/`---@enum`/`---@alias` declarations and each
+module's `require`-export type are harvested from
+`lua_modules/share/lua/<X.Y>/**.lua` with **no manifest declaration of any
+kind** — no `[dependencies]` entry, no per-package `luabox.toml`, no `[types]
+defs`. Surfaces only: a vendored body is never typechecked (a type error
+inside a rock produces nothing), and a rock source that does not parse is
+skipped in silence, named in the LSP log and nowhere else. The editor and CI
+harvest the same tree, so they agree.
+
+What that leaves, stated plainly:
+
+- **A rock with no LuaCATS annotations gives you nothing** and stays `unknown`
+  to the typechecker, exactly as before. Deliberate, not pending: an
+  un-annotated module's export is a table of `unknown`s whose shape is whatever
+  its top-level assignments happen to reveal, so harvesting it could only turn
+  dynamic module construction into `undefined-field` noise about code you did
+  not write. A source with no `---@` anywhere is skipped before it is parsed.
+- **A library whose API is a *global*** rather than a module return — LÖVE,
+  Neovim, OpenResty — still wants a `defs/` package. The harvest contributes
+  type declarations and export types, not ambient globals.
+- **Argument checking at a rock function's call site** does not happen:
+  `local m = require("rock"); m.f("wrong")` is unchecked. That is a
+  pre-existing gap for calls through *any* table or class field — your own
+  modules included — not a harvest limitation. A def-declared global API
+  (`geometry.point(…)`) *is* param-checked, and a rock's `---@return` types do
+  flow, so misusing the *result* is caught.
+- **The flat `lua_modules/<name>/` layout is not harvested.** It keeps its
+  existing route: a `[dependencies]`/`[dev-dependencies]` entry naming the
+  package, a `luabox.toml` for it at `lua_modules/<name>/luabox.toml` (or at
+  the `path` you gave) with `[types] defs`, and the `defs/` directory it names.
+- **A name collision between two rocks resolves silently**, first-wins in path
+  order. You declared neither side and cannot edit vendored code, so there is
+  no warning to act on — unlike a collision between two `[types] defs`
+  packages, which still warns (`LB0307`/`LB0310`).
+
+Writing the definitions yourself remains the escape hatch, and it is a real
+one: a name your `defs/` package — or your own source — declares wins over a
+rock's **outright**, not merged, so a wrong or incomplete annotation upstream
+is something you can correct locally. Reading a *rockspec* for definition files
+it points at is still not planned for 0.x; nothing needs it now.
 
 Your `*.rockspec` and luarocks own everything else (adding, updating,
 publishing), and you run your program with whatever Lua you already have.

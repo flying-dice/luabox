@@ -262,7 +262,7 @@ project-local `lua_modules/` with luarocks yourself, and luabox reads it:
 
 ```sh
 luarocks install --tree lua_modules penlight
-luabox check                # penlight is requirable, bundlable, and skipped as source
+luabox check                # penlight is requirable, bundlable, typed, and skipped as source
 ```
 
 Anything under `lua_modules/` is on the module path for `require` resolution
@@ -275,21 +275,38 @@ hand-vendored or sibling package has. A compiled C module
 alongside your bundle. `lua_modules/` is never walked as project source:
 `check`, `lint`, `fmt` and `build` skip it whatever it contains.
 
-**Getting a dependency's *types* needs more than installing it.** All three
-must hold, or the rock is `unknown` to the typechecker:
+**An installed rock's *types* come along too, with no configuration.** A rock
+that documents itself for lua-language-server has already written the
+signatures, and they ship inside it — so `luabox check` reads the installed
+sources under `lua_modules/share/lua/<X.Y>/` for their LuaCATS **surfaces**:
+every `---@class`, `---@enum` and `---@alias` they declare, plus the type a
+`require` of each module evaluates to. No `[dependencies]` entry, no
+per-package `luabox.toml`, no `[types] defs`. The rock's classes become
+nameable and enforced in your code, `local m = require("rock")` carries the
+module's annotated return types, and misuse is reported at *your* use site
+(the editor sees the same surfaces, so hover and completion agree with CI).
 
-1. a `[dependencies]` (or `[dev-dependencies]`) entry naming the package —
-   the table drives nothing else, but it is the list that gets searched;
-2. a `luabox.toml` for that package with a `[types] defs` key, at
-   `lua_modules/<name>/luabox.toml` (or, for a `path` dependency, at the
-   path you gave) — i.e. the **flat** layout, since a luarocks tree has no
-   per-package `luabox.toml`;
-3. the `defs/` directory it names, holding the `*.d.lua` files.
+Surfaces only — a vendored body is never typechecked. A type error inside a
+rock is not your problem and produces nothing; a rock source that does not
+parse is skipped in silence. Two things still need definitions of your own:
 
-So a plain `luarocks install --tree lua_modules penlight` gives you require
-resolution and bundling, but **not** penlight's types. To type it today,
-write the LuaCATS definitions into your own project's `defs/` and list them
-in your `[types] defs` — the same route as any third-party library.
+- **a rock with no LuaCATS annotations** — there is nothing to harvest, so it
+  stays `unknown` exactly as before (which also means an un-annotated,
+  dynamically-built module table never becomes `undefined-field` noise);
+- **a library whose API is a global** rather than a module return — a
+  LÖVE-style framework — which is what a `defs/` package is for.
+
+Write those definitions into your project's `defs/` and list them in `[types]
+defs`. That also *overrides* a rock's own declaration: your declaration of a
+name wins outright, so a wrong or incomplete annotation upstream is something
+you can fix locally. Details in
+[decisions/09](decisions/09-rock-tree-type-harvest.md).
+
+The flat `lua_modules/<name>/` layout keeps its own route, unchanged: a
+`[dependencies]`/`[dev-dependencies]` entry naming the package, a
+`luabox.toml` for it at `lua_modules/<name>/luabox.toml` (or at the `path` you
+gave) with a `[types] defs` key, and the `defs/` directory it names — the
+luals `workspace.library` model for packages that carry a luabox manifest.
 
 Your `*.rockspec` and luarocks own dependency management — there is no
 solver, no lockfile, and no registry client in luabox
