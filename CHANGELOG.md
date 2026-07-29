@@ -57,10 +57,39 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   your `*.lua` files and `luabox.toml` came back as filesystem events and
   triggered the next rerun. Watch now acts only on events that describe a
   change — creations, removals, renames, content and metadata writes, plus a
-  writer closing a file — and ignores the access events a read produces; and
-  after every rerun it drains whatever that run stirred up, so no run can feed
-  the next one whatever a platform's backend calls its events. An `mtime`-only
-  `touch` still reruns, and one edit still costs one rerun.
+  writer closing a file — and ignores the access events a read produces. That
+  filter is the whole fix, and it is enough on its own: on every platform
+  luabox ships a binary for, a *read* is not reported as a change at all
+  (inotify classifies it as an access; neither FSEvents nor
+  `ReadDirectoryChangesW` reports it), so nothing a run does can feed the next
+  one. An `mtime`-only `touch` still reruns, and one edit still costs one
+  rerun.
+- **`--watch` no longer throws away a save made moments after the previous
+  one.** The fix above originally shipped with a second, belt-and-braces half:
+  a 200 ms sweep after every rerun that received filesystem events and
+  discarded them, so that a rerun could not react to its own activity. It
+  could not tell a rerun's own noise from your editor's, so a save landing in
+  that window was discarded outright — and nothing ever went back for it.
+  `check --watch` sat there reporting `watch: ok` over a tree you had just
+  broken, indefinitely, and `fmt --watch` silently skipped formatting the file
+  you had just saved. Two saves ~0.3 s apart reproduced it every time, and an
+  IDE "save all" spreading five files ~120 ms apart hit it on every use. The
+  sweep is gone: every edit gets its rerun, at any spacing, and one edit still
+  settles into silence afterwards.
+- **`luabox check | head` no longer crashes.** Piping any luabox report into a
+  reader that stops early — `head`, `grep -q`, a pager the user quits — killed
+  the process: Rust's `println!` panics when a write fails, a closed pipe makes
+  every write fail, and any report larger than the pipe buffer (64 kB) is
+  guaranteed to still be writing when the reader leaves. The result was a raw
+  Rust panic and a backtrace on stderr, ending in `SIGABRT` (exit status 134)
+  on release builds, in all five `--format`s. A CI job with `set -o pipefail`
+  and a routine `| head` or `| grep -q` went red for it. A reader that hangs up
+  now means "it got what it wanted": luabox stops writing and exits **0**,
+  silently, the way `head` users already expect — on stderr as well as stdout,
+  so `luabox check 2>&1 | head` behaves too. Nothing else changes: a run whose
+  output is read in full still reports its real exit code, and a genuine write
+  failure (a full disk on `luabox schema > luabox.schema.json`) is still an
+  error, now reported as one line on stderr and exit 1 rather than a panic.
 - **Diagnostics on very long lines are fast to report, and readable.** A file
   with one enormous line — minified or generated source — made reporting
   quadratic all over again, because a label's *column* was counted by walking

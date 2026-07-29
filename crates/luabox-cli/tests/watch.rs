@@ -40,6 +40,15 @@ use std::time::{Duration, Instant};
 /// indefinitely and ignores any deadline check around it).
 fn spawn_line_reader<R: std::io::Read + Send + 'static>(reader: R) -> mpsc::Receiver<String> {
     let (tx, rx) = mpsc::channel();
+    forward_lines(reader, tx);
+    rx
+}
+
+/// `spawn_line_reader`'s body against a caller-supplied sender, so several
+/// readers can feed one channel — `watch::run` prints successes to stdout and
+/// failures to stderr, and a test that cares about "whatever the watcher said
+/// next" has to see both in one stream.
+fn forward_lines<R: std::io::Read + Send + 'static>(reader: R, tx: mpsc::Sender<String>) {
     std::thread::spawn(move || {
         for line in BufReader::new(reader).lines() {
             match line {
@@ -52,7 +61,6 @@ fn spawn_line_reader<R: std::io::Read + Send + 'static>(reader: R) -> mpsc::Rece
             }
         }
     });
-    rx
 }
 
 /// Wait up to `timeout` for a line matching `pred`, draining (and
@@ -213,5 +221,82 @@ fn check_watch_stops_rerunning_once_the_edit_has_settled() {
         "the watcher kept rerunning with nothing changing: {reruns_while_quiet} reruns in \
          {QUIET:?} of quiet (tolerance {MAX_RERUNS_WHILE_QUIET}). That is the self-triggering \
          loop: a rerun's own reads coming back as filesystem events."
+    );
+}
+
+/// An edit made shortly after the previous one must be *reported*, not
+/// swallowed.
+///
+/// The bug this pins (round-5 F1, a wave-10 regression): every run was
+/// followed by a `drain_self_inflicted` sweep — a sliding 200 ms window that
+/// received events and discarded them, added to stop a rerun feeding off its
+/// own reads. It could not tell a run's own noise from a save, so an edit
+/// landing in that window was thrown away outright: `check --watch` went on
+/// reporting `watch: ok` over a tree the user had just broken, forever, and
+/// `fmt --watch` silently skipped formatting the file that had just been
+/// saved. The kind filter (`watch::triggers_rerun`) is what actually stops
+/// the loop; the drain was the unsound half and is gone.
+///
+/// The shape: edit A, then a *breaking* edit B one debounce-and-a-bit later,
+/// so B lands after A's batch has closed but while the old drain was still
+/// sweeping. B's failure has to surface. Timing-tolerant by construction — it
+/// waits for the failure rather than counting reruns or timing them, and the
+/// only way to satisfy it is to actually rerun for B.
+#[test]
+fn check_watch_reports_an_edit_made_while_the_previous_rerun_was_settling() {
+    /// Gap between the two edits. Past `watch::DEBOUNCE_WINDOW` (200 ms), so
+    /// B cannot merely join A's batch and pass this test for free — and well
+    /// inside the ~200 ms sweep the old drain ran afterwards.
+    const EDIT_GAP: Duration = Duration::from_millis(300);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    std::fs::write(
+        root.join("luabox.toml"),
+        "[package]\nname = \"tmp\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n",
+    )
+    .expect("write luabox.toml");
+    std::fs::write(root.join("main.lua"), "local x = 1\nreturn x\n").expect("write main.lua");
+
+    let bin = env!("CARGO_BIN_EXE_luabox");
+    let mut child = Command::new(bin)
+        .arg("check")
+        .arg("--watch")
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn `luabox check --watch`");
+
+    // A failing run is reported on stderr (`watch: failed: ...`) and a
+    // successful one on stdout, so both feed one channel here.
+    let (tx, output) = mpsc::channel();
+    forward_lines(child.stdout.take().expect("piped stdout"), tx.clone());
+    forward_lines(child.stderr.take().expect("piped stderr"), tx);
+
+    let saw_initial_run = wait_for_line(&output, Duration::from_secs(15), |line| {
+        line.starts_with("watch: ")
+    });
+
+    // Edit A: still valid, so the watcher reports `watch: ok` for it.
+    std::fs::write(root.join("main.lua"), "local x = 2\nreturn x\n").expect("edit A");
+    std::thread::sleep(EDIT_GAP);
+    // Edit B: a syntax error. Nothing touches the project after this, so the
+    // only thing that can report it is a rerun triggered by B itself.
+    std::fs::write(root.join("main.lua"), "local x = = 2\nreturn x\n").expect("edit B");
+
+    let saw_failure = wait_for_line(&output, Duration::from_secs(20), |line| {
+        line.contains("watch: failed")
+    });
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(saw_initial_run, "expected the initial run to complete");
+    assert!(
+        saw_failure,
+        "the breaking edit made {EDIT_GAP:?} after the previous one was never reported: \
+         `check --watch` is still claiming the tree is fine 20s later. That is an edit \
+         swallowed between runs — see this test's doc comment."
     );
 }

@@ -90,6 +90,8 @@ use std::process::Command;
 use anyhow::{Context, bail};
 use luabox_syntax::Dialect;
 
+use crate::emit::errln;
+
 /// Emit LÖVE packaging: `<out_dir>/<name>.love`. `bundle_text` is the
 /// already-produced plain bundle (see module docs for why it's written
 /// unmodified as `main.lua`). Returns the written `.love` path.
@@ -375,7 +377,7 @@ fn warn_if_backslash_entries(dest: &Path) {
         .filter(|l| !l.is_empty())
         .collect();
     if !bad_entries.is_empty() {
-        eprintln!(
+        errln!(
             "warning: `{}` contains backslash-separated entry paths ({}) — this Windows \
              `Compress-Archive` wrote OS path separators instead of the ZIP-spec `/`, which can \
              break LÖVE's `love.filesystem` and other unzip tools on non-Windows platforms. \

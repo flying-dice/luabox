@@ -44,6 +44,8 @@ use rayon::prelude::*;
 
 use layout::display_rel;
 
+use crate::emit::errln;
+
 /// The most fix passes to run per file before giving up on convergence.
 const MAX_FIX_PASSES: usize = 8;
 
@@ -159,11 +161,11 @@ fn finish(
     let counts = crate::project::render_diagnostics(diags, Format::Human, root);
     let (errors, warnings) = (counts.errors, counts.warnings);
     if fix {
-        eprintln!(
+        errln!(
             "lint: {errors} errors, {warnings} warnings in {file_count} files ({fixed_files} fixed)"
         );
     } else {
-        eprintln!("lint: {errors} errors, {warnings} warnings in {file_count} files");
+        errln!("lint: {errors} errors, {warnings} warnings in {file_count} files");
     }
     if errors > 0 {
         bail!("lint failed with {errors} error(s)");
