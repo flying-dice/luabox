@@ -22,6 +22,19 @@ pub enum Tier {
 }
 
 impl Tier {
+    /// Every tier, least-to-most opt-in — the closed set a `[lint]` tier
+    /// toggle may name, and half the candidate set the unknown-rule-id
+    /// "did you mean" nudge searches (a mistyped tier such as `pedantics`
+    /// reaches the config as a rule-id override, so the nudge has to be able
+    /// to point back at the tier).
+    pub const ALL: [Tier; 5] = [
+        Tier::Correctness,
+        Tier::Suspicious,
+        Tier::Perf,
+        Tier::Style,
+        Tier::Pedantic,
+    ];
+
     /// The tier's `[lint]` keyword.
     #[must_use]
     pub fn name(self) -> &'static str {

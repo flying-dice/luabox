@@ -27,3 +27,14 @@ pub fn rules() -> Vec<Box<dyn Rule>> {
         Box::new(empty_then::EmptyThen),
     ]
 }
+
+/// Every built-in rule id, in [`rules`] order — the set a `[lint]` rule-id
+/// override may name.
+///
+/// Derived from the registry rather than listed separately, so a rule added
+/// to [`rules`] is knowable to the config validator the moment it exists
+/// (CC-M8: an id nobody could enumerate was an id nobody could check).
+#[must_use]
+pub fn rule_ids() -> Vec<&'static str> {
+    rules().iter().map(|rule| rule.id()).collect()
+}

@@ -45,6 +45,7 @@ Feature: Diagnostic explain pages — luabox explain
       | LB0601 | irreducible `goto`                                               |
       | LB0603 | `<close>` lowering fidelity                                      |
       | LB0606 | integer/float divergence on lowering                             |
+      | LB1004 | unknown lint rule id in `[lint]`                                 |
 
   Scenario: a lint page names the rule id that produces it
     Given an empty directory

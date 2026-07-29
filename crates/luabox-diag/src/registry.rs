@@ -233,6 +233,14 @@ static REGISTRY: &[Entry] = &[
         title: "unresolvable definition package",
         explain: LB1002,
     },
+    // `LB1003` is deliberately absent: SPEC.md §6 reserves it for the parked
+    // dependency dialect-set check, and its explain page was removed with that
+    // subsystem rather than describe it in the present tense.
+    Entry {
+        code: Code::new(1004),
+        title: "unknown lint rule id in `[lint]`",
+        explain: LB1004,
+    },
 ];
 
 /// Look up the explain entry for a code, if it is registered.
@@ -1544,6 +1552,39 @@ management is parked post-v1 (SPEC.md §6), so nothing fetches defs on your
 behalf. Vendor the `.d.lua` files into `defs/` yourself.
 
 Fix: create the defs file/directory, correct the name, or remove the entry.
+";
+
+const LB1004: &str = "\
+# LB1004: unknown lint rule id in `[lint]`
+
+Every key in `[lint]` other than `globals` is either a **tier** name or a
+**rule id**:
+
+```toml
+[lint]
+globals = [\"love\"]      -- the global-write allow-list
+pedantic = \"warn\"       -- a tier toggle
+unused-local = \"allow\"  -- a rule-id override
+```
+
+The key reported here is neither. Tier names are a closed set, so an
+unrecognised key is recorded as a rule-id override — and a rule id that no
+rule answers to is silently inert. Nothing is disabled, nothing is raised,
+and the lint you meant to configure keeps firing at its default level.
+
+The tiers are:
+
+- `correctness` (deny by default)
+- `suspicious`, `perf`, `style` (warn)
+- `pedantic` (off unless enabled)
+
+The rule ids are the kebab-case names printed on every finding — the
+`unused-local` in `warning[LB0501]: ... unused-local lint (style)`.
+
+This is a warning, not an error: an unknown id does not fail `luabox lint`,
+so a manifest shared with a newer or older toolchain still works. Fix the
+spelling (the diagnostic suggests the nearest tier or rule id) or drop the
+entry.
 ";
 
 #[cfg(test)]

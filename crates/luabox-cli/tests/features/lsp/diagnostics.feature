@@ -152,3 +152,29 @@ Feature: luabox lsp — published diagnostics
     And the language server is running
     When I open "main.lua"
     Then the diagnostics for "main.lua" do not include LB0308
+
+  Scenario: a [lint] key naming no known rule is logged, not silently ignored
+    # A config problem belongs to no document, so it has no URI to publish
+    # against — it goes to the client's log pane instead (CC-M8).
+    Given a project with edition "5.4" and lint rule "unused-locl" set to "allow"
+    And a file "main.lua" containing:
+      """
+      local x = 1
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the server logged a warning containing "unknown lint rule id `unused-locl` in `[lint]`"
+    And the server logged a warning containing "did you mean `unused-local`?"
+    # ...and the rule the entry failed to silence still publishes.
+    And the diagnostics for "main.lua" include LB0501
+
+  Scenario: a correctly spelled [lint] key logs nothing
+    Given a project with edition "5.4" and lint rule "unused-local" set to "allow"
+    And a file "main.lua" containing:
+      """
+      local x = 1
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the server logged nothing containing "unknown lint rule id"
+    And the diagnostics for "main.lua" do not include LB0501
