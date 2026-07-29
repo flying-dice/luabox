@@ -12,9 +12,14 @@ toml_edit.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-# The schema/parser parity suite (`src/schema.rs`): `serde_json` reads the
-# embedded schema and the TOML→JSON projection of every corpus manifest,
-# `jsonschema` compiles the schema and validates that corpus against it.
+# The schema renderer and corpus suite (`src/schema.rs`). `serde`/`serde_json`
+# write the generated `schema/luabox.schema.json` — with object keys in the
+# order a reader wants them, which is why the renderer serializes its own
+# ordered tree rather than a `serde_json::Value` — and read the TOML→JSON
+# projection of every corpus manifest; `jsonschema` compiles the schema and
+# validates that corpus against it. All test-only: the binary prints the
+# generated file with `include_str!` and never renders at runtime.
+serde.workspace = true
 serde_json.workspace = true
 jsonschema.workspace = true
 

@@ -215,10 +215,13 @@ LLM handed that one file can write a correct `luabox.toml` without guessing.
 The schema describes the manifest's *data model* — you write TOML, tooling
 maps it to JSON with the standard mapping and validates that.
 
-It cannot go stale: a parity test suite pins the schema's key sets, enums and
-required fields to the parser's own, and runs every example manifest plus a
-curated valid/invalid corpus through both the schema and `luabox` itself,
-demanding the same verdict from each.
+It cannot go stale: the schema is *generated* from the same declarative key
+table `luabox` validates manifests against, so its key sets, enums and
+required fields are the parser's own rather than a copy of them. What that
+table cannot express — above all the mutually exclusive dependency source
+forms — is held in place by running every example manifest plus a curated
+valid/invalid corpus through both the schema and `luabox` itself, demanding
+the same verdict from each.
 
 ### Shipping a bundle: crash-to-source with `unmap`
 

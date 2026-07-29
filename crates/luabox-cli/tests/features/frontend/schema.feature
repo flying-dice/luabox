@@ -1,11 +1,11 @@
 Feature: The published manifest schema — luabox schema
-  The manifest contract is written twice: once as the hand-rolled parser in
-  `luabox-manifest`, once as a JSON Schema (draft 2020-12) so editors,
-  validators and LLM coding assistants can read it (SPEC.md §5). `luabox
-  schema` prints that document — no project, no flags, no filesystem, so
-  `luabox schema > luabox.schema.json` works anywhere. The two copies are
-  pinned to each other by the parity suite in `luabox-manifest`; what these
-  scenarios own is that the CLI actually hands the document over intact.
+  The manifest contract is declared once, in `luabox-manifest`, and rendered
+  two ways: as the hand-rolled parser's key allow-lists, and as a JSON Schema
+  (draft 2020-12) so editors, validators and LLM coding assistants can read it
+  (SPEC.md §5). `luabox schema` prints that document — no project, no flags,
+  no filesystem, so `luabox schema > luabox.schema.json` works anywhere.
+  Whether the document says the right thing is `luabox-manifest`'s problem;
+  what these scenarios own is that the CLI hands it over intact.
 
   Scenario: the schema is machine-readable on stdout
     Given an empty directory

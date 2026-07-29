@@ -1197,6 +1197,7 @@ name = "luabox-manifest"
 version = "0.2.0"
 dependencies = [
  "jsonschema",
+ "serde",
  "serde_json",
  "tempfile",
  "toml_edit",

@@ -14,24 +14,13 @@ use std::ops::Range;
 
 use toml_edit::{ImDocument, Item, Table, TableLike};
 
+use crate::contract::{self, KeySpec};
 use crate::error::ManifestError;
 use crate::model::{
     Build, BundleMode, DEFAULT_ENTRY, DEFAULT_OUT, Dependency, DialectId, GitDependency, Lint,
     LintLevel, LintTier, Manifest, Package, PathDependency, Types, UrlDependency,
 };
 
-// The key allow-lists below are `pub(crate)` for one reason: they are the
-// anchors the JSON Schema parity suite ([`crate::schema`]) compares the
-// published schema's `properties` objects against, so the two descriptions of
-// the manifest contract cannot drift apart.
-pub(crate) const TOP_LEVEL_KEYS: &[&str] = &[
-    "package",
-    "build",
-    "types",
-    "dependencies",
-    "dev-dependencies",
-    "lint",
-];
 /// Top-level tables 0.1.4 accepted and 0.2.0 dropped (#18): they only ever
 /// served the removed `run` command and the parked solver. A manifest written
 /// against the old release carries them across the upgrade untouched, so
@@ -39,33 +28,10 @@ pub(crate) const TOP_LEVEL_KEYS: &[&str] = &[
 /// nudge alone would leave the reader hunting for a typo that isn't there.
 const REMOVED_TOP_LEVEL_TABLES: &[&str] = &["tasks", "workspace"];
 const REMOVED_TABLE_NOTE: &str = "removed in 0.2.0, see CHANGELOG.md";
-pub(crate) const PACKAGE_KEYS: &[&str] = &[
-    "name",
-    "version",
-    "edition",
-    "description",
-    "license",
-    "lua-versions",
-    "min-luabox-version",
-];
-pub(crate) const BUILD_KEYS: &[&str] = &[
-    "target",
-    "out",
-    "mode",
-    "entry",
-    "outfile",
-    "bundle",
-    "sourcemap",
-    "minify",
-];
-pub(crate) const TYPES_KEYS: &[&str] = &["strict", "defs"];
 /// The [`DialectId`] a `Package` carries while its `edition` is missing or
 /// invalid. Never observable: `Manifest::parse` has pushed an error by the
 /// time it is used, so it returns `Err` and the `Package` is dropped.
 const EDITION_PLACEHOLDER: DialectId = DialectId::Lua54;
-pub(crate) const DEPENDENCY_KEYS: &[&str] = &[
-    "git", "rev", "tag", "branch", "path", "url", "sha256", "version",
-];
 
 impl Manifest {
     /// Parse and validate a `luabox.toml` document.
@@ -122,18 +88,24 @@ fn item_span(table: &dyn TableLike, key: &str) -> Option<Range<usize>> {
     table.get(key).and_then(Item::span)
 }
 
+/// Reject every key of `table` that [`crate::contract`] does not declare.
+///
+/// The allow-list — and the `(valid: …)` set the error prints — is the
+/// contract's key order, so a key exists for the parser exactly when it
+/// exists for the published schema.
 fn check_unknown_keys(
     table: &dyn TableLike,
     what: &str,
-    valid: &[&str],
+    keys: &[KeySpec],
     errors: &mut Vec<ManifestError>,
 ) {
+    let valid = contract::names(keys);
     for (key, _) in table.iter() {
         if !valid.contains(&key) {
             errors.push(ManifestError::unknown_key(
                 what,
                 key,
-                valid,
+                &valid,
                 key_span(table, key),
             ));
         }
@@ -143,12 +115,12 @@ fn check_unknown_keys(
 /// [`check_unknown_keys`] for the root table, plus the removal nudge for the
 /// two tables 0.2.0 dropped ([`REMOVED_TOP_LEVEL_TABLES`]).
 fn check_top_level_keys(root: &Table, errors: &mut Vec<ManifestError>) {
+    let valid = contract::names(contract::ROOT);
     for (key, _) in root {
-        if TOP_LEVEL_KEYS.contains(&key) {
+        if valid.contains(&key) {
             continue;
         }
-        let error =
-            ManifestError::unknown_key("top-level table", key, TOP_LEVEL_KEYS, key_span(root, key));
+        let error = ManifestError::unknown_key("top-level table", key, &valid, key_span(root, key));
         errors.push(if REMOVED_TOP_LEVEL_TABLES.contains(&key) {
             error.with_note(REMOVED_TABLE_NOTE)
         } else {
@@ -402,7 +374,7 @@ fn parse_package(root: &Table, errors: &mut Vec<ManifestError>) -> Package {
             min_luabox_version: None,
         };
     };
-    check_unknown_keys(table, "[package] key", PACKAGE_KEYS, errors);
+    check_unknown_keys(table, "[package] key", contract::PACKAGE.keys, errors);
 
     // `name` and `version` are optional in `luabox.toml`: the project's
     // rockspec is the package manifest luarocks reads and supplies them
@@ -469,7 +441,7 @@ fn parse_build(
     let Some(table) = get_table(root, "build", errors) else {
         return Build::defaults(edition_fallback);
     };
-    check_unknown_keys(table, "[build] key", BUILD_KEYS, errors);
+    check_unknown_keys(table, "[build] key", contract::BUILD.keys, errors);
 
     let target = get_string(table, "build", "target", false, errors)
         .map_or(Some(edition_fallback), |raw| {
@@ -513,7 +485,7 @@ fn parse_types(root: &Table, errors: &mut Vec<ManifestError>) -> Types {
     let Some(table) = get_table(root, "types", errors) else {
         return Types::default();
     };
-    check_unknown_keys(table, "[types] key", TYPES_KEYS, errors);
+    check_unknown_keys(table, "[types] key", contract::TYPES.keys, errors);
 
     Types {
         strict: get_bool(table, "types", "strict", false, errors),
@@ -602,7 +574,12 @@ fn parse_dependency(
     };
 
     let ctx = format!("{section}.{name}");
-    check_unknown_keys(table, &format!("`{ctx}` key"), DEPENDENCY_KEYS, errors);
+    check_unknown_keys(
+        table,
+        &format!("`{ctx}` key"),
+        contract::DEPENDENCY.keys,
+        errors,
+    );
 
     let git = get_string(table, &ctx, "git", false, errors);
     let path = get_string(table, &ctx, "path", false, errors);
