@@ -15,7 +15,7 @@ use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
 use luabox_db::Analysis;
 use luabox_lint::{LintConfig, lint_source};
 use luabox_syntax::lua::{Dialect, validate};
-use luabox_types::{Ambient, Strictness, check_file_with_requires};
+use luabox_types::{Ambient, RockSurfaces, Strictness, check_file_with_requires};
 
 use crate::line_index::LineIndex;
 
@@ -37,6 +37,11 @@ pub struct CheckCtx<'a> {
     /// CLI's `build_ambient_checked` ambient, so a dependency's classes resolve
     /// in the editor exactly as they do under `luabox check`.
     pub ambient: &'a Ambient,
+    /// The type surfaces harvested from the project's vendored luarocks tree
+    /// (#30): rock classes/enums/aliases, plus each rock module's
+    /// `require`-export type. Merged *after* the project's own types, so a name
+    /// the project declares wins over a rock's (explicit beats implicit).
+    pub rocks: &'a RockSurfaces,
     /// The resolved `[lint]` configuration (tiers/rules/allowed globals), built
     /// from the manifest the same way `luabox lint` builds it.
     pub lint: &'a LintConfig,
@@ -93,9 +98,28 @@ pub fn diagnostics(
     // merges them. The span file name is dropped on conversion (LSP
     // diagnostics are already per-document), so the lossy path is fine.
     let rel = path.to_string_lossy();
-    let requires = analysis.require_exports(path).unwrap_or_default();
+    let mut requires = analysis.require_exports(path).unwrap_or_default();
+    // A `require` the database cannot resolve may still name a module of the
+    // vendored rock tree (#30): the db only holds project files, so rock exports
+    // are matched by module *name* here. `or_insert` keeps the db's answer where
+    // it has one, so a project file shadowing a rock module still wins — the
+    // same precedence `luabox check` gets from path-keyed resolution.
+    if !ctx.rocks.by_module().is_empty()
+        && let Some(lowered) = analysis.lower(path)
+    {
+        for edge in lowered.file().requires() {
+            if let Some(ty) = ctx.rocks.by_module().get(&edge.module) {
+                requires
+                    .entry(edge.module.clone())
+                    .or_insert_with(|| ty.clone());
+            }
+        }
+    }
     let project_types = analysis.project_types();
-    let ambient = ctx.ambient.with_project_types(&project_types);
+    let ambient = ctx
+        .ambient
+        .with_project_types(&project_types)
+        .with_rock_types(ctx.rocks.types());
     for diag in check_file_with_requires(
         parsed.parse(),
         &rel,
@@ -203,6 +227,15 @@ mod tests {
 
     /// Diagnostics for `src` checked as `dialect`.
     fn diagnostics_for(src: &str, dialect: Dialect) -> Vec<Diagnostic> {
+        diagnostics_with_rocks(src, dialect, &RockSurfaces::default())
+    }
+
+    /// [`diagnostics_for`] with harvested rock surfaces in the context (#30).
+    fn diagnostics_with_rocks(
+        src: &str,
+        dialect: Dialect,
+        rocks: &RockSurfaces,
+    ) -> Vec<Diagnostic> {
         let mut host = AnalysisHost::new(dialect, Strictness::Warn);
         let path = path_for("main.lua");
         host.apply_change(Change::SetFileText {
@@ -217,6 +250,7 @@ mod tests {
         let ctx = CheckCtx {
             strictness: Strictness::Warn,
             ambient: &ambient,
+            rocks,
             lint: &lint,
             known_globals: &known_globals,
         };
@@ -273,6 +307,69 @@ mod tests {
         );
     }
 
+    // --- harvested rock surfaces (#30) -----------------------------------
+
+    /// The surfaces of one annotated rock installed as `mylib`.
+    fn mylib_rock() -> RockSurfaces {
+        let source = luabox_types::RockModule {
+            module: "mylib".to_string(),
+            label: "lua_modules/share/lua/5.4/mylib/init.lua".to_string(),
+            path: path_for("lua_modules/share/lua/5.4/mylib/init.lua"),
+            text: "\
+---@class mylib.Point
+---@field x number
+---@field y number
+
+local M = {}
+
+---@param x number
+---@param y number
+---@return mylib.Point
+function M.point(x, y)
+  return { x = x, y = y }
+end
+
+return M
+"
+            .to_string(),
+        };
+        let ambient = build_ambient(Dialect::Lua54, &[]);
+        luabox_types::rocks::harvest(&ambient, &[source])
+    }
+
+    #[test]
+    fn a_harvested_rock_class_resolves_in_the_editor() {
+        let src = "---@type mylib.Point\nlocal p = { x = 1, y = 2 }\nreturn p\n";
+        // Without the tree the class is an unknown type name…
+        assert!(
+            codes(&diagnostics_for(src, Dialect::Lua54)).contains(&"LB0305"),
+            "expected LB0305 without a rock tree"
+        );
+        // …and with it, it resolves and the literal conforms.
+        let with_rock = diagnostics_with_rocks(src, Dialect::Lua54, &mylib_rock());
+        assert!(codes(&with_rock).is_empty(), "{with_rock:?}");
+    }
+
+    #[test]
+    fn a_rock_module_export_types_a_require_the_database_cannot_resolve() {
+        // `mylib` is not a project file, so the db resolves nothing; the rock's
+        // export type is matched by module name instead, and its `---@return`
+        // flows into the consumer's use site.
+        let src = "\
+---@param s string
+local function want(s) end
+local mylib = require(\"mylib\")
+want(mylib.point(1, 2))
+";
+        let diags = diagnostics_with_rocks(src, Dialect::Lua54, &mylib_rock());
+        assert!(
+            codes(&diags).contains(&"LB0300"),
+            "the rock's return type must reach the consumer: {diags:?}"
+        );
+        // The same source without the tree cannot know what `mylib` is.
+        assert!(!codes(&diagnostics_for(src, Dialect::Lua54)).contains(&"LB0300"));
+    }
+
     #[test]
     fn a_file_the_analysis_does_not_know_has_no_diagnostics() {
         let host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
@@ -280,9 +377,11 @@ mod tests {
         let ambient = build_ambient(Dialect::Lua54, &[]);
         let lint = LintConfig::new();
         let known_globals = ambient.global_names().clone();
+        let rocks = RockSurfaces::default();
         let ctx = CheckCtx {
             strictness: Strictness::Warn,
             ambient: &ambient,
+            rocks: &rocks,
             lint: &lint,
             known_globals: &known_globals,
         };
