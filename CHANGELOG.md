@@ -85,6 +85,15 @@ so it appears in no version entry.
 
 ### Fixed
 
+- **A misspelled `[lint]` key is no longer silently inert** — `unused-locl =
+  "allow"` did nothing and said nothing, because rule ids live in
+  `luabox-lint` and the dependency-free manifest parser cannot check them.
+  The check now runs where the config is consumed: `luabox lint` reports
+  `LB1004` (a warning — the exit code is unchanged) naming the key, and
+  `luabox lsp` logs it via `window/logMessage`. The did-you-mean nudge spans
+  rule ids *and* tier names, so a mistyped tier — which reaches the config as
+  a rule-id override, indistinguishable from one — says ``did you mean
+  `pedantic`?``.
 - **Invalid `--format` and `--mode` values are now rejected by the CLI
   parser itself** — exit 2 with clap's `[possible values: …]` listing,
   matching every other malformed invocation, instead of exit 1 from deep

@@ -13,8 +13,13 @@
 //!   [`LineIndex`](crate::line_index::LineIndex).
 //! - **Diagnostics**: pushed via `textDocument/publishDiagnostics` after
 //!   every open/change/close, computed from a fresh [`Analysis`] snapshot.
+//!   Problems with the *project configuration* rather than a document —
+//!   currently a `[lint]` key naming no known rule id — have no URI to hang a
+//!   diagnostic on and go to the client's log pane via `window/logMessage`
+//!   (see [`Server::log_lint_config_problems`]).
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -22,7 +27,7 @@ use anyhow::Context;
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use lsp_types::notification::{
     DidChangeConfiguration, DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument,
-    DidOpenTextDocument, Notification as _, Progress, PublishDiagnostics,
+    DidOpenTextDocument, LogMessage, Notification as _, Progress, PublishDiagnostics,
 };
 use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
@@ -41,20 +46,21 @@ use lsp_types::{
     DidOpenTextDocumentParams, DocumentHighlight, DocumentSymbolResponse, FileChangeType,
     FileSystemWatcher, FoldingRange, FoldingRangeProviderCapability, GlobPattern,
     GotoDefinitionResponse, Hover, HoverProviderCapability, ImplementationProviderCapability,
-    InitializeParams, InitializeResult, InlayHint, Location, OneOf, PrepareRenameResponse,
-    ProgressParams, ProgressParamsValue, ProgressToken, PublishDiagnosticsParams, Registration,
-    RegistrationParams, RenameOptions, SelectionRange, SelectionRangeProviderCapability,
-    SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelp,
-    SignatureHelpOptions, SymbolInformation, TextDocumentContentChangeEvent,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, TypeDefinitionProviderCapability,
-    Uri, WorkDoneProgress, WorkDoneProgressBegin, WorkDoneProgressCreateParams,
-    WorkDoneProgressEnd, WorkDoneProgressReport, WorkspaceEdit, WorkspaceSymbolResponse,
+    InitializeParams, InitializeResult, InlayHint, Location, LogMessageParams, MessageType, OneOf,
+    PrepareRenameResponse, ProgressParams, ProgressParamsValue, ProgressToken,
+    PublishDiagnosticsParams, Registration, RegistrationParams, RenameOptions, SelectionRange,
+    SelectionRangeProviderCapability, SemanticTokens, SemanticTokensFullOptions,
+    SemanticTokensOptions, SemanticTokensResult, SemanticTokensServerCapabilities,
+    ServerCapabilities, ServerInfo, SignatureHelp, SignatureHelpOptions, SymbolInformation,
+    TextDocumentContentChangeEvent, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit,
+    TypeDefinitionProviderCapability, Uri, WorkDoneProgress, WorkDoneProgressBegin,
+    WorkDoneProgressCreateParams, WorkDoneProgressEnd, WorkDoneProgressReport, WorkspaceEdit,
+    WorkspaceSymbolResponse,
 };
 use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
-use luabox_lint::{LintConfig, lint_source};
+use luabox_lint::{LintConfig, UnknownRuleId, lint_source};
 use luabox_manifest::layout::{self, DefFiles};
-use luabox_manifest::model::{DialectId, Lint, Manifest};
+use luabox_manifest::model::{DialectId, Manifest};
 use luabox_types::{Ambient, build_ambient};
 
 use crate::line_index::LineIndex;
@@ -215,6 +221,10 @@ struct ProjectConfig {
     /// built from `manifest.lint` the same way `luabox lint` builds it, so the
     /// editor honours the project's lint config exactly as the CLI does.
     lint: LintConfig,
+    /// `[lint]` keys naming no known rule id, handed back by the same
+    /// translation (CC-M8). Reported to the client as `window/logMessage`
+    /// warnings — see [`Server::log_lint_config_problems`].
+    unknown_lint_rules: Vec<UnknownRuleId>,
 }
 
 impl ProjectConfig {
@@ -225,6 +235,7 @@ impl ProjectConfig {
             out_dir: None,
             def_sources: Vec::new(),
             lint: LintConfig::new(),
+            unknown_lint_rules: Vec::new(),
         };
         let Ok(text) = fs::read_to_string(root.join("luabox.toml")) else {
             return defaults;
@@ -233,6 +244,10 @@ impl ProjectConfig {
             eprintln!("luabox-lsp: invalid luabox.toml; using defaults (5.4, warn)");
             return defaults;
         };
+        // One `[lint]` translation for the whole workspace (`luabox-lint`'s),
+        // shared with `luabox lint` — including the unknown-rule-id check the
+        // manifest parser cannot do (CC-M8).
+        let (lint, unknown_lint_rules) = LintConfig::from_manifest(&manifest.lint);
         Self {
             // `Manifest::parse` types `[package] edition` as a closed
             // `DialectId`, so this maps inward exhaustively — there is no
@@ -241,7 +256,8 @@ impl ProjectConfig {
             strictness: Strictness::from_manifest_flag(manifest.types.strict),
             out_dir: Some(root.join(&manifest.build.out)),
             def_sources: ambient_def_sources(root, &manifest),
-            lint: build_lint_config(&manifest.lint),
+            lint,
+            unknown_lint_rules,
         }
     }
 }
@@ -260,26 +276,6 @@ fn syntax_dialect(id: DialectId) -> Dialect {
         DialectId::Lua54 => Dialect::Lua54,
         DialectId::LuaJit => Dialect::LuaJit,
     }
-}
-
-/// Translate the manifest `[lint]` table into a [`LintConfig`] — the id-level
-/// then tier-level overrides plus the `global-write` allow-list. Mirrors
-/// `luabox-cli::lint_cmd::build_config`; the LSP crate cannot depend on
-/// `luabox-cli`, so this is duplicated the same way `ambient_def_sources` is.
-/// The level/tier *translation* is no longer duplicated with it: that is
-/// `luabox-lint`'s single `From` mapping (CC-M8).
-fn build_lint_config(lint: &Lint) -> LintConfig {
-    let mut config = LintConfig::new();
-    for name in &lint.globals {
-        config.allow_global(name.clone());
-    }
-    for (tier, level) in &lint.tiers {
-        config.set_tier((*tier).into(), (*level).into());
-    }
-    for (rule, level) in &lint.rules {
-        config.set_rule(rule, (*level).into());
-    }
-    config
 }
 
 /// Resolve the ambient definition-package sources for a project, winner-first
@@ -339,7 +335,7 @@ impl Server {
         // strings resolve exactly as `luabox check` resolves them on disk (the
         // bundler's SPEC.md §7 path-mapping) — editor and CI in lockstep.
         host.set_root(root.clone());
-        Self {
+        let server = Self {
             connection,
             host,
             root,
@@ -350,7 +346,46 @@ impl Server {
             lint: config.lint,
             known_globals,
             open_docs: HashMap::new(),
+        };
+        // Safe to send: `run` only builds the server after `initialize_finish`.
+        server.log_lint_config_problems(&config.unknown_lint_rules);
+        server
+    }
+
+    /// Tell the client about `[lint]` keys that name no known rule id, as
+    /// `window/logMessage` warnings — one per key, wording (and the "did you
+    /// mean" nudge) shared with `luabox lint`'s `LB1004`.
+    ///
+    /// Not `publishDiagnostics`: that is per-document and keyed by URI, and
+    /// this is a manifest problem, not a `.lua` one — the editor would have to
+    /// be told to open `luabox.toml` as a diagnostic target it otherwise never
+    /// analyses. It is not `window/showMessage` either: a popup per unknown
+    /// key on every config reload is noise. `logMessage` is where the other
+    /// manifest complaint in this file goes (an unparseable `luabox.toml`,
+    /// which still only reaches stderr) and is what the log pane is for.
+    fn log_lint_config_problems(&self, unknown: &[UnknownRuleId]) {
+        for entry in unknown {
+            let mut message = format!("luabox.toml: {}", entry.message());
+            for note in entry.notes() {
+                let _ = write!(message, " — {note}");
+            }
+            self.log_message(MessageType::WARNING, message);
         }
+    }
+
+    /// Send one `window/logMessage` notification.
+    fn log_message(&self, typ: MessageType, message: String) {
+        let params = LogMessageParams { typ, message };
+        let Ok(value) = serde_json::to_value(params) else {
+            return;
+        };
+        let _ = self
+            .connection
+            .sender
+            .send(Message::Notification(Notification::new(
+                LogMessage::METHOD.to_owned(),
+                value,
+            )));
     }
 
     /// Re-read `luabox.toml` and rebuild every cached setting derived from it —
@@ -366,6 +401,8 @@ impl Server {
         self.known_globals = ambient.global_names().clone();
         self.ambient = ambient;
         self.lint = config.lint;
+        // Re-report: the reload may have introduced (or fixed) a typo'd key.
+        self.log_lint_config_problems(&config.unknown_lint_rules);
         self.strictness = config.strictness;
         self.out_dir = config.out_dir;
         self.host
@@ -1270,9 +1307,7 @@ mod tests {
     use luabox_manifest::model::{Lint, LintLevel, LintTier, Manifest};
     use tempfile::TempDir;
 
-    use super::{
-        ProjectConfig, ambient_def_sources, apply_content_changes, build_lint_config, root_path,
-    };
+    use super::{ProjectConfig, ambient_def_sources, apply_content_changes, root_path};
 
     /// A ranged change replacing `[start, end)` with `text`.
     fn edit(start: (u32, u32), end: (u32, u32), text: &str) -> TextDocumentContentChangeEvent {
@@ -1479,7 +1514,8 @@ mod tests {
             "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n\n[lint]\nglobals = [\"MY_GLOBAL\"]\nstyle = \"deny\"\nunused-local = \"allow\"\n",
         )
         .expect("manifest");
-        let config = build_lint_config(&manifest.lint);
+        let (config, unknown) = LintConfig::from_manifest(&manifest.lint);
+        assert!(unknown.is_empty(), "{unknown:?}");
         assert!(config.is_allowed_global("MY_GLOBAL"));
         assert!(!config.is_allowed_global("other"));
         // A tier key lands in `tiers`, anything else in `rules`.
@@ -1498,8 +1534,48 @@ mod tests {
     }
 
     #[test]
+    fn a_typod_lint_key_reaches_the_server_as_an_unknown_rule_id() {
+        // The editor honours `[lint]` through the same translation as the CLI,
+        // so it sees the same unknown ids — and surfaces them on
+        // `window/logMessage` (CC-M8). `pedantics` covers the tier-typo case:
+        // it lands in `rules`, and the nudge points back at the tier.
+        let dir = TempDir::new().expect("tempdir");
+        fs::write(
+            dir.path().join("luabox.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n\n[lint]\nunused-locl = \"allow\"\npedantics = \"warn\"\n",
+        )
+        .expect("write");
+
+        let config = ProjectConfig::discover(dir.path());
+        let reported: Vec<(&str, Option<&str>)> = config
+            .unknown_lint_rules
+            .iter()
+            .map(|u| (u.id(), u.suggestion()))
+            .collect();
+        assert_eq!(
+            reported,
+            [
+                ("pedantics", Some("pedantic")),
+                ("unused-locl", Some("unused-local")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_project_without_a_manifest_reports_no_lint_config_problems() {
+        let dir = TempDir::new().expect("tempdir");
+        assert!(
+            ProjectConfig::discover(dir.path())
+                .unknown_lint_rules
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn an_empty_lint_table_leaves_the_config_untouched() {
-        let config = build_lint_config(&Lint::default());
+        let (config, unknown) = LintConfig::from_manifest(&Lint::default());
+        assert!(config.unknown_rule_ids().is_empty());
+        assert!(unknown.is_empty());
         assert!(!config.is_allowed_global("anything"));
     }
 

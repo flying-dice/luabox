@@ -221,6 +221,10 @@ struct LspWorld {
     init: Value,
     /// The latest `publishDiagnostics` payload per URI.
     diagnostics: HashMap<String, Vec<Value>>,
+    /// Every `window/logMessage` the server has sent, in order — the channel
+    /// project-configuration problems (which belong to no document, so they
+    /// cannot be published as diagnostics) come out on.
+    log_messages: Vec<Value>,
     /// The last request's `result` and `error`.
     reply: Value,
     error: Option<Value>,
@@ -250,6 +254,7 @@ impl LspWorld {
             server: None,
             init: Value::Null,
             diagnostics: HashMap::new(),
+            log_messages: Vec::new(),
             reply: Value::Null,
             error: None,
             item: None,
@@ -312,14 +317,18 @@ impl LspWorld {
                 panic!("the language server sent nothing within the timeout: {e}")
             })
         };
-        if message.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
-            && let Some(uri) = message["params"]["uri"].as_str()
-        {
-            let diagnostics = message["params"]["diagnostics"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            self.diagnostics.insert(uri.to_string(), diagnostics);
+        match message.get("method").and_then(Value::as_str) {
+            Some("textDocument/publishDiagnostics") => {
+                if let Some(uri) = message["params"]["uri"].as_str() {
+                    let diagnostics = message["params"]["diagnostics"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    self.diagnostics.insert(uri.to_string(), diagnostics);
+                }
+            }
+            Some("window/logMessage") => self.log_messages.push(message["params"].clone()),
+            _ => {}
         }
         message
     }
@@ -795,6 +804,37 @@ fn diagnostics_are_empty(world: &mut LspWorld, path: String) {
     assert!(
         diagnostics.is_empty(),
         "expected no diagnostics for `{path}`: {diagnostics:?}"
+    );
+}
+
+/// `window/logMessage` assertions: a project-configuration problem belongs to
+/// no document, so it has no URI to hang a diagnostic on and surfaces in the
+/// client's log pane instead (a `[lint]` key naming no known rule id, say).
+#[then(expr = "the server logged a warning containing {string}")]
+fn server_logged_warning(world: &mut LspWorld, needle: String) {
+    // `MessageType::WARNING` is 2 in the protocol's enum.
+    let logged: Vec<&str> = world
+        .log_messages
+        .iter()
+        .filter(|m| m["type"].as_i64() == Some(2))
+        .filter_map(|m| m["message"].as_str())
+        .collect();
+    assert!(
+        logged.iter().any(|m| m.contains(&needle)),
+        "no logged warning contains `{needle}`; logged: {logged:?}"
+    );
+}
+
+#[then(expr = "the server logged nothing containing {string}")]
+fn server_logged_nothing(world: &mut LspWorld, needle: String) {
+    let logged: Vec<&str> = world
+        .log_messages
+        .iter()
+        .filter_map(|m| m["message"].as_str())
+        .collect();
+    assert!(
+        !logged.iter().any(|m| m.contains(&needle)),
+        "a logged message unexpectedly contains `{needle}`; logged: {logged:?}"
     );
 }
 

@@ -20,7 +20,10 @@
 //!
 //! Suppression is `---@luabox-ignore rule-id reason` (reason mandatory —
 //! a bare tag is itself `LB0500`). Config is `[lint]` in the manifest,
-//! translated into a [`config::LintConfig`] by the Frontend.
+//! translated into a [`config::LintConfig`] by
+//! [`LintConfig::from_manifest`], which also hands back the `[lint]` keys
+//! that name no known rule ([`UnknownRuleId`]) for the Frontend to report —
+//! the manifest parser cannot validate ids it is not allowed to know.
 
 mod config;
 mod context;
@@ -28,17 +31,18 @@ mod diagnostic;
 mod facts;
 mod rule;
 mod rules;
+mod suggest;
 mod suppress;
 
 #[cfg(test)]
 mod tests;
 
-pub use config::{Level, LintConfig, LintLevel, LintTier, tier_default};
+pub use config::{Level, LintConfig, LintLevel, LintTier, UnknownRuleId, tier_default};
 pub use context::LintContext;
 pub use diagnostic::{Fix, LintDiagnostic};
 pub use facts::TypeFacts;
 pub use rule::{Rule, Tier};
-pub use rules::rules;
+pub use rules::{rule_ids, rules};
 
 use std::collections::HashSet;
 use std::ops::Range;
