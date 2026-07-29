@@ -246,3 +246,82 @@ Feature: luabox lsp — published diagnostics
     When I open "main.lua"
     Then the diagnostics for "main.lua" do not include LB0306
     And the diagnostics for "main.lua" include LB0308
+
+  # --- types from a bare luarocks tree (#30, decisions/09) ---------------
+  # The server harvests the installed rock sources' LuaCATS surfaces at
+  # startup, so a rock's classes and module return types resolve in the
+  # editor exactly as they do under `luabox check` — with no manifest
+  # declaration at all. Vendored bodies are still never checked.
+
+  Scenario: a rock class from a bare lua_modules tree resolves in the editor
+    Given a strict project with edition "5.4"
+    And a file "lua_modules/share/lua/5.4/mylib/init.lua" containing:
+      """
+      ---@class mylib.Point
+      ---@field x number
+      ---@field y number
+
+      local M = {}
+
+      ---@param x number
+      ---@param y number
+      ---@return mylib.Point
+      function M.point(x, y)
+        return { x = x, y = y }
+      end
+
+      return M
+      """
+    And a file "main.lua" containing:
+      """
+      ---@type mylib.Point
+      local p = { x = 1, y = 2 }
+      return p
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the diagnostics for "main.lua" are empty
+
+  Scenario: a rock module's return type reaches the editor's use site
+    Given a strict project with edition "5.4"
+    And a file "lua_modules/share/lua/5.4/mylib/init.lua" containing:
+      """
+      ---@class mylib.Point
+      ---@field x number
+      ---@field y number
+
+      local M = {}
+
+      ---@param x number
+      ---@param y number
+      ---@return mylib.Point
+      function M.point(x, y)
+        return { x = x, y = y }
+      end
+
+      return M
+      """
+    And a file "main.lua" containing:
+      """
+      local mylib = require("mylib")
+      local p = mylib.point(1, 2)
+      return p.nope
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the diagnostics for "main.lua" include LB0306
+
+  Scenario: a rock source that does not parse publishes nothing
+    Given a strict project with edition "5.4"
+    And a file "lua_modules/share/lua/5.4/broken/init.lua" containing:
+      """
+      ---@class broken.Thing
+      local = = =
+      """
+    And a file "main.lua" containing:
+      """
+      return 1
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the diagnostics for "main.lua" are empty
