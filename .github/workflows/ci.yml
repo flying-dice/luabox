@@ -30,6 +30,14 @@ jobs:
       # hard errors, otherwise a pedantic finding passes CI silently.
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # tools/differ is deliberately workspace-EXCLUDED (it links real
+      # interpreters' behavior, not the product), so nothing above compiles
+      # it — a workspace API change can silently rot it until the
+      # differential workflow runs on a PR to main (exactly what happened on
+      # #45 with the typed-Code u16 seam). Keep it compiling everywhere;
+      # Linux is enough, the full harness still runs in differential.yml.
+      - run: cargo test --manifest-path tools/differ/Cargo.toml
+        if: matrix.os == 'ubuntu-latest'
 
   # Dual line-coverage gates (cargo-llvm-cov), measured as two ISOLATED
   # suites so each style of testing independently guarantees behaviour:
