@@ -108,6 +108,12 @@ credential of its own.
    assets, and should be marked latest. If the run went red *before* the
    publish job, the release is still sitting there as a draft — fix the
    cause and either delete the draft and re-tag, or re-run the workflow.
+   Re-running is supported: `create-release` reuses an existing **draft**
+   for the tag (refreshing its title and notes) instead of failing on a
+   duplicate, and asset uploads use `--clobber`. It deliberately refuses to
+   run over an already-**published** release — at that point the artifacts
+   are public, so replacing them needs a new tag or a deliberate yank, not a
+   re-run.
 
 ## Editor extensions
 

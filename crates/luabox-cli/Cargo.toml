@@ -38,7 +38,8 @@ self-replace.workspace = true
 [dev-dependencies]
 cucumber.workspace = true
 tokio.workspace = true
-tempfile.workspace = true
+# `tempfile` is a real [dependencies] entry above (upgrade_cmd.rs), which
+# tests can use directly — no redundant dev-dependency needed.
 # Tests only: they re-parse the JSON artifacts the commands hand-write
 # (`luabox doc`'s search index, `--format json` output).
 serde_json.workspace = true

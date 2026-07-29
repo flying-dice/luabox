@@ -1177,7 +1177,6 @@ name = "luabox-lsp"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "crossbeam-channel",
  "lsp-server",
  "lsp-types",
  "luabox-bundle",
@@ -1189,7 +1188,6 @@ dependencies = [
  "luabox-syntax",
  "luabox-types",
  "rowan",
- "serde",
  "serde_json",
  "tempfile",
 ]
@@ -1219,7 +1217,6 @@ dependencies = [
  "luabox-diag",
  "luabox-hir",
  "luabox-syntax",
- "tempfile",
 ]
 
 [[package]]

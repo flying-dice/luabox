@@ -32,7 +32,6 @@ sha2 = "0.10"
 # LSP (rust-analyzer's stack: lsp-server over stdio, not tower-lsp — SPEC §16.1)
 lsp-server = "0.7"
 lsp-types = "0.97"
-crossbeam-channel = "0.5"
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1"
 rayon = "1"
