@@ -182,6 +182,15 @@ so it appears in no version entry.
 
 ### Internal (contributors)
 
+- **`luabox check` reads and parses each file once per run.** The cross-file
+  surface pre-pass and the per-file check were two independent parallel walks
+  of the source set, so every file was read twice, parsed twice, harvested
+  twice and lowered three times. They now share one set of per-file records.
+  `luabox-types` grew `FileArtifacts` (a file's harvest + lowering) and the
+  `module_surface_with_artifacts` / `check_file_with_artifacts` entry points
+  that take one; `module_surface`, `check_file_with_requires` and
+  `module_requires` are unchanged wrappers, so the LSP and any other consumer
+  need not care. No diagnostic, ordering or summary changes.
 - **`luabox-resolve` is now `luabox-manifest`.** The crate lost its resolving
   half in this release (see *Removed*) and the name outlived it. It also
   absorbs project *layout* — root discovery, the first-party source walk and
