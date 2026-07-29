@@ -19,14 +19,18 @@
 //!   gate again, then lowering 5.4 -> 5.1, the bundler, the minifier and the
 //!   source-map writer.
 //!
-//! The real binary rather than an in-process thread on purpose: it is the
-//! *main* thread's stack that a user's `luabox check` actually runs on, and
-//! that differs per platform in exactly the way this needs to cover — 8 MiB on
-//! Linux and macOS, **1 MiB** on Windows. This test is an ordinary workspace
-//! test with no platform gate, so `ci.yml`'s `check` matrix runs it on
-//! ubuntu-latest, macos-latest *and* windows-latest via `cargo test
-//! --workspace`. That is what closes the Windows half of the gap: it is CI, not
-//! a local run, that proves it.
+//! The real binary rather than an in-process thread on purpose: a user's
+//! `luabox check` runs on the binary's own threads — the dispatcher thread
+//! `main` spawns AND the rayon workers the per-file `par_iter` spreads real
+//! work across — and both are pinned to an explicit stack in `main.rs`
+//! precisely because the platform defaults differ (8 MiB main on Linux/macOS,
+//! **1 MiB** under MSVC, 2 MiB for unconfigured workers). Each project here
+//! carries [`DEEP_FILES`] deep files so the workers genuinely participate;
+//! see that constant for why one file would silently test only the
+//! dispatcher. This is an ordinary workspace test with no platform gate, so
+//! `ci.yml`'s `check` matrix runs it on ubuntu-latest, macos-latest *and*
+//! windows-latest via `cargo test --workspace`. That is what closes the
+//! Windows half of the gap: it is CI, not a local run, that proves it.
 //!
 //! ## Why 195 and not 220
 //!
@@ -76,7 +80,20 @@ fn deep_module(construct: &str) -> String {
     }
 }
 
-/// A one-file project whose `src/main.lua` is `deep_module(construct)`.
+/// How many deep files each project carries.
+///
+/// MORE THAN ONE IS LOAD-BEARING. `check` runs its per-file pipeline inside
+/// `par_iter`, and with a single file rayon never leaves the calling thread —
+/// which `main` pins at 16 MiB — so a one-file fixture can never observe a
+/// WORKER overflowing (workers only got their pinned stack when `real_main`
+/// gained `ThreadPoolBuilder::stack_size`; before that they sat on the 2 MiB
+/// default and this test passed anyway). Enough files to out-number every
+/// runner's cores forces genuine work-stealing, so the deep recursion
+/// provably runs on workers too.
+const DEEP_FILES: usize = 32;
+
+/// A project whose `src/main.lua` **and** 31 sibling modules are each
+/// `deep_module(construct)` — see [`DEEP_FILES`] for why the siblings exist.
 fn deep_project(construct: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
@@ -86,11 +103,15 @@ fn deep_project(construct: &str) -> tempfile::TempDir {
     )
     .expect("write luabox.toml");
     std::fs::create_dir(dir.path().join("src")).expect("mkdir src");
-    std::fs::write(
-        dir.path().join("src").join("main.lua"),
-        deep_module(construct),
-    )
-    .expect("write main.lua");
+    let module = deep_module(construct);
+    std::fs::write(dir.path().join("src").join("main.lua"), &module).expect("write main.lua");
+    for n in 1..DEEP_FILES {
+        std::fs::write(
+            dir.path().join("src").join(format!("deep_{n:02}.lua")),
+            &module,
+        )
+        .expect("write sibling module");
+    }
     dir
 }
 

@@ -232,19 +232,23 @@ enum Command {
 /// arrive as pages of `<unknown>` telling the user nothing about their
 /// manifest or sources. Rendering the chain here keeps the diagnostic and
 /// drops the noise.
+/// The stack budget every thread that recurses over syntax trees gets — the
+/// dispatcher thread `main` spawns AND rayon's workers alike. Recursion depth
+/// is bounded by the parser (`MAX_DEPTH`), so the budget is a constant of the
+/// design, not of whichever platform or dependency default happens to apply:
+/// the platform main thread is 8 MiB on Linux/macOS but 1 MiB under MSVC
+/// (which a 195-deep source overflowed: STATUS_STACK_OVERFLOW), and an
+/// unconfigured rayon pool hands workers Rust's 2 MiB default — an inherited
+/// margin, not a chosen one.
+const PINNED_STACK_BYTES: usize = 16 * 1024 * 1024;
+
 fn main() -> ExitCode {
     // Every command runs on a dedicated thread with an EXPLICIT stack size,
-    // rustc-style, because the main thread's stack is whatever the platform
-    // linker chose: 8 MiB on Linux/macOS but only 1 MiB under MSVC. The
-    // parser bounds its recursion (MAX_DEPTH) and proves at test time that
-    // the whole pipeline fits a 2 MiB thread — a guarantee the Windows MAIN
-    // thread silently broke (a 195-deep source, which reference Lua accepts,
-    // overflowed it: STATUS_STACK_OVERFLOW). Pinning the stack here makes
-    // the headroom identical on every platform instead of an OS default.
-    const MAIN_STACK_BYTES: usize = 16 * 1024 * 1024;
+    // rustc-style; together with the rayon pool pinned in `real_main`, every
+    // thread that walks a tree has the same 16 MiB regardless of platform.
     let spawned = std::thread::Builder::new()
         .name("luabox".to_owned())
-        .stack_size(MAIN_STACK_BYTES)
+        .stack_size(PINNED_STACK_BYTES)
         .spawn(real_main);
     match spawned {
         // A panic on the worker already printed via the default hook; all
@@ -257,6 +261,15 @@ fn main() -> ExitCode {
 }
 
 fn real_main() -> ExitCode {
+    // Multi-file commands recurse on rayon WORKERS (`check`'s per-file
+    // par_iter), not on the thread above — with more than one file rayon
+    // spreads the work, and an unconfigured global pool would give those
+    // workers the 2 MiB default. Pin them to the same budget. `Err` means a
+    // pool was already built for this process (possible only in-process,
+    // e.g. a test harness); whatever configured it keeps its choice.
+    let _ = rayon::ThreadPoolBuilder::new()
+        .stack_size(PINNED_STACK_BYTES)
+        .build_global();
     let cli = Cli::parse();
     match run(cli.command) {
         Ok(()) => ExitCode::SUCCESS,
