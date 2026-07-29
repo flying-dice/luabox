@@ -9,6 +9,13 @@ rust-version.workspace = true
 
 [dependencies]
 luabox-syntax.workspace = true
+# `validate` reports control-flow legality (goto/label/break) as ordinary
+# coded diagnostics, so it produces `luabox_diag::Diagnostic` directly instead
+# of a bespoke error type each of the three frontends would have to re-map.
+# Its sibling in the Semantics context, `luabox-types`, already hands back
+# diagnostics the same way, and `luabox-diag` is a leaf crate (serde only), so
+# the dep graph stays acyclic (SPEC.md §16).
+luabox-diag.workspace = true
 rowan.workspace = true
 
 [dev-dependencies]

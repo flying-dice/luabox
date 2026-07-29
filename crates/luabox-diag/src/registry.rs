@@ -58,6 +58,25 @@ static REGISTRY: &[Entry] = &[
         title: "`\\u{...}` string escape not available in this edition",
         explain: LB0016,
     },
+    // LB0020-LB0029: source legality that is *not* edition-dependent — code
+    // every reference Lua refuses to load, whatever the `edition`. Kept beside
+    // the LB001x dialect-legality block (both answer "is this source
+    // loadable?") but in its own decade so the two are told apart at a glance.
+    Entry {
+        code: Code::new(20),
+        title: "no visible label for `goto`",
+        explain: LB0020,
+    },
+    Entry {
+        code: Code::new(21),
+        title: "label already defined",
+        explain: LB0021,
+    },
+    Entry {
+        code: Code::new(22),
+        title: "`break` outside a loop",
+        explain: LB0022,
+    },
     Entry {
         code: Code::new(300),
         title: "type mismatch",
@@ -425,6 +444,134 @@ local s = \"\\xE2\\x98\\x83\"
 Raise `edition` to `5.3` or later, or spell out the encoded bytes directly.
 `luabox build` can perform this substitution automatically when lowering to
 an older target.
+";
+
+const LB0020: &str = "\
+# LB0020: no visible label for `goto`
+
+`goto name` must name a label that is **visible** from it. A `::name::` label
+is visible in the block that declares it and in every block nested inside
+that one — never in a sibling block, and never across a function boundary.
+The jump may go forwards or backwards; only visibility matters.
+
+```lua
+-- illegal: nothing declares `nowhere`
+local function f()
+  goto nowhere
+end
+
+-- illegal: the label is in a sibling block, not an enclosing one
+do ::retry:: end
+do goto retry end
+
+-- illegal: a function boundary stops the search
+::top::
+local f = function() goto top end
+
+-- legal: the label is in an enclosing block
+for i = 1, 3 do
+  if skip(i) then goto continue end
+  work(i)
+  ::continue::
+end
+```
+
+Reference Lua rejects the same programs when it *loads* the chunk
+(`no visible label 'nowhere' for <goto>`), so this is a hard error, not a
+lint: the file would never run.
+
+Fix the label's spelling (the diagnostic suggests a near match when there is
+one), move the label to a block that encloses the `goto`, or restructure the
+jump — a `goto` cannot enter a function, and no `goto` can leave one.
+
+Related: `LB0010` reports `goto`/labels under `edition = \"5.1\"`, which has no
+`goto` at all; `LB0601` reports a `goto` that is legal but cannot be lowered
+to a 5.1 target by `luabox build`.
+";
+
+const LB0021: &str = "\
+# LB0021: label already defined
+
+A `::name::` label may not repeat a label name that is already visible at
+that point. Reference Lua reports the *second* declaration
+(`label 'a' already defined`); so does luabox, with the first one pointed at
+as context.
+
+```lua
+-- illegal: two `::a::` in the same block
+local function f()
+  ::a::
+  ::a::
+end
+
+-- legal: sibling blocks close over their own labels
+do ::a:: end
+do ::a:: end
+
+-- legal: a nested function starts a fresh label scope
+local function g() ::a:: end
+local function h() ::a:: end
+```
+
+**Edition difference.** Lua 5.4 tightened the rule: it searches every block
+still open in the function, so shadowing an outer label from a nested block
+is an error there:
+
+```lua
+::a::
+do ::a:: end   -- error under edition = \"5.4\"; accepted by 5.2/5.3/LuaJIT
+```
+
+luabox applies each edition's own rule, so it never rejects what your
+`edition`'s compiler accepts. Code meant to be portable should avoid the
+shadowing form regardless.
+
+Fix: rename one of the labels, or narrow the first one's scope with a
+`do … end` block.
+";
+
+const LB0022: &str = "\
+# LB0022: `break` outside a loop
+
+`break` exits the innermost enclosing `while`, `repeat`, or numeric/generic
+`for` **in the same function**. With no such loop around it, reference Lua
+refuses to load the chunk — `break outside loop` in 5.4, `no loop to break`
+in 5.1 — so this is a hard error in every edition.
+
+```lua
+-- illegal: nothing to break out of
+local x = 1
+break
+
+-- illegal: the loop has already ended
+for i = 1, 3 do end
+break
+
+-- illegal: a function boundary hides the loop around it
+while true do
+  local f = function() break end
+end
+
+-- legal: `do`/`if` blocks do not hide the loop
+while true do
+  do if done() then break end end
+end
+```
+
+The nested-function case is the one that surprises people: a closure defined
+inside a loop is a *separate function*, and `break` has no meaning there.
+Return a flag from the closure and break in the loop body instead:
+
+```lua
+while true do
+  local stop = function() return done() end
+  if stop() then break end
+end
+```
+
+Lua has no `continue`; the idiomatic substitute is a forward `goto` to a
+label at the end of the loop body (`goto continue` … `::continue::`), which
+is legal from 5.2 onward.
 ";
 
 const LB0300: &str = "\

@@ -8,6 +8,39 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`goto`/label/`break` legality is diagnosed**
+  ([#44](https://github.com/flying-dice/luabox/issues/44)) — three programs
+  every reference Lua refuses to *load* used to pass `luabox check` and
+  `luabox lint` clean. They are now errors, in `check`, in `lint` and in the
+  editor:
+  - `LB0020` — a `goto` naming no visible label (`goto nowhere`). The label
+    name is underlined, and a near-miss visible label becomes a
+    ``did you mean `continue`?`` nudge.
+  - `LB0021` — a label already defined in scope (`::a:: ::a::`), pointing at
+    the second declaration with the first one labelled as context.
+  - `LB0022` — `break` with no enclosing loop in the same function, including
+    the case people actually hit: `break` inside a closure *defined* in a
+    loop, where the loop sits on the other side of a function boundary.
+
+  Dialect legality already covered `goto` under `edition = "5.1"`
+  (`LB0010`); the gap was label/loop *resolution* legality, which the HIR had
+  been resolving all along without judging. The rules are read off reference
+  Lua's own (`lparser.c`'s `undefgoto`/`checkrepeated`) and the verdicts were
+  built differentially against `luac5.4 -p` and `luac5.1 -p` over a
+  53-program matrix — every legal `goto` shape (forward, backward, outward,
+  the `::continue::` idiom in each loop kind), every loop kind's `break`, and
+  the same label name in sibling or nested-function scopes are left alone.
+  Duplicate-label scope follows each edition's own rule: 5.4 rejects a nested
+  label that shadows an outer one, 5.2/5.3/LuaJIT do not.
+
+  One reference rule is deliberately left out — a forward `goto` that jumps
+  into the scope of a local — because the HIR erases the void statements the
+  rule turns on. It is an under-approximation only (no legal program is
+  rejected for it) and is recorded in
+  [the limitations page](docs/03-reference/02-limitations.md).
+
 ## [0.2.0] - 2026-07-29
 
 **The v1 scope cut — every item below is a breaking change.** luabox is now

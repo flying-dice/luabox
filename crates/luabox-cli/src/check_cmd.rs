@@ -1,7 +1,7 @@
 //! `luabox check [--target <t>] [--format <f>] [--watch]` — the CI-grade
 //! standalone typecheck (SPEC.md §3, §4, §14).
 //!
-//! Per `.lua` file, three passes over one parse:
+//! Per `.lua` file, four passes over one parse:
 //!
 //! 1. **Parse errors** → `LB0001` (the parser is error-resilient; later
 //!    passes still run on the recovered tree).
@@ -9,7 +9,11 @@
 //!    `--target`, against the ship target too (that is what `--target`
 //!    means before lowering exists: "would this source be legal there?").
 //!    Duplicate findings (same code, same range) are reported once.
-//! 3. **Typecheck** (annotation-driven, against the ambient definition
+//! 3. **Control-flow legality** (#44) → `LB0020`-`LB0022`: an unresolved
+//!    `goto`, a repeated label, `break` with no enclosing loop. Edition-
+//!    independent — every reference Lua rejects these at load time. Skipped
+//!    when the parse is not clean.
+//! 4. **Typecheck** (annotation-driven, against the ambient definition
 //!    layer, with each file's cross-file `require` exports in reach — #85)
 //!    at the manifest's strictness: `[types] strict = true` → strict
 //!    (errors), otherwise warn.
@@ -296,7 +300,26 @@ fn check_one(
         }
     }
 
-    // 3. Types against the ambient definition-package layer (SPEC.md §3),
+    // 3. Control-flow legality (#44): an unresolved `goto`, a repeated label,
+    // or `break` outside a loop — code every reference Lua refuses to load,
+    // whatever the edition. Skipped on a broken parse: the block structure
+    // recovered around a missing `end` is a guess, and a legality verdict over
+    // a guess is noise on top of the syntax error already reported.
+    //
+    // This lowers the file rather than reusing the HIR inside `artifacts`:
+    // `luabox_types::FileArtifacts` keeps its lowering private. The same pass
+    // runs off the lint engine's own lowering and the LSP's memoized one, so
+    // all three frontends return the same verdict.
+    if parse.errors().is_empty() {
+        let lowered = luabox_hir::lower(parse);
+        diags.extend(luabox_hir::validate::control_flow(
+            rel,
+            &lowered,
+            project.dialect,
+        ));
+    }
+
+    // 4. Types against the ambient definition-package layer (SPEC.md §3),
     // with this file's resolved `require` exports in reach (#85).
     let requires = resolve_requires(artifacts, &project.root, project.build_target, exports);
     diags.extend(luabox_types::check_file_with_artifacts(

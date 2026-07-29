@@ -355,6 +355,22 @@ fn no_dialect_diagnostic(world: &mut AcceptanceWorld) {
     }
 }
 
+/// The control-flow legality codes (#44): unresolved `goto`, repeated label,
+/// `break` outside a loop. "No control-flow diagnostic" means none of these —
+/// a program may still be rejected for a syntax or type reason.
+const CONTROL_FLOW_CODES: &[&str] = &["LB0020", "LB0021", "LB0022"];
+
+#[then("no control-flow diagnostic is reported")]
+fn no_control_flow_diagnostic(world: &mut AcceptanceWorld) {
+    let output = format!("{}\n{}", world.stdout(), world.stderr());
+    for code in CONTROL_FLOW_CODES {
+        assert!(
+            !output.contains(code),
+            "expected no control-flow diagnostic, found `{code}`; output:\n{output}"
+        );
+    }
+}
+
 #[then(expr = "diagnostic {word} is reported naming field {string}")]
 #[then(expr = "diagnostic {word} is reported naming key {string}")]
 #[then(expr = "diagnostic {word} is reported listing {string}")]

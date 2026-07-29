@@ -118,6 +118,35 @@ Feature: luabox lsp — published diagnostics
     And diagnostic LB0501 in "main.lua" comes from "luabox-lint"
     And diagnostic LB0501 in "main.lua" spans 0:6 to 0:12
 
+  Scenario: control-flow legality is published as an error, not as a lint (#44)
+    Given a project with edition "5.4"
+    And a file "main.lua" containing:
+      """
+      local function f()
+        goto nowhere
+      end
+      return f
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the diagnostics for "main.lua" include LB0020
+    And diagnostic LB0020 in "main.lua" is an error
+    And diagnostic LB0020 in "main.lua" comes from "luabox"
+    And diagnostic LB0020 in "main.lua" spans 1:7 to 1:14
+
+  Scenario: `break` outside a loop is published in the editor too
+    Given a project with edition "5.4"
+    And a file "main.lua" containing:
+      """
+      for i = 1, 3 do end
+      break
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the diagnostics for "main.lua" include LB0022
+    And diagnostic LB0022 in "main.lua" is an error
+    And diagnostic LB0022 in "main.lua" comes from "luabox"
+
   Scenario: a luabox-ignore comment suppresses the lint finding in the editor
     Given a project with edition "5.4"
     And a file "main.lua" containing:

@@ -1,9 +1,12 @@
 //! Per-file diagnostics for publishing: parse errors, dialect legality, type
 //! diagnostics, and lint findings for `.lua` files.
 //!
-//! Mirrors `luabox check`'s three passes over one memoized parse, then runs
-//! the `luabox lint` engine (the same one the CLI drives), converting every
-//! finding to LSP ranges through the file's [`LineIndex`].
+//! Mirrors `luabox check`'s passes over one memoized parse, then runs the
+//! `luabox lint` engine (the same one the CLI drives), converting every
+//! finding to LSP ranges through the file's [`LineIndex`]. Control-flow
+//! legality (#44) rides in with the lint engine — it is the one pass that
+//! already holds the file's HIR — and is re-tagged to the toolchain source on
+//! the way out, since it is not a lint rule.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -114,7 +117,20 @@ pub fn diagnostics(
     if parsed.errors().is_empty() {
         let outcome = lint_source(&rel, index.text(), dialect, ctx.lint, ctx.known_globals);
         for diag in &outcome.diagnostics {
-            out.push(convert(&index, diag, LINT_SOURCE));
+            // `lint_source` also carries the control-flow legality errors
+            // (#44) — `LB0020`-`LB0022` from `luabox_hir::validate`, which are
+            // not lint rules: they have no tier and no `---@luabox-ignore` id,
+            // and the runtime refuses to load the file either way. They are
+            // published under the toolchain source alongside the parse,
+            // dialect and type diagnostics above; only the `LB05xx` rule
+            // findings get the lint source, which is what the code-action
+            // matcher keys its quick fixes off.
+            let source = if diag.code.number() / 100 == 5 {
+                LINT_SOURCE
+            } else {
+                TYPE_SOURCE
+            };
+            out.push(convert(&index, diag, source));
         }
     }
 
