@@ -48,6 +48,33 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ### Fixed
 
+- **`--watch` stops rerunning once your edit has settled.** After the first
+  change, `luabox check --watch` never went quiet again: it re-ran the command
+  every debounce window, forever, on a project nobody was touching (measured:
+  148 reruns over 30 s of idle after one edit). Nothing had changed — the
+  watcher was reacting to *itself*. `notify`'s inotify backend also subscribes
+  to `OPEN`, `CLOSE_NOWRITE` and `ATTRIB`, so every rerun's own **reads** of
+  your `*.lua` files and `luabox.toml` came back as filesystem events and
+  triggered the next rerun. Watch now acts only on events that describe a
+  change — creations, removals, renames, content and metadata writes, plus a
+  writer closing a file — and ignores the access events a read produces; and
+  after every rerun it drains whatever that run stirred up, so no run can feed
+  the next one whatever a platform's backend calls its events. An `mtime`-only
+  `touch` still reruns, and one edit still costs one rerun.
+- **Diagnostics on very long lines are fast to report, and readable.** A file
+  with one enormous line — minified or generated source — made reporting
+  quadratic all over again, because a label's *column* was counted by walking
+  characters from the start of its line. On a 377 kB single-line file with
+  10 000 findings, `check` took 71 s in the human format (0.5 s as JSON), and
+  the SARIF, GitHub and GitLab renderers ~2.2-2.5 s. Columns are now resolved
+  by binary search like lines, so every format lands within ~1.3x of JSON on
+  that input (human 0.5 s, SARIF 0.7 s), and the cost doubles when the finding
+  count doubles instead of quadrupling. The human renderer also **windows**
+  long source lines rustc-style, printing ~200 characters around the label with
+  `...` markers rather than the whole line plus a column-wide indent — the same
+  input used to produce 3.5 GB of output, and now produces 4.6 MB. Column
+  numbers are unaffected in every format, and a line short enough to print
+  whole is still printed whole, byte for byte.
 - **`check --format gitlab` reports the line each diagnostic is actually on.**
   The GitLab Code Quality renderer discarded the source lookup it was handed
   and wrote `location.lines.begin: 1` for every finding. GitLab places a
@@ -127,6 +154,17 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   reproduces it byte-exact and stays idempotent. A `#` anywhere below byte 0
   is still the length operator, and still an error — matching reference Lua
   exactly.
+
+  **Bundling handles it too.** A bundle splices every module's text into one
+  file, so a module's `#!` line would land in the middle of it — where `#` *is*
+  the length operator, which made `luabox build --bundle` fail its own reparse
+  with `internal bundler error` on any project whose entry or any required
+  module was an executable script (`--minify` instead dropped the line
+  silently). The prefix is now cut from every module as it is spliced, using
+  the lexer's own rule, and the **entry's** `#!` line is re-emitted at byte 0
+  of the bundle — plain and minified alike — so a bundled program stays an
+  executable program. A dependency's shebang is dropped: it only ever meant
+  "run *this* file".
 - **A UTF-8 byte-order mark is accepted where reference Lua accepts it.** Lua
   gained `skipBOM` in 5.2, and LuaJIT has it too, so a BOM'd file compiles
   there and was rejected here in every edition with `unexpected '\u{feff}'`.
@@ -134,7 +172,9 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   byte-exact by `fmt`); under 5.1, which really does reject it, the diagnostic
   now names it — "file starts with a UTF-8 byte-order mark, which Lua 5.1
   rejects — save the file without a BOM" — instead of echoing an invisible
-  codepoint.
+  codepoint. A bundle strips the mark from every module it inlines and never
+  emits one of its own: the bundle is a *new* file, and a `target = "5.1"`
+  bundle carrying a mark would not load at all.
 - **The parser accepts everything reference Lua accepts.** The nesting budget
   was 100, well under the ~197 levels of tables/parens/calls/`if`s that
   `lua5.4` compiles, and a right-associative operator chain spent one level
