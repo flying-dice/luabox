@@ -27,3 +27,11 @@ streamed. Diagnostics proven byte-identical across every example project.
 Recorded in CHANGELOG 0.2.0-unreleased notes; the wrapper APIs
 (`module_surface`, `check_file_with_requires`) kept the LSP and luabox-db
 unchanged.
+
+**Now gated (wave 12).** The accepted 123 MiB had no ceiling: `check` could
+have grown to 500 MiB on the same input with every gate still green. `check`'s
+peak RSS on this corpus is now a CI-blocking leg of `scripts/perf-gate.sh`
+(mirrored in `perf-gate.ps1`), budget 300 MiB — ~2.4× the accepted number,
+wide enough to ignore allocator noise and narrow enough to catch another whole
+regime of retention. Override with `LUABOX_RSS_BUDGET_MIB`; deliberately not
+scaled by `LUABOX_PERF_FACTOR`.

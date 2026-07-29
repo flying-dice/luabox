@@ -3,6 +3,7 @@
 //! Thin frontend over the bounded-context crates: owns UX, argument parsing,
 //! and diagnostic rendering; none of the domain logic.
 
+mod atomic_write;
 mod build_cmd;
 mod check_cmd;
 mod dialect;

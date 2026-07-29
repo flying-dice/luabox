@@ -6,9 +6,11 @@
 
 .DESCRIPTION
     Gates: cold start, `fmt --check` throughput (kept as a wider safety
-    net), the real `check` gate (live since GL#6), and a diagnostics-heavy
+    net), the real `check` gate (live since GL#6), a diagnostics-heavy
     `lint` + `check` gate in two variants — findings suppressed, and
-    findings reported.
+    findings reported — and a peak-RSS gate on the same 100-kLOC corpus
+    (decisions/07 accepted a ~1.9x RSS trade; the ceiling side of that
+    bargain is now enforced).
 
     Why those last gates exist: the ~100-kLOC corpus the first three legs
     use is *clean* (`check: 0 errors, 0 warnings`), so none of them ever
@@ -28,7 +30,8 @@
     an underpowered dev laptop). Defaults to the LUABOX_PERF_FACTOR env
     var, or 1.0. CI is the real enforcement point (Linux, scripts/perf-gate.sh);
     this override exists so local runs on a noisy Windows box aren't
-    misleading, not to relax the actual gate.
+    misleading, not to relax the actual gate. It does NOT scale the
+    peak-RSS budget — see $env:LUABOX_RSS_BUDGET_MIB for that.
 
 .EXAMPLE
     scripts/perf-gate.ps1
@@ -73,6 +76,13 @@ $DiagCheckBudgetBaseMs = 1500
 $DiagLintRenderedBudgetBaseMs = 600
 $DiagCheckRenderedBudgetBaseMs = 2400
 $DiagCorpusFindings = 20000
+# Peak-RSS ceiling for `check` on the 100-kLOC corpus, in MiB. decisions/07
+# accepted 64 -> 123 MiB; measured 123 MiB on the Linux dev baseline, so the
+# budget sits at ~2.4x that. Wide on purpose: this catches a *regime* change
+# (a whole-project structure retained, a per-file clone that used to be a
+# borrow), not a 10% drift — and Windows working-set accounting differs from
+# Linux RSS enough that a tight number would only produce false failures.
+$RssBudgetMib = $(if ($env:LUABOX_RSS_BUDGET_MIB) { [int]$env:LUABOX_RSS_BUDGET_MIB } else { 300 })
 
 $coldStartBudget = $ColdStartBudgetBaseMs * $Factor
 $fmtBudget = $FmtBudgetBaseMs * $Factor
@@ -196,6 +206,46 @@ strict = true
         Write-Host ("PASS check (warm): {0:N1} ms < {1:N1} ms" -f $checkMs, $checkBudget)
     } else {
         Write-Host ("FAIL check (warm): {0:N1} ms >= {1:N1} ms" -f $checkMs, $checkBudget)
+        $fail = $true
+    }
+
+    # --- PEAK-RSS GATE -------------------------------------------------------
+    # The other half of decisions/07's bargain: it *accepted* a ~1.9x peak-RSS
+    # regression (64 -> 123 MiB on this corpus) in exchange for one read/parse
+    # per file, and nothing enforced the ceiling side of that trade.
+    #
+    # Windows has no rusage, so this is not scripts/peak-rss.py's mechanism:
+    # `Process.PeakWorkingSet64` is the equivalent the OS does expose, read off
+    # the child after it exits (the property stays readable on an exited
+    # Process object, which is why the process is started by hand rather than
+    # with `&`). Same corpus, same command, same budget as the bash gate.
+    #
+    # NOT scaled by -Factor: a slow machine runs the same allocations, it just
+    # takes longer over them, so a CPU multiplier has no business loosening a
+    # memory ceiling. $env:LUABOX_RSS_BUDGET_MIB overrides it, for when the
+    # budget itself is being renegotiated.
+    Write-Host ""
+    Write-Host "perf-gate: peak RSS of check on corpus (warm)..."
+    $info = [System.Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = $luaboxBin
+    $info.Arguments = "check"
+    $info.WorkingDirectory = $corpusDir
+    $info.UseShellExecute = $false
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $proc = [System.Diagnostics.Process]::Start($info)
+    # Drain both pipes before waiting, or a report larger than the pipe buffer
+    # deadlocks the child — the same hazard tests/broken_pipe.rs works around.
+    $proc.StandardOutput.ReadToEnd() | Out-Null
+    $proc.StandardError.ReadToEnd() | Out-Null
+    $proc.WaitForExit()
+    $rssMib = [int]($proc.PeakWorkingSet64 / 1MB)
+    $proc.Dispose()
+    if ($rssMib -lt $RssBudgetMib) {
+        Write-Host ("PASS check peak RSS: {0} MiB < {1} MiB" -f $rssMib, $RssBudgetMib)
+    } else {
+        Write-Host ("FAIL check peak RSS: {0} MiB >= {1} MiB" -f $rssMib, $RssBudgetMib)
+        Write-Host "     decisions/07 accepted 123 MiB on this corpus"
         $fail = $true
     }
 

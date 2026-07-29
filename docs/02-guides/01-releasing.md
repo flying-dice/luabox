@@ -97,11 +97,38 @@ credential of its own.
    is missing — they resolve the release through the authenticated GitHub API
    (drafts appear only in the *list* endpoint — `releases/tags/<tag>` 404s
    for a draft) and fetch each asset by id, checksum verification included.
-   `install.sh` needs `jq` on that path. Without the opt-in the scripts
-   behave exactly as they always have — a developer whose shell exports
-   `GITHUB_TOKEN` ambiently (Codespaces, `gh auth` setups) stays on the
-   public path; that default behaviour is what job 6 proves against the real
-   public URLs.
+   `install.sh` needs `jq` on that path and says so *immediately* — the check
+   sits at the `LUABOX_DRAFT_INSTALL=1` opt-in, not deep inside the asset
+   download, so a runner without it dies in seconds with one clear message
+   (and `verify` asserts `jq --version` up front on its unix legs). Without
+   the opt-in the scripts behave exactly as they always have — a developer
+   whose shell exports `GITHUB_TOKEN` ambiently (Codespaces, `gh auth`
+   setups) stays on the public path; that default behaviour is what job 6
+   proves against the real public URLs.
+
+   **That path is no longer first exercised by a real tag.** It used to be:
+   nothing anywhere ran the draft code until a `v*` push reached `verify`,
+   which is the most expensive place to discover a bug in it. CI's
+   `draft-install-mock` job ([`.github/workflows/ci.yml`](../../.github/workflows/ci.yml))
+   now runs the real `scripts/install.sh`, unmodified, on every push against a
+   python3-stdlib mock of the release API (`scripts/tests/mock-release-api.py`,
+   driven by `scripts/tests/draft-install-mock.sh`) via the CI-only
+   `LUABOX_API_BASE` override. It covers the paginated release walk with the
+   tag deliberately on **page 2**; the asset-id **302 to a second host with the
+   `Authorization` header asserted absent** — the mock's storage answers 400 if
+   it ever sees one, and that cross-host auth drop is the riskiest logic in the
+   path, free under `curl -L` but hand-rolled under `wget`, which forwards
+   headers across redirects; a real `tar.gz` + `SHA256SUMS` that must verify,
+   install and run; and the negative case of a tag that does not exist. Both
+   HTTP clients are covered — `install.sh` prefers `curl` and falls back to
+   `wget`, and the wget leg runs with `curl` removed from `PATH`.
+
+   What the mock does *not* cover, and what the first real tag push remains
+   the only test of: GitHub's own responses — real pagination and rate-limit
+   behaviour, the actual pre-signed storage host and its expiry, and draft
+   visibility for the workflow token. `install.ps1`'s draft path has no mock
+   leg either (there is no pwsh in that job); Windows is covered by
+   `release.yml`'s `verify` leg alone.
 7. **Verify.** Once the workflow finishes, check the
    [GitHub Releases page](https://github.com/flying-dice/luabox/releases)
    for the new release: it should no longer be a draft, should carry all six

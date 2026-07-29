@@ -141,7 +141,10 @@ fn lint_one(path: &Path, project: &Project, fix: bool) -> anyhow::Result<FileRes
 
     let was_fixed = fix && source != original;
     if was_fixed {
-        fs::write(path, &source).with_context(|| format!("cannot write `{rel}`"))?;
+        // Never `fs::write`: that truncates the user's source before it writes
+        // a byte, so a failed write destroys it. See `crate::atomic_write`.
+        crate::atomic_write::write_atomic(path, &source)
+            .with_context(|| format!("cannot write `{rel}`"))?;
     }
 
     Ok(FileResult {

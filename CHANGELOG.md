@@ -76,20 +76,49 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   IDE "save all" spreading five files ~120 ms apart hit it on every use. The
   sweep is gone: every edit gets its rerun, at any spacing, and one edit still
   settles into silence afterwards.
-- **`luabox check | head` no longer crashes.** Piping any luabox report into a
-  reader that stops early — `head`, `grep -q`, a pager the user quits — killed
-  the process: Rust's `println!` panics when a write fails, a closed pipe makes
-  every write fail, and any report larger than the pipe buffer (64 kB) is
-  guaranteed to still be writing when the reader leaves. The result was a raw
-  Rust panic and a backtrace on stderr, ending in `SIGABRT` (exit status 134)
-  on release builds, in all five `--format`s. A CI job with `set -o pipefail`
-  and a routine `| head` or `| grep -q` went red for it. A reader that hangs up
-  now means "it got what it wanted": luabox stops writing and exits **0**,
-  silently, the way `head` users already expect — on stderr as well as stdout,
-  so `luabox check 2>&1 | head` behaves too. Nothing else changes: a run whose
-  output is read in full still reports its real exit code, and a genuine write
-  failure (a full disk on `luabox schema > luabox.schema.json`) is still an
-  error, now reported as one line on stderr and exit 1 rather than a panic.
+- **`luabox fmt` and `luabox lint --fix` can no longer destroy the source they
+  rewrite.** Both replaced a file by truncating it and then writing it back —
+  so a write that failed part-way left a fragment where your source had been,
+  and luabox, the only process that still held the bytes, then exited. It was
+  not recoverable. Reproduced with `ulimit -f 8`: a 97,780-byte source came
+  back as 8,192 bytes. A full disk, a quota, or a filesystem going read-only
+  mid-run did the same. Every rewrite of a file *you* wrote now stages the
+  complete new content in a sibling temp file, flushes it to disk, and renames
+  it over the target — an atomic replace, so a concurrent reader sees either
+  all the old bytes or all the new ones, and a failure at any point leaves the
+  original untouched. Permissions are preserved (an executable script stays
+  executable), and a symlinked source is still rewritten *through* the link
+  rather than having the link replaced by a regular file. One thing is given up
+  deliberately: a **hardlinked** source now gets a new inode, so another name
+  for the old file keeps pointing at the old content. Losing the file outright
+  was worse. Files luabox creates rather than replaces are unaffected —
+  `init`/`new` scaffolding, and everything `build`/`doc` write into their own
+  output directory.
+- **`luabox check | head` no longer crashes — and no longer lies about what it
+  found.** Piping any luabox report into a reader that stops early — `head`,
+  `grep -q`, a pager you quit — used to kill the process: Rust's `println!`
+  panics when a write fails, a closed pipe makes every write fail, and any
+  report larger than the pipe buffer (64 kB) is guaranteed to still be writing
+  when the reader leaves. The result was a raw Rust panic and a backtrace on
+  stderr, ending in `SIGABRT` (exit status 134) on release builds, in all five
+  `--format`s. A CI job with `set -o pipefail` and a routine `| head` or
+  `| grep -q` went red for it.
+
+  The first fix for that traded one failure for a quieter, worse one: a
+  departed reader exited **0**, unconditionally. So
+  `set -o pipefail; luabox check | head -1` over a tree with thousands of
+  errors *succeeded*, and a CI gate reported green over a broken tree — silent,
+  and wrong in the safe-looking direction. What happens now is neither: **a
+  departed reader costs you the output and nothing else.** luabox stops
+  writing, does not panic, and exits with the verdict the run actually reached
+  — 1 when `check`, `lint` or `fmt --check` found problems, 0 when they did
+  not, and 0 for commands like `build` and `schema` whose report precedes a
+  success nothing later can revoke. The truncated report is the only loss, and
+  losing it is silent, the way `head` users expect. That applies to stderr as
+  well as stdout, so `luabox check 2>&1 | head` behaves too. A run whose output
+  is read in full is unchanged, and a genuine write failure (a full disk on
+  `luabox schema > luabox.schema.json`) is still an error, reported as one line
+  on stderr and exit 1 rather than a panic.
   `luabox lsp` gets the opposite policy for the same defect: its two stderr
   log lines used to abort the whole language server the moment a client had
   closed the log pipe (an editor restart, a torn-down output pane) while the
@@ -418,7 +447,45 @@ so it appears in no version entry.
   both passes instead of being dropped and rebuilt, and peak RSS on the
   100-kLOC reference corpus went from 64 MiB to 123 MiB (~1.9×). That is the
   deliberate trade — memory for I/O and CPU — and the number is here so
-  nobody has to rediscover it from a profiler.
+  nobody has to rediscover it from a profiler. **That number is now gated.**
+  Accepting it was one thing; leaving it unenforced was another — `check`
+  could have grown to 500 MiB on the same input with every CI gate still
+  green. `scripts/perf-gate.sh` (and `perf-gate.ps1`) gained a peak-RSS leg on
+  that corpus, budget 300 MiB, measured through `wait4(2)`'s rusage
+  (`scripts/peak-rss.py`; `Process.PeakWorkingSet64` on Windows). It is
+  deliberately *not* scaled by `LUABOX_PERF_FACTOR` — a slow machine runs the
+  same allocations, it just takes longer over them — and has its own
+  `LUABOX_RSS_BUDGET_MIB` override for when the budget itself is renegotiated.
+- **The two things that stood behind the parser's depth limit and the
+  watcher's debounce are now assertions rather than claims.** `MAX_DEPTH`
+  (220) had a headroom proof for **parsing** only, in a 2 MiB thread —
+  everything downstream (lowering, inference, the formatter, the bundler, the
+  minifier, the renderers) walked the same 2.2×-deeper trees unmeasured. A new
+  workspace test (`crates/luabox-cli/tests/deep_pipeline.rs`) drives the real
+  binary — `check`, `fmt`, `fmt --check`, `build --bundle --minify
+  --sourcemap` — over each construct at the depth reference Lua accepts, which
+  covers the *main* thread's stack and, because it is an ordinary workspace
+  test, runs on Linux, macOS **and Windows** in CI, where that stack is 1 MiB.
+  Separately, `watch.rs`'s `partition_batches` model claimed agreement with
+  the live `next_batch` loop and nothing checked it; both now consume one table
+  of timed cases and a test requires identical batching on every one (verified
+  by mutation: a model drifted to a sliding window fails it).
+- **`install.sh`'s draft-release path is exercised on every push instead of
+  first by a real tag.** Nothing ran that code until a `v*` push reached
+  `release.yml`'s verify job — the most expensive place to find a bug in it.
+  CI's new `draft-install-mock` job runs the real installer against a
+  python3-stdlib mock of the release API (`scripts/tests/mock-release-api.py`),
+  reached through a new CI-only `LUABOX_API_BASE` override (mirrored in
+  `install.ps1`): the paginated release walk with the tag deliberately on page
+  2, the asset-id 302 to a second host with the `Authorization` header asserted
+  **absent**, a real `tar.gz` + `SHA256SUMS` that must verify and run, and the
+  negative case. The script also gained a `wget` fallback throughout — it was
+  curl-only, and the draft path bypassed even the shared download helper — with
+  the cross-host token drop hand-rolled for `wget`, which forwards headers
+  across redirects where `curl -L` does not. Its `jq` requirement moved to the
+  `LUABOX_DRAFT_INSTALL=1` opt-in itself, so a runner without `jq` fails in
+  seconds with one message rather than several API round-trips later, and
+  `release.yml` asserts `jq --version` before it can get that far.
 - **Releases are gated on the full e2e suite running against the *installed*
   binary.** `release.yml` now creates the release as a true **draft**, and on
   Linux, macOS and Windows it downloads the shipped install script *from that

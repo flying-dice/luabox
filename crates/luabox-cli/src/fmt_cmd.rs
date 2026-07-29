@@ -58,7 +58,10 @@ fn run_once(cwd: &Path, check: bool) -> anyhow::Result<()> {
         let formatted = lua::fmt::format(&source, project.dialect);
         if formatted != source {
             if !check {
-                fs::write(path, formatted).with_context(|| {
+                // Never `fs::write`: that truncates the user's source before
+                // it writes a byte, so a failed write destroys it. See
+                // `crate::atomic_write`.
+                crate::atomic_write::write_atomic(path, &formatted).with_context(|| {
                     format!("cannot write `{}`", display_rel(path, &project.root))
                 })?;
             }
@@ -67,6 +70,12 @@ fn run_once(cwd: &Path, check: bool) -> anyhow::Result<()> {
     }
 
     if check {
+        // `fmt --check`'s report is a plain list, not diagnostics, so it does
+        // not pass through `project::render_diagnostics` — it records its own
+        // verdict, and does so before the first `outln!`. Without this,
+        // `luabox fmt --check | head -1` over an unformatted tree would exit 0
+        // once the list out-ran the pipe buffer (`crate::emit`).
+        crate::emit::set_exit_on_reader_gone(i32::from(!changed.is_empty()));
         if changed.is_empty() {
             outln!("checked {} files; all formatted", files.len());
             return Ok(());

@@ -4,9 +4,15 @@
 # work, not covered here).
 #
 # Gates: cold start, `fmt --check` throughput (kept as a wider safety
-# net), the real `check` gate (live since GL#6), and a diagnostics-heavy
+# net), the real `check` gate (live since GL#6), a diagnostics-heavy
 # `lint` + `check` gate in two variants — findings suppressed, and
-# findings reported.
+# findings reported — and a peak-RSS gate on the same 100-kLOC corpus.
+#
+# The memory gate exists because decisions/07 *accepted* a ~1.9x peak-RSS
+# regression (64 -> 123 MiB on this corpus) in exchange for one read/parse
+# per file, and nothing enforced the other side of that bargain: `check`
+# could have grown to 500 MiB on the same input and every gate would still
+# have been green. Now the accepted number has a ceiling.
 #
 # Why those last gates exist: the ~100-kLOC corpus the first three legs
 # use is *clean* (`check: 0 errors, 0 warnings`), so none of them ever
@@ -30,6 +36,14 @@
 #                        this; if a dev's machine can't hit 1.0, that's a
 #                        machine problem, not evidence the gate is wrong.
 #                        Example: LUABOX_PERF_FACTOR=3 scripts/perf-gate.sh
+#   LUABOX_RSS_BUDGET_MIB
+#                        integer ceiling (MiB) for the peak-RSS leg.
+#                        Default 300. Deliberately NOT scaled by
+#                        LUABOX_PERF_FACTOR: a slow or loaded machine runs
+#                        the same allocations, it just takes longer over
+#                        them, so a CPU multiplier has no business
+#                        loosening a memory ceiling. Override it only when
+#                        the *budget* is being renegotiated.
 #
 # Usage: scripts/perf-gate.sh
 set -euo pipefail
@@ -62,6 +76,15 @@ diag_check_budget_base_ms=1500
 diag_lint_rendered_budget_base_ms=600
 diag_check_rendered_budget_base_ms=2400
 diag_corpus_findings=20000
+# Peak-RSS ceiling for `check` on the 100-kLOC corpus, in MiB. decisions/07
+# accepted 64 -> 123 MiB; measured 123 MiB (three runs, identical) on the dev
+# baseline, so the budget sits at ~2.4x that. Wide on purpose: this is a
+# ceiling that catches a *regime* change (a whole-project structure retained,
+# a per-file clone that used to be a borrow), not a 10% drift — allocator
+# behaviour and page-cache pressure vary too much between machines for a tight
+# memory gate to mean anything. NOT scaled by LUABOX_PERF_FACTOR; see the Env
+# block above.
+rss_budget_mib=300
 
 # Plain `awk` (POSIX, present on every CI/dev box we target) does the
 # float multiply; everything else is integer ms from here on.
@@ -168,6 +191,39 @@ if [[ "$check_ms" -lt "$check_budget" ]]; then
 else
   echo "FAIL check (warm): ${check_ms} ms >= ${check_budget} ms"
   fail=1
+fi
+
+# --- PEAK-RSS GATE ---------------------------------------------------------
+# The other half of decisions/07's bargain. `check` is the command that
+# retains per-file artifacts across both of its passes, and the 100-kLOC
+# corpus above is the input that number was measured on, so this reuses both
+# rather than inventing a third fixture. Warm, like every leg here.
+#
+# The measurement is `wait4(2)`'s rusage — what `/usr/bin/time -v` reports —
+# read through python3's stdlib (scripts/peak-rss.py). One mechanism for Linux
+# and macOS, no packages, and python3 is already a CI dependency (the coverage
+# job runs scripts/per-crate-coverage.py). Where it is missing, the leg SKIPs
+# loudly rather than failing, the way scripts/examples.sh skips its lua5.1
+# step — a missing measuring tool is not evidence of a regression.
+rss_budget="${LUABOX_RSS_BUDGET_MIB:-$rss_budget_mib}"
+echo
+if command -v python3 >/dev/null 2>&1; then
+  echo "perf-gate: peak RSS of check on corpus (warm)..."
+  ( cd "$corpus_dir" && "$luabox_bin" check >/dev/null 2>&1 ) || true
+  if rss_mib="$( cd "$corpus_dir" && python3 "$repo_root/scripts/peak-rss.py" "$luabox_bin" check )"; then
+    if [[ "$rss_mib" -lt "$rss_budget" ]]; then
+      echo "PASS check peak RSS: ${rss_mib} MiB < ${rss_budget} MiB"
+    else
+      echo "FAIL check peak RSS: ${rss_mib} MiB >= ${rss_budget} MiB"
+      echo "     decisions/07 accepted 123 MiB on this corpus; see scripts/peak-rss.py"
+      fail=1
+    fi
+  else
+    echo "FAIL check peak RSS: could not measure"
+    fail=1
+  fi
+else
+  echo "perf-gate: SKIP peak RSS — no python3 on PATH (it reads the child's rusage)"
 fi
 
 # --- DIAGNOSTICS-HEAVY GATE ------------------------------------------------
