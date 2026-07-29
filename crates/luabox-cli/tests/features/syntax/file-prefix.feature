@@ -134,3 +134,124 @@ Feature: File prefix — `#!` line and UTF-8 byte-order mark
       """
     When I run "luabox check"
     Then the command succeeds
+
+  # --- bundling (SPEC.md §7) ------------------------------------------------
+  #
+  # A bundle splices every module's text into ONE file, so the file prefix
+  # stops being a prefix: a module's `#!` line lands mid-file where `#` is
+  # the length operator, and a module's BOM lands where a mark is an illegal
+  # character. Both are therefore cut from every module, and the *entry*'s
+  # `#!` line is re-emitted at byte 0 so the bundle is still an executable
+  # script. No BOM is ever emitted: the bundle is a new file, and a 5.1
+  # target has no `skipBOM` to survive one.
+
+  Scenario Outline: a shebang'd entry and a shebang'd module bundle into one executable script
+    Given a project with edition "5.4" targeting "<target>" bundling
+    And a file "src/main.lua" containing:
+      """
+      #!/usr/bin/env lua
+      local util = require("util")
+      print(util.greet())
+      """
+    And a file "src/util.lua" containing:
+      """
+      #!/usr/bin/env lua
+      local M = {}
+      function M.greet()
+        return "hello-from-util"
+      end
+      return M
+      """
+    When I run "<command>"
+    Then the command succeeds
+    And "dist/main.lua" starts with "#!/usr/bin/env lua"
+    And "dist/main.lua" contains exactly 1 occurrence of "#!/usr/bin/env lua"
+    And "dist/main.lua" contains "hello-from-util"
+
+    Examples:
+      | target | command               |
+      | 5.4    | luabox build          |
+      | 5.4    | luabox build --minify |
+      | 5.1    | luabox build          |
+      | 5.1    | luabox build --minify |
+
+  Scenario Outline: a shebang on a required module alone never reaches the bundle
+    Given a project with edition "5.4" targeting "<target>" bundling
+    And a file "src/main.lua" containing:
+      """
+      local util = require("util")
+      print(util.greet())
+      """
+    And a file "src/util.lua" containing:
+      """
+      #!/usr/bin/env lua
+      local M = {}
+      function M.greet()
+        return "hello-from-util"
+      end
+      return M
+      """
+    When I run "<command>"
+    Then the command succeeds
+    And "dist/main.lua" does not contain "#!/usr/bin/env lua"
+    And "dist/main.lua" contains "hello-from-util"
+
+    Examples:
+      | target | command               |
+      | 5.4    | luabox build          |
+      | 5.4    | luabox build --minify |
+      | 5.1    | luabox build          |
+      | 5.1    | luabox build --minify |
+
+  Scenario Outline: only the entry's shebang survives, and minifying does not drop it
+    Given a project with edition "5.4" targeting "<target>" bundling
+    And a file "src/main.lua" containing:
+      """
+      #!/usr/bin/env lua
+      local util = require("util")
+      print(util.greet())
+      """
+    And a file "src/util.lua" containing:
+      """
+      local M = {}
+      function M.greet()
+        return "hello-from-util"
+      end
+      return M
+      """
+    When I run "<command>"
+    Then the command succeeds
+    And "dist/main.lua" starts with "#!/usr/bin/env lua"
+    And "dist/main.lua" contains exactly 1 occurrence of "#!/usr/bin/env lua"
+
+    Examples:
+      | target | command               |
+      | 5.4    | luabox build          |
+      | 5.4    | luabox build --minify |
+      | 5.1    | luabox build          |
+      | 5.1    | luabox build --minify |
+
+  Scenario Outline: a BOM'd module bundles, and the bundle carries no mark
+    Given a project with edition "5.4" targeting "<target>" bundling
+    And a file "src/main.lua" containing:
+      """
+      local util = require("util")
+      print(util.greet())
+      """
+    And a file "src/util.lua" with a UTF-8 BOM containing:
+      """
+      local M = {}
+      function M.greet()
+        return "hello-from-util"
+      end
+      return M
+      """
+    When I run "<command>"
+    Then the command succeeds
+    And "dist/main.lua" contains "hello-from-util"
+    And "dist/main.lua" carries no UTF-8 byte-order mark
+
+    Examples:
+      | target | command               |
+      | 5.4    | luabox build          |
+      | 5.4    | luabox build --minify |

@@ -102,21 +102,23 @@ jobs:
           name: coverage-e2e-lcov
           path: lcov-e2e.info
 
-  # SPEC.md §16.1 — perf gates are CI-blocking. scripts/perf-gate.sh runs
-  # four, all live. (1)–(3) run against a ~100-kLOC synthetic corpus:
-  #   1. cold start          — `luabox --version`, best of N, < 50 ms
-  #   2. `fmt --check` warm  — < 2 s. Once a proxy for (3) while `check` was
-  #      unbuilt (GL#6); kept now as the wider safety net, since it walks the
-  #      whole corpus through the parser and formatter without the checker's
-  #      caching in the way.
-  #   3. `check` warm        — < 1 s. The real gate SPEC §16.1 asks for; live
-  #      since `luabox check` landed, no longer proxied.
-  #   4. diagnostics-heavy   — `lint` < 1.2 s and `check` < 1.5 s on ONE file
-  #      carrying 20 k suppressed findings. That corpus is separate because
-  #      the one above is clean (`0 errors, 0 warnings`), so (1)–(3) never
-  #      time per-diagnostic work — a blind spot that hid an
-  #      O(diagnostics x file size) line lookup (32 k findings in one file:
-  #      ~32 s to lint; the same file with one finding: 0.35 s).
+  # SPEC.md §16.1 — perf gates are CI-blocking. scripts/perf-gate.sh is the
+  # authoritative list and holds the calibration notes for every budget; it
+  # currently runs seven timed legs, all live:
+  #   1. cold start                     — `luabox --version`, best of 10
+  #   2. `fmt --check` warm             — ~100-kLOC synthetic corpus
+  #   3. `check` warm                   — same corpus; the gate §16.1 asks for
+  #   4. `lint`, diagnostics-heavy      — 20 k findings in ONE file, suppressed
+  #   5. `check`, diagnostics-heavy     — ditto
+  #   6. `lint`, findings rendered      — the same corpus, nothing suppressed
+  #   7. `check`, findings rendered     — ditto
+  # Legs 4-7 exist because the corpus legs 2-3 use is *clean*, so none of
+  # them ever times per-diagnostic work — the blind spot that hid an
+  # O(diagnostics x file size) line lookup (32 k findings in one file: ~32 s
+  # to lint; the same file with one finding: 0.35 s). The suppressed pair
+  # times the bookkeeping with the renderer out of the way; the rendered pair
+  # times what a user actually pays, renderer included, where a second such
+  # cost lived.
   # The LSP keystroke-to-diagnostics budget in §16.1 is NOT gated here — no
   # harness drives the protocol yet; SPEC marks it future work.
   # Every budget is scaled by LUABOX_PERF_FACTOR (set below for this runner).

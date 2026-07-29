@@ -484,3 +484,42 @@ Feature: luabox check — annotation-driven typecheck (P0 MVP)
     Then the command succeeds
     And stdout contains "warning[LB0300]"
     And stderr contains "check: 0 errors, 1 warnings in 1 files"
+
+  # --- rendering long lines (round-4 F3) ------------------------------------
+  #
+  # The human renderer used to print the ENTIRE source line, plus a
+  # column-wide run of spaces, once per label. On a minified or generated
+  # file — one line, hundreds of kilobytes — that made the *report* quadratic
+  # in the file size: 10 k diagnostics on a 377 kB single-line file produced
+  # 3.5 GB of stdout. Long lines are now windowed rustc-style; column numbers
+  # stay exact, and a line short enough to print whole is still printed whole,
+  # byte for byte.
+
+  Scenario: an ordinary source line is printed whole, with the caret under it
+    Given a project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      local = 5
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "1 | local = 5"
+    And stdout does not contain "..."
+
+  Scenario: a diagnostic on a very long line shows a window of it, not all of it
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@param n number
+      local function double(n) return n * 2 end
+      local pad = "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij" double("nope")
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "error[LB0300]"
+    # The column NUMBER is never windowed - it names the true column of a
+    # 409-character line.
+    And stdout contains "--> src/main.lua:3:403"
+    # The window truncates on the left, so the line does not start with `local`.
+    And stdout contains "..."
+    And no line of stdout is longer than 256 characters

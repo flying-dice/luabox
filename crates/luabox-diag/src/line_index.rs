@@ -6,9 +6,23 @@
 //! paid O(n x file size) to be reported — the human renderer spent 43 s on a
 //! 1.8 MB file with 32 k diagnostics that `--format json` emitted in 0.5 s.
 //!
-//! [`IndexedSource`] owns the text and a table of line-start byte offsets
-//! built in one pass, so [`IndexedSource::line_col`] binary-searches instead
-//! of scanning and [`IndexedSource::line_text`] slices instead of iterating.
+//! [`IndexedSource`] owns the text and two tables built in one pass — the
+//! byte offset of every line start, and the byte offset of every UTF-8
+//! *continuation* byte — so [`IndexedSource::line_col`] binary-searches
+//! instead of scanning and [`IndexedSource::line_text`] slices instead of
+//! iterating.
+//!
+//! The continuation table is what makes the *column* cheap. Finding the line
+//! was already a `partition_point`, but the column was then counted by
+//! walking `char_indices` from the line start — O(column) per label, which on
+//! a single-line file (minified source, generated code) is O(file) per label
+//! and quadratic all over again: `check` took 71 s to render 10 k
+//! diagnostics on a 377 kB one-line file that `--format json` emitted in
+//! 0.5 s. A column counts *characters*, and a character is exactly one
+//! non-continuation byte, so the count is
+//! `(offset - line_start) - continuation_bytes_in(line_start..offset)` —
+//! both terms `partition_point`s. The table costs nothing on ASCII input,
+//! where it is empty.
 //!
 //! This is deliberately a *private* re-implementation of the same idea as
 //! `luabox_syntax::LineIndex`: `luabox-diag` is the cross-cutting vocabulary
@@ -27,20 +41,30 @@ pub(crate) struct IndexedSource {
     /// Byte offset of the start of each line. Always begins with `0`, so it
     /// is never empty and its length is the number of lines.
     starts: Vec<usize>,
+    /// Byte offset of every UTF-8 continuation byte (`0b10xx_xxxx`), i.e.
+    /// every byte that does *not* start a character. Empty for ASCII, which
+    /// is the overwhelmingly common case; see the module docs for why this
+    /// is the whole column story.
+    continuations: Vec<usize>,
 }
 
 impl IndexedSource {
     /// Index `text` in one pass.
     pub(crate) fn new(text: String) -> Self {
-        let starts = std::iter::once(0)
-            .chain(
-                text.bytes()
-                    .enumerate()
-                    .filter(|&(_, byte)| byte == b'\n')
-                    .map(|(i, _)| i + 1),
-            )
-            .collect();
-        IndexedSource { text, starts }
+        let mut starts = vec![0];
+        let mut continuations = Vec::new();
+        for (i, byte) in text.bytes().enumerate() {
+            if byte == b'\n' {
+                starts.push(i + 1);
+            } else if byte & 0b1100_0000 == 0b1000_0000 {
+                continuations.push(i);
+            }
+        }
+        IndexedSource {
+            text,
+            starts,
+            continuations,
+        }
     }
 
     /// The whole file.
@@ -56,7 +80,14 @@ impl IndexedSource {
     /// line it terminates; an offset past the end clamps to the last line's
     /// end, and `\r\n` needs no special case because only the `\n` opens a
     /// line.
+    ///
+    /// Both halves are binary searches, so the cost is O(log file) whatever
+    /// the offset — never O(offset), which is what made a one-line file
+    /// quadratic to report.
     pub(crate) fn line_col(&self, offset: usize) -> (usize, usize) {
+        // Clamping first is what the scanning implementation did implicitly
+        // by running out of characters.
+        let offset = offset.min(self.text.len());
         // `starts` is sorted and starts at 0, so the number of starts at or
         // before `offset` is both >= 1 and exactly the 1-based line number.
         let line = self.starts.partition_point(|&start| start <= offset);
@@ -65,15 +96,13 @@ impl IndexedSource {
             .get(line.saturating_sub(1))
             .copied()
             .unwrap_or(0);
-        let col = self
-            .text
-            .get(start..)
-            .unwrap_or("")
-            .char_indices()
-            .take_while(|&(i, _)| start + i < offset)
-            .count()
-            + 1;
-        (line, col)
+        // Characters in `start..offset` = bytes in it, minus the ones that
+        // only continue a character. An offset landing *inside* a character
+        // therefore still counts it, matching the scan this replaced.
+        let bytes = offset.saturating_sub(start);
+        let continued = self.continuations.partition_point(|&i| i < offset)
+            - self.continuations.partition_point(|&i| i < start);
+        (line, bytes - continued + 1)
     }
 
     /// The text of a 1-based `line`, without its terminator.
@@ -82,17 +111,29 @@ impl IndexedSource {
     /// lone `\r` is ordinary text, and a line past the end of the file — which
     /// includes the empty line a trailing newline opens — is `""`.
     pub(crate) fn line_text(&self, line: usize) -> &str {
+        let range = self.line_range(line);
+        let raw = self.text.get(range).unwrap_or("");
+        raw.strip_suffix('\r').unwrap_or(raw)
+    }
+
+    /// Byte range of a 1-based `line`, terminator included — the exact range
+    /// [`IndexedSource::line_text`] slices before it strips a trailing `\r`.
+    ///
+    /// The human renderer needs the *start* to place a label's byte offset
+    /// within its line without re-deriving it from the column, which is the
+    /// only way to window a long line in O(window) rather than O(line).
+    /// An out-of-range line gives an empty range at the end of the file.
+    pub(crate) fn line_range(&self, line: usize) -> std::ops::Range<usize> {
         let index = line.saturating_sub(1);
         let Some(&start) = self.starts.get(index) else {
-            return "";
+            return self.text.len()..self.text.len();
         };
         let end = self
             .starts
             .get(index + 1)
             // The next line starts one past its opening `\n`; drop that `\n`.
             .map_or(self.text.len(), |&next| next.saturating_sub(1));
-        let raw = self.text.get(start..end).unwrap_or("");
-        raw.strip_suffix('\r').unwrap_or(raw)
+        start..end
     }
 }
 
@@ -235,6 +276,56 @@ mod tests {
         assert_eq!(indexed.line_text(1), "a\rb");
         assert_eq!(indexed.line_col(2), (1, 3));
         assert_eq!(indexed.line_text(2), "c");
+    }
+
+    #[test]
+    fn line_range_agrees_with_line_text_everywhere() {
+        for source in TRICKY {
+            let indexed = IndexedSource::new((*source).to_string());
+            for line in 0..source.lines().count() + 4 {
+                let range = indexed.line_range(line);
+                let raw = source.get(range.clone()).unwrap_or("");
+                assert_eq!(
+                    raw.strip_suffix('\r').unwrap_or(raw),
+                    indexed.line_text(line),
+                    "source {source:?} at line {line}"
+                );
+                assert!(range.start <= range.end, "source {source:?} line {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn line_range_starts_where_the_line_starts() {
+        let indexed = IndexedSource::new("ab\ncd\n".to_string());
+        assert_eq!(indexed.line_range(1), 0..2);
+        assert_eq!(indexed.line_range(2), 3..5);
+        // Past the end: an empty range at the end of the file, never a
+        // backwards one.
+        assert_eq!(indexed.line_range(99), 6..6);
+    }
+
+    #[test]
+    fn columns_on_one_long_line_do_not_walk_it() {
+        // The property F3 is about: the column of an offset near the end of
+        // a 400 kB *single* line must not be counted from the line start.
+        // Asserted structurally (two `partition_point`s, no scan) plus the
+        // values themselves, which the oracle test above pins in general.
+        let source = "x".repeat(400_000);
+        let len = source.len();
+        let indexed = IndexedSource::new(source);
+        assert!(
+            indexed.continuations.is_empty(),
+            "an ASCII file must not pay for the continuation table"
+        );
+        assert_eq!(indexed.line_col(len - 1), (1, len));
+        assert_eq!(indexed.line_col(0), (1, 1));
+        // Multi-byte, so the table is actually exercised at scale.
+        let wide = "中".repeat(100_000);
+        let indexed = IndexedSource::new(wide);
+        assert_eq!(indexed.continuations.len(), 200_000);
+        assert_eq!(indexed.line_col(299_997), (1, 100_000));
+        assert_eq!(indexed.line_col(usize::MAX), (1, 100_001));
     }
 
     #[test]

@@ -35,7 +35,18 @@
 //!
 //! ## Filtering
 //!
-//! Only sources that can affect the command's outcome trigger a rerun:
+//! Two filters, and both are load-bearing.
+//!
+//! **By event kind** ([`triggers_rerun`]) — only events that describe a
+//! *change* count. This is not a nicety: notify's inotify backend watches
+//! `OPEN | CLOSE_NOWRITE | ATTRIB` alongside the mutation events, so every
+//! rerun's own *reads* of `*.lua` and `luabox.toml` come straight back as
+//! events. Forwarding those made one edit enough to pin the watcher in a
+//! permanent rerun loop at debounce cadence — measured at ~99 reruns over
+//! 30 s of an otherwise idle project, with not a single MODIFY among them.
+//!
+//! **By path** ([`is_relevant`]) — only sources that can affect the
+//! command's outcome:
 //! `*.lua` and the manifest `luabox.toml`. Everything else is noise and is
 //! ignored by [`is_relevant`], which is `luabox_manifest::layout`'s
 //! first-party-source rule plus one watch-only decoration:
@@ -55,6 +66,16 @@
 //! the manifest (edition, strictness, `[build] out`) is the
 //! closure's job: `check_cmd::run_once`/`fmt_cmd::run_once` already
 //! rediscover the project from scratch on every call.
+//!
+//! ## Self-inflicted events
+//!
+//! Whatever the kind filter lets through, a rerun's own filesystem activity
+//! must never be able to *sustain* the loop. Every run — the first one and
+//! every rerun — is therefore followed by [`drain_self_inflicted`], which
+//! swallows everything that piled up while the command was working. The kind
+//! filter is the specific fix for the read-triggered loop; the drain is the
+//! general one, and it holds for any event a backend classifies in a way
+//! this module did not anticipate.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -63,6 +84,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use luabox_manifest::layout;
+use notify::event::{AccessKind, AccessMode, EventKind, MetadataKind, ModifyKind};
 use notify::{Event, RecursiveMode, Watcher};
 
 /// How long to keep collecting events after the first one in a batch.
@@ -89,6 +111,11 @@ pub fn run(
     let (tx, rx) = mpsc::channel::<Event>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
         if let Ok(event) = res {
+            // Drop non-changes at the source, so they never even start a
+            // debounce window — see `triggers_rerun`.
+            if !triggers_rerun(event.kind) {
+                return;
+            }
             // The other end only ever disappears when `run` itself is
             // unwinding (e.g. the caller dropped everything), so a send
             // failure here is not actionable.
@@ -124,9 +151,55 @@ pub fn run(
             continue;
         }
         println!("--- watching: rerun ({} files changed) ---", batch.len());
-        report(on_change());
+        let result = on_change();
+        // Exactly as after the first run: a rerun reads (and, for `fmt
+        // --watch`, rewrites) the very files being watched, and whatever
+        // that produced must not be mistaken for the *next* user edit.
+        // Without this the loop could feed itself forever off its own
+        // side effects — which is precisely what it did.
+        drain_self_inflicted(&rx);
+        report(result);
     }
     Ok(())
+}
+
+/// Whether a filesystem event describes a *change* worth rerunning for.
+///
+/// notify reports far more than mutations. Its inotify backend asks for
+/// `OPEN | CLOSE_NOWRITE | ATTRIB` on top of the mutation events, so simply
+/// reading a watched file — which is all `luabox check` does — produces a
+/// steady stream of events for it. Forwarding those turned one edit into a
+/// permanent rerun loop: every rerun's reads re-triggered the next.
+///
+/// The rule, deliberately:
+/// - **`Create` / `Remove`** — a file appearing or vanishing changes what the
+///   next run sees. Rerun.
+/// - **`Modify`, except `Metadata(AccessTime)`** — content, renames, write
+///   time, permissions and ownership are all real changes, and an
+///   *unclassified* metadata change (`MetadataKind::Any`, which is what
+///   inotify's `ATTRIB` becomes) covers `touch`, so an mtime-only touch
+///   still reruns. Access *time* is the one metadata change a plain read
+///   causes, so it alone is ignored.
+/// - **`Access`, except `Close(Write)`** — notify defines this whole variant
+///   as "non-mutating access operations": opens, reads, and read-closes are
+///   what the rerun itself generates. `Close(Write)` is the exception and is
+///   honoured: it means a writer just closed the file, which is a change
+///   however it was classified.
+/// - **`Any` / `Other`** — a backend that could not classify the event.
+///   Rerunning once too often is a far smaller failure than silently missing
+///   an edit, so these trigger; the post-run drain is what keeps that from
+///   ever becoming a loop.
+fn triggers_rerun(kind: EventKind) -> bool {
+    match kind {
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        EventKind::Access(_)
+        | EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)) => false,
+        EventKind::Create(_)
+        | EventKind::Modify(_)
+        | EventKind::Remove(_)
+        | EventKind::Any
+        | EventKind::Other => true,
+    }
 }
 
 /// Block until the first event arrives, then keep collecting for
@@ -253,9 +326,11 @@ pub(crate) fn partition_batches(
 #[cfg(test)]
 mod tests {
     use super::{
-        DEBOUNCE_WINDOW, drain_self_inflicted, filter_and_dedupe, is_relevant, next_batch,
-        partition_batches, report,
+        AccessKind, AccessMode, DEBOUNCE_WINDOW, EventKind, MetadataKind, ModifyKind,
+        drain_self_inflicted, filter_and_dedupe, is_relevant, next_batch, partition_batches,
+        report, triggers_rerun,
     };
+    use notify::event::{CreateKind, DataChange, RemoveKind, RenameMode};
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -273,6 +348,66 @@ mod tests {
     }
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
+    }
+
+    // --- the event-kind filter --------------------------------------------
+
+    #[test]
+    fn reads_never_trigger_a_rerun() {
+        // Exactly what a rerun's own reads produce on inotify (OPEN,
+        // CLOSE_NOWRITE) — the events that made `--watch` loop forever.
+        assert!(!triggers_rerun(EventKind::Access(AccessKind::Open(
+            AccessMode::Any
+        ))));
+        assert!(!triggers_rerun(EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        ))));
+        assert!(!triggers_rerun(EventKind::Access(AccessKind::Read)));
+        assert!(!triggers_rerun(EventKind::Access(AccessKind::Any)));
+        assert!(!triggers_rerun(EventKind::Access(AccessKind::Other)));
+        // An access *time* bump is what reading a file costs in metadata
+        // terms; it is not an edit.
+        assert!(!triggers_rerun(EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::AccessTime
+        ))));
+    }
+
+    #[test]
+    fn writes_creations_removals_and_renames_all_trigger_a_rerun() {
+        assert!(triggers_rerun(EventKind::Modify(ModifyKind::Data(
+            DataChange::Any
+        ))));
+        assert!(triggers_rerun(EventKind::Modify(ModifyKind::Name(
+            RenameMode::Both
+        ))));
+        assert!(triggers_rerun(EventKind::Create(CreateKind::File)));
+        assert!(triggers_rerun(EventKind::Remove(RemoveKind::File)));
+        // A writer closing the file is a change, whatever notify calls it.
+        assert!(triggers_rerun(EventKind::Access(AccessKind::Close(
+            AccessMode::Write
+        ))));
+    }
+
+    #[test]
+    fn an_mtime_only_touch_still_triggers_a_rerun() {
+        // `touch file.lua` becomes inotify's ATTRIB, which notify reports as
+        // an unclassified metadata change. Only AccessTime is ignored, so a
+        // touch is still an edit.
+        assert!(triggers_rerun(EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::Any
+        ))));
+        assert!(triggers_rerun(EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::WriteTime
+        ))));
+    }
+
+    #[test]
+    fn an_unclassified_event_errs_towards_rerunning() {
+        // Missing a real edit is worse than one extra rerun; the post-run
+        // drain is what stops that from ever becoming a loop.
+        assert!(triggers_rerun(EventKind::Any));
+        assert!(triggers_rerun(EventKind::Other));
+        assert!(triggers_rerun(notify::Event::default().kind));
     }
 
     #[test]
