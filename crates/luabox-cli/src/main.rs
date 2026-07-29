@@ -3,22 +3,83 @@
 //! Thin frontend over the bounded-context crates: owns UX, argument parsing,
 //! and diagnostic rendering; none of the domain logic.
 
+mod atomic_write;
 mod build_cmd;
 mod check_cmd;
+mod dialect;
 mod doc_cmd;
+mod emit;
 mod fmt_cmd;
 mod lint_cmd;
 mod lsp_cmd;
 mod modes;
 mod project;
 mod scaffold;
+#[cfg(test)]
+mod testutil;
 mod upgrade_cmd;
 mod watch;
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use anyhow::bail;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use luabox_diag::Format;
+use luabox_manifest::model::BundleMode;
+
+use crate::emit::{err, outln};
+
+/// `--format`: the closed set of diagnostic renderings (SPEC.md §14).
+///
+/// A CLI-side mirror of [`luabox_diag::Format`], not that type itself: clap's
+/// `ValueEnum` owns the spellings and the "possible values" help/completions,
+/// while `luabox-diag` stays free of a `clap` dependency. Hand-rolled
+/// `parse_format` string matching died with it (CC-M12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum FormatArg {
+    Human,
+    Json,
+    Sarif,
+    Github,
+    Gitlab,
+}
+
+impl From<FormatArg> for Format {
+    fn from(arg: FormatArg) -> Self {
+        match arg {
+            FormatArg::Human => Format::Human,
+            FormatArg::Json => Format::Json,
+            FormatArg::Sarif => Format::Sarif,
+            FormatArg::Github => Format::GithubActions,
+            FormatArg::Gitlab => Format::GitlabCodeQuality,
+        }
+    }
+}
+
+/// `--mode`: the closed set of bundler embedding modes (SPEC.md §7).
+///
+/// The same CLI-side-mirror trick as [`FormatArg`]: clap validates the flag,
+/// and this maps onto the manifest's [`BundleMode`] so a flag-supplied mode
+/// and a `[build] mode` are the same value by the time `build_cmd` sees them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ModeArg {
+    Plain,
+    Love,
+    #[value(name = "nvim-plugin")]
+    NvimPlugin,
+}
+
+impl From<ModeArg> for BundleMode {
+    fn from(arg: ModeArg) -> Self {
+        match arg {
+            ModeArg::Plain => BundleMode::Plain,
+            ModeArg::Love => BundleMode::Love,
+            ModeArg::NvimPlugin => BundleMode::NvimPlugin,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -43,7 +104,8 @@ enum Command {
         /// Scaffold a library (default is a binary/script project)
         #[arg(long, conflicts_with = "bin")]
         lib: bool,
-        /// Scaffold a binary/script project
+        /// Scaffold a binary/script project — the default, so passing it
+        /// only makes that explicit
         #[arg(long)]
         bin: bool,
         /// Dialect you write: 5.1, 5.2, 5.3, 5.4, luajit
@@ -53,10 +115,14 @@ enum Command {
     /// Scaffold a new project in a new directory
     New {
         name: String,
+        /// Scaffold a library (default is a binary/script project)
         #[arg(long, conflicts_with = "bin")]
         lib: bool,
+        /// Scaffold a binary/script project — the default, so passing it
+        /// only makes that explicit
         #[arg(long)]
         bin: bool,
+        /// Dialect you write: 5.1, 5.2, 5.3, 5.4, luajit
         #[arg(long, default_value = "5.4")]
         edition: String,
     },
@@ -65,9 +131,9 @@ enum Command {
         /// Also validate dialect legality against a ship target
         #[arg(long)]
         target: Option<String>,
-        /// Output format: human, json, sarif, github, gitlab
-        #[arg(long, default_value = "human")]
-        format: String,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = FormatArg::Human)]
+        format: FormatArg,
         /// Rerun on every source/manifest change until interrupted (Ctrl-C);
         /// a failing run is reported but does not stop watching
         #[arg(long)]
@@ -116,10 +182,10 @@ enum Command {
         /// Mangle locals/whitespace in each bundle
         #[arg(long)]
         minify: bool,
-        /// Embedding mode: plain (default), love, nvim-plugin; overrides
+        /// Embedding mode (default: `[build] mode`, else plain); overrides
         /// `[build] mode`
-        #[arg(long)]
-        mode: Option<String>,
+        #[arg(long, value_enum)]
+        mode: Option<ModeArg>,
     },
     /// Generate documentation from annotations
     Doc {
@@ -137,8 +203,11 @@ enum Command {
         /// Release version to install (e.g. 0.1.0 or v0.1.0); default: latest
         version: Option<String>,
     },
-    /// Explain a diagnostic code (e.g. LB0421)
+    /// Explain a diagnostic code (e.g. LB0300)
     Explain { code: String },
+    /// Print the JSON Schema (draft 2020-12) for `luabox.toml`, for editors,
+    /// validators and LLM coding assistants
+    Schema,
     /// Rewrite bundle line references in a traceback back to source, via the
     /// `<bundle>.map` emitted next to the bundle by `luabox build --sourcemap`
     Unmap {
@@ -150,12 +219,102 @@ enum Command {
     },
 }
 
+/// Exit codes are part of the CLI contract (SPEC.md §14): 0 on success, 1
+/// when a command ran and failed, 2 when clap rejects the invocation — that
+/// last path is clap's own, taken inside `Cli::parse` before `run` is
+/// reached, and is untouched here.
+///
+/// `main` returns [`ExitCode`] rather than `anyhow::Result<()>` deliberately.
+/// The `Result` return renders the error with `anyhow`'s `Debug`, which
+/// appends a captured stack backtrace to every failure whenever
+/// `RUST_BACKTRACE` is set in the user's environment — and release builds are
+/// stripped (`Cargo.toml`'s `[profile.release] strip = true`), so those frames
+/// arrive as pages of `<unknown>` telling the user nothing about their
+/// manifest or sources. Rendering the chain here keeps the diagnostic and
+/// drops the noise.
+/// The stack budget every thread that recurses over syntax trees gets — the
+/// dispatcher thread `main` spawns AND rayon's workers alike. Recursion depth
+/// is bounded by the parser (`MAX_DEPTH`), so the budget is a constant of the
+/// design, not of whichever platform or dependency default happens to apply:
+/// the platform main thread is 8 MiB on Linux/macOS but 1 MiB under MSVC
+/// (which a 195-deep source overflowed: `STATUS_STACK_OVERFLOW`), and an
+/// unconfigured rayon pool hands workers Rust's 2 MiB default — an inherited
+/// margin, not a chosen one.
+const PINNED_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn main() -> ExitCode {
+    // Every command runs on a dedicated thread with an EXPLICIT stack size,
+    // rustc-style; together with the rayon pool pinned in `real_main`, every
+    // thread that walks a tree has the same 16 MiB regardless of platform.
+    let spawned = std::thread::Builder::new()
+        .name("luabox".to_owned())
+        .stack_size(PINNED_STACK_BYTES)
+        .spawn(real_main);
+    match spawned {
+        // A panic on the worker already printed via the default hook; all
+        // that is left to salvage is a failing exit code.
+        Ok(handle) => handle.join().unwrap_or(ExitCode::FAILURE),
+        // If the thread cannot even be spawned, degrade to the plain run —
+        // platform-default stack beats not running at all.
+        Err(_) => real_main(),
+    }
+}
+
+fn real_main() -> ExitCode {
+    // Multi-file commands recurse on rayon WORKERS (`check`'s per-file
+    // par_iter), not on the thread above — with more than one file rayon
+    // spreads the work, and an unconfigured global pool would give those
+    // workers the 2 MiB default. Pin them to the same budget. `Err` means a
+    // pool was already built for this process (possible only in-process,
+    // e.g. a test harness); whatever configured it keeps its choice.
+    let _ = rayon::ThreadPoolBuilder::new()
+        .stack_size(PINNED_STACK_BYTES)
+        .build_global();
+    let cli = Cli::parse();
+    match run(cli.command) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            err!("{}", render_error(&error));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The error chain as `anyhow`'s `Debug` renders it — top-level message, then
+/// a `Caused by:` block (numbered once there is more than one source) — minus
+/// the backtrace.
+fn render_error(error: &anyhow::Error) -> String {
+    let mut out = format!("Error: {error}\n");
+    let sources: Vec<String> = error.chain().skip(1).map(ToString::to_string).collect();
+    if sources.is_empty() {
+        return out;
+    }
+    out.push_str("\nCaused by:\n");
+    let numbered = sources.len() > 1;
+    for (index, source) in sources.iter().enumerate() {
+        let lead = if numbered {
+            format!("{index:>4}: ")
+        } else {
+            "    ".to_owned()
+        };
+        let continuation = " ".repeat(lead.len());
+        for (line_number, line) in source.lines().enumerate() {
+            let prefix = if line_number == 0 {
+                &lead
+            } else {
+                &continuation
+            };
+            let _ = writeln!(out, "{prefix}{line}");
+        }
+    }
+    out
+}
+
 // A pure one-arm-per-subcommand dispatcher: length tracks the CLI surface,
 // not complexity.
 #[allow(clippy::too_many_lines)]
-fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    match cli.command {
+fn run(command: Command) -> anyhow::Result<()> {
+    match command {
         Command::Init { lib, edition, .. } => {
             scaffold::init(&std::env::current_dir()?, lib, &edition)
         }
@@ -166,7 +325,12 @@ fn main() -> anyhow::Result<()> {
             target,
             format,
             watch,
-        } => check_cmd::run(&std::env::current_dir()?, target.as_deref(), &format, watch),
+        } => check_cmd::run(
+            &std::env::current_dir()?,
+            target.as_deref(),
+            format.into(),
+            watch,
+        ),
         Command::Lint { fix } => lint_cmd::run(&std::env::current_dir()?, fix),
         Command::Fmt { check, watch } => fmt_cmd::run(&std::env::current_dir()?, check, watch),
         Command::Build {
@@ -197,7 +361,7 @@ fn main() -> anyhow::Result<()> {
                     bundle,
                     sourcemap,
                     minify,
-                    mode,
+                    mode: mode.map(Into::into),
                 },
             )
         }
@@ -206,15 +370,23 @@ fn main() -> anyhow::Result<()> {
         Command::Upgrade { version } => upgrade_cmd::run(version),
         Command::Explain { code } => {
             let parsed: luabox_diag::Code = code.parse().map_err(|_| {
-                anyhow::anyhow!("`{code}` is not a valid diagnostic code; codes look like LB0421")
+                anyhow::anyhow!("`{code}` is not a valid diagnostic code; codes look like LB0300")
             })?;
             match luabox_diag::explain(&parsed) {
                 Some(entry) => {
-                    println!("{}: {}\n\n{}", entry.code, entry.title, entry.explain);
+                    outln!("{}: {}\n\n{}", entry.code, entry.title, entry.explain);
                     Ok(())
                 }
-                None => bail!("no such diagnostic code `{parsed}`; codes look like LB0421"),
+                None => bail!("no such diagnostic code `{parsed}`; codes look like LB0300"),
             }
+        }
+        // No project, no filesystem, no flags: the schema is embedded in the
+        // binary, so this is a `cat` of a compile-time constant. That is the
+        // point — `luabox schema > luabox.schema.json` has to work anywhere,
+        // including in a directory that has no manifest to describe yet.
+        Command::Schema => {
+            outln!("{}", luabox_manifest::schema::json_schema().trim_end());
+            Ok(())
         }
         Command::Unmap { bundle, traceback } => {
             let text = if traceback.is_empty() {
@@ -256,6 +428,54 @@ mod tests {
             .kind()
     }
 
+    // -- error rendering ---------------------------------------------------
+
+    #[test]
+    fn a_bare_error_renders_as_one_error_line() {
+        let rendered = render_error(&anyhow::anyhow!("no such diagnostic code `LB9999`"));
+        assert_eq!(rendered, "Error: no such diagnostic code `LB9999`\n");
+    }
+
+    #[test]
+    fn a_single_source_renders_an_indented_caused_by_block() {
+        let error = anyhow::anyhow!("no such file").context("cannot read `luabox.toml`");
+        assert_eq!(
+            render_error(&error),
+            "Error: cannot read `luabox.toml`\n\nCaused by:\n    no such file\n"
+        );
+    }
+
+    #[test]
+    fn several_sources_are_numbered_outermost_first() {
+        let error = anyhow::anyhow!("connection refused")
+            .context("downloading SHA256SUMS")
+            .context("upgrading to v0.2.0");
+        assert_eq!(
+            render_error(&error),
+            "Error: upgrading to v0.2.0\n\nCaused by:\n   0: downloading SHA256SUMS\n   1: connection refused\n"
+        );
+    }
+
+    #[test]
+    fn a_multi_line_source_keeps_its_lines_under_the_same_indent() {
+        let error = anyhow::anyhow!("first\nsecond").context("invalid `luabox.toml`");
+        assert_eq!(
+            render_error(&error),
+            "Error: invalid `luabox.toml`\n\nCaused by:\n    first\n    second\n"
+        );
+    }
+
+    #[test]
+    fn the_rendering_never_carries_a_backtrace() {
+        // The whole point of rendering the chain by hand: `anyhow`'s `Debug`
+        // appends a `Stack backtrace:` dump whenever `RUST_BACKTRACE` is set,
+        // and a stripped release build renders those frames as `<unknown>`.
+        let error = anyhow::anyhow!("boom").context("while doing the thing");
+        let rendered = render_error(&error);
+        assert!(!rendered.contains("Stack backtrace"), "{rendered}");
+        assert!(!rendered.contains("<unknown>"), "{rendered}");
+    }
+
     #[test]
     fn the_cli_definition_is_internally_consistent() {
         // clap's own debug assertions catch conflicting/duplicated argument
@@ -282,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn the_subcommand_surface_is_exactly_these_eleven() {
+    fn the_subcommand_surface_is_exactly_these_twelve() {
         // The v1 scope cut (DIRECTION.md, 2026-07-26) made luabox a pure
         // static toolchain: no package manager, no registry client, no
         // interpreter. This is the whole surface — adding a command (even a
@@ -295,13 +515,26 @@ mod tests {
         actual.sort();
 
         let mut expected = [
-            "build", "check", "doc", "explain", "fmt", "init", "lint", "lsp", "new", "unmap",
-            "upgrade",
+            "build", "check", "doc", "explain", "fmt", "init", "lint", "lsp", "new", "schema",
+            "unmap", "upgrade",
         ];
         expected.sort_unstable();
 
         assert_eq!(actual, expected, "the CLI subcommand surface changed");
-        assert_eq!(actual.len(), 11);
+        assert_eq!(actual.len(), 12);
+
+        // ...and every one of them is documented. This used to be a second
+        // test with its own copy of the list above, which asserted that each
+        // name was *present* — something the exact-set comparison already
+        // covers — and then looped for `about`. Only the loop was load-bearing
+        // (LG-N5), so it lives here, next to the set it is about.
+        for sub in Cli::command().get_subcommands() {
+            assert!(
+                sub.get_about().is_some(),
+                "`{}` has no help text",
+                sub.get_name()
+            );
+        }
     }
 
     // -- init / new --------------------------------------------------------
@@ -381,7 +614,7 @@ mod tests {
             panic!("expected Check");
         };
         assert_eq!(target, None);
-        assert_eq!(format, "human");
+        assert_eq!(format, FormatArg::Human);
         assert!(!watch);
     }
 
@@ -396,7 +629,7 @@ mod tests {
             panic!("expected Check");
         };
         assert_eq!(target.as_deref(), Some("5.1"));
-        assert_eq!(format, "json");
+        assert_eq!(format, FormatArg::Json);
         assert!(watch);
     }
 
@@ -520,7 +753,7 @@ mod tests {
         assert_eq!(outfile, Some(PathBuf::from("app.lua")));
         assert!(sourcemap);
         assert!(minify);
-        assert_eq!(mode.as_deref(), Some("love"));
+        assert_eq!(mode, Some(ModeArg::Love));
     }
 
     #[test]
@@ -599,10 +832,37 @@ mod tests {
             reject(&["explain"]),
             clap::error::ErrorKind::MissingRequiredArgument
         );
-        let Command::Explain { code } = parse(&["explain", "LB0421"]) else {
+        let Command::Explain { code } = parse(&["explain", "LB0300"]) else {
             panic!("expected Explain");
         };
-        assert_eq!(code, "LB0421");
+        assert_eq!(code, "LB0300");
+    }
+
+    // -- schema ------------------------------------------------------------
+
+    #[test]
+    fn schema_takes_no_arguments_at_all() {
+        assert!(matches!(parse(&["schema"]), Command::Schema));
+        assert_eq!(
+            reject(&["schema", "--format", "json"]),
+            clap::error::ErrorKind::UnknownArgument,
+            "`schema` has no flags — it prints one document"
+        );
+    }
+
+    #[test]
+    fn schema_help_says_what_the_document_is_for() {
+        // The help line is the discovery path: someone scanning `--help` for
+        // a way to point their editor or an LLM at the manifest contract has
+        // to recognise this command as it.
+        let about = Cli::command()
+            .find_subcommand("schema")
+            .expect("subcommand exists")
+            .get_about()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert!(about.contains("JSON Schema"), "{about}");
+        assert!(about.contains("luabox.toml"), "{about}");
     }
 
     // -- unmap -------------------------------------------------------------
@@ -667,27 +927,25 @@ mod tests {
     }
 
     #[test]
-    fn every_subcommand_is_reachable_and_documented() {
-        let command = Cli::command();
-        let names: Vec<&str> = command
-            .get_subcommands()
-            .map(clap::Command::get_name)
-            .collect();
-        for expected in [
-            "init", "new", "check", "lint", "fmt", "build", "doc", "lsp", "upgrade", "explain",
-            "unmap",
-        ] {
-            assert!(
-                names.contains(&expected),
-                "`{expected}` is missing: {names:?}"
-            );
-        }
-        for sub in command.get_subcommands() {
-            assert!(
-                sub.get_about().is_some(),
-                "`{}` has no help text",
-                sub.get_name()
-            );
+    fn the_bin_flag_documents_itself_as_the_explicit_default() {
+        // `--bin` and no flag at all scaffold the same project, so its help
+        // has to say so — otherwise it reads as the opposite of `--lib`, i.e.
+        // as something you have to pass (LG-N11). Both scaffolding commands
+        // carry the same flag, so both are pinned.
+        for name in ["init", "new"] {
+            let sub = Cli::command()
+                .find_subcommand(name)
+                .expect("subcommand exists")
+                .clone();
+            let help = sub
+                .get_arguments()
+                .find(|a| a.get_id() == "bin")
+                .and_then(clap::Arg::get_help)
+                .map_or_else(
+                    || panic!("`{name} --bin` has help text"),
+                    ToString::to_string,
+                );
+            assert!(help.contains("the default"), "{name}: {help}");
         }
     }
 }

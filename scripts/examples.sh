@@ -9,7 +9,8 @@
 # because a compiler that emits a file nobody ever executes is only checked
 # against its own opinion of the file. The interpreter is a property of the
 # harness, not of the product: with no lua5.1 on PATH the run step SKIPs
-# loudly and the script stays green.
+# loudly and the script stays green. `unzip` — used only to look inside the
+# packaged .love — is treated the same way.
 #
 # Usage: bash scripts/examples.sh
 # Honours $LUABOX (path to the luabox binary); defaults to target/release/luabox.
@@ -45,6 +46,21 @@ else
     echo "    (install lua5.1 to run this check locally; CI always runs it)"
 fi
 
+# The archive inspector used to look inside the packaged .love. Like lua5.1
+# it belongs to the harness, not to luabox — luabox builds the .love either
+# way — so with no unzip on PATH the inspection step SKIPs and the gate still
+# passes (examples/README.md says so; this is what makes that true).
+UNZIP=""
+if command -v unzip >/dev/null 2>&1; then
+    UNZIP="unzip"
+fi
+if [ -n "$UNZIP" ]; then
+    echo "==> inspecting packaged archives with: $UNZIP ($(command -v "$UNZIP"))"
+else
+    echo "==> SKIP: no unzip on PATH — the packaged .love will not be inspected"
+    echo "    (install unzip to run this check locally; CI always runs it)"
+fi
+
 fails=0
 pass() { echo "    ok   $1"; }
 skip() { echo "    SKIP $1"; }
@@ -63,7 +79,6 @@ run() {
 }
 
 gate() {
-    local dir="$1"
     run "check"        -- "$LUABOX" check
     run "fmt --check"  -- "$LUABOX" fmt --check
     run "lint"         -- "$LUABOX" lint
@@ -73,28 +88,28 @@ section() { echo; echo "== $1 =="; }
 
 # 1. hello-luabox --------------------------------------------------------------
 section "hello-luabox"
-cd "$examples/hello-luabox"
-gate .
+cd "$examples/hello-luabox" || { echo "error: missing example dir: $examples/hello-luabox" >&2; exit 1; }
+gate
 
 # 2. geometry ------------------------------------------------------------------
 section "geometry"
-cd "$examples/geometry"
-gate .
+cd "$examples/geometry" || { echo "error: missing example dir: $examples/geometry" >&2; exit 1; }
+gate
 
 # 3. renderer (path dep — cross-package types, read in place) -----------------
 section "renderer"
-cd "$examples/renderer"
-gate .
+cd "$examples/renderer" || { echo "error: missing example dir: $examples/renderer" >&2; exit 1; }
+gate
 
 # 4. legacy-inifile ------------------------------------------------------------
 section "legacy-inifile"
-cd "$examples/legacy-inifile"
-gate .
+cd "$examples/legacy-inifile" || { echo "error: missing example dir: $examples/legacy-inifile" >&2; exit 1; }
+gate
 
 # 5. timemachine (build tree + bundle + run the lowered output) ---------------
 section "timemachine"
-cd "$examples/timemachine"
-gate .
+cd "$examples/timemachine" || { echo "error: missing example dir: $examples/timemachine" >&2; exit 1; }
+gate
 # Config bundles to dist/timemachine.lua (minified, with a .map); --no-bundle
 # forces the mirrored tree emit under dist/src/ instead.
 run "build --no-bundle" -- "$LUABOX" build --no-bundle
@@ -114,22 +129,26 @@ fi
 
 # 6. love-asteroids-lite (bundle a .love and check its contents) --------------
 section "love-asteroids-lite"
-cd "$examples/love-asteroids-lite"
-gate .
+cd "$examples/love-asteroids-lite" || { echo "error: missing example dir: $examples/love-asteroids-lite" >&2; exit 1; }
+gate
 # `[build] mode = "love"` makes a bare `luabox build` package the .love.
 run "build (.love via mode=love)" -- "$LUABOX" build
-if unzip -l dist/asteroids-lite.love >/tmp/lb_ex_out 2>&1 \
-    && grep -q "main.lua" /tmp/lb_ex_out && grep -q "conf.lua" /tmp/lb_ex_out; then
-    pass ".love contains main.lua + conf.lua"
+if [ -n "$UNZIP" ]; then
+    if "$UNZIP" -l dist/asteroids-lite.love >/tmp/lb_ex_out 2>&1 \
+        && grep -q "main.lua" /tmp/lb_ex_out && grep -q "conf.lua" /tmp/lb_ex_out; then
+        pass ".love contains main.lua + conf.lua"
+    else
+        fail ".love contains main.lua + conf.lua"; sed 's/^/         | /' /tmp/lb_ex_out >&2
+    fi
 else
-    fail ".love contains main.lua + conf.lua"; sed 's/^/         | /' /tmp/lb_ex_out >&2
+    skip ".love contains main.lua + conf.lua (no unzip on PATH)"
 fi
 
 # 7. workspace (check fans out; gate a member standalone) ---------------------
 section "workspace"
-cd "$examples/workspace"
-gate .
-cd "$examples/workspace/packages/core"
+cd "$examples/workspace" || { echo "error: missing example dir: $examples/workspace" >&2; exit 1; }
+gate
+cd "$examples/workspace/packages/core" || { echo "error: missing example dir: $examples/workspace/packages/core" >&2; exit 1; }
 run "check (core member)" -- "$LUABOX" check
 
 echo

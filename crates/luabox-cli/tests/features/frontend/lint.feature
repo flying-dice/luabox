@@ -102,6 +102,73 @@ Feature: luabox lint — type-informed lint rules (clippy analog)
     Then the command succeeds
     And stderr contains "0 errors, 0 warnings"
 
+  Scenario: a typo'd [lint] rule id is reported instead of silently doing nothing
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [lint]
+      unused-locl = "allow"
+      """
+    And a file "src/main.lua" containing:
+      """
+      local x = 1
+      return 0
+      """
+    When I run "luabox lint"
+    # A warning, not an error: the entry is inert, so the exit code is unchanged.
+    Then the command succeeds
+    And stdout contains "LB1004"
+    And stdout contains "unknown lint rule id `unused-locl` in `[lint]`"
+    And stdout contains "did you mean `unused-local`?"
+    And stdout contains "this `[lint]` entry has no effect"
+    # ...and the rule the entry failed to silence is still firing.
+    And stdout contains "LB0501"
+
+  Scenario: a typo'd [lint] tier name is nudged back at the tier
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [lint]
+      pedantics = "warn"
+      """
+    And a file "src/main.lua" containing:
+      """
+      return 0
+      """
+    When I run "luabox lint"
+    Then the command succeeds
+    And stdout contains "unknown lint rule id `pedantics` in `[lint]`"
+    And stdout contains "did you mean `pedantic`?"
+
+  Scenario: a correctly spelled [lint] rule id produces no config warning
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [lint]
+      unused-local = "allow"
+      """
+    And a file "src/main.lua" containing:
+      """
+      local x = 1
+      return 0
+      """
+    When I run "luabox lint"
+    Then the command succeeds
+    And stdout does not contain "LB1004"
+    And stderr contains "0 errors, 0 warnings"
+
   Scenario: a typo'd global read is flagged as undefined-global
     Given a file "src/main.lua" containing:
       """

@@ -20,12 +20,19 @@ luabox new hello
 cd hello
 ```
 
-`luabox new` scaffolds a project — a `luabox.toml` manifest, a `.gitignore`,
-and `src/main.lua`:
+`luabox new` scaffolds a project — a `luabox.toml` manifest, a
+`hello-0.1.0-1.rockspec`, a `.gitignore`, and `src/main.lua`:
 
 ```
 Created binary project `hello` (edition 5.4)
 ```
+
+The two manifests split by ownership, and neither is generated from the
+other. `luabox.toml` is luabox's own configuration — `edition`, `[build]`,
+`[types]`, `[lint]`. The rockspec is the *ecosystem's* manifest, the one
+luarocks reads: your package's name, version, and dependencies live there,
+so anyone can `luarocks install` your project without luabox. luabox scaffolds
+it and then leaves it alone — it neither edits nor resolves it.
 
 Write an annotated function in `src/main.lua`. The `---@param` / `---@return`
 comments are ordinary LuaCATS — the same annotations lua-language-server reads:
@@ -72,8 +79,8 @@ lint: 0 errors, 0 warnings in 1 files
 ```
 
 That is the whole loop — one binary for check, format, and lint, no build
-config, and nothing spawned: luabox reads your sources, it never executes
-them. Run the program with whatever Lua you already have. See
+config, and no interpreter anywhere: luabox reads your sources, it never
+executes them. Run the program with whatever Lua you already have. See
 [`examples/`](examples/) for larger, real projects —
 a LÖVE game, a multi-package workspace, and a 5.4-to-5.1 cross-version lowering
 demo.
@@ -83,7 +90,7 @@ demo.
 Prebuilt binaries are attached to every tagged
 [GitHub release](https://github.com/flying-dice/luabox/releases) (`v*`, built
 by [`.github/workflows/release.yml`](.github/workflows/release.yml) — see
-[RELEASING.md](RELEASING.md)). The one-line installers fetch the latest one:
+[RELEASING.md](docs/02-guides/01-releasing.md)). The one-line installers fetch the latest one:
 
 ```sh
 # Linux / macOS
@@ -127,7 +134,7 @@ lua-language-server. luabox's edge is that it treats those annotations as
 
 All on stock LuaCATS — there is no second, luabox-specific type file format.
 See [DIRECTION.md](DIRECTION.md) for the governing decision record and
-[SPEC.md](SPEC.md) for the full design.
+[SPEC.md](docs/03-reference/01-spec.md) for the full design.
 
 ## Editor setup
 
@@ -145,7 +152,7 @@ definition/type-definition/implementation, find-references, rename, document
 tokens, formatting, folding and selection ranges; `.lua` files), resolving
 the `luabox` binary from `PATH` (overridable in settings). Neither is on its
 marketplace yet
-([#102](LIMITATIONS.md#editor-extensions-are-not-on-marketplaces-yet-102)).
+([#102](docs/03-reference/02-limitations.md#editor-extensions-are-not-on-marketplaces-yet-102)).
 Any other editor can point its LSP client at `luabox lsp`.
 
 ## Limitations
@@ -158,7 +165,7 @@ artifacts from its own repo's releases). The full LuaCATS tag vocabulary is
 enforced.
 Every remaining gap is
 documented honestly in
-[**LIMITATIONS.md**](LIMITATIONS.md). Read it before you rely on luabox for
+[**LIMITATIONS.md**](docs/03-reference/02-limitations.md). Read it before you rely on luabox for
 anything load-bearing.
 
 ---
@@ -177,6 +184,44 @@ anything load-bearing.
 | `lsp` | language server: diagnostics + quick-fixes, completion (auto-require), hover, goto def/type/impl, references, rename, symbols, signature help, call hierarchy, inlay hints, semantic tokens, formatting |
 | `doc` | static docs from annotations |
 | `explain LBnnnn` | rustc-style diagnostic pages |
+| `schema` | print the JSON Schema (draft 2020-12) for `luabox.toml` — point an editor, a validator or an LLM at the whole manifest contract |
+
+> **`build --mode love` needs an external zip tool on `PATH`.** A `.love`
+> file *is* a zip archive and luabox carries no zip implementation, so
+> packaging is the one build step that shells out: `zip`, else
+> `python3 -m zipfile`, else `python -m zipfile` on Linux/macOS; the
+> System32 `bsdtar`, else PowerShell's `Compress-Archive`, on Windows. With
+> none of them available the build fails loudly, naming every tool it tried
+> — it never leaves a partial `.love` behind. It archives the output luabox
+> just emitted; no Lua is executed. No other build step spawns anything,
+> `mode = "nvim-plugin"` included — across the whole CLI the only commands
+> that start a child process are this packaging step, `upgrade`, and
+> `doc --open` (see [DIRECTION.md](DIRECTION.md)).
+
+### Coding assistance for `luabox.toml`: `luabox schema`
+
+`luabox.toml` is described in full by a JSON Schema (draft 2020-12) that the
+binary carries — every table, every key, every default, every closed
+vocabulary (`edition`, `build.target`, `build.mode`, lint levels) and every
+mutually-exclusive dependency form, each with a prose description. Write it
+out and point your tooling at it:
+
+```sh
+luabox schema > luabox.schema.json
+```
+
+Editors and validators get completion and inline errors for the manifest; an
+LLM handed that one file can write a correct `luabox.toml` without guessing.
+The schema describes the manifest's *data model* — you write TOML, tooling
+maps it to JSON with the standard mapping and validates that.
+
+It cannot go stale: the schema is *generated* from the same declarative key
+table `luabox` validates manifests against, so its key sets, enums and
+required fields are the parser's own rather than a copy of them. What that
+table cannot express — above all the mutually exclusive dependency source
+forms — is held in place by running every example manifest plus a curated
+valid/invalid corpus through both the schema and `luabox` itself, demanding
+the same verdict from each.
 
 ### Shipping a bundle: crash-to-source with `unmap`
 
@@ -262,7 +307,7 @@ Cargo workspace, one crate per bounded context (SPEC.md §16):
 | `luabox-db` | incremental query database |
 | `luabox-lower` | target lowering + polyfills |
 | `luabox-bundle` | require-graph, tree-shake, minify, sourcemaps |
-| `luabox-resolve` | `luabox.toml` manifest model: validation, round-tripping |
+| `luabox-manifest` | `luabox.toml` manifest model + project layout: discovery, source walk, `[types] defs` |
 | `luabox-lsp` | language server |
 | `luabox-cli` | the `luabox` binary |
 
@@ -288,7 +333,7 @@ execution against real runtimes in CI. Prebuilt binaries are attached to each
 [GitHub release](https://github.com/flying-dice/luabox/releases); editor
 extensions release from their own repos;
 not yet published to a package registry (crates.io, Homebrew, etc.). Luau is
-explicitly out of scope. See [LIMITATIONS.md](LIMITATIONS.md) for known gaps.
+explicitly out of scope. See [LIMITATIONS.md](docs/03-reference/02-limitations.md) for known gaps.
 
 ## License
 

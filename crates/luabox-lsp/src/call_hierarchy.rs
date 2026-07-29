@@ -300,7 +300,7 @@ fn find_decl_item(
 /// (`function f`, `local function f`, `M.g`, `C:m`) or a call/name use that
 /// resolves to a declaration. Returns a single-item vector (or `None`).
 #[must_use]
-pub fn prepare(
+pub fn prepare_call_hierarchy(
     analysis: &Analysis,
     sema: &FileSema,
     offset: usize,
@@ -510,7 +510,7 @@ mod tests {
         let sema = sema_for(&analysis, &path);
         // Cursor on the `greet` in the declaration.
         let offset = offset_of(src, "greet") + 1;
-        let items = prepare(&analysis, &sema, offset).expect("prepare");
+        let items = prepare_call_hierarchy(&analysis, &sema, offset).expect("prepare");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "greet");
         assert_eq!(items[0].kind, SymbolKind::FUNCTION);
@@ -526,7 +526,7 @@ mod tests {
         let sema = sema_for(&analysis, &path);
         // Cursor on the `greet` call on line 1.
         let offset = src.rfind("greet").expect("call") + 1;
-        let items = prepare(&analysis, &sema, offset).expect("prepare");
+        let items = prepare_call_hierarchy(&analysis, &sema, offset).expect("prepare");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "greet");
         // Points back at the declaration on line 0, not the call site.
@@ -547,7 +547,7 @@ end
         let (analysis, path) = analyze(&[("main.lua", src)]);
         let sema = sema_for(&analysis, &path);
         let offset = offset_of(src, "caller") + 1;
-        let item = prepare(&analysis, &sema, offset).expect("prepare")[0].clone();
+        let item = prepare_call_hierarchy(&analysis, &sema, offset).expect("prepare")[0].clone();
         let calls = outgoing_calls(&analysis, &sema, &item);
         let names: Vec<&str> = calls.iter().map(|c| c.to.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b"], "{calls:?}");
@@ -572,7 +572,7 @@ end
         let (analysis, path) = analyze(&[("main.lua", src)]);
         let sema = sema_for(&analysis, &path);
         let offset = offset_of(src, "outer") + 1;
-        let item = prepare(&analysis, &sema, offset).expect("prepare")[0].clone();
+        let item = prepare_call_hierarchy(&analysis, &sema, offset).expect("prepare")[0].clone();
         let calls = outgoing_calls(&analysis, &sema, &item);
         let names: Vec<&str> = calls.iter().map(|c| c.to.name.as_str()).collect();
         // Only the direct `inner()` call; `inner_target()` belongs to `inner`.
@@ -590,7 +590,7 @@ end
         let (analysis, path) = analyze(&[("main.lua", src)]);
         let sema = sema_for(&analysis, &path);
         let offset = offset_of(src, "caller") + 1;
-        let item = prepare(&analysis, &sema, offset).expect("prepare")[0].clone();
+        let item = prepare_call_hierarchy(&analysis, &sema, offset).expect("prepare")[0].clone();
         // Neither `print` nor `undefined_global` is a workspace declaration.
         assert!(outgoing_calls(&analysis, &sema, &item).is_empty());
     }
@@ -613,7 +613,7 @@ end
         let sema = sema_for(&analysis, &a_path);
         // Prepare on the `greet` declaration in a.lua.
         let offset = offset_of("function greet() return 1 end\n", "greet");
-        let item = prepare(&analysis, &sema, offset).expect("prepare")[0].clone();
+        let item = prepare_call_hierarchy(&analysis, &sema, offset).expect("prepare")[0].clone();
         let calls = incoming_calls(&analysis, &sema, &item);
         assert_eq!(calls.len(), 1, "one caller: {calls:?}");
         assert_eq!(calls[0].from.name, "useGreet");
@@ -636,7 +636,7 @@ end
             .to_path_buf();
         let sema = sema_for(&analysis, &a_path);
         let offset = offset_of("function greet() return 1 end\n", "greet");
-        let item = prepare(&analysis, &sema, offset).expect("prepare")[0].clone();
+        let item = prepare_call_hierarchy(&analysis, &sema, offset).expect("prepare")[0].clone();
         let calls = incoming_calls(&analysis, &sema, &item);
         assert_eq!(calls.len(), 1, "{calls:?}");
         assert_eq!(calls[0].from.kind, SymbolKind::MODULE);
@@ -660,7 +660,8 @@ end
 
         // Outgoing of `C:run` finds the dotted `M.helper` callee.
         let run_off = offset_of(src, "C:run") + 2;
-        let run_item = prepare(&analysis, &sema, run_off).expect("prepare")[0].clone();
+        let run_item =
+            prepare_call_hierarchy(&analysis, &sema, run_off).expect("prepare")[0].clone();
         assert_eq!(run_item.name, "C:run");
         let run_out = outgoing_calls(&analysis, &sema, &run_item);
         assert_eq!(run_out.len(), 1, "{run_out:?}");
@@ -683,8 +684,9 @@ worker()
 ";
         let (analysis, path) = analyze(&[("main.lua", src)]);
         let sema = sema_for(&analysis, &path);
-        let item =
-            prepare(&analysis, &sema, offset_of(src, "worker") + 1).expect("prepare")[0].clone();
+        let item = prepare_call_hierarchy(&analysis, &sema, offset_of(src, "worker") + 1)
+            .expect("prepare")[0]
+            .clone();
         assert_eq!(item.name, "worker");
         // Its body is the `function` expression, so its callees are found.
         let out = outgoing_calls(&analysis, &sema, &item);
@@ -701,7 +703,8 @@ worker()
         let (analysis, path) =
             analyze(&[("main.lua", caller), ("lib.lua", "function helper() end\n")]);
         let sema = sema_for(&analysis, &path);
-        let items = prepare(&analysis, &sema, offset_of(caller, "helper") + 1).expect("prepare");
+        let items = prepare_call_hierarchy(&analysis, &sema, offset_of(caller, "helper") + 1)
+            .expect("prepare");
         assert_eq!(items[0].name, "helper");
         assert!(items[0].uri.as_str().ends_with("lib.lua"), "{items:?}");
     }
@@ -717,7 +720,7 @@ M.helper()
         let sema = sema_for(&analysis, &path);
         // Cursor on the `helper` of the `M.helper()` call.
         let offset = src.rfind("helper").expect("call") + 1;
-        let items = prepare(&analysis, &sema, offset).expect("prepare");
+        let items = prepare_call_hierarchy(&analysis, &sema, offset).expect("prepare");
         assert_eq!(items[0].name, "M.helper");
         assert_eq!(items[0].selection_range.start.line, 1);
     }
@@ -733,7 +736,7 @@ M.helper()
         let sema = sema_for(&analysis, &path);
         // Cursor on the receiver `M` of `M.helper()`, not the member.
         let offset = src.rfind("M.helper").expect("call");
-        assert!(prepare(&analysis, &sema, offset).is_none());
+        assert!(prepare_call_hierarchy(&analysis, &sema, offset).is_none());
     }
 
     #[test]
@@ -742,12 +745,12 @@ M.helper()
         let (analysis, path) = analyze(&[("main.lua", src)]);
         let sema = sema_for(&analysis, &path);
         // A table-constructor key is neither a declaration nor a call.
-        assert!(prepare(&analysis, &sema, offset_of(src, "key")).is_none());
+        assert!(prepare_call_hierarchy(&analysis, &sema, offset_of(src, "key")).is_none());
         // And a name that resolves to no declaration anywhere.
         let unknown = "missing()\n";
         let (analysis, path) = analyze(&[("other.lua", unknown)]);
         let sema = sema_for(&analysis, &path);
-        assert!(prepare(&analysis, &sema, offset_of(unknown, "missing")).is_none());
+        assert!(prepare_call_hierarchy(&analysis, &sema, offset_of(unknown, "missing")).is_none());
     }
 
     #[test]
@@ -760,8 +763,9 @@ end
 ";
         let (analysis, path) = analyze(&[("main.lua", src)]);
         let sema = sema_for(&analysis, &path);
-        let item =
-            prepare(&analysis, &sema, offset_of(src, "caller") + 1).expect("prepare")[0].clone();
+        let item = prepare_call_hierarchy(&analysis, &sema, offset_of(src, "caller") + 1)
+            .expect("prepare")[0]
+            .clone();
         assert!(outgoing_calls(&analysis, &sema, &item).is_empty());
     }
 
@@ -775,8 +779,9 @@ end
 ";
         let (analysis, path) = analyze(&[("main.lua", src)]);
         let sema = sema_for(&analysis, &path);
-        let item =
-            prepare(&analysis, &sema, offset_of(src, "caller") + 1).expect("prepare")[0].clone();
+        let item = prepare_call_hierarchy(&analysis, &sema, offset_of(src, "caller") + 1)
+            .expect("prepare")[0]
+            .clone();
         // The base is an index expression, so the chain has no dotted name.
         assert!(outgoing_calls(&analysis, &sema, &item).is_empty());
     }
@@ -790,8 +795,9 @@ end
         ]);
         let lib_path = main_path.parent().expect("parent").join("lib.lua");
         let lib_sema = sema_for(&analysis, &lib_path);
-        let item =
-            prepare(&analysis, &lib_sema, offset_of(lib, "there") + 1).expect("prepare")[0].clone();
+        let item = prepare_call_hierarchy(&analysis, &lib_sema, offset_of(lib, "there") + 1)
+            .expect("prepare")[0]
+            .clone();
         // `main.lua` declares nothing at that selection range.
         let main_sema = sema_for(&analysis, &main_path);
         assert!(outgoing_calls(&analysis, &main_sema, &item).is_empty());
@@ -810,8 +816,9 @@ end
 ";
         let (analysis, path) = analyze(&[("main.lua", src)]);
         let sema = sema_for(&analysis, &path);
-        let item =
-            prepare(&analysis, &sema, offset_of(src, "target") + 1).expect("prepare")[0].clone();
+        let item = prepare_call_hierarchy(&analysis, &sema, offset_of(src, "target") + 1)
+            .expect("prepare")[0]
+            .clone();
         let incoming = incoming_calls(&analysis, &sema, &item);
         let names: Vec<&str> = incoming.iter().map(|c| c.from.name.as_str()).collect();
         // Same file, so ordering follows declaration position, not name.

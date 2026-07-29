@@ -9,6 +9,7 @@ use luabox_hir::{Expr, HirId, Resolution, Stmt};
 use crate::context::LintContext;
 use crate::diagnostic::LintDiagnostic;
 use crate::rule::{Rule, Tier};
+use crate::suggest;
 
 /// A name reference resolving to [`Resolution::Global`] that is not:
 ///
@@ -114,51 +115,19 @@ impl Rule for UndefinedGlobal {
 }
 
 /// The closest known-global name within edit distance 1-2, if any — the
-/// "did you mean" hint (ticket #103's `prnit` → `print` example). Ties are
-/// broken by shortest distance, then alphabetically, for determinism.
-fn did_you_mean(
+/// "did you mean" hint (ticket #103's `prnit` → `print` example). The
+/// distance/tie-breaking is [`crate::suggest`]'s, shared with the unknown
+/// `[lint]` rule-id nudge.
+fn did_you_mean<'a>(
     name: &str,
-    known: &HashSet<String>,
-    file_globals: &HashSet<&str>,
-) -> Option<String> {
-    let mut best: Option<(usize, &str)> = None;
-    for candidate in known
-        .iter()
-        .map(String::as_str)
-        .chain(file_globals.iter().copied())
-    {
-        let dist = levenshtein(name, candidate);
-        if dist == 0 || dist > 2 {
-            continue;
-        }
-        let better = match best {
-            None => true,
-            Some((best_dist, best_name)) => {
-                dist < best_dist || (dist == best_dist && candidate < best_name)
-            }
-        };
-        if better {
-            best = Some((dist, candidate));
-        }
-    }
-    best.map(|(_, name)| name.to_owned())
-}
-
-/// Plain Levenshtein edit distance (insert/delete/substitute). Identifiers
-/// are ASCII, so byte-wise comparison is exact — no need for Unicode
-/// grapheme handling.
-fn levenshtein(a: &str, b: &str) -> usize {
-    let a = a.as_bytes();
-    let b = b.as_bytes();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    let mut cur = vec![0usize; b.len() + 1];
-    for i in 1..=a.len() {
-        cur[0] = i;
-        for j in 1..=b.len() {
-            let cost = usize::from(a[i - 1] != b[j - 1]);
-            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
-        }
-        std::mem::swap(&mut prev, &mut cur);
-    }
-    prev[b.len()]
+    known: &'a HashSet<String>,
+    file_globals: &HashSet<&'a str>,
+) -> Option<&'a str> {
+    suggest::closest(
+        name,
+        known
+            .iter()
+            .map(String::as_str)
+            .chain(file_globals.iter().copied()),
+    )
 }

@@ -17,19 +17,40 @@
 //! would buy no caller anything. Library crates in the workspace keep their
 //! typed errors; the buck stops at this application boundary.
 //!
-//! # Tranche 1 features (this crate today)
+//! # Features (this crate today)
 //!
-//! - **Streamed diagnostics** — parse errors, dialect legality, and type
+//! The list below is the dispatch table in `server.rs` written out; if a
+//! request is handled there it is claimed here, and nowhere else.
+//!
+//! - **Streamed diagnostics** — parse errors, dialect legality, type and lint
 //!   diagnostics pushed after every open/change/close.
 //! - **Hover** — binding types from `---@type`/`---@param`, function
 //!   signatures from `@param`/`@return`, class fields, with LuaCATS doc text.
-//! - **Goto definition** — locals/upvalues via HIR name resolution, class
-//!   fields to their `---@field` site, functions to their declaration,
-//!   `require("mod")` to the module file.
+//! - **Goto definition / type definition / implementation** — locals and
+//!   upvalues via HIR name resolution, class fields to their `---@field`
+//!   site, functions to their declaration, `require("mod")` to the module
+//!   file; type-definition and implementation resolve against the
+//!   workspace-global class graph (see [`goto_type_definition`],
+//!   [`goto_implementation`]).
+//! - **Find references + rename** — every use of a binding, class or field
+//!   across the workspace ([`references`]), and `prepare`-gated rename
+//!   driving the same resolution ([`rename`]).
 //! - **Completion** — `.`/`:` member completion on class-typed receivers;
-//!   scope-visible locals, file globals, and keywords elsewhere.
-//! - **Document symbols** — functions (nested, with containers), top-level
-//!   locals, `---@class` declarations.
+//!   scope-visible locals, file globals, and keywords elsewhere; plus
+//!   tsc-style **auto-require imports** that insert the `require` line with
+//!   the item.
+//! - **Code actions** — machine-applicable lint quick-fixes, plus the
+//!   type-driven refactors in [`code_action`] (add-missing-field,
+//!   annotate-local-from-inference, generate-class-from-literal,
+//!   dot/colon conversion).
+//! - **Call hierarchy** — `prepare`, incoming and outgoing calls
+//!   ([`call_hierarchy`]).
+//! - **Document + workspace symbols** — functions (nested, with containers),
+//!   top-level locals, `---@class` declarations ([`symbols`]); the flat
+//!   `workspace/symbol` counterpart adds the workspace-global `---@alias` and
+//!   `---@enum` declarations, which no single file's tree owns.
+//! - **Document highlight, folding ranges, selection ranges** — read/write
+//!   occurrence highlighting and the two structural range families.
 //! - **Formatting** — whole-document and range (MVP: range formats the whole
 //!   document, see [`fmt`]) via the canonical formatters; parse errors yield
 //!   no edits, never an error.
@@ -42,8 +63,25 @@
 //!   cursor sits inside a call's argument list, with the active parameter
 //!   and `---@overload` alternates (see [`signature_help`]).
 //!
-//! The remaining SPEC §8 surface (find-refs, rename, code actions, call
-//! hierarchy, TCP transport) is P4 polish.
+//! # Handler naming
+//!
+//! Each handler module exposes one entry point per LSP request it serves,
+//! named for that request's method: the `textDocument/`, `workspace/` and
+//! `callHierarchy/` prefix dropped, converted to snake case, pluralised when
+//! the reply is a list. So `hover::hover`, `goto_definition::definition`,
+//! `folding::folding_ranges`, `call_hierarchy::incoming_calls`. `Server`'s
+//! wrapper for each carries that same name, which is what makes the dispatch
+//! table in `server.rs` readable as the method list it is. Where a module's
+//! name and its entry point's coincide the stutter stands — it is the price of
+//! having one rule rather than a judgement call per module.
+//!
+//! Of the request handlers SPEC §8 asks for, all are dispatched. What is
+//! still outstanding there is transport and trimmings: **TCP** (stdio is the
+//! only transport — [`run_stdio`]; `luabox lsp --stdio` accepts the flag
+//! editors pass and ignores it, because there is nothing to switch away
+//! from), plus postfix snippets, on-type formatting, the extract/inline and
+//! sort-requires code actions, and the persistent mmap index cache. None of
+//! those is claimed above; if it is not in the list, it is not handled.
 
 mod call_hierarchy;
 mod code_action;
@@ -52,9 +90,9 @@ mod diagnostics;
 mod document_highlight;
 mod fmt;
 mod folding;
-mod goto_def;
-mod goto_impl;
-mod goto_type;
+mod goto_definition;
+mod goto_implementation;
+mod goto_type_definition;
 mod hover;
 mod inlay_hints;
 mod line_index;

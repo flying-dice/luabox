@@ -12,6 +12,12 @@ luabox-syntax.workspace = true
 luabox-hir.workspace = true
 luabox-types.workspace = true
 luabox-diag.workspace = true
+# The `[lint]` vocabulary (`LintLevel`, `LintTier`) lives with the manifest
+# model; this crate re-exports it and owns the one mapping onto its own
+# `Level`/`Tier`, so `luabox-cli` and `luabox-lsp` share it instead of each
+# keeping a keyword-string translation (CC-M8). Acyclic: `luabox-manifest`
+# depends on nothing in this workspace.
+luabox-manifest.workspace = true
 rowan.workspace = true
 
 [lints]

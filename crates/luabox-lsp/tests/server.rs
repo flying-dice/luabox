@@ -1816,6 +1816,38 @@ fn workspace_symbols_match_a_class_and_a_function_across_two_files() {
 }
 
 #[test]
+fn a_vendored_lua_modules_file_is_not_indexed() {
+    // `lua_modules/` is whatever `luarocks install --tree lua_modules`
+    // materialized — vendored code, not project source. The bootstrap index
+    // skips it at every depth, exactly as `luabox check`'s walk does, so the
+    // editor's picture of the workspace is CI's.
+    let mut client = start(&[
+        ("src/main.lua", "function projectSymbol() return 1 end\n"),
+        (
+            "lua_modules/share/lua/5.4/pl/tablex.lua",
+            "function vendoredSymbol() return 1 end\n",
+        ),
+        (
+            "packages/core/lua_modules/dep/init.lua",
+            "function nestedVendoredSymbol() return 1 end\n",
+        ),
+    ]);
+
+    let names: Vec<String> = client
+        .workspace_symbols("")
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert!(names.iter().any(|n| n == "projectSymbol"), "{names:?}");
+    assert!(!names.iter().any(|n| n == "vendoredSymbol"), "{names:?}");
+    assert!(
+        !names.iter().any(|n| n == "nestedVendoredSymbol"),
+        "{names:?}"
+    );
+    client.shutdown();
+}
+
+#[test]
 fn workspace_symbols_query_is_case_insensitive() {
     let client = start(&[("main.lua", "function computeArea() return 1 end\n")]);
     let uri = client.uri("main.lua");
@@ -3494,6 +3526,46 @@ fn no_watchers_are_registered_without_dynamic_registration() {
 fn the_server_exits_cleanly_when_the_client_disconnects() {
     // No shutdown/exit handshake: closing the channel ends the message loop.
     start(&[]).disconnect();
+}
+
+#[test]
+fn a_malformed_initialize_is_refused_on_the_id_the_client_is_waiting_on() {
+    // A `rootUri` the URI grammar rejects — an unencoded space, which a
+    // client whose project lives in `~/my projects` can genuinely emit. The
+    // handshake cannot proceed (there is no workspace to serve), but the
+    // client is blocked on this id, so it is answered rather than left
+    // watching a pipe close.
+    let (server_conn, client) = Connection::memory();
+    let server = std::thread::spawn(move || luabox_lsp::run(server_conn));
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            RequestId::from(0),
+            "initialize".to_string(),
+            serde_json::json!({
+                "processId": serde_json::Value::Null,
+                "rootUri": "file:///my projects",
+                "capabilities": {},
+            }),
+        )))
+        .expect("send");
+
+    let response = match client
+        .receiver
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the server answered")
+    {
+        Message::Response(response) => response,
+        other => panic!("expected a response, got {other:?}"),
+    };
+    let error = response.error.expect("an error response");
+    assert_eq!(error.code, lsp_server::ErrorCode::InvalidParams as i32);
+    assert!(error.message.contains("initialize"), "{}", error.message);
+    // And the session ends: an unusable handshake is terminal.
+    assert!(
+        server.join().expect("server thread panicked").is_err(),
+        "a malformed initialize ends the run"
+    );
 }
 
 // === Protocol maturity: manifest-driven reconfiguration ==================

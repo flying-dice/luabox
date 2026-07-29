@@ -5,10 +5,11 @@
 //! the same set of prebuilt targets. With no argument it installs the latest
 //! release; given `0.1.0` or `v0.1.0` it installs that exact tag.
 //!
-//! ## House divergences from the shared toolchain conventions
+//! ## No new dependencies for the self-update path
 //!
-//! No HTTP crate is linked (SPEC.md §6): downloads shell out to `curl -fsSL`
-//! exactly as the install scripts do. The
+//! `upgrade` is the one command that reaches the network, and it earns that
+//! by adding no transport dependency to the workspace: downloads shell out to
+//! `curl -fsSL` exactly as the install scripts do. The
 //! release archive is unpacked with `tar` — `tar -xzf` for the unix `.tar.gz`
 //! and `tar -xf` for the Windows `.zip` (the bundled `bsdtar` in `System32`
 //! reads zip natively) — so no `zip`/`flate2` crate is pulled in. Only the
@@ -20,6 +21,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
+
+use crate::emit::outln;
 
 /// The release repository, matching the install scripts.
 const REPO: &str = "flying-dice/luabox";
@@ -36,16 +39,16 @@ pub fn run(version: Option<String>) -> Result<()> {
 
     let current = env!("CARGO_PKG_VERSION");
     if !explicit && tag.trim_start_matches('v') == current {
-        println!("luabox is already up to date (v{current}).");
+        outln!("luabox is already up to date (v{current}).");
         return Ok(());
     }
 
-    println!("Upgrading luabox v{current} -> {tag} ({target})...");
+    outln!("Upgrading luabox v{current} -> {tag} ({target})...");
 
     let tmp = tempfile::tempdir().context("creating a temp dir for the download")?;
     install(&tag, target, tmp.path())?;
 
-    println!("luabox upgraded to {tag}.");
+    outln!("luabox upgraded to {tag}.");
     Ok(())
 }
 
@@ -56,11 +59,11 @@ fn install(tag: &str, target: &str, tmp: &Path) -> Result<()> {
     let base = format!("https://github.com/{REPO}/releases/download/{tag}");
     let archive = tmp.join(&asset);
 
-    println!("  downloading {asset} ...");
+    outln!("  downloading {asset} ...");
     download(&format!("{base}/{asset}"), &archive)
         .with_context(|| format!("downloading {asset} — does release {tag} exist?"))?;
 
-    println!("  verifying checksum ...");
+    outln!("  verifying checksum ...");
     let sums = http_text(&format!("{base}/SHA256SUMS")).context("downloading SHA256SUMS")?;
     verify(&archive, &asset, &sums)?;
 

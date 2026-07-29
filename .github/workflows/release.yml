@@ -1,20 +1,41 @@
 name: release
 
-# Cut a GitHub Release for a pushed `v*` tag: publish the release (notes lifted
-# from CHANGELOG.md), build the cross-platform `luabox` binaries, attach them
-# with SHA256SUMS and the install scripts, smoke the just-uploaded artifacts on
-# all three OSes, and only then mark the release `--latest`. (The VS Code
-# extension lives in flying-dice/luabox-vscode and releases its own .vsix.)
+# Cut a GitHub Release for a pushed `v*` tag, and do not let it go live until
+# the artefacts it ships have been installed and fully exercised on every OS.
+#
+# The shape of the pipeline is the point:
+#
+#   create-release      create the release as a TRUE DRAFT (notes lifted from
+#                       CHANGELOG.md). A draft has no public download URLs and
+#                       is invisible to `luabox upgrade` / the installers, so
+#                       nothing a user runs can reach it yet.
+#   build               native `luabox` binaries for the three shipped targets.
+#   publish             attach binaries + SHA256SUMS + both install scripts.
+#   verify (3 OSes)     download the install script FROM THE DRAFT, run it to
+#                       install the DRAFT's binary, then run the FULL black-box
+#                       acceptance + LSP acceptance suites against that
+#                       INSTALLED binary. This is the release gate.
+#   publish-release     asset-completeness + checksum re-verification gates,
+#                       then the single draft -> published transition:
+#                       `gh release edit --draft=false --latest`.
+#   post-publish-smoke  the handful of things that can only work once the
+#                       release is public: `curl … | bash` / `irm … | iex` off
+#                       the public URLs, and `luabox upgrade <tag>`.
 #
 # Everything happens in this ONE workflow run, triggered by the tag push — not
 # via an `on: release` trigger. A release created here with GITHUB_TOKEN would
 # NOT fire a downstream `release: published` workflow (GitHub suppresses
 # token-raised events), so the whole pipeline is chained by `needs:` instead.
 #
-# The install scripts (scripts/install.sh, scripts/install.ps1) download
-# `luabox-<target>.{tar.gz,zip}` from a release pinned by LUABOX_VERSION, so
-# attaching these assets and — after smoke passes — marking the release latest
-# is what makes `curl … | bash` / `irm … | iex` work.
+# Installing from a draft needs credentials that ordinary users do not have.
+# `scripts/install.{sh,ps1}` grew exactly one extra path for this: under an
+# explicit LUABOX_DRAFT_INSTALL=1 opt-in (which requires GITHUB_TOKEN and a
+# pinned LUABOX_VERSION), they resolve the release through the authenticated
+# GitHub API (drafts only appear in the *list* endpoint — `releases/tags/<tag>`
+# 404s for a draft) and pull each asset by id. Without the opt-in the scripts
+# behave exactly as they always have — ambient CI tokens never change install
+# behaviour — which is what `post-publish-smoke` proves against the real
+# public URLs.
 on:
   push:
     tags:
@@ -30,14 +51,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Publish the release up front so the build/publish/smoke jobs have a
-  # target to attach to and download from. Deliberately NOT marked latest yet
-  # (`--latest=false`) — that is gated behind `smoke` and done by `mark-latest`,
-  # so a release only goes live after its freshly-built artifacts install and
-  # run on all three OSes. `--draft=false` so smoke can download the uploaded
-  # install script from the public release-download URL.
+  # Create the release up front so the build/publish/verify jobs have a target
+  # to attach to and read from — but as a DRAFT (`--draft=true`). A draft is
+  # not resolvable by `/releases/latest`, has no public asset URLs, and is not
+  # visible to anyone without repo read access, so a release that fails
+  # verification never existed as far as users are concerned. The one and only
+  # place it stops being a draft is the final step of `publish-release`.
   create-release:
-    name: Create release
+    name: Create draft release
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -62,13 +83,43 @@ jobs:
           test -s release-notes.md || echo "(no CHANGELOG.md entry found for ${version})" > release-notes.md
           echo "--- release notes ---"
           cat release-notes.md
-      - name: Create the GitHub Release (not latest yet)
+      # Idempotent on purpose: RELEASING.md tells a maintainer that a red run
+      # can be fixed by re-running the workflow, and a bare `gh release create`
+      # 422s the moment the draft from the failed run still exists. So:
+      #   - no release for this tag  -> create it as a draft;
+      #   - a DRAFT release exists   -> reuse it (the `publish` job uploads
+      #                                 with `--clobber`, so re-runs overwrite
+      #                                 assets cleanly);
+      #   - a PUBLISHED release      -> fail loudly. Re-running over a live
+      #                                 release would silently replace what
+      #                                 users already downloaded; that needs a
+      #                                 human, a new tag, or an explicit yank.
+      - name: Create the GitHub Release as a draft (or reuse an existing draft)
         run: |
-          gh release create "$TAG" \
-            --title "luabox $TAG" \
-            --notes-file release-notes.md \
-            --draft=false \
-            --latest=false
+          set -euo pipefail
+          existing=$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null || true)
+          case "$existing" in
+            true)
+              echo "::notice::a draft release for ${TAG} already exists — reusing it (re-run path)"
+              gh release edit "$TAG" \
+                --title "luabox $TAG" \
+                --notes-file release-notes.md \
+                --draft=true \
+                --latest=false
+              ;;
+            false)
+              echo "::error::${TAG} is already PUBLISHED — refusing to republish over a live release." >&2
+              echo "Cut a new tag, or delete/yank the published release deliberately first." >&2
+              exit 1
+              ;;
+            *)
+              gh release create "$TAG" \
+                --title "luabox $TAG" \
+                --notes-file release-notes.md \
+                --draft=true \
+                --latest=false
+              ;;
+          esac
 
   # Build native release binaries for the tagged commit. Runner arch is
   # load-bearing: macos-latest is Apple Silicon (aarch64-apple-darwin). Intel
@@ -124,9 +175,11 @@ jobs:
   # The VS Code extension lives in its own repo (flying-dice/luabox-vscode)
   # and ships its .vsix from that repo's releases — no vsix job here.
 
-  # Checksum the binaries and attach them, SHA256SUMS, and the install
-  # scripts to the release. Does NOT mark the release latest — that is gated
-  # behind `smoke` and performed by `mark-latest`.
+  # Checksum the binaries and attach them, SHA256SUMS, and the install scripts
+  # to the DRAFT release. `gh release upload` works fine against a draft. The
+  # install scripts are attached as assets (not just left in-tree) because
+  # `verify` downloads them back out of the release: the script that is tested
+  # must be the artefact users will actually fetch.
   publish:
     name: Upload assets
     needs: [create-release, build]
@@ -147,32 +200,50 @@ jobs:
           cd dist
           sha256sum luabox-*.tar.gz luabox-*.zip > SHA256SUMS
           cat SHA256SUMS
-      - name: Upload assets to release
+      - name: Upload assets to the draft release
         run: |
           gh release upload "$TAG" \
             dist/luabox-*.tar.gz dist/luabox-*.zip dist/SHA256SUMS \
             scripts/install.sh scripts/install.ps1 \
             --clobber
 
-  # Gate: on each OS, install the just-uploaded binary via the just-uploaded
-  # install script (pinned to the tag via LUABOX_VERSION — no `latest`
-  # resolution, since the release is deliberately not latest yet), assert it
-  # runs and reports the tag version, then scaffold a probe project and assert
-  # `luabox check` flags a deliberate type error (LB0300) non-zero and passes a
-  # clean file. Then a battery of hardening probes a real user would hit:
-  #   - `luabox lsp` answers an `initialize` handshake (the whole VS Code
-  #     extension is dead if it doesn't),
-  #   - functional surfaces (`--help`, `explain`, `fmt --check`, `lint`, `doc`),
-  #   - the binary's own self-replace (`luabox upgrade <tag>`), plus its
-  #     negative (a nonexistent tag must fail non-zero),
-  #   - the installer into a path CONTAINING A SPACE (quoting bugs), plus its
-  #     negative (a nonexistent version must fail non-zero, not silently pass).
-  # All three legs must pass before the release goes live. No token:
-  # release-download URLs are public.
-  smoke:
-    name: Smoke ${{ matrix.os }}
+  # THE release gate. On each of the three shipped OSes:
+  #
+  #   1. pull `install.sh`/`install.ps1` out of the DRAFT release (so the asset
+  #      is what gets exercised, not the checked-out copy),
+  #   2. run it with LUABOX_DRAFT_INSTALL=1 + GITHUB_TOKEN +
+  #      LUABOX_VERSION=<tag> — the draft-aware path — and assert the
+  #      installed binary reports the tag's version,
+  #   3. run the FULL black-box e2e suites (`acceptance` + `lsp_acceptance`,
+  #      the cucumber executable spec, SPEC.md §16.2) with LUABOX_E2E_BIN
+  #      pointed at that INSTALLED executable. Every scenario spawns the
+  #      installed binary as a child process, so what is under test is the
+  #      artefact users will download — not a cargo-built one.
+  #
+  # Plus the two probes the e2e suite structurally cannot cover, because they
+  # are about the *installer*, not the binary: installing into a directory
+  # whose path CONTAINS A SPACE (quoting bugs), and the negative case where a
+  # pinned nonexistent version must fail non-zero rather than silently pass.
+  #
+  # What is deliberately NOT here: `luabox upgrade` (it resolves published
+  # releases, so it cannot work against a draft — it moved to
+  # `post-publish-smoke`), and the old hand-rolled `check`/`fmt`/`lint`/`doc`/
+  # LSP-handshake probes, which the e2e suites cover far more thoroughly.
+  #
+  # The suites run without any live-network opt-in: nothing in
+  # `crates/luabox-cli/tests/features/` is tagged for network access, so the
+  # gate is fully deterministic and offline apart from the install itself.
+  verify:
+    name: Verify ${{ matrix.os }}
     needs: publish
     runs-on: ${{ matrix.os }}
+    permissions:
+      # `contents: write`, reluctantly: the REST API only lists DRAFT releases
+      # for callers with push access, so a `contents: read` token cannot see
+      # the draft at all — neither `gh release download` nor the install
+      # scripts' API path would find it. This job never writes anything; the
+      # only mutation in the whole pipeline is `publish-release`'s final edit.
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -183,22 +254,57 @@ jobs:
             shell: bash
           - os: windows-latest
             shell: pwsh
+    env:
+      # GH_TOKEN drives `gh release download`; GITHUB_TOKEN authenticates the
+      # install scripts' draft-aware API path, and LUABOX_DRAFT_INSTALL=1 is
+      # the explicit opt-in that switches them onto it (token presence alone
+      # never does — ambient CI tokens must not change install behaviour).
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      LUABOX_DRAFT_INSTALL: "1"
+      TAG: ${{ github.ref_name }}
+      # Match ci.yml: a warning in the test harness is a build failure.
+      RUSTFLAGS: -Dwarnings
     steps:
-      # Unix (Linux + macOS): run the uploaded install.sh pinned to the tag,
-      # then exercise the binary and a probe project.
-      - name: Smoke (unix)
+      # The tagged source is needed for the cucumber feature files and step
+      # definitions — the harness is the checked-out spec, the binary under
+      # test is the installed release artefact.
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-verify-${{ matrix.os }}
+
+      # install.sh's draft path parses the release LISTING with jq — a draft is
+      # not returned by `releases/tags/<tag>`, so it has to be matched by
+      # tag_name across pages, and an asset id is not something to pull out of
+      # JSON with grep. The installer fails fast and loudly without jq; this
+      # step means the gate can never reach it unprepared, and a runner image
+      # that dropped jq is a red step with an obvious cause rather than an
+      # install failure several round-trips in.
+      - name: Assert jq is available (install.sh's draft path needs it)
         if: matrix.shell == 'bash'
         shell: bash
-        env:
-          TAG: ${{ github.ref_name }}
-          REPO: ${{ github.repository }}
+        run: jq --version
+
+      # ── Install from the draft (unix) ────────────────────────────────────
+      - name: Install from the draft release (unix)
+        if: matrix.shell == 'bash'
+        shell: bash
         run: |
           set -euo pipefail
 
-          # Install via the uploaded install.sh asset, pinned to the tag.
-          # LUABOX_VERSION=<tag> pins the release (no /releases/latest lookup).
-          curl -fsSL "https://github.com/${REPO}/releases/download/${TAG}/install.sh" \
-            | LUABOX_VERSION="${TAG}" bash
+          # Fetch the install script AS A RELEASE ASSET. `gh release download`
+          # resolves drafts with a token (it falls back to the list endpoint
+          # when `releases/tags/<tag>` 404s), which the public URL cannot.
+          work="$(mktemp -d)"
+          gh release download "$TAG" --pattern 'install.sh' --dir "$work"
+
+          # LUABOX_DRAFT_INSTALL=1 + GITHUB_TOKEN (both job env) put install.sh
+          # on its draft-aware path; LUABOX_VERSION pins the tag.
+          LUABOX_VERSION="$TAG" bash "$work/install.sh"
 
           # install.sh installs to $HOME/.luabox/bin by default.
           export PATH="$HOME/.luabox/bin:$PATH"
@@ -212,233 +318,42 @@ jobs:
             exit 1
           fi
 
-          # Scaffold a probe project with a deliberate type error.
-          work="$(mktemp -d)"
-          mkdir -p "$work/src"
-          cat > "$work/luabox.toml" <<'TOML'
-          [package]
-          name = "smoke"
-          version = "0.1.0"
-          edition = "5.4"
+          # Hand the installed executable to the e2e step below.
+          echo "LUABOX_E2E_BIN=$HOME/.luabox/bin/luabox" >> "$GITHUB_ENV"
+          echo "LUABOX_INSTALL_SH=$work/install.sh" >> "$GITHUB_ENV"
 
-          # Strict mode makes LB0300 an error (nonzero exit); without it the
-          # type mismatch is a warning and `luabox check` exits 0.
-          [types]
-          strict = true
-          TOML
-          cat > "$work/src/main.lua" <<'LUA'
-          ---@param name string
-          ---@return string
-          local function greet(name)
-              return "Hello, " .. name .. "!"
-          end
-
-          print(greet(42))
-          LUA
-          cd "$work"
-
-          # The deliberate type error must fail `luabox check` non-zero, with
-          # LB0300 (type mismatch) in the output.
-          if check_out="$(luabox check 2>&1)"; then
-            echo "$check_out"
-            echo "error: 'luabox check' passed on a type-error project (expected failure)" >&2
-            exit 1
-          fi
-          echo "$check_out"
-          if ! printf '%s' "$check_out" | grep -q 'LB0300'; then
-            echo "error: expected LB0300 in 'luabox check' output" >&2
-            exit 1
-          fi
-
-          # Fix the error: a clean file must pass (exit 0).
-          cat > src/main.lua <<'LUA'
-          ---@param name string
-          ---@return string
-          local function greet(name)
-              return "Hello, " .. name .. "!"
-          end
-
-          print(greet("world"))
-          LUA
-          luabox check
-
-          # Exercise self-replace on this OS: re-install the same tag via the
-          # binary's own upgrade command, then prove it still runs.
-          luabox upgrade "${TAG}"
-          luabox --version
-
-          # ── Upgrade negative probe ─────────────────────────────────────
-          # Failure mode: a self-update that silently "succeeds" on a
-          # nonexistent target would leave users convinced they upgraded when
-          # they did not. Run under `if` so set -e does not abort on the
-          # expected failure.
-          if luabox upgrade "v0.0.0-does-not-exist"; then
-            echo "error: 'luabox upgrade' succeeded for a nonexistent version" >&2
-            exit 1
-          fi
-          echo "negative upgrade probe: correctly failed"
-
-          # ── Negative install probe ─────────────────────────────────────
-          # Failure mode: install.sh silently exiting 0 when the pinned release
-          # does not exist would ship a broken install path. The script itself
-          # downloads fine (it is our real tag asset); the pinned nonexistent
-          # VERSION must make it exit non-zero.
-          if curl -fsSL "https://github.com/${REPO}/releases/download/${TAG}/install.sh" \
-            | LUABOX_VERSION="v0.0.0-does-not-exist" bash; then
-            echo "error: install.sh succeeded for a nonexistent version" >&2
-            exit 1
-          fi
-          echo "negative install probe: install.sh correctly failed"
-
-          # ── Install-dir-with-spaces leg ────────────────────────────────
-          # Failure mode: an unquoted $INSTALL_DIR / mkdir / mv in install.sh
-          # word-splits on a space and drops the binary in the wrong place (or
-          # fails). Re-install into a path with a space and assert the exe
-          # landed and runs from there.
-          spaced_dir="$(mktemp -d)/luabox smoke dir"
-          curl -fsSL "https://github.com/${REPO}/releases/download/${TAG}/install.sh" \
-            | LUABOX_INSTALL_DIR="$spaced_dir" LUABOX_VERSION="${TAG}" bash
-          if [ ! -x "$spaced_dir/luabox" ]; then
-            echo "error: install.sh did not place an executable in a spaced dir" >&2
-            exit 1
-          fi
-          "$spaced_dir/luabox" --version
-
-          # ── Broader functional probes ──────────────────────────────────
-          # Cheap, deterministic exercises of surfaces users hit daily. Failure
-          # mode: a build where the top-level CLI, the explain registry, or the
-          # fmt/lint/doc pipelines are broken would still pass the check probe.
-          luabox --help >/dev/null                       # must exit 0
-          explain_out="$(luabox explain LB0300)"
-          if ! printf '%s' "$explain_out" | grep -qi 'type mismatch'; then
-            echo "error: 'luabox explain LB0300' missing 'type mismatch'" >&2
-            printf '%s\n' "$explain_out" >&2
-            exit 1
-          fi
-          # Scaffold a fresh (canonical) project so the fmt/lint/doc probes test
-          # the tools, not this script's hand-written whitespace.
-          clean="$(mktemp -d)/clean"
-          mkdir -p "$clean"
-          (cd "$clean" && luabox init)
-          cd "$clean"
-          luabox fmt          # canonicalize in place, then assert idempotency:
-          luabox fmt --check  # must exit 0 on already-formatted sources
-          luabox lint         # must exit 0 on a clean project
-          luabox doc          # must exit 0 and produce doc/index.html
-          if [ ! -f doc/index.html ]; then
-            echo "error: 'luabox doc' produced no doc/index.html" >&2
-            exit 1
-          fi
-
-          # ── LSP handshake smoke ────────────────────────────────────────
-          # Failure mode: the VS Code extension is worthless if `luabox lsp`
-          # does not answer. Spawn it, send a Content-Length-framed initialize,
-          # and assert the reply advertises "capabilities". A 15s hard cap means
-          # a hung server FAILS the job instead of hanging it.
-          lsp_py="$(mktemp)"
-          cat > "$lsp_py" <<'PY'
-          import json, subprocess, sys, threading
-          exe = sys.argv[1]
-          p = subprocess.Popen([exe, "lsp"], stdin=subprocess.PIPE,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-          def frame(obj):
-              b = json.dumps(obj).encode("utf-8")
-              return b"Content-Length: %d\r\n\r\n" % len(b) + b
-          def send(obj):
-              p.stdin.write(frame(obj)); p.stdin.flush()
-          def read_message(s):
-              hdr = b""
-              while b"\r\n\r\n" not in hdr:
-                  c = s.read(1)
-                  if not c:
-                      return None
-                  hdr += c
-              n = None
-              for line in hdr.split(b"\r\n"):
-                  if line.lower().startswith(b"content-length:"):
-                      n = int(line.split(b":", 1)[1].strip())
-              return s.read(n) if n is not None else None
-          out = {}
-          def work():
-              try:
-                  send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                        "params": {"processId": None, "rootUri": None, "capabilities": {}}})
-                  out["body"] = read_message(p.stdout)
-              except Exception as e:
-                  out["err"] = repr(e)
-          t = threading.Thread(target=work); t.daemon = True; t.start(); t.join(15)
-          if t.is_alive():
-              p.kill(); sys.exit("error: luabox lsp initialize timed out (hung server)")
-          if out.get("err"):
-              p.kill(); sys.exit("error: luabox lsp handshake failed: " + out["err"])
-          body = out.get("body")
-          if not body or b'"capabilities"' not in body:
-              p.kill(); sys.exit("error: initialize reply missing capabilities: %r" % (body,))
-          print("LSP OK:", body[:120])
-          try:
-              send({"jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": None})
-              send({"jsonrpc": "2.0", "method": "exit"})
-              p.wait(timeout=5)
-          except Exception:
-              p.kill()
-          PY
-          python3 "$lsp_py" "$(command -v luabox)"
-
-      # Windows: run the uploaded install.ps1 pinned to the tag, then exercise
-      # the binary and a probe project.
-      - name: Smoke (windows)
+      # ── Install from the draft (windows) ─────────────────────────────────
+      - name: Install from the draft release (windows)
         if: matrix.shell == 'pwsh'
         shell: pwsh
-        env:
-          TAG: ${{ github.ref_name }}
-          REPO: ${{ github.repository }}
         run: |
           $ErrorActionPreference = "Stop"
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           $ProgressPreference = "SilentlyContinue"
 
-          $tag  = $env:TAG
-          $repo = $env:REPO
+          $tag = $env:TAG
 
-          # Download the uploaded install.ps1 to a file and run it (file-based, so
-          # a script parse error surfaces clearly and the shipped env-var path is
-          # used).
-          $ps1 = Join-Path $env:RUNNER_TEMP "install.ps1"
-          Invoke-WebRequest -Uri "https://github.com/$repo/releases/download/$tag/install.ps1" `
-            -OutFile $ps1 -UseBasicParsing
+          # Fetch install.ps1 AS A RELEASE ASSET (draft-aware via gh + token).
+          $work = Join-Path $env:RUNNER_TEMP "release-assets"
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          gh release download $tag --pattern 'install.ps1' --dir $work
+          if ($LASTEXITCODE -ne 0) { Write-Error "could not download install.ps1 from the draft release"; exit 1 }
+          $ps1 = Join-Path $work "install.ps1"
 
-          # Run the installer. install.ps1 is a PowerShell script (not an external
-          # exe), so $LASTEXITCODE is unreliable after `& $ps1`; rely on
-          # $ErrorActionPreference=Stop for throws and assert the binary landed.
+          # Run it file-based first, so a script parse error surfaces clearly.
+          # install.ps1 is a PowerShell script (not an external exe), so
+          # $LASTEXITCODE is unreliable after `& $ps1`; rely on
+          # $ErrorActionPreference=Stop for throws and assert the exe landed.
+          # LUABOX_DRAFT_INSTALL=1 + GITHUB_TOKEN (both job env) put it on the
+          # draft-aware path.
           $env:LUABOX_VERSION = $tag
           & $ps1
 
-          # install.ps1 installs to $env:USERPROFILE\.luabox\bin by default.
-          $binDir = Join-Path $env:USERPROFILE ".luabox\bin"
-          $exe = Join-Path $binDir "luabox.exe"
+          $exe = Join-Path (Join-Path $env:USERPROFILE ".luabox\bin") "luabox.exe"
           if (-not (Test-Path $exe)) { Write-Error "install.ps1 did not produce $exe"; exit 1 }
 
-          # Re-run the installer the way users invoke it: `irm | iex` in an
-          # interactive Windows PowerShell 5.1 console. REPL mode loads
-          # PSReadLine, whose 2.0 DLL embeds a stub of
-          # System.Runtime.InteropServices.RuntimeInformation that shadows the
-          # real type — an arch-detection failure class the file-based run above
-          # cannot catch. This pass ALSO installs into a path CONTAINING A SPACE
-          # (highest-risk on Windows). Failure mode: an unquoted $InstallDir /
-          # Join-Path in install.ps1 would drop the exe or fail here, not in
-          # prod. The remaining probes then run from this spaced install.
-          $spacedDir = Join-Path $env:RUNNER_TEMP "luabox smoke dir"
-          "`$env:LUABOX_INSTALL_DIR = '$spacedDir'; `$env:LUABOX_VERSION = '$tag'; Get-Content -Raw '$ps1' | iex" | powershell.exe -NoProfile -
-          if ($LASTEXITCODE -ne 0) { Write-Error "REPL-mode (5.1) spaced-dir install failed"; exit 1 }
-          $spacedExe = Join-Path $spacedDir "luabox.exe"
-          if (-not (Test-Path $spacedExe)) { Write-Error "install.ps1 did not produce $spacedExe (spaced dir)"; exit 1 }
-          & $spacedExe --version   # exe must launch from a path with a space
-          if ($LASTEXITCODE -ne 0) { Write-Error "luabox.exe failed to run from a spaced dir"; exit 1 }
-          $binDir = $spacedDir
-          $env:PATH = "$binDir;$env:PATH"
-
           # Version must match the tag (strip leading 'v').
-          $verOut   = (luabox --version)
+          $verOut = (& $exe --version)
           Write-Host "version: $verOut"
           $expected = $tag.TrimStart('v')
           if ($verOut -notmatch "(^|\s)$([regex]::Escape($expected))(\s|`$)") {
@@ -446,172 +361,109 @@ jobs:
             exit 1
           }
 
-          # Scaffold a probe project with a deliberate type error.
-          $work = Join-Path $env:RUNNER_TEMP "smoke-proj"
-          New-Item -ItemType Directory -Force -Path (Join-Path $work "src") | Out-Null
-          @"
-          [package]
-          name = "smoke"
-          version = "0.1.0"
-          edition = "5.4"
+          # Hand the installed executable (and the script asset) to the steps
+          # below. Add-Content, not Out-File: no BOM to corrupt GITHUB_ENV.
+          Add-Content -Path $env:GITHUB_ENV -Value "LUABOX_E2E_BIN=$exe"
+          Add-Content -Path $env:GITHUB_ENV -Value "LUABOX_INSTALL_PS1=$ps1"
 
-          # Strict mode makes LB0300 an error (nonzero exit); without it the
-          # type mismatch is a warning and luabox check exits 0.
-          [types]
-          strict = true
-          "@ | Set-Content -Path (Join-Path $work "luabox.toml") -Encoding utf8
-          @"
-          ---@param name string
-          ---@return string
-          local function greet(name)
-              return "Hello, " .. name .. "!"
-          end
+      # ── The gate itself ──────────────────────────────────────────────────
+      # The whole executable spec, black-box, against the installed artefact.
+      # LUABOX_E2E_BIN comes from the install step above; without it the suites
+      # would silently fall back to a cargo-built binary and prove nothing
+      # about the release. `--locked` for the same reason `build` uses it.
+      # `bash` on all three runners (git-bash on Windows) keeps this one step.
+      - name: Full e2e suite against the INSTALLED binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${LUABOX_E2E_BIN:-}" || { echo "error: LUABOX_E2E_BIN unset — the install step did not run" >&2; exit 1; }
+          echo "e2e binary under test: $LUABOX_E2E_BIN"
+          cargo test --locked -p luabox-cli --test acceptance --test lsp_acceptance
 
-          print(greet(42))
-          "@ | Set-Content -Path (Join-Path $work "src\main.lua") -Encoding utf8
-          Set-Location $work
+      # ── Installer-only probes (unix) ─────────────────────────────────────
+      - name: Installer probes (unix)
+        if: matrix.shell == 'bash'
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          # The deliberate type error must fail `luabox check` non-zero, with
-          # LB0300 in the output.
-          $checkOut = (luabox check 2>&1 | Out-String)
-          Write-Host $checkOut
-          if ($LASTEXITCODE -eq 0) { Write-Error "'luabox check' passed on a type-error project (expected failure)"; exit 1 }
-          if ($checkOut -notmatch "LB0300") { Write-Error "expected LB0300 in 'luabox check' output"; exit 1 }
-
-          # Fix the error: a clean file must pass (exit 0).
-          @"
-          ---@param name string
-          ---@return string
-          local function greet(name)
-              return "Hello, " .. name .. "!"
-          end
-
-          print(greet("world"))
-          "@ | Set-Content -Path (Join-Path $work "src\main.lua") -Encoding utf8
-          luabox check
-          if ($LASTEXITCODE -ne 0) { Write-Error "'luabox check' failed on a clean project"; exit 1 }
-
-          # Exercise self-replace on Windows (the rename-aside path): re-install
-          # the same tag via the binary's own upgrade command.
-          luabox upgrade $env:TAG
-          if ($LASTEXITCODE -ne 0) { Write-Error "luabox upgrade failed"; exit 1 }
-
-          # Binary still works after self-replace.
-          luabox --version
-          if ($LASTEXITCODE -ne 0) { Write-Error "luabox --version failed post-upgrade"; exit 1 }
-
-          # ── Upgrade negative probe ─────────────────────────────────────
-          # Failure mode: a self-update that silently "succeeds" on a
-          # nonexistent target convinces users they upgraded when they did not.
-          # Tolerate BOTH a non-zero exit and a thrown terminating error (pwsh
-          # 7.4 can turn a native command's stderr + non-zero exit into a throw
-          # under $ErrorActionPreference=Stop).
-          $upFailed = $false
-          try {
-            luabox upgrade "v0.0.0-does-not-exist" 2>&1 | Out-String | Write-Host
-            if ($LASTEXITCODE -ne 0) { $upFailed = $true }
-          } catch { $upFailed = $true }
-          if (-not $upFailed) { Write-Error "'luabox upgrade' succeeded for a nonexistent version"; exit 1 }
-          Write-Host "negative upgrade probe: correctly failed"
+          # ── Install-dir-with-spaces leg ────────────────────────────────
+          # Failure mode: an unquoted $INSTALL_DIR / mkdir / mv in install.sh
+          # word-splits on a space and drops the binary in the wrong place (or
+          # fails). Nothing in the e2e suite touches the installer, so this
+          # stays hand-written. Re-install into a path with a space and assert
+          # the exe landed and runs from there.
+          spaced_dir="$(mktemp -d)/luabox verify dir"
+          LUABOX_INSTALL_DIR="$spaced_dir" LUABOX_VERSION="$TAG" bash "$LUABOX_INSTALL_SH"
+          if [ ! -x "$spaced_dir/luabox" ]; then
+            echo "error: install.sh did not place an executable in a spaced dir" >&2
+            exit 1
+          fi
+          "$spaced_dir/luabox" --version
 
           # ── Negative install probe ─────────────────────────────────────
-          # Failure mode: install.ps1 silently exiting 0 when the pinned release
-          # does not exist would ship a broken install path. Run in a CHILD
-          # process so its `exit 1` yields a clean $LASTEXITCODE and the expected
-          # failure does not trip $ErrorActionPreference=Stop in this step.
+          # Failure mode: install.sh silently exiting 0 when the pinned release
+          # does not exist would ship a broken install path. With the draft
+          # opt-in in env this also exercises the API lookup's not-found branch.
+          # Run under `if` so set -e does not abort on the expected failure.
+          if LUABOX_VERSION="v0.0.0-does-not-exist" bash "$LUABOX_INSTALL_SH"; then
+            echo "error: install.sh succeeded for a nonexistent version" >&2
+            exit 1
+          fi
+          echo "negative install probe: install.sh correctly failed"
+
+      # ── Installer-only probes (windows) ──────────────────────────────────
+      - name: Installer probes (windows)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $ProgressPreference = "SilentlyContinue"
+
+          $tag = $env:TAG
+          $ps1 = $env:LUABOX_INSTALL_PS1
+
+          # ── REPL-mode (5.1) spaced-dir install ─────────────────────────
+          # Run the installer the way users invoke it: piped into an
+          # interactive Windows PowerShell 5.1 session. REPL mode loads
+          # PSReadLine, whose 2.0 DLL embeds a stub of
+          # System.Runtime.InteropServices.RuntimeInformation that shadows the
+          # real type — an arch-detection failure class the file-based run in
+          # the install step cannot catch, and one nothing else in this
+          # pipeline covers. This pass ALSO installs into a path CONTAINING A
+          # SPACE (highest-risk on Windows): an unquoted $InstallDir /
+          # Join-Path would drop the exe or fail here, not in prod.
+          # LUABOX_DRAFT_INSTALL=1 and GITHUB_TOKEN are inherited by the child
+          # process, so the draft-aware path is what runs.
+          $spacedDir = Join-Path $env:RUNNER_TEMP "luabox verify dir"
+          "`$env:LUABOX_INSTALL_DIR = '$spacedDir'; `$env:LUABOX_VERSION = '$tag'; Get-Content -Raw '$ps1' | iex" | powershell.exe -NoProfile -
+          if ($LASTEXITCODE -ne 0) { Write-Error "REPL-mode (5.1) spaced-dir install failed"; exit 1 }
+          $spacedExe = Join-Path $spacedDir "luabox.exe"
+          if (-not (Test-Path $spacedExe)) { Write-Error "install.ps1 did not produce $spacedExe (spaced dir)"; exit 1 }
+          & $spacedExe --version   # exe must launch from a path with a space
+          if ($LASTEXITCODE -ne 0) { Write-Error "luabox.exe failed to run from a spaced dir"; exit 1 }
+
+          # ── Negative install probe ─────────────────────────────────────
+          # Failure mode: install.ps1 silently exiting 0 when the pinned
+          # release does not exist would ship a broken install path. With the
+          # draft opt-in in env this also exercises the API lookup's
+          # not-found branch. Run in a CHILD process so its `exit 1` yields a
+          # clean $LASTEXITCODE and the expected failure does not trip
+          # $ErrorActionPreference=Stop in this step.
           "`$env:LUABOX_VERSION = 'v0.0.0-does-not-exist'; & '$ps1'" | powershell.exe -NoProfile -
           if ($LASTEXITCODE -eq 0) { Write-Error "install.ps1 succeeded for a nonexistent version"; exit 1 }
           Write-Host "negative install probe: install.ps1 correctly failed with exit $LASTEXITCODE"
 
-          # ── Broader functional probes ──────────────────────────────────
-          # Cheap, deterministic exercises of surfaces users hit daily. Failure
-          # mode: a build where the top-level CLI, the explain registry, or the
-          # fmt/lint/doc pipelines are broken would still pass the check probe.
-          luabox --help | Out-Null
-          if ($LASTEXITCODE -ne 0) { Write-Error "'luabox --help' exited $LASTEXITCODE"; exit 1 }
-          $explainOut = (luabox explain LB0300 | Out-String)
-          if ($explainOut -notmatch "type mismatch") { Write-Error "'luabox explain LB0300' missing 'type mismatch'"; Write-Host $explainOut; exit 1 }
-          # Scaffold a fresh (canonical) project so fmt/lint/doc test the tools,
-          # not this script's hand-written whitespace.
-          $clean = Join-Path $env:RUNNER_TEMP "clean-proj"
-          New-Item -ItemType Directory -Force -Path $clean | Out-Null
-          Set-Location $clean
-          luabox init
-          if ($LASTEXITCODE -ne 0) { Write-Error "luabox init failed"; exit 1 }
-          luabox fmt          # canonicalize in place, then assert idempotency:
-          if ($LASTEXITCODE -ne 0) { Write-Error "luabox fmt failed"; exit 1 }
-          luabox fmt --check  # must exit 0 on already-formatted sources
-          if ($LASTEXITCODE -ne 0) { Write-Error "'luabox fmt --check' failed on canonical sources"; exit 1 }
-          luabox lint         # must exit 0 on a clean project
-          if ($LASTEXITCODE -ne 0) { Write-Error "'luabox lint' failed on a clean project"; exit 1 }
-          luabox doc          # must exit 0 and produce doc/index.html
-          if ($LASTEXITCODE -ne 0) { Write-Error "'luabox doc' failed"; exit 1 }
-          if (-not (Test-Path (Join-Path $clean "doc\index.html"))) { Write-Error "'luabox doc' produced no doc/index.html"; exit 1 }
-
-          # ── LSP handshake smoke ────────────────────────────────────────
-          # Failure mode: the VS Code extension is worthless if `luabox lsp`
-          # does not answer. Spawn it, send a Content-Length-framed initialize,
-          # and assert the reply advertises "capabilities". Python's buffered
-          # binary pipes (not shell pipes) keep Windows stdio byte-exact; a 15s
-          # hard cap means a hung server FAILS the job instead of hanging it.
-          $lspPy = Join-Path $env:RUNNER_TEMP "lsp_smoke.py"
-          @'
-          import json, subprocess, sys, threading
-          exe = sys.argv[1]
-          p = subprocess.Popen([exe, "lsp"], stdin=subprocess.PIPE,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-          def frame(obj):
-              b = json.dumps(obj).encode("utf-8")
-              return b"Content-Length: %d\r\n\r\n" % len(b) + b
-          def send(obj):
-              p.stdin.write(frame(obj)); p.stdin.flush()
-          def read_message(s):
-              hdr = b""
-              while b"\r\n\r\n" not in hdr:
-                  c = s.read(1)
-                  if not c:
-                      return None
-                  hdr += c
-              n = None
-              for line in hdr.split(b"\r\n"):
-                  if line.lower().startswith(b"content-length:"):
-                      n = int(line.split(b":", 1)[1].strip())
-              return s.read(n) if n is not None else None
-          out = {}
-          def work():
-              try:
-                  send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                        "params": {"processId": None, "rootUri": None, "capabilities": {}}})
-                  out["body"] = read_message(p.stdout)
-              except Exception as e:
-                  out["err"] = repr(e)
-          t = threading.Thread(target=work); t.daemon = True; t.start(); t.join(15)
-          if t.is_alive():
-              p.kill(); sys.exit("error: luabox lsp initialize timed out (hung server)")
-          if out.get("err"):
-              p.kill(); sys.exit("error: luabox lsp handshake failed: " + out["err"])
-          body = out.get("body")
-          if not body or b'"capabilities"' not in body:
-              p.kill(); sys.exit("error: initialize reply missing capabilities: %r" % (body,))
-          print("LSP OK:", body[:120])
-          try:
-              send({"jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": None})
-              send({"jsonrpc": "2.0", "method": "exit"})
-              p.wait(timeout=5)
-          except Exception:
-              p.kill()
-          '@ | Set-Content -Path $lspPy -Encoding utf8
-          $py = if (Get-Command python3 -ErrorAction SilentlyContinue) { "python3" } elseif (Get-Command python -ErrorAction SilentlyContinue) { "python" } else { $null }
-          if (-not $py) { Write-Error "no python interpreter available for the LSP smoke"; exit 1 }
-          & $py $lspPy $spacedExe
-          if ($LASTEXITCODE -ne 0) { Write-Error "LSP handshake smoke failed"; exit 1 }
-
-  # Go-live: mark the release latest, only reachable if all three smoke legs
-  # passed. A failed smoke skips this, so the release stays not-latest and the
-  # pipeline is red.
-  mark-latest:
-    name: Mark release latest
-    needs: smoke
+  # Go-live. Only reachable if all three `verify` legs passed, i.e. the
+  # release's own artefacts installed cleanly and passed the entire executable
+  # spec on Linux, macOS and Windows. Two last gates run here, then the single
+  # draft -> published transition. A failure anywhere above skips this job
+  # entirely: the release stays a draft, invisible to users, and the pipeline
+  # is red.
+  publish-release:
+    name: Publish release (draft -> current)
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -621,16 +473,25 @@ jobs:
       GH_REPO: ${{ github.repository }}
       TAG: ${{ github.ref_name }}
     steps:
-      # Gate 1 — asset-completeness. Last line of defense before go-live:
-      # fetch the release's ACTUAL asset list and assert exactly the expected
-      # set is present. Failure mode: `build` uses fail-fast:false, so a single
-      # silently-skipped OS build can leave the whole
+      # Gate 1 — asset-completeness. Fetch the release's ACTUAL asset list and
+      # assert exactly the expected set is present. Failure mode: `build` uses
+      # fail-fast:false, so a single silently-skipped OS build can leave the
       # pipeline green while an asset is missing — users on that OS then get a
-      # 404 from the installer. This catches it before the release is latest.
-      - name: Assert the release has the complete asset set
+      # 404 from the installer. This catches it before the release is public.
+      #
+      # Note the lookup: `releases/tags/<tag>` does NOT resolve a draft even
+      # with a token, so the release id comes from the list endpoint first.
+      - name: Assert the draft has the complete asset set
         run: |
           set -euo pipefail
-          names="$(gh api "repos/${GH_REPO}/releases/tags/${TAG}" --jq '.assets[].name' | sort)"
+          release_id="$(gh api "repos/${GH_REPO}/releases?per_page=100" \
+            --jq "[.[] | select(.tag_name == \"${TAG}\")][0].id // empty")"
+          if [ -z "$release_id" ]; then
+            echo "error: no release found for tag ${TAG}" >&2
+            exit 1
+          fi
+          names="$(gh api "repos/${GH_REPO}/releases/${release_id}/assets?per_page=100" \
+            --jq '.[].name' | sort)"
           echo "assets present:"; printf '%s\n' "$names"
           missing=0
           # 3 binaries + SHA256SUMS + both install scripts, by exact name.
@@ -655,13 +516,14 @@ jobs:
           [ "$missing" -eq 0 ] || { echo "asset-completeness gate failed" >&2; exit 1; }
 
       # Gate 2 — independent integrity re-verification. Freshly download every
-      # binary + SHA256SUMS straight from the published release and run
-      # `sha256sum -c`. Failure mode: a truncated/corrupted upload, or a
-      # SHA256SUMS computed from different bytes than were actually attached,
-      # would pass the per-job upload but hand users a checksum that does not
-      # match the file they download. This proves published sums == published
-      # bytes, independent of the upload path.
-      - name: Re-verify published checksums against freshly downloaded assets
+      # binary + SHA256SUMS straight from the release and run `sha256sum -c`.
+      # Failure mode: a truncated/corrupted upload, or a SHA256SUMS computed
+      # from different bytes than were actually attached, would pass the
+      # per-job upload but hand users a checksum that does not match the file
+      # they download. This proves attached sums == attached bytes,
+      # independent of the upload path. `gh release download` resolves the
+      # draft with the workflow token (the public URLs do not exist yet).
+      - name: Re-verify checksums against freshly downloaded draft assets
         run: |
           set -euo pipefail
           work="$(mktemp -d)"; cd "$work"
@@ -673,5 +535,154 @@ jobs:
           # -c exits non-zero if any listed file is missing or its hash differs.
           sha256sum -c SHA256SUMS
 
-      - name: Mark latest (go live)
-        run: gh release edit "$TAG" --latest
+      # The single draft -> current transition the whole pipeline exists to
+      # gate. After this the public release-download URLs resolve, the
+      # installers' `latest` lookup finds this tag, and `luabox upgrade` can
+      # see it.
+      - name: Publish (draft -> current, and mark latest)
+        run: gh release edit "$TAG" --draft=false --latest
+
+  # Everything that can only be exercised once the release is actually public:
+  # the no-token install one-liners against the real public URLs — both the
+  # raw.githubusercontent one the README prints and the release-download copy
+  # — and the binary's own self-replace, which resolves published releases
+  # through the GitHub API and therefore cannot see a draft.
+  #
+  # Honest about what this is: the release is ALREADY LIVE when this runs. A
+  # failure here does not roll anything back — it turns the pipeline red so a
+  # human can act (yank the release, or cut a fix tag). The pre-publish gate is
+  # `verify`; this is the post-publish canary for the public-URL surface only.
+  post-publish-smoke:
+    name: Post-publish smoke ${{ matrix.os }}
+    needs: publish-release
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            shell: bash
+          - os: macos-latest
+            shell: bash
+          - os: windows-latest
+            shell: pwsh
+    steps:
+      # No token anywhere in these steps, deliberately: both the
+      # raw.githubusercontent and the release-download URLs are public, and
+      # the installers must work with nothing in the environment but
+      # LUABOX_VERSION.
+      - name: Public-path install and upgrade (unix)
+        if: matrix.shell == 'bash'
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Two sources for the same script, both installed from:
+          #
+          #   1. raw.githubusercontent — the URL the README's one-liner
+          #      literally tells users to curl. It serves the tip of `main`,
+          #      which at release time is the commit this tag was cut from,
+          #      so this is what a reader of the README actually gets today.
+          #      Mandatory: it is the documented path.
+          #   2. the release asset attached to this tag — the immutable copy
+          #      the release ships. Cheap to also exercise, and any drift
+          #      between the two surfaces here rather than in a user's shell.
+          #
+          # Both pinned to this tag via LUABOX_VERSION.
+          readme_url="https://raw.githubusercontent.com/${REPO}/main/scripts/install.sh"
+          asset_url="https://github.com/${REPO}/releases/download/${TAG}/install.sh"
+          export PATH="$HOME/.luabox/bin:$PATH"
+
+          for url in "$readme_url" "$asset_url"; do
+            echo "--- installing from ${url}"
+            rm -rf "$HOME/.luabox"
+            curl -fsSL "$url" | LUABOX_VERSION="${TAG}" bash
+            test -x "$HOME/.luabox/bin/luabox" \
+              || { echo "error: ${url} did not produce ~/.luabox/bin/luabox" >&2; exit 1; }
+            luabox --version
+          done
+
+          # Self-replace: re-install the same tag via the binary's own upgrade
+          # command (it resolves published releases, so it could not run before
+          # the draft went live), then prove it still runs.
+          luabox upgrade "${TAG}"
+          luabox --version
+
+          # Failure mode: a self-update that silently "succeeds" on a
+          # nonexistent target would leave users convinced they upgraded when
+          # they did not. Run under `if` so set -e tolerates the expected
+          # failure.
+          if luabox upgrade "v0.0.0-does-not-exist"; then
+            echo "error: 'luabox upgrade' succeeded for a nonexistent version" >&2
+            exit 1
+          fi
+          echo "negative upgrade probe: correctly failed"
+
+      - name: Public-path install and upgrade (windows)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $ProgressPreference = "SilentlyContinue"
+
+          $tag  = $env:TAG
+          $repo = $env:REPO
+
+          # The literal `irm | iex` one-liner from the README, pinned to this
+          # tag, in a Windows PowerShell 5.1 REPL — the environment real users
+          # are in (and where PSReadLine's RuntimeInformation stub bites).
+          #
+          # Two sources, same script. raw.githubusercontent is the URL the
+          # README hands users; it serves the tip of `main`, which at release
+          # time is the commit this tag was cut from — the mandatory one,
+          # because it is the documented path. The release asset attached to
+          # this tag is the immutable copy, exercised too so drift between
+          # them surfaces here and not in a user's shell.
+          $binDir = Join-Path $env:USERPROFILE ".luabox\bin"
+          $exe = Join-Path $binDir "luabox.exe"
+          $urls = @(
+            "https://raw.githubusercontent.com/$repo/main/scripts/install.ps1",
+            "https://github.com/$repo/releases/download/$tag/install.ps1"
+          )
+          foreach ($url in $urls) {
+            Write-Host "--- installing from $url"
+            if (Test-Path (Join-Path $env:USERPROFILE ".luabox")) {
+              Remove-Item -Recurse -Force (Join-Path $env:USERPROFILE ".luabox")
+            }
+            "`$env:LUABOX_VERSION = '$tag'; irm '$url' | iex" | powershell.exe -NoProfile -
+            if ($LASTEXITCODE -ne 0) { Write-Error "public-path irm|iex install failed for $url"; exit 1 }
+            if (-not (Test-Path $exe)) { Write-Error "$url did not produce $exe"; exit 1 }
+          }
+
+          $env:PATH = "$binDir;$env:PATH"
+          luabox --version
+          if ($LASTEXITCODE -ne 0) { Write-Error "luabox --version failed"; exit 1 }
+
+          # Self-replace on Windows (the rename-aside path): only possible now
+          # that the release is published.
+          luabox upgrade $tag
+          if ($LASTEXITCODE -ne 0) { Write-Error "luabox upgrade failed"; exit 1 }
+          luabox --version
+          if ($LASTEXITCODE -ne 0) { Write-Error "luabox --version failed post-upgrade"; exit 1 }
+
+          # Failure mode: a self-update that silently "succeeds" on a
+          # nonexistent target convinces users they upgraded when they did not.
+          # Tolerate BOTH a non-zero exit and a thrown terminating error (pwsh
+          # 7.4 can turn a native command's stderr + non-zero exit into a throw
+          # under $ErrorActionPreference=Stop).
+          $upFailed = $false
+          try {
+            luabox upgrade "v0.0.0-does-not-exist" 2>&1 | Out-String | Write-Host
+            if ($LASTEXITCODE -ne 0) { $upFailed = $true }
+          } catch { $upFailed = $true }
+          if (-not $upFailed) { Write-Error "'luabox upgrade' succeeded for a nonexistent version"; exit 1 }
+          Write-Host "negative upgrade probe: correctly failed"

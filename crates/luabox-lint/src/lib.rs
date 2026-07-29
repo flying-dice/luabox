@@ -20,7 +20,10 @@
 //!
 //! Suppression is `---@luabox-ignore rule-id reason` (reason mandatory —
 //! a bare tag is itself `LB0500`). Config is `[lint]` in the manifest,
-//! translated into a [`config::LintConfig`] by the Frontend.
+//! translated into a [`config::LintConfig`] by
+//! [`LintConfig::from_manifest`], which also hands back the `[lint]` keys
+//! that name no known rule ([`UnknownRuleId`]) for the Frontend to report —
+//! the manifest parser cannot validate ids it is not allowed to know.
 
 mod config;
 mod context;
@@ -28,27 +31,28 @@ mod diagnostic;
 mod facts;
 mod rule;
 mod rules;
+mod suggest;
 mod suppress;
 
 #[cfg(test)]
 mod tests;
 
-pub use config::{Level, LintConfig, tier_default};
+pub use config::{Level, LintConfig, LintLevel, LintTier, UnknownRuleId, tier_default};
 pub use context::LintContext;
 pub use diagnostic::{Fix, LintDiagnostic};
 pub use facts::TypeFacts;
 pub use rule::{Rule, Tier};
-pub use rules::rules;
+pub use rules::{rule_ids, rules};
 
 use std::collections::HashSet;
 use std::ops::Range;
 
 use luabox_diag::{Code, Diagnostic, Label, Severity, Span, Suggestion};
 use luabox_hir::lower;
-use luabox_syntax::{Dialect, lua};
+use luabox_syntax::{Dialect, LineIndex, lua};
 
 use context::to_range;
-use suppress::{Suppressions, line_of};
+use suppress::Suppressions;
 
 /// A machine-applicable edit gathered for `--fix`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +114,10 @@ pub fn lint_source(
     let lowered = lower(&parse);
     let facts = TypeFacts::build(&parse, &lowered);
     let suppress = Suppressions::collect(&parse, source);
+    // Built once per file: resolving each finding's line by counting newlines
+    // from byte 0 made linting O(findings x file size) — 32 k findings in one
+    // 100-kLOC file took minutes.
+    let lines = LineIndex::new(source);
     let ctx = LintContext::new(
         file,
         source,
@@ -125,7 +133,7 @@ pub fn lint_source(
             continue;
         };
         for finding in rule.check(&ctx) {
-            let line = line_of(source, finding.range.start);
+            let line = lines.line_of(finding.range.start);
             if suppress.is_suppressed(rule.id(), line) {
                 continue;
             }

@@ -568,7 +568,10 @@ fn table_entries_are_classified() {
         .find(|(_, e)| matches!(e, Expr::Table { .. }))
         .expect("table expr");
     let Expr::Table { entries } = table else {
-        unreachable!();
+        // `panic!` rather than `unreachable!`: clippy's abort-site lints are
+        // relaxed for tests (clippy.toml's allow-panic-in-tests), and the
+        // `find` above already established the shape.
+        panic!("expected a table expr, got {table:?}");
     };
     assert_eq!(entries.len(), 3);
     assert!(matches!(entries[0], TableEntry::Positional(_)));

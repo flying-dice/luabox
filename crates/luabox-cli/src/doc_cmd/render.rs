@@ -987,6 +987,46 @@ mod tests {
     }
 
     #[test]
+    fn a_deprecated_function_carries_a_badge_on_its_entry() {
+        let module = model::lua_module(
+            "main",
+            "--- Old way.\n---@deprecated\nlocal function old()\nend\n\
+             \n\
+             --- Current way.\nlocal function new()\nend\n",
+            Dialect::Lua54,
+        );
+        let model = DocModel {
+            package: "fixture".to_string(),
+            modules: vec![module],
+        };
+        let pages = pages(&model);
+        let module_page = &pages
+            .iter()
+            .find(|(name, _)| name == "module.main.html")
+            .expect("module page")
+            .1;
+        // One badge, on `old` — the tag is not smeared across the page.
+        assert_eq!(
+            module_page
+                .matches("<span class=\"badge\">deprecated</span>")
+                .count(),
+            1,
+            "{module_page}"
+        );
+    }
+
+    #[test]
+    fn json_strings_escape_the_characters_that_would_break_the_payload() {
+        // Whitespace controls get their short escapes, anything else below
+        // 0x20 the `\u00xx` form, and `<` is escaped so the index can sit
+        // inside a `<script>` block verbatim.
+        assert_eq!(json_str("a\nb\r\tc"), "\"a\\nb\\r\\tc\"");
+        assert_eq!(json_str("\u{1}"), "\"\\u0001\"");
+        assert_eq!(json_str("q\"\\<"), "\"q\\\"\\\\\\u003c\"");
+        assert_eq!(json_str("plain"), "\"plain\"");
+    }
+
+    #[test]
     fn see_references_render_as_a_linked_see_also_section() {
         let module = model::lua_module(
             "main",

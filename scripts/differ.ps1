@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Convenience wrapper for the differential-execution harness (SPEC.md
-    §16.1/§16.2, ticket #23): builds tools/differ and sweeps corpus/differ,
+    §16.1/§16.2, GL#23): builds tools/differ and sweeps corpus/differ,
     comparing lowered output against source on every Lua runtime found on
     PATH. Pairs whose runtime is missing are SKIPPED with a note (the full
     five-runtime matrix runs in CI — .github/workflows/differential.yml).

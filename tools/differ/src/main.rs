@@ -378,7 +378,9 @@ fn run_pair(
     let lowered = match luabox_lower::lower(source, from, to) {
         Ok(l) => l,
         Err(diags) => {
-            let codes: Vec<&str> = diags.iter().map(|d| d.code).collect();
+            // `code` is the bare u16 since the typed-Code change; render the
+            // canonical LBnnnn form the toolchain shows everywhere else.
+            let codes: Vec<String> = diags.iter().map(|d| format!("LB{:04}", d.code)).collect();
             return Outcome::LowerError(format!("lowering failed: {}", codes.join(", ")));
         }
     };
@@ -407,7 +409,11 @@ fn run_pair(
         return Outcome::Skipped(format!("no verified {} runtime on PATH", to.manifest_id()));
     };
     if args.verbose && (!lowered.polyfills.is_empty() || !lowered.warnings.is_empty()) {
-        let warns: Vec<&str> = lowered.warnings.iter().map(|w| w.code).collect();
+        let warns: Vec<String> = lowered
+            .warnings
+            .iter()
+            .map(|w| format!("LB{:04}", w.code))
+            .collect();
         eprintln!(
             "  {name} {}->{}: polyfills=[{}] warnings=[{}]",
             from.manifest_id(),

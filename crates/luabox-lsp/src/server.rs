@@ -13,16 +13,34 @@
 //!   [`LineIndex`](crate::line_index::LineIndex).
 //! - **Diagnostics**: pushed via `textDocument/publishDiagnostics` after
 //!   every open/change/close, computed from a fresh [`Analysis`] snapshot.
+//!   Problems with the *project configuration* rather than a document —
+//!   currently a `[lint]` key naming no known rule id — have no URI to hang a
+//!   diagnostic on and go to the client's log pane via `window/logMessage`
+//!   (see [`Server::log_lint_config_problems`]).
+//! - **Malformed input is not fatal**: a message whose params do not fit the
+//!   method's schema — a hover with no `position`, a `didOpen` carrying a
+//!   `file://` URI with an unencoded space (clients do send these; the URI
+//!   grammar rejects them) — is a *client* bug, and taking the editor's
+//!   language server down over one is the worst possible response. A
+//!   **request** is answered with `-32602 InvalidParams` naming the method and
+//!   the deserialization failure (see [`cast_request`]); a **notification**,
+//!   which has nobody to answer, is logged and dropped (see
+//!   [`Server::notification_params`]). Only genuine transport failures — a
+//!   closed stdin, a dead [`Connection`] — end the loop.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
+use lsp_server::{
+    Connection, ErrorCode, ExtractError, Message, Notification, Request, RequestId, Response,
+};
 use lsp_types::notification::{
     DidChangeConfiguration, DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument,
-    DidOpenTextDocument, Notification as _, Progress, PublishDiagnostics,
+    DidOpenTextDocument, Exit, LogMessage, Notification as _, Progress, PublishDiagnostics,
 };
 use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
@@ -36,12 +54,11 @@ use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyItem, CallHierarchyOutgoingCall,
     CallHierarchyServerCapability, CodeAction, CodeActionKind, CodeActionOrCommand,
     CodeActionProviderCapability, CompletionOptions, CompletionResponse,
-    DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
-    DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentHighlight, DocumentSymbolResponse, FileChangeType,
-    FileSystemWatcher, FoldingRange, FoldingRangeProviderCapability, GlobPattern,
-    GotoDefinitionResponse, Hover, HoverProviderCapability, ImplementationProviderCapability,
-    InitializeParams, InitializeResult, InlayHint, Location, OneOf, PrepareRenameResponse,
+    DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions, DocumentHighlight,
+    DocumentSymbolResponse, FileChangeType, FileSystemWatcher, FoldingRange,
+    FoldingRangeProviderCapability, GlobPattern, GotoDefinitionResponse, Hover,
+    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
+    InlayHint, Location, LogMessageParams, MessageType, OneOf, PrepareRenameResponse,
     ProgressParams, ProgressParamsValue, ProgressToken, PublishDiagnosticsParams, Registration,
     RegistrationParams, RenameOptions, SelectionRange, SelectionRangeProviderCapability,
     SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensResult,
@@ -52,8 +69,9 @@ use lsp_types::{
     WorkDoneProgressEnd, WorkDoneProgressReport, WorkspaceEdit, WorkspaceSymbolResponse,
 };
 use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
-use luabox_lint::{LintConfig, lint_source};
-use luabox_resolve::manifest::{Dependency, Lint, LintLevel, Manifest};
+use luabox_lint::{LintConfig, UnknownRuleId, lint_source};
+use luabox_manifest::layout::{self, DefFiles};
+use luabox_manifest::model::{DialectId, Manifest};
 use luabox_types::{Ambient, build_ambient};
 
 use crate::line_index::LineIndex;
@@ -61,9 +79,22 @@ use crate::sema::FileSema;
 use crate::uri::uri_to_path;
 use crate::{
     call_hierarchy, code_action, completion, diagnostics, document_highlight, fmt, folding,
-    goto_def, goto_impl, goto_type, hover, inlay_hints, references, rename, selection_range,
-    semantic_tokens, signature_help, symbols,
+    goto_definition, goto_implementation, goto_type_definition, hover, inlay_hints, references,
+    rename, selection_range, semantic_tokens, signature_help, symbols,
 };
+
+/// Best-effort stderr logging for a long-running server.
+///
+/// `eprintln!` panics when the write fails, and the release profile is
+/// `panic = "abort"` — so a client that closed our stderr (editor restart, a
+/// torn-down log pane, a client that never captured it) would take the whole
+/// language server down with SIGABRT the moment we tried to log. A dead log
+/// pipe must never kill the server: the message is dropped instead. (The
+/// CLI's emit seam exits 0 on a departed reader; that policy would be wrong
+/// here — an LSP must keep serving.)
+fn log_to_stderr(message: &str) {
+    let _ = writeln!(std::io::stderr(), "{message}");
+}
 
 /// Run the server over stdio until the client sends `shutdown`/`exit`.
 /// A leading `--stdio` argument, which editors commonly pass, is harmless:
@@ -80,7 +111,22 @@ pub fn run_stdio() -> anyhow::Result<()> {
 /// bootstrap, then the message loop. Returns after a clean shutdown.
 pub fn run(connection: Connection) -> anyhow::Result<()> {
     let (id, params) = connection.initialize_start()?;
-    let params: InitializeParams = serde_json::from_value(params)?;
+    // Params the handshake cannot decode (a `rootUri` with an unencoded space
+    // is the realistic one) end the session — there is no workspace to serve —
+    // but the client is told so on the id it is blocked on rather than left
+    // waiting for a pipe that just closed.
+    let params: InitializeParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(err) => {
+            let message = format!("malformed `initialize` request: {err}");
+            let _ = connection.sender.send(Message::Response(Response::new_err(
+                id,
+                ErrorCode::InvalidParams as i32,
+                message.clone(),
+            )));
+            anyhow::bail!(message);
+        }
+    };
     let result = InitializeResult {
         capabilities: server_capabilities(),
         server_info: Some(ServerInfo {
@@ -144,8 +190,9 @@ fn server_capabilities() -> ServerCapabilities {
             ..SignatureHelpOptions::default()
         }),
         // Goto type-definition (value → its `---@class`/`---@alias`/`---@enum`,
-        // see [`crate::goto_type`]) and goto-implementation (interface class →
-        // its subclasses, see [`crate::goto_impl`]).
+        // see [`crate::goto_type_definition`]) and goto-implementation
+        // (interface class → its subclasses, see
+        // [`crate::goto_implementation`]).
         type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
         implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
         references_provider: Some(OneOf::Left(true)),
@@ -213,6 +260,10 @@ struct ProjectConfig {
     /// built from `manifest.lint` the same way `luabox lint` builds it, so the
     /// editor honours the project's lint config exactly as the CLI does.
     lint: LintConfig,
+    /// `[lint]` keys naming no known rule id, handed back by the same
+    /// translation (CC-M8). Reported to the client as `window/logMessage`
+    /// warnings — see [`Server::log_lint_config_problems`].
+    unknown_lint_rules: Vec<UnknownRuleId>,
 }
 
 impl ProjectConfig {
@@ -223,136 +274,68 @@ impl ProjectConfig {
             out_dir: None,
             def_sources: Vec::new(),
             lint: LintConfig::new(),
+            unknown_lint_rules: Vec::new(),
         };
         let Ok(text) = fs::read_to_string(root.join("luabox.toml")) else {
             return defaults;
         };
         let Ok(manifest) = Manifest::parse(&text) else {
-            eprintln!("luabox-lsp: invalid luabox.toml; using defaults (5.4, warn)");
+            log_to_stderr("luabox-lsp: invalid luabox.toml; using defaults (5.4, warn)");
             return defaults;
         };
+        // One `[lint]` translation for the whole workspace (`luabox-lint`'s),
+        // shared with `luabox lint` — including the unknown-rule-id check the
+        // manifest parser cannot do (CC-M8).
+        let (lint, unknown_lint_rules) = LintConfig::from_manifest(&manifest.lint);
         Self {
-            dialect: Dialect::from_manifest_id(&manifest.package.edition).unwrap_or(Dialect::Lua54),
+            // `Manifest::parse` types `[package] edition` as a closed
+            // `DialectId`, so this maps inward exhaustively — there is no
+            // unknown-edition fallback left to take.
+            dialect: syntax_dialect(manifest.package.edition),
             strictness: Strictness::from_manifest_flag(manifest.types.strict),
             out_dir: Some(root.join(&manifest.build.out)),
             def_sources: ambient_def_sources(root, &manifest),
-            lint: build_lint_config(&manifest.lint),
+            lint,
+            unknown_lint_rules,
         }
     }
 }
 
-/// Translate the manifest `[lint]` table into a [`LintConfig`] — the id-level
-/// then tier-level overrides plus the `global-write` allow-list. Mirrors
-/// `luabox-cli::lint_cmd::build_config`; the LSP crate cannot depend on
-/// `luabox-cli`, so this is duplicated the same way `ambient_def_sources` is.
-fn build_lint_config(lint: &Lint) -> LintConfig {
-    let mut config = LintConfig::new();
-    for name in &lint.globals {
-        config.allow_global(name.clone());
-    }
-    for (tier, level) in &lint.tiers {
-        config.set_tier(tier, lint_level_keyword(*level));
-    }
-    for (rule, level) in &lint.rules {
-        config.set_rule(rule, lint_level_keyword(*level));
-    }
-    config
-}
-
-/// The `LintConfig` level keyword for a manifest [`LintLevel`] (mirrors
-/// `lint_cmd::level_keyword`).
-fn lint_level_keyword(level: LintLevel) -> &'static str {
-    match level {
-        LintLevel::Allow => "allow",
-        LintLevel::Warn => "warn",
-        LintLevel::Deny => "deny",
+/// The `luabox-syntax` dialect a validated manifest edition names.
+///
+/// Distribution never parses syntax (SPEC.md §16), so `luabox-manifest` cannot
+/// hand out a `Dialect` itself and each frontend owns this exhaustive match —
+/// duplicated with `luabox-cli::dialect::from_manifest` the same way
+/// `build_lint_config` is duplicated with `lint_cmd::build_config`.
+fn syntax_dialect(id: DialectId) -> Dialect {
+    match id {
+        DialectId::Lua51 => Dialect::Lua51,
+        DialectId::Lua52 => Dialect::Lua52,
+        DialectId::Lua53 => Dialect::Lua53,
+        DialectId::Lua54 => Dialect::Lua54,
+        DialectId::LuaJit => Dialect::LuaJit,
     }
 }
 
 /// Resolve the ambient definition-package sources for a project, winner-first
 /// (SPEC.md §3, #108): the project's own `[types] defs` from `<root>/defs/`,
 /// then every direct dependency's own `[types] defs` from that dependency's
-/// `defs/` (the luals `workspace.library` model). Mirrors
-/// `check_cmd::resolve_project_defs` + `resolve_dep_defs` in the CLI — the LSP
-/// crate cannot depend on `luabox-cli`, so this join is duplicated here the
-/// same way `resolve_dep_shape_exports` already is. The editor and CI thus
-/// build the same ambient scope. Cross-package class collisions (`LB0307`) are
-/// a project-wide, check-time concern and are not surfaced per file here.
+/// `defs/` (the luals `workspace.library` model).
+///
+/// The resolution is `luabox_manifest::layout`'s — the same walk `luabox
+/// check` and `luabox lint` run — so the editor and CI cannot disagree about
+/// which definitions are ambient. Only the texts are kept: `build_ambient`
+/// takes sources, and the labels exist for diagnostics the CLI renders.
+/// Cross-package class collisions (`LB0307`) are a project-wide, check-time
+/// concern and are not surfaced per file here; an unresolvable `[types] defs`
+/// entry is `luabox check`'s `LB1002` to report, not the editor's.
 fn ambient_def_sources(root: &Path, manifest: &Manifest) -> Vec<String> {
-    let mut sources = Vec::new();
-    load_defs_from(&root.join("defs"), &manifest.types.defs, &mut sources);
-
-    // `[dependencies]` + `[dev-dependencies]`, alphabetical by name (the
-    // deterministic winner order), one level deep only.
-    let mut deps: Vec<(&String, &Dependency)> = manifest
-        .dependencies
-        .iter()
-        .chain(&manifest.dev_dependencies)
-        .collect();
-    deps.sort_by(|a, b| a.0.cmp(b.0));
-    for (name, dep) in deps {
-        let dep_root = match dep {
-            Dependency::Path(p) => root.join(p.path.replace('\\', "/")),
-            _ => root.join("lua_modules").join(name),
-        };
-        let Ok(text) = fs::read_to_string(dep_root.join("luabox.toml")) else {
-            continue;
-        };
-        let Ok(dep_manifest) = Manifest::parse(&text) else {
-            continue;
-        };
-        load_defs_from(
-            &dep_root.join("defs"),
-            &dep_manifest.types.defs,
-            &mut sources,
-        );
-    }
-    sources
-}
-
-/// Append the `.d.lua` texts for each `[types] defs` entry resolved against
-/// `defs_dir` (`<name>.d.lua`, or every `*.d.lua` under `<name>/`), sorted.
-fn load_defs_from(defs_dir: &Path, names: &[String], out: &mut Vec<String>) {
-    for name in names {
-        let single = defs_dir.join(format!("{name}.d.lua"));
-        if single.is_file()
-            && let Ok(text) = fs::read_to_string(&single)
-        {
-            out.push(text);
-        }
-        let dir = defs_dir.join(name);
-        if dir.is_dir() {
-            let mut files = Vec::new();
-            collect_d_lua(&dir, &mut files);
-            files.sort();
-            for file in files {
-                if let Ok(text) = fs::read_to_string(&file) {
-                    out.push(text);
-                }
-            }
-        }
-    }
-}
-
-/// Collect every `*.d.lua` file under `dir`, recursively (mirrors the CLI's
-/// helper of the same name).
-fn collect_d_lua(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_d_lua(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("lua")
-            && path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(".d.lua"))
-        {
-            out.push(path);
-        }
-    }
+    let (project_defs, _unresolved) = layout::resolve_project_defs(root, &manifest.types.defs);
+    project_defs
+        .into_iter()
+        .chain(layout::resolve_dep_defs(root, manifest))
+        .map(|def| def.text)
+        .collect()
 }
 
 /// The server state: the analysis host over the project's `.lua` files.
@@ -391,7 +374,7 @@ impl Server {
         // strings resolve exactly as `luabox check` resolves them on disk (the
         // bundler's SPEC.md §7 path-mapping) — editor and CI in lockstep.
         host.set_root(root.clone());
-        Self {
+        let server = Self {
             connection,
             host,
             root,
@@ -402,7 +385,46 @@ impl Server {
             lint: config.lint,
             known_globals,
             open_docs: HashMap::new(),
+        };
+        // Safe to send: `run` only builds the server after `initialize_finish`.
+        server.log_lint_config_problems(&config.unknown_lint_rules);
+        server
+    }
+
+    /// Tell the client about `[lint]` keys that name no known rule id, as
+    /// `window/logMessage` warnings — one per key, wording (and the "did you
+    /// mean" nudge) shared with `luabox lint`'s `LB1004`.
+    ///
+    /// Not `publishDiagnostics`: that is per-document and keyed by URI, and
+    /// this is a manifest problem, not a `.lua` one — the editor would have to
+    /// be told to open `luabox.toml` as a diagnostic target it otherwise never
+    /// analyses. It is not `window/showMessage` either: a popup per unknown
+    /// key on every config reload is noise. `logMessage` is where the other
+    /// manifest complaint in this file goes (an unparseable `luabox.toml`,
+    /// which still only reaches stderr) and is what the log pane is for.
+    fn log_lint_config_problems(&self, unknown: &[UnknownRuleId]) {
+        for entry in unknown {
+            let mut message = format!("luabox.toml: {}", entry.message());
+            for note in entry.notes() {
+                let _ = write!(message, " — {note}");
+            }
+            self.log_message(MessageType::WARNING, message);
         }
+    }
+
+    /// Send one `window/logMessage` notification.
+    fn log_message(&self, typ: MessageType, message: String) {
+        let params = LogMessageParams { typ, message };
+        let Ok(value) = serde_json::to_value(params) else {
+            return;
+        };
+        let _ = self
+            .connection
+            .sender
+            .send(Message::Notification(Notification::new(
+                LogMessage::METHOD.to_owned(),
+                value,
+            )));
     }
 
     /// Re-read `luabox.toml` and rebuild every cached setting derived from it —
@@ -418,6 +440,8 @@ impl Server {
         self.known_globals = ambient.global_names().clone();
         self.ambient = ambient;
         self.lint = config.lint;
+        // Re-report: the reload may have introduced (or fixed) a typo'd key.
+        self.log_lint_config_problems(&config.unknown_lint_rules);
         self.strictness = config.strictness;
         self.out_dir = config.out_dir;
         self.host
@@ -515,34 +539,24 @@ impl Server {
         }
     }
 
-    /// Walk the workspace tree and collect every non-hidden `.lua` file path,
-    /// skipping the manifest's `[build] out` directory (the same traversal the
-    /// eager index and `luabox check` use).
+    /// Every first-party `.lua` file under the workspace root, in the walk's
+    /// deterministic order — `luabox_manifest::layout`'s walk, the one
+    /// `luabox check` uses, so the editor indexes exactly the files CI checks.
+    ///
+    /// This used to be a private copy of the walk, and had drifted twice: it
+    /// descended into vendored `lua_modules/` rock trees (indexing whatever
+    /// luarocks materialized as if it were your code) and it visited entries
+    /// in `read_dir` order rather than sorted.
+    ///
+    /// An unreadable root leaves the index empty rather than killing the
+    /// server: open buffers still analyse from their overlays, which is a far
+    /// better editor experience than refusing to start.
     fn collect_lua_files(&self) -> Vec<PathBuf> {
-        let mut files = Vec::new();
-        let mut stack = vec![self.root.clone()];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let hidden = entry.file_name().to_string_lossy().starts_with('.');
-                if hidden {
-                    continue;
-                }
-                if path.is_dir() {
-                    if self.out_dir.as_deref() != Some(path.as_path()) {
-                        stack.push(path);
-                    }
-                    continue;
-                }
-                if path.extension().and_then(|e| e.to_str()) == Some("lua") {
-                    files.push(path);
-                }
-            }
-        }
-        files
+        layout::collect_lua_files(&self.root, self.out_dir.as_deref(), DefFiles::Include)
+            .unwrap_or_else(|err| {
+                log_to_stderr(&format!("luabox-lsp: cannot index workspace: {err}"));
+                Vec::new()
+            })
     }
 
     /// Create the bootstrap progress token on the client and send `begin`.
@@ -615,11 +629,30 @@ impl Server {
 
     // === Requests =========================================================
 
+    /// Answer one request. Every path produces a response — a result, a
+    /// `MethodNotFound` for a method outside the advertised set, or the
+    /// `InvalidParams` [`cast_request`] hands back for params that do not
+    /// decode — so the client is never left holding an unanswered id. Only
+    /// the send itself can fail, and a dead transport is fatal by design.
+    fn handle_request(&mut self, req: Request) -> anyhow::Result<()> {
+        let response = self
+            .dispatch(req)
+            .unwrap_or_else(|invalid_params| invalid_params);
+        self.connection.sender.send(Message::Response(response))?;
+        Ok(())
+    }
+
+    /// The per-method dispatch table. `Err` carries a ready-to-send
+    /// `InvalidParams` response rather than a fatal error: [`handle_request`]
+    /// sends either arm, so a malformed request costs the client one error
+    /// reply and costs the session nothing.
+    ///
+    /// [`handle_request`]: Self::handle_request
     #[allow(
         clippy::too_many_lines,
         reason = "a flat per-method dispatch table — one arm per LSP request, each a few lines"
     )]
-    fn handle_request(&mut self, req: Request) -> anyhow::Result<()> {
+    fn dispatch(&mut self, req: Request) -> Result<Response, Response> {
         let response = match req.method.as_str() {
             HoverRequest::METHOD => {
                 let (id, params) = cast_request::<HoverRequest>(req)?;
@@ -764,101 +797,99 @@ impl Server {
                 format!("unhandled method `{}`", req.method),
             ),
         };
-        self.connection.sender.send(Message::Response(response))?;
-        Ok(())
+        Ok(response)
+    }
+
+    /// The analysis snapshot and semantic view for the document `uri` names,
+    /// or `None` when the URI is not a file the analysis knows.
+    ///
+    /// Every handler starts here. The snapshot is *returned alongside* the
+    /// view rather than taken and dropped inside: a handler that also queries
+    /// the workspace (references, rename, the goto family) must see the same
+    /// consistent snapshot the view was built from, and salsa memoization only
+    /// pays off while it is alive.
+    fn file(&self, uri: &Uri) -> Option<(Analysis, FileSema)> {
+        let path = uri_to_path(uri)?;
+        let snapshot = self.host.snapshot();
+        let sema = FileSema::new(&snapshot, &path)?;
+        Some((snapshot, sema))
+    }
+
+    /// [`Self::file`] plus the byte offset `position` names in that document —
+    /// the prelude of every position-addressed request.
+    fn at(&self, uri: &Uri, position: lsp_types::Position) -> Option<(Analysis, FileSema, usize)> {
+        let (snapshot, sema) = self.file(uri)?;
+        let offset = sema.index.offset(position);
+        Some((snapshot, sema, offset))
     }
 
     fn hover(&self, uri: &Uri, position: lsp_types::Position) -> Option<Hover> {
-        let path = uri_to_path(uri)?;
-        let sema = self.sema(&path)?;
-        let offset = sema.index.offset(position);
+        let (_snapshot, sema, offset) = self.at(uri, position)?;
         hover::hover(&sema, offset)
     }
 
     /// The callee's resolved signature(s) while `position` sits inside a
     /// call's argument list (see [`crate::signature_help`]).
     fn signature_help(&self, uri: &Uri, position: lsp_types::Position) -> Option<SignatureHelp> {
-        let path = uri_to_path(uri)?;
-        let sema = self.sema(&path)?;
-        let offset = sema.index.offset(position);
+        let (_snapshot, sema, offset) = self.at(uri, position)?;
         signature_help::signature_help(&sema, offset)
     }
 
     /// The call-hierarchy item for the function the cursor names at `position`
-    /// — a declaration or a call site (see [`crate::call_hierarchy`]). Reuses
-    /// one snapshot for the whole resolution.
+    /// — a declaration or a call site (see [`crate::call_hierarchy`]).
     fn prepare_call_hierarchy(
         &self,
         uri: &Uri,
         position: lsp_types::Position,
     ) -> Option<Vec<CallHierarchyItem>> {
-        let path = uri_to_path(uri)?;
-        let snapshot = self.host.snapshot();
-        let sema = FileSema::new(&snapshot, &path)?;
-        let offset = sema.index.offset(position);
-        call_hierarchy::prepare(&snapshot, &sema, offset)
+        let (snapshot, sema, offset) = self.at(uri, position)?;
+        call_hierarchy::prepare_call_hierarchy(&snapshot, &sema, offset)
     }
 
     /// The call sites across the workspace that call `item`, grouped by their
     /// enclosing function (see [`crate::call_hierarchy`]).
     fn incoming_calls(&self, item: &CallHierarchyItem) -> Option<Vec<CallHierarchyIncomingCall>> {
-        let path = uri_to_path(&item.uri)?;
-        let snapshot = self.host.snapshot();
-        let sema = FileSema::new(&snapshot, &path)?;
+        let (snapshot, sema) = self.file(&item.uri)?;
         Some(call_hierarchy::incoming_calls(&snapshot, &sema, item))
     }
 
     /// The functions called within `item`'s body (see
     /// [`crate::call_hierarchy`]).
     fn outgoing_calls(&self, item: &CallHierarchyItem) -> Option<Vec<CallHierarchyOutgoingCall>> {
-        let path = uri_to_path(&item.uri)?;
-        let snapshot = self.host.snapshot();
-        let sema = FileSema::new(&snapshot, &path)?;
+        let (snapshot, sema) = self.file(&item.uri)?;
         Some(call_hierarchy::outgoing_calls(&snapshot, &sema, item))
     }
 
     fn definition(&self, uri: &Uri, position: lsp_types::Position) -> Option<Location> {
-        let path = uri_to_path(uri)?;
-        let sema = self.sema(&path)?;
-        let offset = sema.index.offset(position);
-        goto_def::goto_definition(&sema, offset, &self.root, self.dialect)
+        let (_snapshot, sema, offset) = self.at(uri, position)?;
+        goto_definition::definition(&sema, offset, &self.root, self.dialect)
     }
 
     /// The declaration of the type carried by the value at `position`: its
     /// `---@class`/`---@alias`/`---@enum`, searched workspace-wide (declarations
-    /// are workspace-global). Reuses one snapshot for the whole scan.
+    /// are workspace-global).
     fn type_definition(&self, uri: &Uri, position: lsp_types::Position) -> Option<Location> {
-        let path = uri_to_path(uri)?;
-        let snapshot = self.host.snapshot();
-        let sema = FileSema::new(&snapshot, &path)?;
-        let offset = sema.index.offset(position);
-        goto_type::goto_type_definition(&snapshot, &sema, offset)
+        let (snapshot, sema, offset) = self.at(uri, position)?;
+        goto_type_definition::type_definition(&snapshot, &sema, offset)
     }
 
     /// Every implementor of the `---@class` at `position`: each workspace class
-    /// that lists it as a parent (see [`crate::goto_impl`]). Reuses one snapshot
-    /// for the whole cross-file scan.
+    /// that lists it as a parent (see [`crate::goto_implementation`]).
     fn implementation(&self, uri: &Uri, position: lsp_types::Position) -> Option<Vec<Location>> {
-        let path = uri_to_path(uri)?;
-        let snapshot = self.host.snapshot();
-        let sema = FileSema::new(&snapshot, &path)?;
-        let offset = sema.index.offset(position);
-        goto_impl::goto_implementation(&snapshot, &sema, offset)
+        let (snapshot, sema, offset) = self.at(uri, position)?;
+        goto_implementation::implementation(&snapshot, &sema, offset)
     }
 
     /// All references to the symbol at `position`. Locals/upvalues are found in
     /// the file itself; globals and class members are searched across every
-    /// file the snapshot knows about, reusing one snapshot for the whole scan.
+    /// file the snapshot knows about.
     fn references(
         &self,
         uri: &Uri,
         position: lsp_types::Position,
         include_declaration: bool,
     ) -> Option<Vec<Location>> {
-        let path = uri_to_path(uri)?;
-        let snapshot = self.host.snapshot();
-        let sema = FileSema::new(&snapshot, &path)?;
-        let offset = sema.index.offset(position);
+        let (snapshot, sema, offset) = self.at(uri, position)?;
         references::references(&snapshot, &sema, offset, include_declaration)
     }
 
@@ -872,10 +903,7 @@ impl Server {
         position: lsp_types::Position,
         new_name: &str,
     ) -> Option<WorkspaceEdit> {
-        let path = uri_to_path(uri)?;
-        let snapshot = self.host.snapshot();
-        let sema = FileSema::new(&snapshot, &path)?;
-        let offset = sema.index.offset(position);
+        let (snapshot, sema, offset) = self.at(uri, position)?;
         rename::rename(&snapshot, &sema, offset, new_name)
     }
 
@@ -886,38 +914,30 @@ impl Server {
         uri: &Uri,
         position: lsp_types::Position,
     ) -> Option<PrepareRenameResponse> {
-        let path = uri_to_path(uri)?;
-        let snapshot = self.host.snapshot();
-        let sema = FileSema::new(&snapshot, &path)?;
-        let offset = sema.index.offset(position);
+        let (snapshot, sema, offset) = self.at(uri, position)?;
         rename::prepare_rename(&snapshot, &sema, offset).map(PrepareRenameResponse::Range)
     }
 
     /// Completions at `position`: scope/member items plus auto-require imports
-    /// (see [`crate::completion`]). Reuses one snapshot for the whole pass —
-    /// the auto-require enumeration reads every workspace file's memoized
-    /// module export.
+    /// (see [`crate::completion`]) — the auto-require enumeration reads every
+    /// workspace file's memoized module export off the same snapshot.
     fn completion(
         &self,
         uri: &Uri,
         position: lsp_types::Position,
     ) -> Option<Vec<lsp_types::CompletionItem>> {
-        let path = uri_to_path(uri)?;
-        let snapshot = self.host.snapshot();
-        let sema = FileSema::new(&snapshot, &path)?;
-        let offset = sema.index.offset(position);
+        let (snapshot, sema, offset) = self.at(uri, position)?;
         Some(completion::completion(&sema, offset, &snapshot, &self.root))
     }
 
     fn document_symbols(&self, uri: &Uri) -> Option<Vec<lsp_types::DocumentSymbol>> {
-        let path = uri_to_path(uri)?;
-        let sema = self.sema(&path)?;
+        let (_snapshot, sema) = self.file(uri)?;
         Some(symbols::document_symbols(&sema))
     }
 
     /// Fuzzy (case-insensitive substring) search for `query` across every
-    /// `.lua` file the analysis snapshot knows about, reusing one snapshot
-    /// for the whole scan (mirrors [`Self::references`]): classes, functions,
+    /// `.lua` file the analysis snapshot knows about — one snapshot for the
+    /// whole scan, like [`Self::references`]: classes, functions,
     /// fields/methods, and aliases/enums (see
     /// [`symbols::workspace_symbols`]). Results are deduplicated by name and
     /// location, sorted for a deterministic response, then capped at
@@ -950,10 +970,7 @@ impl Server {
         uri: &Uri,
         position: lsp_types::Position,
     ) -> Option<Vec<DocumentHighlight>> {
-        let path = uri_to_path(uri)?;
-        let snapshot = self.host.snapshot();
-        let sema = FileSema::new(&snapshot, &path)?;
-        let offset = sema.index.offset(position);
+        let (snapshot, sema, offset) = self.at(uri, position)?;
         document_highlight::document_highlight(&snapshot, &sema, offset)
     }
 
@@ -961,8 +978,7 @@ impl Server {
     /// runs (see [`crate::folding`]) — pure syntax-tree geometry, no
     /// semantic analysis needed.
     fn folding_ranges(&self, uri: &Uri) -> Option<Vec<FoldingRange>> {
-        let path = uri_to_path(uri)?;
-        let sema = self.sema(&path)?;
+        let (_snapshot, sema) = self.file(uri)?;
         Some(folding::folding_ranges(&sema))
     }
 
@@ -973,8 +989,7 @@ impl Server {
         uri: &Uri,
         positions: &[lsp_types::Position],
     ) -> Option<Vec<SelectionRange>> {
-        let path = uri_to_path(uri)?;
-        let sema = self.sema(&path)?;
+        let (_snapshot, sema) = self.file(uri)?;
         Some(selection_range::selection_ranges(&sema, positions))
     }
 
@@ -983,18 +998,19 @@ impl Server {
     /// when nothing changed — including the formatters' parse-error
     /// "return input unchanged" guarantee, which must not become an error.
     fn formatting(&self, uri: &Uri) -> Option<Vec<TextEdit>> {
+        // The one handler that needs no semantic view: the formatter takes the
+        // text and re-parses it itself.
         let path = uri_to_path(uri)?;
         let text = self.host.snapshot().file_text(&path)?;
         let formatted = luabox_syntax::lua::fmt::format(&text, self.dialect);
-        Some(fmt::full_document_edits(&text, &formatted))
+        Some(fmt::formatting(&text, &formatted))
     }
 
     fn semantic_tokens(&self, uri: &Uri) -> Option<SemanticTokensResult> {
-        let path = uri_to_path(uri)?;
-        let data = semantic_tokens::lua_tokens(&self.sema(&path)?);
+        let (_snapshot, sema) = self.file(uri)?;
         Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,
-            data,
+            data: semantic_tokens::semantic_tokens(&sema),
         }))
     }
 
@@ -1002,10 +1018,8 @@ impl Server {
     /// display-mode inference's binding types and inferred function
     /// returns (see [`crate::inlay_hints`]).
     fn inlay_hints(&self, uri: &Uri, range: lsp_types::Range) -> Option<Vec<InlayHint>> {
-        let path = uri_to_path(uri)?;
-        let snapshot = self.host.snapshot();
-        let sema = FileSema::new(&snapshot, &path)?;
-        let inferred = snapshot.binding_types(&path)?;
+        let (snapshot, sema) = self.file(uri)?;
+        let inferred = snapshot.binding_types(&sema.path)?;
         let start = sema.index.offset(range.start);
         let end = sema.index.offset(range.end);
         Some(inlay_hints::inlay_hints(
@@ -1030,11 +1044,9 @@ impl Server {
         reason = "WorkspaceEdit keys its edits by Uri; the lint's interior-mutability concern does not affect Uri's hash"
     )]
     fn code_actions(&self, uri: &Uri, range: lsp_types::Range) -> Option<Vec<CodeActionOrCommand>> {
-        let path = uri_to_path(uri)?;
-        let snapshot = self.host.snapshot();
-        let text = snapshot.file_text(&path)?;
-        let index = LineIndex::new(text);
-        let rel = path.to_string_lossy();
+        let (snapshot, sema) = self.file(uri)?;
+        let index = &sema.index;
+        let rel = sema.path.to_string_lossy();
         let outcome = lint_source(
             &rel,
             index.text(),
@@ -1075,7 +1087,7 @@ impl Server {
                 title,
                 kind: Some(CodeActionKind::QUICKFIX),
                 diagnostics: source_diag
-                    .map(|d| vec![diagnostics::convert(&index, d, diagnostics::LINT_SOURCE)]),
+                    .map(|d| vec![diagnostics::convert(index, d, diagnostics::LINT_SOURCE)]),
                 edit: Some(WorkspaceEdit {
                     changes: Some(changes),
                     ..WorkspaceEdit::default()
@@ -1090,38 +1102,61 @@ impl Server {
         // types; the type diagnostics (recomputed with the same helper and
         // context as `publish_lua`, so an `LB0302` offered on a quick-fix is
         // byte-identical to the published one) drive add-missing-field.
-        if let Some(sema) = FileSema::new(&snapshot, &path) {
-            let inferred = snapshot.binding_types(&path);
-            let ctx = diagnostics::CheckCtx {
-                strictness: self.strictness,
-                ambient: &self.ambient,
-                lint: &self.lint,
-                known_globals: &self.known_globals,
-            };
-            let type_diags = diagnostics::lua_diagnostics(&snapshot, &path, self.dialect, &ctx)
-                .unwrap_or_default();
-            actions.extend(code_action::type_actions(
-                &sema,
-                inferred.as_ref(),
-                &type_diags,
-                uri,
-                start,
-                end,
-            ));
-        }
+        let inferred = snapshot.binding_types(&sema.path);
+        let ctx = diagnostics::CheckCtx {
+            strictness: self.strictness,
+            ambient: &self.ambient,
+            lint: &self.lint,
+            known_globals: &self.known_globals,
+        };
+        let type_diags =
+            diagnostics::diagnostics(&snapshot, &sema.path, self.dialect, &ctx).unwrap_or_default();
+        actions.extend(code_action::code_actions(
+            &sema,
+            inferred.as_ref(),
+            &type_diags,
+            uri,
+            start,
+            end,
+        ));
         Some(actions)
-    }
-
-    fn sema(&self, path: &Path) -> Option<FileSema> {
-        FileSema::new(&self.host.snapshot(), path)
     }
 
     // === Notifications ====================================================
 
+    /// Decode a notification's params, or log the problem and drop it.
+    ///
+    /// A notification carries no id, so there is nobody to answer and the
+    /// protocol forbids replying to one: the client's log pane is the only
+    /// honest channel, and it is where this file's other "your project is
+    /// misconfigured" complaints already go (see
+    /// [`Self::log_lint_config_problems`]). What must *not* happen is the old
+    /// behaviour — propagating the error out of the message loop, so a
+    /// `didOpen` whose URI held an unencoded space (or whose `languageId` the
+    /// client forgot) ended the editor session.
+    fn notification_params<N: lsp_types::notification::Notification>(
+        &self,
+        params: serde_json::Value,
+    ) -> Option<N::Params> {
+        match serde_json::from_value(params) {
+            Ok(params) => Some(params),
+            Err(err) => {
+                self.log_message(
+                    MessageType::ERROR,
+                    format!("ignoring malformed `{}` notification: {err}", N::METHOD),
+                );
+                None
+            }
+        }
+    }
+
     fn handle_notification(&mut self, not: Notification) -> anyhow::Result<()> {
         match not.method.as_str() {
             DidOpenTextDocument::METHOD => {
-                let params: DidOpenTextDocumentParams = serde_json::from_value(not.params)?;
+                let Some(params) = self.notification_params::<DidOpenTextDocument>(not.params)
+                else {
+                    return Ok(());
+                };
                 let uri = params.text_document.uri;
                 if let Some(path) = uri_to_path(&uri) {
                     self.open_docs.insert(path, uri.clone());
@@ -1129,7 +1164,10 @@ impl Server {
                 self.set_text(&uri, params.text_document.text)?;
             }
             DidChangeTextDocument::METHOD => {
-                let params: DidChangeTextDocumentParams = serde_json::from_value(not.params)?;
+                let Some(params) = self.notification_params::<DidChangeTextDocument>(not.params)
+                else {
+                    return Ok(());
+                };
                 let uri = params.text_document.uri;
                 // Incremental sync: apply each ranged edit in order against the
                 // current overlay/disk text to rebuild the new buffer.
@@ -1141,7 +1179,10 @@ impl Server {
                 self.set_text(&uri, text)?;
             }
             DidCloseTextDocument::METHOD => {
-                let params: DidCloseTextDocumentParams = serde_json::from_value(not.params)?;
+                let Some(params) = self.notification_params::<DidCloseTextDocument>(not.params)
+                else {
+                    return Ok(());
+                };
                 if let Some(path) = uri_to_path(&params.text_document.uri) {
                     self.open_docs.remove(&path);
                 }
@@ -1153,8 +1194,21 @@ impl Server {
                 self.reload_config()?;
             }
             DidChangeWatchedFiles::METHOD => {
-                let params: DidChangeWatchedFilesParams = serde_json::from_value(not.params)?;
+                let Some(params) = self.notification_params::<DidChangeWatchedFiles>(not.params)
+                else {
+                    return Ok(());
+                };
                 self.watched_files_changed(&params)?;
+            }
+            // `exit` only reaches this table when it was *not* preceded by
+            // `shutdown`: the ordered pair is consumed inside
+            // `Connection::handle_shutdown`, which waits for the notification
+            // itself. The spec is explicit about the unordered case — the
+            // server exits with code 1 — and this error is how the CLI
+            // frontend reaches that code (`main` maps any `Err` to
+            // `ExitCode::FAILURE`).
+            Exit::METHOD => {
+                anyhow::bail!("received `exit` without a prior `shutdown`");
             }
             // `textDocument/didSave` is a deliberate no-op — the overlay is
             // already the saved content. Everything else is ignored.
@@ -1254,7 +1308,7 @@ impl Server {
             known_globals: &self.known_globals,
         };
         let diags =
-            diagnostics::lua_diagnostics(&analysis, path, self.dialect, &ctx).unwrap_or_default();
+            diagnostics::diagnostics(&analysis, path, self.dialect, &ctx).unwrap_or_default();
         self.publish(uri, diags)
     }
 
@@ -1316,12 +1370,33 @@ fn apply_content_changes(text: String, changes: Vec<TextDocumentContentChangeEve
     text
 }
 
-/// Extract a request's id and params, or surface a protocol error.
+/// Extract a request's id and params, or the JSON-RPC error response to send
+/// in their place.
+///
+/// The failure is a *client* bug — a hover with no `position`, a line number
+/// sent as a string, a `file://` URI the grammar rejects because a space in it
+/// was never percent-encoded — and the protocol has an answer for exactly
+/// that: `-32602 InvalidParams`, naming the method and what would not decode.
+/// This used to return an `anyhow::Error` that propagated out of the message
+/// loop, so one bad message killed the process and left the request the client
+/// was blocked on unanswered forever.
 fn cast_request<R: lsp_types::request::Request>(
     req: Request,
-) -> anyhow::Result<(RequestId, R::Params)> {
-    req.extract(R::METHOD)
-        .map_err(|e| anyhow::anyhow!("malformed `{}` request: {e:?}", R::METHOD))
+) -> Result<(RequestId, R::Params), Response> {
+    // `extract` consumes the request, so keep the id for the error response.
+    let id = req.id.clone();
+    req.extract(R::METHOD).map_err(|err| {
+        let detail = match err {
+            ExtractError::JsonError { error, .. } => error.to_string(),
+            // Unreachable: the caller dispatches on the method first.
+            ExtractError::MethodMismatch(req) => format!("method mismatch (`{}`)", req.method),
+        };
+        Response::new_err(
+            id,
+            ErrorCode::InvalidParams as i32,
+            format!("malformed `{}` request: {detail}", R::METHOD),
+        )
+    })
 }
 
 /// The cap on [`Server::workspace_symbols`]'s response: generous for any real
@@ -1353,14 +1428,17 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    use lsp_server::{Connection, Message, Notification, Request, RequestId};
+    use lsp_types::notification::{DidOpenTextDocument, Notification as _};
+    use lsp_types::request::{HoverRequest, Request as _};
     use lsp_types::{Position, Range, TextDocumentContentChangeEvent};
     use luabox_lint::LintConfig;
-    use luabox_resolve::manifest::{Lint, LintLevel, Manifest};
+    use luabox_manifest::model::{Lint, LintLevel, LintTier, Manifest};
+    use serde_json::{Value, json};
     use tempfile::TempDir;
 
     use super::{
-        ProjectConfig, ambient_def_sources, apply_content_changes, build_lint_config,
-        collect_d_lua, lint_level_keyword, load_defs_from, root_path,
+        ErrorCode, ProjectConfig, Server, ambient_def_sources, apply_content_changes, root_path,
     };
 
     /// A ranged change replacing `[start, end)` with `text`.
@@ -1563,36 +1641,73 @@ mod tests {
     // === Lint configuration ===============================================
 
     #[test]
-    fn manifest_lint_levels_map_to_config_keywords() {
-        assert_eq!(lint_level_keyword(LintLevel::Allow), "allow");
-        assert_eq!(lint_level_keyword(LintLevel::Warn), "warn");
-        assert_eq!(lint_level_keyword(LintLevel::Deny), "deny");
-    }
-
-    #[test]
     fn manifest_globals_tiers_and_rules_reach_the_lint_config() {
         let manifest = Manifest::parse(
             "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n\n[lint]\nglobals = [\"MY_GLOBAL\"]\nstyle = \"deny\"\nunused-local = \"allow\"\n",
         )
         .expect("manifest");
-        let config = build_lint_config(&manifest.lint);
+        let (config, unknown) = LintConfig::from_manifest(&manifest.lint);
+        assert!(unknown.is_empty(), "{unknown:?}");
         assert!(config.is_allowed_global("MY_GLOBAL"));
         assert!(!config.is_allowed_global("other"));
         // A tier key lands in `tiers`, anything else in `rules`.
-        assert_eq!(manifest.lint.tiers.get("style"), Some(&LintLevel::Deny));
+        assert_eq!(
+            manifest.lint.tiers.get(&LintTier::Style),
+            Some(&LintLevel::Deny)
+        );
         assert_eq!(
             manifest.lint.rules.get("unused-local"),
             Some(&LintLevel::Allow)
         );
-        // Both override names are ones `LintConfig` accepts.
+        // Both overrides reach the config through the typed setters.
         let mut probe = LintConfig::new();
-        assert!(probe.set_tier("style", "deny"));
-        assert!(probe.set_rule("unused-local", "allow"));
+        probe.set_tier(LintTier::Style.into(), LintLevel::Deny.into());
+        probe.set_rule("unused-local", LintLevel::Allow.into());
+    }
+
+    #[test]
+    fn a_typod_lint_key_reaches_the_server_as_an_unknown_rule_id() {
+        // The editor honours `[lint]` through the same translation as the CLI,
+        // so it sees the same unknown ids — and surfaces them on
+        // `window/logMessage` (CC-M8). `pedantics` covers the tier-typo case:
+        // it lands in `rules`, and the nudge points back at the tier.
+        let dir = TempDir::new().expect("tempdir");
+        fs::write(
+            dir.path().join("luabox.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n\n[lint]\nunused-locl = \"allow\"\npedantics = \"warn\"\n",
+        )
+        .expect("write");
+
+        let config = ProjectConfig::discover(dir.path());
+        let reported: Vec<(&str, Option<&str>)> = config
+            .unknown_lint_rules
+            .iter()
+            .map(|u| (u.id(), u.suggestion()))
+            .collect();
+        assert_eq!(
+            reported,
+            [
+                ("pedantics", Some("pedantic")),
+                ("unused-locl", Some("unused-local")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_project_without_a_manifest_reports_no_lint_config_problems() {
+        let dir = TempDir::new().expect("tempdir");
+        assert!(
+            ProjectConfig::discover(dir.path())
+                .unknown_lint_rules
+                .is_empty()
+        );
     }
 
     #[test]
     fn an_empty_lint_table_leaves_the_config_untouched() {
-        let config = build_lint_config(&Lint::default());
+        let (config, unknown) = LintConfig::from_manifest(&Lint::default());
+        assert!(config.unknown_rule_ids().is_empty());
+        assert!(unknown.is_empty());
         assert!(!config.is_allowed_global("anything"));
     }
 
@@ -1693,26 +1808,233 @@ mod tests {
         write(root, "defs/pkg/nested/b.d.lua", "---@meta\n-- b\n");
         // A plain `.lua` file is not a definition file.
         write(root, "defs/pkg/ignored.lua", "-- ignored\n");
-        let mut out = Vec::new();
-        load_defs_from(&root.join("defs"), &["pkg".to_string()], &mut out);
-        assert_eq!(out.len(), 2, "{out:?}");
-        assert!(out[0].contains("-- a"), "{out:?}");
-        assert!(out[1].contains("-- b"), "{out:?}");
+
+        let manifest = manifest_of(&format!("{MANIFEST_HEAD}\n[types]\ndefs = [\"pkg\"]\n"));
+        let sources = ambient_def_sources(root, &manifest);
+        assert_eq!(sources.len(), 2, "{sources:?}");
+        assert!(sources[0].contains("-- a"), "{sources:?}");
+        assert!(sources[1].contains("-- b"), "{sources:?}");
     }
 
     #[test]
     fn a_defs_name_matching_neither_a_file_nor_a_directory_contributes_nothing() {
+        // The editor does not report the unresolved entry (that is `luabox
+        // check`'s `LB1002`); it simply builds an ambient layer without it.
         let dir = TempDir::new().expect("tempdir");
-        let mut out = Vec::new();
-        load_defs_from(&dir.path().join("defs"), &["absent".to_string()], &mut out);
-        assert!(out.is_empty());
+        let manifest = manifest_of(&format!("{MANIFEST_HEAD}\n[types]\ndefs = [\"absent\"]\n"));
+        assert!(ambient_def_sources(dir.path(), &manifest).is_empty());
+    }
+
+    // === Malformed messages ===============================================
+    //
+    // The server is spoken to by editors, and editors send nonsense: params
+    // that predate a protocol revision, a URI whose spaces were never
+    // percent-encoded, a `null` where an object belongs. None of it may end
+    // the session. These drive `Server`'s two entry points directly over an
+    // in-memory connection, so the assertions are about the *messages the
+    // client would see*, not about a process that happens to still be alive.
+
+    /// A server on an in-memory connection over an empty project, plus the
+    /// client end of the wire and the tempdir that must outlive both.
+    fn test_server() -> (TempDir, Server, Connection) {
+        let dir = TempDir::new().expect("tempdir");
+        let (server_end, client) = Connection::memory();
+        let server = Server::new(server_end, dir.path().to_path_buf());
+        (dir, server, client)
+    }
+
+    /// Everything the client end has received so far.
+    fn drain(client: &Connection) -> Vec<Message> {
+        std::iter::from_fn(|| client.receiver.try_recv().ok()).collect()
+    }
+
+    /// The single response among `messages`.
+    fn sole_response(messages: &[Message]) -> &lsp_server::Response {
+        let mut responses = messages.iter().filter_map(|m| match m {
+            Message::Response(response) => Some(response),
+            _ => None,
+        });
+        let response = responses.next().expect("the server answered the request");
+        assert!(responses.next().is_none(), "exactly one response");
+        response
+    }
+
+    /// A `textDocument/hover` request carrying `params`.
+    fn hover_request(id: i32, params: Value) -> Request {
+        Request {
+            id: RequestId::from(id),
+            method: HoverRequest::METHOD.to_string(),
+            params,
+        }
     }
 
     #[test]
-    fn collect_d_lua_on_a_missing_directory_yields_nothing() {
-        let dir = TempDir::new().expect("tempdir");
-        let mut out = Vec::new();
-        collect_d_lua(&dir.path().join("not-here"), &mut out);
-        assert!(out.is_empty());
+    fn a_request_whose_params_do_not_decode_is_answered_with_invalid_params() {
+        let (_dir, mut server, client) = test_server();
+        // A hover with no `position` at all: `HoverParams` cannot be built
+        // from it, and the client is blocked on id 1 until somebody says so.
+        let request = hover_request(1, json!({ "textDocument": { "uri": "file:///tmp/a.lua" } }));
+        server
+            .handle_request(request)
+            .expect("a malformed request is not a transport failure");
+
+        let messages = drain(&client);
+        let response = sole_response(&messages);
+        assert_eq!(response.id, RequestId::from(1));
+        let error = response.error.as_ref().expect("an error response");
+        assert_eq!(error.code, ErrorCode::InvalidParams as i32);
+        // The message names the method and what would not decode, so the
+        // client's log says which request it got wrong.
+        assert!(
+            error.message.contains("textDocument/hover"),
+            "{}",
+            error.message
+        );
+        assert!(error.message.contains("position"), "{}", error.message);
+    }
+
+    #[test]
+    fn a_uri_with_an_unencoded_space_is_an_invalid_params_reply_not_a_dead_server() {
+        let (_dir, mut server, client) = test_server();
+        // Real clients emit these: the URI path grammar rejects the raw
+        // space, so `Uri`'s deserializer fails before any handler runs.
+        let request = hover_request(
+            7,
+            json!({
+                "textDocument": { "uri": "file:///tmp/a b.lua" },
+                "position": { "line": 0, "character": 0 },
+            }),
+        );
+        server
+            .handle_request(request)
+            .expect("a malformed URI is not a transport failure");
+        let messages = drain(&client);
+        let error = sole_response(&messages)
+            .error
+            .as_ref()
+            .expect("an error response");
+        assert_eq!(error.code, ErrorCode::InvalidParams as i32);
+    }
+
+    #[test]
+    fn a_well_formed_request_is_still_answered_after_a_malformed_one() {
+        let (_dir, mut server, client) = test_server();
+        server
+            .handle_request(hover_request(1, Value::Null))
+            .expect("malformed");
+        // The whole point: the session survives, so the next request lands.
+        server
+            .handle_request(hover_request(
+                2,
+                json!({
+                    "textDocument": { "uri": "file:///tmp/unknown.lua" },
+                    "position": { "line": 0, "character": 0 },
+                }),
+            ))
+            .expect("well-formed");
+
+        let messages = drain(&client);
+        let responses: Vec<_> = messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::Response(response) => Some(response),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert!(responses[0].error.is_some(), "the first is the error");
+        // An unknown document is `null`, not an error — the request was
+        // answerable and got answered.
+        assert!(responses[1].error.is_none(), "{:?}", responses[1].error);
+        assert_eq!(responses[1].id, RequestId::from(2));
+    }
+
+    /// The `window/logMessage` payloads the server has sent.
+    fn log_messages(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::Notification(not) if not.method == super::LogMessage::METHOD => Some(
+                    not.params["message"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_malformed_notification_is_logged_and_dropped() {
+        let (_dir, mut server, client) = test_server();
+        // `languageId` is required by `TextDocumentItem`; a client that omits
+        // it has nothing to be answered with — notifications carry no id — so
+        // the complaint goes to the log pane and the loop carries on.
+        let notification = Notification {
+            method: DidOpenTextDocument::METHOD.to_string(),
+            params: json!({
+                "textDocument": { "uri": "file:///tmp/a.lua", "version": 1, "text": "" },
+            }),
+        };
+        server
+            .handle_notification(notification)
+            .expect("a malformed notification is not fatal");
+
+        let messages = drain(&client);
+        assert!(
+            messages.iter().all(|m| !matches!(m, Message::Response(_))),
+            "a notification is never answered"
+        );
+        let logged = log_messages(&messages);
+        assert!(
+            logged
+                .iter()
+                .any(|m| m.contains("textDocument/didOpen") && m.contains("languageId")),
+            "{logged:?}"
+        );
+    }
+
+    #[test]
+    fn a_did_open_whose_uri_has_an_unencoded_space_is_logged_and_dropped() {
+        let (_dir, mut server, client) = test_server();
+        let notification = Notification {
+            method: DidOpenTextDocument::METHOD.to_string(),
+            params: json!({
+                "textDocument": {
+                    "uri": "file:///tmp/a b.lua",
+                    "languageId": "lua",
+                    "version": 1,
+                    "text": "local x = 1\n",
+                },
+            }),
+        };
+        server
+            .handle_notification(notification)
+            .expect("a malformed URI is not fatal");
+        let logged = log_messages(&drain(&client));
+        assert!(
+            logged.iter().any(|m| m.contains("textDocument/didOpen")),
+            "{logged:?}"
+        );
+    }
+
+    #[test]
+    fn exit_without_a_prior_shutdown_ends_the_loop_with_an_error() {
+        let (_dir, mut server, _client) = test_server();
+        // The ordered `shutdown` → `exit` pair never reaches this table
+        // (`Connection::handle_shutdown` consumes it), so an `exit` here is
+        // the unordered case the spec assigns exit code 1 — which the CLI
+        // reaches by way of this error.
+        let error = server
+            .handle_notification(Notification {
+                method: super::Exit::METHOD.to_string(),
+                params: Value::Null,
+            })
+            .expect_err("`exit` without `shutdown` is an error");
+        assert!(
+            error.to_string().contains("without a prior `shutdown`"),
+            "{error}"
+        );
     }
 }

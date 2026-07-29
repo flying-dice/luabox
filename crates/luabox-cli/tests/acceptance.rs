@@ -2,6 +2,11 @@
 //!
 //! Black-box: every scenario drives the real `luabox` binary against a
 //! temp-dir fixture project. No internal API shortcuts.
+//!
+//! Which binary is [`support::luabox_bin`]'s call: the cargo-built one by
+//! default, or whatever `LUABOX_E2E_BIN` points at — which is how `release.yml`
+//! runs this same suite against the binary its install script pulled out of the
+//! draft release, before that release is allowed to go live.
 
 // Cucumber step functions receive owned captures by signature contract.
 #![allow(clippy::needless_pass_by_value)]
@@ -17,6 +22,13 @@ use std::process::Output;
 
 use cucumber::gherkin::Step;
 use cucumber::{World, given, then, when};
+
+/// Fixture writers shared with the `lsp_acceptance` harness. Cucumber binds a
+/// step attribute to one `World`, so the `#[given]` shims below stay here;
+/// only their bodies are shared.
+mod support;
+
+use support::{docstring, luabox_bin, package_table, write_file};
 
 #[derive(Debug, World)]
 #[world(init = Self::new)]
@@ -51,24 +63,38 @@ fn empty_directory(_world: &mut AcceptanceWorld) {
     // Each scenario starts with a fresh temp dir; nothing to do.
 }
 
-#[given(expr = "I run {string}")]
-#[when(expr = "I run {string}")]
-fn run_command(world: &mut AcceptanceWorld, command: String) {
+/// Run the `luabox` binary in the scenario's project directory with an
+/// explicit `RUST_BACKTRACE` value.
+///
+/// Scenarios assert on stderr text, so the variable is always set rather than
+/// inherited: whatever the developer (or CI) exports must not leak into the
+/// assertions. `"0"` is the default; the one scenario that pins the
+/// no-backtrace-leak contract sets `"1"` instead.
+fn run_luabox(world: &mut AcceptanceWorld, command: &str, backtrace: &str) {
     let mut parts = command.split_whitespace();
     let program = parts.next().expect("empty command");
     assert_eq!(program, "luabox", "scenarios drive the luabox binary only");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_luabox"))
+    let output = std::process::Command::new(luabox_bin())
         .args(parts)
-        // Scenarios assert on stderr text. `anyhow` appends a full stack
-        // backtrace to every `Error:` line when `RUST_BACKTRACE` is set in
-        // the developer's (or CI's) environment, which would leak that
-        // environment into the assertions — pin it off so a scenario reads
-        // the same everywhere.
-        .env("RUST_BACKTRACE", "0")
+        .env("RUST_BACKTRACE", backtrace)
         .current_dir(world.dir.path())
         .output()
         .expect("failed to spawn luabox");
     world.output = Some(output);
+}
+
+#[given(expr = "I run {string}")]
+#[when(expr = "I run {string}")]
+fn run_command(world: &mut AcceptanceWorld, command: String) {
+    run_luabox(world, &command, "0");
+}
+
+/// The same invocation with `RUST_BACKTRACE=1` — the environment a developer
+/// debugging something else already has exported. A failing command must
+/// render the same error chain either way, with no backtrace appended.
+#[when(expr = "I run {string} with RUST_BACKTRACE set")]
+fn run_command_with_backtrace(world: &mut AcceptanceWorld, command: String) {
+    run_luabox(world, &command, "1");
 }
 
 /// Exit codes are part of the CLI contract and are not all the same kind of
@@ -146,26 +172,9 @@ fn file_does_not_contain(world: &mut AcceptanceWorld, path: String, needle: Stri
     );
 }
 
-/// The step's docstring, normalized: the leading newline after `"""` is
-/// stripped and exactly one trailing newline is guaranteed — matching the
-/// formatter's final-newline convention so `equals:` comparisons are exact.
-fn docstring(step: &Step) -> String {
-    let raw = step
-        .docstring
-        .as_deref()
-        .expect("this step requires a docstring (\"\"\" … \"\"\")");
-    let body = raw.strip_prefix('\n').unwrap_or(raw);
-    format!("{}\n", body.trim_end_matches(['\n', '\r']))
-}
-
 #[given(expr = "a file {string} containing:")]
 fn file_containing(world: &mut AcceptanceWorld, path: String, step: &Step) {
-    let full = world.dir.path().join(&path);
-    if let Some(parent) = full.parent() {
-        std::fs::create_dir_all(parent).expect("failed to create parent directories");
-    }
-    let content = docstring(step);
-    std::fs::write(&full, content).unwrap_or_else(|e| panic!("cannot write `{path}`: {e}"));
+    write_file(world.dir.path(), &path, &docstring(step));
 }
 
 #[then(expr = "{string} equals:")]
@@ -214,29 +223,14 @@ fn stdout_contains(world: &mut AcceptanceWorld, needle: String) {
 
 // --- project fixtures (check.feature, dialect-validation.feature) --------
 
-/// Write a minimal `luabox.toml` for a scenario project.
-fn write_manifest(world: &AcceptanceWorld, edition: &str, strict: bool) {
-    let manifest = format!(
-        "[package]\n\
-         name = \"fixture\"\n\
-         version = \"0.1.0\"\n\
-         edition = \"{edition}\"\n\
-         \n\
-         [types]\n\
-         strict = {strict}\n"
-    );
-    std::fs::write(world.dir.path().join("luabox.toml"), manifest)
-        .expect("failed to write luabox.toml");
-}
-
 #[given(expr = "a project with edition {string}")]
 fn project_with_edition(world: &mut AcceptanceWorld, edition: String) {
-    write_manifest(world, &edition, false);
+    support::write_manifest(world.dir.path(), &edition, false);
 }
 
 #[given(expr = "a strict project with edition {string}")]
 fn strict_project_with_edition(world: &mut AcceptanceWorld, edition: String) {
-    write_manifest(world, &edition, true);
+    support::write_manifest(world.dir.path(), &edition, true);
 }
 
 /// A `luabox.toml` built from the smallest valid manifest — `[package]` with
@@ -252,8 +246,7 @@ fn manifest_section_containing(world: &mut AcceptanceWorld, section: String, lin
     } else {
         format!("[package]\nedition = \"5.4\"\n\n[{section}]\n{line}\n")
     };
-    std::fs::write(world.dir.path().join("luabox.toml"), manifest)
-        .expect("failed to write luabox.toml");
+    write_file(world.dir.path(), "luabox.toml", &manifest);
 }
 
 /// A one-line Lua source (used by the dialect-legality Examples tables).
@@ -261,10 +254,77 @@ fn manifest_section_containing(world: &mut AcceptanceWorld, section: String, lin
 /// arrive verbatim.
 #[given(regex = r"^a Lua file containing '(.*)'$")]
 fn lua_file_containing(world: &mut AcceptanceWorld, source: String) {
-    let path = world.dir.path().join("src").join("main.lua");
-    std::fs::create_dir_all(path.parent().expect("src parent"))
-        .expect("failed to create src directory");
-    std::fs::write(&path, format!("{source}\n")).expect("failed to write src/main.lua");
+    write_file(world.dir.path(), "src/main.lua", &format!("{source}\n"));
+}
+
+/// A Lua file whose first bytes are a UTF-8 byte-order mark.
+///
+/// The mark gets its own step rather than living in the docstring: written
+/// there it would be an invisible character in the `.feature` file, which
+/// editors and `git` normalization add and strip at will — exactly the kind
+/// of accident these scenarios exist to pin down.
+#[given(expr = "a Lua file with a UTF-8 BOM containing:")]
+fn lua_file_with_bom(world: &mut AcceptanceWorld, step: &Step) {
+    write_file(
+        world.dir.path(),
+        "src/main.lua",
+        &format!("\u{feff}{}", docstring(step)),
+    );
+}
+
+/// The same, for any path — a *dependency* carrying a byte-order mark,
+/// which the bundler has to cut out of the middle of its output.
+#[given(expr = "a file {string} with a UTF-8 BOM containing:")]
+fn file_with_bom(world: &mut AcceptanceWorld, path: String, step: &Step) {
+    write_file(
+        world.dir.path(),
+        &path,
+        &format!("\u{feff}{}", docstring(step)),
+    );
+}
+
+/// Assert on a file's *first* bytes. Position is the whole point for a `#!`
+/// line: a shebang anywhere but byte 0 is not a shebang, so a "contains"
+/// assertion would pass on output no kernel would honour.
+#[then(expr = "{string} starts with {string}")]
+fn file_starts_with(world: &mut AcceptanceWorld, path: String, prefix: String) {
+    let full = world.dir.path().join(&path);
+    let content =
+        std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("cannot read `{path}`: {e}"));
+    assert!(
+        content.starts_with(&prefix),
+        "`{path}` does not start with `{prefix}`; it starts:\n{}",
+        content.chars().take(120).collect::<String>()
+    );
+}
+
+/// No mark anywhere in the file — not just not at byte 0. Spelled as a step
+/// rather than as `does not contain "<U+FEFF>"` for the same reason the step
+/// above exists: an invisible character in a `.feature` file is an accident
+/// waiting to be normalized away.
+#[then(expr = "{string} carries no UTF-8 byte-order mark")]
+fn file_has_no_bom(world: &mut AcceptanceWorld, path: String) {
+    let full = world.dir.path().join(&path);
+    let content =
+        std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("cannot read `{path}`: {e}"));
+    assert!(
+        !content.contains('\u{feff}'),
+        "`{path}` carries a byte-order mark; content:\n{content}"
+    );
+}
+
+/// The counterpart assertion: the file's content is the docstring with a
+/// leading UTF-8 BOM, byte for byte.
+#[then(expr = "{string} equals, with a leading UTF-8 BOM:")]
+fn file_equals_with_bom(world: &mut AcceptanceWorld, path: String, step: &Step) {
+    let full = world.dir.path().join(&path);
+    let actual =
+        std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("cannot read `{path}`: {e}"));
+    let expected = format!("\u{feff}{}", docstring(step));
+    assert_eq!(
+        actual, expected,
+        "`{path}` does not match the expected content"
+    );
 }
 
 #[then(expr = "diagnostic {word} is reported")]
@@ -331,6 +391,42 @@ fn stdout_is_valid_json(world: &mut AcceptanceWorld) {
     }
 }
 
+/// The issues in a `--format gitlab` report, parsed.
+fn gitlab_issues(stdout: &str) -> Vec<serde_json::Value> {
+    serde_json::from_str(stdout)
+        .unwrap_or_else(|e| panic!("stdout is not a GitLab report: {e}\nstdout:\n{stdout}"))
+}
+
+/// GitLab keys a finding to a place in the merge-request diff through
+/// `location.lines.begin`, so the report has to name the line the diagnostic
+/// is actually on — a contract `stdout contains` cannot express.
+#[then(expr = "the gitlab report places a finding for {string} on line {int}")]
+fn gitlab_finding_on_line(world: &mut AcceptanceWorld, path: String, line: u64) {
+    let stdout = world.stdout();
+    let issues = gitlab_issues(&stdout);
+    assert!(
+        issues.iter().any(|issue| {
+            issue["location"]["path"].as_str() == Some(path.as_str())
+                && issue["location"]["lines"]["begin"].as_u64() == Some(line)
+        }),
+        "no finding for `{path}` on line {line}; stdout:\n{stdout}"
+    );
+}
+
+/// The negative half of the contract: line 1 was the placeholder every finding
+/// used to collapse onto, so a fixture with nothing on line 1 must show none.
+#[then(expr = "no gitlab finding sits on line {int}")]
+fn no_gitlab_finding_on_line(world: &mut AcceptanceWorld, line: u64) {
+    let stdout = world.stdout();
+    let issues = gitlab_issues(&stdout);
+    assert!(
+        !issues
+            .iter()
+            .any(|issue| issue["location"]["lines"]["begin"].as_u64() == Some(line)),
+        "a finding unexpectedly sits on line {line}; stdout:\n{stdout}"
+    );
+}
+
 #[tokio::main]
 async fn main() {
     // @wip gates feature files written ahead of implementation (spec-first,
@@ -362,19 +458,10 @@ async fn main() {
 /// Write a manifest with a `[build] target` (SPEC.md §5).
 fn write_manifest_with_target(world: &AcceptanceWorld, edition: &str, target: &str, strict: bool) {
     let manifest = format!(
-        "[package]\n\
-         name = \"fixture\"\n\
-         version = \"0.1.0\"\n\
-         edition = \"{edition}\"\n\
-         \n\
-         [build]\n\
-         target = \"{target}\"\n\
-         \n\
-         [types]\n\
-         strict = {strict}\n"
+        "{}\n[build]\ntarget = \"{target}\"\n\n[types]\nstrict = {strict}\n",
+        package_table(edition)
     );
-    std::fs::write(world.dir.path().join("luabox.toml"), manifest)
-        .expect("failed to write luabox.toml");
+    write_file(world.dir.path(), "luabox.toml", &manifest);
 }
 
 #[given(expr = "a project with edition {string} targeting {string}")]
@@ -401,17 +488,10 @@ fn project_with_edition_target_bundling(
     target: String,
 ) {
     let manifest = format!(
-        "[package]\n\
-         name = \"fixture\"\n\
-         version = \"0.1.0\"\n\
-         edition = \"{edition}\"\n\
-         \n\
-         [build]\n\
-         target = \"{target}\"\n\
-         bundle = true\n"
+        "{}\n[build]\ntarget = \"{target}\"\nbundle = true\n",
+        package_table(&edition)
     );
-    std::fs::write(world.dir.path().join("luabox.toml"), manifest)
-        .expect("failed to write luabox.toml");
+    write_file(world.dir.path(), "luabox.toml", &manifest);
 }
 
 #[then(expr = "the file {string} does not exist")]
@@ -472,6 +552,22 @@ fn stdout_contains_exactly(world: &mut AcceptanceWorld, count: usize, needle: St
     );
 }
 
+/// A ceiling on the *width* of the report, which is how the human renderer's
+/// long-line windowing is observable from outside: without it a diagnostic on
+/// a 400-character line printed that whole line plus a 400-character caret
+/// indent, and n diagnostics on one long line cost O(n x line) of output.
+#[then(expr = "no line of stdout is longer than {int} characters")]
+fn stdout_lines_bounded(world: &mut AcceptanceWorld, max: usize) {
+    let stdout = world.stdout();
+    for line in stdout.lines() {
+        let width = line.chars().count();
+        assert!(
+            width <= max,
+            "a {width}-character line exceeds the {max}-character bound:\n{line}"
+        );
+    }
+}
+
 #[then(expr = "stdout does not contain {string}")]
 fn stdout_does_not_contain(world: &mut AcceptanceWorld, needle: String) {
     let stdout = world.stdout();
@@ -504,9 +600,10 @@ fn unmap_last_bundle_line(world: &mut AcceptanceWorld, path: String) {
     let content =
         std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("cannot read `{path}`: {e}"));
     let last = content.lines().count();
-    run_command(
+    run_luabox(
         world,
-        format!("luabox unmap {path} {path}:{last}: synthetic-error"),
+        &format!("luabox unmap {path} {path}:{last}: synthetic-error"),
+        "0",
     );
 }
 
@@ -584,18 +681,10 @@ fn write_manifest_with_target_and_mode(
         .map(|d| format!("description = \"{d}\"\n"))
         .unwrap_or_default();
     let manifest = format!(
-        "[package]\n\
-         name = \"fixture\"\n\
-         version = \"0.1.0\"\n\
-         edition = \"{edition}\"\n\
-         {description_line}\
-         \n\
-         [build]\n\
-         target = \"{target}\"\n\
-         mode = \"{mode}\"\n"
+        "{}{description_line}\n[build]\ntarget = \"{target}\"\nmode = \"{mode}\"\n",
+        package_table(edition)
     );
-    std::fs::write(world.dir.path().join("luabox.toml"), manifest)
-        .expect("failed to write luabox.toml");
+    write_file(world.dir.path(), "luabox.toml", &manifest);
 }
 
 #[given(expr = "a project with edition {string} targeting {string} using mode {string}")]

@@ -35,6 +35,11 @@
 //! explicitly skipped, never guessed. The checker's own field-by-field literal
 //! diagnostics (LB0302/LB0303/LB0304) are unchanged by the seeding.
 
+// The `impl Checker<'_>` surface is sectioned across these submodules: each is
+// one more `impl Checker<'_>` block, no state and no behaviour of its own.
+mod conformance;
+mod exhaustive;
+
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
@@ -48,31 +53,14 @@ use luabox_syntax::lua::{self, SyntaxNode};
 use crate::assign::{
     Exactness, LiteralConformance, assignable, classify_literal, is_integral_literal,
 };
+use crate::codes::{
+    AWAIT_IN_SYNC, CYCLIC_ALIAS, DEPRECATED, DISCARD_RETURNS, DUPLICATE_DOC_FIELD, GENERIC_ARITY,
+    MISSING_FIELD, RETURN_MISMATCH, TYPE_MISMATCH, UNKNOWN_FIELD, UNKNOWN_TYPE_NAME,
+    WRONG_ARG_COUNT,
+};
 use crate::env::{self, TypeEnv};
 use crate::ty::{FieldTy, FunctionTy, OperatorSig, ParamTy, TableTy, Ty};
 use crate::version::VersionReq;
-
-/// Diagnostic codes emitted here (block `LB03xx` — Semantics).
-const TYPE_MISMATCH: u16 = 300;
-const WRONG_ARG_COUNT: u16 = 301;
-const MISSING_FIELD: u16 = 302;
-const UNKNOWN_FIELD: u16 = 303;
-const RETURN_MISMATCH: u16 = 304;
-const UNKNOWN_TYPE_NAME: u16 = 305;
-/// Wrong number of generic type arguments (`Name<A, B>` vs its params, #117).
-const GENERIC_ARITY: u16 = 313;
-/// A self- or mutually-referential `---@alias` cycle (luals parity, #123).
-const CYCLIC_ALIAS: u16 = 314;
-/// A non-exhaustive `if`/`elseif` chain dispatching on a finite (literal-union
-/// or `---@enum`) discriminant with no `else` branch (#121).
-const NON_EXHAUSTIVE_IF: u16 = 315;
-/// Use of a `---@deprecated` symbol (luals `deprecated`, #111).
-const DEPRECATED: u16 = 308;
-/// Discarded return of a `---@nodiscard` call (luals `discard-returns`, #112).
-const DISCARD_RETURNS: u16 = 309;
-/// Call to a `---@async` function from a non-async enclosing function (luals
-/// `await-in-sync`).
-const AWAIT_IN_SYNC: u16 = 316;
 
 /// A borrowed view over the four [`crate::infer::Outcome`] fields the checker
 /// consults, built by [`crate::infer::Outcome::view`]. Passing one view keeps
@@ -85,7 +73,7 @@ pub(crate) struct InferenceView<'a> {
     pub expr_types: &'a HashMap<(usize, usize), Ty>,
     /// Resolved `:` method-call signatures keyed by the call's byte range
     /// ([`crate::infer::Outcome::method_sigs`]).
-    pub method_sigs: &'a HashMap<(usize, usize), FunctionTy>,
+    pub method_sigs: &'a HashMap<(usize, usize), crate::infer::MethodSig>,
     /// Final accumulated shape of each `---@type`/`---@class` carrier local,
     /// keyed by the `local` statement's byte range
     /// ([`crate::infer::Outcome::carrier_final`]).
@@ -258,10 +246,11 @@ struct Checker<'a> {
     inferred: &'a HashMap<(usize, usize), Ty>,
     /// Resolved `:` method-call signatures keyed by the method-call
     /// expression's byte range — inference's method resolution (#118). Present
-    /// only when the receiver resolved to a declared `---@class` and the method
-    /// is an annotated function; the checker argument-checks the call against
-    /// it and reports nothing when it is absent (conservatism).
-    method_sigs: &'a HashMap<(usize, usize), FunctionTy>,
+    /// only when the method resolved to an annotated function; the checker
+    /// reports its use-site tags, argument-checks the call when
+    /// [`crate::infer::MethodSig::args_checkable`], and reports nothing at all
+    /// when the entry is absent (conservatism).
+    method_sigs: &'a HashMap<(usize, usize), crate::infer::MethodSig>,
     /// Final accumulated shape of each `---@type` carrier local, keyed by the
     /// `local` statement's byte range (whole-carrier deferral).
     /// `---@class` carriers publish their reified shape here too (#107).
@@ -288,19 +277,19 @@ struct Checker<'a> {
 impl Checker<'_> {
     // --- plumbing ------------------------------------------------------
 
-    fn report(&mut self, code: u16, range: Range<usize>, message: String, label: String) {
+    fn report(&mut self, code: Code, range: Range<usize>, message: String, label: String) {
         self.report_full(code, range, message, label, None);
     }
 
     fn report_full(
         &mut self,
-        code: u16,
+        code: Code,
         range: Range<usize>,
         message: String,
         label: String,
         note: Option<String>,
     ) {
-        let mut diag = Diagnostic::new(Code::new(code), self.severity, message)
+        let mut diag = Diagnostic::new(code, self.severity, message)
             .with_label(Label::primary(Span::new(self.file, range), label));
         if let Some(note) = note {
             diag = diag.with_note(note);
@@ -312,9 +301,9 @@ impl Checker<'_> {
     /// ladder. `---@deprecated` and `---@nodiscard` findings are advisory:
     /// luals keeps them `Warning` in every mode (they never escalate to an
     /// error the way a real type mismatch does), so luabox mirrors that.
-    fn report_warning(&mut self, code: u16, range: Range<usize>, message: String, label: String) {
+    fn report_warning(&mut self, code: Code, range: Range<usize>, message: String, label: String) {
         self.diags.push(
-            Diagnostic::new(Code::new(code), Severity::Warning, message)
+            Diagnostic::new(code, Severity::Warning, message)
                 .with_label(Label::primary(Span::new(self.file, range), label)),
         );
     }
@@ -546,202 +535,6 @@ impl Checker<'_> {
                 self.bind(name, ty, false);
             }
         }
-    }
-
-    /// Run every deferred `---@type` carrier conformance obligation against
-    /// the binding's final accumulated shape. The diagnostic is attributed to
-    /// the `---@type` annotation and carries the same member-naming detail as
-    /// an immediate mismatch. A carrier whose accumulated shape satisfies the
-    /// type produces nothing.
-    fn check_deferred_carriers(&mut self) {
-        for carrier in std::mem::take(&mut self.deferred_carriers) {
-            let Some(found) = self.carrier_final.get(&carrier.decl_key).cloned() else {
-                continue; // inference published no final shape (e.g. off)
-            };
-            if self.assignable(&found, &carrier.target) {
-                continue;
-            }
-            let detail = crate::assign::explain_mismatch(
-                self.env,
-                Exactness::from_strict(self.strict),
-                &found,
-                &carrier.target,
-            )
-            .map_or(String::new(), |d| format!(": {d}"));
-            self.report_full(
-                TYPE_MISMATCH,
-                carrier.span.clone(),
-                format!(
-                    "type mismatch: expected `{}`, found `{found}`{detail}",
-                    carrier.target
-                ),
-                format!("expected `{}`", carrier.target),
-                None,
-            );
-        }
-    }
-
-    /// Verify each `---@class Name : Parent` carrier against the interface(s)
-    /// it declares it extends (#107) — the strictness luals declares but does
-    /// not check.
-    ///
-    /// The obligation is every member the parent chain declares (the merged
-    /// [`TypeEnv::class_shape`] of each parent), *excluding* members `Name`
-    /// re-declares as its own `---@field` (those are governed by `Name`'s own
-    /// declaration). Each obliged member must be satisfied by the carrier's
-    /// FINAL accumulated shape. The rule, precisely — a member is satisfied
-    /// when it is:
-    ///
-    /// - **(a) provided by the carrier** — `function X:m()` / `X.f = ...`,
-    ///   *plus* anything inherited through a `setmetatable(X, { __index =
-    ///   Base })` chain, which [`infer::reify_shape`] already folds into the
-    ///   reified `carrier_final` shape. A provided member's type is checked
-    ///   against the parent's declaration via [`Checker::assignable`]
-    ///   (function subtyping absorbs `self`/receiver looseness); a mismatch is
-    ///   reported.
-    /// - **(b) inherited from a parent carrier** defined in this file and
-    ///   reachable through the class's parent chain — the fallback that
-    ///   covers the `X.__index = Base` idiom, whose delegation the carrier's
-    ///   own reified shape does not fold in. The inherited implementation is
-    ///   the base's concern, so its signature is not re-checked here.
-    /// - **(c) optional / nil-admitting in the parent** — no obligation.
-    ///
-    /// Only a member satisfied by none of these is reported missing. This is
-    /// what keeps classic inheritance from being wrongly flagged: a subclass
-    /// that inherits a concrete base method (idiom (a) or (b)) is silent.
-    fn check_class_conformance(&mut self) {
-        for ob in std::mem::take(&mut self.class_obligations) {
-            let Some(Ty::Table(provided)) = self.carrier_final.get(&ob.decl_key).cloned() else {
-                continue; // inference published no final shape (e.g. off)
-            };
-            let Some(parents) = self.env.class_parents(&ob.name) else {
-                continue;
-            };
-            let parents: Vec<String> = parents.to_vec();
-            // Members already handled — dedup across a diamond of parents.
-            let mut seen: HashSet<String> = HashSet::new();
-            for parent in &parents {
-                let Some(pshape) = self.env.class_shape(parent) else {
-                    continue;
-                };
-                for (member, field) in &pshape.fields {
-                    if !seen.insert(member.clone()) {
-                        continue;
-                    }
-                    // A member `Name` re-declares is its own declaration's
-                    // responsibility, not an inherited obligation.
-                    if self.env.class_declares_own(&ob.name, member) {
-                        continue;
-                    }
-                    // Optional / nil-admitting members impose no obligation.
-                    if field.optional || field.ty.admits_nil() {
-                        continue;
-                    }
-                    self.check_class_member(&ob, parent, member, field, &provided);
-                }
-            }
-        }
-    }
-
-    /// Check one obliged member against the carrier's final shape. See
-    /// [`Checker::check_class_conformance`] for the rule.
-    fn check_class_member(
-        &mut self,
-        ob: &ClassObligation,
-        parent: &str,
-        member: &str,
-        field: &FieldTy,
-        provided: &TableTy,
-    ) {
-        // (a) provided on the carrier (own members + `setmetatable` chain).
-        if let Some(actual) = provided.fields.get(member) {
-            let expected = if field.optional {
-                field.ty.clone().optional()
-            } else {
-                field.ty.clone()
-            };
-            if !self.assignable(&actual.ty, &expected) {
-                let detail = crate::assign::explain_mismatch(
-                    self.env,
-                    Exactness::from_strict(self.strict),
-                    &actual.ty,
-                    &expected,
-                )
-                .map_or(String::new(), |d| format!(": {d}"));
-                self.report_class_conformance(
-                    ob.span.clone(),
-                    format!(
-                        "`{}` does not satisfy `{parent}`: member `{member}` has the wrong type",
-                        ob.name
-                    ),
-                    format!("expected `{expected}`, found `{}`{detail}", actual.ty),
-                    parent,
-                );
-            }
-            return;
-        }
-        // (b) inherited from a parent carrier in this file (the `X.__index =
-        //     Base` chain the reified carrier shape does not fold in).
-        if self.member_on_parent_carrier(&ob.name, member) {
-            return;
-        }
-        // (c) missing entirely.
-        self.report_class_conformance(
-            ob.span.clone(),
-            format!(
-                "`{}` does not satisfy `{parent}`: missing member `{member}`",
-                ob.name
-            ),
-            format!("expected member `{member}` of type `{}`", field.ty),
-            parent,
-        );
-    }
-
-    /// Whether `member` is defined on any parent carrier of `class` in this
-    /// file, walking the parent chain transitively. The parent-carrier
-    /// fallback of [`Checker::check_class_conformance`].
-    fn member_on_parent_carrier(&self, class: &str, member: &str) -> bool {
-        let mut stack: Vec<String> = self
-            .env
-            .class_parents(class)
-            .map(<[String]>::to_vec)
-            .unwrap_or_default();
-        let mut seen: HashSet<String> = HashSet::new();
-        while let Some(parent) = stack.pop() {
-            if !seen.insert(parent.clone()) {
-                continue;
-            }
-            if let Some(Ty::Table(shape)) = self.carrier_class_final.get(&parent)
-                && shape.fields.contains_key(member)
-            {
-                return true;
-            }
-            if let Some(grandparents) = self.env.class_parents(&parent) {
-                stack.extend(grandparents.iter().cloned());
-            }
-        }
-        false
-    }
-
-    /// Report an LB0300 `: Interface` conformance failure at the `---@class`
-    /// tag, with a "declared here" secondary label at the parent's in-file
-    /// declaration when it has one (ambient/defs parents have none) (#107).
-    fn report_class_conformance(
-        &mut self,
-        span: Range<usize>,
-        message: String,
-        label: String,
-        parent: &str,
-    ) {
-        let mut diag = Diagnostic::new(Code::new(TYPE_MISMATCH), self.severity, message)
-            .with_label(Label::primary(Span::new(self.file, span), label));
-        if let Some(range) = self.env.class_decl_span(parent) {
-            diag = diag.with_label(Label::secondary(
-                Span::new(self.file.to_string(), range),
-                format!("`{parent}` declared here"),
-            ));
-        }
-        self.diags.push(diag);
     }
 
     /// Enter a function body: parameters bound to their annotated types,
@@ -1030,178 +823,6 @@ impl Checker<'_> {
         } else if let Some(table) = args.table_arg() {
             self.visit_expr(&Expr::Table(table));
         }
-    }
-
-    // --- union / enum exhaustiveness (LB0315) --------------------------
-
-    /// Report `LB0315` when an `if`/`elseif` chain dispatches a *finite*
-    /// discriminant (a union of literal types, or an `---@enum`) against
-    /// literal cases, has no `else`, and leaves at least one member unhandled
-    /// — the luals-style discriminated-union exhaustiveness check (#121).
-    ///
-    /// The analysis is deliberately narrow: every branch must be exactly
-    /// `x == <literal>` (or `<literal> == x`) on the *same* discriminant `x`.
-    /// Anything else — a compound `and`/`or` condition, a different variable,
-    /// a non-literal comparand, a comparison against a value outside the
-    /// finite domain — aborts the whole analysis, so a false positive is never
-    /// risked. **Deferred** (SPEC has no obligation here): table-dispatch
-    /// exhaustiveness (`{ a = ..., b = ... }` lookup) and `and`/`or` compound
-    /// conditions are out of scope; only the simple `==`-chain is analysed.
-    fn check_exhaustive_if(&mut self, stmt: &lua::ast::IfStmt) {
-        // An `else` clause is a catch-all: the chain is exhaustive by
-        // construction, whatever the discriminant. Nothing to report.
-        if stmt.else_clause().is_some() {
-            return;
-        }
-        // The chain's conditions in order: the `if` test, then each `elseif`
-        // test. A missing condition (parse error) aborts the analysis.
-        let Some(first) = stmt.condition() else {
-            return;
-        };
-        let mut conditions = vec![first];
-        for clause in stmt.elseif_clauses() {
-            let Some(cond) = clause.condition() else {
-                return;
-            };
-            conditions.push(cond);
-        }
-
-        // Establish the discriminant and its finite member set from the first
-        // condition — before any branch narrows it.
-        let Some((discriminant, members)) = self.discriminant_of(&conditions[0]) else {
-            return;
-        };
-
-        // Every branch must compare that same discriminant to a literal that
-        // *is* one of the finite members. A branch that is not such a
-        // comparison (or compares against a value outside the domain) means
-        // the chain is not a pure discriminated dispatch — stay silent.
-        let mut covered: Vec<Ty> = Vec::new();
-        for cond in &conditions {
-            let Some(lit) = self.branch_literal(cond, &discriminant) else {
-                return;
-            };
-            if !members.iter().any(|(_, value)| *value == lit) {
-                return;
-            }
-            covered.push(lit);
-        }
-
-        // The members no branch covers (there is provably no `else`).
-        let uncovered: Vec<String> = members
-            .iter()
-            .filter(|(_, value)| !covered.contains(value))
-            .map(|(name, _)| format!("`{name}`"))
-            .collect();
-        if uncovered.is_empty() {
-            return; // every member handled — exhaustive
-        }
-        self.report_full(
-            NON_EXHAUSTIVE_IF,
-            range(stmt.syntax()),
-            format!(
-                "non-exhaustive `if` on `{discriminant}`: {} not handled",
-                uncovered.join(", "),
-            ),
-            "add the missing branch(es) or an `else` clause".to_string(),
-            Some("the chain dispatches on a finite type and has no `else`".to_string()),
-        );
-    }
-
-    /// Read the first condition of a candidate chain as a discriminated
-    /// dispatch: a binary `==` with one bare-`Name` operand whose type is
-    /// finite and one literal operand. Returns the discriminant's name and its
-    /// finite member set (`(display name, value type)` pairs).
-    fn discriminant_of(&self, cond: &Expr) -> Option<(String, Vec<(String, Ty)>)> {
-        let Expr::Bin(bin) = cond else {
-            return None;
-        };
-        if bin.op_token()?.kind() != lua::SyntaxKind::EQ_EQ {
-            return None;
-        }
-        let lhs = bin.lhs()?;
-        let rhs = bin.rhs()?;
-        // Try each side as the `Name` discriminant; the other must be a
-        // literal. Left-hand side is preferred for determinism.
-        for (name_side, lit_side) in [(&lhs, &rhs), (&rhs, &lhs)] {
-            if let Expr::Name(name) = name_side
-                && let Some(token) = name.name()
-                && let Some(members) = self.finite_members(&self.expr_ty(name_side))
-                && self.literal_ty(lit_side).is_some()
-            {
-                return Some((token.text().to_string(), members));
-            }
-        }
-        None
-    }
-
-    /// The finite member set of a discriminant type, or `None` when the type
-    /// is open-ended (contains `string`/`number`/`unknown`/`any` or any
-    /// non-literal member) and so must never be diagnosed.
-    ///
-    /// Two finite shapes: (a) a `---@enum`, enumerated as `Enum.member` named
-    /// cases; (b) a `Ty::Union` whose members are *all* literal types.
-    fn finite_members(&self, ty: &Ty) -> Option<Vec<(String, Ty)>> {
-        // A `---@enum` discriminant: enumerate its members by name so the
-        // diagnostic can name the uncovered cases `Enum.member`.
-        if let Ty::Named(name) = ty
-            && let Some(members) = self.env.enum_members(name)
-        {
-            if members.is_empty() || !members.iter().all(|(_, v)| is_literal_ty(v)) {
-                return None;
-            }
-            return Some(
-                members
-                    .into_iter()
-                    .map(|(member, value)| (format!("{name}.{member}"), value))
-                    .collect(),
-            );
-        }
-        // Otherwise a union of literal types (an alias like `"a"|"b"|"c"`
-        // expands to this). A named non-enum (a class) resolves to a table
-        // shape, not a union, and is correctly rejected here.
-        let resolved = match ty {
-            Ty::Named(name) => self.env.resolve_named(name)?,
-            other => other.clone(),
-        };
-        if let Ty::Union(union) = resolved
-            && union.iter().all(is_literal_ty)
-        {
-            return Some(union.iter().map(|v| (v.to_string(), v.clone())).collect());
-        }
-        None
-    }
-
-    /// The literal case a branch covers: `discriminant == <literal>` (or the
-    /// mirrored `<literal> == discriminant`) on the given discriminant name.
-    /// `None` for any other condition shape.
-    fn branch_literal(&self, cond: &Expr, discriminant: &str) -> Option<Ty> {
-        let Expr::Bin(bin) = cond else {
-            return None;
-        };
-        if bin.op_token()?.kind() != lua::SyntaxKind::EQ_EQ {
-            return None;
-        }
-        let lhs = bin.lhs()?;
-        let rhs = bin.rhs()?;
-        let is_discriminant = |expr: &Expr| {
-            matches!(expr, Expr::Name(n)
-                if n.name().is_some_and(|t| t.text() == discriminant))
-        };
-        if is_discriminant(&lhs) {
-            return self.literal_ty(&rhs);
-        }
-        if is_discriminant(&rhs) {
-            return self.literal_ty(&lhs);
-        }
-        None
-    }
-
-    /// The type of `expr` when it is a literal type (`"a"` / `42` / `true`, or
-    /// an `---@enum` member reached as `Enum.member`), else `None`.
-    fn literal_ty(&self, expr: &Expr) -> Option<Ty> {
-        let ty = self.expr_ty(expr);
-        is_literal_ty(&ty).then_some(ty)
     }
 
     // --- expression types ---------------------------------------------
@@ -1633,22 +1254,29 @@ impl Checker<'_> {
     /// Check a `:` method call against its resolved method signature. The
     /// inference engine resolves the receiver through class shapes /
     /// `__index` / `self`, and publishes the method's signature keyed by the
-    /// call's byte range *only* when the receiver is a declared `---@class`
-    /// and the member is an annotated function ([`Checker::method_sigs`]) —
-    /// so this is a strict no-op for an unknown/`any`/union receiver, a plain
-    /// inferred table with no declared class, an unannotated method, or an
-    /// unresolved metatable (SPEC §19 conservatism; no false positives).
+    /// call's byte range *only* when the member is an annotated function
+    /// ([`Checker::method_sigs`]) — so this is a strict no-op for an
+    /// unknown/`any`/union receiver, an unannotated method, or an unresolved
+    /// metatable (SPEC §19 conservatism; no false positives).
     ///
-    /// When a signature is present, the call's *explicit* arguments (the
-    /// implicit `self` stripped from the signature) are checked exactly like a
-    /// dotted/free call through the same [`Checker::check_arg_slots`] path, and
-    /// a `---@deprecated` method is flagged at its name span (luals
-    /// `deprecated`, LB0308).
+    /// When a signature is present, the callee's use-site tags are reported at
+    /// the method's name span: `---@deprecated` (luals `deprecated`, LB0308),
+    /// an excluding `---@version`, and `---@async` called from a non-async
+    /// enclosing function (luals `await-in-sync`, LB0316). These hold for every
+    /// resolved receiver, including a plain prototype table with no declared
+    /// `---@class` (#33).
+    ///
+    /// The call's *explicit* arguments (the implicit `self` stripped from the
+    /// signature) are then checked exactly like a dotted/free call through the
+    /// same [`Checker::check_arg_slots`] path — but only for a declared
+    /// `---@class` receiver, whose contract is authoritative
+    /// ([`crate::infer::MethodSig::args_checkable`]).
     fn check_method_call(&mut self, call: &MethodCallExpr) {
-        let Some(sig) = self.method_sigs.get(&range_key(call.syntax())) else {
+        let Some(resolved) = self.method_sigs.get(&range_key(call.syntax())) else {
             return;
         };
-        let mut sig = sig.clone();
+        let args_checkable = resolved.args_checkable;
+        let mut sig = resolved.sig.clone();
         // The implicit `self` receiver is never an explicit argument. It only
         // appears in the signature when declared with an explicit
         // `---@param self T` or reified from an unannotated body; drop it so the
@@ -1689,6 +1317,9 @@ impl Checker<'_> {
                 Some(&name),
                 usize::from(r.start())..usize::from(r.end()),
             );
+        }
+        if !args_checkable {
+            return;
         }
         let (mut slots, string_arg) = arg_slots(call.args());
         if let Some((ty, range)) = string_arg {
@@ -1818,7 +1449,7 @@ impl Checker<'_> {
     /// checked against a table/class shape get field-level diagnostics;
     /// everything else is a single assignability check reported as
     /// `mismatch_code`.
-    fn check_slot(&mut self, slot: &Slot, expected: &Ty, mismatch_code: u16) {
+    fn check_slot(&mut self, slot: &Slot, expected: &Ty, mismatch_code: Code) {
         if let Slot::Expr(Expr::Table(table)) = slot
             && let Some((class, shape)) = self.table_shape(expected)
         {
@@ -2108,7 +1739,7 @@ pub(crate) fn duplicate_doc_fields(
                     if !seen.entry(class.clone()).or_default().insert(name.clone()) {
                         diags.push(
                             Diagnostic::new(
-                                Code::new(311),
+                                DUPLICATE_DOC_FIELD,
                                 Severity::Warning,
                                 format!("duplicate field `{name}` on class `{class}`"),
                             )

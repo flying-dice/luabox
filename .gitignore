@@ -5,6 +5,9 @@ tools/differ/target/
 # Example build artifacts, and the rock tree a user materializes with luarocks.
 examples/**/dist/
 examples/**/lua_modules/
+# `luabox doc` output. Generated on demand by the examples gate; checking it in
+# only ever produced a stale copy of a site the binary regenerates in a second.
+examples/**/doc/
 
 # IDE state
 .idea/

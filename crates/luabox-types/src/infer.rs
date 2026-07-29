@@ -45,27 +45,47 @@
 //! `---@class` (its declaration governs instead). Unknown stays `unknown` —
 //! never `any`.
 
+// The `impl Infer<'_>` surface is sectioned across these submodules: each is
+// one more `impl Infer<'_>` block, no state and no behaviour of its own.
+mod call;
+mod cast;
+mod narrow;
+mod reify;
+mod visibility;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use luabox_diag::{Code, Diagnostic, Label, Severity, Span};
+use luabox_diag::{Diagnostic, Label, Severity, Span};
 use luabox_hir::{
-    BinOp, Binding, BindingId, BindingKind, Block, Body, BodyId, Expr, ExprId, HirId, IfBranch,
-    Literal, LoweredFile, Resolution, Stmt, StmtId, TableEntry, UnOp,
+    BinOp, Binding, BindingId, BindingKind, Block, Body, BodyId, Expr, ExprId, HirId, Literal,
+    LoweredFile, Resolution, Stmt, StmtId, TableEntry, UnOp,
 };
 
-use luabox_syntax::luacats;
-
+use crate::assign::Exactness;
+use crate::codes::FIELD_NOT_FOUND;
 use crate::env::TypeEnv;
-use crate::ty::{FieldTy, FunctionTy, ParamTy, TableTy, Ty};
-
-/// Diagnostic codes emitted here (block `LB03xx` — Semantics).
-const FIELD_NOT_FOUND: u16 = 306;
-/// Access of a `---@private`/`---@protected`/`---@package` member from outside
-/// its visibility scope (luals `invisible`, #115).
-const INVISIBLE: u16 = 312;
+use crate::ty::{FunctionTy, Ty};
 
 /// A byte range key, matching the annotation checker's convention.
 type Key = (usize, usize);
+
+/// A `:` method call's resolved signature, as published to the annotation
+/// checker by [`Outcome::method_sigs`].
+#[derive(Debug, Clone)]
+pub(crate) struct MethodSig {
+    /// The resolved member's signature, with its implicit `self` (if declared)
+    /// still in place.
+    pub(crate) sig: FunctionTy,
+    /// Whether the call's explicit arguments may be arity- and type-checked
+    /// against `sig`. Only when the receiver resolves to a declared
+    /// `---@class`: a plain inferred table's method is resolved structurally
+    /// and its contract is not authoritative enough to manufacture argument
+    /// errors from (SPEC §19 conservatism). The callee's *use-site tags* —
+    /// `---@deprecated` (LB0308), `---@async` (LB0316), `---@version` — carry
+    /// no such risk: they are what the author wrote on the method itself, so
+    /// they are reported for every resolved receiver (#33).
+    pub(crate) args_checkable: bool,
+}
 
 /// What inference hands back to the checker.
 #[derive(Debug, Default)]
@@ -75,13 +95,14 @@ pub(crate) struct Outcome {
     /// results are omitted.
     pub(crate) expr_types: HashMap<Key, Ty>,
     /// The resolved function signature of a `:` method call, keyed by the
-    /// method-call expression's byte range. Published only when the receiver
+    /// method-call expression's byte range. Published whenever the receiver
     /// resolves to a concrete field whose type is a function — the engine's
-    /// method resolution the annotation checker consumes to argument-check the
-    /// call (#118). The signature is as-declared (including its `self`
-    /// parameter, if any, and `---@deprecated`); the checker strips the
-    /// implicit `self` before matching explicit arguments.
-    pub(crate) method_sigs: HashMap<Key, FunctionTy>,
+    /// method resolution the annotation checker consumes to flag the callee's
+    /// use-site tags and (when [`MethodSig::args_checkable`]) to
+    /// argument-check the call (#118, #33). The signature is as-declared
+    /// (including its `self` parameter, if any, and `---@deprecated`); the
+    /// checker strips the implicit `self` before matching explicit arguments.
+    pub(crate) method_sigs: HashMap<Key, MethodSig>,
     /// Inference's own diagnostics (`LB0306`).
     pub(crate) diags: Vec<Diagnostic>,
     /// Final reified type of every binding, in declaration order (the
@@ -170,23 +191,48 @@ pub struct InferredReturn {
     pub returns: Vec<Ty>,
 }
 
+/// Which surface inference is being run for.
+///
+/// The two modes differ in exactly one way — whether *guessing* is allowed.
+/// [`InferMode::Display`] may seed an unannotated parameter from the argument
+/// types observed at the function's call sites; [`InferMode::Check`] may not,
+/// because a diagnostic must never rest on a guess (SPEC §19 conservatism).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InferMode {
+    /// The checker's surface: annotations and literals only, no call-site
+    /// parameter seeding, so no diagnostic can arise from inference about a
+    /// call site elsewhere.
+    Check,
+    /// The editor's inlay-hint surface: call-site parameter seeding on, so the
+    /// bodies of unannotated functions type through. Never feeds diagnostics.
+    Display,
+}
+
+impl InferMode {
+    /// Whether unannotated parameters take the union of the (widened) argument
+    /// types observed at the function's call sites during the first pass.
+    const fn seeds_params(self) -> bool {
+        matches!(self, InferMode::Display)
+    }
+}
+
 /// Run inference over one lowered file.
 ///
-/// `seed_params` turns on call-site parameter inference: an unannotated
-/// parameter takes the union of the (widened) argument types observed at
-/// the function's call sites during the first pass. `externals` carries the
-/// cross-file half (require exports + dependent files' call args). Both are
-/// display-only — the checker runs without them, so neither can manufacture
-/// diagnostics.
+/// `exact` is the assignability end of the strictness ladder, which also
+/// selects the severity inference's own diagnostics carry. `mode` selects the
+/// checker vs. editor surface ([`InferMode`]). `externals` carries the
+/// cross-file inputs (require exports + dependent files' call args); together
+/// with `InferMode::Display`'s seeding they are display-only, so neither can
+/// manufacture a diagnostic.
 pub(crate) fn run(
     hir: &LoweredFile,
     env: &TypeEnv,
     file: &str,
-    strict: bool,
-    seed_params: bool,
+    exact: Exactness,
+    mode: InferMode,
     externals: Option<&ExternalTypes>,
 ) -> Outcome {
-    let severity = if strict {
+    let severity = if exact.is_strict() {
         Severity::Error
     } else {
         Severity::Warning
@@ -196,9 +242,9 @@ pub(crate) fn run(
         hir,
         file,
         severity,
-        strict,
+        exact,
         pass: 0,
-        seed_params,
+        mode,
         externals,
         shapes: Vec::new(),
         shape_of_expr: HashMap::new(),
@@ -450,13 +496,14 @@ struct Infer<'a> {
     hir: &'a LoweredFile,
     file: &'a str,
     severity: Severity,
-    /// Strict mode (drives assignability inside carrier classification).
-    strict: bool,
+    /// The assignability end of the strictness ladder (drives assignability
+    /// inside carrier classification).
+    exact: Exactness,
     /// 0 = build shapes, 1 = emit diagnostics + publish types.
     pass: u8,
-    /// Seed unannotated parameters from call-site argument types
-    /// (display-only inference; see [`run`]).
-    seed_params: bool,
+    /// The surface this run serves — [`InferMode::Display`] seeds unannotated
+    /// parameters from call-site argument types; [`InferMode::Check`] does not.
+    mode: InferMode,
     /// Cross-file inputs (require exports + dependents' call args), when
     /// the analysis layer supplied them. Display-only.
     externals: Option<&'a ExternalTypes>,
@@ -516,7 +563,7 @@ struct Infer<'a> {
     declared: HashSet<BindingId>,
     globals: HashMap<String, ITy>,
     expr_types: HashMap<Key, Ty>,
-    method_sigs: HashMap<Key, FunctionTy>,
+    method_sigs: HashMap<Key, MethodSig>,
     diags: Vec<Diagnostic>,
     memo: HashMap<usize, Ty>,
     reify_stack: Vec<usize>,
@@ -675,7 +722,7 @@ impl Infer<'_> {
                 ),
             ),
         };
-        let mut diag = Diagnostic::new(Code::new(FIELD_NOT_FOUND), self.severity, message)
+        let mut diag = Diagnostic::new(FIELD_NOT_FOUND, self.severity, message)
             .with_label(Label::primary(Span::new(self.file, start..end), label));
         if let Some(class) = declared
             && let Some(range) = self.env.class_decl_span(class)
@@ -688,252 +735,59 @@ impl Infer<'_> {
         self.diags.push(diag);
     }
 
-    // --- member visibility (luals `invisible`, #115) ---------------------
-
-    /// The single `---@class` a receiver value resolves to, if any: a
-    /// `Ty::Named` class, or an inference shape whose (metatable-chained)
-    /// declaration names a class. `None` for anything else (a union, a plain
-    /// table, `unknown`) — the conservative direction, so visibility is only
-    /// ever judged against an unambiguous class receiver.
-    fn receiver_class(&self, recv: &ITy) -> Option<String> {
-        match recv {
-            ITy::Ty(Ty::Named(class)) if self.env.is_class(class) => Some(class.clone()),
-            ITy::Shape(id) => self.shape_declared_class(*id),
-            _ => None,
-        }
-    }
-
-    /// The declared `---@class` name of a shape, following the `__index` chain
-    /// (the receiver-side of [`Self::receiver_class`], reused to name the
-    /// enclosing class of a carrier method).
-    fn shape_declared_class(&self, id: usize) -> Option<String> {
-        let mut cur = Some(id);
-        let mut seen = HashSet::new();
-        while let Some(s) = cur {
-            if !seen.insert(s) {
-                break;
-            }
-            if let Some(class) = &self.shapes[s].declared
-                && self.env.is_class(class)
-            {
-                return Some(class.clone());
-            }
-            cur = self.index_delegate(s);
-        }
-        None
-    }
-
-    /// Check an access `recv.member` (or `recv:member()`) against the member's
-    /// declared visibility and report `invisible` (`LB0312`) when it is not
-    /// reachable from here (#115). `recv_class` is the receiver's resolved
-    /// class; a public member (or one on a non-restricting class) is silent.
-    fn check_visibility(&mut self, body: BodyId, expr: ExprId, recv_class: &str, member: &str) {
-        if self.pass != 1 {
-            return;
-        }
-        let Some((scope, owner)) = self.env.member_visibility(recv_class, member) else {
-            return;
-        };
-        let allowed = match scope {
-            luacats::FieldScope::Public => return,
-            // Private: only the owning class's own methods.
-            luacats::FieldScope::Private => self.class_ctx.iter().any(|c| c == &owner),
-            // Protected: the owning class or any subclass method.
-            luacats::FieldScope::Protected => self
-                .class_ctx
-                .iter()
-                .any(|c| c == &owner || self.env.is_subclass(c, &owner)),
-            // Package: anywhere in the file that declares the owning class.
-            luacats::FieldScope::Package => self.env.declares_class_locally(&owner),
-        };
-        if !allowed {
-            self.report_invisible(body, expr, member, &owner, scope);
-        }
-    }
-
-    /// Report an `invisible` access (`LB0312`). Follows the strictness ladder
-    /// like its sibling `undefined-field` (`LB0306`) — a warning in warn mode,
-    /// an error in strict — which is stricter than luals (always a warning).
-    fn report_invisible(
-        &mut self,
-        body: BodyId,
-        expr: ExprId,
-        member: &str,
-        owner: &str,
-        scope: luacats::FieldScope,
-    ) {
-        let Some((start, end)) = self.expr_range(body, expr) else {
-            return;
-        };
-        let (kind, reach) = match scope {
-            luacats::FieldScope::Private => ("private", "its own class"),
-            luacats::FieldScope::Protected => ("protected", "its class and subclasses"),
-            luacats::FieldScope::Package => ("package", "the file that declares its class"),
-            luacats::FieldScope::Public => return,
-        };
-        let mut diag = Diagnostic::new(
-            Code::new(INVISIBLE),
-            self.severity,
-            format!("cannot access {kind} member `{member}` of `{owner}` here"),
-        )
-        .with_label(Label::primary(
-            Span::new(self.file, start..end),
-            format!("`{member}` is {kind} to `{owner}` — accessible only from {reach}"),
-        ));
-        if let Some(range) = self.env.class_decl_span(owner) {
-            diag = diag.with_label(Label::secondary(
-                Span::new(self.file.to_string(), range),
-                format!("`{owner}` declared here"),
-            ));
-        }
-        self.diags.push(diag);
-    }
-
-    // --- reification -----------------------------------------------------
-
-    /// Snapshot an inference type as a plain structural [`Ty`].
-    fn reify(&mut self, ity: &ITy) -> Ty {
-        match ity {
-            ITy::Ty(ty) => ty.clone(),
-            ITy::Shape(id) => self.reify_shape(*id),
-            ITy::Func(body) => Ty::Function(Box::new(self.reify_func(*body))),
-            ITy::Union(members) => {
-                let members = members.clone();
-                Ty::union(members.iter().map(|m| self.reify(m)).collect())
-            }
-        }
-    }
-
-    fn reify_func(&mut self, body: BodyId) -> FunctionTy {
-        if let Some(sig) = self.funcs.get(&body).and_then(|f| f.sig.clone()) {
-            return sig;
-        }
-        let hir_body = self.body(body);
-        let params: Vec<ParamTy> = hir_body
-            .params
-            .iter()
-            .map(|&p| ParamTy {
-                name: self.binding(p).name.clone(),
-                ty: Ty::Unknown,
-                optional: false,
-            })
-            .collect();
-        let varargs = hir_body.is_vararg.then_some(Ty::Unknown);
-        let (returns_set, returns) = match self.funcs.get(&body) {
-            Some(data) => (data.returns_set, data.returns.clone()),
-            None => (false, Vec::new()),
-        };
-        let returns = if returns_set {
-            returns.iter().map(|r| self.reify(r)).collect()
-        } else {
-            Vec::new()
-        };
-        FunctionTy {
-            params,
-            varargs,
-            returns,
-            returns_vararg: false,
-            // In display mode the inferred returns are the signature: a
-            // dependent file calling this exported function gets them. The
-            // checker (seed_params off) keeps the conservative `false`.
-            has_return_annotation: returns_set && self.seed_params,
-            overloads: Vec::new(),
-            generics: Vec::new(),
-            // Inferred (unannotated) functions carry no doc-comment flags.
-            deprecated: false,
-            nodiscard: false,
-            is_async: false,
-            version: None,
-        }
-    }
-
-    /// Reify a shape: own fields plus the flattened `__index` chain
-    /// (nearest definition wins), skipping `__`-metafields. Cycles cut off
-    /// with the catch-all table shape.
-    fn reify_shape(&mut self, id: usize) -> Ty {
-        // A declared *instance* shape reifies as its declared name: the
-        // result of `setmetatable(x, Carrier)` (and `self` in the carrier's
-        // methods) IS the declared class/struct at annotated boundaries, so
-        // constructors satisfy `---@return <Class>` (#73).
-        if self.shapes[id].is_instance
-            && let Some(name) = self.shapes[id].declared.clone()
-            && self.env.resolve_named(&name).is_some()
-        {
-            return Ty::Named(name);
-        }
-        if let Some(ty) = self.memo.get(&id) {
-            return ty.clone();
-        }
-        if self.reify_stack.contains(&id) {
-            return Ty::any_table();
-        }
-        self.reify_stack.push(id);
-
-        let mut fields: BTreeMap<String, ITy> = BTreeMap::new();
-        let mut indexers: Vec<(Ty, ITy)> = Vec::new();
-        let mut array: Vec<ITy> = Vec::new();
-        let mut cur = Some(id);
-        let mut seen: HashSet<usize> = HashSet::new();
-        while let Some(s) = cur {
-            if !seen.insert(s) {
-                break;
-            }
-            for (name, ity) in &self.shapes[s].fields {
-                if !name.starts_with("__") && !fields.contains_key(name) {
-                    fields.insert(name.clone(), ity.clone());
-                }
-            }
-            for entry in &self.shapes[s].indexers {
-                if !indexers.contains(entry) {
-                    indexers.push(entry.clone());
-                }
-            }
-            for ity in &self.shapes[s].array {
-                if !array.contains(ity) {
-                    array.push(ity.clone());
-                }
-            }
-            cur = self.index_delegate(s);
-        }
-
-        let mut table = TableTy::default();
-        for (name, ity) in fields {
-            let ty = self.reify(&ity);
-            table.fields.insert(
-                name,
-                FieldTy {
-                    ty,
-                    optional: false,
-                },
-            );
-        }
-        for (key, ity) in indexers {
-            let value = self.reify(&ity);
-            table.indexers.push((key, value));
-        }
-        if !array.is_empty() {
-            let elems: Vec<Ty> = array.iter().map(|i| self.reify(i)).collect();
-            table.array = Some(Ty::union(elems));
-        }
-        self.reify_stack.pop();
-        let ty = Ty::Table(Box::new(table));
-        if self.pass == 1 {
-            self.memo.insert(id, ty.clone());
-        }
-        ty
-    }
-
-    /// The shape a lookup delegates to via the metatable's `__index`, when
-    /// it is a tracked table.
-    fn index_delegate(&self, shape: usize) -> Option<usize> {
-        let meta = self.shapes[shape].metatable?;
-        match self.shapes[meta].fields.get("__index") {
-            Some(ITy::Shape(next)) => Some(*next),
-            _ => None,
-        }
-    }
-
     // --- field lookup ------------------------------------------------------
+
+    /// Fold a same-file carrier attachment's use-site tags onto a member that
+    /// resolved through its class's *declared* shape.
+    ///
+    /// A `---@field m fun(...)` line is authoritative for the member's type,
+    /// and `class_shape` lets it shadow the `function C:m()` attachment
+    /// accordingly. But `fun(...)` syntax has nowhere to write
+    /// `---@deprecated`/`---@async`/`---@version`: those tags only ever live on
+    /// the carrier. Without carrying them across, declaring a method as a
+    /// `---@field` *and* defining it silently disables LB0308/LB0316 at every
+    /// `c:m()` site (#33). Only the tags travel — parameters, returns,
+    /// overloads and generics stay as declared.
+    ///
+    /// The attachment is read straight off the carrier shape (`local C = {}`,
+    /// which `function C:m()` extends), not through another class-shape
+    /// lookup, so this cannot re-enter the resolution it is refining.
+    fn carrier_tagged(&self, class: &str, name: &str, found: ITy) -> ITy {
+        let ITy::Ty(Ty::Function(sig)) = &found else {
+            return found;
+        };
+        // Already tagged, or no same-file carrier to consult.
+        if sig.deprecated || sig.is_async || sig.version.is_some() {
+            return found;
+        }
+        let Some(&carrier) = self.declared_carriers.get(class) else {
+            return found;
+        };
+        let Some(attached) = self.shapes[carrier].fields.get(name) else {
+            return found;
+        };
+        let Some(tags) = self.tags_of(attached) else {
+            return found;
+        };
+        if !tags.deprecated && !tags.is_async && tags.version.is_none() {
+            return found;
+        }
+        let mut tagged = (**sig).clone();
+        tagged.deprecated = tags.deprecated;
+        tagged.is_async = tags.is_async;
+        tagged.version.clone_from(&tags.version);
+        ITy::Ty(Ty::Function(Box::new(tagged)))
+    }
+
+    /// The declared signature behind a function-valued member, whether it is an
+    /// already-reified type or a body this file defines.
+    fn tags_of<'s>(&'s self, ity: &'s ITy) -> Option<&'s FunctionTy> {
+        match ity {
+            ITy::Ty(Ty::Function(sig)) => Some(sig),
+            ITy::Func(body) => self.funcs.get(body)?.sig.as_ref(),
+            _ => None,
+        }
+    }
 
     /// Look a named field up on a receiver, following the `__index` chain.
     fn lookup_field(&mut self, recv: &ITy, name: &str) -> Lookup {
@@ -984,7 +838,7 @@ impl Infer<'_> {
                         } else {
                             field.ty.clone()
                         };
-                        return Lookup::Found(ITy::Ty(ty));
+                        return Lookup::Found(self.carrier_tagged(&class, name, ITy::Ty(ty)));
                     }
                     // Absence is diagnosable only for a real LuaCATS `---@class`
                     // with no indexer/array part. A dynamic-access class stays
@@ -1065,7 +919,7 @@ impl Infer<'_> {
                     return Lookup::Opaque;
                 };
                 if let Lookup::Found(ity) = self.lookup_ty_field(&resolved, name) {
-                    return Lookup::Found(ity);
+                    return Lookup::Found(self.carrier_tagged(class, name, ity));
                 }
                 // An annotated instance (`---@return Circle`, `---@type
                 // Circle`) still resolves methods and inferred extensions
@@ -1244,7 +1098,7 @@ impl Infer<'_> {
                 // `---@param` (the `sig` branch above) wins — an annotated
                 // parameter is never recorded here.
                 seed
-            } else if self.seed_params {
+            } else if self.mode.seeds_params() {
                 // Call-site inference: the union of argument types the
                 // previous pass observed for this parameter.
                 self.param_seeds
@@ -1527,12 +1381,7 @@ impl Infer<'_> {
                     let target = target.clone();
                     match self.reify_shape(id) {
                         Ty::Table(lit) => matches!(
-                            crate::assign::classify_literal(
-                                self.env,
-                                crate::assign::Exactness::from_strict(self.strict),
-                                &lit,
-                                &target
-                            ),
+                            crate::assign::classify_literal(self.env, self.exact, &lit, &target),
                             Some(crate::assign::LiteralConformance::MissingOnly)
                         ),
                         _ => false,
@@ -1696,437 +1545,6 @@ impl Infer<'_> {
                 None => self.mark_escaped(&value),
             },
             Target::Opaque => self.mark_escaped(&value),
-        }
-    }
-
-    // --- `---@cast` / inline `--[[@as T]]` overrides -------------------------
-
-    /// Apply any `---@cast var T` annotations attached to this statement
-    /// before walking it (LuaLS semantics: the override holds from this
-    /// point in the flow, even for annotated bindings).
-    fn apply_casts(&mut self, body: BodyId, stmt: StmtId) {
-        let Some(key) = self.stmt_range(body, stmt) else {
-            return;
-        };
-        let env = self.env;
-        let Some(casts) = env.casts_at(key) else {
-            return;
-        };
-        for cast in casts {
-            let target = self.cast_target(body, stmt, &cast.var);
-            let current = match &target {
-                CastTarget::Binding(id) => self.state.get(id).cloned(),
-                CastTarget::Global(name) => self.globals.get(name).cloned(),
-            };
-            let mut ity = current.unwrap_or_else(ITy::unknown);
-            for (kind, ty) in &cast.ops {
-                ity = match kind {
-                    luacats::CastKind::Replace => ITy::Ty(ty.clone()),
-                    luacats::CastKind::Add => ity_union(vec![ity, ITy::Ty(ty.clone())]),
-                    luacats::CastKind::Remove => remove_cast_member(&ity, ty),
-                };
-            }
-            match target {
-                CastTarget::Binding(id) => {
-                    self.state.insert(id, ity);
-                }
-                CastTarget::Global(name) => {
-                    self.globals.insert(name, ity);
-                }
-            }
-        }
-    }
-
-    /// Resolve the variable a `---@cast` names: a resolved use inside the
-    /// annotated statement when one exists (precise), otherwise the most
-    /// recently declared binding of that name (approximate), otherwise a
-    /// global.
-    fn cast_target(&self, body: BodyId, stmt: StmtId, var: &str) -> CastTarget {
-        if let Some(id) = self.find_name_in_stmt(body, stmt, var) {
-            return CastTarget::Binding(id);
-        }
-        let best = self
-            .state
-            .keys()
-            .filter(|id| self.binding(**id).name == var)
-            .max_by_key(|id| self.binding(**id).range.start());
-        match best {
-            Some(&id) => CastTarget::Binding(id),
-            None => CastTarget::Global(var.to_string()),
-        }
-    }
-
-    /// The inline `--[[@as T]]` cast anchored to this expression, if any.
-    fn as_override(&self, body: BodyId, expr: ExprId) -> Option<Ty> {
-        let (_, end) = self.expr_range(body, expr)?;
-        self.env.as_cast_at(end).cloned()
-    }
-
-    fn find_name_in_stmt(&self, body: BodyId, stmt: StmtId, var: &str) -> Option<BindingId> {
-        match self.body(body).stmt(stmt) {
-            Stmt::Local { init, .. } => self.find_name_in_exprs(body, init, var),
-            Stmt::LocalFunction { func, .. } => self.find_name_in_expr(body, *func, var),
-            Stmt::Assign { targets, values } => self
-                .find_name_in_exprs(body, targets, var)
-                .or_else(|| self.find_name_in_exprs(body, values, var)),
-            Stmt::ExprStmt(e) => self.find_name_in_expr(body, *e, var),
-            Stmt::Return(exprs) => self.find_name_in_exprs(body, exprs, var),
-            Stmt::If {
-                branches,
-                else_block,
-            } => branches
-                .iter()
-                .find_map(|b| {
-                    self.find_name_in_expr(body, b.cond, var)
-                        .or_else(|| self.find_name_in_block(body, &b.block, var))
-                })
-                .or_else(|| {
-                    else_block
-                        .as_ref()
-                        .and_then(|b| self.find_name_in_block(body, b, var))
-                }),
-            Stmt::While { cond, body: block } => self
-                .find_name_in_expr(body, *cond, var)
-                .or_else(|| self.find_name_in_block(body, block, var)),
-            Stmt::Repeat { body: block, cond } => self
-                .find_name_in_block(body, block, var)
-                .or_else(|| self.find_name_in_expr(body, *cond, var)),
-            Stmt::NumericFor {
-                start,
-                end,
-                step,
-                body: block,
-                ..
-            } => self
-                .find_name_in_expr(body, *start, var)
-                .or_else(|| self.find_name_in_expr(body, *end, var))
-                .or_else(|| step.and_then(|s| self.find_name_in_expr(body, s, var)))
-                .or_else(|| self.find_name_in_block(body, block, var)),
-            Stmt::GenericFor {
-                exprs, body: block, ..
-            } => self
-                .find_name_in_exprs(body, exprs, var)
-                .or_else(|| self.find_name_in_block(body, block, var)),
-            Stmt::Do { body: block } => self.find_name_in_block(body, block, var),
-            Stmt::Break | Stmt::Goto { .. } | Stmt::Label { .. } | Stmt::Error => None,
-        }
-    }
-
-    fn find_name_in_block(&self, body: BodyId, block: &Block, var: &str) -> Option<BindingId> {
-        block
-            .stmts
-            .iter()
-            .find_map(|&s| self.find_name_in_stmt(body, s, var))
-    }
-
-    fn find_name_in_exprs(&self, body: BodyId, exprs: &[ExprId], var: &str) -> Option<BindingId> {
-        exprs
-            .iter()
-            .find_map(|&e| self.find_name_in_expr(body, e, var))
-    }
-
-    fn find_name_in_expr(&self, body: BodyId, expr: ExprId, var: &str) -> Option<BindingId> {
-        match self.body(body).expr(expr) {
-            Expr::Name(name) if name == var => self.name_binding(body, expr),
-            Expr::Name(_) | Expr::Literal(_) | Expr::Vararg | Expr::Error => None,
-            Expr::Index { base, index, .. } => self
-                .find_name_in_expr(body, *base, var)
-                .or_else(|| self.find_name_in_expr(body, *index, var)),
-            Expr::Call { callee, args } => self
-                .find_name_in_expr(body, *callee, var)
-                .or_else(|| self.find_name_in_exprs(body, args, var)),
-            Expr::MethodCall { receiver, args, .. } => self
-                .find_name_in_expr(body, *receiver, var)
-                .or_else(|| self.find_name_in_exprs(body, args, var)),
-            Expr::Function(fn_body) => {
-                // An upvalue use inside a closure resolves to the same
-                // binding — still a precise hit.
-                let fn_body = *fn_body;
-                let block = &self.body(fn_body).block;
-                self.find_name_in_block(fn_body, block, var)
-            }
-            Expr::Table { entries } => entries.iter().find_map(|entry| match entry {
-                TableEntry::Positional(v) => self.find_name_in_expr(body, *v, var),
-                TableEntry::Named { value, .. } => self.find_name_in_expr(body, *value, var),
-                TableEntry::Keyed { key, value } => self
-                    .find_name_in_expr(body, *key, var)
-                    .or_else(|| self.find_name_in_expr(body, *value, var)),
-            }),
-            Expr::Binary { lhs, rhs, .. } => self
-                .find_name_in_expr(body, *lhs, var)
-                .or_else(|| self.find_name_in_expr(body, *rhs, var)),
-            Expr::Unary { operand, .. } => self.find_name_in_expr(body, *operand, var),
-            Expr::Truncate(inner) => self.find_name_in_expr(body, *inner, var),
-        }
-    }
-
-    // --- branching & narrowing ---------------------------------------------
-
-    fn walk_if(&mut self, body: BodyId, branches: &[IfBranch], else_block: Option<&Block>) {
-        let mut outs: Vec<HashMap<BindingId, ITy>> = Vec::new();
-        // The running "no branch so far was taken" state.
-        let mut fallthrough = self.state.clone();
-        for branch in branches {
-            self.state = fallthrough.clone();
-            self.eval(body, branch.cond);
-            self.apply_narrows(body, branch.cond, true);
-            self.walk_block(body, &branch.block);
-            if !self.block_terminates(body, &branch.block) {
-                outs.push(std::mem::take(&mut self.state));
-            }
-            // Later arms (and the code after the `if`) know this
-            // condition was false.
-            self.state = fallthrough;
-            self.apply_narrows(body, branch.cond, false);
-            fallthrough = std::mem::take(&mut self.state);
-        }
-        if let Some(block) = else_block {
-            self.state = fallthrough;
-            self.walk_block(body, block);
-            if !self.block_terminates(body, block) {
-                outs.push(std::mem::take(&mut self.state));
-            }
-        } else {
-            outs.push(fallthrough);
-        }
-        self.merge_states(outs);
-    }
-
-    /// Union-merge branch-exit states into `self.state`.
-    fn merge_states(&mut self, outs: Vec<HashMap<BindingId, ITy>>) {
-        let mut iter = outs.into_iter();
-        let Some(mut merged) = iter.next() else {
-            // Every path terminated: keep the entry state (dead code after).
-            return;
-        };
-        for out in iter {
-            for (id, ity) in out {
-                match merged.get(&id) {
-                    Some(existing) => {
-                        let union = ity_union(vec![existing.clone(), ity]);
-                        merged.insert(id, union);
-                    }
-                    None => {
-                        merged.insert(id, ity);
-                    }
-                }
-            }
-        }
-        self.state = merged;
-    }
-
-    fn block_terminates(&self, body: BodyId, block: &Block) -> bool {
-        block.stmts.last().is_some_and(|&stmt| {
-            matches!(
-                self.body(body).stmt(stmt),
-                Stmt::Return(_) | Stmt::Break | Stmt::Goto { .. }
-            )
-        })
-    }
-
-    fn apply_narrows(&mut self, body: BodyId, cond: ExprId, positive: bool) {
-        let mut preds: Vec<(BindingId, Pred)> = Vec::new();
-        self.cond_narrows(body, cond, positive, &mut preds);
-        for (binding, pred) in preds {
-            if let Some(current) = self.state.get(&binding) {
-                let narrowed = self.narrow(&current.clone(), &pred);
-                self.state.insert(binding, narrowed);
-            }
-        }
-    }
-
-    /// Derive narrowing predicates from a condition (`positive` = the
-    /// branch where the condition held).
-    fn cond_narrows(
-        &self,
-        body: BodyId,
-        cond: ExprId,
-        positive: bool,
-        out: &mut Vec<(BindingId, Pred)>,
-    ) {
-        match self.body(body).expr(cond) {
-            Expr::Name(_) => {
-                if let Some(binding) = self.name_binding(body, cond) {
-                    out.push((binding, if positive { Pred::Truthy } else { Pred::Falsy }));
-                }
-            }
-            Expr::Truncate(inner) => self.cond_narrows(body, *inner, positive, out),
-            Expr::Unary {
-                op: UnOp::Not,
-                operand,
-            } => self.cond_narrows(body, *operand, !positive, out),
-            Expr::Binary { op, lhs, rhs } => match op {
-                BinOp::And if positive => {
-                    self.cond_narrows(body, *lhs, true, out);
-                    self.cond_narrows(body, *rhs, true, out);
-                }
-                BinOp::Or if !positive => {
-                    self.cond_narrows(body, *lhs, false, out);
-                    self.cond_narrows(body, *rhs, false, out);
-                }
-                BinOp::Eq | BinOp::Ne => {
-                    let holds = (*op == BinOp::Eq) == positive;
-                    self.eq_narrows(body, *lhs, *rhs, holds, out);
-                    self.eq_narrows(body, *rhs, *lhs, holds, out);
-                }
-                _ => {}
-            },
-            _ => {}
-        }
-    }
-
-    /// Narrowing from `subject ==/~= probe` where `probe` is a literal, or
-    /// `subject` is a `type(x)` call compared to a type-name string.
-    fn eq_narrows(
-        &self,
-        body: BodyId,
-        subject: ExprId,
-        probe: ExprId,
-        holds: bool,
-        out: &mut Vec<(BindingId, Pred)>,
-    ) {
-        // `type(x) == "string"`.
-        if let Expr::Call { callee, args } = self.body(body).expr(subject)
-            && matches!(self.body(body).expr(*callee), Expr::Name(n) if n == "type")
-            && matches!(self.resolution(body, *callee), Some(Resolution::Global(_)))
-            && let [arg] = args[..]
-            && let Some(binding) = self.name_binding(body, arg)
-            && let Expr::Literal(Literal::String(s)) = self.body(body).expr(probe)
-            && let Some(name) = s.as_str().and_then(type_name)
-        {
-            out.push((
-                binding,
-                if holds {
-                    Pred::TypeIs(name)
-                } else {
-                    Pred::NotTypeIs(name)
-                },
-            ));
-            return;
-        }
-        // `x == nil` / `x == <literal>`.
-        if let Some(binding) = self.name_binding(body, subject)
-            && let Expr::Literal(lit) = self.body(body).expr(probe)
-        {
-            let pred = match (lit, holds) {
-                (Literal::Nil, true) => Pred::Nil,
-                (Literal::Nil, false) => Pred::NonNil,
-                (other, true) => Pred::Lit(literal_ty(other)),
-                (other, false) => Pred::NotLit(literal_ty(other)),
-            };
-            out.push((binding, pred));
-        }
-    }
-
-    fn name_binding(&self, body: BodyId, expr: ExprId) -> Option<BindingId> {
-        if !matches!(self.body(body).expr(expr), Expr::Name(_)) {
-            return None;
-        }
-        match self.resolution(body, expr) {
-            Some(Resolution::Local(id)) => Some(*id),
-            Some(Resolution::Upvalue { binding, .. }) => Some(*binding),
-            _ => None,
-        }
-    }
-
-    /// Apply a predicate to an inference type (union-filtering).
-    fn narrow(&self, ity: &ITy, pred: &Pred) -> ITy {
-        let members = ity_members(ity);
-        let mut kept: Vec<ITy> = Vec::new();
-        for member in members {
-            match pred {
-                Pred::Truthy => match &member {
-                    ITy::Ty(Ty::Nil | Ty::BoolLit(false)) => {}
-                    ITy::Ty(Ty::Boolean) => kept.push(ITy::Ty(Ty::BoolLit(true))),
-                    ITy::Ty(Ty::Union(inner)) => {
-                        let inner: Vec<Ty> = inner
-                            .iter()
-                            .filter(|t| !matches!(t, Ty::Nil | Ty::BoolLit(false)))
-                            .cloned()
-                            .collect();
-                        if !inner.is_empty() {
-                            kept.push(ITy::Ty(Ty::union(inner)));
-                        }
-                    }
-                    _ => kept.push(member),
-                },
-                Pred::Falsy => match &member {
-                    ITy::Ty(Ty::Nil | Ty::BoolLit(false)) => kept.push(member),
-                    ITy::Ty(Ty::Boolean) => kept.push(ITy::Ty(Ty::BoolLit(false))),
-                    ITy::Ty(Ty::Unknown | Ty::Any) => {
-                        kept.push(ITy::Ty(Ty::union(vec![Ty::Nil, Ty::BoolLit(false)])));
-                    }
-                    ITy::Ty(Ty::Union(inner)) => {
-                        if inner.contains(&Ty::Nil) {
-                            kept.push(ITy::Ty(Ty::Nil));
-                        }
-                        if inner.contains(&Ty::BoolLit(false)) || inner.contains(&Ty::Boolean) {
-                            kept.push(ITy::Ty(Ty::BoolLit(false)));
-                        }
-                    }
-                    _ => {}
-                },
-                Pred::Nil => match &member {
-                    ITy::Ty(Ty::Nil | Ty::Unknown | Ty::Any) => kept.push(ITy::Ty(Ty::Nil)),
-                    ITy::Ty(Ty::Union(inner)) if inner.contains(&Ty::Nil) => {
-                        kept.push(ITy::Ty(Ty::Nil));
-                    }
-                    _ => {}
-                },
-                Pred::NonNil => match &member {
-                    ITy::Ty(Ty::Nil) => {}
-                    ITy::Ty(Ty::Union(inner)) => {
-                        let inner: Vec<Ty> = inner
-                            .iter()
-                            .filter(|t| !matches!(t, Ty::Nil))
-                            .cloned()
-                            .collect();
-                        if !inner.is_empty() {
-                            kept.push(ITy::Ty(Ty::union(inner)));
-                        }
-                    }
-                    _ => kept.push(member),
-                },
-                Pred::TypeIs(name) => {
-                    if let Some(narrowed) = narrow_type_is(&member, name) {
-                        kept.push(narrowed);
-                    }
-                }
-                Pred::NotTypeIs(name) => {
-                    if narrow_type_is(&member, name).is_none() || member.is_unknown() {
-                        kept.push(member);
-                    }
-                }
-                Pred::Lit(lit) => match &member {
-                    ITy::Ty(Ty::Unknown | Ty::Any) => kept.push(ITy::Ty(lit.clone())),
-                    ITy::Ty(ty) => {
-                        if crate::assign::assignable(
-                            self.env,
-                            crate::assign::Exactness::Loose,
-                            lit,
-                            ty,
-                        ) {
-                            kept.push(ITy::Ty(lit.clone()));
-                        }
-                    }
-                    _ => {}
-                },
-                Pred::NotLit(lit) => {
-                    if member != ITy::Ty(lit.clone()) {
-                        kept.push(member);
-                    }
-                }
-            }
-        }
-        if kept.is_empty() {
-            // The branch is (statically) impossible; degrade gracefully.
-            match pred {
-                Pred::Nil => ITy::Ty(Ty::Nil),
-                Pred::TypeIs(name) => ITy::Ty(type_base(name)),
-                _ => ITy::unknown(),
-            }
-        } else {
-            ity_union(kept)
         }
     }
 
@@ -2454,907 +1872,6 @@ impl Infer<'_> {
         }
         None
     }
-
-    // --- calls -----------------------------------------------------------
-
-    /// Evaluate a call, returning its full (positional) return types and
-    /// whether the list is open-ended.
-    fn eval_call(&mut self, body: BodyId, expr: ExprId) -> (Vec<ITy>, bool) {
-        let Expr::Call { callee, args } = self.body(body).expr(expr).clone() else {
-            return (Vec::new(), true);
-        };
-        // Modeled builtins (global names only — shadowed names skip this).
-        if let Expr::Name(name) = self.body(body).expr(callee)
-            && matches!(self.resolution(body, callee), Some(Resolution::Global(_)))
-        {
-            let name = name.clone();
-            match name.as_str() {
-                "setmetatable" => return (vec![self.eval_setmetatable(body, &args)], false),
-                "require" => {
-                    for &arg in &args {
-                        self.eval(body, arg);
-                    }
-                    // Display mode with cross-file inputs: a static
-                    // `require("mod")` evaluates to the target module's
-                    // inferred export type.
-                    if let (Some(externals), Some(key)) =
-                        (self.externals, self.expr_range(body, expr))
-                        && let Some(edge) = self.hir.requires().iter().find(|edge| {
-                            (
-                                usize::from(edge.range.start()),
-                                usize::from(edge.range.end()),
-                            ) == key
-                        })
-                        && let Some(ty) = externals.requires.get(&edge.module)
-                    {
-                        return (vec![ITy::Ty(ty.clone())], false);
-                    }
-                    return (vec![ITy::unknown()], true);
-                }
-                "pairs" | "ipairs" | "next" | "rawget" | "rawequal" | "rawlen" | "tostring"
-                | "tonumber" | "select" | "unpack" => {
-                    // Read-only stdlib: arguments do not escape, but the
-                    // results are not modeled.
-                    for &arg in &args {
-                        self.eval(body, arg);
-                    }
-                    let ret = match name.as_str() {
-                        "tostring" => ITy::Ty(Ty::String),
-                        "rawlen" => ITy::Ty(Ty::Integer),
-                        _ => ITy::unknown(),
-                    };
-                    let open = ret.is_unknown();
-                    return (vec![ret], open);
-                }
-                "type" => {
-                    for &arg in &args {
-                        self.eval(body, arg);
-                    }
-                    return (vec![ITy::Ty(Ty::String)], false);
-                }
-                "assert" => {
-                    let mut vals: Vec<ITy> = Vec::new();
-                    for &arg in &args {
-                        vals.push(self.eval(body, arg));
-                    }
-                    let first = vals
-                        .first()
-                        .map_or_else(ITy::unknown, |v| self.narrow(v, &Pred::Truthy));
-                    return (vec![first], false);
-                }
-                _ => {}
-            }
-        }
-
-        let mut callee_ity = self.eval(body, callee);
-        // A dotted callee whose signature lives only in the ambient/defs
-        // registry (`string.rep`, a defs-global `mylib.f`): the base table's
-        // shape carries no such field (defs register dotted functions by name,
-        // not as class members), so the callee evaluates to `unknown` and the
-        // call result never reaches an unannotated binding. Resolve the
-        // declared signature by dotted name so its returns propagate (#106).
-        if callee_ity.is_unknown()
-            && let Some(dotted) = self.dotted_callee(body, callee)
-            && let Some(sig) = self.env.function(&dotted)
-        {
-            callee_ity = ITy::Ty(Ty::Function(Box::new(sig.clone())));
-        }
-        // Contextual typing (#120): a function-literal argument matched to a
-        // `---@param cb fun(...)` takes the expected function type's parameter
-        // types for its own parameters, so its body checks against them. Seed
-        // BEFORE evaluating the args — the lambda body is walked during that
-        // evaluation, so the seeds must already be in place.
-        self.seed_call_contextual(body, &callee_ity, &args);
-        let mut arg_itys: Vec<ITy> = Vec::with_capacity(args.len());
-        for &arg in &args {
-            let ity = self.eval(body, arg);
-            self.mark_escaped(&ity);
-            arg_itys.push(ity);
-        }
-        match &callee_ity {
-            ITy::Func(fn_body) => self.record_arg_seeds(*fn_body, &arg_itys, false),
-            // Not a function this file defines: record the args by callee
-            // name for dependents-side parameter seeding (`M.f(...)`).
-            _ => {
-                if let Some(name) = self.callee_name(body, callee) {
-                    self.record_outgoing(&name, &arg_itys);
-                }
-            }
-        }
-        // A generic function (`---@generic T`): infer the type variables from
-        // the argument types and substitute into the returns, so an
-        // unannotated binding of the call result gets the flowed type (#84 —
-        // `local n = id(5)` types `n` as `integer`).
-        if let Some(sig) = self.generic_sig_of(&callee_ity) {
-            let reified: Vec<Ty> = arg_itys.iter().map(|a| self.reify(a)).collect();
-            let map = crate::generics::infer_call(&sig, &reified);
-            let sig = crate::generics::subst_function(&sig, &map);
-            return (
-                sig.returns.iter().cloned().map(ITy::Ty).collect(),
-                sig.returns_vararg,
-            );
-        }
-        // Overload-aware result: if the callee's primary signature does not
-        // accept the arguments but an `---@overload` does, the call yields the
-        // matching overload's returns (first match wins, luals-style, #86).
-        if let Some(returns) = self.overloaded_returns(&callee_ity, &arg_itys) {
-            return returns;
-        }
-        // A value whose type is a declared `---@class` with a `---@operator
-        // call` overload is callable — the operator's declared result is the
-        // call's result type (LB0122).
-        if let Some(returns) = self.class_call_returns(&callee_ity, &arg_itys) {
-            return returns;
-        }
-        self.returns_of(&callee_ity)
-    }
-
-    /// The result of calling a value whose type resolves to a declared
-    /// `---@class` carrying a `---@operator call` overload (LB0122). When the
-    /// class declares several `call` overloads, the one whose declared input
-    /// accepts the first argument wins (first-match, mirroring binary-operator
-    /// selection in [`Self::operator_result`]); a no-input `call` operator
-    /// accepts any arguments. `None` for any other callee, leaving the
-    /// ordinary [`Self::returns_of`] path untouched (conservative: no
-    /// unknown / `any` / union / plain-table callee manufactures a result).
-    fn class_call_returns(&mut self, callee: &ITy, arg_itys: &[ITy]) -> Option<(Vec<ITy>, bool)> {
-        let Ty::Named(class) = self.reify(callee) else {
-            return None;
-        };
-        let sigs = self.env.class_operators(&class, "call");
-        if sigs.is_empty() {
-            return None;
-        }
-        let first_arg = arg_itys.first().map(|a| self.reify(a));
-        let chosen = sigs
-            .iter()
-            .find(|sig| match (&sig.input, &first_arg) {
-                (None, _) => true,
-                (Some(input), Some(arg)) => crate::assign::assignable(
-                    self.env,
-                    crate::assign::Exactness::from_strict(self.strict),
-                    arg,
-                    input,
-                ),
-                (Some(_), None) => false,
-            })
-            .unwrap_or(&sigs[0]);
-        Some((vec![ITy::Ty(chosen.result.clone())], false))
-    }
-
-    /// The returns of the first `---@overload` that accepts the arguments when
-    /// the primary signature does not — the value-position complement of the
-    /// checker's overload acceptance (#86). `None` when the callee has no
-    /// overloads or the primary already accepts (ordinary [`Self::returns_of`]).
-    fn overloaded_returns(
-        &mut self,
-        callee_ity: &ITy,
-        arg_itys: &[ITy],
-    ) -> Option<(Vec<ITy>, bool)> {
-        let sig = self.callee_function_ty(callee_ity)?;
-        if sig.overloads.is_empty() {
-            return None;
-        }
-        let reified_args: Vec<Ty> = arg_itys.iter().map(|a| self.reify(a)).collect();
-        if self.sig_accepts(&sig, &reified_args) {
-            return None;
-        }
-        let overload = sig
-            .overloads
-            .iter()
-            .find(|o| self.sig_accepts(o, &reified_args))?;
-        Some((
-            overload.returns.iter().cloned().map(ITy::Ty).collect(),
-            overload.returns_vararg,
-        ))
-    }
-
-    /// The declared signature a callee value carries, if any — an annotated
-    /// function type or a file-local function with a `---@param`/`---@return`
-    /// signature. Used to consult `---@overload`s at the call site (#86).
-    fn callee_function_ty(&self, callee: &ITy) -> Option<FunctionTy> {
-        match callee {
-            ITy::Ty(Ty::Function(sig)) => Some((**sig).clone()),
-            ITy::Func(body) => self.funcs.get(body).and_then(|d| d.sig.clone()),
-            _ => None,
-        }
-    }
-
-    /// Whether `sig` accepts these (reified, positional) argument types —
-    /// inference's non-reporting mirror of the checker's `call_accepts`,
-    /// governing `---@overload` selection for call results (#86).
-    fn sig_accepts(&self, sig: &FunctionTy, args: &[Ty]) -> bool {
-        let supplied = args.len();
-        if supplied < sig.required_params() {
-            return false;
-        }
-        if supplied > sig.params.len() && sig.varargs.is_none() {
-            return false;
-        }
-        for (i, arg) in args.iter().enumerate() {
-            let expected = if let Some(param) = sig.params.get(i) {
-                if param.optional {
-                    param.ty.clone().optional()
-                } else {
-                    param.ty.clone()
-                }
-            } else if let Some(varargs) = &sig.varargs {
-                varargs.clone()
-            } else {
-                continue;
-            };
-            if !crate::assign::assignable(
-                self.env,
-                crate::assign::Exactness::from_strict(self.strict),
-                arg,
-                &expected,
-            ) {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// The annotated signature of a generic callee (`---@generic` with a
-    /// `---@return`), for call-site monomorphisation. `None` for non-generic
-    /// or unannotated callees (they follow the ordinary [`Self::returns_of`]).
-    fn generic_sig_of(&self, callee: &ITy) -> Option<FunctionTy> {
-        let sig = match callee {
-            ITy::Ty(Ty::Function(sig)) => Some((**sig).clone()),
-            ITy::Func(body) => self.funcs.get(body).and_then(|d| d.sig.clone()),
-            _ => None,
-        }?;
-        (!sig.generics.is_empty() && sig.has_return_annotation).then_some(sig)
-    }
-
-    /// The fully-dotted name of a callee rooted at a *global* name
-    /// (`string.rep` → `"string.rep"`), for looking its declared signature up
-    /// in the ambient/defs function registry (#106). `None` when the callee is
-    /// computed, indexed by a non-string-literal, or rooted at a local binding
-    /// (a local shadows any same-named registry function).
-    fn dotted_callee(&self, body: BodyId, callee: ExprId) -> Option<String> {
-        match self.body(body).expr(callee) {
-            Expr::Name(name) => match self.resolution(body, callee) {
-                Some(Resolution::Global(_)) | None => Some(name.clone()),
-                _ => None,
-            },
-            Expr::Index { base, index, .. } => {
-                let seg = match self.body(body).expr(*index) {
-                    Expr::Literal(Literal::String(s)) => s.as_str()?.to_string(),
-                    _ => return None,
-                };
-                let base = self.dotted_callee(body, *base)?;
-                Some(format!("{base}.{seg}"))
-            }
-            _ => None,
-        }
-    }
-
-    /// The terminal name of a callee expression: `f` for a plain name,
-    /// `f` for `M.f` / `M["f"]` (any base). `None` for computed callees.
-    fn callee_name(&self, body: BodyId, callee: ExprId) -> Option<String> {
-        match self.body(body).expr(callee) {
-            Expr::Name(name) => Some(name.clone()),
-            Expr::Index { index, .. } => match self.body(body).expr(*index) {
-                Expr::Literal(Literal::String(s)) => s.as_str().map(str::to_string),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
-    /// Record one observed call of a function this file does not define:
-    /// positional argument types, widened and unioned across call sites.
-    /// Second pass only (its types are the refined ones).
-    fn record_outgoing(&mut self, name: &str, args: &[ITy]) {
-        if self.pass != 1 || args.is_empty() {
-            return;
-        }
-        let tys: Vec<Ty> = args.iter().map(|a| self.reify(a).widened()).collect();
-        let entry = self.outgoing.entry(name.to_string()).or_default();
-        for (i, ty) in tys.into_iter().enumerate() {
-            if matches!(ty, Ty::Unknown) {
-                continue;
-            }
-            while entry.len() <= i {
-                entry.push(Ty::Unknown);
-            }
-            entry[i] = if matches!(entry[i], Ty::Unknown) {
-                ty
-            } else {
-                Ty::union(vec![entry[i].clone(), ty])
-            };
-        }
-    }
-
-    /// Record call-site argument types against a file-local function's
-    /// parameter bindings (positional; `skip_self` shifts past the implicit
-    /// `self` of a `:` call). Fixed types are widened — a parameter is a
-    /// general slot, not the one literal a caller happened to pass.
-    fn record_arg_seeds(&mut self, fn_body: BodyId, args: &[ITy], skip_self: bool) {
-        let params = self.body(fn_body).params.clone();
-        let params = if skip_self
-            && params
-                .first()
-                .is_some_and(|&p| self.binding(p).kind == BindingKind::SelfParam)
-        {
-            &params[1..]
-        } else {
-            &params[..]
-        };
-        for (&param, arg) in params.iter().zip(args) {
-            if arg.is_unknown() {
-                continue;
-            }
-            let seed = match arg {
-                ITy::Ty(ty) => ITy::Ty(ty.widened()),
-                other => other.clone(),
-            };
-            let merged = match self.param_seeds.get(&param) {
-                Some(existing) => ity_union(vec![existing.clone(), seed]),
-                None => seed,
-            };
-            self.param_seeds.insert(param, merged);
-        }
-    }
-
-    /// Contextually type a call's arguments from the callee's declared
-    /// parameter types (bidirectional typing, #120 + follow-ups). Each
-    /// argument is seeded against its matching parameter through the recursive
-    /// [`Self::seed_contextual`], so a function-literal argument takes its
-    /// expected `fun(...)` parameter types, and a table-literal argument's
-    /// function-valued fields (and nested table fields) take the expected
-    /// class's declared field types.
-    ///
-    /// Conservative by construction:
-    ///  - `callee_function_ty` yields `None` for an unannotated / `unknown` /
-    ///    `any` / plain-table callee, so no expected type ⇒ no seeding
-    ///    (behavior exactly as before);
-    ///  - a generic callee (`---@generic`) is skipped — its callback parameter
-    ///    types carry unbound placeholders, and generic callback inference is
-    ///    a documented follow-up, not part of this core;
-    ///  - [`Self::seed_contextual`] only acts where the expected type's own
-    ///    structure directs it (a `fun(...)` for a lambda, a `---@class`/table
-    ///    for a table literal); anything else seeds nothing.
-    fn seed_call_contextual(&mut self, body: BodyId, callee_ity: &ITy, args: &[ExprId]) {
-        let Some(sig) = self.callee_function_ty(callee_ity) else {
-            return;
-        };
-        // Generic callbacks are deferred (#120): seeding placeholder types
-        // would be meaningless. Leave them entirely to today's behavior.
-        if !sig.generics.is_empty() {
-            return;
-        }
-        for (i, &arg) in args.iter().enumerate() {
-            let Some(param) = sig.params.get(i) else {
-                continue;
-            };
-            let expected = param.ty.clone();
-            self.seed_contextual(body, arg, &expected);
-        }
-    }
-
-    /// Recursively seed contextual (bidirectional) types from an `expected`
-    /// type into an expression, following the expected type's own structure.
-    /// This mirrors luals `script/vm/compiler.lua`, which lazily compiles a
-    /// node against its expected (`infer`) type and recurses through nested
-    /// callbacks and table fields (`compileNode` / `compileByNode`). Two
-    /// expression shapes carry context:
-    ///
-    ///  - a **function literal** against an expected `fun(...)`: its parameters
-    ///    take the expected parameter types (so the body checks with no
-    ///    per-parameter annotation), and — following the expected *return*
-    ///    type — a returned function/table literal is seeded transitively, so
-    ///    an `outer(function(a) return function(b) ... end end)` against
-    ///    `---@param cb fun(a: A): fun(b: B)` types both `a` and `b` (#120
-    ///    nested/transitive follow-up);
-    ///  - a **table literal** against an expected `---@class`/table: each field
-    ///    the class declares is seeded against that field's declared type, so a
-    ///    function-valued field's literal takes the field's `fun` parameter
-    ///    types and a nested table-literal field takes the field's class type
-    ///    (contextual typing *into* a table literal, #120 follow-up).
-    ///
-    /// Bounded by the expected type's structure — never guessing. An
-    /// `unknown`/`any`/non-matching expected type seeds nothing, exactly as
-    /// today.
-    fn seed_contextual(&mut self, body: BodyId, expr: ExprId, expected: &Ty) {
-        match self.body(body).expr(expr).clone() {
-            Expr::Function(fn_body) => {
-                let Ty::Function(expected_fn) = expected else {
-                    return;
-                };
-                let expected_fn = expected_fn.clone();
-                self.seed_lambda_params(body, expr, fn_body, &expected_fn);
-                // Follow the expected return type into returned literals —
-                // nested/transitive propagation through further callback or
-                // table layers.
-                self.seed_returns(fn_body, &expected_fn.returns);
-            }
-            Expr::Table { entries } => {
-                let Some(shape) = self.expected_shape(expected) else {
-                    return;
-                };
-                for entry in &entries {
-                    let (name, value) = match entry {
-                        TableEntry::Named { name, value } => (Some(name.clone()), *value),
-                        TableEntry::Keyed { key, value } => {
-                            let name = match self.body(body).expr(*key) {
-                                Expr::Literal(Literal::String(s)) => s.as_str().map(str::to_string),
-                                _ => None,
-                            };
-                            (name, *value)
-                        }
-                        TableEntry::Positional(_) => continue,
-                    };
-                    let Some(name) = name else {
-                        continue;
-                    };
-                    if let Some(field) = shape.fields.get(&name) {
-                        let fty = field.ty.clone();
-                        self.seed_contextual(body, value, &fty);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Record contextual parameter seeds for one function-literal expression
-    /// from an expected `fun(...)` type (#120): the literal's `i`-th parameter
-    /// takes the expected function type's `i`-th parameter type, so the body
-    /// checks against it without a per-parameter annotation. A parameter the
-    /// lambda annotates itself (`---@param`) is skipped — annotations are
-    /// authoritative (SPEC §3) and are applied through the ordinary `sig`
-    /// path. An expected parameter typed `unknown`/`any` seeds nothing.
-    fn seed_lambda_params(
-        &mut self,
-        body: BodyId,
-        fn_expr: ExprId,
-        fn_body: BodyId,
-        expected_fn: &FunctionTy,
-    ) {
-        // The lambda's own `---@param` signature, when the harvester attached
-        // one to this expression — authoritative, so those parameters are left
-        // unseeded and the contextual type never overrides them.
-        let own_sig = self
-            .expr_range(body, fn_expr)
-            .and_then(|k| self.env.fn_sig(k))
-            .cloned();
-        // A function *literal* (`function(...)`) never carries an implicit
-        // `self`, so parameters line up positionally with the expected type's.
-        let params = self.body(fn_body).params.clone();
-        for (i, &param) in params.iter().enumerate() {
-            let binding = self.binding(param);
-            if binding.kind == BindingKind::SelfParam {
-                continue;
-            }
-            let name = binding.name.clone();
-            if own_sig
-                .as_ref()
-                .is_some_and(|s| s.params.iter().any(|p| p.name == name))
-            {
-                continue;
-            }
-            let Some(expected_param) = expected_fn.params.get(i) else {
-                continue;
-            };
-            if matches!(expected_param.ty, Ty::Unknown | Ty::Any) {
-                continue;
-            }
-            let ty = if expected_param.optional {
-                expected_param.ty.clone().optional()
-            } else {
-                expected_param.ty.clone()
-            };
-            self.ctx_param_seeds.insert(param, ITy::Ty(ty));
-        }
-    }
-
-    /// Seed the function/table literals a body `return`s from the enclosing
-    /// (expected) return types — the transitive step that carries a
-    /// `fun(...): fun(...)` expected type into a returned nested lambda, and a
-    /// `---@return <Class>` into a returned table literal's fields. Descends
-    /// through control-flow blocks but not into nested closures (whose returns
-    /// belong to those closures).
-    fn seed_returns(&mut self, fn_body: BodyId, expected: &[Ty]) {
-        if expected.is_empty() {
-            return;
-        }
-        let block = self.body(fn_body).block.clone();
-        let mut rets: Vec<Vec<ExprId>> = Vec::new();
-        self.collect_returns(fn_body, &block, &mut rets);
-        for ret in rets {
-            for (i, &e) in ret.iter().enumerate() {
-                if let Some(exp) = expected.get(i) {
-                    let exp = exp.clone();
-                    self.seed_contextual(fn_body, e, &exp);
-                }
-            }
-        }
-    }
-
-    /// Collect the expression lists of every `return` that belongs to `body`,
-    /// descending through control-flow blocks but never into nested function
-    /// literals.
-    fn collect_returns(&self, body: BodyId, block: &Block, out: &mut Vec<Vec<ExprId>>) {
-        for &stmt in &block.stmts {
-            match self.body(body).stmt(stmt) {
-                Stmt::Return(exprs) => out.push(exprs.clone()),
-                Stmt::If {
-                    branches,
-                    else_block,
-                } => {
-                    for br in branches {
-                        self.collect_returns(body, &br.block, out);
-                    }
-                    if let Some(b) = else_block {
-                        self.collect_returns(body, b, out);
-                    }
-                }
-                Stmt::While { body: b, .. }
-                | Stmt::Repeat { body: b, .. }
-                | Stmt::NumericFor { body: b, .. }
-                | Stmt::GenericFor { body: b, .. }
-                | Stmt::Do { body: b } => self.collect_returns(body, b, out),
-                _ => {}
-            }
-        }
-    }
-
-    /// Resolve an expected type to a single class/table field shape (mirrors
-    /// the checker's `table_shape`), unwrapping a `T?`/`T|nil` optional. A
-    /// union of two or more real members has no single expected shape, so it
-    /// seeds nothing (conservative).
-    fn expected_shape(&self, expected: &Ty) -> Option<TableTy> {
-        match expected {
-            Ty::Named(name) => self.env.class_shape(name),
-            Ty::Table(t) => Some((**t).clone()),
-            Ty::Union(members) => {
-                let non_nil: Vec<&Ty> = members.iter().filter(|m| **m != Ty::Nil).collect();
-                match non_nil[..] {
-                    [single] => self.expected_shape(single),
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
-    }
-
-    /// The inferred returns of every function *without* a `---@return`,
-    /// keyed by the function's source range (the display surface behind
-    /// editor return-type hints). Annotated functions are the editor's
-    /// job: it renders the annotation text verbatim, which survives type
-    /// names the per-file environment cannot resolve (cross-file classes).
-    fn collect_fn_returns(&mut self) -> Vec<InferredReturn> {
-        let mut out = Vec::new();
-        for (body_id, body) in self.hir.bodies() {
-            for (expr_id, expr) in body.exprs() {
-                let Expr::Function(fn_body) = expr else {
-                    continue;
-                };
-                let Some(range) = self.hir.source_map().range(HirId::expr(body_id, expr_id)) else {
-                    continue;
-                };
-                let Some(data) = self.funcs.get(fn_body) else {
-                    continue;
-                };
-                if data.sig.as_ref().is_some_and(|s| s.has_return_annotation)
-                    || !data.returns_set
-                    || data.returns.is_empty()
-                {
-                    continue;
-                }
-                let itys = data.returns.clone();
-                let returns: Vec<Ty> = itys.iter().map(|ity| self.reify(ity)).collect();
-                if returns.iter().all(|ty| matches!(ty, Ty::Unknown)) {
-                    continue;
-                }
-                out.push(InferredReturn {
-                    range: usize::from(range.start())..usize::from(range.end()),
-                    returns,
-                });
-            }
-        }
-        out.sort_by_key(|r| (r.range.start, r.range.end));
-        out
-    }
-
-    /// `setmetatable(t, M)`: merge `t`'s shape into the shared instance
-    /// shape of `M` and return it — the result's field lookups resolve
-    /// through `M.__index`.
-    fn eval_setmetatable(&mut self, body: BodyId, args: &[ExprId]) -> ITy {
-        let t = args.first().map(|&a| self.eval(body, a));
-        let m = args.get(1).map(|&a| self.eval(body, a));
-        match (t, m) {
-            (Some(ITy::Shape(t)), Some(ITy::Shape(m))) => {
-                // Record the metatable on `t` itself — this covers the
-                // carrier-inheritance idiom `setmetatable(Child, {
-                // __index = Base })` where the result is discarded ...
-                self.shapes[t].metatable = Some(m);
-                // ... and unify constructor results on the shared
-                // instance shape of `m`, so `setmetatable(o, Class)` in
-                // `new` and `self` inside `Class:method()` bodies all
-                // extend one shape.
-                let instance = self.instance_of(m);
-                if instance != t {
-                    self.merge_shape_into(t, instance);
-                }
-                ITy::Shape(instance)
-            }
-            (Some(ITy::Shape(t)), _) => {
-                // Untracked metatable: field lookups are no longer provable.
-                self.shapes[t].meta_unknown = true;
-                ITy::Shape(t)
-            }
-            (Some(other), _) => other,
-            (None, _) => ITy::unknown(),
-        }
-    }
-
-    fn merge_shape_into(&mut self, from: usize, into: usize) {
-        let fields: Vec<(String, ITy)> = self.shapes[from]
-            .fields
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        for (name, ity) in fields {
-            self.extend_field(into, &name, ity);
-        }
-        let array = self.shapes[from].array.clone();
-        for ity in array {
-            self.extend_array(into, ity);
-        }
-        let indexers = self.shapes[from].indexers.clone();
-        for (key, ity) in indexers {
-            self.extend_indexer(into, key, ity);
-        }
-        if self.shapes[from].escaped {
-            self.mark_shape_escaped(into);
-        }
-        if self.shapes[from].meta_unknown {
-            self.shapes[into].meta_unknown = true;
-        }
-        if self.shapes[into].declared.is_none() {
-            let declared = self.shapes[from].declared.clone();
-            self.shapes[into].declared = declared;
-        }
-    }
-
-    fn eval_method_call(&mut self, body: BodyId, expr: ExprId) -> (Vec<ITy>, bool) {
-        let Expr::MethodCall {
-            receiver,
-            method,
-            args,
-        } = self.body(body).expr(expr).clone()
-        else {
-            return (Vec::new(), true);
-        };
-        let recv = self.eval(body, receiver);
-        let mut arg_itys: Vec<ITy> = Vec::with_capacity(args.len());
-        for &arg in &args {
-            let ity = self.eval(body, arg);
-            self.mark_escaped(&ity);
-            arg_itys.push(ity);
-        }
-        match self.lookup_field(&recv, &method) {
-            Lookup::Found(f) => {
-                let recv_class = self.receiver_class(&recv);
-                if let Some(class) = &recv_class {
-                    self.check_visibility(body, expr, class, &method);
-                }
-                // Publish the resolved method signature so the annotation
-                // checker can argument-check the `:` call (#118). Gated on:
-                //  - the receiver resolving to a declared `---@class` — a plain
-                //    inferred table's method carries no checkable contract;
-                //  - the resolved member being an *annotated* function value
-                //    (a `---@field m fun(...)` or a `function C:m` carrying a
-                //    `---@param`/`---@return`/`---@deprecated` signature). An
-                //    unannotated method reifies to a `fun` with `unknown`
-                //    parameters and would manufacture arity errors, so — exactly
-                //    as an unannotated free function is never arity-checked — it
-                //    is left unpublished (mandatory conservatism).
-                // Only pass 1's resolution is published, matching `expr_types`.
-                if self.pass == 1
-                    && recv_class.is_some()
-                    && let ITy::Ty(Ty::Function(sig)) = &f
-                    && let Some(key) = self.expr_range(body, expr)
-                {
-                    self.method_sigs.insert(key, (**sig).clone());
-                }
-                match &f {
-                    ITy::Func(fn_body) => self.record_arg_seeds(*fn_body, &arg_itys, true),
-                    _ => self.record_outgoing(&method, &arg_itys),
-                }
-                self.returns_of(&f)
-            }
-            Lookup::Absent { provable, declared } => {
-                if provable {
-                    self.report_absent(body, expr, &method, declared.as_deref());
-                }
-                self.record_outgoing(&method, &arg_itys);
-                (vec![ITy::unknown()], true)
-            }
-            Lookup::Opaque => {
-                self.record_outgoing(&method, &arg_itys);
-                (vec![ITy::unknown()], true)
-            }
-        }
-    }
-
-    /// The return types of calling a function value.
-    fn returns_of(&mut self, callee: &ITy) -> (Vec<ITy>, bool) {
-        match callee {
-            ITy::Ty(Ty::Function(sig)) => {
-                if sig.has_return_annotation {
-                    (
-                        sig.returns.iter().cloned().map(ITy::Ty).collect(),
-                        sig.returns_vararg,
-                    )
-                } else {
-                    (vec![ITy::unknown()], true)
-                }
-            }
-            ITy::Func(fn_body) => match self.funcs.get(fn_body) {
-                Some(data) if data.sig.as_ref().is_some_and(|s| s.has_return_annotation) => {
-                    #[expect(
-                        clippy::expect_used,
-                        reason = "the arm guard already established `data.sig` is Some"
-                    )]
-                    let sig = data.sig.as_ref().expect("checked above");
-                    (
-                        sig.returns.iter().cloned().map(ITy::Ty).collect(),
-                        sig.returns_vararg,
-                    )
-                }
-                Some(data) if data.in_progress => (vec![ITy::unknown()], true),
-                Some(data) if data.returns_set => (data.returns.clone(), false),
-                Some(_) => (Vec::new(), false),
-                None => (vec![ITy::unknown()], true),
-            },
-            _ => (vec![ITy::unknown()], true),
-        }
-    }
-
-    /// Evaluate a value list, expanding a trailing multi-value producer.
-    /// `want = None` collects everything (return statements).
-    fn eval_values(&mut self, body: BodyId, exprs: &[ExprId], want: Option<usize>) -> Vec<ITy> {
-        let mut values: Vec<ITy> = Vec::new();
-        let last = exprs.len().checked_sub(1);
-        for (i, &expr) in exprs.iter().enumerate() {
-            if Some(i) == last {
-                match self.body(body).expr(expr) {
-                    Expr::Call { .. } => {
-                        let (mut rets, mut open) = self.eval_call(body, expr);
-                        if let Some(ty) = self.as_override(body, expr) {
-                            rets = vec![ITy::Ty(ty)];
-                            open = false;
-                        }
-                        self.publish_call(body, expr, &rets, open);
-                        Self::push_expansion(&mut values, rets, open, want);
-                    }
-                    Expr::MethodCall { .. } => {
-                        let (mut rets, mut open) = self.eval_method_call(body, expr);
-                        if let Some(ty) = self.as_override(body, expr) {
-                            rets = vec![ITy::Ty(ty)];
-                            open = false;
-                        }
-                        self.publish_call(body, expr, &rets, open);
-                        Self::push_expansion(&mut values, rets, open, want);
-                    }
-                    Expr::Vararg => {
-                        let want = want.unwrap_or(values.len() + 1);
-                        while values.len() < want {
-                            values.push(ITy::unknown());
-                        }
-                    }
-                    _ => values.push(self.eval(body, expr)),
-                }
-            } else {
-                values.push(self.eval(body, expr));
-            }
-        }
-        if let Some(want) = want {
-            while values.len() < want {
-                values.push(ITy::Ty(Ty::Nil));
-            }
-        }
-        values
-    }
-
-    fn push_expansion(values: &mut Vec<ITy>, rets: Vec<ITy>, open: bool, want: Option<usize>) {
-        let base = values.len();
-        values.extend(rets);
-        if let Some(want) = want {
-            let pad = if open {
-                ITy::unknown()
-            } else {
-                ITy::Ty(Ty::Nil)
-            };
-            while values.len() < want {
-                values.push(pad.clone());
-            }
-            values.truncate(want.max(base));
-        }
-    }
-
-    /// Publish the (first-value) type of a call evaluated via the
-    /// multi-value path, mirroring what [`Infer::eval`] does.
-    fn publish_call(&mut self, body: BodyId, expr: ExprId, rets: &[ITy], open: bool) {
-        if self.pass != 1 {
-            return;
-        }
-        let first = first_value(rets, open);
-        if first.is_unknown() {
-            return;
-        }
-        if let Some(key) = self.expr_range(body, expr) {
-            let ty = self.reify(&first);
-            if ty != Ty::Unknown {
-                self.expr_types.insert(key, ty);
-            }
-        }
-    }
-
-    /// Types of the loop variables of a generic `for`, recognizing
-    /// `pairs(t)`, `ipairs(t)`, and `next, t` iteration.
-    fn iteration_tys(&mut self, body: BodyId, exprs: &[ExprId], nvars: usize) -> Vec<ITy> {
-        let mut out = vec![ITy::unknown(); nvars];
-        let Some(&first) = exprs.first() else {
-            return out;
-        };
-        // `for k, v in next, t do`
-        if let Expr::Name(name) = self.body(body).expr(first)
-            && name == "next"
-            && matches!(self.resolution(body, first), Some(Resolution::Global(_)))
-            && let Some(&table_expr) = exprs.get(1)
-        {
-            let t = self.eval(body, table_expr);
-            let (k, v) = self.pairs_tys(&t);
-            if nvars > 0 {
-                out[0] = k;
-            }
-            if nvars > 1 {
-                out[1] = v;
-            }
-            return out;
-        }
-        let Expr::Call { callee, args } = self.body(body).expr(first).clone() else {
-            return out;
-        };
-        let Expr::Name(name) = self.body(body).expr(callee) else {
-            return out;
-        };
-        if !matches!(self.resolution(body, callee), Some(Resolution::Global(_))) {
-            return out;
-        }
-        let name = name.clone();
-        let Some(&table_expr) = args.first() else {
-            return out;
-        };
-        match name.as_str() {
-            "ipairs" => {
-                let t = self.eval(body, table_expr);
-                if nvars > 0 {
-                    out[0] = ITy::Ty(Ty::Integer);
-                }
-                if nvars > 1 {
-                    out[1] = self.elem_ty(&t);
-                }
-            }
-            "pairs" | "next" => {
-                let t = self.eval(body, table_expr);
-                let (k, v) = self.pairs_tys(&t);
-                if nvars > 0 {
-                    out[0] = k;
-                }
-                if nvars > 1 {
-                    out[1] = v;
-                }
-            }
-            _ => {}
-        }
-        out
-    }
 }
 
 // === helpers ===
@@ -3587,6 +2104,7 @@ mod tests {
     use luabox_syntax::lua::{Dialect, parse};
 
     use super::*;
+    use crate::ty::{FieldTy, ParamTy};
     use crate::{Strictness, check_file};
 
     fn outcome(source: &str) -> Outcome {
@@ -3594,7 +2112,14 @@ mod tests {
         assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
         let env = TypeEnv::build(&parsed);
         let lowered = luabox_hir::lower(&parsed);
-        run(&lowered, &env, "test.lua", true, false, None)
+        run(
+            &lowered,
+            &env,
+            "test.lua",
+            Exactness::Strict,
+            InferMode::Check,
+            None,
+        )
     }
 
     /// Like [`outcome`], with call-site parameter seeding on (the
@@ -3609,7 +2134,14 @@ mod tests {
         assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
         let env = TypeEnv::build(&parsed);
         let lowered = luabox_hir::lower(&parsed);
-        run(&lowered, &env, "test.lua", true, true, externals)
+        run(
+            &lowered,
+            &env,
+            "test.lua",
+            Exactness::Strict,
+            InferMode::Display,
+            externals,
+        )
     }
 
     fn binding_ty(outcome: &Outcome, name: &str) -> Ty {

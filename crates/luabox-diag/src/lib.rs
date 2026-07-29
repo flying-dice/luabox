@@ -14,6 +14,7 @@
 
 mod code;
 mod diagnostic;
+mod line_index;
 pub mod registry;
 mod render;
 

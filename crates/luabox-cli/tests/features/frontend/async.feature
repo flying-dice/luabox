@@ -73,3 +73,98 @@ Feature: luabox check — `---@async` and await-in-sync (LB0316)
     When I run "luabox check"
     Then the command succeeds
     And stdout does not contain "LB0316"
+
+  Scenario: an `---@async` method is flagged at a `:` call from a sync function
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Client
+      local Client = {}
+      Client.__index = Client
+
+      ---@async
+      function Client:fetch() end
+
+      ---@return Client
+      function Client.new()
+        return setmetatable({}, Client)
+      end
+
+      local function sync()
+        Client.new():fetch()
+      end
+      return sync
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stdout contains "LB0316"
+    And stdout contains "call to async `fetch` in a non-async function"
+
+  Scenario: an `---@async` method on a plain prototype is flagged at a `:` call
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      local Proto = {}
+      Proto.__index = Proto
+
+      ---@async
+      function Proto:fetch() end
+
+      local p = setmetatable({}, Proto)
+      local function sync()
+        p:fetch()
+      end
+      return sync
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stdout contains "LB0316"
+    And stdout contains "call to async `fetch` in a non-async function"
+
+  Scenario: a `---@field`-declared method still carries its carrier's `---@async`
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Decl
+      ---@field fetch fun(self: Decl)
+      local Decl = {}
+      Decl.__index = Decl
+
+      ---@async
+      function Decl:fetch() end
+
+      ---@type Decl
+      local d
+      local function sync()
+        d:fetch()
+      end
+      return sync
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stdout contains "LB0316"
+    And stdout contains "call to async `fetch` in a non-async function"
+
+  Scenario: an `---@async` method awaited from an `---@async` caller is clean
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Client
+      local Client = {}
+      Client.__index = Client
+
+      ---@async
+      function Client:fetch() end
+
+      ---@type Client
+      local c
+
+      ---@async
+      local function poll()
+        c:fetch()
+      end
+      return poll
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stdout does not contain "LB0316"

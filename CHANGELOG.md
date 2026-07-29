@@ -4,7 +4,251 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [SemVer](https://semver.org/), with the 0.x caveats
-spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
+spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0x).
+
+## [Unreleased]
+
+### Added
+
+- **`luabox schema` — the manifest contract, published as a JSON Schema.**
+  The binary now carries a complete draft 2020-12 JSON Schema for
+  `luabox.toml` and prints it to stdout, so editors, validators and LLM
+  coding assistants can read the whole contract:
+  `luabox schema > luabox.schema.json`. It covers every table, key, default,
+  closed vocabulary (`edition`, `build.target`, `build.mode`, lint tiers and
+  levels) and every mutually-exclusive dependency form, each with a prose
+  description. The schema describes the manifest's *data model*: you write
+  TOML, tooling maps it to JSON with the standard mapping and validates that.
+- **The manifest contract is declared once, and both the parser and the
+  published schema are built from it.** `luabox.toml` used to be described
+  twice — by the hand-rolled parser's key allow-lists and by a hand-authored
+  JSON Schema — with a parity suite standing between them to catch the drift.
+  There is now a single declarative table in `luabox-manifest`: each table of
+  the manifest names its keys once, with the value type, whether the key is
+  required, the default the parser applies, and the prose an outside reader
+  needs. `Manifest::parse` builds its allow-lists and its did-you-mean
+  candidates from that table, and `schema/luabox.schema.json` is *generated*
+  from it. A key that exists for one and not the other is no longer a test
+  failure; it cannot be written down. Manifest error messages, the published
+  schema and `luabox schema`'s output are unchanged.
+
+  What a key table cannot say stays hand-written — and stays guarded by
+  tests: the four-branch `oneOf` that makes the dependency source forms
+  mutually exclusive, the semver and package-name patterns, and the `[lint]`
+  open rule-id mapping. Every `examples/*/luabox.toml` in the repository plus
+  a curated valid/invalid fixture corpus still runs through **both** the
+  schema validator and the parser, and the two must return the same verdict,
+  which is what holds those fragments to the parser's hand-coded cross-key
+  rules. Adding an example project extends the corpus automatically. The
+  generated schema file stays checked in, because its `$id` is a URL editors
+  point at and the binary prints the file rather than rendering it at
+  runtime; a test fails when the file drifts from the contract and says how
+  to regenerate it
+  (`LUABOX_BLESS=1 cargo test -p luabox-manifest schema_file_is_current`).
+
+### Fixed
+
+- **`--watch` stops rerunning once your edit has settled.** After the first
+  change, `luabox check --watch` never went quiet again: it re-ran the command
+  every debounce window, forever, on a project nobody was touching (measured:
+  148 reruns over 30 s of idle after one edit). Nothing had changed — the
+  watcher was reacting to *itself*. `notify`'s inotify backend also subscribes
+  to `OPEN`, `CLOSE_NOWRITE` and `ATTRIB`, so every rerun's own **reads** of
+  your `*.lua` files and `luabox.toml` came back as filesystem events and
+  triggered the next rerun. Watch now acts only on events that describe a
+  change — creations, removals, renames, content and metadata writes, plus a
+  writer closing a file — and ignores the access events a read produces. That
+  filter is the whole fix, and it is enough on its own: on every platform
+  luabox ships a binary for, a *read* is not reported as a change at all
+  (inotify classifies it as an access; neither FSEvents nor
+  `ReadDirectoryChangesW` reports it), so nothing a run does can feed the next
+  one. An `mtime`-only `touch` still reruns, and one edit still costs one
+  rerun.
+- **`--watch` no longer throws away a save made moments after the previous
+  one.** The fix above originally shipped with a second, belt-and-braces half:
+  a 200 ms sweep after every rerun that received filesystem events and
+  discarded them, so that a rerun could not react to its own activity. It
+  could not tell a rerun's own noise from your editor's, so a save landing in
+  that window was discarded outright — and nothing ever went back for it.
+  `check --watch` sat there reporting `watch: ok` over a tree you had just
+  broken, indefinitely, and `fmt --watch` silently skipped formatting the file
+  you had just saved. Two saves ~0.3 s apart reproduced it every time, and an
+  IDE "save all" spreading five files ~120 ms apart hit it on every use. The
+  sweep is gone: every edit gets its rerun, at any spacing, and one edit still
+  settles into silence afterwards.
+- **`luabox fmt` and `luabox lint --fix` can no longer destroy the source they
+  rewrite.** Both replaced a file by truncating it and then writing it back —
+  so a write that failed part-way left a fragment where your source had been,
+  and luabox, the only process that still held the bytes, then exited. It was
+  not recoverable. Reproduced with `ulimit -f 8`: a 97,780-byte source came
+  back as 8,192 bytes. A full disk, a quota, or a filesystem going read-only
+  mid-run did the same. Every rewrite of a file *you* wrote now stages the
+  complete new content in a sibling temp file, flushes it to disk, and renames
+  it over the target — an atomic replace, so a concurrent reader sees either
+  all the old bytes or all the new ones, and a failure at any point leaves the
+  original untouched. Permissions are preserved (an executable script stays
+  executable), and a symlinked source is still rewritten *through* the link
+  rather than having the link replaced by a regular file. One thing is given up
+  deliberately: a **hardlinked** source now gets a new inode, so another name
+  for the old file keeps pointing at the old content. Losing the file outright
+  was worse. Files luabox creates rather than replaces are unaffected —
+  `init`/`new` scaffolding, and everything `build`/`doc` write into their own
+  output directory.
+- **`luabox check | head` no longer crashes — and no longer lies about what it
+  found.** Piping any luabox report into a reader that stops early — `head`,
+  `grep -q`, a pager you quit — used to kill the process: Rust's `println!`
+  panics when a write fails, a closed pipe makes every write fail, and any
+  report larger than the pipe buffer (64 kB) is guaranteed to still be writing
+  when the reader leaves. The result was a raw Rust panic and a backtrace on
+  stderr, ending in `SIGABRT` (exit status 134) on release builds, in all five
+  `--format`s. A CI job with `set -o pipefail` and a routine `| head` or
+  `| grep -q` went red for it.
+
+  The first fix for that traded one failure for a quieter, worse one: a
+  departed reader exited **0**, unconditionally. So
+  `set -o pipefail; luabox check | head -1` over a tree with thousands of
+  errors *succeeded*, and a CI gate reported green over a broken tree — silent,
+  and wrong in the safe-looking direction. What happens now is neither: **a
+  departed reader costs you the output and nothing else.** luabox stops
+  writing, does not panic, and exits with the verdict the run actually reached
+  — 1 when `check`, `lint` or `fmt --check` found problems, 0 when they did
+  not, and 0 for commands like `build` and `schema` whose report precedes a
+  success nothing later can revoke. The truncated report is the only loss, and
+  losing it is silent, the way `head` users expect. That applies to stderr as
+  well as stdout, so `luabox check 2>&1 | head` behaves too. A run whose output
+  is read in full is unchanged, and a genuine write failure (a full disk on
+  `luabox schema > luabox.schema.json`) is still an error, reported as one line
+  on stderr and exit 1 rather than a panic.
+  `luabox lsp` gets the opposite policy for the same defect: its two stderr
+  log lines used to abort the whole language server the moment a client had
+  closed the log pipe (an editor restart, a torn-down output pane) while the
+  user's `luabox.toml` happened to be mid-edit and invalid — a long-running
+  server must *survive* a dead log pipe, so it now drops the message and
+  keeps serving instead of exiting at all.
+- **Diagnostics on very long lines are fast to report, and readable.** A file
+  with one enormous line — minified or generated source — made reporting
+  quadratic all over again, because a label's *column* was counted by walking
+  characters from the start of its line. On a 377 kB single-line file with
+  10 000 findings, `check` took 71 s in the human format (0.5 s as JSON), and
+  the SARIF, GitHub and GitLab renderers ~2.2-2.5 s. Columns are now resolved
+  by binary search like lines, so every format lands within ~1.3x of JSON on
+  that input (human 0.5 s, SARIF 0.7 s), and the cost doubles when the finding
+  count doubles instead of quadrupling. The human renderer also **windows**
+  long source lines rustc-style, printing ~200 characters around the label with
+  `...` markers rather than the whole line plus a column-wide indent — the same
+  input used to produce 3.5 GB of output, and now produces 4.6 MB. Column
+  numbers are unaffected in every format, and a line short enough to print
+  whole is still printed whole, byte for byte.
+- **`check --format gitlab` reports the line each diagnostic is actually on.**
+  The GitLab Code Quality renderer discarded the source lookup it was handed
+  and wrote `location.lines.begin: 1` for every finding. GitLab places a
+  finding on the merge-request diff by that line and drops it when the line is
+  not part of the diff, so the report parsed, looked plausible, and annotated
+  nothing. It now resolves the primary label's real 1-based line through the
+  same lookup SARIF's `startLine` already used; a file the lookup cannot
+  supply still falls back to line 1, and a diagnostic with no label at all
+  still reports the empty path and line 0. Fingerprints are unchanged — they
+  hash the code, file and byte range, never the rendered line — so existing
+  findings keep their identity and history in GitLab rather than all
+  reappearing as new.
+- **`luabox lsp` survives a malformed message instead of dying on it.** Any
+  request or notification whose params did not deserialize became an error
+  that propagated out of the message loop and killed the process with exit 1
+  — leaving the request the editor was blocked on unanswered, and every open
+  buffer without diagnostics, hover or completion until the client noticed the
+  pipe had closed. A hover with no `position`, a `didOpen` missing its
+  `languageId`, a `formatting` with no `options`, and — the one real clients
+  actually emit — a `file://` URI containing an unencoded space were all
+  fatal. A malformed **request** is now answered with the protocol's own
+  `-32602 InvalidParams`, naming the method and what failed to decode, and a
+  malformed **notification**, which has no id to answer, is reported on
+  `window/logMessage` and dropped; either way the server keeps serving. A
+  malformed `initialize` remains terminal — there is no workspace to serve —
+  but the client is now told so on the id it is blocked on. Genuinely fatal
+  conditions stay fatal: a closed stdin or a dead connection still ends the
+  loop.
+- **`luabox lsp` exits 1 on `exit` without a prior `shutdown`.** The LSP spec
+  reserves exit code 0 for the ordered `shutdown`/`exit` handshake and asks
+  for 1 when a client sends `exit` on its own. The lone notification was
+  ignored outright, so the server lingered until its stdin closed and then
+  exited 0.
+- **A manifest key is never silently inert.** `rev`, `tag` and `branch` pin a
+  *git* checkout, so alongside a `path` or a `url` source they described
+  nothing — and were quietly dropped by both the parser and the published
+  JSON Schema. `{ path = "…", rev = "…" }`, `{ path = "…", tag = "…" }`,
+  `{ path = "…", branch = "…" }` and the same three next to a `url` source
+  are now errors naming the source that *was* found ("has a git reference key
+  but a `path` source"), batched with every other manifest error like the
+  long-standing `sha256`-without-`url` and git-reference-without-`git` rules.
+  The schema's `path source` and `url source` branches exclude the three keys
+  by the same mechanism they already used for `git`/`url`/`sha256`, so an
+  editor flags them before `luabox check` does.
+- **`lint` and `check` no longer slow down as a file collects diagnostics.**
+  Every finding resolved its line number by counting newlines from byte 0, so
+  the cost of reporting was O(diagnostics × file size): a single 100-kLOC file
+  with 32 k findings took over three minutes to lint, while the same file with
+  one finding took 0.35 s. Each file now builds one line table and
+  binary-searches it — 20 k suppressed findings in one file went from 15.7 s to
+  0.35 s for `lint`, and from 4.3 s to 0.66 s for `check`. **Reporting** those
+  findings paid the same price again, and worse: every renderer resolved each
+  label by scanning the file from byte 0 for its line and column, walked it a
+  second time for that line's text, and — because the source lookup hands back
+  an owned `String`, read off disk by the CLI — *cloned the whole file* per
+  label while doing it. Human, SARIF, GitHub Actions and GitLab output were all
+  quadratic in the finding count, which left `--format json`, the one format
+  that renders nothing, as the only fast way to report 32 k diagnostics from
+  one 2.8 MB file: 1.4 s, against 85 s for the same run in human form. Every
+  renderer now fetches each distinct file once per run and answers every label
+  against one line table, byte-for-byte identically to before: on that file,
+  `check` 85 s → 1.4 s (60×), `--format sarif` 82 s → 1.8 s (45×),
+  `--format github` 63 s → 1.3 s (47×) and `--format gitlab` 54 s → 1.5 s
+  (36×) — every one of them now within 1.3× of the `--format json` floor on the
+  same input — and, on a 1.7 MB file carrying 32 k lint findings, `lint` 41 s →
+  0.35 s (116×). The perf gate was structurally blind to all of this (its
+  corpus reports `0 errors, 0 warnings`), so it gained a diagnostics-heavy
+  fourth gate, now in two variants: findings suppressed, which times the
+  bookkeeping and would have failed its budget by 13× against the old code, and
+  findings rendered, which times the renderers and would have failed its budget
+  by 15× (`lint`) and 6× (`check`).
+- **Valid Lua with a `#!` shebang is accepted, in every edition.** Reference
+  Lua has skipped a leading `#` line since 5.0 (`skipcomment`), so an
+  executable script was ordinary source everywhere except here, where
+  `check`/`lint`/`build` rejected it with `unexpected '!'`. The first line of a
+  file that starts with `#` is now lexed as trivia, like a comment, and `fmt`
+  reproduces it byte-exact and stays idempotent. A `#` anywhere below byte 0
+  is still the length operator, and still an error — matching reference Lua
+  exactly.
+
+  **Bundling handles it too.** A bundle splices every module's text into one
+  file, so a module's `#!` line would land in the middle of it — where `#` *is*
+  the length operator, which made `luabox build --bundle` fail its own reparse
+  with `internal bundler error` on any project whose entry or any required
+  module was an executable script (`--minify` instead dropped the line
+  silently). The prefix is now cut from every module as it is spliced, using
+  the lexer's own rule, and the **entry's** `#!` line is re-emitted at byte 0
+  of the bundle — plain and minified alike — so a bundled program stays an
+  executable program. A dependency's shebang is dropped: it only ever meant
+  "run *this* file".
+- **A UTF-8 byte-order mark is accepted where reference Lua accepts it.** Lua
+  gained `skipBOM` in 5.2, and LuaJIT has it too, so a BOM'd file compiles
+  there and was rejected here in every edition with `unexpected '\u{feff}'`.
+  The mark is now skipped as trivia under 5.2/5.3/5.4/LuaJIT (and preserved
+  byte-exact by `fmt`); under 5.1, which really does reject it, the diagnostic
+  now names it — "file starts with a UTF-8 byte-order mark, which Lua 5.1
+  rejects — save the file without a BOM" — instead of echoing an invisible
+  codepoint. A bundle strips the mark from every module it inlines and never
+  emits one of its own: the bundle is a *new* file, and a `target = "5.1"`
+  bundle carrying a mark would not load at all.
+- **The parser accepts everything reference Lua accepts.** The nesting budget
+  was 100, well under the ~197 levels of tables/parens/calls/`if`s that
+  `lua5.4` compiles, and a right-associative operator chain spent one level
+  *per term*, so a 100-term `"a" .. "a" .. …` was rejected while the same-length
+  `+` chain was fine. Right-associative chains (`..`, `^`) are now consumed
+  iteratively, at constant depth and with the same limits as `+` (10 000 terms
+  parse identically to `+`), and the nesting budget is 220 — above every
+  reference implementation, with measured stack headroom for a debug build on
+  a default 2 MiB thread stack. See
+  [LIMITATIONS.md](docs/03-reference/02-limitations.md#parser-nesting-and-expression-size-limits).
 
 ## [0.2.0] - 2026-07-26 (unreleased)
 
@@ -24,8 +268,11 @@ so it appears in no version entry.
 - **`[tasks]`, `[workspace]`, and `{ workspace = true }` dependencies**
   ([#18](https://github.com/flying-dice/luabox/issues/18)) — these manifest
   tables only ever served the removed `run` command and the parked solver,
-  and had been parse-but-inert since the scope cut. They are now the
-  standard unknown-table error with a did-you-mean nudge. Monorepo trees
+  and had been parse-but-inert since the scope cut. They are now an
+  unknown-table error carrying the valid set, the did-you-mean nudge, and —
+  for these two names specifically — `— removed in 0.2.0, see CHANGELOG.md`,
+  so a manifest brought over from 0.1.4 says what happened rather than
+  reading as a typo. Monorepo trees
   are unaffected: the source walk checks nested packages without any
   manifest declaration.
 - **`luabox add` / `remove` / `install` / `update` / `vendor`**
@@ -52,7 +299,8 @@ so it appears in no version entry.
   credential and makes no authenticated request — the editor extensions'
   "Sign in with GitHub" flow no longer has a backing command.
 - **`luabox run`** ([#11](https://github.com/flying-dice/luabox/issues/11))
-  — luabox never spawns a process. `[tasks]` entries, the toolchain-first
+  — luabox never spawns an interpreter and never executes your code.
+  `[tasks]` entries, the toolchain-first
   `PATH` resolution (`node_modules/.bin` semantics), and the
   `luabox run luarocks -- install <rock>` escape hatch all go with it.
 - **`luabox toolchain`**
@@ -69,7 +317,7 @@ so it appears in no version entry.
 
 ### Kept — the seam
 
-- The **`luabox.toml` manifest model** (`[package]`, `[lints]`, `[build]`,
+- The **`luabox.toml` manifest model** (`[package]`, `[lint]`, `[build]`,
   `[types]`) that every frontend command reads.
 - The **`lua_modules/` read path**: `require` resolution, bundling and
   cross-package type checking still work over a rock tree, provided you
@@ -80,6 +328,47 @@ so it appears in no version entry.
 
 ### Fixed
 
+- **A misspelled `[lint]` key is no longer silently inert** — `unused-locl =
+  "allow"` did nothing and said nothing, because rule ids live in
+  `luabox-lint` and the dependency-free manifest parser cannot check them.
+  The check now runs where the config is consumed: `luabox lint` reports
+  `LB1004` (a warning — the exit code is unchanged) naming the key, and
+  `luabox lsp` logs it via `window/logMessage`. The did-you-mean nudge spans
+  rule ids *and* tier names, so a mistyped tier — which reaches the config as
+  a rule-id override, indistinguishable from one — says ``did you mean
+  `pedantic`?``.
+- **Invalid `--format` and `--mode` values are now rejected by the CLI
+  parser itself** — exit 2 with clap's `[possible values: …]` listing,
+  matching every other malformed invocation, instead of exit 1 from deep
+  inside the command. `--edition`/`--target` deliberately keep their
+  domain-level path so `LB1001` stays a machine-readable diagnostic.
+- **A failure no longer dumps a stack backtrace when `RUST_BACKTRACE` is
+  set.** `main` returned a `Result`, so every `Error:` was rendered by
+  `anyhow`'s `Debug` — which appends the captured frames whenever that
+  variable is exported for something else entirely. Release binaries are
+  stripped, so the dump arrived as pages of `<unknown>` burying the one line
+  that named the problem. luabox now renders the error and its `Caused by:`
+  chain itself. Exit codes are unchanged: 0 on success, 1 on a command that
+  ran and failed, 2 on a malformed invocation.
+- **`[tasks]` and `[workspace]` say they were removed, not just that they are
+  unknown** ([#18](https://github.com/flying-dice/luabox/issues/18)). Both are
+  gone (see *Removed*), but a manifest upgraded from 0.1.4 still carries them,
+  and the generic unknown-table error sent readers looking for a misspelling.
+  The error for exactly these two names now ends `— removed in 0.2.0, see
+  CHANGELOG.md`; every other unknown table is unaffected.
+- **`---@deprecated` and `---@async` on a method carrier now reach `obj:method()`
+  call sites** ([#33](https://github.com/flying-dice/luabox/issues/33)). Two
+  carrier shapes swallowed the tags. A plain prototype table (`local P = {}` +
+  `P.__index = P`, no `---@class`) published no method signature at all, because
+  publication was gated on a declared-class receiver — a gate that belongs to
+  *argument* checking, not to tags the author wrote on the method itself; the
+  gate now governs only argument checking, and `LB0308`/`LB0316` fire for any
+  resolved receiver while a structurally-resolved call stays free of
+  manufactured arity findings. A method that is both `---@field`-declared and
+  defined lost them too: the declaration shadows the carrier, and `fun(...)`
+  syntax has nowhere to write a tag, so the declaration now inherits the
+  carrier's `---@deprecated`/`---@async`/`---@version` while still governing
+  parameters and returns — same-file and across the project surface.
 - **`luabox doc` refuses to generate while parse errors exist**
   ([#24](https://github.com/flying-dice/luabox/issues/24)) — a file that
   does not parse has no trustworthy harvest. One rule: project sources
@@ -130,6 +419,94 @@ so it appears in no version entry.
   than the generic `expected expression`. Files that relied on the old
   silence now fail `check`; `fmt` returns them unchanged, as it does for any
   input that does not parse.
+- **The editor no longer indexes vendored `lua_modules/` trees.** The LSP's
+  workspace index had its own copy of the source walk, and that copy still
+  descended into the rock tree `luarocks install --tree lua_modules`
+  materializes — so workspace symbols, goto-definition and rename saw
+  thousands of vendored symbols that `luabox check` had already stopped
+  looking at. Both now run the one walk (`luabox-manifest`'s), which skips
+  `lua_modules/` at every depth and visits entries in sorted order.
+  **Behaviour change:** symbols that live only inside `lua_modules/` no
+  longer appear in workspace symbol search or goto results — put the types
+  you need in a `defs/` package and list it in `[types] defs`, exactly as
+  `check` requires. `--watch` stops rerunning for `lua_modules/` writes for
+  the same reason: the command it reruns would not read those files.
+
+### Internal (contributors)
+
+- **`luabox check` reads and parses each file once per run.** The cross-file
+  surface pre-pass and the per-file check were two independent parallel walks
+  of the source set, so every file was read twice, parsed twice, harvested
+  twice and lowered three times. They now share one set of per-file records.
+  `luabox-types` grew `FileArtifacts` (a file's harvest + lowering) and the
+  `module_surface_with_artifacts` / `check_file_with_artifacts` entry points
+  that take one; `module_surface`, `check_file_with_requires` and
+  `module_requires` are unchanged wrappers, so the LSP and any other consumer
+  need not care. No diagnostic, ordering or summary changes. It is not free:
+  reading and parsing once means the per-file artifacts are *retained* across
+  both passes instead of being dropped and rebuilt, and peak RSS on the
+  100-kLOC reference corpus went from 64 MiB to 123 MiB (~1.9×). That is the
+  deliberate trade — memory for I/O and CPU — and the number is here so
+  nobody has to rediscover it from a profiler. **That number is now gated.**
+  Accepting it was one thing; leaving it unenforced was another — `check`
+  could have grown to 500 MiB on the same input with every CI gate still
+  green. `scripts/perf-gate.sh` (and `perf-gate.ps1`) gained a peak-RSS leg on
+  that corpus, budget 300 MiB, measured through `wait4(2)`'s rusage
+  (`scripts/peak-rss.py`; `Process.PeakWorkingSet64` on Windows). It is
+  deliberately *not* scaled by `LUABOX_PERF_FACTOR` — a slow machine runs the
+  same allocations, it just takes longer over them — and has its own
+  `LUABOX_RSS_BUDGET_MIB` override for when the budget itself is renegotiated.
+- **The two things that stood behind the parser's depth limit and the
+  watcher's debounce are now assertions rather than claims.** `MAX_DEPTH`
+  (220) had a headroom proof for **parsing** only, in a 2 MiB thread —
+  everything downstream (lowering, inference, the formatter, the bundler, the
+  minifier, the renderers) walked the same 2.2×-deeper trees unmeasured. A new
+  workspace test (`crates/luabox-cli/tests/deep_pipeline.rs`) drives the real
+  binary — `check`, `fmt`, `fmt --check`, `build --bundle --minify
+  --sourcemap` — over each construct at the depth reference Lua accepts, which
+  covers the *main* thread's stack and, because it is an ordinary workspace
+  test, runs on Linux, macOS **and Windows** in CI, where that stack is 1 MiB.
+  Separately, `watch.rs`'s `partition_batches` model claimed agreement with
+  the live `next_batch` loop and nothing checked it; both now consume one table
+  of timed cases and a test requires identical batching on every one (verified
+  by mutation: a model drifted to a sliding window fails it).
+- **`install.sh`'s draft-release path is exercised on every push instead of
+  first by a real tag.** Nothing ran that code until a `v*` push reached
+  `release.yml`'s verify job — the most expensive place to find a bug in it.
+  CI's new `draft-install-mock` job runs the real installer against a
+  python3-stdlib mock of the release API (`scripts/tests/mock-release-api.py`),
+  reached through a new CI-only `LUABOX_API_BASE` override (mirrored in
+  `install.ps1`): the paginated release walk with the tag deliberately on page
+  2, the asset-id 302 to a second host with the `Authorization` header asserted
+  **absent**, a real `tar.gz` + `SHA256SUMS` that must verify and run, and the
+  negative case. The script also gained a `wget` fallback throughout — it was
+  curl-only, and the draft path bypassed even the shared download helper — with
+  the cross-host token drop hand-rolled for `wget`, which forwards headers
+  across redirects where `curl -L` does not. Its `jq` requirement moved to the
+  `LUABOX_DRAFT_INSTALL=1` opt-in itself, so a runner without `jq` fails in
+  seconds with one message rather than several API round-trips later, and
+  `release.yml` asserts `jq --version` before it can get that far.
+- **Releases are gated on the full e2e suite running against the *installed*
+  binary.** `release.yml` now creates the release as a true **draft**, and on
+  Linux, macOS and Windows it downloads the shipped install script *from that
+  draft*, installs the draft's binary with it, and runs the whole black-box
+  cucumber spec (`acceptance` + `lsp_acceptance`) against that installed
+  executable. Only once all three legs pass does the release go
+  `--draft=false --latest`; a public-URL install and `luabox upgrade` smoke
+  runs afterwards, since neither can see a draft. The suites pick their binary
+  at runtime from `LUABOX_E2E_BIN` (falling back to the cargo-built one), and
+  `scripts/install.{sh,ps1}` gained a CI-only path — explicit
+  `LUABOX_DRAFT_INSTALL=1` opt-in plus `GITHUB_TOKEN` — that resolves a draft
+  release through the GitHub API; without the opt-in their behaviour is
+  unchanged. See [RELEASING.md](docs/02-guides/01-releasing.md).
+- **`luabox-resolve` is now `luabox-manifest`.** The crate lost its resolving
+  half in this release (see *Removed*) and the name outlived it. It also
+  absorbs project *layout* — root discovery, the first-party source walk and
+  `[types] defs` resolution — which `luabox-cli` and `luabox-lsp` had each
+  grown a separate, and separately drifting, copy of. Not published to any
+  registry, so no downstream rename is needed; imports move from
+  `luabox_resolve::manifest::*` to `luabox_manifest::model::*`, with the
+  layout API under `luabox_manifest::layout`.
 
 ### Migration
 
@@ -147,7 +524,7 @@ need a `[dependencies]` entry plus a `lua_modules/<name>/luabox.toml` with
 `[types] defs` — which a luarocks tree does not have. Write the LuaCATS
 definitions into your own `defs/` and list them in your `[types] defs`; see
 [README](README.md#using-dependencies) and
-[LIMITATIONS.md](LIMITATIONS.md#dependency-management-and-execution-are-non-goals-not-gaps).
+[LIMITATIONS.md](docs/03-reference/02-limitations.md#dependency-management-and-execution-are-non-goals-not-gaps).
 
 ## [0.1.4] - 2026-07-14
 
@@ -234,7 +611,7 @@ definitions into your own `defs/` and list them in your `[types] defs`; see
 
 The first public release: the full command surface works end to end against
 real Lua sources, driven by an executable spec of cucumber scenarios. Alpha
-quality — see the caveats below and [BACKLOG.md](BACKLOG.md) for what remains
+quality — see the caveats below and [BACKLOG.md](docs/04-project/01-backlog.md) for what remains
 open post-launch.
 
 ### Toolchain

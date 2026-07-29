@@ -1,4 +1,4 @@
-//! Bundler embedding modes (SPEC.md §7, ticket #32, flying-dice/luabox#4).
+//! Bundler embedding modes (SPEC.md §7, GL#32, flying-dice/luabox#4).
 //!
 //! `luabox build --mode <mode>` (or `[build] mode` in the manifest) picks
 //! how the single-file bundle from `luabox_bundle::bundle` is packaged for
@@ -55,7 +55,7 @@
 //!
 //! - **Windows**: the system `bsdtar`
 //!   (`%SystemRoot%\System32\tar.exe`, the same trick
-//!   `toolchain_cmd::tar_program` uses — bundled since Windows 10 1809, so
+//!   `upgrade_cmd::tar_program` uses — bundled since Windows 10 1809, so
 //!   present on every supported Windows version) via `tar --format zip -cf`.
 //!   `--format zip` is required explicitly: `-a`'s extension-sniffing
 //!   doesn't recognize `.love`, and silently falls back to a plain POSIX
@@ -88,23 +88,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, bail};
-use luabox_resolve::manifest::ALLOWED_BUNDLE_MODES;
 use luabox_syntax::Dialect;
 
-/// Fails with a cargo-style message listing the valid modes unless `mode`
-/// is one of [`ALLOWED_BUNDLE_MODES`]. Called on a `--mode` value as soon
-/// as it's parsed, before any bundling work happens; manifest-sourced
-/// modes are already validated by `Manifest::parse`.
-pub fn validate(mode: &str) -> anyhow::Result<()> {
-    if ALLOWED_BUNDLE_MODES.contains(&mode) {
-        Ok(())
-    } else {
-        bail!(
-            "unknown bundle mode `{mode}` (valid: {})",
-            ALLOWED_BUNDLE_MODES.join(", ")
-        );
-    }
-}
+use crate::emit::errln;
 
 /// Emit LÖVE packaging: `<out_dir>/<name>.love`. `bundle_text` is the
 /// already-produced plain bundle (see module docs for why it's written
@@ -279,9 +265,10 @@ fn ps_quote(s: &str) -> String {
 }
 
 /// Locate the Windows-bundled `bsdtar` at `%SystemRoot%\System32\tar.exe`
-/// — the same trick `toolchain_cmd::tar_program` uses to make sure a
-/// git-shipped GNU tar earlier on `PATH` (which cannot create zip archives
-/// at all) doesn't shadow it. Returns `None` on a non-standard Windows
+/// by absolute path, so that a git-shipped GNU tar earlier on `PATH` (which
+/// cannot create zip archives at all) doesn't shadow it — the same trick
+/// `upgrade_cmd::tar_program` uses to unpack a release `.zip`. Returns
+/// `None` on a non-standard Windows
 /// install missing it, in which case the caller falls back to
 /// `Compress-Archive`.
 fn system_bsdtar() -> Option<PathBuf> {
@@ -390,7 +377,7 @@ fn warn_if_backslash_entries(dest: &Path) {
         .filter(|l| !l.is_empty())
         .collect();
     if !bad_entries.is_empty() {
-        eprintln!(
+        errln!(
             "warning: `{}` contains backslash-separated entry paths ({}) — this Windows \
              `Compress-Archive` wrote OS path separators instead of the ZIP-spec `/`, which can \
              break LÖVE's `love.filesystem` and other unzip tools on non-Windows platforms. \
@@ -446,22 +433,6 @@ fn zip_with_python(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn validate_accepts_all_allowed_modes() {
-        for mode in ALLOWED_BUNDLE_MODES {
-            validate(mode).unwrap_or_else(|e| panic!("`{mode}` should validate: {e}"));
-        }
-    }
-
-    #[test]
-    fn validate_rejects_unknown_mode_listing_valid_ones() {
-        let error = validate("roblox").unwrap_err().to_string();
-        assert!(error.contains("roblox"));
-        for mode in ALLOWED_BUNDLE_MODES {
-            assert!(error.contains(mode), "{error} should mention {mode}");
-        }
-    }
 
     #[test]
     fn nvim_plugin_layout_preserves_bundle_text_verbatim() {

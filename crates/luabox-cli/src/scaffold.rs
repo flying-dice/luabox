@@ -6,12 +6,14 @@ use std::path::Path;
 use anyhow::{Context, bail};
 use luabox_syntax::Dialect;
 
+use crate::emit::outln;
+
 /// Scaffold a project in `dir` (which must exist). `lib` selects a library
 /// layout; the default is a binary/script project.
 pub fn init(dir: &Path, lib: bool, edition: &str) -> anyhow::Result<()> {
-    let Some(dialect) = Dialect::from_manifest_id(edition) else {
-        bail!("unknown edition `{edition}` — expected one of: 5.1, 5.2, 5.3, 5.4, luajit");
-    };
+    // The one unknown-dialect path (`crate::dialect`), so `init --edition`
+    // fails with the same LB1001 message and note as `check`/`build --target`.
+    let dialect = crate::dialect::parse("edition", edition)?;
     let manifest = dir.join("luabox.toml");
     if manifest.exists() {
         bail!(
@@ -45,7 +47,7 @@ pub fn init(dir: &Path, lib: bool, edition: &str) -> anyhow::Result<()> {
         fs::write(gitignore, "dist/\n")?;
     }
 
-    println!(
+    outln!(
         "Created {} project `{name}` (edition {})",
         if lib { "library" } else { "binary" },
         dialect.manifest_id()
@@ -170,7 +172,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use luabox_resolve::manifest::Manifest;
+    use luabox_manifest::model::{DialectId, Manifest};
 
     /// A scaffolding target directory named `name` inside a fresh tempdir —
     /// the directory name is what `package_name` derives the package from.
@@ -213,8 +215,8 @@ mod tests {
         init(&dir, false, "5.1").expect("init succeeds");
         let text = fs::read_to_string(dir.join("luabox.toml")).expect("manifest");
         let manifest = Manifest::parse(&text).expect("scaffolded manifest must parse");
-        assert_eq!(manifest.package.edition, "5.1");
-        assert_eq!(manifest.build.target, "5.1");
+        assert_eq!(manifest.package.edition, DialectId::Lua51);
+        assert_eq!(manifest.build.target, DialectId::Lua51);
         assert_eq!(manifest.build.out, "dist");
         assert!(manifest.types.strict);
     }

@@ -2,8 +2,19 @@
 # Usage: irm https://raw.githubusercontent.com/flying-dice/luabox/main/scripts/install.ps1 | iex
 #
 # Environment variables:
-#   LUABOX_INSTALL_DIR  - where to install (default: $env:USERPROFILE\.luabox\bin)
-#   LUABOX_VERSION      - version tag to install (default: latest)
+#   LUABOX_INSTALL_DIR   - where to install (default: $env:USERPROFILE\.luabox\bin)
+#   LUABOX_VERSION       - version tag to install (default: latest)
+#   LUABOX_DRAFT_INSTALL - CI only; set to 1 to install from a draft release
+#                          (needs GITHUB_TOKEN and a pinned LUABOX_VERSION)
+#   GITHUB_TOKEN         - CI only; see "draft-release path" below
+#   LUABOX_API_BASE      - CI only; base URL of the GitHub REST API
+#                          (default https://api.github.com). Mirrors the same
+#                          override in scripts/install.sh, which exists so the
+#                          draft path can be pointed at a mock server and
+#                          exercised on every push rather than first being
+#                          discovered by a real tag (the `draft-install-mock`
+#                          job in .github/workflows/ci.yml). It changes nothing
+#                          for a real install.
 
 $ErrorActionPreference = "Stop"
 
@@ -35,10 +46,43 @@ $Version = if ($env:LUABOX_VERSION) {
     "latest"
 }
 
+# CI-only, and the counterpart of install.sh's `API_BASE`. Documented at the
+# top; unset for every real install, which is the whole of its risk surface.
+$ApiBase = if ($env:LUABOX_API_BASE) {
+    $env:LUABOX_API_BASE.TrimEnd("/")
+} else {
+    "https://api.github.com"
+}
+
+# --- draft-release path -----------------------------------------------------
+# A GitHub *draft* release has no public release-download URLs, so the ordinary
+# path below cannot see one. The release pipeline needs exactly that: it must
+# install and fully exercise a release BEFORE publishing it
+# (.github/workflows/release.yml -> the `verify` job). So under an EXPLICIT
+# LUABOX_DRAFT_INSTALL=1 opt-in - never on the mere presence of a token, which
+# many CI environments export ambiently - assets are fetched through the
+# authenticated GitHub API by asset id instead, which does see drafts.
+#
+# With LUABOX_DRAFT_INSTALL unset - every real user, every `irm | iex` - none
+# of this is reachable and the install is byte-for-byte what it always was.
+$Token = $env:GITHUB_TOKEN
+$UseApi = ($env:LUABOX_DRAFT_INSTALL -eq "1")
+if ($UseApi) {
+    # Fail loudly on a half-configured opt-in: without a token the API cannot
+    # see the draft, and a draft is never "latest" - silently falling back to
+    # the public path would just 404 with a misleading message later.
+    if (($null -eq $Token) -or ($Token -eq "")) {
+        Fail "LUABOX_DRAFT_INSTALL=1 needs GITHUB_TOKEN set"
+    }
+    if ($Version -eq "latest") {
+        Fail "LUABOX_DRAFT_INSTALL=1 needs a pinned LUABOX_VERSION (a draft is never 'latest')"
+    }
+}
+
 function Resolve-Version {
     if ($Version -eq "latest") {
         try {
-            $release = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest"
+            $release = Invoke-RestMethod "$ApiBase/repos/$Repo/releases/latest"
         } catch {
             Fail "Could not resolve latest version - are there any releases for $Repo yet?"
         }
@@ -73,18 +117,119 @@ function Get-Target {
     }
 }
 
+# Return the numeric id of asset $Name on the release tagged $Tag, or $null.
+#
+# Deliberately the LIST endpoint: `GET /releases/tags/<tag>` does not return a
+# draft even with a token, so a draft is only reachable by listing releases and
+# matching tag_name here. per_page=100 puts any realistic tag on page 1; the
+# loop walks on regardless rather than assuming it.
+function Get-AssetId($Tag, $Name) {
+    # Only Authorization is passed: `Accept` is a restricted header that
+    # Windows PowerShell 5.1 will not take from a -Headers hashtable, and the
+    # API's default representation is the JSON we want anyway.
+    $headers = @{ "Authorization" = "Bearer $Token" }
+    for ($page = 1; $page -le 5; $page++) {
+        $url = "$ApiBase/repos/$Repo/releases?per_page=100&page=$page"
+        try {
+            # @(...) so a single-element response still behaves like a list.
+            $releases = @(Invoke-RestMethod -Uri $url -Headers $headers -UserAgent "luabox-install")
+        } catch {
+            Fail "Could not list releases for $Repo - is GITHUB_TOKEN allowed to read them?"
+        }
+        # An empty page means the listing is exhausted; nothing left to walk.
+        if ($releases.Count -eq 0) { return $null }
+        foreach ($release in $releases) {
+            if ($release.tag_name -eq $Tag) {
+                foreach ($asset in $release.assets) {
+                    if ($asset.name -eq $Name) { return $asset.id }
+                }
+            }
+        }
+    }
+    return $null
+}
+
+# Download release asset $Name of release $Tag to $Dest through the
+# authenticated API - the only way to read a draft release's assets.
+function Get-ApiAsset($Tag, $Name, $Dest) {
+    $id = Get-AssetId -Tag $Tag -Name $Name
+    if (-not $id) {
+        Fail "No asset '$Name' on release '$Tag' - is GITHUB_TOKEN allowed to read releases of $Repo?"
+    }
+
+    # HttpWebRequest rather than Invoke-WebRequest, for two Windows PowerShell
+    # 5.1 reasons:
+    #   - `Accept` is a restricted header and cannot be supplied via -Headers;
+    #     it has to go through the request object's own property;
+    #   - the asset endpoint 302s to a pre-signed storage URL, and following
+    #     that automatically would forward Authorization to a host that rejects
+    #     two competing auth mechanisms. So the redirect is followed by hand,
+    #     unauthenticated (this is what `curl -L` does for install.sh).
+    $request = [System.Net.HttpWebRequest]::Create(
+        "$ApiBase/repos/$Repo/releases/assets/$id")
+    $request.Method = "GET"
+    $request.Accept = "application/octet-stream"
+    $request.UserAgent = "luabox-install"
+    $request.AllowAutoRedirect = $false
+    $request.Headers.Add("Authorization", "Bearer $Token")
+
+    try {
+        $response = $request.GetResponse()
+    } catch {
+        Fail "Download failed for asset '$Name' (id $id) of release '$Tag'"
+    }
+
+    try {
+        $status = [int]$response.StatusCode
+        if ($status -ge 300 -and $status -lt 400) {
+            $location = $response.Headers["Location"]
+            if (-not $location) {
+                Fail "Asset '$Name' (id $id) redirected without a Location header"
+            }
+            try {
+                Invoke-WebRequest -Uri $location -OutFile $Dest -UseBasicParsing
+            } catch {
+                Fail "Download failed for asset '$Name' (id $id) of release '$Tag'"
+            }
+        } else {
+            $stream = $response.GetResponseStream()
+            $file = [System.IO.File]::Create($Dest)
+            try {
+                $stream.CopyTo($file)
+            } finally {
+                $file.Close()
+                $stream.Close()
+            }
+        }
+    } finally {
+        $response.Close()
+    }
+}
+
+# Fetch release asset $Name of release $Tag to $Dest by whichever of the two
+# paths applies. $FailMessage is the public path's failure wording - the only
+# path a user ever takes, and the only wording that is user-facing.
+function Get-ReleaseAsset($Tag, $Name, $Dest, $FailMessage) {
+    if ($UseApi) {
+        Get-ApiAsset -Tag $Tag -Name $Name -Dest $Dest
+        return
+    }
+    try {
+        Invoke-WebRequest -Uri "https://github.com/$Repo/releases/download/$Tag/$Name" `
+            -OutFile $Dest -UseBasicParsing
+    } catch {
+        Fail $FailMessage
+    }
+}
+
 # Verify a downloaded artifact against the release's SHA256SUMS asset.
 function Test-Checksum($File, $Name, $ReleaseVersion, $TmpDir) {
     Write-Host "  Verifying checksum ..."
 
-    $sumsUrl = "https://github.com/$Repo/releases/download/$ReleaseVersion/SHA256SUMS"
     $sumsPath = Join-Path $TmpDir "SHA256SUMS"
 
-    try {
-        Invoke-WebRequest -Uri $sumsUrl -OutFile $sumsPath -UseBasicParsing
-    } catch {
-        Fail "Could not download SHA256SUMS for $ReleaseVersion"
-    }
+    Get-ReleaseAsset -Tag $ReleaseVersion -Name "SHA256SUMS" -Dest $sumsPath `
+        -FailMessage "Could not download SHA256SUMS for $ReleaseVersion"
 
     $expected = $null
     foreach ($line in Get-Content $sumsPath) {
@@ -116,22 +261,24 @@ function Install-Luabox {
     Write-Host "  Version:  $resolvedVersion"
     Write-Host "  Install:  $InstallDir"
 
-    $downloadUrl = "https://github.com/$Repo/releases/download/$resolvedVersion/$artifactName.zip"
+    $archiveName = "$artifactName.zip"
+    $downloadUrl = "https://github.com/$Repo/releases/download/$resolvedVersion/$archiveName"
 
     $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
     New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
 
     try {
         $archivePath = Join-Path $tmpDir "archive.zip"
-        Write-Host "  Downloading $downloadUrl ..."
-
-        try {
-            Invoke-WebRequest -Uri $downloadUrl -OutFile $archivePath -UseBasicParsing
-        } catch {
-            Fail "Download failed - check that version '$resolvedVersion' exists and has a release asset for '$target'"
+        if ($UseApi) {
+            Write-Host "  Downloading $archiveName via the GitHub release API (draft-aware) ..."
+        } else {
+            Write-Host "  Downloading $downloadUrl ..."
         }
 
-        Test-Checksum -File $archivePath -Name "$artifactName.zip" -ReleaseVersion $resolvedVersion -TmpDir $tmpDir
+        Get-ReleaseAsset -Tag $resolvedVersion -Name $archiveName -Dest $archivePath `
+            -FailMessage "Download failed - check that version '$resolvedVersion' exists and has a release asset for '$target'"
+
+        Test-Checksum -File $archivePath -Name $archiveName -ReleaseVersion $resolvedVersion -TmpDir $tmpDir
 
         Expand-Archive -Path $archivePath -DestinationPath $tmpDir -Force
 

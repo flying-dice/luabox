@@ -3,10 +3,18 @@
 //!
 //! Black-box, like `acceptance.rs`: every scenario spawns the real `luabox`
 //! binary with the `lsp` subcommand and speaks LSP JSON-RPC over the child's
-//! stdin/stdout (`Content-Length` framing). Nothing links `luabox-lsp`
-//! directly, so a scenario exercises the whole stack the editor sees —
-//! transport, capability advertisement, salsa analysis host, and the
-//! `luabox-db` queries behind every request.
+//! stdin/stdout (`Content-Length` framing). No scenario calls into
+//! `luabox-lsp`, so it exercises the whole stack the editor sees — transport,
+//! capability advertisement, salsa analysis host, and the `luabox-db` queries
+//! behind every request. The one thing the harness does borrow from the crate
+//! is [`luabox_lsp::path_to_uri`]: file identity is what both sides must agree
+//! on, and a second copy of the percent-encoder here could disagree with the
+//! server's without any scenario noticing.
+//!
+//! Which binary gets spawned is [`support::luabox_bin`]'s call: the cargo-built
+//! one by default, or whatever `LUABOX_E2E_BIN` points at — which is how
+//! `release.yml` runs this suite against the *installed* release artefact
+//! before the draft release is allowed to go live.
 //!
 //! Reliability rules the harness enforces:
 //!
@@ -41,6 +49,13 @@ use cucumber::gherkin::Step;
 use cucumber::{World, given, then, when};
 use serde_json::{Value, json};
 
+/// Fixture writers shared with the `acceptance` harness. Cucumber binds a step
+/// attribute to one `World`, so the `#[given]` shims below stay here; only
+/// their bodies are shared.
+mod support;
+
+use support::{docstring, luabox_bin, write_file};
+
 /// How long a step waits for a reply before declaring the server hung.
 /// Generous: a cold `cargo test` run may start dozens of servers at once.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -65,7 +80,7 @@ struct Server {
 impl Server {
     /// Spawn `luabox lsp` rooted at `root` and start decoding its stdout.
     fn spawn(root: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_luabox"))
+        let mut child = Command::new(luabox_bin())
             .arg("lsp")
             .current_dir(root)
             .stdin(Stdio::piped())
@@ -131,6 +146,28 @@ impl Server {
         }
     }
 
+    /// Wait for the child to exit *on its own* and return its exit code.
+    ///
+    /// Deliberately leaves stdin open, unlike [`Self::stop`]: the scenario
+    /// that uses this asserts the server stopped because of the message it was
+    /// sent, and closing the pipe would end the loop by EOF instead — hiding
+    /// exactly the behaviour under test.
+    fn wait_for_exit(&mut self) -> i32 {
+        let deadline = Instant::now() + EXIT_TIMEOUT;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return status.code().unwrap_or(-1),
+                Ok(None) => {}
+                Err(error) => panic!("cannot wait for the language server: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the language server is still running"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Wait for the child to exit, killing it once [`EXIT_TIMEOUT`] passes.
     fn reap(&mut self) {
         let deadline = Instant::now() + EXIT_TIMEOUT;
@@ -189,46 +226,11 @@ fn read_frame(reader: &mut BufReader<ChildStdout>) -> Option<Value> {
     serde_json::from_slice(&body).ok()
 }
 
-/// Render a filesystem path as a `file://` URI, percent-encoding everything
-/// outside the URI path charset (mirrors `luabox_lsp::path_to_uri`, which the
-/// server uses for the URIs it hands back).
+/// Render a filesystem path as a `file://` URI — the server's own encoder, so
+/// the URIs a scenario builds are byte-identical to the ones the server hands
+/// back and a mismatch cannot hide behind two copies of the same charset table.
 fn path_to_uri(path: &Path) -> String {
-    use std::fmt::Write as _;
-
-    let path = path.to_string_lossy().replace('\\', "/");
-    let mut uri = String::from("file://");
-    if !path.starts_with('/') {
-        uri.push('/');
-    }
-    for &byte in path.as_bytes() {
-        if byte.is_ascii_alphanumeric()
-            || matches!(
-                byte,
-                b'-' | b'.'
-                    | b'_'
-                    | b'~'
-                    | b'!'
-                    | b'$'
-                    | b'&'
-                    | b'\''
-                    | b'('
-                    | b')'
-                    | b'*'
-                    | b'+'
-                    | b','
-                    | b';'
-                    | b'='
-                    | b':'
-                    | b'@'
-                    | b'/'
-            )
-        {
-            uri.push(byte as char);
-        } else {
-            let _ = write!(uri, "%{byte:02X}");
-        }
-    }
-    uri
+    luabox_lsp::path_to_uri(path).as_str().to_owned()
 }
 
 // === World ===============================================================
@@ -246,6 +248,10 @@ struct LspWorld {
     init: Value,
     /// The latest `publishDiagnostics` payload per URI.
     diagnostics: HashMap<String, Vec<Value>>,
+    /// Every `window/logMessage` the server has sent, in order — the channel
+    /// project-configuration problems (which belong to no document, so they
+    /// cannot be published as diagnostics) come out on.
+    log_messages: Vec<Value>,
     /// The last request's `result` and `error`.
     reply: Value,
     error: Option<Value>,
@@ -262,6 +268,9 @@ struct LspWorld {
     /// The document the last `textDocument/codeAction` request named, so an
     /// "applying the action" step knows which buffer the edits target.
     action_doc: Option<String>,
+    /// The exit code of a server driven to termination by a scenario (rather
+    /// than by teardown) — the `exit`-without-`shutdown` contract.
+    exit_code: Option<i32>,
     next_id: i64,
 }
 
@@ -275,12 +284,14 @@ impl LspWorld {
             server: None,
             init: Value::Null,
             diagnostics: HashMap::new(),
+            log_messages: Vec::new(),
             reply: Value::Null,
             error: None,
             item: None,
             docs: HashMap::new(),
             open: Vec::new(),
             action_doc: None,
+            exit_code: None,
             next_id: 1,
         }
     }
@@ -290,11 +301,7 @@ impl LspWorld {
     }
 
     fn write_file(&self, relative: &str, content: &str) {
-        let path = self.root.join(relative);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("failed to create parent directories");
-        }
-        std::fs::write(&path, content).unwrap_or_else(|e| panic!("cannot write `{relative}`: {e}"));
+        write_file(&self.root, relative, content);
     }
 
     /// Spawn the server and complete the `initialize`/`initialized` handshake.
@@ -341,14 +348,18 @@ impl LspWorld {
                 panic!("the language server sent nothing within the timeout: {e}")
             })
         };
-        if message.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
-            && let Some(uri) = message["params"]["uri"].as_str()
-        {
-            let diagnostics = message["params"]["diagnostics"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            self.diagnostics.insert(uri.to_string(), diagnostics);
+        match message.get("method").and_then(Value::as_str) {
+            Some("textDocument/publishDiagnostics") => {
+                if let Some(uri) = message["params"]["uri"].as_str() {
+                    let diagnostics = message["params"]["diagnostics"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    self.diagnostics.insert(uri.to_string(), diagnostics);
+                }
+            }
+            Some("window/logMessage") => self.log_messages.push(message["params"].clone()),
+            _ => {}
         }
         message
     }
@@ -450,17 +461,6 @@ impl Drop for LspWorld {
 }
 
 // === Shared helpers ======================================================
-
-/// The step's docstring, normalized the same way `acceptance.rs` does: the
-/// leading newline after `"""` stripped, exactly one trailing newline.
-fn docstring(step: &Step) -> String {
-    let raw = step
-        .docstring
-        .as_deref()
-        .expect("this step requires a docstring (\"\"\" … \"\"\")");
-    let body = raw.strip_prefix('\n').unwrap_or(raw);
-    format!("{}\n", body.trim_end_matches(['\n', '\r']))
-}
 
 fn range(start_line: u32, start_col: u32, end_line: u32, end_col: u32) -> Value {
     json!({
@@ -599,27 +599,14 @@ fn decode_tokens(world: &LspWorld) -> Vec<DecodedToken> {
 
 // === Project fixtures ====================================================
 
-fn write_manifest(world: &LspWorld, edition: &str, strict: bool) {
-    let manifest = format!(
-        "[package]\n\
-         name = \"fixture\"\n\
-         version = \"0.1.0\"\n\
-         edition = \"{edition}\"\n\
-         \n\
-         [types]\n\
-         strict = {strict}\n"
-    );
-    world.write_file("luabox.toml", &manifest);
-}
-
 #[given(expr = "a project with edition {string}")]
 fn project_with_edition(world: &mut LspWorld, edition: String) {
-    write_manifest(world, &edition, false);
+    support::write_manifest(&world.root, &edition, false);
 }
 
 #[given(expr = "a strict project with edition {string}")]
 fn strict_project_with_edition(world: &mut LspWorld, edition: String) {
-    write_manifest(world, &edition, true);
+    support::write_manifest(&world.root, &edition, true);
 }
 
 /// A manifest whose `[lint]` section pins one rule, so a scenario can reach a
@@ -628,13 +615,8 @@ fn strict_project_with_edition(world: &mut LspWorld, edition: String) {
 #[given(expr = "a project with edition {string} and lint rule {string} set to {string}")]
 fn project_with_lint_rule(world: &mut LspWorld, edition: String, rule: String, level: String) {
     let manifest = format!(
-        "[package]\n\
-         name = \"fixture\"\n\
-         version = \"0.1.0\"\n\
-         edition = \"{edition}\"\n\
-         \n\
-         [lint]\n\
-         {rule} = \"{level}\"\n"
+        "{}\n[lint]\n{rule} = \"{level}\"\n",
+        support::package_table(&edition)
     );
     world.write_file("luabox.toml", &manifest);
 }
@@ -827,6 +809,103 @@ fn reply_is_error_mentioning(world: &mut LspWorld, needle: String) {
     );
 }
 
+// === Malformed messages ==================================================
+
+/// A hover whose params carry no `position` at all: `HoverParams` cannot be
+/// built from them, so the server has to answer with an error instead of
+/// dying on the way to the handler.
+#[when(expr = "I request a hover for {string} with no position")]
+fn request_hover_without_position(world: &mut LspWorld, path: String) {
+    world.request(
+        "textDocument/hover",
+        json!({ "textDocument": world.text_document(&path) }),
+    );
+}
+
+/// The JSON-RPC error *code*, not just its message: `-32602 InvalidParams` is
+/// the contract a client keys its own error handling off.
+#[then(expr = "the server replies with error code {int}")]
+fn reply_has_error_code(world: &mut LspWorld, expected: i64) {
+    let error = world
+        .error
+        .as_ref()
+        .unwrap_or_else(|| panic!("expected an error reply, got {}", world.reply));
+    assert_eq!(
+        error["code"].as_i64(),
+        Some(expected),
+        "error reply: {error}"
+    );
+}
+
+/// A `didOpen` carrying a URI string the protocol's grammar rejects — an
+/// unencoded space is what real clients emit — so the params fail to decode
+/// before any handler sees them. No diagnostics follow a dropped
+/// notification, so the step does not wait for a publish.
+#[when(expr = "I send a didOpen notification with the raw URI {string}")]
+fn open_with_raw_uri(world: &mut LspWorld, uri: String) {
+    world.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "lua",
+                "version": 1,
+                "text": "local x = 1\n",
+            }
+        }),
+    );
+}
+
+/// The same shape of failure one field over: `languageId` is required by
+/// `TextDocumentItem`, and a client that omits it must not cost the session.
+#[when(expr = "I send a didOpen notification with no languageId for {string}")]
+fn open_without_language_id(world: &mut LspWorld, path: String) {
+    let uri = world.uri(&path);
+    world.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": uri, "version": 1, "text": "local x = 1\n" }
+        }),
+    );
+}
+
+/// A notification has no id to answer, so the client's log pane is the only
+/// place a dropped one can be reported. `MessageType::ERROR` is 1.
+#[then(expr = "the server logged an error containing {string}")]
+fn server_logged_error(world: &mut LspWorld, needle: String) {
+    let logged: Vec<&str> = world
+        .log_messages
+        .iter()
+        .filter(|m| m["type"].as_i64() == Some(1))
+        .filter_map(|m| m["message"].as_str())
+        .collect();
+    assert!(
+        logged.iter().any(|m| m.contains(&needle)),
+        "no logged error contains `{needle}`; logged: {logged:?}"
+    );
+}
+
+/// Take the server out of the world (so teardown does not try to shut an
+/// already-stopped one down), send a bare `exit`, and wait for it to go.
+#[when("I send exit without a prior shutdown")]
+fn exit_without_shutdown(world: &mut LspWorld) {
+    let mut server = world
+        .server
+        .take()
+        .expect("the language server is not running");
+    server.send(&json!({ "jsonrpc": "2.0", "method": "exit", "params": Value::Null }));
+    world.exit_code = Some(server.wait_for_exit());
+}
+
+#[then(expr = "the server process exits with code {int}")]
+fn server_exits_with_code(world: &mut LspWorld, expected: i32) {
+    assert_eq!(
+        world.exit_code,
+        Some(expected),
+        "the language server's exit code"
+    );
+}
+
 // === Diagnostics =========================================================
 
 #[then(expr = "the diagnostics for {string} include {word}")]
@@ -853,6 +932,37 @@ fn diagnostics_are_empty(world: &mut LspWorld, path: String) {
     assert!(
         diagnostics.is_empty(),
         "expected no diagnostics for `{path}`: {diagnostics:?}"
+    );
+}
+
+/// `window/logMessage` assertions: a project-configuration problem belongs to
+/// no document, so it has no URI to hang a diagnostic on and surfaces in the
+/// client's log pane instead (a `[lint]` key naming no known rule id, say).
+#[then(expr = "the server logged a warning containing {string}")]
+fn server_logged_warning(world: &mut LspWorld, needle: String) {
+    // `MessageType::WARNING` is 2 in the protocol's enum.
+    let logged: Vec<&str> = world
+        .log_messages
+        .iter()
+        .filter(|m| m["type"].as_i64() == Some(2))
+        .filter_map(|m| m["message"].as_str())
+        .collect();
+    assert!(
+        logged.iter().any(|m| m.contains(&needle)),
+        "no logged warning contains `{needle}`; logged: {logged:?}"
+    );
+}
+
+#[then(expr = "the server logged nothing containing {string}")]
+fn server_logged_nothing(world: &mut LspWorld, needle: String) {
+    let logged: Vec<&str> = world
+        .log_messages
+        .iter()
+        .filter_map(|m| m["message"].as_str())
+        .collect();
+    assert!(
+        !logged.iter().any(|m| m.contains(&needle)),
+        "a logged message unexpectedly contains `{needle}`; logged: {logged:?}"
     );
 }
 

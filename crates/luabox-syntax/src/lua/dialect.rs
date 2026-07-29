@@ -25,6 +25,18 @@ impl Dialect {
         self != Dialect::Lua51
     }
 
+    /// A leading UTF-8 byte-order mark is skipped before the first token.
+    ///
+    /// Reference Lua gained `skipBOM` in 5.2 (`lauxlib.c`), and LuaJIT has
+    /// the same skip in `lj_lex.c`. Where this is false (5.1) a BOM'd file is
+    /// a syntax error in the reference implementation, so it is one here too.
+    ///
+    /// A leading `#!` line needs no such gate: reference Lua has skipped it
+    /// (`skipcomment`) since 5.0, in every dialect.
+    pub fn skips_bom(self) -> bool {
+        self != Dialect::Lua51
+    }
+
     /// The identifier used in `luabox.toml` (`edition = "5.4"`).
     pub fn manifest_id(self) -> &'static str {
         match self {
@@ -83,6 +95,19 @@ mod tests {
         // Near-misses must not be silently coerced to a supported dialect.
         for id in ["", "5.0", "5.5", "5", "LuaJIT", "luau", " 5.4"] {
             assert_eq!(Dialect::from_manifest_id(id), None, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn only_5_1_rejects_a_leading_bom() {
+        assert!(!Dialect::Lua51.skips_bom());
+        for dialect in [
+            Dialect::Lua52,
+            Dialect::Lua53,
+            Dialect::Lua54,
+            Dialect::LuaJit,
+        ] {
+            assert!(dialect.skips_bom(), "{dialect:?}");
         }
     }
 

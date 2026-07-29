@@ -87,7 +87,7 @@ Status: **accepted** (2026-07-26), owner decision. Scopes down — but does
 not reverse — the "luarocks.org is the registry" pivot (#2). Tracked as
 flying-dice/luabox#10 (dependency management), #11 (`run`/`toolchain`), #12
 (docs) and #13 (gates); the evidence is the quality baseline in
-[PRODUCTION-READINESS.md](PRODUCTION-READINESS.md).
+[PRODUCTION-READINESS.md](docs/04-project/02-production-readiness.md).
 
 ## North star
 
@@ -95,8 +95,32 @@ flying-dice/luabox#10 (dependency management), #11 (`run`/`toolchain`), #12
 an interpreter.**
 
 v1 is a purely static toolchain: parse, typecheck, lint, format, lower,
-bundle, document, and serve LSP. Everything that reaches the network, holds
-a credential, or starts a process is out.
+bundle, document, and serve LSP. Three things are out, and these are the
+load-bearing claims — the ones a user can rely on and a reviewer should hold
+us to:
+
+1. **It never spawns an interpreter.** Your Lua is read, never run.
+2. **It never fetches or resolves packages.** No solver, no lockfile, no
+   registry client, no downloads on your project's behalf.
+3. **It holds no credential.** No login, no token store, no keychain entry.
+
+Three commands do start a child process, and none of them weakens any of the
+three claims:
+
+- **`upgrade`** replaces the running binary with a GitHub release —
+  anonymously, via `curl` and `tar`, on explicit request. It is the toolchain
+  updating itself, not the toolchain acting on your project.
+- **`doc --open`** hands the `index.html` it just generated to the platform's
+  browser opener (`xdg-open`/`open`/`start`).
+- **`build --mode love`** shells out to a zip tool to package the `.love`
+  archive — `zip`, else `python3 -m zipfile`, else `python -m zipfile` on
+  Unix; the System32 `bsdtar`, else PowerShell's `Compress-Archive`, on
+  Windows. It archives the build output luabox just produced, executes no
+  Lua, and when no tool is present it fails loudly naming the ones it tried
+  rather than emitting a half-made archive.
+
+Stating it as "spawns no process at all" was the tidier sentence and the false
+one; the three claims above are what actually holds.
 
 ## What this cuts
 
@@ -106,7 +130,7 @@ a credential, or starts a process is out.
   `luabox.lock`, the rockspec editor, the GitHub device flow, the OS
   keychain, and the whole `luabox-store` CAS crate.
 - **[#11] execution** — `run` and `toolchain` (interpreter *and* luarocks
-  provisioning). luabox acquires nothing and spawns nothing; the earlier
+  provisioning). luabox acquires no runtime and runs no user code; the earlier
   "nvm/rustup for Lua" framing is withdrawn with them.
 
 ## Why
@@ -138,7 +162,7 @@ subsystem, #109).
 Cross-package types are not collateral damage. What survives is the *read*
 side:
 
-- the `luabox.toml` manifest model (`[package]`, `[lints]`, build config),
+- the `luabox.toml` manifest model (`[package]`, `[lint]`, build config),
   used by every frontend command — `luabox-resolve` slims to
   manifest/project/dialect;
 - the **`lua_modules/` read path**, so `require` resolution and
@@ -148,6 +172,17 @@ side:
 
 Users keep the whole ecosystem; luabox stops being the thing that fetches
 it.
+
+**Decision (2026-07-29): the manifest contract is single-sourced from a
+declarative table, not from serde.** One const table in `luabox-manifest`
+(`contract.rs`) drives both the parser's key allowlists/did-you-mean and the
+generated JSON Schema that `luabox schema` prints. A serde-derive route was
+evaluated and rejected: no serde-based engine delivers the trio the parser
+guarantees — every error batch-collected in one pass (`eserde` gets this
+far), a byte span per error for rustc-style rendering (`toml_edit` spans;
+serde derives erase them), and did-you-mean across keys *and* enum values
+plus the removed-table nudges and cross-key dependency rules. Revisit only
+if a serde-compatible engine grows span support and suggestion hooks.
 
 ## What still stands
 
@@ -161,4 +196,7 @@ same token.
 
 - Resolving, installing, vendoring, or publishing packages.
 - Credential storage, sign-in flows, and authenticated requests.
-- Acquiring, pinning, or spawning a Lua interpreter (or a luarocks).
+- Acquiring, pinning, or spawning a Lua interpreter (or a luarocks). (`upgrade`
+  fetching luabox's *own* release, `doc --open` launching a browser, and
+  `build --mode love` packaging via a zip tool are the three deliberate
+  exceptions — see the north star above.)

@@ -65,7 +65,7 @@ pub struct CodeParseError;
 
 impl fmt::Display for CodeParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("not a valid diagnostic code; codes look like LB0421")
+        f.write_str("not a valid diagnostic code; codes look like LB0300")
     }
 }
 
@@ -186,17 +186,17 @@ mod tests {
         let err = "banana".parse::<Code>().unwrap_err();
         assert_eq!(
             err.to_string(),
-            "not a valid diagnostic code; codes look like LB0421"
+            "not a valid diagnostic code; codes look like LB0300"
         );
         // It is a real `std::error::Error`.
         let boxed: Box<dyn std::error::Error> = Box::new(err);
-        assert!(boxed.to_string().contains("LB0421"));
+        assert!(boxed.to_string().contains("LB0300"));
     }
 
     #[test]
     fn deserializing_a_malformed_code_is_an_error_not_a_panic() {
         let err = serde_json::from_str::<Code>("\"LB1\"").unwrap_err();
-        assert!(err.to_string().contains("LB0421"), "{err}");
+        assert!(err.to_string().contains("LB0300"), "{err}");
     }
 
     #[test]

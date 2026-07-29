@@ -13,7 +13,7 @@
     reason = "glob-importing the SyntaxKind variants keeps the grammar's match arms readable"
 )]
 use super::SyntaxKind::{self, *};
-use super::parser::{MAX_DEPTH, Parser};
+use super::parser::{MAX_DEPTH, Marker, Parser};
 
 /// `chunk ::= block` — the root; consumes the entire input.
 pub(super) fn source_file(p: &mut Parser) {
@@ -492,6 +492,11 @@ fn expr_bp_inner(p: &mut Parser, limit: u8) -> Option<SyntaxKind> {
         if left <= limit {
             break;
         }
+        if right < left {
+            // Right-associative (`..`, `^`): the whole run in one loop.
+            kind = right_assoc_chain(p, checkpoint, left);
+            continue;
+        }
         // Past the height budget the operator and operand still parse, but
         // flat into the enclosing node instead of a new `BIN_EXPR` level.
         let wrap = budget_ok && {
@@ -511,6 +516,59 @@ fn expr_bp_inner(p: &mut Parser, limit: u8) -> Option<SyntaxKind> {
         }
     }
     Some(kind)
+}
+
+/// Consume a run of one right-associative operator (`a .. b .. c`, `a^b^c`)
+/// whose left operand is already parsed and starts at `first`.
+///
+/// The obvious spelling — recurse with the operator's *right* power, as the
+/// left-associative path does — makes the recursive call swallow the rest of
+/// the chain, costing one stack frame *and one unit of the nesting budget*
+/// per term. That is why a 100-term `"a" .. "a" .. …` was rejected while the
+/// same-length `+` chain (left-associative, absorbed by the loop above) was
+/// not. Here each operand is parsed at the operator's *left* power instead,
+/// which stops it short of the next same-power operator and hands that back
+/// to this loop; the `BIN_EXPR` levels are opened afterwards, outermost
+/// first, so the tree still nests to the right: `a .. (b .. c)`.
+///
+/// Depth cost: one level, whatever the chain's length.
+fn right_assoc_chain(p: &mut Parser, first: Marker, power: u8) -> SyntaxKind {
+    // One `BIN_EXPR` start per operator; `starts[0]` covers the whole chain.
+    let mut starts = vec![first];
+    let mut budget_ok = true;
+    loop {
+        p.bump(); // the operator
+        let operand = p.checkpoint();
+        if expr_bp(p, power).is_none() {
+            p.expected_expression();
+        }
+        // Anything binding tighter than `power` was already taken by the
+        // operand, so the only continuation is the same operator again.
+        let more = matches!(
+            p.current().and_then(bin_op_power),
+            Some((left, right)) if left == power && right < left
+        );
+        if !more {
+            break;
+        }
+        // Each operator adds one level, so the chain's length *is* the height
+        // it contributes; past the budget the rest of the chain lands flat
+        // inside the innermost node, exactly as the left-associative path
+        // degrades.
+        if budget_ok {
+            budget_ok = p.can_wrap_nested(first, starts.len() + 1);
+        }
+        if budget_ok {
+            starts.push(operand);
+        }
+    }
+    for &start in &starts {
+        p.start_node_at(start, BIN_EXPR);
+    }
+    for _ in &starts {
+        p.finish_node();
+    }
+    BIN_EXPR
 }
 
 /// `nil | false | true | Number | String | '...' | functiondef |

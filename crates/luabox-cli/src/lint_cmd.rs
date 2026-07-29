@@ -12,11 +12,17 @@
 //! errors is never rewritten. A `lint: N errors, M warnings in K files` summary
 //! goes to stderr.
 //!
+//! **`[lint]` config problems** (CC-M8): a key that names neither `globals`,
+//! a tier, nor a rule this build has is reported once as an `LB1004` warning
+//! before the per-file findings, with a "did you mean" nudge across both
+//! vocabularies. It is a warning because the entry is merely inert — the exit
+//! code is unchanged.
+//!
 //! **Known globals** (ticket #103, `undefined-global`): the dialect stdlib
 //! plus any `[types] defs` packages, resolved from `defs/` the same way
-//! `luabox check` builds its `Ambient` layer (see
-//! `luabox-cli::check_cmd::resolve_project_defs`, duplicated here in
-//! miniature — the two commands don't share a `Project` type). Test files
+//! `luabox check` builds its `Ambient` layer — one shared walk in
+//! `luabox_manifest::layout`, so the two commands cannot disagree about which
+//! globals a project declares. Test files
 //! (SPEC.md §11: `*_test.lua`/`*.test.lua`/anything under `tests/`)
 //! additionally see the conventional busted-style test globals (`describe`,
 //! `it`, `before_each`, `after_each`, `test`), which a test framework injects
@@ -28,14 +34,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use luabox_diag::{Diagnostic, Format};
-use luabox_lint::{LintConfig, apply_fixes, lint_source};
-use luabox_resolve::manifest::{Lint, LintLevel, Manifest};
+use luabox_diag::{Code, Diagnostic, Format};
+use luabox_lint::{LintConfig, UnknownRuleId, apply_fixes, lint_source};
+use luabox_manifest::layout::{self, DefFiles};
+use luabox_manifest::model::Manifest;
 use luabox_syntax::Dialect;
 use luabox_types::{Ambient, build_ambient, stdlib_defs};
 use rayon::prelude::*;
 
-use crate::project::{collect_lua_files, display_rel};
+use layout::display_rel;
+
+use crate::emit::errln;
 
 /// The most fix passes to run per file before giving up on convergence.
 const MAX_FIX_PASSES: usize = 8;
@@ -48,7 +57,8 @@ const TEST_HARNESS_GLOBALS: [&str; 5] = ["describe", "it", "before_each", "after
 /// Execute `luabox lint` from `cwd`.
 pub fn run(cwd: &Path, fix: bool) -> anyhow::Result<()> {
     let project = discover(cwd)?;
-    let files = collect_lua_files(&project.root, project.out_dir.as_deref(), false)?;
+    let files =
+        layout::collect_lua_files(&project.root, project.out_dir.as_deref(), DefFiles::Include)?;
 
     // SPEC.md §16: rayon per file — files are independent.
     let per_file: Vec<anyhow::Result<FileResult>> = files
@@ -77,7 +87,17 @@ pub fn run(cwd: &Path, fix: bool) -> anyhow::Result<()> {
         key(a).cmp(&key(b))
     });
 
-    finish(&diags, &project.root, files.len(), fixed_files, fix)
+    // Config problems lead: they are about the manifest, not any one file,
+    // and they explain why a rule the reader thought they had configured is
+    // still firing (or still silent).
+    let mut report: Vec<Diagnostic> = project
+        .unknown_lint_rules
+        .iter()
+        .map(unknown_rule_diagnostic)
+        .collect();
+    report.append(&mut diags);
+
+    finish(&report, &project.root, files.len(), fixed_files, fix)
 }
 
 /// One file's diagnostics plus whether `--fix` rewrote it.
@@ -121,7 +141,10 @@ fn lint_one(path: &Path, project: &Project, fix: bool) -> anyhow::Result<FileRes
 
     let was_fixed = fix && source != original;
     if was_fixed {
-        fs::write(path, &source).with_context(|| format!("cannot write `{rel}`"))?;
+        // Never `fs::write`: that truncates the user's source before it writes
+        // a byte, so a failed write destroys it. See `crate::atomic_write`.
+        crate::atomic_write::write_atomic(path, &source)
+            .with_context(|| format!("cannot write `{rel}`"))?;
     }
 
     Ok(FileResult {
@@ -141,11 +164,11 @@ fn finish(
     let counts = crate::project::render_diagnostics(diags, Format::Human, root);
     let (errors, warnings) = (counts.errors, counts.warnings);
     if fix {
-        eprintln!(
+        errln!(
             "lint: {errors} errors, {warnings} warnings in {file_count} files ({fixed_files} fixed)"
         );
     } else {
-        eprintln!("lint: {errors} errors, {warnings} warnings in {file_count} files");
+        errln!("lint: {errors} errors, {warnings} warnings in {file_count} files");
     }
     if errors > 0 {
         bail!("lint failed with {errors} error(s)");
@@ -164,33 +187,38 @@ struct Project {
     /// project's ambient LuaCATS globals (`love`, project-specific
     /// `.d.lua` packages, ...) don't spuriously trip the lint.
     known_globals: HashSet<String>,
+    /// `[lint]` keys that name no known rule id — reported as `LB1004`
+    /// warnings before the per-file findings, since the manifest parser
+    /// cannot validate ids that live in `luabox-lint` (CC-M8).
+    unknown_lint_rules: Vec<UnknownRuleId>,
 }
 
 /// Find the project: nearest `luabox.toml` walking up from `cwd`, or a
 /// manifest-less default rooted at `cwd` (Lua 5.4, empty lint config).
 fn discover(cwd: &Path) -> anyhow::Result<Project> {
-    let Some((root, manifest)) = crate::project::discover_manifest(cwd)? else {
+    let Some((root, manifest)) = layout::discover_manifest(cwd)? else {
         return Ok(Project {
             root: cwd.to_path_buf(),
             dialect: Dialect::Lua54,
             out_dir: None,
             lint: LintConfig::new(),
             known_globals: stdlib_defs(Dialect::Lua54).global_names().clone(),
+            unknown_lint_rules: Vec::new(),
         });
     };
-    let Some(dialect) = Dialect::from_manifest_id(&manifest.package.edition) else {
-        bail!(
-            "unknown edition `{}` in `{}` (see `luabox explain LB1001`)",
-            manifest.package.edition,
-            root.join("luabox.toml").display()
-        );
-    };
+    // `Manifest::parse` types `[package] edition` as a `DialectId`, so there
+    // is nothing left to re-validate here (CC-M13).
+    let dialect = crate::dialect::from_manifest(manifest.package.edition);
     let known_globals = known_globals(dialect, &root, &manifest);
+    // The `[lint]` translation is `luabox-lint`'s single one, shared with the
+    // LSP; it hands back the unknown ids rather than swallowing them.
+    let (lint, unknown_lint_rules) = LintConfig::from_manifest(&manifest.lint);
     Ok(Project {
         out_dir: Some(root.join(&manifest.build.out)),
         dialect,
-        lint: build_config(&manifest.lint),
+        lint,
         known_globals,
+        unknown_lint_rules,
         root,
     })
 }
@@ -200,37 +228,19 @@ fn discover(cwd: &Path) -> anyhow::Result<Project> {
 /// `<root>/defs/` (SPEC.md §3) *and* every direct dependency's own `[types]
 /// defs` (#108, the luals `workspace.library` model — a dependency's ambient
 /// globals must not spuriously trip the consumer's `undefined-global`).
-/// Mirrors `check_cmd::resolve_project_defs` in miniature (same resolution
-/// rules), and reuses `check_cmd::resolve_dep_defs` for the dependency side,
-/// since the two commands don't share a `Project` type. A project-defs entry
-/// that fails to resolve is silently skipped here — `luabox check` is the
-/// command that reports `LB1002`; `lint` falls back to the stdlib-only
-/// baseline for that entry.
+/// Resolution is `luabox_manifest::layout`'s — the same walk `luabox check`
+/// and the LSP run, so all three see one set of ambient globals. Only the
+/// texts matter here (a global is a global, whatever file declared it), so the
+/// labels are dropped. A project-defs entry that fails to resolve is silently
+/// skipped: `luabox check` is the command that reports `LB1002`; `lint` falls
+/// back to the stdlib-only baseline for that entry.
 fn known_globals(dialect: Dialect, root: &Path, manifest: &Manifest) -> HashSet<String> {
-    let mut sources = Vec::new();
-    let defs_dir = root.join("defs");
-    for name in &manifest.types.defs {
-        let single = defs_dir.join(format!("{name}.d.lua"));
-        if single.is_file()
-            && let Ok(text) = fs::read_to_string(&single)
-        {
-            sources.push(text);
-        }
-        let dir = defs_dir.join(name);
-        if dir.is_dir() {
-            let mut files = Vec::new();
-            collect_d_lua(&dir, &mut files);
-            files.sort();
-            for file in files {
-                if let Ok(text) = fs::read_to_string(&file) {
-                    sources.push(text);
-                }
-            }
-        }
-    }
-    for dep_def in crate::check_cmd::resolve_dep_defs(root, manifest) {
-        sources.push(dep_def.text);
-    }
+    let (project_defs, _unresolved) = layout::resolve_project_defs(root, &manifest.types.defs);
+    let sources: Vec<String> = project_defs
+        .into_iter()
+        .chain(layout::resolve_dep_defs(root, manifest))
+        .map(|def| def.text)
+        .collect();
     if sources.is_empty() {
         return stdlib_defs(dialect).global_names().clone();
     }
@@ -238,48 +248,29 @@ fn known_globals(dialect: Dialect, root: &Path, manifest: &Manifest) -> HashSet<
     ambient.global_names().clone()
 }
 
-/// Collect every `*.d.lua` file under `dir`, recursively (mirrors
-/// `check_cmd`'s helper of the same shape).
-fn collect_d_lua(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_d_lua(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("lua")
-            && path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(".d.lua"))
-        {
-            out.push(path);
-        }
-    }
-}
+/// `LB1004` — a `[lint]` key naming no known rule id (nor a tier).
+///
+/// Not `LB1003`: SPEC.md §6 reserves that number for the parked dependency
+/// dialect-set check.
+const UNKNOWN_LINT_RULE: Code = Code::new(1004);
 
-/// Translate the manifest `[lint]` table into a [`LintConfig`].
-fn build_config(lint: &Lint) -> LintConfig {
-    let mut config = LintConfig::new();
-    for name in &lint.globals {
-        config.allow_global(name.clone());
-    }
-    for (tier, level) in &lint.tiers {
-        config.set_tier(tier, level_keyword(*level));
-    }
-    for (rule, level) in &lint.rules {
-        config.set_rule(rule, level_keyword(*level));
-    }
-    config
-}
+/// The note every unknown-rule-id report carries, pointing at the page that
+/// lists both vocabularies.
+const UNKNOWN_LINT_RULE_NOTE: &str =
+    "run `luabox explain LB1004` for the known tier names and rule ids";
 
-fn level_keyword(level: LintLevel) -> &'static str {
-    match level {
-        LintLevel::Allow => "allow",
-        LintLevel::Warn => "warn",
-        LintLevel::Deny => "deny",
+/// The rendered `LB1004` for one unknown `[lint]` key.
+///
+/// A **warning**: the entry is inert, not fatal, so a manifest shared with a
+/// toolchain that has a rule this build does not still lints (and the exit
+/// code is unchanged). The message and the "did you mean" nudge are
+/// `luabox-lint`'s, so the editor words this identically.
+fn unknown_rule_diagnostic(unknown: &UnknownRuleId) -> Diagnostic {
+    let mut diag = Diagnostic::warning(UNKNOWN_LINT_RULE, unknown.message());
+    for note in unknown.notes() {
+        diag = diag.with_note(note);
     }
+    diag.with_note(UNKNOWN_LINT_RULE_NOTE)
 }
 
 /// Whether `rel` (a root-relative, forward-slash path) is a test file
@@ -305,26 +296,16 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+    use crate::testutil::{read, write};
 
-    /// Write `contents` to `root/rel`, creating parent directories.
-    fn write(root: &Path, rel: &str, contents: &str) {
-        let path = root.join(rel);
-        fs::create_dir_all(path.parent().expect("has a parent")).expect("create parents");
-        fs::write(&path, contents).expect("write file");
-    }
-
+    /// Every lint fixture is a 5.4 project — the dialect is never the subject
+    /// here — so the edition is pinned rather than threaded through each call.
     fn manifest(extra: &str) -> String {
-        format!("[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n{extra}")
+        crate::testutil::manifest("5.4", extra)
     }
 
     fn project(extra: &str) -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write(tmp.path(), "luabox.toml", &manifest(extra));
-        tmp
-    }
-
-    fn read(root: &Path, rel: &str) -> String {
-        fs::read_to_string(root.join(rel)).expect("read back")
+        crate::testutil::project("5.4", extra)
     }
 
     // -- the command -------------------------------------------------------
@@ -418,19 +399,25 @@ mod tests {
         let broken = "local unused = 1\nlocal = \n";
         write(tmp.path(), "src/main.lua", broken);
 
-        // Parse errors are correctness-tier, so the command fails — but the
-        // file itself must survive untouched.
-        assert!(run(tmp.path(), true).is_err());
+        // Parse errors are correctness-tier, so the command fails with the
+        // lint summary (not, say, an io error from a half-written rewrite) —
+        // and the file itself survives byte-for-byte. `local = ` trips the
+        // parser twice: no name, then no expression.
+        let error = run(tmp.path(), true).unwrap_err().to_string();
+        assert_eq!(error, "lint failed with 2 error(s)");
         assert_eq!(read(tmp.path(), "src/main.lua"), broken);
     }
 
     #[test]
     fn definition_files_are_linted_unlike_check_and_build() {
         let tmp = project("");
-        // `lint` passes `exclude_d_lua = false`: `*.d.lua` are walked too, so
-        // a parse error in one is reported rather than skipped.
+        // `lint` walks with `DefFiles::Include`: `*.d.lua` are walked too, so
+        // a parse error in one is reported rather than skipped — and it is
+        // the `.d.lua`'s own parse errors (no name, then no expression), from
+        // the only file in the project.
         write(tmp.path(), "defs/broken.d.lua", "local = \n");
-        assert!(run(tmp.path(), false).is_err());
+        let error = run(tmp.path(), false).unwrap_err().to_string();
+        assert_eq!(error, "lint failed with 2 error(s)");
     }
 
     #[test]
@@ -625,18 +612,12 @@ mod tests {
     // -- config translation ------------------------------------------------
 
     #[test]
-    fn every_manifest_lint_level_maps_to_its_config_keyword() {
-        assert_eq!(level_keyword(LintLevel::Allow), "allow");
-        assert_eq!(level_keyword(LintLevel::Warn), "warn");
-        assert_eq!(level_keyword(LintLevel::Deny), "deny");
-    }
-
-    #[test]
-    fn build_config_threads_globals_tiers_and_rules_into_the_lint_config() {
+    fn the_manifest_lint_table_threads_globals_tiers_and_rules_into_the_lint_config() {
         let text =
             manifest("\n[lint]\nglobals = [\"vim\"]\nstyle = \"deny\"\nunused-local = \"allow\"\n");
         let parsed = Manifest::parse(&text).expect("parses");
-        let config = build_config(&parsed.lint);
+        let (config, unknown) = LintConfig::from_manifest(&parsed.lint);
+        assert!(unknown.is_empty(), "{unknown:?}");
         // `LintConfig` exposes no getters, so assert through behaviour: the
         // allowed rule is silent while another style rule now denies.
         let known = stdlib_defs(Dialect::Lua54).global_names().clone();
@@ -649,6 +630,83 @@ mod tests {
         );
         assert_eq!(outcome.error_count, 0, "{:?}", outcome.diagnostics);
         assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+    }
+
+    // -- unknown `[lint]` rule ids (LB1004, CC-M8) -------------------------
+
+    /// The unknown rule ids `discover` finds for a manifest body.
+    fn unknown_rules(extra: &str) -> Vec<UnknownRuleId> {
+        let tmp = project(extra);
+        discover(tmp.path())
+            .expect("discovery succeeds")
+            .unknown_lint_rules
+    }
+
+    #[test]
+    fn a_typod_rule_id_becomes_an_lb1004_warning_naming_the_rule_it_meant() {
+        let unknown = unknown_rules("\n[lint]\nunused-locl = \"allow\"\n");
+        assert_eq!(unknown.len(), 1, "{unknown:?}");
+
+        let diag = unknown_rule_diagnostic(&unknown[0]);
+        assert_eq!(diag.code, UNKNOWN_LINT_RULE);
+        assert_eq!(diag.code.to_string(), "LB1004");
+        // A warning: the entry is inert, not fatal — the exit code is unchanged.
+        assert_eq!(diag.severity, luabox_diag::Severity::Warning);
+        assert_eq!(
+            diag.message,
+            "unknown lint rule id `unused-locl` in `[lint]`"
+        );
+        assert_eq!(
+            diag.notes,
+            vec![
+                "did you mean `unused-local`?".to_owned(),
+                "this `[lint]` entry has no effect".to_owned(),
+                UNKNOWN_LINT_RULE_NOTE.to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_typod_tier_name_is_nudged_back_at_the_tier() {
+        // `pedantics` is not a tier, so the manifest records it as a rule-id
+        // override; the nudge searches tier names too (audit note, CC-M8).
+        let unknown = unknown_rules("\n[lint]\npedantics = \"warn\"\n");
+        assert_eq!(unknown.len(), 1, "{unknown:?}");
+        assert_eq!(
+            unknown_rule_diagnostic(&unknown[0]).notes[0],
+            "did you mean `pedantic`?"
+        );
+    }
+
+    #[test]
+    fn known_rule_ids_and_tiers_produce_no_config_warning() {
+        assert!(
+            unknown_rules(
+                "\n[lint]\nglobals = [\"acme\"]\npedantic = \"warn\"\nunused-local = \"allow\"\n"
+            )
+            .is_empty()
+        );
+        assert!(unknown_rules("").is_empty());
+    }
+
+    #[test]
+    fn a_typod_rule_id_warns_without_failing_the_command() {
+        let tmp = project("\n[lint]\nunused-locl = \"allow\"\n");
+        write(tmp.path(), "src/main.lua", "return 0\n");
+        // Exit code unchanged: `LB1004` is a warning (SPEC.md §9 — only
+        // deny-tier findings, parse errors and malformed ignores fail).
+        run(tmp.path(), false).expect("a config warning does not fail lint");
+    }
+
+    #[test]
+    fn a_manifest_less_project_has_no_lint_config_to_complain_about() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(
+            discover(tmp.path())
+                .expect("discovery succeeds")
+                .unknown_lint_rules
+                .is_empty()
+        );
     }
 
     #[test]

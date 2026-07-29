@@ -11,7 +11,10 @@
 use luabox_diag::Severity;
 use luabox_syntax::Dialect;
 
-use crate::{Level, LintConfig, LintOutcome, Tier, apply_fixes, lint_source, rules, tier_default};
+use crate::{
+    Level, LintConfig, LintLevel, LintOutcome, LintTier, Tier, UnknownRuleId, apply_fixes,
+    lint_source, rule_ids, rules, tier_default,
+};
 
 /// The Lua 5.4 stdlib's known-global names — every test lints against this
 /// baseline, exactly as `luabox lint` does via `luabox_types::stdlib_defs`
@@ -91,7 +94,7 @@ fn unused_local_function_fires() {
 
 fn pedantic() -> LintConfig {
     let mut c = LintConfig::new();
-    assert!(c.set_tier("pedantic", "warn"));
+    c.set_tier(Tier::Pedantic, Level::Warn);
     c
 }
 
@@ -758,6 +761,39 @@ fn file_level_ignore_suppresses_all() {
     assert_eq!(default_codes(src), Vec::<String>::new());
 }
 
+/// Line numbers now come from a precomputed line table rather than a newline
+/// count per finding (the O(findings x file size) fix). The inputs where a
+/// line table and a raw newline count could disagree are CRLF endings, a
+/// missing final newline, and offsets far from byte 0 — pin all three
+/// through the behaviour that depends on them.
+#[test]
+fn suppression_lines_survive_crlf_and_a_missing_final_newline() {
+    let late = format!(
+        "{}---@luabox-ignore unused-local late\r\nlocal x = 1",
+        "print(1)\r\n".repeat(200)
+    );
+    for src in [
+        "---@luabox-ignore unused-local crlf\r\nlocal x = 1\r\n",
+        "local x = 1 ---@luabox-ignore unused-local crlf trailing\r\n",
+        "---@luabox-ignore unused-local no final newline\nlocal x = 1",
+        "local x = 1 ---@luabox-ignore unused-local no final newline",
+        &late,
+    ] {
+        assert_eq!(default_codes(src), Vec::<String>::new(), "{src:?}");
+    }
+}
+
+/// The mirror of the test above: an ignore comment that is *not* adjacent to
+/// the finding must still not suppress it, whatever the line endings.
+#[test]
+fn a_distant_ignore_comment_does_not_suppress() {
+    // Not file-level: a statement precedes the comment, so it only covers
+    // its own line and the one below — line 5's finding stays.
+    let src = "print(1)\r\nprint(2)\r\n---@luabox-ignore unused-local too late\r\nprint(3)\r\nlocal y = 2\r\n";
+    let c = default_codes(src);
+    assert!(c.contains(&"LB0501".to_owned()), "{c:?}");
+}
+
 #[test]
 fn ignore_targets_only_the_named_rule() {
     // Suppress unused-local; the global-write finding survives.
@@ -795,29 +831,29 @@ fn an_underscore_parameter_is_exempt_from_unused_param() {
 #[test]
 fn rule_allow_silences() {
     let mut c = LintConfig::new();
-    assert!(c.set_rule("unused-local", "allow"));
+    c.set_rule("unused-local", Level::Allow);
     assert!(!has("local x = 1\n", &c, "LB0501"));
 }
 
 #[test]
 fn tier_toggle_silences() {
     let mut c = LintConfig::new();
-    assert!(c.set_tier("style", "allow"));
+    c.set_tier(Tier::Style, Level::Allow);
     assert!(!has("local x = 1\n", &c, "LB0501"));
 }
 
 #[test]
 fn rule_override_beats_tier() {
     let mut c = LintConfig::new();
-    assert!(c.set_tier("style", "deny"));
-    assert!(c.set_rule("unused-local", "allow"));
+    c.set_tier(Tier::Style, Level::Deny);
+    c.set_rule("unused-local", Level::Allow);
     assert!(!has("local x = 1\n", &c, "LB0501"));
 }
 
 #[test]
 fn deny_tier_raises_error_severity() {
     let mut c = LintConfig::new();
-    assert!(c.set_rule("unused-local", "deny"));
+    c.set_rule("unused-local", Level::Deny);
     let out = lint("local x = 1\n", &c);
     assert!(out.error_count >= 1);
     assert!(
@@ -933,19 +969,154 @@ fn levels_map_to_severities_and_reject_unknown_keywords() {
 }
 
 #[test]
-fn unrecognised_config_keywords_are_rejected_without_changing_anything() {
+fn an_unknown_rule_id_is_inert_but_no_longer_silent() {
+    // Rule ids are open — they live with the rules, and a `[lint]` entry for
+    // one this build does not have does not fail the lint. What it must not do
+    // any more is vanish: the override is inert *and reported* (CC-M8).
     let mut c = LintConfig::new();
-    assert!(!c.set_tier("nonsense", "warn"), "unknown tier name");
-    assert!(!c.set_tier("style", "forbid"), "unknown level keyword");
-    assert!(
-        !c.set_rule("unused-local", "forbid"),
-        "unknown level keyword"
+    c.set_rule("no-such-rule", Level::Deny);
+    assert!(has("local x = 1\n", &c, "LB0501"));
+
+    let unknown = c.unknown_rule_ids();
+    assert_eq!(unknown.len(), 1, "{unknown:?}");
+    assert_eq!(unknown[0].id(), "no-such-rule");
+    assert_eq!(
+        unknown[0].message(),
+        "unknown lint rule id `no-such-rule` in `[lint]`"
     );
-    // None of the rejected calls took effect: the style default still fires.
-    assert!(has("local x = 1\n", &c, "LB0501"));
-    // An unknown *rule id* is accepted (ids are not validated) but inert.
-    assert!(c.set_rule("no-such-rule", "deny"));
-    assert!(has("local x = 1\n", &c, "LB0501"));
+}
+
+// --- unknown `[lint]` rule ids (CC-M8) --------------------------------------
+
+#[test]
+fn every_known_rule_id_is_accepted_silently() {
+    let mut c = LintConfig::new();
+    for id in rule_ids() {
+        c.set_rule(id, Level::Warn);
+    }
+    assert!(
+        c.unknown_rule_ids().is_empty(),
+        "{:?}",
+        c.unknown_rule_ids()
+    );
+}
+
+#[test]
+fn a_typod_rule_id_is_reported_with_the_rule_it_meant() {
+    let mut c = LintConfig::new();
+    c.set_rule("unused-locl", Level::Allow);
+    let unknown = c.unknown_rule_ids();
+    assert_eq!(unknown.len(), 1, "{unknown:?}");
+    assert_eq!(unknown[0].suggestion(), Some("unused-local"));
+    assert_eq!(
+        unknown[0].notes(),
+        vec![
+            "did you mean `unused-local`?".to_owned(),
+            "this `[lint]` entry has no effect".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn a_typod_tier_name_is_reported_with_the_tier_it_meant() {
+    // A mistyped *tier* is indistinguishable from a rule-id override by the
+    // time it reaches the config — `[lint] tiers` is typed, so `pedantics`
+    // lands in `rules`. The nudge therefore searches both vocabularies.
+    for (typo, meant) in [
+        ("pedantics", "pedantic"),
+        ("styl", "style"),
+        ("correctnes", "correctness"),
+    ] {
+        let mut c = LintConfig::new();
+        c.set_rule(typo, Level::Warn);
+        let unknown = c.unknown_rule_ids();
+        assert_eq!(unknown.len(), 1, "{typo}: {unknown:?}");
+        assert_eq!(unknown[0].suggestion(), Some(meant), "{typo}");
+    }
+}
+
+#[test]
+fn an_unrecognisable_rule_id_is_reported_without_a_suggestion() {
+    let mut c = LintConfig::new();
+    c.set_rule("totally-made-up-thing", Level::Deny);
+    let unknown = c.unknown_rule_ids();
+    assert_eq!(unknown.len(), 1, "{unknown:?}");
+    assert_eq!(unknown[0].suggestion(), None);
+    assert_eq!(
+        unknown[0].notes(),
+        vec!["this `[lint]` entry has no effect"]
+    );
+}
+
+#[test]
+fn unknown_rule_ids_are_reported_in_a_stable_order() {
+    let mut c = LintConfig::new();
+    for id in ["zebra-rule", "alpha-rule", "middle-rule"] {
+        c.set_rule(id, Level::Warn);
+    }
+    let unknown = c.unknown_rule_ids();
+    let ids: Vec<&str> = unknown.iter().map(UnknownRuleId::id).collect();
+    assert_eq!(ids, ["alpha-rule", "middle-rule", "zebra-rule"]);
+}
+
+#[test]
+fn from_manifest_builds_the_config_and_hands_back_the_unknown_ids() {
+    let manifest = luabox_manifest::model::Manifest::parse(
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n\n\
+         [lint]\nglobals = [\"acme\"]\nstyle = \"deny\"\nunused-local = \"allow\"\n\
+         unused-parm = \"allow\"\n",
+    )
+    .expect("manifest parses");
+    let (config, unknown) = LintConfig::from_manifest(&manifest.lint);
+
+    // The known halves land: the allow-list, the tier toggle, the rule
+    // override (`unused-local` silenced despite style now denying).
+    assert!(config.is_allowed_global("acme"));
+    assert!(!has("local x = 1\n", &config, "LB0501"));
+
+    // ...and the typo is the only thing reported.
+    assert_eq!(unknown.len(), 1, "{unknown:?}");
+    assert_eq!(unknown[0].id(), "unused-parm");
+    assert_eq!(unknown[0].suggestion(), Some("unused-param"));
+}
+
+#[test]
+fn every_tier_is_in_tier_all() {
+    // `Tier::ALL` feeds the did-you-mean candidate set; a tier missing from it
+    // is a tier a typo can never be nudged towards.
+    assert_eq!(Tier::ALL.len(), 5);
+    for tier in Tier::ALL {
+        assert_eq!(Tier::parse(tier.name()), Some(tier));
+    }
+    for name in ["correctness", "suspicious", "perf", "style", "pedantic"] {
+        assert!(
+            Tier::ALL.iter().any(|t| t.name() == name),
+            "`{name}` missing from Tier::ALL"
+        );
+    }
+}
+
+#[test]
+fn the_manifest_lint_vocabulary_maps_onto_this_crate_s_own() {
+    for (manifest_tier, tier) in [
+        (LintTier::Correctness, Tier::Correctness),
+        (LintTier::Suspicious, Tier::Suspicious),
+        (LintTier::Perf, Tier::Perf),
+        (LintTier::Style, Tier::Style),
+        (LintTier::Pedantic, Tier::Pedantic),
+    ] {
+        assert_eq!(Tier::from(manifest_tier), tier);
+        // Both vocabularies spell a tier the same way in `luabox.toml`.
+        assert_eq!(manifest_tier.as_str(), tier.name());
+    }
+    for (manifest_level, level) in [
+        (LintLevel::Allow, Level::Allow),
+        (LintLevel::Warn, Level::Warn),
+        (LintLevel::Deny, Level::Deny),
+    ] {
+        assert_eq!(Level::from(manifest_level), level);
+        assert_eq!(Level::parse(manifest_level.as_str()), Some(level));
+    }
 }
 
 // --- corpus sweep ----------------------------------------------------------

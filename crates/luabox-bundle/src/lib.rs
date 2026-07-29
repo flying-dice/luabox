@@ -148,7 +148,9 @@ impl fmt::Display for BundleError {
             BundleError::Lower { file, diagnostics } => {
                 write!(f, "cannot lower `{file}` for bundling:")?;
                 for d in diagnostics {
-                    write!(f, "\n  {}: {}", d.code, d.message)?;
+                    // `LowerDiagnostic::code` is the bare number; render the
+                    // `LBnnnn` spelling the registry and `luabox explain` use.
+                    write!(f, "\n  LB{:04}: {}", d.code, d.message)?;
                 }
                 Ok(())
             }
@@ -190,8 +192,12 @@ struct Module {
     name: Option<String>,
     /// Root-relative display path, forward slashes.
     file: String,
-    /// Lowered (bare) text; require rewrites and minify are applied to it.
+    /// Lowered (bare) text, **with its file prefix already cut** — see
+    /// [`split_file_prefix`]. Require rewrites and minify are applied to it.
     text: String,
+    /// This module's own `#!` line, verbatim and without its newline, when
+    /// the file had one. Only the *entry*'s is emitted (see [`emit`]).
+    shebang: Option<String>,
     /// `__luabox_rt` helper names this module's lowered text uses.
     helpers: Vec<&'static str>,
     /// Pending `require` call rewrites: range (in `text`) → module name.
@@ -357,22 +363,74 @@ fn load_module(
             line: line_of(&lowered.text, site.range.start()),
         });
     }
+    // The file prefix (a UTF-8 BOM and/or a `#!` line) is only *legal* at
+    // byte 0 of a chunk, and a module's text is spliced into the middle of
+    // the bundle — where `#` is the length operator and a BOM is an illegal
+    // character. It is therefore cut here, before any splicing, and the
+    // entry's `#!` line is re-emitted at the top of the bundle by `emit`.
+    // The cut is the lexer's own (`split_file_prefix`), and it deliberately
+    // leaves the newline that *ended* the shebang in place, so every line of
+    // the module keeps its original number in the `.lua.map` and in the
+    // `require`-rewrite ranges shifted below.
+    let (shebang, prefix) = split_file_prefix(&lowered.text, req.target);
+    let mut text = lowered.text;
+    text.replace_range(..usize::from(prefix), "");
+
     let edges = hir
         .requires()
         .iter()
-        .map(|edge| (edge.range, edge.module.clone()))
+        .map(|edge| (shift_back(edge.range, prefix), edge.module.clone()))
         .collect();
 
     Ok((
         Module {
             name,
             file,
-            text: lowered.text,
+            text,
+            shebang,
             helpers: lowered.polyfills,
             rewrites: Vec::new(),
         },
         edges,
     ))
+}
+
+/// Reference Lua's *file prefix*: an optional UTF-8 byte-order mark followed
+/// by an optional `#`-led first line (`skipBOM` then `skipcomment` in
+/// `lauxlib.c`). Returns the `#!` line's text — verbatim, without the
+/// newline that ends it — and the byte length of the whole prefix.
+///
+/// The split is the lexer's, not a guess: [`lua::lex`] recognizes the prefix
+/// at byte 0 and nowhere else, emits it as [`lua::SyntaxKind::BOM`] /
+/// [`lua::SyntaxKind::SHEBANG`] trivia, and `is_file_prefix` names exactly
+/// those two kinds. Every dialect lexes the prefix the same way (whether a
+/// BOM is *legal* is the parser's verdict, and it has already been taken by
+/// the time this runs), so `dialect` only picks the lexer, never the rule.
+fn split_file_prefix(text: &str, dialect: Dialect) -> (Option<String>, rowan::TextSize) {
+    let mut end = rowan::TextSize::new(0);
+    let mut shebang = None;
+    for token in lua::lex(text, dialect) {
+        if !token.kind.is_file_prefix() {
+            break;
+        }
+        let start = end;
+        end += rowan::TextSize::new(token.len);
+        if token.kind == lua::SyntaxKind::SHEBANG {
+            shebang = text
+                .get(usize::from(start)..usize::from(end))
+                .map(str::to_owned);
+        }
+    }
+    (shebang, end)
+}
+
+/// Move a range back by the file prefix that was just cut off the front of
+/// the text it points into. Every real token starts after the prefix, so the
+/// subtraction never underflows; a `0` floor keeps that an invariant rather
+/// than a panic.
+fn shift_back(range: TextRange, by: rowan::TextSize) -> TextRange {
+    let sub = |offset: rowan::TextSize| offset.checked_sub(by).unwrap_or_default();
+    TextRange::new(sub(range.start()), sub(range.end()))
 }
 
 /// Assemble the bundle text plus its map. `modules[0]` is the entry chunk
@@ -381,6 +439,20 @@ fn load_module(
 /// lazily on first `__luabox_require`.
 fn emit(req: &BundleRequest<'_>, modules: &[Module]) -> (String, BundleMap) {
     let mut out = Emitter::new(req.name);
+
+    // The entry's `#!` line leads the bundle, ahead of even the banner: a
+    // bundled program is still a program, and the kernel only honours a
+    // shebang at byte 0. Dependencies' shebangs are dropped — they only ever
+    // meant "run *this* file", and the dependency is no longer a file.
+    //
+    // A BOM is never emitted, even when the entry had one. The bundle is a
+    // *new* file rather than a rewrite of the entry, and `lua5.1` has no
+    // `skipBOM` (Dialect::skips_bom): a 5.1-targeted bundle carrying a mark
+    // would simply fail to load. Dropping it costs nothing — the mark is not
+    // load-bearing for UTF-8 — and keeps one rule for every target.
+    if let Some(shebang) = modules.first().and_then(|m| m.shebang.as_deref()) {
+        out.raw(shebang);
+    }
 
     out.raw(&format!(
         "-- bundled by luabox ({} -> {})\n",
@@ -604,5 +676,253 @@ mod tests {
     fn canonical_falls_back_to_the_raw_path_when_the_file_is_gone() {
         let missing = Path::new("/definitely/not/here/a.lua");
         assert_eq!(canonical(missing), missing.to_path_buf());
+    }
+
+    // --- file prefix ------------------------------------------------------
+
+    /// `split_file_prefix` returns the prefix length as a plain byte count.
+    fn prefix_len(text: &str) -> usize {
+        usize::from(split_file_prefix(text, Dialect::Lua54).1)
+    }
+
+    #[test]
+    fn split_file_prefix_finds_bom_and_shebang_only_at_byte_zero() {
+        // Nothing to cut.
+        assert_eq!(
+            split_file_prefix("return 1\n", Dialect::Lua54),
+            (None, 0.into())
+        );
+        // A shebang: reported verbatim, newline excluded.
+        let (shebang, len) = split_file_prefix("#!/usr/bin/env lua\nreturn 1\n", Dialect::Lua54);
+        assert_eq!(shebang.as_deref(), Some("#!/usr/bin/env lua"));
+        assert_eq!(usize::from(len), "#!/usr/bin/env lua".len());
+        // Any `#`-led first line, not just `#!` — that is `skipcomment`.
+        assert_eq!(prefix_len("# plain hash line\nreturn 1\n"), 17);
+        // BOM alone, and BOM then shebang (the order `lauxlib.c` accepts).
+        assert_eq!(
+            split_file_prefix("\u{feff}return 1\n", Dialect::Lua54).0,
+            None
+        );
+        assert_eq!(prefix_len("\u{feff}return 1\n"), 3);
+        let (shebang, len) = split_file_prefix("\u{feff}#!/bin/lua\nreturn 1\n", Dialect::Lua54);
+        assert_eq!(
+            shebang.as_deref(),
+            Some("#!/bin/lua"),
+            "the BOM is not part of it"
+        );
+        assert_eq!(usize::from(len), 3 + "#!/bin/lua".len());
+        // A `#` on any later line is the length operator, never a prefix.
+        assert_eq!(prefix_len("\nreturn #t\n"), 0);
+        // A CRLF shebang keeps its `\r`, exactly as the lexer reports it.
+        assert_eq!(
+            split_file_prefix("#!x\r\nreturn 1\n", Dialect::Lua54)
+                .0
+                .as_deref(),
+            Some("#!x\r")
+        );
+        // Degenerate inputs must not panic.
+        assert_eq!(prefix_len(""), 0);
+        assert_eq!(prefix_len("#!/usr/bin/env lua"), 18);
+        assert_eq!(prefix_len("\u{feff}"), 3);
+    }
+
+    #[test]
+    fn split_file_prefix_is_dialect_independent() {
+        // Whether a BOM is *legal* is the parser's verdict; the lexer cuts
+        // the same prefix under every dialect, so the bundler's cut does
+        // not change with `[build] target`.
+        for dialect in [
+            Dialect::Lua51,
+            Dialect::Lua52,
+            Dialect::Lua53,
+            Dialect::Lua54,
+            Dialect::LuaJit,
+        ] {
+            let (shebang, len) =
+                split_file_prefix("\u{feff}#!/usr/bin/env lua\nreturn 1\n", dialect);
+            assert_eq!(
+                shebang.as_deref(),
+                Some("#!/usr/bin/env lua"),
+                "{dialect:?}"
+            );
+            assert_eq!(usize::from(len), 3 + 18, "{dialect:?}");
+        }
+    }
+
+    #[test]
+    fn cutting_the_prefix_leaves_its_newline_so_line_numbers_do_not_move() {
+        // The invariant the `.lua.map` and every `require` rewrite rely on:
+        // what is cut is the prefix *only*, never the newline after it, so
+        // the text that remains still has the module's original line
+        // numbering (line 1 is simply empty).
+        let text = "#!/usr/bin/env lua\nlocal x = 1\nreturn x\n";
+        let (_, len) = split_file_prefix(text, Dialect::Lua54);
+        let mut cut = text.to_owned();
+        cut.replace_range(..usize::from(len), "");
+        assert_eq!(cut, "\nlocal x = 1\nreturn x\n");
+        assert_eq!(line_of(&cut, 1.into()), line_of(text, 19.into()));
+    }
+
+    #[test]
+    fn shift_back_never_underflows() {
+        let by = rowan::TextSize::new(18);
+        assert_eq!(
+            shift_back(TextRange::new(20.into(), 30.into()), by),
+            TextRange::new(2.into(), 12.into())
+        );
+        // Cannot happen (every real token starts after the prefix) but the
+        // floor is what keeps that a `0`, not a panic.
+        assert_eq!(
+            shift_back(TextRange::new(0.into(), 4.into()), by),
+            TextRange::new(0.into(), 0.into())
+        );
+    }
+
+    /// Bundle a set of `(relative path, contents)` files rooted at a temp
+    /// directory, with `src/main.lua` as the entry.
+    fn bundle_files(files: &[(&str, &str)], target: Dialect, minify: bool) -> Bundle {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, contents) in files {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        bundle(&BundleRequest {
+            root: dir.path(),
+            entry: Path::new("src/main.lua"),
+            edition: Dialect::Lua54,
+            target,
+            name: "main.lua",
+            minify,
+            sourcemap: true,
+        })
+        .expect("bundle")
+    }
+
+    #[test]
+    fn a_dependency_shebang_is_cut_instead_of_breaking_the_bundle() {
+        // Regression: the dependency's `#!` line used to be spliced into the
+        // middle of the bundle, where `#` is the length operator — the
+        // bundle then failed its own reparse with "internal bundler error".
+        for minify in [false, true] {
+            let out = bundle_files(
+                &[
+                    ("src/main.lua", "local u = require(\"util\")\nreturn u.n\n"),
+                    ("src/util.lua", "#!/usr/bin/env lua\nreturn { n = 41 }\n"),
+                ],
+                Dialect::Lua54,
+                minify,
+            );
+            assert!(
+                !out.text.contains("#!/usr/bin/env lua"),
+                "minify={minify}: dependency shebang leaked into the bundle:\n{}",
+                out.text
+            );
+            assert!(out.text.contains("41"), "minify={minify}");
+            assert!(
+                !out.text.starts_with("#!"),
+                "minify={minify}: the entry had no shebang, so the bundle must not grow one"
+            );
+        }
+    }
+
+    #[test]
+    fn the_entry_shebang_leads_the_bundle_plain_and_minified() {
+        for minify in [false, true] {
+            for target in [Dialect::Lua51, Dialect::Lua54] {
+                let out = bundle_files(
+                    &[
+                        (
+                            "src/main.lua",
+                            "#!/usr/bin/env lua\nlocal u = require(\"util\")\nreturn u.n\n",
+                        ),
+                        ("src/util.lua", "#!/usr/bin/env lua\nreturn { n = 41 }\n"),
+                    ],
+                    target,
+                    minify,
+                );
+                assert!(
+                    out.text.starts_with("#!/usr/bin/env lua\n"),
+                    "target={target:?} minify={minify}: bundle does not start with the entry \
+                     shebang:\n{}",
+                    out.text
+                );
+                // Exactly one — the dependency's was cut, not moved.
+                assert_eq!(out.text.matches("#!/usr/bin/env lua").count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn a_bom_is_cut_from_every_module_and_never_re_emitted() {
+        // The bundle is a *new* file, so it never inherits a mark: emitting
+        // one would break a 5.1 target outright (no `skipBOM`) and buys
+        // nothing anywhere else.
+        for minify in [false, true] {
+            let out = bundle_files(
+                &[
+                    (
+                        "src/main.lua",
+                        "\u{feff}local u = require(\"util\")\nreturn u.n\n",
+                    ),
+                    ("src/util.lua", "\u{feff}return { n = 41 }\n"),
+                ],
+                Dialect::Lua54,
+                minify,
+            );
+            assert!(
+                !out.text.contains('\u{feff}'),
+                "minify={minify}: bundle carries a BOM:\n{}",
+                out.text
+            );
+            assert!(out.text.contains("41"), "minify={minify}");
+        }
+    }
+
+    #[test]
+    fn a_bom_under_a_5_1_target_is_still_rejected_by_name() {
+        // Unchanged, and deliberately so: `[build] target = "5.1"` means the
+        // *sources* must be legal 5.1 too (tree mode ships them verbatim),
+        // and 5.1 has no `skipBOM`. Cutting the prefix for the bundle does
+        // not soften that verdict.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.lua"), "\u{feff}return 1\n").unwrap();
+        let err = bundle(&BundleRequest {
+            root: dir.path(),
+            entry: Path::new("src/main.lua"),
+            edition: Dialect::Lua51,
+            target: Dialect::Lua51,
+            name: "main.lua",
+            minify: false,
+            sourcemap: false,
+        })
+        .expect_err("a BOM is not legal 5.1");
+        assert!(
+            err.to_string().contains("byte-order mark"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn require_rewrites_still_land_after_a_prefix_is_cut() {
+        // The edge ranges are recorded against the *un*cut text; if the
+        // shift were forgotten the shim call would be spliced 18 bytes off.
+        let out = bundle_files(
+            &[
+                (
+                    "src/main.lua",
+                    "#!/usr/bin/env lua\nlocal u = require(\"util\")\nreturn u.n\n",
+                ),
+                ("src/util.lua", "return { n = 41 }\n"),
+            ],
+            Dialect::Lua54,
+            false,
+        );
+        assert!(
+            out.text.contains("local u = __luabox_require(\"util\")"),
+            "{}",
+            out.text
+        );
     }
 }

@@ -73,8 +73,19 @@ fn known_bit_member(node: &SyntaxNode) -> Option<Helper> {
 }
 
 /// `__luabox_rt.<member>`.
+///
+/// The rewrite table calls this only where [`matches_bit_member`] said yes, so
+/// [`known_bit_member`] answers again here. It is asked rather than asserted:
+/// if the guard and the builder ever disagreed, aborting the whole build would
+/// be a worse answer than emitting the expression unchanged — and unchanged is
+/// *safe*, because `luabox build` re-validates every lowered file against the
+/// target and reports anything the target cannot accept (`build_cmd`'s
+/// residual check), so a missed rewrite surfaces as a diagnostic on the file
+/// rather than a panic with no source location at all.
 pub(crate) fn build_bit_member(node: &SyntaxNode, ctx: &mut Ctx<'_>) -> String {
-    let helper = known_bit_member(node).unwrap_or_else(|| unreachable!("checked by matches"));
+    let Some(helper) = known_bit_member(node) else {
+        return node.text().to_string();
+    };
     ctx.helpers.insert(helper);
     format!("__luabox_rt.{}", helper.name())
 }

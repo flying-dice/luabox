@@ -30,6 +30,14 @@ jobs:
       # hard errors, otherwise a pedantic finding passes CI silently.
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # tools/differ is deliberately workspace-EXCLUDED (it links real
+      # interpreters' behavior, not the product), so nothing above compiles
+      # it — a workspace API change can silently rot it until the
+      # differential workflow runs on a PR to main (exactly what happened on
+      # #45 with the typed-Code u16 seam). Keep it compiling everywhere;
+      # Linux is enough, the full harness still runs in differential.yml.
+      - run: cargo test --manifest-path tools/differ/Cargo.toml
+        if: matrix.os == 'ubuntu-latest'
 
   # Dual line-coverage gates (cargo-llvm-cov), measured as two ISOLATED
   # suites so each style of testing independently guarantees behaviour:
@@ -58,11 +66,16 @@ jobs:
       - run: >
           cargo llvm-cov --no-report
           -p luabox-bundle -p luabox-db -p luabox-diag -p luabox-hir
-          -p luabox-lint -p luabox-lower -p luabox-lsp -p luabox-resolve
+          -p luabox-lint -p luabox-lower -p luabox-lsp -p luabox-manifest
           -p luabox-syntax -p luabox-types
+      # Every luabox-cli test target EXCEPT the two cucumber binaries
+      # (acceptance, lsp_acceptance), which are the e2e suite measured below.
+      # A new `tests/*.rs` has to be added here or its lines silently stop
+      # counting towards the unit floor.
       - run: >
           cargo llvm-cov --no-report
           -p luabox-cli --bins --test cross_package_defs --test watch
+          --test broken_pipe --test atomic_rewrite --test deep_pipeline
       - run: cargo llvm-cov report --fail-under-lines 95
       - run: cargo llvm-cov report --lcov --output-path lcov-unit.info
         if: always()
@@ -102,11 +115,32 @@ jobs:
           name: coverage-e2e-lcov
           path: lcov-e2e.info
 
-  # SPEC.md §16.1 — perf gates are CI-blocking: cold start < 50 ms, and
-  # (until `luabox check` lands, ticket #6) a `fmt --check` throughput
-  # proxy on a ~100-kLOC synthetic corpus < 2 s warm. See
-  # scripts/perf-gate.sh for the harness and how to flip on the real
-  # `check` gate.
+  # SPEC.md §16.1 — perf gates are CI-blocking. scripts/perf-gate.sh is the
+  # authoritative list and holds the calibration notes for every budget; it
+  # currently runs seven timed legs plus one memory leg, all live:
+  #   1. cold start                     — `luabox --version`, best of 10
+  #   2. `fmt --check` warm             — ~100-kLOC synthetic corpus
+  #   3. `check` warm                   — same corpus; the gate §16.1 asks for
+  #   4. `check` peak RSS               — same corpus; budget 300 MiB
+  #   5. `lint`, diagnostics-heavy      — 20 k findings in ONE file, suppressed
+  #   6. `check`, diagnostics-heavy     — ditto
+  #   7. `lint`, findings rendered      — the same corpus, nothing suppressed
+  #   8. `check`, findings rendered     — ditto
+  # Legs 5-8 exist because the corpus legs 2-4 use is *clean*, so none of
+  # them ever times per-diagnostic work — the blind spot that hid an
+  # O(diagnostics x file size) line lookup (32 k findings in one file: ~32 s
+  # to lint; the same file with one finding: 0.35 s). The suppressed pair
+  # times the bookkeeping with the renderer out of the way; the rendered pair
+  # times what a user actually pays, renderer included, where a second such
+  # cost lived.
+  # Leg 4 is the memory one: decisions/07 *accepted* a ~1.9x peak-RSS
+  # regression (64 -> 123 MiB) for one read/parse per file, and nothing
+  # enforced the ceiling side of that trade until it was added.
+  # The LSP keystroke-to-diagnostics budget in §16.1 is NOT gated here — no
+  # harness drives the protocol yet; SPEC marks it future work.
+  # Every *timed* budget is scaled by LUABOX_PERF_FACTOR (set below for this
+  # runner); the RSS budget deliberately is not — a slow machine runs the same
+  # allocations. LUABOX_RSS_BUDGET_MIB overrides that one on its own.
   perf-gates:
     runs-on: ubuntu-latest
     steps:
@@ -117,6 +151,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: perf-gates
+      # The peak-RSS leg SKIPs loudly when python3 is missing — fine on a dev
+      # box, but CI must never run a gate with a leg silently absent. Assert
+      # the tooling up front, the way draft-install-mock does.
+      - name: Assert python3 is available (peak-RSS leg depends on it)
+        run: python3 --version
       # GitHub-hosted runners are ~3x slower and noisier than the dev
       # baseline the budgets were calibrated on (observed: warm check
       # 3145 ms vs the 1000 ms budget). The factor scales every budget;
@@ -149,3 +188,24 @@ jobs:
       - name: Install unzip and lua5.1
         run: sudo apt-get update && sudo apt-get install -y unzip lua5.1
       - run: bash scripts/examples.sh
+
+  # `scripts/install.sh`'s draft-release path (LUABOX_DRAFT_INSTALL=1) needs a
+  # draft release, a token that can see it, and asset endpoints that 302 to
+  # storage — so nothing exercised it until a real `v*` tag ran release.yml's
+  # verify job. The first run of that code was therefore a production release,
+  # which is the most expensive place to discover a bug in it.
+  #
+  # This runs the REAL installer, unmodified, against a python3-stdlib mock of
+  # the release API (scripts/tests/mock-release-api.py), pointed at with the
+  # CI-only LUABOX_API_BASE override. Four legs, all fast: curl and wget happy
+  # paths (the wget one is where the cross-host Authorization drop has to be
+  # done by hand — the mock's storage answers 400 if it ever sees a token), an
+  # unknown tag, and a runner without jq. No cargo, no toolchain: seconds.
+  draft-install-mock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The mock and the installer's draft path both need these; assert them
+      # rather than discovering a silent SKIP in the log.
+      - run: jq --version && wget --version | head -1 && python3 --version
+      - run: bash scripts/tests/draft-install-mock.sh
