@@ -84,10 +84,27 @@ spelled out in [RELEASING.md](RELEASING.md#semver-policy-for-0x).
   with 32 k findings took over three minutes to lint, while the same file with
   one finding took 0.35 s. Each file now builds one line table and
   binary-searches it — 20 k suppressed findings in one file went from 15.7 s to
-  0.35 s for `lint`, and from 4.3 s to 0.66 s for `check`. The perf gate was
-  structurally blind to this (its corpus reports `0 errors, 0 warnings`), so it
-  gained a fourth, diagnostics-heavy leg that would have failed by 13× against
-  the old code.
+  0.35 s for `lint`, and from 4.3 s to 0.66 s for `check`. **Reporting** those
+  findings paid the same price again, and worse: every renderer resolved each
+  label by scanning the file from byte 0 for its line and column, walked it a
+  second time for that line's text, and — because the source lookup hands back
+  an owned `String`, read off disk by the CLI — *cloned the whole file* per
+  label while doing it. Human, SARIF, GitHub Actions and GitLab output were all
+  quadratic in the finding count, which left `--format json`, the one format
+  that renders nothing, as the only fast way to report 32 k diagnostics from
+  one 2.8 MB file: 1.4 s, against 85 s for the same run in human form. Every
+  renderer now fetches each distinct file once per run and answers every label
+  against one line table, byte-for-byte identically to before: on that file,
+  `check` 85 s → 1.4 s (60×), `--format sarif` 82 s → 1.8 s (45×),
+  `--format github` 63 s → 1.3 s (47×) and `--format gitlab` 54 s → 1.5 s
+  (36×) — every one of them now within 1.3× of the `--format json` floor on the
+  same input — and, on a 1.7 MB file carrying 32 k lint findings, `lint` 41 s →
+  0.35 s (116×). The perf gate was structurally blind to all of this (its
+  corpus reports `0 errors, 0 warnings`), so it gained a diagnostics-heavy
+  fourth gate, now in two variants: findings suppressed, which times the
+  bookkeeping and would have failed its budget by 13× against the old code, and
+  findings rendered, which times the renderers and would have failed its budget
+  by 15× (`lint`) and 6× (`check`).
 - **Valid Lua with a `#!` shebang is accepted, in every edition.** Reference
   Lua has skipped a leading `#` line since 5.0 (`skipcomment`), so an
   executable script was ordinary source everywhere except here, where
