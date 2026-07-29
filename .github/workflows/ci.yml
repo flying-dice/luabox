@@ -68,10 +68,14 @@ jobs:
           -p luabox-bundle -p luabox-db -p luabox-diag -p luabox-hir
           -p luabox-lint -p luabox-lower -p luabox-lsp -p luabox-manifest
           -p luabox-syntax -p luabox-types
+      # Every luabox-cli test target EXCEPT the two cucumber binaries
+      # (acceptance, lsp_acceptance), which are the e2e suite measured below.
+      # A new `tests/*.rs` has to be added here or its lines silently stop
+      # counting towards the unit floor.
       - run: >
           cargo llvm-cov --no-report
           -p luabox-cli --bins --test cross_package_defs --test watch
-          --test broken_pipe
+          --test broken_pipe --test atomic_rewrite --test deep_pipeline
       - run: cargo llvm-cov report --fail-under-lines 95
       - run: cargo llvm-cov report --lcov --output-path lcov-unit.info
         if: always()
@@ -113,24 +117,30 @@ jobs:
 
   # SPEC.md §16.1 — perf gates are CI-blocking. scripts/perf-gate.sh is the
   # authoritative list and holds the calibration notes for every budget; it
-  # currently runs seven timed legs, all live:
+  # currently runs seven timed legs plus one memory leg, all live:
   #   1. cold start                     — `luabox --version`, best of 10
   #   2. `fmt --check` warm             — ~100-kLOC synthetic corpus
   #   3. `check` warm                   — same corpus; the gate §16.1 asks for
-  #   4. `lint`, diagnostics-heavy      — 20 k findings in ONE file, suppressed
-  #   5. `check`, diagnostics-heavy     — ditto
-  #   6. `lint`, findings rendered      — the same corpus, nothing suppressed
-  #   7. `check`, findings rendered     — ditto
-  # Legs 4-7 exist because the corpus legs 2-3 use is *clean*, so none of
+  #   4. `check` peak RSS               — same corpus; budget 300 MiB
+  #   5. `lint`, diagnostics-heavy      — 20 k findings in ONE file, suppressed
+  #   6. `check`, diagnostics-heavy     — ditto
+  #   7. `lint`, findings rendered      — the same corpus, nothing suppressed
+  #   8. `check`, findings rendered     — ditto
+  # Legs 5-8 exist because the corpus legs 2-4 use is *clean*, so none of
   # them ever times per-diagnostic work — the blind spot that hid an
   # O(diagnostics x file size) line lookup (32 k findings in one file: ~32 s
   # to lint; the same file with one finding: 0.35 s). The suppressed pair
   # times the bookkeeping with the renderer out of the way; the rendered pair
   # times what a user actually pays, renderer included, where a second such
   # cost lived.
+  # Leg 4 is the memory one: decisions/07 *accepted* a ~1.9x peak-RSS
+  # regression (64 -> 123 MiB) for one read/parse per file, and nothing
+  # enforced the ceiling side of that trade until it was added.
   # The LSP keystroke-to-diagnostics budget in §16.1 is NOT gated here — no
   # harness drives the protocol yet; SPEC marks it future work.
-  # Every budget is scaled by LUABOX_PERF_FACTOR (set below for this runner).
+  # Every *timed* budget is scaled by LUABOX_PERF_FACTOR (set below for this
+  # runner); the RSS budget deliberately is not — a slow machine runs the same
+  # allocations. LUABOX_RSS_BUDGET_MIB overrides that one on its own.
   perf-gates:
     runs-on: ubuntu-latest
     steps:
@@ -173,3 +183,24 @@ jobs:
       - name: Install unzip and lua5.1
         run: sudo apt-get update && sudo apt-get install -y unzip lua5.1
       - run: bash scripts/examples.sh
+
+  # `scripts/install.sh`'s draft-release path (LUABOX_DRAFT_INSTALL=1) needs a
+  # draft release, a token that can see it, and asset endpoints that 302 to
+  # storage — so nothing exercised it until a real `v*` tag ran release.yml's
+  # verify job. The first run of that code was therefore a production release,
+  # which is the most expensive place to discover a bug in it.
+  #
+  # This runs the REAL installer, unmodified, against a python3-stdlib mock of
+  # the release API (scripts/tests/mock-release-api.py), pointed at with the
+  # CI-only LUABOX_API_BASE override. Four legs, all fast: curl and wget happy
+  # paths (the wget one is where the cross-host Authorization drop has to be
+  # done by hand — the mock's storage answers 400 if it ever sees a token), an
+  # unknown tag, and a runner without jq. No cargo, no toolchain: seconds.
+  draft-install-mock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The mock and the installer's draft path both need these; assert them
+      # rather than discovering a silent SKIP in the log.
+      - run: jq --version && wget --version | head -1 && python3 --version
+      - run: bash scripts/tests/draft-install-mock.sh
