@@ -173,6 +173,17 @@ side:
 Users keep the whole ecosystem; luabox stops being the thing that fetches
 it.
 
+**Decision (2026-07-29): the manifest contract is single-sourced from a
+declarative table, not from serde.** One const table in `luabox-manifest`
+(`contract.rs`) drives both the parser's key allowlists/did-you-mean and the
+generated JSON Schema that `luabox schema` prints. A serde-derive route was
+evaluated and rejected: no serde-based engine delivers the trio the parser
+guarantees — every error batch-collected in one pass (`eserde` gets this
+far), a byte span per error for rustc-style rendering (`toml_edit` spans;
+serde derives erase them), and did-you-mean across keys *and* enum values
+plus the removed-table nudges and cross-key dependency rules. Revisit only
+if a serde-compatible engine grows span support and suggestion hooks.
+
 ## What still stands
 
 The **luarocks.org-as-registry direction (#2) is unchanged** — only its
@@ -186,5 +197,6 @@ same token.
 - Resolving, installing, vendoring, or publishing packages.
 - Credential storage, sign-in flows, and authenticated requests.
 - Acquiring, pinning, or spawning a Lua interpreter (or a luarocks). (`upgrade`
-  fetching luabox's *own* release, and `doc --open` launching a browser, are
-  the two deliberate exceptions — see the north star above.)
+  fetching luabox's *own* release, `doc --open` launching a browser, and
+  `build --mode love` packaging via a zip tool are the three deliberate
+  exceptions — see the north star above.)
