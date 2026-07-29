@@ -94,6 +94,50 @@ so it appears in no version entry.
 
 ### Added
 
+- **A bare `luarocks install --tree lua_modules <rock>` now gives you the
+  rock's *types*, with no configuration at all**
+  ([#30](https://github.com/flying-dice/luabox/issues/30)). This was the
+  documented sharp edge: cross-package definitions needed a `[dependencies]`
+  entry, a per-package `lua_modules/<name>/luabox.toml` with `[types] defs`,
+  and the `defs/` directory it named — none of which a luarocks tree has, so a
+  rock stayed `unknown` to the typechecker. The rocks were never actually
+  untyped: LuaCATS is the ecosystem's annotation dialect, and a rock that
+  documents itself for lua-language-server has already written the signatures.
+  `luabox check` and the LSP now read them where they sit, in the installed
+  sources under `lua_modules/share/lua/<X.Y>/`:
+  - a rock's `---@class`, `---@enum` and `---@alias` declarations become
+    nameable and enforced in your code — `---@type rock.Thing` resolves (no
+    more `LB0305`) and its fields are checked;
+  - each rock module's `require`-export type joins the cross-file registry, so
+    `local m = require("rock")` carries the module's annotated return types and
+    misusing a rock-typed value is reported **at your use site** — an
+    undeclared field read on a rock class is an `LB0306` in *your* file. No
+    diagnostic ever names a vendored file.
+
+  **Surfaces only; bodies are never checked.** Vendored code remains
+  unchecked: the harvest returns a type surface and no findings, so a type
+  error inside a rock produces nothing, and a rock source that does not parse
+  is skipped whole — named in the LSP log pane, silent under `check`, never a
+  project diagnostic. A source with no `---@` anywhere is skipped before it is
+  parsed, so an un-annotated, dynamically-built module table cannot become
+  `undefined-field` noise about code you did not write.
+
+  **Explicit beats implicit.** A class, enum or alias name declared by your
+  `[types] defs` or by any of your own source files wins over a rock's
+  **outright** — replaced, not merged — which is what makes writing your own
+  definitions a real escape hatch for a wrong annotation upstream. Among rocks
+  the rule is silent first-wins in path order: you declared neither side of a
+  rock-vs-rock clash and cannot edit vendored code, so there is no
+  `LB0307`/`LB0310` to act on. Editor and CI harvest the same version
+  directory (`[build] target`, `5.1` for `luajit`), so they agree. The flat
+  `lua_modules/<name>/` layout keeps its existing `[dependencies]` + `[types]
+  defs` route unchanged, and a `[dependencies]` entry alongside a rock tree
+  neither breaks nor double-counts the harvest. What still needs definitions of
+  your own — an unannotated rock, a global-API library, argument checking at a
+  module field's call site — is spelled out in
+  [docs/03-reference/02-limitations.md](docs/03-reference/02-limitations.md);
+  the design record is
+  [decisions/09](decisions/09-rock-tree-type-harvest.md).
 - **`luabox schema` — the manifest contract, published as a JSON Schema.**
   The binary now carries a complete draft 2020-12 JSON Schema for
   `luabox.toml` and prints it to stdout, so editors, validators and LLM

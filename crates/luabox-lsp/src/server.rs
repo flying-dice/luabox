@@ -72,7 +72,7 @@ use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
 use luabox_lint::{LintConfig, UnknownRuleId, lint_source};
 use luabox_manifest::layout::{self, DefFiles};
 use luabox_manifest::model::{DialectId, Manifest};
-use luabox_types::{Ambient, build_ambient};
+use luabox_types::{Ambient, RockModule, RockSurfaces, build_ambient};
 
 use crate::line_index::LineIndex;
 use crate::sema::FileSema;
@@ -256,6 +256,11 @@ struct ProjectConfig {
     /// matches `luabox check`'s. Combined with the dialect stdlib into the
     /// server's [`Ambient`].
     def_sources: Vec<String>,
+    /// The `lua_modules/share/lua/<X.Y>/` version directory whose installed rock
+    /// sources are harvested for their type surfaces (#30) — chosen by `[build]
+    /// target` (the edition when unset), exactly as `luabox check` chooses it, so
+    /// the editor harvests the tree the build resolves against.
+    rock_version_dir: &'static str,
     /// The resolved `[lint]` configuration (tiers/rules/allowed globals),
     /// built from `manifest.lint` the same way `luabox lint` builds it, so the
     /// editor honours the project's lint config exactly as the CLI does.
@@ -273,6 +278,7 @@ impl ProjectConfig {
             strictness: Strictness::Warn,
             out_dir: None,
             def_sources: Vec::new(),
+            rock_version_dir: luabox_bundle::rocks_version_dir(Dialect::Lua54),
             lint: LintConfig::new(),
             unknown_lint_rules: Vec::new(),
         };
@@ -295,6 +301,9 @@ impl ProjectConfig {
             strictness: Strictness::from_manifest_flag(manifest.types.strict),
             out_dir: Some(root.join(&manifest.build.out)),
             def_sources: ambient_def_sources(root, &manifest),
+            rock_version_dir: luabox_bundle::rocks_version_dir(syntax_dialect(
+                manifest.build.target,
+            )),
             lint,
             unknown_lint_rules,
         }
@@ -338,6 +347,34 @@ fn ambient_def_sources(root: &Path, manifest: &Manifest) -> Vec<String> {
         .collect()
 }
 
+/// Harvest the type surfaces of the project's vendored luarocks tree (#30) —
+/// `luabox_types::rocks::harvest` over `layout::collect_rock_sources`, the same
+/// pair `luabox check` drives, so a rock's classes and export types resolve in
+/// the editor exactly as they do in CI.
+///
+/// Rock sources that could not be parsed are named in the client's log pane:
+/// that is where a debug-level note about vendored code belongs, and it is the
+/// answer to "why did this rock's types not show up?". They are never published
+/// as diagnostics — no document owns them.
+fn harvest_rock_tree(root: &Path, version_dir: &str, ambient: &Ambient) -> RockSurfaces {
+    let sources: Vec<RockModule> = layout::collect_rock_sources(root, version_dir)
+        .into_iter()
+        .map(|source| RockModule {
+            module: source.module,
+            label: source.label,
+            path: source.path,
+            text: source.text,
+        })
+        .collect();
+    let harvested = luabox_types::rocks::harvest(ambient, &sources);
+    for label in harvested.skipped() {
+        log_to_stderr(&format!(
+            "luabox-lsp: skipped unparseable rock source `{label}` while harvesting types"
+        ));
+    }
+    harvested
+}
+
 /// The server state: the analysis host over the project's `.lua` files.
 struct Server {
     connection: Connection,
@@ -350,6 +387,12 @@ struct Server {
     /// dependency defs, #108), built once at startup so the editor's type
     /// resolution matches `luabox check`.
     ambient: Ambient,
+    /// The type surfaces harvested from the project's vendored luarocks tree
+    /// (#30), built once at startup alongside [`Self::ambient`]: rock classes,
+    /// enums and aliases, plus each rock module's `require`-export type. Merged
+    /// per file in [`crate::diagnostics`] — *after* the project's own types, so
+    /// explicit beats implicit.
+    rocks: RockSurfaces,
     /// The resolved `[lint]` configuration, driving the lint pass in
     /// [`Self::publish_lua`] and the quick-fixes in [`Self::code_actions`].
     lint: LintConfig,
@@ -368,6 +411,7 @@ impl Server {
     fn new(connection: Connection, root: PathBuf) -> Self {
         let config = ProjectConfig::discover(&root);
         let ambient = build_ambient(config.dialect, &config.def_sources);
+        let rocks = harvest_rock_tree(&root, config.rock_version_dir, &ambient);
         let known_globals = ambient.global_names().clone();
         let mut host = AnalysisHost::new(config.dialect, config.strictness);
         // Anchor the db's `require` resolution at the workspace root so module
@@ -382,6 +426,7 @@ impl Server {
             strictness: config.strictness,
             out_dir: config.out_dir,
             ambient,
+            rocks,
             lint: config.lint,
             known_globals,
             open_docs: HashMap::new(),
@@ -437,6 +482,10 @@ impl Server {
     fn reload_config(&mut self) -> anyhow::Result<()> {
         let config = ProjectConfig::discover(&self.root);
         let ambient = build_ambient(config.dialect, &config.def_sources);
+        // Re-harvested too: a manifest edit can move the version directory
+        // (`[build] target`), and the tree itself may have grown a rock since
+        // startup — a reload is the cheapest honest moment to notice.
+        self.rocks = harvest_rock_tree(&self.root, config.rock_version_dir, &ambient);
         self.known_globals = ambient.global_names().clone();
         self.ambient = ambient;
         self.lint = config.lint;
@@ -1106,6 +1155,7 @@ impl Server {
         let ctx = diagnostics::CheckCtx {
             strictness: self.strictness,
             ambient: &self.ambient,
+            rocks: &self.rocks,
             lint: &self.lint,
             known_globals: &self.known_globals,
         };
@@ -1304,6 +1354,7 @@ impl Server {
         let ctx = diagnostics::CheckCtx {
             strictness: self.strictness,
             ambient: &self.ambient,
+            rocks: &self.rocks,
             lint: &self.lint,
             known_globals: &self.known_globals,
         };

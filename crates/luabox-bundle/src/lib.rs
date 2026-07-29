@@ -66,7 +66,7 @@ mod minify;
 mod resolve;
 mod sourcemap;
 
-pub use resolve::{resolve as resolve_module, resolve_candidates};
+pub use resolve::{resolve as resolve_module, resolve_candidates, rocks_version_dir};
 pub use sourcemap::{BundleMap, unmap_traceback};
 
 /// Everything [`bundle`] needs to know.

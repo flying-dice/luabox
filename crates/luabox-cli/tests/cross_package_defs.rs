@@ -11,9 +11,16 @@
 //! consumer's own file walk), so they drive the binary directly with an
 //! explicit `current_dir`.
 //!
-//! Boundary (stated for the reader, not tested here): this shares *ambient
-//! declarations* — it does NOT type `local geo = require("geometry")` module
-//! returns, which is cross-file `require` resolution (#85), out of scope.
+//! Boundary of the `[types] defs` route (stated for the reader, not tested
+//! here): it shares *ambient declarations* — it does NOT type
+//! `local geo = require("geometry")` module returns, which is cross-file
+//! `require` resolution (#85).
+//!
+//! The second half of this file covers the other route: a **bare luarocks tree**
+//! (#30, decisions/09). A rock's own installed sources are harvested for their
+//! LuaCATS surfaces with no manifest declaration at all, and there the module
+//! return type *is* typed — a rock source is a module the consumer `require`s,
+//! not a `---@meta` declaration package.
 
 // test code — panics document assumptions
 #![allow(
@@ -404,5 +411,351 @@ fn reading_undeclared_field_on_dep_class_is_undefined_field() {
     assert!(
         !so.contains("LB0305"),
         "geometry.Point must resolve; stdout:\n{so}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A bare luarocks tree (#30) — the sharp edge, gone.
+//
+// `luarocks install --tree lua_modules <rock>` installs the rock's own
+// annotated sources under `lua_modules/share/lua/<X.Y>/`. Those annotations are
+// harvested for their SURFACES — classes/enums/aliases plus each module's
+// `require`-export type — with **no manifest declaration of any kind**: no
+// `[dependencies]` entry, no per-package `luabox.toml`, no `[types] defs`.
+// Vendored bodies are still never checked (decisions/09).
+// ---------------------------------------------------------------------------
+
+/// A consumer project at `app/` with nothing but `[types] strict` — the whole
+/// point is that no dependency declaration is needed.
+fn write_bare_consumer(temp: &Path, extra_defs: &[&str]) {
+    let defs = if extra_defs.is_empty() {
+        String::new()
+    } else {
+        let list = extra_defs
+            .iter()
+            .map(|d| format!("\"{d}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("defs = [{list}]\n")
+    };
+    write(
+        temp,
+        "app/luabox.toml",
+        &format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n\n\
+             [types]\nstrict = true\n{defs}"
+        ),
+    );
+}
+
+/// The `mylib` rock as luarocks installs it: an annotated module under the 5.4
+/// version directory, publishing a class and a constructor that returns it.
+fn write_installed_rock(temp: &Path) {
+    write(
+        temp,
+        "app/lua_modules/share/lua/5.4/mylib/init.lua",
+        "---@class mylib.Point\n\
+         ---@field x number\n\
+         ---@field y number\n\
+         \nlocal M = {}\n\
+         \n---@param x number\n---@param y number\n---@return mylib.Point\n\
+         function M.point(x, y)\n  return { x = x, y = y }\nend\n\
+         \nreturn M\n",
+    );
+}
+
+// (i) a rock's class is referenceable and enforced in the consumer, with ZERO
+//     manifest declarations — the headline of #30.
+#[test]
+fn a_bare_rock_tree_publishes_its_classes_with_no_manifest_declaration() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = temp.path();
+    write_bare_consumer(temp, &[]);
+    write_installed_rock(temp);
+    write(
+        temp,
+        "app/src/main.lua",
+        "---@param p mylib.Point\nlocal function use(p) end\n\
+         use({ x = 1, y = 2 })\nuse({ x = 1, y = \"no\" })\n",
+    );
+    let out = run(&temp.join("app"), &["check"]);
+    let so = stdout(&out);
+    assert!(
+        !out.status.success(),
+        "expected the bad call to fail; stderr:\n{}",
+        stderr(&out)
+    );
+    // The good call is clean, the bad one is a field mismatch: the rock's class
+    // resolved (no LB0305) and its field types are enforced.
+    assert!(so.contains("LB0300"), "expected LB0300; stdout:\n{so}");
+    assert!(
+        !so.contains("LB0305"),
+        "mylib.Point must resolve from the rock tree; stdout:\n{so}"
+    );
+}
+
+// (j) the rock's export type flows through `require`, and misuse of a value
+//     typed by it is reported IN THE CONSUMER (undefined-field on a rock class).
+#[test]
+fn a_required_rock_module_types_through_and_undefined_field_is_reported_in_the_consumer() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = temp.path();
+    write_bare_consumer(temp, &[]);
+    write_installed_rock(temp);
+    write(
+        temp,
+        "app/src/main.lua",
+        "local mylib = require(\"mylib\")\n\
+         local p = mylib.point(1, 2)\n\
+         local good = p.x\nlocal bad = p.nope\nreturn { good, bad }\n",
+    );
+    let out = run(&temp.join("app"), &["check"]);
+    let so = stdout(&out);
+    assert!(
+        !out.status.success(),
+        "expected failure; stderr:\n{}",
+        stderr(&out)
+    );
+    assert!(so.contains("LB0306"), "expected LB0306; stdout:\n{so}");
+    assert!(
+        so.contains("nope") && so.contains("mylib.Point"),
+        "the finding must name the field and the rock class; stdout:\n{so}"
+    );
+    // Reported against the CONSUMER's file, never the vendored one.
+    assert!(
+        so.contains("src/main.lua"),
+        "the finding must be in the consumer; stdout:\n{so}"
+    );
+    assert!(
+        !so.contains("lua_modules"),
+        "no finding may name a vendored file; stdout:\n{so}"
+    );
+}
+
+// (k) a type error inside a rock source is NOT a project diagnostic: the
+//     harvest reads surfaces, it never checks vendored bodies.
+#[test]
+fn a_type_error_inside_a_rock_source_produces_no_diagnostic() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = temp.path();
+    write_bare_consumer(temp, &[]);
+    write_installed_rock(temp);
+    // Same rock, now with a body that violates its own annotations.
+    write(
+        temp,
+        "app/lua_modules/share/lua/5.4/mylib/bad.lua",
+        "---@param n number\n---@return number\n\
+         local function double(n) return n * 2 end\n\
+         \n---@type mylib.Point\nlocal wrong = { x = \"nope\" }\n\
+         return { doubled = double(\"nope\"), wrong = wrong }\n",
+    );
+    write(temp, "app/src/main.lua", "return 1\n");
+    let out = run(&temp.join("app"), &["check"]);
+    let so = stdout(&out);
+    assert!(
+        out.status.success(),
+        "a rock body must not fail the project; stdout:\n{so}\nstderr:\n{}",
+        stderr(&out)
+    );
+    assert!(so.is_empty(), "no findings at all; stdout:\n{so}");
+    // Only the project's own file is counted as source.
+    assert!(
+        stderr(&out).contains("in 1 files"),
+        "stderr:\n{}",
+        stderr(&out)
+    );
+}
+
+// (l) a rock source that does not parse is skipped silently — it neither fails
+//     the check nor stops the rocks around it from contributing.
+#[test]
+fn an_unparseable_rock_source_is_skipped_without_a_diagnostic() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = temp.path();
+    write_bare_consumer(temp, &[]);
+    write_installed_rock(temp);
+    write(
+        temp,
+        "app/lua_modules/share/lua/5.4/mylib/broken.lua",
+        "---@class mylib.Ghost\nlocal = = =\n",
+    );
+    write(
+        temp,
+        "app/src/main.lua",
+        "---@type mylib.Point\nlocal p = { x = 1, y = 2 }\nreturn p\n",
+    );
+    let out = run(&temp.join("app"), &["check"]);
+    let so = stdout(&out);
+    assert!(
+        out.status.success(),
+        "a broken rock source must not fail the project; stdout:\n{so}\nstderr:\n{}",
+        stderr(&out)
+    );
+    assert!(
+        !so.contains("LB0001"),
+        "no syntax error may escape a vendored file; stdout:\n{so}"
+    );
+    // The sibling rock file still published its class.
+    assert!(
+        !so.contains("LB0305"),
+        "the healthy rock file still contributes; stdout:\n{so}"
+    );
+}
+
+// (m) an explicit `[types] defs` declaration WINS a name collision with a
+//     harvested rock surface, whole — that is what makes it an escape hatch.
+#[test]
+fn an_explicit_defs_package_wins_a_collision_with_a_harvested_rock_class() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = temp.path();
+    write_bare_consumer(temp, &["mylib"]);
+    write_installed_rock(temp);
+    // The project's own def declares `mylib.Point` with ONLY `x`. If the rock's
+    // two-field version won — or if the two were unioned — `{ x = 1 }` would be
+    // reported as missing `y`.
+    write(
+        temp,
+        "app/defs/mylib.d.lua",
+        "---@meta\n\n---@class mylib.Point\n---@field x number\n",
+    );
+    write(
+        temp,
+        "app/src/main.lua",
+        "---@type mylib.Point\nlocal p = { x = 1 }\nreturn p\n",
+    );
+    let out = run(&temp.join("app"), &["check"]);
+    let so = stdout(&out);
+    assert!(
+        out.status.success(),
+        "the project's own declaration must win outright; stdout:\n{so}\nstderr:\n{}",
+        stderr(&out)
+    );
+    assert!(so.is_empty(), "no findings at all; stdout:\n{so}");
+}
+
+// (n) a rock-vs-rock name collision resolves silently first-wins in path order:
+//     the user declared neither side and cannot act on a warning about it.
+#[test]
+fn two_rocks_declaring_one_class_resolve_silently_in_path_order() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = temp.path();
+    write_bare_consumer(temp, &[]);
+    write(
+        temp,
+        "app/lua_modules/share/lua/5.4/alpha.lua",
+        "---@class shared.Thing\n---@field from_alpha number\nreturn {}\n",
+    );
+    write(
+        temp,
+        "app/lua_modules/share/lua/5.4/zeta.lua",
+        "---@class shared.Thing\n---@field from_zeta number\nreturn {}\n",
+    );
+    write(
+        temp,
+        "app/src/main.lua",
+        "---@type shared.Thing\nlocal t = { from_alpha = 1 }\nreturn t\n",
+    );
+    let out = run(&temp.join("app"), &["check"]);
+    let so = stdout(&out);
+    assert!(
+        out.status.success(),
+        "first-wins must be clean; stdout:\n{so}\nstderr:\n{}",
+        stderr(&out)
+    );
+    // No LB0307 — a collision between two vendored files is not the user's to fix.
+    assert!(
+        !so.contains("LB0307"),
+        "a rock-vs-rock clash must be silent; stdout:\n{so}"
+    );
+    assert!(so.is_empty(), "no findings at all; stdout:\n{so}");
+}
+
+// (o) an unannotated rock contributes nothing: it stays requirable, bundlable
+//     and `unknown` to the checker, exactly as before #30.
+#[test]
+fn an_unannotated_rock_is_left_exactly_as_it_was() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = temp.path();
+    write_bare_consumer(temp, &[]);
+    write(
+        temp,
+        "app/lua_modules/share/lua/5.4/plain/init.lua",
+        "local M = {}\nfunction M.anything() return 1 end\nreturn M\n",
+    );
+    // A dynamically-extended module table must not become undefined-field noise.
+    write(
+        temp,
+        "app/src/main.lua",
+        "local plain = require(\"plain\")\nreturn plain.whatever_it_pleases\n",
+    );
+    let out = run(&temp.join("app"), &["check"]);
+    let so = stdout(&out);
+    assert!(
+        out.status.success(),
+        "an unannotated rock must stay invisible; stdout:\n{so}\nstderr:\n{}",
+        stderr(&out)
+    );
+    assert!(so.is_empty(), "no findings at all; stdout:\n{so}");
+}
+
+// (p) an explicit `[dependencies]` entry alongside a rock tree neither breaks
+//     the harvest nor double-counts the class it publishes.
+#[test]
+fn a_declared_dependency_alongside_a_rock_tree_neither_breaks_nor_doubles() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = temp.path();
+    write(
+        temp,
+        "app/luabox.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"5.4\"\n\n\
+         [types]\nstrict = true\n\n[dependencies]\nmylib = \"1.0\"\n",
+    );
+    write_installed_rock(temp);
+    write(
+        temp,
+        "app/src/main.lua",
+        "---@type mylib.Point\nlocal p = { x = 1, y = 2 }\nreturn p\n",
+    );
+    let out = run(&temp.join("app"), &["check"]);
+    let so = stdout(&out);
+    assert!(
+        out.status.success(),
+        "declaring the rock must not break it; stdout:\n{so}\nstderr:\n{}",
+        stderr(&out)
+    );
+    assert!(
+        !so.contains("LB0307"),
+        "the class is published once, not twice; stdout:\n{so}"
+    );
+    assert!(so.is_empty(), "no findings at all; stdout:\n{so}");
+}
+
+// (q) the harvest follows `[build] target`, like `require` resolution does: a
+//     tree installed for another interpreter version is not this project's.
+#[test]
+fn a_tree_installed_for_another_version_is_not_harvested() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = temp.path();
+    write_bare_consumer(temp, &[]);
+    write(
+        temp,
+        "app/lua_modules/share/lua/5.1/mylib/init.lua",
+        "---@class mylib.Point\n---@field x number\nreturn {}\n",
+    );
+    write(
+        temp,
+        "app/src/main.lua",
+        "---@type mylib.Point\nlocal p = { x = 1 }\nreturn p\n",
+    );
+    let out = run(&temp.join("app"), &["check"]);
+    let so = stdout(&out);
+    assert!(
+        !out.status.success(),
+        "the 5.1 tree is not a 5.4 project's; stderr:\n{}",
+        stderr(&out)
+    );
+    assert!(
+        so.contains("LB0305") && so.contains("mylib.Point"),
+        "the class must stay unknown; stdout:\n{so}"
     );
 }

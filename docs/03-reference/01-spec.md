@@ -61,6 +61,7 @@ Luau: out of scope (§1). No parse, no check, no lowering.
 
 - **Source of truth:** LuaLS annotations (`---@class`, `---@field`, `---@param`, `---@return`, `---@generic`, `---@alias`, `---@overload`, `---@type`, `---@cast`, `---@enum`, `---@meta`). Full dialect compatibility.
 - **Definition packages:** `@types/*`-style. `*.d.lua` files (`---@meta` modules), declared in `[types] defs` and read from the project tree (a dependency's own defs join the consumer's ambient scope over a materialized `lua_modules/`). Runtime API defs for: 5.1–5.4 stdlib, LuaJIT ext, LÖVE, Neovim, OpenResty. [Registry *distribution* of def packages is parked post-v1 — §6.]
+- **Harvested rock surfaces:** a materialized luarocks tree's installed sources (`lua_modules/share/lua/<X.Y>/**.lua`) are additionally read for the LuaCATS surfaces they already carry — their `---@class`/`---@enum`/`---@alias` declarations and each module's `require`-export type — with no manifest declaration at all (#30). Surface-only and ambient-relaxed: vendored bodies are never typechecked and an unparseable rock source is skipped silently. Explicit beats implicit — a name declared by `[types] defs` or by any project file wins outright. [decisions/09.]
 - Strictness ladder (per-package, per-file override): `none` → `warn` → `strict` (untyped = `unknown`, not `any`).
 - Inference: bidirectional, flow-sensitive narrowing (`if type(x) == "string"`), literal types, generics with constraints. Match/exceed LuaLS on annotated Lua, adding the rigor LuaLS lacks.
 - **Rich table inference — hard requirement.** Tables never degrade to a bare `table` type. The IR models table *shapes* structurally, and inference maintains them without annotations:
@@ -138,7 +139,10 @@ pedantic = "warn"           # tier/rule levels: allow | warn | deny
   definition files join this project's ambient scope (§3, the luals
   `workspace.library` model). `require` resolution (§7) does not consult the
   table at all — it searches `lua_modules/` by path, so a rock is requirable
-  and bundlable whether or not it is listed here.
+  and bundlable whether or not it is listed here. Neither does the rock-surface
+  harvest (§3, #30): a luarocks tree's own annotations are read whether or not
+  anything declares it, so an entry here is never *required* for types — it
+  only adds the flat layout's `[types] defs` route on top.
 - **Parsed, validated, inert** — `[package] lua-versions` and `[package]
   min-luabox-version`. Both are still accepted and still *diagnosed* (an
   unknown dialect name or a non-semver string is a manifest error today), and

@@ -69,7 +69,15 @@ use luabox_syntax::Dialect;
 /// The `share/lua/<X.Y>` / `lib/lua/<X.Y>` version directory a luarocks tree
 /// installs `dialect`'s modules under. LuaJIT is ABI- and path-compatible
 /// with 5.1 and shares its prefix, which is what luarocks itself does.
-fn rocks_version_dir(dialect: Dialect) -> &'static str {
+///
+/// Re-exported as [`crate::rocks_version_dir`]: the rock-tree *type harvest*
+/// (#30) walks that same directory to read the installed sources' LuaCATS
+/// annotations, and must look in exactly the directory `require` resolution
+/// searches or the editor would see surfaces the checker cannot resolve.
+/// Distribution (`luabox-manifest`) owns the walk but never sees a `Dialect`
+/// (SPEC.md §16), so the caller passes this string in.
+#[must_use]
+pub fn rocks_version_dir(dialect: Dialect) -> &'static str {
     match dialect {
         Dialect::Lua51 | Dialect::LuaJit => "5.1",
         Dialect::Lua52 => "5.2",
