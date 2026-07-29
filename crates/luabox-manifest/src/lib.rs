@@ -15,14 +15,24 @@
 //!
 //! It also publishes that contract in machine-readable form: [`schema`] is a
 //! complete JSON Schema for `luabox.toml`, printed by `luabox schema` for
-//! editors, validators and LLM coding assistants. A parity suite pins it to
-//! the parser, so the document those tools read can never describe a manifest
-//! the toolchain would reject — or reject one it accepts.
+//! editors, validators and LLM coding assistants. Both it and the parser are
+//! rendered from one declarative key table (`contract`), so the document
+//! those tools read cannot describe a manifest the toolchain would reject —
+//! or reject one it accepts.
 //!
 //! Per SPEC.md §16, Distribution "never parses syntax": `edition`/`target`
 //! are validated as plain strings against a local allow-list rather than via
 //! `luabox-syntax`, and the layout walk classifies files by path alone.
 
+// The half of `contract` that carries prose, defaults and examples is read by
+// the schema renderer, which is test-only — the binary prints the generated
+// file with `include_str!` and needs no JSON writer. A non-test build
+// therefore sees those fields as unread; they are not.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "read by the test-only schema renderer")
+)]
+mod contract;
 pub mod error;
 pub mod layout;
 pub mod model;

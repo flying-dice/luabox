@@ -2,22 +2,55 @@
 //!
 //! The manifest parser is hand-rolled ([`crate::model::Manifest::parse`]) so
 //! it can collect *every* error with a span and a did-you-mean nudge — things
-//! a schema validator cannot give. That leaves the contract itself written
+//! a schema validator cannot give. That used to leave the contract written
 //! twice: once as Rust, once as the schema editors, validators and LLM coding
-//! assistants read (`luabox schema`).
+//! assistants read (`luabox schema`), with a parity suite standing between
+//! them.
 //!
-//! Two copies of a contract drift. The test suite at the bottom of this file
-//! is what makes that impossible: it asserts *structural parity* between the
-//! schema document and the parser's own key allow-lists, closed vocabularies
-//! and required keys, and then validates a corpus of real manifests — every
-//! `examples/*/luabox.toml` in the repo plus curated valid/invalid fixtures —
-//! through **both**, requiring the same verdict from each.
+//! Both are now rendered from one declarative table, [`crate::contract`]: the
+//! parser builds its key allow-lists from it, and [`render`] below builds the
+//! schema document from it plus a handful of hand-written fragments for the
+//! shapes a key table cannot express. Most of the old parity suite is gone,
+//! because what it asserted is now unrepresentable rather than merely untrue.
+//!
+//! # What still guards this file, and why
+//!
+//! * `schema_file_is_current` — the checked-in `schema/luabox.schema.json` is
+//!   a *generated* artifact, kept in the tree because its `$id` is a raw
+//!   GitHub URL an editor can point at, and because `luabox schema` prints it
+//!   with `include_str!` rather than rendering at runtime. This test is what
+//!   makes "generated" true; it rewrites the file under `LUABOX_BLESS=1`.
+//! * `the_schema_is_a_valid_draft_2020_12_document` — the renderer emits a
+//!   document, not necessarily a *schema*. Compiling it proves every `$ref`
+//!   resolves and the meta-schema is satisfied.
+//! * `the_schema_identifies_itself_by_its_canonical_url` and
+//!   `every_property_and_definition_is_described` — the envelope and the
+//!   hand-written `$defs`, which no table produces. The `$id` is the URL
+//!   editors point at, and a `$defs` member with no prose defeats the point
+//!   of publishing the document at all.
+//! * `the_required_keys_are_exactly_the_ones_the_parser_demands` and
+//!   `every_declared_value_type_is_the_one_the_parser_enforces` — the two
+//!   columns of the table the parser reads by hand rather than by loop.
+//!   Behavioural: they run `Manifest::parse` and check what it actually does.
+//! * The corpus — every `examples/*/luabox.toml` in the repository plus a
+//!   curated valid/invalid fixture set, run through **both** the schema
+//!   validator and the parser, requiring the same verdict. This is what
+//!   guards the hand-written fragments, above all the four-branch dependency
+//!   `oneOf`, which no table drives and which an adversarial subset sweep
+//!   showed has real teeth.
+//!
+//! What is *gone*: "the schema's properties equal the parser's key lists",
+//! "the schema's enums equal the Rust vocabularies", "the schema's `[lint]`
+//! tier properties equal `LintTier::NAMES`", "every closed table forbids
+//! additional properties". One table now produces both sides of each of
+//! those, so there is nothing left to compare.
 
 /// The complete JSON Schema (draft 2020-12) describing `luabox.toml`.
 ///
 /// Embedded verbatim from `schema/luabox.schema.json` so the file that ships
 /// in the repository — and the one the `$id` URL serves — is byte-for-byte
-/// what the binary prints.
+/// what the binary prints. That file is generated from [`crate::contract`];
+/// `schema_file_is_current` is what keeps it so.
 const SCHEMA: &str = include_str!("../schema/luabox.schema.json");
 
 /// The complete JSON Schema (draft 2020-12) for `luabox.toml`, as JSON text.
@@ -42,6 +75,450 @@ pub fn json_schema() -> &'static str {
     SCHEMA
 }
 
+/// Renders the schema document from [`crate::contract`].
+///
+/// Test-only on purpose: the binary prints the checked-in file with
+/// `include_str!`, so nothing at runtime needs a JSON writer, and
+/// `luabox-manifest` keeps `serde_json` as a dev-dependency. The generated
+/// file is the artifact; this module is how it is produced.
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "test-support code — a malformed fragment is a bug, not an input"
+)]
+mod render {
+    use serde::ser::{SerializeMap, SerializeSeq, Serializer};
+    use serde_json::Value;
+
+    use crate::contract::{self, Json, KeySpec, TableSpec, ValueTy, VocabularySpec};
+
+    // -----------------------------------------------------------------
+    // The envelope and the fragments no key table can express
+    // -----------------------------------------------------------------
+
+    const DRAFT: &str = "https://json-schema.org/draft/2020-12/schema";
+    /// The canonical raw URL this file is served from on `main` — the address
+    /// an editor's `$schema` line points at, so it is part of the contract.
+    const ID: &str = "https://raw.githubusercontent.com/flying-dice/luabox/main/crates/luabox-manifest/schema/luabox.schema.json";
+    const TITLE: &str = "luabox.toml";
+    const ROOT_DESCRIPTION: &str = "The complete configuration contract for a luabox project manifest (`luabox.toml`, SPEC.md §5). luabox is a purely static Lua toolchain: it typechecks, lints, formats, lowers and bundles Lua, consumes a `lua_modules/` rock tree materialised by luarocks, and never fetches packages or runs Lua.\n\nTOML→JSON mapping caveat: this schema describes the manifest's *data model*, not its file syntax. You write `luabox.toml` in TOML; editors, validators and other tooling map that TOML to JSON using the standard mapping (tables → objects, arrays → arrays, strings/integers/booleans → their JSON counterparts) and validate the result against this document. Every `[table]` heading below is therefore an object property, and every `key = value` a property of that object.\n\nThis document is emitted verbatim by `luabox schema`, and is generated from the same declarative key table the hand-written parser (`luabox-manifest`) reads: the accepted key sets, the closed value vocabularies, and the required keys are a single source, so they cannot drift apart from what the toolchain actually accepts.";
+
+    /// `[package] version` and `[package] min-luabox-version` share this
+    /// shape check. The parser's `looks_like_semver` is the authority; this
+    /// is its regex transcription, and the corpus is what holds the two
+    /// together.
+    const SEMVER_PATTERN: &str = r"^[0-9]+\.[0-9]+\.[0-9]+([-+][\s\S]*)?$";
+
+    /// One legal shape of a dependency inline table.
+    struct DependencyForm {
+        title: &'static str,
+        description: &'static str,
+        /// The keys this form requires.
+        needs: &'static [&'static str],
+        /// Key sets this form forbids. Each entry is a *combination*: the
+        /// form is rejected when every key in it is present, which is how
+        /// "at most one of `rev`, `tag`, `branch`" is said in JSON Schema.
+        forbids: &'static [&'static [&'static str]],
+    }
+
+    /// The four legal shapes of a dependency inline table.
+    ///
+    /// This is the one piece of the contract the key table cannot hold: it is
+    /// about *combinations* of keys, which is exactly what
+    /// `crate::parse::parse_dependency` hand-codes. The two are held together
+    /// by the corpus, not by construction — every fixture below runs through
+    /// both the parser and this schema and the verdicts must agree.
+    const DEPENDENCY_FORMS: &[DependencyForm] = &[
+        DependencyForm {
+            title: "path source",
+            description: "A sibling package read in place from the filesystem.",
+            needs: &["path"],
+            forbids: &[
+                &["git"],
+                &["url"],
+                &["sha256"],
+                &["rev"],
+                &["tag"],
+                &["branch"],
+            ],
+        },
+        DependencyForm {
+            title: "git source",
+            description: "A git repository, optionally pinned by exactly one of `rev`, `tag` or `branch`.",
+            needs: &["git"],
+            forbids: &[
+                &["path"],
+                &["url"],
+                &["sha256"],
+                &["rev", "tag"],
+                &["rev", "branch"],
+                &["tag", "branch"],
+            ],
+        },
+        DependencyForm {
+            title: "url source",
+            description: "An http(s) tarball, pinned by its SHA-256 digest.",
+            needs: &["url", "sha256"],
+            forbids: &[&["git"], &["path"], &["rev"], &["tag"], &["branch"]],
+        },
+        DependencyForm {
+            title: "version only",
+            description: "No source at all — the bare version-requirement string spelled longhand.",
+            needs: &["version"],
+            forbids: &[
+                &["git"],
+                &["path"],
+                &["url"],
+                &["sha256"],
+                &["rev"],
+                &["tag"],
+                &["branch"],
+            ],
+        },
+    ];
+
+    // -----------------------------------------------------------------
+    // An ordered JSON tree
+    // -----------------------------------------------------------------
+
+    /// A JSON value whose object keys keep the order they were written in.
+    ///
+    /// `serde_json::Value` sorts them, which would scramble a document meant
+    /// to be read by humans (`type`, `title`, `description`, then the
+    /// constraints). Emission order is the only reason this type exists.
+    /// One ordered object member: its key, and its value.
+    type Entry = (String, J);
+
+    enum J {
+        Leaf(Value),
+        Arr(Vec<J>),
+        Obj(Vec<Entry>),
+    }
+
+    impl serde::Serialize for J {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            match self {
+                J::Leaf(value) => value.serialize(serializer),
+                J::Arr(items) => {
+                    let mut seq = serializer.serialize_seq(Some(items.len()))?;
+                    for item in items {
+                        seq.serialize_element(item)?;
+                    }
+                    seq.end()
+                }
+                J::Obj(entries) => {
+                    let mut map = serializer.serialize_map(Some(entries.len()))?;
+                    for (key, value) in entries {
+                        map.serialize_entry(key, value)?;
+                    }
+                    map.end()
+                }
+            }
+        }
+    }
+
+    fn text(value: &str) -> J {
+        J::Leaf(Value::String(value.to_owned()))
+    }
+
+    fn kv(key: &str, value: J) -> Entry {
+        (key.to_owned(), value)
+    }
+
+    fn obj<const N: usize>(entries: [(&str, J); N]) -> J {
+        J::Obj(entries.into_iter().map(|(k, v)| kv(k, v)).collect())
+    }
+
+    fn strings(values: &[&str]) -> J {
+        J::Arr(values.iter().map(|value| text(value)).collect())
+    }
+
+    fn reference(def: &str) -> J {
+        obj([("$ref", text(&format!("#/$defs/{def}")))])
+    }
+
+    fn literal(value: Json) -> J {
+        match value {
+            Json::Str(value) => text(value),
+            Json::Bool(value) => J::Leaf(Value::Bool(value)),
+            Json::Array(items) => J::Arr(items.iter().copied().map(literal).collect()),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Rendering the table
+    // -----------------------------------------------------------------
+
+    /// The `type`/`$ref` head a shape contributes, and the constraints it
+    /// contributes *after* `description` — the order this document reads in.
+    fn shape(ty: &ValueTy) -> (Vec<Entry>, Vec<Entry>) {
+        match *ty {
+            ValueTy::Str { pattern } => (
+                vec![kv("type", text("string"))],
+                pattern
+                    .map(|p| kv("pattern", text(p)))
+                    .into_iter()
+                    .collect(),
+            ),
+            ValueTy::Bool => (vec![kv("type", text("boolean"))], Vec::new()),
+            ValueTy::ArrayOf {
+                item,
+                item_description,
+            } => {
+                let (mut entries, tail) = shape(item);
+                entries.extend(tail);
+                if let Some(description) = item_description {
+                    entries.push(kv("description", text(description)));
+                }
+                (
+                    vec![kv("type", text("array"))],
+                    vec![kv("items", J::Obj(entries))],
+                )
+            }
+            ValueTy::Ref(def) => (
+                vec![kv("$ref", text(&format!("#/$defs/{def}")))],
+                Vec::new(),
+            ),
+            // A fragment contributes its members where a constraint would go
+            // — after `description`. `serde_json::Map` sorts them, which is
+            // why a fragment is only ever the one small object the key table
+            // cannot hold, never a shape whose reading order matters.
+            ValueTy::Fragment(raw) => {
+                let parsed: serde_json::Map<String, Value> =
+                    serde_json::from_str(raw).expect("a `ValueTy::Fragment` is a JSON object");
+                (
+                    Vec::new(),
+                    parsed.into_iter().map(|(k, v)| (k, J::Leaf(v))).collect(),
+                )
+            }
+        }
+    }
+
+    fn property(key: &KeySpec) -> J {
+        let (mut entries, tail) = shape(&key.ty);
+        if let Some(title) = key.title {
+            entries.push(kv("title", text(title)));
+        }
+        entries.push(kv("description", text(key.description)));
+        entries.extend(tail);
+        if let Some(default) = key.default {
+            entries.push(kv("default", literal(default)));
+        }
+        if !key.examples.is_empty() {
+            entries.push(kv(
+                "examples",
+                J::Arr(key.examples.iter().copied().map(literal).collect()),
+            ));
+        }
+        J::Obj(entries)
+    }
+
+    fn properties(keys: &[KeySpec]) -> J {
+        J::Obj(keys.iter().map(|key| kv(key.name, property(key))).collect())
+    }
+
+    /// The `required` array for `keys`, or `None` when nothing is required —
+    /// an empty `required` is legal but noise.
+    fn required(keys: &[KeySpec]) -> Option<J> {
+        let names: Vec<&str> = keys
+            .iter()
+            .filter(|key| key.required)
+            .map(|key| key.name)
+            .collect();
+        (!names.is_empty()).then(|| strings(&names))
+    }
+
+    /// One `$defs` table: its prose, what it says about keys it does not
+    /// name, its keys, and any hand-written tail (the dependency `oneOf`).
+    fn table(spec: &TableSpec, additional: J, tail: Vec<Entry>) -> J {
+        let mut entries = vec![
+            kv("type", text("object")),
+            kv("title", text(spec.title)),
+            kv("description", text(spec.description)),
+            kv("additionalProperties", additional),
+        ];
+        entries.extend(required(spec.keys).map(|value| kv("required", value)));
+        entries.push(kv("properties", properties(spec.keys)));
+        entries.extend(tail);
+        J::Obj(entries)
+    }
+
+    fn vocabulary(spec: &VocabularySpec) -> J {
+        obj([
+            ("type", text("string")),
+            ("title", text(spec.title)),
+            ("description", text(spec.description)),
+            ("enum", strings(spec.names)),
+        ])
+    }
+
+    fn closed() -> J {
+        J::Leaf(Value::Bool(false))
+    }
+
+    // -----------------------------------------------------------------
+    // The hand-written `$defs`
+    // -----------------------------------------------------------------
+
+    fn semver_def() -> J {
+        obj([
+            ("type", text("string")),
+            ("title", text("Semantic version")),
+            (
+                "description",
+                text(
+                    "A semver-shaped version: `X.Y.Z` where each component is a run of ASCII digits, with an optional `-pre-release` and/or `+build` suffix. luabox shape-checks versions rather than ordering them (it resolves nothing), so anything after the first `-` or `+` is unconstrained.",
+                ),
+            ),
+            ("pattern", text(SEMVER_PATTERN)),
+            (
+                "examples",
+                strings(&["1.2.0", "0.1.0", "1.2.3-beta.1+build.5"]),
+            ),
+        ])
+    }
+
+    fn dependency_map_def() -> J {
+        obj([
+            ("type", text("object")),
+            ("title", text("Dependency table")),
+            (
+                "description",
+                text(
+                    "A table of dependencies keyed by package name. Each value is either a bare version-requirement string or an inline table naming exactly one source.",
+                ),
+            ),
+            ("additionalProperties", reference("dependency")),
+        ])
+    }
+
+    fn dependency_def() -> J {
+        obj([
+            ("title", text("Dependency")),
+            (
+                "description",
+                text(
+                    "One `[dependencies]` / `[dev-dependencies]` entry (SPEC.md §6). Either a bare version-requirement string (`pkg = \"1.2.3\"`) or an inline table naming exactly one source — `path`, `git`, or `url` — or, equivalently to the bare string, only a `version`.",
+                ),
+            ),
+            (
+                "oneOf",
+                J::Arr(vec![
+                    obj([
+                        ("type", text("string")),
+                        ("title", text("Version requirement")),
+                        (
+                            "description",
+                            text(
+                                "A bare version requirement, e.g. `penlight = \"1.13\"`. Recorded verbatim; nothing resolves or compares it in v1.",
+                            ),
+                        ),
+                        ("examples", strings(&["1.0", "1.2.3"])),
+                    ]),
+                    reference("dependencyTable"),
+                ]),
+            ),
+        ])
+    }
+
+    /// The four-branch `oneOf` that makes the dependency source forms
+    /// mutually exclusive, from [`DEPENDENCY_FORMS`].
+    fn dependency_forms() -> J {
+        J::Arr(
+            DEPENDENCY_FORMS
+                .iter()
+                .map(|form| {
+                    obj([
+                        ("title", text(form.title)),
+                        ("description", text(form.description)),
+                        ("required", strings(form.needs)),
+                        (
+                            "not",
+                            obj([(
+                                "anyOf",
+                                J::Arr(
+                                    form.forbids
+                                        .iter()
+                                        .map(|keys| obj([("required", strings(keys))]))
+                                        .collect(),
+                                ),
+                            )]),
+                        ),
+                    ])
+                })
+                .collect(),
+        )
+    }
+
+    /// `[lint]`'s open half: any key that is not one the table names is a
+    /// lint rule id, whose *value* is still closed to a level.
+    fn lint_rule_levels() -> J {
+        obj([
+            ("$ref", text("#/$defs/lintLevel")),
+            (
+                "description",
+                text(
+                    "The level for one lint rule id, e.g. `unused-local = \"allow\"`. Ids live in `luabox lint`; run `luabox explain LB1004` for what happens to an id it does not know.",
+                ),
+            ),
+        ])
+    }
+
+    // -----------------------------------------------------------------
+    // The document
+    // -----------------------------------------------------------------
+
+    fn defs() -> J {
+        let mut entries: Vec<Entry> = contract::VOCABULARIES
+            .iter()
+            .map(|spec| kv(spec.def, vocabulary(spec)))
+            .collect();
+        entries.push(kv("semver", semver_def()));
+        for spec in [&contract::PACKAGE, &contract::BUILD, &contract::TYPES] {
+            entries.push(kv(spec.def, table(spec, closed(), Vec::new())));
+        }
+        entries.push(kv("dependencyMap", dependency_map_def()));
+        entries.push(kv("dependency", dependency_def()));
+        entries.push(kv(
+            contract::DEPENDENCY.def,
+            table(
+                &contract::DEPENDENCY,
+                closed(),
+                vec![kv("oneOf", dependency_forms())],
+            ),
+        ));
+        entries.push(kv(
+            contract::LINT.def,
+            table(&contract::LINT, lint_rule_levels(), Vec::new()),
+        ));
+        J::Obj(entries)
+    }
+
+    fn document() -> J {
+        let mut entries = vec![
+            kv("$schema", text(DRAFT)),
+            kv("$id", text(ID)),
+            kv("title", text(TITLE)),
+            kv("description", text(ROOT_DESCRIPTION)),
+            kv("type", text("object")),
+            kv("additionalProperties", closed()),
+        ];
+        entries.extend(required(contract::ROOT).map(|value| kv("required", value)));
+        entries.push(kv("properties", properties(contract::ROOT)));
+        entries.push(kv("$defs", defs()));
+        J::Obj(entries)
+    }
+
+    /// The schema document as the JSON text `schema/luabox.schema.json` holds
+    /// — pretty-printed, ordered, newline-terminated.
+    pub(super) fn schema_json() -> String {
+        let mut text = serde_json::to_string_pretty(&document())
+            .expect("the rendered document serializes as JSON");
+        text.push('\n');
+        text
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -55,9 +532,9 @@ mod tests {
 
     use serde_json::Value;
 
-    use super::json_schema;
-    use crate::model::{BundleMode, DialectId, LintLevel, LintTier, Manifest};
-    use crate::parse::{BUILD_KEYS, DEPENDENCY_KEYS, PACKAGE_KEYS, TOP_LEVEL_KEYS, TYPES_KEYS};
+    use super::{json_schema, render};
+    use crate::contract::{self, KeySpec, ValueTy};
+    use crate::model::Manifest;
 
     // -----------------------------------------------------------------
     // helpers
@@ -67,37 +544,10 @@ mod tests {
         serde_json::from_str(json_schema()).expect("the embedded schema is valid JSON")
     }
 
-    /// The schema at `pointer`, or a panic naming the pointer that is missing
-    /// — a parity failure must say *where*, not just that something differs.
+    /// The schema at `pointer`, or a panic naming the pointer that is missing.
     fn at<'a>(root: &'a Value, pointer: &str) -> &'a Value {
         root.pointer(pointer)
             .unwrap_or_else(|| panic!("schema has no `{pointer}`"))
-    }
-
-    /// The property names declared at `pointer` (which must be a `properties`
-    /// object), as a set.
-    fn property_names(root: &Value, pointer: &str) -> BTreeSet<String> {
-        at(root, pointer)
-            .as_object()
-            .unwrap_or_else(|| panic!("`{pointer}` is not an object"))
-            .keys()
-            .cloned()
-            .collect()
-    }
-
-    /// The `enum` spellings declared at `pointer`, in schema order.
-    fn enum_values(root: &Value, pointer: &str) -> Vec<String> {
-        at(root, pointer)
-            .as_array()
-            .unwrap_or_else(|| panic!("`{pointer}` is not an array"))
-            .iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .unwrap_or_else(|| panic!("`{pointer}` entries must be strings"))
-                    .to_owned()
-            })
-            .collect()
     }
 
     fn set_of(names: &[&str]) -> BTreeSet<String> {
@@ -124,8 +574,76 @@ mod tests {
             .collect()
     }
 
+    /// Asserts `Manifest::parse` rejects `source` with a message containing
+    /// `needle`.
+    fn assert_reports(source: &str, needle: &str) {
+        let errors = Manifest::parse(source)
+            .err()
+            .unwrap_or_else(|| panic!("expected {source:?} to be rejected"));
+        assert!(
+            errors.iter().any(|error| error.message.contains(needle)),
+            "expected an error containing {needle:?} for {source:?}, got {errors:?}"
+        );
+    }
+
     // -----------------------------------------------------------------
-    // the document itself
+    // the checked-in file is what the contract renders
+    // -----------------------------------------------------------------
+
+    /// The path of the generated artifact, relative to nothing — the test
+    /// rewrites this exact file when blessing.
+    fn schema_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("schema/luabox.schema.json")
+    }
+
+    /// `schema/luabox.schema.json` is generated from [`crate::contract`]. It
+    /// stays checked in because its `$id` is a raw GitHub URL editors point
+    /// at, and because `luabox schema` prints it with `include_str!` rather
+    /// than rendering at runtime — so the file, not the renderer, is what
+    /// ships. This test is the whole reason "generated" is a true statement.
+    ///
+    /// Regenerate with:
+    /// `LUABOX_BLESS=1 cargo test -p luabox-manifest schema_file_is_current`
+    #[test]
+    fn schema_file_is_current() {
+        let rendered = render::schema_json();
+        if std::env::var_os("LUABOX_BLESS").is_some() {
+            std::fs::write(schema_path(), &rendered)
+                .unwrap_or_else(|error| panic!("rewriting {}: {error}", schema_path().display()));
+            return;
+        }
+        let checked_in = json_schema();
+        assert!(
+            rendered == checked_in,
+            "crates/luabox-manifest/schema/luabox.schema.json is out of date — it is generated \
+             from `crate::contract`, and the contract has changed.\n{}\n\nRegenerate it with:\n    \
+             LUABOX_BLESS=1 cargo test -p luabox-manifest schema_file_is_current",
+            first_difference(checked_in, &rendered)
+        );
+    }
+
+    /// The first line where two documents differ, as a short report — a
+    /// 20 KiB `assert_eq!` diff tells a reader nothing.
+    fn first_difference(checked_in: &str, rendered: &str) -> String {
+        for (number, (old, new)) in checked_in.lines().zip(rendered.lines()).enumerate() {
+            if old != new {
+                return format!(
+                    "first difference at line {}:\n  checked in: {old}\n  rendered:   {new}",
+                    number + 1
+                );
+            }
+        }
+        format!(
+            "the files agree for {} lines; the checked-in file has {} of them and the rendered \
+             document has {}",
+            checked_in.lines().count().min(rendered.lines().count()),
+            checked_in.lines().count(),
+            rendered.lines().count()
+        )
+    }
+
+    // -----------------------------------------------------------------
+    // the document is a schema, not merely a document
     // -----------------------------------------------------------------
 
     #[test]
@@ -146,6 +664,10 @@ mod tests {
         let _validator = validator();
     }
 
+    /// The document's envelope — the one part of the schema no key table
+    /// produces, and the part outside tooling depends on most: the `$id` is
+    /// the URL an editor's `$schema` line points at, so changing it silently
+    /// unpoints every editor already configured.
     #[test]
     fn the_schema_identifies_itself_by_its_canonical_url() {
         let schema = schema();
@@ -161,9 +683,16 @@ mod tests {
         assert!(description.contains("TOML"), "{description}");
     }
 
-    /// Every entry of every `properties` object, and every `$defs` entry,
-    /// carries a non-empty `description` — the schema has to be readable on
-    /// its own, because that is the whole point of publishing it.
+    /// Every `properties` entry and every `$defs` member carries a non-empty
+    /// `description`.
+    ///
+    /// For a key the table declares this is true by construction —
+    /// `KeySpec::description` is a `&str`, not an `Option`. What this walk
+    /// still earns its keep on is the hand-written half: the `$defs` the
+    /// renderer writes out longhand (`semver`, `dependencyMap`,
+    /// `dependency`), their nested `oneOf` branches, and the `[lint]`
+    /// rule-level mapping. The schema has to be readable on its own, because
+    /// that is the whole point of publishing it.
     #[test]
     fn every_property_and_definition_is_described() {
         fn walk(node: &Value, path: &str, missing: &mut Vec<String>) {
@@ -203,118 +732,16 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // structural parity with the parser
+    // the two columns the parser reads by hand
     // -----------------------------------------------------------------
-
-    #[test]
-    fn the_top_level_tables_are_exactly_the_ones_the_parser_accepts() {
-        assert_eq!(
-            property_names(&schema(), "/properties"),
-            set_of(TOP_LEVEL_KEYS)
-        );
-    }
-
-    #[test]
-    fn the_package_build_and_types_keys_are_exactly_the_ones_the_parser_accepts() {
-        let schema = schema();
-        assert_eq!(
-            property_names(&schema, "/$defs/package/properties"),
-            set_of(PACKAGE_KEYS),
-            "[package]"
-        );
-        assert_eq!(
-            property_names(&schema, "/$defs/build/properties"),
-            set_of(BUILD_KEYS),
-            "[build]"
-        );
-        assert_eq!(
-            property_names(&schema, "/$defs/types/properties"),
-            set_of(TYPES_KEYS),
-            "[types]"
-        );
-    }
-
-    #[test]
-    fn the_dependency_table_keys_are_exactly_the_ones_the_parser_accepts() {
-        assert_eq!(
-            property_names(&schema(), "/$defs/dependencyTable/properties"),
-            set_of(DEPENDENCY_KEYS)
-        );
-    }
-
-    /// Every table the parser closes with an unknown-key error is closed in
-    /// the schema too — otherwise the schema would bless a manifest the
-    /// toolchain rejects.
-    #[test]
-    fn every_closed_table_rejects_additional_properties() {
-        let schema = schema();
-        for pointer in [
-            "/additionalProperties",
-            "/$defs/package/additionalProperties",
-            "/$defs/build/additionalProperties",
-            "/$defs/types/additionalProperties",
-            "/$defs/dependencyTable/additionalProperties",
-        ] {
-            assert_eq!(at(&schema, pointer), &Value::Bool(false), "{pointer}");
-        }
-    }
-
-    /// Each closed vocabulary appears once in the schema, as a `$defs` enum,
-    /// and lists exactly the Rust enum's variants in declaration order. The
-    /// second half — that every field of that type `$ref`s the definition —
-    /// is what stops a new variant being added in one place only.
-    #[test]
-    fn every_closed_vocabulary_matches_its_rust_enum() {
-        let schema = schema();
-        assert_eq!(
-            enum_values(&schema, "/$defs/dialect/enum"),
-            DialectId::NAMES,
-            "DialectId"
-        );
-        assert_eq!(
-            enum_values(&schema, "/$defs/bundleMode/enum"),
-            BundleMode::NAMES,
-            "BundleMode"
-        );
-        assert_eq!(
-            enum_values(&schema, "/$defs/lintLevel/enum"),
-            LintLevel::NAMES,
-            "LintLevel"
-        );
-
-        for pointer in [
-            "/$defs/package/properties/edition/$ref",
-            "/$defs/package/properties/lua-versions/items/$ref",
-            "/$defs/build/properties/target/$ref",
-        ] {
-            assert_eq!(at(&schema, pointer), "#/$defs/dialect", "{pointer}");
-        }
-        assert_eq!(
-            at(&schema, "/$defs/build/properties/mode/$ref"),
-            "#/$defs/bundleMode"
-        );
-        assert_eq!(
-            at(&schema, "/$defs/lint/additionalProperties/$ref"),
-            "#/$defs/lintLevel",
-            "an open-ended `[lint]` rule key still takes a level, not any string"
-        );
-    }
-
-    /// `[lint]` is the one half-open table: the tier names are closed and
-    /// modelled as fixed properties, everything else is a rule id constrained
-    /// by `additionalProperties`.
-    #[test]
-    fn the_lint_tier_properties_are_exactly_the_rust_tier_names() {
-        let mut tiers = property_names(&schema(), "/$defs/lint/properties");
-        assert!(
-            tiers.remove("globals"),
-            "`[lint] globals` is a string array, not a level — it must be a fixed property"
-        );
-        assert_eq!(tiers, set_of(LintTier::NAMES));
-    }
 
     /// The schema's `required` arrays, and the parser's behaviour, agree on
     /// exactly which keys a manifest cannot omit.
+    ///
+    /// The `required` flag in [`crate::contract`] renders the schema side by
+    /// construction; nothing renders the parser side, which asks for `edition`
+    /// through a `required: true` argument written out at the call site. This
+    /// is what holds those together.
     #[test]
     fn the_required_keys_are_exactly_the_ones_the_parser_demands() {
         let schema = schema();
@@ -344,11 +771,93 @@ mod tests {
             "a `[package]` with no `edition` must be rejected"
         );
         // Every other top-level table is optional in both.
-        for table in TOP_LEVEL_KEYS.iter().filter(|key| **key != "package") {
+        for key in contract::ROOT.iter().filter(|key| key.name != "package") {
             assert!(
-                !required("/required").contains(*table),
-                "`{table}` is optional to the parser but required by the schema"
+                !required("/required").contains(key.name),
+                "`{}` is optional to the parser but required by the schema",
+                key.name
             );
+        }
+    }
+
+    /// A key's declared [`ValueTy`] is the one `Manifest::parse` enforces.
+    ///
+    /// The renderer turns `ty` into the schema's `type`/`$ref`; the parser
+    /// picks its reader (`get_string`, `get_bool`, `get_string_array`) by
+    /// hand at each call site. Feeding every key a value of a shape no key
+    /// accepts, and requiring the error the declared type predicts, is what
+    /// stops `ty` from being decoration.
+    ///
+    /// `[lint]` is excluded: it is half-open, its level keys are read by a
+    /// bespoke loop with its own message ("must be a level string"), and the
+    /// invalid corpus covers that shape through both the parser and the
+    /// schema.
+    #[test]
+    fn every_declared_value_type_is_the_one_the_parser_enforces() {
+        /// A TOML value no manifest key accepts, and the phrasing a key of
+        /// the given shape must answer it with.
+        fn probe(ty: &ValueTy) -> (&'static str, &'static str) {
+            match *ty {
+                // Enum-valued and pattern-constrained keys are read as a
+                // string first, so an integer is the universal wrong shape.
+                ValueTy::Str { .. } | ValueTy::Ref(_) | ValueTy::Fragment(_) => {
+                    ("1", "must be a string")
+                }
+                ValueTy::Bool => ("\"yes\"", "must be a boolean"),
+                ValueTy::ArrayOf { .. } => ("\"one\"", "must be an array of strings"),
+            }
+        }
+
+        for key in contract::PACKAGE.keys {
+            let (bad, expected) = probe(&key.ty);
+            // `edition` is required, so it supplies its own bad value; every
+            // other key needs a valid one alongside.
+            let source = if key.name == "edition" {
+                format!("[package]\nedition = {bad}\n")
+            } else {
+                format!("[package]\nedition = \"5.4\"\n{} = {bad}\n", key.name)
+            };
+            assert_reports(&source, &format!("`package.{}` {expected}", key.name));
+        }
+
+        for spec in [&contract::BUILD, &contract::TYPES] {
+            for key in spec.keys {
+                let (bad, expected) = probe(&key.ty);
+                let source = format!(
+                    "[package]\nedition = \"5.4\"\n\n[{}]\n{} = {bad}\n",
+                    spec.def, key.name
+                );
+                assert_reports(&source, &format!("`{}.{}` {expected}", spec.def, key.name));
+            }
+        }
+
+        for key in contract::DEPENDENCY.keys {
+            let (bad, expected) = probe(&key.ty);
+            let source = format!(
+                "[package]\nedition = \"5.4\"\n\n[dependencies]\nd = {{ {} = {bad} }}\n",
+                key.name
+            );
+            assert_reports(
+                &source,
+                &format!("`dependencies.d.{}` {expected}", key.name),
+            );
+        }
+    }
+
+    /// Every top-level key names a *table*, and the parser says so when it is
+    /// handed a scalar — the shape check the root's [`ValueTy::Ref`] entries
+    /// stand for.
+    #[test]
+    fn every_top_level_key_must_be_a_table() {
+        for key in contract::ROOT {
+            // The scalar has to precede `[package]` to stay a top-level key;
+            // `package` itself cannot be written twice.
+            let source = if key.name == "package" {
+                "package = 5\n".to_owned()
+            } else {
+                format!("{} = 5\n[package]\nedition = \"5.4\"\n", key.name)
+            };
+            assert_reports(&source, &format!("`[{}]` must be a table", key.name));
         }
     }
 
@@ -655,6 +1164,25 @@ mod tests {
             assert_eq!(labels.len(), corpus.len(), "duplicate fixture label");
             let bodies: BTreeSet<&str> = corpus.iter().map(|(_, body)| *body).collect();
             assert_eq!(bodies.len(), corpus.len(), "duplicate fixture body");
+        }
+    }
+
+    /// Every key in the contract is spelled once per table. A duplicate would
+    /// render a duplicate schema property (silently collapsing) and give the
+    /// parser two allow-list entries for one key.
+    #[test]
+    fn no_table_names_a_key_twice() {
+        let tables: [(&str, &[KeySpec]); 6] = [
+            ("top level", contract::ROOT),
+            ("[package]", contract::PACKAGE.keys),
+            ("[build]", contract::BUILD.keys),
+            ("[types]", contract::TYPES.keys),
+            ("dependency table", contract::DEPENDENCY.keys),
+            ("[lint]", contract::LINT.keys),
+        ];
+        for (what, keys) in tables {
+            let names: BTreeSet<&str> = keys.iter().map(|key| key.name).collect();
+            assert_eq!(names.len(), keys.len(), "{what} names a key twice");
         }
     }
 }
