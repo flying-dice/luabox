@@ -34,6 +34,8 @@ use luabox_syntax::lua;
 use crate::check_cmd;
 use model::DocModel;
 
+use crate::emit::errln;
+
 /// Execute `luabox doc` from `cwd`.
 pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
     let project = check_cmd::discover(cwd)?;
@@ -83,7 +85,7 @@ pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
         if lua::parse(&def.text, project.dialect).errors().is_empty() {
             defs.push(def.clone());
         } else {
-            eprintln!(
+            errln!(
                 "doc: skipping dependency def `{}` (does not parse)",
                 def.file
             );
@@ -109,7 +111,7 @@ pub fn run(cwd: &Path, open: bool) -> anyhow::Result<()> {
         let path = out_dir.join(name);
         fs::write(&path, html).with_context(|| format!("cannot write `{}`", path.display()))?;
     }
-    eprintln!(
+    errln!(
         "doc: generated {} pages into `{}`",
         pages.len(),
         layout::display_rel(&out_dir, &project.root)
@@ -209,7 +211,7 @@ fn open_in_browser(index: &Path) {
     let result = std::process::Command::new("xdg-open").arg(index).spawn();
 
     if let Err(error) = result {
-        eprintln!(
+        errln!(
             "doc: generated site, but could not open `{}`: {error}",
             index.display()
         );

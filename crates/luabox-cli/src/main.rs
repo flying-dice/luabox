@@ -7,6 +7,7 @@ mod build_cmd;
 mod check_cmd;
 mod dialect;
 mod doc_cmd;
+mod emit;
 mod fmt_cmd;
 mod lint_cmd;
 mod lsp_cmd;
@@ -26,6 +27,8 @@ use anyhow::bail;
 use clap::{Parser, Subcommand, ValueEnum};
 use luabox_diag::Format;
 use luabox_manifest::model::BundleMode;
+
+use crate::emit::{err, outln};
 
 /// `--format`: the closed set of diagnostic renderings (SPEC.md §14).
 ///
@@ -233,7 +236,7 @@ fn main() -> ExitCode {
     match run(cli.command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprint!("{}", render_error(&error));
+            err!("{}", render_error(&error));
             ExitCode::FAILURE
         }
     }
@@ -333,7 +336,7 @@ fn run(command: Command) -> anyhow::Result<()> {
             })?;
             match luabox_diag::explain(&parsed) {
                 Some(entry) => {
-                    println!("{}: {}\n\n{}", entry.code, entry.title, entry.explain);
+                    outln!("{}: {}\n\n{}", entry.code, entry.title, entry.explain);
                     Ok(())
                 }
                 None => bail!("no such diagnostic code `{parsed}`; codes look like LB0300"),
@@ -344,7 +347,7 @@ fn run(command: Command) -> anyhow::Result<()> {
         // point — `luabox schema > luabox.schema.json` has to work anywhere,
         // including in a directory that has no manifest to describe yet.
         Command::Schema => {
-            println!("{}", luabox_manifest::schema::json_schema().trim_end());
+            outln!("{}", luabox_manifest::schema::json_schema().trim_end());
             Ok(())
         }
         Command::Unmap { bundle, traceback } => {

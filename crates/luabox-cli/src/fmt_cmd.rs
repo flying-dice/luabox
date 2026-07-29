@@ -21,6 +21,8 @@ use luabox_syntax::{Dialect, lua};
 
 use luabox_manifest::layout::{self, DefFiles, display_rel};
 
+use crate::emit::outln;
+
 /// Execute `luabox fmt` from `cwd`. In `--check` mode nothing is written;
 /// the command fails listing every file that would change. With `watch`,
 /// it reruns on every debounced, filtered filesystem change under the
@@ -66,11 +68,11 @@ fn run_once(cwd: &Path, check: bool) -> anyhow::Result<()> {
 
     if check {
         if changed.is_empty() {
-            println!("checked {} files; all formatted", files.len());
+            outln!("checked {} files; all formatted", files.len());
             return Ok(());
         }
         for file in &changed {
-            println!("would reformat {file}");
+            outln!("would reformat {file}");
         }
         bail!(
             "{} of {} files would be reformatted; run `luabox fmt`",
@@ -78,7 +80,7 @@ fn run_once(cwd: &Path, check: bool) -> anyhow::Result<()> {
             files.len()
         );
     }
-    println!(
+    outln!(
         "formatted {} files ({} changed)",
         files.len(),
         changed.len()

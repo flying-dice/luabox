@@ -43,6 +43,8 @@ use rayon::prelude::*;
 
 use layout::display_rel;
 
+use crate::emit::errln;
+
 /// What a manifest-less directory is checked as: Lua 5.4, warn mode — least
 /// surprise. Held in both vocabularies because a manifest-less project still
 /// needs a `[build]` config (`Build::defaults`) to build with.
@@ -350,9 +352,10 @@ fn finish(
     file_count: usize,
 ) -> anyhow::Result<()> {
     let counts = crate::project::render_diagnostics(diags, format, root);
-    eprintln!(
+    errln!(
         "check: {} errors, {} warnings in {file_count} files",
-        counts.errors, counts.warnings
+        counts.errors,
+        counts.warnings
     );
     if counts.errors > 0 {
         bail!("check failed with {} error(s)", counts.errors);

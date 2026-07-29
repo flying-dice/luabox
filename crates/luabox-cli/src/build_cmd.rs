@@ -49,6 +49,8 @@ use rayon::prelude::*;
 use crate::check_cmd;
 use crate::modes;
 
+use crate::emit::{out, outln};
+
 /// CLI overrides for `luabox build`; each field, when set, wins over the
 /// corresponding `[build]` config value.
 pub struct BuildOptions {
@@ -286,7 +288,7 @@ fn emit_tree(
         bail!("build failed with {errors} error(s)");
     }
     let out_display = layout::display_rel(out_dir, &project.root);
-    println!(
+    outln!(
         "build: {} files emitted to {} ({} -> {})",
         lua_files.len(),
         out_display,
@@ -450,7 +452,7 @@ fn emit_plain(
             fs::write(&map_path, map)
                 .with_context(|| format!("cannot write `{}`", map_path.display()))?;
         }
-        println!(
+        outln!(
             "build: {} module(s) inlined into {} ({} -> {}){}{}",
             bundle.modules,
             layout::display_rel(&out_path, root),
@@ -485,7 +487,7 @@ fn emit_love(ctx: &EmitCtx<'_>) -> anyhow::Result<()> {
         ctx.edition,
         ctx.target,
     )?;
-    println!(
+    outln!(
         "build: {} module(s) inlined into {} ({} -> {}){}, packaged as a LÖVE .love archive",
         bundle.modules,
         layout::display_rel(&love_path, ctx.root),
@@ -518,7 +520,7 @@ fn emit_nvim(ctx: &EmitCtx<'_>) -> anyhow::Result<()> {
         fs::write(&map_path, map)
             .with_context(|| format!("cannot write `{}`", map_path.display()))?;
     }
-    println!(
+    outln!(
         "build: {} module(s) inlined into {} ({} -> {}){}{}, written as a Neovim plugin layout",
         bundle.modules,
         layout::display_rel(&plugin_root, ctx.root),
@@ -605,9 +607,9 @@ pub fn unmap(cwd: &Path, bundle: &Path, traceback: Option<&str>) -> anyhow::Resu
         names.push(base.to_string_lossy().into_owned());
     }
 
-    print!("{}", unmap_traceback(&map, &names, &text));
+    out!("{}", unmap_traceback(&map, &names, &text));
     if !text.ends_with('\n') {
-        println!();
+        outln!();
     }
     Ok(())
 }

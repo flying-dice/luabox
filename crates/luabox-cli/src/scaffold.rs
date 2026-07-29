@@ -6,6 +6,8 @@ use std::path::Path;
 use anyhow::{Context, bail};
 use luabox_syntax::Dialect;
 
+use crate::emit::outln;
+
 /// Scaffold a project in `dir` (which must exist). `lib` selects a library
 /// layout; the default is a binary/script project.
 pub fn init(dir: &Path, lib: bool, edition: &str) -> anyhow::Result<()> {
@@ -45,7 +47,7 @@ pub fn init(dir: &Path, lib: bool, edition: &str) -> anyhow::Result<()> {
         fs::write(gitignore, "dist/\n")?;
     }
 
-    println!(
+    outln!(
         "Created {} project `{name}` (edition {})",
         if lib { "library" } else { "binary" },
         dialect.manifest_id()

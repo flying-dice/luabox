@@ -63,6 +63,7 @@ jobs:
       - run: >
           cargo llvm-cov --no-report
           -p luabox-cli --bins --test cross_package_defs --test watch
+          --test broken_pipe
       - run: cargo llvm-cov report --fail-under-lines 95
       - run: cargo llvm-cov report --lcov --output-path lcov-unit.info
         if: always()

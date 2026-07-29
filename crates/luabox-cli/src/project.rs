@@ -11,6 +11,8 @@ use std::path::Path;
 
 use luabox_diag::{Diagnostic, Format, Severity, render};
 
+use crate::emit::outln;
+
 /// Error/warning tallies from a diagnostic set, returned by
 /// [`render_diagnostics`] so each command can shape its own summary line and
 /// exit semantics — those genuinely differ (`check`/`lint` summarize to
@@ -36,7 +38,7 @@ pub(crate) fn render_diagnostics(diags: &[Diagnostic], format: Format, root: &Pa
     let lookup = move |file: &str| fs::read_to_string(root.join(file)).ok();
     let output = render(diags, format, &lookup);
     if !output.is_empty() {
-        println!("{output}");
+        outln!("{output}");
     }
     DiagCounts {
         errors: diags
