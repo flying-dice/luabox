@@ -28,12 +28,14 @@ name: release
 # token-raised events), so the whole pipeline is chained by `needs:` instead.
 #
 # Installing from a draft needs credentials that ordinary users do not have.
-# `scripts/install.{sh,ps1}` grew exactly one extra path for this: with
-# GITHUB_TOKEN set AND a pinned LUABOX_VERSION, they resolve the release
-# through the authenticated GitHub API (drafts only appear in the *list*
-# endpoint — `releases/tags/<tag>` 404s for a draft) and pull each asset by id.
-# With no token the scripts behave exactly as they always have, which is what
-# `post-publish-smoke` proves against the real public URLs.
+# `scripts/install.{sh,ps1}` grew exactly one extra path for this: under an
+# explicit LUABOX_DRAFT_INSTALL=1 opt-in (which requires GITHUB_TOKEN and a
+# pinned LUABOX_VERSION), they resolve the release through the authenticated
+# GitHub API (drafts only appear in the *list* endpoint — `releases/tags/<tag>`
+# 404s for a draft) and pull each asset by id. Without the opt-in the scripts
+# behave exactly as they always have — ambient CI tokens never change install
+# behaviour — which is what `post-publish-smoke` proves against the real
+# public URLs.
 on:
   push:
     tags:
@@ -179,8 +181,9 @@ jobs:
   #
   #   1. pull `install.sh`/`install.ps1` out of the DRAFT release (so the asset
   #      is what gets exercised, not the checked-out copy),
-  #   2. run it with GITHUB_TOKEN + LUABOX_VERSION=<tag> — the draft-aware
-  #      path — and assert the installed binary reports the tag's version,
+  #   2. run it with LUABOX_DRAFT_INSTALL=1 + GITHUB_TOKEN +
+  #      LUABOX_VERSION=<tag> — the draft-aware path — and assert the
+  #      installed binary reports the tag's version,
   #   3. run the FULL black-box e2e suites (`acceptance` + `lsp_acceptance`,
   #      the cucumber executable spec, SPEC.md §16.2) with LUABOX_E2E_BIN
   #      pointed at that INSTALLED executable. Every scenario spawns the
@@ -222,11 +225,13 @@ jobs:
           - os: windows-latest
             shell: pwsh
     env:
-      # GH_TOKEN drives `gh release download`; GITHUB_TOKEN is what the install
-      # scripts look for to switch to their draft-aware API path. Both are the
-      # workflow's own read-scoped token.
+      # GH_TOKEN drives `gh release download`; GITHUB_TOKEN authenticates the
+      # install scripts' draft-aware API path, and LUABOX_DRAFT_INSTALL=1 is
+      # the explicit opt-in that switches them onto it (token presence alone
+      # never does — ambient CI tokens must not change install behaviour).
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      LUABOX_DRAFT_INSTALL: "1"
       TAG: ${{ github.ref_name }}
       # Match ci.yml: a warning in the test harness is a build failure.
       RUSTFLAGS: -Dwarnings
@@ -255,8 +260,8 @@ jobs:
           work="$(mktemp -d)"
           gh release download "$TAG" --pattern 'install.sh' --dir "$work"
 
-          # GITHUB_TOKEN is inherited from the job env, which is what puts
-          # install.sh on its draft-aware path; LUABOX_VERSION pins the tag.
+          # LUABOX_DRAFT_INSTALL=1 + GITHUB_TOKEN (both job env) put install.sh
+          # on its draft-aware path; LUABOX_VERSION pins the tag.
           LUABOX_VERSION="$TAG" bash "$work/install.sh"
 
           # install.sh installs to $HOME/.luabox/bin by default.
@@ -297,7 +302,8 @@ jobs:
           # install.ps1 is a PowerShell script (not an external exe), so
           # $LASTEXITCODE is unreliable after `& $ps1`; rely on
           # $ErrorActionPreference=Stop for throws and assert the exe landed.
-          # GITHUB_TOKEN is in the job env, so this takes the draft-aware path.
+          # LUABOX_DRAFT_INSTALL=1 + GITHUB_TOKEN (both job env) put it on the
+          # draft-aware path.
           $env:LUABOX_VERSION = $tag
           & $ps1
 
@@ -355,8 +361,8 @@ jobs:
 
           # ── Negative install probe ─────────────────────────────────────
           # Failure mode: install.sh silently exiting 0 when the pinned release
-          # does not exist would ship a broken install path. With a token in
-          # env this also exercises the draft-aware lookup's not-found branch.
+          # does not exist would ship a broken install path. With the draft
+          # opt-in in env this also exercises the API lookup's not-found branch.
           # Run under `if` so set -e does not abort on the expected failure.
           if LUABOX_VERSION="v0.0.0-does-not-exist" bash "$LUABOX_INSTALL_SH"; then
             echo "error: install.sh succeeded for a nonexistent version" >&2
@@ -386,8 +392,8 @@ jobs:
           # pipeline covers. This pass ALSO installs into a path CONTAINING A
           # SPACE (highest-risk on Windows): an unquoted $InstallDir /
           # Join-Path would drop the exe or fail here, not in prod.
-          # GITHUB_TOKEN is inherited by the child process, so the draft-aware
-          # path is what runs.
+          # LUABOX_DRAFT_INSTALL=1 and GITHUB_TOKEN are inherited by the child
+          # process, so the draft-aware path is what runs.
           $spacedDir = Join-Path $env:RUNNER_TEMP "luabox verify dir"
           "`$env:LUABOX_INSTALL_DIR = '$spacedDir'; `$env:LUABOX_VERSION = '$tag'; Get-Content -Raw '$ps1' | iex" | powershell.exe -NoProfile -
           if ($LASTEXITCODE -ne 0) { Write-Error "REPL-mode (5.1) spaced-dir install failed"; exit 1 }
@@ -398,8 +404,8 @@ jobs:
 
           # ── Negative install probe ─────────────────────────────────────
           # Failure mode: install.ps1 silently exiting 0 when the pinned
-          # release does not exist would ship a broken install path. With a
-          # token in env this also exercises the draft-aware lookup's
+          # release does not exist would ship a broken install path. With the
+          # draft opt-in in env this also exercises the API lookup's
           # not-found branch. Run in a CHILD process so its `exit 1` yields a
           # clean $LASTEXITCODE and the expected failure does not trip
           # $ErrorActionPreference=Stop in this step.

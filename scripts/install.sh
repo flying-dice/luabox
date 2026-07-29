@@ -3,9 +3,11 @@
 # Usage: curl -fsSL https://raw.githubusercontent.com/flying-dice/luabox/main/scripts/install.sh | bash
 #
 # Environment variables:
-#   LUABOX_INSTALL_DIR  — where to install (default: ~/.luabox/bin)
-#   LUABOX_VERSION      — version tag to install (default: latest)
-#   GITHUB_TOKEN        — CI only; see "draft-release path" below
+#   LUABOX_INSTALL_DIR   — where to install (default: ~/.luabox/bin)
+#   LUABOX_VERSION       — version tag to install (default: latest)
+#   LUABOX_DRAFT_INSTALL — CI only; set to 1 to install from a draft release
+#                          (needs GITHUB_TOKEN and a pinned LUABOX_VERSION)
+#   GITHUB_TOKEN         — CI only; see "draft-release path" below
 
 set -euo pipefail
 
@@ -18,13 +20,28 @@ VERSION="${LUABOX_VERSION:-latest}"
 # A GitHub *draft* release has no public release-download URLs, so the ordinary
 # path below cannot see one. The release pipeline needs exactly that: it must
 # install and fully exercise a release BEFORE publishing it
-# (.github/workflows/release.yml → the `verify` job). So when a token is present
-# AND a tag is pinned, assets are fetched through the authenticated GitHub API
-# by asset id instead, which does see drafts.
+# (.github/workflows/release.yml → the `verify` job). So under an EXPLICIT
+# LUABOX_DRAFT_INSTALL=1 opt-in — never on the mere presence of a token, which
+# many CI environments export ambiently — assets are fetched through the
+# authenticated GitHub API by asset id instead, which does see drafts.
 #
-# With GITHUB_TOKEN unset — every real user, every `curl … | bash` — none of
-# this is reachable and the install is byte-for-byte what it always was.
+# With LUABOX_DRAFT_INSTALL unset — every real user, every `curl … | bash` —
+# none of this is reachable and the install is byte-for-byte what it always was.
 TOKEN="${GITHUB_TOKEN:-}"
+DRAFT_INSTALL="${LUABOX_DRAFT_INSTALL:-}"
+if [ "$DRAFT_INSTALL" = "1" ]; then
+    # Fail loudly on a half-configured opt-in: without a token the API cannot
+    # see the draft, and a draft is never "latest" — silently falling back to
+    # the public path would just 404 with a misleading message later.
+    if [ -z "$TOKEN" ]; then
+        echo "error: LUABOX_DRAFT_INSTALL=1 needs GITHUB_TOKEN set" >&2
+        exit 1
+    fi
+    if [ "$VERSION" = "latest" ]; then
+        echo "error: LUABOX_DRAFT_INSTALL=1 needs a pinned LUABOX_VERSION (a draft is never 'latest')" >&2
+        exit 1
+    fi
+fi
 
 detect_platform() {
     local os arch target
@@ -101,10 +118,10 @@ download_file() {
 }
 
 # True when assets must come from the authenticated API rather than the public
-# release-download URLs: a token to authenticate with, and a pinned tag to look
-# up (there is no "latest" draft — /releases/latest never returns one).
+# release-download URLs: the explicit LUABOX_DRAFT_INSTALL=1 opt-in (its token
+# and pinned-tag preconditions were enforced at startup).
 use_api_downloads() {
-    [ -n "$TOKEN" ] && [ "$VERSION" != "latest" ]
+    [ "$DRAFT_INSTALL" = "1" ]
 }
 
 # Print the numeric id of asset $2 on the release tagged $1, or return 1.
@@ -147,7 +164,7 @@ download_asset_api() {
     local tag="$1" name="$2" dest="$3" id
     if ! command -v jq >/dev/null 2>&1; then
         echo "error: installing from a draft release needs 'jq'" >&2
-        echo "       unset GITHUB_TOKEN to use the public release-download path" >&2
+        echo "       unset LUABOX_DRAFT_INSTALL to use the public release-download path" >&2
         exit 1
     fi
     if ! id="$(find_asset_id "$tag" "$name")"; then

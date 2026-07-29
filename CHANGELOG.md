@@ -209,8 +209,9 @@ so it appears in no version entry.
   `--draft=false --latest`; a public-URL install and `luabox upgrade` smoke
   runs afterwards, since neither can see a draft. The suites pick their binary
   at runtime from `LUABOX_E2E_BIN` (falling back to the cargo-built one), and
-  `scripts/install.{sh,ps1}` gained a `GITHUB_TOKEN`-only path that resolves a
-  draft release through the GitHub API — with no token their behaviour is
+  `scripts/install.{sh,ps1}` gained a CI-only path — explicit
+  `LUABOX_DRAFT_INSTALL=1` opt-in plus `GITHUB_TOKEN` — that resolves a draft
+  release through the GitHub API; without the opt-in their behaviour is
   unchanged. See [RELEASING.md](RELEASING.md).
 - **`luabox-resolve` is now `luabox-manifest`.** The crate lost its resolving
   half in this release (see *Removed*) and the name outlived it. It also

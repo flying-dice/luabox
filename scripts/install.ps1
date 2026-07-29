@@ -2,9 +2,11 @@
 # Usage: irm https://raw.githubusercontent.com/flying-dice/luabox/main/scripts/install.ps1 | iex
 #
 # Environment variables:
-#   LUABOX_INSTALL_DIR  - where to install (default: $env:USERPROFILE\.luabox\bin)
-#   LUABOX_VERSION      - version tag to install (default: latest)
-#   GITHUB_TOKEN        - CI only; see "draft-release path" below
+#   LUABOX_INSTALL_DIR   - where to install (default: $env:USERPROFILE\.luabox\bin)
+#   LUABOX_VERSION       - version tag to install (default: latest)
+#   LUABOX_DRAFT_INSTALL - CI only; set to 1 to install from a draft release
+#                          (needs GITHUB_TOKEN and a pinned LUABOX_VERSION)
+#   GITHUB_TOKEN         - CI only; see "draft-release path" below
 
 $ErrorActionPreference = "Stop"
 
@@ -40,14 +42,26 @@ $Version = if ($env:LUABOX_VERSION) {
 # A GitHub *draft* release has no public release-download URLs, so the ordinary
 # path below cannot see one. The release pipeline needs exactly that: it must
 # install and fully exercise a release BEFORE publishing it
-# (.github/workflows/release.yml -> the `verify` job). So when a token is
-# present AND a tag is pinned, assets are fetched through the authenticated
-# GitHub API by asset id instead, which does see drafts.
+# (.github/workflows/release.yml -> the `verify` job). So under an EXPLICIT
+# LUABOX_DRAFT_INSTALL=1 opt-in - never on the mere presence of a token, which
+# many CI environments export ambiently - assets are fetched through the
+# authenticated GitHub API by asset id instead, which does see drafts.
 #
-# With GITHUB_TOKEN unset - every real user, every `irm | iex` - none of this
-# is reachable and the install is byte-for-byte what it always was.
+# With LUABOX_DRAFT_INSTALL unset - every real user, every `irm | iex` - none
+# of this is reachable and the install is byte-for-byte what it always was.
 $Token = $env:GITHUB_TOKEN
-$UseApi = ($null -ne $Token) -and ($Token -ne "") -and ($Version -ne "latest")
+$UseApi = ($env:LUABOX_DRAFT_INSTALL -eq "1")
+if ($UseApi) {
+    # Fail loudly on a half-configured opt-in: without a token the API cannot
+    # see the draft, and a draft is never "latest" - silently falling back to
+    # the public path would just 404 with a misleading message later.
+    if (($null -eq $Token) -or ($Token -eq "")) {
+        Fail "LUABOX_DRAFT_INSTALL=1 needs GITHUB_TOKEN set"
+    }
+    if ($Version -eq "latest") {
+        Fail "LUABOX_DRAFT_INSTALL=1 needs a pinned LUABOX_VERSION (a draft is never 'latest')"
+    }
+}
 
 function Resolve-Version {
     if ($Version -eq "latest") {

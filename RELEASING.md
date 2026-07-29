@@ -92,16 +92,16 @@ credential of its own.
 
    Installing from a draft needs credentials users do not have, so
    `scripts/install.sh` and `scripts/install.ps1` grew exactly one extra
-   path: when `GITHUB_TOKEN` is set **and** `LUABOX_VERSION` pins a tag, they
-   resolve the release through the authenticated GitHub API (drafts appear
-   only in the *list* endpoint — `releases/tags/<tag>` 404s for a draft) and
-   fetch each asset by id, checksum verification included. `install.sh` needs
-   `jq` on that path. With `GITHUB_TOKEN` unset the scripts behave exactly as
-   they always have; that no-token behaviour is what job 6 proves against the
-   real public URLs. Note the trigger is the bare presence of `GITHUB_TOKEN`,
-   so a developer whose shell exports one (Codespaces, `gh auth` setups) and
-   who also pins `LUABOX_VERSION` will take the API path — unset it to force
-   the public path.
+   path: under an explicit `LUABOX_DRAFT_INSTALL=1` opt-in — which requires
+   `GITHUB_TOKEN` and a pinned `LUABOX_VERSION`, and fails loudly if either
+   is missing — they resolve the release through the authenticated GitHub API
+   (drafts appear only in the *list* endpoint — `releases/tags/<tag>` 404s
+   for a draft) and fetch each asset by id, checksum verification included.
+   `install.sh` needs `jq` on that path. Without the opt-in the scripts
+   behave exactly as they always have — a developer whose shell exports
+   `GITHUB_TOKEN` ambiently (Codespaces, `gh auth` setups) stays on the
+   public path; that default behaviour is what job 6 proves against the real
+   public URLs.
 7. **Verify.** Once the workflow finishes, check the
    [GitHub Releases page](https://github.com/flying-dice/luabox/releases)
    for the new release: it should no longer be a draft, should carry all six
