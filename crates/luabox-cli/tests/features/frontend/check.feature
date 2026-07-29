@@ -406,15 +406,20 @@ Feature: luabox check — annotation-driven typecheck (P0 MVP)
     And stdout contains "check_name"
     And stdout contains "fingerprint"
 
-  Scenario: an unknown --format lists the supported ones
+  # `--format` is a closed set clap owns (a `ValueEnum`), so an unknown one is
+  # a malformed invocation — exit 2 with the possible values, like every other
+  # bad flag value, rather than a hand-rolled message on the command's own
+  # error path.
+  Scenario: an unknown --format is a usage error listing the supported ones
     Given a project with edition "5.4"
     And a file "src/main.lua" containing:
       """
       return 1
       """
     When I run "luabox check --format xml"
-    Then the command fails
-    And stderr contains "unknown format `xml`; expected human, json, sarif, github, or gitlab"
+    Then the command exits with code 2
+    And stderr contains "invalid value 'xml' for '--format <FORMAT>'"
+    And stderr contains "[possible values: human, json, sarif, github, gitlab]"
 
   Scenario: an unknown --target lists the supported dialects
     Given a project with edition "5.4"

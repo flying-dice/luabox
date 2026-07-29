@@ -33,7 +33,7 @@ mod suppress;
 #[cfg(test)]
 mod tests;
 
-pub use config::{Level, LintConfig, tier_default};
+pub use config::{Level, LintConfig, LintLevel, LintTier, tier_default};
 pub use context::LintContext;
 pub use diagnostic::{Fix, LintDiagnostic};
 pub use facts::TypeFacts;

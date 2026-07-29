@@ -31,7 +31,7 @@ use anyhow::{Context, bail};
 use luabox_diag::{Diagnostic, Format};
 use luabox_lint::{LintConfig, apply_fixes, lint_source};
 use luabox_manifest::layout::{self, DefFiles};
-use luabox_manifest::model::{Lint, LintLevel, Manifest};
+use luabox_manifest::model::{Lint, Manifest};
 use luabox_syntax::Dialect;
 use luabox_types::{Ambient, build_ambient, stdlib_defs};
 use rayon::prelude::*;
@@ -180,13 +180,9 @@ fn discover(cwd: &Path) -> anyhow::Result<Project> {
             known_globals: stdlib_defs(Dialect::Lua54).global_names().clone(),
         });
     };
-    let Some(dialect) = Dialect::from_manifest_id(&manifest.package.edition) else {
-        bail!(
-            "unknown edition `{}` in `{}` (see `luabox explain LB1001`)",
-            manifest.package.edition,
-            root.join("luabox.toml").display()
-        );
-    };
+    // `Manifest::parse` types `[package] edition` as a `DialectId`, so there
+    // is nothing left to re-validate here (CC-M13).
+    let dialect = crate::dialect::from_manifest(manifest.package.edition);
     let known_globals = known_globals(dialect, &root, &manifest);
     Ok(Project {
         out_dir: Some(root.join(&manifest.build.out)),
@@ -223,26 +219,22 @@ fn known_globals(dialect: Dialect, root: &Path, manifest: &Manifest) -> HashSet<
 }
 
 /// Translate the manifest `[lint]` table into a [`LintConfig`].
+///
+/// The level/tier translation itself is `luabox-lint`'s (`From` impls on the
+/// vocabulary it re-exports), so this and `luabox-lsp`'s `build_lint_config`
+/// cannot drift apart the way two hand-written keyword tables did.
 fn build_config(lint: &Lint) -> LintConfig {
     let mut config = LintConfig::new();
     for name in &lint.globals {
         config.allow_global(name.clone());
     }
     for (tier, level) in &lint.tiers {
-        config.set_tier(tier, level_keyword(*level));
+        config.set_tier((*tier).into(), (*level).into());
     }
     for (rule, level) in &lint.rules {
-        config.set_rule(rule, level_keyword(*level));
+        config.set_rule(rule, (*level).into());
     }
     config
-}
-
-fn level_keyword(level: LintLevel) -> &'static str {
-    match level {
-        LintLevel::Allow => "allow",
-        LintLevel::Warn => "warn",
-        LintLevel::Deny => "deny",
-    }
 }
 
 /// Whether `rel` (a root-relative, forward-slash path) is a test file
@@ -582,13 +574,6 @@ mod tests {
     }
 
     // -- config translation ------------------------------------------------
-
-    #[test]
-    fn every_manifest_lint_level_maps_to_its_config_keyword() {
-        assert_eq!(level_keyword(LintLevel::Allow), "allow");
-        assert_eq!(level_keyword(LintLevel::Warn), "warn");
-        assert_eq!(level_keyword(LintLevel::Deny), "deny");
-    }
 
     #[test]
     fn build_config_threads_globals_tiers_and_rules_into_the_lint_config() {

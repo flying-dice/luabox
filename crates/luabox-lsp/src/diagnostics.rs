@@ -73,7 +73,9 @@ pub fn diagnostics(
             &index,
             usize::from(err.range.start())..usize::from(err.range.end()),
             DiagnosticSeverity::ERROR,
-            err.code,
+            // `DialectError::code` is the bare number; the protocol carries
+            // the `LBnnnn` spelling.
+            &format!("LB{:04}", err.code),
             err.message,
         ));
     }

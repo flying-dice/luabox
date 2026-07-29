@@ -2,14 +2,20 @@
 //!
 //! Mirrors clippy's `allow`/`warn`/`deny` ladder. A rule's effective level is
 //! its tier default, overridden by a `[lint]` tier toggle, overridden by a
-//! `[lint]` rule-id entry — most specific wins. The manifest model for
-//! `[lint]` lives in `luabox-manifest`; this crate is fed the already-parsed
-//! values (the Frontend translates them) so the Semantics/Frontend layering
-//! stays acyclic (SPEC.md §16).
+//! `[lint]` rule-id entry — most specific wins.
+//!
+//! The manifest model for `[lint]` lives in `luabox-manifest`, and the
+//! translation onto this crate's vocabulary lives *here*, as [`From`] impls on
+//! the re-exported [`LintLevel`]/[`LintTier`]: `luabox-cli` and `luabox-lsp`
+//! both build a [`LintConfig`] from a manifest, and each used to carry its own
+//! `LintLevel` → level-keyword function that the other had to stay in step
+//! with (CC-M8). Still acyclic (SPEC.md §16) — `luabox-manifest` depends on
+//! nothing in this workspace.
 
 use std::collections::{HashMap, HashSet};
 
 use luabox_diag::Severity;
+pub use luabox_manifest::model::{LintLevel, LintTier};
 
 use crate::rule::{Rule, Tier};
 
@@ -47,6 +53,32 @@ impl Level {
     }
 }
 
+impl From<LintLevel> for Level {
+    /// The one `[lint]` level → [`Level`] mapping in the workspace.
+    fn from(level: LintLevel) -> Self {
+        match level {
+            LintLevel::Allow => Level::Allow,
+            LintLevel::Warn => Level::Warn,
+            LintLevel::Deny => Level::Deny,
+        }
+    }
+}
+
+impl From<LintTier> for Tier {
+    /// The one `[lint]` tier → [`Tier`] mapping in the workspace. Exhaustive
+    /// on both sides, so a tier added to either vocabulary stops this
+    /// compiling rather than silently becoming a no-op override.
+    fn from(tier: LintTier) -> Self {
+        match tier {
+            LintTier::Correctness => Tier::Correctness,
+            LintTier::Suspicious => Tier::Suspicious,
+            LintTier::Perf => Tier::Perf,
+            LintTier::Style => Tier::Style,
+            LintTier::Pedantic => Tier::Pedantic,
+        }
+    }
+}
+
 /// The tier default before any `[lint]` override (SPEC.md §9): correctness is
 /// `deny`, suspicious/perf/style are `warn`, pedantic is off.
 #[must_use]
@@ -78,28 +110,19 @@ impl LintConfig {
         self.globals.insert(name.into());
     }
 
-    /// Set a tier-level override. Returns `false` (and does nothing) if the
-    /// tier name or level keyword is unrecognised.
-    pub fn set_tier(&mut self, tier: &str, level: &str) -> bool {
-        match (Tier::parse(tier), Level::parse(level)) {
-            (Some(tier), Some(level)) => {
-                self.tiers.insert(tier, level);
-                true
-            }
-            _ => false,
-        }
+    /// Set a tier-level override.
+    ///
+    /// Typed on both arguments, so there is no unrecognised-name case left to
+    /// silently swallow: the string-keyed setter this replaced returned a
+    /// `bool` that every caller in the workspace discarded (CC-M8).
+    pub fn set_tier(&mut self, tier: Tier, level: Level) {
+        self.tiers.insert(tier, level);
     }
 
-    /// Set a rule-id override. Returns `false` if the level keyword is
-    /// unrecognised (the rule id itself is not validated here).
-    pub fn set_rule(&mut self, rule_id: &str, level: &str) -> bool {
-        match Level::parse(level) {
-            Some(level) => {
-                self.rules.insert(rule_id.to_owned(), level);
-                true
-            }
-            None => false,
-        }
+    /// Set a rule-id override. The rule id stays a string — ids are open, and
+    /// live with the rules themselves — but the level is typed.
+    pub fn set_rule(&mut self, rule_id: &str, level: Level) {
+        self.rules.insert(rule_id.to_owned(), level);
     }
 
     /// Whether `name` is on the `global-write` allow-list.

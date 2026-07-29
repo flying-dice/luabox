@@ -51,9 +51,27 @@ impl Parse {
         &self.errors
     }
 
-    /// The typed AST root. Infallible: the parser always emits a
-    /// `SOURCE_FILE` root.
+    /// The typed AST root.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the green root is not a `SOURCE_FILE`.
+    ///
+    /// It cannot be: the root node is opened once, unconditionally, as the
+    /// first thing [`parse`](super::parse) does and closed as the last, so
+    /// every `Parse` — including one built entirely from error recovery, or
+    /// from empty input — has exactly that root. `every_input_shape_parses_to_
+    /// a_source_file_root` sweeps the degenerate inputs.
+    ///
+    /// The alternative is an `Option` on the single most-called accessor in
+    /// the crate, whose `None` no caller could do anything with but unwrap
+    /// again — so the assertion stays here, where it is stated once.
     pub fn tree(&self) -> ast::SourceFile {
+        #[expect(
+            clippy::unreachable,
+            reason = "the parser opens SOURCE_FILE unconditionally as its first act — see the \
+                      # Panics section"
+        )]
         ast::AstNode::cast(self.syntax())
             .unwrap_or_else(|| unreachable!("the parser always emits a SOURCE_FILE root"))
     }
@@ -533,6 +551,43 @@ mod tests {
         "::top::\nlocal i = 0\nwhile true do\n  i = i + 1\n  if i & 3 == 0 then goto top end\n  repeat i = i // 2 until i < 1 or i ~ 5 == 0\n  break\nend\n",
         "function obj.ns:method(a, b, ...)\n  local args = { ... }\n  return self, select('#', ...)\nend\nobj = setmetatable({}, { __index = function(_, k) return k end })\nobj:method 'lit' -- string call\nobj:method { 1, 2 }\ndo local x <close> = open() end\nreturn obj\n",
     ];
+
+    /// The reachability proof behind `Parse::tree`'s `#[expect]`: whatever
+    /// the input, the root is a `SOURCE_FILE` and `tree()` returns it. The
+    /// interesting cases are the degenerate ones — empty input, input that is
+    /// nothing but trivia, and input the parser can only recover from — since
+    /// those are the shapes where a root could plausibly be missing.
+    #[test]
+    fn every_input_shape_parses_to_a_source_file_root() {
+        for text in [
+            "",
+            " ",
+            "\n\n",
+            "-- only a comment",
+            "--[[ only a long comment ]]",
+            "\u{feff}",
+            "end",
+            ")",
+            "local",
+            "local x = ",
+            "\0\u{1}\u{7f}",
+            "«»",
+        ] {
+            for dialect in Dialect::ALL {
+                let parse = parse(text, dialect);
+                assert_eq!(
+                    parse.syntax().kind(),
+                    SyntaxKind::SOURCE_FILE,
+                    "{text:?} under {dialect:?}"
+                );
+                assert_eq!(
+                    parse.tree().syntax().text().to_string(),
+                    text,
+                    "{text:?} under {dialect:?}"
+                );
+            }
+        }
+    }
 
     fn assert_lossless(parse: &Parse, text: &str) {
         assert_eq!(

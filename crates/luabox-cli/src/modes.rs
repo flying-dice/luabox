@@ -88,23 +88,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, bail};
-use luabox_manifest::model::ALLOWED_BUNDLE_MODES;
 use luabox_syntax::Dialect;
-
-/// Fails with a cargo-style message listing the valid modes unless `mode`
-/// is one of [`ALLOWED_BUNDLE_MODES`]. Called on a `--mode` value as soon
-/// as it's parsed, before any bundling work happens; manifest-sourced
-/// modes are already validated by `Manifest::parse`.
-pub fn validate(mode: &str) -> anyhow::Result<()> {
-    if ALLOWED_BUNDLE_MODES.contains(&mode) {
-        Ok(())
-    } else {
-        bail!(
-            "unknown bundle mode `{mode}` (valid: {})",
-            ALLOWED_BUNDLE_MODES.join(", ")
-        );
-    }
-}
 
 /// Emit LÖVE packaging: `<out_dir>/<name>.love`. `bundle_text` is the
 /// already-produced plain bundle (see module docs for why it's written
@@ -447,22 +431,6 @@ fn zip_with_python(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn validate_accepts_all_allowed_modes() {
-        for mode in ALLOWED_BUNDLE_MODES {
-            validate(mode).unwrap_or_else(|e| panic!("`{mode}` should validate: {e}"));
-        }
-    }
-
-    #[test]
-    fn validate_rejects_unknown_mode_listing_valid_ones() {
-        let error = validate("roblox").unwrap_err().to_string();
-        assert!(error.contains("roblox"));
-        for mode in ALLOWED_BUNDLE_MODES {
-            assert!(error.contains(mode), "{error} should mention {mode}");
-        }
-    }
 
     #[test]
     fn nvim_plugin_layout_preserves_bundle_text_verbatim() {

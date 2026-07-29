@@ -44,9 +44,21 @@ pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
 ///
 /// # Panics
 ///
-/// Panics if the rendered URI does not parse, which cannot happen for the
-/// absolute paths the server feeds it (every produced character is either
-/// percent-encoded or URI-legal).
+/// Panics if the rendered URI does not parse.
+///
+/// That cannot happen for *any* path, not just the ones the server feeds it:
+/// the loop below emits each byte either verbatim — and only from
+/// [`is_uri_path_byte`], which is the RFC 3986 `pchar` set plus `/` — or as a
+/// `%XX` escape, and the result is prefixed with `file://` plus a leading `/`
+/// when the path has none. Every byte of the output is therefore
+/// path-position-legal, so the grammar cannot reject it; the abort is on the
+/// *encoder* being wrong, not on its input.
+///
+/// It aborts rather than returning a `Result` because the LSP has nowhere to
+/// put the failure: a URI names the document in every request and response,
+/// and a server that silently substituted a wrong or empty one would answer
+/// requests about the wrong file. `a_path_of_every_byte_value_still_produces_
+/// a_parseable_uri` sweeps the whole 0..=255 byte range through it.
 #[must_use]
 pub fn path_to_uri(path: &Path) -> Uri {
     use std::fmt::Write as _;
@@ -63,6 +75,11 @@ pub fn path_to_uri(path: &Path) -> Uri {
             let _ = write!(out, "%{b:02X}");
         }
     }
+    #[expect(
+        clippy::unreachable,
+        reason = "every emitted byte is percent-encoded or in the pchar set, so the grammar \
+                  cannot reject the result — see the # Panics section"
+    )]
     Uri::from_str(&out).unwrap_or_else(|e| unreachable!("constructed URI is valid: {e}"))
 }
 
@@ -163,6 +180,30 @@ mod tests {
         let uri = path_to_uri(&path);
         assert_eq!(uri.as_str(), "file:///C:/my%20dir/h%C3%A9llo.lua");
         assert_eq!(uri_to_path(&uri).unwrap(), path);
+    }
+
+    /// The reachability proof behind `path_to_uri`'s `#[expect]`: the encoder
+    /// emits nothing the URI path grammar can reject, whatever bytes the path
+    /// holds. Sweeps the whole byte range (as one path segment per byte, plus
+    /// all of them at once) rather than a hand-picked "weird path" list.
+    #[test]
+    fn a_path_of_every_byte_value_still_produces_a_parseable_uri() {
+        for byte in 0u8..=255 {
+            // `to_string_lossy` is what `path_to_uri` reads, so build the
+            // path from a `String`: any byte that survives that round trip is
+            // one the encoder must handle.
+            let segment = String::from_utf8_lossy(&[byte]).into_owned();
+            let uri = path_to_uri(Path::new(&format!("/tmp/{segment}/a.lua")));
+            assert!(uri.as_str().starts_with("file:///tmp/"), "byte {byte}");
+        }
+        let all: String = (0u8..=255).map(|b| b as char).collect();
+        let uri = path_to_uri(Path::new(&format!("/{all}")));
+        assert!(uri.as_str().starts_with("file:///"));
+    }
+
+    #[test]
+    fn a_relative_path_still_gets_the_leading_slash_the_scheme_requires() {
+        assert_eq!(path_to_uri(Path::new("a.lua")).as_str(), "file:///a.lua");
     }
 
     #[test]

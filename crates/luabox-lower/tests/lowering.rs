@@ -24,7 +24,7 @@ fn text(source: &str, from: Dialect, to: Dialect) -> String {
 }
 
 /// Lower and expect failure, returning the error codes.
-fn error_codes(source: &str, from: Dialect, to: Dialect) -> Vec<&'static str> {
+fn error_codes(source: &str, from: Dialect, to: Dialect) -> Vec<u16> {
     match lower(source, from, to) {
         Ok(lowered) => panic!("expected lowering to fail, got:\n{}", lowered.text),
         Err(diags) => diags
@@ -35,7 +35,7 @@ fn error_codes(source: &str, from: Dialect, to: Dialect) -> Vec<&'static str> {
     }
 }
 
-fn warning_codes(source: &str, from: Dialect, to: Dialect) -> Vec<&'static str> {
+fn warning_codes(source: &str, from: Dialect, to: Dialect) -> Vec<u16> {
     match lower(source, from, to) {
         Ok(lowered) => lowered.warnings.iter().map(|d| d.code).collect(),
         Err(diags) => panic!("expected lowering to succeed, got {diags:#?}"),
@@ -77,7 +77,7 @@ fn floor_div_lowers_to_math_floor() {
 #[test]
 fn floor_div_warns_lb0606_once_per_file() {
     let warnings = warning_codes("x = a // b\ny = c // d\n", Dialect::Lua53, Dialect::Lua51);
-    assert_eq!(warnings, vec!["LB0606"]);
+    assert_eq!(warnings, vec![606]);
 }
 
 #[test]
@@ -331,7 +331,7 @@ end
 ";
     assert_eq!(
         error_codes(source, Dialect::Lua54, Dialect::Lua51),
-        vec!["LB0601"]
+        vec![601]
     );
 }
 
@@ -343,7 +343,7 @@ if a then goto top end
 if b then goto top end
 ";
     let codes = error_codes(source, Dialect::Lua52, Dialect::Lua51);
-    assert!(codes.iter().all(|c| *c == "LB0601"), "{codes:?}");
+    assert!(codes.iter().all(|c| *c == 601), "{codes:?}");
 }
 
 #[test]
@@ -354,7 +354,7 @@ if a then goto top else print(1) end
 ";
     assert_eq!(
         error_codes(source, Dialect::Lua52, Dialect::Lua51),
-        vec!["LB0601"]
+        vec![601]
     );
 }
 
@@ -369,7 +369,7 @@ end
 ";
     assert_eq!(
         error_codes(source, Dialect::Lua52, Dialect::Lua51),
-        vec!["LB0601"]
+        vec![601]
     );
 }
 
@@ -396,7 +396,7 @@ print(\"unreachable\")
 ";
     assert_eq!(
         error_codes(source, Dialect::Lua52, Dialect::Lua51),
-        vec!["LB0601"]
+        vec![601]
     );
 }
 
@@ -410,7 +410,7 @@ end
 ";
     assert_eq!(
         error_codes(source, Dialect::Lua52, Dialect::Lua51),
-        vec!["LB0601"]
+        vec![601]
     );
 }
 
@@ -418,7 +418,7 @@ end
 fn goto_with_no_matching_label_anywhere_is_irreducible() {
     assert_eq!(
         error_codes("goto nowhere\n", Dialect::Lua52, Dialect::Lua51),
-        vec!["LB0601"]
+        vec![601]
     );
 }
 
@@ -428,7 +428,7 @@ fn goto_cannot_see_a_label_outside_its_function() {
     let source = "local function f()\n  goto out\nend\n::out::\nf()\n";
     assert_eq!(
         error_codes(source, Dialect::Lua52, Dialect::Lua51),
-        vec!["LB0601"]
+        vec![601]
     );
 }
 
@@ -443,7 +443,7 @@ end
 ";
     assert_eq!(
         error_codes(source, Dialect::Lua52, Dialect::Lua51),
-        vec!["LB0601"]
+        vec![601]
     );
 }
 
@@ -458,7 +458,7 @@ end
 ";
     assert_eq!(
         error_codes(source, Dialect::Lua52, Dialect::Lua51),
-        vec!["LB0601"]
+        vec![601]
     );
 }
 
@@ -475,7 +475,7 @@ work()
 ";
     assert_eq!(
         error_codes(source, Dialect::Lua52, Dialect::Lua51),
-        vec!["LB0601"]
+        vec![601]
     );
 }
 
@@ -582,7 +582,7 @@ fn const_reassignment_is_lb0602() {
             Dialect::Lua54,
             Dialect::Lua51
         ),
-        vec!["LB0602"]
+        vec![602]
     );
 }
 
@@ -594,7 +594,7 @@ fn const_reassignment_inside_closure_is_lb0602() {
             Dialect::Lua54,
             Dialect::Lua53
         ),
-        vec!["LB0602"]
+        vec![602]
     );
 }
 
@@ -606,7 +606,7 @@ fn const_function_decl_sugar_is_lb0602() {
             Dialect::Lua54,
             Dialect::Lua53
         ),
-        vec!["LB0602"]
+        vec![602]
     );
 }
 
@@ -673,7 +673,7 @@ end
     assert_eq!(lowered.polyfills, vec!["close_scope"]);
     assert_eq!(
         lowered.warnings.iter().map(|w| w.code).collect::<Vec<_>>(),
-        vec!["LB0603"]
+        vec![603]
     );
 }
 
@@ -688,7 +688,7 @@ end
 ";
     let lowered = lower(source, Dialect::Lua54, Dialect::Lua51).expect("lower");
     assert!(
-        lowered.warnings.iter().all(|w| w.code != "LB0603"),
+        lowered.warnings.iter().all(|w| w.code != 603),
         "{:?}",
         lowered.warnings
     );
@@ -735,7 +735,7 @@ end
 ";
     assert_eq!(
         error_codes(source, Dialect::Lua54, Dialect::Lua51),
-        vec!["LB0603"]
+        vec![603]
     );
 }
 
@@ -749,7 +749,7 @@ end
 ";
     assert_eq!(
         error_codes(source, Dialect::Lua54, Dialect::Lua51),
-        vec!["LB0603"]
+        vec![603]
     );
 }
 
@@ -763,7 +763,7 @@ end
 ";
     assert_eq!(
         error_codes(source, Dialect::Lua54, Dialect::Lua51),
-        vec!["LB0603"]
+        vec![603]
     );
 }
 
@@ -784,7 +784,7 @@ fn close_in_multi_name_local_is_hard_lb0603() {
     let source = "local a, h <close> = 1, open()\n";
     assert_eq!(
         error_codes(source, Dialect::Lua54, Dialect::Lua51),
-        vec!["LB0603"]
+        vec![603]
     );
 }
 
@@ -819,7 +819,7 @@ do
 end
 ";
     let codes = error_codes(source, Dialect::Lua54, Dialect::Lua51);
-    assert!(codes.contains(&"LB0603"), "{codes:?}");
+    assert!(codes.contains(&603), "{codes:?}");
 }
 
 #[test]
@@ -843,7 +843,7 @@ fn const_reassigned_from_a_local_function_body_is_lb0602() {
     let source = "local x <const> = 1\nlocal function f()\n  x = 2\nend\nf()\n";
     assert_eq!(
         error_codes(source, Dialect::Lua54, Dialect::Lua53),
-        vec!["LB0602"]
+        vec![602]
     );
 }
 
@@ -866,7 +866,7 @@ fn const_reassigned_inside_a_for_body_is_lb0602() {
     ] {
         assert_eq!(
             error_codes(source, Dialect::Lua54, Dialect::Lua53),
-            vec!["LB0602"],
+            vec![602],
             "{source}"
         );
     }
@@ -878,7 +878,7 @@ fn const_reassigned_in_an_elseif_or_else_branch_is_lb0602() {
         "local x <const> = 1\nif a then\n  p()\nelseif b then\n  x = 2\nelse\n  x = 3\nend\n";
     assert_eq!(
         error_codes(source, Dialect::Lua54, Dialect::Lua53),
-        vec!["LB0602", "LB0602"]
+        vec![602, 602]
     );
 }
 
@@ -889,7 +889,7 @@ fn const_reassigned_from_a_closure_in_value_position_is_lb0602() {
     let source = "local x <const> = 1\ny = (function() x = 2 end)()\n";
     assert_eq!(
         error_codes(source, Dialect::Lua54, Dialect::Lua53),
-        vec!["LB0602"]
+        vec![602]
     );
 }
 
@@ -900,7 +900,7 @@ fn const_reassigned_through_an_index_target_is_lb0602() {
     let source = "local x <const> = 1\nt[(function() x = 2 end)()] = 1\n";
     assert_eq!(
         error_codes(source, Dialect::Lua54, Dialect::Lua53),
-        vec!["LB0602"]
+        vec![602]
     );
 }
 
@@ -951,7 +951,7 @@ end
 ";
     let lowered = lower(source, Dialect::Lua54, Dialect::Lua51).expect("lower");
     assert!(
-        lowered.warnings.iter().all(|w| w.code != "LB0603"),
+        lowered.warnings.iter().all(|w| w.code != 603),
         "{:?}",
         lowered.warnings
     );
@@ -969,7 +969,7 @@ end
     let lowered = lower(source, Dialect::Lua54, Dialect::Lua51).expect("lower");
     assert_eq!(
         lowered.warnings.iter().map(|w| w.code).collect::<Vec<_>>(),
-        vec!["LB0603"]
+        vec![603]
     );
 }
 
@@ -1034,7 +1034,7 @@ fn env_whole_assignment_becomes_setfenv() {
 fn env_multi_name_local_is_lb0604() {
     assert_eq!(
         error_codes("local _ENV, x = a, b\n", Dialect::Lua52, Dialect::Lua51),
-        vec!["LB0604"]
+        vec![604]
     );
 }
 
@@ -1046,7 +1046,7 @@ fn env_local_in_nested_do_block_is_lb0604() {
             Dialect::Lua52,
             Dialect::Lua51
         ),
-        vec!["LB0604"]
+        vec![604]
     );
 }
 
@@ -1058,7 +1058,7 @@ fn env_parameter_is_lb0604() {
             Dialect::Lua52,
             Dialect::Lua51
         ),
-        vec!["LB0604"]
+        vec![604]
     );
 }
 
@@ -1086,7 +1086,7 @@ fn env_read_in_an_assignment_value_list_becomes_getfenv() {
 fn env_multi_target_assignment_is_lb0604() {
     assert_eq!(
         error_codes("_ENV, x = a, b\n", Dialect::Lua52, Dialect::Lua51),
-        vec!["LB0604"]
+        vec![604]
     );
 }
 
@@ -1094,7 +1094,7 @@ fn env_multi_target_assignment_is_lb0604() {
 fn env_assignment_with_multiple_values_is_lb0604() {
     assert_eq!(
         error_codes("_ENV = a, b\n", Dialect::Lua52, Dialect::Lua51),
-        vec!["LB0604"]
+        vec![604]
     );
 }
 
@@ -1102,7 +1102,7 @@ fn env_assignment_with_multiple_values_is_lb0604() {
 fn env_assignment_in_a_nested_block_is_lb0604() {
     assert_eq!(
         error_codes("do\n  _ENV = t\nend\n", Dialect::Lua52, Dialect::Lua51),
-        vec!["LB0604"]
+        vec![604]
     );
 }
 
@@ -1110,7 +1110,7 @@ fn env_assignment_in_a_nested_block_is_lb0604() {
 fn env_local_without_a_value_is_lb0604() {
     assert_eq!(
         error_codes("local _ENV\nx = 1\n", Dialect::Lua52, Dialect::Lua51),
-        vec!["LB0604"]
+        vec![604]
     );
 }
 
@@ -1185,7 +1185,7 @@ fn jit_ffi_require_is_lb0605() {
             Dialect::LuaJit,
             Dialect::Lua51
         ),
-        vec!["LB0605"]
+        vec![605]
     );
 }
 
@@ -1193,7 +1193,7 @@ fn jit_ffi_require_is_lb0605() {
 fn jit_unknown_bit_member_is_lb0605() {
     assert_eq!(
         error_codes("x = bit.frobnicate(1)\n", Dialect::LuaJit, Dialect::Lua51),
-        vec!["LB0605"]
+        vec![605]
     );
 }
 
@@ -1201,7 +1201,7 @@ fn jit_unknown_bit_member_is_lb0605() {
 fn jit_64bit_literal_is_lb0605() {
     assert_eq!(
         error_codes("local n = 42LL\n", Dialect::LuaJit, Dialect::Lua51),
-        vec!["LB0605"]
+        vec![605]
     );
 }
 
@@ -1239,7 +1239,7 @@ fn big_integer_literal_warns_lb0606() {
         Dialect::Lua53,
         Dialect::Lua51,
     );
-    assert_eq!(warnings, vec!["LB0606"]);
+    assert_eq!(warnings, vec![606]);
 }
 
 #[test]
@@ -1259,7 +1259,7 @@ fn string_format_percent_d_warns_lb0606() {
         Dialect::Lua54,
         Dialect::Lua51,
     );
-    assert_eq!(warnings, vec!["LB0606"]);
+    assert_eq!(warnings, vec![606]);
 }
 
 #[test]
@@ -1279,7 +1279,7 @@ fn a_percent_d_after_other_directives_still_warns() {
         Dialect::Lua54,
         Dialect::Lua51,
     );
-    assert_eq!(warnings, vec!["LB0606"]);
+    assert_eq!(warnings, vec![606]);
 }
 
 #[test]
@@ -1330,7 +1330,7 @@ fn untransformed_formatting_survives_verbatim() {
 fn parse_error_input_is_rejected_with_lb0001() {
     assert_eq!(
         error_codes("local = = =\n", Dialect::Lua54, Dialect::Lua51),
-        vec!["LB0001"; error_codes("local = = =\n", Dialect::Lua54, Dialect::Lua51).len()]
+        vec![1; error_codes("local = = =\n", Dialect::Lua54, Dialect::Lua51).len()]
     );
 }
 
@@ -1363,10 +1363,7 @@ fn lower_bare_is_identity_for_the_same_dialect_too() {
 fn lower_bare_reports_the_same_errors_as_lower() {
     let source = "local x <const> = 1\nx = 2\n";
     let diags = lower_bare(source, Dialect::Lua54, Dialect::Lua51).expect_err("const reassigned");
-    assert_eq!(
-        diags.iter().map(|d| d.code).collect::<Vec<_>>(),
-        vec!["LB0602"]
-    );
+    assert_eq!(diags.iter().map(|d| d.code).collect::<Vec<_>>(), vec![602]);
 }
 
 #[test]

@@ -4,10 +4,10 @@
 //! problem in the file, not just the first (cargo/rustc-style batch
 //! diagnostics, SPEC.md §14).
 //!
-//! Validation stays string-only: `edition` and `build.target` are checked
-//! against a local allow-list ([`ALLOWED_DIALECTS`]), never by parsing Lua —
-//! Distribution "never parses syntax" (SPEC.md §16), so this crate has no
-//! dependency on `luabox-syntax` and never will.
+//! Validation stays syntax-free: `edition` and `build.target` are parsed into
+//! the local [`DialectId`] vocabulary, never by parsing Lua — Distribution
+//! "never parses syntax" (SPEC.md §16), so this crate has no dependency on
+//! `luabox-syntax` and never will.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -16,8 +16,8 @@ use toml_edit::{ImDocument, Item, Table, TableLike};
 
 use crate::error::ManifestError;
 use crate::model::{
-    ALLOWED_BUNDLE_MODES, ALLOWED_DIALECTS, Build, DEFAULT_ENTRY, Dependency, GitDependency,
-    LINT_TIERS, Lint, LintLevel, Manifest, Package, PathDependency, Types, UrlDependency,
+    Build, BundleMode, DEFAULT_ENTRY, DEFAULT_OUT, Dependency, DialectId, GitDependency, Lint,
+    LintLevel, LintTier, Manifest, Package, PathDependency, Types, UrlDependency,
 };
 
 const TOP_LEVEL_KEYS: &[&str] = &[
@@ -35,7 +35,6 @@ const TOP_LEVEL_KEYS: &[&str] = &[
 /// nudge alone would leave the reader hunting for a typo that isn't there.
 const REMOVED_TOP_LEVEL_TABLES: &[&str] = &["tasks", "workspace"];
 const REMOVED_TABLE_NOTE: &str = "removed in 0.2.0, see CHANGELOG.md";
-const LINT_LEVELS: &[&str] = &["allow", "warn", "deny"];
 const PACKAGE_KEYS: &[&str] = &[
     "name",
     "version",
@@ -56,6 +55,10 @@ const BUILD_KEYS: &[&str] = &[
     "minify",
 ];
 const TYPES_KEYS: &[&str] = &["strict", "defs"];
+/// The [`DialectId`] a `Package` carries while its `edition` is missing or
+/// invalid. Never observable: `Manifest::parse` has pushed an error by the
+/// time it is used, so it returns `Err` and the `Package` is dropped.
+const EDITION_PLACEHOLDER: DialectId = DialectId::Lua54;
 const DEPENDENCY_KEYS: &[&str] = &[
     "git", "rev", "tag", "branch", "path", "url", "sha256", "version",
 ];
@@ -81,7 +84,7 @@ impl Manifest {
         check_top_level_keys(root, &mut errors);
 
         let package = parse_package(root, &mut errors);
-        let build = parse_build(root, &package.edition, &mut errors);
+        let build = parse_build(root, package.edition, &mut errors);
         let types = parse_types(root, &mut errors);
         let dependencies = parse_dependencies(root, "dependencies", &mut errors);
         let dev_dependencies = parse_dependencies(root, "dev-dependencies", &mut errors);
@@ -251,14 +254,15 @@ fn get_string_array(
     out
 }
 
-/// Like [`get_string_array`] but each entry is validated against
-/// [`ALLOWED_DIALECTS`] (SPEC.md §2, §6).
+/// Like [`get_string_array`] but each entry is parsed as a [`DialectId`]
+/// (SPEC.md §2, §6); an entry that is not a known dialect is reported and
+/// dropped.
 fn get_dialect_array(
     table: &dyn TableLike,
     ctx: &str,
     key: &str,
     errors: &mut Vec<ManifestError>,
-) -> Vec<String> {
+) -> Vec<DialectId> {
     let Some(item) = table.get(key) else {
         return Vec::new();
     };
@@ -272,10 +276,12 @@ fn get_dialect_array(
     let mut out = Vec::with_capacity(array.len());
     for value in array {
         match value.as_str() {
-            Some(s) => {
-                validate_dialect(&format!("{ctx}.{key} entry"), s, value.span(), errors);
-                out.push(s.to_owned());
-            }
+            Some(s) => out.extend(parse_closed::<DialectId>(
+                &format!("{ctx}.{key} entry"),
+                s,
+                value.span(),
+                errors,
+            )),
             None => errors.push(ManifestError::new(
                 format!("`{ctx}.{key}` entries must be strings"),
                 value.span(),
@@ -289,20 +295,32 @@ fn get_dialect_array(
 // Value-level validation
 // ---------------------------------------------------------------------
 
-fn validate_dialect(
+/// Parse one closed-vocabulary value ([`DialectId`], [`BundleMode`], …),
+/// recording an `invalid <what> …` error naming the accepted set when the
+/// spelling is not one the vocabulary accepts.
+///
+/// This is the single place a `[package]`/`[build]` enum field is validated:
+/// the typed model can therefore only ever carry accepted values, which is
+/// what lets frontends map the field inward with an exhaustive match instead
+/// of re-checking a string that already passed here.
+fn parse_closed<T>(
     what: &str,
     value: &str,
     span: Option<Range<usize>>,
     errors: &mut Vec<ManifestError>,
-) {
-    if !ALLOWED_DIALECTS.contains(&value) {
-        errors.push(ManifestError::new(
-            format!(
-                "invalid {what} `{value}` (valid: {})",
-                ALLOWED_DIALECTS.join(", ")
-            ),
-            span,
-        ));
+) -> Option<T>
+where
+    T: std::str::FromStr<Err = crate::model::UnknownValue>,
+{
+    match value.parse::<T>() {
+        Ok(parsed) => Some(parsed),
+        Err(unknown) => {
+            errors.push(ManifestError::new(
+                format!("invalid {what} {unknown}"),
+                span,
+            ));
+            None
+        }
     }
 }
 
@@ -373,7 +391,7 @@ fn parse_package(root: &Table, errors: &mut Vec<ManifestError>) -> Package {
         return Package {
             name: String::new(),
             version: String::new(),
-            edition: String::new(),
+            edition: EDITION_PLACEHOLDER,
             description: None,
             license: None,
             lua_versions: Vec::new(),
@@ -405,15 +423,14 @@ fn parse_package(root: &Table, errors: &mut Vec<ManifestError>) -> Package {
         ));
     }
 
-    let edition = get_string(table, "package", "edition", true, errors).unwrap_or_default();
-    if !edition.is_empty() {
-        validate_dialect(
-            "package.edition",
-            &edition,
-            item_span(table, "edition"),
-            errors,
-        );
-    }
+    // `edition` is required, so the placeholder below is only ever the value
+    // of a `Package` that is discarded: `Manifest::parse` returns `Err` with
+    // the missing/invalid-key error whenever this branch is taken.
+    let edition = get_string(table, "package", "edition", true, errors)
+        .and_then(|raw| {
+            parse_closed::<DialectId>("package.edition", &raw, item_span(table, "edition"), errors)
+        })
+        .unwrap_or(EDITION_PLACEHOLDER);
 
     let description = get_string(table, "package", "description", false, errors);
     let license = get_string(table, "package", "license", false, errors);
@@ -440,39 +457,29 @@ fn parse_package(root: &Table, errors: &mut Vec<ManifestError>) -> Package {
     }
 }
 
-fn parse_build(root: &Table, edition_fallback: &str, errors: &mut Vec<ManifestError>) -> Build {
+fn parse_build(
+    root: &Table,
+    edition_fallback: DialectId,
+    errors: &mut Vec<ManifestError>,
+) -> Build {
     let Some(table) = get_table(root, "build", errors) else {
-        return Build {
-            target: edition_fallback.to_owned(),
-            out: "dist".to_owned(),
-            mode: "plain".to_owned(),
-            entry: vec![DEFAULT_ENTRY.to_owned()],
-            outfile: None,
-            bundle: false,
-            sourcemap: false,
-            minify: false,
-        };
+        return Build::defaults(edition_fallback);
     };
     check_unknown_keys(table, "[build] key", BUILD_KEYS, errors);
 
     let target = get_string(table, "build", "target", false, errors)
-        .unwrap_or_else(|| edition_fallback.to_owned());
-    if !target.is_empty() {
-        validate_dialect("build.target", &target, item_span(table, "target"), errors);
-    }
-    let out = get_string(table, "build", "out", false, errors).unwrap_or_else(|| "dist".to_owned());
+        .map_or(Some(edition_fallback), |raw| {
+            parse_closed::<DialectId>("build.target", &raw, item_span(table, "target"), errors)
+        })
+        .unwrap_or(edition_fallback);
+    let out =
+        get_string(table, "build", "out", false, errors).unwrap_or_else(|| DEFAULT_OUT.to_owned());
 
-    let mode =
-        get_string(table, "build", "mode", false, errors).unwrap_or_else(|| "plain".to_owned());
-    if !mode.is_empty() && !ALLOWED_BUNDLE_MODES.contains(&mode.as_str()) {
-        errors.push(ManifestError::new(
-            format!(
-                "invalid build.mode `{mode}` (valid: {})",
-                ALLOWED_BUNDLE_MODES.join(", ")
-            ),
-            item_span(table, "mode"),
-        ));
-    }
+    let mode = get_string(table, "build", "mode", false, errors)
+        .map_or(Some(BundleMode::default()), |raw| {
+            parse_closed::<BundleMode>("build.mode", &raw, item_span(table, "mode"), errors)
+        })
+        .unwrap_or_default();
 
     // `entry` defaults to the conventional single entry point when absent;
     // an explicit empty list stays empty (a library with nothing to bundle).
@@ -512,9 +519,11 @@ fn parse_types(root: &Table, errors: &mut Vec<ManifestError>) -> Types {
 
 /// Parse `[lint]` (SPEC.md §9). `globals` is a string array; every other key
 /// is a level entry (`allow`/`warn`/`deny`) targeting either a tier name
-/// ([`LINT_TIERS`]) or a rule id. Rule ids are open (they live in
+/// ([`LintTier`]) or a rule id. Rule ids are open (they live in
 /// `luabox-lint`), so unknown keys are not rejected here — only the *level
-/// value* is validated, with a cargo-style did-you-mean nudge.
+/// value* is validated, with a cargo-style did-you-mean nudge. Tier names are
+/// closed, so [`Lint::tiers`] is keyed by the typed [`LintTier`] and can never
+/// hand a consumer a tier it does not know.
 fn parse_lint(root: &Table, errors: &mut Vec<ManifestError>) -> Lint {
     let Some(table) = get_table(root, "lint", errors) else {
         return Lint::default();
@@ -532,31 +541,25 @@ fn parse_lint(root: &Table, errors: &mut Vec<ManifestError>) -> Lint {
             ));
             continue;
         };
-        let Some(level) = parse_lint_level(raw) else {
+        let Ok(level) = raw.parse::<LintLevel>() else {
             errors.push(ManifestError::unknown_key(
                 &format!("lint level for `{key}`"),
                 raw,
-                LINT_LEVELS,
+                LintLevel::NAMES,
                 item_span(table, key),
             ));
             continue;
         };
-        if LINT_TIERS.contains(&key) {
-            lint.tiers.insert(key.to_owned(), level);
-        } else {
-            lint.rules.insert(key.to_owned(), level);
+        match key.parse::<LintTier>() {
+            Ok(tier) => {
+                lint.tiers.insert(tier, level);
+            }
+            Err(_) => {
+                lint.rules.insert(key.to_owned(), level);
+            }
         }
     }
     lint
-}
-
-fn parse_lint_level(raw: &str) -> Option<LintLevel> {
-    match raw {
-        "allow" => Some(LintLevel::Allow),
-        "warn" => Some(LintLevel::Warn),
-        "deny" => Some(LintLevel::Deny),
-        _ => None,
-    }
 }
 
 fn parse_dependencies(
@@ -741,11 +744,11 @@ mod tests {
 
         assert_eq!(manifest.package.name, "my-lib");
         assert_eq!(manifest.package.version, "1.2.0");
-        assert_eq!(manifest.package.edition, "5.4");
+        assert_eq!(manifest.package.edition, DialectId::Lua54);
         assert_eq!(manifest.package.license.as_deref(), Some("MIT"));
         assert_eq!(manifest.package.description, None);
 
-        assert_eq!(manifest.build.target, "5.1");
+        assert_eq!(manifest.build.target, DialectId::Lua51);
         assert_eq!(manifest.build.out, "dist");
 
         assert!(manifest.types.strict);
@@ -765,9 +768,17 @@ mod tests {
             Manifest::parse("[package]\nname = \"tiny\"\nversion = \"0.1.0\"\nedition = \"5.1\"\n")
                 .expect("minimal manifest is valid");
 
-        assert_eq!(manifest.build.target, "5.1", "target defaults to edition");
+        assert_eq!(
+            manifest.build.target,
+            DialectId::Lua51,
+            "target defaults to edition"
+        );
         assert_eq!(manifest.build.out, "dist");
-        assert_eq!(manifest.build.mode, "plain", "mode defaults to plain");
+        assert_eq!(
+            manifest.build.mode,
+            BundleMode::Plain,
+            "mode defaults to plain"
+        );
         assert_eq!(
             manifest.build.entry,
             vec!["src/main.lua".to_owned()],
@@ -814,7 +825,7 @@ mod tests {
             Manifest::parse("[package]\nedition = \"5.4\"\n").expect("edition-only manifest valid");
         assert!(manifest.package.name.is_empty());
         assert!(manifest.package.version.is_empty());
-        assert_eq!(manifest.package.edition, "5.4");
+        assert_eq!(manifest.package.edition, DialectId::Lua54);
     }
 
     #[test]
@@ -858,7 +869,7 @@ mod tests {
             Manifest::parse("[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.9\"\n")
                 .unwrap_err();
         let msg = &errors[0].message;
-        for dialect in ALLOWED_DIALECTS {
+        for dialect in DialectId::NAMES {
             assert!(msg.contains(dialect), "{msg} should mention {dialect}");
         }
     }
@@ -879,7 +890,7 @@ mod tests {
                 "[package]\nname = \"ok\"\nversion = \"1.0.0\"\nedition = \"5.4\"\n\n[build]\nmode = \"{mode}\"\n"
             ))
             .unwrap_or_else(|e| panic!("mode `{mode}` should be valid: {e:?}"));
-            assert_eq!(manifest.build.mode, mode);
+            assert_eq!(manifest.build.mode.as_str(), mode);
         }
     }
 
@@ -893,7 +904,7 @@ mod tests {
             .iter()
             .find(|e| e.message.contains("build.mode"))
             .expect("build.mode error present");
-        for mode in ALLOWED_BUNDLE_MODES {
+        for mode in BundleMode::NAMES {
             assert!(
                 msg.message.contains(mode),
                 "{} should mention {mode}",
@@ -1005,7 +1016,7 @@ mod tests {
         .expect("valid manifest");
         assert_eq!(
             manifest.package.lua_versions,
-            vec!["5.1".to_owned(), "5.4".to_owned()]
+            vec![DialectId::Lua51, DialectId::Lua54]
         );
         assert_eq!(
             manifest.package.min_luabox_version.as_deref(),
@@ -1256,7 +1267,10 @@ mod tests {
         );
         let manifest = Manifest::parse(&src).expect("valid [lint]");
         assert_eq!(manifest.lint.globals, vec!["vim", "love"]);
-        assert_eq!(manifest.lint.tiers.get("pedantic"), Some(&LintLevel::Warn));
+        assert_eq!(
+            manifest.lint.tiers.get(&LintTier::Pedantic),
+            Some(&LintLevel::Warn)
+        );
         assert_eq!(
             manifest.lint.rules.get("unused-local"),
             Some(&LintLevel::Allow)

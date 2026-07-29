@@ -18,12 +18,14 @@ use super::{Dialect, Parse, SyntaxKind};
 /// One dialect-legality violation: a construct that parsed (it's part of
 /// the union grammar) but is not legal under the configured `dialect`.
 ///
-/// `code` is a plain `LBnnnn` string — `luabox-syntax` does not depend on
-/// `luabox-diag` (SPEC.md §16 acyclic dep graph); the CLI maps these onto
-/// registered [`luabox_diag`]-style diagnostics.
+/// `code` is the bare numeric part of the `LBnnnn` code (`13` for `LB0013`).
+/// `luabox-syntax` does not depend on `luabox-diag` (SPEC.md §16 acyclic dep
+/// graph), and a `u16` is precisely what `luabox_diag::Code::new` takes — so a
+/// frontend converts by construction instead of re-parsing a string this crate
+/// had just formatted, and there is no "cannot happen" arm to abort in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialectError {
-    pub code: &'static str,
+    pub code: u16,
     pub message: String,
     pub range: rowan::TextRange,
 }
@@ -74,7 +76,7 @@ fn check_node(node: &super::SyntaxNode, dialect: Dialect, errors: &mut Vec<Diale
                 "a `goto` statement"
             };
             errors.push(DialectError {
-                code: "LB0010",
+                code: 10,
                 message: format!(
                     "{construct} is not available in {}; goto/labels are supported from Lua 5.2 onward (also LuaJIT)",
                     edition_name(dialect)
@@ -85,7 +87,7 @@ fn check_node(node: &super::SyntaxNode, dialect: Dialect, errors: &mut Vec<Diale
         SyntaxKind::NAME_ATTRIB if dialect != Dialect::Lua54 => {
             let attrib_text = node.text().to_string();
             errors.push(DialectError {
-                code: "LB0013",
+                code: 13,
                 message: format!(
                     "the `{attrib_text}` attribute is not available in {}; `<const>`/`<close>` attributes are supported from Lua 5.4 onward",
                     edition_name(dialect)
@@ -101,7 +103,7 @@ fn check_token(token: &super::SyntaxToken, dialect: Dialect, errors: &mut Vec<Di
     match token.kind() {
         SyntaxKind::SLASH_SLASH if !supports_53_ops(dialect) => {
             errors.push(DialectError {
-                code: "LB0011",
+                code: 11,
                 message: format!(
                     "integer division `//` is not available in {}; supported from Lua 5.3 onward (not supported on LuaJIT)",
                     edition_name(dialect)
@@ -117,7 +119,7 @@ fn check_token(token: &super::SyntaxToken, dialect: Dialect, errors: &mut Vec<Di
             if !supports_53_ops(dialect) =>
         {
             errors.push(DialectError {
-                code: "LB0012",
+                code: 12,
                 message: format!(
                     "the bitwise operator `{}` is not available in {}; bitwise operators are supported from Lua 5.3 onward (not supported on LuaJIT)",
                     token.text(),
@@ -150,7 +152,7 @@ fn check_number_literal(
     };
     if rest.contains('.') || rest.contains('p') {
         errors.push(DialectError {
-            code: "LB0014",
+            code: 14,
             message: format!(
                 "the hex float literal `{text}` is not available in {}; hex float literals are supported from Lua 5.2 onward (also LuaJIT)",
                 edition_name(dialect)
@@ -184,10 +186,10 @@ fn check_string_escapes(
         let esc = bytes[i + 1];
         match esc {
             b'z' | b'Z' if !supports_52_lexis(dialect) => {
-                push_escape_error(errors, "LB0015", "\\z", "Lua 5.2", i, 2, start);
+                push_escape_error(errors, 15, "\\z", "Lua 5.2", i, 2, start);
             }
             b'x' if !supports_52_lexis(dialect) => {
-                push_escape_error(errors, "LB0015", "\\x", "Lua 5.2", i, 2, start);
+                push_escape_error(errors, 15, "\\x", "Lua 5.2", i, 2, start);
             }
             b'u' if bytes.get(i + 2) == Some(&b'{') && !supports_53_ops(dialect) => {
                 // Skip to the closing `}` (or end of the token) so the
@@ -198,7 +200,7 @@ fn check_string_escapes(
                     j += 1;
                 }
                 let end = (j + 1).min(bytes.len());
-                push_escape_error(errors, "LB0016", "\\u{...}", "Lua 5.3", i, end - i, start);
+                push_escape_error(errors, 16, "\\u{...}", "Lua 5.3", i, end - i, start);
                 i = end;
                 continue;
             }
@@ -214,7 +216,7 @@ fn check_string_escapes(
 )]
 fn push_escape_error(
     errors: &mut Vec<DialectError>,
-    code: &'static str,
+    code: u16,
     escape: &str,
     earliest: &str,
     offset: usize,
@@ -242,7 +244,7 @@ mod tests {
         validate(&parse, dialect)
     }
 
-    fn codes_for(text: &str, dialect: Dialect) -> Vec<&'static str> {
+    fn codes_for(text: &str, dialect: Dialect) -> Vec<u16> {
         errors_for(text, dialect).iter().map(|e| e.code).collect()
     }
 
@@ -258,7 +260,7 @@ mod tests {
         ] {
             assert_eq!(
                 codes_for("::top:: goto top", dialect),
-                Vec::<&str>::new(),
+                Vec::<u16>::new(),
                 "{dialect:?} should allow goto/labels"
             );
         }
@@ -272,7 +274,7 @@ mod tests {
         // 5.1 code, so it must not fire here.
         let errors = errors_for("::top::", Dialect::Lua51);
         assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].code, "LB0010");
+        assert_eq!(errors[0].code, 10);
         assert_eq!(errors[0].range, rowan::TextRange::new(0.into(), 7.into()));
     }
 
@@ -280,7 +282,7 @@ mod tests {
     fn bare_goto_call_in_51_is_legal_51_code() {
         // In 5.1, `goto` is an ordinary identifier: `goto(top)` is a call,
         // not a goto statement, and must not trip LB0010.
-        assert_eq!(codes_for("goto(top)", Dialect::Lua51), Vec::<&str>::new());
+        assert_eq!(codes_for("goto(top)", Dialect::Lua51), Vec::<u16>::new());
     }
 
     #[test]
@@ -300,7 +302,7 @@ mod tests {
         let parse = parse("goto top", Dialect::Lua52);
         let errors = validate(&parse, Dialect::Lua51);
         assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].code, "LB0010");
+        assert_eq!(errors[0].code, 10);
         assert!(
             errors[0].message.contains("a `goto` statement"),
             "{}",
@@ -323,14 +325,14 @@ mod tests {
     #[test]
     fn integer_division_errors_before_53_and_on_luajit() {
         for dialect in [Dialect::Lua51, Dialect::Lua52, Dialect::LuaJit] {
-            assert_eq!(codes_for("x = a // b", dialect), vec!["LB0011"]);
+            assert_eq!(codes_for("x = a // b", dialect), vec![11]);
         }
     }
 
     #[test]
     fn integer_division_clean_on_53_and_54() {
         for dialect in [Dialect::Lua53, Dialect::Lua54] {
-            assert_eq!(codes_for("x = a // b", dialect), Vec::<&str>::new());
+            assert_eq!(codes_for("x = a // b", dialect), Vec::<u16>::new());
         }
     }
 
@@ -346,16 +348,12 @@ mod tests {
     #[test]
     fn bitops_error_before_53_and_on_luajit() {
         for dialect in [Dialect::Lua51, Dialect::Lua52, Dialect::LuaJit] {
-            assert_eq!(codes_for("x = a & b", dialect), vec!["LB0012"]);
-            assert_eq!(codes_for("x = a | b", dialect), vec!["LB0012"]);
-            assert_eq!(codes_for("x = a << b", dialect), vec!["LB0012"]);
-            assert_eq!(codes_for("x = a >> b", dialect), vec!["LB0012"]);
-            assert_eq!(
-                codes_for("x = a ~ b", dialect),
-                vec!["LB0012"],
-                "binary xor"
-            );
-            assert_eq!(codes_for("x = ~a", dialect), vec!["LB0012"], "unary bnot");
+            assert_eq!(codes_for("x = a & b", dialect), vec![12]);
+            assert_eq!(codes_for("x = a | b", dialect), vec![12]);
+            assert_eq!(codes_for("x = a << b", dialect), vec![12]);
+            assert_eq!(codes_for("x = a >> b", dialect), vec![12]);
+            assert_eq!(codes_for("x = a ~ b", dialect), vec![12], "binary xor");
+            assert_eq!(codes_for("x = ~a", dialect), vec![12], "unary bnot");
         }
     }
 
@@ -364,7 +362,7 @@ mod tests {
         for dialect in [Dialect::Lua53, Dialect::Lua54] {
             assert_eq!(
                 codes_for("x = a & b | c ~ d << e >> f", dialect),
-                Vec::<&str>::new()
+                Vec::<u16>::new()
             );
         }
     }
@@ -372,14 +370,14 @@ mod tests {
     #[test]
     fn tilde_eq_never_fires() {
         for dialect in Dialect::ALL {
-            assert_eq!(codes_for("x = a ~= b", dialect), Vec::<&str>::new());
+            assert_eq!(codes_for("x = a ~= b", dialect), Vec::<u16>::new());
         }
     }
 
     #[test]
     fn hash_length_operator_never_fires() {
         for dialect in Dialect::ALL {
-            assert_eq!(codes_for("x = #t", dialect), Vec::<&str>::new());
+            assert_eq!(codes_for("x = #t", dialect), Vec::<u16>::new());
         }
     }
 
@@ -400,8 +398,8 @@ mod tests {
             Dialect::Lua53,
             Dialect::LuaJit,
         ] {
-            assert_eq!(codes_for("local x <const> = 1", dialect), vec!["LB0013"]);
-            assert_eq!(codes_for("local x <close> = 1", dialect), vec!["LB0013"]);
+            assert_eq!(codes_for("local x <const> = 1", dialect), vec![13]);
+            assert_eq!(codes_for("local x <close> = 1", dialect), vec![13]);
         }
     }
 
@@ -409,7 +407,7 @@ mod tests {
     fn attribs_clean_only_on_54() {
         assert_eq!(
             codes_for("local x <const>, y <close> = 1, 2", Dialect::Lua54),
-            Vec::<&str>::new()
+            Vec::<u16>::new()
         );
     }
 
@@ -424,29 +422,29 @@ mod tests {
 
     #[test]
     fn hex_float_errors_in_51_only() {
-        assert_eq!(codes_for("x = 0x1p4", Dialect::Lua51), vec!["LB0014"]);
-        assert_eq!(codes_for("x = 0x1.8p3", Dialect::Lua51), vec!["LB0014"]);
+        assert_eq!(codes_for("x = 0x1p4", Dialect::Lua51), vec![14]);
+        assert_eq!(codes_for("x = 0x1.8p3", Dialect::Lua51), vec![14]);
         for dialect in [
             Dialect::Lua52,
             Dialect::Lua53,
             Dialect::Lua54,
             Dialect::LuaJit,
         ] {
-            assert_eq!(codes_for("x = 0x1p4", dialect), Vec::<&str>::new());
+            assert_eq!(codes_for("x = 0x1p4", dialect), Vec::<u16>::new());
         }
     }
 
     #[test]
     fn plain_hex_integer_never_fires() {
         for dialect in Dialect::ALL {
-            assert_eq!(codes_for("x = 0xBEBADA", dialect), Vec::<&str>::new());
+            assert_eq!(codes_for("x = 0xBEBADA", dialect), Vec::<u16>::new());
         }
     }
 
     #[test]
     fn plain_decimal_float_never_fires() {
         for dialect in Dialect::ALL {
-            assert_eq!(codes_for("x = 3.1416e-2", dialect), Vec::<&str>::new());
+            assert_eq!(codes_for("x = 3.1416e-2", dialect), Vec::<u16>::new());
         }
     }
 
@@ -454,19 +452,16 @@ mod tests {
 
     #[test]
     fn z_and_x_escapes_error_in_51_only() {
-        assert_eq!(
-            codes_for("x = \"a\\z\n  b\"", Dialect::Lua51),
-            vec!["LB0015"]
-        );
-        assert_eq!(codes_for("x = \"a\\x41b\"", Dialect::Lua51), vec!["LB0015"]);
+        assert_eq!(codes_for("x = \"a\\z\n  b\"", Dialect::Lua51), vec![15]);
+        assert_eq!(codes_for("x = \"a\\x41b\"", Dialect::Lua51), vec![15]);
         for dialect in [
             Dialect::Lua52,
             Dialect::Lua53,
             Dialect::Lua54,
             Dialect::LuaJit,
         ] {
-            assert_eq!(codes_for("x = \"a\\z\n  b\"", dialect), Vec::<&str>::new());
-            assert_eq!(codes_for("x = \"a\\x41b\"", dialect), Vec::<&str>::new());
+            assert_eq!(codes_for("x = \"a\\z\n  b\"", dialect), Vec::<u16>::new());
+            assert_eq!(codes_for("x = \"a\\x41b\"", dialect), Vec::<u16>::new());
         }
     }
 
@@ -476,7 +471,7 @@ mod tests {
         // `\z` escape.
         assert_eq!(
             codes_for(r#"x = "a\\z""#, Dialect::Lua51),
-            Vec::<&str>::new()
+            Vec::<u16>::new()
         );
     }
 
@@ -487,12 +482,12 @@ mod tests {
         for dialect in Dialect::ALL {
             assert_eq!(
                 codes_for("x = [[a\\z b\\x41 c\\u{48}]]", dialect),
-                Vec::<&str>::new(),
+                Vec::<u16>::new(),
                 "{dialect:?}"
             );
             assert_eq!(
                 codes_for("x = [==[a\\x41]==]", dialect),
-                Vec::<&str>::new(),
+                Vec::<u16>::new(),
                 "{dialect:?}"
             );
         }
@@ -503,7 +498,7 @@ mod tests {
         for dialect in Dialect::ALL {
             assert_eq!(
                 codes_for(r#"x = "a\nb\tc\\d\"e""#, dialect),
-                Vec::<&str>::new()
+                Vec::<u16>::new()
             );
         }
     }
@@ -521,14 +516,14 @@ mod tests {
     #[test]
     fn unicode_escape_errors_before_53() {
         for dialect in [Dialect::Lua51, Dialect::Lua52, Dialect::LuaJit] {
-            assert_eq!(codes_for(r#"x = "\u{48}""#, dialect), vec!["LB0016"]);
+            assert_eq!(codes_for(r#"x = "\u{48}""#, dialect), vec![16]);
         }
     }
 
     #[test]
     fn unicode_escape_clean_on_53_and_54() {
         for dialect in [Dialect::Lua53, Dialect::Lua54] {
-            assert_eq!(codes_for(r#"x = "\u{48}""#, dialect), Vec::<&str>::new());
+            assert_eq!(codes_for(r#"x = "\u{48}""#, dialect), Vec::<u16>::new());
         }
     }
 
@@ -538,7 +533,7 @@ mod tests {
         // stray \x-ish sequence.
         let errors = errors_for(r#"x = "\u{48}""#, Dialect::Lua51);
         assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].code, "LB0016");
+        assert_eq!(errors[0].code, 16);
     }
 
     // === Multiple violations collected in one pass ===
@@ -549,10 +544,7 @@ mod tests {
         let errors = errors_for(src, Dialect::Lua51);
         let mut codes: Vec<_> = errors.iter().map(|e| e.code).collect();
         codes.sort_unstable();
-        assert_eq!(
-            codes,
-            vec!["LB0010", "LB0011", "LB0012", "LB0013", "LB0014"]
-        );
+        assert_eq!(codes, vec![10, 11, 12, 13, 14]);
         // Reported in source order.
         for pair in errors.windows(2) {
             assert!(pair[0].range.start() <= pair[1].range.start());
@@ -573,7 +565,7 @@ for i = 1, #t do t[i] = t[i] * 2 end\n\
 for k, v in pairs(t) do print(k, v) end\n\
 local s = \"line1\\nline2\\ttab\"\n\
 print(fib(10), s)\n";
-        assert_eq!(codes_for(src, Dialect::Lua51), Vec::<&str>::new());
+        assert_eq!(codes_for(src, Dialect::Lua51), Vec::<u16>::new());
     }
 
     #[test]
@@ -587,7 +579,7 @@ if i < 3 then goto top end\n\
 local hex = 0x1p4\n\
 local s = \"a\\z\n  b\\x41\"\n\
 print(i, hex, s)\n";
-        assert_eq!(codes_for(src, Dialect::Lua52), Vec::<&str>::new());
+        assert_eq!(codes_for(src, Dialect::Lua52), Vec::<u16>::new());
     }
 
     #[test]
@@ -599,7 +591,7 @@ local bits = a & b | 1 ~ 2\n\
 bits = bits << 1 >> 1\n\
 local s = \"\\u{48}\\u{49}\"\n\
 print(q, bits, s)\n";
-        assert_eq!(codes_for(src, Dialect::Lua53), Vec::<&str>::new());
+        assert_eq!(codes_for(src, Dialect::Lua53), Vec::<u16>::new());
     }
 
     #[test]
@@ -613,7 +605,7 @@ do\n\
   local s = \"\\u{2603}\"\n\
   print(q, bits, s)\n\
 end\n";
-        assert_eq!(codes_for(src, Dialect::Lua54), Vec::<&str>::new());
+        assert_eq!(codes_for(src, Dialect::Lua54), Vec::<u16>::new());
     }
 
     #[test]
@@ -627,6 +619,6 @@ local hex = 0x1p4\n\
 local n = 42LL\n\
 local s = \"a\\z\n  b\\x41\"\n\
 print(i, hex, n, s)\n";
-        assert_eq!(codes_for(src, Dialect::LuaJit), Vec::<&str>::new());
+        assert_eq!(codes_for(src, Dialect::LuaJit), Vec::<u16>::new());
     }
 }

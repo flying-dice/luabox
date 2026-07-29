@@ -30,13 +30,19 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail};
 use luabox_diag::{Code, Diagnostic, Format, Label, Span};
 use luabox_manifest::layout::{self, DefFiles, DefSource};
-use luabox_manifest::model::Manifest;
+use luabox_manifest::model::{Build, DialectId, Manifest};
 use luabox_syntax::{Dialect, lua};
 use luabox_types::ty::Ty;
 use luabox_types::{Ambient, DefFile, Strictness, build_ambient_checked, stdlib_defs};
 use rayon::prelude::*;
 
 use layout::display_rel;
+
+/// What a manifest-less directory is checked as: Lua 5.4, warn mode — least
+/// surprise. Held in both vocabularies because a manifest-less project still
+/// needs a `[build]` config (`Build::defaults`) to build with.
+const DEFAULT_DIALECT_ID: DialectId = DialectId::Lua54;
+const DEFAULT_DIALECT: Dialect = Dialect::Lua54;
 
 /// Execute `luabox check` from `cwd`. With `watch`, the check reruns on
 /// every debounced, filtered filesystem change under the project root
@@ -45,29 +51,31 @@ use layout::display_rel;
 /// only returns on setup failure (e.g. the watch root can't be observed).
 /// Without `watch` it runs once and its `Result` becomes the process exit
 /// code, as before.
-pub fn run(cwd: &Path, target: Option<&str>, format: &str, watch: bool) -> anyhow::Result<()> {
+pub fn run(cwd: &Path, target: Option<&str>, format: Format, watch: bool) -> anyhow::Result<()> {
+    let project = discover(cwd)?;
     if watch {
-        // Discover once up front purely to get a root/out-dir to watch;
-        // `run_once` rediscovers the project fresh on every rerun, so a
-        // manifest edit (edition, strictness) takes effect on the very
-        // next rerun without any extra plumbing here.
-        let project = discover(cwd)?;
         let cwd = cwd.to_path_buf();
         let target = target.map(str::to_owned);
-        let format = format.to_owned();
         return crate::watch::run(&project.root, project.out_dir.as_deref(), move || {
-            run_once(&cwd, target.as_deref(), &format, None)
+            // Rediscovered per rerun — that is what makes a manifest edit
+            // (edition, strictness) take effect on the very next rerun. The
+            // discovery above is only for the root/out-dir being watched.
+            run_once(&discover(&cwd)?, target.as_deref(), format)
         });
     }
-    run_once(cwd, target, format, None)
+    run_once(&project, target, format)
 }
 
-/// The single-pass body of `luabox check`: discover the project, typecheck
-/// every file, and translate the diagnostics into an exit code. Shared by
-/// one-shot `run`, each rerun of `run` in `--watch` mode, and the
-/// check-first gate of `luabox build` (`crate::build_cmd`), which passes
-/// its chosen out directory as `skip_out` so previously emitted output is
-/// never checked as project source even under a custom `--out`.
+/// The single-pass body of `luabox check`: typecheck every file of an
+/// already-discovered project and translate the diagnostics into an exit
+/// code. Shared by one-shot `run`, each rerun of `run` in `--watch` mode, and
+/// the check-first gate of `luabox build` (`crate::build_cmd`).
+///
+/// It takes a `&Project` rather than a directory to discover (CC-M11): the
+/// caller decides what the project *is*, which is how `build` gets its chosen
+/// `--out` skipped — it sets `out_dir` on the project it already discovered,
+/// so previously emitted output is never checked as source, and no second
+/// manifest read is needed to arrange that.
 // Require-resolution is single-sourced through [`luabox_bundle::resolve_module`]
 // (SPEC.md §7): this CLI path resolves against the filesystem, and luabox-db —
 // the Semantics seam behind the LSP — resolves the same candidate ordering
@@ -76,29 +84,19 @@ pub fn run(cwd: &Path, target: Option<&str>, format: &str, watch: bool) -> anyho
 // prior db path-suffix approximation is gone). Surface assembly likewise flows
 // through the one `luabox_types::module_surface` producer on both sides.
 pub(crate) fn run_once(
-    cwd: &Path,
+    project: &Project,
     target: Option<&str>,
-    format: &str,
-    skip_out: Option<&Path>,
+    format: Format,
 ) -> anyhow::Result<()> {
-    let format = parse_format(format)?;
-    let mut project = discover(cwd)?;
-    if let Some(out) = skip_out {
-        project.out_dir = Some(out.to_path_buf());
-    }
-
-    // Validate --target up front: a bad value is itself a diagnostic.
+    // Validate --target up front: a bad value is itself a diagnostic, so it
+    // rides the chosen output format like any other finding rather than
+    // becoming a usage error (`crate::dialect`).
     let mut target_dialect = None;
     if let Some(id) = target {
-        let Some(dialect) = Dialect::from_manifest_id(id) else {
-            let diag = Diagnostic::error(
-                code(1001),
-                format!("unknown target `{id}`; expected one of: 5.1, 5.2, 5.3, 5.4, luajit"),
-            )
-            .with_note("run `luabox explain LB1001` for the full list of editions");
-            return finish(&[diag], format, &project.root, 0);
-        };
-        target_dialect = Some(dialect);
+        match crate::dialect::parse("target", id) {
+            Ok(dialect) => target_dialect = Some(dialect),
+            Err(unknown) => return finish(&[unknown.diagnostic()], format, &project.root, 0),
+        }
     }
 
     let lua_files =
@@ -182,7 +180,7 @@ pub(crate) fn run_once(
             check_one(
                 &source,
                 &rel,
-                &project,
+                project,
                 target_dialect,
                 ambient,
                 &exports,
@@ -218,7 +216,7 @@ fn check_one(
     // 1. Parse errors.
     for err in parse.errors() {
         diags.push(
-            Diagnostic::error(code(1), err.message.clone()).with_label(Label::primary(
+            Diagnostic::error(Code::new(1), err.message.clone()).with_label(Label::primary(
                 Span::new(rel, to_range(err.range)),
                 "syntax error here",
             )),
@@ -233,19 +231,15 @@ fn check_one(
     {
         passes.push(target);
     }
-    let mut seen: HashSet<(&'static str, u32, u32)> = HashSet::new();
+    let mut seen: HashSet<(u16, u32, u32)> = HashSet::new();
     for dialect in passes {
         for err in lua::validate::validate(&parse, dialect) {
             let key = (err.code, err.range.start().into(), err.range.end().into());
             if !seen.insert(key) {
                 continue;
             }
-            let parsed: Code = err
-                .code
-                .parse()
-                .unwrap_or_else(|_| unreachable!("validator emits registered codes"));
             diags.push(
-                Diagnostic::error(parsed, err.message).with_label(Label::primary(
+                Diagnostic::error(Code::new(err.code), err.message).with_label(Label::primary(
                     Span::new(rel, to_range(err.range)),
                     "not legal in this edition",
                 )),
@@ -318,23 +312,8 @@ fn finish(
     Ok(())
 }
 
-pub(crate) fn code(number: u16) -> Code {
-    Code::new(number)
-}
-
 fn to_range(range: rowan::TextRange) -> std::ops::Range<usize> {
     usize::from(range.start())..usize::from(range.end())
-}
-
-fn parse_format(format: &str) -> anyhow::Result<Format> {
-    Ok(match format {
-        "human" => Format::Human,
-        "json" => Format::Json,
-        "sarif" => Format::Sarif,
-        "github" => Format::GithubActions,
-        "gitlab" => Format::GitlabCodeQuality,
-        other => bail!("unknown format `{other}`; expected human, json, sarif, github, or gitlab"),
-    })
 }
 
 pub(crate) struct Project {
@@ -345,6 +324,18 @@ pub(crate) struct Project {
     /// `[build] target` — the dialect you ship (SPEC.md §2.1, §5); defaults
     /// to the edition. Consumed by `crate::build_cmd`.
     pub(crate) build_target: Dialect,
+    /// `[package] name`, empty when the manifest omits it (SPEC.md §6: the
+    /// rockspec is the package manifest) or when there is no manifest at all.
+    /// Each consumer supplies its own substitute — `build` bundles as
+    /// `"bundle"`, `doc` titles the site after the project directory — which
+    /// is why discovery reports the manifest's answer rather than guessing.
+    pub(crate) name: String,
+    /// `[package] description`, for the `nvim-plugin` doc stub.
+    pub(crate) description: Option<String>,
+    /// `[build]` (SPEC.md §5, §7). Discovery is the *only* manifest read on
+    /// the `build` path: flags override these fields, nothing re-parses
+    /// `luabox.toml` to find them again.
+    pub(crate) build: Build,
     /// `[types] defs`, ambient definition packages resolved from the
     /// project-local `defs/` directory (SPEC.md §3, §5). `pub(crate)` so
     /// `doc_cmd` can resolve the same def files it uses for type-checking
@@ -366,37 +357,31 @@ pub(crate) fn discover(cwd: &Path) -> anyhow::Result<Project> {
     let Some((root, manifest)) = layout::discover_manifest(cwd)? else {
         return Ok(Project {
             root: cwd.to_path_buf(),
-            dialect: Dialect::Lua54,
+            dialect: DEFAULT_DIALECT,
             strictness: Strictness::Warn,
             out_dir: None,
-            build_target: Dialect::Lua54,
+            build_target: DEFAULT_DIALECT,
+            name: String::new(),
+            description: None,
+            build: Build::defaults(DEFAULT_DIALECT_ID),
             defs: Vec::new(),
             dep_defs: Vec::new(),
         });
     };
-    let manifest_path = root.join("luabox.toml");
-    let Some(dialect) = Dialect::from_manifest_id(&manifest.package.edition) else {
-        bail!(
-            "unknown edition `{}` in `{}` (see `luabox explain LB1001`)",
-            manifest.package.edition,
-            manifest_path.display()
-        );
-    };
-    let Some(build_target) = Dialect::from_manifest_id(&manifest.build.target) else {
-        bail!(
-            "unknown build target `{}` in `{}` (see `luabox explain LB1001`)",
-            manifest.build.target,
-            manifest_path.display()
-        );
-    };
+    // No "unknown edition in a manifest that already parsed" arm: `[package]
+    // edition` and `[build] target` are typed as `DialectId` by
+    // `Manifest::parse`, so the mapping inward is exhaustive (CC-M13).
     Ok(Project {
-        root: root.clone(),
-        dialect,
+        dialect: crate::dialect::from_manifest(manifest.package.edition),
         strictness: Strictness::from_manifest_flag(manifest.types.strict),
         out_dir: Some(root.join(&manifest.build.out)),
-        build_target,
+        build_target: crate::dialect::from_manifest(manifest.build.target),
+        name: manifest.package.name.clone(),
+        description: manifest.package.description.clone(),
+        build: manifest.build.clone(),
         defs: manifest.types.defs.clone(),
         dep_defs: resolve_dep_defs(&root, &manifest),
+        root,
     })
 }
 
@@ -420,7 +405,7 @@ pub(crate) fn resolve_project_defs(
         .into_iter()
         .map(|name| {
             Diagnostic::error(
-                code(1002),
+                Code::new(1002),
                 format!("cannot resolve definition package `{name}` from `[types] defs`"),
             )
             .with_note(format!(
@@ -465,51 +450,19 @@ mod tests {
     // they build the project from the text rather than from `(edition, extra)`.
     use crate::testutil::{manifest, project_with_manifest as project, write};
 
-    // -- format parsing ----------------------------------------------------
-
-    #[test]
-    fn every_documented_output_format_is_accepted() {
-        for (name, expected) in [
-            ("human", Format::Human),
-            ("json", Format::Json),
-            ("sarif", Format::Sarif),
-            ("github", Format::GithubActions),
-            ("gitlab", Format::GitlabCodeQuality),
-        ] {
-            assert_eq!(
-                parse_format(name).expect("accepted"),
-                expected,
-                "for {name}"
-            );
-        }
+    /// `luabox check` as the CLI runs it: discover, then check once. The
+    /// output format is clap's problem now (`crate::FormatArg`), so it
+    /// arrives already typed.
+    fn check(cwd: &Path, target: Option<&str>, format: Format) -> anyhow::Result<()> {
+        run_once(&discover(cwd)?, target, format)
     }
 
-    #[test]
-    fn an_unknown_output_format_is_rejected_listing_the_valid_ones() {
-        let error = parse_format("xml").unwrap_err().to_string();
-        assert!(error.contains("unknown format `xml`"), "{error}");
-        assert!(
-            error.contains("human, json, sarif, github, or gitlab"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn run_once_rejects_a_bad_format_before_touching_the_filesystem() {
-        // No project, no files — the format is validated first, so the failure
-        // is `parse_format`'s own message (not a discovery or walk error) and
-        // the run gets far enough to create nothing.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let error = run_once(tmp.path(), None, "yaml", None)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("unknown format `yaml`"), "{error}");
-        let created: Vec<_> = fs::read_dir(tmp.path())
-            .expect("read the project root")
-            .flatten()
-            .map(|entry| entry.file_name())
-            .collect();
-        assert!(created.is_empty(), "the rejected run wrote {created:?}");
+    /// [`check`] with the chosen out directory overridden, as `luabox build`
+    /// does for its check gate.
+    fn check_skipping(cwd: &Path, out: &Path) -> anyhow::Result<()> {
+        let mut project = discover(cwd)?;
+        project.out_dir = Some(out.to_path_buf());
+        run_once(&project, None, Format::Human)
     }
 
     // -- discovery ---------------------------------------------------------
@@ -563,20 +516,20 @@ mod tests {
     fn a_clean_project_checks_successfully() {
         let tmp = project(&manifest("5.4", ""));
         write(tmp.path(), "src/main.lua", "local x = 1\nprint(x)\n");
-        run_once(tmp.path(), None, "human", None).expect("check passes");
+        check(tmp.path(), None, Format::Human).expect("check passes");
     }
 
     #[test]
     fn an_empty_project_checks_successfully() {
         let tmp = project(&manifest("5.4", ""));
-        run_once(tmp.path(), None, "human", None).expect("check passes");
+        check(tmp.path(), None, Format::Human).expect("check passes");
     }
 
     #[test]
     fn a_syntax_error_fails_the_check() {
         let tmp = project(&manifest("5.4", ""));
         write(tmp.path(), "src/main.lua", "local x = \n");
-        let error = run_once(tmp.path(), None, "human", None)
+        let error = check(tmp.path(), None, Format::Human)
             .unwrap_err()
             .to_string();
         assert!(error.contains("check failed with"), "{error}");
@@ -593,7 +546,7 @@ mod tests {
         );
         // Exactly one error — the argument mismatch — and not, say, a second
         // one from the annotation itself.
-        let error = run_once(tmp.path(), None, "human", None)
+        let error = check(tmp.path(), None, Format::Human)
             .unwrap_err()
             .to_string();
         assert_eq!(error, "check failed with 1 error(s)");
@@ -608,14 +561,14 @@ mod tests {
             "---@param n number\nlocal function double(n)\n  return n * 2\nend\ndouble(\"nope\")\n",
         );
         // Warnings never fail the command (module docs, SPEC.md §3).
-        run_once(tmp.path(), None, "human", None).expect("warnings do not fail");
+        check(tmp.path(), None, Format::Human).expect("warnings do not fail");
     }
 
     #[test]
     fn an_unknown_target_is_reported_as_a_diagnostic_not_a_bare_error() {
         let tmp = project(&manifest("5.4", ""));
         write(tmp.path(), "src/main.lua", "return 0\n");
-        let error = run_once(tmp.path(), Some("5.9"), "human", None)
+        let error = check(tmp.path(), Some("5.9"), Format::Human)
             .unwrap_err()
             .to_string();
         // LB1001 is rendered like any other diagnostic, then the run fails
@@ -628,7 +581,7 @@ mod tests {
         let tmp = project(&manifest("5.4", ""));
         write(tmp.path(), "src/main.lua", "return 0\n");
         for target in ["5.1", "5.2", "5.3", "5.4", "luajit"] {
-            run_once(tmp.path(), Some(target), "human", None)
+            check(tmp.path(), Some(target), Format::Human)
                 .unwrap_or_else(|e| panic!("target {target} should check clean: {e}"));
         }
     }
@@ -642,10 +595,10 @@ mod tests {
             "src/main.lua",
             "local i = 0\n::top::\ni = i + 1\nif i < 3 then goto top end\n",
         );
-        run_once(tmp.path(), None, "human", None).expect("legal in the edition");
+        check(tmp.path(), None, Format::Human).expect("legal in the edition");
         // Both 5.1-illegal constructs are reported — the `::top::` label and
         // the `goto` — each once.
-        let error = run_once(tmp.path(), Some("5.1"), "human", None)
+        let error = check(tmp.path(), Some("5.1"), Format::Human)
             .unwrap_err()
             .to_string();
         assert_eq!(error, "check failed with 2 error(s)");
@@ -655,10 +608,10 @@ mod tests {
     fn a_target_equal_to_the_edition_does_not_duplicate_findings() {
         let tmp = project(&manifest("5.1", ""));
         write(tmp.path(), "src/main.lua", "local i = 0\ngoto top\n");
-        let with_target = run_once(tmp.path(), Some("5.1"), "human", None)
+        let with_target = check(tmp.path(), Some("5.1"), Format::Human)
             .unwrap_err()
             .to_string();
-        let without = run_once(tmp.path(), None, "human", None)
+        let without = check(tmp.path(), None, Format::Human)
             .unwrap_err()
             .to_string();
         // The edition pass and the target pass are the same dialect: the
@@ -673,7 +626,7 @@ mod tests {
         // the reader sees one finding, not the same one twice.
         let tmp = project(&manifest("5.1", ""));
         write(tmp.path(), "src/main.lua", "local x = 7 // 2\n");
-        let error = run_once(tmp.path(), Some("5.2"), "human", None)
+        let error = check(tmp.path(), Some("5.2"), Format::Human)
             .unwrap_err()
             .to_string();
         assert_eq!(error, "check failed with 1 error(s)");
@@ -681,13 +634,17 @@ mod tests {
 
     #[test]
     fn diagnostics_render_in_the_requested_machine_format() {
-        for format in ["human", "json", "sarif", "github", "gitlab"] {
+        for format in [
+            Format::Human,
+            Format::Json,
+            Format::Sarif,
+            Format::GithubActions,
+            Format::GitlabCodeQuality,
+        ] {
             let tmp = project(&manifest("5.4", ""));
             write(tmp.path(), "src/main.lua", "local x = \n");
-            let error = run_once(tmp.path(), None, format, None)
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("check failed"), "for {format}: {error}");
+            let error = check(tmp.path(), None, format).unwrap_err().to_string();
+            assert!(error.contains("check failed"), "for {format:?}: {error}");
         }
     }
 
@@ -697,11 +654,11 @@ mod tests {
         // Broken syntax in a `*.d.lua` would fail the check if it were
         // walked as project source; `*.d.lua` are ambient surfaces instead.
         write(tmp.path(), "defs/broken.d.lua", "local x = \n");
-        run_once(tmp.path(), None, "human", None).expect("d.lua files are skipped");
+        check(tmp.path(), None, Format::Human).expect("d.lua files are skipped");
     }
 
     #[test]
-    fn previously_emitted_build_output_is_skipped_via_skip_out() {
+    fn previously_emitted_build_output_is_skipped_via_the_project_out_dir() {
         let tmp = project(&manifest("5.4", "\n[build]\nout = \"dist\"\n"));
         write(tmp.path(), "src/main.lua", "return 0\n");
         write(tmp.path(), "custom-out/main.lua", "local x = \n");
@@ -709,19 +666,19 @@ mod tests {
         // The manifest's out dir doesn't cover `custom-out/`, so an
         // unqualified check sees the broken emitted file — and it is that one
         // file's syntax error it trips on, nothing else...
-        let error = run_once(tmp.path(), None, "human", None)
+        let error = check(tmp.path(), None, Format::Human)
             .unwrap_err()
             .to_string();
         assert_eq!(error, "check failed with 1 error(s)");
-        // ...but `build` passing its chosen `--out` as `skip_out` does not.
+        // ...but `build` setting its chosen `--out` on the project does not.
         let out = tmp.path().join("custom-out");
-        run_once(tmp.path(), None, "human", Some(&out)).expect("emitted output is skipped");
+        check_skipping(tmp.path(), &out).expect("emitted output is skipped");
     }
 
     #[test]
     fn a_malformed_manifest_fails_the_check_rather_than_defaulting() {
         let tmp = project("not = = toml\n");
-        let error = run_once(tmp.path(), None, "human", None)
+        let error = check(tmp.path(), None, Format::Human)
             .unwrap_err()
             .to_string();
         assert!(error.starts_with("invalid `"), "{error}");
@@ -744,7 +701,7 @@ mod tests {
             "src/main.lua",
             "local greet = require(\"src.greet\")\nprint(greet.hello(\"world\"))\n",
         );
-        run_once(tmp.path(), None, "human", None).expect("cross-file require checks clean");
+        check(tmp.path(), None, Format::Human).expect("cross-file require checks clean");
     }
 
     // -- `[types] defs` resolution -----------------------------------------
@@ -786,7 +743,7 @@ mod tests {
     fn an_unresolvable_defs_entry_fails_the_check() {
         let tmp = project(&manifest("5.4", "\n[types]\ndefs = [\"ghost\"]\n"));
         write(tmp.path(), "src/main.lua", "return 0\n");
-        let error = run_once(tmp.path(), None, "human", None)
+        let error = check(tmp.path(), None, Format::Human)
             .unwrap_err()
             .to_string();
         assert!(error.contains("check failed with 1 error(s)"), "{error}");
@@ -807,7 +764,7 @@ mod tests {
              mylib = {}\n",
         );
         write(tmp.path(), "src/main.lua", "print(mylib.version)\n");
-        run_once(tmp.path(), None, "human", None).expect("the ambient global checks clean");
+        check(tmp.path(), None, Format::Human).expect("the ambient global checks clean");
     }
 
     // -- dependency-contributed defs (#108) --------------------------------
