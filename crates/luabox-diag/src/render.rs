@@ -9,9 +9,25 @@
 //! the text *owned*, so calling it once per label cloned the whole file per
 //! diagnostic. Every renderer therefore goes through [`Sources`], a per-render
 //! cache that calls the lookup once per distinct file and keeps the text
-//! alongside an [`IndexedSource`] line table. That, plus the table replacing
-//! the byte-0 scans that resolved each label's line, is what makes rendering
-//! linear in the diagnostics rather than O(diagnostics x file size).
+//! alongside an [`IndexedSource`] line table.
+//!
+//! # Cost
+//!
+//! Rendering *n* diagnostics over a file of size *f* costs O(f + n log f),
+//! with no term in `n x f` left:
+//!
+//! - the source is fetched and indexed once per distinct file, not per label
+//!   ([`Sources`]);
+//! - line **and** column are binary searches over that index — the column
+//!   used to be counted by walking from the line start, which is O(file) per
+//!   label on a single-line file (see the `line_index` module docs);
+//! - the human renderer prints a *window* of the source line, never the whole
+//!   line ([`window_line`]), so one enormous line cannot make the **output**
+//!   quadratic even when the lookups are not.
+//!
+//! What is still linear in a single diagnostic's own size — and deliberately
+//! so — is its span: `caret_width` counts the characters a label covers.
+//! A diagnostic that spans a megabyte pays for that megabyte once.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -133,6 +149,116 @@ fn render_one_human(out: &mut String, diag: &Diagnostic, sources: &mut Sources<'
     }
 }
 
+/// Widest source line the human renderer prints in full. Past this the line
+/// is windowed around the label (rustc does the same).
+///
+/// This is a bound on *output*, not just on comfort. Without it every label
+/// on a long line printed the whole line plus a column-wide run of spaces:
+/// 10 k diagnostics on a 377 kB single-line file produced 3.5 GB of stdout,
+/// which is neither readable nor, at that size, survivable.
+const HUMAN_LINE_WINDOW: usize = 200;
+
+/// How many characters of the window sit to the left of the label, so a span
+/// is shown with some of what precedes it rather than flush against the edge.
+const HUMAN_LINE_MARGIN: usize = 20;
+
+/// Marks a windowed line as continuing past what is shown.
+const ELLIPSIS: &str = "...";
+
+/// One source line as the human renderer should print it, windowed if it is
+/// too long to print whole.
+struct LineWindow {
+    /// What to put after the `N | ` gutter.
+    text: String,
+    /// Characters of padding before the caret run.
+    indent: usize,
+    /// Caret run length, clipped to what the window actually shows.
+    width: usize,
+}
+
+/// Window `line` around a label at 1-based character column `col` / byte
+/// offset `span_off` *within the line*, whose caret run is `width` characters.
+///
+/// A line no wider than [`HUMAN_LINE_WINDOW`] is returned untouched, with the
+/// caret placement the renderer has always used — byte-for-byte the same
+/// output as before windowing existed. Only a longer line is cut down, to at
+/// most `HUMAN_LINE_WINDOW` characters plus `...` markers on whichever sides
+/// continue. Column *numbers* are never windowed: the `file:line:col` header
+/// keeps naming the true column, in every format.
+///
+/// The label sits [`HUMAN_LINE_MARGIN`] characters into the window when
+/// there is line on both sides of it; when the line runs out on the right,
+/// the window takes the slack back on the left, so it always shows as much
+/// as it is allowed to.
+///
+/// Every step is bounded by the window, never by the line: the long-line test
+/// stops after `HUMAN_LINE_WINDOW + 1` characters, and each of the two walks
+/// that find the window's edges takes at most `HUMAN_LINE_WINDOW` steps —
+/// `char_indices().rev()` walks back from the *end* of the head slice, so the
+/// leading part of a megabyte-long line is never touched. That is what keeps
+/// a one-line file from being quadratic to render.
+fn window_line(line: &str, col: usize, span_off: usize, width: usize) -> LineWindow {
+    if line.chars().nth(HUMAN_LINE_WINDOW).is_none() {
+        return LineWindow {
+            text: line.to_owned(),
+            indent: col.saturating_sub(1),
+            width,
+        };
+    }
+
+    // An offset past the line's end (a label on the `\n`, or on the `\r` of a
+    // CRLF pair, which `line_text` has already stripped) pins to the end.
+    let span_off = span_off.min(line.len());
+
+    // Right edge first: at most all but the left margin, but take whatever
+    // the line actually has.
+    let tail = line.get(span_off..).unwrap_or("");
+    let mut right = 0usize;
+    let mut end = line.len();
+    for (i, _) in tail.char_indices() {
+        if right == HUMAN_LINE_WINDOW - HUMAN_LINE_MARGIN {
+            end = span_off + i;
+            break;
+        }
+        right += 1;
+    }
+
+    // Left edge: the margin, plus whatever the right side did not spend.
+    let budget = HUMAN_LINE_WINDOW - right;
+    let head = line.get(..span_off).unwrap_or("");
+    let mut start = span_off;
+    let mut left = 0usize;
+    for (i, _) in head.char_indices().rev() {
+        if left == budget {
+            break;
+        }
+        start = i;
+        left += 1;
+    }
+
+    let mut text = String::new();
+    if start > 0 {
+        text.push_str(ELLIPSIS);
+    }
+    text.push_str(line.get(start..end).unwrap_or(""));
+    if end < line.len() {
+        text.push_str(ELLIPSIS);
+    }
+    LineWindow {
+        indent: left + if start > 0 { ELLIPSIS.len() } else { 0 },
+        // Clip the carets to the characters still on screen, so a span
+        // running off the window does not underline the `...` and beyond.
+        width: line
+            .get(span_off..end)
+            .unwrap_or("")
+            .chars()
+            .take(width)
+            .count()
+            .max(1),
+        text,
+    }
+}
+
 fn render_label_human(out: &mut String, label: &Label, sources: &mut Sources<'_>) {
     let file = &label.span.file;
     let Some(source) = sources.get(file) else {
@@ -145,13 +271,23 @@ fn render_label_human(out: &mut String, label: &Label, sources: &mut Sources<'_>
     };
 
     let (line, col) = source.line_col(label.span.range.start);
-    let text = source.line_text(line);
+    let span_off = label
+        .span
+        .range
+        .start
+        .saturating_sub(source.line_range(line).start);
+    let shown = window_line(
+        source.line_text(line),
+        col,
+        span_off,
+        caret_width(source.text(), &label.span.range),
+    );
     let gutter = line.to_string();
     let pad = " ".repeat(gutter.len());
     let caret = if label.primary { '^' } else { '-' };
-    let underline: String =
-        std::iter::repeat_n(caret, caret_width(source.text(), &label.span.range)).collect();
-    let indent = " ".repeat(col.saturating_sub(1));
+    let underline: String = std::iter::repeat_n(caret, shown.width).collect();
+    let indent = " ".repeat(shown.indent);
+    let text = shown.text;
 
     let _ = writeln!(out, "{pad} --> {file}:{line}:{col}");
     let _ = writeln!(out, "{pad} |");
@@ -418,6 +554,137 @@ mod tests {
         assert!(out.contains("help: give the local a name"), "{out}");
         assert!(out.contains("note: Lua locals require a name"), "{out}");
         assert!(out.contains("warning[LB1001]"), "{out}");
+    }
+
+    // --- long-line windowing ----------------------------------------------
+
+    /// Render one primary label over `source` at `range`, human format.
+    fn render_span(source: &str, range: std::ops::Range<usize>) -> String {
+        let code: Code = "LB0001".parse().unwrap();
+        let diag = Diagnostic::error(code, "boom")
+            .with_label(Label::primary(Span::new("main.lua", range), "here"));
+        let owned = source.to_string();
+        let lookup = move |file: &str| (file == "main.lua").then(|| owned.clone());
+        render_human(std::slice::from_ref(&diag), &lookup)
+    }
+
+    #[test]
+    fn a_line_at_the_window_width_is_printed_whole_and_unchanged() {
+        // The byte-identity boundary: exactly HUMAN_LINE_WINDOW characters
+        // is still a short line, so nothing about the output changes.
+        let line = "x".repeat(HUMAN_LINE_WINDOW);
+        let out = render_span(&line, 4..5);
+        assert!(out.contains(&format!("1 | {line}\n")), "{out}");
+        assert!(!out.contains(ELLIPSIS), "{out}");
+        assert!(out.contains("--> main.lua:1:5"), "{out}");
+        assert!(
+            out.contains(&format!("  | {}^ here", " ".repeat(4))),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_long_line_is_windowed_around_the_label_with_markers() {
+        // One character past the window: now it is cut.
+        let line = "abcdefghij".repeat(200); // 2000 chars
+        let out = render_span(&line, 1000..1004);
+        let rendered = out
+            .lines()
+            .find(|l| l.starts_with("1 | "))
+            .expect("a source line");
+        let shown = rendered.trim_start_matches("1 | ");
+        assert!(shown.starts_with(ELLIPSIS), "{rendered}");
+        assert!(shown.ends_with(ELLIPSIS), "{rendered}");
+        assert_eq!(
+            shown.chars().count(),
+            HUMAN_LINE_WINDOW + 2 * ELLIPSIS.len(),
+            "the window plus both markers, nothing more: {rendered}"
+        );
+        // The column NUMBER is never windowed.
+        assert!(out.contains("--> main.lua:1:1001"), "{out}");
+        // ... and the carets still sit under the span: MARGIN characters in,
+        // past the leading marker.
+        let caret_line = out.lines().find(|l| l.contains('^')).expect("a caret line");
+        let indent = caret_line
+            .trim_start_matches("  | ")
+            .chars()
+            .take_while(|&c| c == ' ')
+            .count();
+        assert_eq!(indent, HUMAN_LINE_MARGIN + ELLIPSIS.len(), "{caret_line}");
+        assert!(caret_line.contains("^^^^ here"), "{caret_line}");
+    }
+
+    #[test]
+    fn a_label_at_the_start_or_end_of_a_long_line_windows_one_sided() {
+        let line = "abcdefghij".repeat(200);
+        let head = render_span(&line, 0..1);
+        let head_line = head.lines().find(|l| l.starts_with("1 | ")).unwrap();
+        assert!(
+            !head_line.trim_start_matches("1 | ").starts_with(ELLIPSIS),
+            "nothing precedes the label, so no leading marker: {head_line}"
+        );
+        assert!(head_line.ends_with(ELLIPSIS), "{head_line}");
+
+        let tail = render_span(&line, 1999..2000);
+        let tail_line = tail.lines().find(|l| l.starts_with("1 | ")).unwrap();
+        assert!(tail_line.trim_start_matches("1 | ").starts_with(ELLIPSIS));
+        assert!(
+            !tail_line.ends_with(ELLIPSIS),
+            "the window reaches the end of the line: {tail_line}"
+        );
+    }
+
+    #[test]
+    fn a_span_running_past_the_window_has_its_carets_clipped() {
+        let line = "y".repeat(5_000);
+        let out = render_span(&line, 0..5_000);
+        let caret_line = out.lines().find(|l| l.contains('^')).unwrap();
+        let carets = caret_line.chars().filter(|&c| c == '^').count();
+        assert!(
+            carets <= HUMAN_LINE_WINDOW,
+            "carets must not run past the window: {carets}"
+        );
+        assert!(carets > 0, "{caret_line}");
+    }
+
+    #[test]
+    fn windowing_a_long_line_never_splits_a_character() {
+        // Multi-byte characters either side of the label, so both window
+        // edges land in the middle of one if the byte math is wrong.
+        let line = "中".repeat(1_000);
+        let out = render_span(&line, 1_500..1_503);
+        assert!(out.contains("--> main.lua:1:501"), "{out}");
+        let rendered = out.lines().find(|l| l.starts_with("1 | ")).unwrap();
+        assert!(rendered.contains('中'), "{rendered}");
+        assert_eq!(
+            rendered.trim_start_matches("1 | ").chars().count(),
+            HUMAN_LINE_WINDOW + 2 * ELLIPSIS.len()
+        );
+    }
+
+    #[test]
+    fn rendering_many_labels_on_one_huge_line_stays_small() {
+        // The output bound the window exists for: before it, each label
+        // printed the whole line plus a column-wide indent, so n labels on
+        // an f-byte line cost O(n x f) of stdout — GBs in the wild.
+        let code: Code = "LB0001".parse().unwrap();
+        let line = "z".repeat(100_000);
+        let diags: Vec<Diagnostic> = (0..500)
+            .map(|i| {
+                Diagnostic::error(code, "boom").with_label(Label::primary(
+                    Span::new("main.lua", i * 100..i * 100 + 1),
+                    "here",
+                ))
+            })
+            .collect();
+        let owned = line.clone();
+        let lookup = move |file: &str| (file == "main.lua").then(|| owned.clone());
+        let out = render_human(&diags, &lookup);
+        assert!(
+            out.len() < 500 * 4 * (HUMAN_LINE_WINDOW + 64),
+            "rendered {} bytes for 500 labels on a 100 kB line",
+            out.len()
+        );
     }
 
     #[test]

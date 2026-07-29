@@ -552,6 +552,22 @@ fn stdout_contains_exactly(world: &mut AcceptanceWorld, count: usize, needle: St
     );
 }
 
+/// A ceiling on the *width* of the report, which is how the human renderer's
+/// long-line windowing is observable from outside: without it a diagnostic on
+/// a 400-character line printed that whole line plus a 400-character caret
+/// indent, and n diagnostics on one long line cost O(n x line) of output.
+#[then(expr = "no line of stdout is longer than {int} characters")]
+fn stdout_lines_bounded(world: &mut AcceptanceWorld, max: usize) {
+    let stdout = world.stdout();
+    for line in stdout.lines() {
+        let width = line.chars().count();
+        assert!(
+            width <= max,
+            "a {width}-character line exceeds the {max}-character bound:\n{line}"
+        );
+    }
+}
+
 #[then(expr = "stdout does not contain {string}")]
 fn stdout_does_not_contain(world: &mut AcceptanceWorld, needle: String) {
     let stdout = world.stdout();

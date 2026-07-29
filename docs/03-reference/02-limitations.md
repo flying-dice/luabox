@@ -161,6 +161,22 @@ luabox builds one tree node per operator, so a chain longer than 512 terms
 reports `expression too complex`. Machine-generated sources are the only
 realistic way to reach that; hand-written Lua does not.
 
+### Human diagnostics window very long source lines
+
+`--format human` prints roughly 200 characters of a source line around each
+label, with `...` marking whichever side continues, rather than the whole
+line. This only shows up on lines longer than that — minified or generated
+sources — where printing the line in full made the *report* larger than the
+file it described (10 000 findings on a 377 kB single-line file produced
+3.5 GB of output). Column numbers are never windowed: `file:line:col` names
+the true column here and in every machine format, and `--format json`,
+`sarif`, `github` and `gitlab` carry no source text at all, so nothing is
+lost to a tool reading them.
+
+Reporting is otherwise linear in the number of findings. The one cost that
+still scales with a *single* diagnostic is its own span: a label covering a
+megabyte counts a megabyte of characters to size its caret run, once.
+
 ### Dependency management and execution are non-goals, not gaps
 
 luabox neither manages dependencies nor runs Lua. There is no resolver, no
