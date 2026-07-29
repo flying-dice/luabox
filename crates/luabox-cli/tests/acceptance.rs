@@ -272,6 +272,47 @@ fn lua_file_with_bom(world: &mut AcceptanceWorld, step: &Step) {
     );
 }
 
+/// The same, for any path — a *dependency* carrying a byte-order mark,
+/// which the bundler has to cut out of the middle of its output.
+#[given(expr = "a file {string} with a UTF-8 BOM containing:")]
+fn file_with_bom(world: &mut AcceptanceWorld, path: String, step: &Step) {
+    write_file(
+        world.dir.path(),
+        &path,
+        &format!("\u{feff}{}", docstring(step)),
+    );
+}
+
+/// Assert on a file's *first* bytes. Position is the whole point for a `#!`
+/// line: a shebang anywhere but byte 0 is not a shebang, so a "contains"
+/// assertion would pass on output no kernel would honour.
+#[then(expr = "{string} starts with {string}")]
+fn file_starts_with(world: &mut AcceptanceWorld, path: String, prefix: String) {
+    let full = world.dir.path().join(&path);
+    let content =
+        std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("cannot read `{path}`: {e}"));
+    assert!(
+        content.starts_with(&prefix),
+        "`{path}` does not start with `{prefix}`; it starts:\n{}",
+        content.chars().take(120).collect::<String>()
+    );
+}
+
+/// No mark anywhere in the file — not just not at byte 0. Spelled as a step
+/// rather than as `does not contain "<U+FEFF>"` for the same reason the step
+/// above exists: an invisible character in a `.feature` file is an accident
+/// waiting to be normalized away.
+#[then(expr = "{string} carries no UTF-8 byte-order mark")]
+fn file_has_no_bom(world: &mut AcceptanceWorld, path: String) {
+    let full = world.dir.path().join(&path);
+    let content =
+        std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("cannot read `{path}`: {e}"));
+    assert!(
+        !content.contains('\u{feff}'),
+        "`{path}` carries a byte-order mark; content:\n{content}"
+    );
+}
+
 /// The counterpart assertion: the file's content is the docstring with a
 /// leading UTF-8 BOM, byte for byte.
 #[then(expr = "{string} equals, with a leading UTF-8 BOM:")]
