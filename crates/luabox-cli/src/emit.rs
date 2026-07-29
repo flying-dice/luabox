@@ -11,14 +11,31 @@
 //! running `set -o pipefail` with a routine `| head` or `| grep -q` went red
 //! for it, in all five `--format`s.
 //!
-//! ## The rule
+//! ## The rule: a departed reader keeps the verdict
 //!
-//! A closed pipe is not an error. It means the reader got what it wanted and
-//! left, so luabox stops writing and exits **0**, quietly — ripgrep's
-//! convention, and the one `head` users already expect. That applies to
-//! stderr as well as stdout: `luabox check 2>&1 | head` puts both streams on
-//! the same dead pipe, and a diagnostics summary has no more claim on a
-//! departed reader than the report does.
+//! A closed pipe is not an *error* — the reader got what it wanted and left,
+//! and luabox stops writing rather than panicking. But it is not a *pass*
+//! either. The exit status reports what the run **found**; the truncated
+//! output is the only thing lost.
+//!
+//! This is deliberately not ripgrep's "EPIPE means exit 0" convention, and the
+//! round-8 review is why. `set -o pipefail; luabox check | head -1` over a
+//! tree with 6000 errors exited 0, because the report died on the pipe before
+//! the command's own failure could become the exit code — so a CI gate went
+//! green over a broken tree. Failing *open* on a broken pipe is worse than any
+//! panic: it is silent, and it is wrong in the safe-looking direction.
+//!
+//! So each command records its verdict with [`set_exit_on_reader_gone`]
+//! *before* it emits its report — which it can, because by then the run is
+//! over and only the printing is left — and a departed reader exits with that
+//! code. `check`, `lint` and `fmt --check` record 1 when they found problems
+//! and 0 when they did not. `build`, `doc` and the rest record nothing: their
+//! reports precede a success that nothing later can revoke, so the default 0
+//! is already their verdict.
+//!
+//! The rule applies to stderr as well as stdout: `luabox check 2>&1 | head`
+//! puts both streams on the same dead pipe, and a diagnostics summary has no
+//! more claim on a departed reader than the report does.
 //!
 //! Any *other* write failure (a full disk on `luabox schema > out.json`, say)
 //! is a real failure and exits 1, with a one-line explanation on stderr —
@@ -37,6 +54,49 @@
 //! command signature had to change to thread a `Result` back out.
 
 use std::io::{self, ErrorKind, Write};
+use std::sync::atomic::{AtomicI32, Ordering};
+
+/// The exit status a departed reader gets — the verdict of the run that was
+/// mid-report when the pipe closed. Process-global rather than threaded
+/// through every emitter because the emitters are macros with no `self`, and
+/// because there is exactly one process-wide answer at any moment.
+///
+/// Default 0: a command that records nothing is one whose report precedes an
+/// unconditional success.
+static EXIT_ON_READER_GONE: AtomicI32 = AtomicI32::new(0);
+
+/// Record the exit status to use if the reader hangs up mid-report.
+///
+/// Call this once the run's outcome is known and *before* emitting the report
+/// — see the module docs for why a broken pipe must not discard the verdict.
+pub(crate) fn set_exit_on_reader_gone(code: i32) {
+    EXIT_ON_READER_GONE.store(code, Ordering::Relaxed);
+}
+
+/// The recorded verdict ([`set_exit_on_reader_gone`]), or 0 if none was.
+fn exit_on_reader_gone() -> i32 {
+    EXIT_ON_READER_GONE.load(Ordering::Relaxed)
+}
+
+/// Serializes the tests that assert on [`EXIT_ON_READER_GONE`].
+///
+/// The recorded verdict is process-global by design, and `cargo test` runs the
+/// unit tests of this binary on many threads at once — so any test that both
+/// writes and reads it has to own it for the duration or it reads someone
+/// else's write. Test-only, and the only reason it is here rather than in the
+/// test module is that `crate::project`'s tests take it too.
+#[cfg(test)]
+pub(crate) fn verdict_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The recorded verdict, for the tests that assert the wiring.
+#[cfg(test)]
+pub(crate) fn recorded_verdict() -> i32 {
+    exit_on_reader_gone()
+}
 
 /// What a user-facing write leaves the stream in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +104,8 @@ pub(crate) enum Flow {
     /// The bytes landed. Carry on.
     Continue,
     /// The reader closed the pipe (`EPIPE`). There is nobody left to write
-    /// to, and that is a success — see the module docs.
+    /// to, so writing stops — but the run's verdict still decides the exit
+    /// status ([`set_exit_on_reader_gone`]); see the module docs.
     ReaderGone,
 }
 
@@ -83,7 +144,8 @@ fn write_text(stream: &mut impl Write, text: &str) -> io::Result<Flow> {
 fn act(outcome: io::Result<Flow>, stream: &str) {
     match outcome {
         Ok(Flow::Continue) => {}
-        Ok(Flow::ReaderGone) => std::process::exit(0),
+        // Not 0: the output is lost, the verdict is not. See the module docs.
+        Ok(Flow::ReaderGone) => std::process::exit(exit_on_reader_gone()),
         Err(error) => {
             // The stream we would normally explain this on may be the one
             // that just failed, so this is best-effort by construction — and
@@ -137,8 +199,23 @@ mod tests {
     // test code — panics document assumptions
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{Flow, classify, write_text};
+    use super::{
+        Flow, classify, exit_on_reader_gone, set_exit_on_reader_gone, verdict_lock, write_text,
+    };
     use std::io::{self, ErrorKind, Write};
+
+    #[test]
+    fn a_recorded_verdict_is_what_a_departed_reader_would_exit_with() {
+        // The round-8 finding in one assertion: the code `act` exits with on
+        // `ReaderGone` is whatever the command recorded, not a hard-wired 0.
+        let _guard = verdict_lock();
+        set_exit_on_reader_gone(1);
+        assert_eq!(exit_on_reader_gone(), 1);
+        // ...and back, so a command whose report precedes an unconditional
+        // success (`build`, `doc`) still leaves a departed reader with 0.
+        set_exit_on_reader_gone(0);
+        assert_eq!(exit_on_reader_gone(), 0);
+    }
 
     /// A sink that fails every write with a caller-chosen error — the only
     /// way to drive the `EPIPE` path deterministically, since a real closed
