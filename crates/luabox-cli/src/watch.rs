@@ -67,15 +67,46 @@
 //! closure's job: `check_cmd::run_once`/`fmt_cmd::run_once` already
 //! rediscover the project from scratch on every call.
 //!
-//! ## Self-inflicted events
+//! ## Self-inflicted events, and why there is no post-run drain
 //!
-//! Whatever the kind filter lets through, a rerun's own filesystem activity
-//! must never be able to *sustain* the loop. Every run — the first one and
-//! every rerun — is therefore followed by [`drain_self_inflicted`], which
-//! swallows everything that piled up while the command was working. The kind
-//! filter is the specific fix for the read-triggered loop; the drain is the
-//! general one, and it holds for any event a backend classifies in a way
-//! this module did not anticipate.
+//! A rerun reads (and, for `fmt --watch`, rewrites) the very files being
+//! watched, so its own filesystem activity is a candidate trigger for the
+//! *next* rerun. That used to be handled twice: by the kind filter above,
+//! and — belt and braces — by a post-run *drain*, a sliding 200ms window
+//! that received events and threw them away.
+//!
+//! The drain was unsound and has been deleted. It could not tell a run's own
+//! noise from a user's save, so an edit landing in that window was discarded
+//! outright: `check --watch` sat on a stale `watch: ok` over a tree the user
+//! had just broken, and `fmt --watch` silently skipped formatting the file
+//! that had just been saved. Reproduced deterministically at a ~300ms edit
+//! gap, and by an IDE "save all" spreading five files ~120ms apart.
+//!
+//! [`triggers_rerun`] alone is enough, because on every backend luabox ships
+//! a binary for, a *read* is not reported as a change at all:
+//!
+//! | backend | platform | what a read produces | verdict |
+//! | --- | --- | --- | --- |
+//! | inotify | linux | `IN_OPEN` / `IN_ACCESS` / `IN_CLOSE_NOWRITE`, i.e. `Access(_)` | filtered out |
+//! | `FSEvents` | macOS | nothing — the API reports content and directory changes, not opens | nothing to filter |
+//! | `ReadDirectoryChangesW` | windows | nothing — notify subscribes to name, attribute, size, write, creation and security changes, never `FILE_NOTIFY_CHANGE_LAST_ACCESS` | nothing to filter |
+//!
+//! What a run *writes* does still trigger a rerun, and that is correct rather
+//! than a loop: `fmt` only writes a file whose formatting actually changes,
+//! so a rewrite costs exactly one extra rerun and then converges (run →
+//! rewrite → rerun → nothing left to rewrite → quiet), and `check` writes
+//! nothing at all.
+//!
+//! That is a claim about backends, so it comes with its boundary. notify's
+//! `kqueue` backend (BSD, and macOS under its `macos_kqueue` feature) maps
+//! `NOTE_ATTRIB` onto `Modify(Metadata(Any))`, which *is* a trigger, so a
+//! platform where a plain read makes an `atime` bump visible could feed
+//! itself. luabox ships linux, macOS and windows binaries only
+//! (`.github/workflows/release.yml`), and `notify::recommended_watcher`
+//! never selects `kqueue` for those. If that ever changes, the answer is a
+//! *filtering sweep* — collect the post-run window, keep whatever still
+//! passes [`triggers_rerun`] and [`is_relevant`], and rerun if anything
+//! survives — never a drain that discards.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -86,6 +117,8 @@ use std::time::{Duration, Instant};
 use luabox_manifest::layout;
 use notify::event::{AccessKind, AccessMode, EventKind, MetadataKind, ModifyKind};
 use notify::{Event, RecursiveMode, Watcher};
+
+use crate::emit::{errln, outln};
 
 /// How long to keep collecting events after the first one in a batch.
 const DEBOUNCE_WINDOW: Duration = Duration::from_millis(200);
@@ -137,27 +170,20 @@ pub fn run(
     // order below was fixed.
     watcher.watch(root, RecursiveMode::Recursive)?;
 
+    // Nothing is drained between a run and the next batch — not here and not
+    // in the loop below. A drain cannot distinguish a run's own noise from a
+    // save made while the run was working, so it swallowed real edits; see
+    // the module docs for the per-backend argument that makes the kind filter
+    // sufficient on its own.
     let result = on_change();
-    // The run above may itself have touched watched files (`fmt --watch`
-    // rewrites in place), and the watcher was already armed to catch
-    // exactly that. Drain those self-inflicted events before reporting
-    // the run as done, so they aren't mistaken for a user edit made
-    // afterwards and don't trigger a spurious immediate rerun.
-    drain_self_inflicted(&rx);
     report(result);
 
     while let Some(batch) = next_batch(&rx, root, out_dir) {
         if batch.is_empty() {
             continue;
         }
-        println!("--- watching: rerun ({} files changed) ---", batch.len());
+        outln!("--- watching: rerun ({} files changed) ---", batch.len());
         let result = on_change();
-        // Exactly as after the first run: a rerun reads (and, for `fmt
-        // --watch`, rewrites) the very files being watched, and whatever
-        // that produced must not be mistaken for the *next* user edit.
-        // Without this the loop could feed itself forever off its own
-        // side effects — which is precisely what it did.
-        drain_self_inflicted(&rx);
         report(result);
     }
     Ok(())
@@ -187,8 +213,10 @@ pub fn run(
 ///   however it was classified.
 /// - **`Any` / `Other`** — a backend that could not classify the event.
 ///   Rerunning once too often is a far smaller failure than silently missing
-///   an edit, so these trigger; the post-run drain is what keeps that from
-///   ever becoming a loop.
+///   an edit, so these trigger. Nothing downstream discards them, so this is
+///   the whole defence against a self-sustaining loop: it holds because no
+///   backend luabox ships on reports a *read* at all — see the module docs
+///   for the per-backend audit and where it stops being true.
 fn triggers_rerun(kind: EventKind) -> bool {
     match kind {
         EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
@@ -233,23 +261,12 @@ fn next_batch(
     Some(filter_and_dedupe(raw, root, out_dir))
 }
 
-/// Wait out a full [`DEBOUNCE_WINDOW`] of silence on `rx`, resetting on
-/// every event received, so that any events already queued (or arriving
-/// shortly after) are consumed without triggering anything. Unlike the
-/// batching in [`run`]'s own loop (anchored to the first event, not
-/// sliding — see the module docs), this must fully settle before treating
-/// later events as real changes, since it exists to swallow a run's own
-/// side effects rather than to group a burst of unrelated ones.
-fn drain_self_inflicted(rx: &mpsc::Receiver<Event>) {
-    while rx.recv_timeout(DEBOUNCE_WINDOW).is_ok() {}
-}
-
 /// Print a run's outcome. Errors from `on_change` are reported, not
 /// propagated — a broken rerun must not kill the watcher.
 fn report(result: anyhow::Result<()>) {
     match result {
-        Ok(()) => println!("watch: ok"),
-        Err(err) => eprintln!("watch: failed: {err:#}"),
+        Ok(()) => outln!("watch: ok"),
+        Err(err) => errln!("watch: failed: {err:#}"),
     }
 }
 
@@ -327,13 +344,12 @@ pub(crate) fn partition_batches(
 mod tests {
     use super::{
         AccessKind, AccessMode, DEBOUNCE_WINDOW, EventKind, MetadataKind, ModifyKind,
-        drain_self_inflicted, filter_and_dedupe, is_relevant, next_batch, partition_batches,
-        report, triggers_rerun,
+        filter_and_dedupe, is_relevant, next_batch, partition_batches, report, triggers_rerun,
     };
     use notify::event::{CreateKind, DataChange, RemoveKind, RenameMode};
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     /// A watcher event naming `paths`, as `notify` would deliver it.
     fn event(paths: &[&str]) -> notify::Event {
@@ -403,8 +419,9 @@ mod tests {
 
     #[test]
     fn an_unclassified_event_errs_towards_rerunning() {
-        // Missing a real edit is worse than one extra rerun; the post-run
-        // drain is what stops that from ever becoming a loop.
+        // Missing a real edit is worse than one extra rerun. Nothing
+        // downstream throws these away, which is safe only because no shipped
+        // backend emits an event for a read at all (see the module docs).
         assert!(triggers_rerun(EventKind::Any));
         assert!(triggers_rerun(EventKind::Other));
         assert!(triggers_rerun(notify::Event::default().kind));
@@ -634,29 +651,22 @@ mod tests {
     }
 
     #[test]
-    fn draining_returns_immediately_once_the_watcher_channel_is_closed() {
+    fn an_edit_that_landed_while_a_run_was_working_is_still_the_next_batch() {
+        // The wave-10 regression, at the level the loop is built from: a save
+        // made *during* a run is already sitting in the channel when the run
+        // finishes. The post-run drain used to receive it and throw it away,
+        // leaving `check --watch` reporting a stale `watch: ok` over a tree
+        // the user had just broken. Nothing between `on_change` and
+        // `next_batch` may consume events, so it comes back as a batch.
+        let root = Path::new("/proj");
         let (tx, rx) = mpsc::channel::<notify::Event>();
-        drop(tx);
-        // A disconnected channel must not make the drain wait out a full
-        // debounce window before the first run is reported.
-        let started = Instant::now();
-        drain_self_inflicted(&rx);
-        assert!(started.elapsed() < DEBOUNCE_WINDOW);
-    }
-
-    #[test]
-    fn draining_consumes_events_already_queued_by_the_run_itself() {
-        let (tx, rx) = mpsc::channel::<notify::Event>();
-        // Two self-inflicted events (e.g. `fmt --watch` rewriting files)
-        // are already queued when the run finishes.
-        tx.send(notify::Event::default()).expect("send");
-        tx.send(notify::Event::default()).expect("send");
+        tx.send(event(&["/proj/broken.lua"])).expect("send");
         drop(tx);
 
-        drain_self_inflicted(&rx);
-        assert!(
-            rx.try_recv().is_err(),
-            "the queue must be empty so no spurious rerun follows"
+        assert_eq!(
+            next_batch(&rx, root, None),
+            Some(vec![p("/proj/broken.lua")]),
+            "an edit queued during a run must survive to trigger the next rerun"
         );
     }
 
