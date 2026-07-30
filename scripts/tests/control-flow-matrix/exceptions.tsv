@@ -1,0 +1,7 @@
+# program	versions	reason
+# Documented under-approximation (docs/03-reference/02-limitations.md, #44):
+# a forward goto jumping into the scope of a local is rejected by reference
+# Lua but accepted by luabox — the HIR erases the void statements the
+# reference rule turns on. luabox may ACCEPT where luac REJECTS, never the
+# reverse.
+exception_goto_into_local_scope	5.2 5.3 5.4	accepts-where-luac-rejects (documented)

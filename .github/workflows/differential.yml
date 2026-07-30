@@ -83,3 +83,16 @@ jobs:
 
       - name: Differential corpus sweep (blocking)
         run: cargo run --release --manifest-path tools/differ/Cargo.toml -- --corpus corpus/differ --verbose
+
+      # Control-flow LEGALITY differential (#44) — a different axis from the
+      # sweep above, which executes lowered output: this one holds luabox's
+      # accept/reject verdict for goto/label/break to `luac<V> -p` as live
+      # ground truth, per version, over the committed matrix in
+      # scripts/tests/control-flow-matrix/. The dialect-aware label-shadowing
+      # split is covered by construction — whatever each reference compiler
+      # says is what luabox is held to. The runners above already installed
+      # lua5.1-5.4, and luac ships with them.
+      - name: Build luabox for the control-flow differential
+        run: cargo build --release --bin luabox
+      - name: Control-flow legality vs reference luac (blocking)
+        run: bash scripts/tests/control-flow-differential.sh

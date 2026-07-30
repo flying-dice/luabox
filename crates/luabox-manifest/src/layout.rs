@@ -471,18 +471,33 @@ pub fn collect_rock_sources(root: &Path, version_dir: &str) -> Vec<RockSource> {
 /// Collect every `*.lua` file under `dir`, recursively. Unlike
 /// [`collect_d_lua`] this takes *all* Lua files: a rock's annotations live in
 /// its ordinary sources, which is the whole point of #30.
+///
+/// Symlinked directories are NOT descended ([`is_real_dir`]): a rock tree is
+/// third-party content walked unconditionally on every `check`/`lint`/
+/// `build`, and a link back up the tree (`pkg/up -> ..`) would otherwise
+/// recurse until the accumulated path tripped `ENAMETOOLONG` — termination by
+/// filesystem accident rather than by design. A symlinked *file* is still
+/// taken: only the cycle vector is closed.
 fn collect_rock_lua(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        if is_real_dir(&entry) {
             collect_rock_lua(&path, out);
         } else if path.extension().and_then(OsStr::to_str) == Some("lua") {
             out.push(path);
         }
     }
+}
+
+/// True for a directory entry that is a directory in its own right — not a
+/// symlink to one. `Path::is_dir()` follows links; `entry.file_type()` is the
+/// symlink-aware (and cheaper — no extra stat) test the walks above need to
+/// stay cycle-free without a visited set.
+fn is_real_dir(entry: &fs::DirEntry) -> bool {
+    entry.file_type().is_ok_and(|kind| kind.is_dir())
 }
 
 /// The dotted `require` name a rock source answers to: its path relative to
@@ -515,14 +530,15 @@ fn rock_module_name(path: &Path, base: &Path) -> Option<String> {
 /// Collect every `*.d.lua` file under `dir`, recursively. An unreadable
 /// directory contributes nothing rather than failing: definition packages are
 /// an additive layer, and a missing one is already reported by its caller as
-/// an unresolved name.
+/// an unresolved name. Symlinked directories are not descended — same cycle
+/// guard as [`collect_rock_lua`], same rationale.
 pub fn collect_d_lua(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        if is_real_dir(&entry) {
             collect_d_lua(&path, out);
         } else if is_def_file(&path) {
             out.push(path);
@@ -1192,6 +1208,51 @@ edition = \"5.4\"
             rocks[0].path,
             tmp.path().join("lua_modules/share/lua/5.4/inifile.lua")
         );
+    }
+
+    /// A symlink cycle in a rock tree (`pkg/up -> ..`) must be a non-event:
+    /// the walk skips symlinked directories by design, not by running the
+    /// path into `ENAMETOOLONG`. A symlinked *file* is still harvested.
+    #[cfg(unix)]
+    #[test]
+    fn collect_rock_sources_does_not_descend_symlinked_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/pkg/real.lua",
+            "---@class pkg.T\nreturn 1\n",
+        );
+        write(tmp.path(), "elsewhere/linked.lua", "return 2\n");
+        let pkg = tmp.path().join("lua_modules/share/lua/5.4/pkg");
+        // The cycle: pkg/up -> the version dir's parent.
+        std::os::unix::fs::symlink("..", pkg.join("up")).expect("symlink dir");
+        // A symlinked file, which must still be taken.
+        std::os::unix::fs::symlink(
+            tmp.path().join("elsewhere/linked.lua"),
+            pkg.join("alias.lua"),
+        )
+        .expect("symlink file");
+
+        let rocks = collect_rock_sources(tmp.path(), "5.4");
+        let modules: Vec<&str> = rocks.iter().map(|r| r.module.as_str()).collect();
+        assert_eq!(
+            modules,
+            ["pkg.alias", "pkg.real"],
+            "the cycle contributes nothing, the linked file still counts"
+        );
+    }
+
+    /// Same guard on the defs walk — `collect_d_lua` shares the shape.
+    #[cfg(unix)]
+    #[test]
+    fn collect_d_lua_does_not_descend_symlinked_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "defs/real.d.lua", "---@meta\n");
+        std::os::unix::fs::symlink("..", tmp.path().join("defs/up")).expect("symlink");
+
+        let mut out = Vec::new();
+        collect_d_lua(&tmp.path().join("defs"), &mut out);
+        assert_eq!(out.len(), 1, "one real def file, no cycle traversal");
     }
 
     #[test]

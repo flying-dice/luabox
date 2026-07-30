@@ -265,11 +265,16 @@ What that leaves, stated plainly:
   Neovim, OpenResty — still wants a `defs/` package. The harvest contributes
   type declarations and export types, not ambient globals.
 - **Argument checking at a rock function's call site** does not happen:
-  `local m = require("rock"); m.f("wrong")` is unchecked. That is a
-  pre-existing gap for calls through *any* table or class field — your own
-  modules included — not a harvest limitation. A def-declared global API
-  (`geometry.point(…)`) *is* param-checked, and a rock's `---@return` types do
-  flow, so misusing the *result* is caught.
+  `local m = require("rock"); m.f("wrong")` is unchecked. The axis is the
+  **module boundary**, not field access — measured: a table-field call in the
+  *same* file IS argument-checked (LB0300), a call to anything reached via
+  `require` is not, your own modules included. Fields survive the boundary
+  (LB0306 fires cross-module) and a rock's `---@return` types flow, so
+  misusing a *result* is caught; a rock's `---@param` is **not enforced at
+  cross-module call sites**. Pre-existing, not a harvest limitation — tracked
+  as [#46](https://github.com/flying-dice/luabox/issues/46), with the
+  measured table on the issue. An explicit `---@type` at the call site
+  restores checking today.
 - **The flat `lua_modules/<name>/` layout is not harvested.** It keeps its
   existing route: a `[dependencies]`/`[dev-dependencies]` entry naming the
   package, a `luabox.toml` for it at `lua_modules/<name>/luabox.toml` (or at
