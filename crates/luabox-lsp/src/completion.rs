@@ -17,7 +17,7 @@ use luabox_hir::BindingKind;
 use luabox_syntax::luacats::FieldKey;
 use luabox_types::ty::Ty;
 
-use crate::requires::RequireExports;
+use crate::requires::{self, RequireExports};
 use crate::sema::{self, FileSema};
 
 /// Lua keywords offered in plain (non-member) positions.
@@ -73,13 +73,15 @@ pub fn completion(
     items.into_values().collect()
 }
 
-/// Fields/methods of the receiver identifier ending at `dot_offset`.
+/// Fields/methods of the receiver identifier ending at `dot_offset`: the
+/// receiver's `---@class` fields, or — for a `require` binding — the members
+/// of the required module's export type (#54).
 fn member_items(
     sema: &FileSema,
     text: &str,
     dot_offset: usize,
     trigger: u8,
-    _exports: &RequireExports,
+    exports: &RequireExports,
     items: &mut BTreeMap<String, CompletionItem>,
 ) {
     let bytes = text.as_bytes();
@@ -96,6 +98,7 @@ fn member_items(
     )]
     let receiver = &text[recv_start..dot_offset];
     let Some(class) = sema.class_of_name(receiver, recv_start) else {
+        require_member_items(sema, receiver, recv_start, trigger, exports, items);
         return;
     };
     for (field, declaring) in sema.class_fields(&class) {
@@ -125,6 +128,58 @@ fn member_items(
                     "{declaring}.{name}: {}",
                     sema::render_type(&field.ty)
                 )),
+                ..CompletionItem::default()
+            },
+        );
+    }
+}
+
+/// Members of a `require` binding: the named fields of the required module's
+/// export type, out of the shared resolution the type pass checks against
+/// (#54). Declines for every receiver that is not one, so the caller's other
+/// routes are unaffected.
+///
+/// Qualified by the *module* rather than the local name in the detail line,
+/// matching the hover, so an item names where it came from rather than what
+/// the file happened to call it.
+fn require_member_items(
+    sema: &FileSema,
+    receiver: &str,
+    recv_start: usize,
+    trigger: u8,
+    exports: &RequireExports,
+    items: &mut BTreeMap<String, CompletionItem>,
+) {
+    let Some(binding) = sema.visible_binding_named(receiver, recv_start) else {
+        return;
+    };
+    let Some(module) = requires::require_module_of(sema, binding) else {
+        return;
+    };
+    let Some(fields) = exports.get(module).and_then(requires::export_fields) else {
+        return;
+    };
+    for (name, field) in fields {
+        let is_fun = matches!(field.ty, Ty::Function(_));
+        // After `:` only methods make sense.
+        if trigger == b':' && !is_fun {
+            continue;
+        }
+        let kind = if is_fun {
+            if trigger == b':' {
+                CompletionItemKind::METHOD
+            } else {
+                CompletionItemKind::FUNCTION
+            }
+        } else {
+            CompletionItemKind::FIELD
+        };
+        items.insert(
+            name.clone(),
+            CompletionItem {
+                label: name.clone(),
+                kind: Some(kind),
+                detail: Some(format!("{module}.{name}: {}", field.ty)),
                 ..CompletionItem::default()
             },
         );
@@ -416,11 +471,15 @@ mod tests {
     }
 
     /// A two-file workspace's annotated module, mirroring `hover`'s.
+    ///
+    /// `version` is deliberately unannotated: its type is whatever the module
+    /// surface inferred (the string *literal*), and that is precisely what
+    /// completion must show — the type the checker will hold a use site to.
+    /// Widening it for display would be prettier and would be the editor
+    /// disagreeing with CI, which is the bug this file is about.
     const OTHER: &str = "\
 local M = {}
 
----The module version.
----@type string
 M.version = \"1.0\"
 
 ---Helps.
@@ -717,7 +776,7 @@ local visible = 2
         );
         assert_eq!(
             item(&items, "version").detail.as_deref(),
-            Some("other.version: string")
+            Some("other.version: \"1.0\"")
         );
     }
 

@@ -18,13 +18,36 @@
 //!   [`RockSurfaces::by_module`] map (#30), merged with `or_insert` so a
 //!   project file that shadows a rock module keeps the database's answer —
 //!   the same precedence path-keyed resolution gives `luabox check`.
+//!
+//! [`require_module_of`] is the other half: which *binding* a module string
+//! belongs to. It is deliberately narrow — the initialiser must be exactly a
+//! static `require("...")` call in the matching position of a `local`
+//! statement. Everything looser stays `unknown`, which is the honest answer
+//! rather than a guess:
+//!
+//! - `local m = require(name)` — a dynamic require has no statically known
+//!   module, and the type pass does not resolve one either;
+//! - `local m = require("a") or require("b")` — the initialiser is a binary
+//!   expression, not a require; which branch runs is a runtime fact, and
+//!   naming either one would be a coin flip presented as a type;
+//! - `local m = require("mod").sub` — the binding is the *field*, not the
+//!   module.
+//!
+//! Shadowing needs no special case: the lookup is keyed on the binding's own
+//! declaration range, so `local m = require("a")` followed by
+//! `local m = require("b")` gives each `m` its own module.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use luabox_db::Analysis;
+use luabox_hir::Binding;
+use luabox_syntax::lua::SyntaxKind;
+use luabox_syntax::lua::ast::{self, AstNode};
 use luabox_types::RockSurfaces;
-use luabox_types::ty::Ty;
+use luabox_types::ty::{FieldTy, Ty};
+
+use crate::sema::FileSema;
 
 /// Module string → export type for one file's static `require`s: the project
 /// database's answers, with the rock harvest's module-keyed answers merged
@@ -70,6 +93,71 @@ impl RequireExports {
     pub fn by_module(&self) -> &HashMap<String, Ty> {
         &self.by_module
     }
+
+    /// The export type of `module`, if it resolved. `None` for a module the
+    /// project does not have and no rock provides — `unknown` to the type
+    /// pass, and `unknown` to every surface that reads this.
+    #[must_use]
+    pub fn get(&self, module: &str) -> Option<&Ty> {
+        self.by_module.get(module)
+    }
+
+    /// The export type of the module `binding` is initialised from — the type
+    /// hover and completion must show for a `require` binding, because it is
+    /// the type the problems pane already checks that binding against.
+    ///
+    /// `None` when the binding is not a plain `local x = require("...")`, or
+    /// when the module resolved to nothing. Both are `unknown` to the type
+    /// pass too, so both stay `unknown` here.
+    #[must_use]
+    pub fn binding_export(&self, sema: &FileSema, binding: &Binding) -> Option<&Ty> {
+        self.get(require_module_of(sema, binding)?)
+    }
+}
+
+/// The module string of the static `require` that initialises `binding`, when
+/// the binding is a `local` name whose matching initialiser is exactly that
+/// call. See the module docs for what is deliberately excluded.
+#[must_use]
+pub fn require_module_of<'a>(sema: &'a FileSema, binding: &Binding) -> Option<&'a str> {
+    let declares = |stmt: &ast::LocalStmt| {
+        stmt.names()
+            .position(|n| n.name().is_some_and(|t| t.text_range() == binding.range))
+    };
+    let (local, index) = sema
+        .root
+        .descendants()
+        .filter(|node| node.kind() == SyntaxKind::LOCAL_STMT)
+        .filter_map(ast::LocalStmt::cast)
+        .find_map(|stmt| declares(&stmt).map(|index| (stmt, index)))?;
+    // Positional: `local a, b = require("x"), require("y")` gives each name
+    // its own module, and a name past the end of the value list has none.
+    let value = local.values()?.exprs().nth(index)?;
+    let range = value.syntax().text_range();
+    // Identity, not containment: the initialiser must *be* the require call.
+    // `require("a") or require("b")` and `require("mod").sub` both contain one
+    // and are both something else.
+    sema.requires()
+        .iter()
+        .find(|edge| edge.range == range)
+        .map(|edge| edge.module.as_str())
+}
+
+/// The named fields of a module export, when the export is a structural table
+/// — the shape of the overwhelmingly common `local M = {} … return M` module.
+///
+/// A module that returns a `---@class` instance is [`Ty::Named`], whose fields
+/// live in the class declaration rather than in the type; resolving those
+/// needs the ambient environment the *type pass* holds, not the per-file view
+/// these surfaces are built on, so members of such a module are not offered.
+/// The binding itself still hovers as the class name, which is the half that
+/// carries the information.
+#[must_use]
+pub fn export_fields(ty: &Ty) -> Option<&BTreeMap<String, FieldTy>> {
+    match ty {
+        Ty::Table(table) => Some(&table.fields),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -103,6 +191,114 @@ mod tests {
             });
         }
         (host.snapshot(), first.expect("at least one file"))
+    }
+
+    /// The module the binding named `name` in the first file is required from.
+    fn module_of(files: &[(&str, &str)], name: &str) -> Option<String> {
+        let (analysis, path) = analyze(files);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let lowered = analysis.lower(&path).expect("lowered");
+        let (_, binding) = lowered.file().bindings().find(|(_, b)| b.name == name)?;
+        require_module_of(&sema, binding).map(ToString::to_string)
+    }
+
+    #[test]
+    fn a_plain_local_require_names_its_module() {
+        let files = [("main.lua", "local m = require(\"other\")\nreturn m\n")];
+        assert_eq!(module_of(&files, "m").as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn a_multi_name_local_matches_requires_positionally() {
+        let src = "local a, b = require(\"x\"), require(\"y\")\nreturn a, b\n";
+        let files = [("main.lua", src)];
+        assert_eq!(module_of(&files, "a").as_deref(), Some("x"));
+        assert_eq!(module_of(&files, "b").as_deref(), Some("y"));
+    }
+
+    #[test]
+    fn a_name_past_the_end_of_the_value_list_has_no_module() {
+        let files = [("main.lua", "local a, b = require(\"x\")\nreturn a, b\n")];
+        assert_eq!(module_of(&files, "b"), None);
+    }
+
+    /// `require("a") or require("b")` is a binary expression, not a require:
+    /// which branch runs is a runtime fact (see the module docs).
+    #[test]
+    fn an_or_chained_require_names_no_module() {
+        let src = "local m = require(\"a\") or require(\"b\")\nreturn m\n";
+        assert_eq!(module_of(&[("main.lua", src)], "m"), None);
+    }
+
+    #[test]
+    fn a_field_of_a_require_is_not_the_module_binding() {
+        let src = "local helper = require(\"other\").helper\nreturn helper\n";
+        assert_eq!(module_of(&[("main.lua", src)], "helper"), None);
+    }
+
+    #[test]
+    fn a_dynamic_require_names_no_module() {
+        let src = "local name = \"other\"\nlocal m = require(name)\nreturn m\n";
+        assert_eq!(module_of(&[("main.lua", src)], "m"), None);
+    }
+
+    #[test]
+    fn a_local_with_no_initialiser_names_no_module() {
+        assert_eq!(module_of(&[("main.lua", "local m\nreturn m\n")], "m"), None);
+    }
+
+    #[test]
+    fn a_shadowing_require_binding_keeps_its_own_module() {
+        // Two bindings both named `m`; the lookup is keyed on the declaration
+        // range, so each answers with the module it was declared from.
+        let src = "\
+local m = require(\"first\")
+print(m)
+local m = require(\"second\")
+return m
+";
+        let (analysis, path) = analyze(&[("main.lua", src)]);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let lowered = analysis.lower(&path).expect("lowered");
+        let modules: Vec<String> = lowered
+            .file()
+            .bindings()
+            .filter(|(_, b)| b.name == "m")
+            .filter_map(|(_, b)| require_module_of(&sema, b))
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(modules, vec!["first", "second"]);
+    }
+
+    /// `binding_export` is the two halves joined: the binding's module, then
+    /// that module's export type out of the shared map.
+    #[test]
+    fn a_require_binding_exports_the_modules_type() {
+        let files = [
+            ("main.lua", "local m = require(\"other\")\nreturn m\n"),
+            (
+                "other.lua",
+                "local M = {}\n---@return string\nfunction M.helper() return \"s\" end\nreturn M\n",
+            ),
+        ];
+        let (analysis, path) = analyze(&files);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let exports = RequireExports::resolve(&analysis, &path, &RockSurfaces::default());
+        let lowered = analysis.lower(&path).expect("lowered");
+        let (_, binding) = lowered
+            .file()
+            .bindings()
+            .find(|(_, b)| b.name == "m")
+            .expect("the binding");
+        let ty = exports.binding_export(&sema, binding).expect("its export");
+        let fields = export_fields(ty).expect("a structural table export");
+        assert!(fields.contains_key("helper"), "{ty}");
+    }
+
+    #[test]
+    fn export_fields_declines_a_non_table_export() {
+        assert!(export_fields(&Ty::Number).is_none());
+        assert!(export_fields(&Ty::Named("Point".to_string())).is_none());
     }
 
     #[test]

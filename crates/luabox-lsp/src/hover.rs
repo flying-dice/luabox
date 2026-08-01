@@ -7,9 +7,10 @@ use lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind};
 use luabox_hir::{BindingKind, Resolution};
 use luabox_syntax::lua::SyntaxKind;
 use luabox_syntax::lua::ast::{self, AstNode};
+use luabox_types::ty::Ty;
 use rowan::TextRange;
 
-use crate::requires::RequireExports;
+use crate::requires::{self, RequireExports};
 use crate::sema::{self, FileSema};
 
 /// Compute the hover at a byte `offset`.
@@ -54,9 +55,16 @@ pub fn hover(sema: &FileSema, offset: usize, exports: &RequireExports) -> Option
         {
             return Some(reply(&info.sig, &info.docs, &info.sees, token_range, sema));
         }
+        // An explicit `---@type`/`---@param` first, then — for a `require`
+        // binding — the module's export type out of the shared resolution
+        // (#54). Explicit beats implicit, the same precedence the rest of the
+        // toolchain uses; what changed is that "implicit" is no longer a
+        // synonym for `unknown`.
         let rendered_ty = sema
             .binding_type(binding)
-            .map_or_else(|| "unknown".to_string(), |ty| sema::render_type(&ty));
+            .map(|ty| sema::render_type(&ty))
+            .or_else(|| exports.binding_export(sema, binding).map(Ty::to_string))
+            .unwrap_or_else(|| "unknown".to_string());
         let keyword = match binding.kind {
             BindingKind::Param | BindingKind::SelfParam => "(param)",
             BindingKind::ForVar => "(for)",
@@ -72,12 +80,13 @@ pub fn hover(sema: &FileSema, offset: usize, exports: &RequireExports) -> Option
     None
 }
 
-/// Hover for `recv.field` / `recv:method` when `recv`'s class is known, with
-/// a fallback to dotted function names (`M.helper`).
+/// Hover for `recv.field` / `recv:method` when `recv`'s class is known, when
+/// `recv` is a `require` binding whose module exports the member, with a
+/// fallback to dotted function names (`M.helper`).
 fn member_hover(
     sema: &FileSema,
     token: &luabox_syntax::lua::SyntaxToken,
-    _exports: &RequireExports,
+    exports: &RequireExports,
 ) -> Option<Hover> {
     let parent = token.parent()?;
     let (receiver, member) = match parent.kind() {
@@ -120,6 +129,20 @@ fn member_hover(
         );
         let docs = field.desc.clone().unwrap_or_default();
         return Some(reply(&code, &docs, &[], member.text_range(), sema));
+    }
+
+    // A member of a `require` binding: the field comes out of the module's
+    // export type, which is the same type the problems pane checks the
+    // access against (#54). Qualified by the *module* rather than the local
+    // name, so the hover names what it came from.
+    if let Some(binding) = sema.visible_binding_named(recv_token.text(), offset)
+        && let Some(module) = requires::require_module_of(sema, binding)
+        && let Some(fields) = exports.get(module).and_then(requires::export_fields)
+        && let Some(field) = fields.get(member.text())
+    {
+        let q = if field.optional { "?" } else { "" };
+        let code = format!("(field) {module}.{}{q}: {}", member.text(), field.ty);
+        return Some(reply(&code, "", &[], member.text_range(), sema));
     }
 
     // Fallback: an annotated dotted function `M.helper`.

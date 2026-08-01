@@ -86,8 +86,7 @@ Feature: luabox lsp — hover and completion on a `require` binding
       """
       local M = {}
 
-      ---@type string
-      M.version = "1.0"
+      M.count = 1
 
       ---@param n number
       ---@return string
@@ -104,16 +103,18 @@ Feature: luabox lsp — hover and completion on a `require` binding
     And the document "main.lua" is open
     When I request completion at 1:8 in "main.lua"
     Then the completion list contains "helper"
-    And the completion list contains "version"
-    And completion item "version" has detail "other.version: string"
+    And the completion list contains "count"
+    # The *inferred* type, literal and all — the one the checker will hold a
+    # use site to. Widening it for display would be the editor disagreeing
+    # with CI, which is the defect this file exists for.
+    And completion item "count" has detail "other.count: 1"
 
   Scenario: a colon on a require binding offers only its function members
     Given a file "other.lua" containing:
       """
       local M = {}
 
-      ---@type string
-      M.version = "1.0"
+      M.count = 1
 
       ---@return string
       function M.helper() return "s" end
@@ -129,7 +130,7 @@ Feature: luabox lsp — hover and completion on a `require` binding
     And the document "main.lua" is open
     When I request completion at 1:8 in "main.lua"
     Then the completion list contains "helper"
-    And the completion list does not contain "version"
+    And the completion list does not contain "count"
     And every completion item is a method
 
   # --- rock modules, resolved through the vendored-tree harvest (#30) ------
