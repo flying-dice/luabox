@@ -81,6 +81,20 @@ fn burn(depth: u32) -> u64 {
 
 #[test]
 fn a_pinned_worker_survives_a_recursion_no_default_stack_could() {
+    // `RUST_MIN_STACK` raises the default stack of every thread rayon spawns,
+    // so an environment setting it to 8 MiB or more would let an *unpinned*
+    // worker survive `burn`: deletion modes 1 and 2 would both stop failing,
+    // silently, and this file would go on passing while proving nothing. The
+    // assumption was named but undischarged (Shockwave round 7) and is worth
+    // one line. Asserted rather than removed, because a CI runner that sets it
+    // deliberately should be told this test is incompatible with it, not
+    // quietly overridden.
+    assert!(
+        std::env::var_os("RUST_MIN_STACK").is_none(),
+        "RUST_MIN_STACK is set: it raises every thread's default stack, which \
+         would mask an unpinned worker and make this test vacuous"
+    );
+
     // Reach the pin the way production does. The client end is dropped first,
     // so `initialize_start` fails and `run` returns immediately — but
     // `pin_worker_stacks()` is the line before it, and by then the global pool

@@ -162,11 +162,10 @@ pub fn diagnostics(
         Some(&ambient),
         &requires,
     ) {
-        // Type diagnostics are all `LB03xx`, so this is `TYPE_SOURCE` today —
-        // but through the band authority rather than by assertion, so a code
-        // moving band moves its source with it.
-        let source = source_for(diag.code);
-        out.push(convert(&index, &diag, source));
+        // Type diagnostics are all `LB03xx`, so this publishes under
+        // `TYPE_SOURCE` today — but through the band authority inside
+        // `convert`, so a code moving band moves its source with it.
+        out.push(convert(&index, &diag));
     }
 
     // 4. Lint findings — the `luabox lint` engine (SPEC.md §9), published
@@ -189,7 +188,7 @@ pub fn diagnostics(
             // matcher keys its quick fixes off. The band is `luabox_diag`'s
             // to define ([`luabox_diag::Code::is_lint`]) — an open-coded
             // `number() / 100 == 5` here was a contract nothing asserted.
-            out.push(convert(&index, diag, source_for(diag.code)));
+            out.push(convert(&index, diag));
         }
     }
 
@@ -197,14 +196,20 @@ pub fn diagnostics(
 }
 
 /// Convert a toolchain [`luabox_diag::Diagnostic`] to an LSP diagnostic through
-/// `index`, tagging it with `source`. Shared by the type pass, the lint pass,
-/// and the code-action matcher so a lint diagnostic offered on a quick-fix is
-/// byte-identical to the one published for the same finding.
-pub(crate) fn convert(
-    index: &LineIndex,
-    diag: &luabox_diag::Diagnostic,
-    source: &str,
-) -> Diagnostic {
+/// `index`. Shared by the type pass, the lint pass, and the code-action
+/// matcher so a lint diagnostic offered on a quick-fix is byte-identical to
+/// the one published for the same finding.
+///
+/// The `source` is *derived* here, from [`source_for`], rather than taken as a
+/// parameter. It used to be a `&str` argument, and all three non-test callers
+/// passed exactly `source_for(diag.code)` — an invariant held by convention
+/// across two modules, which is the shape of both source-mismatch bugs the
+/// previous rounds found (a hardcoded [`LINT_SOURCE`] at the code-action site
+/// in round 5, a hardcoded [`TYPE_SOURCE`] at three publishers in round 6).
+/// A caller can no longer pass a source that disagrees with the code, because
+/// it can no longer pass one at all (Shockwave round 7, issue X).
+pub(crate) fn convert(index: &LineIndex, diag: &luabox_diag::Diagnostic) -> Diagnostic {
+    let source = source_for(diag.code);
     let range = diag
         .primary_label()
         .map_or(0..0, |label| label.span.range.clone());

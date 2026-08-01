@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 
 use luabox_diag::Code;
 use luabox_hir::{
-    BindingId, BindingKind, Body, BodyId, Expr, ExprId, HirId, Literal, Resolution, Stmt,
+    BinOp, BindingId, BindingKind, Body, BodyId, Expr, ExprId, HirId, Literal, Resolution, Stmt,
     TableEntry,
 };
 
@@ -43,6 +43,9 @@ use crate::rule::{Rule, Tier};
 /// The metafield instance lookup consults.
 const INDEX: &str = "__index";
 
+/// The metafield a plain call `f(…)` on a table dispatches through.
+const CALL: &str = "__call";
+
 /// The prefix every metamethod name carries (`__call`, `__tostring`, `__add`,
 /// `__mode`, …). A carrier declaring one of these is a metatable with a
 /// deliberate purpose that is not instance lookup.
@@ -51,7 +54,7 @@ const METAFIELD_PREFIX: &str = "__";
 /// The receiver name a function attached to the carrier reaches an instance
 /// through — implicit under `function C:m()`, written out under
 /// `function C.__call(self, …)`. Both spellings count (see
-/// [`InstanceUses::seed_attached_self`]).
+/// [`InstanceUses::calling_reaches_a_method`]).
 const SELF: &str = "self";
 
 /// `setmetatable(<expr>, C)` where `C` is a `---@class` carrier declared in
@@ -75,11 +78,25 @@ const SELF: &str = "self";
 ///   `Vec.__tostring` on a carrier nothing is ever called on is a deliberate
 ///   operator metatable and there is nothing for a missing `__index` to
 ///   break; the same `__tostring` on a carrier some `v:length()` in the file
-///   actually reaches is a class that happens to overload an operator, and
-///   that call still crashes. The gate is behavioural, not structural:
-///   *declaring* `function Cache:reset()` next to `Cache.__mode = "k"` is not
-///   a lookup, and a `Cache` nothing is ever invoked on runs fine (Shockwave
-///   round 6 measured eight such carriers).
+///   really does execute is a class that happens to overload an operator, and
+///   *that* call crashes. The gate is behavioural, not structural, and
+///   "behavioural" is about what the file **reaches**, not about what it
+///   contains:
+///
+///   - *declaring* `function Cache:reset()` next to `Cache.__mode = "k"` is
+///     not a lookup, and a `Cache` no call site invokes runs fine (Shockwave
+///     round 6 measured eight such carriers);
+///   - nor is *writing* `self:clear()` inside that `Cache:reset`. The body of
+///     a method nothing calls does not execute, so the colon call in it never
+///     happens; round 7 measured this arm firing on exactly that program,
+///     which `lua5.4` runs to completion. What makes `Cache:reset` reachable
+///     is `c:reset()` on a derived value, and that is a use the derivations
+///     see directly.
+///
+///   The two ways this file can *reach* a method through the metatable are a
+///   colon call on a derived value and a plain call on one whose `__call`
+///   runs a colon call on its own receiver. Both are in [`InstanceUses`],
+///   with the one approximation that remains.
 ///
 /// It is **in-file only** — the carrier, the `__index` write and the
 /// `setmetatable` call must all be in the file being linted — and, being a
@@ -146,10 +163,13 @@ impl Rule for MetatableWithoutIndex {
                 }
                 // An operator metatable has no instance lookup to break — so
                 // a carrier that declares a metafield only fires once this
-                // file actually *reaches* a method on an instance of it. A
-                // declared-but-never-invoked `function Cache:reset()` is not
-                // a lookup; `c:value()` on a value derived from
-                // `setmetatable(_, Cache)` is (see [`InstanceUses`]).
+                // file actually *reaches* a method on an instance of it.
+                // Neither declaring `function Cache:reset()` nor writing
+                // `self:clear()` inside it is a lookup — an unreached body
+                // does not execute. `c:value()` on a value derived from
+                // `setmetatable(_, Cache)` is one, and so is `c()` when
+                // `Cache.__call` runs a colon call on its own receiver (see
+                // [`InstanceUses`]).
                 //
                 // Carriers with no metafield at all never reach this arm:
                 // that region is the rule's original, measured-clean
@@ -214,6 +234,52 @@ fn setmetatable_arg(
         [_, meta] => Some(*meta),
         _ => None,
     }
+}
+
+/// Which value expression, and which of its result slots, supplies each name
+/// in a `local a, b, c = …` or `a, b, c = …` — Lua's adjustment rule, spelled
+/// out.
+///
+/// Every initializer but the last is truncated to one value, so name `i` takes
+/// slot 0 of initializer `i`. The *last* initializer is the only one that can
+/// expand: a call or `...` fills every remaining name, so a name past the end
+/// of the list takes slot `i - (len - 1)` of it. Anything else (a literal, a
+/// name, a parenthesised call) yields exactly one value, and the names past it
+/// are `nil` — [`None`].
+///
+/// `names.iter().zip(init)` is the shape this replaces, and it silently
+/// *dropped* every name past the initializer list: `local _n, c = make()`
+/// paired `_n` with `make()` and left `c` invisible to all three passes that
+/// walk these statements — so a `c` holding a constructed instance was never
+/// seeded, and the rule went silent on a program that crashes (Shockwave
+/// round 7, issue W). It also mis-slotted the name it *did* pair, handing
+/// `_n` a derivation that belongs to `c`.
+///
+/// The slot is reported rather than resolved: what a multi-value tail actually
+/// yields is the caller's question ([`InstanceUses::carriers_of`] answers it
+/// for the constructor pattern and gives up otherwise), and a name this
+/// function reports as unknown-but-present is strictly better than one it
+/// never mentions.
+fn supplies<'a>(
+    body: &'a Body,
+    names: usize,
+    init: &'a [ExprId],
+) -> impl Iterator<Item = Option<(ExprId, usize)>> + 'a {
+    (0..names).map(move |i| {
+        let (&last, head) = init.split_last()?;
+        if let Some(&expr) = head.get(i) {
+            Some((expr, 0))
+        } else if i == head.len() {
+            Some((last, 0))
+        } else if matches!(
+            body.expr(last),
+            Expr::Call { .. } | Expr::MethodCall { .. } | Expr::Vararg
+        ) {
+            Some((last, i - head.len()))
+        } else {
+            None
+        }
+    })
 }
 
 /// Which carrier bindings the rule must not fire on: those whose `__index` is
@@ -319,11 +385,16 @@ impl Carriers {
                         }
                     }
                     // `local C = { __index = … }` — the key in the carrier's
-                    // own constructor. Names and values pair positionally,
-                    // exactly as Lua does. (`local mt = C` is an alias and is
-                    // handled by [`Aliases`], not here.)
+                    // own constructor. Names and values pair through
+                    // [`supplies`], exactly as Lua adjusts them; a table
+                    // constructor is single-valued, so only slot 0 can be one.
+                    // (`local mt = C` is an alias and is handled by
+                    // [`Aliases`], not here.)
                     Stmt::Local { names, init } => {
-                        for (name, &value) in names.iter().zip(init) {
+                        for (name, supply) in names.iter().zip(supplies(body, names.len(), init)) {
+                            let Some((value, 0)) = supply else {
+                                continue;
+                            };
                             let Expr::Table { entries } = body.expr(value) else {
                                 continue;
                             };
@@ -401,9 +472,10 @@ impl Carriers {
         self.operator_tables.contains(&binding)
     }
 
-    /// Whether some colon call in this file lands on a value derived from
+    /// Whether this file *reaches* a method on a value derived from
     /// `setmetatable(_, C)` — the lookup a missing `__index` breaks, observed
-    /// rather than inferred from a declaration. See [`InstanceUses`].
+    /// at a call site rather than inferred from a declaration or from a colon
+    /// call written inside a body nothing enters. See [`InstanceUses`].
     fn has_instance_use(&self, binding: BindingId) -> bool {
         self.instance_uses.contains(&binding)
     }
@@ -431,7 +503,13 @@ impl Aliases {
                 let Stmt::Local { names, init } = stmt else {
                     continue;
                 };
-                for (name, &value) in names.iter().zip(init) {
+                // A name can only alias a carrier when it is bound to a bare
+                // name, which is single-valued — so only slot 0 aliases, and
+                // a name fed by a multi-value tail aliases nothing.
+                for (name, supply) in names.iter().zip(supplies(body, names.len(), init)) {
+                    let Some((value, 0)) = supply else {
+                        continue;
+                    };
                     if !matches!(body.expr(value), Expr::Name(_)) {
                         continue;
                     }
@@ -495,6 +573,22 @@ fn compress(direct: &HashMap<BindingId, BindingId>) -> HashMap<BindingId, Bindin
 /// A set of carrier bindings.
 type Carrying = HashSet<BindingId>;
 
+/// A value this pass can name and therefore track a derivation against: a
+/// resolved binding (local, upvalue, parameter — alias-rooted), or a global.
+///
+/// Globals are here because `g = setmetatable({}, C)` followed by `g:m()` is
+/// the same program as the `local` spelling and crashes the same way, and
+/// [`binding_of`] answers `None` for both halves of it — there is no
+/// [`BindingId`] for a free name. Keying on the name instead is exactly as
+/// sound as the rest of this pass, which is flow-insensitive anyway: two
+/// different tables reaching one global name merge their carriers, which is
+/// the over-approximating direction on a gate whose failure mode is silence.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum ValueRef {
+    Binding(BindingId),
+    Global(String),
+}
+
 /// The raw shapes one traversal of the file collects for [`InstanceUses`].
 /// Kept apart from the derivation state so a phase can read the shapes while
 /// writing the state.
@@ -502,22 +596,31 @@ type Carrying = HashSet<BindingId>;
 struct Shapes {
     /// Every `setmetatable(_, C)` call expression, by the carrier root `C`.
     constructions: HashMap<(BodyId, ExprId), BindingId>,
-    /// Function bodies reachable by name: `local function f` and
-    /// `local f = function …`.
-    fn_of_local: HashMap<BindingId, BodyId>,
+    /// Function bodies reachable by name: `local function f`,
+    /// `local f = function …`, `function g() … end`, `g = function …`.
+    fn_of_name: HashMap<ValueRef, BodyId>,
     /// Function bodies reachable as a field of a carrier: `function C.new()`,
-    /// `C.new = function …`. Keyed by carrier root and literal key.
+    /// `C.new = function …`, `local C = { new = function … }`. Keyed by
+    /// carrier root and literal key.
     fn_of_field: HashMap<(BindingId, String), BodyId>,
-    /// Every `local x = <expr>`, in the order the file declares them.
-    inits: Vec<(BodyId, BindingId, ExprId)>,
-    /// Every `return <expr>`, by the body it returns from.
-    returns: Vec<(BodyId, ExprId)>,
+    /// The body of each carrier's `__call` metamethod — the function a plain
+    /// call on one of its instances dispatches to. See
+    /// [`InstanceUses::calling_reaches_a_method`].
+    call_metamethod: HashMap<BindingId, BodyId>,
+    /// Every binding-or-global initialisation the pass can see, as
+    /// (body, bound value, initialiser, result slot of that initialiser).
+    /// `local x = <expr>` and `x = <expr>` alike.
+    inits: Vec<(BodyId, ValueRef, ExprId, usize)>,
+    /// Every `return <exprs>`, by the body it returns from. The list is kept
+    /// whole: which *slot* a value is returned in is what a caller's
+    /// `local _n, c = make()` needs.
+    returns: Vec<(BodyId, Vec<ExprId>)>,
     /// Every `receiver:m(…)` receiver, by the body it appears in.
     receivers: Vec<(BodyId, ExprId)>,
-    /// Function bodies attached to a carrier — `function C:m()`,
-    /// `C.__call = function …`, `local C = { __lt = function … }` — with the
-    /// carrier they hang off.
-    attached: Vec<(BodyId, BindingId)>,
+    /// Every plain call's callee expression, by the body it appears in — the
+    /// `f` of `f(…)`. A call on an *instance* is a `__call` dispatch, which is
+    /// the other way a file reaches a method through a metatable.
+    callees: Vec<(BodyId, ExprId)>,
 }
 
 /// The carriers with an **observed instance-side use**: somewhere in this
@@ -529,38 +632,75 @@ struct Shapes {
 /// any instance — `local d = setmetatable({}, D); d:m()` is a use of `D` and
 /// says nothing about a `C` that happens to declare an `m` of its own.
 ///
-/// Four derivations are tracked, and they are exactly the four Shockwave's
-/// round-6 shapes need:
+/// # Which values are derived
 ///
-/// 1. **the construction itself**, method-called on the spot:
-///    `setmetatable({}, C):m()`;
-/// 2. **a local bound to it** — `local c = setmetatable({}, C)` — and any
-///    `local d = c` alias of that local, through the same [`Aliases`] map the
-///    carrier side uses;
+/// A value is *derived* from `C` when this pass can follow it back to a
+/// `setmetatable(_, C)`:
+///
+/// 1. **the construction itself**: `setmetatable({}, C):m()`;
+/// 2. **a name bound to it** — `local c = setmetatable({}, C)`, and equally
+///    `c = setmetatable({}, C)` on a name declared earlier or on a global —
+///    plus any `local d = c` alias, through the same [`Aliases`] map the
+///    carrier side uses. `a or b` and `a and b` are followed into their
+///    result operands;
 /// 3. **the constructor pattern**: a function whose body returns a
-///    construction (directly, or via a local it bound to one) is a *factory*
-///    for that carrier, and a local bound to a call of it holds an instance.
+///    construction (directly, or via a name it bound to one) is a *factory*
+///    for that carrier, and a name bound to a call of it holds an instance.
 ///    `local c = Counter.new(); c:value()` is the canonical carrier program
-///    and must keep firing;
-/// 4. **`self` inside a function attached to the carrier**, colon-declared
-///    method or metafield alike. A `__call` factory whose body is
-///    `return self:build()` reaches an instance method from *inside* the
-///    carrier, and that program does crash.
+///    and must keep firing. Return **slots** are tracked, so
+///    `return 1, setmetatable({}, C)` seeds the second name of
+///    `local n, c = make()` and not the first.
 ///
-/// Everything else is unknown and stays unknown: a carrier stored in a table,
-/// passed to a function, or reached through `require` derives nothing. That
-/// direction is the safe one here — an underived instance means the operator
-/// table stays silent, which is the false-negative axis, and this rule's
-/// false-positive axis is the one that had eight measured members.
+/// # Which uses count
+///
+/// Two, and both are *reaching* a method rather than declaring one:
+///
+/// - a **colon call on a derived value** — `c:m()`. This is the lookup a
+///   missing `__index` breaks, observed directly;
+/// - a **plain call on a derived value** — `f()` — when the carrier's
+///   `__call` metamethod is a function body in this file whose own `self`
+///   takes a colon call. That is the chain `f()` → `C.__call(self)` →
+///   `self:m()`, and it does crash.
+///
+/// The second used to be spelled the other way round: `self` inside *any*
+/// function attached to the carrier was treated as a derived value, so a
+/// `self:m()` anywhere in any attached body counted as a use whether or not
+/// the file ever reached that body. Shockwave round 7 measured the cost: the
+/// `__call` fixture with its last line changed from `print(f())` to
+/// `print(type(f))` produced byte-identical lint output against opposite
+/// runtime verdicts, and `function Cache:reset() self:clear() end` on an
+/// uninvoked `Cache` fired on a program that runs fine. Presence in a body is
+/// not reaching it. A colon-declared method is reached only through an
+/// instance colon call, which derivation (1)–(3) already sees; the `__call`
+/// body is the one that a *plain* call reaches, so it is the one this asks
+/// about.
+///
+/// **The remaining approximation is one level deep and is a false positive.**
+/// A `self:m()` that sits inside `if false then … end` within the `__call`
+/// body still counts — this pass has no reachability analysis inside a body,
+/// the same bound the `__index`-write side has carried since the rule shipped.
+/// The shape needed to trip it (a carrier with a `__call`, no `__index`, a
+/// dead-branch `self:m()` inside that `__call`, and a plain call on an
+/// instance) has no measured instance; the earlier over-approximation had
+/// eight. It is recorded in `docs/03-reference/02-limitations.md`.
+///
+/// Everything else is unknown and stays unknown: an instance stored in a
+/// table, passed as a parameter, taken from a `for`-in variable, returned by a
+/// method call, or reached through `require` derives nothing. That direction
+/// is the safe one here — an underived instance means the operator table stays
+/// silent, which is the false-negative axis, and this rule's false-positive
+/// axis is the one that had eight measured members.
 struct InstanceUses<'ctx, 'src> {
     ctx: &'ctx LintContext<'src>,
     aliases: &'ctx Aliases,
     shapes: Shapes,
-    /// Value bindings (alias roots) and the carriers they may hold an
+    /// Values (alias-rooted bindings, and globals by name) and the carriers
+    /// they may hold an instance of.
+    derived: HashMap<ValueRef, Carrying>,
+    /// Function bodies that return an instance, by **return slot**: entry `i`
+    /// is the set of carriers the body's `i`th returned value may be an
     /// instance of.
-    derived: HashMap<BindingId, Carrying>,
-    /// Function bodies that return an instance, and of which carrier.
-    factories: HashMap<BodyId, Carrying>,
+    factories: HashMap<BodyId, Vec<Carrying>>,
 }
 
 impl<'ctx, 'src> InstanceUses<'ctx, 'src> {
@@ -572,38 +712,57 @@ impl<'ctx, 'src> InstanceUses<'ctx, 'src> {
             derived: HashMap::new(),
             factories: HashMap::new(),
         };
-        // Two rounds of `seed_locals`, with factory discovery between them,
-        // and no more: the first round finds the locals bound directly to a
+        // Two rounds of `seed_values`, with factory discovery between them,
+        // and no more: the first round finds the names bound directly to a
         // construction, which is what makes a `return` recognisable as a
-        // factory; the second finds the locals bound to a call of one. That
+        // factory; the second finds the names bound to a call of one. That
         // is constructor depth one — `local c = Counter.new()` — which is the
         // pattern this is for. A factory that returns another factory's
         // result is not chased, deliberately: an unbounded fixpoint over
-        // (binding × carrier) is a shape a big file could pay for, and the
+        // (value × carrier) is a shape a big file could pay for, and the
         // miss is a false negative, not a false positive.
-        this.seed_locals();
+        this.seed_values();
         this.seed_factories();
-        this.seed_locals();
-        this.seed_attached_self();
+        this.seed_values();
         this.observed()
     }
 
-    /// The carriers a value expression may hold an instance of.
-    fn carriers_of(&self, body_id: BodyId, expr: ExprId) -> Carrying {
+    /// The carriers result `slot` of a value expression may hold an instance
+    /// of. Slot 0 is the ordinary single-value question; higher slots are only
+    /// ever answerable for a call of a known factory, which is what makes
+    /// `local _n, c = make()` land on `c`.
+    fn carriers_of(&self, body_id: BodyId, expr: ExprId, slot: usize) -> Carrying {
         match self.ctx.lowered.body(body_id).expr(expr) {
-            // `(setmetatable({}, C)):m()` — the paren is not a value.
-            Expr::Truncate(inner) => self.carriers_of(body_id, *inner),
-            Expr::Name(_) => self
-                .binding_at(body_id, expr)
-                .and_then(|binding| self.derived.get(&binding))
+            // `(setmetatable({}, C)):m()` — the paren is not a value, and it
+            // truncates to exactly one.
+            Expr::Truncate(inner) if slot == 0 => self.carriers_of(body_id, *inner, 0),
+            Expr::Name(_) if slot == 0 => self
+                .value_at(body_id, expr)
+                .and_then(|value| self.derived.get(&value))
                 .cloned()
                 .unwrap_or_default(),
+            // `local c = setmetatable({}, C) or fallback` is the instance
+            // whenever the construction is truthy, which a table always is;
+            // `a and b` evaluates to `b` when it evaluates to anything but its
+            // own left operand. Both truncate to one value.
+            Expr::Binary { op, lhs, rhs } if slot == 0 => match op {
+                BinOp::And => self.carriers_of(body_id, *rhs, 0),
+                BinOp::Or => {
+                    let mut carriers = self.carriers_of(body_id, *lhs, 0);
+                    carriers.extend(self.carriers_of(body_id, *rhs, 0));
+                    carriers
+                }
+                _ => Carrying::new(),
+            },
             Expr::Call { .. } => {
-                if let Some(&carrier) = self.shapes.constructions.get(&(body_id, expr)) {
+                if slot == 0
+                    && let Some(&carrier) = self.shapes.constructions.get(&(body_id, expr))
+                {
                     return Carrying::from([carrier]);
                 }
                 self.callee_body(body_id, expr)
                     .and_then(|body| self.factories.get(&body))
+                    .and_then(|slots| slots.get(slot))
                     .cloned()
                     .unwrap_or_default()
             }
@@ -620,8 +779,8 @@ impl<'ctx, 'src> InstanceUses<'ctx, 'src> {
         };
         match body.expr(*callee) {
             Expr::Name(_) => self
-                .binding_at(body_id, *callee)
-                .and_then(|binding| self.shapes.fn_of_local.get(&binding).copied()),
+                .value_at(body_id, *callee)
+                .and_then(|value| self.shapes.fn_of_name.get(&value).copied()),
             Expr::Index { base, index, .. } => {
                 if !matches!(body.expr(*base), Expr::Name(_)) {
                     return None;
@@ -637,65 +796,125 @@ impl<'ctx, 'src> InstanceUses<'ctx, 'src> {
         }
     }
 
-    /// The alias root of the binding a name expression resolves to.
+    /// The value a name expression refers to: the alias root of its binding,
+    /// or the global's name.
+    fn value_at(&self, body_id: BodyId, expr: ExprId) -> Option<ValueRef> {
+        value_ref(
+            self.ctx.lowered.resolution(HirId::expr(body_id, expr)),
+            |b| self.aliases.root(b),
+        )
+    }
+
+    /// The alias root of the binding a name expression resolves to, ignoring
+    /// globals — the carrier positions, where a `---@class` annotation is only
+    /// ever attached to a binding.
     fn binding_at(&self, body_id: BodyId, expr: ExprId) -> Option<BindingId> {
         binding_of(self.ctx.lowered.resolution(HirId::expr(body_id, expr)))
             .map(|binding| self.aliases.root(binding))
     }
 
-    /// `local c = <expr>` — record what `c` may hold.
-    fn seed_locals(&mut self) {
-        let mut found: Vec<(BindingId, BindingId)> = Vec::new();
-        for &(body_id, binding, value) in &self.shapes.inits {
-            for carrier in self.carriers_of(body_id, value) {
-                found.push((self.aliases.root(binding), carrier));
+    /// `local c = <expr>` and `c = <expr>` — record what `c` may hold, from
+    /// the initialiser slot [`supplies`] said feeds it.
+    fn seed_values(&mut self) {
+        let mut found: Vec<(ValueRef, BindingId)> = Vec::new();
+        for (body_id, target, value, slot) in &self.shapes.inits {
+            for carrier in self.carriers_of(*body_id, *value, *slot) {
+                found.push((target.clone(), carrier));
             }
         }
-        for (binding, carrier) in found {
-            self.derived.entry(binding).or_default().insert(carrier);
+        for (target, carrier) in found {
+            self.derived.entry(target).or_default().insert(carrier);
         }
     }
 
-    /// A body that returns an instance is a factory for that carrier.
+    /// A body that returns an instance is a factory for that carrier, in the
+    /// slot it returns it in.
+    ///
+    /// Only the value written in each slot is read: a trailing `return f()`
+    /// that would itself expand to several values contributes its slot 0 and
+    /// nothing beyond, the same constructor-depth-one bound the seeding rounds
+    /// take.
     fn seed_factories(&mut self) {
-        let mut found: Vec<(BodyId, BindingId)> = Vec::new();
-        for &(body_id, value) in &self.shapes.returns {
-            for carrier in self.carriers_of(body_id, value) {
-                found.push((body_id, carrier));
+        let mut found: Vec<(BodyId, usize, BindingId)> = Vec::new();
+        for (body_id, values) in &self.shapes.returns {
+            for (slot, &value) in values.iter().enumerate() {
+                for carrier in self.carriers_of(*body_id, value, 0) {
+                    found.push((*body_id, slot, carrier));
+                }
             }
         }
-        for (body_id, carrier) in found {
-            self.factories.entry(body_id).or_default().insert(carrier);
+        for (body_id, slot, carrier) in found {
+            let slots = self.factories.entry(body_id).or_default();
+            if slots.len() <= slot {
+                slots.resize_with(slot + 1, Carrying::new);
+            }
+            if let Some(at) = slots.get_mut(slot) {
+                at.insert(carrier);
+            }
         }
     }
 
-    /// The `self` of a function attached to the carrier holds an instance of
-    /// it — implicit under `function C:m()`, written out under
-    /// `function C.__call(self, …)`. Only the first parameter counts, and
-    /// only when it is the implicit `self` or is literally named [`SELF`].
-    fn seed_attached_self(&mut self) {
-        let mut found: Vec<(BindingId, BindingId)> = Vec::new();
-        for &(fn_body, carrier) in &self.shapes.attached {
-            let Some(&param) = self.ctx.lowered.body(fn_body).params.first() else {
-                continue;
-            };
-            let binding = self.ctx.lowered.binding(param);
-            if binding.kind == BindingKind::SelfParam || binding.name == SELF {
-                found.push((param, carrier));
-            }
-        }
-        for (binding, carrier) in found {
-            self.derived.entry(binding).or_default().insert(carrier);
-        }
-    }
-
-    /// Every carrier some `receiver:m(…)` in the file reaches.
+    /// Every carrier this file actually reaches a method on: through a colon
+    /// call on a derived value, or through a plain call on one whose `__call`
+    /// runs a colon call on its own `self`.
     fn observed(&self) -> HashSet<BindingId> {
         let mut out = HashSet::new();
         for &(body_id, receiver) in &self.shapes.receivers {
-            out.extend(self.carriers_of(body_id, receiver));
+            out.extend(self.carriers_of(body_id, receiver, 0));
+        }
+        for &(body_id, callee) in &self.shapes.callees {
+            for carrier in self.carriers_of(body_id, callee, 0) {
+                if self.calling_reaches_a_method(carrier) {
+                    out.insert(carrier);
+                }
+            }
         }
         out
+    }
+
+    /// Whether *calling* an instance of this carrier reaches a method on it:
+    /// the carrier's `__call` is a function body in this file, its first
+    /// parameter is the receiver, and that receiver takes a colon call inside
+    /// the body.
+    ///
+    /// Only the `__call` body is asked, not every attached body. A carrier
+    /// whose `__call` is `function(self) return 1 end` beside a
+    /// `function C:reset() self:clear() end` that nothing invokes runs fine
+    /// under `c()`, and asking the wider question would report it.
+    ///
+    /// Only the *direct* body counts: a colon call inside a closure nested in
+    /// the `__call`, or in a helper it calls, is not followed. That is a false
+    /// negative, and the direction this arm errs in.
+    fn calling_reaches_a_method(&self, carrier: BindingId) -> bool {
+        let Some(&body_id) = self.shapes.call_metamethod.get(&carrier) else {
+            return false;
+        };
+        let Some(&param) = self.ctx.lowered.body(body_id).params.first() else {
+            return false;
+        };
+        let binding = self.ctx.lowered.binding(param);
+        // Implicit under `function C:__call()`, written out under
+        // `function C.__call(self, …)`. Both spellings count.
+        if binding.kind != BindingKind::SelfParam && binding.name != SELF {
+            return false;
+        }
+        self.shapes.receivers.iter().any(|&(body, receiver)| {
+            body == body_id && self.binding_at(body, receiver) == Some(param)
+        })
+    }
+}
+
+/// [`binding_of`], extended to name globals — see [`ValueRef`]. The `root`
+/// callback applies the alias map to the binding case only; a global has no
+/// alias chain to walk.
+fn value_ref(
+    res: Option<&Resolution>,
+    root: impl FnOnce(BindingId) -> BindingId,
+) -> Option<ValueRef> {
+    match res? {
+        Resolution::Local(b) => Some(ValueRef::Binding(root(*b))),
+        Resolution::Upvalue { binding, .. } => Some(ValueRef::Binding(root(*binding))),
+        Resolution::Global(name) => Some(ValueRef::Global(name.clone())),
     }
 }
 
@@ -707,9 +926,15 @@ impl Shapes {
                 binding_of(ctx.lowered.resolution(HirId::expr(body_id, expr)))
                     .map(|binding| aliases.root(binding))
             };
+            let value_of = |expr: ExprId| {
+                value_ref(ctx.lowered.resolution(HirId::expr(body_id, expr)), |b| {
+                    aliases.root(b)
+                })
+            };
             for (expr_id, expr) in body.exprs() {
                 match expr {
-                    Expr::Call { .. } => {
+                    Expr::Call { callee, .. } => {
+                        this.callees.push((body_id, *callee));
                         if let Some(meta) = setmetatable_arg(ctx, body_id, body, expr)
                             && let Some(carrier) = carrier_of(meta)
                         {
@@ -725,11 +950,18 @@ impl Shapes {
             for (_, stmt) in body.stmts() {
                 match stmt {
                     Stmt::Local { names, init } => {
-                        for (name, &value) in names.iter().zip(init) {
-                            this.inits.push((body_id, name.binding, value));
+                        for (name, supply) in names.iter().zip(supplies(body, names.len(), init)) {
+                            let Some((value, slot)) = supply else {
+                                continue;
+                            };
+                            let target = ValueRef::Binding(aliases.root(name.binding));
+                            this.inits.push((body_id, target.clone(), value, slot));
+                            if slot != 0 {
+                                continue;
+                            }
                             match body.expr(value) {
                                 Expr::Function(fn_body) => {
-                                    this.fn_of_local.insert(name.binding, *fn_body);
+                                    this.fn_of_name.insert(target, *fn_body);
                                 }
                                 // `local C = { __lt = function … }` attaches
                                 // to the carrier its own constructor declares.
@@ -742,35 +974,55 @@ impl Shapes {
                     }
                     Stmt::LocalFunction { binding, func } => {
                         if let Expr::Function(fn_body) = body.expr(*func) {
-                            this.fn_of_local.insert(*binding, *fn_body);
+                            this.fn_of_name
+                                .insert(ValueRef::Binding(aliases.root(*binding)), *fn_body);
                         }
                     }
+                    // Both target shapes matter. An `Expr::Index` target is
+                    // `function C:m()` / `C.__call = function …` — a function
+                    // attached to a carrier. An `Expr::Name` target is
+                    // `c = setmetatable({}, C)` on a name declared earlier
+                    // (`local c` then `c = …`), on a global, or
+                    // `function make() … end`. Reading only the first left
+                    // `local c` + `c = setmetatable({}, Cache)` + `c:reset()`
+                    // silent on a crash (Shockwave round 7).
                     Stmt::Assign { targets, values } => {
-                        for (slot, &target) in targets.iter().enumerate() {
-                            let Expr::Index { base, index, .. } = body.expr(target) else {
+                        for (&target, supply) in
+                            targets.iter().zip(supplies(body, targets.len(), values))
+                        {
+                            let Some((value, slot)) = supply else {
                                 continue;
                             };
-                            if !matches!(body.expr(*base), Expr::Name(_)) {
-                                continue;
-                            }
-                            let (Some(carrier), Some(&value)) =
-                                (carrier_of(*base), values.get(slot))
-                            else {
-                                continue;
-                            };
-                            let Expr::Function(fn_body) = body.expr(value) else {
-                                continue;
-                            };
-                            this.attached.push((*fn_body, carrier));
-                            if let Some(key) = index_key(body.expr(*index)) {
-                                this.fn_of_field.insert((carrier, key.to_owned()), *fn_body);
+                            match body.expr(target) {
+                                Expr::Index { base, index, .. } => {
+                                    if slot != 0 || !matches!(body.expr(*base), Expr::Name(_)) {
+                                        continue;
+                                    }
+                                    let (Some(carrier), Expr::Function(fn_body)) =
+                                        (carrier_of(*base), body.expr(value))
+                                    else {
+                                        continue;
+                                    };
+                                    if let Some(key) = index_key(body.expr(*index)) {
+                                        this.attach(carrier, key, *fn_body);
+                                    }
+                                }
+                                Expr::Name(_) => {
+                                    let Some(bound) = value_of(target) else {
+                                        continue;
+                                    };
+                                    this.inits.push((body_id, bound.clone(), value, slot));
+                                    if slot == 0
+                                        && let Expr::Function(fn_body) = body.expr(value)
+                                    {
+                                        this.fn_of_name.insert(bound, *fn_body);
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
-                    Stmt::Return(values) => {
-                        this.returns
-                            .extend(values.iter().map(|&value| (body_id, value)));
-                    }
+                    Stmt::Return(values) => this.returns.push((body_id, values.clone())),
                     _ => {}
                 }
             }
@@ -778,15 +1030,28 @@ impl Shapes {
         this
     }
 
-    /// Attach every function value in a carrier's own table constructor.
+    /// Record a function attached to a carrier under a literal key: reachable
+    /// as `C.key(…)`, and — when the key is [`CALL`] — as the metamethod a
+    /// plain call on one of the carrier's instances dispatches to.
+    fn attach(&mut self, carrier: BindingId, key: &str, fn_body: BodyId) {
+        if key == CALL {
+            self.call_metamethod.insert(carrier, fn_body);
+        }
+        self.fn_of_field.insert((carrier, key.to_owned()), fn_body);
+    }
+
+    /// Attach every keyed function value in a carrier's own table
+    /// constructor — `local C = { __call = function(self) … end }` declares
+    /// the metamethod exactly as `C.__call = …` does.
     fn attach_entries(&mut self, body: &Body, carrier: BindingId, entries: &[TableEntry]) {
         for entry in entries {
-            let value = match entry {
+            let (key, value) = match entry {
                 TableEntry::Positional(_) => continue,
-                TableEntry::Named { value, .. } | TableEntry::Keyed { value, .. } => *value,
+                TableEntry::Named { name, value } => (Some(name.as_str()), *value),
+                TableEntry::Keyed { key, value } => (index_key(body.expr(*key)), *value),
             };
-            if let Expr::Function(fn_body) = body.expr(value) {
-                self.attached.push((*fn_body, carrier));
+            if let (Some(key), Expr::Function(fn_body)) = (key, body.expr(value)) {
+                self.attach(carrier, key, *fn_body);
             }
         }
     }
