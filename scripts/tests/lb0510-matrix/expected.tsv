@@ -85,3 +85,70 @@ metafield_fn_vararg_slot_uninvoked	0	ok	the twin
 plain_carrier_invoked	1	crash	the no-metafield region, canonical repro (round 2)
 plain_carrier_uninvoked	1	ok	the no-metafield region is structural on purpose: the documented over-approximation
 plain_carrier_index_wired	0	ok	__index is written
+
+# --- round 8: REACHABILITY -- a use is a call the file makes, not a colon --
+# call it contains. `observed()` read receivers out of every body with no
+# reachability test at all, so a colon call written in a function nothing
+# invokes counted. The reached set is the chunk plus a fixpoint over the
+# in-file call graph; a closure that escapes is not reached (FN-biased).
+metafield_reach_uninvoked_local_fn	0	ok	round-8 FP, closed: the colon call sits in a `local function` nothing calls
+metafield_reach_invoked_local_fn	1	crash	the twin: the same body, entered
+metafield_reach_dead_if_false	0	ok	round-8 FP, closed: literal-false branches are pruned when collecting uses
+metafield_reach_live_if_true	1	crash	the twin: a literal-true branch is live
+metafield_reach_escaping_closure	0	crash	FN: the closure escapes as an argument, so no call site names its body
+metafield_reach_escaping_closure_uninvoked	0	ok	the twin -- same silence, here it is right
+metafield_reach_two_deep_invoked	1	crash	the reached set is a fixpoint: chunk -> f -> g
+metafield_reach_two_deep_uninvoked	0	ok	the twin: the same chain with nothing at the top
+metafield_reach_carrier_field_fn_invoked	1	crash	a carrier field function reached by `Cache.run()`
+metafield_reach_carrier_field_fn_uninvoked	0	ok	the twin
+metafield_reach_colon_method_invoked	1	crash	a colon-method body reached by an instance colon call; Runner is wired
+metafield_reach_colon_method_uninvoked	0	ok	the twin
+metafield_reach_dead_while_false	0	ok	`while false do` never enters its body
+metafield_reach_repeat_runs_once	1	crash	`repeat` tests after the body, so the body always runs
+metafield_reach_else_of_dead_if	1	crash	pruning a literal-false `then` must not prune the `else` that runs
+metafield_reach_dead_if_nil	0	ok	`nil` is falsy and is a literal the collector can decide
+metafield_reach_guard_variable_false	1	ok	DISCLOSED FP: the prune is literal-condition only; a name is not decided
+metafield_reach_plain_table_method_invoked	1	crash	`h:go()` enters the method body, whose `c:reset()` is the lookup
+metafield_reach_plain_table_method_uninvoked	0	ok	the twin
+metafield_reach_pcall_argument	0	ok	the closure escapes into pcall -- unreached, and pcall swallows the error
+metafield_reach_immediate_closure	1	crash	an immediately-invoked function expression names its own body
+metafield_reach_returned_to_unknown	0	ok	the chunk returns the closure; nothing in this file enters it
+
+# --- round 8: the STATEMENT-FORM constructor (8th FN class) ----------------
+# `setmetatable(t, C)` links its FIRST ARGUMENT's binding, alias-rooted, as
+# derived-from-C -- not only the call's result.
+metafield_stmt_ctor_invoked	1	crash	round-8 FN, closed: `local t = {}` then `setmetatable(t, Cache)`
+metafield_stmt_ctor_uninvoked	0	ok	the twin
+metafield_stmt_ctor_factory_invoked	1	crash	the statement form inside new(), flowing into factory detection
+metafield_stmt_ctor_factory_uninvoked	0	ok	the twin
+metafield_stmt_ctor_alias_invoked	1	crash	the first-argument link is alias-rooted: constructing through `u` seeds `t`
+metafield_stmt_ctor_alias_uninvoked	0	ok	the twin
+metafield_stmt_ctor_expression_form	1	crash	the link is on evaluation, not on statement position
+
+# --- round 8: OR/AND follow the operand that is actually evaluated ---------
+# `ctor or x` is definitively ctor (a table is truthy, x never evaluates);
+# `x or ctor` is ambiguous and is NOT seeded; `x and ctor` is seeded (a falsy
+# x makes the name falsy and the colon call fails anyway); `ctor and x`
+# evaluates to x and is not seeded. The invoked/uninvoked twins for the two
+# closed cases are metafield_or_fallback_* and metafield_and_chain_*, above.
+metafield_or_rhs_ctor_live_lhs	0	ok	round-8 FP, closed: `x or ctor` with a truthy x never runs the construction
+metafield_or_rhs_ctor_nil_lhs	0	crash	FN: the price of the row above -- a falsy x does bind the construction
+metafield_and_rhs_ctor_falsy_guard	1	crash	`x and ctor` with a falsy x: the name holds false and the call fails anyway
+metafield_and_lhs_ctor_invoked	0	ok	`ctor and x` evaluates to x; the construction is discarded
+metafield_and_lhs_ctor_uninvoked	0	ok	the twin
+metafield_or_rhs_ctor_dead_branch	0	ok	round-8 FP as measured: silenced by the operand rule and by the prune
+
+# --- round 8: module factories and dot dispatch ---------------------------
+metafield_global_module_factory_invoked	1	crash	FN, closed: functions on a table are keyed by value now, so a global M works
+metafield_global_module_factory_uninvoked	0	ok	the twin
+metafield_local_module_factory_invoked	1	crash	the control: the same module table as a local, which always resolved
+metafield_dot_dispatch_invoked	1	crash	FN, closed: `c.reset(c)` resolves through the missing __index and fails
+metafield_dot_dispatch_uninvoked	0	ok	the twin -- the lookup yields nil and nothing is called
+metafield_dot_field_read_only	0	ok	a bare field read bound to a name is not a call
+metafield_dot_metafield_read	0	ok	a metafield read is not an instance-side use -- __mode is not served by __index
+
+# --- round 8: shapes pinned so the reachability work cannot break them -----
+metafield_call_dead_branch_self_colon	0	ok	round-7's last disclosed FP, closed by the literal-condition prune
+metafield_call_chain_via_alias	1	crash	the __call chain through an alias of the instance still dispatches
+metafield_carrier_alias_at_construction	0	crash	FN: the metatable argument is an alias; the class is looked up on the binding
+metafield_carrier_alias_at_construction_uninvoked	0	ok	the twin -- same silence, here it is right

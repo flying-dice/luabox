@@ -50,7 +50,7 @@ use lsp_types::request::{
     FoldingRangeRequest, Formatting, GotoDefinition, GotoImplementation, GotoTypeDefinition,
     HoverRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting, References,
     RegisterCapability, Rename, Request as _, SelectionRangeRequest, SemanticTokensFullRequest,
-    SignatureHelpRequest, WorkDoneProgressCreate, WorkspaceSymbolRequest,
+    Shutdown, SignatureHelpRequest, WorkDoneProgressCreate, WorkspaceSymbolRequest,
 };
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyItem, CallHierarchyOutgoingCall,
@@ -592,6 +592,42 @@ struct Server {
     /// A `RefCell` for the same reason [`Self::progress_seq`] is a `Cell`:
     /// the progress helpers run behind `&self`.
     pending: RefCell<VecDeque<Message>>,
+    /// Whether a `window/workDoneProgress/create` has already gone
+    /// unanswered. A client that ignores one ignores them all, and the wait
+    /// costs [`PROGRESS_CREATE_TIMEOUT`] every time it is paid: two startup
+    /// tokens plus one per config reload. Remembering the first timeout turns
+    /// a silent client's 2 × 250 ms startup penalty into 250 ms and makes
+    /// every later reload free.
+    ///
+    /// Only a *timeout* sets this. A client that answers — with a result or
+    /// with an error — has told the server something, and the next create is
+    /// waited for normally.
+    create_unanswered: Cell<bool>,
+}
+
+/// What a `window/workDoneProgress/create` came back as.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CreateOutcome {
+    /// The client answered with a result: the token is live.
+    Accepted,
+    /// The client answered with an error: the token is refused and nothing
+    /// may be reported under it.
+    Refused,
+    /// No answer arrived — the wait timed out, the transport died, or the
+    /// session is ending. The caller reports under the token regardless,
+    /// which is the behaviour this whole mechanism replaced and so is no
+    /// worse than it.
+    Unanswered,
+}
+
+/// Whether a message is one of the two that end the session, and so must
+/// reach [`Server::main_loop`] rather than wait behind a progress token.
+fn ends_the_session(message: &Message) -> bool {
+    match message {
+        Message::Request(request) => request.method == Shutdown::METHOD,
+        Message::Notification(notification) => notification.method == Exit::METHOD,
+        Message::Response(_) => false,
+    }
 }
 
 /// How long the server waits for the client to answer
@@ -638,6 +674,7 @@ impl Server {
             progress,
             progress_seq: Cell::new(0),
             pending: RefCell::new(VecDeque::new()),
+            create_unanswered: Cell::new(false),
         };
         // Safe to send: `run` only builds the server after `initialize_finish`.
         server.log_lint_config_problems(&config.unknown_lint_rules);
@@ -863,19 +900,20 @@ impl Server {
     /// path is what a second call site forgetting it looks like (Shockwave
     /// round 5); this is the structural version of that fix.
     fn begin_progress(&self, total: usize) -> Option<ProgressToken> {
-        self.progress.then(|| {
-            let token = self.create_progress_token("luabox/bootstrap");
-            self.send_progress(
-                &token,
-                WorkDoneProgress::Begin(WorkDoneProgressBegin {
-                    title: "Indexing workspace".to_string(),
-                    message: Some(format!("0/{total} files")),
-                    percentage: Some(0),
-                    ..WorkDoneProgressBegin::default()
-                }),
-            );
-            token
-        })
+        if !self.progress {
+            return None;
+        }
+        let token = self.create_progress_token("luabox/bootstrap")?;
+        self.send_progress(
+            &token,
+            WorkDoneProgress::Begin(WorkDoneProgressBegin {
+                title: "Indexing workspace".to_string(),
+                message: Some(format!("0/{total} files")),
+                percentage: Some(0),
+                ..WorkDoneProgressBegin::default()
+            }),
+        );
+        Some(token)
     }
 
     /// An untotalled work-done token for a single indivisible step — a rock
@@ -886,18 +924,24 @@ impl Server {
     /// the caller sends nothing at all. This gate used to live only at
     /// `bootstrap`'s call site, which left the reload path announcing itself
     /// to clients that never asked (Shockwave round 5).
+    ///
+    /// Also `None` when the client **refused** the token — see
+    /// [`Self::create_progress_token`]. Both are the same fact from the
+    /// caller's side ("there is no token to report under"), so both take the
+    /// same silent path and no `begin`/`report`/`end` goes out.
     fn begin_progress_titled(&self, token_name: &str, title: &str) -> Option<ProgressToken> {
-        self.progress.then(|| {
-            let token = self.create_progress_token(token_name);
-            self.send_progress(
-                &token,
-                WorkDoneProgress::Begin(WorkDoneProgressBegin {
-                    title: title.to_string(),
-                    ..WorkDoneProgressBegin::default()
-                }),
-            );
-            token
-        })
+        if !self.progress {
+            return None;
+        }
+        let token = self.create_progress_token(token_name)?;
+        self.send_progress(
+            &token,
+            WorkDoneProgress::Begin(WorkDoneProgressBegin {
+                title: title.to_string(),
+                ..WorkDoneProgressBegin::default()
+            }),
+        );
+        Some(token)
     }
 
     fn end_progress(&self, token: &ProgressToken) {
@@ -924,7 +968,18 @@ impl Server {
     /// itself as `luabox/reload-2` and its `create` request carries the
     /// matching id. Both must be unique — see [`Self::progress_seq`] — and
     /// deriving them from one counter is what keeps them in step.
-    fn create_progress_token(&self, name: &str) -> ProgressToken {
+    /// `None` when there is no usable token: the request could not be sent, or
+    /// the client answered it with an **error**. A `$/progress` under a token
+    /// the client refused is exactly the traffic this mechanism exists to
+    /// stop, and the refusal used to be invisible — `await_progress_create`
+    /// matched on the response id and never looked at `response.error`, so a
+    /// client replying `-32601` still received a `begin`, five `report`s and
+    /// an `end` under a token it had just declined (Shockwave round 8).
+    /// Refusal is now the `progress: false` path exactly: nothing goes out.
+    ///
+    /// A client that answers *nothing* is a different case and keeps the old
+    /// behaviour — see [`Self::await_progress_create`].
+    fn create_progress_token(&self, name: &str) -> Option<ProgressToken> {
         let seq = self.progress_seq.get();
         self.progress_seq.set(seq.wrapping_add(1));
         let unique = format!("{name}-{seq}");
@@ -933,20 +988,19 @@ impl Server {
         let create = WorkDoneProgressCreateParams {
             token: token.clone(),
         };
-        if let Ok(value) = serde_json::to_value(create)
-            && self
-                .connection
-                .sender
-                .send(Message::Request(Request::new(
-                    id.clone(),
-                    WorkDoneProgressCreate::METHOD.to_string(),
-                    value,
-                )))
-                .is_ok()
-        {
-            self.await_progress_create(&id);
+        let value = serde_json::to_value(create).ok()?;
+        self.connection
+            .sender
+            .send(Message::Request(Request::new(
+                id.clone(),
+                WorkDoneProgressCreate::METHOD.to_string(),
+                value,
+            )))
+            .ok()?;
+        match self.await_progress_create(&id) {
+            CreateOutcome::Accepted | CreateOutcome::Unanswered => Some(token),
+            CreateOutcome::Refused => None,
         }
-        token
     }
 
     /// Read from the connection until the client answers `id`, buffering
@@ -963,19 +1017,60 @@ impl Server {
     ///
     /// The wait is bounded by [`PROGRESS_CREATE_TIMEOUT`]. A client that never
     /// answers gets the old behaviour — the `begin` goes out unacknowledged —
-    /// rather than a server that stops serving it.
-    fn await_progress_create(&self, id: &RequestId) {
+    /// rather than a server that stops serving it, and after the first such
+    /// timeout it is not waited for again ([`Self::create_unanswered`]).
+    ///
+    /// # Shutdown ends the wait immediately
+    ///
+    /// `shutdown` and `exit` are the two messages that must not sit on the
+    /// queue. [`Connection::handle_shutdown`] answers the request and then
+    /// reads the *channel* for the `exit` that follows, and it cannot see
+    /// [`Self::pending`] — so an `exit` drained in here was invisible to it:
+    /// the server answered the shutdown, waited 30 s for a notification it was
+    /// already holding, and exited 1. A control session without the progress
+    /// capability exited 0, which is what makes it a regression; VS Code and
+    /// Neovim surface it as abnormal termination. It reproduced on the reload
+    /// path as well as at startup.
+    ///
+    /// Aborting the wait on either message fixes it without touching
+    /// `Connection`'s contract: the message goes on the queue in arrival
+    /// order, this returns, and [`Self::main_loop`] drains it into the
+    /// ordinary handshake — which then finds the `exit` where it expects it,
+    /// on the channel. Waiting out the remaining 250 ms for a token nobody
+    /// will use is pointless anyway.
+    fn await_progress_create(&self, id: &RequestId) -> CreateOutcome {
+        if self.create_unanswered.get() {
+            return CreateOutcome::Unanswered;
+        }
         let deadline = Instant::now() + PROGRESS_CREATE_TIMEOUT;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.connection.receiver.recv_timeout(left) {
-                Ok(Message::Response(response)) if response.id == *id => return,
+                Ok(Message::Response(response)) if response.id == *id => {
+                    // A response is not an acceptance. An error answer means
+                    // the client declined the token, and reporting under it
+                    // anyway is the traffic this wait exists to prevent.
+                    return if response.error.is_some() {
+                        CreateOutcome::Refused
+                    } else {
+                        CreateOutcome::Accepted
+                    };
+                }
                 Ok(Message::Response(_)) => {}
-                Ok(other) => self.pending.borrow_mut().push_back(other),
+                Ok(other) => {
+                    let ends_the_session = ends_the_session(&other);
+                    self.pending.borrow_mut().push_back(other);
+                    if ends_the_session {
+                        return CreateOutcome::Unanswered;
+                    }
+                }
                 // Timed out, or the client hung up. Either way there is
                 // nothing left to wait for; the caller reports regardless and
                 // the loop notices the disconnect on its next read.
-                Err(_) => return,
+                Err(_) => {
+                    self.create_unanswered.set(true);
+                    return CreateOutcome::Unanswered;
+                }
             }
         }
     }
@@ -1029,10 +1124,23 @@ impl Server {
                     self.handle_request(req)?;
                 }
                 Message::Notification(not) => self.handle_notification(not)?,
-                // The server tracks no outstanding requests of its own: the
-                // only one it sends is `window/workDoneProgress/create`, and
-                // `await_progress_create` reads that response where it is
-                // needed. Anything reaching here is unsolicited.
+                // The server sends two kinds of request, and reads the
+                // response to one of them. `window/workDoneProgress/create`
+                // is read by `await_progress_create`, where the answer
+                // decides whether the token may be used. `client/registerCapability`
+                // — the file-watcher registration in `register_file_watchers`
+                // — is fire-and-forget, and its response lands here and is
+                // dropped.
+                //
+                // That is a real gap, stated rather than papered over: a
+                // client that *rejects* the watcher registration leaves this
+                // server believing file watching is live, so external edits
+                // go unnoticed until the buffer is touched. Nothing currently
+                // detects it. Closing it means tracking the id and degrading
+                // on an error answer (polling, or a log message telling the
+                // user why the editor is stale), which is a change of
+                // behaviour rather than a comment fix and is not in this
+                // round.
                 Message::Response(_) => {}
             }
         }
@@ -2831,14 +2939,16 @@ mod tests {
             "a token was reported under before it was created: {before:?}"
         );
 
-        // Nothing may arrive while the create is outstanding. Well inside
-        // `PROGRESS_CREATE_TIMEOUT`, so a server that waits is still waiting
-        // and a server that does not has already sent its `begin`.
+        // Nothing may arrive while the create is outstanding. The window is
+        // *derived* from the bound rather than written out: a literal 60 ms
+        // silently stops proving anything the moment
+        // `PROGRESS_CREATE_TIMEOUT` is lowered to 50 ms — the wait would
+        // already have expired and the `begin` already have been sent, and
+        // this would still pass. A quarter of the bound is comfortably inside
+        // it however the constant moves.
+        let inside_the_wait = super::PROGRESS_CREATE_TIMEOUT / 4;
         assert!(
-            client
-                .receiver
-                .recv_timeout(std::time::Duration::from_millis(60))
-                .is_err(),
+            client.receiver.recv_timeout(inside_the_wait).is_err(),
             "the server reported under the token before the client created it"
         );
 
@@ -2873,17 +2983,27 @@ mod tests {
     }
 
     /// A client that speaks while a `window/workDoneProgress/create` is
-    /// outstanding must not lose what it said. `await_progress_create` takes
-    /// those messages off the wire to find the response, and `main_loop`
-    /// drains them before reading anything new — this asserts the queue, by
-    /// sending a `didOpen` *before* answering the create and then checking the
-    /// server published diagnostics for it.
+    /// outstanding must not lose what it said, **and must not have it
+    /// reordered**. `await_progress_create` takes those messages off the wire
+    /// to find the response, and `main_loop` drains the queue before reading
+    /// anything new.
+    ///
+    /// Two `didOpen`s, not one. With a single message the test could not tell
+    /// a queue from a one-slot buffer, and the commit that introduced it
+    /// claimed arrival order — which is a property of a `VecDeque` drained
+    /// from the front and would survive a change to `pop_back` or to a `Vec`
+    /// used as a stack completely unremarked. The assertion is that the
+    /// server publishes for `a.lua` before `b.lua`, in the order they were
+    /// sent.
     #[test]
-    fn a_notification_sent_during_the_create_wait_is_still_handled() {
+    fn notifications_sent_during_the_create_wait_are_handled_in_arrival_order() {
         let dir = TempDir::new().expect("tempdir");
-        let path = dir.path().join("src").join("main.lua");
-        fs::create_dir_all(path.parent().expect("src")).expect("mkdir");
-        fs::write(&path, "local x = 1\n").expect("write");
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).expect("mkdir");
+        let first = src.join("a.lua");
+        let second = src.join("b.lua");
+        fs::write(&first, "local a = 1\n").expect("write");
+        fs::write(&second, "local b = 2\n").expect("write");
         let root = dir.path().to_path_buf();
         let (server_end, client) = Connection::memory();
 
@@ -2903,22 +3023,29 @@ mod tests {
                 break request.clone();
             }
         };
-        // Spoken into the window where the server is *not* in `main_loop`.
-        let uri = crate::uri::path_to_uri(&path);
-        client
-            .sender
-            .send(Message::Notification(Notification {
-                method: DidOpenTextDocument::METHOD.to_string(),
-                params: json!({
-                    "textDocument": {
-                        "uri": uri.as_str(),
-                        "languageId": "lua",
-                        "version": 1,
-                        "text": "local x = 1\n",
-                    }
-                }),
-            }))
-            .expect("the server is still reading");
+        // Both spoken into the window where the server is *not* in
+        // `main_loop`, so both go on the queue.
+        let first_uri = crate::uri::path_to_uri(&first);
+        let second_uri = crate::uri::path_to_uri(&second);
+        for (uri, text) in [
+            (&first_uri, "local a = 1\n"),
+            (&second_uri, "local b = 2\n"),
+        ] {
+            client
+                .sender
+                .send(Message::Notification(Notification {
+                    method: DidOpenTextDocument::METHOD.to_string(),
+                    params: json!({
+                        "textDocument": {
+                            "uri": uri.as_str(),
+                            "languageId": "lua",
+                            "version": 1,
+                            "text": text,
+                        }
+                    }),
+                }))
+                .expect("the server is still reading");
+        }
         client
             .sender
             .send(Message::Response(lsp_server::Response::new_ok(
@@ -2927,39 +3054,249 @@ mod tests {
             )))
             .expect("the server is still reading");
 
-        let published = loop {
+        let mut published = Vec::new();
+        while published.len() < 2 {
             let msg = client
                 .receiver
                 .recv_timeout(std::time::Duration::from_secs(10))
-                .expect("the buffered didOpen is handled once the loop starts");
+                .expect("both buffered didOpens are handled once the loop starts");
             if let Message::Notification(not) = &msg
                 && not.method == PublishDiagnostics::METHOD
             {
-                break not.clone();
+                published.push(not.params["uri"].clone());
             }
-        };
-        assert_eq!(published.params["uri"], uri.as_str());
-        // A clean shutdown so the thread joins rather than being torn down.
-        let shutdown = Request {
-            id: RequestId::from(99),
-            method: "shutdown".to_string(),
-            params: Value::Null,
-        };
-        client
-            .sender
-            .send(Message::Request(shutdown))
-            .expect("the server is still reading");
-        client
-            .sender
-            .send(Message::Notification(Notification {
-                method: "exit".to_string(),
-                params: Value::Null,
-            }))
-            .expect("the server is still reading");
+        }
+        assert_eq!(
+            published,
+            vec![
+                Value::from(first_uri.as_str()),
+                Value::from(second_uri.as_str())
+            ],
+            "the queue must drain in arrival order"
+        );
+        shut_down(&client, 99);
         server
             .join()
             .expect("the server thread does not panic")
             .expect("a clean shutdown");
+    }
+
+    /// Send the ordered `shutdown` → `exit` pair a clean session ends with.
+    fn shut_down(client: &Connection, id: i32) {
+        client
+            .sender
+            .send(Message::Request(Request {
+                id: RequestId::from(id),
+                method: super::Shutdown::METHOD.to_string(),
+                params: Value::Null,
+            }))
+            .expect("the server is still reading");
+        client
+            .sender
+            .send(Message::Notification(Notification {
+                method: super::Exit::METHOD.to_string(),
+                params: Value::Null,
+            }))
+            .expect("the server is still reading");
+    }
+
+    /// Wait for a server thread to finish, failing rather than hanging.
+    ///
+    /// The bound matters: the bug these tests cover made
+    /// `Connection::handle_shutdown` wait 30 s for an `exit` it was already
+    /// holding, and over a memory transport — where `exit` does not close the
+    /// channel the way a closed stdin does — that is a 30 s block rather than
+    /// a fast failure. A `join()` would sit through it and then pass or fail
+    /// on the exit code alone; this fails on the *hang*.
+    fn join_within(
+        handle: std::thread::JoinHandle<anyhow::Result<()>>,
+        done: &std::sync::mpsc::Receiver<()>,
+    ) -> anyhow::Result<()> {
+        done.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the server ends the session promptly rather than waiting out a timeout");
+        handle.join().expect("the server thread does not panic")
+    }
+
+    /// A `shutdown`/`exit` pair sent while a `window/workDoneProgress/create`
+    /// is outstanding must still end the session cleanly.
+    ///
+    /// This is the round-8 regression. `await_progress_create` drained both
+    /// messages onto [`Server::pending`], and `Connection::handle_shutdown`
+    /// reads the *channel* for the `exit` that follows the request it answers
+    /// — it cannot see the queue. So the server answered the shutdown, waited
+    /// out `handle_shutdown`'s own 30 s bound for a notification it was
+    /// already holding, and exited 1. A session without the progress
+    /// capability exited 0, which is what made it a regression rather than a
+    /// standing wart.
+    ///
+    /// Both windows are covered, because both call the same helper: the
+    /// startup harvest (before `main_loop` is entered at all) and the config
+    /// reload (from inside it).
+    #[test]
+    fn a_shutdown_during_the_startup_create_wait_exits_cleanly() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let (server_end, client) = Connection::memory();
+        let (done, finished) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn(move || {
+            let mut server = Server::new(server_end, root, true);
+            let outcome = server.main_loop();
+            let _ = done.send(());
+            outcome
+        });
+
+        await_create(&client);
+        // Answered with a shutdown instead of a response — the sequence an
+        // editor sends when the user closes the window during the harvest.
+        shut_down(&client, 1);
+
+        join_within(server, &finished).expect("a clean shutdown, not exit 1");
+        assert!(
+            drain(&client).iter().any(|message| {
+                matches!(message, Message::Response(response) if response.id == RequestId::from(1))
+            }),
+            "the shutdown request must still be answered"
+        );
+    }
+
+    /// The same, on the reload path — the window Shockwave reproduced it in.
+    /// Here the server is inside `main_loop` when the create goes out.
+    #[test]
+    fn a_shutdown_during_the_reload_create_wait_exits_cleanly() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let (server_end, client) = Connection::memory();
+        let (done, finished) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn(move || {
+            let mut server = Server::new(server_end, root, true);
+            let outcome = server.main_loop();
+            let _ = done.send(());
+            outcome
+        });
+
+        // Get past the startup token first, so the create being waited for
+        // below is the reload's.
+        let startup = await_create(&client);
+        client
+            .sender
+            .send(Message::Response(lsp_server::Response::new_ok(
+                startup.id,
+                Value::Null,
+            )))
+            .expect("the server is still reading");
+        client
+            .sender
+            .send(Message::Notification(Notification {
+                method: super::DidChangeConfiguration::METHOD.to_string(),
+                params: json!({ "settings": {} }),
+            }))
+            .expect("the server is still reading");
+
+        await_create(&client);
+        shut_down(&client, 2);
+
+        join_within(server, &finished).expect("a clean shutdown, not exit 1");
+        assert!(
+            drain(&client).iter().any(|message| {
+                matches!(message, Message::Response(response) if response.id == RequestId::from(2))
+            }),
+            "the shutdown request must still be answered"
+        );
+    }
+
+    /// Read up to and including the next `window/workDoneProgress/create`.
+    fn await_create(client: &Connection) -> lsp_server::Request {
+        loop {
+            let msg = client
+                .receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("a pause announces itself");
+            if let Message::Request(request) = &msg
+                && request.method == super::WorkDoneProgressCreate::METHOD
+            {
+                return request.clone();
+            }
+        }
+    }
+
+    /// A client that answers the create with an **error** has refused the
+    /// token, and nothing may be reported under it.
+    ///
+    /// `await_progress_create` matched on the response id and never looked at
+    /// `response.error`, so a client replying `-32601` still received the
+    /// `begin`, the per-file `report`s and the `end` — the exact traffic the
+    /// wait was added to prevent, under a token the client had just declined.
+    /// Refusal now takes the `progress: false` path.
+    #[test]
+    fn a_refused_progress_token_is_never_reported_under() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let (server_end, client) = Connection::memory();
+        // Files for the bootstrap index to report on, so a server that
+        // ignored the refusal would have something to say.
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).expect("mkdir");
+        for i in 0..5 {
+            fs::write(src.join(format!("f{i}.lua")), "local x = 1\n").expect("write");
+        }
+
+        let refuser = std::thread::spawn(move || {
+            // Refuse every create this session sends.
+            while let Ok(message) = client.receiver.recv() {
+                if let Message::Request(request) = &message
+                    && request.method == super::WorkDoneProgressCreate::METHOD
+                {
+                    let refusal = lsp_server::Response::new_err(
+                        request.id.clone(),
+                        ErrorCode::MethodNotFound as i32,
+                        "no work-done progress here".to_string(),
+                    );
+                    if client.sender.send(Message::Response(refusal)).is_err() {
+                        break;
+                    }
+                }
+                if is_progress(&message) {
+                    return true;
+                }
+            }
+            false
+        });
+
+        let mut server = Server::new(server_end, root, true);
+        server.bootstrap();
+        drop(server);
+        assert!(
+            !refuser.join().expect("the client thread does not panic"),
+            "a refused token was reported under"
+        );
+    }
+
+    /// A client that answers *nothing* is not a client that refuses: it gets
+    /// the degraded path (the token is used regardless), and it is asked only
+    /// once. Every wait costs `PROGRESS_CREATE_TIMEOUT`, and a silent client
+    /// pays it on both startup tokens plus every config reload.
+    #[test]
+    fn a_silent_client_is_waited_for_once_and_then_reported_to_anyway() {
+        let (_dir, mut server, client) = test_server();
+        // `Server::new`'s startup harvest has already paid the one wait.
+        assert!(server.create_unanswered.get(), "the first wait timed out");
+        assert!(
+            !progress_notifications(&client).is_empty(),
+            "the degraded path still reports"
+        );
+
+        let before = std::time::Instant::now();
+        server.bootstrap();
+        assert!(
+            before.elapsed() < super::PROGRESS_CREATE_TIMEOUT,
+            "a second create was waited out after the first went unanswered"
+        );
+        assert!(
+            !progress_notifications(&client).is_empty(),
+            "…and still reports"
+        );
     }
 
     /// …and with the capability, all three paths do speak.

@@ -191,8 +191,8 @@ tutorial class (a dot constructor, `:length()`, `__tostring` and `__add`) is
 exactly that shape, and `v:length()` does crash. If nothing reaches a method,
 the carrier reads as a deliberate operator metatable and stays silent.
 
-*Reaching* is the operative word, and it means a call site, not a line of
-source. Two things are not uses:
+*Reaching* is the operative word, and it means a call site the file can
+actually get to, not a line of source. Three things are not uses:
 
 - a **declaration**. `Cache.__mode = "k"` beside a `function Cache:reset()`
   that nothing ever invokes is a weak-keyed table with a helper on it, and the
@@ -205,11 +205,30 @@ source. Two things are not uses:
   measured the rule firing on it. The body of an unreached function does not
   execute, so a `self:m()` written in it is not a lookup; what would make it
   one is `c:reset()` on a derived value, which the derivations below see
-  directly.
+  directly;
+- a **call the file never performs**, which is the general form of the one
+  above and is what round 8 measured. `local c = setmetatable({}, Cache)`
+  beside `local function boom() return c:reset() end` and `print(type(boom))`
+  is a colon call on a derived value that no execution reaches, and so is
+  `if false then c:reset() end`.
+
+That last one is answered by two mechanisms, both deliberately shallow:
+
+- **reached bodies.** The rule starts at the chunk and follows the in-file
+  call graph to a fixpoint — a plain call of a named function or of a field of
+  a named table (local *or* global), a function expression the call site
+  writes out, the `__call` dispatch on a derived value, and the colon method a
+  receiver's own table or its carrier declares. Uses are counted only in
+  bodies that set contains;
+- **literal-condition pruning.** `if false then`, `if nil then` and
+  `while false do` never enter their blocks, so statements inside them are not
+  collected. Only literals are decided — `repeat` is never pruned (it tests
+  after its body) and the `else` of a literal-false `if` is the branch that
+  runs.
 
 So an instance-side use is a **call**, on a value the pass can *derive* from
 `setmetatable(_, C)` — derivation is what keeps one class's calls from
-settling another's. Two call shapes count:
+settling another's. Three call shapes count:
 
 - a **colon call on a derived value**: `c:m()`. This is the lookup a missing
   `__index` breaks, seen at the site that performs it;
@@ -218,25 +237,45 @@ settling another's. Two call shapes count:
   call. That is the chain `c()` → `C.__call(self)` → `self:m()`, and it
   crashes. Only the `__call` body is asked, not every function attached to the
   carrier: a `__call` that reaches no method, beside a `C:reset()` nothing
-  invokes, is a program that runs fine.
+  invokes, is a program that runs fine;
+- **dot dispatch with an explicit self**: `c.m(c)`, when `m` names a function
+  attached to the carrier. With no `__index`, `c.m` is `nil`, so this fails
+  with `attempt to call a nil value (field 'm')` where the colon form says
+  `method 'm'` — one defect, two spellings. It is the **call** that counts:
+  `local r = c.reset` and `print(type(c.reset))` perform the lookup, get
+  `nil`, and run fine.
 
 And a value is derived from `C` when it comes from one of these:
 
 - the construction itself, called on the spot: `setmetatable({}, C):m()`;
-- a name bound to it — `local c = setmetatable({}, C)`, and equally
+- **the construction's first argument**. `setmetatable` mutates the table it
+  is handed and returns it, so `local t = {}; setmetatable(t, C)` makes `t` an
+  instance exactly as binding the result does. This is the idiomatic
+  constructor spelling and was missed until round 8;
+- a name bound to either — `local c = setmetatable({}, C)`, and equally
   `c = setmetatable({}, C)` on a name declared earlier or on a global — plus
-  any `local d = c` alias. `a or b` and `a and b` are followed into the
-  operand the expression evaluates to;
+  any `local d = c` alias. `and` and `or` are followed into the operand the
+  expression **definitively evaluates to**. A construction is a table and so
+  always truthy, which decides all four shapes: `ctor or x` *is* the
+  construction (`x` never evaluates) and is followed; `x and ctor` is followed
+  too, because when `x` is truthy the result is the construction and when it
+  is falsy the same colon call fails just as hard; `x or ctor` is followed
+  only as far as `x`, since whether the construction is reached depends on a
+  truthiness this pass cannot decide; and `ctor and x` evaluates to `x`, so
+  the construction is discarded;
 - the constructor pattern: a function whose body returns a construction
   (directly, or via a name it bound to one) is a factory for that carrier,
-  so `local c = Counter.new(); c:value()` is a use. Return **slots** are
-  tracked, so `return 1, setmetatable({}, C)` seeds the second name of
-  `local n, c = make()` and not the first. Constructor depth is one — a
-  factory returning another factory's result is not chased.
+  so `local c = Counter.new(); c:value()` is a use, and so is the module-table
+  spelling `local c = M.new()` whether `M` is a local or a global. Return
+  **slots** are tracked, so `return 1, setmetatable({}, C)` seeds the second
+  name of `local n, c = make()` and not the first. Constructor depth is one —
+  a factory returning another factory's result is not chased.
 
 **What that leaves out, precisely.** Each of these is silent on a program that
-crashes, and each has a committed matrix fixture (with its uninvoked twin) so
-that closing one is a deliberate act rather than a surprise:
+crashes. Ten of the eleven have a committed matrix fixture with its uninvoked
+twin, so that closing one is a deliberate act rather than a surprise; the
+`require` bound is the exception and structurally cannot have one, because the
+matrix runs one file at a time and that bound is cross-file by nature.
 
 - an instance held in a **table field** (`local box = { c = setmetatable({}, C) }`,
   then `box.c:m()`) — this pass tracks names, not table contents;
@@ -245,26 +284,40 @@ that closing one is a deliberate act rather than a surprise:
 - an instance taken from a **generic-`for` variable** — the value comes from an
   iterator this pass does not evaluate;
 - an instance from a **method-call factory** (`local c = factory:make()`) —
-  only a plain call of a named function or a carrier field resolves to a body;
+  only a plain call of a named function or a table field resolves to a body;
 - an instance in a **`...` slot** — the name is paired with the right slot of
   the right expression, but nothing is known about what a vararg holds;
 - a **depth-two constructor** — see above;
 - a `__call` that reaches the method through a **nested closure** or a helper
   it calls, rather than in its own body;
+- a use inside a **closure that escapes** — passed as an argument, stored
+  under a computed key, or returned to whoever required the chunk. No call
+  site in this file names that body, so the reached set does not contain it,
+  and a `c:m()` written in it is not counted. This is the FN-biased edge of
+  the reachability work, and it is what keeps `print(type(boom))` quiet;
+- an instance bound by **`x or setmetatable(_, C)`** — the construction is
+  reached only when `x` is falsy, and following it regardless warned on a
+  program that runs (round 8). Following `x` alone costs this miss;
+- a construction whose **metatable argument is an alias** of the carrier
+  (`local mt = C; setmetatable({}, mt)`). The `---@class` annotation is looked
+  up on the binding the argument names, and `mt` carries none, so the rule
+  never reaches its gates. Rooting that lookup through the alias map would
+  also root a *reassigned* alias (`mt = {}`), which is a false positive, so
+  this stays a miss;
 - a carrier reached through **`require`** — the in-file bound, above.
 
 Those misses are false-negative-shaped, which is the direction this arm has to
 err in: the carrier declared a metafield, so silence is the plausible reading.
 
-**One approximation remains, and it is false-positive-shaped.** A `self:m()`
-that sits inside `if false then … end` within the `__call` body still counts as
-reaching a method, because this pass has no reachability analysis *inside* a
-body — the same bound the `__index`-write side has carried since the rule
-shipped ("an `__index` write inside a branch that never runs", above). The
-shape needed to trip it is a carrier with a `__call`, no `__index`, a
-dead-branch `self:m()` inside that `__call`, and a plain call on one of its
-instances; it has no measured instance, where the over-approximation it
-replaced had eight.
+**One approximation remains, and it is false-positive-shaped.** The branch
+prune reads *literals* only, so a guard that is a name is not decided:
+`local on = false; if on then c:reset() end` still counts as reaching a
+method. That is the same bound the `__index`-write side has carried since the
+rule shipped ("an `__index` write inside a branch that never runs", above),
+and deciding it needs constant propagation rather than a look at the token.
+The round-7 approximation recorded here — a `self:m()` inside `if false then
+… end` within the `__call` body — is **closed**: the prune applies wherever
+statements are collected, that body included.
 
 **The behavioural gate applies to the metafield arm only.** A carrier with no
 metafield at all is judged structurally — the construction alone is enough,

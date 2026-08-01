@@ -10,6 +10,74 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ### Fixed
 
+- **`LB0510` counts uses where the file can *reach* them.** The previous round
+  closed the reported instances and left the mechanism, so the same defect
+  came back in new shapes. `observed()` iterated receivers across every body
+  in the file with no reachability test at all: a `local function boom()
+  return c:reset() end` that nothing invokes, beside `print(type(boom))`,
+  warned about a lookup no execution performs — and so did
+  `if false then c:reset() end`.
+
+  Uses are now counted only in bodies this file **enters** — the chunk, plus
+  a fixpoint over the in-file call graph across the edges the pass already
+  tracked (a named function, a field of a named table, a function expression
+  the call site writes out, the `__call` dispatch on a derived value, and the
+  colon method an instance call reaches) — and only in statements no
+  **literal** condition prunes. A closure that escapes is not reached, and a
+  guard that is a name is not decided; both are false-negative-shaped and both
+  are disclosed with fixtures. Round 7's last disclosed approximation, a
+  dead-branch `self:m()` inside a `__call`, closes as a side effect.
+
+  Three more shapes in the same neighbourhood, each measured against
+  `lua5.4` before being written down:
+
+  - **the statement-form constructor.** `setmetatable` mutates its first
+    argument and returns it; only the result was tracked, so the idiomatic
+    `local t = {}; setmetatable(t, Cache); t:reset()` was silent on a crash.
+    The argument is now linked too, alias-rooted, which also makes the same
+    shape inside `Cache.new()` flow into factory detection.
+  - **`and`/`or` follow the operand actually evaluated**, which is what the
+    doc claimed and the code did not: `Or` seeded both operands. A
+    construction is a table and always truthy, so `ctor or x` *is* the
+    construction and `x or ctor` is undecidable; `x and ctor` is followed
+    because a falsy `x` fails the same call just as hard, and `ctor and x`
+    evaluates to `x`.
+  - **module factories and dot dispatch.** Functions attached to a table were
+    keyed by binding, so a *global* module table (`M = {}; function M.new()`)
+    resolved to no body at all. And `c.reset(c)` is the same lookup as
+    `c:reset()` with the same failure, so it now counts — while a bare field
+    read, a metafield read, and a key naming nothing on the carrier do not.
+
+  The shape matrix grew from 48 programs to 94, and the disclosed-miss list
+  in [LIMITATIONS](docs/03-reference/02-limitations.md) from eight entries to
+  eleven. Its preface no longer claims a committed fixture for all of them:
+  ten have one, and `require` structurally cannot, because that bound is
+  cross-file and the matrix runs one file at a time.
+
+- **A `shutdown` sent while a progress token is being created no longer exits
+  1.** `Connection::handle_shutdown` answers the request and then reads the
+  *channel* for the `exit` that follows; it cannot see the queue
+  `await_progress_create` drains into. So an `exit` that arrived during the
+  wait was invisible to it — the server answered the shutdown, waited out
+  `handle_shutdown`'s own 30 s bound for a notification it was already
+  holding, and exited 1. A session without the progress capability exited 0,
+  which is what makes it a regression; VS Code and Neovim surface it as
+  abnormal termination, and it reproduced on the config-reload path as well
+  as at startup.
+
+  The wait now **aborts** the moment it drains a `shutdown` request or an
+  `exit` notification: the message goes on the queue in arrival order, the
+  loop drains it into the ordinary handshake, and that handshake finds the
+  `exit` where it expects it. `Connection`'s contract is untouched. Waiting
+  out the remaining 250 ms for a token nobody will use was pointless anyway.
+
+- **An error answer to `window/workDoneProgress/create` is a refusal, not a
+  success.** The wait matched on the response id and never looked at
+  `response.error`, so a client replying `-32601` still received the `begin`,
+  the per-file `report`s and the `end` under a token it had just declined —
+  the exact traffic the wait was added to prevent. A refused token now takes
+  the `progress: false` path: no `begin`, no `report`, no `end`.
+
 - **`LB0510` counts calls the file *makes*, not colon calls it *contains*.**
   The reached-a-method gate had a syntactic hole: `self` inside any function
   attached to the carrier was treated as an instance, so a `self:m()` written
@@ -335,6 +403,17 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   are queued and drained by the loop before anything new, in arrival order.
   Bounded at 250 ms, so a client that answers nothing gets the previous
   behaviour rather than a server that stops serving it.
+
+  **It is not free, and "no worse than what it replaced" is true of the
+  protocol and false of the latency.** A client that never answers a create
+  pays the full bound on every token: two at startup, one per config reload.
+  Measured over the same workspace, startup-to-usable went from a 5842 ms
+  median to 6282 ms — 2 × 250 ms before the editor is usable, plus 250 ms on
+  each reload. A client that answers (every real editor does) pays a
+  sub-millisecond round trip and none of this. The silent case is now halved
+  — after one create goes unanswered the server stops waiting for the rest of
+  the session — but it is not zero, and a client that answers *slowly* still
+  costs whatever it costs.
 
 - **`diagnostics::convert` derives its `source` instead of taking one.** All
   three non-test call sites passed exactly `source_for(diag.code)` — an
