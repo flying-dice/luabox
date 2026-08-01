@@ -10,6 +10,24 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ### Fixed
 
+- **`--target` now reaches the control-flow legality pass, and `luabox build`
+  will not emit a tree the target cannot load.** `--target` means "would this
+  source be legal there?", but the `LB0020`-`LB0022` pass ran for the project
+  `edition` only. Duplicate-label scope is the one control-flow rule that
+  differs by edition — 5.4's `checkrepeated` searches every open block where
+  5.2/5.3/LuaJIT search only the current one — so `edition = "5.2"` with
+  `::a:: do ::a:: end` and `luabox check --target 5.4` reported **0 errors**
+  for a chunk `luac5.4 -p` refuses to load. It is now `LB0021`, exit 1, and
+  the finding is reported once when both the edition and the target flag the
+  same span, exactly as dialect legality already deduplicated.
+
+  `luabox build` keeps its edition-only check gate on purpose (lowering is
+  what handles constructs the target rejects), but nothing lowers a shadowed
+  label away — so the same program built with `--target 5.4` silently emitted
+  an unloadable file and exited 0. The residual validation of each lowered
+  file now judges control-flow legality under the target too, and refuses to
+  write anything when it fails. `luabox lint` and the language server have no
+  target flag and are unaffected.
 - **`goto`/label/`break` legality is diagnosed**
   ([#44](https://github.com/flying-dice/luabox/issues/44)) — three programs
   every reference Lua refuses to *load* used to pass `luabox check` and

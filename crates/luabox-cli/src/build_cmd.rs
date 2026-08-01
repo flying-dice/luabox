@@ -13,7 +13,10 @@
 //!    *edition* dialect legality + typecheck). Build refuses to emit while
 //!    check reports errors. Target-dialect legality is deliberately *not*
 //!    part of this gate: constructs illegal on the target are exactly what
-//!    lowering exists to handle.
+//!    lowering exists to handle. What lowering *cannot* handle is caught
+//!    downstream instead, by the residual validation of each lowered file
+//!    (`lower_one`) — parse, dialect legality, and control-flow legality of
+//!    the output under the target.
 //! 3. **Emit**, one of two shapes:
 //!    - **Tree mode** (`bundle = false`, `mode = plain`): every `.lua` file
 //!      is lowered `edition → target` and written under `out`, mirroring the
@@ -340,6 +343,31 @@ fn lower_one(
                          lowered output of `{rel}`",
                     target.manifest_id()
                 )));
+            }
+            // Control-flow legality of the *output* under the target (#44,
+            // Shockwave round 2). The check gate deliberately runs edition
+            // legality only — lowering is what handles constructs the target
+            // rejects — but nothing lowers a duplicate label away, and the
+            // duplicate-label scope tightened in 5.4
+            // (`luabox_hir::validate::repeated_label_scope`). Without this, a
+            // 5.2 project shipping `::a:: do ::a:: end` to 5.4 emitted a file
+            // `luac5.4 -p` refuses to load, and `build` exited 0.
+            //
+            // Spans are dropped for the same reason the residual findings
+            // above drop them: their ranges index the lowered text, and the
+            // renderer would resolve `rel` against the *source* on disk.
+            if parse.errors().is_empty() {
+                let lowered_hir = luabox_hir::lower(&parse);
+                for finding in luabox_hir::validate::control_flow(rel, &lowered_hir, target) {
+                    residual = true;
+                    diags.push(Diagnostic::error(finding.code, finding.message).with_note(
+                        format!(
+                            "the lowered output of `{rel}` cannot load on target {}; no lowering \
+                             rule rewrites this",
+                            target.manifest_id()
+                        ),
+                    ));
+                }
             }
             if residual {
                 (None, diags)
@@ -696,6 +724,44 @@ mod tests {
         run(tmp.path(), &opts()).expect("second build");
         // `dist/dist/...` would mean the walk re-consumed the output tree.
         assert!(!tmp.path().join("dist").join("dist").exists());
+    }
+
+    /// Shockwave round 2: the check gate is edition-only by design, and no
+    /// lowering rule renames a shadowed label — so a 5.2 project shipping to
+    /// 5.4 used to emit a file `luac5.4 -p` refuses to load, exit 0. The
+    /// residual validation of the lowered output is what catches it.
+    #[test]
+    fn tree_mode_refuses_to_emit_control_flow_the_target_cannot_load() {
+        let tmp = project("5.2", "\n[build]\ntarget = \"5.4\"\nout = \"dist\"\n");
+        write(tmp.path(), "src/main.lua", "::a:: do ::a:: end\nreturn 1\n");
+
+        let error = run(tmp.path(), &opts()).unwrap_err().to_string();
+        assert!(error.contains("build failed"), "{error}");
+        assert!(
+            !tmp.path()
+                .join("dist")
+                .join("src")
+                .join("main.lua")
+                .exists(),
+            "nothing may be written when the output cannot load"
+        );
+    }
+
+    /// The same program, shipped where its own edition already accepts it:
+    /// the residual pass must not invent a finding.
+    #[test]
+    fn tree_mode_still_emits_a_label_shadow_a_looser_target_accepts() {
+        let tmp = project("5.2", "\n[build]\ntarget = \"5.1\"\nout = \"dist\"\n");
+        write(tmp.path(), "src/main.lua", "do ::a:: end ::a::\nreturn 1\n");
+
+        run(tmp.path(), &opts()).expect("lowered away for 5.1, and legal there");
+        assert!(
+            tmp.path()
+                .join("dist")
+                .join("src")
+                .join("main.lua")
+                .exists()
+        );
     }
 
     #[test]

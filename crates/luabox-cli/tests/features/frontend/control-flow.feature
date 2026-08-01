@@ -85,6 +85,84 @@ Feature: Control-flow legality — goto / label / break (#44)
       | 5.1     | while true do do break end end                                |
       | 5.1     | for i=1,3 do break end                                        |
 
+  # `--target` asks "would this source be legal there?" (see `check`'s module
+  # doc), and the duplicate-label rule is the one control-flow rule that
+  # differs by edition — `checkrepeated` tightened in 5.4. So the legality
+  # pass has to run for the ship target too, not just the edition
+  # (Shockwave round 2). Verdicts below are `luac5.4 -p` / `luac5.2 -p`.
+  Scenario Outline: control-flow legality is judged for the --target too
+    Given a project with edition "<edition>"
+    And a Lua file containing '<source>'
+    When I run "luabox check --target <target>"
+    Then the command fails
+    And diagnostic <code> is reported
+
+    Examples: legal in the edition, unloadable on the ship target
+      | edition | target | source                     | code   |
+      | 5.2     | 5.4    | ::a:: do ::a:: end         | LB0021 |
+      | 5.3     | 5.4    | ::a:: do ::a:: end         | LB0021 |
+      | luajit  | 5.4    | ::a:: do ::a:: end         | LB0021 |
+      | 5.2     | 5.4    | ::a:: do do ::a:: end end  | LB0021 |
+
+  Scenario Outline: a target that accepts the source stays quiet
+    Given a project with edition "<edition>"
+    And a Lua file containing '<source>'
+    When I run "luabox check --target <target>"
+    Then the command succeeds
+    And no control-flow diagnostic is reported
+
+    Examples: legal under both the edition and the target
+      | edition | target | source             |
+      | 5.4     | 5.2    | do ::a:: end ::a:: |
+      | 5.2     | 5.4    | do ::a:: end ::a:: |
+      | 5.2     | 5.2    | ::a:: do ::a:: end |
+      | 5.4     | 5.4    | do ::a:: end ::a:: |
+
+  Scenario: the duplicate label is reported once, not once per legality pass
+    Given a project with edition "5.4"
+    And a Lua file containing '::a:: do ::a:: end'
+    When I run "luabox check --target 5.4"
+    Then the command fails
+    And diagnostic LB0021 is reported
+    And stdout contains exactly 1 occurrence of "error[LB0021]"
+
+  Scenario: `goto` on a 5.1 target stays the dialect finding, with no second complaint
+    Given a project with edition "5.4"
+    And a Lua file containing 'local i = 0 ::top:: i = i + 1 if i < 3 then goto top end'
+    When I run "luabox check --target 5.1"
+    Then the command fails
+    And diagnostic LB0010 is reported
+    And no control-flow diagnostic is reported
+
+  Scenario: `break` outside a loop is reported once whatever the target
+    Given a project with edition "5.1"
+    And a Lua file containing 'local x = 1 break'
+    When I run "luabox check --target 5.4"
+    Then the command fails
+    And diagnostic LB0022 is reported
+    And stdout contains exactly 1 occurrence of "error[LB0022]"
+
+  # `luabox build` runs its check gate on the *edition* only, by design:
+  # lowering exists to handle constructs the target rejects. Nothing lowers a
+  # duplicate label away, so the residual validation of the lowered output is
+  # what catches it — before anything is written.
+  Scenario: `luabox build` refuses to emit a tree the target cannot load
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      name = "shadow"
+      edition = "5.2"
+      """
+    And a file "src/main.lua" containing:
+      """
+      ::a:: do ::a:: end
+      return 1
+      """
+    When I run "luabox build --target 5.4"
+    Then the command fails
+    And stdout contains "LB0021"
+    And the file "dist/src/main.lua" does not exist
+
   Scenario: a near-miss label name gets a did-you-mean nudge
     Given a project with edition "5.4"
     And a Lua file containing 'for i=1,3 do goto continu ::continue:: end'

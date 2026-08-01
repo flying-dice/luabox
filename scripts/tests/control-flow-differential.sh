@@ -12,11 +12,27 @@
 # (the under-approximation LIMITATIONS records), never reject what luac
 # accepts.
 #
+# Two columns per version, because luabox has two ways to be asked about V:
+#
+#   edition=V   `luabox check`               — "is this source legal as written?"
+#   target=V    `luabox check --target V`    — "would this source be legal there?"
+#
+# The target column pins the manifest edition to the MOST PERMISSIVE edition
+# that parses every program in the matrix (5.2: it has goto/labels, and its
+# duplicate-label scope is the loose pre-5.4 one), so the only thing that can
+# move a verdict is the target. It exists because the target column was the
+# hole Shockwave round 2 found: the control-flow legality pass ran for the
+# edition only, so `edition = "5.2"` + `--target 5.4` accepted
+# split_label_shadow_nested.lua — which luac5.4 rejects.
+#
 # Versions without a luac on PATH SKIP loudly (this box may only carry
 # 5.1/5.4); CI's differential job installs 5.1-5.4 so every column runs
 # there. LuaJIT has no luac; its label semantics follow 5.2, which the 5.2
 # column covers.
 set -u
+
+# The edition the target column pins; see the header.
+TARGET_COLUMN_EDITION=5.2
 
 here="$(cd "$(dirname "$0")" && pwd)"
 matrix="$here/control-flow-matrix"
@@ -53,29 +69,47 @@ for ver in 5.1 5.2 5.3 5.4; do
 
     work="$(mktemp -d)"
     mkdir -p "$work/src"
-    printf '[package]\nname = "cfdiff"\nversion = "0.1.0"\nedition = "%s"\n' "$ver" > "$work/luabox.toml"
+    edition_toml="$work/edition.toml"
+    target_toml="$work/target.toml"
+    printf '[package]\nname = "cfdiff"\nversion = "0.1.0"\nedition = "%s"\n' "$ver" > "$edition_toml"
+    printf '[package]\nname = "cfdiff"\nversion = "0.1.0"\nedition = "%s"\n' \
+        "$TARGET_COLUMN_EDITION" > "$target_toml"
 
     for prog in "$matrix"/*.lua; do
         base="$(basename "$prog" .lua)"
-        cells=$((cells + 1))
 
         if "$luac" -p "$prog" >/dev/null 2>&1; then ref=accept; else ref=reject; fi
         cp "$prog" "$work/src/main.lua"
-        if (cd "$work" && "$luabox" check >/dev/null 2>&1); then lb=accept; else lb=reject; fi
 
-        if [ "$ref" = "$lb" ]; then
-            continue
-        fi
-        if reason="$(exception_for "$base" "$ver")"; then
-            # Direction check: the documented divergence is accept-where-luac-
-            # rejects ONLY. luabox rejecting what luac accepts is never OK.
-            if [ "$ref" = reject ] && [ "$lb" = accept ]; then
-                echo "EXCEPT  $base @ $ver: luac=$ref luabox=$lb ($reason)"
+        for column in edition target; do
+            cells=$((cells + 1))
+            if [ "$column" = edition ]; then
+                cp "$edition_toml" "$work/luabox.toml"
+                if (cd "$work" && "$luabox" check >/dev/null 2>&1); then lb=accept; else lb=reject; fi
+            else
+                cp "$target_toml" "$work/luabox.toml"
+                if (cd "$work" && "$luabox" check --target "$ver" >/dev/null 2>&1); then
+                    lb=accept
+                else
+                    lb=reject
+                fi
+            fi
+
+            if [ "$ref" = "$lb" ]; then
                 continue
             fi
-        fi
-        echo "FAIL  $base @ $ver: luac=$ref luabox=$lb"
-        fails=$((fails + 1))
+            if reason="$(exception_for "$base" "$ver")"; then
+                # Direction check: the documented divergence is accept-where-
+                # luac-rejects ONLY. luabox rejecting what luac accepts is
+                # never OK.
+                if [ "$ref" = reject ] && [ "$lb" = accept ]; then
+                    echo "EXCEPT  $base @ $ver ($column): luac=$ref luabox=$lb ($reason)"
+                    continue
+                fi
+            fi
+            echo "FAIL  $base @ $ver ($column): luac=$ref luabox=$lb"
+            fails=$((fails + 1))
+        done
     done
     rm -rf "$work"
 done
