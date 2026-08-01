@@ -27,6 +27,39 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ### Fixed
 
+- **Calls to `require`d functions are argument-checked.** A function reached
+  across a module boundary flowed its *type* into the consumer — a required
+  function's `---@return` typed the value you bound — but its `---@param`
+  annotations were enforced nowhere, so `local m = require("mod");
+  m.f("wrong")` reported nothing while the identical call written in the same
+  file reported `LB0300`. Every `require`d function in every project was
+  unchecked at its call sites, rocks included, which bounded what a vendored
+  tree's harvested types could actually catch. The checker resolved a callee's
+  signature only through registries keyed by *name* — a local binding, a
+  dotted name in the ambient map — and a required module's members appear in
+  neither; nothing in the consumer file declares them. It now falls back to
+  the callee's resolved *type*, which inference had already computed, and
+  hands it to the same argument-checking path a same-file call takes. So
+  `LB0300` and `LB0301` read identically on both sides of the boundary, and
+  overloads, generics, `---@vararg` and optional parameters behave there
+  exactly as they do within a file. Covered: `return M` module tables, a
+  module whose export *is* a function, nested tables, colon- and dot-calls on
+  exported classes, and vendored rocks.
+
+  Conservatism is inherited rather than re-decided: an **unannotated**
+  exported function is still not argument-checked, because an unannotated
+  same-file function is not either. That required carrying provenance —
+  reification erases the difference between a written `---@param` list and one
+  read off an unannotated body, and checking calls against the latter would
+  invent arity errors about code that makes no claim — so a function type now
+  records whether a human wrote its signature. Two smaller gaps fell out of
+  the same work: a `---@param` block above `return function(...) end` now
+  binds to that function (a single-function module could not carry a signature
+  at all before), and a `---@type fun(...)` over a name is authoritative at
+  its call sites. Dynamic `require` paths, `---@field`-only class members and
+  functions re-exported through a second `require` remain out, and are
+  enumerated in [the limitations
+  reference](docs/03-reference/02-limitations.md) (refs #46).
 - **The project source walk no longer follows a symlink cycle.** `src/loop ->
   <root>` made `layout::walk` re-collect every source once per level until the
   kernel's symlink budget ran out — 41 copies of one `src/main.lua` on Linux,

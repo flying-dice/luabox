@@ -294,10 +294,19 @@ return M
 }
 
 #[test]
-fn a_typed_assignment_over_a_non_literal_right_hand_side_is_unchanged() {
-    // `---@type fun(…)` over a *name* (not a function literal) declares the
-    // variable but defines no callable here; the existing inference path owns
-    // it, and nothing new is manufactured.
+fn a_typed_assignment_over_a_non_literal_right_hand_side_is_checked_from_its_type() {
+    // `---@type fun(…)` over a *name* (not a function literal) registers no
+    // callable under a dotted name — the by-name route the sibling tests above
+    // exercise. It does give `M.f` a declared type, though, and since #46 a
+    // call is checked against its callee's resolved *type* when the by-name
+    // registries come up empty. So the second argument reports.
+    //
+    // This test previously asserted silence here, pinning the defect #46 is
+    // about: a callee whose signature is known only through its type went
+    // unchecked. Deliberately rewritten — annotations are authoritative
+    // (SPEC §3), and luals reports the same call as `redundant-parameter`.
+    // The same rule is what makes the issue's own fifth row (`---@type` at a
+    // cross-module call site) report.
     let src = "\
 local M = {}
 local other = function(a, b) end
@@ -306,5 +315,5 @@ M.f = other
 M.f(1, 2)
 return M
 ";
-    assert_eq!(strict_codes(src), Vec::<String>::new());
+    assert_eq!(strict_codes(src), vec!["LB0301"]);
 }

@@ -369,6 +369,95 @@ Feature: luabox check — cross-module argument checking (#46)
     Then the command succeeds
     And stderr contains "check: 0 errors, 0 warnings"
 
+  Scenario: a member declared only as a ---@field does not reach the consumer
+    Given a strict project with edition "5.4"
+    And a file "src/api.lua" containing:
+      """
+      ---@class Api
+      ---@field send fun(payload: string): boolean
+      local Api = {}
+      return Api
+      """
+    And a file "src/app.lua" containing:
+      """
+      local api = require("api")
+      local ok = api.send(42)
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stderr contains "check: 0 errors, 0 warnings"
+
+  Scenario: the same class member, attached rather than declared, is argument-checked
+    Given a strict project with edition "5.4"
+    And a file "src/api.lua" containing:
+      """
+      ---@class Api
+      local Api = {}
+
+      ---@param payload string
+      ---@return boolean
+      function Api.send(payload)
+        return true
+      end
+      return Api
+      """
+    And a file "src/app.lua" containing:
+      """
+      local api = require("api")
+      local ok = api.send(42)
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0300"
+
+  Scenario: a function re-exported from a second require is not checked transitively
+    Given a strict project with edition "5.4"
+    And a file "src/geom.lua" containing:
+      """
+      local M = {}
+      ---@param w number
+      ---@param h number
+      ---@return number
+      function M.area(w, h)
+        return w * h
+      end
+      return M
+      """
+    And a file "src/reexport.lua" containing:
+      """
+      local geom = require("geom")
+      return { area = geom.area }
+      """
+    And a file "src/app.lua" containing:
+      """
+      local r = require("reexport")
+      local x = r.area("nope", 4)
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stderr contains "check: 0 errors, 0 warnings"
+
+  Scenario: a function re-exported from the same file is argument-checked
+    Given a strict project with edition "5.4"
+    And a file "src/reexport.lua" containing:
+      """
+      ---@param w number
+      ---@param h number
+      ---@return number
+      local function area(w, h)
+        return w * h
+      end
+      return { area = area }
+      """
+    And a file "src/app.lua" containing:
+      """
+      local r = require("reexport")
+      local x = r.area("nope", 4)
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0300"
+
   Scenario: a dynamic require path stays unchecked
     Given a strict project with edition "5.4"
     And a file "src/geom.lua" containing:

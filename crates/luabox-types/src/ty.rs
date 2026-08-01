@@ -134,6 +134,35 @@ pub struct FunctionTy {
     /// Whether any `---@return` was written. Without one, return
     /// statements are not checked and calls evaluate to `unknown`.
     pub has_return_annotation: bool,
+    /// Whether this signature was **written**, as LuaCATS — a `---@param` /
+    /// `---@return` / `---@overload` block, a `fun(...)` type expression, a
+    /// `---@field f fun(...)`, an `---@operator call` — rather than
+    /// synthesized by inference from an unannotated function body.
+    ///
+    /// It is provenance, and it exists because reification erases the
+    /// difference: [`crate::infer`] snapshots an unannotated `function M.f(a,
+    /// b)` as a `FunctionTy` with two `unknown`, non-optional parameters and
+    /// no varargs, which is indistinguishable *by shape* from a written
+    /// signature — but means something entirely different. A written
+    /// signature is a contract to check calls against; a synthesized one
+    /// describes a body nobody annotated, and checking calls against it would
+    /// manufacture arity errors about code the author never made a claim
+    /// about.
+    ///
+    /// Same-file checking gets this for free: an unannotated function has no
+    /// entry in the signature registries `Checker::callee_sig` consults, so it
+    /// is never resolved and never checked. Crossing a module boundary it has
+    /// to be carried, because a required module's export is *only* reachable
+    /// as a reified [`Ty`] — this flag is what lets a consumer apply exactly
+    /// the same conservatism to a call through `require` as to a call next
+    /// door (#46).
+    ///
+    /// A *partially* annotated signature is still declared: `reconcile_params`
+    /// already makes its unannotated parameters optional `unknown`, which is
+    /// what keeps partial annotation from manufacturing arity errors. This
+    /// flag asks the coarser question of whether a human wrote a signature at
+    /// all.
+    pub declared: bool,
     /// Additional `---@overload fun(...)` signatures. A call is accepted
     /// when it matches this primary signature *or* any overload; the
     /// primary governs the inferred result type (TODO(P1): pick the
@@ -304,6 +333,7 @@ impl Ty {
                 returns: func.returns.iter().map(Ty::widened).collect(),
                 returns_vararg: func.returns_vararg,
                 has_return_annotation: func.has_return_annotation,
+                declared: func.declared,
                 overloads: func.overloads.clone(),
                 generics: func.generics.clone(),
                 deprecated: func.deprecated,

@@ -91,7 +91,7 @@ fn codes(diags: &[Diagnostic]) -> Vec<String> {
 }
 
 /// A `return M` module table of annotated functions — the ordinary shape.
-const GEOM: &str = r#"
+const GEOM: &str = r"
 local M = {}
 ---@param w number
 ---@param h number
@@ -100,7 +100,7 @@ function M.area(w, h)
   return w * h
 end
 return M
-"#;
+";
 
 // --- the issue's measured table: the two rows that were `no` -------------
 
@@ -121,13 +121,13 @@ local x = geom.area("nope", 4)
 #[test]
 fn cross_module_direct_function_export_is_argument_checked() {
     let diags = check_with(
-        r#"
+        r"
 ---@param n number
 ---@return number
 return function(n)
   return n
 end
-"#,
+",
         r#"
 local f = require("mod")
 local x = f("nope")
@@ -203,13 +203,13 @@ local x = geom.area(3, 4)
 #[test]
 fn unannotated_export_is_not_checked() {
     let diags = check_with(
-        r#"
+        r"
 local M = {}
 function M.f(a, b)
   return a
 end
 return M
-"#,
+",
         r#"
 local m = require("mod")
 m.f("anything")
@@ -224,13 +224,13 @@ m.f(1, 2, 3)
 #[test]
 fn cross_module_optional_parameter_may_be_omitted() {
     let diags = check_with(
-        r#"
+        r"
 local M = {}
 ---@param a number
 ---@param b? string
 function M.f(a, b) end
 return M
-"#,
+",
         r#"
 local m = require("mod")
 m.f(1)
@@ -243,13 +243,13 @@ m.f(1)
 #[test]
 fn cross_module_optional_parameter_still_type_checked_when_supplied() {
     let diags = check_with(
-        r#"
+        r"
 local M = {}
 ---@param a number
 ---@param b? string
 function M.f(a, b) end
 return M
-"#,
+",
         r#"
 local m = require("mod")
 m.f(1, 2)
@@ -262,13 +262,13 @@ m.f(1, 2)
 #[test]
 fn cross_module_varargs_accept_extra_arguments() {
     let diags = check_with(
-        r#"
+        r"
 local M = {}
 ---@param a number
 ---@vararg string
 function M.f(a, ...) end
 return M
-"#,
+",
         r#"
 local m = require("mod")
 m.f(1, "x", "y")
@@ -281,13 +281,13 @@ m.f(1, "x", "y")
 #[test]
 fn cross_module_varargs_element_type_is_checked() {
     let diags = check_with(
-        r#"
+        r"
 local M = {}
 ---@param a number
 ---@vararg string
 function M.f(a, ...) end
 return M
-"#,
+",
         r#"
 local m = require("mod")
 m.f(1, "x", 2)
@@ -342,7 +342,7 @@ local x = require("mod").area("nope", 4)
 #[test]
 fn nested_table_export_is_argument_checked() {
     let diags = check_with(
-        r#"
+        r"
 local M = { util = {} }
 ---@param s string
 ---@return string
@@ -350,7 +350,7 @@ function M.util.fmt(s)
   return s
 end
 return M
-"#,
+",
         r#"
 local m = require("mod")
 local x = m.util.fmt(42)
@@ -367,7 +367,7 @@ fn re_exported_function_is_argument_checked() {
             ("geom", GEOM),
             (
                 "reexport",
-                r#"
+                r"
 ---@param w number
 ---@param h number
 ---@return number
@@ -375,7 +375,7 @@ local function area(w, h)
   return w * h
 end
 return { area = area }
-"#,
+",
             ),
         ],
         r#"
@@ -392,7 +392,7 @@ local x = r.area("nope", 4)
 #[test]
 fn colon_method_on_exported_class_is_argument_checked_once() {
     let diags = check_with(
-        r#"
+        r"
 ---@class Box
 local Box = {}
 Box.__index = Box
@@ -408,7 +408,7 @@ function Box:grow(w)
   return w
 end
 return Box
-"#,
+",
         r#"
 local Box = require("mod")
 local b = Box.new()
@@ -422,10 +422,15 @@ local x = b:grow("nope")
 #[test]
 fn dot_call_of_an_exported_method_is_argument_checked() {
     let diags = check_with(
-        r#"
+        r"
 ---@class Box
 local Box = {}
 Box.__index = Box
+
+---@return Box
+function Box.new()
+  return setmetatable({}, Box)
+end
 
 ---@param self Box
 ---@param w number
@@ -434,28 +439,69 @@ function Box.grow(self, w)
   return w
 end
 return Box
-"#,
+",
         r#"
 local Box = require("mod")
----@type Box
-local b = nil
+local b = Box.new()
 local x = Box.grow(b, "nope")
 "#,
     );
     assert_eq!(codes(&diags), ["LB0300"], "{diags:#?}");
 }
 
-/// A `---@field f fun(...)` declared on the exported class, rather than a
-/// `function M.f` definition.
+/// A member that exists **only** as a `---@field` on the exported class — no
+/// `function M.f` anywhere — does not reach the consumer, so its calls are
+/// unchecked. A disclosed remaining edge, not an argument-checking one: what
+/// is missing at the boundary is the *member*, not its signature.
+///
+/// A `---@class`'s `---@field` lines live in the type environment, while a
+/// module's export type is the reified shape of the value it returns, and the
+/// carrier `local Api = {}` accumulates only what is assigned to it. So the
+/// consumer receives an empty table and `api.send` resolves to nothing to
+/// check. Exporting the carrier as `Ty::Named("Api")` instead was tried and
+/// rejected: it makes the class's *declared* surface authoritative over the
+/// accumulated one, which produced false `LB0306`/`LB0300` on valid code in
+/// `cross_file_require::require_of_class_module_resolves_inherited_method`
+/// (a class module whose methods are attached, not declared). False positives
+/// on correct code are the one outcome this work may not trade for.
+///
+/// The same class *with its methods attached* — `function Api.send(...)` — is
+/// checked; that is `cross_module_table_field_call_is_argument_checked` and
+/// the colon-method test above. Disclosed in
+/// `docs/03-reference/02-limitations.md`.
 #[test]
-fn declared_field_function_is_argument_checked() {
+fn declaration_only_class_member_is_not_reached_across_the_boundary() {
     let diags = check_with(
-        r#"
+        r"
 ---@class Api
 ---@field send fun(payload: string): boolean
 local Api = {}
 return Api
+",
+        r#"
+local api = require("mod")
+local ok = api.send(42)
 "#,
+    );
+    assert_eq!(codes(&diags), Vec::<String>::new(), "{diags:#?}");
+}
+
+/// The counterpart that *is* checked: the same class with its member attached
+/// as a definition rather than declared as a `---@field`.
+#[test]
+fn attached_class_member_is_argument_checked() {
+    let diags = check_with(
+        r"
+---@class Api
+local Api = {}
+
+---@param payload string
+---@return boolean
+function Api.send(payload)
+  return true
+end
+return Api
+",
         r#"
 local api = require("mod")
 local ok = api.send(42)
@@ -468,7 +514,7 @@ local ok = api.send(42)
 /// accepted, one matching none reports.
 #[test]
 fn cross_module_overload_is_accepted_when_it_matches() {
-    let module = r#"
+    let module = r"
 local M = {}
 ---@param a number
 ---@return number
@@ -477,7 +523,7 @@ function M.f(a)
   return 1
 end
 return M
-"#;
+";
     let ok = check_with(
         module,
         r#"

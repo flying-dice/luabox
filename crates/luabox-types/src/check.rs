@@ -1048,7 +1048,43 @@ impl Checker<'_> {
         // Fallback: a value whose *type* resolves to a declared `---@class`
         // carrying a `---@operator call` overload is itself callable — the
         // operator's signature governs argument and result checking (LB0122).
-        self.class_call_sig(callee)
+        if let Some(sig) = self.class_call_sig(callee) {
+            return Some(sig);
+        }
+        // Last resort: the callee's *resolved type* is itself a written
+        // signature. This is the route by which a function reached across a
+        // module boundary is argument-checked (#46) — `local m =
+        // require("mod"); m.f(...)` binds nothing the registries above know
+        // about, but inference has already resolved `m` to the required
+        // module's export type and `m.f` to the function it holds.
+        self.resolved_callee_sig(callee)
+    }
+
+    /// The callee's signature taken from its **resolved type**, when that type
+    /// is a *written* ([`FunctionTy::declared`]) signature.
+    ///
+    /// The registries [`Checker::callee_sig`] consults above are keyed by name
+    /// — a local binding, a dotted name in the ambient/defs function map — and
+    /// a required module's members appear in neither: nothing in the consumer
+    /// file declares them. What the consumer *does* have is the module's
+    /// export type, resolved by inference and published as the callee
+    /// expression's type, so consulting it is what makes a cross-module call
+    /// check identically to a same-file one. Everything downstream — arity,
+    /// `---@param` types, overload selection, generic instantiation — is the
+    /// one shared [`Checker::check_arg_slots`] path, unchanged.
+    ///
+    /// The `declared` gate is the whole of the conservatism, and it is not a
+    /// new policy: it reproduces on the cross-module side the property that
+    /// makes the same-file side safe — an unannotated function is registered
+    /// nowhere, so it is never resolved and never argument-checked. An
+    /// unannotated *exported* function reifies to a `FunctionTy` all the same
+    /// (`unknown` parameters, the body's arity), and checking against that
+    /// would invent `LB0301`s about code carrying no claim at all.
+    fn resolved_callee_sig(&self, callee: &Expr) -> Option<FunctionTy> {
+        match self.expr_ty(callee) {
+            Ty::Function(sig) if sig.declared => Some(*sig),
+            _ => None,
+        }
     }
 
     /// A callable [`FunctionTy`] synthesized from the `---@operator call`
@@ -1870,6 +1906,8 @@ fn operator_call_fn(sig: &OperatorSig) -> FunctionTy {
         varargs,
         returns: vec![sig.result.clone()],
         has_return_annotation: true,
+        // Synthesized from a written `---@operator call` (#46).
+        declared: true,
         ..FunctionTy::default()
     }
 }

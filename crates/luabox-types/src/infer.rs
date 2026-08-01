@@ -1247,7 +1247,38 @@ impl Infer<'_> {
                         }
                     }
                 }
-                let values = self.eval_values(body, &exprs, None);
+                // `---@param`-annotated `return function(…) end`: the doc block
+                // above the `return` binds to the returned function literal
+                // (the `direct` module shape of #46), so it supplies that
+                // function's signature — its body walks against the declared
+                // parameters, and the value the module exports is the declared
+                // `fun(…)` rather than a signature inferred off an unannotated
+                // body. Exactly the rule `local f = function(…) end` follows in
+                // `walk_local`, applied to the one other place a doc block can
+                // sit above a function literal.
+                let return_sig = self
+                    .stmt_range(body, stmt)
+                    .and_then(|key| self.env.fn_sig(key))
+                    .cloned();
+                let returned_fn = exprs.first().and_then(|&e| match self.body(body).expr(e) {
+                    Expr::Function(b) => Some(*b),
+                    _ => None,
+                });
+                let values = match (&return_sig, returned_fn) {
+                    (Some(sig), Some(fn_body)) => {
+                        self.walk_body(fn_body, Some(sig), None);
+                        let mut values = vec![ITy::Ty(Ty::Function(Box::new(sig.clone())))];
+                        // The annotated function is the first returned value;
+                        // anything after it evaluates normally.
+                        values.extend(self.eval_values(
+                            body,
+                            exprs.get(1..).unwrap_or_default(),
+                            None,
+                        ));
+                        values
+                    }
+                    _ => self.eval_values(body, &exprs, None),
+                };
                 let data = self.funcs.entry(body).or_default();
                 for (i, value) in values.into_iter().enumerate() {
                     if i < data.returns.len() {
