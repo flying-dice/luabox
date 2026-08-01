@@ -27,6 +27,57 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ### Fixed
 
+- **A generic `---@class`'s type parameters are scoped to the declaration that
+  writes them.** Two declarations of one generic class may spell the parameter
+  differently — `---@class Boxed<T>` with `---@field value T` beside
+  `---@class Boxed<U>` with `---@field other U` — and luals resolves each
+  declaration's field bodies against its own list. luabox handed the *first*
+  non-empty list to every declaration of the name, so a renamed duplicate's
+  own, valid annotation was reported as `LB0305` "unknown type name". Each
+  declaration now lowers against its own parameters and the shapes are unified
+  **positionally** as they merge: slot 0 is one type variable however the two
+  spell it, so `Boxed<string>` makes both `value` and `other` `string`. Three
+  merge points needed the rule and all three carry it — the instantiation
+  templates, the class definition that crosses the `require` boundary, and the
+  workspace-global class two files build. A declaration naming *another*
+  declaration's parameter is still `LB0305`; the scoping cuts both ways, as it
+  does in luals (refs #49).
+- **A trailing parameter whose type admits `nil` is optional for arity.**
+  `---@param b number|nil` and `---@param b? number` say the same thing about
+  what may reach `b`, and Lua supplies `nil` for every argument the caller left
+  off — so omitting it is the call the annotation permits, which is what luals
+  concludes. Only the `?` spelling was counted, so `f(1)` against
+  `f(a: number, b: number|nil)` reported `LB0301`. The rule lands on every
+  arity path at once (direct, method, overload selection, cross-module).
+  Deliberately narrow in two directions, both documented: only a *trailing* run
+  is optional, and "admits `nil`" means the type says `nil` — `any` and
+  `unknown` decline to constrain the parameter rather than declaring it
+  omittable, so they stay required (refs #46).
+- **A string receiver's members resolve through the `string` library.** Every
+  string in a Lua state shares one metatable whose `__index` is the `string`
+  table, so `s:upper()` *is* `string.upper(s)`. The free-function spelling
+  typed; the receiver-method spelling produced `unknown`, which surfaced as
+  `LB0300` "found `unknown`" wherever the result was used — for every string
+  method. Now `s:upper()` is `string`, `s:byte()` is `integer`,
+  `s:match(p)` is `string|nil`, and the arguments are checked with the receiver
+  bound (`s:rep("three")` is `LB0300`, `s:sub()` is `LB0301`). A member the
+  library does not declare is `LB0306` in both the `:` and `.` spellings, as it
+  is at runtime, and a project that writes `function string.trim(s)` gets
+  `s:trim()` — also as at runtime (refs #46).
+
+### Documentation
+
+- **The `---@class` module-export edge is written out where the other
+  editor/CI edges are.** The disclosure lived only in `README.md`, and it was
+  inaccurate: it described a class *carrier* module as hovering "as the class
+  name" with CI "still checking" its members. Measured, the carrier spelling
+  hovers as the structural table the carrier is, and CI does not enforce it
+  either — `p.x` crosses the boundary as `unknown` and `p.nope` is accepted.
+  The class *instance* spelling is the one where the editor is narrower than
+  CI. Both rows are now in `docs/03-reference/02-limitations.md` as a measured
+  table, pinned by fixtures on both sides, and the `requires.rs` doc comment
+  that made the same claim is corrected to match (refs #54).
+
 - **Hover and completion on a `require` binding now use the type pass's
   answer.** `local m = require("mod")` hovered `unknown` while `luabox check`
   and the server's own diagnostics resolved the module's export type for that

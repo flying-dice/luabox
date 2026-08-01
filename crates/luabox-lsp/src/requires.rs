@@ -146,12 +146,30 @@ pub fn require_module_of<'a>(sema: &'a FileSema, binding: &Binding) -> Option<&'
 /// The named fields of a module export, when the export is a structural table
 /// — the shape of the overwhelmingly common `local M = {} … return M` module.
 ///
-/// A module that returns a `---@class` instance is [`Ty::Named`], whose fields
-/// live in the class declaration rather than in the type; resolving those
-/// needs the ambient environment the *type pass* holds, not the per-file view
-/// these surfaces are built on, so members of such a module are not offered.
-/// The binding itself still hovers as the class name, which is the half that
-/// carries the information.
+/// A `---@class` module's fields live in the class declaration rather than in
+/// the type, and resolving those needs the ambient environment the *type pass*
+/// holds, not the per-file view these surfaces are built on. So members of
+/// such a module are not offered, in either of its two spellings — and the two
+/// differ in what is left, which is worth stating exactly because it is not
+/// symmetrical (measured; pinned by
+/// `tests/features/lsp/hover-require.feature` and recorded in
+/// `docs/03-reference/02-limitations.md`):
+///
+/// * A **class instance** export (`---@type Point` on the returned local) is
+///   [`Ty::Named`], so the binding hovers as `Point` — the class name is the
+///   half that survives — while `p.x` has no hover and completion omits `x`.
+///   `luabox check` types `p.x` as `number` and reports `p.nope`, so the
+///   editor is strictly narrower than CI here.
+/// * A **class carrier** export (`---@class Point` over `local P = {}`) is
+///   the structural table the carrier itself is, so the binding hovers as
+///   that table (`local p: {  }`) rather than as `Point`, and `p.x` again has
+///   no hover and no completion. CI does not enforce this one either: `p.x`
+///   crosses the boundary as `unknown` and `p.nope` is accepted, so the two
+///   sides agree in *leniency* rather than the editor lagging.
+///
+/// Naming the class directly (`---@param p Point`) enforces it on both sides;
+/// class names are workspace-global, so the `require` is not what carries the
+/// type.
 #[must_use]
 pub fn export_fields(ty: &Ty) -> Option<&BTreeMap<String, FieldTy>> {
     match ty {

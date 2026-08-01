@@ -47,6 +47,21 @@ Choosing the union would make a mistyped duplicate silently widen the field
 rather than be reported, so the warning plus a stable winner is the more useful
 answer; the divergence is here rather than in the code's favour.
 
+**Type parameters are scoped to the declaration that writes them.** Two
+declarations of a generic class may spell the parameter differently —
+`---@class Boxed<T>` with `---@field value T` beside `---@class Boxed<U>` with
+`---@field other U` — and each declaration's field bodies resolve against its
+own list, as they do in luals. The templates are then unified *positionally*
+when they merge: slot 0 is one type variable however the two spell it, so
+`Boxed<string>` makes both `value` and `other` `string`. This holds in one
+file and across files alike. Two consequences worth stating: a declaration
+naming *another* declaration's parameter is a genuine unknown type name
+(`LB0305`) — the scoping cuts both ways — and the parameter *list* follows the
+same first-wins rule as every other member, so a duplicate declaring more
+parameters than the first has no canonical slot for the surplus, which stays
+lenient as `unknown` rather than becoming a placeholder no instantiation could
+substitute.
+
 One thing that is **not** a union: a project file's own `---@class` still
 *replaces* a same-named class from the stdlib or from a `[types] defs` package,
 whole. That is the escape hatch — your declaration corrects the packaged one
@@ -698,6 +713,35 @@ What that leaves, stated plainly:
 
   An explicit `---@type` at the call site still restores checking in any of
   these cases, as it always did.
+
+  Two call-site rules that the widening exposed have since been settled, and
+  each keeps one deliberately narrow edge:
+
+  - **A trailing parameter that admits `nil` is optional for arity.**
+    `---@param b number|nil` and `---@param b? number` say the same thing
+    about what may reach `b`, and Lua supplies `nil` for every argument the
+    caller left off — so omitting it is exactly the call the annotation
+    permits, which is what luals concludes too. `f(1)` against
+    `f(a: number, b: number|nil)` is clean, on both sides of the module
+    boundary. **Only a trailing run counts.** A nil-admitting parameter
+    *followed by a required one* still requires an argument, because a caller
+    cannot skip a middle argument in Lua without writing `nil` in its place —
+    relaxing that slot would let a genuinely short call through. luals's exact
+    behaviour in that position could not be verified here, and this is the
+    direction that cannot be wrong in the dangerous way. Equally narrow:
+    "admits `nil`" means the type *says* `nil`. `---@param b any` and
+    `---@param b unknown` accept `nil` assignably but only decline to
+    constrain the parameter, so they stay required.
+  - **A string receiver's `:` methods resolve through the `string` library.**
+    Every string shares one metatable whose `__index` is the `string` table,
+    so `s:upper()` *is* `string.upper(s)` — it types as `string`, `s:byte()`
+    as `integer`, `s:match(p)` as `string|nil`, and the arguments are checked
+    with the receiver bound (`s:rep("three")` is `LB0300`). A member the
+    library does not declare is `LB0306` in both the `:` and the `.`
+    spellings, as it is at runtime. A **nil-admitting receiver** is the edge
+    left: `---@type string|nil` must be narrowed before a method call, which
+    stays lenient rather than reported — the pre-existing rule for union
+    receivers generally, not specific to strings.
 - **The flat `lua_modules/<name>/` layout is not harvested.** It keeps its
   existing route: a `[dependencies]`/`[dev-dependencies]` entry naming the
   package, a `luabox.toml` for it at `lua_modules/<name>/luabox.toml` (or at
@@ -715,6 +759,39 @@ it points at is still not planned for 0.x; nothing needs it now.
 
 Your `*.rockspec` and luarocks own everything else (adding, updating,
 publishing), and you run your program with whatever Lua you already have.
+
+### A `---@class` module export: editor and CI both stop short (#54)
+
+The editor reads `require` bindings through the same resolver the type pass
+does, so hover and completion agree with CI for the ordinary `local M = {} …
+return M` module. One shape does not close, in **both** of its spellings: a
+module whose export is a `---@class`. The class's `---@field`s live in the
+declaring file's ambient environment, and the per-file view the editor
+surfaces are built on cannot reach it — so **the module's members get no
+hover and are not offered by completion, either way**.
+
+What is left of the binding differs between the two spellings, and the
+difference is measured, not assumed. Both rows are pinned by fixtures —
+`tests/features/lsp/hover-require.feature` for the editor column,
+`tests/features/frontend/require.feature` for CI.
+
+Given `---@class Point` / `---@field x number` in `point.lua` and
+`local p = require("point")` in the consumer:
+
+| module spells its export as | binding hovers as | `p.x` hover | `p.` completion | `luabox check` |
+| --- | --- | --- | --- | --- |
+| a class **instance** — `---@type Point` on the returned local | `local p: Point` | none | omits `x` | enforces: `p.x` is `number`, `p.nope` is `LB0306` |
+| a class **carrier** — `---@class Point` over `local P = {}` | `local p: {  }` (the structural table the carrier is) | none | omits `x` | lenient: `p.x` crosses as `unknown` and `p.nope` is accepted |
+
+So the instance spelling is the one where the editor is genuinely narrower
+than CI. The carrier spelling is not an editor gap at all — both sides see
+the structural table, and they agree.
+
+**The way to get the class enforced is to name it**: `---@param p Point`, or
+`---@type Point` on the binding. Class names are workspace-global, so the
+`require` is not what carries the type — no `require` is needed for the type
+at all. With the class named, members are typed, hovered, completed and
+checked on both sides.
 
 ### `build --mode love` requires an external zip tool
 
