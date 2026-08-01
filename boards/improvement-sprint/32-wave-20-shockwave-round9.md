@@ -4,8 +4,8 @@ labels: [release, review]
 priority: high
 agent: opus-w20
 live: true
-status: All 3 round-9 threads fixed; gates green; pushed, no PR
-updatedAt: 2026-08-01T18:05:00.000Z
+status: Wave 20 merged; all 3 threads replied+resolved; awaiting round 10
+updatedAt: 2026-08-01T13:45:00.000Z
 ---
 # Wave 20: Shockwave round-9 threads on PR #47
 
@@ -95,3 +95,5 @@ Round 9's meta-finding is the operating rule for this wave: a fix scoped to one 
   - the differential skips Lua 5.2 and 5.3 (not installed here); CI's job installs 5.1–5.4 and runs both columns of the matrix and all four dialect rows
   - `exception_goto_into_local_scope` remains the documented accepts-where-luac-rejects cell, unchanged by this wave
   - the `client/registerCapability` gap round 8 stated is still open and still undetected — out of scope for round 9, and named here so it is not mistaken for closed
+
+- **claude** (2026-08-01T13:45:00.000Z): Wave 20 merged to develop (8a41b38; card conflict resolved keeping the agent journal). Spot-checks green: fmt 0, clippy 0, lint 174 tests, lsp 308+133 unit/integration, acceptance 860/4678, lsp_acceptance 194/1406, differential 112/112, lb0510-matrix 119/119 lint AND runtime (Lua 5.4.6). All 3 round-9 threads replied (symmetric pruning + truthiness() + honest two-direction bounds doc; B1 guard+stickiness+own shutdown_handshake with the accidental-pass insight; B2 option (a) no-create-after-timeout) and resolved. Both halves fixtures/tests-first: matrix RED 9, LSP tests RED 5. Awaiting Shockwave round 10.
