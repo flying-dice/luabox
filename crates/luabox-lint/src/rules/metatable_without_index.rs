@@ -220,13 +220,12 @@ impl Carriers {
                                     if !matches!(body.expr(*base), Expr::Name(_)) {
                                         continue;
                                     }
-                                    match index_key(body.expr(*index)) {
-                                        None => settled.extend(resolve(*base)),
-                                        Some(INDEX) => settled.extend(resolve(*base)),
-                                        Some(key) if key.starts_with(METAFIELD_PREFIX) => {
+                                    match key_kind(index_key(body.expr(*index))) {
+                                        KeyKind::Index => settled.extend(resolve(*base)),
+                                        KeyKind::Metafield => {
                                             operator_tables.extend(resolve(*base));
                                         }
-                                        Some(_) => {}
+                                        KeyKind::Plain => {}
                                     }
                                 }
                                 // `C = <anything>` — the annotated value is
@@ -244,10 +243,12 @@ impl Carriers {
                         for (name, &value) in names.iter().zip(init) {
                             match body.expr(value) {
                                 Expr::Table { entries } => {
-                                    if entries.iter().any(|entry| declares_index(body, entry)) {
+                                    let kinds =
+                                        || entries.iter().filter_map(|e| entry_kind(body, e));
+                                    if kinds().any(|kind| kind == KeyKind::Index) {
                                         settled.insert(name.binding);
                                     }
-                                    if entries.iter().any(|entry| declares_metafield(body, entry)) {
+                                    if kinds().any(|kind| kind == KeyKind::Metafield) {
                                         operator_tables.insert(name.binding);
                                     }
                                 }
@@ -274,14 +275,15 @@ impl Carriers {
                 let Some(&carrier) = args.first() else {
                     continue;
                 };
-                match args.get(1).map(|&key| index_key(body.expr(key))) {
-                    // No key argument at all is malformed source; read it the
-                    // way an unreadable key is read.
-                    None | Some(None) | Some(Some(INDEX)) => settled.extend(resolve(carrier)),
-                    Some(Some(key)) if key.starts_with(METAFIELD_PREFIX) => {
-                        operator_tables.extend(resolve(carrier));
-                    }
-                    Some(Some(_)) => {}
+                // No key argument at all is malformed source; read it the way
+                // an unreadable key is read.
+                let kind = args
+                    .get(1)
+                    .map_or(KeyKind::Index, |&key| key_kind(index_key(body.expr(key))));
+                match kind {
+                    KeyKind::Index => settled.extend(resolve(carrier)),
+                    KeyKind::Metafield => operator_tables.extend(resolve(carrier)),
+                    KeyKind::Plain => {}
                 }
             }
         }
@@ -313,27 +315,32 @@ fn index_key(expr: &Expr) -> Option<&str> {
     }
 }
 
-/// The literal key a table-constructor entry names, or `None` for a
-/// positional entry or a key this pass cannot evaluate.
-fn entry_key<'a>(body: &'a luabox_hir::Body, entry: &'a TableEntry) -> Option<Option<&'a str>> {
-    match entry {
-        TableEntry::Positional(_) => None,
-        TableEntry::Named { name, .. } => Some(Some(name.as_str())),
-        TableEntry::Keyed { key, .. } => Some(index_key(body.expr(*key))),
+/// What one written key says about the carrier it is written to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyKind {
+    /// `__index` — or a key this pass cannot evaluate, which counts the same
+    /// because the write *might* be `__index`.
+    Index,
+    /// Another metafield (`__call`, `__tostring`, `__add`, `__mode`, …).
+    Metafield,
+    /// An ordinary field, which says nothing about instance lookup.
+    Plain,
+}
+
+fn key_kind(key: Option<&str>) -> KeyKind {
+    match key {
+        None | Some(INDEX) => KeyKind::Index,
+        Some(key) if key.starts_with(METAFIELD_PREFIX) => KeyKind::Metafield,
+        Some(_) => KeyKind::Plain,
     }
 }
 
-/// Whether a table-constructor entry declares `__index` — or a key this pass
-/// cannot evaluate, which counts the same.
-fn declares_index(body: &luabox_hir::Body, entry: &TableEntry) -> bool {
-    matches!(entry_key(body, entry), Some(None) | Some(Some(INDEX)))
-}
-
-/// Whether a table-constructor entry declares a metafield that is not
-/// `__index`.
-fn declares_metafield(body: &luabox_hir::Body, entry: &TableEntry) -> bool {
-    matches!(
-        entry_key(body, entry),
-        Some(Some(key)) if key != INDEX && key.starts_with(METAFIELD_PREFIX)
-    )
+/// The kind of key a table-constructor entry names, or `None` for a
+/// positional entry (which names no key at all).
+fn entry_kind(body: &luabox_hir::Body, entry: &TableEntry) -> Option<KeyKind> {
+    match entry {
+        TableEntry::Positional(_) => None,
+        TableEntry::Named { name, .. } => Some(key_kind(Some(name.as_str()))),
+        TableEntry::Keyed { key, .. } => Some(key_kind(index_key(body.expr(*key)))),
+    }
 }

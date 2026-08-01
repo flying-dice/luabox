@@ -373,6 +373,14 @@ fn load_defs_package(
     if dir.is_dir() {
         let mut files = Vec::new();
         collect_d_lua(&dir, &mut files);
+        // Deliberately `PathBuf`'s component-wise `Ord` — the *opposite* rule
+        // to the raw-byte sort its sibling rock walk uses (`collect_rock_
+        // sources`), and safe here for the reason that one is not: `defs/` is
+        // never listed by `resolve_candidates`, so there is no `require`
+        // resolution order for this order to contradict. All it has to be is
+        // deterministic, and `load_defs_package` is the single shared
+        // consumer for both front-ends, so `check` and the server pick the
+        // same `LB0307` winner. Do not "fix" this one to match the other.
         files.sort();
         for file in files {
             if let Ok(text) = fs::read_to_string(&file) {
@@ -1188,7 +1196,7 @@ edition = \"5.4\"
     }
 
     #[test]
-    fn collect_rock_sources_yields_module_names_labels_and_text_path_sorted() {
+    fn collect_rock_sources_yields_module_names_labels_and_text_in_require_candidate_order() {
         let tmp = tempfile::tempdir().expect("tempdir");
         write(
             tmp.path(),

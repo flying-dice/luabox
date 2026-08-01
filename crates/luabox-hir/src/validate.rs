@@ -478,6 +478,34 @@ mod tests {
         // Defence in depth still works if a caller ignores the clean-parse
         // contract: the recovered tree yields nothing at 5.1.
         assert!(diags("local function f() goto nowhere end", Dialect::Lua51).is_empty());
+
+        // …but that assertion alone cannot fail if the guard is deleted: the
+        // recovered 5.1 tree may hold no `Stmt::Goto` to complain about
+        // (Shockwave round 4). So drive the pass with a file that certainly
+        // does — parsed and lowered under 5.2, judged at 5.1, which is the
+        // shape `--target 5.1` produces. Without the guard this reports
+        // LB0020.
+        let real_goto = parse("local function f() goto nowhere end", Dialect::Lua52);
+        assert!(real_goto.errors().is_empty(), "{:?}", real_goto.errors());
+        let lowered = lower(&real_goto);
+        assert!(
+            lowered
+                .bodies()
+                .any(|(_, body)| body.stmts().any(|(_, s)| matches!(s, Stmt::Goto { .. }))),
+            "the fixture must actually contain a `Stmt::Goto`"
+        );
+        assert!(
+            control_flow("t.lua", &lowered, Dialect::Lua51).is_empty(),
+            "the `goto` guard must suppress LB0020 under 5.1"
+        );
+        assert_eq!(
+            control_flow("t.lua", &lowered, Dialect::Lua52)
+                .iter()
+                .map(|d| d.code.number())
+                .collect::<Vec<_>>(),
+            [UNRESOLVED_GOTO],
+            "…and the same file at an edition with `goto` does report it"
+        );
     }
 
     /// The three programs from #44, each rejected by reference Lua at load

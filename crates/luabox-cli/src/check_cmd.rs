@@ -495,12 +495,11 @@ impl Findings {
     }
 
     fn record(&mut self, key: FindingKey, diag: Diagnostic) {
-        match self.index.get(&key) {
-            Some(&at) => self.order[at] = diag,
-            None => {
-                self.index.insert(key, self.order.len());
-                self.order.push(diag);
-            }
+        if let Some(&at) = self.index.get(&key) {
+            self.order[at] = diag;
+        } else {
+            self.index.insert(key, self.order.len());
+            self.order.push(diag);
         }
     }
 

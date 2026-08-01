@@ -1542,7 +1542,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ErrorCode, ProjectConfig, Server, ambient_def_sources, apply_content_changes, root_path,
+        CodeActionOrCommand, ErrorCode, ProjectConfig, PublishDiagnostics, Server,
+        ambient_def_sources, apply_content_changes, root_path,
     };
 
     /// A ranged change replacing `[start, end)` with `text`.
@@ -2139,6 +2140,91 @@ mod tests {
         assert!(
             error.to_string().contains("without a prior `shutdown`"),
             "{error}"
+        );
+    }
+    /// The lint quick-fix *pairing*, not just its precondition.
+    ///
+    /// `code_actions` matches a fix back to the diagnostic that produced it
+    /// by comparing suggestion span + replacement, then re-`convert`s that
+    /// diagnostic under `LINT_SOURCE`. Nothing asserted that the result was
+    /// the diagnostic the client was actually shown, so a future non-rule
+    /// finding riding the same `lint_source` engine while carrying a
+    /// machine-applicable fix would pass every band test and still hand the
+    /// editor a `diagnostics` entry that matches nothing in the problems
+    /// pane. Driven over a *mixed* set: `LB0022` (control-flow legality, not
+    /// a lint rule, toolchain source) alongside the fixable `LB0501`.
+    #[test]
+    fn a_quickfix_references_the_exact_diagnostic_that_was_published() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("main.lua");
+        let source = "break\nlocal unused = 1\n";
+        fs::write(&path, source).expect("write the document");
+        let uri_text = format!("file://{}", path.display());
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": uri_text,
+                        "languageId": "lua",
+                        "version": 1,
+                        "text": source,
+                    },
+                }),
+            })
+            .expect("didOpen");
+
+        let published = drain(&client)
+            .iter()
+            .find_map(|message| match message {
+                Message::Notification(not) if not.method == PublishDiagnostics::METHOD => {
+                    serde_json::from_value::<lsp_types::PublishDiagnosticsParams>(
+                        not.params.clone(),
+                    )
+                    .ok()
+                    .map(|params| params.diagnostics)
+                }
+                _ => None,
+            })
+            .expect("the server published diagnostics for the open document");
+        let code_of = |diag: &lsp_types::Diagnostic| match diag.code.clone() {
+            Some(lsp_types::NumberOrString::String(code)) => code,
+            _ => String::new(),
+        };
+        assert!(
+            published.iter().any(|d| code_of(d) == "LB0022"),
+            "the set must be mixed: {published:?}"
+        );
+        let published_lint = published
+            .iter()
+            .find(|d| code_of(d) == "LB0501")
+            .expect("the fixable lint was published");
+
+        let uri: lsp_types::Uri = uri_text.parse().expect("uri");
+        let actions = server
+            .code_actions(
+                &uri,
+                Range {
+                    start: Position::new(1, 6),
+                    end: Position::new(1, 6),
+                },
+            )
+            .expect("code actions");
+        let quickfix = actions
+            .iter()
+            .find_map(|action| match action {
+                CodeActionOrCommand::CodeAction(action)
+                    if action.kind.as_ref() == Some(&super::CodeActionKind::QUICKFIX) =>
+                {
+                    Some(action)
+                }
+                _ => None,
+            })
+            .expect("a quickfix for the unused local");
+        assert_eq!(
+            quickfix.diagnostics.as_deref(),
+            Some(std::slice::from_ref(published_lint)),
+            "the action must reference the published diagnostic byte for byte"
         );
     }
 }
