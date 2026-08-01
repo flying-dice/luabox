@@ -451,3 +451,31 @@ Feature: luabox check — generic annotations
     When I run "luabox check"
     Then the command succeeds
     And zero diagnostics are reported
+
+  Scenario: two files declaring the same generic class may name the parameter differently
+    Given a strict project with edition "5.4"
+    And a file "src/a.lua" containing:
+      """
+      ---@class Boxed<T>
+      ---@field value T
+      return {}
+      """
+    And a file "src/b.lua" containing:
+      """
+      ---@class Boxed<U>
+      ---@field other U
+      return {}
+      """
+    And a file "src/main.lua" containing:
+      """
+      require("a")
+      require("b")
+      ---@param s string
+      local function want(s) end
+      ---@param b Boxed<string>
+      local function use(b) want(b.value) want(b.other) end
+      return use
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And zero diagnostics are reported
