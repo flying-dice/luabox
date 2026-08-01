@@ -152,3 +152,52 @@ metafield_call_dead_branch_self_colon	0	ok	round-7's last disclosed FP, closed b
 metafield_call_chain_via_alias	1	crash	the __call chain through an alias of the instance still dispatches
 metafield_carrier_alias_at_construction	0	crash	FN: the metatable argument is an alias; the class is looked up on the binding
 metafield_carrier_alias_at_construction_uninvoked	0	ok	the twin -- same silence, here it is right
+
+# --- round 9: BRANCH PRUNING MADE SYMMETRIC ---------------------------------
+# The prune was one-sided: only the `then` of a literal-false `if` was
+# dropped. A literal-TRUE `if` runs its `then`, so its `else` -- and every
+# later `elseif` arm -- is the dead half, and both feed the fixpoint and the
+# use count. Dead numeric-for headers and statements after `do return end`
+# are the same cheap literal question and are pruned with them.
+metafield_reach_else_of_live_if	0	ok	round-9 FP, closed: the `else` of a literal-true `if` never runs
+metafield_reach_branch_after_live_if	0	ok	round-9 FP, closed: arms after a literal-true branch are never tested
+metafield_reach_dead_numeric_for	0	ok	round-9 FP, closed: `for _ = 1, 0` runs zero times
+metafield_reach_dead_numeric_for_negative_step	0	ok	round-9 FP, closed: `for _ = 1, 10, -1` counts the wrong way
+metafield_reach_live_numeric_for	1	crash	the twin: one iteration reaches the method
+metafield_reach_numeric_for_variable_bound	1	ok	DISCLOSED FP: the header prune is literal-only, exactly like the `if` guard
+metafield_reach_after_do_return	0	ok	round-9 FP, closed: statements after `do return end` are dead
+metafield_reach_before_do_return	1	crash	the twin: the same two statements the other way round
+
+# --- round 9: the TERNARY `cond and ctor or other` -------------------------
+# `And` seeded its right operand unconditionally and `is_falsy_literal` was
+# never consulted on the BinOp path, so a literal-false cond still seeded the
+# construction the ternary discards. Both operators now read the truthiness
+# of the operand that decides -- literals only, and through nested and/or.
+metafield_ternary_dead_literal_cond	0	ok	round-9 FP, closed: `false and ctor or other` is `other`
+metafield_ternary_live_literal_cond	1	crash	the twin: `true and ctor or other` is the construction
+metafield_ternary_named_false_cond	1	ok	DISCLOSED FP: a cond that is a *name* is not decided (see guard_variable_false)
+metafield_ternary_named_true_cond	1	crash	the twin: seeding through an undecided cond is what makes this row right
+metafield_or_lhs_dead_literal	1	crash	round-9 FN, closed: `false or ctor` IS the construction
+metafield_or_lhs_live_literal	0	ok	the twin: a literal-truthy lhs is the value; the construction never runs
+metafield_and_rhs_ctor_dead_literal	0	ok	round-9 FP, closed: `false and ctor` never evaluates its right operand
+metafield_and_rhs_ctor_live_literal	1	crash	the twin: `true and ctor` is the construction
+
+# --- round 9: FPs that stay, each with the twin that shows why -------------
+# All three are the same root cause -- derivation is flow-insensitive, so a
+# name carries every value ever bound to it and a call site carries every
+# body ever attached to the name. Deciding them needs ordering this pass does
+# not have; they are disclosed in docs/03-reference/02-limitations.md.
+metafield_flow_reassigned_before_use	1	ok	DISCLOSED FP: `c` is reassigned before the call; derivation is flow-insensitive
+metafield_flow_reassigned_after_use	1	crash	the twin: the same lines with the call in the middle
+metafield_two_setmetatable_second_wins	1	ok	DISCLOSED FP: the second setmetatable replaces the first; the superseded site still reports
+metafield_two_setmetatable_second_bare	1	crash	the twin: the winning metatable is the bare one, and the lookup does fail
+metafield_fn_replaced_after_call	0	crash	DISCLOSED FN: the name-to-body map is last-wins, so the entered body is not the mapped one
+metafield_fn_replaced_before_call	1	ok	the twin, and the FP the same map produces the other way round
+
+# --- round 9: a method read off a derived value, bound then called ---------
+# `local m = c.reset; m(c)` is `c.reset(c)` with a name in between: the read
+# goes through the missing __index, yields nil, and the call fails. The read
+# alone is still not a use.
+metafield_dot_handle_invoked	1	crash	round-9 FN, closed: dot dispatch through a local handle
+metafield_dot_handle_uninvoked	0	ok	the twin: the read happens, nothing is called
+metafield_dot_handle_off_the_carrier	0	ok	the guard: reading off the CARRIER is a plain table read no metatable serves

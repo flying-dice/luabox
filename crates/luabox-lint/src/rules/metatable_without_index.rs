@@ -32,8 +32,8 @@ use std::collections::{HashMap, HashSet};
 
 use luabox_diag::Code;
 use luabox_hir::{
-    BinOp, BindingId, BindingKind, Block, Body, BodyId, Expr, ExprId, HirId, Literal, Resolution,
-    Stmt, TableEntry,
+    BinOp, BindingId, BindingKind, Block, Body, BodyId, Expr, ExprId, HirId, Literal, Number,
+    Resolution, Stmt, TableEntry, UnOp,
 };
 
 use crate::context::{LintContext, binding_of};
@@ -97,14 +97,16 @@ const SELF: &str = "self";
 ///     `local function boom() return c:reset() end` and `print(type(boom))`
 ///     is a lookup that never happens, and so is one inside
 ///     `if false then … end`. Uses are counted only in bodies this file
-///     [enters](InstanceUses::reached_bodies) and only in statements no
-///     literal condition prunes.
+///     [enters](InstanceUses::reached_bodies) and only in statements the
+///     source itself proves live ([`Shapes::walk_block`]).
 ///
 ///   The three ways this file can *reach* a method through the metatable are
 ///   a colon call on a derived value, a plain call on one whose `__call` runs
-///   a colon call on its own receiver, and dot dispatch with an explicit self
-///   (`c.m(c)`). All are in [`InstanceUses`], with the one approximation that
-///   remains.
+///   a colon call on its own receiver, and dot dispatch — written out
+///   (`c.m(c)`) or through a name the read was bound to
+///   (`local m = c.reset; m(c)`). All are in [`InstanceUses`], whose
+///   [bounds](InstanceUses#what-this-does-not-decide) are enumerated there
+///   and in `docs/03-reference/02-limitations.md`.
 ///
 /// It is **in-file only** — the carrier, the `__index` write and the
 /// `setmetatable` call must all be in the file being linted — and, being a
@@ -670,10 +672,14 @@ struct Shapes {
 ///    equally `c = setmetatable({}, C)` on a name declared earlier or on a
 ///    global — plus any `local d = c` alias, through the same [`Aliases`] map
 ///    the carrier side uses. `a or b` and `a and b` are followed into the
-///    operand the expression **definitively evaluates to**, which for a
-///    construction (always truthy) means `ctor or x` and `x and ctor` are
-///    followed and `x or ctor` and `ctor and x` are not — spelled out at the
-///    [`BinOp`] arm of [`Self::carriers_of`];
+///    operand the expression **definitively evaluates to**. When the left
+///    operand's truthiness is written in the source it decides on its own
+///    (`false and ctor` is `false`, `false or ctor` is the construction, and
+///    the ternary `cond and ctor or other` follows whichever side a literal
+///    `cond` selects); when it is not, a construction is always truthy and
+///    that decides the rest — `ctor or x` and `x and ctor` are followed,
+///    `x or ctor` and `ctor and x` are not. Spelled out at the [`BinOp`] arm
+///    of [`Self::carriers_of`];
 /// 4. **the constructor pattern**: a function whose body returns a
 ///    construction (directly, or via a name it bound to one) is a *factory*
 ///    for that carrier, and a name bound to a call of it holds an instance.
@@ -695,10 +701,11 @@ struct Shapes {
 ///   `__call` metamethod is a function body in this file whose own `self`
 ///   takes a colon call. That is the chain `f()` → `C.__call(self)` →
 ///   `self:m()`, and it does crash;
-/// - **dot dispatch with an explicit self** — `c.m(c)` — when `m` names a
-///   function attached to the carrier. Same lookup, same failure, different
-///   spelling; see [`Self::dot_dispatched`] for what keeps a bare field
-///   *read* out of it.
+/// - **dot dispatch** — `c.m(c)`, and equally `local m = c.reset; m(c)` —
+///   when `m` names a function attached to the carrier. Same lookup, same
+///   failure, different spelling; see [`Self::dot_read`] for what keeps a
+///   bare field *read* out of it, and [`Self::seed_dot_handles`] for the
+///   spelling with a name in the middle.
 ///
 /// The second used to be spelled the other way round: `self` inside *any*
 /// function attached to the carrier was treated as a derived value, so a
@@ -723,26 +730,66 @@ struct Shapes {
 /// `if false then c:reset() end`.
 ///
 /// So a use is counted only where the file can perform it: in a body the
-/// [reached set](Self::reached_bodies) contains, and in a statement no
-/// literal condition prunes ([`Shapes::walk_block`]). Both are FN-biased at
-/// their edges — an escaping closure is not reached, and a guard that is a
-/// name is not decided.
+/// [reached set](Self::reached_bodies) contains, and in a statement the
+/// source proves live ([`Shapes::walk_block`]). Both are FN-biased at their
+/// edges — an escaping closure is not reached, and a guard that is a name is
+/// not decided.
 ///
-/// **The remaining approximation is a false positive, and it is the
-/// non-literal guard.** `local on = false; if on then c:reset() end` still
-/// counts, because deciding it needs constant propagation rather than a look
-/// at the token — the same bound the `__index`-write side has carried since
-/// the rule shipped ("an `__index` write in a branch that never runs"). The
-/// dead-branch `self:m()` inside a `__call` that round 7 disclosed here is
-/// **closed**: the prune applies wherever statements are walked, the `__call`
-/// body included.
+/// # What this does not decide
 ///
-/// Everything else is unknown and stays unknown: an instance stored in a
-/// table, passed as a parameter, taken from a `for`-in variable, returned by a
-/// method call, or reached through `require` derives nothing. That direction
-/// is the safe one here — an underived instance means the operator table stays
-/// silent, which is the false-negative axis, and this rule's false-positive
-/// axis is the one that had eight measured members.
+/// Wave 20 replaced "the one approximation that remains" with a list, because
+/// four consecutive review rounds found that sentence describing a narrower
+/// pass than the one below it. What follows is the whole set, and it is what
+/// `docs/03-reference/02-limitations.md` says at more length; each entry has a
+/// committed matrix fixture with its twin under
+/// `scripts/tests/lb0510-matrix/`.
+///
+/// **False-positive-shaped** — a finding on a program that runs:
+///
+/// - **a guard that is not a literal.** `local on = false; if on then
+///   c:reset() end` counts, and so do the ternary
+///   (`local ready = false; local c = ready and ctor or other`) and the
+///   numeric-`for` header (`local n = 0; for _ = 1, n`) with the same shape.
+///   Deciding any of them needs constant propagation rather than a look at
+///   the token, which is the bound the `__index`-write side has carried since
+///   the rule shipped ("an `__index` write in a branch that never runs");
+/// - **flow-insensitive derivation.** A name carries every value ever bound
+///   to it, so `local c = setmetatable({}, C); c = plain; c:m()` counts the
+///   call on `plain` against `C`. This is deliberate — see
+///   [`Self::build`] — and it is the same fact as the next two;
+/// - **two `setmetatable` calls on one table.** The second *replaces* the
+///   metatable, so only it is in effect at the lookup, but each call is a
+///   real construction site and the rule reports one finding per site. The
+///   superseded one is a finding against a lookup the winning metatable
+///   serves;
+/// - **an insert-last-wins name-to-body map.** `local function run() … end;
+///   run(); run = function() … end` maps `run` to the *replacement*, so the
+///   call is attributed to a body it does not enter. The same map produces a
+///   false negative the other way round (below).
+///
+/// **False-negative-shaped** — silence on a program that crashes. This is the
+/// direction the metafield arm errs in, because a carrier that declares a
+/// metafield is plausibly an operator table:
+///
+/// - the name-to-body map again: a function **called and then replaced**
+///   resolves to the replacement, so the body the call really enters is never
+///   marked reached;
+/// - a use inside a **closure that escapes** — no call site in this file
+///   names its body, which is what keeps `print(type(boom))` quiet;
+/// - `x or setmetatable(_, C)` with an **undecided** `x`; following `x` alone
+///   is what closes the round-8 false positive on a truthy one;
+/// - a construction whose **metatable argument is an alias** of the carrier;
+/// - an instance in a **table field**, a **parameter**, a **`for`-in
+///   variable**, a **`...` slot**, or from a **method-call factory**;
+/// - a **depth-two constructor**, and a `__call` that reaches the method
+///   through a **nested closure**;
+/// - a carrier reached through **`require`** — the rule is in-file only.
+///
+/// Two round-7 disclosures here are **closed**: the dead-branch `self:m()`
+/// inside a `__call` (the prune applies wherever statements are walked, that
+/// body included), and the one-sided prune round 9 found — the `else` of a
+/// literal-true `if` is now dead code the same way the `then` of a
+/// literal-false one is.
 struct InstanceUses<'ctx, 'src> {
     ctx: &'ctx LintContext<'src>,
     aliases: &'ctx Aliases,
@@ -750,6 +797,12 @@ struct InstanceUses<'ctx, 'src> {
     /// Values (alias-rooted bindings, and globals by name) and the carriers
     /// they may hold an instance of.
     derived: HashMap<ValueRef, Carrying>,
+    /// Values bound to a **method read off a derived value** —
+    /// `local m = c.reset` — and the carriers that read went through. Calling
+    /// one of these is the lookup a missing `__index` breaks, with a name
+    /// standing in for the `c.reset` an inline `c.reset(c)` writes out. See
+    /// [`Self::seed_dot_handles`].
+    dot_handles: HashMap<ValueRef, Carrying>,
     /// Function bodies that return an instance, by **return slot**: entry `i`
     /// is the set of carriers the body's `i`th returned value may be an
     /// instance of.
@@ -766,6 +819,7 @@ impl<'ctx, 'src> InstanceUses<'ctx, 'src> {
             aliases,
             shapes: Shapes::collect(ctx, aliases),
             derived: HashMap::new(),
+            dot_handles: HashMap::new(),
             factories: HashMap::new(),
             reached: HashSet::new(),
         };
@@ -786,6 +840,9 @@ impl<'ctx, 'src> InstanceUses<'ctx, 'src> {
         this.seed_values();
         this.seed_factories();
         this.seed_values();
+        // Reads a name off a completed derivation, so it goes after the last
+        // seeding round and before anything consults it.
+        this.seed_dot_handles();
         // Derivation is flow-insensitive and stays that way: which carrier a
         // value belongs to does not depend on whether the file runs the line.
         // Which *uses* count does, so reachability is answered once the
@@ -799,7 +856,8 @@ impl<'ctx, 'src> InstanceUses<'ctx, 'src> {
     /// ever answerable for a call of a known factory, which is what makes
     /// `local _n, c = make()` land on `c`.
     fn carriers_of(&self, body_id: BodyId, expr: ExprId, slot: usize) -> Carrying {
-        match self.ctx.lowered.body(body_id).expr(expr) {
+        let body = self.ctx.lowered.body(body_id);
+        match body.expr(expr) {
             // `(setmetatable({}, C)):m()` — the paren is not a value, and it
             // truncates to exactly one.
             Expr::Truncate(inner) if slot == 0 => self.carriers_of(body_id, *inner, 0),
@@ -810,8 +868,13 @@ impl<'ctx, 'src> InstanceUses<'ctx, 'src> {
                 .unwrap_or_default(),
             // `and` / `or` are followed into the operand the expression
             // **definitively evaluates to**, which is not the same as either
-            // operand it might mention. A construction is a table, so it is
-            // always truthy, and that is what decides three of the four:
+            // operand it might mention. Two facts decide it: a construction
+            // is a table and so always truthy, and a left operand whose
+            // truthiness is *written in the source* ([`truthiness`]) says on
+            // its own which side survives.
+            //
+            // With an **undecided** left operand — a name, a call, a
+            // comparison — the round-8 reading stands:
             //
             // - `ctor or x` — the construction is truthy, so `x` never
             //   evaluates and the result *is* the construction. Followed.
@@ -826,13 +889,38 @@ impl<'ctx, 'src> InstanceUses<'ctx, 'src> {
             //   on which the same colon call fails just as hard. Followed:
             //   there is no assignment of `x` under which the use is safe.
             // - `ctor and x` — the construction is truthy, so the result is
-            //   `x` and the construction is discarded. Not followed, which
-            //   falls out of following the right operand alone.
+            //   `x` and the construction is discarded. Not followed.
+            //
+            // With a **literal** left operand the answer is not a trade at
+            // all, it is Lua's evaluation order, and round 9 is where this
+            // pass started reading it. `false and ctor` never evaluates
+            // `ctor`: the result is the falsy left operand, and seeding the
+            // construction warned on a program in which it does not exist.
+            // `false or ctor` is the mirror miss — the construction *is* the
+            // value, and following the left operand alone never saw it. The
+            // shape both of those live in is the ternary
+            // `cond and ctor or other`, which parses as
+            // `(cond and ctor) or other`: [`truthiness`] folds the inner
+            // `and`, so a literal `cond` decides which of `ctor`/`other`
+            // flows out and the other side is not seeded. A `cond` that is a
+            // *name* is still not decided — that is the same bound the `if`
+            // guard carries, disclosed in
+            // `docs/03-reference/02-limitations.md`.
             //
             // Both operators truncate to exactly one value.
             Expr::Binary { op, lhs, rhs } if slot == 0 => match op {
-                BinOp::And => self.carriers_of(body_id, *rhs, 0),
-                BinOp::Or => self.carriers_of(body_id, *lhs, 0),
+                BinOp::And => match truthiness(body, *lhs) {
+                    // The right operand never evaluates; the result is the
+                    // falsy left one.
+                    Some(false) => self.carriers_of(body_id, *lhs, 0),
+                    Some(true) | None => self.carriers_of(body_id, *rhs, 0),
+                },
+                BinOp::Or => match truthiness(body, *lhs) {
+                    // The left operand cannot survive, so the result is the
+                    // right one whatever it turns out to be.
+                    Some(false) => self.carriers_of(body_id, *rhs, 0),
+                    Some(true) | None => self.carriers_of(body_id, *lhs, 0),
+                },
                 _ => Carrying::new(),
             },
             Expr::Call { .. } => {
@@ -941,6 +1029,31 @@ impl<'ctx, 'src> InstanceUses<'ctx, 'src> {
         }
     }
 
+    /// `local m = c.reset` — record that **`m`** holds the result of a method
+    /// read through `c`'s metatable, so a later `m(…)` is that lookup.
+    ///
+    /// With no `__index` the read yields `nil`, and calling `nil` fails
+    /// exactly as the inline `c.reset(c)` fails. The read on its own is
+    /// still not a use — `local r = c.reset; print(type(r))` performs the
+    /// lookup, gets `nil` and runs — which is why this records a *handle*
+    /// rather than a use, and [`Self::observed`] only counts it at a call.
+    ///
+    /// Only slot 0, because an index expression yields exactly one value.
+    fn seed_dot_handles(&mut self) {
+        let mut found: Vec<(ValueRef, BindingId)> = Vec::new();
+        for (body_id, target, value, slot) in &self.shapes.inits {
+            if *slot != 0 {
+                continue;
+            }
+            for carrier in self.dot_read(*body_id, *value) {
+                found.push((target.clone(), carrier));
+            }
+        }
+        for (target, carrier) in found {
+            self.dot_handles.entry(target).or_default().insert(carrier);
+        }
+    }
+
     /// A body that returns an instance is a factory for that carrier, in the
     /// slot it returns it in.
     ///
@@ -1044,7 +1157,8 @@ impl<'ctx, 'src> InstanceUses<'ctx, 'src> {
     ///
     /// Three shapes reach a method: a colon call on a derived value, a plain
     /// call on one whose `__call` runs a colon call on its own `self`, and
-    /// dot dispatch with an explicit self.
+    /// dot dispatch — written out at the call site (`c.m(c)`) or through a
+    /// name the read was bound to (`local m = c.reset; m(c)`).
     fn observed(&self) -> HashSet<BindingId> {
         let mut out = HashSet::new();
         for &(body_id, receiver, _) in &self.shapes.receivers {
@@ -1061,28 +1175,41 @@ impl<'ctx, 'src> InstanceUses<'ctx, 'src> {
                     out.insert(carrier);
                 }
             }
-            out.extend(self.dot_dispatched(body_id, callee));
+            // `c.m(c)` — the read is the callee.
+            out.extend(self.dot_read(body_id, callee));
+            // `local m = c.reset; m(c)` — the same read, one name back.
+            if let Some(value) = self.value_at(body_id, callee)
+                && let Some(carriers) = self.dot_handles.get(&value)
+            {
+                out.extend(carriers.iter().copied());
+            }
         }
         out
     }
 
-    /// `c.m(c)` — the explicit-self spelling of `c:m()`, and the same lookup.
+    /// `c.m` — a method read off a **derived value**, which is the lookup
+    /// `c:m()` performs written out longhand.
     ///
-    /// With no `__index`, `c.m` is `nil`, so the call fails with `attempt to
-    /// call a nil value (field 'm')` where the colon form says `method 'm'`:
-    /// one defect, two spellings, and Lua code writes both.
+    /// With no `__index`, `c.m` is `nil`, so a call of it fails with `attempt
+    /// to call a nil value (field 'm')` where the colon form says
+    /// `method 'm'`: one defect, two spellings, and Lua code writes both.
     ///
-    /// Two things keep this from counting more than it should. It is a
-    /// **call**, not a field access — `local r = c.reset` and
-    /// `print(type(c.reset))` perform the lookup, get `nil`, and run fine, so
-    /// only an [`Expr::Index`] in *callee* position is read. And the key must
-    /// name a function **attached to the carrier**: `c.m(…)` where `m` was
-    /// put in the instance's own table by the construction resolves without
-    /// the metatable, and a metafield (`c.__mode`) is not served by `__index`
-    /// at all.
-    fn dot_dispatched(&self, body_id: BodyId, callee: ExprId) -> Carrying {
+    /// This answers the *read*; both call sites that ask it supply the call.
+    /// `c.m(c)` asks with the callee expression itself, and
+    /// `local m = c.reset; m(c)` asks through [`Self::seed_dot_handles`],
+    /// which binds the answer to a name. Neither counts the read on its own:
+    /// `local r = c.reset` and `print(type(c.reset))` perform the lookup, get
+    /// `nil`, and run fine.
+    ///
+    /// The key must name a function **attached to the carrier**. `c.m(…)`
+    /// where `m` was put in the instance's own table by the construction
+    /// resolves without the metatable, a metafield (`c.__mode`) is not served
+    /// by `__index` at all, and a read off the *carrier* (`Cache.reset`) is a
+    /// plain table read no metatable serves — the base has to be a value
+    /// derived from a construction, which is what `carriers_of` asks.
+    fn dot_read(&self, body_id: BodyId, expr: ExprId) -> Carrying {
         let body = self.ctx.lowered.body(body_id);
-        let Expr::Index { base, index, .. } = body.expr(callee) else {
+        let Expr::Index { base, index, .. } = body.expr(expr) else {
             return Carrying::new();
         };
         let Some(key) = index_key(body.expr(*index)) else {
@@ -1305,24 +1432,46 @@ impl Shapes {
         }
     }
 
-    /// Collect the call sites in one block, **skipping blocks a literal
-    /// condition proves never run**.
+    /// Collect the call sites in one block, **skipping blocks the source
+    /// proves never run**.
     ///
     /// This is the only control-flow reasoning in the pass, and it is
-    /// deliberately the shallowest kind: a condition that *is* `false` or
-    /// `nil` in the source. `if false then c:reset() end` next to a
-    /// construction was a measured round-8 false positive, and it needs
-    /// nothing more than reading the literal to answer. A condition that is a
-    /// name, a comparison or a call is not decided — `local on = false; if on
-    /// then …` still counts, and that bound is disclosed in
+    /// deliberately the shallowest kind: everything it decides, it decides by
+    /// reading literals. `if false then c:reset() end` next to a construction
+    /// was a measured round-8 false positive, and it needs nothing more than
+    /// looking at the token to answer. A condition that is a name, a
+    /// comparison or a call is not decided — `local on = false; if on then …`
+    /// still counts, and that bound is disclosed in
     /// `docs/03-reference/02-limitations.md` beside the `__index`-write
     /// side's identical one.
     ///
-    /// `repeat` is the case worth naming: it tests *after* its body, so the
-    /// body always executes and no condition can prune it.
+    /// Four shapes are pruned, and they are pruned **symmetrically** — round
+    /// 9's finding was that only the first half of the first one was:
+    ///
+    /// - **`if`/`elseif`/`else`.** A literal-falsy arm's block is dead and
+    ///   the next arm is tested. A literal-**truthy** arm's block is the one
+    ///   that runs, and everything after it — the later `elseif`
+    ///   *conditions*, their blocks, and the `else` — is dead with it. Only
+    ///   the falsy half was read until round 9, so
+    ///   `if true then … else c:reset() end` counted a call no execution
+    ///   performs;
+    /// - **`while`.** A literal-falsy condition never enters the body.
+    ///   `repeat` is the case worth naming for not being here: it tests
+    ///   *after* its body, so the body always executes and no condition can
+    ///   prune it;
+    /// - **the numeric `for` header.** `for _ = 1, 0` and
+    ///   `for _ = 1, 10, -1` run zero times, which is the same literal
+    ///   question the `if` guard asks and is answered by [`numeric_for_runs`].
+    ///   A bound that is a name is not decided, exactly as a guard that is a
+    ///   name is not;
+    /// - **statements after one that leaves the block** ([`terminates`]).
+    ///   `do return end` is Lua's only spelling for an early return — a bare
+    ///   `return` must be the last statement of its block — and everything
+    ///   after it in the enclosing block is unreachable.
     fn walk_block(&mut self, body_id: BodyId, body: &Body, block: &Block) {
         for &stmt_id in &block.stmts {
-            match body.stmt(stmt_id) {
+            let stmt = body.stmt(stmt_id);
+            match stmt {
                 Stmt::Local { init, .. } => self.walk_exprs(body_id, body, init),
                 Stmt::Assign { targets, values } => {
                     self.walk_exprs(body_id, body, targets);
@@ -1333,15 +1482,34 @@ impl Shapes {
                     branches,
                     else_block,
                 } => {
+                    // Arms are tested in order and the first truthy one wins,
+                    // so both the walk and the stop are ordered too.
+                    let mut fell_through = true;
                     for branch in branches {
+                        // The condition itself is evaluated — a call written
+                        // in it is performed — but only while every arm above
+                        // it was falsy, which is why this sits inside the
+                        // loop that `break`s.
                         self.walk_expr(body_id, body, branch.cond);
-                        if !is_falsy_literal(body.expr(branch.cond)) {
-                            self.walk_block(body_id, body, &branch.block);
+                        match truthiness(body, branch.cond) {
+                            // Never taken: the block is dead, the next arm is
+                            // tested.
+                            Some(false) => {}
+                            // Always taken: nothing after it runs, including
+                            // the `else`.
+                            Some(true) => {
+                                self.walk_block(body_id, body, &branch.block);
+                                fell_through = false;
+                                break;
+                            }
+                            None => self.walk_block(body_id, body, &branch.block),
                         }
                     }
                     // The `else` of a literal-false `if` is the branch that
-                    // *does* run, so it is never pruned with the `then`.
-                    if let Some(block) = else_block {
+                    // *does* run, so it is never pruned with the `then`; the
+                    // `else` of a literal-true one is the branch that does
+                    // not, and until round 9 it was never pruned at all.
+                    if fell_through && let Some(block) = else_block {
                         self.walk_block(body_id, body, block);
                     }
                 }
@@ -1350,7 +1518,7 @@ impl Shapes {
                     body: loop_body,
                 } => {
                     self.walk_expr(body_id, body, *cond);
-                    if !is_falsy_literal(body.expr(*cond)) {
+                    if truthiness(body, *cond) != Some(false) {
                         self.walk_block(body_id, body, loop_body);
                     }
                 }
@@ -1368,12 +1536,16 @@ impl Shapes {
                     body: loop_body,
                     ..
                 } => {
+                    // The header's own expressions are evaluated whether or
+                    // not the loop takes a single iteration.
                     self.walk_expr(body_id, body, *start);
                     self.walk_expr(body_id, body, *end);
                     if let Some(step) = step {
                         self.walk_expr(body_id, body, *step);
                     }
-                    self.walk_block(body_id, body, loop_body);
+                    if numeric_for_runs(body, *start, *end, *step) {
+                        self.walk_block(body_id, body, loop_body);
+                    }
                 }
                 Stmt::GenericFor {
                     exprs,
@@ -1387,6 +1559,9 @@ impl Shapes {
                 Stmt::Return(values) => self.walk_exprs(body_id, body, values),
                 Stmt::LocalFunction { func, .. } => self.walk_expr(body_id, body, *func),
                 Stmt::Break | Stmt::Goto { .. } | Stmt::Label { .. } | Stmt::Error => {}
+            }
+            if terminates(body, stmt) {
+                break;
             }
         }
     }
@@ -1446,10 +1621,147 @@ impl Shapes {
     }
 }
 
-/// Whether an expression is a literal Lua treats as false — the only
-/// conditions [`Shapes::walk_block`] decides.
-fn is_falsy_literal(expr: &Expr) -> bool {
-    matches!(expr, Expr::Literal(Literal::Nil | Literal::Bool(false)))
+/// Whether an expression is one Lua will treat as true, as false, or one this
+/// pass declines to decide — the single question behind every prune in
+/// [`Shapes::walk_block`] and behind the `and`/`or` operand rule in
+/// [`InstanceUses::carriers_of`].
+///
+/// Only **literals** are decided. `nil` and `false` are falsy; every other
+/// literal — `true`, any number, any string, including a string whose escapes
+/// this pass could not decode — is truthy, because Lua's notion of truth has
+/// exactly two false values. A name, a call, a comparison, a table
+/// constructor and a function expression are all [`None`]: the last two are
+/// in fact always truthy, but nothing in this pass asks about them and a
+/// bound that is easy to state is worth more here than one extra shape.
+///
+/// `and` and `or` fold, which is what makes the ternary
+/// `cond and ctor or other` answerable: it parses as
+/// `(cond and ctor) or other`, so a literal `cond` decides the inner `and`,
+/// and the folded answer decides the `or`. Without the fold the `or` sees a
+/// [`Expr::Binary`] left operand, cannot read it, and follows it — straight
+/// back into the construction the ternary discards.
+///
+/// A `None` is never an assertion that the value is unknown at runtime; it is
+/// this pass declining. Both callers treat it as "not decided" and fall back
+/// to the conservative arm.
+fn truthiness(body: &Body, expr: ExprId) -> Option<bool> {
+    match body.expr(expr) {
+        Expr::Literal(Literal::Nil | Literal::Bool(false)) => Some(false),
+        Expr::Literal(_) => Some(true),
+        Expr::Truncate(inner) => truthiness(body, *inner),
+        Expr::Binary {
+            op: BinOp::And,
+            lhs,
+            rhs,
+        } => match truthiness(body, *lhs) {
+            // A truthy left operand hands the result to the right one; a
+            // falsy one *is* the result; an undecided one decides nothing.
+            Some(true) => truthiness(body, *rhs),
+            undecided_or_false => undecided_or_false,
+        },
+        Expr::Binary {
+            op: BinOp::Or,
+            lhs,
+            rhs,
+        } => match truthiness(body, *lhs) {
+            Some(false) => truthiness(body, *rhs),
+            undecided_or_true => undecided_or_true,
+        },
+        _ => None,
+    }
+}
+
+/// Whether a numeric `for` takes at least one iteration, as far as its
+/// *written* header says — `true` whenever this pass cannot tell.
+///
+/// Lua evaluates the three control expressions once and then loops while the
+/// variable has not passed the limit, in the direction the step points. So
+/// `for _ = 1, 0` and `for _ = 1, 10, -1` never enter the body, exactly as
+/// `if false then` never enters its block, and the question is the same
+/// literal one — which is what makes this prune symmetric with the branch
+/// prune rather than a new kind of reasoning.
+///
+/// Three things deliberately answer `true`:
+///
+/// - a bound or step that is not a literal number (`for _ = 1, n`). The same
+///   place the `if` guard stops, and disclosed with it;
+/// - a **zero** step. Lua 5.4 raises `'for' step is zero` when it evaluates
+///   the header, so the body does not run — but the program does not run
+///   either, and reporting the loop as dead code would be describing a
+///   program that never gets that far. Undecided is the honest answer;
+/// - a LuaJIT cdata or imaginary literal, which is not a 5.x loop bound.
+///
+/// Comparison is in `f64`, which is what Lua does when a float appears in the
+/// header. Two integer bounds far enough apart to lose their difference to
+/// rounding compare equal instead of ordered, and `start <= end` is the
+/// answer either way at that magnitude.
+fn numeric_for_runs(body: &Body, start: ExprId, end: ExprId, step: Option<ExprId>) -> bool {
+    let (Some(start), Some(end)) = (literal_number(body, start), literal_number(body, end)) else {
+        return true;
+    };
+    let step = match step {
+        None => 1.0,
+        Some(step) => match literal_number(body, step) {
+            Some(step) => step,
+            None => return true,
+        },
+    };
+    if step > 0.0 {
+        start <= end
+    } else if step < 0.0 {
+        start >= end
+    } else {
+        true
+    }
+}
+
+/// The numeric value of a literal loop bound, `-1` included: a negative step
+/// is a unary minus applied to a literal, not a literal of its own.
+fn literal_number(body: &Body, expr: ExprId) -> Option<f64> {
+    match body.expr(expr) {
+        Expr::Literal(Literal::Number(number)) => match *number {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "loop bounds are compared, not counted; see `numeric_for_runs`"
+            )]
+            Number::Int(value) => Some(value as f64),
+            Number::Float(value) => Some(value),
+            // LuaJIT cdata boxes and imaginaries are not 5.x loop bounds.
+            Number::I64(_) | Number::U64(_) | Number::Imaginary(_) => None,
+        },
+        Expr::Unary {
+            op: UnOp::Neg,
+            operand,
+        } => literal_number(body, *operand).map(|value| -value),
+        Expr::Truncate(inner) => literal_number(body, *inner),
+        _ => None,
+    }
+}
+
+/// Whether a statement always leaves the block it is written in, so that
+/// nothing written after it in that block can run.
+///
+/// `return` is the one that matters, and `do return end` is the only spelling
+/// Lua accepts for an early one — a bare `return` must be the last statement
+/// of its block, so "statements after a return" can only mean "statements
+/// after a `do` block that ends in one". That is why this recurses.
+///
+/// `break` counts too, for the block it is written in: it leaves the
+/// enclosing loop, so the rest of *that* block is unreachable. Only the
+/// current block is pruned, not the rest of the loop body around it — which
+/// under-prunes, the safe direction here.
+///
+/// `goto` is not here on purpose: a `goto` can jump to a label further down
+/// the same block, so what follows it may very well run.
+fn terminates(body: &Body, stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Return(_) | Stmt::Break => true,
+        Stmt::Do { body: inner } => inner
+            .stmts
+            .last()
+            .is_some_and(|&last| terminates(body, body.stmt(last))),
+        _ => false,
+    }
 }
 
 /// The literal string key of an index expression, or `None` when the key is

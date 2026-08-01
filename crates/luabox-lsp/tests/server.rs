@@ -24,7 +24,7 @@ use lsp_types::request::{
     FoldingRangeRequest, Formatting, GotoDefinition, GotoImplementation, GotoTypeDefinition,
     HoverRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting, References,
     RegisterCapability, Rename, Request as _, SelectionRangeRequest, SemanticTokensFullRequest,
-    Shutdown, SignatureHelpRequest, WorkspaceSymbolRequest,
+    Shutdown, SignatureHelpRequest, WorkDoneProgressCreate, WorkspaceSymbolRequest,
 };
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
@@ -128,11 +128,34 @@ impl TestClient {
         id
     }
 
+    /// Read one message, **answering `window/workDoneProgress/create` on the
+    /// way past** — which is what a real editor does, and what this harness
+    /// has to do now that an unanswered create mutes progress for the rest of
+    /// the session (round 9, B2: a create the server sends but does not wait
+    /// for is how a late refusal ended up reported under). A client that
+    /// never advertised the capability is sent no creates and sees no change,
+    /// which is every test here but one.
+    ///
+    /// The message is still returned, so a caller that was skipping past
+    /// creates goes on skipping past them.
     fn recv(&self) -> Message {
-        self.conn
+        let message = self
+            .conn
             .receiver
             .recv_timeout(Duration::from_secs(30))
-            .expect("server timed out")
+            .expect("server timed out");
+        if let Message::Request(request) = &message
+            && request.method == WorkDoneProgressCreate::METHOD
+        {
+            self.conn
+                .sender
+                .send(Message::Response(lsp_server::Response::new_ok(
+                    request.id.clone(),
+                    serde_json::Value::Null,
+                )))
+                .expect("the server is still reading");
+        }
+        message
     }
 
     /// Skip interleaved notifications until the response for `id` arrives.

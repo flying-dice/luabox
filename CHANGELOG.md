@@ -10,6 +10,79 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ### Fixed
 
+- **`LB0510` prunes dead code symmetrically, and its bounds are now a list
+  rather than a count.** The prune was one-sided in two places. It dropped the
+  `then` of a literal-false `if` and never the `else` of a literal-**true**
+  one, so `if true then … else c:reset() end` counted a call no execution
+  performs; and it read no loop header and no early return at all. Arms are
+  now walked in order and everything after the first literal-truthy one is
+  dead with it — later `elseif` conditions, their blocks, and the `else`. Two
+  more shapes are the same literal question and are answered with it: a
+  numeric `for` whose written header runs zero times (`for _ = 1, 0`,
+  `for _ = 1, 10, -1`) and statements after one that leaves the block
+  (`do return end`, `break`). A zero step is deliberately not decided: Lua
+  raises `'for' step is zero` evaluating the header, and a program that never
+  gets that far is not dead code.
+
+  Separately, the ternary. `cond and ctor or other` parses as
+  `(cond and ctor) or other`, and `and` seeded its right operand
+  unconditionally — no literal was consulted on that path at all — so a
+  literal-false `cond`, under which Lua never evaluates the construction,
+  still seeded it. Truthiness is now read where the source writes it out, and
+  folds through nested `and`/`or`, which is what makes the ternary answerable:
+  `false and ctor` is the falsy left operand, `false or ctor` *is* the
+  construction (a closed false negative), and a literal `cond` selects one of
+  `ctor`/`other`. An undecided `cond` still seeds the `ctor` side, the same
+  trade `x and ctor` already took.
+
+  One more miss closed: `local m = c.reset; m(c)` is `c.reset(c)` with a name
+  in between — the read goes through the missing `__index`, yields `nil`, and
+  the call fails. The read alone is still not a use, and a read off the
+  *carrier* is a plain table read no metatable serves.
+
+  Four false positives and one false negative are **disclosed rather than
+  fixed**, each with a matrix twin: flow-insensitive derivation (`c`
+  reassigned before use), two `setmetatable` calls on one table (the second
+  replaces it, so the superseded site is a finding against a lookup that
+  works), the insert-last-wins name-to-body map in both directions, and a
+  guard that is a name rather than a literal — in its `if`, ternary and
+  numeric-`for` spellings. Deciding any of them needs constant propagation,
+  and a partial one that decided `and`/`or` but not `if` would be worse than
+  none.
+
+  [LIMITATIONS](docs/03-reference/02-limitations.md) loses "one approximation
+  remains" — the claim four consecutive review rounds found overclaiming — for
+  an enumerated, two-direction bounds section written against the code and
+  then checked back against it. The shape matrix grew from 94 programs to 119.
+
+- **The language server no longer exits 1 when a session ends during the
+  *second* progress-create window.** The previous round's fix aborted the wait
+  on a `shutdown` or `exit`, which is right but not sufficient: `run` opens
+  two create windows before the message loop (the startup rock harvest, then
+  the workspace index), and a queued config reload opens more from inside it.
+  Window 1 aborted on the `shutdown` and correctly left the `exit` on the
+  channel; window 2 then drained that `exit` onto the pending queue, and the
+  shutdown handshake read an empty channel for 30 s before failing — the same
+  wait-then-exit-1 the round before had closed, reached by one more window.
+
+  A session-ender is now **sticky**: the next create is not sent at all, so no
+  window opens, and nothing is announced to a client that has asked to leave
+  (the abort path used to return the token, so a shutting-down client still
+  received `begin`/`report`/`end` plus another create). The shutdown handshake
+  is the server's own, looking in the pending queue before the channel and
+  answering a repeated `shutdown` instead of failing the session on it. The
+  30 s bound is unchanged.
+
+- **A `window/workDoneProgress/create` the server will not wait for is no
+  longer sent.** After one create went unanswered the server skipped the
+  *wait* on the next but still sent it, so a client's late error answer landed
+  in the message loop's discard arm and `$/progress` went out under a token it
+  had just refused — the never-answers optimisation stepped around the refusal
+  check the whole mechanism exists for. One timeout now mutes progress for the
+  session: no further create is sent, so there is no token to report under and
+  no traffic to a client that is not listening. The token that timed out keeps
+  the degraded path, which is the behaviour this mechanism replaced.
+
 - **`LB0510` counts uses where the file can *reach* them.** The previous round
   closed the reported instances and left the mechanism, so the same defect
   came back in new shapes. `observed()` iterated receivers across every body
