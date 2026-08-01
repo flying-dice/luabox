@@ -452,3 +452,239 @@ return use
 ";
     assert_eq!(codes(src), vec!["LB0306"]);
 }
+
+// ---------------------------------------------------------------------------
+// Per-declaration type-parameter scoping (#49 follow-up).
+//
+// Each declaration's `---@field` bodies are lowered against *its own* `<...>`
+// parameter list; the templates are then unified **positionally** when they
+// merge, so declaration 2's slot-0 parameter becomes declaration 1's slot-0
+// name in the merged template. Before this, the first non-empty parameter
+// list was handed to every declaration of the name, so a duplicate that
+// renamed the parameter had its own field bodies resolved against names that
+// were not in scope for it (LB0305 on the user's own, valid annotation).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_duplicate_that_renames_the_parameter_lowers_its_own_fields() {
+    // Both declarations carry field bodies under *different* parameter names.
+    // luals accepts this: `U` is in scope for the second declaration because
+    // the second declaration is the one that declares it.
+    let src = "\
+---@class Boxed<T>
+---@field value T
+
+---@class Boxed<U>
+---@field other U
+
+---@param b Boxed<string>
+local function use(b) return b.value end
+return use
+";
+    assert_eq!(codes(src), none());
+}
+
+#[test]
+fn a_bare_first_declaration_does_not_capture_a_later_declarations_parameter() {
+    // The canonical parameter list comes from the first *non-empty*
+    // declaration (`<U>`), but the second declaration's field body is written
+    // against `<T>` — its own list — and must lower against that.
+    let src = "\
+---@class Boxed<U>
+
+---@class Boxed<T>
+---@field value T
+return 1
+";
+    assert_eq!(codes(src), none());
+}
+
+#[test]
+fn a_renamed_duplicates_field_monomorphises_through_the_canonical_parameter() {
+    // The functional half: both declarations' fields have to *substitute*,
+    // not merely lower without complaint. `Boxed<string>` makes `value` and
+    // `other` both `string`, whichever declaration contributed them.
+    let src = "\
+---@class Boxed<T>
+---@field value T
+
+---@class Boxed<U>
+---@field other U
+
+---@param s string
+local function want(s) end
+---@param b Boxed<string>
+local function use(b) want(b.value) want(b.other) end
+return use
+";
+    assert_eq!(codes(src), none());
+}
+
+#[test]
+fn a_renamed_duplicates_field_still_reports_a_mismatch_after_substitution() {
+    // The negative direction of the previous test: `other` is the second
+    // declaration's `U`, mapped to canonical slot 0, so `Boxed<string>` types
+    // it `string` — passing it where a `number` is wanted is LB0300.
+    let src = "\
+---@class Boxed<T>
+---@field value T
+
+---@class Boxed<U>
+---@field other U
+
+---@param n number
+local function want(n) end
+---@param b Boxed<string>
+local function bad(b) want(b.other) end
+return bad
+";
+    let diags = check(src);
+    assert_eq!(
+        diags.iter().map(|d| d.code.to_string()).collect::<Vec<_>>(),
+        vec!["LB0300"]
+    );
+    assert!(
+        diags[0].message.contains("found `string`"),
+        "the renamed parameter must monomorphise to the type argument, got: {}",
+        diags[0].message
+    );
+}
+
+#[test]
+fn a_lone_declaration_with_any_parameter_name_is_clean() {
+    // Control: nothing about the merge is involved, so `<U>` alone works.
+    let src = "\
+---@class Boxed<U>
+---@field other U
+
+---@param s string
+local function want(s) end
+---@param b Boxed<string>
+local function use(b) want(b.other) end
+return use
+";
+    assert_eq!(codes(src), none());
+}
+
+#[test]
+fn two_declarations_sharing_a_parameter_name_stay_clean() {
+    // Control: the shape that already worked keeps working.
+    let src = "\
+---@class Boxed<T>
+---@field value T
+
+---@class Boxed<T>
+---@field other T
+
+---@param s string
+local function want(s) end
+---@param b Boxed<string>
+local function use(b) want(b.value) want(b.other) end
+return use
+";
+    assert_eq!(codes(src), none());
+}
+
+#[test]
+fn three_declarations_each_rename_the_parameter_independently() {
+    // Neighborhood: the positional unification is not a two-declaration
+    // special case.
+    let src = "\
+---@class Tri<A>
+---@field a A
+
+---@class Tri<B>
+---@field b B
+
+---@class Tri<C>
+---@field c C
+
+---@param s string
+local function want(s) end
+---@param t Tri<string>
+local function use(t) want(t.a) want(t.b) want(t.c) end
+return use
+";
+    assert_eq!(codes(src), none());
+}
+
+#[test]
+fn a_bare_declaration_between_two_renamed_ones_contributes_nothing_and_breaks_nothing() {
+    let src = "\
+---@class Mid<T>
+---@field first T
+
+---@class Mid
+
+---@class Mid<U>
+---@field second U
+
+---@param s string
+local function want(s) end
+---@param m Mid<string>
+local function use(m) want(m.first) want(m.second) end
+return use
+";
+    assert_eq!(codes(src), none());
+}
+
+#[test]
+fn a_duplicate_declaring_more_parameters_keeps_the_canonical_arity() {
+    // Parameter counts follow the same first-wins rule as the names: the
+    // canonical list is `<T>`, so `Mixed<string>` is arity-correct and the
+    // second declaration's slot-0 `A` maps onto `T`. Its *surplus* `B` has no
+    // canonical slot to map to and stays lenient (`unknown`), the same
+    // leniency a bare generic reference gets.
+    let src = "\
+---@class Mixed<T>
+---@field first T
+
+---@class Mixed<A, B>
+---@field second A
+---@field spare B
+
+---@param s string
+local function want(s) end
+---@param m Mixed<string>
+local function use(m) want(m.first) want(m.second) end
+return use
+";
+    assert_eq!(codes(src), none());
+}
+
+#[test]
+fn a_duplicate_declaring_fewer_parameters_lowers_against_its_own_list() {
+    let src = "\
+---@class Fewer<K, V>
+---@field key K
+---@field value V
+
+---@class Fewer<X>
+---@field extra X
+
+---@param s string
+local function want(s) end
+---@param n number
+local function wantn(n) end
+---@param f Fewer<string, number>
+local function use(f) want(f.key) wantn(f.value) want(f.extra) end
+return use
+";
+    assert_eq!(codes(src), none());
+}
+
+#[test]
+fn a_declaration_referring_to_another_declarations_parameter_is_still_unknown() {
+    // The scoping cuts both ways: `T` belongs to the first declaration only,
+    // so the second declaration naming it is a genuine LB0305 — exactly what
+    // luals reports.
+    let src = "\
+---@class Scoped<T>
+---@field first T
+
+---@class Scoped<U>
+---@field second T
+return 1
+";
+    assert_eq!(codes(src), vec!["LB0305"]);
+}

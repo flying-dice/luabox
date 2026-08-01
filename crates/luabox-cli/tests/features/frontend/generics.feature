@@ -357,3 +357,97 @@ Feature: luabox check — generic annotations
     When I run "luabox check"
     Then the command fails
     And stdout contains "LB0300"
+
+  Scenario: two declarations of a generic class may name the type parameter differently
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Boxed<T>
+      ---@field value T
+
+      ---@class Boxed<U>
+      ---@field other U
+
+      ---@param b Boxed<string>
+      local function use(b) return b.value end
+      return use
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And zero diagnostics are reported
+
+  Scenario: a bare first declaration does not rebind a later declaration's parameter
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Boxed<U>
+
+      ---@class Boxed<T>
+      ---@field value T
+      return 1
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And zero diagnostics are reported
+
+  Scenario: a renamed duplicate's field monomorphises through the canonical parameter
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Boxed<T>
+      ---@field value T
+
+      ---@class Boxed<U>
+      ---@field other U
+
+      ---@param n number
+      local function want(n) end
+      ---@param b Boxed<string>
+      local function bad(b) want(b.other) end
+      return bad
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0300"
+    And stdout contains "found `string`"
+
+  Scenario: a declaration naming another declaration's type parameter is still unknown
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Scoped<T>
+      ---@field first T
+
+      ---@class Scoped<U>
+      ---@field second T
+      return 1
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0305"
+    And stdout contains "unknown type name `T`"
+
+  Scenario: a renamed duplicate is merged across the require boundary too
+    Given a strict project with edition "5.4"
+    And a file "src/shapes.lua" containing:
+      """
+      ---@class Boxed<T>
+      ---@field value T
+
+      ---@class Boxed<U>
+      ---@field other U
+      return {}
+      """
+    And a file "src/main.lua" containing:
+      """
+      require("shapes")
+
+      ---@param s string
+      local function want(s) end
+      ---@param b Boxed<string>
+      local function use(b) want(b.value) want(b.other) end
+      return use
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And zero diagnostics are reported
