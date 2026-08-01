@@ -10,13 +10,18 @@
 //!    effective build config: flags override `[build]`, which defaults the
 //!    target to the edition and the out dir to `dist`.
 //! 2. **Check first** — the same per-file gate as `luabox check` (parse +
-//!    *edition* dialect legality + typecheck). Build refuses to emit while
-//!    check reports errors. Target-dialect legality is deliberately *not*
-//!    part of this gate: constructs illegal on the target are exactly what
-//!    lowering exists to handle. What lowering *cannot* handle is caught
-//!    downstream instead, by the residual validation of each lowered file
-//!    (`lower_one`) — parse, dialect legality, and control-flow legality of
-//!    the output under the target.
+//!    *edition* dialect legality + typecheck), plus the *ship target's*
+//!    control-flow legality pass over the source (`check_gate`,
+//!    `TargetPasses::control_flow_only`). Build refuses to emit while check
+//!    reports errors. The target's *dialect* legality is deliberately not
+//!    part of this gate: constructs the target's parser rejects are exactly
+//!    what lowering exists to rewrite. Its *loader* verdict is, because
+//!    nothing lowers a duplicate label away. What lowering cannot handle —
+//!    and what lowering itself introduces — is caught downstream by the
+//!    residual validation of each lowered file: `lower_one` here for tree
+//!    mode, and its twin in `luabox_bundle::load_module` for the three
+//!    bundle-shaped emits. Both run parse, dialect legality and control-flow
+//!    legality of the output under the target.
 //! 3. **Emit**, one of two shapes:
 //!    - **Tree mode** (`bundle = false`, `mode = plain`): every `.lua` file
 //!      is lowered `edition → target` and written under `out`, mirroring the
@@ -357,13 +362,50 @@ fn lower_one(
                 )));
             }
             // Control-flow legality of the *output* under the target (#44,
-            // Shockwave round 2). The check gate deliberately runs edition
-            // legality only — lowering is what handles constructs the target
-            // rejects — but nothing lowers a duplicate label away, and the
-            // duplicate-label scope tightened in 5.4
-            // (`luabox_hir::validate::repeated_label_scope`). Without this, a
-            // 5.2 project shipping `::a:: do ::a:: end` to 5.4 emitted a file
-            // `luac5.4 -p` refuses to load, and `build` exited 0.
+            // Shockwave round 2). Since round 4 the check gate runs the ship
+            // target's control-flow pass against the *source* as well (see
+            // `check_gate`), so the original motivating case — a 5.2 project
+            // shipping `::a:: do ::a:: end` to 5.4 — is now refused up front,
+            // with a span and a "first defined here" label. This arm is what
+            // stays behind it.
+            //
+            // Its primary service is a finding *lowering itself introduces*,
+            // which no source-level gate can see by construction. Shipping
+            //
+            //     do
+            //       goto skip
+            //       local h <close> = setmetatable({}, {…})
+            //       ::skip::
+            //     end
+            //
+            // to target 5.3 is legal 5.4 source and passes the gate; lowering
+            // wraps the `<close>` scope tail in a pcall'd function, which puts
+            // a function boundary between the `goto` and its label, and this
+            // arm reports the resulting `LB0020` with the lowered-output note,
+            // exit 1, nothing written. Spanless is honest there: the boundary
+            // the finding is about does not exist in the file on disk.
+            //
+            // Three further paths reach these residual arms with findings that
+            // *are* source-level, reported spanless because the arms cannot
+            // tell the two apart. None of them emits an artifact, so this is a
+            // diagnostic-quality gap, not a correctness one:
+            //
+            //   1. any module under `lua_modules/` — `collect_lua_files`
+            //      prunes the vendored rock tree, `resolve_candidates` searches
+            //      it, so the bundler lowers dependency sources the gate never
+            //      checked (this lands in the bundle-path twin in
+            //      `luabox_bundle::load_module`, not here). The realistic one.
+            //   2. `--out` pointed at a directory that holds sources: the out
+            //      dir is excluded from `collect_lua_files`, so the gate checks
+            //      zero files while a bundle entry under it still lowers.
+            //   3. `LB0014`/`LB0015`/`LB0016` in tree mode: the gate runs the
+            //      target's *control-flow* pass only, by design, so a `\u{…}`
+            //      escape shipped to 5.1 is silent in `check` and lands here.
+            //
+            // (1) and (2) are two faces of one design question — `check` and
+            // `build` disagree about which files are in the project — and
+            // aligning the gate's file set with the bundler's is the owner's
+            // call, not a comment's.
             //
             // Spans are dropped for the same reason the residual findings
             // above drop them: their ranges index the lowered text, and the

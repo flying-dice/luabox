@@ -128,7 +128,9 @@ enum Command {
     },
     /// Typecheck the project
     Check {
-        /// Also validate dialect legality against a ship target
+        /// Validate against a ship target on both axes — dialect legality and
+        /// loader (control-flow) legality; `[build] target` already drives the
+        /// loader half, and this overrides it
         #[arg(long)]
         target: Option<String>,
         /// Output format
