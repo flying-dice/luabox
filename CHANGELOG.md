@@ -10,6 +10,27 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ### Fixed
 
+- **`LB0510` fires again on the canonical carrier class.** The previous
+  round's two false-positive fixes each over-reached, and between them they
+  silenced the shape `metatable-without-index` exists for. A single
+  `function Counter.__tostring(c)` line beside a colon method disabled the
+  rule, so the idiomatic Vector2 tutorial class — a dot constructor,
+  `:length()`, `__tostring`, `__add` — crashed on `v:length()` in silence;
+  and a bare `local mt = Counter` with nothing written through it disabled it
+  too, as did an alias inside a dead branch or an unrelated nested function.
+  Re-measured against `lua5.4` over a 32-shape matrix: 19 shapes crash at
+  runtime, the rule fired on 5.
+
+  Another metafield now buys silence only on a carrier with **no instance
+  methods** — a colon-declared `function C:m()` is what instance lookup, and
+  so `__index`, is needed for — and an alias suppresses only when something
+  is actually written *through* it, with carrier identity propagated along
+  alias chains so a write through any link counts. After: 17 of the 19
+  crashing shapes are reported, with zero false positives across the 13 that
+  run clean. The two that stay quiet are the documented conservative bounds
+  (a write in a dead branch or a never-called function), consistent with the
+  same writes made directly on the carrier.
+
 - **Every bundle mode refused to notice a chunk the ship target cannot
   load.** `luabox build`'s residual control-flow validation lived on the
   tree-mode path only; `bundle = true`, `mode = "love"` and
@@ -224,6 +245,35 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ### Internal (contributors)
 
+- **Work-done progress is gated on the client, and the startup pause has a
+  token.** `window.workDoneProgress` was read once and handed to the
+  bootstrap index alone, so the config reload announced itself to clients
+  that never advertised the capability; the flag now lives on the server and
+  gates every `$/progress` it sends. The synchronous startup rock harvest —
+  a stretch of protocol silence a client could not attribute to anything —
+  is now wrapped in its own token, which required running it after the
+  `Server` is constructed so it can reach the same helper the reload uses.
+  The two tokens carry distinct ids so the pauses are distinguishable.
+
+- **Three stale claims in comments and help text now match the code.**
+  `build`'s residual-validation comment said the check gate runs edition
+  legality only (it has also run the ship target's control-flow pass since
+  the previous round) and implied the residual arms were unreachable; it now
+  describes what they actually serve — a finding *lowering itself*
+  introduces, plus three enumerated paths the gate cannot see (a module under
+  `lua_modules/`, `--out` pointed at a source directory, and `LB0014`/`15`/`16`
+  in tree mode), none of which writes an artifact. `build`'s module doc gains
+  the same correction and names the bundle-path twin. `check --help`'s
+  `--target` no longer says "*also* validate dialect legality": the manifest
+  target drives the control-flow axis with no flag, and the flag asks both.
+  `SPEC.md` §5 states which passes `[build] target` drives per command.
+
+- **The rendered diagnostic stream is source-ordered across legality axes.**
+  Dialect legality and control-flow legality were each sorted and then
+  concatenated in pass order, so an `LB0021` at line 13 could render after an
+  `LB0013` at line 29. They are now sorted together, with a stable tie-break
+  that keeps the parser's verdict ahead of the loader's at the same span.
+
 - **The language server's startup number is reproducible.**
   `scripts/lsp-startup-bench.sh` (plus its stdio client
   `scripts/lsp-startup-bench.py` and `gen-corpus --rock-tree`) regenerates the
@@ -301,14 +351,16 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   measurement end to end: it generates the corpus (`gen-corpus --rock-tree`:
   50 files, 102,813 lines of `---@class` Lua under
   `lua_modules/share/lua/5.4/`), drives the real stdio protocol, and times
-  `initialize` to the **first** `publishDiagnostics`. On a 4 vCPU box, 7 runs
-  each: **2751 ms → 760 ms median** (2673 ms → 718 ms min), 3.6x. The
-  baseline is the same binary forced to one rayon worker, not a pre-fix
-  build, so the comparison is of the parallelism and of nothing else in a
-  commit range. The same project with no rock tree publishes in 11 ms, so the
-  harvest is effectively the whole wait. The ratio is host-dependent; the
-  harness, not the constant, is what makes the claim checkable. The single
-  source for the numbers is the code comment at `harvest_rock_tree`.
+  `initialize` to the **first** `publishDiagnostics`. On one 4 vCPU
+  virtualized box, 7 runs each: **2751 ms → 760 ms median** (2673 ms → 718 ms
+  min), 3.6x. The baseline is the same binary forced to one rayon worker, not
+  a pre-fix build, so the comparison is of the parallelism and of nothing else
+  in a commit range. The same project with no rock tree publishes in 11 ms, so
+  the harvest is effectively the whole wait. The sequential row is single-host
+  and steal-sensitive — an independent 4 vCPU box did not reproduce it — so
+  the harness, not the constant, is what makes the claim checkable. The single
+  source for the numbers, and for the host they were taken on, is the code
+  comment at `harvest_rock_tree`.
 
 ## [0.2.0] - 2026-07-29
 

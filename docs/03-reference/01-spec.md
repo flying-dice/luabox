@@ -126,6 +126,15 @@ defs = ["love2d"]           # ambient definition packages
 pedantic = "warn"           # tier/rule levels: allow | warn | deny
 ```
 
+- `[build] target` is read by more than `build`, and which passes it drives
+  depends on the command. `luabox check` runs the target's **control-flow
+  (loader) legality** pass only — a program the target's loader refuses is an
+  error even where nothing is being emitted. `luabox build` runs that same pass
+  as its emit gate, then **lowering** plus the residual validation of each
+  lowered file. `--target` on either command overrides the manifest value *and*
+  additionally turns on the target's **dialect legality** pass, which the
+  manifest value alone deliberately does not: on the `build` path, constructs
+  the target's parser rejects are exactly what lowering exists to rewrite.
 - Every table above is live in v1. `[tasks]` and `[workspace]` were dropped
   in 0.2.0 (#18): they only ever served the removed `run` command and the
   parked solver, so they now get the standard unknown-table error (with the

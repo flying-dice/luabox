@@ -1070,6 +1070,337 @@ fn the_note_does_not_assert_a_crash_that_no_call_site_makes() {
     );
 }
 
+// --- LB0510 shape matrix: the wave-15 over-suppression, closed ------------
+//
+// Wave 15's two false-positive fixes each over-reached, and the canonical
+// carrier program went silent (Shockwave round 5). Every fixture below was
+// run under `lua5.4` (5.4.6) before being written down; the doc comment
+// records what the interpreter actually printed, and the assertion direction
+// follows it. Two crashing shapes are deliberately *not* reported — they are
+// the documented conservative bounds, marked as such.
+
+/// Regression A. A carrier that declares another metafield **and** colon
+/// methods is a class that overloads an operator, not an operator table:
+/// `c:value()` is `attempt to call a nil value (method 'value')` under
+/// `lua5.4` for every metafield below, `__name` included (it only decorates
+/// error messages). Wave 15 silenced all of them.
+#[test]
+fn a_metafield_alongside_a_colon_method_still_fires() {
+    for decl in [
+        "function Counter.__tostring(c) return \"c\" end",
+        "function Counter.__call(c) return 1 end",
+        "function Counter.__eq(a, b) return true end",
+        "function Counter.__add(a, b) return 1 end",
+        "function Counter.__gc(c) end",
+        "Counter.__name = \"Counter\"",
+        "Counter.__mode = \"k\"",
+    ] {
+        let src = format!(
+            "\
+---@class Counter
+---@field n integer
+local Counter = {{}}
+
+{decl}
+
+function Counter:value()
+  return self.n
+end
+
+local c = setmetatable({{ n = 1 }}, Counter)
+return c:value()
+"
+        );
+        assert!(
+            has(&src, &LintConfig::new(), "LB0510"),
+            "silent on `{decl}`"
+        );
+    }
+}
+
+/// The idiomatic Vector2 tutorial class: a dot constructor, a colon method
+/// and two metafields. `v:length()` crashes under `lua5.4`; wave 15 was
+/// silent on it. The dot-declared `Vec.new` is *not* what makes it fire —
+/// the colon-declared `Vec:length` is.
+#[test]
+fn the_vector2_tutorial_class_fires() {
+    let src = "\
+---@class Vec2
+---@field x number
+---@field y number
+local Vec = {}
+
+function Vec.new(x, y)
+  return setmetatable({ x = x, y = y }, Vec)
+end
+
+function Vec:length()
+  return math.sqrt(self.x * self.x + self.y * self.y)
+end
+
+function Vec.__tostring(v)
+  return \"(\" .. v.x .. \", \" .. v.y .. \")\"
+end
+
+function Vec.__add(a, b)
+  return Vec.new(a.x + b.x, a.y + b.y)
+end
+
+local v = Vec.new(3, 4)
+return v:length()
+";
+    assert!(has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// The discriminator, both directions in one fixture pair: the metafield-only
+/// carrier above stays silent, and the *same* carrier plus one colon method
+/// fires. `a_carrier_declaring_only_another_metafield_is_silent` pins the
+/// first half; this pins that the second half is what changed.
+#[test]
+fn one_colon_method_is_the_difference_between_operator_table_and_class() {
+    let carrier = "\
+---@class Vec
+local Vec = {}
+function Vec.__tostring(v) return \"v\" end
+";
+    let operator_table = format!("{carrier}local v = setmetatable({{}}, Vec)\nreturn v\n");
+    let class = format!(
+        "{carrier}function Vec:length() return 0 end
+local v = setmetatable({{}}, Vec)
+return v:length()
+"
+    );
+    assert!(!has(&operator_table, &LintConfig::new(), "LB0510"));
+    assert!(has(&class, &LintConfig::new(), "LB0510"));
+}
+
+/// A metafield spelled with a colon is still a metafield, not an instance
+/// method — `function Vec:__call()` takes `self` implicitly but is reached
+/// through the metatable, never through `__index`. The program runs fine.
+#[test]
+fn a_colon_declared_metafield_is_not_an_instance_method() {
+    let src = "\
+---@class Vec
+local Vec = {}
+function Vec:__call() return 1 end
+local v = setmetatable({}, Vec)
+return v
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// Regression B. `local mt = Counter` with **no write through it** settles
+/// nothing: the program still crashes and the rule must still fire. Wave 15
+/// settled on the alias binding itself, so a bare alias disabled the rule.
+#[test]
+fn a_bare_alias_with_no_write_still_fires() {
+    let src = "\
+---@class Counter
+---@field n integer
+local Counter = {}
+local mt = Counter
+print(type(mt))
+function Counter:value() return self.n end
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+    assert!(has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// …and neither does an alias *chain* with no write anywhere along it.
+#[test]
+fn an_alias_chain_with_no_write_still_fires() {
+    let src = "\
+---@class Counter
+---@field n integer
+local Counter = {}
+local a = Counter
+local b = a
+print(type(b))
+function Counter:value() return self.n end
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+    assert!(has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// A write through an alias of a *plain* key is a plain-key write: `mt.n = 1`
+/// wires nothing up, and the program crashes.
+#[test]
+fn an_alias_write_of_a_plain_key_still_fires() {
+    let src = "\
+---@class Counter
+---@field n integer
+local Counter = {}
+local mt = Counter
+mt.n = 1
+function Counter:value() return self.n end
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+    assert!(has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// An alias chain whose *last* link takes the `__index` write still wires the
+/// carrier up — `b` and `Counter` are the same table. The program runs.
+#[test]
+fn an_alias_chain_with_a_terminal_index_write_is_silent() {
+    let src = "\
+---@class Counter
+---@field n integer
+local Counter = {}
+local a = Counter
+local b = a
+b.__index = b
+function Counter:value() return self.n end
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// An unreadable key through an alias reads exactly like an unreadable key on
+/// the carrier: it might be `__index`, so the rule stays quiet.
+#[test]
+fn an_alias_write_of_a_computed_key_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+local mt = Counter
+local k = \"__index\"
+mt[k] = mt
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// A metafield written through an alias classifies the *carrier*, and the
+/// no-instance-methods discriminator applies there too — so the same pair as
+/// above, one line apart.
+#[test]
+fn a_metafield_through_an_alias_follows_the_same_discriminator() {
+    let operator_table = "\
+---@class Vec
+local Vec = {}
+local mt = Vec
+function mt.__tostring(v) return \"v\" end
+local v = setmetatable({}, Vec)
+return v
+";
+    let class = "\
+---@class Counter
+---@field n integer
+local Counter = {}
+local mt = Counter
+function mt.__tostring(c) return \"c\" end
+function Counter:value() return self.n end
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+    assert!(!has(operator_table, &LintConfig::new(), "LB0510"));
+    assert!(has(class, &LintConfig::new(), "LB0510"));
+}
+
+/// A documented conservative bound. `if false then … end` never runs, so the
+/// program crashes — but this pass has no reachability analysis, and a direct
+/// `Counter.__index = Counter` in the same dead branch is silent for the same
+/// reason. Suppressing through the alias keeps the two consistent.
+#[test]
+fn an_alias_in_a_dead_branch_is_silent_like_a_direct_write() {
+    let through_alias = "\
+---@class Counter
+local Counter = {}
+if false then
+  local mt = Counter
+  mt.__index = mt
+end
+function Counter:value() return self.n end
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+    let direct = "\
+---@class Counter
+local Counter = {}
+if false then
+  Counter.__index = Counter
+end
+function Counter:value() return self.n end
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+    assert!(!has(through_alias, &LintConfig::new(), "LB0510"));
+    assert!(!has(direct, &LintConfig::new(), "LB0510"));
+}
+
+/// The same bound for a function that is never called.
+#[test]
+fn an_alias_inside_a_never_called_function_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+local function wire()
+  local mt = Counter
+  mt.__index = mt
+end
+function Counter:value() return self.n end
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// Reassigning an *alias* rebinds a name; it does not touch the carrier's
+/// table, so it must not settle the carrier on its own.
+#[test]
+fn reassigning_an_alias_does_not_settle_the_carrier() {
+    let src = "\
+---@class Counter
+local Counter = {}
+local mt = Counter
+mt = {}
+function Counter:value() return self.n end
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+    assert!(has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// Both inheritance shapes still fire: the base is wired, the derived carrier
+/// is not, and `d:value()` crashes under `lua5.4` in each.
+#[test]
+fn both_inheritance_shapes_still_fire() {
+    let via_setmetatable_of_class = "\
+---@class Base
+local Base = {}
+Base.__index = Base
+function Base:name() return \"base\" end
+
+---@class Derived
+local Derived = setmetatable({}, Base)
+function Derived:value() return 1 end
+
+local d = setmetatable({}, Derived)
+return d:value()
+";
+    let index_to_base_only = "\
+---@class Base
+local Base = {}
+Base.__index = Base
+function Base:name() return \"base\" end
+
+---@class Derived
+local Derived = {}
+setmetatable(Derived, { __index = Base })
+function Derived:value() return 1 end
+
+local d = setmetatable({}, Derived)
+return d:value()
+";
+    assert!(has(via_setmetatable_of_class, &LintConfig::new(), "LB0510"));
+    assert!(has(index_to_base_only, &LintConfig::new(), "LB0510"));
+}
+
 // --- suppression / malformed-ignore (LB0500) -------------------------------
 
 #[test]

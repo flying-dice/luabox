@@ -40,11 +40,11 @@ use lsp_types::{
     GotoDefinitionParams, GotoDefinitionResponse, HoverContents, HoverParams, InitializeParams,
     InlayHint, InlayHintLabel, InlayHintParams, NumberOrString, ParameterLabel,
     PartialResultParams, Position, PrepareRenameResponse, ProgressParams, ProgressParamsValue,
-    PublishDiagnosticsParams, Range, ReferenceContext, ReferenceParams, RegistrationParams,
-    RenameParams, SelectionRange, SelectionRangeParams, SemanticToken, SemanticTokensParams,
-    SemanticTokensResult, SignatureHelp, SignatureHelpParams, SymbolInformation, SymbolKind,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, TextEdit, Uri, VersionedTextDocumentIdentifier,
+    ProgressToken, PublishDiagnosticsParams, Range, ReferenceContext, ReferenceParams,
+    RegistrationParams, RenameParams, SelectionRange, SelectionRangeParams, SemanticToken,
+    SemanticTokensParams, SemanticTokensResult, SignatureHelp, SignatureHelpParams,
+    SymbolInformation, SymbolKind, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, TextEdit, Uri, VersionedTextDocumentIdentifier,
     WindowClientCapabilities, WorkDoneProgress, WorkDoneProgressParams,
     WorkspaceClientCapabilities, WorkspaceEdit, WorkspaceFolder, WorkspaceSymbolParams,
     WorkspaceSymbolResponse,
@@ -286,9 +286,40 @@ impl TestClient {
         });
     }
 
+    /// How many `$/progress` notifications arrive before the response to a
+    /// freshly issued request.
+    ///
+    /// The wire is ordered, so everything the server emitted during startup is
+    /// already queued ahead of that response: an answer of zero is conclusive
+    /// rather than a race with a server that had not got round to it yet.
+    fn progress_before_a_round_trip(&mut self) -> usize {
+        let id = self.send_request_raw(
+            WorkspaceSymbolRequest::METHOD,
+            serde_json::to_value(WorkspaceSymbolParams {
+                query: String::new(),
+                partial_result_params: PartialResultParams::default(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .expect("encode"),
+        );
+        let mut seen = 0;
+        loop {
+            match self.recv() {
+                Message::Notification(not) if not.method == Progress::METHOD => seen += 1,
+                Message::Response(resp) if resp.id == id => return seen,
+                _ => {}
+            }
+        }
+    }
+
     /// Collect the `$/progress` notification kinds ("begin"/"report"/"end")
-    /// until (and including) the terminating "end".
-    fn drain_progress(&self) -> Vec<&'static str> {
+    /// carried by `token`, until (and including) that token's terminating
+    /// "end". Notifications under any *other* token are skipped: startup now
+    /// opens two tokens in sequence — the rock harvest's, then the bootstrap
+    /// index's — so a helper that stopped at the first "end" it saw would
+    /// report the wrong one (Shockwave round 5).
+    fn drain_progress_for(&self, token: &str) -> Vec<&'static str> {
+        let want = ProgressToken::String(token.to_string());
         let mut kinds = Vec::new();
         loop {
             if let Message::Notification(not) = self.recv()
@@ -296,6 +327,9 @@ impl TestClient {
             {
                 let params: ProgressParams =
                     serde_json::from_value(not.params).expect("decode progress");
+                if params.token != want {
+                    continue;
+                }
                 let ProgressParamsValue::WorkDone(value) = params.value;
                 let kind = match value {
                     WorkDoneProgress::Begin(_) => "begin",
@@ -3226,10 +3260,31 @@ fn bootstrap_reports_work_done_progress_when_supported() {
         ..ClientCapabilities::default()
     };
     let client = start_with(&[("a.lua", "return {}\n")], caps);
-    let kinds = client.drain_progress();
+    // The rock harvest opens first and is a single indivisible step, so it has
+    // a begin and an end and no report to make (it is one `par_iter`).
+    let harvest = client.drain_progress_for("luabox/rock-harvest");
+    assert_eq!(harvest, vec!["begin", "end"], "{harvest:?}");
+    // The workspace index follows, and does report per file.
+    let kinds = client.drain_progress_for("luabox/bootstrap");
     assert_eq!(kinds.first(), Some(&"begin"), "{kinds:?}");
     assert_eq!(kinds.last(), Some(&"end"), "{kinds:?}");
     assert!(kinds.contains(&"report"), "{kinds:?}");
+    client.shutdown();
+}
+
+/// Over the real transport, end to end: a client that does not advertise
+/// `window.workDoneProgress` must see no `$/progress` traffic at all —
+/// neither for the startup rock harvest nor for the workspace index. The unit
+/// tests cover the reload path, which has no in-process startup to wait on.
+#[test]
+fn no_progress_traffic_without_the_client_capability() {
+    let mut client = start_with(&[("a.lua", "return {}\n")], ClientCapabilities::default());
+    let seen = client.progress_before_a_round_trip();
+    assert_eq!(
+        seen, 0,
+        "a client that never advertised work-done progress was sent {seen} \
+         `$/progress` notification(s)"
+    );
     client.shutdown();
 }
 

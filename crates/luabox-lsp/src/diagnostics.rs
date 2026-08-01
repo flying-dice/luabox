@@ -28,6 +28,30 @@ const TYPE_SOURCE: &str = "luabox";
 /// specific rule.
 pub(crate) const LINT_SOURCE: &str = "luabox-lint";
 
+/// The `source` a diagnostic is published under, decided by its code.
+///
+/// `lint_source` also carries the control-flow legality errors (#44) —
+/// `LB0020`-`LB0022` from `luabox_hir::validate`, which are *not* lint rules:
+/// they have no tier and no `---@luabox-ignore` id, and the runtime refuses to
+/// load the file either way. Those go out under the toolchain source alongside
+/// the parse, dialect and type diagnostics; only the lint band gets
+/// [`LINT_SOURCE`]. The band is `luabox_diag`'s to define
+/// ([`luabox_diag::Code::is_lint`]) — an open-coded `number() / 100 == 5` here
+/// was a contract nothing asserted.
+///
+/// Every publisher goes through this, including the code-action matcher, which
+/// re-converts the originating diagnostic to pair it with its quick fix. That
+/// site hardcoded [`LINT_SOURCE`], which happened to be right for every fix
+/// that exists today (all of them come from lint rules) and would silently
+/// mis-pair the first fix-carrying diagnostic that does not (Shockwave round 5).
+pub(crate) const fn source_for(code: luabox_diag::Code) -> &'static str {
+    if code.is_lint() {
+        LINT_SOURCE
+    } else {
+        TYPE_SOURCE
+    }
+}
+
 /// The project's type-checking and lint context: strictness, the ambient
 /// definition-package layer, and the lint configuration/known-globals baseline.
 /// Owned by the server.
@@ -151,12 +175,7 @@ pub fn diagnostics(
             // matcher keys its quick fixes off. The band is `luabox_diag`'s
             // to define ([`luabox_diag::Code::is_lint`]) — an open-coded
             // `number() / 100 == 5` here was a contract nothing asserted.
-            let source = if diag.code.is_lint() {
-                LINT_SOURCE
-            } else {
-                TYPE_SOURCE
-            };
-            out.push(convert(&index, diag, source));
+            out.push(convert(&index, diag, source_for(diag.code)));
         }
     }
 
@@ -322,6 +341,24 @@ mod tests {
             .unwrap_or_else(|| panic!("expected LB0022: {diags:?}"));
         assert_eq!(found.source.as_deref(), Some(TYPE_SOURCE));
         assert!(!luabox_diag::Code::new(22).is_lint());
+    }
+
+    /// The single decision both publishers share — the diagnostic stream and
+    /// the code-action matcher, which re-converts the originating diagnostic
+    /// to pair it with its fix. Asserted on the band boundary rather than on
+    /// whichever codes happen to carry fixes today, because the point of the
+    /// helper is the case that does not exist yet: a fix-carrying diagnostic
+    /// outside the lint band, which the hardcoded source would mis-pair.
+    #[test]
+    fn the_published_source_follows_the_lint_band_in_both_directions() {
+        for number in [1_u16, 22, 300, 306, 499, 600, 601, 1001] {
+            let code = luabox_diag::Code::new(number);
+            assert_eq!(source_for(code), TYPE_SOURCE, "LB{number:04} is not a lint");
+        }
+        for number in [500_u16, 501, 509, 510, 599] {
+            let code = luabox_diag::Code::new(number);
+            assert_eq!(source_for(code), LINT_SOURCE, "LB{number:04} is a lint");
+        }
     }
 
     // --- harvested rock surfaces (#30) -----------------------------------

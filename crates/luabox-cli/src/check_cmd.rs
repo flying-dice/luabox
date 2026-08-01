@@ -398,7 +398,12 @@ fn check_one(
             );
         }
     }
-    diags.extend(findings.into_source_order());
+    // Held rather than emitted. Passes 2 and 3 are two legality *axes* over one
+    // file, and a reader scanning a file's findings reads down the file, not
+    // down luabox's pass list — so they are sorted together, below. Per-pass
+    // sorting concatenated in pass order let an `LB0021` at line 13 render
+    // after an `LB0013` at line 29 (Shockwave round 5).
+    let mut legality: Vec<Diagnostic> = findings.into_source_order();
 
     // 3. Control-flow legality (#44): an unresolved `goto`, a repeated label,
     // or `break` outside a loop — code every reference Lua refuses to load,
@@ -437,8 +442,18 @@ fn check_one(
                 findings.record(key, diag);
             }
         }
-        diags.extend(findings.into_source_order());
+        legality.extend(findings.into_source_order());
     }
+
+    // Both legality axes, in one globally source-ordered run. The sort is
+    // stable and each half arrives already sorted, so two findings at the same
+    // span keep dialect-legality before loader-legality: the parser's verdict
+    // is the one that explains the loader's.
+    legality.sort_by_key(|diag| {
+        diag.primary_label()
+            .map_or((0, 0), |l| (l.span.range.start, l.span.range.end))
+    });
+    diags.extend(legality);
 
     // 4. Types against the ambient definition-package layer (SPEC.md §3),
     // with this file's resolved `require` exports in reach (#85).

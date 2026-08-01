@@ -225,6 +225,38 @@ Feature: Control-flow legality — goto / label / break (#44)
     And stdout contains "LB0021"
     And the file "dist/fixture.love" does not exist
 
+  # The third bundle-shaped emit. `plain` bundling and `love` were pinned in
+  # round 4; `nvim-plugin` routes through the same `luabox-bundle` twin and
+  # was the one shape with no scenario behind it.
+  Scenario: nvim-plugin mode refuses to write a tree the target cannot load
+    Given a project with edition "5.2" targeting "5.4" using mode "nvim-plugin"
+    And a Lua file containing '::a:: do ::a:: end'
+    When I run "luabox build"
+    Then the command fails
+    And stdout contains "LB0021"
+    And the file "dist/fixture/lua/fixture/init.lua" does not exist
+
+  # Tree mode against a *manifest* ship target, with no flag in sight: the
+  # gate reads `[build] target` and asks the loader's question of the source.
+  # Every other build-side control-flow scenario passes `--target` or bundles,
+  # so this row of the matrix rested on the check-side scenario alone.
+  Scenario: tree mode refuses a manifest ship target's loader verdict
+    Given a project with edition "5.2" targeting "5.4"
+    And a Lua file containing '::a:: do ::a:: end'
+    When I run "luabox build"
+    Then the command fails
+    And stdout contains "LB0021"
+    And the file "dist/src/main.lua" does not exist
+
+  # …and the flag beats the manifest on the build path too: 5.2 accepts the
+  # nested label its own edition accepts, so there is nothing to refuse.
+  Scenario: an explicit target overrides the manifest's on the build path
+    Given a project with edition "5.2" targeting "5.4"
+    And a Lua file containing '::a:: do ::a:: end'
+    When I run "luabox build --target 5.2"
+    Then the command succeeds
+    And the file "dist/src/main.lua" exists
+
   # Shockwave round 4, finding E: two `LB0021`s at the same primary span are
   # not the same finding — `repeated_label_scope` makes the first-definition
   # site dialect-dependent — so keeping whichever pass ran first printed one
@@ -373,3 +405,21 @@ Feature: Control-flow legality — goto / label / break (#44)
       | LB0020 | no visible label for `goto` |
       | LB0021 | label already defined       |
       | LB0022 | `break` outside a loop      |
+
+  # Shockwave round 5, finding E residual. Passes 2 and 3 are two legality
+  # *axes* over one file, each internally sorted but concatenated in pass
+  # order, so a control-flow finding early in the file rendered after a
+  # dialect finding late in it. A reader scanning a file's diagnostics reads
+  # down the file, not down luabox's pass list.
+  Scenario: the two legality axes render in one source order, not in pass order
+    Given a project with edition "5.2"
+    And a file "src/main.lua" containing:
+      """
+      ::a:: ::a::
+      local n = 1 // 2
+      """
+    When I run "luabox check"
+    Then the command fails
+    And diagnostic LB0021 is reported
+    And diagnostic LB0011 is reported
+    And stdout contains "src/main.lua:1:9" before "src/main.lua:2:13"

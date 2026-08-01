@@ -156,12 +156,50 @@ print(k:value())   -- crashes; `luabox check` and `luabox lint` are both silent
 
 is not reported: the `setmetatable` argument resolves to a `require` result,
 not to an in-file `---@class` carrier, and the rule stays silent on anything it
-cannot see whole. The same holds for a carrier whose `__index` is written
-inside a function that is never called, in a branch that never runs, through a
-local alias (`local mt = C`), or with a computed key — those are deliberate
-*suppressions*, and they cost false negatives rather than false positives. A
-carrier that declares some other metafield (`__call`, `__tostring`, `__add`,
-`__mode`) is likewise silent: it is an operator metatable, not a broken class.
+cannot see whole.
+
+**Some in-file writes are suppressions too.** Each costs false negatives
+rather than false positives, which is the trade a rule with no `LB0306` behind
+it has to make:
+
+- an `__index` write with a **computed key** (`C[k] = v`, or `rawset(C, k, v)`
+  with a `k` this pass cannot evaluate) — the write *might* be the one that
+  matters, so the carrier is treated as wired;
+- an `__index` write **inside a function that is never called**, or **in a
+  branch that never runs** — the pass has no reachability analysis, so it
+  reads a dead `if false then C.__index = C end` as a write;
+- an `__index` write **through a local alias in either of those positions**.
+  A plain `local mt = C; mt.__index = mt` *is* followed: carrier identity
+  propagates along local aliases, including chains, so a write through any
+  link counts against the carrier it ultimately names. What buys silence is
+  an actual `__index`-shaped write — a bare `local mt = C` with nothing
+  written through it settles nothing, and `mt.n = 1` is a plain-field write
+  that settles nothing either. Aliasing into a dead branch inherits the
+  dead-branch suppression above and nothing more;
+- **reassignment of the carrier** (`C = <anything>`): the value the `---@class`
+  annotation described is not necessarily the one that reaches `setmetatable`.
+  Reassigning an *alias* (`mt = {}`) is not a write to the carrier's table and
+  does not suppress.
+
+**A carrier that declares another metafield *and* has no instance methods is
+treated as an operator metatable.** Both halves are required. Any
+`__`-prefixed key other than `__index` — `__call`, `__tostring`, `__add`,
+`__mode`, `__gc`, `__name`, … — marks the carrier as declaring a metafield; a
+colon-declared function on the carrier (`function C:m()`) marks it as carrying
+an instance method. A carrier with a metafield and no instance method is
+silent: nothing is ever looked up through it, so there is nothing for a
+missing `__index` to break. A carrier with both still fires, because
+`instance:m()` crashes no matter how many operators the class overloads — the
+idiomatic Vector2 tutorial class (a dot constructor, `:length()`, `__tostring`
+and `__add`) is exactly that shape, and it does crash.
+
+The rule does not claim to know the author's *intent* here; it checks those
+two structural facts. Two things deliberately do not count as instance
+methods: `---@field`-declared members (the canonical carrier declares
+`---@field n integer` for a data field, not a method) and dot-assigned
+function fields (`C.new = function() … end` is called as `C.new()`, never
+through the metatable). Both omissions are false-negative-shaped — a carrier
+declaring a metafield alongside only those stays silent.
 
 **It is lint-only.** `LB0510` never affects `luabox check`'s exit code; it
 appears in `luabox lint` (and in the editor, on the lint channel). Wiring it

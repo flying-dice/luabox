@@ -80,6 +80,19 @@ exception_for() { # $1=program $2=version -> prints reason, rc 0 if excepted
 # See the header. This needs no reference compiler, so it runs even when every
 # version SKIPs, and it runs before any cell so a violation is reported once
 # rather than once per column.
+#
+# The invariant is enforced on the PARSE/DIALECT axis only — LB0000-LB0019,
+# the whole allocated band plus its unallocated headroom, so a code added
+# there later is covered without editing this pattern. The CONTROL-FLOW axis
+# (LB0020-LB0022) is deliberately not checked: half the matrix is programs a
+# loader must reject, so a control-flow error here is the measurement, not a
+# violation. That axis's own version of this invariant — "the target column's
+# edition is the most permissive control-flow dialect modelled" — holds by
+# construction: 5.2 is the loosest of the four (5.4 alone rejects a nested
+# label shadowing an outer one), so no program can be rejected by the column
+# edition's control-flow pass and accepted by a target's. It is unreachable
+# today rather than unasserted; a fifth dialect looser than 5.2 would be what
+# changes that.
 preflight="$(mktemp -d)"
 mkdir -p "$preflight/src"
 printf '[package]\nname = "cfdiff"\nversion = "0.1.0"\nedition = "%s"\n' \
@@ -89,9 +102,9 @@ for prog in "$matrix"/*.lua; do
     base="$(basename "$prog" .lua)"
     cp "$prog" "$preflight/src/main.lua"
     out="$( (cd "$preflight" && "$luabox" check) 2>&1 )"
-    if printf '%s\n' "$out" | grep -Eq 'error\[LB0001\]|error\[LB001[0-9]\]'; then
+    if printf '%s\n' "$out" | grep -Eq 'error\[LB000[0-9]\]|error\[LB001[0-9]\]'; then
         echo "INVARIANT  $base does not parse cleanly at edition $TARGET_COLUMN_EDITION:" >&2
-        printf '%s\n' "$out" | grep -E 'error\[LB0001\]|error\[LB001[0-9]\]' >&2
+        printf '%s\n' "$out" | grep -E 'error\[LB000[0-9]\]|error\[LB001[0-9]\]' >&2
         violations=$((violations + 1))
     fi
 done
