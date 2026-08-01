@@ -2188,6 +2188,171 @@ fn dot_dispatch_is_an_instance_use_but_a_field_read_is_not() {
     }
 }
 
+/// Round 9. The prune was one-sided: only the `then` of a literal-false `if`
+/// was dropped, so `if true then … else c:reset() end` counted a call no
+/// execution performs. A literal-true arm runs, and everything after it — the
+/// later `elseif` conditions, their blocks, and the `else` — is dead with it.
+///
+/// The live halves are asserted beside the dead ones, because a prune that
+/// swallowed its own control would pass every "silent on" assertion here.
+#[test]
+fn branch_pruning_reads_both_sides_of_a_literal_condition() {
+    for tail in [
+        "if true then return 1 else c:reset() end\n",
+        "if true then return 1 elseif true then c:reset() end\n",
+        "if false then c:reset() end\n",
+    ] {
+        let src = format!("{ROUND8_CACHE}local c = setmetatable({{}}, Cache)\n{tail}");
+        assert!(
+            !has(&src, &LintConfig::new(), "LB0510"),
+            "fired on `{tail}`"
+        );
+    }
+    for tail in [
+        "if true then c:reset() end\n",
+        "if false then return 1 else c:reset() end\n",
+        "if false then return 1 elseif true then c:reset() end\n",
+        // The guard is a name in the `else` position, so nothing decides it.
+        "local on = false\nif on then return 1 else c:reset() end\n",
+    ] {
+        let src = format!("{ROUND8_CACHE}local c = setmetatable({{}}, Cache)\n{tail}");
+        assert!(
+            has(&src, &LintConfig::new(), "LB0510"),
+            "silent on `{tail}`"
+        );
+    }
+}
+
+/// Round 9. A numeric `for` whose written header runs zero times never enters
+/// its body — the same literal question the `if` guard asks, which is what
+/// makes the prune symmetric with it rather than a new kind of reasoning.
+///
+/// A bound that is a name is not decided (the disclosed bound), and a zero
+/// step is not decided either: Lua 5.4 raises `'for' step is zero` when it
+/// evaluates the header, and a program that never gets that far is not one
+/// this rule should be describing as dead code.
+#[test]
+fn a_numeric_for_with_dead_literal_bounds_is_not_entered() {
+    for header in [
+        "for _ = 1, 0 do c:reset() end\n",
+        "for _ = 1, 10, -1 do c:reset() end\n",
+        "for _ = 0, -1 do c:reset() end\n",
+        "for _ = 1.5, 1.0 do c:reset() end\n",
+    ] {
+        let src = format!("{ROUND8_CACHE}local c = setmetatable({{}}, Cache)\n{header}");
+        assert!(
+            !has(&src, &LintConfig::new(), "LB0510"),
+            "fired on `{header}`"
+        );
+    }
+    for header in [
+        "for _ = 1, 1 do c:reset() end\n",
+        "for _ = 10, 1, -1 do c:reset() end\n",
+        "local n = 0\nfor _ = 1, n do c:reset() end\n",
+        "for _ = 1, 10, 0 do c:reset() end\n",
+    ] {
+        let src = format!("{ROUND8_CACHE}local c = setmetatable({{}}, Cache)\n{header}");
+        assert!(
+            has(&src, &LintConfig::new(), "LB0510"),
+            "silent on `{header}`"
+        );
+    }
+}
+
+/// Round 9. `do return end` is Lua's only spelling for an early return — a
+/// bare `return` must be the last statement of its block — so "statements
+/// after a return" can only mean statements after a `do` block that ends in
+/// one. Nothing after it runs.
+#[test]
+fn statements_after_an_early_return_are_not_reached() {
+    let after = format!(
+        "{ROUND8_CACHE}\
+local c = setmetatable({{}}, Cache)
+do return end
+c:reset()
+"
+    );
+    assert!(!has(&after, &LintConfig::new(), "LB0510"), "fired after");
+    let before = format!(
+        "{ROUND8_CACHE}\
+local c = setmetatable({{}}, Cache)
+c:reset()
+do return end
+"
+    );
+    assert!(has(&before, &LintConfig::new(), "LB0510"), "silent before");
+}
+
+/// Round 9, P2. The ternary `cond and ctor or other` parses as
+/// `(cond and ctor) or other`, and `and`'s right operand used to be seeded
+/// unconditionally — so a literal-false `cond`, under which Lua never
+/// evaluates the construction at all, still seeded it.
+///
+/// A `cond` that is a *name* is still not decided, which is the same bound
+/// the `if` guard carries; both directions are asserted so the trade is
+/// visible rather than assumed.
+#[test]
+fn a_literal_condition_decides_which_side_of_a_ternary_flows() {
+    let other = "local other = { reset = function() return 1 end }\n";
+    for init in [
+        "local c = false and setmetatable({}, Cache) or other\n",
+        "local c = nil and setmetatable({}, Cache) or other\n",
+        "local c = false and setmetatable({}, Cache)\n",
+        "local c = \"x\" or setmetatable({}, Cache)\n",
+    ] {
+        let src = format!("{ROUND8_CACHE}{other}{init}return c:reset()\n");
+        assert!(
+            !has(&src, &LintConfig::new(), "LB0510"),
+            "fired on `{init}`"
+        );
+    }
+    for init in [
+        "local c = true and setmetatable({}, Cache) or other\n",
+        "local c = true and setmetatable({}, Cache)\n",
+        "local c = false or setmetatable({}, Cache)\n",
+        "local c = nil or setmetatable({}, Cache)\n",
+        // Undecided cond: seeded, which is the disclosed false positive when
+        // the name is falsy and the fallback rescues the call.
+        "local ready = false\nlocal c = ready and setmetatable({}, Cache) or other\n",
+    ] {
+        let src = format!("{ROUND8_CACHE}{other}{init}return c:reset()\n");
+        assert!(
+            has(&src, &LintConfig::new(), "LB0510"),
+            "silent on `{init}`"
+        );
+    }
+}
+
+/// Round 9. `local m = c.reset` reads the method off the *instance*, which
+/// with no `__index` yields `nil`, so `m(c)` fails exactly as `c.reset(c)`
+/// does. The read alone is still not a use, and a read off the **carrier** is
+/// a plain table read no metatable serves.
+#[test]
+fn a_method_read_off_an_instance_and_then_called_is_a_use() {
+    let called = format!(
+        "{ROUND8_CACHE}\
+local c = setmetatable({{}}, Cache)
+local m = c.reset
+return m(c)
+"
+    );
+    assert!(has(&called, &LintConfig::new(), "LB0510"), "silent on m(c)");
+    for tail in [
+        // The read, never called.
+        "local m = c.reset\nreturn type(m)\n",
+        // Read off the carrier: an ordinary field access that runs fine.
+        "local m = Cache.reset\nreturn m(c)\n",
+        // A metafield is not served by `__index`.
+        "local m = c.__mode\nreturn type(m)\n",
+    ] {
+        let src = format!("{ROUND8_CACHE}local c = setmetatable({{}}, Cache)\n{tail}");
+        assert!(
+            !has(&src, &LintConfig::new(), "LB0510"),
+            "fired on `{tail}`"
+        );
+    }
+}
+
 // --- suppression / malformed-ignore (LB0500) -------------------------------
 
 #[test]

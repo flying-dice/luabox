@@ -220,11 +220,27 @@ That last one is answered by two mechanisms, both deliberately shallow:
   writes out, the `__call` dispatch on a derived value, and the colon method a
   receiver's own table or its carrier declares. Uses are counted only in
   bodies that set contains;
-- **literal-condition pruning.** `if false then`, `if nil then` and
-  `while false do` never enter their blocks, so statements inside them are not
-  collected. Only literals are decided — `repeat` is never pruned (it tests
-  after its body) and the `else` of a literal-false `if` is the branch that
-  runs.
+- **literal pruning of dead statements.** Everything this decides, it decides
+  by reading literals in the source; nothing is propagated, and a condition
+  that is a name, a comparison or a call is left alone. Four constructs are
+  pruned, and the `if` is read on **both** sides:
+
+  | written                                    | what does not run                                    |
+  | ------------------------------------------ | ---------------------------------------------------- |
+  | `if false then A end` / `if nil then A end` | `A`; the `else` is the branch that *does* run         |
+  | `if true then A else B end`                 | `B` — and every later `elseif` condition and block    |
+  | `while false do A end`                      | `A`. `repeat` is never pruned: it tests after its body |
+  | `for _ = 1, 0` / `for _ = 1, 10, -1`        | the loop body — zero iterations, from literal bounds  |
+  | `do return end` then `A` (and after `break`) | `A` — nothing after a statement that leaves the block |
+
+  Until round 9 only the first row was read, so `if true then … else
+  c:reset() end` counted a call no execution performs, and neither dead loop
+  headers nor statements after an early return were pruned at all. A zero
+  step (`for _ = 1, 10, 0`) is deliberately *not* decided: Lua 5.4 raises
+  `'for' step is zero` while evaluating the header, and a program that never
+  gets that far is not one this rule should be calling dead code. `goto` is
+  not pruned either — it can jump forward to a label in the same block, so
+  what follows it may very well run.
 
 So an instance-side use is a **call**, on a value the pass can *derive* from
 `setmetatable(_, C)` — derivation is what keeps one class's calls from
@@ -238,12 +254,15 @@ settling another's. Three call shapes count:
   crashes. Only the `__call` body is asked, not every function attached to the
   carrier: a `__call` that reaches no method, beside a `C:reset()` nothing
   invokes, is a program that runs fine;
-- **dot dispatch with an explicit self**: `c.m(c)`, when `m` names a function
-  attached to the carrier. With no `__index`, `c.m` is `nil`, so this fails
-  with `attempt to call a nil value (field 'm')` where the colon form says
-  `method 'm'` — one defect, two spellings. It is the **call** that counts:
-  `local r = c.reset` and `print(type(c.reset))` perform the lookup, get
-  `nil`, and run fine.
+- **dot dispatch**: `c.m(c)`, when `m` names a function attached to the
+  carrier. With no `__index`, `c.m` is `nil`, so this fails with `attempt to
+  call a nil value (field 'm')` where the colon form says `method 'm'` — one
+  defect, two spellings. The read may be one name back — `local m = c.reset;
+  m(c)` is the same lookup with the `nil` bound to a name first — but it is
+  the **call** that counts: `local r = c.reset` and `print(type(c.reset))`
+  perform the lookup, get `nil`, and run fine. Reading the method off the
+  **carrier** (`local m = Cache.reset; m(c)`) is a plain table read that no
+  metatable serves, and is not a use of anything.
 
 And a value is derived from `C` when it comes from one of these:
 
@@ -255,14 +274,30 @@ And a value is derived from `C` when it comes from one of these:
 - a name bound to either — `local c = setmetatable({}, C)`, and equally
   `c = setmetatable({}, C)` on a name declared earlier or on a global — plus
   any `local d = c` alias. `and` and `or` are followed into the operand the
-  expression **definitively evaluates to**. A construction is a table and so
-  always truthy, which decides all four shapes: `ctor or x` *is* the
-  construction (`x` never evaluates) and is followed; `x and ctor` is followed
-  too, because when `x` is truthy the result is the construction and when it
-  is falsy the same colon call fails just as hard; `x or ctor` is followed
-  only as far as `x`, since whether the construction is reached depends on a
-  truthiness this pass cannot decide; and `ctor and x` evaluates to `x`, so
-  the construction is discarded;
+  expression **definitively evaluates to**, which two facts decide.
+
+  The first is the *left operand's truthiness where the source writes it out*.
+  `false and ctor` never evaluates `ctor` at all — the result is the falsy
+  left operand — and `false or ctor` *is* the construction. That reading
+  folds through nesting, which is what makes the ternary
+  `cond and ctor or other` answerable: it parses as `(cond and ctor) or
+  other`, so a literal `cond` picks one of `ctor`/`other` and the other side
+  is not seeded. Until round 9 `and` seeded its right operand unconditionally
+  and no literal was consulted on this path at all, so `false and ctor or
+  other` warned about a construction Lua never performs.
+
+  The second applies when the left operand is *not* written out — a name, a
+  call, a comparison. A construction is a table and so always truthy, which
+  decides the remaining four shapes: `ctor or x` *is* the construction (`x`
+  never evaluates) and is followed; `x and ctor` is followed too, because when
+  `x` is truthy the result is the construction and when it is falsy the same
+  colon call fails just as hard; `x or ctor` is followed only as far as `x`,
+  since whether the construction is reached depends on a truthiness this pass
+  cannot decide; and `ctor and x` evaluates to `x`, so the construction is
+  discarded. A ternary with an undecided `cond` is seeded from its `ctor`
+  side, which is a false positive when that `cond` is always falsy and the
+  `or` fallback answers the call — the same undecided-guard bound listed
+  below, in a second spelling;
 - the constructor pattern: a function whose body returns a construction
   (directly, or via a name it bound to one) is a factory for that carrier,
   so `local c = Counter.new(); c:value()` is a use, and so is the module-table
@@ -271,11 +306,51 @@ And a value is derived from `C` when it comes from one of these:
   name of `local n, c = make()` and not the first. Constructor depth is one —
   a factory returning another factory's result is not chased.
 
-**What that leaves out, precisely.** Each of these is silent on a program that
-crashes. Ten of the eleven have a committed matrix fixture with its uninvoked
-twin, so that closing one is a deliberate act rather than a surprise; the
-`require` bound is the exception and structurally cannot have one, because the
-matrix runs one file at a time and that bound is cross-file by nature.
+**What this rule does not decide, in full.** Four rounds of review found this
+section claiming "one approximation remains" while the pass carried several,
+so the claim is a list rather than a count, written against the code and then
+checked back against it. Both directions are here, because a rule that
+discloses only its misses is describing half of itself.
+
+**What is false-positive-shaped** — a finding on a program that runs. Each
+entry has a committed matrix fixture, with the twin that shows the same shape
+being read correctly on the other side of it.
+
+- **an undecided guard.** The prune reads *literals* only, so a guard that is
+  a name is not decided: `local on = false; if on then c:reset() end` still
+  counts as reaching a method, and so do the two other places a guard appears
+  — the ternary (`local ready = false; local c = ready and
+  setmetatable({}, C) or other`) and the numeric-`for` header (`local n = 0;
+  for _ = 1, n do c:m() end`). All three are the same bound the
+  `__index`-write side has carried since the rule shipped ("an `__index`
+  write inside a branch that never runs", above): deciding them needs
+  constant propagation rather than a look at the token, and a partial
+  constant propagation that decided `and`/`or` but not `if` would be worse
+  than none, because the two would then disagree about the same program;
+- **flow-insensitive derivation.** Which carrier a value belongs to is a
+  property of the name, not of the line: a name carries *every* value ever
+  bound to it. So `local c = setmetatable({}, C); c = plain; c:m()` counts
+  the call on `plain` against `C` and warns about a program that runs. This
+  is deliberate — the alternative is an ordering this pass does not compute —
+  and the next two entries are the same fact in other clothes;
+- **two `setmetatable` calls on one table.** `setmetatable` *replaces* the
+  metatable, so only the last call is in effect when the lookup happens.
+  Each call is a genuine construction site and the rule reports one finding
+  per site (which is what pins `metafield_lt_invoked_method`, two
+  constructions of one carrier, at two findings), so a superseded first call
+  is reported against a lookup the winning metatable serves perfectly well;
+- **an insert-last-wins name-to-body map.** Functions are mapped from name to
+  body with the last attachment winning, so `local function run() … end;
+  run(); run = function() c:m() end` attributes the call to the replacement
+  — a body it never enters — and warns. The same map misses the mirror
+  program, which is in the false-negative list below.
+
+**And what is false-negative-shaped** — silence on a program that crashes.
+Eleven of the twelve have a committed matrix fixture beside the twin that
+reads the other way, so that closing one is a deliberate act rather than a
+surprise; the `require` bound is the exception and structurally cannot have
+one, because the matrix runs one file at a time and that bound is cross-file
+by nature.
 
 - an instance held in a **table field** (`local box = { c = setmetatable({}, C) }`,
   then `box.c:m()`) — this pass tracks names, not table contents;
@@ -295,9 +370,15 @@ matrix runs one file at a time and that bound is cross-file by nature.
   site in this file names that body, so the reached set does not contain it,
   and a `c:m()` written in it is not counted. This is the FN-biased edge of
   the reachability work, and it is what keeps `print(type(boom))` quiet;
-- an instance bound by **`x or setmetatable(_, C)`** — the construction is
-  reached only when `x` is falsy, and following it regardless warned on a
-  program that runs (round 8). Following `x` alone costs this miss;
+- a function **called and then replaced** — the name-to-body map above, the
+  other way round: `local function run() c:m() end; run(); run = function()
+  end` maps `run` to the replacement, so the body the call really enters is
+  never marked reached;
+- an instance bound by **`x or setmetatable(_, C)`** with an undecided `x` —
+  the construction is reached only when `x` is falsy, and following it
+  regardless warned on a program that runs (round 8). Following `x` alone
+  costs this miss. A *literal* falsy left operand is decided and does fire,
+  as of round 9;
 - a construction whose **metatable argument is an alias** of the carrier
   (`local mt = C; setmetatable({}, mt)`). The `---@class` annotation is looked
   up on the binding the argument names, and `mt` carries none, so the rule
@@ -306,18 +387,15 @@ matrix runs one file at a time and that bound is cross-file by nature.
   this stays a miss;
 - a carrier reached through **`require`** — the in-file bound, above.
 
-Those misses are false-negative-shaped, which is the direction this arm has to
-err in: the carrier declared a metafield, so silence is the plausible reading.
+Those misses are the direction this arm has to err in: the carrier declared a
+metafield, so silence is the plausible reading.
 
-**One approximation remains, and it is false-positive-shaped.** The branch
-prune reads *literals* only, so a guard that is a name is not decided:
-`local on = false; if on then c:reset() end` still counts as reaching a
-method. That is the same bound the `__index`-write side has carried since the
-rule shipped ("an `__index` write inside a branch that never runs", above),
-and deciding it needs constant propagation rather than a look at the token.
-The round-7 approximation recorded here — a `self:m()` inside `if false then
-… end` within the `__call` body — is **closed**: the prune applies wherever
-statements are collected, that body included.
+Two approximations previously recorded here are **closed**. The round-7 one —
+a `self:m()` inside `if false then … end` within the `__call` body — closed
+when the prune started applying wherever statements are collected, that body
+included. The round-9 one was the prune itself being one-sided: it dropped the
+`then` of a literal-false `if` and never the `else` of a literal-true one, and
+it read no loop header and no early return at all.
 
 **The behavioural gate applies to the metafield arm only.** A carrier with no
 metafield at all is judged structurally — the construction alone is enough,
