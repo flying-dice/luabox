@@ -595,3 +595,126 @@ Feature: stdlib definition packages — `---@meta` `.d.lua` ambient types
     Then the command fails
     And stdout contains "error[LB0306]"
     And stdout contains "undefined field `nosuchthing`"
+
+  # Shockwave round 4, finding B/J: within the lexical rank the carrier map
+  # took the FIRST carrier for a repeated variable name, but `function M:m()`
+  # names the binding in scope — which Lua resolves to the LAST `local M`.
+  # The project-source path resolves the binding and always said "last"; the
+  # defs path said "first", so the two disagreed on every repeated-carrier
+  # shape. Both now follow the binding.
+
+  Scenario: a repeated carrier variable in a defs file follows the last binding
+    Given a file "defs/zoo.d.lua" containing:
+      """
+      ---@meta
+
+      ---@class Alpha
+      local M = {}
+
+      ---@class Beta
+      local M = {}
+
+      ---@return string
+      function M:only() end
+      """
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      defs = ["zoo"]
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param a Alpha
+      ---@param b Beta
+      local function use(a, b)
+        return b:only(), a:only()
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "undefined field `only` on `Alpha`"
+    And stdout does not contain "undefined field `only` on `Beta`"
+
+  Scenario: the same repeated carrier as project source gives the same answer
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      """
+    And a file "src/zoo.lua" containing:
+      """
+      ---@class Alpha
+      local M = {}
+
+      ---@class Beta
+      local M = {}
+
+      ---@return string
+      function M:only() end
+
+      return M
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param a Alpha
+      ---@param b Beta
+      local function use(a, b)
+        return b:only(), a:only()
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "undefined field `only` on `Alpha`"
+    And stdout does not contain "undefined field `only` on `Beta`"
+
+  Scenario: the repeated carrier declared the other way round flips with it
+    Given a file "defs/zoo.d.lua" containing:
+      """
+      ---@meta
+
+      ---@class Beta
+      local M = {}
+
+      ---@class Alpha
+      local M = {}
+
+      ---@return string
+      function M:only() end
+      """
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      defs = ["zoo"]
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param a Alpha
+      ---@param b Beta
+      local function use(a, b)
+        return a:only(), b:only()
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "undefined field `only` on `Beta`"
+    And stdout does not contain "undefined field `only` on `Alpha`"

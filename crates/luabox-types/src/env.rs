@@ -1656,8 +1656,18 @@ fn standalone_scope(tag: &Tag) -> Option<FieldScope> {
 /// binding, got it right. Swapping the two class blocks flipped the verdict
 /// (Shockwave round 3); #39's whole point is defs/project parity.
 ///
-/// Within each rank the first declaration wins, matching every other
-/// collision rule in the crate.
+/// Within the **nominal** rank the first declaration wins, matching every
+/// other collision rule in the crate. Within the **lexical** rank the *last*
+/// one does, because that rank is not a collision rule at all — it is a
+/// binding lookup, and Lua's answer for a repeated `local M` is the most
+/// recent binding. `function M:m()` after two `local M = {}` carriers names
+/// the second; the project-source inference path resolves the binding and
+/// says so, while this path used to answer with the first, so the two
+/// disagreed on every shape with a repeated carrier variable (Shockwave
+/// round 4). #39's whole point is defs/project parity, so the defs path
+/// follows the binding too. This is a different axis from the rank order
+/// above: lexical still beats nominal, whichever declaration order they come
+/// in.
 ///
 /// Shared by the standalone-visibility pass (#115) and the defs
 /// carrier-member fold (#39).
@@ -1682,16 +1692,17 @@ fn carrier_var_classes(
             .or_insert_with(|| c.name.clone());
     }
 
-    // Rank 1, collected first-wins among themselves, then applied over the
-    // nominal aliases — one write per variable, so no ordering artefact
-    // survives into the result.
+    // Rank 1, collected last-wins among themselves (the binding a later
+    // `function M:m()` names), then applied over the nominal aliases — one
+    // write per variable, so the rank order survives whatever the declaration
+    // order was.
     let mut lexical: HashMap<String, String> = HashMap::new();
     for (item, c) in classes() {
         if let Some(span) = item.target
             && let Some(name) =
                 stmt_at(root, (span.start, span.end)).and_then(|s| carrier_var_name(&s))
         {
-            lexical.entry(name).or_insert_with(|| c.name.clone());
+            lexical.insert(name, c.name.clone());
         }
     }
     var_to_class.extend(lexical);
@@ -2302,10 +2313,13 @@ function Solo:hide() end
         assert_eq!(def.visibility.get("hide"), Some(&FieldScope::Private));
     }
 
-    /// Two carriers with the same variable name: first declaration wins, the
-    /// way every other collision in this crate resolves.
+    /// Two carriers with the same variable name: the **last** one wins,
+    /// because `function M:only()` names the binding in scope and Lua's
+    /// answer for a repeated `local M` is the most recent binding. This is
+    /// not a collision rule — it is a lookup, and the project-source
+    /// inference path resolves it that way (Shockwave round 4).
     #[test]
-    fn the_first_carrier_wins_a_repeated_variable_name() {
+    fn the_last_carrier_wins_a_repeated_variable_name() {
         let env = env_of(
             "\
 ---@class First
@@ -2320,8 +2334,78 @@ function M:only() end
         );
         let first = env.classes.get("First").expect("First declared");
         let second = env.classes.get("Second").expect("Second declared");
-        assert_eq!(first.visibility.get("only"), Some(&FieldScope::Private));
-        assert!(second.visibility.is_empty(), "{:?}", second.visibility);
+        assert_eq!(second.visibility.get("only"), Some(&FieldScope::Private));
+        assert!(first.visibility.is_empty(), "{:?}", first.visibility);
+    }
+
+    /// The three shapes Shockwave measured against `lua5.4` and against the
+    /// project-source path. Each names two carriers `M`; the member belongs
+    /// to whichever class the *second* `M` carries, whatever the class names
+    /// and whichever carrier form is used.
+    #[test]
+    fn a_repeated_carrier_variable_follows_the_binding_in_every_shape() {
+        let shapes = [
+            (
+                "two local carriers",
+                "\
+---@class Alpha
+local M = {}
+
+---@class Beta
+local M = {}
+
+---@private
+function M:only() end
+",
+                "Beta",
+                "Alpha",
+            ),
+            (
+                "the same two, declared the other way round",
+                "\
+---@class Beta
+local M = {}
+
+---@class Alpha
+local M = {}
+
+---@private
+function M:only() end
+",
+                "Alpha",
+                "Beta",
+            ),
+            (
+                "a local carrier then an assigned one",
+                "\
+---@class Alpha
+local M = {}
+
+---@class Beta
+M = {}
+
+---@private
+function M:only() end
+",
+                "Beta",
+                "Alpha",
+            ),
+        ];
+        for (label, source, winner, loser) in shapes {
+            let env = env_of(source);
+            let winner_def = env.classes.get(winner).expect("class declared");
+            let loser_def = env.classes.get(loser).expect("class declared");
+            assert_eq!(
+                winner_def.visibility.get("only"),
+                Some(&FieldScope::Private),
+                "{label}: `only` belongs to `{winner}`"
+            );
+            assert!(
+                loser_def.visibility.is_empty(),
+                "{label}: nothing attaches to `{loser}`: {:?}",
+                loser_def.visibility
+            );
+        }
     }
 
     #[test]

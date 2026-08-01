@@ -934,6 +934,142 @@ return a, b
     assert_eq!(found, 2);
 }
 
+// --- LB0510 false positives closed in Shockwave round 4 --------------------
+//
+// Two shapes of correct, idiomatic code the rule warned on. Both directions
+// are pinned: the suppression must not swallow the true positives above.
+
+/// An operator metatable. `Vec` declares `__tostring` and nothing else; no
+/// `v:method()` exists anywhere, and the program runs fine under every
+/// reference Lua. There is nothing for a missing `__index` to break.
+#[test]
+fn a_carrier_declaring_only_another_metafield_is_silent() {
+    for metafield in ["__tostring", "__call", "__mode", "__add", "__eq"] {
+        let src = format!(
+            "\
+---@class Vec
+local Vec = {{}}
+function Vec.{metafield}(v) return v end
+local v = setmetatable({{}}, Vec)
+return v
+"
+        );
+        assert!(
+            !has(&src, &LintConfig::new(), "LB0510"),
+            "fired on `{metafield}`"
+        );
+    }
+}
+
+#[test]
+fn a_metafield_in_the_carriers_own_constructor_is_silent() {
+    let src = "\
+---@class Vec
+local Vec = { __tostring = function(v) return \"v\" end }
+local v = setmetatable({}, Vec)
+return v
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// The carrier still fires when the only thing attached to it is an ordinary
+/// field or method — a *metafield* is what buys silence, not any field.
+#[test]
+fn a_carrier_with_only_plain_fields_still_fires() {
+    let src = "\
+---@class Counter
+local Counter = {}
+Counter.n = 0
+function Counter:value() return self.n end
+local c = setmetatable({}, Counter)
+return c:value()
+";
+    assert!(has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// `local mt = Counter` aliases the same table, so `mt.__index = mt` wires
+/// `Counter` up — this pass follows bindings, not values, so it cannot see
+/// that and must not guess the other way. Same trade as a computed key.
+#[test]
+fn an_index_written_through_a_local_alias_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+local mt = Counter
+mt.__index = mt
+function Counter:value() return 1 end
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// `rawset(C, "n", 0)` writes a plain field, not `__index`. The arm used to
+/// settle on *any* `rawset`, though `index_key` already reads literal keys.
+#[test]
+fn a_rawset_of_a_plain_literal_key_does_not_settle_the_carrier() {
+    let src = "\
+---@class Counter
+local Counter = {}
+rawset(Counter, \"n\", 0)
+function Counter:value() return self.n end
+local c = setmetatable({}, Counter)
+return c:value()
+";
+    assert!(has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// …but a computed `rawset` key still settles it, and a `rawset` of another
+/// metafield still reads as an operator table.
+#[test]
+fn a_rawset_of_a_computed_key_still_settles_the_carrier() {
+    let src = "\
+---@class Counter
+local Counter = {}
+local k = \"__index\"
+rawset(Counter, k, Counter)
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn a_rawset_of_another_metafield_is_silent() {
+    let src = "\
+---@class Vec
+local Vec = {}
+rawset(Vec, \"__tostring\", function(v) return \"v\" end)
+local v = setmetatable({}, Vec)
+return v
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// The message must not assert a crash that no call site makes: it describes
+/// what a method call *would* do, conditionally.
+#[test]
+fn the_note_does_not_assert_a_crash_that_no_call_site_makes() {
+    let out = lint(COUNTER_REPRO, &LintConfig::new());
+    let diag = out
+        .diagnostics
+        .iter()
+        .find(|d| d.code.to_string() == "LB0510")
+        .expect("LB0510");
+    assert!(
+        diag.notes
+            .iter()
+            .any(|n| n.contains("any `t:method()` fails at runtime")),
+        "{:?}",
+        diag.notes
+    );
+    assert!(
+        !diag.notes.iter().any(|n| n.contains("every `t:method()`")),
+        "{:?}",
+        diag.notes
+    );
+}
+
 // --- suppression / malformed-ignore (LB0500) -------------------------------
 
 #[test]

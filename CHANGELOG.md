@@ -21,13 +21,18 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   the finding is reported once when both the edition and the target flag the
   same span, exactly as dialect legality already deduplicated.
 
-  `luabox build` keeps its edition-only check gate on purpose (lowering is
-  what handles constructs the target rejects), but nothing lowers a shadowed
-  label away — so the same program built with `--target 5.4` silently emitted
-  an unloadable file and exited 0. The residual validation of each lowered
-  file now judges control-flow legality under the target too, and refuses to
-  write anything when it fails. `luabox lint` and the language server have no
-  target flag and are unaffected.
+  `luabox build`'s check gate does not judge the target's *dialect* legality
+  on purpose (lowering is what handles constructs the target's parser
+  rejects), but nothing lowers a shadowed label away — so the same program
+  built with `--target 5.4` silently emitted an unloadable file and exited 0.
+  The gate now runs the target's control-flow pass against the source, and
+  the residual validation of each lowered file judges it again over the
+  lowered text. Emission stays per file, as it always has (tsc/esbuild
+  semantics): the file that fails is not written and the exit code is
+  nonzero, while files that lowered cleanly are still emitted — and because
+  `build` never cleans `dist/`, a failing rebuild leaves the previous run's
+  output in place. `luabox lint` and the language server have no target flag
+  and are unaffected.
 - **A `---@class` in a defs file no longer steals another class's carrier
   variable.** `---@class Wrapper` over `local Animal = {}` binds the *local*
   `Animal` to `Wrapper`, so `function Animal:speak()` is `Wrapper`'s method.
