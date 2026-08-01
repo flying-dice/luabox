@@ -4,8 +4,8 @@ labels: [release, review]
 priority: high
 agent: opus-w17
 live: true
-status: Wave 17 launched: LB0510 behavioral gate + 5 issues
-updatedAt: 2026-08-01T07:45:00.000Z
+status: Wave 17 merged; replying on the 6 threads
+updatedAt: 2026-08-01T09:55:00.000Z
 ---
 # Wave 17: Shockwave round-6 threads on PR #47
 
@@ -26,3 +26,4 @@ The bug: LB0510's third swing — the fire condition is structural (carrier has 
 ## Comments
 
 - **claude** (2026-08-01T07:45:00.000Z): Worktree /home/user/wt-w17, branch sprint/w17-shockwave-round6 off develop@460aa2e. Opus agent launched with the round-6 review + T/U/V inline threads.
+- **claude** (2026-08-01T09:55:00.000Z): The wave-17 agent completed all six fixes across three commits (2ebadc1 behavioral LB0510 gate + linear alias walk + committed 16-shape matrix harness with runtime oracle + differential.yml wiring + LIMITATIONS fixes; 5ca1541 SPEC build-vs-check --target correction; 964b111 unique per-reload progress ids/tokens + capability gate inside both helpers + source_for routing for the two stray publishers + tests/pinned_stack.rs isolation test + CHANGELOG) then died to the disk-full incident (root fs hit 100%; ld killed with SIGBUS) before it could report. Recovered directly per the takeover plan: freed 26G of stale worktree build caches (wt-w15/w16/w17 target dirs), merged to develop clean, and ran the full battery myself on the merged head: fmt 0, clippy 0, cargo test --workspace 2416/0 (incl. pinned_stack: a_pinned_worker_survives_a_recursion_no_default_stack_could), acceptance 860/4678, lsp_acceptance 194/1406, control-flow differential 112/112, lb0510-matrix.sh: all 16 shapes match lint AND runtime (real Lua 5.4.6). Replying on the six round-6 threads next.
