@@ -1952,6 +1952,242 @@ return f()
     assert!(!has(nested, &LintConfig::new(), "LB0510"));
 }
 
+// --- LB0510: reaching a *body*, and the shapes around it (round 8) --------
+//
+// The mechanism-level companions to `scripts/tests/lb0510-matrix/`, which
+// carries the full shape grid with its `lua5.4` column. These assert the four
+// mechanisms directly, so `cargo test` catches a regression without needing a
+// release binary and an interpreter.
+
+/// The carrier every test below constructs an instance of.
+const ROUND8_CACHE: &str = "\
+---@class Cache
+local Cache = {}
+Cache.__mode = \"k\"
+function Cache:reset() self.n = 0 end
+";
+
+/// Reachability, both directions. `observed()` used to read receivers out of
+/// every body in the file with no reachability test at all, so a colon call
+/// written inside a function nothing invokes counted as a lookup. Only the
+/// second of these programs performs one, and only it crashes.
+#[test]
+fn a_colon_call_in_an_uninvoked_body_is_not_an_instance_use() {
+    let uninvoked = format!(
+        "{ROUND8_CACHE}\
+local c = setmetatable({{}}, Cache)
+local function boom() return c:reset() end
+return type(boom)
+"
+    );
+    let invoked = format!(
+        "{ROUND8_CACHE}\
+local c = setmetatable({{}}, Cache)
+local function boom() return c:reset() end
+return boom()
+"
+    );
+    assert!(!has(&uninvoked, &LintConfig::new(), "LB0510"));
+    assert!(has(&invoked, &LintConfig::new(), "LB0510"));
+}
+
+/// The reached set is a fixpoint over the call graph, not one hop: the chunk
+/// calls `f`, `f` calls `g`, and the colon call in `g` is what runs.
+#[test]
+fn reachability_follows_the_call_graph_to_a_fixpoint() {
+    let src = format!(
+        "{ROUND8_CACHE}\
+local c = setmetatable({{}}, Cache)
+local function g() return c:reset() end
+local function f() return g() end
+return f()
+"
+    );
+    assert!(has(&src, &LintConfig::new(), "LB0510"));
+}
+
+/// A closure that escapes has no call site naming its body, so this file does
+/// not enter it. A disclosed false negative — the FN-biased half of the
+/// reachability trade.
+#[test]
+fn an_escaping_closure_is_not_reached() {
+    let src = format!(
+        "{ROUND8_CACHE}\
+local c = setmetatable({{}}, Cache)
+local function boom() return c:reset() end
+local function apply(f) return f() end
+return apply(boom)
+"
+    );
+    assert!(!has(&src, &LintConfig::new(), "LB0510"));
+}
+
+/// Literal-condition pruning, and its exact edges: `false`/`nil`/`while false`
+/// prune, the `else` of a literal-false `if` does not, and `repeat` tests
+/// after its body so nothing prunes that.
+#[test]
+fn a_literal_false_branch_is_not_a_lookup_but_its_else_is() {
+    for tail in [
+        "if false then c:reset() end\n",
+        "if nil then c:reset() end\n",
+        "while false do c:reset() end\n",
+    ] {
+        let src = format!("{ROUND8_CACHE}local c = setmetatable({{}}, Cache)\n{tail}");
+        assert!(
+            !has(&src, &LintConfig::new(), "LB0510"),
+            "fired on `{tail}`"
+        );
+    }
+    for tail in [
+        "if true then c:reset() end\n",
+        "if false then return 1 else c:reset() end\n",
+        "repeat c:reset() until true\n",
+    ] {
+        let src = format!("{ROUND8_CACHE}local c = setmetatable({{}}, Cache)\n{tail}");
+        assert!(
+            has(&src, &LintConfig::new(), "LB0510"),
+            "silent on `{tail}`"
+        );
+    }
+}
+
+/// The prune is literal-condition only. A guard that is a *name* is not
+/// decided, so this fires on a program that runs — the disclosed false
+/// positive, kept honest by a test rather than by prose.
+#[test]
+fn a_non_literal_guard_is_not_pruned() {
+    let src = format!(
+        "{ROUND8_CACHE}\
+local c = setmetatable({{}}, Cache)
+local on = false
+if on then c:reset() end
+"
+    );
+    assert!(has(&src, &LintConfig::new(), "LB0510"));
+}
+
+/// The statement-form constructor: `setmetatable(t, C)` links **`t`**, not
+/// only whatever the call's result is bound to. The idiomatic spelling, and
+/// silent on a crash until round 8.
+#[test]
+fn the_statement_form_constructor_seeds_its_first_argument() {
+    let direct = format!(
+        "{ROUND8_CACHE}\
+local t = {{}}
+setmetatable(t, Cache)
+return t:reset()
+"
+    );
+    // The same shape inside `new()`, flowing into factory detection through
+    // the existing return-a-derived-local logic.
+    let factory = format!(
+        "{ROUND8_CACHE}\
+function Cache.new()
+  local t = {{}}
+  setmetatable(t, Cache)
+  return t
+end
+local c = Cache.new()
+return c:reset()
+"
+    );
+    // Alias-rooted: `u` and `t` name one table.
+    let aliased = format!(
+        "{ROUND8_CACHE}\
+local t = {{}}
+local u = t
+setmetatable(u, Cache)
+return t:reset()
+"
+    );
+    for (name, src) in [("direct", direct), ("factory", factory), ("alias", aliased)] {
+        assert!(has(&src, &LintConfig::new(), "LB0510"), "silent on {name}");
+    }
+}
+
+/// `and`/`or` follow the operand the expression **definitively evaluates
+/// to**. A construction is a table, so it is always truthy: `ctor or x` is
+/// the construction, `x or ctor` is undecidable and not followed,
+/// `x and ctor` is followed (a falsy `x` fails the call just as hard), and
+/// `ctor and x` evaluates to `x`.
+#[test]
+fn a_logical_operator_follows_only_the_operand_it_evaluates_to() {
+    let fires = [
+        ("ctor or x", "local c = setmetatable({}, Cache) or {}\n"),
+        (
+            "x and ctor",
+            "local ready = true\nlocal c = ready and setmetatable({}, Cache)\n",
+        ),
+    ];
+    let silent = [
+        (
+            "x or ctor",
+            "local fallback = nil\nlocal c = fallback or setmetatable({}, Cache)\n",
+        ),
+        (
+            "ctor and x",
+            "local c = setmetatable({}, Cache) and { reset = function() return 1 end }\n",
+        ),
+    ];
+    for (name, init) in fires {
+        let src = format!("{ROUND8_CACHE}{init}return c:reset()\n");
+        assert!(
+            has(&src, &LintConfig::new(), "LB0510"),
+            "silent on `{name}`"
+        );
+    }
+    for (name, init) in silent {
+        let src = format!("{ROUND8_CACHE}{init}return c:reset()\n");
+        assert!(
+            !has(&src, &LintConfig::new(), "LB0510"),
+            "fired on `{name}`"
+        );
+    }
+}
+
+/// A module-table factory on a **global** table. Functions attached to a
+/// table were keyed by binding, and a global name has no binding, so
+/// `M.new()` resolved to no body at all. The local control has always worked
+/// and is asserted beside it.
+#[test]
+fn a_module_table_factory_resolves_whether_the_table_is_local_or_global() {
+    for owner in ["M = {}", "local M = {}"] {
+        let src = format!(
+            "{ROUND8_CACHE}{owner}
+function M.new() return setmetatable({{}}, Cache) end
+local c = M.new()
+return c:reset()
+"
+        );
+        assert!(
+            has(&src, &LintConfig::new(), "LB0510"),
+            "silent on `{owner}`"
+        );
+    }
+}
+
+/// Dot dispatch with an explicit self is the same lookup as the colon form
+/// and fails the same way. What must *not* count is a field access that never
+/// calls, a metafield read, or a key naming nothing on the carrier.
+#[test]
+fn dot_dispatch_is_an_instance_use_but_a_field_read_is_not() {
+    let dispatch =
+        format!("{ROUND8_CACHE}local c = setmetatable({{}}, Cache)\nreturn c.reset(c)\n");
+    assert!(has(&dispatch, &LintConfig::new(), "LB0510"));
+    for tail in [
+        "return type(c.reset)\n",
+        "local r = c.reset\nreturn type(r)\n",
+        "return type(c.__mode)\n",
+        "return c.absent(c)\n",
+    ] {
+        let src = format!("{ROUND8_CACHE}local c = setmetatable({{}}, Cache)\n{tail}");
+        assert!(
+            !has(&src, &LintConfig::new(), "LB0510"),
+            "fired on `{tail}`"
+        );
+    }
+}
+
 // --- suppression / malformed-ignore (LB0500) -------------------------------
 
 #[test]
