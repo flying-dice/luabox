@@ -661,6 +661,32 @@ print(p.z)
         assert!(!second.contains("helper"), "{second}");
     }
 
+    /// The one shape that does *not* fully close: a module whose export is a
+    /// `---@class` instance rather than a table literal. The export type is
+    /// `Ty::Named("Point")`, so the binding hovers as the class — useful, and
+    /// what the type pass has — but the class's `---@field`s live in the
+    /// *declaring* file, and resolving them needs the ambient environment
+    /// only the type pass holds. Members of such a module therefore have no
+    /// hover here while diagnostics still check them. Pinned so the boundary
+    /// is a recorded fact rather than a surprise; the README scopes the claim
+    /// to match.
+    #[test]
+    fn a_class_instance_module_hovers_as_the_class_but_has_no_member_hover() {
+        let files = [
+            (
+                "main.lua",
+                "local p = require(\"point\")\nprint(p)\nprint(p.x)\n",
+            ),
+            (
+                "point.lua",
+                "---@class Point\n---@field x number\n\n---@type Point\nlocal P = nil\nreturn P\n",
+            ),
+        ];
+        let binding = at_files(&files, "p)", 0).expect("hover");
+        assert!(binding.contains("local p: Point"), "{binding}");
+        assert_eq!(at_files(&files, "x)", 0), None);
+    }
+
     #[test]
     fn see_lines_render_one_inline_and_several_as_bullets() {
         assert_eq!(see_lines(&["a.b".to_string()]), "See: a.b");
