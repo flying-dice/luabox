@@ -126,13 +126,34 @@ Feature: Control-flow legality — goto / label / break (#44)
     And diagnostic LB0021 is reported
     And stdout contains exactly 1 occurrence of "error[LB0021]"
 
+  # The control that proves `--target` is live at pass 2 while pass 3 stays
+  # quiet: `goto` and `::a::` are both illegal in 5.1, so the reader gets two
+  # LB0010s and nothing from the control-flow pass (which skips goto/label for
+  # editions without `goto` at all). Shockwave round 3's exact shape.
   Scenario: `goto` on a 5.1 target stays the dialect finding, with no second complaint
-    Given a project with edition "5.4"
-    And a Lua file containing 'local i = 0 ::top:: i = i + 1 if i < 3 then goto top end'
+    Given a project with edition "5.2"
+    And a Lua file containing 'do goto a end ::a::'
     When I run "luabox check --target 5.1"
     Then the command fails
     And diagnostic LB0010 is reported
+    And stdout contains exactly 2 occurrence of "error[LB0010]"
     And no control-flow diagnostic is reported
+
+  Scenario: the same program is clean on the edition alone
+    Given a project with edition "5.2"
+    And a Lua file containing 'do goto a end ::a::'
+    When I run "luabox check"
+    Then the command succeeds
+    And zero diagnostics are reported
+
+  # The reverse direction cannot produce a false negative — the shadow is
+  # already illegal in the edition, so `--target` has nothing left to add.
+  Scenario: edition 5.4 rejects the nested label shadow with no target at all
+    Given a project with edition "5.4"
+    And a Lua file containing '::a:: do ::a:: end'
+    When I run "luabox check"
+    Then the command fails
+    And diagnostic LB0021 is reported
 
   Scenario: `break` outside a loop is reported once whatever the target
     Given a project with edition "5.1"

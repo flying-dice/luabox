@@ -1158,25 +1158,65 @@ fn every_registered_rule_is_uniquely_identified_and_described() {
 /// cannot see the rule registry — so this is where it lives.
 #[test]
 fn every_rule_code_is_in_the_lint_band() {
-    for rule in rules() {
+    let registry = rules();
+    assert!(!registry.is_empty(), "the registry is empty");
+    for rule in &registry {
         let code = rule.code();
+        // `is_lint_rule` is `is_lint` minus `LB0500`, the crate's own
+        // malformed-`---@luabox-ignore` diagnostic: in the band (so the LSP
+        // tags it with the lint source) but not a rule.
         assert!(
-            code.is_lint(),
-            "rule `{}` has code {code}, outside the lint band",
-            rule.id()
-        );
-        // `LB0500` is the crate's own malformed-`---@luabox-ignore`
-        // diagnostic, not a rule; the rule codes start one above it.
-        assert_ne!(
-            code.number(),
-            luabox_diag::Code::LINT_BAND_START,
-            "rule `{}` claims LB0500, which is the suppression-syntax code",
+            code.is_lint_rule(),
+            "rule `{}` has code {code}, which is not a lint rule code",
             rule.id()
         );
     }
-    // The suppression-syntax diagnostic is in the band too — the band is
-    // "codes this crate raises", which is what the LSP's source tag means.
+    // The suppression-syntax diagnostic is in the band and is not a rule —
+    // both halves, so neither predicate can quietly collapse into the other.
     assert!(luabox_diag::Code::new(500).is_lint());
+    assert!(!luabox_diag::Code::new(500).is_lint_rule());
+}
+
+/// The second unwritten invariant behind the editor's quick-fix matcher:
+/// **only rules carry fixes**.
+///
+/// `crate::lint_source` mirrors a rule's machine-applicable fix into both the
+/// `fixes` list and the diagnostic's suggestions, and the language server
+/// pairs them back up by span + replacement before offering a code action.
+/// A fix arriving on a diagnostic outside the rule band would be matched to
+/// a diagnostic the editor tagged with the toolchain source, and the action
+/// would reference a diagnostic the client never saw.
+#[test]
+fn only_lint_rules_carry_fixes() {
+    // A file with a fixable finding (`pairs` over an array literal), a
+    // non-rule lint-crate finding (`LB0500`, a bare ignore tag), and a
+    // control-flow legality error (`LB0022`) — all three travel out of the
+    // same engine.
+    let src = "\
+---@luabox-ignore
+local function each()
+  for _, v in pairs({ 1, 2, 3 }) do print(v) end
+end
+break
+return each
+";
+    let out = lint(src, &LintConfig::new());
+    let codes: Vec<String> = out.diagnostics.iter().map(|d| d.code.to_string()).collect();
+    assert!(codes.contains(&"LB0500".to_owned()), "{codes:?}");
+    assert!(codes.contains(&"LB0022".to_owned()), "{codes:?}");
+    assert!(codes.contains(&"LB0507".to_owned()), "{codes:?}");
+    assert!(!out.fixes.is_empty(), "expected at least one fix");
+
+    for diag in &out.diagnostics {
+        if diag.suggestions.is_empty() {
+            continue;
+        }
+        assert!(
+            diag.code.is_lint_rule(),
+            "{} carries a fix but is not a lint rule code",
+            diag.code
+        );
+    }
 }
 
 #[test]

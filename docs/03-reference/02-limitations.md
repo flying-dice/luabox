@@ -84,16 +84,6 @@ as a type annotation (not through a value use site) is not flagged —
 deliberate luals parity; its `deprecated` diagnostic also fires only on
 value/call use sites.
 
-The `__index`-less carrier is the one place where that parity and the runtime
-disagree outright: `local c = setmetatable({}, C)` followed by `c:m()`
-resolves in the checker and is `attempt to call a nil value (method 'm')` in
-every reference Lua, because instance lookup reads `C.__index`, not `C`. The
-checker keeps parity — that is what makes annotations portable — and the
-runtime gap is covered by the `metatable-without-index` lint (`LB0510`,
-suspicious tier). That rule is **luabox-specific**: luals ships no equivalent
-diagnostic, so `[lint] metatable-without-index = "allow"` restores exact luals
-behaviour.
-
 Two boundaries here are real and deliberate. A receiver that cannot resolve to
 a single declared class at all — an `any`/unknown parameter, a union, a table
 built behind an unresolved metatable — surfaces nothing: the method it names is
@@ -101,6 +91,47 @@ not known, so there are no tags to report. And a *dotted* call reached through a
 value expression (`w.helper(…)` where `w` is an instance) is not
 argument-checked; dotted callees resolve by name, so only `M.helper(…)` on the
 module table itself is. Both cost false negatives, never false positives.
+
+### The `__index`-less carrier: member *resolution* falls through
+
+The `C.__index = C`-less carrier is not only a tag-propagation case. **Member
+resolution itself falls through**: a value derived from `setmetatable({}, C)`
+resolves `C`'s carrier-attached members *as if `__index` were set*, so `c:m()`
+type-checks, takes `m`'s declared signature and return type, and reports
+nothing — no `LB0306` — even though no metatable link exists at runtime. This
+is the deliberate luals-parity behaviour of #33 (luals folds carrier
+attachments into the class off the carrier binding, with no metatable
+reasoning), and it is the one place where that parity and the runtime disagree
+outright:
+
+```lua
+---@class Counter
+---@field n integer
+local Counter = {}
+function Counter:value() return self.n end
+
+local c = setmetatable({ n = 1 }, Counter)
+print(c:value())   -- luabox check: exit 0
+                   -- lua5.4:       attempt to call a nil value (method 'value')
+```
+
+Adding `Counter.__index = Counter` makes the program run. The fall-through is
+scoped: it only *adds* resolutions off a resolved carrier — `c:nonexistent()`
+on the same value still reports `LB0306` — so a genuinely undefined member is
+not hidden by it.
+
+Note that the "false negatives, never false positives" line above is about
+**unresolved** receivers (an `any`/union/unknown receiver surfaces nothing
+because there is no member to speak about). It does **not** describe this
+case: here the receiver resolves fine and the finding the runtime would
+justify is suppressed on purpose.
+
+The checker keeps parity — that is what makes annotations portable — and the
+runtime gap is covered by the `metatable-without-index` lint (`LB0510`,
+suspicious tier), which fires on `setmetatable(t, C)` where `C` is an in-file
+`---@class` carrier whose `__index` is never assigned. That rule is
+**luabox-specific**: luals ships no equivalent diagnostic, so
+`[lint] metatable-without-index = "allow"` restores exact luals behaviour.
 
 Every operator luals supports applies. Binary/unary operator *expressions*
 (`add`, `sub`, `mul`, `div`, `mod`, `pow`, `idiv`, `concat`, `band`, `bor`,
