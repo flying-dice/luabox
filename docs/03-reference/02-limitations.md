@@ -181,25 +181,62 @@ it has to make:
   Reassigning an *alias* (`mt = {}`) is not a write to the carrier's table and
   does not suppress.
 
-**A carrier that declares another metafield *and* has no instance methods is
-treated as an operator metatable.** Both halves are required. Any
-`__`-prefixed key other than `__index` — `__call`, `__tostring`, `__add`,
-`__mode`, `__gc`, `__name`, … — marks the carrier as declaring a metafield; a
-colon-declared function on the carrier (`function C:m()`) marks it as carrying
-an instance method. A carrier with a metafield and no instance method is
-silent: nothing is ever looked up through it, so there is nothing for a
-missing `__index` to break. A carrier with both still fires, because
-`instance:m()` crashes no matter how many operators the class overloads — the
+**A carrier that declares another metafield fires only on an observed
+instance-side use.** Any `__`-prefixed key other than `__index` — `__call`,
+`__tostring`, `__add`, `__mode`, `__gc`, `__name`, … — marks the carrier as
+declaring a metafield, and from there the rule asks a *behavioural* question
+rather than a structural one: does some colon call in this file actually reach
+a method on an instance of that carrier? If it does, the finding stands — the
 idiomatic Vector2 tutorial class (a dot constructor, `:length()`, `__tostring`
-and `__add`) is exactly that shape, and it does crash.
+and `__add`) is exactly that shape, and `v:length()` does crash. If nothing
+reaches a method, the carrier reads as a deliberate operator metatable and
+stays silent.
 
-The rule does not claim to know the author's *intent* here; it checks those
-two structural facts. Two things deliberately do not count as instance
-methods: `---@field`-declared members (the canonical carrier declares
-`---@field n integer` for a data field, not a method) and dot-assigned
-function fields (`C.new = function() … end` is called as `C.new()`, never
-through the metatable). Both omissions are false-negative-shaped — a carrier
-declaring a metafield alongside only those stays silent.
+A *declaration* is not a use. `Cache.__mode = "k"` beside a
+`function Cache:reset()` that nothing ever invokes is a weak-keyed table with
+a helper on it, and the program runs fine; the rule warned on eight such
+carriers until the gate stopped counting colon-method declarations and started
+counting reached calls (Shockwave round 6).
+
+An instance-side use is a colon call on a value the pass can *derive* from
+`setmetatable(_, C)` — derivation is what keeps one class's calls from
+settling another's. Four derivations are followed, and no more:
+
+- the construction itself, method-called on the spot:
+  `setmetatable({}, C):m()`;
+- a local bound to it (`local c = setmetatable({}, C)`), and any
+  `local d = c` alias of that local;
+- the constructor pattern: a function whose body returns a construction
+  (directly, or via a local it bound to one) is a factory for that carrier,
+  so `local c = Counter.new(); c:value()` is a use. Constructor depth is
+  one — a factory returning another factory's result is not chased;
+- `self` inside a function attached to the carrier, colon-declared method or
+  metafield alike. A `__call` factory whose body is `return self:build()`
+  reaches an instance method from inside the carrier, and that does crash.
+
+Everything outside those four derives nothing, so an instance reached through
+a table field, a parameter or a `require` leaves the operator table silent.
+Those misses are false-negative-shaped, which is the direction this arm has to
+err in: the carrier declared a metafield, so silence is the plausible reading.
+
+**The behavioural gate applies to the metafield arm only.** A carrier with no
+metafield at all is judged structurally — the construction alone is enough,
+whether or not any method is invoked — and that is deliberate.
+`local c = setmetatable({ n = 1 }, Counter)` on a `Counter` with no `__index`
+and no metafield cannot serve the lookup the `---@class` annotation promises,
+however little the file goes on to do with it, and that reading is pinned by
+four rounds of measurement.
+
+Two things still deliberately do not make a carrier a class:
+`---@field`-declared members (the canonical carrier declares `---@field n
+integer` for a data field, not a method) and dot-assigned function fields
+(`C.new = function() … end` is called as `C.new()`, never through the
+metatable). Neither is an instance-side use on its own.
+
+The shape matrix behind every claim in this section is committed and runnable:
+`scripts/tests/lb0510-matrix/` holds one program per shape with its expected
+lint verdict, and `scripts/tests/lb0510-matrix.sh` re-derives both columns —
+what `luabox lint` says, and what `lua5.4` does when the program is executed.
 
 **It is lint-only.** `LB0510` never affects `luabox check`'s exit code; it
 appears in `luabox lint` (and in the editor, on the lint channel). Wiring it

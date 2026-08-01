@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 
 use luabox_diag::Code;
 use luabox_hir::{
-    BindingId, BindingKind, Body, Expr, ExprId, HirId, Literal, LoweredFile, Resolution, Stmt,
+    BindingId, BindingKind, Body, BodyId, Expr, ExprId, HirId, Literal, Resolution, Stmt,
     TableEntry,
 };
 
@@ -47,6 +47,12 @@ const INDEX: &str = "__index";
 /// `__mode`, …). A carrier declaring one of these is a metatable with a
 /// deliberate purpose that is not instance lookup.
 const METAFIELD_PREFIX: &str = "__";
+
+/// The receiver name a function attached to the carrier reaches an instance
+/// through — implicit under `function C:m()`, written out under
+/// `function C.__call(self, …)`. Both spellings count (see
+/// [`InstanceUses::seed_attached_self`]).
+const SELF: &str = "self";
 
 /// `setmetatable(<expr>, C)` where `C` is a `---@class` carrier declared in
 /// this file and nothing ever assigns `C.__index` — so every `instance:m()`
@@ -64,13 +70,16 @@ const METAFIELD_PREFIX: &str = "__";
 ///   spelling this pass can see (see [`Carriers::index_is_settled`]);
 /// - the carrier is not an *operator table*: one that declares some other
 ///   metafield (`__call`, `__tostring`, `__add`, `__mode`, `__gc`, `__name`,
-///   …) **and** carries no instance methods (see
-///   [`Carriers::is_operator_table`] and [`Carriers::has_instance_methods`]).
+///   …) with **no observed instance-side use** (see
+///   [`Carriers::is_operator_table`] and [`Carriers::has_instance_use`]).
 ///   `Vec.__tostring` on a carrier nothing is ever called on is a deliberate
 ///   operator metatable and there is nothing for a missing `__index` to
-///   break; the same `__tostring` on a carrier that also declares
-///   `function Vec:length()` is a class that happens to overload an operator,
-///   and `v:length()` still crashes.
+///   break; the same `__tostring` on a carrier some `v:length()` in the file
+///   actually reaches is a class that happens to overload an operator, and
+///   that call still crashes. The gate is behavioural, not structural:
+///   *declaring* `function Cache:reset()` next to `Cache.__mode = "k"` is not
+///   a lookup, and a `Cache` nothing is ever invoked on runs fine (Shockwave
+///   round 6 measured eight such carriers).
 ///
 /// It is **in-file only** — the carrier, the `__index` write and the
 /// `setmetatable` call must all be in the file being linted — and, being a
@@ -114,22 +123,14 @@ impl Rule for MetatableWithoutIndex {
         let mut out = Vec::new();
         for (body_id, body) in ctx.lowered.bodies() {
             for (_, expr) in body.exprs() {
-                let Expr::Call { callee, args } = expr else {
+                // One diagnostic per `setmetatable` call site, by
+                // construction: each call expression is visited once and
+                // pushes at most one finding, so a carrier used as a
+                // metatable twice reports twice — once per site — and never
+                // twice for the same site.
+                let Some(meta) = setmetatable_arg(ctx, body_id, body, expr) else {
                     continue;
                 };
-                if !matches!(body.expr(*callee), Expr::Name(n) if n == "setmetatable") {
-                    continue;
-                }
-                if !matches!(
-                    ctx.lowered.resolution(HirId::expr(body_id, *callee)),
-                    Some(Resolution::Global(name)) if name == "setmetatable"
-                ) {
-                    continue;
-                }
-                if args.len() != 2 {
-                    continue;
-                }
-                let meta = args[1];
                 let Some(binding) = binding_of(ctx.lowered.resolution(HirId::expr(body_id, meta)))
                 else {
                     continue;
@@ -143,11 +144,17 @@ impl Rule for MetatableWithoutIndex {
                 if carriers.index_is_settled(carrier) {
                     continue;
                 }
-                // An operator metatable has no instance lookup to break — but
-                // only when nothing is ever looked up through it. A carrier
-                // with colon methods on it needs `__index` no matter how many
-                // operators it also overloads.
-                if carriers.is_operator_table(carrier) && !carriers.has_instance_methods(carrier) {
+                // An operator metatable has no instance lookup to break — so
+                // a carrier that declares a metafield only fires once this
+                // file actually *reaches* a method on an instance of it. A
+                // declared-but-never-invoked `function Cache:reset()` is not
+                // a lookup; `c:value()` on a value derived from
+                // `setmetatable(_, Cache)` is (see [`InstanceUses`]).
+                //
+                // Carriers with no metafield at all never reach this arm:
+                // that region is the rule's original, measured-clean
+                // behaviour and is deliberately left structural.
+                if carriers.is_operator_table(carrier) && !carriers.has_instance_use(carrier) {
                     continue;
                 }
                 let Some(range) = ctx.node_range(HirId::expr(body_id, meta)) else {
@@ -177,6 +184,38 @@ impl Rule for MetatableWithoutIndex {
     }
 }
 
+/// The metatable argument of a real `setmetatable(t, C)` call — the second of
+/// exactly two arguments to the *global* `setmetatable`, not a shadowing
+/// local. `None` for every other expression.
+///
+/// Shared by [`MetatableWithoutIndex::check`], which reports on the call, and
+/// [`InstanceUses`], which treats it as the origin of an instance value: both
+/// must agree on what counts as a construction, or the behavioural gate would
+/// be answering a different question from the one the rule asks.
+fn setmetatable_arg(
+    ctx: &LintContext<'_>,
+    body_id: BodyId,
+    body: &Body,
+    expr: &Expr,
+) -> Option<ExprId> {
+    let Expr::Call { callee, args } = expr else {
+        return None;
+    };
+    if !matches!(body.expr(*callee), Expr::Name(n) if n == "setmetatable") {
+        return None;
+    }
+    if !matches!(
+        ctx.lowered.resolution(HirId::expr(body_id, *callee)),
+        Some(Resolution::Global(name)) if name == "setmetatable"
+    ) {
+        return None;
+    }
+    match args.as_slice() {
+        [_, meta] => Some(*meta),
+        _ => None,
+    }
+}
+
 /// Which carrier bindings the rule must not fire on: those whose `__index` is
 /// settled, and those that are metatables for some purpose other than
 /// instance lookup.
@@ -187,7 +226,7 @@ struct Carriers {
     aliases: Aliases,
     settled: HashSet<BindingId>,
     operator_tables: HashSet<BindingId>,
-    instance_methods: HashSet<BindingId>,
+    instance_uses: HashSet<BindingId>,
 }
 
 impl Carriers {
@@ -218,30 +257,22 @@ impl Carriers {
     ///   `setmetatable`. Reassignment is *not* followed through aliases:
     ///   `mt = {}` rebinds the name `mt`, it does not touch `C`'s table.
     ///
-    /// Separately it records two things the suppression decision needs:
+    /// Separately it records the **operator tables**: carriers that declare
+    /// some *other* metafield (`__call`, `__tostring`, `__add`, `__mode`,
+    /// `__gc`, `__name`, …). Those, and only those, are then put to the
+    /// behavioural question [`InstanceUses`] answers — is a method ever
+    /// actually reached on an instance of this carrier?
     ///
-    /// - **operator tables**: carriers that declare some *other* metafield
-    ///   (`__call`, `__tostring`, `__add`, `__mode`, `__gc`, `__name`, …);
-    /// - **instance methods**: carriers with a colon-declared function on them
-    ///   (`function C:m()`), which is precisely what instance lookup — and so
-    ///   `__index` — is needed for.
-    ///
-    /// Only a carrier with a metafield **and** no instance method is treated
-    /// as an operator metatable. A colon method is the discriminator because
-    /// it is unambiguous: `self` is implicit, so the function is written to be
-    /// reached as `instance:m()`, which is the lookup a missing `__index`
-    /// breaks. A `---@field` is not counted — the canonical carrier declares
-    /// `---@field n integer` for a *data* field on the instance, not a method
-    /// — and neither is a dot-assigned function field (`C.new = function() …`,
-    /// the idiomatic constructor, is called as `C.new()`, never through the
-    /// metatable). Both are false-negative-shaped omissions: a carrier that
-    /// declares only `---@field`-style methods alongside a metafield stays
-    /// silent.
+    /// Wave 16 asked a *structural* question instead ("does the carrier
+    /// declare a colon method?"), and Shockwave round 6 measured eight
+    /// carriers where the answer was yes and the program ran fine: declaring
+    /// `function Cache:reset()` beside `Cache.__mode = "k"` is not a lookup.
+    /// The colon-method set is therefore gone; what replaced it is in
+    /// [`InstanceUses`].
     fn build(ctx: &LintContext<'_>) -> Self {
         let aliases = Aliases::build(ctx);
         let mut settled: HashSet<BindingId> = HashSet::new();
         let mut operator_tables: HashSet<BindingId> = HashSet::new();
-        let mut instance_methods: HashSet<BindingId> = HashSet::new();
         for (body_id, body) in ctx.lowered.bodies() {
             let resolve =
                 |expr: ExprId| binding_of(ctx.lowered.resolution(HirId::expr(body_id, expr)));
@@ -251,8 +282,8 @@ impl Carriers {
 
             for (_, stmt) in body.stmts() {
                 match stmt {
-                    Stmt::Assign { targets, values } => {
-                        for (slot, &target) in targets.iter().enumerate() {
+                    Stmt::Assign { targets, .. } => {
+                        for &target in targets {
                             match body.expr(target) {
                                 // `C.__index = …`, `C.__call = …`, `C[k] = …`
                                 // — and `function C.__tostring(v) … end` and
@@ -272,17 +303,11 @@ impl Carriers {
                                         KeyKind::Metafield => {
                                             operator_tables.insert(carrier);
                                         }
-                                        // Only an ordinary key names an
-                                        // instance method; `function
-                                        // C:__call(…)` is a metafield spelled
-                                        // with a colon, not a method lookup.
-                                        KeyKind::Plain => {
-                                            if values.get(slot).is_some_and(|&v| {
-                                                is_colon_method(ctx.lowered, body, v)
-                                            }) {
-                                                instance_methods.insert(carrier);
-                                            }
-                                        }
+                                        // An ordinary key says nothing about
+                                        // instance lookup on its own — what
+                                        // it is *used* for is [`InstanceUses`]
+                                        // question.
+                                        KeyKind::Plain => {}
                                     }
                                 }
                                 // `C = <anything>` — the annotated value is
@@ -343,11 +368,19 @@ impl Carriers {
                 }
             }
         }
+        // The behavioural gate only ever gates the operator-table arm, so it
+        // is only ever paid for by a file that has one. A file with no
+        // metafield-declaring carrier skips the traversal entirely.
+        let instance_uses = if operator_tables.is_empty() {
+            HashSet::new()
+        } else {
+            InstanceUses::build(ctx, &aliases)
+        };
         Self {
             aliases,
             settled,
             operator_tables,
-            instance_methods,
+            instance_uses,
         }
     }
 
@@ -368,10 +401,11 @@ impl Carriers {
         self.operator_tables.contains(&binding)
     }
 
-    /// Whether this carrier declares a colon method (`function C:m()`) — the
-    /// lookup a missing `__index` breaks.
-    fn has_instance_methods(&self, binding: BindingId) -> bool {
-        self.instance_methods.contains(&binding)
+    /// Whether some colon call in this file lands on a value derived from
+    /// `setmetatable(_, C)` — the lookup a missing `__index` breaks, observed
+    /// rather than inferred from a declaration. See [`InstanceUses`].
+    fn has_instance_use(&self, binding: BindingId) -> bool {
+        self.instance_uses.contains(&binding)
     }
 }
 
@@ -380,6 +414,13 @@ impl Carriers {
 /// Only `local` aliases of a *name* are followed. Storing the carrier in a
 /// table, passing it to a function or returning it are all values this pass
 /// does not track, and each stays exactly as unknown as it was.
+///
+/// The map is **fully resolved at build time**: every entry points straight
+/// at its root, so [`Self::root`] is one hash lookup. It used to hold the
+/// direct `alias → next` edges and walk them per query, which made
+/// [`Carriers::build`]'s per-write `carrier_of` quadratic in the chain depth
+/// — Shockwave round 6 measured 15.3 s for a file with an 8000-deep chain and
+/// 8000 indexed writes, against a flat control that was linear.
 struct Aliases(HashMap<BindingId, BindingId>);
 
 impl Aliases {
@@ -402,35 +443,353 @@ impl Aliases {
                 }
             }
         }
-        Self(direct)
+        Self(compress(&direct))
     }
 
-    /// Follow `local b = a; local a = C` to `C`. Every `local` introduces a
-    /// fresh binding, so the chain is acyclic by construction; the step bound
-    /// makes that structural rather than assumed.
+    /// The binding `local b = a; local a = C` ultimately names — `C`. One
+    /// lookup: [`compress`] already walked the chain.
     fn root(&self, binding: BindingId) -> BindingId {
-        let mut current = binding;
-        for _ in 0..=self.0.len() {
-            match self.0.get(&current) {
-                Some(&next) if next != current => current = next,
-                _ => break,
-            }
-        }
-        current
+        self.0.get(&binding).copied().unwrap_or(binding)
     }
 }
 
-/// Whether this value is a colon-declared function — `function C:m()`, which
-/// lowers to a plain function whose first parameter is the implicit `self`.
-fn is_colon_method(lowered: &LoweredFile, body: &Body, value: ExprId) -> bool {
-    let Expr::Function(fn_body) = body.expr(value) else {
-        return false;
-    };
-    lowered
-        .body(*fn_body)
-        .params
-        .first()
-        .is_some_and(|&param| lowered.binding(param).kind == BindingKind::SelfParam)
+/// Resolve every alias to its root once, with path compression: each walk
+/// stops at the first already-resolved node and writes the answer back to
+/// every node it passed, so each binding is stepped over at most once across
+/// the whole build and the result is linear in the number of aliases.
+///
+/// The self-loop guard (`next != current`) is kept, and the step bound with
+/// it: every `local` introduces a fresh binding, so a chain is acyclic by
+/// construction, but that is a property of the lowerer rather than of this
+/// function's input, and a bound makes termination structural instead of
+/// assumed. Neither guard costs anything on well-formed input — the bound is
+/// only ever reached by a cycle, which the memo would otherwise spin on.
+fn compress(direct: &HashMap<BindingId, BindingId>) -> HashMap<BindingId, BindingId> {
+    let mut roots: HashMap<BindingId, BindingId> = HashMap::with_capacity(direct.len());
+    let mut path: Vec<BindingId> = Vec::new();
+    for &start in direct.keys() {
+        if roots.contains_key(&start) {
+            continue;
+        }
+        path.clear();
+        let mut current = start;
+        let root = loop {
+            if let Some(&known) = roots.get(&current) {
+                break known;
+            }
+            match direct.get(&current) {
+                Some(&next) if next != current && path.len() <= direct.len() => {
+                    path.push(current);
+                    current = next;
+                }
+                _ => break current,
+            }
+        };
+        for &node in &path {
+            roots.insert(node, root);
+        }
+    }
+    roots
+}
+
+/// A set of carrier bindings.
+type Carrying = HashSet<BindingId>;
+
+/// The raw shapes one traversal of the file collects for [`InstanceUses`].
+/// Kept apart from the derivation state so a phase can read the shapes while
+/// writing the state.
+#[derive(Default)]
+struct Shapes {
+    /// Every `setmetatable(_, C)` call expression, by the carrier root `C`.
+    constructions: HashMap<(BodyId, ExprId), BindingId>,
+    /// Function bodies reachable by name: `local function f` and
+    /// `local f = function …`.
+    fn_of_local: HashMap<BindingId, BodyId>,
+    /// Function bodies reachable as a field of a carrier: `function C.new()`,
+    /// `C.new = function …`. Keyed by carrier root and literal key.
+    fn_of_field: HashMap<(BindingId, String), BodyId>,
+    /// Every `local x = <expr>`, in the order the file declares them.
+    inits: Vec<(BodyId, BindingId, ExprId)>,
+    /// Every `return <expr>`, by the body it returns from.
+    returns: Vec<(BodyId, ExprId)>,
+    /// Every `receiver:m(…)` receiver, by the body it appears in.
+    receivers: Vec<(BodyId, ExprId)>,
+    /// Function bodies attached to a carrier — `function C:m()`,
+    /// `C.__call = function …`, `local C = { __lt = function … }` — with the
+    /// carrier they hang off.
+    attached: Vec<(BodyId, BindingId)>,
+}
+
+/// The carriers with an **observed instance-side use**: somewhere in this
+/// file, a colon call lands on a value this pass can derive from
+/// `setmetatable(_, C)`.
+///
+/// This is the behavioural half of the operator-table gate. Deriving a value
+/// from a construction is what makes it *this* carrier's instance rather than
+/// any instance — `local d = setmetatable({}, D); d:m()` is a use of `D` and
+/// says nothing about a `C` that happens to declare an `m` of its own.
+///
+/// Four derivations are tracked, and they are exactly the four Shockwave's
+/// round-6 shapes need:
+///
+/// 1. **the construction itself**, method-called on the spot:
+///    `setmetatable({}, C):m()`;
+/// 2. **a local bound to it** — `local c = setmetatable({}, C)` — and any
+///    `local d = c` alias of that local, through the same [`Aliases`] map the
+///    carrier side uses;
+/// 3. **the constructor pattern**: a function whose body returns a
+///    construction (directly, or via a local it bound to one) is a *factory*
+///    for that carrier, and a local bound to a call of it holds an instance.
+///    `local c = Counter.new(); c:value()` is the canonical carrier program
+///    and must keep firing;
+/// 4. **`self` inside a function attached to the carrier**, colon-declared
+///    method or metafield alike. A `__call` factory whose body is
+///    `return self:build()` reaches an instance method from *inside* the
+///    carrier, and that program does crash.
+///
+/// Everything else is unknown and stays unknown: a carrier stored in a table,
+/// passed to a function, or reached through `require` derives nothing. That
+/// direction is the safe one here — an underived instance means the operator
+/// table stays silent, which is the false-negative axis, and this rule's
+/// false-positive axis is the one that had eight measured members.
+struct InstanceUses<'ctx, 'src> {
+    ctx: &'ctx LintContext<'src>,
+    aliases: &'ctx Aliases,
+    shapes: Shapes,
+    /// Value bindings (alias roots) and the carriers they may hold an
+    /// instance of.
+    derived: HashMap<BindingId, Carrying>,
+    /// Function bodies that return an instance, and of which carrier.
+    factories: HashMap<BodyId, Carrying>,
+}
+
+impl<'ctx, 'src> InstanceUses<'ctx, 'src> {
+    fn build(ctx: &'ctx LintContext<'src>, aliases: &'ctx Aliases) -> HashSet<BindingId> {
+        let mut this = Self {
+            ctx,
+            aliases,
+            shapes: Shapes::collect(ctx, aliases),
+            derived: HashMap::new(),
+            factories: HashMap::new(),
+        };
+        // Two rounds of `seed_locals`, with factory discovery between them,
+        // and no more: the first round finds the locals bound directly to a
+        // construction, which is what makes a `return` recognisable as a
+        // factory; the second finds the locals bound to a call of one. That
+        // is constructor depth one — `local c = Counter.new()` — which is the
+        // pattern this is for. A factory that returns another factory's
+        // result is not chased, deliberately: an unbounded fixpoint over
+        // (binding × carrier) is a shape a big file could pay for, and the
+        // miss is a false negative, not a false positive.
+        this.seed_locals();
+        this.seed_factories();
+        this.seed_locals();
+        this.seed_attached_self();
+        this.observed()
+    }
+
+    /// The carriers a value expression may hold an instance of.
+    fn carriers_of(&self, body_id: BodyId, expr: ExprId) -> Carrying {
+        match self.ctx.lowered.body(body_id).expr(expr) {
+            // `(setmetatable({}, C)):m()` — the paren is not a value.
+            Expr::Truncate(inner) => self.carriers_of(body_id, *inner),
+            Expr::Name(_) => self
+                .binding_at(body_id, expr)
+                .and_then(|binding| self.derived.get(&binding))
+                .cloned()
+                .unwrap_or_default(),
+            Expr::Call { .. } => {
+                if let Some(&carrier) = self.shapes.constructions.get(&(body_id, expr)) {
+                    return Carrying::from([carrier]);
+                }
+                self.callee_body(body_id, expr)
+                    .and_then(|body| self.factories.get(&body))
+                    .cloned()
+                    .unwrap_or_default()
+            }
+            _ => Carrying::new(),
+        }
+    }
+
+    /// The function body a call expression reaches, when this pass can name
+    /// it: a local holding a function, or a field of a carrier.
+    fn callee_body(&self, body_id: BodyId, call: ExprId) -> Option<BodyId> {
+        let body = self.ctx.lowered.body(body_id);
+        let Expr::Call { callee, .. } = body.expr(call) else {
+            return None;
+        };
+        match body.expr(*callee) {
+            Expr::Name(_) => self
+                .binding_at(body_id, *callee)
+                .and_then(|binding| self.shapes.fn_of_local.get(&binding).copied()),
+            Expr::Index { base, index, .. } => {
+                if !matches!(body.expr(*base), Expr::Name(_)) {
+                    return None;
+                }
+                let carrier = self.binding_at(body_id, *base)?;
+                let key = index_key(body.expr(*index))?;
+                self.shapes
+                    .fn_of_field
+                    .get(&(carrier, key.to_owned()))
+                    .copied()
+            }
+            _ => None,
+        }
+    }
+
+    /// The alias root of the binding a name expression resolves to.
+    fn binding_at(&self, body_id: BodyId, expr: ExprId) -> Option<BindingId> {
+        binding_of(self.ctx.lowered.resolution(HirId::expr(body_id, expr)))
+            .map(|binding| self.aliases.root(binding))
+    }
+
+    /// `local c = <expr>` — record what `c` may hold.
+    fn seed_locals(&mut self) {
+        let mut found: Vec<(BindingId, BindingId)> = Vec::new();
+        for &(body_id, binding, value) in &self.shapes.inits {
+            for carrier in self.carriers_of(body_id, value) {
+                found.push((self.aliases.root(binding), carrier));
+            }
+        }
+        for (binding, carrier) in found {
+            self.derived.entry(binding).or_default().insert(carrier);
+        }
+    }
+
+    /// A body that returns an instance is a factory for that carrier.
+    fn seed_factories(&mut self) {
+        let mut found: Vec<(BodyId, BindingId)> = Vec::new();
+        for &(body_id, value) in &self.shapes.returns {
+            for carrier in self.carriers_of(body_id, value) {
+                found.push((body_id, carrier));
+            }
+        }
+        for (body_id, carrier) in found {
+            self.factories.entry(body_id).or_default().insert(carrier);
+        }
+    }
+
+    /// The `self` of a function attached to the carrier holds an instance of
+    /// it — implicit under `function C:m()`, written out under
+    /// `function C.__call(self, …)`. Only the first parameter counts, and
+    /// only when it is the implicit `self` or is literally named [`SELF`].
+    fn seed_attached_self(&mut self) {
+        let mut found: Vec<(BindingId, BindingId)> = Vec::new();
+        for &(fn_body, carrier) in &self.shapes.attached {
+            let Some(&param) = self.ctx.lowered.body(fn_body).params.first() else {
+                continue;
+            };
+            let binding = self.ctx.lowered.binding(param);
+            if binding.kind == BindingKind::SelfParam || binding.name == SELF {
+                found.push((param, carrier));
+            }
+        }
+        for (binding, carrier) in found {
+            self.derived.entry(binding).or_default().insert(carrier);
+        }
+    }
+
+    /// Every carrier some `receiver:m(…)` in the file reaches.
+    fn observed(&self) -> HashSet<BindingId> {
+        let mut out = HashSet::new();
+        for &(body_id, receiver) in &self.shapes.receivers {
+            out.extend(self.carriers_of(body_id, receiver));
+        }
+        out
+    }
+}
+
+impl Shapes {
+    fn collect(ctx: &LintContext<'_>, aliases: &Aliases) -> Self {
+        let mut this = Self::default();
+        for (body_id, body) in ctx.lowered.bodies() {
+            let carrier_of = |expr: ExprId| {
+                binding_of(ctx.lowered.resolution(HirId::expr(body_id, expr)))
+                    .map(|binding| aliases.root(binding))
+            };
+            for (expr_id, expr) in body.exprs() {
+                match expr {
+                    Expr::Call { .. } => {
+                        if let Some(meta) = setmetatable_arg(ctx, body_id, body, expr)
+                            && let Some(carrier) = carrier_of(meta)
+                        {
+                            this.constructions.insert((body_id, expr_id), carrier);
+                        }
+                    }
+                    Expr::MethodCall { receiver, .. } => {
+                        this.receivers.push((body_id, *receiver));
+                    }
+                    _ => {}
+                }
+            }
+            for (_, stmt) in body.stmts() {
+                match stmt {
+                    Stmt::Local { names, init } => {
+                        for (name, &value) in names.iter().zip(init) {
+                            this.inits.push((body_id, name.binding, value));
+                            match body.expr(value) {
+                                Expr::Function(fn_body) => {
+                                    this.fn_of_local.insert(name.binding, *fn_body);
+                                }
+                                // `local C = { __lt = function … }` attaches
+                                // to the carrier its own constructor declares.
+                                Expr::Table { entries } => {
+                                    this.attach_entries(body, name.binding, entries);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Stmt::LocalFunction { binding, func } => {
+                        if let Expr::Function(fn_body) = body.expr(*func) {
+                            this.fn_of_local.insert(*binding, *fn_body);
+                        }
+                    }
+                    Stmt::Assign { targets, values } => {
+                        for (slot, &target) in targets.iter().enumerate() {
+                            let Expr::Index { base, index, .. } = body.expr(target) else {
+                                continue;
+                            };
+                            if !matches!(body.expr(*base), Expr::Name(_)) {
+                                continue;
+                            }
+                            let (Some(carrier), Some(&value)) =
+                                (carrier_of(*base), values.get(slot))
+                            else {
+                                continue;
+                            };
+                            let Expr::Function(fn_body) = body.expr(value) else {
+                                continue;
+                            };
+                            this.attached.push((*fn_body, carrier));
+                            if let Some(key) = index_key(body.expr(*index)) {
+                                this.fn_of_field.insert((carrier, key.to_owned()), *fn_body);
+                            }
+                        }
+                    }
+                    Stmt::Return(values) => {
+                        this.returns
+                            .extend(values.iter().map(|&value| (body_id, value)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        this
+    }
+
+    /// Attach every function value in a carrier's own table constructor.
+    fn attach_entries(&mut self, body: &Body, carrier: BindingId, entries: &[TableEntry]) {
+        for entry in entries {
+            let value = match entry {
+                TableEntry::Positional(_) => continue,
+                TableEntry::Named { value, .. } | TableEntry::Keyed { value, .. } => *value,
+            };
+            if let Expr::Function(fn_body) = body.expr(value) {
+                self.attached.push((*fn_body, carrier));
+            }
+        }
+    }
 }
 
 /// The literal string key of an index expression, or `None` when the key is

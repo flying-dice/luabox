@@ -22,6 +22,11 @@ use crate::line_index::LineIndex;
 /// The `source` field on published type, parse, and dialect diagnostics.
 const TYPE_SOURCE: &str = "luabox";
 
+/// The code a recovered parse error is published under. `luabox_syntax`'s
+/// parse errors carry a message and a range but no code of their own — the
+/// toolchain assigns them all `LB0001`.
+const PARSE_ERROR: luabox_diag::Code = luabox_diag::Code::new(1);
+
 /// The `source` on published lint diagnostics, distinct from [`TYPE_SOURCE`]
 /// so the editor — and the code-action matcher in [`crate::server`] — can tell
 /// lint findings apart from type diagnostics. The `LB05xx` code carries the
@@ -39,11 +44,16 @@ pub(crate) const LINT_SOURCE: &str = "luabox-lint";
 /// ([`luabox_diag::Code::is_lint`]) — an open-coded `number() / 100 == 5` here
 /// was a contract nothing asserted.
 ///
-/// Every publisher goes through this, including the code-action matcher, which
-/// re-converts the originating diagnostic to pair it with its quick fix. That
-/// site hardcoded [`LINT_SOURCE`], which happened to be right for every fix
-/// that exists today (all of them come from lint rules) and would silently
-/// mis-pair the first fix-carrying diagnostic that does not (Shockwave round 5).
+/// Every publisher goes through this — the type pass, the parse and dialect
+/// passes, the lint pass, and the code-action matcher, which re-converts the
+/// originating diagnostic to pair it with its quick fix. That last site
+/// hardcoded [`LINT_SOURCE`], which happened to be right for every fix that
+/// exists today (all of them come from lint rules) and would silently mis-pair
+/// the first fix-carrying diagnostic that does not (Shockwave round 5); the
+/// first three hardcoded [`TYPE_SOURCE`], which is right for every code they
+/// can emit today and would be wrong for the first one outside the band
+/// (Shockwave round 6). "Every publisher" is now true rather than nearly true,
+/// which is cheaper than keeping the exceptions enumerated and correct.
 pub(crate) const fn source_for(code: luabox_diag::Code) -> &'static str {
     if code.is_lint() {
         LINT_SOURCE
@@ -94,7 +104,7 @@ pub fn diagnostics(
             &index,
             usize::from(err.range.start())..usize::from(err.range.end()),
             DiagnosticSeverity::ERROR,
-            "LB0001",
+            PARSE_ERROR,
             err.message.clone(),
         ));
     }
@@ -105,9 +115,9 @@ pub fn diagnostics(
             &index,
             usize::from(err.range.start())..usize::from(err.range.end()),
             DiagnosticSeverity::ERROR,
-            // `DialectError::code` is the bare number; the protocol carries
-            // the `LBnnnn` spelling.
-            &format!("LB{:04}", err.code),
+            // `DialectError::code` is the bare number; `Code` is what carries
+            // the `LBnnnn` spelling — and what `source_for` reads.
+            luabox_diag::Code::new(err.code),
             err.message,
         ));
     }
@@ -152,7 +162,11 @@ pub fn diagnostics(
         Some(&ambient),
         &requires,
     ) {
-        out.push(convert(&index, &diag, TYPE_SOURCE));
+        // Type diagnostics are all `LB03xx`, so this is `TYPE_SOURCE` today —
+        // but through the band authority rather than by assertion, so a code
+        // moving band moves its source with it.
+        let source = source_for(diag.code);
+        out.push(convert(&index, &diag, source));
     }
 
     // 4. Lint findings — the `luabox lint` engine (SPEC.md §9), published
@@ -213,18 +227,27 @@ pub(crate) fn convert(
     }
 }
 
+/// A diagnostic assembled from a code and a message rather than converted
+/// from a [`luabox_diag::Diagnostic`] — the parse and dialect passes, which
+/// carry their own error types.
+///
+/// The `source` comes from [`source_for`] like every other publisher's.
+/// Neither caller can currently produce a code in the lint band, so this is
+/// `TYPE_SOURCE` in practice; taking the code rather than a pre-rendered
+/// string is what makes that a *derived* fact instead of a hardcoded one
+/// (Shockwave round 6).
 fn diagnostic(
     index: &LineIndex,
     range: std::ops::Range<usize>,
     severity: DiagnosticSeverity,
-    code: &str,
+    code: luabox_diag::Code,
     message: String,
 ) -> Diagnostic {
     Diagnostic {
         range: index.range(range),
         severity: Some(severity),
         code: Some(NumberOrString::String(code.to_string())),
-        source: Some(TYPE_SOURCE.to_string()),
+        source: Some(source_for(code).to_string()),
         message,
         ..Diagnostic::default()
     }
@@ -359,6 +382,47 @@ mod tests {
             let code = luabox_diag::Code::new(number);
             assert_eq!(source_for(code), LINT_SOURCE, "LB{number:04} is a lint");
         }
+    }
+
+    /// The invariant the helper exists for, asserted over the published
+    /// stream rather than over the helper: *every* diagnostic this module
+    /// emits carries the source its code implies. Two publishers used to
+    /// bypass `source_for` and hardcode [`TYPE_SOURCE`] — harmless, since
+    /// neither can produce an `LB05xx`, and exactly the kind of "correct for
+    /// the codes that exist today" that the round-5 code-action bug was
+    /// (Shockwave round 6). Routing them through the helper kills the class;
+    /// this is what notices if one grows back.
+    #[test]
+    fn every_published_diagnostic_carries_the_source_its_code_implies() {
+        // Between them these reach all four publishers: a recovered parse
+        // error (LB0001), a dialect violation under 5.1 (LB0013), a type
+        // diagnostic (LB03xx) and a lint finding (LB05xx). The lint pass is
+        // skipped when the parse is dirty, so the parse-error case has to be
+        // its own source.
+        let sources = [
+            "local y: = 3\n",
+            "local x <const> = 1\nlocal unused = 2\nreturn x\n",
+            "---@type string\nlocal s = 1\nlocal spare = 2\nreturn s\n",
+        ];
+        let mut bands = HashSet::new();
+        let mut seen = 0_usize;
+        for src in sources {
+            for diag in &diagnostics_for(src, Dialect::Lua51) {
+                let Some(NumberOrString::String(spelling)) = &diag.code else {
+                    panic!("every diagnostic carries an LBnnnn code: {diag:?}");
+                };
+                let code: luabox_diag::Code = spelling.parse().expect("a well-formed code");
+                assert_eq!(
+                    diag.source.as_deref(),
+                    Some(source_for(code)),
+                    "{spelling} published under the wrong source: {diag:?}"
+                );
+                bands.insert(code.is_lint());
+                seen += 1;
+            }
+        }
+        assert!(seen >= 4, "expected a mixed stream, saw {seen}");
+        assert_eq!(bands.len(), 2, "both bands must be represented");
     }
 
     // --- harvested rock surfaces (#30) -----------------------------------

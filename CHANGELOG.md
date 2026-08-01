@@ -10,6 +10,36 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ### Fixed
 
+- **`LB0510` no longer warns on a carrier whose methods nobody calls.** The
+  operator-table gate was *structural* where it needed to be *behavioural*: a
+  carrier that declared a lookup-irrelevant metafield **and** a colon method
+  was read as a class, whether or not anything ever invoked that method on an
+  instance. Eight measured shapes warned and ran fine under `lua5.4` —
+  `Cache.__mode = "k"` beside `function Cache:reset()`, a `__newindex` guard
+  beside `Guard:reject()`, an `__lt` comparator beside `Sorter:cmp()`.
+
+  On a carrier with a metafield the rule now fires only on an **observed
+  instance-side use**: a colon call landing on a value derived from
+  `setmetatable(_, C)`. Four derivations are followed — the construction
+  method-called on the spot, a local bound to it (and aliases of that local),
+  the constructor pattern (`local c = Counter.new(); c:value()`), and `self`
+  inside a function attached to the carrier, which is how a `__call` factory
+  doing `return self:build()` still fires. Deriving the value is also what
+  keeps one class's calls from settling another's: a `:get()` on a `Store`
+  instance says nothing about a `Cache` that happens to declare a `get` too.
+
+  A carrier with **no** metafield is unchanged — still structural, still
+  firing on the construction alone. That region is pinned by four rounds of
+  measurement, and gating it behaviourally would reopen the false-negative
+  axis the previous round closed.
+
+  The shape matrix behind all of this is now committed and runnable rather
+  than kept in prose: `scripts/tests/lb0510-matrix/` holds one program per
+  shape with its expected finding count, and `scripts/tests/lb0510-matrix.sh`
+  re-derives both the lint verdict and — where `lua5.4` is on `PATH` — what
+  the program actually does when executed. It is blocking in the differential
+  workflow, the job with real interpreters on the runner.
+
 - **`LB0510` fires again on the canonical carrier class.** The previous
   round's two false-positive fixes each over-reached, and between them they
   silenced the shape `metatable-without-index` exists for. A single
@@ -244,6 +274,53 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   in [the limitations page](docs/03-reference/02-limitations.md).
 
 ### Internal (contributors)
+
+- **Every server-created progress token and its `create` request id are now
+  unique.** Both were derived from the token *name*, a compile-time constant,
+  so three config reloads sent three `window/workDoneProgress/create` requests
+  sharing one id and one token. JSON-RPC requires ids to be unique among
+  outstanding requests and LSP requires server-generated tokens to be unique;
+  a client tracking outstanding requests by id saw the second `create` collide
+  with the first. A per-session counter now feeds both, so a reload announces
+  itself as `luabox/reload-2`, `luabox/reload-3`, …. The startup tokens fire
+  once each but get the same treatment.
+
+- **The work-done capability gate moved inside `begin_progress`.** It returned
+  a token unconditionally and relied on its one call site being guarded —
+  which is what the reload path getting a second, unguarded call site looked
+  like last round. It now returns `Option<ProgressToken>` like its titled
+  sibling, so the gate is a property of the function.
+
+- **Every published diagnostic's `source` is derived from its code.** Two
+  publishers — the type pass and the parse/dialect helper — bypassed
+  `source_for` and hardcoded the toolchain source. Harmless today, since
+  neither can emit an `LB05xx`, and precisely the "right for the codes that
+  exist now" shape as the code-action bug fixed last round. Both are routed
+  through the helper; behaviour is byte-identical, and a new test asserts the
+  invariant over the published stream rather than over the helper.
+
+- **`pin_worker_stacks` has a test that fails when it is deleted.** The old
+  suite (idempotence, plus cross-crate constant equality) passed with the pin
+  gone, the `.stack_size` dropped, or both constants lowered together, and the
+  call site carried a comment claiming no such test could exist. That holds
+  only for parser-driven recursion, which `MAX_DEPTH` caps below 2 MiB; a
+  *synthetic* recursion is under no such cap. `luabox-lsp`'s new
+  `tests/pinned_stack.rs` reaches the pin through `run` — the production call
+  site — then recurses ~8 MiB on a global-pool worker: comfortably past
+  rayon's 2 MiB default and comfortably inside the pinned 16 MiB. It is the
+  only test in its binary, because `build_global` succeeds once per process.
+  All three failure modes were checked by hand and each aborts the binary.
+
+- **`LB0510`'s alias resolution is linear again.** `Carriers::build` calls
+  `Aliases::root` once per indexed write, and `root` walked the whole
+  `local b = a; local a = C` chain on every call — quadratic in chain depth
+  times writes. Measured on a generated file with an 8000-link chain and 8000
+  writes through its deepest link, lint went from 1.27 s to 0.08 s; at 32000
+  (a 1.36 MB file) from 22.85 s to 0.38 s, which is the flat control's time.
+  Every alias is now resolved to its root once at build time, with path
+  compression, so `root` is a single lookup. The self-loop guard and the step
+  bound are kept: a chain is acyclic by construction, but that is a property
+  of the lowerer rather than of this function's input.
 
 - **Work-done progress is gated on the client, and the startup pause has a
   token.** `window.workDoneProgress` was read once and handed to the

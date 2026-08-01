@@ -57,6 +57,17 @@ fn has(source: &str, config: &LintConfig, code: &str) -> bool {
     codes(source, config).iter().any(|c| c == code)
 }
 
+/// How many findings of `code` the default configuration produces. Not built
+/// on [`codes`], which dedupes — the point here is the multiplicity, for
+/// rules whose per-site cardinality is part of the contract.
+fn count(source: &str, code: &str) -> usize {
+    lint(source, &LintConfig::new())
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.to_string() == code)
+        .count()
+}
+
 // --- unused-local (LB0501, style) ------------------------------------------
 
 #[test]
@@ -1399,6 +1410,232 @@ return d:value()
 ";
     assert!(has(via_setmetatable_of_class, &LintConfig::new(), "LB0510"));
     assert!(has(index_to_base_only, &LintConfig::new(), "LB0510"));
+}
+
+// --- LB0510: the behavioural gate on the metafield arm (Shockwave round 6) -
+//
+// Round 6's finding: the operator-table gate was STRUCTURAL where it needed to
+// be BEHAVIOURAL. A carrier that declared a lookup-irrelevant metafield and a
+// colon method that was never invoked on an instance warned, and the program
+// ran fine under `lua5.4` — eight measured shapes. The gate now asks whether a
+// method is actually *reached* on an instance derived from
+// `setmetatable(_, C)`.
+//
+// Every fixture below was run under `lua5.4` (5.4.6) before being written
+// down; the doc comment records what the interpreter did, and the assertion
+// direction follows it. The same shapes are committed as a runnable corpus in
+// `scripts/tests/lb0510-matrix/`, which re-derives both columns — the lint
+// verdict and the runtime verdict — so these claims are falsifiable by anyone
+// with the binary and an interpreter.
+//
+// Only the metafield arm moved. The no-metafield region is pinned by four
+// rounds of measurement and is deliberately untouched; the last test in this
+// section is its guard.
+
+/// The eight false positives, in their three measured species. Each carrier
+/// declares a metafield that has nothing to do with lookup **and** a colon
+/// method that nothing ever invokes on an instance; each program prints and
+/// exits 0 under `lua5.4`.
+#[test]
+fn a_metafield_carrier_whose_method_is_never_invoked_is_silent() {
+    let cache = "\
+---@class Cache
+local Cache = {}
+Cache.__mode = \"k\"
+function Cache:reset() self.n = 0 end
+local store = setmetatable({}, Cache)
+store[{}] = 1
+return store
+";
+    let guard = "\
+---@class Guard
+local Guard = {}
+Guard.__newindex = function(t, k, v) rawset(t, k, v) end
+function Guard:reject() return false end
+local g = setmetatable({}, Guard)
+g.x = 1
+return g
+";
+    let sorter = "\
+---@class Sorter
+local Sorter = {}
+Sorter.__lt = function(a, b) return rawget(a, \"n\") < rawget(b, \"n\") end
+function Sorter:cmp(other) return self.n < other.n end
+local a = setmetatable({ n = 1 }, Sorter)
+local b = setmetatable({ n = 2 }, Sorter)
+return a < b
+";
+    for (name, src) in [("cache", cache), ("guard", guard), ("sorter", sorter)] {
+        assert!(!has(src, &LintConfig::new(), "LB0510"), "fired on `{name}`");
+    }
+}
+
+/// The refuted candidate, kept as a fixture because it is the shape that
+/// makes the gate more than "is the method called at the top level": the
+/// `__call` factory reaches an instance method from *inside* the carrier, on
+/// its own `self`. `lua5.4` says `attempt to call a nil value (method
+/// 'build')`.
+#[test]
+fn a_call_factory_that_reaches_self_fires() {
+    let src = "\
+---@class Factory
+local Factory = {}
+function Factory:build() return 42 end
+function Factory.__call(self) return self:build() end
+local f = setmetatable({}, Factory)
+return f()
+";
+    assert!(has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// …and the colon-declared spelling of the same, where `self` is implicit.
+#[test]
+fn a_colon_declared_metafield_reaching_self_fires() {
+    let src = "\
+---@class Factory
+local Factory = {}
+function Factory:build() return 42 end
+function Factory:__call() return self:build() end
+local f = setmetatable({}, Factory)
+return f()
+";
+    assert!(has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// The canonical carrier program's constructor spelling, with a metafield
+/// alongside. `Counter.new` returns the construction, the call is bound to a
+/// local and the local takes a colon call — `lua5.4` crashes on it, and this
+/// is the shape the behavioural gate must not lose.
+#[test]
+fn the_constructor_pattern_still_fires_beside_a_metafield() {
+    let direct = "\
+---@class Counter
+local Counter = {}
+Counter.__tostring = function(c) return \"c\" end
+function Counter:value() return self.n end
+function Counter.new(n) return setmetatable({ n = n }, Counter) end
+local c = Counter.new(1)
+return c:value()
+";
+    // The same, with the construction bound to a local inside the factory.
+    let via_local = "\
+---@class Counter
+local Counter = {}
+Counter.__mode = \"k\"
+function Counter:value() return self.n end
+function Counter.new(n)
+  local instance = setmetatable({ n = n }, Counter)
+  return instance
+end
+local c = Counter.new(1)
+return c:value()
+";
+    assert!(has(direct, &LintConfig::new(), "LB0510"));
+    assert!(has(via_local, &LintConfig::new(), "LB0510"));
+}
+
+/// The construction method-called on the spot, with no local in between.
+/// `lua5.4`: `attempt to call a nil value (method 'length')`.
+#[test]
+fn an_immediate_colon_call_on_the_construction_fires() {
+    let src = "\
+---@class Vec
+local Vec = {}
+function Vec.__tostring(v) return \"v\" end
+function Vec:length() return 0 end
+return setmetatable({}, Vec):length()
+";
+    assert!(has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// Instance values follow the same alias chain carriers do: `local w = v`
+/// names the same table, so `w:length()` is a use of `v`'s carrier. Crashes.
+#[test]
+fn a_colon_call_through_an_instance_alias_fires() {
+    let src = "\
+---@class Vec
+local Vec = {}
+function Vec.__tostring(v) return \"v\" end
+function Vec:length() return 0 end
+local v = setmetatable({}, Vec)
+local w = v
+return w:length()
+";
+    assert!(has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// Derivation is what makes a use *this* carrier's use. `Store` and `Cache`
+/// both declare `get`; the only `:get()` in the file lands on a `Store`
+/// instance, and `Store` is wired. `Cache` must not borrow that call — the
+/// program runs fine.
+#[test]
+fn a_colon_call_on_another_classs_instance_is_not_a_use_of_this_carrier() {
+    let src = "\
+---@class Cache
+local Cache = {}
+Cache.__mode = \"k\"
+function Cache:get() return 1 end
+
+---@class Store
+local Store = {}
+Store.__index = Store
+function Store:get() return 2 end
+
+local s = setmetatable({}, Store)
+local c = setmetatable({}, Cache)
+return s:get(), type(c)
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// One finding per `setmetatable` *site*, never two for the same site. The
+/// round-6 report saw `Sorter` warn twice; the cause was two constructions,
+/// not a duplicate — and once the shape actually invokes `a:cmp(b)` (which
+/// `lua5.4` refuses: `attempt to call a nil value (method 'cmp')`) both sites
+/// are genuine. Pinned in both directions so a future firing shape cannot
+/// double-report.
+#[test]
+fn a_firing_carrier_reports_once_per_setmetatable_site() {
+    let carrier = "\
+---@class Sorter
+local Sorter = {}
+Sorter.__lt = function(a, b) return rawget(a, \"n\") < rawget(b, \"n\") end
+function Sorter:cmp(other) return self.n < other.n end
+";
+    let two_sites = format!(
+        "{carrier}local a = setmetatable({{ n = 1 }}, Sorter)
+local b = setmetatable({{ n = 2 }}, Sorter)
+return a:cmp(b)
+"
+    );
+    let one_site = format!(
+        "{carrier}local a = setmetatable({{ n = 1 }}, Sorter)
+return a:cmp(a)
+"
+    );
+    assert_eq!(count(&two_sites, "LB0510"), 2, "one per construction");
+    assert_eq!(count(&one_site, "LB0510"), 1);
+}
+
+/// The guard on the region the gate does **not** touch. With no metafield on
+/// the carrier the rule is structural, as it has been for four rounds of
+/// measurement: it fires on the construction whether or not any method is
+/// invoked. This program does not crash — `lua5.4` prints and exits 0 — and
+/// the finding is still correct to make, because the carrier cannot serve the
+/// lookup it was annotated for. Behavioural gating here would reopen the
+/// false-negative axis round 6 closed, so it is deliberately absent.
+#[test]
+fn the_no_metafield_region_stays_structural() {
+    let uninvoked = "\
+---@class Counter
+local Counter = {}
+function Counter:value() return self.n end
+local c = setmetatable({ n = 1 }, Counter)
+return type(c)
+";
+    assert!(has(uninvoked, &LintConfig::new(), "LB0510"));
+    // …and the invoked half of the same region, unchanged.
+    assert!(has(COUNTER_REPRO, &LintConfig::new(), "LB0510"));
 }
 
 // --- suppression / malformed-ignore (LB0500) -------------------------------

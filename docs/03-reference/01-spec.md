@@ -131,10 +131,22 @@ pedantic = "warn"           # tier/rule levels: allow | warn | deny
   (loader) legality** pass only — a program the target's loader refuses is an
   error even where nothing is being emitted. `luabox build` runs that same pass
   as its emit gate, then **lowering** plus the residual validation of each
-  lowered file. `--target` on either command overrides the manifest value *and*
-  additionally turns on the target's **dialect legality** pass, which the
-  manifest value alone deliberately does not: on the `build` path, constructs
-  the target's parser rejects are exactly what lowering exists to rewrite.
+  lowered file. `--target` overrides the manifest value on both commands, but
+  what it *switches on* differs, and the two must not be conflated:
+  - `check --target V` asks the literal question "would this source be legal
+    there?", so it turns on the target's **dialect legality** pass alongside
+    the control-flow one — which the manifest value alone deliberately does
+    not. `check --target 5.1` over `local x = 0x1p4` reports `LB0014` from the
+    gate, and the summary reads `check: 1 errors`.
+  - `build --target V` selects the **lowering target**. The gate it runs first
+    stays loader-only: target-illegal constructs are exactly what lowering
+    exists to rewrite, so refusing them up front would fail the build for
+    using the feature `--target` provides. `build --target 5.1` over the same
+    file reports `check: 0 errors` from the gate, and `LB0014` arrives instead
+    from the **residual** validation of the lowered file, carrying the note
+    that the construct has no lowering rule for that target. Both commands
+    exit 1; they reach it through different passes, and the diagnostic that
+    proves it is the residual arm's note.
 - Every table above is live in v1. `[tasks]` and `[workspace]` were dropped
   in 0.2.0 (#18): they only ever served the removed `run` command and the
   parked solver, so they now get the standard unknown-table error (with the

@@ -313,13 +313,18 @@ impl TestClient {
     }
 
     /// Collect the `$/progress` notification kinds ("begin"/"report"/"end")
-    /// carried by `token`, until (and including) that token's terminating
-    /// "end". Notifications under any *other* token are skipped: startup now
-    /// opens two tokens in sequence — the rock harvest's, then the bootstrap
-    /// index's — so a helper that stopped at the first "end" it saw would
-    /// report the wrong one (Shockwave round 5).
-    fn drain_progress_for(&self, token: &str) -> Vec<&'static str> {
-        let want = ProgressToken::String(token.to_string());
+    /// carried by the token of kind `kind`, until (and including) that token's
+    /// terminating "end". Notifications under any *other* token are skipped:
+    /// startup opens two tokens in sequence — the rock harvest's, then the
+    /// bootstrap index's — so a helper that stopped at the first "end" it saw
+    /// would report the wrong one (Shockwave round 5).
+    ///
+    /// Matched by **prefix**, because a token is a kind plus a per-session
+    /// sequence number (`luabox/reload-2`, `luabox/reload-3`, …): LSP requires
+    /// server-generated tokens to be unique, and repeated pauses of one kind
+    /// are the case that makes that bite (Shockwave round 6). The kind is the
+    /// part a test means.
+    fn drain_progress_for(&self, kind: &str) -> Vec<&'static str> {
         let mut kinds = Vec::new();
         loop {
             if let Message::Notification(not) = self.recv()
@@ -327,7 +332,10 @@ impl TestClient {
             {
                 let params: ProgressParams =
                     serde_json::from_value(not.params).expect("decode progress");
-                if params.token != want {
+                let ProgressToken::String(name) = &params.token else {
+                    continue;
+                };
+                if !name.starts_with(kind) {
                     continue;
                 }
                 let ProgressParamsValue::WorkDone(value) = params.value;

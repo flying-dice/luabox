@@ -1,0 +1,29 @@
+# LB0510 shape matrix -- expected verdicts. Tab-separated, '#' comments.
+#
+#   program              the .lua file in this directory, without the extension
+#   findings             how many LB0510 diagnostics `luabox lint` must emit
+#                        (0 = silent; >1 pins one finding per setmetatable site)
+#   runtime              what `lua5.4` does: `crash` (non-zero exit) or `ok`
+#   note                 why the two columns say what they say
+#
+# `findings` and `runtime` are independent measurements and are NOT asserted
+# equal -- see README.md. Every row below was taken from the tools, not
+# reasoned about.
+#
+# program	findings	runtime	note
+metafield_mode_uninvoked_method	0	ok	FP closed round 6: a declared-but-uninvoked method is not a lookup
+metafield_newindex_uninvoked_method	0	ok	FP closed round 6: same, through a __newindex guard
+metafield_lt_uninvoked_method	0	ok	FP closed round 6: same, through an __lt comparator (two constructions)
+metafield_lt_invoked_method	2	crash	the same carrier once a:cmp(b) is reached -- one finding per construction
+metafield_tostring_invoked_method	1	crash	a class that overloads an operator; c:value() is reached
+metafield_call_factory_reaches_self	1	crash	the instance-side use is self:build() inside the carrier's own __call
+metafield_constructor_pattern_invoked	1	crash	constructor pattern: Counter.new() returns the construction, c:value() reaches it
+metafield_constructor_via_local_invoked	1	crash	the same, with the construction bound to a local inside the factory
+metafield_immediate_colon_call	1	crash	setmetatable({}, Vec):length() -- no local in between
+metafield_instance_alias_invoked	1	crash	the colon call lands on local w = v, an alias of the instance
+metafield_only_no_methods	0	ok	a pure operator metatable: nothing is ever looked up through it
+metafield_other_class_same_method_name	0	ok	the only :get() derives from Store, not Cache -- derivation keeps them apart
+metafield_with_index_invoked	0	ok	__index is written, so the lookup resolves
+plain_carrier_invoked	1	crash	the no-metafield region, canonical repro (round 2)
+plain_carrier_uninvoked	1	ok	the no-metafield region is structural on purpose: the documented over-approximation
+plain_carrier_index_wired	0	ok	__index is written
