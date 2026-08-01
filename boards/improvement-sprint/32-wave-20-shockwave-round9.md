@@ -4,8 +4,8 @@ labels: [release, review]
 priority: high
 agent: opus-w20
 live: true
-status: Wave 20 merged; all 3 threads replied+resolved; awaiting round 10
-updatedAt: 2026-08-01T13:45:00.000Z
+status: Round 10 sweep fixed directly; awaiting round 11 / approval
+updatedAt: 2026-08-01T14:45:00.000Z
 ---
 # Wave 20: Shockwave round-9 threads on PR #47
 
@@ -97,3 +97,5 @@ Round 9's meta-finding is the operating rule for this wave: a fix scoped to one 
   - the `client/registerCapability` gap round 8 stated is still open and still undetected — out of scope for round 9, and named here so it is not mistaken for closed
 
 - **claude** (2026-08-01T13:45:00.000Z): Wave 20 merged to develop (8a41b38; card conflict resolved keeping the agent journal). Spot-checks green: fmt 0, clippy 0, lint 174 tests, lsp 308+133 unit/integration, acceptance 860/4678, lsp_acceptance 194/1406, differential 112/112, lb0510-matrix 119/119 lint AND runtime (Lua 5.4.6). All 3 round-9 threads replied (symmetric pruning + truthiness() + honest two-direction bounds doc; B1 guard+stickiness+own shutdown_handshake with the accidental-pass insight; B2 option (a) no-create-after-timeout) and resolved. Both halves fixtures/tests-first: matrix RED 9, LSP tests RED 5. Awaiting Shockwave round 10.
+
+- **claude** (2026-08-01T14:45:00.000Z): Round 10 @ 9f72beb: all 3 carried threads CLOSED on measurement (Shockwave: "the strongest yet"... "Close these three and I expect to approve"). Its final ~120-execution sweep found 3 defects the PR introduced, all small, fixed DIRECTLY on develop at 580ec8b per the small-item rule: (1) differential.yml paths widened to crates/luabox-lint/** in both lists (the LB0510 runtime gate could be skipped by editing facts.rs — the file this PR changed); (2) check --watch now reruns on versioned rock-tree changes via new layout::is_rock_source (the #30 harvest made the old blanket lua_modules/ exclusion rationale false), unit-pinned both directions; (3) the bundle loader gate carries "at line N" from the finding's own span, pinned at the library boundary. Spot-checks: bundle 69 tests, manifest 125, cli lib, acceptance 860/4678 all green; fmt 0; clippy 0. The 5 pre-existing raise-don't-block observations filed as #50 (global ---@class carrier members), #51 (project-walk symlink guard), #52 (gitlab format path/fingerprint), #53 (lint --format missing), #54 (require-binding hover). All 3 threads replied and resolved. Awaiting round 11 — expected approval.
