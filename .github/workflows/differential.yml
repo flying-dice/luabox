@@ -15,6 +15,15 @@ on:
       - "crates/luabox-bundle/**"
       - "corpus/differ/**"
       - "tools/differ/**"
+      # The control-flow legality gate's own inputs, plus the crates that
+      # carry its codes (luabox-diag) and its pass-3 call site (luabox-cli):
+      # without these, the matrix, the runner's direction check, or the wiring
+      # could be edited or deleted and this job would stay unrun — green with
+      # the dialect-split cell gone.
+      - "scripts/tests/control-flow-differential.sh"
+      - "scripts/tests/control-flow-matrix/**"
+      - "crates/luabox-diag/**"
+      - "crates/luabox-cli/**"
       - ".github/workflows/differential.yml"
   pull_request:
     paths:
@@ -24,6 +33,15 @@ on:
       - "crates/luabox-bundle/**"
       - "corpus/differ/**"
       - "tools/differ/**"
+      # The control-flow legality gate's own inputs, plus the crates that
+      # carry its codes (luabox-diag) and its pass-3 call site (luabox-cli):
+      # without these, the matrix, the runner's direction check, or the wiring
+      # could be edited or deleted and this job would stay unrun — green with
+      # the dialect-split cell gone.
+      - "scripts/tests/control-flow-differential.sh"
+      - "scripts/tests/control-flow-matrix/**"
+      - "crates/luabox-diag/**"
+      - "crates/luabox-cli/**"
       - ".github/workflows/differential.yml"
   schedule:
     # Weekly sweep (Mon 05:17 UTC) so runtime/apt drift is noticed even when
