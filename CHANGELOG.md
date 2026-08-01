@@ -10,6 +10,72 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ### Fixed
 
+- **Every bundle mode refused to notice a chunk the ship target cannot
+  load.** `luabox build`'s residual control-flow validation lived on the
+  tree-mode path only; `bundle = true`, `mode = "love"` and
+  `mode = "nvim-plugin"` all route through the bundler, which validated parse
+  errors and dialect legality but never control-flow legality. A 5.2 project
+  shipping `::a:: do ::a:: end` to 5.4 therefore wrote the illegal chunk into
+  `dist/main.lua` — and into the `.love` archive — and exited **0**, while
+  tree mode exited 1 with no output. The bundler now judges it too, so all
+  four emit shapes agree.
+
+- **A manifest-declared ship target reaches the legality passes.**
+  `[build] target` fed `require` resolution and the rock harvest but nothing
+  that judged the source, so a project *declaring* `target = "5.4"` passed
+  `luabox check` on a program `luabox check --target 5.4` rejects, then built
+  an artifact that cannot load. The control-flow pass now runs for the
+  manifest target as well; `--target` still overrides it. The target's
+  *dialect* legality is deliberately not asked of a manifest target — a
+  declared target says the project is lowered there, and reporting `LB0011`
+  on every `//` in a 5.3 project shipping 5.1 would fail `check` for using
+  the feature `[build] target` exists to provide. An explicit `--target` is
+  the literal "would this source be legal there?" question and still asks
+  both.
+
+- **A duplicate label reported for two dialects no longer contradicts
+  itself.** The edition and target legality runs were merged on (code,
+  primary span) with the first one winning, but two `LB0021`s at the same
+  span are not the same verdict: 5.4's `checkrepeated` searches every open
+  block where 5.2's searches only the current one, so the first-definition
+  site is dialect-dependent. Edition 5.2 with `--target 5.4` over
+
+  ```lua
+  ::a::
+  do
+    ::a::
+    ::a::
+  end
+  ```
+
+  named line 4 as a duplicate of line 3, then line 3 as a duplicate of line
+  1 — line 3 reported as both — and printed them out of source order. The
+  ship target's verdict now wins a construct both reject, a finding only the
+  target rejects says so in a note, and the merged set is rendered in source
+  order.
+
+- **`luabox build`'s duplicate-label report carries a span.** It was
+  reconstructed from the lowered text, whose ranges do not index the source,
+  so it shipped with no labels at all while `check --target` gave full spans
+  for the identical defect. The build gate now judges the source at the ship
+  target, so the finding underlines the duplicate and points at the first
+  definition. The spanless residual pass over the lowered output stays as the
+  belt-and-braces catch for anything lowering itself introduces.
+
+- **`metatable-without-index` (`LB0510`) no longer warns on correct code.**
+  Two shapes were false positives. An *operator metatable* — a carrier
+  declaring `__call`, `__tostring`, `__add` or `__mode` and no `__index` —
+  is a metatable whose purpose is not instance lookup; there is no
+  `t:method()` to fail, and the rule is now silent when the carrier declares
+  any metafield other than `__index`. An *aliased* `__index` write
+  (`local mt = Counter; mt.__index = mt`) settles the same table the rule
+  cannot follow, so a local alias of a carrier now suppresses, the same
+  conservative trade as a computed key. In the other direction,
+  `rawset(C, "n", 0)` no longer over-suppresses: only a literal `__index` or
+  an unreadable key settles the carrier. The finding's note stopped asserting
+  a crash at call sites that may not exist.
+
+
 - **`--target` now reaches the control-flow legality pass, and `luabox build`
   will not emit a tree the target cannot load.** `--target` means "would this
   source be legal there?", but the `LB0020`-`LB0022` pass ran for the project
@@ -157,6 +223,53 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   in [the limitations page](docs/03-reference/02-limitations.md).
 
 ### Internal (contributors)
+
+- **The language server's startup number is reproducible.**
+  `scripts/lsp-startup-bench.sh` (plus its stdio client
+  `scripts/lsp-startup-bench.py` and `gen-corpus --rock-tree`) regenerates the
+  corpus, drives the real protocol and reports median/min, so the
+  `harvest_rock_tree` figure can be re-measured instead of quoted. It is not
+  a CI gate. Three claims around it were wrong and are fixed: two comments
+  disagreed on the same measurement (654 ms vs 545 ms); the harvest was
+  described as happening "once, at startup" when `reload_config` re-runs it
+  on the main loop for every `workspace/didChangeConfiguration` and every
+  watched `luabox.toml` edit — that reload is now wrapped in a work-done
+  progress token so the pause is visible rather than looking like a hang; and
+  the rayon pool was pinned only by the CLI entry point, so a library caller
+  of `luabox_lsp::run`/`run_stdio` harvested on rayon's 2 MiB default worker
+  stacks. Both public entry points now pin, best effort, and a test drives a
+  195-deep source over 32 rock modules through the *unpinned* path.
+
+- **A repeated carrier variable in a defs file follows the binding.** Within
+  the lexical rank, `carrier_var_classes` kept the first carrier for a
+  repeated variable name — but `function M:m()` names the binding in scope,
+  which Lua resolves to the last `local M`. The project-source inference path
+  resolved the binding and said "last"; the defs path said "first", so the
+  two disagreed on every repeated-carrier shape, which is exactly the parity
+  #39 exists to hold. Lexical-over-nominal ranking is a separate axis and is
+  unchanged.
+
+- **The control-flow differential enforces its own matrix invariant.**
+  `scripts/tests/control-flow-differential.sh` asserted in prose that its
+  target column's pinned edition parses every matrix program, with nothing
+  checking it; a future program using a 5.3+ construct would have made that
+  column measure two things at once and failed in the direction the script
+  calls never-OK, blaming luabox for a defect in the matrix. A preflight now
+  fails loudly, naming the program.
+
+- **`LB0510`'s bounds are documented.** The limitations reference now states
+  plainly that the rule is in-file only — the cross-file `require`d-carrier
+  shape crashes at runtime with `check` and `lint` both silent — and that it
+  is lint-only, never affecting `check`'s exit code. Cross-file carrier
+  analysis is a different pass and is deliberately not attempted.
+
+- **Two tests that could not fail, and one that was missing.** The `goto`
+  half of `control_flow`'s 5.1 guard is now exercised by a hand-lowered file
+  that genuinely contains a `Stmt::Goto` (the recovered 5.1 parse may contain
+  none, so the old assertion held whether or not the guard existed); the lint
+  quick-fix *pairing* — not just its precondition — is asserted against the
+  diagnostic the server actually published, over a mixed diagnostic set.
+
 - **`luabox_hir::validate::control_flow`'s 5.1 comment now matches the
   measurement.** It claimed `goto` under `edition = "5.1"` is "already
   reported as `LB0010`"; it is in fact two `LB0001` parse errors — `goto` is
@@ -184,18 +297,18 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   16 MiB worker stack), through the same `harvest_file` + `RockSurfaces::fold`
   split, so the result is byte-identical — the fold is what fixes precedence.
 
-  Measured on a penlight-scale annotated tree (50 files, ~103 kLOC of
-  `---@class` Lua under `lua_modules/share/lua/5.4/`), driving the real stdio
-  protocol and timing `initialize` to the **first** `publishDiagnostics`, 4
-  cores, 7 runs: **2270 ms → 545 ms median** (2222 ms → 529 ms min), ~3.8x.
-  Cross-checked against the same final binary forced to one rayon worker
-  (2095 ms median), so the win is the parallelism and nothing else in the
-  commit range. The same project with no rock tree publishes in 8 ms, so the
-  harvest was effectively the whole wait. The numbers are in the code comment
-  at `harvest_rock_tree`, along with the judgment that the harvest stays on
-  the startup path: an asynchronous republish would trade the remaining
-  ~0.5 s for a window in which rock-typed code is diagnosed against an empty
-  rock layer, flashing `LB0305`/`LB0306` and then clearing them.
+  Measured by `scripts/lsp-startup-bench.sh`, which reproduces the whole
+  measurement end to end: it generates the corpus (`gen-corpus --rock-tree`:
+  50 files, 102,813 lines of `---@class` Lua under
+  `lua_modules/share/lua/5.4/`), drives the real stdio protocol, and times
+  `initialize` to the **first** `publishDiagnostics`. On a 4 vCPU box, 7 runs
+  each: **2751 ms → 760 ms median** (2673 ms → 718 ms min), 3.6x. The
+  baseline is the same binary forced to one rayon worker, not a pre-fix
+  build, so the comparison is of the parallelism and of nothing else in a
+  commit range. The same project with no rock tree publishes in 11 ms, so the
+  harvest is effectively the whole wait. The ratio is host-dependent; the
+  harness, not the constant, is what makes the claim checkable. The single
+  source for the numbers is the code comment at `harvest_rock_tree`.
 
 ## [0.2.0] - 2026-07-29
 

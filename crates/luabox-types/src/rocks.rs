@@ -231,10 +231,13 @@ impl RockSurfaces {
 /// sources — tests, and any future single-rock query. **Both production
 /// front-ends run the two halves with a rayon pool between them**: `luabox
 /// check` always did, and `luabox lsp` does since the startup harvest was
-/// measured (2270 ms -> 654 ms to first diagnostics on a 100-kLOC tree; see
-/// `luabox_lsp`'s `harvest_rock_tree`). They get the identical result — the
-/// fold is what orders the surfaces, not the order they were computed in — so
-/// this form is a convenience, not a second implementation.
+/// measured. `luabox_lsp`'s `harvest_rock_tree` is the single source of that
+/// number and of the harness that reproduces it
+/// (`scripts/lsp-startup-bench.sh`); it is deliberately not restated here,
+/// because a second copy is how this comment came to contradict the other one
+/// (Shockwave round 4). The two forms give the identical result — the fold is
+/// what orders the surfaces, not the order they were computed in — so this is
+/// a convenience, not a second implementation.
 #[must_use]
 pub fn harvest(ambient: &Ambient, sources: &[RockModule]) -> RockSurfaces {
     let files = sources

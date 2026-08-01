@@ -107,10 +107,35 @@ pub fn run_stdio() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The stack budget every thread that recurses over syntax trees gets,
+/// mirroring `luabox-cli`'s `PINNED_STACK_BYTES`. Recursion depth is bounded
+/// by the parser's own `MAX_DEPTH`, so this is a constant of the design and
+/// not of whichever platform default applies: an unconfigured rayon pool
+/// hands workers Rust's 2 MiB, and a deep source overflows that.
+const PINNED_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// Pin the global rayon pool's worker stacks, best effort.
+///
+/// The `luabox lsp` subcommand reaches this crate through `luabox-cli`'s
+/// `real_main`, which already pins the pool — but [`run_stdio`] and [`run`]
+/// are `pub`, and an embedder calling either directly got rayon's 2 MiB
+/// default on every worker of the startup rock harvest (Shockwave round 4).
+/// Pinning at the library entry closes that. `Err` means a pool was already
+/// built for this process — exactly what the CLI path does, and what a test
+/// harness may do — and whoever configured it keeps their choice.
+fn pin_worker_stacks() {
+    let _ = rayon::ThreadPoolBuilder::new()
+        .stack_size(PINNED_STACK_BYTES)
+        .build_global();
+}
+
 /// Run the server over any [`Connection`] (stdio in production,
 /// [`Connection::memory`] in tests): initialize handshake, project
 /// bootstrap, then the message loop. Returns after a clean shutdown.
 pub fn run(connection: Connection) -> anyhow::Result<()> {
+    // Both public entry points pin, not just `run_stdio`: an embedder that
+    // owns its own transport reaches the same harvest through this one.
+    pin_worker_stacks();
     let (id, params) = connection.initialize_start()?;
     // Params the handshake cannot decode (a `rootUri` with an unencoded space
     // is the realistic one) end the session — there is no workspace to serve —
@@ -354,52 +379,71 @@ fn ambient_def_sources(root: &Path, manifest: &Manifest) -> Vec<String> {
 /// rock's classes and export types resolve in the editor exactly as they do in
 /// CI.
 ///
-/// # This is on the startup critical path, so it is parallel
+/// # It runs on two paths, and both are synchronous
 ///
-/// It runs inside [`Server::new`] — after the `initialize` handshake, before
-/// the main loop — so every millisecond here is a millisecond the editor shows
-/// no diagnostics. Per-file reduction is pure and independent, so it rides the
-/// rayon pool; the fold is what orders the surfaces (path order = precedence),
-/// so the parallel and sequential forms give the identical result.
+/// - [`Server::new`] — after the `initialize` handshake, before the main
+///   loop, so every millisecond here is a millisecond the editor shows no
+///   diagnostics;
+/// - [`Server::reload_config`] — reached from `workspace/
+///   didChangeConfiguration` and from a watched edit to `luabox.toml`. A
+///   manifest edit can move the version directory (`[build] target`) and the
+///   tree itself may have grown a rock, so the reload re-harvests. That
+///   happens **on the main loop**, so the same wall-clock cost lands as a
+///   mid-session stall every time the manifest is saved — not once, at
+///   startup, as this comment used to claim (Shockwave round 4). The reload
+///   path is wrapped in a work-done progress token so the pause is visible in
+///   the editor instead of looking like a hang.
 ///
-/// The pool is the global one `luabox-cli`'s `real_main` pins to a 16 MiB
-/// worker stack before parsing argv — the `luabox lsp` binary goes through
-/// that same entry point — so these workers get the pinned stack the syntax
-/// walks need, not rayon's 2 MiB default.
+/// Per-file reduction is pure and independent, so it rides the rayon pool;
+/// the fold is what orders the surfaces (path order = precedence), so the
+/// parallel and sequential forms give the identical result.
 ///
-/// **Measured** on a penlight-scale annotated tree — 50 files, ~103 kLOC of
-/// `---@class`-annotated Lua under `lua_modules/share/lua/5.4/`, from the
-/// perf-gate corpus generator — driving the real stdio protocol
-/// (`initialize` -> `initialized` -> `didOpen`) and timing to the FIRST
-/// `publishDiagnostics`. 4 cores, 7 runs each:
+/// The pool is the global one, pinned to a 16 MiB worker stack by
+/// `luabox-cli`'s `real_main` on the `luabox lsp` path and by
+/// [`pin_worker_stacks`] for a library caller that owns its own transport —
+/// so these workers get the stack the syntax walks need, not rayon's 2 MiB
+/// default. `a_deep_rock_tree_survives_the_startup_harvest` drives the
+/// harvest at depth 195 over 32 files through the *unpinned* path on purpose.
 ///
-/// | harvest                        | median  | min     |
-/// |--------------------------------|---------|---------|
-/// | sequential (pre-fix build)     | 2270 ms | 2222 ms |
-/// | sequential (`RAYON_NUM_THREADS=1`, same binary) | 2095 ms | 2024 ms |
-/// | parallel                       |  545 ms |  529 ms |
+/// # Measured, by a committed harness
 ///
-/// ~3.8x, and the two sequential rows agree, so the win is the parallelism
-/// and not some other change in the same commit range. The same project with
-/// the rock tree removed publishes in 8 ms, so the harvest is effectively the
-/// whole of that number.
+/// `scripts/lsp-startup-bench.sh` reproduces every number below end to end:
+/// it generates the corpus (`gen-corpus --rock-tree`: 50 files, 102,813 lines
+/// of `---@class`-annotated Lua under `lua_modules/share/lua/5.4/`), drives
+/// the real stdio protocol (`initialize` -> `initialized` -> `didOpen`) and
+/// times to the FIRST `publishDiagnostics`. It is not a CI gate — SPEC.md's
+/// LSP perf budget is future work — but the claim is re-runnable, which the
+/// prose-described corpus and scratch-directory driver it replaces were not.
+///
+/// This box, 4 vCPU, 7 runs each:
+///
+/// | harvest                                         | median  | min     |
+/// |-------------------------------------------------|---------|---------|
+/// | sequential (`RAYON_NUM_THREADS=1`, same binary)  | 2751 ms | 2673 ms |
+/// | parallel                                        |  760 ms |  718 ms |
+///
+/// 3.6x. The baseline is the same binary forced to one rayon worker rather
+/// than a pre-fix build, so the comparison is of the parallelism and of
+/// nothing else in a commit range. The ratio is host-dependent — a reviewer
+/// measured 2.8x on their own 4 vCPU box — which is why the harness, not the
+/// constant, is the thing that is committed. The same project with the rock
+/// tree removed publishes in 11 ms, so the harvest is effectively the whole
+/// of that number.
 ///
 /// # Why it is still synchronous
 ///
-/// 545 ms is at the ~500 ms mark at which moving the harvest off the
-/// critical path (background thread, republish on completion) starts to look
-/// worth its complexity — but it is *at* that mark, not past it, and the
-/// asynchronous form buys that latency with a *correctness* cost the
-/// synchronous form does not have: between the first publish and the harvest
-/// landing, every project
-/// file naming a rock class would be diagnosed against an empty rock layer,
-/// so `LB0305`/`LB0306` would flash red and then vanish. A burst of wrong
-/// squiggles is worse than half a second of none, once, at startup.
+/// The asynchronous form (background thread, republish on completion) buys
+/// the latency with a *correctness* cost the synchronous form does not have:
+/// between the first publish and the harvest landing, every project file
+/// naming a rock class would be diagnosed against an empty rock layer, so
+/// `LB0305`/`LB0306` would flash red and then vanish. A burst of wrong
+/// squiggles is worse than a pause with a progress indicator on it.
 ///
-/// What should reopen this is the *shape* of the tree, not this constant: a
-/// vendored tree several times larger changes the trade, and at that point
-/// the republish path — and the false-positive window it opens — is the
-/// thing to design, not another constant factor here.
+/// That trade is easier to defend at startup than on reload, and the reload
+/// stall is the honest reason to reopen it — along with the *shape* of the
+/// tree, not this constant: a vendored tree several times larger changes the
+/// trade, and at that point the republish path (and the false-positive window
+/// it opens) is the thing to design, not another constant factor here.
 ///
 /// Rock sources that could not be parsed are named in the client's log pane:
 /// that is where a debug-level note about vendored code belongs, and it is the
@@ -538,7 +582,16 @@ impl Server {
         // Re-harvested too: a manifest edit can move the version directory
         // (`[build] target`), and the tree itself may have grown a rock since
         // startup — a reload is the cheapest honest moment to notice.
+        //
+        // This is the startup harvest's whole cost, landing mid-session on the
+        // main loop (see `harvest_rock_tree`), so it is announced: without the
+        // token the editor goes unresponsive for the best part of a second
+        // every time `luabox.toml` is saved, with nothing to attribute it to.
+        // The work itself is unchanged — this is a label on the pause, not a
+        // restructuring of the loop.
+        let progress = self.begin_progress_titled("Reloading luabox configuration");
         self.rocks = harvest_rock_tree(&self.root, config.rock_version_dir, &ambient);
+        self.end_progress(&progress);
         self.known_globals = ambient.global_names().clone();
         self.ambient = ambient;
         self.lint = config.lint;
@@ -637,7 +690,7 @@ impl Server {
         }
 
         if let Some(token) = &token {
-            self.send_progress(token, WorkDoneProgress::End(WorkDoneProgressEnd::default()));
+            self.end_progress(token);
         }
     }
 
@@ -663,17 +716,7 @@ impl Server {
 
     /// Create the bootstrap progress token on the client and send `begin`.
     fn begin_progress(&self, total: usize) -> ProgressToken {
-        let token = ProgressToken::String("luabox/bootstrap".to_string());
-        let create = WorkDoneProgressCreateParams {
-            token: token.clone(),
-        };
-        if let Ok(value) = serde_json::to_value(create) {
-            let _ = self.connection.sender.send(Message::Request(Request::new(
-                RequestId::from("luabox-bootstrap-progress".to_string()),
-                WorkDoneProgressCreate::METHOD.to_string(),
-                value,
-            )));
-        }
+        let token = self.create_progress_token("luabox/bootstrap");
         self.send_progress(
             &token,
             WorkDoneProgress::Begin(WorkDoneProgressBegin {
@@ -683,6 +726,43 @@ impl Server {
                 ..WorkDoneProgressBegin::default()
             }),
         );
+        token
+    }
+
+    /// An untotalled work-done token for a single indivisible step — the
+    /// config reload's rock harvest, which has no per-file report to make from
+    /// inside `harvest_rock_tree`'s `par_iter`.
+    fn begin_progress_titled(&self, title: &str) -> ProgressToken {
+        let token = self.create_progress_token("luabox/reload");
+        self.send_progress(
+            &token,
+            WorkDoneProgress::Begin(WorkDoneProgressBegin {
+                title: title.to_string(),
+                ..WorkDoneProgressBegin::default()
+            }),
+        );
+        token
+    }
+
+    fn end_progress(&self, token: &ProgressToken) {
+        self.send_progress(token, WorkDoneProgress::End(WorkDoneProgressEnd::default()));
+    }
+
+    /// Ask the client to create a server-side progress token. A client that
+    /// does not support it simply answers with an error, which is why the
+    /// response is not waited on.
+    fn create_progress_token(&self, name: &str) -> ProgressToken {
+        let token = ProgressToken::String(name.to_string());
+        let create = WorkDoneProgressCreateParams {
+            token: token.clone(),
+        };
+        if let Ok(value) = serde_json::to_value(create) {
+            let _ = self.connection.sender.send(Message::Request(Request::new(
+                RequestId::from(format!("{name}-progress")),
+                WorkDoneProgressCreate::METHOD.to_string(),
+                value,
+            )));
+        }
         token
     }
 
@@ -2225,6 +2305,83 @@ mod tests {
             quickfix.diagnostics.as_deref(),
             Some(std::slice::from_ref(published_lint)),
             "the action must reference the published diagnostic byte for byte"
+        );
+    }
+    /// The startup rock harvest recurses over every vendored source on rayon
+    /// WORKERS, and this path had never been measured against a worker stack
+    /// (Shockwave round 4). `deep_pipeline.rs` proves the CLI's pipeline
+    /// survives depth 195 — but only because `real_main` pins the pool, which
+    /// no library caller does.
+    ///
+    /// `test_server` deliberately does NOT call `pin_worker_stacks`: it goes
+    /// straight to `Server::new`, the way an embedder that owns its own
+    /// transport reaches the harvest, so what this exercises is rayon's
+    /// unconfigured 2 MiB default. The shape is `deep_pipeline`'s — 32 files
+    /// so work-stealing genuinely spreads them across workers rather than
+    /// running everything on the calling thread, at the depth reference Lua
+    /// accepts. A worker overflowing aborts the process, so "this test
+    /// returned" is the whole assertion.
+    #[test]
+    fn a_deep_rock_tree_survives_the_startup_harvest() {
+        const DEPTH: usize = 195;
+        const FILES: usize = 32;
+        let dir = TempDir::new().expect("tempdir");
+        write(dir.path(), "luabox.toml", MANIFEST_HEAD);
+        let nest = format!("{}{}", "{".repeat(DEPTH), "}".repeat(DEPTH));
+        for n in 0..FILES {
+            write(
+                dir.path(),
+                &format!("lua_modules/share/lua/5.4/deep_{n:02}.lua"),
+                &format!(
+                    "---@class Deep{n:02}\nlocal Deep = {{}}\nlocal x = {nest}\nreturn Deep\n"
+                ),
+            );
+        }
+        let (server_end, _client) = Connection::memory();
+        let server = Server::new(server_end, dir.path().to_path_buf());
+        assert_eq!(
+            server.rocks.types().len(),
+            FILES,
+            "every deep rock module must have been harvested"
+        );
+    }
+    /// The config reload re-harvests the whole rock tree on the main loop —
+    /// the startup cost, landing mid-session (Shockwave round 4 measured a
+    /// ~0.9 s stall on every `luabox.toml` save). The work is unchanged; what
+    /// is new is that the client is told a pause is happening, so it reads as
+    /// progress rather than as a hang.
+    #[test]
+    fn a_config_reload_announces_itself_with_a_progress_token() {
+        let (_dir, mut server, client) = test_server();
+        server
+            .handle_notification(Notification {
+                method: super::DidChangeConfiguration::METHOD.to_string(),
+                params: json!({ "settings": {} }),
+            })
+            .expect("a configuration change is not fatal");
+
+        let messages = drain(&client);
+        let progress: Vec<Value> = messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Notification(not) if not.method == super::Progress::METHOD => {
+                    Some(not.params.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            progress.iter().any(|params| {
+                params["value"]["kind"] == "begin"
+                    && params["value"]["title"] == "Reloading luabox configuration"
+            }),
+            "{progress:?}"
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|params| params["value"]["kind"] == "end"),
+            "{progress:?}"
         );
     }
 }

@@ -738,17 +738,20 @@ mod tests {
         assert!(!tmp.path().join("dist").join("dist").exists());
     }
 
-    /// Shockwave round 2: the check gate is edition-only by design, and no
-    /// lowering rule renames a shadowed label — so a 5.2 project shipping to
-    /// 5.4 used to emit a file `luac5.4 -p` refuses to load, exit 0. The
-    /// residual validation of the lowered output is what catches it.
+    /// Shockwave round 2: the check gate does not judge the target's *dialect*
+    /// legality by design, and no lowering rule renames a shadowed label — so
+    /// a 5.2 project shipping to 5.4 used to emit a file `luac5.4 -p` refuses
+    /// to load, exit 0. Since round 4 the gate runs the target's control-flow
+    /// pass against the source, which is what gives the finding a span; the
+    /// residual validation of the lowered output stays behind it, for anything
+    /// lowering itself introduces.
     #[test]
     fn tree_mode_refuses_to_emit_control_flow_the_target_cannot_load() {
         let tmp = project("5.2", "\n[build]\ntarget = \"5.4\"\nout = \"dist\"\n");
         write(tmp.path(), "src/main.lua", "::a:: do ::a:: end\nreturn 1\n");
 
         let error = run(tmp.path(), &opts()).unwrap_err().to_string();
-        assert!(error.contains("build failed"), "{error}");
+        assert!(error.contains("refuses to emit"), "{error}");
         assert!(
             !tmp.path()
                 .join("dist")
