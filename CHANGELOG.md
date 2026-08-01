@@ -28,6 +28,17 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   file now judges control-flow legality under the target too, and refuses to
   write anything when it fails. `luabox lint` and the language server have no
   target flag and are unaffected.
+- **A `---@class` in a defs file no longer steals another class's carrier
+  variable.** `---@class Wrapper` over `local Animal = {}` binds the *local*
+  `Animal` to `Wrapper`, so `function Animal:speak()` is `Wrapper`'s method.
+  A later `---@class Animal` (carried by some other variable) overwrote that
+  binding with its own name-is-its-own-carrier alias, and `speak` folded onto
+  the wrong class — swapping the two class blocks flipped the verdict, and
+  the ordinary project-source path, which resolves the binding, disagreed
+  with the defs path on the identical body. Carrier-variable bindings now
+  take precedence over name aliases explicitly and in one ordered pass, so
+  both orderings agree with each other and with project source (#39's goal).
+
 - **`luabox check` and the language server no longer disagree about which
   file a colliding rock module name means.** A vendored tree can hold both
   `pl.lua` and `pl/init.lua`, and both answer to `require("pl")`. The rock
@@ -141,6 +152,15 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   in [the limitations page](docs/03-reference/02-limitations.md).
 
 ### Internal (contributors)
+- **`luabox_hir::validate::control_flow`'s 5.1 comment now matches the
+  measurement.** It claimed `goto` under `edition = "5.1"` is "already
+  reported as `LB0010`"; it is in fact two `LB0001` parse errors — `goto` is
+  not in the 5.1 grammar — and since every caller skips this pass on a dirty
+  parse, the `goto` guard is unreachable from any front-end path. The label
+  guard *is* reachable and load-bearing (`::a::` parses under 5.1 and is
+  `LB0010`). Both guards are documented per their real reachability, the
+  `goto` one kept as defence in depth because the function is `pub` over an
+  already-lowered file, and the asymmetry is pinned by a test.
 
 - **The lint code band has an authority instead of a magic decade.** The
   language server decided whether a finding was a lint rule — and therefore

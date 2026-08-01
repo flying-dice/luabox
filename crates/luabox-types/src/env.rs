@@ -1638,31 +1638,63 @@ fn standalone_scope(tag: &Tag) -> Option<FieldScope> {
 /// Map every variable that carries a `---@class` to that class's name, so a
 /// method attached to it (`function M:m()`) can be traced back to the class.
 ///
-/// The carrier *variable* need not share the class name (`---@class Animal`
-/// over `local M = {}`), and the class name is itself a valid carrier
-/// reference (`function Animal:m()`), so both spellings are entered. Shared by
-/// the standalone-visibility pass (#115) and the defs carrier-member fold
-/// (#39).
+/// Two spellings reach a class, and they are **not** equal in rank:
+///
+/// 1. **Lexical** — the carrier variable, which need not share the class name
+///    (`---@class Wrapper` over `local Animal = {}`). `function Animal:m()`
+///    names that *binding*, which is what Lua itself resolves.
+/// 2. **Nominal** — the class name, which is also a valid carrier reference
+///    (`---@class Animal` … `function Animal:m()`).
+///
+/// **Lexical beats nominal**, and the two passes below are ordered to say so.
+/// Filling one map with both, last-write-wins, made the answer depend on
+/// declaration order: a later `---@class Animal` whose own carrier is some
+/// other variable would enter the nominal alias `Animal -> Animal` on top of
+/// an earlier lexical binding `Animal -> Wrapper`, and
+/// [`absorb_carrier_members`] then folded `function Animal:speak()` onto the
+/// wrong class — while the project-source inference path, which resolves the
+/// binding, got it right. Swapping the two class blocks flipped the verdict
+/// (Shockwave round 3); #39's whole point is defs/project parity.
+///
+/// Within each rank the first declaration wins, matching every other
+/// collision rule in the crate.
+///
+/// Shared by the standalone-visibility pass (#115) and the defs
+/// carrier-member fold (#39).
 fn carrier_var_classes(
     items: &[luacats::AnnotatedItem],
     root: &SyntaxNode,
 ) -> HashMap<String, String> {
+    let classes = || {
+        items.iter().flat_map(|item| {
+            item.block.tags.iter().filter_map(move |tag| match tag {
+                Tag::Class(c) if !c.name.is_empty() => Some((item, c)),
+                _ => None,
+            })
+        })
+    };
+
+    // Rank 2 first, so rank 1 can overwrite it.
     let mut var_to_class: HashMap<String, String> = HashMap::new();
-    for item in items {
-        for tag in &item.block.tags {
-            let Tag::Class(c) = tag else { continue };
-            if c.name.is_empty() {
-                continue;
-            }
-            var_to_class.insert(c.name.clone(), c.name.clone());
-            if let Some(span) = item.target
-                && let Some(name) =
-                    stmt_at(root, (span.start, span.end)).and_then(|s| carrier_var_name(&s))
-            {
-                var_to_class.insert(name, c.name.clone());
-            }
+    for (_, c) in classes() {
+        var_to_class
+            .entry(c.name.clone())
+            .or_insert_with(|| c.name.clone());
+    }
+
+    // Rank 1, collected first-wins among themselves, then applied over the
+    // nominal aliases — one write per variable, so no ordering artefact
+    // survives into the result.
+    let mut lexical: HashMap<String, String> = HashMap::new();
+    for (item, c) in classes() {
+        if let Some(span) = item.target
+            && let Some(name) =
+                stmt_at(root, (span.start, span.end)).and_then(|s| carrier_var_name(&s))
+        {
+            lexical.entry(name).or_insert_with(|| c.name.clone());
         }
     }
+    var_to_class.extend(lexical);
     var_to_class
 }
 
@@ -2205,6 +2237,91 @@ function Zoo.hide() end
         );
         let def = env.classes.get("Animal").expect("class declared");
         assert_eq!(def.visibility.get("hide"), Some(&FieldScope::Private));
+    }
+
+    /// Shockwave round 3: a later `---@class` whose NAME equals an earlier
+    /// class's carrier VARIABLE used to clobber the lexical binding, so
+    /// `function Animal:speak()` folded onto class `Animal` instead of onto
+    /// `Wrapper` — the class the local `Animal` actually carries. Swapping the
+    /// two class blocks flipped the verdict; both orders must now agree.
+    #[test]
+    fn a_carrier_variable_binding_beats_a_same_named_class() {
+        let wrapper_first = "\
+---@class Wrapper
+local Animal = {}
+
+---@class Animal
+local Zoo = {}
+
+---@private
+function Animal:speak() end
+";
+        let animal_first = "\
+---@class Animal
+local Zoo = {}
+
+---@class Wrapper
+local Animal = {}
+
+---@private
+function Animal:speak() end
+";
+        for (label, source) in [
+            ("Wrapper first", wrapper_first),
+            ("Animal first", animal_first),
+        ] {
+            let env = env_of(source);
+            let wrapper = env.classes.get("Wrapper").expect("Wrapper declared");
+            let animal = env.classes.get("Animal").expect("Animal declared");
+            assert_eq!(
+                wrapper.visibility.get("speak"),
+                Some(&FieldScope::Private),
+                "{label}: `speak` belongs to the class the local `Animal` carries"
+            );
+            assert!(
+                animal.visibility.is_empty(),
+                "{label}: nothing attaches to the same-named class: {:?}",
+                animal.visibility
+            );
+        }
+    }
+
+    /// The nominal spelling still works when nothing shadows it: a class whose
+    /// own name is used as the carrier reference.
+    #[test]
+    fn a_class_name_is_still_a_carrier_reference_when_unshadowed() {
+        let env = env_of(
+            "\
+---@class Solo
+local Solo = {}
+---@private
+function Solo:hide() end
+",
+        );
+        let def = env.classes.get("Solo").expect("class declared");
+        assert_eq!(def.visibility.get("hide"), Some(&FieldScope::Private));
+    }
+
+    /// Two carriers with the same variable name: first declaration wins, the
+    /// way every other collision in this crate resolves.
+    #[test]
+    fn the_first_carrier_wins_a_repeated_variable_name() {
+        let env = env_of(
+            "\
+---@class First
+local M = {}
+
+---@class Second
+local M = {}
+
+---@private
+function M:only() end
+",
+        );
+        let first = env.classes.get("First").expect("First declared");
+        let second = env.classes.get("Second").expect("Second declared");
+        assert_eq!(first.visibility.get("only"), Some(&FieldScope::Private));
+        assert!(second.visibility.is_empty(), "{:?}", second.visibility);
     }
 
     #[test]

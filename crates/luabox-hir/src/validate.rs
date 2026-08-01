@@ -93,11 +93,36 @@ fn repeated_label_scope(dialect: Dialect) -> RepeatScope {
 /// order.
 ///
 /// `file` names the source in the emitted spans, exactly as
-/// `luabox_types::check_file` takes it. `dialect` is the edition the file is
-/// written in: `goto`/label checks are skipped for editions without `goto`
-/// (Lua 5.1 — the construct is already reported as `LB0010` by dialect
-/// legality, and a second complaint about the same tokens is noise), while
-/// the `break` check runs for every edition because every edition has
+/// `luabox_types::check_file` takes it.
+///
+/// # `dialect`, and what the two `has_goto` guards are actually for
+///
+/// `dialect` is the edition (or, since the `--target` fix, the ship target)
+/// the file is being judged against. `goto`/label checks are skipped for
+/// editions without `goto` — Lua 5.1 — but the two guards are **not**
+/// symmetric, and the reachability differs. Measured, not assumed:
+///
+/// - **Labels** (guard in [`Walker::check_label`]) — `::a::` *parses* under
+///   the 5.1 grammar and is rejected by dialect legality as `LB0010`. The
+///   parse is clean, so this pass runs, and without the guard a 5.1 file with
+///   `::a:: ::a::` would collect an `LB0021` on top of two `LB0010`s. This
+///   guard is load-bearing.
+/// - **`goto`** (guard in [`Walker::check_goto`]) — `goto` is *not in the 5.1
+///   grammar at all*: `local function f() goto nowhere end` under
+///   `edition = "5.1"` is two `LB0001` parse errors, not `LB0010`. Every
+///   caller skips this pass when the parse is dirty (see below), so no CLI,
+///   lint or LSP path reaches `check_goto` with a 5.1 dialect and a real
+///   `goto` in hand. `LB0010` on a `goto` token does exist, but only through
+///   `--target 5.1` on a file whose *edition* parses it — and then the
+///   dialect is 5.1 only for the target pass, where this guard is exactly
+///   what keeps the second complaint away.
+///
+///   The guard is kept as defence in depth rather than removed: this is a
+///   `pub` function over a `LoweredFile`, so "the parse was clean" is a
+///   caller's promise, not something the signature enforces, and the cost of
+///   honouring it is one bool.
+///
+/// The `break` check runs for every edition, because every edition has
 /// `break`.
 ///
 /// Callers should skip this pass on a file with parse errors: a recovered
@@ -201,6 +226,11 @@ impl Walker<'_> {
     }
 
     /// Report a `::label::` whose name is already defined, and record it.
+    ///
+    /// The `has_goto` guard here is reachable and load-bearing: `::a::` is in
+    /// the 5.1 grammar, so a 5.1 file full of labels parses cleanly, reaches
+    /// this pass, and would collect `LB0021` on top of the `LB0010` dialect
+    /// legality already reports for each label. See [`control_flow`].
     fn check_label(&mut self, label: LabelId, scopes: &mut Scopes) {
         if !self.dialect.has_goto() {
             return;
@@ -236,6 +266,16 @@ impl Walker<'_> {
         }
     }
 
+    /// Report a `goto` that reaches no visible label.
+    ///
+    /// Unlike [`Walker::check_label`]'s, the `has_goto` guard here is
+    /// defence in depth, not a live filter: `goto` is not in the 5.1 grammar,
+    /// so a 5.1 file containing one fails to parse (`LB0001`) and every
+    /// caller skips this pass on a dirty parse. It is kept because
+    /// [`control_flow`] is `pub` and takes an already-lowered file, so that
+    /// skip is a caller's promise rather than a type-level guarantee — and
+    /// because `--target 5.1` does judge a 5.2-parsed `goto` at dialect 5.1,
+    /// where suppressing the second complaint is the intended behaviour.
     fn check_goto(
         &mut self,
         body_id: BodyId,
@@ -404,6 +444,40 @@ mod tests {
         let parsed = parse(source, dialect);
         let lowered = lower(&parsed);
         control_flow("t.lua", &lowered, dialect)
+    }
+
+    /// The measured asymmetry between the two `has_goto` guards
+    /// (Shockwave round 3), pinned so the doc comment cannot drift from it.
+    ///
+    /// A label parses under 5.1 and a `goto` does not, so only the label
+    /// guard is reachable from a clean parse.
+    #[test]
+    fn only_the_label_half_of_the_5_1_guard_is_reachable_from_a_clean_parse() {
+        // `::a::` is in the 5.1 grammar: it parses, so this pass runs, and
+        // the guard is what keeps LB0021 off a file already carrying two
+        // LB0010s from dialect legality.
+        let labels = parse("::a::\n::a::\n", Dialect::Lua51);
+        assert!(labels.errors().is_empty(), "{:?}", labels.errors());
+        assert!(
+            codes("::a::\n::a::\n", Dialect::Lua51).is_empty(),
+            "the label guard must suppress LB0021 under 5.1"
+        );
+        // The same program at an edition that has `goto` does report it, so
+        // the guard is the only reason it is quiet above.
+        assert_eq!(codes("::a::\n::a::\n", Dialect::Lua52), [DUPLICATE_LABEL]);
+
+        // `goto` is NOT in the 5.1 grammar: the file never parses, so no
+        // caller reaches `check_goto` with a 5.1 dialect and a real `goto`.
+        // The guard there is defence in depth, and this is the measurement
+        // that says so.
+        let gotos = parse("local function f() goto nowhere end", Dialect::Lua51);
+        assert!(
+            !gotos.errors().is_empty(),
+            "`goto` must be a 5.1 parse error, not a dialect finding"
+        );
+        // Defence in depth still works if a caller ignores the clean-parse
+        // contract: the recovered tree yields nothing at 5.1.
+        assert!(diags("local function f() goto nowhere end", Dialect::Lua51).is_empty());
     }
 
     /// The three programs from #44, each rejected by reference Lua at load

@@ -3,9 +3,15 @@ Feature: Control-flow legality — goto / label / break (#44)
   check` and `luabox lint` clean: a `goto` naming no visible label, a label
   declared twice in one scope, and a `break` with no enclosing loop. They are
   errors (`LB0020`, `LB0021`, `LB0022`), not lints — the file would never
-  run — and unlike the `LB001x` dialect deltas they are edition-independent:
-  the `break` rule holds in every edition, and the goto/label rules hold in
-  every edition that has `goto` at all (5.1 reports `LB0010` instead).
+  run — and they are edition-independent with one exception: duplicate-label
+  scope tightened in 5.4, which is why `--target` has to be judged too (see
+  the `--target` block below). The `break` rule holds in every edition; the
+  goto/label rules hold in every edition that has `goto` at all.
+
+  Under `edition = "5.1"` the two halves differ, measured: `::a::` parses and
+  is `LB0010` (dialect legality), while `goto` is not in the 5.1 grammar at
+  all and is `LB0001` (a parse error) — so neither collects a second
+  control-flow complaint, but for different reasons.
 
   Every verdict below is the verdict of `luac5.4 -p` (and `luac5.1 -p` for
   `break`) on the same program.
