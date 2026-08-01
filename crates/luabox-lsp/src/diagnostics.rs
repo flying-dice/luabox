@@ -18,6 +18,7 @@ use luabox_syntax::lua::{Dialect, validate};
 use luabox_types::{Ambient, RockSurfaces, Strictness, check_file_with_requires};
 
 use crate::line_index::LineIndex;
+use crate::requires::RequireExports;
 
 /// The `source` field on published type, parse, and dialect diagnostics.
 const TYPE_SOURCE: &str = "luabox";
@@ -132,23 +133,11 @@ pub fn diagnostics(
     // merges them. The span file name is dropped on conversion (LSP
     // diagnostics are already per-document), so the lossy path is fine.
     let rel = path.to_string_lossy();
-    let mut requires = analysis.require_exports(path).unwrap_or_default();
-    // A `require` the database cannot resolve may still name a module of the
-    // vendored rock tree (#30): the db only holds project files, so rock exports
-    // are matched by module *name* here. `or_insert` keeps the db's answer where
-    // it has one, so a project file shadowing a rock module still wins — the
-    // same precedence `luabox check` gets from path-keyed resolution.
-    if !ctx.rocks.by_module().is_empty()
-        && let Some(lowered) = analysis.lower(path)
-    {
-        for edge in lowered.file().requires() {
-            if let Some(ty) = ctx.rocks.by_module().get(&edge.module) {
-                requires
-                    .entry(edge.module.clone())
-                    .or_insert_with(|| ty.clone());
-            }
-        }
-    }
+    // The project's and the rock tree's `require` answers, merged by the one
+    // resolver every surface shares (#54) — hover and completion read the very
+    // same map, so a `require` binding cannot type one way here and another
+    // way under the cursor.
+    let requires = RequireExports::resolve(analysis, path, ctx.rocks);
     let project_types = analysis.project_types();
     let ambient = ctx
         .ambient
@@ -160,7 +149,7 @@ pub fn diagnostics(
         ctx.strictness,
         dialect,
         Some(&ambient),
-        &requires,
+        requires.by_module(),
     ) {
         // Type diagnostics are all `LB03xx`, so this publishes under
         // `TYPE_SOURCE` today — but through the band authority inside

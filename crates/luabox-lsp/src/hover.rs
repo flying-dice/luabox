@@ -9,11 +9,16 @@ use luabox_syntax::lua::SyntaxKind;
 use luabox_syntax::lua::ast::{self, AstNode};
 use rowan::TextRange;
 
+use crate::requires::RequireExports;
 use crate::sema::{self, FileSema};
 
 /// Compute the hover at a byte `offset`.
+///
+/// `exports` is the shared `require` resolution ([`RequireExports`]) — the
+/// same map the type pass checks against, so a `require` binding hovers with
+/// the type the problems pane already agrees it has (#54).
 #[must_use]
-pub fn hover(sema: &FileSema, offset: usize) -> Option<Hover> {
+pub fn hover(sema: &FileSema, offset: usize, exports: &RequireExports) -> Option<Hover> {
     let token = sema.ident_at(offset)?;
     let token_range = token.text_range();
 
@@ -27,7 +32,7 @@ pub fn hover(sema: &FileSema, offset: usize) -> Option<Hover> {
     }
 
     // 2. A field / method access on a receiver with a known class type.
-    if let Some(hover) = member_hover(sema, &token) {
+    if let Some(hover) = member_hover(sema, &token, exports) {
         return Some(hover);
     }
 
@@ -69,7 +74,11 @@ pub fn hover(sema: &FileSema, offset: usize) -> Option<Hover> {
 
 /// Hover for `recv.field` / `recv:method` when `recv`'s class is known, with
 /// a fallback to dotted function names (`M.helper`).
-fn member_hover(sema: &FileSema, token: &luabox_syntax::lua::SyntaxToken) -> Option<Hover> {
+fn member_hover(
+    sema: &FileSema,
+    token: &luabox_syntax::lua::SyntaxToken,
+    _exports: &RequireExports,
+) -> Option<Hover> {
     let parent = token.parent()?;
     let (receiver, member) = match parent.kind() {
         SyntaxKind::FIELD_EXPR => {
@@ -189,24 +198,36 @@ fn see_lines(sees: &[String]) -> String {
 )]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
+    use luabox_types::RockSurfaces;
+
+    /// The workspace root every test file lives under.
+    fn root() -> PathBuf {
+        PathBuf::from(if cfg!(windows) { r"C:\ws" } else { "/ws" })
+    }
+
+    /// Analyse `files` (the first is the file under test) with the workspace
+    /// root set, so cross-file `require` resolution finds the siblings.
+    fn analyze_files(files: &[(&str, &str)]) -> (Analysis, PathBuf) {
+        let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
+        host.set_root(root());
+        let mut first = None;
+        for (rel, text) in files {
+            let path = root().join(rel);
+            first.get_or_insert_with(|| path.clone());
+            host.apply_change(Change::SetFileText {
+                path,
+                dialect: Dialect::Lua54,
+                text: (*text).to_string(),
+            });
+        }
+        (host.snapshot(), first.expect("at least one file"))
+    }
 
     fn analyze(text: &str) -> (Analysis, PathBuf) {
-        let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
-        let path = Path::new(if cfg!(windows) {
-            r"C:\ws\main.lua"
-        } else {
-            "/ws/main.lua"
-        })
-        .to_path_buf();
-        host.apply_change(Change::SetFileText {
-            path: path.clone(),
-            dialect: Dialect::Lua54,
-            text: text.to_string(),
-        });
-        (host.snapshot(), path)
+        analyze_files(&[("main.lua", text)])
     }
 
     /// Byte offset just inside the `nth` (0-based) occurrence of `needle`.
@@ -218,15 +239,68 @@ mod tests {
         text[from..].find(needle).expect("occurrence") + from
     }
 
-    /// The rendered markdown of the hover at the `nth` occurrence of `needle`.
-    fn at(src: &str, needle: &str, nth: usize) -> Option<String> {
-        let (analysis, path) = analyze(src);
+    /// The rendered markdown of the hover at the `nth` occurrence of `needle`
+    /// in the first of `files`, with `rocks` in the shared `require` resolution.
+    fn at_with(
+        files: &[(&str, &str)],
+        needle: &str,
+        nth: usize,
+        rocks: &RockSurfaces,
+    ) -> Option<String> {
+        let src = files[0].1;
+        let (analysis, path) = analyze_files(files);
         let sema = FileSema::new(&analysis, &path).expect("sema");
-        hover(&sema, offset_of(src, needle, nth)).map(|h| match h.contents {
+        let exports = RequireExports::resolve(&analysis, &path, rocks);
+        hover(&sema, offset_of(src, needle, nth), &exports).map(|h| match h.contents {
             HoverContents::Markup(markup) => markup.value,
             other => panic!("expected markup hover contents, got {other:?}"),
         })
     }
+
+    /// [`at_with`] across `files` and no rock tree.
+    fn at_files(files: &[(&str, &str)], needle: &str, nth: usize) -> Option<String> {
+        at_with(files, needle, nth, &RockSurfaces::default())
+    }
+
+    /// The rendered markdown of the hover at the `nth` occurrence of `needle`.
+    fn at(src: &str, needle: &str, nth: usize) -> Option<String> {
+        at_files(&[("main.lua", src)], needle, nth)
+    }
+
+    /// One annotated rock installed as `mylib`, harvested the way the server
+    /// harvests a vendored `lua_modules` tree (#30).
+    fn mylib_rock() -> RockSurfaces {
+        let source = luabox_types::RockModule {
+            module: "mylib".to_string(),
+            label: "lua_modules/share/lua/5.4/mylib/init.lua".to_string(),
+            path: root().join("lua_modules/share/lua/5.4/mylib/init.lua"),
+            text: "\
+local M = {}
+
+---Greets.
+---@param who string
+---@return string
+function M.greet(who) return \"hi \" .. who end
+
+return M
+"
+            .to_string(),
+        };
+        let ambient = luabox_types::build_ambient(Dialect::Lua54, &[]);
+        luabox_types::rocks::harvest(&ambient, &[source])
+    }
+
+    /// A two-file workspace: `main.lua` requires the annotated `other.lua`.
+    const OTHER: &str = "\
+local M = {}
+
+---Helps.
+---@param n number
+---@return string
+function M.helper(n) return tostring(n) end
+
+return M
+";
 
     #[test]
     fn function_declaration_name_hovers_as_its_signature() {
@@ -415,10 +489,153 @@ print(p.z)
         let src = "local answer = 42\nprint(answer)\n";
         let (analysis, path) = analyze(src);
         let sema = FileSema::new(&analysis, &path).expect("sema");
-        let hovered = hover(&sema, offset_of(src, "answer", 1)).expect("hover");
+        let exports = RequireExports::resolve(&analysis, &path, &RockSurfaces::default());
+        let hovered = hover(&sema, offset_of(src, "answer", 1), &exports).expect("hover");
         let range = hovered.range.expect("range");
         assert_eq!(range.start, lsp_types::Position::new(1, 6));
         assert_eq!(range.end, lsp_types::Position::new(1, 12));
+    }
+
+    // === `require` bindings (#54) =========================================
+    //
+    // The defect: `local m = require("mod")` hovered `unknown` while the type
+    // pass — CLI and LSP diagnostics alike — already knew the module's export
+    // type for the same binding. These pin the agreement.
+
+    #[test]
+    fn a_require_binding_hovers_as_the_module_export_type() {
+        let files = [
+            ("main.lua", "local m = require(\"other\")\nprint(m)\n"),
+            ("other.lua", OTHER),
+        ];
+        let text = at_files(&files, "m)", 0).expect("hover");
+        assert!(text.contains("local m: "), "{text}");
+        assert!(text.contains("helper"), "{text}");
+        assert!(!text.contains("local m: unknown"), "{text}");
+    }
+
+    /// The declaration site answers the same as the use site: the two go
+    /// through different hover routes (`binding_decl_at` vs the resolution),
+    /// and the regression was visible at both.
+    #[test]
+    fn a_require_binding_hovers_the_same_at_its_declaration() {
+        let files = [
+            ("main.lua", "local m = require(\"other\")\nprint(m)\n"),
+            ("other.lua", OTHER),
+        ];
+        let decl = at_files(&files, "m = require", 0).expect("hover");
+        let use_site = at_files(&files, "m)", 0).expect("hover");
+        assert_eq!(decl, use_site, "declaration and use must agree");
+    }
+
+    #[test]
+    fn a_rock_require_binding_hovers_as_the_harvested_export() {
+        // `mylib` is not a project file: the export comes from the rock
+        // harvest's module map, the same source the type pass reads.
+        let files = [(
+            "main.lua",
+            "local mylib = require(\"mylib\")\nprint(mylib)\n",
+        )];
+        let text = at_with(&files, "mylib)", 0, &mylib_rock()).expect("hover");
+        assert!(text.contains("greet"), "{text}");
+        assert!(!text.contains("local mylib: unknown"), "{text}");
+    }
+
+    #[test]
+    fn a_field_of_a_require_binding_hovers_as_the_module_field() {
+        let files = [
+            (
+                "main.lua",
+                "local m = require(\"other\")\nprint(m.helper(1))\n",
+            ),
+            ("other.lua", OTHER),
+        ];
+        let text = at_files(&files, "helper(1)", 0).expect("hover");
+        assert!(text.contains("(field) other.helper: fun("), "{text}");
+        assert!(text.contains("string"), "{text}");
+    }
+
+    #[test]
+    fn a_field_a_required_module_does_not_export_has_no_hover() {
+        let files = [
+            ("main.lua", "local m = require(\"other\")\nprint(m.nope)\n"),
+            ("other.lua", OTHER),
+        ];
+        assert_eq!(at_files(&files, "nope", 0), None);
+    }
+
+    /// An explicit annotation beats the inferred module export, the same
+    /// precedence the rest of the toolchain uses.
+    #[test]
+    fn an_annotated_require_binding_keeps_its_annotation() {
+        let files = [
+            (
+                "main.lua",
+                "---@type string\nlocal m = require(\"other\")\nprint(m)\n",
+            ),
+            ("other.lua", OTHER),
+        ];
+        let text = at_files(&files, "m)", 0).expect("hover");
+        assert!(text.contains("local m: string"), "{text}");
+    }
+
+    #[test]
+    fn a_require_of_a_module_that_does_not_exist_hovers_gracefully() {
+        let files = [("main.lua", "local m = require(\"absent\")\nprint(m)\n")];
+        let text = at_files(&files, "m)", 0).expect("hover");
+        assert!(text.contains("local m: unknown"), "{text}");
+    }
+
+    /// By design: a dynamic require has no statically known module, so there
+    /// is nothing to show. `unknown` is the correct answer, not a gap.
+    #[test]
+    fn a_dynamic_require_binding_hovers_as_unknown_by_design() {
+        let files = [
+            (
+                "main.lua",
+                "local name = \"other\"\nlocal m = require(name)\nprint(m)\n",
+            ),
+            ("other.lua", OTHER),
+        ];
+        let text = at_files(&files, "m)", 0).expect("hover");
+        assert!(text.contains("local m: unknown"), "{text}");
+    }
+
+    /// Also by design: `require("a") or require("b")` resolves at runtime, so
+    /// naming either module's type would be a guess dressed as a fact.
+    #[test]
+    fn an_or_chained_require_binding_hovers_as_unknown_by_design() {
+        let files = [
+            (
+                "main.lua",
+                "local m = require(\"other\") or require(\"spare\")\nprint(m)\n",
+            ),
+            ("other.lua", OTHER),
+            ("spare.lua", "return 1\n"),
+        ];
+        let text = at_files(&files, "m)", 0).expect("hover");
+        assert!(text.contains("local m: unknown"), "{text}");
+    }
+
+    #[test]
+    fn a_shadowed_require_binding_hovers_as_its_own_module() {
+        let files = [
+            (
+                "main.lua",
+                "local m = require(\"other\")\nprint(m)\nlocal m = require(\"spare\")\nprint(m)\n",
+            ),
+            ("other.lua", OTHER),
+            (
+                "spare.lua",
+                "local S = {}\n---@return number\nfunction S.count() return 1 end\nreturn S\n",
+            ),
+        ];
+        let first = at_files(&files, "m)", 0).expect("hover");
+        let second = at_files(&files, "m)", 1).expect("hover");
+        assert!(first.contains("helper"), "{first}");
+        assert!(!first.contains("count"), "{first}");
+        assert!(second.contains("count"), "{second}");
+        assert!(!second.contains("helper"), "{second}");
     }
 
     #[test]

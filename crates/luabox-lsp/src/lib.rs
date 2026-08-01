@@ -98,6 +98,7 @@ mod inlay_hints;
 mod line_index;
 mod references;
 mod rename;
+mod requires;
 mod selection_range;
 mod sema;
 mod semantic_tokens;
