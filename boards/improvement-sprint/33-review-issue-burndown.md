@@ -4,8 +4,8 @@ labels: [release, burndown]
 priority: high
 agent: claude
 live: true
-status: Waves 21+22 launched in parallel; 23 (#54) and 24 (#46) to follow
-updatedAt: 2026-08-01T15:40:00.000Z
+status: Wave 22 (#51/#52/#53) and wave 23 (#54) done; 21 in flight, 24 (#46) to follow
+updatedAt: 2026-08-01T23:55:00.000Z
 ---
 # Burn-down 2: the issues the PR #47 review raised
 
@@ -77,3 +77,58 @@ Owner directive: burn down both what was open AND what the reviews opened. Eight
   Not verifiable locally: GitLab's own ingestion of the corrected report — the schema contract is asserted against the documented required-field rules (non-empty `description`/`check_name`/`fingerprint`/`location.path`, a known severity, `begin >= 1`), not against a live GitLab instance. Likewise the SARIF "absent locations is valid" reading is from the 2.1.0 spec, not from a validator run.
 
   `target/scratch/` removed. Pushed to `origin/sprint/w22-cli-cluster`. **No PR opened**, per the wave brief.
+
+- **claude** (2026-08-01T23:55:00.000Z): **#54 — require-binding hover complete** — three commits on `sprint/w23-hover-require` (off `develop@8a540a3`), all gates green, no PR. `df -h /` first: 13G free at start, 9.9G at the low point; no `wt-*/target` deleted (wt-w21 live and untouched throughout, and `crates/luabox-types` never opened for edit).
+
+  Tests-first, red counted before the fix: **15 red** — 7 in `cargo test -p luabox-lsp --lib`, 8 in the new `crates/luabox-cli/tests/features/lsp/hover-require.feature` (a NEW feature file, not an edit to `hover.feature`/`completion.feature`, so the parallel agent has nothing to conflict with). Commit `39f660b`.
+
+  ### The defect, and why it was two things pretending to be one
+
+  `local m = require("mod")` hovered `unknown`. The reviewer measured hover; the same binding typed correctly in the problems pane. Both were true, because there were **two** `require` resolvers:
+
+  - `diagnostics::diagnostics` built a `module → Ty` map inline (db `require_exports` for project modules per #85, `RockSurfaces::by_module` merged beneath for rocks per #30) and threaded it into `check_file_with_requires`;
+  - `hover`/`completion` went through `FileSema::binding_type`, which is the per-file LuaCATS annotation harvest and has never known anything about cross-file modules. No annotation → `None` → the literal string `"unknown"`.
+
+  So the fix was not a lookup in the hover provider. It is `crates/luabox-lsp/src/requires.rs` — `RequireExports` — and the diagnostics pipeline was moved onto it *first*, as a pure extraction with no behaviour change, so that "one source of truth" is a fact about the code rather than a claim in a commit message. Commit `43774ee` then routes hover and completion through the same object.
+
+  ### Audit of the adjacent surfaces, as asked
+
+  | surface | before | after |
+  |---|---|---|
+  | hover on a project-module require | `unknown` | the module's export type |
+  | hover on a rock require (harvested tree) | `unknown` | the harvested export type |
+  | hover on a **field** of a require binding (`m.helper`) | **no hover at all** (declined) | `(field) mod.helper: fun(…)`, qualified by the *module* |
+  | **completion** on a require binding (`m.`) | **nothing offered** — same defect, previously unmeasured | the module's exported members; `m:` only the function-typed ones |
+  | goto-definition on the binding | already correct (its `local` declaration) | unchanged, now **pinned** |
+  | goto-definition on the require *string* | already correct (the module file) | unchanged, now **pinned** |
+
+  So the reviewer's "completion was not reliably measured and I am not claiming anything" resolves to: it had the same defect, it is fixed through the same shared source, and it is pinned both as unit tests and as acceptance scenarios. Goto-definition was already right on both halves and is now pinned so it stays right.
+
+  ### Decisions worth recording
+
+  - **Types render as the checker holds them, literals included.** A module field inferred as `1` shows `1`, not `integer`. Widening for display (what inlay hints do, deliberately) would be prettier and would be *the editor disagreeing with CI* — the exact class of defect #54 is. Cost a red: the first fixture asserted `other.version: string` and the truth was `other.version: "1.0"`; the fixture was wrong, not the code.
+  - **`require_module_of` matches by identity, not containment.** The `local`'s initialiser in the matching position must *be* the require call. That is what makes `require("a") or require("b")` and `require("mod").sub` decline rather than guess, and it makes shadowing free (the lookup is keyed on the binding's own declaration range, so two `local m`s get their own modules).
+  - **`or`-chained require: decided as `unknown`, documented.** Which branch runs is a runtime fact; naming either module's type would be a coin flip presented as a type. Pinned as *correct*, with the reason in the module docs, the feature file and the CHANGELOG — not left as an unexplained gap.
+  - **Dynamic `require(name)`: `unknown` BY DESIGN**, pinned. The type pass does not resolve it either, so the two still agree.
+  - **Explicit beats implicit.** An `---@type` on the binding still wins over the module export, matching the rest of the toolchain.
+
+  ### README
+
+  Re-read against reality rather than deleted. "(the editor sees the same surfaces, so hover and completion agree with CI)" was true of diagnostics and false of hover — half of what #54 said. It now states the specific thing that holds (binding, member, completion; project modules and rocks) and names its two edges: the by-design `unknown`s, and **one place the editor is genuinely narrower than CI** — a module whose export is a `---@class` *instance* is `Ty::Named`, so the binding hovers as the class name but the class's `---@field`s are declared in the module's own file, out of reach of the per-file view these surfaces are built on. Its members get no hover or completion while `luabox check` still checks them. Measured, not assumed (a throwaway probe confirmed `Named("Point")`), and pinned by `a_class_instance_module_hovers_as_the_class_but_has_no_member_hover` so the README and the test cannot drift apart. Closing that would mean giving the editor surfaces the ambient environment — a bigger change than #54, and not this wave's.
+
+  ### Gates (exit codes taken directly, never through a pipe)
+
+  | gate | result |
+  |---|---|
+  | `cargo fmt --all --check` | clean |
+  | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+  | `cargo test --workspace` | **2497 passed**, 0 failed |
+  | `acceptance` (release) | **872 scenarios / 4751 steps, all passed** |
+  | `lsp_acceptance` (release) | **208 scenarios / 1516 steps, all passed** (was 194/1406 — +14 from `hover-require.feature`) |
+  | `cargo build --release` | ok |
+  | `control-flow-differential.sh` | **112/112 cells agree** with reference `luac` (5.2/5.3 skipped, no luac on PATH) |
+  | `lb0510-matrix.sh` | **119/119 shapes match, lint AND runtime** (Lua 5.4.6) |
+
+  Not verifiable locally: nothing behavioural — the whole issue is reproducible in-tree and every claim above is pinned by a test. The only unverified reading is that a real editor renders the wider table-shaped hover acceptably; the LSP contract (a markdown code block) is unchanged, only its contents are longer.
+
+  `target/scratch/` removed. Pushed to `origin/sprint/w23-hover-require`. **No PR opened**, per the wave brief.
