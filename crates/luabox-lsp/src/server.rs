@@ -2239,7 +2239,11 @@ mod tests {
         let path = dir.path().join("main.lua");
         let source = "break\nlocal unused = 1\n";
         fs::write(&path, source).expect("write the document");
-        let uri_text = format!("file://{}", path.display());
+        // Through `path_to_uri`, not `format!("file://…")`: a hand-built URI
+        // keeps Windows' backslashes and drive colon, and the server then
+        // publishes under a different (normalized) URI than the one opened.
+        let uri = crate::uri::path_to_uri(&path);
+        let uri_text = uri.to_string();
         server
             .handle_notification(Notification {
                 method: DidOpenTextDocument::METHOD.to_string(),
@@ -2280,7 +2284,6 @@ mod tests {
             .find(|d| code_of(d) == "LB0501")
             .expect("the fixable lint was published");
 
-        let uri: lsp_types::Uri = uri_text.parse().expect("uri");
         let actions = server
             .code_actions(
                 &uri,
