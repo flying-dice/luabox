@@ -135,6 +135,23 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   registered rule's code against it (that is the load-bearing test —
   `luabox-diag` sits below the rule registry and cannot see it), and the
   registry checks the band is densely allocated from `LB0500`.
+- **The language server's startup rock harvest is parallel, and measured.**
+  `luabox check` parallelized the identical workload after a measured
+  1.98 s → 0.55 s; the LSP kept the sequential form and shipped no number.
+  It now rides the same rayon pool (the global one `real_main` pins to a
+  16 MiB worker stack), through the same `harvest_file` + `RockSurfaces::fold`
+  split, so the result is byte-identical — the fold is what fixes precedence.
+
+  Measured on a penlight-scale annotated tree (50 files, ~103 kLOC of
+  `---@class` Lua under `lua_modules/share/lua/5.4/`), driving the real stdio
+  protocol and timing `initialize` to the **first** `publishDiagnostics`, 4
+  cores, 7 runs: **2270 ms → 654 ms median** (2222 ms → 574 ms min), a 3.5x
+  cut. The same project with no rock tree publishes in 8 ms, so the harvest
+  was effectively the whole wait. The number is now in the code comment at
+  `harvest_rock_tree`, along with the judgment that the harvest stays on the
+  startup path: an asynchronous republish would trade the remaining ~650 ms
+  for a window in which rock-typed code is diagnosed against an empty rock
+  layer, flashing `LB0305`/`LB0306` and then clearing them.
 
 ## [0.2.0] - 2026-07-29
 

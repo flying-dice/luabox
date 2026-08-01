@@ -73,6 +73,7 @@ use luabox_lint::{LintConfig, UnknownRuleId, lint_source};
 use luabox_manifest::layout::{self, DefFiles};
 use luabox_manifest::model::{DialectId, Manifest};
 use luabox_types::{Ambient, RockModule, RockSurfaces, build_ambient};
+use rayon::prelude::*;
 
 use crate::line_index::LineIndex;
 use crate::sema::FileSema;
@@ -348,9 +349,53 @@ fn ambient_def_sources(root: &Path, manifest: &Manifest) -> Vec<String> {
 }
 
 /// Harvest the type surfaces of the project's vendored luarocks tree (#30) —
-/// `luabox_types::rocks::harvest` over `layout::collect_rock_sources`, the same
-/// pair `luabox check` drives, so a rock's classes and export types resolve in
-/// the editor exactly as they do in CI.
+/// `luabox_types::rocks::harvest_file` over `layout::collect_rock_sources`,
+/// folded by `RockSurfaces::fold`, the same pair `luabox check` drives, so a
+/// rock's classes and export types resolve in the editor exactly as they do in
+/// CI.
+///
+/// # This is on the startup critical path, so it is parallel
+///
+/// It runs inside [`Server::new`] — after the `initialize` handshake, before
+/// the main loop — so every millisecond here is a millisecond the editor shows
+/// no diagnostics. Per-file reduction is pure and independent, so it rides the
+/// rayon pool; the fold is what orders the surfaces (path order = precedence),
+/// so the parallel and sequential forms give the identical result.
+///
+/// The pool is the global one `luabox-cli`'s `real_main` pins to a 16 MiB
+/// worker stack before parsing argv — the `luabox lsp` binary goes through
+/// that same entry point — so these workers get the pinned stack the syntax
+/// walks need, not rayon's 2 MiB default.
+///
+/// **Measured** on a penlight-scale annotated tree — 50 files, ~103 kLOC of
+/// `---@class`-annotated Lua under `lua_modules/share/lua/5.4/`, from the
+/// perf-gate corpus generator — driving the real stdio protocol
+/// (`initialize` -> `initialized` -> `didOpen`) and timing to the FIRST
+/// `publishDiagnostics`. 4 cores, 7 runs each:
+///
+/// | harvest    | median  | min     |
+/// |------------|---------|---------|
+/// | sequential | 2270 ms | 2222 ms |
+/// | parallel   |  654 ms |  574 ms |
+///
+/// 3.5x. The same project with the rock tree removed publishes in 8 ms, so
+/// the harvest is effectively the whole of that number.
+///
+/// # Why it is still synchronous
+///
+/// 654 ms is above the ~500 ms mark at which moving the harvest off the
+/// critical path (background thread, republish on completion) starts to look
+/// worth its complexity — but only by a margin, and the asynchronous form
+/// buys that latency with a *correctness* cost the synchronous form does not
+/// have: between the first publish and the harvest landing, every project
+/// file naming a rock class would be diagnosed against an empty rock layer,
+/// so `LB0305`/`LB0306` would flash red and then vanish. A burst of wrong
+/// squiggles is worse than half a second of none, once, at startup.
+///
+/// What should reopen this is the *shape* of the tree, not this constant: a
+/// vendored tree several times larger changes the trade, and at that point
+/// the republish path — and the false-positive window it opens — is the
+/// thing to design, not another constant factor here.
 ///
 /// Rock sources that could not be parsed are named in the client's log pane:
 /// that is where a debug-level note about vendored code belongs, and it is the
@@ -366,7 +411,11 @@ fn harvest_rock_tree(root: &Path, version_dir: &str, ambient: &Ambient) -> RockS
             text: source.text,
         })
         .collect();
-    let harvested = luabox_types::rocks::harvest(ambient, &sources);
+    let files: Vec<luabox_types::RockFile> = sources
+        .par_iter()
+        .map(|source| luabox_types::rocks::harvest_file(ambient, source))
+        .collect();
+    let harvested = RockSurfaces::fold(&sources, files);
     for label in harvested.skipped() {
         log_to_stderr(&format!(
             "luabox-lsp: skipped unparseable rock source `{label}` while harvesting types"

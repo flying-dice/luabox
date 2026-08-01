@@ -218,10 +218,14 @@ impl RockSurfaces {
 /// Harvest the annotation surfaces of `sources` against `ambient`, sequentially
 /// — [`harvest_file`] over each, folded by [`RockSurfaces::fold`].
 ///
-/// The convenience form, for a caller with no thread pool (the LSP, which pays
-/// this once at startup). `luabox check` runs the same two halves with its
-/// existing rayon pool between them, and gets the identical result: the fold is
-/// what orders the surfaces, not the order they were computed in.
+/// The convenience form, for a caller with no thread pool and a handful of
+/// sources — tests, and any future single-rock query. **Both production
+/// front-ends run the two halves with a rayon pool between them**: `luabox
+/// check` always did, and `luabox lsp` does since the startup harvest was
+/// measured (2270 ms -> 654 ms to first diagnostics on a 100-kLOC tree; see
+/// `luabox_lsp`'s `harvest_rock_tree`). They get the identical result — the
+/// fold is what orders the surfaces, not the order they were computed in — so
+/// this form is a convenience, not a second implementation.
 #[must_use]
 pub fn harvest(ambient: &Ambient, sources: &[RockModule]) -> RockSurfaces {
     let files = sources
