@@ -215,10 +215,35 @@ impl FunctionTy {
         }
     }
 
-    /// How many arguments a call must supply: the non-optional parameters.
+    /// How many arguments a call must supply.
+    ///
+    /// A parameter is optional two ways. `---@param b? number` says so
+    /// outright. `---@param b number|nil` says the same thing about what may
+    /// reach `b` — and since Lua supplies `nil` for every argument the caller
+    /// left off, omitting it is exactly the call the annotation permits, which
+    /// is why luals treats it as optional for the count too.
+    ///
+    /// The `nil`-admitting half applies only to a **trailing** run of
+    /// parameters: a caller cannot skip a middle argument in Lua without
+    /// writing `nil` in its place, so relaxing a non-trailing slot would admit
+    /// a genuinely short call. An explicit `?` still does not count anywhere,
+    /// trailing or not, exactly as before. The narrowness is deliberate and is
+    /// recorded in `docs/03-reference/02-limitations.md`.
     #[must_use]
     pub fn required_params(&self) -> usize {
-        self.params.iter().filter(|p| !p.optional).count()
+        let mut required = 0;
+        let mut trailing = true;
+        for param in self.params.iter().rev() {
+            if param.optional {
+                continue;
+            }
+            if trailing && param.ty.admits_nil_explicitly() {
+                continue;
+            }
+            required += 1;
+            trailing = false;
+        }
+        required
     }
 }
 
@@ -276,6 +301,23 @@ impl Ty {
         match self {
             Ty::Nil | Ty::Any | Ty::Unknown => true,
             Ty::Union(members) => members.iter().any(Ty::admits_nil),
+            _ => false,
+        }
+    }
+
+    /// Whether this type admits `nil` because it *says* `nil` — the narrower
+    /// half of [`Self::admits_nil`], which also answers `true` for `any` and
+    /// `unknown`.
+    ///
+    /// The distinction matters where admitting `nil` is read as a statement of
+    /// intent rather than as an assignability fact: `---@param b number|nil`
+    /// declares that omitting the argument is allowed ([`FunctionTy::required_params`]),
+    /// whereas `---@param b any` only declines to constrain it.
+    #[must_use]
+    pub fn admits_nil_explicitly(&self) -> bool {
+        match self {
+            Ty::Nil => true,
+            Ty::Union(members) => members.iter().any(Ty::admits_nil_explicitly),
             _ => false,
         }
     }
