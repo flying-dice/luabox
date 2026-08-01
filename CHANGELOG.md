@@ -301,14 +301,16 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   measurement end to end: it generates the corpus (`gen-corpus --rock-tree`:
   50 files, 102,813 lines of `---@class` Lua under
   `lua_modules/share/lua/5.4/`), drives the real stdio protocol, and times
-  `initialize` to the **first** `publishDiagnostics`. On a 4 vCPU box, 7 runs
-  each: **2751 ms → 760 ms median** (2673 ms → 718 ms min), 3.6x. The
-  baseline is the same binary forced to one rayon worker, not a pre-fix
-  build, so the comparison is of the parallelism and of nothing else in a
-  commit range. The same project with no rock tree publishes in 11 ms, so the
-  harvest is effectively the whole wait. The ratio is host-dependent; the
-  harness, not the constant, is what makes the claim checkable. The single
-  source for the numbers is the code comment at `harvest_rock_tree`.
+  `initialize` to the **first** `publishDiagnostics`. On one 4 vCPU
+  virtualized box, 7 runs each: **2751 ms → 760 ms median** (2673 ms → 718 ms
+  min), 3.6x. The baseline is the same binary forced to one rayon worker, not
+  a pre-fix build, so the comparison is of the parallelism and of nothing else
+  in a commit range. The same project with no rock tree publishes in 11 ms, so
+  the harvest is effectively the whole wait. The sequential row is single-host
+  and steal-sensitive — an independent 4 vCPU box did not reproduce it — so
+  the harness, not the constant, is what makes the claim checkable. The single
+  source for the numbers, and for the host they were taken on, is the code
+  comment at `harvest_rock_tree`.
 
 ## [0.2.0] - 2026-07-29
 

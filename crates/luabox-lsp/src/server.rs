@@ -111,8 +111,12 @@ pub fn run_stdio() -> anyhow::Result<()> {
 /// mirroring `luabox-cli`'s `PINNED_STACK_BYTES`. Recursion depth is bounded
 /// by the parser's own `MAX_DEPTH`, so this is a constant of the design and
 /// not of whichever platform default applies: an unconfigured rayon pool
-/// hands workers Rust's 2 MiB, and a deep source overflows that.
-const PINNED_STACK_BYTES: usize = 16 * 1024 * 1024;
+/// hands workers Rust's 2 MiB.
+///
+/// Public so that "mirroring `luabox-cli`'s" is a *checkable* claim rather
+/// than a comment — `luabox-cli` asserts the two are equal
+/// (`the_lsp_and_the_cli_pin_the_same_worker_stack`). Nothing else reads it.
+pub const PINNED_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 /// Pin the global rayon pool's worker stacks, best effort.
 ///
@@ -123,6 +127,26 @@ const PINNED_STACK_BYTES: usize = 16 * 1024 * 1024;
 /// Pinning at the library entry closes that. `Err` means a pool was already
 /// built for this process — exactly what the CLI path does, and what a test
 /// harness may do — and whoever configured it keeps their choice.
+///
+/// # Why there is no "delete the pin and watch it overflow" test
+///
+/// There cannot be one, and that is a property of the design rather than a
+/// gap in the suite. Recursion over a syntax tree is bounded by the parser's
+/// `MAX_DEPTH`, and `luabox-syntax`'s `parsing_at_the_depth_limit_fits_a_
+/// default_stack` already proves — in a *debug* build, whose frames are
+/// several times fatter than release's — that parsing at exactly that limit
+/// fits 2 MiB. `a_deep_rock_tree_survives_the_startup_harvest` makes the same
+/// point for the whole harvest pipeline, through deliberately *unpinned*
+/// rayon workers. So no input a differential test could construct overflows
+/// an unpinned worker while fitting a pinned one: anything deeper than
+/// `MAX_DEPTH` is rejected by the parser before recursion begins.
+///
+/// This is therefore belt-and-braces against a future consumer that recurses
+/// harder than today's do, and what is testable about it is tested: the
+/// constant matches the CLI's (`luabox-cli`, above), and calling this is
+/// idempotent and never fatal ([`tests::pinning_worker_stacks_is_idempotent_
+/// and_never_fatal`]) — the `Err` arm, which is what production actually
+/// takes on the CLI path, where `real_main` has already built the pool.
 fn pin_worker_stacks() {
     let _ = rayon::ThreadPoolBuilder::new()
         .stack_size(PINNED_STACK_BYTES)
@@ -163,7 +187,12 @@ pub fn run(connection: Connection) -> anyhow::Result<()> {
     connection.initialize_finish(id, serde_json::to_value(result)?)?;
 
     // Client capabilities that gate optional protocol features: work-done
-    // progress for the bootstrap index, and dynamic file-watcher registration.
+    // progress for every pause the server announces (the startup rock harvest,
+    // the bootstrap index, the config reload), and dynamic file-watcher
+    // registration. This rides on the `Server` rather than staying a
+    // `bootstrap` argument because a client that does not advertise
+    // `window.workDoneProgress` must see no `$/progress` traffic *at all* —
+    // the reload path was sending it unconditionally (Shockwave round 5).
     let work_done_progress = params
         .capabilities
         .window
@@ -181,11 +210,17 @@ pub fn run(connection: Connection) -> anyhow::Result<()> {
     let root = root_path(&params)
         .or_else(|| std::env::current_dir().ok())
         .context("cannot determine a workspace root")?;
-    let mut server = Server::new(connection, root);
+    // `Server::new` runs the startup rock harvest, and announces it — which is
+    // a server-initiated `window/workDoneProgress/create` before the client's
+    // `initialized` notification. That is protocol-legal: LSP only bars the
+    // server from speaking *until it has responded to `initialize`*, and
+    // `initialize_finish` above is that response. The bootstrap token below
+    // has been sent from the same window since it shipped.
+    let mut server = Server::new(connection, root, work_done_progress);
     if watch_files {
         server.register_file_watchers();
     }
-    server.bootstrap(work_done_progress);
+    server.bootstrap();
     server.main_loop()
 }
 
@@ -383,16 +418,23 @@ fn ambient_def_sources(root: &Path, manifest: &Manifest) -> Vec<String> {
 ///
 /// - [`Server::new`] — after the `initialize` handshake, before the main
 ///   loop, so every millisecond here is a millisecond the editor shows no
-///   diagnostics;
+///   diagnostics. Wrapped in a work-done token since round 5
+///   ([`Server::harvest_announced`]): the handshake has already been answered
+///   by then, so a server-initiated `window/workDoneProgress/create` is
+///   protocol-legal, and the pause is attributable rather than silent;
 /// - [`Server::reload_config`] — reached from `workspace/
 ///   didChangeConfiguration` and from a watched edit to `luabox.toml`. A
 ///   manifest edit can move the version directory (`[build] target`) and the
 ///   tree itself may have grown a rock, so the reload re-harvests. That
 ///   happens **on the main loop**, so the same wall-clock cost lands as a
 ///   mid-session stall every time the manifest is saved — not once, at
-///   startup, as this comment used to claim (Shockwave round 4). The reload
-///   path is wrapped in a work-done progress token so the pause is visible in
-///   the editor instead of looking like a hang.
+///   startup, as this comment used to claim (Shockwave round 4). It is wrapped
+///   in the same work-done progress token, so the pause is visible in the
+///   editor instead of looking like a hang.
+///
+/// Both tokens are gated on the client's `window.workDoneProgress` capability
+/// ([`Server::progress`]): a client that did not ask for progress receives
+/// none, and simply sees the pause.
 ///
 /// Per-file reduction is pure and independent, so it rides the rayon pool;
 /// the fold is what orders the surfaces (path order = precedence), so the
@@ -415,7 +457,9 @@ fn ambient_def_sources(root: &Path, manifest: &Manifest) -> Vec<String> {
 /// LSP perf budget is future work — but the claim is re-runnable, which the
 /// prose-described corpus and scratch-directory driver it replaces were not.
 ///
-/// This box, 4 vCPU, 7 runs each:
+/// **Host** (the numbers below are one host's, and only that host's):
+/// `Intel(R) Xeon(R) Processor @ 2.80GHz`, 4 vCPU, containerized/virtualized
+/// sandbox, 7 runs per row.
 ///
 /// | harvest                                         | median  | min     |
 /// |-------------------------------------------------|---------|---------|
@@ -424,11 +468,16 @@ fn ambient_def_sources(root: &Path, manifest: &Manifest) -> Vec<String> {
 ///
 /// 3.6x. The baseline is the same binary forced to one rayon worker rather
 /// than a pre-fix build, so the comparison is of the parallelism and of
-/// nothing else in a commit range. The ratio is host-dependent — a reviewer
-/// measured 2.8x on their own 4 vCPU box — which is why the harness, not the
-/// constant, is the thing that is committed. The same project with the rock
-/// tree removed publishes in 11 ms, so the harvest is effectively the whole
-/// of that number.
+/// nothing else in a commit range. The same project with the rock tree removed
+/// publishes in 11 ms, so the harvest is effectively the whole of that number.
+///
+/// **The sequential row is single-host and does not reproduce.** A reviewer's
+/// own 4 vCPU box measured a *maximum* of 2384 ms against this host's
+/// *minimum* of 2673 — non-overlapping ranges — and a ratio of 2.8x rather
+/// than 3.6x. One rayon worker doing all the parsing is exactly the shape that
+/// is sensitive to CPU steal on a shared virtualized host, which is why the
+/// host is recorded here and why the harness, not the constant, is the thing
+/// that is committed. Re-run it before quoting either number.
 ///
 /// # Why it is still synchronous
 ///
@@ -502,20 +551,31 @@ struct Server {
     /// didOpen/didClose so a `workspace/didChangeConfiguration` can republish
     /// diagnostics for every open buffer after a settings change.
     open_docs: HashMap<PathBuf, Uri>,
+    /// Whether the client advertised `window.workDoneProgress`. Every
+    /// `$/progress` the server sends is gated on this — a client that did not
+    /// ask for progress receives none, on any path.
+    progress: bool,
 }
 
+/// The progress token id and title the startup rock harvest announces itself
+/// under. Distinct from the reload's so a client (and the protocol tests) can
+/// tell the two pauses apart.
+const STARTUP_HARVEST_PROGRESS: (&str, &str) = ("luabox/rock-harvest", "Indexing luabox rock tree");
+
+/// The same, for the config reload's re-harvest.
+const RELOAD_HARVEST_PROGRESS: (&str, &str) = ("luabox/reload", "Reloading luabox configuration");
+
 impl Server {
-    fn new(connection: Connection, root: PathBuf) -> Self {
+    fn new(connection: Connection, root: PathBuf, progress: bool) -> Self {
         let config = ProjectConfig::discover(&root);
         let ambient = build_ambient(config.dialect, &config.def_sources);
-        let rocks = harvest_rock_tree(&root, config.rock_version_dir, &ambient);
         let known_globals = ambient.global_names().clone();
         let mut host = AnalysisHost::new(config.dialect, config.strictness);
         // Anchor the db's `require` resolution at the workspace root so module
         // strings resolve exactly as `luabox check` resolves them on disk (the
         // bundler's SPEC.md §7 path-mapping) — editor and CI in lockstep.
         host.set_root(root.clone());
-        let server = Self {
+        let mut server = Self {
             connection,
             host,
             root,
@@ -523,14 +583,41 @@ impl Server {
             strictness: config.strictness,
             out_dir: config.out_dir,
             ambient,
-            rocks,
+            rocks: RockSurfaces::default(),
             lint: config.lint,
             known_globals,
             open_docs: HashMap::new(),
+            progress,
         };
         // Safe to send: `run` only builds the server after `initialize_finish`.
         server.log_lint_config_problems(&config.unknown_lint_rules);
+        // The startup harvest runs *here*, after the struct exists, so it can
+        // go through the same announced-harvest helper the reload uses. It used
+        // to run before the struct was built, which is why it was the one
+        // synchronous pause with no token on it — Shockwave captured 746 ms of
+        // protocol silence between the `initialize` response and the bootstrap
+        // token, covering an index that itself took 0.1 ms (round 5). The work
+        // is unchanged; what is new is that the client can attribute the wait.
+        server.rocks = server.harvest_announced(config.rock_version_dir, STARTUP_HARVEST_PROGRESS);
         server
+    }
+
+    /// Run the rock-tree harvest inside a work-done progress token, so the
+    /// synchronous pause is attributable in the editor instead of reading as a
+    /// hang. Both callers — startup and [`Self::reload_config`] — come through
+    /// here, and both inherit the client-capability gate in
+    /// [`Self::begin_progress_titled`].
+    ///
+    /// Harvests against [`Self::ambient`], which both callers set before
+    /// calling: `new` builds it into the struct, `reload_config` installs the
+    /// freshly built one first.
+    fn harvest_announced(&self, version_dir: &str, progress: (&str, &str)) -> RockSurfaces {
+        let token = self.begin_progress_titled(progress.0, progress.1);
+        let rocks = harvest_rock_tree(&self.root, version_dir, &self.ambient);
+        if let Some(token) = &token {
+            self.end_progress(token);
+        }
+        rocks
     }
 
     /// Tell the client about `[lint]` keys that name no known rule id, as
@@ -589,11 +676,13 @@ impl Server {
         // every time `luabox.toml` is saved, with nothing to attribute it to.
         // The work itself is unchanged — this is a label on the pause, not a
         // restructuring of the loop.
-        let progress = self.begin_progress_titled("Reloading luabox configuration");
-        self.rocks = harvest_rock_tree(&self.root, config.rock_version_dir, &ambient);
-        self.end_progress(&progress);
+        //
+        // The new ambient layer is installed first because the harvest reads
+        // `self.ambient`, and the freshly discovered one is what the rocks must
+        // be resolved against.
         self.known_globals = ambient.global_names().clone();
         self.ambient = ambient;
+        self.rocks = self.harvest_announced(config.rock_version_dir, RELOAD_HARVEST_PROGRESS);
         self.lint = config.lint;
         // Re-report: the reload may have introduced (or fixed) a typo'd key.
         self.log_lint_config_problems(&config.unknown_lint_rules);
@@ -663,13 +752,13 @@ impl Server {
     /// Load every `.lua` file under the root into the host (so
     /// `project_diagnostics` and cross-file goto have the full picture).
     ///
-    /// When the client supports work-done progress (`progress`), the index is
-    /// wrapped in a server-created `$/progress` token — begin, a report per
-    /// file loaded, then end — so a large workspace shows a progress indicator
-    /// at startup instead of an unexplained pause.
-    fn bootstrap(&mut self, progress: bool) {
+    /// When the client supports work-done progress ([`Self::progress`]), the
+    /// index is wrapped in a server-created `$/progress` token — begin, a
+    /// report per file loaded, then end — so a large workspace shows a
+    /// progress indicator at startup instead of an unexplained pause.
+    fn bootstrap(&mut self) {
         let files = self.collect_lua_files();
-        let token = progress.then(|| self.begin_progress(files.len()));
+        let token = self.progress.then(|| self.begin_progress(files.len()));
 
         for (i, path) in files.into_iter().enumerate() {
             let Ok(text) = fs::read_to_string(&path) else {
@@ -729,19 +818,26 @@ impl Server {
         token
     }
 
-    /// An untotalled work-done token for a single indivisible step — the
-    /// config reload's rock harvest, which has no per-file report to make from
-    /// inside `harvest_rock_tree`'s `par_iter`.
-    fn begin_progress_titled(&self, title: &str) -> ProgressToken {
-        let token = self.create_progress_token("luabox/reload");
-        self.send_progress(
-            &token,
-            WorkDoneProgress::Begin(WorkDoneProgressBegin {
-                title: title.to_string(),
-                ..WorkDoneProgressBegin::default()
-            }),
-        );
-        token
+    /// An untotalled work-done token for a single indivisible step — a rock
+    /// harvest, which has no per-file report to make from inside
+    /// `harvest_rock_tree`'s `par_iter`.
+    ///
+    /// `None` when the client did not advertise `window.workDoneProgress`, so
+    /// the caller sends nothing at all. This gate used to live only at
+    /// `bootstrap`'s call site, which left the reload path announcing itself
+    /// to clients that never asked (Shockwave round 5).
+    fn begin_progress_titled(&self, token_name: &str, title: &str) -> Option<ProgressToken> {
+        self.progress.then(|| {
+            let token = self.create_progress_token(token_name);
+            self.send_progress(
+                &token,
+                WorkDoneProgress::Begin(WorkDoneProgressBegin {
+                    title: title.to_string(),
+                    ..WorkDoneProgressBegin::default()
+                }),
+            );
+            token
+        })
     }
 
     fn end_progress(&self, token: &ProgressToken) {
@@ -1268,8 +1364,18 @@ impl Server {
             actions.push(CodeActionOrCommand::CodeAction(CodeAction {
                 title,
                 kind: Some(CodeActionKind::QUICKFIX),
-                diagnostics: source_diag
-                    .map(|d| vec![diagnostics::convert(index, d, diagnostics::LINT_SOURCE)]),
+                // Through `source_for`, not a hardcoded `LINT_SOURCE`: the
+                // client pairs an action with a published diagnostic by
+                // matching the whole record, source included, so a future
+                // fix-carrying diagnostic outside the lint band must be
+                // re-converted under the source it was published with.
+                diagnostics: source_diag.map(|d| {
+                    vec![diagnostics::convert(
+                        index,
+                        d,
+                        diagnostics::source_for(d.code),
+                    )]
+                }),
                 edit: Some(WorkspaceEdit {
                     changes: Some(changes),
                     ..WorkspaceEdit::default()
@@ -2020,11 +2126,19 @@ mod tests {
     // client would see*, not about a process that happens to still be alive.
 
     /// A server on an in-memory connection over an empty project, plus the
-    /// client end of the wire and the tempdir that must outlive both.
+    /// client end of the wire and the tempdir that must outlive both. The
+    /// client is taken to support work-done progress; [`test_server_with`]
+    /// drives the other direction.
     fn test_server() -> (TempDir, Server, Connection) {
+        test_server_with(true)
+    }
+
+    /// The same, with the client's `window.workDoneProgress` capability set
+    /// explicitly — every `$/progress` the server sends is gated on it.
+    fn test_server_with(progress: bool) -> (TempDir, Server, Connection) {
         let dir = TempDir::new().expect("tempdir");
         let (server_end, client) = Connection::memory();
-        let server = Server::new(server_end, dir.path().to_path_buf());
+        let server = Server::new(server_end, dir.path().to_path_buf(), progress);
         (dir, server, client)
     }
 
@@ -2341,7 +2455,7 @@ mod tests {
             );
         }
         let (server_end, _client) = Connection::memory();
-        let server = Server::new(server_end, dir.path().to_path_buf());
+        let server = Server::new(server_end, dir.path().to_path_buf(), false);
         assert_eq!(
             server.rocks.types().len(),
             FILES,
@@ -2386,5 +2500,116 @@ mod tests {
                 .any(|params| params["value"]["kind"] == "end"),
             "{progress:?}"
         );
+    }
+
+    /// Every `$/progress` notification the client end received, as params.
+    fn progress_notifications(client: &Connection) -> Vec<Value> {
+        drain(client)
+            .iter()
+            .filter_map(|message| match message {
+                Message::Notification(not) if not.method == super::Progress::METHOD => {
+                    Some(not.params.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The startup rock harvest is synchronous and runs before the main loop,
+    /// so it is a stretch of protocol silence the client cannot attribute to
+    /// anything — Shockwave round 5 captured 746 ms of it between the
+    /// `initialize` response and the bootstrap token, which covered an index
+    /// that took 0.1 ms. The harvest now carries its own token.
+    ///
+    /// `Server::new` is exactly where `run` reaches it, and by then
+    /// `initialize_finish` has answered the handshake, so the server-initiated
+    /// `window/workDoneProgress/create` this sends is protocol-legal.
+    #[test]
+    fn the_startup_harvest_announces_itself_with_a_progress_token() {
+        let (_dir, _server, client) = test_server();
+        let progress = progress_notifications(&client);
+        assert!(
+            progress.iter().any(|params| {
+                params["value"]["kind"] == "begin"
+                    && params["value"]["title"] == super::STARTUP_HARVEST_PROGRESS.1
+            }),
+            "the startup harvest must open a token: {progress:?}"
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|params| params["value"]["kind"] == "end"),
+            "…and close it: {progress:?}"
+        );
+    }
+
+    /// The other direction, on both harvest paths: a client that does not
+    /// advertise `window.workDoneProgress` must receive **zero** progress
+    /// traffic. The reload path read no capability at all before round 5 — it
+    /// announced itself to every client — and the startup path would have
+    /// inherited that bug the moment it grew a token.
+    #[test]
+    fn a_client_without_the_capability_receives_no_progress_traffic() {
+        let (_dir, mut server, client) = test_server_with(false);
+        assert!(
+            progress_notifications(&client).is_empty(),
+            "startup harvest sent progress to a client that never asked"
+        );
+
+        server
+            .handle_notification(Notification {
+                method: super::DidChangeConfiguration::METHOD.to_string(),
+                params: json!({ "settings": {} }),
+            })
+            .expect("a configuration change is not fatal");
+        assert!(
+            progress_notifications(&client).is_empty(),
+            "config reload sent progress to a client that never asked"
+        );
+
+        server.bootstrap();
+        assert!(
+            progress_notifications(&client).is_empty(),
+            "bootstrap sent progress to a client that never asked"
+        );
+    }
+
+    /// The pin's `Err` arm is not an accident — it is the arm production takes
+    /// on the `luabox lsp` path, where `real_main` has already built the global
+    /// pool by the time `run` calls this. Calling it repeatedly, and after a
+    /// pool exists, must be a no-op rather than a panic or an abort.
+    ///
+    /// This is the strongest assertion available: see `pin_worker_stacks`'s
+    /// doc comment for why a "delete the pin and watch a worker overflow"
+    /// differential cannot be constructed against a parser that caps recursion
+    /// depth below what a 2 MiB stack holds.
+    #[test]
+    fn pinning_worker_stacks_is_idempotent_and_never_fatal() {
+        use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
+
+        super::pin_worker_stacks();
+        super::pin_worker_stacks();
+        // The pool is usable afterwards either way — whether this call built
+        // it or found one already built by another test in this binary.
+        let sum: usize = (0..1024_usize).into_par_iter().sum();
+        assert_eq!(sum, 1024 * 1023 / 2);
+    }
+
+    /// …and with the capability, all three paths do speak.
+    #[test]
+    fn a_client_with_the_capability_hears_every_announced_pause() {
+        let (_dir, mut server, client) = test_server();
+        assert!(!progress_notifications(&client).is_empty(), "startup");
+
+        server
+            .handle_notification(Notification {
+                method: super::DidChangeConfiguration::METHOD.to_string(),
+                params: json!({ "settings": {} }),
+            })
+            .expect("a configuration change is not fatal");
+        assert!(!progress_notifications(&client).is_empty(), "reload");
+
+        server.bootstrap();
+        assert!(!progress_notifications(&client).is_empty(), "bootstrap");
     }
 }

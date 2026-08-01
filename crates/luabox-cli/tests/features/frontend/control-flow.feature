@@ -405,3 +405,21 @@ Feature: Control-flow legality — goto / label / break (#44)
       | LB0020 | no visible label for `goto` |
       | LB0021 | label already defined       |
       | LB0022 | `break` outside a loop      |
+
+  # Shockwave round 5, finding E residual. Passes 2 and 3 are two legality
+  # *axes* over one file, each internally sorted but concatenated in pass
+  # order, so a control-flow finding early in the file rendered after a
+  # dialect finding late in it. A reader scanning a file's diagnostics reads
+  # down the file, not down luabox's pass list.
+  Scenario: the two legality axes render in one source order, not in pass order
+    Given a project with edition "5.2"
+    And a file "src/main.lua" containing:
+      """
+      ::a:: ::a::
+      local n = 1 // 2
+      """
+    When I run "luabox check"
+    Then the command fails
+    And diagnostic LB0021 is reported
+    And diagnostic LB0011 is reported
+    And stdout contains "src/main.lua:1:9" before "src/main.lua:2:13"

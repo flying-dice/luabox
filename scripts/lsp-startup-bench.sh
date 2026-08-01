@@ -12,10 +12,15 @@
 #   scripts/lsp-startup-bench.py   the stdio LSP client that owns the clock
 #   tools/gen-corpus --rock-tree   the corpus, into a real rock-tree layout
 #
-# It is NOT a CI gate. SPEC.md's LSP perf budget is future work, and the
-# absolute number is host-dependent (Shockwave measured 2.81x on 4 vCPU where
-# this box measures 3.84x). The harness is the point: the claim has to be
-# re-runnable by whoever doubts it.
+# It is NOT a CI gate. SPEC.md's LSP perf budget is future work, and both the
+# absolute numbers and the ratio are host-dependent — the sequential row is one
+# rayon worker doing all the parsing, which is exactly the shape CPU steal on a
+# shared virtualized host distorts, and two independent 4 vCPU boxes produced
+# non-overlapping sequential ranges. So this file quotes no ratio of its own:
+# the committed measurements, and the host they were taken on, live in
+# `harvest_rock_tree`'s doc comment (crates/luabox-lsp/src/server.rs), and this
+# script is what re-derives them. The harness is the point — the claim has to
+# be re-runnable by whoever doubts it.
 #
 # Usage:
 #   scripts/lsp-startup-bench.sh [--runs N] [--files N] [--lines-per-file N]

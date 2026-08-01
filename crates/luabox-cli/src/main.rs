@@ -409,6 +409,16 @@ mod tests {
     use super::*;
     use clap::CommandFactory as _;
 
+    /// `luabox-lsp` pins its own global rayon pool for embedders that reach
+    /// `run`/`run_stdio` without going through `real_main`, and its comment
+    /// says the budget mirrors this one. Two constants in two crates drift
+    /// silently; this makes the mirror a compile-and-run claim, so raising one
+    /// without the other fails here rather than in an embedder's stack trace.
+    #[test]
+    fn the_lsp_and_the_cli_pin_the_same_worker_stack() {
+        assert_eq!(PINNED_STACK_BYTES, luabox_lsp::PINNED_STACK_BYTES);
+    }
+
     /// Parse an argv (without the leading program name) into a subcommand.
     fn parse(args: &[&str]) -> Command {
         let command_line: Vec<&str> = std::iter::once("luabox")
