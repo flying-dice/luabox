@@ -43,7 +43,13 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   beats a silent widening, is written up in
   [Known limitations](docs/03-reference/02-limitations.md). A project file's own
   `---@class` still *replaces* a same-named stdlib/`[types] defs` class whole —
-  that escape hatch is unchanged.
+  that escape hatch is unchanged. The generic monomorphisation template merges
+  the same way: a `---@class Name<T>` declared twice keeps both declarations'
+  fields, and a *bare* re-declaration that only adds members now reaches the
+  template instead of being skipped for carrying no `<T>`. That also removes a
+  false `LB0305` — a duplicate that renamed the parameter left the template
+  saying `U` while the surviving field body said `T`, and reported the first
+  declaration's own annotation as an unknown type name.
 - **A `---@class` carried by a global collects its members.** `---@class Global`
   over `Glob = {}` tagged the class but never gathered anything attached to it,
   so `function Glob:size()` was invisible and every `g:size()` through the class
