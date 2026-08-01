@@ -490,7 +490,8 @@ Feature: luabox check — cross-module argument checking (#46)
       ---@param scale number|nil
       ---@return number
       function M.area(w, scale)
-        return w * (scale or 1)
+        if scale == nil then return w end
+        return w * scale
       end
       return M
       """
