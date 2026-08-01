@@ -10,20 +10,78 @@
 # equal -- see README.md. Every row below was taken from the tools, not
 # reasoned about.
 #
+# Rows come in invoked/uninvoked twins wherever a shape can be written both
+# ways. That pairing is the point: round 7 found a fixture whose lint output
+# was byte-identical to a variant with the opposite runtime verdict, and the
+# matrix could not see it because only the invoked half had ever been written
+# down. A twin whose lint column matches its partner's while the runtime
+# column differs is either a false positive or a disclosed false negative, and
+# the note has to say which.
+#
 # program	findings	runtime	note
+
+# --- the metafield arm: reached-method gate, invoked/uninvoked twins -------
 metafield_mode_uninvoked_method	0	ok	FP closed round 6: a declared-but-uninvoked method is not a lookup
 metafield_newindex_uninvoked_method	0	ok	FP closed round 6: same, through a __newindex guard
 metafield_lt_uninvoked_method	0	ok	FP closed round 6: same, through an __lt comparator (two constructions)
 metafield_lt_invoked_method	2	crash	the same carrier once a:cmp(b) is reached -- one finding per construction
 metafield_tostring_invoked_method	1	crash	a class that overloads an operator; c:value() is reached
-metafield_call_factory_reaches_self	1	crash	the instance-side use is self:build() inside the carrier's own __call
-metafield_constructor_pattern_invoked	1	crash	constructor pattern: Counter.new() returns the construction, c:value() reaches it
-metafield_constructor_via_local_invoked	1	crash	the same, with the construction bound to a local inside the factory
-metafield_immediate_colon_call	1	crash	setmetatable({}, Vec):length() -- no local in between
-metafield_instance_alias_invoked	1	crash	the colon call lands on local w = v, an alias of the instance
 metafield_only_no_methods	0	ok	a pure operator metatable: nothing is ever looked up through it
 metafield_other_class_same_method_name	0	ok	the only :get() derives from Store, not Cache -- derivation keeps them apart
 metafield_with_index_invoked	0	ok	__index is written, so the lookup resolves
+
+# --- derivation (1)-(3): which values hold an instance ---------------------
+metafield_immediate_colon_call	1	crash	setmetatable({}, Vec):length() -- no local in between
+metafield_instance_alias_invoked	1	crash	the colon call lands on local w = v, an alias of the instance
+metafield_constructor_pattern_invoked	1	crash	constructor pattern: Counter.new() returns the construction, c:value() reaches it
+metafield_constructor_via_local_invoked	1	crash	the same, with the construction bound to a local inside the factory
+
+# --- round 7: the __call chain, replacing the syntactic self derivation ----
+metafield_call_factory_reaches_self	1	crash	f() dispatches to Factory.__call, whose own self takes a colon call
+metafield_call_uninvoked_factory	0	ok	round-7 FP, closed: the same file ending print(type(f)) -- nothing calls f
+metafield_mode_self_colon_invoked	1	crash	c:reset() is a colon call on a derived value -- derivations (1)-(3) see it
+metafield_mode_self_colon_uninvoked	0	ok	round-7 FP, closed: self:clear() in a body no call site enters is not a lookup
+metafield_call_body_without_self_colon	0	ok	the instance is called, but the __call it reaches runs no method -- only the __call body is asked
+metafield_table_ctor_call_invoked	1	crash	__call declared in the carrier's own table constructor; r() reaches r:route()
+metafield_table_ctor_call_uninvoked	0	ok	the twin: same carrier, nothing calls the instance
+
+# --- round 7: seeding gaps (Shapes::collect saw too few bindings) ----------
+metafield_split_local_invoked	1	crash	round-7 FN, closed: local c then c = setmetatable(...), seeded from the assignment
+metafield_split_local_uninvoked	0	ok	the twin: bound the same way, never reached
+metafield_global_assign_invoked	1	crash	round-7 FN, closed: a global holds the instance; derivation keys on the name
+metafield_global_assign_uninvoked	0	ok	the twin
+metafield_global_factory_invoked	1	crash	round-7 FN, closed: function make() ... end is an assignment to a name, not a local
+metafield_global_factory_uninvoked	0	ok	the twin
+metafield_or_fallback_invoked	1	crash	round-7 FN, closed: setmetatable(...) or fallback evaluates to the construction
+metafield_or_fallback_uninvoked	0	ok	the twin
+metafield_and_chain_invoked	1	crash	round-7 FN, closed: guard and setmetatable(...) evaluates to its right operand
+metafield_and_chain_uninvoked	0	ok	the twin
+
+# --- round 7, issue W: names past the end of the initialiser list ----------
+metafield_multi_return_slot_invoked	1	crash	W: local n, c = make() where make returns (1, construction) -- c was dropped by zip
+metafield_multi_return_slot_uninvoked	0	ok	the twin
+
+# --- DISCLOSED false negatives: silent on a crash, on purpose -------------
+# Each pair is one documented bound in docs/03-reference/02-limitations.md.
+# The lint column is identical across the twin while the runtime column is
+# not; that is what a disclosed miss looks like, and it is the direction this
+# arm errs in (the carrier declared a metafield, so silence is plausible).
+metafield_fn_table_field	0	crash	FN: the instance lives in a table field; this pass tracks names, not contents
+metafield_fn_table_field_uninvoked	0	ok	the twin -- same silence, here it is right
+metafield_fn_parameter	0	crash	FN: the instance arrives as a parameter; arguments are not propagated into bodies
+metafield_fn_parameter_uninvoked	0	ok	the twin
+metafield_fn_for_in	0	crash	FN: a generic-for variable takes its value from an iterator this pass does not evaluate
+metafield_fn_for_in_uninvoked	0	ok	the twin
+metafield_fn_method_call_factory	0	crash	FN: the factory is reached by factory:make(); only plain calls resolve to a body
+metafield_fn_method_call_factory_uninvoked	0	ok	the twin
+metafield_fn_nested_self_colon	0	crash	FN: the __call reaches the method through a nested closure; only its own body is scanned
+metafield_fn_nested_self_colon_uninvoked	0	ok	the twin -- and the FP the old syntactic derivation reported here
+metafield_fn_factory_of_factory	0	crash	FN: constructor depth is one; a factory returning a factory's result is not chased
+metafield_fn_factory_of_factory_uninvoked	0	ok	the twin
+metafield_fn_vararg_slot	0	crash	FN: the instance arrives in a ... slot; the slot is paired, its contents are unknown
+metafield_fn_vararg_slot_uninvoked	0	ok	the twin
+
+# --- the no-metafield region: structural on purpose, unchanged ------------
 plain_carrier_invoked	1	crash	the no-metafield region, canonical repro (round 2)
 plain_carrier_uninvoked	1	ok	the no-metafield region is structural on purpose: the documented over-approximation
 plain_carrier_index_wired	0	ok	__index is written

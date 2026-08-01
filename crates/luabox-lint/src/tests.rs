@@ -1638,6 +1638,320 @@ return type(c)
     assert!(has(COUNTER_REPRO, &LintConfig::new(), "LB0510"));
 }
 
+// --- LB0510: reaching a body, not writing one (Shockwave round 7) ---------
+//
+// Every shape below has a committed twin in `scripts/tests/lb0510-matrix/`
+// with its `lua5.4` verdict pinned alongside its finding count; the runtime
+// claims in these doc comments are that harness's measurements, not
+// assertions about what Lua ought to do.
+
+/// The round-7 false positive, in the pair that exposed it. Both files
+/// declare the same `__call`, the same method and the same construction; they
+/// differ only in the last line, and `lua5.4` differs with them — `f()` is
+/// `attempt to call a nil value (method 'build')`, `type(f)` exits 0. The old
+/// derivation counted the `self:build()` *written* inside `Factory.__call`,
+/// so it produced byte-identical output for both.
+#[test]
+fn a_call_metamethod_reaching_self_fires_only_when_the_instance_is_called() {
+    let carrier = "\
+---@class Factory
+local Factory = {}
+function Factory:build() return 42 end
+function Factory.__call(self) return self:build() end
+local f = setmetatable({}, Factory)
+";
+    assert!(has(
+        &format!("{carrier}return f()\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+    assert!(!has(
+        &format!("{carrier}return type(f)\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+}
+
+/// The other half of the same over-count: a colon method whose body reaches
+/// `self`, on a carrier nothing ever invokes. A colon method is reachable
+/// only through an instance colon call, which the value derivations already
+/// see — so the uninvoked file must be silent (it runs fine) and the invoked
+/// one must fire (it crashes).
+#[test]
+fn a_self_colon_call_in_an_unreached_method_is_not_an_instance_use() {
+    let carrier = "\
+---@class Cache
+local Cache = {}
+Cache.__mode = \"k\"
+function Cache:clear() self.n = 0 end
+function Cache:reset() self:clear() end
+local c = setmetatable({}, Cache)
+";
+    assert!(!has(
+        &format!("{carrier}return type(c)\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+    assert!(has(
+        &format!("{carrier}return c:reset()\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+}
+
+/// The `__call` body is asked, not every attached body. This carrier *is*
+/// called, and the call reaches a `__call` that runs no method; the
+/// `self:clear()` lives in a `Cache:reset` nothing invokes. `lua5.4` runs it
+/// to completion, and asking the wider question would report it.
+#[test]
+fn a_call_metamethod_that_reaches_no_method_is_not_an_instance_use() {
+    let src = "\
+---@class Cache
+local Cache = {}
+Cache.__call = function(self) return 1 end
+function Cache:clear() self.n = 0 end
+function Cache:reset() self:clear() end
+local c = setmetatable({}, Cache)
+return c()
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// The metamethod declared in the carrier's own table constructor is the same
+/// metamethod. `r()` runs `Router.__call(r)`, which runs `r:route()`, which is
+/// the lookup — and crashes.
+#[test]
+fn a_call_metamethod_declared_in_the_carrier_constructor_counts() {
+    let carrier = "\
+---@class Router
+local Router = { __call = function(self) return self:route() end }
+function Router:route() return \"/\" end
+local r = setmetatable({}, Router)
+";
+    assert!(has(
+        &format!("{carrier}return r()\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+    assert!(!has(
+        &format!("{carrier}return type(r)\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+}
+
+/// Seeding used to read `Stmt::Local` only, so a name declared on one line
+/// and assigned the construction on the next held nothing. The program
+/// crashes.
+#[test]
+fn a_construction_bound_by_assignment_seeds_the_name() {
+    let carrier = "\
+---@class Cache
+local Cache = {}
+Cache.__mode = \"k\"
+function Cache:reset() self.n = 0 end
+local c
+c = setmetatable({}, Cache)
+";
+    assert!(has(
+        &format!("{carrier}return c:reset()\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+    assert!(!has(
+        &format!("{carrier}return type(c)\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+}
+
+/// A global holds the instance. `binding_of` answers `None` for both halves
+/// of `store = setmetatable({}, Cache)` / `store:reset()`, so the derivation
+/// is keyed on the name — the program is the `local` spelling in every other
+/// respect and crashes the same way.
+#[test]
+fn a_construction_bound_to_a_global_seeds_the_name() {
+    let carrier = "\
+---@class Cache
+local Cache = {}
+Cache.__mode = \"k\"
+function Cache:reset() self.n = 0 end
+store = setmetatable({}, Cache)
+";
+    assert!(has(
+        &format!("{carrier}return store:reset()\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+    assert!(!has(
+        &format!("{carrier}return type(store)\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+}
+
+/// …and the constructor pattern through a *global* factory, which is an
+/// assignment to a name rather than a `local function`.
+#[test]
+fn a_global_factory_is_a_constructor_pattern() {
+    let carrier = "\
+---@class Counter
+local Counter = {}
+Counter.__tostring = function(c) return \"counter\" end
+function Counter:value() return self.n end
+function make(n) return setmetatable({ n = n }, Counter) end
+local c = make(1)
+";
+    assert!(has(
+        &format!("{carrier}return c:value()\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+    assert!(!has(
+        &format!("{carrier}return type(c)\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+}
+
+/// `or` and `and` are followed into the operand the expression evaluates to.
+/// A table is always truthy, so `setmetatable(...) or fallback` *is* the
+/// construction, and `guard and setmetatable(...)` is it whenever it is
+/// anything at all.
+#[test]
+fn a_construction_behind_a_logical_operator_seeds_the_name() {
+    let carrier = "\
+---@class Cache
+local Cache = {}
+Cache.__mode = \"k\"
+function Cache:reset() self.n = 0 end
+";
+    for init in [
+        "local c = setmetatable({}, Cache) or {}",
+        "local ready = true\nlocal c = ready and setmetatable({}, Cache)",
+    ] {
+        assert!(
+            has(
+                &format!("{carrier}{init}\nreturn c:reset()\n"),
+                &LintConfig::new(),
+                "LB0510"
+            ),
+            "invoked: `{init}`"
+        );
+        assert!(
+            !has(
+                &format!("{carrier}{init}\nreturn type(c)\n"),
+                &LintConfig::new(),
+                "LB0510"
+            ),
+            "uninvoked: `{init}`"
+        );
+    }
+}
+
+/// Issue W. `local n, c = make()` has two names and one initialiser, so `c`
+/// is past the end of the list — `names.iter().zip(init)` dropped it, and
+/// handed `n` the derivation that belongs to it. Both halves are asserted:
+/// the name that really holds the instance fires, and the one that holds the
+/// number does not.
+#[test]
+fn a_name_past_the_initialiser_list_takes_the_right_return_slot() {
+    let carrier = "\
+---@class Cache
+local Cache = {}
+Cache.__mode = \"k\"
+function Cache:reset() self.n = 0 end
+local function make() return 1, setmetatable({}, Cache) end
+local n, c = make()
+";
+    assert!(has(
+        &format!("{carrier}return n, c:reset()\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+    assert!(!has(
+        &format!("{carrier}return n, type(c)\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+    // The *first* slot is a number. A colon call on the name bound to it is
+    // not an instance-side use of the carrier — that file crashes with
+    // `attempt to index a number value`, a different bug entirely.
+    assert!(!has(
+        &format!("{carrier}return n:reset()\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+}
+
+/// The disclosed misses, pinned as a set so that closing one is a deliberate
+/// act rather than a surprise. Every program here crashes under `lua5.4` and
+/// every one is silent, and `docs/03-reference/02-limitations.md` says so
+/// shape by shape. Each also has a committed matrix fixture with its runtime
+/// verdict measured.
+#[test]
+fn the_disclosed_false_negative_classes_stay_silent() {
+    let carrier = "\
+---@class Cache
+local Cache = {}
+Cache.__mode = \"k\"
+function Cache:reset() self.n = 0 end
+";
+    for (name, tail) in [
+        (
+            "table field",
+            "local box = { c = setmetatable({}, Cache) }\nreturn box.c:reset()\n",
+        ),
+        (
+            "parameter",
+            "local function use(c) return c:reset() end\nreturn use(setmetatable({}, Cache))\n",
+        ),
+        (
+            "for-in variable",
+            "for _, c in ipairs({ setmetatable({}, Cache) }) do return c:reset() end\n",
+        ),
+        (
+            "method-call factory",
+            "local f = {}\nfunction f:make() return setmetatable({}, Cache) end\nlocal c = f:make()\nreturn c:reset()\n",
+        ),
+        (
+            "vararg slot",
+            "local function use(...) local a, c = ... return a, c:reset() end\nreturn use(1, setmetatable({}, Cache))\n",
+        ),
+    ] {
+        assert!(
+            !has(&format!("{carrier}{tail}"), &LintConfig::new(), "LB0510"),
+            "fired on the disclosed `{name}` miss"
+        );
+    }
+    // Constructor depth is one: a factory returning a factory's result.
+    let depth_two = "\
+---@class Counter
+local Counter = {}
+Counter.__mode = \"k\"
+function Counter:value() return self.n end
+local function inner() return setmetatable({ n = 1 }, Counter) end
+local function outer() return inner() end
+local c = outer()
+return c:value()
+";
+    assert!(!has(depth_two, &LintConfig::new(), "LB0510"));
+    // …and a `__call` that reaches the method through a nested closure: only
+    // the metamethod's own body is scanned for a colon call on its receiver.
+    let nested = "\
+---@class Factory
+local Factory = {}
+function Factory:build() return 42 end
+function Factory.__call(self)
+  local run = function() return self:build() end
+  return run()
+end
+local f = setmetatable({}, Factory)
+return f()
+";
+    assert!(!has(nested, &LintConfig::new(), "LB0510"));
+}
+
 // --- suppression / malformed-ignore (LB0500) -------------------------------
 
 #[test]

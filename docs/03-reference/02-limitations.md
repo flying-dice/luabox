@@ -185,39 +185,86 @@ it has to make:
 instance-side use.** Any `__`-prefixed key other than `__index` — `__call`,
 `__tostring`, `__add`, `__mode`, `__gc`, `__name`, … — marks the carrier as
 declaring a metafield, and from there the rule asks a *behavioural* question
-rather than a structural one: does some colon call in this file actually reach
-a method on an instance of that carrier? If it does, the finding stands — the
-idiomatic Vector2 tutorial class (a dot constructor, `:length()`, `__tostring`
-and `__add`) is exactly that shape, and `v:length()` does crash. If nothing
-reaches a method, the carrier reads as a deliberate operator metatable and
-stays silent.
+rather than a structural one: does this file **reach** a method on an instance
+of that carrier? If it does, the finding stands — the idiomatic Vector2
+tutorial class (a dot constructor, `:length()`, `__tostring` and `__add`) is
+exactly that shape, and `v:length()` does crash. If nothing reaches a method,
+the carrier reads as a deliberate operator metatable and stays silent.
 
-A *declaration* is not a use. `Cache.__mode = "k"` beside a
-`function Cache:reset()` that nothing ever invokes is a weak-keyed table with
-a helper on it, and the program runs fine; the rule warned on eight such
-carriers until the gate stopped counting colon-method declarations and started
-counting reached calls (Shockwave round 6).
+*Reaching* is the operative word, and it means a call site, not a line of
+source. Two things are not uses:
 
-An instance-side use is a colon call on a value the pass can *derive* from
+- a **declaration**. `Cache.__mode = "k"` beside a `function Cache:reset()`
+  that nothing ever invokes is a weak-keyed table with a helper on it, and the
+  program runs fine; the rule warned on eight such carriers until the gate
+  stopped counting colon-method declarations and started counting reached
+  calls (Shockwave round 6);
+- a **colon call inside a body nothing enters**. Add one line to the example
+  above — make it `function Cache:reset() self:clear() end` — and the file
+  still runs to completion, because `reset` is still never called. Round 7
+  measured the rule firing on it. The body of an unreached function does not
+  execute, so a `self:m()` written in it is not a lookup; what would make it
+  one is `c:reset()` on a derived value, which the derivations below see
+  directly.
+
+So an instance-side use is a **call**, on a value the pass can *derive* from
 `setmetatable(_, C)` — derivation is what keeps one class's calls from
-settling another's. Four derivations are followed, and no more:
+settling another's. Two call shapes count:
 
-- the construction itself, method-called on the spot:
-  `setmetatable({}, C):m()`;
-- a local bound to it (`local c = setmetatable({}, C)`), and any
-  `local d = c` alias of that local;
+- a **colon call on a derived value**: `c:m()`. This is the lookup a missing
+  `__index` breaks, seen at the site that performs it;
+- a **plain call on a derived value**: `c()`, when the carrier's `__call`
+  metamethod is a function body in this file whose own receiver takes a colon
+  call. That is the chain `c()` → `C.__call(self)` → `self:m()`, and it
+  crashes. Only the `__call` body is asked, not every function attached to the
+  carrier: a `__call` that reaches no method, beside a `C:reset()` nothing
+  invokes, is a program that runs fine.
+
+And a value is derived from `C` when it comes from one of these:
+
+- the construction itself, called on the spot: `setmetatable({}, C):m()`;
+- a name bound to it — `local c = setmetatable({}, C)`, and equally
+  `c = setmetatable({}, C)` on a name declared earlier or on a global — plus
+  any `local d = c` alias. `a or b` and `a and b` are followed into the
+  operand the expression evaluates to;
 - the constructor pattern: a function whose body returns a construction
-  (directly, or via a local it bound to one) is a factory for that carrier,
-  so `local c = Counter.new(); c:value()` is a use. Constructor depth is
-  one — a factory returning another factory's result is not chased;
-- `self` inside a function attached to the carrier, colon-declared method or
-  metafield alike. A `__call` factory whose body is `return self:build()`
-  reaches an instance method from inside the carrier, and that does crash.
+  (directly, or via a name it bound to one) is a factory for that carrier,
+  so `local c = Counter.new(); c:value()` is a use. Return **slots** are
+  tracked, so `return 1, setmetatable({}, C)` seeds the second name of
+  `local n, c = make()` and not the first. Constructor depth is one — a
+  factory returning another factory's result is not chased.
 
-Everything outside those four derives nothing, so an instance reached through
-a table field, a parameter or a `require` leaves the operator table silent.
+**What that leaves out, precisely.** Each of these is silent on a program that
+crashes, and each has a committed matrix fixture (with its uninvoked twin) so
+that closing one is a deliberate act rather than a surprise:
+
+- an instance held in a **table field** (`local box = { c = setmetatable({}, C) }`,
+  then `box.c:m()`) — this pass tracks names, not table contents;
+- an instance arriving as a **parameter** — argument values are not propagated
+  into callee bodies;
+- an instance taken from a **generic-`for` variable** — the value comes from an
+  iterator this pass does not evaluate;
+- an instance from a **method-call factory** (`local c = factory:make()`) —
+  only a plain call of a named function or a carrier field resolves to a body;
+- an instance in a **`...` slot** — the name is paired with the right slot of
+  the right expression, but nothing is known about what a vararg holds;
+- a **depth-two constructor** — see above;
+- a `__call` that reaches the method through a **nested closure** or a helper
+  it calls, rather than in its own body;
+- a carrier reached through **`require`** — the in-file bound, above.
+
 Those misses are false-negative-shaped, which is the direction this arm has to
 err in: the carrier declared a metafield, so silence is the plausible reading.
+
+**One approximation remains, and it is false-positive-shaped.** A `self:m()`
+that sits inside `if false then … end` within the `__call` body still counts as
+reaching a method, because this pass has no reachability analysis *inside* a
+body — the same bound the `__index`-write side has carried since the rule
+shipped ("an `__index` write inside a branch that never runs", above). The
+shape needed to trip it is a carrier with a `__call`, no `__index`, a
+dead-branch `self:m()` inside that `__call`, and a plain call on one of its
+instances; it has no measured instance, where the over-approximation it
+replaced had eight.
 
 **The behavioural gate applies to the metafield arm only.** A carrier with no
 metafield at all is judged structurally — the construction alone is enough,
