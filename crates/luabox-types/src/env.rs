@@ -881,6 +881,11 @@ impl TypeEnv {
                 nodiscard,
                 is_async,
                 version,
+                // A signature was *written* here, so calls may be checked
+                // against it — including from another module, where this flag
+                // is the only surviving evidence that a human wrote one (#46).
+                // A block carrying only use-site flags declares no signature.
+                declared: has_sig_tags,
                 ..FunctionTy::default()
             };
             // With no signature tags the block contributes only the flag:
@@ -1431,6 +1436,21 @@ fn resolve_callable_target(stmt: &Stmt) -> Option<(Option<String>, Option<lua::a
                     .map(|t| t.text().to_string()),
                 f.param_list(),
             ))
+        }
+        // `return function(…) end` — a module whose entire export *is* a
+        // function, the `direct` row of #46's table. The doc block above the
+        // `return` binds to the function value exactly as it does above a
+        // `local f = function(…) end`, so a single-function module can carry a
+        // signature at all; without this its `---@param`s bind to nothing and
+        // the module is unchecked in its own file as well as in every
+        // consumer. No name to register under — the function is reached only
+        // through `require`, never by a dotted name in this file.
+        Stmt::Return(ret) => {
+            let value = ret.exprs().and_then(|v| v.exprs().next());
+            let Some(Expr::Function(f)) = value else {
+                return None;
+            };
+            Some((None, f.param_list()))
         }
         // `Carrier.m = function(…) end` / `g = function(…) end` — the
         // assignment spelling of a function definition. luals binds a doc

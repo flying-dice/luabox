@@ -62,6 +62,12 @@ impl Infer<'_> {
             // dependent file calling this exported function gets them. The
             // checker (seed_params off) keeps the conservative `false`.
             has_return_annotation: returns_set && self.mode.seeds_params(),
+            // Explicitly *not* declared: this signature was read off an
+            // unannotated body, so its parameters are a description and not a
+            // contract. A consumer reaching this function through `require`
+            // must not argument-check against it, exactly as a same-file call
+            // to an unannotated function is not argument-checked (#46).
+            declared: false,
             overloads: Vec::new(),
             generics: Vec::new(),
             // Inferred (unannotated) functions carry no doc-comment flags.

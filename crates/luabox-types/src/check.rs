@@ -1045,10 +1045,43 @@ impl Checker<'_> {
             Expr::Paren(paren) => return self.callee_sig(&paren.inner()?),
             _ => {}
         }
-        // Fallback: a value whose *type* resolves to a declared `---@class`
-        // carrying a `---@operator call` overload is itself callable — the
-        // operator's signature governs argument and result checking (LB0122).
-        self.class_call_sig(callee)
+        // Both remaining fallbacks read the callee's *resolved type*, so it is
+        // resolved once here and shared. `expr_ty` is not a table lookup: for
+        // a call expression it re-enters `callee_sig` for that call's own
+        // callee, so it recurses with the expression tree and is memoized
+        // nowhere. Resolving once per callee rather than once per fallback
+        // keeps the work on this path the shape it had before #46 added a
+        // second fallback to it.
+        let callee_ty = self.expr_ty(callee);
+        // A value whose type resolves to a declared `---@class` carrying a
+        // `---@operator call` overload is itself callable — the operator's
+        // signature governs argument and result checking (LB0122).
+        if let Some(sig) = self.class_call_sig(&callee_ty) {
+            return Some(sig);
+        }
+        // Last resort: the callee's resolved type is itself a *written*
+        // ([`FunctionTy::declared`]) signature. This is the route by which a
+        // function reached across a module boundary is argument-checked
+        // (#46) — `local m = require("mod"); m.f(...)` binds nothing the
+        // name-keyed registries above know about, because nothing in the
+        // consumer file declares it, but inference has already resolved `m` to
+        // the required module's export type and `m.f` to the function it
+        // holds. Everything downstream — arity, `---@param` types, overload
+        // selection, generic instantiation — is the one shared
+        // [`Checker::check_arg_slots`] path, unchanged.
+        //
+        // The `declared` gate is the whole of the conservatism, and it is not
+        // a new policy: it reproduces on the cross-module side the property
+        // that makes the same-file side safe — an unannotated function is
+        // registered nowhere, so it is never resolved and never
+        // argument-checked. An unannotated *exported* function reifies to a
+        // `FunctionTy` all the same (`unknown` parameters, the body's arity),
+        // and checking against that would invent `LB0301`s about code
+        // carrying no claim at all.
+        match callee_ty {
+            Ty::Function(sig) if sig.declared => Some(*sig),
+            _ => None,
+        }
     }
 
     /// A callable [`FunctionTy`] synthesized from the `---@operator call`
@@ -1060,11 +1093,16 @@ impl Checker<'_> {
     /// overloads become the primary + `---@overload`s, so the existing
     /// overload-acceptance path selects the matching one and governs the
     /// result type.
-    fn class_call_sig(&self, callee: &Expr) -> Option<FunctionTy> {
-        let Ty::Named(class) = self.expr_ty(callee) else {
+    ///
+    /// Takes the callee's already-resolved type rather than the expression, so
+    /// [`Checker::callee_sig`] resolves it once for both of its fallbacks (see
+    /// the note there on why a second resolution is exponential, not merely
+    /// wasteful).
+    fn class_call_sig(&self, callee_ty: &Ty) -> Option<FunctionTy> {
+        let Ty::Named(class) = callee_ty else {
             return None;
         };
-        let mut sigs = self.env.class_operators(&class, "call").into_iter();
+        let mut sigs = self.env.class_operators(class, "call").into_iter();
         let mut fun = operator_call_fn(&sigs.next()?);
         fun.overloads = sigs.map(|s| operator_call_fn(&s)).collect();
         Some(fun)
@@ -1870,6 +1908,8 @@ fn operator_call_fn(sig: &OperatorSig) -> FunctionTy {
         varargs,
         returns: vec![sig.result.clone()],
         has_return_annotation: true,
+        // Synthesized from a written `---@operator call` (#46).
+        declared: true,
         ..FunctionTy::default()
     }
 }

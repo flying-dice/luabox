@@ -656,17 +656,48 @@ What that leaves, stated plainly:
 - **A library whose API is a *global*** rather than a module return — LÖVE,
   Neovim, OpenResty — still wants a `defs/` package. The harvest contributes
   type declarations and export types, not ambient globals.
-- **Argument checking at a rock function's call site** does not happen:
-  `local m = require("rock"); m.f("wrong")` is unchecked. The axis is the
-  **module boundary**, not field access — measured: a table-field call in the
-  *same* file IS argument-checked (LB0300), a call to anything reached via
-  `require` is not, your own modules included. Fields survive the boundary
-  (LB0306 fires cross-module) and a rock's `---@return` types flow, so
-  misusing a *result* is caught; a rock's `---@param` is **not enforced at
-  cross-module call sites**. Pre-existing, not a harvest limitation — tracked
-  as [#46](https://github.com/flying-dice/luabox/issues/46), with the
-  measured table on the issue. An explicit `---@type` at the call site
-  restores checking today.
+- **Argument checking at a rock function's call site now happens**, and this
+  bound is gone ([#46](https://github.com/flying-dice/luabox/issues/46)).
+  `local m = require("rock"); m.f("wrong")` reports `LB0300`, and the wrong
+  *number* of arguments reports `LB0301`, exactly as the same call written in
+  the same file does — it is one shared signature-checking path, so the
+  diagnostics read identically on both sides of the module boundary. This
+  applies to every `require`d function, your own project modules included and
+  not only rocks: a `return M` module table, a module whose export *is* a
+  function, nested tables (`m.util.fmt`), colon-methods and dot-calls on an
+  exported class, `---@overload`s, `---@vararg`, and `---@param x? T`
+  optionals, which stay omittable across the boundary exactly as they are
+  within a file.
+
+  What is *not* checked is unchanged and deliberate: a function carrying **no
+  signature annotation** is not argument-checked, because an unannotated
+  same-file function is not either. Its parameters are a description of a
+  body, not a contract, and checking calls against them would invent arity
+  errors about code that claims nothing. A rock with no LuaCATS annotations
+  still gives you nothing, per the first bullet above.
+
+  Three edges remain out, each far narrower than the bound it replaces:
+
+  - **A dynamic require path** — `require(name)` for a computed `name` —
+    resolves to no module, so its result stays `unknown` and nothing about it
+    is checked. Static string literals are the resolvable set, the same set
+    the bundler accepts.
+  - **A member declared only as a `---@field`** on an exported `---@class`,
+    with no `function M.f` defining it, does not reach the consumer: a
+    module's export type is the shape of the value it returns, and a
+    `---@field` line declares a member without assigning one. The same class
+    with its members *attached* (`function Api.send(...)`) is checked
+    normally. What is missing here is the member, not its signature.
+  - **A function re-exported from a second `require`** — module B does
+    `local a = require("a"); return { f = a.f }` and a consumer calls
+    `require("b").f(...)`. B's *own* requires are deliberately left
+    unresolved when B's export type is computed; that is what keeps the
+    cross-file registry acyclic and `require` cycles tolerable, and the cost
+    is that a signature does not travel two hops. Re-exporting a function
+    defined in B itself works.
+
+  An explicit `---@type` at the call site still restores checking in any of
+  these cases, as it always did.
 - **The flat `lua_modules/<name>/` layout is not harvested.** It keeps its
   existing route: a `[dependencies]`/`[dev-dependencies]` entry naming the
   package, a `luabox.toml` for it at `lua_modules/<name>/luabox.toml` (or at

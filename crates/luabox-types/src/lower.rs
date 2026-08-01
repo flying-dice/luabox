@@ -364,6 +364,10 @@ impl<'a> Lowerer<'a> {
     fn lower_fun(&mut self, params: &[FunParam], returns: &[FunReturn]) -> Ty {
         let mut func = FunctionTy {
             has_return_annotation: true,
+            // A `fun(...)` type expression is a written signature wherever it
+            // appears — `---@type`, `---@field`, a parameter's own type — so
+            // calls against it are checkable, cross-module included (#46).
+            declared: true,
             ..FunctionTy::default()
         };
         for param in params {
