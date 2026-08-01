@@ -248,6 +248,16 @@ pub fn is_rock_source(path: &Path, root: &Path) -> bool {
 /// typecheck rock sources against the project's own strictness — which fails
 /// on any rock that is not trivially typed, and took `luabox build` down with
 /// it.
+///
+/// Symlinked directories are NOT descended ([`is_real_dir`]) — the same guard,
+/// for the same reason, as the two sibling walks ([`collect_rock_lua`],
+/// [`collect_d_lua`]). A link back up the tree (`src/loop -> <root>`) used to
+/// be followed by `Path::is_dir()`, so the walk re-collected every source once
+/// per level until the kernel's symlink budget ran out: 41 copies of one
+/// `src/main.lua` on Linux, and 41 diagnostics for one mistake. Termination by
+/// `ELOOP` is termination by filesystem accident; this is termination by
+/// design. A symlinked *file* is still taken — only the cycle vector is
+/// closed.
 pub fn collect_lua_files(
     root: &Path,
     out_dir: Option<&Path>,
@@ -276,7 +286,7 @@ fn walk(
     entries.sort_by_key(fs::DirEntry::file_name);
     for entry in entries {
         let path = entry.path();
-        if path.is_dir() {
+        if is_real_dir(&entry) {
             if is_in_project_tree(&path, root, out_dir) {
                 walk(&path, root, out_dir, defs, lua)?;
             }
@@ -859,6 +869,50 @@ edition = \"5.4\"
         let rendered = error.to_string();
         assert!(rendered.contains("cannot read directory"), "{rendered}");
         assert!(std::error::Error::source(&error).is_some());
+    }
+
+    /// A symlink cycle in the project's own tree (`src/loop -> <root>`) must
+    /// be a non-event, exactly as it is for the two rock/defs walks: the
+    /// walk skips symlinked directories by design rather than spiralling
+    /// until the kernel's symlink budget runs out. Before the guard,
+    /// `path.is_dir()` followed the link and the walk re-collected
+    /// `src/main.lua` once per level — 41 copies of one file on Linux
+    /// (`MAXSYMLINKS`), and 41 diagnostics for one mistake.
+    #[cfg(unix)]
+    #[test]
+    fn collect_lua_files_does_not_descend_symlinked_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "src/main.lua", "return 1\n");
+        // The cycle: src/loop points back at the project root.
+        std::os::unix::fs::symlink(tmp.path(), tmp.path().join("src/loop")).expect("symlink dir");
+
+        let files = collect_lua_files(tmp.path(), None, DefFiles::Include).expect("walk");
+        assert_eq!(
+            rel_all(&files, tmp.path()),
+            ["src/main.lua"],
+            "the cycle contributes nothing and the file is reported once"
+        );
+    }
+
+    /// The other half of the sibling contract: only the cycle vector is
+    /// closed, so a symlinked *file* is still project source.
+    #[cfg(unix)]
+    #[test]
+    fn collect_lua_files_still_takes_a_symlinked_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "src/real.lua", "return 1\n");
+        write(tmp.path(), "elsewhere.lua.txt", "return 2\n");
+        std::os::unix::fs::symlink(
+            tmp.path().join("elsewhere.lua.txt"),
+            tmp.path().join("src/alias.lua"),
+        )
+        .expect("symlink file");
+
+        let files = collect_lua_files(tmp.path(), None, DefFiles::Include).expect("walk");
+        assert_eq!(
+            rel_all(&files, tmp.path()),
+            ["src/alias.lua", "src/real.lua"]
+        );
     }
 
     #[test]

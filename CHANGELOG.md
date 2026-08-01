@@ -10,6 +10,15 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ### Fixed
 
+- **The project source walk no longer follows a symlink cycle.** `src/loop ->
+  <root>` made `layout::walk` re-collect every source once per level until the
+  kernel's symlink budget ran out — 41 copies of one `src/main.lua` on Linux,
+  and 41 diagnostics for one mistake, terminating by `ELOOP` rather than by
+  design. The walk now tests `entry.file_type()` (`is_real_dir`) instead of
+  `Path::is_dir()`, the same guard the sibling rock and defs walks already
+  carried: symlinked directories are not descended, symlinked *files* are
+  still project source, and `walk`'s `LayoutError` propagation is unchanged
+  (refs #51).
 - **`luabox check --watch` now reruns when the vendored rock tree changes.**
   Since the rock type harvest landed, `check` reads
   `lua_modules/share/lua/<X.Y>/**.lua` — but the watcher still filtered all of
