@@ -525,3 +525,242 @@ end
     );
     assert_eq!(strict_codes_ambient(&src), vec!["LB0308", "LB0300"]);
 }
+
+// ---------------------------------------------------------------------------
+// String receiver methods (#46 follow-up).
+//
+// Every string in a Lua state shares one metatable whose `__index` is the
+// `string` table, so `s:upper()` *is* `string.upper(s)`. The free-function
+// spelling already typed; the receiver-method spelling produced `unknown`,
+// which surfaced as LB0300 "found `unknown`" wherever the result was used.
+// ---------------------------------------------------------------------------
+
+/// Strict check with the stdlib ambient layer, returning `(code, message)`
+/// pairs so a diagnostic's *content* can be asserted, not only its code.
+fn strict_diags_ambient(src: &str) -> Vec<(String, String)> {
+    let parse = lua::parse(src, lua::Dialect::Lua54);
+    assert_eq!(parse.errors(), &[], "fixture must parse cleanly");
+    check_file_with_ambient(
+        &parse,
+        "test.lua",
+        Strictness::Strict,
+        lua::Dialect::Lua54,
+        Some(stdlib_defs(lua::Dialect::Lua54)),
+    )
+    .iter()
+    .map(|d| (d.code.to_string(), d.message.clone()))
+    .collect()
+}
+
+fn none() -> Vec<String> {
+    Vec::new()
+}
+
+#[test]
+fn every_string_method_types_its_result_through_the_string_library() {
+    // The reviewer's list, in one fixture: upper lower sub rep gsub match len
+    // byte format. `match` returns `string|nil` (luals: `string?`), so it is
+    // asserted against a nil-admitting parameter rather than a bare `string`.
+    let src = "\
+---@param s string
+local function want_s(s) end
+---@param n integer
+local function want_i(n) end
+---@param s string|nil
+local function want_sn(s) end
+
+---@type string
+local s = \"hi\"
+want_s(s:upper())
+want_s(s:lower())
+want_s(s:sub(1, 2))
+want_s(s:rep(3))
+want_s(s:gsub(\"a\", \"b\"))
+want_sn(s:match(\"a\"))
+want_i(s:len())
+want_i(s:byte())
+want_s(s:format())
+";
+    assert_eq!(strict_codes_ambient(src), none());
+}
+
+#[test]
+fn the_free_function_spelling_still_types() {
+    // Control: `string.upper(s)` was never broken and must stay clean.
+    let src = "\
+---@param s string
+local function want(s) end
+---@type string
+local s = \"hi\"
+want(string.upper(s))
+";
+    assert_eq!(strict_codes_ambient(src), none());
+}
+
+#[test]
+fn a_string_method_result_that_does_not_fit_is_a_plain_mismatch() {
+    // The negative direction: now that `s:upper()` types as `string`, using it
+    // where a number is wanted is LB0300 naming `string` — not `unknown`.
+    let src = "\
+---@param n number
+local function want(n) end
+---@type string
+local s = \"hi\"
+want(s:upper())
+";
+    let diags = strict_diags_ambient(src);
+    assert_eq!(
+        diags.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>(),
+        vec!["LB0300"]
+    );
+    assert!(
+        diags[0].1.contains("found `string`"),
+        "the receiver method's result must be typed, got: {}",
+        diags[0].1
+    );
+}
+
+#[test]
+fn a_string_literal_receiver_resolves_the_same_methods() {
+    let src = "\
+---@param s string
+local function want(s) end
+want((\"x\"):rep(3))
+";
+    assert_eq!(strict_codes_ambient(src), none());
+}
+
+#[test]
+fn an_inferred_string_local_resolves_the_same_methods() {
+    let src = "\
+---@param s string
+local function want(s) end
+local s = \"hi\"
+want(s:upper())
+";
+    assert_eq!(strict_codes_ambient(src), none());
+}
+
+#[test]
+fn a_concatenation_result_resolves_the_same_methods() {
+    let src = "\
+---@param s string
+local function want(s) end
+---@type string
+local s = \"hi\"
+want((s .. \"y\"):lower())
+";
+    assert_eq!(strict_codes_ambient(src), none());
+}
+
+#[test]
+fn a_string_typed_class_field_resolves_the_same_methods() {
+    let src = "\
+---@class Holder
+---@field name string
+
+---@param s string
+local function want(s) end
+---@param h Holder
+local function use(h) want(h.name:upper()) end
+return use
+";
+    assert_eq!(strict_codes_ambient(src), none());
+}
+
+#[test]
+fn a_method_the_string_library_does_not_declare_is_an_undefined_field() {
+    // luals reports `undefined-field` here, and so does Lua itself:
+    // `("x"):nope()` raises "attempt to call a nil value (method 'nope')".
+    let src = "\
+---@type string
+local s = \"hi\"
+return s:nope()
+";
+    let diags = strict_diags_ambient(src);
+    assert_eq!(
+        diags.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>(),
+        vec!["LB0306"]
+    );
+    assert!(
+        diags[0].1.contains("undefined field `nope` on `string`"),
+        "got: {}",
+        diags[0].1
+    );
+}
+
+#[test]
+fn a_field_the_string_library_does_not_declare_is_an_undefined_field_too() {
+    // The `.` spelling reaches the same metatable, so it resolves and fails
+    // the same way.
+    let src = "\
+---@type string
+local s = \"hi\"
+return s.nope
+";
+    assert_eq!(strict_codes_ambient(src), vec!["LB0306"]);
+}
+
+#[test]
+fn the_dot_spelling_of_a_string_method_is_the_library_function_itself() {
+    let src = "\
+---@param s string
+local function want(s) end
+---@type string
+local s = \"hi\"
+want(s.upper(s))
+";
+    assert_eq!(strict_codes_ambient(src), none());
+}
+
+#[test]
+fn a_string_methods_arguments_are_checked_with_self_bound() {
+    // The receiver is the library function's *first* parameter, so the
+    // explicit arguments line up from its second. A wrong one is LB0300 and a
+    // wrong count is LB0301, exactly as for a `---@class` method.
+    let src = "\
+---@type string
+local s = \"hi\"
+return s:rep(\"three\")
+";
+    assert_eq!(strict_codes_ambient(src), vec!["LB0300"]);
+}
+
+#[test]
+fn a_string_method_called_with_too_many_arguments_is_an_arity_error() {
+    let src = "\
+---@type string
+local s = \"hi\"
+return s:upper(1, 2, 3)
+";
+    assert_eq!(strict_codes_ambient(src), vec!["LB0301"]);
+}
+
+#[test]
+fn a_string_method_called_with_too_few_arguments_is_an_arity_error() {
+    let src = "\
+---@type string
+local s = \"hi\"
+return s:sub()
+";
+    assert_eq!(strict_codes_ambient(src), vec!["LB0301"]);
+}
+
+#[test]
+fn a_project_extension_of_the_string_library_is_reachable_as_a_method() {
+    // Resolution goes through the ordinary dotted-function registry, so a
+    // project that extends the library gets the method form for free — which
+    // is exactly what happens at runtime.
+    let src = "\
+---@param s string
+---@return string
+function string.trim(s) return s end
+
+---@param s string
+local function want(s) end
+---@type string
+local s = \"hi\"
+want(s:trim())
+";
+    assert_eq!(strict_codes_ambient(src), none());
+}
