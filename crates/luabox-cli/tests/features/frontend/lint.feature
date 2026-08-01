@@ -1039,3 +1039,168 @@ Feature: luabox lint — type-informed lint rules (clippy analog)
     When I run "luabox lint"
     Then the command succeeds
     And stdout contains "read of undefined global `undeclared_thing`"
+
+  # --- report formats (#53) -----------------------------------------------
+  #
+  # `lint` and `check` produce the same `Diagnostic` type and now share the
+  # same rendering infrastructure, so `lint` carries the identical closed
+  # `--format` set. What does NOT change is lint's exit-code semantics
+  # (SPEC.md §9): a warn-tier finding still exits 0. The machine formats
+  # therefore have to carry severity faithfully, so a CI consumer can gate on
+  # warnings itself — luabox does not make that call for it.
+
+  Scenario: --format json carries a warning faithfully without moving the exit code
+    Given a file "src/main.lua" containing:
+      """
+      ---@class Counter
+      ---@field n integer
+      local Counter = {}
+
+      function Counter:value()
+        return self.n
+      end
+
+      local c = setmetatable({ n = 1 }, Counter)
+      return c:value()
+      """
+    When I run "luabox lint --format json"
+    Then the command succeeds
+    And stdout is valid JSON
+    And the json report marks "LB0510" as "warning"
+
+  Scenario: --format sarif emits a SARIF 2.1.0 report
+    Given a file "src/main.lua" containing:
+      """
+      ---@class Counter
+      ---@field n integer
+      local Counter = {}
+
+      function Counter:value()
+        return self.n
+      end
+
+      local c = setmetatable({ n = 1 }, Counter)
+      return c:value()
+      """
+    When I run "luabox lint --format sarif"
+    Then the command succeeds
+    And stdout is valid JSON
+    And stdout contains "sarif-schema-2.1.0.json"
+    And the sarif report marks "LB0510" as "warning"
+
+  Scenario: --format gitlab emits a schema-valid code-quality report
+    Given a file "src/main.lua" containing:
+      """
+      ---@class Counter
+      ---@field n integer
+      local Counter = {}
+
+      function Counter:value()
+        return self.n
+      end
+
+      local c = setmetatable({ n = 1 }, Counter)
+      return c:value()
+      """
+    When I run "luabox lint --format gitlab"
+    Then the command succeeds
+    And the gitlab report satisfies the code quality schema
+    And the gitlab report marks "LB0510" as "minor"
+
+  # A clean project must still emit a well-formed *empty* document rather
+  # than nothing at all, or a consumer that unconditionally parses stdout
+  # breaks on the happy path. `check` already does this; `lint` matches it.
+  Scenario Outline: a clean project emits a valid empty document
+    Given a file "src/main.lua" containing:
+      """
+      local x = 1
+      print(x)
+      return 0
+      """
+    When I run "luabox lint --format <format>"
+    Then the command succeeds
+    And stdout is valid JSON
+    And stdout contains "<empty>"
+
+    Examples:
+      | format | empty |
+      | json   | []    |
+      | gitlab | []    |
+
+  # A `[lint]` deny escalation has to show up in BOTH places: the severity a
+  # machine format reports, and the exit code. Reporting one without the
+  # other would make the report disagree with the verdict.
+  Scenario: a deny escalation is reflected in the severity and the exit code
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [lint]
+      suspicious = "deny"
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@class Counter
+      ---@field n integer
+      local Counter = {}
+
+      function Counter:value()
+        return self.n
+      end
+
+      local c = setmetatable({ n = 1 }, Counter)
+      return c:value()
+      """
+    When I run "luabox lint --format json"
+    Then the command fails
+    And stdout is valid JSON
+    And the json report marks "LB0510" as "error"
+
+  # The review's exact probe. `lint --format json` used to exit 2 — clap
+  # rejecting an unknown flag — which is the "you invoked me wrong" code, not
+  # a verdict. It must now be 0 or 1 according to the findings, never 2.
+  Scenario: --format json on a clean project exits 0, not 2
+    Given a file "src/main.lua" containing:
+      """
+      local x = 1
+      print(x)
+      return 0
+      """
+    When I run "luabox lint --format json"
+    Then the command exits with code 0
+
+  Scenario: --format json with a correctness finding exits 1, not 2
+    Given a file "src/main.lua" containing:
+      """
+      ---@luabox-ignore unused-local
+      local x = 1
+      return 0
+      """
+    When I run "luabox lint --format json"
+    Then the command exits with code 1
+    And stdout is valid JSON
+    And the json report marks "LB0500" as "error"
+
+  Scenario: an unknown --format is a usage error listing the supported ones
+    Given a file "src/main.lua" containing:
+      """
+      return 1
+      """
+    When I run "luabox lint --format xml"
+    Then the command exits with code 2
+    And stderr contains "invalid value 'xml' for '--format <FORMAT>'"
+    And stderr contains "[possible values: human, json, sarif, github, gitlab]"
+
+  Scenario: --format github emits workflow-command annotations
+    Given a file "src/main.lua" containing:
+      """
+      local unused = 1
+      return 0
+      """
+    When I run "luabox lint --format github"
+    Then the command succeeds
+    And stdout contains "::warning file=src/main.lua"
+    And stdout contains "LB0501"

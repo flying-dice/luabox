@@ -8,6 +8,23 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ## [Unreleased]
 
+### Added
+
+- **`luabox lint --format json|sarif|github|gitlab`.** `lint` had no
+  `--format` at all, so `luabox lint --format json` exited 2 — clap rejecting
+  an unknown argument, the "you invoked me wrong" code rather than a verdict —
+  while `check` carried the full surface. `lint` now takes the same closed set
+  through the same renderer; the two commands produce the same diagnostic
+  values, so a second rendering path for them could only be a way to disagree.
+  Lint's exit-code semantics are untouched (SPEC.md §9): a warn-tier finding
+  still exits 0. That is precisely why the machine formats carry severity
+  faithfully — a CI consumer that wants to gate on warnings reads the severity
+  back out of the report and decides for itself, rather than having luabox
+  decide for it. A `[lint]` deny escalation moves both together: reported as an
+  error, and exit 1. A clean project emits a well-formed *empty* document, as
+  `check` already did, so a consumer that unconditionally parses stdout does
+  not break on the happy path (refs #53).
+
 ### Fixed
 
 - **The project source walk no longer follows a symlink cycle.** `src/loop ->

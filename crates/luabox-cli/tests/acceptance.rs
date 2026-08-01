@@ -515,6 +515,47 @@ fn gitlab_fingerprints_are_distinct(world: &mut AcceptanceWorld) {
     );
 }
 
+/// Every machine format has to carry a finding's **severity** faithfully,
+/// whatever the command's own exit code did with it: `lint` exits 0 on a
+/// warn-tier finding, so a CI consumer that wants to gate on warnings can
+/// only do so by reading the severity back out of the report.
+///
+/// One step over the three JSON-shaped formats, since the contract is one
+/// contract and only the spelling of the two fields differs.
+#[then(expr = "the {word} report marks {string} as {string}")]
+fn report_marks_severity(world: &mut AcceptanceWorld, format: String, code: String, level: String) {
+    let stdout = world.stdout();
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout is not JSON: {e}\nstdout:\n{stdout}"));
+    // (the code field, the severity field, the findings) per format.
+    let (code_key, level_key, findings) = match format.as_str() {
+        "json" => ("code", "severity", value.as_array().cloned()),
+        "gitlab" => ("check_name", "severity", value.as_array().cloned()),
+        "sarif" => (
+            "ruleId",
+            "level",
+            value["runs"][0]["results"].as_array().cloned(),
+        ),
+        other => panic!("no severity contract defined for the `{other}` format"),
+    };
+    let findings = findings.unwrap_or_else(|| panic!("no findings array\nstdout:\n{stdout}"));
+    let matching: Vec<&serde_json::Value> = findings
+        .iter()
+        .filter(|f| f[code_key].as_str() == Some(code.as_str()))
+        .collect();
+    assert!(
+        !matching.is_empty(),
+        "no `{code}` finding in the {format} report; stdout:\n{stdout}"
+    );
+    for finding in matching {
+        assert_eq!(
+            finding[level_key].as_str(),
+            Some(level.as_str()),
+            "`{code}` is not reported as `{level}` in {finding}"
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // @wip gates feature files written ahead of implementation (spec-first,
