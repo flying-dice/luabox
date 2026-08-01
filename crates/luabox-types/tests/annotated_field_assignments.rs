@@ -314,6 +314,37 @@ return M
 }
 
 #[test]
+fn a_class_annotation_over_a_global_table_is_checked_on_the_spot() {
+    // The `local X = {}` carrier defers its conformance to the *final*
+    // accumulated shape (a luabox leniency). The assignment spellings do not:
+    // the literal is checked where it is written, which is what luals does for
+    // both. Documented in `docs/03-reference/02-limitations.md`.
+    let src = "\
+---@class Iface
+---@field a string
+
+---@type Iface
+G = {}
+G.a = \"x\"
+";
+    assert_eq!(codes(src), vec!["LB0302"]);
+}
+
+#[test]
+fn the_local_carrier_deferral_is_unchanged() {
+    let src = "\
+---@class Iface
+---@field a string
+
+---@type Iface
+local L = {}
+L.a = \"x\"
+return L
+";
+    assert_eq!(codes(src), none());
+}
+
+#[test]
 fn an_annotation_on_a_call_target_is_not_a_slot() {
     // Only assignment *targets* take an annotation; a bare call statement
     // under a `---@type` declares nothing and must not manufacture a

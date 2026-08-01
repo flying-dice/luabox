@@ -1,0 +1,25 @@
+---
+column: doing
+labels: [release, burndown]
+priority: high
+agent: claude
+live: true
+status: Waves 21+22 launched in parallel; 23 (#54) and 24 (#46) to follow
+updatedAt: 2026-08-01T18:20:00.000Z
+---
+# Burn-down 2: the issues the PR #47 review raised
+
+Owner directive: burn down both what was open AND what the reviews opened. Eight burnable: #46 (round 1, re-scoped), #48/#49 (round 3 raise-don't-fix), #50/#51/#52/#53/#54 (round 10 sweep). Owner-only stays: #27 (tag), #28 (branch protection), #34 (marketplace credentials).
+
+## Plan
+
+- **Wave 21** (wt-w21, sprint/w21-types-cluster): #48 `---@type` over field assignment, #49 same-file `---@class` union, #50 global carrier members — all luabox-types annotation semantics.
+- **Wave 22** (wt-w22, sprint/w22-cli-cluster): #51 project-walk symlink guard, #52 gitlab format (empty path + fingerprint collisions), #53 `lint --format` — manifest/CLI.
+- **Wave 23**: #54 require-binding hover (luabox-lsp) — after a slot frees.
+- **Wave 24**: #46 cross-module argument checking — the substantial checker feature, its own wave with design care.
+- Then: develop → main PR through Shockwave (fixtures/tests-first discipline stands), deliberate closes with evidence.
+
+## Comments
+
+- **claude** (2026-08-01T15:40:00.000Z): Waves 21 and 22 launched in parallel (disjoint crates; CHANGELOG/board conflicts resolved keep-both at merge). Disk pre-checked: 21G free, both agents instructed to df before heavy builds and clean stale wt-*/target dirs.
+- **claude** (2026-08-01T18:20:00.000Z): Wave 21 done on `sprint/w21-types-cluster` — #48, #49, #50 all fixed, tests-first. Red counts committed before the fix: 10/20 (`annotated_field_assignments.rs`, #48), 11/14 (`duplicate_class_merge.rs`, #49), 12/18 (`global_carrier_members.rs`, #50), plus 2 `lsp_acceptance` scenarios so the editor path is covered by the same semantics. Three luals-parity calls, each documented in the test module header, `docs/03-reference/02-limitations.md` and CHANGELOG: (a) `---@type` on an assignment is positional and binds to the *statement*, so it reaches `M.a` / `M["a"]` / `M.a.b` / `G = 1` alike, and a `---@field` keeps the class surface while the annotation governs the assignment; (b) duplicate `---@class` unions everywhere, and a duplicate `---@field` is **first-wins** — measured off the cross-file fold first (`cross_file_conflicting_field_keeps_the_first_files_type` was already green), which also makes `LB0311`'s own "the first declaration wins" note true of the stored type for the first time; luals unions the types instead, divergence disclosed; (c) a global carrier is *lexical* like a local one, so it beats a nominal match in both declaration orders, and a re-carried global follows Lua's most-recent-assignment rule — the one place a global write replaces rather than unions, which is what keeps the inference path in parity with the defs-side `carrier_var_classes` (waves 3/4). Wave-14/16/19 tests unmodified. One pre-existing test was rewritten, deliberately: `annotated_assignments::a_non_function_typed_assignment_is_unchanged` pinned exactly the #48 defect (#38 scoped itself to `fun(…)` and declared the rest out of scope), so it is now `..._declares_and_checks_its_slot`. Gates green, exit codes direct: fmt, clippy `-D warnings` (workspace, all-targets), `cargo test --workspace` (860 acceptance + 196 lsp scenarios, all unit suites), release `acceptance` 860/860 and `lsp_acceptance` 196/196, `lb0510-matrix.sh` 119/119, `control-flow-differential.sh` 112/112. New user-visible edge, disclosed: `---@type <Class>` over `G = {}` now reports missing members on the spot (`LB0302`) — the build-it-up-later deferral is a property of the `local X = {}` carrier spelling; `---@class` is the carrier spelling that collects members attached to a global later, and that is what #50 fixed.
