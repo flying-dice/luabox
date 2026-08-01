@@ -78,6 +78,7 @@ use luabox_types::{Ambient, RockModule, RockSurfaces, build_ambient};
 use rayon::prelude::*;
 
 use crate::line_index::LineIndex;
+use crate::requires::RequireExports;
 use crate::sema::FileSema;
 use crate::uri::uri_to_path;
 use crate::{
@@ -1497,8 +1498,16 @@ impl Server {
     }
 
     fn hover(&self, uri: &Uri, position: lsp_types::Position) -> Option<Hover> {
-        let (_snapshot, sema, offset) = self.at(uri, position)?;
-        hover::hover(&sema, offset)
+        let (snapshot, sema, offset) = self.at(uri, position)?;
+        let exports = self.require_exports(&snapshot, &sema.path);
+        hover::hover(&sema, offset, &exports)
+    }
+
+    /// The shared `require` resolution for one file — the same map the
+    /// diagnostics pipeline checks against (#54), so hover and completion
+    /// cannot type a `require` binding differently from the problems pane.
+    fn require_exports(&self, snapshot: &Analysis, path: &Path) -> RequireExports {
+        RequireExports::resolve(snapshot, path, &self.rocks)
     }
 
     /// The callee's resolved signature(s) while `position` sits inside a
@@ -1600,7 +1609,10 @@ impl Server {
         position: lsp_types::Position,
     ) -> Option<Vec<lsp_types::CompletionItem>> {
         let (snapshot, sema, offset) = self.at(uri, position)?;
-        Some(completion::completion(&sema, offset, &snapshot, &self.root))
+        let exports = self.require_exports(&snapshot, &sema.path);
+        Some(completion::completion(
+            &sema, offset, &snapshot, &self.root, &exports,
+        ))
     }
 
     fn document_symbols(&self, uri: &Uri) -> Option<Vec<lsp_types::DocumentSymbol>> {

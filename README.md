@@ -283,8 +283,19 @@ every `---@class`, `---@enum` and `---@alias` they declare, plus the type a
 `require` of each module evaluates to. No `[dependencies]` entry, no
 per-package `luabox.toml`, no `[types] defs`. The rock's classes become
 nameable and enforced in your code, `local m = require("rock")` carries the
-module's annotated return types, and misuse is reported at *your* use site
-(the editor sees the same surfaces, so hover and completion agree with CI).
+module's annotated return types, and misuse is reported at *your* use site.
+
+The editor reads those surfaces through the same resolver the type pass
+does, so a `require` binding hovers and completes with the type CI checks
+it against (#54): `local m = require("rock")` shows the module's export
+type, `m.helper` shows that member's, and `m.` offers the members. Two
+things are `unknown` on both sides, by design rather than by omission — a
+dynamic `require(name)`, and `require("a") or require("b")`, name no module
+statically. One case is narrower in the editor than in CI: when a module's
+export is a `---@class` *instance* rather than a table, the binding hovers
+as the class name but its fields are declared in the module's own file,
+beyond the reach of the editor's per-file view — so its members get no
+hover or completion, while `luabox check` still checks them.
 
 Surfaces only — a vendored body is never typechecked. A type error inside a
 rock is not your problem and produces nothing; a rock source that does not

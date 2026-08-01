@@ -27,6 +27,30 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ### Fixed
 
+- **Hover and completion on a `require` binding now use the type pass's
+  answer.** `local m = require("mod")` hovered `unknown` while `luabox check`
+  and the server's own diagnostics resolved the module's export type for that
+  very binding — two `require` resolvers, and the editor asked the one that had
+  never heard of cross-file modules (the per-file LuaCATS harvest). There is
+  one now: `luabox-lsp`'s `requires::RequireExports`, the map the type pass
+  already threads into `check_file_with_requires` — project modules from the
+  database, rock modules from the vendored-tree harvest, in the precedence
+  path-keyed resolution gives `luabox check`. Hover on the binding renders the
+  module's export type, hover on a member (`m.helper`) renders that member's
+  type qualified by the module, and `.`/`:` completion offers the module's
+  exported members (`:` only the function-typed ones). Rock requires resolve
+  the same way. Types render as the checker holds them, literals included: a
+  module field inferred as `1` shows `1`, not `integer` — widening it for
+  display would be the editor disagreeing with CI, which is the whole class of
+  defect. An explicit `---@type` still wins over the module export. What stays
+  `unknown` is unchanged and deliberate, and now pinned as such: a dynamic
+  `require(name)`, and `require("a") or require("b")`, name no module
+  statically, and the type pass does not resolve them either. One
+  narrower-than-CI case is documented rather than papered over: when a module's
+  export is a `---@class` *instance*, the binding hovers as the class name but
+  its fields live in the declaring file, out of the editor's per-file reach, so
+  its members get no hover or completion. README's "hover and completion agree
+  with CI" is scoped to match (refs #54).
 - **The project source walk no longer follows a symlink cycle.** `src/loop ->
   <root>` made `layout::walk` re-collect every source once per level until the
   kernel's symlink budget ran out — 41 copies of one `src/main.lua` on Linux,
