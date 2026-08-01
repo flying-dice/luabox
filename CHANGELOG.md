@@ -10,6 +10,36 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ### Fixed
 
+- **`LB0510` no longer warns on a carrier whose methods nobody calls.** The
+  operator-table gate was *structural* where it needed to be *behavioural*: a
+  carrier that declared a lookup-irrelevant metafield **and** a colon method
+  was read as a class, whether or not anything ever invoked that method on an
+  instance. Eight measured shapes warned and ran fine under `lua5.4` —
+  `Cache.__mode = "k"` beside `function Cache:reset()`, a `__newindex` guard
+  beside `Guard:reject()`, an `__lt` comparator beside `Sorter:cmp()`.
+
+  On a carrier with a metafield the rule now fires only on an **observed
+  instance-side use**: a colon call landing on a value derived from
+  `setmetatable(_, C)`. Four derivations are followed — the construction
+  method-called on the spot, a local bound to it (and aliases of that local),
+  the constructor pattern (`local c = Counter.new(); c:value()`), and `self`
+  inside a function attached to the carrier, which is how a `__call` factory
+  doing `return self:build()` still fires. Deriving the value is also what
+  keeps one class's calls from settling another's: a `:get()` on a `Store`
+  instance says nothing about a `Cache` that happens to declare a `get` too.
+
+  A carrier with **no** metafield is unchanged — still structural, still
+  firing on the construction alone. That region is pinned by four rounds of
+  measurement, and gating it behaviourally would reopen the false-negative
+  axis the previous round closed.
+
+  The shape matrix behind all of this is now committed and runnable rather
+  than kept in prose: `scripts/tests/lb0510-matrix/` holds one program per
+  shape with its expected finding count, and `scripts/tests/lb0510-matrix.sh`
+  re-derives both the lint verdict and — where `lua5.4` is on `PATH` — what
+  the program actually does when executed. It is blocking in the differential
+  workflow, the job with real interpreters on the runner.
+
 - **`LB0510` fires again on the canonical carrier class.** The previous
   round's two false-positive fixes each over-reached, and between them they
   silenced the shape `metatable-without-index` exists for. A single
@@ -244,6 +274,17 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   in [the limitations page](docs/03-reference/02-limitations.md).
 
 ### Internal (contributors)
+
+- **`LB0510`'s alias resolution is linear again.** `Carriers::build` calls
+  `Aliases::root` once per indexed write, and `root` walked the whole
+  `local b = a; local a = C` chain on every call — quadratic in chain depth
+  times writes. Measured on a generated file with an 8000-link chain and 8000
+  writes through its deepest link, lint went from 1.27 s to 0.08 s; at 32000
+  (a 1.36 MB file) from 22.85 s to 0.38 s, which is the flat control's time.
+  Every alias is now resolved to its root once at build time, with path
+  compression, so `root` is a single lookup. The self-loop guard and the step
+  bound are kept: a chain is acyclic by construction, but that is a property
+  of the lowerer rather than of this function's input.
 
 - **Work-done progress is gated on the client, and the startup pause has a
   token.** `window.workDoneProgress` was read once and handed to the

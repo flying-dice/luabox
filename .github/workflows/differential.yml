@@ -24,6 +24,13 @@ on:
       - "scripts/tests/control-flow-matrix/**"
       - "crates/luabox-diag/**"
       - "crates/luabox-cli/**"
+      # LB0510's shape matrix rides this job too: it is the only one with a
+      # real Lua on the runner, and the runtime column is the whole point of
+      # it. Same reasoning as above — without these paths the rule, the corpus
+      # or the runner could be edited and the job would stay unrun.
+      - "crates/luabox-lint/src/rules/metatable_without_index.rs"
+      - "scripts/tests/lb0510-matrix.sh"
+      - "scripts/tests/lb0510-matrix/**"
       - ".github/workflows/differential.yml"
   pull_request:
     paths:
@@ -42,6 +49,13 @@ on:
       - "scripts/tests/control-flow-matrix/**"
       - "crates/luabox-diag/**"
       - "crates/luabox-cli/**"
+      # LB0510's shape matrix rides this job too: it is the only one with a
+      # real Lua on the runner, and the runtime column is the whole point of
+      # it. Same reasoning as above — without these paths the rule, the corpus
+      # or the runner could be edited and the job would stay unrun.
+      - "crates/luabox-lint/src/rules/metatable_without_index.rs"
+      - "scripts/tests/lb0510-matrix.sh"
+      - "scripts/tests/lb0510-matrix/**"
       - ".github/workflows/differential.yml"
   schedule:
     # Weekly sweep (Mon 05:17 UTC) so runtime/apt drift is noticed even when
@@ -114,3 +128,12 @@ jobs:
         run: cargo build --release --bin luabox
       - name: Control-flow legality vs reference luac (blocking)
         run: bash scripts/tests/control-flow-differential.sh
+
+      # LB0510 shape matrix (#47) — a third axis on the same binary: for every
+      # shape of `metatable-without-index`, both the lint verdict and what
+      # `lua5.4` actually does when the program runs. It lives here rather
+      # than in `ci.yml` because the runtime column needs an interpreter, and
+      # this is the job that installs one; the lint column alone would be a
+      # weaker test than the unit suite already runs.
+      - name: LB0510 shape matrix vs lua5.4 (blocking)
+        run: bash scripts/tests/lb0510-matrix.sh
