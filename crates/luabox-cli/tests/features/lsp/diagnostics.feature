@@ -393,4 +393,4 @@ Feature: luabox lsp — published diagnostics
       """
     And the language server is running
     When I open "main.lua"
-    Then the diagnostics for "main.lua" are empty
+    Then the diagnostics for "main.lua" do not include LB0306

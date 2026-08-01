@@ -89,7 +89,11 @@ return M
 ";
     let diags = check(src);
     let label = diags[0].primary_label().expect("primary label");
-    assert_eq!(&src[label.span.range.clone()], "1");
+    assert_eq!(
+        src.get(label.span.range.clone()),
+        Some("1"),
+        "the error must sit on the initializer, not the annotation"
+    );
 }
 
 #[test]

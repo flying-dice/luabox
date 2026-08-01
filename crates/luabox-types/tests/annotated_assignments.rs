@@ -276,17 +276,21 @@ return M
 }
 
 #[test]
-fn a_non_function_typed_assignment_is_unchanged() {
-    // `---@type` over a non-function value on an assignment is out of scope:
-    // it declares nothing callable and adds no diagnostic (the conservative
-    // boundary — a `---@type` local is where that rule is enforced).
+fn a_non_function_typed_assignment_declares_and_checks_its_slot() {
+    // #38 scoped itself to `fun(…)` and left every other `---@type` on an
+    // assignment inert — which turned out to be the whole of #48: the
+    // annotation looked accepted and did nothing. It now declares the slot and
+    // checks the initializer, exactly as on a `local`. The neighbourhood
+    // (globals, index and nested-field targets, multi-target positions, the
+    // interaction with `---@field`) lives in
+    // `tests/annotated_field_assignments.rs`.
     let src = "\
 local M = {}
 ---@type integer
 M.n = \"not an integer\"
 return M
 ";
-    assert_eq!(strict_codes(src), Vec::<String>::new());
+    assert_eq!(strict_codes(src), vec!["LB0300"]);
 }
 
 #[test]
