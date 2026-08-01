@@ -1,0 +1,29 @@
+---
+column: doing
+labels: [release, review]
+priority: high
+agent: opus-w18
+live: true
+status: Wave 18 complete; all 4 round-7 threads fixed and gated
+updatedAt: 2026-08-01T12:40:00.000Z
+---
+# Wave 18: Shockwave round-7 threads on PR #47
+
+Round 7 @ 8106d8c: 5 of 6 round-6 threads CLOSED (progress id/token counter, alias path compression, source_for routing, pin isolation, spec/help wording). Verdict FAIL, 4 open: 2 bugs in LB0510, 2 issues (W, X), 1 issue (Y). refs #47
+
+Both bugs are in the metafield arm's behavioural gate, and both are about the gate asking a question the code does not actually answer. Derivation (d) counted a colon call's *presence* in a carrier-attached body rather than whether the file ever enters that body, and `Shapes::collect` seeded value bindings from `Stmt::Local` only. Shockwave measured 11 FNs and 7 FPs over 44 extra shapes.
+
+## Scope
+
+- LB0510 bug 1: drop derivation (d)'s unconditional syntactic counting; replace with reachable-chain semantics on derived values (plain call + `__call` + self colon call). Fix the three overclaiming doc sentences ("actually reach", "and that does crash", the Cache "runs fine" paragraph)
+- LB0510 bug 2: seed derivations from assignment-bound names and from globals; fix or precisely disclose `and`/`or`, non-first multi-return slots, for-in variables
+- W: three `names.iter().zip(init)` sites drop trailing names on a multi-value init — measured FN via `local _n, c = make()`
+- X: `diagnostics::convert` takes a free-form `source: &str` that all three call sites derive identically
+- Y: `$/progress` begin races the `window/workDoneProgress/create` response; main_loop discards every response
+- Addendum: `RUST_MIN_STACK` would mask two of three pinned-stack deletion modes
+
+## Comments
+
+- **claude** (2026-08-01T10:10:00.000Z): Worktree /home/user/wt-w18, branch sprint/w18-shockwave-round7 off develop@8106d8c. Opus agent launched with the round-7 review + the W/X/Y inline threads and the pinned_stack addendum. Disk checked first per the wave-17 incident: 22G free at start.
+
+- **claude** (2026-08-01T12:40:00.000Z): All four threads fixed across three commits, each gated on the runtime oracle. **f5097d6 (LB0510 pair + W)** — derivation (d) is gone. A method is now reached one of exactly two ways: a colon call on a derived value, or a plain call on one whose `__call` metamethod is a body in this file whose own receiver takes a colon call (the chain `f()` → `C.__call(self)` → `self:m()`). Only the `__call` body is asked, not every attached body — the wider question reports `Cache.__call = function(self) return 1 end` beside an uninvoked `Cache:reset() self:clear() end` under `c()`, which `lua5.4` runs clean, so there is a committed fixture for it. Seeding now reads assignments to names (split `local c` / `c = setmetatable(...)`, globals keyed by name since a free name has no BindingId, and `function make() … end` as a factory) and follows `and`/`or` into the operand the expression evaluates to. W: all three `zip(init)` sites go through one `supplies()` helper that adjusts names to initialisers the way Lua does, reporting which *result slot* feeds each name; factory returns are tracked per slot to match, so `local n, c = make()` over `return 1, setmetatable({}, Cache)` seeds `c` and not `n` (both halves asserted). Measured before→after on the matrix: 5 FPs closed (`call_uninvoked_factory`, `mode_self_colon_uninvoked`, `call_body_without_self_colon`, `table_ctor_call_uninvoked`, `fn_nested_self_colon_uninvoked` — all 1/ok → 0/ok), 6 FNs closed (`split_local`, `global_assign`, `global_factory`, `or_fallback`, `and_chain`, `multi_return_slot` — all 0/crash → 1/crash), and one honest cost: `fn_nested_self_colon` went 1/crash → 0/crash, i.e. a shape that used to fire for the wrong reason (the *written* colon call, which is also why its uninvoked twin fired) is now a disclosed FN with a fixture. Matrix 16 → 48 shapes, every invoked fixture now committed with its uninvoked twin; 7 disclosed-FN classes named shape by shape in LIMITATIONS with fixtures (table field, parameter, for-in, method-call factory, vararg slot, depth-two constructor, nested-closure `__call`) plus the pre-existing require bound. The one remaining approximation (a dead-branch `self:m()` inside the `__call` body) is FP-shaped, one level deep, disclosed, and has no measured instance — the derivation it replaced had eight. **a74bee5 (X)** — `convert`'s `source: &str` parameter deleted; it reads `source_for(diag.code)` itself, so the class is unrepresentable. Byte-identical by construction. **e7dfdd8 (Y)** — took option (a), not (b): `create_progress_token` waits for the matching response before returning, with a bounded read loop that queues non-matching client traffic for `main_loop` to drain first (a `didOpen` sent during the startup harvest is handled, in arrival order). Bounded at 250 ms so a client that never answers gets the old behaviour rather than a stalled server. Two tests drive `Server` from a worker thread with the test playing the client, so the assertion is wire order; the first fails against the previous code (verified by reverting the wait). Addendum: pinned_stack now asserts `RUST_MIN_STACK` is unset (verified failing under `RUST_MIN_STACK=8388608`). Gates on the merged head, exit codes direct: df 20G free, fmt 0, clippy --workspace --all-targets -D warnings 0, cargo test --workspace 2428/0, acceptance 860 scenarios / 4678 steps, lsp_acceptance 194 / 1406, control-flow differential 112/112 cells, lb0510-matrix.sh all 48 shapes match lint AND runtime against real Lua 5.4.6. No PR opened.

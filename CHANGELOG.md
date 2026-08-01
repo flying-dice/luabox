@@ -10,6 +10,54 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ### Fixed
 
+- **`LB0510` counts calls the file *makes*, not colon calls it *contains*.**
+  The reached-a-method gate had a syntactic hole: `self` inside any function
+  attached to the carrier was treated as an instance, so a `self:m()` written
+  anywhere in any attached body counted as a use whether or not the file ever
+  entered that body. Two measured false positives. The committed `__call`
+  fixture with its last line changed from `print(f())` to `print(type(f))`
+  produced byte-identical lint output against opposite `lua5.4` verdicts; and
+  `Cache.__mode = "k"` beside `function Cache:reset() self:clear() end` that
+  nothing invokes warned on a program that runs to completion — the same shape
+  the previous round closed, reopened by one added line.
+
+  A method is now reached one of two ways: a **colon call on a derived value**
+  (`c:m()`), or a **plain call on a derived value** (`c()`) when the carrier's
+  `__call` metamethod is a body in this file whose own receiver takes a colon
+  call — the chain `c()` → `C.__call(self)` → `self:m()`, which does crash.
+  Only the `__call` body is asked, not every attached body: a `__call` that
+  reaches no method, beside a `C:reset()` nothing invokes, runs fine. A colon
+  method is silent unless something reaches it on an instance, which is a
+  colon call on a derived value and was already tracked.
+
+- **`LB0510` sees instances bound by assignment, by a global, or past the end
+  of an initialiser list.** Value bindings were seeded from `local` statements
+  only, and assignments were read for `C.field = …` targets alone, so
+  `local c` / `c = setmetatable({}, Cache)` / `c:reset()` was silent on a
+  crash. So were `g = setmetatable({}, Cache); g:m()`, the constructor pattern
+  through a global `function make() … end`, and
+  `local c = setmetatable({}, Cache) or fallback`. All now fire.
+
+  Separately, all three passes paired names against initialisers with
+  `names.iter().zip(init)`, which **drops** every name past the end of the
+  list: `local n, c = make()` where `make` returns `1, setmetatable({}, Cache)`
+  left `c` invisible and handed `n` the derivation that belongs to it. Names
+  and values are now adjusted the way Lua adjusts them, tracking which result
+  slot feeds which name, and factory return slots are tracked to match.
+
+  What is still missed is now named shape by shape in
+  [LIMITATIONS](docs/03-reference/02-limitations.md) — table field, parameter,
+  generic-`for` variable, method-call factory, `...` slot, depth-two
+  constructor, a `__call` reaching its method through a nested closure, and
+  the pre-existing `require` bound — each with a committed fixture and its
+  `lua5.4` verdict, so closing one is a deliberate act rather than a surprise.
+
+  The shape matrix grew from 16 programs to 48. Every shape that can be
+  written invoked and uninvoked is now committed **both** ways: the round-7
+  false positive existed because only the invoked half had ever been written
+  down, so the harness could not see that two files with opposite runtime
+  verdicts were producing identical lint output.
+
 - **`LB0510` no longer warns on a carrier whose methods nobody calls.** The
   operator-table gate was *structural* where it needed to be *behavioural*: a
   carrier that declared a lookup-irrelevant metafield **and** a colon method
@@ -274,6 +322,33 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   in [the limitations page](docs/03-reference/02-limitations.md).
 
 ### Internal (contributors)
+
+- **The server waits for the `window/workDoneProgress/create` response before
+  reporting under the token.** It sent the create and the token's `begin` back
+  to back — 0.1 ms apart on the wire, with no response in between — and the
+  message loop discarded every response, so the answer was never read at all.
+  LSP puts the token in the client's hands: a `$/progress` under a token the
+  client has not acknowledged is a notification it may drop, and a dropped
+  `begin` announces the pause to nobody. `create_progress_token` now waits, so
+  every caller's `begin` follows the response by construction. Client messages
+  arriving during the wait — `initialized`, a `didOpen` for a restored buffer —
+  are queued and drained by the loop before anything new, in arrival order.
+  Bounded at 250 ms, so a client that answers nothing gets the previous
+  behaviour rather than a server that stops serving it.
+
+- **`diagnostics::convert` derives its `source` instead of taking one.** All
+  three non-test call sites passed exactly `source_for(diag.code)` — an
+  invariant held by convention across two modules, and the shape of both
+  source-mismatch bugs the previous rounds found. The parameter is gone;
+  behaviour is byte-identical, and a caller can no longer disagree with the
+  code because there is nothing left to pass.
+
+- **The pinned-stack isolation test refuses to run under `RUST_MIN_STACK`.**
+  The variable raises every thread's default stack, so an environment setting
+  it to 8 MiB or more would let an *unpinned* rayon worker survive the
+  calibrated recursion — two of the three deletion modes would stop failing
+  and the test would pass while proving nothing. It now asserts the variable
+  is unset, loudly, rather than overriding it.
 
 - **Every server-created progress token and its `create` request id are now
   unique.** Both were derived from the token *name*, a compile-time constant,
