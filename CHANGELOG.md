@@ -97,6 +97,32 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   attachment's tags. An attachment with no doc block still joins the surface,
   at a fully permissive signature, so nothing is silently dropped.
 
+### Added
+
+- **`metatable-without-index` (`LB0510`, suspicious) — the runtime half of the
+  `---@class` carrier trade.** `luabox check` resolves `c:m()` through a
+  `---@class` carrier even when the metatable chain has no `__index`; that is
+  deliberate luals parity (#33) and it stays. But `setmetatable({}, Counter)`
+  followed by `c:value()` is `attempt to call a nil value (method 'value')` in
+  every reference Lua, and luabox had stopped saying so. The new lint says it
+  instead: it fires on `setmetatable(t, C)` where `C` is a `---@class` carrier
+  declared in the same file and nothing anywhere assigns `C.__index`, and it
+  names the one-line fix (`C.__index = C`).
+
+  It is deliberately conservative — a global carrier, one reached through
+  `require`, a table literal, a call result, a computed field write
+  (`C[k] = v`), a `rawset(C, …)`, or a reassignment of `C` all leave it
+  silent — and `---@meta` definition files are exempt. Suppressible as
+  `---@luabox-ignore metatable-without-index <reason>` and configurable as any
+  `[lint]` rule; `metatable-without-index = "allow"` restores exact luals
+  behaviour.
+
+  **Parity status: luabox-specific.** luals ships no equivalent diagnostic —
+  it has nothing that reasons about metatable wiring — so this is a
+  deliberate, opt-out-able addition on top of parity, not a divergence in the
+  checker. `luabox explain LB0510` says all of this, and the trade is recorded
+  in [the limitations page](docs/03-reference/02-limitations.md).
+
 ### Internal (contributors)
 
 - **The lint code band has an authority instead of a magic decade.** The

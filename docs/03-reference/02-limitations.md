@@ -84,6 +84,16 @@ as a type annotation (not through a value use site) is not flagged —
 deliberate luals parity; its `deprecated` diagnostic also fires only on
 value/call use sites.
 
+The `__index`-less carrier is the one place where that parity and the runtime
+disagree outright: `local c = setmetatable({}, C)` followed by `c:m()`
+resolves in the checker and is `attempt to call a nil value (method 'm')` in
+every reference Lua, because instance lookup reads `C.__index`, not `C`. The
+checker keeps parity — that is what makes annotations portable — and the
+runtime gap is covered by the `metatable-without-index` lint (`LB0510`,
+suspicious tier). That rule is **luabox-specific**: luals ships no equivalent
+diagnostic, so `[lint] metatable-without-index = "allow"` restores exact luals
+behaviour.
+
 Two boundaries here are real and deliberate. A receiver that cannot resolve to
 a single declared class at all — an `any`/unknown parameter, a union, a table
 built behind an unresolved metatable — surfaces nothing: the method it names is

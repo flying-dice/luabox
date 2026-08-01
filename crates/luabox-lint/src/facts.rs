@@ -18,17 +18,24 @@ use luabox_syntax::luacats::{self, AnnotatedItem, Span, Tag, TypeExpr, TypeExprK
 #[derive(Debug, Default)]
 pub struct TypeFacts {
     binding_types: HashMap<BindingId, TypeExpr>,
+    /// The `---@class Name` a local binding carries, for the canonical luals
+    /// carrier shape (`---@class C` above `local C = {}`). Keyed on the
+    /// *first* local the annotated statement declares — the carrier the
+    /// typechecker folds member attachments into (#33).
+    class_carriers: HashMap<BindingId, String>,
     is_meta: bool,
 }
 
 impl TypeFacts {
-    /// Harvest `---@param` and `---@type` annotations and bind them to HIR
-    /// bindings by name within the annotated statement. Also determines
-    /// whether the file is a `---@meta` definition file (SPEC.md §3).
+    /// Harvest `---@param`, `---@type` and `---@class` annotations and bind
+    /// them to HIR bindings by name within the annotated statement. Also
+    /// determines whether the file is a `---@meta` definition file
+    /// (SPEC.md §3).
     #[must_use]
     pub fn build(parse: &lua::Parse, lowered: &LoweredFile) -> Self {
         let items = luacats::harvest(parse);
         let mut binding_types = HashMap::new();
+        let mut class_carriers = HashMap::new();
         for item in &items {
             let Some(target) = item.target else {
                 continue;
@@ -46,6 +53,15 @@ impl TypeFacts {
                             binding_types.insert(bid, ty.clone());
                         }
                     }
+                    Tag::Class(c) => {
+                        // `---@class C` over `local C = {}` — only the first
+                        // declared local is the carrier; a multi-local
+                        // statement under one `---@class` is not a shape the
+                        // annotation describes, so the rest are left alone.
+                        if let Some(&bid) = local_bindings(lowered, target).first() {
+                            class_carriers.insert(bid, c.name.clone());
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -53,8 +69,19 @@ impl TypeFacts {
         let is_meta = has_leading_meta_tag(&items, first_stmt_offset(lowered));
         Self {
             binding_types,
+            class_carriers,
             is_meta,
         }
+    }
+
+    /// The `---@class` name this local binding carries, if it is a carrier.
+    ///
+    /// Only the in-file, local carrier shape is recorded: a global carrier or
+    /// one reached through `require` has no binding here and every consumer
+    /// stays silent, which is the "unknown → skip" contract this module keeps.
+    #[must_use]
+    pub fn class_carrier(&self, binding: BindingId) -> Option<&str> {
+        self.class_carriers.get(&binding).map(String::as_str)
     }
 
     /// Whether this file is a `---@meta` definition file (SPEC.md §3): a

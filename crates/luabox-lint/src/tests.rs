@@ -726,6 +726,214 @@ fn empty_elseif_fires() {
     assert!(has(src, &LintConfig::new(), "LB0508"));
 }
 
+// --- metatable-without-index (LB0510, suspicious) --------------------------
+//
+// The checker resolves `c:value()` through the carrier with no `__index`
+// (luals parity, #33, LIMITATIONS-recorded). Every reference Lua crashes on
+// that program, so the runtime gap lives here instead (Shockwave round 2).
+
+/// The reviewer's repro, verbatim in shape: `lua5.4` says
+/// `attempt to call a nil value (method 'value')`.
+const COUNTER_REPRO: &str = "\
+---@class Counter
+---@field n integer
+local Counter = {}
+
+function Counter:value()
+  return self.n
+end
+
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+
+#[test]
+fn setmetatable_with_an_unwired_carrier_fires() {
+    assert!(has(COUNTER_REPRO, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn the_finding_names_the_carrier_and_the_one_line_fix() {
+    let out = lint(COUNTER_REPRO, &LintConfig::new());
+    let diag = out
+        .diagnostics
+        .iter()
+        .find(|d| d.code.to_string() == "LB0510")
+        .expect("LB0510");
+    assert!(diag.message.contains("Counter"), "{}", diag.message);
+    assert!(diag.message.contains("__index"), "{}", diag.message);
+    assert!(
+        diag.notes
+            .iter()
+            .any(|n| n.contains("Counter.__index = Counter")),
+        "{:?}",
+        diag.notes
+    );
+}
+
+#[test]
+fn an_index_assigned_before_the_setmetatable_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+Counter.__index = Counter
+function Counter:value() return 1 end
+local c = setmetatable({}, Counter)
+return c:value()
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// Order does not matter to Lua: the field is set before any lookup runs.
+#[test]
+fn an_index_assigned_after_the_setmetatable_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+function Counter:value() return 1 end
+local c = setmetatable({}, Counter)
+Counter.__index = Counter
+return c:value()
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn an_index_assigned_to_something_other_than_the_carrier_is_silent() {
+    let src = "\
+---@class Base
+local Base = {}
+Base.__index = Base
+---@class Counter
+local Counter = {}
+Counter.__index = Base
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn a_bracket_spelled_index_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+Counter[\"__index\"] = Counter
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn an_index_key_in_the_carriers_own_constructor_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = { __index = nil }
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// A computed key might be `__index`; guessing would be a false positive.
+#[test]
+fn a_dynamic_field_write_on_the_carrier_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+local k = \"__index\"
+Counter[k] = Counter
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn a_rawset_on_the_carrier_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+rawset(Counter, \"__index\", Counter)
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn a_dynamic_metatable_is_silent() {
+    let src = "local mt = require(\"other\")\nlocal c = setmetatable({}, mt)\nreturn c\n";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn a_metatable_that_is_not_a_declared_carrier_is_silent() {
+    let src = "local mt = {}\nlocal c = setmetatable({}, mt)\nreturn c\n";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn a_table_literal_metatable_is_silent() {
+    let src = "local c = setmetatable({}, { __index = {} })\nreturn c\n";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// A local `setmetatable` is not the stdlib one.
+#[test]
+fn a_shadowed_setmetatable_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+local setmetatable = function(t, _) return t end
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn a_meta_definition_file_is_exempt() {
+    let src = "\
+---@meta
+---@class Counter
+local Counter = {}
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn the_rule_is_suppressible_like_any_other() {
+    let src = "\
+---@class Counter
+local Counter = {}
+---@luabox-ignore metatable-without-index wired up by the caller
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn every_setmetatable_on_an_unwired_carrier_is_reported() {
+    let src = "\
+---@class Counter
+local Counter = {}
+local a = setmetatable({}, Counter)
+local b = setmetatable({}, Counter)
+return a, b
+";
+    let found = lint(src, &LintConfig::new())
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.to_string() == "LB0510")
+        .count();
+    assert_eq!(found, 2);
+}
+
 // --- suppression / malformed-ignore (LB0500) -------------------------------
 
 #[test]
@@ -912,7 +1120,7 @@ fn apply_fixes_is_stable_on_second_run() {
 #[test]
 fn every_registered_rule_is_uniquely_identified_and_described() {
     let registry = rules();
-    assert_eq!(registry.len(), 9, "the SPEC §9 rule set");
+    assert_eq!(registry.len(), 10, "the SPEC §9 rule set");
     let mut ids: Vec<&str> = Vec::new();
     let mut codes: Vec<String> = Vec::new();
     for rule in &registry {
