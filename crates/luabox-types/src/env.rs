@@ -1592,20 +1592,53 @@ fn collect_generic_classes(
             );
         }
     }
+    // The parameter list each name declares — first non-empty declaration
+    // wins, matching every other first-wins rule in the file. Collected ahead
+    // of the templates so a *bare* `---@class Name` block that only adds
+    // members is recognised as a declaration of the generic class rather than
+    // of some unrelated plain one, whichever order the two appear in.
+    let mut params_of: BTreeMap<&str, &Vec<String>> = BTreeMap::new();
     for item in items {
         for tag in &item.block.tags {
             let Tag::Class(c) = tag else { continue };
-            if c.params.is_empty() || c.name.is_empty() {
+            if c.name.is_empty() || c.params.is_empty() {
                 continue;
             }
-            let template = lower_class_template(&item.block.tags, &c.name, &c.params, lowerer);
-            out.insert(
-                c.name.clone(),
-                GenericClass {
-                    params: c.params.clone(),
-                    template,
-                },
-            );
+            params_of.entry(&c.name).or_insert(&c.params);
+        }
+    }
+    // Every declaration of a generic name contributes its members, unioning
+    // first-wins — duplicate `---@class` declarations merge here exactly as
+    // they do in `absorb_block` (#49); before this the last one replaced the
+    // template and the earlier declarations' fields vanished from it. The
+    // file's *first* declaration still replaces an ambient generic class of
+    // the same name whole (the `[types] defs` escape hatch).
+    let mut claimed: HashSet<&str> = HashSet::new();
+    for item in items {
+        for tag in &item.block.tags {
+            let Tag::Class(c) = tag else { continue };
+            let Some(params) = params_of.get(c.name.as_str()).copied() else {
+                continue;
+            };
+            let template = lower_class_template(&item.block.tags, &c.name, params, lowerer);
+            if claimed.insert(&c.name) {
+                out.insert(
+                    c.name.clone(),
+                    GenericClass {
+                        params: params.clone(),
+                        template,
+                    },
+                );
+            } else if let Some(existing) = out.get_mut(&c.name) {
+                for (name, field) in template.fields {
+                    existing.template.fields.entry(name).or_insert(field);
+                }
+                for indexer in template.indexers {
+                    if !existing.template.indexers.contains(&indexer) {
+                        existing.template.indexers.push(indexer);
+                    }
+                }
+            }
         }
     }
     out

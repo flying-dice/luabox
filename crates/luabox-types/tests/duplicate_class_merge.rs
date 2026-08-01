@@ -200,6 +200,97 @@ return use
     assert_eq!(codes(src), none());
 }
 
+#[test]
+fn a_duplicate_declaration_can_supply_the_type_parameters_the_first_omitted() {
+    // Generic parameters follow the same first-wins rule as everything else,
+    // with one allowance: a bare first declaration has none to keep, so a
+    // later `<T>` is taken rather than dropped.
+    let src = "\
+---@class Boxed
+---@class Boxed<T>
+---@field value T
+
+---@param b Boxed<string>
+local function use(b) return b.value end
+---@param s string
+local function want(s) end
+---@param b2 Boxed<string>
+local function bad(b2) want(b2.value) end
+return use, bad
+";
+    assert_eq!(codes(src), none());
+}
+
+#[test]
+fn the_first_declarations_type_parameters_are_not_renamed_by_a_duplicate() {
+    // A duplicate that renames the parameter does not rewrite the first
+    // declaration's body: `value` stays bound to `T`, so a `Boxed<string>`
+    // still monomorphises to `string`. Before the merge, the second
+    // declaration replaced the template — its parameter list said `U` while
+    // the surviving field body still said `T`, which resolved to nothing and
+    // reported the first declaration's own annotation as an unknown name.
+    let src = "\
+---@class Boxed<T>
+---@field value T
+---@class Boxed<U>
+
+---@param n number
+local function want(n) end
+---@param b Boxed<string>
+local function bad(b) want(b.value) end
+return bad
+";
+    let diags = check(src);
+    assert_eq!(
+        diags.iter().map(|d| d.code.to_string()).collect::<Vec<_>>(),
+        vec!["LB0300"]
+    );
+    assert!(
+        diags[0].message.contains("found `string`"),
+        "the first declaration's parameter binding must survive, got: {}",
+        diags[0].message
+    );
+}
+
+#[test]
+fn a_bare_duplicate_adds_members_to_a_generic_class() {
+    // The generic template is built per declaration too, so a bare
+    // re-declaration that only hangs more `---@field`s off the class has to
+    // reach it — in either order.
+    let src = "\
+---@class Pair<T>
+---@field first T
+
+---@class Pair
+---@field label string
+
+---@param s string
+local function want(s) end
+---@param p Pair<string>
+local function use(p) want(p.first) want(p.label) end
+return use
+";
+    assert_eq!(codes(src), none());
+}
+
+#[test]
+fn a_generic_declaration_after_a_bare_one_still_collects_both() {
+    let src = "\
+---@class Pair
+---@field label string
+
+---@class Pair<T>
+---@field first T
+
+---@param s string
+local function want(s) end
+---@param p Pair<string>
+local function use(p) want(p.first) want(p.label) end
+return use
+";
+    assert_eq!(codes(src), none());
+}
+
 // --- the conflict rule, pinned in both directions -------------------------
 
 #[test]
