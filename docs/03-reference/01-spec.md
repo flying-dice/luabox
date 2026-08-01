@@ -78,7 +78,7 @@ Luau: out of scope (§1). No parse, no check, no lowering.
 luabox init [--lib|--bin] [--edition 5.4|5.1|...]    scaffold in cwd
 luabox new <name> [--lib|--bin] [--edition <d>]       scaffold new dir
 luabox check [--target <t>] [--format <f>] [--watch]  typecheck
-luabox lint [--fix]                                   clippy analog
+luabox lint [--fix] [--format <f>]                    clippy analog
 luabox fmt [--check] [--watch]                        canonical formatter
 luabox build [--target <t>] [--out dir] [--outfile f] lower + emit (tsc/esbuild-style)
              [--entry <p>…] [--bundle|--no-bundle]    — tree emit, or bundle per entry
@@ -287,6 +287,7 @@ luabox follows the pnpm/bun model: **[luarocks.org](https://luarocks.org) is the
 ## 14. Diagnostics culture
 
 - Every error coded (`LB0421`), `luabox explain` page, span-rich rendering with labels/suggestions. Machine formats: JSON, SARIF, GitHub Actions, GitLab Code Quality.
+- `--format` is offered by both diagnostic-reporting commands — `check` and `lint` — over the same closed set and through the same renderer, since the two produce the same diagnostic values. The format never changes the exit code: `lint` still exits 0 on a warn-tier finding (§9), and every machine format carries severity faithfully, so a CI consumer that wants to gate on warnings makes that call itself rather than having it made for it.
 - Conformance diagnostics report through the ordinary `LB03xx` codes.
 
 ## 15. Stability & governance

@@ -177,7 +177,7 @@ anything load-bearing.
 | `init` / `new` | scaffold a project (`--lib`, `--edition 5.1..5.4\|luajit`) |
 | `check` | typecheck: LuaCATS + rich inference, dialect legality, `goto`/label/`break` legality, `--target`, `--watch`, `--format json\|sarif\|github\|gitlab` |
 | `fmt` | canonical formatter for `.lua` (`--check`, `--watch`) |
-| `lint` | type-informed rules, `---@luabox-ignore`, per-rule `[lint]` levels |
+| `lint` | type-informed rules, `---@luabox-ignore`, per-rule `[lint]` levels, `--fix`, `--format json\|sarif\|github\|gitlab` |
 | `build` | one tsc/esbuild-style emit driven by `[build]`: lower `edition → target` (goto, bitops, `<close>`, `_ENV`, …) with tree-shaken polyfills; `bundle = true` inlines the require graph into one file per `entry` (`--minify`, `--sourcemap`); `mode = love\|nvim-plugin` packages a `.love` / Neovim plugin. Flags (`--target`/`--out`/`--outfile`/`--entry`/`--bundle`/`--no-bundle`/`--sourcemap`/`--minify`/`--mode`) override config |
 | `unmap` | decode a production traceback back to source lines via the `<bundle>.map` that `build --sourcemap` writes next to the bundle |
 | `upgrade` | self-update from GitHub releases (`luabox upgrade` for latest, or a specific `v0.1.1`), checksum-verified |
