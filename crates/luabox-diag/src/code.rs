@@ -15,6 +15,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// Blocks `2xxx` and above are unassigned and reserved for later contexts
 /// (types, lint, lowering, resolver, ...). Internally the code is stored as a
 /// number so its rendering (`LB{:04}`) is always canonical.
+///
+/// Inside block `0` the hundreds are subdivided by producer — `03xx`
+/// typecheck, `05xx` lint, `06xx` lowering. Only one of those subdivisions is
+/// load-bearing outside the registry (consumers branch on it), and it has a
+/// predicate rather than open-coded arithmetic: see [`Code::is_lint`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Code(u16);
 
@@ -45,6 +50,38 @@ impl Code {
     pub const fn number(self) -> u16 {
         self.0
     }
+
+    /// Whether this code sits in the lint band — **the** authority on that
+    /// question, so nobody has to open-code `number() / 100 == 5`.
+    ///
+    /// # The band contract
+    ///
+    /// `LB0500`-`LB0599` belongs to `luabox-lint` and to nothing else:
+    ///
+    /// - `LB0500` is the crate's own suppression-syntax diagnostic (a
+    ///   malformed `---@luabox-ignore`). It is not a rule: it has no tier and
+    ///   no id, and it cannot be suppressed.
+    /// - `LB0501`+ are the rule codes, one per entry in `luabox_lint::rules`.
+    ///
+    /// The invariant that every rule's code lands in this band is asserted in
+    /// `luabox-lint`, where the registry lives; this crate cannot see the rule
+    /// set, so it asserts only the half it owns — that no code it registers
+    /// *outside* the band claims to be in it.
+    ///
+    /// Consumers use it to decide provenance rather than meaning: the language
+    /// server tags findings in this band with the `luabox-lint` source, which
+    /// is what its quick-fix matcher keys off. The control-flow legality
+    /// errors (`LB0020`-`LB0022`) travel through the same lint engine and are
+    /// deliberately *not* in the band — they are not rules.
+    #[must_use]
+    pub const fn is_lint(self) -> bool {
+        self.0 >= Self::LINT_BAND_START && self.0 <= Self::LINT_BAND_END
+    }
+
+    /// First code of the lint band — see [`Code::is_lint`].
+    pub const LINT_BAND_START: u16 = 500;
+    /// Last code of the lint band — see [`Code::is_lint`].
+    pub const LINT_BAND_END: u16 = 599;
 }
 
 impl fmt::Display for Code {
@@ -197,6 +234,21 @@ mod tests {
     fn deserializing_a_malformed_code_is_an_error_not_a_panic() {
         let err = serde_json::from_str::<Code>("\"LB1\"").unwrap_err();
         assert!(err.to_string().contains("LB0300"), "{err}");
+    }
+
+    #[test]
+    fn the_lint_band_is_exactly_500_to_599() {
+        assert!(!Code::new(499).is_lint());
+        assert!(Code::new(500).is_lint(), "LB0500 is the lint crate's own");
+        assert!(Code::new(509).is_lint());
+        assert!(Code::new(599).is_lint());
+        assert!(!Code::new(600).is_lint(), "LB0601 is lowering, not lint");
+        assert!(
+            !Code::new(20).is_lint(),
+            "control-flow legality is not lint"
+        );
+        assert!(!Code::new(316).is_lint(), "typecheck is not lint");
+        assert!(!Code::new(1004).is_lint(), "manifest is not lint");
     }
 
     #[test]

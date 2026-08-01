@@ -1766,6 +1766,40 @@ mod tests {
         }
     }
 
+    /// The half of the lint-band contract ([`Code::is_lint`]) this crate can
+    /// actually check.
+    ///
+    /// It cannot check the interesting half — "every code in `LB0500`-`LB0599`
+    /// is emitted by `luabox-lint`, and every lint rule's code is in the
+    /// band". The registry is a table of codes, titles and prose; it has no
+    /// idea which crate raises an entry, and `luabox-diag` sits *below*
+    /// `luabox-lint` in the dependency graph, so it cannot enumerate the rule
+    /// set either. That direction is asserted in `luabox-lint`'s own
+    /// `every_rule_code_is_in_the_lint_band` — **that** is the load-bearing
+    /// test; this one is a cheap structural guard beside it.
+    ///
+    /// What it does check is that the band is allocated *densely* from its
+    /// start: a new rule takes the next free code, so a hole means either a
+    /// typo'd code number or a code retired without a plan. Both are worth a
+    /// failing test.
+    #[test]
+    fn the_lint_band_is_densely_allocated_from_its_start() {
+        let band: Vec<u16> = all()
+            .iter()
+            .map(|entry| entry.code.number())
+            .filter(|&n| Code::new(n).is_lint())
+            .collect();
+        assert!(!band.is_empty(), "the lint band has no registered codes");
+        let highest = band.iter().copied().max().unwrap_or(Code::LINT_BAND_START);
+        let expected: Vec<u16> = (Code::LINT_BAND_START..=highest).collect();
+        assert_eq!(
+            band,
+            expected,
+            "the lint band must be contiguous from LB{:04} to LB{highest:04}",
+            Code::LINT_BAND_START
+        );
+    }
+
     #[test]
     fn every_entry_has_nonempty_title_and_explain() {
         for entry in all() {

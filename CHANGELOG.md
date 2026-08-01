@@ -97,6 +97,19 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   attachment's tags. An attachment with no doc block still joins the surface,
   at a fully permissive signature, so nothing is silently dropped.
 
+### Internal (contributors)
+
+- **The lint code band has an authority instead of a magic decade.** The
+  language server decided whether a finding was a lint rule — and therefore
+  whether its quick-fix matcher would look at it — with
+  `diag.code.number() / 100 == 5`, and nothing asserted that every lint rule
+  actually lives in `LB0500`-`LB0599`. `luabox_diag::Code::is_lint` now owns
+  the band, with the contract spelled out in its doc comment, and the
+  invariant is asserted where it cannot rot: `luabox-lint` checks every
+  registered rule's code against it (that is the load-bearing test —
+  `luabox-diag` sits below the rule registry and cannot see it), and the
+  registry checks the band is densely allocated from `LB0500`.
+
 ## [0.2.0] - 2026-07-29
 
 **The v1 scope cut — every item below is a breaking change.** luabox is now

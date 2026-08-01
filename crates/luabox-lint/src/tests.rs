@@ -928,16 +928,47 @@ fn every_registered_rule_is_uniquely_identified_and_described() {
         );
         assert!(!ids.contains(&id), "duplicate rule id `{id}`");
         let code = rule.code().to_string();
-        assert!(
-            code.starts_with("LB05"),
-            "`{id}` code {code} is outside LB05xx"
-        );
         assert!(!codes.contains(&code), "duplicate code {code} on `{id}`");
         // The tier keyword round-trips, so a `[lint]` toggle can name it.
         assert_eq!(Tier::parse(rule.tier().name()), Some(rule.tier()));
         ids.push(id);
         codes.push(code);
     }
+}
+
+/// The load-bearing half of the lint-band contract
+/// ([`luabox_diag::Code::is_lint`]).
+///
+/// The language server decides a finding's `source` — and therefore whether
+/// its quick-fix matcher will look at it — from that predicate. Nothing used
+/// to assert that a rule's code satisfies it: the LSP open-coded
+/// `code.number() / 100 == 5` and every rule happened to comply
+/// (Shockwave round 2). A rule registered at, say, `LB0700` would have been
+/// published under the toolchain source, silently losing its quick fixes.
+///
+/// `luabox-diag` cannot assert this direction — it sits below this crate and
+/// cannot see the rule registry — so this is where it lives.
+#[test]
+fn every_rule_code_is_in_the_lint_band() {
+    for rule in rules() {
+        let code = rule.code();
+        assert!(
+            code.is_lint(),
+            "rule `{}` has code {code}, outside the lint band",
+            rule.id()
+        );
+        // `LB0500` is the crate's own malformed-`---@luabox-ignore`
+        // diagnostic, not a rule; the rule codes start one above it.
+        assert_ne!(
+            code.number(),
+            luabox_diag::Code::LINT_BAND_START,
+            "rule `{}` claims LB0500, which is the suppression-syntax code",
+            rule.id()
+        );
+    }
+    // The suppression-syntax diagnostic is in the band too — the band is
+    // "codes this crate raises", which is what the LSP's source tag means.
+    assert!(luabox_diag::Code::new(500).is_lint());
 }
 
 #[test]
