@@ -196,6 +196,48 @@ Feature: luabox check — annotation-driven typecheck (P0 MVP)
     And stdout contains "LB0301"
     And stdout contains "this function takes 2 arguments but 1 was supplied"
 
+  Scenario: a trailing parameter that admits nil may be omitted
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@param a number
+      ---@param b number|nil
+      local function f(a, b) end
+
+      f(1)
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And zero diagnostics are reported
+
+  Scenario: a nil-admitting parameter before a required one is still required
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@param a number|nil
+      ---@param b number
+      local function h(a, b) end
+
+      h(1)
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0301"
+
+  Scenario: omitting a trailing nil-admitting parameter does not stop its type being checked
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@param a number
+      ---@param b number|nil
+      local function f(a, b) end
+
+      f(1, "nope")
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0300"
+
   Scenario: too many arguments points at the first extra one
     Given a strict project with edition "5.4"
     And a file "src/main.lua" containing:

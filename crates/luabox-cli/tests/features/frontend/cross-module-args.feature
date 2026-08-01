@@ -480,3 +480,26 @@ Feature: luabox check — cross-module argument checking (#46)
     When I run "luabox check"
     Then the command succeeds
     And stderr contains "check: 0 errors, 0 warnings"
+
+  Scenario: a trailing nil-admitting parameter is optional across the boundary too
+    Given a strict project with edition "5.4"
+    And a file "src/geom.lua" containing:
+      """
+      local M = {}
+      ---@param w number
+      ---@param scale number|nil
+      ---@return number
+      function M.area(w, scale)
+        return w * (scale or 1)
+      end
+      return M
+      """
+    And a file "src/app.lua" containing:
+      """
+      local geom = require("geom")
+      local x = geom.area(3)
+      return x
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And zero diagnostics are reported

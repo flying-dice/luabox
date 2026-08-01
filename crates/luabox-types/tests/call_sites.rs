@@ -305,3 +305,150 @@ M.double(\"no\")
 ";
     assert_eq!(strict_codes(src), vec!["LB0300"]);
 }
+
+// ---------------------------------------------------------------------------
+// A trailing parameter whose declared type admits `nil` is optional for arity
+// (#46 follow-up). `---@param b number|nil` and `---@param b? number` say the
+// same thing about what may reach `b`, and luals treats both as optional for
+// the argument count; only the second spelling did here.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_trailing_nil_admitting_parameter_is_optional_for_arity() {
+    let src = "\
+---@param a number
+---@param b number|nil
+local function f(a, b) end
+f(1)
+";
+    assert_eq!(strict_codes(src), Vec::<String>::new());
+}
+
+#[test]
+fn the_question_mark_spelling_of_the_same_parameter_stays_optional() {
+    // Control: the spelling that already worked keeps working.
+    let src = "\
+---@param a number
+---@param b? number
+local function g(a, b) end
+g(1)
+";
+    assert_eq!(strict_codes(src), Vec::<String>::new());
+}
+
+#[test]
+fn every_trailing_nil_admitting_parameter_is_optional() {
+    let src = "\
+---@param a number
+---@param b number|nil
+---@param c string|nil
+local function f(a, b, c) end
+f(1)
+f(1, 2)
+f(1, 2, \"x\")
+";
+    assert_eq!(strict_codes(src), Vec::<String>::new());
+}
+
+#[test]
+fn a_question_mark_parameter_does_not_break_the_trailing_run() {
+    let src = "\
+---@param a number
+---@param b? number
+---@param c string|nil
+local function f(a, b, c) end
+f(1)
+";
+    assert_eq!(strict_codes(src), Vec::<String>::new());
+}
+
+#[test]
+fn nil_anywhere_in_the_union_makes_the_parameter_optional() {
+    let src = "\
+---@param a number
+---@param b string|nil|number
+local function f(a, b) end
+f(1)
+";
+    assert_eq!(strict_codes(src), Vec::<String>::new());
+}
+
+#[test]
+fn an_alias_that_expands_to_a_nil_union_is_optional_too() {
+    let src = "\
+---@alias MaybeNum number|nil
+---@param a number
+---@param b MaybeNum
+local function f(a, b) end
+f(1)
+";
+    assert_eq!(strict_codes(src), Vec::<String>::new());
+}
+
+#[test]
+fn a_nil_admitting_parameter_before_a_required_one_is_still_required() {
+    // Deliberately conservative: only a *trailing* nil-admitting parameter is
+    // optional for arity. A caller cannot skip a middle argument in Lua
+    // without writing `nil` for it, so relaxing a non-trailing slot would let
+    // a genuinely short call through. Documented in
+    // docs/03-reference/02-limitations.md.
+    let src = "\
+---@param a number|nil
+---@param b number
+local function h(a, b) end
+h(1)
+";
+    assert_eq!(strict_codes(src), vec!["LB0301"]);
+}
+
+#[test]
+fn a_nil_admitting_parameter_supplied_explicitly_is_still_type_checked() {
+    let src = "\
+---@param a number
+---@param b number|nil
+local function f(a, b) end
+f(1, \"nope\")
+";
+    assert_eq!(strict_codes(src), vec!["LB0300"]);
+}
+
+#[test]
+fn too_many_arguments_past_a_nil_admitting_parameter_is_still_reported() {
+    let src = "\
+---@param a number
+---@param b number|nil
+local function f(a, b) end
+f(1, 2, 3)
+";
+    assert_eq!(strict_codes(src), vec!["LB0301"]);
+}
+
+#[test]
+fn nil_admitting_is_explicit_nil_not_any() {
+    // The boundary of the rule: `any` and `unknown` are *unconstrained*, not
+    // declarations that the argument may be omitted, so they stay required.
+    // Narrower than luals may be here, and deliberately so — see
+    // docs/03-reference/02-limitations.md.
+    let src = "\
+---@param a number
+---@param b any
+local function f(a, b) end
+f(1)
+";
+    assert_eq!(strict_codes(src), vec!["LB0301"]);
+}
+
+#[test]
+fn a_nil_admitting_method_parameter_is_optional_too() {
+    let src = "\
+---@class Widget
+local Widget = {}
+---@param a number
+---@param b number|nil
+function Widget:draw(a, b) end
+local w = Widget
+w:draw(1)
+return w
+";
+    assert_eq!(strict_codes(src), Vec::<String>::new());
+}
