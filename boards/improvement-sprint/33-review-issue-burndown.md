@@ -5,7 +5,7 @@ priority: high
 agent: claude
 live: true
 status: Waves 21+22 launched in parallel; 23 (#54) and 24 (#46) to follow
-updatedAt: 2026-08-01T19:05:00.000Z
+updatedAt: 2026-08-01T22:30:00.000Z
 ---
 # Burn-down 2: the issues the PR #47 review raised
 
@@ -80,3 +80,59 @@ Owner directive: burn down both what was open AND what the reviews opened. Eight
 
 - **claude** (2026-08-01T18:20:00.000Z): Wave 21 done on `sprint/w21-types-cluster` — #48, #49, #50 all fixed, tests-first. Red counts committed before the fix: 10/20 (`annotated_field_assignments.rs`, #48), 11/14 (`duplicate_class_merge.rs`, #49), 12/18 (`global_carrier_members.rs`, #50), plus 2 `lsp_acceptance` scenarios so the editor path is covered by the same semantics. Three luals-parity calls, each documented in the test module header, `docs/03-reference/02-limitations.md` and CHANGELOG: (a) `---@type` on an assignment is positional and binds to the *statement*, so it reaches `M.a` / `M["a"]` / `M.a.b` / `G = 1` alike, and a `---@field` keeps the class surface while the annotation governs the assignment; (b) duplicate `---@class` unions everywhere, and a duplicate `---@field` is **first-wins** — measured off the cross-file fold first (`cross_file_conflicting_field_keeps_the_first_files_type` was already green), which also makes `LB0311`'s own "the first declaration wins" note true of the stored type for the first time; luals unions the types instead, divergence disclosed; (c) a global carrier is *lexical* like a local one, so it beats a nominal match in both declaration orders, and a re-carried global follows Lua's most-recent-assignment rule — the one place a global write replaces rather than unions, which is what keeps the inference path in parity with the defs-side `carrier_var_classes` (waves 3/4). Wave-14/16/19 tests unmodified. One pre-existing test was rewritten, deliberately: `annotated_assignments::a_non_function_typed_assignment_is_unchanged` pinned exactly the #48 defect (#38 scoped itself to `fun(…)` and declared the rest out of scope), so it is now `..._declares_and_checks_its_slot`. Gates green, exit codes direct: fmt, clippy `-D warnings` (workspace, all-targets), `cargo test --workspace` (860 acceptance + 196 lsp scenarios, all unit suites), release `acceptance` 860/860 and `lsp_acceptance` 196/196, `lb0510-matrix.sh` 119/119, `control-flow-differential.sh` 112/112. New user-visible edge, disclosed: `---@type <Class>` over `G = {}` now reports missing members on the spot (`LB0302`) — the build-it-up-later deferral is a property of the `local X = {}` carrier spelling; `---@class` is the carrier spelling that collects members attached to a global later, and that is what #50 fixed.
 - **claude** (2026-08-01T19:05:00.000Z): Wave 21 addendum — the one-step-away hunt on #49 found a second copy of the same defect and it is fixed in the same branch. `collect_generic_classes` builds the `Name<T>` monomorphisation template per `---@class` block and inserted by name, so a generic class declared twice in a file kept only the last block's `---@field` bodies, and a *bare* re-declaration adding members was skipped outright for carrying no `<T>`. Parameter lists are now resolved file-wide first (first non-empty wins) and every declaration of the name contributes its members first-wins, in either order. Side effect worth noting: it removes a false `LB0305` — a duplicate that renamed the parameter (`Boxed<T>` … `Boxed<U>`) left the template's params saying `U` while the surviving field body said `T`, so the *first* declaration's own annotation was reported as an unknown type name. Four tests added; all gates re-run green after it (release `acceptance` 860/860, `lsp_acceptance` 196/196, lb0510 119/119, control-flow 112/112, fmt/clippy/`cargo test --workspace`). Coverage spot-checked with `cargo llvm-cov -p luabox-types`: 96.80% lines (floor 92), `env.rs` 95.16%, `infer.rs` 95.25%, `check.rs` 96.69% — no erosion in the changed files. The full two-job CI coverage gate (unit aggregate 95 / e2e 83) was not reproduced locally; disk headroom, not a suspected result.
+
+- **claude** (2026-08-01T22:30:00.000Z): **Wave 24 — #46 cross-module argument checking** complete on `sprint/w24-cross-module-args`, tests-first, all gates green. `df -h /` before every heavy build: 21G at start, 9.2G at the end; no `wt-*` sibling touched (wt-w23 left alone).
+
+  **Measured before designing.** The issue's five-row table reproduced exactly on `develop` first (rows 3 and 4 `none`; rows 1/2/5 already `LB0300`), and the same 23-shape harness re-run after the fix gives the before/after below. Eleven shapes flipped from unchecked to checked; every negative stayed silent, which was the point of measuring them up front.
+
+  | shape | before | after |
+  |---|---|---|
+  | row 1 same-file direct | LB0300 | LB0300 |
+  | row 2 same-file table field | LB0300 | LB0300 |
+  | **row 3 cross-module direct** | none | **LB0300** |
+  | **row 4 cross-module table field** | none | **LB0300** |
+  | row 5 cross-module + call-site `---@type` | LB0300 | LB0300 |
+  | correct args cross-module | none | none |
+  | unannotated exported fn | none | none |
+  | optional param omitted | none | none |
+  | varargs, extra args | none | none |
+  | dynamic require path | none | none |
+  | wrong arity, too few | none | **LB0301** |
+  | wrong arity, too many | none | **LB0301** |
+  | aliased require binding | none | **LB0300** |
+  | function stored then called | none | **LB0300** |
+  | nested table export | none | **LB0300** |
+  | colon-method on exported class | LB0300 | LB0300 |
+  | dot-call of a method | none | **LB0300** |
+  | rock function (lua_modules harvest) | none | **LB0300** |
+  | rock function, correct args | none | none |
+  | module via `init.lua` | none | **LB0300** |
+  | `require("m").f(...)` inline | none | **LB0300** |
+  | cross-module call as a nested argument | none | **LB0300** |
+  | re-export of a *required* function | none | none (disclosed) |
+
+  **A fallback, not a second mechanism.** `Checker::callee_sig` resolved a callee only through registries keyed by *name* — a local binding, a dotted name in the ambient/defs map — and a required module's members are in neither, because nothing in the consumer file declares them. Inference had already resolved the callee to its `fun(...)`; nobody asked it. `callee_sig` now falls back to that resolved type and hands it to the existing `check_arg_slots`, so arity, `---@param` types, overload selection, generics, `---@vararg` and optionals are the same code on both sides of the boundary.
+
+  **Conservatism needed provenance.** An unannotated exported function must not be argument-checked, because an unannotated *same-file* function is not — measured on `develop` before any design. Same-file is safe because such a function is registered nowhere; `reconcile_params` separately makes *partially* annotated parameters optional `unknown`, so partial annotation cannot manufacture arity errors either. Reification erases the difference between a written `---@param` list and one read off a body (both become a `FunctionTy` with `unknown` params), so `FunctionTy::declared` now records whether a human wrote the signature — set at the annotation-lowering sites, explicitly `false` in `reify_func`'s synthesized branch. The failure direction is "stops checking", never "false positive".
+
+  **luals-parity calls.** (a) Only *written* signatures check calls; luals does not arity-check an unannotated function either, and this is what keeps the negative column above empty. (b) `---@type fun(...)` is authoritative at call sites (SPEC §3; luals reports `redundant-parameter`) — the rule the issue's own row 5 already assumed. (c) A `---@param` block above `return function(...) end` now binds to that function: without it a single-function module could not carry a signature *at all*, in its own file as much as in a consumer, which is what made row 3 unreachable rather than merely unchecked.
+
+  **One pre-existing test rewritten, deliberately.** `annotated_assignments::a_typed_assignment_over_a_non_literal_right_hand_side_is_unchanged` asserted that `---@type fun(a: integer)` over `M.f = other`, then `M.f(1, 2)`, reports nothing — pinning exactly this defect (a callee known only through its type going unchecked). Now `..._is_checked_from_its_type`, asserting `LB0301`. No other wave 14/16/19/21 test changed.
+
+  **Two neighbourhood shapes disclosed rather than fixed**, each with a fixture pinning the behaviour, plus the rewritten #46 bullet in `docs/03-reference/02-limitations.md` (bound removed, what now works stated, remaining edges enumerated): a member declared only as a `---@field` on an exported class (the *member* does not reach the consumer, not its signature), and a function re-exported through a second `require` (a module's own requires are deliberately unresolved — that is what keeps the registry acyclic and cycles tolerable). Exporting a class carrier as `Ty::Named` was tried for the first and **reverted**: it produced false `LB0306`/`LB0300` on valid code in `cross_file_require::require_of_class_module_resolves_inherited_method`. False positives on correct code are not a trade this work may make.
+
+  **Two false trails, killed by measurement rather than assumed.** A `luabox check` pinning a core during a gate run looked like an exponential blowup from resolving the callee type twice per level; a scaling fixture (nested calls through a required module's function, depths 6→30) came back flat at ~32ms on *both* the suspect and the fixed build, so the theory was wrong — the processes were `broken_pipe`'s deliberately large fixtures (1400 files, 2000 findings) in a debug build under `--workspace` parallelism, slow by design. Separately, a workspace run reporting 872 scenarios instead of 894 turned out to be a shell-precedence mistake (`cd X && … &` swallowed the `cd`), which had run cargo against `/home/user/luabox` instead of the worktree; re-run with absolute paths. The single-resolution change was kept on its own merits and its comment corrected to claim only what was measured.
+
+  Gates, exit codes taken directly (never through a pipe):
+
+  | gate | exit | result |
+  |---|---|---|
+  | `cargo fmt --all --check` | 0 | clean |
+  | `cargo clippy --workspace --all-targets -- -D warnings` | 0 | clean |
+  | `cargo test --workspace` | 0 | all suites green |
+  | release `acceptance` | 0 | **894 scenarios / 4882 steps, all passed** (872 baseline + 22 new) |
+  | release `lsp_acceptance` | 0 | **196 scenarios / 1417 steps, all passed** (baseline held; no lsp files touched) |
+  | `lb0510-matrix.sh` | 0 | **119/119 shapes match, lint AND runtime** (Lua 5.4.6) |
+  | `control-flow-differential.sh` | 0 | **112/112 cells agree** with reference `luac` (5.2/5.3 skipped, no luac) |
+
+  Red counts committed before the fix: **13 red / 21** in `crates/luabox-types/tests/cross_module_args.rs` and **8 red / 18** new scenarios in `crates/luabox-cli/tests/features/frontend/cross-module-args.feature` (suite 872 → 890 at that commit; 894 once the disclosure fixtures were added), carried by `74c400c`. Fix `e5380a6`, follow-up refactor `330971b`. Not verified locally: nothing — every gate in the brief ran here. **No PR opened**, per the wave brief.
