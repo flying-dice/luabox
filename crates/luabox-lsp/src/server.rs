@@ -373,21 +373,25 @@ fn ambient_def_sources(root: &Path, manifest: &Manifest) -> Vec<String> {
 /// (`initialize` -> `initialized` -> `didOpen`) and timing to the FIRST
 /// `publishDiagnostics`. 4 cores, 7 runs each:
 ///
-/// | harvest    | median  | min     |
-/// |------------|---------|---------|
-/// | sequential | 2270 ms | 2222 ms |
-/// | parallel   |  654 ms |  574 ms |
+/// | harvest                        | median  | min     |
+/// |--------------------------------|---------|---------|
+/// | sequential (pre-fix build)     | 2270 ms | 2222 ms |
+/// | sequential (`RAYON_NUM_THREADS=1`, same binary) | 2095 ms | 2024 ms |
+/// | parallel                       |  545 ms |  529 ms |
 ///
-/// 3.5x. The same project with the rock tree removed publishes in 8 ms, so
-/// the harvest is effectively the whole of that number.
+/// ~3.8x, and the two sequential rows agree, so the win is the parallelism
+/// and not some other change in the same commit range. The same project with
+/// the rock tree removed publishes in 8 ms, so the harvest is effectively the
+/// whole of that number.
 ///
 /// # Why it is still synchronous
 ///
-/// 654 ms is above the ~500 ms mark at which moving the harvest off the
+/// 545 ms is at the ~500 ms mark at which moving the harvest off the
 /// critical path (background thread, republish on completion) starts to look
-/// worth its complexity — but only by a margin, and the asynchronous form
-/// buys that latency with a *correctness* cost the synchronous form does not
-/// have: between the first publish and the harvest landing, every project
+/// worth its complexity — but it is *at* that mark, not past it, and the
+/// asynchronous form buys that latency with a *correctness* cost the
+/// synchronous form does not have: between the first publish and the harvest
+/// landing, every project
 /// file naming a rock class would be diagnosed against an empty rock layer,
 /// so `LB0305`/`LB0306` would flash red and then vanish. A burst of wrong
 /// squiggles is worse than half a second of none, once, at startup.

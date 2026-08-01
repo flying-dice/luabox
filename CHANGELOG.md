@@ -182,13 +182,15 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   Measured on a penlight-scale annotated tree (50 files, ~103 kLOC of
   `---@class` Lua under `lua_modules/share/lua/5.4/`), driving the real stdio
   protocol and timing `initialize` to the **first** `publishDiagnostics`, 4
-  cores, 7 runs: **2270 ms → 654 ms median** (2222 ms → 574 ms min), a 3.5x
-  cut. The same project with no rock tree publishes in 8 ms, so the harvest
-  was effectively the whole wait. The number is now in the code comment at
-  `harvest_rock_tree`, along with the judgment that the harvest stays on the
-  startup path: an asynchronous republish would trade the remaining ~650 ms
-  for a window in which rock-typed code is diagnosed against an empty rock
-  layer, flashing `LB0305`/`LB0306` and then clearing them.
+  cores, 7 runs: **2270 ms → 545 ms median** (2222 ms → 529 ms min), ~3.8x.
+  Cross-checked against the same final binary forced to one rayon worker
+  (2095 ms median), so the win is the parallelism and nothing else in the
+  commit range. The same project with no rock tree publishes in 8 ms, so the
+  harvest was effectively the whole wait. The numbers are in the code comment
+  at `harvest_rock_tree`, along with the judgment that the harvest stays on
+  the startup path: an asynchronous republish would trade the remaining
+  ~0.5 s for a window in which rock-typed code is diagnosed against an empty
+  rock layer, flashing `LB0305`/`LB0306` and then clearing them.
 
 ## [0.2.0] - 2026-07-29
 
