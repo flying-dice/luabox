@@ -10,6 +10,22 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ### Fixed
 
+- **`luabox check --watch` now reruns when the vendored rock tree changes.**
+  Since the rock type harvest landed, `check` reads
+  `lua_modules/share/lua/<X.Y>/**.lua` — but the watcher still filtered all of
+  `lua_modules/` out, so `luarocks install --tree lua_modules <rock>` (the
+  exact workflow the harvest exists for) left a running watcher printing a
+  stale verdict until some project file was touched. The versioned rock tree
+  is now relevant (`layout::is_rock_source`); flat `lua_modules/` layouts,
+  rockspecs, and nested trees inside workspace members still are not, because
+  the rerun still does not read them.
+- **The bundle loader gate names the line, not just the file.** A vendored
+  rock that cannot load on the ship target (`not loadable under target 5.4:
+  label `a` is already defined`) reported a path and a message with no
+  position — and the rock path is the only one that reaches this branch,
+  since the check gate never walks `lua_modules/`. The error now carries
+  `at line N` from the finding's own span.
+
 - **`LB0510` prunes dead code symmetrically, and its bounds are now a list
   rather than a count.** The prune was one-sided in two places. It dropped the
   `then` of a literal-false `if` and never the `else` of a literal-**true**
@@ -463,6 +479,14 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   in [the limitations page](docs/03-reference/02-limitations.md).
 
 ### Internal (contributors)
+
+- **The `differential` job's path filter covers the whole lint crate.** The
+  LB0510 runtime gate (the only job with a real Lua on the runner) filtered
+  exactly one lint file — the rule itself — while the rule also reads
+  `facts.rs` and `context.rs`, so an edit to either landed green with the
+  runtime column unrun, which is what the filter's own comment promises
+  cannot happen. `crates/luabox-lint/**` now, so the rule can grow a
+  dependency on a sibling module without anyone remembering the filter.
 
 - **The server waits for the `window/workDoneProgress/create` response before
   reporting under the token.** It sent the create and the token's `begin` back

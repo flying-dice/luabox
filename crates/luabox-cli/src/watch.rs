@@ -64,8 +64,11 @@
 //! - what the file walk already skips — dot-directories and dot-files
 //!   anywhere under the root (`.git/`, `.luabox/`, editor state), the
 //!   manifest's `[build]` output directory (generated, not source), and
-//!   vendored `lua_modules/` rock trees at every depth. A rerun for a file
-//!   the command would not read is a rerun for nothing;
+//!   vendored `lua_modules/` trees, with one carve-out: `.lua` files under
+//!   the root's own `lua_modules/share/lua/<X.Y>/` ARE relevant, because
+//!   since #30 the rerun *reads* them for the rock type harvest
+//!   ([`layout::is_rock_source`]). A rerun for a file the command would not
+//!   read is a rerun for nothing — and a rock install is a file it does;
 //! - **watch-only**: editor temp/lock files — `*.tmp`, `*~` (Emacs backups),
 //!   `.#*` (Emacs lock files — also covered by the dot-file rule above), and
 //!   vim's `4913` existence-probe file. These are a *filesystem-event*
@@ -317,7 +320,12 @@ pub(crate) fn is_relevant(path: &Path, root: &Path, out_dir: Option<&Path>) -> b
     if name == "luabox.toml" {
         return layout::is_in_project_tree(path, root, out_dir);
     }
-    layout::is_project_source(path, root, out_dir)
+    // The versioned rock tree is the one part of `lua_modules/` the command
+    // about to rerun actually reads (#30's type harvest), so a rock install
+    // or removal is a real input change — `luarocks install --tree
+    // lua_modules <rock>` is precisely the edit a watching developer makes
+    // and expects picked up (Shockwave round 10).
+    layout::is_project_source(path, root, out_dir) || layout::is_rock_source(path, root)
 }
 
 /// Vim probes whether it can create files in the target directory by
@@ -651,22 +659,47 @@ mod tests {
     }
 
     #[test]
-    fn irrelevant_vendored_rock_tree_ignored() {
-        // The commands `--watch` reruns skip `lua_modules/` entirely, so a
-        // `luarocks install` landing files there is not a source change.
+    fn relevant_versioned_rock_tree_since_the_harvest_reads_it() {
+        // Since #30 the rerun READS `lua_modules/share/lua/<X.Y>/**.lua` for
+        // the rock type harvest, so `luarocks install --tree lua_modules` is
+        // an input change the watcher must see (Shockwave round 10).
         let root = Path::new("/proj");
-        assert!(!is_relevant(
+        assert!(is_relevant(
             Path::new("/proj/lua_modules/share/lua/5.4/pl/tablex.lua"),
             root,
             None
         ));
+        assert!(is_relevant(
+            Path::new("/proj/lua_modules/share/lua/5.1/rk.lua"),
+            root,
+            None
+        ));
+    }
+
+    #[test]
+    fn irrelevant_unread_vendored_paths_ignored() {
+        // Only the versioned tree is read; everything else under
+        // `lua_modules/` — flat layouts, rockspecs, a NESTED tree inside a
+        // workspace member — still is not, and neither is a rock's manifest.
+        let root = Path::new("/proj");
         assert!(!is_relevant(
-            Path::new("/proj/packages/core/lua_modules/dep/init.lua"),
+            Path::new("/proj/lua_modules/dep/src/init.lua"),
+            root,
+            None
+        ));
+        assert!(!is_relevant(
+            Path::new("/proj/packages/core/lua_modules/share/lua/5.4/dep.lua"),
             root,
             None
         ));
         assert!(!is_relevant(
             Path::new("/proj/lua_modules/dep/luabox.toml"),
+            root,
+            None
+        ));
+        // A non-.lua file inside the versioned tree is not read either.
+        assert!(!is_relevant(
+            Path::new("/proj/lua_modules/share/lua/5.4/pl-3.7.0-1.rockspec"),
             root,
             None
         ));

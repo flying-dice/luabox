@@ -27,8 +27,12 @@ on:
       # LB0510's shape matrix rides this job too: it is the only one with a
       # real Lua on the runner, and the runtime column is the whole point of
       # it. Same reasoning as above — without these paths the rule, the corpus
-      # or the runner could be edited and the job would stay unrun.
-      - "crates/luabox-lint/src/rules/metatable_without_index.rs"
+      # or the runner could be edited and the job would stay unrun. The whole
+      # crate, not the rule file: the rule reads facts.rs and context.rs today
+      # (Shockwave round 10 caught the narrow filter missing exactly the file
+      # this PR changed), and a glob cannot rot when the rule grows a
+      # dependency on a sibling module.
+      - "crates/luabox-lint/**"
       - "scripts/tests/lb0510-matrix.sh"
       - "scripts/tests/lb0510-matrix/**"
       - ".github/workflows/differential.yml"
@@ -52,8 +56,12 @@ on:
       # LB0510's shape matrix rides this job too: it is the only one with a
       # real Lua on the runner, and the runtime column is the whole point of
       # it. Same reasoning as above — without these paths the rule, the corpus
-      # or the runner could be edited and the job would stay unrun.
-      - "crates/luabox-lint/src/rules/metatable_without_index.rs"
+      # or the runner could be edited and the job would stay unrun. The whole
+      # crate, not the rule file: the rule reads facts.rs and context.rs today
+      # (Shockwave round 10 caught the narrow filter missing exactly the file
+      # this PR changed), and a glob cannot rot when the rule grows a
+      # dependency on a sibling module.
+      - "crates/luabox-lint/**"
       - "scripts/tests/lb0510-matrix.sh"
       - "scripts/tests/lb0510-matrix/**"
       - ".github/workflows/differential.yml"

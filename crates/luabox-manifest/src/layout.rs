@@ -212,6 +212,32 @@ pub fn is_project_source(path: &Path, root: &Path, out_dir: Option<&Path>) -> bo
         && is_in_project_tree(path, root, out_dir)
 }
 
+/// Whether `path` is a vendored rock source the toolchain *reads*: a `.lua`
+/// file under the project's own `lua_modules/share/lua/<X.Y>/` tree — the
+/// path-level form of what [`collect_rock_sources`] walks for the type
+/// harvest (#30).
+///
+/// Any version directory counts, not just the one the manifest currently
+/// selects: the caller that needs this rule (`luabox check --watch`) cannot
+/// know the manifest's answer without re-reading it, and a rerun is exactly
+/// how it finds out. Only the project root's own tree qualifies — a nested
+/// `lua_modules/` inside a rock is never read, matching the harvest.
+#[must_use]
+pub fn is_rock_source(path: &Path, root: &Path) -> bool {
+    if path.extension().and_then(OsStr::to_str) != Some("lua") {
+        return false;
+    }
+    let Ok(rel) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut parts = rel.components();
+    parts.next() == Some(Component::Normal(OsStr::new(VENDOR_DIR)))
+        && parts.next() == Some(Component::Normal(OsStr::new("share")))
+        && parts.next() == Some(Component::Normal(OsStr::new("lua")))
+        && matches!(parts.next(), Some(Component::Normal(_)))
+        && parts.next().is_some()
+}
+
 /// All project-source `*.lua` files under `root` ([`is_project_source`]), in
 /// deterministic order — entries sorted by file name at each directory level,
 /// walked depth-first.

@@ -371,10 +371,23 @@ fn load_module(
         .into_iter()
         .next()
     {
+        // The finding's spans index the text this module was parsed from, so
+        // a line number is honest here — unlike `build`'s residual arm, whose
+        // ranges index a lowered text the renderer cannot resolve. Without it
+        // a user pointed at a 400-line vendored file with two labels named
+        // `d` has nothing to go on (Shockwave round 10).
+        let at = finding
+            .primary_label()
+            .map(|label| {
+                let offset = rowan::TextSize::try_from(label.span.range.start)
+                    .unwrap_or(rowan::TextSize::from(u32::MAX));
+                format!(" at line {}", line_of(&lowered.text, offset))
+            })
+            .unwrap_or_default();
         return Err(BundleError::Parse {
             file,
             message: format!(
-                "not loadable under target {}: {} (no lowering rule)",
+                "not loadable under target {}: {}{at} (no lowering rule)",
                 req.target.manifest_id(),
                 finding.message
             ),
@@ -954,6 +967,14 @@ mod tests {
             .expect_err("a duplicate label cannot load on 5.4");
             assert!(
                 err.to_string().contains("label `a` is already defined"),
+                "unexpected error: {err}"
+            );
+            // With a line, not just a path: this branch is the only report a
+            // vendored rock's failure ever gets — the check gate never sees
+            // `lua_modules/` — and a 400-line file with two labels named `a`
+            // needs more than the file name (Shockwave round 10).
+            assert!(
+                err.to_string().contains("at line 1"),
                 "unexpected error: {err}"
             );
         }
