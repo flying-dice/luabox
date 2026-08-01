@@ -330,3 +330,50 @@ Feature: luabox check — cross-file require resolution (#85)
     When I run "luabox check"
     Then the command fails
     And stdout contains "LB0302"
+
+  # The CI half of the class-carrier edge disclosed in
+  # docs/03-reference/02-limitations.md (the editor half is pinned in
+  # tests/features/lsp/hover-require.feature). A module whose export is a
+  # `---@class` *carrier* crosses the boundary as the structural table the
+  # carrier is, so member reads on the binding are lenient rather than
+  # enforced — including a member the class does not declare.
+  Scenario: a class-carrier module's members cross the boundary untyped
+    Given a strict project with edition "5.4"
+    And a file "src/point.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+      local P = {}
+      return P
+      """
+    And a file "src/main.lua" containing:
+      """
+      local p = require("point")
+      print(p.x)
+      print(p.nope)
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And zero diagnostics are reported
+
+  # Naming the class directly is the way to get it enforced — class names are
+  # workspace-global, so no `require` is needed for the *type*.
+  Scenario: naming the carrier's class directly enforces its fields
+    Given a strict project with edition "5.4"
+    And a file "src/point.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+      local P = {}
+      return P
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param p Point
+      local function use(p) return p.nope end
+      return use
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0306"
+    And stdout contains "undefined field `nope` on `Point`"

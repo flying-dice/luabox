@@ -1003,6 +1003,7 @@ impl Infer<'_> {
                     declared: provable.then(|| class.clone()),
                 }
             }
+            Ty::String | Ty::StringLit(_) => self.lookup_string_member(name),
             Ty::Union(members) => {
                 let mut found: Vec<ITy> = Vec::new();
                 for member in members.clone() {
@@ -1014,6 +1015,39 @@ impl Infer<'_> {
                 Lookup::Found(ity_union(found))
             }
             _ => Lookup::Opaque,
+        }
+    }
+
+    /// A member read off a string value, resolved through the `string`
+    /// library — which is what Lua itself does.
+    ///
+    /// Every string in a Lua state shares one metatable whose `__index` is the
+    /// `string` table (`lstrlib.c`'s `createmetatable`, run by
+    /// `luaopen_string`). So `s:upper()` *is* `string.upper(s)` and `s.upper`
+    /// *is* `string.upper` — one resolution, the `:` form with `self` bound.
+    /// luals models it the same way and types both.
+    ///
+    /// Resolution goes through the ordinary dotted-function registry, so a
+    /// project that extends the library (`function string.trim(s) end`) gets
+    /// `s:trim()` for free, exactly as it does at runtime.
+    fn lookup_string_member(&mut self, name: &str) -> Lookup {
+        if let Some(sig) = self.env.function(&format!("string.{name}")) {
+            return Lookup::Found(ITy::Ty(Ty::Function(Box::new(sig.clone()))));
+        }
+        // A definition package may spell the library as a table type
+        // (`---@class stringlib` with `---@field upper fun(...)`) rather than
+        // as `function string.upper` statements; both reach the same members.
+        if let Some(ty) = self.env.global_type("string").cloned()
+            && let Lookup::Found(ity) = self.lookup_ty_field(&ty, name)
+        {
+            return Lookup::Found(ity);
+        }
+        // The string metatable is fixed, so a member the library does not
+        // declare is a genuine `undefined-field`: `("x"):nope()` raises
+        // "attempt to call a nil value (method 'nope')" at runtime.
+        Lookup::Absent {
+            provable: true,
+            declared: Some("string".to_string()),
         }
     }
 

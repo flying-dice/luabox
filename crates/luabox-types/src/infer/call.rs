@@ -707,15 +707,29 @@ impl Infer<'_> {
                 // resolve to a declared `---@class`; the tags do not (see
                 // [`MethodSig::args_checkable`]).
                 // Only pass 1's resolution is published, matching `expr_types`.
+                //
+                // A *string* receiver is the third authoritative case. Its
+                // members resolve through the fixed `string` library rather
+                // than through a class, so `recv_class` is `None` — but the
+                // signature is a declared stdlib one, every bit as binding as a
+                // `---@class` method's. The library spells `self` as an
+                // ordinary leading parameter (`string.upper(s)`), which
+                // `Checker::check_method_call` cannot recognise by name, so it
+                // is dropped here, where the receiver is still known.
                 if self.pass == 1
                     && let ITy::Ty(Ty::Function(sig)) = &f
                     && let Some(key) = self.expr_range(body, expr)
                 {
+                    let string_receiver = matches!(recv, ITy::Ty(Ty::String | Ty::StringLit(_)));
+                    let mut sig = (**sig).clone();
+                    if string_receiver && !sig.params.is_empty() {
+                        sig.params.remove(0);
+                    }
                     self.method_sigs.insert(
                         key,
                         MethodSig {
-                            sig: (**sig).clone(),
-                            args_checkable: recv_class.is_some(),
+                            sig,
+                            args_checkable: recv_class.is_some() || string_receiver,
                         },
                     );
                 }

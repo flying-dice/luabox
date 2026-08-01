@@ -318,3 +318,89 @@ Feature: luabox lsp — hover and completion on a `require` binding
     And the document "main.lua" is open
     When I request the definition at 0:20 in "main.lua"
     Then the location is in "other.lua"
+
+  # --- the disclosed edge: a `---@class` carrier module (#54) --------------
+  #
+  # These scenarios pin what was *measured*, not what would be convenient.
+  # A module whose export is a `---@class` carrier (`---@class Point` over
+  # `local P = {}`) is a structural table as far as the per-file view the
+  # editor surfaces are built on can tell: the class's `---@field`s live in
+  # the declaring file's ambient environment, which only the type pass holds.
+  # So the binding hovers as that table, its members have no hover, and
+  # completion does not offer them. Recorded in
+  # docs/03-reference/02-limitations.md.
+
+  Scenario: a class-carrier module's binding hovers as a structural table
+    Given a file "point.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+      local P = {}
+      return P
+      """
+    And a file "main.lua" containing:
+      """
+      local p = require("point")
+      print(p)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I hover at 1:6 in "main.lua"
+    Then the hover text contains "local p: {"
+    And the hover text does not contain "Point"
+
+  Scenario: a class-carrier module's member has no hover
+    Given a file "point.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+      local P = {}
+      return P
+      """
+    And a file "main.lua" containing:
+      """
+      local p = require("point")
+      print(p.x)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I hover at 1:8 in "main.lua"
+    Then the reply is null
+
+  Scenario: a class-carrier module's members are not offered by completion
+    Given a file "point.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+      local P = {}
+      return P
+      """
+    And a file "main.lua" containing:
+      """
+      local p = require("point")
+      print(p.
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request completion at 1:8 in "main.lua"
+    Then the completion list does not contain "x"
+
+  Scenario: a class *instance* export does hover as the class name
+    Given a file "point.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+
+      ---@type Point
+      local P = nil
+      return P
+      """
+    And a file "main.lua" containing:
+      """
+      local p = require("point")
+      print(p)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I hover at 1:6 in "main.lua"
+    Then the hover text contains "local p: Point"

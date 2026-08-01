@@ -291,11 +291,18 @@ it against (#54): `local m = require("rock")` shows the module's export
 type, `m.helper` shows that member's, and `m.` offers the members. Two
 things are `unknown` on both sides, by design rather than by omission — a
 dynamic `require(name)`, and `require("a") or require("b")`, name no module
-statically. One case is narrower in the editor than in CI: when a module's
-export is a `---@class` *instance* rather than a table, the binding hovers
-as the class name but its fields are declared in the module's own file,
-beyond the reach of the editor's per-file view — so its members get no
-hover or completion, while `luabox check` still checks them.
+statically. A module whose export is a `---@class` is the one shape that
+does not fully close, in both of its spellings: the class's fields are
+declared in the module's own file, beyond the reach of the editor's
+per-file view, so the module's members get no hover and no completion
+either way. What is left of the binding differs between the two, and the
+difference is measured rather than assumed — a class *instance* export
+still hovers as the class name while `luabox check` fully enforces it; a
+class *carrier* export hovers as the structural table the carrier is, which
+is also all CI gets. Both are written out side by side in
+[Known limitations](docs/03-reference/02-limitations.md). Naming the class
+directly (`---@param p Point`) enforces it on both sides — class names are
+workspace-global, so the `require` is not what carries the type.
 
 Surfaces only — a vendored body is never typechecked. A type error inside a
 rock is not your problem and produces nothing; a rock source that does not
