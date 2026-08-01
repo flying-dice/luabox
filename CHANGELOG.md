@@ -10,6 +10,52 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ### Fixed
 
+- **`--target` now reaches the control-flow legality pass, and `luabox build`
+  will not emit a tree the target cannot load.** `--target` means "would this
+  source be legal there?", but the `LB0020`-`LB0022` pass ran for the project
+  `edition` only. Duplicate-label scope is the one control-flow rule that
+  differs by edition — 5.4's `checkrepeated` searches every open block where
+  5.2/5.3/LuaJIT search only the current one — so `edition = "5.2"` with
+  `::a:: do ::a:: end` and `luabox check --target 5.4` reported **0 errors**
+  for a chunk `luac5.4 -p` refuses to load. It is now `LB0021`, exit 1, and
+  the finding is reported once when both the edition and the target flag the
+  same span, exactly as dialect legality already deduplicated.
+
+  `luabox build` keeps its edition-only check gate on purpose (lowering is
+  what handles constructs the target rejects), but nothing lowers a shadowed
+  label away — so the same program built with `--target 5.4` silently emitted
+  an unloadable file and exited 0. The residual validation of each lowered
+  file now judges control-flow legality under the target too, and refuses to
+  write anything when it fails. `luabox lint` and the language server have no
+  target flag and are unaffected.
+- **A `---@class` in a defs file no longer steals another class's carrier
+  variable.** `---@class Wrapper` over `local Animal = {}` binds the *local*
+  `Animal` to `Wrapper`, so `function Animal:speak()` is `Wrapper`'s method.
+  A later `---@class Animal` (carried by some other variable) overwrote that
+  binding with its own name-is-its-own-carrier alias, and `speak` folded onto
+  the wrong class — swapping the two class blocks flipped the verdict, and
+  the ordinary project-source path, which resolves the binding, disagreed
+  with the defs path on the identical body. Carrier-variable bindings now
+  take precedence over name aliases explicitly and in one ordered pass, so
+  both orderings agree with each other and with project source (#39's goal).
+
+- **`luabox check` and the language server no longer disagree about which
+  file a colliding rock module name means.** A vendored tree can hold both
+  `pl.lua` and `pl/init.lua`, and both answer to `require("pl")`. The rock
+  walk sorted a `Vec<PathBuf>`, whose `Ord` is component-wise: it ranks the
+  bare component `pl` below `pl.lua` and so put the **directory** first,
+  inverting the order `require` actually resolves in. The harvest is
+  first-wins per module name, so the editor (name-keyed) called `pl` the
+  `init.lua` while `luabox check` (path-keyed, through
+  `resolve_candidates`, which tries the flat `<rel>.lua` first) called it
+  `pl.lua` — the same source got opposite verdicts in CI and in the editor.
+
+  The walk now sorts by the paths' raw bytes, which reproduces candidate
+  order on every platform (`.` = 0x2E sorts below both `/` and `\`). Pinned
+  from both ends: a `collect_rock_sources` unit test over a tree that
+  actually contains the colliding pair, and one repro fixture asserted
+  through `luabox check` and through the server.
+
 - **`goto`/label/`break` legality is diagnosed**
   ([#44](https://github.com/flying-dice/luabox/issues/44)) — three programs
   every reference Lua refuses to *load* used to pass `luabox check` and
@@ -78,6 +124,73 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   same-name `---@field` staying authoritative on type while inheriting the
   attachment's tags. An attachment with no doc block still joins the surface,
   at a fully permissive signature, so nothing is silently dropped.
+
+### Added
+
+- **`metatable-without-index` (`LB0510`, suspicious) — the runtime half of the
+  `---@class` carrier trade.** `luabox check` resolves `c:m()` through a
+  `---@class` carrier even when the metatable chain has no `__index`; that is
+  deliberate luals parity (#33) and it stays. But `setmetatable({}, Counter)`
+  followed by `c:value()` is `attempt to call a nil value (method 'value')` in
+  every reference Lua, and luabox had stopped saying so. The new lint says it
+  instead: it fires on `setmetatable(t, C)` where `C` is a `---@class` carrier
+  declared in the same file and nothing anywhere assigns `C.__index`, and it
+  names the one-line fix (`C.__index = C`).
+
+  It is deliberately conservative — a global carrier, one reached through
+  `require`, a table literal, a call result, a computed field write
+  (`C[k] = v`), a `rawset(C, …)`, or a reassignment of `C` all leave it
+  silent — and `---@meta` definition files are exempt. Suppressible as
+  `---@luabox-ignore metatable-without-index <reason>` and configurable as any
+  `[lint]` rule; `metatable-without-index = "allow"` restores exact luals
+  behaviour.
+
+  **Parity status: luabox-specific.** luals ships no equivalent diagnostic —
+  it has nothing that reasons about metatable wiring — so this is a
+  deliberate, opt-out-able addition on top of parity, not a divergence in the
+  checker. `luabox explain LB0510` says all of this, and the trade is recorded
+  in [the limitations page](docs/03-reference/02-limitations.md).
+
+### Internal (contributors)
+- **`luabox_hir::validate::control_flow`'s 5.1 comment now matches the
+  measurement.** It claimed `goto` under `edition = "5.1"` is "already
+  reported as `LB0010`"; it is in fact two `LB0001` parse errors — `goto` is
+  not in the 5.1 grammar — and since every caller skips this pass on a dirty
+  parse, the `goto` guard is unreachable from any front-end path. The label
+  guard *is* reachable and load-bearing (`::a::` parses under 5.1 and is
+  `LB0010`). Both guards are documented per their real reachability, the
+  `goto` one kept as defence in depth because the function is `pub` over an
+  already-lowered file, and the asymmetry is pinned by a test.
+
+- **The lint code band has an authority instead of a magic decade.** The
+  language server decided whether a finding was a lint rule — and therefore
+  whether its quick-fix matcher would look at it — with
+  `diag.code.number() / 100 == 5`, and nothing asserted that every lint rule
+  actually lives in `LB0500`-`LB0599`. `luabox_diag::Code::is_lint` now owns
+  the band, with the contract spelled out in its doc comment, and the
+  invariant is asserted where it cannot rot: `luabox-lint` checks every
+  registered rule's code against it (that is the load-bearing test —
+  `luabox-diag` sits below the rule registry and cannot see it), and the
+  registry checks the band is densely allocated from `LB0500`.
+- **The language server's startup rock harvest is parallel, and measured.**
+  `luabox check` parallelized the identical workload after a measured
+  1.98 s → 0.55 s; the LSP kept the sequential form and shipped no number.
+  It now rides the same rayon pool (the global one `real_main` pins to a
+  16 MiB worker stack), through the same `harvest_file` + `RockSurfaces::fold`
+  split, so the result is byte-identical — the fold is what fixes precedence.
+
+  Measured on a penlight-scale annotated tree (50 files, ~103 kLOC of
+  `---@class` Lua under `lua_modules/share/lua/5.4/`), driving the real stdio
+  protocol and timing `initialize` to the **first** `publishDiagnostics`, 4
+  cores, 7 runs: **2270 ms → 545 ms median** (2222 ms → 529 ms min), ~3.8x.
+  Cross-checked against the same final binary forced to one rayon worker
+  (2095 ms median), so the win is the parallelism and nothing else in the
+  commit range. The same project with no rock tree publishes in 8 ms, so the
+  harvest was effectively the whole wait. The numbers are in the code comment
+  at `harvest_rock_tree`, along with the judgment that the harvest stays on
+  the startup path: an asynchronous republish would trade the remaining
+  ~0.5 s for a window in which rock-typed code is diagnosed against an empty
+  rock layer, flashing `LB0305`/`LB0306` and then clearing them.
 
 ## [0.2.0] - 2026-07-29
 

@@ -3,6 +3,7 @@
 mod concat_in_loop;
 mod empty_then;
 mod global_write;
+mod metatable_without_index;
 mod nil_compare;
 mod pairs_on_array;
 mod shadowed_local;
@@ -25,6 +26,7 @@ pub fn rules() -> Vec<Box<dyn Rule>> {
         Box::new(concat_in_loop::ConcatInLoop),
         Box::new(pairs_on_array::PairsOnArray),
         Box::new(empty_then::EmptyThen),
+        Box::new(metatable_without_index::MetatableWithoutIndex),
     ]
 }
 

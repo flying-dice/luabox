@@ -79,11 +79,20 @@ pub struct RockModule {
 
 /// What [`harvest`] found in a luarocks tree.
 ///
-/// Every map is populated **first-wins in the caller's order** (path-sorted, so
-/// deterministic). Two files can answer to one module name — `pl.lua` and
-/// `pl/init.lua` — and path order puts `pl.lua` first, which is also the order
-/// `luabox_bundle::resolve_candidates` tries them in, so the harvest and
-/// `require` resolution cannot disagree about which file is `pl`.
+/// Every map is populated **first-wins in the caller's order**, and that order
+/// is a contract, not a convenience. Two files can answer to one module name —
+/// `pl.lua` and `pl/init.lua` — and `luabox_manifest::layout::collect_rock_sources`
+/// hands them over sorted by their paths' raw BYTES, which puts `pl.lua` first
+/// because `.` (0x2E) sorts below the path separator. That is the order
+/// `luabox_bundle::resolve_candidates` tries them in, so the name-keyed harvest
+/// (what the editor calls `pl`) and path-keyed `require` resolution (what
+/// `luabox check` calls `pl`) cannot disagree about which file is `pl`.
+///
+/// It is worth spelling out because the obvious sort is wrong: `Path: Ord` is
+/// component-wise, so it ranks the bare component `pl` below `pl.lua` and puts
+/// the *directory* first — which is exactly what shipped, and exactly what made
+/// `check` and the language server give opposite verdicts on one source
+/// (Shockwave round 3).
 #[derive(Debug, Default)]
 pub struct RockSurfaces {
     types: Vec<FileTypes>,
@@ -218,10 +227,14 @@ impl RockSurfaces {
 /// Harvest the annotation surfaces of `sources` against `ambient`, sequentially
 /// — [`harvest_file`] over each, folded by [`RockSurfaces::fold`].
 ///
-/// The convenience form, for a caller with no thread pool (the LSP, which pays
-/// this once at startup). `luabox check` runs the same two halves with its
-/// existing rayon pool between them, and gets the identical result: the fold is
-/// what orders the surfaces, not the order they were computed in.
+/// The convenience form, for a caller with no thread pool and a handful of
+/// sources — tests, and any future single-rock query. **Both production
+/// front-ends run the two halves with a rayon pool between them**: `luabox
+/// check` always did, and `luabox lsp` does since the startup harvest was
+/// measured (2270 ms -> 654 ms to first diagnostics on a 100-kLOC tree; see
+/// `luabox_lsp`'s `harvest_rock_tree`). They get the identical result — the
+/// fold is what orders the surfaces, not the order they were computed in — so
+/// this form is a convenience, not a second implementation.
 #[must_use]
 pub fn harvest(ambient: &Ambient, sources: &[RockModule]) -> RockSurfaces {
     let files = sources

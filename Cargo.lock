@@ -1189,6 +1189,7 @@ dependencies = [
  "luabox-manifest",
  "luabox-syntax",
  "luabox-types",
+ "rayon",
  "rowan",
  "serde_json",
  "tempfile",

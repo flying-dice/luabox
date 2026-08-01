@@ -213,6 +213,11 @@ static REGISTRY: &[Entry] = &[
         explain: LB0509,
     },
     Entry {
+        code: Code::new(510),
+        title: "metatable carrier with no `__index` (metatable-without-index)",
+        explain: LB0510,
+    },
+    Entry {
         code: Code::new(601),
         title: "irreducible `goto`",
         explain: LB0601,
@@ -1489,6 +1494,80 @@ prnit(\"hello\")   -- not flagged, this line only
 ```
 ";
 
+const LB0510: &str = "\
+# LB0510: metatable carrier with no `__index` (metatable-without-index)
+
+`setmetatable(t, C)` names a `---@class` carrier `C` that never gets an
+`__index`. Suspicious tier: `setmetatable` installs `C` as `t`'s
+**metatable**, and a method call on `t` looks the name up in
+`C.__index` — not in `C`. With no `__index`, every `t:method()` is
+`attempt to call a nil value` at runtime, in every reference Lua.
+
+```lua
+---@class Counter
+---@field n integer
+local Counter = {}
+
+function Counter:value()
+  return self.n
+end
+
+local c = setmetatable({ n = 1 }, Counter)   -- LB0510 on `Counter`
+print(c:value())                             -- crashes: `value` is nil
+```
+
+The one-line fix:
+
+```lua
+---@class Counter
+local Counter = {}
+Counter.__index = Counter   -- <- instance lookups now reach the methods
+```
+
+## Why the type checker does not report this
+
+It used to (as `LB0306`, undefined field), and that was **removed on
+purpose** in [#33](https://github.com/flying-dice/luabox/issues/33): luals
+folds carrier attachments into the class off the carrier *binding*, with no
+metatable reasoning, so `c:value()` resolves there — signature, `---@deprecated`
+and all — whether or not `__index` exists. luabox matches that, and the
+divergence is recorded in the
+[limitations reference](https://github.com/flying-dice/luabox/blob/main/docs/03-reference/02-limitations.md).
+
+Parity is the right default for a checker (it is what makes annotations
+portable), but the runtime gap is real, so it moved here instead of
+disappearing: a lint is configurable and suppressible, which is what a
+finding luals does not have should be.
+
+**Parity status: luabox-specific.** luals ships no equivalent diagnostic —
+its set has nothing that reasons about metatable wiring. Turning this rule
+off restores exact luals behaviour:
+
+```toml
+[lint]
+metatable-without-index = \"allow\"
+```
+
+## When it stays silent
+
+Deliberately conservative — the rule only speaks when it is sure:
+
+- the second argument must be a bare name resolving to a `---@class` carrier
+  **declared in the same file**. A global carrier, one reached through
+  `require`, a table literal, a call result or any other expression is
+  unknown, and unknown means silent;
+- any `__index` write to the carrier clears it, wherever it sits relative to
+  the `setmetatable` call and whatever it assigns — `C.__index = C`,
+  `C.__index = Base`, `C[\"__index\"] = …`, or an `__index` key in `C`'s own
+  constructor (`local C = { __index = … }`);
+- a write this pass cannot evaluate also clears it: `C[k] = v` with a
+  computed key, `rawset(C, …)`, or a reassignment of `C` itself;
+- `---@meta` definition files are exempt — they declare a surface and never
+  run.
+
+**Suppression:** `---@luabox-ignore metatable-without-index <reason>`.
+";
+
 const LB0601: &str = "\
 # LB0601: irreducible `goto`
 
@@ -1764,6 +1843,40 @@ mod tests {
                 "{rendered} resolved to another entry"
             );
         }
+    }
+
+    /// The half of the lint-band contract ([`Code::is_lint`]) this crate can
+    /// actually check.
+    ///
+    /// It cannot check the interesting half — "every code in `LB0500`-`LB0599`
+    /// is emitted by `luabox-lint`, and every lint rule's code is in the
+    /// band". The registry is a table of codes, titles and prose; it has no
+    /// idea which crate raises an entry, and `luabox-diag` sits *below*
+    /// `luabox-lint` in the dependency graph, so it cannot enumerate the rule
+    /// set either. That direction is asserted in `luabox-lint`'s own
+    /// `every_rule_code_is_in_the_lint_band` — **that** is the load-bearing
+    /// test; this one is a cheap structural guard beside it.
+    ///
+    /// What it does check is that the band is allocated *densely* from its
+    /// start: a new rule takes the next free code, so a hole means either a
+    /// typo'd code number or a code retired without a plan. Both are worth a
+    /// failing test.
+    #[test]
+    fn the_lint_band_is_densely_allocated_from_its_start() {
+        let band: Vec<u16> = all()
+            .iter()
+            .map(|entry| entry.code.number())
+            .filter(|&n| Code::new(n).is_lint())
+            .collect();
+        assert!(!band.is_empty(), "the lint band has no registered codes");
+        let highest = band.iter().copied().max().unwrap_or(Code::LINT_BAND_START);
+        let expected: Vec<u16> = (Code::LINT_BAND_START..=highest).collect();
+        assert_eq!(
+            band,
+            expected,
+            "the lint band must be contiguous from LB{:04} to LB{highest:04}",
+            Code::LINT_BAND_START
+        );
     }
 
     #[test]

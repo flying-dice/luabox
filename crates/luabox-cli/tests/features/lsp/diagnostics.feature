@@ -325,3 +325,36 @@ Feature: luabox lsp — published diagnostics
     And the language server is running
     When I open "main.lua"
     Then the diagnostics for "main.lua" are empty
+
+  # Shockwave round 3: `pl.lua` and `pl/init.lua` both answer to the module
+  # `pl`, and the two frontends key the harvest differently — `luabox check`
+  # by path, the server by module name. They agree only if the rock walk hands
+  # files back in `require`-candidate order (flat `<rel>.lua` first). It did
+  # not: `Vec<PathBuf>::sort` is component-wise and put the directory first,
+  # so the SAME source got opposite verdicts in CI and in the editor. The
+  # `luabox check` half of this pair lives in
+  # `features/frontend/luarocks-tree.feature`.
+  Scenario: a flat rock module beats its init form, the way `require` resolves it
+    Given a strict project with edition "5.4"
+    And a file "lua_modules/share/lua/5.4/pl.lua" containing:
+      """
+      ---@type number
+      local flat = 1
+      return flat
+      """
+    And a file "lua_modules/share/lua/5.4/pl/init.lua" containing:
+      """
+      ---@type string
+      local init = "s"
+      return init
+      """
+    And a file "main.lua" containing:
+      """
+      local pl = require("pl")
+      ---@param s string
+      local function want(s) return s end
+      return want(pl)
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the diagnostics for "main.lua" include LB0300

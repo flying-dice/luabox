@@ -726,6 +726,214 @@ fn empty_elseif_fires() {
     assert!(has(src, &LintConfig::new(), "LB0508"));
 }
 
+// --- metatable-without-index (LB0510, suspicious) --------------------------
+//
+// The checker resolves `c:value()` through the carrier with no `__index`
+// (luals parity, #33, LIMITATIONS-recorded). Every reference Lua crashes on
+// that program, so the runtime gap lives here instead (Shockwave round 2).
+
+/// The reviewer's repro, verbatim in shape: `lua5.4` says
+/// `attempt to call a nil value (method 'value')`.
+const COUNTER_REPRO: &str = "\
+---@class Counter
+---@field n integer
+local Counter = {}
+
+function Counter:value()
+  return self.n
+end
+
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+
+#[test]
+fn setmetatable_with_an_unwired_carrier_fires() {
+    assert!(has(COUNTER_REPRO, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn the_finding_names_the_carrier_and_the_one_line_fix() {
+    let out = lint(COUNTER_REPRO, &LintConfig::new());
+    let diag = out
+        .diagnostics
+        .iter()
+        .find(|d| d.code.to_string() == "LB0510")
+        .expect("LB0510");
+    assert!(diag.message.contains("Counter"), "{}", diag.message);
+    assert!(diag.message.contains("__index"), "{}", diag.message);
+    assert!(
+        diag.notes
+            .iter()
+            .any(|n| n.contains("Counter.__index = Counter")),
+        "{:?}",
+        diag.notes
+    );
+}
+
+#[test]
+fn an_index_assigned_before_the_setmetatable_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+Counter.__index = Counter
+function Counter:value() return 1 end
+local c = setmetatable({}, Counter)
+return c:value()
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// Order does not matter to Lua: the field is set before any lookup runs.
+#[test]
+fn an_index_assigned_after_the_setmetatable_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+function Counter:value() return 1 end
+local c = setmetatable({}, Counter)
+Counter.__index = Counter
+return c:value()
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn an_index_assigned_to_something_other_than_the_carrier_is_silent() {
+    let src = "\
+---@class Base
+local Base = {}
+Base.__index = Base
+---@class Counter
+local Counter = {}
+Counter.__index = Base
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn a_bracket_spelled_index_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+Counter[\"__index\"] = Counter
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn an_index_key_in_the_carriers_own_constructor_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = { __index = nil }
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// A computed key might be `__index`; guessing would be a false positive.
+#[test]
+fn a_dynamic_field_write_on_the_carrier_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+local k = \"__index\"
+Counter[k] = Counter
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn a_rawset_on_the_carrier_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+rawset(Counter, \"__index\", Counter)
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn a_dynamic_metatable_is_silent() {
+    let src = "local mt = require(\"other\")\nlocal c = setmetatable({}, mt)\nreturn c\n";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn a_metatable_that_is_not_a_declared_carrier_is_silent() {
+    let src = "local mt = {}\nlocal c = setmetatable({}, mt)\nreturn c\n";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn a_table_literal_metatable_is_silent() {
+    let src = "local c = setmetatable({}, { __index = {} })\nreturn c\n";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// A local `setmetatable` is not the stdlib one.
+#[test]
+fn a_shadowed_setmetatable_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+local setmetatable = function(t, _) return t end
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn a_meta_definition_file_is_exempt() {
+    let src = "\
+---@meta
+---@class Counter
+local Counter = {}
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn the_rule_is_suppressible_like_any_other() {
+    let src = "\
+---@class Counter
+local Counter = {}
+---@luabox-ignore metatable-without-index wired up by the caller
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn every_setmetatable_on_an_unwired_carrier_is_reported() {
+    let src = "\
+---@class Counter
+local Counter = {}
+local a = setmetatable({}, Counter)
+local b = setmetatable({}, Counter)
+return a, b
+";
+    let found = lint(src, &LintConfig::new())
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.to_string() == "LB0510")
+        .count();
+    assert_eq!(found, 2);
+}
+
 // --- suppression / malformed-ignore (LB0500) -------------------------------
 
 #[test]
@@ -912,7 +1120,7 @@ fn apply_fixes_is_stable_on_second_run() {
 #[test]
 fn every_registered_rule_is_uniquely_identified_and_described() {
     let registry = rules();
-    assert_eq!(registry.len(), 9, "the SPEC §9 rule set");
+    assert_eq!(registry.len(), 10, "the SPEC §9 rule set");
     let mut ids: Vec<&str> = Vec::new();
     let mut codes: Vec<String> = Vec::new();
     for rule in &registry {
@@ -928,15 +1136,86 @@ fn every_registered_rule_is_uniquely_identified_and_described() {
         );
         assert!(!ids.contains(&id), "duplicate rule id `{id}`");
         let code = rule.code().to_string();
-        assert!(
-            code.starts_with("LB05"),
-            "`{id}` code {code} is outside LB05xx"
-        );
         assert!(!codes.contains(&code), "duplicate code {code} on `{id}`");
         // The tier keyword round-trips, so a `[lint]` toggle can name it.
         assert_eq!(Tier::parse(rule.tier().name()), Some(rule.tier()));
         ids.push(id);
         codes.push(code);
+    }
+}
+
+/// The load-bearing half of the lint-band contract
+/// ([`luabox_diag::Code::is_lint`]).
+///
+/// The language server decides a finding's `source` — and therefore whether
+/// its quick-fix matcher will look at it — from that predicate. Nothing used
+/// to assert that a rule's code satisfies it: the LSP open-coded
+/// `code.number() / 100 == 5` and every rule happened to comply
+/// (Shockwave round 2). A rule registered at, say, `LB0700` would have been
+/// published under the toolchain source, silently losing its quick fixes.
+///
+/// `luabox-diag` cannot assert this direction — it sits below this crate and
+/// cannot see the rule registry — so this is where it lives.
+#[test]
+fn every_rule_code_is_in_the_lint_band() {
+    let registry = rules();
+    assert!(!registry.is_empty(), "the registry is empty");
+    for rule in &registry {
+        let code = rule.code();
+        // `is_lint_rule` is `is_lint` minus `LB0500`, the crate's own
+        // malformed-`---@luabox-ignore` diagnostic: in the band (so the LSP
+        // tags it with the lint source) but not a rule.
+        assert!(
+            code.is_lint_rule(),
+            "rule `{}` has code {code}, which is not a lint rule code",
+            rule.id()
+        );
+    }
+    // The suppression-syntax diagnostic is in the band and is not a rule —
+    // both halves, so neither predicate can quietly collapse into the other.
+    assert!(luabox_diag::Code::new(500).is_lint());
+    assert!(!luabox_diag::Code::new(500).is_lint_rule());
+}
+
+/// The second unwritten invariant behind the editor's quick-fix matcher:
+/// **only rules carry fixes**.
+///
+/// `crate::lint_source` mirrors a rule's machine-applicable fix into both the
+/// `fixes` list and the diagnostic's suggestions, and the language server
+/// pairs them back up by span + replacement before offering a code action.
+/// A fix arriving on a diagnostic outside the rule band would be matched to
+/// a diagnostic the editor tagged with the toolchain source, and the action
+/// would reference a diagnostic the client never saw.
+#[test]
+fn only_lint_rules_carry_fixes() {
+    // A file with a fixable finding (`pairs` over an array literal), a
+    // non-rule lint-crate finding (`LB0500`, a bare ignore tag), and a
+    // control-flow legality error (`LB0022`) — all three travel out of the
+    // same engine.
+    let src = "\
+---@luabox-ignore
+local function each()
+  for _, v in pairs({ 1, 2, 3 }) do print(v) end
+end
+break
+return each
+";
+    let out = lint(src, &LintConfig::new());
+    let codes: Vec<String> = out.diagnostics.iter().map(|d| d.code.to_string()).collect();
+    assert!(codes.contains(&"LB0500".to_owned()), "{codes:?}");
+    assert!(codes.contains(&"LB0022".to_owned()), "{codes:?}");
+    assert!(codes.contains(&"LB0507".to_owned()), "{codes:?}");
+    assert!(!out.fixes.is_empty(), "expected at least one fix");
+
+    for diag in &out.diagnostics {
+        if diag.suggestions.is_empty() {
+            continue;
+        }
+        assert!(
+            diag.code.is_lint_rule(),
+            "{} carries a fix but is not a lint rule code",
+            diag.code
+        );
     }
 }
 

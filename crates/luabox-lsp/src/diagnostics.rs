@@ -148,8 +148,10 @@ pub fn diagnostics(
             // published under the toolchain source alongside the parse,
             // dialect and type diagnostics above; only the `LB05xx` rule
             // findings get the lint source, which is what the code-action
-            // matcher keys its quick fixes off.
-            let source = if diag.code.number() / 100 == 5 {
+            // matcher keys its quick fixes off. The band is `luabox_diag`'s
+            // to define ([`luabox_diag::Code::is_lint`]) — an open-coded
+            // `number() / 100 == 5` here was a contract nothing asserted.
+            let source = if diag.code.is_lint() {
                 LINT_SOURCE
             } else {
                 TYPE_SOURCE
@@ -301,10 +303,25 @@ mod tests {
             .iter()
             .find(|d| d.source.as_deref() == Some(LINT_SOURCE))
             .unwrap_or_else(|| panic!("expected a lint diagnostic: {diags:?}"));
-        assert!(
-            codes(std::slice::from_ref(lint))[0].starts_with("LB05"),
-            "{lint:?}"
-        );
+        // Through the same authority the tagging uses, not a string prefix.
+        let code: luabox_diag::Code = codes(std::slice::from_ref(lint))[0]
+            .parse()
+            .unwrap_or_else(|_| panic!("unparseable code: {lint:?}"));
+        assert!(code.is_lint(), "{lint:?}");
+    }
+
+    /// The other direction: a finding the lint engine carries but that is not
+    /// a lint rule (`LB0020`-`LB0022`, control-flow legality) stays on the
+    /// toolchain source, so the quick-fix matcher never offers a fix for it.
+    #[test]
+    fn control_flow_legality_does_not_get_the_lint_source() {
+        let diags = diagnostics_for("local x = 1\nbreak\n", Dialect::Lua54);
+        let found = diags
+            .iter()
+            .find(|d| d.code == Some(lsp_types::NumberOrString::String("LB0022".to_owned())))
+            .unwrap_or_else(|| panic!("expected LB0022: {diags:?}"));
+        assert_eq!(found.source.as_deref(), Some(TYPE_SOURCE));
+        assert!(!luabox_diag::Code::new(22).is_lint());
     }
 
     // --- harvested rock surfaces (#30) -----------------------------------

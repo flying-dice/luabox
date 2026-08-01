@@ -331,3 +331,42 @@ Feature: A genuine luarocks tree under lua_modules/
     Then the command succeeds
     And stdout does not contain "LB0302"
     And stdout does not contain "LB0307"
+
+  # Shockwave round 3, the `luabox check` half of the colliding-name pair (the
+  # editor half is `features/lsp/diagnostics.feature`). `pl.lua` and
+  # `pl/init.lua` both answer to `pl`; `require` tries the flat form first, so
+  # `pl` is the number, and passing it where a string is wanted must flag —
+  # here, and identically in the editor.
+  Scenario: a flat rock module beats its init form, the way `require` resolves it
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      """
+    And a file "lua_modules/share/lua/5.4/pl.lua" containing:
+      """
+      ---@type number
+      local flat = 1
+      return flat
+      """
+    And a file "lua_modules/share/lua/5.4/pl/init.lua" containing:
+      """
+      ---@type string
+      local init = "s"
+      return init
+      """
+    And a file "src/main.lua" containing:
+      """
+      local pl = require("pl")
+      ---@param s string
+      local function want(s) return s end
+      return want(pl)
+      """
+    When I run "luabox check"
+    Then the command fails
+    And diagnostic LB0300 is reported

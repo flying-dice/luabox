@@ -406,6 +406,126 @@ Feature: stdlib definition packages — `---@meta` `.d.lua` ambient types
     And stdout does not contain "LB0306"
     And stderr contains "check: 0 errors, 0 warnings"
 
+  # Shockwave round 3: `function Animal:speak()` names the LOCAL `Animal`, so
+  # it belongs to `Wrapper` — the class that local carries — not to the
+  # unrelated class that happens to be *named* `Animal`. Both orderings of the
+  # two class blocks must agree, and both must agree with what the same body
+  # does as ordinary project source (#39 is a defs/project parity goal).
+
+  Scenario: a carrier variable wins over a same-named class declared after it
+    Given a file "defs/zoo.d.lua" containing:
+      """
+      ---@meta
+
+      ---@class Wrapper
+      local Animal = {}
+
+      ---@class Animal
+      local Zoo = {}
+
+      ---@return string
+      function Animal:speak() end
+      """
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      defs = ["zoo"]
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param w Wrapper
+      local function use(w)
+        return w:speak()
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stdout does not contain "LB0306"
+
+  Scenario: the same file with the two class blocks swapped gives the same answer
+    Given a file "defs/zoo.d.lua" containing:
+      """
+      ---@meta
+
+      ---@class Animal
+      local Zoo = {}
+
+      ---@class Wrapper
+      local Animal = {}
+
+      ---@return string
+      function Animal:speak() end
+      """
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      defs = ["zoo"]
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param w Wrapper
+      ---@param a Animal
+      local function use(w, a)
+        return w:speak(), a:speak()
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "undefined field `speak` on `Animal`"
+    And stdout does not contain "undefined field `speak` on `Wrapper`"
+
+  Scenario: the same body as project source agrees with the defs file
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      """
+    And a file "src/zoo.lua" containing:
+      """
+      ---@class Wrapper
+      local Animal = {}
+
+      ---@class Animal
+      local Zoo = {}
+
+      ---@return string
+      function Animal:speak() end
+
+      return { Animal = Animal, Zoo = Zoo }
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param w Wrapper
+      ---@param a Animal
+      local function use(w, a)
+        return w:speak(), a:speak()
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "undefined field `speak` on `Animal`"
+    And stdout does not contain "undefined field `speak` on `Wrapper`"
+
   Scenario: a carrier-style method's signature is enforced at the use site
     Given a file "defs/game.d.lua" containing:
       """

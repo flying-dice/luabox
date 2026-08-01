@@ -27,7 +27,8 @@ down with it), yet its *signatures* should be VISIBLE.
 
 **Harvest rule.** When a project has a luarocks tree for the version directory
 its `[build] target` resolves against (`lua_modules/share/lua/<X.Y>/`, `5.1` for
-LuaJIT), every `*.lua` under it is read in path-sorted order and reduced to its
+LuaJIT), every `*.lua` under it is read in `require`-candidate order (see the
+first-wins note below) and reduced to its
 *surface*: the `---@class`/`---@enum`/`---@alias` declarations it makes, and the
 type a `require` of it evaluates to. Nothing else. Zero manifest declaration is
 required — that is the point. A source with no `---@` anywhere is skipped before
@@ -66,8 +67,20 @@ two halves of one intent). A rock's declaration is not the user's, so when a
 project declares `mylib.Point` itself it is correcting or replacing what the rock
 says, and unioning the rock's fields back in would defeat the escape hatch.
 
-Among harvested rocks the order is the deterministic path sort and the rule is
-**silent** first-wins — no `LB0307`/`LB0310`. This diverges from `[types] defs`
+Among harvested rocks the order is a deterministic sort of the paths' raw
+**bytes**, and the rule is **silent** first-wins — no `LB0307`/`LB0310`.
+
+Byte order, not `Path`'s component-wise `Ord`, because the order *is* the
+collision rule: `pl.lua` and `pl/init.lua` both answer to the module `pl`, and
+whichever the walk yields first is the one the name-keyed harvest calls `pl`.
+`luabox_bundle::resolve_candidates` — which is what path-keyed `require`
+resolution uses — tries the flat `<rel>.lua` before `<rel>/init.lua`, and byte
+order reproduces that (`.` = 0x2E sorts below both `/` = 0x2F and `\` = 0x5C).
+`Path: Ord` compares component by component, ranks `pl` below `pl.lua`, and so
+puts the directory first; that inversion shipped, and it made `luabox check`
+(path-keyed) and the language server (name-keyed) resolve one `require` to two
+different files and report opposite verdicts on the same source. Fixed in the
+w14 Shockwave round-3 pass. This diverges from `[types] defs`
 collisions, which warn, and the reason is that a warning must be actionable: the
 user declared neither side of a rock-vs-rock name clash, cannot edit vendored
 code, and did not ask for either surface. Warning about it would make a

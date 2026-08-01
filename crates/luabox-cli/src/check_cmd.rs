@@ -304,14 +304,9 @@ fn check_one(
 
     // 2. Dialect legality: edition, then ship target (deduplicated — the
     // same construct may be illegal in both).
-    let mut passes = vec![project.dialect];
-    if let Some(target) = target
-        && target != project.dialect
-    {
-        passes.push(target);
-    }
+    let passes = dialect_passes(project.dialect, target);
     let mut seen: HashSet<(u16, u32, u32)> = HashSet::new();
-    for dialect in passes {
+    for dialect in passes.iter().copied() {
         for err in lua::validate::validate(parse, dialect) {
             let key = (err.code, err.range.start().into(), err.range.end().into());
             if !seen.insert(key) {
@@ -332,17 +327,30 @@ fn check_one(
     // recovered around a missing `end` is a guess, and a legality verdict over
     // a guess is noise on top of the syntax error already reported.
     //
+    // Run for the *same* dialect pair as pass 2, deduplicated the same way.
+    // The pass is not fully edition-independent: `checkrepeated` tightened in
+    // 5.4 (`luabox_hir::validate::repeated_label_scope`), so `::a:: do ::a::
+    // end` is legal source in a 5.2 project yet cannot load on a 5.4 ship
+    // target. Checking only the edition let exactly that combination through
+    // (Shockwave round 2).
+    //
     // This lowers the file rather than reusing the HIR inside `artifacts`:
     // `luabox_types::FileArtifacts` keeps its lowering private. The same pass
     // runs off the lint engine's own lowering and the LSP's memoized one, so
-    // all three frontends return the same verdict.
+    // all three frontends return the same verdict. Lowering is dialect-free,
+    // so both passes read one lowering.
     if parse.errors().is_empty() {
         let lowered = luabox_hir::lower(parse);
-        diags.extend(luabox_hir::validate::control_flow(
-            rel,
-            &lowered,
-            project.dialect,
-        ));
+        let mut seen: HashSet<(u16, usize, usize)> = HashSet::new();
+        for dialect in passes.iter().copied() {
+            for diag in luabox_hir::validate::control_flow(rel, &lowered, dialect) {
+                let range = diag.primary_label().map_or(0..0, |l| l.span.range.clone());
+                if !seen.insert((diag.code.number(), range.start, range.end)) {
+                    continue;
+                }
+                diags.push(diag);
+            }
+        }
     }
 
     // 4. Types against the ambient definition-package layer (SPEC.md §3),
@@ -357,6 +365,25 @@ fn check_one(
         &requires,
         artifacts,
     ));
+}
+
+/// The dialects a legality pass runs for: the project edition, plus the ship
+/// `--target` when it differs.
+///
+/// One helper for both legality passes (dialect, then control flow) so they
+/// cannot drift apart: `--target` means "would this source be legal there?",
+/// and a construct the target's *loader* rejects is no less a target problem
+/// than one its *parser* rejects. A target equal to the edition adds nothing —
+/// the pass would produce identical findings, deduplicated away — so it is not
+/// pushed at all.
+fn dialect_passes(edition: Dialect, target: Option<Dialect>) -> Vec<Dialect> {
+    let mut passes = vec![edition];
+    if let Some(target) = target
+        && target != edition
+    {
+        passes.push(target);
+    }
+    passes
 }
 
 /// Map each static `require("mod")` the file names to the export type of the
@@ -770,6 +797,76 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert_eq!(error, "check failed with 1 error(s)");
+    }
+
+    /// The pass list both legality passes share: edition first, target only
+    /// when it differs (Shockwave round 2 — control flow used to ignore it).
+    #[test]
+    fn the_dialect_pass_list_adds_the_target_only_when_it_differs() {
+        assert_eq!(dialect_passes(Dialect::Lua52, None), vec![Dialect::Lua52]);
+        assert_eq!(
+            dialect_passes(Dialect::Lua52, Some(Dialect::Lua52)),
+            vec![Dialect::Lua52]
+        );
+        assert_eq!(
+            dialect_passes(Dialect::Lua52, Some(Dialect::Lua54)),
+            vec![Dialect::Lua52, Dialect::Lua54]
+        );
+    }
+
+    #[test]
+    fn a_label_shadow_legal_in_the_edition_is_reported_for_a_5_4_target() {
+        // `checkrepeated` tightened in 5.4: `::a:: do ::a:: end` loads on
+        // 5.2/5.3/LuaJIT and is `label 'a' already defined` on 5.4
+        // (`luac5.4 -p`). `--target 5.4` has to say so.
+        for edition in ["5.2", "5.3", "luajit"] {
+            let tmp = project(&manifest(edition, ""));
+            write(tmp.path(), "src/main.lua", "::a:: do ::a:: end\n");
+            check(tmp.path(), None, Format::Human)
+                .unwrap_or_else(|e| panic!("legal in edition {edition}: {e}"));
+            let error = check(tmp.path(), Some("5.4"), Format::Human)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "check failed with 1 error(s)", "edition {edition}");
+        }
+    }
+
+    #[test]
+    fn a_looser_target_does_not_resurrect_a_finding_the_edition_cleared() {
+        // The reverse direction: legal under 5.4, and 5.2's looser rule can
+        // only accept more, so nothing is reported.
+        let tmp = project(&manifest("5.4", ""));
+        write(tmp.path(), "src/main.lua", "do ::a:: end ::a::\n");
+        check(tmp.path(), Some("5.2"), Format::Human).expect("legal under both");
+    }
+
+    #[test]
+    fn a_control_flow_finding_in_both_passes_is_reported_once() {
+        // `break` outside a loop is illegal in every edition, so both the
+        // edition pass and the target pass produce it for the same range.
+        let tmp = project(&manifest("5.1", ""));
+        write(tmp.path(), "src/main.lua", "local x = 1 break\n");
+        let with_target = check(tmp.path(), Some("5.4"), Format::Human)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(with_target, "check failed with 1 error(s)");
+    }
+
+    #[test]
+    fn a_goto_on_a_5_1_target_stays_the_dialect_finding_alone() {
+        // 5.1 has no `goto` at all, so the control-flow pass skips goto/label
+        // for it (`luabox_hir::validate::control_flow`) and the reader gets
+        // the two `LB0010` dialect findings, not a third complaint.
+        let tmp = project(&manifest("5.4", ""));
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "local i = 0\n::top::\ni = i + 1\nif i < 3 then goto top end\n",
+        );
+        let error = check(tmp.path(), Some("5.1"), Format::Human)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "check failed with 2 error(s)");
     }
 
     #[test]
