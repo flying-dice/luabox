@@ -358,3 +358,39 @@ Feature: luabox lsp — published diagnostics
     And the language server is running
     When I open "main.lua"
     Then the diagnostics for "main.lua" include LB0300
+
+  # #48: a `---@type` over a table-field assignment used to be dropped on the
+  # floor — no declared type, no mismatch. The editor path and `luabox check`
+  # read the same crate, so the fix has to surface here too, at the
+  # initializer.
+  Scenario: a --@type over a table-field assignment is enforced in the editor
+    Given a strict project with edition "5.4"
+    And a file "main.lua" containing:
+      """
+      local M = {}
+      ---@type string
+      M.a = 1
+      return M
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the diagnostics for "main.lua" include LB0300
+    And diagnostic LB0300 in "main.lua" spans 2:6 to 2:7
+
+  # #50: a `---@class` carried by a *global* never collected its members, so
+  # every method call through the class read as an undefined field. The
+  # editor must see the members exactly as `luabox check` does.
+  Scenario: a class carried by a global resolves its methods in the editor
+    Given a strict project with edition "5.4"
+    And a file "main.lua" containing:
+      """
+      ---@class Glob
+      Glob = {}
+      function Glob:size() return 1 end
+      ---@param g Glob
+      local function use(g) return g:size() end
+      return use
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the diagnostics for "main.lua" do not include LB0306

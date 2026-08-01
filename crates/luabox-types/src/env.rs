@@ -278,19 +278,12 @@ impl TypeEnv {
             lowerer.generics = block_generics(item);
             env.absorb_block(item, &mut lowerer, &root);
         }
-        // The classes this file itself declares (the `package`-visibility test,
-        // #115) and the standalone `---@private`/`---@protected`/`---@package`
-        // visibility on `function Class:method` doc blocks, resolved once every
-        // class in the file is known.
-        for item in items {
-            for tag in &item.block.tags {
-                if let Tag::Class(c) = tag
-                    && !c.name.is_empty()
-                {
-                    env.local_classes.insert(c.name.clone());
-                }
-            }
-        }
+        // The standalone `---@private`/`---@protected`/`---@package` visibility
+        // on `function Class:method` doc blocks, resolved once every class in
+        // the file is known. (`local_classes` — the classes this file itself
+        // declares, the `package`-visibility test of #115 — is filled by
+        // `absorb_block` as each `---@class` is seen, because the duplicate
+        // merge of #49 needs it during the walk, not after it.)
         env.absorb_standalone_visibility(items, &root);
         // Inline `--[[@as T]]` casts: anchor each to the end offset of the
         // expression it directly follows (skipping back over whitespace).
@@ -692,7 +685,7 @@ impl TypeEnv {
                         .and_then(crate::version::VersionReq::parse);
                 }
                 Tag::Class(c) if !c.name.is_empty() => {
-                    let parents = c
+                    let parents: Vec<String> = c
                         .parents
                         .iter()
                         .filter_map(|p| match &p.kind {
@@ -708,17 +701,49 @@ impl TypeEnv {
                     for parent in &c.parents {
                         lowerer.lower(parent);
                     }
-                    self.classes.insert(
-                        c.name.clone(),
-                        ClassDef {
-                            parents,
-                            params: c.params.clone(),
-                            ..ClassDef::default()
-                        },
-                    );
+                    // Two declarations of one class in the same file are two
+                    // halves of one intent, exactly as two declarations across
+                    // files are: they **union** (#49). Before this, the second
+                    // declaration replaced the first and every member it had
+                    // collected vanished — a merge rule that depended on the
+                    // file boundary, which luals has no notion of.
+                    //
+                    // The *first* declaration in this file still replaces any
+                    // ambient (stdlib / `[types] defs`) class of the same name
+                    // whole: that is the escape hatch (see
+                    // `Ambient::with_rock_types`), a different axis from
+                    // duplicate declarations in code the user wrote.
+                    // `local_classes` — the set of names *this file* declares —
+                    // is what tells the two apart, so it is filled here rather
+                    // than in a later sweep.
+                    if self.local_classes.insert(c.name.clone()) {
+                        self.classes.insert(
+                            c.name.clone(),
+                            ClassDef {
+                                parents,
+                                params: c.params.clone(),
+                                ..ClassDef::default()
+                            },
+                        );
+                    } else if let Some(existing) = self.classes.get_mut(&c.name) {
+                        for parent in parents {
+                            if !existing.parents.contains(&parent) {
+                                existing.parents.push(parent);
+                            }
+                        }
+                        // A re-declaration may name the type parameters the
+                        // first one omitted; it never renames them (first-wins,
+                        // as for every other member).
+                        if existing.params.is_empty() {
+                            existing.params.clone_from(&c.params);
+                        }
+                    }
                     current_class = Some(c.name.clone());
+                    // First-wins, matching the fields: the "declared here"
+                    // label points at the declaration that introduced the name.
                     self.class_decl_spans
-                        .insert(c.name.clone(), c.span.start..c.span.end);
+                        .entry(c.name.clone())
+                        .or_insert(c.span.start..c.span.end);
                     if let Some(span) = item.target {
                         self.declared_targets
                             .insert((span.start, span.end), c.name.clone());
@@ -736,6 +761,21 @@ impl TypeEnv {
                     let ty = lowerer.lower(&f.ty);
                     match &f.key {
                         FieldKey::Name(name) => {
+                            // **First declaration wins**, whether the duplicate
+                            // sits in this `---@class` block, in a second block
+                            // for the same class in this file (#49), or in
+                            // another file (`TypeEnv::merge_file_types`, which
+                            // has always been first-wins). `LB0311`
+                            // (`duplicate-doc-field`) already promised exactly
+                            // this in its note — "the first declaration wins;
+                            // remove or rename this one" — and now the stored
+                            // type agrees with the message. luals unions the
+                            // two declared types instead; luabox keeps the
+                            // first deterministically and warns, the same trade
+                            // it makes for duplicate aliases and enums (#110).
+                            if class.fields.contains_key(name) {
+                                continue;
+                            }
                             class.fields.insert(
                                 name.clone(),
                                 FieldTy {
@@ -746,8 +786,8 @@ impl TypeEnv {
                             // Record a non-public `---@field <scope>` modifier
                             // for the visibility check (#115). A plain (public)
                             // field is left out of the map — and clears any
-                            // inherited restriction — so a later same-name
-                            // public re-declaration reads as public.
+                            // inherited restriction — so a same-name public
+                            // re-declaration on a *subclass* reads as public.
                             match f.scope {
                                 Some(FieldScope::Public) | None => {
                                     class.visibility.remove(name);
@@ -1552,20 +1592,53 @@ fn collect_generic_classes(
             );
         }
     }
+    // The parameter list each name declares — first non-empty declaration
+    // wins, matching every other first-wins rule in the file. Collected ahead
+    // of the templates so a *bare* `---@class Name` block that only adds
+    // members is recognised as a declaration of the generic class rather than
+    // of some unrelated plain one, whichever order the two appear in.
+    let mut params_of: BTreeMap<&str, &Vec<String>> = BTreeMap::new();
     for item in items {
         for tag in &item.block.tags {
             let Tag::Class(c) = tag else { continue };
-            if c.params.is_empty() || c.name.is_empty() {
+            if c.name.is_empty() || c.params.is_empty() {
                 continue;
             }
-            let template = lower_class_template(&item.block.tags, &c.name, &c.params, lowerer);
-            out.insert(
-                c.name.clone(),
-                GenericClass {
-                    params: c.params.clone(),
-                    template,
-                },
-            );
+            params_of.entry(&c.name).or_insert(&c.params);
+        }
+    }
+    // Every declaration of a generic name contributes its members, unioning
+    // first-wins — duplicate `---@class` declarations merge here exactly as
+    // they do in `absorb_block` (#49); before this the last one replaced the
+    // template and the earlier declarations' fields vanished from it. The
+    // file's *first* declaration still replaces an ambient generic class of
+    // the same name whole (the `[types] defs` escape hatch).
+    let mut claimed: HashSet<&str> = HashSet::new();
+    for item in items {
+        for tag in &item.block.tags {
+            let Tag::Class(c) = tag else { continue };
+            let Some(params) = params_of.get(c.name.as_str()).copied() else {
+                continue;
+            };
+            let template = lower_class_template(&item.block.tags, &c.name, params, lowerer);
+            if claimed.insert(&c.name) {
+                out.insert(
+                    c.name.clone(),
+                    GenericClass {
+                        params: params.clone(),
+                        template,
+                    },
+                );
+            } else if let Some(existing) = out.get_mut(&c.name) {
+                for (name, field) in template.fields {
+                    existing.template.fields.entry(name).or_insert(field);
+                }
+                for indexer in template.indexers {
+                    if !existing.template.indexers.contains(&indexer) {
+                        existing.template.indexers.push(indexer);
+                    }
+                }
+            }
         }
     }
     out

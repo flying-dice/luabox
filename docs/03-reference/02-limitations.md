@@ -25,6 +25,34 @@ bare `---@alias A A`) is reported as `LB0314`, at the alias's own declaration
 do — the recursive edge itself still terminates safely, lowering to
 `unknown` rather than recursing, matching luals' `cyclic-alias` diagnostic.
 
+### Duplicate `---@class` declarations union (#49 — one edge documented)
+
+Two `---@class` declarations for one name are two halves of one intent, so
+they **union**: parents, `---@field` members, `---@operator` overloads,
+visibility modifiers and carrier attachments from every declaration land on the
+same class. This holds identically whether the declarations sit in one file, in
+two project files, or in a `---@meta` definition file — the file boundary does
+not change the merge, which is what luals does (it resolves a member against
+every `doc.class` set carrying the name). A class carried more than once
+(`---@class Two` over two different tables) collects the members of both
+carriers.
+
+A same-name **field** declared twice is where luabox and luals part company.
+luabox keeps the **first** declaration, wherever it was written — inside one
+`---@class` block, in a second block for the same class, or in another file —
+and warns at the loser as `duplicate-doc-field` (`LB0311`), the same
+deterministic first-wins trade it makes for duplicate aliases (`LB0310`) and
+enums. luals instead *unions* the two declared types into `string|number`.
+Choosing the union would make a mistyped duplicate silently widen the field
+rather than be reported, so the warning plus a stable winner is the more useful
+answer; the divergence is here rather than in the code's favour.
+
+One thing that is **not** a union: a project file's own `---@class` still
+*replaces* a same-named class from the stdlib or from a `[types] defs` package,
+whole. That is the escape hatch — your declaration corrects the packaged one
+rather than merging with it — and it is a different axis from duplicate
+declarations in code you wrote.
+
 ### LuaCATS tags: the full vocabulary is enforced
 
 Every LuaCATS tag now influences checking, navigation, or docs — nothing is
@@ -50,6 +78,16 @@ warns at use sites as luals does, riding the `deprecated` diagnostic —
 `>5.2`/`JIT`/comma lists, and 5.1 implies LuaJIT), `---@source`
 (goto-definition redirects to the annotated location), and `---@see`
 (rendered in hover and as linked "See also" sections in `luabox doc`).
+
+A `---@class` is carried by whatever its statement binds, and luabox draws no
+distinction between the spellings: `local M = {}`, `Glob = {}`, and a
+re-assignment of an existing name all carry the class, and every later
+`function Carrier:method()`, `function Carrier.fn()` or `Carrier.const = v`
+attaches to it (#50 — the global spelling used to lose its members). A variable
+carried twice answers with its most recent carrier, the way Lua resolves the
+name; and the carrier *variable* wins over a class of the same name, so
+`---@class Wrapper` over `Glob = {}` makes `function Glob:m()` a member of
+`Wrapper`, whichever order the declarations appear in.
 
 Deliberate parity boundaries (luals behaves the same way): async-ness never
 *propagates* (only an explicit `---@async` tag counts, matching luals's
@@ -492,9 +530,30 @@ positional exactly as on a `local`, so a lone annotation over `a, b = f, g`
 declares `a` only, and `b` keeps its inferred type. A declared signature that
 disagrees with the literal's own parameter list — extra or missing parameters —
 is **not** diagnosed: luals has no such rule (`---@type` simply covers the
-value's type), so the declaration governs and luabox stays silent. A `---@type`
-over anything other than a function literal on an assignment is unchanged;
-that slot's enforcement lives on the `---@type` local path.
+value's type), so the declaration governs and luabox stays silent.
+
+A `---@type` over a **non-function** value on an assignment is enforced too, as
+of #48. It used to be inert — `---@type string` above `M.a = 1` declared
+nothing and diagnosed nothing, so the annotation looked accepted and rotted —
+and it now declares the assigned slot and checks the initializer against it
+(`LB0300`), exactly as on a `local`. luals binds a doc block to the statement
+rather than to the target's syntax, so every spelling gets the same treatment:
+a table field (`M.a`), a bracket index with a literal key (`M["a"]`), a nested
+field (`M.a.b`, which annotates the innermost slot — the one being assigned), a
+global (`G = 1`), and a plain name. The positional rule above is the same one
+here, so a lone annotation over `M.a, M.b = x, y` declares `M.a` only. Where a
+`---@field` also declares the member, the two do not compete: the `---@field`
+governs the **class surface** (what a value annotated with the class reads
+back), and the `---@type` governs the assignment it sits above.
+
+One boundary is deliberate. A `---@type <Class>` over `local X = {}` defers its
+conformance to the carrier's *final* accumulated shape, so members assigned
+later in the file count — a luabox leniency luals does not have. The assignment
+spellings have no such deferral: `---@type <Class>` over `G = {}` reports its
+missing members against the literal on the spot (`LB0302`), which is what luals
+does for both. For a global table built up over several statements, use the
+`---@class` carrier spelling — that one *does* collect the members attached to
+it later (#50).
 
 The expected type now also propagates *into* literals and through nested
 layers, matching luals (`script/vm/compiler.lua`, which lazily compiles a node

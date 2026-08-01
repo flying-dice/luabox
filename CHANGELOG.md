@@ -57,6 +57,57 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   (the specified way to say "no location"), GitHub Actions drops the `file=`
   property, JSON carries no location field at all, and no other format emits
   a fingerprint (refs #52).
+- **A `---@type` above an assignment is applied, not silently dropped.**
+  `---@type string` above `M.a = 1` used to declare nothing and diagnose
+  nothing: the annotation was consumed only for `local` statements, so it
+  looked accepted and rotted. It now declares the assigned slot and checks the
+  initializer against it (`LB0300` on the value), exactly as on a `local`.
+  luals binds a doc block to the statement rather than to the target's syntax,
+  so every spelling gets it: a table field (`M.a`), a bracket index with a
+  literal key (`M["a"]`), a nested field (`M.a.b`, annotating the innermost
+  slot — the one being assigned), a global (`G = 1`), and a plain name. Reads
+  of the target see the declared type. `---@type A, B` stays positional as on a
+  `local`, so a lone annotation over `M.a, M.b = x, y` declares `M.a` only.
+  Where a `---@field` also declares the member the two do not compete: the
+  `---@field` governs the class surface, the `---@type` governs the assignment
+  it sits above. One consequence worth knowing: `---@type <Class>` over
+  `G = {}` now reports its missing members on the spot (`LB0302`) — the
+  build-it-up-later deferral is a property of the `local X = {}` carrier
+  spelling, and `---@class` is the carrier spelling that does collect members
+  attached to a global later.
+- **Two `---@class` declarations for one name in the same file union instead of
+  the second wiping the first.** Across files they already unioned; within one
+  file the second declaration replaced the class and every member the first had
+  contributed vanished — a merge rule that depended on the file boundary, which
+  luals has no notion of. Parents, `---@field`s, `---@operator`s, visibility
+  and carrier attachments now merge from every declaration, in one file, across
+  files, and in `---@meta` definition files alike, and a class carried by two
+  different tables collects the members of both. A same-name **field** declared
+  twice keeps the **first** declaration and warns at the loser as
+  `duplicate-doc-field` (`LB0311`) — which is what that warning's own note has
+  always said, so the stored type and the message now agree. luals unions the
+  two types instead; the divergence, and why a stable winner plus a warning
+  beats a silent widening, is written up in
+  [Known limitations](docs/03-reference/02-limitations.md). A project file's own
+  `---@class` still *replaces* a same-named stdlib/`[types] defs` class whole —
+  that escape hatch is unchanged. The generic monomorphisation template merges
+  the same way: a `---@class Name<T>` declared twice keeps both declarations'
+  fields, and a *bare* re-declaration that only adds members now reaches the
+  template instead of being skipped for carrying no `<T>`. That also removes a
+  false `LB0305` — a duplicate that renamed the parameter left the template
+  saying `U` while the surviving field body said `T`, and reported the first
+  declaration's own annotation as an unknown type name.
+- **A `---@class` carried by a global collects its members.** `---@class Global`
+  over `Glob = {}` tagged the class but never gathered anything attached to it,
+  so `function Glob:size()` was invisible and every `g:size()` through the class
+  reported `LB0306` on valid luals code. The carrier maps were keyed on local
+  bindings, which a free global name does not have. All the member spellings now
+  land — `function Glob:m()`, `function Glob.fn()`, `Glob.const = v`,
+  `Glob.fn = function() end` — with their declared signatures, in-file, across
+  files, and in `---@meta` definition files. Precedence is unchanged and now
+  covers globals coherently: the carrier *variable* beats a class of the same
+  name in either declaration order, and a variable carried twice answers with
+  its most recent carrier, the way Lua resolves the name.
 - **`luabox check --watch` now reruns when the vendored rock tree changes.**
   Since the rock type harvest landed, `check` reads
   `lua_modules/share/lua/<X.Y>/**.lua` — but the watcher still filtered all of

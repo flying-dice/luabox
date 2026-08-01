@@ -369,8 +369,26 @@ impl Checker<'_> {
                     .values()
                     .map(|v| v.exprs().collect())
                     .unwrap_or_default();
+                // A `---@type T` above the assignment declares its slots,
+                // positionally, exactly as above a `local` (#48). Before this,
+                // the annotation was consumed for `local` statements only, so
+                // `---@type string` over `M.a = 1` neither declared `M.a` nor
+                // diagnosed the `1` — it looked accepted and did nothing.
+                // luals binds a doc block to the assignment it precedes
+                // whatever shape the target has, so every spelling of the
+                // statement gets the same treatment: `M.a`, `M["a"]`, `M.a.b`,
+                // a global, and a plain name.
+                let declared: Option<Vec<Ty>> = self
+                    .env
+                    .typed_local(range_key(assign.syntax()))
+                    .map(<[Ty]>::to_vec);
                 for (i, target) in targets.iter().enumerate() {
-                    if let Expr::Name(name) = target
+                    if let Some(expected) = declared.as_ref().and_then(|d| d.get(i)) {
+                        if let Some(value) = values.get(i) {
+                            let expected = expected.clone();
+                            self.check_slot(&Slot::Expr(value.clone()), &expected, TYPE_MISMATCH);
+                        }
+                    } else if let Expr::Name(name) = target
                         && let Some(name) = name.name()
                         && let Some(binding) = self.lookup(name.text()).cloned()
                         && binding.checked
