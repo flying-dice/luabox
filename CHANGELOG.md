@@ -19,6 +19,27 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   carried: symlinked directories are not descended, symlinked *files* are
   still project source, and `walk`'s `LayoutError` propagation is unchanged
   (refs #51).
+- **The GitLab Code Quality report no longer emits unusable locations or
+  colliding fingerprints.** Two defects made the format lossy in a pipeline.
+  An unspanned project-level finding (`LB1001` an unrecognised edition,
+  `LB1002` an unresolvable `[types] defs` package, `LB1004` an unknown
+  `[lint]` key) reported `location.path: ""` with `begin: 0`, which GitLab's
+  parser rejects — the report parsed as JSON and annotated nothing. Those
+  findings now take a stable synthetic path decided by code family: the
+  manifest block (`LB1xxx`) reports `luabox.toml`, the file it is actually
+  about, and anything else genuinely fileless reports the project root, both
+  on line 1. Separately, the fingerprint hashed only code + file + byte
+  range, so two *distinct* diagnostics over one range — the parser emits
+  "unexpected token" and "expected an identifier" about the same token —
+  hashed identically, and GitLab keeps one issue per fingerprint: the second
+  finding silently vanished. The message is now hashed in. Fingerprints stay
+  stable across runs for unchanged findings, which is their purpose; a
+  *reworded* message deliberately re-keys its findings, the correct half of
+  that trade to lose. JSON, SARIF and GitHub Actions were swept for both
+  defect classes and have neither — SARIF omits `result.locations` entirely
+  (the specified way to say "no location"), GitHub Actions drops the `file=`
+  property, JSON carries no location field at all, and no other format emits
+  a fingerprint (refs #52).
 - **`luabox check --watch` now reruns when the vendored rock tree changes.**
   Since the rock type harvest landed, `check` reads
   `lua_modules/share/lua/<X.Y>/**.lua` — but the watcher still filtered all of

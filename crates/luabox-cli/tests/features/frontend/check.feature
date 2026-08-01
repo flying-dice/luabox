@@ -515,6 +515,51 @@ Feature: luabox check — annotation-driven typecheck (P0 MVP)
     And the gitlab report places a finding for "src/main.lua" on line 7
     And no gitlab finding sits on line 1
 
+  # A project-level finding (`LB1xxx`) has no span, and the report used to
+  # give it `location.path: ""` — which GitLab's parser rejects, so a report
+  # that parsed as JSON annotated nothing at all. It now takes the manifest,
+  # the file the finding is actually about.
+  Scenario: --format gitlab gives an unspanned finding a usable location
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      defs = ["ghost"]
+      """
+    And a file "src/main.lua" containing:
+      """
+      return 1
+      """
+    When I run "luabox check --format gitlab"
+    Then the command fails
+    And stdout is valid JSON
+    And the gitlab report satisfies the code quality schema
+    And the gitlab report places a finding for "luabox.toml" on line 1
+
+  # The fingerprint is GitLab's identity for a finding and it excluded the
+  # message, so two distinct diagnostics at one byte range hashed alike and
+  # GitLab kept only one of them.
+  Scenario: --format gitlab fingerprints distinguish findings that share a range
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@param n number
+      local function double(n)
+        return n * 2
+      end
+
+      double("nope")
+      double("also nope")
+      """
+    When I run "luabox check --format gitlab"
+    Then the command fails
+    And the gitlab report satisfies the code quality schema
+    And every gitlab fingerprint is distinct
+
   # `--format` is a closed set clap owns (a `ValueEnum`), so an unknown one is
   # a malformed invocation — exit 2 with the possible values, like every other
   # bad flag value, rather than a hand-rolled message on the command's own

@@ -426,6 +426,14 @@ fn escape_github(message: &str) -> String {
 
 // ---- GitLab Code Quality ------------------------------------------------
 
+/// The path an unspanned **manifest-level** finding (`LB1xxx` — the
+/// manifest/config block, see [`crate::code::Code`]) reports.
+const MANIFEST_PATH: &str = "luabox.toml";
+
+/// The path any other genuinely fileless finding reports: the project root,
+/// spelled the way a repository-relative path is.
+const PROJECT_ROOT_PATH: &str = ".";
+
 fn gitlab_severity(severity: Severity) -> &'static str {
     match severity {
         Severity::Error => "major",
@@ -433,22 +441,88 @@ fn gitlab_severity(severity: Severity) -> &'static str {
     }
 }
 
-/// A stable FNV-1a fingerprint over a diagnostic's identity (code + file +
-/// byte range). Deterministic across runs and Rust versions.
+/// The code block that owns `luabox.toml` — manifest/config diagnostics
+/// (`LB1xxx`: editions, `[types] defs`, `[lint]` keys). See
+/// [`Code::block`](crate::code::Code::block).
+const MANIFEST_BLOCK: u16 = 1;
+
+/// Where a fileless diagnostic's finding is reported.
+///
+/// GitLab's Code Quality parser rejects an issue whose `location.path` is
+/// empty, so a diagnostic with no span cannot simply say "nowhere" — it needs
+/// a stable synthetic path, and which one it gets is decided per **code
+/// family**, by what the finding is actually about:
+///
+/// - the manifest block ([`MANIFEST_BLOCK`] — `LB1001` an unrecognised
+///   edition, `LB1002` an unresolvable `[types] defs` package, `LB1004` an
+///   unknown `[lint]` key) is a statement about `luabox.toml`, so it reports
+///   [`MANIFEST_PATH`]. Those findings then land on the merge-request diff
+///   whenever the manifest is part of it — precisely when they are
+///   actionable;
+/// - anything else genuinely fileless belongs to the project as a whole and
+///   reports [`PROJECT_ROOT_PATH`].
+///
+/// Both are compile-time constants keyed off the code, never a scanned or
+/// configured value, so the same finding resolves to the same path on every
+/// run over every checkout — which is what lets [`fingerprint`] hash it.
+const fn synthetic_path(code: crate::code::Code) -> &'static str {
+    if code.block() == MANIFEST_BLOCK {
+        MANIFEST_PATH
+    } else {
+        PROJECT_ROOT_PATH
+    }
+}
+
+/// The `location` a GitLab issue reports for `diag`: a non-empty path and a
+/// 1-based line, always.
+///
+/// A diagnostic with a primary label reports that label's file and its real
+/// line (resolved through the lookup, falling back to line 1 for a file the
+/// lookup cannot supply). One without — or one whose label names no file at
+/// all — takes its [`synthetic_path`] and line 1: the schema has no spelling
+/// for "no line", and 1 is the honest floor for a whole-file finding.
+fn gitlab_location(diag: &Diagnostic, sources: &mut Sources<'_>) -> (String, usize) {
+    match diag.primary_label() {
+        Some(label) if !label.span.file.is_empty() => {
+            let begin = sources
+                .get(&label.span.file)
+                .map_or(1, |source| source.line_col(label.span.range.start).0);
+            (label.span.file.clone(), begin)
+        }
+        _ => (synthetic_path(diag.code).to_owned(), 1),
+    }
+}
+
+/// A stable FNV-1a fingerprint over a diagnostic's identity: code + reported
+/// `path` + byte range + **message**. Deterministic across runs and Rust
+/// versions.
 ///
 /// The rendered line number is deliberately *not* an input. GitLab keys a
 /// finding's history (first-seen, resolved) by its fingerprint, so anything
 /// that changes when the rendering changes would resurrect every finding in
 /// the project as brand new. The byte range already pins the diagnostic more
 /// precisely than a line does, and it is the same value whatever the renderer
-/// makes of it — including under the pre-fix renderer, which hardcoded line 1
-/// and never fed it here either.
-fn fingerprint(diag: &Diagnostic) -> String {
-    let (file, start, end) = diag.primary_label().map_or_else(
-        || (String::new(), 0, 0),
-        |l| (l.span.file.clone(), l.span.range.start, l.span.range.end),
-    );
-    let key = format!("{}:{file}:{start}:{end}", diag.code);
+/// makes of it. `path` is the location's path, which is likewise
+/// lookup-independent: a label's own file, or the code family's constant
+/// [`synthetic_path`].
+///
+/// The **message** is an input because without it the fingerprint was not an
+/// identity at all. Two *different* `LB0001`s over one byte range — a real
+/// shape, the parser emits "unexpected token" and "expected an identifier"
+/// about the same token — hashed the same, and GitLab keeps one issue per
+/// fingerprint: the second finding vanished from the report. Every unspanned
+/// diagnostic of a code was worse still, sharing a single hash.
+///
+/// The trade-off is deliberate and worth stating: **rewording a diagnostic
+/// re-keys its findings**, so they show up in GitLab as resolved-and-new
+/// rather than continuous. That is the correct half to lose — a reworded
+/// message is a one-off event under the tool's own control, whereas a
+/// collision silently drops a finding on every run.
+fn fingerprint(diag: &Diagnostic, path: &str) -> String {
+    let (start, end) = diag
+        .primary_label()
+        .map_or((0, 0), |l| (l.span.range.start, l.span.range.end));
+    let key = format!("{}:{path}:{start}:{end}:{}", diag.code, diag.message);
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in key.bytes() {
         hash ^= u64::from(byte);
@@ -471,8 +545,10 @@ fn fingerprint(diag: &Diagnostic) -> String {
 ///
 /// - a label whose file the lookup cannot supply keeps `begin: 1` — the path
 ///   is still named, and the schema requires a `begin`;
-/// - a diagnostic with no label at all has no file either, and reports the
-///   empty path with `begin: 0`.
+/// - a diagnostic with no label at all has no file either, and takes the
+///   synthetic path its code family earns ([`synthetic_path`]) with
+///   `begin: 1`. It used to report `path: ""` and `begin: 0`, which GitLab's
+///   parser rejects — a report that parsed as JSON and annotated nothing.
 ///
 /// The [`fingerprint`] is deliberately *not* line-derived (see its docs), so
 /// this correction does not renumber anybody's existing GitLab findings.
@@ -482,18 +558,11 @@ pub fn render_gitlab_code_quality(diags: &[Diagnostic], lookup: SourceLookup<'_>
     let issues: Vec<_> = diags
         .iter()
         .map(|diag| {
-            let (path, begin) = if let Some(label) = diag.primary_label() {
-                let begin = sources
-                    .get(&label.span.file)
-                    .map_or(1, |source| source.line_col(label.span.range.start).0);
-                (label.span.file.clone(), begin)
-            } else {
-                (String::new(), 0)
-            };
+            let (path, begin) = gitlab_location(diag, &mut sources);
             json!({
                 "description": diag.message,
                 "check_name": diag.code.to_string(),
-                "fingerprint": fingerprint(diag),
+                "fingerprint": fingerprint(diag, &path),
                 "severity": gitlab_severity(diag.severity),
                 "location": { "path": path, "lines": { "begin": begin } },
             })
@@ -792,6 +861,205 @@ mod tests {
         assert_eq!(a[1]["fingerprint"], b[1]["fingerprint"]);
     }
 
+    // --- the GitLab report's own schema -----------------------------------
+
+    /// The severities GitLab's Code Quality parser accepts.
+    const GITLAB_SEVERITIES: [&str; 5] = ["info", "minor", "major", "critical", "blocker"];
+
+    /// Parse a GitLab report and assert every issue satisfies the format's
+    /// required-field contract — each present, of the right type, and **not
+    /// empty**. GitLab rejects a report whose `location.path` is `""`, which
+    /// is exactly the defect a `stdout is valid JSON` check cannot see: the
+    /// document parses and annotates nothing.
+    fn gitlab_report(out: &str) -> Vec<serde_json::Value> {
+        let issues: Vec<serde_json::Value> =
+            serde_json::from_str(out).unwrap_or_else(|e| panic!("not a JSON array: {e}\n{out}"));
+        for issue in &issues {
+            for field in ["description", "check_name", "fingerprint"] {
+                let value = issue[field]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("`{field}` is not a string in {issue}"));
+                assert!(!value.is_empty(), "`{field}` is empty in {issue}");
+            }
+            let severity = issue["severity"].as_str().expect("severity is a string");
+            assert!(
+                GITLAB_SEVERITIES.contains(&severity),
+                "`{severity}` is not a GitLab severity in {issue}"
+            );
+            let path = issue["location"]["path"]
+                .as_str()
+                .unwrap_or_else(|| panic!("`location.path` is not a string in {issue}"));
+            assert!(!path.is_empty(), "`location.path` is empty in {issue}");
+            let begin = issue["location"]["lines"]["begin"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("`location.lines.begin` is not an integer in {issue}"));
+            assert!(begin >= 1, "`location.lines.begin` is {begin} in {issue}");
+        }
+        issues
+    }
+
+    /// Every diagnostic shape the renderer can be handed — spanned, spanned
+    /// at an unreadable file, unspanned manifest-level, unspanned other —
+    /// must come out as a report GitLab will actually ingest.
+    #[test]
+    fn every_gitlab_issue_satisfies_the_code_quality_schema() {
+        let mut diags = fixture();
+        diags.push(Diagnostic::error(
+            "LB1002".parse().unwrap(),
+            "cannot resolve definition package `ghost` from `[types] defs`",
+        ));
+        diags.push(Diagnostic::warning(
+            "LB0001".parse().unwrap(),
+            "no location",
+        ));
+        diags.push(
+            Diagnostic::error("LB0001".parse().unwrap(), "unreadable")
+                .with_label(Label::primary(Span::new("unknown.lua", 4..5), "here")),
+        );
+        let issues = gitlab_report(&render(&diags, Format::GitlabCodeQuality, &lookup));
+        assert_eq!(issues.len(), 5);
+    }
+
+    /// A project-level (`LB1xxx`) finding has no span, but it does have a
+    /// file it is *about* — the manifest. Naming it keeps the finding on the
+    /// merge-request diff whenever `luabox.toml` itself is part of it.
+    #[test]
+    fn an_unspanned_manifest_finding_is_attributed_to_the_manifest() {
+        let diags = vec![
+            Diagnostic::warning("LB1001".parse().unwrap(), "edition `6.0` is not recognised"),
+            Diagnostic::error("LB1002".parse().unwrap(), "cannot resolve `ghost`"),
+        ];
+        let issues = gitlab_report(&render(&diags, Format::GitlabCodeQuality, &lookup));
+        assert_eq!(issues[0]["location"]["path"], "luabox.toml");
+        assert_eq!(issues[1]["location"]["path"], "luabox.toml");
+    }
+
+    /// Anything else genuinely fileless belongs to the project as a whole, so
+    /// it reports the project root rather than a file it is not about.
+    #[test]
+    fn an_unspanned_non_manifest_finding_is_attributed_to_the_project_root() {
+        let diag = Diagnostic::error("LB0001".parse().unwrap(), "no location for this one");
+        let issues = gitlab_report(&render(&[diag], Format::GitlabCodeQuality, &lookup));
+        assert_eq!(issues[0]["location"]["path"], PROJECT_ROOT_PATH);
+    }
+
+    /// The collision the fingerprint used to have: two *different* findings
+    /// of the same code over the same byte range hashed identically, and
+    /// GitLab keys findings by fingerprint — so it kept one and dropped the
+    /// other. One diagnostic silently disappeared from the report.
+    #[test]
+    fn two_distinct_findings_at_one_range_keep_distinct_fingerprints() {
+        let code: Code = "LB0001".parse().unwrap();
+        let span = Span::new("main.lua", 18..19);
+        let diags = vec![
+            Diagnostic::error(code, "unexpected token `=`")
+                .with_label(Label::primary(span.clone(), "a")),
+            Diagnostic::error(code, "expected an identifier").with_label(Label::primary(span, "b")),
+        ];
+        let issues = gitlab_report(&render(&diags, Format::GitlabCodeQuality, &lookup));
+        assert_ne!(
+            issues[0]["fingerprint"], issues[1]["fingerprint"],
+            "same code, same range, different findings — they must not collide"
+        );
+    }
+
+    /// …and the same holds without a span at all: two distinct project-level
+    /// findings both collapse onto the synthetic manifest path, so the
+    /// message is the only thing left to tell them apart.
+    #[test]
+    fn two_distinct_unspanned_findings_keep_distinct_fingerprints() {
+        let code: Code = "LB1004".parse().unwrap();
+        let diags = vec![
+            Diagnostic::warning(code, "unknown lint rule id `unused-locl` in `[lint]`"),
+            Diagnostic::warning(code, "unknown lint rule id `globl-write` in `[lint]`"),
+        ];
+        let issues = gitlab_report(&render(&diags, Format::GitlabCodeQuality, &lookup));
+        assert_ne!(issues[0]["fingerprint"], issues[1]["fingerprint"]);
+    }
+
+    /// A fingerprint is a finding's identity in GitLab's history (first-seen,
+    /// resolved), so an unchanged finding must fingerprint identically on
+    /// every run — including the unspanned shapes.
+    #[test]
+    fn gitlab_fingerprints_are_stable_across_identical_runs() {
+        let mut diags = fixture();
+        diags.push(Diagnostic::error(
+            "LB1002".parse().unwrap(),
+            "cannot resolve `ghost`",
+        ));
+        diags.push(Diagnostic::warning("LB0001".parse().unwrap(), "bare"));
+
+        let first = gitlab_report(&render(&diags, Format::GitlabCodeQuality, &lookup));
+        let second = gitlab_report(&render(&diags, Format::GitlabCodeQuality, &lookup));
+        let prints = |issues: &[serde_json::Value]| -> Vec<String> {
+            issues
+                .iter()
+                .map(|i| i["fingerprint"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(prints(&first), prints(&second));
+    }
+
+    /// The documented trade-off: the message is *in* the fingerprint, so
+    /// rewording a diagnostic re-keys its findings in GitLab. That is the
+    /// intended behaviour — the alternative is two distinct findings sharing
+    /// one identity, which loses one of them outright.
+    #[test]
+    fn rewording_a_message_intentionally_changes_the_fingerprint() {
+        let code: Code = "LB0001".parse().unwrap();
+        let at = |message: &str| {
+            let diag = Diagnostic::error(code, message)
+                .with_label(Label::primary(Span::new("main.lua", 18..19), "here"));
+            let out = render(&[diag], Format::GitlabCodeQuality, &lookup);
+            let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+            value[0]["fingerprint"].as_str().unwrap().to_owned()
+        };
+        assert_ne!(at("unexpected token `=`"), at("unexpected token '='"));
+    }
+
+    /// The sweep the GitLab fix prompted: does any *other* machine format
+    /// emit an empty location for an unspanned finding? None does — and each
+    /// for a reason that is a property of the format, not an accident, so
+    /// pin the reasons rather than trusting the reading.
+    ///
+    /// - **JSON** is the `Diagnostic` structure verbatim: an unspanned
+    ///   diagnostic has an empty `labels` array and no location field to be
+    ///   wrong about.
+    /// - **SARIF** omits `result.locations` entirely. The property is
+    ///   optional in SARIF 2.1.0, and absent is the specified way to say a
+    ///   result has no location — an empty `artifactLocation.uri` would be
+    ///   the malformed spelling, and is never emitted.
+    /// - **GitHub Actions** drops the `file=` property, leaving `::error::`,
+    ///   which annotates the workflow step rather than a file. The format
+    ///   tolerates it by design.
+    ///
+    /// Fingerprints are GitLab's alone — no other renderer emits one — so the
+    /// collision defect had nowhere else to live either.
+    #[test]
+    fn no_other_machine_format_emits_an_empty_location_for_an_unspanned_finding() {
+        let bare = Diagnostic::error("LB1002".parse().unwrap(), "cannot resolve `ghost`");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&render(std::slice::from_ref(&bare), Format::Json, &lookup))
+                .unwrap();
+        assert_eq!(json[0]["labels"].as_array().unwrap().len(), 0);
+        assert!(json[0].get("location").is_none());
+
+        let sarif: serde_json::Value =
+            serde_json::from_str(&render(std::slice::from_ref(&bare), Format::Sarif, &lookup))
+                .unwrap();
+        let result = &sarif["runs"][0]["results"][0];
+        assert_eq!(result["ruleId"], "LB1002");
+        assert!(
+            result.get("locations").is_none(),
+            "SARIF says absent, never an empty uri: {result}"
+        );
+
+        let gha = render(std::slice::from_ref(&bare), Format::GithubActions, &lookup);
+        assert_eq!(gha, "::error::LB1002: cannot resolve `ghost`\n");
+        assert!(!gha.contains("file="), "no empty file property: {gha}");
+    }
+
     /// A file the lookup cannot supply still gets a usable issue: the path is
     /// named and `begin` falls back to 1 rather than vanishing (the schema
     /// requires it).
@@ -846,16 +1114,18 @@ mod tests {
         let gha = render(std::slice::from_ref(&bare), Format::GithubActions, &lookup);
         assert_eq!(gha, "::warning::LB0001: no location for this one\n");
 
-        // GitLab: empty path and a begin line of 0, plus a stable fingerprint
-        // over the label-less identity.
+        // GitLab: a *synthetic* path, because the format has no way to say
+        // "nowhere" — an empty `location.path` is rejected outright. `LB0001`
+        // is not a manifest code, so the finding belongs to the project as a
+        // whole. Plus a stable fingerprint over the label-less identity.
         let gitlab = render(
             std::slice::from_ref(&bare),
             Format::GitlabCodeQuality,
             &lookup,
         );
         let value: serde_json::Value = serde_json::from_str(&gitlab).unwrap();
-        assert_eq!(value[0]["location"]["path"], "");
-        assert_eq!(value[0]["location"]["lines"]["begin"], 0);
+        assert_eq!(value[0]["location"]["path"], PROJECT_ROOT_PATH);
+        assert_eq!(value[0]["location"]["lines"]["begin"], 1);
         let fingerprint = value[0]["fingerprint"].as_str().unwrap().to_owned();
         assert_eq!(fingerprint.len(), 16);
         let again = render(&[bare], Format::GitlabCodeQuality, &lookup);
