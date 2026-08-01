@@ -1412,18 +1412,14 @@ impl Server {
             actions.push(CodeActionOrCommand::CodeAction(CodeAction {
                 title,
                 kind: Some(CodeActionKind::QUICKFIX),
-                // Through `source_for`, not a hardcoded `LINT_SOURCE`: the
-                // client pairs an action with a published diagnostic by
+                // `convert` derives the source from the code, so this site
+                // cannot hardcode `LINT_SOURCE` any more — it did, until round
+                // 5. The client pairs an action with a published diagnostic by
                 // matching the whole record, source included, so a future
-                // fix-carrying diagnostic outside the lint band must be
-                // re-converted under the source it was published with.
-                diagnostics: source_diag.map(|d| {
-                    vec![diagnostics::convert(
-                        index,
-                        d,
-                        diagnostics::source_for(d.code),
-                    )]
-                }),
+                // fix-carrying diagnostic outside the lint band is
+                // re-converted under the source it was published with, and
+                // there is no argument here to get wrong.
+                diagnostics: source_diag.map(|d| vec![diagnostics::convert(index, d)]),
                 edit: Some(WorkspaceEdit {
                     changes: Some(changes),
                     ..WorkspaceEdit::default()
