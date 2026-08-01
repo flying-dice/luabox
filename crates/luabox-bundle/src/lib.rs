@@ -357,6 +357,29 @@ fn load_module(
     }
 
     let hir = luabox_hir::lower(&parse);
+    // Control-flow legality of the lowered output under the target — the
+    // bundle-path twin of the residual pass in `luabox build`'s `lower_one`
+    // (#44). Lowering rewrites constructs the target's *parser* rejects; it
+    // has no rule that rewrites a duplicate label away, so without this a 5.2
+    // project shipping `::a:: do ::a:: end` to 5.4 bundled the illegal chunk
+    // into `dist/main.lua` — and into the `.love` archive and the Neovim
+    // runtimepath tree, which route through here too — and exited 0
+    // (Shockwave round 4). Gated on a clean parse by the early return above,
+    // for the same reason every other caller gates it: a legality verdict
+    // over a recovered block structure is a guess.
+    if let Some(finding) = luabox_hir::validate::control_flow(&file, &hir, req.target)
+        .into_iter()
+        .next()
+    {
+        return Err(BundleError::Parse {
+            file,
+            message: format!(
+                "not loadable under target {}: {} (no lowering rule)",
+                req.target.manifest_id(),
+                finding.message
+            ),
+        });
+    }
     for site in hir.dynamic_requires() {
         dynamic.push(DynamicRequireSite {
             file: file.clone(),

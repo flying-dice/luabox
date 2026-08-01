@@ -10,9 +10,16 @@
 //!    means before lowering exists: "would this source be legal there?").
 //!    Duplicate findings (same code, same range) are reported once.
 //! 3. **Control-flow legality** (#44) → `LB0020`-`LB0022`: an unresolved
-//!    `goto`, a repeated label, `break` with no enclosing loop. Edition-
-//!    independent — every reference Lua rejects these at load time. Skipped
-//!    when the parse is not clean.
+//!    `goto`, a repeated label, `break` with no enclosing loop. Every
+//!    reference Lua rejects these at load time; only the duplicate-label
+//!    *scope* differs by dialect, which is why this pass runs for the ship
+//!    target as well — and, unlike pass 2, for a ship target the manifest
+//!    declares in `[build] target` and not only for `--target` (see
+//!    [`TargetPasses`]). Skipped when the parse is not clean.
+//!
+//! Passes 2 and 3 each merge their edition and target runs: one finding per
+//! (code, primary span), the target's verdict winning a construct both
+//! reject, rendered in source order.
 //! 4. **Typecheck** (annotation-driven, against the ambient definition
 //!    layer, with each file's cross-file `require` exports in reach — #85)
 //!    at the manifest's strictness: `[types] strict = true` → strict
@@ -32,7 +39,7 @@
 //! loop instead of a one-shot check — see `crate::watch` for the debounce
 //! and filtering rules.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -111,7 +118,73 @@ pub(crate) fn run_once(
             Err(unknown) => return finish(&[unknown.diagnostic()], format, &project.root, 0),
         }
     }
+    // With no `--target`, the manifest's `[build] target` still names a ship
+    // dialect, and the *loader* half of that question has to be asked: a
+    // project declaring `target = "5.4"` passed `luabox check` on a program
+    // `luabox check --target 5.4` rejects, then built an artifact that cannot
+    // load (Shockwave round 4). It reaches the control-flow pass only — see
+    // [`TargetPasses`] for why the dialect-legality pass is not asked of a
+    // manifest target: constructs the target's parser rejects are what the
+    // declared lowering exists to rewrite, so reporting them would fail every
+    // project that uses the feature. `--target` is the explicit "would this
+    // *source* be legal there?" question and still drives both passes.
+    // `[build] target` defaults to the edition, and `dialect_passes` drops a
+    // target equal to the edition, so a project that declares neither is
+    // unaffected.
+    let passes = TargetPasses {
+        legality: target_dialect,
+        control_flow: Some(target_dialect.unwrap_or(project.build_target)),
+    };
+    run_passes(project, passes, format)
+}
 
+/// The ship-target legality passes `run_once` runs on top of the project
+/// edition, held apart because [`crate::build_cmd`]'s check gate wants one
+/// and not the other.
+///
+/// `legality` (pass 2) asks whether the source *parses* on the target;
+/// `control_flow` (pass 3) asks whether the target's *loader* accepts it.
+/// The distinction is what lowering can do about each: a construct the
+/// target's parser rejects is exactly what lowering exists to rewrite, so
+/// `build` must not gate on it, while nothing lowers a duplicate label away,
+/// so `build` must.
+///
+/// The same split decides what a *manifest* `[build] target` may ask. An
+/// explicit `--target` is the literal question ("would this source be legal
+/// there?") and sets both. `[build] target` is a declaration that the project
+/// is lowered to that dialect, so it sets `control_flow` only — asking it for
+/// dialect legality would report `LB0011` on every `//` in a 5.3 project that
+/// ships 5.1, i.e. fail `luabox check` for using the feature `[build] target`
+/// exists to provide.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TargetPasses {
+    legality: Option<Dialect>,
+    control_flow: Option<Dialect>,
+}
+
+impl TargetPasses {
+    /// The gate `luabox build` runs before emitting: the target's *loader*
+    /// verdict only, for the reason spelled out on [`TargetPasses`].
+    pub(crate) fn control_flow_only(target: Dialect) -> Self {
+        Self {
+            legality: None,
+            control_flow: Some(target),
+        }
+    }
+}
+
+/// `luabox check` with an explicitly chosen set of target passes — the entry
+/// point [`crate::build_cmd`]'s check gate uses. Everything else about the
+/// run is identical to [`run_once`].
+pub(crate) fn run_gated(
+    project: &Project,
+    passes: TargetPasses,
+    format: Format,
+) -> anyhow::Result<()> {
+    run_passes(project, passes, format)
+}
+
+fn run_passes(project: &Project, passes: TargetPasses, format: Format) -> anyhow::Result<()> {
     let lua_files =
         layout::collect_lua_files(&project.root, project.out_dir.as_deref(), DefFiles::Exclude)?;
     // Definition packages (SPEC.md §3): the dialect stdlib layer, plus any
@@ -248,7 +321,7 @@ pub(crate) fn run_once(
         .par_iter()
         .map(|file| {
             let mut diags = Vec::new();
-            check_one(file, project, target_dialect, ambient, &exports, &mut diags);
+            check_one(file, project, passes, ambient, &exports, &mut diags);
             diags
         })
         .collect();
@@ -279,7 +352,7 @@ struct SourceFile {
 fn check_one(
     file: &SourceFile,
     project: &Project,
-    target: Option<Dialect>,
+    passes: TargetPasses,
     ambient: &Ambient,
     exports: &HashMap<PathBuf, Ty>,
     diags: &mut Vec<Diagnostic>,
@@ -302,24 +375,30 @@ fn check_one(
         );
     }
 
-    // 2. Dialect legality: edition, then ship target (deduplicated — the
-    // same construct may be illegal in both).
-    let passes = dialect_passes(project.dialect, target);
-    let mut seen: HashSet<(u16, u32, u32)> = HashSet::new();
-    for dialect in passes.iter().copied() {
+    // 2. Dialect legality: edition, then ship target (merged — the same
+    // construct may be illegal in both, and is then reported once).
+    let legality_passes = dialect_passes(project.dialect, passes.legality);
+    let mut findings = Findings::default();
+    for (i, dialect) in legality_passes.iter().copied().enumerate() {
         for err in lua::validate::validate(parse, dialect) {
-            let key = (err.code, err.range.start().into(), err.range.end().into());
-            if !seen.insert(key) {
-                continue;
-            }
-            diags.push(
-                Diagnostic::error(Code::new(err.code), err.message).with_label(Label::primary(
-                    Span::new(rel, to_range(err.range)),
-                    "not legal in this edition",
-                )),
+            let range = to_range(err.range);
+            let key = (err.code, range.start, range.end);
+            // Counterfactual otherwise: a construct the *edition* accepts and
+            // only the target rejects was still labelled "not legal in this
+            // edition".
+            let label = if i > 0 && !findings.contains(key) {
+                format!("not legal on target {}", dialect.manifest_id())
+            } else {
+                "not legal in this edition".to_owned()
+            };
+            findings.record(
+                key,
+                Diagnostic::error(Code::new(err.code), err.message)
+                    .with_label(Label::primary(Span::new(rel, range), label)),
             );
         }
     }
+    diags.extend(findings.into_source_order());
 
     // 3. Control-flow legality (#44): an unresolved `goto`, a repeated label,
     // or `break` outside a loop — code every reference Lua refuses to load,
@@ -327,7 +406,7 @@ fn check_one(
     // recovered around a missing `end` is a guess, and a legality verdict over
     // a guess is noise on top of the syntax error already reported.
     //
-    // Run for the *same* dialect pair as pass 2, deduplicated the same way.
+    // Run for the *same* dialect pair as pass 2, merged the same way.
     // The pass is not fully edition-independent: `checkrepeated` tightened in
     // 5.4 (`luabox_hir::validate::repeated_label_scope`), so `::a:: do ::a::
     // end` is legal source in a 5.2 project yet cannot load on a 5.4 ship
@@ -341,16 +420,24 @@ fn check_one(
     // so both passes read one lowering.
     if parse.errors().is_empty() {
         let lowered = luabox_hir::lower(parse);
-        let mut seen: HashSet<(u16, usize, usize)> = HashSet::new();
-        for dialect in passes.iter().copied() {
+        let control_flow_passes = dialect_passes(project.dialect, passes.control_flow);
+        let mut findings = Findings::default();
+        for (i, dialect) in control_flow_passes.iter().copied().enumerate() {
             for diag in luabox_hir::validate::control_flow(rel, &lowered, dialect) {
                 let range = diag.primary_label().map_or(0..0, |l| l.span.range.clone());
-                if !seen.insert((diag.code.number(), range.start, range.end)) {
-                    continue;
-                }
-                diags.push(diag);
+                let key = (diag.code.number(), range.start, range.end);
+                let diag = if i > 0 && !findings.contains(key) {
+                    diag.with_note(format!(
+                        "the project edition loads this; the ship target {} does not",
+                        dialect.manifest_id()
+                    ))
+                } else {
+                    diag
+                };
+                findings.record(key, diag);
             }
         }
+        diags.extend(findings.into_source_order());
     }
 
     // 4. Types against the ambient definition-package layer (SPEC.md §3),
@@ -376,6 +463,56 @@ fn check_one(
 /// than one its *parser* rejects. A target equal to the edition adds nothing —
 /// the pass would produce identical findings, deduplicated away — so it is not
 /// pushed at all.
+/// What identifies one legality finding across the edition and target runs:
+/// its code and its primary range.
+type FindingKey = (u16, usize, usize);
+
+/// The findings of one legality pass, merged across the edition and target
+/// runs and returned in source order.
+///
+/// Two runs reporting the same code at the same primary range are the same
+/// *construct*, but not necessarily the same *verdict*:
+/// `repeated_label_scope` makes the first-definition site of an `LB0021`
+/// dialect-dependent, so `::a:: do ::a:: ::a:: end` at edition 5.2 with
+/// `--target 5.4` produced two findings that named each other's spans — one
+/// line reported as a duplicate *and* cited as the first definition
+/// (Shockwave round 4). Keeping whichever ran first also meant the edition
+/// always won, and the rendered order followed pass order rather than the
+/// source.
+///
+/// So: the **later** run wins a key both fill — the ship target is the
+/// dialect that decides whether the artifact loads — and the merged set is
+/// sorted by span before it is rendered.
+#[derive(Default)]
+struct Findings {
+    order: Vec<Diagnostic>,
+    index: HashMap<FindingKey, usize>,
+}
+
+impl Findings {
+    fn contains(&self, key: FindingKey) -> bool {
+        self.index.contains_key(&key)
+    }
+
+    fn record(&mut self, key: FindingKey, diag: Diagnostic) {
+        match self.index.get(&key) {
+            Some(&at) => self.order[at] = diag,
+            None => {
+                self.index.insert(key, self.order.len());
+                self.order.push(diag);
+            }
+        }
+    }
+
+    fn into_source_order(mut self) -> Vec<Diagnostic> {
+        self.order.sort_by_key(|diag| {
+            diag.primary_label()
+                .map_or((0, 0), |l| (l.span.range.start, l.span.range.end))
+        });
+        self.order
+    }
+}
+
 fn dialect_passes(edition: Dialect, target: Option<Dialect>) -> Vec<Dialect> {
     let mut passes = vec![edition];
     if let Some(target) = target

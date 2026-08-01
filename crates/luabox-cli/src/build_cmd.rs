@@ -131,7 +131,7 @@ pub fn run(cwd: &Path, opts: &BuildOptions) -> anyhow::Result<()> {
     if !do_bundle {
         // Tree mode ignores the bundle-only knobs (`entry`, `outfile`,
         // `sourcemap`, `minify`) — there is no require graph to walk.
-        check_gate(&project)?;
+        check_gate(&project, target)?;
         return emit_tree(&project, &out_dir, edition, target);
     }
 
@@ -178,7 +178,7 @@ pub fn run(cwd: &Path, opts: &BuildOptions) -> anyhow::Result<()> {
     }
 
     // Check gate, exactly as tree mode: refuse to emit on check errors.
-    check_gate(&project)?;
+    check_gate(&project, target)?;
 
     fs::create_dir_all(&out_dir)
         .with_context(|| format!("cannot create `{}`", out_dir.display()))?;
@@ -225,8 +225,20 @@ const NAMELESS_BUNDLE: &str = "bundle";
 
 /// `luabox build` runs `luabox check` first and refuses to emit while it
 /// reports errors — the same gate for both emit shapes.
-fn check_gate(project: &check_cmd::Project) -> anyhow::Result<()> {
-    if check_cmd::run_once(project, None, Format::Human).is_err() {
+///
+/// The gate runs the *edition* dialect-legality pass plus the ship target's
+/// **control-flow** legality pass, and deliberately not the target's
+/// dialect-legality pass (`TargetPasses::control_flow_only`): constructs the
+/// target's *parser* rejects are exactly what lowering exists to rewrite,
+/// while nothing lowers a duplicate label away, so a program the target's
+/// *loader* refuses must never reach an emitter. That is the same defect the
+/// residual passes catch downstream, caught here against the source — which
+/// is why `build`'s `LB0021` carries a span and a "first defined here" label
+/// rather than the spanless reconstruction the residual pass can offer
+/// (Shockwave round 4).
+fn check_gate(project: &check_cmd::Project, target: Dialect) -> anyhow::Result<()> {
+    let passes = check_cmd::TargetPasses::control_flow_only(target);
+    if check_cmd::run_gated(project, passes, Format::Human).is_err() {
         bail!("`luabox build` refuses to emit while `luabox check` reports errors");
     }
     Ok(())
