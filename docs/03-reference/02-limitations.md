@@ -25,6 +25,49 @@ bare `---@alias A A`) is reported as `LB0314`, at the alias's own declaration
 do — the recursive edge itself still terminates safely, lowering to
 `unknown` rather than recursing, matching luals' `cyclic-alias` diagnostic.
 
+### Duplicate `---@class` declarations union (#49 — one edge documented)
+
+Two `---@class` declarations for one name are two halves of one intent, so
+they **union**: parents, `---@field` members, `---@operator` overloads,
+visibility modifiers and carrier attachments from every declaration land on the
+same class. This holds identically whether the declarations sit in one file, in
+two project files, or in a `---@meta` definition file — the file boundary does
+not change the merge, which is what luals does (it resolves a member against
+every `doc.class` set carrying the name). A class carried more than once
+(`---@class Two` over two different tables) collects the members of both
+carriers.
+
+A same-name **field** declared twice is where luabox and luals part company.
+luabox keeps the **first** declaration, wherever it was written — inside one
+`---@class` block, in a second block for the same class, or in another file —
+and warns at the loser as `duplicate-doc-field` (`LB0311`), the same
+deterministic first-wins trade it makes for duplicate aliases (`LB0310`) and
+enums. luals instead *unions* the two declared types into `string|number`.
+Choosing the union would make a mistyped duplicate silently widen the field
+rather than be reported, so the warning plus a stable winner is the more useful
+answer; the divergence is here rather than in the code's favour.
+
+**Type parameters are scoped to the declaration that writes them.** Two
+declarations of a generic class may spell the parameter differently —
+`---@class Boxed<T>` with `---@field value T` beside `---@class Boxed<U>` with
+`---@field other U` — and each declaration's field bodies resolve against its
+own list, as they do in luals. The templates are then unified *positionally*
+when they merge: slot 0 is one type variable however the two spell it, so
+`Boxed<string>` makes both `value` and `other` `string`. This holds in one
+file and across files alike. Two consequences worth stating: a declaration
+naming *another* declaration's parameter is a genuine unknown type name
+(`LB0305`) — the scoping cuts both ways — and the parameter *list* follows the
+same first-wins rule as every other member, so a duplicate declaring more
+parameters than the first has no canonical slot for the surplus, which stays
+lenient as `unknown` rather than becoming a placeholder no instantiation could
+substitute.
+
+One thing that is **not** a union: a project file's own `---@class` still
+*replaces* a same-named class from the stdlib or from a `[types] defs` package,
+whole. That is the escape hatch — your declaration corrects the packaged one
+rather than merging with it — and it is a different axis from duplicate
+declarations in code you wrote.
+
 ### LuaCATS tags: the full vocabulary is enforced
 
 Every LuaCATS tag now influences checking, navigation, or docs — nothing is
@@ -50,6 +93,16 @@ warns at use sites as luals does, riding the `deprecated` diagnostic —
 `>5.2`/`JIT`/comma lists, and 5.1 implies LuaJIT), `---@source`
 (goto-definition redirects to the annotated location), and `---@see`
 (rendered in hover and as linked "See also" sections in `luabox doc`).
+
+A `---@class` is carried by whatever its statement binds, and luabox draws no
+distinction between the spellings: `local M = {}`, `Glob = {}`, and a
+re-assignment of an existing name all carry the class, and every later
+`function Carrier:method()`, `function Carrier.fn()` or `Carrier.const = v`
+attaches to it (#50 — the global spelling used to lose its members). A variable
+carried twice answers with its most recent carrier, the way Lua resolves the
+name; and the carrier *variable* wins over a class of the same name, so
+`---@class Wrapper` over `Glob = {}` makes `function Glob:m()` a member of
+`Wrapper`, whichever order the declarations appear in.
 
 Deliberate parity boundaries (luals behaves the same way): async-ness never
 *propagates* (only an explicit `---@async` tag counts, matching luals's
@@ -492,9 +545,30 @@ positional exactly as on a `local`, so a lone annotation over `a, b = f, g`
 declares `a` only, and `b` keeps its inferred type. A declared signature that
 disagrees with the literal's own parameter list — extra or missing parameters —
 is **not** diagnosed: luals has no such rule (`---@type` simply covers the
-value's type), so the declaration governs and luabox stays silent. A `---@type`
-over anything other than a function literal on an assignment is unchanged;
-that slot's enforcement lives on the `---@type` local path.
+value's type), so the declaration governs and luabox stays silent.
+
+A `---@type` over a **non-function** value on an assignment is enforced too, as
+of #48. It used to be inert — `---@type string` above `M.a = 1` declared
+nothing and diagnosed nothing, so the annotation looked accepted and rotted —
+and it now declares the assigned slot and checks the initializer against it
+(`LB0300`), exactly as on a `local`. luals binds a doc block to the statement
+rather than to the target's syntax, so every spelling gets the same treatment:
+a table field (`M.a`), a bracket index with a literal key (`M["a"]`), a nested
+field (`M.a.b`, which annotates the innermost slot — the one being assigned), a
+global (`G = 1`), and a plain name. The positional rule above is the same one
+here, so a lone annotation over `M.a, M.b = x, y` declares `M.a` only. Where a
+`---@field` also declares the member, the two do not compete: the `---@field`
+governs the **class surface** (what a value annotated with the class reads
+back), and the `---@type` governs the assignment it sits above.
+
+One boundary is deliberate. A `---@type <Class>` over `local X = {}` defers its
+conformance to the carrier's *final* accumulated shape, so members assigned
+later in the file count — a luabox leniency luals does not have. The assignment
+spellings have no such deferral: `---@type <Class>` over `G = {}` reports its
+missing members against the literal on the spot (`LB0302`), which is what luals
+does for both. For a global table built up over several statements, use the
+`---@class` carrier spelling — that one *does* collect the members attached to
+it later (#50).
 
 The expected type now also propagates *into* literals and through nested
 layers, matching luals (`script/vm/compiler.lua`, which lazily compiles a node
@@ -597,17 +671,77 @@ What that leaves, stated plainly:
 - **A library whose API is a *global*** rather than a module return — LÖVE,
   Neovim, OpenResty — still wants a `defs/` package. The harvest contributes
   type declarations and export types, not ambient globals.
-- **Argument checking at a rock function's call site** does not happen:
-  `local m = require("rock"); m.f("wrong")` is unchecked. The axis is the
-  **module boundary**, not field access — measured: a table-field call in the
-  *same* file IS argument-checked (LB0300), a call to anything reached via
-  `require` is not, your own modules included. Fields survive the boundary
-  (LB0306 fires cross-module) and a rock's `---@return` types flow, so
-  misusing a *result* is caught; a rock's `---@param` is **not enforced at
-  cross-module call sites**. Pre-existing, not a harvest limitation — tracked
-  as [#46](https://github.com/flying-dice/luabox/issues/46), with the
-  measured table on the issue. An explicit `---@type` at the call site
-  restores checking today.
+- **Argument checking at a rock function's call site now happens**, and this
+  bound is gone ([#46](https://github.com/flying-dice/luabox/issues/46)).
+  `local m = require("rock"); m.f("wrong")` reports `LB0300`, and the wrong
+  *number* of arguments reports `LB0301`, exactly as the same call written in
+  the same file does — it is one shared signature-checking path, so the
+  diagnostics read identically on both sides of the module boundary. This
+  applies to every `require`d function, your own project modules included and
+  not only rocks: a `return M` module table, a module whose export *is* a
+  function, nested tables (`m.util.fmt`), colon-methods and dot-calls on an
+  exported class, `---@overload`s, `---@vararg`, and `---@param x? T`
+  optionals, which stay omittable across the boundary exactly as they are
+  within a file.
+
+  What is *not* checked is unchanged and deliberate: a function carrying **no
+  signature annotation** is not argument-checked, because an unannotated
+  same-file function is not either. Its parameters are a description of a
+  body, not a contract, and checking calls against them would invent arity
+  errors about code that claims nothing. A rock with no LuaCATS annotations
+  still gives you nothing, per the first bullet above.
+
+  Three edges remain out, each far narrower than the bound it replaces:
+
+  - **A dynamic require path** — `require(name)` for a computed `name` —
+    resolves to no module, so its result stays `unknown` and nothing about it
+    is checked. Static string literals are the resolvable set, the same set
+    the bundler accepts.
+  - **A member declared only as a `---@field`** on an exported `---@class`,
+    with no `function M.f` defining it, does not reach the consumer: a
+    module's export type is the shape of the value it returns, and a
+    `---@field` line declares a member without assigning one. The same class
+    with its members *attached* (`function Api.send(...)`) is checked
+    normally. What is missing here is the member, not its signature.
+  - **A function re-exported from a second `require`** — module B does
+    `local a = require("a"); return { f = a.f }` and a consumer calls
+    `require("b").f(...)`. B's *own* requires are deliberately left
+    unresolved when B's export type is computed; that is what keeps the
+    cross-file registry acyclic and `require` cycles tolerable, and the cost
+    is that a signature does not travel two hops. Re-exporting a function
+    defined in B itself works.
+
+  An explicit `---@type` at the call site still restores checking in any of
+  these cases, as it always did.
+
+  Two call-site rules that the widening exposed have since been settled, and
+  each keeps one deliberately narrow edge:
+
+  - **A trailing parameter that admits `nil` is optional for arity.**
+    `---@param b number|nil` and `---@param b? number` say the same thing
+    about what may reach `b`, and Lua supplies `nil` for every argument the
+    caller left off — so omitting it is exactly the call the annotation
+    permits, which is what luals concludes too. `f(1)` against
+    `f(a: number, b: number|nil)` is clean, on both sides of the module
+    boundary. **Only a trailing run counts.** A nil-admitting parameter
+    *followed by a required one* still requires an argument, because a caller
+    cannot skip a middle argument in Lua without writing `nil` in its place —
+    relaxing that slot would let a genuinely short call through. luals's exact
+    behaviour in that position could not be verified here, and this is the
+    direction that cannot be wrong in the dangerous way. Equally narrow:
+    "admits `nil`" means the type *says* `nil`. `---@param b any` and
+    `---@param b unknown` accept `nil` assignably but only decline to
+    constrain the parameter, so they stay required.
+  - **A string receiver's `:` methods resolve through the `string` library.**
+    Every string shares one metatable whose `__index` is the `string` table,
+    so `s:upper()` *is* `string.upper(s)` — it types as `string`, `s:byte()`
+    as `integer`, `s:match(p)` as `string|nil`, and the arguments are checked
+    with the receiver bound (`s:rep("three")` is `LB0300`). A member the
+    library does not declare is `LB0306` in both the `:` and the `.`
+    spellings, as it is at runtime. A **nil-admitting receiver** is the edge
+    left: `---@type string|nil` must be narrowed before a method call, which
+    stays lenient rather than reported — the pre-existing rule for union
+    receivers generally, not specific to strings.
 - **The flat `lua_modules/<name>/` layout is not harvested.** It keeps its
   existing route: a `[dependencies]`/`[dev-dependencies]` entry naming the
   package, a `luabox.toml` for it at `lua_modules/<name>/luabox.toml` (or at
@@ -625,6 +759,39 @@ it points at is still not planned for 0.x; nothing needs it now.
 
 Your `*.rockspec` and luarocks own everything else (adding, updating,
 publishing), and you run your program with whatever Lua you already have.
+
+### A `---@class` module export: editor and CI both stop short (#54)
+
+The editor reads `require` bindings through the same resolver the type pass
+does, so hover and completion agree with CI for the ordinary `local M = {} …
+return M` module. One shape does not close, in **both** of its spellings: a
+module whose export is a `---@class`. The class's `---@field`s live in the
+declaring file's ambient environment, and the per-file view the editor
+surfaces are built on cannot reach it — so **the module's members get no
+hover and are not offered by completion, either way**.
+
+What is left of the binding differs between the two spellings, and the
+difference is measured, not assumed. Both rows are pinned by fixtures —
+`tests/features/lsp/hover-require.feature` for the editor column,
+`tests/features/frontend/require.feature` for CI.
+
+Given `---@class Point` / `---@field x number` in `point.lua` and
+`local p = require("point")` in the consumer:
+
+| module spells its export as | binding hovers as | `p.x` hover | `p.` completion | `luabox check` |
+| --- | --- | --- | --- | --- |
+| a class **instance** — `---@type Point` on the returned local | `local p: Point` | none | omits `x` | enforces: `p.x` is `number`, `p.nope` is `LB0306` |
+| a class **carrier** — `---@class Point` over `local P = {}` | `local p: {  }` (the structural table the carrier is) | none | omits `x` | lenient: `p.x` crosses as `unknown` and `p.nope` is accepted |
+
+So the instance spelling is the one where the editor is genuinely narrower
+than CI. The carrier spelling is not an editor gap at all — both sides see
+the structural table, and they agree.
+
+**The way to get the class enforced is to name it**: `---@param p Point`, or
+`---@type Point` on the binding. Class names are workspace-global, so the
+`require` is not what carries the type — no `require` is needed for the type
+at all. With the class named, members are typed, hovered, completed and
+checked on both sides.
 
 ### `build --mode love` requires an external zip tool
 

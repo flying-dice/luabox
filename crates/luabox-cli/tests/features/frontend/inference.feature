@@ -241,3 +241,64 @@ Feature: rich table inference — tables never degrade to bare `table`
     When I run "luabox check"
     Then the command fails
     And diagnostic LB0300 is reported
+
+  Scenario: a string receiver's `:` method resolves through the string library
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@param s string
+      local function want_s(s) end
+      ---@param n integer
+      local function want_i(n) end
+
+      ---@type string
+      local s = "hi"
+      want_s(s:upper())
+      want_s(s:sub(1, 2))
+      want_s(("x"):rep(3))
+      want_s((s .. "y"):lower())
+      want_i(s:byte())
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And zero diagnostics are reported
+
+  Scenario: a string method's result is typed, so misusing it names the type
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@param n number
+      local function want(n) end
+      ---@type string
+      local s = "hi"
+      want(s:upper())
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0300"
+    And stdout contains "found `string`"
+
+  Scenario: a method the string library does not declare is an undefined field
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@type string
+      local s = "hi"
+      return s:nope()
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0306"
+    And stdout contains "undefined field `nope` on `string`"
+
+  Scenario: a string method's arguments are checked with the receiver bound
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@type string
+      local s = "hi"
+      return s:rep("three")
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0300"

@@ -17,6 +17,7 @@ use luabox_hir::BindingKind;
 use luabox_syntax::luacats::FieldKey;
 use luabox_types::ty::Ty;
 
+use crate::requires::{self, RequireExports};
 use crate::sema::{self, FileSema};
 
 /// Lua keywords offered in plain (non-member) positions.
@@ -28,12 +29,16 @@ const KEYWORDS: &[&str] = &[
 /// Compute completions at `offset` (the cursor's byte offset). `analysis` and
 /// `project_root` back the auto-require pass — enumerating other modules'
 /// exports and reversing each target file to its `require` module path.
+/// `exports` is the shared `require` resolution ([`RequireExports`]), so
+/// members of a `require` binding come from the same map the type pass checks
+/// against (#54).
 #[must_use]
 pub fn completion(
     sema: &FileSema,
     offset: usize,
     analysis: &Analysis,
     project_root: &Path,
+    exports: &RequireExports,
 ) -> Vec<CompletionItem> {
     let text = sema.index.text();
     let bytes = text.as_bytes();
@@ -53,7 +58,7 @@ pub fn completion(
 
     let mut items: BTreeMap<String, CompletionItem> = BTreeMap::new();
     if let Some(trigger) = trigger {
-        member_items(sema, text, start - 1, trigger, &mut items);
+        member_items(sema, text, start - 1, trigger, exports, &mut items);
     } else {
         scope_items(sema, offset, &mut items);
         // Auto-require runs after scope items so names already in scope
@@ -68,12 +73,15 @@ pub fn completion(
     items.into_values().collect()
 }
 
-/// Fields/methods of the receiver identifier ending at `dot_offset`.
+/// Fields/methods of the receiver identifier ending at `dot_offset`: the
+/// receiver's `---@class` fields, or — for a `require` binding — the members
+/// of the required module's export type (#54).
 fn member_items(
     sema: &FileSema,
     text: &str,
     dot_offset: usize,
     trigger: u8,
+    exports: &RequireExports,
     items: &mut BTreeMap<String, CompletionItem>,
 ) {
     let bytes = text.as_bytes();
@@ -90,6 +98,7 @@ fn member_items(
     )]
     let receiver = &text[recv_start..dot_offset];
     let Some(class) = sema.class_of_name(receiver, recv_start) else {
+        require_member_items(sema, receiver, recv_start, trigger, exports, items);
         return;
     };
     for (field, declaring) in sema.class_fields(&class) {
@@ -119,6 +128,58 @@ fn member_items(
                     "{declaring}.{name}: {}",
                     sema::render_type(&field.ty)
                 )),
+                ..CompletionItem::default()
+            },
+        );
+    }
+}
+
+/// Members of a `require` binding: the named fields of the required module's
+/// export type, out of the shared resolution the type pass checks against
+/// (#54). Declines for every receiver that is not one, so the caller's other
+/// routes are unaffected.
+///
+/// Qualified by the *module* rather than the local name in the detail line,
+/// matching the hover, so an item names where it came from rather than what
+/// the file happened to call it.
+fn require_member_items(
+    sema: &FileSema,
+    receiver: &str,
+    recv_start: usize,
+    trigger: u8,
+    exports: &RequireExports,
+    items: &mut BTreeMap<String, CompletionItem>,
+) {
+    let Some(binding) = sema.visible_binding_named(receiver, recv_start) else {
+        return;
+    };
+    let Some(module) = requires::require_module_of(sema, binding) else {
+        return;
+    };
+    let Some(fields) = exports.get(module).and_then(requires::export_fields) else {
+        return;
+    };
+    for (name, field) in fields {
+        let is_fun = matches!(field.ty, Ty::Function(_));
+        // After `:` only methods make sense.
+        if trigger == b':' && !is_fun {
+            continue;
+        }
+        let kind = if is_fun {
+            if trigger == b':' {
+                CompletionItemKind::METHOD
+            } else {
+                CompletionItemKind::FUNCTION
+            }
+        } else {
+            CompletionItemKind::FIELD
+        };
+        items.insert(
+            name.clone(),
+            CompletionItem {
+                label: name.clone(),
+                kind: Some(kind),
+                detail: Some(format!("{module}.{name}: {}", field.ty)),
                 ..CompletionItem::default()
             },
         );
@@ -361,8 +422,10 @@ mod tests {
 
     use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
 
+    use luabox_types::RockSurfaces;
+
     use super::{CompletionItem, CompletionItemKind, completion};
-    use super::{FileSema, header_end, module_path};
+    use super::{FileSema, RequireExports, header_end, module_path};
 
     /// The workspace root every test file lives under.
     fn root() -> PathBuf {
@@ -371,6 +434,9 @@ mod tests {
 
     fn analyze(files: &[(&str, &str)]) -> (Analysis, PathBuf) {
         let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
+        // Anchoring the root is what lets cross-file `require` resolve, which
+        // the shared export map (#54) depends on.
+        host.set_root(root());
         let mut first = None;
         for (rel, text) in files {
             let path = root().join(rel);
@@ -384,14 +450,45 @@ mod tests {
         (host.snapshot(), first.expect("at least one file"))
     }
 
-    /// Completions at the byte offset just past `needle` in the first file.
-    fn after(files: &[(&str, &str)], needle: &str) -> Vec<CompletionItem> {
+    /// Completions at the byte offset just past `needle` in the first file,
+    /// with `rocks` in the shared `require` resolution.
+    fn after_with(
+        files: &[(&str, &str)],
+        needle: &str,
+        rocks: &RockSurfaces,
+    ) -> Vec<CompletionItem> {
         let src = files[0].1;
         let offset = src.find(needle).expect("needle present") + needle.len();
         let (analysis, path) = analyze(files);
         let sema = FileSema::new(&analysis, &path).expect("sema");
-        completion(&sema, offset, &analysis, &root())
+        let exports = RequireExports::resolve(&analysis, &path, rocks);
+        completion(&sema, offset, &analysis, &root(), &exports)
     }
+
+    /// Completions at the byte offset just past `needle` in the first file.
+    fn after(files: &[(&str, &str)], needle: &str) -> Vec<CompletionItem> {
+        after_with(files, needle, &RockSurfaces::default())
+    }
+
+    /// A two-file workspace's annotated module, mirroring `hover`'s.
+    ///
+    /// `version` is deliberately unannotated: its type is whatever the module
+    /// surface inferred (the string *literal*), and that is precisely what
+    /// completion must show — the type the checker will hold a use site to.
+    /// Widening it for display would be prettier and would be the editor
+    /// disagreeing with CI, which is the bug this file is about.
+    const OTHER: &str = "\
+local M = {}
+
+M.version = \"1.0\"
+
+---Helps.
+---@param n number
+---@return string
+function M.helper(n) return tostring(n) end
+
+return M
+";
 
     fn labels(items: &[CompletionItem]) -> Vec<&str> {
         items.iter().map(|i| i.label.as_str()).collect()
@@ -609,7 +706,8 @@ local visible = 2
         let src = "local x = 1\n";
         let (analysis, path) = analyze(&[("main.lua", src)]);
         let sema = FileSema::new(&analysis, &path).expect("sema");
-        let items = completion(&sema, src.len() + 500, &analysis, &root());
+        let exports = RequireExports::resolve(&analysis, &path, &RockSurfaces::default());
+        let items = completion(&sema, src.len() + 500, &analysis, &root(), &exports);
         assert!(labels(&items).contains(&"x"), "{:?}", labels(&items));
     }
 
@@ -647,6 +745,95 @@ local visible = 2
         let root = Path::new("/proj");
         assert_eq!(module_path(root, Path::new("/other/x.lua")), None);
         assert_eq!(module_path(root, Path::new("/proj/x.txt")), None);
+    }
+
+    // === `require` bindings (#54) =========================================
+    //
+    // The hover half of #54 was measured; completion was not, so it is pinned
+    // here too — members of a `require` binding come from the same shared
+    // export map, so the two surfaces cannot drift apart again.
+
+    #[test]
+    fn a_require_binding_offers_its_module_members() {
+        let files = [
+            ("main.lua", "local m = require(\"other\")\nm.\n"),
+            ("other.lua", OTHER),
+        ];
+        let items = after(&files, "m.");
+        assert_eq!(
+            labels(&items),
+            vec!["helper", "version"],
+            "{:?}",
+            labels(&items)
+        );
+        assert_eq!(
+            item(&items, "helper").kind,
+            Some(CompletionItemKind::FUNCTION)
+        );
+        assert_eq!(
+            item(&items, "version").kind,
+            Some(CompletionItemKind::FIELD)
+        );
+        assert_eq!(
+            item(&items, "version").detail.as_deref(),
+            Some("other.version: \"1.0\"")
+        );
+    }
+
+    #[test]
+    fn a_colon_trigger_on_a_require_binding_offers_only_functions() {
+        let files = [
+            ("main.lua", "local m = require(\"other\")\nm:\n"),
+            ("other.lua", OTHER),
+        ];
+        let items = after(&files, "m:");
+        assert_eq!(labels(&items), vec!["helper"], "{:?}", labels(&items));
+        assert_eq!(
+            item(&items, "helper").kind,
+            Some(CompletionItemKind::METHOD)
+        );
+    }
+
+    #[test]
+    fn a_rock_require_binding_offers_the_harvested_members() {
+        let source = luabox_types::RockModule {
+            module: "mylib".to_string(),
+            label: "lua_modules/share/lua/5.4/mylib/init.lua".to_string(),
+            path: root().join("lua_modules/share/lua/5.4/mylib/init.lua"),
+            text: "\
+local M = {}
+
+---@param who string
+---@return string
+function M.greet(who) return \"hi \" .. who end
+
+return M
+"
+            .to_string(),
+        };
+        let ambient = luabox_types::build_ambient(Dialect::Lua54, &[]);
+        let rocks = luabox_types::rocks::harvest(&ambient, &[source]);
+        let files = [("main.lua", "local mylib = require(\"mylib\")\nmylib.\n")];
+        let items = after_with(&files, "mylib.", &rocks);
+        assert_eq!(labels(&items), vec!["greet"], "{:?}", labels(&items));
+    }
+
+    #[test]
+    fn a_require_binding_for_an_absent_module_offers_nothing() {
+        let files = [("main.lua", "local m = require(\"absent\")\nm.\n")];
+        assert!(after(&files, "m.").is_empty());
+    }
+
+    #[test]
+    fn a_dynamic_require_binding_offers_nothing_by_design() {
+        let files = [
+            (
+                "main.lua",
+                "local name = \"other\"\nlocal m = require(name)\nm.\n",
+            ),
+            ("other.lua", OTHER),
+        ];
+        assert!(after(&files, "m.").is_empty());
     }
 
     #[test]

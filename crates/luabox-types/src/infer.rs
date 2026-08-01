@@ -251,7 +251,7 @@ pub(crate) fn run(
         instances: HashMap::new(),
         declared_carriers: HashMap::new(),
         carrier_locals: HashMap::new(),
-        class_carrier_locals: HashMap::new(),
+        class_carriers: HashMap::new(),
         carrier_keys: HashSet::new(),
         funcs: HashMap::new(),
         param_seeds: HashMap::new(),
@@ -308,17 +308,31 @@ pub(crate) fn run(
     // reified shape folds in `setmetatable(X, { __index = Base })`-style
     // inheritance via `reify_shape`'s `__index` walk; the name-keyed map
     // covers the `X.__index = Base` chain the carrier's own shape omits (#107).
-    let class_carriers: Vec<(Key, BindingId, String)> = infer
-        .class_carrier_locals
+    //
+    // A class may be carried more than once in one file (`---@class Two` over
+    // two different tables, each with its own methods). Those carriers
+    // **union**, exactly as duplicate `---@class` declarations do (#49) — and
+    // the fold is done in statement order rather than `HashMap` order, so a
+    // repeated carrier folds the same way on every run.
+    let mut class_carriers: Vec<(Key, CarrierRef, String)> = infer
+        .class_carriers
         .iter()
-        .map(|(k, (b, n))| (*k, *b, n.clone()))
+        .map(|(k, (c, n))| (*k, c.clone(), n.clone()))
         .collect();
-    let mut carrier_class_final = HashMap::new();
-    for (key, binding, name) in class_carriers {
-        if let Some(ity) = infer.state.get(&binding).cloned() {
+    class_carriers.sort_by_key(|(key, _, _)| *key);
+    let mut carrier_class_final: HashMap<String, Ty> = HashMap::new();
+    for (key, carrier, name) in class_carriers {
+        if let Some(ity) = infer.carrier_ity(&carrier) {
             let ty = infer.reify(&ity);
             carrier_final.entry(key).or_insert_with(|| ty.clone());
-            carrier_class_final.insert(name, ty);
+            match carrier_class_final.remove(&name) {
+                Some(existing) => {
+                    carrier_class_final.insert(name, union_carrier_shapes(existing, ty));
+                }
+                None => {
+                    carrier_class_final.insert(name, ty);
+                }
+            }
         }
     }
     Outcome {
@@ -491,6 +505,19 @@ enum Pred {
     NotLit(Ty),
 }
 
+/// What a `---@class` carrier statement binds its table to.
+///
+/// A `local X = {}` carrier is a [`BindingId`]; a `Glob = {}` carrier is a
+/// *free* name, which has no binding at all — the reason global carriers used
+/// to lose every member they collected (#50). Wave 19 met the same shape in
+/// `luabox-lint` (`ValueRef::Global`) and answered it the same way: key the
+/// global half by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CarrierRef {
+    Local(BindingId),
+    Global(String),
+}
+
 struct Infer<'a> {
     env: &'a TypeEnv,
     hir: &'a LoweredFile,
@@ -512,20 +539,27 @@ struct Infer<'a> {
     shape_of_expr: HashMap<(BodyId, ExprId), usize>,
     /// Carrier shape → its shared instance shape.
     instances: HashMap<usize, usize>,
-    /// Declared name → the carrier shape bound to that declaration, so an
+    /// Declared name → the carrier shapes bound to that declaration, so an
     /// annotated instance value (`---@return Circle`) still resolves
     /// methods and inferred extensions through the carrier (#73).
-    declared_carriers: HashMap<String, usize>,
+    ///
+    /// A `Vec` because one class may be carried more than once in a file:
+    /// duplicate `---@class` declarations union rather than replace (#49), so
+    /// a member is looked up across every carrier, in declaration order,
+    /// first-wins — the rule the rest of the crate merges classes by.
+    declared_carriers: HashMap<String, Vec<usize>>,
     /// `---@type` carrier locals (`local X = {}` whose object annotation is
     /// satisfied only by later extension), keyed by the `local` statement's
     /// byte range → the carrier binding. Their final shape is published as
     /// [`Outcome::carrier_final`] for the deferred conformance check.
     carrier_locals: HashMap<Key, BindingId>,
-    /// `---@class Name : ...` carriers (`local X = {}` tagged with a class
-    /// that has parents), keyed by the `local` statement's byte range → the
-    /// carrier binding, plus the class name. Their final reified shape feeds
-    /// the checker's `: Interface` conformance check (#107).
-    class_carrier_locals: HashMap<Key, (BindingId, String)>,
+    /// `---@class Name` carriers (`local X = {}`, `Glob = {}`, or a
+    /// re-assignment that re-carries an existing binding), keyed by the
+    /// carrier statement's byte range → what the class is carried *by*, plus
+    /// the class name. Their final reified shape feeds the checker's
+    /// `: Interface` conformance check (#107) and the file's exported class
+    /// surface ([`crate::FileTypes::collect`]).
+    class_carriers: HashMap<Key, (CarrierRef, String)>,
     /// The statement keys classified as carriers in pass 0, reused verbatim
     /// in pass 1 so the keep-the-shape decision (rather than freeze to the
     /// annotated type) is identical across passes.
@@ -760,10 +794,13 @@ impl Infer<'_> {
         if sig.deprecated || sig.is_async || sig.version.is_some() {
             return found;
         }
-        let Some(&carrier) = self.declared_carriers.get(class) else {
-            return found;
-        };
-        let Some(attached) = self.shapes[carrier].fields.get(name) else {
+        let Some(attached) = self
+            .declared_carriers
+            .get(class)
+            .into_iter()
+            .flatten()
+            .find_map(|&carrier| self.shapes[carrier].fields.get(name))
+        else {
             return found;
         };
         let Some(tags) = self.tags_of(attached) else {
@@ -938,8 +975,15 @@ impl Infer<'_> {
                 }
                 // An annotated instance (`---@return Circle`, `---@type
                 // Circle`) still resolves methods and inferred extensions
-                // through the declared carrier's shared instance shape (#73).
-                if let Some(&carrier) = self.declared_carriers.get(class.as_str()) {
+                // through the declared carrier's shared instance shape (#73) —
+                // through *every* carrier of the class, since duplicate
+                // declarations union (#49).
+                let carriers = self
+                    .declared_carriers
+                    .get(class.as_str())
+                    .cloned()
+                    .unwrap_or_default();
+                for carrier in carriers {
                     let instance = self.instance_of(carrier);
                     if let Lookup::Found(ity) = self.lookup_shape_field(instance, name) {
                         return Lookup::Found(ity);
@@ -959,6 +1003,7 @@ impl Infer<'_> {
                     declared: provable.then(|| class.clone()),
                 }
             }
+            Ty::String | Ty::StringLit(_) => self.lookup_string_member(name),
             Ty::Union(members) => {
                 let mut found: Vec<ITy> = Vec::new();
                 for member in members.clone() {
@@ -970,6 +1015,39 @@ impl Infer<'_> {
                 Lookup::Found(ity_union(found))
             }
             _ => Lookup::Opaque,
+        }
+    }
+
+    /// A member read off a string value, resolved through the `string`
+    /// library — which is what Lua itself does.
+    ///
+    /// Every string in a Lua state shares one metatable whose `__index` is the
+    /// `string` table (`lstrlib.c`'s `createmetatable`, run by
+    /// `luaopen_string`). So `s:upper()` *is* `string.upper(s)` and `s.upper`
+    /// *is* `string.upper` — one resolution, the `:` form with `self` bound.
+    /// luals models it the same way and types both.
+    ///
+    /// Resolution goes through the ordinary dotted-function registry, so a
+    /// project that extends the library (`function string.trim(s) end`) gets
+    /// `s:trim()` for free, exactly as it does at runtime.
+    fn lookup_string_member(&mut self, name: &str) -> Lookup {
+        if let Some(sig) = self.env.function(&format!("string.{name}")) {
+            return Lookup::Found(ITy::Ty(Ty::Function(Box::new(sig.clone()))));
+        }
+        // A definition package may spell the library as a table type
+        // (`---@class stringlib` with `---@field upper fun(...)`) rather than
+        // as `function string.upper` statements; both reach the same members.
+        if let Some(ty) = self.env.global_type("string").cloned()
+            && let Lookup::Found(ity) = self.lookup_ty_field(&ty, name)
+        {
+            return Lookup::Found(ity);
+        }
+        // The string metatable is fixed, so a member the library does not
+        // declare is a genuine `undefined-field`: `("x"):nope()` raises
+        // "attempt to call a nil value (method 'nope')" at runtime.
+        Lookup::Absent {
+            provable: true,
+            declared: Some("string".to_string()),
         }
     }
 
@@ -1203,7 +1281,38 @@ impl Infer<'_> {
                         }
                     }
                 }
-                let values = self.eval_values(body, &exprs, None);
+                // `---@param`-annotated `return function(…) end`: the doc block
+                // above the `return` binds to the returned function literal
+                // (the `direct` module shape of #46), so it supplies that
+                // function's signature — its body walks against the declared
+                // parameters, and the value the module exports is the declared
+                // `fun(…)` rather than a signature inferred off an unannotated
+                // body. Exactly the rule `local f = function(…) end` follows in
+                // `walk_local`, applied to the one other place a doc block can
+                // sit above a function literal.
+                let return_sig = self
+                    .stmt_range(body, stmt)
+                    .and_then(|key| self.env.fn_sig(key))
+                    .cloned();
+                let returned_fn = exprs.first().and_then(|&e| match self.body(body).expr(e) {
+                    Expr::Function(b) => Some(*b),
+                    _ => None,
+                });
+                let values = match (&return_sig, returned_fn) {
+                    (Some(sig), Some(fn_body)) => {
+                        self.walk_body(fn_body, Some(sig), None);
+                        let mut values = vec![ITy::Ty(Ty::Function(Box::new(sig.clone())))];
+                        // The annotated function is the first returned value;
+                        // anything after it evaluates normally.
+                        values.extend(self.eval_values(
+                            body,
+                            exprs.get(1..).unwrap_or_default(),
+                            None,
+                        ));
+                        values
+                    }
+                    _ => self.eval_values(body, &exprs, None),
+                };
                 let data = self.funcs.entry(body).or_default();
                 for (i, value) in values.into_iter().enumerate() {
                     if i < data.returns.len() {
@@ -1353,21 +1462,53 @@ impl Infer<'_> {
 
         // `---@class` / `---@struct` bound to this local: associate the
         // carrier shape with its declaration.
-        if let (Some(key), Some(local)) = (key, names.first())
-            && let Some(name) = self.env.declared_target(key)
-        {
-            let name = name.to_string();
-            if let Some(ITy::Shape(id)) = self.state.get(&local.binding) {
-                let id = *id;
-                self.shapes[id].declared = Some(name.clone());
-                self.declared_carriers.insert(name.clone(), id);
-                // A `---@class Name : Parent` carrier: record it so its final
-                // reified shape can be checked for `: Interface` conformance
-                // (#107). Parentless classes carry no obligation, so the
-                // checker skips them; recording them here is harmless.
-                self.class_carrier_locals.insert(key, (local.binding, name));
-            }
+        if let Some((key, local)) = key.zip(names.first()) {
+            self.record_class_carrier(key, &CarrierRef::Local(local.binding));
         }
+    }
+
+    /// The live inference type a carrier is currently bound to.
+    ///
+    /// A `local` carrier lives in the flow state; a global one has no binding
+    /// at all and lives in the globals map (#50).
+    fn carrier_ity(&self, carrier: &CarrierRef) -> Option<ITy> {
+        match carrier {
+            CarrierRef::Local(binding) => self.state.get(binding).cloned(),
+            CarrierRef::Global(name) => self.globals.get(name).cloned(),
+        }
+    }
+
+    /// Associate the table a `---@class` statement carries with the class it
+    /// declares, if the statement carries one.
+    ///
+    /// Shared by both carrier spellings — `local X = {}` and `Glob = {}` /
+    /// `X = {}` — because luals draws no distinction between them: the class
+    /// is carried by whatever the statement binds, and every later
+    /// `function X:m()` is a member of it (#50). A carrier that is not a table
+    /// shape (a call result, a re-assignment frozen by an annotation) records
+    /// nothing, exactly as before.
+    fn record_class_carrier(&mut self, key: Key, carrier: &CarrierRef) {
+        let Some(name) = self.env.declared_target(key) else {
+            return;
+        };
+        let name = name.to_string();
+        let Some(ITy::Shape(id)) = self.carrier_ity(carrier) else {
+            return;
+        };
+        self.shapes[id].declared = Some(name.clone());
+        // Appended, not overwritten: a class declared twice in one file is
+        // carried twice, and both carriers' members belong to it (#49). Pass 1
+        // re-walks the same statements and re-derives the same shape ids, so
+        // the list is kept a set.
+        let carriers = self.declared_carriers.entry(name.clone()).or_default();
+        if !carriers.contains(&id) {
+            carriers.push(id);
+        }
+        // A `---@class Name : Parent` carrier: record it so its final reified
+        // shape can be checked for `: Interface` conformance (#107) and folded
+        // into the file's exported class surface. Parentless classes carry no
+        // obligation, so the checker skips them; recording them is harmless.
+        self.class_carriers.insert(key, (carrier.clone(), name));
     }
 
     /// Whether a `local X = {…}` is a `---@type T` carrier (single name,
@@ -1489,27 +1630,63 @@ impl Infer<'_> {
             .iter()
             .map(|&t| self.resolve_target(body, t))
             .collect();
-        // `---@type fun(…)` positions ahead of the walk so a multi-assignment's
-        // function literals take their declared parameter types (#38). Only a
-        // function type over a function literal is covered — a `---@type` in
-        // any other position on an assignment is left exactly as before.
+        // A `---@type T` seeds the initializer in its slot before the value is
+        // walked, exactly as on a `local` — a `fun(…)` types a function
+        // literal's parameters, a class/table target types a table literal's
+        // members. Positional: slot `i` seeds target `i`.
         for (i, &value) in values.iter().enumerate() {
-            if matches!(self.body(body).expr(value), Expr::Function(_))
-                && let Some(sig) = declared_fn_sig(declared_tys.as_deref(), i)
-            {
-                self.seed_contextual(body, value, &Ty::Function(Box::new(sig)));
+            if let Some(ty) = declared_tys.as_ref().and_then(|t| t.get(i)) {
+                let ty = ty.clone();
+                self.seed_contextual(body, value, &ty);
             }
         }
-        let mut values = self.eval_values(body, values, Some(targets.len()));
-        for (i, value) in values.iter_mut().enumerate() {
-            if matches!(value, ITy::Func(_))
-                && let Some(sig) = declared_fn_sig(declared_tys.as_deref(), i)
+        let values = self.eval_values(body, values, Some(targets.len()));
+        // The annotation is *authoritative* for the slot it names (#48): the
+        // assigned target reads back as the declared type, not as whatever the
+        // initializer inferred. This is the `local` rule — `---@type string`
+        // over `local a = 1` declares `a: string` — applied to the other
+        // spellings of the same statement, which luals does not distinguish:
+        // `M.a = 1`, `M["a"] = 1`, `M.a.b = 1`, `G = 1`. `assign_into` still
+        // refuses to overwrite an already-declared local binding, so an
+        // annotation cannot silently redeclare one.
+        // Whether this statement carries a `---@class`, which changes how its
+        // first target is written: see below.
+        let carries_class = key.is_some_and(|k| self.env.declared_target(k).is_some());
+        for (i, target) in resolved.iter().enumerate() {
+            let value = match declared_tys.as_ref().and_then(|t| t.get(i)) {
+                Some(ty) => ITy::Ty(ty.clone()),
+                // A target with no value of its own (`a, b = f()` past the
+                // expansion) is left exactly as it was, not nil-ed.
+                None => match values.get(i) {
+                    Some(value) => value.clone(),
+                    None => continue,
+                },
+            };
+            // A global write normally *unions* with whatever the global held —
+            // globals are written from anywhere, so the conservative merge is
+            // right. A `---@class Glob = {}` carrier statement is the exception:
+            // it rebinds the carrier outright, so a variable carried twice
+            // answers with its most recent carrier, the way Lua resolves the
+            // name and the way the defs-side `carrier_var_classes` already
+            // answered (waves 3/4 — defs/project parity, #50). A `local`
+            // carrier already replaced, so this only aligns the global half.
+            if carries_class
+                && i == 0
+                && let Target::Global(name) = target
             {
-                *value = ITy::Ty(Ty::Function(Box::new(sig)));
+                self.globals.insert(name.clone(), value);
+            } else {
+                self.assign_into(target, value);
             }
         }
-        for (target, value) in resolved.into_iter().zip(values) {
-            self.assign_into(&target, value);
+        // `---@class` carried by an assignment — `Glob = {}` (a global, which
+        // has no binding to key on) or `X = {}` re-carrying an existing one
+        // (#50). Recorded after the assignment so the carrier's shape is the
+        // one this statement just bound.
+        if let Some((key, target)) = key.zip(resolved.first())
+            && let Some(carrier) = assign_carrier_ref(target)
+        {
+            self.record_class_carrier(key, &carrier);
         }
     }
 
@@ -1958,6 +2135,49 @@ fn declared_fn_sig(declared_tys: Option<&[Ty]>, index: usize) -> Option<Function
         Ty::Function(sig) => Some((**sig).clone()),
         _ => None,
     }
+}
+
+/// The carrier an assignment target names, for a `---@class` bound to an
+/// assignment statement (#50).
+///
+/// Only a whole variable carries a class — a global (`Glob = {}`, which has no
+/// binding, hence the name key) or a local re-assigned in place (`M = {}`).
+/// A field, index or opaque target names no variable and carries nothing,
+/// matching [`crate::env::carrier_var_name`], the defs-side half of the same
+/// rule.
+fn assign_carrier_ref(target: &Target) -> Option<CarrierRef> {
+    match target {
+        Target::Binding { id, .. } => Some(CarrierRef::Local(*id)),
+        Target::Global(name) => Some(CarrierRef::Global(name.clone())),
+        _ => None,
+    }
+}
+
+/// Fold a second carrier's reified shape into the first's, for a class carried
+/// by more than one table in one file (#49).
+///
+/// Member-wise union, **first carrier wins** a same-name collision — the rule
+/// [`TypeEnv::merge_file_types`] applies to the cross-file case and
+/// [`TypeEnv::absorb_block`] to duplicate `---@field`s, so a class's members
+/// resolve the same way however they were split up. A carrier that reified to
+/// something other than a table contributes nothing.
+fn union_carrier_shapes(first: Ty, second: Ty) -> Ty {
+    let (mut first_table, second_table) = match (first, second) {
+        (Ty::Table(f), Ty::Table(s)) => (f, s),
+        (first, _) => return first,
+    };
+    for (name, field) in second_table.fields {
+        first_table.fields.entry(name).or_insert(field);
+    }
+    for indexer in second_table.indexers {
+        if !first_table.indexers.contains(&indexer) {
+            first_table.indexers.push(indexer);
+        }
+    }
+    if first_table.array.is_none() {
+        first_table.array = second_table.array;
+    }
+    Ty::Table(first_table)
 }
 
 fn first_value(rets: &[ITy], open: bool) -> ITy {

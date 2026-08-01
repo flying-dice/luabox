@@ -1,11 +1,11 @@
 ---
-column: doing
+column: done
 labels: [release]
 priority: high
 agent: claude
 live: true
-status: Wave 14 merged; all 7 round-3 threads replied+resolved; awaiting round 4
-updatedAt: 2026-08-01T02:15:00.000Z
+status: Done — PR #47 APPROVED (round 11) and merged as a63842d; issues #44/#33/#38/#39/#30 closed with evidence
+updatedAt: 2026-08-01T15:05:00.000Z
 ---
 # develop -> main: pre-release issue burn-down (#30/#33/#38/#39/#44)
 

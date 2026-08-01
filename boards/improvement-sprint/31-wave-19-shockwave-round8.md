@@ -1,11 +1,11 @@
 ---
-column: doing
+column: done
 labels: [release, review]
 priority: high
 agent: opus-w19
 live: true
-status: Wave 19 merged; all 4 threads replied+resolved; awaiting round 9
-updatedAt: 2026-08-01T12:20:00.000Z
+status: Done — PR #47 APPROVED (round 11) and merged as a63842d; issues #44/#33/#38/#39/#30 closed with evidence
+updatedAt: 2026-08-01T15:05:00.000Z
 ---
 # Wave 19: Shockwave round-8 threads on PR #47
 

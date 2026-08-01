@@ -278,19 +278,12 @@ impl TypeEnv {
             lowerer.generics = block_generics(item);
             env.absorb_block(item, &mut lowerer, &root);
         }
-        // The classes this file itself declares (the `package`-visibility test,
-        // #115) and the standalone `---@private`/`---@protected`/`---@package`
-        // visibility on `function Class:method` doc blocks, resolved once every
-        // class in the file is known.
-        for item in items {
-            for tag in &item.block.tags {
-                if let Tag::Class(c) = tag
-                    && !c.name.is_empty()
-                {
-                    env.local_classes.insert(c.name.clone());
-                }
-            }
-        }
+        // The standalone `---@private`/`---@protected`/`---@package` visibility
+        // on `function Class:method` doc blocks, resolved once every class in
+        // the file is known. (`local_classes` — the classes this file itself
+        // declares, the `package`-visibility test of #115 — is filled by
+        // `absorb_block` as each `---@class` is seen, because the duplicate
+        // merge of #49 needs it during the walk, not after it.)
         env.absorb_standalone_visibility(items, &root);
         // Inline `--[[@as T]]` casts: anchor each to the end offset of the
         // expression it directly follows (skipping back over whitespace).
@@ -402,29 +395,56 @@ impl TypeEnv {
                             existing.parents.push(parent.clone());
                         }
                     }
+                    // Type parameters follow the same first-wins rule as
+                    // members, with the same allowance the in-file merge makes:
+                    // a declaration that named none has none to keep.
+                    if existing.params.is_empty() {
+                        existing.params.clone_from(&def.params);
+                    }
+                    // …and one that spells them differently is unified
+                    // **positionally**, exactly as two declarations in one file
+                    // are, so its field bodies still substitute at an
+                    // instantiation site instead of leaking the other
+                    // declaration's parameter name through the merged class.
+                    let rename = (!def.params.is_empty() && def.params != existing.params)
+                        .then(|| positional_rename(&def.params, &existing.params));
+                    let subst = |field: &FieldTy| match &rename {
+                        Some(map) => FieldTy {
+                            ty: crate::generics::subst_ty(&field.ty, map),
+                            optional: field.optional,
+                        },
+                        None => field.clone(),
+                    };
                     for (field, ty) in &def.fields {
                         existing
                             .fields
                             .entry(field.clone())
-                            .or_insert_with(|| ty.clone());
+                            .or_insert_with(|| subst(ty));
                     }
                     for (member, ty) in &def.methods {
                         // As in [`FileTypes::collect`]: the existing `---@field`
                         // declaration wins on type, but inherits the incoming
                         // attachment's use-site tags (#33).
                         if let Some(declared) = existing.fields.get(member) {
-                            let merged = with_carrier_tags(declared, ty);
+                            let merged = with_carrier_tags(declared, &subst(ty));
                             existing.fields.insert(member.clone(), merged);
                         } else {
                             existing
                                 .methods
                                 .entry(member.clone())
-                                .or_insert_with(|| ty.clone());
+                                .or_insert_with(|| subst(ty));
                         }
                     }
-                    for indexer in &def.indexers {
-                        if !existing.indexers.contains(indexer) {
-                            existing.indexers.push(indexer.clone());
+                    for (key, value) in &def.indexers {
+                        let indexer = match &rename {
+                            Some(map) => (
+                                crate::generics::subst_ty(key, map),
+                                crate::generics::subst_ty(value, map),
+                            ),
+                            None => (key.clone(), value.clone()),
+                        };
+                        if !existing.indexers.contains(&indexer) {
+                            existing.indexers.push(indexer);
                         }
                     }
                     for (op, sigs) in &def.operators {
@@ -646,6 +666,10 @@ impl TypeEnv {
         root: &SyntaxNode,
     ) {
         let mut current_class: Option<String> = None;
+        // The positional unification a re-declaration's field bodies need when
+        // it spells the class's type parameters differently from the canonical
+        // (first) list — `None` while the two agree, which is the common case.
+        let mut class_rename: Option<BTreeMap<String, Ty>> = None;
         let mut params: Vec<&ParamTag> = Vec::new();
         let mut returns: Vec<&ReturnTag> = Vec::new();
         // Legacy `---@vararg Type`: the deprecated EmmyLua spelling of
@@ -692,7 +716,7 @@ impl TypeEnv {
                         .and_then(crate::version::VersionReq::parse);
                 }
                 Tag::Class(c) if !c.name.is_empty() => {
-                    let parents = c
+                    let parents: Vec<String> = c
                         .parents
                         .iter()
                         .filter_map(|p| match &p.kind {
@@ -708,17 +732,64 @@ impl TypeEnv {
                     for parent in &c.parents {
                         lowerer.lower(parent);
                     }
-                    self.classes.insert(
-                        c.name.clone(),
-                        ClassDef {
-                            parents,
-                            params: c.params.clone(),
-                            ..ClassDef::default()
-                        },
-                    );
+                    // Two declarations of one class in the same file are two
+                    // halves of one intent, exactly as two declarations across
+                    // files are: they **union** (#49). Before this, the second
+                    // declaration replaced the first and every member it had
+                    // collected vanished — a merge rule that depended on the
+                    // file boundary, which luals has no notion of.
+                    //
+                    // The *first* declaration in this file still replaces any
+                    // ambient (stdlib / `[types] defs`) class of the same name
+                    // whole: that is the escape hatch (see
+                    // `Ambient::with_rock_types`), a different axis from
+                    // duplicate declarations in code the user wrote.
+                    // `local_classes` — the set of names *this file* declares —
+                    // is what tells the two apart, so it is filled here rather
+                    // than in a later sweep.
+                    if self.local_classes.insert(c.name.clone()) {
+                        self.classes.insert(
+                            c.name.clone(),
+                            ClassDef {
+                                parents,
+                                params: c.params.clone(),
+                                ..ClassDef::default()
+                            },
+                        );
+                    } else if let Some(existing) = self.classes.get_mut(&c.name) {
+                        for parent in parents {
+                            if !existing.parents.contains(&parent) {
+                                existing.parents.push(parent);
+                            }
+                        }
+                        // A re-declaration may name the type parameters the
+                        // first one omitted; it never renames them (first-wins,
+                        // as for every other member).
+                        if existing.params.is_empty() {
+                            existing.params.clone_from(&c.params);
+                        }
+                    }
+                    // A re-declaration's `---@field` bodies are written against
+                    // the type parameters *it* names, so when those differ from
+                    // the canonical list they are unified **positionally** as
+                    // the fields are absorbed: slot `i` is one type variable
+                    // however the two declarations spell it. Without this the
+                    // merged class carries a field typed by a name its own
+                    // parameter list never mentions, and instantiating it
+                    // leaves that name unsubstituted — visible across the
+                    // `require` boundary, where the merged class is what the
+                    // consumer sees.
+                    class_rename = self
+                        .classes
+                        .get(&c.name)
+                        .filter(|def| !c.params.is_empty() && def.params != c.params)
+                        .map(|def| positional_rename(&c.params, &def.params));
                     current_class = Some(c.name.clone());
+                    // First-wins, matching the fields: the "declared here"
+                    // label points at the declaration that introduced the name.
                     self.class_decl_spans
-                        .insert(c.name.clone(), c.span.start..c.span.end);
+                        .entry(c.name.clone())
+                        .or_insert(c.span.start..c.span.end);
                     if let Some(span) = item.target {
                         self.declared_targets
                             .insert((span.start, span.end), c.name.clone());
@@ -734,8 +805,27 @@ impl TypeEnv {
                         continue; // a stray @field outside a @class block
                     };
                     let ty = lowerer.lower(&f.ty);
+                    let ty = match &class_rename {
+                        Some(map) => crate::generics::subst_ty(&ty, map),
+                        None => ty,
+                    };
                     match &f.key {
                         FieldKey::Name(name) => {
+                            // **First declaration wins**, whether the duplicate
+                            // sits in this `---@class` block, in a second block
+                            // for the same class in this file (#49), or in
+                            // another file (`TypeEnv::merge_file_types`, which
+                            // has always been first-wins). `LB0311`
+                            // (`duplicate-doc-field`) already promised exactly
+                            // this in its note — "the first declaration wins;
+                            // remove or rename this one" — and now the stored
+                            // type agrees with the message. luals unions the
+                            // two declared types instead; luabox keeps the
+                            // first deterministically and warns, the same trade
+                            // it makes for duplicate aliases and enums (#110).
+                            if class.fields.contains_key(name) {
+                                continue;
+                            }
                             class.fields.insert(
                                 name.clone(),
                                 FieldTy {
@@ -746,8 +836,8 @@ impl TypeEnv {
                             // Record a non-public `---@field <scope>` modifier
                             // for the visibility check (#115). A plain (public)
                             // field is left out of the map — and clears any
-                            // inherited restriction — so a later same-name
-                            // public re-declaration reads as public.
+                            // inherited restriction — so a same-name public
+                            // re-declaration on a *subclass* reads as public.
                             match f.scope {
                                 Some(FieldScope::Public) | None => {
                                     class.visibility.remove(name);
@@ -759,6 +849,10 @@ impl TypeEnv {
                         }
                         FieldKey::Indexer(key) => {
                             let key = lowerer.lower(key);
+                            let key = match &class_rename {
+                                Some(map) => crate::generics::subst_ty(&key, map),
+                                None => key,
+                            };
                             class.indexers.push((key, ty));
                         }
                     }
@@ -841,6 +935,11 @@ impl TypeEnv {
                 nodiscard,
                 is_async,
                 version,
+                // A signature was *written* here, so calls may be checked
+                // against it — including from another module, where this flag
+                // is the only surviving evidence that a human wrote one (#46).
+                // A block carrying only use-site flags declares no signature.
+                declared: has_sig_tags,
                 ..FunctionTy::default()
             };
             // With no signature tags the block contributes only the flag:
@@ -1392,6 +1491,21 @@ fn resolve_callable_target(stmt: &Stmt) -> Option<(Option<String>, Option<lua::a
                 f.param_list(),
             ))
         }
+        // `return function(…) end` — a module whose entire export *is* a
+        // function, the `direct` row of #46's table. The doc block above the
+        // `return` binds to the function value exactly as it does above a
+        // `local f = function(…) end`, so a single-function module can carry a
+        // signature at all; without this its `---@param`s bind to nothing and
+        // the module is unchecked in its own file as well as in every
+        // consumer. No name to register under — the function is reached only
+        // through `require`, never by a dotted name in this file.
+        Stmt::Return(ret) => {
+            let value = ret.exprs().and_then(|v| v.exprs().next());
+            let Some(Expr::Function(f)) = value else {
+                return None;
+            };
+            Some((None, f.param_list()))
+        }
         // `Carrier.m = function(…) end` / `g = function(…) end` — the
         // assignment spelling of a function definition. luals binds a doc
         // block's `---@param`/`---@return`/`---@deprecated` to the function
@@ -1552,42 +1666,175 @@ fn collect_generic_classes(
             );
         }
     }
+    // The *canonical* parameter list for each name — first non-empty
+    // declaration wins, matching every other first-wins rule in the file.
+    // Collected ahead of the templates so a *bare* `---@class Name` block that
+    // only adds members is recognised as a declaration of the generic class
+    // rather than of some unrelated plain one, whichever order the two appear
+    // in. It fixes the merged template's parameter *names and arity*; it is
+    // deliberately NOT the list a declaration's own field bodies resolve
+    // against (see below).
+    let mut params_of: BTreeMap<&str, &Vec<String>> = BTreeMap::new();
     for item in items {
         for tag in &item.block.tags {
             let Tag::Class(c) = tag else { continue };
-            if c.params.is_empty() || c.name.is_empty() {
+            if c.name.is_empty() || c.params.is_empty() {
                 continue;
             }
-            let template = lower_class_template(&item.block.tags, &c.name, &c.params, lowerer);
-            out.insert(
-                c.name.clone(),
-                GenericClass {
-                    params: c.params.clone(),
-                    template,
-                },
-            );
+            params_of.entry(&c.name).or_insert(&c.params);
         }
     }
+    // Every declaration of a generic name contributes its members, unioning
+    // first-wins — duplicate `---@class` declarations merge here exactly as
+    // they do in `absorb_block` (#49); before this the last one replaced the
+    // template and the earlier declarations' fields vanished from it. The
+    // file's *first* declaration still replaces an ambient generic class of
+    // the same name whole (the `[types] defs` escape hatch).
+    //
+    // Each declaration's `---@field` bodies are lowered against the parameter
+    // list *that declaration* declares — its type parameters are scoped to it,
+    // exactly as luals scopes them — and the resulting templates are unified
+    // *positionally* as they merge: a second declaration's slot-0 parameter is
+    // the same type variable as the first's, whatever the two are spelled.
+    // Handing the canonical list to every declaration instead resolved a
+    // renamed duplicate's own, valid annotation against names that were never
+    // in scope for it, reporting LB0305 on it.
+    //
+    // This pass is template *construction*, not diagnosis: the main
+    // `absorb_block` walk lowers every one of these `---@field` bodies again
+    // and is the sole reporter for them, so whatever this pass records is
+    // rolled back below. Leaving it in would double-report a field whose type
+    // name is genuinely unknown, once per pass.
+    let quiet = QuietMark::of(lowerer);
+    let mut claimed: HashSet<&str> = HashSet::new();
+    for item in items {
+        for (i, tag) in item.block.tags.iter().enumerate() {
+            let Tag::Class(c) = tag else { continue };
+            let Some(canonical) = params_of.get(c.name.as_str()).copied() else {
+                continue;
+            };
+            // A bare re-declaration declares no parameters of its own, so it
+            // borrows the canonical ones — there is nothing to rename.
+            let own: &[String] = if c.params.is_empty() {
+                canonical
+            } else {
+                &c.params
+            };
+            let mut template = lower_class_template(&item.block.tags, i, own, lowerer);
+            if own != canonical.as_slice() {
+                template = rename_template_params(&template, own, canonical);
+            }
+            if claimed.insert(&c.name) {
+                out.insert(
+                    c.name.clone(),
+                    GenericClass {
+                        params: canonical.clone(),
+                        template,
+                    },
+                );
+            } else if let Some(existing) = out.get_mut(&c.name) {
+                for (name, field) in template.fields {
+                    existing.template.fields.entry(name).or_insert(field);
+                }
+                for indexer in template.indexers {
+                    if !existing.template.indexers.contains(&indexer) {
+                        existing.template.indexers.push(indexer);
+                    }
+                }
+            }
+        }
+    }
+    quiet.rollback(lowerer);
     out
 }
 
-/// Lower one generic class's own `---@field`s into a template table, with its
-/// `<T>` params in scope so each `T` becomes a `Ty::Named(T)` placeholder.
-/// Fields between the class's tag and the next `---@class` in the block belong
-/// to it (mirrors [`TypeEnv::absorb_block`]'s `current_class` tracking).
+/// The lengths of a [`Lowerer`]'s diagnostic buffers before a lowering that is
+/// performed only to *build* a type, so anything it records can be discarded.
+struct QuietMark {
+    unknown_names: usize,
+    arity_errors: usize,
+    cyclic_aliases: usize,
+}
+
+impl QuietMark {
+    fn of(lowerer: &Lowerer<'_>) -> Self {
+        QuietMark {
+            unknown_names: lowerer.unknown_names.len(),
+            arity_errors: lowerer.arity_errors.len(),
+            cyclic_aliases: lowerer.cyclic_aliases.len(),
+        }
+    }
+
+    fn rollback(self, lowerer: &mut Lowerer<'_>) {
+        lowerer.unknown_names.truncate(self.unknown_names);
+        lowerer.arity_errors.truncate(self.arity_errors);
+        lowerer.cyclic_aliases.truncate(self.cyclic_aliases);
+    }
+}
+
+/// The substitution that carries one declaration's type-variable names onto
+/// the canonical ones, matched by **position**: `own[i]` and `canonical[i]`
+/// are one type variable however the two declarations spell it.
+///
+/// A surplus parameter (the declaration names more than the canonical list has
+/// slots for) has no canonical variable to become, so it maps to `unknown` —
+/// the same leniency a bare generic reference gets for the arguments it omits,
+/// rather than a dangling placeholder no instantiation could ever substitute.
+fn positional_rename(own: &[String], canonical: &[String]) -> BTreeMap<String, Ty> {
+    own.iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let to = canonical
+                .get(i)
+                .map_or(Ty::Unknown, |c| Ty::Named(c.clone()));
+            (name.clone(), to)
+        })
+        .collect()
+}
+
+/// Rewrite one declaration's type-variable placeholders onto the canonical
+/// parameter names, **positionally** — `own[i]` and `canonical[i]` name the
+/// same type variable, so `---@class Boxed<U>`'s field typed `U` becomes the
+/// canonical `T` before the templates merge.
+///
+/// A surplus parameter (the declaration names more than the canonical list
+/// has slots for) has no canonical variable to become, so it collapses to
+/// `unknown` — the same leniency a bare generic reference gets for the
+/// arguments it omits, rather than a dangling placeholder no instantiation
+/// could ever substitute.
+fn rename_template_params(template: &TableTy, own: &[String], canonical: &[String]) -> TableTy {
+    let map = positional_rename(own, canonical);
+    match crate::generics::subst_ty(&Ty::Table(Box::new(template.clone())), &map) {
+        Ty::Table(table) => *table,
+        // `subst_ty` maps a `Ty::Table` to a `Ty::Table`; this arm is
+        // unreachable, and falling back to the un-renamed template keeps the
+        // function total without a panic.
+        _ => template.clone(),
+    }
+}
+
+/// Lower the `---@field`s belonging to the `---@class` at `tags[class]` into a
+/// template table, with that declaration's `<T>` params in scope so each `T`
+/// becomes a `Ty::Named(T)` placeholder.
+///
+/// Ownership is **positional**: the fields between the class's tag and the next
+/// `---@class` in the block are its own (mirrors [`TypeEnv::absorb_block`]'s
+/// `current_class` tracking). Matching on the class *name* instead cannot tell
+/// two declarations of one name apart when both sit in a single block, and so
+/// handed each of them the other's fields — harmless while both were lowered
+/// against one parameter list, wrong once each has its own.
 fn lower_class_template(
     tags: &[Tag],
-    class_name: &str,
+    class: usize,
     params: &[String],
     lowerer: &mut Lowerer<'_>,
 ) -> TableTy {
     let saved = std::mem::replace(&mut lowerer.generics, params.iter().cloned().collect());
     let mut table = TableTy::default();
-    let mut active = false;
-    for tag in tags {
+    for tag in tags.iter().skip(class + 1) {
         match tag {
-            Tag::Class(c) => active = c.name == class_name,
-            Tag::Field(f) if active => {
+            Tag::Class(_) => break,
+            Tag::Field(f) => {
                 let ty = lowerer.lower(&f.ty);
                 match &f.key {
                     FieldKey::Name(name) => {

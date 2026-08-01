@@ -146,6 +146,9 @@ enum Command {
         /// Apply machine-applicable fixes
         #[arg(long)]
         fix: bool,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = FormatArg::Human)]
+        format: FormatArg,
     },
     /// Format Lua sources canonically
     Fmt {
@@ -333,7 +336,9 @@ fn run(command: Command) -> anyhow::Result<()> {
             format.into(),
             watch,
         ),
-        Command::Lint { fix } => lint_cmd::run(&std::env::current_dir()?, fix),
+        Command::Lint { fix, format } => {
+            lint_cmd::run(&std::env::current_dir()?, fix, format.into())
+        }
         Command::Fmt { check, watch } => fmt_cmd::run(&std::env::current_dir()?, check, watch),
         Command::Build {
             target,
@@ -658,16 +663,58 @@ mod tests {
     }
 
     #[test]
-    fn lint_takes_an_optional_fix_flag() {
-        let Command::Lint { fix } = parse(&["lint"]) else {
+    fn lint_takes_an_optional_fix_flag_and_defaults_to_the_human_format() {
+        let Command::Lint { fix, format } = parse(&["lint"]) else {
             panic!("expected Lint");
         };
         assert!(!fix);
+        assert_eq!(format, FormatArg::Human);
 
-        let Command::Lint { fix } = parse(&["lint", "--fix"]) else {
+        let Command::Lint { fix, format } = parse(&["lint", "--fix"]) else {
             panic!("expected Lint");
         };
         assert!(fix);
+        assert_eq!(format, FormatArg::Human);
+    }
+
+    /// `lint` carries the same closed `--format` set as `check` — the two
+    /// produce the same `Diagnostic` type and share one renderer (#53).
+    #[test]
+    fn lint_accepts_every_format_check_does_and_composes_with_fix() {
+        for (spelling, expected) in [
+            ("human", FormatArg::Human),
+            ("json", FormatArg::Json),
+            ("sarif", FormatArg::Sarif),
+            ("github", FormatArg::Github),
+            ("gitlab", FormatArg::Gitlab),
+        ] {
+            let Command::Lint { fix, format } = parse(&["lint", "--format", spelling]) else {
+                panic!("expected Lint");
+            };
+            assert!(!fix);
+            assert_eq!(format, expected, "for `{spelling}`");
+        }
+
+        let Command::Lint { fix, format } = parse(&["lint", "--fix", "--format", "sarif"]) else {
+            panic!("expected Lint");
+        };
+        assert!(fix);
+        assert_eq!(format, FormatArg::Sarif);
+    }
+
+    /// The review's probe: an unknown `lint --format` is clap's usage error
+    /// (exit 2), exactly as it is for `check` — never a silent fallback, and
+    /// never `--format` itself being rejected as an unknown argument.
+    #[test]
+    fn lint_rejects_an_unknown_format_the_same_way_check_does() {
+        assert_eq!(
+            reject(&["lint", "--format", "xml"]),
+            clap::error::ErrorKind::InvalidValue
+        );
+        assert_eq!(
+            reject(&["lint", "--format"]),
+            clap::error::ErrorKind::InvalidValue
+        );
     }
 
     #[test]

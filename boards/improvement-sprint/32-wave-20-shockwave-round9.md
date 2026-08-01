@@ -1,11 +1,11 @@
 ---
-column: doing
+column: done
 labels: [release, review]
 priority: high
 agent: opus-w20
 live: true
-status: Round 10 sweep fixed directly; awaiting round 11 / approval
-updatedAt: 2026-08-01T14:45:00.000Z
+status: Done — PR #47 APPROVED (round 11) and merged as a63842d; issues #44/#33/#38/#39/#30 closed with evidence
+updatedAt: 2026-08-01T15:05:00.000Z
 ---
 # Wave 20: Shockwave round-9 threads on PR #47
 

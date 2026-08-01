@@ -177,7 +177,7 @@ anything load-bearing.
 | `init` / `new` | scaffold a project (`--lib`, `--edition 5.1..5.4\|luajit`) |
 | `check` | typecheck: LuaCATS + rich inference, dialect legality, `goto`/label/`break` legality, `--target`, `--watch`, `--format json\|sarif\|github\|gitlab` |
 | `fmt` | canonical formatter for `.lua` (`--check`, `--watch`) |
-| `lint` | type-informed rules, `---@luabox-ignore`, per-rule `[lint]` levels |
+| `lint` | type-informed rules, `---@luabox-ignore`, per-rule `[lint]` levels, `--fix`, `--format json\|sarif\|github\|gitlab` |
 | `build` | one tsc/esbuild-style emit driven by `[build]`: lower `edition → target` (goto, bitops, `<close>`, `_ENV`, …) with tree-shaken polyfills; `bundle = true` inlines the require graph into one file per `entry` (`--minify`, `--sourcemap`); `mode = love\|nvim-plugin` packages a `.love` / Neovim plugin. Flags (`--target`/`--out`/`--outfile`/`--entry`/`--bundle`/`--no-bundle`/`--sourcemap`/`--minify`/`--mode`) override config |
 | `unmap` | decode a production traceback back to source lines via the `<bundle>.map` that `build --sourcemap` writes next to the bundle |
 | `upgrade` | self-update from GitHub releases (`luabox upgrade` for latest, or a specific `v0.1.1`), checksum-verified |
@@ -283,8 +283,26 @@ every `---@class`, `---@enum` and `---@alias` they declare, plus the type a
 `require` of each module evaluates to. No `[dependencies]` entry, no
 per-package `luabox.toml`, no `[types] defs`. The rock's classes become
 nameable and enforced in your code, `local m = require("rock")` carries the
-module's annotated return types, and misuse is reported at *your* use site
-(the editor sees the same surfaces, so hover and completion agree with CI).
+module's annotated return types, and misuse is reported at *your* use site.
+
+The editor reads those surfaces through the same resolver the type pass
+does, so a `require` binding hovers and completes with the type CI checks
+it against (#54): `local m = require("rock")` shows the module's export
+type, `m.helper` shows that member's, and `m.` offers the members. Two
+things are `unknown` on both sides, by design rather than by omission — a
+dynamic `require(name)`, and `require("a") or require("b")`, name no module
+statically. A module whose export is a `---@class` is the one shape that
+does not fully close, in both of its spellings: the class's fields are
+declared in the module's own file, beyond the reach of the editor's
+per-file view, so the module's members get no hover and no completion
+either way. What is left of the binding differs between the two, and the
+difference is measured rather than assumed — a class *instance* export
+still hovers as the class name while `luabox check` fully enforces it; a
+class *carrier* export hovers as the structural table the carrier is, which
+is also all CI gets. Both are written out side by side in
+[Known limitations](docs/03-reference/02-limitations.md). Naming the class
+directly (`---@param p Point`) enforces it on both sides — class names are
+workspace-global, so the `require` is not what carries the type.
 
 Surfaces only — a vendored body is never typechecked. A type error inside a
 rock is not your problem and produces nothing; a rock source that does not

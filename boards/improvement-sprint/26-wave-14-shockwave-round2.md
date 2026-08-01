@@ -1,11 +1,11 @@
 ---
-column: doing
+column: done
 labels: [wave, review-round]
 priority: high
 agent: opus-w14
 live: true
-status: launching
-updatedAt: 2026-08-01T09:40:00.000Z
+status: Done — PR #47 APPROVED (round 11) and merged as a63842d; issues #44/#33/#38/#39/#30 closed with evidence
+updatedAt: 2026-08-01T15:05:00.000Z
 ---
 # Wave 14 — Shockwave round-2 threads on PR #47
 

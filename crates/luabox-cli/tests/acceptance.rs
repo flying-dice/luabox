@@ -461,6 +461,101 @@ fn no_gitlab_finding_on_line(world: &mut AcceptanceWorld, line: u64) {
     );
 }
 
+/// GitLab's Code Quality parser rejects an issue with a missing or empty
+/// required field — `location.path: ""` above all — so a report can be valid
+/// JSON, look plausible, and be thrown away whole. `stdout is valid JSON`
+/// cannot see that; this asserts the format's actual contract.
+#[then("the gitlab report satisfies the code quality schema")]
+fn gitlab_report_is_schema_valid(world: &mut AcceptanceWorld) {
+    const SEVERITIES: [&str; 5] = ["info", "minor", "major", "critical", "blocker"];
+    let stdout = world.stdout();
+    let issues = gitlab_issues(&stdout);
+    assert!(!issues.is_empty(), "an empty report proves nothing");
+    for issue in &issues {
+        for field in ["description", "check_name", "fingerprint"] {
+            let value = issue[field].as_str().unwrap_or_else(|| {
+                panic!("`{field}` is missing or not a string in {issue}\nstdout:\n{stdout}")
+            });
+            assert!(!value.is_empty(), "`{field}` is empty in {issue}");
+        }
+        let severity = issue["severity"].as_str().unwrap_or_default();
+        assert!(
+            SEVERITIES.contains(&severity),
+            "`{severity}` is not a GitLab severity in {issue}"
+        );
+        let path = issue["location"]["path"].as_str().unwrap_or_default();
+        assert!(
+            !path.is_empty(),
+            "`location.path` is empty — GitLab drops this issue: {issue}"
+        );
+        let begin = issue["location"]["lines"]["begin"].as_u64().unwrap_or(0);
+        assert!(begin >= 1, "`location.lines.begin` is {begin} in {issue}");
+    }
+}
+
+/// Fingerprints are GitLab's identity for a finding: one per issue, and two
+/// issues must never share one or the report silently loses a finding.
+#[then("every gitlab fingerprint is distinct")]
+fn gitlab_fingerprints_are_distinct(world: &mut AcceptanceWorld) {
+    let stdout = world.stdout();
+    let issues = gitlab_issues(&stdout);
+    let mut prints: Vec<&str> = issues
+        .iter()
+        .map(|issue| issue["fingerprint"].as_str().unwrap_or_default())
+        .collect();
+    let total = prints.len();
+    prints.sort_unstable();
+    prints.dedup();
+    assert_eq!(
+        prints.len(),
+        total,
+        "{} of {total} fingerprints collide — GitLab keeps one issue per \
+         fingerprint, so the rest are dropped; stdout:\n{stdout}",
+        total - prints.len()
+    );
+}
+
+/// Every machine format has to carry a finding's **severity** faithfully,
+/// whatever the command's own exit code did with it: `lint` exits 0 on a
+/// warn-tier finding, so a CI consumer that wants to gate on warnings can
+/// only do so by reading the severity back out of the report.
+///
+/// One step over the three JSON-shaped formats, since the contract is one
+/// contract and only the spelling of the two fields differs.
+#[then(expr = "the {word} report marks {string} as {string}")]
+fn report_marks_severity(world: &mut AcceptanceWorld, format: String, code: String, level: String) {
+    let stdout = world.stdout();
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout is not JSON: {e}\nstdout:\n{stdout}"));
+    // (the code field, the severity field, the findings) per format.
+    let (code_key, level_key, findings) = match format.as_str() {
+        "json" => ("code", "severity", value.as_array().cloned()),
+        "gitlab" => ("check_name", "severity", value.as_array().cloned()),
+        "sarif" => (
+            "ruleId",
+            "level",
+            value["runs"][0]["results"].as_array().cloned(),
+        ),
+        other => panic!("no severity contract defined for the `{other}` format"),
+    };
+    let findings = findings.unwrap_or_else(|| panic!("no findings array\nstdout:\n{stdout}"));
+    let matching: Vec<&serde_json::Value> = findings
+        .iter()
+        .filter(|f| f[code_key].as_str() == Some(code.as_str()))
+        .collect();
+    assert!(
+        !matching.is_empty(),
+        "no `{code}` finding in the {format} report; stdout:\n{stdout}"
+    );
+    for finding in matching {
+        assert_eq!(
+            finding[level_key].as_str(),
+            Some(level.as_str()),
+            "`{code}` is not reported as `{level}` in {finding}"
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // @wip gates feature files written ahead of implementation (spec-first,

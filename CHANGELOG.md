@@ -8,8 +8,214 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ## [Unreleased]
 
+### Added
+
+- **`luabox lint --format json|sarif|github|gitlab`.** `lint` had no
+  `--format` at all, so `luabox lint --format json` exited 2 — clap rejecting
+  an unknown argument, the "you invoked me wrong" code rather than a verdict —
+  while `check` carried the full surface. `lint` now takes the same closed set
+  through the same renderer; the two commands produce the same diagnostic
+  values, so a second rendering path for them could only be a way to disagree.
+  Lint's exit-code semantics are untouched (SPEC.md §9): a warn-tier finding
+  still exits 0. That is precisely why the machine formats carry severity
+  faithfully — a CI consumer that wants to gate on warnings reads the severity
+  back out of the report and decides for itself, rather than having luabox
+  decide for it. A `[lint]` deny escalation moves both together: reported as an
+  error, and exit 1. A clean project emits a well-formed *empty* document, as
+  `check` already did, so a consumer that unconditionally parses stdout does
+  not break on the happy path (refs #53).
+
 ### Fixed
 
+- **A generic `---@class`'s type parameters are scoped to the declaration that
+  writes them.** Two declarations of one generic class may spell the parameter
+  differently — `---@class Boxed<T>` with `---@field value T` beside
+  `---@class Boxed<U>` with `---@field other U` — and luals resolves each
+  declaration's field bodies against its own list. luabox handed the *first*
+  non-empty list to every declaration of the name, so a renamed duplicate's
+  own, valid annotation was reported as `LB0305` "unknown type name". Each
+  declaration now lowers against its own parameters and the shapes are unified
+  **positionally** as they merge: slot 0 is one type variable however the two
+  spell it, so `Boxed<string>` makes both `value` and `other` `string`. Three
+  merge points needed the rule and all three carry it — the instantiation
+  templates, the class definition that crosses the `require` boundary, and the
+  workspace-global class two files build. A declaration naming *another*
+  declaration's parameter is still `LB0305`; the scoping cuts both ways, as it
+  does in luals (refs #49).
+- **A trailing parameter whose type admits `nil` is optional for arity.**
+  `---@param b number|nil` and `---@param b? number` say the same thing about
+  what may reach `b`, and Lua supplies `nil` for every argument the caller left
+  off — so omitting it is the call the annotation permits, which is what luals
+  concludes. Only the `?` spelling was counted, so `f(1)` against
+  `f(a: number, b: number|nil)` reported `LB0301`. The rule lands on every
+  arity path at once (direct, method, overload selection, cross-module).
+  Deliberately narrow in two directions, both documented: only a *trailing* run
+  is optional, and "admits `nil`" means the type says `nil` — `any` and
+  `unknown` decline to constrain the parameter rather than declaring it
+  omittable, so they stay required (refs #46).
+- **A string receiver's members resolve through the `string` library.** Every
+  string in a Lua state shares one metatable whose `__index` is the `string`
+  table, so `s:upper()` *is* `string.upper(s)`. The free-function spelling
+  typed; the receiver-method spelling produced `unknown`, which surfaced as
+  `LB0300` "found `unknown`" wherever the result was used — for every string
+  method. Now `s:upper()` is `string`, `s:byte()` is `integer`,
+  `s:match(p)` is `string|nil`, and the arguments are checked with the receiver
+  bound (`s:rep("three")` is `LB0300`, `s:sub()` is `LB0301`). A member the
+  library does not declare is `LB0306` in both the `:` and `.` spellings, as it
+  is at runtime, and a project that writes `function string.trim(s)` gets
+  `s:trim()` — also as at runtime (refs #46).
+
+### Documentation
+
+- **The `---@class` module-export edge is written out where the other
+  editor/CI edges are.** The disclosure lived only in `README.md`, and it was
+  inaccurate: it described a class *carrier* module as hovering "as the class
+  name" with CI "still checking" its members. Measured, the carrier spelling
+  hovers as the structural table the carrier is, and CI does not enforce it
+  either — `p.x` crosses the boundary as `unknown` and `p.nope` is accepted.
+  The class *instance* spelling is the one where the editor is narrower than
+  CI. Both rows are now in `docs/03-reference/02-limitations.md` as a measured
+  table, pinned by fixtures on both sides, and the `requires.rs` doc comment
+  that made the same claim is corrected to match (refs #54).
+
+- **Hover and completion on a `require` binding now use the type pass's
+  answer.** `local m = require("mod")` hovered `unknown` while `luabox check`
+  and the server's own diagnostics resolved the module's export type for that
+  very binding — two `require` resolvers, and the editor asked the one that had
+  never heard of cross-file modules (the per-file LuaCATS harvest). There is
+  one now: `luabox-lsp`'s `requires::RequireExports`, the map the type pass
+  already threads into `check_file_with_requires` — project modules from the
+  database, rock modules from the vendored-tree harvest, in the precedence
+  path-keyed resolution gives `luabox check`. Hover on the binding renders the
+  module's export type, hover on a member (`m.helper`) renders that member's
+  type qualified by the module, and `.`/`:` completion offers the module's
+  exported members (`:` only the function-typed ones). Rock requires resolve
+  the same way. Types render as the checker holds them, literals included: a
+  module field inferred as `1` shows `1`, not `integer` — widening it for
+  display would be the editor disagreeing with CI, which is the whole class of
+  defect. An explicit `---@type` still wins over the module export. What stays
+  `unknown` is unchanged and deliberate, and now pinned as such: a dynamic
+  `require(name)`, and `require("a") or require("b")`, name no module
+  statically, and the type pass does not resolve them either. One
+  narrower-than-CI case is documented rather than papered over: when a module's
+  export is a `---@class` *instance*, the binding hovers as the class name but
+  its fields live in the declaring file, out of the editor's per-file reach, so
+  its members get no hover or completion. README's "hover and completion agree
+  with CI" is scoped to match (refs #54).
+- **Calls to `require`d functions are argument-checked.** A function reached
+  across a module boundary flowed its *type* into the consumer — a required
+  function's `---@return` typed the value you bound — but its `---@param`
+  annotations were enforced nowhere, so `local m = require("mod");
+  m.f("wrong")` reported nothing while the identical call written in the same
+  file reported `LB0300`. Every `require`d function in every project was
+  unchecked at its call sites, rocks included, which bounded what a vendored
+  tree's harvested types could actually catch. The checker resolved a callee's
+  signature only through registries keyed by *name* — a local binding, a
+  dotted name in the ambient map — and a required module's members appear in
+  neither; nothing in the consumer file declares them. It now falls back to
+  the callee's resolved *type*, which inference had already computed, and
+  hands it to the same argument-checking path a same-file call takes. So
+  `LB0300` and `LB0301` read identically on both sides of the boundary, and
+  overloads, generics, `---@vararg` and optional parameters behave there
+  exactly as they do within a file. Covered: `return M` module tables, a
+  module whose export *is* a function, nested tables, colon- and dot-calls on
+  exported classes, and vendored rocks.
+
+  Conservatism is inherited rather than re-decided: an **unannotated**
+  exported function is still not argument-checked, because an unannotated
+  same-file function is not either. That required carrying provenance —
+  reification erases the difference between a written `---@param` list and one
+  read off an unannotated body, and checking calls against the latter would
+  invent arity errors about code that makes no claim — so a function type now
+  records whether a human wrote its signature. Two smaller gaps fell out of
+  the same work: a `---@param` block above `return function(...) end` now
+  binds to that function (a single-function module could not carry a signature
+  at all before), and a `---@type fun(...)` over a name is authoritative at
+  its call sites. Dynamic `require` paths, `---@field`-only class members and
+  functions re-exported through a second `require` remain out, and are
+  enumerated in [the limitations
+  reference](docs/03-reference/02-limitations.md) (refs #46).
+- **The project source walk no longer follows a symlink cycle.** `src/loop ->
+  <root>` made `layout::walk` re-collect every source once per level until the
+  kernel's symlink budget ran out — 41 copies of one `src/main.lua` on Linux,
+  and 41 diagnostics for one mistake, terminating by `ELOOP` rather than by
+  design. The walk now tests `entry.file_type()` (`is_real_dir`) instead of
+  `Path::is_dir()`, the same guard the sibling rock and defs walks already
+  carried: symlinked directories are not descended, symlinked *files* are
+  still project source, and `walk`'s `LayoutError` propagation is unchanged
+  (refs #51).
+- **The GitLab Code Quality report no longer emits unusable locations or
+  colliding fingerprints.** Two defects made the format lossy in a pipeline.
+  An unspanned project-level finding (`LB1001` an unrecognised edition,
+  `LB1002` an unresolvable `[types] defs` package, `LB1004` an unknown
+  `[lint]` key) reported `location.path: ""` with `begin: 0`, which GitLab's
+  parser rejects — the report parsed as JSON and annotated nothing. Those
+  findings now take a stable synthetic path decided by code family: the
+  manifest block (`LB1xxx`) reports `luabox.toml`, the file it is actually
+  about, and anything else genuinely fileless reports the project root, both
+  on line 1. Separately, the fingerprint hashed only code + file + byte
+  range, so two *distinct* diagnostics over one range — the parser emits
+  "unexpected token" and "expected an identifier" about the same token —
+  hashed identically, and GitLab keeps one issue per fingerprint: the second
+  finding silently vanished. The message is now hashed in. Fingerprints stay
+  stable across runs for unchanged findings, which is their purpose; a
+  *reworded* message deliberately re-keys its findings, the correct half of
+  that trade to lose. JSON, SARIF and GitHub Actions were swept for both
+  defect classes and have neither — SARIF omits `result.locations` entirely
+  (the specified way to say "no location"), GitHub Actions drops the `file=`
+  property, JSON carries no location field at all, and no other format emits
+  a fingerprint (refs #52).
+- **A `---@type` above an assignment is applied, not silently dropped.**
+  `---@type string` above `M.a = 1` used to declare nothing and diagnose
+  nothing: the annotation was consumed only for `local` statements, so it
+  looked accepted and rotted. It now declares the assigned slot and checks the
+  initializer against it (`LB0300` on the value), exactly as on a `local`.
+  luals binds a doc block to the statement rather than to the target's syntax,
+  so every spelling gets it: a table field (`M.a`), a bracket index with a
+  literal key (`M["a"]`), a nested field (`M.a.b`, annotating the innermost
+  slot — the one being assigned), a global (`G = 1`), and a plain name. Reads
+  of the target see the declared type. `---@type A, B` stays positional as on a
+  `local`, so a lone annotation over `M.a, M.b = x, y` declares `M.a` only.
+  Where a `---@field` also declares the member the two do not compete: the
+  `---@field` governs the class surface, the `---@type` governs the assignment
+  it sits above. One consequence worth knowing: `---@type <Class>` over
+  `G = {}` now reports its missing members on the spot (`LB0302`) — the
+  build-it-up-later deferral is a property of the `local X = {}` carrier
+  spelling, and `---@class` is the carrier spelling that does collect members
+  attached to a global later.
+- **Two `---@class` declarations for one name in the same file union instead of
+  the second wiping the first.** Across files they already unioned; within one
+  file the second declaration replaced the class and every member the first had
+  contributed vanished — a merge rule that depended on the file boundary, which
+  luals has no notion of. Parents, `---@field`s, `---@operator`s, visibility
+  and carrier attachments now merge from every declaration, in one file, across
+  files, and in `---@meta` definition files alike, and a class carried by two
+  different tables collects the members of both. A same-name **field** declared
+  twice keeps the **first** declaration and warns at the loser as
+  `duplicate-doc-field` (`LB0311`) — which is what that warning's own note has
+  always said, so the stored type and the message now agree. luals unions the
+  two types instead; the divergence, and why a stable winner plus a warning
+  beats a silent widening, is written up in
+  [Known limitations](docs/03-reference/02-limitations.md). A project file's own
+  `---@class` still *replaces* a same-named stdlib/`[types] defs` class whole —
+  that escape hatch is unchanged. The generic monomorphisation template merges
+  the same way: a `---@class Name<T>` declared twice keeps both declarations'
+  fields, and a *bare* re-declaration that only adds members now reaches the
+  template instead of being skipped for carrying no `<T>`. That also removes a
+  false `LB0305` — a duplicate that renamed the parameter left the template
+  saying `U` while the surviving field body said `T`, and reported the first
+  declaration's own annotation as an unknown type name.
+- **A `---@class` carried by a global collects its members.** `---@class Global`
+  over `Glob = {}` tagged the class but never gathered anything attached to it,
+  so `function Glob:size()` was invisible and every `g:size()` through the class
+  reported `LB0306` on valid luals code. The carrier maps were keyed on local
+  bindings, which a free global name does not have. All the member spellings now
+  land — `function Glob:m()`, `function Glob.fn()`, `Glob.const = v`,
+  `Glob.fn = function() end` — with their declared signatures, in-file, across
+  files, and in `---@meta` definition files. Precedence is unchanged and now
+  covers globals coherently: the carrier *variable* beats a class of the same
+  name in either declaration order, and a variable carried twice answers with
+  its most recent carrier, the way Lua resolves the name.
 - **`luabox check --watch` now reruns when the vendored rock tree changes.**
   Since the rock type harvest landed, `check` reads
   `lua_modules/share/lua/<X.Y>/**.lua` — but the watcher still filtered all of

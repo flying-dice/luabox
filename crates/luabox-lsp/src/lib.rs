@@ -25,7 +25,9 @@
 //! - **Streamed diagnostics** — parse errors, dialect legality, type and lint
 //!   diagnostics pushed after every open/change/close.
 //! - **Hover** — binding types from `---@type`/`---@param`, function
-//!   signatures from `@param`/`@return`, class fields, with LuaCATS doc text.
+//!   signatures from `@param`/`@return`, class fields, with LuaCATS doc text;
+//!   a `require` binding and its members type from the module's export
+//!   through [`requires`], the same resolution the type pass checks against.
 //! - **Goto definition / type definition / implementation** — locals and
 //!   upvalues via HIR name resolution, class fields to their `---@field`
 //!   site, functions to their declaration, `require("mod")` to the module
@@ -35,10 +37,11 @@
 //! - **Find references + rename** — every use of a binding, class or field
 //!   across the workspace ([`references`]), and `prepare`-gated rename
 //!   driving the same resolution ([`rename`]).
-//! - **Completion** — `.`/`:` member completion on class-typed receivers;
-//!   scope-visible locals, file globals, and keywords elsewhere; plus
-//!   tsc-style **auto-require imports** that insert the `require` line with
-//!   the item.
+//! - **Completion** — `.`/`:` member completion on class-typed receivers and
+//!   on `require` bindings (the required module's exported members, via
+//!   [`requires`]); scope-visible locals, file globals, and keywords
+//!   elsewhere; plus tsc-style **auto-require imports** that insert the
+//!   `require` line with the item.
 //! - **Code actions** — machine-applicable lint quick-fixes, plus the
 //!   type-driven refactors in [`code_action`] (add-missing-field,
 //!   annotate-local-from-inference, generate-class-from-literal,
@@ -98,6 +101,7 @@ mod inlay_hints;
 mod line_index;
 mod references;
 mod rename;
+mod requires;
 mod selection_range;
 mod sema;
 mod semantic_tokens;

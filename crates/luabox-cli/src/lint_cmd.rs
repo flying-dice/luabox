@@ -1,11 +1,26 @@
-//! `luabox lint [--fix]` — the clippy analog (SPEC.md §9).
+//! `luabox lint [--fix] [--format <f>]` — the clippy analog (SPEC.md §9).
 //!
 //! Discovers the project (nearest `luabox.toml`, cargo-style), lints every
 //! `.lua` file in parallel over the shared parse/HIR/type machinery, and
-//! renders findings in the human format. Tiers and per-rule levels come from
-//! `[lint]` in the manifest; the exit code is nonzero iff any deny-tier finding
-//! (or a parse error / malformed suppression) was produced — warnings never
-//! fail the command.
+//! renders findings in the requested format. Tiers and per-rule levels come
+//! from `[lint]` in the manifest; the exit code is nonzero iff any deny-tier
+//! finding (or a parse error / malformed suppression) was produced — warnings
+//! never fail the command.
+//!
+//! **`--format`** (#53) is the same closed set `luabox check` carries, through
+//! the same renderer: `lint` and `check` produce the same
+//! [`luabox_diag::Diagnostic`] values, so a second rendering path for them
+//! would only be a way for the two to disagree. Both go through
+//! [`crate::project::render_diagnostics`].
+//!
+//! The exit code does **not** move with the format, and that is the point of
+//! carrying severity faithfully into the machine formats. A warn-tier finding
+//! still exits 0 (SPEC.md §9) — luabox does not decide that a warning should
+//! fail somebody's build. A CI consumer that *does* want to gate on warnings
+//! reads the severity back out of the report and makes that call itself,
+//! which it can only do if the report says `warning` where the human
+//! rendering says `warning`. A `[lint]` deny escalation moves both together:
+//! the finding is reported as an error *and* the command exits 1.
 //!
 //! `--fix` applies machine-applicable fixes to disk (innermost-first,
 //! non-overlapping), re-linting each file until it converges. A file with parse
@@ -54,8 +69,8 @@ const MAX_FIX_PASSES: usize = 8;
 /// native flat `test`. `assert` is not listed — it's already stdlib.
 const TEST_HARNESS_GLOBALS: [&str; 5] = ["describe", "it", "before_each", "after_each", "test"];
 
-/// Execute `luabox lint` from `cwd`.
-pub fn run(cwd: &Path, fix: bool) -> anyhow::Result<()> {
+/// Execute `luabox lint` from `cwd`, rendering findings in `format`.
+pub fn run(cwd: &Path, fix: bool, format: Format) -> anyhow::Result<()> {
     let project = discover(cwd)?;
     let files =
         layout::collect_lua_files(&project.root, project.out_dir.as_deref(), DefFiles::Include)?;
@@ -97,7 +112,14 @@ pub fn run(cwd: &Path, fix: bool) -> anyhow::Result<()> {
         .collect();
     report.append(&mut diags);
 
-    finish(&report, &project.root, files.len(), fixed_files, fix)
+    finish(
+        &report,
+        format,
+        &project.root,
+        files.len(),
+        fixed_files,
+        fix,
+    )
 }
 
 /// One file's diagnostics plus whether `--fix` rewrote it.
@@ -154,14 +176,23 @@ fn lint_one(path: &Path, project: &Project, fix: bool) -> anyhow::Result<FileRes
 }
 
 /// Render, summarize, and translate the error count into the exit code.
+///
+/// The summary goes to **stderr** and the report to stdout, so a machine
+/// format is never adulterated by the `lint: N errors, M warnings` line — a
+/// consumer can pipe stdout straight into a parser.
+///
+/// The error count, and therefore the exit code, is read off the same
+/// diagnostics whatever `format` renders them as: the report never changes
+/// the verdict and the verdict never changes the report.
 fn finish(
     diags: &[Diagnostic],
+    format: Format,
     root: &Path,
     file_count: usize,
     fixed_files: usize,
     fix: bool,
 ) -> anyhow::Result<()> {
-    let counts = crate::project::render_diagnostics(diags, Format::Human, root);
+    let counts = crate::project::render_diagnostics(diags, format, root);
     let (errors, warnings) = (counts.errors, counts.warnings);
     if fix {
         errln!(
@@ -308,6 +339,71 @@ mod tests {
         crate::testutil::project("5.4", extra)
     }
 
+    // -- report formats (#53) ----------------------------------------------
+
+    /// Every format `check` carries, `lint` carries — same closed set, same
+    /// renderer. The exit code is lint's own and must not move with it.
+    const EVERY_FORMAT: [Format; 5] = [
+        Format::Human,
+        Format::Json,
+        Format::Sarif,
+        Format::GithubActions,
+        Format::GitlabCodeQuality,
+    ];
+
+    /// `metatable-without-index` (LB0510, suspicious tier): a warn-tier
+    /// finding, so the command still exits 0 while reporting it.
+    const LB0510_REPRO: &str = "\
+---@class Counter
+---@field n integer
+local Counter = {}
+
+function Counter:value()
+  return self.n
+end
+
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+
+    #[test]
+    fn a_warn_tier_finding_leaves_the_exit_code_at_zero_in_every_format() {
+        for format in EVERY_FORMAT {
+            let tmp = project("");
+            write(tmp.path(), "src/main.lua", LB0510_REPRO);
+            run(tmp.path(), false, format)
+                .unwrap_or_else(|e| panic!("a warning must not fail lint in {format:?}: {e}"));
+        }
+    }
+
+    /// A `[lint]` deny escalation has to move the exit code in every format
+    /// alike — the rendering never decides the verdict.
+    #[test]
+    fn a_deny_escalation_fails_the_command_in_every_format() {
+        for format in EVERY_FORMAT {
+            let tmp = project("\n[lint]\nsuspicious = \"deny\"\n");
+            write(tmp.path(), "src/main.lua", LB0510_REPRO);
+            let error = run(tmp.path(), false, format).unwrap_err().to_string();
+            assert!(error.contains("lint failed with"), "in {format:?}: {error}");
+        }
+    }
+
+    /// An empty project is the happy path a machine consumer still has to
+    /// parse, so the document must be well-formed and empty rather than
+    /// absent — matching what `check` already emits.
+    #[test]
+    fn a_clean_project_still_emits_a_valid_document_in_every_format() {
+        for format in EVERY_FORMAT {
+            let tmp = project("");
+            write(
+                tmp.path(),
+                "src/main.lua",
+                "local x = 1\nprint(x)\nreturn 0\n",
+            );
+            run(tmp.path(), false, format).expect("a clean project lints successfully");
+        }
+    }
+
     // -- the command -------------------------------------------------------
 
     #[test]
@@ -318,13 +414,13 @@ mod tests {
             "src/main.lua",
             "local x = 1\nprint(x)\nreturn 0\n",
         );
-        run(tmp.path(), false).expect("lint passes");
+        run(tmp.path(), false, Format::Human).expect("lint passes");
     }
 
     #[test]
     fn an_empty_project_lints_successfully() {
         let tmp = project("");
-        run(tmp.path(), false).expect("lint passes");
+        run(tmp.path(), false, Format::Human).expect("lint passes");
     }
 
     #[test]
@@ -332,7 +428,7 @@ mod tests {
         let tmp = project("");
         write(tmp.path(), "src/main.lua", "local unused = 1\nreturn 0\n");
         // `unused-local` is style-tier: a warning, exit zero (SPEC.md §9).
-        run(tmp.path(), false).expect("warnings do not fail lint");
+        run(tmp.path(), false, Format::Human).expect("warnings do not fail lint");
     }
 
     #[test]
@@ -345,7 +441,9 @@ mod tests {
             "src/main.lua",
             "---@luabox-ignore unused-local\nlocal x = 1\nreturn 0\n",
         );
-        let error = run(tmp.path(), false).unwrap_err().to_string();
+        let error = run(tmp.path(), false, Format::Human)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("lint failed with"), "{error}");
         assert!(error.contains("error(s)"), "{error}");
     }
@@ -354,7 +452,9 @@ mod tests {
     fn a_tier_promoted_to_deny_in_the_manifest_fails_the_command() {
         let tmp = project("\n[lint]\nstyle = \"deny\"\n");
         write(tmp.path(), "src/main.lua", "local unused = 1\nreturn 0\n");
-        let error = run(tmp.path(), false).unwrap_err().to_string();
+        let error = run(tmp.path(), false, Format::Human)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("lint failed with"), "{error}");
     }
 
@@ -363,14 +463,15 @@ mod tests {
         let tmp = project("\n[lint]\nstyle = \"deny\"\nunused-local = \"allow\"\n");
         write(tmp.path(), "src/main.lua", "local unused = 1\nreturn 0\n");
         // The rule-level `allow` wins over the tier-level `deny`.
-        run(tmp.path(), false).expect("the allowed rule no longer fires");
+        run(tmp.path(), false, Format::Human).expect("the allowed rule no longer fires");
     }
 
     #[test]
     fn a_global_declared_in_the_manifest_is_treated_as_intentional() {
         let tmp = project("\n[lint]\ncorrectness = \"deny\"\nglobals = [\"counter\"]\n");
         write(tmp.path(), "src/main.lua", "counter = 0\nreturn counter\n");
-        run(tmp.path(), false).expect("an allow-listed global does not fire global-write");
+        run(tmp.path(), false, Format::Human)
+            .expect("an allow-listed global does not fire global-write");
     }
 
     #[test]
@@ -378,10 +479,10 @@ mod tests {
         let tmp = project("");
         write(tmp.path(), "src/main.lua", "local unused = 1\nreturn 0\n");
 
-        run(tmp.path(), true).expect("lint --fix succeeds");
+        run(tmp.path(), true, Format::Human).expect("lint --fix succeeds");
         assert!(read(tmp.path(), "src/main.lua").contains("_unused"));
         // The rewritten file is clean on a second, non-fixing pass.
-        run(tmp.path(), false).expect("the fixed file lints clean");
+        run(tmp.path(), false, Format::Human).expect("the fixed file lints clean");
     }
 
     #[test]
@@ -389,7 +490,7 @@ mod tests {
         let tmp = project("");
         let original = "local unused = 1\nreturn 0\n";
         write(tmp.path(), "src/main.lua", original);
-        run(tmp.path(), false).expect("lint passes");
+        run(tmp.path(), false, Format::Human).expect("lint passes");
         assert_eq!(read(tmp.path(), "src/main.lua"), original);
     }
 
@@ -403,7 +504,9 @@ mod tests {
         // lint summary (not, say, an io error from a half-written rewrite) —
         // and the file itself survives byte-for-byte. `local = ` trips the
         // parser twice: no name, then no expression.
-        let error = run(tmp.path(), true).unwrap_err().to_string();
+        let error = run(tmp.path(), true, Format::Human)
+            .unwrap_err()
+            .to_string();
         assert_eq!(error, "lint failed with 2 error(s)");
         assert_eq!(read(tmp.path(), "src/main.lua"), broken);
     }
@@ -416,7 +519,9 @@ mod tests {
         // the `.d.lua`'s own parse errors (no name, then no expression), from
         // the only file in the project.
         write(tmp.path(), "defs/broken.d.lua", "local = \n");
-        let error = run(tmp.path(), false).unwrap_err().to_string();
+        let error = run(tmp.path(), false, Format::Human)
+            .unwrap_err()
+            .to_string();
         assert_eq!(error, "lint failed with 2 error(s)");
     }
 
@@ -424,7 +529,7 @@ mod tests {
     fn the_build_output_directory_is_never_linted() {
         let tmp = project("\n[build]\nout = \"dist\"\n");
         write(tmp.path(), "dist/main.lua", "local = \n");
-        run(tmp.path(), false).expect("emitted output is not project source");
+        run(tmp.path(), false, Format::Human).expect("emitted output is not project source");
     }
 
     #[test]
@@ -438,14 +543,16 @@ mod tests {
         assert!(project.known_globals.contains("print"));
 
         write(tmp.path(), "main.lua", "local x = 1\nprint(x)\n");
-        run(tmp.path(), false).expect("lint passes");
+        run(tmp.path(), false, Format::Human).expect("lint passes");
     }
 
     #[test]
     fn a_malformed_manifest_fails_the_lint_rather_than_defaulting() {
         let tmp = tempfile::tempdir().expect("tempdir");
         write(tmp.path(), "luabox.toml", "= = =\n");
-        let error = run(tmp.path(), false).unwrap_err().to_string();
+        let error = run(tmp.path(), false, Format::Human)
+            .unwrap_err()
+            .to_string();
         assert!(error.starts_with("invalid `"), "{error}");
     }
 
@@ -554,7 +661,7 @@ mod tests {
     fn a_test_file_may_use_busted_style_harness_globals() {
         let tmp = project("\n[lint]\nundefined-global = \"deny\"\n");
         write(tmp.path(), "tests/spec.lua", BUSTED_CALL);
-        run(tmp.path(), false).expect("harness globals are known inside tests/");
+        run(tmp.path(), false, Format::Human).expect("harness globals are known inside tests/");
     }
 
     #[test]
@@ -568,7 +675,7 @@ mod tests {
                 acc
             });
         write(tmp.path(), "spec_test.lua", &calls);
-        run(tmp.path(), false).expect("all harness globals are known");
+        run(tmp.path(), false, Format::Human).expect("all harness globals are known");
     }
 
     #[test]
@@ -576,7 +683,9 @@ mod tests {
         let tmp = project("\n[lint]\nundefined-global = \"deny\"\n");
         write(tmp.path(), "src/main.lua", BUSTED_CALL);
         // `describe` is not declared anywhere for ordinary sources.
-        let error = run(tmp.path(), false).unwrap_err().to_string();
+        let error = run(tmp.path(), false, Format::Human)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("lint failed with"), "{error}");
     }
 
@@ -695,7 +804,7 @@ mod tests {
         write(tmp.path(), "src/main.lua", "return 0\n");
         // Exit code unchanged: `LB1004` is a warning (SPEC.md §9 — only
         // deny-tier findings, parse errors and malformed ignores fail).
-        run(tmp.path(), false).expect("a config warning does not fail lint");
+        run(tmp.path(), false, Format::Human).expect("a config warning does not fail lint");
     }
 
     #[test]
@@ -719,7 +828,7 @@ mod tests {
             "src/main.lua",
             "local a = 1\nlocal b = 2\nlocal c = 3\nreturn 0\n",
         );
-        run(tmp.path(), true).expect("lint --fix succeeds");
+        run(tmp.path(), true, Format::Human).expect("lint --fix succeeds");
         let fixed = read(tmp.path(), "src/main.lua");
         assert!(fixed.contains("_a"), "{fixed}");
         assert!(fixed.contains("_b"), "{fixed}");
@@ -733,6 +842,6 @@ mod tests {
         write(tmp.path(), "src/a.lua", "local unused_a = 1\nreturn 0\n");
         // Ordering is a rendering concern; the command still succeeds and the
         // sort must not panic on labelless diagnostics.
-        run(tmp.path(), false).expect("lint passes");
+        run(tmp.path(), false, Format::Human).expect("lint passes");
     }
 }

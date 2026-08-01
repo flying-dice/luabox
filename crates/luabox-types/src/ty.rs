@@ -134,6 +134,35 @@ pub struct FunctionTy {
     /// Whether any `---@return` was written. Without one, return
     /// statements are not checked and calls evaluate to `unknown`.
     pub has_return_annotation: bool,
+    /// Whether this signature was **written**, as LuaCATS — a `---@param` /
+    /// `---@return` / `---@overload` block, a `fun(...)` type expression, a
+    /// `---@field f fun(...)`, an `---@operator call` — rather than
+    /// synthesized by inference from an unannotated function body.
+    ///
+    /// It is provenance, and it exists because reification erases the
+    /// difference: [`crate::infer`] snapshots an unannotated `function M.f(a,
+    /// b)` as a `FunctionTy` with two `unknown`, non-optional parameters and
+    /// no varargs, which is indistinguishable *by shape* from a written
+    /// signature — but means something entirely different. A written
+    /// signature is a contract to check calls against; a synthesized one
+    /// describes a body nobody annotated, and checking calls against it would
+    /// manufacture arity errors about code the author never made a claim
+    /// about.
+    ///
+    /// Same-file checking gets this for free: an unannotated function has no
+    /// entry in the signature registries `Checker::callee_sig` consults, so it
+    /// is never resolved and never checked. Crossing a module boundary it has
+    /// to be carried, because a required module's export is *only* reachable
+    /// as a reified [`Ty`] — this flag is what lets a consumer apply exactly
+    /// the same conservatism to a call through `require` as to a call next
+    /// door (#46).
+    ///
+    /// A *partially* annotated signature is still declared: `reconcile_params`
+    /// already makes its unannotated parameters optional `unknown`, which is
+    /// what keeps partial annotation from manufacturing arity errors. This
+    /// flag asks the coarser question of whether a human wrote a signature at
+    /// all.
+    pub declared: bool,
     /// Additional `---@overload fun(...)` signatures. A call is accepted
     /// when it matches this primary signature *or* any overload; the
     /// primary governs the inferred result type (TODO(P1): pick the
@@ -186,10 +215,35 @@ impl FunctionTy {
         }
     }
 
-    /// How many arguments a call must supply: the non-optional parameters.
+    /// How many arguments a call must supply.
+    ///
+    /// A parameter is optional two ways. `---@param b? number` says so
+    /// outright. `---@param b number|nil` says the same thing about what may
+    /// reach `b` — and since Lua supplies `nil` for every argument the caller
+    /// left off, omitting it is exactly the call the annotation permits, which
+    /// is why luals treats it as optional for the count too.
+    ///
+    /// The `nil`-admitting half applies only to a **trailing** run of
+    /// parameters: a caller cannot skip a middle argument in Lua without
+    /// writing `nil` in its place, so relaxing a non-trailing slot would admit
+    /// a genuinely short call. An explicit `?` still does not count anywhere,
+    /// trailing or not, exactly as before. The narrowness is deliberate and is
+    /// recorded in `docs/03-reference/02-limitations.md`.
     #[must_use]
     pub fn required_params(&self) -> usize {
-        self.params.iter().filter(|p| !p.optional).count()
+        let mut required = 0;
+        let mut trailing = true;
+        for param in self.params.iter().rev() {
+            if param.optional {
+                continue;
+            }
+            if trailing && param.ty.admits_nil_explicitly() {
+                continue;
+            }
+            required += 1;
+            trailing = false;
+        }
+        required
     }
 }
 
@@ -251,6 +305,23 @@ impl Ty {
         }
     }
 
+    /// Whether this type admits `nil` because it *says* `nil` — the narrower
+    /// half of [`Self::admits_nil`], which also answers `true` for `any` and
+    /// `unknown`.
+    ///
+    /// The distinction matters where admitting `nil` is read as a statement of
+    /// intent rather than as an assignability fact: `---@param b number|nil`
+    /// declares that omitting the argument is allowed ([`FunctionTy::required_params`]),
+    /// whereas `---@param b any` only declines to constrain it.
+    #[must_use]
+    pub fn admits_nil_explicitly(&self) -> bool {
+        match self {
+            Ty::Nil => true,
+            Ty::Union(members) => members.iter().any(Ty::admits_nil_explicitly),
+            _ => false,
+        }
+    }
+
     /// Widen literal types to their primitives (`42` → `integer`, `1.5` →
     /// `number`, `"hi"` → `string`, `true` → `boolean`), recursively through
     /// unions, tables, and function signatures. Display-oriented: a binding
@@ -304,6 +375,7 @@ impl Ty {
                 returns: func.returns.iter().map(Ty::widened).collect(),
                 returns_vararg: func.returns_vararg,
                 has_return_annotation: func.has_return_annotation,
+                declared: func.declared,
                 overloads: func.overloads.clone(),
                 generics: func.generics.clone(),
                 deprecated: func.deprecated,
