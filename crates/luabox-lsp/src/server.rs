@@ -595,14 +595,46 @@ struct Server {
     /// Whether a `window/workDoneProgress/create` has already gone
     /// unanswered. A client that ignores one ignores them all, and the wait
     /// costs [`PROGRESS_CREATE_TIMEOUT`] every time it is paid: two startup
-    /// tokens plus one per config reload. Remembering the first timeout turns
-    /// a silent client's 2 × 250 ms startup penalty into 250 ms and makes
-    /// every later reload free.
+    /// tokens plus one per config reload.
+    ///
+    /// Once set, **no further create is sent at all** and every later
+    /// announcement is silent for the rest of the session. Wave 19 only
+    /// skipped the *wait*, which kept the latency win and lost the guarantee
+    /// the wait exists for: the create still went out, the client's late
+    /// error answer landed in [`Self::main_loop`]'s discard arm, and
+    /// `$/progress` went out under a token it had just refused (Shockwave
+    /// round 9, B2). A refusal check a latency optimisation can step around
+    /// is not a check. Not sending is simpler than polling for a late answer
+    /// and strictly stronger — there is no token, so there is nothing to
+    /// report under and no traffic to a client that is not listening.
+    ///
+    /// The cost is disclosed rather than hidden: **one timeout mutes progress
+    /// for the session**, so a client that stalls once during startup and
+    /// recovers gets no progress on later reloads. That client was already
+    /// getting `$/progress` under tokens it never acknowledged, which is the
+    /// thing this mechanism was built to stop.
     ///
     /// Only a *timeout* sets this. A client that answers — with a result or
     /// with an error — has told the server something, and the next create is
-    /// waited for normally.
+    /// sent and waited for normally.
     create_unanswered: Cell<bool>,
+    /// Whether the client has asked to end the session: a `shutdown` request
+    /// or an `exit` notification has been seen, wherever it was seen.
+    ///
+    /// Sticky, and that is the point. Aborting *one* create window on a
+    /// session-ender is not enough, because `run` opens two before the loop
+    /// (the startup harvest, then `bootstrap`) and a queued reload can open
+    /// more from inside it. Window 1 would abort on the `shutdown` and leave
+    /// the `exit` on the channel — correct — and window 2 would then drain
+    /// that `exit` onto [`Self::pending`], where
+    /// [`Self::shutdown_handshake`]'s predecessor could not see it: 30 s of
+    /// waiting for a notification the server was holding, then exit 1,
+    /// byte-identical to the pre-round-8 behaviour (Shockwave round 9, B1).
+    ///
+    /// Once set, [`Self::create_progress_token`] sends nothing and returns no
+    /// token, so no window opens and nothing is announced to a client that is
+    /// leaving.
+    shutting_down: Cell<bool>,
 }
 
 /// What a `window/workDoneProgress/create` came back as.
@@ -613,11 +645,17 @@ enum CreateOutcome {
     /// The client answered with an error: the token is refused and nothing
     /// may be reported under it.
     Refused,
-    /// No answer arrived — the wait timed out, the transport died, or the
-    /// session is ending. The caller reports under the token regardless,
-    /// which is the behaviour this whole mechanism replaced and so is no
-    /// worse than it.
+    /// No answer arrived — the wait timed out or the transport died. The
+    /// caller reports under the token regardless, which is the behaviour this
+    /// whole mechanism replaced and so is no worse than it.
     Unanswered,
+    /// The session is ending: the wait was abandoned because a `shutdown` or
+    /// an `exit` arrived. Distinct from [`Self::Unanswered`] because the
+    /// caller must **not** report under the token — a `begin`/`report`/`end`
+    /// sequence to a client that has asked to shut down is traffic nobody
+    /// wants, and it used to go out because the abort path returned the token
+    /// like any other unanswered create.
+    Ending,
 }
 
 /// Whether a message is one of the two that end the session, and so must
@@ -640,6 +678,12 @@ fn ends_the_session(message: &Message) -> bool {
 /// local editor answers a create in well under a millisecond (Shockwave's
 /// round-7 capture measured the *server's* two sends 0.1 ms apart).
 const PROGRESS_CREATE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// How long [`Server::shutdown_handshake`] waits for the `exit` that must
+/// follow a `shutdown`. Matches what `Connection::handle_shutdown` allowed,
+/// so replacing it changes which messages are *found*, not how long a client
+/// that really does go silent is given.
+const SHUTDOWN_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The progress token id and title the startup rock harvest announces itself
 /// under. Distinct from the reload's so a client (and the protocol tests) can
@@ -675,6 +719,7 @@ impl Server {
             progress_seq: Cell::new(0),
             pending: RefCell::new(VecDeque::new()),
             create_unanswered: Cell::new(false),
+            shutting_down: Cell::new(false),
         };
         // Safe to send: `run` only builds the server after `initialize_finish`.
         server.log_lint_config_problems(&config.unknown_lint_rules);
@@ -977,9 +1022,24 @@ impl Server {
     /// an `end` under a token it had just declined (Shockwave round 8).
     /// Refusal is now the `progress: false` path exactly: nothing goes out.
     ///
-    /// A client that answers *nothing* is a different case and keeps the old
-    /// behaviour — see [`Self::await_progress_create`].
+    /// Two things make this `None` **before anything is sent**, so the client
+    /// sees no request at all:
+    ///
+    /// - **the session is ending** ([`Self::session_is_ending`]). A client
+    ///   that has sent `shutdown` is not going to render a progress bar, and
+    ///   the request would open a window whose only effect is to swallow the
+    ///   `exit` that follows — which is exactly the round-9 defect;
+    /// - **a previous create went unanswered** ([`Self::create_unanswered`]).
+    ///   Wave 19 skipped the wait but still sent the create, which is how a
+    ///   late refusal ended up reported under. There is nothing to poll for
+    ///   if nothing was asked.
+    ///
+    /// A client that answers *nothing* to the first create keeps the old
+    /// behaviour for that one token — see [`Self::await_progress_create`].
     fn create_progress_token(&self, name: &str) -> Option<ProgressToken> {
+        if self.session_is_ending() || self.create_unanswered.get() {
+            return None;
+        }
         let seq = self.progress_seq.get();
         self.progress_seq.set(seq.wrapping_add(1));
         let unique = format!("{name}-{seq}");
@@ -999,8 +1059,33 @@ impl Server {
             .ok()?;
         match self.await_progress_create(&id) {
             CreateOutcome::Accepted | CreateOutcome::Unanswered => Some(token),
-            CreateOutcome::Refused => None,
+            CreateOutcome::Refused | CreateOutcome::Ending => None,
         }
+    }
+
+    /// Whether the client has asked to end the session — see
+    /// [`Self::shutting_down`].
+    ///
+    /// Two ways to know, and both are consulted. The flag is the record of a
+    /// session-ender this server has already drained, and it is what stops
+    /// the *next* create window opening. The scan of [`Self::pending`] is
+    /// belt and braces: a session-ender sitting on the queue means the loop
+    /// is about to handle it whatever else happens, so opening a window and
+    /// reading the channel first can only get in the way. It also keeps the
+    /// answer right if a session-ender ever reaches the queue by a route the
+    /// flag does not cover.
+    ///
+    /// Cheap: the queue holds what a client said during one create window,
+    /// which is a handful of messages, and this is asked once per token.
+    fn session_is_ending(&self) -> bool {
+        if self.shutting_down.get() {
+            return true;
+        }
+        if self.pending.borrow().iter().any(ends_the_session) {
+            self.shutting_down.set(true);
+            return true;
+        }
+        false
     }
 
     /// Read from the connection until the client answers `id`, buffering
@@ -1035,12 +1120,20 @@ impl Server {
     /// Aborting the wait on either message fixes it without touching
     /// `Connection`'s contract: the message goes on the queue in arrival
     /// order, this returns, and [`Self::main_loop`] drains it into the
-    /// ordinary handshake — which then finds the `exit` where it expects it,
-    /// on the channel. Waiting out the remaining 250 ms for a token nobody
-    /// will use is pointless anyway.
+    /// [handshake](Self::shutdown_handshake) — which looks in the queue as
+    /// well as on the channel. Waiting out the remaining 250 ms for a token
+    /// nobody will use is pointless anyway.
+    ///
+    /// Round 9 found that aborting is not sufficient on its own, because
+    /// `run` opens a second window straight afterwards; the abort therefore
+    /// also records [`Self::shutting_down`], and returns
+    /// [`CreateOutcome::Ending`] rather than `Unanswered` so the caller
+    /// reports nothing under a token the client will never see.
     fn await_progress_create(&self, id: &RequestId) -> CreateOutcome {
-        if self.create_unanswered.get() {
-            return CreateOutcome::Unanswered;
+        // The queue may already hold the `shutdown` a previous window drained
+        // — reading the channel ahead of it would take the `exit` too.
+        if self.session_is_ending() {
+            return CreateOutcome::Ending;
         }
         let deadline = Instant::now() + PROGRESS_CREATE_TIMEOUT;
         loop {
@@ -1061,7 +1154,8 @@ impl Server {
                     let ends_the_session = ends_the_session(&other);
                     self.pending.borrow_mut().push_back(other);
                     if ends_the_session {
-                        return CreateOutcome::Unanswered;
+                        self.shutting_down.set(true);
+                        return CreateOutcome::Ending;
                     }
                 }
                 // Timed out, or the client hung up. Either way there is
@@ -1118,7 +1212,7 @@ impl Server {
             };
             match msg {
                 Message::Request(req) => {
-                    if self.connection.handle_shutdown(&req)? {
+                    if self.shutdown_handshake(&req)? {
                         return Ok(());
                     }
                     self.handle_request(req)?;
@@ -1142,6 +1236,66 @@ impl Server {
                 // behaviour rather than a comment fix and is not in this
                 // round.
                 Message::Response(_) => {}
+            }
+        }
+    }
+
+    /// Answer a `shutdown` request and wait for the `exit` that must follow
+    /// it, looking in [`Self::pending`] **before** the channel. `false` for
+    /// any other request, which the caller then dispatches normally.
+    ///
+    /// This is [`Connection::handle_shutdown`] with two differences, and it
+    /// replaces it rather than wrapping it because neither can be added from
+    /// outside:
+    ///
+    /// - **it can see the queue.** `Connection` reads the channel and nothing
+    ///   else, which is the whole round-8 defect: an `exit` a create window
+    ///   drained was invisible to it, and it waited out its own 30 s bound
+    ///   for a notification the server was already holding. The sticky
+    ///   [`Self::shutting_down`] flag means no window opens after the first
+    ///   session-ender, so in practice the `exit` is still on the channel —
+    ///   but "in practice" is how the round-8 fix was argued, and this makes
+    ///   it structural instead;
+    /// - **a repeated `shutdown` is answered, not fatal.** `Connection`
+    ///   returns a protocol error for any non-`exit` message, so a client
+    ///   that sends `shutdown` twice — which some editors do when a window
+    ///   close races a user quit — turned a clean session into exit 1. Every
+    ///   request this server receives gets a response, and there is no reason
+    ///   for the last one to be the exception. Anything else during the
+    ///   handshake is still a protocol error, with `Connection`'s wording.
+    ///
+    /// The bound is [`SHUTDOWN_EXIT_TIMEOUT`], matching what `Connection`
+    /// allowed, so a client that answers the request and then vanishes fails
+    /// exactly as it used to.
+    fn shutdown_handshake(&self, req: &Request) -> anyhow::Result<bool> {
+        if req.method != Shutdown::METHOD {
+            return Ok(false);
+        }
+        // Set before the response goes out: from here the session is ending
+        // whatever else arrives, and nothing may open another create window.
+        self.shutting_down.set(true);
+        self.connection
+            .sender
+            .send(Message::Response(Response::new_ok(req.id.clone(), ())))?;
+        let deadline = Instant::now() + SHUTDOWN_EXIT_TIMEOUT;
+        loop {
+            let queued = self.pending.borrow_mut().pop_front();
+            let message = if let Some(message) = queued {
+                message
+            } else {
+                let left = deadline.saturating_duration_since(Instant::now());
+                self.connection.receiver.recv_timeout(left).map_err(|err| {
+                    anyhow::anyhow!("no `exit` notification after `shutdown`: {err}")
+                })?
+            };
+            match message {
+                Message::Notification(not) if not.method == Exit::METHOD => return Ok(true),
+                Message::Request(repeat) if repeat.method == Shutdown::METHOD => {
+                    self.connection
+                        .sender
+                        .send(Message::Response(Response::new_ok(repeat.id, ())))?;
+                }
+                other => anyhow::bail!("unexpected message during shutdown: {other:?}"),
             }
         }
     }
@@ -2699,6 +2853,116 @@ mod tests {
             "every deep rock module must have been harvested"
         );
     }
+    /// A server on a worker thread with the client end **here**, so a test
+    /// can answer `window/workDoneProgress/create` the way a real editor
+    /// does.
+    ///
+    /// [`test_server`]'s client is inert, and cannot be used for a test about
+    /// any pause after the first: one unanswered create now mutes progress
+    /// for the whole session ([`Server::create_unanswered`]), so a create
+    /// that goes unanswered on the way in means there is no second create to
+    /// assert anything about. The thread runs `Server::new` → `bootstrap` →
+    /// `main_loop`, which is exactly what [`run`] does after the handshake.
+    struct AnsweringClient {
+        client: Connection,
+        server: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+        /// Everything read off the wire so far, in arrival order.
+        seen: Vec<Message>,
+        _dir: TempDir,
+    }
+
+    impl AnsweringClient {
+        fn start() -> Self {
+            let dir = TempDir::new().expect("tempdir");
+            let root = dir.path().to_path_buf();
+            let (server_end, client) = Connection::memory();
+            let server = std::thread::spawn(move || {
+                let mut server = Server::new(server_end, root, true);
+                server.bootstrap();
+                server.main_loop()
+            });
+            Self {
+                client,
+                server: Some(server),
+                seen: Vec::new(),
+                _dir: dir,
+            }
+        }
+
+        /// Read up to and including the next create, and accept it. Hands
+        /// back the `(request id, token)` pair the create carried.
+        fn accept_create(&mut self) -> (String, String) {
+            let create = loop {
+                let msg = self
+                    .client
+                    .receiver
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("a pause announces itself");
+                self.seen.push(msg.clone());
+                if let Message::Request(request) = msg
+                    && request.method == super::WorkDoneProgressCreate::METHOD
+                {
+                    break request;
+                }
+            };
+            self.client
+                .sender
+                .send(Message::Response(lsp_server::Response::new_ok(
+                    create.id.clone(),
+                    Value::Null,
+                )))
+                .expect("the server is still reading");
+            (
+                create.id.to_string(),
+                create.params["token"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        }
+
+        fn notify(&self, method: &str, params: Value) {
+            self.client
+                .sender
+                .send(Message::Notification(Notification::new(
+                    method.to_owned(),
+                    params,
+                )))
+                .expect("the server is still reading");
+        }
+
+        fn reload(&self) {
+            self.notify(
+                super::DidChangeConfiguration::METHOD,
+                json!({ "settings": {} }),
+            );
+        }
+
+        /// End the session and collect everything still on the wire.
+        fn shut_down(&mut self) {
+            shut_down(&self.client, 77);
+            let server = self.server.take().expect("shut down once");
+            server
+                .join()
+                .expect("the server thread does not panic")
+                .expect("a clean shutdown");
+            self.seen.extend(drain(&self.client));
+        }
+
+        /// Every `$/progress` seen so far, as params.
+        fn progress(&self) -> Vec<Value> {
+            self.seen
+                .iter()
+                .filter_map(|message| match message {
+                    Message::Notification(not) if not.method == super::Progress::METHOD => {
+                        Some(not.params.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
     /// The config reload re-harvests the whole rock tree on the main loop —
     /// the startup cost, landing mid-session (Shockwave round 4 measured a
     /// ~0.9 s stall on every `luabox.toml` save). The work is unchanged; what
@@ -2706,24 +2970,17 @@ mod tests {
     /// progress rather than as a hang.
     #[test]
     fn a_config_reload_announces_itself_with_a_progress_token() {
-        let (_dir, mut server, client) = test_server();
-        server
-            .handle_notification(Notification {
-                method: super::DidChangeConfiguration::METHOD.to_string(),
-                params: json!({ "settings": {} }),
-            })
-            .expect("a configuration change is not fatal");
+        let mut client = AnsweringClient::start();
+        // The two startup tokens first: a client that ignored them would be
+        // told nothing about the reload either.
+        client.accept_create();
+        client.accept_create();
 
-        let messages = drain(&client);
-        let progress: Vec<Value> = messages
-            .iter()
-            .filter_map(|message| match message {
-                Message::Notification(not) if not.method == super::Progress::METHOD => {
-                    Some(not.params.clone())
-                }
-                _ => None,
-            })
-            .collect();
+        client.reload();
+        client.accept_create();
+        client.shut_down();
+
+        let progress = client.progress();
         assert!(
             progress.iter().any(|params| {
                 params["value"]["kind"] == "begin"
@@ -2780,10 +3037,10 @@ mod tests {
         );
     }
 
-    /// Every `window/workDoneProgress/create` request the client end received,
-    /// as `(request id, token)` pairs.
-    fn progress_creates(client: &Connection) -> Vec<(String, String)> {
-        drain(client)
+    /// Every `window/workDoneProgress/create` among messages already read off
+    /// the wire, as `(request id, token)` pairs.
+    fn progress_creates_of(messages: &[Message]) -> Vec<(String, String)> {
+        messages
             .iter()
             .filter_map(|message| match message {
                 Message::Request(request)
@@ -2813,20 +3070,18 @@ mod tests {
     /// distinctness; `luabox/reload-3` is one spelling of it.
     #[test]
     fn consecutive_reloads_do_not_reuse_a_progress_id_or_token() {
-        let (_dir, mut server, client) = test_server();
-        // Drop the startup harvest's create, so what is left is the reloads'.
-        let _startup = progress_creates(&client);
+        let mut client = AnsweringClient::start();
+        // The two startup creates, answered, so the reloads' creates are sent
+        // at all — and dropped, so what is counted below is the reloads'.
+        client.accept_create();
+        client.accept_create();
 
         let mut seen: Vec<(String, String)> = Vec::new();
         for _ in 0..3 {
-            server
-                .handle_notification(Notification {
-                    method: super::DidChangeConfiguration::METHOD.to_string(),
-                    params: json!({ "settings": {} }),
-                })
-                .expect("a configuration change is not fatal");
-            seen.extend(progress_creates(&client));
+            client.reload();
+            seen.push(client.accept_create());
         }
+        client.shut_down();
 
         assert_eq!(seen.len(), 3, "one create per reload: {seen:?}");
         let ids: std::collections::HashSet<&str> = seen.iter().map(|(id, _)| id.as_str()).collect();
@@ -3273,18 +3528,35 @@ mod tests {
         );
     }
 
-    /// A client that answers *nothing* is not a client that refuses: it gets
-    /// the degraded path (the token is used regardless), and it is asked only
-    /// once. Every wait costs `PROGRESS_CREATE_TIMEOUT`, and a silent client
-    /// pays it on both startup tokens plus every config reload.
+    /// A client that answers *nothing* is not a client that refuses. The one
+    /// create it was asked for still takes the degraded path — the token is
+    /// used regardless, which is the behaviour this whole mechanism replaced
+    /// and so is no worse than it — and after that the session goes quiet:
+    /// **no further create is sent at all**.
+    ///
+    /// Round 9 (B2) is why the second half is not "asked without waiting".
+    /// Skipping only the wait kept the latency win and lost the guarantee:
+    /// the create went out, the client's late `-32601` landed in
+    /// `main_loop`'s discard arm, and `$/progress` went out under a token it
+    /// had refused. The semantics are disclosed rather than hidden — one
+    /// timeout mutes progress for the session — and the alternative was a
+    /// refusal check any slow client could step around.
     #[test]
-    fn a_silent_client_is_waited_for_once_and_then_reported_to_anyway() {
+    fn one_unanswered_create_mutes_progress_for_the_session() {
         let (_dir, mut server, client) = test_server();
         // `Server::new`'s startup harvest has already paid the one wait.
         assert!(server.create_unanswered.get(), "the first wait timed out");
+        // One drain: it consumes the wire, so the create and the progress it
+        // carried have to be read out of the same batch.
+        let startup = drain(&client);
+        assert_eq!(
+            progress_creates_of(&startup).len(),
+            1,
+            "exactly one create was asked: {startup:?}"
+        );
         assert!(
-            !progress_notifications(&client).is_empty(),
-            "the degraded path still reports"
+            startup.iter().any(is_progress),
+            "the degraded path still reports under the token it asked for"
         );
 
         let before = std::time::Instant::now();
@@ -3293,27 +3565,45 @@ mod tests {
             before.elapsed() < super::PROGRESS_CREATE_TIMEOUT,
             "a second create was waited out after the first went unanswered"
         );
+        let after = drain(&client);
         assert!(
-            !progress_notifications(&client).is_empty(),
-            "…and still reports"
+            progress_creates_of(&after).is_empty(),
+            "a second create was SENT after the first went unanswered — a \
+             late refusal of it would land in main_loop's discard arm: \
+             {after:?}"
+        );
+        assert!(
+            !after.iter().any(is_progress),
+            "…and reported under: {after:?}"
         );
     }
 
-    /// …and with the capability, all three paths do speak.
+    /// …and with the capability, all three paths do speak — to a client that
+    /// answers, which after round 9 is the only kind that hears more than the
+    /// first.
     #[test]
     fn a_client_with_the_capability_hears_every_announced_pause() {
-        let (_dir, mut server, client) = test_server();
-        assert!(!progress_notifications(&client).is_empty(), "startup");
+        let mut client = AnsweringClient::start();
+        let (_, harvest) = client.accept_create();
+        let (_, bootstrap) = client.accept_create();
+        client.reload();
+        let (_, reload) = client.accept_create();
+        client.shut_down();
 
-        server
-            .handle_notification(Notification {
-                method: super::DidChangeConfiguration::METHOD.to_string(),
-                params: json!({ "settings": {} }),
-            })
-            .expect("a configuration change is not fatal");
-        assert!(!progress_notifications(&client).is_empty(), "reload");
-
-        server.bootstrap();
-        assert!(!progress_notifications(&client).is_empty(), "bootstrap");
+        let tokens: Vec<String> = client
+            .progress()
+            .iter()
+            .map(|params| params["token"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        for (name, token) in [
+            ("startup", &harvest),
+            ("bootstrap", &bootstrap),
+            ("reload", &reload),
+        ] {
+            assert!(
+                tokens.iter().any(|seen| seen == token),
+                "{name} announced nothing under `{token}`: {tokens:?}"
+            );
+        }
     }
 }
