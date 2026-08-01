@@ -28,6 +28,7 @@
 //!   [`Server::notification_params`]). Only genuine transport failures — a
 //!   closed stdin, a dead [`Connection`] — end the loop.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
@@ -128,25 +129,33 @@ pub const PINNED_STACK_BYTES: usize = 16 * 1024 * 1024;
 /// built for this process — exactly what the CLI path does, and what a test
 /// harness may do — and whoever configured it keeps their choice.
 ///
-/// # Why there is no "delete the pin and watch it overflow" test
+/// # What isolates this call
 ///
-/// There cannot be one, and that is a property of the design rather than a
-/// gap in the suite. Recursion over a syntax tree is bounded by the parser's
-/// `MAX_DEPTH`, and `luabox-syntax`'s `parsing_at_the_depth_limit_fits_a_
-/// default_stack` already proves — in a *debug* build, whose frames are
-/// several times fatter than release's — that parsing at exactly that limit
-/// fits 2 MiB. `a_deep_rock_tree_survives_the_startup_harvest` makes the same
-/// point for the whole harvest pipeline, through deliberately *unpinned*
-/// rayon workers. So no input a differential test could construct overflows
-/// an unpinned worker while fitting a pinned one: anything deeper than
-/// `MAX_DEPTH` is rejected by the parser before recursion begins.
+/// No program the *parser* accepts can tell a pinned worker from an unpinned
+/// one. Recursion over a syntax tree is bounded by `MAX_DEPTH`, and
+/// `luabox-syntax`'s `parsing_at_the_depth_limit_fits_a_default_stack` proves
+/// — in a *debug* build, whose frames are several times fatter than
+/// release's — that parsing at exactly that limit fits 2 MiB;
+/// `a_deep_rock_tree_survives_the_startup_harvest` makes the same point for
+/// the whole harvest pipeline through deliberately *unpinned* rayon workers.
+/// Anything deeper than `MAX_DEPTH` is rejected before recursion begins.
 ///
-/// This is therefore belt-and-braces against a future consumer that recurses
-/// harder than today's do, and what is testable about it is tested: the
-/// constant matches the CLI's (`luabox-cli`, above), and calling this is
-/// idempotent and never fatal ([`tests::pinning_worker_stacks_is_idempotent_
-/// and_never_fatal`]) — the `Err` arm, which is what production actually
-/// takes on the CLI path, where `real_main` has already built the pool.
+/// That is a claim about parser-driven recursion, and wave 16's version of
+/// this comment overreached by generalising it to "no such test can exist"
+/// (Shockwave round 6). A **synthetic** recursion is not parser-capped, and
+/// one calibrated to need well over 2 MiB and well under 16 MiB does isolate
+/// the pin. `tests/pinned_stack.rs` is that test: it reaches this function
+/// through [`run`] — the production call site, not a back door — and then
+/// recurses on a global-pool worker. Delete the call in `run`, drop
+/// `.stack_size` from the builder below, or lower both constants to rayon's
+/// 2 MiB default, and that worker overflows and takes the test binary with
+/// it.
+///
+/// The rest is still tested here: the constant matches the CLI's
+/// (`luabox-cli`, above), and calling this is idempotent and never fatal
+/// ([`tests::pinning_worker_stacks_is_idempotent_and_never_fatal`]) — the
+/// `Err` arm, which is what production actually takes on the CLI path, where
+/// `real_main` has already built the pool.
 fn pin_worker_stacks() {
     let _ = rayon::ThreadPoolBuilder::new()
         .stack_size(PINNED_STACK_BYTES)
@@ -555,6 +564,24 @@ struct Server {
     /// `$/progress` the server sends is gated on this — a client that did not
     /// ask for progress receives none, on any path.
     progress: bool,
+    /// A monotonic counter making every server-created progress token — and
+    /// the `window/workDoneProgress/create` request id that carries it —
+    /// unique within the session.
+    ///
+    /// Both used to be derived from the token *name* alone, which is a
+    /// compile-time constant, so three config reloads sent three `create`
+    /// requests sharing one id and one token (Shockwave round 6). Neither is
+    /// legal: JSON-RPC ids must be unique among outstanding requests, and LSP
+    /// requires a server-generated token to be unique. A client that tracks
+    /// its outstanding requests by id sees the second `create` collide with
+    /// the first. The startup tokens fire once each, but get the same
+    /// treatment — a rule with an exception is a rule nobody can check.
+    ///
+    /// A `Cell` because the progress helpers take `&self`:
+    /// `harvest_announced` is called as `self.rocks = self.harvest_announced(…)`,
+    /// which a `&mut self` chain cannot express. The server is
+    /// single-threaded, so there is nothing to share it across.
+    progress_seq: Cell<u64>,
 }
 
 /// The progress token id and title the startup rock harvest announces itself
@@ -588,6 +615,7 @@ impl Server {
             known_globals,
             open_docs: HashMap::new(),
             progress,
+            progress_seq: Cell::new(0),
         };
         // Safe to send: `run` only builds the server after `initialize_finish`.
         server.log_lint_config_problems(&config.unknown_lint_rules);
@@ -758,7 +786,7 @@ impl Server {
     /// progress indicator at startup instead of an unexplained pause.
     fn bootstrap(&mut self) {
         let files = self.collect_lua_files();
-        let token = self.progress.then(|| self.begin_progress(files.len()));
+        let token = self.begin_progress(files.len());
 
         for (i, path) in files.into_iter().enumerate() {
             let Ok(text) = fs::read_to_string(&path) else {
@@ -804,18 +832,28 @@ impl Server {
     }
 
     /// Create the bootstrap progress token on the client and send `begin`.
-    fn begin_progress(&self, total: usize) -> ProgressToken {
-        let token = self.create_progress_token("luabox/bootstrap");
-        self.send_progress(
-            &token,
-            WorkDoneProgress::Begin(WorkDoneProgressBegin {
-                title: "Indexing workspace".to_string(),
-                message: Some(format!("0/{total} files")),
-                percentage: Some(0),
-                ..WorkDoneProgressBegin::default()
-            }),
-        );
-        token
+    ///
+    /// `None` when the client did not advertise `window.workDoneProgress`, so
+    /// the caller sends nothing at all — the same shape, and the same gate, as
+    /// [`Self::begin_progress_titled`]. The gate used to live at the single
+    /// call site instead, which made "every `$/progress` is gated" a property
+    /// of *where this is called from* rather than of the function. The reload
+    /// path is what a second call site forgetting it looks like (Shockwave
+    /// round 5); this is the structural version of that fix.
+    fn begin_progress(&self, total: usize) -> Option<ProgressToken> {
+        self.progress.then(|| {
+            let token = self.create_progress_token("luabox/bootstrap");
+            self.send_progress(
+                &token,
+                WorkDoneProgress::Begin(WorkDoneProgressBegin {
+                    title: "Indexing workspace".to_string(),
+                    message: Some(format!("0/{total} files")),
+                    percentage: Some(0),
+                    ..WorkDoneProgressBegin::default()
+                }),
+            );
+            token
+        })
     }
 
     /// An untotalled work-done token for a single indivisible step — a rock
@@ -847,14 +885,24 @@ impl Server {
     /// Ask the client to create a server-side progress token. A client that
     /// does not support it simply answers with an error, which is why the
     /// response is not waited on.
+    ///
+    /// `name` is a *kind* (`luabox/reload`), not an identity: the token that
+    /// goes on the wire is `name` plus the next value of
+    /// [`Self::progress_seq`], so the third reload of a session announces
+    /// itself as `luabox/reload-2` and its `create` request carries the
+    /// matching id. Both must be unique — see [`Self::progress_seq`] — and
+    /// deriving them from one counter is what keeps them in step.
     fn create_progress_token(&self, name: &str) -> ProgressToken {
-        let token = ProgressToken::String(name.to_string());
+        let seq = self.progress_seq.get();
+        self.progress_seq.set(seq.wrapping_add(1));
+        let unique = format!("{name}-{seq}");
+        let token = ProgressToken::String(unique.clone());
         let create = WorkDoneProgressCreateParams {
             token: token.clone(),
         };
         if let Ok(value) = serde_json::to_value(create) {
             let _ = self.connection.sender.send(Message::Request(Request::new(
-                RequestId::from(format!("{name}-progress")),
+                RequestId::from(format!("{unique}-progress")),
                 WorkDoneProgressCreate::METHOD.to_string(),
                 value,
             )));
@@ -2543,6 +2591,73 @@ mod tests {
         );
     }
 
+    /// Every `window/workDoneProgress/create` request the client end received,
+    /// as `(request id, token)` pairs.
+    fn progress_creates(client: &Connection) -> Vec<(String, String)> {
+        drain(client)
+            .iter()
+            .filter_map(|message| match message {
+                Message::Request(request)
+                    if request.method == super::WorkDoneProgressCreate::METHOD =>
+                {
+                    Some((
+                        request.id.to_string(),
+                        request.params["token"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                    ))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Two consecutive reloads must not reuse either identifier. Both were
+    /// compile-time constants derived from the token *name*, so three reloads
+    /// sent three `window/workDoneProgress/create` requests sharing one id and
+    /// one token (Shockwave round 6) — and both are required to be unique:
+    /// JSON-RPC ids among outstanding requests, LSP tokens by the
+    /// server-generated-token rule.
+    ///
+    /// Asserted on the pair, not on the format. What the counter has to buy is
+    /// distinctness; `luabox/reload-3` is one spelling of it.
+    #[test]
+    fn consecutive_reloads_do_not_reuse_a_progress_id_or_token() {
+        let (_dir, mut server, client) = test_server();
+        // Drop the startup harvest's create, so what is left is the reloads'.
+        let _startup = progress_creates(&client);
+
+        let mut seen: Vec<(String, String)> = Vec::new();
+        for _ in 0..3 {
+            server
+                .handle_notification(Notification {
+                    method: super::DidChangeConfiguration::METHOD.to_string(),
+                    params: json!({ "settings": {} }),
+                })
+                .expect("a configuration change is not fatal");
+            seen.extend(progress_creates(&client));
+        }
+
+        assert_eq!(seen.len(), 3, "one create per reload: {seen:?}");
+        let ids: std::collections::HashSet<&str> = seen.iter().map(|(id, _)| id.as_str()).collect();
+        let tokens: std::collections::HashSet<&str> =
+            seen.iter().map(|(_, token)| token.as_str()).collect();
+        assert_eq!(ids.len(), 3, "request ids must be distinct: {seen:?}");
+        assert_eq!(
+            tokens.len(),
+            3,
+            "progress tokens must be distinct: {seen:?}"
+        );
+        // …and each still says which pause it is announcing.
+        assert!(
+            tokens
+                .iter()
+                .all(|token| token.starts_with(super::RELOAD_HARVEST_PROGRESS.0)),
+            "a reload must announce itself under the reload kind: {seen:?}"
+        );
+    }
+
     /// The other direction, on both harvest paths: a client that does not
     /// advertise `window.workDoneProgress` must receive **zero** progress
     /// traffic. The reload path read no capability at all before round 5 — it
@@ -2579,10 +2694,11 @@ mod tests {
     /// pool by the time `run` calls this. Calling it repeatedly, and after a
     /// pool exists, must be a no-op rather than a panic or an abort.
     ///
-    /// This is the strongest assertion available: see `pin_worker_stacks`'s
-    /// doc comment for why a "delete the pin and watch a worker overflow"
-    /// differential cannot be constructed against a parser that caps recursion
-    /// depth below what a 2 MiB stack holds.
+    /// This asserts the `Err` arm and nothing about the stack size — it
+    /// cannot, because the global pool of this binary may have been built by
+    /// any earlier test. What isolates the pin itself is
+    /// `tests/pinned_stack.rs`, which owns its own test binary for exactly
+    /// that reason.
     #[test]
     fn pinning_worker_stacks_is_idempotent_and_never_fatal() {
         use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
