@@ -5,7 +5,7 @@ priority: high
 agent: claude
 live: true
 status: Waves 21+22+23 landed on develop; 24 (#46) in flight
-updatedAt: 2026-08-01T23:55:00.000Z
+updatedAt: 2026-08-01T20:35:00.000Z
 ---
 # Burn-down 2: the issues the PR #47 review raised
 
@@ -137,3 +137,5 @@ Owner directive: burn down both what was open AND what the reviews opened. Eight
   Not verifiable locally: nothing behavioural — the whole issue is reproducible in-tree and every claim above is pinned by a test. The only unverified reading is that a real editor renders the wider table-shaped hover acceptably; the LSP contract (a markdown code block) is unchanged, only its contents are longer.
 
   `target/scratch/` removed. Pushed to `origin/sprint/w23-hover-require`. **No PR opened**, per the wave brief.
+
+- **claude** (2026-08-01T20:35:00.000Z): Wave 23 merged to develop (`4e3e88b`; this card resolved keep-both, CHANGELOG merged clean). Spot-checks green on the merged head, exit codes direct: fmt 0, clippy 0, `cargo test --workspace` 0, release `acceptance` **872/872** (4751 steps), release `lsp_acceptance` **210/210** (1527 steps — wave 23's 14 scenarios and wave 21's 2 now both on the merged head), `control-flow-differential.sh` **112/112**, `lb0510-matrix.sh` **119/119** lint AND runtime (Lua 5.4.6). Pushed. Disk incident averted at merge time: 3.7G free when the wave-23 notification arrived (wave 24 building concurrently); freed `wt-w23/target` (7.4G) before running gates, 12G free after; wt-w23 worktree now fully removed. Seven of eight burnable issues fixed on develop (#48 #49 #50 #51 #52 #53 #54); #46 (wave 24) is the last one in flight.
