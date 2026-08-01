@@ -28,11 +28,13 @@
 //!   [`Server::notification_params`]). Only genuine transport failures — a
 //!   closed stdin, a dead [`Connection`] — end the loop.
 
-use std::collections::{HashMap, HashSet};
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use lsp_server::{
@@ -48,7 +50,7 @@ use lsp_types::request::{
     FoldingRangeRequest, Formatting, GotoDefinition, GotoImplementation, GotoTypeDefinition,
     HoverRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting, References,
     RegisterCapability, Rename, Request as _, SelectionRangeRequest, SemanticTokensFullRequest,
-    SignatureHelpRequest, WorkDoneProgressCreate, WorkspaceSymbolRequest,
+    Shutdown, SignatureHelpRequest, WorkDoneProgressCreate, WorkspaceSymbolRequest,
 };
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyItem, CallHierarchyOutgoingCall,
@@ -72,7 +74,8 @@ use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
 use luabox_lint::{LintConfig, UnknownRuleId, lint_source};
 use luabox_manifest::layout::{self, DefFiles};
 use luabox_manifest::model::{DialectId, Manifest};
-use luabox_types::{Ambient, build_ambient};
+use luabox_types::{Ambient, RockModule, RockSurfaces, build_ambient};
+use rayon::prelude::*;
 
 use crate::line_index::LineIndex;
 use crate::sema::FileSema;
@@ -106,10 +109,67 @@ pub fn run_stdio() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The stack budget every thread that recurses over syntax trees gets,
+/// mirroring `luabox-cli`'s `PINNED_STACK_BYTES`. Recursion depth is bounded
+/// by the parser's own `MAX_DEPTH`, so this is a constant of the design and
+/// not of whichever platform default applies: an unconfigured rayon pool
+/// hands workers Rust's 2 MiB.
+///
+/// Public so that "mirroring `luabox-cli`'s" is a *checkable* claim rather
+/// than a comment — `luabox-cli` asserts the two are equal
+/// (`the_lsp_and_the_cli_pin_the_same_worker_stack`). Nothing else reads it.
+pub const PINNED_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// Pin the global rayon pool's worker stacks, best effort.
+///
+/// The `luabox lsp` subcommand reaches this crate through `luabox-cli`'s
+/// `real_main`, which already pins the pool — but [`run_stdio`] and [`run`]
+/// are `pub`, and an embedder calling either directly got rayon's 2 MiB
+/// default on every worker of the startup rock harvest (Shockwave round 4).
+/// Pinning at the library entry closes that. `Err` means a pool was already
+/// built for this process — exactly what the CLI path does, and what a test
+/// harness may do — and whoever configured it keeps their choice.
+///
+/// # What isolates this call
+///
+/// No program the *parser* accepts can tell a pinned worker from an unpinned
+/// one. Recursion over a syntax tree is bounded by `MAX_DEPTH`, and
+/// `luabox-syntax`'s `parsing_at_the_depth_limit_fits_a_default_stack` proves
+/// — in a *debug* build, whose frames are several times fatter than
+/// release's — that parsing at exactly that limit fits 2 MiB;
+/// `a_deep_rock_tree_survives_the_startup_harvest` makes the same point for
+/// the whole harvest pipeline through deliberately *unpinned* rayon workers.
+/// Anything deeper than `MAX_DEPTH` is rejected before recursion begins.
+///
+/// That is a claim about parser-driven recursion, and wave 16's version of
+/// this comment overreached by generalising it to "no such test can exist"
+/// (Shockwave round 6). A **synthetic** recursion is not parser-capped, and
+/// one calibrated to need well over 2 MiB and well under 16 MiB does isolate
+/// the pin. `tests/pinned_stack.rs` is that test: it reaches this function
+/// through [`run`] — the production call site, not a back door — and then
+/// recurses on a global-pool worker. Delete the call in `run`, drop
+/// `.stack_size` from the builder below, or lower both constants to rayon's
+/// 2 MiB default, and that worker overflows and takes the test binary with
+/// it.
+///
+/// The rest is still tested here: the constant matches the CLI's
+/// (`luabox-cli`, above), and calling this is idempotent and never fatal
+/// ([`tests::pinning_worker_stacks_is_idempotent_and_never_fatal`]) — the
+/// `Err` arm, which is what production actually takes on the CLI path, where
+/// `real_main` has already built the pool.
+fn pin_worker_stacks() {
+    let _ = rayon::ThreadPoolBuilder::new()
+        .stack_size(PINNED_STACK_BYTES)
+        .build_global();
+}
+
 /// Run the server over any [`Connection`] (stdio in production,
 /// [`Connection::memory`] in tests): initialize handshake, project
 /// bootstrap, then the message loop. Returns after a clean shutdown.
 pub fn run(connection: Connection) -> anyhow::Result<()> {
+    // Both public entry points pin, not just `run_stdio`: an embedder that
+    // owns its own transport reaches the same harvest through this one.
+    pin_worker_stacks();
     let (id, params) = connection.initialize_start()?;
     // Params the handshake cannot decode (a `rootUri` with an unencoded space
     // is the realistic one) end the session — there is no workspace to serve —
@@ -137,7 +197,12 @@ pub fn run(connection: Connection) -> anyhow::Result<()> {
     connection.initialize_finish(id, serde_json::to_value(result)?)?;
 
     // Client capabilities that gate optional protocol features: work-done
-    // progress for the bootstrap index, and dynamic file-watcher registration.
+    // progress for every pause the server announces (the startup rock harvest,
+    // the bootstrap index, the config reload), and dynamic file-watcher
+    // registration. This rides on the `Server` rather than staying a
+    // `bootstrap` argument because a client that does not advertise
+    // `window.workDoneProgress` must see no `$/progress` traffic *at all* —
+    // the reload path was sending it unconditionally (Shockwave round 5).
     let work_done_progress = params
         .capabilities
         .window
@@ -155,11 +220,17 @@ pub fn run(connection: Connection) -> anyhow::Result<()> {
     let root = root_path(&params)
         .or_else(|| std::env::current_dir().ok())
         .context("cannot determine a workspace root")?;
-    let mut server = Server::new(connection, root);
+    // `Server::new` runs the startup rock harvest, and announces it — which is
+    // a server-initiated `window/workDoneProgress/create` before the client's
+    // `initialized` notification. That is protocol-legal: LSP only bars the
+    // server from speaking *until it has responded to `initialize`*, and
+    // `initialize_finish` above is that response. The bootstrap token below
+    // has been sent from the same window since it shipped.
+    let mut server = Server::new(connection, root, work_done_progress);
     if watch_files {
         server.register_file_watchers();
     }
-    server.bootstrap(work_done_progress);
+    server.bootstrap();
     server.main_loop()
 }
 
@@ -256,6 +327,11 @@ struct ProjectConfig {
     /// matches `luabox check`'s. Combined with the dialect stdlib into the
     /// server's [`Ambient`].
     def_sources: Vec<String>,
+    /// The `lua_modules/share/lua/<X.Y>/` version directory whose installed rock
+    /// sources are harvested for their type surfaces (#30) — chosen by `[build]
+    /// target` (the edition when unset), exactly as `luabox check` chooses it, so
+    /// the editor harvests the tree the build resolves against.
+    rock_version_dir: &'static str,
     /// The resolved `[lint]` configuration (tiers/rules/allowed globals),
     /// built from `manifest.lint` the same way `luabox lint` builds it, so the
     /// editor honours the project's lint config exactly as the CLI does.
@@ -273,6 +349,7 @@ impl ProjectConfig {
             strictness: Strictness::Warn,
             out_dir: None,
             def_sources: Vec::new(),
+            rock_version_dir: luabox_bundle::rocks_version_dir(Dialect::Lua54),
             lint: LintConfig::new(),
             unknown_lint_rules: Vec::new(),
         };
@@ -295,6 +372,9 @@ impl ProjectConfig {
             strictness: Strictness::from_manifest_flag(manifest.types.strict),
             out_dir: Some(root.join(&manifest.build.out)),
             def_sources: ambient_def_sources(root, &manifest),
+            rock_version_dir: luabox_bundle::rocks_version_dir(syntax_dialect(
+                manifest.build.target,
+            )),
             lint,
             unknown_lint_rules,
         }
@@ -338,6 +418,119 @@ fn ambient_def_sources(root: &Path, manifest: &Manifest) -> Vec<String> {
         .collect()
 }
 
+/// Harvest the type surfaces of the project's vendored luarocks tree (#30) —
+/// `luabox_types::rocks::harvest_file` over `layout::collect_rock_sources`,
+/// folded by `RockSurfaces::fold`, the same pair `luabox check` drives, so a
+/// rock's classes and export types resolve in the editor exactly as they do in
+/// CI.
+///
+/// # It runs on two paths, and both are synchronous
+///
+/// - [`Server::new`] — after the `initialize` handshake, before the main
+///   loop, so every millisecond here is a millisecond the editor shows no
+///   diagnostics. Wrapped in a work-done token since round 5
+///   ([`Server::harvest_announced`]): the handshake has already been answered
+///   by then, so a server-initiated `window/workDoneProgress/create` is
+///   protocol-legal, and the pause is attributable rather than silent;
+/// - [`Server::reload_config`] — reached from `workspace/
+///   didChangeConfiguration` and from a watched edit to `luabox.toml`. A
+///   manifest edit can move the version directory (`[build] target`) and the
+///   tree itself may have grown a rock, so the reload re-harvests. That
+///   happens **on the main loop**, so the same wall-clock cost lands as a
+///   mid-session stall every time the manifest is saved — not once, at
+///   startup, as this comment used to claim (Shockwave round 4). It is wrapped
+///   in the same work-done progress token, so the pause is visible in the
+///   editor instead of looking like a hang.
+///
+/// Both tokens are gated on the client's `window.workDoneProgress` capability
+/// ([`Server::progress`]): a client that did not ask for progress receives
+/// none, and simply sees the pause.
+///
+/// Per-file reduction is pure and independent, so it rides the rayon pool;
+/// the fold is what orders the surfaces (path order = precedence), so the
+/// parallel and sequential forms give the identical result.
+///
+/// The pool is the global one, pinned to a 16 MiB worker stack by
+/// `luabox-cli`'s `real_main` on the `luabox lsp` path and by
+/// [`pin_worker_stacks`] for a library caller that owns its own transport —
+/// so these workers get the stack the syntax walks need, not rayon's 2 MiB
+/// default. `a_deep_rock_tree_survives_the_startup_harvest` drives the
+/// harvest at depth 195 over 32 files through the *unpinned* path on purpose.
+///
+/// # Measured, by a committed harness
+///
+/// `scripts/lsp-startup-bench.sh` reproduces every number below end to end:
+/// it generates the corpus (`gen-corpus --rock-tree`: 50 files, 102,813 lines
+/// of `---@class`-annotated Lua under `lua_modules/share/lua/5.4/`), drives
+/// the real stdio protocol (`initialize` -> `initialized` -> `didOpen`) and
+/// times to the FIRST `publishDiagnostics`. It is not a CI gate — SPEC.md's
+/// LSP perf budget is future work — but the claim is re-runnable, which the
+/// prose-described corpus and scratch-directory driver it replaces were not.
+///
+/// **Host** (the numbers below are one host's, and only that host's):
+/// `Intel(R) Xeon(R) Processor @ 2.80GHz`, 4 vCPU, containerized/virtualized
+/// sandbox, 7 runs per row.
+///
+/// | harvest                                         | median  | min     |
+/// |-------------------------------------------------|---------|---------|
+/// | sequential (`RAYON_NUM_THREADS=1`, same binary)  | 2751 ms | 2673 ms |
+/// | parallel                                        |  760 ms |  718 ms |
+///
+/// 3.6x. The baseline is the same binary forced to one rayon worker rather
+/// than a pre-fix build, so the comparison is of the parallelism and of
+/// nothing else in a commit range. The same project with the rock tree removed
+/// publishes in 11 ms, so the harvest is effectively the whole of that number.
+///
+/// **The sequential row is single-host and does not reproduce.** A reviewer's
+/// own 4 vCPU box measured a *maximum* of 2384 ms against this host's
+/// *minimum* of 2673 — non-overlapping ranges — and a ratio of 2.8x rather
+/// than 3.6x. One rayon worker doing all the parsing is exactly the shape that
+/// is sensitive to CPU steal on a shared virtualized host, which is why the
+/// host is recorded here and why the harness, not the constant, is the thing
+/// that is committed. Re-run it before quoting either number.
+///
+/// # Why it is still synchronous
+///
+/// The asynchronous form (background thread, republish on completion) buys
+/// the latency with a *correctness* cost the synchronous form does not have:
+/// between the first publish and the harvest landing, every project file
+/// naming a rock class would be diagnosed against an empty rock layer, so
+/// `LB0305`/`LB0306` would flash red and then vanish. A burst of wrong
+/// squiggles is worse than a pause with a progress indicator on it.
+///
+/// That trade is easier to defend at startup than on reload, and the reload
+/// stall is the honest reason to reopen it — along with the *shape* of the
+/// tree, not this constant: a vendored tree several times larger changes the
+/// trade, and at that point the republish path (and the false-positive window
+/// it opens) is the thing to design, not another constant factor here.
+///
+/// Rock sources that could not be parsed are named in the client's log pane:
+/// that is where a debug-level note about vendored code belongs, and it is the
+/// answer to "why did this rock's types not show up?". They are never published
+/// as diagnostics — no document owns them.
+fn harvest_rock_tree(root: &Path, version_dir: &str, ambient: &Ambient) -> RockSurfaces {
+    let sources: Vec<RockModule> = layout::collect_rock_sources(root, version_dir)
+        .into_iter()
+        .map(|source| RockModule {
+            module: source.module,
+            label: source.label,
+            path: source.path,
+            text: source.text,
+        })
+        .collect();
+    let files: Vec<luabox_types::RockFile> = sources
+        .par_iter()
+        .map(|source| luabox_types::rocks::harvest_file(ambient, source))
+        .collect();
+    let harvested = RockSurfaces::fold(&sources, files);
+    for label in harvested.skipped() {
+        log_to_stderr(&format!(
+            "luabox-lsp: skipped unparseable rock source `{label}` while harvesting types"
+        ));
+    }
+    harvested
+}
+
 /// The server state: the analysis host over the project's `.lua` files.
 struct Server {
     connection: Connection,
@@ -350,6 +543,12 @@ struct Server {
     /// dependency defs, #108), built once at startup so the editor's type
     /// resolution matches `luabox check`.
     ambient: Ambient,
+    /// The type surfaces harvested from the project's vendored luarocks tree
+    /// (#30), built once at startup alongside [`Self::ambient`]: rock classes,
+    /// enums and aliases, plus each rock module's `require`-export type. Merged
+    /// per file in [`crate::diagnostics`] — *after* the project's own types, so
+    /// explicit beats implicit.
+    rocks: RockSurfaces,
     /// The resolved `[lint]` configuration, driving the lint pass in
     /// [`Self::publish_lua`] and the quick-fixes in [`Self::code_actions`].
     lint: LintConfig,
@@ -362,10 +561,140 @@ struct Server {
     /// didOpen/didClose so a `workspace/didChangeConfiguration` can republish
     /// diagnostics for every open buffer after a settings change.
     open_docs: HashMap<PathBuf, Uri>,
+    /// Whether the client advertised `window.workDoneProgress`. Every
+    /// `$/progress` the server sends is gated on this — a client that did not
+    /// ask for progress receives none, on any path.
+    progress: bool,
+    /// A monotonic counter making every server-created progress token — and
+    /// the `window/workDoneProgress/create` request id that carries it —
+    /// unique within the session.
+    ///
+    /// Both used to be derived from the token *name* alone, which is a
+    /// compile-time constant, so three config reloads sent three `create`
+    /// requests sharing one id and one token (Shockwave round 6). Neither is
+    /// legal: JSON-RPC ids must be unique among outstanding requests, and LSP
+    /// requires a server-generated token to be unique. A client that tracks
+    /// its outstanding requests by id sees the second `create` collide with
+    /// the first. The startup tokens fire once each, but get the same
+    /// treatment — a rule with an exception is a rule nobody can check.
+    ///
+    /// A `Cell` because the progress helpers take `&self`:
+    /// `harvest_announced` is called as `self.rocks = self.harvest_announced(…)`,
+    /// which a `&mut self` chain cannot express. The server is
+    /// single-threaded, so there is nothing to share it across.
+    progress_seq: Cell<u64>,
+    /// Client messages read off the wire by [`Self::await_progress_create`]
+    /// while it was waiting for a `window/workDoneProgress/create` response,
+    /// and not yet handled. [`Self::main_loop`] drains this before reading
+    /// anything new, so a notification the client sent during the startup
+    /// harvest is handled in arrival order rather than lost.
+    ///
+    /// A `RefCell` for the same reason [`Self::progress_seq`] is a `Cell`:
+    /// the progress helpers run behind `&self`.
+    pending: RefCell<VecDeque<Message>>,
+    /// Whether a `window/workDoneProgress/create` has already gone
+    /// unanswered. A client that ignores one ignores them all, and the wait
+    /// costs [`PROGRESS_CREATE_TIMEOUT`] every time it is paid: two startup
+    /// tokens plus one per config reload.
+    ///
+    /// Once set, **no further create is sent at all** and every later
+    /// announcement is silent for the rest of the session. Wave 19 only
+    /// skipped the *wait*, which kept the latency win and lost the guarantee
+    /// the wait exists for: the create still went out, the client's late
+    /// error answer landed in [`Self::main_loop`]'s discard arm, and
+    /// `$/progress` went out under a token it had just refused (Shockwave
+    /// round 9, B2). A refusal check a latency optimisation can step around
+    /// is not a check. Not sending is simpler than polling for a late answer
+    /// and strictly stronger — there is no token, so there is nothing to
+    /// report under and no traffic to a client that is not listening.
+    ///
+    /// The cost is disclosed rather than hidden: **one timeout mutes progress
+    /// for the session**, so a client that stalls once during startup and
+    /// recovers gets no progress on later reloads. That client was already
+    /// getting `$/progress` under tokens it never acknowledged, which is the
+    /// thing this mechanism was built to stop.
+    ///
+    /// Only a *timeout* sets this. A client that answers — with a result or
+    /// with an error — has told the server something, and the next create is
+    /// sent and waited for normally.
+    create_unanswered: Cell<bool>,
+    /// Whether the client has asked to end the session: a `shutdown` request
+    /// or an `exit` notification has been seen, wherever it was seen.
+    ///
+    /// Sticky, and that is the point. Aborting *one* create window on a
+    /// session-ender is not enough, because `run` opens two before the loop
+    /// (the startup harvest, then `bootstrap`) and a queued reload can open
+    /// more from inside it. Window 1 would abort on the `shutdown` and leave
+    /// the `exit` on the channel — correct — and window 2 would then drain
+    /// that `exit` onto [`Self::pending`], where
+    /// [`Self::shutdown_handshake`]'s predecessor could not see it: 30 s of
+    /// waiting for a notification the server was holding, then exit 1,
+    /// byte-identical to the pre-round-8 behaviour (Shockwave round 9, B1).
+    ///
+    /// Once set, [`Self::create_progress_token`] sends nothing and returns no
+    /// token, so no window opens and nothing is announced to a client that is
+    /// leaving.
+    shutting_down: Cell<bool>,
 }
 
+/// What a `window/workDoneProgress/create` came back as.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CreateOutcome {
+    /// The client answered with a result: the token is live.
+    Accepted,
+    /// The client answered with an error: the token is refused and nothing
+    /// may be reported under it.
+    Refused,
+    /// No answer arrived — the wait timed out or the transport died. The
+    /// caller reports under the token regardless, which is the behaviour this
+    /// whole mechanism replaced and so is no worse than it.
+    Unanswered,
+    /// The session is ending: the wait was abandoned because a `shutdown` or
+    /// an `exit` arrived. Distinct from [`Self::Unanswered`] because the
+    /// caller must **not** report under the token — a `begin`/`report`/`end`
+    /// sequence to a client that has asked to shut down is traffic nobody
+    /// wants, and it used to go out because the abort path returned the token
+    /// like any other unanswered create.
+    Ending,
+}
+
+/// Whether a message is one of the two that end the session, and so must
+/// reach [`Server::main_loop`] rather than wait behind a progress token.
+fn ends_the_session(message: &Message) -> bool {
+    match message {
+        Message::Request(request) => request.method == Shutdown::METHOD,
+        Message::Notification(notification) => notification.method == Exit::METHOD,
+        Message::Response(_) => false,
+    }
+}
+
+/// How long the server waits for the client to answer
+/// `window/workDoneProgress/create` before reporting under the token anyway.
+///
+/// The wait is what the protocol asks for; the bound is what keeps a client
+/// that answers nothing from freezing the session. Timing out and sending the
+/// `begin` regardless is exactly the behaviour this whole mechanism replaced,
+/// so the degraded path is no worse than the old unconditional one — and a
+/// local editor answers a create in well under a millisecond (Shockwave's
+/// round-7 capture measured the *server's* two sends 0.1 ms apart).
+const PROGRESS_CREATE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// How long [`Server::shutdown_handshake`] waits for the `exit` that must
+/// follow a `shutdown`. Matches what `Connection::handle_shutdown` allowed,
+/// so replacing it changes which messages are *found*, not how long a client
+/// that really does go silent is given.
+const SHUTDOWN_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The progress token id and title the startup rock harvest announces itself
+/// under. Distinct from the reload's so a client (and the protocol tests) can
+/// tell the two pauses apart.
+const STARTUP_HARVEST_PROGRESS: (&str, &str) = ("luabox/rock-harvest", "Indexing luabox rock tree");
+
+/// The same, for the config reload's re-harvest.
+const RELOAD_HARVEST_PROGRESS: (&str, &str) = ("luabox/reload", "Reloading luabox configuration");
+
 impl Server {
-    fn new(connection: Connection, root: PathBuf) -> Self {
+    fn new(connection: Connection, root: PathBuf, progress: bool) -> Self {
         let config = ProjectConfig::discover(&root);
         let ambient = build_ambient(config.dialect, &config.def_sources);
         let known_globals = ambient.global_names().clone();
@@ -374,7 +703,7 @@ impl Server {
         // strings resolve exactly as `luabox check` resolves them on disk (the
         // bundler's SPEC.md §7 path-mapping) — editor and CI in lockstep.
         host.set_root(root.clone());
-        let server = Self {
+        let mut server = Self {
             connection,
             host,
             root,
@@ -382,13 +711,45 @@ impl Server {
             strictness: config.strictness,
             out_dir: config.out_dir,
             ambient,
+            rocks: RockSurfaces::default(),
             lint: config.lint,
             known_globals,
             open_docs: HashMap::new(),
+            progress,
+            progress_seq: Cell::new(0),
+            pending: RefCell::new(VecDeque::new()),
+            create_unanswered: Cell::new(false),
+            shutting_down: Cell::new(false),
         };
         // Safe to send: `run` only builds the server after `initialize_finish`.
         server.log_lint_config_problems(&config.unknown_lint_rules);
+        // The startup harvest runs *here*, after the struct exists, so it can
+        // go through the same announced-harvest helper the reload uses. It used
+        // to run before the struct was built, which is why it was the one
+        // synchronous pause with no token on it — Shockwave captured 746 ms of
+        // protocol silence between the `initialize` response and the bootstrap
+        // token, covering an index that itself took 0.1 ms (round 5). The work
+        // is unchanged; what is new is that the client can attribute the wait.
+        server.rocks = server.harvest_announced(config.rock_version_dir, STARTUP_HARVEST_PROGRESS);
         server
+    }
+
+    /// Run the rock-tree harvest inside a work-done progress token, so the
+    /// synchronous pause is attributable in the editor instead of reading as a
+    /// hang. Both callers — startup and [`Self::reload_config`] — come through
+    /// here, and both inherit the client-capability gate in
+    /// [`Self::begin_progress_titled`].
+    ///
+    /// Harvests against [`Self::ambient`], which both callers set before
+    /// calling: `new` builds it into the struct, `reload_config` installs the
+    /// freshly built one first.
+    fn harvest_announced(&self, version_dir: &str, progress: (&str, &str)) -> RockSurfaces {
+        let token = self.begin_progress_titled(progress.0, progress.1);
+        let rocks = harvest_rock_tree(&self.root, version_dir, &self.ambient);
+        if let Some(token) = &token {
+            self.end_progress(token);
+        }
+        rocks
     }
 
     /// Tell the client about `[lint]` keys that name no known rule id, as
@@ -437,8 +798,23 @@ impl Server {
     fn reload_config(&mut self) -> anyhow::Result<()> {
         let config = ProjectConfig::discover(&self.root);
         let ambient = build_ambient(config.dialect, &config.def_sources);
+        // Re-harvested too: a manifest edit can move the version directory
+        // (`[build] target`), and the tree itself may have grown a rock since
+        // startup — a reload is the cheapest honest moment to notice.
+        //
+        // This is the startup harvest's whole cost, landing mid-session on the
+        // main loop (see `harvest_rock_tree`), so it is announced: without the
+        // token the editor goes unresponsive for the best part of a second
+        // every time `luabox.toml` is saved, with nothing to attribute it to.
+        // The work itself is unchanged — this is a label on the pause, not a
+        // restructuring of the loop.
+        //
+        // The new ambient layer is installed first because the harvest reads
+        // `self.ambient`, and the freshly discovered one is what the rocks must
+        // be resolved against.
         self.known_globals = ambient.global_names().clone();
         self.ambient = ambient;
+        self.rocks = self.harvest_announced(config.rock_version_dir, RELOAD_HARVEST_PROGRESS);
         self.lint = config.lint;
         // Re-report: the reload may have introduced (or fixed) a typo'd key.
         self.log_lint_config_problems(&config.unknown_lint_rules);
@@ -508,13 +884,13 @@ impl Server {
     /// Load every `.lua` file under the root into the host (so
     /// `project_diagnostics` and cross-file goto have the full picture).
     ///
-    /// When the client supports work-done progress (`progress`), the index is
-    /// wrapped in a server-created `$/progress` token — begin, a report per
-    /// file loaded, then end — so a large workspace shows a progress indicator
-    /// at startup instead of an unexplained pause.
-    fn bootstrap(&mut self, progress: bool) {
+    /// When the client supports work-done progress ([`Self::progress`]), the
+    /// index is wrapped in a server-created `$/progress` token — begin, a
+    /// report per file loaded, then end — so a large workspace shows a
+    /// progress indicator at startup instead of an unexplained pause.
+    fn bootstrap(&mut self) {
         let files = self.collect_lua_files();
-        let token = progress.then(|| self.begin_progress(files.len()));
+        let token = self.begin_progress(files.len());
 
         for (i, path) in files.into_iter().enumerate() {
             let Ok(text) = fs::read_to_string(&path) else {
@@ -535,7 +911,7 @@ impl Server {
         }
 
         if let Some(token) = &token {
-            self.send_progress(token, WorkDoneProgress::End(WorkDoneProgressEnd::default()));
+            self.end_progress(token);
         }
     }
 
@@ -560,18 +936,19 @@ impl Server {
     }
 
     /// Create the bootstrap progress token on the client and send `begin`.
-    fn begin_progress(&self, total: usize) -> ProgressToken {
-        let token = ProgressToken::String("luabox/bootstrap".to_string());
-        let create = WorkDoneProgressCreateParams {
-            token: token.clone(),
-        };
-        if let Ok(value) = serde_json::to_value(create) {
-            let _ = self.connection.sender.send(Message::Request(Request::new(
-                RequestId::from("luabox-bootstrap-progress".to_string()),
-                WorkDoneProgressCreate::METHOD.to_string(),
-                value,
-            )));
+    ///
+    /// `None` when the client did not advertise `window.workDoneProgress`, so
+    /// the caller sends nothing at all — the same shape, and the same gate, as
+    /// [`Self::begin_progress_titled`]. The gate used to live at the single
+    /// call site instead, which made "every `$/progress` is gated" a property
+    /// of *where this is called from* rather than of the function. The reload
+    /// path is what a second call site forgetting it looks like (Shockwave
+    /// round 5); this is the structural version of that fix.
+    fn begin_progress(&self, total: usize) -> Option<ProgressToken> {
+        if !self.progress {
+            return None;
         }
+        let token = self.create_progress_token("luabox/bootstrap")?;
         self.send_progress(
             &token,
             WorkDoneProgress::Begin(WorkDoneProgressBegin {
@@ -581,7 +958,215 @@ impl Server {
                 ..WorkDoneProgressBegin::default()
             }),
         );
-        token
+        Some(token)
+    }
+
+    /// An untotalled work-done token for a single indivisible step — a rock
+    /// harvest, which has no per-file report to make from inside
+    /// `harvest_rock_tree`'s `par_iter`.
+    ///
+    /// `None` when the client did not advertise `window.workDoneProgress`, so
+    /// the caller sends nothing at all. This gate used to live only at
+    /// `bootstrap`'s call site, which left the reload path announcing itself
+    /// to clients that never asked (Shockwave round 5).
+    ///
+    /// Also `None` when the client **refused** the token — see
+    /// [`Self::create_progress_token`]. Both are the same fact from the
+    /// caller's side ("there is no token to report under"), so both take the
+    /// same silent path and no `begin`/`report`/`end` goes out.
+    fn begin_progress_titled(&self, token_name: &str, title: &str) -> Option<ProgressToken> {
+        if !self.progress {
+            return None;
+        }
+        let token = self.create_progress_token(token_name)?;
+        self.send_progress(
+            &token,
+            WorkDoneProgress::Begin(WorkDoneProgressBegin {
+                title: title.to_string(),
+                ..WorkDoneProgressBegin::default()
+            }),
+        );
+        Some(token)
+    }
+
+    fn end_progress(&self, token: &ProgressToken) {
+        self.send_progress(token, WorkDoneProgress::End(WorkDoneProgressEnd::default()));
+    }
+
+    /// Ask the client to create a server-side progress token, and **wait for
+    /// it to answer** before the caller reports anything under that token.
+    ///
+    /// LSP puts the token in the client's hands: `window/workDoneProgress/create`
+    /// is a *request*, and a `$/progress` under a token the client has not
+    /// acknowledged is a notification it is entitled to drop. The server used
+    /// to send the create and the `begin` back to back — Shockwave's round-7
+    /// capture has them 0.1 ms apart with no response in between, and
+    /// [`Self::main_loop`] discarded every `Message::Response`, so the answer
+    /// was never read at all. Against VS Code that works (its client responds,
+    /// and tolerates an early `$/progress`); against a strict client the
+    /// `begin` is dropped and the token announces nothing, which defeats the
+    /// point of having one.
+    ///
+    /// `name` is a *kind* (`luabox/reload`), not an identity: the token that
+    /// goes on the wire is `name` plus the next value of
+    /// [`Self::progress_seq`], so the third reload of a session announces
+    /// itself as `luabox/reload-2` and its `create` request carries the
+    /// matching id. Both must be unique — see [`Self::progress_seq`] — and
+    /// deriving them from one counter is what keeps them in step.
+    /// `None` when there is no usable token: the request could not be sent, or
+    /// the client answered it with an **error**. A `$/progress` under a token
+    /// the client refused is exactly the traffic this mechanism exists to
+    /// stop, and the refusal used to be invisible — `await_progress_create`
+    /// matched on the response id and never looked at `response.error`, so a
+    /// client replying `-32601` still received a `begin`, five `report`s and
+    /// an `end` under a token it had just declined (Shockwave round 8).
+    /// Refusal is now the `progress: false` path exactly: nothing goes out.
+    ///
+    /// Two things make this `None` **before anything is sent**, so the client
+    /// sees no request at all:
+    ///
+    /// - **the session is ending** ([`Self::session_is_ending`]). A client
+    ///   that has sent `shutdown` is not going to render a progress bar, and
+    ///   the request would open a window whose only effect is to swallow the
+    ///   `exit` that follows — which is exactly the round-9 defect;
+    /// - **a previous create went unanswered** ([`Self::create_unanswered`]).
+    ///   Wave 19 skipped the wait but still sent the create, which is how a
+    ///   late refusal ended up reported under. There is nothing to poll for
+    ///   if nothing was asked.
+    ///
+    /// A client that answers *nothing* to the first create keeps the old
+    /// behaviour for that one token — see [`Self::await_progress_create`].
+    fn create_progress_token(&self, name: &str) -> Option<ProgressToken> {
+        if self.session_is_ending() || self.create_unanswered.get() {
+            return None;
+        }
+        let seq = self.progress_seq.get();
+        self.progress_seq.set(seq.wrapping_add(1));
+        let unique = format!("{name}-{seq}");
+        let token = ProgressToken::String(unique.clone());
+        let id = RequestId::from(format!("{unique}-progress"));
+        let create = WorkDoneProgressCreateParams {
+            token: token.clone(),
+        };
+        let value = serde_json::to_value(create).ok()?;
+        self.connection
+            .sender
+            .send(Message::Request(Request::new(
+                id.clone(),
+                WorkDoneProgressCreate::METHOD.to_string(),
+                value,
+            )))
+            .ok()?;
+        match self.await_progress_create(&id) {
+            CreateOutcome::Accepted | CreateOutcome::Unanswered => Some(token),
+            CreateOutcome::Refused | CreateOutcome::Ending => None,
+        }
+    }
+
+    /// Whether the client has asked to end the session — see
+    /// [`Self::shutting_down`].
+    ///
+    /// Two ways to know, and both are consulted. The flag is the record of a
+    /// session-ender this server has already drained, and it is what stops
+    /// the *next* create window opening. The scan of [`Self::pending`] is
+    /// belt and braces: a session-ender sitting on the queue means the loop
+    /// is about to handle it whatever else happens, so opening a window and
+    /// reading the channel first can only get in the way. It also keeps the
+    /// answer right if a session-ender ever reaches the queue by a route the
+    /// flag does not cover.
+    ///
+    /// Cheap: the queue holds what a client said during one create window,
+    /// which is a handful of messages, and this is asked once per token.
+    fn session_is_ending(&self) -> bool {
+        if self.shutting_down.get() {
+            return true;
+        }
+        if self.pending.borrow().iter().any(ends_the_session) {
+            self.shutting_down.set(true);
+            return true;
+        }
+        false
+    }
+
+    /// Read from the connection until the client answers `id`, buffering
+    /// everything else in [`Self::pending`] for [`Self::main_loop`].
+    ///
+    /// Buffering is the whole difficulty. This runs *before* the main loop on
+    /// the startup path (`Server::new` announces the rock harvest) and *on* it
+    /// for a config reload, and in both windows the client is free to speak —
+    /// `initialized`, a `didOpen` for the file the editor restored, a
+    /// `didChangeConfiguration`. Those cannot be dropped, so they go on a
+    /// queue the loop drains first. Responses other than the one being waited
+    /// for are discarded, which is what the loop does with every response
+    /// anyway: this server tracks no outstanding requests of its own.
+    ///
+    /// The wait is bounded by [`PROGRESS_CREATE_TIMEOUT`]. A client that never
+    /// answers gets the old behaviour — the `begin` goes out unacknowledged —
+    /// rather than a server that stops serving it, and after the first such
+    /// timeout it is not waited for again ([`Self::create_unanswered`]).
+    ///
+    /// # Shutdown ends the wait immediately
+    ///
+    /// `shutdown` and `exit` are the two messages that must not sit on the
+    /// queue. [`Connection::handle_shutdown`] answers the request and then
+    /// reads the *channel* for the `exit` that follows, and it cannot see
+    /// [`Self::pending`] — so an `exit` drained in here was invisible to it:
+    /// the server answered the shutdown, waited 30 s for a notification it was
+    /// already holding, and exited 1. A control session without the progress
+    /// capability exited 0, which is what makes it a regression; VS Code and
+    /// Neovim surface it as abnormal termination. It reproduced on the reload
+    /// path as well as at startup.
+    ///
+    /// Aborting the wait on either message fixes it without touching
+    /// `Connection`'s contract: the message goes on the queue in arrival
+    /// order, this returns, and [`Self::main_loop`] drains it into the
+    /// [handshake](Self::shutdown_handshake) — which looks in the queue as
+    /// well as on the channel. Waiting out the remaining 250 ms for a token
+    /// nobody will use is pointless anyway.
+    ///
+    /// Round 9 found that aborting is not sufficient on its own, because
+    /// `run` opens a second window straight afterwards; the abort therefore
+    /// also records [`Self::shutting_down`], and returns
+    /// [`CreateOutcome::Ending`] rather than `Unanswered` so the caller
+    /// reports nothing under a token the client will never see.
+    fn await_progress_create(&self, id: &RequestId) -> CreateOutcome {
+        // The queue may already hold the `shutdown` a previous window drained
+        // — reading the channel ahead of it would take the `exit` too.
+        if self.session_is_ending() {
+            return CreateOutcome::Ending;
+        }
+        let deadline = Instant::now() + PROGRESS_CREATE_TIMEOUT;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.connection.receiver.recv_timeout(left) {
+                Ok(Message::Response(response)) if response.id == *id => {
+                    // A response is not an acceptance. An error answer means
+                    // the client declined the token, and reporting under it
+                    // anyway is the traffic this wait exists to prevent.
+                    return if response.error.is_some() {
+                        CreateOutcome::Refused
+                    } else {
+                        CreateOutcome::Accepted
+                    };
+                }
+                Ok(Message::Response(_)) => {}
+                Ok(other) => {
+                    let ends_the_session = ends_the_session(&other);
+                    self.pending.borrow_mut().push_back(other);
+                    if ends_the_session {
+                        self.shutting_down.set(true);
+                        return CreateOutcome::Ending;
+                    }
+                }
+                // Timed out, or the client hung up. Either way there is
+                // nothing left to wait for; the caller reports regardless and
+                // the loop notices the disconnect on its next read.
+                Err(_) => {
+                    self.create_unanswered.set(true);
+                    return CreateOutcome::Unanswered;
+                }
+            }
+        }
     }
 
     /// Send a `report` for the bootstrap index after loading file `done` of the
@@ -612,19 +1197,107 @@ impl Server {
     }
 
     fn main_loop(&mut self) -> anyhow::Result<()> {
-        while let Ok(msg) = self.connection.receiver.recv() {
+        loop {
+            // Anything [`Self::await_progress_create`] took off the wire while
+            // it waited comes first, in arrival order — a `didOpen` sent
+            // during the startup harvest must be handled, and must be handled
+            // before whatever the client says next.
+            let queued = self.pending.borrow_mut().pop_front();
+            let msg = match queued {
+                Some(msg) => msg,
+                None => match self.connection.receiver.recv() {
+                    Ok(msg) => msg,
+                    Err(_) => return Ok(()),
+                },
+            };
             match msg {
                 Message::Request(req) => {
-                    if self.connection.handle_shutdown(&req)? {
+                    if self.shutdown_handshake(&req)? {
                         return Ok(());
                     }
                     self.handle_request(req)?;
                 }
                 Message::Notification(not) => self.handle_notification(not)?,
+                // The server sends two kinds of request, and reads the
+                // response to one of them. `window/workDoneProgress/create`
+                // is read by `await_progress_create`, where the answer
+                // decides whether the token may be used. `client/registerCapability`
+                // — the file-watcher registration in `register_file_watchers`
+                // — is fire-and-forget, and its response lands here and is
+                // dropped.
+                //
+                // That is a real gap, stated rather than papered over: a
+                // client that *rejects* the watcher registration leaves this
+                // server believing file watching is live, so external edits
+                // go unnoticed until the buffer is touched. Nothing currently
+                // detects it. Closing it means tracking the id and degrading
+                // on an error answer (polling, or a log message telling the
+                // user why the editor is stale), which is a change of
+                // behaviour rather than a comment fix and is not in this
+                // round.
                 Message::Response(_) => {}
             }
         }
-        Ok(())
+    }
+
+    /// Answer a `shutdown` request and wait for the `exit` that must follow
+    /// it, looking in [`Self::pending`] **before** the channel. `false` for
+    /// any other request, which the caller then dispatches normally.
+    ///
+    /// This is [`Connection::handle_shutdown`] with two differences, and it
+    /// replaces it rather than wrapping it because neither can be added from
+    /// outside:
+    ///
+    /// - **it can see the queue.** `Connection` reads the channel and nothing
+    ///   else, which is the whole round-8 defect: an `exit` a create window
+    ///   drained was invisible to it, and it waited out its own 30 s bound
+    ///   for a notification the server was already holding. The sticky
+    ///   [`Self::shutting_down`] flag means no window opens after the first
+    ///   session-ender, so in practice the `exit` is still on the channel —
+    ///   but "in practice" is how the round-8 fix was argued, and this makes
+    ///   it structural instead;
+    /// - **a repeated `shutdown` is answered, not fatal.** `Connection`
+    ///   returns a protocol error for any non-`exit` message, so a client
+    ///   that sends `shutdown` twice — which some editors do when a window
+    ///   close races a user quit — turned a clean session into exit 1. Every
+    ///   request this server receives gets a response, and there is no reason
+    ///   for the last one to be the exception. Anything else during the
+    ///   handshake is still a protocol error, with `Connection`'s wording.
+    ///
+    /// The bound is [`SHUTDOWN_EXIT_TIMEOUT`], matching what `Connection`
+    /// allowed, so a client that answers the request and then vanishes fails
+    /// exactly as it used to.
+    fn shutdown_handshake(&self, req: &Request) -> anyhow::Result<bool> {
+        if req.method != Shutdown::METHOD {
+            return Ok(false);
+        }
+        // Set before the response goes out: from here the session is ending
+        // whatever else arrives, and nothing may open another create window.
+        self.shutting_down.set(true);
+        self.connection
+            .sender
+            .send(Message::Response(Response::new_ok(req.id.clone(), ())))?;
+        let deadline = Instant::now() + SHUTDOWN_EXIT_TIMEOUT;
+        loop {
+            let queued = self.pending.borrow_mut().pop_front();
+            let message = if let Some(message) = queued {
+                message
+            } else {
+                let left = deadline.saturating_duration_since(Instant::now());
+                self.connection.receiver.recv_timeout(left).map_err(|err| {
+                    anyhow::anyhow!("no `exit` notification after `shutdown`: {err}")
+                })?
+            };
+            match message {
+                Message::Notification(not) if not.method == Exit::METHOD => return Ok(true),
+                Message::Request(repeat) if repeat.method == Shutdown::METHOD => {
+                    self.connection
+                        .sender
+                        .send(Message::Response(Response::new_ok(repeat.id, ())))?;
+                }
+                other => anyhow::bail!("unexpected message during shutdown: {other:?}"),
+            }
+        }
     }
 
     // === Requests =========================================================
@@ -1086,8 +1759,14 @@ impl Server {
             actions.push(CodeActionOrCommand::CodeAction(CodeAction {
                 title,
                 kind: Some(CodeActionKind::QUICKFIX),
-                diagnostics: source_diag
-                    .map(|d| vec![diagnostics::convert(index, d, diagnostics::LINT_SOURCE)]),
+                // `convert` derives the source from the code, so this site
+                // cannot hardcode `LINT_SOURCE` any more — it did, until round
+                // 5. The client pairs an action with a published diagnostic by
+                // matching the whole record, source included, so a future
+                // fix-carrying diagnostic outside the lint band is
+                // re-converted under the source it was published with, and
+                // there is no argument here to get wrong.
+                diagnostics: source_diag.map(|d| vec![diagnostics::convert(index, d)]),
                 edit: Some(WorkspaceEdit {
                     changes: Some(changes),
                     ..WorkspaceEdit::default()
@@ -1106,6 +1785,7 @@ impl Server {
         let ctx = diagnostics::CheckCtx {
             strictness: self.strictness,
             ambient: &self.ambient,
+            rocks: &self.rocks,
             lint: &self.lint,
             known_globals: &self.known_globals,
         };
@@ -1304,6 +1984,7 @@ impl Server {
         let ctx = diagnostics::CheckCtx {
             strictness: self.strictness,
             ambient: &self.ambient,
+            rocks: &self.rocks,
             lint: &self.lint,
             known_globals: &self.known_globals,
         };
@@ -1438,7 +2119,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ErrorCode, ProjectConfig, Server, ambient_def_sources, apply_content_changes, root_path,
+        CodeActionOrCommand, ErrorCode, ProjectConfig, PublishDiagnostics, Server,
+        ambient_def_sources, apply_content_changes, root_path,
     };
 
     /// A ranged change replacing `[start, end)` with `text`.
@@ -1835,11 +2517,19 @@ mod tests {
     // client would see*, not about a process that happens to still be alive.
 
     /// A server on an in-memory connection over an empty project, plus the
-    /// client end of the wire and the tempdir that must outlive both.
+    /// client end of the wire and the tempdir that must outlive both. The
+    /// client is taken to support work-done progress; [`test_server_with`]
+    /// drives the other direction.
     fn test_server() -> (TempDir, Server, Connection) {
+        test_server_with(true)
+    }
+
+    /// The same, with the client's `window.workDoneProgress` capability set
+    /// explicitly — every `$/progress` the server sends is gated on it.
+    fn test_server_with(progress: bool) -> (TempDir, Server, Connection) {
         let dir = TempDir::new().expect("tempdir");
         let (server_end, client) = Connection::memory();
-        let server = Server::new(server_end, dir.path().to_path_buf());
+        let server = Server::new(server_end, dir.path().to_path_buf(), progress);
         (dir, server, client)
     }
 
@@ -2036,5 +2726,884 @@ mod tests {
             error.to_string().contains("without a prior `shutdown`"),
             "{error}"
         );
+    }
+    /// The lint quick-fix *pairing*, not just its precondition.
+    ///
+    /// `code_actions` matches a fix back to the diagnostic that produced it
+    /// by comparing suggestion span + replacement, then re-`convert`s that
+    /// diagnostic under `LINT_SOURCE`. Nothing asserted that the result was
+    /// the diagnostic the client was actually shown, so a future non-rule
+    /// finding riding the same `lint_source` engine while carrying a
+    /// machine-applicable fix would pass every band test and still hand the
+    /// editor a `diagnostics` entry that matches nothing in the problems
+    /// pane. Driven over a *mixed* set: `LB0022` (control-flow legality, not
+    /// a lint rule, toolchain source) alongside the fixable `LB0501`.
+    #[test]
+    fn a_quickfix_references_the_exact_diagnostic_that_was_published() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("main.lua");
+        let source = "break\nlocal unused = 1\n";
+        fs::write(&path, source).expect("write the document");
+        // Through `path_to_uri`, not `format!("file://…")`: a hand-built URI
+        // keeps Windows' backslashes and drive colon, and the server then
+        // publishes under a different (normalized) URI than the one opened.
+        let uri = crate::uri::path_to_uri(&path);
+        let uri_text = uri.to_string();
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": uri_text,
+                        "languageId": "lua",
+                        "version": 1,
+                        "text": source,
+                    },
+                }),
+            })
+            .expect("didOpen");
+
+        let published = drain(&client)
+            .iter()
+            .find_map(|message| match message {
+                Message::Notification(not) if not.method == PublishDiagnostics::METHOD => {
+                    serde_json::from_value::<lsp_types::PublishDiagnosticsParams>(
+                        not.params.clone(),
+                    )
+                    .ok()
+                    .map(|params| params.diagnostics)
+                }
+                _ => None,
+            })
+            .expect("the server published diagnostics for the open document");
+        let code_of = |diag: &lsp_types::Diagnostic| match diag.code.clone() {
+            Some(lsp_types::NumberOrString::String(code)) => code,
+            _ => String::new(),
+        };
+        assert!(
+            published.iter().any(|d| code_of(d) == "LB0022"),
+            "the set must be mixed: {published:?}"
+        );
+        let published_lint = published
+            .iter()
+            .find(|d| code_of(d) == "LB0501")
+            .expect("the fixable lint was published");
+
+        let actions = server
+            .code_actions(
+                &uri,
+                Range {
+                    start: Position::new(1, 6),
+                    end: Position::new(1, 6),
+                },
+            )
+            .expect("code actions");
+        let quickfix = actions
+            .iter()
+            .find_map(|action| match action {
+                CodeActionOrCommand::CodeAction(action)
+                    if action.kind.as_ref() == Some(&super::CodeActionKind::QUICKFIX) =>
+                {
+                    Some(action)
+                }
+                _ => None,
+            })
+            .expect("a quickfix for the unused local");
+        assert_eq!(
+            quickfix.diagnostics.as_deref(),
+            Some(std::slice::from_ref(published_lint)),
+            "the action must reference the published diagnostic byte for byte"
+        );
+    }
+    /// The startup rock harvest recurses over every vendored source on rayon
+    /// WORKERS, and this path had never been measured against a worker stack
+    /// (Shockwave round 4). `deep_pipeline.rs` proves the CLI's pipeline
+    /// survives depth 195 — but only because `real_main` pins the pool, which
+    /// no library caller does.
+    ///
+    /// `test_server` deliberately does NOT call `pin_worker_stacks`: it goes
+    /// straight to `Server::new`, the way an embedder that owns its own
+    /// transport reaches the harvest, so what this exercises is rayon's
+    /// unconfigured 2 MiB default. The shape is `deep_pipeline`'s — 32 files
+    /// so work-stealing genuinely spreads them across workers rather than
+    /// running everything on the calling thread, at the depth reference Lua
+    /// accepts. A worker overflowing aborts the process, so "this test
+    /// returned" is the whole assertion.
+    #[test]
+    fn a_deep_rock_tree_survives_the_startup_harvest() {
+        const DEPTH: usize = 195;
+        const FILES: usize = 32;
+        let dir = TempDir::new().expect("tempdir");
+        write(dir.path(), "luabox.toml", MANIFEST_HEAD);
+        let nest = format!("{}{}", "{".repeat(DEPTH), "}".repeat(DEPTH));
+        for n in 0..FILES {
+            write(
+                dir.path(),
+                &format!("lua_modules/share/lua/5.4/deep_{n:02}.lua"),
+                &format!(
+                    "---@class Deep{n:02}\nlocal Deep = {{}}\nlocal x = {nest}\nreturn Deep\n"
+                ),
+            );
+        }
+        let (server_end, _client) = Connection::memory();
+        let server = Server::new(server_end, dir.path().to_path_buf(), false);
+        assert_eq!(
+            server.rocks.types().len(),
+            FILES,
+            "every deep rock module must have been harvested"
+        );
+    }
+    /// A server on a worker thread with the client end **here**, so a test
+    /// can answer `window/workDoneProgress/create` the way a real editor
+    /// does.
+    ///
+    /// [`test_server`]'s client is inert, and cannot be used for a test about
+    /// any pause after the first: one unanswered create now mutes progress
+    /// for the whole session ([`Server::create_unanswered`]), so a create
+    /// that goes unanswered on the way in means there is no second create to
+    /// assert anything about. The thread runs `Server::new` → `bootstrap` →
+    /// `main_loop`, which is exactly what [`run`] does after the handshake.
+    struct AnsweringClient {
+        client: Connection,
+        server: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+        /// Everything read off the wire so far, in arrival order.
+        seen: Vec<Message>,
+        _dir: TempDir,
+    }
+
+    impl AnsweringClient {
+        fn start() -> Self {
+            let dir = TempDir::new().expect("tempdir");
+            let root = dir.path().to_path_buf();
+            let (server_end, client) = Connection::memory();
+            let server = std::thread::spawn(move || {
+                let mut server = Server::new(server_end, root, true);
+                server.bootstrap();
+                server.main_loop()
+            });
+            Self {
+                client,
+                server: Some(server),
+                seen: Vec::new(),
+                _dir: dir,
+            }
+        }
+
+        /// Read up to and including the next create, and accept it. Hands
+        /// back the `(request id, token)` pair the create carried.
+        fn accept_create(&mut self) -> (String, String) {
+            let create = loop {
+                let msg = self
+                    .client
+                    .receiver
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("a pause announces itself");
+                self.seen.push(msg.clone());
+                if let Message::Request(request) = msg
+                    && request.method == super::WorkDoneProgressCreate::METHOD
+                {
+                    break request;
+                }
+            };
+            self.client
+                .sender
+                .send(Message::Response(lsp_server::Response::new_ok(
+                    create.id.clone(),
+                    Value::Null,
+                )))
+                .expect("the server is still reading");
+            (
+                create.id.to_string(),
+                create.params["token"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        }
+
+        fn notify(&self, method: &str, params: Value) {
+            self.client
+                .sender
+                .send(Message::Notification(Notification::new(
+                    method.to_owned(),
+                    params,
+                )))
+                .expect("the server is still reading");
+        }
+
+        fn reload(&self) {
+            self.notify(
+                super::DidChangeConfiguration::METHOD,
+                json!({ "settings": {} }),
+            );
+        }
+
+        /// End the session and collect everything still on the wire.
+        fn shut_down(&mut self) {
+            shut_down(&self.client, 77);
+            let server = self.server.take().expect("shut down once");
+            server
+                .join()
+                .expect("the server thread does not panic")
+                .expect("a clean shutdown");
+            self.seen.extend(drain(&self.client));
+        }
+
+        /// Every `$/progress` seen so far, as params.
+        fn progress(&self) -> Vec<Value> {
+            self.seen
+                .iter()
+                .filter_map(|message| match message {
+                    Message::Notification(not) if not.method == super::Progress::METHOD => {
+                        Some(not.params.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    /// The config reload re-harvests the whole rock tree on the main loop —
+    /// the startup cost, landing mid-session (Shockwave round 4 measured a
+    /// ~0.9 s stall on every `luabox.toml` save). The work is unchanged; what
+    /// is new is that the client is told a pause is happening, so it reads as
+    /// progress rather than as a hang.
+    #[test]
+    fn a_config_reload_announces_itself_with_a_progress_token() {
+        let mut client = AnsweringClient::start();
+        // The two startup tokens first: a client that ignored them would be
+        // told nothing about the reload either.
+        client.accept_create();
+        client.accept_create();
+
+        client.reload();
+        client.accept_create();
+        client.shut_down();
+
+        let progress = client.progress();
+        assert!(
+            progress.iter().any(|params| {
+                params["value"]["kind"] == "begin"
+                    && params["value"]["title"] == "Reloading luabox configuration"
+            }),
+            "{progress:?}"
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|params| params["value"]["kind"] == "end"),
+            "{progress:?}"
+        );
+    }
+
+    /// Every `$/progress` notification the client end received, as params.
+    fn progress_notifications(client: &Connection) -> Vec<Value> {
+        drain(client)
+            .iter()
+            .filter_map(|message| match message {
+                Message::Notification(not) if not.method == super::Progress::METHOD => {
+                    Some(not.params.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The startup rock harvest is synchronous and runs before the main loop,
+    /// so it is a stretch of protocol silence the client cannot attribute to
+    /// anything — Shockwave round 5 captured 746 ms of it between the
+    /// `initialize` response and the bootstrap token, which covered an index
+    /// that took 0.1 ms. The harvest now carries its own token.
+    ///
+    /// `Server::new` is exactly where `run` reaches it, and by then
+    /// `initialize_finish` has answered the handshake, so the server-initiated
+    /// `window/workDoneProgress/create` this sends is protocol-legal.
+    #[test]
+    fn the_startup_harvest_announces_itself_with_a_progress_token() {
+        let (_dir, _server, client) = test_server();
+        let progress = progress_notifications(&client);
+        assert!(
+            progress.iter().any(|params| {
+                params["value"]["kind"] == "begin"
+                    && params["value"]["title"] == super::STARTUP_HARVEST_PROGRESS.1
+            }),
+            "the startup harvest must open a token: {progress:?}"
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|params| params["value"]["kind"] == "end"),
+            "…and close it: {progress:?}"
+        );
+    }
+
+    /// Every `window/workDoneProgress/create` among messages already read off
+    /// the wire, as `(request id, token)` pairs.
+    fn progress_creates_of(messages: &[Message]) -> Vec<(String, String)> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Request(request)
+                    if request.method == super::WorkDoneProgressCreate::METHOD =>
+                {
+                    Some((
+                        request.id.to_string(),
+                        request.params["token"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                    ))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Two consecutive reloads must not reuse either identifier. Both were
+    /// compile-time constants derived from the token *name*, so three reloads
+    /// sent three `window/workDoneProgress/create` requests sharing one id and
+    /// one token (Shockwave round 6) — and both are required to be unique:
+    /// JSON-RPC ids among outstanding requests, LSP tokens by the
+    /// server-generated-token rule.
+    ///
+    /// Asserted on the pair, not on the format. What the counter has to buy is
+    /// distinctness; `luabox/reload-3` is one spelling of it.
+    #[test]
+    fn consecutive_reloads_do_not_reuse_a_progress_id_or_token() {
+        let mut client = AnsweringClient::start();
+        // The two startup creates, answered, so the reloads' creates are sent
+        // at all — and dropped, so what is counted below is the reloads'.
+        client.accept_create();
+        client.accept_create();
+
+        let mut seen: Vec<(String, String)> = Vec::new();
+        for _ in 0..3 {
+            client.reload();
+            seen.push(client.accept_create());
+        }
+        client.shut_down();
+
+        assert_eq!(seen.len(), 3, "one create per reload: {seen:?}");
+        let ids: std::collections::HashSet<&str> = seen.iter().map(|(id, _)| id.as_str()).collect();
+        let tokens: std::collections::HashSet<&str> =
+            seen.iter().map(|(_, token)| token.as_str()).collect();
+        assert_eq!(ids.len(), 3, "request ids must be distinct: {seen:?}");
+        assert_eq!(
+            tokens.len(),
+            3,
+            "progress tokens must be distinct: {seen:?}"
+        );
+        // …and each still says which pause it is announcing.
+        assert!(
+            tokens
+                .iter()
+                .all(|token| token.starts_with(super::RELOAD_HARVEST_PROGRESS.0)),
+            "a reload must announce itself under the reload kind: {seen:?}"
+        );
+    }
+
+    /// The other direction, on both harvest paths: a client that does not
+    /// advertise `window.workDoneProgress` must receive **zero** progress
+    /// traffic. The reload path read no capability at all before round 5 — it
+    /// announced itself to every client — and the startup path would have
+    /// inherited that bug the moment it grew a token.
+    #[test]
+    fn a_client_without_the_capability_receives_no_progress_traffic() {
+        let (_dir, mut server, client) = test_server_with(false);
+        assert!(
+            progress_notifications(&client).is_empty(),
+            "startup harvest sent progress to a client that never asked"
+        );
+
+        server
+            .handle_notification(Notification {
+                method: super::DidChangeConfiguration::METHOD.to_string(),
+                params: json!({ "settings": {} }),
+            })
+            .expect("a configuration change is not fatal");
+        assert!(
+            progress_notifications(&client).is_empty(),
+            "config reload sent progress to a client that never asked"
+        );
+
+        server.bootstrap();
+        assert!(
+            progress_notifications(&client).is_empty(),
+            "bootstrap sent progress to a client that never asked"
+        );
+    }
+
+    /// The pin's `Err` arm is not an accident — it is the arm production takes
+    /// on the `luabox lsp` path, where `real_main` has already built the global
+    /// pool by the time `run` calls this. Calling it repeatedly, and after a
+    /// pool exists, must be a no-op rather than a panic or an abort.
+    ///
+    /// This asserts the `Err` arm and nothing about the stack size — it
+    /// cannot, because the global pool of this binary may have been built by
+    /// any earlier test. What isolates the pin itself is
+    /// `tests/pinned_stack.rs`, which owns its own test binary for exactly
+    /// that reason.
+    #[test]
+    fn pinning_worker_stacks_is_idempotent_and_never_fatal() {
+        use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
+
+        super::pin_worker_stacks();
+        super::pin_worker_stacks();
+        // The pool is usable afterwards either way — whether this call built
+        // it or found one already built by another test in this binary.
+        let sum: usize = (0..1024_usize).into_par_iter().sum();
+        assert_eq!(sum, 1024 * 1023 / 2);
+    }
+
+    /// The token belongs to the client until it says otherwise:
+    /// `window/workDoneProgress/create` is a *request*, and a `$/progress`
+    /// under a token the client has not acknowledged is a notification it may
+    /// drop. Round 7 captured the create at t=0.0053 and the `begin` at
+    /// t=0.0054 with no response in between, and `main_loop` discarded every
+    /// response, so the answer was never read.
+    ///
+    /// This drives `Server::new` (whose startup harvest is the session's first
+    /// announced pause) on a worker thread and plays the client here, so the
+    /// assertion is about message *order on the wire*: nothing under the token
+    /// before the create, nothing at all while the response is outstanding,
+    /// and the `begin` only after it is sent.
+    #[test]
+    fn a_progress_begin_waits_for_the_create_response() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let (server_end, client) = Connection::memory();
+        let server = std::thread::spawn(move || drop(Server::new(server_end, root, true)));
+
+        // Read up to the create request. A `$/progress` in this prefix would
+        // be a token being used before it was asked for.
+        let mut before = Vec::new();
+        let create = loop {
+            let msg = client
+                .receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the startup harvest announces itself");
+            if let Message::Request(request) = &msg
+                && request.method == super::WorkDoneProgressCreate::METHOD
+            {
+                break request.clone();
+            }
+            before.push(msg);
+        };
+        assert!(
+            !before.iter().any(is_progress),
+            "a token was reported under before it was created: {before:?}"
+        );
+
+        // Nothing may arrive while the create is outstanding. The window is
+        // *derived* from the bound rather than written out: a literal 60 ms
+        // silently stops proving anything the moment
+        // `PROGRESS_CREATE_TIMEOUT` is lowered to 50 ms — the wait would
+        // already have expired and the `begin` already have been sent, and
+        // this would still pass. A quarter of the bound is comfortably inside
+        // it however the constant moves.
+        let inside_the_wait = super::PROGRESS_CREATE_TIMEOUT / 4;
+        assert!(
+            client.receiver.recv_timeout(inside_the_wait).is_err(),
+            "the server reported under the token before the client created it"
+        );
+
+        client
+            .sender
+            .send(Message::Response(lsp_server::Response::new_ok(
+                create.id,
+                Value::Null,
+            )))
+            .expect("the server is still reading");
+
+        // …and now it speaks.
+        let begin = loop {
+            let msg = client
+                .receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the begin follows the create response");
+            if is_progress(&msg) {
+                break msg;
+            }
+        };
+        let Message::Notification(begin) = begin else {
+            panic!("progress is a notification")
+        };
+        assert_eq!(begin.params["value"]["kind"], "begin", "{begin:?}");
+        server.join().expect("the server thread does not panic");
+    }
+
+    /// Whether a message is a `$/progress` notification.
+    fn is_progress(message: &Message) -> bool {
+        matches!(message, Message::Notification(not) if not.method == super::Progress::METHOD)
+    }
+
+    /// A client that speaks while a `window/workDoneProgress/create` is
+    /// outstanding must not lose what it said, **and must not have it
+    /// reordered**. `await_progress_create` takes those messages off the wire
+    /// to find the response, and `main_loop` drains the queue before reading
+    /// anything new.
+    ///
+    /// Two `didOpen`s, not one. With a single message the test could not tell
+    /// a queue from a one-slot buffer, and the commit that introduced it
+    /// claimed arrival order — which is a property of a `VecDeque` drained
+    /// from the front and would survive a change to `pop_back` or to a `Vec`
+    /// used as a stack completely unremarked. The assertion is that the
+    /// server publishes for `a.lua` before `b.lua`, in the order they were
+    /// sent.
+    #[test]
+    fn notifications_sent_during_the_create_wait_are_handled_in_arrival_order() {
+        let dir = TempDir::new().expect("tempdir");
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).expect("mkdir");
+        let first = src.join("a.lua");
+        let second = src.join("b.lua");
+        fs::write(&first, "local a = 1\n").expect("write");
+        fs::write(&second, "local b = 2\n").expect("write");
+        let root = dir.path().to_path_buf();
+        let (server_end, client) = Connection::memory();
+
+        let server = std::thread::spawn(move || {
+            let mut server = Server::new(server_end, root, true);
+            server.main_loop()
+        });
+
+        let create = loop {
+            let msg = client
+                .receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the startup harvest announces itself");
+            if let Message::Request(request) = &msg
+                && request.method == super::WorkDoneProgressCreate::METHOD
+            {
+                break request.clone();
+            }
+        };
+        // Both spoken into the window where the server is *not* in
+        // `main_loop`, so both go on the queue.
+        let first_uri = crate::uri::path_to_uri(&first);
+        let second_uri = crate::uri::path_to_uri(&second);
+        for (uri, text) in [
+            (&first_uri, "local a = 1\n"),
+            (&second_uri, "local b = 2\n"),
+        ] {
+            client
+                .sender
+                .send(Message::Notification(Notification {
+                    method: DidOpenTextDocument::METHOD.to_string(),
+                    params: json!({
+                        "textDocument": {
+                            "uri": uri.as_str(),
+                            "languageId": "lua",
+                            "version": 1,
+                            "text": text,
+                        }
+                    }),
+                }))
+                .expect("the server is still reading");
+        }
+        client
+            .sender
+            .send(Message::Response(lsp_server::Response::new_ok(
+                create.id,
+                Value::Null,
+            )))
+            .expect("the server is still reading");
+
+        let mut published = Vec::new();
+        while published.len() < 2 {
+            let msg = client
+                .receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("both buffered didOpens are handled once the loop starts");
+            if let Message::Notification(not) = &msg
+                && not.method == PublishDiagnostics::METHOD
+            {
+                published.push(not.params["uri"].clone());
+            }
+        }
+        assert_eq!(
+            published,
+            vec![
+                Value::from(first_uri.as_str()),
+                Value::from(second_uri.as_str())
+            ],
+            "the queue must drain in arrival order"
+        );
+        shut_down(&client, 99);
+        server
+            .join()
+            .expect("the server thread does not panic")
+            .expect("a clean shutdown");
+    }
+
+    /// Send the ordered `shutdown` → `exit` pair a clean session ends with.
+    fn shut_down(client: &Connection, id: i32) {
+        client
+            .sender
+            .send(Message::Request(Request {
+                id: RequestId::from(id),
+                method: super::Shutdown::METHOD.to_string(),
+                params: Value::Null,
+            }))
+            .expect("the server is still reading");
+        client
+            .sender
+            .send(Message::Notification(Notification {
+                method: super::Exit::METHOD.to_string(),
+                params: Value::Null,
+            }))
+            .expect("the server is still reading");
+    }
+
+    /// Wait for a server thread to finish, failing rather than hanging.
+    ///
+    /// The bound matters: the bug these tests cover made
+    /// `Connection::handle_shutdown` wait 30 s for an `exit` it was already
+    /// holding, and over a memory transport — where `exit` does not close the
+    /// channel the way a closed stdin does — that is a 30 s block rather than
+    /// a fast failure. A `join()` would sit through it and then pass or fail
+    /// on the exit code alone; this fails on the *hang*.
+    fn join_within(
+        handle: std::thread::JoinHandle<anyhow::Result<()>>,
+        done: &std::sync::mpsc::Receiver<()>,
+    ) -> anyhow::Result<()> {
+        done.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the server ends the session promptly rather than waiting out a timeout");
+        handle.join().expect("the server thread does not panic")
+    }
+
+    /// A `shutdown`/`exit` pair sent while a `window/workDoneProgress/create`
+    /// is outstanding must still end the session cleanly.
+    ///
+    /// This is the round-8 regression. `await_progress_create` drained both
+    /// messages onto [`Server::pending`], and `Connection::handle_shutdown`
+    /// reads the *channel* for the `exit` that follows the request it answers
+    /// — it cannot see the queue. So the server answered the shutdown, waited
+    /// out `handle_shutdown`'s own 30 s bound for a notification it was
+    /// already holding, and exited 1. A session without the progress
+    /// capability exited 0, which is what made it a regression rather than a
+    /// standing wart.
+    ///
+    /// Both windows are covered, because both call the same helper: the
+    /// startup harvest (before `main_loop` is entered at all) and the config
+    /// reload (from inside it).
+    #[test]
+    fn a_shutdown_during_the_startup_create_wait_exits_cleanly() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let (server_end, client) = Connection::memory();
+        let (done, finished) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn(move || {
+            let mut server = Server::new(server_end, root, true);
+            let outcome = server.main_loop();
+            let _ = done.send(());
+            outcome
+        });
+
+        await_create(&client);
+        // Answered with a shutdown instead of a response — the sequence an
+        // editor sends when the user closes the window during the harvest.
+        shut_down(&client, 1);
+
+        join_within(server, &finished).expect("a clean shutdown, not exit 1");
+        assert!(
+            drain(&client).iter().any(|message| {
+                matches!(message, Message::Response(response) if response.id == RequestId::from(1))
+            }),
+            "the shutdown request must still be answered"
+        );
+    }
+
+    /// The same, on the reload path — the window Shockwave reproduced it in.
+    /// Here the server is inside `main_loop` when the create goes out.
+    #[test]
+    fn a_shutdown_during_the_reload_create_wait_exits_cleanly() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let (server_end, client) = Connection::memory();
+        let (done, finished) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn(move || {
+            let mut server = Server::new(server_end, root, true);
+            let outcome = server.main_loop();
+            let _ = done.send(());
+            outcome
+        });
+
+        // Get past the startup token first, so the create being waited for
+        // below is the reload's.
+        let startup = await_create(&client);
+        client
+            .sender
+            .send(Message::Response(lsp_server::Response::new_ok(
+                startup.id,
+                Value::Null,
+            )))
+            .expect("the server is still reading");
+        client
+            .sender
+            .send(Message::Notification(Notification {
+                method: super::DidChangeConfiguration::METHOD.to_string(),
+                params: json!({ "settings": {} }),
+            }))
+            .expect("the server is still reading");
+
+        await_create(&client);
+        shut_down(&client, 2);
+
+        join_within(server, &finished).expect("a clean shutdown, not exit 1");
+        assert!(
+            drain(&client).iter().any(|message| {
+                matches!(message, Message::Response(response) if response.id == RequestId::from(2))
+            }),
+            "the shutdown request must still be answered"
+        );
+    }
+
+    /// Read up to and including the next `window/workDoneProgress/create`.
+    fn await_create(client: &Connection) -> lsp_server::Request {
+        loop {
+            let msg = client
+                .receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("a pause announces itself");
+            if let Message::Request(request) = &msg
+                && request.method == super::WorkDoneProgressCreate::METHOD
+            {
+                return request.clone();
+            }
+        }
+    }
+
+    /// A client that answers the create with an **error** has refused the
+    /// token, and nothing may be reported under it.
+    ///
+    /// `await_progress_create` matched on the response id and never looked at
+    /// `response.error`, so a client replying `-32601` still received the
+    /// `begin`, the per-file `report`s and the `end` — the exact traffic the
+    /// wait was added to prevent, under a token the client had just declined.
+    /// Refusal now takes the `progress: false` path.
+    #[test]
+    fn a_refused_progress_token_is_never_reported_under() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let (server_end, client) = Connection::memory();
+        // Files for the bootstrap index to report on, so a server that
+        // ignored the refusal would have something to say.
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).expect("mkdir");
+        for i in 0..5 {
+            fs::write(src.join(format!("f{i}.lua")), "local x = 1\n").expect("write");
+        }
+
+        let refuser = std::thread::spawn(move || {
+            // Refuse every create this session sends.
+            while let Ok(message) = client.receiver.recv() {
+                if let Message::Request(request) = &message
+                    && request.method == super::WorkDoneProgressCreate::METHOD
+                {
+                    let refusal = lsp_server::Response::new_err(
+                        request.id.clone(),
+                        ErrorCode::MethodNotFound as i32,
+                        "no work-done progress here".to_string(),
+                    );
+                    if client.sender.send(Message::Response(refusal)).is_err() {
+                        break;
+                    }
+                }
+                if is_progress(&message) {
+                    return true;
+                }
+            }
+            false
+        });
+
+        let mut server = Server::new(server_end, root, true);
+        server.bootstrap();
+        drop(server);
+        assert!(
+            !refuser.join().expect("the client thread does not panic"),
+            "a refused token was reported under"
+        );
+    }
+
+    /// A client that answers *nothing* is not a client that refuses. The one
+    /// create it was asked for still takes the degraded path — the token is
+    /// used regardless, which is the behaviour this whole mechanism replaced
+    /// and so is no worse than it — and after that the session goes quiet:
+    /// **no further create is sent at all**.
+    ///
+    /// Round 9 (B2) is why the second half is not "asked without waiting".
+    /// Skipping only the wait kept the latency win and lost the guarantee:
+    /// the create went out, the client's late `-32601` landed in
+    /// `main_loop`'s discard arm, and `$/progress` went out under a token it
+    /// had refused. The semantics are disclosed rather than hidden — one
+    /// timeout mutes progress for the session — and the alternative was a
+    /// refusal check any slow client could step around.
+    #[test]
+    fn one_unanswered_create_mutes_progress_for_the_session() {
+        let (_dir, mut server, client) = test_server();
+        // `Server::new`'s startup harvest has already paid the one wait.
+        assert!(server.create_unanswered.get(), "the first wait timed out");
+        // One drain: it consumes the wire, so the create and the progress it
+        // carried have to be read out of the same batch.
+        let startup = drain(&client);
+        assert_eq!(
+            progress_creates_of(&startup).len(),
+            1,
+            "exactly one create was asked: {startup:?}"
+        );
+        assert!(
+            startup.iter().any(is_progress),
+            "the degraded path still reports under the token it asked for"
+        );
+
+        let before = std::time::Instant::now();
+        server.bootstrap();
+        assert!(
+            before.elapsed() < super::PROGRESS_CREATE_TIMEOUT,
+            "a second create was waited out after the first went unanswered"
+        );
+        let after = drain(&client);
+        assert!(
+            progress_creates_of(&after).is_empty(),
+            "a second create was SENT after the first went unanswered — a \
+             late refusal of it would land in main_loop's discard arm: \
+             {after:?}"
+        );
+        assert!(
+            !after.iter().any(is_progress),
+            "…and reported under: {after:?}"
+        );
+    }
+
+    /// …and with the capability, all three paths do speak — to a client that
+    /// answers, which after round 9 is the only kind that hears more than the
+    /// first.
+    #[test]
+    fn a_client_with_the_capability_hears_every_announced_pause() {
+        let mut client = AnsweringClient::start();
+        let (_, harvest) = client.accept_create();
+        let (_, bootstrap) = client.accept_create();
+        client.reload();
+        let (_, reload) = client.accept_create();
+        client.shut_down();
+
+        let tokens: Vec<String> = client
+            .progress()
+            .iter()
+            .map(|params| params["token"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        for (name, token) in [
+            ("startup", &harvest),
+            ("bootstrap", &bootstrap),
+            ("reload", &reload),
+        ] {
+            assert!(
+                tokens.iter().any(|seen| seen == token),
+                "{name} announced nothing under `{token}`: {tokens:?}"
+            );
+        }
     }
 }

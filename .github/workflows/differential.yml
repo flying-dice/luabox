@@ -15,6 +15,26 @@ on:
       - "crates/luabox-bundle/**"
       - "corpus/differ/**"
       - "tools/differ/**"
+      # The control-flow legality gate's own inputs, plus the crates that
+      # carry its codes (luabox-diag) and its pass-3 call site (luabox-cli):
+      # without these, the matrix, the runner's direction check, or the wiring
+      # could be edited or deleted and this job would stay unrun — green with
+      # the dialect-split cell gone.
+      - "scripts/tests/control-flow-differential.sh"
+      - "scripts/tests/control-flow-matrix/**"
+      - "crates/luabox-diag/**"
+      - "crates/luabox-cli/**"
+      # LB0510's shape matrix rides this job too: it is the only one with a
+      # real Lua on the runner, and the runtime column is the whole point of
+      # it. Same reasoning as above — without these paths the rule, the corpus
+      # or the runner could be edited and the job would stay unrun. The whole
+      # crate, not the rule file: the rule reads facts.rs and context.rs today
+      # (Shockwave round 10 caught the narrow filter missing exactly the file
+      # this PR changed), and a glob cannot rot when the rule grows a
+      # dependency on a sibling module.
+      - "crates/luabox-lint/**"
+      - "scripts/tests/lb0510-matrix.sh"
+      - "scripts/tests/lb0510-matrix/**"
       - ".github/workflows/differential.yml"
   pull_request:
     paths:
@@ -24,6 +44,26 @@ on:
       - "crates/luabox-bundle/**"
       - "corpus/differ/**"
       - "tools/differ/**"
+      # The control-flow legality gate's own inputs, plus the crates that
+      # carry its codes (luabox-diag) and its pass-3 call site (luabox-cli):
+      # without these, the matrix, the runner's direction check, or the wiring
+      # could be edited or deleted and this job would stay unrun — green with
+      # the dialect-split cell gone.
+      - "scripts/tests/control-flow-differential.sh"
+      - "scripts/tests/control-flow-matrix/**"
+      - "crates/luabox-diag/**"
+      - "crates/luabox-cli/**"
+      # LB0510's shape matrix rides this job too: it is the only one with a
+      # real Lua on the runner, and the runtime column is the whole point of
+      # it. Same reasoning as above — without these paths the rule, the corpus
+      # or the runner could be edited and the job would stay unrun. The whole
+      # crate, not the rule file: the rule reads facts.rs and context.rs today
+      # (Shockwave round 10 caught the narrow filter missing exactly the file
+      # this PR changed), and a glob cannot rot when the rule grows a
+      # dependency on a sibling module.
+      - "crates/luabox-lint/**"
+      - "scripts/tests/lb0510-matrix.sh"
+      - "scripts/tests/lb0510-matrix/**"
       - ".github/workflows/differential.yml"
   schedule:
     # Weekly sweep (Mon 05:17 UTC) so runtime/apt drift is noticed even when
@@ -83,3 +123,25 @@ jobs:
 
       - name: Differential corpus sweep (blocking)
         run: cargo run --release --manifest-path tools/differ/Cargo.toml -- --corpus corpus/differ --verbose
+
+      # Control-flow LEGALITY differential (#44) — a different axis from the
+      # sweep above, which executes lowered output: this one holds luabox's
+      # accept/reject verdict for goto/label/break to `luac<V> -p` as live
+      # ground truth, per version, over the committed matrix in
+      # scripts/tests/control-flow-matrix/. The dialect-aware label-shadowing
+      # split is covered by construction — whatever each reference compiler
+      # says is what luabox is held to. The runners above already installed
+      # lua5.1-5.4, and luac ships with them.
+      - name: Build luabox for the control-flow differential
+        run: cargo build --release --bin luabox
+      - name: Control-flow legality vs reference luac (blocking)
+        run: bash scripts/tests/control-flow-differential.sh
+
+      # LB0510 shape matrix (#47) — a third axis on the same binary: for every
+      # shape of `metatable-without-index`, both the lint verdict and what
+      # `lua5.4` actually does when the program runs. It lives here rather
+      # than in `ci.yml` because the runtime column needs an interpreter, and
+      # this is the job that installs one; the lint column alone would be a
+      # weaker test than the unit suite already runs.
+      - name: LB0510 shape matrix vs lua5.4 (blocking)
+        run: bash scripts/tests/lb0510-matrix.sh

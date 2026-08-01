@@ -136,6 +136,38 @@ impl Ambient {
         }
     }
 
+    /// A new ambient layer: this one plus the type surfaces harvested from a
+    /// vendored luarocks tree (#30, [`crate::rocks::harvest`]).
+    ///
+    /// Consumes `self` so a caller that has just built the project-wide layer
+    /// ([`Self::with_project_types`]) extends it in place rather than cloning
+    /// the whole surface a second time; a project with no rock tree passes an
+    /// empty iterator and pays nothing.
+    ///
+    /// **Explicit beats implicit.** Where [`Self::with_project_types`] unions a
+    /// class's members across declarations (luals parity — two declarations in
+    /// code you wrote are one intent), a harvested rock surface only fills names
+    /// nothing else has claimed: a class, enum or alias already declared by the
+    /// stdlib, by `[types] defs`, or by any project file is left exactly as it
+    /// is. That is what makes `[types] defs` a real escape hatch — your
+    /// declaration replaces the rock's rather than merging with it — and it is
+    /// why this must be applied *after* [`Self::with_project_types`].
+    #[must_use]
+    pub fn with_rock_types<'a>(
+        mut self,
+        rocks: impl IntoIterator<Item = &'a crate::env::FileTypes>,
+    ) -> Ambient {
+        for types in rocks {
+            self.env.insert_unclaimed_types(types);
+            for (name, alias) in types.aliases() {
+                self.aliases
+                    .entry(name.clone())
+                    .or_insert_with(|| alias.clone());
+            }
+        }
+        self
+    }
+
     /// Undeclared type names referenced by the definition files themselves —
     /// a self-consistency check for the shipped packages (should be empty).
     #[cfg(test)]

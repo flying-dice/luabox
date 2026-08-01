@@ -8,6 +8,688 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`luabox check --watch` now reruns when the vendored rock tree changes.**
+  Since the rock type harvest landed, `check` reads
+  `lua_modules/share/lua/<X.Y>/**.lua` — but the watcher still filtered all of
+  `lua_modules/` out, so `luarocks install --tree lua_modules <rock>` (the
+  exact workflow the harvest exists for) left a running watcher printing a
+  stale verdict until some project file was touched. The versioned rock tree
+  is now relevant (`layout::is_rock_source`); flat `lua_modules/` layouts,
+  rockspecs, and nested trees inside workspace members still are not, because
+  the rerun still does not read them.
+- **The bundle loader gate names the line, not just the file.** A vendored
+  rock that cannot load on the ship target (`not loadable under target 5.4:
+  label `a` is already defined`) reported a path and a message with no
+  position — and the rock path is the only one that reaches this branch,
+  since the check gate never walks `lua_modules/`. The error now carries
+  `at line N` from the finding's own span.
+
+- **`LB0510` prunes dead code symmetrically, and its bounds are now a list
+  rather than a count.** The prune was one-sided in two places. It dropped the
+  `then` of a literal-false `if` and never the `else` of a literal-**true**
+  one, so `if true then … else c:reset() end` counted a call no execution
+  performs; and it read no loop header and no early return at all. Arms are
+  now walked in order and everything after the first literal-truthy one is
+  dead with it — later `elseif` conditions, their blocks, and the `else`. Two
+  more shapes are the same literal question and are answered with it: a
+  numeric `for` whose written header runs zero times (`for _ = 1, 0`,
+  `for _ = 1, 10, -1`) and statements after one that leaves the block
+  (`do return end`, `break`). A zero step is deliberately not decided: Lua
+  raises `'for' step is zero` evaluating the header, and a program that never
+  gets that far is not dead code.
+
+  Separately, the ternary. `cond and ctor or other` parses as
+  `(cond and ctor) or other`, and `and` seeded its right operand
+  unconditionally — no literal was consulted on that path at all — so a
+  literal-false `cond`, under which Lua never evaluates the construction,
+  still seeded it. Truthiness is now read where the source writes it out, and
+  folds through nested `and`/`or`, which is what makes the ternary answerable:
+  `false and ctor` is the falsy left operand, `false or ctor` *is* the
+  construction (a closed false negative), and a literal `cond` selects one of
+  `ctor`/`other`. An undecided `cond` still seeds the `ctor` side, the same
+  trade `x and ctor` already took.
+
+  One more miss closed: `local m = c.reset; m(c)` is `c.reset(c)` with a name
+  in between — the read goes through the missing `__index`, yields `nil`, and
+  the call fails. The read alone is still not a use, and a read off the
+  *carrier* is a plain table read no metatable serves.
+
+  Four false positives and one false negative are **disclosed rather than
+  fixed**, each with a matrix twin: flow-insensitive derivation (`c`
+  reassigned before use), two `setmetatable` calls on one table (the second
+  replaces it, so the superseded site is a finding against a lookup that
+  works), the insert-last-wins name-to-body map in both directions, and a
+  guard that is a name rather than a literal — in its `if`, ternary and
+  numeric-`for` spellings. Deciding any of them needs constant propagation,
+  and a partial one that decided `and`/`or` but not `if` would be worse than
+  none.
+
+  [LIMITATIONS](docs/03-reference/02-limitations.md) loses "one approximation
+  remains" — the claim four consecutive review rounds found overclaiming — for
+  an enumerated, two-direction bounds section written against the code and
+  then checked back against it. The shape matrix grew from 94 programs to 119.
+
+- **The language server no longer exits 1 when a session ends during the
+  *second* progress-create window.** The previous round's fix aborted the wait
+  on a `shutdown` or `exit`, which is right but not sufficient: `run` opens
+  two create windows before the message loop (the startup rock harvest, then
+  the workspace index), and a queued config reload opens more from inside it.
+  Window 1 aborted on the `shutdown` and correctly left the `exit` on the
+  channel; window 2 then drained that `exit` onto the pending queue, and the
+  shutdown handshake read an empty channel for 30 s before failing — the same
+  wait-then-exit-1 the round before had closed, reached by one more window.
+
+  A session-ender is now **sticky**: the next create is not sent at all, so no
+  window opens, and nothing is announced to a client that has asked to leave
+  (the abort path used to return the token, so a shutting-down client still
+  received `begin`/`report`/`end` plus another create). The shutdown handshake
+  is the server's own, looking in the pending queue before the channel and
+  answering a repeated `shutdown` instead of failing the session on it. The
+  30 s bound is unchanged.
+
+- **A `window/workDoneProgress/create` the server will not wait for is no
+  longer sent.** After one create went unanswered the server skipped the
+  *wait* on the next but still sent it, so a client's late error answer landed
+  in the message loop's discard arm and `$/progress` went out under a token it
+  had just refused — the never-answers optimisation stepped around the refusal
+  check the whole mechanism exists for. One timeout now mutes progress for the
+  session: no further create is sent, so there is no token to report under and
+  no traffic to a client that is not listening. The token that timed out keeps
+  the degraded path, which is the behaviour this mechanism replaced.
+
+- **`LB0510` counts uses where the file can *reach* them.** The previous round
+  closed the reported instances and left the mechanism, so the same defect
+  came back in new shapes. `observed()` iterated receivers across every body
+  in the file with no reachability test at all: a `local function boom()
+  return c:reset() end` that nothing invokes, beside `print(type(boom))`,
+  warned about a lookup no execution performs — and so did
+  `if false then c:reset() end`.
+
+  Uses are now counted only in bodies this file **enters** — the chunk, plus
+  a fixpoint over the in-file call graph across the edges the pass already
+  tracked (a named function, a field of a named table, a function expression
+  the call site writes out, the `__call` dispatch on a derived value, and the
+  colon method an instance call reaches) — and only in statements no
+  **literal** condition prunes. A closure that escapes is not reached, and a
+  guard that is a name is not decided; both are false-negative-shaped and both
+  are disclosed with fixtures. Round 7's last disclosed approximation, a
+  dead-branch `self:m()` inside a `__call`, closes as a side effect.
+
+  Three more shapes in the same neighbourhood, each measured against
+  `lua5.4` before being written down:
+
+  - **the statement-form constructor.** `setmetatable` mutates its first
+    argument and returns it; only the result was tracked, so the idiomatic
+    `local t = {}; setmetatable(t, Cache); t:reset()` was silent on a crash.
+    The argument is now linked too, alias-rooted, which also makes the same
+    shape inside `Cache.new()` flow into factory detection.
+  - **`and`/`or` follow the operand actually evaluated**, which is what the
+    doc claimed and the code did not: `Or` seeded both operands. A
+    construction is a table and always truthy, so `ctor or x` *is* the
+    construction and `x or ctor` is undecidable; `x and ctor` is followed
+    because a falsy `x` fails the same call just as hard, and `ctor and x`
+    evaluates to `x`.
+  - **module factories and dot dispatch.** Functions attached to a table were
+    keyed by binding, so a *global* module table (`M = {}; function M.new()`)
+    resolved to no body at all. And `c.reset(c)` is the same lookup as
+    `c:reset()` with the same failure, so it now counts — while a bare field
+    read, a metafield read, and a key naming nothing on the carrier do not.
+
+  The shape matrix grew from 48 programs to 94, and the disclosed-miss list
+  in [LIMITATIONS](docs/03-reference/02-limitations.md) from eight entries to
+  eleven. Its preface no longer claims a committed fixture for all of them:
+  ten have one, and `require` structurally cannot, because that bound is
+  cross-file and the matrix runs one file at a time.
+
+- **A `shutdown` sent while a progress token is being created no longer exits
+  1.** `Connection::handle_shutdown` answers the request and then reads the
+  *channel* for the `exit` that follows; it cannot see the queue
+  `await_progress_create` drains into. So an `exit` that arrived during the
+  wait was invisible to it — the server answered the shutdown, waited out
+  `handle_shutdown`'s own 30 s bound for a notification it was already
+  holding, and exited 1. A session without the progress capability exited 0,
+  which is what makes it a regression; VS Code and Neovim surface it as
+  abnormal termination, and it reproduced on the config-reload path as well
+  as at startup.
+
+  The wait now **aborts** the moment it drains a `shutdown` request or an
+  `exit` notification: the message goes on the queue in arrival order, the
+  loop drains it into the ordinary handshake, and that handshake finds the
+  `exit` where it expects it. `Connection`'s contract is untouched. Waiting
+  out the remaining 250 ms for a token nobody will use was pointless anyway.
+
+- **An error answer to `window/workDoneProgress/create` is a refusal, not a
+  success.** The wait matched on the response id and never looked at
+  `response.error`, so a client replying `-32601` still received the `begin`,
+  the per-file `report`s and the `end` under a token it had just declined —
+  the exact traffic the wait was added to prevent. A refused token now takes
+  the `progress: false` path: no `begin`, no `report`, no `end`.
+
+- **`LB0510` counts calls the file *makes*, not colon calls it *contains*.**
+  The reached-a-method gate had a syntactic hole: `self` inside any function
+  attached to the carrier was treated as an instance, so a `self:m()` written
+  anywhere in any attached body counted as a use whether or not the file ever
+  entered that body. Two measured false positives. The committed `__call`
+  fixture with its last line changed from `print(f())` to `print(type(f))`
+  produced byte-identical lint output against opposite `lua5.4` verdicts; and
+  `Cache.__mode = "k"` beside `function Cache:reset() self:clear() end` that
+  nothing invokes warned on a program that runs to completion — the same shape
+  the previous round closed, reopened by one added line.
+
+  A method is now reached one of two ways: a **colon call on a derived value**
+  (`c:m()`), or a **plain call on a derived value** (`c()`) when the carrier's
+  `__call` metamethod is a body in this file whose own receiver takes a colon
+  call — the chain `c()` → `C.__call(self)` → `self:m()`, which does crash.
+  Only the `__call` body is asked, not every attached body: a `__call` that
+  reaches no method, beside a `C:reset()` nothing invokes, runs fine. A colon
+  method is silent unless something reaches it on an instance, which is a
+  colon call on a derived value and was already tracked.
+
+- **`LB0510` sees instances bound by assignment, by a global, or past the end
+  of an initialiser list.** Value bindings were seeded from `local` statements
+  only, and assignments were read for `C.field = …` targets alone, so
+  `local c` / `c = setmetatable({}, Cache)` / `c:reset()` was silent on a
+  crash. So were `g = setmetatable({}, Cache); g:m()`, the constructor pattern
+  through a global `function make() … end`, and
+  `local c = setmetatable({}, Cache) or fallback`. All now fire.
+
+  Separately, all three passes paired names against initialisers with
+  `names.iter().zip(init)`, which **drops** every name past the end of the
+  list: `local n, c = make()` where `make` returns `1, setmetatable({}, Cache)`
+  left `c` invisible and handed `n` the derivation that belongs to it. Names
+  and values are now adjusted the way Lua adjusts them, tracking which result
+  slot feeds which name, and factory return slots are tracked to match.
+
+  What is still missed is now named shape by shape in
+  [LIMITATIONS](docs/03-reference/02-limitations.md) — table field, parameter,
+  generic-`for` variable, method-call factory, `...` slot, depth-two
+  constructor, a `__call` reaching its method through a nested closure, and
+  the pre-existing `require` bound — each with a committed fixture and its
+  `lua5.4` verdict, so closing one is a deliberate act rather than a surprise.
+
+  The shape matrix grew from 16 programs to 48. Every shape that can be
+  written invoked and uninvoked is now committed **both** ways: the round-7
+  false positive existed because only the invoked half had ever been written
+  down, so the harness could not see that two files with opposite runtime
+  verdicts were producing identical lint output.
+
+- **`LB0510` no longer warns on a carrier whose methods nobody calls.** The
+  operator-table gate was *structural* where it needed to be *behavioural*: a
+  carrier that declared a lookup-irrelevant metafield **and** a colon method
+  was read as a class, whether or not anything ever invoked that method on an
+  instance. Eight measured shapes warned and ran fine under `lua5.4` —
+  `Cache.__mode = "k"` beside `function Cache:reset()`, a `__newindex` guard
+  beside `Guard:reject()`, an `__lt` comparator beside `Sorter:cmp()`.
+
+  On a carrier with a metafield the rule now fires only on an **observed
+  instance-side use**: a colon call landing on a value derived from
+  `setmetatable(_, C)`. Four derivations are followed — the construction
+  method-called on the spot, a local bound to it (and aliases of that local),
+  the constructor pattern (`local c = Counter.new(); c:value()`), and `self`
+  inside a function attached to the carrier, which is how a `__call` factory
+  doing `return self:build()` still fires. Deriving the value is also what
+  keeps one class's calls from settling another's: a `:get()` on a `Store`
+  instance says nothing about a `Cache` that happens to declare a `get` too.
+
+  A carrier with **no** metafield is unchanged — still structural, still
+  firing on the construction alone. That region is pinned by four rounds of
+  measurement, and gating it behaviourally would reopen the false-negative
+  axis the previous round closed.
+
+  The shape matrix behind all of this is now committed and runnable rather
+  than kept in prose: `scripts/tests/lb0510-matrix/` holds one program per
+  shape with its expected finding count, and `scripts/tests/lb0510-matrix.sh`
+  re-derives both the lint verdict and — where `lua5.4` is on `PATH` — what
+  the program actually does when executed. It is blocking in the differential
+  workflow, the job with real interpreters on the runner.
+
+- **`LB0510` fires again on the canonical carrier class.** The previous
+  round's two false-positive fixes each over-reached, and between them they
+  silenced the shape `metatable-without-index` exists for. A single
+  `function Counter.__tostring(c)` line beside a colon method disabled the
+  rule, so the idiomatic Vector2 tutorial class — a dot constructor,
+  `:length()`, `__tostring`, `__add` — crashed on `v:length()` in silence;
+  and a bare `local mt = Counter` with nothing written through it disabled it
+  too, as did an alias inside a dead branch or an unrelated nested function.
+  Re-measured against `lua5.4` over a 32-shape matrix: 19 shapes crash at
+  runtime, the rule fired on 5.
+
+  Another metafield now buys silence only on a carrier with **no instance
+  methods** — a colon-declared `function C:m()` is what instance lookup, and
+  so `__index`, is needed for — and an alias suppresses only when something
+  is actually written *through* it, with carrier identity propagated along
+  alias chains so a write through any link counts. After: 17 of the 19
+  crashing shapes are reported, with zero false positives across the 13 that
+  run clean. The two that stay quiet are the documented conservative bounds
+  (a write in a dead branch or a never-called function), consistent with the
+  same writes made directly on the carrier.
+
+- **Every bundle mode refused to notice a chunk the ship target cannot
+  load.** `luabox build`'s residual control-flow validation lived on the
+  tree-mode path only; `bundle = true`, `mode = "love"` and
+  `mode = "nvim-plugin"` all route through the bundler, which validated parse
+  errors and dialect legality but never control-flow legality. A 5.2 project
+  shipping `::a:: do ::a:: end` to 5.4 therefore wrote the illegal chunk into
+  `dist/main.lua` — and into the `.love` archive — and exited **0**, while
+  tree mode exited 1 with no output. The bundler now judges it too, so all
+  four emit shapes agree.
+
+- **A manifest-declared ship target reaches the legality passes.**
+  `[build] target` fed `require` resolution and the rock harvest but nothing
+  that judged the source, so a project *declaring* `target = "5.4"` passed
+  `luabox check` on a program `luabox check --target 5.4` rejects, then built
+  an artifact that cannot load. The control-flow pass now runs for the
+  manifest target as well; `--target` still overrides it. The target's
+  *dialect* legality is deliberately not asked of a manifest target — a
+  declared target says the project is lowered there, and reporting `LB0011`
+  on every `//` in a 5.3 project shipping 5.1 would fail `check` for using
+  the feature `[build] target` exists to provide. An explicit `--target` is
+  the literal "would this source be legal there?" question and still asks
+  both.
+
+- **A duplicate label reported for two dialects no longer contradicts
+  itself.** The edition and target legality runs were merged on (code,
+  primary span) with the first one winning, but two `LB0021`s at the same
+  span are not the same verdict: 5.4's `checkrepeated` searches every open
+  block where 5.2's searches only the current one, so the first-definition
+  site is dialect-dependent. Edition 5.2 with `--target 5.4` over
+
+  ```lua
+  ::a::
+  do
+    ::a::
+    ::a::
+  end
+  ```
+
+  named line 4 as a duplicate of line 3, then line 3 as a duplicate of line
+  1 — line 3 reported as both — and printed them out of source order. The
+  ship target's verdict now wins a construct both reject, a finding only the
+  target rejects says so in a note, and the merged set is rendered in source
+  order.
+
+- **`luabox build`'s duplicate-label report carries a span.** It was
+  reconstructed from the lowered text, whose ranges do not index the source,
+  so it shipped with no labels at all while `check --target` gave full spans
+  for the identical defect. The build gate now judges the source at the ship
+  target, so the finding underlines the duplicate and points at the first
+  definition. The spanless residual pass over the lowered output stays as the
+  belt-and-braces catch for anything lowering itself introduces.
+
+- **`metatable-without-index` (`LB0510`) no longer warns on correct code.**
+  Two shapes were false positives. An *operator metatable* — a carrier
+  declaring `__call`, `__tostring`, `__add` or `__mode` and no `__index` —
+  is a metatable whose purpose is not instance lookup; there is no
+  `t:method()` to fail, and the rule is now silent when the carrier declares
+  any metafield other than `__index`. An *aliased* `__index` write
+  (`local mt = Counter; mt.__index = mt`) settles the same table the rule
+  cannot follow, so a local alias of a carrier now suppresses, the same
+  conservative trade as a computed key. In the other direction,
+  `rawset(C, "n", 0)` no longer over-suppresses: only a literal `__index` or
+  an unreadable key settles the carrier. The finding's note stopped asserting
+  a crash at call sites that may not exist.
+
+
+- **`--target` now reaches the control-flow legality pass, and `luabox build`
+  will not emit a tree the target cannot load.** `--target` means "would this
+  source be legal there?", but the `LB0020`-`LB0022` pass ran for the project
+  `edition` only. Duplicate-label scope is the one control-flow rule that
+  differs by edition — 5.4's `checkrepeated` searches every open block where
+  5.2/5.3/LuaJIT search only the current one — so `edition = "5.2"` with
+  `::a:: do ::a:: end` and `luabox check --target 5.4` reported **0 errors**
+  for a chunk `luac5.4 -p` refuses to load. It is now `LB0021`, exit 1, and
+  the finding is reported once when both the edition and the target flag the
+  same span, exactly as dialect legality already deduplicated.
+
+  `luabox build`'s check gate does not judge the target's *dialect* legality
+  on purpose (lowering is what handles constructs the target's parser
+  rejects), but nothing lowers a shadowed label away — so the same program
+  built with `--target 5.4` silently emitted an unloadable file and exited 0.
+  The gate now runs the target's control-flow pass against the source, and
+  the residual validation of each lowered file judges it again over the
+  lowered text. Emission stays per file, as it always has (tsc/esbuild
+  semantics): the file that fails is not written and the exit code is
+  nonzero, while files that lowered cleanly are still emitted — and because
+  `build` never cleans `dist/`, a failing rebuild leaves the previous run's
+  output in place. `luabox lint` and the language server have no target flag
+  and are unaffected.
+- **A `---@class` in a defs file no longer steals another class's carrier
+  variable.** `---@class Wrapper` over `local Animal = {}` binds the *local*
+  `Animal` to `Wrapper`, so `function Animal:speak()` is `Wrapper`'s method.
+  A later `---@class Animal` (carried by some other variable) overwrote that
+  binding with its own name-is-its-own-carrier alias, and `speak` folded onto
+  the wrong class — swapping the two class blocks flipped the verdict, and
+  the ordinary project-source path, which resolves the binding, disagreed
+  with the defs path on the identical body. Carrier-variable bindings now
+  take precedence over name aliases explicitly and in one ordered pass, so
+  both orderings agree with each other and with project source (#39's goal).
+
+- **`luabox check` and the language server no longer disagree about which
+  file a colliding rock module name means.** A vendored tree can hold both
+  `pl.lua` and `pl/init.lua`, and both answer to `require("pl")`. The rock
+  walk sorted a `Vec<PathBuf>`, whose `Ord` is component-wise: it ranks the
+  bare component `pl` below `pl.lua` and so put the **directory** first,
+  inverting the order `require` actually resolves in. The harvest is
+  first-wins per module name, so the editor (name-keyed) called `pl` the
+  `init.lua` while `luabox check` (path-keyed, through
+  `resolve_candidates`, which tries the flat `<rel>.lua` first) called it
+  `pl.lua` — the same source got opposite verdicts in CI and in the editor.
+
+  The walk now sorts by the paths' raw bytes, which reproduces candidate
+  order on every platform (`.` = 0x2E sorts below both `/` and `\`). Pinned
+  from both ends: a `collect_rock_sources` unit test over a tree that
+  actually contains the colliding pair, and one repro fixture asserted
+  through `luabox check` and through the server.
+
+- **`goto`/label/`break` legality is diagnosed**
+  ([#44](https://github.com/flying-dice/luabox/issues/44)) — three programs
+  every reference Lua refuses to *load* used to pass `luabox check` and
+  `luabox lint` clean. They are now errors, in `check`, in `lint` and in the
+  editor:
+  - `LB0020` — a `goto` naming no visible label (`goto nowhere`). The label
+    name is underlined, and a near-miss visible label becomes a
+    ``did you mean `continue`?`` nudge.
+  - `LB0021` — a label already defined in scope (`::a:: ::a::`), pointing at
+    the second declaration with the first one labelled as context.
+  - `LB0022` — `break` with no enclosing loop in the same function, including
+    the case people actually hit: `break` inside a closure *defined* in a
+    loop, where the loop sits on the other side of a function boundary.
+
+  Dialect legality already covered `goto` under `edition = "5.1"`
+  (`LB0010`); the gap was label/loop *resolution* legality, which the HIR had
+  been resolving all along without judging. The rules are read off reference
+  Lua's own (`lparser.c`'s `undefgoto`/`checkrepeated`) and the verdicts were
+  built differentially against `luac5.4 -p` and `luac5.1 -p` over a
+  53-program matrix — every legal `goto` shape (forward, backward, outward,
+  the `::continue::` idiom in each loop kind), every loop kind's `break`, and
+  the same label name in sibling or nested-function scopes are left alone.
+  Duplicate-label scope follows each edition's own rule: 5.4 rejects a nested
+  label that shadows an outer one, 5.2/5.3/LuaJIT do not.
+
+  One reference rule is deliberately left out — a forward `goto` that jumps
+  into the scope of a local — because the HIR erases the void statements the
+  rule turns on. It is an under-approximation only (no legal program is
+  rejected for it) and is recorded in
+  [the limitations page](docs/03-reference/02-limitations.md).
+- **`---@type fun(…)` on an assignment now types the function it annotates**
+  ([#38](https://github.com/flying-dice/luabox/issues/38)). `---@deprecated` +
+  `---@type fun(self: C, n: integer)` above `C.m = function(self, n) end`
+  reached nothing: neither the declared signature nor the block's tags landed
+  on the assigned value, so `o:m(…)` was unchecked and the deprecation never
+  surfaced. `Carrier.m = function(…) end` is the assignment spelling of a
+  function definition — luals binds a doc block to the function value there
+  exactly as it does above `function Carrier.m()` — so a doc block now attaches
+  either way it is written: an explicit `---@type fun(…)` is authoritative for
+  the value (SPEC §3) and supplies parameters, returns, overloads and generics,
+  while the block's use-site tags
+  (`---@deprecated`/`---@async`/`---@nodiscard`/`---@version`), which `fun(…)`
+  syntax cannot express, ride along with it. The literal's own parameters are
+  typed from the declared signature, the same bidirectional rule `---@type` on
+  a `local` follows. `---@type A, B` stays positional, so a lone annotation
+  over `a, b = f, g` declares `a` only. A declared signature that disagrees
+  with the literal's parameter list is not itself a diagnostic — luals has no
+  such rule, and the declaration simply governs.
+- **A `---@class` carrier with no `C.__index = C` line no longer loses its
+  methods** ([#33](https://github.com/flying-dice/luabox/issues/33)). The
+  canonical luals shape — `---@class C`, `local C = {}`, `function C:m()`, and
+  no runtime metatable link — reported `LB0306` (undefined field) at every
+  `o:m()` and dropped the method's `---@deprecated`/`---@async` tags with it.
+  An instance's shape reached its carrier only through an explicit `__index`,
+  a runtime-fidelity requirement luals does not make: it folds carrier
+  attachments into the class off the carrier binding. The fall-through only
+  *adds* resolutions, so a genuinely undefined field is still reported and
+  argument checking stays exactly as conservative as before.
+- **Carrier-style members in a `---@meta` defs file are folded into the class**
+  ([#39](https://github.com/flying-dice/luabox/issues/39)). `function
+  Class:method()` (and `function Class.fn()`) inside a definition package
+  reported `LB0306` at every use site: a checked project file gets its carrier
+  attachments folded in by inference, but a defs file is never inferred, so
+  they reached nothing. They are now harvested syntactically — signature,
+  returns, and use-site tags — exactly as luals treats a library file, with a
+  same-name `---@field` staying authoritative on type while inheriting the
+  attachment's tags. An attachment with no doc block still joins the surface,
+  at a fully permissive signature, so nothing is silently dropped.
+
+### Added
+
+- **`metatable-without-index` (`LB0510`, suspicious) — the runtime half of the
+  `---@class` carrier trade.** `luabox check` resolves `c:m()` through a
+  `---@class` carrier even when the metatable chain has no `__index`; that is
+  deliberate luals parity (#33) and it stays. But `setmetatable({}, Counter)`
+  followed by `c:value()` is `attempt to call a nil value (method 'value')` in
+  every reference Lua, and luabox had stopped saying so. The new lint says it
+  instead: it fires on `setmetatable(t, C)` where `C` is a `---@class` carrier
+  declared in the same file and nothing anywhere assigns `C.__index`, and it
+  names the one-line fix (`C.__index = C`).
+
+  It is deliberately conservative — a global carrier, one reached through
+  `require`, a table literal, a call result, a computed field write
+  (`C[k] = v`), a `rawset(C, …)`, or a reassignment of `C` all leave it
+  silent — and `---@meta` definition files are exempt. Suppressible as
+  `---@luabox-ignore metatable-without-index <reason>` and configurable as any
+  `[lint]` rule; `metatable-without-index = "allow"` restores exact luals
+  behaviour.
+
+  **Parity status: luabox-specific.** luals ships no equivalent diagnostic —
+  it has nothing that reasons about metatable wiring — so this is a
+  deliberate, opt-out-able addition on top of parity, not a divergence in the
+  checker. `luabox explain LB0510` says all of this, and the trade is recorded
+  in [the limitations page](docs/03-reference/02-limitations.md).
+
+### Internal (contributors)
+
+- **The `differential` job's path filter covers the whole lint crate.** The
+  LB0510 runtime gate (the only job with a real Lua on the runner) filtered
+  exactly one lint file — the rule itself — while the rule also reads
+  `facts.rs` and `context.rs`, so an edit to either landed green with the
+  runtime column unrun, which is what the filter's own comment promises
+  cannot happen. `crates/luabox-lint/**` now, so the rule can grow a
+  dependency on a sibling module without anyone remembering the filter.
+
+- **The server waits for the `window/workDoneProgress/create` response before
+  reporting under the token.** It sent the create and the token's `begin` back
+  to back — 0.1 ms apart on the wire, with no response in between — and the
+  message loop discarded every response, so the answer was never read at all.
+  LSP puts the token in the client's hands: a `$/progress` under a token the
+  client has not acknowledged is a notification it may drop, and a dropped
+  `begin` announces the pause to nobody. `create_progress_token` now waits, so
+  every caller's `begin` follows the response by construction. Client messages
+  arriving during the wait — `initialized`, a `didOpen` for a restored buffer —
+  are queued and drained by the loop before anything new, in arrival order.
+  Bounded at 250 ms, so a client that answers nothing gets the previous
+  behaviour rather than a server that stops serving it.
+
+  **It is not free, and "no worse than what it replaced" is true of the
+  protocol and false of the latency.** A client that never answers a create
+  pays the full bound on every token: two at startup, one per config reload.
+  Measured over the same workspace, startup-to-usable went from a 5842 ms
+  median to 6282 ms — 2 × 250 ms before the editor is usable, plus 250 ms on
+  each reload. A client that answers (every real editor does) pays a
+  sub-millisecond round trip and none of this. The silent case is now halved
+  — after one create goes unanswered the server stops waiting for the rest of
+  the session — but it is not zero, and a client that answers *slowly* still
+  costs whatever it costs.
+
+- **`diagnostics::convert` derives its `source` instead of taking one.** All
+  three non-test call sites passed exactly `source_for(diag.code)` — an
+  invariant held by convention across two modules, and the shape of both
+  source-mismatch bugs the previous rounds found. The parameter is gone;
+  behaviour is byte-identical, and a caller can no longer disagree with the
+  code because there is nothing left to pass.
+
+- **The pinned-stack isolation test refuses to run under `RUST_MIN_STACK`.**
+  The variable raises every thread's default stack, so an environment setting
+  it to 8 MiB or more would let an *unpinned* rayon worker survive the
+  calibrated recursion — two of the three deletion modes would stop failing
+  and the test would pass while proving nothing. It now asserts the variable
+  is unset, loudly, rather than overriding it.
+
+- **Every server-created progress token and its `create` request id are now
+  unique.** Both were derived from the token *name*, a compile-time constant,
+  so three config reloads sent three `window/workDoneProgress/create` requests
+  sharing one id and one token. JSON-RPC requires ids to be unique among
+  outstanding requests and LSP requires server-generated tokens to be unique;
+  a client tracking outstanding requests by id saw the second `create` collide
+  with the first. A per-session counter now feeds both, so a reload announces
+  itself as `luabox/reload-2`, `luabox/reload-3`, …. The startup tokens fire
+  once each but get the same treatment.
+
+- **The work-done capability gate moved inside `begin_progress`.** It returned
+  a token unconditionally and relied on its one call site being guarded —
+  which is what the reload path getting a second, unguarded call site looked
+  like last round. It now returns `Option<ProgressToken>` like its titled
+  sibling, so the gate is a property of the function.
+
+- **Every published diagnostic's `source` is derived from its code.** Two
+  publishers — the type pass and the parse/dialect helper — bypassed
+  `source_for` and hardcoded the toolchain source. Harmless today, since
+  neither can emit an `LB05xx`, and precisely the "right for the codes that
+  exist now" shape as the code-action bug fixed last round. Both are routed
+  through the helper; behaviour is byte-identical, and a new test asserts the
+  invariant over the published stream rather than over the helper.
+
+- **`pin_worker_stacks` has a test that fails when it is deleted.** The old
+  suite (idempotence, plus cross-crate constant equality) passed with the pin
+  gone, the `.stack_size` dropped, or both constants lowered together, and the
+  call site carried a comment claiming no such test could exist. That holds
+  only for parser-driven recursion, which `MAX_DEPTH` caps below 2 MiB; a
+  *synthetic* recursion is under no such cap. `luabox-lsp`'s new
+  `tests/pinned_stack.rs` reaches the pin through `run` — the production call
+  site — then recurses ~8 MiB on a global-pool worker: comfortably past
+  rayon's 2 MiB default and comfortably inside the pinned 16 MiB. It is the
+  only test in its binary, because `build_global` succeeds once per process.
+  All three failure modes were checked by hand and each aborts the binary.
+
+- **`LB0510`'s alias resolution is linear again.** `Carriers::build` calls
+  `Aliases::root` once per indexed write, and `root` walked the whole
+  `local b = a; local a = C` chain on every call — quadratic in chain depth
+  times writes. Measured on a generated file with an 8000-link chain and 8000
+  writes through its deepest link, lint went from 1.27 s to 0.08 s; at 32000
+  (a 1.36 MB file) from 22.85 s to 0.38 s, which is the flat control's time.
+  Every alias is now resolved to its root once at build time, with path
+  compression, so `root` is a single lookup. The self-loop guard and the step
+  bound are kept: a chain is acyclic by construction, but that is a property
+  of the lowerer rather than of this function's input.
+
+- **Work-done progress is gated on the client, and the startup pause has a
+  token.** `window.workDoneProgress` was read once and handed to the
+  bootstrap index alone, so the config reload announced itself to clients
+  that never advertised the capability; the flag now lives on the server and
+  gates every `$/progress` it sends. The synchronous startup rock harvest —
+  a stretch of protocol silence a client could not attribute to anything —
+  is now wrapped in its own token, which required running it after the
+  `Server` is constructed so it can reach the same helper the reload uses.
+  The two tokens carry distinct ids so the pauses are distinguishable.
+
+- **Three stale claims in comments and help text now match the code.**
+  `build`'s residual-validation comment said the check gate runs edition
+  legality only (it has also run the ship target's control-flow pass since
+  the previous round) and implied the residual arms were unreachable; it now
+  describes what they actually serve — a finding *lowering itself*
+  introduces, plus three enumerated paths the gate cannot see (a module under
+  `lua_modules/`, `--out` pointed at a source directory, and `LB0014`/`15`/`16`
+  in tree mode), none of which writes an artifact. `build`'s module doc gains
+  the same correction and names the bundle-path twin. `check --help`'s
+  `--target` no longer says "*also* validate dialect legality": the manifest
+  target drives the control-flow axis with no flag, and the flag asks both.
+  `SPEC.md` §5 states which passes `[build] target` drives per command.
+
+- **The rendered diagnostic stream is source-ordered across legality axes.**
+  Dialect legality and control-flow legality were each sorted and then
+  concatenated in pass order, so an `LB0021` at line 13 could render after an
+  `LB0013` at line 29. They are now sorted together, with a stable tie-break
+  that keeps the parser's verdict ahead of the loader's at the same span.
+
+- **The language server's startup number is reproducible.**
+  `scripts/lsp-startup-bench.sh` (plus its stdio client
+  `scripts/lsp-startup-bench.py` and `gen-corpus --rock-tree`) regenerates the
+  corpus, drives the real protocol and reports median/min, so the
+  `harvest_rock_tree` figure can be re-measured instead of quoted. It is not
+  a CI gate. Three claims around it were wrong and are fixed: two comments
+  disagreed on the same measurement (654 ms vs 545 ms); the harvest was
+  described as happening "once, at startup" when `reload_config` re-runs it
+  on the main loop for every `workspace/didChangeConfiguration` and every
+  watched `luabox.toml` edit — that reload is now wrapped in a work-done
+  progress token so the pause is visible rather than looking like a hang; and
+  the rayon pool was pinned only by the CLI entry point, so a library caller
+  of `luabox_lsp::run`/`run_stdio` harvested on rayon's 2 MiB default worker
+  stacks. Both public entry points now pin, best effort, and a test drives a
+  195-deep source over 32 rock modules through the *unpinned* path.
+
+- **A repeated carrier variable in a defs file follows the binding.** Within
+  the lexical rank, `carrier_var_classes` kept the first carrier for a
+  repeated variable name — but `function M:m()` names the binding in scope,
+  which Lua resolves to the last `local M`. The project-source inference path
+  resolved the binding and said "last"; the defs path said "first", so the
+  two disagreed on every repeated-carrier shape, which is exactly the parity
+  #39 exists to hold. Lexical-over-nominal ranking is a separate axis and is
+  unchanged.
+
+- **The control-flow differential enforces its own matrix invariant.**
+  `scripts/tests/control-flow-differential.sh` asserted in prose that its
+  target column's pinned edition parses every matrix program, with nothing
+  checking it; a future program using a 5.3+ construct would have made that
+  column measure two things at once and failed in the direction the script
+  calls never-OK, blaming luabox for a defect in the matrix. A preflight now
+  fails loudly, naming the program.
+
+- **`LB0510`'s bounds are documented.** The limitations reference now states
+  plainly that the rule is in-file only — the cross-file `require`d-carrier
+  shape crashes at runtime with `check` and `lint` both silent — and that it
+  is lint-only, never affecting `check`'s exit code. Cross-file carrier
+  analysis is a different pass and is deliberately not attempted.
+
+- **Two tests that could not fail, and one that was missing.** The `goto`
+  half of `control_flow`'s 5.1 guard is now exercised by a hand-lowered file
+  that genuinely contains a `Stmt::Goto` (the recovered 5.1 parse may contain
+  none, so the old assertion held whether or not the guard existed); the lint
+  quick-fix *pairing* — not just its precondition — is asserted against the
+  diagnostic the server actually published, over a mixed diagnostic set.
+
+- **`luabox_hir::validate::control_flow`'s 5.1 comment now matches the
+  measurement.** It claimed `goto` under `edition = "5.1"` is "already
+  reported as `LB0010`"; it is in fact two `LB0001` parse errors — `goto` is
+  not in the 5.1 grammar — and since every caller skips this pass on a dirty
+  parse, the `goto` guard is unreachable from any front-end path. The label
+  guard *is* reachable and load-bearing (`::a::` parses under 5.1 and is
+  `LB0010`). Both guards are documented per their real reachability, the
+  `goto` one kept as defence in depth because the function is `pub` over an
+  already-lowered file, and the asymmetry is pinned by a test.
+
+- **The lint code band has an authority instead of a magic decade.** The
+  language server decided whether a finding was a lint rule — and therefore
+  whether its quick-fix matcher would look at it — with
+  `diag.code.number() / 100 == 5`, and nothing asserted that every lint rule
+  actually lives in `LB0500`-`LB0599`. `luabox_diag::Code::is_lint` now owns
+  the band, with the contract spelled out in its doc comment, and the
+  invariant is asserted where it cannot rot: `luabox-lint` checks every
+  registered rule's code against it (that is the load-bearing test —
+  `luabox-diag` sits below the rule registry and cannot see it), and the
+  registry checks the band is densely allocated from `LB0500`.
+- **The language server's startup rock harvest is parallel, and measured.**
+  `luabox check` parallelized the identical workload after a measured
+  1.98 s → 0.55 s; the LSP kept the sequential form and shipped no number.
+  It now rides the same rayon pool (the global one `real_main` pins to a
+  16 MiB worker stack), through the same `harvest_file` + `RockSurfaces::fold`
+  split, so the result is byte-identical — the fold is what fixes precedence.
+
+  Measured by `scripts/lsp-startup-bench.sh`, which reproduces the whole
+  measurement end to end: it generates the corpus (`gen-corpus --rock-tree`:
+  50 files, 102,813 lines of `---@class` Lua under
+  `lua_modules/share/lua/5.4/`), drives the real stdio protocol, and times
+  `initialize` to the **first** `publishDiagnostics`. On one 4 vCPU
+  virtualized box, 7 runs each: **2751 ms → 760 ms median** (2673 ms → 718 ms
+  min), 3.6x. The baseline is the same binary forced to one rayon worker, not
+  a pre-fix build, so the comparison is of the parallelism and of nothing else
+  in a commit range. The same project with no rock tree publishes in 11 ms, so
+  the harvest is effectively the whole wait. The sequential row is single-host
+  and steal-sensitive — an independent 4 vCPU box did not reproduce it — so
+  the harness, not the constant, is what makes the claim checkable. The single
+  source for the numbers, and for the host they were taken on, is the code
+  comment at `harvest_rock_tree`.
+
 ## [0.2.0] - 2026-07-29
 
 **The v1 scope cut — every item below is a breaking change.** luabox is now
@@ -23,6 +705,50 @@ so it appears in no version entry.
 
 ### Added
 
+- **A bare `luarocks install --tree lua_modules <rock>` now gives you the
+  rock's *types*, with no configuration at all**
+  ([#30](https://github.com/flying-dice/luabox/issues/30)). This was the
+  documented sharp edge: cross-package definitions needed a `[dependencies]`
+  entry, a per-package `lua_modules/<name>/luabox.toml` with `[types] defs`,
+  and the `defs/` directory it named — none of which a luarocks tree has, so a
+  rock stayed `unknown` to the typechecker. The rocks were never actually
+  untyped: LuaCATS is the ecosystem's annotation dialect, and a rock that
+  documents itself for lua-language-server has already written the signatures.
+  `luabox check` and the LSP now read them where they sit, in the installed
+  sources under `lua_modules/share/lua/<X.Y>/`:
+  - a rock's `---@class`, `---@enum` and `---@alias` declarations become
+    nameable and enforced in your code — `---@type rock.Thing` resolves (no
+    more `LB0305`) and its fields are checked;
+  - each rock module's `require`-export type joins the cross-file registry, so
+    `local m = require("rock")` carries the module's annotated return types and
+    misusing a rock-typed value is reported **at your use site** — an
+    undeclared field read on a rock class is an `LB0306` in *your* file. No
+    diagnostic ever names a vendored file.
+
+  **Surfaces only; bodies are never checked.** Vendored code remains
+  unchecked: the harvest returns a type surface and no findings, so a type
+  error inside a rock produces nothing, and a rock source that does not parse
+  is skipped whole — named in the LSP log pane, silent under `check`, never a
+  project diagnostic. A source with no `---@` anywhere is skipped before it is
+  parsed, so an un-annotated, dynamically-built module table cannot become
+  `undefined-field` noise about code you did not write.
+
+  **Explicit beats implicit.** A class, enum or alias name declared by your
+  `[types] defs` or by any of your own source files wins over a rock's
+  **outright** — replaced, not merged — which is what makes writing your own
+  definitions a real escape hatch for a wrong annotation upstream. Among rocks
+  the rule is silent first-wins in path order: you declared neither side of a
+  rock-vs-rock clash and cannot edit vendored code, so there is no
+  `LB0307`/`LB0310` to act on. Editor and CI harvest the same version
+  directory (`[build] target`, `5.1` for `luajit`), so they agree. The flat
+  `lua_modules/<name>/` layout keeps its existing `[dependencies]` + `[types]
+  defs` route unchanged, and a `[dependencies]` entry alongside a rock tree
+  neither breaks nor double-counts the harvest. What still needs definitions of
+  your own — an unannotated rock, a global-API library, argument checking at a
+  module field's call site — is spelled out in
+  [docs/03-reference/02-limitations.md](docs/03-reference/02-limitations.md);
+  the design record is
+  [decisions/09](decisions/09-rock-tree-type-harvest.md).
 - **`luabox schema` — the manifest contract, published as a JSON Schema.**
   The binary now carries a complete draft 2020-12 JSON Schema for
   `luabox.toml` and prints it to stdout, so editors, validators and LLM

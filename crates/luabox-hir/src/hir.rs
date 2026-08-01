@@ -182,9 +182,10 @@ pub enum Stmt {
     },
     Return(Vec<ExprId>),
     Break,
-    /// `goto name`; `target` is resolved to the visible label, or `None` if no
-    /// matching label exists in the function (legality checking is a TODO for
-    /// diagnostics).
+    /// `goto name`; `target` is resolved to the visible label, or `None` if
+    /// no matching label exists in the function. `None` is the *illegal* case
+    /// — [`crate::validate::control_flow`] reports it as `LB0020`, the way
+    /// reference Lua refuses to load the chunk (#44).
     Goto {
         name: String,
         target: Option<LabelId>,

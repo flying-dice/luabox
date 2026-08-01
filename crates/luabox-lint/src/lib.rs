@@ -112,6 +112,16 @@ pub fn lint_source(
     }
 
     let lowered = lower(&parse);
+    // Control-flow legality (#44): an unresolved `goto`, a repeated label, or
+    // `break` outside a loop is code the runtime refuses to load, so it rides
+    // here as an error beside the parse errors above — not as a rule with a
+    // tier, and not suppressible, exactly like a malformed ignore. Skipped on
+    // a broken parse for the same reason the rules below are: the block
+    // structure recovered around a missing `end` is a guess, and a legality
+    // verdict over a guess is noise.
+    if !had_parse_errors {
+        diagnostics.extend(luabox_hir::validate::control_flow(file, &lowered, dialect));
+    }
     let facts = TypeFacts::build(&parse, &lowered);
     let suppress = Suppressions::collect(&parse, source);
     // Built once per file: resolving each finding's line by counting newlines

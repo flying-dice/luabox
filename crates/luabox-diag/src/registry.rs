@@ -58,6 +58,25 @@ static REGISTRY: &[Entry] = &[
         title: "`\\u{...}` string escape not available in this edition",
         explain: LB0016,
     },
+    // LB0020-LB0029: source legality that is *not* edition-dependent — code
+    // every reference Lua refuses to load, whatever the `edition`. Kept beside
+    // the LB001x dialect-legality block (both answer "is this source
+    // loadable?") but in its own decade so the two are told apart at a glance.
+    Entry {
+        code: Code::new(20),
+        title: "no visible label for `goto`",
+        explain: LB0020,
+    },
+    Entry {
+        code: Code::new(21),
+        title: "label already defined",
+        explain: LB0021,
+    },
+    Entry {
+        code: Code::new(22),
+        title: "`break` outside a loop",
+        explain: LB0022,
+    },
     Entry {
         code: Code::new(300),
         title: "type mismatch",
@@ -192,6 +211,11 @@ static REGISTRY: &[Entry] = &[
         code: Code::new(509),
         title: "read of an undefined global (undefined-global)",
         explain: LB0509,
+    },
+    Entry {
+        code: Code::new(510),
+        title: "metatable carrier with no `__index` (metatable-without-index)",
+        explain: LB0510,
     },
     Entry {
         code: Code::new(601),
@@ -425,6 +449,134 @@ local s = \"\\xE2\\x98\\x83\"
 Raise `edition` to `5.3` or later, or spell out the encoded bytes directly.
 `luabox build` can perform this substitution automatically when lowering to
 an older target.
+";
+
+const LB0020: &str = "\
+# LB0020: no visible label for `goto`
+
+`goto name` must name a label that is **visible** from it. A `::name::` label
+is visible in the block that declares it and in every block nested inside
+that one — never in a sibling block, and never across a function boundary.
+The jump may go forwards or backwards; only visibility matters.
+
+```lua
+-- illegal: nothing declares `nowhere`
+local function f()
+  goto nowhere
+end
+
+-- illegal: the label is in a sibling block, not an enclosing one
+do ::retry:: end
+do goto retry end
+
+-- illegal: a function boundary stops the search
+::top::
+local f = function() goto top end
+
+-- legal: the label is in an enclosing block
+for i = 1, 3 do
+  if skip(i) then goto continue end
+  work(i)
+  ::continue::
+end
+```
+
+Reference Lua rejects the same programs when it *loads* the chunk
+(`no visible label 'nowhere' for <goto>`), so this is a hard error, not a
+lint: the file would never run.
+
+Fix the label's spelling (the diagnostic suggests a near match when there is
+one), move the label to a block that encloses the `goto`, or restructure the
+jump — a `goto` cannot enter a function, and no `goto` can leave one.
+
+Related: `LB0010` reports `goto`/labels under `edition = \"5.1\"`, which has no
+`goto` at all; `LB0601` reports a `goto` that is legal but cannot be lowered
+to a 5.1 target by `luabox build`.
+";
+
+const LB0021: &str = "\
+# LB0021: label already defined
+
+A `::name::` label may not repeat a label name that is already visible at
+that point. Reference Lua reports the *second* declaration
+(`label 'a' already defined`); so does luabox, with the first one pointed at
+as context.
+
+```lua
+-- illegal: two `::a::` in the same block
+local function f()
+  ::a::
+  ::a::
+end
+
+-- legal: sibling blocks close over their own labels
+do ::a:: end
+do ::a:: end
+
+-- legal: a nested function starts a fresh label scope
+local function g() ::a:: end
+local function h() ::a:: end
+```
+
+**Edition difference.** Lua 5.4 tightened the rule: it searches every block
+still open in the function, so shadowing an outer label from a nested block
+is an error there:
+
+```lua
+::a::
+do ::a:: end   -- error under edition = \"5.4\"; accepted by 5.2/5.3/LuaJIT
+```
+
+luabox applies each edition's own rule, so it never rejects what your
+`edition`'s compiler accepts. Code meant to be portable should avoid the
+shadowing form regardless.
+
+Fix: rename one of the labels, or narrow the first one's scope with a
+`do … end` block.
+";
+
+const LB0022: &str = "\
+# LB0022: `break` outside a loop
+
+`break` exits the innermost enclosing `while`, `repeat`, or numeric/generic
+`for` **in the same function**. With no such loop around it, reference Lua
+refuses to load the chunk — `break outside loop` in 5.4, `no loop to break`
+in 5.1 — so this is a hard error in every edition.
+
+```lua
+-- illegal: nothing to break out of
+local x = 1
+break
+
+-- illegal: the loop has already ended
+for i = 1, 3 do end
+break
+
+-- illegal: a function boundary hides the loop around it
+while true do
+  local f = function() break end
+end
+
+-- legal: `do`/`if` blocks do not hide the loop
+while true do
+  do if done() then break end end
+end
+```
+
+The nested-function case is the one that surprises people: a closure defined
+inside a loop is a *separate function*, and `break` has no meaning there.
+Return a flag from the closure and break in the loop body instead:
+
+```lua
+while true do
+  local stop = function() return done() end
+  if stop() then break end
+end
+```
+
+Lua has no `continue`; the idiomatic substitute is a forward `goto` to a
+label at the end of the loop body (`goto continue` … `::continue::`), which
+is legal from 5.2 onward.
 ";
 
 const LB0300: &str = "\
@@ -1342,6 +1494,80 @@ prnit(\"hello\")   -- not flagged, this line only
 ```
 ";
 
+const LB0510: &str = "\
+# LB0510: metatable carrier with no `__index` (metatable-without-index)
+
+`setmetatable(t, C)` names a `---@class` carrier `C` that never gets an
+`__index`. Suspicious tier: `setmetatable` installs `C` as `t`'s
+**metatable**, and a method call on `t` looks the name up in
+`C.__index` — not in `C`. With no `__index`, every `t:method()` is
+`attempt to call a nil value` at runtime, in every reference Lua.
+
+```lua
+---@class Counter
+---@field n integer
+local Counter = {}
+
+function Counter:value()
+  return self.n
+end
+
+local c = setmetatable({ n = 1 }, Counter)   -- LB0510 on `Counter`
+print(c:value())                             -- crashes: `value` is nil
+```
+
+The one-line fix:
+
+```lua
+---@class Counter
+local Counter = {}
+Counter.__index = Counter   -- <- instance lookups now reach the methods
+```
+
+## Why the type checker does not report this
+
+It used to (as `LB0306`, undefined field), and that was **removed on
+purpose** in [#33](https://github.com/flying-dice/luabox/issues/33): luals
+folds carrier attachments into the class off the carrier *binding*, with no
+metatable reasoning, so `c:value()` resolves there — signature, `---@deprecated`
+and all — whether or not `__index` exists. luabox matches that, and the
+divergence is recorded in the
+[limitations reference](https://github.com/flying-dice/luabox/blob/main/docs/03-reference/02-limitations.md).
+
+Parity is the right default for a checker (it is what makes annotations
+portable), but the runtime gap is real, so it moved here instead of
+disappearing: a lint is configurable and suppressible, which is what a
+finding luals does not have should be.
+
+**Parity status: luabox-specific.** luals ships no equivalent diagnostic —
+its set has nothing that reasons about metatable wiring. Turning this rule
+off restores exact luals behaviour:
+
+```toml
+[lint]
+metatable-without-index = \"allow\"
+```
+
+## When it stays silent
+
+Deliberately conservative — the rule only speaks when it is sure:
+
+- the second argument must be a bare name resolving to a `---@class` carrier
+  **declared in the same file**. A global carrier, one reached through
+  `require`, a table literal, a call result or any other expression is
+  unknown, and unknown means silent;
+- any `__index` write to the carrier clears it, wherever it sits relative to
+  the `setmetatable` call and whatever it assigns — `C.__index = C`,
+  `C.__index = Base`, `C[\"__index\"] = …`, or an `__index` key in `C`'s own
+  constructor (`local C = { __index = … }`);
+- a write this pass cannot evaluate also clears it: `C[k] = v` with a
+  computed key, `rawset(C, …)`, or a reassignment of `C` itself;
+- `---@meta` definition files are exempt — they declare a surface and never
+  run.
+
+**Suppression:** `---@luabox-ignore metatable-without-index <reason>`.
+";
+
 const LB0601: &str = "\
 # LB0601: irreducible `goto`
 
@@ -1617,6 +1843,40 @@ mod tests {
                 "{rendered} resolved to another entry"
             );
         }
+    }
+
+    /// The half of the lint-band contract ([`Code::is_lint`]) this crate can
+    /// actually check.
+    ///
+    /// It cannot check the interesting half — "every code in `LB0500`-`LB0599`
+    /// is emitted by `luabox-lint`, and every lint rule's code is in the
+    /// band". The registry is a table of codes, titles and prose; it has no
+    /// idea which crate raises an entry, and `luabox-diag` sits *below*
+    /// `luabox-lint` in the dependency graph, so it cannot enumerate the rule
+    /// set either. That direction is asserted in `luabox-lint`'s own
+    /// `every_rule_code_is_in_the_lint_band` — **that** is the load-bearing
+    /// test; this one is a cheap structural guard beside it.
+    ///
+    /// What it does check is that the band is allocated *densely* from its
+    /// start: a new rule takes the next free code, so a hole means either a
+    /// typo'd code number or a code retired without a plan. Both are worth a
+    /// failing test.
+    #[test]
+    fn the_lint_band_is_densely_allocated_from_its_start() {
+        let band: Vec<u16> = all()
+            .iter()
+            .map(|entry| entry.code.number())
+            .filter(|&n| Code::new(n).is_lint())
+            .collect();
+        assert!(!band.is_empty(), "the lint band has no registered codes");
+        let highest = band.iter().copied().max().unwrap_or(Code::LINT_BAND_START);
+        let expected: Vec<u16> = (Code::LINT_BAND_START..=highest).collect();
+        assert_eq!(
+            band,
+            expected,
+            "the lint band must be contiguous from LB{:04} to LB{highest:04}",
+            Code::LINT_BAND_START
+        );
     }
 
     #[test]

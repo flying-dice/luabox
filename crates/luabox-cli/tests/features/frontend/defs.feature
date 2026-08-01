@@ -363,3 +363,358 @@ Feature: stdlib definition packages — `---@meta` `.d.lua` ambient types
     Then the command fails
     And stdout contains "LB0300"
     And stdout contains "expected `string`, found `2`"
+
+  # --- carrier-style members in a defs file (#39) ---------------------------
+  # `---@field` is the defs convention, but luals makes no distinction: a
+  # `function Class:method()` written in a library file is a member of that
+  # class. A defs file is never inferred, so its carrier attachments are
+  # harvested syntactically — signatures and tags included.
+
+  Scenario: a carrier-style method in a defs file is a member of its class
+    Given a file "defs/game.d.lua" containing:
+      """
+      ---@meta
+
+      ---@class Widget
+      local Widget = {}
+
+      ---@param n integer
+      ---@return string
+      function Widget:render(n) end
+      """
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      defs = ["game"]
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param w Widget
+      local function use(w)
+        return w:render(1)
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stdout does not contain "LB0306"
+    And stderr contains "check: 0 errors, 0 warnings"
+
+  # Shockwave round 3: `function Animal:speak()` names the LOCAL `Animal`, so
+  # it belongs to `Wrapper` — the class that local carries — not to the
+  # unrelated class that happens to be *named* `Animal`. Both orderings of the
+  # two class blocks must agree, and both must agree with what the same body
+  # does as ordinary project source (#39 is a defs/project parity goal).
+
+  Scenario: a carrier variable wins over a same-named class declared after it
+    Given a file "defs/zoo.d.lua" containing:
+      """
+      ---@meta
+
+      ---@class Wrapper
+      local Animal = {}
+
+      ---@class Animal
+      local Zoo = {}
+
+      ---@return string
+      function Animal:speak() end
+      """
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      defs = ["zoo"]
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param w Wrapper
+      local function use(w)
+        return w:speak()
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stdout does not contain "LB0306"
+
+  Scenario: the same file with the two class blocks swapped gives the same answer
+    Given a file "defs/zoo.d.lua" containing:
+      """
+      ---@meta
+
+      ---@class Animal
+      local Zoo = {}
+
+      ---@class Wrapper
+      local Animal = {}
+
+      ---@return string
+      function Animal:speak() end
+      """
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      defs = ["zoo"]
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param w Wrapper
+      ---@param a Animal
+      local function use(w, a)
+        return w:speak(), a:speak()
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "undefined field `speak` on `Animal`"
+    And stdout does not contain "undefined field `speak` on `Wrapper`"
+
+  Scenario: the same body as project source agrees with the defs file
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      """
+    And a file "src/zoo.lua" containing:
+      """
+      ---@class Wrapper
+      local Animal = {}
+
+      ---@class Animal
+      local Zoo = {}
+
+      ---@return string
+      function Animal:speak() end
+
+      return { Animal = Animal, Zoo = Zoo }
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param w Wrapper
+      ---@param a Animal
+      local function use(w, a)
+        return w:speak(), a:speak()
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "undefined field `speak` on `Animal`"
+    And stdout does not contain "undefined field `speak` on `Wrapper`"
+
+  Scenario: a carrier-style method's signature is enforced at the use site
+    Given a file "defs/game.d.lua" containing:
+      """
+      ---@meta
+
+      ---@class Widget
+      local Widget = {}
+
+      ---@param n integer
+      ---@return string
+      function Widget:render(n) end
+      """
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      defs = ["game"]
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param w Widget
+      local function use(w)
+        return w:render("nope")
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "error[LB0300]"
+    And stdout contains "expected `integer`"
+
+  Scenario: a member neither declared nor attached in a defs file is still undefined
+    Given a file "defs/game.d.lua" containing:
+      """
+      ---@meta
+
+      ---@class Widget
+      local Widget = {}
+
+      function Widget:render() end
+      """
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      defs = ["game"]
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param w Widget
+      local function use(w)
+        w:nosuchthing()
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "error[LB0306]"
+    And stdout contains "undefined field `nosuchthing`"
+
+  # Shockwave round 4, finding B/J: within the lexical rank the carrier map
+  # took the FIRST carrier for a repeated variable name, but `function M:m()`
+  # names the binding in scope — which Lua resolves to the LAST `local M`.
+  # The project-source path resolves the binding and always said "last"; the
+  # defs path said "first", so the two disagreed on every repeated-carrier
+  # shape. Both now follow the binding.
+
+  Scenario: a repeated carrier variable in a defs file follows the last binding
+    Given a file "defs/zoo.d.lua" containing:
+      """
+      ---@meta
+
+      ---@class Alpha
+      local M = {}
+
+      ---@class Beta
+      local M = {}
+
+      ---@return string
+      function M:only() end
+      """
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      defs = ["zoo"]
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param a Alpha
+      ---@param b Beta
+      local function use(a, b)
+        return b:only(), a:only()
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "undefined field `only` on `Alpha`"
+    And stdout does not contain "undefined field `only` on `Beta`"
+
+  Scenario: the same repeated carrier as project source gives the same answer
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      """
+    And a file "src/zoo.lua" containing:
+      """
+      ---@class Alpha
+      local M = {}
+
+      ---@class Beta
+      local M = {}
+
+      ---@return string
+      function M:only() end
+
+      return M
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param a Alpha
+      ---@param b Beta
+      local function use(a, b)
+        return b:only(), a:only()
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "undefined field `only` on `Alpha`"
+    And stdout does not contain "undefined field `only` on `Beta`"
+
+  Scenario: the repeated carrier declared the other way round flips with it
+    Given a file "defs/zoo.d.lua" containing:
+      """
+      ---@meta
+
+      ---@class Beta
+      local M = {}
+
+      ---@class Alpha
+      local M = {}
+
+      ---@return string
+      function M:only() end
+      """
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      defs = ["zoo"]
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param a Alpha
+      ---@param b Beta
+      local function use(a, b)
+        return a:only(), b:only()
+      end
+      return use
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "undefined field `only` on `Beta`"
+    And stdout does not contain "undefined field `only` on `Alpha`"

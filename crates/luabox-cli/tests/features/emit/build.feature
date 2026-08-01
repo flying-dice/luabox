@@ -228,3 +228,61 @@ Feature: luabox build — target lowering emit (tree mode)
     Then the command succeeds
     And stdout contains "(5.4 -> 5.1)"
     And "dist/src/main.lua" contains "math.floor"
+
+  # The narrowing's safety net. `check` asks the *loader's* question of a
+  # manifest ship target and not the *parser's* — constructs the target's
+  # parser rejects are what lowering exists to rewrite. When lowering has no
+  # rule for one, the residual validation of the lowered output refuses, so
+  # the pair "check is silent / build fails" is the contract, not a gap.
+  # LB0014/15/16 are the lexical-legality codes with no lowering rule
+  # (Shockwave round 5, thread M path 3): the finding is spanless because its
+  # range indexes the lowered text, and nothing is written either way.
+  Scenario Outline: a lexical construct with no lowering rule is check-silent and build-fatal
+    Given a project with edition "5.4" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      local s = <source>
+      return s
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And zero diagnostics are reported
+    When I run "luabox build"
+    Then the command fails
+    And stdout contains "<code>"
+    And stdout contains "has no lowering rule for target 5.1"
+    And the file "dist/src/main.lua" does not exist
+
+    Examples:
+      | code   | source           |
+      | LB0014 | 0x1p4            |
+      | LB0015 | "a\z  b"         |
+      | LB0016 | "\u{48}\u{69}"   |
+
+  # Shockwave round 5, thread M path 1 — the realistic one. `collect_lua_files`
+  # prunes `lua_modules/`, so the check gate never sees a vendored dependency's
+  # sources; `luabox_bundle::resolve_candidates` searches exactly that tree, so
+  # the bundler lowers them. The refusal is correct and no artifact is written;
+  # what it cannot offer is a span, because the gate that owns source ranges
+  # never looked at the file. Pinned so the spanless-but-refusing behaviour is
+  # a decision rather than a surprise.
+  Scenario: a vendored dependency the check gate never saw still refuses to bundle
+    Given a project with edition "5.4" targeting "5.1" bundling
+    And a file "src/main.lua" containing:
+      """
+      local dep = require("dep")
+      return dep
+      """
+    And a file "lua_modules/share/lua/5.1/dep.lua" containing:
+      """
+      local s = "\u{48}"
+      return s
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And zero diagnostics are reported
+    When I run "luabox build"
+    Then the command fails
+    And stderr contains "lua_modules/share/lua/5.1/dep.lua"
+    And stderr contains "no lowering rule"
+    And the file "dist/main.lua" does not exist

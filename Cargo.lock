@@ -1105,6 +1105,7 @@ dependencies = [
  "cucumber",
  "luabox-bundle",
  "luabox-diag",
+ "luabox-hir",
  "luabox-lint",
  "luabox-lower",
  "luabox-lsp",
@@ -1145,6 +1146,7 @@ dependencies = [
 name = "luabox-hir"
 version = "0.2.0"
 dependencies = [
+ "luabox-diag",
  "luabox-syntax",
  "proptest",
  "rowan",
@@ -1187,6 +1189,7 @@ dependencies = [
  "luabox-manifest",
  "luabox-syntax",
  "luabox-types",
+ "rayon",
  "rowan",
  "serde_json",
  "tempfile",

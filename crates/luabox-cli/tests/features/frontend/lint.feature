@@ -591,6 +591,130 @@ Feature: luabox lint — type-informed lint rules (clippy analog)
     And "src/main.lua" contains "local function add(a, _b)"
     And stderr contains "(1 fixed)"
 
+  # --- metatable-without-index (suspicious, LB0510) -----------------------
+  #
+  # The checker resolves `c:value()` through the carrier with no `__index`
+  # (luals parity, #33, LIMITATIONS-recorded). `lua5.4` says
+  # `attempt to call a nil value (method 'value')` on the same program, so
+  # the runtime gap is a lint (Shockwave round 2). luabox-specific: luals
+  # ships no equivalent diagnostic.
+
+  Scenario: a `---@class` carrier used as a metatable with no `__index` is flagged
+    Given a file "src/main.lua" containing:
+      """
+      ---@class Counter
+      ---@field n integer
+      local Counter = {}
+
+      function Counter:value()
+        return self.n
+      end
+
+      local c = setmetatable({ n = 1 }, Counter)
+      return c:value()
+      """
+    When I run "luabox lint"
+    Then the command succeeds
+    And stdout contains "LB0510"
+    And stdout contains "never sets `__index`"
+    And stdout contains "add `Counter.__index = Counter`"
+
+  Scenario: the checker keeps its luals parity for the same program
+    Given a file "src/main.lua" containing:
+      """
+      ---@class Counter
+      ---@field n integer
+      local Counter = {}
+
+      function Counter:value()
+        return self.n
+      end
+
+      local c = setmetatable({ n = 1 }, Counter)
+      return c:value()
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And zero diagnostics are reported
+
+  Scenario Outline: a wired-up carrier is left alone, whatever the spelling
+    Given a file "src/main.lua" containing:
+      """
+      ---@class Counter
+      local Counter = {}
+      <wiring>
+      local c = setmetatable({}, Counter)
+      return c
+      """
+    When I run "luabox lint"
+    Then the command succeeds
+    And stdout does not contain "LB0510"
+
+    Examples:
+      | wiring                                |
+      | Counter.__index = Counter             |
+      | Counter["__index"] = Counter          |
+      | rawset(Counter, "__index", Counter)   |
+
+  Scenario: an `__index` written after the `setmetatable` is still an `__index`
+    Given a file "src/main.lua" containing:
+      """
+      ---@class Counter
+      local Counter = {}
+      local c = setmetatable({}, Counter)
+      Counter.__index = Counter
+      return c
+      """
+    When I run "luabox lint"
+    Then the command succeeds
+    And stdout does not contain "LB0510"
+
+  Scenario: a metatable that is not a known carrier stays silent
+    Given a file "src/main.lua" containing:
+      """
+      local mt = require("other")
+      local c = setmetatable({}, mt)
+      return c
+      """
+    When I run "luabox lint"
+    Then the command succeeds
+    And stdout does not contain "LB0510"
+
+  Scenario: the rule is suppressible like any other lint
+    Given a file "src/main.lua" containing:
+      """
+      ---@class Counter
+      local Counter = {}
+      ---@luabox-ignore metatable-without-index wired up by the caller
+      local c = setmetatable({}, Counter)
+      return c
+      """
+    When I run "luabox lint"
+    Then the command succeeds
+    And stdout does not contain "LB0510"
+
+  Scenario: `[lint]` can turn the rule off, restoring exact luals behaviour
+    Given a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [lint]
+      metatable-without-index = "allow"
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@class Counter
+      local Counter = {}
+      local c = setmetatable({}, Counter)
+      return c
+      """
+    When I run "luabox lint"
+    Then the command succeeds
+    And stdout does not contain "LB0510"
+
   # --- [lint] level resolution -------------------------------------------
 
   Scenario: a [lint] tier set to deny fails the command

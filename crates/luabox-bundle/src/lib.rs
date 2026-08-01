@@ -66,7 +66,7 @@ mod minify;
 mod resolve;
 mod sourcemap;
 
-pub use resolve::{resolve as resolve_module, resolve_candidates};
+pub use resolve::{resolve as resolve_module, resolve_candidates, rocks_version_dir};
 pub use sourcemap::{BundleMap, unmap_traceback};
 
 /// Everything [`bundle`] needs to know.
@@ -357,6 +357,42 @@ fn load_module(
     }
 
     let hir = luabox_hir::lower(&parse);
+    // Control-flow legality of the lowered output under the target — the
+    // bundle-path twin of the residual pass in `luabox build`'s `lower_one`
+    // (#44). Lowering rewrites constructs the target's *parser* rejects; it
+    // has no rule that rewrites a duplicate label away, so without this a 5.2
+    // project shipping `::a:: do ::a:: end` to 5.4 bundled the illegal chunk
+    // into `dist/main.lua` — and into the `.love` archive and the Neovim
+    // runtimepath tree, which route through here too — and exited 0
+    // (Shockwave round 4). Gated on a clean parse by the early return above,
+    // for the same reason every other caller gates it: a legality verdict
+    // over a recovered block structure is a guess.
+    if let Some(finding) = luabox_hir::validate::control_flow(&file, &hir, req.target)
+        .into_iter()
+        .next()
+    {
+        // The finding's spans index the text this module was parsed from, so
+        // a line number is honest here — unlike `build`'s residual arm, whose
+        // ranges index a lowered text the renderer cannot resolve. Without it
+        // a user pointed at a 400-line vendored file with two labels named
+        // `d` has nothing to go on (Shockwave round 10).
+        let at = finding
+            .primary_label()
+            .map(|label| {
+                let offset = rowan::TextSize::try_from(label.span.range.start)
+                    .unwrap_or(rowan::TextSize::from(u32::MAX));
+                format!(" at line {}", line_of(&lowered.text, offset))
+            })
+            .unwrap_or_default();
+        return Err(BundleError::Parse {
+            file,
+            message: format!(
+                "not loadable under target {}: {}{at} (no lowering rule)",
+                req.target.manifest_id(),
+                finding.message
+            ),
+        });
+    }
     for site in hir.dynamic_requires() {
         dynamic.push(DynamicRequireSite {
             file: file.clone(),
@@ -902,6 +938,65 @@ mod tests {
             err.to_string().contains("byte-order mark"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn a_label_the_target_loader_rejects_is_refused_at_the_library_boundary() {
+        // Shockwave round 4, finding D. `::a:: do ::a:: end` is legal 5.2
+        // source (`checkrepeated` scans the current block there) and cannot
+        // load on 5.4 (it scans every open block). Nothing lowers it away, so
+        // without the control-flow pass here every bundle mode — `bundle =
+        // true`, `mode = "love"`, `mode = "nvim-plugin"` — wrote the illegal
+        // chunk and reported success. Asserted at the library boundary, not
+        // only through the CLI, because `build`'s check gate now catches the
+        // same defect earlier and would mask a regression here.
+        for entry in ["::a:: do ::a:: end\n", "return require(\"dep\")\n"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("src")).unwrap();
+            std::fs::write(dir.path().join("src/main.lua"), entry).unwrap();
+            std::fs::write(dir.path().join("src/dep.lua"), "::a:: do ::a:: end\n").unwrap();
+            let err = bundle(&BundleRequest {
+                root: dir.path(),
+                entry: Path::new("src/main.lua"),
+                edition: Dialect::Lua52,
+                target: Dialect::Lua54,
+                name: "main.lua",
+                minify: false,
+                sourcemap: false,
+            })
+            .expect_err("a duplicate label cannot load on 5.4");
+            assert!(
+                err.to_string().contains("label `a` is already defined"),
+                "unexpected error: {err}"
+            );
+            // With a line, not just a path: this branch is the only report a
+            // vendored rock's failure ever gets — the check gate never sees
+            // `lua_modules/` — and a 400-line file with two labels named `a`
+            // needs more than the file name (Shockwave round 10).
+            assert!(
+                err.to_string().contains("at line 1"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_label_legal_on_the_target_still_bundles() {
+        // The mirror image: the same program with the target *at* the
+        // edition is legal and must not be refused.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.lua"), "::a:: do ::a:: end\n").unwrap();
+        bundle(&BundleRequest {
+            root: dir.path(),
+            entry: Path::new("src/main.lua"),
+            edition: Dialect::Lua52,
+            target: Dialect::Lua52,
+            name: "main.lua",
+            minify: false,
+            sourcemap: false,
+        })
+        .expect("legal under 5.2");
     }
 
     #[test]

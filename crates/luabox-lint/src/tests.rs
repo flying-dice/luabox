@@ -57,6 +57,17 @@ fn has(source: &str, config: &LintConfig, code: &str) -> bool {
     codes(source, config).iter().any(|c| c == code)
 }
 
+/// How many findings of `code` the default configuration produces. Not built
+/// on [`codes`], which dedupes — the point here is the multiplicity, for
+/// rules whose per-site cardinality is part of the contract.
+fn count(source: &str, code: &str) -> usize {
+    lint(source, &LintConfig::new())
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.to_string() == code)
+        .count()
+}
+
 // --- unused-local (LB0501, style) ------------------------------------------
 
 #[test]
@@ -726,6 +737,1622 @@ fn empty_elseif_fires() {
     assert!(has(src, &LintConfig::new(), "LB0508"));
 }
 
+// --- metatable-without-index (LB0510, suspicious) --------------------------
+//
+// The checker resolves `c:value()` through the carrier with no `__index`
+// (luals parity, #33, LIMITATIONS-recorded). Every reference Lua crashes on
+// that program, so the runtime gap lives here instead (Shockwave round 2).
+
+/// The reviewer's repro, verbatim in shape: `lua5.4` says
+/// `attempt to call a nil value (method 'value')`.
+const COUNTER_REPRO: &str = "\
+---@class Counter
+---@field n integer
+local Counter = {}
+
+function Counter:value()
+  return self.n
+end
+
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+
+#[test]
+fn setmetatable_with_an_unwired_carrier_fires() {
+    assert!(has(COUNTER_REPRO, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn the_finding_names_the_carrier_and_the_one_line_fix() {
+    let out = lint(COUNTER_REPRO, &LintConfig::new());
+    let diag = out
+        .diagnostics
+        .iter()
+        .find(|d| d.code.to_string() == "LB0510")
+        .expect("LB0510");
+    assert!(diag.message.contains("Counter"), "{}", diag.message);
+    assert!(diag.message.contains("__index"), "{}", diag.message);
+    assert!(
+        diag.notes
+            .iter()
+            .any(|n| n.contains("Counter.__index = Counter")),
+        "{:?}",
+        diag.notes
+    );
+}
+
+#[test]
+fn an_index_assigned_before_the_setmetatable_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+Counter.__index = Counter
+function Counter:value() return 1 end
+local c = setmetatable({}, Counter)
+return c:value()
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// Order does not matter to Lua: the field is set before any lookup runs.
+#[test]
+fn an_index_assigned_after_the_setmetatable_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+function Counter:value() return 1 end
+local c = setmetatable({}, Counter)
+Counter.__index = Counter
+return c:value()
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn an_index_assigned_to_something_other_than_the_carrier_is_silent() {
+    let src = "\
+---@class Base
+local Base = {}
+Base.__index = Base
+---@class Counter
+local Counter = {}
+Counter.__index = Base
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn a_bracket_spelled_index_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+Counter[\"__index\"] = Counter
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn an_index_key_in_the_carriers_own_constructor_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = { __index = nil }
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// A computed key might be `__index`; guessing would be a false positive.
+#[test]
+fn a_dynamic_field_write_on_the_carrier_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+local k = \"__index\"
+Counter[k] = Counter
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn a_rawset_on_the_carrier_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+rawset(Counter, \"__index\", Counter)
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn a_dynamic_metatable_is_silent() {
+    let src = "local mt = require(\"other\")\nlocal c = setmetatable({}, mt)\nreturn c\n";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn a_metatable_that_is_not_a_declared_carrier_is_silent() {
+    let src = "local mt = {}\nlocal c = setmetatable({}, mt)\nreturn c\n";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn a_table_literal_metatable_is_silent() {
+    let src = "local c = setmetatable({}, { __index = {} })\nreturn c\n";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// A local `setmetatable` is not the stdlib one.
+#[test]
+fn a_shadowed_setmetatable_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+local setmetatable = function(t, _) return t end
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn a_meta_definition_file_is_exempt() {
+    let src = "\
+---@meta
+---@class Counter
+local Counter = {}
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn the_rule_is_suppressible_like_any_other() {
+    let src = "\
+---@class Counter
+local Counter = {}
+---@luabox-ignore metatable-without-index wired up by the caller
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn every_setmetatable_on_an_unwired_carrier_is_reported() {
+    let src = "\
+---@class Counter
+local Counter = {}
+local a = setmetatable({}, Counter)
+local b = setmetatable({}, Counter)
+return a, b
+";
+    let found = lint(src, &LintConfig::new())
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.to_string() == "LB0510")
+        .count();
+    assert_eq!(found, 2);
+}
+
+// --- LB0510 false positives closed in Shockwave round 4 --------------------
+//
+// Two shapes of correct, idiomatic code the rule warned on. Both directions
+// are pinned: the suppression must not swallow the true positives above.
+
+/// An operator metatable. `Vec` declares `__tostring` and nothing else; no
+/// `v:method()` exists anywhere, and the program runs fine under every
+/// reference Lua. There is nothing for a missing `__index` to break.
+#[test]
+fn a_carrier_declaring_only_another_metafield_is_silent() {
+    for metafield in ["__tostring", "__call", "__mode", "__add", "__eq"] {
+        let src = format!(
+            "\
+---@class Vec
+local Vec = {{}}
+function Vec.{metafield}(v) return v end
+local v = setmetatable({{}}, Vec)
+return v
+"
+        );
+        assert!(
+            !has(&src, &LintConfig::new(), "LB0510"),
+            "fired on `{metafield}`"
+        );
+    }
+}
+
+#[test]
+fn a_metafield_in_the_carriers_own_constructor_is_silent() {
+    let src = "\
+---@class Vec
+local Vec = { __tostring = function(v) return \"v\" end }
+local v = setmetatable({}, Vec)
+return v
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// The carrier still fires when the only thing attached to it is an ordinary
+/// field or method — a *metafield* is what buys silence, not any field.
+#[test]
+fn a_carrier_with_only_plain_fields_still_fires() {
+    let src = "\
+---@class Counter
+local Counter = {}
+Counter.n = 0
+function Counter:value() return self.n end
+local c = setmetatable({}, Counter)
+return c:value()
+";
+    assert!(has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// `local mt = Counter` aliases the same table, so `mt.__index = mt` wires
+/// `Counter` up — this pass follows bindings, not values, so it cannot see
+/// that and must not guess the other way. Same trade as a computed key.
+#[test]
+fn an_index_written_through_a_local_alias_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+local mt = Counter
+mt.__index = mt
+function Counter:value() return 1 end
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// `rawset(C, "n", 0)` writes a plain field, not `__index`. The arm used to
+/// settle on *any* `rawset`, though `index_key` already reads literal keys.
+#[test]
+fn a_rawset_of_a_plain_literal_key_does_not_settle_the_carrier() {
+    let src = "\
+---@class Counter
+local Counter = {}
+rawset(Counter, \"n\", 0)
+function Counter:value() return self.n end
+local c = setmetatable({}, Counter)
+return c:value()
+";
+    assert!(has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// …but a computed `rawset` key still settles it, and a `rawset` of another
+/// metafield still reads as an operator table.
+#[test]
+fn a_rawset_of_a_computed_key_still_settles_the_carrier() {
+    let src = "\
+---@class Counter
+local Counter = {}
+local k = \"__index\"
+rawset(Counter, k, Counter)
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+#[test]
+fn a_rawset_of_another_metafield_is_silent() {
+    let src = "\
+---@class Vec
+local Vec = {}
+rawset(Vec, \"__tostring\", function(v) return \"v\" end)
+local v = setmetatable({}, Vec)
+return v
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// The message must not assert a crash that no call site makes: it describes
+/// what a method call *would* do, conditionally.
+#[test]
+fn the_note_does_not_assert_a_crash_that_no_call_site_makes() {
+    let out = lint(COUNTER_REPRO, &LintConfig::new());
+    let diag = out
+        .diagnostics
+        .iter()
+        .find(|d| d.code.to_string() == "LB0510")
+        .expect("LB0510");
+    assert!(
+        diag.notes
+            .iter()
+            .any(|n| n.contains("any `t:method()` fails at runtime")),
+        "{:?}",
+        diag.notes
+    );
+    assert!(
+        !diag.notes.iter().any(|n| n.contains("every `t:method()`")),
+        "{:?}",
+        diag.notes
+    );
+}
+
+// --- LB0510 shape matrix: the wave-15 over-suppression, closed ------------
+//
+// Wave 15's two false-positive fixes each over-reached, and the canonical
+// carrier program went silent (Shockwave round 5). Every fixture below was
+// run under `lua5.4` (5.4.6) before being written down; the doc comment
+// records what the interpreter actually printed, and the assertion direction
+// follows it. Two crashing shapes are deliberately *not* reported — they are
+// the documented conservative bounds, marked as such.
+
+/// Regression A. A carrier that declares another metafield **and** colon
+/// methods is a class that overloads an operator, not an operator table:
+/// `c:value()` is `attempt to call a nil value (method 'value')` under
+/// `lua5.4` for every metafield below, `__name` included (it only decorates
+/// error messages). Wave 15 silenced all of them.
+#[test]
+fn a_metafield_alongside_a_colon_method_still_fires() {
+    for decl in [
+        "function Counter.__tostring(c) return \"c\" end",
+        "function Counter.__call(c) return 1 end",
+        "function Counter.__eq(a, b) return true end",
+        "function Counter.__add(a, b) return 1 end",
+        "function Counter.__gc(c) end",
+        "Counter.__name = \"Counter\"",
+        "Counter.__mode = \"k\"",
+    ] {
+        let src = format!(
+            "\
+---@class Counter
+---@field n integer
+local Counter = {{}}
+
+{decl}
+
+function Counter:value()
+  return self.n
+end
+
+local c = setmetatable({{ n = 1 }}, Counter)
+return c:value()
+"
+        );
+        assert!(
+            has(&src, &LintConfig::new(), "LB0510"),
+            "silent on `{decl}`"
+        );
+    }
+}
+
+/// The idiomatic Vector2 tutorial class: a dot constructor, a colon method
+/// and two metafields. `v:length()` crashes under `lua5.4`; wave 15 was
+/// silent on it. The dot-declared `Vec.new` is *not* what makes it fire —
+/// the colon-declared `Vec:length` is.
+#[test]
+fn the_vector2_tutorial_class_fires() {
+    let src = "\
+---@class Vec2
+---@field x number
+---@field y number
+local Vec = {}
+
+function Vec.new(x, y)
+  return setmetatable({ x = x, y = y }, Vec)
+end
+
+function Vec:length()
+  return math.sqrt(self.x * self.x + self.y * self.y)
+end
+
+function Vec.__tostring(v)
+  return \"(\" .. v.x .. \", \" .. v.y .. \")\"
+end
+
+function Vec.__add(a, b)
+  return Vec.new(a.x + b.x, a.y + b.y)
+end
+
+local v = Vec.new(3, 4)
+return v:length()
+";
+    assert!(has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// The discriminator, both directions in one fixture pair: the metafield-only
+/// carrier above stays silent, and the *same* carrier plus one colon method
+/// fires. `a_carrier_declaring_only_another_metafield_is_silent` pins the
+/// first half; this pins that the second half is what changed.
+#[test]
+fn one_colon_method_is_the_difference_between_operator_table_and_class() {
+    let carrier = "\
+---@class Vec
+local Vec = {}
+function Vec.__tostring(v) return \"v\" end
+";
+    let operator_table = format!("{carrier}local v = setmetatable({{}}, Vec)\nreturn v\n");
+    let class = format!(
+        "{carrier}function Vec:length() return 0 end
+local v = setmetatable({{}}, Vec)
+return v:length()
+"
+    );
+    assert!(!has(&operator_table, &LintConfig::new(), "LB0510"));
+    assert!(has(&class, &LintConfig::new(), "LB0510"));
+}
+
+/// A metafield spelled with a colon is still a metafield, not an instance
+/// method — `function Vec:__call()` takes `self` implicitly but is reached
+/// through the metatable, never through `__index`. The program runs fine.
+#[test]
+fn a_colon_declared_metafield_is_not_an_instance_method() {
+    let src = "\
+---@class Vec
+local Vec = {}
+function Vec:__call() return 1 end
+local v = setmetatable({}, Vec)
+return v
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// Regression B. `local mt = Counter` with **no write through it** settles
+/// nothing: the program still crashes and the rule must still fire. Wave 15
+/// settled on the alias binding itself, so a bare alias disabled the rule.
+#[test]
+fn a_bare_alias_with_no_write_still_fires() {
+    let src = "\
+---@class Counter
+---@field n integer
+local Counter = {}
+local mt = Counter
+print(type(mt))
+function Counter:value() return self.n end
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+    assert!(has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// …and neither does an alias *chain* with no write anywhere along it.
+#[test]
+fn an_alias_chain_with_no_write_still_fires() {
+    let src = "\
+---@class Counter
+---@field n integer
+local Counter = {}
+local a = Counter
+local b = a
+print(type(b))
+function Counter:value() return self.n end
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+    assert!(has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// A write through an alias of a *plain* key is a plain-key write: `mt.n = 1`
+/// wires nothing up, and the program crashes.
+#[test]
+fn an_alias_write_of_a_plain_key_still_fires() {
+    let src = "\
+---@class Counter
+---@field n integer
+local Counter = {}
+local mt = Counter
+mt.n = 1
+function Counter:value() return self.n end
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+    assert!(has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// An alias chain whose *last* link takes the `__index` write still wires the
+/// carrier up — `b` and `Counter` are the same table. The program runs.
+#[test]
+fn an_alias_chain_with_a_terminal_index_write_is_silent() {
+    let src = "\
+---@class Counter
+---@field n integer
+local Counter = {}
+local a = Counter
+local b = a
+b.__index = b
+function Counter:value() return self.n end
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// An unreadable key through an alias reads exactly like an unreadable key on
+/// the carrier: it might be `__index`, so the rule stays quiet.
+#[test]
+fn an_alias_write_of_a_computed_key_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+local mt = Counter
+local k = \"__index\"
+mt[k] = mt
+local c = setmetatable({}, Counter)
+return c
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// A metafield written through an alias classifies the *carrier*, and the
+/// no-instance-methods discriminator applies there too — so the same pair as
+/// above, one line apart.
+#[test]
+fn a_metafield_through_an_alias_follows_the_same_discriminator() {
+    let operator_table = "\
+---@class Vec
+local Vec = {}
+local mt = Vec
+function mt.__tostring(v) return \"v\" end
+local v = setmetatable({}, Vec)
+return v
+";
+    let class = "\
+---@class Counter
+---@field n integer
+local Counter = {}
+local mt = Counter
+function mt.__tostring(c) return \"c\" end
+function Counter:value() return self.n end
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+    assert!(!has(operator_table, &LintConfig::new(), "LB0510"));
+    assert!(has(class, &LintConfig::new(), "LB0510"));
+}
+
+/// A documented conservative bound. `if false then … end` never runs, so the
+/// program crashes — but this pass has no reachability analysis, and a direct
+/// `Counter.__index = Counter` in the same dead branch is silent for the same
+/// reason. Suppressing through the alias keeps the two consistent.
+#[test]
+fn an_alias_in_a_dead_branch_is_silent_like_a_direct_write() {
+    let through_alias = "\
+---@class Counter
+local Counter = {}
+if false then
+  local mt = Counter
+  mt.__index = mt
+end
+function Counter:value() return self.n end
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+    let direct = "\
+---@class Counter
+local Counter = {}
+if false then
+  Counter.__index = Counter
+end
+function Counter:value() return self.n end
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+    assert!(!has(through_alias, &LintConfig::new(), "LB0510"));
+    assert!(!has(direct, &LintConfig::new(), "LB0510"));
+}
+
+/// The same bound for a function that is never called.
+#[test]
+fn an_alias_inside_a_never_called_function_is_silent() {
+    let src = "\
+---@class Counter
+local Counter = {}
+local function wire()
+  local mt = Counter
+  mt.__index = mt
+end
+function Counter:value() return self.n end
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// Reassigning an *alias* rebinds a name; it does not touch the carrier's
+/// table, so it must not settle the carrier on its own.
+#[test]
+fn reassigning_an_alias_does_not_settle_the_carrier() {
+    let src = "\
+---@class Counter
+local Counter = {}
+local mt = Counter
+mt = {}
+function Counter:value() return self.n end
+local c = setmetatable({ n = 1 }, Counter)
+return c:value()
+";
+    assert!(has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// Both inheritance shapes still fire: the base is wired, the derived carrier
+/// is not, and `d:value()` crashes under `lua5.4` in each.
+#[test]
+fn both_inheritance_shapes_still_fire() {
+    let via_setmetatable_of_class = "\
+---@class Base
+local Base = {}
+Base.__index = Base
+function Base:name() return \"base\" end
+
+---@class Derived
+local Derived = setmetatable({}, Base)
+function Derived:value() return 1 end
+
+local d = setmetatable({}, Derived)
+return d:value()
+";
+    let index_to_base_only = "\
+---@class Base
+local Base = {}
+Base.__index = Base
+function Base:name() return \"base\" end
+
+---@class Derived
+local Derived = {}
+setmetatable(Derived, { __index = Base })
+function Derived:value() return 1 end
+
+local d = setmetatable({}, Derived)
+return d:value()
+";
+    assert!(has(via_setmetatable_of_class, &LintConfig::new(), "LB0510"));
+    assert!(has(index_to_base_only, &LintConfig::new(), "LB0510"));
+}
+
+// --- LB0510: the behavioural gate on the metafield arm (Shockwave round 6) -
+//
+// Round 6's finding: the operator-table gate was STRUCTURAL where it needed to
+// be BEHAVIOURAL. A carrier that declared a lookup-irrelevant metafield and a
+// colon method that was never invoked on an instance warned, and the program
+// ran fine under `lua5.4` — eight measured shapes. The gate now asks whether a
+// method is actually *reached* on an instance derived from
+// `setmetatable(_, C)`.
+//
+// Every fixture below was run under `lua5.4` (5.4.6) before being written
+// down; the doc comment records what the interpreter did, and the assertion
+// direction follows it. The same shapes are committed as a runnable corpus in
+// `scripts/tests/lb0510-matrix/`, which re-derives both columns — the lint
+// verdict and the runtime verdict — so these claims are falsifiable by anyone
+// with the binary and an interpreter.
+//
+// Only the metafield arm moved. The no-metafield region is pinned by four
+// rounds of measurement and is deliberately untouched; the last test in this
+// section is its guard.
+
+/// The eight false positives, in their three measured species. Each carrier
+/// declares a metafield that has nothing to do with lookup **and** a colon
+/// method that nothing ever invokes on an instance; each program prints and
+/// exits 0 under `lua5.4`.
+#[test]
+fn a_metafield_carrier_whose_method_is_never_invoked_is_silent() {
+    let cache = "\
+---@class Cache
+local Cache = {}
+Cache.__mode = \"k\"
+function Cache:reset() self.n = 0 end
+local store = setmetatable({}, Cache)
+store[{}] = 1
+return store
+";
+    let guard = "\
+---@class Guard
+local Guard = {}
+Guard.__newindex = function(t, k, v) rawset(t, k, v) end
+function Guard:reject() return false end
+local g = setmetatable({}, Guard)
+g.x = 1
+return g
+";
+    let sorter = "\
+---@class Sorter
+local Sorter = {}
+Sorter.__lt = function(a, b) return rawget(a, \"n\") < rawget(b, \"n\") end
+function Sorter:cmp(other) return self.n < other.n end
+local a = setmetatable({ n = 1 }, Sorter)
+local b = setmetatable({ n = 2 }, Sorter)
+return a < b
+";
+    for (name, src) in [("cache", cache), ("guard", guard), ("sorter", sorter)] {
+        assert!(!has(src, &LintConfig::new(), "LB0510"), "fired on `{name}`");
+    }
+}
+
+/// The refuted candidate, kept as a fixture because it is the shape that
+/// makes the gate more than "is the method called at the top level": the
+/// `__call` factory reaches an instance method from *inside* the carrier, on
+/// its own `self`. `lua5.4` says `attempt to call a nil value (method
+/// 'build')`.
+#[test]
+fn a_call_factory_that_reaches_self_fires() {
+    let src = "\
+---@class Factory
+local Factory = {}
+function Factory:build() return 42 end
+function Factory.__call(self) return self:build() end
+local f = setmetatable({}, Factory)
+return f()
+";
+    assert!(has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// …and the colon-declared spelling of the same, where `self` is implicit.
+#[test]
+fn a_colon_declared_metafield_reaching_self_fires() {
+    let src = "\
+---@class Factory
+local Factory = {}
+function Factory:build() return 42 end
+function Factory:__call() return self:build() end
+local f = setmetatable({}, Factory)
+return f()
+";
+    assert!(has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// The canonical carrier program's constructor spelling, with a metafield
+/// alongside. `Counter.new` returns the construction, the call is bound to a
+/// local and the local takes a colon call — `lua5.4` crashes on it, and this
+/// is the shape the behavioural gate must not lose.
+#[test]
+fn the_constructor_pattern_still_fires_beside_a_metafield() {
+    let direct = "\
+---@class Counter
+local Counter = {}
+Counter.__tostring = function(c) return \"c\" end
+function Counter:value() return self.n end
+function Counter.new(n) return setmetatable({ n = n }, Counter) end
+local c = Counter.new(1)
+return c:value()
+";
+    // The same, with the construction bound to a local inside the factory.
+    let via_local = "\
+---@class Counter
+local Counter = {}
+Counter.__mode = \"k\"
+function Counter:value() return self.n end
+function Counter.new(n)
+  local instance = setmetatable({ n = n }, Counter)
+  return instance
+end
+local c = Counter.new(1)
+return c:value()
+";
+    assert!(has(direct, &LintConfig::new(), "LB0510"));
+    assert!(has(via_local, &LintConfig::new(), "LB0510"));
+}
+
+/// The construction method-called on the spot, with no local in between.
+/// `lua5.4`: `attempt to call a nil value (method 'length')`.
+#[test]
+fn an_immediate_colon_call_on_the_construction_fires() {
+    let src = "\
+---@class Vec
+local Vec = {}
+function Vec.__tostring(v) return \"v\" end
+function Vec:length() return 0 end
+return setmetatable({}, Vec):length()
+";
+    assert!(has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// Instance values follow the same alias chain carriers do: `local w = v`
+/// names the same table, so `w:length()` is a use of `v`'s carrier. Crashes.
+#[test]
+fn a_colon_call_through_an_instance_alias_fires() {
+    let src = "\
+---@class Vec
+local Vec = {}
+function Vec.__tostring(v) return \"v\" end
+function Vec:length() return 0 end
+local v = setmetatable({}, Vec)
+local w = v
+return w:length()
+";
+    assert!(has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// Derivation is what makes a use *this* carrier's use. `Store` and `Cache`
+/// both declare `get`; the only `:get()` in the file lands on a `Store`
+/// instance, and `Store` is wired. `Cache` must not borrow that call — the
+/// program runs fine.
+#[test]
+fn a_colon_call_on_another_classs_instance_is_not_a_use_of_this_carrier() {
+    let src = "\
+---@class Cache
+local Cache = {}
+Cache.__mode = \"k\"
+function Cache:get() return 1 end
+
+---@class Store
+local Store = {}
+Store.__index = Store
+function Store:get() return 2 end
+
+local s = setmetatable({}, Store)
+local c = setmetatable({}, Cache)
+return s:get(), type(c)
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// One finding per `setmetatable` *site*, never two for the same site. The
+/// round-6 report saw `Sorter` warn twice; the cause was two constructions,
+/// not a duplicate — and once the shape actually invokes `a:cmp(b)` (which
+/// `lua5.4` refuses: `attempt to call a nil value (method 'cmp')`) both sites
+/// are genuine. Pinned in both directions so a future firing shape cannot
+/// double-report.
+#[test]
+fn a_firing_carrier_reports_once_per_setmetatable_site() {
+    let carrier = "\
+---@class Sorter
+local Sorter = {}
+Sorter.__lt = function(a, b) return rawget(a, \"n\") < rawget(b, \"n\") end
+function Sorter:cmp(other) return self.n < other.n end
+";
+    let two_sites = format!(
+        "{carrier}local a = setmetatable({{ n = 1 }}, Sorter)
+local b = setmetatable({{ n = 2 }}, Sorter)
+return a:cmp(b)
+"
+    );
+    let one_site = format!(
+        "{carrier}local a = setmetatable({{ n = 1 }}, Sorter)
+return a:cmp(a)
+"
+    );
+    assert_eq!(count(&two_sites, "LB0510"), 2, "one per construction");
+    assert_eq!(count(&one_site, "LB0510"), 1);
+}
+
+/// The guard on the region the gate does **not** touch. With no metafield on
+/// the carrier the rule is structural, as it has been for four rounds of
+/// measurement: it fires on the construction whether or not any method is
+/// invoked. This program does not crash — `lua5.4` prints and exits 0 — and
+/// the finding is still correct to make, because the carrier cannot serve the
+/// lookup it was annotated for. Behavioural gating here would reopen the
+/// false-negative axis round 6 closed, so it is deliberately absent.
+#[test]
+fn the_no_metafield_region_stays_structural() {
+    let uninvoked = "\
+---@class Counter
+local Counter = {}
+function Counter:value() return self.n end
+local c = setmetatable({ n = 1 }, Counter)
+return type(c)
+";
+    assert!(has(uninvoked, &LintConfig::new(), "LB0510"));
+    // …and the invoked half of the same region, unchanged.
+    assert!(has(COUNTER_REPRO, &LintConfig::new(), "LB0510"));
+}
+
+// --- LB0510: reaching a body, not writing one (Shockwave round 7) ---------
+//
+// Every shape below has a committed twin in `scripts/tests/lb0510-matrix/`
+// with its `lua5.4` verdict pinned alongside its finding count; the runtime
+// claims in these doc comments are that harness's measurements, not
+// assertions about what Lua ought to do.
+
+/// The round-7 false positive, in the pair that exposed it. Both files
+/// declare the same `__call`, the same method and the same construction; they
+/// differ only in the last line, and `lua5.4` differs with them — `f()` is
+/// `attempt to call a nil value (method 'build')`, `type(f)` exits 0. The old
+/// derivation counted the `self:build()` *written* inside `Factory.__call`,
+/// so it produced byte-identical output for both.
+#[test]
+fn a_call_metamethod_reaching_self_fires_only_when_the_instance_is_called() {
+    let carrier = "\
+---@class Factory
+local Factory = {}
+function Factory:build() return 42 end
+function Factory.__call(self) return self:build() end
+local f = setmetatable({}, Factory)
+";
+    assert!(has(
+        &format!("{carrier}return f()\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+    assert!(!has(
+        &format!("{carrier}return type(f)\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+}
+
+/// The other half of the same over-count: a colon method whose body reaches
+/// `self`, on a carrier nothing ever invokes. A colon method is reachable
+/// only through an instance colon call, which the value derivations already
+/// see — so the uninvoked file must be silent (it runs fine) and the invoked
+/// one must fire (it crashes).
+#[test]
+fn a_self_colon_call_in_an_unreached_method_is_not_an_instance_use() {
+    let carrier = "\
+---@class Cache
+local Cache = {}
+Cache.__mode = \"k\"
+function Cache:clear() self.n = 0 end
+function Cache:reset() self:clear() end
+local c = setmetatable({}, Cache)
+";
+    assert!(!has(
+        &format!("{carrier}return type(c)\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+    assert!(has(
+        &format!("{carrier}return c:reset()\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+}
+
+/// The `__call` body is asked, not every attached body. This carrier *is*
+/// called, and the call reaches a `__call` that runs no method; the
+/// `self:clear()` lives in a `Cache:reset` nothing invokes. `lua5.4` runs it
+/// to completion, and asking the wider question would report it.
+#[test]
+fn a_call_metamethod_that_reaches_no_method_is_not_an_instance_use() {
+    let src = "\
+---@class Cache
+local Cache = {}
+Cache.__call = function(self) return 1 end
+function Cache:clear() self.n = 0 end
+function Cache:reset() self:clear() end
+local c = setmetatable({}, Cache)
+return c()
+";
+    assert!(!has(src, &LintConfig::new(), "LB0510"));
+}
+
+/// The metamethod declared in the carrier's own table constructor is the same
+/// metamethod. `r()` runs `Router.__call(r)`, which runs `r:route()`, which is
+/// the lookup — and crashes.
+#[test]
+fn a_call_metamethod_declared_in_the_carrier_constructor_counts() {
+    let carrier = "\
+---@class Router
+local Router = { __call = function(self) return self:route() end }
+function Router:route() return \"/\" end
+local r = setmetatable({}, Router)
+";
+    assert!(has(
+        &format!("{carrier}return r()\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+    assert!(!has(
+        &format!("{carrier}return type(r)\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+}
+
+/// Seeding used to read `Stmt::Local` only, so a name declared on one line
+/// and assigned the construction on the next held nothing. The program
+/// crashes.
+#[test]
+fn a_construction_bound_by_assignment_seeds_the_name() {
+    let carrier = "\
+---@class Cache
+local Cache = {}
+Cache.__mode = \"k\"
+function Cache:reset() self.n = 0 end
+local c
+c = setmetatable({}, Cache)
+";
+    assert!(has(
+        &format!("{carrier}return c:reset()\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+    assert!(!has(
+        &format!("{carrier}return type(c)\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+}
+
+/// A global holds the instance. `binding_of` answers `None` for both halves
+/// of `store = setmetatable({}, Cache)` / `store:reset()`, so the derivation
+/// is keyed on the name — the program is the `local` spelling in every other
+/// respect and crashes the same way.
+#[test]
+fn a_construction_bound_to_a_global_seeds_the_name() {
+    let carrier = "\
+---@class Cache
+local Cache = {}
+Cache.__mode = \"k\"
+function Cache:reset() self.n = 0 end
+store = setmetatable({}, Cache)
+";
+    assert!(has(
+        &format!("{carrier}return store:reset()\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+    assert!(!has(
+        &format!("{carrier}return type(store)\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+}
+
+/// …and the constructor pattern through a *global* factory, which is an
+/// assignment to a name rather than a `local function`.
+#[test]
+fn a_global_factory_is_a_constructor_pattern() {
+    let carrier = "\
+---@class Counter
+local Counter = {}
+Counter.__tostring = function(c) return \"counter\" end
+function Counter:value() return self.n end
+function make(n) return setmetatable({ n = n }, Counter) end
+local c = make(1)
+";
+    assert!(has(
+        &format!("{carrier}return c:value()\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+    assert!(!has(
+        &format!("{carrier}return type(c)\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+}
+
+/// `or` and `and` are followed into the operand the expression evaluates to.
+/// A table is always truthy, so `setmetatable(...) or fallback` *is* the
+/// construction, and `guard and setmetatable(...)` is it whenever it is
+/// anything at all.
+#[test]
+fn a_construction_behind_a_logical_operator_seeds_the_name() {
+    let carrier = "\
+---@class Cache
+local Cache = {}
+Cache.__mode = \"k\"
+function Cache:reset() self.n = 0 end
+";
+    for init in [
+        "local c = setmetatable({}, Cache) or {}",
+        "local ready = true\nlocal c = ready and setmetatable({}, Cache)",
+    ] {
+        assert!(
+            has(
+                &format!("{carrier}{init}\nreturn c:reset()\n"),
+                &LintConfig::new(),
+                "LB0510"
+            ),
+            "invoked: `{init}`"
+        );
+        assert!(
+            !has(
+                &format!("{carrier}{init}\nreturn type(c)\n"),
+                &LintConfig::new(),
+                "LB0510"
+            ),
+            "uninvoked: `{init}`"
+        );
+    }
+}
+
+/// Issue W. `local n, c = make()` has two names and one initialiser, so `c`
+/// is past the end of the list — `names.iter().zip(init)` dropped it, and
+/// handed `n` the derivation that belongs to it. Both halves are asserted:
+/// the name that really holds the instance fires, and the one that holds the
+/// number does not.
+#[test]
+fn a_name_past_the_initialiser_list_takes_the_right_return_slot() {
+    let carrier = "\
+---@class Cache
+local Cache = {}
+Cache.__mode = \"k\"
+function Cache:reset() self.n = 0 end
+local function make() return 1, setmetatable({}, Cache) end
+local n, c = make()
+";
+    assert!(has(
+        &format!("{carrier}return n, c:reset()\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+    assert!(!has(
+        &format!("{carrier}return n, type(c)\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+    // The *first* slot is a number. A colon call on the name bound to it is
+    // not an instance-side use of the carrier — that file crashes with
+    // `attempt to index a number value`, a different bug entirely.
+    assert!(!has(
+        &format!("{carrier}return n:reset()\n"),
+        &LintConfig::new(),
+        "LB0510"
+    ));
+}
+
+/// The disclosed misses, pinned as a set so that closing one is a deliberate
+/// act rather than a surprise. Every program here crashes under `lua5.4` and
+/// every one is silent, and `docs/03-reference/02-limitations.md` says so
+/// shape by shape. Each also has a committed matrix fixture with its runtime
+/// verdict measured.
+#[test]
+fn the_disclosed_false_negative_classes_stay_silent() {
+    let carrier = "\
+---@class Cache
+local Cache = {}
+Cache.__mode = \"k\"
+function Cache:reset() self.n = 0 end
+";
+    for (name, tail) in [
+        (
+            "table field",
+            "local box = { c = setmetatable({}, Cache) }\nreturn box.c:reset()\n",
+        ),
+        (
+            "parameter",
+            "local function use(c) return c:reset() end\nreturn use(setmetatable({}, Cache))\n",
+        ),
+        (
+            "for-in variable",
+            "for _, c in ipairs({ setmetatable({}, Cache) }) do return c:reset() end\n",
+        ),
+        (
+            "method-call factory",
+            "local f = {}\nfunction f:make() return setmetatable({}, Cache) end\nlocal c = f:make()\nreturn c:reset()\n",
+        ),
+        (
+            "vararg slot",
+            "local function use(...) local a, c = ... return a, c:reset() end\nreturn use(1, setmetatable({}, Cache))\n",
+        ),
+    ] {
+        assert!(
+            !has(&format!("{carrier}{tail}"), &LintConfig::new(), "LB0510"),
+            "fired on the disclosed `{name}` miss"
+        );
+    }
+    // Constructor depth is one: a factory returning a factory's result.
+    let depth_two = "\
+---@class Counter
+local Counter = {}
+Counter.__mode = \"k\"
+function Counter:value() return self.n end
+local function inner() return setmetatable({ n = 1 }, Counter) end
+local function outer() return inner() end
+local c = outer()
+return c:value()
+";
+    assert!(!has(depth_two, &LintConfig::new(), "LB0510"));
+    // …and a `__call` that reaches the method through a nested closure: only
+    // the metamethod's own body is scanned for a colon call on its receiver.
+    let nested = "\
+---@class Factory
+local Factory = {}
+function Factory:build() return 42 end
+function Factory.__call(self)
+  local run = function() return self:build() end
+  return run()
+end
+local f = setmetatable({}, Factory)
+return f()
+";
+    assert!(!has(nested, &LintConfig::new(), "LB0510"));
+}
+
+// --- LB0510: reaching a *body*, and the shapes around it (round 8) --------
+//
+// The mechanism-level companions to `scripts/tests/lb0510-matrix/`, which
+// carries the full shape grid with its `lua5.4` column. These assert the four
+// mechanisms directly, so `cargo test` catches a regression without needing a
+// release binary and an interpreter.
+
+/// The carrier every test below constructs an instance of.
+const ROUND8_CACHE: &str = "\
+---@class Cache
+local Cache = {}
+Cache.__mode = \"k\"
+function Cache:reset() self.n = 0 end
+";
+
+/// Reachability, both directions. `observed()` used to read receivers out of
+/// every body in the file with no reachability test at all, so a colon call
+/// written inside a function nothing invokes counted as a lookup. Only the
+/// second of these programs performs one, and only it crashes.
+#[test]
+fn a_colon_call_in_an_uninvoked_body_is_not_an_instance_use() {
+    let uninvoked = format!(
+        "{ROUND8_CACHE}\
+local c = setmetatable({{}}, Cache)
+local function boom() return c:reset() end
+return type(boom)
+"
+    );
+    let invoked = format!(
+        "{ROUND8_CACHE}\
+local c = setmetatable({{}}, Cache)
+local function boom() return c:reset() end
+return boom()
+"
+    );
+    assert!(!has(&uninvoked, &LintConfig::new(), "LB0510"));
+    assert!(has(&invoked, &LintConfig::new(), "LB0510"));
+}
+
+/// The reached set is a fixpoint over the call graph, not one hop: the chunk
+/// calls `f`, `f` calls `g`, and the colon call in `g` is what runs.
+#[test]
+fn reachability_follows_the_call_graph_to_a_fixpoint() {
+    let src = format!(
+        "{ROUND8_CACHE}\
+local c = setmetatable({{}}, Cache)
+local function g() return c:reset() end
+local function f() return g() end
+return f()
+"
+    );
+    assert!(has(&src, &LintConfig::new(), "LB0510"));
+}
+
+/// A closure that escapes has no call site naming its body, so this file does
+/// not enter it. A disclosed false negative — the FN-biased half of the
+/// reachability trade.
+#[test]
+fn an_escaping_closure_is_not_reached() {
+    let src = format!(
+        "{ROUND8_CACHE}\
+local c = setmetatable({{}}, Cache)
+local function boom() return c:reset() end
+local function apply(f) return f() end
+return apply(boom)
+"
+    );
+    assert!(!has(&src, &LintConfig::new(), "LB0510"));
+}
+
+/// Literal-condition pruning, and its exact edges: `false`/`nil`/`while false`
+/// prune, the `else` of a literal-false `if` does not, and `repeat` tests
+/// after its body so nothing prunes that.
+#[test]
+fn a_literal_false_branch_is_not_a_lookup_but_its_else_is() {
+    for tail in [
+        "if false then c:reset() end\n",
+        "if nil then c:reset() end\n",
+        "while false do c:reset() end\n",
+    ] {
+        let src = format!("{ROUND8_CACHE}local c = setmetatable({{}}, Cache)\n{tail}");
+        assert!(
+            !has(&src, &LintConfig::new(), "LB0510"),
+            "fired on `{tail}`"
+        );
+    }
+    for tail in [
+        "if true then c:reset() end\n",
+        "if false then return 1 else c:reset() end\n",
+        "repeat c:reset() until true\n",
+    ] {
+        let src = format!("{ROUND8_CACHE}local c = setmetatable({{}}, Cache)\n{tail}");
+        assert!(
+            has(&src, &LintConfig::new(), "LB0510"),
+            "silent on `{tail}`"
+        );
+    }
+}
+
+/// The prune is literal-condition only. A guard that is a *name* is not
+/// decided, so this fires on a program that runs — the disclosed false
+/// positive, kept honest by a test rather than by prose.
+#[test]
+fn a_non_literal_guard_is_not_pruned() {
+    let src = format!(
+        "{ROUND8_CACHE}\
+local c = setmetatable({{}}, Cache)
+local on = false
+if on then c:reset() end
+"
+    );
+    assert!(has(&src, &LintConfig::new(), "LB0510"));
+}
+
+/// The statement-form constructor: `setmetatable(t, C)` links **`t`**, not
+/// only whatever the call's result is bound to. The idiomatic spelling, and
+/// silent on a crash until round 8.
+#[test]
+fn the_statement_form_constructor_seeds_its_first_argument() {
+    let direct = format!(
+        "{ROUND8_CACHE}\
+local t = {{}}
+setmetatable(t, Cache)
+return t:reset()
+"
+    );
+    // The same shape inside `new()`, flowing into factory detection through
+    // the existing return-a-derived-local logic.
+    let factory = format!(
+        "{ROUND8_CACHE}\
+function Cache.new()
+  local t = {{}}
+  setmetatable(t, Cache)
+  return t
+end
+local c = Cache.new()
+return c:reset()
+"
+    );
+    // Alias-rooted: `u` and `t` name one table.
+    let aliased = format!(
+        "{ROUND8_CACHE}\
+local t = {{}}
+local u = t
+setmetatable(u, Cache)
+return t:reset()
+"
+    );
+    for (name, src) in [("direct", direct), ("factory", factory), ("alias", aliased)] {
+        assert!(has(&src, &LintConfig::new(), "LB0510"), "silent on {name}");
+    }
+}
+
+/// `and`/`or` follow the operand the expression **definitively evaluates
+/// to**. A construction is a table, so it is always truthy: `ctor or x` is
+/// the construction, `x or ctor` is undecidable and not followed,
+/// `x and ctor` is followed (a falsy `x` fails the call just as hard), and
+/// `ctor and x` evaluates to `x`.
+#[test]
+fn a_logical_operator_follows_only_the_operand_it_evaluates_to() {
+    let fires = [
+        ("ctor or x", "local c = setmetatable({}, Cache) or {}\n"),
+        (
+            "x and ctor",
+            "local ready = true\nlocal c = ready and setmetatable({}, Cache)\n",
+        ),
+    ];
+    let silent = [
+        (
+            "x or ctor",
+            "local fallback = nil\nlocal c = fallback or setmetatable({}, Cache)\n",
+        ),
+        (
+            "ctor and x",
+            "local c = setmetatable({}, Cache) and { reset = function() return 1 end }\n",
+        ),
+    ];
+    for (name, init) in fires {
+        let src = format!("{ROUND8_CACHE}{init}return c:reset()\n");
+        assert!(
+            has(&src, &LintConfig::new(), "LB0510"),
+            "silent on `{name}`"
+        );
+    }
+    for (name, init) in silent {
+        let src = format!("{ROUND8_CACHE}{init}return c:reset()\n");
+        assert!(
+            !has(&src, &LintConfig::new(), "LB0510"),
+            "fired on `{name}`"
+        );
+    }
+}
+
+/// A module-table factory on a **global** table. Functions attached to a
+/// table were keyed by binding, and a global name has no binding, so
+/// `M.new()` resolved to no body at all. The local control has always worked
+/// and is asserted beside it.
+#[test]
+fn a_module_table_factory_resolves_whether_the_table_is_local_or_global() {
+    for owner in ["M = {}", "local M = {}"] {
+        let src = format!(
+            "{ROUND8_CACHE}{owner}
+function M.new() return setmetatable({{}}, Cache) end
+local c = M.new()
+return c:reset()
+"
+        );
+        assert!(
+            has(&src, &LintConfig::new(), "LB0510"),
+            "silent on `{owner}`"
+        );
+    }
+}
+
+/// Dot dispatch with an explicit self is the same lookup as the colon form
+/// and fails the same way. What must *not* count is a field access that never
+/// calls, a metafield read, or a key naming nothing on the carrier.
+#[test]
+fn dot_dispatch_is_an_instance_use_but_a_field_read_is_not() {
+    let dispatch =
+        format!("{ROUND8_CACHE}local c = setmetatable({{}}, Cache)\nreturn c.reset(c)\n");
+    assert!(has(&dispatch, &LintConfig::new(), "LB0510"));
+    for tail in [
+        "return type(c.reset)\n",
+        "local r = c.reset\nreturn type(r)\n",
+        "return type(c.__mode)\n",
+        "return c.absent(c)\n",
+    ] {
+        let src = format!("{ROUND8_CACHE}local c = setmetatable({{}}, Cache)\n{tail}");
+        assert!(
+            !has(&src, &LintConfig::new(), "LB0510"),
+            "fired on `{tail}`"
+        );
+    }
+}
+
+/// Round 9. The prune was one-sided: only the `then` of a literal-false `if`
+/// was dropped, so `if true then … else c:reset() end` counted a call no
+/// execution performs. A literal-true arm runs, and everything after it — the
+/// later `elseif` conditions, their blocks, and the `else` — is dead with it.
+///
+/// The live halves are asserted beside the dead ones, because a prune that
+/// swallowed its own control would pass every "silent on" assertion here.
+#[test]
+fn branch_pruning_reads_both_sides_of_a_literal_condition() {
+    for tail in [
+        "if true then return 1 else c:reset() end\n",
+        "if true then return 1 elseif true then c:reset() end\n",
+        "if false then c:reset() end\n",
+    ] {
+        let src = format!("{ROUND8_CACHE}local c = setmetatable({{}}, Cache)\n{tail}");
+        assert!(
+            !has(&src, &LintConfig::new(), "LB0510"),
+            "fired on `{tail}`"
+        );
+    }
+    for tail in [
+        "if true then c:reset() end\n",
+        "if false then return 1 else c:reset() end\n",
+        "if false then return 1 elseif true then c:reset() end\n",
+        // The guard is a name in the `else` position, so nothing decides it.
+        "local on = false\nif on then return 1 else c:reset() end\n",
+    ] {
+        let src = format!("{ROUND8_CACHE}local c = setmetatable({{}}, Cache)\n{tail}");
+        assert!(
+            has(&src, &LintConfig::new(), "LB0510"),
+            "silent on `{tail}`"
+        );
+    }
+}
+
+/// Round 9. A numeric `for` whose written header runs zero times never enters
+/// its body — the same literal question the `if` guard asks, which is what
+/// makes the prune symmetric with it rather than a new kind of reasoning.
+///
+/// A bound that is a name is not decided (the disclosed bound), and a zero
+/// step is not decided either: Lua 5.4 raises `'for' step is zero` when it
+/// evaluates the header, and a program that never gets that far is not one
+/// this rule should be describing as dead code.
+#[test]
+fn a_numeric_for_with_dead_literal_bounds_is_not_entered() {
+    for header in [
+        "for _ = 1, 0 do c:reset() end\n",
+        "for _ = 1, 10, -1 do c:reset() end\n",
+        "for _ = 0, -1 do c:reset() end\n",
+        "for _ = 1.5, 1.0 do c:reset() end\n",
+    ] {
+        let src = format!("{ROUND8_CACHE}local c = setmetatable({{}}, Cache)\n{header}");
+        assert!(
+            !has(&src, &LintConfig::new(), "LB0510"),
+            "fired on `{header}`"
+        );
+    }
+    for header in [
+        "for _ = 1, 1 do c:reset() end\n",
+        "for _ = 10, 1, -1 do c:reset() end\n",
+        "local n = 0\nfor _ = 1, n do c:reset() end\n",
+        "for _ = 1, 10, 0 do c:reset() end\n",
+    ] {
+        let src = format!("{ROUND8_CACHE}local c = setmetatable({{}}, Cache)\n{header}");
+        assert!(
+            has(&src, &LintConfig::new(), "LB0510"),
+            "silent on `{header}`"
+        );
+    }
+}
+
+/// Round 9. `do return end` is Lua's only spelling for an early return — a
+/// bare `return` must be the last statement of its block — so "statements
+/// after a return" can only mean statements after a `do` block that ends in
+/// one. Nothing after it runs.
+#[test]
+fn statements_after_an_early_return_are_not_reached() {
+    let after = format!(
+        "{ROUND8_CACHE}\
+local c = setmetatable({{}}, Cache)
+do return end
+c:reset()
+"
+    );
+    assert!(!has(&after, &LintConfig::new(), "LB0510"), "fired after");
+    let before = format!(
+        "{ROUND8_CACHE}\
+local c = setmetatable({{}}, Cache)
+c:reset()
+do return end
+"
+    );
+    assert!(has(&before, &LintConfig::new(), "LB0510"), "silent before");
+}
+
+/// Round 9, P2. The ternary `cond and ctor or other` parses as
+/// `(cond and ctor) or other`, and `and`'s right operand used to be seeded
+/// unconditionally — so a literal-false `cond`, under which Lua never
+/// evaluates the construction at all, still seeded it.
+///
+/// A `cond` that is a *name* is still not decided, which is the same bound
+/// the `if` guard carries; both directions are asserted so the trade is
+/// visible rather than assumed.
+#[test]
+fn a_literal_condition_decides_which_side_of_a_ternary_flows() {
+    let other = "local other = { reset = function() return 1 end }\n";
+    for init in [
+        "local c = false and setmetatable({}, Cache) or other\n",
+        "local c = nil and setmetatable({}, Cache) or other\n",
+        "local c = false and setmetatable({}, Cache)\n",
+        "local c = \"x\" or setmetatable({}, Cache)\n",
+    ] {
+        let src = format!("{ROUND8_CACHE}{other}{init}return c:reset()\n");
+        assert!(
+            !has(&src, &LintConfig::new(), "LB0510"),
+            "fired on `{init}`"
+        );
+    }
+    for init in [
+        "local c = true and setmetatable({}, Cache) or other\n",
+        "local c = true and setmetatable({}, Cache)\n",
+        "local c = false or setmetatable({}, Cache)\n",
+        "local c = nil or setmetatable({}, Cache)\n",
+        // Undecided cond: seeded, which is the disclosed false positive when
+        // the name is falsy and the fallback rescues the call.
+        "local ready = false\nlocal c = ready and setmetatable({}, Cache) or other\n",
+    ] {
+        let src = format!("{ROUND8_CACHE}{other}{init}return c:reset()\n");
+        assert!(
+            has(&src, &LintConfig::new(), "LB0510"),
+            "silent on `{init}`"
+        );
+    }
+}
+
+/// Round 9. `local m = c.reset` reads the method off the *instance*, which
+/// with no `__index` yields `nil`, so `m(c)` fails exactly as `c.reset(c)`
+/// does. The read alone is still not a use, and a read off the **carrier** is
+/// a plain table read no metatable serves.
+#[test]
+fn a_method_read_off_an_instance_and_then_called_is_a_use() {
+    let called = format!(
+        "{ROUND8_CACHE}\
+local c = setmetatable({{}}, Cache)
+local m = c.reset
+return m(c)
+"
+    );
+    assert!(has(&called, &LintConfig::new(), "LB0510"), "silent on m(c)");
+    for tail in [
+        // The read, never called.
+        "local m = c.reset\nreturn type(m)\n",
+        // Read off the carrier: an ordinary field access that runs fine.
+        "local m = Cache.reset\nreturn m(c)\n",
+        // A metafield is not served by `__index`.
+        "local m = c.__mode\nreturn type(m)\n",
+    ] {
+        let src = format!("{ROUND8_CACHE}local c = setmetatable({{}}, Cache)\n{tail}");
+        assert!(
+            !has(&src, &LintConfig::new(), "LB0510"),
+            "fired on `{tail}`"
+        );
+    }
+}
+
 // --- suppression / malformed-ignore (LB0500) -------------------------------
 
 #[test]
@@ -912,7 +2539,7 @@ fn apply_fixes_is_stable_on_second_run() {
 #[test]
 fn every_registered_rule_is_uniquely_identified_and_described() {
     let registry = rules();
-    assert_eq!(registry.len(), 9, "the SPEC §9 rule set");
+    assert_eq!(registry.len(), 10, "the SPEC §9 rule set");
     let mut ids: Vec<&str> = Vec::new();
     let mut codes: Vec<String> = Vec::new();
     for rule in &registry {
@@ -928,15 +2555,86 @@ fn every_registered_rule_is_uniquely_identified_and_described() {
         );
         assert!(!ids.contains(&id), "duplicate rule id `{id}`");
         let code = rule.code().to_string();
-        assert!(
-            code.starts_with("LB05"),
-            "`{id}` code {code} is outside LB05xx"
-        );
         assert!(!codes.contains(&code), "duplicate code {code} on `{id}`");
         // The tier keyword round-trips, so a `[lint]` toggle can name it.
         assert_eq!(Tier::parse(rule.tier().name()), Some(rule.tier()));
         ids.push(id);
         codes.push(code);
+    }
+}
+
+/// The load-bearing half of the lint-band contract
+/// ([`luabox_diag::Code::is_lint`]).
+///
+/// The language server decides a finding's `source` — and therefore whether
+/// its quick-fix matcher will look at it — from that predicate. Nothing used
+/// to assert that a rule's code satisfies it: the LSP open-coded
+/// `code.number() / 100 == 5` and every rule happened to comply
+/// (Shockwave round 2). A rule registered at, say, `LB0700` would have been
+/// published under the toolchain source, silently losing its quick fixes.
+///
+/// `luabox-diag` cannot assert this direction — it sits below this crate and
+/// cannot see the rule registry — so this is where it lives.
+#[test]
+fn every_rule_code_is_in_the_lint_band() {
+    let registry = rules();
+    assert!(!registry.is_empty(), "the registry is empty");
+    for rule in &registry {
+        let code = rule.code();
+        // `is_lint_rule` is `is_lint` minus `LB0500`, the crate's own
+        // malformed-`---@luabox-ignore` diagnostic: in the band (so the LSP
+        // tags it with the lint source) but not a rule.
+        assert!(
+            code.is_lint_rule(),
+            "rule `{}` has code {code}, which is not a lint rule code",
+            rule.id()
+        );
+    }
+    // The suppression-syntax diagnostic is in the band and is not a rule —
+    // both halves, so neither predicate can quietly collapse into the other.
+    assert!(luabox_diag::Code::new(500).is_lint());
+    assert!(!luabox_diag::Code::new(500).is_lint_rule());
+}
+
+/// The second unwritten invariant behind the editor's quick-fix matcher:
+/// **only rules carry fixes**.
+///
+/// `crate::lint_source` mirrors a rule's machine-applicable fix into both the
+/// `fixes` list and the diagnostic's suggestions, and the language server
+/// pairs them back up by span + replacement before offering a code action.
+/// A fix arriving on a diagnostic outside the rule band would be matched to
+/// a diagnostic the editor tagged with the toolchain source, and the action
+/// would reference a diagnostic the client never saw.
+#[test]
+fn only_lint_rules_carry_fixes() {
+    // A file with a fixable finding (`pairs` over an array literal), a
+    // non-rule lint-crate finding (`LB0500`, a bare ignore tag), and a
+    // control-flow legality error (`LB0022`) — all three travel out of the
+    // same engine.
+    let src = "\
+---@luabox-ignore
+local function each()
+  for _, v in pairs({ 1, 2, 3 }) do print(v) end
+end
+break
+return each
+";
+    let out = lint(src, &LintConfig::new());
+    let codes: Vec<String> = out.diagnostics.iter().map(|d| d.code.to_string()).collect();
+    assert!(codes.contains(&"LB0500".to_owned()), "{codes:?}");
+    assert!(codes.contains(&"LB0022".to_owned()), "{codes:?}");
+    assert!(codes.contains(&"LB0507".to_owned()), "{codes:?}");
+    assert!(!out.fixes.is_empty(), "expected at least one fix");
+
+    for diag in &out.diagnostics {
+        if diag.suggestions.is_empty() {
+            continue;
+        }
+        assert!(
+            diag.code.is_lint_rule(),
+            "{} carries a fix but is not a lint rule code",
+            diag.code
+        );
     }
 }
 

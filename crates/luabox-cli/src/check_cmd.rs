@@ -1,7 +1,7 @@
 //! `luabox check [--target <t>] [--format <f>] [--watch]` — the CI-grade
 //! standalone typecheck (SPEC.md §3, §4, §14).
 //!
-//! Per `.lua` file, three passes over one parse:
+//! Per `.lua` file, four passes over one parse:
 //!
 //! 1. **Parse errors** → `LB0001` (the parser is error-resilient; later
 //!    passes still run on the recovered tree).
@@ -9,7 +9,18 @@
 //!    `--target`, against the ship target too (that is what `--target`
 //!    means before lowering exists: "would this source be legal there?").
 //!    Duplicate findings (same code, same range) are reported once.
-//! 3. **Typecheck** (annotation-driven, against the ambient definition
+//! 3. **Control-flow legality** (#44) → `LB0020`-`LB0022`: an unresolved
+//!    `goto`, a repeated label, `break` with no enclosing loop. Every
+//!    reference Lua rejects these at load time; only the duplicate-label
+//!    *scope* differs by dialect, which is why this pass runs for the ship
+//!    target as well — and, unlike pass 2, for a ship target the manifest
+//!    declares in `[build] target` and not only for `--target` (see
+//!    [`TargetPasses`]). Skipped when the parse is not clean.
+//!
+//! Passes 2 and 3 each merge their edition and target runs: one finding per
+//! (code, primary span), the target's verdict winning a construct both
+//! reject, rendered in source order.
+//! 4. **Typecheck** (annotation-driven, against the ambient definition
 //!    layer, with each file's cross-file `require` exports in reach — #85)
 //!    at the manifest's strictness: `[types] strict = true` → strict
 //!    (errors), otherwise warn.
@@ -28,7 +39,7 @@
 //! loop instead of a one-shot check — see `crate::watch` for the debounce
 //! and filtering rules.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -107,7 +118,73 @@ pub(crate) fn run_once(
             Err(unknown) => return finish(&[unknown.diagnostic()], format, &project.root, 0),
         }
     }
+    // With no `--target`, the manifest's `[build] target` still names a ship
+    // dialect, and the *loader* half of that question has to be asked: a
+    // project declaring `target = "5.4"` passed `luabox check` on a program
+    // `luabox check --target 5.4` rejects, then built an artifact that cannot
+    // load (Shockwave round 4). It reaches the control-flow pass only — see
+    // [`TargetPasses`] for why the dialect-legality pass is not asked of a
+    // manifest target: constructs the target's parser rejects are what the
+    // declared lowering exists to rewrite, so reporting them would fail every
+    // project that uses the feature. `--target` is the explicit "would this
+    // *source* be legal there?" question and still drives both passes.
+    // `[build] target` defaults to the edition, and `dialect_passes` drops a
+    // target equal to the edition, so a project that declares neither is
+    // unaffected.
+    let passes = TargetPasses {
+        legality: target_dialect,
+        control_flow: Some(target_dialect.unwrap_or(project.build_target)),
+    };
+    run_passes(project, passes, format)
+}
 
+/// The ship-target legality passes `run_once` runs on top of the project
+/// edition, held apart because [`crate::build_cmd`]'s check gate wants one
+/// and not the other.
+///
+/// `legality` (pass 2) asks whether the source *parses* on the target;
+/// `control_flow` (pass 3) asks whether the target's *loader* accepts it.
+/// The distinction is what lowering can do about each: a construct the
+/// target's parser rejects is exactly what lowering exists to rewrite, so
+/// `build` must not gate on it, while nothing lowers a duplicate label away,
+/// so `build` must.
+///
+/// The same split decides what a *manifest* `[build] target` may ask. An
+/// explicit `--target` is the literal question ("would this source be legal
+/// there?") and sets both. `[build] target` is a declaration that the project
+/// is lowered to that dialect, so it sets `control_flow` only — asking it for
+/// dialect legality would report `LB0011` on every `//` in a 5.3 project that
+/// ships 5.1, i.e. fail `luabox check` for using the feature `[build] target`
+/// exists to provide.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TargetPasses {
+    legality: Option<Dialect>,
+    control_flow: Option<Dialect>,
+}
+
+impl TargetPasses {
+    /// The gate `luabox build` runs before emitting: the target's *loader*
+    /// verdict only, for the reason spelled out on [`TargetPasses`].
+    pub(crate) fn control_flow_only(target: Dialect) -> Self {
+        Self {
+            legality: None,
+            control_flow: Some(target),
+        }
+    }
+}
+
+/// `luabox check` with an explicitly chosen set of target passes — the entry
+/// point [`crate::build_cmd`]'s check gate uses. Everything else about the
+/// run is identical to [`run_once`].
+pub(crate) fn run_gated(
+    project: &Project,
+    passes: TargetPasses,
+    format: Format,
+) -> anyhow::Result<()> {
+    run_passes(project, passes, format)
+}
+
+fn run_passes(project: &Project, passes: TargetPasses, format: Format) -> anyhow::Result<()> {
     let lua_files =
         layout::collect_lua_files(&project.root, project.out_dir.as_deref(), DefFiles::Exclude)?;
     // Definition packages (SPEC.md §3): the dialect stdlib layer, plus any
@@ -130,6 +207,17 @@ pub(crate) fn run_once(
     let ambient: &Ambient = ambient_owned
         .as_ref()
         .unwrap_or_else(|| stdlib_defs(project.dialect));
+
+    // Types from a bare luarocks tree (#30). A rock's installed sources under
+    // `lua_modules/share/lua/<X.Y>/` are ordinary annotated Lua; their LuaCATS
+    // surfaces — classes/enums/aliases plus each module's `require`-export type
+    // — join this project's scope with no manifest declaration at all, which is
+    // the whole point: `luarocks install --tree lua_modules <rock>` now buys
+    // types as well as resolution and bundling. Surface-only and
+    // ambient-relaxed: nothing here checks a vendored body or can produce a
+    // diagnostic (`luabox_types::rocks`). The version directory is the one the
+    // build resolves against, so `check` looks where the build will.
+    let rocks = harvest_rocks(project, ambient);
 
     // Read and parse the whole source set ONCE (CC-M1). Both halves of the
     // check — the cross-file surface pre-pass below and the per-file check
@@ -187,11 +275,18 @@ pub(crate) fn run_once(
             )
         })
         .collect();
-    let exports: HashMap<PathBuf, Ty> = files
+    let mut exports: HashMap<PathBuf, Ty> = files
         .iter()
         .zip(&surfaces)
         .filter_map(|(file, surface)| Some((file.canonical.clone(), surface.export.clone()?)))
         .collect();
+    // Rock exports join the same path-keyed registry (#30). Keying by path (not
+    // by module name) is what keeps precedence exact: `resolve_requires` asks
+    // the bundler which *file* a `require` names, and a project file that
+    // shadows a rock module is the file it returns.
+    for (path, export) in rocks.by_path() {
+        exports.entry(canonical(path)).or_insert(export.clone());
+    }
     // Duplicate `---@alias` across project files / `[types] defs` (luals
     // `duplicate-doc-alias`, LB0310, #113): a project-assembly finding — like
     // the LB0307 class collisions above — computed over the whole source set,
@@ -207,8 +302,16 @@ pub(crate) fn run_once(
     ));
     // The project-wide ambient: defs + every file's workspace-global
     // classes/enums, merged (defs win same-name member collisions; luals
-    // merges duplicate class declarations' fields rather than dropping).
-    let ambient = ambient.with_project_types(surfaces.iter().map(|s| &s.types));
+    // merges duplicate class declarations' fields rather than dropping),
+    // then the harvested rock surfaces (#30) LAST — explicit beats implicit,
+    // so a rock's declaration only fills a name neither the defs layer nor any
+    // project file claimed. Rock surfaces are deliberately absent from the
+    // `LB0307`/`LB0310` collision reports above: the user declared neither side
+    // of a rock-vs-rock name clash and cannot act on it, and #30 is about a
+    // tree that needs no configuration at all.
+    let ambient = ambient
+        .with_project_types(surfaces.iter().map(|s| &s.types))
+        .with_rock_types(rocks.types());
     let ambient = &ambient;
 
     // SPEC.md §16: rayon per-module. Each file is checked against the
@@ -218,7 +321,7 @@ pub(crate) fn run_once(
         .par_iter()
         .map(|file| {
             let mut diags = Vec::new();
-            check_one(file, project, target_dialect, ambient, &exports, &mut diags);
+            check_one(file, project, passes, ambient, &exports, &mut diags);
             diags
         })
         .collect();
@@ -249,7 +352,7 @@ struct SourceFile {
 fn check_one(
     file: &SourceFile,
     project: &Project,
-    target: Option<Dialect>,
+    passes: TargetPasses,
     ambient: &Ambient,
     exports: &HashMap<PathBuf, Ty>,
     diags: &mut Vec<Diagnostic>,
@@ -272,31 +375,87 @@ fn check_one(
         );
     }
 
-    // 2. Dialect legality: edition, then ship target (deduplicated — the
-    // same construct may be illegal in both).
-    let mut passes = vec![project.dialect];
-    if let Some(target) = target
-        && target != project.dialect
-    {
-        passes.push(target);
-    }
-    let mut seen: HashSet<(u16, u32, u32)> = HashSet::new();
-    for dialect in passes {
+    // 2. Dialect legality: edition, then ship target (merged — the same
+    // construct may be illegal in both, and is then reported once).
+    let legality_passes = dialect_passes(project.dialect, passes.legality);
+    let mut findings = Findings::default();
+    for (i, dialect) in legality_passes.iter().copied().enumerate() {
         for err in lua::validate::validate(parse, dialect) {
-            let key = (err.code, err.range.start().into(), err.range.end().into());
-            if !seen.insert(key) {
-                continue;
-            }
-            diags.push(
-                Diagnostic::error(Code::new(err.code), err.message).with_label(Label::primary(
-                    Span::new(rel, to_range(err.range)),
-                    "not legal in this edition",
-                )),
+            let range = to_range(err.range);
+            let key = (err.code, range.start, range.end);
+            // Counterfactual otherwise: a construct the *edition* accepts and
+            // only the target rejects was still labelled "not legal in this
+            // edition".
+            let label = if i > 0 && !findings.contains(key) {
+                format!("not legal on target {}", dialect.manifest_id())
+            } else {
+                "not legal in this edition".to_owned()
+            };
+            findings.record(
+                key,
+                Diagnostic::error(Code::new(err.code), err.message)
+                    .with_label(Label::primary(Span::new(rel, range), label)),
             );
         }
     }
+    // Held rather than emitted. Passes 2 and 3 are two legality *axes* over one
+    // file, and a reader scanning a file's findings reads down the file, not
+    // down luabox's pass list — so they are sorted together, below. Per-pass
+    // sorting concatenated in pass order let an `LB0021` at line 13 render
+    // after an `LB0013` at line 29 (Shockwave round 5).
+    let mut legality: Vec<Diagnostic> = findings.into_source_order();
 
-    // 3. Types against the ambient definition-package layer (SPEC.md §3),
+    // 3. Control-flow legality (#44): an unresolved `goto`, a repeated label,
+    // or `break` outside a loop — code every reference Lua refuses to load,
+    // whatever the edition. Skipped on a broken parse: the block structure
+    // recovered around a missing `end` is a guess, and a legality verdict over
+    // a guess is noise on top of the syntax error already reported.
+    //
+    // Run for the *same* dialect pair as pass 2, merged the same way.
+    // The pass is not fully edition-independent: `checkrepeated` tightened in
+    // 5.4 (`luabox_hir::validate::repeated_label_scope`), so `::a:: do ::a::
+    // end` is legal source in a 5.2 project yet cannot load on a 5.4 ship
+    // target. Checking only the edition let exactly that combination through
+    // (Shockwave round 2).
+    //
+    // This lowers the file rather than reusing the HIR inside `artifacts`:
+    // `luabox_types::FileArtifacts` keeps its lowering private. The same pass
+    // runs off the lint engine's own lowering and the LSP's memoized one, so
+    // all three frontends return the same verdict. Lowering is dialect-free,
+    // so both passes read one lowering.
+    if parse.errors().is_empty() {
+        let lowered = luabox_hir::lower(parse);
+        let control_flow_passes = dialect_passes(project.dialect, passes.control_flow);
+        let mut findings = Findings::default();
+        for (i, dialect) in control_flow_passes.iter().copied().enumerate() {
+            for diag in luabox_hir::validate::control_flow(rel, &lowered, dialect) {
+                let range = diag.primary_label().map_or(0..0, |l| l.span.range.clone());
+                let key = (diag.code.number(), range.start, range.end);
+                let diag = if i > 0 && !findings.contains(key) {
+                    diag.with_note(format!(
+                        "the project edition loads this; the ship target {} does not",
+                        dialect.manifest_id()
+                    ))
+                } else {
+                    diag
+                };
+                findings.record(key, diag);
+            }
+        }
+        legality.extend(findings.into_source_order());
+    }
+
+    // Both legality axes, in one globally source-ordered run. The sort is
+    // stable and each half arrives already sorted, so two findings at the same
+    // span keep dialect-legality before loader-legality: the parser's verdict
+    // is the one that explains the loader's.
+    legality.sort_by_key(|diag| {
+        diag.primary_label()
+            .map_or((0, 0), |l| (l.span.range.start, l.span.range.end))
+    });
+    diags.extend(legality);
+
+    // 4. Types against the ambient definition-package layer (SPEC.md §3),
     // with this file's resolved `require` exports in reach (#85).
     let requires = resolve_requires(artifacts, &project.root, project.build_target, exports);
     diags.extend(luabox_types::check_file_with_artifacts(
@@ -308,6 +467,74 @@ fn check_one(
         &requires,
         artifacts,
     ));
+}
+
+/// The dialects a legality pass runs for: the project edition, plus the ship
+/// `--target` when it differs.
+///
+/// One helper for both legality passes (dialect, then control flow) so they
+/// cannot drift apart: `--target` means "would this source be legal there?",
+/// and a construct the target's *loader* rejects is no less a target problem
+/// than one its *parser* rejects. A target equal to the edition adds nothing —
+/// the pass would produce identical findings, deduplicated away — so it is not
+/// pushed at all.
+/// What identifies one legality finding across the edition and target runs:
+/// its code and its primary range.
+type FindingKey = (u16, usize, usize);
+
+/// The findings of one legality pass, merged across the edition and target
+/// runs and returned in source order.
+///
+/// Two runs reporting the same code at the same primary range are the same
+/// *construct*, but not necessarily the same *verdict*:
+/// `repeated_label_scope` makes the first-definition site of an `LB0021`
+/// dialect-dependent, so `::a:: do ::a:: ::a:: end` at edition 5.2 with
+/// `--target 5.4` produced two findings that named each other's spans — one
+/// line reported as a duplicate *and* cited as the first definition
+/// (Shockwave round 4). Keeping whichever ran first also meant the edition
+/// always won, and the rendered order followed pass order rather than the
+/// source.
+///
+/// So: the **later** run wins a key both fill — the ship target is the
+/// dialect that decides whether the artifact loads — and the merged set is
+/// sorted by span before it is rendered.
+#[derive(Default)]
+struct Findings {
+    order: Vec<Diagnostic>,
+    index: HashMap<FindingKey, usize>,
+}
+
+impl Findings {
+    fn contains(&self, key: FindingKey) -> bool {
+        self.index.contains_key(&key)
+    }
+
+    fn record(&mut self, key: FindingKey, diag: Diagnostic) {
+        if let Some(&at) = self.index.get(&key) {
+            self.order[at] = diag;
+        } else {
+            self.index.insert(key, self.order.len());
+            self.order.push(diag);
+        }
+    }
+
+    fn into_source_order(mut self) -> Vec<Diagnostic> {
+        self.order.sort_by_key(|diag| {
+            diag.primary_label()
+                .map_or((0, 0), |l| (l.span.range.start, l.span.range.end))
+        });
+        self.order
+    }
+}
+
+fn dialect_passes(edition: Dialect, target: Option<Dialect>) -> Vec<Dialect> {
+    let mut passes = vec![edition];
+    if let Some(target) = target
+        && target != edition
+    {
+        passes.push(target);
+    }
+    passes
 }
 
 /// Map each static `require("mod")` the file names to the export type of the
@@ -335,6 +562,46 @@ fn resolve_requires(
         }
     }
     requires
+}
+
+/// Harvest the type surfaces of the project's vendored luarocks tree, if it has
+/// one (#30) — [`luabox_types::rocks::harvest`] over
+/// [`layout::collect_rock_sources`].
+///
+/// The version directory is chosen by `[build] target` (the edition when unset),
+/// exactly as [`resolve_requires`] chooses it, so the tree `check` harvests is
+/// the tree the build resolves against. A project with no
+/// `lua_modules/share/lua/<X.Y>/` directory pays one failed `is_dir` and gets an
+/// empty result — the flat `lua_modules/<name>/` layout keeps its existing
+/// `[dependencies]` + `[types] defs` path untouched.
+///
+/// A rock source that did not parse is dropped silently here — `check`'s output
+/// is the project's findings and a vendored file the user did not write has no
+/// business in it. The skipped labels are still reported where a debug-level
+/// note belongs: the LSP names them in its log pane (`crate::lsp_cmd` →
+/// `luabox_lsp`).
+fn harvest_rocks(project: &Project, ambient: &Ambient) -> luabox_types::RockSurfaces {
+    let version_dir = luabox_bundle::rocks_version_dir(project.build_target);
+    let sources: Vec<luabox_types::RockModule> =
+        layout::collect_rock_sources(&project.root, version_dir)
+            .into_iter()
+            .map(|source| luabox_types::RockModule {
+                module: source.module,
+                label: source.label,
+                path: source.path,
+                text: source.text,
+            })
+            .collect();
+    // Per-file reduction is pure and independent, so it rides the same rayon
+    // pool the source set does — a fully annotated 100-kLOC rock tree is
+    // otherwise the largest single cost in a run. The fold is what orders the
+    // surfaces (path order = precedence), so the parallel and sequential forms
+    // give the identical result.
+    let files: Vec<luabox_types::RockFile> = sources
+        .par_iter()
+        .map(|source| luabox_types::rocks::harvest_file(ambient, source))
+        .collect();
+    luabox_types::RockSurfaces::fold(&sources, files)
 }
 
 /// Canonicalize a path for identity comparison against
@@ -683,6 +950,76 @@ mod tests {
         assert_eq!(error, "check failed with 1 error(s)");
     }
 
+    /// The pass list both legality passes share: edition first, target only
+    /// when it differs (Shockwave round 2 — control flow used to ignore it).
+    #[test]
+    fn the_dialect_pass_list_adds_the_target_only_when_it_differs() {
+        assert_eq!(dialect_passes(Dialect::Lua52, None), vec![Dialect::Lua52]);
+        assert_eq!(
+            dialect_passes(Dialect::Lua52, Some(Dialect::Lua52)),
+            vec![Dialect::Lua52]
+        );
+        assert_eq!(
+            dialect_passes(Dialect::Lua52, Some(Dialect::Lua54)),
+            vec![Dialect::Lua52, Dialect::Lua54]
+        );
+    }
+
+    #[test]
+    fn a_label_shadow_legal_in_the_edition_is_reported_for_a_5_4_target() {
+        // `checkrepeated` tightened in 5.4: `::a:: do ::a:: end` loads on
+        // 5.2/5.3/LuaJIT and is `label 'a' already defined` on 5.4
+        // (`luac5.4 -p`). `--target 5.4` has to say so.
+        for edition in ["5.2", "5.3", "luajit"] {
+            let tmp = project(&manifest(edition, ""));
+            write(tmp.path(), "src/main.lua", "::a:: do ::a:: end\n");
+            check(tmp.path(), None, Format::Human)
+                .unwrap_or_else(|e| panic!("legal in edition {edition}: {e}"));
+            let error = check(tmp.path(), Some("5.4"), Format::Human)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "check failed with 1 error(s)", "edition {edition}");
+        }
+    }
+
+    #[test]
+    fn a_looser_target_does_not_resurrect_a_finding_the_edition_cleared() {
+        // The reverse direction: legal under 5.4, and 5.2's looser rule can
+        // only accept more, so nothing is reported.
+        let tmp = project(&manifest("5.4", ""));
+        write(tmp.path(), "src/main.lua", "do ::a:: end ::a::\n");
+        check(tmp.path(), Some("5.2"), Format::Human).expect("legal under both");
+    }
+
+    #[test]
+    fn a_control_flow_finding_in_both_passes_is_reported_once() {
+        // `break` outside a loop is illegal in every edition, so both the
+        // edition pass and the target pass produce it for the same range.
+        let tmp = project(&manifest("5.1", ""));
+        write(tmp.path(), "src/main.lua", "local x = 1 break\n");
+        let with_target = check(tmp.path(), Some("5.4"), Format::Human)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(with_target, "check failed with 1 error(s)");
+    }
+
+    #[test]
+    fn a_goto_on_a_5_1_target_stays_the_dialect_finding_alone() {
+        // 5.1 has no `goto` at all, so the control-flow pass skips goto/label
+        // for it (`luabox_hir::validate::control_flow`) and the reader gets
+        // the two `LB0010` dialect findings, not a third complaint.
+        let tmp = project(&manifest("5.4", ""));
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "local i = 0\n::top::\ni = i + 1\nif i < 3 then goto top end\n",
+        );
+        let error = check(tmp.path(), Some("5.1"), Format::Human)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "check failed with 2 error(s)");
+    }
+
     #[test]
     fn diagnostics_render_in_the_requested_machine_format() {
         for format in [
@@ -853,6 +1190,169 @@ mod tests {
         // The label is dependency-prefixed and forward-slashed.
         assert_eq!(defs[0].file, "geometry/defs/geometry.d.lua");
         assert!(defs[0].text.contains("geometry.Shape"));
+    }
+
+    // -- types harvested from a bare luarocks tree (#30) --------------------
+    //
+    // The tree walk is `luabox_manifest::layout`'s and the surface harvest is
+    // `luabox_types::rocks`'; both are tested there. These pin what `check`
+    // adds: the wiring — no manifest declaration needed, project-side
+    // declarations winning, and a rock body never being checked.
+
+    /// An annotated rock installed the way luarocks installs one.
+    const ROCK: &str = "\
+---@class mylib.Point
+---@field x number
+---@field y number
+
+local M = {}
+
+---@param x number
+---@param y number
+---@return mylib.Point
+function M.point(x, y)
+  return { x = x, y = y }
+end
+
+return M
+";
+
+    #[test]
+    fn a_bare_rock_tree_types_a_require_with_no_manifest_declaration() {
+        let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
+        write(tmp.path(), "lua_modules/share/lua/5.4/mylib/init.lua", ROCK);
+        // No `[dependencies]`, no `[types] defs`, no `lua_modules/mylib/luabox.toml`.
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "local mylib = require(\"mylib\")\nlocal p = mylib.point(1, 2)\nreturn p.x\n",
+        );
+        check(tmp.path(), None, Format::Human).expect("rock types resolve and check clean");
+    }
+
+    #[test]
+    fn misusing_a_harvested_rock_type_is_reported_in_the_consumer() {
+        let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
+        write(tmp.path(), "lua_modules/share/lua/5.4/mylib/init.lua", ROCK);
+        // The rock's `---@return mylib.Point` flows through the `require`, so
+        // both misuses are the consumer's: a field the rock's class does not
+        // declare, and the class where a string is wanted.
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "local mylib = require(\"mylib\")\n\
+             local p = mylib.point(1, 2)\n\
+             ---@param s string\n\
+             local function want(s) end\n\
+             want(p)\n\
+             return p.nope\n",
+        );
+        let error = check(tmp.path(), None, Format::Human)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "check failed with 2 error(s)");
+    }
+
+    #[test]
+    fn a_type_error_inside_a_rock_source_is_never_a_project_diagnostic() {
+        let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
+        // Annotated (so it *is* harvested) and wrong (so it would fail if it
+        // were checked): the rock misuses its own signature.
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/mylib/init.lua",
+            &format!("{ROCK}\n---@type mylib.Point\nlocal bad = {{ x = \"nope\" }}\n"),
+        );
+        write(tmp.path(), "src/main.lua", "return 1\n");
+        check(tmp.path(), None, Format::Human).expect("vendored bodies are never checked");
+    }
+
+    #[test]
+    fn an_unparseable_rock_source_is_skipped_silently() {
+        let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/broken/init.lua",
+            "---@class broken.Thing\nlocal = = =\n",
+        );
+        write(tmp.path(), "src/main.lua", "return 1\n");
+        check(tmp.path(), None, Format::Human).expect("a broken rock cannot fail the project");
+    }
+
+    #[test]
+    fn an_explicit_defs_declaration_wins_a_collision_with_a_harvested_rock_class() {
+        let tmp = project(&manifest(
+            "5.4",
+            "\n[types]\nstrict = true\ndefs = [\"mylib\"]\n",
+        ));
+        write(tmp.path(), "lua_modules/share/lua/5.4/mylib/init.lua", ROCK);
+        // The project's own def declares `mylib.Point` with only `x`. If the
+        // rock's two-field version won, `{ x = 1 }` would be missing `y`.
+        write(
+            tmp.path(),
+            "defs/mylib.d.lua",
+            "---@meta\n---@class mylib.Point\n---@field x number\n",
+        );
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "---@type mylib.Point\nlocal p = { x = 1 }\nreturn p\n",
+        );
+        check(tmp.path(), None, Format::Human).expect("explicit defs win — `x` alone is complete");
+    }
+
+    #[test]
+    fn a_rock_tree_for_another_version_directory_is_not_harvested() {
+        let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
+        // Installed for 5.1; this project targets 5.4, so the tree is not
+        // this build's and `require` would not resolve into it either.
+        write(tmp.path(), "lua_modules/share/lua/5.1/mylib/init.lua", ROCK);
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "---@type mylib.Point\nlocal p = { x = 1, y = 2 }\nreturn p\n",
+        );
+        let error = check(tmp.path(), None, Format::Human)
+            .unwrap_err()
+            .to_string();
+        // LB0305 — the class is undeclared, exactly as before #30.
+        assert!(error.contains("check failed with"), "{error}");
+    }
+
+    #[test]
+    fn an_explicit_dependencies_entry_alongside_a_rock_tree_neither_breaks_nor_doubles() {
+        let tmp = project(&manifest(
+            "5.4",
+            "\n[types]\nstrict = true\n\n[dependencies]\nmylib = \"1.0\"\n",
+        ));
+        write(tmp.path(), "lua_modules/share/lua/5.4/mylib/init.lua", ROCK);
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "---@type mylib.Point\nlocal p = { x = 1, y = 2 }\nreturn p\n",
+        );
+        // The entry finds no `lua_modules/mylib/luabox.toml`, so it contributes
+        // no defs; the harvest supplies the class once. No LB0307.
+        check(tmp.path(), None, Format::Human).expect("declared dependency plus harvest is clean");
+    }
+
+    #[test]
+    fn a_project_file_shadowing_a_rock_module_keeps_its_own_export_type() {
+        let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
+        write(tmp.path(), "lua_modules/share/lua/5.4/mylib.lua", ROCK);
+        // `<root>/src/mylib.lua` is earlier in the resolution order than the
+        // rock tree, so `require("mylib")` is this file — with no `point`.
+        write(
+            tmp.path(),
+            "src/mylib.lua",
+            "local M = {}\n---@return string\nfunction M.shadow() return \"me\" end\nreturn M\n",
+        );
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "local mylib = require(\"mylib\")\nreturn mylib.shadow()\n",
+        );
+        check(tmp.path(), None, Format::Human).expect("the project file wins resolution");
     }
 
     fn read_manifest_for_test(root: &Path) -> Manifest {

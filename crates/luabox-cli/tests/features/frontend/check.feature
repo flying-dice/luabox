@@ -240,6 +240,92 @@ Feature: luabox check — annotation-driven typecheck (P0 MVP)
     And stdout contains "LB0304"
     And stdout contains "return type mismatch: expected `number`, found"
 
+  # --- `---@type fun(...)` on an assignment (#38) --------------------------
+  # `Carrier.m = function(...) end` is the assignment spelling of a function
+  # definition: an explicit `---@type fun(...)` is authoritative for the value
+  # (SPEC §3), supplying the signature call sites are checked against, and the
+  # block's tags ride along. `---@type A, B` stays positional, so a lone
+  # annotation over a multi-assignment declares the first target only.
+
+  Scenario: a `---@type fun(...)` assignment is checked at its call site
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      local M = {}
+      ---@type fun(n: integer)
+      M.f = function(n) end
+      M.f("nope")
+      return M
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "error[LB0300]"
+    And stdout contains "expected `integer`"
+
+  Scenario: a `---@type fun(...)` assignment governs arity
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      local M = {}
+      ---@type fun(n: integer)
+      M.f = function(n) end
+      M.f()
+      return M
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "error[LB0301]"
+
+  Scenario: a `---@type fun(...)` assignment types the literal's parameters
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      ---@class Widget
+      ---@field size number
+      local Widget = {}
+
+      local M = {}
+      ---@type fun(w: Widget)
+      M.use = function(w)
+        return w.nofield
+      end
+      return M, Widget
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "error[LB0306]"
+
+  Scenario: one annotation over a multi-assignment declares the first target only
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      local M = {}
+      ---@type fun(a: integer)
+      M.a, M.b = function(a) end, function(b) end
+      M.b("anything")
+      M.a("nope")
+      return M
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stderr contains "check: 1 errors"
+    And stdout contains "expected `integer`"
+
+  Scenario: a declared signature disagreeing with the literal is not itself an error
+    Given a strict project with edition "5.4"
+    And a file "src/main.lua" containing:
+      """
+      local M = {}
+      ---@type fun(a: integer)
+      M.extra = function(a, b, c) end
+      ---@type fun(a: integer, b: integer)
+      M.missing = function(a) end
+      return M
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stderr contains "check: 0 errors, 0 warnings"
+
   # --- annotation lowering (LB0305, LB0314) -------------------------------
 
   Scenario: an unknown type name in an annotation is diagnosed

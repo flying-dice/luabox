@@ -8,6 +8,16 @@
 //!
 //! Usage:
 //!   gen-corpus --out <dir> [--seed <u64>] [--files <n>] [--lines-per-file <n>]
+//!                          [--rock-tree [<X.Y>]]
+//!
+//! `--rock-tree` writes a whole *project* instead of a bare directory of
+//! modules: the generated files land under
+//! `<out>/lua_modules/share/lua/<X.Y>/`, the layout `luarocks install --tree
+//! lua_modules` produces, beside a `luabox.toml` and a one-line
+//! `src/main.lua`. That is the shape `scripts/lsp-startup-bench.sh` needs to
+//! reproduce the language server's startup rock-harvest measurement, and it
+//! is generated rather than described so the number can be re-measured
+//! instead of quoted.
 //!
 //! Same seed + same flags always produces byte-identical output — the
 //! generator uses its own tiny splitmix64 PRNG (no external dependency)
@@ -15,7 +25,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const NOUNS: &[&str] = &[
@@ -73,6 +83,9 @@ struct Args {
     seed: u64,
     files: usize,
     lines_per_file: usize,
+    /// `Some(version)` writes a rock-tree project; `None` writes the modules
+    /// straight into `--out`.
+    rock_tree: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -80,8 +93,9 @@ fn parse_args() -> Result<Args, String> {
     let mut seed: u64 = 42;
     let mut files: usize = 50;
     let mut lines_per_file: usize = 2000;
+    let mut rock_tree: Option<String> = None;
 
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--out" => {
@@ -108,6 +122,14 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "--lines-per-file must be a usize".to_string())?;
             }
+            "--rock-tree" => {
+                // The version is optional: `--rock-tree` alone means 5.4.
+                let version = match args.peek() {
+                    Some(next) if !next.starts_with("--") => args.next(),
+                    _ => None,
+                };
+                rock_tree = Some(version.unwrap_or_else(|| "5.4".to_string()));
+            }
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -121,6 +143,7 @@ fn parse_args() -> Result<Args, String> {
         seed,
         files,
         lines_per_file,
+        rock_tree,
     })
 }
 
@@ -132,7 +155,10 @@ fn print_help() {
          --out <dir>              output directory (default: target/corpus)\n    \
          --seed <u64>             PRNG seed, same seed => byte-identical output (default: 42)\n    \
          --files <n>              number of .lua files to write (default: 50)\n    \
-         --lines-per-file <n>     approx. line count per file (default: 2000)\n"
+         --lines-per-file <n>     approx. line count per file (default: 2000)\n    \
+         --rock-tree [<X.Y>]      write a project whose modules live under\n                             \
+         <out>/lua_modules/share/lua/<X.Y>/ (default version: 5.4),\n                             \
+         with a luabox.toml and a src/main.lua beside them\n"
     );
 }
 
@@ -153,25 +179,65 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &Args) -> std::io::Result<()> {
-    fs::create_dir_all(&args.out)?;
+    let modules_dir = match &args.rock_tree {
+        Some(version) => args
+            .out
+            .join("lua_modules")
+            .join("share")
+            .join("lua")
+            .join(version),
+        None => args.out.clone(),
+    };
+    fs::create_dir_all(&modules_dir)?;
     let mut rng = Rng::new(args.seed);
     let mut total_lines = 0usize;
 
     for file_idx in 0..args.files {
         let content = gen_file(&mut rng, file_idx, args.lines_per_file);
         total_lines += content.matches('\n').count();
-        let path = args.out.join(format!("module_{file_idx:04}.lua"));
+        let path = modules_dir.join(format!("module_{file_idx:04}.lua"));
         let mut f = fs::File::create(&path)?;
         f.write_all(content.as_bytes())?;
+    }
+
+    if let Some(version) = &args.rock_tree {
+        write_project(&args.out, version)?;
     }
 
     println!(
         "gen-corpus: wrote {} files (~{total_lines} lines total, seed {}) to {}",
         args.files,
         args.seed,
-        args.out.display()
+        modules_dir.display()
     );
     Ok(())
+}
+
+/// The manifest and entry file that turn a bare `lua_modules/` tree into a
+/// project the CLI and the language server both discover. `src/main.lua`
+/// names one generated module so the file the benchmark opens is a realistic
+/// consumer of the tree rather than an empty chunk.
+fn write_project(out: &Path, version: &str) -> std::io::Result<()> {
+    fs::create_dir_all(out.join("src"))?;
+    fs::write(
+        out.join("luabox.toml"),
+        format!(
+            "[package]\n\
+             name = \"gen-corpus\"\n\
+             version = \"0.0.0\"\n\
+             edition = \"{version}\"\n\
+             \n\
+             [build]\n\
+             target = \"{version}\"\n\
+             \n\
+             [types]\n\
+             strict = true\n"
+        ),
+    )?;
+    fs::write(
+        out.join("src").join("main.lua"),
+        "local m = require(\"module_0000\")\nreturn m\n",
+    )
 }
 
 /// Generate one ~`target_lines`-line idiomatic Lua module: a mix of plain

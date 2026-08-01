@@ -407,3 +407,121 @@ end
     );
     assert_eq!(strict_codes_ambient(&src), vec!["LB0308", "LB0316"]);
 }
+
+/// The canonical luals class shape: a `---@class` carrier with methods
+/// attached to it and **no** `C.__index = C` line. luals folds carrier
+/// attachments into the class off the carrier binding, with no metatable
+/// reasoning at all, so instances see them (#33 residue).
+const NO_INDEX_CARRIER: &str = "\
+---@class Plain
+local Plain = {}
+
+---@deprecated
+function Plain:legacy() end
+
+---@async
+function Plain:fetch() end
+
+---@param n number
+function Plain:resize(n) end
+";
+
+#[test]
+fn carrier_without_index_link_resolves_its_methods() {
+    // Before #33's residue fix this was `LB0306`: the instance shape reached
+    // its carrier only through an explicit `__index`, so the class the author
+    // declared appeared to have no members at all.
+    let src = format!(
+        "{NO_INDEX_CARRIER}
+---@type Plain
+local p
+p:resize(1)
+"
+    );
+    assert_eq!(strict_codes_ambient(&src), Vec::<String>::new());
+}
+
+#[test]
+fn carrier_without_index_link_still_reports_a_real_undefined_field() {
+    // The fall-through only *adds* resolutions: a member neither the
+    // declaration nor the carrier has is still a provable undefined field.
+    let src = format!(
+        "{NO_INDEX_CARRIER}
+---@type Plain
+local p
+p:nonexistent()
+"
+    );
+    assert_eq!(strict_codes_ambient(&src), vec!["LB0306"]);
+}
+
+#[test]
+fn carrier_without_index_link_surfaces_deprecated_at_a_method_call() {
+    let src = format!(
+        "{NO_INDEX_CARRIER}
+---@type Plain
+local p
+p:legacy()
+"
+    );
+    assert_eq!(strict_codes_ambient(&src), vec!["LB0308"]);
+}
+
+#[test]
+fn carrier_without_index_link_surfaces_async_at_a_method_call() {
+    let src = format!(
+        "{NO_INDEX_CARRIER}
+---@type Plain
+local p
+local function sync()
+  p:fetch()
+end
+"
+    );
+    assert_eq!(strict_codes_ambient(&src), vec!["LB0316"]);
+}
+
+#[test]
+fn carrier_without_index_link_checks_arguments_for_a_declared_class() {
+    // The receiver still resolves to a declared `---@class`, so arguments are
+    // authoritative exactly as they are through an `__index` chain.
+    let src = format!(
+        "{NO_INDEX_CARRIER}
+---@type Plain
+local p
+p:resize(\"nope\")
+"
+    );
+    assert_eq!(strict_codes_ambient(&src), vec!["LB0300"]);
+}
+
+#[test]
+fn carrier_without_index_link_resolves_through_a_constructor_return() {
+    // The `---@return Plain` route reaches the same instance shape.
+    let src = format!(
+        "{NO_INDEX_CARRIER}
+---@return Plain
+local function make() end
+
+local function use()
+  local p = make()
+  p:legacy()
+  p:fetch()
+end
+"
+    );
+    assert_eq!(strict_codes_ambient(&src), vec!["LB0308", "LB0316"]);
+}
+
+#[test]
+fn carrier_without_index_link_resolves_a_self_call() {
+    let src = format!(
+        "{NO_INDEX_CARRIER}
+function Plain:go()
+  self:legacy()
+  self:resize(\"nope\")
+end
+"
+    );
+    assert_eq!(strict_codes_ambient(&src), vec!["LB0308", "LB0300"]);
+}

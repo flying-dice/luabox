@@ -16,11 +16,16 @@
 //!   directory are excluded by both.
 //! * **Which types** — [`resolve_project_defs`] and [`resolve_dep_defs`]
 //!   locate the `*.d.lua` ambient definition files the project and its direct
-//!   dependencies contribute (#108, the luals `workspace.library` model).
+//!   dependencies contribute (#108, the luals `workspace.library` model), and
+//!   [`collect_rock_sources`] enumerates the *installed rock sources* of a
+//!   luarocks tree whose LuaCATS annotations Semantics harvests for their
+//!   type surfaces (#30).
 //!
 //! Layout is classification by *path*: Distribution never parses syntax
 //! (SPEC.md §16), so nothing here reads a Lua file's contents to decide what
-//! it is. Diagnostics are the frontend's job too — an unresolvable `[types]
+//! it is — [`collect_rock_sources`] hands every rock source's text back
+//! unjudged, and whether a given one carries usable annotations is Semantics'
+//! call. Diagnostics are the frontend's job too — an unresolvable `[types]
 //! defs` entry comes back as a name, not an `LB1002`.
 
 use std::ffi::OsStr;
@@ -207,6 +212,32 @@ pub fn is_project_source(path: &Path, root: &Path, out_dir: Option<&Path>) -> bo
         && is_in_project_tree(path, root, out_dir)
 }
 
+/// Whether `path` is a vendored rock source the toolchain *reads*: a `.lua`
+/// file under the project's own `lua_modules/share/lua/<X.Y>/` tree — the
+/// path-level form of what [`collect_rock_sources`] walks for the type
+/// harvest (#30).
+///
+/// Any version directory counts, not just the one the manifest currently
+/// selects: the caller that needs this rule (`luabox check --watch`) cannot
+/// know the manifest's answer without re-reading it, and a rerun is exactly
+/// how it finds out. Only the project root's own tree qualifies — a nested
+/// `lua_modules/` inside a rock is never read, matching the harvest.
+#[must_use]
+pub fn is_rock_source(path: &Path, root: &Path) -> bool {
+    if path.extension().and_then(OsStr::to_str) != Some("lua") {
+        return false;
+    }
+    let Ok(rel) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut parts = rel.components();
+    parts.next() == Some(Component::Normal(OsStr::new(VENDOR_DIR)))
+        && parts.next() == Some(Component::Normal(OsStr::new("share")))
+        && parts.next() == Some(Component::Normal(OsStr::new("lua")))
+        && matches!(parts.next(), Some(Component::Normal(_)))
+        && parts.next().is_some()
+}
+
 /// All project-source `*.lua` files under `root` ([`is_project_source`]), in
 /// deterministic order — entries sorted by file name at each directory level,
 /// walked depth-first.
@@ -368,6 +399,14 @@ fn load_defs_package(
     if dir.is_dir() {
         let mut files = Vec::new();
         collect_d_lua(&dir, &mut files);
+        // Deliberately `PathBuf`'s component-wise `Ord` — the *opposite* rule
+        // to the raw-byte sort its sibling rock walk uses (`collect_rock_
+        // sources`), and safe here for the reason that one is not: `defs/` is
+        // never listed by `resolve_candidates`, so there is no `require`
+        // resolution order for this order to contradict. All it has to be is
+        // deterministic, and `load_defs_package` is the single shared
+        // consumer for both front-ends, so `check` and the server pick the
+        // same `LB0307` winner. Do not "fix" this one to match the other.
         files.sort();
         for file in files {
             if let Ok(text) = fs::read_to_string(&file) {
@@ -389,17 +428,168 @@ fn dep_def_label(dep_name: &str, file: &Path, dep_root: &Path) -> String {
     format!("{dep_name}/{}", display_rel(file, dep_root))
 }
 
+// ---------------------------------------------------------------------
+// Installed rock sources (the luarocks-tree type harvest, #30)
+// ---------------------------------------------------------------------
+
+/// One Lua source file installed in a luarocks tree, as the type harvest sees
+/// it (#30).
+///
+/// Not a [`DefSource`]: a def file is an ambient `---@meta` *declaration*
+/// package named by a manifest, while this is ordinary vendored code that also
+/// happens to carry annotations, and it answers to a `require` name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RockSource {
+    /// The dotted `require` name this file answers to — its path under the
+    /// version directory, `/` → `.`, with a trailing `init` dropped
+    /// (`pl/tablex.lua` → `pl.tablex`, `pl/init.lua` → `pl`), i.e. the name
+    /// `luabox_bundle::resolve_module` maps back to this same file.
+    pub module: String,
+    /// How diagnostics and debug notes name this file: its root-relative
+    /// path, forward-slashed.
+    pub label: String,
+    /// The file on disk — the identity a resolved `require` is matched against.
+    pub path: PathBuf,
+    /// The file's contents, handed back unjudged (see the module docs).
+    pub text: String,
+}
+
+/// The `lua_modules/share/lua/<version_dir>/` directory a luarocks tree
+/// installs pure-Lua modules into — where `require` resolution looks
+/// (`luabox_bundle::resolve_candidates`) and therefore where the type harvest
+/// reads. `version_dir` is `luabox_bundle::rocks_version_dir`'s answer for the
+/// dialect in play (`"5.4"`, `"5.1"` for LuaJIT).
+#[must_use]
+pub fn rock_tree_dir(root: &Path, version_dir: &str) -> PathBuf {
+    root.join(VENDOR_DIR)
+        .join("share")
+        .join("lua")
+        .join(version_dir)
+}
+
+/// Every `*.lua` file installed under [`rock_tree_dir`], read, in the order
+/// `require` would try them — the collision-winner order for the type harvest
+/// (#30). See the sort inside for why that is not `Vec<PathBuf>::sort`.
+///
+/// Empty when the project has no luarocks tree for this version directory,
+/// which is the scope guard: the harvest requires the versioned
+/// `share/lua/<X.Y>/` layout, and the flat `lua_modules/<name>/` layout keeps
+/// its existing `[dependencies]` + `[types] defs` path untouched.
+///
+/// Nothing here fails: an unreadable directory or file simply contributes
+/// nothing. A vendored tree is not the project's code, and a permissions
+/// problem inside it must never turn into a diagnostic about the project.
+#[must_use]
+pub fn collect_rock_sources(root: &Path, version_dir: &str) -> Vec<RockSource> {
+    let base = rock_tree_dir(root, version_dir);
+    if !base.is_dir() {
+        return Vec::new();
+    }
+    let mut files = Vec::new();
+    collect_rock_lua(&base, &mut files);
+    // Ordered by the paths' raw bytes, NOT by `Path`'s own `Ord`.
+    //
+    // This order is a contract, not a tidiness: the harvest is first-wins per
+    // module name (`luabox_types::RockSurfaces`), so whichever of `pl.lua` and
+    // `pl/init.lua` comes first here is the file the editor calls `pl` — and
+    // `luabox_bundle::resolve_candidates` tries the flat `<rel>.lua` BEFORE
+    // `<rel>/init.lua`, which is the file `luabox check` calls `pl`. The two
+    // must agree or the same source gets opposite verdicts in CI and in the
+    // editor (Shockwave round 3 measured exactly that).
+    //
+    // `Path: Ord` compares component-wise, so it ranks `pl` against `pl.lua`
+    // and puts the DIRECTORY first — inverting the contract. Byte order gets
+    // it right for free and on every platform: the separator is `/` (0x2F) on
+    // Unix and `\` (0x5C) on Windows, both above `.` (0x2E), so `pl.lua`
+    // precedes `pl<sep>init.lua` either way. `OsStr: Ord` is that byte
+    // comparison, and needs no lossy `String` round-trip to reach it.
+    files.sort_by(|a, b| a.as_os_str().cmp(b.as_os_str()));
+    files
+        .into_iter()
+        .filter_map(|path| {
+            let module = rock_module_name(&path, &base)?;
+            let text = fs::read_to_string(&path).ok()?;
+            Some(RockSource {
+                module,
+                label: display_rel(&path, root),
+                path,
+                text,
+            })
+        })
+        .collect()
+}
+
+/// Collect every `*.lua` file under `dir`, recursively. Unlike
+/// [`collect_d_lua`] this takes *all* Lua files: a rock's annotations live in
+/// its ordinary sources, which is the whole point of #30.
+///
+/// Symlinked directories are NOT descended ([`is_real_dir`]): a rock tree is
+/// third-party content walked unconditionally on every `check`/`lint`/
+/// `build`, and a link back up the tree (`pkg/up -> ..`) would otherwise
+/// recurse until the accumulated path tripped `ENAMETOOLONG` — termination by
+/// filesystem accident rather than by design. A symlinked *file* is still
+/// taken: only the cycle vector is closed.
+fn collect_rock_lua(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if is_real_dir(&entry) {
+            collect_rock_lua(&path, out);
+        } else if path.extension().and_then(OsStr::to_str) == Some("lua") {
+            out.push(path);
+        }
+    }
+}
+
+/// True for a directory entry that is a directory in its own right — not a
+/// symlink to one. `Path::is_dir()` follows links; `entry.file_type()` is the
+/// symlink-aware (and cheaper — no extra stat) test the walks above need to
+/// stay cycle-free without a visited set.
+fn is_real_dir(entry: &fs::DirEntry) -> bool {
+    entry.file_type().is_ok_and(|kind| kind.is_dir())
+}
+
+/// The dotted `require` name a rock source answers to: its path relative to
+/// the version directory `base`, without the `.lua` extension, `/` → `.`, and
+/// with a trailing `init` segment dropped (`pl/init.lua` → `pl`) — the inverse
+/// of `luabox_bundle::resolve_candidates`' luarocks-tree mapping.
+///
+/// `None` for a path outside `base` or one whose components are not UTF-8: a
+/// name that cannot be spelled cannot be `require`d either.
+fn rock_module_name(path: &Path, base: &Path) -> Option<String> {
+    let rel = path.strip_prefix(base).ok()?;
+    let mut segments: Vec<&str> = Vec::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(name) => segments.push(name.to_str()?),
+            _ => return None,
+        }
+    }
+    let last = segments.pop()?;
+    let stem = last.strip_suffix(".lua")?;
+    // `pl/init.lua` is `require "pl"`; a bare `init.lua` at the tree root has
+    // no parent to name it, so it keeps its own.
+    let names_its_parent = stem == "init" && !segments.is_empty();
+    if !names_its_parent {
+        segments.push(stem);
+    }
+    Some(segments.join("."))
+}
+
 /// Collect every `*.d.lua` file under `dir`, recursively. An unreadable
 /// directory contributes nothing rather than failing: definition packages are
 /// an additive layer, and a missing one is already reported by its caller as
-/// an unresolved name.
+/// an unresolved name. Symlinked directories are not descended — same cycle
+/// guard as [`collect_rock_lua`], same rationale.
 pub fn collect_d_lua(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        if is_real_dir(&entry) {
             collect_d_lua(&path, out);
         } else if is_def_file(&path) {
             out.push(path);
@@ -1019,6 +1209,234 @@ edition = \"5.4\"
     fn dep_def_label_falls_back_to_the_whole_path_when_it_is_not_under_the_dep_root() {
         let label = dep_def_label("dep", Path::new("/elsewhere/x.d.lua"), Path::new("/root"));
         assert_eq!(label, "dep//elsewhere/x.d.lua");
+    }
+
+    // --- installed rock sources (#30) -------------------------------------
+
+    #[test]
+    fn rock_tree_dir_names_the_versioned_share_directory() {
+        assert_eq!(
+            rock_tree_dir(Path::new("/proj"), "5.4"),
+            Path::new("/proj/lua_modules/share/lua/5.4")
+        );
+    }
+
+    #[test]
+    fn collect_rock_sources_yields_module_names_labels_and_text_in_require_candidate_order() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/pl/tablex.lua",
+            "---@meta-ish\nreturn 1\n",
+        );
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/pl/init.lua",
+            "return 2\n",
+        );
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/inifile.lua",
+            "return 3\n",
+        );
+
+        let rocks = collect_rock_sources(tmp.path(), "5.4");
+        let named: Vec<(&str, &str)> = rocks
+            .iter()
+            .map(|r| (r.module.as_str(), r.label.as_str()))
+            .collect();
+        // Byte-sorted — the deterministic first-wins order the harvest relies
+        // on, and the order `resolve_candidates` tries.
+        assert_eq!(
+            named,
+            [
+                ("inifile", "lua_modules/share/lua/5.4/inifile.lua"),
+                ("pl", "lua_modules/share/lua/5.4/pl/init.lua"),
+                ("pl.tablex", "lua_modules/share/lua/5.4/pl/tablex.lua"),
+            ]
+        );
+        assert_eq!(rocks[0].text, "return 3\n");
+        assert_eq!(
+            rocks[0].path,
+            tmp.path().join("lua_modules/share/lua/5.4/inifile.lua")
+        );
+    }
+
+    /// The collision the whole sort exists for (Shockwave round 3).
+    ///
+    /// `pl.lua` and `pl/init.lua` both answer to the module `pl`, and the
+    /// harvest is first-wins, so whichever comes back first here is the file
+    /// the editor calls `pl`. `luabox_bundle::resolve_candidates` tries the
+    /// flat `<rel>.lua` first, which is the file `luabox check` calls `pl`.
+    /// `Vec<PathBuf>::sort` ranked the DIRECTORY first (`Path: Ord` is
+    /// component-wise, and `pl` < `pl.lua`), so `check` and the LSP resolved
+    /// the same `require` to different files and gave opposite verdicts on the
+    /// same source.
+    ///
+    /// The older test above never caught it: its tree has no flat `pl.lua` to
+    /// collide with `pl/init.lua`.
+    #[test]
+    fn a_flat_module_beats_its_init_form_the_way_require_would() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/pl/init.lua",
+            "return \"init\"\n",
+        );
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/pl.lua",
+            "return \"flat\"\n",
+        );
+        // A second collision one level down, so the rule is shown to be about
+        // the `<rel>.lua` / `<rel>/init.lua` pair, not about the tree root.
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/pl/tablex/init.lua",
+            "return \"deep-init\"\n",
+        );
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/pl/tablex.lua",
+            "return \"deep-flat\"\n",
+        );
+
+        let rocks = collect_rock_sources(tmp.path(), "5.4");
+        // Every module named, in order: the flat form of each colliding pair
+        // comes first, so first-wins picks it.
+        let named: Vec<(&str, &str)> = rocks
+            .iter()
+            .map(|r| (r.module.as_str(), r.text.trim()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("pl", "return \"flat\""),
+                ("pl", "return \"init\""),
+                ("pl.tablex", "return \"deep-flat\""),
+                ("pl.tablex", "return \"deep-init\""),
+            ]
+        );
+    }
+
+    /// A symlink cycle in a rock tree (`pkg/up -> ..`) must be a non-event:
+    /// the walk skips symlinked directories by design, not by running the
+    /// path into `ENAMETOOLONG`. A symlinked *file* is still harvested.
+    #[cfg(unix)]
+    #[test]
+    fn collect_rock_sources_does_not_descend_symlinked_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/pkg/real.lua",
+            "---@class pkg.T\nreturn 1\n",
+        );
+        write(tmp.path(), "elsewhere/linked.lua", "return 2\n");
+        let pkg = tmp.path().join("lua_modules/share/lua/5.4/pkg");
+        // The cycle: pkg/up -> the version dir's parent.
+        std::os::unix::fs::symlink("..", pkg.join("up")).expect("symlink dir");
+        // A symlinked file, which must still be taken.
+        std::os::unix::fs::symlink(
+            tmp.path().join("elsewhere/linked.lua"),
+            pkg.join("alias.lua"),
+        )
+        .expect("symlink file");
+
+        let rocks = collect_rock_sources(tmp.path(), "5.4");
+        let modules: Vec<&str> = rocks.iter().map(|r| r.module.as_str()).collect();
+        assert_eq!(
+            modules,
+            ["pkg.alias", "pkg.real"],
+            "the cycle contributes nothing, the linked file still counts"
+        );
+    }
+
+    /// Same guard on the defs walk — `collect_d_lua` shares the shape.
+    #[cfg(unix)]
+    #[test]
+    fn collect_d_lua_does_not_descend_symlinked_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "defs/real.d.lua", "---@meta\n");
+        std::os::unix::fs::symlink("..", tmp.path().join("defs/up")).expect("symlink");
+
+        let mut out = Vec::new();
+        collect_d_lua(&tmp.path().join("defs"), &mut out);
+        assert_eq!(out.len(), 1, "one real def file, no cycle traversal");
+    }
+
+    #[test]
+    fn collect_rock_sources_is_empty_without_a_versioned_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // The flat layout keeps its existing defs-based path: no harvest.
+        write(tmp.path(), "lua_modules/pkg/src/init.lua", "return 1\n");
+        // …and so does a tree installed for another interpreter version.
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.1/legacy.lua",
+            "return 1\n",
+        );
+        assert!(collect_rock_sources(tmp.path(), "5.4").is_empty());
+    }
+
+    #[test]
+    fn collect_rock_sources_ignores_non_lua_files_and_c_modules() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "lua_modules/share/lua/5.4/ok.lua", "return 1\n");
+        write(tmp.path(), "lua_modules/share/lua/5.4/README.md", "hi\n");
+        write(tmp.path(), "lua_modules/lib/lua/5.4/lfs.so", "binary\n");
+        write(
+            tmp.path(),
+            "lua_modules/lib/luarocks/rocks-5.4/pl/spec.lua",
+            "return 1\n",
+        );
+
+        let modules: Vec<String> = collect_rock_sources(tmp.path(), "5.4")
+            .into_iter()
+            .map(|r| r.module)
+            .collect();
+        assert_eq!(modules, ["ok"]);
+    }
+
+    #[test]
+    fn collect_rock_sources_takes_a_deeply_nested_module() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/a/b/c/d.lua",
+            "return 1\n",
+        );
+        let rocks = collect_rock_sources(tmp.path(), "5.4");
+        assert_eq!(rocks.len(), 1);
+        assert_eq!(rocks[0].module, "a.b.c.d");
+    }
+
+    #[test]
+    fn a_bare_init_lua_at_the_tree_root_keeps_its_own_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/init.lua",
+            "return 1\n",
+        );
+        let rocks = collect_rock_sources(tmp.path(), "5.4");
+        // Nothing to name it after — the `init` drop needs a parent segment.
+        assert_eq!(rocks[0].module, "init");
+    }
+
+    #[test]
+    fn rock_module_name_rejects_a_path_outside_the_tree_or_a_non_lua_file() {
+        let base = Path::new("/proj/lua_modules/share/lua/5.4");
+        assert!(rock_module_name(Path::new("/elsewhere/x.lua"), base).is_none());
+        assert!(rock_module_name(&base.join("notes.txt"), base).is_none());
+        // The base itself has no trailing file segment to name.
+        assert!(rock_module_name(base, base).is_none());
+    }
+
+    #[test]
+    fn collect_rock_lua_on_a_missing_directory_yields_nothing() {
+        let mut found = Vec::new();
+        collect_rock_lua(Path::new("no-such-rock-tree-xyzzy"), &mut found);
+        assert!(found.is_empty());
     }
 
     #[test]

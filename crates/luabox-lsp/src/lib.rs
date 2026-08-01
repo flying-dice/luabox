@@ -107,5 +107,5 @@ mod symbols;
 mod uri;
 
 pub use line_index::LineIndex;
-pub use server::{run, run_stdio};
+pub use server::{PINNED_STACK_BYTES, run, run_stdio};
 pub use uri::{path_to_uri, uri_to_path};

@@ -15,6 +15,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// Blocks `2xxx` and above are unassigned and reserved for later contexts
 /// (types, lint, lowering, resolver, ...). Internally the code is stored as a
 /// number so its rendering (`LB{:04}`) is always canonical.
+///
+/// Inside block `0` the hundreds are subdivided by producer — `03xx`
+/// typecheck, `05xx` lint, `06xx` lowering. Only one of those subdivisions is
+/// load-bearing outside the registry (consumers branch on it), and it has a
+/// predicate rather than open-coded arithmetic: see [`Code::is_lint`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Code(u16);
 
@@ -45,6 +50,62 @@ impl Code {
     pub const fn number(self) -> u16 {
         self.0
     }
+
+    /// Whether this code sits in the lint band — **the** authority on that
+    /// question, so nobody has to open-code `number() / 100 == 5`.
+    ///
+    /// # The band contract
+    ///
+    /// `LB0500`-`LB0599` belongs to `luabox-lint` and to nothing else:
+    ///
+    /// - `LB0500` is the crate's own suppression-syntax diagnostic (a
+    ///   malformed `---@luabox-ignore`). It is not a rule: it has no tier and
+    ///   no id, and it cannot be suppressed.
+    /// - `LB0501`+ are the rule codes, one per entry in `luabox_lint::rules`.
+    ///
+    /// The invariant that every rule's code lands in this band is asserted in
+    /// `luabox-lint`, where the registry lives; this crate cannot see the rule
+    /// set, so it asserts only the half it owns — that the band is allocated
+    /// densely from [`Code::LINT_BAND_START`].
+    ///
+    /// Consumers use it to decide provenance rather than meaning: the language
+    /// server tags findings in this band with the `luabox-lint` source, which
+    /// is what its quick-fix matcher keys off. The control-flow legality
+    /// errors (`LB0020`-`LB0022`) travel through the same lint engine and are
+    /// deliberately *not* in the band — they are not rules. Neither is the
+    /// next band up: `LB06xx` is lowering's, and already allocated.
+    ///
+    /// Do **not** build a band test on [`Code::block`]: that is the leading
+    /// digit of a four-digit code, so it is `0` for every `LB0xxx` and cannot
+    /// tell a lint code from a syntax one.
+    #[must_use]
+    pub const fn is_lint(self) -> bool {
+        self.0 >= Self::LINT_BAND_START && self.0 <= Self::LINT_BAND_END
+    }
+
+    /// Whether this code is a lint **rule** code — in the band
+    /// ([`Code::is_lint`]) and not [`Code::LINT_BAND_START`] itself.
+    ///
+    /// The distinction is small but real, and it is why there are two
+    /// predicates rather than one: `LB0500` is `luabox-lint`'s own
+    /// suppression-syntax diagnostic. It is in the band (the language server
+    /// tags it with the lint source, because the lint crate is where it comes
+    /// from) but it is not a rule — it has no tier, no id, no
+    /// `---@luabox-ignore` spelling, and no fix. Anything reasoning about
+    /// *rules* wants this predicate: the registry invariant in `luabox-lint`,
+    /// and with it the "only rules carry fixes" contract the editor's
+    /// quick-fix matcher rests on.
+    #[must_use]
+    pub const fn is_lint_rule(self) -> bool {
+        self.is_lint() && self.0 != Self::LINT_BAND_START
+    }
+
+    /// First code of the lint band — `LB0500`, the suppression-syntax
+    /// diagnostic. Rule codes start one above it. See [`Code::is_lint`].
+    pub const LINT_BAND_START: u16 = 500;
+    /// Last code of the lint band — see [`Code::is_lint`]. `LB0600` and up
+    /// belong to lowering.
+    pub const LINT_BAND_END: u16 = 599;
 }
 
 impl fmt::Display for Code {
@@ -197,6 +258,45 @@ mod tests {
     fn deserializing_a_malformed_code_is_an_error_not_a_panic() {
         let err = serde_json::from_str::<Code>("\"LB1\"").unwrap_err();
         assert!(err.to_string().contains("LB0300"), "{err}");
+    }
+
+    #[test]
+    fn the_lint_band_is_exactly_500_to_599() {
+        assert!(!Code::new(499).is_lint());
+        assert!(Code::new(500).is_lint(), "LB0500 is the lint crate's own");
+        assert!(Code::new(509).is_lint());
+        assert!(Code::new(599).is_lint());
+        assert!(!Code::new(600).is_lint(), "LB0601 is lowering, not lint");
+        assert!(
+            !Code::new(20).is_lint(),
+            "control-flow legality is not lint"
+        );
+        assert!(!Code::new(316).is_lint(), "typecheck is not lint");
+        assert!(!Code::new(1004).is_lint(), "manifest is not lint");
+    }
+
+    #[test]
+    fn a_rule_code_is_in_the_band_but_is_never_lb0500() {
+        assert!(!Code::new(500).is_lint_rule(), "LB0500 is not a rule");
+        assert!(Code::new(501).is_lint_rule());
+        assert!(Code::new(510).is_lint_rule());
+        assert!(Code::new(599).is_lint_rule());
+        assert!(!Code::new(499).is_lint_rule());
+        assert!(!Code::new(600).is_lint_rule());
+        // Every rule code is a band code; only the converse differs.
+        for n in 0..=Code::MAX {
+            let code = Code::new(n);
+            assert!(!code.is_lint_rule() || code.is_lint(), "{code}");
+        }
+    }
+
+    /// `block` is the leading digit of a four-digit code, so it cannot stand
+    /// in for the band predicates — the pitfall the doc comment warns about.
+    #[test]
+    fn block_cannot_stand_in_for_the_lint_band() {
+        assert_eq!(Code::new(1).block(), Code::new(510).block());
+        assert!(!Code::new(1).is_lint());
+        assert!(Code::new(510).is_lint());
     }
 
     #[test]

@@ -42,6 +42,7 @@ Feature: Diagnostic explain pages — luabox explain
       | LB0506 | string concatenation in a loop (concat-in-loop)                  |
       | LB0507 | `pairs` on an array (pairs-on-array)                             |
       | LB0508 | empty `if ... then` body (empty-then)                            |
+      | LB0510 | metatable carrier with no `__index` (metatable-without-index)    |
       | LB0601 | irreducible `goto`                                               |
       | LB0603 | `<close>` lowering fidelity                                      |
       | LB0606 | integer/float divergence on lowering                             |

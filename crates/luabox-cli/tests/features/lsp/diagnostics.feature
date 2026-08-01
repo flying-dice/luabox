@@ -118,6 +118,35 @@ Feature: luabox lsp — published diagnostics
     And diagnostic LB0501 in "main.lua" comes from "luabox-lint"
     And diagnostic LB0501 in "main.lua" spans 0:6 to 0:12
 
+  Scenario: control-flow legality is published as an error, not as a lint (#44)
+    Given a project with edition "5.4"
+    And a file "main.lua" containing:
+      """
+      local function f()
+        goto nowhere
+      end
+      return f
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the diagnostics for "main.lua" include LB0020
+    And diagnostic LB0020 in "main.lua" is an error
+    And diagnostic LB0020 in "main.lua" comes from "luabox"
+    And diagnostic LB0020 in "main.lua" spans 1:7 to 1:14
+
+  Scenario: `break` outside a loop is published in the editor too
+    Given a project with edition "5.4"
+    And a file "main.lua" containing:
+      """
+      for i = 1, 3 do end
+      break
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the diagnostics for "main.lua" include LB0022
+    And diagnostic LB0022 in "main.lua" is an error
+    And diagnostic LB0022 in "main.lua" comes from "luabox"
+
   Scenario: a luabox-ignore comment suppresses the lint finding in the editor
     Given a project with edition "5.4"
     And a file "main.lua" containing:
@@ -178,3 +207,154 @@ Feature: luabox lsp — published diagnostics
     When I open "main.lua"
     Then the server logged nothing containing "unknown lint rule id"
     And the diagnostics for "main.lua" do not include LB0501
+
+  Scenario: a carrier-style method in a defs file resolves in the editor too (#39)
+    # Diagnostics flow through the same seam as `luabox check`, so the defs
+    # surface an editor sees is the surface the CLI checks: no phantom
+    # `undefined field`, and the method's own tag still publishes.
+    Given a file "defs/game.d.lua" containing:
+      """
+      ---@meta
+
+      ---@class Widget
+      local Widget = {}
+
+      ---@deprecated
+      ---@param n integer
+      function Widget:render(n) end
+      """
+    And a file "luabox.toml" containing:
+      """
+      [package]
+      name = "fixture"
+      version = "0.1.0"
+      edition = "5.4"
+
+      [types]
+      strict = true
+      defs = ["game"]
+      """
+    And a file "main.lua" containing:
+      """
+      ---@param w Widget
+      local function use(w)
+        w:render(1)
+      end
+      return use
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the diagnostics for "main.lua" do not include LB0306
+    And the diagnostics for "main.lua" include LB0308
+
+  # --- types from a bare luarocks tree (#30, decisions/09) ---------------
+  # The server harvests the installed rock sources' LuaCATS surfaces at
+  # startup, so a rock's classes and module return types resolve in the
+  # editor exactly as they do under `luabox check` — with no manifest
+  # declaration at all. Vendored bodies are still never checked.
+
+  Scenario: a rock class from a bare lua_modules tree resolves in the editor
+    Given a strict project with edition "5.4"
+    And a file "lua_modules/share/lua/5.4/mylib/init.lua" containing:
+      """
+      ---@class mylib.Point
+      ---@field x number
+      ---@field y number
+
+      local M = {}
+
+      ---@param x number
+      ---@param y number
+      ---@return mylib.Point
+      function M.point(x, y)
+        return { x = x, y = y }
+      end
+
+      return M
+      """
+    And a file "main.lua" containing:
+      """
+      ---@type mylib.Point
+      local p = { x = 1, y = 2 }
+      return p
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the diagnostics for "main.lua" are empty
+
+  Scenario: a rock module's return type reaches the editor's use site
+    Given a strict project with edition "5.4"
+    And a file "lua_modules/share/lua/5.4/mylib/init.lua" containing:
+      """
+      ---@class mylib.Point
+      ---@field x number
+      ---@field y number
+
+      local M = {}
+
+      ---@param x number
+      ---@param y number
+      ---@return mylib.Point
+      function M.point(x, y)
+        return { x = x, y = y }
+      end
+
+      return M
+      """
+    And a file "main.lua" containing:
+      """
+      local mylib = require("mylib")
+      local p = mylib.point(1, 2)
+      return p.nope
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the diagnostics for "main.lua" include LB0306
+
+  Scenario: a rock source that does not parse publishes nothing
+    Given a strict project with edition "5.4"
+    And a file "lua_modules/share/lua/5.4/broken/init.lua" containing:
+      """
+      ---@class broken.Thing
+      local = = =
+      """
+    And a file "main.lua" containing:
+      """
+      return 1
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the diagnostics for "main.lua" are empty
+
+  # Shockwave round 3: `pl.lua` and `pl/init.lua` both answer to the module
+  # `pl`, and the two frontends key the harvest differently — `luabox check`
+  # by path, the server by module name. They agree only if the rock walk hands
+  # files back in `require`-candidate order (flat `<rel>.lua` first). It did
+  # not: `Vec<PathBuf>::sort` is component-wise and put the directory first,
+  # so the SAME source got opposite verdicts in CI and in the editor. The
+  # `luabox check` half of this pair lives in
+  # `features/frontend/luarocks-tree.feature`.
+  Scenario: a flat rock module beats its init form, the way `require` resolves it
+    Given a strict project with edition "5.4"
+    And a file "lua_modules/share/lua/5.4/pl.lua" containing:
+      """
+      ---@type number
+      local flat = 1
+      return flat
+      """
+    And a file "lua_modules/share/lua/5.4/pl/init.lua" containing:
+      """
+      ---@type string
+      local init = "s"
+      return init
+      """
+    And a file "main.lua" containing:
+      """
+      local pl = require("pl")
+      ---@param s string
+      local function want(s) return s end
+      return want(pl)
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the diagnostics for "main.lua" include LB0300
