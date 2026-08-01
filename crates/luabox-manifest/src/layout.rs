@@ -433,8 +433,9 @@ pub fn rock_tree_dir(root: &Path, version_dir: &str) -> PathBuf {
         .join(version_dir)
 }
 
-/// Every `*.lua` file installed under [`rock_tree_dir`], read, in path-sorted
-/// order — the deterministic collision-winner order for the type harvest (#30).
+/// Every `*.lua` file installed under [`rock_tree_dir`], read, in the order
+/// `require` would try them — the collision-winner order for the type harvest
+/// (#30). See the sort inside for why that is not `Vec<PathBuf>::sort`.
 ///
 /// Empty when the project has no luarocks tree for this version directory,
 /// which is the scope guard: the harvest requires the versioned
@@ -452,7 +453,23 @@ pub fn collect_rock_sources(root: &Path, version_dir: &str) -> Vec<RockSource> {
     }
     let mut files = Vec::new();
     collect_rock_lua(&base, &mut files);
-    files.sort();
+    // Ordered by the paths' raw bytes, NOT by `Path`'s own `Ord`.
+    //
+    // This order is a contract, not a tidiness: the harvest is first-wins per
+    // module name (`luabox_types::RockSurfaces`), so whichever of `pl.lua` and
+    // `pl/init.lua` comes first here is the file the editor calls `pl` — and
+    // `luabox_bundle::resolve_candidates` tries the flat `<rel>.lua` BEFORE
+    // `<rel>/init.lua`, which is the file `luabox check` calls `pl`. The two
+    // must agree or the same source gets opposite verdicts in CI and in the
+    // editor (Shockwave round 3 measured exactly that).
+    //
+    // `Path: Ord` compares component-wise, so it ranks `pl` against `pl.lua`
+    // and puts the DIRECTORY first — inverting the contract. Byte order gets
+    // it right for free and on every platform: the separator is `/` (0x2F) on
+    // Unix and `\` (0x5C) on Windows, both above `.` (0x2E), so `pl.lua`
+    // precedes `pl<sep>init.lua` either way. `OsStr: Ord` is that byte
+    // comparison, and needs no lossy `String` round-trip to reach it.
+    files.sort_by(|a, b| a.as_os_str().cmp(b.as_os_str()));
     files
         .into_iter()
         .filter_map(|path| {
@@ -1194,7 +1211,8 @@ edition = \"5.4\"
             .iter()
             .map(|r| (r.module.as_str(), r.label.as_str()))
             .collect();
-        // Path-sorted — the deterministic first-wins order the harvest relies on.
+        // Byte-sorted — the deterministic first-wins order the harvest relies
+        // on, and the order `resolve_candidates` tries.
         assert_eq!(
             named,
             [
@@ -1207,6 +1225,63 @@ edition = \"5.4\"
         assert_eq!(
             rocks[0].path,
             tmp.path().join("lua_modules/share/lua/5.4/inifile.lua")
+        );
+    }
+
+    /// The collision the whole sort exists for (Shockwave round 3).
+    ///
+    /// `pl.lua` and `pl/init.lua` both answer to the module `pl`, and the
+    /// harvest is first-wins, so whichever comes back first here is the file
+    /// the editor calls `pl`. `luabox_bundle::resolve_candidates` tries the
+    /// flat `<rel>.lua` first, which is the file `luabox check` calls `pl`.
+    /// `Vec<PathBuf>::sort` ranked the DIRECTORY first (`Path: Ord` is
+    /// component-wise, and `pl` < `pl.lua`), so `check` and the LSP resolved
+    /// the same `require` to different files and gave opposite verdicts on the
+    /// same source.
+    ///
+    /// The older test above never caught it: its tree has no flat `pl.lua` to
+    /// collide with `pl/init.lua`.
+    #[test]
+    fn a_flat_module_beats_its_init_form_the_way_require_would() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/pl/init.lua",
+            "return \"init\"\n",
+        );
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/pl.lua",
+            "return \"flat\"\n",
+        );
+        // A second collision one level down, so the rule is shown to be about
+        // the `<rel>.lua` / `<rel>/init.lua` pair, not about the tree root.
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/pl/tablex/init.lua",
+            "return \"deep-init\"\n",
+        );
+        write(
+            tmp.path(),
+            "lua_modules/share/lua/5.4/pl/tablex.lua",
+            "return \"deep-flat\"\n",
+        );
+
+        let rocks = collect_rock_sources(tmp.path(), "5.4");
+        // Every module named, in order: the flat form of each colliding pair
+        // comes first, so first-wins picks it.
+        let named: Vec<(&str, &str)> = rocks
+            .iter()
+            .map(|r| (r.module.as_str(), r.text.trim()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("pl", "return \"flat\""),
+                ("pl", "return \"init\""),
+                ("pl.tablex", "return \"deep-flat\""),
+                ("pl.tablex", "return \"deep-init\""),
+            ]
         );
     }
 

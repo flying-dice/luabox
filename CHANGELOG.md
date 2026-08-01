@@ -28,6 +28,23 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   file now judges control-flow legality under the target too, and refuses to
   write anything when it fails. `luabox lint` and the language server have no
   target flag and are unaffected.
+- **`luabox check` and the language server no longer disagree about which
+  file a colliding rock module name means.** A vendored tree can hold both
+  `pl.lua` and `pl/init.lua`, and both answer to `require("pl")`. The rock
+  walk sorted a `Vec<PathBuf>`, whose `Ord` is component-wise: it ranks the
+  bare component `pl` below `pl.lua` and so put the **directory** first,
+  inverting the order `require` actually resolves in. The harvest is
+  first-wins per module name, so the editor (name-keyed) called `pl` the
+  `init.lua` while `luabox check` (path-keyed, through
+  `resolve_candidates`, which tries the flat `<rel>.lua` first) called it
+  `pl.lua` — the same source got opposite verdicts in CI and in the editor.
+
+  The walk now sorts by the paths' raw bytes, which reproduces candidate
+  order on every platform (`.` = 0x2E sorts below both `/` and `\`). Pinned
+  from both ends: a `collect_rock_sources` unit test over a tree that
+  actually contains the colliding pair, and one repro fixture asserted
+  through `luabox check` and through the server.
+
 - **`goto`/label/`break` legality is diagnosed**
   ([#44](https://github.com/flying-dice/luabox/issues/44)) — three programs
   every reference Lua refuses to *load* used to pass `luabox check` and
