@@ -221,6 +221,24 @@ fn stdout_contains(world: &mut AcceptanceWorld, needle: String) {
     );
 }
 
+/// Ordering, not just presence: the merged legality passes must render in
+/// source order, whichever dialect run produced each finding (Shockwave
+/// round 4 — the target's verdict used to print before the edition's).
+#[then(expr = "stdout contains {string} before {string}")]
+fn stdout_contains_in_order(world: &mut AcceptanceWorld, first: String, second: String) {
+    let stdout = world.stdout();
+    let at_first = stdout
+        .find(&first)
+        .unwrap_or_else(|| panic!("stdout does not contain `{first}`; stdout:\n{stdout}"));
+    let at_second = stdout
+        .find(&second)
+        .unwrap_or_else(|| panic!("stdout does not contain `{second}`; stdout:\n{stdout}"));
+    assert!(
+        at_first < at_second,
+        "expected `{first}` before `{second}`; stdout:\n{stdout}"
+    );
+}
+
 // --- project fixtures (check.feature, dialect-validation.feature) --------
 
 #[given(expr = "a project with edition {string}")]

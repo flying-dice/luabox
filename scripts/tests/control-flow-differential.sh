@@ -25,6 +25,23 @@
 # edition only, so `edition = "5.2"` + `--target 5.4` accepted
 # split_label_shadow_nested.lua — which luac5.4 rejects.
 #
+# That "most permissive" claim is an INVARIANT OF THE MATRIX, and it is
+# enforced below rather than asserted here (Shockwave round 4). A future
+# program using a 5.3+ construct — `local x = 7 // 2` is the easy one — would
+# still parse under its own edition column, but under the target column it
+# would be rejected for being illegal 5.2 rather than illegal on the target.
+# The cell then reads luabox=reject / luac=accept, which this script calls
+# never-OK, and it would blame luabox for a defect in the matrix. So before
+# the columns run, every program is checked once at TARGET_COLUMN_EDITION
+# with no target: any parse error (LB0001) or edition-dialect error
+# (LB0010-LB0019) fails the script loudly, naming the program. Control-flow
+# rejections (LB0020-LB0022) are expected — half the matrix is illegal
+# programs — and are not invariant violations.
+#
+# exceptions.tsv cannot express this: it is keyed program+version, with no
+# column dimension. The fix when this fires is to change the program, or to
+# give the matrix a per-program column edition — not to except the cell.
+#
 # Versions without a luac on PATH SKIP loudly (this box may only carry
 # 5.1/5.4); CI's differential job installs 5.1-5.4 so every column runs
 # there. LuaJIT has no luac; its label semantics follow 5.2, which the 5.2
@@ -58,6 +75,37 @@ exception_for() { # $1=program $2=version -> prints reason, rc 0 if excepted
     done < "$matrix/exceptions.tsv"
     return 1
 }
+
+# --- matrix invariant: every program parses under the target column edition
+# See the header. This needs no reference compiler, so it runs even when every
+# version SKIPs, and it runs before any cell so a violation is reported once
+# rather than once per column.
+preflight="$(mktemp -d)"
+mkdir -p "$preflight/src"
+printf '[package]\nname = "cfdiff"\nversion = "0.1.0"\nedition = "%s"\n' \
+    "$TARGET_COLUMN_EDITION" > "$preflight/luabox.toml"
+violations=0
+for prog in "$matrix"/*.lua; do
+    base="$(basename "$prog" .lua)"
+    cp "$prog" "$preflight/src/main.lua"
+    out="$( (cd "$preflight" && "$luabox" check) 2>&1 )"
+    if printf '%s\n' "$out" | grep -Eq 'error\[LB0001\]|error\[LB001[0-9]\]'; then
+        echo "INVARIANT  $base does not parse cleanly at edition $TARGET_COLUMN_EDITION:" >&2
+        printf '%s\n' "$out" | grep -E 'error\[LB0001\]|error\[LB001[0-9]\]' >&2
+        violations=$((violations + 1))
+    fi
+done
+rm -rf "$preflight"
+if [ "$violations" -gt 0 ]; then
+    echo >&2
+    echo "control-flow differential: $violations matrix program(s) violate the target-column invariant." >&2
+    echo "  The target column pins edition $TARGET_COLUMN_EDITION so that only --target can move a verdict." >&2
+    echo "  A program that is not legal $TARGET_COLUMN_EDITION source makes that column measure" >&2
+    echo "  ${TARGET_COLUMN_EDITION}-legality AND target legality, and fails as luabox=reject/luac=accept —" >&2
+    echo "  blaming luabox for a defect in the matrix. Rewrite the program in $TARGET_COLUMN_EDITION," >&2
+    echo "  or give the matrix a per-program column edition. exceptions.tsv cannot express this." >&2
+    exit 1
+fi
 
 for ver in 5.1 5.2 5.3 5.4; do
     luac="luac$ver"

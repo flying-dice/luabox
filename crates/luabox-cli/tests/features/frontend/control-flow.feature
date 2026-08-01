@@ -169,10 +169,13 @@ Feature: Control-flow legality — goto / label / break (#44)
     And diagnostic LB0022 is reported
     And stdout contains exactly 1 occurrence of "error[LB0022]"
 
-  # `luabox build` runs its check gate on the *edition* only, by design:
-  # lowering exists to handle constructs the target rejects. Nothing lowers a
-  # duplicate label away, so the residual validation of the lowered output is
-  # what catches it — before anything is written.
+  # `luabox build`'s check gate runs the *edition* dialect-legality pass plus
+  # the *target*'s control-flow pass. Lowering exists to handle constructs the
+  # target's parser rejects, so those are not gated; nothing lowers a
+  # duplicate label away, so what the target's loader rejects is — against the
+  # source, which is what gives the finding its span. The residual pass over
+  # the lowered output stays as the belt-and-braces catch for anything
+  # lowering itself introduces.
   Scenario: `luabox build` refuses to emit a tree the target cannot load
     Given a file "luabox.toml" containing:
       """
@@ -189,6 +192,99 @@ Feature: Control-flow legality — goto / label / break (#44)
     Then the command fails
     And stdout contains "LB0021"
     And the file "dist/src/main.lua" does not exist
+
+  # Shockwave round 4, finding M: the build-time report used to be
+  # reconstructed from the *lowered* text and so carried no labels at all,
+  # while `check --target` gave full spans for the identical defect.
+  Scenario: `luabox build`'s duplicate-label report carries source spans
+    Given a project with edition "5.2"
+    And a Lua file containing '::a:: do ::a:: end'
+    When I run "luabox build --target 5.4"
+    Then the command fails
+    And stdout contains "duplicate label"
+    And stdout contains "first defined here"
+    And stdout contains "src/main.lua:1:12"
+
+  # Shockwave round 4, finding D: every bundle mode routed around the residual
+  # control-flow pass, so `bundle = true` and `mode = "love"` shipped a chunk
+  # `luac5.4 -p` refuses — with exit code 0. Zero bundle-mode scenarios
+  # existed, which is why it survived three rounds.
+  Scenario: bundling refuses to write a chunk the target cannot load
+    Given a project with edition "5.2" targeting "5.4" bundling
+    And a Lua file containing '::a:: do ::a:: end'
+    When I run "luabox build"
+    Then the command fails
+    And stdout contains "LB0021"
+    And the file "dist/main.lua" does not exist
+
+  Scenario: love mode refuses to write an archive the target cannot load
+    Given a project with edition "5.2" targeting "5.4" using mode "love"
+    And a Lua file containing '::a:: do ::a:: end'
+    When I run "luabox build"
+    Then the command fails
+    And stdout contains "LB0021"
+    And the file "dist/fixture.love" does not exist
+
+  # Shockwave round 4, finding E: two `LB0021`s at the same primary span are
+  # not the same finding — `repeated_label_scope` makes the first-definition
+  # site dialect-dependent — so keeping whichever pass ran first printed one
+  # line as a duplicate *and* cited it as the first definition, out of source
+  # order. The ship target's verdict wins, and the merged set is sorted.
+  Scenario: a target-dialect duplicate names one first-definition site, in source order
+    Given a project with edition "5.2"
+    And a file "src/main.lua" containing:
+      """
+      ::a::
+      do
+        ::a::
+        ::a::
+      end
+      """
+    When I run "luabox check --target 5.4"
+    Then the command fails
+    And stdout contains exactly 2 occurrence of "error[LB0021]"
+    And stdout contains "src/main.lua:3:5" before "src/main.lua:4:5"
+    And stdout contains exactly 2 occurrence of "src/main.lua:1:3"
+    And stdout contains exactly 1 occurrence of "src/main.lua:3:5"
+    And stdout contains exactly 1 occurrence of "src/main.lua:4:5"
+
+  # Shockwave round 4, finding H: `[build] target` reached the require
+  # resolver and the rock harvest but never the legality passes, so a project
+  # that *declares* it shipped 5.4 passed a check that `--target 5.4` failed.
+  Scenario: a manifest-declared ship target reaches the control-flow pass
+    Given a project with edition "5.2" targeting "5.4"
+    And a Lua file containing '::a:: do ::a:: end'
+    When I run "luabox check"
+    Then the command fails
+    And diagnostic LB0021 is reported
+
+  Scenario: the `--target` flag overrides a manifest-declared ship target
+    Given a project with edition "5.2" targeting "5.4"
+    And a Lua file containing '::a:: do ::a:: end'
+    When I run "luabox check --target 5.2"
+    Then the command succeeds
+    And zero diagnostics are reported
+
+  # A manifest ship target is a declaration that the project is *lowered*
+  # there, so it asks the loader's question and not the parser's: reporting
+  # `LB0011` on every `//` in a 5.3 project that ships 5.1 would fail
+  # `luabox check` for using the feature `[build] target` exists to provide.
+  # An explicit `--target` is the literal "would this source be legal there?"
+  # question and still asks both.
+  Scenario: a manifest ship target does not report constructs lowering rewrites
+    Given a project with edition "5.3" targeting "5.1"
+    And a Lua file containing 'local x = 7 // 2'
+    When I run "luabox check"
+    Then the command succeeds
+    And zero diagnostics are reported
+
+  Scenario: an explicit target still reports constructs lowering rewrites
+    Given a project with edition "5.3" targeting "5.1"
+    And a Lua file containing 'local x = 7 // 2'
+    When I run "luabox check --target 5.1"
+    Then the command fails
+    And diagnostic LB0011 is reported
+    And stdout contains "not legal on target 5.1"
 
   Scenario: a near-miss label name gets a did-you-mean nudge
     Given a project with edition "5.4"

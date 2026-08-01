@@ -131,7 +131,7 @@ pub fn run(cwd: &Path, opts: &BuildOptions) -> anyhow::Result<()> {
     if !do_bundle {
         // Tree mode ignores the bundle-only knobs (`entry`, `outfile`,
         // `sourcemap`, `minify`) — there is no require graph to walk.
-        check_gate(&project)?;
+        check_gate(&project, target)?;
         return emit_tree(&project, &out_dir, edition, target);
     }
 
@@ -178,7 +178,7 @@ pub fn run(cwd: &Path, opts: &BuildOptions) -> anyhow::Result<()> {
     }
 
     // Check gate, exactly as tree mode: refuse to emit on check errors.
-    check_gate(&project)?;
+    check_gate(&project, target)?;
 
     fs::create_dir_all(&out_dir)
         .with_context(|| format!("cannot create `{}`", out_dir.display()))?;
@@ -225,8 +225,20 @@ const NAMELESS_BUNDLE: &str = "bundle";
 
 /// `luabox build` runs `luabox check` first and refuses to emit while it
 /// reports errors — the same gate for both emit shapes.
-fn check_gate(project: &check_cmd::Project) -> anyhow::Result<()> {
-    if check_cmd::run_once(project, None, Format::Human).is_err() {
+///
+/// The gate runs the *edition* dialect-legality pass plus the ship target's
+/// **control-flow** legality pass, and deliberately not the target's
+/// dialect-legality pass (`TargetPasses::control_flow_only`): constructs the
+/// target's *parser* rejects are exactly what lowering exists to rewrite,
+/// while nothing lowers a duplicate label away, so a program the target's
+/// *loader* refuses must never reach an emitter. That is the same defect the
+/// residual passes catch downstream, caught here against the source — which
+/// is why `build`'s `LB0021` carries a span and a "first defined here" label
+/// rather than the spanless reconstruction the residual pass can offer
+/// (Shockwave round 4).
+fn check_gate(project: &check_cmd::Project, target: Dialect) -> anyhow::Result<()> {
+    let passes = check_cmd::TargetPasses::control_flow_only(target);
+    if check_cmd::run_gated(project, passes, Format::Human).is_err() {
         bail!("`luabox build` refuses to emit while `luabox check` reports errors");
     }
     Ok(())
@@ -726,17 +738,20 @@ mod tests {
         assert!(!tmp.path().join("dist").join("dist").exists());
     }
 
-    /// Shockwave round 2: the check gate is edition-only by design, and no
-    /// lowering rule renames a shadowed label — so a 5.2 project shipping to
-    /// 5.4 used to emit a file `luac5.4 -p` refuses to load, exit 0. The
-    /// residual validation of the lowered output is what catches it.
+    /// Shockwave round 2: the check gate does not judge the target's *dialect*
+    /// legality by design, and no lowering rule renames a shadowed label — so
+    /// a 5.2 project shipping to 5.4 used to emit a file `luac5.4 -p` refuses
+    /// to load, exit 0. Since round 4 the gate runs the target's control-flow
+    /// pass against the source, which is what gives the finding a span; the
+    /// residual validation of the lowered output stays behind it, for anything
+    /// lowering itself introduces.
     #[test]
     fn tree_mode_refuses_to_emit_control_flow_the_target_cannot_load() {
         let tmp = project("5.2", "\n[build]\ntarget = \"5.4\"\nout = \"dist\"\n");
         write(tmp.path(), "src/main.lua", "::a:: do ::a:: end\nreturn 1\n");
 
         let error = run(tmp.path(), &opts()).unwrap_err().to_string();
-        assert!(error.contains("build failed"), "{error}");
+        assert!(error.contains("refuses to emit"), "{error}");
         assert!(
             !tmp.path()
                 .join("dist")

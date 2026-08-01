@@ -133,6 +133,45 @@ suspicious tier), which fires on `setmetatable(t, C)` where `C` is an in-file
 **luabox-specific**: luals ships no equivalent diagnostic, so
 `[lint] metatable-without-index = "allow"` restores exact luals behaviour.
 
+#### What that lint does *not* cover
+
+`LB0510` is a partial cover, not a closure of the gap, and both of its bounds
+are worth stating plainly.
+
+**It is in-file only.** The carrier, the `setmetatable` call and any `__index`
+write must all be in the file being linted. The common shape
+
+```lua
+-- src/klass.lua
+---@class Klass
+local Klass = {}
+function Klass:value() return 1 end
+return Klass
+
+-- src/main.lua
+local Klass = require("klass")
+local k = setmetatable({}, Klass)
+print(k:value())   -- crashes; `luabox check` and `luabox lint` are both silent
+```
+
+is not reported: the `setmetatable` argument resolves to a `require` result,
+not to an in-file `---@class` carrier, and the rule stays silent on anything it
+cannot see whole. The same holds for a carrier whose `__index` is written
+inside a function that is never called, in a branch that never runs, through a
+local alias (`local mt = C`), or with a computed key — those are deliberate
+*suppressions*, and they cost false negatives rather than false positives. A
+carrier that declares some other metafield (`__call`, `__tostring`, `__add`,
+`__mode`) is likewise silent: it is an operator metatable, not a broken class.
+
+**It is lint-only.** `LB0510` never affects `luabox check`'s exit code; it
+appears in `luabox lint` (and in the editor, on the lint channel). Wiring it
+into `check` would put a heuristic behind the command CI gates on, which is
+exactly the split the `check`/`lint` separation exists to keep.
+
+Cross-file carrier analysis is not a tightening of this rule but a different
+pass — one with the project's require graph in hand — and it is not shipped.
+The reliable defence remains `C.__index = C`.
+
 Every operator luals supports applies. Binary/unary operator *expressions*
 (`add`, `sub`, `mul`, `div`, `mod`, `pow`, `idiv`, `concat`, `band`, `bor`,
 `bxor`, `shl`, `shr`, `unm`, `bnot`, `len`) are typed on the operator-expression
