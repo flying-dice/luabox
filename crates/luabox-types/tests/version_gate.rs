@@ -71,6 +71,25 @@ legacy()
 }
 
 #[test]
+fn version_rides_a_typed_function_assignment_too() {
+    // The `---@type fun(…)` + `NAME = function` spelling builds its
+    // signature on a different absorb path from `local function` (#58
+    // mutation audit: that path could drop the version and every fixture
+    // here stayed green). Same rule, other spelling: the gate fires under
+    // an excluded edition and stays quiet under a matching one.
+    let src = "\
+---@version 5.2
+---@type fun(): number
+legacy = function() return 1 end
+local x = legacy()
+";
+    let ds = diags(src, Dialect::Lua54);
+    assert_eq!(ds.len(), 1, "one finding: {ds:?}");
+    assert_eq!(ds[0].code.to_string(), "LB0308");
+    assert_eq!(codes(src, Dialect::Lua52), Vec::<String>::new());
+}
+
+#[test]
 fn matching_edition_is_clean() {
     let src = "\
 ---@version 5.2

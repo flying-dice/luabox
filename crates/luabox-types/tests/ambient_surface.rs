@@ -44,6 +44,8 @@ function deflib.render(n) end
 
 ---@type number
 DEF_LIMIT = 0
+
+RAW_FLAG = false
 ";
 
 fn defs_ambient() -> Ambient {
@@ -117,6 +119,30 @@ use('nonsense')
 }
 
 #[test]
+fn defs_enum_members_type_through_the_dotted_read() {
+    // `DefMode.fast` in a consumer has NO local table to fall back on — the
+    // enum's carrier is a `local` of the defs file — so the dotted read
+    // types through the enum-member lookup alone (#58 mutation audit: that
+    // lookup had no crate-local coverage on the defs path). Both
+    // directions: the accepting probe is the separating one, because strict
+    // mode rejects a dropped-lookup `unknown` with the same LB0300 a real
+    // mismatch gets.
+    let ambient = merged();
+    let clean = "\
+---@param s string
+local function want(s) end
+want(DefMode.fast)
+";
+    assert_eq!(codes(clean, &ambient), Vec::<String>::new());
+    let caught = "\
+---@param n number
+local function want(n) end
+want(DefMode.fast)
+";
+    assert_eq!(codes(caught, &ambient), vec!["LB0300"]);
+}
+
+#[test]
 fn defs_global_types_survive_the_project_merge() {
     let ambient = merged();
     // Both directions, deliberately: strict mode rejects `unknown` at a
@@ -144,6 +170,23 @@ want(DEF_LIMIT)
         vec!["LB0300"],
         "…and the type must be the declared one, not merely something"
     );
+}
+
+#[test]
+fn a_bare_non_table_def_global_declares_no_module_shape() {
+    // #105's classifier is exactly `NAME = {}` (#58 mutation audit): a bare
+    // non-table global in a defs file registers no structural table. The
+    // separating probe is a `table`-typed parameter — an over-eager
+    // classifier hands `RAW_FLAG` an empty table shape and sails through,
+    // while the honest `unknown` is rejected by strict mode. (A scalar-typed
+    // probe cannot separate the two: strict rejects both with LB0300.)
+    let ambient = merged();
+    let src = "\
+---@param t table
+local function want(t) end
+want(RAW_FLAG)
+";
+    assert_eq!(codes(src, &ambient), vec!["LB0300"]);
 }
 
 // --- `class_members`: the editor surfaces' read path (#56) -----------------

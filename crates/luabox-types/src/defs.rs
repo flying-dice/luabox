@@ -860,6 +860,49 @@ f(math.pi)
     }
 
     #[test]
+    fn an_intra_file_class_repeat_is_one_collision_not_two() {
+        // The within-file dedup's whole job (#58 mutation audit): a package
+        // whose own file repeats a class collides with the OTHER package
+        // once, not once per repetition — the repeat is a duplicate
+        // declaration (the union rule's business, #49), not two claims.
+        let defs = vec![
+            DefFile {
+                file: "defs/a.d.lua".to_string(),
+                text: "---@meta\n---@class Widget\n---@field a number\n".to_string(),
+            },
+            DefFile {
+                file: "dep/defs/b.d.lua".to_string(),
+                text: "---@meta\n---@class Widget\n---@field b number\n\
+                       ---@class Widget\n---@field c number\n"
+                    .to_string(),
+            },
+        ];
+        let (_ambient, diags) = build_ambient_checked(Dialect::Lua54, &defs);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code.to_string(), "LB0307");
+    }
+
+    #[test]
+    fn an_intra_file_alias_repeat_is_one_collision_not_two() {
+        // The alias twin of the class dedup above (#113 dedups per file the
+        // same way; the duplicate-alias diagnostic within one file is
+        // LB0310's own separate report, not a package collision).
+        let defs = vec![
+            DefFile {
+                file: "a.d.lua".to_string(),
+                text: "---@meta\n---@alias Id integer\n".to_string(),
+            },
+            DefFile {
+                file: "b.d.lua".to_string(),
+                text: "---@meta\n---@alias Id string\n---@alias Id boolean\n".to_string(),
+            },
+        ];
+        let diags = alias_collisions(&defs, &[]);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code.to_string(), "LB0310");
+    }
+
+    #[test]
     fn build_ambient_checked_distinct_classes_no_collision() {
         let defs = vec![
             DefFile {

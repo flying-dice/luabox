@@ -6,7 +6,11 @@
 #
 # Reason classes (reviewed 2026-08-02; run of 407 mutants over the
 # merge-seam scope: 282 caught / 39 missed -> 13 killed by new tests,
-# 26 waived below):
+# now 13 waived below — 14 of the original 26 got kills in the sprint
+# extension: enum-member dotted reads, collision intra-file dedup, the
+# ---@type fun attachment family, version on assigned signatures, the
+# NAME = {} classifier, own-declaration conformance exclusion, and the
+# truncated-long-bracket guard):
 #   [equivalent]  semantically identical / reduces to a no-op — unkillable
 #   [defensive]   guards malformed empty-name harvest output that the
 #                 public checker surface cannot name or observe
@@ -15,8 +19,6 @@
 #                 via the cli e2e suites or narrower than a crate test
 #                 reaches today; candidates for future kills
 #
-crates/luabox-types/src/defs.rs:397:42: replace || with && in class_collisions	[gap] def-package collision warning (LB0307/LB0310); the OR arms need two colliding def sources to separate
-crates/luabox-types/src/defs.rs:458:42: replace || with && in alias_collisions	[gap] alias-collision twin of the line above
 crates/luabox-types/src/env.rs:132:38: replace match guard !c.name.is_empty() with true in FileTypes::collect	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
 crates/luabox-types/src/env.rs:148:37: replace match guard !e.name.is_empty() with true in FileTypes::collect	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
 crates/luabox-types/src/env.rs:153:38: replace match guard !a.name.is_empty() with true in FileTypes::collect	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
@@ -27,18 +29,6 @@ crates/luabox-types/src/env.rs:888:33: replace match guard !c.var.is_empty() wit
 crates/luabox-types/src/env.rs:1939:34: replace match guard !c.name.is_empty() with true in carrier_var_classes	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
 crates/luabox-types/src/env.rs:298:30: replace > with >= in TypeEnv::build_from_items	[defensive] whitespace-walk bound on the inline-@as anchor; anchor==0 needs a cast with no expression before it, which the grammar does not produce
 crates/luabox-types/src/env.rs:301:27: replace > with >= in TypeEnv::build_from_items	[defensive] whitespace-walk bound on the inline-@as anchor; anchor==0 needs a cast with no expression before it, which the grammar does not produce
-crates/luabox-types/src/env.rs:923:13: delete field version from struct FunctionTy expression in TypeEnv::absorb_block	[gap] ---@version carried onto a block-annotated signature; gating pinned via version_gate on other spellings
-crates/luabox-types/src/env.rs:982:9: replace TypeEnv::attach_typed_functions with ()	[gap] use-site tag fold for ---@type fun() over NAME = function assignments — pinned by cli e2e scenarios, not crate-locally
-crates/luabox-types/src/env.rs:996:16: delete ! in TypeEnv::attach_typed_functions	[gap] use-site tag fold for ---@type fun() over NAME = function assignments — pinned by cli e2e scenarios, not crate-locally
-crates/luabox-types/src/env.rs:1535:5: replace assign_target_name -> Option<String> with None	[gap] use-site tag fold for ---@type fun() over NAME = function assignments — pinned by cli e2e scenarios, not crate-locally
-crates/luabox-types/src/env.rs:1535:5: replace assign_target_name -> Option<String> with Some(String::new())	[gap] use-site tag fold for ---@type fun() over NAME = function assignments — pinned by cli e2e scenarios, not crate-locally
-crates/luabox-types/src/env.rs:1535:5: replace assign_target_name -> Option<String> with Some("xyzzy".into())	[gap] use-site tag fold for ---@type fun() over NAME = function assignments — pinned by cli e2e scenarios, not crate-locally
-crates/luabox-types/src/env.rs:1536:9: delete match arm Expr::Name(name) in assign_target_name	[gap] use-site tag fold for ---@type fun() over NAME = function assignments — pinned by cli e2e scenarios, not crate-locally
-crates/luabox-types/src/env.rs:1246:9: replace TypeEnv::enum_member -> Option<&Ty> with None	[gap] enum_member accessor; exhaustiveness consumes it via check.rs paths the crate suite reaches only shallowly
 crates/luabox-types/src/env.rs:1288:9: replace TypeEnv::typed_local_span -> Option<std::ops::Range<usize>> with None	[label] declared-here span for the duplicate-field note; suites assert codes, not label spans
 crates/luabox-types/src/env.rs:1322:9: replace TypeEnv::is_class -> bool with true	[gap] is_class feeds LB0306 provability; forcing true would mis-prove absence on non-class named types — needs an alias-typed shape to separate
-crates/luabox-types/src/env.rs:1330:9: replace TypeEnv::class_declares_own -> bool with false	[gap] own-declaration exclusion for conformance obligations (#107)
 crates/luabox-types/src/env.rs:1787:22: replace && with || in class_param_unification	[equivalent] with || the guard admits only cases whose rename map is the identity (own==canonical) or empty (own empty) — a no-op substitution either way
-crates/luabox-types/src/env.rs:2078:5: replace is_table_constructor -> bool with true	[gap] NAME = {} def idiom classifier (#105); needs a def source with a non-table global assign to separate
-crates/luabox-types/src/env.rs:2174:30: replace + with - in unquote_lua	[gap] long-bracket unquote for defs string values; the mutated arithmetic underflows only on [[...]] level-0 strings in defs
-crates/luabox-types/src/env.rs:1537:9: delete match arm Expr::Field(field) in assign_target_name	[gap] use-site tag fold for ---@type fun() over NAME = function assignments — pinned by cli e2e scenarios, not crate-locally (timeout/missed flapper: timed out in the first audit run, missed in the second)

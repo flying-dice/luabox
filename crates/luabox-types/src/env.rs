@@ -2236,6 +2236,12 @@ mod tests {
         assert_eq!(unquote_lua("[["), "[[");
         assert_eq!(unquote_lua(""), "");
         assert_eq!(unquote_lua("\""), "\"");
+        // A token that ENDS like a long bracket but is shorter than its own
+        // delimiters (#58 mutation audit): the length half of the guard is
+        // the only thing standing between this and an out-of-range slice —
+        // every input above satisfies or fails BOTH halves at once, so only
+        // this one can catch the length check weakening.
+        assert_eq!(unquote_lua("[]]"), "[]]");
     }
 
     // --- definition-layer merge order ------------------------------------
