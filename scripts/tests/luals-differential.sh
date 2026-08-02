@@ -38,7 +38,7 @@ luals="${LUALS:-lua-language-server}"
 # else luals reports (style, unused locals, …) is out of scope for the
 # comparison — .luarc.json in the corpus disables the noisiest, and this set
 # is the positive filter.
-parity_codes="param-type-mismatch missing-parameter undefined-field undefined-doc-name duplicate-doc-field assign-type-mismatch return-type-mismatch missing-return cast-local-type undefined-global"
+parity_codes="param-type-mismatch missing-parameter undefined-field undefined-doc-name duplicate-doc-field assign-type-mismatch return-type-mismatch missing-return missing-fields cast-local-type undefined-global"
 
 if [ ! -x "$luabox" ]; then
     echo "error: no luabox binary at $luabox (build with: cargo build --release --bin luabox, or set LUABOX)" >&2

@@ -15,6 +15,11 @@
 #
 # Measured against lua-language-server 3.13.5 (the version CI pins).
 #
+# Corpus rule: luals checks this directory as ONE workspace, so classes are
+# workspace-global across cases — every case must use class names unique to
+# its own file, or cross-file duplicate-doc-field noise leaks into other
+# rows' verdicts.
+#
 # case	luabox	luals	note
 clean_control	clean	clean	control: an annotated, well-typed file is clean in both
 trailing_nil_param_omitted	clean	clean	#49: omitting a TRAILING `number|nil` param is fine in both (measured, was guessed before)
@@ -27,3 +32,8 @@ undefined_field_on_class	diag	diag	baseline: unknown member on a `---@type` inst
 duplicate_class_union	clean	clean	#46/#49: two `---@class Config` declarations union their fields in both
 duplicate_field_conflict_first_wins	diag	diag	both flag a same-name field re-declared at a different type, by different rules: luals unions (`string|number` fails the number param), luabox keeps the first (LB0311 + LB0300) — divergent semantics, agreeing presence; the semantic divergence is recorded in docs/03-reference/02-limitations.md
 renamed_generic_duplicate	clean	diag	INTENTIONAL DIVERGENCE: lua-language-server 3.13.5 does not support generic classes (`---@class Boxed<T>` yields undefined-doc-name for `T`), while luabox implements them per the LuaCATS generics spec — luabox is deliberately ahead, not lagging; re-measure when the pinned luals version gains support
+inherited_member_through_subclass	clean	clean	inheritance: a parent's field types through the subclass in both
+inherited_member_misuse	diag	diag	inheritance: misusing an inherited field is rejected by both
+string_method_arg_mismatch	diag	diag	#48: `s:rep("three")` argument-checks with the receiver bound in both
+required_field_missing_from_literal	diag	diag	a literal missing a required ---@field is rejected by both (LB0300 here, missing-fields there)
+required_field_present_in_literal	clean	clean	control: the same literal with the field present is clean in both
