@@ -319,18 +319,19 @@ Feature: luabox lsp — hover and completion on a `require` binding
     When I request the definition at 0:20 in "main.lua"
     Then the location is in "other.lua"
 
-  # --- the disclosed edge: a `---@class` carrier module (#54) --------------
+  # --- a `---@class` module export closes, in both spellings (#56) ---------
   #
-  # These scenarios pin what was *measured*, not what would be convenient.
-  # A module whose export is a `---@class` carrier (`---@class Point` over
-  # `local P = {}`) is a structural table as far as the per-file view the
-  # editor surfaces are built on can tell: the class's `---@field`s live in
-  # the declaring file's ambient environment, which only the type pass holds.
-  # So the binding hovers as that table, its members have no hover, and
-  # completion does not offer them. Recorded in
-  # docs/03-reference/02-limitations.md.
+  # This block used to pin the one shape the editor could not read (#54): a
+  # module whose export is a `---@class`. The class's `---@field`s live in
+  # the workspace ambient environment, and the per-file view hover and
+  # completion were built on could not reach it. Two things closed it: the
+  # export now crosses the `require` boundary as the class it carries (the
+  # workspace-global identity, which is what luals resolves a require to),
+  # and the editor surfaces resolve class members through the same ambient
+  # environment the checker uses — so what the editor offers is what
+  # `luabox check` enforces.
 
-  Scenario: a class-carrier module's binding hovers as a structural table
+  Scenario: a class-carrier module's binding hovers as the class name
     Given a file "point.lua" containing:
       """
       ---@class Point
@@ -346,10 +347,9 @@ Feature: luabox lsp — hover and completion on a `require` binding
     And the language server is running
     And the document "main.lua" is open
     When I hover at 1:6 in "main.lua"
-    Then the hover text contains "local p: {"
-    And the hover text does not contain "Point"
+    Then the hover text contains "local p: Point"
 
-  Scenario: a class-carrier module's member has no hover
+  Scenario: a class-carrier module's member hovers with its declared type
     Given a file "point.lua" containing:
       """
       ---@class Point
@@ -365,9 +365,10 @@ Feature: luabox lsp — hover and completion on a `require` binding
     And the language server is running
     And the document "main.lua" is open
     When I hover at 1:8 in "main.lua"
-    Then the reply is null
+    Then the hover text contains "Point.x"
+    And the hover text contains "number"
 
-  Scenario: a class-carrier module's members are not offered by completion
+  Scenario: a class-carrier module's members are offered by completion
     Given a file "point.lua" containing:
       """
       ---@class Point
@@ -383,9 +384,28 @@ Feature: luabox lsp — hover and completion on a `require` binding
     And the language server is running
     And the document "main.lua" is open
     When I request completion at 1:8 in "main.lua"
-    Then the completion list does not contain "x"
+    Then the completion list contains "x"
+    And completion item "x" has detail "Point.x: number"
 
-  Scenario: a class *instance* export does hover as the class name
+  Scenario: a member the class does not declare still has no hover
+    Given a file "point.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+      local P = {}
+      return P
+      """
+    And a file "main.lua" containing:
+      """
+      local p = require("point")
+      print(p.nope)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I hover at 1:8 in "main.lua"
+    Then the reply is null
+
+  Scenario: a class *instance* export hovers as the class name
     Given a file "point.lua" containing:
       """
       ---@class Point
@@ -404,3 +424,65 @@ Feature: luabox lsp — hover and completion on a `require` binding
     And the document "main.lua" is open
     When I hover at 1:6 in "main.lua"
     Then the hover text contains "local p: Point"
+
+  Scenario: a class instance module's member hovers with its declared type
+    Given a file "point.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+
+      ---@type Point
+      local P = nil
+      return P
+      """
+    And a file "main.lua" containing:
+      """
+      local p = require("point")
+      print(p.x)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I hover at 1:8 in "main.lua"
+    Then the hover text contains "Point.x"
+    And the hover text contains "number"
+
+  Scenario: a class instance module's members are offered by completion
+    Given a file "point.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+
+      ---@type Point
+      local P = nil
+      return P
+      """
+    And a file "main.lua" containing:
+      """
+      local p = require("point")
+      print(p.
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request completion at 1:8 in "main.lua"
+    Then the completion list contains "x"
+    And completion item "x" has detail "Point.x: number"
+
+  Scenario: a class declared in another file resolves members with no require
+    Given a file "shapes.lua" containing:
+      """
+      ---@class Circle
+      ---@field radius number
+      local C = {}
+      return C
+      """
+    And a file "main.lua" containing:
+      """
+      ---@type Circle
+      local c = nil
+      print(c.radius)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I hover at 2:8 in "main.lua"
+    Then the hover text contains "Circle.radius"
+    And the hover text contains "number"

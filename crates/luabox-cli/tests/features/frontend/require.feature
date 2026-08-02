@@ -331,13 +331,33 @@ Feature: luabox check — cross-file require resolution (#85)
     Then the command fails
     And stdout contains "LB0302"
 
-  # The CI half of the class-carrier edge disclosed in
-  # docs/03-reference/02-limitations.md (the editor half is pinned in
+  # The CI half of the class-carrier edge (#56; the editor half is pinned in
   # tests/features/lsp/hover-require.feature). A module whose export is a
-  # `---@class` *carrier* crosses the boundary as the structural table the
-  # carrier is, so member reads on the binding are lenient rather than
-  # enforced — including a member the class does not declare.
-  Scenario: a class-carrier module's members cross the boundary untyped
+  # `---@class` *carrier* crosses the boundary as the class it carries — the
+  # workspace-global identity, which is what luals resolves the require to —
+  # so its members are typed and enforced exactly as the instance spelling
+  # always was. This used to be the lenient row of the limitations table.
+  Scenario: a class-carrier module's members cross the boundary typed
+    Given a strict project with edition "5.4"
+    And a file "src/point.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+      local P = {}
+      return P
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param n number
+      local function want(n) end
+      local p = require("point")
+      want(p.x)
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And zero diagnostics are reported
+
+  Scenario: a class-carrier module's undeclared members are rejected
     Given a strict project with edition "5.4"
     And a file "src/point.lua" containing:
       """
@@ -349,12 +369,11 @@ Feature: luabox check — cross-file require resolution (#85)
     And a file "src/main.lua" containing:
       """
       local p = require("point")
-      print(p.x)
       print(p.nope)
       """
     When I run "luabox check"
-    Then the command succeeds
-    And zero diagnostics are reported
+    Then the command fails
+    And stdout contains "LB0306"
 
   # Naming the class directly is the way to get it enforced — class names are
   # workspace-global, so no `require` is needed for the *type*.

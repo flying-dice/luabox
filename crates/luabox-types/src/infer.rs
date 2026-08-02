@@ -3167,6 +3167,47 @@ end
     // --- display mode: cross-file (externals) ------------------------------
 
     #[test]
+    fn a_returned_class_carrier_exports_as_the_class_it_carries() {
+        // The export position mirrors what luals resolves a `require` to:
+        // the returned carrier IS the class — the workspace-global identity —
+        // not the structural table it happens to be inside its own file
+        // (#56). Inside the file nothing changes; only what crosses the
+        // `require` boundary does.
+        let src = "\
+---@class Point
+---@field x number
+local P = {}
+return P
+";
+        let out = outcome(src);
+        let export = out.module_export.expect("module export");
+        assert_eq!(export.to_string(), "Point");
+    }
+
+    #[test]
+    fn a_returned_plain_table_still_exports_structurally() {
+        // Control: the overwhelmingly common `local M = {} … return M`
+        // module has no class to become — its structural surface is the
+        // export, exactly as before.
+        let src = "\
+local M = {}
+
+function M.area(w, h)
+  return w * h
+end
+
+return M
+";
+        let out = outcome(src);
+        let export = out.module_export.expect("module export");
+        let rendered = export.to_string();
+        assert!(
+            rendered.contains("area"),
+            "a plain module must keep its structural export: {rendered}"
+        );
+    }
+
+    #[test]
     fn module_export_is_the_chunk_return_type() {
         let src = "\
 local M = {}
