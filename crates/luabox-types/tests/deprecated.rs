@@ -68,6 +68,23 @@ local alias = old
 }
 
 #[test]
+fn deprecated_use_inside_an_assignment_targets_index_is_flagged() {
+    // #58 mutation audit (check.rs): an assignment TARGET is a write, but
+    // its base/index sub-expressions are reads — `t[old()] = 1` uses `old`
+    // even though nothing on the right-hand side does. This is the one
+    // shape that reaches the target-traversal arm alone: a value-position
+    // read goes through the ordinary expression walk instead.
+    let src = "\
+---@deprecated
+local function old() end
+
+local t = {}
+t[old()] = 1
+";
+    assert_eq!(codes(src, Strictness::Warn), vec!["LB0308"]);
+}
+
+#[test]
 fn deprecated_declaration_site_not_flagged() {
     let src = "\
 ---@deprecated
