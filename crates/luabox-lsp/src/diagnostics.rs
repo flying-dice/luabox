@@ -68,9 +68,11 @@ pub(crate) const fn source_for(code: luabox_diag::Code) -> &'static str {
 /// Owned by the server.
 pub struct CheckCtx<'a> {
     pub strictness: Strictness,
-    /// The ambient layer to check against — the editor's counterpart of the
-    /// CLI's `build_ambient_checked` ambient, so a dependency's classes resolve
-    /// in the editor exactly as they do under `luabox check`.
+    /// The MERGED ambient layer to check against — defs + workspace-global
+    /// project types + rock types, as [`crate::server`]'s revision-keyed
+    /// cache builds it — so a dependency's classes resolve in the editor
+    /// exactly as they do under `luabox check`, and one merge serves every
+    /// surface instead of being rebuilt per published file.
     pub ambient: &'a Ambient,
     /// The type surfaces harvested from the project's vendored luarocks tree
     /// (#30): rock classes/enums/aliases, plus each rock module's
@@ -138,17 +140,12 @@ pub fn diagnostics(
     // same map, so a `require` binding cannot type one way here and another
     // way under the cursor.
     let requires = RequireExports::resolve(analysis, path, ctx.rocks);
-    let project_types = analysis.project_types();
-    let ambient = ctx
-        .ambient
-        .with_project_types(&project_types)
-        .with_rock_types(ctx.rocks.types());
     for diag in check_file_with_requires(
         parsed.parse(),
         &rel,
         ctx.strictness,
         dialect,
-        Some(&ambient),
+        Some(ctx.ambient),
         requires.by_module(),
     ) {
         // Type diagnostics are all `LB03xx`, so this publishes under
@@ -282,9 +279,15 @@ mod tests {
             text: src.to_string(),
         });
         let analysis = host.snapshot();
-        let ambient = build_ambient(dialect, &[]);
+        // The MERGED layer, exactly as the server's revision-keyed cache
+        // builds it — the merge lives with the caller now, not in
+        // `diagnostics()`.
+        let base = build_ambient(dialect, &[]);
+        let known_globals = base.global_names().clone();
+        let ambient = base
+            .with_project_types(&analysis.project_types())
+            .with_rock_types(rocks.types());
         let lint = LintConfig::new();
-        let known_globals = ambient.global_names().clone();
         let ctx = CheckCtx {
             strictness: Strictness::Warn,
             ambient: &ambient,

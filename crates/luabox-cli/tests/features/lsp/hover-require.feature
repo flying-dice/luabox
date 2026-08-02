@@ -467,6 +467,41 @@ Feature: luabox lsp — hover and completion on a `require` binding
     Then the completion list contains "x"
     And completion item "x" has detail "Point.x: number"
 
+  Scenario: hover tracks an edit to the declaring file
+    # Pins the merged-ambient cache's invalidation: the first hover populates
+    # the revision-keyed cache, the didChange to the OTHER file must
+    # invalidate it, and the second hover must see the member that edit
+    # introduced. A cache keyed on anything that misses cross-file edits
+    # serves the first (null) answer forever.
+    Given a file "point.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+      local P = {}
+      return P
+      """
+    And a file "main.lua" containing:
+      """
+      local p = require("point")
+      print(p.y)
+      """
+    And the language server is running
+    And the document "point.lua" is open
+    And the document "main.lua" is open
+    When I hover at 1:8 in "main.lua"
+    Then the reply is null
+    When I change "point.lua" to:
+      """
+      ---@class Point
+      ---@field x number
+      ---@field y number
+      local P = {}
+      return P
+      """
+    And I hover at 1:8 in "main.lua"
+    Then the hover text contains "Point.y"
+    And the hover text contains "number"
+
   Scenario: a class declared in another file resolves members with no require
     Given a file "shapes.lua" containing:
       """

@@ -4,7 +4,7 @@ labels: [wave]
 priority: high
 agent: claude
 live: false
-updatedAt: 2026-08-02T07:00:00.000Z
+updatedAt: 2026-08-02T09:00:00.000Z
 ---
 # Post-v1 hardening: issues #56–#59
 
@@ -22,6 +22,8 @@ tests).
 - [x] #58 — mutation pass over luabox-types, weak fixtures strengthened, scheduled CI job
 
 ## Comments
+
+- **claude** (2026-08-02T09:00:00.000Z): Sprint extension (2 extra hours). Fourteen more #58 allowlist [gap] lines got measured kills — allowlist 27 → 13 (remaining: 10 defensive empty-name guards, 1 label-span, 1 equivalent mutant, 1 acknowledged is_class edge). Kills in crates/luabox-types/tests/ambient_surface.rs:105 (defs enum dotted read, bare-global classifier), crates/luabox-types/tests/annotated_field_assignments.rs:45 (the ---@type fun attachment family — 7 mutants via dotted + plain call-site probes), crates/luabox-types/tests/luacats_conformance.rs:84 (own-declaration conformance exclusion + one-variable control), crates/luabox-types/tests/version_gate.rs:74 (LB0308 on the assignment construction path), crates/luabox-types/src/defs.rs tests (intra-file collision dedup ×2), crates/luabox-types/src/env.rs:2246 (the '[]]' truncated-bracket input — the only input that separates the length guard). Also #57 corpus 11 → 16 rows, 15/16 measured parity (inheritance, s:rep args, literal conformance; missing-fields added to the parity set), with a corpus rule discovered and documented: luals treats the corpus as one workspace, so case files need unique class names. Acceptance 911/911 + lsp 218/218 re-verified on this head. Note: the container recycled mid-extension — branch restored intact from origin (everything was pushed), only local artifacts (luals binary, mutants output) needed re-fetching; the allowlist encodes the measurements, so nothing was lost.
 
 - **claude** (2026-08-02T07:00:00.000Z): #58 done; card to review — all four issues implemented on claude/production-readiness-assessment-9natxz. Mutation audit: 407 mutants over the merge-seam scope, first run 282 caught / 39 missed. 14 survivors killed by new tests — crates/luabox-types/tests/ambient_surface.rs:1 (class_members + clone_surface defs layer, 7 tests), crates/luabox-types/tests/duplicate_class_merge_property.rs:283 (template ownership break + indexer union, both verified by hand-applied mutation), crates/luabox-types/tests/field_visibility.rs:133 (is_subclass consulted at last), plus Check-mode reify flag pins in crates/luabox-types/src/infer.rs. 27 waived with per-line reviewed reasons in scripts/tests/mutants-allowlist.txt:1 (classes: equivalent/defensive/label/gap). Gate scripts/tests/mutants-gate.sh:1 diffs live missed set vs allowlist (new survivor fails, stale line reported); weekly CI .github/workflows/mutants.yml:1. Verification run 294 caught / 28 missed matched the allowlist exactly after fixing the one probe my own two-directions rule caught (defs_global_types: strict-mode unknown-rejection masked the drop — the ACCEPTING probe separates). The wave-21 rules are now written down in docs/01-getting-started/02-development.md:37.
 

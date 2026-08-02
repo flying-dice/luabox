@@ -71,6 +71,12 @@ pub struct AnalysisHost {
     inputs: HashMap<FileId, SourceFile>,
     project: Project,
     default_dialect: Dialect,
+    /// Monotonic change counter: bumped by every [`Self::apply_change`], the
+    /// one choke point all mutations flow through, and carried onto each
+    /// [`Analysis`] snapshot. A consumer caching anything derived from a
+    /// snapshot (the LSP's merged ambient layer) keys the cache on this —
+    /// equal revisions mean no input changed, so the derivation is current.
+    revision: u64,
 }
 
 impl AnalysisHost {
@@ -86,6 +92,7 @@ impl AnalysisHost {
             inputs: HashMap::new(),
             project,
             default_dialect,
+            revision: 0,
         }
     }
 
@@ -109,6 +116,7 @@ impl AnalysisHost {
 
     /// Apply one [`Change`], updating the VFS and the affected salsa inputs.
     pub fn apply_change(&mut self, change: Change) {
+        self.revision += 1;
         match change {
             Change::SetFileText {
                 path,
@@ -160,6 +168,7 @@ impl AnalysisHost {
             db: self.db.clone(),
             files,
             project: self.project,
+            revision: self.revision,
         }
     }
 
@@ -200,6 +209,19 @@ pub struct Analysis {
     db: RootDatabase,
     files: HashMap<PathBuf, SourceFile>,
     project: Project,
+    /// The host's change counter at snapshot time — see
+    /// [`AnalysisHost::apply_change`]. Two snapshots with equal revisions saw
+    /// identical inputs, so anything derived from one is valid for the other.
+    revision: u64,
+}
+
+impl Analysis {
+    /// The host's change counter at snapshot time — a cache key for
+    /// derivations over this snapshot (equal revision ⇒ identical inputs).
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
 }
 
 impl Analysis {

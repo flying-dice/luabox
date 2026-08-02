@@ -34,6 +34,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -550,6 +551,18 @@ struct Server {
     /// per file in [`crate::diagnostics`] — *after* the project's own types, so
     /// explicit beats implicit.
     rocks: RockSurfaces,
+    /// The merged editor ambient — [`Self::ambient`] + the workspace-global
+    /// project types + the rock tree — cached per
+    /// [`luabox_db::Analysis::revision`], because every surface that needs it
+    /// (diagnostics on each keystroke, hover, completion) used to re-clone
+    /// the defs surface and re-merge every project file per request. The
+    /// revision key makes staleness structural: any [`Change`] bumps it, and
+    /// [`Self::reload_config`] — which swaps the base layers the merge is
+    /// built from without touching the host — clears the cache by hand.
+    ///
+    /// `RefCell` for the same reason as [`Self::pending`]: the read paths run
+    /// behind `&self`, and the server is single-threaded.
+    merged_ambient: RefCell<Option<(u64, Rc<Ambient>)>>,
     /// The resolved `[lint]` configuration, driving the lint pass in
     /// [`Self::publish_lua`] and the quick-fixes in [`Self::code_actions`].
     lint: LintConfig,
@@ -713,6 +726,7 @@ impl Server {
             out_dir: config.out_dir,
             ambient,
             rocks: RockSurfaces::default(),
+            merged_ambient: RefCell::new(None),
             lint: config.lint,
             known_globals,
             open_docs: HashMap::new(),
@@ -816,6 +830,9 @@ impl Server {
         self.known_globals = ambient.global_names().clone();
         self.ambient = ambient;
         self.rocks = self.harvest_announced(config.rock_version_dir, RELOAD_HARVEST_PROGRESS);
+        // The merge's BASE layers just changed while the host (and so the
+        // revision) did not — the one staleness the revision key cannot see.
+        *self.merged_ambient.borrow_mut() = None;
         self.lint = config.lint;
         // Re-report: the reload may have introduced (or fixed) a typo'd key.
         self.log_lint_config_problems(&config.unknown_lint_rules);
@@ -1511,17 +1528,27 @@ impl Server {
         RequireExports::resolve(snapshot, path, &self.rocks)
     }
 
-    /// The merged ambient layer for the editor surfaces — defs, then the
-    /// workspace-global project types, then the rock tree, merged exactly as
-    /// the diagnostics pipeline merges them (see [`diagnostics::diagnostics`]),
-    /// so hover and completion resolve a class's members against the very
-    /// environment `luabox check` enforces (#56). Built per request off the
-    /// same snapshot the view came from; `project_types` itself is memoized,
-    /// so the cost is the surface merge the diagnostics path already pays.
-    fn merged_ambient(&self, snapshot: &Analysis) -> Ambient {
-        self.ambient
-            .with_project_types(&snapshot.project_types())
-            .with_rock_types(self.rocks.types())
+    /// The merged ambient layer every editor surface reads — defs, then the
+    /// workspace-global project types, then the rock tree — so diagnostics,
+    /// hover and completion all resolve against the very environment
+    /// `luabox check` enforces (#56). Cached on [`Analysis::revision`]: a
+    /// request against an unchanged world reuses the merge instead of
+    /// re-cloning the defs surface and re-merging every project file, which
+    /// each of the three surfaces used to pay per request.
+    fn merged_ambient(&self, snapshot: &Analysis) -> Rc<Ambient> {
+        let revision = snapshot.revision();
+        if let Some((cached_at, merged)) = self.merged_ambient.borrow().as_ref()
+            && *cached_at == revision
+        {
+            return Rc::clone(merged);
+        }
+        let merged = Rc::new(
+            self.ambient
+                .with_project_types(&snapshot.project_types())
+                .with_rock_types(self.rocks.types()),
+        );
+        *self.merged_ambient.borrow_mut() = Some((revision, Rc::clone(&merged)));
+        merged
     }
 
     /// The callee's resolved signature(s) while `position` sits inside a
@@ -1809,9 +1836,10 @@ impl Server {
         // context as `publish_lua`, so an `LB0302` offered on a quick-fix is
         // byte-identical to the published one) drive add-missing-field.
         let inferred = snapshot.binding_types(&sema.path);
+        let merged = self.merged_ambient(&snapshot);
         let ctx = diagnostics::CheckCtx {
             strictness: self.strictness,
-            ambient: &self.ambient,
+            ambient: &merged,
             rocks: &self.rocks,
             lint: &self.lint,
             known_globals: &self.known_globals,
@@ -2008,9 +2036,10 @@ impl Server {
     /// snapshot.
     fn publish_lua(&mut self, uri: &Uri, path: &Path) -> anyhow::Result<()> {
         let analysis: Analysis = self.host.snapshot();
+        let merged = self.merged_ambient(&analysis);
         let ctx = diagnostics::CheckCtx {
             strictness: self.strictness,
-            ambient: &self.ambient,
+            ambient: &merged,
             rocks: &self.rocks,
             lint: &self.lint,
             known_globals: &self.known_globals,
