@@ -1,12 +1,10 @@
 ---
-column: doing
+column: review
 labels: [wave]
 priority: high
 agent: claude
-live: true
-status: "#59 #57 #56 done — running #58 (mutation audit)"
-progress: 75
-updatedAt: 2026-08-02T04:00:00.000Z
+live: false
+updatedAt: 2026-08-02T07:00:00.000Z
 ---
 # Post-v1 hardening: issues #56–#59
 
@@ -21,9 +19,11 @@ tests).
 - [x] #59 — one shared positional-unification function across the three merge seams, proptest coverage
 - [x] #56 — hover/completion resolve through the ambient environment, limitation rows flipped
 - [x] #57 — luals differential CI job with divergence allowlist
-- [ ] #58 — mutation pass over luabox-types, weak fixtures strengthened, scheduled CI job
+- [x] #58 — mutation pass over luabox-types, weak fixtures strengthened, scheduled CI job
 
 ## Comments
+
+- **claude** (2026-08-02T07:00:00.000Z): #58 done; card to review — all four issues implemented on claude/production-readiness-assessment-9natxz. Mutation audit: 407 mutants over the merge-seam scope, first run 282 caught / 39 missed. 14 survivors killed by new tests — crates/luabox-types/tests/ambient_surface.rs:1 (class_members + clone_surface defs layer, 7 tests), crates/luabox-types/tests/duplicate_class_merge_property.rs:283 (template ownership break + indexer union, both verified by hand-applied mutation), crates/luabox-types/tests/field_visibility.rs:133 (is_subclass consulted at last), plus Check-mode reify flag pins in crates/luabox-types/src/infer.rs. 27 waived with per-line reviewed reasons in scripts/tests/mutants-allowlist.txt:1 (classes: equivalent/defensive/label/gap). Gate scripts/tests/mutants-gate.sh:1 diffs live missed set vs allowlist (new survivor fails, stale line reported); weekly CI .github/workflows/mutants.yml:1. Verification run 294 caught / 28 missed matched the allowlist exactly after fixing the one probe my own two-directions rule caught (defs_global_types: strict-mode unknown-rejection masked the drop — the ACCEPTING probe separates). The wave-21 rules are now written down in docs/01-getting-started/02-development.md:37.
 
 - **claude** (2026-08-02T00:00:00.000Z): Card opened. Issues #56–#59 filed with the evidence from the Shockwave review rounds. Working on branch claude/production-readiness-assessment-9natxz based on develop head 210700e. Order: #59 first (foundation in luabox-types), then #56, #57, #58.
 - **claude** (2026-08-02T04:00:00.000Z): #56 done, three commits in the wave-25 discipline. Red pins first (23aedb9: 1 red unit, 2 red acceptance, 6/218 red lsp_acceptance). Then the fix (3bf2f73): the module-export position reifies a returned carrier as the class it carries — crates/luabox-types/src/infer/reify.rs:32 (`reify_export`) — and hover/completion resolve members through the merged ambient via the new public crates/luabox-types/src/defs.rs:97 (`Ambient::class_members`), wired at crates/luabox-lsp/src/server.rs:1521 (`merged_ambient`), crates/luabox-lsp/src/hover.rs:159 (ambient arm), crates/luabox-lsp/src/completion.rs:199 (`ambient_member_items`). Notable: this exact design was once tried and REJECTED over false positives — measured on harnesses that skipped the with_project_types merge every real surface performs; both harnesses made pipeline-faithful (crates/luabox-types/tests/cross_file_require.rs:153, crates/luabox-types/tests/cross_module_args.rs:473) and the attached-method shapes stay clean. Docs flipped (d6a7807): docs/03-reference/02-limitations.md table now records symmetry, README claim updated, CHANGELOG carries the behaviour change. Gates: 911/911 acceptance, 218/218 lsp_acceptance, workspace green, clippy/fmt clean, luals differential 11/11. Perf gate fails on this container but the PRE-CHANGE baseline fails identically (1604ms vs 1568ms, budget 1000ms) — environmental, CI is the enforcement point.
