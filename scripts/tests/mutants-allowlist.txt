@@ -6,11 +6,15 @@
 #
 # Reason classes (reviewed 2026-08-02; run of 407 mutants over the
 # merge-seam scope: 282 caught / 39 missed -> 13 killed by new tests,
-# now 13 waived below — 14 of the original 26 got kills in the sprint
-# extension: enum-member dotted reads, collision intra-file dedup, the
-# ---@type fun attachment family, version on assigned signatures, the
-# NAME = {} classifier, own-declaration conformance exclusion, and the
-# truncated-long-bracket guard):
+# now 16 waived below, every count MEASURED by a full verification run:
+# 11 of the original 26 [gap] lines got kills in the sprint extension
+# (enum-member dotted reads, collision intra-file dedup, the
+# assign_target_name name variants, version on assigned signatures, the
+# NAME = {} classifier, own-declaration conformance exclusion, the
+# truncated-long-bracket guard). Three claimed kills did NOT hold — the
+# attach_typed_functions no-op pair and the dotted-target arm survive
+# because the local-table shape path independently checks those calls —
+# and are re-waived below with what the measurement showed):
 #   [equivalent]  semantically identical / reduces to a no-op — unkillable
 #   [defensive]   guards malformed empty-name harvest output that the
 #                 public checker surface cannot name or observe
@@ -32,3 +36,6 @@ crates/luabox-types/src/env.rs:301:27: replace > with >= in TypeEnv::build_from_
 crates/luabox-types/src/env.rs:1288:9: replace TypeEnv::typed_local_span -> Option<std::ops::Range<usize>> with None	[label] declared-here span for the duplicate-field note; suites assert codes, not label spans
 crates/luabox-types/src/env.rs:1322:9: replace TypeEnv::is_class -> bool with true	[equivalent] measured, not assumed: two candidate separating shapes (alias-typed local from a literal, alias-typed parameter) behave identically under the mutation — alias reads take the shape/alias arms, so the Named-absence arm this gates appears to see only real class names in practice; the alias leniency itself is now pinned in undefined_field.rs either way
 crates/luabox-types/src/env.rs:1787:22: replace && with || in class_param_unification	[equivalent] with || the guard admits only cases whose rename map is the identity (own==canonical) or empty (own empty) — a no-op substitution either way
+crates/luabox-types/src/env.rs:982:9: replace TypeEnv::attach_typed_functions with ()	[gap] measured twice: the dotted call-site probe passes in BOTH worlds — the local-table shape path independently checks these calls, so the attachment's only unshared consumers are cross-crate dotted-name lookups with no shape in scope; a defs-path probe is the remaining kill candidate
+crates/luabox-types/src/env.rs:996:16: delete ! in TypeEnv::attach_typed_functions	[gap] measured twice: the dotted call-site probe passes in BOTH worlds — the local-table shape path independently checks these calls, so the attachment's only unshared consumers are cross-crate dotted-name lookups with no shape in scope; a defs-path probe is the remaining kill candidate
+crates/luabox-types/src/env.rs:1537:9: delete match arm Expr::Field(field) in assign_target_name	[gap] measured twice: the dotted call-site probe passes in BOTH worlds — the local-table shape path independently checks these calls, so the attachment's only unshared consumers are cross-crate dotted-name lookups with no shape in scope; a defs-path probe is the remaining kill candidate
