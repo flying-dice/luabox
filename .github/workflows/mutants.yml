@@ -1,0 +1,48 @@
+# Mutation testing over luabox-types (#58), on a schedule rather than the
+# merge path: a full run costs tens of minutes, and its job is to find
+# fixtures that cannot fail — the wave-21 failure mode — not to gate every
+# push. Survivors are compared against the committed allowlist
+# (scripts/tests/mutants-allowlist.txt): a NEW survivor fails the job, so
+# the weekly signal is "a test gap appeared", never a drifting score.
+name: mutants
+
+on:
+  schedule:
+    # Weekly, Monday 04:17 UTC (odd minute to avoid the on-the-hour stampede).
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+  # Also run when the gate itself or its expectations change, so a broken
+  # script or a bad allowlist edit cannot land silently and rot until Monday.
+  pull_request:
+    paths:
+      - "scripts/tests/mutants-gate.sh"
+      - "scripts/tests/mutants-allowlist.txt"
+      - ".github/workflows/mutants.yml"
+
+jobs:
+  mutants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      - name: Run the mutation gate (merge-seam neighbourhood + infer core)
+        run: |
+          MUTANTS_OUT="$RUNNER_TEMP/mutants" \
+            bash scripts/tests/mutants-gate.sh
+
+      - name: Upload full mutants report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-report
+          path: ${{ runner.temp }}/mutants/mutants.out
+          if-no-files-found: ignore

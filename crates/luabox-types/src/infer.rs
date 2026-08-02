@@ -3167,6 +3167,61 @@ end
     // --- display mode: cross-file (externals) ------------------------------
 
     #[test]
+    fn check_mode_export_keeps_unannotated_returns_uncontractual() {
+        // #58 mutation audit: `has_return_annotation` on a reified
+        // unannotated function must stay `false` in Check mode — it is the
+        // flag that says "these returns are a description, not a contract"
+        // (#46), and the seams that read it live in other crates, so
+        // nothing here noticed it flipping.
+        let src = "\
+local M = {}
+
+function M.f()
+  return 1
+end
+
+return M
+";
+        let out = outcome(src);
+        let export = out.module_export.expect("module export");
+        let Ty::Table(table) = export else {
+            panic!("plain module exports structurally, got {export}");
+        };
+        let Ty::Function(f) = &table.fields.get("f").expect("field f").ty else {
+            panic!("f reifies as a function");
+        };
+        assert!(
+            !f.has_return_annotation,
+            "an unannotated body's returns are not a contract in Check mode"
+        );
+    }
+
+    #[test]
+    fn reified_shapes_exclude_metafields() {
+        // #58 mutation audit: `__index` and friends are wiring, not members
+        // — a reified export must not carry them, or every consumer of a
+        // metatable-using module sees phantom fields.
+        let src = "\
+local M = {}
+M.__index = M
+
+function M.real()
+  return 1
+end
+
+return M
+";
+        let out = outcome(src);
+        let export = out.module_export.expect("module export");
+        let rendered = export.to_string();
+        assert!(rendered.contains("real"), "{rendered}");
+        assert!(
+            !rendered.contains("__index"),
+            "metafields must not reify as members: {rendered}"
+        );
+    }
+
+    #[test]
     fn a_returned_class_carrier_exports_as_the_class_it_carries() {
         // The export position mirrors what luals resolves a `require` to:
         // the returned carrier IS the class — the workspace-global identity —

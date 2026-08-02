@@ -43,6 +43,30 @@ justified rows there, not a hidden allowlist. Without a local
 lua-language-server (or `LUALS=/path/to/bin`) its column SKIPs loudly and the
 luabox column still runs.
 
+A third comparison gate runs on a weekly schedule rather than per-PR:
+mutation testing over `luabox-types` (`scripts/tests/mutants-gate.sh`, CI
+job `mutants`). Survivors diff against the committed allowlist in
+`scripts/tests/mutants-allowlist.txt` — a new survivor is a fixture gap and
+fails the job; a reviewed survivor is a justified line there.
+
+## Writing fixtures that can fail
+
+The wave-21 lesson (PR #55): the original duplicate-class fixture used the
+one shape where the defect was invisible, so the test passed while the bug
+shipped. Three rules keep that from recurring, and the mutation gate above
+audits the result:
+
+- **Red first.** A fixture that pins a bug must fail against the pre-fix
+  binary; commit it red (with the measured count in the message), then the
+  fix that turns it green — the branch history is the proof the test can
+  fail.
+- **One variable per control.** A control scenario must differ from its
+  positive case in exactly one respect; a control that duplicates the
+  positive shape validates nothing.
+- **Probe both directions.** For type assertions, pair the accepting probe
+  with a rejecting one (`want_string(x)` clean AND `want_number(x)` firing)
+  — leniency bugs pass every accepting probe.
+
 ## Conventions
 
 - Restriction lints deny `unwrap`/`expect`/`panic` in non-test code.

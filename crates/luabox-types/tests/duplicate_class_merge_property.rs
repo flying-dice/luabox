@@ -284,6 +284,62 @@ local function want(s) end
     );
 }
 
+/// Template field ownership is **positional**, not name-keyed (#58 mutation
+/// audit): the fields between one `---@class` tag and the next belong to
+/// the first, full stop. Deleting the `Tag::Class => break` in
+/// `lower_class_template` folds a following class's fields into the
+/// preceding template — invisible to every fixture whose blocks declare one
+/// class each, which is all the suite had.
+#[test]
+fn a_following_class_in_the_same_block_does_not_leak_its_fields() {
+    // Second deliberately spells its parameter `T` — the same name as
+    // First's — so a leak MONOMORPHISES: leaked `y: T` becomes `string`
+    // under `First<string>` and the probe goes silently clean. Without the
+    // leak, `a.y` is a missing member (lenient `unknown` on a generic
+    // instance, measured), which strict mode rejects at the probe with
+    // LB0300 `found unknown`. The diagnostic's *presence* is what separates
+    // the two worlds.
+    let src = "\
+---@class First<T>
+---@field x T
+---@class Second<T>
+---@field y T
+
+---@type First<string>
+local a
+---@param s string
+local function want_string(s) end
+local probe = want_string(a.y)
+";
+    assert_eq!(check(src), vec!["LB0300".to_string()]);
+}
+
+/// A duplicate declaration's INDEXER unions into the merged template too
+/// (#58 mutation audit): the generator and every deterministic fixture
+/// above carry named fields only, so the indexer arm of the template merge
+/// could be inverted without a test noticing.
+#[test]
+fn a_duplicate_declarations_indexer_unions_into_the_template() {
+    let src = "\
+---@class Bag<T>
+---@field first T
+
+---@class Bag<T>
+---@field [string] T
+
+---@type Bag<number>
+local b
+---@param n number
+local function want_number(n) end
+local probe = want_number(b.anything)
+";
+    // The second declaration's `[string] T` indexer monomorphises to
+    // `number` under `Bag<number>`, so an arbitrary member read type-checks
+    // clean. Dropped, `b.anything` is `unknown`, which strict mode rejects
+    // at the probe.
+    assert_eq!(check(src), Vec::<String>::new());
+}
+
 /// The generator never produces a single bare declaration alone (its cases
 /// always have two); pin that control here so the suite covers it.
 #[test]
