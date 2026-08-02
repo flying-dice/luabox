@@ -406,8 +406,7 @@ impl TypeEnv {
                     // are, so its field bodies still substitute at an
                     // instantiation site instead of leaking the other
                     // declaration's parameter name through the merged class.
-                    let rename = (!def.params.is_empty() && def.params != existing.params)
-                        .then(|| positional_rename(&def.params, &existing.params));
+                    let rename = class_param_unification(&def.params, &existing.params);
                     let subst = |field: &FieldTy| match &rename {
                         Some(map) => FieldTy {
                             ty: crate::generics::subst_ty(&field.ty, map),
@@ -782,8 +781,7 @@ impl TypeEnv {
                     class_rename = self
                         .classes
                         .get(&c.name)
-                        .filter(|def| !c.params.is_empty() && def.params != c.params)
-                        .map(|def| positional_rename(&c.params, &def.params));
+                        .and_then(|def| class_param_unification(&c.params, &def.params));
                     current_class = Some(c.name.clone());
                     // First-wins, matching the fields: the "declared here"
                     // label points at the declaration that introduced the name.
@@ -1721,8 +1719,8 @@ fn collect_generic_classes(
                 &c.params
             };
             let mut template = lower_class_template(&item.block.tags, i, own, lowerer);
-            if own != canonical.as_slice() {
-                template = rename_template_params(&template, own, canonical);
+            if let Some(map) = class_param_unification(own, canonical) {
+                template = rename_template_params(&template, &map);
             }
             if claimed.insert(&c.name) {
                 out.insert(
@@ -1772,6 +1770,23 @@ impl QuietMark {
     }
 }
 
+/// The positional substitution one declaration's members need before they
+/// merge into the canonical class, or `None` when nothing needs renaming —
+/// the declaration names no parameters of its own, or spells them exactly as
+/// the canonical list does (the common case).
+///
+/// This is the **single owner** of the duplicate-declaration unification rule
+/// (#59): every seam that folds a re-declaration's members into the canonical
+/// class — the instantiation templates ([`collect_generic_classes`]), the
+/// in-file member fold ([`TypeEnv::absorb_block`]), and the workspace-global
+/// fold ([`TypeEnv::merge_file_types`]) — obtains its substitution here.
+/// The #46 family happened because the rule lived as three hand-rolled
+/// copies of guard + rename; a seam added later must call this, not re-derive
+/// it.
+fn class_param_unification(own: &[String], canonical: &[String]) -> Option<BTreeMap<String, Ty>> {
+    (!own.is_empty() && own != canonical).then(|| positional_rename(own, canonical))
+}
+
 /// The substitution that carries one declaration's type-variable names onto
 /// the canonical ones, matched by **position**: `own[i]` and `canonical[i]`
 /// are one type variable however the two declarations spell it.
@@ -1780,6 +1795,10 @@ impl QuietMark {
 /// slots for) has no canonical variable to become, so it maps to `unknown` —
 /// the same leniency a bare generic reference gets for the arguments it omits,
 /// rather than a dangling placeholder no instantiation could ever substitute.
+///
+/// Implementation detail of [`class_param_unification`] — merge seams call
+/// that, never this directly, so the "when" and the "what" of the rule stay
+/// in one place.
 fn positional_rename(own: &[String], canonical: &[String]) -> BTreeMap<String, Ty> {
     own.iter()
         .enumerate()
@@ -1792,19 +1811,11 @@ fn positional_rename(own: &[String], canonical: &[String]) -> BTreeMap<String, T
         .collect()
 }
 
-/// Rewrite one declaration's type-variable placeholders onto the canonical
-/// parameter names, **positionally** — `own[i]` and `canonical[i]` name the
-/// same type variable, so `---@class Boxed<U>`'s field typed `U` becomes the
-/// canonical `T` before the templates merge.
-///
-/// A surplus parameter (the declaration names more than the canonical list
-/// has slots for) has no canonical variable to become, so it collapses to
-/// `unknown` — the same leniency a bare generic reference gets for the
-/// arguments it omits, rather than a dangling placeholder no instantiation
-/// could ever substitute.
-fn rename_template_params(template: &TableTy, own: &[String], canonical: &[String]) -> TableTy {
-    let map = positional_rename(own, canonical);
-    match crate::generics::subst_ty(&Ty::Table(Box::new(template.clone())), &map) {
+/// Rewrite one declaration's type-variable placeholders through a
+/// [`class_param_unification`] substitution — `---@class Boxed<U>`'s field
+/// typed `U` becomes the canonical `T` before the templates merge.
+fn rename_template_params(template: &TableTy, map: &BTreeMap<String, Ty>) -> TableTy {
+    match crate::generics::subst_ty(&Ty::Table(Box::new(template.clone())), map) {
         Ty::Table(table) => *table,
         // `subst_ty` maps a `Ty::Table` to a `Ty::Table`; this arm is
         // unreachable, and falling back to the un-renamed template keeps the
