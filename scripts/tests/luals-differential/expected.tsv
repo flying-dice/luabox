@@ -1,0 +1,29 @@
+# luals parity expectations: one row per corpus case.
+#
+#   case          the .lua file in this directory (without extension)
+#   luabox        diag | clean — does `luabox check` (strict) report anything?
+#   luals         diag | clean — does lua-language-server --check report any
+#                 diagnostic from the type-parity code set (see the script)?
+#   note          for AGREE rows, what the case pins; for DIVERGE rows
+#                 (luabox != luals), WHY the divergence is intentional.
+#
+# The two columns are NOT asserted equal — a row where they differ is a
+# reviewed, justified divergence, visible in this file rather than buried in
+# an allowlist. What the script enforces is that both columns match what is
+# written down, so a parity drift in either tool shows up as a diff against
+# a claim (the lb0510-matrix discipline, applied to luals parity).
+#
+# Measured against lua-language-server 3.13.5 (the version CI pins).
+#
+# case	luabox	luals	note
+clean_control	clean	clean	control: an annotated, well-typed file is clean in both
+trailing_nil_param_omitted	clean	clean	#49: omitting a TRAILING `number|nil` param is fine in both (measured, was guessed before)
+optional_param_trailing_omitted	clean	clean	#49: `---@param b? number` omitted — the `?` spelling agrees with the `|nil` spelling
+nontrailing_nil_param_omitted	diag	diag	#49 residual RESOLVED BY MEASUREMENT: luals reports missing-parameter for an omitted NON-trailing `number|nil` param, so luabox's conservative trailing-only bound matches luals exactly
+string_receiver_methods	clean	clean	#48: `s:upper()`, chained `:sub`, `:len` on a string receiver type in both
+string_receiver_misspelt	diag	diag	#48: a misspelt string method is undefined-field there, LB0306 here
+plain_param_type_mismatch	diag	diag	baseline: string passed to a number param is rejected by both
+undefined_field_on_class	diag	diag	baseline: unknown member on a `---@type` instance is rejected by both
+duplicate_class_union	clean	clean	#46/#49: two `---@class Config` declarations union their fields in both
+duplicate_field_conflict_first_wins	diag	diag	both flag a same-name field re-declared at a different type, by different rules: luals unions (`string|number` fails the number param), luabox keeps the first (LB0311 + LB0300) — divergent semantics, agreeing presence; the semantic divergence is recorded in docs/03-reference/02-limitations.md
+renamed_generic_duplicate	clean	diag	INTENTIONAL DIVERGENCE: lua-language-server 3.13.5 does not support generic classes (`---@class Boxed<T>` yields undefined-doc-name for `T`), while luabox implements them per the LuaCATS generics spec — luabox is deliberately ahead, not lagging; re-measure when the pinned luals version gains support

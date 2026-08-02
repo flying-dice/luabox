@@ -726,9 +726,13 @@ What that leaves, stated plainly:
     boundary. **Only a trailing run counts.** A nil-admitting parameter
     *followed by a required one* still requires an argument, because a caller
     cannot skip a middle argument in Lua without writing `nil` in its place —
-    relaxing that slot would let a genuinely short call through. luals's exact
-    behaviour in that position could not be verified here, and this is the
-    direction that cannot be wrong in the dangerous way. Equally narrow:
+    relaxing that slot would let a genuinely short call through. This bound
+    was taken conservatively when luals could not be run here; it has since
+    been **measured**: lua-language-server 3.13.5 reports `missing-parameter`
+    for exactly that call, so the trailing-only rule matches luals, and the
+    `nontrailing_nil_param_omitted` row of the luals parity gate
+    (`scripts/tests/luals-differential.sh`, CI job `luals-parity`) keeps it
+    measured. Equally narrow:
     "admits `nil`" means the type *says* `nil`. `---@param b any` and
     `---@param b unknown` accept `nil` assignably but only decline to
     constrain the parameter, so they stay required.

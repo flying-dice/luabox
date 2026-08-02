@@ -27,6 +27,22 @@ Coverage runs as two isolated suites (unit and black-box e2e) with
 `coverage-unit` and `coverage-e2e` jobs in ci.yml for the exact package lists
 and floors.
 
+Two comparison gates run against external ground truth and need extra
+binaries locally (CI always has them):
+
+```sh
+bash scripts/tests/luals-differential.sh   # type-checker parity vs lua-language-server (#57)
+bash scripts/tests/lb0510-matrix.sh        # LB0510 lint verdicts vs real lua5.4 runtime
+```
+
+The luals gate compares `luabox check` and a **pinned** lua-language-server
+(version in `.github/workflows/luals-parity.yml`) over the corpus in
+`scripts/tests/luals-differential/`, against the committed two-column
+expectations in that directory's `expected.tsv` — intentional divergences are
+justified rows there, not a hidden allowlist. Without a local
+lua-language-server (or `LUALS=/path/to/bin`) its column SKIPs loudly and the
+luabox column still runs.
+
 ## Conventions
 
 - Restriction lints deny `unwrap`/`expect`/`panic` in non-test code.

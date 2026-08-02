@@ -1,0 +1,57 @@
+# luals parity differential (#57): run lua-language-server over the corpus in
+# scripts/tests/luals-differential/ and compare both tools' verdicts against
+# the committed expectations. Merge-blocking: no continue-on-error — a parity
+# drift in either tool is a diff against a claim and fails the job.
+#
+# The luals version is PINNED (binary release, sha256-verified): the point of
+# the gate is that "matches luals" is measured against a named version, not
+# against whatever happened to be latest. Bumping the pin is a deliberate
+# change that re-measures every row (see the intentional-divergence rows in
+# expected.tsv for what may flip).
+name: luals-parity
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/luabox-types/**"
+      - "crates/luabox-cli/**"
+      - "scripts/tests/luals-differential.sh"
+      - "scripts/tests/luals-differential/**"
+      - ".github/workflows/luals-parity.yml"
+  pull_request:
+    paths:
+      - "crates/luabox-types/**"
+      - "crates/luabox-cli/**"
+      - "scripts/tests/luals-differential.sh"
+      - "scripts/tests/luals-differential/**"
+      - ".github/workflows/luals-parity.yml"
+
+env:
+  LUALS_VERSION: "3.13.5"
+  LUALS_SHA256: "5d4316291b8c79b145002318fbb7cc294a327c314e2711e590609b178478eb59"
+
+jobs:
+  luals-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install lua-language-server ${{ env.LUALS_VERSION }} (pinned)
+        run: |
+          curl -sSL -o luals.tar.gz \
+            "https://github.com/LuaLS/lua-language-server/releases/download/${LUALS_VERSION}/lua-language-server-${LUALS_VERSION}-linux-x64.tar.gz"
+          echo "${LUALS_SHA256}  luals.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/luals"
+          tar xzf luals.tar.gz -C "$HOME/luals"
+          "$HOME/luals/bin/lua-language-server" --version
+
+      - name: Build luabox (release)
+        run: cargo build --locked --release --bin luabox
+
+      - name: Run the parity differential
+        run: LUALS="$HOME/luals/bin/lua-language-server" scripts/tests/luals-differential.sh
