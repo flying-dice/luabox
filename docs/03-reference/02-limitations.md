@@ -691,18 +691,17 @@ What that leaves, stated plainly:
   errors about code that claims nothing. A rock with no LuaCATS annotations
   still gives you nothing, per the first bullet above.
 
-  Three edges remain out, each far narrower than the bound it replaces:
+  Two edges remain out, each far narrower than the bound it replaces (a
+  third — a member declared only as a `---@field` on an exported
+  `---@class`, never assigned — closed with #56: the carrier now crosses
+  the boundary as the class it carries, and the class's declared surface is
+  exactly what `---@field` lines populate, so the declared and attached
+  spellings are argument-checked identically):
 
   - **A dynamic require path** — `require(name)` for a computed `name` —
     resolves to no module, so its result stays `unknown` and nothing about it
     is checked. Static string literals are the resolvable set, the same set
     the bundler accepts.
-  - **A member declared only as a `---@field`** on an exported `---@class`,
-    with no `function M.f` defining it, does not reach the consumer: a
-    module's export type is the shape of the value it returns, and a
-    `---@field` line declares a member without assigning one. The same class
-    with its members *attached* (`function Api.send(...)`) is checked
-    normally. What is missing here is the member, not its signature.
   - **A function re-exported from a second `require`** — module B does
     `local a = require("a"); return { f = a.f }` and a consumer calls
     `require("b").f(...)`. B's *own* requires are deliberately left
@@ -764,38 +763,35 @@ it points at is still not planned for 0.x; nothing needs it now.
 Your `*.rockspec` and luarocks own everything else (adding, updating,
 publishing), and you run your program with whatever Lua you already have.
 
-### A `---@class` module export: editor and CI both stop short (#54)
+### A `---@class` module export: closed, in both spellings (#54 → #56)
 
-The editor reads `require` bindings through the same resolver the type pass
-does, so hover and completion agree with CI for the ordinary `local M = {} …
-return M` module. One shape does not close, in **both** of its spellings: a
-module whose export is a `---@class`. The class's `---@field`s live in the
-declaring file's ambient environment, and the per-file view the editor
-surfaces are built on cannot reach it — so **the module's members get no
-hover and are not offered by completion, either way**.
+This section used to record the one shape that did not close: a module
+whose export is a `---@class`. The class's `---@field`s live in the
+workspace ambient environment, and the per-file view the editor surfaces
+were built on could not reach it. Two things closed it (#56): the export
+now crosses the `require` boundary **as the class it carries** — the
+workspace-global identity, which is what luals resolves a require to — and
+hover/completion resolve class members through the **same merged ambient
+environment** the checker enforces, so the editor cannot offer what
+`luabox check` rejects or omit what it accepts.
 
-What is left of the binding differs between the two spellings, and the
-difference is measured, not assumed. Both rows are pinned by fixtures —
-`tests/features/lsp/hover-require.feature` for the editor column,
-`tests/features/frontend/require.feature` for CI.
+The table below is still measured, not assumed — the same fixtures pin the
+new behaviour: `tests/features/lsp/hover-require.feature` for the editor
+columns, `tests/features/frontend/require.feature` for CI.
 
 Given `---@class Point` / `---@field x number` in `point.lua` and
 `local p = require("point")` in the consumer:
 
 | module spells its export as | binding hovers as | `p.x` hover | `p.` completion | `luabox check` |
 | --- | --- | --- | --- | --- |
-| a class **instance** — `---@type Point` on the returned local | `local p: Point` | none | omits `x` | enforces: `p.x` is `number`, `p.nope` is `LB0306` |
-| a class **carrier** — `---@class Point` over `local P = {}` | `local p: {  }` (the structural table the carrier is) | none | omits `x` | lenient: `p.x` crosses as `unknown` and `p.nope` is accepted |
+| a class **instance** — `---@type Point` on the returned local | `local p: Point` | `Point.x: number` | offers `x` | enforces: `p.x` is `number`, `p.nope` is `LB0306` |
+| a class **carrier** — `---@class Point` over `local P = {}` | `local p: Point` | `Point.x: number` | offers `x` | enforces: `p.x` is `number`, `p.nope` is `LB0306` |
 
-So the instance spelling is the one where the editor is genuinely narrower
-than CI. The carrier spelling is not an editor gap at all — both sides see
-the structural table, and they agree.
-
-**The way to get the class enforced is to name it**: `---@param p Point`, or
-`---@type Point` on the binding. Class names are workspace-global, so the
-`require` is not what carries the type — no `require` is needed for the type
-at all. With the class named, members are typed, hovered, completed and
-checked on both sides.
+The two spellings are symmetric now, and naming the class directly
+(`---@param p Point`, `---@type Point`) is equivalent rather than a
+workaround — class names are workspace-global, so the editor resolves a
+class's members with no `require` in sight, exactly as the checker always
+did.
 
 ### `build --mode love` requires an external zip tool
 

@@ -8,7 +8,51 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ## [Unreleased]
 
+### Changed
+
+- **A `---@class` module export crosses `require` as the class, in both
+  spellings** (#56). A returned *carrier* (`---@class Point` over
+  `local P = {}`) used to cross the boundary as the structural table it
+  happens to be — empty, since `---@field` lines declare members without
+  assigning them — so consumers got leniency: `p.x` arrived `unknown`,
+  `p.nope` was accepted, and a `---@field`-declared function was never
+  argument-checked. The export position now reifies the carrier as the
+  class it carries, the workspace-global identity luals resolves a require
+  to, making the carrier and instance spellings symmetric: members typed,
+  `p.nope` an `LB0306`, `---@field`-declared functions argument-checked.
+  Strictly narrowing for code that leaned on the old leniency — that
+  leniency was a disclosed limitation, and the shape it hid is exactly the
+  one the wave-25 review flagged. Inside the declaring file nothing
+  changes; only what crosses `require` does.
+
 ### Added
+
+- **Hover and completion resolve class members through the checker's
+  ambient environment** (#56). The editor surfaces were built on a per-file
+  view, so a class declared in another file — named via `---@type`, or
+  arriving through a `require` — had no member hover and no member
+  completion even while diagnostics enforced those members. Both surfaces
+  now read the same merged defs + workspace-global + rocks environment the
+  diagnostics pipeline checks against (`Ambient::class_members`), so what
+  the editor offers is what `luabox check` enforces — the last row of the
+  `#54` limitations table, closed from both ends.
+
+- **A lua-language-server parity gate** (#57). "Matches luals" is now
+  measured, not claimed: `scripts/tests/luals-differential.sh` re-derives
+  both tools' verdicts over a corpus of parity-sensitive shapes and diffs
+  them against committed two-column expectations, where an intentional
+  divergence is a justified row rather than a hidden allowlist. CI pins
+  luals 3.13.5 by sha256. The gate's first run resolved the one guessed
+  bound from #49 by measurement: luals requires an omitted *non-trailing*
+  nil-admitting parameter exactly as luabox does.
+
+- **Property coverage for duplicate generic-class declarations** (#59). The
+  positional-unification rule that #46 needed at three separate merge seams
+  now has a single owner (`class_param_unification`), and a proptest
+  generator covers the duplicate-declaration shape space — parameter
+  spellings × field placement × declaration order × same/cross-file — with
+  behavioural probes in both directions, so the next shape in that family
+  is found by a generator instead of a reviewer.
 
 - **`luabox lint --format json|sarif|github|gitlab`.** `lint` had no
   `--format` at all, so `luabox lint --format json` exited 2 — clap rejecting
