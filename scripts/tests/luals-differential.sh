@@ -117,7 +117,18 @@ while IFS=$'\t' read -r case_name want_luabox want_luals note; do
     fi
 
     # --- luabox column ----------------------------------------------------
+    rm -f "$work/src"/*.lua
     cp "$src" "$work/src/main.lua"
+    # Cross-file cases: a `<case>.deps` sidecar names sibling module files
+    # (one per line) copied in under their own names, so the case's
+    # `require("name")` resolves for luabox exactly as it does for luals
+    # (whose workspace is the corpus directory itself).
+    if [ -f "$corpus/$case_name.deps" ]; then
+        while IFS= read -r dep; do
+            [ -n "$dep" ] || continue
+            cp "$corpus/$dep" "$work/src/$dep"
+        done <"$corpus/$case_name.deps"
+    fi
     out="$( (cd "$work" && "$luabox" check) 2>&1 )"
     summary="$(printf '%s\n' "$out" | grep -E '^check: ' || true)"
     if [ -z "$summary" ]; then
@@ -154,9 +165,15 @@ while IFS=$'\t' read -r case_name want_luabox want_luals note; do
 done < "$expected"
 
 # Every corpus file must be claimed by a row — an unclaimed case is coverage
-# that silently isn't (the no-silent-caps rule).
+# that silently isn't (the no-silent-caps rule). Files named by a `.deps`
+# sidecar are support modules for a cross-file case, not cases.
+support="$(cat "$corpus"/*.deps 2>/dev/null || true)"
 for src in "$corpus"/*.lua; do
+    base="$(basename "$src")"
     name="$(basename "$src" .lua)"
+    if printf '%s\n' "$support" | grep -qxF "$base"; then
+        continue
+    fi
     if [ -z "${seen[$name]:-}" ]; then
         echo "FAIL  $name.lua exists in the corpus but expected.tsv has no row for it" >&2
         fails=$((fails + 1))

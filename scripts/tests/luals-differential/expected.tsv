@@ -37,3 +37,5 @@ inherited_member_misuse	diag	diag	inheritance: misusing an inherited field is re
 string_method_arg_mismatch	diag	diag	#48: `s:rep("three")` argument-checks with the receiver bound in both
 required_field_missing_from_literal	diag	diag	a literal missing a required ---@field is rejected by both (LB0300 here, missing-fields there)
 required_field_present_in_literal	clean	clean	control: the same literal with the field present is clean in both
+carrier_require_typed	clean	clean	#56 end-to-end: a require'd carrier module's declared member types through in both — luals resolves the require as the class, and since #56 so does luabox
+carrier_require_undeclared	diag	diag	#56 end-to-end: an undeclared member on the require'd carrier is rejected by both (LB0306 here, undefined-field there)
