@@ -7,6 +7,7 @@ use lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind};
 use luabox_hir::{BindingKind, Resolution};
 use luabox_syntax::lua::SyntaxKind;
 use luabox_syntax::lua::ast::{self, AstNode};
+use luabox_types::Ambient;
 use luabox_types::ty::Ty;
 use rowan::TextRange;
 
@@ -17,9 +18,17 @@ use crate::sema::{self, FileSema};
 ///
 /// `exports` is the shared `require` resolution ([`RequireExports`]) — the
 /// same map the type pass checks against, so a `require` binding hovers with
-/// the type the problems pane already agrees it has (#54).
+/// the type the problems pane already agrees it has (#54). `ambient` is the
+/// merged workspace environment the same pass enforces (#56), so a
+/// class-typed value's members hover with the types `luabox check` gives
+/// them, wherever the class is declared.
 #[must_use]
-pub fn hover(sema: &FileSema, offset: usize, exports: &RequireExports) -> Option<Hover> {
+pub fn hover(
+    sema: &FileSema,
+    offset: usize,
+    exports: &RequireExports,
+    ambient: &Ambient,
+) -> Option<Hover> {
     let token = sema.ident_at(offset)?;
     let token_range = token.text_range();
 
@@ -33,7 +42,7 @@ pub fn hover(sema: &FileSema, offset: usize, exports: &RequireExports) -> Option
     }
 
     // 2. A field / method access on a receiver with a known class type.
-    if let Some(hover) = member_hover(sema, &token, exports) {
+    if let Some(hover) = member_hover(sema, &token, exports, ambient) {
         return Some(hover);
     }
 
@@ -80,13 +89,15 @@ pub fn hover(sema: &FileSema, offset: usize, exports: &RequireExports) -> Option
     None
 }
 
-/// Hover for `recv.field` / `recv:method` when `recv`'s class is known, when
-/// `recv` is a `require` binding whose module exports the member, with a
-/// fallback to dotted function names (`M.helper`).
+/// Hover for `recv.field` / `recv:method` when `recv`'s class is known —
+/// declared in this file or resolved through the workspace ambient (#56) —
+/// when `recv` is a `require` binding whose module exports the member, with
+/// a fallback to dotted function names (`M.helper`).
 fn member_hover(
     sema: &FileSema,
     token: &luabox_syntax::lua::SyntaxToken,
     exports: &RequireExports,
+    ambient: &Ambient,
 ) -> Option<Hover> {
     let parent = token.parent()?;
     let (receiver, member) = match parent.kind() {
@@ -143,6 +154,29 @@ fn member_hover(
         let q = if field.optional { "?" } else { "" };
         let code = format!("(field) {module}.{}{q}: {}", member.text(), field.ty);
         return Some(reply(&code, "", &[], member.text_range(), sema));
+    }
+
+    // The receiver's class resolved through the workspace ambient (#56):
+    // its annotated type names a class some other file declares, or it is a
+    // `require` binding whose module exports a class — both `---@class`
+    // spellings cross the boundary as [`Ty::Named`] now. Members come out
+    // of the same merged surface the checker resolves against, qualified by
+    // the class name.
+    if let Some(binding) = sema.visible_binding_named(recv_token.text(), offset) {
+        let named = sema.annotated_named_type(binding).or_else(|| {
+            requires::require_module_of(sema, binding)
+                .and_then(|module| exports.get(module))
+                .and_then(requires::export_class)
+                .map(ToString::to_string)
+        });
+        if let Some(class) = named
+            && let Some(shape) = ambient.class_members(&class)
+            && let Some(field) = shape.fields.get(member.text())
+        {
+            let q = if field.optional { "?" } else { "" };
+            let code = format!("(field) {class}.{}{q}: {}", member.text(), field.ty);
+            return Some(reply(&code, "", &[], member.text_range(), sema));
+        }
     }
 
     // Fallback: an annotated dotted function `M.helper`.
@@ -274,7 +308,11 @@ mod tests {
         let (analysis, path) = analyze_files(files);
         let sema = FileSema::new(&analysis, &path).expect("sema");
         let exports = RequireExports::resolve(&analysis, &path, rocks);
-        hover(&sema, offset_of(src, needle, nth), &exports).map(|h| match h.contents {
+        // The merged workspace layer, exactly as the server builds it (#56).
+        let ambient = luabox_types::stdlib_defs(luabox_syntax::lua::Dialect::Lua54)
+            .with_project_types(&analysis.project_types())
+            .with_rock_types(rocks.types());
+        hover(&sema, offset_of(src, needle, nth), &exports, &ambient).map(|h| match h.contents {
             HoverContents::Markup(markup) => markup.value,
             other => panic!("expected markup hover contents, got {other:?}"),
         })
@@ -513,7 +551,9 @@ print(p.z)
         let (analysis, path) = analyze(src);
         let sema = FileSema::new(&analysis, &path).expect("sema");
         let exports = RequireExports::resolve(&analysis, &path, &RockSurfaces::default());
-        let hovered = hover(&sema, offset_of(src, "answer", 1), &exports).expect("hover");
+        let ambient = luabox_types::stdlib_defs(luabox_syntax::lua::Dialect::Lua54)
+            .with_project_types(&analysis.project_types());
+        let hovered = hover(&sema, offset_of(src, "answer", 1), &exports, &ambient).expect("hover");
         let range = hovered.range.expect("range");
         assert_eq!(range.start, lsp_types::Position::new(1, 6));
         assert_eq!(range.end, lsp_types::Position::new(1, 12));
@@ -661,17 +701,13 @@ print(p.z)
         assert!(!second.contains("helper"), "{second}");
     }
 
-    /// The one shape that does *not* fully close: a module whose export is a
-    /// `---@class` instance rather than a table literal. The export type is
-    /// `Ty::Named("Point")`, so the binding hovers as the class — useful, and
-    /// what the type pass has — but the class's `---@field`s live in the
-    /// *declaring* file, and resolving them needs the ambient environment
-    /// only the type pass holds. Members of such a module therefore have no
-    /// hover here while diagnostics still check them. Pinned so the boundary
-    /// is a recorded fact rather than a surprise; the README scopes the claim
-    /// to match.
+    /// The shape that used to be the recorded boundary (#54), closed by #56:
+    /// a module whose export is a `---@class` instance. The binding hovers
+    /// as the class, and the class's `---@field`s — declared in the *other*
+    /// file — now resolve through the merged workspace ambient, the same
+    /// environment diagnostics check the access against.
     #[test]
-    fn a_class_instance_module_hovers_as_the_class_but_has_no_member_hover() {
+    fn a_class_instance_module_hovers_as_the_class_with_member_hover() {
         let files = [
             (
                 "main.lua",
@@ -684,7 +720,31 @@ print(p.z)
         ];
         let binding = at_files(&files, "p)", 0).expect("hover");
         assert!(binding.contains("local p: Point"), "{binding}");
-        assert_eq!(at_files(&files, "x)", 0), None);
+        let member = at_files(&files, "x)", 0).expect("member hover");
+        assert!(member.contains("Point.x"), "{member}");
+        assert!(member.contains("number"), "{member}");
+    }
+
+    /// The carrier spelling closes identically (#56): the export crosses as
+    /// the class it carries, so the binding hovers as the class name and
+    /// members resolve through the same merged ambient.
+    #[test]
+    fn a_class_carrier_module_hovers_as_the_class_with_member_hover() {
+        let files = [
+            (
+                "main.lua",
+                "local p = require(\"point\")\nprint(p)\nprint(p.x)\n",
+            ),
+            (
+                "point.lua",
+                "---@class Point\n---@field x number\nlocal P = {}\nreturn P\n",
+            ),
+        ];
+        let binding = at_files(&files, "p)", 0).expect("hover");
+        assert!(binding.contains("local p: Point"), "{binding}");
+        let member = at_files(&files, "x)", 0).expect("member hover");
+        assert!(member.contains("Point.x"), "{member}");
+        assert!(member.contains("number"), "{member}");
     }
 
     #[test]

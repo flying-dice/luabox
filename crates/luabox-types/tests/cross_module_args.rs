@@ -450,27 +450,23 @@ local x = Box.grow(b, "nope")
 }
 
 /// A member that exists **only** as a `---@field` on the exported class — no
-/// `function M.f` anywhere — does not reach the consumer, so its calls are
-/// unchecked. A disclosed remaining edge, not an argument-checking one: what
-/// is missing at the boundary is the *member*, not its signature.
+/// `function M.f` anywhere — now reaches the consumer argument-checked
+/// (#56): the carrier crosses the `require` boundary as the class it
+/// carries, and the class's declared surface is exactly what `---@field`
+/// lines populate.
 ///
-/// A `---@class`'s `---@field` lines live in the type environment, while a
-/// module's export type is the reified shape of the value it returns, and the
-/// carrier `local Api = {}` accumulates only what is assigned to it. So the
-/// consumer receives an empty table and `api.send` resolves to nothing to
-/// check. Exporting the carrier as `Ty::Named("Api")` instead was tried and
-/// rejected: it makes the class's *declared* surface authoritative over the
-/// accumulated one, which produced false `LB0306`/`LB0300` on valid code in
-/// `cross_file_require::require_of_class_module_resolves_inherited_method`
-/// (a class module whose methods are attached, not declared). False positives
-/// on correct code are the one outcome this work may not trade for.
-///
-/// The same class *with its methods attached* — `function Api.send(...)` — is
-/// checked; that is `cross_module_table_field_call_is_argument_checked` and
-/// the colon-method test above. Disclosed in
-/// `docs/03-reference/02-limitations.md`.
+/// History, because this exact design was once tried and REJECTED: the
+/// rejection's false positives (`LB0306`/`LB0300` on a class module whose
+/// methods are attached, not declared) were measured on a test harness that
+/// skipped `with_project_types` — the workspace-global class merge every
+/// real surface performs, which is what carries `function Api.send(...)`
+/// attachments into the class. With the harness made pipeline-faithful
+/// (`cross_file_require::require_of_class_module_resolves_inherited_method`,
+/// green), the attached-method shape stays clean and the declared shape
+/// checks — the two spellings are finally symmetric, which is luals's
+/// behaviour too.
 #[test]
-fn declaration_only_class_member_is_not_reached_across_the_boundary() {
+fn declaration_only_class_member_is_argument_checked_across_the_boundary() {
     let diags = check_with(
         r"
 ---@class Api
@@ -483,7 +479,7 @@ local api = require("mod")
 local ok = api.send(42)
 "#,
     );
-    assert_eq!(codes(&diags), Vec::<String>::new(), "{diags:#?}");
+    assert_eq!(codes(&diags), vec!["LB0300"], "{diags:#?}");
 }
 
 /// The counterpart that *is* checked: the same class with its member attached

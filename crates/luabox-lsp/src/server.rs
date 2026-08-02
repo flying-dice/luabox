@@ -1500,7 +1500,8 @@ impl Server {
     fn hover(&self, uri: &Uri, position: lsp_types::Position) -> Option<Hover> {
         let (snapshot, sema, offset) = self.at(uri, position)?;
         let exports = self.require_exports(&snapshot, &sema.path);
-        hover::hover(&sema, offset, &exports)
+        let ambient = self.merged_ambient(&snapshot);
+        hover::hover(&sema, offset, &exports, &ambient)
     }
 
     /// The shared `require` resolution for one file — the same map the
@@ -1508,6 +1509,19 @@ impl Server {
     /// cannot type a `require` binding differently from the problems pane.
     fn require_exports(&self, snapshot: &Analysis, path: &Path) -> RequireExports {
         RequireExports::resolve(snapshot, path, &self.rocks)
+    }
+
+    /// The merged ambient layer for the editor surfaces — defs, then the
+    /// workspace-global project types, then the rock tree, merged exactly as
+    /// the diagnostics pipeline merges them (see [`diagnostics::diagnostics`]),
+    /// so hover and completion resolve a class's members against the very
+    /// environment `luabox check` enforces (#56). Built per request off the
+    /// same snapshot the view came from; `project_types` itself is memoized,
+    /// so the cost is the surface merge the diagnostics path already pays.
+    fn merged_ambient(&self, snapshot: &Analysis) -> Ambient {
+        self.ambient
+            .with_project_types(&snapshot.project_types())
+            .with_rock_types(self.rocks.types())
     }
 
     /// The callee's resolved signature(s) while `position` sits inside a
@@ -1610,8 +1624,9 @@ impl Server {
     ) -> Option<Vec<lsp_types::CompletionItem>> {
         let (snapshot, sema, offset) = self.at(uri, position)?;
         let exports = self.require_exports(&snapshot, &sema.path);
+        let ambient = self.merged_ambient(&snapshot);
         Some(completion::completion(
-            &sema, offset, &snapshot, &self.root, &exports,
+            &sema, offset, &snapshot, &self.root, &exports, &ambient,
         ))
     }
 

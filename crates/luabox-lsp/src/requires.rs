@@ -146,34 +146,33 @@ pub fn require_module_of<'a>(sema: &'a FileSema, binding: &Binding) -> Option<&'
 /// The named fields of a module export, when the export is a structural table
 /// — the shape of the overwhelmingly common `local M = {} … return M` module.
 ///
-/// A `---@class` module's fields live in the class declaration rather than in
-/// the type, and resolving those needs the ambient environment the *type pass*
-/// holds, not the per-file view these surfaces are built on. So members of
-/// such a module are not offered, in either of its two spellings — and the two
-/// differ in what is left, which is worth stating exactly because it is not
-/// symmetrical (measured; pinned by
-/// `tests/features/lsp/hover-require.feature` and recorded in
-/// `docs/03-reference/02-limitations.md`):
-///
-/// * A **class instance** export (`---@type Point` on the returned local) is
-///   [`Ty::Named`], so the binding hovers as `Point` — the class name is the
-///   half that survives — while `p.x` has no hover and completion omits `x`.
-///   `luabox check` types `p.x` as `number` and reports `p.nope`, so the
-///   editor is strictly narrower than CI here.
-/// * A **class carrier** export (`---@class Point` over `local P = {}`) is
-///   the structural table the carrier itself is, so the binding hovers as
-///   that table (`local p: {  }`) rather than as `Point`, and `p.x` again has
-///   no hover and no completion. CI does not enforce this one either: `p.x`
-///   crosses the boundary as `unknown` and `p.nope` is accepted, so the two
-///   sides agree in *leniency* rather than the editor lagging.
-///
-/// Naming the class directly (`---@param p Point`) enforces it on both sides;
-/// class names are workspace-global, so the `require` is not what carries the
-/// type.
+/// A `---@class` module export is the other shape, and it is [`Ty::Named`]
+/// in **both** of its spellings (#56): an *instance* export (`---@type
+/// Point` on the returned local) always was, and a *carrier* export
+/// (`---@class Point` over `local P = {}`) now crosses the `require`
+/// boundary as the class it carries — the workspace-global identity, which
+/// is what luals resolves the require to. This function declines those;
+/// [`export_class`] is their half, and members resolve through the merged
+/// ambient environment ([`luabox_types::Ambient::class_members`]) — the
+/// same surface `luabox check` enforces, in the editor and in CI alike.
 #[must_use]
 pub fn export_fields(ty: &Ty) -> Option<&BTreeMap<String, FieldTy>> {
     match ty {
         Ty::Table(table) => Some(&table.fields),
+        _ => None,
+    }
+}
+
+/// The class a module export names, when the export crossed the boundary as
+/// a class (#56) — both `---@class` spellings do: the carrier exports as
+/// the class it carries, the instance as its `---@type`. The counterpart of
+/// [`export_fields`]; members come from
+/// [`luabox_types::Ambient::class_members`], never from the export type
+/// itself.
+#[must_use]
+pub fn export_class(ty: &Ty) -> Option<&str> {
+    match ty {
+        Ty::Named(name) => Some(name),
         _ => None,
     }
 }

@@ -289,7 +289,7 @@ pub(crate) fn run(
         .get(&hir.chunk())
         .filter(|data| data.returns_set)
         .and_then(|data| data.returns.first().cloned())
-        .map(|ity| infer.reify(&ity));
+        .map(|ity| infer.reify_export(&ity));
     // The final accumulated shape of every carrier local, snapshotted after
     // both passes so later `X.f = ...` / `function X:m()` extensions are all
     // in (whole-carrier conformance).

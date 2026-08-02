@@ -15,6 +15,7 @@ use lsp_types::{
 use luabox_db::Analysis;
 use luabox_hir::BindingKind;
 use luabox_syntax::luacats::FieldKey;
+use luabox_types::Ambient;
 use luabox_types::ty::Ty;
 
 use crate::requires::{self, RequireExports};
@@ -31,7 +32,9 @@ const KEYWORDS: &[&str] = &[
 /// exports and reversing each target file to its `require` module path.
 /// `exports` is the shared `require` resolution ([`RequireExports`]), so
 /// members of a `require` binding come from the same map the type pass checks
-/// against (#54).
+/// against (#54). `ambient` is the merged workspace environment the same
+/// pass enforces (#56), so a class-typed receiver's members are offered with
+/// the types `luabox check` gives them, wherever the class is declared.
 #[must_use]
 pub fn completion(
     sema: &FileSema,
@@ -39,6 +42,7 @@ pub fn completion(
     analysis: &Analysis,
     project_root: &Path,
     exports: &RequireExports,
+    ambient: &Ambient,
 ) -> Vec<CompletionItem> {
     let text = sema.index.text();
     let bytes = text.as_bytes();
@@ -58,7 +62,7 @@ pub fn completion(
 
     let mut items: BTreeMap<String, CompletionItem> = BTreeMap::new();
     if let Some(trigger) = trigger {
-        member_items(sema, text, start - 1, trigger, exports, &mut items);
+        member_items(sema, text, start - 1, trigger, exports, ambient, &mut items);
     } else {
         scope_items(sema, offset, &mut items);
         // Auto-require runs after scope items so names already in scope
@@ -74,7 +78,8 @@ pub fn completion(
 }
 
 /// Fields/methods of the receiver identifier ending at `dot_offset`: the
-/// receiver's `---@class` fields, or — for a `require` binding — the members
+/// receiver's `---@class` fields (declared in this file, or resolved through
+/// the workspace ambient, #56), or — for a `require` binding — the members
 /// of the required module's export type (#54).
 fn member_items(
     sema: &FileSema,
@@ -82,6 +87,7 @@ fn member_items(
     dot_offset: usize,
     trigger: u8,
     exports: &RequireExports,
+    ambient: &Ambient,
     items: &mut BTreeMap<String, CompletionItem>,
 ) {
     let bytes = text.as_bytes();
@@ -98,7 +104,11 @@ fn member_items(
     )]
     let receiver = &text[recv_start..dot_offset];
     let Some(class) = sema.class_of_name(receiver, recv_start) else {
+        // Not a file-local class: a plain module's structural export first,
+        // then the workspace-ambient class routes (#56) — the two fill
+        // disjoint shapes ([`Ty::Table`] vs [`Ty::Named`]/annotated names).
         require_member_items(sema, receiver, recv_start, trigger, exports, items);
+        ambient_member_items(sema, receiver, recv_start, trigger, exports, ambient, items);
         return;
     };
     for (field, declaring) in sema.class_fields(&class) {
@@ -183,6 +193,61 @@ fn require_member_items(
                 ..CompletionItem::default()
             },
         );
+    }
+}
+
+/// Members of a class-typed receiver resolved through the workspace ambient
+/// (#56): the receiver's annotated type names a class some other file
+/// declares, or it is a `require` binding whose module exports a class —
+/// both `---@class` spellings cross the boundary as [`Ty::Named`]. The
+/// member surface is [`Ambient::class_members`], the very shape the checker
+/// enforces, so completion cannot offer what `luabox check` rejects (or
+/// omit what it accepts). Declines for every other receiver.
+fn ambient_member_items(
+    sema: &FileSema,
+    receiver: &str,
+    recv_start: usize,
+    trigger: u8,
+    exports: &RequireExports,
+    ambient: &Ambient,
+    items: &mut BTreeMap<String, CompletionItem>,
+) {
+    let Some(binding) = sema.visible_binding_named(receiver, recv_start) else {
+        return;
+    };
+    let named = sema.annotated_named_type(binding).or_else(|| {
+        requires::require_module_of(sema, binding)
+            .and_then(|module| exports.get(module))
+            .and_then(requires::export_class)
+            .map(ToString::to_string)
+    });
+    let Some(class) = named else {
+        return;
+    };
+    let Some(shape) = ambient.class_members(&class) else {
+        return;
+    };
+    for (name, field) in &shape.fields {
+        let is_fun = matches!(field.ty, Ty::Function(_));
+        // After `:` only methods make sense.
+        if trigger == b':' && !is_fun {
+            continue;
+        }
+        let kind = if is_fun {
+            if trigger == b':' {
+                CompletionItemKind::METHOD
+            } else {
+                CompletionItemKind::FUNCTION
+            }
+        } else {
+            CompletionItemKind::FIELD
+        };
+        items.entry(name.clone()).or_insert_with(|| CompletionItem {
+            label: name.clone(),
+            kind: Some(kind),
+            detail: Some(format!("{class}.{name}: {}", field.ty)),
+            ..CompletionItem::default()
+        });
     }
 }
 
@@ -462,7 +527,11 @@ mod tests {
         let (analysis, path) = analyze(files);
         let sema = FileSema::new(&analysis, &path).expect("sema");
         let exports = RequireExports::resolve(&analysis, &path, rocks);
-        completion(&sema, offset, &analysis, &root(), &exports)
+        // The merged workspace layer, exactly as the server builds it (#56).
+        let ambient = luabox_types::stdlib_defs(luabox_syntax::lua::Dialect::Lua54)
+            .with_project_types(&analysis.project_types())
+            .with_rock_types(rocks.types());
+        completion(&sema, offset, &analysis, &root(), &exports, &ambient)
     }
 
     /// Completions at the byte offset just past `needle` in the first file.
@@ -707,7 +776,16 @@ local visible = 2
         let (analysis, path) = analyze(&[("main.lua", src)]);
         let sema = FileSema::new(&analysis, &path).expect("sema");
         let exports = RequireExports::resolve(&analysis, &path, &RockSurfaces::default());
-        let items = completion(&sema, src.len() + 500, &analysis, &root(), &exports);
+        let ambient = luabox_types::stdlib_defs(luabox_syntax::lua::Dialect::Lua54)
+            .with_project_types(&analysis.project_types());
+        let items = completion(
+            &sema,
+            src.len() + 500,
+            &analysis,
+            &root(),
+            &exports,
+            &ambient,
+        );
         assert!(labels(&items).contains(&"x"), "{:?}", labels(&items));
     }
 

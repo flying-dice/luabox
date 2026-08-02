@@ -151,9 +151,16 @@ fn shape_ambient() -> Ambient {
 
 #[test]
 fn require_of_class_module_resolves_inherited_method() {
-    let ambient = shape_ambient();
+    // The module's workspace-global types merge into the consumer's ambient
+    // (`with_project_types`) exactly as the real pipeline merges every
+    // checked file's — since #56 the export IS the class name, so the
+    // carrier's member attachments must arrive via that merge, not via a
+    // structural export type.
+    let base = shape_ambient();
+    let (export_ty, types) = surface(SHAPE_MODULE, &base);
+    let ambient = base.with_project_types([&types]);
     let mut requires = HashMap::new();
-    requires.insert("shape".to_string(), export(SHAPE_MODULE, &ambient));
+    requires.insert("shape".to_string(), export_ty);
 
     // `Shape.new(2)` types as the class; `:area()` resolves through the
     // ambient class declaration and produces `number`.
@@ -172,9 +179,11 @@ want(s:area())
 
 #[test]
 fn method_misuse_on_required_class_errors_at_consumer_site() {
-    let ambient = shape_ambient();
+    let base = shape_ambient();
+    let (export_ty, types) = surface(SHAPE_MODULE, &base);
+    let ambient = base.with_project_types([&types]);
     let mut requires = HashMap::new();
-    requires.insert("shape".to_string(), export(SHAPE_MODULE, &ambient));
+    requires.insert("shape".to_string(), export_ty);
 
     // Calling a method the class does not declare is an undefined-field
     // read (LB0306), reported in the consumer at the misuse site.

@@ -29,6 +29,35 @@ impl Infer<'_> {
         }
     }
 
+    /// [`Self::reify`] for the **module-export** position (#56).
+    ///
+    /// A returned `---@class` *carrier* crosses the `require` boundary as
+    /// the class it carries — [`Ty::Named`] — rather than as its structural
+    /// table, because the class is the workspace-global identity and it is
+    /// what luals resolves a `require` of the module to. Only the export
+    /// position does this: inside the declaring file the carrier stays
+    /// structural, so its own conformance obligations are unchanged.
+    /// (Instances need no arm here — an instance shape already reifies as
+    /// its declared name at every annotated boundary, per
+    /// [`Self::reify_shape`].)
+    pub(super) fn reify_export(&mut self, ity: &ITy) -> Ty {
+        match ity {
+            ITy::Shape(id) => {
+                if let Some(name) = self.shapes[*id].declared.clone()
+                    && self.env.resolve_named(&name).is_some()
+                {
+                    return Ty::Named(name);
+                }
+                self.reify_shape(*id)
+            }
+            ITy::Union(members) => {
+                let members = members.clone();
+                Ty::union(members.iter().map(|m| self.reify_export(m)).collect())
+            }
+            other => self.reify(other),
+        }
+    }
+
     fn reify_func(&mut self, body: BodyId) -> FunctionTy {
         if let Some(sig) = self.funcs.get(&body).and_then(|f| f.sig.clone()) {
             return sig;

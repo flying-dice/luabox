@@ -369,7 +369,12 @@ Feature: luabox check — cross-module argument checking (#46)
     Then the command succeeds
     And stderr contains "check: 0 errors, 0 warnings"
 
-  Scenario: a member declared only as a ---@field does not reach the consumer
+  # Before #56 this spelling was the disclosed gap: a `---@field`-declared
+  # member lived only in the class declaration, and the carrier crossed the
+  # boundary as its structural table — so the consumer never saw `send`. The
+  # export is the class now, so the declared and attached spellings are
+  # argument-checked identically (the next scenario is the attached twin).
+  Scenario: a member declared as a ---@field reaches the consumer argument-checked
     Given a strict project with edition "5.4"
     And a file "src/api.lua" containing:
       """
@@ -384,8 +389,8 @@ Feature: luabox check — cross-module argument checking (#46)
       local ok = api.send(42)
       """
     When I run "luabox check"
-    Then the command succeeds
-    And stderr contains "check: 0 errors, 0 warnings"
+    Then the command fails
+    And stdout contains "LB0300"
 
   Scenario: the same class member, attached rather than declared, is argument-checked
     Given a strict project with edition "5.4"

@@ -88,6 +88,22 @@ impl Ambient {
         &self.global_names
     }
 
+    /// The merged member surface of a class this layer declares: parents
+    /// folded in depth-first, carrier attachments and `---@field`
+    /// declarations unioned — exactly the shape the checker resolves a
+    /// member access against. `None` for a name that is not a class here.
+    ///
+    /// This is the editor surfaces' read path (#56): hover and completion
+    /// on a class-typed value resolve members through the same ambient
+    /// environment the type pass holds (build the layer with
+    /// [`Self::with_project_types`] / [`Self::with_rock_types`] first, as
+    /// the diagnostics pipeline does), so what the editor offers is what
+    /// `luabox check` enforces — one environment, not a parallel view.
+    #[must_use]
+    pub fn class_members(&self, name: &str) -> Option<crate::ty::TableTy> {
+        self.env.class_shape(name)
+    }
+
     /// A new ambient layer: this one plus the workspace-global
     /// `---@class`/`---@enum`/`---@alias` declarations collected from every
     /// checked project source file (luals parity: classes, enums, and

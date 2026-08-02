@@ -393,6 +393,17 @@ impl FileSema {
         self.classes().contains_key(name.as_str()).then_some(name)
     }
 
+    /// The bare named type of a binding's annotation, peeling `?` and
+    /// parentheses — WITHOUT requiring this file to declare it.
+    /// [`Self::class_of_binding`] answers for file-local classes; this is
+    /// the workspace-ambient surfaces' half (#56): the name is resolved
+    /// against the merged ambient environment instead, where classes are
+    /// workspace-global.
+    #[must_use]
+    pub fn annotated_named_type(&self, binding: &Binding) -> Option<String> {
+        named_of(&self.binding_type(binding)?)
+    }
+
     /// [`Self::class_of_binding`] for the nearest binding named `name`
     /// visible at `offset`.
     #[must_use]
