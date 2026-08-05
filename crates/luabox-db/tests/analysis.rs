@@ -509,6 +509,34 @@ fn set_root_rebases_require_resolution_and_is_visible_through_the_vfs() {
 }
 
 #[test]
+fn set_root_bumps_the_revision_like_any_other_input_write() {
+    // The revision is the cache key consumers key derived state on (the LSP's
+    // merged ambient layer), so it must move whenever an input does. `set_root`
+    // writes a salsa input; two snapshots either side of a re-root comparing
+    // equal would hand a re-rooted host a stale derivation with no signal.
+    let mut host = host();
+    let start = host.snapshot().revision();
+
+    host.set_root(PathBuf::from("/workspace"));
+    let rooted = host.snapshot().revision();
+    assert!(
+        rooted > start,
+        "set_root moved an input: {start} -> {rooted}"
+    );
+
+    // Reading, not writing, leaves it alone.
+    assert_eq!(host.snapshot().revision(), rooted);
+
+    host.apply_change(set("/workspace/main.lua", GOOD));
+    assert!(host.snapshot().revision() > rooted);
+
+    // A re-root is a re-root even when the path is one the host has seen.
+    let before = host.snapshot().revision();
+    host.set_root(PathBuf::from("/workspace"));
+    assert!(host.snapshot().revision() > before);
+}
+
+#[test]
 fn clearing_an_overlay_reverts_to_disk_and_ignores_unknown_paths() {
     let mut host = host();
     host.apply_change(set("a.lua", GOOD));

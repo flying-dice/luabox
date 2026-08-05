@@ -71,11 +71,14 @@ pub struct AnalysisHost {
     inputs: HashMap<FileId, SourceFile>,
     project: Project,
     default_dialect: Dialect,
-    /// Monotonic change counter: bumped by every [`Self::apply_change`], the
-    /// one choke point all mutations flow through, and carried onto each
-    /// [`Analysis`] snapshot. A consumer caching anything derived from a
-    /// snapshot (the LSP's merged ambient layer) keys the cache on this —
-    /// equal revisions mean no input changed, so the derivation is current.
+    /// Monotonic change counter: bumped by **every** method that writes a
+    /// salsa input — [`Self::apply_change`] and [`Self::set_root`] — and
+    /// carried onto each [`Analysis`] snapshot. A consumer caching anything
+    /// derived from a snapshot (the LSP's merged ambient layer) keys the cache
+    /// on this — equal revisions mean no input changed, so the derivation is
+    /// current. The invariant is only worth as much as its enforcement: any
+    /// new mutator added here bumps it too, whether or not today's derivations
+    /// happen to read the input it writes.
     revision: u64,
 }
 
@@ -104,7 +107,15 @@ impl AnalysisHost {
     /// resolve against `<root>/…` and `<root>/src/…` exactly as `luabox check`
     /// resolves them on disk. One root, one resolution ordering, editor and CI
     /// in lockstep.
+    ///
+    /// Bumps the change counter: the root is a salsa input like any other, so
+    /// a snapshot taken after a re-root must not compare equal to one taken
+    /// before it. Today's front-end calls this once at startup, before any
+    /// cache exists, and no cached derivation reads the root — but a cache key
+    /// that is right only by accident is a latent staleness bug, not an
+    /// invariant.
     pub fn set_root(&mut self, root: PathBuf) {
+        self.revision += 1;
         self.project.set_root(&mut self.db).to(root);
     }
 
@@ -222,9 +233,7 @@ impl Analysis {
     pub fn revision(&self) -> u64 {
         self.revision
     }
-}
 
-impl Analysis {
     /// The typecheck diagnostics for `path`, or `None` if it is not a known
     /// file. Equal to [`luabox_types::check_file`] over the file's source.
     #[must_use]
