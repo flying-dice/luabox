@@ -793,6 +793,66 @@ workaround — class names are workspace-global, so the editor resolves a
 class's members with no `require` in sight, exactly as the checker always
 did.
 
+**"Enforces" means the class's *declarations* are the member list**, so two
+shapes deserve naming — both measured, both with a spelling that resolves
+them.
+
+*A member attached under a computed key.* A carrier populated in a loop —
+
+```lua
+---@class Handlers
+local H = {}
+for _, name in ipairs({ "one", "two" }) do
+  H[name] = function() return name end
+end
+return H
+```
+
+— has members at runtime that are declared nowhere, so `h.one` in a consumer
+is `LB0306`. This is the one shape the closure genuinely narrows: it was
+accepted before the export crossed as the class. It is also **luals parity,
+not extra strictness** — lua-language-server 3.13.5 reports `undefined-field`
+on exactly the same read, measured as a row of the parity gate
+(`dynamic_key_carrier_require` in `scripts/tests/luals-differential/`).
+Declare the key space and both tools go clean:
+
+```lua
+---@class Handlers
+---@field [string] fun(): string
+```
+
+*A member reached through an undeclared `__index`.* The same rule in its
+other spelling: `local T = setmetatable({}, { __index = Proto })` on a
+`---@class` carrier borrows `Proto`'s members at runtime, and `Proto` is a
+plain table nothing declares — so `t.hello` through a `require` is `LB0306`.
+luals agrees here too (`undefined-field`, row
+`metatable_index_carrier_require`). Declare the member on the class, or make
+the delegate a class the carrier names as a parent (`---@class Thing : Proto`),
+and it resolves — an ordinary inheritance chain is unaffected.
+
+Statically visible attachments need nothing: dotted functions
+(`function H.one()`), colon methods, data fields, table-literal carriers and
+members assigned from a `require` all resolve as before — measured clean
+either side of the change.
+
+*A generic carrier with nothing bound.* A class name carries no type
+arguments, so `---@class Box<T>` crossing a `require` has no `T` to bind. Its
+members type as `unknown` — the same thing a bare `Box` reference means in an
+annotation — rather than leaking the parameter name into a consumer that
+cannot name it. Naming the arguments on the binding types them:
+
+```lua
+---@type Box<number>
+local b = require("box")
+```
+
+An *undeclared* member on a generic carrier stays lenient rather than
+`LB0306` — bound or not, and matching a bare `Box` annotation, since a
+generic class reaches its use site as the monomorphised template rather than
+as the name. luals 3.13.5 has no generic-class support at all, so the two
+generic rows in the parity corpus record where the tools part company and
+why (`generic_carrier_require`, `generic_carrier_require_bound`).
+
 ### `build --mode love` requires an external zip tool
 
 A `.love` file is a zip archive and luabox carries no zip implementation, so

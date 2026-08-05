@@ -41,13 +41,18 @@ The luals gate compares `luabox check` and a **pinned** lua-language-server
 expectations in that directory's `expected.tsv` — intentional divergences are
 justified rows there, not a hidden allowlist. Without a local
 lua-language-server (or `LUALS=/path/to/bin`) its column SKIPs loudly and the
-luabox column still runs.
+luabox column still runs. `LUABOX=` may be relative or absolute; the driver
+resolves it before running each case from a temp project directory.
 
 A third comparison gate runs on a weekly schedule rather than per-PR:
 mutation testing over `luabox-types` (`scripts/tests/mutants-gate.sh`, CI
 job `mutants`). Survivors diff against the committed allowlist in
 `scripts/tests/mutants-allowlist.txt` — a new survivor is a fixture gap and
-fails the job; a reviewed survivor is a justified line there.
+fails the job; a reviewed survivor is a justified line there. A **timed-out**
+mutant is judged the same way: no test killed it, the run just stopped
+waiting, so a new one fails the job rather than disappearing from the count.
+Its scope is the merge-seam neighbourhood, pinned in both the script default
+and the workflow; widening it to `check.rs` waits on #60.
 
 ## Writing fixtures that can fail
 

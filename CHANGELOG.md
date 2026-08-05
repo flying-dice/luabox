@@ -25,6 +25,18 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   one the wave-25 review flagged. Inside the declaring file nothing
   changes; only what crosses `require` does.
 
+  **One narrowing reaches code that works at runtime**, and it is worth
+  naming: a member attached to the carrier under a *computed* key
+  (`for _, n in ipairs(names) do H[n] = … end`) is declared nowhere, so
+  reading it through a `require` is now `LB0306`. Declaring the key space —
+  `---@field [string] fun(): string` on the class — makes it clean again.
+  Not a unilateral tightening: lua-language-server reports `undefined-field`
+  on the same read, and both verdicts are now corpus rows of the #57 parity
+  gate (`dynamic_key_carrier_require`, `dynamic_key_carrier_indexer`).
+  Statically visible attachments — dotted functions, colon methods, data
+  fields, table-literal carriers, members assigned from a `require` — are
+  measured unaffected.
+
 ### Added
 
 - **Hover and completion resolve class members through the checker's
@@ -70,6 +82,16 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   not break on the happy path (refs #53).
 
 ### Fixed
+
+- **A generic `---@class` carrier no longer exports its unbound type
+  parameter.** `---@class Box<T>` crossing a `require` handed the consumer
+  members typed `T` — a type variable it can neither name nor produce, so
+  `expected number, found T` pointed at no action. The export now carries the
+  same monomorphised template a bare `Box` reference lowers to: the unbound
+  parameter reads `unknown`, and `---@type Box<number>` on the binding — the
+  annotation that does bind it — types the members. The verdict is unchanged
+  either way; the diagnostic is what changed. Two parity-corpus rows now cover
+  a generic class crossing `require` in both directions.
 
 - **A generic `---@class`'s type parameters are scoped to the declaration that
   writes them.** Two declarations of one generic class may spell the parameter
