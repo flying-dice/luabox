@@ -44,6 +44,15 @@ if [ ! -x "$luabox" ]; then
     echo "error: no luabox binary at $luabox (build with: cargo build --release --bin luabox, or set LUABOX)" >&2
     exit 1
 fi
+# The luabox column runs each case from a temp project directory, so a
+# *relative* LUABOX — validated just above against the caller's cwd — would not
+# exist at the call site, and every row would fail on a binary the guard just
+# confirmed. Resolve it once here, against the cwd the guard used, so the
+# documented recovery path ("set LUABOX") cannot fabricate parity failures.
+case "$luabox" in
+/*) ;;
+*) luabox="$(cd "$(dirname "$luabox")" && pwd)/$(basename "$luabox")" ;;
+esac
 if [ ! -f "$expected" ]; then
     echo "error: no expectations at $expected" >&2
     exit 1
