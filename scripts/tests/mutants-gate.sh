@@ -18,9 +18,12 @@
 # prune (reported, not failed: killing a waived mutant is progress).
 #
 # Scope: the FILES env var (comma-separated, default the merge-seam
-# neighbourhood where the #46 family lived). The scheduled CI job widens it;
-# see .github/workflows/mutants.yml. Not per-PR: a full run costs tens of
-# minutes, which is why it rides a schedule instead of the merge path.
+# neighbourhood where the #46 family lived). The scheduled CI job pins the
+# same set explicitly rather than widening it — widening waits on #60, whose
+# finding is that check.rs's fallback is largely shadowed by inference, so
+# auditing it before that cleanup would allowlist noise rather than kill it.
+# See .github/workflows/mutants.yml. Not per-PR either way: a full run costs
+# tens of minutes, which is why it rides a schedule instead of the merge path.
 set -u
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -45,11 +48,9 @@ for f in "${parts[@]}"; do
 done
 
 echo "mutants-gate: cargo mutants -p luabox-types ${file_args[*]} (this takes a while)"
-# Exit 3 = missed mutants (judged by the allowlist comparison below), exit 4
-# = only timeouts. Anything else is a real failure. A mutant on the
-# timeout/missed boundary can flap between runs on a loaded machine; the
-# allowlist judges MISSED lines only, so a flap toward timeout reads as a
-# stale allowlist NOTE, never a failure.
+# Exit 3 = missed mutants, exit 4 = only timeouts. Both are judged below by
+# the allowlist comparison rather than by the exit code; anything else is a
+# real failure.
 (cd "$repo" && cargo mutants -p luabox-types "${file_args[@]}" -o "$out_dir")
 status=$?
 case "$status" in
@@ -62,6 +63,15 @@ esac
 
 missed="$out_dir/mutants.out/missed.txt"
 [ -f "$missed" ] || missed=/dev/null
+# A TIMED-OUT mutant is not a killed one: no test proved it dead, the run just
+# stopped waiting. Judging `missed.txt` alone would let a loaded runner — where
+# every survivor happens to time out — print "0 survivors" and exit 0, which is
+# the exact failure mode this gate exists to catch (an absence of signal read
+# as coverage). So timeouts are judged by the same allowlist: an already-
+# reviewed line that flaps missed -> timeout stays reviewed, a NEW timed-out
+# mutant is an unjudged one and fails.
+timeout="$out_dir/mutants.out/timeout.txt"
+[ -f "$timeout" ] || timeout=/dev/null
 
 # Column 1 of the allowlist is the exact cargo-mutants missed line; the
 # reviewed reason rides after a tab and is stripped for comparison.
@@ -79,21 +89,44 @@ while IFS= read -r line; do
     fi
 done <"$missed"
 
+new_timeouts=0
+while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    if grep -qxF "$line" "$waived"; then
+        echo "NOTE  allowlist line timed out this run rather than surviving outright: $line"
+    else
+        echo "FAIL  new timed-out mutant (no test killed it — the run stopped waiting): $line" >&2
+        fails=$((fails + 1))
+        new_timeouts=$((new_timeouts + 1))
+    fi
+done <"$timeout"
+
+# Stale = the allowlist line neither survived NOR timed out, i.e. a test now
+# kills it. A line that flapped to the timeout list is still unkilled, so it is
+# not stale and must not be pruned.
 stale=0
 while IFS= read -r line; do
     [ -n "$line" ] || continue
-    if ! grep -qxF "$line" "$missed"; then
+    if ! grep -qxF "$line" "$missed" && ! grep -qxF "$line" "$timeout"; then
         echo "NOTE  allowlist line no longer survives (a test now kills it — prune it): $line"
         stale=$((stale + 1))
     fi
 done <"$waived"
 rm -f "$waived"
 
-total="$(grep -c . "$missed" 2>/dev/null || echo 0)"
+# `grep -c` prints its count and exits 1 when that count is zero, so the
+# non-zero status is swallowed rather than answered with a second "0".
+count_lines() { grep -c . "$1" 2>/dev/null || true; }
+total="$(count_lines "$missed")"
+timed_out="$(count_lines "$timeout")"
 echo
-echo "mutants-gate: $total survivor(s), $new new, $stale stale allowlist line(s)"
+echo "mutants-gate: $total survivor(s), $timed_out timed out, $new new, $new_timeouts new timed out, $stale stale allowlist line(s)"
 if [ "$fails" -gt 0 ]; then
     echo "mutants-gate: FAILED — kill each new survivor with a test or add a reviewed allowlist line"
+    if [ "$new_timeouts" -gt 0 ]; then
+        echo "mutants-gate:   a timed-out mutant is unkilled, not killed — give it a faster test,"
+        echo "mutants-gate:   raise --timeout, or waive it with a reviewed reason like any survivor"
+    fi
     exit 1
 fi
-echo "mutants-gate: OK (survivors all reviewed)"
+echo "mutants-gate: OK ($total survivor(s) and $timed_out timeout(s) all reviewed)"

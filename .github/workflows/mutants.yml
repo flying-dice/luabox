@@ -34,9 +34,17 @@ jobs:
         with:
           tool: cargo-mutants
 
+      # The scope is pinned here rather than inherited, so what the weekly run
+      # audits is readable in the job and not only in the script's default.
+      # It is deliberately the same merge-seam set a local run gets: widening
+      # to check.rs waits on #60 (its fallback measured largely shadowed by
+      # inference, 74% kill rate), because auditing it before that cleanup
+      # lands would grow the allowlist rather than the coverage. Widening the
+      # set is an edit to this line and a matching allowlist review.
       - name: Run the mutation gate (merge-seam neighbourhood + infer core)
         run: |
-          MUTANTS_OUT="$RUNNER_TEMP/mutants" \
+          FILES="crates/luabox-types/src/env.rs,crates/luabox-types/src/defs.rs,crates/luabox-types/src/generics.rs,crates/luabox-types/src/infer/reify.rs" \
+            MUTANTS_OUT="$RUNNER_TEMP/mutants" \
             bash scripts/tests/mutants-gate.sh
 
       - name: Upload full mutants report

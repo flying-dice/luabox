@@ -4,6 +4,11 @@
 # not listed here fails the job; a listed line that stops surviving is
 # reported as stale to prune.
 #
+# TIMED-OUT mutants are judged against this same file: a timeout is an
+# unkilled mutant, not a killed one, so a new one fails the job and a listed
+# line that flaps missed -> timeout stays reviewed (and is not stale).
+# The line format is identical either way, so no separate section is needed.
+#
 # Reason classes (reviewed 2026-08-02; run of 407 mutants over the
 # merge-seam scope: 282 caught / 39 missed -> 13 killed by new tests,
 # now 16 waived below, every count MEASURED by a full verification run:
