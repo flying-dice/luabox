@@ -40,13 +40,31 @@ impl Infer<'_> {
     /// (Instances need no arm here — an instance shape already reifies as
     /// its declared name at every annotated boundary, per
     /// [`Self::reify_shape`].)
+    ///
+    /// A **generic** carrier is the one class this cannot name: `Ty::Named`
+    /// carries no type arguments, so `---@class Box<T>` would cross as `Box`
+    /// with its members still typed `T` — a variable the consumer can neither
+    /// name nor produce, in a diagnostic that points at no action. It crosses
+    /// instead as what a bare `Box` reference lowers to (#84): the template
+    /// with its unbound parameters as `unknown`. The two spellings of "a
+    /// generic class with nothing bound" then agree, and `---@type Box<number>`
+    /// — the annotation that *does* bind them — reads the same either side of
+    /// the `require`.
     pub(super) fn reify_export(&mut self, ity: &ITy) -> Ty {
         match ity {
             ITy::Shape(id) => {
                 if let Some(name) = self.shapes[*id].declared.clone()
-                    && self.env.resolve_named(&name).is_some()
+                    && let Some(resolved) = self.env.resolve_named(&name)
                 {
-                    return Ty::Named(name);
+                    let params: Vec<String> = self.env.class_type_params(&name).to_vec();
+                    if params.is_empty() {
+                        return Ty::Named(name);
+                    }
+                    let map = params
+                        .into_iter()
+                        .map(|param| (param, Ty::Unknown))
+                        .collect();
+                    return crate::generics::subst_ty(&resolved, &map);
                 }
                 self.reify_shape(*id)
             }

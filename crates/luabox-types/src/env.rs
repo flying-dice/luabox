@@ -1315,6 +1315,17 @@ impl TypeEnv {
         self.classes.get(name).map(|def| def.parents.as_slice())
     }
 
+    /// The generic type-parameter names of a `---@class Name<T>`, in
+    /// declaration order — empty for a plain class and for a name that is no
+    /// class at all. A caller holding only the *name* of a class (a
+    /// [`Ty::Named`], which carries no arguments) uses this to tell whether
+    /// the name alone is a complete type or a template with nothing bound.
+    pub(crate) fn class_type_params(&self, name: &str) -> &[String] {
+        self.classes
+            .get(name)
+            .map_or::<&[String], _>(&[], |def| def.params.as_slice())
+    }
+
     /// Whether `name` is a LuaCATS `---@class` (in-file, def-package, or
     /// cross-package). The `undefined-field` read rule (#90) fires only for
     /// real classes.

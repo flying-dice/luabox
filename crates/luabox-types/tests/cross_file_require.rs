@@ -195,6 +195,110 @@ local _ = s:bogus()
     assert_eq!(codes(&check(consumer, &ambient, &requires)), vec!["LB0306"]);
 }
 
+// --- generic carriers crossing the boundary --------------------------------
+
+/// A carrier for a *generic* class — the one class name that is not a
+/// complete type on its own, since `Ty::Named` carries no type arguments.
+const BOX_MODULE: &str = "\
+---@class Box<T>
+---@field item T
+local B = {}
+return B
+";
+
+fn box_ambient_and_requires() -> (Ambient, HashMap<String, Ty>) {
+    let (export_ty, types) = surface(BOX_MODULE, stdlib());
+    let ambient = stdlib().with_project_types([&types]);
+    let mut requires = HashMap::new();
+    requires.insert("box".to_string(), export_ty);
+    (ambient, requires)
+}
+
+#[test]
+fn generic_carrier_export_never_names_its_unbound_parameter() {
+    // Crossing as `Box` would type the member `T` in the consumer — a type
+    // variable it can neither name nor produce, so the diagnostic points at no
+    // action. The unbound parameter reads `unknown`, exactly as it does for a
+    // bare `Box` written by hand.
+    let (ambient, requires) = box_ambient_and_requires();
+    let consumer = "\
+---@param n number
+local function want(n) end
+local b = require(\"box\")
+want(b.item)
+";
+    let diags = check(consumer, &ambient, &requires);
+    assert_eq!(codes(&diags), vec!["LB0300"]);
+    assert!(
+        diags[0].message.contains("found `unknown`"),
+        "{}",
+        diags[0].message
+    );
+    assert!(
+        !diags[0].message.contains("`T`"),
+        "the parameter must not reach the consumer: {}",
+        diags[0].message
+    );
+}
+
+#[test]
+fn binding_the_type_argument_types_the_required_generic_carrier() {
+    // The other direction, and the action the `unknown` implies: naming the
+    // argument on the binding monomorphises the same export to `number`.
+    // Measured as a *control*, not a red pin — this held before the export
+    // stopped leaking `T` too (the `---@type` overrides the export type), and
+    // it is what makes the `unknown` above actionable rather than terminal.
+    let (ambient, requires) = box_ambient_and_requires();
+    let consumer = "\
+---@param n number
+local function want(n) end
+---@type Box<number>
+local b = require(\"box\")
+want(b.item)
+";
+    assert_eq!(
+        codes(&check(consumer, &ambient, &requires)),
+        Vec::<String>::new()
+    );
+
+    // …and a wrong argument is rejected against the bound parameter, so the
+    // members are genuinely typed rather than leniently erased.
+    let mismatched = "\
+---@param n number
+local function want(n) end
+---@type Box<string>
+local b = require(\"box\")
+want(b.item)
+";
+    assert_eq!(
+        codes(&check(mismatched, &ambient, &requires)),
+        vec!["LB0300"]
+    );
+}
+
+#[test]
+fn a_plain_carrier_still_crosses_as_the_class_itself() {
+    // The one-variable control for the two tests above: drop the `<T>` and the
+    // #56 behaviour is unchanged — the export is the class, so an undeclared
+    // member is `LB0306`.
+    const PLAIN: &str = "\
+---@class Crate
+---@field item number
+local C = {}
+return C
+";
+    let (export_ty, types) = surface(PLAIN, stdlib());
+    let ambient = stdlib().with_project_types([&types]);
+    let mut requires = HashMap::new();
+    requires.insert("crate".to_string(), export_ty);
+
+    let consumer = "\
+local c = require(\"crate\")
+local _ = c.nope
+";
+    assert_eq!(codes(&check(consumer, &ambient, &requires)), vec!["LB0306"]);
+}
+
 // --- unresolved requires and cycles ----------------------------------------
 
 #[test]
