@@ -276,7 +276,7 @@ pub fn module_surface_with_artifacts(
         InferMode::Check,
         None,
     );
-    let types = FileTypes::collect(items, &env, &outcome.carrier_class_final);
+    let types = FileTypes::collect(items, &env, &outcome.carrier_class_final, file);
     ModuleSurface {
         export: outcome.module_export,
         types,

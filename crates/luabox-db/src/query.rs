@@ -95,18 +95,28 @@ pub fn outgoing_calls(db: &dyn Db, file: SourceFile) -> OutgoingCalls {
 /// *and* return types. The file's own requires are not followed (their
 /// exports would recurse); acyclic because [`outgoing_calls`] is
 /// standalone.
+///
+/// The ambient is the project-merged one (round 3 review F44): a
+/// `---@class` carrier export (#56) is a bare [`Ty::Named`], so resolving
+/// its members downstream — the inlay-hint surface reading a required
+/// module's fields, `inlay_hints.rs` — needs the *class's* own file's
+/// declaration in scope, not just this file's. `project_types_checked` is
+/// acyclic here for the same reason it is beneath [`module_export_checked`]:
+/// it depends only on the project-independent, per-file
+/// [`module_surface_checked`], never back on this query.
 #[salsa::tracked]
 pub fn module_export(db: &dyn Db, file: SourceFile, project: Project) -> ModuleExport {
     db.push_log(format!("module_export({})", display(db, file)));
     let parsed = parse(db, file);
     let name = display(db, file);
-    let ambient = stdlib_defs(file.dialect(db));
+    let base = stdlib_defs(file.dialect(db));
+    let ambient = base.with_project_types(project_types_checked(db, project).iter());
     let externals = ExternalTypes {
         requires: HashMap::new(),
         fn_param_seeds: dependent_seeds(db, file, project),
     };
     ModuleExport::new(
-        infer_display_types(parsed.parse(), &name, Some(ambient), Some(&externals)).module_export,
+        infer_display_types(parsed.parse(), &name, Some(&ambient), Some(&externals)).module_export,
     )
 }
 
@@ -114,14 +124,17 @@ pub fn module_export(db: &dyn Db, file: SourceFile, project: Project) -> ModuleE
 /// binding types and inferred function returns, with call-site parameter
 /// seeding, the file's require exports in scope, and exported functions'
 /// parameters seeded from every dependent file's observed call arguments.
-/// The stdlib definition layer for the file's dialect is merged beneath
-/// the file's own annotations.
+/// The stdlib definition layer for the file's dialect, merged with every
+/// project file's workspace-global classes/enums (round 3 review F44 — see
+/// [`module_export`]'s doc comment for why the merge is required here, not
+/// just for the check-mode path), sits beneath the file's own annotations.
 #[salsa::tracked]
 pub fn binding_types(db: &dyn Db, file: SourceFile, project: Project) -> BindingTypes {
     db.push_log(format!("binding_types({})", display(db, file)));
     let parsed = parse(db, file);
     let name = display(db, file);
-    let ambient = stdlib_defs(file.dialect(db));
+    let base = stdlib_defs(file.dialect(db));
+    let ambient = base.with_project_types(project_types_checked(db, project).iter());
     let externals = ExternalTypes {
         requires: require_exports(db, file, project),
         fn_param_seeds: dependent_seeds(db, file, project),
@@ -129,7 +142,7 @@ pub fn binding_types(db: &dyn Db, file: SourceFile, project: Project) -> Binding
     BindingTypes::new(infer_display_types(
         parsed.parse(),
         &name,
-        Some(ambient),
+        Some(&ambient),
         Some(&externals),
     ))
 }
@@ -144,7 +157,11 @@ pub fn binding_types(db: &dyn Db, file: SourceFile, project: Project) -> Binding
 /// `function Class:method` member attachments, resolve from every other
 /// file). The file's own requires are not followed, so the cross-file
 /// graph stays acyclic even when modules require each other. Depends only
-/// on the file's parse (and dialect), not on `Project`.
+/// on the file's parse (and dialect), not on `Project` — deliberately: this
+/// is the acyclic base [`project_types_checked`] merges every file's
+/// `.types()` from, so it must not itself depend on the merged ambient (see
+/// [`module_export_checked`], which reifies the *export* with that merge
+/// applied, as a separate query for exactly this reason).
 #[salsa::tracked]
 pub fn module_surface_checked(db: &dyn Db, file: SourceFile) -> ModuleSurfaceChecked {
     db.push_log(format!("module_surface_checked({})", display(db, file)));
@@ -158,10 +175,48 @@ pub fn module_surface_checked(db: &dyn Db, file: SourceFile) -> ModuleSurfaceChe
     ))
 }
 
+/// The **check-mode** export of one file, reified against the *project-wide*
+/// ambient (round 3 review F42/F43): [`module_surface_checked`] reifies
+/// against a defs-only ambient — required to keep it acyclic, since
+/// [`project_types_checked`] is built from it — so a generic ancestor
+/// declared in *another* file is invisible to `reify_export`'s
+/// `class_params_in_scope` check there. `---@class Sub : Base` (bare) with
+/// `Base<U>` in a different file then reads as having no free parameters
+/// (the ancestor cannot be seen at all, so none of its params are either)
+/// and crosses `require` as the unerased `Ty::Named("Sub")`, and the
+/// *consumer's* own merged env resolves `Sub.item` back to the literal,
+/// unbound `U` — the exact leak `a_parent_written_bare_leaves_its_parameter_unbound_and_erased`
+/// (`cross_file_require.rs`) pins for the same-file shape.
+///
+/// This query re-reifies the export with every OTHER project file's classes
+/// already merged in, so a cross-file ancestor is visible at the same point
+/// the same-file one already is. Acyclic: it depends on
+/// [`project_types_checked`], which depends only on the project-independent
+/// [`module_surface_checked`] — never on this query — so there is no cycle
+/// even when `file` is itself a member of `project.files`.
+#[salsa::tracked]
+pub(crate) fn module_export_checked(
+    db: &dyn Db,
+    file: SourceFile,
+    project: Project,
+) -> ModuleExport {
+    db.push_log(format!("module_export_checked({})", display(db, file)));
+    let parsed = parse(db, file);
+    let name = display(db, file);
+    let base = stdlib_defs(file.dialect(db));
+    let ambient = base.with_project_types(project_types_checked(db, project).iter());
+    let surface = luabox_types::module_surface(parsed.parse(), &name, Some(&ambient));
+    ModuleExport::new(surface.export)
+}
+
 /// Module string → **check-mode** export type, for every static `require`
 /// in `file` that resolves to another project file — the registry
 /// [`luabox_types::check_file_with_requires`] threads into checking so a
 /// consumer types its `require` results from the module's annotations (#85).
+///
+/// Reads [`module_export_checked`] (project-merged reification), not
+/// [`module_surface_checked`]'s own defs-only export — round 3 review
+/// F42/F43.
 pub(crate) fn require_exports_checked(
     db: &dyn Db,
     file: SourceFile,
@@ -171,7 +226,7 @@ pub(crate) fn require_exports_checked(
     for edge in lower(db, file).file().requires() {
         if let Some(target) = resolve_require(db, project, &edge.module, file.dialect(db))
             && target != file
-            && let Some(ty) = module_surface_checked(db, target).export()
+            && let Some(ty) = module_export_checked(db, target, project).ty()
         {
             map.insert(edge.module.clone(), ty.clone());
         }
@@ -182,7 +237,10 @@ pub(crate) fn require_exports_checked(
 /// Every project file's workspace-global class/enum contribution — the
 /// input [`luabox_types::Ambient::with_project_types`] merges beneath each
 /// file's own declarations so a class declared anywhere in the project
-/// resolves everywhere (luals parity, #85).
+/// resolves everywhere (luals parity, #85). Built from the
+/// project-independent [`module_surface_checked`] (never
+/// [`module_export_checked`]), which is what keeps this acyclic when it is
+/// in turn read back by queries that need the merged ambient.
 pub(crate) fn project_types_checked(db: &dyn Db, project: Project) -> Vec<luabox_types::FileTypes> {
     project
         .files(db)

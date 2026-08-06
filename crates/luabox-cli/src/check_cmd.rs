@@ -275,18 +275,6 @@ fn run_passes(project: &Project, passes: TargetPasses, format: Format) -> anyhow
             )
         })
         .collect();
-    let mut exports: HashMap<PathBuf, Ty> = files
-        .iter()
-        .zip(&surfaces)
-        .filter_map(|(file, surface)| Some((file.canonical.clone(), surface.export.clone()?)))
-        .collect();
-    // Rock exports join the same path-keyed registry (#30). Keying by path (not
-    // by module name) is what keeps precedence exact: `resolve_requires` asks
-    // the bundler which *file* a `require` names, and a project file that
-    // shadows a rock module is the file it returns.
-    for (path, export) in rocks.by_path() {
-        exports.entry(canonical(path)).or_insert(export.clone());
-    }
     // Duplicate `---@alias` across project files / `[types] defs` (luals
     // `duplicate-doc-alias`, LB0310, #113): a project-assembly finding — like
     // the LB0307 class collisions above — computed over the whole source set,
@@ -313,6 +301,48 @@ fn run_passes(project: &Project, passes: TargetPasses, format: Format) -> anyhow
         .with_project_types(surfaces.iter().map(|s| &s.types))
         .with_rock_types(rocks.types());
     let ambient = &ambient;
+
+    // Re-reify every file's EXPORT against the now-merged project ambient
+    // (round 3 review F42). `surfaces` above was computed with the defs-only
+    // `ambient` — required, since the merge just above is built *from*
+    // `surfaces.types`, so reifying against the merge while building it would
+    // be circular. That leaves a generic ancestor declared in a *different*
+    // project file invisible to `reify_export`'s unbound-parameter check when
+    // a file's own surface is first computed: `---@class Sub : Base` (bare,
+    // `Base` in another file) crossed `require` as the unerased
+    // `Ty::Named("Sub")` instead of the lenient structural template the
+    // same-file case already gets, leaking `Base`'s free parameter into every
+    // consumer once the *consumer's* fully-merged env resolved `Sub` back to
+    // its real, still-unbound shape. `luabox-db`'s `module_export_checked`
+    // closes the identical gap for the LSP path this same way; only `.export`
+    // is re-derived here — `.types` (each file's own declarations) does not
+    // depend on cross-file visibility and is unchanged by the merge, so
+    // recomputing it a second time would be wasted work, not a correctness
+    // requirement.
+    let exports_by_file: Vec<Option<Ty>> = files
+        .par_iter()
+        .map(|file| {
+            luabox_types::module_surface_with_artifacts(
+                &file.parse,
+                &file.rel,
+                Some(ambient),
+                &file.artifacts,
+            )
+            .export
+        })
+        .collect();
+    let mut exports: HashMap<PathBuf, Ty> = files
+        .iter()
+        .zip(&exports_by_file)
+        .filter_map(|(file, export)| Some((file.canonical.clone(), export.clone()?)))
+        .collect();
+    // Rock exports join the same path-keyed registry (#30). Keying by path (not
+    // by module name) is what keeps precedence exact: `resolve_requires` asks
+    // the bundler which *file* a `require` names, and a project file that
+    // shadows a rock module is the file it returns.
+    for (path, export) in rocks.by_path() {
+        exports.entry(canonical(path)).or_insert(export.clone());
+    }
 
     // SPEC.md §16: rayon per-module. Each file is checked against the
     // shared project ambient plus its own resolved `require` exports;
@@ -880,6 +910,90 @@ mod tests {
         );
         // Warnings never fail the command (module docs, SPEC.md §3).
         check(tmp.path(), None, Format::Human).expect("warnings do not fail");
+    }
+
+    // -- cross-file export-seam reification (round 3 review F42) -----------
+
+    #[test]
+    fn a_cross_file_bare_generic_ancestor_erases_leniently_not_by_name() {
+        // F42: the cross-file surface pre-pass computes every file's export
+        // with a defs-only ambient (`ambient` at the top of `run_passes`,
+        // *before* `with_project_types` merges the project's own classes in)
+        // — required to build that merge without circularity. A generic
+        // ancestor declared in a DIFFERENT file is therefore invisible to
+        // `reify_export`'s unbound-parameter check when `sub.lua`'s own
+        // surface is computed, so `---@class Sub : Base` (bare — `Base`'s
+        // parameter unbound) crossed `require` as the unerased
+        // `Ty::Named("Sub")` instead of the lenient structural template
+        // every same-file bare-parent case already gets
+        // (`cross_file_require::a_parent_written_bare_leaves_its_parameter_unbound_and_erased`).
+        //
+        // The probe: reading an undeclared member on the required carrier.
+        // Erased-to-`unknown` is a structural table with no undefined-field
+        // obligation, so it must be clean; the bug's telltale is the
+        // opposite — `Sub` keeps its class identity, `nope` is enforced
+        // against a shape that never declares it, and `LB0306` fires on
+        // code that should be lenient exactly like the same-file case is.
+        let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
+        write(
+            tmp.path(),
+            "src/base.lua",
+            // `item` is optional so `Sub`'s carrier conformance (#107 — a
+            // pre-existing, unrelated obligation: does `Sub`'s own Lua code
+            // literally provide every non-optional inherited member? — it
+            // does not here, since `S` is a bare table) imposes no
+            // obligation, isolating the export-seam question this test is
+            // actually about. Confirmed pre-existing by reproducing the same
+            // conformance diagnostic on this exact shape checked SAME-FILE.
+            "---@class Base<U>\n---@field item? U\nlocal M = {}\nreturn M\n",
+        );
+        write(
+            tmp.path(),
+            "src/sub.lua",
+            "---@class Sub : Base\nlocal S = {}\nreturn S\n",
+        );
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "local s = require(\"sub\")\nlocal _ = s.nope\n",
+        );
+        check(tmp.path(), None, Format::Human)
+            .expect("an unbound cross-file ancestor's carrier must erase leniently, not enforce LB0306 on a name it never declared");
+    }
+
+    #[test]
+    fn a_cross_file_bound_generic_ancestor_still_types_its_member() {
+        // The one-variable control for the test above: the SAME two files,
+        // with the parent reference BOUND (`Base<number>`) instead of bare.
+        // A fix that makes the erasure check unconditionally lenient for any
+        // cross-file ancestor (rather than correctly detecting "still
+        // unbound") would pass the sibling test above by accident while
+        // losing real type-checking here — `item` must resolve as `number`,
+        // genuinely, not as `unknown`.
+        let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
+        write(
+            tmp.path(),
+            "src/base.lua",
+            // `item` optional — see the sibling test's comment (#107, unrelated).
+            "---@class Base<U>\n---@field item? U\nlocal M = {}\nreturn M\n",
+        );
+        write(
+            tmp.path(),
+            "src/sub.lua",
+            "---@class Sub : Base<number>\nlocal S = {}\nreturn S\n",
+        );
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "---@param s string\nlocal function want(s) end\nlocal m = require(\"sub\")\nwant(m.item)\n",
+        );
+        let error = check(tmp.path(), None, Format::Human)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error, "check failed with 1 error(s)",
+            "`item` must be genuinely `number` (rejected against `string`), not leniently `unknown`"
+        );
     }
 
     #[test]

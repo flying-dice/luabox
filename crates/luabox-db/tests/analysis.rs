@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use luabox_db::{AnalysisHost, Change, Dialect, Strictness};
 use luabox_syntax::lua;
-use luabox_types::check_file;
+use luabox_types::{check_file, check_file_with_requires, stdlib_defs};
 
 /// Source with a call-argument type error (`LB0300`) that `check_file` reports.
 const BAD: &str = "\
@@ -572,6 +572,125 @@ fn clearing_an_overlay_reverts_to_disk_and_ignores_unknown_paths() {
         path: PathBuf::from("never-seen.lua"),
     });
     assert_eq!(host.snapshot().files().count(), 1);
+}
+
+#[test]
+fn display_mode_resolves_a_required_carriers_class_across_files() {
+    // F44 (round 3 review) — regression: `module_export`/`binding_types` build
+    // their ambient as `stdlib_defs(dialect)` alone, with no
+    // `with_project_types` merge, unlike the check-mode path. Since #56 a
+    // declared `---@class` carrier crosses `require` as `Ty::Named(name)`
+    // rather than a structural table, so resolving anything about it in the
+    // *consumer's* display-mode inference (inlay hints) needs the carrier's
+    // own class declaration in scope — which lives in a DIFFERENT file, and
+    // was never merged in. Before #56 this never mattered: the export was
+    // already fully structural, needing no further class lookup.
+    //
+    // `widget.lua` declares a carrier class; `main.lua` requires it and
+    // calls its constructor. The constructor's return type is `Widget`
+    // (`Infer::reify_shape`'s instance-identity rule), which the display
+    // inference must resolve back to its `id: number` field to report
+    // anything useful for `v` at all — with the merge missing, `Widget`
+    // resolves to `Lookup::Opaque` (`infer.rs`) and the binding renders as
+    // unknown.
+    let widget = "\
+---@class Widget
+---@field id number
+local W = {}
+W.__index = W
+---@return Widget
+function W.make() return setmetatable({}, W) end
+return W
+";
+    let main = "\
+local m = require(\"widget\")
+local v = m.make()
+";
+    let mut host = host();
+    host.apply_changes([set("widget.lua", widget), set("main.lua", main)]);
+
+    let snap = host.snapshot();
+    let types = snap.binding_types(Path::new("main.lua")).unwrap();
+    let v_binding = types
+        .bindings()
+        .iter()
+        .find(|b| b.name == "v")
+        .expect("`v` is a binding");
+    let rendered = format!("{:?}", v_binding.ty);
+    assert!(
+        rendered.contains("Widget") || rendered.contains("\"id\""),
+        "`v`'s type must resolve through the cross-file carrier class, not \
+         stay opaque/unknown: {rendered}"
+    );
+}
+
+#[test]
+fn a_cross_file_generic_ancestor_does_not_leak_its_parameter_through_require_exports() {
+    // F42/F43 (round 3 review): the export-seam fix (#56) erases an unbound
+    // generic parameter at the `require` boundary by asking
+    // `class_params_in_scope` whether the exported class still has one free
+    // — but the round-2 fix computed that answer against a defs-only
+    // ambient (`module_surface_checked`), which cannot see a *different*
+    // project file's classes. `base.lua` declares the generic ancestor;
+    // `sub.lua` inherits it bare (`: Base`, parameter left unbound) and
+    // returns the carrier; `main.lua` requires `sub` and reads the
+    // inherited field. Every existing fixture for this guard
+    // (`cross_file_require.rs`) declares the ancestor and the child in ONE
+    // file, where `class_params_in_scope` can already see the ancestor —
+    // this is the shape that actually crosses the export seam.
+    let base = "\
+---@class Base<U>
+---@field item U
+local M = {}
+return M
+";
+    let sub = "\
+---@class Sub : Base
+local S = {}
+return S
+";
+    let main = "\
+---@param n number
+local function want(n) end
+local s = require(\"sub\")
+want(s.item)
+";
+    let mut host = host();
+    host.set_root(PathBuf::from("/proj"));
+    host.apply_changes([
+        set("/proj/base.lua", base),
+        set("/proj/sub.lua", sub),
+        set("/proj/main.lua", main),
+    ]);
+
+    let snap = host.snapshot();
+    let requires = snap
+        .require_exports(Path::new("/proj/main.lua"))
+        .expect("main.lua is a known file");
+    let project_types = snap.project_types();
+    let ambient = stdlib_defs(Dialect::Lua54).with_project_types(project_types.iter());
+
+    let parsed = lua::parse(main, Dialect::Lua54);
+    let diags = check_file_with_requires(
+        &parsed,
+        "main.lua",
+        Strictness::Strict,
+        Dialect::Lua54,
+        Some(&ambient),
+        &requires,
+    );
+    let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
+    assert_eq!(
+        codes,
+        vec!["LB0300".to_string()],
+        "the inherited, still-unbound parameter must erase to `unknown` — a \
+         cross-file leak reports `found \\`U\\`` here instead: {diags:?}"
+    );
+    assert!(
+        diags[0].message.contains("found `unknown`"),
+        "the parameter name must never reach the consumer: {}",
+        diags[0].message
+    );
 }
 
 #[test]

@@ -1531,10 +1531,23 @@ impl Checker<'_> {
                 expected,
             )
             .map_or(String::new(), |d| format!(": {d}"));
+            // `found` is `unknown` for several reasons — an unannotated
+            // parameter, a `require` of an untyped module, a generic
+            // carrier's unbound parameter erased at the export seam (#56).
+            // Whichever it is, the same remedy applies: an explicit
+            // `---@type <expected>` on the value's binding is what would let
+            // it be checked (round 3 review F72 — the generic-carrier
+            // mismatch this fires for named neither the class, the argument,
+            // nor the annotation that fixes it; this note is deliberately
+            // general rather than guessing *why* the value is unknown, which
+            // this call has no way to know).
+            let action = matches!(found, Ty::Unknown)
+                .then(|| format!(" (add `---@type {expected}` to check it)"))
+                .unwrap_or_default();
             self.report_full(
                 mismatch_code,
                 slot_range(slot),
-                format!("{noun}: expected `{expected}`, found `{found}`{detail}"),
+                format!("{noun}: expected `{expected}`, found `{found}`{detail}{action}"),
                 format!("expected `{expected}`"),
                 None,
             );

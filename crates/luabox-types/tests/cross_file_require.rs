@@ -239,6 +239,17 @@ want(b.item)
         "the parameter must not reach the consumer: {}",
         diags[0].message
     );
+    // F72 (round 3 review): naming neither `Box`, the type argument, nor the
+    // `---@type Box<number>` annotation that resolves it left the diagnostic
+    // pointing at no action — even though `unknown` is only ever actionable
+    // via an explicit `---@type`, the exact action
+    // `binding_the_type_argument_types_the_required_generic_carrier` (below)
+    // measures. The message must say so.
+    assert!(
+        diags[0].message.contains("---@type number"),
+        "the message must name the remedy an `unknown` mismatch always has: {}",
+        diags[0].message
+    );
 }
 
 #[test]
@@ -459,6 +470,118 @@ want(l.slot)
     assert_eq!(
         codes(&check(mismatched, &ambient, &requires)),
         vec!["LB0300"]
+    );
+}
+
+#[test]
+fn a_real_class_name_reused_as_an_ancestors_parameter_does_not_erase_the_export() {
+    // F43: `class_params_in_scope` collects an ancestor's *declared parameter
+    // names* unconditionally, and class names and type parameters share one
+    // namespace (`env.rs` documents the collision explicitly). `Emitter<Event>`
+    // names its OWN type parameter `Event` — legal, if confusing — and `Sub :
+    // Emitter<Click>` binds it away. `Sub`'s own (unrelated) field `pending`
+    // is typed `Event`, naming the REAL class. Pre-fix, `class_params_in_scope`
+    // reports "Event" as a parameter in scope (from `Emitter`'s declaration)
+    // with no regard for `Sub`'s parent reference already binding it, so
+    // `reify_export` erases the real class reference to `unknown` and, in the
+    // same stroke, costs the module its `Ty::Named("Sub")` identity — an
+    // undeclared member that should be `LB0306` reads as lenient instead.
+    const EVENT_DEF: &str = "\
+---@meta
+---@class Event
+---@field id number
+";
+    const COLLIDING_MODULE: &str = "\
+---@class Emitter<Event>
+---@class Sub : Emitter<Click>
+---@field pending Event
+local S = {}
+return S
+";
+    let base = build_ambient(Dialect::Lua54, &[EVENT_DEF.to_string()]);
+    let (export_ty, types) = surface(COLLIDING_MODULE, &base);
+    let ambient = base.with_project_types([&types]);
+    let mut requires = HashMap::new();
+    requires.insert("sub".to_string(), export_ty);
+
+    // The real class's identity must survive the export seam: an undeclared
+    // member is LB0306, exactly as the plain (non-generic-neighbour) carrier
+    // control (`a_plain_carrier_still_crosses_as_the_class_itself`) pins.
+    let undeclared = "\
+local s = require(\"sub\")
+local _ = s.nope
+";
+    assert_eq!(
+        codes(&check(undeclared, &ambient, &requires)),
+        vec!["LB0306"],
+        "Sub must keep its #56 class identity: Emitter's own parameter (which \
+         happens to be spelled `Event`) is bound by `Sub`'s parent reference, \
+         not left free"
+    );
+
+    // …and `pending`'s declared type is genuinely the real class `Event`
+    // (with its own `id` field), not erased to `unknown` because its name
+    // collides with an unrelated ancestor's parameter.
+    let good = "\
+local s = require(\"sub\")
+---@type number
+local n = s.pending.id
+";
+    assert_eq!(
+        codes(&check(good, &ambient, &requires)),
+        Vec::<String>::new(),
+        "`pending` must resolve as the real `Event` class, not `unknown`"
+    );
+}
+
+#[test]
+fn undefined_member_on_a_cross_file_class_names_the_remedy_and_the_declaring_file() {
+    // F71 (round 3 review): the undefined-field diagnostic's "declared here"
+    // secondary was populated only by `absorb_block` (same-file classes), so
+    // a cross-file consumer's `p.nope` — previously-accepted Lua turned into
+    // a CI failure by #56, the case the largest number of users meet first —
+    // named a class that appears nowhere in their own file, with no pointer
+    // to `mod.lua` and no statement of what to write instead. The class's
+    // own file/span now travel through `FileTypes`/`merge_file_types`, and
+    // the message itself names the three ways to add the member.
+    const PLAIN: &str = "\
+---@class Point
+---@field x number
+local P = {}
+return P
+";
+    let (export_ty, types) = surface(PLAIN, stdlib());
+    let ambient = stdlib().with_project_types([&types]);
+    let mut requires = HashMap::new();
+    requires.insert("point".to_string(), export_ty);
+
+    let consumer = "\
+local p = require(\"point\")
+local _ = p.nope
+";
+    let diags = check(consumer, &ambient, &requires);
+    assert_eq!(codes(&diags), vec!["LB0306"]);
+    let label = diags[0].primary_label().expect("primary label");
+    assert!(
+        label.message.contains("---@field")
+            && label.message.contains("function")
+            && label.message.contains("[string]"),
+        "the label must name all three remedies: {}",
+        label.message
+    );
+    let secondary = diags[0]
+        .labels
+        .iter()
+        .find(|l| !l.primary)
+        .unwrap_or_else(|| panic!("expected a \"declared here\" secondary label: {diags:#?}"));
+    assert_eq!(
+        secondary.span.file, "mod.lua",
+        "the secondary label must point at the class's OWN file, not the consumer's: {diags:#?}"
+    );
+    assert!(
+        secondary.message.contains("`Point` declared here"),
+        "{}",
+        secondary.message
     );
 }
 

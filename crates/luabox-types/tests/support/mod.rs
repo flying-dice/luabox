@@ -1,0 +1,65 @@
+//! Fixture helpers shared by the two duplicate-`---@class`-merge suites
+//! (`duplicate_class_merge.rs`, `duplicate_class_merge_property.rs`, #59).
+//!
+//! Round 3 review F79: `check`, `surface` and `check_cross` were ~40 lines
+//! duplicated near-verbatim between the two files, differing only in
+//! `check`'s return type (one file wanted the full [`Diagnostic`]s, to
+//! inspect a message; the other only ever reduced to codes) and
+//! `check_cross`'s element type (`&[&str]` vs `&[String]`). Both are
+//! resolved here rather than copied: `check` returns the full diagnostics,
+//! and `codes` is the reduction most call sites want; `check_cross` is
+//! generic over `AsRef<str>` so either owned or borrowed fixture strings
+//! work.
+//!
+//! This file is a module of each test binary (`mod support;`), not a target
+//! of its own — it is not compiled or counted separately.
+
+use luabox_diag::Diagnostic;
+use luabox_syntax::lua::{self, Dialect, parse};
+use luabox_types::{
+    Ambient, FileTypes, Strictness, check_file_with_ambient, module_surface, stdlib_defs,
+};
+
+/// Strict-check one standalone file against the stdlib ambient.
+pub fn check(src: &str) -> Vec<Diagnostic> {
+    let parsed = parse(src, Dialect::Lua54);
+    assert_eq!(parsed.errors(), &[], "fixture must parse cleanly:\n{src}");
+    check_file_with_ambient(
+        &parsed,
+        "test.lua",
+        Strictness::Strict,
+        lua::Dialect::Lua54,
+        Some(stdlib_defs(Dialect::Lua54)),
+    )
+}
+
+/// [`check`], reduced to diagnostic codes — what most call sites want.
+pub fn codes(src: &str) -> Vec<String> {
+    check(src).iter().map(|d| d.code.to_string()).collect()
+}
+
+/// The workspace surface one project file contributes.
+pub fn surface(src: &str, base: &Ambient) -> FileTypes {
+    let parsed = parse(src, Dialect::Lua54);
+    assert_eq!(parsed.errors(), &[], "fixture must parse cleanly:\n{src}");
+    module_surface(&parsed, "m.lua", Some(base)).types
+}
+
+/// Check `consumer` against the merged surface of every `file`.
+pub fn check_cross<S: AsRef<str>>(files: &[S], consumer: &str) -> Vec<String> {
+    let base = stdlib_defs(Dialect::Lua54);
+    let types: Vec<FileTypes> = files.iter().map(|f| surface(f.as_ref(), base)).collect();
+    let ambient = base.with_project_types(types.iter());
+    let parsed = parse(consumer, Dialect::Lua54);
+    assert_eq!(parsed.errors(), &[], "consumer must parse cleanly");
+    check_file_with_ambient(
+        &parsed,
+        "consumer.lua",
+        Strictness::Strict,
+        Dialect::Lua54,
+        Some(&ambient),
+    )
+    .iter()
+    .map(|d| d.code.to_string())
+    .collect()
+}

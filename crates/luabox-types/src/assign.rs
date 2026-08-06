@@ -858,7 +858,12 @@ mod tests {
             );
             let items = luabox_syntax::luacats::harvest(&parsed);
             let inner = TypeEnv::build_from_items(&parsed, &items, None);
-            crate::env::FileTypes::collect(&items, &inner, &std::collections::HashMap::new())
+            crate::env::FileTypes::collect(
+                &items,
+                &inner,
+                &std::collections::HashMap::new(),
+                "rec.lua",
+            )
         });
         assert!(assignable(
             &env,

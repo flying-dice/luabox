@@ -25,57 +25,17 @@
 //! defs`) class of the same name whole — that is a different axis (the
 //! escape hatch, see `Ambient::with_rock_types`) and is unchanged.
 
-use luabox_diag::Diagnostic;
-use luabox_syntax::lua::{self, Dialect, parse};
-use luabox_types::{
-    Ambient, FileTypes, Strictness, build_ambient, check_file_with_ambient, module_surface,
-    stdlib_defs,
-};
+use luabox_syntax::lua::{Dialect, parse};
+use luabox_types::{Strictness, build_ambient, check_file_with_ambient};
 
-fn check(src: &str) -> Vec<Diagnostic> {
-    let parsed = parse(src, Dialect::Lua54);
-    assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
-    check_file_with_ambient(
-        &parsed,
-        "test.lua",
-        Strictness::Strict,
-        lua::Dialect::Lua54,
-        Some(stdlib_defs(Dialect::Lua54)),
-    )
-}
-
-fn codes(src: &str) -> Vec<String> {
-    check(src).iter().map(|d| d.code.to_string()).collect()
-}
+// F79 (round 3 review): `check`/`codes`/`surface`/`check_cross` used to be
+// ~40 lines defined here near-verbatim identically to
+// `duplicate_class_merge_property.rs` — now one shared module both import.
+mod support;
+use support::{check, check_cross, codes};
 
 fn none() -> Vec<String> {
     Vec::new()
-}
-
-/// The workspace surface one project file contributes.
-fn surface(src: &str, base: &Ambient) -> FileTypes {
-    let parsed = parse(src, Dialect::Lua54);
-    assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
-    module_surface(&parsed, "m.lua", Some(base)).types
-}
-
-/// Check `consumer` against the merged surface of every `file`.
-fn check_cross(files: &[&str], consumer: &str) -> Vec<String> {
-    let base = stdlib_defs(Dialect::Lua54);
-    let types: Vec<FileTypes> = files.iter().map(|f| surface(f, base)).collect();
-    let ambient = base.with_project_types(types.iter());
-    let parsed = parse(consumer, Dialect::Lua54);
-    assert_eq!(parsed.errors(), &[], "consumer must parse cleanly");
-    check_file_with_ambient(
-        &parsed,
-        "consumer.lua",
-        Strictness::Strict,
-        Dialect::Lua54,
-        Some(&ambient),
-    )
-    .iter()
-    .map(|d| d.code.to_string())
-    .collect()
 }
 
 // --- same-file duplicates union -------------------------------------------
@@ -314,6 +274,58 @@ fn cross_file_conflicting_field_keeps_the_first_files_type() {
             "---@param s string\nlocal function want(s) end\n---@param c Cf\nlocal function use(c) want(c.a) end\n",
         ),
         none()
+    );
+}
+
+#[test]
+fn cross_file_conflicting_parent_argument_keeps_the_first_files_binding() {
+    // F40 (round 3 review): `ParentRef { name, args }` makes "same parent,
+    // different arguments" representable — before this PR `parents` was
+    // `Vec<String>`, so the state could not even exist. Both merge seams
+    // dedup a parent by NAME alone (`env.rs`'s `merge_file_types` and
+    // `absorb_block`), so `---@class Sub : Base<number>` in one file and
+    // `---@class Sub : Base<string>` in another is not diagnosed either way
+    // — it resolves silently by fold order, the same rule
+    // `cross_file_conflicting_field_keeps_the_first_files_type` pins for a
+    // `---@field` conflict (that one *is* diagnosed, `LB0311`; this one is
+    // not — noted as a residual, not fixed here). Pinned in both directions
+    // so a future change to the fold order — or a diagnostic added later —
+    // is a deliberate edit to this test, not a silent behaviour change.
+    let base = "---@class Base<U>\n---@field item U\n";
+    let files = [
+        format!("{base}---@class Sub : Base<number>\n"),
+        format!("{base}---@class Sub : Base<string>\n"),
+    ];
+    let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
+    assert_eq!(
+        check_cross(
+            &file_refs,
+            "---@param n number\nlocal function want(n) end\n---@param s Sub\nlocal function use(s) want(s.item) end\n",
+        ),
+        none(),
+        "the first file's `Base<number>` binding must survive: item is `number`"
+    );
+    assert_eq!(
+        check_cross(
+            &file_refs,
+            "---@param str string\nlocal function want(str) end\n---@param s Sub\nlocal function use(s) want(s.item) end\n",
+        ),
+        vec!["LB0300"],
+        "the second file's `Base<string>` binding must NOT win — item is not `string`"
+    );
+
+    // Reversing which file is listed first flips the answer: this is
+    // fold-order-dependent, not a stable per-name rule, which is the shape
+    // of the residual (nothing compares the two bindings or reports a
+    // conflict).
+    let reversed: Vec<&str> = file_refs.iter().rev().copied().collect();
+    assert_eq!(
+        check_cross(
+            &reversed,
+            "---@param str string\nlocal function want(str) end\n---@param s Sub\nlocal function use(s) want(s.item) end\n",
+        ),
+        none(),
+        "with the files reversed, `Base<string>` is now first and wins: item is `string`"
     );
 }
 

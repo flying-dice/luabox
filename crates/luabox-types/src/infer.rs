@@ -734,9 +734,16 @@ impl Infer<'_> {
 
     /// Report an absent-field read (`LB0306`). When `declared` names the
     /// `---@class` the receiver resolved to, the message is luals'
-    /// `undefined-field` phrasing and — where the class is declared in this
-    /// file — carries a "declared here" secondary label (#90). For an
-    /// inferred table it keeps the constructor/metatable phrasing.
+    /// `undefined-field` phrasing, names the three ways to declare the
+    /// member (round 3 review F71 — least-surprise for a newly-firing
+    /// diagnostic is naming the remedy, not just the symptom), and carries a
+    /// "declared here" secondary label pointing at the class's own file —
+    /// same-file via [`crate::env::TypeEnv::class_decl_span`], cross-file via
+    /// [`crate::env::TypeEnv::cross_file_class_decl_span`] (previously
+    /// silently omitted for a class declared anywhere but the file currently
+    /// checking, which is exactly the shape a `require`d carrier's members
+    /// take). For an inferred table it keeps the constructor/metatable
+    /// phrasing.
     fn report_absent(&mut self, body: BodyId, expr: ExprId, name: &str, declared: Option<&str>) {
         if self.pass != 1 {
             return;
@@ -747,7 +754,11 @@ impl Infer<'_> {
         let (message, label) = match declared {
             Some(class) => (
                 format!("undefined field `{name}` on `{class}`"),
-                format!("`{class}` declares no field `{name}`"),
+                format!(
+                    "`{class}` declares no field `{name}` — add `---@field {name} <type>`, \
+                     attach `function {class}.{name}(...)` / `function {class}:{name}(...)`, \
+                     or declare a `---@field [string] <type>` key space"
+                ),
             ),
             None => (
                 format!("cannot find field `{name}` on this table"),
@@ -758,13 +769,18 @@ impl Infer<'_> {
         };
         let mut diag = Diagnostic::new(FIELD_NOT_FOUND, self.severity, message)
             .with_label(Label::primary(Span::new(self.file, start..end), label));
-        if let Some(class) = declared
-            && let Some(range) = self.env.class_decl_span(class)
-        {
-            diag = diag.with_label(Label::secondary(
-                Span::new(self.file.to_string(), range),
-                format!("`{class}` declared here"),
-            ));
+        if let Some(class) = declared {
+            if let Some(range) = self.env.class_decl_span(class) {
+                diag = diag.with_label(Label::secondary(
+                    Span::new(self.file.to_string(), range),
+                    format!("`{class}` declared here"),
+                ));
+            } else if let Some((decl_file, range)) = self.env.cross_file_class_decl_span(class) {
+                diag = diag.with_label(Label::secondary(
+                    Span::new(decl_file, range),
+                    format!("`{class}` declared here"),
+                ));
+            }
         }
         self.diags.push(diag);
     }

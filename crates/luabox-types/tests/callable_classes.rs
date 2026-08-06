@@ -121,6 +121,54 @@ local bad = d(99)
 }
 
 #[test]
+fn inherited_operator_from_a_bound_generic_parent_substitutes_its_parameter() {
+    // F37: `collect_operators` performed no substitution at all, unlike its
+    // sibling `collect_class`. `---@class Base<U>` / `---@operator add(U): U`
+    // inherited by `---@class Sub : Base<number>` left `U` free — the
+    // operand's declared type stayed the unresolvable `Ty::Named("U")`, so no
+    // overload ever matched a real argument and `s + 5` fell through to
+    // `unknown` instead of `Base<number>`'s actual `add(number): number` —
+    // the exact leak the #56 export-seam fix closed for fields, surviving on
+    // the operator path.
+    let src = "\
+---@class Base<U>
+---@operator add(U): U
+local B = {}
+---@class Sub : Base<number>
+local S = {}
+---@type Sub
+local s = S
+---@type number
+local n = s + 5
+";
+    assert_eq!(
+        strict_codes(src),
+        Vec::<String>::new(),
+        "the parent's bound argument must substitute into the inherited operator's signature"
+    );
+
+    // The rejecting probe beside the accepting one: the substituted result is
+    // genuinely `number`, not leniently `unknown` (an argument-shape mismatch
+    // on a binary operator has no dedicated diagnostic by design — no
+    // matching overload just falls back to `unknown`, per
+    // `Infer::operator_binary`'s doc comment — so the result-mismatch
+    // assignment below is the probe that distinguishes "substituted to
+    // `number`" from "erased to `unknown`").
+    let wrong_result = "\
+---@class Base<U>
+---@operator add(U): U
+local B = {}
+---@class Sub : Base<number>
+local S = {}
+---@type Sub
+local s = S
+---@type string
+local n = s + 5
+";
+    assert_eq!(strict_codes(wrong_result), vec!["LB0300"]);
+}
+
+#[test]
 fn unresolved_callee_is_unchanged_no_new_diagnostic() {
     // An `any`/unknown callee never manufactures a call diagnostic: it is
     // not a declared class with a `call` operator (conservatism, AC #3).

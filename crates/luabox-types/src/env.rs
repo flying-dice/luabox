@@ -114,6 +114,16 @@ pub struct FileTypes {
     pub(crate) classes: BTreeMap<String, ClassDef>,
     pub(crate) enums: BTreeMap<String, EnumDef>,
     pub(crate) aliases: BTreeMap<String, AliasTag>,
+    /// The `---@class` tag span of each class this file declares, paired with
+    /// this file's own name — the "declared here" secondary a cross-file
+    /// consumer's undefined-field diagnostic points at (#90, round 3 review
+    /// F71). `TypeEnv::class_decl_span` only ever answers for the *current*
+    /// file's own declarations (populated by `absorb_block` during that
+    /// file's own build), so a class merged in from elsewhere needs its span
+    /// carried here instead, alongside the file it actually lives in — a
+    /// span with no file would silently mislabel whichever file happens to be
+    /// checking at the time.
+    pub(crate) class_decl_spans: BTreeMap<String, (String, std::ops::Range<usize>)>,
 }
 
 impl FileTypes {
@@ -130,10 +140,16 @@ impl FileTypes {
     /// itself declares are collected — ambient (defs/stdlib) declarations
     /// seeded into `env` are not re-exported. Aliases are collected raw from
     /// the harvested tags (expansion is deferred to each consumer's lowerer).
+    ///
+    /// `file` names the declaring file — carried alongside each class's
+    /// `---@class` tag span (round 3 review F71) so a cross-file consumer's
+    /// "declared here" secondary label points at the right file, not
+    /// whichever one happens to be checking.
     pub(crate) fn collect(
         items: &[luacats::AnnotatedItem],
         env: &TypeEnv,
         carriers: &HashMap<String, Ty>,
+        file: &str,
     ) -> FileTypes {
         let mut out = FileTypes::default();
         for item in items {
@@ -154,6 +170,11 @@ impl FileTypes {
                             }
                         }
                         out.classes.insert(c.name.clone(), def);
+                        if let Some(range) = env.class_decl_span(&c.name) {
+                            out.class_decl_spans
+                                .entry(c.name.clone())
+                                .or_insert((file.to_string(), range));
+                        }
                     }
                     Tag::Enum(e) if !e.name.is_empty() => {
                         if let Some(def) = env.enums.get(&e.name) {
@@ -209,6 +230,15 @@ pub struct TypeEnv {
     /// same-file classes are recorded; ambient/defs parents have no in-file
     /// span to point at.
     class_decl_spans: BTreeMap<String, std::ops::Range<usize>>,
+    /// The `---@class` tag span of a class declared in ANOTHER project file,
+    /// paired with that file's name — merged in from [`FileTypes`] by
+    /// [`Self::merge_file_types`] (round 3 review F71). Distinct from
+    /// [`Self::class_decl_spans`] (same-file only, keyed by name with no file
+    /// component, since it is only ever read against *this* file): a
+    /// cross-file consumer's undefined-field diagnostic needs to know
+    /// *which* file the class it names lives in before it can point a
+    /// secondary label at it at all.
+    cross_file_class_decl_spans: BTreeMap<String, (String, std::ops::Range<usize>)>,
     /// Ambient / global values by name: stdlib module tables (`string`,
     /// `math`, ...) and scalar globals (`_VERSION`) declared by definition
     /// packages (`---@meta` `.d.lua`). Populated only for the ambient
@@ -277,13 +307,14 @@ impl TypeEnv {
             env.enums = ambient.env.enums.clone();
             env.functions = ambient.env.functions.clone();
             env.global_types = ambient.env.global_types.clone();
+            env.cross_file_class_decl_spans = ambient.env.cross_file_class_decl_spans.clone();
         }
         let mut lowerer = Lowerer::new(&decl);
+        let root = parse.syntax();
         // Build generic `---@class Name<T>` templates before the main pass so
         // references (`Name<number>`) resolve regardless of declaration order,
         // and ambient generic classes are reachable too (#84).
-        lowerer.generic_classes = collect_generic_classes(items, ambient, &mut lowerer);
-        let root = parse.syntax();
+        lowerer.generic_classes = collect_generic_classes(items, &root, ambient, &decl);
         for item in items {
             lowerer.generics = block_generics(item);
             env.absorb_block(item, &mut lowerer, &root);
@@ -383,6 +414,7 @@ impl TypeEnv {
             enums: self.enums.clone(),
             functions: self.functions.clone(),
             global_types: self.global_types.clone(),
+            cross_file_class_decl_spans: self.cross_file_class_decl_spans.clone(),
             ..TypeEnv::default()
         }
     }
@@ -394,32 +426,58 @@ impl TypeEnv {
     /// collisions, and a carrier attachment never shadowing a `---@field`;
     /// enums merge first-wins.
     pub(crate) fn merge_file_types(&mut self, file: &FileTypes) {
+        // First-wins, matching every other axis of this merge: the first
+        // file to declare a name is the one a "declared here" secondary
+        // points at (round 3 review F71).
+        for (name, location) in &file.class_decl_spans {
+            self.cross_file_class_decl_spans
+                .entry(name.clone())
+                .or_insert_with(|| location.clone());
+        }
         for (name, def) in &file.classes {
             match self.classes.get_mut(name) {
                 None => {
                     self.classes.insert(name.clone(), def.clone());
                 }
                 Some(existing) => {
-                    // Parents dedup by NAME: two declarations naming one
-                    // parent with different arguments are the same edge in the
-                    // chain, and the first wins as every other member does.
-                    for parent in &def.parents {
-                        if !existing.parents.iter().any(|p| p.name == parent.name) {
-                            existing.parents.push(parent.clone());
-                        }
-                    }
                     // Type parameters follow the same first-wins rule as
                     // members, with the same allowance the in-file merge makes:
-                    // a declaration that named none has none to keep.
+                    // a declaration that named none has none to keep. Read
+                    // before the parents loop below: the rename it drives
+                    // (#59, F38) must be computed against the canonical
+                    // params already on record, and applied to `parent.args`
+                    // *before* a parent is pushed — otherwise a pushed
+                    // argument keeps this declaration's own (non-canonical)
+                    // spelling.
                     if existing.params.is_empty() {
                         existing.params.clone_from(&def.params);
                     }
                     // …and one that spells them differently is unified
                     // **positionally**, exactly as two declarations in one file
-                    // are, so its field bodies still substitute at an
-                    // instantiation site instead of leaking the other
-                    // declaration's parameter name through the merged class.
+                    // are, so its field bodies — and its parent references'
+                    // type arguments — still substitute at an instantiation
+                    // site instead of leaking the other declaration's
+                    // parameter name through the merged class.
                     let rename = class_param_unification(&def.params, &existing.params);
+                    // Parents dedup by NAME: two declarations naming one
+                    // parent with different arguments are the same edge in the
+                    // chain, and the first wins as every other member does.
+                    for parent in &def.parents {
+                        let parent = match &rename {
+                            Some(map) => ParentRef {
+                                name: parent.name.clone(),
+                                args: parent
+                                    .args
+                                    .iter()
+                                    .map(|arg| crate::generics::subst_ty(arg, map))
+                                    .collect(),
+                            },
+                            None => parent.clone(),
+                        };
+                        if !existing.parents.iter().any(|p| p.name == parent.name) {
+                            existing.parents.push(parent);
+                        }
+                    }
                     let subst = |field: &FieldTy| match &rename {
                         Some(map) => FieldTy {
                             ty: crate::generics::subst_ty(&field.ty, map),
@@ -780,33 +838,62 @@ impl TypeEnv {
                                 ..ClassDef::default()
                             },
                         );
-                    } else if let Some(existing) = self.classes.get_mut(&c.name) {
-                        for parent in parents {
-                            if !existing.parents.iter().any(|p| p.name == parent.name) {
-                                existing.parents.push(parent);
-                            }
-                        }
+                        class_rename = None;
+                    } else {
                         // A re-declaration may name the type parameters the
-                        // first one omitted; it never renames them (first-wins,
-                        // as for every other member).
-                        if existing.params.is_empty() {
+                        // first one omitted; it never renames them
+                        // (first-wins, as for every other member) — done
+                        // BEFORE the rename below is computed, not after: a
+                        // bare first declaration has an EMPTY canonical list
+                        // until this runs, and computing the rename against
+                        // that stale empty list mapped this very
+                        // declaration's own, now-canonical parameter to
+                        // `unknown` instead of leaving it alone (own ==
+                        // canonical needs the update to have already
+                        // happened to see that they agree).
+                        if let Some(existing) = self.classes.get_mut(&c.name)
+                            && existing.params.is_empty()
+                        {
                             existing.params.clone_from(&c.params);
                         }
+                        // A re-declaration's `---@field` bodies — and, per
+                        // #59/F38, its *parent references' type arguments* —
+                        // are written against the type parameters *it* names,
+                        // so when those differ from the canonical list they
+                        // are unified **positionally** here, before either is
+                        // absorbed: slot `i` is one type variable however the
+                        // two declarations spell it. The rename must exist
+                        // *before* `parents` is pushed, or the pushed
+                        // argument keeps the re-declaration's own
+                        // (non-canonical) spelling. Without this the merged
+                        // class carries a parent argument (or a field type)
+                        // naming a parameter its own parameter list never
+                        // mentions, unresolvable at every instantiation site —
+                        // visible across the `require` boundary, where the
+                        // merged class is what the consumer sees.
+                        class_rename = self
+                            .classes
+                            .get(&c.name)
+                            .and_then(|def| class_param_unification(&c.params, &def.params));
+                        if let Some(existing) = self.classes.get_mut(&c.name) {
+                            for parent in parents {
+                                let parent = match &class_rename {
+                                    Some(map) => ParentRef {
+                                        name: parent.name,
+                                        args: parent
+                                            .args
+                                            .iter()
+                                            .map(|arg| crate::generics::subst_ty(arg, map))
+                                            .collect(),
+                                    },
+                                    None => parent,
+                                };
+                                if !existing.parents.iter().any(|p| p.name == parent.name) {
+                                    existing.parents.push(parent);
+                                }
+                            }
+                        }
                     }
-                    // A re-declaration's `---@field` bodies are written against
-                    // the type parameters *it* names, so when those differ from
-                    // the canonical list they are unified **positionally** as
-                    // the fields are absorbed: slot `i` is one type variable
-                    // however the two declarations spell it. Without this the
-                    // merged class carries a field typed by a name its own
-                    // parameter list never mentions, and instantiating it
-                    // leaves that name unsubstituted — visible across the
-                    // `require` boundary, where the merged class is what the
-                    // consumer sees.
-                    class_rename = self
-                        .classes
-                        .get(&c.name)
-                        .and_then(|def| class_param_unification(&c.params, &def.params));
                     current_class = Some(c.name.clone());
                     // First-wins, matching the fields: the "declared here"
                     // label points at the declaration that introduced the name.
@@ -1202,6 +1289,66 @@ impl TypeEnv {
         Some(shape)
     }
 
+    /// Every generic class this env declares, as the [`GenericClass`]
+    /// templates a [`Lowerer`] instantiates a reference against — the same
+    /// derivation [`collect_generic_classes`]'s discovery pass ends with,
+    /// exposed for a caller that already has a *complete* env (this one) and
+    /// needs a lowerer that can resolve a **nested** generic reference inside
+    /// an argument list (round 3 review F48's [`Self::lower_bound_args`]):
+    /// without it, `Box<Pair<number>>` would lower `Pair<number>` as the bare
+    /// `Ty::Named("Pair")`, since a fresh [`Lowerer`] otherwise starts with no
+    /// generic classes in scope at all.
+    fn generic_classes(&self) -> BTreeMap<String, GenericClass> {
+        let mut out = BTreeMap::new();
+        for (name, def) in &self.classes {
+            if def.params.is_empty() {
+                continue;
+            }
+            if let Some(shape) = self.class_shape(name) {
+                out.insert(
+                    name.clone(),
+                    GenericClass {
+                        params: def.params.clone(),
+                        template: shape,
+                    },
+                );
+            }
+        }
+        out
+    }
+
+    /// Lower a list of LuaCATS type expressions — a generic reference's
+    /// `<...>` arguments — against this env's own declared names (classes,
+    /// enums, and `aliases`, supplied by the caller since this env does not
+    /// itself retain alias bodies). No `---@generic`/class-parameter scope:
+    /// an argument names a concrete type, never a template placeholder, so
+    /// nothing needs to be in `Lowerer::generics` for this call. Reports no
+    /// diagnostics — this is a resolution query over an already-checked
+    /// annotation, not a declaration being checked for the first time; an
+    /// undeclared name lowers leniently to `Ty::Unknown`, matching how a bare
+    /// unresolvable reference already behaves everywhere else in the checker.
+    ///
+    /// The reference-site half of round 3 review F48: `Ambient::class_members`
+    /// resolves a class's shape with every parameter free, which is right for
+    /// a bare `Box` but silently wrong for `Box<number>` — this is what lets a
+    /// caller (LSP hover/completion) bind the arguments the reference actually
+    /// wrote before asking for the shape, instead of the editor answering `T`
+    /// where the checker answers `number`.
+    pub(crate) fn lower_bound_args(
+        &self,
+        args: &[luacats::TypeExpr],
+        aliases: &BTreeMap<String, AliasTag>,
+    ) -> Vec<Ty> {
+        let decl = Declared {
+            classes: self.classes.keys().cloned().collect(),
+            enums: self.enums.keys().cloned().collect(),
+            aliases: aliases.clone(),
+        };
+        let mut lowerer = Lowerer::new(&decl);
+        lowerer.generic_classes = self.generic_classes();
+        args.iter().map(|arg| lowerer.lower(arg)).collect()
+    }
+
     fn collect_class(
         &self,
         name: &str,
@@ -1209,47 +1356,65 @@ impl TypeEnv {
         shape: &mut TableTy,
         seen: &mut HashSet<String>,
     ) {
+        // `seen` guards the *currently-expanding path*, not "ever visited":
+        // it is inserted here and removed again at the bottom of this call,
+        // so a true cycle (a class reachable from itself) still trips the
+        // guard, but a diamond — the same ancestor reached through two
+        // different parents, each possibly binding its parameters
+        // differently, e.g. `C : A, B` where `A : Base` and `B : Base<number>`
+        // — is expanded once per edge instead of only the first (#59, F39).
         if !seen.insert(name.to_string()) {
             return;
         }
-        let Some(def) = self.classes.get(name) else {
-            return;
-        };
-        let bound: BTreeMap<String, Ty> = def
-            .params
-            .iter()
-            .zip(args)
-            .map(|(param, arg)| (param.clone(), arg.clone()))
-            .collect();
-        for parent in &def.parents {
-            // A parent's arguments are written in *this* class's parameter
-            // vocabulary — `---@class Cell<T> : Slot<T>` passes its own `T`
-            // through — so they are substituted before they bind the parent's.
-            let parent_args: Vec<Ty> = parent
-                .args
+        if let Some(def) = self.classes.get(name) {
+            let bound: BTreeMap<String, Ty> = def
+                .params
                 .iter()
-                .map(|arg| crate::generics::subst_ty(arg, &bound))
+                .zip(args)
+                .map(|(param, arg)| (param.clone(), arg.clone()))
                 .collect();
-            self.collect_class(&parent.name, &parent_args, shape, seen);
-        }
-        // Carrier-attached members first, then `---@field` declarations —
-        // both override inherited members, and a declaration wins over a
-        // same-name attachment (annotations are authoritative).
-        for (member, ty) in &def.methods {
+            for parent in &def.parents {
+                // A parent's arguments are written in *this* class's parameter
+                // vocabulary — `---@class Cell<T> : Slot<T>` passes its own `T`
+                // through — so they are substituted before they bind the parent's.
+                let parent_args: Vec<Ty> = parent
+                    .args
+                    .iter()
+                    .map(|arg| crate::generics::subst_ty(arg, &bound))
+                    .collect();
+                self.collect_class(&parent.name, &parent_args, shape, seen);
+            }
+            // Carrier-attached members first, then `---@field` declarations —
+            // both override inherited members, and a declaration wins over a
+            // same-name attachment (annotations are authoritative).
+            for (member, ty) in &def.methods {
+                shape
+                    .fields
+                    .insert(member.clone(), crate::generics::subst_field(ty, &bound));
+            }
+            for (field, ty) in &def.fields {
+                shape
+                    .fields
+                    .insert(field.clone(), crate::generics::subst_field(ty, &bound));
+            }
+            // Both halves of an indexer are substituted, matching
+            // `generics::subst_table` — the reference implementation every
+            // *direct* generic instantiation goes through. Only the value
+            // was substituted here before, so an inherited `---@field [K] V`
+            // left its key as the free `Ty::Named("K")`: unresolvable
+            // downstream, which `assign.rs` reads as "matches any key" (a
+            // false accept) and, on the value-mismatch path, as "matches no
+            // key" (a spurious false reject) — #59, F36.
             shape
-                .fields
-                .insert(member.clone(), crate::generics::subst_field(ty, &bound));
+                .indexers
+                .extend(def.indexers.iter().map(|(key, value)| {
+                    (
+                        crate::generics::subst_ty(key, &bound),
+                        crate::generics::subst_ty(value, &bound),
+                    )
+                }));
         }
-        for (field, ty) in &def.fields {
-            shape
-                .fields
-                .insert(field.clone(), crate::generics::subst_field(ty, &bound));
-        }
-        shape.indexers.extend(
-            def.indexers
-                .iter()
-                .map(|(key, value)| (key.clone(), crate::generics::subst_ty(value, &bound))),
-        );
+        seen.remove(name);
     }
 
     /// The member names of `name`'s shape that are carrier attachments
@@ -1284,13 +1449,23 @@ impl TypeEnv {
     pub(crate) fn class_operators(&self, name: &str, op: &str) -> Vec<OperatorSig> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
-        self.collect_operators(name, op, &mut out, &mut seen);
+        self.collect_operators(name, &[], op, &mut out, &mut seen);
         out
     }
 
+    /// [`Self::collect_class`]'s substitution and cycle-guard rules, for
+    /// `---@operator` overloads instead of members: `args` binds `name`'s own
+    /// type parameters, a parent's arguments are substituted through that
+    /// binding before they bind the parent's own, and `seen` guards only the
+    /// currently-expanding path so a shared ancestor reached through two
+    /// differently-bound parents is still visited on both edges (#59, F37 —
+    /// before this fix `collect_operators` performed no substitution at all,
+    /// unlike its sibling, so `---@operator add(U): U` on `---@class Base<U>`
+    /// inherited by `---@class Sub : Base<number>` left `U` free).
     fn collect_operators(
         &self,
         name: &str,
+        args: &[Ty],
         op: &str,
         out: &mut Vec<OperatorSig>,
         seen: &mut HashSet<String>,
@@ -1298,15 +1473,34 @@ impl TypeEnv {
         if !seen.insert(name.to_string()) {
             return;
         }
-        let Some(def) = self.classes.get(name) else {
-            return;
-        };
-        if let Some(sigs) = def.operators.get(op) {
-            out.extend(sigs.iter().cloned());
+        if let Some(def) = self.classes.get(name) {
+            let bound: BTreeMap<String, Ty> = def
+                .params
+                .iter()
+                .zip(args)
+                .map(|(param, arg)| (param.clone(), arg.clone()))
+                .collect();
+            if let Some(sigs) = def.operators.get(op) {
+                out.extend(sigs.iter().map(|sig| {
+                    OperatorSig {
+                        input: sig
+                            .input
+                            .as_ref()
+                            .map(|ty| crate::generics::subst_ty(ty, &bound)),
+                        result: crate::generics::subst_ty(&sig.result, &bound),
+                    }
+                }));
+            }
+            for parent in &def.parents {
+                let parent_args: Vec<Ty> = parent
+                    .args
+                    .iter()
+                    .map(|arg| crate::generics::subst_ty(arg, &bound))
+                    .collect();
+                self.collect_operators(&parent.name, &parent_args, op, out, seen);
+            }
         }
-        for parent in &def.parents {
-            self.collect_operators(&parent.name, op, out, seen);
-        }
+        seen.remove(name);
     }
 
     pub(crate) fn enum_member(&self, enum_name: &str, member: &str) -> Option<&Ty> {
@@ -1377,46 +1571,112 @@ impl TypeEnv {
         self.class_decl_spans.get(name).cloned()
     }
 
+    /// [`Self::class_decl_span`]'s cross-file counterpart (round 3 review
+    /// F71): the declaring file plus span for a class declared in a
+    /// *different* project file than the one currently checking, or `None`
+    /// when `name` is not a class this env has cross-file span data for
+    /// (either genuinely undeclared, or declared in the current file — use
+    /// [`Self::class_decl_span`] for that case).
+    pub(crate) fn cross_file_class_decl_span(
+        &self,
+        name: &str,
+    ) -> Option<(String, std::ops::Range<usize>)> {
+        self.cross_file_class_decl_spans.get(name).cloned()
+    }
+
     /// The declared parents of a `---@class`, in declaration order — each
     /// with the type arguments this declaration binds to it.
     pub(crate) fn class_parents(&self, name: &str) -> Option<&[ParentRef]> {
         self.classes.get(name).map(|def| def.parents.as_slice())
     }
 
-    /// Every generic parameter name that can appear in `name`'s **resolved**
-    /// shape: its own `---@class Name<T>` parameters plus those of every
-    /// ancestor, depth-first over the parent chain and deduplicated. Empty for
-    /// a plain class and for a name that is no class at all. A caller holding
-    /// only the *name* of a class (a [`Ty::Named`], which carries no
-    /// arguments) uses this to tell whether the name alone is a complete type
-    /// or a template with parameters still unbound.
+    /// Every generic-parameter placeholder that still appears **free** in
+    /// `name`'s **resolved** shape — unbound, and therefore something a
+    /// caller holding only the *name* (a [`Ty::Named`], which carries no
+    /// arguments) cannot substitute. Empty for a plain class, for a class
+    /// whose ancestors are all fully bound, and for a name that is no class
+    /// at all.
     ///
-    /// [`Self::class_shape`] flattens inherited `---@field`s in, so a parent's
-    /// parameter can reach the shape as a member type whether or not the child
-    /// declares parameters of its own: `---@class Sub : Base` — a generic
-    /// parent named without arguments — leaves `Base`'s `U` free in `Sub`'s
-    /// members. (A parent named *with* arguments binds them; see
-    /// [`Self::class_shape_bound`].) A caller substituting a class's free
-    /// parameters must therefore cover the ancestors' too.
+    /// This walks the already-**resolved**, already-substituted shape
+    /// ([`Self::class_shape`], which folds every ancestor's `---@field`s in
+    /// with their parent references' arguments already bound — see
+    /// [`Self::collect_class`]) and keeps the [`Ty::Named`] leaves that do
+    /// not resolve to a real class or enum. That is deliberate, not
+    /// incidental (#59, F43): class names and `---@generic`/`---@class<T>`
+    /// parameters share one namespace (a class may legally, if confusingly,
+    /// declare a parameter spelled the same as some unrelated real class), so
+    /// walking each ancestor's *declared parameter list* — the previous
+    /// implementation — could not tell "an ancestor's own parameter, still
+    /// free" from "a real class, referenced by name, that happens to share a
+    /// spelling with some *other* ancestor's parameter" and erased the
+    /// latter. Walking the resolved shape instead asks the only question
+    /// that matters: does this `Ty::Named` resolve? A parameter a parent
+    /// reference already bound is substituted away before this ever sees it
+    /// ([`Self::class_shape_bound`]); a parameter left free (`---@class Sub :
+    /// Base` — a generic parent named without arguments) survives
+    /// substitution as itself and is caught here.
     pub(crate) fn class_params_in_scope(&self, name: &str) -> Vec<String> {
-        let mut params: Vec<String> = Vec::new();
-        let mut stack = vec![name.to_string()];
-        let mut seen = HashSet::new();
-        while let Some(class) = stack.pop() {
-            if !seen.insert(class.clone()) {
-                continue;
-            }
-            let Some(def) = self.classes.get(&class) else {
-                continue;
-            };
-            for param in &def.params {
-                if !params.contains(param) {
-                    params.push(param.clone());
+        let Some(shape) = self.class_shape(name) else {
+            return Vec::new();
+        };
+        let mut found: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for field in shape.fields.values() {
+            self.collect_free_names(&field.ty, &mut found, &mut seen);
+        }
+        for (key, value) in &shape.indexers {
+            self.collect_free_names(key, &mut found, &mut seen);
+            self.collect_free_names(value, &mut found, &mut seen);
+        }
+        if let Some(array) = &shape.array {
+            self.collect_free_names(array, &mut found, &mut seen);
+        }
+        found
+    }
+
+    /// [`Self::class_params_in_scope`]'s walk: every [`Ty::Named`] reachable
+    /// from `ty` that does not resolve to a real class or enum, collected
+    /// once each into `out` (deduplicated via `seen`).
+    fn collect_free_names(&self, ty: &Ty, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+        match ty {
+            Ty::Named(candidate) => {
+                if !self.classes.contains_key(candidate)
+                    && !self.enums.contains_key(candidate)
+                    && seen.insert(candidate.clone())
+                {
+                    out.push(candidate.clone());
                 }
             }
-            stack.extend(def.parents.iter().map(|p| p.name.clone()));
+            Ty::Union(members) => {
+                for member in members {
+                    self.collect_free_names(member, out, seen);
+                }
+            }
+            Ty::Table(table) => {
+                for field in table.fields.values() {
+                    self.collect_free_names(&field.ty, out, seen);
+                }
+                for (key, value) in &table.indexers {
+                    self.collect_free_names(key, out, seen);
+                    self.collect_free_names(value, out, seen);
+                }
+                if let Some(array) = &table.array {
+                    self.collect_free_names(array, out, seen);
+                }
+            }
+            Ty::Function(func) => {
+                for param in &func.params {
+                    self.collect_free_names(&param.ty, out, seen);
+                }
+                if let Some(varargs) = &func.varargs {
+                    self.collect_free_names(varargs, out, seen);
+                }
+                for ret in &func.returns {
+                    self.collect_free_names(ret, out, seen);
+                }
+            }
+            _ => {}
         }
-        params
     }
 
     /// Whether `name` is a LuaCATS `---@class` (in-file, def-package, or
@@ -1739,114 +1999,65 @@ fn block_generics(item: &luacats::AnnotatedItem) -> HashSet<String> {
 }
 
 /// Build the generic `---@class Name<T>` templates the lowerer instantiates at
-/// reference sites: file-declared classes (their `---@field` bodies lowered
-/// with the params in scope) and ambient generic classes (already lowered with
-/// placeholders in the definition package). Parent fields are not folded into
-/// the template — field-level substitution through the class's own declared
-/// fields is the bar (#84); inherited generic fields are deliberately shallow.
+/// reference sites: every class with parameters, its template the class's
+/// FULLY RESOLVED shape — including inherited members, monomorphised through
+/// the parent chain exactly as [`TypeEnv::class_shape`] already does for
+/// every other consumer of it (#59).
+///
+/// Corrected (round 3 review 2(a)): previously this built each class's
+/// template from its own `---@field`s alone, one declaration at a time —
+/// parent fields were never folded in ("inherited generic fields are
+/// deliberately shallow", the doc comment used to say, citing #84 as if that
+/// were a settled design rather than a gap). `---@type Sub<string>` where
+/// `Sub : Base<T>` resolved `slot` (declared on `Base`, not `Sub`) as
+/// `unknown` instead of `string` — a real class's own reference-site
+/// behaviour disagreeing with the same class read through a plain
+/// `---@type Sub` binding, which correctly inherits via `class_shape`.
+/// `docs/03-reference/02-limitations.md` documents the old behaviour as
+/// deliberate; it is not — see the fix's report for the corrected wording.
+///
+/// The fix: build a throwaway, diagnostics-discarded `TypeEnv` via the SAME
+/// `absorb_block` machinery [`TypeEnv::build_from_items`] uses for real,
+/// seeded with the same ambient. Once every class in the file is known to
+/// it — same two-pass shape [`TypeEnv::build_from_items`] already needs so a
+/// reference resolves regardless of declaration order — `class_shape` (already
+/// inheritance-, substitution- and cycle-aware) answers the "what does this
+/// class's shape monomorphise to, own params free" question directly, so a
+/// generic reference's ancestors are in scope on the same terms a same-file
+/// plain reference's already are. The cost is one extra walk of the file's
+/// annotations per build; correctness here was worth more than that walk.
 fn collect_generic_classes(
     items: &[luacats::AnnotatedItem],
+    root: &SyntaxNode,
     ambient: Option<&crate::defs::Ambient>,
-    lowerer: &mut Lowerer<'_>,
+    decl: &Declared,
 ) -> BTreeMap<String, GenericClass> {
-    let mut out: BTreeMap<String, GenericClass> = BTreeMap::new();
+    let mut discovery = TypeEnv::default();
     if let Some(ambient) = ambient {
-        for (name, def) in &ambient.env.classes {
-            if def.params.is_empty() {
-                continue;
-            }
+        discovery.classes = ambient.env.classes.clone();
+        discovery.enums = ambient.env.enums.clone();
+    }
+    let mut discovery_lowerer = Lowerer::new(decl);
+    for item in items {
+        discovery_lowerer.generics = block_generics(item);
+        discovery.absorb_block(item, &mut discovery_lowerer, root);
+    }
+
+    let mut out: BTreeMap<String, GenericClass> = BTreeMap::new();
+    for (name, def) in &discovery.classes {
+        if def.params.is_empty() {
+            continue; // only a generic class needs a reference-site template
+        }
+        if let Some(shape) = discovery.class_shape(name) {
             out.insert(
                 name.clone(),
                 GenericClass {
                     params: def.params.clone(),
-                    template: TableTy {
-                        fields: def.fields.clone(),
-                        indexers: def.indexers.clone(),
-                        ..TableTy::default()
-                    },
+                    template: shape,
                 },
             );
         }
     }
-    // The *canonical* parameter list for each name — first non-empty
-    // declaration wins, matching every other first-wins rule in the file.
-    // Collected ahead of the templates so a *bare* `---@class Name` block that
-    // only adds members is recognised as a declaration of the generic class
-    // rather than of some unrelated plain one, whichever order the two appear
-    // in. It fixes the merged template's parameter *names and arity*; it is
-    // deliberately NOT the list a declaration's own field bodies resolve
-    // against (see below).
-    let mut params_of: BTreeMap<&str, &Vec<String>> = BTreeMap::new();
-    for item in items {
-        for tag in &item.block.tags {
-            let Tag::Class(c) = tag else { continue };
-            if c.name.is_empty() || c.params.is_empty() {
-                continue;
-            }
-            params_of.entry(&c.name).or_insert(&c.params);
-        }
-    }
-    // Every declaration of a generic name contributes its members, unioning
-    // first-wins — duplicate `---@class` declarations merge here exactly as
-    // they do in `absorb_block` (#49); before this the last one replaced the
-    // template and the earlier declarations' fields vanished from it. The
-    // file's *first* declaration still replaces an ambient generic class of
-    // the same name whole (the `[types] defs` escape hatch).
-    //
-    // Each declaration's `---@field` bodies are lowered against the parameter
-    // list *that declaration* declares — its type parameters are scoped to it,
-    // exactly as luals scopes them — and the resulting templates are unified
-    // *positionally* as they merge: a second declaration's slot-0 parameter is
-    // the same type variable as the first's, whatever the two are spelled.
-    // Handing the canonical list to every declaration instead resolved a
-    // renamed duplicate's own, valid annotation against names that were never
-    // in scope for it, reporting LB0305 on it.
-    //
-    // This pass is template *construction*, not diagnosis: the main
-    // `absorb_block` walk lowers every one of these `---@field` bodies again
-    // and is the sole reporter for them, so whatever this pass records is
-    // rolled back below. Leaving it in would double-report a field whose type
-    // name is genuinely unknown, once per pass.
-    let quiet = QuietMark::of(lowerer);
-    let mut claimed: HashSet<&str> = HashSet::new();
-    for item in items {
-        for (i, tag) in item.block.tags.iter().enumerate() {
-            let Tag::Class(c) = tag else { continue };
-            let Some(canonical) = params_of.get(c.name.as_str()).copied() else {
-                continue;
-            };
-            // A bare re-declaration declares no parameters of its own, so it
-            // borrows the canonical ones — there is nothing to rename.
-            let own: &[String] = if c.params.is_empty() {
-                canonical
-            } else {
-                &c.params
-            };
-            let mut template = lower_class_template(&item.block.tags, i, own, lowerer);
-            if let Some(map) = class_param_unification(own, canonical) {
-                template = rename_template_params(&template, &map);
-            }
-            if claimed.insert(&c.name) {
-                out.insert(
-                    c.name.clone(),
-                    GenericClass {
-                        params: canonical.clone(),
-                        template,
-                    },
-                );
-            } else if let Some(existing) = out.get_mut(&c.name) {
-                for (name, field) in template.fields {
-                    existing.template.fields.entry(name).or_insert(field);
-                }
-                for indexer in template.indexers {
-                    if !existing.template.indexers.contains(&indexer) {
-                        existing.template.indexers.push(indexer);
-                    }
-                }
-            }
-        }
-    }
-    quiet.rollback(lowerer);
     out
 }
 
@@ -1913,65 +2124,6 @@ fn positional_rename(own: &[String], canonical: &[String]) -> BTreeMap<String, T
             (name.clone(), to)
         })
         .collect()
-}
-
-/// Rewrite one declaration's type-variable placeholders through a
-/// [`class_param_unification`] substitution — `---@class Boxed<U>`'s field
-/// typed `U` becomes the canonical `T` before the templates merge.
-fn rename_template_params(template: &TableTy, map: &BTreeMap<String, Ty>) -> TableTy {
-    match crate::generics::subst_ty(&Ty::Table(Box::new(template.clone())), map) {
-        Ty::Table(table) => *table,
-        // `subst_ty` maps a `Ty::Table` to a `Ty::Table`; this arm is
-        // unreachable, and falling back to the un-renamed template keeps the
-        // function total without a panic.
-        _ => template.clone(),
-    }
-}
-
-/// Lower the `---@field`s belonging to the `---@class` at `tags[class]` into a
-/// template table, with that declaration's `<T>` params in scope so each `T`
-/// becomes a `Ty::Named(T)` placeholder.
-///
-/// Ownership is **positional**: the fields between the class's tag and the next
-/// `---@class` in the block are its own (mirrors [`TypeEnv::absorb_block`]'s
-/// `current_class` tracking). Matching on the class *name* instead cannot tell
-/// two declarations of one name apart when both sit in a single block, and so
-/// handed each of them the other's fields — harmless while both were lowered
-/// against one parameter list, wrong once each has its own.
-fn lower_class_template(
-    tags: &[Tag],
-    class: usize,
-    params: &[String],
-    lowerer: &mut Lowerer<'_>,
-) -> TableTy {
-    let saved = std::mem::replace(&mut lowerer.generics, params.iter().cloned().collect());
-    let mut table = TableTy::default();
-    for tag in tags.iter().skip(class + 1) {
-        match tag {
-            Tag::Class(_) => break,
-            Tag::Field(f) => {
-                let ty = lowerer.lower(&f.ty);
-                match &f.key {
-                    FieldKey::Name(name) => {
-                        table.fields.insert(
-                            name.clone(),
-                            FieldTy {
-                                ty,
-                                optional: f.optional,
-                            },
-                        );
-                    }
-                    FieldKey::Indexer(key) => {
-                        let key = lowerer.lower(key);
-                        table.indexers.push((key, ty));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    lowerer.generics = saved;
-    table
 }
 
 /// Lower one `---@cast` tag's operation list.
@@ -2307,13 +2459,7 @@ mod tests {
         assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
         let items = luacats::harvest(&parsed);
         let env = TypeEnv::build_from_items(&parsed, &items, None);
-        FileTypes::collect(&items, &env, &HashMap::new())
-    }
-
-    /// The names of a class's parents, in declaration order — the axis these
-    /// merge assertions are about, with the bound arguments left aside.
-    fn parent_names(def: &ClassDef) -> Vec<&str> {
-        def.parents.iter().map(|p| p.name.as_str()).collect()
+        FileTypes::collect(&items, &env, &HashMap::new(), "surface.lua")
     }
 
     // --- string-literal delimiters ---------------------------------------
@@ -2405,7 +2551,23 @@ mod tests {
         // Base's `n` survives; the second declaration's `extra` is added.
         assert_eq!(def.fields["n"].ty, Ty::Number);
         assert_eq!(def.fields["extra"].ty, Ty::Boolean);
-        assert_eq!(parent_names(def), vec!["Parent", "Other"]);
+        // Full `ParentRef` equality (name *and* args), not just the name
+        // projection `parent_names` gives — F41: the weakened form would
+        // still pass if a seam dropped or mis-substituted a parent's bound
+        // arguments, which is exactly what F38 found.
+        assert_eq!(
+            def.parents,
+            vec![
+                ParentRef {
+                    name: "Parent".to_string(),
+                    args: Vec::new(),
+                },
+                ParentRef {
+                    name: "Other".to_string(),
+                    args: Vec::new(),
+                },
+            ]
+        );
         assert_eq!(def.indexers, vec![(Ty::Integer, Ty::String)]);
         assert_eq!(def.operators["add"].len(), 1);
         assert_eq!(def.visibility.get("hidden"), Some(&FieldScope::Private));
@@ -2425,9 +2587,162 @@ mod tests {
         env.merge_file_types(&file);
         env.merge_file_types(&file);
         let def = env.classes.get("Dup").expect("merged class");
-        assert_eq!(parent_names(def), vec!["Base"]);
+        // Full equality (F41): a name-only projection cannot see a seam that
+        // duplicates the same name with different (or mis-substituted) args.
+        assert_eq!(
+            def.parents,
+            vec![ParentRef {
+                name: "Base".to_string(),
+                args: Vec::new(),
+            }]
+        );
         assert_eq!(def.indexers.len(), 1);
         assert_eq!(def.operators["add"].len(), 1);
+    }
+
+    #[test]
+    fn merging_a_renamed_redeclaration_substitutes_its_parents_type_arguments() {
+        // F38 (cross-file seam): the base declares `Both<T>`; the incoming
+        // file re-declares it as `Both<U> : Container<U>` — its OWN
+        // parameter is spelled `U`, and its parent reference passes that same
+        // `U` through to `Container`. The merge must rename `U` to the
+        // canonical `T` in the re-declaration's field bodies (already
+        // covered) *and* in `parent.args` — otherwise `Container`'s bound
+        // argument is left naming a parameter `Both` itself does not have,
+        // unresolvable at every downstream instantiation site (#59, F38).
+        let mut env = TypeEnv::default();
+        env.merge_file_types(&surface("---@class Both<T>\n---@field n T\n"));
+        env.merge_file_types(&surface(
+            "\
+---@class Container<U>
+---@class Both<U> : Container<U>
+---@field extra U
+",
+        ));
+        let def = env.classes.get("Both").expect("merged class");
+        assert_eq!(def.params, vec!["T".to_string()]);
+        assert_eq!(
+            def.parents,
+            vec![ParentRef {
+                name: "Container".to_string(),
+                args: vec![Ty::Named("T".to_string())],
+            }],
+            "the parent's argument must be renamed onto the canonical `T`, not left as the free `U`"
+        );
+        // …and the rename reaches the re-declaration's own field body too,
+        // matching the parent-args fix rather than regressing it.
+        assert_eq!(def.fields["extra"].ty, Ty::Named("T".to_string()));
+    }
+
+    #[test]
+    fn a_declaration_that_first_supplies_a_bare_classs_parameter_keeps_its_own_field_named() {
+        // Coordinator follow-up (round 3 review 2(a) fix uncovered this):
+        // `class_rename` used to be computed against `existing.params`
+        // *before* the "a re-declaration may supply the parameters the first
+        // one omitted" update a few lines below it — so for a bare first
+        // declaration (`params` starts empty), the rename saw an empty
+        // canonical list, `class_param_unification(["T"], [])` did not
+        // consider `["T"]` equal to `[]`, and `positional_rename` mapped `T`
+        // to `unknown` (no canonical slot 0 to become) — the re-declaration's
+        // OWN, now-canonical parameter, renamed to nothing, on the
+        // declaration that just fixed the canonical list to be exactly that.
+        // Invisible to every test that only read the class through the old
+        // template-only generic-reference path, which never consulted
+        // `class_shape`/`env.classes` for this; the plain-reference path
+        // (`---@type Boxed` with no args, or anything routed through
+        // `class_shape`) had this wrong all along.
+        let env = env_of(
+            "\
+---@class Boxed
+---@class Boxed<T>
+---@field value T
+",
+        );
+        let def = env.classes.get("Boxed").expect("declared class");
+        assert_eq!(def.params, vec!["T".to_string()]);
+        assert_eq!(
+            def.fields["value"].ty,
+            Ty::Named("T".to_string()),
+            "the re-declaration's own field must stay bound to its own \
+             (now-canonical) parameter, not collapse to `unknown`"
+        );
+    }
+
+    #[test]
+    fn a_same_file_renamed_redeclaration_substitutes_its_parents_type_arguments() {
+        // F38 (in-file seam, `absorb_block`): the same shape as above, but
+        // both declarations live in one file, so the fix must apply on the
+        // `absorb_block` path independently of `merge_file_types`.
+        let env = env_of(
+            "\
+---@class Container<U>
+---@class Both<T>
+---@field n T
+---@class Both<U> : Container<U>
+---@field extra U
+",
+        );
+        let def = env.classes.get("Both").expect("declared class");
+        assert_eq!(def.params, vec!["T".to_string()]);
+        assert_eq!(
+            def.parents,
+            vec![ParentRef {
+                name: "Container".to_string(),
+                args: vec![Ty::Named("T".to_string())],
+            }]
+        );
+        assert_eq!(def.fields["extra"].ty, Ty::Named("T".to_string()));
+    }
+
+    #[test]
+    fn a_diamond_reaching_one_ancestor_through_two_bindings_keeps_both() {
+        // F39: the recursion guard used to key purely on the ancestor's
+        // *name*, so once a first parent's visit to a shared ancestor
+        // claimed the guard, a second parent's edge into that SAME ancestor
+        // was dropped outright — even when it binds the ancestor's
+        // parameters differently. `C : A, B` where `A : Base` (bare, `U`
+        // unbound) and `B : Base<number>` (bound): before the fix, whichever
+        // parent is listed *first* is the only one ever actually visited (the
+        // other's binding vanishes silently), so `C.item` tracks declaration
+        // position instead of each parent's own binding.
+        //
+        // The two orderings below are an accepting/rejecting pair for the
+        // same fix: post-fix, `collect_class` merges fields sibling-parent by
+        // sibling-parent with the later one overwriting (mirroring "own
+        // overrides inherited"), so the *last-listed* parent's binding wins —
+        // deterministic, and different in each direction from what the
+        // pre-fix "first parent claims the guard" behaviour produces.
+        let listed_second_wins = env_of(
+            "\
+---@class Base<U>
+---@field item U
+---@class A : Base
+---@class B : Base<number>
+---@class C : A, B
+",
+        );
+        let shape = listed_second_wins.class_shape("C").expect("declared class");
+        assert_eq!(
+            shape.fields["item"].ty,
+            Ty::Number,
+            "B's explicit `Base<number>` binding must reach C.item; pre-fix this reads as the free `U` (A's bare visit claims the guard first)"
+        );
+
+        let swapped = env_of(
+            "\
+---@class Base<U>
+---@field item U
+---@class A : Base
+---@class B : Base<number>
+---@class C : B, A
+",
+        );
+        let swapped_shape = swapped.class_shape("C").expect("declared class");
+        assert_eq!(
+            swapped_shape.fields["item"].ty,
+            Ty::Named("U".to_string()),
+            "A's bare visit must still reach C.item when listed second; pre-fix this reads `number` (B's bound visit claims the guard first)"
+        );
     }
 
     #[test]

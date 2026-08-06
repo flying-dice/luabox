@@ -104,6 +104,54 @@ impl Ambient {
         self.env.class_shape(name)
     }
 
+    /// [`Self::class_members`] with `name`'s own type parameters bound to
+    /// `args`, positionally — the shape a reference that wrote them means
+    /// (round 3 review F48). `---@type Box<number>` binds `Box`'s `T` to
+    /// `number`; `args` empty is exactly [`Self::class_members`] (every
+    /// parameter free, matching a bare `Box`). See
+    /// [`crate::env::TypeEnv::class_shape_bound`] for the substitution rule
+    /// this delegates to — the same one every other consumer of a generic
+    /// class's shape already goes through.
+    #[must_use]
+    pub fn class_members_bound(
+        &self,
+        name: &str,
+        args: &[crate::ty::Ty],
+    ) -> Option<crate::ty::TableTy> {
+        self.env.class_shape_bound(name, args)
+    }
+
+    /// [`Self::class_members_bound`] from a LuaCATS type expression directly
+    /// — the reference-site half of round 3 review F48 (#56's acceptance
+    /// criterion: "no divergence between what the editor accepts and what CI
+    /// rejects"). `Self::class_members(name)` alone cannot answer this
+    /// correctly for a generic reference: extracting just the name and
+    /// asking for its (necessarily unbound) shape is exactly the shape of
+    /// the divergence this closes — hover/completion answering `T` where the
+    /// checker, which resolves the *whole* reference, answers `number`.
+    ///
+    /// `ty` is expected to be a `Named` reference (`Box`, `Box<number>`,
+    /// `mylib.Point`); anything else (`T?`, `A|B`, an array, ...) returns
+    /// `None` rather than guessing which member of a compound type the
+    /// caller meant — unwrap to the `Named` case yourself first if that is
+    /// what you have. `None` also covers a `Named` reference whose name is
+    /// not a class at all (an alias, an enum, an unresolvable name).
+    ///
+    /// The arguments are lowered against this ambient layer's own declared
+    /// names — the workspace scope every project file's own annotations
+    /// already resolve against — so a class name, alias, or nested generic
+    /// reference used as an argument (`Box<Pair<number>>`) resolves exactly
+    /// as it would inside a checked file. No `---@generic` scope applies: an
+    /// argument names a concrete type, not a template placeholder.
+    #[must_use]
+    pub fn class_members_of(&self, ty: &luacats::TypeExpr) -> Option<crate::ty::TableTy> {
+        let luacats::TypeExprKind::Named { name, args } = &ty.kind else {
+            return None;
+        };
+        let args = self.env.lower_bound_args(args, &self.aliases);
+        self.class_members_bound(name, &args)
+    }
+
     /// A new ambient layer: this one plus the workspace-global
     /// `---@class`/`---@enum`/`---@alias` declarations collected from every
     /// checked project source file (luals parity: classes, enums, and
@@ -515,6 +563,104 @@ fn report_alias(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ty::Ty;
+
+    /// A generic class's shape as harvested from a project file — the
+    /// merged ambient a real hover/completion query would hold.
+    fn box_ambient() -> Ambient {
+        let src = "---@class Box<T>\n---@field item T\nlocal B = {}\nreturn B\n";
+        let parsed = lua::parse(src, Dialect::Lua54);
+        assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
+        let types = crate::module_surface(&parsed, "box.lua", None).types;
+        stdlib(Dialect::Lua54).with_project_types([&types])
+    }
+
+    /// The [`luacats::TypeExpr`] a `---@type <src>` annotation parses to —
+    /// the shape a real LuaCATS caller (hover/completion) already holds.
+    fn type_expr(src: &str) -> luacats::TypeExpr {
+        let parsed = lua::parse(&format!("---@type {src}\nlocal b\n"), Dialect::Lua54);
+        assert_eq!(
+            parsed.errors(),
+            &[],
+            "annotation fixture must parse cleanly"
+        );
+        let items = luacats::harvest(&parsed);
+        for item in &items {
+            for tag in &item.block.tags {
+                if let Tag::Type(t) = tag {
+                    return t.types[0].clone();
+                }
+            }
+        }
+        panic!("no ---@type tag harvested from {src:?}");
+    }
+
+    #[test]
+    fn class_members_of_a_bound_reference_resolves_the_bound_type() {
+        // Round 3 review F48: `Ambient::class_members(name)` alone always
+        // resolves through `class_shape_bound(name, &[])` — every parameter
+        // free — so a caller that extracted just the name from `Box<number>`
+        // and asked for its members got `item: T`, the exact "editor accepts
+        // what CI rejects" shape #56's acceptance criterion forbids: the
+        // checker resolves the same reference to `item: number`.
+        let ambient = box_ambient();
+        let ty = type_expr("Box<number>");
+        let shape = ambient
+            .class_members_of(&ty)
+            .expect("Box<number> is a class reference");
+        assert_eq!(
+            shape.fields["item"].ty,
+            Ty::Number,
+            "the bound reference's member must resolve to the type it was bound to"
+        );
+
+        // The rejecting probe beside the accepting one: `class_members_bound`
+        // called directly with the SAME argument must agree — proving
+        // `class_members_of` is not doing anything `class_members_bound`
+        // itself would not, and that a genuinely wrong argument is
+        // distinguishable from the right one (not just "some concrete type").
+        let bound_directly = ambient
+            .class_members_bound("Box", &[Ty::String])
+            .expect("Box is a class");
+        assert_eq!(bound_directly.fields["item"].ty, Ty::String);
+        assert_ne!(bound_directly.fields["item"].ty, shape.fields["item"].ty);
+    }
+
+    #[test]
+    fn class_members_of_an_unbound_reference_stays_lenient() {
+        // The one-variable control: the identical class, referenced bare —
+        // no arguments to bind, so the member stays the free `T` (unknown
+        // downstream), exactly as `Ambient::class_members` already behaves
+        // and exactly as a bare `Box` written by hand means (#84).
+        let ambient = box_ambient();
+        let ty = type_expr("Box");
+        let shape = ambient
+            .class_members_of(&ty)
+            .expect("Box is a class reference");
+        assert_eq!(shape.fields["item"].ty, Ty::Named("T".to_string()));
+
+        // Consistent with the plain by-name lookup, which this must not
+        // diverge from for the unbound case.
+        assert_eq!(shape, ambient.class_members("Box").expect("Box is a class"));
+    }
+
+    #[test]
+    fn class_members_of_a_non_named_type_expression_is_none() {
+        // The documented boundary: `class_members_of` resolves a `Named`
+        // reference only, and only when the name is a class. A caller
+        // holding a compound type (`T?`, a union, an array, ...) — not
+        // `TypeExprKind::Named` at the syntax level at all — gets `None`
+        // rather than a guess at which member it meant; a real `Named`
+        // reference to a non-class name (`string`) is `None` for the same
+        // reason `class_members`/`class_members_bound` already are.
+        let ambient = box_ambient();
+        for src in ["Box?", "Box|nil", "Box[]", "string"] {
+            assert!(
+                ambient.class_members_of(&type_expr(src)).is_none(),
+                "{src} must not resolve as a bound class reference"
+            );
+        }
+    }
 
     #[test]
     fn every_dialect_builds_without_unknown_type_names() {
