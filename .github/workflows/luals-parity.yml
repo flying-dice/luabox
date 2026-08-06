@@ -14,15 +14,47 @@ on:
   push:
     branches: [main]
     paths:
+      # luabox-types and luabox-cli, plus every crate either transitively
+      # depends on (per their Cargo.toml [dependencies]) that can move a
+      # `luabox check` verdict: parsing, lowering, diagnostics, lint, LSP,
+      # bundling and manifest resolution all sit upstream of the checker a
+      # generic-carrier `require` runs through. Only luabox-db is excluded —
+      # nothing on the check path depends on it. A narrower filter lets a
+      # lowering or parse change merge with parity unmeasured, surfacing as
+      # drift on whatever unrelated luabox-types PR runs next.
       - "crates/luabox-types/**"
       - "crates/luabox-cli/**"
+      - "crates/luabox-hir/**"
+      - "crates/luabox-syntax/**"
+      - "crates/luabox-diag/**"
+      - "crates/luabox-manifest/**"
+      - "crates/luabox-lint/**"
+      - "crates/luabox-lsp/**"
+      - "crates/luabox-lower/**"
+      - "crates/luabox-bundle/**"
       - "scripts/tests/luals-differential.sh"
       - "scripts/tests/luals-differential/**"
       - ".github/workflows/luals-parity.yml"
   pull_request:
     paths:
+      # luabox-types and luabox-cli, plus every crate either transitively
+      # depends on (per their Cargo.toml [dependencies]) that can move a
+      # `luabox check` verdict: parsing, lowering, diagnostics, lint, LSP,
+      # bundling and manifest resolution all sit upstream of the checker a
+      # generic-carrier `require` runs through. Only luabox-db is excluded —
+      # nothing on the check path depends on it. A narrower filter lets a
+      # lowering or parse change merge with parity unmeasured, surfacing as
+      # drift on whatever unrelated luabox-types PR runs next.
       - "crates/luabox-types/**"
       - "crates/luabox-cli/**"
+      - "crates/luabox-hir/**"
+      - "crates/luabox-syntax/**"
+      - "crates/luabox-diag/**"
+      - "crates/luabox-manifest/**"
+      - "crates/luabox-lint/**"
+      - "crates/luabox-lsp/**"
+      - "crates/luabox-lower/**"
+      - "crates/luabox-bundle/**"
       - "scripts/tests/luals-differential.sh"
       - "scripts/tests/luals-differential/**"
       - ".github/workflows/luals-parity.yml"
@@ -34,6 +66,12 @@ env:
 jobs:
   luals-parity:
     runs-on: ubuntu-latest
+    # This job builds luabox in release mode and then runs
+    # lua-language-server --check with its output suppressed
+    # (scripts/tests/luals-differential.sh) — a hang on either has no other
+    # signal, and this is merge-blocking, so it must not eat the 360-minute
+    # default before anyone learns anything.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -43,7 +81,13 @@ jobs:
 
       - name: Install lua-language-server ${{ env.LUALS_VERSION }} (pinned)
         run: |
-          curl -sSL -o luals.tar.gz \
+          # -f: a missing/renamed release asset (404 body, rc=0 without it)
+          # must fail here as a fetch error, not one line later as
+          # `sha256sum: FAILED` — which reads identically to "the pinned
+          # artifact was tampered with" on a security-shaped check and hides
+          # the actual fix (bump the pin). --retry survives a transient CDN
+          # blip instead of failing the merge-blocking job the same way.
+          curl -sSL -f --retry 3 -o luals.tar.gz \
             "https://github.com/LuaLS/lua-language-server/releases/download/${LUALS_VERSION}/lua-language-server-${LUALS_VERSION}-linux-x64.tar.gz"
           echo "${LUALS_SHA256}  luals.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/luals"
@@ -54,4 +98,11 @@ jobs:
         run: cargo build --locked --release --bin luabox
 
       - name: Run the parity differential
-        run: LUALS="$HOME/luals/bin/lua-language-server" scripts/tests/luals-differential.sh
+        # LUALS_REQUIRED=1: the driver SKIPs (exit 0) when no luals binary is
+        # on PATH — a tolerable local convenience for a dev box without the
+        # tarball installed, but CI always installs it two steps above, so a
+        # SKIP here means the install step silently produced a binary that
+        # was not where LUALS pointed (tarball layout change, a dropped
+        # LUALS= prefix). Without this, that failure mode is a green job
+        # that measured none of the parity it exists to measure (F23).
+        run: LUALS="$HOME/luals/bin/lua-language-server" LUALS_REQUIRED=1 scripts/tests/luals-differential.sh

@@ -7,12 +7,28 @@
 name: mutants
 
 on:
+  # `schedule` is only ever evaluated against the workflow file on the
+  # repository's DEFAULT branch (main) — GitHub does not run a cron trigger
+  # off the branch a PR happens to be open against. This repo lands PRs on
+  # develop and promotes to main later, so the cron below stays dormant for
+  # the whole develop->main interval: `push: branches: [main]` is the
+  # trigger that actually fires, the moment this workflow reaches the one
+  # branch schedule can see, instead of waiting up to a week for the next
+  # Monday. Once resident on main the cron takes over as the ongoing weekly
+  # backstop.
   schedule:
     # Weekly, Monday 04:17 UTC (odd minute to avoid the on-the-hour stampede).
     - cron: "17 4 * * 1"
+  push:
+    branches: [main]
   workflow_dispatch:
-  # Also run when the gate itself or its expectations change, so a broken
-  # script or a bad allowlist edit cannot land silently and rot until Monday.
+  # Also run gate-selftest (seconds, no cargo-mutants, no build) when the
+  # gate itself or its expectations change, so a broken script or a bad
+  # allowlist edit cannot land silently and rot until Monday. The full audit
+  # deliberately does NOT run on this trigger — see the `mutants` job's
+  # `if:` below — a full run costs tens of minutes and `pull_request` fires
+  # on every push to an open PR, which is exactly the merge-path cost this
+  # workflow rides a schedule to avoid.
   pull_request:
     paths:
       - "scripts/tests/mutants-gate.sh"
@@ -31,11 +47,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The gate shells out to `cargo mutants`, and `cargo` is a rustup shim
+      # that resolves rust-toolchain.toml (1.92.0 + rustfmt + clippy) before
+      # ever reaching the stubbed cargo-mutants this self-test substitutes —
+      # the stub only replaces the subcommand, not the toolchain underneath
+      # it. Installing the pinned toolchain once here means that resolution
+      # happens up front, not lazily on each of the self-test's ten gate
+      # invocations, and a toolchain problem fails as itself instead of
+      # surfacing as "cargo-mutants failed with exit 1".
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
       - name: Self-test the mutation gate's judgement
         run: bash scripts/tests/mutants-gate-selftest.sh
 
   mutants:
     needs: gate-selftest
+    # Not on pull_request: that event fires on every push to an open PR, and
+    # a full run costs tens of minutes — the merge-path cost this workflow
+    # rides schedule/push-to-main to avoid (see the `on:` block above).
+    # gate-selftest above still runs on every PR touching the gate files.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -45,21 +81,27 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Pinned: mutants-allowlist.txt keys on cargo-mutants' verbatim output
+      # (the mutation description text, missed.txt's formatting), so an
+      # unpinned `latest` resolving a new release on its own schedule would
+      # turn every waived line stale and every survivor new in one stroke,
+      # for a reason nothing in this repo names. Bumping the pin is a
+      # deliberate change that re-measures the whole allowlist.
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-mutants
+          tool: cargo-mutants@27.1.0
 
-      # The scope is pinned here rather than inherited, so what the weekly run
-      # audits is readable in the job and not only in the script's default.
-      # It is deliberately the same merge-seam set a local run gets: widening
-      # to check.rs waits on #60 (its fallback measured largely shadowed by
-      # inference, 74% kill rate), because auditing it before that cleanup
-      # lands would grow the allowlist rather than the coverage. Widening the
-      # set is an edit to this line and a matching allowlist review.
+      # No FILES= here: the scope used to be re-pinned in this job "so it's
+      # readable in the job and not only in the script's default" — that
+      # readability is exactly what gave the scope two hand-maintained
+      # copies, free to drift apart with nothing to notice (F4). The
+      # script's default (scripts/tests/mutants-gate.sh) is now the one
+      # owner; mutants-gate.sh itself guards against a narrowing that drops
+      # a waived file. Widening the audited set is an edit to that default
+      # plus a matching allowlist review — not this job.
       - name: Run the mutation gate (merge-seam neighbourhood + infer core)
         run: |
-          FILES="crates/luabox-types/src/env.rs,crates/luabox-types/src/defs.rs,crates/luabox-types/src/generics.rs,crates/luabox-types/src/infer/reify.rs" \
-            MUTANTS_OUT="$RUNNER_TEMP/mutants" \
+          MUTANTS_OUT="$RUNNER_TEMP/mutants" \
             bash scripts/tests/mutants-gate.sh
 
       - name: Upload full mutants report
