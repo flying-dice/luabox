@@ -1083,3 +1083,153 @@ s:close(1)
 ";
     assert_eq!(codes(&check_tagged(consumer)), vec!["LB0308", "LB0301"]);
 }
+
+// --- where a free type parameter can hide inside a member's type -----------
+//
+// `class_params_in_scope` decides whether an export keeps its class identity
+// (#56 enforcement) or crosses as the erased template, by walking the
+// *resolved* shape for parameters nothing binds. The walk has one arm per
+// composite type, and a missing arm is invisible in the ordinary case: the
+// parameter simply is not found, the class keeps its name, and the export
+// becomes STRICTER — an undeclared member starts reporting LB0306 instead of
+// staying lenient. Each fixture below hides the parameter one level down in a
+// different composite, so a deleted arm is a failing test rather than a
+// silent tightening. (Measured: each was a surviving mutant of the
+// `Ty::Union` / `Ty::Table` / `Ty::Function` arms before these landed.)
+
+/// Assert a carrier whose only mention of `T` is inside `member_decl` crosses
+/// as the erased template: an undeclared read stays lenient, and the declared
+/// member does not leak the parameter name into the consumer.
+fn generic_member_erases(member_decl: &str) -> Vec<String> {
+    let module = format!(
+        "\
+---@class Hidden<T>
+{member_decl}
+local H = {{}}
+return H
+"
+    );
+    let (export_ty, types) = surface(&module, stdlib());
+    let ambient = stdlib().with_project_types([&types]);
+    let mut requires = HashMap::new();
+    requires.insert("hidden".to_string(), export_ty);
+
+    let consumer = "\
+local h = require(\"hidden\")
+local _ = h.nope
+";
+    codes(&check(consumer, &ambient, &requires))
+}
+
+#[test]
+fn a_parameter_inside_a_union_member_still_erases_the_export() {
+    assert_eq!(
+        generic_member_erases("---@field maybe T|nil"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_parameter_inside_a_nested_table_member_still_erases_the_export() {
+    assert_eq!(
+        generic_member_erases("---@field nested { inner: T }"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_parameter_inside_a_function_member_still_erases_the_export() {
+    assert_eq!(
+        generic_member_erases("---@field pick fun(): T"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_plain_member_is_the_control_for_the_three_hiding_places() {
+    // One variable against the three above: the same carrier with no type
+    // parameter anywhere keeps its class identity, so the identical read IS
+    // LB0306. Without this, "clean" above could mean the rule never ran.
+    const PLAIN: &str = "\
+---@class Shown
+---@field maybe number|nil
+local S = {}
+return S
+";
+    let (export_ty, types) = surface(PLAIN, stdlib());
+    let ambient = stdlib().with_project_types([&types]);
+    let mut requires = HashMap::new();
+    requires.insert("shown".to_string(), export_ty);
+
+    let consumer = "\
+local s = require(\"shown\")
+local _ = s.nope
+";
+    assert_eq!(codes(&check(consumer, &ambient, &requires)), vec!["LB0306"]);
+}
+
+#[test]
+fn an_unknown_name_in_a_parent_argument_is_reported_once_not_twice() {
+    // The parent reference is lowered twice — once for its diagnostics, once
+    // to capture the bound arguments — and the second pass rolls its
+    // diagnostics back (`QuietMark`). Without the rollback the same LB0305
+    // is reported twice for one written mistake. Measured: a surviving
+    // mutant replaced `QuietMark::rollback` with a no-op and no test noticed.
+    let consumer = "\
+---@class Holder<H>
+---@field held H
+---@class Bad : Holder<Nope>
+local B = {}
+";
+    assert_eq!(
+        codes(&check(consumer, stdlib(), &HashMap::new())),
+        ["LB0305"]
+    );
+}
+
+#[test]
+fn the_declaring_file_label_survives_the_surface_clone() {
+    // #56's undefined-field message points a secondary label at the file that
+    // declares the class, which a consumer's own file never names. The span
+    // map is repopulated by `merge_file_types` for every file merged in the
+    // same call, so a single-layer fixture cannot see whether `clone_surface`
+    // carries it — the merge would put it back. **Layering is what
+    // separates them**: the second `with_project_types` merges only the
+    // second file, so the first file's declaring span survives solely by
+    // being cloned off the base. Measured: a surviving mutant dropped that
+    // field from the clone, and the single-layer shape stayed green.
+    const DECLARING: &str = "\
+---@class Labelled
+---@field item number
+local L = {}
+return L
+";
+    const LATER: &str = "\
+---@class Unrelated
+---@field other number
+local U = {}
+return U
+";
+    let (export_ty, types) = surface(DECLARING, stdlib());
+    let (_, later_types) = surface(LATER, stdlib());
+    let ambient = stdlib()
+        .with_project_types([&types])
+        .with_project_types([&later_types]);
+    let mut requires = HashMap::new();
+    requires.insert("labelled".to_string(), export_ty);
+
+    let consumer = "\
+local b = require(\"labelled\")
+local _ = b.nope
+";
+    let diags = check(consumer, &ambient, &requires);
+    assert_eq!(codes(&diags), vec!["LB0306"]);
+    assert!(
+        diags[0]
+            .labels
+            .iter()
+            .any(|l| !l.primary && l.span.file == "mod.lua"),
+        "the declaring file must be labelled: {:?}",
+        diags[0].labels
+    );
+}

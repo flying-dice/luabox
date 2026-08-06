@@ -627,6 +627,51 @@ mod tests {
     }
 
     #[test]
+    fn class_members_of_monomorphises_a_nested_generic_argument() {
+        // The argument list is lowered against the env's OWN generic classes
+        // (`TypeEnv::generic_classes`), which is what lets an argument that is
+        // itself a generic reference resolve: without those templates in
+        // scope, `Pair<number>` lowers to the bare `Ty::Named("Pair")` — a
+        // name carrying none of its binding — and `Box<Pair<number>>`'s member
+        // silently becomes an unresolvable reference rather than the pair's
+        // shape. Measured: three surviving mutants returned an empty or
+        // garbage template map here and no test noticed.
+        let src = "\
+---@class Pair<P>
+---@field left P
+---@field right P
+---@class Boxed<T>
+---@field item T
+local B = {}
+return B
+";
+        let parsed = lua::parse(src, Dialect::Lua54);
+        assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
+        let types = crate::module_surface(&parsed, "boxed.lua", None).types;
+        let ambient = stdlib(Dialect::Lua54).with_project_types([&types]);
+
+        let shape = ambient
+            .class_members_of(&type_expr("Boxed<Pair<number>>"))
+            .expect("Boxed<...> is a class reference");
+        let Ty::Table(inner) = &shape.fields["item"].ty else {
+            panic!(
+                "the nested argument must resolve to Pair's shape, got {:?}",
+                shape.fields["item"].ty
+            );
+        };
+        assert_eq!(inner.fields["left"].ty, Ty::Number);
+        assert_eq!(inner.fields["right"].ty, Ty::Number);
+
+        // Rejecting probe: a different nested binding is a different shape,
+        // so the argument is genuinely carried rather than erased to a
+        // catch-all table both spellings would satisfy.
+        let other = ambient
+            .class_members_of(&type_expr("Boxed<Pair<string>>"))
+            .expect("Boxed<...> is a class reference");
+        assert_ne!(other.fields["item"].ty, shape.fields["item"].ty);
+    }
+
+    #[test]
     fn class_members_of_an_unbound_reference_stays_lenient() {
         // The one-variable control: the identical class, referenced bare —
         // no arguments to bind, so the member stays the free `T` (unknown

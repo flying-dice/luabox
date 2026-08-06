@@ -53,8 +53,25 @@ if [ ! -f "$allowlist" ]; then
     echo "error: no allowlist at $allowlist" >&2
     exit 1
 fi
+# Small scratch files created below (waived/classified/repin); an early exit
+# anywhere past this point must not leave them behind. This does NOT touch
+# out_dir — that is the actual report (mutants.out), which stays reachable
+# on disk on every exit path; see the echo right after out_dir is resolved.
+trap 'rm -f "${waived:-}" "${classified:-}" "${repin:-}" 2>/dev/null' EXIT
 
 out_dir="${MUTANTS_OUT:-$(mktemp -d)}"
+# cargo-mutants runs inside `(cd "$repo" && ...)` below, but out_dir is read
+# back out here against the CALLER's cwd — a relative MUTANTS_OUT would be
+# written under $repo and looked for somewhere else entirely, which reads as
+# "the run generated 0 mutants" only after paying for the whole run.
+# luals-differential.sh:52-55 resolves LUABOX the same way for the same
+# reason; mktemp -d is already absolute, so this is a no-op in the common
+# (unset MUTANTS_OUT) case.
+case "$out_dir" in
+/*) ;;
+*) out_dir="$(cd "$(dirname "$out_dir")" && pwd)/$(basename "$out_dir")" ;;
+esac
+echo "mutants-gate: report directory: $out_dir"
 file_args=()
 IFS=',' read -ra parts <<<"$files"
 # The scope is a hardcoded path string here and in the workflow, and neither
@@ -70,6 +87,35 @@ for f in "${parts[@]}"; do
     fi
     file_args+=(--file "$f")
 done
+
+# The check above only catches a scope naming a path that does not exist. It
+# says nothing about a scope that still exists but was narrowed to exclude a
+# file the allowlist waives mutants in: FILES=crates/luabox-types/src/env.rs
+# alone still passes that loop while auditing a quarter of the claimed
+# surface, giving 0 new / 0 stale / exit 0 for the files left out entirely.
+# Every waived line's file must be inside the scope actually being audited
+# this run, or the allowlist's claims about the rest are not being measured
+# — so require the scope to be a superset of the files the allowlist
+# references (a superset, not equal: FILES may legitimately audit more than
+# is waived yet, e.g. a file with no survivors at all).
+waived_files="$(grep -v '^#' "$allowlist" | cut -f1 | grep . | cut -d: -f1 | sort -u)" || true
+if [ -n "$waived_files" ]; then
+    missing_scope=""
+    while IFS= read -r wf; do
+        [ -n "$wf" ] || continue
+        found=0
+        for f in "${parts[@]}"; do
+            [ "$f" = "$wf" ] && found=1 && break
+        done
+        [ "$found" -eq 1 ] || missing_scope="$missing_scope $wf"
+    done <<<"$waived_files"
+    if [ -n "$missing_scope" ]; then
+        echo "error: the allowlist waives mutants in a file this run's scope does not audit:$missing_scope" >&2
+        echo "error:   FILES ($files) must be a superset of every file mutants-allowlist.txt references, or" >&2
+        echo "error:   those waivers are recorded but not re-measured this run. Widen FILES or narrow the allowlist." >&2
+        exit 1
+    fi
+fi
 
 echo "mutants-gate: cargo mutants -p luabox-types ${file_args[*]} (this takes a while)"
 # Exit 3 = missed mutants, exit 4 = only timeouts. Both are judged below by
@@ -123,17 +169,42 @@ waived_total="$(count_lines "$waived")"
 # from a real survivor at the moment of judgement — the reviewer diffed texts
 # by eye and a mixed batch (4 shifts + 1 genuinely new mutant, 2026-08-05)
 # looks exactly like a clean shift batch in the counts. Here the pairing is
-# measured: a live mutant whose (file, text) matches an unclaimed waived line
-# is a SHIFT, and only a live mutant with no such match at all is NEW.
-# Duplicate (file, text) pairs exist (two `replace > with >=` mutants in one
-# function), so the match is a multiset: same-position pairs claim each other
-# first, then the leftovers pair up as shifts, and whatever is still unpaired
-# is new (live side) or stale (allowlist side).
+# measured in three passes, each one only allowed to conclude what it can
+# actually prove — anything a pass cannot prove is left for the next one,
+# and what nothing can prove is NEW (fails) rather than a guess dressed as a
+# NOTE (#58 review round 3, F1/F2):
+#
+#   Pass 0: a waived line whose FULL TEXT — file, line:col, and mutation,
+#   unchanged — appears verbatim in caught.txt this run is PROVEN killed at
+#   that exact spot, not moved. This is the case Pass 2 used to get wrong: a
+#   waived mutant gets a new test and is genuinely caught in the same run a
+#   DIFFERENT, never-reviewed mutant with the same mutation text survives
+#   somewhere else in the file. Position-blind text matching alone cannot
+#   tell "moved" from "one killed, an unrelated one appeared" apart — both
+#   leave one residual waived line and one residual live line in the same
+#   key — so this is resolved with independent evidence (caught.txt) rather
+#   than guessed from the residual counts. A line proven caught here is
+#   retired as STALE immediately and never offered to Pass 2 as a shift
+#   candidate.
+#   Pass 1: identical position claims its own waived line — nothing moved.
+#   Pass 2: same mutant text, moved. The lines left in a key after Pass 0
+#   and Pass 1 are sorted by position on each side and paired by rank
+#   (smallest live position with smallest residual waived position, and so
+#   on) — the only pairing that preserves relative order, which is what an
+#   edit shifting a block of code produces. Pairing "whichever unclaimed
+#   waived line comes first" instead (the old rule) could cross two
+#   reviewed reasons onto each other's positions with nothing in the output
+#   to reveal it (F2, reproduced: 308<->323 and 311<->320, provably crossed
+#   against the columns the gate had already parsed). Only
+#   min(residual waived, residual live) pairs are made per key; a count
+#   imbalance is never forced into a pairing just to make the totals
+#   balance — the excess is genuinely new or genuinely stale.
 classified="$(mktemp)"
 {
     awk '{ print "W\t" $0 }' "$waived"
     awk '{ print "M\t" $0 }' "$missed"
     awk '{ print "T\t" $0 }' "$timeout"
+    awk '{ print "C\t" $0 }' "$caught"
 } | awk -F'\t' '
 function key(s) {
     if (match(s, /:[0-9]+:[0-9]+: /)) return substr(s, 1, RSTART - 1) SUBSEP substr(s, RSTART + RLENGTH)
@@ -143,7 +214,15 @@ function pos(s) {
     if (match(s, /:[0-9]+:[0-9]+: /)) return substr(s, RSTART + 1, RLENGTH - 3)
     return "?"
 }
+# A sortable position: pos() returns "line:col"; zero-pad both so plain
+# string comparison orders them numerically.
+function sortpos(p,    parts, n) {
+    n = split(p, parts, ":")
+    if (n != 2) return p
+    return sprintf("%010d:%010d", parts[1], parts[2])
+}
 {
+    if ($1 == "C") { caughtset[$2] = 1; next }
     k = key($2)
     keys[k] = 1
     if ($1 == "W") { wline[k, ++w[k]] = $2; wpos[k, w[k]] = pos($2) }
@@ -152,6 +231,11 @@ function pos(s) {
 END {
     for (k in keys) {
         nw = w[k] + 0; nl = l[k] + 0
+        # Pass 0: proven-caught waived lines are retired before Pass 1/2
+        # ever see them — see the comment above this pipeline.
+        for (j = 1; j <= nw; j++) {
+            if (wline[k, j] in caughtset) { wtaken[k, j] = 1; print "STALE\t" wline[k, j] }
+        }
         # Pass 1: identical position claims its own waived line.
         for (i = 1; i <= nl; i++) {
             for (j = 1; j <= nw; j++) {
@@ -162,17 +246,28 @@ END {
                 }
             }
         }
-        # Pass 2: same mutant, moved — measured as a pairing, not eyeballed.
-        for (i = 1; i <= nl; i++) {
-            if (ltaken[k, i]) continue
-            for (j = 1; j <= nw; j++) {
-                if (wtaken[k, j]) continue
-                wtaken[k, j] = 1; ltaken[k, i] = 1
-                print "SHIFT\t" wline[k, j] "\t" lline[k, i]
-                if (lkind[k, i] == "T") print "TIMEOUT\t" lline[k, i]
-                break
-            }
+        # Pass 2: same mutant, moved — a measured, order-preserving pairing
+        # over what Pass 0 and Pass 1 left, not a first-unclaimed-wins guess.
+        rw = 0
+        for (j = 1; j <= nw; j++) if (!wtaken[k, j]) { rw++; ridx[rw] = j; rkey[rw] = sortpos(wpos[k, j]) SUBSEP j }
+        rl = 0
+        for (i = 1; i <= nl; i++) if (!ltaken[k, i]) { rl++; lidx[rl] = i; lkey2[rl] = sortpos(lpos[k, i]) SUBSEP i }
+        # Selection sort: n is a handful of mutants sharing identical
+        # mutation text, and awk has no builtin sort-with-comparator.
+        for (a = 1; a <= rw; a++)
+            for (b = a + 1; b <= rw; b++)
+                if (rkey[b] < rkey[a]) { t = rkey[a]; rkey[a] = rkey[b]; rkey[b] = t; t = ridx[a]; ridx[a] = ridx[b]; ridx[b] = t }
+        for (a = 1; a <= rl; a++)
+            for (b = a + 1; b <= rl; b++)
+                if (lkey2[b] < lkey2[a]) { t = lkey2[a]; lkey2[a] = lkey2[b]; lkey2[b] = t; t = lidx[a]; lidx[a] = lidx[b]; lidx[b] = t }
+        pairs = (rw < rl) ? rw : rl
+        for (a = 1; a <= pairs; a++) {
+            j = ridx[a]; i = lidx[a]
+            wtaken[k, j] = 1; ltaken[k, i] = 1
+            print "SHIFT\t" wline[k, j] "\t" lline[k, i]
+            if (lkind[k, i] == "T") print "TIMEOUT\t" lline[k, i]
         }
+        delete ridx; delete rkey; delete lidx; delete lkey2
         # Whatever is left is genuinely new, or genuinely killed.
         for (i = 1; i <= nl; i++) if (!ltaken[k, i]) print "NEW\t" lkind[k, i] "\t" lline[k, i]
         for (j = 1; j <= nw; j++) if (!wtaken[k, j]) print "STALE\t" wline[k, j]
@@ -227,6 +322,22 @@ rm -f "$classified"
 # is an audit that ran somewhere else — the shape a scope drift takes when the
 # paths still exist (a module split, a package rename) and the file check above
 # cannot see it.
+#
+# Deliberately only TOTAL staleness fails (#58 review round 3, F16). Partial
+# staleness — some waived lines killed, others still reviewed survivors — is
+# ordinary test progress and is reported as NOTEs above, not failed; punishing
+# it would make writing the kill-test for one waived mutant a reason the job
+# turns red. The scope-coverage check above (F4) closes the sharpest version
+# of the residual worry this asymmetry raises: a FILES narrowing that drops a
+# waived line's file outright now fails before the run even starts, so it
+# cannot masquerade as partial staleness. What it does NOT close: an in-scope
+# file that is internally split into new modules while FILES still names the
+# old path — the moved mutants simply stop being generated at their old
+# text+position and their waived lines go stale exactly like a genuine kill
+# would. That case is still live and is a judgement call for whoever reviews
+# the stale list, not something this gate can distinguish mechanically without
+# a generated-count baseline to compare against (which would need its own
+# provenance — see mutants-allowlist.txt's header).
 if [ "$waived_total" -gt 0 ] && [ "$stale" -eq "$waived_total" ]; then
     echo
     echo "mutants-gate: FAILED — every one of the $waived_total reviewed lines went stale in one run" >&2
