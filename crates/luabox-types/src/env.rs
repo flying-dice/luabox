@@ -23,11 +23,21 @@ use crate::ty::{FieldTy, FunctionTy, OperatorSig, ParamTy, TableTy, Ty, TypePara
 /// A statement's byte range, used to key annotations to their target.
 pub(crate) type Target = (usize, usize);
 
+/// A `---@class Sub : Base<number>` parent reference: the parent's name plus
+/// the type arguments this declaration binds to its parameters, lowered.
+/// Empty `args` is a parent written bare (`: Base`) or a plain parent with no
+/// parameters — in both, the parent's parameters stay free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParentRef {
+    pub name: String,
+    pub args: Vec<Ty>,
+}
+
 /// A declared `---@class`: parents plus *own* members (inherited members
 /// are merged on demand by [`TypeEnv::class_shape`]).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct ClassDef {
-    pub parents: Vec<String>,
+    pub parents: Vec<ParentRef>,
     pub fields: BTreeMap<String, FieldTy>,
     pub indexers: Vec<(Ty, Ty)>,
     /// Generic type-parameter names from `---@class Name<T>` — empty for a
@@ -390,8 +400,11 @@ impl TypeEnv {
                     self.classes.insert(name.clone(), def.clone());
                 }
                 Some(existing) => {
+                    // Parents dedup by NAME: two declarations naming one
+                    // parent with different arguments are the same edge in the
+                    // chain, and the first wins as every other member does.
                     for parent in &def.parents {
-                        if !existing.parents.contains(parent) {
+                        if !existing.parents.iter().any(|p| p.name == parent.name) {
                             existing.parents.push(parent.clone());
                         }
                     }
@@ -715,21 +728,33 @@ impl TypeEnv {
                         .and_then(crate::version::VersionReq::parse);
                 }
                 Tag::Class(c) if !c.name.is_empty() => {
-                    let parents: Vec<String> = c
-                        .parents
-                        .iter()
-                        .filter_map(|p| match &p.kind {
-                            TypeExprKind::Named { name, .. } => Some(name.clone()),
-                            _ => None,
-                        })
-                        .collect();
                     // Validate each parent reference: lowering a `: Base` that
                     // no class/alias/enum declares records an unknown
                     // name at the parent's own span → LB0305 (#107). Forward
                     // references and defs/ambient parents already sit in the
                     // lowerer's declared-name universe, so they do not fire.
+                    //
+                    // That lowering answers "is this real?" and then throws the
+                    // reference away — it monomorphises to a structural table,
+                    // while a parent must stay a NAME for the merge to walk.
+                    // So the arguments are lowered a second time and kept:
+                    // `: Base<number>` binds `Base`'s parameters in
+                    // `class_shape_bound` instead of leaving them free. The
+                    // second pass is construction, not diagnosis — the first
+                    // one is the sole reporter, so a `: Base<Bogus>` is one
+                    // LB0305, not two.
+                    let mut parents: Vec<ParentRef> = Vec::new();
                     for parent in &c.parents {
                         lowerer.lower(parent);
+                        if let TypeExprKind::Named { name, args } = &parent.kind {
+                            let quiet = QuietMark::of(lowerer);
+                            let args = args.iter().map(|a| lowerer.lower(a)).collect();
+                            quiet.rollback(lowerer);
+                            parents.push(ParentRef {
+                                name: name.clone(),
+                                args,
+                            });
+                        }
                     }
                     // Two declarations of one class in the same file are two
                     // halves of one intent, exactly as two declarations across
@@ -757,7 +782,7 @@ impl TypeEnv {
                         );
                     } else if let Some(existing) = self.classes.get_mut(&c.name) {
                         for parent in parents {
-                            if !existing.parents.contains(&parent) {
+                            if !existing.parents.iter().any(|p| p.name == parent.name) {
                                 existing.parents.push(parent);
                             }
                         }
@@ -1152,37 +1177,79 @@ impl TypeEnv {
     // --- lookups -----------------------------------------------------
 
     /// The merged structural shape of a class: parents first (depth-first),
-    /// own members overriding, with a cycle guard.
+    /// own members overriding, with a cycle guard. The class's *own* type
+    /// parameters stay free — `Box<T>`'s `item` is `T` here, as a bare `Box`
+    /// reference means.
     pub(crate) fn class_shape(&self, name: &str) -> Option<TableTy> {
+        self.class_shape_bound(name, &[])
+    }
+
+    /// [`Self::class_shape`] with `name`'s own type parameters bound to
+    /// `args`, positionally — what a reference that wrote them means.
+    ///
+    /// This is also how a parent's parameters are bound while merging:
+    /// `---@class Sub : Base<number>` gives `Base`'s `U` as `number`, so
+    /// `Sub` inherits `item: number` rather than a parameter no one can name.
+    /// An argument the reference omits leaves its parameter free, which every
+    /// downstream path already reads as `unknown`.
+    pub(crate) fn class_shape_bound(&self, name: &str, args: &[Ty]) -> Option<TableTy> {
         if !self.classes.contains_key(name) {
             return None;
         }
         let mut shape = TableTy::default();
         let mut seen = HashSet::new();
-        self.collect_class(name, &mut shape, &mut seen);
+        self.collect_class(name, args, &mut shape, &mut seen);
         Some(shape)
     }
 
-    fn collect_class(&self, name: &str, shape: &mut TableTy, seen: &mut HashSet<String>) {
+    fn collect_class(
+        &self,
+        name: &str,
+        args: &[Ty],
+        shape: &mut TableTy,
+        seen: &mut HashSet<String>,
+    ) {
         if !seen.insert(name.to_string()) {
             return;
         }
         let Some(def) = self.classes.get(name) else {
             return;
         };
+        let bound: BTreeMap<String, Ty> = def
+            .params
+            .iter()
+            .zip(args)
+            .map(|(param, arg)| (param.clone(), arg.clone()))
+            .collect();
         for parent in &def.parents {
-            self.collect_class(parent, shape, seen);
+            // A parent's arguments are written in *this* class's parameter
+            // vocabulary — `---@class Cell<T> : Slot<T>` passes its own `T`
+            // through — so they are substituted before they bind the parent's.
+            let parent_args: Vec<Ty> = parent
+                .args
+                .iter()
+                .map(|arg| crate::generics::subst_ty(arg, &bound))
+                .collect();
+            self.collect_class(&parent.name, &parent_args, shape, seen);
         }
         // Carrier-attached members first, then `---@field` declarations —
         // both override inherited members, and a declaration wins over a
         // same-name attachment (annotations are authoritative).
         for (member, ty) in &def.methods {
-            shape.fields.insert(member.clone(), ty.clone());
+            shape
+                .fields
+                .insert(member.clone(), crate::generics::subst_field(ty, &bound));
         }
         for (field, ty) in &def.fields {
-            shape.fields.insert(field.clone(), ty.clone());
+            shape
+                .fields
+                .insert(field.clone(), crate::generics::subst_field(ty, &bound));
         }
-        shape.indexers.extend(def.indexers.iter().cloned());
+        shape.indexers.extend(
+            def.indexers
+                .iter()
+                .map(|(key, value)| (key.clone(), crate::generics::subst_ty(value, &bound))),
+        );
     }
 
     /// The member names of `name`'s shape that are carrier attachments
@@ -1204,7 +1271,7 @@ impl TypeEnv {
             };
             methods.extend(def.methods.keys().cloned());
             declared.extend(def.fields.keys().cloned());
-            stack.extend(def.parents.iter().cloned());
+            stack.extend(def.parents.iter().map(|p| p.name.clone()));
         }
         &methods - &declared
     }
@@ -1238,7 +1305,7 @@ impl TypeEnv {
             out.extend(sigs.iter().cloned());
         }
         for parent in &def.parents {
-            self.collect_operators(parent, op, out, seen);
+            self.collect_operators(&parent.name, op, out, seen);
         }
     }
 
@@ -1310,20 +1377,46 @@ impl TypeEnv {
         self.class_decl_spans.get(name).cloned()
     }
 
-    /// The declared parents of a `---@class`, in declaration order.
-    pub(crate) fn class_parents(&self, name: &str) -> Option<&[String]> {
+    /// The declared parents of a `---@class`, in declaration order — each
+    /// with the type arguments this declaration binds to it.
+    pub(crate) fn class_parents(&self, name: &str) -> Option<&[ParentRef]> {
         self.classes.get(name).map(|def| def.parents.as_slice())
     }
 
-    /// The generic type-parameter names of a `---@class Name<T>`, in
-    /// declaration order — empty for a plain class and for a name that is no
-    /// class at all. A caller holding only the *name* of a class (a
-    /// [`Ty::Named`], which carries no arguments) uses this to tell whether
-    /// the name alone is a complete type or a template with nothing bound.
-    pub(crate) fn class_type_params(&self, name: &str) -> &[String] {
-        self.classes
-            .get(name)
-            .map_or::<&[String], _>(&[], |def| def.params.as_slice())
+    /// Every generic parameter name that can appear in `name`'s **resolved**
+    /// shape: its own `---@class Name<T>` parameters plus those of every
+    /// ancestor, depth-first over the parent chain and deduplicated. Empty for
+    /// a plain class and for a name that is no class at all. A caller holding
+    /// only the *name* of a class (a [`Ty::Named`], which carries no
+    /// arguments) uses this to tell whether the name alone is a complete type
+    /// or a template with parameters still unbound.
+    ///
+    /// [`Self::class_shape`] flattens inherited `---@field`s in, so a parent's
+    /// parameter can reach the shape as a member type whether or not the child
+    /// declares parameters of its own: `---@class Sub : Base` — a generic
+    /// parent named without arguments — leaves `Base`'s `U` free in `Sub`'s
+    /// members. (A parent named *with* arguments binds them; see
+    /// [`Self::class_shape_bound`].) A caller substituting a class's free
+    /// parameters must therefore cover the ancestors' too.
+    pub(crate) fn class_params_in_scope(&self, name: &str) -> Vec<String> {
+        let mut params: Vec<String> = Vec::new();
+        let mut stack = vec![name.to_string()];
+        let mut seen = HashSet::new();
+        while let Some(class) = stack.pop() {
+            if !seen.insert(class.clone()) {
+                continue;
+            }
+            let Some(def) = self.classes.get(&class) else {
+                continue;
+            };
+            for param in &def.params {
+                if !params.contains(param) {
+                    params.push(param.clone());
+                }
+            }
+            stack.extend(def.parents.iter().map(|p| p.name.clone()));
+        }
+        params
     }
 
     /// Whether `name` is a LuaCATS `---@class` (in-file, def-package, or
@@ -1372,7 +1465,7 @@ impl TypeEnv {
             if def.fields.contains_key(member) || def.methods.contains_key(member) {
                 return None;
             }
-            stack.extend(def.parents.iter().cloned());
+            stack.extend(def.parents.iter().map(|p| p.name.clone()));
         }
         None
     }
@@ -1390,7 +1483,7 @@ impl TypeEnv {
                 continue;
             }
             if let Some(def) = self.classes.get(&name) {
-                stack.extend(def.parents.iter().cloned());
+                stack.extend(def.parents.iter().map(|p| p.name.clone()));
             }
         }
         false
@@ -2217,6 +2310,12 @@ mod tests {
         FileTypes::collect(&items, &env, &HashMap::new())
     }
 
+    /// The names of a class's parents, in declaration order — the axis these
+    /// merge assertions are about, with the bound arguments left aside.
+    fn parent_names(def: &ClassDef) -> Vec<&str> {
+        def.parents.iter().map(|p| p.name.as_str()).collect()
+    }
+
     // --- string-literal delimiters ---------------------------------------
 
     #[test]
@@ -2306,7 +2405,7 @@ mod tests {
         // Base's `n` survives; the second declaration's `extra` is added.
         assert_eq!(def.fields["n"].ty, Ty::Number);
         assert_eq!(def.fields["extra"].ty, Ty::Boolean);
-        assert_eq!(def.parents, vec!["Parent".to_string(), "Other".to_string()]);
+        assert_eq!(parent_names(def), vec!["Parent", "Other"]);
         assert_eq!(def.indexers, vec![(Ty::Integer, Ty::String)]);
         assert_eq!(def.operators["add"].len(), 1);
         assert_eq!(def.visibility.get("hidden"), Some(&FieldScope::Private));
@@ -2326,7 +2425,7 @@ mod tests {
         env.merge_file_types(&file);
         env.merge_file_types(&file);
         let def = env.classes.get("Dup").expect("merged class");
-        assert_eq!(def.parents, vec!["Base".to_string()]);
+        assert_eq!(parent_names(def), vec!["Base"]);
         assert_eq!(def.indexers.len(), 1);
         assert_eq!(def.operators["add"].len(), 1);
     }

@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use crate::ty::{FunctionTy, TableTy, Ty};
+use crate::ty::{FieldTy, FunctionTy, TableTy, Ty};
 
 /// Substitute `Ty::Named(param)` placeholders throughout a type, per `map`.
 /// A name not in `map` is left as-is (an unbound type variable stays
@@ -32,6 +32,16 @@ pub(crate) fn subst_ty(ty: &Ty, map: &BTreeMap<String, Ty>) -> Ty {
         Ty::Table(table) => Ty::Table(Box::new(subst_table(table, map))),
         Ty::Function(func) => Ty::Function(Box::new(subst_function(func, map))),
         _ => ty.clone(),
+    }
+}
+
+/// [`subst_ty`] through one declared member, keeping its optionality — the
+/// class merge's unit of work, since a class contributes members rather than
+/// a whole table.
+pub(crate) fn subst_field(field: &FieldTy, map: &BTreeMap<String, Ty>) -> FieldTy {
+    FieldTy {
+        ty: subst_ty(&field.ty, map),
+        optional: field.optional,
     }
 }
 

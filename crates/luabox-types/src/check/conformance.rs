@@ -92,11 +92,13 @@ impl Checker<'_> {
             let Some(parents) = self.env.class_parents(&ob.name) else {
                 continue;
             };
-            let parents: Vec<String> = parents.to_vec();
+            let parents = parents.to_vec();
             // Members already handled — dedup across a diamond of parents.
             let mut seen: HashSet<String> = HashSet::new();
             for parent in &parents {
-                let Some(pshape) = self.env.class_shape(parent) else {
+                // The obligation is the parent **as this class named it**:
+                // `: Base<number>` obliges `item: number`, not `item: U`.
+                let Some(pshape) = self.env.class_shape_bound(&parent.name, &parent.args) else {
                     continue;
                 };
                 for (member, field) in &pshape.fields {
@@ -112,7 +114,7 @@ impl Checker<'_> {
                     if field.optional || field.ty.admits_nil() {
                         continue;
                     }
-                    self.check_class_member(&ob, parent, member, field, &provided);
+                    self.check_class_member(&ob, &parent.name, member, field, &provided);
                 }
             }
         }
@@ -179,7 +181,7 @@ impl Checker<'_> {
         let mut stack: Vec<String> = self
             .env
             .class_parents(class)
-            .map(<[String]>::to_vec)
+            .map(|parents| parents.iter().map(|p| p.name.clone()).collect())
             .unwrap_or_default();
         let mut seen: HashSet<String> = HashSet::new();
         while let Some(parent) = stack.pop() {
@@ -192,7 +194,7 @@ impl Checker<'_> {
                 return true;
             }
             if let Some(grandparents) = self.env.class_parents(&parent) {
-                stack.extend(grandparents.iter().cloned());
+                stack.extend(grandparents.iter().map(|p| p.name.clone()));
             }
         }
         false

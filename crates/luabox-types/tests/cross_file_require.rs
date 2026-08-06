@@ -299,6 +299,169 @@ local _ = c.nope
     assert_eq!(codes(&check(consumer, &ambient, &requires)), vec!["LB0306"]);
 }
 
+#[test]
+fn an_undeclared_member_on_a_generic_carrier_stays_lenient() {
+    // The documented exception to #56, pinned in the direction it actually
+    // behaves. A carrier with an unbound parameter crosses as the *template*
+    // rather than as `Ty::Named` — that is what stops `T` leaking into the
+    // consumer — and a template is a structural table, which carries no
+    // undefined-field obligation. So the read below is clean where
+    // `a_plain_carrier_still_crosses_as_the_class_itself`'s identical read is
+    // `LB0306`; the two differ by `<T>` alone.
+    //
+    // Without this pin, `reify_export`'s erasure branch is one edit away from
+    // flipping the rule back with nothing failing (round 2, finding 3).
+    let (ambient, requires) = box_ambient_and_requires();
+    let consumer = "\
+local b = require(\"box\")
+local _ = b.nope
+";
+    assert_eq!(
+        codes(&check(consumer, &ambient, &requires)),
+        Vec::<String>::new()
+    );
+}
+
+/// `---@class Sub : Base<number>` — a plain class inheriting a member whose
+/// type is the *parent's* type parameter.
+const BOUND_PARENT_MODULE: &str = "\
+---@class Base<U>
+---@field item U
+---@class Sub : Base<number>
+local S = {}
+return S
+";
+
+fn sub_ambient_and_requires(module: &str) -> (Ambient, HashMap<String, Ty>) {
+    let (export_ty, types) = surface(module, stdlib());
+    let ambient = stdlib().with_project_types([&types]);
+    let mut requires = HashMap::new();
+    requires.insert("sub".to_string(), export_ty);
+    (ambient, requires)
+}
+
+#[test]
+fn a_parent_type_argument_binds_the_inherited_member() {
+    // `: Base<number>` used to bind nothing at all: the argument was dropped
+    // at lowering, `Sub` inherited `item: U`, and the consumer was told
+    // `found `U`` — a name it can neither produce nor act on. The argument now
+    // binds the parent's parameter where the members merge, so `item` is
+    // `number` on both sides of the `require`, and `Sub` has nothing unbound
+    // left to erase: it keeps its #56 class identity.
+    let (ambient, requires) = sub_ambient_and_requires(BOUND_PARENT_MODULE);
+    let consumer = "\
+---@param n number
+local function want(n) end
+local s = require(\"sub\")
+want(s.item)
+";
+    assert_eq!(
+        codes(&check(consumer, &ambient, &requires)),
+        Vec::<String>::new()
+    );
+
+    // The rejecting probe beside the accepting one: `item` is genuinely
+    // `number`, not leniently erased to `unknown`.
+    let mismatched = "\
+---@param s string
+local function want(s) end
+local s = require(\"sub\")
+want(s.item)
+";
+    let diags = check(mismatched, &ambient, &requires);
+    assert_eq!(codes(&diags), vec!["LB0300"]);
+    assert!(
+        diags[0].message.contains("found `number`"),
+        "{}",
+        diags[0].message
+    );
+
+    // …and the class identity survives, so an undeclared member is `LB0306`.
+    let undeclared = "\
+local s = require(\"sub\")
+local _ = s.nope
+";
+    assert_eq!(
+        codes(&check(undeclared, &ambient, &requires)),
+        vec!["LB0306"]
+    );
+}
+
+#[test]
+fn a_parent_written_bare_leaves_its_parameter_unbound_and_erased() {
+    // The one-variable control: the same two classes with the argument
+    // dropped from the parent reference. Nothing binds `U`, so the seam does
+    // what it does for a carrier's own unbound parameter — cross as the
+    // template with `unknown` — rather than leak the name. That is the rule
+    // the round-2 regression broke, kept pinned for the shape that still
+    // reaches it.
+    const BARE_PARENT: &str = "\
+---@class Base<U>
+---@field item U
+---@class Sub : Base
+local S = {}
+return S
+";
+    let (ambient, requires) = sub_ambient_and_requires(BARE_PARENT);
+    let consumer = "\
+---@param n number
+local function want(n) end
+local s = require(\"sub\")
+want(s.item)
+";
+    let diags = check(consumer, &ambient, &requires);
+    assert_eq!(codes(&diags), vec!["LB0300"]);
+    assert!(
+        diags[0].message.contains("found `unknown`"),
+        "{}",
+        diags[0].message
+    );
+    assert!(
+        !diags[0].message.contains("`U`"),
+        "an inherited parameter must not reach the consumer either: {}",
+        diags[0].message
+    );
+}
+
+#[test]
+fn a_parent_argument_written_in_the_childs_own_parameter_passes_through() {
+    // Two levels, with the middle class passing its own parameter up:
+    // `Mid<M> : Slot<M>` and `Leaf : Mid<number>` means `Leaf.slot` is
+    // `number`. The binding is positional at each level, so a class's own map
+    // must reach the arguments it passes to its parent before those bind the
+    // parent's parameters — one substitution, applied on the way up.
+    const CHAIN: &str = "\
+---@class Slot<S>
+---@field slot S
+---@class Mid<M> : Slot<M>
+---@class Leaf : Mid<number>
+local L = {}
+return L
+";
+    let (ambient, requires) = sub_ambient_and_requires(CHAIN);
+    let consumer = "\
+---@param n number
+local function want(n) end
+local l = require(\"sub\")
+want(l.slot)
+";
+    assert_eq!(
+        codes(&check(consumer, &ambient, &requires)),
+        Vec::<String>::new()
+    );
+
+    let mismatched = "\
+---@param s string
+local function want(s) end
+local l = require(\"sub\")
+want(l.slot)
+";
+    assert_eq!(
+        codes(&check(mismatched, &ambient, &requires)),
+        vec!["LB0300"]
+    );
+}
+
 // --- unresolved requires and cycles ----------------------------------------
 
 #[test]
