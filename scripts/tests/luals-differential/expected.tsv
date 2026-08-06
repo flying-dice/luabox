@@ -1,11 +1,23 @@
 # luals parity expectations: one row per corpus case.
 #
 #   case          the .lua file in this directory (without extension)
-#   luabox        diag | clean — does `luabox check` (strict) report anything?
+#   luabox        diag | clean — does `luabox check` (strict) report anything
+#                 over the case's file set (the case plus every module its
+#                 .deps sidecar names, typechecked as one project)?
+#   codes         the sorted, deduped set of LB diagnostic codes `luabox
+#                 check --format json` reports for that file set — empty for
+#                 a clean row. Asserted exactly, not just "diag" — "not
+#                 clean" alone can't distinguish the LB0306 a row names from
+#                 an accidental LB0300 or a regressed LB0305 (F19).
 #   luals         diag | clean — does lua-language-server --check report any
-#                 diagnostic from the type-parity code set (see the script)?
+#                 diagnostic from the type-parity code set (see the script)
+#                 anywhere in the SAME file set the luabox column just
+#                 typechecked — the case plus its .deps modules, not just
+#                 the case's own basename (F17)?
 #   note          for AGREE rows, what the case pins; for DIVERGE rows
-#                 (luabox != luals), WHY the divergence is intentional.
+#                 (luabox != luals), WHY the divergence is intentional. A
+#                 DIVERGE row with an empty note is refused by the script
+#                 (F28) — this is enforced, not just a convention.
 #
 # The two columns are NOT asserted equal — a row where they differ is a
 # reviewed, justified divergence, visible in this file rather than buried in
@@ -18,30 +30,30 @@
 # Corpus rule: luals checks this directory as ONE workspace, so classes are
 # workspace-global across cases — every case must use class names unique to
 # its own file, or cross-file duplicate-doc-field noise leaks into other
-# rows' verdicts.
+# rows' verdicts. Enforced by the script, not just stated here (F28).
 #
-# case	luabox	luals	note
-clean_control	clean	clean	control: an annotated, well-typed file is clean in both
-trailing_nil_param_omitted	clean	clean	#49: omitting a TRAILING `number|nil` param is fine in both (measured, was guessed before)
-optional_param_trailing_omitted	clean	clean	#49: `---@param b? number` omitted — the `?` spelling agrees with the `|nil` spelling
-nontrailing_nil_param_omitted	diag	diag	#49 residual RESOLVED BY MEASUREMENT: luals reports missing-parameter for an omitted NON-trailing `number|nil` param, so luabox's conservative trailing-only bound matches luals exactly
-string_receiver_methods	clean	clean	#48: `s:upper()`, chained `:sub`, `:len` on a string receiver type in both
-string_receiver_misspelt	diag	diag	#48: a misspelt string method is undefined-field there, LB0306 here
-plain_param_type_mismatch	diag	diag	baseline: string passed to a number param is rejected by both
-undefined_field_on_class	diag	diag	baseline: unknown member on a `---@type` instance is rejected by both
-duplicate_class_union	clean	clean	#46/#49: two `---@class Config` declarations union their fields in both
-duplicate_field_conflict_first_wins	diag	diag	both flag a same-name field re-declared at a different type, by different rules: luals unions (`string|number` fails the number param), luabox keeps the first (LB0311 + LB0300) — divergent semantics, agreeing presence; the semantic divergence is recorded in docs/03-reference/02-limitations.md
-renamed_generic_duplicate	clean	diag	INTENTIONAL DIVERGENCE: lua-language-server 3.13.5 does not support generic classes (`---@class Boxed<T>` yields undefined-doc-name for `T`), while luabox implements them per the LuaCATS generics spec — luabox is deliberately ahead, not lagging; re-measure when the pinned luals version gains support
-inherited_member_through_subclass	clean	clean	inheritance: a parent's field types through the subclass in both
-inherited_member_misuse	diag	diag	inheritance: misusing an inherited field is rejected by both
-string_method_arg_mismatch	diag	diag	#48: `s:rep("three")` argument-checks with the receiver bound in both
-required_field_missing_from_literal	diag	diag	a literal missing a required ---@field is rejected by both (LB0300 here, missing-fields there)
-required_field_present_in_literal	clean	clean	control: the same literal with the field present is clean in both
-carrier_require_typed	clean	clean	#56 end-to-end: a require'd carrier module's declared member types through in both — luals resolves the require as the class, and since #56 so does luabox
-carrier_require_undeclared	diag	diag	#56 end-to-end: an undeclared member on the require'd carrier is rejected by both (LB0306 here, undefined-field there)
-dynamic_key_carrier_require	diag	diag	#56 narrowing, MEASURED AGAINST THE ORACLE: a member attached to the carrier under a computed key (`H[n] = ...`) exists at runtime but is declared nowhere, and BOTH tools reject the read — undefined-field there, LB0306 here. The narrowing is luals parity, not luabox being stricter; the escape hatch is the next row
-dynamic_key_carrier_indexer	clean	clean	the hatch for the row above: `---@field [string] fun(): string` on the class declares the dynamic key space, and the same read is clean in both
-generic_carrier_require	diag	diag	a generic `---@class Box<T>` carrier crossing `require` with nothing bound: both reject feeding its member to a `number` param, by different routes — luabox types the unbound parameter `unknown` (naming it, e.g. `---@type Box<number>`, is the action), luals 3.13.5 has no generic classes at all and reports `Cannot assign T to parameter number`. Presence agrees; the rendering is the divergence
-generic_carrier_require_bound	clean	diag	INTENTIONAL DIVERGENCE, same root as renamed_generic_duplicate: binding the argument (`---@type Box<number>`) types the required carrier's member here, while luals 3.13.5 cannot parse the generic class at all and reports undefined-field on the member — luabox is deliberately ahead; re-measure when the pinned luals version gains generic-class support
-generic_carrier_require_undeclared	clean	diag	INTENTIONAL DIVERGENCE, and the one place #56's enforcement claim does not hold: an UNDECLARED member read off a generic carrier crossing `require` is clean here and undefined-field there. luabox's route is that a class with an unbound parameter crosses as the monomorphised template rather than as `Ty::Named` — which is what stops `T` reaching the consumer (generic_carrier_require) — and a template is structural, so it enforces no member list; luals 3.13.5 has no generic classes at all and treats `GenericBox` as a plain one. Compare carrier_require_undeclared, the same read with the `<T>` dropped, where both report. Pinned in both directions at the type layer too (cross_file_require.rs), where the inherited-parameter cases live as well — a bound `: Base<number>` keeps the class identity and its enforcement, a bare `: Base` does not
-metatable_index_carrier_require	diag	diag	#56 narrowing, second shape: a member reached through a `__index` metatable whose source is an undeclared table is not a declaration either, and both tools reject the read across `require` — same rule as dynamic_key_carrier_require, same hatch (declare it on the class, or make the source a declared parent)
+# case	luabox	codes	luals	note
+clean_control	clean	-	clean	control: an annotated, well-typed file is clean in both
+trailing_nil_param_omitted	clean	-	clean	#49: omitting a TRAILING `number|nil` param is fine in both (measured, was guessed before)
+optional_param_trailing_omitted	clean	-	clean	#49: `---@param b? number` omitted — the `?` spelling agrees with the `|nil` spelling
+nontrailing_nil_param_omitted	diag	LB0301	diag	#49 residual RESOLVED BY MEASUREMENT: g(1) supplies a well-typed p and omits the non-trailing, required q — the ONLY way this can fail is the arity rule, since p is not a type mismatch. luals reports missing-parameter for it, luabox reports LB0301 (arity), matching exactly. (Earlier this fixture called g("only"): a string bound to `p: number|nil` diags in both tools regardless of the arity rule — confounded, could not isolate what it claimed to resolve. F20, measured.)
+string_receiver_methods	clean	-	clean	#48: `s:upper()`, chained `:sub`, `:len` on a string receiver type in both
+string_receiver_misspelt	diag	LB0306	diag	#48: a misspelt string method is undefined-field there, LB0306 here
+plain_param_type_mismatch	diag	LB0300	diag	baseline: string passed to a number param is rejected by both
+undefined_field_on_class	diag	LB0306	diag	baseline: unknown member on a `---@type` instance is rejected by both
+duplicate_class_union	clean	-	clean	#46/#49: two `---@class Config` declarations union their fields in both
+duplicate_field_conflict_first_wins	diag	LB0300,LB0311	diag	both flag a same-name field re-declared at a different type, by different rules: luals unions (`string|number` fails the number param), luabox keeps the first (LB0311 + LB0300) — divergent semantics, agreeing presence; the semantic divergence is recorded in docs/03-reference/02-limitations.md. LB0311 alone fires regardless of resolution order and can't tell first-wins from last-wins apart (F22) — the codes column is what actually pins it: LB0300 on top of LB0311 only fires because `a`'s kept type is the FIRST declaration's `string`, not the second's `number`; a last-wins resolution would report LB0311 alone
+renamed_generic_duplicate	clean	-	diag	INTENTIONAL DIVERGENCE: lua-language-server 3.13.5 does not support generic classes (`---@class Boxed<T>` yields undefined-doc-name for `T`), while luabox implements them per the LuaCATS generics spec — luabox is deliberately ahead, not lagging; re-measure when the pinned luals version gains support
+inherited_member_through_subclass	clean	-	clean	inheritance: a parent's field types through the subclass in both
+inherited_member_misuse	diag	LB0300	diag	inheritance: misusing an inherited field is rejected by both
+string_method_arg_mismatch	diag	LB0300	diag	#48: `s:rep("three")` argument-checks with the receiver bound in both
+required_field_missing_from_literal	diag	LB0300	diag	a literal missing a required ---@field is rejected by both (LB0300 here, missing-fields there)
+required_field_present_in_literal	clean	-	clean	control: the same literal with the field present is clean in both
+carrier_require_typed	clean	-	clean	#56 end-to-end: a require'd carrier module's declared member types through in both — luals resolves the require as the class, and since #56 so does luabox
+carrier_require_undeclared	diag	LB0306	diag	#56 end-to-end: an undeclared member on the require'd carrier is rejected by both (LB0306 here, undefined-field there)
+dynamic_key_carrier_require	diag	LB0306	diag	#56 narrowing, MEASURED AGAINST THE ORACLE: a member attached to the carrier under a computed key (`H[n] = ...`) exists at runtime but is declared nowhere, and BOTH tools reject the read — undefined-field there, LB0306 here. The narrowing is luals parity, not luabox being stricter; the escape hatch is the next row
+dynamic_key_carrier_indexer	clean	-	clean	the hatch for the row above: `---@field [string] fun(): string` on the class declares the dynamic key space, and the same read is clean in both
+generic_carrier_require	diag	LB0300	diag	a generic `---@class Box<T>` carrier crossing `require` with nothing bound: both reject feeding its member to a `number` param, by different routes — luabox types the unbound parameter `unknown` (naming it, e.g. `---@type Box<number>`, is the action), luals 3.13.5 has no generic classes at all and reports `Cannot assign T to parameter number`. Presence agrees; the rendering is the divergence. NOTE: this row cannot and does not pin the round-1 message-rendering fix (`found T` -> `found unknown`) — both LB0300 either way, so it read diag before and after that change. The rendering fix is pinned at cross_file_require.rs:235, not here (F21)
+generic_carrier_require_bound	clean	-	diag	INTENTIONAL DIVERGENCE, same root as renamed_generic_duplicate: binding the argument (`---@type Box<number>`) types the required carrier's member here, while luals 3.13.5 cannot parse the generic class at all and reports undefined-field on the member — luabox is deliberately ahead; re-measure when the pinned luals version gains generic-class support
+generic_carrier_require_undeclared	clean	-	diag	INTENTIONAL DIVERGENCE, and the one place #56's enforcement claim does not hold: an UNDECLARED member read off a generic carrier crossing `require` is clean here and undefined-field there. luabox's route is that a class with an unbound parameter crosses as the monomorphised template rather than as `Ty::Named` — which is what stops `T` reaching the consumer (generic_carrier_require) — and a template is structural, so it enforces no member list; luals 3.13.5 has no generic classes at all and treats `GenericBox` as a plain one. Compare carrier_require_undeclared, the same read with the `<T>` dropped, where both report. Pinned in both directions at the type layer too (cross_file_require.rs), where the inherited-parameter cases live as well — a bound `: Base<number>` keeps the class identity and its enforcement, a bare `: Base` does not
+metatable_index_carrier_require	diag	LB0306	diag	#56 narrowing, second shape: a member reached through a `__index` metatable whose source is an undeclared table is not a declaration either, and both tools reject the read across `require` — same rule as dynamic_key_carrier_require, same hatch (declare it on the class, or make the source a declared parent)
