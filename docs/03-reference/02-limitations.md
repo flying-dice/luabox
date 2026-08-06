@@ -785,7 +785,7 @@ Given `---@class Point` / `---@field x number` in `point.lua` and
 | module spells its export as | binding hovers as | `p.x` hover | `p.` completion | `luabox check` |
 | --- | --- | --- | --- | --- |
 | a class **instance** — `---@type Point` on the returned local | `local p: Point` | `Point.x: number` | offers `x` | enforces: `p.x` is `number`, `p.nope` is `LB0306` |
-| a class **carrier** — `---@class Point` over `local P = {}` | `local p: Point` | `Point.x: number` | offers `x` | enforces: `p.x` is `number`, `p.nope` is `LB0306` |
+| a class **carrier** — `---@class Point` over `local P = {}` | `local p: Point` | `Point.x: number` | offers `x` | enforces: `p.x` is `number`, `p.nope` is `LB0306` — **except** for a class with an unbound type parameter (below) |
 
 The two spellings are symmetric now, and naming the class directly
 (`---@param p Point`, `---@type Point`) is equivalent rather than a
@@ -835,23 +835,50 @@ Statically visible attachments need nothing: dotted functions
 members assigned from a `require` all resolve as before — measured clean
 either side of the change.
 
-*A generic carrier with nothing bound.* A class name carries no type
-arguments, so `---@class Box<T>` crossing a `require` has no `T` to bind. Its
-members type as `unknown` — the same thing a bare `Box` reference means in an
-annotation — rather than leaking the parameter name into a consumer that
-cannot name it. Naming the arguments on the binding types them:
+*A carrier with an unbound type parameter — the exception to "enforces".* A
+class name carries no type arguments, so `---@class Box<T>` crossing a
+`require` has no `T` to bind. Its members type as `unknown` — the same thing
+a bare `Box` reference means in an annotation — rather than leaking the
+parameter name into a consumer that cannot name it. Naming the arguments on
+the binding types them:
 
 ```lua
 ---@type Box<number>
 local b = require("box")
 ```
 
-An *undeclared* member on a generic carrier stays lenient rather than
-`LB0306` — bound or not, and matching a bare `Box` annotation, since a
-generic class reaches its use site as the monomorphised template rather than
-as the name. luals 3.13.5 has no generic-class support at all, so the two
+The mechanism has a cost worth stating plainly, because it is the one place
+the enforcement claim above does not hold: such a carrier crosses as the
+**monomorphised template** rather than as the class name, and a template is
+a structural table, which carries no member list to enforce. So `b.nope` on
+a generic carrier is **clean**, where the identical read on a plain
+`---@class Crate` is `LB0306` — the two differ by `<T>` alone. Both
+directions are pinned as fixtures
+(`an_undeclared_member_on_a_generic_carrier_stays_lenient` and
+`a_plain_carrier_still_crosses_as_the_class_itself` in
+`crates/luabox-types/tests/cross_file_require.rs`), so the rule cannot flip
+back unnoticed. luals 3.13.5 has no generic-class support at all, so the
 generic rows in the parity corpus record where the tools part company and
 why (`generic_carrier_require`, `generic_carrier_require_bound`).
+
+**"Unbound" includes a parameter inherited from a parent**, and a parent's
+arguments now bind. `---@class Sub : Base<number>` over `---@class Base<U>` /
+`---@field item U` used to bind nothing at all — the argument was dropped
+when the declaration was lowered, so `Sub` inherited `item: U` and a consumer
+was told `found U`, a name it can neither produce nor act on. The argument
+binds the parent's parameter where the members merge, at every level of the
+chain (`---@class Mid<M> : Slot<M>` passes its own parameter up), so `Sub`
+has nothing unbound left: `item` is `number`, and the export keeps the class
+identity and its enforcement.
+
+What stays unbound is a generic parent named **without** arguments
+(`---@class Sub : Base`) — there is no argument to bind, so `Sub`'s members
+fall under the rule above and the export crosses as the template. Both
+directions are fixtures (`a_parent_type_argument_binds_the_inherited_member`
+and `a_parent_written_bare_leaves_its_parameter_unbound_and_erased`).
+Separately, a **reference site**'s monomorphisation stays shallow by design
+(#84): `Cell<number>` substitutes `Cell`'s own `---@field` bodies, not the
+ones it inherits.
 
 ### `build --mode love` requires an external zip tool
 

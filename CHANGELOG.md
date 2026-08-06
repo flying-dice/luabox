@@ -37,6 +37,19 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   fields, table-literal carriers, members assigned from a `require` — are
   measured unaffected.
 
+  **One class shape is excepted**, and the exception is the mechanism's
+  price rather than an oversight: a carrier whose members still mention an
+  **unbound type parameter** — `---@class Box<T>`, or a class inheriting a
+  field from a generic parent it named without arguments (`: Base`) —
+  crosses as the monomorphised template instead of as the class, because
+  `Ty::Named` carries no type arguments and a class name that means `T` in
+  the consumer names a variable it cannot produce. A template is structural,
+  so it enforces no member list: `b.nope` on a generic carrier stays clean
+  where the same read on a plain class is `LB0306`. Both directions are
+  pinned as fixtures, and `---@type Box<number>` on the binding restores
+  typed members. See
+  [limitations](docs/03-reference/02-limitations.md#a-class-module-export-closed-in-both-spellings-54--56).
+
 ### Added
 
 - **Hover and completion resolve class members through the checker's
@@ -92,6 +105,26 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   annotation that does bind it — types the members. The verdict is unchanged
   either way; the diagnostic is what changed. Two parity-corpus rows now cover
   a generic class crossing `require` in both directions.
+
+  The parameter need not be the carrier's own: a class inheriting `---@field
+  item U` from `---@class Base<U>` leaked `U` the same way. One rule now owns
+  the seam — every type parameter in scope for the resolved shape is
+  substituted, and the export crosses as the class name only when that
+  substitution changes nothing.
+
+- **A `---@class Sub : Base<number>` binds its parent's type parameter.** The
+  arguments on a parent reference were dropped when the declaration was
+  lowered — only the parent's *name* was kept — so an inherited `---@field
+  item U` stayed `U` no matter what the child bound it to: `Sub.item` typed
+  as an unbound parameter, and `: Base<number>` reported `LB0300` against its
+  own declared parent (`missing member item of type U`). Parent arguments are
+  now lowered and bound where the class members merge, at every level of the
+  chain (`---@class Mid<M> : Slot<M>` passes its own parameter up), so
+  `Sub.item` is `number`, the conformance obligation is stated in the child's
+  vocabulary, and the class keeps the #56 export identity because it has
+  nothing unbound left. A parent named *without* arguments (`: Base`) still
+  leaves its parameters free, as a bare reference always has. Reference-site
+  monomorphisation (`Cell<number>`) stays shallow by design (#84).
 
 - **A generic `---@class`'s type parameters are scoped to the declaration that
   writes them.** Two declarations of one generic class may spell the parameter
