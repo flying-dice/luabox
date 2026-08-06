@@ -44,6 +44,7 @@ use luabox_db::Analysis;
 use luabox_hir::Binding;
 use luabox_syntax::lua::SyntaxKind;
 use luabox_syntax::lua::ast::{self, AstNode};
+use luabox_syntax::luacats::{TypeExpr, TypeExprKind};
 use luabox_types::RockSurfaces;
 use luabox_types::ty::{FieldTy, Ty};
 
@@ -174,6 +175,57 @@ pub fn export_class(ty: &Ty) -> Option<&str> {
     match ty {
         Ty::Named(name) => Some(name),
         _ => None,
+    }
+}
+
+/// The receiver `binding`'s class **reference** (#48, #56): its own
+/// `---@type` annotation, used exactly as written — arguments included, so
+/// `Box<number>` stays `Box<number>`, not just `Box` — or, when the binding
+/// has no such annotation, a bare reference to the class the `require`
+/// module its initialiser resolves to carries (both `---@class` spellings,
+/// #56: [`export_class`]). A carrier export never carries explicit type
+/// arguments (`reify_export` erases what it cannot bind, #42), so that half
+/// is always argument-less.
+///
+/// This is the **one** receiver→class-reference rule, called by hover,
+/// completion, signature help and goto-definition, so a surface cannot
+/// silently miss it the way signature help did (#50), hover/completion each
+/// carried their own copy of it (#56), and — the shape this closes — so a
+/// generic reference cannot resolve correctly on one surface and leniently
+/// on another (#48). The reference returned is a *candidate*: the caller
+/// still confirms it against
+/// [`luabox_types::Ambient::class_members_of`]/[`crate::merged_ambient::MergedAmbient::class_members_of`]
+/// (an annotation can name anything, including a type that resolves to
+/// nothing).
+#[must_use]
+pub fn receiver_type(
+    sema: &FileSema,
+    exports: &RequireExports,
+    binding: &Binding,
+) -> Option<TypeExpr> {
+    if let Some(ty) = sema.annotated_type(binding) {
+        return Some(ty);
+    }
+    let name = require_module_of(sema, binding)
+        .and_then(|module| exports.get(module))
+        .and_then(export_class)?;
+    Some(bare_named(name))
+}
+
+/// A synthetic, argument-less `Named` reference to `name` — the shape a
+/// `require`-carried class always is (#42), and the shape
+/// [`luabox_types::Ambient::class_members_of`] treats identically to a bare
+/// `---@type Name` annotation (#48's "unbound stays lenient" rule). The span
+/// is a placeholder: nothing downstream of [`receiver_type`] reads it (no
+/// diagnostic is raised against this expression; it never appears in a
+/// source file).
+fn bare_named(name: &str) -> TypeExpr {
+    TypeExpr {
+        kind: TypeExprKind::Named {
+            name: name.to_string(),
+            args: Vec::new(),
+        },
+        span: luabox_syntax::luacats::Span { start: 0, end: 0 },
     }
 }
 
@@ -353,5 +405,102 @@ return m
             &RockSurfaces::default(),
         );
         assert!(exports.by_module().is_empty());
+    }
+
+    // === `receiver_type` (#48, #56) ========================================
+
+    /// The bare class name `receiver_type` resolves for `name` — the
+    /// argument-discarding view every display/locate call site reads via
+    /// `sema::named_of(&ty)`.
+    fn class_of(files: &[(&str, &str)], name: &str) -> Option<String> {
+        crate::sema::named_of(&type_of(files, name)?)
+    }
+
+    /// The full class reference `receiver_type` resolves for `name`,
+    /// arguments included — what a member-lookup call site hands to
+    /// `Ambient::class_members_of` (#48).
+    fn type_of(files: &[(&str, &str)], name: &str) -> Option<TypeExpr> {
+        let (analysis, path) = analyze(files);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let exports = RequireExports::resolve(&analysis, &path, &RockSurfaces::default());
+        let lowered = analysis.lower(&path).expect("lowered");
+        let (_, binding) = lowered.file().bindings().find(|(_, b)| b.name == name)?;
+        receiver_type(&sema, &exports, binding)
+    }
+
+    #[test]
+    fn an_explicit_annotation_names_the_class_directly() {
+        let src = "\
+---@class Point
+---@field x number
+
+---@type Point
+local p = nil
+";
+        assert_eq!(
+            class_of(&[("main.lua", src)], "p").as_deref(),
+            Some("Point")
+        );
+    }
+
+    /// The candidate is returned even when the class is declared in another
+    /// file — resolving it is the caller's job, against the merged ambient
+    /// (#46/#47's defect was skipping that lookup, not this one).
+    #[test]
+    fn an_annotation_naming_a_cross_file_class_still_names_it() {
+        let files = [
+            ("main.lua", "---@type Point\nlocal p = nil\nprint(p)\n"),
+            ("point.lua", "---@class Point\n---@field x number\n"),
+        ];
+        assert_eq!(class_of(&files, "p").as_deref(), Some("Point"));
+    }
+
+    #[test]
+    fn a_require_binding_falls_back_to_the_required_modules_carrier_class() {
+        let files = [
+            ("main.lua", "local p = require(\"point\")\nprint(p)\n"),
+            (
+                "point.lua",
+                "---@class Point\n---@field x number\nlocal P = {}\nreturn P\n",
+            ),
+        ];
+        assert_eq!(class_of(&files, "p").as_deref(), Some("Point"));
+    }
+
+    #[test]
+    fn a_plain_table_binding_names_no_class() {
+        let files = [("main.lua", "local t = {}\nprint(t)\n")];
+        assert_eq!(class_of(&files, "t"), None);
+    }
+
+    /// #48: an explicit `Box<number>` annotation is returned whole —
+    /// arguments included — not narrowed to the bare name `class_of` (and
+    /// the pre-#48 `class_of_receiver`) reads off it.
+    #[test]
+    fn an_explicit_annotation_keeps_its_type_arguments() {
+        let files = [(
+            "main.lua",
+            "---@class Box<T>\n---@field item T\n\n---@type Box<number>\nlocal b = nil\n",
+        )];
+        let ty = type_of(&files, "b").expect("a reference");
+        assert_eq!(crate::sema::render_type(&ty), "Box<number>");
+    }
+
+    /// A `require`-carried class is always argument-less (#42's erasure) —
+    /// `receiver_type`'s synthesised reference must not invent arguments a
+    /// real annotation never wrote. (A *generic* carrier's export erases to
+    /// a structural table rather than `Ty::Named` at all, #69 — a separate,
+    /// pre-existing gap, not this test's concern.)
+    #[test]
+    fn a_required_carrier_class_reference_has_no_arguments() {
+        let files = [
+            ("main.lua", "local b = require(\"box\")\nprint(b)\n"),
+            (
+                "box.lua",
+                "---@class Box\n---@field item number\nlocal B = {}\nreturn B\n",
+            ),
+        ];
+        let ty = type_of(&files, "b").expect("a reference");
+        assert_eq!(crate::sema::render_type(&ty), "Box");
     }
 }

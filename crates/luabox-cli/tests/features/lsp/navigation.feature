@@ -191,6 +191,30 @@ Feature: luabox lsp — goto definition, type definition, and implementation
     When I request the definition at 5:3 in "main.lua"
     Then the location starts on line 1
 
+  # A receiver's own class declared in *this* file, inheriting from a
+  # parent declared in another — the shape the file-local-only member
+  # lookup used to answer null for, though `luabox check` resolved the
+  # member fine through the merged workspace ambient (#46, #54).
+  Scenario: definition on a member inherited from a parent in another file jumps to the parent
+    Given a file "base.lua" containing:
+      """
+      ---@class Base
+      ---@field id number
+      """
+    And a file "main.lua" containing:
+      """
+      ---@class Sub : Base
+      ---@field name string
+
+      ---@type Sub
+      local s = nil
+      print(s.id)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request the definition at 5:8 in "main.lua"
+    Then the location is in "base.lua"
+
   Scenario: definition on a dotted function jumps to its declaration
     Given a file "main.lua" containing:
       """

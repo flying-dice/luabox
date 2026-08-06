@@ -18,8 +18,8 @@ use luabox_hir::{Binding, BindingId, Expr as HirExpr, HirId, Resolution};
 use luabox_syntax::lua::ast::{self, AstNode};
 use luabox_syntax::lua::{SyntaxKind, SyntaxNode, SyntaxToken};
 use luabox_syntax::luacats::{
-    AnnotatedItem, ClassTag, FieldKey, FieldTag, FunParam, FunReturn, ParamTag, Tag, TypeExpr,
-    TypeExprKind,
+    AnnotatedItem, ClassTag, FieldKey, FieldTag, FunParam, FunReturn, ParamTag, Span, Tag,
+    TypeExpr, TypeExprKind,
 };
 use rowan::{TextRange, TextSize, TokenAtOffset};
 
@@ -257,26 +257,6 @@ impl FileSema {
         out
     }
 
-    /// The named fields of `class`, parents first (own fields override),
-    /// with a cycle guard. Returns `(field, declaring class)` pairs.
-    #[must_use]
-    pub fn class_fields(&self, class: &str) -> Vec<(&FieldTag, String)> {
-        let classes = self.classes();
-        let mut seen = HashSet::new();
-        let mut by_name: Vec<(String, (&FieldTag, String))> = Vec::new();
-        collect_fields(&classes, class, &mut seen, &mut by_name);
-        let mut merged: Vec<(&FieldTag, String)> = Vec::new();
-        let mut names = HashSet::new();
-        // Later entries (own fields) override earlier (inherited) ones.
-        for (name, entry) in by_name.into_iter().rev() {
-            if names.insert(name) {
-                merged.push(entry);
-            }
-        }
-        merged.reverse();
-        merged
-    }
-
     /// The annotation item whose target statement contains `range`
     /// (innermost when several nest).
     #[must_use]
@@ -384,32 +364,23 @@ impl FileSema {
         None
     }
 
-    /// The class name a binding's annotated type resolves to, if the type is
-    /// a declared `---@class` (peeling `?` and parentheses).
+    /// The receiver's annotated type, arguments included (#48):
+    /// `---@type Box<number>` answers the whole `Box<number>` reference, not
+    /// just `Box`, so a caller can hand it to
+    /// [`luabox_types::Ambient::class_members_of`] and get `item: number`
+    /// rather than the free `T` a bare-name lookup leaves it as. Peels `?`
+    /// and parentheses. Resolved against the merged workspace ambient by the
+    /// caller ([`crate::requires::receiver_type`], #56), not against this
+    /// file's own `---@class` declarations — classes are workspace-global,
+    /// so requiring this file to declare the name too would miss exactly
+    /// the cross-file receiver #46/#47 fixed. `None` for no annotation, or
+    /// one that — after peeling — is not a `Named` reference at all (a
+    /// union, an array, ...): the same boundary `class_members_of` itself
+    /// enforces, kept here so a caller cannot construct a `TypeExpr` it
+    /// would reject anyway.
     #[must_use]
-    pub fn class_of_binding(&self, binding: &Binding) -> Option<String> {
-        let ty = self.binding_type(binding)?;
-        let name = named_of(&ty)?;
-        self.classes().contains_key(name.as_str()).then_some(name)
-    }
-
-    /// The bare named type of a binding's annotation, peeling `?` and
-    /// parentheses — WITHOUT requiring this file to declare it.
-    /// [`Self::class_of_binding`] answers for file-local classes; this is
-    /// the workspace-ambient surfaces' half (#56): the name is resolved
-    /// against the merged ambient environment instead, where classes are
-    /// workspace-global.
-    #[must_use]
-    pub fn annotated_named_type(&self, binding: &Binding) -> Option<String> {
-        named_of(&self.binding_type(binding)?)
-    }
-
-    /// [`Self::class_of_binding`] for the nearest binding named `name`
-    /// visible at `offset`.
-    #[must_use]
-    pub fn class_of_name(&self, name: &str, offset: usize) -> Option<String> {
-        let binding = self.visible_binding_named(name, offset)?;
-        self.class_of_binding(binding)
+    pub fn annotated_type(&self, binding: &Binding) -> Option<TypeExpr> {
+        peel_to_named(self.binding_type(binding)?)
     }
 
     /// Which of the target `local` statement's names this binding is
@@ -558,31 +529,72 @@ fn contains(range: TextRange, offset: usize) -> bool {
     start <= offset && offset <= end && !(offset == end && start == end)
 }
 
-fn collect_fields<'a>(
-    classes: &HashMap<&str, ClassDecl<'a>>,
-    name: &str,
-    seen: &mut HashSet<String>,
-    out: &mut Vec<(String, (&'a FieldTag, String))>,
-) {
-    if !seen.insert(name.to_string()) {
-        return;
-    }
-    let Some(info) = classes.get(name) else {
-        return;
-    };
-    for parent in &info.tag.parents {
-        if let Some(parent_name) = match &parent.kind {
-            TypeExprKind::Named { name, .. } => Some(name.clone()),
-            _ => None,
-        } {
-            collect_fields(classes, &parent_name, seen, out);
+/// Where a `class`'s `member` field is textually declared: the file, its
+/// `---@field` description, and the tag's span in that file.
+pub struct FieldSource {
+    pub path: PathBuf,
+    pub desc: Option<String>,
+    pub span: Span,
+}
+
+/// [`FieldSource`] for `class.member`, searched across every project file's
+/// own `---@class` annotations, walking the parent chain **across files**
+/// (#51, #54) — the cross-file counterpart of [`collect_fields`], which can
+/// only walk a parent declared in the same file it started from (the exact
+/// shape #46/#47 fixed for existence; this is its declaration-site half).
+///
+/// Used only to *enrich* a member already confirmed to exist by
+/// [`luabox_types::Ambient::class_members`] — a description for hover
+/// (#51), a jump target for goto-definition (#54) — never to decide whether
+/// it exists: `luabox_types::env::collect_class`'s merge (defs winning a
+/// same-name collision, generic substitution, ...) is the authority on that,
+/// and reimplementing it here would be a second copy of the merge rule (#59
+/// exists to prevent exactly that shape). `None` when no project file
+/// declares `class` or an ancestor of it with that field — a class built
+/// entirely from carrier-attached `function C:method`s, with no `---@field`
+/// anywhere in its chain, has nothing here to find; that is a real,
+/// documented gap, not a bug (#51 only pins the loss for a field an
+/// `---@field` tag actually declares).
+#[must_use]
+pub fn locate_field(analysis: &Analysis, class: &str, member: &str) -> Option<FieldSource> {
+    let mut paths: Vec<&Path> = analysis.files().collect();
+    paths.sort_unstable();
+    let semas: Vec<FileSema> = paths
+        .into_iter()
+        .filter_map(|p| FileSema::new(analysis, p))
+        .collect();
+    let maps: Vec<HashMap<&str, ClassDecl<'_>>> = semas.iter().map(FileSema::classes).collect();
+
+    let mut queue: std::collections::VecDeque<String> =
+        std::collections::VecDeque::from([class.to_string()]);
+    let mut seen = HashSet::new();
+    while let Some(name) = queue.pop_front() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        for (sema, map) in semas.iter().zip(&maps) {
+            let Some(decl) = map.get(name.as_str()) else {
+                continue;
+            };
+            if let Some(field) = decl
+                .fields
+                .iter()
+                .find(|f| matches!(&f.key, FieldKey::Name(n) if n == member))
+            {
+                return Some(FieldSource {
+                    path: sema.path.clone(),
+                    desc: field.desc.clone(),
+                    span: field.span,
+                });
+            }
+            for parent in &decl.tag.parents {
+                if let Some(parent_name) = named_of(parent) {
+                    queue.push_back(parent_name);
+                }
+            }
         }
     }
-    for field in &info.fields {
-        if let FieldKey::Name(field_name) = &field.key {
-            out.push((field_name.clone(), (field, name.to_string())));
-        }
-    }
+    None
 }
 
 /// The `---@see` references of an annotation block, in declaration order
@@ -620,13 +632,14 @@ pub fn named_of(ty: &TypeExpr) -> Option<String> {
     }
 }
 
-/// Whether an annotated type is a function type.
-#[must_use]
-pub fn is_function_type(ty: &TypeExpr) -> bool {
-    match &ty.kind {
-        TypeExprKind::Fun { .. } => true,
-        TypeExprKind::Optional(inner) | TypeExprKind::Paren(inner) => is_function_type(inner),
-        _ => false,
+/// [`named_of`], keeping the whole `Named` node — arguments included —
+/// rather than extracting just its name (#48). `None` for the same shapes
+/// `named_of` declines.
+fn peel_to_named(ty: TypeExpr) -> Option<TypeExpr> {
+    match ty.kind {
+        TypeExprKind::Named { .. } => Some(ty),
+        TypeExprKind::Optional(inner) | TypeExprKind::Paren(inner) => peel_to_named(*inner),
+        _ => None,
     }
 }
 
@@ -867,7 +880,6 @@ mod tests {
     use super::*;
 
     use luabox_db::{AnalysisHost, Change, Dialect, Strictness};
-    use luabox_syntax::luacats::Span;
 
     fn analyze(text: &str) -> (Analysis, PathBuf) {
         let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
@@ -975,11 +987,42 @@ mod tests {
     }
 
     #[test]
-    fn is_function_type_peels_optional_and_parens() {
-        assert!(is_function_type(&parse_ty("fun()")));
-        assert!(is_function_type(&parse_ty("fun()?")));
-        assert!(is_function_type(&parse_ty("(fun())")));
-        assert!(!is_function_type(&parse_ty("string")));
+    fn annotated_type_keeps_the_type_arguments_named_of_drops() {
+        let src = "---@type Box<number>\nlocal b = nil\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let lowered = analysis.lower(&path).expect("lowered");
+        let (_, binding) = lowered
+            .file()
+            .bindings()
+            .find(|(_, b)| b.name == "b")
+            .expect("the binding");
+        let ty = sema.annotated_type(binding).expect("an annotation");
+        assert_eq!(render_type(&ty), "Box<number>");
+    }
+
+    #[test]
+    fn annotated_type_peels_optional_and_declines_a_compound_type() {
+        let src = "---@type Box<number>?\nlocal b = nil\n---@type Box|nil\nlocal c = nil\n";
+        let (analysis, path) = sema_of(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let lowered = analysis.lower(&path).expect("lowered");
+        let named = |name: &str| {
+            lowered
+                .file()
+                .bindings()
+                .find(|(_, binding)| binding.name == name)
+                .map(|(_, binding)| binding.clone())
+                .expect("the binding")
+        };
+        // `?` peels through, keeping the arguments.
+        assert_eq!(
+            render_type(&sema.annotated_type(&named("b")).expect("an annotation")),
+            "Box<number>"
+        );
+        // A union is not a `Named` reference even after peeling — declines,
+        // matching `class_members_of`'s own boundary.
+        assert!(sema.annotated_type(&named("c")).is_none());
     }
 
     #[test]
@@ -1085,84 +1128,90 @@ mod tests {
         assert!(id.is_none() || sema.binding_type(id.expect("binding")).is_some());
     }
 
-    // === class_of_binding / class_of_name =================================
+    // === locate_field (#51, #54) ==========================================
 
-    #[test]
-    fn class_of_binding_peels_an_optional_annotation() {
-        let src = "---@class Point\n---@field x number\n\n---@type Point?\nlocal p = nil\n";
-        let (analysis, path) = sema_of(src);
-        let sema = FileSema::new(&analysis, &path).expect("sema");
-        assert_eq!(
-            sema.class_of_name("p", offset_of(src, "p = nil", 0) + 5)
-                .as_deref(),
-            Some("Point")
-        );
+    /// A workspace root every multi-file `locate_field` test lives under, so
+    /// cross-file class resolution finds every sibling.
+    fn root() -> PathBuf {
+        PathBuf::from(if cfg!(windows) { r"C:\ws" } else { "/ws" })
+    }
+
+    fn analyze_files(files: &[(&str, &str)]) -> Analysis {
+        let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
+        host.set_root(root());
+        for (rel, text) in files {
+            host.apply_change(Change::SetFileText {
+                path: root().join(rel),
+                dialect: Dialect::Lua54,
+                text: (*text).to_string(),
+            });
+        }
+        host.snapshot()
     }
 
     #[test]
-    fn class_of_binding_declines_a_type_that_is_not_a_declared_class() {
-        let src = "---@type Missing\nlocal p = nil\n";
-        let (analysis, path) = sema_of(src);
-        let sema = FileSema::new(&analysis, &path).expect("sema");
-        assert_eq!(sema.class_of_name("p", src.len()), None);
-        assert_eq!(sema.class_of_name("nothing", src.len()), None);
+    fn locate_field_finds_a_field_declared_in_the_same_file() {
+        let analysis = analyze_files(&[(
+            "main.lua",
+            "---@class Point\n---@field x number the x coordinate\n",
+        )]);
+        let found = locate_field(&analysis, "Point", "x").expect("found");
+        assert_eq!(found.path, root().join("main.lua"));
+        assert_eq!(found.desc.as_deref(), Some("the x coordinate"));
     }
 
-    // === class_fields =====================================================
-
+    /// The shape #51 pins: a class required from another file still carries
+    /// its `---@field` description, because the locator searches every
+    /// project file, not just the receiver's own.
     #[test]
-    fn class_fields_collects_parents_first_and_records_the_declaring_class() {
-        let src = "\
----@class Base
----@field id number
-
----@class Derived: Base
----@field name string
-";
-        let (analysis, path) = sema_of(src);
-        let sema = FileSema::new(&analysis, &path).expect("sema");
-        let fields = sema.class_fields("Derived");
-        let rendered: Vec<(String, String)> = fields
-            .iter()
-            .map(|(f, declaring)| {
-                let FieldKey::Name(name) = &f.key else {
-                    panic!("expected a named field, got {:?}", f.key)
-                };
-                let name = name.clone();
-                (name, declaring.clone())
-            })
-            .collect();
-        assert_eq!(
-            rendered,
-            vec![
-                ("id".to_string(), "Base".to_string()),
-                ("name".to_string(), "Derived".to_string()),
-            ]
-        );
+    fn locate_field_finds_a_field_declared_in_another_file() {
+        let analysis = analyze_files(&[
+            ("main.lua", "local p = require(\"point\")\nprint(p.x)\n"),
+            (
+                "point.lua",
+                "---@class Point\n---@field x number the x coordinate\nlocal P = {}\nreturn P\n",
+            ),
+        ]);
+        let found = locate_field(&analysis, "Point", "x").expect("found");
+        assert_eq!(found.path, root().join("point.lua"));
+        assert_eq!(found.desc.as_deref(), Some("the x coordinate"));
     }
 
+    /// The shape #46/#54 pin: a field inherited from a parent declared in a
+    /// *different* file than the child — the locator walks the parent chain
+    /// across files, not just within the file it started from.
     #[test]
-    fn own_field_overrides_an_inherited_one_of_the_same_name() {
-        let src = "\
----@class Base
----@field v number
-
----@class Derived: Base
----@field v string
-";
-        let (analysis, path) = sema_of(src);
-        let sema = FileSema::new(&analysis, &path).expect("sema");
-        let fields = sema.class_fields("Derived");
-        assert_eq!(fields.len(), 1, "{:?}", fields.len());
-        assert_eq!(fields[0].1, "Derived");
-        assert_eq!(render_type(&fields[0].0.ty), "string");
+    fn locate_field_walks_a_parent_declared_in_another_file() {
+        let analysis = analyze_files(&[
+            ("main.lua", "---@class Sub : Base\n---@field name string\n"),
+            ("base.lua", "---@class Base\n---@field id number\n"),
+        ]);
+        let found = locate_field(&analysis, "Sub", "id").expect("found");
+        assert_eq!(found.path, root().join("base.lua"));
     }
 
     #[test]
-    fn class_fields_of_an_undeclared_class_is_empty() {
-        let (analysis, path) = sema_of("---@class Known\n");
-        let sema = FileSema::new(&analysis, &path).expect("sema");
-        assert!(sema.class_fields("NotDeclared").is_empty());
+    fn locate_field_declines_a_field_no_ancestor_declares() {
+        let analysis = analyze_files(&[("main.lua", "---@class Point\n---@field x number\n")]);
+        assert!(locate_field(&analysis, "Point", "nope").is_none());
+    }
+
+    #[test]
+    fn locate_field_declines_an_undeclared_class() {
+        let analysis = analyze_files(&[("main.lua", "---@class Point\n---@field x number\n")]);
+        assert!(locate_field(&analysis, "Nope", "x").is_none());
+    }
+
+    /// A class assembled purely from carrier-attached methods (no
+    /// `---@field` anywhere in its chain) has nothing for the locator to
+    /// find — an honest gap, not a bug (module docs).
+    #[test]
+    fn locate_field_declines_a_carrier_only_attachment() {
+        let analysis = analyze_files(&[(
+            "main.lua",
+            "---@class Greeter\nlocal G = {}\nfunction G.greet() end\n",
+        )]);
+        assert!(locate_field(&analysis, "Greeter", "greet").is_none());
     }
 
     #[test]
@@ -1174,11 +1223,14 @@ mod tests {
 ---@class B: A
 ---@field b number
 ";
-        let (analysis, path) = sema_of(src);
-        let sema = FileSema::new(&analysis, &path).expect("sema");
-        // The cycle guard stops the walk; each field appears exactly once.
-        assert_eq!(sema.class_fields("A").len(), 2);
-        assert_eq!(sema.class_fields("B").len(), 2);
+        let (analysis, _) = sema_of(src);
+        // The cycle guard stops the walk; each side's own field is still
+        // found, and the mutual reference does not hang the lookup.
+        assert!(locate_field(&analysis, "A", "a").is_some());
+        assert!(locate_field(&analysis, "B", "b").is_some());
+        // The cycle also means each side can see the other's field, exactly
+        // as `env::collect_class`'s own cycle guard resolves it.
+        assert!(locate_field(&analysis, "A", "b").is_some());
     }
 
     #[test]
@@ -1187,11 +1239,10 @@ mod tests {
 ---@class Odd: { x: number }
 ---@field own string
 ";
-        let (analysis, path) = sema_of(src);
-        let sema = FileSema::new(&analysis, &path).expect("sema");
-        let fields = sema.class_fields("Odd");
-        assert_eq!(fields.len(), 1);
-        assert_eq!(fields[0].1, "Odd");
+        let (analysis, _) = sema_of(src);
+        // The structural-table parent has no name to walk to; `Odd`'s own
+        // field is still found, and the lookup does not panic on the shape.
+        assert!(locate_field(&analysis, "Odd", "own").is_some());
     }
 
     // === functions() ======================================================

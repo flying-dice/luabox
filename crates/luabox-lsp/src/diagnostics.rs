@@ -15,9 +15,10 @@ use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
 use luabox_db::Analysis;
 use luabox_lint::{LintConfig, lint_source};
 use luabox_syntax::lua::{Dialect, validate};
-use luabox_types::{Ambient, RockSurfaces, Strictness, check_file_with_requires};
+use luabox_types::{RockSurfaces, Strictness, check_file_with_requires};
 
 use crate::line_index::LineIndex;
+use crate::merged_ambient::MergedAmbient;
 use crate::requires::RequireExports;
 
 /// The `source` field on published type, parse, and dialect diagnostics.
@@ -68,12 +69,22 @@ pub(crate) const fn source_for(code: luabox_diag::Code) -> &'static str {
 /// Owned by the server.
 pub struct CheckCtx<'a> {
     pub strictness: Strictness,
-    /// The MERGED ambient layer to check against — defs + workspace-global
+    /// The merged ambient layer to check against — defs + workspace-global
     /// project types + rock types, as [`crate::server`]'s revision-keyed
     /// cache builds it — so a dependency's classes resolve in the editor
     /// exactly as they do under `luabox check`, and one merge serves every
     /// surface instead of being rebuilt per published file.
-    pub ambient: &'a Ambient,
+    ///
+    /// [`MergedAmbient`] rather than a bare [`luabox_types::Ambient`] on
+    /// purpose (#62): the two are the same Rust type once built
+    /// (`with_project_types`/`with_rock_types` both return `Ambient`), so a
+    /// caller that skips the merge — `&self.ambient`, the unmerged base
+    /// layer `server.rs` passed here before the merge existed — type-checks
+    /// identically and silently drops every cross-file class. Routing
+    /// through the newtype (built only by
+    /// [`MergedAmbient::build`]) makes that mistake a compile error instead
+    /// of a doc comment nobody re-reads at the call site.
+    pub ambient: &'a MergedAmbient,
     /// The type surfaces harvested from the project's vendored luarocks tree
     /// (#30): rock classes/enums/aliases, plus each rock module's
     /// `require`-export type. Merged *after* the project's own types, so a name
@@ -145,7 +156,7 @@ pub fn diagnostics(
         &rel,
         ctx.strictness,
         dialect,
-        Some(ctx.ambient),
+        Some(ctx.ambient.get()),
         requires.by_module(),
     ) {
         // Type diagnostics are all `LB03xx`, so this publishes under
@@ -279,14 +290,12 @@ mod tests {
             text: src.to_string(),
         });
         let analysis = host.snapshot();
-        // The MERGED layer, exactly as the server's revision-keyed cache
+        // The merged layer, exactly as the server's revision-keyed cache
         // builds it — the merge lives with the caller now, not in
         // `diagnostics()`.
         let base = build_ambient(dialect, &[]);
         let known_globals = base.global_names().clone();
-        let ambient = base
-            .with_project_types(&analysis.project_types())
-            .with_rock_types(rocks.types());
+        let ambient = MergedAmbient::build(&base, &analysis.project_types(), rocks.types());
         let lint = LintConfig::new();
         let ctx = CheckCtx {
             strictness: Strictness::Warn,
@@ -489,9 +498,10 @@ want(mylib.point(1, 2))
     fn a_file_the_analysis_does_not_know_has_no_diagnostics() {
         let host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
         let analysis = host.snapshot();
-        let ambient = build_ambient(Dialect::Lua54, &[]);
+        let base = build_ambient(Dialect::Lua54, &[]);
+        let known_globals = base.global_names().clone();
+        let ambient = MergedAmbient::build(&base, &analysis.project_types(), &[]);
         let lint = LintConfig::new();
-        let known_globals = ambient.global_names().clone();
         let rocks = RockSurfaces::default();
         let ctx = CheckCtx {
             strictness: Strictness::Warn,

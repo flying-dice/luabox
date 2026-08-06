@@ -79,6 +79,7 @@ use luabox_types::{Ambient, RockModule, RockSurfaces, build_ambient};
 use rayon::prelude::*;
 
 use crate::line_index::LineIndex;
+use crate::merged_ambient::MergedAmbient;
 use crate::requires::RequireExports;
 use crate::sema::FileSema;
 use crate::uri::uri_to_path;
@@ -553,16 +554,33 @@ struct Server {
     rocks: RockSurfaces,
     /// The merged editor ambient — [`Self::ambient`] + the workspace-global
     /// project types + the rock tree — cached per
-    /// [`luabox_db::Analysis::revision`], because every surface that needs it
-    /// (diagnostics on each keystroke, hover, completion) used to re-clone
-    /// the defs surface and re-merge every project file per request. The
-    /// revision key makes staleness structural: any [`Change`] bumps it, and
-    /// [`Self::reload_config`] — which swaps the base layers the merge is
-    /// built from without touching the host — clears the cache by hand.
+    /// [`luabox_db::Analysis::revision`]. What this delivers, **measured**
+    /// (#57): every surface reading the SAME revision reuses one merge —
+    /// `code_actions` reusing the entry `publish_lua` installed for the same
+    /// request, and hover/completion/signature-help/goto-definition between
+    /// edits. What it does **not** deliver, also measured: diagnostics on a
+    /// keystroke. `DidChangeTextDocument` bumps the revision (`host.rs`)
+    /// immediately before `publish_lua` reads this cache, so the very next
+    /// read is guaranteed a miss — one full re-clone + re-merge per
+    /// keystroke, same as before this cache existed. A prior revision of
+    /// this comment claimed the keystroke case as a beneficiary; it was
+    /// not, and nothing had measured it.
+    ///
+    /// The revision key makes staleness structural: any [`Change`] bumps it,
+    /// and [`Self::reload_config`] — which swaps the base layers the merge
+    /// is built from without touching the host — clears the cache by hand
+    /// (see the comment there, and #59, for why that line is *not* dead
+    /// code despite [`Self::host`]'s revision bumping on the very next line
+    /// too).
     ///
     /// `RefCell` for the same reason as [`Self::pending`]: the read paths run
     /// behind `&self`, and the server is single-threaded.
-    merged_ambient: RefCell<Option<(u64, Rc<Ambient>)>>,
+    merged_ambient: RefCell<Option<(u64, Rc<MergedAmbient>)>>,
+    /// `"hit@<revision>"` / `"rebuilt@<revision>"` per [`Self::merged_ambient`]
+    /// call since the last drain (`#[cfg(test)]` only — see
+    /// [`Self::take_merged_ambient_trace`], #58/#60).
+    #[cfg(test)]
+    merged_ambient_trace: RefCell<Vec<String>>,
     /// The resolved `[lint]` configuration, driving the lint pass in
     /// [`Self::publish_lua`] and the quick-fixes in [`Self::code_actions`].
     lint: LintConfig,
@@ -727,6 +745,8 @@ impl Server {
             ambient,
             rocks: RockSurfaces::default(),
             merged_ambient: RefCell::new(None),
+            #[cfg(test)]
+            merged_ambient_trace: RefCell::new(Vec::new()),
             lint: config.lint,
             known_globals,
             open_docs: HashMap::new(),
@@ -836,10 +856,23 @@ impl Server {
         self.lint = config.lint;
         // Re-report: the reload may have introduced (or fixed) a typo'd key.
         self.log_lint_config_problems(&config.unknown_lint_rules);
+        // Guarded (#59): an unconditional `apply_change` here bumps the
+        // host's revision on every reload regardless of whether strictness
+        // actually moved, which pays for a full `clone_surface` +
+        // `merge_file_types` over every project file it never asked for —
+        // and, worse, makes the manual `merged_ambient` clear above
+        // untestable, since the bump alone would invalidate the cache and
+        // hide whether that line did anything. A reload that only touches
+        // `[types] defs` or the rock tree (this test's shape) now leaves the
+        // host's revision untouched, so the clear above is what is doing the
+        // work — and is the only thing that can be doing it.
+        let strictness_changed = config.strictness != self.strictness;
         self.strictness = config.strictness;
         self.out_dir = config.out_dir;
-        self.host
-            .apply_change(Change::SetStrictness(config.strictness));
+        if strictness_changed {
+            self.host
+                .apply_change(Change::SetStrictness(config.strictness));
+        }
         if config.dialect != self.dialect {
             self.dialect = config.dialect;
             let paths: Vec<PathBuf> = self
@@ -1518,7 +1551,7 @@ impl Server {
         let (snapshot, sema, offset) = self.at(uri, position)?;
         let exports = self.require_exports(&snapshot, &sema.path);
         let ambient = self.merged_ambient(&snapshot);
-        hover::hover(&sema, offset, &exports, &ambient)
+        hover::hover(&sema, offset, &exports, &ambient, &snapshot)
     }
 
     /// The shared `require` resolution for one file — the same map the
@@ -1530,32 +1563,64 @@ impl Server {
 
     /// The merged ambient layer every editor surface reads — defs, then the
     /// workspace-global project types, then the rock tree — so diagnostics,
-    /// hover and completion all resolve against the very environment
-    /// `luabox check` enforces (#56). Cached on [`Analysis::revision`]: a
-    /// request against an unchanged world reuses the merge instead of
-    /// re-cloning the defs surface and re-merging every project file, which
-    /// each of the three surfaces used to pay per request.
-    fn merged_ambient(&self, snapshot: &Analysis) -> Rc<Ambient> {
+    /// hover, completion, signature help and goto-definition all resolve
+    /// against the very environment `luabox check` enforces (#56). Cached on
+    /// [`Analysis::revision`]: a request against an unchanged world reuses
+    /// the merge instead of re-cloning the defs surface and re-merging every
+    /// project file (see the field doc on [`Self::merged_ambient`] for what
+    /// this reuse does and does not reach, measured).
+    ///
+    /// Traced into [`Self::merged_ambient_trace`] on both outcomes (#60) —
+    /// the only signal that a served entry is fresh rather than a merge that
+    /// quietly went stale, since the client sees no difference in the
+    /// response either way. `revision` is included so a trace can tell a
+    /// miss-then-hit pair apart from two independent misses.
+    fn merged_ambient(&self, snapshot: &Analysis) -> Rc<MergedAmbient> {
         let revision = snapshot.revision();
         if let Some((cached_at, merged)) = self.merged_ambient.borrow().as_ref()
             && *cached_at == revision
         {
+            #[cfg(test)]
+            self.merged_ambient_trace
+                .borrow_mut()
+                .push(format!("hit@{revision}"));
             return Rc::clone(merged);
         }
-        let merged = Rc::new(
-            self.ambient
-                .with_project_types(&snapshot.project_types())
-                .with_rock_types(self.rocks.types()),
-        );
+        let merged = Rc::new(MergedAmbient::build(
+            &self.ambient,
+            &snapshot.project_types(),
+            self.rocks.types(),
+        ));
+        #[cfg(test)]
+        self.merged_ambient_trace
+            .borrow_mut()
+            .push(format!("rebuilt@{revision}"));
         *self.merged_ambient.borrow_mut() = Some((revision, Rc::clone(&merged)));
         merged
+    }
+
+    /// Drain [`Self::merged_ambient_trace`] since the last call — test aid
+    /// (#58, #60), mirroring [`luabox_db::AnalysisHost::take_execution_log`]'s
+    /// own "what actually ran" signal applied to this hand-rolled cache
+    /// rather than salsa's. Not `window/logMessage`: this fires on every
+    /// hover, completion, signature-help, goto-definition and diagnostics
+    /// publish, and pushing that to the client's log pane on every keystroke
+    /// would be exactly the noise `window/logMessage` is reserved against
+    /// elsewhere in this file (manifest problems, malformed messages) — an
+    /// in-process trace is the honest scope for "did this specific call hit
+    /// or rebuild", the same scope `take_execution_log` keeps its answer to.
+    #[cfg(test)]
+    fn take_merged_ambient_trace(&self) -> Vec<String> {
+        std::mem::take(&mut self.merged_ambient_trace.borrow_mut())
     }
 
     /// The callee's resolved signature(s) while `position` sits inside a
     /// call's argument list (see [`crate::signature_help`]).
     fn signature_help(&self, uri: &Uri, position: lsp_types::Position) -> Option<SignatureHelp> {
-        let (_snapshot, sema, offset) = self.at(uri, position)?;
-        signature_help::signature_help(&sema, offset)
+        let (snapshot, sema, offset) = self.at(uri, position)?;
+        let exports = self.require_exports(&snapshot, &sema.path);
+        let ambient = self.merged_ambient(&snapshot);
+        signature_help::signature_help(&sema, offset, &exports, &ambient)
     }
 
     /// The call-hierarchy item for the function the cursor names at `position`
@@ -1584,8 +1649,18 @@ impl Server {
     }
 
     fn definition(&self, uri: &Uri, position: lsp_types::Position) -> Option<Location> {
-        let (_snapshot, sema, offset) = self.at(uri, position)?;
-        goto_definition::definition(&sema, offset, &self.root, self.dialect)
+        let (snapshot, sema, offset) = self.at(uri, position)?;
+        let exports = self.require_exports(&snapshot, &sema.path);
+        let ambient = self.merged_ambient(&snapshot);
+        goto_definition::definition(
+            &sema,
+            offset,
+            &self.root,
+            self.dialect,
+            &snapshot,
+            &exports,
+            &ambient,
+        )
     }
 
     /// The declaration of the type carried by the value at `position`: its
@@ -2166,7 +2241,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use lsp_server::{Connection, Message, Notification, Request, RequestId};
-    use lsp_types::notification::{DidOpenTextDocument, Notification as _};
+    use lsp_types::notification::{DidChangeTextDocument, DidOpenTextDocument, Notification as _};
     use lsp_types::request::{HoverRequest, Request as _};
     use lsp_types::{Position, Range, TextDocumentContentChangeEvent};
     use luabox_lint::LintConfig;
@@ -2561,6 +2636,162 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let manifest = manifest_of(&format!("{MANIFEST_HEAD}\n[types]\ndefs = [\"absent\"]\n"));
         assert!(ambient_def_sources(dir.path(), &manifest).is_empty());
+    }
+
+    // === Merged ambient cache (#57–#60) ====================================
+    //
+    // What the cache measurably delivers (#57, correcting the prior comment's
+    // false "diagnostics on each keystroke" claim): the SAME revision's
+    // second read reuses the merge — read here through the trace
+    // (#58/#60's observability), not by inference from timing or a deleted
+    // cache still passing the suite green.
+
+    /// Open one document and hover it twice with no edit in between: the
+    /// `didOpen` publish is the first read at this revision (a rebuild), the
+    /// hover right after is the second (a hit) — the cross-surface reuse
+    /// the cache actually delivers.
+    #[test]
+    fn a_second_read_at_the_same_revision_hits_the_cache() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("main.lua");
+        let source = "local x = 1\nprint(x)\n";
+        fs::write(&path, source).expect("write the document");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": uri.to_string(),
+                        "languageId": "lua",
+                        "version": 1,
+                        "text": source,
+                    },
+                }),
+            })
+            .expect("didOpen");
+        drop(drain(&client));
+
+        server.hover(&uri, lsp_types::Position::new(1, 6));
+
+        let trace = server.take_merged_ambient_trace();
+        assert!(trace.iter().any(|e| e.starts_with("rebuilt@")), "{trace:?}");
+        assert!(trace.iter().any(|e| e.starts_with("hit@")), "{trace:?}");
+    }
+
+    /// A keystroke bumps the revision (`host.rs`) immediately before
+    /// `publish_lua` reads this cache, so the very next read is a guaranteed
+    /// miss — measured, not assumed: two edits in a row rebuild twice, never
+    /// hit.
+    #[test]
+    fn a_keystroke_always_rebuilds_never_hits() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("main.lua");
+        fs::write(&path, "local x = 1\n").expect("write the document");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": uri.to_string(),
+                        "languageId": "lua",
+                        "version": 1,
+                        "text": "local x = 1\n",
+                    },
+                }),
+            })
+            .expect("didOpen");
+        drop(drain(&client));
+        drop(server.take_merged_ambient_trace());
+
+        for version in 2..=3 {
+            server
+                .handle_notification(Notification {
+                    method: DidChangeTextDocument::METHOD.to_string(),
+                    params: json!({
+                        "textDocument": { "uri": uri.to_string(), "version": version },
+                        "contentChanges": [{ "text": "local x = 2\n" }],
+                    }),
+                })
+                .expect("didChange");
+            drop(drain(&client));
+        }
+
+        let trace = server.take_merged_ambient_trace();
+        assert_eq!(
+            trace.iter().filter(|e| e.starts_with("hit@")).count(),
+            0,
+            "{trace:?}"
+        );
+        assert_eq!(
+            trace.iter().filter(|e| e.starts_with("rebuilt@")).count(),
+            2,
+            "{trace:?}"
+        );
+    }
+
+    /// #59: a reload that changes only `[types] defs` (no strictness change)
+    /// still invalidates the merged-ambient cache, because the manual clear
+    /// in `reload_config` does not depend on the host's revision moving —
+    /// and, per the guard added there, the revision genuinely does not move
+    /// in this scenario (`SetStrictness` is skipped when the value is
+    /// unchanged), so this is the manual clear's effect in isolation, not
+    /// the revision key's.
+    #[test]
+    fn a_defs_only_reload_invalidates_the_cache_without_bumping_the_revision() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        fs::write(root.join("luabox.toml"), MANIFEST_HEAD).expect("write manifest");
+        let path = root.join("main.lua");
+        let source = "---@type Widget\nlocal w = nil\nprint(w.gadget)\n";
+        fs::write(&path, source).expect("write the document");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": uri.to_string(),
+                        "languageId": "lua",
+                        "version": 1,
+                        "text": source,
+                    },
+                }),
+            })
+            .expect("didOpen");
+        drop(drain(&client));
+        let before = server.host.snapshot().revision();
+
+        // Add a `[types] defs` entry declaring `Widget` and reload — no
+        // strictness change. Def files resolve under `<root>/defs/<name>.d.lua`
+        // (`layout::resolve_project_defs`), so `defs = ["widget"]`.
+        fs::create_dir_all(root.join("defs")).expect("defs dir");
+        fs::write(
+            root.join("defs/widget.d.lua"),
+            "---@meta\n---@class Widget\n---@field gadget number\n",
+        )
+        .expect("write defs");
+        fs::write(
+            root.join("luabox.toml"),
+            format!("{MANIFEST_HEAD}\n[types]\ndefs = [\"widget\"]\n"),
+        )
+        .expect("rewrite manifest");
+        server.reload_config().expect("reload");
+        drop(drain(&client));
+
+        let after = server.host.snapshot().revision();
+        assert_eq!(
+            before, after,
+            "strictness did not change, so neither should the revision"
+        );
+
+        let hover = server.hover(&uri, lsp_types::Position::new(2, 10));
+        let text = match hover.expect("hover").contents {
+            lsp_types::HoverContents::Markup(markup) => markup.value,
+            other => panic!("expected markup hover contents, got {other:?}"),
+        };
+        assert!(text.contains("Widget.gadget"), "{text}");
     }
 
     // === Malformed messages ===============================================

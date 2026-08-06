@@ -99,6 +99,7 @@ mod goto_type_definition;
 mod hover;
 mod inlay_hints;
 mod line_index;
+mod merged_ambient;
 mod references;
 mod rename;
 mod requires;

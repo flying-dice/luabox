@@ -4,13 +4,14 @@
 //! `See: x` line, or a `See:` header with `  * x` bullets when several).
 
 use lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind};
+use luabox_db::Analysis;
 use luabox_hir::{BindingKind, Resolution};
 use luabox_syntax::lua::SyntaxKind;
 use luabox_syntax::lua::ast::{self, AstNode};
-use luabox_types::Ambient;
 use luabox_types::ty::Ty;
 use rowan::TextRange;
 
+use crate::merged_ambient::MergedAmbient;
 use crate::requires::{self, RequireExports};
 use crate::sema::{self, FileSema};
 
@@ -21,13 +22,19 @@ use crate::sema::{self, FileSema};
 /// the type the problems pane already agrees it has (#54). `ambient` is the
 /// merged workspace environment the same pass enforces (#56), so a
 /// class-typed value's members hover with the types `luabox check` gives
-/// them, wherever the class is declared.
+/// them, wherever the class is declared — including when the receiver's own
+/// class is declared in *this* file but inherits from one declared
+/// elsewhere, which the file-local-only lookup this replaced could not see
+/// (#46). `analysis` backs the cross-file `---@field` description lookup
+/// ([`sema::locate_field`], #51) — the merged ambient's shape carries a
+/// field's type but not its doc text.
 #[must_use]
 pub fn hover(
     sema: &FileSema,
     offset: usize,
     exports: &RequireExports,
-    ambient: &Ambient,
+    ambient: &MergedAmbient,
+    analysis: &Analysis,
 ) -> Option<Hover> {
     let token = sema.ident_at(offset)?;
     let token_range = token.text_range();
@@ -42,7 +49,7 @@ pub fn hover(
     }
 
     // 2. A field / method access on a receiver with a known class type.
-    if let Some(hover) = member_hover(sema, &token, exports, ambient) {
+    if let Some(hover) = member_hover(sema, &token, exports, ambient, analysis) {
         return Some(hover);
     }
 
@@ -90,14 +97,16 @@ pub fn hover(
 }
 
 /// Hover for `recv.field` / `recv:method` when `recv`'s class is known —
-/// declared in this file or resolved through the workspace ambient (#56) —
-/// when `recv` is a `require` binding whose module exports the member, with
-/// a fallback to dotted function names (`M.helper`).
+/// resolved through the workspace ambient (#56), which already includes
+/// every class this file itself declares — when `recv` is a `require`
+/// binding whose module exports the member (#54), with a fallback to
+/// dotted function names (`M.helper`).
 fn member_hover(
     sema: &FileSema,
     token: &luabox_syntax::lua::SyntaxToken,
     exports: &RequireExports,
-    ambient: &Ambient,
+    ambient: &MergedAmbient,
+    analysis: &Analysis,
 ) -> Option<Hover> {
     let parent = token.parent()?;
     let (receiver, member) = match parent.kind() {
@@ -125,57 +134,54 @@ fn member_hover(
     let recv_token = recv_name.name()?;
     let offset = usize::from(recv_token.text_range().start());
 
-    if let Some(class) = sema.class_of_name(recv_token.text(), offset) {
-        let (field, declaring) = sema
-            .class_fields(&class)
-            .into_iter()
-            .find(|(f, _)| {
-                matches!(&f.key, luabox_syntax::luacats::FieldKey::Name(n) if n == member.text())
-            })?;
-        let q = if field.optional { "?" } else { "" };
-        let code = format!(
-            "(field) {declaring}.{}{q}: {}",
-            member.text(),
-            sema::render_type(&field.ty)
-        );
-        let docs = field.desc.clone().unwrap_or_default();
-        return Some(reply(&code, &docs, &[], member.text_range(), sema));
-    }
-
-    // A member of a `require` binding: the field comes out of the module's
-    // export type, which is the same type the problems pane checks the
-    // access against (#54). Qualified by the *module* rather than the local
-    // name, so the hover names what it came from.
-    if let Some(binding) = sema.visible_binding_named(recv_token.text(), offset)
-        && let Some(module) = requires::require_module_of(sema, binding)
-        && let Some(fields) = exports.get(module).and_then(requires::export_fields)
-        && let Some(field) = fields.get(member.text())
-    {
-        let q = if field.optional { "?" } else { "" };
-        let code = format!("(field) {module}.{}{q}: {}", member.text(), field.ty);
-        return Some(reply(&code, "", &[], member.text_range(), sema));
-    }
-
-    // The receiver's class resolved through the workspace ambient (#56):
-    // its annotated type names a class some other file declares, or it is a
-    // `require` binding whose module exports a class — both `---@class`
-    // spellings cross the boundary as [`Ty::Named`] now. Members come out
-    // of the same merged surface the checker resolves against, qualified by
-    // the class name.
     if let Some(binding) = sema.visible_binding_named(recv_token.text(), offset) {
-        let named = sema.annotated_named_type(binding).or_else(|| {
-            requires::require_module_of(sema, binding)
-                .and_then(|module| exports.get(module))
-                .and_then(requires::export_class)
-                .map(ToString::to_string)
-        });
-        if let Some(class) = named
-            && let Some(shape) = ambient.class_members(&class)
-            && let Some(field) = shape.fields.get(member.text())
+        // A member of a `require` binding via its module's structural
+        // export: the field comes out of the module's export type, which
+        // is the same type the problems pane checks the access against
+        // (#54). Qualified by the *module* rather than the local name, so
+        // the hover names what it came from.
+        if let Some(module) = requires::require_module_of(sema, binding)
+            && let Some(fields) = exports.get(module).and_then(requires::export_fields)
+            && let Some(field) = fields.get(member.text())
         {
             let q = if field.optional { "?" } else { "" };
-            let code = format!("(field) {class}.{}{q}: {}", member.text(), field.ty);
+            let code = format!("(field) {module}.{}{q}: {}", member.text(), field.ty);
             return Some(reply(&code, "", &[], member.text_range(), sema));
+        }
+
+        // The receiver's class reference, resolved through the workspace
+        // ambient (#56): its annotated type names a class — declared in
+        // this file or any other, the merged ambient already includes both
+        // (#46) — or it is a `require` binding whose module exports a class
+        // (both `---@class` spellings cross the boundary as [`Ty::Named`]).
+        // Members come out of the same merged surface the checker resolves
+        // against, monomorphised against the reference's own type
+        // arguments exactly as the checker monomorphises the same
+        // reference at its use site (#48): `Box<number>`'s `item` hovers
+        // `number`, not the free `T` a bare-name lookup would leave it as.
+        if let Some(ty) = requires::receiver_type(sema, exports, binding)
+            && let Some(class) = sema::named_of(&ty)
+            && let Some(shape) = ambient.class_members_of(&ty)
+        {
+            if let Some(field) = shape.fields.get(member.text()) {
+                let q = if field.optional { "?" } else { "" };
+                let code = format!("(field) {class}.{}{q}: {}", member.text(), field.ty);
+                let docs = sema::locate_field(analysis, &class, member.text())
+                    .and_then(|found| found.desc)
+                    .unwrap_or_default();
+                return Some(reply(&code, &docs, &[], member.text_range(), sema));
+            }
+            // A dynamic-access class (#53): an indexer or array part makes
+            // any member access lenient to the checker (`infer.rs`'s
+            // `provable = false` — a declared indexer/array admits any
+            // string key), so hover agrees rather than showing nothing for
+            // a member `luabox check` accepts. No specific type is
+            // promised — the checker itself does not type the access
+            // beyond leniency.
+            if !shape.indexers.is_empty() || shape.array.is_some() {
+                let code = format!("(field) {class}.{}: unknown", member.text());
+                return Some(reply(&code, "", &[], member.text_range(), sema));
+            }
         }
     }
 
@@ -309,10 +315,16 @@ mod tests {
         let sema = FileSema::new(&analysis, &path).expect("sema");
         let exports = RequireExports::resolve(&analysis, &path, rocks);
         // The merged workspace layer, exactly as the server builds it (#56).
-        let ambient = luabox_types::stdlib_defs(luabox_syntax::lua::Dialect::Lua54)
-            .with_project_types(&analysis.project_types())
-            .with_rock_types(rocks.types());
-        hover(&sema, offset_of(src, needle, nth), &exports, &ambient).map(|h| match h.contents {
+        let base = luabox_types::stdlib_defs(luabox_syntax::lua::Dialect::Lua54);
+        let ambient = MergedAmbient::build(base, &analysis.project_types(), rocks.types());
+        hover(
+            &sema,
+            offset_of(src, needle, nth),
+            &exports,
+            &ambient,
+            &analysis,
+        )
+        .map(|h| match h.contents {
             HoverContents::Markup(markup) => markup.value,
             other => panic!("expected markup hover contents, got {other:?}"),
         })
@@ -551,9 +563,16 @@ print(p.z)
         let (analysis, path) = analyze(src);
         let sema = FileSema::new(&analysis, &path).expect("sema");
         let exports = RequireExports::resolve(&analysis, &path, &RockSurfaces::default());
-        let ambient = luabox_types::stdlib_defs(luabox_syntax::lua::Dialect::Lua54)
-            .with_project_types(&analysis.project_types());
-        let hovered = hover(&sema, offset_of(src, "answer", 1), &exports, &ambient).expect("hover");
+        let base = luabox_types::stdlib_defs(luabox_syntax::lua::Dialect::Lua54);
+        let ambient = MergedAmbient::build(base, &analysis.project_types(), &[]);
+        let hovered = hover(
+            &sema,
+            offset_of(src, "answer", 1),
+            &exports,
+            &ambient,
+            &analysis,
+        )
+        .expect("hover");
         let range = hovered.range.expect("range");
         assert_eq!(range.start, lsp_types::Position::new(1, 6));
         assert_eq!(range.end, lsp_types::Position::new(1, 12));
@@ -745,6 +764,127 @@ print(p.z)
         let member = at_files(&files, "x)", 0).expect("member hover");
         assert!(member.contains("Point.x"), "{member}");
         assert!(member.contains("number"), "{member}");
+    }
+
+    // === the ambient arm reaches a file-local receiver class too (#46) ====
+    //
+    // The defect: when the receiver's own class was declared in *this*
+    // file, `class_of_name` succeeded and the old file-local branch's `?`
+    // returned from the whole function on a miss — so an inherited member
+    // whose parent lives in another file was never reachable, even though
+    // the merged ambient (which already includes this file's own classes)
+    // resolves it. Measured before the fix: `s.id` hovered `None`.
+
+    #[test]
+    fn a_member_inherited_from_a_parent_declared_in_another_file_hovers() {
+        let files = [
+            (
+                "main.lua",
+                "---@class Sub : Base\n---@field name string\n\n---@type Sub\nlocal s = nil\nprint(s.id)\n",
+            ),
+            ("other.lua", "---@class Base\n---@field id number\n"),
+        ];
+        let text = at_files(&files, "id)", 0).expect("hover");
+        assert!(text.contains("Sub.id"), "{text}");
+        assert!(text.contains("number"), "{text}");
+    }
+
+    /// Probing the other direction: a member neither `Sub` nor `Base`
+    /// declares must still have no hover, even once the ambient arm is
+    /// reachable for a file-local receiver.
+    #[test]
+    fn a_member_neither_the_class_nor_its_cross_file_parent_declares_has_no_hover() {
+        let files = [
+            (
+                "main.lua",
+                "---@class Sub : Base\n---@field name string\n\n---@type Sub\nlocal s = nil\nprint(s.nope)\n",
+            ),
+            ("other.lua", "---@class Base\n---@field id number\n"),
+        ];
+        assert_eq!(at_files(&files, "nope", 0), None);
+    }
+
+    // === the ambient arm's field description (#51) ========================
+
+    #[test]
+    fn an_ambient_members_field_description_survives_crossing_require() {
+        let files = [
+            ("main.lua", "local p = require(\"point\")\nprint(p.x)\n"),
+            (
+                "point.lua",
+                "---@class Point\n---@field x number the x coordinate\nlocal P = {}\nreturn P\n",
+            ),
+        ];
+        let text = at_files(&files, "x)", 0).expect("hover");
+        assert!(text.contains("the x coordinate"), "{text}");
+    }
+
+    // === a bound generic reference resolves its type argument (#48) =======
+    //
+    // `---@type Box<number>` monomorphises at the reference site — the
+    // checker's `lower.rs` does this for every use. The ambient arm used to
+    // extract just the bare name (`sema::named_of` dropped `args`) and ask
+    // for `Box`'s unbound shape, so `item` stayed the free `T`.
+
+    #[test]
+    fn a_bound_generic_carriers_member_resolves_the_bound_argument() {
+        let files = [
+            (
+                "main.lua",
+                "---@type Box<number>\nlocal b = nil\nprint(b.item)\n",
+            ),
+            ("box.lua", "---@class Box<T>\n---@field item T\n"),
+        ];
+        let text = at_files(&files, "item)", 0).expect("hover");
+        assert!(text.contains("Box.item: number"), "{text}");
+        assert!(!text.contains(": T"), "{text}");
+    }
+
+    /// The one-variable control, both directions: the identical class
+    /// referenced bare stays lenient — the free `T` — exactly as it did
+    /// before #48, and exactly as `class_members_of`'s own unbound case
+    /// documents.
+    #[test]
+    fn an_unbound_generic_receiver_still_hovers_leniently() {
+        let files = [
+            ("main.lua", "---@type Box\nlocal b = nil\nprint(b.item)\n"),
+            ("box.lua", "---@class Box<T>\n---@field item T\n"),
+        ];
+        let text = at_files(&files, "item)", 0).expect("hover");
+        assert!(text.contains("Box.item: T"), "{text}");
+    }
+
+    // === a dynamic-access class agrees with the checker's leniency (#53) ==
+
+    #[test]
+    fn a_member_covered_by_a_declared_indexer_hovers_instead_of_declining() {
+        let files = [
+            (
+                "main.lua",
+                "local h = require(\"handlers\")\nprint(h.one)\n",
+            ),
+            (
+                "handlers.lua",
+                "---@class Handlers\n---@field [string] fun(): string\nlocal H = {}\nreturn H\n",
+            ),
+        ];
+        let text = at_files(&files, "one)", 0).expect("hover");
+        assert!(text.contains("Handlers.one"), "{text}");
+    }
+
+    /// Control: a class with no indexer/array part still declines an
+    /// undeclared member — the leniency is specific to a dynamic-access
+    /// class, not a general relaxation.
+    #[test]
+    fn a_member_on_a_class_with_no_indexer_still_has_no_hover() {
+        let files = [
+            ("main.lua", "local p = require(\"point\")\nprint(p.nope)\n"),
+            (
+                "point.lua",
+                "---@class Point\n---@field x number\nlocal P = {}\nreturn P\n",
+            ),
+        ];
+        assert_eq!(at_files(&files, "nope", 0), None);
     }
 
     #[test]

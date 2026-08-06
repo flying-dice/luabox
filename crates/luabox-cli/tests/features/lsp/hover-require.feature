@@ -521,3 +521,94 @@ Feature: luabox lsp — hover and completion on a `require` binding
     When I hover at 2:8 in "main.lua"
     Then the hover text contains "Circle.radius"
     And the hover text contains "number"
+
+  # --- a receiver's own class is declared here, but inherits from another
+  # file (#46) --------------------------------------------------------------
+  #
+  # #56 closed cross-file *require*; this closes cross-file *inheritance*.
+  # `s`'s class (`Sub`) is declared in the same file as the receiver, so the
+  # old file-local lookup succeeded and never fell through to the ambient —
+  # an inherited member whose parent lives elsewhere hovered null though
+  # `luabox check` resolved it through the merged project classes.
+
+  Scenario: a member inherited from a parent declared in another file hovers
+    Given a file "base.lua" containing:
+      """
+      ---@class Base
+      ---@field id number
+      """
+    And a file "main.lua" containing:
+      """
+      ---@class Sub : Base
+      ---@field name string
+
+      ---@type Sub
+      local s = nil
+      print(s.id)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I hover at 5:8 in "main.lua"
+    Then the hover text contains "Sub.id"
+    And the hover text contains "number"
+
+  Scenario: a member neither the class nor its cross-file parent declares still has no hover
+    Given a file "base.lua" containing:
+      """
+      ---@class Base
+      ---@field id number
+      """
+    And a file "main.lua" containing:
+      """
+      ---@class Sub : Base
+      ---@field name string
+
+      ---@type Sub
+      local s = nil
+      print(s.nope)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I hover at 5:8 in "main.lua"
+    Then the reply is null
+
+  # --- a bound generic reference resolves its type argument (#48) ----------
+  #
+  # `---@type Box<number>` monomorphises at the reference site — the checker
+  # binds `Box`'s `T` to `number` when it resolves `b.item`. The ambient arm
+  # used to extract just the bare name `Box` and ask for its unbound shape,
+  # so hover answered `T` where the checker answered `number`.
+
+  Scenario: a bound generic class declared in another file resolves its type argument
+    Given a file "box.lua" containing:
+      """
+      ---@class Box<T>
+      ---@field item T
+      """
+    And a file "main.lua" containing:
+      """
+      ---@type Box<number>
+      local b = nil
+      print(b.item)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I hover at 2:8 in "main.lua"
+    Then the hover text contains "Box.item: number"
+
+  Scenario: an unbound generic class still hovers its free type parameter
+    Given a file "box.lua" containing:
+      """
+      ---@class Box<T>
+      ---@field item T
+      """
+    And a file "main.lua" containing:
+      """
+      ---@type Box
+      local b = nil
+      print(b.item)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I hover at 2:8 in "main.lua"
+    Then the hover text contains "Box.item: T"
