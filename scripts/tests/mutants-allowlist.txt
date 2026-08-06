@@ -1,19 +1,25 @@
 # Reviewed surviving mutants (#58). scripts/tests/mutants-gate.sh diffs
 # the live missed set against column 1 of this file (tab-separated: the
-# exact cargo-mutants missed line, then the reviewed reason). A survivor
-# not listed here fails the job; a listed line that stops surviving is
-# reported as stale to prune.
+# cargo-mutants missed line as first seen, then the reviewed reason). A
+# survivor not listed here fails the job; a listed line that stops surviving
+# is reported as stale to prune — unless EVERY line goes stale in one run,
+# which is a scope that moved rather than an allowlist that was earned, and
+# fails.
 #
 # TIMED-OUT mutants are judged against this same file: a timeout is an
 # unkilled mutant, not a killed one, so a new one fails the job and a listed
 # line that flaps missed -> timeout stays reviewed (and is not stale).
 # The line format is identical either way, so no separate section is needed.
 #
-# LINE NUMBERS ARE EXACT, so an edit to a scoped file above a waived mutant
-# shifts it and the weekly job reads the shift as new+stale in matching
-# pairs — that pairing is the signature. The fix is to re-pin the numbers
-# here, not to re-review the mutants (first seen 2026-08-05: adding one
-# accessor to env.rs moved four lines by +11).
+# LINE NUMBERS ARE INFORMATIONAL. The gate keys the comparison on (file,
+# mutant text) and pairs live mutants against these lines as a multiset —
+# same position first, then the leftovers — so an edit above a waived mutant
+# is REPORTED as a measured shift (old and new position both printed) and a
+# mutant with no (file, text) match at all is what fails the job. Re-pin the
+# printed positions when convenient; the judgement is the gate's, not the
+# reader's. Keying on the whole line put that judgement here instead, and
+# the rule's first exercise was a mixed batch — four shifts and one
+# genuinely new mutant (2026-08-05) — which the counts alone cannot separate.
 #
 # Reason classes (reviewed 2026-08-02; run of 407 mutants over the
 # merge-seam scope: 282 caught / 39 missed -> 13 killed by new tests,

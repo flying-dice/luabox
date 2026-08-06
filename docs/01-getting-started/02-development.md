@@ -51,8 +51,15 @@ job `mutants`). Survivors diff against the committed allowlist in
 fails the job; a reviewed survivor is a justified line there. A **timed-out**
 mutant is judged the same way: no test killed it, the run just stopped
 waiting, so a new one fails the job rather than disappearing from the count.
-Its scope is the merge-seam neighbourhood, pinned in both the script default
-and the workflow; widening it to `check.rs` waits on #60.
+The comparison is keyed on (file, mutant text) with `line:col` informational,
+so an edit that *moves* a waived mutant is reported as a measured shift
+(both positions printed) rather than being left for a reader to tell apart
+from a real survivor. Its scope is the merge-seam neighbourhood, pinned in
+both the script default and the workflow; widening it to `check.rs` waits on
+#60. Three ways of auditing nothing fail rather than pass: a scoped path
+that no longer exists, a run that generated zero mutants, and an allowlist
+every line of which went stale at once — the same rule the luals gate
+applies to an unclaimed corpus case.
 
 ## Writing fixtures that can fail
 

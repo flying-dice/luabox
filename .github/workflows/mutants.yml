@@ -16,11 +16,26 @@ on:
   pull_request:
     paths:
       - "scripts/tests/mutants-gate.sh"
+      - "scripts/tests/mutants-gate-selftest.sh"
       - "scripts/tests/mutants-allowlist.txt"
       - ".github/workflows/mutants.yml"
 
 jobs:
+  # The gate on the gate. Seconds, no cargo-mutants, no build — so it runs
+  # first and on every PR that touches the gate, ahead of the two-hour job it
+  # guards. Both review rounds found the gate reporting OK for a run that
+  # proved nothing; these cases are that class of defect, staged.
+  gate-selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Self-test the mutation gate's judgement
+        run: bash scripts/tests/mutants-gate-selftest.sh
+
   mutants:
+    needs: gate-selftest
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
