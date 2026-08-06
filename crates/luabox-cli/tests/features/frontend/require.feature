@@ -396,3 +396,169 @@ Feature: luabox check — cross-file require resolution (#85)
     Then the command fails
     And stdout contains "LB0306"
     And stdout contains "undefined field `nope` on `Point`"
+
+  # Round 3 review F53(claims): the PR's own claim is "`p.nope` is LB0306, in
+  # both spellings, with or without a `require`" (docs/03-reference/
+  # 02-limitations.md:788 asserts the same for the instance row). The two
+  # existing `p.nope`/LB0306 scenarios above are both carrier-shaped (the
+  # class tag directly precedes the returned local); neither pins the
+  # *instance* spelling — a `---@type Point` annotation on a local that is
+  # NOT the class's own carrier, only later returned. Both directions are
+  # probed (round 3 review: "properties that only assert 'no diagnostic'
+  # pass under every leniency bug").
+  Scenario: an instance-typed module's declared members cross the boundary typed
+    Given a strict project with edition "5.4"
+    And a file "src/point.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+
+      ---@type Point
+      local p = { x = 0 }
+      return p
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param n number
+      local function want(n) end
+      local p = require("point")
+      want(p.x)
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And zero diagnostics are reported
+
+  Scenario: an instance-typed module's undeclared members are rejected
+    Given a strict project with edition "5.4"
+    And a file "src/point.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+
+      ---@type Point
+      local p = { x = 0 }
+      return p
+      """
+    And a file "src/main.lua" containing:
+      """
+      local p = require("point")
+      print(p.nope)
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0306"
+
+  # --- chaos gaps reachable against the export/carrier boundary, round 3
+  # review F80 -----------------------------------------------------------
+
+  Scenario: a require cycle between two class carriers is tolerated
+    # F80: the existing cycle pin (above, "a require cycle is tolerated")
+    # uses plain-table modules, so the class-graph walk `collect_class`
+    # added for parent resolution is never entered cyclically. Here each
+    # carrier names the OTHER's class as its parent, and each module
+    # requires the other — measured to terminate rather than hang or crash,
+    # via the same `seen` recursion guard `collect_class` already carries.
+    Given a strict project with edition "5.4"
+    And a file "src/a.lua" containing:
+      """
+      local B = require("b")
+      ---@class A : B
+      local M = {}
+      return M
+      """
+    And a file "src/b.lua" containing:
+      """
+      local A = require("a")
+      ---@class B : A
+      local M = {}
+      return M
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stderr contains "check: 0 errors, 0 warnings"
+
+  Scenario: a module requiring itself does not hang the checker
+    # F80: the degenerate fixpoint of the cycle above.
+    Given a strict project with edition "5.4"
+    And a file "src/self.lua" containing:
+      """
+      local M = require("self")
+      ---@class Loopy
+      ---@field one string
+      local N = {}
+      return N
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stderr contains "check: 0 errors, 0 warnings"
+
+  Scenario: a zero-member class exported as a carrier rejects every read
+    # F80: every existing carrier fixture declares at least one member.
+    # Nothing pinned whether an empty carrier's every field read is LB0306
+    # (the class-identity rule) or lenient (nothing to enforce).
+    Given a strict project with edition "5.4"
+    And a file "src/empty.lua" containing:
+      """
+      ---@class Empty
+      local M = {}
+      return M
+      """
+    And a file "src/main.lua" containing:
+      """
+      local e = require("empty")
+      print(e.anything)
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0306"
+
+  Scenario: a same-file duplicate carrier exported through require unions both halves
+    # F80: the same-file duplicate-carrier union is pinned in-file
+    # (`duplicate_class_merge.rs::a_duplicate_declaration_can_add_members_via_a_second_carrier`),
+    # but that fixture never exports — this pins the union's interaction
+    # with the export seam (#56/#59 together).
+    Given a strict project with edition "5.4"
+    And a file "src/two.lua" containing:
+      """
+      ---@class Two
+      local A = {}
+      function A:a() end
+
+      ---@class Two
+      local B = {}
+      function B:b() end
+
+      return B
+      """
+    And a file "src/main.lua" containing:
+      """
+      local t = require("two")
+      t:a()
+      t:b()
+      """
+    When I run "luabox check"
+    Then the command succeeds
+    And stderr contains "check: 0 errors, 0 warnings"
+
+  Scenario: a very long class name crosses the export boundary
+    # F80: `class_members`/`export_class` key on `&str` names with no pin
+    # outside short ASCII identifiers.
+    Given a strict project with edition "5.4"
+    And a file "src/longname.lua" containing:
+      """
+      ---@class ThisClassNameIsDeliberatelyVeryLongToExerciseAnyFixedSizeAssumptionInClassNameHandlingAcrossTheRequireBoundaryXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+      ---@field x number
+      local M = {}
+      return M
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param n number
+      local function want(n) end
+      local m = require("longname")
+      want(m.x)
+      print(m.nope)
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0306"
