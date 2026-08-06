@@ -2,6 +2,7 @@
 name = "luabox-lint"
 description = "luabox: type-informed lint rules over the shared analysis (clippy analog)"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

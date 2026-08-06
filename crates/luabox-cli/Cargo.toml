@@ -2,6 +2,7 @@
 name = "luabox-cli"
 description = "luabox: the unified Lua toolchain CLI (Frontend context)"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

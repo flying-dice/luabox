@@ -8,6 +8,18 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ## [Unreleased]
 
+**Breaking: `luabox check` rejects Lua it previously accepted.** The #56
+export-seam change below is a narrowing, not a superset — a clean project
+today can fail in CI after upgrading, with no code change of its own. Read
+the #56 entry in full before upgrading a project you run in CI; the
+"opt-out and migration" note under it is the fastest path to green if you
+hit a new failure.
+
+This block rides **0.2.0**, itself a breaking minor under the
+[0.x policy](docs/02-guides/01-releasing.md#semver-policy-for-0x) for the v1
+scope cut, so no further bump is forced — but it may not ship as a patch,
+and that rule is now written into the policy rather than left to judgement.
+
 ### Changed
 
 - **A `---@class` module export crosses `require` as the class, in both
@@ -33,9 +45,21 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   Not a unilateral tightening: lua-language-server reports `undefined-field`
   on the same read, and both verdicts are now corpus rows of the #57 parity
   gate (`dynamic_key_carrier_require`, `dynamic_key_carrier_indexer`).
+
+  **A second runtime-working shape narrows the same way, and is not covered
+  by the computed-key fix above**: a carrier that borrows its members
+  through an undeclared `__index` — `local T = setmetatable({}, { __index =
+  Proto })` where `Proto` is a plain table nothing declares — reads
+  `t.hello` through a `require` as `LB0306` now too, for the identical
+  reason: nothing declares `hello`. lua-language-server agrees here as well
+  (`undefined-field`, corpus row `metatable_index_carrier_require`).
+  Declare the member on the class, or make `Proto` a class the carrier
+  names as a parent (`---@class Thing : Proto`).
+
   Statically visible attachments — dotted functions, colon methods, data
   fields, table-literal carriers, members assigned from a `require` — are
-  measured unaffected.
+  measured unaffected. The two shapes above (computed key, undeclared
+  `__index`) are the ones that are not.
 
   **One class shape is excepted**, and the exception is the mechanism's
   price rather than an oversight: a carrier whose members still mention an
@@ -46,9 +70,37 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   the consumer names a variable it cannot produce. A template is structural,
   so it enforces no member list: `b.nope` on a generic carrier stays clean
   where the same read on a plain class is `LB0306`. Both directions are
-  pinned as fixtures, and `---@type Box<number>` on the binding restores
-  typed members. See
+  pinned as fixtures, and `---@type Box<number>` on the binding types its
+  *declared* members correctly — it does not add enforcement: an
+  *undeclared* member on a bound generic reference is still `LB0300 "found
+  unknown"`, never `LB0306`, for the same reason. See
   [limitations](docs/03-reference/02-limitations.md#a-class-module-export-closed-in-both-spellings-54--56).
+
+  **The narrowing also reaches vendored luarocks surfaces.** A rock's own
+  harvested types go through this same export reification, so `luabox
+  check` can newly emit `LB0306` in *your* file because an upstream rock
+  exports a dynamic-key `---@class` carrier — a shape you did not write and
+  cannot edit in place. The fix is still available, just indirect: declare
+  the rock's class yourself, indexer included, in a `[types] defs` package
+  (`[types] defs = ["defs"]`, a `defs/<rock>.lua` file); your project's own
+  declaration of a name wins outright over a rock's, not merged with it (see
+  [Using dependencies](README.md#using-dependencies) in README).
+
+  **No per-diagnostic opt-out exists for `LB0306`, and none was added.**
+  `[lint]` has per-rule `allow`/`warn`/`deny`; the checker's own `LB03xx`
+  family has no equivalent severity control in `luabox.toml`. Two blunter
+  hatches exist today and are not new: `---@diagnostic disable:
+  undefined-field` (per line or per file) suppresses this one code exactly;
+  `[types] strict = false` downgrades every type diagnostic — not `LB0306`
+  alone — from error to warning project-wide, and `check`'s exit code is
+  nonzero only on an error, so this is CI-green again but blunter than the
+  one code you meant to waive: it silences every other type mismatch along
+  with it. There is no staged, per-module migration between the two
+  hatches — a project with many affected carrier modules fixes every call
+  site in one pass or takes the whole-project downgrade. There is also no
+  flag that recovers the *old* verdicts while keeping strict mode on: the
+  only way to keep this PR's behavior from reaching your CI is not
+  upgrading past it — pin the `luabox` binary version.
 
 ### Added
 
@@ -95,6 +147,21 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   not break on the happy path (refs #53).
 
 ### Fixed
+
+- **Inlay hints and hover no longer lose a require'd carrier's member types.**
+  Introduced and fixed inside this same block: when the export seam started
+  reifying against the merged project ambient, the *display*-mode queries
+  (`module_export`, `binding_types`) were left reading the defs-only ambient,
+  so a binding whose class is declared in another file silently rendered
+  `unknown` in the editor while `luabox check` typed it correctly — the exact
+  editor/CI divergence #56 exists to close. Both queries now merge project
+  types, pinned by a cross-file fixture.
+
+- **A member covered only by a declared indexer now hovers.** `---@field
+  [string] fun(): string` on a class made `h.anything` legal to the checker
+  but gave the editor nothing to show; hover now falls back to the member's
+  erased type instead of declining, matching the leniency rule the checker
+  already applied.
 
 - **A generic `---@class` carrier no longer exports its unbound type
   parameter.** `---@class Box<T>` crossing a `require` handed the consumer
@@ -169,13 +236,19 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 - **The `---@class` module-export edge is written out where the other
   editor/CI edges are.** The disclosure lived only in `README.md`, and it was
   inaccurate: it described a class *carrier* module as hovering "as the class
-  name" with CI "still checking" its members. Measured, the carrier spelling
-  hovers as the structural table the carrier is, and CI does not enforce it
-  either — `p.x` crosses the boundary as `unknown` and `p.nope` is accepted.
-  The class *instance* spelling is the one where the editor is narrower than
-  CI. Both rows are now in `docs/03-reference/02-limitations.md` as a measured
-  table, pinned by fixtures on both sides, and the `requires.rs` doc comment
-  that made the same claim is corrected to match (refs #54).
+  name" with CI "still checking" its members. Measured at the time, the
+  carrier spelling hovered as the structural table the carrier is, and CI did
+  not enforce it either — `p.x` crossed the boundary as `unknown` and `p.nope`
+  was accepted. The class *instance* spelling was the one where the editor was
+  narrower than CI. Both rows are now in `docs/03-reference/02-limitations.md`
+  as a measured table, pinned by fixtures on both sides, and the `requires.rs`
+  doc comment that made the same claim is corrected to match (refs #54).
+
+  **Superseded within this same Unreleased block**: the #56 entry above closes
+  that edge — a carrier export now crosses as the class and CI does enforce
+  its members, so the measurement recorded here describes the behaviour this
+  release changes, not the behaviour it ships. The limitations table it points
+  at has been flipped to match.
 
 - **Hover and completion on a `require` binding now use the type pass's
   answer.** `local m = require("mod")` hovered `unknown` while `luabox check`

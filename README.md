@@ -297,7 +297,10 @@ it carries, and hover and completion resolve the class's members through
 the same merged ambient environment `luabox check` enforces — so a carrier
 or instance export hovers as the class name, its members hover with their
 declared types, completion offers them, and CI rejects what neither
-declares. The measured rows are in
+declares. One shape is excepted, in the editor and in CI alike: a **generic**
+class (`---@class Box<T>`) has no name that carries its type arguments, so it
+crosses as a structural template — its declared members type correctly, but
+an undeclared one is accepted rather than rejected. The measured rows are in
 [Known limitations](docs/03-reference/02-limitations.md). Naming the class
 directly (`---@param p Point`) is equivalent — class names are
 workspace-global, so the `require` is not what carries the type.

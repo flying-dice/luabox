@@ -785,9 +785,13 @@ Given `---@class Point` / `---@field x number` in `point.lua` and
 | module spells its export as | binding hovers as | `p.x` hover | `p.` completion | `luabox check` |
 | --- | --- | --- | --- | --- |
 | a class **instance** — `---@type Point` on the returned local | `local p: Point` | `Point.x: number` | offers `x` | enforces: `p.x` is `number`, `p.nope` is `LB0306` |
-| a class **carrier** — `---@class Point` over `local P = {}` | `local p: Point` | `Point.x: number` | offers `x` | enforces: `p.x` is `number`, `p.nope` is `LB0306` — **except** for a class with an unbound type parameter (below) |
+| a class **carrier** — `---@class Point` over `local P = {}` | `local p: Point` | `Point.x: number` | offers `x` | enforces: `p.x` is `number`, `p.nope` is `LB0306` |
+| a **generic** carrier — `---@class Box<T>` over `local B = {}` | the structural table, not the name `Box` | the member's erased type, not `Box.item` | offers `item` | **lenient**: `b.nope` is accepted (below) |
 
-The two spellings are symmetric now, and naming the class directly
+The first two rows are symmetric now; the third is the exception, and it is
+an exception in three of the four columns rather than only in the checker's
+— the export crosses as the monomorphised template, and a template has no
+class name for the editor to render either. Naming the class directly
 (`---@param p Point`, `---@type Point`) is equivalent rather than a
 workaround — class names are workspace-global, so the editor resolves a
 class's members with no `require` in sight, exactly as the checker always
@@ -876,9 +880,24 @@ What stays unbound is a generic parent named **without** arguments
 fall under the rule above and the export crosses as the template. Both
 directions are fixtures (`a_parent_type_argument_binds_the_inherited_member`
 and `a_parent_written_bare_leaves_its_parameter_unbound_and_erased`).
-Separately, a **reference site**'s monomorphisation stays shallow by design
-(#84): `Cell<number>` substitutes `Cell`'s own `---@field` bodies, not the
-ones it inherits.
+A **reference site**'s monomorphisation reaches inherited members too, as of
+this change: `---@type Leaf` over `---@class Slot<S>` / `---@class Mid<M> :
+Slot<M>` / `---@class Leaf : Mid<number>` types `Leaf.slot` as `number`,
+where it previously read `unknown`. The template a reference instantiates is
+now the class's merged shape rather than its own `---@field` bodies alone,
+so a direct generic reference and a plain one agree.
+
+**What a generic reference still does not carry is the class identity.**
+`Ty::Named` has no room for type arguments, so `---@type Box<number>` lowers
+to the monomorphised *table* — its declared members are typed correctly, but
+an **undeclared** member on it is lenient (`LB0300`, `found unknown`) rather
+than `LB0306`. It is the same exception the export seam has, reached by a
+different route, and it applies to every generic reference rather than only
+to a carrier crossing `require`. Pinned as
+`undeclared_members_on_a_generic_reference_stay_lenient_lb0300_not_lb0306`.
+Closing it means growing `Ty::Named` an argument list — a type-representation
+change touching 125 construction and match sites across 18 files — which is
+deliberately not in this change's scope.
 
 ### `build --mode love` requires an external zip tool
 
