@@ -17,15 +17,19 @@
 # instead: a stub `cargo-mutants` on PATH writes the mutants.out/*.txt files
 # each case needs and exits with the code the real tool would. What is under
 # test is the gate's judgement, which is what reviews keep finding wrong.
-# cargo-mutants itself is out of scope here — but is NOT "pinned", whatever
-# an earlier version of this comment claimed: mutants.yml installs it as
-# `tool: cargo-mutants` with no `@x.y.z`, so install-action resolves whatever
-# the latest release is at run time. The allowlist keys on cargo-mutants'
-# verbatim wording (mutants-allowlist.txt's column 1), so an upstream rename
-# of a mutation ("replace > with >=" becoming something else) would turn
-# every waived line stale and every live mutant new in the same run — a real
-# gap, with no fixture here or anywhere else that can exercise it without
-# actually swapping the installed binary.
+# cargo-mutants itself is out of scope here — and IS pinned, contrary to what
+# an earlier revision of this comment claimed in the OTHER direction:
+# .github/workflows/mutants.yml installs it as `tool: cargo-mutants@27.1.0`
+# (checked at this head; re-grep `tool: cargo-mutants@` there before trusting
+# this sentence again, since nothing here re-derives it). Pinning removes the
+# "changes under CI on its own schedule" version of the risk, but not the
+# "someone bumps the pin" version: the allowlist keys on cargo-mutants'
+# verbatim wording (mutants-allowlist.txt's column 1), so a future version
+# bump that renames a mutation ("replace > with >=" becoming something else)
+# would turn every waived line stale and every live mutant new in the same
+# run — a real gap, on a much narrower trigger than "any time", with no
+# fixture here or anywhere else that can exercise it without actually
+# swapping the installed binary.
 #
 # Every case asserts an exit code AND at least one discriminating string that
 # only the code path under test can produce — several also assert a string
@@ -100,17 +104,23 @@ fail=0
 # A needle prefixed with `!` must be ABSENT from the log rather than present
 # — a second, unrelated failure path can supply the same "expected" string a
 # deleted line was supposed to produce, and a needle can only prove presence.
-# FILES_OVERRIDE / ALLOWLIST_OVERRIDE (set by the caller as temporary
-# variable assignments on the `run` call itself) substitute for the fixture
-# scope/allowlist without hand-rolling a second invocation of the gate.
+# FILES_OVERRIDE / ALLOWLIST_OVERRIDE / SCOPE_OF_RECORD_OVERRIDE (set by the
+# caller as temporary variable assignments on the `run` call itself)
+# substitute for the fixture scope/allowlist/scope-of-record without
+# hand-rolling a second invocation of the gate. SCOPE_OF_RECORD defaults to
+# $scope (the same single file FILES defaults to), matching the gate's own
+# "SCOPE_OF_RECORD defaults to the same list FILES defaults to" — so every
+# case below that does not name the R19 guard gets FILES == SCOPE_OF_RECORD
+# and never trips it by accident.
 run() {
     local name="$1" want_exit="$2" outcomes="$3" stub_exit="$4"
     shift 4
     local log="$work/$name.log"
     local files="${FILES_OVERRIDE:-$scope}"
     local list="${ALLOWLIST_OVERRIDE:-$allowlist}"
+    local record="${SCOPE_OF_RECORD_OVERRIDE:-$scope}"
     STUB_OUTCOMES="$outcomes" STUB_EXIT="$stub_exit" \
-        FILES="$files" ALLOWLIST="$list" MUTANTS_OUT="$work/out-$name" \
+        FILES="$files" ALLOWLIST="$list" SCOPE_OF_RECORD="$record" MUTANTS_OUT="$work/out-$name" \
         bash "$gate" >"$log" 2>&1
     local got=$?
     local ok=1
@@ -273,6 +283,32 @@ run f1_caught_proof_beats_shared_key 1 "$proven_kill" 3 \
     "new surviving mutant" "315:19" "1 new" "0 shifted" "1 stale" \
     "!was: crates/luabox-types/src/env.rs:298:30"
 
+# R18 (#58 review round 4): F1's proof above only fires when the killed
+# mutant did NOT move — it matches the waived line's FULL TEXT, position
+# included, against caught.txt verbatim. An edit can shift a waived mutant's
+# line AND kill it in the same run: the kill then shows up in caught.txt at
+# the mutant's NEW position (915:19) while the allowlist still names the
+# old one (298:30), so the old full-line check never finds it, the waived
+# line falls through to Pass 2, and Pass 2 pairs it — by position rank, the
+# only evidence it has — against whatever else shares its key. Reproduced
+# here: a genuinely new, never-reviewed survivor (305:11) shares the same
+# key, and the old code paired 298:30 with IT instead ("0 new, 1 shifted,
+# OK, exit 0" — the exact shape the review reproduced), silently dropping
+# the real survivor and misreporting the true kill as merely a pending
+# re-pin. The fix must retire 298:30 as STALE on caught.txt's key-level
+# evidence (proven killed, wherever it now sits) and report 305:11 as NEW.
+killed_and_shifted="$work/killed-and-shifted.txt"
+cat >"$killed_and_shifted" <<'OUT'
+missed:crates/luabox-types/src/env.rs:301:27: replace > with >= in TypeEnv::build_from_items
+missed:crates/luabox-types/src/env.rs:1333:9: replace TypeEnv::is_class -> bool with true
+caught:crates/luabox-types/src/env.rs:915:19: replace > with >= in TypeEnv::build_from_items
+missed:crates/luabox-types/src/env.rs:305:11: replace > with >= in TypeEnv::build_from_items
+OUT
+run r18_killed_and_shifted_beats_shared_key 1 "$killed_and_shifted" 3 \
+    "new surviving mutant" "305:11" "1 new" "0 shifted" "1 stale" "prune it" \
+    "!was: crates/luabox-types/src/env.rs:298:30" \
+    "!now: crates/luabox-types/src/env.rs:305:11"
+
 # F2: two waived mutants at different positions both shift in the same run.
 # Pairing must be nearest-position, not "whichever unclaimed waived line
 # comes first in the allowlist" — the old rule paired 308<->323 and
@@ -293,7 +329,7 @@ missed:crates/luabox-types/src/env.rs:320:30: replace > with >= in TypeEnv::buil
 OUT
 crossed_log="$work/pass2_pairing.log"
 STUB_OUTCOMES="$crossed" STUB_EXIT=3 \
-    FILES="$scope" ALLOWLIST="$crossed_allowlist" MUTANTS_OUT="$work/out-pass2-pairing" \
+    FILES="$scope" ALLOWLIST="$crossed_allowlist" SCOPE_OF_RECORD="$scope" MUTANTS_OUT="$work/out-pass2-pairing" \
     bash "$gate" >"$crossed_log" 2>&1
 crossed_exit=$?
 if [ "$crossed_exit" = 0 ] \
@@ -304,6 +340,82 @@ if [ "$crossed_exit" = 0 ] \
 else
     echo "FAIL  pass2_pairing_is_nearest_not_crossed: expected 308->320 and 311->323 paired, not crossed" >&2
     sed 's/^/        /' "$crossed_log" >&2
+    fail=$((fail + 1))
+fi
+
+# R20 (#58 review round 4): the fixture above lists its waivers in ASCENDING
+# position order in the allowlist file, so it exercises only the LIVE-side
+# rank sort — deleting the waived-side sort (mutants-gate.sh, the `rkey`
+# selection-sort block) leaves this fixture 21/21 green because sorting an
+# already-sorted array is a no-op. Reversed here: reason-B (311) is written
+# BEFORE reason-A (308) in the allowlist file, while the live positions
+# (320, 323) stay ascending — so a pairing that used the waived lines in
+# file-encounter order instead of position order would cross 311<->320 and
+# 308<->323, reproducing F2's original bug on this axis specifically.
+reversed_allowlist="$work/reversed-allowlist.txt"
+cat >"$reversed_allowlist" <<'LIST'
+crates/luabox-types/src/env.rs:311:27: replace > with >= in TypeEnv::build_from_items	[defensive] reason-B
+crates/luabox-types/src/env.rs:308:30: replace > with >= in TypeEnv::build_from_items	[defensive] reason-A
+LIST
+reversed="$work/reversed.txt"
+cat >"$reversed" <<'OUT'
+missed:crates/luabox-types/src/env.rs:320:30: replace > with >= in TypeEnv::build_from_items
+missed:crates/luabox-types/src/env.rs:323:27: replace > with >= in TypeEnv::build_from_items
+OUT
+reversed_log="$work/pass2_waived_side_sort.log"
+STUB_OUTCOMES="$reversed" STUB_EXIT=3 \
+    FILES="$scope" ALLOWLIST="$reversed_allowlist" SCOPE_OF_RECORD="$scope" MUTANTS_OUT="$work/out-waived-sort" \
+    bash "$gate" >"$reversed_log" 2>&1
+reversed_exit=$?
+if [ "$reversed_exit" = 0 ] \
+    && grep -A1 -F "was: crates/luabox-types/src/env.rs:308:30" "$reversed_log" | grep -qF "now: crates/luabox-types/src/env.rs:320:30" \
+    && grep -A1 -F "was: crates/luabox-types/src/env.rs:311:27" "$reversed_log" | grep -qF "now: crates/luabox-types/src/env.rs:323:27"; then
+    echo "PASS  pass2_pairing_sorts_the_waived_side_too (exit $reversed_exit)"
+    pass=$((pass + 1))
+else
+    echo "FAIL  pass2_pairing_sorts_the_waived_side_too: expected 308->320 and 311->323 paired despite the allowlist file listing 311 before 308" >&2
+    sed 's/^/        /' "$reversed_log" >&2
+    fail=$((fail + 1))
+fi
+
+# R20 (#58 review round 4): `k = key($2)` is the entire (file, mutation)
+# keying the gate's headline claim rests on — every other case above still
+# passes without it, because their fixtures' positions happen to already
+# sort in an order that looks key-correct. Isolate it: two DIFFERENT
+# mutation texts at CLOSE positions (100, 105) whose true (keyed) shift
+# partners sit at positions that invert the naive position-only ranking —
+# text A's partner (900) is numerically FARTHER than text B's partner (106)
+# even though text A's waived line sits at the LOWER position (100 < 105).
+# Correct, key-aware pairing is 100<->900 (both text A) and 105<->106 (both
+# text B). Positional-only pairing (what a collapsed, empty key produces —
+# every row falling into one bucket) sorts strictly by position on both
+# sides regardless of text and pairs 100<->106 and 105<->900 instead,
+# crossing the two mutation texts onto each other exactly as F2 originally
+# crossed two reasons — provably wrong here because the paired "now:" text
+# would not even be the same mutation as the "was:" line.
+key_allowlist="$work/key-allowlist.txt"
+cat >"$key_allowlist" <<'LIST'
+crates/luabox-types/src/env.rs:100:1: replace > with >= in TypeEnv::build_from_items	[defensive] text-A
+crates/luabox-types/src/env.rs:105:1: replace TypeEnv::is_class -> bool with true	[equivalent] text-B
+LIST
+key_outcomes="$work/key-outcomes.txt"
+cat >"$key_outcomes" <<'OUT'
+missed:crates/luabox-types/src/env.rs:106:1: replace TypeEnv::is_class -> bool with true
+missed:crates/luabox-types/src/env.rs:900:1: replace > with >= in TypeEnv::build_from_items
+OUT
+key_log="$work/key_is_load_bearing.log"
+STUB_OUTCOMES="$key_outcomes" STUB_EXIT=3 \
+    FILES="$scope" ALLOWLIST="$key_allowlist" SCOPE_OF_RECORD="$scope" MUTANTS_OUT="$work/out-key-load-bearing" \
+    bash "$gate" >"$key_log" 2>&1
+key_exit=$?
+if [ "$key_exit" = 0 ] \
+    && grep -A1 -F "was: crates/luabox-types/src/env.rs:100:1" "$key_log" | grep -qF "now: crates/luabox-types/src/env.rs:900:1" \
+    && grep -A1 -F "was: crates/luabox-types/src/env.rs:105:1" "$key_log" | grep -qF "now: crates/luabox-types/src/env.rs:106:1"; then
+    echo "PASS  pairing_is_keyed_on_mutation_text_not_position_alone (exit $key_exit)"
+    pass=$((pass + 1))
+else
+    echo "FAIL  pairing_is_keyed_on_mutation_text_not_position_alone: expected 100(text-A)->900(text-A) and 105(text-B)->106(text-B), not paired by raw position" >&2
+    sed 's/^/        /' "$key_log" >&2
     fail=$((fail + 1))
 fi
 
@@ -344,23 +456,67 @@ run whole_allowlist_stale_fails 1 "$elsewhere" 0 "went stale in one run" "wrong 
 # The cheapest way for the audit to go quiet: a rename nobody propagated.
 # FILES_OVERRIDE substitutes the scope for this one call; run() falls back
 # to $scope otherwise, so this is the seam F14 asked for — one call site,
-# not a hand-rolled invocation with its own grep and its own message.
+# not a hand-rolled invocation with its own grep and its own message. The
+# two `!` needles are load-bearing, not decorative (#58 review round 4,
+# R20): the "scoped file does not exist" echo alone does not prove the
+# target `exit 1` fired — it is printed BEFORE the deleted line, so it
+# survives either way. Without the target exit, `file_args` still picks up
+# the nonexistent path unconditionally after the `fi`, and FILES (this
+# fake single file) narrows below both SCOPE_OF_RECORD (default: $scope, a
+# DIFFERENT single file) and the default allowlist's env.rs waivers — either
+# downstream check fires its own exit 1 with its own message, reproducing
+# this case's exit code and its one positive needle without the line under
+# test ever running.
 FILES_OVERRIDE="crates/luabox-types/src/renamed_by_a_refactor.rs" \
-    run missing_scope_file_fails 1 "$steady" 3 "scoped file does not exist"
+    run missing_scope_file_fails 1 "$steady" 3 "scoped file does not exist" \
+    "!narrows the audit below the scope of record" \
+    "!waives mutants in a file this run's scope does not audit"
 
 # The allowlist itself can go missing (a bad ALLOWLIST override, a checkout
 # that dropped the file) — distinct from "every line in it went stale".
+# `!report directory:` is load-bearing, not decorative (#58 review round 4,
+# R20): the "no allowlist at" echo alone does not prove the target `exit 1`
+# fired — without it, $steady's own missed set has nothing waived to match
+# (the allowlist read below fails silently) and every one of its 3 survivors
+# becomes NEW on its own, which ALSO exits 1 and ALSO leaves "no allowlist
+# at" sitting in the log from the echo that ran just before the deleted
+# line — a second, unrelated failure reproducing both assertions this case
+# had. "report directory:" is only ever printed after the allowlist check
+# passes, so its absence is the one thing that specifically proves the exit
+# happened there and cargo-mutants was never reached.
 ALLOWLIST_OVERRIDE="$work/does-not-exist.txt" \
-    run missing_allowlist_fails 1 "$steady" 3 "no allowlist at"
+    run missing_allowlist_fails 1 "$steady" 3 "no allowlist at" "!report directory:" "!new surviving mutant"
 
 # F4: a scope naming a file that EXISTS but excludes a file the allowlist
 # waives mutants in must fail before spending the run — not silently audit a
 # fraction of the claimed surface and report 0 new / 0 stale / exit 0. Real
 # file, wrong one: distinct from missing_scope_file_fails (F14 shape) above.
+# SCOPE_OF_RECORD_OVERRIDE matches FILES_OVERRIDE here so THIS narrowing
+# clears the R19 scope-of-record check (below) cleanly and the run reaches
+# the allowlist-narrowing check this case actually targets — the
+# scope-of-record narrowing itself is exercised by its own case below.
 FILES_OVERRIDE="crates/luabox-types/src/defs.rs" \
+    SCOPE_OF_RECORD_OVERRIDE="crates/luabox-types/src/defs.rs" \
     run scope_excludes_a_waived_file_fails 1 "$steady" 3 \
     "the allowlist waives mutants in a file this run's scope does not audit" \
     "crates/luabox-types/src/env.rs"
+
+# R19 (#58 review round 4): the check above compares FILES against the
+# ALLOWLIST's own referenced files, which all 17 real waivers happen to sit
+# inside env.rs today — so FILES=crates/luabox-types/src/env.rs alone
+# satisfies it while auditing a quarter of the four-file scope this file's
+# header and .github/workflows/mutants.yml both claim, giving 0 new / 0
+# stale / exit 0 for the three files never even attempted. Reproduced here
+# with SCOPE_OF_RECORD_OVERRIDE standing in for production's default (the
+# full four-file default_files) while FILES stays at the fixture's usual
+# single file — exactly the shape a scope pinned narrower than the
+# documented surface takes, regardless of what the allowlist references.
+FILES_OVERRIDE="crates/luabox-types/src/env.rs" \
+    SCOPE_OF_RECORD_OVERRIDE="crates/luabox-types/src/env.rs,crates/luabox-types/src/defs.rs,crates/luabox-types/src/generics.rs,crates/luabox-types/src/infer/reify.rs" \
+    run scope_of_record_narrowing_fails 1 "$steady" 3 \
+    "narrows the audit below the scope of record" \
+    "crates/luabox-types/src/defs.rs" \
+    "!the allowlist waives mutants in a file this run's scope does not audit"
 
 # F3: MUTANTS_OUT may be given relative to the caller's cwd. cargo-mutants
 # runs inside `(cd "$repo" && ...)`, so an unresolved relative path would be
@@ -376,7 +532,7 @@ relout_log="$work/relative-mutants-out.log"
 (
     cd "$relout_dir" || exit 1
     STUB_OUTCOMES="$steady" STUB_EXIT=3 \
-        FILES="$scope" ALLOWLIST="$allowlist" MUTANTS_OUT="relout" \
+        FILES="$scope" ALLOWLIST="$allowlist" SCOPE_OF_RECORD="$scope" MUTANTS_OUT="relout" \
         bash "$gate" >"$relout_log" 2>&1
 )
 relout_exit=$?
@@ -424,7 +580,7 @@ ALLOWLIST_OVERRIDE="$comment_only_allowlist" \
 # not just reverted to $orig_path (which, on a dev box, has the real tool).
 scrubbed_path="$(printf '%s' "$orig_path" | tr ':' '\n' | grep -v '\.cargo' | paste -sd: -)"
 cargo_absent_log="$work/cargo_absent.log"
-PATH="$scrubbed_path" FILES="$scope" ALLOWLIST="$allowlist" MUTANTS_OUT="$work/out-cargo-absent" \
+PATH="$scrubbed_path" FILES="$scope" ALLOWLIST="$allowlist" SCOPE_OF_RECORD="$scope" MUTANTS_OUT="$work/out-cargo-absent" \
     bash "$gate" >"$cargo_absent_log" 2>&1
 cargo_absent_exit=$?
 if [ "$cargo_absent_exit" = 1 ] && grep -qF -- "cargo-mutants not installed" "$cargo_absent_log"; then

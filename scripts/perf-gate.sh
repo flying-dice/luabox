@@ -226,6 +226,103 @@ else
   echo "perf-gate: SKIP peak RSS — no python3 on PATH (it reads the child's rusage)"
 fi
 
+# --- RETAINED-TYPEENV REGRESSION GATE --------------------------------------
+# `luabox check`'s cross-file pass once shared one `TypeEnv` per file across
+# the export pass and the check pass instead of building and dropping one
+# transiently in each (round 4 review R14, reverted by round 4 review
+# finding 6 — see check_cmd.rs's `run_passes`/`check_one` doc comments and
+# luabox-types/src/lib.rs's `build_file_env` doc comment). It bought ~1.76x
+# CPU (one ambient clone per file instead of two) for a peak-memory
+# regression that grows with (file count x ambient size): every file's env
+# had to stay alive until the whole export pass finished, so peak RSS scaled
+# O(files^2) on a project where file count and workspace-global class count
+# scale together — not O(files), the way the CPU-time saving alone would
+# suggest. The PEAK-RSS GATE above would not catch it coming back: its
+# 50-file/100-kLOC corpus only widens the retained-vs-transient gap to
+# ~3-5x, nowhere near a ceiling sized for a ~1.9x accepted trade.
+#
+# Reproduced here as its own leg on a corpus shaped to actually grow the
+# ambient with N: an N-file project, two `---@class` declarations per file,
+# and a linear `require` chain (module i requires module i-1). Measured on
+# the CURRENT (correct, transient) implementation and, separately, on a
+# deliberately reintroduced retained-`Vec<TypeEnv>` implementation
+# (check_cmd.rs's `file_exports`/`check_one` patched back to R14's shape),
+# three runs each, release build, peak RSS via scripts/peak-rss.py:
+#
+#   N      transient (correct)   retained (R14, reintroduced)   ratio
+#   100     11 MiB                 51 MiB                        4.6x
+#   200     15 MiB                145 MiB                        9.3x
+#   300     20 MiB                290 MiB                       14.5x
+#   500     29 MiB                734 MiB                       25.3x
+#
+# N=500 is the size check_cmd.rs's own doc comment already cites (~29x
+# peak RSS on the project that measurement was taken on), the gap here is
+# already >25x at that size, and generating + checking 500 tiny files costs
+# under 2s warm — cheap enough for every CI run, unlike a corpus anywhere
+# near N=500 built from the ~100-kLOC generator's 2000-line files (that
+# would be 1M lines and minutes, not seconds). The budget sits at 100 MiB:
+# just over 3x above the correct implementation's ~29 MiB (headroom for
+# machine noise, same rationale as the PEAK-RSS GATE above), while the
+# reintroduced retained implementation misses it by ~7x (734 MiB) — not a
+# close call in either direction. Deliberately NOT scaled by
+# LUABOX_PERF_FACTOR, for the same reason as $rss_budget_mib above: a slow
+# machine runs the same allocations, it just takes longer over them.
+retained_env_corpus_files=500
+retained_env_rss_budget_mib="${LUABOX_RETAINED_ENV_RSS_BUDGET_MIB:-100}"
+echo
+if command -v python3 >/dev/null 2>&1; then
+  echo "perf-gate: generating ${retained_env_corpus_files}-file retained-TypeEnv regression corpus..."
+  retained_env_dir="$corpus_dir/retained-env/src"
+  mkdir -p "$retained_env_dir"
+  cat > "$corpus_dir/retained-env/luabox.toml" <<'EOF'
+[package]
+name = "perf-gate-retained-env"
+version = "0.0.0"
+edition = "5.4"
+
+[build]
+target = "5.4"
+out = "dist"
+
+[types]
+strict = true
+
+[dependencies]
+EOF
+  for ((i = 0; i < retained_env_corpus_files; i++)); do
+    f="$retained_env_dir/mod_${i}.lua"
+    {
+      if ((i > 0)); then
+        printf 'local prev = require("mod_%d")\n\n' "$((i - 1))"
+      fi
+      printf -- '---@class Widget%dA\n---@field n number\nlocal A = { n = %d }\n\n' "$i" "$i"
+      printf -- '---@class Widget%dB\n---@field n number\nlocal B = { n = %d }\n\n' "$i" "$i"
+      if ((i > 0)); then
+        printf 'return { a = A, b = B, prev = prev }\n'
+      else
+        printf 'return { a = A, b = B }\n'
+      fi
+    } > "$f"
+  done
+
+  echo "perf-gate: peak RSS of check on the retained-TypeEnv regression corpus (warm)..."
+  ( cd "$corpus_dir/retained-env" && "$luabox_bin" check >/dev/null 2>&1 ) || true
+  if retained_env_rss_mib="$( cd "$corpus_dir/retained-env" && python3 "$repo_root/scripts/peak-rss.py" "$luabox_bin" check )"; then
+    if [[ "$retained_env_rss_mib" -lt "$retained_env_rss_budget_mib" ]]; then
+      echo "PASS retained-TypeEnv regression: ${retained_env_rss_mib} MiB < ${retained_env_rss_budget_mib} MiB"
+    else
+      echo "FAIL retained-TypeEnv regression: ${retained_env_rss_mib} MiB >= ${retained_env_rss_budget_mib} MiB"
+      echo "     round 4 review R14 (reverted) measured ~734 MiB on this corpus; see check_cmd.rs's run_passes doc comment"
+      fail=1
+    fi
+  else
+    echo "FAIL retained-TypeEnv regression: could not measure"
+    fail=1
+  fi
+else
+  echo "perf-gate: SKIP retained-TypeEnv regression — no python3 on PATH (it reads the child's rusage)"
+fi
+
 # --- DIAGNOSTICS-HEAVY GATE ------------------------------------------------
 # The corpus above is clean, so nothing so far times per-diagnostic work.
 # These four legs do: one file, `diag_corpus_findings` findings, run twice

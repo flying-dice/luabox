@@ -29,12 +29,16 @@
 # an unclaimed case is coverage that silently is not.
 #
 # Scope: the FILES env var (comma-separated, default the merge-seam
-# neighbourhood where the #46 family lived). The scheduled CI job pins the
-# same set explicitly rather than widening it — widening waits on #60, whose
-# finding is that check.rs's fallback is largely shadowed by inference, so
-# auditing it before that cleanup would allowlist noise rather than kill it.
-# See .github/workflows/mutants.yml. Not per-PR either way: a full run costs
-# tens of minutes, which is why it rides a schedule instead of the merge path.
+# neighbourhood where the #46 family lived). The scheduled CI job sets no
+# FILES at all and deliberately relies on this default — see the "No FILES="
+# comment on the `mutants` job in .github/workflows/mutants.yml, which
+# retired the job's own explicit pin because two hand-maintained copies of
+# the same scope were free to drift apart with nothing to notice (F4).
+# Widening the scope waits on #60, whose finding is that check.rs's fallback
+# is largely shadowed by inference, so auditing it before that cleanup would
+# allowlist noise rather than kill it. Not per-PR either way: a full run
+# costs tens of minutes, which is why it rides a schedule instead of the
+# merge path.
 set -u
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -43,7 +47,10 @@ repo="$here/../.."
 # against fixture expectations and a stub cargo-mutants; CI and every human
 # run take the default.
 allowlist="${ALLOWLIST:-$here/mutants-allowlist.txt}"
-files="${FILES:-crates/luabox-types/src/env.rs,crates/luabox-types/src/defs.rs,crates/luabox-types/src/generics.rs,crates/luabox-types/src/infer/reify.rs}"
+# default_files is the scope of record — see SCOPE_OF_RECORD below — as well
+# as FILES' own default, from the one place both are written down.
+default_files="crates/luabox-types/src/env.rs,crates/luabox-types/src/defs.rs,crates/luabox-types/src/generics.rs,crates/luabox-types/src/infer/reify.rs"
+files="${FILES:-$default_files}"
 
 if ! command -v cargo-mutants >/dev/null 2>&1; then
     echo "error: cargo-mutants not installed (cargo install cargo-mutants --locked)" >&2
@@ -74,14 +81,16 @@ esac
 echo "mutants-gate: report directory: $out_dir"
 file_args=()
 IFS=',' read -ra parts <<<"$files"
-# The scope is a hardcoded path string here and in the workflow, and neither
-# is updated by a rename. cargo-mutants does not object to a --file matching
-# nothing — it lists nothing and exits 0 — so the audit would run empty and
-# the job would pass. Check the paths before spending the run.
+# The scope is a hardcoded path string here — the one owner now that the
+# workflow's own FILES pin has been retired (see the Scope note above) —
+# and it is not updated by a rename. cargo-mutants does not object to a
+# --file matching nothing — it lists nothing and exits 0 — so the audit
+# would run empty and the job would pass. Check the paths before spending
+# the run.
 for f in "${parts[@]}"; do
     if [ ! -f "$repo/$f" ]; then
         echo "error: scoped file does not exist: $f" >&2
-        echo "error:   FILES / .github/workflows/mutants.yml still name a path this repo does not have;" >&2
+        echo "error:   FILES (or this script's default, if FILES is unset) still names a path this repo does not have;" >&2
         echo "error:   a rename or module move empties the audit without failing it. Re-point the scope." >&2
         exit 1
     fi
@@ -89,26 +98,64 @@ for f in "${parts[@]}"; do
 done
 
 # The check above only catches a scope naming a path that does not exist. It
-# says nothing about a scope that still exists but was narrowed to exclude a
-# file the allowlist waives mutants in: FILES=crates/luabox-types/src/env.rs
-# alone still passes that loop while auditing a quarter of the claimed
-# surface, giving 0 new / 0 stale / exit 0 for the files left out entirely.
-# Every waived line's file must be inside the scope actually being audited
-# this run, or the allowlist's claims about the rest are not being measured
-# — so require the scope to be a superset of the files the allowlist
-# references (a superset, not equal: FILES may legitimately audit more than
-# is waived yet, e.g. a file with no survivors at all).
-waived_files="$(grep -v '^#' "$allowlist" | cut -f1 | grep . | cut -d: -f1 | sort -u)" || true
-if [ -n "$waived_files" ]; then
-    missing_scope=""
-    while IFS= read -r wf; do
-        [ -n "$wf" ] || continue
+# says nothing about a scope that was narrowed while every path named still
+# exists. Two different things can be narrowed away from, so two checks:
+#
+# missing_from_scope echoes, space-separated, which lines of $2 (newline-
+# separated paths) are absent from $parts (the FILES actually being audited
+# this run) — empty means fully covered.
+missing_from_scope() {
+    local list="$1" out="" candidate f found
+    while IFS= read -r candidate; do
+        [ -n "$candidate" ] || continue
         found=0
         for f in "${parts[@]}"; do
-            [ "$f" = "$wf" ] && found=1 && break
+            [ "$f" = "$candidate" ] && found=1 && break
         done
-        [ "$found" -eq 1 ] || missing_scope="$missing_scope $wf"
-    done <<<"$waived_files"
+        [ "$found" -eq 1 ] || out="$out $candidate"
+    done <<<"$list"
+    printf '%s' "$out"
+}
+
+# Check 1: FILES must be a superset of the SCOPE OF RECORD — the documented,
+# canonical audit surface (default_files above, the scope the scheduled job
+# in .github/workflows/mutants.yml inherits by leaving FILES unset). This is
+# the check
+# missing before #58 review round 4 (R18/R19): the allowlist-only check
+# below asks "does this run re-measure every waiver on record", which a
+# narrowing can satisfy by accident when every current waiver happens to sit
+# in one file — all 17 lines in mutants-allowlist.txt are in env.rs today, so
+# FILES=crates/luabox-types/src/env.rs alone passed that check while auditing
+# a quarter of the four-file surface this file's own header and CI both
+# claim, giving 0 new / 0 stale / exit 0 for the three files left out
+# entirely. The allowlist is a fact about what has been REVIEWED, not a
+# definition of what the gate is FOR; the scope of record is that
+# definition, and it does not shrink just because every current waiver
+# happens to fit inside a narrower FILES. SCOPE_OF_RECORD is a seam for
+# mutants-gate-selftest.sh, exactly like ALLOWLIST above — every other run
+# takes the default, which is default_files itself, so a plain human run and
+# CI (which sets no FILES and so also takes that default) both compare
+# against the one scope this file and the workflow agree on.
+scope_of_record="${SCOPE_OF_RECORD:-$default_files}"
+missing_scope_of_record="$(missing_from_scope "$(printf '%s' "$scope_of_record" | tr ',' '\n')")"
+if [ -n "$missing_scope_of_record" ]; then
+    echo "error: FILES ($files) narrows the audit below the scope of record:$missing_scope_of_record" >&2
+    echo "error:   the scope of record is $scope_of_record (SCOPE_OF_RECORD, default: the same list FILES" >&2
+    echo "error:   defaults to). Every current waiver fitting inside a narrower FILES does not make that" >&2
+    echo "error:   narrower run complete — widen FILES to cover the scope of record." >&2
+    exit 1
+fi
+
+# Check 2: FILES must also be a superset of the files the allowlist actually
+# references (a superset, not equal: FILES may legitimately audit more than
+# is waived yet, e.g. a file with no survivors at all, or the scope of
+# record growing before the allowlist catches up). This is what catches a
+# waiver left behind by a rename that scope_of_record's fixed literal cannot
+# see on its own — the two checks are independent, not a fallback for each
+# other.
+waived_files="$(grep -v '^#' "$allowlist" | cut -f1 | grep . | cut -d: -f1 | sort -u)" || true
+if [ -n "$waived_files" ]; then
+    missing_scope="$(missing_from_scope "$waived_files")"
     if [ -n "$missing_scope" ]; then
         echo "error: the allowlist waives mutants in a file this run's scope does not audit:$missing_scope" >&2
         echo "error:   FILES ($files) must be a superset of every file mutants-allowlist.txt references, or" >&2
@@ -174,21 +221,39 @@ waived_total="$(count_lines "$waived")"
 # and what nothing can prove is NEW (fails) rather than a guess dressed as a
 # NOTE (#58 review round 3, F1/F2):
 #
-#   Pass 0: a waived line whose FULL TEXT — file, line:col, and mutation,
-#   unchanged — appears verbatim in caught.txt this run is PROVEN killed at
-#   that exact spot, not moved. This is the case Pass 2 used to get wrong: a
+#   Pass 1 (runs first): identical position claims its own waived line —
+#   nothing moved, so this is the strongest possible evidence and gets first
+#   claim on both sides before either of the passes below infers anything.
+#   Pass 0 (runs second, over what Pass 1 left unclaimed): a waived line
+#   whose (file, mutation text) KEY — position dropped — matches a caught.txt
+#   entry this run is PROVEN killed, wherever it now sits. Position is
+#   deliberately NOT part of this match: an edit can shift a waived mutant's
+#   line AND kill it in the same run (#58 review round 4, F1/R18), and a
+#   full-line match — position included — misses exactly that case, because
+#   the kill shows up in caught.txt at the mutant's NEW position while the
+#   allowlist still names the old one. Running this after Pass 1 (rather
+#   than before, as an earlier revision did) matters: Pass 1 first removes
+#   any waived line that is still alive, unmoved, at its own exact position,
+#   so Pass 0 only ever proposes STALE for a waived line that is confirmed
+#   ABSENT from this run's live results at its original spot — it cannot
+#   steal a waived line out from under a survivor that is simply sitting
+#   still. This is also the case Pass 2 used to get wrong on its own: a
 #   waived mutant gets a new test and is genuinely caught in the same run a
 #   DIFFERENT, never-reviewed mutant with the same mutation text survives
 #   somewhere else in the file. Position-blind text matching alone cannot
-#   tell "moved" from "one killed, an unrelated one appeared" apart — both
-#   leave one residual waived line and one residual live line in the same
-#   key — so this is resolved with independent evidence (caught.txt) rather
-#   than guessed from the residual counts. A line proven caught here is
-#   retired as STALE immediately and never offered to Pass 2 as a shift
-#   candidate.
-#   Pass 1: identical position claims its own waived line — nothing moved.
-#   Pass 2: same mutant text, moved. The lines left in a key after Pass 0
-#   and Pass 1 are sorted by position on each side and paired by rank
+#   tell "moved and killed" from "one killed, an unrelated one appeared"
+#   apart — both leave one residual waived line and one residual live line
+#   in the same key — so this is resolved with independent evidence
+#   (caught.txt) rather than guessed from the residual counts. When more
+#   than one waived line in a key is unclaimed and caught.txt has fewer
+#   matches than that, the lowest-position waived line(s) are retired first
+#   (same rank-pairing discipline as Pass 2, for a reproducible report) —
+#   the rest stay open for Pass 2. A line retired here is STALE immediately
+#   and never offered to Pass 2 as a shift candidate.
+#   Pass 2: same mutant text, moved, with no caught.txt evidence either way
+#   — still surviving, just not where the allowlist says. The lines left in
+#   a key after Pass 1 and Pass 0 are sorted by position on each side and
+#   paired by rank
 #   (smallest live position with smallest residual waived position, and so
 #   on) — the only pairing that preserves relative order, which is what an
 #   edit shifting a block of code produces. Pairing "whichever unclaimed
@@ -222,7 +287,10 @@ function sortpos(p,    parts, n) {
     return sprintf("%010d:%010d", parts[1], parts[2])
 }
 {
-    if ($1 == "C") { caughtset[$2] = 1; next }
+    # Caught entries are keyed the same position-blind way as everything
+    # else — a count per key is all Pass 0 needs, position plays no part in
+    # proving a kill (see the comment above this pipeline).
+    if ($1 == "C") { kc = key($2); cn[kc]++; next }
     k = key($2)
     keys[k] = 1
     if ($1 == "W") { wline[k, ++w[k]] = $2; wpos[k, w[k]] = pos($2) }
@@ -231,12 +299,10 @@ function sortpos(p,    parts, n) {
 END {
     for (k in keys) {
         nw = w[k] + 0; nl = l[k] + 0
-        # Pass 0: proven-caught waived lines are retired before Pass 1/2
-        # ever see them — see the comment above this pipeline.
-        for (j = 1; j <= nw; j++) {
-            if (wline[k, j] in caughtset) { wtaken[k, j] = 1; print "STALE\t" wline[k, j] }
-        }
-        # Pass 1: identical position claims its own waived line.
+        # Pass 1 (runs first): identical position claims its own waived
+        # line — still alive, unmoved. This must run before Pass 0 so a
+        # survivor sitting still at its reviewed spot is never up for grabs
+        # as caught-elsewhere evidence for a DIFFERENT key-mate.
         for (i = 1; i <= nl; i++) {
             for (j = 1; j <= nw; j++) {
                 if (!wtaken[k, j] && wpos[k, j] == lpos[k, i]) {
@@ -246,8 +312,31 @@ END {
                 }
             }
         }
-        # Pass 2: same mutant, moved — a measured, order-preserving pairing
-        # over what Pass 0 and Pass 1 left, not a first-unclaimed-wins guess.
+        # Pass 0 (runs second, over what Pass 1 left unclaimed): a caught
+        # entry sharing this key proves a kill, position-blind, so a waived
+        # line that moved AND was killed in the same run still retires as
+        # STALE instead of falling through to Pass 2 and masquerading as a
+        # still-open shift. Retire lowest-position-rank waived lines first
+        # when there are more unclaimed waived lines than caught entries to
+        # prove them with — the rest stay open for Pass 2.
+        nc = cn[k] + 0
+        if (nc > 0) {
+            rw0 = 0
+            for (j = 1; j <= nw; j++) if (!wtaken[k, j]) { rw0++; ridx0[rw0] = j; rkey0[rw0] = sortpos(wpos[k, j]) SUBSEP j }
+            for (a = 1; a <= rw0; a++)
+                for (b = a + 1; b <= rw0; b++)
+                    if (rkey0[b] < rkey0[a]) { t = rkey0[a]; rkey0[a] = rkey0[b]; rkey0[b] = t; t = ridx0[a]; ridx0[a] = ridx0[b]; ridx0[b] = t }
+            take0 = (nc < rw0) ? nc : rw0
+            for (a = 1; a <= take0; a++) {
+                j = ridx0[a]
+                wtaken[k, j] = 1
+                print "STALE\t" wline[k, j]
+            }
+            delete ridx0; delete rkey0
+        }
+        # Pass 2: same mutant, moved, no caught.txt evidence either way —
+        # a measured, order-preserving pairing over what Pass 1 and Pass 0
+        # left, not a first-unclaimed-wins guess.
         rw = 0
         for (j = 1; j <= nw; j++) if (!wtaken[k, j]) { rw++; ridx[rw] = j; rkey[rw] = sortpos(wpos[k, j]) SUBSEP j }
         rl = 0

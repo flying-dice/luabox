@@ -21,6 +21,25 @@ on:
     - cron: "17 4 * * 1"
   push:
     branches: [main]
+    paths:
+      # Without this, EVERY push to main — including a docs-only promotion —
+      # starts the 120-minute `mutants` job below for no reason a mutation
+      # score could ever move on. `crates/**` covers any source or test
+      # change anywhere in the workspace that could add or remove coverage
+      # over the scoped files (mutants-gate.sh's FILES default:
+      # crates/luabox-types/src/{env,defs,generics,infer/reify}.rs) — the
+      # test that kills a given mutant is not necessarily in the same crate
+      # as the mutated code, so this is deliberately the whole `crates/`
+      # tree rather than just luabox-types. `scripts/tests/mutants-*` covers
+      # the gate script, its self-test and the committed allowlist as one
+      # rule — the same glob the `pull_request` trigger below now uses too,
+      # so a new file in that family is covered on both triggers by
+      # construction rather than by remembering to edit two lists. The
+      # workflow file is self-referential for the same reason
+      # luals-parity.yml lists itself.
+      - "crates/**"
+      - "scripts/tests/mutants-*"
+      - ".github/workflows/mutants.yml"
   workflow_dispatch:
   # Also run gate-selftest (seconds, no cargo-mutants, no build) when the
   # gate itself or its expectations change, so a broken script or a bad
@@ -31,9 +50,13 @@ on:
   # workflow rides a schedule to avoid.
   pull_request:
     paths:
-      - "scripts/tests/mutants-gate.sh"
-      - "scripts/tests/mutants-gate-selftest.sh"
-      - "scripts/tests/mutants-allowlist.txt"
+      # Same glob as the `push` trigger above, and for the same reason: this
+      # used to enumerate mutants-gate.sh, mutants-gate-selftest.sh and
+      # mutants-allowlist.txt by name, which covered today's three files but
+      # would silently exclude a fourth `mutants-*` file from this trigger
+      # while `push`'s glob picked it up automatically — one rule, two
+      # mechanisms, free to disagree. One glob now backs both.
+      - "scripts/tests/mutants-*"
       - ".github/workflows/mutants.yml"
 
 jobs:

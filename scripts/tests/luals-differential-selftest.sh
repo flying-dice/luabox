@@ -53,18 +53,33 @@ cat >"$stub_luabox" <<'STUB'
 # codes named by a `-- STUB-LUABOX-DIAG: <CODE>` marker comment on its own
 # line in any *.lua file under ./src (case file or copied dep) — the same
 # file set the real luabox column typechecks as one project.
+#
+# A `-- STUB-LUABOX-BREAK-JSON` marker instead makes the stub emit output
+# that is not valid JSON at all — standing in for a real tool bug (a panic
+# mid-write, a truncated pipe) rather than a well-formed "0 diagnostics" or
+# "N diagnostics" answer. This exists to drive
+# luals-differential.sh:311-318, the `codes_rc != 0` handler.
 if [ "${1:-}" != "check" ]; then
     echo "stub-luabox: unsupported invocation: $*" >&2
     exit 2
 fi
 codes=()
+break_json=0
 shopt -s nullglob
 for f in src/*.lua; do
+    if grep -qF -- '-- STUB-LUABOX-BREAK-JSON' "$f"; then
+        break_json=1
+    fi
     while IFS= read -r code; do
         codes+=("$code")
     done < <(grep -oE -- '-- STUB-LUABOX-DIAG: [A-Za-z0-9]+' "$f" | awk '{print $3}')
 done
 shopt -u nullglob
+if [ "$break_json" = 1 ]; then
+    printf 'not-json: stub-luabox produced a malformed response\n'
+    echo "check: stub forced a malformed response" >&2
+    exit 0
+fi
 if [ "${#codes[@]}" -eq 0 ]; then
     printf '[]\n'
     echo "check: 0 errors, 0 warnings in 1 files" >&2
@@ -428,6 +443,123 @@ got=$?
 assert luals_tool_failure_shows_real_output 1 "$got" "$log" \
     "lua-language-server --check failed to run (exit 3)" \
     "workspace load failed: permission denied on /fixture/root"
+
+# ============================================================================
+# round-4 (R24): the half of the gate F25/round-3 left unasserted — the
+# actual COMPARISON logic, the two data-integrity sweeps that run outside the
+# per-row loop, and the per-invocation state that must not leak between rows.
+# Every case below was proven the same way as 1-14: delete the exact line(s)
+# it names from luals-differential.sh and re-run this file — PASS must
+# become FAIL.
+# ============================================================================
+
+# 15: the luals-column comparison itself (:340-348). luabox and luals both
+# read "clean" in expected.tsv (so the divergence-note rule at :251 never
+# fires), but the stub luals tool actually flags the case — the comparison
+# block is what is supposed to catch that and fail the row.
+luals_wrong_expectation_corpus="$(newcorpus luals-wrong-expectation)"
+cat >"$luals_wrong_expectation_corpus/only_case.lua" <<'LUA'
+-- luabox stub reports nothing; luals stub does — expected.tsv wrongly
+-- claims luals is clean too.
+-- STUB-LUALS-DIAG: undefined-field
+LUA
+printf '# case\tluabox\tcodes\tluals\tnote\nonly_case\tclean\t-\tclean\tcontrol\n' \
+    >"$luals_wrong_expectation_corpus/expected.tsv"
+run luals_column_mismatch_fails 1 "$luals_wrong_expectation_corpus" \
+    "luals is 'diag', expected.tsv says 'clean'"
+
+# 16: the unclaimed-corpus sweep (:357-368) — a *.lua file with no row in
+# expected.tsv at all (and not named by any .deps sidecar) must fail, not
+# pass by omission.
+unclaimed_corpus="$(newcorpus unclaimed)"
+cat >"$unclaimed_corpus/orphan.lua" <<'LUA'
+-- present on disk, never mentioned in expected.tsv
+LUA
+printf '# case\tluabox\tcodes\tluals\tnote\n' >"$unclaimed_corpus/expected.tsv"
+run unclaimed_corpus_file_fails 1 "$unclaimed_corpus" \
+    "orphan.lua exists in the corpus but expected.tsv has no row for it"
+
+# 17: the row-level src existence guard (:243-247) — expected.tsv names a
+# case whose .lua file does not exist on disk. want_luabox is set to a value
+# ("diag") that a silently-empty $work/src would NOT produce (an absent cp
+# source leaves the stub luabox seeing zero files, i.e. "clean"), so this
+# case only passes for the RIGHT reason: the specific "does not exist"
+# message, not an incidental code-mismatch on the fallback path.
+ghost_corpus="$(newcorpus ghost-case)"
+printf '# case\tluabox\tcodes\tluals\tnote\nghost\tdiag\tLB0300\tdiag\tcontrol\n' \
+    >"$ghost_corpus/expected.tsv"
+run src_missing_for_named_case_fails 1 "$ghost_corpus" \
+    "ghost: expected.tsv names it, but" \
+    "does not exist"
+
+# 18: luabox's own JSON-parse-failure handler (:311-318) — the stub tool
+# emits a malformed response instead of a diagnostics array.
+break_json_corpus="$(newcorpus break-json)"
+cat >"$break_json_corpus/only_case.lua" <<'LUA'
+-- STUB-LUABOX-BREAK-JSON
+LUA
+printf '# case\tluabox\tcodes\tluals\tnote\nonly_case\tclean\t-\tclean\tcontrol\n' \
+    >"$break_json_corpus/expected.tsv"
+run luabox_json_parse_failure_fails 1 "$break_json_corpus" \
+    "could not parse 'luabox check --format json' output as JSON"
+
+# 19: the parity-code positive filter (:176 sets the code universe, :188
+# applies it) — luals flags a REAL diagnostic code that is simply not in
+# $parity_codes (style/unused-local territory). It must not count toward the
+# case's diag verdict; expected.tsv says clean and must stay clean.
+non_parity_corpus="$(newcorpus non-parity-code)"
+cat >"$non_parity_corpus/only_case.lua" <<'LUA'
+-- luals reports a real but out-of-scope code; the parity filter must drop it
+-- STUB-LUALS-DIAG: unused-local
+LUA
+printf '# case\tluabox\tcodes\tluals\tnote\nonly_case\tclean\t-\tclean\ta non-parity-set luals code must not flip the verdict\n' \
+    >"$non_parity_corpus/expected.tsv"
+run non_parity_luals_code_does_not_count 0 "$non_parity_corpus" \
+    "both columns match" \
+    "!only_case                                clean      -                        diag"
+
+# 20: per-row state does not leak (:257's `rm -f "$work/src"/*.lua`) — row 1
+# has a `.deps` dependency carrying a diagnostic marker; row 2 has NO deps
+# and must come back clean. Without the cleanup, row 2 inherits row 1's
+# dependency file still sitting in the shared $work/src and reports its
+# diagnostic as its own.
+leak_corpus="$(newcorpus stale-dep-leak)"
+cat >"$leak_corpus/case_with_dep.lua" <<'LUA'
+local h = require("helper")
+LUA
+cat >"$leak_corpus/helper.lua" <<'LUA'
+-- STUB-LUABOX-DIAG: LB0306
+LUA
+printf 'helper.lua\n' >"$leak_corpus/case_with_dep.deps"
+cat >"$leak_corpus/case_clean.lua" <<'LUA'
+-- no deps of its own; must not see the previous row's dependency file
+LUA
+printf '# case\tluabox\tcodes\tluals\tnote\ncase_with_dep\tdiag\tLB0306\tclean\tluabox-only marker, luals stub does not mirror it\ncase_clean\tclean\t-\tclean\tcontrol\n' \
+    >"$leak_corpus/expected.tsv"
+run stale_dep_file_cleared_between_cases 0 "$leak_corpus" \
+    "both columns match" \
+    "!case_clean: luabox is 'diag', expected.tsv says 'clean'"
+
+# 21: the luabox binary existence guard (:86-89) — fires before any corpus
+# or expected.tsv is even read.
+log="$work/luabox_binary_missing_fails.log"
+LUABOX="$work/bin/does-not-exist-luabox" LUALS="$stub_luals" \
+    LUALS_CORPUS="$skip_corpus" bash "$gate" >"$log" 2>&1
+got=$?
+assert luabox_binary_missing_fails 1 "$got" "$log" \
+    "error: no luabox binary at"
+
+# 22: the expected.tsv existence guard (:99-102).
+no_expected_corpus="$(newcorpus no-expected-tsv)"
+cat >"$no_expected_corpus/only_case.lua" <<'LUA'
+-- no expected.tsv in this corpus directory at all
+LUA
+log="$work/expected_tsv_missing_fails.log"
+LUABOX="$stub_luabox" LUALS="$stub_luals" LUALS_CORPUS="$no_expected_corpus" \
+    bash "$gate" >"$log" 2>&1
+got=$?
+assert expected_tsv_missing_fails 1 "$got" "$log" \
+    "error: no expectations at"
 
 echo
 echo "luals-differential-selftest: $pass passed, $fail failed"
