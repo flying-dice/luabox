@@ -44,12 +44,33 @@
 #                        them, so a CPU multiplier has no business
 #                        loosening a memory ceiling. Override it only when
 #                        the *budget* is being renegotiated.
+#   LUABOX_RETAINED_ENV_RSS_BUDGET_MIB
+#                        integer ceiling (MiB) for the RETAINED-TYPEENV
+#                        REGRESSION GATE below, the peak-RSS leg's sibling
+#                        on a different corpus. Default 100. Same rule as
+#                        LUABOX_RSS_BUDGET_MIB above: not scaled by
+#                        LUABOX_PERF_FACTOR, for the same reason.
+#
+# That second memory leg pins RAYON_NUM_THREADS=4 around the command it
+# measures rather than leaving rayon's default (the runner's own core
+# count). luabox-types/src/lib.rs documents peak RSS on that corpus as
+# scaling with rayon parallelism x ambient size — a wider CI runner
+# legitimately allocates more concurrently, and 100 MiB is a ceiling
+# calibrated at one specific thread count (4; see that leg's own comment),
+# not a bound that holds at every width. Pinning makes the ceiling mean the
+# same thing on a 2-core box and a 64-core one; the alternative — loosening
+# the ceiling itself to tolerate a wide runner — would stop catching the
+# regression class this leg exists for, so that is deliberately not the fix
+# here (#58 review round 5, N39).
 #
 # Usage: scripts/perf-gate.sh
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+
+# shellcheck source=perf-gate-lib.sh
+source "$repo_root/scripts/perf-gate-lib.sh"
 
 factor="${LUABOX_PERF_FACTOR:-1.0}"
 
@@ -86,10 +107,10 @@ diag_corpus_findings=20000
 # block above.
 rss_budget_mib=300
 
-# Plain `awk` (POSIX, present on every CI/dev box we target) does the
-# float multiply; everything else is integer ms from here on.
-cold_start_budget=$(awk -v b="$cold_start_budget_base_ms" -v f="$factor" 'BEGIN { printf "%d", b * f }')
-fmt_budget=$(awk -v b="$fmt_budget_base_ms" -v f="$factor" 'BEGIN { printf "%d", b * f }')
+# scale_budget_ms (perf-gate-lib.sh) does the float multiply; everything
+# else is integer ms from here on.
+cold_start_budget=$(scale_budget_ms "$cold_start_budget_base_ms" "$factor")
+fmt_budget=$(scale_budget_ms "$fmt_budget_base_ms" "$factor")
 
 echo "perf-gate: LUABOX_PERF_FACTOR=${factor} (cold-start budget ${cold_start_budget} ms, fmt budget ${fmt_budget} ms)"
 
@@ -110,22 +131,7 @@ trap cleanup EXIT
 
 echo "perf-gate: generating ~100 kLOC corpus into ${corpus_dir} ..."
 "$gen_corpus_bin" --out "$corpus_dir/src" --seed 42 --files 50 --lines-per-file 2000
-
-cat > "$corpus_dir/luabox.toml" <<'EOF'
-[package]
-name = "perf-gate-corpus"
-version = "0.0.0"
-edition = "5.4"
-
-[build]
-target = "5.4"
-out = "dist"
-
-[types]
-strict = true
-
-[dependencies]
-EOF
+write_perf_manifest "$corpus_dir/luabox.toml" "perf-gate-corpus" true
 
 fail=0
 
@@ -178,7 +184,7 @@ fi
 # --- CHECK GATE ------------------------------------------------------------
 # SPEC.md §16.1: `check` on the 100-kLOC corpus < 1 s warm. Live since
 # GL#6; the fmt --check gate above stays as the wider safety net.
-check_budget=$(awk -v b="$check_budget_base_ms" -v f="$factor" 'BEGIN { printf "%d", b * f }')
+check_budget=$(scale_budget_ms "$check_budget_base_ms" "$factor")
 echo
 echo "perf-gate: check throughput on corpus (warm)..."
 ( cd "$corpus_dir" && "$luabox_bin" check >/dev/null 2>&1 ) || true
@@ -267,28 +273,40 @@ fi
 # close call in either direction. Deliberately NOT scaled by
 # LUABOX_PERF_FACTOR, for the same reason as $rss_budget_mib above: a slow
 # machine runs the same allocations, it just takes longer over them.
+#
+# RAYON_NUM_THREADS=4 is pinned around both the warm-up and the measured
+# invocation below. lib.rs documents peak RSS on this corpus as scaling
+# with rayon parallelism x ambient size, so a wide CI runner legitimately
+# allocates more concurrently than a narrow one — 100 MiB is a ceiling
+# calibrated at one thread count, and would either false-fail a correct
+# implementation on a wide box or stop meaning anything if loosened to
+# tolerate one. Pinning is the fix that keeps the ceiling itself honest
+# instead (#58 review round 5, N39); it does not touch $retained_env_rss_
+# budget_mib, which is not scaled here either.
+#
+# This leg's wall time is measured too, alongside the RSS it was already
+# paying to compute — reusing the one `check` invocation the peak-RSS
+# measurement already runs, rather than a second pair of warm-up/measured
+# calls, keeps the marginal cost near zero (#58 review round 5, N37: this
+# was previously the only 500-file leg with no `date +%s%N` bracket at
+# all, so `check` could have regressed 10x here and every leg would still
+# have been green). Calibrated the same way as the other timed legs above:
+# three runs of the exact command below (RAYON_NUM_THREADS=4, warm,
+# python3-wrapped) measured 1271-1406 ms on the dev baseline; the budget
+# sits at just under 3x that, matching this file's usual headroom
+# convention, and — unlike the MiB budget two paragraphs up — IS scaled by
+# LUABOX_PERF_FACTOR, because wall time genuinely is slower on a slow
+# machine where a fixed allocation count is not.
 retained_env_corpus_files=500
 retained_env_rss_budget_mib="${LUABOX_RETAINED_ENV_RSS_BUDGET_MIB:-100}"
+retained_env_check_budget_base_ms=4000
+retained_env_check_budget=$(scale_budget_ms "$retained_env_check_budget_base_ms" "$factor")
 echo
 if command -v python3 >/dev/null 2>&1; then
   echo "perf-gate: generating ${retained_env_corpus_files}-file retained-TypeEnv regression corpus..."
   retained_env_dir="$corpus_dir/retained-env/src"
   mkdir -p "$retained_env_dir"
-  cat > "$corpus_dir/retained-env/luabox.toml" <<'EOF'
-[package]
-name = "perf-gate-retained-env"
-version = "0.0.0"
-edition = "5.4"
-
-[build]
-target = "5.4"
-out = "dist"
-
-[types]
-strict = true
-
-[dependencies]
-EOF
+  write_perf_manifest "$corpus_dir/retained-env/luabox.toml" "perf-gate-retained-env" true
   for ((i = 0; i < retained_env_corpus_files; i++)); do
     f="$retained_env_dir/mod_${i}.lua"
     {
@@ -305,19 +323,40 @@ EOF
     } > "$f"
   done
 
-  echo "perf-gate: peak RSS of check on the retained-TypeEnv regression corpus (warm)..."
-  ( cd "$corpus_dir/retained-env" && "$luabox_bin" check >/dev/null 2>&1 ) || true
-  if retained_env_rss_mib="$( cd "$corpus_dir/retained-env" && python3 "$repo_root/scripts/peak-rss.py" "$luabox_bin" check )"; then
-    if [[ "$retained_env_rss_mib" -lt "$retained_env_rss_budget_mib" ]]; then
-      echo "PASS retained-TypeEnv regression: ${retained_env_rss_mib} MiB < ${retained_env_rss_budget_mib} MiB"
+  # N38: a PASS printed against a corpus that was not actually generated the
+  # way the budgets above assume is not evidence of anything. Reproduced
+  # against an empty corpus before this check existed: the leg printed
+  # "PASS retained-TypeEnv regression: 11 MiB < 100 MiB" over `check`'s own
+  # "0 errors, 0 warnings in 0 files" — a measurement of nothing, read as a
+  # clean run. peak-rss.py deliberately ignores the measured command's exit
+  # status (its own doc comment says so), so a broken corpus does not fail
+  # any other way on its own.
+  if ! assert_lua_file_count "$retained_env_dir" "$retained_env_corpus_files"; then
+    fail=1
+  else
+    echo "perf-gate: peak RSS + wall time of check on the retained-TypeEnv regression corpus (warm)..."
+    ( cd "$corpus_dir/retained-env" && RAYON_NUM_THREADS=4 "$luabox_bin" check >/dev/null 2>&1 ) || true
+    start=$(date +%s%N)
+    if retained_env_rss_mib="$( cd "$corpus_dir/retained-env" && RAYON_NUM_THREADS=4 python3 "$repo_root/scripts/peak-rss.py" "$luabox_bin" check )"; then
+      end=$(date +%s%N)
+      retained_env_ms=$(( (end - start) / 1000000 ))
+      if [[ "$retained_env_rss_mib" -lt "$retained_env_rss_budget_mib" ]]; then
+        echo "PASS retained-TypeEnv regression, peak RSS: ${retained_env_rss_mib} MiB < ${retained_env_rss_budget_mib} MiB"
+      else
+        echo "FAIL retained-TypeEnv regression, peak RSS: ${retained_env_rss_mib} MiB >= ${retained_env_rss_budget_mib} MiB"
+        echo "     round 4 review R14 (reverted) measured ~734 MiB on this corpus; see check_cmd.rs's run_passes doc comment"
+        fail=1
+      fi
+      if [[ "$retained_env_ms" -lt "$retained_env_check_budget" ]]; then
+        echo "PASS retained-TypeEnv regression, wall time: ${retained_env_ms} ms < ${retained_env_check_budget} ms"
+      else
+        echo "FAIL retained-TypeEnv regression, wall time: ${retained_env_ms} ms >= ${retained_env_check_budget} ms"
+        fail=1
+      fi
     else
-      echo "FAIL retained-TypeEnv regression: ${retained_env_rss_mib} MiB >= ${retained_env_rss_budget_mib} MiB"
-      echo "     round 4 review R14 (reverted) measured ~734 MiB on this corpus; see check_cmd.rs's run_passes doc comment"
+      echo "FAIL retained-TypeEnv regression: could not measure"
       fail=1
     fi
-  else
-    echo "FAIL retained-TypeEnv regression: could not measure"
-    fail=1
   fi
 else
   echo "perf-gate: SKIP retained-TypeEnv regression — no python3 on PATH (it reads the child's rusage)"
@@ -337,27 +376,16 @@ fi
 # label. Neither subsumes the other — a regression in either half moves
 # only its own pair — and stdout goes to /dev/null in both, so the gate
 # times the toolchain, not the terminal.
-diag_lint_budget=$(awk -v b="$diag_lint_budget_base_ms" -v f="$factor" 'BEGIN { printf "%d", b * f }')
-diag_check_budget=$(awk -v b="$diag_check_budget_base_ms" -v f="$factor" 'BEGIN { printf "%d", b * f }')
-diag_lint_rendered_budget=$(awk -v b="$diag_lint_rendered_budget_base_ms" -v f="$factor" 'BEGIN { printf "%d", b * f }')
-diag_check_rendered_budget=$(awk -v b="$diag_check_rendered_budget_base_ms" -v f="$factor" 'BEGIN { printf "%d", b * f }')
+diag_lint_budget=$(scale_budget_ms "$diag_lint_budget_base_ms" "$factor")
+diag_check_budget=$(scale_budget_ms "$diag_check_budget_base_ms" "$factor")
+diag_lint_rendered_budget=$(scale_budget_ms "$diag_lint_rendered_budget_base_ms" "$factor")
+diag_check_rendered_budget=$(scale_budget_ms "$diag_check_rendered_budget_base_ms" "$factor")
 
 diag_dir="$corpus_dir/diagnostics-heavy"
 mkdir -p "$diag_dir/lint/src" "$diag_dir/check/src"
 mkdir -p "$diag_dir/lint-rendered/src" "$diag_dir/check-rendered/src"
 for project in lint check lint-rendered check-rendered; do
-  cat > "$diag_dir/$project/luabox.toml" <<'EOF'
-[package]
-name = "perf-gate-diagnostics"
-version = "0.0.0"
-edition = "5.4"
-
-[build]
-target = "5.4"
-out = "dist"
-
-[dependencies]
-EOF
+  write_perf_manifest "$diag_dir/$project/luabox.toml" "perf-gate-diagnostics" false
 done
 
 echo

@@ -117,31 +117,67 @@ jobs:
 
   # SPEC.md §16.1 — perf gates are CI-blocking. scripts/perf-gate.sh is the
   # authoritative list and holds the calibration notes for every budget; it
-  # currently runs seven timed legs plus one memory leg, all live:
+  # currently runs eight timed legs plus two memory legs, all live:
   #   1. cold start                     — `luabox --version`, best of 10
   #   2. `fmt --check` warm             — ~100-kLOC synthetic corpus
   #   3. `check` warm                   — same corpus; the gate §16.1 asks for
   #   4. `check` peak RSS               — same corpus; budget 300 MiB
-  #   5. `lint`, diagnostics-heavy      — 20 k findings in ONE file, suppressed
-  #   6. `check`, diagnostics-heavy     — ditto
-  #   7. `lint`, findings rendered      — the same corpus, nothing suppressed
-  #   8. `check`, findings rendered     — ditto
-  # Legs 5-8 exist because the corpus legs 2-4 use is *clean*, so none of
+  #   5. retained-TypeEnv regression, peak RSS + wall time
+  #                                      — a SEPARATE 500-tiny-file corpus;
+  #                                        RSS budget 100 MiB, wall-time
+  #                                        budget scaled like every other
+  #                                        timed leg below
+  #   6. `lint`, diagnostics-heavy      — 20 k findings in ONE file, suppressed
+  #   7. `check`, diagnostics-heavy     — ditto
+  #   8. `lint`, findings rendered      — the same corpus, nothing suppressed
+  #   9. `check`, findings rendered     — ditto
+  # Legs 6-9 exist because the corpus legs 2-4 use is *clean*, so none of
   # them ever times per-diagnostic work — the blind spot that hid an
   # O(diagnostics x file size) line lookup (32 k findings in one file: ~32 s
   # to lint; the same file with one finding: 0.35 s). The suppressed pair
   # times the bookkeeping with the renderer out of the way; the rendered pair
   # times what a user actually pays, renderer included, where a second such
   # cost lived.
-  # Leg 4 is the memory one: decisions/07 *accepted* a ~1.9x peak-RSS
+  # Leg 4 is the first memory leg: decisions/07 *accepted* a ~1.9x peak-RSS
   # regression (64 -> 123 MiB) for one read/parse per file, and nothing
   # enforced the ceiling side of that trade until it was added.
+  # Leg 5 is the SECOND memory leg (and also timed, unlike leg 4) — leg 4's
+  # 50-file corpus only widens the retained-vs-transient gap round 4 review
+  # R14 (reverted) introduced to ~3-5x, nowhere near a ceiling sized for a
+  # ~1.9x accepted trade, so a dedicated 500-tiny-file corpus reproduces the
+  # ~25x gap that shape actually has. Its RSS measurement pins
+  # RAYON_NUM_THREADS=4 — peak RSS there scales with rayon parallelism x
+  # ambient size (luabox-types/src/lib.rs), so an unpinned thread count
+  # would make its 100 MiB ceiling mean something different on every runner
+  # width; `perf-gates` itself does not need to set this — perf-gate.sh
+  # pins it internally around the one leg it applies to. That budget is
+  # $LUABOX_RETAINED_ENV_RSS_BUDGET_MIB, the sibling of
+  # $LUABOX_RSS_BUDGET_MIB below and, like it, NOT scaled by
+  # LUABOX_PERF_FACTOR.
   # The LSP keystroke-to-diagnostics budget in §16.1 is NOT gated here — no
   # harness drives the protocol yet; SPEC marks it future work.
   # Every *timed* budget is scaled by LUABOX_PERF_FACTOR (set below for this
-  # runner); the RSS budget deliberately is not — a slow machine runs the same
-  # allocations. LUABOX_RSS_BUDGET_MIB overrides that one on its own.
+  # runner); the RSS budgets deliberately are not — a slow machine runs the
+  # same allocations. LUABOX_RSS_BUDGET_MIB and
+  # LUABOX_RETAINED_ENV_RSS_BUDGET_MIB override those two on their own.
+  #
+  # perf-gate-selftest below is the gate on the gate, same discipline (and
+  # same reason) as mutants.yml's gate-selftest and luals-parity.yml's
+  # differential-selftest: scripts/tests/perf-gate-selftest.sh drives the
+  # pure judgement functions scripts/perf-gate-lib.sh factors out of legs 4
+  # and 5 (the corpus-file-count check, the budget-scaling arithmetic, the
+  # manifest writer) without a release build or a real corpus — seconds, not
+  # the several minutes below it.
+  perf-gate-selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Self-test perf-gate-lib.sh's judgement
+        run: bash scripts/tests/perf-gate-selftest.sh
+
   perf-gates:
+    needs: perf-gate-selftest
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -151,10 +187,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: perf-gates
-      # The peak-RSS leg SKIPs loudly when python3 is missing — fine on a dev
+      # The peak-RSS legs SKIP loudly when python3 is missing — fine on a dev
       # box, but CI must never run a gate with a leg silently absent. Assert
       # the tooling up front, the way draft-install-mock does.
-      - name: Assert python3 is available (peak-RSS leg depends on it)
+      - name: Assert python3 is available (peak-RSS legs depend on it)
         run: python3 --version
       # GitHub-hosted runners are ~3x slower and noisier than the dev
       # baseline the budgets were calibrated on (observed: warm check

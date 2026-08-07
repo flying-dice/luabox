@@ -50,6 +50,12 @@ orig_path="$PATH"
 # (one `name:line` per line, name in caught|missed|timeout|unviable) into the
 # -o directory, then exits $STUB_EXIT. `cargo mutants` dispatches to whatever
 # `cargo-mutants` is first on PATH, so this substitutes for the real tool.
+#
+# Every kind's file is created unconditionally (even with zero lines) UNLESS
+# its name appears in STUB_SKIP_OUTCOME_FILES (comma-separated) — that is the
+# one seam this stub has for staging N32: a real cargo-mutants run that never
+# writes one of the four files at all, which is a different fact from writing
+# it empty (see mutants-gate.sh's outcome-file existence check).
 mkdir -p "$work/bin"
 cat >"$work/bin/cargo-mutants" <<'STUB'
 #!/bin/bash
@@ -60,10 +66,13 @@ for arg in "$@"; do
     prev="$arg"
 done
 mkdir -p "$out/mutants.out"
-: >"$out/mutants.out/caught.txt"
-: >"$out/mutants.out/missed.txt"
-: >"$out/mutants.out/timeout.txt"
-: >"$out/mutants.out/unviable.txt"
+skip=",${STUB_SKIP_OUTCOME_FILES:-},"
+for kind in caught missed timeout unviable; do
+    case "$skip" in
+    *",$kind,"*) ;;
+    *) : >"$out/mutants.out/$kind.txt" ;;
+    esac
+done
 if [ -n "${STUB_OUTCOMES:-}" ] && [ -f "$STUB_OUTCOMES" ]; then
     while IFS= read -r entry; do
         [ -n "$entry" ] || continue
@@ -308,6 +317,32 @@ run r18_killed_and_shifted_beats_shared_key 1 "$killed_and_shifted" 3 \
     "new surviving mutant" "305:11" "1 new" "0 shifted" "1 stale" "prune it" \
     "!was: crates/luabox-types/src/env.rs:298:30" \
     "!now: crates/luabox-types/src/env.rs:305:11"
+
+# N32 (#58 review round 5): R18's whole fix, above, rests on caught.txt as
+# the ONLY evidence that separates "waived mutant genuinely killed" from
+# "waived mutant just moved". The old outcome_file() substituted /dev/null
+# for ANY of the four outcome files that did not exist, with no warning —
+# indistinguishable from that file existing and legitimately having zero
+# lines. So a cargo-mutants release that stops writing caught.txt (or any
+# release that fails to write it for some other reason) would silently
+# degrade Pass 0 straight back to the round-4 defect: the R18 fixture above
+# would go back to reporting a genuine kill as a mere SHIFT. STUB_OUTCOMES
+# here stages nothing but missed lines — no "caught:" entry — because the
+# stub's append (`>>`) would otherwise recreate caught.txt itself and defeat
+# the case; STUB_SKIP_OUTCOME_FILES is the only way this file can leave
+# caught.txt genuinely absent rather than empty. "!all reviewed" proves the
+# run did not fall through to classification and print OK for a state its
+# own Pass 0 could not actually evidence.
+steady_no_caught="$work/steady-no-caught.txt"
+cat >"$steady_no_caught" <<'OUT'
+missed:crates/luabox-types/src/env.rs:298:30: replace > with >= in TypeEnv::build_from_items
+missed:crates/luabox-types/src/env.rs:301:27: replace > with >= in TypeEnv::build_from_items
+missed:crates/luabox-types/src/env.rs:1333:9: replace TypeEnv::is_class -> bool with true
+OUT
+export STUB_SKIP_OUTCOME_FILES="caught"
+run caught_file_missing_fails_loudly 1 "$steady_no_caught" 3 \
+    "did not write" "caught.txt" "!all reviewed"
+unset STUB_SKIP_OUTCOME_FILES
 
 # F2: two waived mutants at different positions both shift in the same run.
 # Pairing must be nearest-position, not "whichever unclaimed waived line
@@ -599,6 +634,188 @@ fi
 # far enough from every other exit code in this file that a gate which
 # always exits 1 on error cannot pass this by accident.
 run status_137_propagates 137 "$steady" 137 "cargo-mutants failed with exit 137"
+
+# N33 (#58 review round 5): five load-bearing lines the earlier cases above
+# never exercised, found by deleting each of mutants-gate.sh's 232 non-
+# comment lines one at a time and re-running this file — those five left it
+# 25/25 green. Every case below was checked directly against mutants-gate.sh
+# with the named line deleted or neutered before being written the way it
+# is now: each such run reproduced the failure this comment describes, then
+# the line was restored.
+
+# :52 default_files — FILES' own default AND the scope of record R19 (see
+# scope_of_record_narrowing_fails above) is measured against. Every case
+# above sets FILES explicitly (via $scope or an override), so none of them
+# ever let the gate's actual default resolve — a truncation or typo in the
+# four-file literal would sit there undetected. Invoked directly, not
+# through run(), with FILES and SCOPE_OF_RECORD both left unset so the real
+# default is what the printed command line has to name. Deleting the line
+# does not silently narrow the scope, either — this repo's `set -u` turns
+# the now-unbound $default_files into a hard crash the moment `files=` reads
+# it (confirmed: "line 52: default_files: unbound variable", not a quiet
+# empty scope), which is a stronger failure than a truncation would produce
+# but still one this case's needles catch, since none of the four paths
+# would be in the log.
+default_files_log="$work/default_files.log"
+STUB_OUTCOMES="$empty" STUB_EXIT=0 \
+    ALLOWLIST="$comment_only_allowlist" MUTANTS_OUT="$work/out-default-files" \
+    bash "$gate" >"$default_files_log" 2>&1
+if grep -qF -- "--file crates/luabox-types/src/env.rs" "$default_files_log" \
+    && grep -qF -- "--file crates/luabox-types/src/defs.rs" "$default_files_log" \
+    && grep -qF -- "--file crates/luabox-types/src/generics.rs" "$default_files_log" \
+    && grep -qF -- "--file crates/luabox-types/src/infer/reify.rs" "$default_files_log"; then
+    echo "PASS  default_files_covers_all_four_scope_files"
+    pass=$((pass + 1))
+else
+    echo "FAIL  default_files_covers_all_four_scope_files: expected all four --file args in the log" >&2
+    sed 's/^/        /' "$default_files_log" >&2
+    fail=$((fail + 1))
+fi
+
+# :97 file_args+=(--file "$f") — nothing above ever asserted the printed
+# `cargo mutants` command line actually carries a --file argument; deleting
+# it silently widens every case in this file to `cargo mutants -p
+# luabox-types` over the WHOLE crate without failing a single one, because
+# the stub ignores every argument except -o. Reuses the ordinary $scope
+# fixture and pins the flag for it by name.
+file_args_log="$work/file_args.log"
+STUB_OUTCOMES="$steady" STUB_EXIT=3 \
+    FILES="$scope" ALLOWLIST="$allowlist" SCOPE_OF_RECORD="$scope" MUTANTS_OUT="$work/out-file-args" \
+    bash "$gate" >"$file_args_log" 2>&1
+if grep -qF -- "cargo mutants -p luabox-types --file crates/luabox-types/src/env.rs" "$file_args_log"; then
+    echo "PASS  file_args_scopes_cargo_mutants_to_files"
+    pass=$((pass + 1))
+else
+    echo "FAIL  file_args_scopes_cargo_mutants_to_files: expected --file crates/luabox-types/src/env.rs in the printed command line" >&2
+    sed 's/^/        /' "$file_args_log" >&2
+    fail=$((fail + 1))
+fi
+
+# sortpos() (the zero-padding awk function feeding both selection sorts) —
+# every fixture above uses positions of equal digit width, so lexicographic
+# and numeric order coincide and the function's actual job (making "100"
+# sort after "9", not before it) can never be exercised. Two waived lines at
+# 9:1 and 100:1, two live mutants at 20:1 and 95:1, all four sharing one
+# mutation text: correct (numeric) ascending-rank pairing is 9<->20 and
+# 100<->95. Confirmed by neutering sortpos to `return p` (no padding) and
+# re-running this exact fixture: the pairing crosses to 100<->20 and 9<->95
+# — lexicographically "100:1" sorts before "9:1" because '1' < '9' as the
+# first character — which is what these needles would catch.
+sortpos_allowlist="$work/sortpos-allowlist.txt"
+cat >"$sortpos_allowlist" <<'LIST'
+crates/luabox-types/src/env.rs:9:1: replace TypeEnv::is_class -> bool with true	[equivalent] narrow
+crates/luabox-types/src/env.rs:100:1: replace TypeEnv::is_class -> bool with true	[equivalent] wide
+LIST
+sortpos_outcomes="$work/sortpos-outcomes.txt"
+cat >"$sortpos_outcomes" <<'OUT'
+missed:crates/luabox-types/src/env.rs:20:1: replace TypeEnv::is_class -> bool with true
+missed:crates/luabox-types/src/env.rs:95:1: replace TypeEnv::is_class -> bool with true
+OUT
+sortpos_log="$work/sortpos_zero_pads_numerically.log"
+STUB_OUTCOMES="$sortpos_outcomes" STUB_EXIT=3 \
+    FILES="$scope" ALLOWLIST="$sortpos_allowlist" SCOPE_OF_RECORD="$scope" MUTANTS_OUT="$work/out-sortpos" \
+    bash "$gate" >"$sortpos_log" 2>&1
+sortpos_exit=$?
+if [ "$sortpos_exit" = 0 ] \
+    && grep -A1 -F "was: crates/luabox-types/src/env.rs:9:1" "$sortpos_log" | grep -qF "now: crates/luabox-types/src/env.rs:20:1" \
+    && grep -A1 -F "was: crates/luabox-types/src/env.rs:100:1" "$sortpos_log" | grep -qF "now: crates/luabox-types/src/env.rs:95:1"; then
+    echo "PASS  sortpos_zero_pads_numerically (exit $sortpos_exit)"
+    pass=$((pass + 1))
+else
+    echo "FAIL  sortpos_zero_pads_numerically: expected 9->20 and 100->95 paired by numeric, not lexicographic, position" >&2
+    sed 's/^/        /' "$sortpos_log" >&2
+    fail=$((fail + 1))
+fi
+
+# Pass 0's tie-break sort and take0 = min(nc, rw0) — when a key has more
+# unclaimed waived lines than caught.txt entries to prove them with, this is
+# the arithmetic and ordering deciding WHICH waived line(s) retire as STALE
+# on caught-entry evidence and which are left open for Pass 2. Two waived
+# lines at 50:1 (low) and 60:1 (high), one caught entry (so nc=1, rw0=2,
+# take0=1) and one live survivor at 70:1: correct behaviour retires ONLY the
+# lower-position line (50) as stale and leaves 60 open, which Pass 2 then
+# pairs with the live 70:1 as a shift. Confirmed by changing take0 to `rw0`
+# (retire every unclaimed line, ignoring how much caught.txt evidence there
+# actually is): both waived lines go stale, the live 70:1 has nothing left
+# to pair with and becomes a NEW survivor, and the whole run flips to
+# FAILED — every needle below would miss. The allowlist strips reason text
+# before comparison (column 1 only), so this is asserted on POSITION, not
+# on the [equivalent] label, which never reaches the gate's output at all.
+#
+# This is also N34's exact shape (#58 review round 5), and doubles as its
+# regression case: rw0 (2) > nc (1) here, so which specific line the report
+# retires is a position-rank pick, not a proof that THAT line (rather than
+# 60:1) is the one nc's single caught entry actually killed — the old
+# wording ("a test now kills it — prune it") stated the pick as fact
+# regardless. "PROBABLY" is the hedge that must appear on 50:1's line now;
+# the un-ambiguous sibling cases above (f1_caught_proof_beats_shared_key,
+# r18_killed_and_shifted_beats_shared_key — both rw0 == nc, no leftover
+# candidate, nothing to hedge) keep asserting the confident "prune it"
+# wording, so this file pins both sides of the distinction.
+take0_allowlist="$work/take0-allowlist.txt"
+cat >"$take0_allowlist" <<'LIST'
+crates/luabox-types/src/env.rs:50:1: replace TypeEnv::is_class -> bool with true	[equivalent] lower position, must retire first
+crates/luabox-types/src/env.rs:60:1: replace TypeEnv::is_class -> bool with true	[equivalent] higher position, must stay open for Pass 2
+LIST
+take0_outcomes="$work/take0-outcomes.txt"
+cat >"$take0_outcomes" <<'OUT'
+caught:crates/luabox-types/src/env.rs:999:1: replace TypeEnv::is_class -> bool with true
+missed:crates/luabox-types/src/env.rs:70:1: replace TypeEnv::is_class -> bool with true
+OUT
+ALLOWLIST_OVERRIDE="$take0_allowlist" \
+    run pass0_retires_lowest_position_first 0 "$take0_outcomes" 3 \
+    "1 stale" \
+    "PROBABLY no longer survives" "position-rank pick, not individual proof" \
+    "crates/luabox-types/src/env.rs:50:1" \
+    "was: crates/luabox-types/src/env.rs:60:1" "now: crates/luabox-types/src/env.rs:70:1" \
+    "!prune it): crates/luabox-types/src/env.rs:50:1" \
+    "!prune it): crates/luabox-types/src/env.rs:60:1" \
+    "!was: crates/luabox-types/src/env.rs:50:1"
+
+# `| sort` at the end of the classification pipeline — mixed_batch_output_is_
+# sorted above already discloses that its own 2-key fixture happens to come
+# out in sorted order from gawk's unsorted hash iteration anyway, so it does
+# not prove the line load-bearing. This fixture was found empirically (run
+# with `| sort` stripped, try candidate multi-key batches, keep the one that
+# actually differs): four keys spanning all four kinds — NEW (900), SHIFT
+# (fn_b, 20->25), STALE (fn_a, 10) and STALE (fn_c, 30), TIMEOUT (fn_d, 40)
+# — whose natural gawk iteration order this run measured as STALE(fn_c),
+# SHIFT(fn_b), STALE(fn_a), NEW, TIMEOUT — provably NOT the sorted order
+# (NEW, SHIFT, STALE(fn_a=10), STALE(fn_c=30), TIMEOUT(fn_d)) `| sort`
+# produces and this case asserts.
+sort_allowlist="$work/sort-allowlist.txt"
+cat >"$sort_allowlist" <<'LIST'
+crates/luabox-types/src/env.rs:10:1: replace fn_a with ()	[equivalent] a
+crates/luabox-types/src/env.rs:20:1: replace fn_b with ()	[equivalent] b
+crates/luabox-types/src/env.rs:30:1: replace fn_c with ()	[equivalent] c
+crates/luabox-types/src/env.rs:40:1: replace fn_d with ()	[equivalent] d
+LIST
+sort_outcomes="$work/sort-outcomes.txt"
+cat >"$sort_outcomes" <<'OUT'
+missed:crates/luabox-types/src/env.rs:900:1: replace fn_new with ()
+missed:crates/luabox-types/src/env.rs:25:1: replace fn_b with ()
+caught:crates/luabox-types/src/env.rs:30:1: replace fn_c with ()
+timeout:crates/luabox-types/src/env.rs:40:1: replace fn_d with ()
+OUT
+sort_log="$work/pipeline_output_is_sorted.log"
+STUB_OUTCOMES="$sort_outcomes" STUB_EXIT=3 \
+    FILES="$scope" ALLOWLIST="$sort_allowlist" SCOPE_OF_RECORD="$scope" MUTANTS_OUT="$work/out-sort" \
+    bash "$gate" >"$sort_log" 2>&1
+new_line="$(grep -n 'new surviving mutant' "$sort_log" | head -1 | cut -d: -f1)"
+shift_line="$(grep -n 'waived mutant moved' "$sort_log" | head -1 | cut -d: -f1)"
+stale_a_line="$(grep -n 'env.rs:10:1: replace fn_a' "$sort_log" | grep 'prune it' | head -1 | cut -d: -f1)"
+stale_c_line="$(grep -n 'env.rs:30:1: replace fn_c' "$sort_log" | grep 'prune it' | head -1 | cut -d: -f1)"
+timeout_line="$(grep -n 'timed out this run rather than surviving' "$sort_log" | head -1 | cut -d: -f1)"
+if [ -n "$new_line" ] && [ -n "$shift_line" ] && [ -n "$stale_a_line" ] && [ -n "$stale_c_line" ] && [ -n "$timeout_line" ] \
+    && [ "$new_line" -lt "$shift_line" ] && [ "$shift_line" -lt "$stale_a_line" ] \
+    && [ "$stale_a_line" -lt "$stale_c_line" ] && [ "$stale_c_line" -lt "$timeout_line" ]; then
+    echo "PASS  pipeline_output_is_sorted_across_four_kinds (NEW $new_line < SHIFT $shift_line < STALE(a) $stale_a_line < STALE(c) $stale_c_line < TIMEOUT $timeout_line)"
+    pass=$((pass + 1))
+else
+    echo "FAIL  pipeline_output_is_sorted_across_four_kinds: expected NEW < SHIFT < STALE(fn_a) < STALE(fn_c) < TIMEOUT" >&2
+    sed 's/^/        /' "$sort_log" >&2
+    fail=$((fail + 1))
+fi
 
 echo
 echo "mutants-gate-selftest: $pass passed, $fail failed"

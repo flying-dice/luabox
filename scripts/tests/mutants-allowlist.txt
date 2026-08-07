@@ -48,6 +48,29 @@
 # which is why none of them appears below. Every one of the 17 waivers is in
 # env.rs.
 #
+# THIS COVERS FOUR FILES, NOT THE ROUND'S WHOLE CHANGE — mutants-gate.sh's
+# default_files (the scope of record) is these four crates/luabox-types
+# paths only, deliberately (see that script's own "Scope:" comment for why).
+# Say what that means plainly rather than let "every viable mutant … is
+# CAUGHT" read wider than it is: the BOM fix in
+# crates/luabox-syntax/src/luacats/mod.rs, the LSP resolution work in
+# crates/luabox-lsp, and the new `unsafe impl salsa::Update for ProjectTypes`
+# in crates/luabox-db/src/value.rs are all outside this scope and this run
+# says nothing about any of them — mutation-audited or not, that is a claim
+# for whoever reviewed those files by hand, not for this file (#58 review
+# round 5, N35).
+#
+# BE PRECISE ABOUT WHAT BACKED THIS: a manual run, not a CI-enforced one.
+# `mutants.yml`'s `pull_request` trigger structurally cannot run the
+# `mutants` job at all (its `if:` excludes that event, deliberately — a full
+# run costs tens of minutes and would otherwise tax every push to an open
+# PR), so nothing in CI re-measures this line's claim against a PR head
+# before merge; the schedule/push-to-main triggers are what re-measure it
+# afterward, on `main`. If you want CI itself to have confirmed this exact
+# head rather than trusting this paragraph, `workflow_dispatch` on
+# `mutants.yml` runs the full job against any ref, PR branch included — see
+# that trigger's comment in the workflow file.
+#
 # Two earlier runs on this same scope FAILED, and both are worth recording
 # because they are what this file is for. The first found 8 new survivors in
 # then-new code (`generic_classes`, three `collect_free_names` arms,

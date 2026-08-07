@@ -179,8 +179,32 @@ case "$status" in
 esac
 
 results="$out_dir/mutants.out"
-outcome_file() { [ -f "$results/$1" ] && echo "$results/$1" || echo /dev/null; }
-missed="$(outcome_file missed.txt)"
+# cargo-mutants writes all four outcome files unconditionally whenever a run
+# reaches classification — mutants-gate-selftest.sh's stub replicates exactly
+# that (every case creates all four, even the ones with zero entries).
+# EMPTY caught.txt is a fact: "0 mutants caught this run", the ordinary shape
+# of a run whose scope has few or no defensive-equivalent survivors. A
+# MISSING caught.txt is a different fact: cargo-mutants failed to write it, or
+# a future release renamed/dropped it. Pass 0 below has no other source of
+# evidence that a waived mutant was genuinely killed rather than merely
+# shifted (R18) — reading a missing file as "nothing caught" would silently
+# disable that evidence and hand every killed-and-shifted mutant back to
+# Pass 2 as an ordinary shift, degrading straight back to the round-4 defect
+# with no warning at all. That is a fourth way to audit NOTHING (see the
+# header above, which names three) — fail loudly, same as the other three,
+# rather than substituting /dev/null and continuing.
+for outcome in caught missed timeout unviable; do
+    if [ ! -f "$results/$outcome.txt" ]; then
+        echo
+        echo "mutants-gate: FAILED — cargo-mutants did not write $results/$outcome.txt" >&2
+        echo "mutants-gate:   a missing outcome file is not the same fact as one with zero lines in it —" >&2
+        echo "mutants-gate:   the gate cannot tell 'nothing $outcome this run' from 'the classification" >&2
+        echo "mutants-gate:   this run depends on silently did not happen'. Check the installed cargo-mutants" >&2
+        echo "mutants-gate:   version against what it writes to -o." >&2
+        exit 1
+    fi
+done
+missed="$results/missed.txt"
 # A TIMED-OUT mutant is not a killed one: no test proved it dead, the run just
 # stopped waiting. Judging `missed.txt` alone would let a loaded runner — where
 # every survivor happens to time out — print "0 survivors" and exit 0, which is
@@ -188,9 +212,9 @@ missed="$(outcome_file missed.txt)"
 # as coverage). So timeouts are judged by the same allowlist: an already-
 # reviewed line that flaps missed -> timeout stays reviewed, a NEW timed-out
 # mutant is an unjudged one and fails.
-timeout="$(outcome_file timeout.txt)"
-caught="$(outcome_file caught.txt)"
-unviable="$(outcome_file unviable.txt)"
+timeout="$results/timeout.txt"
+caught="$results/caught.txt"
+unviable="$results/unviable.txt"
 
 # `grep -c` prints its count and exits 1 when that count is zero, so the
 # non-zero status is swallowed rather than answered with a second "0".
@@ -319,6 +343,19 @@ END {
         # still-open shift. Retire lowest-position-rank waived lines first
         # when there are more unclaimed waived lines than caught entries to
         # prove them with — the rest stay open for Pass 2.
+        #
+        # That "retire lowest-position-rank first" rule is a REPRODUCIBLE
+        # pick, not a PROVEN one, exactly when rw0 > nc: nc caught entries
+        # prove that many of the waived lines sharing this key are dead, but
+        # not WHICH ones — the cargo-mutants report does not correlate a caught
+        # mutant back to which reviewed candidate it was. When rw0 == nc
+        # every remaining candidate retires regardless of pick order, so the
+        # CONCLUSION is sound even though the individual pairing is still
+        # arbitrary; when rw0 > nc the pick determines which specific line
+        # the report calls dead and which stays open, and got there by
+        # position rank alone. `ambiguous` records exactly this case for the
+        # STALE line printed below, which reads it back and hedges instead
+        # of stating an unproven pick as fact (#58 review round 5, N34).
         nc = cn[k] + 0
         if (nc > 0) {
             rw0 = 0
@@ -327,10 +364,12 @@ END {
                 for (b = a + 1; b <= rw0; b++)
                     if (rkey0[b] < rkey0[a]) { t = rkey0[a]; rkey0[a] = rkey0[b]; rkey0[b] = t; t = ridx0[a]; ridx0[a] = ridx0[b]; ridx0[b] = t }
             take0 = (nc < rw0) ? nc : rw0
+            ambiguous = (rw0 > nc)
             for (a = 1; a <= take0; a++) {
                 j = ridx0[a]
                 wtaken[k, j] = 1
-                print "STALE\t" wline[k, j]
+                if (ambiguous) print "STALE\t" wline[k, j] "\tTIE"
+                else           print "STALE\t" wline[k, j]
             }
             delete ridx0; delete rkey0
         }
@@ -400,7 +439,17 @@ while IFS=$'\t' read -r kind a b; do
         # Stale = the allowlist line neither survived NOR timed out anywhere,
         # i.e. a test now kills it. A line that only moved is a SHIFT above and
         # is still unkilled, so it is not stale and must not be pruned.
-        echo "NOTE  allowlist line no longer survives (a test now kills it — prune it): $a"
+        #
+        # $b == TIE (set by the classifier's Pass 0, above) means THIS line
+        # was picked by position rank among several sharing the same
+        # mutation text, with fewer caught.txt entries than candidates —
+        # some line in that group is proven dead, this one specifically is
+        # not (N34). Say so instead of stating the pick as fact.
+        if [ "$b" = "TIE" ]; then
+            echo "NOTE  allowlist line PROBABLY no longer survives — proven dead is one of several reviewed lines sharing this exact mutation text; WHICH one is a position-rank pick, not individual proof. Verify by hand before pruning: $a"
+        else
+            echo "NOTE  allowlist line no longer survives (a test now kills it — prune it): $a"
+        fi
         stale=$((stale + 1))
         ;;
     esac

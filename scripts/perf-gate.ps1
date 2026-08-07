@@ -8,9 +8,14 @@
     Gates: cold start, `fmt --check` throughput (kept as a wider safety
     net), the real `check` gate (live since GL#6), a diagnostics-heavy
     `lint` + `check` gate in two variants — findings suppressed, and
-    findings reported — and a peak-RSS gate on the same 100-kLOC corpus
+    findings reported — a peak-RSS gate on the same 100-kLOC corpus
     (decisions/07 accepted a ~1.9x RSS trade; the ceiling side of that
-    bargain is now enforced).
+    bargain is now enforced), and a second, independent peak-RSS + wall-time
+    gate (the RETAINED-TYPEENV REGRESSION GATE) on a 500-file corpus shaped
+    to catch a different regression the first RSS gate's corpus is too
+    small to widen: round 4 review R14's reverted retained-`Vec<TypeEnv>`
+    change, at ~25x peak RSS on this one at N=500 against ~5x on the
+    100-kLOC corpus.
 
     Why those last gates exist: the ~100-kLOC corpus the first three legs
     use is *clean* (`check: 0 errors, 0 warnings`), so none of them ever
@@ -52,6 +57,40 @@ $PSNativeCommandUseErrorActionPreference = $false
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
+
+# New-PerfManifest -Path -Name -Strict — every generated corpus below needs
+# a luabox.toml differing only in `name` and whether `[types] strict = true`
+# is present; two near-identical here-strings (the bash gate's N42 finding
+# applies here too) is exactly the kind of duplication that lets one copy
+# drift from the other silently. One writer, one place to read the shape
+# from — mirrors scripts/perf-gate-lib.sh's write_perf_manifest.
+function New-PerfManifest {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Name,
+        [bool]$Strict = $false
+    )
+    $body = @"
+[package]
+name = "$Name"
+version = "0.0.0"
+edition = "5.4"
+
+[build]
+target = "5.4"
+out = "dist"
+
+"@
+    if ($Strict) {
+        $body += @"
+[types]
+strict = true
+
+"@
+    }
+    $body += "[dependencies]"
+    Set-Content -Path $Path -Value $body -NoNewline
+}
 
 $ColdStartBudgetBaseMs = 50
 $FmtBudgetBaseMs = 2000
@@ -119,22 +158,7 @@ try {
     & $genCorpusBin --out (Join-Path $corpusDir "src") --seed 42 --files 50 --lines-per-file 2000
     if ($LASTEXITCODE -ne 0) { throw "gen-corpus failed (exit $LASTEXITCODE)" }
 
-    $manifest = @'
-[package]
-name = "perf-gate-corpus"
-version = "0.0.0"
-edition = "5.4"
-
-[build]
-target = "5.4"
-out = "dist"
-
-[types]
-strict = true
-
-[dependencies]
-'@
-    Set-Content -Path (Join-Path $corpusDir "luabox.toml") -Value $manifest -NoNewline
+    New-PerfManifest -Path (Join-Path $corpusDir "luabox.toml") -Name "perf-gate-corpus" -Strict $true
 
     # --- Cold start: MIN of N runs ----------------------------------------
     # Min (not mean/median) is the right statistic for a cold-start
@@ -249,6 +273,123 @@ strict = true
         $fail = $true
     }
 
+    # --- RETAINED-TYPEENV REGRESSION GATE -------------------------------------
+    # Windows counterpart of scripts/perf-gate.sh's leg of the same name
+    # (round 4 review R14, reverted by round 4 review finding 6 — see
+    # check_cmd.rs's run_passes/check_one doc comments and
+    # luabox-types/src/lib.rs's build_file_env doc comment). The bash gate's
+    # comment carries the full history and the measured table (Linux, release
+    # build, three runs each):
+    #
+    #   N      transient (correct)   retained (R14, reintroduced)   ratio
+    #   100     11 MiB                 51 MiB                        4.6x
+    #   200     15 MiB                145 MiB                        9.3x
+    #   300     20 MiB                290 MiB                       14.5x
+    #   500     29 MiB                734 MiB                       25.3x
+    #
+    # Same corpus shape, same N=500, same 100 MiB budget as the bash gate —
+    # just over 3x the correct implementation's ~29 MiB, while the retained
+    # implementation misses it by ~7x. $env:LUABOX_RETAINED_ENV_RSS_BUDGET_MIB
+    # overrides the MiB ceiling; NOT scaled by -Factor, same reason as
+    # $RssBudgetMib above. The wall-time budget IS scaled by -Factor, like
+    # every timed leg — this is the Windows half of the bash gate's N37 fix:
+    # previously this leg measured peak RSS only, so `check` could regress
+    # arbitrarily here and stay green.
+    $RetainedEnvCorpusFiles = 500
+    $RetainedEnvRssBudgetMib = $(if ($env:LUABOX_RETAINED_ENV_RSS_BUDGET_MIB) { [int]$env:LUABOX_RETAINED_ENV_RSS_BUDGET_MIB } else { 100 })
+    $RetainedEnvCheckBudgetBaseMs = 4000
+    $retainedEnvCheckBudget = $RetainedEnvCheckBudgetBaseMs * $Factor
+
+    Write-Host ""
+    Write-Host "perf-gate: generating $RetainedEnvCorpusFiles-file retained-TypeEnv regression corpus..."
+    $retainedEnvRoot = Join-Path $corpusDir "retained-env"
+    $retainedEnvSrc = Join-Path $retainedEnvRoot "src"
+    New-Item -ItemType Directory -Path $retainedEnvSrc -Force | Out-Null
+    New-PerfManifest -Path (Join-Path $retainedEnvRoot "luabox.toml") -Name "perf-gate-retained-env" -Strict $true
+
+    for ($i = 0; $i -lt $RetainedEnvCorpusFiles; $i++) {
+        $modLines = [System.Collections.Generic.List[string]]::new()
+        if ($i -gt 0) {
+            $modLines.Add("local prev = require(`"mod_$($i - 1)`")")
+            $modLines.Add("")
+        }
+        $modLines.Add("---@class Widget${i}A")
+        $modLines.Add("---@field n number")
+        $modLines.Add("local A = { n = $i }")
+        $modLines.Add("")
+        $modLines.Add("---@class Widget${i}B")
+        $modLines.Add("---@field n number")
+        $modLines.Add("local B = { n = $i }")
+        $modLines.Add("")
+        if ($i -gt 0) {
+            $modLines.Add("return { a = A, b = B, prev = prev }")
+        } else {
+            $modLines.Add("return { a = A, b = B }")
+        }
+        Set-Content -Path (Join-Path $retainedEnvSrc "mod_$i.lua") -Value $modLines
+    }
+
+    # Windows counterpart of the bash gate's N38 fix: a PASS printed against
+    # a corpus that was not actually generated the way the budgets below
+    # assume is not evidence of anything.
+    $actualLuaFiles = (Get-ChildItem -Path $retainedEnvSrc -Filter "*.lua" -File).Count
+    if ($actualLuaFiles -ne $RetainedEnvCorpusFiles) {
+        Write-Host ("FAIL retained-TypeEnv regression: corpus has {0} .lua file(s), expected {1} — the generation step did not run as this leg's budget assumes" -f $actualLuaFiles, $RetainedEnvCorpusFiles)
+        $fail = $true
+    } else {
+        Write-Host ""
+        Write-Host "perf-gate: peak RSS + wall time of check on the retained-TypeEnv regression corpus (warm)..."
+        # RAYON_NUM_THREADS=4 pinned around both the warm-up and the measured
+        # process — Windows counterpart of the bash gate's N39 fix. Peak RSS
+        # on this corpus scales with rayon parallelism x ambient size
+        # (luabox-types/src/lib.rs), so an unpinned thread count would make
+        # the 100 MiB ceiling mean something different on every runner width;
+        # pinning keeps the ceiling itself honest instead of loosening it.
+        $prevRayonThreads = $env:RAYON_NUM_THREADS
+        $env:RAYON_NUM_THREADS = "4"
+        try {
+            Push-Location $retainedEnvRoot
+            try {
+                & $luaboxBin check *> $null
+            } finally {
+                Pop-Location
+            }
+
+            $retainedInfo = [System.Diagnostics.ProcessStartInfo]::new()
+            $retainedInfo.FileName = $luaboxBin
+            $retainedInfo.Arguments = "check"
+            $retainedInfo.WorkingDirectory = $retainedEnvRoot
+            $retainedInfo.UseShellExecute = $false
+            $retainedInfo.RedirectStandardOutput = $true
+            $retainedInfo.RedirectStandardError = $true
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $retainedProc = [System.Diagnostics.Process]::Start($retainedInfo)
+            $retainedProc.StandardOutput.ReadToEnd() | Out-Null
+            $retainedProc.StandardError.ReadToEnd() | Out-Null
+            $retainedProc.WaitForExit()
+            $sw.Stop()
+            $retainedEnvMs = $sw.Elapsed.TotalMilliseconds
+            $retainedEnvRssMib = [int]($retainedProc.PeakWorkingSet64 / 1MB)
+            $retainedProc.Dispose()
+        } finally {
+            if ($prevRayonThreads) { $env:RAYON_NUM_THREADS = $prevRayonThreads } else { Remove-Item Env:\RAYON_NUM_THREADS -ErrorAction SilentlyContinue }
+        }
+
+        if ($retainedEnvRssMib -lt $RetainedEnvRssBudgetMib) {
+            Write-Host ("PASS retained-TypeEnv regression, peak RSS: {0} MiB < {1} MiB" -f $retainedEnvRssMib, $RetainedEnvRssBudgetMib)
+        } else {
+            Write-Host ("FAIL retained-TypeEnv regression, peak RSS: {0} MiB >= {1} MiB" -f $retainedEnvRssMib, $RetainedEnvRssBudgetMib)
+            Write-Host "     round 4 review R14 (reverted) measured ~734 MiB on this corpus (Linux); see check_cmd.rs's run_passes doc comment"
+            $fail = $true
+        }
+        if ($retainedEnvMs -lt $retainedEnvCheckBudget) {
+            Write-Host ("PASS retained-TypeEnv regression, wall time: {0:N1} ms < {1:N1} ms" -f $retainedEnvMs, $retainedEnvCheckBudget)
+        } else {
+            Write-Host ("FAIL retained-TypeEnv regression, wall time: {0:N1} ms >= {1:N1} ms" -f $retainedEnvMs, $retainedEnvCheckBudget)
+            $fail = $true
+        }
+    }
+
     # --- DIAGNOSTICS-HEAVY GATE ---------------------------------------------
     # The corpus above is clean, so nothing so far times per-diagnostic
     # work. These four legs do: one file, $DiagCorpusFindings findings,
@@ -268,22 +409,10 @@ strict = true
     $diagLintRenderedBudget = $DiagLintRenderedBudgetBaseMs * $Factor
     $diagCheckRenderedBudget = $DiagCheckRenderedBudgetBaseMs * $Factor
 
-    $diagManifest = @'
-[package]
-name = "perf-gate-diagnostics"
-version = "0.0.0"
-edition = "5.4"
-
-[build]
-target = "5.4"
-out = "dist"
-
-[dependencies]
-'@
     $diagRoot = Join-Path $corpusDir "diagnostics-heavy"
     foreach ($project in @("lint", "check", "lint-rendered", "check-rendered")) {
         New-Item -ItemType Directory -Path (Join-Path $diagRoot "$project/src") -Force | Out-Null
-        Set-Content -Path (Join-Path $diagRoot "$project/luabox.toml") -Value $diagManifest -NoNewline
+        New-PerfManifest -Path (Join-Path $diagRoot "$project/luabox.toml") -Name "perf-gate-diagnostics" -Strict $false
     }
 
     Write-Host ""

@@ -4,6 +4,19 @@
 # push. Survivors are compared against the committed allowlist
 # (scripts/tests/mutants-allowlist.txt): a NEW survivor fails the job, so
 # the weekly signal is "a test gap appeared", never a drifting score.
+#
+# What this means for a PR: `pull_request` cannot trigger the `mutants` job
+# (see its `if:` below) — automatically, nothing in CI re-measures a PR head
+# before merge, so a claim like mutants-allowlist.txt's header ("MEASURED
+# AGAINST THIS HEAD") is evidence from a run someone did, not evidence CI
+# enforced. A maintainer who wants that confirmation FROM CI, against an
+# exact PR head, before merging, can get it on demand at the cost of the one
+# run it would otherwise take a week to reach: Actions -> mutants -> Run
+# workflow -> pick the PR's branch as the ref. `workflow_dispatch` is not
+# `pull_request`, so the job-level `if:` lets it through, and `gate-selftest`
+# runs first exactly as it does on every other trigger. That is the honest
+# shape of the tradeoff this file makes: automatic-and-free on a schedule, or
+# CI-verified-and-costly on demand — never automatic-and-free on every push.
 name: mutants
 
 on:
@@ -36,10 +49,25 @@ on:
       # so a new file in that family is covered on both triggers by
       # construction rather than by remembering to edit two lists. The
       # workflow file is self-referential for the same reason
-      # luals-parity.yml lists itself.
+      # luals-parity.yml lists itself. Cargo.lock, the workspace Cargo.toml
+      # and rust-toolchain.toml are here for the same reason
+      # luals-parity.yml's push trigger lists them: `cargo mutants` shells
+      # out through `cargo`, a rustup shim that resolves rust-toolchain.toml,
+      # and builds against whatever Cargo.lock/Cargo.toml pin — a dependency
+      # or toolchain bump can change which mutants are even generated (a
+      # changed dependency's types reshape what compiles) exactly like a
+      # source change would, and needs the same trigger.
       - "crates/**"
       - "scripts/tests/mutants-*"
       - ".github/workflows/mutants.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+  # The only trigger under which `mutants` (not just `gate-selftest`) can run
+  # against an open PR's head — see the file header above. Pick the PR's
+  # source branch as the ref when dispatching; `actions/checkout@v4` below
+  # checks out whatever ref this run was dispatched against, same as any
+  # other trigger.
   workflow_dispatch:
   # Also run gate-selftest (seconds, no cargo-mutants, no build) when the
   # gate itself or its expectations change, so a broken script or a bad
@@ -56,6 +84,22 @@ on:
       # would silently exclude a fourth `mutants-*` file from this trigger
       # while `push`'s glob picked it up automatically — one rule, two
       # mechanisms, free to disagree. One glob now backs both.
+      #
+      # `crates/**` is here because gate-selftest hard-depends on
+      # crates/luabox-types/src/{env,defs}.rs existing at the paths its
+      # fixture scope hardcodes (mutants-gate-selftest.sh's $scope and its
+      # defs.rs FILES_OVERRIDE case) — mutants-gate.sh's own "scoped file
+      # does not exist" check is exactly what fires when they do not.
+      # Reproduced: rename env.rs on a branch and re-run the self-test
+      # locally — 4 passed, 22 failed (checked against this file's current
+      # 26-case suite; re-grep before trusting the count next time a case is
+      # added or removed). Without `crates/**` on THIS trigger, a
+      # PR that renames or moves either file matches nothing here, so
+      # gate-selftest never runs to catch it, the PR merges green, and
+      # `push`'s copy of the same glob (which does cover `crates/**`) is what
+      # finally fails it — on main, after merge, as the mirror of the defect
+      # R22 named on the other trigger.
+      - "crates/**"
       - "scripts/tests/mutants-*"
       - ".github/workflows/mutants.yml"
 
@@ -94,6 +138,10 @@ jobs:
     # a full run costs tens of minutes — the merge-path cost this workflow
     # rides schedule/push-to-main to avoid (see the `on:` block above).
     # gate-selftest above still runs on every PR touching the gate files.
+    # This condition is what makes `mutants` unable to gate any PR
+    # automatically — `workflow_dispatch` is the deliberate exception (see
+    # its comment in the `on:` block), for a maintainer who wants CI, not
+    # just a human, to have re-measured this exact PR head before merge.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 120
