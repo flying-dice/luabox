@@ -48,6 +48,7 @@ use luabox_syntax::luacats::{TypeExpr, TypeExprKind};
 use luabox_types::RockSurfaces;
 use luabox_types::ty::{FieldTy, Ty};
 
+use crate::merged_ambient::MergedAmbient;
 use crate::sema::FileSema;
 
 /// Module string → export type for one file's static `require`s: the project
@@ -165,8 +166,8 @@ pub fn export_fields(ty: &Ty) -> Option<&BTreeMap<String, FieldTy>> {
 }
 
 /// The `require` binding's module's structural table export
-/// ([`export_fields`]) — but **only** when [`receiver_type`] resolves to
-/// nothing for the same binding (R7).
+/// ([`export_fields`]) — but **only** when [`receiver_type`] does not
+/// *resolve* to a class shape for the same binding (R7, N16).
 ///
 /// `receiver_type` already gives an explicit `---@type`/`---@param`
 /// annotation priority over anything inferred from a `require`, and gives a
@@ -182,13 +183,29 @@ pub fn export_fields(ty: &Ty) -> Option<&BTreeMap<String, FieldTy>> {
 /// check before reading the module's table shape, so a binding with a class
 /// reference of its own — whether written or carried — never falls back to
 /// it, on either surface, again.
+///
+/// The gate checks `ambient.class_members_of(...)`, not merely
+/// `receiver_type(...).is_some()` (N16): a *presence* check suppresses the
+/// structural route for **any** `---@type`, including one whose name
+/// resolves to nothing — `---@type table`, `---@type Bogus`, or a mid-edit
+/// partially-typed class name, none of which `ambient` can ever answer a
+/// member for. Gating on presence alone left those cases dead on both
+/// surfaces: the class arm below (`ambient_member_items`/`member_hover`'s
+/// second branch) also fails to resolve, and nothing catches it — hover
+/// `None`, completion `[]`, even though `luabox check` reports no
+/// diagnostics for the same file. A *resolves* check falls back to the
+/// table shape exactly when the annotation cannot answer for member access,
+/// matching what the checker itself would do.
 #[must_use]
 pub fn require_struct_fields<'s, 'a>(
     sema: &'s FileSema,
     exports: &'a RequireExports,
+    ambient: &MergedAmbient,
     binding: &Binding,
 ) -> Option<(&'s str, &'a BTreeMap<String, FieldTy>)> {
-    if receiver_type(sema, exports, binding).is_some() {
+    if let Some(ty) = receiver_type(sema, exports, binding)
+        && ambient.class_members_of(&ty).is_some()
+    {
         return None;
     }
     let module = require_module_of(sema, binding)?;

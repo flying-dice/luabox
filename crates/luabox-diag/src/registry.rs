@@ -163,6 +163,11 @@ static REGISTRY: &[Entry] = &[
         explain: LB0316,
     },
     Entry {
+        code: Code::new(317),
+        title: "class ancestry deeper than the resolver walks",
+        explain: LB0317,
+    },
+    Entry {
         code: Code::new(500),
         title: "malformed `---@luabox-ignore`",
         explain: LB0500,
@@ -1239,6 +1244,39 @@ fetch()   -- not flagged, this line only
 
 Mark the enclosing function `---@async`, move the call into an async function,
 or suppress the diagnostic if the call is genuinely synchronous-safe.
+";
+
+const LB0317: &str = "\
+# LB0317: class ancestry deeper than the resolver walks
+
+A `---@class` inherits through a parent chain longer than luabox resolves
+(200 links). Members declared above that depth are **not** in the resolved
+shape, so reads of them are unchecked rather than silently correct — which is
+why this is reported rather than truncated quietly.
+
+```lua
+---@class C0
+---@field deep string
+
+---@class C1 : C0
+---@class C2 : C1
+-- ... 200+ links ...
+---@class C201 : C200   -- LB0317: ancestry deeper than 200 links
+```
+
+**Why there is a limit at all.** Resolving a class walks its ancestors
+recursively, one native stack frame per link. The ceiling is the thread's
+stack, which differs by entry point — an editor embedding the language
+server can run the walk on a thread with no explicit stack budget at all —
+so an unbounded walk aborts the process on some hosts and not others, with
+no diagnostic and no file name. A fixed limit well under the smallest
+measured floor turns that into this message.
+
+**What to do.** A 200-deep inheritance chain is almost always generated
+code or a mistake — a cycle written as a chain, or a generator emitting one
+class per row. Flatten the hierarchy, or declare the members you actually
+read on a class nearer the leaf. A genuine cycle (`A : B`, `B : A`) is a
+different diagnostic and terminates safely on its own.
 ";
 
 const LB0500: &str = "\

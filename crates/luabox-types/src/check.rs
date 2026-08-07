@@ -54,11 +54,11 @@ use crate::assign::{
     Exactness, LiteralConformance, assignable, classify_literal, is_integral_literal,
 };
 use crate::codes::{
-    AWAIT_IN_SYNC, CYCLIC_ALIAS, DEPRECATED, DISCARD_RETURNS, DUPLICATE_DOC_FIELD, GENERIC_ARITY,
-    MISSING_FIELD, RETURN_MISMATCH, TYPE_MISMATCH, UNKNOWN_FIELD, UNKNOWN_TYPE_NAME,
-    WRONG_ARG_COUNT,
+    AWAIT_IN_SYNC, CLASS_DEPTH_LIMIT, CYCLIC_ALIAS, DEPRECATED, DISCARD_RETURNS,
+    DUPLICATE_DOC_FIELD, GENERIC_ARITY, MISSING_FIELD, RETURN_MISMATCH, TYPE_MISMATCH,
+    UNKNOWN_FIELD, UNKNOWN_TYPE_NAME, WRONG_ARG_COUNT,
 };
-use crate::env::{self, TypeEnv};
+use crate::env::{self, MAX_ANCESTRY_DEPTH, TypeEnv};
 use crate::ty::{FieldTy, FunctionTy, OperatorSig, ParamTy, TableTy, Ty};
 use crate::version::VersionReq;
 
@@ -179,6 +179,47 @@ pub(crate) fn run(
     }
     checker.check_deferred_carriers();
     checker.check_class_conformance();
+
+    // A `---@class` ancestor chain too deep for `DiamondGuard` to walk
+    // safely (LB0317, round 5 review N2's durable fix): every
+    // `class_shape`/`class_shape_bound`/`class_operators` query made above
+    // — and every one inference made building `inference`, before this
+    // function started — shares `typeenv`'s depth-limit ledger, so draining
+    // it here, after both have finished querying `typeenv` for this file,
+    // catches every root class whose resolution the guard refused to
+    // finish, not just the ones this pass itself queried.
+    for name in typeenv.take_depth_limit_hits() {
+        let limit_note = format!(
+            "exceeds the {MAX_ANCESTRY_DEPTH}-class ancestry limit this checker enforces to \
+             avoid a stack overflow while resolving it"
+        );
+        let remedy = "flatten the hierarchy or use composition instead of a long \
+             inheritance chain — members above the limit are not included in this \
+             class's resolved shape"
+            .to_string();
+        if let Some(range) = typeenv.class_decl_span(&name) {
+            checker.report_full(
+                CLASS_DEPTH_LIMIT,
+                range,
+                format!("`{name}`'s `---@class` ancestry is too deep to resolve safely"),
+                limit_note,
+                Some(remedy),
+            );
+        } else if let Some((decl_file, range)) = typeenv.cross_file_class_decl_span(&name) {
+            checker.diags.push(
+                Diagnostic::new(
+                    CLASS_DEPTH_LIMIT,
+                    severity,
+                    format!("`{name}`'s `---@class` ancestry is too deep to resolve safely"),
+                )
+                .with_label(Label::primary(Span::new(decl_file, range), limit_note))
+                .with_note(remedy),
+            );
+        }
+        // Else: no locatable declaration in this project (an ambient /
+        // `[types] defs` class) — the crash is still prevented; there is
+        // simply nothing here to point a diagnostic at.
+    }
 
     let mut diags = checker.diags;
     diags.sort_by_key(|d| d.primary_label().map_or(0, |l| l.span.range.start));
@@ -1669,6 +1710,16 @@ impl Checker<'_> {
                 if let Some(value) = value {
                     self.check_slot(&Slot::Expr(value), &value_ty, TYPE_MISMATCH);
                 }
+                continue;
+            }
+            // `class`'s ancestry was too deep to resolve fully (`LB0317`):
+            // `shape` is admittedly incomplete, so `name` might simply be
+            // declared past the cutoff rather than genuinely absent. Stay
+            // lenient — `LB0317` alone is the honest diagnostic (production
+            // readiness review finding 1, same reasoning as the field-read
+            // side in `crate::infer::Infer::lookup_shape_field`/
+            // `lookup_ty_field`).
+            if class.is_some_and(|c| self.env.class_ancestry_truncated(c)) {
                 continue;
             }
             self.report_full(

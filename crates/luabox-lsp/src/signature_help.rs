@@ -375,9 +375,16 @@ fn signature_from_class_field(
             doc: None,
         });
     }
-    let doc = sema::locate_field(analysis, current, &class, member)
-        .and_then(|found| found.desc)
-        .unwrap_or_default();
+    let doc = sema::locate_field(
+        analysis,
+        current,
+        &class,
+        member,
+        ambient.ambient_paths(),
+        ambient.sema_cache(),
+    )
+    .and_then(|found| found.desc)
+    .unwrap_or_default();
     Some(Signature {
         name: format!("{class}{sep}{member}"),
         params,
@@ -392,7 +399,14 @@ fn signature_from_class_field(
 /// `fun(...) | string` is not a callable signature help should render
 /// either, and there is no such annotation this project's harvest produces
 /// today, but declining a shape nobody wrote is cheaper than guessing at it.
-fn as_function_ty(ty: &Ty) -> Option<&FunctionTy> {
+///
+/// `pub(crate)`: the one "is this field callable" predicate (N19) —
+/// [`crate::completion`]'s `is_fun`/completion-`kind` checks all read this
+/// now, rather than each carrying its own flat `matches!(field.ty,
+/// Ty::Function(_))`, which missed exactly this optional/union case and let
+/// a `:`-triggered member list silently disagree with what signature help
+/// would render for the same field.
+pub(crate) fn as_function_ty(ty: &Ty) -> Option<&FunctionTy> {
     match ty {
         Ty::Function(fun) => Some(fun),
         Ty::Union(members) => {
@@ -696,6 +710,43 @@ c.cb(1)
 ";
         let help = help_after_open(src, "cb(").expect("signature help");
         assert_eq!(labels(&help), vec!["Circle.cb(x: number)"]);
+    }
+
+    /// N50: `as_function_ty`'s "two `Function` members" decline arm, never
+    /// directly exercised before — `union.iter()` returns `Some` on the
+    /// first `Function` and only *then* checks whether a second one follows,
+    /// so a field typed as two distinct call shapes must still decline
+    /// rather than silently rendering the first one as if it were the whole
+    /// truth.
+    #[test]
+    fn a_field_typed_as_a_union_of_two_function_shapes_has_no_signature_help() {
+        let src = "\
+---@class Circle
+---@field cb fun(x: number)|fun(y: string)
+
+---@type Circle
+local c = nil
+c.cb(1)
+";
+        assert!(help_after_open(src, "cb(").is_none());
+    }
+
+    /// N50: `as_function_ty`'s "`Function` unioned with a non-`nil` member"
+    /// decline arm. `fun(...) | string` is not the `T?` shape `?` lowers
+    /// to — a real call could resolve to either type at runtime — so
+    /// signature help must decline rather than guess the `Function` arm is
+    /// the only one that matters.
+    #[test]
+    fn a_field_typed_as_a_function_or_string_union_has_no_signature_help() {
+        let src = "\
+---@class Circle
+---@field cb fun(x: number)|string
+
+---@type Circle
+local c = nil
+c.cb(1)
+";
+        assert!(help_after_open(src, "cb(").is_none());
     }
 
     #[test]

@@ -3514,20 +3514,73 @@ fn a_watched_change_to_a_non_lua_file_is_ignored() {
 }
 
 #[test]
-fn a_watched_delete_publishes_nothing_for_the_deleted_file() {
-    // A deleted file cannot be re-read; the last known text stays in the
-    // analysis and no diagnostics are published for it.
+fn a_watched_delete_publishes_empty_diagnostics_for_the_deleted_file() {
+    // N24: a deleted file's text is cleared to empty rather than kept as
+    // the last-known content — otherwise a `require` target's stale exports
+    // and class declarations keep resolving indefinitely for every other
+    // file that referenced it. Clearing the text is itself a change, so
+    // (unlike before this fix) it *is* published — an empty file has no
+    // diagnostics of its own, but the publish is what tells the client the
+    // server actually noticed the deletion rather than silently doing
+    // nothing (the failure mode this scenario used to encode as correct).
     let client = start(&[("mod.lua", TYPE_OK)]);
+    let mod_uri = client.uri("mod.lua");
     std::fs::remove_file(client.root.join("mod.lua")).expect("remove");
     client.notify::<DidChangeWatchedFiles>(DidChangeWatchedFilesParams {
         changes: vec![FileEvent {
-            uri: client.uri("mod.lua"),
+            uri: mod_uri.clone(),
             typ: FileChangeType::DELETED,
         }],
     });
+    assert_eq!(
+        client.wait_diagnostics(&mod_uri),
+        Vec::new(),
+        "an empty (deleted) file has no diagnostics of its own"
+    );
+
+    // A different file opened afterwards is unaffected — the deletion
+    // publish above does not swallow or reorder the next document's own.
     let uri = client.uri("main.lua");
     client.open_async(&uri, TYPE_OK);
-    assert_eq!(client.next_diagnostics().uri.as_str(), uri.as_str());
+    assert_eq!(client.wait_diagnostics(&uri), Vec::new());
+    client.shutdown();
+}
+
+/// N24: the require-resolution half of the same fix, at the protocol level
+/// — a `require` target deleted mid-session stops resolving, so a diagnostic
+/// against a member the deleted file used to export must appear once the
+/// deletion is processed, where it did not before.
+#[test]
+fn a_watched_delete_of_a_require_target_stops_it_resolving() {
+    let point = "---@class Point\n---@field x number\nlocal P = {}\nreturn P\n";
+    let main = "local p = require(\"point\")\nprint(p.x)\n";
+    let mut client = start(&[("point.lua", point), ("main.lua", main)]);
+    let uri = client.uri("main.lua");
+    client.open_async(&uri, main);
+    let before = client.hover(&uri, 1, 8);
+    let text_before = match before.expect("hover before deletion").contents {
+        HoverContents::Markup(markup) => markup.value,
+        other => panic!("expected markup hover contents, got {other:?}"),
+    };
+    assert!(text_before.contains("Point.x"), "{text_before}");
+
+    std::fs::remove_file(client.root.join("point.lua")).expect("remove");
+    client.notify::<DidChangeWatchedFiles>(DidChangeWatchedFilesParams {
+        changes: vec![FileEvent {
+            uri: client.uri("point.lua"),
+            typ: FileChangeType::DELETED,
+        }],
+    });
+
+    let after = client.hover(&uri, 1, 8);
+    let text_after = after.map(|h| match h.contents {
+        HoverContents::Markup(markup) => markup.value,
+        other => panic!("expected markup hover contents, got {other:?}"),
+    });
+    assert!(
+        text_after.as_deref().is_none_or(|t| !t.contains("Point.x")),
+        "a deleted require target must stop resolving: {text_after:?}"
+    );
     client.shutdown();
 }
 
@@ -3598,26 +3651,37 @@ fn file_watchers_are_registered_when_the_client_supports_it() {
 fn no_watchers_are_registered_without_dynamic_registration() {
     // The default harness advertises nothing, so the server must never ask
     // to register file watchers for this session — that is the property
-    // this test measures, not which message happens to arrive first. It
-    // does not pin position: a `window/logMessage` trace (merged-ambient
-    // cache observability, R26) is ordinary protocol traffic a client
-    // tolerates ahead of the publish, same as `WorkDoneProgressCreate` is
-    // already tolerated by `recv` for every other test in this file. What
-    // would still fail this test is a `client/registerCapability` request
-    // arriving before the diagnostics publish for the opened document.
-    let client = start(&[]);
+    // this test measures, checked over **every** message for the whole
+    // session (N49), not just the ones up to the first `publishDiagnostics`.
+    // A loop that `break`s on the first publish only checks the stream's
+    // prefix: a `client/registerCapability` request arriving *after*
+    // diagnostics (there is only one call site today, but nothing pins that)
+    // would sail past unnoticed. Driving the shutdown handshake by hand here
+    // — rather than `TestClient::shutdown`, whose own `wait_response` skips
+    // past intervening messages without inspecting them — keeps every
+    // message in scope for the assertion through to the session's actual
+    // end. `window/logMessage` (merged-ambient cache observability, R26) and
+    // `WorkDoneProgressCreate` are ordinary protocol traffic the `_ => {}`
+    // arm tolerates, same as every other test in this file.
+    let mut client = start(&[]);
     let uri = client.uri("main.lua");
     client.open_async(&uri, TYPE_OK);
+    let shutdown_id = client.send_request_raw(Shutdown::METHOD, serde_json::Value::Null);
     loop {
         match client.recv() {
             Message::Request(req) if req.method == RegisterCapability::METHOD => {
                 panic!("watcher registration sent without dynamic_registration support")
             }
-            Message::Notification(not) if not.method == PublishDiagnostics::METHOD => break,
+            Message::Response(resp) if resp.id == shutdown_id => break,
             _ => {}
         }
     }
-    client.shutdown();
+    client.notify::<Exit>(());
+    client
+        .server_thread
+        .join()
+        .expect("server thread panicked")
+        .expect("server errored");
 }
 
 #[test]

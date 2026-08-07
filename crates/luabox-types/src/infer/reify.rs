@@ -54,35 +54,33 @@ impl Infer<'_> {
     /// The parameter need not be the carrier's own. A class inherits its
     /// ancestors' `---@field`s, so `---@class Sub : Base` — a generic parent
     /// named without arguments — leaves `Sub`'s `item` as `U` at this seam
-    /// just as `Box`'s is `T`. One rule owns both: substitute every parameter
-    /// in scope ([`TypeEnv::class_params_in_scope`]) and cross as the name
-    /// only when that substitution changed nothing — i.e. when the resolved
-    /// shape is a complete type. `---@class Sub : Base<number>` *does* bind
-    /// its parent's parameter (`TypeEnv::class_shape_bound`), so it has
-    /// nothing to substitute and keeps the #56 class identity.
+    /// just as `Box`'s is `T`. One rule owns both:
+    /// [`TypeEnv::class_shape_bound_export`] substitutes every parameter a
+    /// visited class leaves unbound, and this crosses as the name only when
+    /// that came out identical to the ordinary (non-erasing) resolution —
+    /// i.e. when the resolved shape is already a complete type.
+    /// `---@class Sub : Base<number>` *does* bind its parent's parameter, so
+    /// there is nothing for either resolution to disagree about and this
+    /// keeps the #56 class identity.
     pub(super) fn reify_export(&mut self, ity: &ITy) -> Ty {
         match ity {
             ITy::Shape(id) => {
                 if let Some(name) = self.shapes[*id].declared.clone()
                     && let Some(resolved) = self.env.resolve_named(&name)
                 {
-                    let params = self.env.class_params_in_scope(&name);
-                    if params.is_empty() {
-                        return Ty::Named(name);
+                    // A class may declare `<T>` and mention it nowhere in its
+                    // own or its ancestors' members — erasure then changes
+                    // nothing, and only a substitution that changes
+                    // *something* costs the class its name.
+                    if let Some(erased) = self
+                        .env
+                        .class_shape_bound_export(&name, &[])
+                        .map(|shape| Ty::Table(Box::new(shape)))
+                        && erased != resolved
+                    {
+                        return erased;
                     }
-                    let map: BTreeMap<String, Ty> = params
-                        .into_iter()
-                        .map(|param| (param, Ty::Unknown))
-                        .collect();
-                    // A parameter in scope is not necessarily a parameter the
-                    // shape *uses*: a class may declare `<T>` and mention it
-                    // nowhere. Only a substitution that changes something
-                    // costs the class its name.
-                    let erased = crate::generics::subst_ty(&resolved, &map);
-                    if erased == resolved {
-                        return Ty::Named(name);
-                    }
-                    return erased;
+                    return Ty::Named(name);
                 }
                 self.reify_shape(*id)
             }

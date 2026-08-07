@@ -111,7 +111,7 @@ fn member_items(
         reason = "dot_offset indexes an ASCII `.`/`:` and recv_start walks back over ASCII identifier bytes, so both are char boundaries"
     )]
     let receiver = &text[recv_start..dot_offset];
-    require_member_items(sema, receiver, recv_start, trigger, exports, items);
+    require_member_items(sema, receiver, recv_start, trigger, exports, ambient, items);
     ambient_member_items(sema, receiver, recv_start, trigger, exports, ambient, items);
 }
 
@@ -132,16 +132,18 @@ fn require_member_items(
     recv_start: usize,
     trigger: u8,
     exports: &RequireExports,
+    ambient: &MergedAmbient,
     items: &mut BTreeMap<String, CompletionItem>,
 ) {
     let Some(binding) = sema.visible_binding_named(receiver, recv_start) else {
         return;
     };
-    let Some((module, fields)) = requires::require_struct_fields(sema, exports, binding) else {
+    let Some((module, fields)) = requires::require_struct_fields(sema, exports, ambient, binding)
+    else {
         return;
     };
     for (name, field) in fields {
-        let is_fun = matches!(field.ty, Ty::Function(_));
+        let is_fun = crate::signature_help::as_function_ty(&field.ty).is_some();
         // After `:` only methods make sense.
         if trigger == b':' && !is_fun {
             continue;
@@ -207,7 +209,7 @@ fn ambient_member_items(
         return;
     };
     for (name, field) in &shape.fields {
-        let is_fun = matches!(field.ty, Ty::Function(_));
+        let is_fun = crate::signature_help::as_function_ty(&field.ty).is_some();
         // After `:` only methods make sense.
         if trigger == b':' && !is_fun {
             continue;
@@ -395,7 +397,7 @@ fn auto_require_fields(
         if items.contains_key(name) || sema.visible_binding_named(name, offset).is_some() {
             continue;
         }
-        let kind = if matches!(field.ty, Ty::Function(_)) {
+        let kind = if crate::signature_help::as_function_ty(&field.ty).is_some() {
             CompletionItemKind::FUNCTION
         } else {
             CompletionItemKind::VARIABLE
@@ -629,6 +631,54 @@ g:
         assert_eq!(items[0].kind, Some(CompletionItemKind::METHOD));
     }
 
+    /// N19: an *optional* function-typed field (`fun(...)?`, lowered to
+    /// `Ty::Function | Ty::Nil`) must be offered after `:` and carry the
+    /// `METHOD` kind — the same predicate `signature_help`'s `as_function_ty`
+    /// already uses (round 5 `an_optional_function_typed_field_still_renders_a_signature`).
+    /// Before the fix, completion's flat `matches!(field.ty, Ty::Function(_))`
+    /// missed the union, so the field was silently absent from the `:` list
+    /// while signature help rendered a full signature for it — the editor
+    /// asserting the member both does not exist and is callable off the same
+    /// keystroke sequence.
+    #[test]
+    fn a_colon_trigger_offers_an_optional_function_typed_field_too() {
+        let src = "\
+---@class C
+---@field grow fun(amount: number)? optional method
+---@field walk fun(steps: number) plain method
+
+---@type C
+local c = nil
+c:
+";
+        let items = after(&[("main.lua", src)], "c:");
+        assert_eq!(labels(&items), vec!["grow", "walk"], "{:?}", labels(&items));
+        assert_eq!(item(&items, "grow").kind, Some(CompletionItemKind::METHOD));
+        assert_eq!(item(&items, "walk").kind, Some(CompletionItemKind::METHOD));
+    }
+
+    /// N19: the same predicate drives the completion item `kind` on the
+    /// plain `.`-triggered list too — an optional function field must report
+    /// `FUNCTION`, not `FIELD`.
+    #[test]
+    fn a_dot_trigger_reports_the_function_kind_for_an_optional_function_field() {
+        let src = "\
+---@class C
+---@field grow fun(amount: number)?
+
+---@type C
+local c = nil
+c.
+";
+        let items = after(&[("main.lua", src)], "c.");
+        assert_eq!(
+            item(&items, "grow").kind,
+            Some(CompletionItemKind::FUNCTION),
+            "{:?}",
+            labels(&items)
+        );
+    }
+
     #[test]
     fn a_dot_trigger_offers_fields_and_functions_with_their_types() {
         let src = "\
@@ -840,6 +890,24 @@ local visible = 2
                 .contains("local frobnicate = require(\"lib\").frobnicate"),
             "{edits:?}"
         );
+    }
+
+    /// N19: `auto_require_fields`'s kind decision is the third of the three
+    /// sites that used to read `matches!(field.ty, Ty::Function(_))` flat —
+    /// an optional function-typed export field must still report `FUNCTION`,
+    /// not `VARIABLE`.
+    #[test]
+    fn auto_require_reports_the_function_kind_for_an_optional_function_export() {
+        let files = [
+            ("main.lua", "local x = 1\nfrob\n"),
+            (
+                "lib.lua",
+                "local M = {}\n---@type fun()?\nM.frobnicate = nil\nreturn M\n",
+            ),
+        ];
+        let items = after(&files, "frob");
+        let offered = item(&items, "frobnicate");
+        assert_eq!(offered.kind, Some(CompletionItemKind::FUNCTION));
     }
 
     #[test]
@@ -1059,6 +1127,46 @@ local visible = 2
     fn an_unannotated_require_bindings_member_completion_still_offers_the_structural_export() {
         let files = [
             ("main.lua", "local m = require(\"m\")\nm.\n"),
+            ("m.lua", "local M = {}\nM.x = 42\nreturn M\n"),
+        ];
+        let items = after(&files, "m.");
+        assert_eq!(
+            item(&items, "x").detail.as_deref(),
+            Some("m.x: 42"),
+            "{:?}",
+            labels(&items)
+        );
+    }
+
+    /// N16: `require_struct_fields`'s gate must be a *resolves* check, not a
+    /// *presence* check. `---@type table` is a real annotation but `table`
+    /// is not a class the ambient can resolve members from, so the
+    /// structural fallback must still offer `x` — before the fix, any
+    /// `---@type` at all suppressed `require_member_items` regardless of
+    /// whether the class arm (`ambient_member_items`) could resolve
+    /// anything, and the list came back empty.
+    #[test]
+    fn an_annotation_that_does_not_resolve_to_a_class_falls_back_to_the_structural_export_completion()
+     {
+        let files = [
+            ("main.lua", "---@type table\nlocal m = require(\"m\")\nm.\n"),
+            ("m.lua", "local M = {}\nM.x = 42\nreturn M\n"),
+        ];
+        let items = after(&files, "m.");
+        assert_eq!(
+            item(&items, "x").detail.as_deref(),
+            Some("m.x: 42"),
+            "{:?}",
+            labels(&items)
+        );
+    }
+
+    /// Same shape with an annotation naming a class that does not exist —
+    /// the mid-edit case.
+    #[test]
+    fn an_annotation_naming_an_undeclared_class_falls_back_to_the_structural_export_completion() {
+        let files = [
+            ("main.lua", "---@type Bogus\nlocal m = require(\"m\")\nm.\n"),
             ("m.lua", "local M = {}\nM.x = 42\nreturn M\n"),
         ];
         let items = after(&files, "m.");

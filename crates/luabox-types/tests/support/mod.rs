@@ -12,7 +12,14 @@
 //! work.
 //!
 //! This file is a module of each test binary (`mod support;`), not a target
-//! of its own — it is not compiled or counted separately.
+//! of its own — it is not compiled or counted separately. Each binary that
+//! includes it uses whatever subset of these helpers its own fixtures need
+//! (directly, or transitively — `codes` calls `check`, `check_cross` calls
+//! `check_cross_diags` calls `surface`), so a binary that never needs, say,
+//! `check_cross`'s codes-only reduction leaves it genuinely unused in that
+//! one compilation; `dead_code` is suppressed crate-wide for this module
+//! rather than per binary.
+#![allow(dead_code)]
 
 use luabox_diag::Diagnostic;
 use luabox_syntax::lua::{self, Dialect, parse};
@@ -45,8 +52,12 @@ pub fn surface(src: &str, base: &Ambient) -> FileTypes {
     module_surface(&parsed, "m.lua", Some(base)).types
 }
 
-/// Check `consumer` against the merged surface of every `file`.
-pub fn check_cross<S: AsRef<str>>(files: &[S], consumer: &str) -> Vec<String> {
+/// [`check_cross`]'s full-diagnostic form: `files` merged in the caller's
+/// order (file-order dependence — which of two conflicting cross-file
+/// declarations wins — is itself part of what the class-merge-precedence
+/// matrix measures, `docs/03-reference/03-class-merge-precedence.md`), then
+/// `consumer` checked against the merged surface.
+pub fn check_cross_diags<S: AsRef<str>>(files: &[S], consumer: &str) -> Vec<Diagnostic> {
     let base = stdlib_defs(Dialect::Lua54);
     let types: Vec<FileTypes> = files.iter().map(|f| surface(f.as_ref(), base)).collect();
     let ambient = base.with_project_types(types.iter());
@@ -59,7 +70,12 @@ pub fn check_cross<S: AsRef<str>>(files: &[S], consumer: &str) -> Vec<String> {
         Dialect::Lua54,
         Some(&ambient),
     )
-    .iter()
-    .map(|d| d.code.to_string())
-    .collect()
+}
+
+/// Check `consumer` against the merged surface of every `file`.
+pub fn check_cross<S: AsRef<str>>(files: &[S], consumer: &str) -> Vec<String> {
+    check_cross_diags(files, consumer)
+        .iter()
+        .map(|d| d.code.to_string())
+        .collect()
 }

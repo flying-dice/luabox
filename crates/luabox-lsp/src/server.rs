@@ -44,6 +44,7 @@ use lsp_server::{
 use lsp_types::notification::{
     DidChangeConfiguration, DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument,
     DidOpenTextDocument, Exit, LogMessage, Notification as _, Progress, PublishDiagnostics,
+    SetTrace,
 };
 use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
@@ -67,9 +68,10 @@ use lsp_types::{
     SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensResult,
     SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelp,
     SignatureHelpOptions, SymbolInformation, TextDocumentContentChangeEvent,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, TypeDefinitionProviderCapability,
-    Uri, WorkDoneProgress, WorkDoneProgressBegin, WorkDoneProgressCreateParams,
-    WorkDoneProgressEnd, WorkDoneProgressReport, WorkspaceEdit, WorkspaceSymbolResponse,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, TraceValue,
+    TypeDefinitionProviderCapability, Uri, WorkDoneProgress, WorkDoneProgressBegin,
+    WorkDoneProgressCreateParams, WorkDoneProgressEnd, WorkDoneProgressReport, WorkspaceEdit,
+    WorkspaceSymbolResponse,
 };
 use luabox_db::{Analysis, AnalysisHost, Change, Dialect, Strictness};
 use luabox_lint::{LintConfig, UnknownRuleId, lint_source};
@@ -219,6 +221,11 @@ pub fn run(connection: Connection) -> anyhow::Result<()> {
         .and_then(|w| w.did_change_watched_files.as_ref())
         .and_then(|d| d.dynamic_registration)
         .unwrap_or(false);
+    // The initial trace level (N22): `Off` unless the client explicitly asks
+    // for tracing, per spec ("If omitted trace is disabled ('off')") — the
+    // server's own diagnostic chatter (`Self::merged_ambient`'s rebuild log)
+    // is silent by default and stays silent for every client that never asks.
+    let trace = params.trace.unwrap_or_default();
 
     let root = root_path(&params)
         .or_else(|| std::env::current_dir().ok())
@@ -229,7 +236,7 @@ pub fn run(connection: Connection) -> anyhow::Result<()> {
     // server from speaking *until it has responded to `initialize`*, and
     // `initialize_finish` above is that response. The bootstrap token below
     // has been sent from the same window since it shipped.
-    let mut server = Server::new(connection, root, work_done_progress);
+    let mut server = Server::new(connection, root, work_done_progress, trace);
     if watch_files {
         server.register_file_watchers();
     }
@@ -330,6 +337,11 @@ struct ProjectConfig {
     /// matches `luabox check`'s. Combined with the dialect stdlib into the
     /// server's [`Ambient`].
     def_sources: Vec<String>,
+    /// The absolute paths `def_sources`'s project-local entries were read
+    /// from (N18) — [`ambient_def_paths`], computed alongside `def_sources`
+    /// from the same resolution so the two can never disagree about what is
+    /// genuinely ambient.
+    def_paths: HashSet<PathBuf>,
     /// The `lua_modules/share/lua/<X.Y>/` version directory whose installed rock
     /// sources are harvested for their type surfaces (#30) — chosen by `[build]
     /// target` (the edition when unset), exactly as `luabox check` chooses it, so
@@ -352,6 +364,7 @@ impl ProjectConfig {
             strictness: Strictness::Warn,
             out_dir: None,
             def_sources: Vec::new(),
+            def_paths: HashSet::new(),
             rock_version_dir: luabox_bundle::rocks_version_dir(Dialect::Lua54),
             lint: LintConfig::new(),
             unknown_lint_rules: Vec::new(),
@@ -375,6 +388,7 @@ impl ProjectConfig {
             strictness: Strictness::from_manifest_flag(manifest.types.strict),
             out_dir: Some(root.join(&manifest.build.out)),
             def_sources: ambient_def_sources(root, &manifest),
+            def_paths: ambient_def_paths(root, &manifest),
             rock_version_dir: luabox_bundle::rocks_version_dir(syntax_dialect(
                 manifest.build.target,
             )),
@@ -418,6 +432,28 @@ fn ambient_def_sources(root: &Path, manifest: &Manifest) -> Vec<String> {
         .into_iter()
         .chain(layout::resolve_dep_defs(root, manifest))
         .map(|def| def.text)
+        .collect()
+}
+
+/// The absolute paths of the project's own `[types] defs` files (N18) — the
+/// genuine ambient scope [`crate::merged_ambient::MergedAmbient::ambient_paths`]
+/// backs [`crate::sema::locate_field`]'s elevated precedence with, so a
+/// `*.d.lua`-named file that is not actually configured here gets none.
+///
+/// Project-local only: [`layout::resolve_dep_defs`]'s files live under
+/// `lua_modules/<dep>/defs/` (`layout::VENDOR_DIR`), which
+/// [`layout::collect_lua_files`] always excludes from the ordinary source
+/// walk — they never appear in [`luabox_db::Analysis::files`] at all, so
+/// `locate_field` could never visit one regardless of what this returns.
+/// [`layout::resolve_project_defs`] labels a project-local def by its
+/// root-relative path (`defs/love.d.lua`) — the exact same walk `bootstrap`
+/// uses to populate the host, so a label here and a path in
+/// [`luabox_db::Analysis::files`] name the same file whenever both exist.
+fn ambient_def_paths(root: &Path, manifest: &Manifest) -> HashSet<PathBuf> {
+    let (project_defs, _unresolved) = layout::resolve_project_defs(root, &manifest.types.defs);
+    project_defs
+        .into_iter()
+        .map(|def| root.join(&def.label))
         .collect()
 }
 
@@ -546,6 +582,12 @@ struct Server {
     /// dependency defs, #108), built once at startup so the editor's type
     /// resolution matches `luabox check`.
     ambient: Ambient,
+    /// The absolute paths of the project's own `[types] defs` files
+    /// [`Self::ambient`] was built from (N18) — [`ambient_def_paths`], kept
+    /// alongside `ambient` and installed into every [`MergedAmbient`] so
+    /// `sema::locate_field` can tell a genuinely ambient `.d.lua` file from
+    /// one that merely looks like one.
+    ambient_paths: HashSet<PathBuf>,
     /// The type surfaces harvested from the project's vendored luarocks tree
     /// (#30), built once at startup alongside [`Self::ambient`]: rock classes,
     /// enums and aliases, plus each rock module's `require`-export type. Merged
@@ -592,6 +634,17 @@ struct Server {
     /// `$/progress` the server sends is gated on this — a client that did not
     /// ask for progress receives none, on any path.
     progress: bool,
+    /// The client's negotiated trace level (`initialize`'s `trace` field,
+    /// `$/setTrace` afterwards) — `Off` unless a client opts in, per spec
+    /// default. Gates [`Self::merged_ambient`]'s "rebuilt@" log (N22): that
+    /// trace fired unconditionally on every cache miss, which a keystroke
+    /// guarantees (`Self::merged_ambient`'s own doc), so a client with no
+    /// interest in it — the overwhelming majority, since `trace` defaults to
+    /// `Off` and nothing else in this server asks a user to turn it on — used
+    /// to receive one `window/logMessage` per revision for the life of the
+    /// session regardless. `Cell` for the same reason `progress_seq` is: the
+    /// logging call sites run behind `&self`.
+    trace: Cell<TraceValue>,
     /// A monotonic counter making every server-created progress token — and
     /// the `window/workDoneProgress/create` request id that carries it —
     /// unique within the session.
@@ -721,7 +774,7 @@ const STARTUP_HARVEST_PROGRESS: (&str, &str) = ("luabox/rock-harvest", "Indexing
 const RELOAD_HARVEST_PROGRESS: (&str, &str) = ("luabox/reload", "Reloading luabox configuration");
 
 impl Server {
-    fn new(connection: Connection, root: PathBuf, progress: bool) -> Self {
+    fn new(connection: Connection, root: PathBuf, progress: bool, trace: TraceValue) -> Self {
         let config = ProjectConfig::discover(&root);
         let ambient = build_ambient(config.dialect, &config.def_sources);
         let known_globals = ambient.global_names().clone();
@@ -738,12 +791,14 @@ impl Server {
             strictness: config.strictness,
             out_dir: config.out_dir,
             ambient,
+            ambient_paths: config.def_paths,
             rocks: RockSurfaces::default(),
             merged_ambient: RefCell::new(None),
             lint: config.lint,
             known_globals,
             open_docs: HashMap::new(),
             progress,
+            trace: Cell::new(trace),
             progress_seq: Cell::new(0),
             pending: RefCell::new(VecDeque::new()),
             create_unanswered: Cell::new(false),
@@ -842,6 +897,7 @@ impl Server {
         // be resolved against.
         self.known_globals = ambient.global_names().clone();
         self.ambient = ambient;
+        self.ambient_paths = config.def_paths;
         self.rocks = self.harvest_announced(config.rock_version_dir, RELOAD_HARVEST_PROGRESS);
         // The merge's BASE layers just changed while the host (and so the
         // revision) did not — the one staleness the revision key cannot see.
@@ -1574,29 +1630,40 @@ impl Server {
     /// in an always-on output channel regardless of severity. A hit fires on
     /// every hover, completion, signature-help, goto-definition and
     /// diagnostics publish — once per request for the life of the session,
-    /// not once per revision — so logging it is unbounded chatter with no
-    /// capability check and no opt-out.
+    /// not once per revision — so logging it unconditionally is unbounded
+    /// chatter.
     ///
-    /// Rejected: keep both arms and rely on clients to filter `LOG` (the
-    /// volume complaint stands unresolved); gate the hit log behind a
-    /// capability or a config flag (a negotiation path and a silent default
-    /// for a signal nobody asked to opt into, for what should be a one-line
-    /// fix); revert to `#[cfg(test)]` (reopens R26 outright — a release
-    /// build goes back to unobservable). Chosen: log the rebuild only. A
-    /// rebuild happens once per revision, not once per request, so volume
-    /// collapses while "did the merge rebuild when the world changed?" stays
-    /// answerable from the wire — a stale merge (a rebuild that should have
-    /// fired after an edit but didn't) still shows up as a *missing*
-    /// `rebuilt@` line, the exact failure mode R26 closed. What is lost: a
-    /// client can no longer tell "second read at this revision, cache hit"
-    /// apart from "second read at this revision, the server was never asked
-    /// again" — both now produce zero additional log lines, and nothing
-    /// downstream of this trace ever needed that distinction (the cache-hit
-    /// test below asserts the *absence* of a second `rebuilt@`, not the
-    /// presence of a `hit@`, for exactly this reason). `revision` stays on
-    /// the rebuild line so a client's log pane can tell two rebuilds at
-    /// different revisions apart from a rebuild firing twice at the same
-    /// one — a bug, since the cache key is the revision.
+    /// **The rebuild arm is not rare either (N22).** The doc that shipped
+    /// with this trace argued "a rebuild happens once per revision, not once
+    /// per request, so volume collapses" — true in general, but every
+    /// `textDocument/didChange` bumps the revision (this function's own
+    /// paragraph above), so on the *editing* path "once per revision" is
+    /// "once per keystroke": measured, 100 edits produced 101 log messages.
+    /// The same "several real clients surface every `window/logMessage` line
+    /// in an always-on output channel" argument R26 used to drop the *hit*
+    /// arm applies unchanged to a rebuild log that fires that often.
+    ///
+    /// Gated on [`Self::trace`] (N22), not unconditional: `initialize`'s
+    /// `trace` field (spec default `Off`, updated live via `$/setTrace`) is
+    /// the protocol's own mechanism for exactly this kind of optional
+    /// execution trace — not a bespoke capability or config flag (the
+    /// alternative this doc used to reject "a negotiation path and a silent
+    /// default for a signal nobody asked to opt into" — `trace` already *is*
+    /// that negotiation, standardised, and a client that never sets it now
+    /// receives zero merged-ambient log lines, addressing the volume
+    /// complaint without touching R26's guarantee: a client that *does* ask
+    /// for `messages`/`verbose` sees a stale merge the same way it always
+    /// did — a missing `rebuilt@` line where an edit should have produced
+    /// one. What is lost, same as before: a client can no longer tell
+    /// "second read at this revision, cache hit" apart from "second read at
+    /// this revision, the server was never asked again" — both produce zero
+    /// additional log lines, and nothing downstream of this trace ever
+    /// needed that distinction (the cache-hit test below asserts the
+    /// *absence* of a second `rebuilt@`, not the presence of a `hit@`, for
+    /// exactly this reason). `revision` stays on the rebuild line so a
+    /// client's log pane can tell two rebuilds at different revisions apart
+    /// from a rebuild firing twice at the same one — a bug, since the cache
+    /// key is the revision.
     ///
     /// `LOG`, not `WARNING`/`INFO`: `WARNING`, used elsewhere in this file
     /// (manifest problems, malformed messages), is for something the user
@@ -1612,15 +1679,24 @@ impl Server {
         {
             return Rc::clone(merged);
         }
-        let merged = Rc::new(MergedAmbient::build(
-            &self.ambient,
-            &snapshot.project_types(),
-            self.rocks.types(),
-        ));
-        self.log_message(
-            MessageType::LOG,
-            format!("merged ambient rebuilt@{revision}"),
+        let merged = Rc::new(
+            MergedAmbient::build(&self.ambient, &snapshot.project_types(), self.rocks.types())
+                .with_ambient_paths(self.ambient_paths.clone()),
         );
+        // N22: gated on the negotiated trace level, not unconditional — see
+        // the `trace` field doc. A keystroke bumps the revision every time
+        // (this function's own doc), so an ungated log here is a
+        // `window/logMessage` per keystroke for the life of the session, for
+        // every client, with no way to turn it off; `trace` defaults to
+        // `Off`, so the overwhelming majority of sessions now see none of it,
+        // while a client that asks for `messages`/`verbose` still gets
+        // exactly the observability R26 established.
+        if self.trace.get() != TraceValue::Off {
+            self.log_message(
+                MessageType::LOG,
+                format!("merged ambient rebuilt@{revision}"),
+            );
+        }
         *self.merged_ambient.borrow_mut() = Some((revision, Rc::clone(&merged)));
         merged
     }
@@ -2014,6 +2090,15 @@ impl Server {
                 // re-read the manifest and republish every open document.
                 self.reload_config()?;
             }
+            SetTrace::METHOD => {
+                // The client's live opt-in/opt-out of trace-level chatter
+                // (N22) — `initialize`'s `trace` field is only the starting
+                // value; `$/setTrace` is how a client turns tracing on
+                // mid-session (e.g. a "Report LSP issue" flow) or back off.
+                if let Some(params) = self.notification_params::<SetTrace>(not.params) {
+                    self.trace.set(params.value);
+                }
+            }
             DidChangeWatchedFiles::METHOD => {
                 let Some(params) = self.notification_params::<DidChangeWatchedFiles>(not.params)
                 else {
@@ -2041,10 +2126,12 @@ impl Server {
     /// Handle `workspace/didChangeWatchedFiles`: re-read each changed `.lua`
     /// file from disk into the host (so an external edit invalidates the
     /// analysis) and, if `luabox.toml` changed, reload the project config. A
-    /// deleted `.lua` file cannot be read, so its overlay/disk text is left as
-    /// is — a subsequent open will refresh it. Diagnostics for any changed file
-    /// that is currently open are republished; a manifest change republishes
-    /// every open document via [`Self::reload_config`].
+    /// deleted `.lua` file's text is cleared to empty rather than left as-is
+    /// (N24) — everything it exported or declared must stop resolving for
+    /// every other file that referenced it, which leaving the last-known
+    /// text in place would not do. Diagnostics for any changed (including
+    /// deleted) file that is currently open are republished; a manifest
+    /// change republishes every open document via [`Self::reload_config`].
     fn watched_files_changed(
         &mut self,
         params: &DidChangeWatchedFilesParams,
@@ -2062,6 +2149,30 @@ impl Server {
                 continue;
             }
             if event.typ == FileChangeType::DELETED {
+                // N24: the file is gone from disk, but the host still holds
+                // its last-known text (and everything derived from it —
+                // exports, class declarations) until told otherwise, so a
+                // stale `require` target keeps resolving and hover keeps
+                // answering from content that no longer exists. There is no
+                // `Change::RemoveFile` (`luabox_db::Change` has no delete
+                // variant) — clearing the text to empty is the closest
+                // in-repo equivalent: an empty file exports nothing and
+                // declares nothing, so every surface that read something out
+                // of it starts reading nothing, the same externally
+                // observable effect a real removal would have. Guarded by
+                // `open_docs` the same way the write-then-publish arm below
+                // is: an editor overlay still shadows disk, so a buffer left
+                // open after its backing file was deleted keeps showing what
+                // the user is looking at rather than being blanked out from
+                // under them.
+                self.host.apply_change(Change::SetFileText {
+                    path: path.clone(),
+                    dialect: self.dialect,
+                    text: String::new(),
+                });
+                if !self.open_docs.contains_key(&path) {
+                    self.publish_lua(&event.uri, &path)?;
+                }
                 continue;
             }
             if let Ok(text) = fs::read_to_string(&path) {
@@ -2252,9 +2363,11 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use lsp_server::{Connection, Message, Notification, Request, RequestId};
-    use lsp_types::notification::{DidChangeTextDocument, DidOpenTextDocument, Notification as _};
+    use lsp_types::notification::{
+        DidChangeTextDocument, DidChangeWatchedFiles, DidOpenTextDocument, Notification as _,
+    };
     use lsp_types::request::{HoverRequest, Request as _};
-    use lsp_types::{Position, Range, TextDocumentContentChangeEvent};
+    use lsp_types::{Position, Range, TextDocumentContentChangeEvent, TraceValue};
     use luabox_lint::LintConfig;
     use luabox_manifest::model::{Lint, LintLevel, LintTier, Manifest};
     use serde_json::{Value, json};
@@ -2688,7 +2801,7 @@ mod tests {
     /// one — the only way the wire now exposes it.
     #[test]
     fn a_second_read_at_the_same_revision_does_not_rebuild_again() {
-        let (dir, mut server, client) = test_server();
+        let (dir, mut server, client) = test_server_with_trace(TraceValue::Messages);
         let path = dir.path().join("main.lua");
         let source = "local x = 1\nprint(x)\n";
         fs::write(&path, source).expect("write the document");
@@ -2723,13 +2836,101 @@ mod tests {
         );
     }
 
+    /// N22: a client that never sets `trace` (the spec default, and what
+    /// `test_server`/`test_server_with` build) sees **no** "merged ambient
+    /// rebuilt@" chatter at all, even across several edits that each
+    /// guarantee a rebuild — the volume complaint's fix, measured the same
+    /// way the complaint itself was: counting `window/logMessage` traffic
+    /// across a run of edits.
+    #[test]
+    fn a_client_that_never_sets_trace_receives_no_merged_ambient_log() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("main.lua");
+        fs::write(&path, "local x = 1\n").expect("write the document");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": uri.to_string(),
+                        "languageId": "lua",
+                        "version": 1,
+                        "text": "local x = 1\n",
+                    },
+                }),
+            })
+            .expect("didOpen");
+        let mut trace = merged_ambient_log(&drain(&client));
+        for version in 2..=4 {
+            server
+                .handle_notification(Notification {
+                    method: DidChangeTextDocument::METHOD.to_string(),
+                    params: json!({
+                        "textDocument": { "uri": uri.to_string(), "version": version },
+                        "contentChanges": [{ "text": format!("local x = {version}\n") }],
+                    }),
+                })
+                .expect("didChange");
+            trace.extend(merged_ambient_log(&drain(&client)));
+        }
+        assert!(trace.is_empty(), "{trace:?}");
+    }
+
+    /// N22: `$/setTrace` turns the log on mid-session — a client is not
+    /// limited to whatever `initialize`'s `trace` field said at startup.
+    #[test]
+    fn a_set_trace_notification_turns_the_merged_ambient_log_on_live() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("main.lua");
+        fs::write(&path, "local x = 1\n").expect("write the document");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": uri.to_string(),
+                        "languageId": "lua",
+                        "version": 1,
+                        "text": "local x = 1\n",
+                    },
+                }),
+            })
+            .expect("didOpen");
+        // Silent before the client asks for tracing.
+        assert!(merged_ambient_log(&drain(&client)).is_empty());
+
+        server
+            .handle_notification(Notification {
+                method: "$/setTrace".to_string(),
+                params: json!({ "value": "messages" }),
+            })
+            .expect("setTrace");
+        server
+            .handle_notification(Notification {
+                method: DidChangeTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": uri.to_string(), "version": 2 },
+                    "contentChanges": [{ "text": "local x = 2\n" }],
+                }),
+            })
+            .expect("didChange");
+        let trace = merged_ambient_log(&drain(&client));
+        assert_eq!(
+            trace.iter().filter(|e| e.contains("rebuilt@")).count(),
+            1,
+            "{trace:?}"
+        );
+    }
+
     /// A keystroke bumps the revision (`host.rs`) immediately before
     /// `publish_lua` reads this cache, so the very next read is a guaranteed
     /// miss — measured, not assumed: two edits in a row rebuild twice, never
     /// reuse a merge from before either edit.
     #[test]
     fn a_keystroke_always_rebuilds_never_hits() {
-        let (dir, mut server, client) = test_server();
+        let (dir, mut server, client) = test_server_with_trace(TraceValue::Messages);
         let path = dir.path().join("main.lua");
         fs::write(&path, "local x = 1\n").expect("write the document");
         let uri = crate::uri::path_to_uri(&path);
@@ -2792,7 +2993,7 @@ mod tests {
     /// the revision key's.
     #[test]
     fn a_defs_only_reload_invalidates_the_cache_without_bumping_the_revision() {
-        let (dir, mut server, client) = test_server();
+        let (dir, mut server, client) = test_server_with_trace(TraceValue::Messages);
         let root = dir.path();
         fs::write(root.join("luabox.toml"), MANIFEST_HEAD).expect("write manifest");
         let path = root.join("main.lua");
@@ -2985,6 +3186,177 @@ mod tests {
         );
     }
 
+    /// N18: a `.d.lua`-named file is not automatically part of the project's
+    /// *ambient* defs scope — that requires `[types] defs = [...]` naming it
+    /// (`sema::locate_field`'s doc used to claim otherwise). With no such
+    /// config, `defs/widget.d.lua` here is just an ordinary project file that
+    /// happens to be named by convention, and `merge_file_types` (`env.rs`)
+    /// has no notion of the `.d.lua` suffix at all for ordinary project
+    /// files — collision resolution is pure first-loaded-wins, the same as
+    /// the plain-file case pinned above. Before the fix, `sema::search_order`
+    /// unconditionally visited every `*.d.lua` file ahead of `current` and
+    /// every other project file, so the *type* resolved to `a_widget.lua`
+    /// (the type merge's real answer, matching `luabox check`) while hover's
+    /// *description* and goto-definition both named `defs/widget.d.lua`
+    /// instead — three surfaces giving three different answers about which
+    /// declaration won, off one cursor position.
+    #[test]
+    fn a_def_named_file_with_no_types_defs_config_is_an_ordinary_project_file_for_collisions() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        fs::write(root.join("luabox.toml"), MANIFEST_HEAD).expect("write manifest");
+        fs::write(
+            root.join("a_widget.lua"),
+            "---@class Widget\n---@field id string the id from a_widget\n",
+        )
+        .expect("write the first-sorted colliding file");
+        fs::create_dir_all(root.join("defs")).expect("mkdir defs");
+        fs::write(
+            root.join("defs/widget.d.lua"),
+            "---@meta\n---@class Widget\n---@field id number the id from defs\n",
+        )
+        .expect("write the second-sorted colliding file");
+        let path = root.join("main.lua");
+        let source = "---@type Widget\nlocal w = nil\nprint(w.id)\n";
+        fs::write(&path, source).expect("write the document");
+        server.bootstrap();
+        drop(drain(&client));
+
+        let uri = crate::uri::path_to_uri(&path);
+        let hover = server.hover(&uri, lsp_types::Position::new(2, 8));
+        let text = match hover.expect("hover").contents {
+            lsp_types::HoverContents::Markup(markup) => markup.value,
+            other => panic!("expected markup hover contents, got {other:?}"),
+        };
+        // The type merge's own first-wins decision: `a_widget.lua` sorts
+        // before `defs/widget.d.lua` (`a` < `defs`'s `d`), so it is loaded
+        // first and wins the collision — exactly as the plain two-`.lua`-file
+        // case above does, `.d.lua` naming notwithstanding.
+        assert!(text.contains("Widget.id: string"), "{text}");
+        assert!(!text.contains("Widget.id: number"), "{text}");
+        // Description must agree with the type, not the other declaration.
+        assert!(text.contains("the id from a_widget"), "{text}");
+        assert!(!text.contains("the id from defs"), "{text}");
+
+        let location = server
+            .definition(&uri, lsp_types::Position::new(2, 8))
+            .expect("definition");
+        assert!(
+            location.uri.as_str().ends_with("a_widget.lua"),
+            "{location:?}"
+        );
+    }
+
+    // === Watched-file deletion (N24) =======================================
+
+    /// N24: a `require` target deleted mid-session must stop resolving.
+    /// `watched_files_changed`'s `FileChangeType::DELETED` arm used to
+    /// `continue` outright, never telling the host anything changed — the
+    /// host kept the deleted file's last-known text (and everything derived
+    /// from it) indefinitely, so hover kept answering from a file that no
+    /// longer exists on disk. There is no `Change::RemoveFile` in
+    /// `luabox-db` (`luabox_db::Change` has `SetFileText`/`SetOverlay`/
+    /// `ClearOverlay`/`SetDialect`/`SetStrictness`, no delete variant) —
+    /// overwriting the text to empty is the closest in-repo equivalent: an
+    /// empty file exports nothing and declares nothing, so every surface
+    /// that read something out of it starts reading nothing, the same
+    /// externally-observable effect a real removal would have.
+    #[test]
+    fn a_deleted_require_target_stops_resolving() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let point_path = root.join("point.lua");
+        fs::write(
+            &point_path,
+            "---@class Point\n---@field x number\nlocal P = {}\nreturn P\n",
+        )
+        .expect("write point.lua");
+        let main_path = root.join("main.lua");
+        let source = "local p = require(\"point\")\nprint(p.x)\n";
+        fs::write(&main_path, source).expect("write main.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        let uri = crate::uri::path_to_uri(&main_path);
+        let before = server.hover(&uri, lsp_types::Position::new(1, 8));
+        let text_before = match before.expect("hover before deletion").contents {
+            lsp_types::HoverContents::Markup(markup) => markup.value,
+            other => panic!("expected markup hover contents, got {other:?}"),
+        };
+        assert!(text_before.contains("Point.x"), "{text_before}");
+
+        // The file is gone from disk — deleting it for real, then telling
+        // the server via `workspace/didChangeWatchedFiles`, exactly as a
+        // client with file watching enabled would.
+        fs::remove_file(&point_path).expect("delete point.lua");
+        let point_uri = crate::uri::path_to_uri(&point_path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({
+                    "changes": [{ "uri": point_uri.to_string(), "type": 3 }],
+                }),
+            })
+            .expect("didChangeWatchedFiles");
+        drop(drain(&client));
+
+        let after = server.hover(&uri, lsp_types::Position::new(1, 8));
+        let text_after = after.map(|h| match h.contents {
+            lsp_types::HoverContents::Markup(markup) => markup.value,
+            other => panic!("expected markup hover contents, got {other:?}"),
+        });
+        assert!(
+            text_after.as_deref().is_none_or(|t| !t.contains("Point.x")),
+            "a deleted require target must stop resolving: {text_after:?}"
+        );
+    }
+
+    /// The one-variable control: a *non*-deleted watched-file change (a
+    /// `Changed`/`Created` event) must still update resolution the way it
+    /// always has — the deletion arm's fix must not have broken the other
+    /// branch of the same handler.
+    #[test]
+    fn a_changed_require_targets_watched_file_event_still_updates_resolution() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let point_path = root.join("point.lua");
+        fs::write(
+            &point_path,
+            "---@class Point\n---@field x number\nlocal P = {}\nreturn P\n",
+        )
+        .expect("write point.lua");
+        let main_path = root.join("main.lua");
+        let source = "local p = require(\"point\")\nprint(p.x)\n";
+        fs::write(&main_path, source).expect("write main.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        // An external edit, not through the editor overlay — adds a field.
+        fs::write(
+            &point_path,
+            "---@class Point\n---@field x number\n---@field y number\nlocal P = {}\nreturn P\n",
+        )
+        .expect("rewrite point.lua");
+        let point_uri = crate::uri::path_to_uri(&point_path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({
+                    "changes": [{ "uri": point_uri.to_string(), "type": 2 }],
+                }),
+            })
+            .expect("didChangeWatchedFiles");
+        drop(drain(&client));
+
+        let main_uri = crate::uri::path_to_uri(&main_path);
+        let hover = server.hover(&main_uri, lsp_types::Position::new(1, 8));
+        let text = match hover.expect("hover").contents {
+            lsp_types::HoverContents::Markup(markup) => markup.value,
+            other => panic!("expected markup hover contents, got {other:?}"),
+        };
+        assert!(text.contains("Point.x"), "{text}");
+    }
+
     // === Malformed messages ===============================================
     //
     // The server is spoken to by editors, and editors send nonsense: params
@@ -3004,10 +3376,24 @@ mod tests {
 
     /// The same, with the client's `window.workDoneProgress` capability set
     /// explicitly — every `$/progress` the server sends is gated on it.
+    /// Trace defaults to `Off`, matching a real client that never sets it —
+    /// [`test_server_with_trace`] is the one to reach for when a test
+    /// actually asserts on `Self::merged_ambient`'s log.
     fn test_server_with(progress: bool) -> (TempDir, Server, Connection) {
+        test_server_full(progress, TraceValue::Off)
+    }
+
+    /// [`test_server`] with the trace level set explicitly (N22) — for the
+    /// handful of tests that assert on the "merged ambient rebuilt@" log,
+    /// which is now silent unless a client opts in.
+    fn test_server_with_trace(trace: TraceValue) -> (TempDir, Server, Connection) {
+        test_server_full(true, trace)
+    }
+
+    fn test_server_full(progress: bool, trace: TraceValue) -> (TempDir, Server, Connection) {
         let dir = TempDir::new().expect("tempdir");
         let (server_end, client) = Connection::memory();
-        let server = Server::new(server_end, dir.path().to_path_buf(), progress);
+        let server = Server::new(server_end, dir.path().to_path_buf(), progress, trace);
         (dir, server, client)
     }
 
@@ -3324,7 +3710,7 @@ mod tests {
             );
         }
         let (server_end, _client) = Connection::memory();
-        let server = Server::new(server_end, dir.path().to_path_buf(), false);
+        let server = Server::new(server_end, dir.path().to_path_buf(), false, TraceValue::Off);
         assert_eq!(
             server.rocks.types().len(),
             FILES,
@@ -3355,7 +3741,7 @@ mod tests {
             let root = dir.path().to_path_buf();
             let (server_end, client) = Connection::memory();
             let server = std::thread::spawn(move || {
-                let mut server = Server::new(server_end, root, true);
+                let mut server = Server::new(server_end, root, true, TraceValue::Off);
                 server.bootstrap();
                 server.main_loop()
             });
@@ -3650,7 +4036,8 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let root = dir.path().to_path_buf();
         let (server_end, client) = Connection::memory();
-        let server = std::thread::spawn(move || drop(Server::new(server_end, root, true)));
+        let server =
+            std::thread::spawn(move || drop(Server::new(server_end, root, true, TraceValue::Off)));
 
         // Read up to the create request. A `$/progress` in this prefix would
         // be a token being used before it was asked for.
@@ -3741,7 +4128,7 @@ mod tests {
         let (server_end, client) = Connection::memory();
 
         let server = std::thread::spawn(move || {
-            let mut server = Server::new(server_end, root, true);
+            let mut server = Server::new(server_end, root, true, TraceValue::Off);
             server.main_loop()
         });
 
@@ -3873,7 +4260,7 @@ mod tests {
         let (done, finished) = std::sync::mpsc::channel();
 
         let server = std::thread::spawn(move || {
-            let mut server = Server::new(server_end, root, true);
+            let mut server = Server::new(server_end, root, true, TraceValue::Off);
             let outcome = server.main_loop();
             let _ = done.send(());
             outcome
@@ -3903,7 +4290,7 @@ mod tests {
         let (done, finished) = std::sync::mpsc::channel();
 
         let server = std::thread::spawn(move || {
-            let mut server = Server::new(server_end, root, true);
+            let mut server = Server::new(server_end, root, true, TraceValue::Off);
             let outcome = server.main_loop();
             let _ = done.send(());
             outcome
@@ -3997,7 +4384,7 @@ mod tests {
             false
         });
 
-        let mut server = Server::new(server_end, root, true);
+        let mut server = Server::new(server_end, root, true, TraceValue::Off);
         server.bootstrap();
         drop(server);
         assert!(

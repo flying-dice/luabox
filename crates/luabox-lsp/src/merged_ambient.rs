@@ -26,14 +26,15 @@
 //! server's `Rc`.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use luabox_syntax::luacats::{TypeExpr, TypeExprKind};
 use luabox_types::ty::TableTy;
 use luabox_types::{Ambient, FileTypes};
 
-use crate::sema;
+use crate::sema::{self, FileSemaCache};
 
 /// The merged ambient layer, plus a per-instance memo of resolved class
 /// shapes, keyed on the *rendered* reference (`sema::render_type`) rather
@@ -48,6 +49,21 @@ use crate::sema;
 pub struct MergedAmbient {
     ambient: Ambient,
     shapes: RefCell<HashMap<String, Option<Rc<TableTy>>>>,
+    /// The absolute paths of every project-local `[types] defs` file this
+    /// workspace's `base` layer was built from (N18) — the *genuine* ambient
+    /// scope, as opposed to any file merely named `*.d.lua`. Empty unless a
+    /// caller opts in via [`Self::with_ambient_paths`]; `server.rs` is the
+    /// one production caller, computed alongside `base` itself so the two
+    /// can never disagree about what counts as ambient.
+    ambient_paths: HashSet<PathBuf>,
+    /// [`crate::sema::locate_field`]'s `FileSema` cache (N20, round 4 review
+    /// R10 half-fixed), living here rather than per-call: one `MergedAmbient`
+    /// is built per [`luabox_db::Analysis::revision`] and shared behind the
+    /// server's `Rc` (this type's own doc, above) — exactly the lifetime a
+    /// `locate_field` cache needs to survive from one hover to the
+    /// goto-definition right after it, instead of rebuilding every workspace
+    /// file's `FileSema` from scratch on each call.
+    sema_cache: FileSemaCache,
 }
 
 impl MergedAmbient {
@@ -67,7 +83,40 @@ impl MergedAmbient {
         MergedAmbient {
             ambient,
             shapes: RefCell::new(HashMap::new()),
+            ambient_paths: HashSet::new(),
+            sema_cache: FileSemaCache::default(),
         }
+    }
+
+    /// Attach the set of paths that are genuinely part of `base`'s ambient
+    /// scope (a project-local `[types] defs` entry) — [`Self::ambient_paths`]
+    /// answers from this set. A plain [`Self::build`] leaves it empty, which
+    /// is the correct answer for every test/caller that never configured
+    /// `[types] defs` in the first place.
+    #[must_use]
+    pub fn with_ambient_paths(mut self, paths: HashSet<PathBuf>) -> Self {
+        self.ambient_paths = paths;
+        self
+    }
+
+    /// The workspace's genuinely-configured ambient `[types] defs` file
+    /// paths (N18) — the only files [`crate::sema::locate_field`]'s search
+    /// order may give elevated precedence over ordinary load order, because
+    /// it is the only case `luabox_types::env::TypeEnv::merge_file_types`
+    /// itself gives one (via the separately-seeded `Ambient` this whole
+    /// layer is built from). A `*.d.lua`-suffixed file that is not in this
+    /// set is, to the merge, an ordinary project file like any other.
+    #[must_use]
+    pub fn ambient_paths(&self) -> &HashSet<PathBuf> {
+        &self.ambient_paths
+    }
+
+    /// [`crate::sema::locate_field`]'s shared `FileSema` cache for this
+    /// revision (N20) — see the field doc for why living here closes the
+    /// cross-call gap the per-call-local cache left open.
+    #[must_use]
+    pub fn sema_cache(&self) -> &FileSemaCache {
+        &self.sema_cache
     }
 
     /// The raw merged layer, for callers that must hand it to a
@@ -122,6 +171,16 @@ impl MergedAmbient {
         let shape = self.ambient.class_members_of(ty).map(Rc::new);
         self.shapes.borrow_mut().insert(key, shape.clone());
         shape
+    }
+
+    /// Whether `name`'s ancestry was too deep for the most recent
+    /// [`Self::class_members`]/[`Self::class_members_of`] call to resolve
+    /// fully (`LB0317`) — [`Ambient::class_ancestry_truncated`], through the
+    /// merged layer, so a caller checks the exact same env whichever of the
+    /// two entry points it read the shape through.
+    #[must_use]
+    pub fn class_ancestry_truncated(&self, name: &str) -> bool {
+        self.ambient.class_ancestry_truncated(name)
     }
 }
 
@@ -269,5 +328,62 @@ mod tests {
         // And the repeats are the memoised entries, not fresh derivations.
         assert!(Rc::ptr_eq(&first_number, &second_number));
         assert!(Rc::ptr_eq(&first_string, &second_string));
+    }
+
+    // === class_ancestry_truncated (production readiness review, finding 2) =
+
+    /// A single-file `---@class C0`, `---@class C1 : C0`, ..., `Cn : C(n-1)`
+    /// chain of length `n`, matching `luabox-types`' own ancestry-limit
+    /// fixtures.
+    fn chain_source(n: usize) -> String {
+        use std::fmt::Write as _;
+        let mut src = String::from("---@class C0\n---@field item number\n");
+        for i in 1..=n {
+            let _ = writeln!(src, "---@class C{i} : C{}", i - 1);
+        }
+        src
+    }
+
+    #[test]
+    fn class_ancestry_truncated_is_false_for_a_class_that_resolves_fully() {
+        let ambient = merged(&chain_source(150));
+        let shape = ambient.class_members("C150").expect("C150 resolves");
+        assert!(shape.fields.contains_key("item"), "C0's field must survive");
+        assert!(!ambient.class_ancestry_truncated("C150"));
+    }
+
+    /// The gap finding 2 names directly: `Ambient::class_members` walks a
+    /// *different*, long-lived `TypeEnv` than the one `crate::check::run`
+    /// drains for the Problems panel, and nothing used to drain — or even
+    /// expose — this one's ledger. A class deep enough to trip
+    /// `DiamondGuard`'s cap must both lose `C0`'s field from the shape
+    /// `class_members` returns AND be flagged by
+    /// `class_ancestry_truncated`, exactly as `luabox check` would report
+    /// `LB0317` for the same class.
+    #[test]
+    fn class_ancestry_truncated_is_true_for_a_class_diamond_guard_cut_off() {
+        let ambient = merged(&chain_source(400));
+        let shape = ambient.class_members("C400").expect("C400 resolves");
+        assert!(
+            !shape.fields.contains_key("item"),
+            "C0's field is above the cutoff and must not appear"
+        );
+        assert!(ambient.class_ancestry_truncated("C400"));
+    }
+
+    /// The query must reflect the class just resolved, not every class this
+    /// layer has ever touched — a shallow class looked up after a truncated
+    /// one must not inherit the previous call's `true`.
+    #[test]
+    fn class_ancestry_truncated_does_not_leak_across_classes() {
+        let src = format!(
+            "{}\n---@class Shallow\n---@field x number\n",
+            chain_source(400)
+        );
+        let ambient = merged(&src);
+        ambient.class_members("C400").expect("C400 resolves");
+        assert!(ambient.class_ancestry_truncated("C400"));
+        ambient.class_members("Shallow").expect("Shallow resolves");
+        assert!(!ambient.class_ancestry_truncated("Shallow"));
     }
 }

@@ -57,6 +57,30 @@ fn class_at(sema: &FileSema, offset: usize) -> Option<String> {
 
 /// Append the declaration site of every class in `sema` that names `parent`
 /// among its parents.
+///
+/// Round 5 review N12 flagged this alongside `luabox-types`'s five
+/// hand-rolled ancestor walks as a candidate for the same cleanup. It is
+/// not one: those walk *up* a chain of `---@class` parents, so they need a
+/// cycle guard (a malformed or adversarial `: Parent` graph can cycle) and,
+/// for `DiamondGuard` specifically, type-argument sensitivity (`env.rs`'s
+/// doc comment on `DiamondGuard` and `TypeEnv::walk_ancestor_names`). This
+/// function does neither — it is a single pass over one file's classes,
+/// each checked against `parent` by one direct, non-recursive membership
+/// test (`info.tag.parents`), with no edge ever followed and therefore
+/// nothing to guard against looping. There is no walk here to unify with
+/// `walk_ancestor_names` or replace with `DiamondGuard`; the two families
+/// share a data shape (`---@class ... : Parent`) but not an algorithm.
+///
+/// What *is* true, separately from N12: `luabox-types`'s own
+/// `TypeEnv::is_subclass` (`env.rs`) treats "subclass" as transitive
+/// (walking the full ancestor chain via `walk_ancestor_names`), while this
+/// function only matches *direct* parents — a three-level
+/// `Leaf : Mid : Base` reports `Mid` but not `Leaf` as an implementor of
+/// `Base`. That is an intentional scope choice this module's own doc
+/// comment states ("collecting the declaration site of each class whose
+/// parent list (`: Interface`) names it"), not a residual left by this
+/// finding; making it transitive would be new behaviour with its own
+/// design/perf/test cost, out of scope for closing N12.
 fn collect_implementors(sema: &FileSema, parent: &str, out: &mut Vec<Location>) {
     for info in sema.classes().values() {
         let extends = info

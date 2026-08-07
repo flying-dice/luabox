@@ -75,7 +75,7 @@ pub use assign::{Exactness, assignable};
 pub use defs::{
     Ambient, DefFile, alias_collisions, build_ambient, build_ambient_checked, stdlib as stdlib_defs,
 };
-pub use env::{FileTypes, TypeEnv};
+pub use env::{FileTypes, MAX_ANCESTRY_DEPTH, TypeEnv};
 pub use infer::{ExternalTypes, InferredBinding, InferredReturn};
 pub use rocks::{RockFile, RockModule, RockSurfaces};
 pub use version::VersionReq;

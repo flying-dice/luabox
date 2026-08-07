@@ -895,10 +895,17 @@ impl Infer<'_> {
                     }
                     // Absence is diagnosable only for a real LuaCATS `---@class`
                     // with no indexer/array part. A dynamic-access class stays
-                    // lenient.
+                    // lenient — and so does a class whose ancestry the
+                    // `class_shape` call just above truncated (`LB0317`,
+                    // production readiness review finding 1): its shape is
+                    // admittedly incomplete, so an absent field here might
+                    // simply be declared past the cutoff. `LB0317` alone is
+                    // the honest diagnostic; a false `LB0306` on top of it is
+                    // not.
                     if self.env.is_class(&class)
                         && shape.indexers.is_empty()
                         && shape.array.is_none()
+                        && !self.env.class_ancestry_truncated(&class)
                     {
                         declared_class.get_or_insert(class);
                     } else {
@@ -1007,13 +1014,18 @@ impl Infer<'_> {
                 }
                 // Absent on a declared class → luals `undefined-field` (#90),
                 // provable only for a real LuaCATS `---@class` with no
-                // indexer/array part (dynamic access) and that resolved to a
-                // table (not an enum union).
+                // indexer/array part (dynamic access), that resolved to a
+                // table (not an enum union), and whose ancestry the
+                // `resolve_named` call above did not truncate (`LB0317`,
+                // production readiness review finding 1 — a truncated shape
+                // stays lenient on member reads, same as `lookup_shape_field`).
                 let dynamic = match &resolved {
                     Ty::Table(t) => !t.indexers.is_empty() || t.array.is_some(),
                     _ => true,
                 };
-                let provable = self.env.is_class(class) && !dynamic;
+                let provable = self.env.is_class(class)
+                    && !dynamic
+                    && !self.env.class_ancestry_truncated(class);
                 Lookup::Absent {
                     provable,
                     declared: provable.then(|| class.clone()),

@@ -1274,15 +1274,21 @@ s:close(1)
 
 // --- where a free type parameter can hide inside a member's type -----------
 //
-// `class_params_in_scope` decides whether an export keeps its class identity
-// (#56 enforcement) or crosses as the erased template, by walking the
-// *resolved* shape for parameters nothing binds. The walk has one arm per
-// composite type, and a missing arm is invisible in the ordinary case: the
+// `TypeEnv::class_shape_bound_export` (round 5 review N8/N9 — this replaced
+// the `class_params_in_scope` plus after-the-fact `subst_ty` pass these
+// comments originally described) decides whether an export keeps its class
+// identity (#56 enforcement) or crosses as the erased template: it
+// substitutes each visited class's own unbound trailing parameters to
+// `unknown` in that class's own `bound` map before `crate::generics::subst_ty`/
+// `subst_field` recurse through the member's type — the same general-purpose
+// substitution every direct generic instantiation already goes through, not
+// a bespoke walk with one arm per composite. A regression that skips a
+// composite during substitution is invisible in the ordinary case: the
 // parameter simply is not found, the class keeps its name, and the export
 // becomes STRICTER — an undeclared member starts reporting LB0306 instead of
 // staying lenient. Each fixture below hides the parameter one level down in a
-// different composite, so a deleted arm is a failing test rather than a
-// silent tightening. (Measured: each was a surviving mutant of the
+// different composite, so a substitution regression is a failing test rather
+// than a silent tightening. (Measured: each was a surviving mutant of the
 // `Ty::Union` / `Ty::Table` / `Ty::Function` arms before these landed.)
 
 /// Assert a carrier whose only mention of `T` is inside `member_decl` crosses
@@ -1529,9 +1535,9 @@ return M
 
 /// `Ctop`'s own field `other` names the real class `V`. Diagnostic codes for
 /// an undeclared read off it — `["LB0306"]` proves `other` kept its real `V`
-/// identity; an empty result means the export lost it (either the stale
-/// pre-fix bug, or the separate, still-open name-collision gap the second
-/// order below documents).
+/// identity; an empty result means the export lost it, in either edge order
+/// (round 5 review N8/N9 closed the gap that used to make this order-
+/// dependent — see `a_diamond_binding_v_first_leaves_item_free_but_other_keeps_its_own_identity`).
 fn diamond_undeclared_field_is_reported(parents: &str) -> Vec<String> {
     let module = diamond_over_generic_ancestor(parents);
     let (export_ty, types) = surface(&module, stdlib());
@@ -1565,37 +1571,36 @@ fn a_diamond_binding_v_last_reports_the_undeclared_read_and_keeps_item_bound() {
 }
 
 #[test]
-fn a_diamond_binding_v_first_leaves_item_free_and_other_pays_the_known_collision() {
-    // `Ctop : Aone, Bone` — the opposite order. The binding edge runs
-    // first, the bare edge (Bone -> Base) runs last, so — independent of
-    // this fix, per the already-pinned "last-listed-parent-wins" merge rule
-    // — Bone's bare reference wins `item`, exactly as a lone bare parent
-    // does (`a_parent_written_bare_leaves_its_parameter_unbound_and_erased`):
+fn a_diamond_binding_v_first_leaves_item_free_but_other_keeps_its_own_identity() {
+    // `Ctop : Aone, Bone` — the opposite order from the sibling test above.
+    // The binding edge runs first, the bare edge (Bone -> Base) runs last,
+    // so — per the already-pinned "last-listed-parent-wins" merge rule —
+    // Bone's bare reference wins `item`, exactly as a lone bare parent does
+    // (`a_parent_written_bare_leaves_its_parameter_unbound_and_erased`):
     // `item` is genuinely, correctly free, and `Ctop`'s export legitimately
-    // erases at the #56 seam.
+    // erases it at the #56 seam.
     diamond_item_type_matches_the_last_listed_parent("Aone, Bone", false);
 
-    // This is where this fix's job ends and a separate, narrower, KNOWN
-    // limitation begins: the erasure substitutes every `Ty::Named("V")` it
-    // finds in the resolved shape, and the resolved shape cannot, by
-    // representation alone, distinguish "the ancestor's genuinely-free
-    // template parameter" from "a field that happens to name the real class
-    // `V`" once both have collapsed to the identical `Ty::Named("V")` value.
-    // `other` pays for that collision here — same as it would for a lone
-    // (non-diamond) bare `---@class Sub : Base` whose sibling field also
-    // happened to be spelled like `Base`'s own parameter. This is NOT a
-    // regression: `free` already, coincidentally, agreed with `shape` for
-    // THIS order before this fix (the last-visited edge for `Base` is the
-    // bare one either way), so this fix changes nothing observable here —
-    // it only retracts a stale contribution when the LAST visit disagrees
-    // with an EARLIER one, which is precisely the other test's order, not
-    // this one.
+    // `other`'s reference to the real class `V` must survive regardless —
+    // round 5 review N8/N9: the erasure used to substitute every
+    // `Ty::Named("V")` it found anywhere in the *fully-merged* shape,
+    // unable to distinguish "`Base`'s own genuinely-free template
+    // parameter" from "`Ctop`'s own field, which happens to name the real
+    // class `V`", once both had collapsed to the identical `Ty::Named("V")`
+    // value — a real gap this exact edge order used to pay for (see the
+    // history of this test; it was pinned as a known, accepted limitation
+    // before the guard rewrite below). [`TypeEnv::collect_class`]'s
+    // `erase_free` now substitutes each visited class's own free
+    // parameters in *that class's own* `bound` map, at the exact
+    // declaration doing the substituting — `Ctop` is not generic and
+    // declares `other` itself, so nothing about `Base`'s unrelated `V`
+    // parameter, in either edge order, ever reaches it. `other` keeps its
+    // real `V` identity independent of which parent binds `Base` last.
     assert_eq!(
         diamond_undeclared_field_is_reported("Aone, Bone"),
-        Vec::<String>::new(),
-        "Aone-then-Bone: item is genuinely free by the existing merge rule, \
-         so the export erases — other's collision with the same spelling is \
-         a separate, pre-existing representational gap, not this fix's job"
+        vec!["LB0306"],
+        "Aone-then-Bone: `other`'s real `V` identity must survive `Base`'s \
+         unrelated, same-spelled free parameter regardless of edge order"
     );
 }
 

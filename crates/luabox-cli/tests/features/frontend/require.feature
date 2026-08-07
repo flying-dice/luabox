@@ -570,6 +570,15 @@ Feature: luabox check — cross-file require resolution (#85)
     # name, so a CJK class name is legal LuaCATS input; nothing pinned it
     # surviving `class_members`/`export_class`'s `&str` keying across the
     # `require` boundary.
+    #
+    # Round 5 review N46: the original version of this scenario asserted only
+    # field EXISTENCE (`m.nope` is `LB0306`), never that the declared field's
+    # TYPE survives the boundary too — the half most likely to regress, since
+    # a lenient `unknown` erasure of `x` would still leave `want(m.x)` clean
+    # and would still leave `m.nope` undeclared, so the scenario would keep
+    # passing. `wants` below pins the type: it demands `string`, `m.x` is
+    # declared `number`, so only a genuine `number` crossing (not `unknown`)
+    # makes `wants(m.x)` fail.
     Given a strict project with edition "5.4"
     And a file "src/config.lua" containing:
       """
@@ -582,23 +591,69 @@ Feature: luabox check — cross-file require resolution (#85)
       """
       ---@param n number
       local function want(n) end
+      ---@param s string
+      local function wants(s) end
       local m = require("config")
       want(m.x)
+      wants(m.x)
       print(m.nope)
       """
     When I run "luabox check"
     Then the command fails
     And stdout contains "LB0306"
+    And stdout contains "LB0300"
 
-  # The remaining two round 4 review R28 chaos gaps do not get a scenario
-  # here:
+  Scenario: a class carried by a file that opens with a UTF-8 BOM crosses require with its field types intact
+    # Round 4 review R28's third chaos gap, on the BOM half. This scenario
+    # replaces a comment that declined coverage on the claim that asserting
+    # the correct (clean) result "fails today" — round 5 review N44 measured
+    # that, at this head, it does not: the `is_file_prefix` fold at
+    # `crates/luabox-syntax/src/luacats/mod.rs:1105` (mutation-verified — two
+    # tests die when it is removed) makes `resolve_target`'s backward scan
+    # skip the leading BOM, so a doc block that opens a BOM'd file still
+    # links to the statement that follows it rather than misreading it as a
+    # trailing comment on nothing. Before that fold landed, field EXISTENCE
+    # crossed `require` correctly from a BOM'd carrier but every declared
+    # field's TYPE read back as `unknown` at the consumer. `wants` below
+    # pins the type half the same way the unicode scenario above does: it
+    # demands `string`, `p.x` is declared `number`, so only a genuine
+    # `number` crossing makes `wants(p.x)` fail.
+    Given a strict project with edition "5.4"
+    And a file "src/point.lua" with a UTF-8 BOM containing:
+      """
+      ---@class Point
+      ---@field x number
+      local M = {}
+      return M
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param n number
+      local function want(n) end
+      ---@param s string
+      local function wants(s) end
+      local p = require("point")
+      want(p.x)
+      wants(p.x)
+      print(p.nope)
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0306"
+    And stdout contains "LB0300"
+
+  # One round 4 review R28 chaos gap still does not get a scenario here:
   #
   # * A required module deleted mid-session, then hovered. Hover
   #   (`textDocument/hover`) is exclusively an LSP-protocol surface —
   #   `features/lsp/`, driven by the separate `lsp_acceptance` harness. The
   #   CLI's `check` never hovers anything, so faking this against `luabox
   #   check` would not pin what the finding actually names. It belongs in
-  #   `features/lsp/hover-require.feature`, outside this file's scope.
+  #   `features/lsp/hover-require.feature`, outside this file's scope — and
+  #   outside a documentation-only pass's file ownership besides. Round 5
+  #   review N45: this deferral, like the CRLF one below, is not tracked in
+  #   an issue; N24 names the live consequence (hover keeps answering from a
+  #   deleted file after a `didChangeWatchedFiles` delete event).
   #
   # * CRLF through the export seam — genuinely blocked, not merely skipped.
   #   Every content-bearing `Given` step in this suite writes its fixture
@@ -608,29 +663,13 @@ Feature: luabox check — cross-file require resolution (#85)
   #   alone — a literal CRLF authored inside a `"""..."""` block is silently
   #   normalized to LF before any step function ever runs (checked against
   #   `gherkin` 0.14.0's `docstring()` rule and `textwrap` 0.16.2's
-  #   `dedent`). The BOM half of this same gap (below) dodges the identical
-  #   problem by never putting the mark INSIDE the docstring — `a file
-  #   {string} with a UTF-8 BOM containing:` (`acceptance.rs`) prepends it
-  #   outside the dedented text. CRLF needs the same treatment: a
-  #   `write_file`-driven step that appends `\r\n` line endings itself. That
-  #   step does not exist, and adding one means editing
-  #   `crates/luabox-cli/tests/acceptance.rs`/`support/mod.rs` — outside this
-  #   pass's file ownership.
-  #
-  # A third thing surfaced while probing the BOM half of this gap, worth
-  # flagging even though it stops here rather than becoming a scenario: a
-  # class carrier declared in a file that itself opens with a UTF-8 BOM
-  # crosses `require` with field EXISTENCE resolved correctly (LB0306 still
-  # fires on a genuinely undeclared field, naming the class and pointing at
-  # its declaration), but every DECLARED field's TYPE reads back as `unknown`
-  # at the consumer — `want(p.x)` against `---@field x number` in a BOM'd
-  # `point.lua` reports LB0300 "found `unknown`"; the identical source
-  # without the mark is clean, and the same field resolves correctly to
-  # `number` from A USE SITE INSIDE the BOM'd file itself (same-file
-  # inference is unaffected — only the cross-file merge is). Measured
-  # pre-existing on the round-3 head too, so this delta did not introduce it.
-  # The root cause sits outside `luabox-db` — most likely the `luacats`
-  # harvester or the `merge_file_types`/reification path in `luabox-types` —
-  # so it is reported here rather than fixed or pinned: a scenario asserting
-  # the correct (clean) result fails today, and one asserting the actual
-  # (`unknown`) result would misrepresent a defect as spec.
+  #   `dedent`). The BOM scenario above dodges the identical problem by
+  #   never putting the mark INSIDE the docstring — `a file {string} with a
+  #   UTF-8 BOM containing:` (`acceptance.rs`) prepends it outside the
+  #   dedented text. CRLF needs the same treatment: a `write_file`-driven
+  #   step that appends `\r\n` line endings itself. That step does not
+  #   exist, and adding one means editing
+  #   `crates/luabox-cli/tests/acceptance.rs`/`support/mod.rs` — outside
+  #   this pass's file ownership. (BOM+CRLF combined and CRLF-only were both
+  #   measured correct through this same seam at this head; only the harness
+  #   gap keeps them uncovered.)

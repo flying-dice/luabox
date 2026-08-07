@@ -205,7 +205,10 @@ impl AnalysisHost {
     }
 
     /// Drain the query execution trace collected since the last call — the
-    /// list of queries that actually *ran* (cache misses). Test/tracing aid.
+    /// list of queries that actually *ran* (cache misses). Test aid: no
+    /// front-end calls this today, so a session that never drains it still
+    /// only ever retains the trace's capped tail (round 5 review N23)
+    /// rather than growing without bound.
     #[must_use]
     pub fn take_execution_log(&self) -> Vec<String> {
         self.db.take_logs()

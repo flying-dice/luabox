@@ -39,7 +39,7 @@
 //! loop instead of a one-shot check — see `crate::watch` for the debounce
 //! and filtering rules.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -47,9 +47,11 @@ use anyhow::{Context, bail};
 use luabox_diag::{Code, Diagnostic, Format, Label, Span};
 use luabox_manifest::layout::{self, DefFiles, DefSource};
 use luabox_manifest::model::{Build, DialectId, Manifest};
-use luabox_syntax::{Dialect, lua};
+use luabox_syntax::{Dialect, lua, luacats};
 use luabox_types::ty::Ty;
-use luabox_types::{Ambient, DefFile, Strictness, build_ambient_checked, stdlib_defs};
+use luabox_types::{
+    Ambient, DefFile, MAX_ANCESTRY_DEPTH, Strictness, build_ambient_checked, stdlib_defs,
+};
 use rayon::prelude::*;
 
 use layout::display_rel;
@@ -254,6 +256,13 @@ fn run_passes(project: &Project, passes: TargetPasses, format: Format) -> anyhow
         files.push(result?);
     }
 
+    // A `---@class` chain deep enough to overflow the pinned stack has to be
+    // caught HERE, before the surface pass below recurses over it — see
+    // `deep_class_chain_diagnostic`.
+    if let Some(diag) = deep_class_chain_diagnostic(&files) {
+        return finish(&[diag], format, &project.root, files.len());
+    }
+
     // Cross-file pre-pass (#85): reify every project file's surface up
     // front — its `require`-export type (keyed by canonical path) plus its
     // workspace-global `---@class`/`---@enum` declarations (luals parity:
@@ -352,13 +361,17 @@ fn run_passes(project: &Project, passes: TargetPasses, format: Format) -> anyhow
     // retained array on an N-file project where file count and class count
     // scale together, which the CPU-time table above cannot show at all.
     // Measured (same shape, two-class-per-file synthetic project, peak RSS
-    // via `scripts/peak-rss.py`, release build):
+    // via `scripts/peak-rss.py`, release build) — the same table
+    // `build_file_env`'s doc comment carries and `scripts/perf-gate.sh`'s
+    // "RETAINED-TYPEENV REGRESSION GATE" leg re-measures on every CI run:
     //
     //   N      2 builds/file (transient)   1 build/file (R14, retained)
-    //   100    15 MiB                      79 MiB
-    //   500    49 MiB                      1419 MiB
+    //   100    11 MiB                       51 MiB   (4.6x)
+    //   200    15 MiB                      145 MiB   (9.3x)
+    //   300    20 MiB                      290 MiB  (14.5x)
+    //   500    29 MiB                      734 MiB  (25.3x)
     //
-    // A ~29x memory blowup at N=500 for a ~1.76x CPU win is the wrong side
+    // A ~25x memory blowup at N=500 for a ~1.76x CPU win is the wrong side
     // of that trade — a project large enough to make the CPU saving matter
     // is exactly the project large enough for the retained-`Vec<TypeEnv>`
     // memory to become the dominant cost, or exhaust memory outright, well
@@ -415,6 +428,125 @@ fn run_passes(project: &Project, passes: TargetPasses, format: Format) -> anyhow
     finish(&diags, format, &project.root, lua_files.len())
 }
 
+/// Hard ceiling on a `---@class` single-parent inheritance chain, checked
+/// syntactically — from the harvested annotations, not the type env — by
+/// [`deep_class_chain_diagnostic`], before
+/// [`luabox_types::module_surface_with_artifacts`] gets anywhere near it.
+///
+/// Round 5 review N2 originally gave this its own, looser ceiling (2,000),
+/// reasoned from this CLI's *own* pinned-thread crash floor. That stopped
+/// being the right number the day `luabox-types` grew a durable, general fix
+/// for the same finding: `env::MAX_ANCESTRY_DEPTH`'s `DiamondGuard` cap,
+/// which refuses to recurse past 200 links inside the resolution walk itself
+/// — unconditionally, for every caller, not just this CLI's pinned
+/// dispatcher thread. A chain between the two numbers (200 < depth ≤ 2,000)
+/// used to sail past this pre-check's "fine" verdict and then have its shape
+/// silently truncated the moment anything resolved it, which is exactly
+/// backwards: a check that certifies a depth as safe must not be looser than
+/// the resolver that actually walks it (production readiness review, finding
+/// 1). This now imports [`luabox_types::MAX_ANCESTRY_DEPTH`] rather than
+/// keeping its own figure, so the two can no longer drift apart — one number,
+/// enforced twice: cheaply and syntactically here, before any class is
+/// resolved (and even for a chain nothing in the project ever references —
+/// see below); durably inside the resolver itself for every caller,
+/// including ones this pre-check never runs ahead of (the LSP request path,
+/// an embedder calling `luabox_lsp::run_stdio` directly).
+///
+/// [`MAX_ANCESTRY_DEPTH`]'s check: the deepest class (project-wide,
+/// across every file [`run_passes`] just parsed) whose single-parent
+/// ancestor chain exceeds it, as one diagnostic naming the file and the
+/// class. `None` when every declared chain is within bounds.
+///
+/// A parent expressed as anything other than a bare name (a union, a table
+/// literal, ...) does not extend a chain this walk follows — the heuristic
+/// under-counts rather than duplicates `luabox-types`' own resolution — and
+/// a multi-parent class (`---@class A : B, C`) is treated as a root for the
+/// same reason: the pathological shape this guards against is a plain
+/// linear chain, and bounding a generic/diamond ancestry is
+/// `luabox-types`' `DiamondGuard` to do, not this syntactic trip-wire's.
+/// Depth does not require the chain to be *used* anywhere in the file —
+/// declaring it is already enough to make `luabox-types` walk it once
+/// something in the project resolves any class near the bottom, and a
+/// declared-but-dead chain this deep is not a real project shape worth
+/// letting through to find out.
+///
+/// Depth is computed iteratively — an explicit stack, not a recursive walk
+/// — precisely so this check cannot itself overflow on the input it exists
+/// to reject; a same-walk "on this path" set stops a cyclic `---@class A :
+/// B` / `---@class B : A` back-edge (its own, separately reported error)
+/// rather than looping forever, and memoizing each resolved depth keeps the
+/// whole project-wide pass linear in the number of declared classes.
+fn deep_class_chain_diagnostic(files: &[SourceFile]) -> Option<Diagnostic> {
+    // name -> (declaring file, span); name -> single named parent. First
+    // declaration of a name wins, matching this module's other project-wide
+    // merges (`with_project_types`'s "defs win").
+    let mut declared_at: HashMap<String, (&str, luacats::Span)> = HashMap::new();
+    let mut parent_of: HashMap<String, String> = HashMap::new();
+    for file in files {
+        for item in luacats::harvest(&file.parse) {
+            for tag in item.block.tags {
+                let luacats::Tag::Class(class) = tag else {
+                    continue;
+                };
+                declared_at
+                    .entry(class.name.clone())
+                    .or_insert((file.rel.as_str(), class.span));
+                if let [parent] = class.parents.as_slice()
+                    && let luacats::TypeExprKind::Named { name, .. } = &parent.kind
+                {
+                    parent_of
+                        .entry(class.name.clone())
+                        .or_insert_with(|| name.clone());
+                }
+            }
+        }
+    }
+
+    let mut depth: HashMap<String, usize> = HashMap::new();
+    for start in parent_of.keys() {
+        if depth.contains_key(start) {
+            continue;
+        }
+        let mut path: Vec<String> = Vec::new();
+        let mut on_path: HashSet<&str> = HashSet::new();
+        let mut current = start.as_str();
+        while !depth.contains_key(current) && !on_path.contains(current) {
+            let Some(parent) = parent_of.get(current) else {
+                break;
+            };
+            on_path.insert(current);
+            path.push(current.to_owned());
+            current = parent.as_str();
+        }
+        let mut base = depth.get(current).copied().unwrap_or(0);
+        for name in path.into_iter().rev() {
+            base += 1;
+            depth.insert(name, base);
+        }
+    }
+
+    let (deepest, &max_depth) = depth.iter().max_by_key(|&(_, d)| d)?;
+    if max_depth <= MAX_ANCESTRY_DEPTH {
+        return None;
+    }
+    let &(rel, span) = declared_at.get(deepest)?;
+    Some(
+        Diagnostic::error(
+            Code::new(1),
+            format!(
+                "`{deepest}`'s single-inheritance chain is {max_depth} classes deep, over \
+                 the {MAX_ANCESTRY_DEPTH}-class limit this checker enforces to avoid a \
+                 stack overflow while resolving it — flatten the hierarchy or use \
+                 composition instead of a long single-inheritance chain"
+            ),
+        )
+        .with_label(Label::primary(
+            Span::new(rel, span.start..span.end),
+            "deepest class in the chain",
+        )),
+    )
+}
+
 /// One project file, read and parsed once: everything both halves of the
 /// check need from it, so neither goes back to disk nor re-derives what the
 /// other already has (CC-M1).
@@ -437,7 +569,7 @@ struct SourceFile {
 /// it, rather than reusing one threaded in from [`run_passes`] (round 4
 /// review finding 6 reverted round 4 review R14's env-sharing — see the doc
 /// comment above `file_exports` in [`run_passes`] for the measurement: R14's
-/// retained `Vec<TypeEnv>` was an O(N²)-peak-memory regression, ~29x at
+/// retained `Vec<TypeEnv>` was an O(N²)-peak-memory regression, ~25x at
 /// N=500 on the benchmark project, for a ~1.76x CPU win).
 fn check_one(
     file: &SourceFile,
@@ -970,6 +1102,86 @@ mod tests {
         );
         // Warnings never fail the command (module docs, SPEC.md §3).
         check(tmp.path(), None, Format::Human).expect("warnings do not fail");
+    }
+
+    // -- the class-chain depth ceiling (round 5 review N2) ------------------
+
+    /// A single-file `---@class C0`, `---@class C1 : C0`, ..., `Cn : C(n-1)`
+    /// chain of length `n`.
+    fn class_chain_source(n: usize) -> String {
+        let mut src = String::from("---@class C0\n---@field item number\n");
+        for i in 1..=n {
+            use std::fmt::Write as _;
+            let _ = writeln!(src, "---@class C{i} : C{}", i - 1);
+        }
+        src
+    }
+
+    #[test]
+    fn a_class_chain_past_the_depth_ceiling_is_a_clean_diagnostic_not_a_crash() {
+        // Round 5 review N2: a single-parent `Cn : C(n-1)` chain recurses one
+        // Rust stack frame per ancestor inside `luabox-types`' class-shape
+        // resolution, and past whatever the pinned stack survives the whole
+        // PROCESS aborts — no diagnostic, no file name, not even the nonzero
+        // exit code `check` normally reports (see `deep_class_chain_diagnostic`'s
+        // doc comment for the measured floors that make this a real, not
+        // hypothetical, failure mode).
+        //
+        // 2,500 sits well above `MAX_ANCESTRY_DEPTH` (200) but far below even
+        // the *debug* binary's measured un-pinned crash floor (~990, see the
+        // constant's own doc comment): unlike a probe at the actual crash
+        // depth, this test stays a clean assertion failure — not a process
+        // abort — if the guard below it ever regresses, so it is safe to run
+        // in every future `cargo test` regardless of what changes around it.
+        let tmp = project(&manifest("5.4", ""));
+        write(tmp.path(), "src/main.lua", &class_chain_source(2_500));
+        // Exactly one error: the depth diagnostic, and nothing from the
+        // (otherwise well-formed) chain itself.
+        let error = check(tmp.path(), None, Format::Human)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "check failed with 1 error(s)");
+    }
+
+    #[test]
+    fn a_class_chain_at_or_under_the_ceiling_checks_normally() {
+        // The floor side of the same guard: a chain of exactly
+        // `MAX_ANCESTRY_DEPTH` must not be refused — this is a regression
+        // check on the boundary (`<=`, not `<`) as much as it is on the
+        // feature existing at all.
+        let tmp = project(&manifest("5.4", ""));
+        write(
+            tmp.path(),
+            "src/main.lua",
+            &class_chain_source(MAX_ANCESTRY_DEPTH),
+        );
+        check(tmp.path(), None, Format::Human).expect("a chain at the ceiling is not refused");
+    }
+
+    #[test]
+    fn the_pre_check_ceiling_and_the_resolver_cap_are_the_same_number() {
+        // Production readiness review finding 1: before this pre-check
+        // imported `luabox_types::MAX_ANCESTRY_DEPTH` instead of keeping its
+        // own, looser, separately-reasoned figure (2,000), a 400-class
+        // single-inheritance chain — well inside what this pre-check's
+        // message called safe — sailed straight through it, then had its
+        // shape silently truncated the moment anything referenced it (the
+        // resolver's own cap sat at 200 all along), producing a false
+        // `LB0306` `undefined field` for a field the pre-check's own message
+        // a moment earlier had certified as within bounds. Now the two
+        // share one constant, so a 400-class chain — comfortably past the
+        // shared ceiling — is caught HERE, early and cheaply, before
+        // resolution ever gets a chance to truncate anything: exactly one
+        // diagnostic, not the pre-check's silence followed by a wrong one
+        // from the checker.
+        let tmp = project(&manifest("5.4", ""));
+        let mut src = class_chain_source(400);
+        src.push_str("\n---@type C400\nlocal x = {}\nlocal y = x.item\n");
+        write(tmp.path(), "src/main.lua", &src);
+        let error = check(tmp.path(), None, Format::Human)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "check failed with 1 error(s)");
     }
 
     // -- cross-file export-seam reification (round 3 review F42) -----------

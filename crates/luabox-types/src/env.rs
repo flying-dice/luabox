@@ -8,7 +8,8 @@
 //! separately, by threading a module-export registry into inference rather
 //! than into this environment (see [`crate::check_file_with_requires`], #85).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Mutex;
 
 use luabox_syntax::lua::ast::{AstNode, Expr, LocalStmt, Stmt};
 use luabox_syntax::lua::{self, SyntaxKind, SyntaxNode};
@@ -261,132 +262,383 @@ pub struct TypeEnv {
     /// file that declares its class, so an access is in-package iff the owner
     /// class is one this file declares.
     local_classes: HashSet<String>,
+    /// Root class names whose ancestor-chain resolution tripped
+    /// [`DiamondGuard`]'s depth cap (`LB0317`, round 5 review N2's durable
+    /// fix) — recorded, not merely detected, because [`Self::class_shape`]/
+    /// [`Self::class_shape_bound`]/[`Self::class_shape_bound_export`]/
+    /// [`Self::class_operators`] all take `&self` and run repeatedly during
+    /// inference and checking (unlike `unknown_names`/`arity_errors`/
+    /// `cyclic_aliases` above, which the `Lowerer` — a `&mut self` pass —
+    /// collects once while `build_from_items` runs): there is no `&mut
+    /// self` moment after construction for a plain field to be written
+    /// into, so this needs interior mutability. A `Mutex` rather than a
+    /// `RefCell`: `TypeEnv` lives inside `Ambient`, which
+    /// `defs.rs`'s per-dialect `OnceLock` cache holds in a `static`, so it
+    /// must stay `Sync`. Drained, not merely read, by `crate::check::run` —
+    /// see [`Self::take_depth_limit_hits`].
+    depth_limit_hits: Mutex<HashSet<String>>,
 }
 
 /// The cycle-guard + memo bookkeeping shared by [`TypeEnv::collect_class`]
 /// and [`TypeEnv::collect_operators`]'s depth-first ancestor walks (round 4
 /// review finding 7 — before this, each function hand-rolled its own
 /// `on_path: HashSet<String>` plus `memo: Vec<(String, Vec<Ty>)>` pair with
-/// the identical enter/exit logic; a fix to one walk's guard had to be
-/// remembered and re-applied to the other by hand, which is exactly how #59
-/// F37 happened — `collect_operators` missing a fix `collect_class` already
-/// had). One owner now; both walks call [`Self::enter`]/[`Self::exit`] and
-/// neither touches `on_path`/`memo`/`bindings` directly.
+/// the identical enter/exit logic). One owner now; both walks call
+/// [`Self::visit`] and neither touches `on_path`/`resolved`/`generation`
+/// directly — there is no separate "did you check `Skip`?" step to forget
+/// (round 5 review N15): [`Self::visit`] itself decides whether the body
+/// runs, and records the visit on the way out regardless of whether it did.
 ///
-/// `memo` is a `HashSet`, not the `Vec` it used to be (round 4 review
-/// finding 5): a `Vec` membership check (`.contains`) is O(k) per call, so
-/// k visits paid O(k²) total, despite [`TypeEnv::collect_class`]'s doc
-/// comment and `diamond_perf_sweep` both having claimed O(k) throughout
-/// round 4. [`Ty`] did not derive `Hash` (nothing forced it to before
-/// round 4), so a `HashSet<(String, Vec<Ty>)>` was not a drop-in until
-/// [`Ty`] and every type it is built from (`FieldTy`, `TableTy`, `ParamTy`,
-/// `TypeParam`, `FunctionTy`, `VersionReq`) picked up the derive.
+/// Round 5 shipped a version of this guard that skipped a repeat visit to
+/// `(name, args)` unless `name` had *ever*, anywhere in the whole call, been
+/// bound to some other `args` (`bindings: HashMap<String, HashSet<Vec<Ty>>>`,
+/// checked as "does any entry disagree"). Two bugs followed from that being
+/// **unscoped** — a property of the whole call rather than of what actually
+/// happened *since* a key was last resolved:
 ///
-/// `bindings` is round 5 review's addition: every distinct `args` a class
-/// name has been bound to *so far* (forward-only — this call's own visits,
-/// in the order they occurred), keyed by the bare name, ignoring which
-/// specific `args` a given call used. [`Self::enter`] consults it for
-/// exactly one question — see [`Entry::Skip`] vs [`Entry::Proceed`] — and
-/// nothing else reads it. Populated in [`Self::exit`], alongside `memo`, so
-/// a later visit only ever sees bindings that were fully resolved *before*
-/// it — the guard never needs to look ahead.
+/// - **Exponential (round 5 review N1).** Once any name anywhere in the walk
+///   was bound two ways, *every* later repeat of it — even one that agrees
+///   with every other visit — re-expanded its full subtree, which is
+///   exactly the O(2^k) behaviour the memo exists to prevent.
+/// - **Wrong winner, both directions (N3/N4/N5).** The check asked "has
+///   `name` ever disagreed", not "has anything conflicting happened since
+///   *this* key was last resolved" — so a genuinely stale repeat (something
+///   else overwrote what it contributed) could be skipped, and an
+///   up-to-date one could be needlessly re-expanded, depending on which
+///   *other*, unrelated bindings happened to exist elsewhere in the call.
 ///
-/// Measured (`diamond_perf_sweep`, release build): the range that test
-/// shipped with (through k=100) is too small to tell O(k) from O(k²) apart
-/// — both finish in low milliseconds there, so the doc comment's O(k) claim
-/// was wrong, not merely untested. Extended through k=1600 and compared
-/// against a reverted `Vec`-memo build at the same sizes, the gap is
-/// unambiguous and widening — see `diamond_perf_sweep`'s doc comment for
-/// the table.
+/// This version replaces the per-name binding *set* with a single
+/// monotonic `generation` counter plus, per key, the generation as of which
+/// it was last resolved (`resolved`). `generation` advances exactly once
+/// per *genuinely new* distinct binding of an already-seen name (a real
+/// diamond disagreement) — never for a name's first-ever binding, and never
+/// for a repeat of a binding already on record. A repeat visit is safe to
+/// skip exactly when its own recorded generation matches the current one:
+/// nothing has disagreed with it *since it was last written*, wherever in
+/// the tree that disagreement would have happened. A stale one (recorded
+/// generation behind current) re-runs the same body a fresh visit would —
+/// which restores its contribution at its own listed position (fixing
+/// N3/N4/N5) without re-expanding on every subsequent visit the way the
+/// round 5 guard did (fixing N1's exponential).
 ///
-/// Round 5 review's fix (below) keeps this shape deliberately: a repeat
-/// visit costs one `HashSet` lookup plus one scan bounded by that name's
-/// *distinct* binding count (small and input-dependent, not k) — and nothing
-/// more when the visit is skipped. An earlier draft of this fix instead
-/// cached and replayed a full per-key *result* on every repeat; measured
-/// against this same `diamond_perf_sweep` fixture, that draft turned the
-/// k=200..800 rows from single-digit milliseconds into 50ms/191ms/765ms (a
-/// ~4x-per-doubling curve, i.e. quadratic again) and stack-overflowed at
-/// k=1600 — the cached-result approach still paid to clone and re-merge an
-/// ever-growing per-key snapshot at every one of the k levels, even though
-/// zero repeats in that fixture ever needed reapplying. Re-expanding a
-/// repeat's own frame in place (this fix) does not carry that cost: a
-/// non-competing repeat is skipped exactly as before (`Entry::Skip`, O(1)),
-/// and a competing one falls straight through to an ordinary walk instead
-/// of a separate replay path.
+/// This is **not** claimed to be O(k): a re-walk can itself re-descend into
+/// further stale repeats, so the cost of a genuinely adversarial shape —
+/// every level disagrees with itself, `conflicting_diamond_source` in the
+/// tests below — is polynomial, not linear, and measurably worse than the
+/// no-conflict case (`diamond_source`) which this guard *does* keep at
+/// O(k). Measured, release build, `diamond_perf_sweep`:
+///
+/// ```text
+/// k     conflicting_diamond_source   diamond_source (no conflict)
+/// 20    1.41ms                       0.21ms
+/// 40    8.89ms                       0.42ms
+/// 60    28.05ms                      0.60ms
+/// 80    60.96ms                      0.83ms
+/// 100   116.31ms                     1.06ms
+/// ```
+///
+/// The conflicting column's growth (≈2.8x per doubling of k, i.e. roughly
+/// O(k^2.8) over this range) is bounded and nowhere near the 2.0-2.4x
+/// **per level** (not per doubling) round 5's unscoped guard measured on
+/// the same adversarial shape — the fix this replaces took 32s at k=20;
+/// this one takes 1.4ms — but it is not the flat O(k) the no-conflict shape
+/// gets, and no comment in this file claims otherwise (round 5 review
+/// N13/N14: every complexity claim here is one this test measured, not one
+/// reasoned about and left unverified).
+///
+/// `should_apply` (returned by [`Self::visit`]'s bookkeeping to the caller)
+/// answers a second, narrower question some callers need: is this
+/// particular visit a name's first-ever binding, or does it follow an
+/// earlier, different one? [`TypeEnv::collect_class`]'s indexer merge is the
+/// one consumer — see its doc comment for why fields and indexers need
+/// different answers to "which sibling wins" even though both are merged by
+/// the same walk (round 5 review N6/N7).
+/// Ancestor-chain depth [`DiamondGuard`] refuses to recurse past (round 5
+/// review N2's durable fix — `LB0317`, [`crate::codes::CLASS_DEPTH_LIMIT`]).
+///
+/// Every live `on_path` entry costs one native `TypeEnv::collect_class`/
+/// `collect_operators` stack frame; a single-parent `Cn : C(n-1)` chain
+/// walks one frame per ancestor with nothing to stop it short of the calling
+/// thread's own stack, and past whatever that thread survives the whole
+/// PROCESS aborts — `SIGABRT`, uncatchable, no diagnostic, no file name
+/// (exactly the failure round 5 review N2 reported: `class_shape`/
+/// `class_shape_bound`/`class_operators` all take `&self`, called from
+/// every entry point that resolves a class — the CLI, the LSP request path,
+/// and an embedder calling `luabox_lsp::run_stdio` directly, whose thread
+/// carries no explicit stack pin at all).
+///
+/// Measured fresh for this constant (debug build, this walk's *current*
+/// frame size — `env::tests::temp_probe_unpinned_debug_floor`, bisected by
+/// hand and not left in the tree): a chain forcing resolution of its
+/// deepest class, `cargo test`'s own default thread (no `.stack_size()` —
+/// Rust's un-pinned default, ~2 MiB, exactly the budget an embedder calling
+/// `luabox_lsp::run_stdio` directly gets, since that thread carries no
+/// explicit stack pin at all) survives to **~990-999** before it aborts;
+/// pinned to 16 MiB (`luabox-cli::main::PINNED_STACK_BYTES`, mirrored by
+/// `luabox-lsp::server::PINNED_STACK_BYTES` — what the CLI/LSP's own
+/// dispatcher threads actually run with) it survives to **~7,900-7,999** —
+/// an ~8x ratio matching the ~8x more stack, confirming this walk's frame
+/// size scales as expected between the two.
+///
+/// The un-pinned figure, not the pinned one, is the binding constraint: the
+/// embedder thread the finding names as most exposed gets no pin at all, and
+/// `cargo test` itself exercises that same un-pinned default on every test
+/// that does not explicitly spawn a bigger stack (most of this module's
+/// deep-chain tests do spawn one; this guard must hold even for the ones
+/// that do not, and for every caller outside this crate's own test suite).
+/// 200 sits about 5x below the ~990 un-pinned floor while staying trivially
+/// clear of the pinned/release floors above it. No dialect or SPEC.md
+/// convention describes a legitimate hierarchy within an order of
+/// magnitude of this depth, so the only inputs
+/// this can refuse are already pathological — see
+/// `env::tests::a_class_chain_at_the_ancestry_limit_resolves_fully_and_correctly`
+/// for the floor side of that claim, and
+/// `env::tests::a_class_chain_past_the_ancestry_limit_does_not_crash` for the
+/// ceiling side.
+///
+/// `luabox-cli::check_cmd`'s syntactic pre-check
+/// (`deep_class_chain_diagnostic`) imports this exact constant rather than
+/// deriving its own ceiling: it used to guard 2,000 links deep, a number
+/// picked for its *own* (pinned-thread) crash floor with room to spare — but
+/// that number was never a promise this walk could keep. A chain past 200
+/// still hits this cap and truncates inside `class_shape`/`class_shape_bound`/
+/// `class_operators` regardless of what the pre-check said was safe, so a
+/// pre-check ceiling looser than this one only misinforms the user about
+/// where resolution actually gives out (production readiness review,
+/// finding 1: a 400-class chain the pre-check certified "fine" produced a
+/// false `LB0306` on a field the truncated walk simply never reached). One
+/// number, enforced twice — once early and cheaply as `LB0001` on the raw
+/// annotations (catching a declared-but-never-resolved chain the walk below
+/// would otherwise never visit), once durably here for every caller that
+/// reaches a `TypeEnv` directly, CLI pre-check or not.
+pub const MAX_ANCESTRY_DEPTH: usize = 200;
+
 #[derive(Default)]
 struct DiamondGuard {
     on_path: HashSet<String>,
-    memo: HashSet<(String, Vec<Ty>)>,
-    bindings: HashMap<String, HashSet<Vec<Ty>>>,
-}
-
-/// What [`DiamondGuard::enter`] found for a `(name, args)` key.
-enum Entry {
-    /// Contribute nothing: either `name` is already on the
-    /// currently-expanding path (a true cycle, e.g. `---@class A : B` /
-    /// `---@class B : A`), or this exact `(name, args)` key was already
-    /// expanded to completion by an earlier visit **and** `name` has never
-    /// been bound to anything else anywhere in this call — every edge that
-    /// reaches it agrees, so re-expanding would only rewrite exactly what
-    /// is already there. The caller must return immediately without
-    /// calling [`DiamondGuard::exit`].
-    Skip,
-    /// Proceed: either this is genuinely the first visit to `(name, args)`,
-    /// or it is a repeat — but `name` has *also* been bound to some
-    /// *other* `args` elsewhere in this call, so this is a genuine diamond
-    /// where at least two edges disagree on `name`'s binding (`Multi : P1,
-    /// P2, P3` with `P1 : Base<string>`, `P2 : Base<number>`, `P3 :
-    /// Base<string>` is exactly this: `P3`'s `(Base, [string])` repeats
-    /// `P1`'s, but `Base` was *also* seen as `[number]` via `P2`). Either
-    /// way the caller re-runs the same body, writing directly into its
-    /// shared `shape`/`free` accumulators — for a repeat, that reasserts
-    /// this edge's contribution exactly at its own listed position,
-    /// which is what lets `P3`, though a repeat, still overwrite `P2`'s
-    /// `number` the way its later position demands. Skipping it here (the
-    /// round 5 bug) is what left `P2`'s value — the non-final edge —
-    /// standing instead. The caller must call [`DiamondGuard::exit`] once
-    /// this visit's expansion is complete.
-    Proceed,
+    /// Every `(name, args)` this call has resolved, and the `generation` as
+    /// of which its contribution is known current. Doubles as the old
+    /// `memo` (a key present at all `HashSet<(String, Vec<Ty>)>::contains`)
+    /// and the old `bindings` (`resolved.get(name)` non-empty, with more
+    /// than one key, tells you `name` has disagreeing bindings) — round 5
+    /// review N11: those were two collections holding one derivable
+    /// relationship (`memo.contains((n, a)) <=> bindings[n].contains(a)`
+    /// at every program point, since both were only ever written together
+    /// in `exit`), and nothing enforced that they stayed in sync.
+    resolved: HashMap<String, HashMap<Vec<Ty>, u64>>,
+    /// Bumped once per genuinely new distinct binding of an already-seen
+    /// name — see the type doc comment.
+    generation: u64,
+    /// Set the first time a visit would push `on_path` past
+    /// [`MAX_ANCESTRY_DEPTH`] — the ancestor name whose visit was refused.
+    /// Sticky: `should_apply` refuses every further attempt on this guard
+    /// too, once set, so a pathological chain does not resolve partway down
+    /// some branches and stop short on others depending on visit order.
+    /// Read back by [`TypeEnv::class_shape_bound`] and its siblings, right
+    /// after their own top-level `collect_class`/`collect_operators` call
+    /// returns, to record `LB0317` (round 5 review N2's durable fix).
+    depth_exceeded: Option<String>,
 }
 
 impl DiamondGuard {
-    /// Try to enter `(name, args)`. See [`Entry`] for what each outcome
-    /// means and requires of the caller.
-    fn enter(&mut self, name: &str, args: &[Ty]) -> Entry {
-        if !self.on_path.insert(name.to_string()) {
-            return Entry::Skip; // true cycle
-        }
-        let key = (name.to_string(), args.to_vec());
-        if self.memo.contains(&key) {
-            let disagrees_elsewhere = self
-                .bindings
-                .get(name)
-                .is_some_and(|seen| seen.iter().any(|other| other != args));
-            if !disagrees_elsewhere {
-                self.on_path.remove(name);
-                return Entry::Skip;
-            }
-            // A genuine repeat-with-conflict: fall through and re-expand,
-            // exactly like a fresh visit — `on_path` stays inserted for
-            // the caller to remove via `exit`, below.
-        }
-        Entry::Proceed
-    }
-
-    /// Leave `name`'s currently-expanding path and record `(name, args)` as
-    /// resolved — pairs with an [`Entry::Proceed`] from [`Self::enter`],
-    /// called once that visit's expansion is done. Safe to call again for a
-    /// key that was already recorded (a repeat-with-conflict re-running
-    /// this same body): both `memo` and `bindings` are sets, so re-inserting
-    /// an already-present entry is a no-op.
-    fn exit(&mut self, name: &str, args: &[Ty]) {
-        self.memo.insert((name.to_string(), args.to_vec()));
-        self.bindings
+    /// Visit `(name, args)`, running `body` only if this key needs
+    /// (re-)processing right now, and recording the visit on the way out
+    /// regardless. This is the only way into a walk this guard oversees:
+    /// there is no `Skip` a caller must remember to check and no `exit` a
+    /// caller must remember to pair with an `enter` — `body` either runs
+    /// exactly once, with its result folded in and the visit recorded, or
+    /// it does not run at all and nothing is recorded (round 5 review N15).
+    ///
+    /// `body`'s second argument is whether this is `name`'s first-ever
+    /// binding in this call (`true`) or a binding that follows a *different*
+    /// one (`false`) — see the type doc comment and
+    /// [`TypeEnv::collect_class`]'s indexer merge, the one place that
+    /// distinction changes behaviour.
+    fn visit(&mut self, name: &str, args: &[Ty], body: impl FnOnce(&mut Self, bool)) {
+        let Some(is_first_binding) = self.should_apply(name, args) else {
+            return;
+        };
+        body(self, is_first_binding);
+        self.resolved
             .entry(name.to_string())
             .or_default()
-            .insert(args.to_vec());
+            .insert(args.to_vec(), self.generation);
         self.on_path.remove(name);
+    }
+
+    /// The decision half of [`Self::visit`]: `None` means a true cycle or an
+    /// up-to-date repeat — the caller does nothing further, `on_path` is
+    /// already rolled back, and nothing is recorded. `Some(is_first_binding)`
+    /// means the caller must run its body and this guard is now waiting for
+    /// the bookkeeping `visit` performs on return.
+    fn should_apply(&mut self, name: &str, args: &[Ty]) -> Option<bool> {
+        if self.depth_exceeded.is_some() {
+            return None; // already tripped — refuse everything else too
+        }
+        if self.on_path.contains(name) {
+            return None; // true cycle
+        }
+        if self.on_path.len() >= MAX_ANCESTRY_DEPTH {
+            // A genuinely new level, not a cycle back-edge (checked above):
+            // recursing into `collect_class`/`collect_operators` for `name`
+            // would add another native stack frame past the crash floor
+            // `MAX_ANCESTRY_DEPTH` is set to stay clear of (see its doc
+            // comment). Refuse here, before that frame exists, rather than
+            // let the process find its own limit.
+            self.depth_exceeded = Some(name.to_string());
+            return None;
+        }
+        self.on_path.insert(name.to_string());
+        let mut is_first_binding = true;
+        if let Some(bindings) = self.resolved.get(name) {
+            is_first_binding = false;
+            if let Some(&resolved_at) = bindings.get(args) {
+                if resolved_at == self.generation {
+                    self.on_path.remove(name);
+                    return None; // up to date; nothing has disagreed since
+                }
+                // Stale: something else disagreed with `name`'s binding
+                // since this exact key was last resolved. Fall through and
+                // re-resolve it now, restoring it to the current
+                // generation — `on_path` stays inserted for `visit`'s
+                // bookkeeping to remove.
+            } else {
+                // A genuinely new distinct binding of an already-seen name:
+                // a real diamond disagreement. Advance the generation so
+                // every other key resolved before this point is now stale
+                // and will re-assert itself the next (and only the next)
+                // time it is visited.
+                self.generation += 1;
+            }
+        }
+        Some(is_first_binding)
+    }
+}
+
+// --- member merge precedence ------------------------------------------
+//
+// Two `---@class` declarations for one name are merged by three separate
+// seams — `TypeEnv::absorb_block` (same file), `TypeEnv::merge_file_types`
+// (cross file), `TypeEnv::collect_class` (the consume-site ancestor fold) —
+// and each decides, independently, per member kind, who wins when two
+// declarations disagree. The functions below are the single owner of that
+// decision for each kind: every seam that needs to decide calls one of
+// these rather than re-deriving the rule inline. See
+// `docs/03-reference/03-class-merge-precedence.md` for the full measured
+// matrix these functions encode.
+
+/// The two contexts a member-precedence decision gets made in.
+///
+/// - `Duplicate` — a second `---@class` declaration for a name already
+///   declared: `absorb_block`'s same-file case or `merge_file_types`'s
+///   cross-file case. Both read a *duplicate* of the user's own intent, so
+///   both resolve the identical way: the first declaration wins.
+/// - `AncestorFold` — `collect_class`'s consume-site walk, folding two
+///   *different* classes (unrelated parents, or the same generic ancestor
+///   reached twice with different bindings) into one shape. `is_first_binding`
+///   is [`DiamondGuard::visit`]'s distinction between a name's first-ever
+///   binding in the walk and a competing repeat of it — the two
+///   arrival shapes the indexer rule (only) tells apart (see
+///   [`indexer_resolution`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemberArrival {
+    Duplicate,
+    AncestorFold { is_first_binding: bool },
+}
+
+/// The single "does an incoming value replace what's already on record"
+/// rule for every member kind whose precedence is a plain overwrite-or-keep
+/// decision — `---@field`s, carrier methods, and visibility scopes.
+/// Value-agnostic (`V` is never inspected, only whether it is present),
+/// which is what lets one function serve all three: matrix rows
+/// `field-B`/`field-C` (duplicate: first wins), `field-D`/`field-F`
+/// (ancestor fold: last-visited edge wins), and their method/visibility
+/// counterparts.
+fn member_wins<V>(existing: Option<&V>, arrival: MemberArrival) -> bool {
+    match (existing, arrival) {
+        (Some(_), MemberArrival::Duplicate) => false,
+        (None, _) | (Some(_), MemberArrival::AncestorFold { .. }) => true,
+    }
+}
+
+/// What a seam merging a `---@field [K] V` indexer for `key` should do with
+/// the slot: append a fresh one, replace what is there, or leave it alone.
+enum IndexerResolution {
+    Insert,
+    Overwrite,
+    Keep,
+}
+
+/// `---@field [K] V` indexer precedence — the single rule for every seam
+/// that must decide two indexer values for the same key
+/// (`docs/03-reference/03-class-merge-precedence.md`'s indexer table).
+/// Indexers need a rule [`member_wins`] cannot express: `AncestorFold`'s two
+/// sub-cases disagree with each other, not just with `Duplicate`.
+///
+/// - `Duplicate` (same-file `absorb_block` / cross-file `merge_file_types`):
+///   the **first** declaration wins — an existing slot is always kept
+///   (`indexer-B`/`indexer-C`).
+/// - `AncestorFold` with `is_first_binding: true` — two genuinely
+///   *different* classes each declaring their own indexer for the same key
+///   (unrelated parents): the **first**-listed one wins, so a later
+///   sibling's value is dropped (`indexer-D`).
+/// - `AncestorFold` with `is_first_binding: false` — the *same* ancestor
+///   reached twice with different bindings (a diamond): the **last**-visited
+///   edge wins, exactly like fields (`indexer-F`).
+fn indexer_resolution(exists: bool, arrival: MemberArrival) -> IndexerResolution {
+    match (exists, arrival) {
+        (
+            true,
+            MemberArrival::AncestorFold {
+                is_first_binding: false,
+            },
+        ) => IndexerResolution::Overwrite,
+        (true, MemberArrival::Duplicate | MemberArrival::AncestorFold { .. }) => {
+            IndexerResolution::Keep
+        }
+        (false, _) => IndexerResolution::Insert,
+    }
+}
+
+/// `---@operator` accumulation — the one kind where nothing picks a winner
+/// between two conflicting values at merge time: every declared overload
+/// joins one scan list, and *resolution* (inference, #114) tries each in
+/// declaration order until one accepts the operand, so first-listed-wins
+/// and first-visited-edge-wins (`operator-D`/`operator-F`) fall out of
+/// **accumulation order** rather than an overwrite decision here. What does
+/// differ by seam is whether a value-identical repeat is added again:
+/// `merge_file_types` folds an already-complete class def and must not grow
+/// the list from folding the same source twice (`operator-C`); `absorb_block`
+/// reads this file's own doc blocks one at a time, in this file's own
+/// declaration order, where a value-identical repeat is not a state two
+/// `---@operator` tags on one class ever produce (`operator-B`'s two
+/// overloads always differ on `result`) — so it does not dedupe.
+///
+/// `collect_operators` (the ancestor-fold seam for this kind) does not call
+/// this function: it has no duplicate-vs-keep decision to make either — own
+/// operators are appended once, then parents are walked and appended after,
+/// depth-first, in declaration order — and forcing it through the same
+/// signature as the two duplicate seams would flatten a genuinely different
+/// operation (unconditional list-building) into a conflict-resolution shape
+/// it does not have.
+fn push_operator_overload(sigs: &mut Vec<OperatorSig>, sig: OperatorSig, dedupe: bool) {
+    if dedupe && sigs.contains(&sig) {
+        return;
+    }
+    sigs.push(sig);
+}
+
+/// A class's own `<T, U, ...>` type-parameter list: a re-declaration that
+/// names none has none to contribute (first non-empty list is canonical,
+/// `typeparam-B-absorb-block-second-empty-same-file`); shared by
+/// `absorb_block`'s same-file case and `merge_file_types`'s cross-file case.
+/// No `AncestorFold` counterpart exists for this kind — a class's own
+/// parameter list has no analogue across parents for `collect_class` to
+/// arbitrate (matrix: type-parameter table, D/E/F columns N/A).
+fn adopt_params_if_unset(existing: &mut Vec<String>, incoming: &[String]) {
+    if existing.is_empty() {
+        existing.clear();
+        existing.extend_from_slice(incoming);
     }
 }
 
@@ -576,9 +828,7 @@ impl TypeEnv {
                     // *before* a parent is pushed — otherwise a pushed
                     // argument keeps this declaration's own (non-canonical)
                     // spelling.
-                    if existing.params.is_empty() {
-                        existing.params.clone_from(&def.params);
-                    }
+                    adopt_params_if_unset(&mut existing.params, &def.params);
                     // …and one that spells them differently is unified
                     // **positionally**, exactly as two declarations in one file
                     // are, so its field bodies — and its parent references'
@@ -613,10 +863,9 @@ impl TypeEnv {
                         None => field.clone(),
                     };
                     for (field, ty) in &def.fields {
-                        existing
-                            .fields
-                            .entry(field.clone())
-                            .or_insert_with(|| subst(ty));
+                        if member_wins(existing.fields.get(field), MemberArrival::Duplicate) {
+                            existing.fields.insert(field.clone(), subst(ty));
+                        }
                     }
                     for (member, ty) in &def.methods {
                         // As in [`FileTypes::collect`]: the existing `---@field`
@@ -625,13 +874,20 @@ impl TypeEnv {
                         if let Some(declared) = existing.fields.get(member) {
                             let merged = with_carrier_tags(declared, &subst(ty));
                             existing.fields.insert(member.clone(), merged);
-                        } else {
-                            existing
-                                .methods
-                                .entry(member.clone())
-                                .or_insert_with(|| subst(ty));
+                        } else if member_wins(
+                            existing.methods.get(member),
+                            MemberArrival::Duplicate,
+                        ) {
+                            existing.methods.insert(member.clone(), subst(ty));
                         }
                     }
+                    // First declaration wins, matching the fields loop above
+                    // (round 5 review N7): deduping on the full `(key,
+                    // value)` pair alone let two declarations that conflict
+                    // on *value* for the same key both survive as separate
+                    // entries, which `TypeEnv::collect_class`'s consumer then
+                    // resolved by walk order — a second, silent precedence
+                    // rule disagreeing with this file's own first-wins one.
                     for (key, value) in &def.indexers {
                         let indexer = match &rename {
                             Some(map) => (
@@ -640,7 +896,11 @@ impl TypeEnv {
                             ),
                             None => (key.clone(), value.clone()),
                         };
-                        if !existing.indexers.contains(&indexer) {
+                        let exists = existing.indexers.iter().any(|(k, _)| *k == indexer.0);
+                        if matches!(
+                            indexer_resolution(exists, MemberArrival::Duplicate),
+                            IndexerResolution::Insert
+                        ) {
                             existing.indexers.push(indexer);
                         }
                     }
@@ -666,13 +926,13 @@ impl TypeEnv {
                                 },
                                 None => sig.clone(),
                             };
-                            if !slot.contains(&sig) {
-                                slot.push(sig);
-                            }
+                            push_operator_overload(slot, sig, true);
                         }
                     }
                     for (member, scope) in &def.visibility {
-                        existing.visibility.entry(member.clone()).or_insert(*scope);
+                        if member_wins(existing.visibility.get(member), MemberArrival::Duplicate) {
+                            existing.visibility.insert(member.clone(), *scope);
+                        }
                     }
                 }
             }
@@ -1012,10 +1272,8 @@ impl TypeEnv {
                         // `unknown` instead of leaving it alone (own ==
                         // canonical needs the update to have already
                         // happened to see that they agree).
-                        if let Some(existing) = self.classes.get_mut(&c.name)
-                            && existing.params.is_empty()
-                        {
-                            existing.params.clone_from(&c.params);
+                        if let Some(existing) = self.classes.get_mut(&c.name) {
+                            adopt_params_if_unset(&mut existing.params, &c.params);
                         }
                         // A re-declaration's `---@field` bodies — and, per
                         // #59/F38, its *parent references' type arguments* —
@@ -1094,7 +1352,7 @@ impl TypeEnv {
                             // two declared types instead; luabox keeps the
                             // first deterministically and warns, the same trade
                             // it makes for duplicate aliases and enums (#110).
-                            if class.fields.contains_key(name) {
+                            if !member_wins(class.fields.get(name), MemberArrival::Duplicate) {
                                 continue;
                             }
                             class.fields.insert(
@@ -1124,7 +1382,22 @@ impl TypeEnv {
                                 Some(map) => crate::generics::subst_ty(&key, map),
                                 None => key,
                             };
-                            class.indexers.push((key, ty));
+                            // First declaration wins, matching `FieldKey::Name`
+                            // just above (round 5 review N7): before this, a
+                            // re-declaration's conflicting `---@field [K] V`
+                            // was simply appended, so a duplicate class ended
+                            // up with two indexer entries for one key and
+                            // `TypeEnv::collect_class`'s consumer picked
+                            // whichever it walked last — the opposite winner
+                            // from every other duplicate-member axis in this
+                            // block, none of which warned either.
+                            let exists = class.indexers.iter().any(|(k, _)| *k == key);
+                            if matches!(
+                                indexer_resolution(exists, MemberArrival::Duplicate),
+                                IndexerResolution::Insert
+                            ) {
+                                class.indexers.push((key, ty));
+                            }
                         }
                     }
                 }
@@ -1149,11 +1422,11 @@ impl TypeEnv {
                         Some(map) => crate::generics::subst_ty(&result, map),
                         None => result,
                     };
-                    class
-                        .operators
-                        .entry(o.op.clone())
-                        .or_default()
-                        .push(OperatorSig { input, result });
+                    push_operator_overload(
+                        class.operators.entry(o.op.clone()).or_default(),
+                        OperatorSig { input, result },
+                        false,
+                    );
                 }
                 Tag::Param(p) => params.push(p),
                 Tag::Return(r) => returns.push(r),
@@ -1350,6 +1623,23 @@ impl TypeEnv {
     /// does elsewhere (#33). An attachment with no doc block at all still joins
     /// the surface, at a fully permissive signature — its member *exists*, and
     /// an unannotated function is never arity-checked.
+    ///
+    /// This is the one merge seam that does **not** thread a `class_rename`
+    /// (round 5 review N10): fields, operators and parent argument lists all
+    /// unify a re-declaration's differently-spelled type parameters onto the
+    /// class's canonical ones (`class_param_unification`, `absorb_block`'s
+    /// `Tag::Field`/`Tag::Operator` arms), but a carrier-attached method's
+    /// signature is harvested from the *function's own* `---@param`/
+    /// `---@return` tags, lowered against the ordinary declared-name
+    /// universe — a class's own type-parameter placeholders are never in
+    /// that scope at all, so a signature here cannot name one in the first
+    /// place (referencing it lowers to an unresolved name, `LB0305`). There
+    /// is currently no fixture where a rename would have anything to
+    /// substitute: this is a documented, currently-unreachable gap, not the
+    /// uniform "one owner" guarantee the parent-argument/field/operator
+    /// seams give — tracked here rather than silently assumed, so a future
+    /// `---@generic`-scoped carrier attachment does not inherit an
+    /// unexamined asymmetry.
     fn absorb_carrier_members(&mut self, items: &[luacats::AnnotatedItem], root: &SyntaxNode) {
         let var_to_class = carrier_var_classes(items, root);
         if var_to_class.is_empty() {
@@ -1458,9 +1748,113 @@ impl TypeEnv {
         }
         let mut shape = TableTy::default();
         let mut guard = DiamondGuard::default();
-        let mut free = BTreeMap::new();
-        self.collect_class(name, args, &mut shape, &mut guard, &mut free);
+        self.collect_class(name, args, &mut shape, &mut guard, false);
+        self.note_depth_limit(&guard, name);
         Some(shape)
+    }
+
+    /// [`Self::class_shape_bound`] for the **module-export** seam (#56): the
+    /// identical walk, except a class's own unbound trailing parameters
+    /// substitute to [`Ty::Unknown`] *at the exact point [`Self::collect_class`]
+    /// already decides they are free*, instead of being left as
+    /// [`Ty::Named`] and erased afterwards by matching on the parameter's
+    /// *spelling* against the fully-resolved shape.
+    ///
+    /// That was the previous shape of this fix
+    /// (`class_params_in_scope` — deleted, round 5 review N8/N9 — plus a
+    /// blanket `subst_ty` over the flattened result in
+    /// [`crate::infer::Infer::reify_export`]): it could not tell a
+    /// genuinely-unbound parameter from a bound reference to a real class
+    /// that merely happens to share the parameter's spelling, and erased
+    /// both alike, everywhere in the merged shape the spelling occurred —
+    /// not just the occurrences the unbound parameter actually produced.
+    /// `---@class Holder` / `---@field evt Event` / `---@class Emitter<Event>`
+    /// / `---@class Sub : Holder, Emitter` is the control: `Emitter`'s own,
+    /// entirely unrelated parameter happens to be spelled `Event`, and the
+    /// old pass erased `Holder`'s legitimate `evt: Event` reference right
+    /// alongside it, everywhere `Sub` is used through `require` — while the
+    /// same file, read without crossing `require`, resolved `evt` correctly
+    /// (round 5 review N9: the two seams disagreed about what the same
+    /// declarations mean). Baking the substitution into each visited
+    /// class's own `bound` map — this method, via [`Self::collect_class`]'s
+    /// `erase_free` — means `Emitter`'s substitution can only ever touch
+    /// occurrences `Emitter`'s own fields produce; `Holder`'s `Event`
+    /// reference is substituted through `Holder`'s own `bound` map, which
+    /// has no entry for it, so it is untouched, on both sides of `require`
+    /// alike.
+    pub(crate) fn class_shape_bound_export(&self, name: &str, args: &[Ty]) -> Option<TableTy> {
+        if !self.classes.contains_key(name) {
+            return None;
+        }
+        let mut shape = TableTy::default();
+        let mut guard = DiamondGuard::default();
+        self.collect_class(name, args, &mut shape, &mut guard, true);
+        self.note_depth_limit(&guard, name);
+        Some(shape)
+    }
+
+    /// Record that resolving `root`'s shape/operators tripped
+    /// [`DiamondGuard`]'s depth cap, if it did — the shared tail
+    /// [`Self::class_shape_bound`], [`Self::class_shape_bound_export`] and
+    /// [`Self::class_operators`] each run once their own top-level
+    /// `collect_class`/`collect_operators` call returns.
+    fn note_depth_limit(&self, guard: &DiamondGuard, root: &str) {
+        if guard.depth_exceeded.is_some() {
+            self.depth_limit_hits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(root.to_string());
+        }
+    }
+
+    /// Drain every depth-limit hit (`LB0317`) recorded since the env was
+    /// built — root class names only, deduplicated (one pathological class
+    /// can trip the guard on every reference within a file's check, not
+    /// just once). `crate::check::run` calls this once per file, after both
+    /// inference and the checker have finished querying `self`, and turns
+    /// each name into one diagnostic.
+    pub(crate) fn take_depth_limit_hits(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .depth_limit_hits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_iter()
+        .collect()
+    }
+
+    /// Whether resolving `name`'s ancestor chain has ever tripped
+    /// [`DiamondGuard`]'s depth cap on this env (`LB0317`) — a *peek*, unlike
+    /// [`Self::take_depth_limit_hits`], which drains. Two callers need this
+    /// answer without draining the ledger `crate::check::run` still owns:
+    ///
+    /// - A field lookup that just called `class_shape`/`class_shape_bound`
+    ///   for `name` and came up empty (`crate::infer`'s `lookup_shape_field`/
+    ///   `lookup_ty_field`, `crate::check`'s `check_table_literal`): a class
+    ///   whose ancestry was truncated has an admittedly incomplete shape, so
+    ///   an absent member there is not provably undefined — `LB0317` alone
+    ///   is the honest diagnostic, not `LB0317` *and* a false `LB0306`/
+    ///   `LB0303` for a field that exists past the cutoff (production
+    ///   readiness review, finding 1).
+    /// - An LSP surface reading through [`crate::defs::Ambient`]'s own
+    ///   long-lived env (`Ambient::class_members`/`class_members_bound`),
+    ///   which never runs through `check::run` and so is never drained —
+    ///   [`crate::defs::Ambient::class_ancestry_truncated`] exposes this same
+    ///   peek so hover/completion/goto-definition/signature-help can say so
+    ///   too, instead of silently showing fewer members than the class
+    ///   actually declares with the Problems panel none the wiser (finding
+    ///   2).
+    ///
+    /// Reading, not draining, is correct for both: the answer must still be
+    /// there for `take_depth_limit_hits` to drain into `LB0317` afterwards,
+    /// and it must still be there the *next* time an LSP surface asks, since
+    /// nothing else ever clears an `Ambient`'s own env.
+    pub(crate) fn class_ancestry_truncated(&self, name: &str) -> bool {
+        self.depth_limit_hits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(name)
     }
 
     /// Every generic class this env declares, as the [`GenericClass`]
@@ -1523,130 +1917,66 @@ impl TypeEnv {
         args.iter().map(|arg| lowerer.lower(arg)).collect()
     }
 
-    /// Expand `name` (bound to `args`) into `shape`, folding parents in
-    /// depth-first, and record, per ancestor class name, that ancestor's own
-    /// type parameters left unbound by **this** visit into `free` (this
-    /// call's [`Self::class_params_in_scope`] accumulator).
+    /// Expand `name` (bound to `args`) into `shape`, folding parents
+    /// depth-first, own members overriding.
     ///
-    /// `free` is keyed by class name, one entry per name, overwritten on
-    /// every visit rather than accumulated — **last visit wins**, the same
-    /// rule fields/indexers already follow. This has to be true for the same
-    /// reason: a diamond can reach one ancestor through two edges that bind
-    /// it differently (`C : A, B` with `A : Base` and `B : Base<number>`),
-    /// and since both edges write every one of that ancestor's fields
-    /// unconditionally, the *fields* an ancestor ultimately contributes are
-    /// always whichever edge visited it last — never a union of both. Before
-    /// this was fixed (round 4 review R1, finding 1), `free` **was** a
-    /// straight union (`free.extend(..)`, never retracted), so a class's
-    /// free-ness in the merged shape and its free-ness by this bookkeeping
-    /// could disagree: the earlier, superseded edge's contribution to `free`
-    /// survived even after a later edge overwrote every field it produced. A
-    /// parameter spelled like some unrelated real class name then reported
-    /// the class as still generic-over-that-name, and [`Self::reify_export`]
-    /// erased every occurrence of that spelling it found — including a
-    /// sibling field that named the real class, not the stale template
-    /// parameter. Keying by name and overwriting on each visit makes `free`
-    /// agree with the fields by construction: whichever edge's fields win is
-    /// also the edge whose free-parameter set wins.
+    /// `erase_free` decides what a class's own type parameters left
+    /// **unbound** by a visit become in the result: `false` (every ordinary
+    /// caller — [`Self::class_shape_bound`]) leaves an unbound parameter as
+    /// itself (`Box<T>`'s `item` reads `T`, as a bare `Box` reference
+    /// means); `true` ([`Self::class_shape_bound_export`] only) substitutes
+    /// [`Ty::Unknown`] for it instead, in `bound` itself, at the exact place
+    /// this method already computes which parameters a visit leaves free —
+    /// see that method's doc comment for why, and for round 5 review N8/N9,
+    /// the bug this replaces.
     ///
-    /// Two guards, doing two different jobs (round 4 review R1 — restoring
-    /// this split after a round-3 fix collapsed them into one), bundled into
-    /// one [`DiamondGuard`] (round 4 review finding 7 — this walk and
+    /// Two guards, doing two different jobs (round 4 review R1), bundled
+    /// into one [`DiamondGuard`] (round 4 review finding 7 — this walk and
     /// [`Self::collect_operators`]'s had been two hand-copied pairs of the
-    /// same two fields and the same enter/exit logic; this is their single
-    /// owner):
+    /// same fields and enter/exit logic; this is their single owner, via
+    /// [`DiamondGuard::visit`]):
     ///
-    /// - `on_path` guards the *currently-expanding path*: inserted here,
-    ///   removed again at the bottom of this call, so a true cycle (a class
-    ///   reachable from itself, e.g. `---@class A : B` / `---@class B : A`)
-    ///   still terminates, while a diamond — the same ancestor reached
-    ///   through two different parents — is not dropped just because some
-    ///   *other* branch has it on its own path.
-    /// - `memo` (plus `bindings`, round 5 review) decides whether a repeat
-    ///   `(name, args)` visit — one already expanded to completion earlier
-    ///   in this same call, regardless of path — should be skipped outright
-    ///   or re-walked. **It is not simply "every repeat is skipped"**
-    ///   (round 5 review — the bug this fixed, and a bug in this fix's
-    ///   first draft, both below).
+    /// - `on_path` guards the *currently-expanding path*: inserted on entry,
+    ///   removed on exit, so a true cycle (a class reachable from itself,
+    ///   e.g. `---@class A : B` / `---@class B : A`) still terminates, while
+    ///   a diamond — the same ancestor reached through two different
+    ///   parents — is not dropped just because some *other* branch has it
+    ///   on its own path.
+    /// - `resolved`/`generation` decide whether a repeat `(name, args)`
+    ///   visit — one already expanded to completion earlier in this same
+    ///   call, regardless of path — should be skipped outright or
+    ///   re-walked. **It is not simply "every repeat is skipped"**: see
+    ///   [`DiamondGuard`]'s doc comment for why that collapses a k-level
+    ///   diamond back to O(2^k) (round 5 review N1) the moment *any* name in
+    ///   the walk has two bindings, and gets the *wrong* winner besides
+    ///   (N3/N4/N5) — and for why the fix is a generation counter, not a
+    ///   cache-and-always-reapply (measured wrong on
+    ///   `a_later_empty_sibling_does_not_clobber_an_earlier_siblings_field_override`,
+    ///   round 4 R1's own pinned regression: `Base.x: number`; `A : Base`
+    ///   overrides `x: string`; `B : Base` (bare) declares nothing;
+    ///   `C : A, B` — an unconditional reapply lets `B`'s bare, uninforming
+    ///   repeat of `(Base, [])` stomp `A`'s override *after* it ran).
     ///
-    ///   Skipping every repeat unconditionally is what collapses a k-level
-    ///   diamond from O(2^k) visits (#59, F39's fix, measured exponential —
-    ///   round 4 review R1) to genuinely O(k) (round 4 review finding 5: an
-    ///   earlier `Vec`-backed membership check was an O(k) scan repeated for
-    ///   each of the k visits — O(k²), despite this doc comment and the
-    ///   perf test below claiming O(k) throughout round 4; [`DiamondGuard`]
-    ///   backs the memo with a `HashSet` instead, now that [`Ty`] derives
-    ///   `Hash`, for an O(1)-amortized lookup and a genuinely O(k) walk) —
-    ///   **when every edge of the diamond binds the shared ancestor
-    ///   identically**. That was this doc comment's (and
-    ///   [`DiamondGuard`]'s) claim through round 4: "every edge of a real
-    ///   diamond binds its shared ancestor identically... An edge that
-    ///   binds the same ancestor differently is a different memo key, and
-    ///   still expands on both edges." True for **two** edges. False for
-    ///   three or more: `Multi : P1, P2, P3` with `P1 : Base<string>`,
-    ///   `P2 : Base<number>`, `P3 : Base<string>` (P3 repeats P1's exact
-    ///   binding, with a *different*-binding edge, P2, listed between them)
-    ///   is a diamond where unconditional skipping drops P3's edge
-    ///   entirely, leaving P2's `number` — the stale, non-final edge —
-    ///   standing where P3's `string` belongs. Measured (before this fix):
-    ///   `error[LB0300]: type mismatch: expected string, found number` on a
-    ///   read that must be clean.
-    ///
-    ///   The obvious fix — cache each key's resolved contribution and
-    ///   *always* re-apply it on a repeat, instead of skipping — is wrong,
-    ///   measured two ways. Correctness:
-    ///   `a_later_empty_sibling_does_not_clobber_an_earlier_siblings_field_override`
-    ///   (round 4 R1's own pinned regression test) — `Base.x: number`;
-    ///   `A : Base` overrides `x: string`; `B : Base` (bare, same key as
-    ///   `A`'s path to `Base`) declares nothing; `C : A, B`. `B`'s visit to
-    ///   `(Base, [])` **is** a repeat of `A`'s, and always-reapply writes
-    ///   `Base`'s raw `x: number` back in at `B`'s position — *after* `A`'s
-    ///   override already ran — measured `C.x: number`, clobbering `A`'s
-    ///   override exactly the way round 4 R1 fixed. Performance: caching a
-    ///   per-key result and folding it into a returned, cloned accumulator
-    ///   at every level turned `diamond_perf_sweep`'s k=200..800 rows from
-    ///   single-digit milliseconds into 50ms/191ms/765ms (quadratic again,
-    ///   despite the memo) and stack-overflowed at k=1600 — a class's
-    ///   `free` entry alone accumulates one entry per distinct class name in
-    ///   its whole ancestry, so a cached-and-cloned-at-every-level design
-    ///   pays for that ever-growing snapshot at every one of the k levels,
-    ///   even though this fixture's repeats never need reapplying at all.
-    ///
-    ///   What actually distinguishes the two fixtures: in `Multi`, `Base`
-    ///   is bound to **two different** `args` somewhere in the call
-    ///   (`[string]` via `P1`/`P3`, `[number]` via `P2`) — a genuine
-    ///   disagreement a later edge needs to be able to re-assert. In the
-    ///   `A`/`B`/`C` fixture, `Base` is *always* bound to `[]` — `B`'s
-    ///   repeat carries no information `A`'s earlier visit didn't already
-    ///   supply, so re-running it can only ever stomp whatever an unrelated
-    ///   sibling wrote in the meantime, never correct anything.
-    ///   [`DiamondGuard`]'s `bindings` map is exactly this check: a repeat
-    ///   is skipped ([`Entry::Skip`]) unless its class name has *also* been
-    ///   bound to some other `args` elsewhere in this call, in which case
-    ///   the guard reports [`Entry::Proceed`] and this method just
-    ///   re-expands `name`'s own frame in place — the *same* code path a
-    ///   fresh visit takes, writing directly into the shared `shape`/`free`
-    ///   accumulators below, so a genuinely competing repeat reasserts its
-    ///   binding exactly at its own listed position (restoring
-    ///   last-listed-parent-wins) without any separate cache-and-replay
-    ///   machinery, and without paying for one on the (overwhelmingly
-    ///   common) fixtures that never hit it: a repeat still costs one
-    ///   `HashSet` lookup plus one scan bounded by that name's *distinct*
-    ///   binding count — never a clone of anything the size of the whole
-    ///   walk so far.
+    ///   A repeat that does need to re-run reasserts its binding exactly at
+    ///   its own listed position — the same code path a fresh visit takes,
+    ///   writing directly into the shared `shape` accumulator below — which
+    ///   is what lets a later, competing edge still overwrite an earlier
+    ///   one's contribution the way its later position demands
+    ///   (last-listed-parent-wins for fields; see the indexer loop below for
+    ///   why indexers need a narrower rule than "always overwrite").
     fn collect_class(
         &self,
         name: &str,
         args: &[Ty],
         shape: &mut TableTy,
         guard: &mut DiamondGuard,
-        free: &mut BTreeMap<String, BTreeSet<String>>,
+        erase_free: bool,
     ) {
-        if matches!(guard.enter(name, args), Entry::Skip) {
-            return;
-        }
-        if let Some(def) = self.classes.get(name) {
-            let bound: BTreeMap<String, Ty> = def
+        guard.visit(name, args, |guard, is_first_binding| {
+            let Some(def) = self.classes.get(name) else {
+                return;
+            };
+            let mut bound: BTreeMap<String, Ty> = def
                 .params
                 .iter()
                 .zip(args)
@@ -1654,26 +1984,24 @@ impl TypeEnv {
                 .collect();
             // Every declared parameter past `args`' length has nothing to
             // bind it — it survives substitution as itself
-            // (`generics::subst_ty` leaves an unmapped name alone), so it is
-            // free in the result regardless of whether some *other* class
-            // happens to declare a real name spelled the same way (round 4
-            // review R6 — the previous walk re-derived "free" from the
-            // resolved shape by asking whether each `Ty::Named` leaf failed
-            // to resolve as a real class/enum, which cannot tell a
-            // genuinely-unbound parameter from a bound one whose argument
-            // happened to *be* a same-spelled real class reference; recording
-            // it here, at the one place substitution actually decides
-            // bound-vs-free, is unambiguous).
-            //
-            // Overwrite `name`'s entry rather than extend a running set: this
-            // visit's fields are about to overwrite every field `name`
-            // contributed on any prior visit (below), so this visit's free
-            // params must overwrite its prior contribution too, not join it
-            // (round 4 review R1, finding 1 — see this fn's doc comment).
-            free.insert(
-                name.to_string(),
-                def.params.iter().skip(args.len()).cloned().collect(),
-            );
+            // (`generics::subst_ty` leaves an unmapped name alone) unless
+            // `erase_free` asks for it to become `unknown` instead, decided
+            // right here, at the one place substitution actually knows which
+            // parameters this visit leaves free — not by a later pass that
+            // matches on a parameter's *spelling* against the resolved
+            // shape, which cannot tell a genuinely-unbound parameter from a
+            // bound reference to a real class that happens to share its
+            // name (round 4 review R6, and round 5 review N8: a later
+            // "collect every free name, then erase every occurrence of it
+            // anywhere in the merged shape" pass reintroduced exactly that
+            // confusion one level up — an unrelated ancestor's own unbound
+            // parameter erased a same-spelled real class reference living
+            // in a completely different branch of the same shape).
+            if erase_free {
+                for param in def.params.iter().skip(args.len()) {
+                    bound.insert(param.clone(), Ty::Unknown);
+                }
+            }
             for parent in &def.parents {
                 // A parent's arguments are written in *this* class's parameter
                 // vocabulary — `---@class Cell<T> : Slot<T>` passes its own `T`
@@ -1683,49 +2011,119 @@ impl TypeEnv {
                     .iter()
                     .map(|arg| crate::generics::subst_ty(arg, &bound))
                     .collect();
-                self.collect_class(&parent.name, &parent_args, shape, guard, free);
+                self.collect_class(&parent.name, &parent_args, shape, guard, erase_free);
             }
             // Carrier-attached members first, then `---@field` declarations —
             // both override inherited members, and a declaration wins over a
-            // same-name attachment (annotations are authoritative).
+            // same-name attachment (annotations are authoritative). Always
+            // overwrite: whichever edge visits a field-declaring class last
+            // is this codebase's winner for a plain member, independently of
+            // whether that class is genuinely unrelated to any sibling edge
+            // or is the same shared ancestor bound differently — measured
+            // against `develop` (round 5 review N6's own field control).
             for (member, ty) in &def.methods {
-                shape
-                    .fields
-                    .insert(member.clone(), crate::generics::subst_field(ty, &bound));
+                let value = crate::generics::subst_field(ty, &bound);
+                if member_wins(
+                    shape.fields.get(member),
+                    MemberArrival::AncestorFold { is_first_binding },
+                ) {
+                    shape.fields.insert(member.clone(), value);
+                }
             }
             for (field, ty) in &def.fields {
-                shape
-                    .fields
-                    .insert(field.clone(), crate::generics::subst_field(ty, &bound));
+                let value = crate::generics::subst_field(ty, &bound);
+                if member_wins(
+                    shape.fields.get(field),
+                    MemberArrival::AncestorFold { is_first_binding },
+                ) {
+                    shape.fields.insert(field.clone(), value);
+                }
             }
             // Both halves of an indexer are substituted, matching
             // `generics::subst_table` — the reference implementation every
-            // *direct* generic instantiation goes through. Only the value
-            // was substituted here before, so an inherited `---@field [K] V`
-            // left its key as the free `Ty::Named("K")`: unresolvable
-            // downstream, which `assign.rs` reads as "matches any key" (a
-            // false accept) and, on the value-mismatch path, as "matches no
-            // key" (a spurious false reject) — #59, F36.
+            // *direct* generic instantiation goes through (#59, F36).
             //
-            // Same key overwrites rather than accumulating a second entry —
-            // matching `shape.fields`' last-listed-parent-wins rule instead
-            // of a bare `Vec::extend` (round 4 review R3/R4): two parents
-            // reaching one generic ancestor through different arguments used
-            // to leave both indexer entries in the list, which
-            // `assign.rs`'s all-pairs check reads as "must satisfy every
-            // stale binding at once" — a stricter, and different, answer
-            // than the field the very same diamond produces.
+            // Indexers do **not** follow the field rule above: measured
+            // against `develop` (round 5 review N6), two *unrelated* classes
+            // each declaring their own same-keyed indexer keep the
+            // **first**-listed one (`C2 : P1, P2` with `P1`'s own `[string]:
+            // number` and `P2`'s own, unrelated `[string]: string` reads
+            // `c["k"]` as `number` — P1's), while a shared generic ancestor
+            // reached twice with *different* bindings still keeps the
+            // **last** one, exactly like fields
+            // (`conflicting_generic_diamond_bindings_agree_between_fields_indexers_and_assignability`,
+            // pinned) — because that second case is the *same name* bound
+            // two different ways, not two different names. `is_first_binding`
+            // is exactly that distinction: `true` only for a class name's
+            // first-ever binding in this call, `false` for a binding that
+            // follows a *different* one — a fresh fully-unrelated visit
+            // (`P1`, `P2`, or `Base`'s own first binding) is always the
+            // former; only a genuine repeat-with-conflict (this is the
+            // second, third, ... distinct binding of one name) is the
+            // latter. So: append (first-listed for this key wins) when this
+            // is a name's first binding; overwrite (last processed wins,
+            // matching fields) when it is not.
+            //
+            // Round 5 shipped a plain overwrite-by-key here unconditionally
+            // — correct for the shared-ancestor case, but it silently
+            // flipped the unrelated-classes case from first- to last-wins,
+            // a verdict change against `develop` with no changelog entry
+            // (round 5 review N6). The duplicate-`---@class`-declaration
+            // seams (`absorb_block`, `merge_file_types`) keep their own,
+            // separate first-wins rule for indexers unchanged (round 5
+            // review N7) — this loop only decides between *already-merged*
+            // per-class indexer lists.
             for (key, value) in &def.indexers {
                 let key = crate::generics::subst_ty(key, &bound);
                 let value = crate::generics::subst_ty(value, &bound);
-                if let Some(slot) = shape.indexers.iter_mut().find(|(k, _)| *k == key) {
-                    slot.1 = value;
-                } else {
-                    shape.indexers.push((key, value));
+                let exists = shape.indexers.iter().any(|(k, _)| *k == key);
+                match indexer_resolution(exists, MemberArrival::AncestorFold { is_first_binding }) {
+                    IndexerResolution::Insert => shape.indexers.push((key, value)),
+                    IndexerResolution::Overwrite => {
+                        if let Some(slot) = shape.indexers.iter_mut().find(|(k, _)| *k == key) {
+                            slot.1 = value;
+                        }
+                    }
+                    IndexerResolution::Keep => {} // first-listed for this key already stands
                 }
             }
+        });
+    }
+
+    /// The shared shape of [`Self::class_method_names`], [`Self::member_visibility`]
+    /// and [`Self::is_subclass`] (round 5 review N12): a `seen`-guarded walk
+    /// of `name` and its ancestor chain, visiting each distinct class name at
+    /// most once. Deliberately **not** [`DiamondGuard`] — none of the three
+    /// cares which *type arguments* an edge binds, only whether a name has
+    /// been reached before, so the extra machinery `DiamondGuard` needs to
+    /// tell "same ancestor, different binding" apart from a true repeat
+    /// would answer a question none of these three ask. `visit` sees every
+    /// popped name exactly once (even one no `ClassDef` exists for — an
+    /// undeclared parent reference is a legitimate value to compare against,
+    /// as [`Self::is_subclass`] does) and returns [`std::ops::ControlFlow::Break`]
+    /// to stop the walk early with a result, or [`std::ops::ControlFlow::Continue`]
+    /// to keep going; a name with no [`ClassDef`] contributes no parents to
+    /// walk further, regardless of which `visit` returns for it.
+    fn walk_ancestor_names<T>(
+        &self,
+        start: &str,
+        mut visit: impl FnMut(&str, Option<&ClassDef>) -> std::ops::ControlFlow<T>,
+    ) -> Option<T> {
+        let mut stack = vec![start.to_string()];
+        let mut seen = HashSet::new();
+        while let Some(name) = stack.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let def = self.classes.get(&name);
+            if let std::ops::ControlFlow::Break(result) = visit(&name, def) {
+                return Some(result);
+            }
+            if let Some(def) = def {
+                stack.extend(def.parents.iter().map(|p| p.name.clone()));
+            }
         }
-        guard.exit(name, args);
+        None
     }
 
     /// The member names of `name`'s shape that are carrier attachments
@@ -1736,19 +2134,13 @@ impl TypeEnv {
     pub(crate) fn class_method_names(&self, name: &str) -> HashSet<String> {
         let mut methods = HashSet::new();
         let mut declared = HashSet::new();
-        let mut stack = vec![name.to_string()];
-        let mut seen = HashSet::new();
-        while let Some(class) = stack.pop() {
-            if !seen.insert(class.clone()) {
-                continue;
+        self.walk_ancestor_names(name, |_, def| {
+            if let Some(def) = def {
+                methods.extend(def.methods.keys().cloned());
+                declared.extend(def.fields.keys().cloned());
             }
-            let Some(def) = self.classes.get(&class) else {
-                continue;
-            };
-            methods.extend(def.methods.keys().cloned());
-            declared.extend(def.fields.keys().cloned());
-            stack.extend(def.parents.iter().map(|p| p.name.clone()));
-        }
+            std::ops::ControlFlow::Continue::<()>(())
+        });
         &methods - &declared
     }
 
@@ -1761,6 +2153,7 @@ impl TypeEnv {
         let mut out = Vec::new();
         let mut guard = DiamondGuard::default();
         self.collect_operators(name, &[], op, &mut out, &mut guard);
+        self.note_depth_limit(&guard, name);
         out
     }
 
@@ -1772,29 +2165,27 @@ impl TypeEnv {
     /// differently-bound parents on both edges (#59, F37 — before that fix
     /// `collect_operators` performed no substitution at all, unlike its
     /// sibling, so `---@operator add(U): U` on `---@class Base<U>` inherited
-    /// by `---@class Sub : Base<number>` left `U` free), and its `memo` half
+    /// by `---@class Sub : Base<number>` left `U` free), and its memo half
     /// skips a redundant `(name, args)` pair already expanded to completion
     /// — the same diamond-collapsing rule `collect_class` applies, since
     /// this walk has the identical shape and the identical exponential
-    /// exposure (round 4 review R1, and the identical O(k²)-not-O(k) memo
-    /// cost round 4 review finding 5 fixed — see [`DiamondGuard`]).
+    /// exposure (round 4 review R1; round 5 review N1 for why the guard
+    /// itself had to change again).
     ///
     /// Unlike [`Self::collect_class`], this walk does not *need*
-    /// [`DiamondGuard`]'s round 5 `bindings` distinction — a genuinely
-    /// competing repeat (`Entry::Proceed`) re-running this body is
-    /// harmless here, not merely correct: `out` is append-only, never
-    /// overwritten by position, so a repeat `(name, args)` — bound
-    /// identically to its earlier visit, hence the same
-    /// `def.operators.get(op)` result — only ever appends duplicate
-    /// `OperatorSig`s identical in value to ones already present. Those
-    /// duplicates cannot change which signature the first-match scan
-    /// (#114) finds, so unlike [`Self::collect_class`] (where reapplying a
-    /// non-competing repeat corrupts a sibling's override — see its doc
-    /// comment), this walk does not need to special-case
-    /// [`Entry::Skip`] vs re-running: skipping is merely the cheaper of two
-    /// correct outcomes, so [`Entry::Skip`] is still honoured, but a
-    /// stray [`Entry::Proceed`] on a competing repeat would not corrupt
-    /// anything either.
+    /// [`DiamondGuard::visit`]'s `is_first_binding` distinction — a
+    /// genuinely competing repeat re-running this body is harmless here,
+    /// not merely correct: `out` is append-only, never overwritten by
+    /// position, so a repeat `(name, args)` — bound identically to its
+    /// earlier visit, hence the same `def.operators.get(op)` result — only
+    /// ever appends duplicate `OperatorSig`s identical in value to ones
+    /// already present. Those duplicates cannot change which signature the
+    /// first-match scan (#114) finds, so unlike [`Self::collect_class`]
+    /// (where reapplying a non-competing repeat corrupts a sibling's
+    /// override — see its doc comment), this walk does not need to
+    /// special-case a skip vs re-running: skipping is merely the cheaper of
+    /// two correct outcomes here, but a stray reapply on a competing repeat
+    /// would not corrupt anything either.
     fn collect_operators(
         &self,
         name: &str,
@@ -1803,10 +2194,10 @@ impl TypeEnv {
         out: &mut Vec<OperatorSig>,
         guard: &mut DiamondGuard,
     ) {
-        if matches!(guard.enter(name, args), Entry::Skip) {
-            return;
-        }
-        if let Some(def) = self.classes.get(name) {
+        guard.visit(name, args, |guard, _is_first_binding| {
+            let Some(def) = self.classes.get(name) else {
+                return;
+            };
             let bound: BTreeMap<String, Ty> = def
                 .params
                 .iter()
@@ -1832,8 +2223,7 @@ impl TypeEnv {
                     .collect();
                 self.collect_operators(&parent.name, &parent_args, op, out, guard);
             }
-        }
-        guard.exit(name, args);
+        });
     }
 
     pub(crate) fn enum_member(&self, enum_name: &str, member: &str) -> Option<&Ty> {
@@ -1923,42 +2313,6 @@ impl TypeEnv {
         self.classes.get(name).map(|def| def.parents.as_slice())
     }
 
-    /// Every generic-parameter placeholder that still appears **free** in
-    /// `name`'s **resolved** shape — unbound, and therefore something a
-    /// caller holding only the *name* (a [`Ty::Named`], which carries no
-    /// arguments) cannot substitute. Empty for a plain class, for a class
-    /// whose ancestors are all fully bound, and for a name that is no class
-    /// at all.
-    ///
-    /// Free-ness is decided at the one place substitution actually knows the
-    /// answer: [`Self::collect_class`], while it is zipping each visited
-    /// class's own declared parameters against the arguments bound to it. A
-    /// parameter past the end of that zip has nothing binding it and
-    /// survives substitution as itself; one is recorded there regardless of
-    /// whether it happens to be spelled like some unrelated real class or
-    /// enum (round 4 review R6). An **earlier** implementation asked that
-    /// question after the fact instead — walk the fully-substituted shape
-    /// and keep the `Ty::Named` leaves that fail to resolve as a real
-    /// class/enum — which cannot distinguish "genuinely unbound" from "bound
-    /// to a real class whose name happens to collide with some ancestor's
-    /// parameter", and erased the latter (`---@class Base<Event>` with
-    /// `---@class Sub : Base` — bare, `Event` unbound — used to leave a
-    /// legitimately-bound sibling reference to the real class `Event`
-    /// resolved, but also left a genuinely-free `Event` looking resolved,
-    /// i.e. bound, since "Event" the parameter and "Event" the class are the
-    /// same string). Recording at the zip instead of re-deriving from the
-    /// result is unambiguous in both directions.
-    pub(crate) fn class_params_in_scope(&self, name: &str) -> Vec<String> {
-        if !self.classes.contains_key(name) {
-            return Vec::new();
-        }
-        let mut shape = TableTy::default();
-        let mut guard = DiamondGuard::default();
-        let mut free = BTreeMap::new();
-        self.collect_class(name, &[], &mut shape, &mut guard, &mut free);
-        free.into_values().flatten().collect()
-    }
-
     /// Whether `name` is a LuaCATS `---@class` (in-file, def-package, or
     /// cross-package). The `undefined-field` read rule (#90) fires only for
     /// real classes.
@@ -1988,45 +2342,34 @@ impl TypeEnv {
         class: &str,
         member: &str,
     ) -> Option<(FieldScope, String)> {
-        let mut stack = vec![class.to_string()];
-        let mut seen = HashSet::new();
-        while let Some(name) = stack.pop() {
-            if !seen.insert(name.clone()) {
-                continue;
-            }
-            let Some(def) = self.classes.get(&name) else {
-                continue;
+        self.walk_ancestor_names(class, |name, def| {
+            let Some(def) = def else {
+                return std::ops::ControlFlow::Continue(());
             };
             if let Some(scope) = def.visibility.get(member) {
-                return Some((*scope, name));
+                return std::ops::ControlFlow::Break(Some((*scope, name.to_string())));
             }
             // A plain (public) re-declaration of the member here shadows any
             // parent restriction — resolution stops, member is public.
             if def.fields.contains_key(member) || def.methods.contains_key(member) {
-                return None;
+                return std::ops::ControlFlow::Break(None);
             }
-            stack.extend(def.parents.iter().map(|p| p.name.clone()));
-        }
-        None
+            std::ops::ControlFlow::Continue(())
+        })
+        .flatten()
     }
 
     /// Whether `class` is `ancestor` or transitively extends it (`---@class
     /// Child : ancestor`) — the `protected` reachability test (#115).
     pub(crate) fn is_subclass(&self, class: &str, ancestor: &str) -> bool {
-        let mut stack = vec![class.to_string()];
-        let mut seen = HashSet::new();
-        while let Some(name) = stack.pop() {
+        self.walk_ancestor_names(class, |name, _def| {
             if name == ancestor {
-                return true;
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
             }
-            if !seen.insert(name.clone()) {
-                continue;
-            }
-            if let Some(def) = self.classes.get(&name) {
-                stack.extend(def.parents.iter().map(|p| p.name.clone()));
-            }
-        }
-        false
+        })
+        .is_some()
     }
 
     /// Whether `class` is declared by *this* file's own annotations (the
@@ -2305,13 +2648,37 @@ fn block_generics(item: &luacats::AnnotatedItem) -> HashSet<String> {
 /// class's shape monomorphise to, own params free" question directly, so a
 /// generic reference's ancestors are in scope on the same terms a same-file
 /// plain reference's already are. The cost is one extra walk of the file's
-/// annotations per build; correctness here was worth more than that walk.
+/// annotations per build; correctness here was worth more than that walk —
+/// **when there is a generic class to build a template for at all.**
+///
+/// Round 5 review N27: that discovery walk (and the `class_shape` resolution
+/// after it) ran unconditionally, before the `def.params.is_empty()` filter
+/// that discards everything it built for a plain class — so a project with
+/// zero generic classes anywhere still paid to re-absorb every file's
+/// annotations a second time, in full, on every `check`. Measured: 110ms at
+/// N=50 files, 6159ms at N=500 (`luabox check` CPU, generic-free corpus).
+/// The cheap fix: a project or file with no generic class in scope has
+/// nothing this function could ever return, so check for one — a single
+/// pass over each item's already-harvested tags, no lowering, no absorb —
+/// before paying for the discovery env at all.
 fn collect_generic_classes(
     items: &[luacats::AnnotatedItem],
     root: &SyntaxNode,
     ambient: Option<&crate::defs::Ambient>,
     decl: &Declared,
 ) -> BTreeMap<String, GenericClass> {
+    let file_has_generics = items.iter().any(|item| {
+        item.block
+            .tags
+            .iter()
+            .any(|tag| matches!(tag, Tag::Class(c) if !c.params.is_empty()))
+    });
+    let ambient_has_generics =
+        ambient.is_some_and(|a| a.env.classes.values().any(|def| !def.params.is_empty()));
+    if !file_has_generics && !ambient_has_generics {
+        return BTreeMap::new();
+    }
+
     let mut discovery = TypeEnv::default();
     if let Some(ambient) = ambient {
         discovery.classes = ambient.env.classes.clone();
@@ -2733,6 +3100,48 @@ mod tests {
         TypeEnv::build(&parsed)
     }
 
+    #[test]
+    #[ignore = "manual stack-depth probe, not a CI assertion — see doc comment"]
+    fn stack_probe_deep_single_parent_chain() {
+        // Manual probe for round 5 review N2's ORIGINAL (non-durable) fix:
+        // `luabox`'s dispatcher/rayon threads run with a 16 MiB pinned stack
+        // (`luabox-cli/src/main.rs::PINNED_STACK_BYTES`). Run with
+        // `cargo test -p luabox-types --lib --release -- --ignored --nocapture
+        // env::tests::stack_probe_deep_single_parent_chain` and watch for
+        // SIGSEGV/abort rather than a clean assertion failure — a stack
+        // overflow does not unwind, so this cannot assert its own failure.
+        //
+        // Superseded by `MAX_ANCESTRY_DEPTH` (N2's DURABLE fix, see its doc
+        // comment): every `n` below now returns `ok=true` well inside the
+        // guard's cap, so this probe can no longer find a crash floor — it
+        // is kept only as a manual sanity check that the cap holds even at
+        // scales the guard was never meant to reach for real, not as a live
+        // measurement tool — the actual `MAX_ANCESTRY_DEPTH` reasoning was
+        // bisected by hand with a scratch probe of the same shape (not left
+        // in the tree; see the constant's own doc comment for the numbers
+        // it found), and this probe predates that measurement.
+        for n in [20_000, 25_000, 29_000, 31_000, 40_000, 50_000] {
+            let mut src = String::from("---@class C0\n---@field item number\n");
+            for i in 1..=n {
+                use std::fmt::Write as _;
+                let _ = writeln!(src, "---@class C{i} : C{}", i - 1);
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .stack_size(16 * 1024 * 1024)
+                .spawn(move || {
+                    let env = env_of(&src);
+                    let shape = env.class_shape(&format!("C{n}"));
+                    let _ = tx.send(shape.is_some());
+                })
+                .expect("spawn probe thread")
+                .join()
+                .expect("probe thread must not panic/abort");
+            let ok = rx.recv().expect("probe thread must send a result");
+            eprintln!("n={n:<6} ok={ok}");
+        }
+    }
+
     /// The workspace-global surface one source file contributes.
     fn surface(source: &str) -> FileTypes {
         let parsed = parse(source, Dialect::Lua54);
@@ -2881,6 +3290,30 @@ mod tests {
     }
 
     #[test]
+    fn merge_file_types_keeps_the_first_declarations_conflicting_indexer_value() {
+        // `merge_file_types`'s indexer loop doc comment (round 5 review N7):
+        // "first declaration wins" for a re-declared `---@field [K] V`. The
+        // only existing coverage of this seam's indexer path
+        // (`merging_a_present_class_is_member_wise_with_the_base_winning`
+        // declares the indexer once; `merging_repeated_declarations_never_
+        // duplicates_parents_or_operators` re-declares it with an IDENTICAL
+        // value) — so first-wins and an unconditional overwrite produce the
+        // same observable entry count and value in both, and neither can
+        // tell the two rules apart. Here the second file's `[string]`
+        // indexer conflicts on VALUE (`string` vs the first file's
+        // `number`), so only a real first-wins rule keeps `number`.
+        let mut env = TypeEnv::default();
+        env.merge_file_types(&surface("---@class Both\n---@field [string] number\n"));
+        env.merge_file_types(&surface("---@class Both\n---@field [string] string\n"));
+        let def = env.classes.get("Both").expect("merged class");
+        assert_eq!(
+            def.indexers,
+            vec![(Ty::String, Ty::Number)],
+            "the first file's conflicting indexer value must win, not the second's"
+        );
+    }
+
+    #[test]
     fn merging_a_renamed_redeclaration_substitutes_its_parents_type_arguments() {
         // F38 (cross-file seam): the base declares `Both<T>`; the incoming
         // file re-declares it as `Both<U> : Container<U>` — its OWN
@@ -2972,6 +3405,33 @@ mod tests {
             }]
         );
         assert_eq!(def.fields["extra"].ty, Ty::Named("T".to_string()));
+    }
+
+    #[test]
+    fn absorb_block_keeps_the_first_declarations_conflicting_indexer_value() {
+        // `absorb_block`'s `FieldKey::Indexer` arm doc comment (round 5
+        // review N7): the same first-wins rule as
+        // `merge_file_types_keeps_the_first_declarations_conflicting_indexer_value`
+        // above, pinned on the in-file duplicate-`---@class` seam instead of
+        // the cross-file one — the two seams keep separate implementations
+        // (round 5 review N7's note in `collect_class`'s own doc comment)
+        // and neither test can stand in for the other. Same conflicting-
+        // value shape: the first `Both` declares `[string] number`, the
+        // second re-declares `[string] string`.
+        let env = env_of(
+            "\
+---@class Both
+---@field [string] number
+---@class Both
+---@field [string] string
+",
+        );
+        let def = env.classes.get("Both").expect("declared class");
+        assert_eq!(
+            def.indexers,
+            vec![(Ty::String, Ty::Number)],
+            "the first declaration's conflicting indexer value must win, not the second's"
+        );
     }
 
     #[test]
@@ -3118,6 +3578,276 @@ mod tests {
         src
     }
 
+    /// A k-level diamond that, unlike [`diamond_source`], genuinely
+    /// disagrees at every level: `A{i}<T> : A{i-1}<T>, A{i-1}<number>` — one
+    /// edge passes the caller's own type parameter through, the other
+    /// hard-codes `number`, so `A{i-1}` is reached with two different
+    /// bindings at every level once the top-level reference's own argument
+    /// is not itself `number`. Round 5 review N1: `DiamondGuard`'s guard
+    /// only re-walks a repeat when *something* has disagreed with it since
+    /// it was last resolved — [`diamond_source`]'s shape never disagrees
+    /// (every binding is the same empty `args`), so it cannot exercise that
+    /// path at all, and a round 5 regression that made the guard re-walk
+    /// far more than it needs to (reported: unconditionally, on any
+    /// disagreement anywhere in the whole call, not just since a key's own
+    /// last resolution) went uncaught by every cost assertion in this file.
+    fn conflicting_diamond_source(k: usize) -> String {
+        use std::fmt::Write as _;
+
+        let mut src = String::from("---@class A0<T>\n---@field item T\n");
+        for i in 1..=k {
+            let _ = writeln!(
+                src,
+                "---@class A{i}<T> : A{prev}<T>, A{prev}<number>",
+                prev = i - 1
+            );
+        }
+        src
+    }
+
+    #[test]
+    fn a_k_level_diamond_with_conflicting_bindings_resolves_in_bounded_time() {
+        // Round 5 review N1/N36: the ignored `diamond_perf_sweep` below is
+        // the only cost assertion for this walk, and its `diamond_source`
+        // fixture cannot reach a genuine binding conflict (see
+        // `conflicting_diamond_source`'s doc comment) — so nothing in this
+        // suite, run by CI or otherwise, could fail on the exponential N1
+        // measured (0.17s at k=20, 32s at k=20 on the shipped round-5 guard
+        // — over an unbounded 2.0-2.4x per level). This test is exactly
+        // that missing assertion, using the fixture that actually reaches
+        // the guard's conflict-driven re-walk path, at a k CI can afford
+        // (k=60, matching `a_k_level_diamond_over_a_shared_ancestor_...`'s
+        // own k) with the same background-thread-plus-timeout shape so a
+        // regression back to exponential times out the test rather than
+        // hanging the suite.
+        let k = 60;
+        let source = conflicting_diamond_source(k);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let env = env_of(&source);
+            let shape = env.class_shape_bound(&format!("A{k}"), &[Ty::String]);
+            let _ = tx.send(shape);
+        });
+        let shape = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect(
+                "a k=60 conflicting diamond must resolve in well under 5s; \
+                 an exponential regression would not return in this process's lifetime",
+            )
+            .expect("the top-level diamond class is declared");
+        // Termination and a non-corrupted shape is what this test is for;
+        // the guard's *correctness* on conflicting bindings (which binding
+        // wins) is pinned by `duplicate_class_merge.rs`'s dedicated
+        // fixtures.
+        assert!(
+            matches!(shape.fields["item"].ty, Ty::Number | Ty::String),
+            "resolution must still produce a real field type, not a corrupted shape: {:?}",
+            shape.fields["item"].ty
+        );
+    }
+
+    #[test]
+    fn a_deep_single_parent_chain_does_not_overflow_a_pinned_stack() {
+        // Round 5 review N2's ORIGINAL fix (the `DiamondGuard` rewrite this
+        // comment used to describe) only pushed the survivable floor from
+        // ~29-31k to ~40-50k on a 16 MiB pinned stack — the walk was still
+        // unbounded, so a long enough chain always found a floor to fall
+        // through. `MAX_ANCESTRY_DEPTH` is N2's DURABLE fix: `DiamondGuard`
+        // now refuses to recurse past a fixed depth at all (see its doc
+        // comment for the measured reasoning), so "does this depth overflow
+        // the stack" is no longer the right question for ANY chain length —
+        // see `a_class_chain_at_the_ancestry_limit_resolves_fully_and_correctly`
+        // for the floor side (a chain within the limit still resolves
+        // completely and correctly) and
+        // `a_class_chain_past_the_ancestry_limit_does_not_crash` for the
+        // ceiling side (a chain past it is refused cleanly, on any stack,
+        // not just a pinned 16 MiB one).
+        let n = MAX_ANCESTRY_DEPTH - 1;
+        let mut src = String::from("---@class C0\n---@field item number\n");
+        for i in 1..=n {
+            use std::fmt::Write as _;
+            let _ = writeln!(src, "---@class C{i} : C{}", i - 1);
+        }
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let env = env_of(&src);
+                let shape = env
+                    .class_shape(&format!("C{n}"))
+                    .expect("the deepest class is declared");
+                assert_eq!(shape.fields["item"].ty, Ty::Number);
+            })
+            .expect("spawn probe thread")
+            .join()
+            .expect("must not overflow an 8 MiB stack at this depth");
+    }
+
+    #[test]
+    fn a_class_chain_at_the_ancestry_limit_resolves_fully_and_correctly() {
+        // The floor side of `MAX_ANCESTRY_DEPTH` (round 5 review N2's
+        // durable fix): a chain of EXACTLY the limit's class count (C0
+        // through C(MAX_ANCESTRY_DEPTH - 1), `MAX_ANCESTRY_DEPTH` classes
+        // total) must resolve completely — the guard trips only on the
+        // class that would push `on_path` PAST the limit, not on the one
+        // that reaches it exactly. A regression here (the guard firing one
+        // class too early) would silently truncate real, legitimately-sized
+        // hierarchies — "a limit that fires on real code is a worse bug
+        // than the crash it guards against".
+        let n = MAX_ANCESTRY_DEPTH - 1;
+        let mut src = String::from("---@class C0\n---@field item number\n");
+        for i in 1..=n {
+            use std::fmt::Write as _;
+            let _ = writeln!(src, "---@class C{i} : C{}", i - 1);
+        }
+        let env = env_of(&src);
+        let shape = env
+            .class_shape(&format!("C{n}"))
+            .expect("the deepest class is declared");
+        assert_eq!(
+            shape.fields["item"].ty,
+            Ty::Number,
+            "a chain within the limit must still merge its root ancestor's field"
+        );
+        assert!(
+            env.take_depth_limit_hits().is_empty(),
+            "a chain within the limit must not record a depth-limit hit"
+        );
+    }
+
+    #[test]
+    fn a_class_chain_one_class_past_the_ancestry_limit_already_truncates() {
+        // The other half of the same boundary, pinned tight enough to catch
+        // an off-by-one in `DiamondGuard::should_apply`'s
+        // `self.on_path.len() >= MAX_ANCESTRY_DEPTH` check (`>=` weakened to
+        // `>` would fire one class late). The test above proves the LARGEST
+        // chain that must resolve fully sits at `MAX_ANCESTRY_DEPTH` classes
+        // (C0..C(MAX_ANCESTRY_DEPTH - 1)); this proves the SMALLEST chain
+        // that must already report truncation is exactly one class more —
+        // C0..C(MAX_ANCESTRY_DEPTH), `MAX_ANCESTRY_DEPTH + 1` classes total.
+        // Neither existing test pins this: the floor test above sits exactly
+        // AT the boundary from the resolving side, and
+        // `a_class_chain_past_the_ancestry_limit_does_not_crash` below uses
+        // n=50,000 — 250x past the boundary, so shifting the trip point by
+        // one class in either direction changes nothing it asserts. Only a
+        // chain exactly one class past the true limit can tell `>=` and `>`
+        // apart.
+        let n = MAX_ANCESTRY_DEPTH;
+        let mut src = String::from("---@class C0\n---@field item number\n");
+        for i in 1..=n {
+            use std::fmt::Write as _;
+            let _ = writeln!(src, "---@class C{i} : C{}", i - 1);
+        }
+        let env = env_of(&src);
+        let shape = env
+            .class_shape(&format!("C{n}"))
+            .expect("the class is declared, even though its ancestry is truncated");
+        assert!(
+            !shape.fields.contains_key("item"),
+            "one class past the limit must already truncate before reaching C0's field"
+        );
+        assert_eq!(
+            env.take_depth_limit_hits(),
+            vec![format!("C{n}")],
+            "the query root must be recorded as a depth-limit hit exactly one class past the boundary"
+        );
+    }
+
+    #[test]
+    fn a_class_chain_past_the_ancestry_limit_does_not_crash() {
+        // The ceiling side, and the durable half of round 5 review N2: a
+        // chain deep enough to abort the process outright under the OLD,
+        // unbounded walk (`n` here is 250x `MAX_ANCESTRY_DEPTH`, and the
+        // measured crash floors this constant is reasoned against — see its
+        // doc comment — never got anywhere close even on a 16 MiB pinned
+        // stack) must now resolve WITHOUT recursing anywhere near a stack
+        // limit at all.
+        //
+        // Proven on a deliberately modest 2 MiB stack — well under the
+        // 16 MiB every other test in this suite pins, and close to the
+        // scale an embedder calling `luabox_lsp::run_stdio` directly gets
+        // with no explicit pin of its own (the most exposed caller the
+        // finding names, and the same scale `MAX_ANCESTRY_DEPTH`'s own
+        // measurement used): if the guard's cap were removed or widened
+        // back past where `MAX_ANCESTRY_DEPTH` puts it, this thread
+        // overflows — confirmed by hand while picking the constant (a
+        // 200-class-per-frame budget this thin does not survive a chain
+        // anywhere near 50,000 without the cap).
+        let n = 50_000;
+        let mut src = String::from("---@class C0\n---@field item number\n");
+        for i in 1..=n {
+            use std::fmt::Write as _;
+            let _ = writeln!(src, "---@class C{i} : C{}", i - 1);
+        }
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let env = env_of(&src);
+                let shape = env
+                    .class_shape(&format!("C{n}"))
+                    .expect("the class is declared, even though its ancestry is truncated");
+                // Truncated, not silently wrong: the root ancestor's field
+                // sits far below the depth the guard permits, so it must be
+                // ABSENT from the returned shape — a caller reading a
+                // truncated shape as if it were complete is exactly the
+                // "quietly wrong" outcome the guard exists to avoid papering
+                // over. Reporting that fact is `crate::check::run`'s job
+                // (see `class_ancestry_depth_limit.rs`); this level only
+                // proves the walk terminates safely and knows it happened.
+                assert!(
+                    !shape.fields.contains_key("item"),
+                    "a truncated shape must not silently carry the unreached root's field"
+                );
+                let hits = env.take_depth_limit_hits();
+                assert_eq!(
+                    hits,
+                    vec![format!("C{n}")],
+                    "the query root must be recorded as a depth-limit hit"
+                );
+            })
+            .expect("spawn probe thread")
+            .join()
+            .expect(
+                "must not overflow a 2 MiB stack at 250x the ancestry limit — \
+                 the depth cap must have bounded native recursion long before this",
+            );
+    }
+
+    #[test]
+    fn class_operators_also_refuses_to_recurse_past_the_ancestry_limit() {
+        // `TypeEnv::collect_operators` shares `DiamondGuard`/`should_apply`
+        // with `collect_class` verbatim (round 4 review finding 7's shared
+        // owner) — proven directly rather than only inferred from
+        // `class_shape`'s coverage above: an `---@operator` declared on the
+        // chain's root must be reachable through an ordinary chain, and
+        // absent (not crashed, not silently kept) once the chain is deep
+        // enough to trip the cap.
+        let n = 10_000;
+        let mut src = String::from("---@class C0\n---@operator add(number): number\n");
+        for i in 1..=n {
+            use std::fmt::Write as _;
+            let _ = writeln!(src, "---@class C{i} : C{}", i - 1);
+        }
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let env = env_of(&src);
+                let ops = env.class_operators(&format!("C{n}"), "add");
+                assert!(
+                    ops.is_empty(),
+                    "the root's operator sits far below the depth the guard permits, \
+                     so it must not be reachable through a truncated walk"
+                );
+                assert_eq!(
+                    env.take_depth_limit_hits(),
+                    vec![format!("C{n}")],
+                    "the query root must be recorded as a depth-limit hit"
+                );
+            })
+            .expect("spawn probe thread")
+            .join()
+            .expect("must not overflow a 2 MiB stack — collect_operators must share the cap");
+    }
+
     #[test]
     fn a_k_level_diamond_over_a_shared_ancestor_resolves_in_bounded_time() {
         // Round 4 review R1: the F39 fix (`seen`/`on_path` guards only the
@@ -3163,10 +3893,18 @@ mod tests {
     }
 
     /// Not run by default — `cargo test -p luabox-types --lib -- --ignored
-    /// --nocapture env::tests::diamond_perf_sweep` prints the k-vs-time table
-    /// round 4 review R1 asked for. Kept rather than thrown away: the next
-    /// person doubting the memo's flatness can re-run this instead of
-    /// re-deriving the fixture from the review transcript.
+    /// --nocapture env::tests::diamond_perf_sweep` prints the k-vs-time
+    /// tables round 4 review R1 asked for, plus (round 5 review N36) a
+    /// `conflicting_diamond_source` sweep — see [`DiamondGuard`]'s doc
+    /// comment for that table and what it shows. Kept rather than thrown
+    /// away: the next person doubting the memo's flatness can re-run this
+    /// instead of re-deriving the fixture from the review transcript. The
+    /// `diamond_source` (no-conflict) sweep below this comment never
+    /// exercises [`DiamondGuard`]'s conflict/re-walk path at all (every
+    /// binding in that fixture is the same empty `args`) — a cost
+    /// assertion on it alone cannot see N1's regression, which is why
+    /// `a_k_level_diamond_with_conflicting_bindings_resolves_in_bounded_time`,
+    /// unlike this test, is *not* `#[ignore]`d.
     ///
     /// The range used to stop at k=100 — round 4 review finding 5 found
     /// that too small to tell O(k) from the `Vec`-memo's actual O(k²)
@@ -3192,6 +3930,19 @@ mod tests {
     #[test]
     #[ignore = "manual measurement, not a CI assertion — see doc comment"]
     fn diamond_perf_sweep() {
+        eprintln!("-- conflicting_diamond_source (genuine per-level disagreement) --");
+        for k in [8, 12, 16, 18, 20, 22, 24, 30, 40, 60, 80, 100] {
+            let source = conflicting_diamond_source(k);
+            let start = std::time::Instant::now();
+            let env = env_of(&source);
+            let shape = env
+                .class_shape_bound(&format!("A{k}"), &[Ty::String])
+                .expect("declared class");
+            let elapsed = start.elapsed();
+            assert!(matches!(shape.fields["item"].ty, Ty::Number | Ty::String));
+            eprintln!("k={k:<4} lines={:<5} {elapsed:?}", source.lines().count());
+        }
+        eprintln!("-- diamond_source (no generics, never disagrees) --");
         for k in [16, 18, 20, 22, 24, 25, 40, 60, 80, 100, 200, 400, 800, 1600] {
             let source = diamond_source(k);
             let start = std::time::Instant::now();
@@ -3229,6 +3980,106 @@ mod tests {
             shape.indexers,
             vec![(Ty::String, Ty::Number)],
             "one binding reached through two edges must carry one indexer entry, not two"
+        );
+    }
+
+    #[test]
+    fn two_unrelated_parents_with_the_same_indexer_key_keep_the_first_listed_one() {
+        // `collect_class`'s indexer merge doc comment (round 5 review N6):
+        // two genuinely UNRELATED classes — no shared name, no common
+        // ancestor — that each declare their own indexer for the same key
+        // resolve first-LISTED-wins, unlike the field merge just above it
+        // (always last-processed) and unlike the *other* indexer rule for a
+        // shared ancestor reached twice (last-wins, pinned below by
+        // `a_shared_generic_ancestor_reached_with_conflicting_bindings_keeps_the_last_listed_one`).
+        // The one variable that separates the two rules is identity: `P1`
+        // and `P2` here are two distinct classes that happen to pick the
+        // same key, not one class reached via two edges — `is_first_binding`
+        // is `true` on both of their visits, so the loop's `(Some(_), true)`
+        // arm leaves whichever was listed first standing.
+        //
+        // Both orderings below are an accepting/rejecting pair: swapping
+        // which parent is listed first flips the winner, proving the rule is
+        // genuinely first-LISTED, not some other order-independent tie-break
+        // that happens to agree with one ordering by accident.
+        let first_wins = env_of(
+            "\
+---@class P1
+---@field [string] number
+---@class P2
+---@field [string] string
+---@class C1 : P1, P2
+",
+        );
+        let shape = first_wins.class_shape("C1").expect("declared class");
+        assert_eq!(
+            shape.indexers,
+            vec![(Ty::String, Ty::Number)],
+            "P1, listed first, must win an unrelated same-key indexer conflict"
+        );
+
+        let swapped = env_of(
+            "\
+---@class P1
+---@field [string] number
+---@class P2
+---@field [string] string
+---@class C2 : P2, P1
+",
+        );
+        let swapped_shape = swapped.class_shape("C2").expect("declared class");
+        assert_eq!(
+            swapped_shape.indexers,
+            vec![(Ty::String, Ty::String)],
+            "P2, listed first here, must win when the listing order is reversed"
+        );
+    }
+
+    #[test]
+    fn a_shared_generic_ancestor_reached_with_conflicting_bindings_keeps_the_last_listed_one() {
+        // The other half of the same indexer-merge doc comment: unlike two
+        // unrelated classes above, ONE ancestor (`Base`) reached twice
+        // through a diamond with two DIFFERENT type arguments is the same
+        // name bound two different ways — `is_first_binding` is `false` on
+        // the second (and any later) visit, so the `(Some(slot), false)` arm
+        // overwrites, matching the field-merge rule (last-processed wins)
+        // instead of the unrelated-parents rule just pinned above. Same
+        // shape (two parents feeding one child, one key in conflict),
+        // differing only in whether the two edges name the same ancestor —
+        // the one variable that actually decides which rule applies.
+        //
+        // Both orderings again flip the winner, proving this is genuinely
+        // last-LISTED and not a coincidence of declaration order.
+        let last_wins = env_of(
+            "\
+---@class Base<V>
+---@field [string] V
+---@class A : Base<number>
+---@class B : Base<string>
+---@class D1 : A, B
+",
+        );
+        let shape = last_wins.class_shape("D1").expect("declared class");
+        assert_eq!(
+            shape.indexers,
+            vec![(Ty::String, Ty::String)],
+            "B's binding, listed last, must win a shared-ancestor indexer conflict"
+        );
+
+        let swapped = env_of(
+            "\
+---@class Base<V>
+---@field [string] V
+---@class A : Base<number>
+---@class B : Base<string>
+---@class D2 : B, A
+",
+        );
+        let swapped_shape = swapped.class_shape("D2").expect("declared class");
+        assert_eq!(
+            swapped_shape.indexers,
+            vec![(Ty::String, Ty::Number)],
+            "A's binding, listed last here, must win when the listing order is reversed"
         );
     }
 
@@ -3717,5 +4568,78 @@ function partial(a, b) end
         assert_eq!(sig.params[1].name, "b");
         assert_eq!(sig.params[1].ty, Ty::Unknown);
         assert!(sig.params[1].optional);
+    }
+
+    // --- collect_generic_classes's cheap pre-scan (round 5 review N27) ----
+
+    /// An ambient definition layer whose ONLY declared class is generic —
+    /// deliberately built from `Ambient::build` directly rather than
+    /// `crate::defs::build_ambient`/`stdlib`, which always merge in the real
+    /// stdlib and so would always contribute at least one non-generic class
+    /// (`string`'s carrier, file handles, ...) alongside it. That mix is
+    /// exactly what let a bug in `ambient_has_generics`'s per-class scan slip
+    /// past `tests/generics.rs`'s `ambient_codes` fixtures: they answer "does
+    /// ANY class in the ambient have params" correctly by accident, because
+    /// the stdlib always supplies a non-generic class to satisfy an inverted
+    /// check too. An ambient with nothing BUT a generic class is the only
+    /// fixture that tells `def.params.is_empty()` and `!def.params.is_empty()`
+    /// apart.
+    fn pure_generic_ambient() -> crate::defs::Ambient {
+        crate::defs::Ambient::build(&["---@meta\n---@class Box<T>\n---@field value T\n"])
+    }
+
+    #[test]
+    fn a_generic_class_declared_only_in_the_ambient_still_instantiates() {
+        // The consuming file declares no class of its own (`file_has_generics`
+        // is false), so whether `Box<T>`'s template is built at all rests
+        // entirely on `ambient_has_generics` correctly seeing that Box HAS
+        // parameters. If that scan were inverted (seeing "has an EMPTY
+        // params list" instead), an ambient of only-generic classes would
+        // read as having none, `collect_generic_classes`'s cheap pre-scan
+        // would short-circuit to an empty map, and `Box<number>` would lower
+        // to the bare, unbound `Named("Box")` — the field stays the free `T`
+        // and a string can no longer be told apart from a number.
+        let ambient = pure_generic_ambient();
+        let parsed = lua::parse(
+            "---@type Box<number>\nlocal b = { value = \"x\" }\n",
+            Dialect::Lua54,
+        );
+        assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
+        let diags = crate::check_file_with_ambient(
+            &parsed,
+            "test.lua",
+            crate::Strictness::Strict,
+            Dialect::Lua54,
+            Some(&ambient),
+        );
+        assert_eq!(
+            diags.iter().map(|d| d.code.to_string()).collect::<Vec<_>>(),
+            vec!["LB0300"],
+            "value bound to `number` by the ambient-only template must reject a string literal"
+        );
+
+        // The accepting pair: the same binding, given a conforming literal,
+        // must stay clean — proving this is a genuine substitution and not a
+        // blanket rejection of ambient-only generic references.
+        let parsed_ok = lua::parse(
+            "---@type Box<number>\nlocal b = { value = 1 }\n",
+            Dialect::Lua54,
+        );
+        assert_eq!(parsed_ok.errors(), &[], "fixture must parse cleanly");
+        let diags_ok = crate::check_file_with_ambient(
+            &parsed_ok,
+            "test.lua",
+            crate::Strictness::Strict,
+            Dialect::Lua54,
+            Some(&ambient),
+        );
+        assert_eq!(
+            diags_ok
+                .iter()
+                .map(|d| d.code.to_string())
+                .collect::<Vec<_>>(),
+            Vec::<String>::new(),
+            "a correctly-typed field must be accepted once Box<number> resolves"
+        );
     }
 }

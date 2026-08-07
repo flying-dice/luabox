@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use luabox_db::{AnalysisHost, Change, Dialect, Strictness};
+use luabox_db::{AnalysisHost, Change, Dialect, MAX_EXECUTION_LOG_ENTRIES, Strictness};
 use luabox_syntax::lua;
 use luabox_types::{check_file, check_file_with_requires, stdlib_defs};
 
@@ -856,5 +856,32 @@ return M
         second.as_ptr(),
         "two calls at the same revision must share one allocation, not each \
          deep-clone their own"
+    );
+}
+
+/// Round 5 review N23: the execution trace has no non-test drainer, so a
+/// long-running session that never calls `take_execution_log` used to grow
+/// it by roughly one entry per query invocation, per revision, forever —
+/// measured, a linear ~0.84 KiB/keystroke RSS climb over 3000 edits with no
+/// plateau. Simulate exactly that: many more revisions, each touching a
+/// fresh file (so each one logs real entries), than the cap — without ever
+/// draining in between — and assert the trace stayed at its ceiling instead
+/// of growing past it.
+#[test]
+fn execution_log_never_grows_past_its_cap() {
+    let mut host = host();
+    let edits = MAX_EXECUTION_LOG_ENTRIES * 4;
+    for i in 0..edits {
+        host.apply_change(set(&format!("f{i}.lua"), GOOD));
+        let _ = host.snapshot().diagnostics(Path::new(&format!("f{i}.lua")));
+    }
+
+    let log = host.take_execution_log();
+
+    assert!(
+        log.len() <= MAX_EXECUTION_LOG_ENTRIES,
+        "execution log grew past its cap of {MAX_EXECUTION_LOG_ENTRIES}: {} entries \
+         after {edits} undrained revisions — the bound regressed",
+        log.len()
     );
 }

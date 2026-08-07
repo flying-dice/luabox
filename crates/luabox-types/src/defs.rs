@@ -126,6 +126,30 @@ impl Ambient {
         self.env.class_shape_bound(name, args)
     }
 
+    /// Whether `name`'s ancestor chain was too deep for the most recent
+    /// [`Self::class_members`]/[`Self::class_members_bound`]/
+    /// [`Self::class_members_of`] call to resolve fully (`LB0317`) — a class
+    /// this layer declares but whose shape above the depth cap is missing
+    /// from what those calls returned.
+    ///
+    /// This layer's `env` is long-lived (one per workspace revision, cached
+    /// behind `luabox-lsp`'s `MergedAmbient`), unlike the per-file `TypeEnv`
+    /// `crate::check::run` builds and drains on every check — nothing else
+    /// ever drains this one, so every hit since the layer was built stays
+    /// visible here for as long as the layer lives, not just the one that
+    /// just happened. Exposed so an LSP surface reading a class's members
+    /// through this layer (hover, completion, goto-definition, signature
+    /// help — none of which go through `check::run`) can tell the user their
+    /// class shape is incomplete instead of silently showing fewer members
+    /// than the class declares while the Problems panel, checking the same
+    /// file through its own `TypeEnv`, already says so (production readiness
+    /// review, finding 2 — this module's own doc above promises "one
+    /// environment, not a parallel view").
+    #[must_use]
+    pub fn class_ancestry_truncated(&self, name: &str) -> bool {
+        self.env.class_ancestry_truncated(name)
+    }
+
     /// [`Self::class_members_bound`] from a LuaCATS type expression directly
     /// — the reference-site half of round 3 review F48 (#56's acceptance
     /// criterion: "no divergence between what the editor accepts and what CI
@@ -710,6 +734,107 @@ return B
                 "{src} must not resolve as a bound class reference"
             );
         }
+    }
+
+    // === class_ancestry_truncated (production readiness review, finding 2,
+    // crate-level gap) =======================================================
+    //
+    // `luabox-lsp`'s `merged_ambient.rs` already pins this accessor through
+    // `MergedAmbient`'s wrapper, but that suite is out of scope for this
+    // crate's own mutation gate (`cargo mutants -p luabox-types` runs only
+    // `luabox-types`' tests). Nothing at THIS crate's level ever called
+    // `Ambient::class_ancestry_truncated` directly — every other test above
+    // reads a class's shape (`class_members`/`class_members_of`), never
+    // whether that shape was truncated — so a survivor here was a public API
+    // this crate ships with no test of its own ever exercising it.
+
+    /// A single-file `---@class C0`, `---@class C1 : C0`, ..., `Cn : C(n-1)`
+    /// chain of length `n` — the same shape `env.rs`'s own
+    /// `MAX_ANCESTRY_DEPTH` boundary tests and `merged_ambient.rs`'s
+    /// `chain_source` use.
+    fn chain_source(n: usize) -> String {
+        use std::fmt::Write as _;
+        let mut src = String::from("---@class C0\n---@field item number\n");
+        for i in 1..=n {
+            let _ = writeln!(src, "---@class C{i} : C{}", i - 1);
+        }
+        src
+    }
+
+    /// The ambient a project file contributing `chain_source(n)` would merge
+    /// into — `class_members`/`class_ancestry_truncated`'s real read path
+    /// (`with_project_types`), not the raw `TypeEnv` `env.rs`'s own tests
+    /// build directly.
+    fn chain_ambient(n: usize) -> Ambient {
+        let src = chain_source(n);
+        let parsed = lua::parse(&src, Dialect::Lua54);
+        assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
+        let types = crate::module_surface(&parsed, "chain.lua", None).types;
+        stdlib(Dialect::Lua54).with_project_types([&types])
+    }
+
+    #[test]
+    fn class_ancestry_truncated_is_false_for_a_class_within_the_depth_cap() {
+        // The floor side: a chain of exactly `MAX_ANCESTRY_DEPTH` classes
+        // resolves in full, so the deepest class's ancestry was never
+        // truncated. Pins the `-> false` direction: a mutant that always
+        // returns `false` would pass this alone, which is exactly why the
+        // `-> true` sibling test below also has to exist.
+        let n = crate::env::MAX_ANCESTRY_DEPTH - 1;
+        let ambient = chain_ambient(n);
+        let name = format!("C{n}");
+        let shape = ambient.class_members(&name).expect("the class resolves");
+        assert!(
+            shape.fields.contains_key("item"),
+            "a chain within the limit must still merge C0's field"
+        );
+        assert!(!ambient.class_ancestry_truncated(&name));
+    }
+
+    #[test]
+    fn class_ancestry_truncated_is_true_for_a_class_past_the_depth_cap() {
+        // The ceiling side: one class past `MAX_ANCESTRY_DEPTH` already loses
+        // C0's field to the cap, so the accessor must say so. Pins the
+        // `-> true` direction: a mutant that always returns `true` would
+        // pass this alone, which is exactly why the sibling test above also
+        // has to exist — only together do the two pin both directions.
+        let n = crate::env::MAX_ANCESTRY_DEPTH;
+        let ambient = chain_ambient(n);
+        let name = format!("C{n}");
+        let shape = ambient.class_members(&name).expect("the class resolves");
+        assert!(
+            !shape.fields.contains_key("item"),
+            "one class past the limit must already truncate before reaching C0's field"
+        );
+        assert!(ambient.class_ancestry_truncated(&name));
+    }
+
+    #[test]
+    fn class_ancestry_truncated_does_not_leak_across_class_names() {
+        // The query must answer for the class just resolved, not "has this
+        // layer ever seen a depth-limit hit anywhere" — a shallow class
+        // looked up after a truncated one must not inherit the previous
+        // call's `true`.
+        let deep_n = crate::env::MAX_ANCESTRY_DEPTH;
+        let src = format!(
+            "{}\n---@class Shallow\n---@field x number\n",
+            chain_source(deep_n)
+        );
+        let parsed = lua::parse(&src, Dialect::Lua54);
+        assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
+        let types = crate::module_surface(&parsed, "chain.lua", None).types;
+        let ambient = stdlib(Dialect::Lua54).with_project_types([&types]);
+
+        let deep_name = format!("C{deep_n}");
+        ambient
+            .class_members(&deep_name)
+            .expect("the deep class resolves");
+        assert!(ambient.class_ancestry_truncated(&deep_name));
+
+        ambient
+            .class_members("Shallow")
+            .expect("the shallow class resolves");
+        assert!(!ambient.class_ancestry_truncated("Shallow"));
     }
 
     #[test]

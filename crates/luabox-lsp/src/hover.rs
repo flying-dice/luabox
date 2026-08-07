@@ -145,7 +145,8 @@ fn member_hover(
         // toolchain uses (R7): `requires::require_struct_fields` is the one
         // place both hover and completion check that before falling back to
         // the table shape.
-        if let Some((module, fields)) = requires::require_struct_fields(sema, exports, binding)
+        if let Some((module, fields)) =
+            requires::require_struct_fields(sema, exports, ambient, binding)
             && let Some(field) = fields.get(member.text())
         {
             let q = if field.optional { "?" } else { "" };
@@ -170,9 +171,16 @@ fn member_hover(
             if let Some(field) = shape.fields.get(member.text()) {
                 let q = if field.optional { "?" } else { "" };
                 let code = format!("(field) {class}.{}{q}: {}", member.text(), field.ty);
-                let docs = sema::locate_field(analysis, &sema.path, &class, member.text())
-                    .and_then(|found| found.desc)
-                    .unwrap_or_default();
+                let docs = sema::locate_field(
+                    analysis,
+                    &sema.path,
+                    &class,
+                    member.text(),
+                    ambient.ambient_paths(),
+                    ambient.sema_cache(),
+                )
+                .and_then(|found| found.desc)
+                .unwrap_or_default();
                 return Some(reply(&code, &docs, &[], member.text_range(), sema));
             }
             // A dynamic-access class (#53): an indexer or array part makes
@@ -185,6 +193,28 @@ fn member_hover(
             if !shape.indexers.is_empty() || shape.array.is_some() {
                 let code = format!("(field) {class}.{}: unknown", member.text());
                 return Some(reply(&code, "", &[], member.text_range(), sema));
+            }
+            // `class`'s ancestry was too deep for `class_members_of` to
+            // resolve fully (`LB0317`) and `member` is not among the fields
+            // it did reach — say so, rather than silently falling through to
+            // "no hover" as if `member` plainly does not exist. The Problems
+            // panel already carries `LB0317` for this class's declaration
+            // (`crate::diagnostics`, same file, same class, its own
+            // `TypeEnv`); hover reads through `ambient`'s separate,
+            // long-lived env instead (production readiness review, finding
+            // 2), so it needs its own check of the same fact to agree with
+            // what the panel already told the user.
+            if ambient.class_ancestry_truncated(&class) {
+                let code = format!("(field) {class}.{}: unknown", member.text());
+                let note = format!(
+                    "`{class}`'s `---@class` ancestry exceeds the \
+                     {}-class limit this checker enforces to resolve it safely (LB0317) — \
+                     `{}` may be declared above that limit and missing here for that reason \
+                     alone.",
+                    luabox_types::MAX_ANCESTRY_DEPTH,
+                    member.text()
+                );
+                return Some(reply(&code, &note, &[], member.text_range(), sema));
             }
         }
     }
@@ -561,6 +591,26 @@ print(p.z)
         assert_eq!(at(src, "z)", 0), None);
     }
 
+    /// Production readiness review, finding 2: `member_hover` reads a
+    /// class's members through [`MergedAmbient::class_members_of`], a
+    /// *different*, long-lived env than the one `crate::diagnostics` drains
+    /// per file for the Problems panel — this module's own doc (#56)
+    /// promises "the types `luabox check` gives them", but before this fix a
+    /// field genuinely declared by `C0`, just past the resolver's ancestry
+    /// cutoff, silently vanished from hover with no signal at all, while the
+    /// Problems panel for the same file correctly showed `LB0317`.
+    #[test]
+    fn a_field_past_the_ancestry_cutoff_hovers_with_a_truncation_note() {
+        let mut src = String::from("---@class C0\n---@field item number\n");
+        for i in 1..=400 {
+            use std::fmt::Write as _;
+            let _ = writeln!(src, "---@class C{i} : C{}", i - 1);
+        }
+        src.push_str("\n---@type C400\nlocal x = nil\nprint(x.item)\n");
+        let text = at(&src, "item)", 0).expect("hover must say something, not vanish silently");
+        assert!(text.contains("LB0317"), "{text}");
+    }
+
     #[test]
     fn hover_range_covers_exactly_the_identifier() {
         let src = "local answer = 42\nprint(answer)\n";
@@ -693,6 +743,43 @@ print(p.z)
     fn an_unannotated_require_bindings_member_still_hovers_the_structural_export() {
         let files = [
             ("main.lua", "local m = require(\"m\")\nprint(m.x)\n"),
+            ("m.lua", "local M = {}\nM.x = 42\nreturn M\n"),
+        ];
+        let text = at_files(&files, "x)", 0).expect("hover");
+        assert!(text.contains("(field) m.x: 42"), "{text}");
+    }
+
+    /// N16: the R7 gate must be a *resolves* check, not a *presence* check.
+    /// `---@type table` names a real LuaCATS type, but `table` is not a class
+    /// the ambient can resolve members from — `luabox check` reports zero
+    /// diagnostics for this exact fixture. Before the fix,
+    /// `require_struct_fields` bailed on `receiver_type(...).is_some()`
+    /// alone, so this non-resolving annotation suppressed the structural
+    /// route too and the member hover went `None` — the class arm right
+    /// below it also fails to resolve, and nothing catches it.
+    #[test]
+    fn an_annotation_that_does_not_resolve_to_a_class_falls_back_to_the_structural_export() {
+        let files = [
+            (
+                "main.lua",
+                "---@type table\nlocal m = require(\"m\")\nprint(m.x)\n",
+            ),
+            ("m.lua", "local M = {}\nM.x = 42\nreturn M\n"),
+        ];
+        let text = at_files(&files, "x)", 0).expect("hover");
+        assert!(text.contains("(field) m.x: 42"), "{text}");
+    }
+
+    /// Same shape, an annotation naming a class that simply does not exist —
+    /// the mid-edit case: a partially-typed class name resolves to nothing
+    /// too, and must not blank out the structural fallback either.
+    #[test]
+    fn an_annotation_naming_an_undeclared_class_falls_back_to_the_structural_export() {
+        let files = [
+            (
+                "main.lua",
+                "---@type Bogus\nlocal m = require(\"m\")\nprint(m.x)\n",
+            ),
             ("m.lua", "local M = {}\nM.x = 42\nreturn M\n"),
         ];
         let text = at_files(&files, "x)", 0).expect("hover");
