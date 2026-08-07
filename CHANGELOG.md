@@ -161,6 +161,28 @@ and that rule is now written into the policy rather than left to judgement.
   diagnostic text is observable output a downstream tool can grep, and this
   one changed twice before anyone outside this PR could see either version.
 
+- **Indexer precedence now follows one measured rule per seam, and a
+  multi-parent merge no longer flips verdicts.** Two distinct rules govern
+  a same-key `---@field [K] V` indexer, and this release makes both explicit
+  after an intermediate build of this block collapsed them into one:
+
+  - **Two unrelated parents** (`---@class C : P1, P2`, each declaring the
+    key independently) resolve **first-listed-wins**, matching `develop`.
+    An intermediate build of this block made it last-wins, which turned a
+    read `develop` accepts into a false reject, and the reversed parent list
+    from a rejection into silence. Both directions are measured against a
+    binary built at the merge base and pinned.
+  - **One ancestor reached twice with different type arguments** (a generic
+    diamond) resolves **last-listed-wins**, matching the rule its `---@field`
+    members already followed, so a class's fields and its indexers cannot
+    disagree about which edge won.
+
+  Separately, a same-key indexer re-declared on one class name across two
+  `---@class` blocks now **dedups first-wins** at both merge seams (in-file
+  and cross-file), matching the `LB0311` first-wins rule for a duplicate
+  `---@field`. Previously both seams simply appended, so one merged class
+  could carry the same key twice and resolve it by scan order.
+
 - **Inlay hints and hover no longer lose a require'd carrier's member types.**
   Introduced and fixed inside this same block: when the export seam started
   reifying against the merged project ambient, the *display*-mode queries

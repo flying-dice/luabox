@@ -47,6 +47,20 @@ Choosing the union would make a mistyped duplicate silently widen the field
 rather than be reported, so the warning plus a stable winner is the more useful
 answer; the divergence is here rather than in the code's favour.
 
+**Indexers follow two rules, and which one applies depends on how the key
+arrived.** A same-key `---@field [K] V` re-declared on one class name — two
+`---@class` blocks, same file or across files — is **first-wins**, the same
+deterministic rule a duplicate `---@field` follows, though without the
+`LB0311` warning the named-field case emits. Inherited keys split by shape:
+two *unrelated* parents (`---@class C : P1, P2`, each declaring the key) is
+**first-listed-wins**, while one ancestor reached twice through a generic
+diamond with *different* type arguments is **last-listed-wins**, matching
+what the class's own `---@field` members do so that fields and indexers
+cannot disagree about which edge won. Both inherited rules are measured
+against the pre-change binary rather than derived, because an intermediate
+build of this release collapsed them into a single last-wins rule and
+silently changed verdicts in both directions.
+
 **Type parameters are scoped to the declaration that writes them.** Two
 declarations of a generic class may spell the parameter differently —
 `---@class Boxed<T>` with `---@field value T` beside `---@class Boxed<U>` with
