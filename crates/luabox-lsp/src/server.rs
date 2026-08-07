@@ -576,11 +576,6 @@ struct Server {
     /// `RefCell` for the same reason as [`Self::pending`]: the read paths run
     /// behind `&self`, and the server is single-threaded.
     merged_ambient: RefCell<Option<(u64, Rc<MergedAmbient>)>>,
-    /// `"hit@<revision>"` / `"rebuilt@<revision>"` per [`Self::merged_ambient`]
-    /// call since the last drain (`#[cfg(test)]` only — see
-    /// [`Self::take_merged_ambient_trace`], #58/#60).
-    #[cfg(test)]
-    merged_ambient_trace: RefCell<Vec<String>>,
     /// The resolved `[lint]` configuration, driving the lint pass in
     /// [`Self::publish_lua`] and the quick-fixes in [`Self::code_actions`].
     lint: LintConfig,
@@ -745,8 +740,6 @@ impl Server {
             ambient,
             rocks: RockSurfaces::default(),
             merged_ambient: RefCell::new(None),
-            #[cfg(test)]
-            merged_ambient_trace: RefCell::new(Vec::new()),
             lint: config.lint,
             known_globals,
             open_docs: HashMap::new(),
@@ -1570,20 +1563,53 @@ impl Server {
     /// project file (see the field doc on [`Self::merged_ambient`] for what
     /// this reuse does and does not reach, measured).
     ///
-    /// Traced into [`Self::merged_ambient_trace`] on both outcomes (#60) —
-    /// the only signal that a served entry is fresh rather than a merge that
-    /// quietly went stale, since the client sees no difference in the
-    /// response either way. `revision` is included so a trace can tell a
-    /// miss-then-hit pair apart from two independent misses.
+    /// Traced via [`Self::log_message`] at [`MessageType::LOG`] on the
+    /// **rebuild** arm only (#60, #58's `#[cfg(test)]`-only trace was proven
+    /// indistinguishable from a stale merge in a release build, R26 — that
+    /// requirement stands unchanged: a rebuild must stay externally
+    /// observable in a release build). R26 also logged the *hit* arm, on the
+    /// reasoning that clients filter `LOG` out of their visible pane by
+    /// default — an assumption about client behaviour the LSP spec does not
+    /// make, and several real clients surface every `window/logMessage` line
+    /// in an always-on output channel regardless of severity. A hit fires on
+    /// every hover, completion, signature-help, goto-definition and
+    /// diagnostics publish — once per request for the life of the session,
+    /// not once per revision — so logging it is unbounded chatter with no
+    /// capability check and no opt-out.
+    ///
+    /// Rejected: keep both arms and rely on clients to filter `LOG` (the
+    /// volume complaint stands unresolved); gate the hit log behind a
+    /// capability or a config flag (a negotiation path and a silent default
+    /// for a signal nobody asked to opt into, for what should be a one-line
+    /// fix); revert to `#[cfg(test)]` (reopens R26 outright — a release
+    /// build goes back to unobservable). Chosen: log the rebuild only. A
+    /// rebuild happens once per revision, not once per request, so volume
+    /// collapses while "did the merge rebuild when the world changed?" stays
+    /// answerable from the wire — a stale merge (a rebuild that should have
+    /// fired after an edit but didn't) still shows up as a *missing*
+    /// `rebuilt@` line, the exact failure mode R26 closed. What is lost: a
+    /// client can no longer tell "second read at this revision, cache hit"
+    /// apart from "second read at this revision, the server was never asked
+    /// again" — both now produce zero additional log lines, and nothing
+    /// downstream of this trace ever needed that distinction (the cache-hit
+    /// test below asserts the *absence* of a second `rebuilt@`, not the
+    /// presence of a `hit@`, for exactly this reason). `revision` stays on
+    /// the rebuild line so a client's log pane can tell two rebuilds at
+    /// different revisions apart from a rebuild firing twice at the same
+    /// one — a bug, since the cache key is the revision.
+    ///
+    /// `LOG`, not `WARNING`/`INFO`: `WARNING`, used elsewhere in this file
+    /// (manifest problems, malformed messages), is for something the user
+    /// should notice unprompted; a cache rebuild is not that. `LOG` is the
+    /// tier LSP reserves for exactly this volume — clients that do filter it
+    /// stay silent, the same tier
+    /// [`luabox_db::AnalysisHost::take_execution_log`] answers for salsa's
+    /// own cache.
     fn merged_ambient(&self, snapshot: &Analysis) -> Rc<MergedAmbient> {
         let revision = snapshot.revision();
         if let Some((cached_at, merged)) = self.merged_ambient.borrow().as_ref()
             && *cached_at == revision
         {
-            #[cfg(test)]
-            self.merged_ambient_trace
-                .borrow_mut()
-                .push(format!("hit@{revision}"));
             return Rc::clone(merged);
         }
         let merged = Rc::new(MergedAmbient::build(
@@ -1591,27 +1617,12 @@ impl Server {
             &snapshot.project_types(),
             self.rocks.types(),
         ));
-        #[cfg(test)]
-        self.merged_ambient_trace
-            .borrow_mut()
-            .push(format!("rebuilt@{revision}"));
+        self.log_message(
+            MessageType::LOG,
+            format!("merged ambient rebuilt@{revision}"),
+        );
         *self.merged_ambient.borrow_mut() = Some((revision, Rc::clone(&merged)));
         merged
-    }
-
-    /// Drain [`Self::merged_ambient_trace`] since the last call — test aid
-    /// (#58, #60), mirroring [`luabox_db::AnalysisHost::take_execution_log`]'s
-    /// own "what actually ran" signal applied to this hand-rolled cache
-    /// rather than salsa's. Not `window/logMessage`: this fires on every
-    /// hover, completion, signature-help, goto-definition and diagnostics
-    /// publish, and pushing that to the client's log pane on every keystroke
-    /// would be exactly the noise `window/logMessage` is reserved against
-    /// elsewhere in this file (manifest problems, malformed messages) — an
-    /// in-process trace is the honest scope for "did this specific call hit
-    /// or rebuild", the same scope `take_execution_log` keeps its answer to.
-    #[cfg(test)]
-    fn take_merged_ambient_trace(&self) -> Vec<String> {
-        std::mem::take(&mut self.merged_ambient_trace.borrow_mut())
     }
 
     /// The callee's resolved signature(s) while `position` sits inside a
@@ -1620,7 +1631,7 @@ impl Server {
         let (snapshot, sema, offset) = self.at(uri, position)?;
         let exports = self.require_exports(&snapshot, &sema.path);
         let ambient = self.merged_ambient(&snapshot);
-        signature_help::signature_help(&sema, offset, &exports, &ambient)
+        signature_help::signature_help(&sema, offset, &exports, &ambient, &snapshot)
     }
 
     /// The call-hierarchy item for the function the cursor names at `position`
@@ -2642,16 +2653,41 @@ mod tests {
     //
     // What the cache measurably delivers (#57, correcting the prior comment's
     // false "diagnostics on each keystroke" claim): the SAME revision's
-    // second read reuses the merge — read here through the trace
-    // (#58/#60's observability), not by inference from timing or a deleted
-    // cache still passing the suite green.
+    // second read reuses the merge — read here through the *absence* of a
+    // second `rebuilt@` `window/logMessage` line (#58/#60's observability,
+    // made real in a release build by R26 — no `#[cfg(test)]` gate, so
+    // `merged_ambient_log` reads the protocol the server actually sent, not
+    // an in-process vec only tests can see), not by inference from timing or
+    // a deleted cache still passing the suite green. R26 also logged the hit
+    // arm directly as a `hit@` line; a later pass (finding 1, volume flagged
+    // independently by three review passes) dropped it — a hit fires once
+    // per request for the life of a session, unconditionally, and several
+    // real `window/logMessage` panes surface every line regardless of
+    // severity. `merged_ambient`'s own doc carries the full trade; what's
+    // pinned here is what survives it.
+
+    /// The `merged ambient rebuilt@` `window/logMessage` payloads among
+    /// `messages`, in order — the same signal [`super::Server::merged_ambient`]
+    /// sends a real client, so a test reading it is reading exactly what
+    /// production would log, not a parallel test-only channel (R26). No
+    /// `hit@` payload exists to read (finding 1: the hit arm is not logged),
+    /// so this list is exactly the server's rebuild history at this
+    /// revision-key granularity.
+    fn merged_ambient_log(messages: &[Message]) -> Vec<String> {
+        log_messages(messages)
+            .into_iter()
+            .filter(|m| m.starts_with("merged ambient "))
+            .collect()
+    }
 
     /// Open one document and hover it twice with no edit in between: the
     /// `didOpen` publish is the first read at this revision (a rebuild), the
-    /// hover right after is the second (a hit) — the cross-surface reuse
-    /// the cache actually delivers.
+    /// hover right after is the second. Only the rebuild arm is logged
+    /// (finding 1), so the cross-surface reuse the cache actually delivers
+    /// shows up as the *absence* of a second `rebuilt@` line, not a `hit@`
+    /// one — the only way the wire now exposes it.
     #[test]
-    fn a_second_read_at_the_same_revision_hits_the_cache() {
+    fn a_second_read_at_the_same_revision_does_not_rebuild_again() {
         let (dir, mut server, client) = test_server();
         let path = dir.path().join("main.lua");
         let source = "local x = 1\nprint(x)\n";
@@ -2670,19 +2706,27 @@ mod tests {
                 }),
             })
             .expect("didOpen");
-        drop(drain(&client));
+        // The `didOpen` publish is itself a read at this revision (the
+        // rebuild) — captured, not discarded, since the log is now the real
+        // `window/logMessage` protocol and a dropped drain is a dropped
+        // message, not just a cleared in-process buffer (R26).
+        let mut trace = merged_ambient_log(&drain(&client));
 
         server.hover(&uri, lsp_types::Position::new(1, 6));
+        trace.extend(merged_ambient_log(&drain(&client)));
 
-        let trace = server.take_merged_ambient_trace();
-        assert!(trace.iter().any(|e| e.starts_with("rebuilt@")), "{trace:?}");
-        assert!(trace.iter().any(|e| e.starts_with("hit@")), "{trace:?}");
+        assert_eq!(
+            trace.iter().filter(|e| e.contains("rebuilt@")).count(),
+            1,
+            "a second read at the same revision must reuse the merge, not \
+             rebuild it again: {trace:?}"
+        );
     }
 
     /// A keystroke bumps the revision (`host.rs`) immediately before
     /// `publish_lua` reads this cache, so the very next read is a guaranteed
     /// miss — measured, not assumed: two edits in a row rebuild twice, never
-    /// hit.
+    /// reuse a merge from before either edit.
     #[test]
     fn a_keystroke_always_rebuilds_never_hits() {
         let (dir, mut server, client) = test_server();
@@ -2703,29 +2747,37 @@ mod tests {
             })
             .expect("didOpen");
         drop(drain(&client));
-        drop(server.take_merged_ambient_trace());
 
+        // Each `didChange` republishes diagnostics, which reads the cache
+        // (`publish_lua` → `merged_ambient`) — the drain must happen inside
+        // the loop, per iteration, or the `window/logMessage` for an earlier
+        // change is indistinguishable from a later one once both are mixed
+        // into one drain. Each edit's text must genuinely differ from the
+        // last (round 4 review R17): `apply_change` now bumps the revision
+        // only when a salsa input actually changed, so two edits setting
+        // the identical text would make the second a no-op — a legitimate
+        // cache *hit* — and this test would stop measuring what its name
+        // claims.
+        let mut trace = Vec::new();
         for version in 2..=3 {
             server
                 .handle_notification(Notification {
                     method: DidChangeTextDocument::METHOD.to_string(),
                     params: json!({
                         "textDocument": { "uri": uri.to_string(), "version": version },
-                        "contentChanges": [{ "text": "local x = 2\n" }],
+                        "contentChanges": [{ "text": format!("local x = {version}\n") }],
                     }),
                 })
                 .expect("didChange");
-            drop(drain(&client));
+            trace.extend(merged_ambient_log(&drain(&client)));
         }
 
-        let trace = server.take_merged_ambient_trace();
+        // Only the rebuild arm is logged (finding 1) — a `hit@` line cannot
+        // appear even if a bug turned one of these into an accidental cache
+        // hit, so the assertion the test's name stands on is the rebuild
+        // count alone: two edits in, two rebuilds out, none skipped.
         assert_eq!(
-            trace.iter().filter(|e| e.starts_with("hit@")).count(),
-            0,
-            "{trace:?}"
-        );
-        assert_eq!(
-            trace.iter().filter(|e| e.starts_with("rebuilt@")).count(),
+            trace.iter().filter(|e| e.contains("rebuilt@")).count(),
             2,
             "{trace:?}"
         );
@@ -2792,6 +2844,145 @@ mod tests {
             other => panic!("expected markup hover contents, got {other:?}"),
         };
         assert!(text.contains("Widget.gadget"), "{text}");
+    }
+
+    /// Round 4 review R11: a `[types] defs` declaration of `Widget` collides
+    /// with an ordinary project file's own `---@class Widget`. The type
+    /// merge (`env.rs`'s `merge_file_types`) seeds the ambient/defs classes
+    /// first, so a same-named field on a later-merged project file loses the
+    /// *type* collision but not its own `---@field` description — hover must
+    /// render the defs field's type with whichever file's description
+    /// `locate_field` actually names (here, the same defs file, since it is
+    /// visited first), and goto-definition must jump there too, not to the
+    /// project file `sema::locate_field` used to prefer by alphabetical
+    /// accident.
+    #[test]
+    fn a_defs_declaration_wins_a_same_name_collision_over_a_project_files_own() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        fs::create_dir_all(root.join("defs")).expect("defs dir");
+        fs::write(
+            root.join("defs/widget.d.lua"),
+            "---@meta\n---@class Widget\n---@field id string the id from defs\n",
+        )
+        .expect("write defs");
+        // An unrelated project file re-declaring the identical class name
+        // with a *different* field type and its own description — the
+        // collision. Named so it would sort before `defs/widget.d.lua`
+        // alphabetically, the exact ordering the previous `sort_unstable()`
+        // used and got wrong.
+        fs::write(
+            root.join("a_widget.lua"),
+            "---@class Widget\n---@field id number the id from a_widget\n",
+        )
+        .expect("write the colliding project file");
+        let path = root.join("main.lua");
+        let source = "---@type Widget\nlocal w = nil\nprint(w.id)\n";
+        fs::write(&path, source).expect("write the document");
+        fs::write(
+            root.join("luabox.toml"),
+            format!("{MANIFEST_HEAD}\n[types]\ndefs = [\"widget\"]\n"),
+        )
+        .expect("write manifest");
+        // `reload_config` picks up `[types] defs` (the ambient/base layer,
+        // read straight off disk); `bootstrap` is what actually loads every
+        // `.lua` file — `defs/widget.d.lua` included (`DefFiles::Include`)
+        // — into the host as a *project* file too, which is what
+        // `sema::locate_field`'s cross-file search reads. Both are needed:
+        // without `bootstrap`, neither colliding declaration is visible to
+        // `locate_field` at all, and the test would pass vacuously with an
+        // empty description on either side of the assertion.
+        server.reload_config().expect("reload");
+        server.bootstrap();
+        drop(drain(&client));
+
+        let uri = crate::uri::path_to_uri(&path);
+        let hover = server.hover(&uri, lsp_types::Position::new(2, 8));
+        let text = match hover.expect("hover").contents {
+            lsp_types::HoverContents::Markup(markup) => markup.value,
+            other => panic!("expected markup hover contents, got {other:?}"),
+        };
+        // The type is defs' (`string`), not the project file's (`number`).
+        assert!(text.contains("Widget.id: string"), "{text}");
+        assert!(!text.contains("Widget.id: number"), "{text}");
+        // The description is whichever file `locate_field` actually named —
+        // the defs file, since it is visited first — not the project file's.
+        assert!(text.contains("the id from defs"), "{text}");
+        assert!(!text.contains("the id from a_widget"), "{text}");
+
+        // Goto-definition follows the same authority: it must land in the
+        // defs file, not the project file whose type lost the collision.
+        let location = server
+            .definition(&uri, lsp_types::Position::new(2, 8))
+            .expect("definition");
+        assert!(
+            location.uri.as_str().ends_with("defs/widget.d.lua"),
+            "{location:?}"
+        );
+    }
+
+    /// Finding 3: two *ordinary* project files (neither one is `current`,
+    /// neither is a `.d.lua`) both declare `---@class Widget`. `sema.rs`'s
+    /// `search_order` broke this tie with an alphabetical sort, documented
+    /// as "not proven to match `merge_file_types`'s own first-wins order,
+    /// which is keyed on `Project::files(db)` insertion order". This pins
+    /// that it *does* match, for the file set every real session's `current`
+    /// actually collides against — every file `bootstrap` loads at startup:
+    /// `Project::files(db)`'s insertion order is exactly
+    /// `luabox_manifest::layout::collect_lua_files`'s walk order (sorted by
+    /// filename within each directory, always descending fully before the
+    /// next sibling), which is the same order `Path`'s own component-wise
+    /// `Ord` produces over the full paths — i.e. exactly what
+    /// `rest.sort_unstable()` in `search_order` produces. `aa_widget.lua`
+    /// sorts before `bb_widget.lua` both ways, so if the ordering actually
+    /// disagreed with the merge, this test would show the *type* resolving
+    /// to one file while hover's *description* and goto-definition named
+    /// the other — the exact split finding 3 warns is possible.
+    #[test]
+    fn a_first_declared_ordinary_project_file_wins_a_same_name_collision_over_a_later_one() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        fs::write(root.join("luabox.toml"), MANIFEST_HEAD).expect("write manifest");
+        fs::write(
+            root.join("aa_widget.lua"),
+            "---@class Widget\n---@field id string the id from aa_widget\n",
+        )
+        .expect("write the first-sorted colliding file");
+        fs::write(
+            root.join("bb_widget.lua"),
+            "---@class Widget\n---@field id number the id from bb_widget\n",
+        )
+        .expect("write the second-sorted colliding file");
+        let path = root.join("main.lua");
+        let source = "---@type Widget\nlocal w = nil\nprint(w.id)\n";
+        fs::write(&path, source).expect("write the document");
+        // `bootstrap`, not `didOpen`, so `Project::files(db)` receives every
+        // file in `collect_lua_files`'s sorted walk order — the order the
+        // proof above depends on. `didOpen`-only files append in open order
+        // instead (the gap `sema::locate_field`'s doc names as still open).
+        server.bootstrap();
+        drop(drain(&client));
+
+        let uri = crate::uri::path_to_uri(&path);
+        let hover = server.hover(&uri, lsp_types::Position::new(2, 8));
+        let text = match hover.expect("hover").contents {
+            lsp_types::HoverContents::Markup(markup) => markup.value,
+            other => panic!("expected markup hover contents, got {other:?}"),
+        };
+        // The type merge's own first-wins decision.
+        assert!(text.contains("Widget.id: string"), "{text}");
+        assert!(!text.contains("Widget.id: number"), "{text}");
+        // Navigation must agree with it — same file, same description.
+        assert!(text.contains("the id from aa_widget"), "{text}");
+        assert!(!text.contains("the id from bb_widget"), "{text}");
+
+        let location = server
+            .definition(&uri, lsp_types::Position::new(2, 8))
+            .expect("definition");
+        assert!(
+            location.uri.as_str().ends_with("aa_widget.lua"),
+            "{location:?}"
+        );
     }
 
     // === Malformed messages ===============================================

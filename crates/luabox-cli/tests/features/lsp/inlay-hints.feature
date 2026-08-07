@@ -56,6 +56,31 @@ Feature: luabox lsp — inlay hints
     Then an inlay hint at 6:32 reads ": Rect"
     And an inlay hint at 6:23 reads ": number"
 
+  # Round 3 review F44, round 4 review R31: the display-mode ambient
+  # (`binding_types`, the query this surface reads) needs the project-wide
+  # class merge, not just the file's own annotations, or a required module's
+  # `---@class` carrier export stays opaque instead of resolving to the
+  # class it carries. F44's own test pinned the regression one layer down,
+  # at `binding_types` itself (`luabox-db/tests/analysis.rs`); this is the
+  # inlay-hint-level scenario nothing had reached.
+  Scenario: a required module's class-carrier binding hints with the class name
+    Given a file "widget.lua" containing:
+      """
+      ---@class Widget
+      ---@field id number
+      local W = {}
+      return W
+      """
+    And a file "main.lua" containing:
+      """
+      local w = require("widget")
+      print(w)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request inlay hints for the first 2 lines of "main.lua"
+    Then an inlay hint at 0:7 reads ": Widget"
+
   Scenario: a local function name gets no binding hint, only a return hint
     Given a file "main.lua" containing:
       """

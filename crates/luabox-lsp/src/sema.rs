@@ -555,16 +555,94 @@ pub struct FieldSource {
 /// anywhere in its chain, has nothing here to find; that is a real,
 /// documented gap, not a bug (#51 only pins the loss for a field an
 /// `---@field` tag actually declares).
+///
+/// `current` is the file the query is being asked *from* (the cursor's own
+/// file) — checked first *for the common case*, and every other file is
+/// visited lazily, one `FileSema` at a time, only as the parent-chain walk
+/// actually needs it (round 4 review R10): the previous version built a
+/// `FileSema` — a full byte scan (`LineIndex::new`) and a `classes()` walk —
+/// for *every* project file before looking at a single candidate, even when
+/// `class` was declared in `current` itself. Measured release (this crate's
+/// own N-filler-files repro, member hover, single-digit-line filler files,
+/// zero `.d.lua` files present): 33µs → 252µs → 1.29ms at N = 10/100/500
+/// before this fix, 6µs → 55µs → 380µs after — a 5–7× cut, not flat:
+/// [`search_order`] still walks [`Analysis::files`] once per
+/// collision-priority group to classify defs vs. project paths (R11 needs
+/// that ordering *before* trusting `current` alone), so the residual cost is
+/// O(files) in cheap path-suffix comparisons and a sort, not O(files) in
+/// full parses.
+///
+/// That R10 measurement never exercised a `[types] defs` project (zero
+/// `.d.lua` filler files), so it never caught this: `search_order` put every
+/// `*.d.lua` file ahead of `current` in the *visit* order too, not just the
+/// priority order, and the loop below builds a full `FileSema` for each path
+/// it visits in turn — so a project with defs configured paid a full parse
+/// of every defs file before ever reaching `current`, on every hover, even
+/// when `class` is declared in `current` and nowhere in `defs`. Re-measured
+/// (release, same repro, same member-hover shape) with 10 filler `.d.lua`
+/// files held constant across the sweep — none of them declaring the queried
+/// class, a modest but realistic vendored-defs package — while N project
+/// filler files still scales 10/100/500: 23µs → 78µs → 358µs before this fix,
+/// 8µs → 67µs → 327µs after (both medians of 50 runs against one built
+/// `Analysis`, two independent runs, single-digit-percent run-to-run
+/// variance). The cut is largest at N = 10 (roughly 2.7×) and shrinks as N
+/// grows, because the 10-file defs tier this fix skips is a fixed cost that
+/// becomes a smaller fraction of a total dominated by the (unfiltered) `rest`
+/// tier as project-file count grows — expected, since this fix targets only
+/// the defs tier, not `rest`. [`search_order`] now takes `class` and skips a
+/// defs file's `FileSema` build entirely when the file's raw text cannot
+/// possibly hold a `---@class class` tag ([`may_declare_class`] below — a
+/// cheap, false-positive-safe substring scan over the text
+/// [`luabox_db::Analysis::file_text`] already has cached, not a second
+/// parse).
+///
+/// Visit order otherwise follows the type merge's own authority (round 4
+/// review R11): a `[types] defs` declaration always wins a same-name
+/// collision with a project file (`env.rs`'s `merge_file_types` seeds the
+/// ambient/defs classes first, so `existing.fields.entry(...).or_insert_with`
+/// keeps the defs field on a collision) — so every `*.d.lua` file
+/// ([`is_def_file`], the same convention `luabox_manifest::layout` files
+/// under) that might declare the class in play is visited before any
+/// non-`current` project file, and [`may_declare_class`]'s scan is a
+/// *superset* filter (word-boundary substring match, no false negatives) so
+/// this precedence is exact, not approximate: a defs file that really
+/// declares `class` is never skipped, only ones that provably cannot.
+/// `current` ends up visited first in the overwhelmingly common case (no
+/// defs file mentions the class at all) purely because the defs tier
+/// filters down to nothing, not because the order structurally changed —
+/// R11's own fixture (`locate_field_visits_a_defs_file_before_a_colliding_project_file`)
+/// still passes unmodified, because a colliding defs file still mentions
+/// the class and is still visited first.
+///
+/// Two project files (neither one `current` nor a `*.d.lua`) colliding on
+/// one class name fall back to a sorted, deterministic tiebreak — proven,
+/// not merely hoped, to match `merge_file_types`'s own first-wins order for
+/// every file loaded at workspace bootstrap (finding 3, pinned end-to-end by
+/// `server.rs`'s `a_first_declared_ordinary_project_file_wins_a_same_name_collision_over_a_later_one`):
+/// `server.rs::bootstrap` loads files in `luabox_manifest::layout::collect_lua_files`'s
+/// walk order — sorted by filename within each directory, always descending
+/// fully before advancing to the next sibling — which is exactly the order
+/// `Path`'s own `Ord` (component-wise lexicographic) produces over the full
+/// paths, i.e. exactly what `rest.sort_unstable()` below produces, and
+/// that's also the order `Project::files(db)` receives its entries in
+/// (`host.rs`'s `sync_file` appends each new file to that `Vec` the first
+/// time bootstrap syncs it), which is the order `merge_file_types` reads
+/// first-wins from. The one gap this does not close: a file created and
+/// `didOpen`'d only *after* bootstrap — never seen by the initial workspace
+/// walk — is appended to `Project::files(db)` in `didOpen` order, not
+/// resorted, so its position in the merge's first-wins order can disagree
+/// with this alphabetical tiebreak. Closing that would need
+/// `luabox_db::Analysis` to expose `Project::files(db)`'s actual `Vec`
+/// order (today `Analysis::files` erases it through a `HashMap`) — a
+/// `luabox-db` change, outside this crate.
 #[must_use]
-pub fn locate_field(analysis: &Analysis, class: &str, member: &str) -> Option<FieldSource> {
-    let mut paths: Vec<&Path> = analysis.files().collect();
-    paths.sort_unstable();
-    let semas: Vec<FileSema> = paths
-        .into_iter()
-        .filter_map(|p| FileSema::new(analysis, p))
-        .collect();
-    let maps: Vec<HashMap<&str, ClassDecl<'_>>> = semas.iter().map(FileSema::classes).collect();
-
+pub fn locate_field(
+    analysis: &Analysis,
+    current: &Path,
+    class: &str,
+    member: &str,
+) -> Option<FieldSource> {
+    let mut cache: HashMap<PathBuf, FileSema> = HashMap::new();
     let mut queue: std::collections::VecDeque<String> =
         std::collections::VecDeque::from([class.to_string()]);
     let mut seen = HashSet::new();
@@ -572,7 +650,18 @@ pub fn locate_field(analysis: &Analysis, class: &str, member: &str) -> Option<Fi
         if !seen.insert(name.clone()) {
             continue;
         }
-        for (sema, map) in semas.iter().zip(&maps) {
+        let order = search_order(analysis, current, &name);
+        for &path in &order {
+            let sema = match cache.entry(path.to_path_buf()) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let Some(built) = FileSema::new(analysis, path) else {
+                        continue;
+                    };
+                    e.insert(built)
+                }
+            };
+            let map = sema.classes();
             let Some(decl) = map.get(name.as_str()) else {
                 continue;
             };
@@ -596,6 +685,92 @@ pub fn locate_field(analysis: &Analysis, class: &str, member: &str) -> Option<Fi
     }
     None
 }
+
+/// [`locate_field`]'s file visit order for one BFS class name: `current`
+/// first, then every `*.d.lua` definition file ([`is_def_file`]) that
+/// [`may_declare_class`] says could hold a `---@class name` tag, sorted,
+/// then every other project file sorted — see [`locate_field`]'s own doc for
+/// why. Recomputed per BFS name (parent-chain classes can live in different
+/// defs files than the class the walk started from, so a filter keyed on the
+/// *original* class would wrongly hide a parent's own defs declaration).
+///
+/// Cheap regardless: this builds no `FileSema` — [`Analysis::files`] is a
+/// handful of path comparisons, and [`may_declare_class`] scans text
+/// [`Analysis::file_text`] already has cached, not a fresh parse. The
+/// `FileSema`s the returned paths name are the expensive part, and this
+/// function builds none of them.
+fn search_order<'a>(analysis: &'a Analysis, current: &'a Path, name: &str) -> Vec<&'a Path> {
+    let current_is_def = is_def_file(current);
+    let mut defs: Vec<&Path> = analysis
+        .files()
+        .filter(|p| is_def_file(p) && *p != current)
+        .filter(|p| {
+            analysis
+                .file_text(p)
+                .is_some_and(|text| may_declare_class(&text, name))
+        })
+        .collect();
+    defs.sort_unstable();
+    let mut rest: Vec<&Path> = analysis
+        .files()
+        .filter(|p| !is_def_file(p) && *p != current)
+        .collect();
+    rest.sort_unstable();
+    if current_is_def {
+        std::iter::once(current).chain(defs).chain(rest).collect()
+    } else {
+        defs.into_iter()
+            .chain(std::iter::once(current))
+            .chain(rest)
+            .collect()
+    }
+}
+
+/// Whether `text` could possibly hold a `---@class name` tag — a linear
+/// byte scan for the word `class`, followed by whitespace, followed by the
+/// word `name`, with no full parse. A *superset* filter, not a replacement
+/// for the real one: it is allowed false positives (an unrelated occurrence
+/// of the two words in sequence costs one wasted `FileSema` build downstream,
+/// same as before this existed) but never a false negative, because a
+/// genuine `---@class name` tag's literal source bytes always contain
+/// `"class"`, then whitespace, then `name`, contiguously — the luacats
+/// grammar has no other way to spell the tag. Word-bounded on both sides so
+/// neither `subclass Name` nor `class NameExtra` counts as a match for
+/// `class Name` (safe in the false-positive direction only: it can only make
+/// this return `true` more often, never `false` for a genuine tag).
+fn may_declare_class(text: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    // `match_indices` only ever yields byte offsets that fall on a `name`
+    // match's own boundaries, which are themselves always char-boundary
+    // aligned (a match is a valid `&str` slice) — `get` never actually
+    // returns `None` here, but reaching for it over direct indexing keeps
+    // this provably panic-free rather than merely reasoned to be.
+    text.match_indices(name).any(|(idx, _)| {
+        let before_ok = text
+            .get(..idx)
+            .map(|s| s.trim_end_matches(char::is_whitespace))
+            .and_then(|s| s.strip_suffix("class"))
+            .is_some_and(|rest| !rest.ends_with(|c: char| c.is_alphanumeric() || c == '_'));
+        let after_ok = text
+            .get(idx + name.len()..)
+            .and_then(|s| s.chars().next())
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        before_ok && after_ok
+    })
+}
+
+/// Whether `path` is a `*.d.lua` `---@meta` definition file.
+///
+/// Re-exported from [`luabox_manifest::layout::is_def_file`] rather than
+/// re-implemented: the `.d.lua` convention has one owner, and both
+/// [`locate_field`]'s defs-vs-project precedence and [`search_order`]'s
+/// defs-tier filter key on the same answer `collect_lua_files` walks with.
+/// A local copy would have no compiler-enforced link to that one — loosening
+/// the convention there would silently leave this behind, breaking the
+/// precedence with a wrong hover result and no build failure.
+use luabox_manifest::layout::is_def_file;
 
 /// The `---@see` references of an annotation block, in declaration order
 /// (multiple `@see` tags are allowed; empty-bodied ones are skipped).
@@ -1155,7 +1330,8 @@ mod tests {
             "main.lua",
             "---@class Point\n---@field x number the x coordinate\n",
         )]);
-        let found = locate_field(&analysis, "Point", "x").expect("found");
+        let current = root().join("main.lua");
+        let found = locate_field(&analysis, &current, "Point", "x").expect("found");
         assert_eq!(found.path, root().join("main.lua"));
         assert_eq!(found.desc.as_deref(), Some("the x coordinate"));
     }
@@ -1172,7 +1348,8 @@ mod tests {
                 "---@class Point\n---@field x number the x coordinate\nlocal P = {}\nreturn P\n",
             ),
         ]);
-        let found = locate_field(&analysis, "Point", "x").expect("found");
+        let current = root().join("main.lua");
+        let found = locate_field(&analysis, &current, "Point", "x").expect("found");
         assert_eq!(found.path, root().join("point.lua"));
         assert_eq!(found.desc.as_deref(), Some("the x coordinate"));
     }
@@ -1186,20 +1363,23 @@ mod tests {
             ("main.lua", "---@class Sub : Base\n---@field name string\n"),
             ("base.lua", "---@class Base\n---@field id number\n"),
         ]);
-        let found = locate_field(&analysis, "Sub", "id").expect("found");
+        let current = root().join("main.lua");
+        let found = locate_field(&analysis, &current, "Sub", "id").expect("found");
         assert_eq!(found.path, root().join("base.lua"));
     }
 
     #[test]
     fn locate_field_declines_a_field_no_ancestor_declares() {
         let analysis = analyze_files(&[("main.lua", "---@class Point\n---@field x number\n")]);
-        assert!(locate_field(&analysis, "Point", "nope").is_none());
+        let current = root().join("main.lua");
+        assert!(locate_field(&analysis, &current, "Point", "nope").is_none());
     }
 
     #[test]
     fn locate_field_declines_an_undeclared_class() {
         let analysis = analyze_files(&[("main.lua", "---@class Point\n---@field x number\n")]);
-        assert!(locate_field(&analysis, "Nope", "x").is_none());
+        let current = root().join("main.lua");
+        assert!(locate_field(&analysis, &current, "Nope", "x").is_none());
     }
 
     /// A class assembled purely from carrier-attached methods (no
@@ -1211,7 +1391,8 @@ mod tests {
             "main.lua",
             "---@class Greeter\nlocal G = {}\nfunction G.greet() end\n",
         )]);
-        assert!(locate_field(&analysis, "Greeter", "greet").is_none());
+        let current = root().join("main.lua");
+        assert!(locate_field(&analysis, &current, "Greeter", "greet").is_none());
     }
 
     #[test]
@@ -1223,14 +1404,14 @@ mod tests {
 ---@class B: A
 ---@field b number
 ";
-        let (analysis, _) = sema_of(src);
+        let (analysis, path) = sema_of(src);
         // The cycle guard stops the walk; each side's own field is still
         // found, and the mutual reference does not hang the lookup.
-        assert!(locate_field(&analysis, "A", "a").is_some());
-        assert!(locate_field(&analysis, "B", "b").is_some());
+        assert!(locate_field(&analysis, &path, "A", "a").is_some());
+        assert!(locate_field(&analysis, &path, "B", "b").is_some());
         // The cycle also means each side can see the other's field, exactly
         // as `env::collect_class`'s own cycle guard resolves it.
-        assert!(locate_field(&analysis, "A", "b").is_some());
+        assert!(locate_field(&analysis, &path, "A", "b").is_some());
     }
 
     #[test]
@@ -1239,10 +1420,135 @@ mod tests {
 ---@class Odd: { x: number }
 ---@field own string
 ";
-        let (analysis, _) = sema_of(src);
+        let (analysis, path) = sema_of(src);
         // The structural-table parent has no name to walk to; `Odd`'s own
         // field is still found, and the lookup does not panic on the shape.
-        assert!(locate_field(&analysis, "Odd", "own").is_some());
+        assert!(locate_field(&analysis, &path, "Odd", "own").is_some());
+    }
+
+    // === defs-vs-project authority (round 4 review R11) ====================
+
+    /// A class declared in a `*.d.lua` definition file collides with the
+    /// same class declared again in an ordinary project file: the search
+    /// order must put the `.d.lua` file first, matching the type merge's own
+    /// "defs wins a same-name collision" rule — not whichever file happens
+    /// to sort first alphabetically among ordinary project files
+    /// (`a_widget.lua` before `defs/widget.d.lua`, the previous behaviour).
+    /// The end-to-end proof that this is also what the *type* resolves to —
+    /// not just which file `locate_field` names — is
+    /// `server.rs`'s `a_defs_declaration_wins_a_same_name_collision_over_a_project_files_own`,
+    /// which goes through the real `[types] defs` manifest wiring this unit
+    /// test does not have access to.
+    #[test]
+    fn locate_field_visits_a_defs_file_before_a_colliding_project_file() {
+        let analysis = analyze_files(&[
+            (
+                "a_widget.lua",
+                "---@class Widget\n---@field id number the id from a_widget\n",
+            ),
+            (
+                "defs/widget.d.lua",
+                "---@meta\n---@class Widget\n---@field id string the id from defs\n",
+            ),
+        ]);
+        let current = root().join("a_widget.lua");
+        let found = locate_field(&analysis, &current, "Widget", "id").expect("found");
+        assert_eq!(found.path, root().join("defs/widget.d.lua"));
+        assert_eq!(found.desc.as_deref(), Some("the id from defs"));
+    }
+
+    /// The one-variable control: with no colliding declaration, a `.d.lua`
+    /// file elsewhere in the workspace does not change which file a single,
+    /// unambiguous declaration resolves to.
+    #[test]
+    fn locate_field_still_finds_a_single_declaration_with_a_defs_file_present() {
+        let analysis = analyze_files(&[
+            ("a_widget.lua", "---@class Widget\n---@field id number\n"),
+            (
+                "defs/other.d.lua",
+                "---@meta\n---@class Other\n---@field y number\n",
+            ),
+        ]);
+        let current = root().join("a_widget.lua");
+        let found = locate_field(&analysis, &current, "Widget", "id").expect("found");
+        assert_eq!(found.path, root().join("a_widget.lua"));
+    }
+
+    // === defs-tier pre-filter (finding 2) ===================================
+
+    /// [`may_declare_class`]'s own unit coverage: word-bounded so neither a
+    /// prefix nor a suffix collision counts, but never a false negative for
+    /// the actual tag shape.
+    #[test]
+    fn may_declare_class_matches_the_real_tag_shape() {
+        assert!(may_declare_class("---@class Widget\n", "Widget"));
+        assert!(may_declare_class("---@class Widget: Base\n", "Widget"));
+        // Multiple spaces/tabs between `class` and the name are still a match
+        // (the luacats grammar tolerates them; a false negative here would
+        // silently drop a genuine defs declaration from the search order).
+        assert!(may_declare_class("---@class   Widget\n", "Widget"));
+    }
+
+    #[test]
+    fn may_declare_class_declines_a_prefix_or_suffix_collision() {
+        // `subclass Widget` — `class` is a suffix of `subclass`, not the
+        // whole preceding word.
+        assert!(!may_declare_class(
+            "-- subclass Widget lives here\n",
+            "Widget"
+        ));
+        // `class WidgetExtra` — `Widget` is a prefix of the actual name.
+        assert!(!may_declare_class("---@class WidgetExtra\n", "Widget"));
+        assert!(!may_declare_class("---@class Other\n", "Widget"));
+    }
+
+    /// The defs-tier filter this backs: a `.d.lua` file whose text cannot
+    /// possibly hold a `---@class Widget` tag is excluded from
+    /// `locate_field`'s visit order entirely, so no `FileSema` is ever built
+    /// for it — the fix finding 2 asks for. Asserted on `search_order`
+    /// directly (white-box) because the *absence* of a wasted `FileSema`
+    /// build has no other externally observable signal — `locate_field`'s
+    /// answer is identical either way, by construction, since the excluded
+    /// file never contains the class.
+    #[test]
+    fn search_order_excludes_a_defs_file_that_cannot_declare_the_class() {
+        let analysis = analyze_files(&[
+            ("main.lua", "---@class Widget\n---@field id number\n"),
+            (
+                "defs/unrelated.d.lua",
+                "---@meta\n---@class Other\n---@field y number\n",
+            ),
+        ]);
+        let current = root().join("main.lua");
+        let order = search_order(&analysis, &current, "Widget");
+        assert!(
+            !order.contains(&root().join("defs/unrelated.d.lua").as_path()),
+            "{order:?}"
+        );
+        // `current` is still visited (first, since the defs tier is empty
+        // after filtering) — this is not just "returns nothing".
+        assert!(order.contains(&current.as_path()), "{order:?}");
+    }
+
+    /// The regression finding 2 explicitly warns against: filtering the defs
+    /// tier by the *original* queried class name would hide a parent class
+    /// that lives only in a defs file whose text never mentions the child's
+    /// name. `search_order` is recomputed per BFS name (`locate_field`'s own
+    /// loop), so the parent's own name is what gets checked against the defs
+    /// tier once the walk reaches it.
+    #[test]
+    fn locate_field_finds_a_parent_field_in_a_defs_file_that_never_mentions_the_child() {
+        let analysis = analyze_files(&[
+            ("main.lua", "---@class Sub : Base\n---@field name string\n"),
+            (
+                "defs/base.d.lua",
+                "---@meta\n---@class Base\n---@field id number the id from base\n",
+            ),
+        ]);
+        let current = root().join("main.lua");
+        let found = locate_field(&analysis, &current, "Sub", "id").expect("found");
+        assert_eq!(found.path, root().join("defs/base.d.lua"));
+        assert_eq!(found.desc.as_deref(), Some("the id from base"));
     }
 
     // === functions() ======================================================

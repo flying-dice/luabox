@@ -562,3 +562,75 @@ Feature: luabox check — cross-file require resolution (#85)
     When I run "luabox check"
     Then the command fails
     And stdout contains "LB0306"
+
+  Scenario: a unicode class name crosses the export boundary
+    # Round 4 review R28: chaos gap (c) — the "very long class name" scenario
+    # above is ~270 ASCII characters, a size axis, not a character-set one.
+    # `take_name` (luacats/mod.rs) explicitly accepts any non-ASCII byte in a
+    # name, so a CJK class name is legal LuaCATS input; nothing pinned it
+    # surviving `class_members`/`export_class`'s `&str` keying across the
+    # `require` boundary.
+    Given a strict project with edition "5.4"
+    And a file "src/config.lua" containing:
+      """
+      ---@class 配置
+      ---@field x number
+      local M = {}
+      return M
+      """
+    And a file "src/main.lua" containing:
+      """
+      ---@param n number
+      local function want(n) end
+      local m = require("config")
+      want(m.x)
+      print(m.nope)
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0306"
+
+  # The remaining two round 4 review R28 chaos gaps do not get a scenario
+  # here:
+  #
+  # * A required module deleted mid-session, then hovered. Hover
+  #   (`textDocument/hover`) is exclusively an LSP-protocol surface —
+  #   `features/lsp/`, driven by the separate `lsp_acceptance` harness. The
+  #   CLI's `check` never hovers anything, so faking this against `luabox
+  #   check` would not pin what the finding actually names. It belongs in
+  #   `features/lsp/hover-require.feature`, outside this file's scope.
+  #
+  # * CRLF through the export seam — genuinely blocked, not merely skipped.
+  #   Every content-bearing `Given` step in this suite writes its fixture
+  #   from a Gherkin docstring, and the `gherkin` crate's `docstring()` rule
+  #   dedents the captured text via `textwrap::dedent`, which walks it with
+  #   `str::lines()` (splits on `\r\n` and `\n` alike) and rejoins with `\n`
+  #   alone — a literal CRLF authored inside a `"""..."""` block is silently
+  #   normalized to LF before any step function ever runs (checked against
+  #   `gherkin` 0.14.0's `docstring()` rule and `textwrap` 0.16.2's
+  #   `dedent`). The BOM half of this same gap (below) dodges the identical
+  #   problem by never putting the mark INSIDE the docstring — `a file
+  #   {string} with a UTF-8 BOM containing:` (`acceptance.rs`) prepends it
+  #   outside the dedented text. CRLF needs the same treatment: a
+  #   `write_file`-driven step that appends `\r\n` line endings itself. That
+  #   step does not exist, and adding one means editing
+  #   `crates/luabox-cli/tests/acceptance.rs`/`support/mod.rs` — outside this
+  #   pass's file ownership.
+  #
+  # A third thing surfaced while probing the BOM half of this gap, worth
+  # flagging even though it stops here rather than becoming a scenario: a
+  # class carrier declared in a file that itself opens with a UTF-8 BOM
+  # crosses `require` with field EXISTENCE resolved correctly (LB0306 still
+  # fires on a genuinely undeclared field, naming the class and pointing at
+  # its declaration), but every DECLARED field's TYPE reads back as `unknown`
+  # at the consumer — `want(p.x)` against `---@field x number` in a BOM'd
+  # `point.lua` reports LB0300 "found `unknown`"; the identical source
+  # without the mark is clean, and the same field resolves correctly to
+  # `number` from A USE SITE INSIDE the BOM'd file itself (same-file
+  # inference is unaffected — only the cross-file merge is). Measured
+  # pre-existing on the round-3 head too, so this delta did not introduce it.
+  # The root cause sits outside `luabox-db` — most likely the `luacats`
+  # harvester or the `merge_file_types`/reification path in `luabox-types` —
+  # so it is reported here rather than fixed or pinned: a scenario asserting
+  # the correct (clean) result fails today, and one asserting the actual
+  # (`unknown`) result would misrepresent a defect as spec.

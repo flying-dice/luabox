@@ -15,11 +15,12 @@ use lsp_types::{
     Documentation, MarkupContent, MarkupKind, ParameterInformation, ParameterLabel, SignatureHelp,
     SignatureInformation,
 };
+use luabox_db::Analysis;
 use luabox_syntax::lua::SyntaxKind;
 use luabox_syntax::lua::SyntaxToken;
 use luabox_syntax::lua::ast::{self, AstNode};
 use luabox_syntax::luacats::TypeExpr;
-use luabox_types::ty::Ty;
+use luabox_types::ty::{FunctionTy, Ty};
 use rowan::TextRange;
 
 use crate::merged_ambient::MergedAmbient;
@@ -61,15 +62,19 @@ struct CallSite {
 /// and completion read (#54, #56), so a method call resolves a signature
 /// exactly when hover/completion resolve the same receiver's members — #50
 /// was this surface silently disagreeing with the other two because it had
-/// neither wired in.
+/// neither wired in. `analysis` backs the cross-file `---@field` description
+/// lookup ([`sema::locate_field`]) for a class-field route (R8): the merged
+/// ambient's shape carries a field's type but not its doc text, the same gap
+/// hover closes with the same call.
 #[must_use]
 pub fn signature_help(
     sema: &FileSema,
     offset: usize,
     exports: &RequireExports,
     ambient: &MergedAmbient,
+    analysis: &Analysis,
 ) -> Option<SignatureHelp> {
-    let call = enclosing_call(sema, offset, exports, ambient)?;
+    let call = enclosing_call(sema, offset, exports, ambient, analysis)?;
     if call.signatures.is_empty() {
         return None;
     }
@@ -115,6 +120,7 @@ fn enclosing_call(
     offset: usize,
     exports: &RequireExports,
     ambient: &MergedAmbient,
+    analysis: &Analysis,
 ) -> Option<CallSite> {
     let mut best: Option<(TextRange, ast::ArgList, Callee)> = None;
     for node in sema.root.descendants() {
@@ -157,9 +163,9 @@ fn enclosing_call(
     }
     let (_, args, callee) = best?;
     let signatures = match callee {
-        Callee::Call(callee) => resolve_call_signatures(sema, &callee, exports, ambient)?,
+        Callee::Call(callee) => resolve_call_signatures(sema, &callee, exports, ambient, analysis)?,
         Callee::Method(receiver, member) => {
-            resolve_method_signatures(sema, receiver, &member, exports, ambient)?
+            resolve_method_signatures(sema, receiver, &member, exports, ambient, analysis)?
         }
     };
     Some(CallSite {
@@ -222,6 +228,7 @@ fn resolve_call_signatures(
     callee: &ast::Expr,
     exports: &RequireExports,
     ambient: &MergedAmbient,
+    analysis: &Analysis,
 ) -> Option<Vec<Signature>> {
     match callee {
         ast::Expr::Name(name_expr) => {
@@ -237,7 +244,14 @@ fn resolve_call_signatures(
             let offset = usize::from(recv_token.text_range().start());
             if let Some(binding) = sema.visible_binding_named(recv_token.text(), offset)
                 && let Some(ty) = requires::receiver_type(sema, exports, binding)
-                && let Some(sig) = signature_from_class_field(ambient, &ty, member.text(), '.')
+                && let Some(sig) = signature_from_class_field(
+                    ambient,
+                    analysis,
+                    &sema.path,
+                    &ty,
+                    member.text(),
+                    '.',
+                )
             {
                 return Some(vec![sig]);
             }
@@ -259,6 +273,7 @@ fn resolve_method_signatures(
     member: &SyntaxToken,
     exports: &RequireExports,
     ambient: &MergedAmbient,
+    analysis: &Analysis,
 ) -> Option<Vec<Signature>> {
     let Some(ast::Expr::Name(recv)) = receiver else {
         return None;
@@ -267,7 +282,8 @@ fn resolve_method_signatures(
     let offset = usize::from(recv_token.text_range().start());
     let binding = sema.visible_binding_named(recv_token.text(), offset)?;
     let ty = requires::receiver_type(sema, exports, binding)?;
-    signature_from_class_field(ambient, &ty, member.text(), ':').map(|s| vec![s])
+    signature_from_class_field(ambient, analysis, &sema.path, &ty, member.text(), ':')
+        .map(|s| vec![s])
 }
 
 /// The primary signature plus any `---@overload`s for a `functions()`-visible
@@ -309,8 +325,29 @@ fn signatures_from_functions(sema: &FileSema, name: &str) -> Option<Vec<Signatur
 /// exactly as they do (#48): `Box<number>:get()`'s return type is `number`,
 /// not the free `T` a bare-name lookup would leave it as. `sep` is `.`/`:`
 /// to match how the call site spells the access.
+///
+/// Peels `?` off the field's type before matching `Ty::Function` (R9):
+/// `---@field cb fun(x: number)?` lowers to `fun(...) | nil` (`Ty` has no
+/// dedicated optional variant — [`luabox_types::ty`]'s doc), so a flat
+/// `let Ty::Function(fun) = &field.ty` misses it exactly the way the
+/// deleted file-local branch's own `sema::as_function_type` used to guard
+/// against for the `TypeExpr` shape (`---@field`'s syntax-side optional
+/// wrapper), a fresh instance of the same hover/signature-help divergence
+/// this PR closed everywhere else: hovering `cb` still types it as a
+/// function, so signature help declining is the two surfaces disagreeing
+/// again.
+///
+/// The field's `---@field` description (R8): `shape.fields` is the merged
+/// ambient's `Ty`, which carries no doc text, so — mirroring
+/// `hover::member_hover`'s own `sema::locate_field` call for the identical
+/// gap — `analysis` is searched for the declaring `---@field` tag. `None`
+/// when no project file's own annotation is found (a purely inferred
+/// signature, or one from a rock/def file `locate_field` does not reach),
+/// same as hover's.
 fn signature_from_class_field(
     ambient: &MergedAmbient,
+    analysis: &Analysis,
+    current: &std::path::Path,
     ty: &TypeExpr,
     member: &str,
     sep: char,
@@ -318,9 +355,7 @@ fn signature_from_class_field(
     let class = sema::named_of(ty)?;
     let shape = ambient.class_members_of(ty)?;
     let field = shape.fields.get(member)?;
-    let Ty::Function(fun) = &field.ty else {
-        return None;
-    };
+    let fun = as_function_ty(&field.ty)?;
     let mut params: Vec<RenderedParam> = fun
         .params
         .iter()
@@ -340,12 +375,46 @@ fn signature_from_class_field(
             doc: None,
         });
     }
+    let doc = sema::locate_field(analysis, current, &class, member)
+        .and_then(|found| found.desc)
+        .unwrap_or_default();
     Some(Signature {
         name: format!("{class}{sep}{member}"),
         params,
         returns: fun.returns.iter().map(ToString::to_string).collect(),
-        doc: String::new(),
+        doc,
     })
+}
+
+/// The function shape of `ty`, peeling `T | nil` — the lowered form of a
+/// LuaCATS `?` (R9). `Ty::Union` is checked for exactly one `Function`
+/// member rather than "the first union member that is a function": a
+/// `fun(...) | string` is not a callable signature help should render
+/// either, and there is no such annotation this project's harvest produces
+/// today, but declining a shape nobody wrote is cheaper than guessing at it.
+fn as_function_ty(ty: &Ty) -> Option<&FunctionTy> {
+    match ty {
+        Ty::Function(fun) => Some(fun),
+        Ty::Union(members) => {
+            let mut found = None;
+            for member in members {
+                match member {
+                    Ty::Function(fun) => {
+                        if found.is_some() {
+                            // A second function member: not the single
+                            // callable shape this renders a signature for.
+                            return None;
+                        }
+                        found = Some(fun.as_ref());
+                    }
+                    Ty::Nil => {}
+                    _ => return None,
+                }
+            }
+            found
+        }
+        _ => None,
+    }
 }
 
 /// [`SigParam`] (from a `---@param`/`fun(...)` [`TypeExpr`][luabox_syntax::luacats::TypeExpr])
@@ -496,7 +565,7 @@ mod tests {
         );
         let base = luabox_types::stdlib_defs(luabox_syntax::lua::Dialect::Lua54);
         let ambient = MergedAmbient::build(base, &analysis.project_types(), &[]);
-        signature_help(sema, offset, &exports, &ambient)
+        signature_help(sema, offset, &exports, &ambient, analysis)
     }
 
     #[test]
@@ -555,6 +624,78 @@ p:translate(1, 2)
             vec!["Point:translate(dx: number, dy: number): Point"]
         );
         assert_eq!(help.active_parameter, Some(0));
+    }
+
+    /// R8: a class field's `---@field` description must reach signature
+    /// help's `documentation` — the same text hover already shows for the
+    /// identical field (`hover::method_call_name_hovers_as_the_class_field`).
+    /// `signature_from_class_field` used to hard-code `doc: String::new()`,
+    /// and `render_signature` gates `documentation` on the doc being
+    /// non-empty, so the drop was silent: no field ever got a `documentation`
+    /// payload through this route.
+    #[test]
+    fn a_class_fields_description_reaches_signature_help_documentation() {
+        let src = "\
+---@class Circle
+---@field grow fun(amount: number) grows the circle
+
+---@type Circle
+local c = nil
+c:grow(2)
+";
+        let (analysis, path) = analyze(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let offset = src.rfind("grow(2)").unwrap() + "grow(".len();
+        let help = help_at(&analysis, &path, &sema, offset).expect("signature help");
+        let doc = help.signatures[0]
+            .documentation
+            .as_ref()
+            .expect("a documentation payload");
+        let text = match doc {
+            Documentation::MarkupContent(markup) => markup.value.clone(),
+            Documentation::String(s) => s.clone(),
+        };
+        assert!(text.contains("grows the circle"), "{text}");
+    }
+
+    /// The one-variable control: a field with no doc line still resolves a
+    /// signature — the fix must not have made resolution itself depend on a
+    /// description being present.
+    #[test]
+    fn a_class_field_with_no_description_still_resolves_with_no_documentation() {
+        let src = "\
+---@class Circle
+---@field grow fun(amount: number)
+
+---@type Circle
+local c = nil
+c:grow(2)
+";
+        let help = help_after_open(src, "grow(").expect("signature help");
+        assert_eq!(help.signatures[0].documentation, None);
+    }
+
+    /// R9: `?` on the field's *type* (`fun(...)?`), not the field itself,
+    /// must still render a signature. `---@field`'s `?` after the name marks
+    /// the *field* optional (`FieldTy::optional`, untouched here); `Ty` has
+    /// no dedicated optional variant (`T?` lowers to `T | nil`), so the flat
+    /// `let Ty::Function(fun) = &field.ty` this route used declined every
+    /// optional-function field outright. Hover already types `cb` as a
+    /// function through the identical merged `Ty` (`sema::render_type`
+    /// renders a union verbatim), so this was a fresh instance of the
+    /// hover/signature-help divergence #50 closed for every other shape.
+    #[test]
+    fn an_optional_function_typed_field_still_renders_a_signature() {
+        let src = "\
+---@class Circle
+---@field cb fun(x: number)?
+
+---@type Circle
+local c = nil
+c.cb(1)
+";
+        let help = help_after_open(src, "cb(").expect("signature help");
+        assert_eq!(labels(&help), vec!["Circle.cb(x: number)"]);
     }
 
     #[test]

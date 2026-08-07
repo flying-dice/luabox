@@ -596,7 +596,14 @@ Feature: luabox lsp — hover and completion on a `require` binding
     When I hover at 2:8 in "main.lua"
     Then the hover text contains "Box.item: number"
 
-  Scenario: an unbound generic class still hovers its free type parameter
+  # Round 4 review R32: this is a one-variable *control*, not #48 coverage —
+  # the pre-fix bare-name lookup produces the identical `Box.item: T` answer
+  # for this fixture (measured on both binaries), so it cannot distinguish
+  # the fix from its absence by itself. It stands beside the falsifiable
+  # bound-case scenario above (which the pre-fix lookup gets wrong, answering
+  # `T` where the fix answers `number`) to show the fix does not change the
+  # *unbound* answer — not to stand in for coverage of the bound one.
+  Scenario: control — an unbound generic class still hovers its free type parameter
     Given a file "box.lua" containing:
       """
       ---@class Box<T>

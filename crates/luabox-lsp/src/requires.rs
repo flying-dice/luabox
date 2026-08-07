@@ -164,6 +164,38 @@ pub fn export_fields(ty: &Ty) -> Option<&BTreeMap<String, FieldTy>> {
     }
 }
 
+/// The `require` binding's module's structural table export
+/// ([`export_fields`]) — but **only** when [`receiver_type`] resolves to
+/// nothing for the same binding (R7).
+///
+/// `receiver_type` already gives an explicit `---@type`/`---@param`
+/// annotation priority over anything inferred from a `require`, and gives a
+/// `require`d module that itself carries a `---@class` priority over the
+/// table shape too — but that precedence lived only inside `receiver_type`
+/// itself. The structural-export lookup used to run as an
+/// unconditional first check ahead of it, on every member surface, so an
+/// explicit annotation naming a real class lost to the plain table the
+/// `require`d module happened to return: `---@type Point` over `local m =
+/// require("m")`, with `m.lua` a bare `local M = {} … return M`, hovered
+/// `(field) m.x: 42` off the table instead of `(field) Point.x: string` off
+/// the annotation. This is the single gate both hover and completion now
+/// check before reading the module's table shape, so a binding with a class
+/// reference of its own — whether written or carried — never falls back to
+/// it, on either surface, again.
+#[must_use]
+pub fn require_struct_fields<'s, 'a>(
+    sema: &'s FileSema,
+    exports: &'a RequireExports,
+    binding: &Binding,
+) -> Option<(&'s str, &'a BTreeMap<String, FieldTy>)> {
+    if receiver_type(sema, exports, binding).is_some() {
+        return None;
+    }
+    let module = require_module_of(sema, binding)?;
+    let fields = exports.get(module).and_then(export_fields)?;
+    Some((module, fields))
+}
+
 /// The class a module export names, when the export crossed the boundary as
 /// a class (#56) — both `---@class` spellings do: the carrier exports as
 /// the class it carries, the instance as its `---@type`. The counterpart of

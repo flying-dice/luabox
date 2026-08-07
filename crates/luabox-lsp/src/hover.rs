@@ -139,9 +139,13 @@ fn member_hover(
         // export: the field comes out of the module's export type, which
         // is the same type the problems pane checks the access against
         // (#54). Qualified by the *module* rather than the local name, so
-        // the hover names what it came from.
-        if let Some(module) = requires::require_module_of(sema, binding)
-            && let Some(fields) = exports.get(module).and_then(requires::export_fields)
+        // the hover names what it came from. Only when the binding carries
+        // no class reference of its own — an explicit `---@type` beats an
+        // inferred module export, the same precedence the rest of the
+        // toolchain uses (R7): `requires::require_struct_fields` is the one
+        // place both hover and completion check that before falling back to
+        // the table shape.
+        if let Some((module, fields)) = requires::require_struct_fields(sema, exports, binding)
             && let Some(field) = fields.get(member.text())
         {
             let q = if field.optional { "?" } else { "" };
@@ -166,7 +170,7 @@ fn member_hover(
             if let Some(field) = shape.fields.get(member.text()) {
                 let q = if field.optional { "?" } else { "" };
                 let code = format!("(field) {class}.{}{q}: {}", member.text(), field.ty);
-                let docs = sema::locate_field(analysis, &class, member.text())
+                let docs = sema::locate_field(analysis, &sema.path, &class, member.text())
                     .and_then(|found| found.desc)
                     .unwrap_or_default();
                 return Some(reply(&code, &docs, &[], member.text_range(), sema));
@@ -661,6 +665,40 @@ print(p.z)
         assert!(text.contains("local m: string"), "{text}");
     }
 
+    /// R7: an explicit `---@type` on a `require` binding must win over the
+    /// module's plain structural table export for a *member* hover too, not
+    /// just the binding hover `an_annotated_require_binding_keeps_its_annotation`
+    /// already pinned. Before the fix, the structural-export arm ran first
+    /// unconditionally and answered `(field) m.x: 42` with no doc, dropping
+    /// the annotation; the caret must resolve through `Point` instead.
+    #[test]
+    fn an_explicit_annotation_on_a_require_binding_wins_a_member_hover_too() {
+        let files = [
+            (
+                "main.lua",
+                "---@class Point\n---@field x number the point's x\n\n---@type Point\nlocal m = require(\"m\")\nprint(m.x)\n",
+            ),
+            ("m.lua", "local M = {}\nM.x = 42\nreturn M\n"),
+        ];
+        let text = at_files(&files, "x)", 0).expect("hover");
+        assert!(text.contains("Point.x: number"), "{text}");
+        assert!(text.contains("the point's x"), "{text}");
+        assert!(!text.contains("m.x"), "{text}");
+    }
+
+    /// The one-variable control: with no `---@type` at all, the same `m.lua`
+    /// module still hovers off its structural table export exactly as
+    /// before — the fix must not have swallowed the plain-table case.
+    #[test]
+    fn an_unannotated_require_bindings_member_still_hovers_the_structural_export() {
+        let files = [
+            ("main.lua", "local m = require(\"m\")\nprint(m.x)\n"),
+            ("m.lua", "local M = {}\nM.x = 42\nreturn M\n"),
+        ];
+        let text = at_files(&files, "x)", 0).expect("hover");
+        assert!(text.contains("(field) m.x: 42"), "{text}");
+    }
+
     #[test]
     fn a_require_of_a_module_that_does_not_exist_hovers_gracefully() {
         let files = [("main.lua", "local m = require(\"absent\")\nprint(m)\n")];
@@ -885,6 +923,34 @@ print(p.z)
             ),
         ];
         assert_eq!(at_files(&files, "nope", 0), None);
+    }
+
+    // === an alias-typed class field (round 4 review R27) ==================
+    //
+    // Hover and completion both resolve a class field's member through the
+    // merged ambient's `Ty` now (#56), and `Ty` has no dedicated alias
+    // variant — an `---@alias` always expands to its underlying shape at
+    // lowering time (`lower.rs`'s own doc). No test declared this shape on
+    // either surface before; this pins hover's half.
+
+    #[test]
+    fn an_alias_typed_field_hovers_with_the_alias_expanded() {
+        let src = "\
+---@alias Direction \"up\"|\"down\"
+
+---@class Compass
+---@field dir Direction the facing direction
+
+---@type Compass
+local c = nil
+print(c.dir)
+";
+        let text = at(src, "dir)", 0).expect("hover");
+        assert!(text.contains("Compass.dir: \"up\"|\"down\""), "{text}");
+        assert!(text.contains("the facing direction"), "{text}");
+        // The alias name itself does not leak into the rendered type — `Ty`
+        // has no alias variant, so it cannot round-trip the spelling.
+        assert!(!text.contains("Direction"), "{text}");
     }
 
     #[test]

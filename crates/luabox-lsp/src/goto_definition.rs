@@ -147,7 +147,7 @@ fn member_definition(
                 || !shape.indexers.is_empty()
                 || shape.array.is_some()
         })
-        && let Some(found) = sema::locate_field(analysis, &class, member.text())
+        && let Some(found) = sema::locate_field(analysis, &sema.path, &class, member.text())
     {
         let span = found.span;
         let range = TextRange::new(

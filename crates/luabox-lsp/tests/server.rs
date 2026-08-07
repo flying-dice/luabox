@@ -3596,14 +3596,26 @@ fn file_watchers_are_registered_when_the_client_supports_it() {
 
 #[test]
 fn no_watchers_are_registered_without_dynamic_registration() {
-    // The default harness advertises nothing, so the first server message is
-    // a publish, never a registration request.
+    // The default harness advertises nothing, so the server must never ask
+    // to register file watchers for this session — that is the property
+    // this test measures, not which message happens to arrive first. It
+    // does not pin position: a `window/logMessage` trace (merged-ambient
+    // cache observability, R26) is ordinary protocol traffic a client
+    // tolerates ahead of the publish, same as `WorkDoneProgressCreate` is
+    // already tolerated by `recv` for every other test in this file. What
+    // would still fail this test is a `client/registerCapability` request
+    // arriving before the diagnostics publish for the opened document.
     let client = start(&[]);
     let uri = client.uri("main.lua");
     client.open_async(&uri, TYPE_OK);
-    match client.recv() {
-        Message::Notification(not) => assert_eq!(not.method, PublishDiagnostics::METHOD),
-        other => panic!("expected diagnostics, got {other:?}"),
+    loop {
+        match client.recv() {
+            Message::Request(req) if req.method == RegisterCapability::METHOD => {
+                panic!("watcher registration sent without dynamic_registration support")
+            }
+            Message::Notification(not) if not.method == PublishDiagnostics::METHOD => break,
+            _ => {}
+        }
     }
     client.shutdown();
 }

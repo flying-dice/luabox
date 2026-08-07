@@ -118,7 +118,10 @@ fn member_items(
 /// Members of a `require` binding: the named fields of the required module's
 /// export type, out of the shared resolution the type pass checks against
 /// (#54). Declines for every receiver that is not one, so the caller's other
-/// routes are unaffected.
+/// routes are unaffected. Only when the binding carries no class reference of
+/// its own — an explicit `---@type` beats an inferred module export, the
+/// same precedence `hover::member_hover` uses (R7):
+/// `requires::require_struct_fields` is the one shared gate.
 ///
 /// Qualified by the *module* rather than the local name in the detail line,
 /// matching the hover, so an item names where it came from rather than what
@@ -134,10 +137,7 @@ fn require_member_items(
     let Some(binding) = sema.visible_binding_named(receiver, recv_start) else {
         return;
     };
-    let Some(module) = requires::require_module_of(sema, binding) else {
-        return;
-    };
-    let Some(fields) = exports.get(module).and_then(requires::export_fields) else {
+    let Some((module, fields)) = requires::require_struct_fields(sema, exports, binding) else {
         return;
     };
     for (name, field) in fields {
@@ -738,6 +738,31 @@ b.
         assert_eq!(item(&items, "item").detail.as_deref(), Some("Box.item: T"));
     }
 
+    // === an alias-typed class field (round 4 review R27) ==================
+    //
+    // Completion's `ambient_member_items` resolves through the same merged
+    // `Ty` hover does (#56); no test declared an `---@alias`-typed field on
+    // either surface before. This pins completion's half.
+
+    #[test]
+    fn an_alias_typed_field_offers_the_alias_expanded_in_its_detail() {
+        let src = "\
+---@alias Direction \"up\"|\"down\"
+
+---@class Compass
+---@field dir Direction
+
+---@type Compass
+local c = nil
+c.
+";
+        let items = after(&[("main.lua", src)], "c.");
+        assert_eq!(
+            item(&items, "dir").detail.as_deref(),
+            Some("Compass.dir: \"up\"|\"down\"")
+        );
+    }
+
     #[test]
     fn a_concat_operator_is_not_a_member_trigger() {
         // `..` is concatenation, so scope completion applies, not members.
@@ -1001,6 +1026,47 @@ local visible = 2
         assert_eq!(
             item(&items, "version").detail.as_deref(),
             Some("other.version: \"1.0\"")
+        );
+    }
+
+    /// R7: an explicit `---@type` on a `require` binding must win over the
+    /// module's plain structural table export in completion too — the same
+    /// precedence hover uses (`an_explicit_annotation_on_a_require_binding_wins_a_member_hover_too`).
+    /// Before the fix, `require_member_items` ran unconditionally and
+    /// inserted `x` from the table shape first; `ambient_member_items`'s
+    /// `or_insert_with` could then never override it with `Point.x`.
+    #[test]
+    fn an_explicit_annotation_on_a_require_binding_wins_member_completion_too() {
+        let files = [
+            (
+                "main.lua",
+                "---@class Point\n---@field x number\n\n---@type Point\nlocal m = require(\"m\")\nm.\n",
+            ),
+            ("m.lua", "local M = {}\nM.x = 42\nreturn M\n"),
+        ];
+        let items = after(&files, "m.");
+        assert_eq!(
+            item(&items, "x").detail.as_deref(),
+            Some("Point.x: number"),
+            "{:?}",
+            labels(&items)
+        );
+    }
+
+    /// The one-variable control: with no `---@type` at all, the same module
+    /// still offers its structural export exactly as before.
+    #[test]
+    fn an_unannotated_require_bindings_member_completion_still_offers_the_structural_export() {
+        let files = [
+            ("main.lua", "local m = require(\"m\")\nm.\n"),
+            ("m.lua", "local M = {}\nM.x = 42\nreturn M\n"),
+        ];
+        let items = after(&files, "m.");
+        assert_eq!(
+            item(&items, "x").detail.as_deref(),
+            Some("m.x: 42"),
+            "{:?}",
+            labels(&items)
         );
     }
 

@@ -193,9 +193,41 @@ mod tests {
         (host.snapshot(), path)
     }
 
+    /// A workspace root every multi-file test lives under, so cross-file
+    /// `require` resolution finds every sibling.
+    fn root() -> PathBuf {
+        PathBuf::from(if cfg!(windows) { r"C:\ws" } else { "/ws" })
+    }
+
+    /// [`analyze`], generalised to several files sharing a workspace root —
+    /// the first file is the one under test.
+    fn analyze_files(files: &[(&str, &str)]) -> (Analysis, PathBuf) {
+        let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
+        host.set_root(root());
+        let mut first = None;
+        for (rel, text) in files {
+            let path = root().join(rel);
+            first.get_or_insert_with(|| path.clone());
+            host.apply_change(Change::SetFileText {
+                path,
+                dialect: Dialect::Lua54,
+                text: (*text).to_string(),
+            });
+        }
+        (host.snapshot(), first.expect("at least one file"))
+    }
+
     /// Hints over the byte range `start..end` of `src`.
     fn hints_in(src: &str, start: usize, end: usize) -> Vec<InlayHint> {
         let (analysis, path) = analyze(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let types = analysis.binding_types(&path).expect("binding types");
+        inlay_hints(&sema, types.bindings(), types.fn_returns(), start, end)
+    }
+
+    /// [`hints_in`] across `files`, hinting the first (`current`) file.
+    fn hints_in_files(files: &[(&str, &str)], start: usize, end: usize) -> Vec<InlayHint> {
+        let (analysis, path) = analyze_files(files);
         let sema = FileSema::new(&analysis, &path).expect("sema");
         let types = analysis.binding_types(&path).expect("binding types");
         inlay_hints(&sema, types.bindings(), types.fn_returns(), start, end)
@@ -249,6 +281,30 @@ local function g() return \"s\" end
             "{:?}",
             labels(&hints)
         );
+    }
+
+    // === a required module's carrier class (round 3 review F44, round 4
+    // review R31) ===========================================================
+    //
+    // F44 pinned the regression one layer down, at `binding_types` itself
+    // (`luabox-db/tests/analysis.rs`'s
+    // `display_mode_resolves_a_required_carriers_class_across_files`): the
+    // display-mode ambient needs the project-wide class merge, or a
+    // `require`d carrier's constructor return stays opaque. No test read
+    // that fix through the inlay-hint surface itself — this is that test.
+
+    #[test]
+    fn a_required_class_carrier_binding_hints_with_the_class_name() {
+        let files = [
+            ("main.lua", "local w = require(\"widget\")\nprint(w)\n"),
+            (
+                "widget.lua",
+                "---@class Widget\n---@field id number\nlocal W = {}\nreturn W\n",
+            ),
+        ];
+        let src = files[0].1;
+        let hints = hints_in_files(&files, 0, src.len());
+        assert!(labels(&hints).contains(&": Widget"), "{:?}", labels(&hints));
     }
 
     #[test]
