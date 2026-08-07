@@ -1,0 +1,128 @@
+# Verdict regression oracle (scripts/tests/verdict-differential.sh):
+# `luabox check --format json`'s diagnostic-code set, re-derived per case in
+# scripts/tests/verdict-differential/ and compared to the committed
+# expectations. Merge-blocking: no continue-on-error — a verdict drift
+# against a committed claim fails the job.
+#
+# Why this job exists, and why it is separate from luals-parity.yml despite
+# building the exact same binary the exact same way: PR #61's five review
+# rounds each found the checker's verdict had silently drifted from develop,
+# every time discovered by a reviewer building two binaries and diffing by
+# hand — that capability had no home in CI at all. luals-parity.yml measures
+# agreement with an INDEPENDENT tool (lua-language-server); this measures
+# agreement with luabox's OWN PAST verdict, committed once rather than
+# re-derived from a rebuilt baseline on every run (see
+# scripts/tests/verdict-differential.sh's header for why re-deriving live —
+# the shape both differential.yml and luals-parity.yml use for their
+# oracles — is the wrong tradeoff for a self-comparison). Same shipped
+# binary, same build step, genuinely different question, so its own job
+# rather than a step bolted onto luals-parity's.
+name: verdict-differential
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # The full dependency closure luals-parity.yml's own comment derives
+      # for the `luabox` binary — copied verbatim rather than re-derived,
+      # because it is the SAME binary built the SAME way (`cargo build
+      # --release --bin luabox`): every crate reachable by walking
+      # luabox-cli's Cargo.toml, including luabox-lsp's own dependency
+      # luabox-db even though `check` never calls into it — a broken
+      # luabox-db is a broken build of the binary this job also needs, and a
+      # paths filter that cannot see that source just times out or silently
+      # doesn't run. Cargo.lock, the workspace Cargo.toml and
+      # rust-toolchain.toml are the pin `--locked` resolves against — a
+      # dependency or toolchain bump can move a row's codes column exactly
+      # like a source change would.
+      - "crates/luabox-types/**"
+      - "crates/luabox-cli/**"
+      - "crates/luabox-hir/**"
+      - "crates/luabox-syntax/**"
+      - "crates/luabox-diag/**"
+      - "crates/luabox-manifest/**"
+      - "crates/luabox-lint/**"
+      - "crates/luabox-lsp/**"
+      - "crates/luabox-lower/**"
+      - "crates/luabox-bundle/**"
+      - "crates/luabox-db/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      # This gate's own inputs. Listed explicitly, not swept in by a
+      # directory glob alone — a PR touching only the driver or only the
+      # self-test must still start both jobs below (a prior round shipped a
+      # self-test CI never ran at all; see verdict-differential-selftest.sh's
+      # header).
+      - "scripts/tests/verdict-differential.sh"
+      - "scripts/tests/verdict-differential-selftest.sh"
+      - "scripts/tests/verdict-differential/**"
+      - ".github/workflows/verdict-differential.yml"
+  pull_request:
+    paths:
+      # See the matching comment on the `push` trigger above — same
+      # closure, same reasoning, kept in sync deliberately (two triggers,
+      # one filter; luals-parity.yml's own comment records what drift
+      # between two hand-maintained copies costs).
+      - "crates/luabox-types/**"
+      - "crates/luabox-cli/**"
+      - "crates/luabox-hir/**"
+      - "crates/luabox-syntax/**"
+      - "crates/luabox-diag/**"
+      - "crates/luabox-manifest/**"
+      - "crates/luabox-lint/**"
+      - "crates/luabox-lsp/**"
+      - "crates/luabox-lower/**"
+      - "crates/luabox-bundle/**"
+      - "crates/luabox-db/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "scripts/tests/verdict-differential.sh"
+      - "scripts/tests/verdict-differential-selftest.sh"
+      - "scripts/tests/verdict-differential/**"
+      - ".github/workflows/verdict-differential.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  # The gate on the gate — same discipline as luals-parity.yml's
+  # differential-selftest and mutants.yml's gate-selftest, for the same
+  # reason: a self-test that exists but that nothing in CI ever runs is
+  # exactly as useless as no self-test (R23/F25 on the sibling gate).
+  # luabox is STUBBED by the self-test itself (STUB-LUABOX-DIAG marker
+  # comments, no real typecheck), so this job needs no Rust toolchain and no
+  # release build — seconds, not the several minutes below it.
+  verdict-differential-selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Self-test the verdict-differential driver's judgement
+        run: bash scripts/tests/verdict-differential-selftest.sh
+
+  verdict-differential:
+    needs: verdict-differential-selftest
+    runs-on: ubuntu-latest
+    # No external tool to install (unlike luals-parity.yml) — a release
+    # build plus a handful of one-file typechecks. A hang has no other
+    # signal, so this still gets its own budget rather than the 360-minute
+    # default.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: verdict-differential
+
+      - name: Build luabox (release)
+        run: cargo build --locked --release --bin luabox
+
+      - name: Run the verdict regression oracle
+        run: bash scripts/tests/verdict-differential.sh
