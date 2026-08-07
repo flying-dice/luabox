@@ -4875,3 +4875,86 @@ function partial(a, b) end
         );
     }
 }
+
+#[cfg(test)]
+mod publish_carrier_method_tests {
+    use crate::ty::Ty;
+    use luabox_syntax::lua::{Dialect, parse};
+
+    /// The published class surface for one module, through the same
+    /// `module_surface` entry point the CLI and LSP use — `TypeEnv`'s own
+    /// test `surface` helper passes no carrier map, so it never populates
+    /// `ClassDef::methods` and cannot see this behaviour at all.
+    fn methods_of(source: &str, class: &str) -> crate::ty::FieldTy {
+        let parsed = parse(source, Dialect::Lua54);
+        assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
+        let types = crate::module_surface(&parsed, "mod.lua", None).types;
+        let def = types.classes.get(class).expect("class collected");
+        def.methods
+            .values()
+            .next()
+            .expect("carrier method published")
+            .clone()
+    }
+
+    /// A carrier method with **no** `return` statement must be published
+    /// unchanged: `returns` is empty, so there is no inferred return type to
+    /// promote, and promoting anyway publishes it as an *annotated* signature
+    /// declaring it returns nothing — a stronger claim than the code makes,
+    /// turning "inference found nothing" into "this returns no value".
+    ///
+    /// Measured: the guard is `has_return_annotation || returns.is_empty()`.
+    /// With `||` swapped for `&&`, this method is promoted and
+    /// `has_return_annotation` flips to `true` on an empty `returns` list.
+    /// That mutant survived the full suite before this test existed.
+    #[test]
+    fn a_carrier_method_with_no_return_statement_is_published_unpromoted() {
+        let method = methods_of(
+            "\
+---@class Silent
+local S = {}
+function S:noop() end
+return S
+",
+            "Silent",
+        );
+        let Ty::Function(sig) = &method.ty else {
+            panic!("carrier method is a function, got {:?}", method.ty);
+        };
+        assert!(
+            sig.returns.is_empty(),
+            "fixture must have no inferred returns: {:?}",
+            sig.returns
+        );
+        assert!(
+            !sig.has_return_annotation,
+            "a method inference found no return type for must not be published \
+             as declaring one"
+        );
+    }
+
+    /// The control separating the two halves of the same guard, one variable
+    /// apart: this body *does* return, so promotion is correct — that is
+    /// finding 2's fix, and without it the return type is erased at this seam.
+    #[test]
+    fn a_carrier_method_with_an_inferred_return_is_published_promoted() {
+        let method = methods_of(
+            "\
+---@class Talker
+local T = {}
+function T:speak() return \"hi\" end
+return T
+",
+            "Talker",
+        );
+        let Ty::Function(sig) = &method.ty else {
+            panic!("carrier method is a function, got {:?}", method.ty);
+        };
+        assert!(!sig.returns.is_empty(), "fixture must infer a return type");
+        assert!(
+            sig.has_return_annotation,
+            "an inferred return type must survive publication into the class \
+             surface (finding 2)"
+        );
+    }
+}
