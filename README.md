@@ -166,7 +166,11 @@ enforced.
 Every remaining gap is
 documented honestly in
 [**LIMITATIONS.md**](docs/03-reference/02-limitations.md). Read it before you rely on luabox for
-anything load-bearing.
+anything load-bearing. Where two `---@class` declarations for one name
+disagree — two blocks, two files, or two parents — the winner is tabulated
+per member kind in the
+[class-merge precedence matrix](docs/03-reference/03-class-merge-precedence.md),
+including which cells lua-language-server agrees with.
 
 ---
 

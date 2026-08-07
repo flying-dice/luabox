@@ -538,9 +538,11 @@ impl DiamondGuard {
 ///   *different* classes (unrelated parents, or the same generic ancestor
 ///   reached twice with different bindings) into one shape. `is_first_binding`
 ///   is [`DiamondGuard::visit`]'s distinction between a name's first-ever
-///   binding in the walk and a competing repeat of it — the two
-///   arrival shapes the indexer rule (only) tells apart (see
-///   [`indexer_resolution`]).
+///   binding in the walk (`true`, a genuinely unrelated sibling parent) and a
+///   competing repeat of it (`false`, the same ancestor reached again with a
+///   different binding — a diamond conflict) — the distinction both
+///   `member_wins` and [`indexer_resolution`] read to give the two shapes
+///   their own (opposite) winners.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MemberArrival {
     Duplicate,
@@ -549,16 +551,32 @@ enum MemberArrival {
 
 /// The single "does an incoming value replace what's already on record"
 /// rule for every member kind whose precedence is a plain overwrite-or-keep
-/// decision — `---@field`s, carrier methods, and visibility scopes.
-/// Value-agnostic (`V` is never inspected, only whether it is present),
-/// which is what lets one function serve all three: matrix rows
-/// `field-B`/`field-C` (duplicate: first wins), `field-D`/`field-F`
-/// (ancestor fold: last-visited edge wins), and their method/visibility
-/// counterparts.
+/// decision — `---@field`s, carrier methods, and (for `Duplicate` only)
+/// visibility scopes; visibility's own `AncestorFold` shape is decided
+/// separately, by `walk_ancestor_names` (see its doc comment). Value-agnostic
+/// (`V` is never inspected, only whether it is present), which is what lets
+/// one function serve all these: matrix rows `field-B`/`field-C` (duplicate:
+/// first wins), `field-D` (ancestor fold, first binding: first-**listed**
+/// parent wins — luals parity, production-readiness-assessment-9natxz A1),
+/// `field-F` (ancestor fold, repeat binding: last-**visited** edge wins), and
+/// their method/visibility counterparts.
 fn member_wins<V>(existing: Option<&V>, arrival: MemberArrival) -> bool {
     match (existing, arrival) {
+        (None, _) => true,
         (Some(_), MemberArrival::Duplicate) => false,
-        (None, _) | (Some(_), MemberArrival::AncestorFold { .. }) => true,
+        // Two genuinely *different* classes each declaring their own value
+        // for this key (unrelated parents, `is_first_binding: true`) is
+        // first-listed-wins — luals parity (compiler.lua:369-375/424,
+        // production-readiness-assessment-9natxz A1): the first sibling
+        // visited claims the key and every later one is blocked, exactly
+        // like `indexer_resolution`'s `Keep` arm for the identical case. The
+        // *same* ancestor reached again with a genuinely different binding
+        // (a diamond conflict, `is_first_binding: false`) is unaffected by
+        // this fix and stays last-visited-edge-wins, matching indexer's
+        // `Overwrite` arm — that shape has no luals analogue to disagree
+        // with (luals 3.13.5 has no generic `---@class` support at all) and
+        // is not part of this correction.
+        (Some(_), MemberArrival::AncestorFold { is_first_binding }) => !is_first_binding,
     }
 }
 
@@ -573,8 +591,12 @@ enum IndexerResolution {
 /// `---@field [K] V` indexer precedence — the single rule for every seam
 /// that must decide two indexer values for the same key
 /// (`docs/03-reference/03-class-merge-precedence.md`'s indexer table).
-/// Indexers need a rule [`member_wins`] cannot express: `AncestorFold`'s two
-/// sub-cases disagree with each other, not just with `Duplicate`.
+/// [`member_wins`] answers the identical `is_first_binding` question now
+/// (production-readiness-assessment-9natxz A1 brought fields onto the same
+/// rule this function already had), but a map's `insert` can't express
+/// "leave the existing slot alone" the way a `Vec` of `(key, value)` pairs
+/// needs to — hence the three-way `IndexerResolution` here instead of
+/// `member_wins`'s bool.
 ///
 /// - `Duplicate` (same-file `absorb_block` / cross-file `merge_file_types`):
 ///   the **first** declaration wins — an existing slot is always kept
@@ -582,7 +604,7 @@ enum IndexerResolution {
 /// - `AncestorFold` with `is_first_binding: true` — two genuinely
 ///   *different* classes each declaring their own indexer for the same key
 ///   (unrelated parents): the **first**-listed one wins, so a later
-///   sibling's value is dropped (`indexer-D`).
+///   sibling's value is dropped (`indexer-D`) — matching fields.
 /// - `AncestorFold` with `is_first_binding: false` — the *same* ancestor
 ///   reached twice with different bindings (a diamond): the **last**-visited
 ///   edge wins, exactly like fields (`indexer-F`).
@@ -2034,10 +2056,13 @@ impl TypeEnv {
     ///   A repeat that does need to re-run reasserts its binding exactly at
     ///   its own listed position — the same code path a fresh visit takes,
     ///   writing directly into the shared `shape` accumulator below — which
-    ///   is what lets a later, competing edge still overwrite an earlier
-    ///   one's contribution the way its later position demands
-    ///   (last-listed-parent-wins for fields; see the indexer loop below for
-    ///   why indexers need a narrower rule than "always overwrite").
+    ///   is what lets a later, competing (`is_first_binding: false`) edge
+    ///   still overwrite an earlier one's contribution the way its later
+    ///   *visit* position demands (last-visited-edge-wins for a diamond
+    ///   conflict on fields; see the indexer loop below, and `member_wins`,
+    ///   for why a genuinely unrelated sibling parent — `is_first_binding:
+    ///   true` — is the opposite rule, first-**listed**-wins, matching
+    ///   luals).
     fn collect_class(
         &self,
         name: &str,
@@ -2076,6 +2101,72 @@ impl TypeEnv {
                     bound.insert(param.clone(), Ty::Unknown);
                 }
             }
+            // This class's OWN contribution goes first — carrier-attached
+            // members, then `---@field` declarations, with a declaration
+            // *unconditionally* overriding a same-name attachment on THIS
+            // SAME class (annotations are authoritative, matrix row
+            // method-G) — resolved into a local map, then merged into
+            // `shape` **before** any parent is even recursed into. This
+            // ordering, not just the merge rule, is what makes "own
+            // overrides inherited" hold unconditionally: luals's own
+            // mechanism runs a class's own phase 1-3 (fields, then carrier
+            // attachments) and locks each via `copyToSearched` *before*
+            // phase 4 (extends) ever runs (compiler.lua:342-509), so an
+            // ancestor's contribution for a key this class already declared
+            // is never even considered. Mirroring that order here means the
+            // `is_first_binding`-gated merge below — the same one two
+            // *different* classes' contributions go through — already
+            // blocks a parent from overwriting this class's own value with
+            // no separate carve-out needed: by the time a parent is
+            // recursed into, this class's own declarations have already
+            // claimed their keys in `shape`.
+            //
+            // Doing this the other way around — parents first, own second,
+            // both still merged through the identical `is_first_binding`
+            // gate — was tried and is wrong: a root (or any first-visited)
+            // class's own `is_first_binding` is `true` the same as an
+            // unrelated sibling's, so its own fields loop would refuse to
+            // overwrite what its *own* parent recursion, moments earlier in
+            // the very same visit, had just written — breaking the most
+            // basic single-inheritance override
+            // (`env::tests::temp_probe_single_parent_override`) and the
+            // pinned `a_later_empty_sibling_does_not_clobber_an_earlier_
+            // siblings_field_override` regression alike. Own-first avoids
+            // that: this class's own value is already sitting in `shape`
+            // *before* its own parent's `is_first_binding` is even
+            // computed, so the parent's later, `is_first_binding`-gated
+            // attempt to write the same key is correctly refused as "someone
+            // already claimed this" — precedence, not conflation.
+            let mut own: BTreeMap<String, FieldTy> = BTreeMap::new();
+            for (member, ty) in &def.methods {
+                own.insert(member.clone(), crate::generics::subst_field(ty, &bound));
+            }
+            for (field, ty) in &def.fields {
+                own.insert(field.clone(), crate::generics::subst_field(ty, &bound));
+            }
+            // The cross-ancestor question this same gate also answers: does
+            // this class's (already internally resolved) own contribution
+            // override what an earlier-processed *different* class already
+            // put in `shape`? Two genuinely *unrelated* parents each
+            // declaring their own value for this key keep the
+            // **first**-listed one — luals parity (production-readiness-
+            // assessment-9natxz A1: this codebase used to overwrite
+            // unconditionally here, i.e. last-listed-wins, reasoned from its
+            // own code comments rather than from luals's actual
+            // `compiler.lua:369-375`/`424` behaviour, and was backwards) —
+            // while the *same* ancestor reached again with a genuinely
+            // different binding (a diamond conflict) still overwrites, i.e.
+            // last-**visited**-edge-wins, unaffected by that fix since luals
+            // has no generic-class support to disagree with there. Matches
+            // `indexer_resolution` below.
+            for (member, value) in own {
+                if member_wins(
+                    shape.fields.get(&member),
+                    MemberArrival::AncestorFold { is_first_binding },
+                ) {
+                    shape.fields.insert(member, value);
+                }
+            }
             for parent in &def.parents {
                 // A parent's arguments are written in *this* class's parameter
                 // vocabulary — `---@class Cell<T> : Slot<T>` passes its own `T`
@@ -2086,32 +2177,6 @@ impl TypeEnv {
                     .map(|arg| crate::generics::subst_ty(arg, &bound))
                     .collect();
                 self.collect_class(&parent.name, &parent_args, shape, guard, erase_free);
-            }
-            // Carrier-attached members first, then `---@field` declarations —
-            // both override inherited members, and a declaration wins over a
-            // same-name attachment (annotations are authoritative). Always
-            // overwrite: whichever edge visits a field-declaring class last
-            // is this codebase's winner for a plain member, independently of
-            // whether that class is genuinely unrelated to any sibling edge
-            // or is the same shared ancestor bound differently — measured
-            // against `develop` (round 5 review N6's own field control).
-            for (member, ty) in &def.methods {
-                let value = crate::generics::subst_field(ty, &bound);
-                if member_wins(
-                    shape.fields.get(member),
-                    MemberArrival::AncestorFold { is_first_binding },
-                ) {
-                    shape.fields.insert(member.clone(), value);
-                }
-            }
-            for (field, ty) in &def.fields {
-                let value = crate::generics::subst_field(ty, &bound);
-                if member_wins(
-                    shape.fields.get(field),
-                    MemberArrival::AncestorFold { is_first_binding },
-                ) {
-                    shape.fields.insert(field.clone(), value);
-                }
             }
             // Both halves of an indexer are substituted, matching
             // `generics::subst_table` — the reference implementation every
@@ -3276,6 +3341,37 @@ mod tests {
         let parsed = parse(source, Dialect::Lua54);
         assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
         TypeEnv::build(&parsed)
+    }
+
+    #[test]
+    fn a_single_parents_own_field_declaration_overrides_its_inherited_value() {
+        // production-readiness-assessment-9natxz A1's own regression: the
+        // *first* shape of the `member_wins`/`is_first_binding` fix merged
+        // `own` (this class's own fields/methods) into `shape` using the
+        // same gate as two unrelated siblings, WITHOUT moving `own` ahead of
+        // the parents loop — and a root (or any first-visited) class's own
+        // `is_first_binding` is `true` exactly like an unrelated sibling's,
+        // so `Sub`'s own field refused to overwrite what `Sub`'s own
+        // recursion into `Base`, moments earlier in the same visit, had just
+        // written. The most basic single-inheritance override in the
+        // language broke before this shipped. `collect_class` now merges a
+        // class's own contribution *before* recursing into its parents (see
+        // its doc comment), which fixes this by construction: `Sub`'s own
+        // value claims the key before `Base` is ever visited.
+        let env = env_of(
+            "\
+---@class Base
+---@field x number
+---@class Sub : Base
+---@field x string
+",
+        );
+        let shape = env.class_shape("Sub").expect("declared class");
+        assert_eq!(
+            shape.fields["x"].ty,
+            Ty::String,
+            "Sub's own override must win over Base's inherited field"
+        );
     }
 
     #[test]

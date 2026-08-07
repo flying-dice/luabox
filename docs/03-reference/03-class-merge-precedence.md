@@ -67,6 +67,17 @@ write-back their own doc comments already promised), and the matrix tables
 further down reflect the new, consistent verdict, not the one that was
 measured.
 
+Finding 6, added later (production-readiness-assessment-9natxz A1), is a
+different kind of check than 1-5: those five were only ever compared against
+`develop`, luabox's own prior binary — a self-consistency check, not a
+luals-parity one. Finding 6 was found by reading lua-language-server 3.13.5's
+own source and measuring the pinned binary directly, and it overturns a
+"current vs develop agree" cell rather than a "current vs develop disagree"
+one — both binaries resolved field/method's unrelated-parents shape
+last-listed, and both were wrong against luals. Read it as a correction
+against the reference implementation, not against this repository's own
+history.
+
 1. **FIXED. Same-file inheritance of a carrier-attached method through
    `: Parent` used to not resolve at all.** `---@class C : P1` where `P1`'s
    carrier attaches `function T1:m()` in the *same file* read `c.m` as
@@ -159,9 +170,12 @@ measured.
    parents in *reverse* declared order, so the LIFO pop yields the
    first-declared parent first — ordinary left-to-right preorder traversal.
    Visibility's unrelated-parents shape now resolves **first-listed-parent-
-   wins**, matching indexer and operator for the identical shape; field's own
-   unrelated-parents rule stays last-listed, per the intentional field/
-   indexer asymmetry the indexer table already calls out below.
+   wins**, matching indexer and operator for the identical shape. At the
+   time this finding was fixed, field's own unrelated-parents rule was
+   believed to be a deliberate last-listed exception to this same-shape
+   agreement — it was not; see finding 6, which found that belief backwards
+   against luals and brought field (and method) onto the same first-listed
+   rule this finding already gave visibility.
    `walk_ancestor_names`'s other two consumers (`class_method_names`,
    `is_subclass`) are order-independent and unaffected.
 5. **FIXED. A bare (unbound) generic parameter used to leak its literal name
@@ -194,8 +208,36 @@ measured.
    (the `require`-seam's own `erased != resolved` comparison) are
    deliberately untouched — they answer a different question ("what does
    this class's template look like") than a value reference does.
+6. **FIXED. Field and method's unrelated-parents shape resolved
+   last-listed-parent-wins — backwards against lua-language-server, which
+   this whole page exists to be a drop-in for** (production-readiness-
+   assessment-9natxz A1). Unlike findings 1-5, which were measured only
+   against luabox's own prior binary (`develop`), this one was checked
+   against luals 3.13.5 itself, by reading `script/vm/compiler.lua:369-509`
+   and then confirming the reading by measurement: `---@class C : P1, P2`
+   where both parents declare the same member resolves it to **P1's**
+   type in luals, and swapping the parent list to `C : P2, P1` flips the
+   winner to P2's — first-listed, not last-listed, and this holds
+   identically for a plain `---@field` and for a carrier-attached method
+   (the method/carrier lookup runs inside the same `searchClass` recursion
+   the `extends` walk drives, so it inherits the identical gate). luabox
+   previously resolved last-listed for both, and `docs/03-reference/
+   02-limitations.md` defended that as an "intentional asymmetry" against
+   indexer/operator/visibility's first-listed rule for the identical
+   shape — reasoning that traced back to luabox's own code comments, never
+   to luals. It was wrong: luals has exactly one rule here, first-listed,
+   and applies it uniformly across every member kind that inherits at
+   all. Field and method now resolve first-listed too, closing the
+   asymmetry findings 3 and 4 already narrowed to "field is the one
+   deliberate exception" — field was never a deliberate exception, it was
+   the one cell nobody had checked against the actual reference
+   implementation. This is a **verdict-changing** fix: a project with
+   `---@class C : P1, P2` where P1 and P2 disagree on a shared member's
+   type, previously clean under `luabox check` reading P2's type, now
+   resolves to P1's — matching what `lua-language-server --check` already
+   told that project. See `CHANGELOG.md` for the user-facing statement.
 
-**A sixth, previously unfixtured asymmetry is also fixed by this change:**
+**A further, previously unfixtured asymmetry is also fixed by this change:**
 `push_operator_overload` deduped a byte-identical `---@operator` repeat when
 called from `merge_file_types` (cross-file) but not from `absorb_block`
 (same-file) — the same-file seam could carry two identical copies of one
@@ -223,7 +265,7 @@ that this cell was measured with.
 | single | resolves (baseline) | yes | `field-A-single` |
 | dup-same-file | **first** declaration (+ `LB0311` warning) | yes | `field-B-absorb-block-dup-same-file` |
 | dup-cross-file | **first**-processed file | yes | `field-C-merge-file-types-dup-cross-file` (+ `-reversed`) |
-| unrelated-parents | **last**-listed parent | yes | `field-D-unrelated-parents` (+ `-swapped`) |
+| unrelated-parents | **first**-listed parent (finding 6, fixed: was last-listed — see Findings) | **no** — this rule is `current`-only, and is a correction against luals rather than against `develop`: `develop` also resolved last-listed, matching luals 3.13.5's own `compiler.lua:369-375`/`424` (confirmed by direct measurement against the pinned binary) is what changed, not this page's earlier `develop` comparison | `field-D-unrelated-parents` (+ `-swapped`) |
 | diamond-identical | resolves to the agreed value | **no** — develop leaks the raw type-parameter name instead of resolving (declared fix, see Findings) | `field-E-diamond-identical-binding` |
 | diamond-conflicting | **last**-visited ancestry edge | **no** — develop unobservable (leaks raw name); current confirmed both directions | `field-F-diamond-conflicting-binding` (+ `-swapped`) |
 | bound-vs-bare (bound half) | parent argument substitutes correctly | **no** — develop never binds it (declared fix) | `field-G-generic-bound-vs-bare` |
@@ -236,9 +278,9 @@ that this cell was measured with.
 | single | resolves (baseline) | yes | `method-A-single` |
 | dup-same-file (two carriers, one class) | **first**-declared carrier, in statement order | yes | `method-B-two-carriers-same-file` |
 | dup-cross-file | **first**-processed file, matching every other member kind's dup-cross-file rule (finding 2, fixed: was unobservable — both binaries used to type the call `unknown`) | **no** — develop still unobservable, this rule is `current`-only | `method-C-merge-file-types-cross-file` (+ `-reversed`), zero-dup repro: `method-cross-file-signature-gap` (+ field control) |
-| unrelated-parents | **last**-listed parent, matching field-D (finding 1, fixed: was N/A — `LB0306` regardless of order) | **no** — develop still N/A, this rule is `current`-only | `method-D-unrelated-parents` (+ `-swapped`), repro: `method-inheritance-gap-same-file` (+ cross-file control) |
+| unrelated-parents | **first**-listed parent, matching field-D (finding 1 fixed the N/A gap — `LB0306` regardless of order; finding 6 then flipped the winner from last-listed to first-listed, same root cause and same fix as field-D) | **no** — this rule is `current`-only for the same reason as field-D: luals resolves the first-listed parent (compiler.lua:369-375, and the method/carrier lookup runs inside the identical `searchClass` recursion the `extends` walk drives, so it is subject to the same gate — see Findings) | `method-D-unrelated-parents` (+ `-swapped`), repro: `method-inheritance-gap-same-file` (+ cross-file control) |
 | diamond-identical | resolves to the agreed value (finding 1, fixed: was N/A, same reason) | **no** — develop still N/A | `method-E-diamond-identical` |
-| diamond-conflicting | **N/A** — methods carry no type parameter to bind two ways; substitute test (declaration overriding an inherited attachment) confirms declaration wins, unremarkable | yes | `method-F-diamond-conflicting-via-field-override` |
+| diamond-conflicting | **N/A** — methods carry no type parameter to bind two ways. The substitute test this row used to pin (declaration overriding an inherited attachment) was retired: that shape is not actually a diamond-conflict at all — it is two *unrelated* parents (one inheriting a carrier attachment, the other declaring its own field), so finding 6 governs it, and it now resolves first-listed-wins like every other unrelated-parents cell, not "declaration always wins" | yes | `method-F-diamond-conflicting-unrelated-ancestor-declaration` |
 | declaration-vs-attachment (same name, same class) | `---@field` declaration's type wins over the carrier attachment | yes | `method-G-field-declaration-beats-attachment` |
 
 ### Indexer (`---@field [K] V`)
@@ -254,25 +296,71 @@ that this cell was measured with.
 | bound-vs-bare (bound half) | substitutes correctly | **no** — develop never binds it (declared fix) | `indexer-G-generic-bound-vs-bare` |
 | bound-vs-bare (bare half) | reads `unknown` (finding 5, fixed: used to leak the literal parameter name) | **no** — develop still leaks the raw name, this rule is `current`-only | `indexer-G-generic-bound-vs-bare` |
 
-Note the **field/indexer asymmetry on unrelated-parents** (field: last-listed
-wins; indexer: first-listed wins) is intentional and is the one precedence
-axis `CHANGELOG.md`/`collect_class`'s own doc comment states explicitly.
-Operator and visibility (below) both resolve unrelated-parents
-first-listed-wins too, so indexer/operator/visibility now agree with each
-other on this axis and field is the one deliberate exception, not one voice
-in a three-way disagreement.
+**The field/indexer asymmetry on unrelated-parents that used to be noted
+here was a bug, not a deliberate design axis — it is gone.** Prior editions
+of this page described field's unrelated-parents rule as last-listed-wins,
+called it "the one precedence axis `CHANGELOG.md`/`collect_class`'s own doc
+comment states explicitly," and reasoned it was intentionally the mirror of
+indexer/operator/visibility's first-listed rule. That reasoning was built
+entirely from luabox's own code comments and never checked against
+lua-language-server's actual behaviour. It was checked
+(production-readiness-assessment-9natxz A1, source-read against luals
+3.13.5's `script/vm/compiler.lua:369-375`/`424` and confirmed by direct
+measurement: swapping a class's parent order flips which parent luals
+enforces, and the first-listed one always wins) and found backwards: luals
+has exactly one rule for "two unrelated parents disagree on a member,"
+first-listed-wins, applying identically to fields, carrier methods, and
+indexers. Field (finding 6) and method (the same finding, same root cause)
+are now first-listed-wins too, so **field, method, indexer, and visibility
+all agree on unrelated-parents: first-listed wins**, with no remaining
+exception among the member kinds luals actually resolves this way. Operator
+(below) resolves unrelated-parents first-listed too, and stays consistent
+with the rest of this list on this axis — but that agreement is luabox's own
+internal-consistency choice, not luals parity: luals does not inherit
+`---@operator` through `: Parent` at all, so there is no luals rule for
+operator's unrelated-parents to match in the first place. See the operator
+table below.
 
 ### Operator (`---@operator op(...): R`)
 
+**Inherited operators are a luabox extension beyond lua-language-server
+3.13.5, not a parity claim.** Earlier editions of this page and table
+described the four inheritance-shaped rows below (unrelated-parents,
+diamond-identical, diamond-conflicting, bound-vs-bare) as "matching
+field/indexer for the identical shape" — implying luals has some inherited-
+operator behaviour luabox reproduces. It does not: `vm.runOperator`
+(`script/vm/operator.lua:101-120`) reads only the value's *own* class's
+`.operators`, never `set.extends`, and `class.operators` is populated purely
+per-`doc.class`-block at parse time (`script/parser/luadoc.lua:2084`) with no
+code path anywhere in `script/vm/` that copies a parent's `---@operator`
+onto a child (production-readiness-assessment-9natxz C1, confirmed by
+direct measurement: a subclass inheriting an operator from its only
+operator-declaring ancestor produces no diagnostic at all downstream in
+luals, on either operand, while the identical class declaring and using the
+operator itself flags correctly). `---@class Vector : Shape` where only
+`Shape` declares `---@operator add` simply never resolves `+` on a `Vector`
+in luals — there is no rule to match, agree with, or diverge from. luabox
+resolving it anyway is real, deliberate, additional capability, not a bug
+and not a parity gap; it just has no oracle to check its own precedence
+against, which is why its internal first/last-listed choices below are
+luabox's own and were modelled on the field rule that finding 6 found
+backwards — worth a second look on its own terms, not assumed correct
+because it "matches" a rule that turned out to be wrong. The first three
+rows (single, dup-same-file, dup-cross-file) are the genuine luals-parity
+part of this table: luals resolves a single class's *own* declared
+overloads by the identical "first whose input accepts the operand" scan
+(`operator.lua:111-116`), a union-of-declarations-then-first-match mechanism
+luabox's own accumulation matches.
+
 | Arrival shape | Winner | Same in develop? | Fixture id |
 |---|---|---|---|
-| single | resolves (baseline) | yes | `operator-A-single` |
-| dup-same-file | **first** overload matched by the "first input that accepts" scan (#114) | yes | `operator-B-absorb-block-dup-same-file` |
-| dup-cross-file | **first**-processed file's overload, same scan mechanism | yes | `operator-C-merge-file-types-dup-cross-file` |
-| unrelated-parents | **first**-listed parent | yes | `operator-D-unrelated-parents` (+ `-swapped`) |
-| diamond-identical | resolves to the agreed value | **no** — develop leaks raw name (declared fix) | `operator-E-diamond-identical-binding` |
-| diamond-conflicting | **last**-visited ancestry edge — matches field/indexer for the identical shape (finding 3, fixed: was first-visited), confirmed both directions | **no** — develop unobservable (leaks raw name in both checks, not just one) | `operator-F-diamond-conflicting-binding` (+ `-swapped`) |
-| bound-vs-bare | not separately fixtured; substitution follows the same `collect_operators` binding as fields/indexers | — | — |
+| single | resolves (baseline) — luals parity: both scan the class's own declared overloads | yes | `operator-A-single` |
+| dup-same-file | **first** overload matched by the "first input that accepts" scan (#114) — luals parity, same scan mechanism (`operator.lua:111-116`) | yes | `operator-B-absorb-block-dup-same-file` |
+| dup-cross-file | **first**-processed file's overload, same scan mechanism — luals parity | yes | `operator-C-merge-file-types-dup-cross-file` |
+| unrelated-parents | **first**-listed parent — luabox-only extension, no luals rule to match (see above) | yes | `operator-D-unrelated-parents` (+ `-swapped`) |
+| diamond-identical | resolves to the agreed value — luabox-only extension, no luals rule to match | **no** — develop leaks raw name (declared fix) | `operator-E-diamond-identical-binding` |
+| diamond-conflicting | **last**-visited ancestry edge — internally consistent with field/indexer's rule for the identical shape (finding 3, fixed: was first-visited), confirmed both directions, but luabox-only: no luals rule to match | **no** — develop unobservable (leaks raw name in both checks, not just one) | `operator-F-diamond-conflicting-binding` (+ `-swapped`) |
+| bound-vs-bare | not separately fixtured; substitution follows the same `collect_operators` binding as fields/indexers — luabox-only extension | — | — |
 
 ### Type parameter (a class's own `<T, U, ...>` list)
 

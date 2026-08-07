@@ -44,8 +44,19 @@ and warns at the loser as `duplicate-doc-field` (`LB0311`), the same
 deterministic first-wins trade it makes for duplicate aliases (`LB0310`) and
 enums. luals instead *unions* the two declared types into `string|number`.
 Choosing the union would make a mistyped duplicate silently widen the field
-rather than be reported, so the warning plus a stable winner is the more useful
-answer; the divergence is here rather than in the code's favour.
+rather than be reported, so the warning plus a stable winner reads as the more
+useful answer.
+
+**That reasoning was reached without consulting luals' implementation, and is
+being revisited** ([#67](https://github.com/flying-dice/luabox/issues/67)).
+Read from `script/vm/` rather than inferred, luals unions same-rank duplicates
+for `---@field`, for a re-declared carrier method, and for a re-declared
+indexer — so a project luals checks cleanly can pick up a fresh `LB0300` here
+purely from the resolution rule, on code the author did not change. The
+warning is worth keeping; the type resolution changing the verdict is the
+part that breaks a drop-in migration. See the
+[class-merge precedence matrix](03-class-merge-precedence.md) for every cell
+and which of them luals agrees with.
 
 **Indexers follow two rules, and which one applies depends on how the key
 arrived.** A same-key `---@field [K] V` re-declared on one class name — two
@@ -54,12 +65,34 @@ deterministic rule a duplicate `---@field` follows, though without the
 `LB0311` warning the named-field case emits. Inherited keys split by shape:
 two *unrelated* parents (`---@class C : P1, P2`, each declaring the key) is
 **first-listed-wins**, while one ancestor reached twice through a generic
-diamond with *different* type arguments is **last-listed-wins**, matching
-what the class's own `---@field` members do so that fields and indexers
-cannot disagree about which edge won. Both inherited rules are measured
-against the pre-change binary rather than derived, because an intermediate
-build of this release collapsed them into a single last-wins rule and
-silently changed verdicts in both directions.
+diamond with *different* type arguments is **last-listed-wins**. These two
+inherited rules are measured against the pre-change binary rather than
+derived, because an intermediate build of this release collapsed them into a
+single last-wins rule and silently changed verdicts in both directions.
+
+**Correction: an earlier edition of this page described a field/indexer
+asymmetry on the unrelated-parents shape as intentional. It was a bug, not a
+design choice, and it has been fixed.** This page used to say a class's own
+`---@field` members resolve `C : P1, P2` **last**-listed-wins — the opposite
+of the indexer rule above — and called that the one deliberate asymmetry in
+an otherwise-consistent precedence table. That reasoning was built from
+luabox's own code comments and was never checked against
+lua-language-server, the tool this project is a drop-in for. Checked against
+luals 3.13.5's actual source (`script/vm/compiler.lua:369-375`, gated by
+`copyToSearched` at lines 424/510) and confirmed by measurement — swapping a
+class's parent order flips which parent luals enforces — luals resolves
+**first**-listed-wins for this shape, uniformly, for a `---@field`, a
+carrier-attached method, and an indexer alike; there is no asymmetry in the
+reference implementation to reproduce. luabox's field (and, by the same
+root cause, carrier-attached method) rule now matches: **two unrelated
+parents disagree on a plain field or method, and the first-listed one
+wins**, the identical rule indexer already had. A project with `---@class C
+: P1, P2` where the parents disagree on a shared member's type, previously
+resolved to P2's (last-listed) type under `luabox check`, now resolves to
+P1's (first-listed) — matching what `lua-language-server --check` already
+told that project. See the [class-merge precedence matrix](03-class-merge-precedence.md)
+(finding 6) and `CHANGELOG.md` for the full measurement and the user-facing
+statement.
 
 **Type parameters are scoped to the declaration that writes them.** Two
 declarations of a generic class may spell the parameter differently —

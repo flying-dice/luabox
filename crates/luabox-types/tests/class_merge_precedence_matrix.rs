@@ -206,7 +206,7 @@ want_string(f.x)
     Cell {
         kind: "field",
         shape: "unrelated-parents",
-        winner: "last-listed parent",
+        winner: "first-listed parent (luals parity — see production-readiness-assessment-9natxz A1: luals's own compiler.lua:369-375/424 resolves the first-listed parent, confirmed by directly measuring the pinned binary; luabox previously resolved last-listed, reasoned from its own code comments rather than from luals, and was backwards)",
         variants: &[
             Variant {
                 label: "C:P1,P2",
@@ -230,7 +230,7 @@ local function want_number(n) end
 want_string(c.x)
 ",
                 )],
-                expect: &[],
+                expect: &[("LB0300", "type mismatch: expected `string`, found `number`")],
             },
             Variant {
                 label: "C:P2,P1",
@@ -254,7 +254,7 @@ local function want_number(n) end
 want_string(c.x)
 ",
                 )],
-                expect: &[("LB0300", "type mismatch: expected `string`, found `number`")],
+                expect: &[],
             },
         ],
     },
@@ -543,7 +543,7 @@ want_string(f:m())
     Cell {
         kind: "method",
         shape: "unrelated-parents",
-        winner: "last-listed parent wins, matching field-D (finding 1 fixed: was N/A)",
+        winner: "first-listed parent wins, matching field-D (luals parity — production-readiness-assessment-9natxz A1: the carrier/bindSource lookup runs inside the same searchClass recursion the extends walk drives, so it is subject to the identical first-ancestor-wins gate as `---@field`)",
         variants: &[
             Variant {
                 label: "C:P1,P2",
@@ -576,9 +576,9 @@ local function want_number(n) end
 want_string(c:m())
 "#,
                 )],
-                // P2, the last-listed parent, wins — `m` returns `"s"`, so
-                // `want_string(c:m())` passes cleanly.
-                expect: &[],
+                // P1, the first-listed parent, wins — `m` returns `1`, so
+                // `want_string(c:m())` mismatches.
+                expect: &[("LB0300", "type mismatch: expected `string`, found `1`")],
             },
             Variant {
                 label: "C:P2,P1",
@@ -611,11 +611,11 @@ local function want_number(n) end
 want_string(c:m())
 "#,
                 )],
-                // Parents reversed: P1, now last-listed, wins — `m` returns
-                // `1`, so `want_string(c:m())` mismatches. Confirms the
+                // Parents reversed: P2, now first-listed, wins — `m` returns
+                // `"s"`, so `want_string(c:m())` passes cleanly. Confirms the
                 // winner is genuinely order-dependent, not a coincidence of
                 // which parent happened to return a string.
-                expect: &[("LB0300", "type mismatch: expected `string`, found `1`")],
+                expect: &[],
             },
         ],
     },
@@ -658,10 +658,10 @@ want_string(c:m())
     Cell {
         kind: "method",
         shape: "diamond-conflicting",
-        winner: "N/A (no type param); override substitute: declaration wins",
+        winner: "N/A (no type param to bind two ways). This fixture is actually an unrelated-parents shape wearing this slot (A's inherited Base attachment vs. B's own field declaration are two DIFFERENT classes' contributions, not one class's own declaration-over-attachment): A, first-listed, wins (A1, luals parity) — B's `m` declaration never even gets visited, matching luals's key-locking (compiler.lua:369-375/424), not the within-class method-G rule",
         variants: &[Variant {
             label: "base",
-            fixture_id: "method-F-diamond-conflicting-via-field-override",
+            fixture_id: "method-F-diamond-conflicting-unrelated-ancestor-declaration",
             files: &[(
                 "main.lua",
                 r"
@@ -689,7 +689,12 @@ local function want_number(n) end
 want_string(c.m(c))
 ",
             )],
-            expect: &[],
+            // A, first-listed, wins: `m` resolves to Base's inherited
+            // attachment (returns `1`), not B's own `---@field` declaration
+            // — B's declaration is never visited at all, because luals's
+            // (and now luabox's) key-locking resolves "m" via A's subtree
+            // before B is ever looked at. `want_string(c.m(c))` mismatches.
+            expect: &[("LB0300", "type mismatch: expected `string`, found `1`")],
         }],
     },
     Cell {

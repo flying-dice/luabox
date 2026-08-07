@@ -263,6 +263,57 @@ and that rule is now written into the policy rather than left to judgement.
     the first-match scan finds), so this is a representation fix, not a
     verdict change.
 
+- **A class inheriting one member from two unrelated parents now resolves it
+  to the *first*-listed parent's type, not the second's — a luals-parity
+  correction, not a self-consistency one**
+  (`docs/03-reference/03-class-merge-precedence.md`, finding 6). Unlike this
+  section's other class-merge findings, which were only ever checked against
+  luabox's own prior binary, this one was checked against
+  lua-language-server 3.13.5's own source (`script/vm/compiler.lua:369-375`,
+  gated by `copyToSearched` at lines 424/510) and confirmed by direct
+  measurement: swapping a class's parent order in the pinned luals binary
+  flips which parent's type it enforces, and the first-listed parent always
+  wins. luabox previously resolved `---@class C : P1, P2` to the
+  **last**-listed parent's type for both a plain `---@field` and a
+  carrier-attached method, and `docs/03-reference/02-limitations.md`
+  defended that as an intentional asymmetry against indexer/operator/
+  visibility's first-listed rule for the identical shape. That defence was
+  reasoned from luabox's own code comments, never from luals, and it was
+  backwards: luals has exactly one rule for this shape, first-listed-wins,
+  applied uniformly across every member kind that inherits at all. Both
+  seams now agree with it.
+
+  **This is a verdict-changing narrowing *and* widening, depending on which
+  parent a call site was written against** — a user whose
+  class inherits one member from two parents now gets the first parent's
+  type where they previously got the second's. A call site written against
+  the (previously winning) second parent's type may now report `LB0300`;
+  a call site written against the first parent's type, previously rejected,
+  may now go clean. Every member kind that resolves an inheritance shape at
+  all — field, carrier method, indexer, operator (as a luabox extension,
+  see below), and visibility — agrees on first-listed-wins for this shape
+  after this change; before it, field and method were the two odd ones out.
+
+- **Corrected an unfounded parity claim: luabox's inherited-`---@operator`
+  precedence never matched anything in lua-language-server, because luals
+  does not inherit operators through `: Parent` at all.**
+  `docs/03-reference/03-class-merge-precedence.md`'s operator table
+  described the unrelated-parents/diamond-identical/diamond-conflicting
+  rows as "matching field/indexer for the identical shape," which read as a
+  parity claim. It was not one: `vm.runOperator`
+  (`script/vm/operator.lua:101-120`) reads only a value's *own* class's
+  operators and never `set.extends`, confirmed by measurement (a subclass
+  inheriting its only operator-declaring ancestor's `---@operator add`
+  produces no diagnostic on either operand in luals, while the same class
+  declaring and using the operator itself flags correctly). Inherited
+  operators are a real, deliberate **luabox extension beyond luals 3.13.5**,
+  not a bug and not a parity gap — but the docs now say so plainly, with the
+  source citation, instead of implying a reference behaviour that does not
+  exist. No behaviour changed in this entry; only the claim did. Inherited
+  operator precedence itself was modelled on the same (now-corrected) field
+  rule finding 6 found backwards, so it is flagged in the docs as deserving
+  its own review — not addressed here.
+
 - **A bare reference to a generic ancestor no longer leaks its unbound type
   parameter's literal name into `LB0300` text**
   (`docs/03-reference/03-class-merge-precedence.md`, finding 5). `---@class
