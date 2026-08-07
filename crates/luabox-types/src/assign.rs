@@ -401,6 +401,20 @@ fn attached_member_names(env: &TypeEnv, ty: &Ty) -> std::collections::HashSet<St
 
 /// Resolve a type to its structural table shape, unwrapping `T?` optionals
 /// and following `Ty::Named` through the environment.
+///
+/// Deliberately the raw (non-erasing) resolution: [`classify_literal`] runs
+/// `field.optional`/`field.ty.admits_nil()` against this shape to decide
+/// whether a table literal is genuinely missing a required member, and
+/// erasing an unbound generic parameter to `unknown` here would make it
+/// `admits_nil() == true` — silently reclassifying a literal that is
+/// actually missing a required member as fully conforming (production
+/// readiness review finding 5's first attempt, measured and reverted; see
+/// `check::conformance`'s and `Checker::table_shape`'s doc comments for the
+/// same regression measured at their own call sites). `explain_mismatch`'s
+/// own text never actually names this leaked parameter: its "missing" list
+/// prints field names only, and its "wrong type" list can't trigger on a
+/// leaf gated by an unbound parameter — `assignable` already treats an
+/// undeclared bare name exactly like `unknown`, matching either way.
 fn resolve_table(env: &TypeEnv, ty: &Ty) -> Option<TableTy> {
     match ty {
         Ty::Table(table) => Some((**table).clone()),

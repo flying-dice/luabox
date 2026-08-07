@@ -37,7 +37,7 @@
 //! coincidence of which type happened to be `string`.
 
 mod support;
-use support::{check, check_cross_diags};
+use support::{check_cross_diags, check_self};
 
 /// One Lua project — `("main.lua", ...)` plus zero or more library files
 /// (`a.lua`, `b.lua`, `p1.lua`, ...) merged beneath it in the order listed,
@@ -345,7 +345,7 @@ want_string(c.item)
     Cell {
         kind: "field",
         shape: "bound-vs-bare",
-        winner: "bound: substitutes; bare: stays free (leaks name)",
+        winner: "bound: substitutes; bare: reads `unknown` (production readiness review finding 5)",
         variants: &[Variant {
             label: "base",
             fixture_id: "field-G-generic-bound-vs-bare",
@@ -372,7 +372,10 @@ want_string(sb.item)
             )],
             expect: &[
                 ("LB0300", "type mismatch: expected `string`, found `number`"),
-                ("LB0300", "type mismatch: expected `string`, found `T`"),
+                (
+                    "LB0300",
+                    "type mismatch: expected `string`, found `unknown`",
+                ),
             ],
         }],
     },
@@ -444,7 +447,7 @@ want_string(f:m())
     Cell {
         kind: "method",
         shape: "dup-cross-file",
-        winner: "unobservable: neither candidate survives (finding 2)",
+        winner: "first-processed FILE wins (finding 2 fixed: was unobservable)",
         variants: &[
             Variant {
                 label: "a=1,b=s",
@@ -485,10 +488,7 @@ want_string(f:m())
 ",
                     ),
                 ],
-                expect: &[(
-                    "LB0300",
-                    "type mismatch: expected `string`, found `unknown`",
-                )],
+                expect: &[("LB0300", "type mismatch: expected `string`, found `1`")],
             },
             Variant {
                 label: "a=s,b=1",
@@ -529,17 +529,21 @@ want_string(f:m())
 ",
                     ),
                 ],
-                expect: &[(
-                    "LB0300",
-                    "type mismatch: expected `string`, found `unknown`",
-                )],
+                // `a.lua` (first-processed) declares `m` returning `"s"` —
+                // `want_string(f:m())` passes cleanly, confirming the winner
+                // is `a.lua`'s own value (a real type, not `unknown`) rather
+                // than merely "the first entry happens to already be a
+                // string": swap the two files' bodies (the `a=1,b=s`
+                // variant above) and the winner flips to `a.lua`'s new
+                // value, `1`, not `"s"` again.
+                expect: &[],
             },
         ],
     },
     Cell {
         kind: "method",
         shape: "unrelated-parents",
-        winner: "N/A: inheritance itself is broken (finding 1)",
+        winner: "last-listed parent wins, matching field-D (finding 1 fixed: was N/A)",
         variants: &[
             Variant {
                 label: "C:P1,P2",
@@ -572,7 +576,9 @@ local function want_number(n) end
 want_string(c:m())
 "#,
                 )],
-                expect: &[("LB0306", "undefined field `m` on `C`")],
+                // P2, the last-listed parent, wins — `m` returns `"s"`, so
+                // `want_string(c:m())` passes cleanly.
+                expect: &[],
             },
             Variant {
                 label: "C:P2,P1",
@@ -605,14 +611,18 @@ local function want_number(n) end
 want_string(c:m())
 "#,
                 )],
-                expect: &[("LB0306", "undefined field `m` on `C`")],
+                // Parents reversed: P1, now last-listed, wins — `m` returns
+                // `1`, so `want_string(c:m())` mismatches. Confirms the
+                // winner is genuinely order-dependent, not a coincidence of
+                // which parent happened to return a string.
+                expect: &[("LB0300", "type mismatch: expected `string`, found `1`")],
             },
         ],
     },
     Cell {
         kind: "method",
         shape: "diamond-identical",
-        winner: "N/A, same reason as unrelated-parents",
+        winner: "resolves to the agreed value (finding 1 fixed: was N/A)",
         variants: &[Variant {
             label: "base",
             fixture_id: "method-E-diamond-identical",
@@ -640,7 +650,9 @@ local function want_number(n) end
 want_string(c:m())
 "#,
             )],
-            expect: &[("LB0306", "undefined field `m` on `C`")],
+            // Both edges (A and B) reach `Base`'s identical `m`, so it
+            // resolves cleanly to `"s"` — `want_string(c:m())` passes.
+            expect: &[],
         }],
     },
     Cell {
@@ -711,7 +723,7 @@ want_string(F.m())
     Cell {
         kind: "method",
         shape: "same-file-inheritance-gap (finding 1 repro)",
-        winner: "LB0306 even though `m` exists on P1",
+        winner: "resolves, matching the cross-file control (finding 1 fixed: was LB0306)",
         variants: &[Variant {
             label: "base",
             fixture_id: "method-inheritance-gap-same-file",
@@ -731,13 +743,13 @@ local c
 local y = c.m
 ",
             )],
-            expect: &[("LB0306", "undefined field `m` on `C`")],
+            expect: &[],
         }],
     },
     Cell {
         kind: "method",
         shape: "cross-file-inheritance-control (finding 1 repro)",
-        winner: "resolves once P1 is a different file",
+        winner: "resolves regardless of which file P1 lives in",
         variants: &[Variant {
             label: "base",
             fixture_id: "method-inheritance-cross-file-control",
@@ -764,6 +776,82 @@ local y = c.m
                 ),
             ],
             expect: &[],
+        }],
+    },
+    Cell {
+        kind: "method",
+        shape: "cross-file-signature-gap (finding 2 repro)",
+        winner: "resolves to the inferred return type (finding 2 fixed: was `unknown`)",
+        variants: &[Variant {
+            label: "base",
+            fixture_id: "method-cross-file-signature-gap",
+            files: &[
+                (
+                    "p1.lua",
+                    r#"
+---@class Foo
+local F = {}
+function F:m()
+  return "s"
+end
+"#,
+                ),
+                (
+                    "main.lua",
+                    r"
+---@type Foo
+local f
+
+---@param n number
+local function want_number(n) end
+
+want_number(f:m())
+",
+                ),
+            ],
+            // Zero duplication — `Foo` is declared in exactly one file —
+            // so there is no precedence decision to make, only whether the
+            // carrier method's own (unannotated, body-inferred) return type
+            // crosses the file boundary at all. Before the fix it did not:
+            // `f:m()` typed `unknown` and this call passed silently, no
+            // matter how badly it disagreed with `want_number`'s parameter.
+            expect: &[("LB0300", "type mismatch: expected `number`, found `\"s\"`")],
+        }],
+    },
+    Cell {
+        kind: "method",
+        shape: "cross-file-signature-gap-field-control (finding 2 repro)",
+        winner: "resolves — the one-variable control: a `---@field` in the identical shape already worked",
+        variants: &[Variant {
+            label: "base",
+            fixture_id: "method-cross-file-signature-gap-field-control",
+            files: &[
+                (
+                    "p1.lua",
+                    r"
+---@class Foo
+---@field m fun(): string
+",
+                ),
+                (
+                    "main.lua",
+                    r"
+---@type Foo
+local f
+
+---@param n number
+local function want_number(n) end
+
+want_number(f.m())
+",
+                ),
+            ],
+            // Identical cross-file shape, but `m` is an annotated
+            // `---@field` rather than a carrier attachment: this already
+            // resolved before *and* after the finding-2 fix, isolating the
+            // gap to carrier-attached methods specifically, not cross-file
+            // member access in general.
+            expect: &[("LB0300", "type mismatch: expected `number`, found `string`")],
         }],
     },
     Cell {
@@ -1002,7 +1090,7 @@ want_string(c["k"])
     Cell {
         kind: "indexer",
         shape: "bound-vs-bare",
-        winner: "bound: substitutes; bare: stays free (leaks name)",
+        winner: "bound: substitutes; bare: reads `unknown` (production readiness review finding 5)",
         variants: &[Variant {
             label: "base",
             fixture_id: "indexer-G-generic-bound-vs-bare",
@@ -1029,7 +1117,10 @@ want_string(sb["k"])
             )],
             expect: &[
                 ("LB0300", "type mismatch: expected `string`, found `number`"),
-                ("LB0300", "type mismatch: expected `string`, found `T`"),
+                (
+                    "LB0300",
+                    "type mismatch: expected `string`, found `unknown`",
+                ),
             ],
         }],
     },
@@ -1229,7 +1320,7 @@ want_string(a + b)
     Cell {
         kind: "operator",
         shape: "diamond-conflicting",
-        winner: "first-visited edge (opposite of field/indexer's last-wins, finding 3)",
+        winner: "last-visited edge (now matches field/indexer, finding 3 fixed)",
         variants: &[
             Variant {
                 label: "A=number,B=string",
@@ -1256,7 +1347,7 @@ want_string(a + b)
 want_number(a + b)
 ",
                 )],
-                expect: &[("LB0300", "type mismatch: expected `string`, found `number`")],
+                expect: &[("LB0300", "type mismatch: expected `number`, found `string`")],
             },
             Variant {
                 label: "A=string,B=number",
@@ -1281,7 +1372,7 @@ want_string(a + b)
 want_number(a + b)
 ",
                 )],
-                expect: &[("LB0300", "type mismatch: expected `number`, found `string`")],
+                expect: &[("LB0300", "type mismatch: expected `string`, found `number`")],
             },
         ],
     },
@@ -1536,7 +1627,7 @@ local y = f.x
     Cell {
         kind: "visibility",
         shape: "unrelated-parents",
-        winner: "last-listed parent (opposite of indexer/operator, finding 4; LIFO ancestor stack)",
+        winner: "first-listed parent (now matches indexer/operator, finding 4 fixed)",
         variants: &[
             Variant {
                 label: "C:P1,P2",
@@ -1554,7 +1645,7 @@ local c
 local y = c.x
 ",
                 )],
-                expect: &[("LB0312", "cannot access protected member `x` of `P2` here")],
+                expect: &[("LB0312", "cannot access private member `x` of `P1` here")],
             },
             Variant {
                 label: "C:P2,P1",
@@ -1572,7 +1663,7 @@ local c
 local y = c.x
 ",
                 )],
-                expect: &[("LB0312", "cannot access private member `x` of `P1` here")],
+                expect: &[("LB0312", "cannot access protected member `x` of `P2` here")],
             },
         ],
     },
@@ -1609,10 +1700,12 @@ local y = c.x
 
 /// Run one fixture project: `main.lua` is always the checked consumer; every
 /// other named file is a library merged beneath it, in listed order
-/// (`check_cross_diags`), or — when `main.lua` is the only file — a single
-/// standalone check (`check`), matching whichever of `absorb_block`'s
-/// same-file path or `merge_file_types`'s cross-file path the fixture
-/// exercises.
+/// (`check_cross_diags`), or — when `main.lua` is the only file — a
+/// self-inclusive standalone check (`check_self`, folding `main.lua`'s own
+/// surface beneath its own ambient — the CLI batch path always does this,
+/// self included, `docs/03-reference/03-class-merge-precedence.md`'s finding
+/// 1), matching whichever of `absorb_block`'s same-file path or
+/// `merge_file_types`'s cross-file path the fixture exercises.
 fn run(files: &[(&str, &str)]) -> Vec<(String, String)> {
     let consumer = files
         .iter()
@@ -1625,7 +1718,7 @@ fn run(files: &[(&str, &str)]) -> Vec<(String, String)> {
         .map(|(_, src)| *src)
         .collect();
     let diags = if libs.is_empty() {
-        check(consumer)
+        check_self(consumer)
     } else {
         check_cross_diags(&libs, consumer)
     };

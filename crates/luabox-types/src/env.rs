@@ -166,7 +166,8 @@ impl FileTypes {
                                     let merged = with_carrier_tags(declared, field);
                                     def.fields.insert(member.clone(), merged);
                                 } else {
-                                    def.methods.insert(member.clone(), field.clone());
+                                    def.methods
+                                        .insert(member.clone(), publish_carrier_method_ty(field));
                                 }
                             }
                         }
@@ -604,25 +605,43 @@ fn indexer_resolution(exists: bool, arrival: MemberArrival) -> IndexerResolution
 /// between two conflicting values at merge time: every declared overload
 /// joins one scan list, and *resolution* (inference, #114) tries each in
 /// declaration order until one accepts the operand, so first-listed-wins
-/// and first-visited-edge-wins (`operator-D`/`operator-F`) fall out of
-/// **accumulation order** rather than an overwrite decision here. What does
-/// differ by seam is whether a value-identical repeat is added again:
-/// `merge_file_types` folds an already-complete class def and must not grow
-/// the list from folding the same source twice (`operator-C`); `absorb_block`
-/// reads this file's own doc blocks one at a time, in this file's own
-/// declaration order, where a value-identical repeat is not a state two
-/// `---@operator` tags on one class ever produce (`operator-B`'s two
-/// overloads always differ on `result`) — so it does not dedupe.
+/// (`operator-D`) falls out of **accumulation order** rather than an
+/// overwrite decision here. `operator-F`'s diamond-conflicting shape is the
+/// one exception with an overwrite-shaped decision — see
+/// [`TypeEnv::collect_operators`]'s doc comment for why *that* seam does
+/// need one, unlike the two duplicate-declaration seams below.
+///
+/// Both duplicate-declaration seams calling this function dedupe a
+/// value-identical repeat: `merge_file_types` folds an already-complete
+/// class def and must not grow the list from folding the same source twice
+/// (`operator-C`, pinned by
+/// `merging_repeated_declarations_never_duplicates_parents_or_operators`);
+/// `absorb_block` reads this file's own doc blocks one at a time and used to
+/// skip the dedupe check entirely, on the reasoning that a value-identical
+/// `---@operator` repeat is not a state two tags on one class in one file
+/// ever produce in the corpus this was measured against (`operator-B`'s two
+/// overloads always differ on `result`). That reasoning covered the
+/// *measured* corpus, not the general case — a literal copy-paste of one
+/// `---@operator` tag onto a second `---@class` block for the same name is
+/// exactly as constructible in one file as across two, and there is no
+/// reason a same-file duplicate should keep a byte-identical entry twice
+/// when a cross-file one collapses it to one (the same "the file boundary
+/// does not change the merge" principle
+/// `docs/03-reference/02-limitations.md`'s "Duplicate `---@class`
+/// declarations union" section already states for every other member kind).
+/// Both seams now dedupe identically — see
+/// `absorb_block_dedupes_a_byte_identical_operator_repeat_the_same_as_merge_file_types`
+/// for the pin. A repeat that differs on `input`/`result` (`operator-B`'s
+/// actual fixture) is never value-identical, so this change does not touch
+/// it: `sigs.contains` compares the whole signature, and two overloads that
+/// disagree on anything still both survive, exactly as before.
 ///
 /// `collect_operators` (the ancestor-fold seam for this kind) does not call
-/// this function: it has no duplicate-vs-keep decision to make either — own
-/// operators are appended once, then parents are walked and appended after,
-/// depth-first, in declaration order — and forcing it through the same
-/// signature as the two duplicate seams would flatten a genuinely different
-/// operation (unconditional list-building) into a conflict-resolution shape
-/// it does not have.
-fn push_operator_overload(sigs: &mut Vec<OperatorSig>, sig: OperatorSig, dedupe: bool) {
-    if dedupe && sigs.contains(&sig) {
+/// this function: unconditional list-building plus a narrower,
+/// owner-tracked supersede rule for diamond conflicts is a different shape
+/// than "keep or drop one incoming value" — see its own doc comment.
+fn push_operator_overload(sigs: &mut Vec<OperatorSig>, sig: OperatorSig) {
+    if sigs.contains(&sig) {
         return;
     }
     sigs.push(sig);
@@ -926,7 +945,7 @@ impl TypeEnv {
                                 },
                                 None => sig.clone(),
                             };
-                            push_operator_overload(slot, sig, true);
+                            push_operator_overload(slot, sig);
                         }
                     }
                     for (member, scope) in &def.visibility {
@@ -1250,12 +1269,48 @@ impl TypeEnv {
                     // `local_classes` — the set of names *this file* declares —
                     // is what tells the two apart, so it is filled here rather
                     // than in a later sweep.
+                    //
+                    // `methods` is the one axis carried over rather than reset:
+                    // when this file checks *itself*, `self.classes` is seeded
+                    // from the project-wide ambient (`build_from_items`, which
+                    // clones `ambient.env.classes` before any `absorb_block`
+                    // call runs) — and that ambient is self-inclusive
+                    // (`check_cmd.rs`'s `run_passes` folds every file's own
+                    // `FileTypes` in, itself included), so a class this file
+                    // declares already carries *this file's own* carrier
+                    // attachments (`function Class:method()`), reified by
+                    // `FileTypes::collect`'s post-inference carrier fold on an
+                    // earlier pass over this same file. Resetting the whole
+                    // `ClassDef` here — as every other field does, correctly,
+                    // since `absorb_block`'s own `Tag::Field`/`Tag::Operator`
+                    // arms re-derive them from scratch in this very pass —
+                    // silently discarded that seeded `methods` map, which
+                    // nothing else in `absorb_block` (or anywhere else before
+                    // this file's own obligations are checked) ever
+                    // repopulates: carrier methods are folded in only by
+                    // `FileTypes::collect`, run *after* this file's own
+                    // `TypeEnv` is built and checked, and its output feeds
+                    // *other* files via `merge_file_types`, never this one.
+                    // The result was a same-file `: Parent` inheriting a
+                    // carrier-attached method reading as a false `LB0306`
+                    // (`collect_class`'s ancestry walk finds an empty
+                    // `methods` map on the parent) even though the identical
+                    // shape resolves cleanly the moment the parent moves to
+                    // its own file — cross-file consumption never hits this
+                    // reset because a non-locally-declared class is left
+                    // exactly as the ambient seeded it.
                     if self.local_classes.insert(c.name.clone()) {
+                        let methods = self
+                            .classes
+                            .get(&c.name)
+                            .map(|def| def.methods.clone())
+                            .unwrap_or_default();
                         self.classes.insert(
                             c.name.clone(),
                             ClassDef {
                                 parents,
                                 params: c.params.clone(),
+                                methods,
                                 ..ClassDef::default()
                             },
                         );
@@ -1425,7 +1480,6 @@ impl TypeEnv {
                     push_operator_overload(
                         class.operators.entry(o.op.clone()).or_default(),
                         OperatorSig { input, result },
-                        false,
                     );
                 }
                 Tag::Param(p) => params.push(p),
@@ -1740,8 +1794,13 @@ impl TypeEnv {
     /// This is also how a parent's parameters are bound while merging:
     /// `---@class Sub : Base<number>` gives `Base`'s `U` as `number`, so
     /// `Sub` inherits `item: number` rather than a parameter no one can name.
-    /// An argument the reference omits leaves its parameter free, which every
-    /// downstream path already reads as `unknown`.
+    /// An argument the reference omits leaves its parameter free, spelled out
+    /// as the parameter's own literal name here — correct for the ambient/LSP
+    /// callers that want to show a generic template as written (`class_shape`
+    /// backs [`Self::generic_classes`] and `crate::defs::Ambient`'s hover
+    /// surface). A reference-consuming site that could put that name in front
+    /// of a user as if it meant something wants [`Self::class_shape_bound_export`]
+    /// instead (finding 5 of the production readiness review).
     pub(crate) fn class_shape_bound(&self, name: &str, args: &[Ty]) -> Option<TableTy> {
         if !self.classes.contains_key(name) {
             return None;
@@ -1759,6 +1818,21 @@ impl TypeEnv {
     /// already decides they are free*, instead of being left as
     /// [`Ty::Named`] and erased afterwards by matching on the parameter's
     /// *spelling* against the fully-resolved shape.
+    ///
+    /// Despite the name, `require` is no longer this method's only caller
+    /// (finding 5 of the production readiness review): every same-file
+    /// reference-consuming site that can put a member's type in front of a
+    /// user — [`crate::infer::Infer::lookup_shape_field`]/`lookup_ty_field`'s
+    /// field reads, [`Self::resolve_named_bound`]'s `ipairs`/`pairs` element
+    /// types, `Checker::table_shape`'s table-literal obligation, and
+    /// `Checker::check_class_conformance`'s `: Parent` obligation — reuses
+    /// this same erasure rather than leaving its own bare-reference case to
+    /// leak `T` a second, differently-shaped way. Only [`Self::class_shape`]/
+    /// [`Self::class_shape_bound`] (ambient/LSP template display,
+    /// [`Self::generic_classes`]) and [`Self::resolve_named`]'s raw baseline
+    /// (this method's own `erased != resolved` comparison in
+    /// [`crate::infer::Infer::reify_export`]) still want the parameter left
+    /// as itself.
     ///
     /// That was the previous shape of this fix
     /// (`class_params_in_scope` — deleted, round 5 review N8/N9 — plus a
@@ -2120,7 +2194,21 @@ impl TypeEnv {
                 return Some(result);
             }
             if let Some(def) = def {
-                stack.extend(def.parents.iter().map(|p| p.name.clone()));
+                // Reversed: `stack` is a LIFO, so pushing in declared order
+                // would pop the *last*-listed parent first —
+                // `member_visibility`'s only order-sensitive consumer used to
+                // inherit exactly that last-listed-wins bias for two
+                // unrelated parents, disagreeing with indexer/operator's
+                // first-listed rule for the identical shape (finding 4).
+                // Pushing reversed pops the first-listed parent first, giving
+                // every order-sensitive caller ordinary left-to-right
+                // declaration-order preorder traversal — own name first
+                // (already true: `start` is visited before any parent is
+                // pushed), then each parent's whole subtree in listed order.
+                // `class_method_names` (accumulates a set) and `is_subclass`
+                // (`Break` on name match) are unaffected by traversal order
+                // either way.
+                stack.extend(def.parents.iter().rev().map(|p| p.name.clone()));
             }
         }
         None
@@ -2150,11 +2238,11 @@ impl TypeEnv {
     /// overload whose parameter accepts the other operand (#114). Own
     /// operators precede inherited ones so a subclass override wins.
     pub(crate) fn class_operators(&self, name: &str, op: &str) -> Vec<OperatorSig> {
-        let mut out = Vec::new();
+        let mut out: Vec<(String, OperatorSig)> = Vec::new();
         let mut guard = DiamondGuard::default();
         self.collect_operators(name, &[], op, &mut out, &mut guard);
         self.note_depth_limit(&guard, name);
-        out
+        out.into_iter().map(|(_owner, sig)| sig).collect()
     }
 
     /// [`Self::collect_class`]'s substitution and [`DiamondGuard`] rules,
@@ -2172,29 +2260,31 @@ impl TypeEnv {
     /// exposure (round 4 review R1; round 5 review N1 for why the guard
     /// itself had to change again).
     ///
-    /// Unlike [`Self::collect_class`], this walk does not *need*
-    /// [`DiamondGuard::visit`]'s `is_first_binding` distinction — a
-    /// genuinely competing repeat re-running this body is harmless here,
-    /// not merely correct: `out` is append-only, never overwritten by
-    /// position, so a repeat `(name, args)` — bound identically to its
-    /// earlier visit, hence the same `def.operators.get(op)` result — only
-    /// ever appends duplicate `OperatorSig`s identical in value to ones
-    /// already present. Those duplicates cannot change which signature the
-    /// first-match scan (#114) finds, so unlike [`Self::collect_class`]
-    /// (where reapplying a non-competing repeat corrupts a sibling's
-    /// override — see its doc comment), this walk does not need to
-    /// special-case a skip vs re-running: skipping is merely the cheaper of
-    /// two correct outcomes here, but a stray reapply on a competing repeat
-    /// would not corrupt anything either.
+    /// `out` carries each entry's owning ancestor name alongside its
+    /// substituted signature (stripped by [`Self::class_operators`] before it
+    /// returns) so a genuinely competing repeat — [`DiamondGuard::visit`]'s
+    /// `is_first_binding: false`, an ancestor reached a second time with a
+    /// *different* binding, a diamond conflict — can supersede that
+    /// ancestor's earlier contribution rather than merely append beside it.
+    /// Before this, a competing repeat's entries only ever joined the list
+    /// after the first-visited edge's, so the first-match scan (#114) always
+    /// picked the *first*-visited edge's signature — the opposite of
+    /// [`Self::collect_class`]'s last-visited-edge-wins for the identical
+    /// diamond-conflicting shape on fields/indexers, and undocumented
+    /// anywhere (finding 3). Superseding on every non-first-binding visit —
+    /// including a *stale* one reasserting a binding identical to what it
+    /// already contributed — costs nothing beyond a `retain` a stale replay
+    /// would otherwise skip: the entries it removes and re-adds are
+    /// value-identical, so the net list is the same either way.
     fn collect_operators(
         &self,
         name: &str,
         args: &[Ty],
         op: &str,
-        out: &mut Vec<OperatorSig>,
+        out: &mut Vec<(String, OperatorSig)>,
         guard: &mut DiamondGuard,
     ) {
-        guard.visit(name, args, |guard, _is_first_binding| {
+        guard.visit(name, args, |guard, is_first_binding| {
             let Some(def) = self.classes.get(name) else {
                 return;
             };
@@ -2204,15 +2294,26 @@ impl TypeEnv {
                 .zip(args)
                 .map(|(param, arg)| (param.clone(), arg.clone()))
                 .collect();
+            if !is_first_binding {
+                // A competing (or stale) repeat of this exact ancestor:
+                // whatever it contributed on an earlier visit is no longer
+                // current — drop it before this visit's fresh entries go in,
+                // so the most-recently-visited binding is the only candidate
+                // the first-match scan sees for this ancestor.
+                out.retain(|(owner, _)| owner != name);
+            }
             if let Some(sigs) = def.operators.get(op) {
                 out.extend(sigs.iter().map(|sig| {
-                    OperatorSig {
-                        input: sig
-                            .input
-                            .as_ref()
-                            .map(|ty| crate::generics::subst_ty(ty, &bound)),
-                        result: crate::generics::subst_ty(&sig.result, &bound),
-                    }
+                    (
+                        name.to_string(),
+                        OperatorSig {
+                            input: sig
+                                .input
+                                .as_ref()
+                                .map(|ty| crate::generics::subst_ty(ty, &bound)),
+                            result: crate::generics::subst_ty(&sig.result, &bound),
+                        },
+                    )
                 }));
             }
             for parent in &def.parents {
@@ -2247,6 +2348,29 @@ impl TypeEnv {
     /// becomes its table shape, an enum the union of its member values.
     pub(crate) fn resolve_named(&self, name: &str) -> Option<Ty> {
         if let Some(shape) = self.class_shape(name) {
+            return Some(Ty::Table(Box::new(shape)));
+        }
+        self.enums.get(name).map(|e| e.value_union.clone())
+    }
+
+    /// [`Self::resolve_named`], except a class's own type parameters left
+    /// unbound by this reference substitute to [`Ty::Unknown`] instead of
+    /// surviving as their literal name — the [`Self::class_shape_bound_export`]
+    /// rule (#56, finding 5 of the production readiness review), reused here
+    /// for every other reference-consuming site that can put a member's type
+    /// in front of a user: a field read on an annotated value, an `ipairs`/
+    /// `pairs` element type, a table-literal's expected shape. `T` is not a
+    /// value a Lua reference can name or produce, so a bare `---@class Sub :
+    /// Base` (Base generic, left unbound) should read `Sub`'s inherited
+    /// member the same way a bare `Box` reference already does (#84) and the
+    /// same way it crosses `require` (#56) — not literally as `T`.
+    ///
+    /// [`Self::resolve_named`] itself must keep the raw (non-erasing)
+    /// resolution: [`crate::infer::Infer::reify_export`] diffs its own
+    /// erased result against it to decide whether erasure changed anything,
+    /// and that comparison needs an unerased baseline to diff against.
+    pub(crate) fn resolve_named_bound(&self, name: &str) -> Option<Ty> {
+        if let Some(shape) = self.class_shape_bound_export(name, &[]) {
             return Some(Ty::Table(Box::new(shape)));
         }
         self.enums.get(name).map(|e| e.value_union.clone())
@@ -2337,6 +2461,12 @@ impl TypeEnv {
     /// nearest declaration wins, so a subclass that re-declares an inherited
     /// restricted member as a plain `---@field` (recorded as *not* in
     /// `visibility`, but present in `fields`) overrides it back to public.
+    /// Two *unrelated* parents at the same depth (`---@class C : P1, P2`,
+    /// both declaring `member`) resolve **first-listed-wins** —
+    /// `walk_ancestor_names`'s traversal order, matching indexer/operator's
+    /// first-listed rule for the identical shape (finding 4; before this it
+    /// was last-listed, via the same LIFO stack read in the opposite
+    /// direction, a third mechanism disagreeing with both).
     pub(crate) fn member_visibility(
         &self,
         class: &str,
@@ -3021,6 +3151,54 @@ pub(crate) fn merge_block_tags(mut declared: FunctionTy, block: Option<&Function
 /// half is `crate::infer::Inferencer::carrier_tagged`, which reads the live
 /// carrier shape directly. Non-function members, and attachments carrying no
 /// tags, pass the declaration through unchanged (#33).
+/// Trust a carrier method's own body-inferred return type as part of the
+/// class's published, workspace-global surface (finding 2 of
+/// `docs/03-reference/03-class-merge-precedence.md`).
+///
+/// [`crate::infer::reify::Infer::reify_func`] stamps every reified,
+/// unannotated function's `has_return_annotation` with
+/// `returns_set && self.mode.seeds_params()` — `false` in [`InferMode::Check`]
+/// (the mode both [`crate::module_surface_from_env`] and the checker itself
+/// run in). That flag conflates two different questions: whether an
+/// unannotated *parameter* was seeded from call-site argument types (a
+/// genuine guess — SPEC §19 forbids resting a diagnostic on it, so it is
+/// rightly `Display`-only) and whether a function's *return* type is known
+/// at all (a plain deduction from its own `return` statements, no guessing
+/// about other call sites involved — the same deduction a same-file
+/// `f:m()` call already rests a diagnostic on today, via the live,
+/// not-yet-reified `ITy::Func` path `infer::call::eval_method_call`'s
+/// `returns_of` takes). Reusing the parameter-seeding flag to *also* gate
+/// the return type erases a carrier method's return type the moment it
+/// crosses into this file's published [`ClassDef::methods`] — the one seam
+/// `ClassDef::methods`'s own doc comment promises behaves "exactly like
+/// `---@field` members" — even with zero cross-file duplication to
+/// arbitrate: `f:m()` typed `unknown` where `f.x` (a `---@field`, whose type
+/// is annotation-derived and never touches this flag) resolves fine.
+///
+/// This promotes exactly that one case — a reified, unannotated function
+/// whose return type inference *did* determine (`returns` non-empty) —
+/// before it is published in a class's method surface, leaving every other
+/// user of a reified [`Ty::Function`] (module exports, inlay display,
+/// [`check::conformance`]'s `carrier_class_final` fallback) untouched: none
+/// of those read through this function, so a `require`'d free function's
+/// unannotated return type still does not seed a consumer's diagnostics —
+/// only a class's own carrier-attached methods, which are declarations, not
+/// call-site guesses.
+fn publish_carrier_method_ty(field: &FieldTy) -> FieldTy {
+    let Ty::Function(sig) = &field.ty else {
+        return field.clone();
+    };
+    if sig.has_return_annotation || sig.returns.is_empty() {
+        return field.clone();
+    }
+    let mut sig = (**sig).clone();
+    sig.has_return_annotation = true;
+    FieldTy {
+        ty: Ty::Function(Box::new(sig)),
+        optional: field.optional,
+    }
+}
+
 fn with_carrier_tags(declared: &FieldTy, carrier: &FieldTy) -> FieldTy {
     let (Ty::Function(declared_sig), Ty::Function(carrier_sig)) = (&declared.ty, &carrier.ty)
     else {
@@ -3431,6 +3609,60 @@ mod tests {
             def.indexers,
             vec![(Ty::String, Ty::Number)],
             "the first declaration's conflicting indexer value must win, not the second's"
+        );
+    }
+
+    #[test]
+    fn absorb_block_dedupes_a_byte_identical_operator_repeat_the_same_as_merge_file_types() {
+        // `push_operator_overload`'s doc comment: the same-file
+        // (`absorb_block`) and cross-file (`merge_file_types`) duplicate-
+        // `---@class` seams used to disagree on whether a byte-identical
+        // `---@operator` repeat collapses to one entry or survives as two —
+        // `merge_file_types` always deduped (pinned by
+        // `merging_repeated_declarations_never_duplicates_parents_or_operators`
+        // below), `absorb_block` never did. Two `Both` blocks in one file
+        // declaring the *identical* `add` overload must now collapse to one
+        // entry here too, matching the cross-file rule for the identical
+        // shape.
+        let env = env_of(
+            "\
+---@class Both
+---@operator add(Both): Both
+---@class Both
+---@operator add(Both): Both
+",
+        );
+        let def = env.classes.get("Both").expect("declared class");
+        let sigs = def.operators.get("add").expect("operator carried over");
+        assert_eq!(
+            sigs.len(),
+            1,
+            "a byte-identical `---@operator` repeat in one file must dedupe, \
+             matching merge_file_types's cross-file rule for the same shape: {sigs:?}"
+        );
+    }
+
+    #[test]
+    fn absorb_block_keeps_two_operator_overloads_that_differ_on_result() {
+        // The other half of the same doc comment: dedupe compares the whole
+        // signature, so two overloads that genuinely differ (here, on
+        // `result`) both survive — this is `operator-B`'s own fixture shape
+        // (`docs/03-reference/03-class-merge-precedence.md`), unaffected by
+        // the fix above, which only collapses a truly identical repeat.
+        let env = env_of(
+            "\
+---@class Both
+---@operator add(Both): number
+---@class Both
+---@operator add(Both): string
+",
+        );
+        let def = env.classes.get("Both").expect("declared class");
+        let sigs = def.operators.get("add").expect("operator carried over");
+        assert_eq!(
+            sigs.len(),
+            2,
+            "two overloads that disagree on result must both survive, not dedupe: {sigs:?}"
         );
     }
 

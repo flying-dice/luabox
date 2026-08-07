@@ -57,47 +57,155 @@ None of these are winner *reversals* — `develop` never produces an
 observable winner for these cells; it names a type variable, not one of the
 two candidate values.
 
-Five cells, however, are genuine, measured, previously-unenumerated gaps —
+Five cells, however, were genuine, measured, previously-unenumerated gaps —
 identical in both binaries (not a regression), and not stated anywhere in
-`CHANGELOG.md` or `docs/03-reference/02-limitations.md`:
+`CHANGELOG.md` or `docs/03-reference/02-limitations.md`. Findings 1 through 4
+below are now **fixed**: this page's own contradictions, once found, are not
+left standing — the seams they named have been changed to agree with the
+majority rule for their arrival shape (or, for 1 and 2, to actually do the
+write-back their own doc comments already promised), and the matrix tables
+further down reflect the new, consistent verdict, not the one that was
+measured.
 
-1. **Same-file inheritance of a carrier-attached method through `: Parent`
-   does not resolve at all.** `---@class C : P1` where `P1`'s carrier
-   attaches `function T1:m()` in the *same file* reads `c.m` as `LB0306`
-   undefined field — even though `m` visibly exists on `P1`. Move `P1` to
-   its own file and the identical shape resolves cleanly. Field inheritance
-   through the identical `: Parent` shape is unaffected — only carrier
-   *methods* hit this. Root cause, read from the source rather than
-   measured: `collect_class`'s ancestry walk only ever reads
-   `self.classes[name].methods`, and a project source file's own classes
-   only get that map populated by `FileTypes::collect`'s post-inference
-   carrier fold — a step that runs to build this file's *exported* surface
-   for other files, and is never written back into the same `TypeEnv`
-   before this file's own obligations are checked. Cross-file consumption
-   works because `merge_file_types` folds the already-collected map.
-2. **A carrier-attached method's signature does not cross the same-project
-   file boundary at all, even with zero duplication.** `f:m()` types as
-   `unknown` when `Foo`'s carrier method lives in a different file than the
-   read — one declaration, no conflict, still `unknown`. This contradicts
-   `ClassDef.methods`'s own doc comment, which says these "resolve on reads
-   and method calls exactly like `---@field` members" workspace-global.
-3. **Operator diamond-conflict resolves first-visited-edge-wins;
+1. **FIXED. Same-file inheritance of a carrier-attached method through
+   `: Parent` used to not resolve at all.** `---@class C : P1` where `P1`'s
+   carrier attaches `function T1:m()` in the *same file* read `c.m` as
+   `LB0306` undefined field — even though `m` visibly existed on `P1`.
+   Moving `P1` to its own file made the identical shape resolve cleanly.
+   Field inheritance through the identical `: Parent` shape was unaffected —
+   only carrier *methods* hit this. Root cause: `collect_class`'s ancestry
+   walk only ever reads `self.classes[name].methods`, and a project source
+   file's own classes only got that map populated by `FileTypes::collect`'s
+   post-inference carrier fold — a step that runs to build this file's
+   *exported* surface for other files. It reads `env.classes` (already
+   correctly seeded for a checked file, since the CLI batch path folds every
+   project file's surface, itself included, into the ambient before
+   checking any file — `check_cmd.rs`'s `run_passes`), but `absorb_block`'s
+   handling of a first-time local `---@class` declaration threw the seeded
+   `ClassDef` away wholesale and replaced it with an empty one, discarding
+   the `methods` map that seeded value already carried. Nothing else in
+   `absorb_block` (or anywhere before this file's own obligations are
+   checked) ever repopulates it, so the loss was permanent for the rest of
+   that file's own check. `absorb_block` now carries the pre-existing
+   entry's `methods` forward across that overwrite instead of discarding it
+   — the one axis safe to preserve, since nothing else in `absorb_block`
+   ever writes to `methods` in the first place (every other field — parents,
+   fields, indexers, operators, visibility — is correctly re-derived from
+   scratch in the same pass, so resetting those was never the bug).
+   Cross-file consumption was already correct because a class this file does
+   *not* declare is left exactly as the ambient seeded it — only the
+   locally-declared-class overwrite discarded anything.
+2. **FIXED. A carrier-attached method's signature used to not cross the
+   same-project file boundary at all, even with zero duplication.** `f:m()`
+   typed as `unknown` when `Foo`'s carrier method lived in a different file
+   than the read — one declaration, no conflict, still `unknown` — which
+   contradicted `ClassDef.methods`'s own doc comment, promising these
+   "resolve on reads and method calls exactly like `---@field` members"
+   workspace-global. Root cause: reifying an unannotated function's return
+   type stamps `FunctionTy::has_return_annotation` with
+   `returns_set && self.mode.seeds_params()` (`infer::reify::reify_func`) —
+   `false` in `InferMode::Check`, the mode both the checker and
+   `module_surface_from_env`'s surface pass run in. That flag conflates two
+   different questions: whether an unannotated *parameter* was seeded from
+   call-site argument types (a genuine guess, rightly `Display`-mode-only
+   per SPEC §19) and whether a function's *return* type is known at all — a
+   plain deduction from its own `return` statements, no guessing about other
+   call sites involved, and the identical deduction a same-file `f:m()` call
+   already rests a diagnostic on via the live (not-yet-reified) inference
+   path. Reusing the parameter-seeding flag to also gate the return type
+   erased a carrier method's return type the moment it was published into a
+   class's `methods` surface — the one seam `ClassDef.methods` explicitly
+   promises behaves like a `---@field`, and unlike `---@field`, whose type
+   is annotation-derived and never touches this flag. `FileTypes::collect`
+   now promotes `has_return_annotation` to `true` when folding a carrier
+   method into `def.methods` and its return type was actually inferred
+   (`returns` non-empty) — narrowly, at the one seam the doc comment's
+   promise concerns, not in `reify_func` generally: a `require`'d free
+   function's unannotated return type still does not seed a consumer's
+   diagnostics (module exports, inlay display, and
+   `check::conformance`'s same-file `carrier_class_final` fallback all read
+   through the un-promoted value, untouched), matching #56's "annotations
+   are authoritative" rule for that seam. Only a class's own carrier-attached
+   *methods* — declarations, not call-site guesses — cross the boundary with
+   their inferred return type now.
+3. **FIXED. Operator diamond-conflict used to resolve first-visited-edge-wins;
    field/indexer diamond-conflict resolves last-visited-edge-wins — the
-   identical arrival shape, opposite winners**, and the operator rule is
+   identical arrival shape, opposite winners** — and the operator rule was
    not stated anywhere. Cause: operators accumulate as a list resolved by
    "first whose input accepts the operand" (#114) rather than overwriting
-   by key, so the first-added signature always wins ties — an inevitable
-   consequence of that data model, but never written down as a rule anyone
-   could check code against.
-4. **Visibility's unrelated-parents shape resolves last-listed-parent-wins —
-   opposite of indexer/operator's first-listed rule for the identical
-   shape** — via a third, independent mechanism (`walk_ancestor_names`
-   pushes parents onto a stack in declaration order and pops LIFO, so the
-   last-declared parent is visited, and can `Break` the search, first).
-5. A bare (unbound) generic parameter leaks its literal name (e.g. `T`) into
-   user-facing `LB0300` text on both binaries. Documented as "stays free"
-   in `docs/03-reference/02-limitations.md`, but the exact wording — naming
-   an internal type variable to the user — is not itself promised anywhere.
+   by key, so the first-added signature always won ties — an artifact of
+   that data model, not a decision anyone had written down or could check
+   code against. `TypeEnv::collect_operators` now tags each accumulated
+   overload with its owning ancestor name and, on a genuinely competing
+   repeat visit of that ancestor (a diamond conflict — the same
+   `DiamondGuard::visit`-provided `is_first_binding: false` signal
+   `collect_class`'s field/indexer merge already reads), removes that
+   ancestor's earlier entries before appending the fresh ones. The
+   first-match scan is unaffected — it still finds the first entry whose
+   input accepts the operand — but for a diamond-conflicting ancestor there
+   is now only ever one entry, the most-recently-visited edge's, so the
+   scan cannot land on a superseded one. Operator diamond-conflict now
+   resolves **last-visited-edge-wins**, matching field and indexer for the
+   identical shape. The *other* operator rows this page measured
+   (dup-same-file, dup-cross-file, unrelated-parents, diamond-identical) are
+   untouched: none of them puts two entries for the same ancestor in the
+   list, so the new supersede logic never triggers for them.
+4. **FIXED. Visibility's unrelated-parents shape used to resolve
+   last-listed-parent-wins — opposite of indexer/operator's first-listed rule
+   for the identical shape** — via a third, independent mechanism
+   (`walk_ancestor_names` pushed parents onto a stack in declaration order
+   and popped LIFO, so the last-declared parent was visited, and could
+   `Break` the search, first). `walk_ancestor_names` now pushes each class's
+   parents in *reverse* declared order, so the LIFO pop yields the
+   first-declared parent first — ordinary left-to-right preorder traversal.
+   Visibility's unrelated-parents shape now resolves **first-listed-parent-
+   wins**, matching indexer and operator for the identical shape; field's own
+   unrelated-parents rule stays last-listed, per the intentional field/
+   indexer asymmetry the indexer table already calls out below.
+   `walk_ancestor_names`'s other two consumers (`class_method_names`,
+   `is_subclass`) are order-independent and unaffected.
+5. **FIXED. A bare (unbound) generic parameter used to leak its literal name
+   (e.g. `T`) into user-facing `LB0300` text on both binaries.** Still
+   documented as "stays free" in `docs/03-reference/02-limitations.md` — that
+   resolution rule is correct and unchanged — but the exact *wording*, naming
+   an internal type variable to the reader as if it meant something, was
+   never itself promised anywhere, and is not something a reader can act on:
+   `T` is not a value a Lua reference can name or produce. This is the
+   identical shape the #56 export-seam fix (`CHANGELOG.md` Unreleased,
+   "A generic `---@class` carrier no longer exports its unbound type
+   parameter") already solved at the `require` boundary —
+   `TypeEnv::class_shape_bound_export`'s existing erase-to-`unknown`
+   substitution is reused, not reinvented, at every same-file
+   reference-consuming site that can put a member's type in front of a
+   reader: `crate::infer::Infer::lookup_shape_field`/`lookup_ty_field`'s
+   field reads, an `ipairs`/indexer element read, `check::conformance`'s
+   `: Parent` obligation, and `Checker::field_shape`'s table-literal
+   obligation. `Checker::table_shape`/`check::conformance`'s own
+   `class_shape_bound`/`class_shape_bound_export` split keeps each
+   obligation's *presence* gate (`field.optional`/`field.ty.admits_nil()`)
+   reading the raw, non-erasing resolution — erasing the gate itself, not
+   just the displayed text, was measured to silently turn a genuinely
+   missing required member into a "no obligation" (`unknown` admits `nil`)
+   and drop the diagnostic outright, a regression worse than the leak it
+   replaced. Only the *text* is substituted; the verdict — whether a
+   diagnostic fires at all — is unchanged. `Checker::class_shape`/
+   `class_shape_bound` (ambient/LSP template display, e.g. hovering
+   `Box<T>`'s own declaration) and `TypeEnv::resolve_named`'s raw baseline
+   (the `require`-seam's own `erased != resolved` comparison) are
+   deliberately untouched — they answer a different question ("what does
+   this class's template look like") than a value reference does.
+
+**A sixth, previously unfixtured asymmetry is also fixed by this change:**
+`push_operator_overload` deduped a byte-identical `---@operator` repeat when
+called from `merge_file_types` (cross-file) but not from `absorb_block`
+(same-file) — the same-file seam could carry two identical copies of one
+overload where the cross-file seam collapsed them to one, an inconsistency
+of the same kind as findings 3 and 4 even though it never showed up as a
+different *winner* (a repeat identical to the winning entry cannot change
+which signature the first-match scan finds). Both seams now dedupe
+identically, matching every other member kind's "the file boundary does not
+change the merge" rule
+(`docs/03-reference/02-limitations.md`).
 
 ## The matrix
 
@@ -119,7 +227,7 @@ that this cell was measured with.
 | diamond-identical | resolves to the agreed value | **no** — develop leaks the raw type-parameter name instead of resolving (declared fix, see Findings) | `field-E-diamond-identical-binding` |
 | diamond-conflicting | **last**-visited ancestry edge | **no** — develop unobservable (leaks raw name); current confirmed both directions | `field-F-diamond-conflicting-binding` (+ `-swapped`) |
 | bound-vs-bare (bound half) | parent argument substitutes correctly | **no** — develop never binds it (declared fix) | `field-G-generic-bound-vs-bare` |
-| bound-vs-bare (bare half) | stays free, but leaks the literal parameter name into diagnostic text | yes (both leak it) | `field-G-generic-bound-vs-bare` |
+| bound-vs-bare (bare half) | stays free; reads `unknown` in diagnostic text (finding 5, fixed: used to leak the literal parameter name) | **no** — develop still leaks the raw name, this rule is `current`-only | `field-G-generic-bound-vs-bare` |
 
 ### Method (carrier-attached: `function Class:method()`)
 
@@ -127,9 +235,9 @@ that this cell was measured with.
 |---|---|---|---|
 | single | resolves (baseline) | yes | `method-A-single` |
 | dup-same-file (two carriers, one class) | **first**-declared carrier, in statement order | yes | `method-B-two-carriers-same-file` |
-| dup-cross-file | **unobservable** — neither candidate survives; both binaries type the call `unknown` (finding 2) | yes | `method-C-merge-file-types-cross-file` (+ `-reversed`), control: `method-inheritance-cross-file-control` |
-| unrelated-parents | **N/A — inheritance itself is broken** (finding 1); `LB0306` regardless of order | yes | `method-D-unrelated-parents` (+ `-swapped`), repro: `method-inheritance-gap-same-file` |
-| diamond-identical | **N/A**, same reason | yes | `method-E-diamond-identical` |
+| dup-cross-file | **first**-processed file, matching every other member kind's dup-cross-file rule (finding 2, fixed: was unobservable — both binaries used to type the call `unknown`) | **no** — develop still unobservable, this rule is `current`-only | `method-C-merge-file-types-cross-file` (+ `-reversed`), zero-dup repro: `method-cross-file-signature-gap` (+ field control) |
+| unrelated-parents | **last**-listed parent, matching field-D (finding 1, fixed: was N/A — `LB0306` regardless of order) | **no** — develop still N/A, this rule is `current`-only | `method-D-unrelated-parents` (+ `-swapped`), repro: `method-inheritance-gap-same-file` (+ cross-file control) |
+| diamond-identical | resolves to the agreed value (finding 1, fixed: was N/A, same reason) | **no** — develop still N/A | `method-E-diamond-identical` |
 | diamond-conflicting | **N/A** — methods carry no type parameter to bind two ways; substitute test (declaration overriding an inherited attachment) confirms declaration wins, unremarkable | yes | `method-F-diamond-conflicting-via-field-override` |
 | declaration-vs-attachment (same name, same class) | `---@field` declaration's type wins over the carrier attachment | yes | `method-G-field-declaration-beats-attachment` |
 
@@ -144,11 +252,15 @@ that this cell was measured with.
 | diamond-identical | resolves to the agreed value | **no** — develop leaks raw name (declared fix) | `indexer-E-diamond-identical-binding` |
 | diamond-conflicting | **last**-visited ancestry edge | **no** — develop unobservable; current confirmed both directions | `indexer-F-diamond-conflicting-binding` (+ `-swapped`) |
 | bound-vs-bare (bound half) | substitutes correctly | **no** — develop never binds it (declared fix) | `indexer-G-generic-bound-vs-bare` |
-| bound-vs-bare (bare half) | leaks literal parameter name | yes | `indexer-G-generic-bound-vs-bare` |
+| bound-vs-bare (bare half) | reads `unknown` (finding 5, fixed: used to leak the literal parameter name) | **no** — develop still leaks the raw name, this rule is `current`-only | `indexer-G-generic-bound-vs-bare` |
 
 Note the **field/indexer asymmetry on unrelated-parents** (field: last-listed
 wins; indexer: first-listed wins) is intentional and is the one precedence
 axis `CHANGELOG.md`/`collect_class`'s own doc comment states explicitly.
+Operator and visibility (below) both resolve unrelated-parents
+first-listed-wins too, so indexer/operator/visibility now agree with each
+other on this axis and field is the one deliberate exception, not one voice
+in a three-way disagreement.
 
 ### Operator (`---@operator op(...): R`)
 
@@ -159,7 +271,7 @@ axis `CHANGELOG.md`/`collect_class`'s own doc comment states explicitly.
 | dup-cross-file | **first**-processed file's overload, same scan mechanism | yes | `operator-C-merge-file-types-dup-cross-file` |
 | unrelated-parents | **first**-listed parent | yes | `operator-D-unrelated-parents` (+ `-swapped`) |
 | diamond-identical | resolves to the agreed value | **no** — develop leaks raw name (declared fix) | `operator-E-diamond-identical-binding` |
-| diamond-conflicting | **first**-visited ancestry edge — **opposite of field/indexer's last-wins for the identical shape** (finding 3), confirmed both directions | **no** — develop unobservable (leaks raw name in both checks, not just one) | `operator-F-diamond-conflicting-binding` (+ `-swapped`) |
+| diamond-conflicting | **last**-visited ancestry edge — matches field/indexer for the identical shape (finding 3, fixed: was first-visited), confirmed both directions | **no** — develop unobservable (leaks raw name in both checks, not just one) | `operator-F-diamond-conflicting-binding` (+ `-swapped`) |
 | bound-vs-bare | not separately fixtured; substitution follows the same `collect_operators` binding as fields/indexers | — | — |
 
 ### Type parameter (a class's own `<T, U, ...>` list)
@@ -179,7 +291,7 @@ axis `CHANGELOG.md`/`collect_class`'s own doc comment states explicitly.
 | single | enforces (baseline) | yes | `visibility-A-single-private` |
 | dup-same-file, conflicting scopes | **first** declaration wins **atomically** with the field itself — the second `---@field` line is skipped whole, scope included, before its own scope is ever read | yes | `visibility-B-absorb-block-conflicting-scopes` |
 | dup-cross-file, conflicting scopes | **first**-processed file | yes | `visibility-C-merge-file-types-conflicting-scopes` (+ `-reversed`) |
-| unrelated-parents, conflicting scopes | **last**-listed parent — **opposite of indexer/operator's first-listed rule for the identical shape** (finding 4), via a third, unrelated mechanism (LIFO ancestor-name stack) | yes | `visibility-D-unrelated-parents-conflicting-scope` (+ `-swapped`) |
+| unrelated-parents, conflicting scopes | **first**-listed parent — matches indexer/operator's first-listed rule for the identical shape (finding 4, fixed: was last-listed via a LIFO `walk_ancestor_names` stack pop order; the stack now pushes reversed, so ordinary declaration-order traversal decides it, the same left-to-right rule every other seam in this document already reads for "first") | yes | `visibility-D-unrelated-parents-conflicting-scope` (+ `-swapped`) |
 | diamond, same owner reached twice | unambiguous — both edges reach the identical declaration, nothing to arbitrate | yes | `visibility-E-diamond-identical-owner` |
 | diamond-conflicting | **N/A** — visibility isn't parameterized by generic arguments, so a diamond cannot bind it two different ways | — | — |
 

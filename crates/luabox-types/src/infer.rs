@@ -884,7 +884,14 @@ impl Infer<'_> {
                 // undefined-field read (#90) — provable UNLESS the class
                 // declares an indexer / array part (dynamic access is
                 // declared, so any string key is admissible).
-                if let Some(shape) = self.env.class_shape(&class) {
+                //
+                // `class_shape_bound_export`, not `class_shape`: this reads
+                // a *value's* field, not a template on display, so a bare
+                // reference's own unbound generic parameter must not leak
+                // its literal name into the field's type (finding 5 of the
+                // production readiness review) — same rule the `require`
+                // boundary already applies (#56).
+                if let Some(shape) = self.env.class_shape_bound_export(&class, &[]) {
                     if let Some(field) = shape.fields.get(name) {
                         let ty = if field.optional {
                             field.ty.clone().optional()
@@ -990,7 +997,12 @@ impl Infer<'_> {
                 }
             }
             Ty::Named(class) => {
-                let Some(resolved) = self.env.resolve_named(class) else {
+                // `resolve_named_bound`, not `resolve_named`: a field read
+                // is a reference-consuming site (finding 5, production
+                // readiness review) — an unbound generic parameter reads as
+                // `unknown` here, the same rule the `require` boundary
+                // already applies (#56), not its own literal name.
+                let Some(resolved) = self.env.resolve_named_bound(class) else {
                     return Lookup::Opaque;
                 };
                 if let Lookup::Found(ity) = self.lookup_ty_field(&resolved, name) {
@@ -1104,7 +1116,11 @@ impl Infer<'_> {
                 }
                 ity_union(parts)
             }
-            ITy::Ty(Ty::Named(class)) => match self.env.resolve_named(class) {
+            // `resolve_named_bound`: an `ipairs`/array-index element type is
+            // as much a reference-consuming site as a field read (finding 5,
+            // production readiness review) — a bare generic's unbound
+            // parameter must not leak its literal name into it.
+            ITy::Ty(Ty::Named(class)) => match self.env.resolve_named_bound(class) {
                 Some(resolved) => self.elem_ty(&ITy::Ty(resolved)),
                 None => ITy::unknown(),
             },
@@ -1153,7 +1169,9 @@ impl Infer<'_> {
                 }
                 (ity_union(keys), ity_union(values))
             }
-            ITy::Ty(Ty::Named(class)) => match self.env.resolve_named(class) {
+            // `resolve_named_bound`: same reference-consuming rule as
+            // `elem_ty` above (finding 5, production readiness review).
+            ITy::Ty(Ty::Named(class)) => match self.env.resolve_named_bound(class) {
                 Some(resolved) => self.pairs_tys(&ITy::Ty(resolved)),
                 None => (ITy::unknown(), ITy::unknown()),
             },

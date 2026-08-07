@@ -183,6 +183,106 @@ and that rule is now written into the policy rather than left to judgement.
   `---@field`. Previously both seams simply appended, so one merged class
   could carry the same key twice and resolve it by scan order.
 
+- **A class inheriting a carrier-attached method (`function Class:method()`)
+  from a same-file parent now resolves it, and the method's own inferred
+  return type now crosses a `require`d project file boundary**
+  (`docs/03-reference/03-class-merge-precedence.md`, findings 1 and 2). Two
+  independent gaps, both fixed:
+
+  - **Same-file inheritance.** `---@class C : P1` where `P1`'s carrier
+    attaches `function T1:m()` in the *same file* used to read `c.m` as a
+    false `LB0306` "undefined field" — even though `m` visibly existed on
+    `P1` — while the identical shape resolved cleanly the moment `P1` moved
+    to its own file. Cross-file consumption already worked because
+    `merge_file_types` folds a class's already-collected carrier-method
+    surface in; same-file did not, because `absorb_block` discarded that
+    same surface — already correctly seeded from this file's own earlier
+    surface pass — every time it (re)declared one of this file's own
+    classes. `absorb_block` now carries a class's already-known methods
+    forward across that declaration instead of discarding them. Every other
+    axis (parents, fields, indexers, operators, visibility) is unaffected —
+    they were already, correctly, re-derived from scratch on every
+    declaration; only `methods`, which nothing else in `absorb_block` ever
+    writes, was silently losing its seeded value.
+  - **Cross-file signature transport.** `f:m()` used to type as `unknown`
+    when `Foo`'s carrier method lived in a different project file than the
+    read, even with zero cross-file duplication to arbitrate — contradicting
+    `ClassDef.methods`'s own doc comment, which promises a carrier method
+    resolves "exactly like `---@field` members" workspace-global. The
+    reifier gated a function's inferred *return* type behind the same flag
+    that (rightly) blocks an unannotated *parameter* from being seeded off
+    call-site argument types — a guess `Display` mode allows and the checker
+    must not (SPEC §19) — even though a body's own inferred return type is a
+    plain deduction, not a call-site guess, and same-file `f:m()` calls
+    already trusted it. A carrier method's inferred return type now survives
+    being published into a class's workspace-global `methods` surface;
+    everything else that flows through the same reifier — `require` exports,
+    inlay display, `: Interface` conformance's carrier fallback — is
+    untouched, so an unannotated free function still does not leak its
+    inferred signature across a `require` boundary.
+
+  Both are narrowing fixes for code that leaned on the old false negative:
+  a same-file class inheriting a carrier method it previously couldn't see,
+  or a cross-file carrier-method call whose mistyped argument previously
+  passed silently as `unknown`, may now report a real `LB0306`/`LB0300`.
+
+- **Two more class-merge precedence rules now agree with the rest of the
+  matrix instead of contradicting it, and duplicate `---@operator` overloads
+  dedupe the same way regardless of which file they repeat in**
+  (`docs/03-reference/03-class-merge-precedence.md`, findings 3 and 4). Both
+  are behaviour changes for a project relying on the old, undocumented
+  order:
+
+  - **`---@operator` diamond conflicts now resolve last-visited-edge-wins**,
+    matching `---@field` and indexer for the identical shape (one ancestor
+    reached twice through a generic diamond with conflicting type
+    arguments, e.g. `A : Base<number>`, `B : Base<string>`, `C : A, B`).
+    Previously the *first*-visited edge won — the opposite of field/indexer
+    — an artifact of operators being resolved by a first-match scan (#114)
+    rather than an overwrite, never stated as a rule anywhere. A project
+    whose diamond-conflicting classes disagree on an operator's result type
+    will see that operator's result flip to the other candidate.
+  - **Visibility's unrelated-parents shape now resolves first-listed-
+    parent-wins**, matching indexer and operator for the identical shape
+    (`---@class C : P1, P2`, both declaring conflicting visibility on the
+    same member name). Previously it resolved *last*-listed-parent-wins, via
+    a third, independent mechanism (`walk_ancestor_names`'s LIFO ancestor
+    stack) that disagreed with both. A project with such a class will see
+    the enforced scope switch to the first-listed parent's — a member that
+    read as public because a later, unrestricted parent won may now report
+    `LB0312`, and vice versa.
+  - **A duplicate `---@operator` overload, byte-identical to one already on
+    the class, now dedupes the same way whether the repeat is in the same
+    file or a different one.** The cross-file seam
+    (`TypeEnv::merge_file_types`) already deduped an identical repeat; the
+    same-file seam (`TypeEnv::absorb_block`) did not, so a literal
+    copy-paste of one `---@operator` tag onto a second `---@class` block for
+    the same name kept two identical entries where the cross-file
+    equivalent kept one. Never observable as a different resolved *result*
+    (a repeat identical to the winning entry cannot change which signature
+    the first-match scan finds), so this is a representation fix, not a
+    verdict change.
+
+- **A bare reference to a generic ancestor no longer leaks its unbound type
+  parameter's literal name into `LB0300` text**
+  (`docs/03-reference/03-class-merge-precedence.md`, finding 5). `---@class
+  Sub : Base` naming a generic `Base` without `<...>` left `Base`'s own
+  parameter free, exactly as documented — but every same-file diagnostic
+  that named the free parameter's *type* printed its literal spelling
+  (`found T`, `expected member item of type T`) rather than `unknown`: a
+  type variable the reader can neither name nor produce, in a message that
+  therefore pointed at no action. This is the identical shape the #56
+  export-seam fix above already solved at the `require` boundary — reused
+  here rather than re-invented: a field read, an `ipairs`/indexer read, a
+  `: Parent` conformance obligation, and a table-literal's expected shape
+  now each read a bare ancestor's unbound parameter as `unknown`, matching
+  what a bare `Box` reference and a `require`d export already print. The
+  obligation itself is unaffected — a `: Parent` conformance check and a
+  table-literal's missing-field check still decide *whether* a member is
+  required from the parameter's real (unerased) type; only the *displayed*
+  type of an already-detected mismatch or a genuinely missing member is
+  substituted, so this is a diagnostic-text fix, not a verdict change.
+
 - **Inlay hints and hover no longer lose a require'd carrier's member types.**
   Introduced and fixed inside this same block: when the export seam started
   reifying against the merged project ambient, the *display*-mode queries

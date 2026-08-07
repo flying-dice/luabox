@@ -79,3 +79,33 @@ pub fn check_cross<S: AsRef<str>>(files: &[S], consumer: &str) -> Vec<String> {
         .map(|d| d.code.to_string())
         .collect()
 }
+
+/// [`check`], but self-inclusive: `src`'s own workspace surface is folded
+/// into its own checking ambient before `src` is checked against it —
+/// mirroring the CLI batch path's project-wide ambient (`check_cmd.rs`'s
+/// `run_passes`: every project file's surface, the file *being checked*
+/// included, is reified and merged before any file is checked; see
+/// `docs/03-reference/03-class-merge-precedence.md`'s finding 1). `check`
+/// alone (stdlib ambient only) cannot exercise a class seeing its own
+/// same-file carrier-attached methods through inheritance from a same-file
+/// parent: `TypeEnv::collect_class`'s ancestry walk only ever reads
+/// `TypeEnv::classes[name].methods`, and nothing populates that for a
+/// project file's own declarations except this self-fold — `check_cross`
+/// exercises the cross-file half (a library file's already-folded surface
+/// merging into a *different* consumer's ambient) but, like `check`, never
+/// folds `consumer` beneath its own ambient, so it cannot stand in for this
+/// either.
+pub fn check_self(src: &str) -> Vec<Diagnostic> {
+    let base = stdlib_defs(Dialect::Lua54);
+    let own = surface(src, base);
+    let ambient = base.with_project_types(std::iter::once(&own));
+    let parsed = parse(src, Dialect::Lua54);
+    assert_eq!(parsed.errors(), &[], "fixture must parse cleanly:\n{src}");
+    check_file_with_ambient(
+        &parsed,
+        "test.lua",
+        Strictness::Strict,
+        Dialect::Lua54,
+        Some(&ambient),
+    )
+}

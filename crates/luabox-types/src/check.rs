@@ -315,6 +315,30 @@ struct Checker<'a> {
     async_ctx: Vec<bool>,
 }
 
+/// [`Checker::table_shape`]/[`Checker::field_shape`]'s shared unwrap of a
+/// `T?`/`T|nil` optional around an object type, resolving a bare
+/// `Ty::Named` through whichever `resolve` the caller supplies — the one
+/// place either method's structural recursion (through a union) lives.
+/// A free function, not a method: it never touches `self` except to
+/// recurse.
+fn object_shape(
+    expected: &Ty,
+    resolve: &impl Fn(&str) -> Option<TableTy>,
+) -> Option<(Option<String>, TableTy)> {
+    match expected {
+        Ty::Named(name) => resolve(name).map(|shape| (Some(name.clone()), shape)),
+        Ty::Table(table) => Some((None, (**table).clone())),
+        Ty::Union(members) => {
+            let non_nil: Vec<&Ty> = members.iter().filter(|m| **m != Ty::Nil).collect();
+            match non_nil[..] {
+                [single] => object_shape(single, resolve),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 impl Checker<'_> {
     // --- plumbing ------------------------------------------------------
 
@@ -992,7 +1016,7 @@ impl Checker<'_> {
         // A field of a typed value: look it up in the structural shape.
         if let (Some(base), Some(member)) = (field.base(), field.field_name()) {
             let base_ty = self.expr_ty(&base);
-            if let Some((_, shape)) = self.table_shape(&base_ty)
+            if let Some((_, shape)) = self.field_shape(&base_ty)
                 && let Some(fld) = shape.fields.get(member.text())
             {
                 return if fld.optional {
@@ -1598,22 +1622,34 @@ impl Checker<'_> {
 
     /// Resolve an expected type to a checkable table shape (unwrapping a
     /// `T?`/`T|nil` optional around it).
+    ///
+    /// Deliberately the raw (non-erasing) resolution: [`Checker::check_table_literal`]
+    /// runs `field.optional`/`field.ty.admits_nil()` against this shape to
+    /// decide which fields a literal is actually obliged to provide, and
+    /// erasing an unbound generic parameter to `unknown` here would make it
+    /// `admits_nil() == true` — silently dropping that obligation rather than
+    /// just misnaming it in text (production readiness review finding 5's
+    /// first attempt, measured and reverted). [`Checker::check_table_literal`]
+    /// builds its own display-only twin of this shape for message text,
+    /// leaving this one's gating untouched. [`Self::field_ty`] — a genuine
+    /// reference-consuming *read*, not an obligation gate — wants
+    /// [`Self::field_shape`] instead.
     fn table_shape(&self, expected: &Ty) -> Option<(Option<String>, TableTy)> {
-        match expected {
-            Ty::Named(name) => self
-                .env
-                .class_shape(name)
-                .map(|shape| (Some(name.clone()), shape)),
-            Ty::Table(table) => Some((None, (**table).clone())),
-            Ty::Union(members) => {
-                let non_nil: Vec<&Ty> = members.iter().filter(|m| **m != Ty::Nil).collect();
-                match non_nil[..] {
-                    [single] => self.table_shape(single),
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
+        object_shape(expected, &|name| self.env.class_shape(name))
+    }
+
+    /// [`Self::table_shape`], except a `Ty::Named` resolves through
+    /// [`crate::env::TypeEnv::class_shape_bound_export`]: a bare reference's
+    /// own unbound generic parameter reads as `unknown` rather than its
+    /// literal name (finding 5, production readiness review) — the same rule
+    /// the `require` boundary already applies (#56). [`Self::field_ty`] is
+    /// this method's only caller: it types an *expression* (`s.item`), never
+    /// gates a presence obligation, so nothing here needs `table_shape`'s raw
+    /// resolution.
+    fn field_shape(&self, expected: &Ty) -> Option<(Option<String>, TableTy)> {
+        object_shape(expected, &|name| {
+            self.env.class_shape_bound_export(name, &[])
+        })
     }
 
     /// Field-level check of a table constructor against a structural shape
@@ -1658,6 +1694,16 @@ impl Checker<'_> {
 
         let declared_by = class.map(|c| format!("declared by `---@class {c}`"));
 
+        // Display-only twin of `shape`, `class`'s own left-unbound generic
+        // parameters read as `unknown` rather than their literal name
+        // (finding 5, production readiness review) — never consulted for the
+        // `field.optional`/`admits_nil` obligation gate below, which must
+        // keep reading `shape`'s raw (non-erasing) resolution or an unbound
+        // parameter's `unknown` would `admits_nil() == true` and silently
+        // drop the obligation instead of just misnaming it (measured;
+        // `table_shape`'s doc comment has the regression this avoided).
+        let display_shape = class.and_then(|c| self.env.class_shape_bound_export(c, &[]));
+
         // Missing required fields — one diagnostic each, naming the field.
         // Carrier member attachments (`function Class:method` collected from
         // the declaring file) resolve on reads but carry no literal
@@ -1672,11 +1718,15 @@ impl Checker<'_> {
                 && !present.contains_key(name)
                 && !attached.contains(name)
             {
+                let display_ty = display_shape
+                    .as_ref()
+                    .and_then(|s| s.fields.get(name))
+                    .map_or_else(|| field.ty.clone(), |f| f.ty.clone());
                 self.report_full(
                     MISSING_FIELD,
                     range(table.syntax()),
                     format!("missing required field `{name}` in table literal"),
-                    format!("expected field `{name}` of type `{}`", field.ty),
+                    format!("expected field `{name}` of type `{display_ty}`"),
                     declared_by.clone(),
                 );
             }
