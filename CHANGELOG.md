@@ -148,6 +148,19 @@ and that rule is now written into the policy rather than left to judgement.
 
 ### Fixed
 
+- **A type-mismatch remedy suffix was introduced and withdrawn inside this
+  same block.** Round 3 review F72 had `check_slot` append `" (add `---@type
+  <expected>` to check it)"` to a `LB0300`/`LB0304` message whenever the
+  found type was `unknown`. Round 4 review R12 withdrew it: `slot` there is
+  the mismatching *expression* — a call argument or a `return` value — never
+  the binding `---@type` actually attaches to, so the note pointed at a site
+  the reader cannot annotate; and it fired for return-type mismatches too,
+  where `---@type` is not even the applicable tag (`---@return` is). Net
+  effect on this release: none — the suffix never reached a tagged version,
+  only intermediate builds of this same Unreleased block. Noted here because
+  diagnostic text is observable output a downstream tool can grep, and this
+  one changed twice before anyone outside this PR could see either version.
+
 - **Inlay hints and hover no longer lose a require'd carrier's member types.**
   Introduced and fixed inside this same block: when the export seam started
   reifying against the merged project ambient, the *display*-mode queries

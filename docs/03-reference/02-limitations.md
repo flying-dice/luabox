@@ -776,8 +776,9 @@ environment** the checker enforces, so the editor cannot offer what
 `luabox check` rejects or omit what it accepts.
 
 The table below is still measured, not assumed — the same fixtures pin the
-new behaviour: `tests/features/lsp/hover-require.feature` for the editor
-columns, `tests/features/frontend/require.feature` for CI.
+new behaviour: `crates/luabox-cli/tests/features/lsp/hover-require.feature`
+for the editor columns, `crates/luabox-cli/tests/features/frontend/require.feature`
+for CI.
 
 Given `---@class Point` / `---@field x number` in `point.lua` and
 `local p = require("point")` in the consumer:
