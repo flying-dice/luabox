@@ -1089,7 +1089,20 @@ fn collect_tokens(root: &lua::SyntaxNode) -> Vec<Tk> {
             let r = token.text_range();
             let kind = token.kind();
             let is_comment = kind == SyntaxKind::COMMENT;
-            let is_ws = kind == SyntaxKind::WHITESPACE;
+            // A leading BOM/`#!` line (`SyntaxKind::is_file_prefix`) is
+            // trivia here exactly as whitespace is: `resolve_target`'s
+            // backward scan for "the real token before this doc-comment
+            // block" must skip past it, or a doc block that opens the file
+            // (right after the BOM/shebang) is misread as a *trailing*
+            // comment on a nonexistent preceding statement instead of a
+            // *leading* one on the statement that follows — `resolve_target`
+            // returns `None`, the class/field the block declares gets no
+            // `item.target`, and the carrier that statement declares never
+            // gets linked to its class (silently: no parse error, no
+            // diagnostic, just a lost `require`-export identity two layers
+            // up). Neither token contains a newline itself, so folding them
+            // into `is_ws` does not perturb `adjacent`'s newline count.
+            let is_ws = kind == SyntaxKind::WHITESPACE || kind.is_file_prefix();
             let newlines = if is_ws {
                 token.text().bytes().filter(|&b| b == b'\n').count()
             } else {

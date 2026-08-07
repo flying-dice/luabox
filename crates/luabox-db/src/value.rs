@@ -262,6 +262,60 @@ unsafe impl salsa::Update for OutgoingCalls {
     }
 }
 
+/// The memoized project-wide class/enum contribution merge (#85, round 4
+/// review R14): every project file's [`luabox_types::FileTypes`], filtered
+/// to the files that declare anything.
+///
+/// Before this wrapper, `project_types_checked` was a plain function, not a
+/// tracked salsa query — and it has three per-file callers
+/// (`module_export`, `binding_types`, `module_export_checked`), each itself
+/// a tracked query keyed on `(file, project)`. A display pass over an
+/// N-file project calls one of those N times, and each call rebuilt this
+/// `Vec<FileTypes>` (and paid the `with_project_types` merge over it) from
+/// scratch — O(N) work per file, O(N²) total. Making the query itself
+/// tracked collapses that to O(N): the merge runs once per project
+/// revision and every per-file caller shares the memo.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectTypes(Arc<Vec<luabox_types::FileTypes>>);
+
+impl ProjectTypes {
+    pub(crate) fn new(types: Vec<luabox_types::FileTypes>) -> Self {
+        Self(Arc::new(types))
+    }
+
+    /// Every project file's workspace-global class/enum contribution.
+    #[must_use]
+    pub fn types(&self) -> &[luabox_types::FileTypes] {
+        &self.0
+    }
+}
+
+/// Lets a caller hold or pass `ProjectTypes` exactly where it used to hold
+/// or pass `&[FileTypes]` — `&project_types` deref-coerces straight through
+/// (round 4 review finding 2: `Host::project_types()` used to hand back a
+/// fresh `Vec<FileTypes>` built by `.to_vec()`ing this same slice, deep
+/// cloning every file's class/enum/alias maps on every call. `ProjectTypes`
+/// is already `Arc`-backed and cheap to clone; this `Deref` is what lets
+/// `Host::project_types()` return the wrapper itself — a refcount bump —
+/// with no source change at any of its call sites (`MergedAmbient::build`'s
+/// `&[FileTypes]` parameter, `.iter()`, `with_project_types`'s
+/// `IntoIterator`, ...).
+impl std::ops::Deref for ProjectTypes {
+    type Target = [luabox_types::FileTypes];
+
+    fn deref(&self) -> &Self::Target {
+        self.types()
+    }
+}
+
+// SAFETY: fully-owned `Arc` payload; replacement via `PartialEq`.
+unsafe impl salsa::Update for ProjectTypes {
+    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
+        // SAFETY: forwarded from the `Update` contract.
+        unsafe { replace_if_ne(old_pointer, new_value) }
+    }
+}
+
 // SAFETY: fully-owned `Arc` payload; replacement via `PartialEq`.
 unsafe impl salsa::Update for BindingTypes {
     unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {

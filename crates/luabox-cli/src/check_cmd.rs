@@ -315,11 +315,61 @@ fn run_passes(project: &Project, passes: TargetPasses, format: Format) -> anyhow
     // consumer once the *consumer's* fully-merged env resolved `Sub` back to
     // its real, still-unbound shape. `luabox-db`'s `module_export_checked`
     // closes the identical gap for the LSP path this same way; only `.export`
-    // is re-derived here — `.types` (each file's own declarations) does not
-    // depend on cross-file visibility and is unchanged by the merge, so
-    // recomputing it a second time would be wasted work, not a correctness
-    // requirement.
-    let exports_by_file: Vec<Option<Ty>> = files
+    // is re-derived here. `.types` (each file's own declarations) is NOT
+    // re-derived — measurably NOT because it is independent of cross-file
+    // visibility (round 4 review R15: it is not — `---@field p Point` with
+    // `Point` declared in another file lowers against the defs-only ambient
+    // `surfaces` was built with, so the `.types` published above carries
+    // `p: unknown`, while this same merged ambient would resolve it to
+    // `p: Point`), but because that gap is pre-existing and out of scope
+    // here: this pass closes F42's export-seam gap, not every place a
+    // project file's own declarations go stale relative to the full project
+    // merge.
+    //
+    // Each file's `TypeEnv` against `ambient` is built, used, and dropped
+    // right here — NOT threaded through to `check_one` (round 4 review
+    // finding 6, reverting round 4 review R14's env-sharing).
+    //
+    // R14 kept the `TypeEnv` this pass builds around for `check_one` to
+    // reuse instead of building a second one: `TypeEnv::build_from_items`
+    // clones the whole `ambient` class/enum/function/global surface into a
+    // fresh owned map every time it runs, so skipping the second clone
+    // measurably cut CPU time (synthetic N-file project, each with two
+    // small classes, a linear `require` chain, release build):
+    //
+    //   N      2 builds/file (transient)   1 build/file (R14, retained)
+    //   500    1.32s                       0.75s
+    //   1000   6.15s                       3.29s
+    //   2000   26.6s                       13.6s
+    //
+    // What R14 did not measure is what "retained" costs in *peak memory*:
+    // every file's env is independently O(project class count), and the
+    // export registry's dependency (every file's export must be known
+    // before any file's `require`s can resolve, so the check phase cannot
+    // start until every file's export pass has finished) means R14 had to
+    // collect *all* of them into one `Vec<TypeEnv>` alive across the whole
+    // pass — O(files) envs, each O(classes), an O(N²) peak just for the
+    // retained array on an N-file project where file count and class count
+    // scale together, which the CPU-time table above cannot show at all.
+    // Measured (same shape, two-class-per-file synthetic project, peak RSS
+    // via `scripts/peak-rss.py`, release build):
+    //
+    //   N      2 builds/file (transient)   1 build/file (R14, retained)
+    //   100    15 MiB                      79 MiB
+    //   500    49 MiB                      1419 MiB
+    //
+    // A ~29x memory blowup at N=500 for a ~1.76x CPU win is the wrong side
+    // of that trade — a project large enough to make the CPU saving matter
+    // is exactly the project large enough for the retained-`Vec<TypeEnv>`
+    // memory to become the dominant cost, or exhaust memory outright, well
+    // before `check` finishes. Back to two transient builds per file: the
+    // export re-derivation pass below drops its own env the moment it has
+    // this file's `.export` (`module_surface_with_artifacts`, matching the
+    // very first surface pass above), and `check_one` builds and drops its
+    // own separately (`check_file_with_artifacts`) — at any instant only as
+    // many envs are alive as there are rayon workers in flight, not one per
+    // project file.
+    let file_exports: Vec<Option<Ty>> = files
         .par_iter()
         .map(|file| {
             luabox_types::module_surface_with_artifacts(
@@ -331,11 +381,12 @@ fn run_passes(project: &Project, passes: TargetPasses, format: Format) -> anyhow
             .export
         })
         .collect();
-    let mut exports: HashMap<PathBuf, Ty> = files
-        .iter()
-        .zip(&exports_by_file)
-        .filter_map(|(file, export)| Some((file.canonical.clone(), export.clone()?)))
-        .collect();
+    let mut exports: HashMap<PathBuf, Ty> = HashMap::new();
+    for (export, file) in file_exports.into_iter().zip(&files) {
+        if let Some(export) = export {
+            exports.insert(file.canonical.clone(), export);
+        }
+    }
     // Rock exports join the same path-keyed registry (#30). Keying by path (not
     // by module name) is what keeps precedence exact: `resolve_requires` asks
     // the bundler which *file* a `require` names, and a project file that
@@ -346,12 +397,13 @@ fn run_passes(project: &Project, passes: TargetPasses, format: Format) -> anyhow
 
     // SPEC.md §16: rayon per-module. Each file is checked against the
     // shared project ambient plus its own resolved `require` exports;
-    // collecting per-file Vecs preserves source order.
+    // collecting per-file Vecs preserves source order. Builds its own
+    // `TypeEnv` (see the doc comment above `file_exports`).
     let per_file: Vec<Vec<Diagnostic>> = files
         .par_iter()
         .map(|file| {
             let mut diags = Vec::new();
-            check_one(file, project, passes, ambient, &exports, &mut diags);
+            check_one(file, ambient, project, passes, &exports, &mut diags);
             diags
         })
         .collect();
@@ -379,11 +431,19 @@ struct SourceFile {
 }
 
 /// All three passes for one file.
+///
+/// `ambient` is the project-merged ambient; the type pass below
+/// (`check_file_with_artifacts`) builds and drops its own `TypeEnv` against
+/// it, rather than reusing one threaded in from [`run_passes`] (round 4
+/// review finding 6 reverted round 4 review R14's env-sharing — see the doc
+/// comment above `file_exports` in [`run_passes`] for the measurement: R14's
+/// retained `Vec<TypeEnv>` was an O(N²)-peak-memory regression, ~29x at
+/// N=500 on the benchmark project, for a ~1.76x CPU win).
 fn check_one(
     file: &SourceFile,
+    ambient: &Ambient,
     project: &Project,
     passes: TargetPasses,
-    ambient: &Ambient,
     exports: &HashMap<PathBuf, Ty>,
     diags: &mut Vec<Diagnostic>,
 ) {

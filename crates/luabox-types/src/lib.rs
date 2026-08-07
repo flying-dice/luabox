@@ -266,17 +266,91 @@ pub fn module_surface_with_artifacts(
     ambient: Option<&Ambient>,
     artifacts: &FileArtifacts,
 ) -> ModuleSurface {
+    let env = build_file_env(parse, artifacts, ambient);
+    module_surface_from_env(&env, file, artifacts)
+}
+
+/// The environment [`module_surface_from_env`]/[`check_file_from_env`] share
+/// — split out for a caller needing both against the *same* `ambient` that
+/// has a place to hold `env` across both calls.
+///
+/// [`module_surface_with_artifacts`] and [`check_file_with_artifacts`] each
+/// build their own `env` this way and discard it after one use, which is
+/// **deliberate**, not merely "the simple option" (round 4 review finding 6
+/// reverted round 4 review R14's attempt at sharing one build across both
+/// halves in the CLI batch path, `check_cmd.rs`'s `run_passes` — see that
+/// function's doc comment for the measurement): the check half needs every
+/// file's export already collected into the project-wide `require` registry
+/// before any file can be checked, so a caller cannot fold this and
+/// [`check_file_from_env`] into one per-file call — it has to build the
+/// export half for every file, THEN check every file. R14 kept each file's
+/// built `TypeEnv` alive in a `Vec` across that gap instead of building a
+/// second one; that traded CPU time for peak memory that scales with
+/// (file count × ambient size) instead of (rayon parallelism × ambient
+/// size) — an O(N²)-ish regression measured at ~29x peak RSS on a 500-file
+/// synthetic project for a ~1.76x CPU win, the wrong side of that trade at
+/// realistic project sizes.
+///
+/// **Do not thread one `env` from this function across a `rayon` pass over
+/// a project's files** — that is the CLI batch path
+/// (`check_cmd.rs`'s `run_passes`) above all; it is exactly the shape R14
+/// had and reverted. Re-measured independently for the gate below (N-file
+/// project, two `---@class` declarations per file, a linear `require`
+/// chain, release build, peak RSS via `scripts/peak-rss.py`, three runs
+/// each):
+///
+///   N      one build/file (this function, per call)   one retained `Vec<TypeEnv>` (R14)
+///   100    11 MiB                                       51 MiB   (4.6x)
+///   200    15 MiB                                      145 MiB   (9.3x)
+///   300    20 MiB                                      290 MiB  (14.5x)
+///   500    29 MiB                                      734 MiB  (25.3x)
+///
+/// `scripts/perf-gate.sh`'s "RETAINED-TYPEENV REGRESSION GATE" leg
+/// reproduces the N=500 row on every CI run (budget 100 MiB — the
+/// transient column has ~3x headroom under it, the retained column misses
+/// it by ~7x) specifically so this regression fails loudly instead of
+/// shipping again. `build_file_env` still exists for a caller with a good
+/// reason to hold `env` across two calls of its own on ONE file — just
+/// budget the same tradeoff before reaching for it across many.
+#[must_use]
+pub fn build_file_env(
+    parse: &lua::Parse,
+    artifacts: &FileArtifacts,
+    ambient: Option<&Ambient>,
+) -> TypeEnv {
+    TypeEnv::build_from_items(parse, &artifacts.items, ambient)
+}
+
+/// [`module_surface_with_artifacts`] over an already-built [`TypeEnv`]
+/// ([`build_file_env`]), for a caller that also runs [`check_file_from_env`]
+/// against the identical `env` and must not pay
+/// `TypeEnv::build_from_items`'s ambient-cloning cost twice — see
+/// [`build_file_env`]'s doc comment for why the CLI batch path builds its
+/// own `env` per call instead (round 4 review finding 6).
+///
+/// The CLI batch path (`check_cmd.rs`'s `run_passes`) must NOT call this
+/// with an `env` held alive across its `rayon` pass over every project
+/// file — that reintroduces R14's retained `Vec<TypeEnv>`, measured at up
+/// to ~25x peak RSS over the transient one-build-per-call shape at N=500
+/// files (see [`build_file_env`]'s doc comment for the full table), and is
+/// now caught by `scripts/perf-gate.sh`'s "RETAINED-TYPEENV REGRESSION
+/// GATE" leg (500-file corpus, budget 100 MiB).
+#[must_use]
+pub fn module_surface_from_env(
+    env: &TypeEnv,
+    file: &str,
+    artifacts: &FileArtifacts,
+) -> ModuleSurface {
     let items = &artifacts.items;
-    let env = TypeEnv::build_from_items(parse, items, ambient);
     let outcome = infer::run(
         &artifacts.lowered,
-        &env,
+        env,
         file,
         Exactness::Strict,
         InferMode::Check,
         None,
     );
-    let types = FileTypes::collect(items, &env, &outcome.carrier_class_final, file);
+    let types = FileTypes::collect(items, env, &outcome.carrier_class_final, file);
     ModuleSurface {
         export: outcome.module_export,
         types,
@@ -385,6 +459,32 @@ pub fn check_file_with_artifacts<S: std::hash::BuildHasher>(
     requires: &HashMap<String, Ty, S>,
     artifacts: &FileArtifacts,
 ) -> Vec<Diagnostic> {
+    let env = build_file_env(parse, artifacts, ambient);
+    check_file_from_env(&env, parse, file, strictness, edition, requires, artifacts)
+}
+
+/// [`check_file_with_artifacts`] over an already-built [`TypeEnv`]
+/// ([`build_file_env`]) — see [`build_file_env`]'s doc comment for why the
+/// CLI batch path does not currently hold one `env` across a call to this
+/// and a call to [`module_surface_from_env`] (round 4 review finding 6).
+///
+/// Same rule as [`module_surface_from_env`]: the CLI batch path
+/// (`check_cmd.rs`'s `run_passes`/`check_one`) must build and drop its own
+/// `env` per file, never one held across its `rayon` pass over the whole
+/// project — R14 did that and cost up to ~25x peak RSS over the transient
+/// shape at N=500 files (measured table in [`build_file_env`]'s doc
+/// comment), now a CI-blocking leg in `scripts/perf-gate.sh`
+/// ("RETAINED-TYPEENV REGRESSION GATE", 500-file corpus, budget 100 MiB).
+#[must_use]
+pub fn check_file_from_env<S: std::hash::BuildHasher>(
+    env: &TypeEnv,
+    parse: &lua::Parse,
+    file: &str,
+    strictness: Strictness,
+    edition: lua::Dialect,
+    requires: &HashMap<String, Ty, S>,
+    artifacts: &FileArtifacts,
+) -> Vec<Diagnostic> {
     let items = &artifacts.items;
     // A `---@meta` definition package: its `---@class` declarations are
     // contracts, not carriers, so no `: Interface` conformance runs inside it
@@ -398,7 +498,6 @@ pub fn check_file_with_artifacts<S: std::hash::BuildHasher>(
 
     let mut diags: Vec<Diagnostic> = Vec::new();
 
-    let env = TypeEnv::build_from_items(parse, items, ambient);
     // A resolved `require`-export registry (#85) reaches inference through
     // the display-mode `externals` channel, but with call-site parameter
     // seeding OFF (`fn_param_seeds` empty, `seed_params` false below): only
@@ -426,7 +525,7 @@ pub fn check_file_with_artifacts<S: std::hash::BuildHasher>(
         // (LB0306) at the same strictness-mapped severity.
         let inference = infer::run(
             &artifacts.lowered,
-            &env,
+            env,
             file,
             Exactness::from_strict(strictness == Strictness::Strict),
             InferMode::Check,
@@ -434,7 +533,7 @@ pub fn check_file_with_artifacts<S: std::hash::BuildHasher>(
         );
         diags.extend(check::run(
             parse,
-            &env,
+            env,
             file,
             strictness == Strictness::Strict,
             is_meta,

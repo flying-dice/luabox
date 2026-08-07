@@ -8,7 +8,7 @@
 //! separately, by threading a module-export registry into inference rather
 //! than into this environment (see [`crate::check_file_with_requires`], #85).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use luabox_syntax::lua::ast::{AstNode, Expr, LocalStmt, Stmt};
 use luabox_syntax::lua::{self, SyntaxKind, SyntaxNode};
@@ -261,6 +261,133 @@ pub struct TypeEnv {
     /// file that declares its class, so an access is in-package iff the owner
     /// class is one this file declares.
     local_classes: HashSet<String>,
+}
+
+/// The cycle-guard + memo bookkeeping shared by [`TypeEnv::collect_class`]
+/// and [`TypeEnv::collect_operators`]'s depth-first ancestor walks (round 4
+/// review finding 7 — before this, each function hand-rolled its own
+/// `on_path: HashSet<String>` plus `memo: Vec<(String, Vec<Ty>)>` pair with
+/// the identical enter/exit logic; a fix to one walk's guard had to be
+/// remembered and re-applied to the other by hand, which is exactly how #59
+/// F37 happened — `collect_operators` missing a fix `collect_class` already
+/// had). One owner now; both walks call [`Self::enter`]/[`Self::exit`] and
+/// neither touches `on_path`/`memo`/`bindings` directly.
+///
+/// `memo` is a `HashSet`, not the `Vec` it used to be (round 4 review
+/// finding 5): a `Vec` membership check (`.contains`) is O(k) per call, so
+/// k visits paid O(k²) total, despite [`TypeEnv::collect_class`]'s doc
+/// comment and `diamond_perf_sweep` both having claimed O(k) throughout
+/// round 4. [`Ty`] did not derive `Hash` (nothing forced it to before
+/// round 4), so a `HashSet<(String, Vec<Ty>)>` was not a drop-in until
+/// [`Ty`] and every type it is built from (`FieldTy`, `TableTy`, `ParamTy`,
+/// `TypeParam`, `FunctionTy`, `VersionReq`) picked up the derive.
+///
+/// `bindings` is round 5 review's addition: every distinct `args` a class
+/// name has been bound to *so far* (forward-only — this call's own visits,
+/// in the order they occurred), keyed by the bare name, ignoring which
+/// specific `args` a given call used. [`Self::enter`] consults it for
+/// exactly one question — see [`Entry::Skip`] vs [`Entry::Proceed`] — and
+/// nothing else reads it. Populated in [`Self::exit`], alongside `memo`, so
+/// a later visit only ever sees bindings that were fully resolved *before*
+/// it — the guard never needs to look ahead.
+///
+/// Measured (`diamond_perf_sweep`, release build): the range that test
+/// shipped with (through k=100) is too small to tell O(k) from O(k²) apart
+/// — both finish in low milliseconds there, so the doc comment's O(k) claim
+/// was wrong, not merely untested. Extended through k=1600 and compared
+/// against a reverted `Vec`-memo build at the same sizes, the gap is
+/// unambiguous and widening — see `diamond_perf_sweep`'s doc comment for
+/// the table.
+///
+/// Round 5 review's fix (below) keeps this shape deliberately: a repeat
+/// visit costs one `HashSet` lookup plus one scan bounded by that name's
+/// *distinct* binding count (small and input-dependent, not k) — and nothing
+/// more when the visit is skipped. An earlier draft of this fix instead
+/// cached and replayed a full per-key *result* on every repeat; measured
+/// against this same `diamond_perf_sweep` fixture, that draft turned the
+/// k=200..800 rows from single-digit milliseconds into 50ms/191ms/765ms (a
+/// ~4x-per-doubling curve, i.e. quadratic again) and stack-overflowed at
+/// k=1600 — the cached-result approach still paid to clone and re-merge an
+/// ever-growing per-key snapshot at every one of the k levels, even though
+/// zero repeats in that fixture ever needed reapplying. Re-expanding a
+/// repeat's own frame in place (this fix) does not carry that cost: a
+/// non-competing repeat is skipped exactly as before (`Entry::Skip`, O(1)),
+/// and a competing one falls straight through to an ordinary walk instead
+/// of a separate replay path.
+#[derive(Default)]
+struct DiamondGuard {
+    on_path: HashSet<String>,
+    memo: HashSet<(String, Vec<Ty>)>,
+    bindings: HashMap<String, HashSet<Vec<Ty>>>,
+}
+
+/// What [`DiamondGuard::enter`] found for a `(name, args)` key.
+enum Entry {
+    /// Contribute nothing: either `name` is already on the
+    /// currently-expanding path (a true cycle, e.g. `---@class A : B` /
+    /// `---@class B : A`), or this exact `(name, args)` key was already
+    /// expanded to completion by an earlier visit **and** `name` has never
+    /// been bound to anything else anywhere in this call — every edge that
+    /// reaches it agrees, so re-expanding would only rewrite exactly what
+    /// is already there. The caller must return immediately without
+    /// calling [`DiamondGuard::exit`].
+    Skip,
+    /// Proceed: either this is genuinely the first visit to `(name, args)`,
+    /// or it is a repeat — but `name` has *also* been bound to some
+    /// *other* `args` elsewhere in this call, so this is a genuine diamond
+    /// where at least two edges disagree on `name`'s binding (`Multi : P1,
+    /// P2, P3` with `P1 : Base<string>`, `P2 : Base<number>`, `P3 :
+    /// Base<string>` is exactly this: `P3`'s `(Base, [string])` repeats
+    /// `P1`'s, but `Base` was *also* seen as `[number]` via `P2`). Either
+    /// way the caller re-runs the same body, writing directly into its
+    /// shared `shape`/`free` accumulators — for a repeat, that reasserts
+    /// this edge's contribution exactly at its own listed position,
+    /// which is what lets `P3`, though a repeat, still overwrite `P2`'s
+    /// `number` the way its later position demands. Skipping it here (the
+    /// round 5 bug) is what left `P2`'s value — the non-final edge —
+    /// standing instead. The caller must call [`DiamondGuard::exit`] once
+    /// this visit's expansion is complete.
+    Proceed,
+}
+
+impl DiamondGuard {
+    /// Try to enter `(name, args)`. See [`Entry`] for what each outcome
+    /// means and requires of the caller.
+    fn enter(&mut self, name: &str, args: &[Ty]) -> Entry {
+        if !self.on_path.insert(name.to_string()) {
+            return Entry::Skip; // true cycle
+        }
+        let key = (name.to_string(), args.to_vec());
+        if self.memo.contains(&key) {
+            let disagrees_elsewhere = self
+                .bindings
+                .get(name)
+                .is_some_and(|seen| seen.iter().any(|other| other != args));
+            if !disagrees_elsewhere {
+                self.on_path.remove(name);
+                return Entry::Skip;
+            }
+            // A genuine repeat-with-conflict: fall through and re-expand,
+            // exactly like a fresh visit — `on_path` stays inserted for
+            // the caller to remove via `exit`, below.
+        }
+        Entry::Proceed
+    }
+
+    /// Leave `name`'s currently-expanding path and record `(name, args)` as
+    /// resolved — pairs with an [`Entry::Proceed`] from [`Self::enter`],
+    /// called once that visit's expansion is done. Safe to call again for a
+    /// key that was already recorded (a repeat-with-conflict re-running
+    /// this same body): both `memo` and `bindings` are sets, so re-inserting
+    /// an already-present entry is a no-op.
+    fn exit(&mut self, name: &str, args: &[Ty]) {
+        self.memo.insert((name.to_string(), args.to_vec()));
+        self.bindings
+            .entry(name.to_string())
+            .or_default()
+            .insert(args.to_vec());
+        self.on_path.remove(name);
+    }
 }
 
 impl TypeEnv {
@@ -517,11 +644,30 @@ impl TypeEnv {
                             existing.indexers.push(indexer);
                         }
                     }
+                    // Operator signatures follow the same positional rename
+                    // as fields/methods/indexers above (round 4 review R5):
+                    // without it, a re-declaration that spells the class's
+                    // type parameters differently left an inherited
+                    // `---@operator add(U): U` naming `U` on a merged class
+                    // whose canonical parameter list reads `T`, unresolvable
+                    // at every use site and, when it reaches a diagnostic, a
+                    // raw type-parameter name in user-facing text — the same
+                    // class of defect F42/F43 exist to prevent.
                     for (op, sigs) in &def.operators {
                         let slot = existing.operators.entry(op.clone()).or_default();
                         for sig in sigs {
-                            if !slot.contains(sig) {
-                                slot.push(sig.clone());
+                            let sig = match &rename {
+                                Some(map) => OperatorSig {
+                                    input: sig
+                                        .input
+                                        .as_ref()
+                                        .map(|ty| crate::generics::subst_ty(ty, map)),
+                                    result: crate::generics::subst_ty(&sig.result, map),
+                                },
+                                None => sig.clone(),
+                            };
+                            if !slot.contains(&sig) {
+                                slot.push(sig);
                             }
                         }
                     }
@@ -550,6 +696,21 @@ impl TypeEnv {
     /// the rock says, and unioning the rock's fields back in would defeat the
     /// escape hatch. So an already-claimed name is left exactly as it is, and
     /// only unclaimed names are inserted.
+    ///
+    /// Deliberately does NOT propagate `class_decl_spans` (round 4 review
+    /// R33, corrected after an earlier pass in this same round got it
+    /// backwards and broke the acceptance suite): unlike a project file, a
+    /// rock's declaring source is vendored code the user did not write and
+    /// cannot edit. `luarocks-tree.feature`'s "misusing a rock type is
+    /// reported in the consumer, not the rock" scenario is the encoded
+    /// contract — it asserts the undefined-field diagnostic names the
+    /// consumer (`src/main.lua`) and explicitly asserts the secondary does
+    /// NOT mention `lua_modules` at all. A "declared here" pointing into
+    /// vendored code adds a location the reader cannot act on and re-blames
+    /// the rock for the consumer's own mistake — the opposite of what F71's
+    /// remedy exists to do. So `insert_unclaimed_types` leaving
+    /// `cross_file_class_decl_spans` untouched is not the third seam F71
+    /// missed; it is the one seam that must stay closed.
     pub(crate) fn insert_unclaimed_types(&mut self, file: &FileTypes) {
         for (name, def) in &file.classes {
             self.classes
@@ -976,6 +1137,18 @@ impl TypeEnv {
                     };
                     let input = o.input.as_ref().map(|t| lowerer.lower(t));
                     let result = lowerer.lower(&o.result);
+                    // Same-file positional rename, matching `Tag::Field`
+                    // above (round 4 review R5): a re-declaration's operator
+                    // bodies are written against the type parameters *it*
+                    // names, exactly like its field bodies.
+                    let input = match &class_rename {
+                        Some(map) => input.map(|ty| crate::generics::subst_ty(&ty, map)),
+                        None => input,
+                    };
+                    let result = match &class_rename {
+                        Some(map) => crate::generics::subst_ty(&result, map),
+                        None => result,
+                    };
                     class
                         .operators
                         .entry(o.op.clone())
@@ -1284,8 +1457,9 @@ impl TypeEnv {
             return None;
         }
         let mut shape = TableTy::default();
-        let mut seen = HashSet::new();
-        self.collect_class(name, args, &mut shape, &mut seen);
+        let mut guard = DiamondGuard::default();
+        let mut free = BTreeMap::new();
+        self.collect_class(name, args, &mut shape, &mut guard, &mut free);
         Some(shape)
     }
 
@@ -1349,21 +1523,126 @@ impl TypeEnv {
         args.iter().map(|arg| lowerer.lower(arg)).collect()
     }
 
+    /// Expand `name` (bound to `args`) into `shape`, folding parents in
+    /// depth-first, and record, per ancestor class name, that ancestor's own
+    /// type parameters left unbound by **this** visit into `free` (this
+    /// call's [`Self::class_params_in_scope`] accumulator).
+    ///
+    /// `free` is keyed by class name, one entry per name, overwritten on
+    /// every visit rather than accumulated — **last visit wins**, the same
+    /// rule fields/indexers already follow. This has to be true for the same
+    /// reason: a diamond can reach one ancestor through two edges that bind
+    /// it differently (`C : A, B` with `A : Base` and `B : Base<number>`),
+    /// and since both edges write every one of that ancestor's fields
+    /// unconditionally, the *fields* an ancestor ultimately contributes are
+    /// always whichever edge visited it last — never a union of both. Before
+    /// this was fixed (round 4 review R1, finding 1), `free` **was** a
+    /// straight union (`free.extend(..)`, never retracted), so a class's
+    /// free-ness in the merged shape and its free-ness by this bookkeeping
+    /// could disagree: the earlier, superseded edge's contribution to `free`
+    /// survived even after a later edge overwrote every field it produced. A
+    /// parameter spelled like some unrelated real class name then reported
+    /// the class as still generic-over-that-name, and [`Self::reify_export`]
+    /// erased every occurrence of that spelling it found — including a
+    /// sibling field that named the real class, not the stale template
+    /// parameter. Keying by name and overwriting on each visit makes `free`
+    /// agree with the fields by construction: whichever edge's fields win is
+    /// also the edge whose free-parameter set wins.
+    ///
+    /// Two guards, doing two different jobs (round 4 review R1 — restoring
+    /// this split after a round-3 fix collapsed them into one), bundled into
+    /// one [`DiamondGuard`] (round 4 review finding 7 — this walk and
+    /// [`Self::collect_operators`]'s had been two hand-copied pairs of the
+    /// same two fields and the same enter/exit logic; this is their single
+    /// owner):
+    ///
+    /// - `on_path` guards the *currently-expanding path*: inserted here,
+    ///   removed again at the bottom of this call, so a true cycle (a class
+    ///   reachable from itself, e.g. `---@class A : B` / `---@class B : A`)
+    ///   still terminates, while a diamond — the same ancestor reached
+    ///   through two different parents — is not dropped just because some
+    ///   *other* branch has it on its own path.
+    /// - `memo` (plus `bindings`, round 5 review) decides whether a repeat
+    ///   `(name, args)` visit — one already expanded to completion earlier
+    ///   in this same call, regardless of path — should be skipped outright
+    ///   or re-walked. **It is not simply "every repeat is skipped"**
+    ///   (round 5 review — the bug this fixed, and a bug in this fix's
+    ///   first draft, both below).
+    ///
+    ///   Skipping every repeat unconditionally is what collapses a k-level
+    ///   diamond from O(2^k) visits (#59, F39's fix, measured exponential —
+    ///   round 4 review R1) to genuinely O(k) (round 4 review finding 5: an
+    ///   earlier `Vec`-backed membership check was an O(k) scan repeated for
+    ///   each of the k visits — O(k²), despite this doc comment and the
+    ///   perf test below claiming O(k) throughout round 4; [`DiamondGuard`]
+    ///   backs the memo with a `HashSet` instead, now that [`Ty`] derives
+    ///   `Hash`, for an O(1)-amortized lookup and a genuinely O(k) walk) —
+    ///   **when every edge of the diamond binds the shared ancestor
+    ///   identically**. That was this doc comment's (and
+    ///   [`DiamondGuard`]'s) claim through round 4: "every edge of a real
+    ///   diamond binds its shared ancestor identically... An edge that
+    ///   binds the same ancestor differently is a different memo key, and
+    ///   still expands on both edges." True for **two** edges. False for
+    ///   three or more: `Multi : P1, P2, P3` with `P1 : Base<string>`,
+    ///   `P2 : Base<number>`, `P3 : Base<string>` (P3 repeats P1's exact
+    ///   binding, with a *different*-binding edge, P2, listed between them)
+    ///   is a diamond where unconditional skipping drops P3's edge
+    ///   entirely, leaving P2's `number` — the stale, non-final edge —
+    ///   standing where P3's `string` belongs. Measured (before this fix):
+    ///   `error[LB0300]: type mismatch: expected string, found number` on a
+    ///   read that must be clean.
+    ///
+    ///   The obvious fix — cache each key's resolved contribution and
+    ///   *always* re-apply it on a repeat, instead of skipping — is wrong,
+    ///   measured two ways. Correctness:
+    ///   `a_later_empty_sibling_does_not_clobber_an_earlier_siblings_field_override`
+    ///   (round 4 R1's own pinned regression test) — `Base.x: number`;
+    ///   `A : Base` overrides `x: string`; `B : Base` (bare, same key as
+    ///   `A`'s path to `Base`) declares nothing; `C : A, B`. `B`'s visit to
+    ///   `(Base, [])` **is** a repeat of `A`'s, and always-reapply writes
+    ///   `Base`'s raw `x: number` back in at `B`'s position — *after* `A`'s
+    ///   override already ran — measured `C.x: number`, clobbering `A`'s
+    ///   override exactly the way round 4 R1 fixed. Performance: caching a
+    ///   per-key result and folding it into a returned, cloned accumulator
+    ///   at every level turned `diamond_perf_sweep`'s k=200..800 rows from
+    ///   single-digit milliseconds into 50ms/191ms/765ms (quadratic again,
+    ///   despite the memo) and stack-overflowed at k=1600 — a class's
+    ///   `free` entry alone accumulates one entry per distinct class name in
+    ///   its whole ancestry, so a cached-and-cloned-at-every-level design
+    ///   pays for that ever-growing snapshot at every one of the k levels,
+    ///   even though this fixture's repeats never need reapplying at all.
+    ///
+    ///   What actually distinguishes the two fixtures: in `Multi`, `Base`
+    ///   is bound to **two different** `args` somewhere in the call
+    ///   (`[string]` via `P1`/`P3`, `[number]` via `P2`) — a genuine
+    ///   disagreement a later edge needs to be able to re-assert. In the
+    ///   `A`/`B`/`C` fixture, `Base` is *always* bound to `[]` — `B`'s
+    ///   repeat carries no information `A`'s earlier visit didn't already
+    ///   supply, so re-running it can only ever stomp whatever an unrelated
+    ///   sibling wrote in the meantime, never correct anything.
+    ///   [`DiamondGuard`]'s `bindings` map is exactly this check: a repeat
+    ///   is skipped ([`Entry::Skip`]) unless its class name has *also* been
+    ///   bound to some other `args` elsewhere in this call, in which case
+    ///   the guard reports [`Entry::Proceed`] and this method just
+    ///   re-expands `name`'s own frame in place — the *same* code path a
+    ///   fresh visit takes, writing directly into the shared `shape`/`free`
+    ///   accumulators below, so a genuinely competing repeat reasserts its
+    ///   binding exactly at its own listed position (restoring
+    ///   last-listed-parent-wins) without any separate cache-and-replay
+    ///   machinery, and without paying for one on the (overwhelmingly
+    ///   common) fixtures that never hit it: a repeat still costs one
+    ///   `HashSet` lookup plus one scan bounded by that name's *distinct*
+    ///   binding count — never a clone of anything the size of the whole
+    ///   walk so far.
     fn collect_class(
         &self,
         name: &str,
         args: &[Ty],
         shape: &mut TableTy,
-        seen: &mut HashSet<String>,
+        guard: &mut DiamondGuard,
+        free: &mut BTreeMap<String, BTreeSet<String>>,
     ) {
-        // `seen` guards the *currently-expanding path*, not "ever visited":
-        // it is inserted here and removed again at the bottom of this call,
-        // so a true cycle (a class reachable from itself) still trips the
-        // guard, but a diamond — the same ancestor reached through two
-        // different parents, each possibly binding its parameters
-        // differently, e.g. `C : A, B` where `A : Base` and `B : Base<number>`
-        // — is expanded once per edge instead of only the first (#59, F39).
-        if !seen.insert(name.to_string()) {
+        if matches!(guard.enter(name, args), Entry::Skip) {
             return;
         }
         if let Some(def) = self.classes.get(name) {
@@ -1373,6 +1652,28 @@ impl TypeEnv {
                 .zip(args)
                 .map(|(param, arg)| (param.clone(), arg.clone()))
                 .collect();
+            // Every declared parameter past `args`' length has nothing to
+            // bind it — it survives substitution as itself
+            // (`generics::subst_ty` leaves an unmapped name alone), so it is
+            // free in the result regardless of whether some *other* class
+            // happens to declare a real name spelled the same way (round 4
+            // review R6 — the previous walk re-derived "free" from the
+            // resolved shape by asking whether each `Ty::Named` leaf failed
+            // to resolve as a real class/enum, which cannot tell a
+            // genuinely-unbound parameter from a bound one whose argument
+            // happened to *be* a same-spelled real class reference; recording
+            // it here, at the one place substitution actually decides
+            // bound-vs-free, is unambiguous).
+            //
+            // Overwrite `name`'s entry rather than extend a running set: this
+            // visit's fields are about to overwrite every field `name`
+            // contributed on any prior visit (below), so this visit's free
+            // params must overwrite its prior contribution too, not join it
+            // (round 4 review R1, finding 1 — see this fn's doc comment).
+            free.insert(
+                name.to_string(),
+                def.params.iter().skip(args.len()).cloned().collect(),
+            );
             for parent in &def.parents {
                 // A parent's arguments are written in *this* class's parameter
                 // vocabulary — `---@class Cell<T> : Slot<T>` passes its own `T`
@@ -1382,7 +1683,7 @@ impl TypeEnv {
                     .iter()
                     .map(|arg| crate::generics::subst_ty(arg, &bound))
                     .collect();
-                self.collect_class(&parent.name, &parent_args, shape, seen);
+                self.collect_class(&parent.name, &parent_args, shape, guard, free);
             }
             // Carrier-attached members first, then `---@field` declarations —
             // both override inherited members, and a declaration wins over a
@@ -1405,16 +1706,26 @@ impl TypeEnv {
             // downstream, which `assign.rs` reads as "matches any key" (a
             // false accept) and, on the value-mismatch path, as "matches no
             // key" (a spurious false reject) — #59, F36.
-            shape
-                .indexers
-                .extend(def.indexers.iter().map(|(key, value)| {
-                    (
-                        crate::generics::subst_ty(key, &bound),
-                        crate::generics::subst_ty(value, &bound),
-                    )
-                }));
+            //
+            // Same key overwrites rather than accumulating a second entry —
+            // matching `shape.fields`' last-listed-parent-wins rule instead
+            // of a bare `Vec::extend` (round 4 review R3/R4): two parents
+            // reaching one generic ancestor through different arguments used
+            // to leave both indexer entries in the list, which
+            // `assign.rs`'s all-pairs check reads as "must satisfy every
+            // stale binding at once" — a stricter, and different, answer
+            // than the field the very same diamond produces.
+            for (key, value) in &def.indexers {
+                let key = crate::generics::subst_ty(key, &bound);
+                let value = crate::generics::subst_ty(value, &bound);
+                if let Some(slot) = shape.indexers.iter_mut().find(|(k, _)| *k == key) {
+                    slot.1 = value;
+                } else {
+                    shape.indexers.push((key, value));
+                }
+            }
         }
-        seen.remove(name);
+        guard.exit(name, args);
     }
 
     /// The member names of `name`'s shape that are carrier attachments
@@ -1448,29 +1759,51 @@ impl TypeEnv {
     /// operators precede inherited ones so a subclass override wins.
     pub(crate) fn class_operators(&self, name: &str, op: &str) -> Vec<OperatorSig> {
         let mut out = Vec::new();
-        let mut seen = HashSet::new();
-        self.collect_operators(name, &[], op, &mut out, &mut seen);
+        let mut guard = DiamondGuard::default();
+        self.collect_operators(name, &[], op, &mut out, &mut guard);
         out
     }
 
-    /// [`Self::collect_class`]'s substitution and cycle-guard rules, for
-    /// `---@operator` overloads instead of members: `args` binds `name`'s own
-    /// type parameters, a parent's arguments are substituted through that
-    /// binding before they bind the parent's own, and `seen` guards only the
-    /// currently-expanding path so a shared ancestor reached through two
-    /// differently-bound parents is still visited on both edges (#59, F37 —
-    /// before this fix `collect_operators` performed no substitution at all,
-    /// unlike its sibling, so `---@operator add(U): U` on `---@class Base<U>`
-    /// inherited by `---@class Sub : Base<number>` left `U` free).
+    /// [`Self::collect_class`]'s substitution and [`DiamondGuard`] rules,
+    /// for `---@operator` overloads instead of members: `args` binds
+    /// `name`'s own type parameters, a parent's arguments are substituted
+    /// through that binding before they bind the parent's own, the guard's
+    /// `on_path` half admits a shared ancestor reached through two
+    /// differently-bound parents on both edges (#59, F37 — before that fix
+    /// `collect_operators` performed no substitution at all, unlike its
+    /// sibling, so `---@operator add(U): U` on `---@class Base<U>` inherited
+    /// by `---@class Sub : Base<number>` left `U` free), and its `memo` half
+    /// skips a redundant `(name, args)` pair already expanded to completion
+    /// — the same diamond-collapsing rule `collect_class` applies, since
+    /// this walk has the identical shape and the identical exponential
+    /// exposure (round 4 review R1, and the identical O(k²)-not-O(k) memo
+    /// cost round 4 review finding 5 fixed — see [`DiamondGuard`]).
+    ///
+    /// Unlike [`Self::collect_class`], this walk does not *need*
+    /// [`DiamondGuard`]'s round 5 `bindings` distinction — a genuinely
+    /// competing repeat (`Entry::Proceed`) re-running this body is
+    /// harmless here, not merely correct: `out` is append-only, never
+    /// overwritten by position, so a repeat `(name, args)` — bound
+    /// identically to its earlier visit, hence the same
+    /// `def.operators.get(op)` result — only ever appends duplicate
+    /// `OperatorSig`s identical in value to ones already present. Those
+    /// duplicates cannot change which signature the first-match scan
+    /// (#114) finds, so unlike [`Self::collect_class`] (where reapplying a
+    /// non-competing repeat corrupts a sibling's override — see its doc
+    /// comment), this walk does not need to special-case
+    /// [`Entry::Skip`] vs re-running: skipping is merely the cheaper of two
+    /// correct outcomes, so [`Entry::Skip`] is still honoured, but a
+    /// stray [`Entry::Proceed`] on a competing repeat would not corrupt
+    /// anything either.
     fn collect_operators(
         &self,
         name: &str,
         args: &[Ty],
         op: &str,
         out: &mut Vec<OperatorSig>,
-        seen: &mut HashSet<String>,
+        guard: &mut DiamondGuard,
     ) {
-        if !seen.insert(name.to_string()) {
+        if matches!(guard.enter(name, args), Entry::Skip) {
             return;
         }
         if let Some(def) = self.classes.get(name) {
@@ -1497,10 +1830,10 @@ impl TypeEnv {
                     .iter()
                     .map(|arg| crate::generics::subst_ty(arg, &bound))
                     .collect();
-                self.collect_operators(&parent.name, &parent_args, op, out, seen);
+                self.collect_operators(&parent.name, &parent_args, op, out, guard);
             }
         }
-        seen.remove(name);
+        guard.exit(name, args);
     }
 
     pub(crate) fn enum_member(&self, enum_name: &str, member: &str) -> Option<&Ty> {
@@ -1597,86 +1930,33 @@ impl TypeEnv {
     /// whose ancestors are all fully bound, and for a name that is no class
     /// at all.
     ///
-    /// This walks the already-**resolved**, already-substituted shape
-    /// ([`Self::class_shape`], which folds every ancestor's `---@field`s in
-    /// with their parent references' arguments already bound — see
-    /// [`Self::collect_class`]) and keeps the [`Ty::Named`] leaves that do
-    /// not resolve to a real class or enum. That is deliberate, not
-    /// incidental (#59, F43): class names and `---@generic`/`---@class<T>`
-    /// parameters share one namespace (a class may legally, if confusingly,
-    /// declare a parameter spelled the same as some unrelated real class), so
-    /// walking each ancestor's *declared parameter list* — the previous
-    /// implementation — could not tell "an ancestor's own parameter, still
-    /// free" from "a real class, referenced by name, that happens to share a
-    /// spelling with some *other* ancestor's parameter" and erased the
-    /// latter. Walking the resolved shape instead asks the only question
-    /// that matters: does this `Ty::Named` resolve? A parameter a parent
-    /// reference already bound is substituted away before this ever sees it
-    /// ([`Self::class_shape_bound`]); a parameter left free (`---@class Sub :
-    /// Base` — a generic parent named without arguments) survives
-    /// substitution as itself and is caught here.
+    /// Free-ness is decided at the one place substitution actually knows the
+    /// answer: [`Self::collect_class`], while it is zipping each visited
+    /// class's own declared parameters against the arguments bound to it. A
+    /// parameter past the end of that zip has nothing binding it and
+    /// survives substitution as itself; one is recorded there regardless of
+    /// whether it happens to be spelled like some unrelated real class or
+    /// enum (round 4 review R6). An **earlier** implementation asked that
+    /// question after the fact instead — walk the fully-substituted shape
+    /// and keep the `Ty::Named` leaves that fail to resolve as a real
+    /// class/enum — which cannot distinguish "genuinely unbound" from "bound
+    /// to a real class whose name happens to collide with some ancestor's
+    /// parameter", and erased the latter (`---@class Base<Event>` with
+    /// `---@class Sub : Base` — bare, `Event` unbound — used to leave a
+    /// legitimately-bound sibling reference to the real class `Event`
+    /// resolved, but also left a genuinely-free `Event` looking resolved,
+    /// i.e. bound, since "Event" the parameter and "Event" the class are the
+    /// same string). Recording at the zip instead of re-deriving from the
+    /// result is unambiguous in both directions.
     pub(crate) fn class_params_in_scope(&self, name: &str) -> Vec<String> {
-        let Some(shape) = self.class_shape(name) else {
+        if !self.classes.contains_key(name) {
             return Vec::new();
-        };
-        let mut found: Vec<String> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        for field in shape.fields.values() {
-            self.collect_free_names(&field.ty, &mut found, &mut seen);
         }
-        for (key, value) in &shape.indexers {
-            self.collect_free_names(key, &mut found, &mut seen);
-            self.collect_free_names(value, &mut found, &mut seen);
-        }
-        if let Some(array) = &shape.array {
-            self.collect_free_names(array, &mut found, &mut seen);
-        }
-        found
-    }
-
-    /// [`Self::class_params_in_scope`]'s walk: every [`Ty::Named`] reachable
-    /// from `ty` that does not resolve to a real class or enum, collected
-    /// once each into `out` (deduplicated via `seen`).
-    fn collect_free_names(&self, ty: &Ty, out: &mut Vec<String>, seen: &mut HashSet<String>) {
-        match ty {
-            Ty::Named(candidate) => {
-                if !self.classes.contains_key(candidate)
-                    && !self.enums.contains_key(candidate)
-                    && seen.insert(candidate.clone())
-                {
-                    out.push(candidate.clone());
-                }
-            }
-            Ty::Union(members) => {
-                for member in members {
-                    self.collect_free_names(member, out, seen);
-                }
-            }
-            Ty::Table(table) => {
-                for field in table.fields.values() {
-                    self.collect_free_names(&field.ty, out, seen);
-                }
-                for (key, value) in &table.indexers {
-                    self.collect_free_names(key, out, seen);
-                    self.collect_free_names(value, out, seen);
-                }
-                if let Some(array) = &table.array {
-                    self.collect_free_names(array, out, seen);
-                }
-            }
-            Ty::Function(func) => {
-                for param in &func.params {
-                    self.collect_free_names(&param.ty, out, seen);
-                }
-                if let Some(varargs) = &func.varargs {
-                    self.collect_free_names(varargs, out, seen);
-                }
-                for ret in &func.returns {
-                    self.collect_free_names(ret, out, seen);
-                }
-            }
-            _ => {}
-        }
+        let mut shape = TableTy::default();
+        let mut guard = DiamondGuard::default();
+        let mut free = BTreeMap::new();
+        self.collect_class(name, &[], &mut shape, &mut guard, &mut free);
+        free.into_values().flatten().collect()
     }
 
     /// Whether `name` is a LuaCATS `---@class` (in-file, def-package, or
@@ -2695,6 +2975,75 @@ mod tests {
     }
 
     #[test]
+    fn merging_a_renamed_redeclaration_substitutes_its_own_operators_type_arguments() {
+        // Round 4 review finding 3 (`merge_file_types` seam): R5's fix
+        // renames a re-declaration's OWN `---@operator` bodies onto the
+        // canonical parameter list, the same as it already does for fields,
+        // parents and indexers — but had zero test coverage of its own.
+        // `Both<T>` is canonical; the incoming file re-declares it as
+        // `Both<U>` and attaches `---@operator add(U): U`. Un-renamed, that
+        // signature would name `U`, a parameter `Both` does not have (its
+        // canonical list reads `T`) — unresolvable at every use site.
+        let mut env = TypeEnv::default();
+        env.merge_file_types(&surface("---@class Both<T>\n---@field n T\n"));
+        env.merge_file_types(&surface(
+            "\
+---@class Both<U>
+---@operator add(U): U
+",
+        ));
+        let def = env.classes.get("Both").expect("merged class");
+        assert_eq!(def.params, vec!["T".to_string()]);
+        let sigs = def.operators.get("add").expect("operator carried over");
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(
+            sigs[0].input,
+            Some(Ty::Named("T".to_string())),
+            "the re-declaration's operator input must be renamed onto the \
+             canonical `T`, not left as the stale `U`"
+        );
+        assert_eq!(
+            sigs[0].result,
+            Ty::Named("T".to_string()),
+            "the re-declaration's operator result must be renamed onto the \
+             canonical `T`, not left as the stale `U`"
+        );
+    }
+
+    #[test]
+    fn a_same_file_renamed_redeclaration_substitutes_its_own_operators_type_arguments() {
+        // Round 4 review finding 3 (`absorb_block` seam): the same shape as
+        // above, but both declarations live in one file, so the fix must
+        // apply on the in-file fold independently of `merge_file_types`
+        // (matching `a_same_file_renamed_redeclaration_substitutes_its_parents_type_arguments`'s
+        // pairing for the parent-args rename).
+        let env = env_of(
+            "\
+---@class Both<T>
+---@field n T
+---@class Both<U>
+---@operator add(U): U
+",
+        );
+        let def = env.classes.get("Both").expect("declared class");
+        assert_eq!(def.params, vec!["T".to_string()]);
+        let sigs = def.operators.get("add").expect("operator carried over");
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(
+            sigs[0].input,
+            Some(Ty::Named("T".to_string())),
+            "the re-declaration's operator input must be renamed onto the \
+             canonical `T`, not left as the stale `U`"
+        );
+        assert_eq!(
+            sigs[0].result,
+            Ty::Named("T".to_string()),
+            "the re-declaration's operator result must be renamed onto the \
+             canonical `T`, not left as the stale `U`"
+        );
+    }
+
+    #[test]
     fn a_diamond_reaching_one_ancestor_through_two_bindings_keeps_both() {
         // F39: the recursion guard used to key purely on the ancestor's
         // *name*, so once a first parent's visit to a shared ancestor
@@ -2742,6 +3091,144 @@ mod tests {
             swapped_shape.fields["item"].ty,
             Ty::Named("U".to_string()),
             "A's bare visit must still reach C.item when listed second; pre-fix this reads `number` (B's bound visit claims the guard first)"
+        );
+    }
+
+    /// A k-level "every level forks into two siblings that reconverge"
+    /// diamond, matching round 4 review R1's benchmark shape ("one file,
+    /// three declarations per level"): `L{i}A` and `L{i}B` both extend
+    /// `L{i-1}C`, and `L{i}C` extends both. No generics — the plain
+    /// bare-inheritance case already trips the guard-vs-memo defect; a
+    /// generic ancestor is F39's separate, still-covered concern.
+    fn diamond_source(k: usize) -> String {
+        use std::fmt::Write as _;
+
+        let mut src = String::from("---@class L0\n---@field item number\n");
+        // Level 1 hangs off the bare base `L0`; every later level hangs off
+        // the *previous level's converged class* `L{i-1}C` — the actual
+        // diamond, not a chain of unrelated single-parent classes.
+        let mut prev = "L0".to_string();
+        for i in 1..=k {
+            let _ = write!(
+                src,
+                "---@class L{i}A : {prev}\n---@class L{i}B : {prev}\n---@class L{i}C : L{i}A, L{i}B\n"
+            );
+            prev = format!("L{i}C");
+        }
+        src
+    }
+
+    #[test]
+    fn a_k_level_diamond_over_a_shared_ancestor_resolves_in_bounded_time() {
+        // Round 4 review R1: the F39 fix (`seen`/`on_path` guards only the
+        // currently-expanding path, never memoised) made `collect_class`'s
+        // visit count the number of root-to-node PATHS through a diamond,
+        // not nodes — O(2^k). Measured on binaries built at both heads, this
+        // exact fixture shape: 71 lines (k=22) took 20.77s, 80 lines (k=25)
+        // took 144.67s, geometric mean 2.00x per level — on the editor's
+        // per-keystroke path, since nothing bounds it (no cache, no depth
+        // cap, no fuel). The fix memoises `collect_class` on `(name, args)`
+        // within one `class_shape_bound` call: every edge of a diamond that
+        // binds its shared ancestor identically (the case this fixture
+        // generates — no generics, every binding is the same empty `args`)
+        // is expanded once, not once per path, which collapses this exact
+        // shape to O(k) — not merely sub-exponential.
+        //
+        // A regression that drops the memo (or widens the guard back to
+        // "ever visited", re-losing F39's per-edge distinction) makes this
+        // either hang or return the wrong shape. Running the resolution on
+        // a background thread with a bounded `recv_timeout` catches a hang
+        // without hanging the test suite itself; the field assertion below
+        // catches a wrong-shape regression the timeout alone would not.
+        let k = 60;
+        let source = diamond_source(k);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let env = env_of(&source);
+            let shape = env.class_shape(&format!("L{k}C"));
+            let _ = tx.send(shape);
+        });
+        let shape = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect(
+                "a k=60 diamond must resolve in well under 5s on the memoised path; \
+                 an O(2^60) regression would not return in this process's lifetime",
+            )
+            .expect("the top-level diamond class is declared");
+        assert_eq!(
+            shape.fields["item"].ty,
+            Ty::Number,
+            "the base field must still resolve correctly, not merely terminate"
+        );
+    }
+
+    /// Not run by default — `cargo test -p luabox-types --lib -- --ignored
+    /// --nocapture env::tests::diamond_perf_sweep` prints the k-vs-time table
+    /// round 4 review R1 asked for. Kept rather than thrown away: the next
+    /// person doubting the memo's flatness can re-run this instead of
+    /// re-deriving the fixture from the review transcript.
+    ///
+    /// The range used to stop at k=100 — round 4 review finding 5 found
+    /// that too small to tell O(k) from the `Vec`-memo's actual O(k²)
+    /// apart (both finish in low milliseconds through k=100, so the claim
+    /// was unfalsifiable from this table alone). Extended to k=1600 (release
+    /// build; k=3200 stack-overflows on the walk's recursion depth, a
+    /// separate, pre-existing limit unrelated to the memo) — measured, this
+    /// fixed [`DiamondGuard`]'s `HashSet` memo against a reverted `Vec`-memo
+    /// build at the same sizes:
+    ///
+    ///   k      `HashSet` (this fix)   `Vec` (pre-fix)
+    ///   200    3.30ms                 4.39ms
+    ///   400    6.53ms                 9.31ms
+    ///   800    13.16ms                28.12ms
+    ///   1600   30.00ms                60.64ms
+    ///
+    /// The `HashSet` column roughly doubles per doubling of k (linear); the
+    /// `Vec` column's k=800 and k=1600 points are already ~2x the
+    /// `HashSet` column's and widening. Both totals still include this
+    /// fixture's O(k) source-text parse/harvest cost, which is why the
+    /// `HashSet` column is not perfectly flat-doubling — the memo lookup
+    /// itself is O(1) amortized; the walk around it is inherently O(k).
+    #[test]
+    #[ignore = "manual measurement, not a CI assertion — see doc comment"]
+    fn diamond_perf_sweep() {
+        for k in [16, 18, 20, 22, 24, 25, 40, 60, 80, 100, 200, 400, 800, 1600] {
+            let source = diamond_source(k);
+            let start = std::time::Instant::now();
+            let env = env_of(&source);
+            let shape = env.class_shape(&format!("L{k}C")).expect("declared class");
+            let elapsed = start.elapsed();
+            assert_eq!(shape.fields["item"].ty, Ty::Number);
+            eprintln!("k={k:<4} lines={:<5} {elapsed:?}", source.lines().count());
+        }
+    }
+
+    #[test]
+    fn a_diamond_reaching_a_shared_generic_ancestor_with_equal_bindings_carries_one_indexer() {
+        // Round 4 review R4: the memo that fixes R1 also collapses the
+        // memory half — a diamond over a generic ancestor bound the SAME way
+        // on every edge used to carry the identical indexer entry once per
+        // edge (2 for one diamond, 4 nested two deep — old head 1 and 1).
+        // Distinct bindings still coexist as distinct entries (the diamond
+        // below binds `Base`'s `V` to `number` on both edges, so there is
+        // exactly one binding to carry); `class_shape_bound`'s overwrite-by-
+        // key insert (rather than a bare `Vec::extend`) is what keeps a
+        // *differently*-bound diamond (R3, pinned in `duplicate_class_merge.rs`)
+        // down to one entry per key too, not two stale ones.
+        let env = env_of(
+            "\
+---@class Base<V>
+---@field [string] V
+---@class A : Base<number>
+---@class B : Base<number>
+---@class C : A, B
+",
+        );
+        let shape = env.class_shape("C").expect("declared class");
+        assert_eq!(
+            shape.indexers,
+            vec![(Ty::String, Ty::Number)],
+            "one binding reached through two edges must carry one indexer entry, not two"
         );
     }
 

@@ -25,7 +25,7 @@ use luabox_syntax::lua::Dialect;
 /// [`VersionReq::parse`] returns `None` when the body names no version luabox
 /// recognises (empty, or only unsupported tokens such as `5.5`), so an
 /// unrecognised annotation gates nothing rather than gating everything.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VersionReq {
     /// The valid editions, canonically ordered (`Dialect`'s `Ord`:
     /// `5.1 < 5.2 < 5.3 < 5.4 < luajit`). Always non-empty for a `Some`.

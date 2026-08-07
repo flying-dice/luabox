@@ -300,7 +300,18 @@ fn walk(
 }
 
 /// Whether `path` is a `*.d.lua` `---@meta` definition file.
-fn is_def_file(path: &Path) -> bool {
+///
+/// Public because this is the **one owner** of the `.d.lua` convention, and it
+/// has consumers outside this crate: `luabox-lsp`'s `locate_field` resolves a
+/// member's declaration by visiting defs files before ordinary project files,
+/// because the type merge lets a defs declaration win a same-name collision —
+/// so navigation and the merge must agree on which files those are. A second
+/// copy of the rule has no compiler-enforced link to this one: loosen the
+/// convention here (a second suffix, a directory-based rule) and the copy
+/// keeps the old behaviour, breaking that precedence with no build failure —
+/// only a wrong hover result someone eventually notices.
+#[must_use]
+pub fn is_def_file(path: &Path) -> bool {
     path.file_name()
         .and_then(OsStr::to_str)
         .is_some_and(|name| name.ends_with(".d.lua"))

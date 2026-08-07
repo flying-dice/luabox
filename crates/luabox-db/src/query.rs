@@ -24,7 +24,7 @@ use crate::db::Db;
 use crate::input::{Project, SourceFile};
 use crate::value::{
     Annotations, BindingTypes, Diagnostics, LoweredHandle, ModuleExport, ModuleSurfaceChecked,
-    OutgoingCalls, ParsedModule, TypeEnvHandle,
+    OutgoingCalls, ParsedModule, ProjectTypes, TypeEnvHandle,
 };
 
 /// Parse a file into a lossless syntax tree.
@@ -110,7 +110,7 @@ pub fn module_export(db: &dyn Db, file: SourceFile, project: Project) -> ModuleE
     let parsed = parse(db, file);
     let name = display(db, file);
     let base = stdlib_defs(file.dialect(db));
-    let ambient = base.with_project_types(project_types_checked(db, project).iter());
+    let ambient = base.with_project_types(project_types_checked(db, project).types().iter());
     let externals = ExternalTypes {
         requires: HashMap::new(),
         fn_param_seeds: dependent_seeds(db, file, project),
@@ -134,7 +134,7 @@ pub fn binding_types(db: &dyn Db, file: SourceFile, project: Project) -> Binding
     let parsed = parse(db, file);
     let name = display(db, file);
     let base = stdlib_defs(file.dialect(db));
-    let ambient = base.with_project_types(project_types_checked(db, project).iter());
+    let ambient = base.with_project_types(project_types_checked(db, project).types().iter());
     let externals = ExternalTypes {
         requires: require_exports(db, file, project),
         fn_param_seeds: dependent_seeds(db, file, project),
@@ -204,7 +204,7 @@ pub(crate) fn module_export_checked(
     let parsed = parse(db, file);
     let name = display(db, file);
     let base = stdlib_defs(file.dialect(db));
-    let ambient = base.with_project_types(project_types_checked(db, project).iter());
+    let ambient = base.with_project_types(project_types_checked(db, project).types().iter());
     let surface = luabox_types::module_surface(parsed.parse(), &name, Some(&ambient));
     ModuleExport::new(surface.export)
 }
@@ -241,13 +241,27 @@ pub(crate) fn require_exports_checked(
 /// project-independent [`module_surface_checked`] (never
 /// [`module_export_checked`]), which is what keeps this acyclic when it is
 /// in turn read back by queries that need the merged ambient.
-pub(crate) fn project_types_checked(db: &dyn Db, project: Project) -> Vec<luabox_types::FileTypes> {
-    project
-        .files(db)
-        .iter()
-        .map(|&file| module_surface_checked(db, file).types().clone())
-        .filter(|types| !types.is_empty())
-        .collect()
+///
+/// `#[salsa::tracked]` (round 4 review R14): this has three per-file
+/// callers — [`module_export`], [`binding_types`], [`module_export_checked`]
+/// — each itself tracked and keyed on `(file, project)`. Before this was a
+/// tracked query in its own right, every one of those N per-file calls in a
+/// display pass re-ran this whole collection from scratch — O(N) work per
+/// call, O(N²) total, even though every `module_surface_checked(db, file)`
+/// it reads is itself already memoized. Tracking it here means the
+/// collection (and the `with_project_types` merge each caller builds over
+/// it) runs once per project revision and is shared by every caller: O(N).
+#[salsa::tracked]
+pub(crate) fn project_types_checked(db: &dyn Db, project: Project) -> ProjectTypes {
+    db.push_log("project_types_checked()".to_string());
+    ProjectTypes::new(
+        project
+            .files(db)
+            .iter()
+            .map(|&file| module_surface_checked(db, file).types().clone())
+            .filter(|types| !types.is_empty())
+            .collect(),
+    )
 }
 
 /// Module string → export type, for every static `require` in `file` that

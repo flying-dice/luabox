@@ -84,6 +84,43 @@ end
 }
 
 #[test]
+fn return_type_mismatch_against_unknown_names_no_remedy() {
+    // Round 3 review F72 had `check_slot` append a blanket "(add `---@type
+    // <expected>` to check it)" remedy whenever the found type was
+    // `unknown` — for a call-argument mismatch that is at least sometimes
+    // actionable (a `require` binding can carry `---@type`), but a `return`
+    // has no binding at all, and `---@type` is not even the applicable tag
+    // for one (`---@return` is). Round 4 review R12 withdrew the remedy
+    // rather than special-case it, since a suggestion naming a tag and a
+    // site that do not apply here misdirects. `require` of a module this
+    // fixture never declares a type for resolves as bare `unknown` — the
+    // exact case F72's remedy targeted — and strict mode still rejects it
+    // against the declared `number` return.
+    let src = "\
+---@return number
+local function f()
+  local mod = require(\"bogus\")
+  return mod
+end
+";
+    let diags = check(src, Strictness::Strict);
+    assert_eq!(
+        diags.iter().map(|d| d.code.to_string()).collect::<Vec<_>>(),
+        vec!["LB0304"]
+    );
+    assert!(
+        diags[0].message.contains("found `unknown`"),
+        "{}",
+        diags[0].message
+    );
+    assert!(
+        !diags[0].message.contains("---@type"),
+        "a `return` has no binding and `---@type` is not its tag: {}",
+        diags[0].message
+    );
+}
+
+#[test]
 fn return_count_mismatch() {
     let src = "\
 ---@return number, string

@@ -24,7 +24,8 @@ use crate::db::RootDatabase;
 use crate::input::{Project, SourceFile};
 use crate::query;
 use crate::value::{
-    Annotations, BindingTypes, LoweredHandle, ModuleExport, ParsedModule, TypeEnvHandle,
+    Annotations, BindingTypes, LoweredHandle, ModuleExport, ParsedModule, ProjectTypes,
+    TypeEnvHandle,
 };
 use crate::vfs::{FileId, Vfs};
 
@@ -126,9 +127,19 @@ impl AnalysisHost {
     }
 
     /// Apply one [`Change`], updating the VFS and the affected salsa inputs.
+    ///
+    /// Bumps [`Self::revision`] only when the change actually wrote a salsa
+    /// input (round 4 review R17). The unconditional bump this replaced fired
+    /// even when nothing moved — most visibly for `SetFileText`, which
+    /// `workspace/didChangeWatchedFiles` (`server.rs`) issues for every
+    /// non-deleted `.lua` file in a watch event regardless of whether its
+    /// text differs from what the host already has. Every revision-keyed
+    /// cache downstream (the LSP's `MergedAmbient`, `server.rs:1583`, keyed
+    /// on `Analysis::revision`) is invalidated on any bump, so a no-op write
+    /// was paying a full `clone_surface` + `merge_file_types` over every
+    /// project file for zero change.
     pub fn apply_change(&mut self, change: Change) {
-        self.revision += 1;
-        match change {
+        let changed = match change {
             Change::SetFileText {
                 path,
                 dialect,
@@ -136,27 +147,37 @@ impl AnalysisHost {
             } => {
                 let id = self.vfs.intern(path, dialect);
                 self.vfs.set_disk_text(id, Some(text));
-                self.sync_file(id);
+                self.sync_file(id)
             }
             Change::SetOverlay { path, text } => {
                 let id = self.vfs.intern(path, self.default_dialect);
                 self.vfs.set_overlay(id, text);
-                self.sync_file(id);
+                self.sync_file(id)
             }
             Change::ClearOverlay { path } => {
                 if let Some(id) = self.vfs.file_id(&path) {
                     self.vfs.clear_overlay(id);
-                    self.sync_file(id);
+                    self.sync_file(id)
+                } else {
+                    false
                 }
             }
             Change::SetDialect { path, dialect } => {
                 let id = self.vfs.intern(path, dialect);
                 self.vfs.set_dialect(id, dialect);
-                self.sync_file(id);
+                self.sync_file(id)
             }
             Change::SetStrictness(strictness) => {
-                self.project.set_strictness(&mut self.db).to(strictness);
+                if self.project.strictness(&self.db) == strictness {
+                    false
+                } else {
+                    self.project.set_strictness(&mut self.db).to(strictness);
+                    true
+                }
             }
+        };
+        if changed {
+            self.revision += 1;
         }
     }
 
@@ -192,17 +213,23 @@ impl AnalysisHost {
 
     /// Reconcile the effective VFS text/dialect for `id` into salsa, creating
     /// the [`SourceFile`] input on first sight and updating fields only when
-    /// they actually change (so no spurious revisions).
-    fn sync_file(&mut self, id: FileId) {
+    /// they actually change (so no spurious revisions). Returns whether a
+    /// salsa input was actually written — the signal [`Self::apply_change`]
+    /// uses to decide whether [`Self::revision`] moves (round 4 review R17).
+    fn sync_file(&mut self, id: FileId) -> bool {
         let text = self.vfs.effective_text(id).unwrap_or("").to_owned();
         let dialect = self.vfs.dialect(id);
         if let Some(input) = self.inputs.get(&id).copied() {
+            let mut changed = false;
             if input.text(&self.db) != &text {
                 input.set_text(&mut self.db).to(text);
+                changed = true;
             }
             if input.dialect(&self.db) != dialect {
                 input.set_dialect(&mut self.db).to(dialect);
+                changed = true;
             }
+            changed
         } else {
             let path = self.vfs.path(id).to_path_buf();
             let input = SourceFile::new(&self.db, path, text, dialect);
@@ -210,6 +237,7 @@ impl AnalysisHost {
             let mut files = self.project.files(&self.db).clone();
             files.push(input);
             self.project.set_files(&mut self.db).to(files);
+            true
         }
     }
 }
@@ -318,8 +346,17 @@ impl Analysis {
     /// `function Class:method` member attachments — resolves from every
     /// other file). Merge them beneath an ambient layer with
     /// [`luabox_types::Ambient::with_project_types`].
+    ///
+    /// Returns the `Arc`-backed [`ProjectTypes`] wrapper itself rather than
+    /// a fresh `Vec` (round 4 review finding 2): the memoized query already
+    /// holds every file's class/enum/alias maps behind an `Arc`, so cloning
+    /// it here is a refcount bump, not a deep copy of each file's maps — the
+    /// clone this used to pay on every call, including the `merged_ambient`
+    /// rebuild path this same PR made cheap everywhere else. `ProjectTypes`
+    /// derefs to `&[FileTypes]`, so every existing call site (`&[FileTypes]`
+    /// parameters, `.iter()`, `with_project_types`) needs no change.
     #[must_use]
-    pub fn project_types(&self) -> Vec<luabox_types::FileTypes> {
+    pub fn project_types(&self) -> ProjectTypes {
         query::project_types_checked(&self.db, self.project)
     }
 

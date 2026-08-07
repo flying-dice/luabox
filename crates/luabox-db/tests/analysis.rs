@@ -694,6 +694,106 @@ want(s.item)
 }
 
 #[test]
+fn a_watch_event_delivering_unchanged_text_does_not_bump_the_revision() {
+    // R17 (round 4 review): `workspace/didChangeWatchedFiles` (`server.rs`)
+    // calls `apply_change(SetFileText { .. })` for every non-deleted `.lua`
+    // path named in a watch event, whether or not the on-disk text actually
+    // differs from what the host already has — a save-without-edit, an
+    // unrelated watcher coalescing multiple events, a `touch`. Every
+    // revision-keyed cache downstream (the LSP's `MergedAmbient`,
+    // `server.rs:1583`) treats any bump as "the world changed" and pays a
+    // full `clone_surface` + `merge_file_types` over every project file.
+    // Re-delivering identical text must not move the revision; text that
+    // actually differs still must.
+    let mut host = host();
+    host.apply_change(set("a.lua", GOOD));
+    let after_first_write = host.snapshot().revision();
+
+    // The exact re-delivery the watcher performs: same path, same dialect,
+    // byte-identical text.
+    host.apply_change(set("a.lua", GOOD));
+    assert_eq!(
+        host.snapshot().revision(),
+        after_first_write,
+        "re-delivering unchanged text must not bump the revision"
+    );
+
+    // Text that actually differs still must.
+    host.apply_change(set("a.lua", BAD));
+    assert!(
+        host.snapshot().revision() > after_first_write,
+        "an actual edit must still bump the revision"
+    );
+}
+
+#[test]
+fn a_strictness_no_op_does_not_bump_the_revision() {
+    // Same class of fix as the watch-event case above (R17): re-applying the
+    // strictness the project already has must not move the revision either.
+    let mut host = host();
+    let start = host.snapshot().revision();
+
+    host.apply_change(Change::SetStrictness(Strictness::Strict));
+    assert_eq!(
+        host.snapshot().revision(),
+        start,
+        "the host defaults to Strict; setting it to Strict again is a no-op"
+    );
+
+    host.apply_change(Change::SetStrictness(Strictness::Warn));
+    assert!(
+        host.snapshot().revision() > start,
+        "an actual strictness change must still bump the revision"
+    );
+}
+
+#[test]
+fn project_types_checked_is_memoized_once_across_a_display_pass_over_many_files() {
+    // R14 (round 4 review): `project_types_checked` merges every project
+    // file's workspace-global class/enum contribution — the input
+    // `Ambient::with_project_types` folds beneath each file's own
+    // declarations. It has three per-file callers (`module_export`,
+    // `binding_types`, `module_export_checked`), each itself a tracked
+    // query keyed on `(file, project)`. Before it was a tracked query in
+    // its own right, a display pass over N files (the LSP's inlay-hint
+    // sweep on open) called it N times, and it rebuilt the whole
+    // `Vec<FileTypes>` collection — and the merge each caller runs over it
+    // — from scratch every single time: O(N) work per file it touched,
+    // O(N²) total, even though every `module_surface_checked` it reads is
+    // itself already memoized. Tracking it collapses that to one execution
+    // per project revision, shared by every caller.
+    const N: usize = 25;
+    let mut host = host();
+    let changes: Vec<Change> = (0..N)
+        .map(|i| {
+            set(
+                &format!("f{i}.lua"),
+                &format!("---@class C{i}\n---@field x number\nlocal M = {{}}\nreturn M\n"),
+            )
+        })
+        .collect();
+    host.apply_changes(changes);
+    let _ = host.take_execution_log();
+
+    // One display pass, touching every file's `binding_types` for the
+    // first time at this revision — exactly what an LSP opening an N-file
+    // workspace does.
+    let snap = host.snapshot();
+    for i in 0..N {
+        let _ = snap.binding_types(Path::new(&format!("f{i}.lua")));
+    }
+    let log = host.take_execution_log();
+
+    let types_runs = mentioning(&log, "project_types_checked()");
+    assert_eq!(
+        types_runs.len(),
+        1,
+        "the project-wide types merge must execute once per revision, not \
+         once per file touched ({N} files, log: {log:?})"
+    );
+}
+
+#[test]
 fn set_dialect_reparses_the_file_under_the_new_dialect() {
     // LuaJIT-only `0x10ULL` is a parse error under 5.4.
     const JIT_ONLY: &str = "local n = 10ULL\n";
@@ -721,5 +821,40 @@ fn set_dialect_reparses_the_file_under_the_new_dialect() {
             .errors()
             .is_empty(),
         "under LuaJIT the same source is clean"
+    );
+}
+
+#[test]
+fn project_types_shares_its_allocation_across_calls_instead_of_deep_cloning() {
+    // Round 4 review finding 2: `Host::project_types()` used to end in
+    // `.types().to_vec()`, deep-cloning every project file's class/enum/
+    // alias maps on every single call. Two calls against the *same*
+    // snapshot revision now read the identical memoized `ProjectTypes`
+    // (an `Arc`-backed wrapper) and hand back a cheap `Arc` clone rather
+    // than a fresh `Vec`, so the two results' backing storage is the exact
+    // same allocation — measured here by comparing the slice's data
+    // pointer, not merely its contents (equal *contents* would pass even
+    // with the old deep clone; equal *pointer* would not).
+    const MODULE: &str = "\
+---@class Point
+---@field x number
+local M = {}
+return M
+";
+    let mut host = host();
+    host.apply_change(set("m.lua", MODULE));
+    let snap = host.snapshot();
+
+    let first = snap.project_types();
+    let second = snap.project_types();
+    assert!(
+        !first.is_empty(),
+        "the fixture declares a class, so the contribution must be non-empty"
+    );
+    assert_eq!(
+        first.as_ptr(),
+        second.as_ptr(),
+        "two calls at the same revision must share one allocation, not each \
+         deep-clone their own"
     );
 }

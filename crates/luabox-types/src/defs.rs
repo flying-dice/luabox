@@ -112,8 +112,13 @@ impl Ambient {
     /// [`crate::env::TypeEnv::class_shape_bound`] for the substitution rule
     /// this delegates to — the same one every other consumer of a generic
     /// class's shape already goes through.
+    // `pub(crate)`, not `pub` (round 4 review R16): no consumer outside this
+    // module or its tests calls it directly — every external caller
+    // (`luabox-lsp`, verified: it only ever reaches this through
+    // `Self::class_members_of`) goes through `class_members_of` below, which
+    // is the crate's real reference-site API for a bound generic lookup.
     #[must_use]
-    pub fn class_members_bound(
+    pub(crate) fn class_members_bound(
         &self,
         name: &str,
         args: &[crate::ty::Ty],
