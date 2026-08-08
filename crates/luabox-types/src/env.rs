@@ -5358,36 +5358,69 @@ mod tests {
         // see `MAX_ANCESTRY_RESOLUTIONS`'s own doc for the CLI wall-clock
         // numbers this same fixture produces (2.29s → 0.21s for 1 group,
         // 25.28s → 2.13s for 10, budgeted vs not).
+        //
+        // Wrapped in a spawned thread + bounded `recv_timeout`, the same
+        // pattern `a_k_level_diamond_over_a_shared_ancestor_resolves_in_bounded_time`
+        // uses below: `MAX_ANCESTRY_RESOLUTIONS`'s own doc comment measures
+        // this EXACT fixture — one group alone, k=190 — at >90s uncapped. A
+        // regression that stops `resolutions` from ever advancing (`+=`
+        // weakening to a no-op, say) does not merely miscount: the
+        // assertions below on `resolutions` alone cannot see it either,
+        // because a counter stuck at 0 still satisfies
+        // `0 <= MAX_ANCESTRY_RESOLUTIONS + 1` and `0 <= per_group_ceiling *
+        // groups` — both inequalities a broken cap trivially passes. The
+        // timeout is what actually detects "the budget never fires", fast,
+        // instead of the whole run either passing on a lie or hanging
+        // however long ten uncapped k=190 groups take.
         let k = 190;
         let groups = 10;
         let mut multi_source = String::new();
         for g in 0..groups {
             multi_source.push_str(&conflicting_diamond_group(&format!("G{g}_"), k));
         }
-        let env = env_of(&multi_source);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let env = env_of(&multi_source);
+            let mut per_group = Vec::with_capacity(groups);
+            for g in 0..groups {
+                let mut shape = TableTy::default();
+                let mut guard = DiamondGuard::default();
+                env.collect_class(
+                    &format!("G{g}_A{k}"),
+                    &[Ty::String],
+                    &mut shape,
+                    &mut guard,
+                    false,
+                );
+                per_group.push((
+                    shape.fields.get("item").map(|f| f.ty.clone()),
+                    guard.resolutions,
+                ));
+            }
+            let _ = tx.send(per_group);
+        });
+        let per_group = rx.recv_timeout(std::time::Duration::from_secs(30)).expect(
+            "10 independently-conflicting k=190 diamond groups must resolve in well under \
+             30s when the total-work budget is actually capping each one (measured ~5s in a \
+             debug build) — a single uncapped k=190 group alone measures >90s \
+             (MAX_ANCESTRY_RESOLUTIONS's own doc comment); a resolutions counter that never \
+             advances blows this well past any reasonable timeout rather than merely \
+             miscounting",
+        );
 
         let mut total_resolutions: u64 = 0;
-        for g in 0..groups {
-            let mut shape = TableTy::default();
-            let mut guard = DiamondGuard::default();
-            env.collect_class(
-                &format!("G{g}_A{k}"),
-                &[Ty::String],
-                &mut shape,
-                &mut guard,
-                false,
-            );
+        for (g, (item_ty, resolutions)) in per_group.into_iter().enumerate() {
             assert!(
-                matches!(shape.fields["item"].ty, Ty::Number | Ty::String),
+                matches!(item_ty, Some(Ty::Number | Ty::String)),
                 "group {g}'s own resolution must still produce a real field type"
             );
             assert!(
-                guard.resolutions <= MAX_ANCESTRY_RESOLUTIONS + 1,
-                "group {g} alone must be capped by the total-work budget: {} resolutions, \
-                 budget {MAX_ANCESTRY_RESOLUTIONS}",
-                guard.resolutions
+                resolutions <= MAX_ANCESTRY_RESOLUTIONS + 1,
+                "group {g} alone must be capped by the total-work budget: {resolutions} \
+                 resolutions, budget {MAX_ANCESTRY_RESOLUTIONS}"
             );
-            total_resolutions += guard.resolutions;
+            total_resolutions += resolutions;
         }
 
         // The growth assertion itself: G independently-conflicting groups
@@ -6581,6 +6614,187 @@ function partial(a, b) end
             templates.contains_key("Box"),
             "a bare reference to a generic ambient class must still trigger its template: \
              {templates:?}"
+        );
+    }
+
+    /// `collect_generic_classes`'s pre-scan result for a source with no
+    /// ambient layer — the file-declared half of the M56 scan (see
+    /// `pure_generic_ambient`'s siblings above), factored out for the
+    /// disjunction-arm regression tests below: each one pins a single `||`
+    /// inside `type_expr_references_any`/`tag_references_any` with a
+    /// fixture whose ONLY generic reference sits on one side of that
+    /// specific `||`, the other side always false. `&&` in place of `||`
+    /// silently drops such a fixture's reference, `file_references_generics`
+    /// reads false, and the discovery pass — and with it the whole
+    /// `templates` map — is skipped entirely (CI mutants-pr gate,
+    /// 2026-08-08: four survivors at env.rs:3442/3449/3479/3497, none of
+    /// which any test before this group could distinguish from `||`).
+    fn generic_templates_of(source: &str) -> BTreeMap<String, GenericClass> {
+        let parsed = parse(source, Dialect::Lua54);
+        assert_eq!(parsed.errors(), &[], "fixture must parse cleanly: {source}");
+        let items = luacats::harvest(&parsed);
+        let root = parsed.syntax();
+        let mut decl = Declared::default();
+        decl.absorb_tags(&items);
+        collect_generic_classes(&items, &root, None, &decl, &TypeEnv::default())
+    }
+
+    /// env.rs:3442:54 — `type_expr_references_any(key, names) ||
+    /// type_expr_references_any(value, names)` in the `TableField::Indexer`
+    /// arm. `Box` sits only in the indexer's KEY; the value (`string`)
+    /// never mentions it, so `&&` reduces the whole arm to `false`.
+    #[test]
+    fn an_indexer_key_only_reference_to_a_generic_class_is_still_seen() {
+        let templates = generic_templates_of(
+            "\
+---@class Box<T>
+---@field value T
+---@class Holder
+---@field data { [Box]: string }
+",
+        );
+        assert!(
+            templates.contains_key("Box"),
+            "a generic class named only as an indexer's KEY type must still trigger its \
+             template: {templates:?}"
+        );
+    }
+
+    /// The paired arm: `Box` sits only in the indexer's VALUE, the key
+    /// (`string`) never mentions it.
+    #[test]
+    fn an_indexer_value_only_reference_to_a_generic_class_is_still_seen() {
+        let templates = generic_templates_of(
+            "\
+---@class Box<T>
+---@field value T
+---@class Holder
+---@field data { [string]: Box }
+",
+        );
+        assert!(
+            templates.contains_key("Box"),
+            "a generic class named only as an indexer's VALUE type must still trigger its \
+             template: {templates:?}"
+        );
+    }
+
+    /// env.rs:3449:16 — the `TypeExprKind::Fun` arm ORs a params scan
+    /// against a returns scan. `Box` sits only in the PARAM, the return
+    /// (`string`) never mentions it, so `&&` reduces the whole arm to
+    /// `false`.
+    #[test]
+    fn a_fun_params_only_reference_to_a_generic_class_is_still_seen() {
+        let templates = generic_templates_of(
+            "\
+---@class Box<T>
+---@field value T
+---@class Holder
+---@field make fun(a: Box): string
+",
+        );
+        assert!(
+            templates.contains_key("Box"),
+            "a generic class named only in a `fun` type's PARAMS must still trigger its \
+             template: {templates:?}"
+        );
+    }
+
+    /// The paired arm: `Box` sits only in the RETURN, the param (`string`)
+    /// never mentions it.
+    #[test]
+    fn a_fun_returns_only_reference_to_a_generic_class_is_still_seen() {
+        let templates = generic_templates_of(
+            "\
+---@class Box<T>
+---@field value T
+---@class Holder
+---@field make fun(a: string): Box
+",
+        );
+        assert!(
+            templates.contains_key("Box"),
+            "a generic class named only in a `fun` type's RETURNS must still trigger its \
+             template: {templates:?}"
+        );
+    }
+
+    /// env.rs:3479:17 — `Tag::Alias`'s arm ORs the single-line `ty` against
+    /// the multiline `members` list. `Box` sits only in `ty` (single-line
+    /// form, `members` is empty and so trivially false), so `&&` reduces
+    /// the whole arm to `false` regardless of `ty`.
+    #[test]
+    fn an_alias_ty_only_reference_to_a_generic_class_is_still_seen() {
+        let templates = generic_templates_of(
+            "\
+---@class Box<T>
+---@field value T
+---@alias Foo Box
+",
+        );
+        assert!(
+            templates.contains_key("Box"),
+            "a generic class named only in an alias's single-line TY must still trigger its \
+             template: {templates:?}"
+        );
+    }
+
+    /// The paired arm: `Box` sits only in a multiline alias's MEMBERS list
+    /// (`ty` is `None` for this form and so trivially false).
+    #[test]
+    fn an_alias_members_only_reference_to_a_generic_class_is_still_seen() {
+        let templates = generic_templates_of(
+            "\
+---@class Box<T>
+---@field value T
+---@alias Foo
+---| Box
+",
+        );
+        assert!(
+            templates.contains_key("Box"),
+            "a generic class named only in an alias's MEMBERS list must still trigger its \
+             template: {templates:?}"
+        );
+    }
+
+    /// env.rs:3497:17 — `Tag::Operator`'s arm ORs the optional `input`
+    /// against the always-present `result`. `Box` sits only in `input`, the
+    /// result (`number`) never mentions it, so `&&` reduces the whole arm
+    /// to `false`.
+    #[test]
+    fn an_operator_input_only_reference_to_a_generic_class_is_still_seen() {
+        let templates = generic_templates_of(
+            "\
+---@class Box<T>
+---@field value T
+---@class Holder
+---@operator add(Box): number
+",
+        );
+        assert!(
+            templates.contains_key("Box"),
+            "a generic class named only in an operator's INPUT must still trigger its \
+             template: {templates:?}"
+        );
+    }
+
+    /// The paired arm: `Box` sits only in the RESULT, the input (`number`)
+    /// never mentions it.
+    #[test]
+    fn an_operator_result_only_reference_to_a_generic_class_is_still_seen() {
+        let templates = generic_templates_of(
+            "\
+---@class Box<T>
+---@field value T
+---@class Holder
+---@operator add(number): Box
+",
+        );
+        assert!(
+            templates.contains_key("Box"),
+            "a generic class named only in an operator's RESULT must still trigger its \
+             template: {templates:?}"
         );
     }
 }
