@@ -146,7 +146,180 @@ and that rule is now written into the policy rather than left to judgement.
   `check` already did, so a consumer that unconditionally parses stdout does
   not break on the happy path (refs #53).
 
+- **A `---@class` ancestry too costly to resolve is now reported
+  (`LB0319`), separately from one that is too deep (`LB0317`).** The
+  resolver bounds two different things. `MAX_ANCESTRY_DEPTH` protects the
+  native stack and is fixed by flattening the hierarchy;
+  `MAX_ANCESTRY_RESOLUTIONS` bounds the *re*-resolution a diamond conflict
+  forces — the same generic ancestor reached through more than one parent,
+  bound differently on each branch — and flattening does not help. Both
+  used to report as `LB0317`, so the diagnostic named the wrong cause and
+  advised the wrong fix.
+
+  The budget counts re-resolutions only. A hierarchy that is merely large —
+  hundreds of generated `---@class` declarations, each visited once —
+  resolves in linear time and does not trip it: measured, 601 classes at
+  depth 6 check clean in 0.09 s, matching the merge base. An earlier build
+  of this block counted first visits too and rejected exactly that shape.
+
+  Honours the full ladder: `[types] strict = false` downgrades it to a
+  warning, `---@diagnostic disable[-line|-next-line]:
+  class-ancestry-too-costly` suppresses it, and `luabox explain LB0319`
+  describes the fix.
+
+- **A class now flows to any ancestor it declares, even when it overrides an
+  inherited member at an incompatible type.** `---@class Child : Parent`
+  with `---@field v number` over `Parent`'s `---@field v string` used to
+  fail `takes(child)` where `takes` wants a `Parent` — the two were compared
+  structurally, so overriding a member, which is the point of overriding,
+  broke every upcast the declaration promises. Declared ancestry is now
+  nominal for this direction, matching lua-language-server 3.13.5 (measured
+  against the pinned binary, which accepts it).
+
+  Strictly a loosening: it only ever turns a rejection into an acceptance,
+  so it cannot introduce a new false positive on code that checks clean
+  today. The declaration-site obligation is unchanged — a `---@class Name :
+  Parent` carrier is still verified against every member `Parent` declares,
+  so an override that does not satisfy its base is still reported, at the
+  declaration rather than at every use.
+
+  The *tightening* half of nominality — luals also rejects an undeclared
+  class that happens to match structurally, where luabox accepts it — is a
+  core semantic change to every `LB0300` and is deliberately not made here;
+  it is tracked in #68, behind #66's per-code severity control.
+
+- **A cyclic `---@class` ancestry is now reported (`LB0318`).** `---@class A :
+  A`, and the mutual `A : B` / `B : A`, previously resolved in complete
+  silence: the resolver's own cycle guard stopped the walk at the back-edge,
+  so nothing crashed, but the class kept only the members reached before it
+  and a user whose intent was to extend something else got no signal
+  anywhere. The alias axis has reported its version of this as `LB0314` since
+  `#123`; this is the class axis, drained at the same point in the check and
+  with the same attribution tiers (this file's declaration, another project
+  file's, then the consuming file for an ambient `[types] defs` class).
+
+  luabox-only and deliberately stricter than the oracle — lua-language-server
+  3.13.5 reports nothing for either shape (measured against the pinned
+  binary). It honors the full strictness ladder like every other `LB03xx`:
+  `[types] strict = false` downgrades it to `warning`, and `---@diagnostic
+  disable[-line|-next-line]: cyclic-class-ancestry` suppresses it.
+  `luabox explain LB0318` describes the fix.
+
+- **A `---@class` ancestry-depth limit (`LB0317`, `MAX_ANCESTRY_DEPTH = 200`)**
+  (#56, production readiness review round 6, M4/M5). `luabox check` and the
+  LSP now both refuse to resolve a `---@class` ancestor chain deeper than
+  200 links, durably (`luabox-types`' own resolver, `DiamondGuard`) and,
+  redundantly but cheaply, syntactically ahead of it (the CLI's own
+  project-wide pre-check, so a chain nothing in the project ever references
+  is still caught, not just one the resolver happens to walk). This closes
+  the crash the limit exists to prevent (round 5 review N2 — an
+  unbounded ancestor walk could abort the whole process, uncatchably, on a
+  deep enough chain, with no diagnostic and no file name), but it is a
+  **breaking narrowing**: a chain over 200 links that `develop` and every
+  earlier round of this branch checked cleanly is `error`, exit 1, as of
+  this release. Flatten the hierarchy or use composition in place of a long
+  single-inheritance chain; a generated-bindings project (one `---@class`
+  per table/message/IDL node) is the realistic shape that reaches this. See
+  `luabox explain LB0317`.
+
+  Two bugs in the CLI's own pre-check (`check_cmd::deep_class_chain_diagnostics`)
+  shipped alongside the limit in an earlier build of this same block, both
+  fixed before this line ever reached a tagged release:
+
+  - **Wrong code, no working escape hatch.** The pre-check used to emit
+    `LB0001` — "syntax error" — for this condition, so `luabox explain` on
+    the code actually printed described a missing `end`/`)`/`}`, not an
+    ancestry limit, and the diagnostic was always `error` regardless of the
+    manifest. It now emits `LB0317` and honors the same strictness ladder
+    every other type diagnostic does: `[types] strict = false` downgrades it
+    to `warning` (exit 0 — the general shape of this hatch, and its blunt,
+    whole-project reach, are described in the `#56` entry above), `[types]
+    strict = true` keeps it `error`, and `[types] strict` unset from `None`
+    (reachable only programmatically, not from a manifest) reports nothing
+    at all, same as every other checker diagnostic.
+    `---@diagnostic disable[-line|-next-line]: class-ancestry-too-deep` in
+    the declaring file suppresses one class's own `LB0317` — from **both**
+    emitters. `LB0317` is reported by two of them: this CLI pre-check and,
+    separately, the type pass's own depth-limit drain. Registering the rule
+    name in only one of them silenced only that one, so a file-wide `disable`
+    left the other's diagnostic standing (measured on a 220-link chain: 18
+    suppressed, 1 surviving). The name now lives in a single owner,
+    `luabox_types::RULE_CLASS_ANCESTRY_TOO_DEEP`, which both read.
+  - **A second, unrelated parent silently flipped the verdict.** The
+    pre-check only followed a class's single named parent, so
+    `---@class C : A, B` at a depth that would be refused as `---@class C :
+    A` sailed through as `warning`/exit 0 (or, before the fix above,
+    reported nothing) purely because a second parent was added. It now
+    walks every named parent (bounded, so a pathologically wide declared
+    hierarchy cannot overflow the pre-check's own stack any more than a
+    pathologically deep one could), and reports every over-limit class in
+    the project, not just one arbitrarily chosen by hashmap order.
+
+  A class whose over-limit ancestry is declared in a `[types] defs` package
+  rather than this project's own source now still produces `LB0317`,
+  attributed to the file whose resolution reached it — previously it was
+  silently dropped, so the LSP reported the identical project red while
+  `check` stayed green on the same commit.
+
+  **`LB0317` past the limit is honest, not exhaustive.** Once a class's
+  ancestry truncates, further undefined-field reads on *that* class
+  (`LB0306`/`LB0303`) are not reported for it: the resolved shape is
+  admittedly incomplete past 200 links, so an absent member there might
+  simply be declared beyond the cutoff, and a false undefined-field on top
+  of the truncation warning would be worse than silence. In warn mode this
+  can mean a real bug on a truncated class goes unreported and `check`
+  still exits 0 — the same "strict=false silences the specific thing you
+  meant to see" tradeoff `[types] strict` always carries elsewhere (see the
+  `#56` entry's own no-per-diagnostic-opt-out note). Under `[types] strict =
+  true` the truncation itself is always `error`, so a build depending on
+  that class's member-checking staying honest cannot go green while
+  checking against it is silently incomplete.
+
 ### Fixed
+
+- **The `---@diagnostic disable` escape hatch for `LB0317`/`LB0318` did not
+  work cross-file, even though the CHANGELOG entries above and the
+  `require.feature` scenarios document putting it in the offending class's
+  own declaring file** (production readiness review G1). Both diagnostics
+  can carry a primary label attributed to a *different* project file than
+  the one whose check pass actually tripped the resolver
+  (`TypeEnv::cross_file_class_decl_span` — a class declared in file A is
+  resolved, and its diagnostic reported, only because file B references
+  it). The suppression scan built its `---@diagnostic` directive scan and
+  line index from the *checking* file's own source unconditionally, so a
+  disable comment sitting correctly in A's declaration was invisible to the
+  pass emitting the diagnostic — and worse, the line number fed to the
+  suppression check was computed from the wrong file's line breaks, so even
+  a correctly-scoped `disable-line` could hit or miss arbitrarily.
+  `luabox_types::check_file_with_artifacts_and_sources` now threads a
+  cross-file source resolver (`luabox-cli`'s `check_cmd`, which already
+  holds every project file's source for the length of a run) into the
+  suppression scan: a diagnostic whose primary label belongs to file X is
+  suppression-checked against X's own directives and line index, never the
+  checking file's. A direct `luabox_types::check_file*` caller with no
+  resolver in reach (the LSP, an embedder) now leaves a cross-file
+  diagnostic **unsuppressed** rather than checked against the wrong file —
+  a strict correctness improvement, not merely "no worse" than before.
+
+- **A cross-file `---@class` cycle emitted four `LB0318`s for a two-class
+  cycle, where the identical shape written in one file emits two**
+  (production readiness review G2). Each project file gets its own
+  `TypeEnv` (deliberately — see `build_file_env`'s doc comment), so every
+  file whose own check pass resolves a class caught in an N-file cycle
+  independently rediscovers the *whole* cycle (`TypeEnv::note_cyclic`
+  records every name a cycle reaches, not just the one queried) and reports
+  every member of it, not just its own. `luabox check` now dedupes
+  `LB0317`/`LB0318`/`LB0319` by `(code, primary span, message)` once every
+  project file's diagnostics have converged: the declaration span a given
+  class resolves to is the same regardless of which file's pass emitted the
+  diagnostic pointing at it, so this collapses every file's rediscovery
+  back to the one true diagnostic per class — matching what the identical
+  shape written in a single file already reported. The **message** is in
+  the key because it is the only place a `Diagnostic` retains the class
+  name, and a class with no in-project declaration is attributed to the
+  consuming file at offset `0..0` — the same coordinates whichever class
+  tripped the guard. Keying on the span alone silently dropped the second
+  of two over-budget `[types] defs` classes consumed by one file.
 
 - **A type-mismatch remedy suffix was introduced and withdrawn inside this
   same block.** Round 3 review F72 had `check_slot` append `" (add `---@type

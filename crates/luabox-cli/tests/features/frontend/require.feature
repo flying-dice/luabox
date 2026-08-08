@@ -451,13 +451,22 @@ Feature: luabox check — cross-file require resolution (#85)
   # --- chaos gaps reachable against the export/carrier boundary, round 3
   # review F80 -----------------------------------------------------------
 
-  Scenario: a require cycle between two class carriers is tolerated
+  Scenario: a require cycle between two class carriers terminates, and names the cycle
     # F80: the existing cycle pin (above, "a require cycle is tolerated")
     # uses plain-table modules, so the class-graph walk `collect_class`
     # added for parent resolution is never entered cyclically. Here each
     # carrier names the OTHER's class as its parent, and each module
     # requires the other — measured to terminate rather than hang or crash,
     # via the same `seen` recursion guard `collect_class` already carries.
+    #
+    # Round 6 review M67: terminating is what this scenario exists to pin,
+    # and it still does. What it USED to pin alongside that — `0 errors, 0
+    # warnings` — was not a property worth keeping. `---@class A : B` with
+    # `---@class B : A` is a class that is its own ancestor: meaningless as
+    # written, and previously accepted in complete silence, so a user who
+    # closed the loop by a rename or a copy-paste got no signal from any
+    # surface. That is now `LB0318`. The escape hatches are pinned in the
+    # two scenarios below.
     Given a strict project with edition "5.4"
     And a file "src/a.lua" containing:
       """
@@ -474,8 +483,143 @@ Feature: luabox check — cross-file require resolution (#85)
       return M
       """
     When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0318"
+    And stdout contains "ancestry is cyclic"
+    # Production readiness review G2: each project file gets its own
+    # `TypeEnv`, so BOTH `a.lua`'s and `b.lua`'s check pass independently
+    # rediscover the WHOLE cycle (`env::TypeEnv::note_cyclic` records every
+    # name a cycle reaches, not just the one queried) and each produces its
+    # own candidate diagnostic for BOTH `A` and `B` — 4 candidates for this
+    # 2-class cycle where the identical shape written in one file produces
+    # 2. `luabox_cli::check_cmd::dedupe_ancestry_diagnostics` collapses the
+    # duplicates by `(code, primary span)` after every file's diagnostics
+    # converge, so exactly one `LB0318` survives per class: 2, not 4.
+    And stdout contains exactly 2 occurrence of "LB0318"
+
+  Scenario: a require cycle across three class carriers dedupes to one diagnostic per class
+    # R5 (production readiness issue): the scenario above proves the dedup
+    # for a TWO-file mutual cycle only — every project file gets its own
+    # `TypeEnv` (production readiness review G2), so a regression that
+    # dedups by `code` alone (collapsing every `LB0318` in the project down
+    # to just one, regardless of which class it names), or that fails to
+    # collapse a three-way rediscovery at all, would still pass a two-file
+    # fixture: with only two classes total, "one diagnostic per class" and
+    # "one diagnostic total" cannot be told apart there. A three-file mutual
+    # cycle (`A : C`, `C : B`, `B : A`) can tell them apart: three DISTINCT
+    # classes, each independently rediscovering the whole cycle from its own
+    # file's check pass (3 files × 3 names = 9 candidates before dedup), so
+    # "collapsed to one span-keyed diagnostic per class" and "collapsed to
+    # one diagnostic, period" predict different counts — 3 vs 1 — and only
+    # the former is correct.
+    #
+    # The expected count (3) is measured against the built binary, not
+    # guessed: `luabox_cli::check_cmd::dedupe_ancestry_diagnostics` collapses
+    # by `(code, primary span)`, and each class's declaration span is
+    # distinct, so each of the three survives exactly once.
+    Given a strict project with edition "5.4"
+    And a file "src/a.lua" containing:
+      """
+      local C = require("c")
+      ---@class A : C
+      local M = {}
+      return M
+      """
+    And a file "src/b.lua" containing:
+      """
+      local A = require("a")
+      ---@class B : A
+      local M = {}
+      return M
+      """
+    And a file "src/c.lua" containing:
+      """
+      local B = require("b")
+      ---@class C : B
+      local M = {}
+      return M
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains "LB0318"
+    And stdout contains exactly 3 occurrence of "LB0318"
+    And stdout contains "`A`'s `---@class` ancestry is cyclic"
+    And stdout contains "`B`'s `---@class` ancestry is cyclic"
+    And stdout contains "`C`'s `---@class` ancestry is cyclic"
+
+  Scenario: the cyclic-class diagnostic downgrades with the strictness ladder
+    # M67's escape hatch, half one: `LB0318` is a new strictness INCREASE
+    # over code that checked clean before, so it must honour the same ladder
+    # every other LB03xx does rather than being a hard rejection with no way
+    # out (round 6 review M4(a) made exactly that complaint about LB0317).
+    Given a project with edition "5.4"
+    And a file "src/a.lua" containing:
+      """
+      ---@class CycA : CycB
+      local M = {}
+      return M
+      """
+    And a file "src/b.lua" containing:
+      """
+      ---@class CycB : CycA
+      local M = {}
+      return M
+      """
+    And a file "src/use.lua" containing:
+      """
+      ---@type CycA
+      local a
+      return a
+      """
+    When I run "luabox check"
     Then the command succeeds
-    And stderr contains "check: 0 errors, 0 warnings"
+    And stdout contains "LB0318"
+    And stderr contains "0 errors"
+
+  Scenario: the cyclic-class diagnostic is suppressible from its own declaring file alone
+    # M67's escape hatch, half two, and production readiness review G1. The
+    # rule name is luabox's own — lua-language-server 3.13.5 has no
+    # counterpart to borrow one from (measured against the pinned binary: it
+    # reports nothing for this shape) — and it has exactly one owner,
+    # `luabox_types::RULE_CYCLIC_CLASS_ANCESTRY`.
+    #
+    # A prior version of this scenario put the SAME `---@diagnostic disable`
+    # comment in BOTH files, which cannot fail even when the escape hatch is
+    # broken cross-file (issue #58's pattern): a bare, file-wide `disable`
+    # needs no line number at all to apply, so each file's own comment
+    # coincidentally suppressed that file's misattributed copy of the OTHER
+    # class's finding too — regardless of whether the checker was even
+    # consulting the right file's directives. This version puts the comment
+    # ONLY in `SupA`'s own declaring file, `a.lua`; `b.lua` has none. `SupA`'s
+    # finding can disappear only if whichever file's check pass ends up
+    # emitting it — not necessarily `a.lua`'s own; see
+    # `check_file_with_artifacts_and_sources`'s doc comment — honors
+    # `a.lua`'s directive against `a.lua`'s own source, never its own.
+    # `SupB` carries no such comment anywhere and must still be reported.
+    Given a strict project with edition "5.4"
+    And a file "src/a.lua" containing:
+      """
+      ---@diagnostic disable: cyclic-class-ancestry
+      ---@class SupA : SupB
+      local M = {}
+      return M
+      """
+    And a file "src/b.lua" containing:
+      """
+      ---@class SupB : SupA
+      local M = {}
+      return M
+      """
+    And a file "src/use.lua" containing:
+      """
+      ---@type SupA
+      local a
+      return a
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout does not contain "`SupA`'s `---@class` ancestry is cyclic"
+    And stdout contains "`SupB`'s `---@class` ancestry is cyclic"
 
   Scenario: a module requiring itself does not hang the checker
     # F80: the degenerate fixpoint of the cycle above.
@@ -579,6 +723,17 @@ Feature: luabox check — cross-file require resolution (#85)
     # passing. `wants` below pins the type: it demands `string`, `m.x` is
     # declared `number`, so only a genuine `number` crossing (not `unknown`)
     # makes `wants(m.x)` fail.
+    #
+    # Round 6 review M38: pinning `LB0300` alone still isn't the type-crossing
+    # assertion N46 asked for — in strict mode an `unknown` erasure of `x`
+    # emits the identical code, `LB0300`, just with a different message
+    # (`found `unknown`` instead of `found `number``), so the round-4
+    # regression this scenario exists to catch would still pass the
+    # code-only check. Measured against this head: `wants(m.x)` produces
+    # exactly `type mismatch: expected `string`, found `number``. Asserting
+    # that message text — not just the code — is the discriminating check:
+    # it is satisfied by the correct `number` crossing and not by an
+    # `unknown` erasure, which would read `found `unknown`` instead.
     Given a strict project with edition "5.4"
     And a file "src/config.lua" containing:
       """
@@ -601,7 +756,7 @@ Feature: luabox check — cross-file require resolution (#85)
     When I run "luabox check"
     Then the command fails
     And stdout contains "LB0306"
-    And stdout contains "LB0300"
+    And stdout contains "type mismatch: expected `string`, found `number`"
 
   Scenario: a class carried by a file that opens with a UTF-8 BOM crosses require with its field types intact
     # Round 4 review R28's third chaos gap, on the BOM half. This scenario
@@ -618,6 +773,14 @@ Feature: luabox check — cross-file require resolution (#85)
     # pins the type half the same way the unicode scenario above does: it
     # demands `string`, `p.x` is declared `number`, so only a genuine
     # `number` crossing makes `wants(p.x)` fail.
+    #
+    # Round 6 review M38: same gap as the unicode scenario above — `LB0300`
+    # alone does not discriminate a genuine `number` crossing from an
+    # `unknown` erasure, which reports the same code with a different
+    # message. Measured against this head: `wants(p.x)` produces exactly
+    # `type mismatch: expected `string`, found `number``; an erased `x`
+    # would instead read `found `unknown``. Asserting the message closes the
+    # gap the code-only assertion left open.
     Given a strict project with edition "5.4"
     And a file "src/point.lua" with a UTF-8 BOM containing:
       """
@@ -640,7 +803,7 @@ Feature: luabox check — cross-file require resolution (#85)
     When I run "luabox check"
     Then the command fails
     And stdout contains "LB0306"
-    And stdout contains "LB0300"
+    And stdout contains "type mismatch: expected `string`, found `number`"
 
   # One round 4 review R28 chaos gap still does not get a scenario here:
   #

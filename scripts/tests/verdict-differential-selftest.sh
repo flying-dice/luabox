@@ -34,8 +34,10 @@ gate="$here/verdict-differential.sh"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-pass=0
-fail=0
+# Round 6 review M49: the pass/fail counters, the exit-plus-`!needle`
+# assertion and M35's "measured nothing" guard live in one place now.
+# shellcheck source=scripts/tests/selftest-lib.sh
+. "$here/selftest-lib.sh"
 
 # --- stub tool ---------------------------------------------------------
 mkdir -p "$work/bin"
@@ -46,36 +48,55 @@ cat >"$stub_luabox" <<'STUB'
 # stub luabox: understands only `check --format json`, invoked from inside
 # the differential script's per-case temp project. Reports exactly the
 # codes named by a `-- STUB-LUABOX-DIAG: <CODE>` marker comment on its own
-# line in any *.lua file under ./src (case file or copied dep).
+# line in any *.lua file under ./src (case file or copied dep) OR ./defs
+# (an ambient package copied by a `.defs` sidecar, M33) — scanning both is
+# what lets a self-test case PROVE a `.defs` sidecar's file actually landed
+# on disk, not just that the driver didn't crash.
 #
 # A `-- STUB-LUABOX-BREAK-JSON` marker instead makes the stub emit output
 # that is not valid JSON at all — standing in for a real tool bug rather
 # than a well-formed "0 diagnostics" or "N diagnostics" answer.
+#
+# A `-- STUB-LUABOX-EXIT: <N>` marker overrides the exit code the stub
+# would otherwise use (0 for no codes, 1 for any) — M31: the real
+# discriminator this gate was missing was luabox's own exit status, so the
+# self-test needs to be able to decouple "printed diagnostics" from "exited
+# nonzero" in both directions (empty output + nonzero exit; diagnostics +
+# an exit code other than the default 1) rather than the stub's normal
+# behaviour always keeping the two in lockstep.
+#
+# The manifest itself (M60) is asserted a different way — see
+# write_case_manifest in verdict-differential.sh, which echoes what it
+# wrote to ITS OWN stdout per case, independent of whether this stub (or
+# the real luabox) ever opens luabox.toml at all.
 if [ "${1:-}" != "check" ]; then
     echo "stub-luabox: unsupported invocation: $*" >&2
     exit 2
 fi
 codes=()
 break_json=0
+exit_override=""
 shopt -s nullglob
-for f in src/*.lua; do
+for f in src/*.lua defs/*.lua; do
     if grep -qF -- '-- STUB-LUABOX-BREAK-JSON' "$f"; then
         break_json=1
     fi
     while IFS= read -r code; do
         codes+=("$code")
     done < <(grep -oE -- '-- STUB-LUABOX-DIAG: [A-Za-z0-9]+' "$f" | awk '{print $3}')
+    m="$(grep -oE -- '-- STUB-LUABOX-EXIT: [0-9]+' "$f" | awk '{print $3}' | tail -1)"
+    [ -n "$m" ] && exit_override="$m"
 done
 shopt -u nullglob
 if [ "$break_json" = 1 ]; then
     printf 'not-json: stub-luabox produced a malformed response\n'
     echo "check: stub forced a malformed response" >&2
-    exit 0
+    exit "${exit_override:-0}"
 fi
 if [ "${#codes[@]}" -eq 0 ]; then
     printf '[]\n'
     echo "check: 0 errors, 0 warnings in 1 files" >&2
-    exit 0
+    exit "${exit_override:-0}"
 fi
 out="["
 sep=""
@@ -86,7 +107,7 @@ done
 printf '%s]\n' "$out"
 echo "check: ${#codes[@]} errors, 0 warnings in 1 files" >&2
 echo "Error: check failed with ${#codes[@]} error(s)" >&2
-exit 1
+exit "${exit_override:-1}"
 STUB
 chmod +x "$stub_luabox"
 
@@ -98,41 +119,9 @@ newcorpus() {
 }
 
 # assert <name> <want-exit> <got-exit> <log> <needle>...
-# A needle prefixed with `!` must be ABSENT from the log.
-assert() {
-    local name="$1" want_exit="$2" got_exit="$3" log="$4"
-    shift 4
-    local ok=1 report=""
-    [ "$got_exit" = "$want_exit" ] || {
-        ok=0
-        report="$report expected exit $want_exit"
-    }
-    local needle
-    for needle in "$@"; do
-        case "$needle" in
-        !*)
-            if grep -qF -- "${needle#!}" "$log"; then
-                ok=0
-                report="$report present-but-should-be-absent:[${needle#!}]"
-            fi
-            ;;
-        *)
-            if ! grep -qF -- "$needle" "$log"; then
-                ok=0
-                report="$report missing:[$needle]"
-            fi
-            ;;
-        esac
-    done
-    if [ "$ok" = 1 ]; then
-        echo "PASS  $name (exit $got_exit)"
-        pass=$((pass + 1))
-    else
-        echo "FAIL  $name: got exit $got_exit.$report" >&2
-        sed 's/^/        /' "$log" >&2
-        fail=$((fail + 1))
-    fi
-}
+# This file's local name for selftest-lib.sh's `assert_exit`, kept so the
+# ~40 call sites below read as they always have.
+assert() { assert_exit "$@"; }
 
 # run <name> <want-exit> <corpus-dir> <needle>...
 # Standard invocation: stub luabox, real (missing) VERDICT_PRINT.
@@ -475,6 +464,158 @@ got=$?
 assert print_mode_todo_for_new_case 0 "$got" "$log" \
     "brand_new_case	clean	-	TODO: brand_new_case"
 
-echo
-echo "verdict-differential-selftest: $pass passed, $fail failed"
-[ "$fail" -eq 0 ]
+# ============================================================================
+# 21-24: M31 — luabox's own exit status is now inspected, not ignored.
+# ============================================================================
+
+# 21: the exact bug reported — a binary that fails outright but prints an
+# empty diagnostics array (`[]`) used to be recorded as a clean, PASSING
+# verdict. `-- STUB-LUABOX-EXIT: 2` forces the stub to exit nonzero while
+# still reporting zero codes (no `-- STUB-LUABOX-DIAG` marker at all).
+exit_empty_corpus="$(newcorpus exit-nonzero-empty)"
+cat >"$exit_empty_corpus/only_case.lua" <<'LUA'
+-- STUB-LUABOX-EXIT: 2
+LUA
+printf '# case\tverdict\tcodes\tnote\nonly_case\tclean\t-\tcontrol\n' \
+    >"$exit_empty_corpus/expected.tsv"
+run luabox_nonzero_exit_with_empty_json_fails 1 "$exit_empty_corpus" \
+    "luabox exited 2 but printed an empty diagnostics array"
+
+# 22: a hang gets the same treatment via `timeout`, but reported as a
+# timeout specifically (rc=124), not a generic nonzero exit — a hang and a
+# crash want different next steps. Uses its own stub (sleeps past
+# VERDICT_CASE_TIMEOUT) rather than the shared marker-driven one.
+hang_stub="$work/bin/hang-luabox"
+cat >"$hang_stub" <<'STUB'
+#!/bin/bash
+if [ "${1:-}" != "check" ]; then
+    echo "hang-stub: unsupported invocation: $*" >&2
+    exit 2
+fi
+sleep 5
+printf '[]\n'
+exit 0
+STUB
+chmod +x "$hang_stub"
+hang_corpus="$(newcorpus hang)"
+cat >"$hang_corpus/only_case.lua" <<'LUA'
+-- would be clean, if the stub ever returned
+LUA
+printf '# case\tverdict\tcodes\tnote\nonly_case\tclean\t-\tcontrol\n' \
+    >"$hang_corpus/expected.tsv"
+log="$work/luabox_timeout_fails.log"
+LUABOX="$hang_stub" VERDICT_CORPUS="$hang_corpus" VERDICT_CASE_TIMEOUT=1 \
+    bash "$gate" >"$log" 2>&1
+got=$?
+assert luabox_timeout_fails 1 "$got" "$log" \
+    "luabox timed out after 1s (VERDICT_CASE_TIMEOUT)"
+
+# 23: (M31's second half) a nonzero exit code that is NOT the stub's
+# default 1, paired with REAL diagnostics that match expected.tsv, must
+# still PASS — the fix must not overfit to "exit must be exactly 1 for a
+# diag row"; any nonzero exit alongside genuine diagnostics is legitimate
+# (luabox's own non-strict/warn mode can do exactly this).
+exit_diag_corpus="$(newcorpus exit-nonzero-with-diag)"
+cat >"$exit_diag_corpus/only_case.lua" <<'LUA'
+-- STUB-LUABOX-DIAG: LB0300
+-- STUB-LUABOX-EXIT: 3
+LUA
+printf '# case\tverdict\tcodes\tnote\nonly_case\tdiag\tLB0300\tcontrol\n' \
+    >"$exit_diag_corpus/expected.tsv"
+run luabox_nonzero_exit_with_diagnostics_still_matches 0 "$exit_diag_corpus" \
+    "match expected.tsv"
+
+# 24: the expected clean/zero-exit case — no markers at all, default stub
+# behaviour (exit 0, empty codes). Control for 21-23: proves the new exit-
+# status check does not itself misfire on the ordinary, correct case.
+exit_zero_clean_corpus="$(newcorpus exit-zero-clean)"
+cat >"$exit_zero_clean_corpus/only_case.lua" <<'LUA'
+-- nothing flagged, default exit 0
+LUA
+printf '# case\tverdict\tcodes\tnote\nonly_case\tclean\t-\tcontrol\n' \
+    >"$exit_zero_clean_corpus/expected.tsv"
+run luabox_zero_exit_clean_control_passes 0 "$exit_zero_clean_corpus" \
+    "match expected.tsv"
+
+# ============================================================================
+# 25-26: M60/M33 — the per-case manifest is now assertable, not silently
+# droppable, and a case can override it.
+# ============================================================================
+
+# 25: the DEFAULT manifest's `strict = true` line survives into what the
+# stub actually saw. Before M60, this line was written by an unprotected
+# printf nothing ever read back — deleting it left every case in this file
+# green. The stub now dumps luabox.toml verbatim; assert the line is really
+# in there.
+default_manifest_corpus="$(newcorpus default-manifest)"
+cat >"$default_manifest_corpus/only_case.lua" <<'LUA'
+-- STUB-LUABOX-DIAG: LB0300
+LUA
+printf '# case\tverdict\tcodes\tnote\nonly_case\tdiag\tLB0300\tcontrol\n' \
+    >"$default_manifest_corpus/expected.tsv"
+run manifest_strict_true_survives_in_default_manifest 0 "$default_manifest_corpus" \
+    "strict = true"
+
+# 26: a case shipping its own `<case>.toml` sidecar gets THAT manifest
+# instead of the default — M33's escape hatch. Content deliberately omits
+# "strict = true" so the two assertions (present / absent) can only both
+# pass if the override, not the default, was actually written.
+override_corpus="$(newcorpus manifest-override)"
+cat >"$override_corpus/only_case.lua" <<'LUA'
+-- verdict is irrelevant to this assertion; only the manifest dump is
+LUA
+printf 'strict = false  # override marker: the default manifest string is absent here\n' \
+    >"$override_corpus/only_case.toml"
+printf '# case\tverdict\tcodes\tnote\nonly_case\tclean\t-\tcontrol\n' \
+    >"$override_corpus/expected.tsv"
+run manifest_override_sidecar_is_honored 0 "$override_corpus" \
+    "strict = false" \
+    "!strict = true"
+
+# ============================================================================
+# 27: M33 — the `.defs` sidecar actually copies its file(s) into $work/defs,
+# where a real `[types] defs` manifest entry would resolve them from. The
+# stub scans defs/*.lua the same way it scans src/*.lua (see the stub's own
+# header), so a diagnostic marker only surfacing correctly here proves the
+# file made it onto disk under the right name, not merely that the driver
+# didn't crash.
+# ============================================================================
+defs_corpus="$(newcorpus defs-sidecar)"
+cat >"$defs_corpus/carrier.lua" <<'LUA'
+-- carrier itself flags nothing; the diagnostic can only come from the
+-- ambient defs file named by carrier.defs
+LUA
+cat >"$defs_corpus/ambient.d.lua" <<'LUA'
+-- STUB-LUABOX-DIAG: LB0305
+LUA
+printf 'ambient.d.lua\n' >"$defs_corpus/carrier.defs"
+printf '# case\tverdict\tcodes\tnote\ncarrier\tdiag\tLB0305\tcontrol\n' \
+    >"$defs_corpus/expected.tsv"
+run defs_sidecar_copies_ambient_file 0 "$defs_corpus" \
+    "match expected.tsv" \
+    "!luabox codes are"
+
+# ============================================================================
+# 28: M61 — a blank line inside (and trailing) a `.deps` sidecar is skipped,
+# not treated as a dependency name (which `cp` would then fail on) nor as
+# the end of the file. Two real entries with a blank line BETWEEN them plus
+# one AFTER: both dependencies' diagnostics must still surface.
+# ============================================================================
+deps_blank_line_corpus="$(newcorpus deps-blank-line)"
+cat >"$deps_blank_line_corpus/dep_one.lua" <<'LUA'
+-- STUB-LUABOX-DIAG: LB0300
+LUA
+cat >"$deps_blank_line_corpus/dep_two.lua" <<'LUA'
+-- STUB-LUABOX-DIAG: LB0306
+LUA
+cat >"$deps_blank_line_corpus/carrier.lua" <<'LUA'
+-- carrier itself is clean; both diagnostics come from its dependencies
+LUA
+printf 'dep_one.lua\n\ndep_two.lua\n\n' >"$deps_blank_line_corpus/carrier.deps"
+printf '# case\tverdict\tcodes\tnote\ncarrier\tdiag\tLB0300,LB0306\tblank lines in .deps (between entries and trailing) are skipped, not fatal\n' \
+    >"$deps_blank_line_corpus/expected.tsv"
+run deps_blank_line_is_skipped 0 "$deps_blank_line_corpus" \
+    "match expected.tsv" \
+    "!luabox codes are"
+
+selftest_report verdict-differential-selftest

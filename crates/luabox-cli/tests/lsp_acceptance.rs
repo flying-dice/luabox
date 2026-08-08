@@ -730,6 +730,32 @@ fn file_changes_on_disk(world: &mut LspWorld, path: String, step: &Step) {
     }
 }
 
+/// A file removed behind the editor's back — deleted on disk and reported
+/// through `workspace/didChangeWatchedFiles` with `FileChangeType::DELETED`
+/// (3 in the protocol's numbering), exactly as a real editor's file watcher
+/// would report a deletion. `server.rs`'s white-box
+/// `a_watched_delete_publishes_empty_diagnostics_for_the_deleted_file` and
+/// its sibling test already prove this at the protocol level (round 5 review
+/// N24); round 5 review N45 asked for the black-box counterpart through this
+/// cucumber surface and round 6 review M48 found that deferral still
+/// untracked, so `hover-require.feature`'s "hover stops answering from a
+/// module deleted behind the editor's back" scenario is the first one to
+/// exercise this step.
+#[when(expr = "the file {string} is deleted")]
+fn file_deleted_on_disk(world: &mut LspWorld, path: String) {
+    let uri = world.uri(&path);
+    let abs = world.root.join(&path);
+    std::fs::remove_file(&abs).unwrap_or_else(|e| panic!("failed to delete {path}: {e}"));
+    world.notify(
+        "workspace/didChangeWatchedFiles",
+        // `FileChangeType::DELETED` is 3 in the protocol's numbering.
+        json!({ "changes": [{ "uri": uri, "type": 3 }] }),
+    );
+    if !world.open.contains(&path) {
+        world.wait_diagnostics(&uri);
+    }
+}
+
 /// A manifest rewritten on disk and reported the same way. Reloading the
 /// configuration republishes every open document, so the step blocks until
 /// each one has been republished.

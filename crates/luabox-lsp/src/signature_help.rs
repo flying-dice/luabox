@@ -382,6 +382,7 @@ fn signature_from_class_field(
         member,
         ambient.ambient_paths(),
         ambient.sema_cache(),
+        ambient.search_order_cache(),
     )
     .and_then(|found| found.desc)
     .unwrap_or_default();

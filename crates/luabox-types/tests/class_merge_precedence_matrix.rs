@@ -22,19 +22,29 @@
 //! exists and its `winner` documents *why* there is nothing to run, so the
 //! cell is never just missing from this file.
 //!
-//! Every fixture's Lua source and expected `(code, message)` diagnostics are
-//! copied verbatim from the measurement corpus
-//! (`merge-matrix.md`'s `fixtures*.json`/`results*.json`, produced by
-//! running `luabox check --format json` against this worktree before the
-//! refactor) — this file asserts the refactor reproduces exactly what was
-//! measured, not a re-derived guess at what it should produce.
+//! Every fixture's Lua source and expected `(code, message)` diagnostics in
+//! [`CELLS`] below ARE the measurement corpus — not a copy of one (round 6
+//! review M42: an earlier revision of this comment cited a `merge-matrix.md`
+//! "measurement corpus" that was never committed to the repository).
+//! `regen_merge_matrix_provenance`, near the bottom of this file, is the
+//! actual, re-runnable measurement: it runs every variant below through a
+//! real `luabox check` subprocess and writes what it measured to
+//! `docs/03-reference/merge-matrix-provenance.md`. The fast `#[test]`s above
+//! it re-run the same variants in-process on every `cargo test` and assert
+//! they still produce exactly what is written here.
 //!
 //! A cell with more than one `variant` (labelled `swapped`/`reversed` in the
 //! matrix doc) is the same matrix cell confirmed in both directions — e.g.
 //! `field-D-unrelated-parents` and its `-swapped` twin both assert the
-//! **last**-listed parent wins, with the parents' declaration order
+//! **first**-listed parent wins, with the parents' declaration order
 //! reversed, so the winner is provably order-dependent rather than a
-//! coincidence of which type happened to be `string`.
+//! coincidence of which type happened to be `string`. (Round 6 review M39:
+//! this sentence used to say **last**-listed — the one rule this round's
+//! `9b32867` changed, and the one place restating it drifted from the cell
+//! it introduces. Re-measured for this correction, both in-process
+//! (`class_merge_precedence_matrix_matches_the_documented_matrix`, which
+//! asserts exactly this row) and through a real binary
+//! (`regen_merge_matrix_provenance`): first-listed, both directions.)
 
 mod support;
 use support::{check_cross_diags, check_self};
@@ -47,9 +57,8 @@ struct Variant {
     /// only one variant, otherwise the axis flipped for confirmation
     /// (`"C:P2,P1"`, `"a=string,b=number"`, ...).
     label: &'static str,
-    /// The fixture id in `docs/03-reference/03-class-merge-precedence.md` /
-    /// `merge-matrix.md`, so a failure can be cross-checked against the doc
-    /// by name.
+    /// The fixture id in `docs/03-reference/03-class-merge-precedence.md`,
+    /// so a failure can be cross-checked against the doc by name.
     fixture_id: &'static str,
     files: &'static [(&'static str, &'static str)],
     /// The exact `(code, message)` diagnostics `current` produced when this
@@ -57,14 +66,47 @@ struct Variant {
     expect: &'static [(&'static str, &'static str)],
 }
 
+/// Whether [`Cell::winner`]'s prose claims a checkable "which one wins"
+/// ordering rule (round 6 review M43). `winner` used to be pure prose, "read
+/// [by a human], not asserted" by anything `cargo test` runs — which is
+/// exactly how M39 happened: the module doc at the top of this file said
+/// **last**-listed for `field-D-unrelated-parents` while this cell's own
+/// `winner` field said, correctly, first-listed, and nothing but a human
+/// re-reading both ever compared them. `direction` is that comparison, made
+/// permanent: it sits in the same struct literal as `winner`, so editing one
+/// without the other is a one-line diff away from a failing test, not a
+/// silent drift discovered by the next review round.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Direction {
+    /// `winner` claims whichever declaration, parent, or ancestry edge is
+    /// FIRST (in source or processing order) wins.
+    First,
+    /// `winner` claims whichever declaration, parent, or ancestry edge is
+    /// LAST wins.
+    Last,
+    /// `winner` makes no first/last ordering claim this file can check: a
+    /// baseline resolve, an agreement case (diamond-identical), a
+    /// kind-vs-kind precedence rule (declaration beats attachment), or N/A /
+    /// not-separately-fixtured.
+    Other,
+}
+
 /// One matrix cell: a member kind crossed with an arrival shape.
 struct Cell {
     kind: &'static str,
     shape: &'static str,
-    /// The matrix doc's own words for who wins — read, not asserted; the
-    /// assertion is `Variant::expect`. Kept so a failure's panic message
-    /// names the rule that broke, not just the code that changed.
+    /// The matrix doc's own words for who wins. Free prose — for a panic
+    /// message that names the rule that broke, not just the code that
+    /// changed — but no longer *unchecked* prose: `direction` pins its
+    /// ordering claim, and `winner_prose_names_the_same_direction_as_its_direction_flag`
+    /// (below) asserts the two agree (M43).
     winner: &'static str,
+    /// The ordering claim `winner` makes, cross-checked against it by
+    /// `winner_prose_names_the_same_direction_as_its_direction_flag` and,
+    /// for a cell with a genuine order-swapped twin, against
+    /// [`Variant::expect`] itself by
+    /// `order_directional_cells_actually_prove_the_claimed_direction`.
+    direction: Direction,
     variants: &'static [Variant],
 }
 
@@ -73,6 +115,7 @@ const CELLS: &[Cell] = &[
         kind: "field",
         shape: "single",
         winner: "resolves (baseline)",
+        direction: Direction::Other,
         variants: &[Variant {
             label: "base",
             fixture_id: "field-A-single",
@@ -99,6 +142,7 @@ want_string(f.x)
         kind: "field",
         shape: "dup-same-file",
         winner: "first declaration (+ LB0311 warning)",
+        direction: Direction::First,
         variants: &[Variant {
             label: "base",
             fixture_id: "field-B-absorb-block-dup-same-file",
@@ -130,6 +174,7 @@ want_string(f.x)
         kind: "field",
         shape: "dup-cross-file",
         winner: "first-processed file",
+        direction: Direction::First,
         variants: &[
             Variant {
                 label: "a=number,b=string",
@@ -207,6 +252,7 @@ want_string(f.x)
         kind: "field",
         shape: "unrelated-parents",
         winner: "first-listed parent (luals parity — see production-readiness-assessment-9natxz A1: luals's own compiler.lua:369-375/424 resolves the first-listed parent, confirmed by directly measuring the pinned binary; luabox previously resolved last-listed, reasoned from its own code comments rather than from luals, and was backwards)",
+        direction: Direction::First,
         variants: &[
             Variant {
                 label: "C:P1,P2",
@@ -262,6 +308,7 @@ want_string(c.x)
         kind: "field",
         shape: "diamond-identical",
         winner: "resolves to the agreed value",
+        direction: Direction::Other,
         variants: &[Variant {
             label: "base",
             fixture_id: "field-E-diamond-identical-binding",
@@ -291,6 +338,7 @@ want_string(c.item)
         kind: "field",
         shape: "diamond-conflicting",
         winner: "last-visited ancestry edge",
+        direction: Direction::Last,
         variants: &[
             Variant {
                 label: "A=number,B=string",
@@ -346,6 +394,7 @@ want_string(c.item)
         kind: "field",
         shape: "bound-vs-bare",
         winner: "bound: substitutes; bare: reads `unknown` (production readiness review finding 5)",
+        direction: Direction::Other,
         variants: &[Variant {
             label: "base",
             fixture_id: "field-G-generic-bound-vs-bare",
@@ -383,6 +432,7 @@ want_string(sb.item)
         kind: "method",
         shape: "single",
         winner: "resolves (baseline)",
+        direction: Direction::Other,
         variants: &[Variant {
             label: "base",
             fixture_id: "method-A-single",
@@ -412,6 +462,7 @@ want_number(f:m())
         kind: "method",
         shape: "dup-same-file",
         winner: "first-declared carrier, in statement order",
+        direction: Direction::First,
         variants: &[Variant {
             label: "base",
             fixture_id: "method-B-two-carriers-same-file",
@@ -448,6 +499,7 @@ want_string(f:m())
         kind: "method",
         shape: "dup-cross-file",
         winner: "first-processed FILE wins (finding 2 fixed: was unobservable)",
+        direction: Direction::First,
         variants: &[
             Variant {
                 label: "a=1,b=s",
@@ -544,6 +596,14 @@ want_string(f:m())
         kind: "method",
         shape: "unrelated-parents",
         winner: "first-listed parent wins, matching field-D (luals parity — production-readiness-assessment-9natxz A1: the carrier/bindSource lookup runs inside the same searchClass recursion the extends walk drives, so it is subject to the identical first-ancestor-wins gate as `---@field`)",
+        // Round 6 review M43: this flag said `Last` while the prose above
+        // said first-listed, and nothing compared them. Re-measured against
+        // the built binary: `MC : MP1, MP2` with `MP1:m(): number` and
+        // `MP2:m(): string` types `c:m()` as `number` (clean against a
+        // `number` param); swapping to `MC : MP2, MP1` types it `string`
+        // (`LB0300 expected number, found string`). Order-dependent,
+        // first-listed. The prose was right and the flag was stale.
+        direction: Direction::First,
         variants: &[
             Variant {
                 label: "C:P1,P2",
@@ -623,6 +683,7 @@ want_string(c:m())
         kind: "method",
         shape: "diamond-identical",
         winner: "resolves to the agreed value (finding 1 fixed: was N/A)",
+        direction: Direction::Other,
         variants: &[Variant {
             label: "base",
             fixture_id: "method-E-diamond-identical",
@@ -656,9 +717,40 @@ want_string(c:m())
         }],
     },
     Cell {
+        // Round 6 review M44: this row used to be `shape: "diamond-conflicting"`
+        // with a `winner` that opened "N/A (no type param to bind two ways)"
+        // and then, in the same string, described a live variant with a real
+        // `LB0300` assertion — a genuinely N/A cell and a genuinely live one,
+        // sharing one `(kind, shape)` key. `every_cell_is_named_exactly_once`
+        // only catches a *duplicate* `(kind, shape)` pair; it has no way to
+        // notice that a single row's own prose contradicts its own
+        // `variants`. Split honestly below: this is the true N/A row (methods
+        // carry no type parameter, so there is nothing for a diamond to bind
+        // two ways), and the live fixture moves to its own row under a shape
+        // name that says what it actually is.
         kind: "method",
         shape: "diamond-conflicting",
-        winner: "N/A (no type param to bind two ways). This fixture is actually an unrelated-parents shape wearing this slot (A's inherited Base attachment vs. B's own field declaration are two DIFFERENT classes' contributions, not one class's own declaration-over-attachment): A, first-listed, wins (A1, luals parity) — B's `m` declaration never even gets visited, matching luals's key-locking (compiler.lua:369-375/424), not the within-class method-G rule",
+        winner: "N/A: methods carry no type parameter to bind two ways",
+        direction: Direction::Other,
+        variants: &[],
+    },
+    Cell {
+        // The substitute this slot used to carry (declaration overriding an
+        // inherited attachment) was retired: measured, it is not a
+        // diamond-conflict at all — A's inherited `Base` attachment and B's
+        // own `---@field` declaration are two DIFFERENT classes' contributions
+        // to `C : A, B`, i.e. an unrelated-parents shape (finding 6 governs
+        // it), not one class's own declaration beating its own attachment
+        // (that is method-G, a different, single-class shape). Kept as its
+        // own row — not folded back into `unrelated-parents` above — because
+        // its assertion exercises the field/method key-locking boundary
+        // (`m` resolves via A's subtree before B is ever visited, matching
+        // luals's `searchClass`, compiler.lua:369-375/424) that the plain
+        // unrelated-parents fixture does not.
+        kind: "method",
+        shape: "unrelated-ancestor-declaration-vs-attachment (finding 6 repro)",
+        winner: "A, first-listed, wins (A1, luals parity) — B's `m` declaration never even gets visited, matching luals's key-locking, not the within-class method-G rule",
+        direction: Direction::First,
         variants: &[Variant {
             label: "base",
             fixture_id: "method-F-diamond-conflicting-unrelated-ancestor-declaration",
@@ -701,6 +793,7 @@ want_string(c.m(c))
         kind: "method",
         shape: "declaration-vs-attachment",
         winner: "the ---@field declaration's type wins",
+        direction: Direction::Other,
         variants: &[Variant {
             label: "base",
             fixture_id: "method-G-field-declaration-beats-attachment",
@@ -729,6 +822,7 @@ want_string(F.m())
         kind: "method",
         shape: "same-file-inheritance-gap (finding 1 repro)",
         winner: "resolves, matching the cross-file control (finding 1 fixed: was LB0306)",
+        direction: Direction::Other,
         variants: &[Variant {
             label: "base",
             fixture_id: "method-inheritance-gap-same-file",
@@ -755,6 +849,7 @@ local y = c.m
         kind: "method",
         shape: "cross-file-inheritance-control (finding 1 repro)",
         winner: "resolves regardless of which file P1 lives in",
+        direction: Direction::Other,
         variants: &[Variant {
             label: "base",
             fixture_id: "method-inheritance-cross-file-control",
@@ -787,6 +882,7 @@ local y = c.m
         kind: "method",
         shape: "cross-file-signature-gap (finding 2 repro)",
         winner: "resolves to the inferred return type (finding 2 fixed: was `unknown`)",
+        direction: Direction::Other,
         variants: &[Variant {
             label: "base",
             fixture_id: "method-cross-file-signature-gap",
@@ -827,6 +923,7 @@ want_number(f:m())
         kind: "method",
         shape: "cross-file-signature-gap-field-control (finding 2 repro)",
         winner: "resolves — the one-variable control: a `---@field` in the identical shape already worked",
+        direction: Direction::Other,
         variants: &[Variant {
             label: "base",
             fixture_id: "method-cross-file-signature-gap-field-control",
@@ -863,6 +960,7 @@ want_number(f.m())
         kind: "indexer",
         shape: "single",
         winner: "resolves (baseline)",
+        direction: Direction::Other,
         variants: &[Variant {
             label: "base",
             fixture_id: "indexer-A-single",
@@ -888,7 +986,17 @@ want_string(f["k"])
     Cell {
         kind: "indexer",
         shape: "dup-same-file",
-        winner: "first declaration, silently (no LB0311-style warning)",
+        // Round 6 review M11: this used to read "first declaration,
+        // *silently* (no LB0311-style warning)" — the asymmetry M11 names.
+        // The resolution was already the named field's (first wins); only
+        // the diagnostic was missing, so a conflicting indexer resolved with
+        // no signal while the identical conflict on a named field warned.
+        // Measured against the oracle before changing it: lua-language-server
+        // 3.13.5 on this exact fixture reports `duplicate-doc-field
+        // Duplicate defined fields `[string]`.`, the same as it does for a
+        // repeated named field across two blocks of one class.
+        winner: "first declaration (+ LB0311 warning), matching field-B",
+        direction: Direction::First,
         variants: &[Variant {
             label: "base",
             fixture_id: "indexer-B-absorb-block-dup-same-file",
@@ -910,13 +1018,17 @@ local function want_number(n) end
 want_string(f["k"])
 "#,
             )],
-            expect: &[("LB0300", "type mismatch: expected `string`, found `number`")],
+            expect: &[
+                ("LB0311", "duplicate field `[string]` on class `Foo`"),
+                ("LB0300", "type mismatch: expected `string`, found `number`"),
+            ],
         }],
     },
     Cell {
         kind: "indexer",
         shape: "dup-cross-file",
         winner: "first-processed file",
+        direction: Direction::First,
         variants: &[Variant {
             label: "base",
             fixture_id: "indexer-C-merge-file-types-dup-cross-file",
@@ -957,6 +1069,7 @@ want_string(f["k"])
         kind: "indexer",
         shape: "unrelated-parents",
         winner: "first-listed parent",
+        direction: Direction::First,
         variants: &[
             Variant {
                 label: "C:P1,P2",
@@ -1012,6 +1125,7 @@ want_string(c["k"])
         kind: "indexer",
         shape: "diamond-identical",
         winner: "resolves to the agreed value",
+        direction: Direction::Other,
         variants: &[Variant {
             label: "base",
             fixture_id: "indexer-E-diamond-identical-binding",
@@ -1041,6 +1155,7 @@ want_string(c["k"])
         kind: "indexer",
         shape: "diamond-conflicting",
         winner: "last-visited ancestry edge",
+        direction: Direction::Last,
         variants: &[
             Variant {
                 label: "A=number,B=string",
@@ -1096,6 +1211,7 @@ want_string(c["k"])
         kind: "indexer",
         shape: "bound-vs-bare",
         winner: "bound: substitutes; bare: reads `unknown` (production readiness review finding 5)",
+        direction: Direction::Other,
         variants: &[Variant {
             label: "base",
             fixture_id: "indexer-G-generic-bound-vs-bare",
@@ -1133,6 +1249,7 @@ want_string(sb["k"])
         kind: "operator",
         shape: "single",
         winner: "resolves (baseline)",
+        direction: Direction::Other,
         variants: &[Variant {
             label: "base",
             fixture_id: "operator-A-single",
@@ -1162,6 +1279,7 @@ want_string(a + b)
         kind: "operator",
         shape: "dup-same-file",
         winner: "first overload matched by the accepts-input scan (#114)",
+        direction: Direction::First,
         variants: &[Variant {
             label: "base",
             fixture_id: "operator-B-absorb-block-dup-same-file",
@@ -1192,6 +1310,7 @@ want_string(a + b)
         kind: "operator",
         shape: "dup-cross-file",
         winner: "first-processed file's overload, same scan mechanism",
+        direction: Direction::First,
         variants: &[Variant {
             label: "base",
             fixture_id: "operator-C-merge-file-types-dup-cross-file",
@@ -1234,6 +1353,7 @@ want_string(a + b)
         kind: "operator",
         shape: "unrelated-parents",
         winner: "first-listed parent",
+        direction: Direction::First,
         variants: &[
             Variant {
                 label: "C:P1,P2",
@@ -1295,6 +1415,7 @@ want_number(a + b)
         kind: "operator",
         shape: "diamond-identical",
         winner: "resolves to the agreed value",
+        direction: Direction::Other,
         variants: &[Variant {
             label: "base",
             fixture_id: "operator-E-diamond-identical-binding",
@@ -1326,6 +1447,7 @@ want_string(a + b)
         kind: "operator",
         shape: "diamond-conflicting",
         winner: "last-visited edge (now matches field/indexer, finding 3 fixed)",
+        direction: Direction::Last,
         variants: &[
             Variant {
                 label: "A=number,B=string",
@@ -1385,12 +1507,14 @@ want_number(a + b)
         kind: "operator",
         shape: "bound-vs-bare",
         winner: "not separately fixtured (see collect_operators binding)",
+        direction: Direction::Other,
         variants: &[],
     },
     Cell {
         kind: "typeparam",
         shape: "dup-same-file-renamed",
         winner: "positional unification: slot 0 is one variable",
+        direction: Direction::Other,
         variants: &[Variant {
             label: "base",
             fixture_id: "typeparam-B-absorb-block-renamed-same-file",
@@ -1420,6 +1544,7 @@ want_string(b.other)
         kind: "typeparam",
         shape: "dup-same-file-second-empty",
         winner: "first (non-empty) declaration's list is canonical",
+        direction: Direction::First,
         variants: &[Variant {
             label: "base",
             fixture_id: "typeparam-B-absorb-block-second-empty-same-file",
@@ -1448,6 +1573,7 @@ want_string(b.value)
         kind: "typeparam",
         shape: "dup-cross-file-renamed",
         winner: "same positional unification, across files",
+        direction: Direction::Other,
         variants: &[Variant {
             label: "base",
             fixture_id: "typeparam-C-merge-file-types-renamed-cross-file",
@@ -1489,6 +1615,7 @@ want_string(b.other)
         kind: "typeparam",
         shape: "bound-vs-bare (parent reference)",
         winner: "`: Base<number>` binds the parent's parameter",
+        direction: Direction::Other,
         variants: &[Variant {
             label: "base",
             fixture_id: "typeparam-G-parent-bound-vs-bare",
@@ -1517,12 +1644,14 @@ want_string(sd.item)
         kind: "typeparam",
         shape: "unrelated-parents / diamond",
         winner: "N/A: a class's own parameter list has no analogue across parents",
+        direction: Direction::Other,
         variants: &[],
     },
     Cell {
         kind: "visibility",
         shape: "single",
         winner: "enforces (baseline)",
+        direction: Direction::Other,
         variants: &[Variant {
             label: "base",
             fixture_id: "visibility-A-single-private",
@@ -1543,6 +1672,7 @@ local y = f.x
         kind: "visibility",
         shape: "dup-same-file",
         winner: "first wins atomically with the field itself",
+        direction: Direction::First,
         variants: &[Variant {
             label: "base",
             fixture_id: "visibility-B-absorb-block-conflicting-scopes",
@@ -1568,6 +1698,7 @@ local y = f.x
         kind: "visibility",
         shape: "dup-cross-file",
         winner: "first-processed file",
+        direction: Direction::First,
         variants: &[
             Variant {
                 label: "private,protected",
@@ -1633,6 +1764,7 @@ local y = f.x
         kind: "visibility",
         shape: "unrelated-parents",
         winner: "first-listed parent (now matches indexer/operator, finding 4 fixed)",
+        direction: Direction::First,
         variants: &[
             Variant {
                 label: "C:P1,P2",
@@ -1676,6 +1808,7 @@ local y = c.x
         kind: "visibility",
         shape: "diamond (identical owner)",
         winner: "unambiguous: both edges reach the same declaration",
+        direction: Direction::Other,
         variants: &[Variant {
             label: "base",
             fixture_id: "visibility-E-diamond-identical-owner",
@@ -1699,6 +1832,7 @@ local y = c.x
         kind: "visibility",
         shape: "diamond-conflicting",
         winner: "N/A: visibility is not parameterized by generic arguments",
+        direction: Direction::Other,
         variants: &[],
     },
 ];
@@ -1776,12 +1910,17 @@ fn class_merge_precedence_matrix_matches_the_documented_matrix() {
         failures.join("\n")
     );
     // Every fixtured variant in the corpus actually ran. This was a `>= 45`
-    // floor while the real count was 52, which meant an entire `Cell` could
-    // be deleted — seven variants' worth — with this suite still green. A
-    // merge-gate finder proved it by removing the row that pins carrier
-    // methods resolving to the first-listed parent and watching both tests
-    // pass. The floor is now the exact count, so a row that disappears is a
-    // failure rather than a smaller number nobody reads.
+    // floor while the real count was 51 (round 6 review M65: this comment
+    // used to say 52 — measured against `EXPECTED_FIXTURED_VARIANTS` and the
+    // commit that introduced this guard, `619517d`, whose own message says
+    // 51; the "52" here was a transcription slip in the comment text, not in
+    // the code), which meant up to six variants could vanish and the floor
+    // would stay satisfied. A merge-gate finder proved it concretely by
+    // removing the entire two-variant row that pins carrier methods
+    // resolving to the first-listed parent (`method-D-unrelated-parents` and
+    // its `-swapped` twin, dropping the count from 51 to 49) and watching
+    // both tests pass. The floor is now the exact count, so a row that
+    // disappears is a failure rather than a smaller number nobody reads.
     assert_eq!(
         checked, EXPECTED_FIXTURED_VARIANTS,
         "the matrix ran {checked} fixtured variants, expected          {EXPECTED_FIXTURED_VARIANTS} — if you added or removed a cell,          update this count and the published table together"
@@ -1794,7 +1933,9 @@ const EXPECTED_FIXTURED_VARIANTS: usize = 51;
 
 /// Every fixture id named by the published matrix
 /// (`docs/03-reference/03-class-merge-precedence.md`) exists as a variant in
-/// [`CELLS`], and vice versa.
+/// [`CELLS`], and vice versa — in both directions, for every variant,
+/// including `-swapped`/`-reversed` twins and the finding-specific repro
+/// fixtures.
 ///
 /// This is the check that makes "adding a member kind or an arrival shape
 /// forces a row" true rather than aspirational. Without it the table and the
@@ -1806,25 +1947,47 @@ const EXPECTED_FIXTURED_VARIANTS: usize = 51;
 /// source of truth for what each one resolves to. Cells the doc marks N/A or
 /// unobservable name no fixture id, so they are absent from both sides and
 /// stay that way.
+///
+/// (Round 6 review M62: this used to check one direction only — every
+/// documented id has a test — and the doc wrote a `-swapped`/`-reversed`
+/// twin as a `(+ `-swapped`)` suffix on its sibling's id, plus a couple of
+/// repro fixtures named only in prose ("zero-dup repro: ... (+ field
+/// control)"), never as their own literal backtick token. Neither shape was
+/// ever a `documented` entry, so the ~10 twin variants and the
+/// prose-only repro variants had no doc-side protection at all: deleting
+/// `method-D-unrelated-parents-swapped` and its `EXPECTED_FIXTURED_VARIANTS`
+/// decrement left every test in this file green. The doc above now spells
+/// out every twin and every repro fixture as its own literal backtick id —
+/// measured, this closes the gap exactly: the set of `field`/`method`/
+/// `indexer`/`operator`/`typeparam`/`visibility`-prefixed backtick tokens in
+/// the doc and the set of `fixture_id`s in [`CELLS`] are now equal, 51 or
+/// 51, zero missing either direction. The parser below is widened to match
+/// (prefix-based, not "single uppercase letter" — that heuristic is what
+/// excluded the prose-named repro ids in the first place) and the assertion
+/// is now bidirectional, so either side losing an entry independently is a
+/// failure, not a silent shrink.)
 #[test]
 fn the_published_matrix_and_the_test_table_name_the_same_fixtures() {
+    const KIND_PREFIXES: &[&str] = &[
+        "field-",
+        "method-",
+        "indexer-",
+        "operator-",
+        "typeparam-",
+        "visibility-",
+    ];
     let doc = include_str!("../../../docs/03-reference/03-class-merge-precedence.md");
     let mut documented: Vec<String> = Vec::new();
     for line in doc.lines() {
-        // Fixture ids live in the last column of each table row, in backticks,
-        // shaped `<kind>-<letter>-<slug>` (plus optional `-swapped` twins
-        // written as a bare `` (+ `-swapped`) `` suffix, which the row's own
-        // `variants` cover and which are not separate ids).
+        // Fixture ids live in table rows, in backticks. Every one — base id,
+        // `-swapped`/`-reversed` twin, and finding-specific repro fixture —
+        // is spelled out in full as its own backtick token (see the doc
+        // comment above); no shorthand suffix notation is left to miss.
         if !line.starts_with('|') {
             continue;
         }
         for token in line.split('`') {
-            let looks_like_id = token
-                .split_once('-')
-                .and_then(|(_, rest)| rest.split_once('-'))
-                .is_some_and(|(letter, _)| {
-                    letter.len() == 1 && letter.chars().all(|c| c.is_ascii_uppercase())
-                });
+            let looks_like_id = KIND_PREFIXES.iter().any(|p| token.starts_with(p));
             if looks_like_id && !documented.contains(&token.to_string()) {
                 documented.push(token.to_string());
             }
@@ -1841,27 +2004,33 @@ fn the_published_matrix_and_the_test_table_name_the_same_fixtures() {
         .flat_map(|cell| cell.variants.iter().map(|v| v.fixture_id))
         .collect();
 
-    // Checked in one direction deliberately: every fixture id the published
-    // table names must be measured here. That is the direction that catches
-    // a deleted row — the doc still advertises the cell while nothing pins
-    // it, which the exact-count assertion above cannot see on its own.
-    //
-    // The reverse is not asserted, because the table writes a swapped twin
-    // as a `(+ `-swapped`)` suffix on its sibling's id rather than as its own
-    // entry, and names a few finding-specific repro fixtures in prose.
-    // Requiring every tested id to appear verbatim would fail on that
-    // formatting rather than on drift; the exact count bounds the test side.
+    // Both directions, now that every variant — including twins and repro
+    // fixtures — is spelled out literally in the doc (M62): a documented id
+    // with no test is a claim nothing checks; a tested id with no doc
+    // mention is a fixture the published matrix doesn't actually advertise.
     let missing_from_tests: Vec<&String> = documented
         .iter()
         .filter(|id| !tested.iter().any(|t| t == &id.as_str()))
         .collect();
-
     assert!(
         missing_from_tests.is_empty(),
         "the published matrix names {} fixture(s) this table does not \
          measure: {missing_from_tests:?} — a documented cell with no test is \
          a claim nothing checks",
         missing_from_tests.len()
+    );
+
+    let missing_from_doc: Vec<&&str> = tested
+        .iter()
+        .filter(|id| !documented.iter().any(|d| d == *id))
+        .collect();
+    assert!(
+        missing_from_doc.is_empty(),
+        "this table measures {} fixture(s) the published matrix does not \
+         name: {missing_from_doc:?} — a tested variant with no doc mention \
+         can be deleted, with its EXPECTED_FIXTURED_VARIANTS decrement, and \
+         nothing here would notice",
+        missing_from_doc.len()
     );
 }
 
@@ -1880,4 +2049,499 @@ fn every_cell_is_named_exactly_once() {
             cell.shape
         );
     }
+}
+
+/// Every `CELLS` row with `variants: &[]` — an N/A or not-separately-fixtured
+/// cell — is named by a `| — | — |` row in the published matrix, under the
+/// matching section header, and vice versa.
+///
+/// (Round 6 review M63: the module doc at the top of this file claims a cell
+/// marked N/A "is never just missing from this file" — but nothing checked
+/// that. Deleting either zero-variant `Cell` (`typeparam` /
+/// `unrelated-parents / diamond`, or `visibility` / `diamond-conflicting`)
+/// with no other edit left every other test in this file green:
+/// `class_merge_precedence_matrix_matches_the_documented_matrix` only walks
+/// non-empty `variants`, `EXPECTED_FIXTURED_VARIANTS` only counts fixtured
+/// variants, `every_cell_is_named_exactly_once` only catches a *duplicate*
+/// key, and the fixture-id matcher above only sees rows with a real
+/// backtick-quoted id — an N/A row's fixture-id column is `—`, not a
+/// fixture. This test closes that: it cross-checks `(kind, shape)` for every
+/// zero-variant row on both sides, so a placeholder disappearing from either
+/// the doc or the code is a failure, making the module doc's claim true
+/// rather than aspirational.)
+#[test]
+fn every_na_cell_is_documented_and_every_documented_na_row_is_a_cell() {
+    const SECTION_KINDS: &[(&str, &str)] = &[
+        ("### `---@field`", "field"),
+        ("### Method", "method"),
+        ("### Indexer", "indexer"),
+        ("### Operator", "operator"),
+        ("### Type parameter", "typeparam"),
+        ("### Visibility", "visibility"),
+    ];
+    let doc = include_str!("../../../docs/03-reference/03-class-merge-precedence.md");
+    let mut kind: Option<&str> = None;
+    let mut documented: Vec<(String, String)> = Vec::new();
+    for line in doc.lines() {
+        if line.starts_with("### ") {
+            kind = SECTION_KINDS
+                .iter()
+                .find(|(prefix, _)| line.starts_with(prefix))
+                .map(|(_, k)| *k);
+            continue;
+        }
+        if !line.starts_with('|') || !line.trim_end().ends_with("| — | — |") {
+            continue;
+        }
+        let Some(k) = kind else { continue };
+        let shape = line
+            .trim_start_matches('|')
+            .split('|')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        documented.push((k.to_string(), shape));
+    }
+    assert!(
+        documented.len() >= 3,
+        "parsed only {} zero-variant `| — | — |` rows from the published \
+         matrix — the table's shape or section headers changed and this \
+         parser no longer reads it, which would make this test vacuous",
+        documented.len()
+    );
+
+    let coded: Vec<(&str, &str)> = CELLS
+        .iter()
+        .filter(|c| c.variants.is_empty())
+        .map(|c| (c.kind, c.shape))
+        .collect();
+
+    let missing_from_code: Vec<&(String, String)> = documented
+        .iter()
+        .filter(|(k, s)| !coded.iter().any(|(ck, cs)| ck == k && *cs == s.as_str()))
+        .collect();
+    assert!(
+        missing_from_code.is_empty(),
+        "the published matrix documents {} zero-variant row(s) with no \
+         matching zero-variant CELLS entry: {missing_from_code:?}",
+        missing_from_code.len()
+    );
+
+    let missing_from_doc: Vec<&(&str, &str)> = coded
+        .iter()
+        .filter(|(k, s)| !documented.iter().any(|(dk, ds)| dk == k && ds == *s))
+        .collect();
+    assert!(
+        missing_from_doc.is_empty(),
+        "CELLS has {} zero-variant row(s) the published matrix's \
+         `| — | — |` convention does not document: {missing_from_doc:?} — \
+         a zero-variant cell can otherwise be deleted from this file with no \
+         other edit and every test still green (M63)",
+        missing_from_doc.len()
+    );
+}
+
+/// [`Cell::winner`]'s prose and its [`Cell::direction`] flag must name the
+/// same rule (round 6 review M43). They live in the same struct literal, a
+/// few lines apart, so this cannot be defeated the way M39 was — one field
+/// changed (or added new) without the other being touched.
+///
+/// A row whose prose mentions BOTH "first" and "last" (contrasting this
+/// cell's rule against a sibling's, or narrating a history where the rule
+/// changed) is deliberately skipped rather than guessed at: a bare substring
+/// scan cannot safely tell "this cell's own rule is first, unlike a sibling
+/// which is last" apart from an actual contradiction, and guessing wrong
+/// would make this test itself the next source of drift.
+#[test]
+fn winner_prose_names_the_same_direction_as_its_direction_flag() {
+    let mut failures = Vec::new();
+    for cell in CELLS {
+        let lower = cell.winner.to_lowercase();
+        let says_first = lower.contains("first");
+        let says_last = lower.contains("last");
+        let claimed = match (says_first, says_last) {
+            (true, false) => Some(Direction::First),
+            (false, true) => Some(Direction::Last),
+            _ => None, // neither, or both — not a single checkable claim
+        };
+        if let Some(claimed) = claimed
+            && claimed != cell.direction
+        {
+            failures.push(format!(
+                "{}/{}: winner text says {claimed:?} but Cell::direction is {:?} — one of \
+                 them is wrong:\n  winner: {}",
+                cell.kind, cell.shape, cell.direction, cell.winner
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} cell(s) whose winner prose disagrees with their own direction flag:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// A [`Cell`] with a genuine order-swapped twin (`variants.len() >= 2`) and
+/// a [`Direction`] other than `Other` must actually SHOW the claimed
+/// order-dependence, not merely assert it: if every variant after the first
+/// produced the identical diagnostics, reversing the declaration/parent/edge
+/// order changed nothing observable, and "first-listed wins" or
+/// "last-visited wins" is an unfalsified claim, not a measured one — the gap
+/// M43 exists to close. Round 6 review M39's drift was in the prose alone;
+/// this test's sibling above catches that. This test catches the shape one
+/// level deeper: a `direction` flag with no evidence behind it at all.
+#[test]
+fn order_directional_cells_actually_prove_the_claimed_direction() {
+    let mut failures = Vec::new();
+    for cell in CELLS {
+        if cell.direction == Direction::Other || cell.variants.len() < 2 {
+            continue;
+        }
+        let baseline = cell.variants[0].expect;
+        for other in &cell.variants[1..] {
+            if other.expect == baseline {
+                failures.push(format!(
+                    "{}/{} [{}]: Cell::direction claims {:?}, but this variant produced the \
+                     SAME diagnostics as `{}` — that is not order-dependence, it is a \
+                     coincidence with a direction claim stapled to it: {:?}",
+                    cell.kind,
+                    cell.shape,
+                    other.label,
+                    cell.direction,
+                    cell.variants[0].label,
+                    other.expect
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} order-directional cell(s) with no actual measured order-dependence:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+// === Provenance regeneration (round 6 review M42) =========================
+//
+// `docs/03-reference/03-class-merge-precedence.md` used to cite a
+// `merge-matrix.md` "scratch report this page was built from" that was never
+// committed — `find . -name 'merge-matrix*'` returns nothing, so neither
+// that 396-line doc nor this 1883-line file could be re-derived or audited
+// by anyone who did not already trust the person who wrote them. This is
+// the real regeneration mechanism the doc now points at instead: it runs
+// every fixture in [`CELLS`] — the same fixtures the fast, in-process
+// `class_merge_precedence_matrix_matches_the_documented_matrix` test above
+// checks against this crate's library code directly — through an actual
+// `luabox` release binary as a subprocess, exactly the way a user's project
+// would be checked, and writes what it measured to
+// `docs/03-reference/merge-matrix-provenance.md`. There is exactly one
+// fixture corpus in this repository now, not a corpus plus a doc plus a
+// scratch report that can drift from it three separate ways.
+
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// A directory under the OS temp dir, unique per call, built from only
+/// `std` — this crate's `[dev-dependencies]` do not include `tempfile`
+/// (only `proptest`), and adding one is outside a documentation-provenance
+/// fix's file ownership. `std::process::id()` plus a per-process atomic
+/// counter is enough uniqueness for a single test process's own fixtures.
+fn fresh_temp_dir(label: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "luabox-merge-matrix-provenance-{}-{label}-{n}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(dir.join("src")).expect("create fixture project dir");
+    dir
+}
+
+/// Materialize one fixture's `files` under `dir/src/` with a minimal strict
+/// manifest (edition 5.4 — every fixture in this file is parsed with
+/// [`luabox_syntax::lua::Dialect::Lua54`]) and run `bin check` against it,
+/// returning the `(code, message)` pairs parsed from its human-readable
+/// output (`error[LB0300]: message` / `warning[LB0300]: message` — no JSON
+/// parser is pulled in for this alone, for the same dependency-ownership
+/// reason [`fresh_temp_dir`] avoids `tempfile`).
+fn run_via_binary(bin: &Path, label: &str, files: &[(&str, &str)]) -> Vec<(String, String)> {
+    let dir = fresh_temp_dir(label);
+    std::fs::write(
+        dir.join("luabox.toml"),
+        "[package]\nname=\"regen\"\nversion=\"0.1.0\"\nedition=\"5.4\"\n\n[types]\nstrict=true\n",
+    )
+    .expect("write manifest");
+    for (name, src) in files {
+        std::fs::write(dir.join("src").join(name), src).expect("write fixture source");
+    }
+    let output = Command::new(bin)
+        .arg("check")
+        .current_dir(&dir)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {}: {e}", bin.display()));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut diags = Vec::new();
+    for line in stdout.lines() {
+        for prefix in ["error[", "warning["] {
+            if let Some(rest) = line.strip_prefix(prefix)
+                && let Some((code, tail)) = rest.split_once(']')
+                && let Some(message) = tail.strip_prefix(": ")
+            {
+                diags.push((code.to_string(), message.to_string()));
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    diags
+}
+
+/// Regenerates `docs/03-reference/merge-matrix-provenance.md` by measuring
+/// every fixture in [`CELLS`] against a real `luabox check`, and — when
+/// `LUABOX_DEVELOP_BIN` names a second binary — a second real `luabox check`
+/// from that binary too, so the doc's "Same in develop?" column has an
+/// actual, reproducible answer behind it instead of a claim nobody can
+/// re-run.
+///
+/// `#[ignore]`d: this shells out to a prebuilt release binary rather than
+/// exercising this crate's own code in-process, so it does not belong in the
+/// default `cargo test` run. To regenerate:
+///
+/// ```text
+/// cargo build --release -p luabox-cli
+/// LUABOX_BIN=$PWD/target/release/luabox \
+/// LUABOX_DEVELOP_BIN=/path/to/a/release/luabox/built/at/git-merge-base/HEAD/origin-develop \
+///   cargo test -p luabox-types --test class_merge_precedence_matrix \
+///   -- --ignored regen_merge_matrix_provenance --nocapture
+/// ```
+///
+/// `LUABOX_DEVELOP_BIN` is optional; without it the report says plainly that
+/// the develop column was not measured this run, rather than reprinting a
+/// stale answer.
+#[test]
+#[ignore = "shells out to a prebuilt release binary — see this test's doc comment for how to run it"]
+fn regen_merge_matrix_provenance() {
+    let current_bin = std::env::var("LUABOX_BIN").unwrap_or_else(|_| {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/release/luabox").to_string()
+    });
+    let current_bin = PathBuf::from(current_bin);
+    assert!(
+        current_bin.is_file(),
+        "no luabox binary at {} — build one (`cargo build --release -p luabox-cli`) or set \
+         LUABOX_BIN",
+        current_bin.display()
+    );
+    let develop_bin = std::env::var("LUABOX_DEVELOP_BIN").ok().map(PathBuf::from);
+    if let Some(bin) = &develop_bin {
+        assert!(
+            bin.is_file(),
+            "LUABOX_DEVELOP_BIN={} is not a file",
+            bin.display()
+        );
+    }
+
+    let mut report = String::new();
+    report.push_str("<!-- GENERATED by `regen_merge_matrix_provenance`");
+    report.push_str(
+        " (crates/luabox-types/tests/class_merge_precedence_matrix.rs) — do not hand-edit. \
+         Regenerate per that test's doc comment. -->\n\n# Class-merge precedence matrix — \
+         provenance\n\nBacks `docs/03-reference/03-class-merge-precedence.md`. Every row below \
+         is one `CELLS` variant from `class_merge_precedence_matrix.rs`, measured against a \
+         real `luabox check` subprocess (not this crate's in-process helpers) at the time this \
+         file was regenerated.\n\n",
+    );
+    if develop_bin.is_none() {
+        report.push_str(
+            "**`LUABOX_DEVELOP_BIN` was not set for this run — the develop column below is \
+             `(not measured this run)`, not a claim.**\n\n",
+        );
+    }
+    report.push_str(
+        "| Fixture id | Measured (current) | Matches doc `expect`? | Measured (develop) |\n\
+         |---|---|---|---|\n",
+    );
+
+    let mut mismatches = Vec::new();
+    for cell in CELLS {
+        for variant in cell.variants {
+            let got_current = run_via_binary(&current_bin, "current", variant.files);
+            let want: Vec<(String, String)> = variant
+                .expect
+                .iter()
+                .map(|(c, m)| ((*c).to_string(), (*m).to_string()))
+                .collect();
+            let matches_doc = got_current == want;
+            if !matches_doc {
+                mismatches.push(format!(
+                    "{}/{} [{}] (fixture `{}`): binary measured {got_current:?}, doc/test \
+                     `expect` says {want:?}",
+                    cell.kind, cell.shape, variant.label, variant.fixture_id
+                ));
+            }
+            let got_develop = develop_bin
+                .as_ref()
+                .map(|bin| run_via_binary(bin, "develop", variant.files));
+            let develop_cell = match &got_develop {
+                Some(d) => format!("{d:?}"),
+                None => "(not measured this run)".to_string(),
+            };
+            let _ = writeln!(
+                report,
+                "| `{}` | {got_current:?} | {} | {develop_cell} |",
+                variant.fixture_id,
+                if matches_doc { "yes" } else { "**NO**" },
+            );
+        }
+    }
+
+    let doc_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/03-reference/merge-matrix-provenance.md");
+    std::fs::write(&doc_path, &report)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", doc_path.display()));
+
+    assert!(
+        mismatches.is_empty(),
+        "{} fixture(s) measured through the real binary disagree with this file's own \
+         `expect`, i.e. the in-process helpers and the shipped binary disagree — investigate \
+         before trusting the regenerated report:\n{}",
+        mismatches.len(),
+        mismatches.join("\n")
+    );
+}
+
+// --- malformed `---@class` header axis (round 6 review M66) -----------
+//
+// Everything above this line pins *which parent wins* once a class header
+// parses. `M66` is a different axis entirely: does a **malformed** header —
+// one `luacats::harvest` cannot turn into a well-formed class at all — get a
+// diagnostic pointing at the malformation, or does it get silently dropped?
+// Measured against this head's release binary (`target/release/luabox`,
+// strict mode) and, for comparison, the pinned lua-language-server 3.13.5
+// (`--check`, `--checklevel=Information`):
+//
+//   shape                    luabox (this head)                 luals 3.13.5
+//   ---@class : Base         silent: rc=0, 0 errors, 0 warnings  `luadoc-miss-class-name`
+//                                                                 ("<class name> expected")
+//                                                                 at the declaration, plus
+//                                                                 `doc-field-no-class` on the
+//                                                                 `---@field` beneath it
+//   ---@class 123abc         silent: rc=0, 0 errors, 0 warnings  identical to the above —
+//                                                                 luals treats a non-identifier
+//                                                                 name token the same as a
+//                                                                 missing one
+//   ---@class A : P,         LB0305 "unknown type name `P`" at   `luadoc-miss-class-extends-name`
+//   (P undeclared)           the declaration (`P` is treated      ("<class extends name>
+//                            as an ordinary — if undeclared —     expected") at the trailing
+//                            parent reference; the trailing       comma, PLUS an ordinary
+//                            comma itself raises nothing)         `undefined-doc-class` on `P`
+//   bare ---@class           silent at the declaration; the       `luadoc-miss-class-name` +
+//   (no name at all)         only signal is `LB0305 unknown       `doc-field-no-class` at the
+//                            type name` two lines later, at       declaration (same as the
+//                            the *consumer*'s `---@type`           `: Base` row above)
+//
+// luals reports a real diagnostic AT THE DECLARATION for all four shapes —
+// never silence. luabox is silent for two of the four (`: Base`, `123abc`)
+// and, for the other two, only ever reports at a *use site*, never at the
+// malformed declaration itself. The `A : P,` row corrects an earlier draft
+// of this finding, which had claimed all three non-bare shapes were silent
+// (`rc=0`) — measured fresh against this head, `A : P,` is NOT silent: `P`
+// resolves through the ordinary undeclared-parent path (the same one
+// `---@class A : Missing` already uses correctly), independent of the
+// trailing comma. Only the header-identity/name half of the axis (no name,
+// or a name luacats' grammar cannot lex as a name) is the silent gap; a
+// malformed *extends list* already surfaces through the existing
+// undeclared-name machinery.
+//
+// The parser/harvest fix this axis is waiting on (giving `luacats::harvest`
+// a diagnostic for a header it cannot turn into a class, likely a new
+// `LB0xxx` code — none is assigned as of this review) is out of scope here;
+// see `docs/03-reference/02-limitations.md`'s "Malformed `---@class`
+// headers" section for the full write-up. This test pins today's measured
+// (partly silent) reality so a *regression* — one of the already-diagnosed
+// shapes going silent, or vice versa — fails loudly; it is `#[ignore]`d
+// because it documents a known bug rather than covering a rule this repo
+// claims to have already fixed, the way every other test in this file does.
+// Delete the `#[ignore]` and update whichever assertions the fix changes
+// once the harvest fix lands — the point of running this by hand in the
+// meantime is to notice the day that happens.
+#[test]
+#[ignore = "pins a known bug (M66: malformed ---@class headers), not a manual-probe \
+            convenience — see the doc comment above for why this stays out of the default \
+            suite instead of being deleted or turned green"]
+fn malformed_class_headers_m66() {
+    type MalformedCase = (
+        &'static str,
+        &'static str,
+        &'static [(&'static str, &'static str)],
+    );
+    let cases: &[MalformedCase] = &[
+        (
+            "no name, colon parent (`---@class : Base`)",
+            r"
+---@class : Base
+---@field x number
+local M = {}
+return M
+",
+            &[],
+        ),
+        (
+            "non-identifier name (`---@class 123abc`)",
+            r"
+---@class 123abc
+---@field x number
+local M = {}
+return M
+",
+            &[],
+        ),
+        (
+            "trailing comma in the extends list (`---@class A : P,`)",
+            r"
+---@class A : P,
+---@field x number
+local M = {}
+return M
+",
+            &[("LB0305", "unknown type name `P` in annotation")],
+        ),
+        (
+            "bare, no name at all (`---@class`), consumer two lines later",
+            r"
+---@class
+---@field x number
+local M = {}
+---@type A
+local a
+print(a.x)
+return M
+",
+            &[("LB0305", "unknown type name `A` in annotation")],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, src, expect) in cases {
+        let got: Vec<(String, String)> = support::check_self(src)
+            .into_iter()
+            .map(|d| (d.code.to_string(), d.message))
+            .collect();
+        let want: Vec<(String, String)> = expect
+            .iter()
+            .map(|(c, m)| ((*c).to_string(), (*m).to_string()))
+            .collect();
+        if got != want {
+            failures.push(format!("{label}\n  got:  {got:?}\n  want: {want:?}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} malformed-header shape(s) no longer match today's measured (partly buggy) \
+         reality — a regression, or the M66 fix landing:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }

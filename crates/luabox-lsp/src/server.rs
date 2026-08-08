@@ -2137,6 +2137,7 @@ impl Server {
         params: &DidChangeWatchedFilesParams,
     ) -> anyhow::Result<()> {
         let mut reload = false;
+        let mut republish_open = false;
         for event in &params.changes {
             let Some(path) = uri_to_path(&event.uri) else {
                 continue;
@@ -2173,6 +2174,30 @@ impl Server {
                 if !self.open_docs.contains_key(&path) {
                     self.publish_lua(&event.uri, &path)?;
                 }
+                // M58 (round 6 review): the deleted file's export/class
+                // surface just vanished from the merged workspace ambient —
+                // every already-*open* document whose diagnostics depended
+                // on it (a `require` of the deleted module, a class
+                // inherited from it, ...) must be re-checked against the
+                // new surface, the same way a manifest reload already
+                // re-checks every open document
+                // (`reload_config`/`republish_open_docs`). Resolution itself
+                // is correct the instant the change above lands (hover
+                // reads a fresh `Analysis` per request), but nothing
+                // re-published a *diagnostics* notification for anyone but
+                // the deleted file's own URI — an unrelated open consumer's
+                // Problems panel stayed clean until its own next keystroke
+                // re-triggered `set_text`'s publish, disagreeing with hover
+                // about the same instant in the meantime.
+                //
+                // Flagged, not called here: this arm runs once per deleted
+                // file in the batch, but `republish_open_docs` re-checks
+                // every open document from scratch (fresh `Analysis`,
+                // `publish_lua` per file) — calling it per event turns a
+                // batch of D deletes against O open documents into D×O full
+                // diagnostics passes. Set the flag and act once after the
+                // loop, same idiom as `reload`/`reload_config` below.
+                republish_open = true;
                 continue;
             }
             if let Ok(text) = fs::read_to_string(&path) {
@@ -2190,7 +2215,13 @@ impl Server {
             }
         }
         if reload {
+            // Subsumes `republish_open_docs` (see its call at the end of
+            // `reload_config`) — running both would publish every open
+            // document's diagnostics twice for a batch that both deletes a
+            // `.lua` file and touches `luabox.toml`.
             self.reload_config()?;
+        } else if republish_open {
+            self.republish_open_docs()?;
         }
         Ok(())
     }
@@ -3355,6 +3386,187 @@ mod tests {
             other => panic!("expected markup hover contents, got {other:?}"),
         };
         assert!(text.contains("Point.x"), "{text}");
+    }
+
+    /// M58 (round 6 review, N24 half-fixed): resolution is correct
+    /// immediately after a `DELETED` watched-file event — hover for the
+    /// deleted class's own file already answers `null` right away, proven
+    /// above. What was still missing: the event alone republished nothing
+    /// for an *unrelated* already-open document whose diagnostics depended
+    /// on the deleted file (a class inherited from it, here) — its Problems
+    /// panel stayed clean until its own next keystroke, disagreeing with
+    /// hover about the same instant. `base.lua` is deleted; `main.lua`
+    /// (open, inheriting from `Base`) must be republished with the
+    /// resulting diagnostic in the same batch, not on the next edit.
+    #[test]
+    fn a_deleted_watched_file_republishes_diagnostics_for_an_open_consumer() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let base_path = root.join("base.lua");
+        fs::write(&base_path, "---@class Base\n---@field id number\n").expect("write base.lua");
+        let main_path = root.join("main.lua");
+        // A `---@param`, not a `---@type … = nil` binding: the latter is
+        // itself an `LB0300` (`nil` does not satisfy `Sub`) so it is never
+        // clean, and this test's whole subject is the transition from clean
+        // to not-clean caused by the deletion alone.
+        let source = "\
+---@class Sub : Base
+
+---@param s Sub
+local function use(s) print(s.id) end
+
+return use
+";
+        fs::write(&main_path, source).expect("write main.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        let main_uri = crate::uri::path_to_uri(&main_path);
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": main_uri.to_string(),
+                        "languageId": "lua",
+                        "version": 1,
+                        "text": source,
+                    },
+                }),
+            })
+            .expect("didOpen");
+        let opened = drain(&client);
+        let before = published_diagnostics(&opened, &main_uri)
+            .expect("didOpen publishes main.lua's diagnostics");
+        assert!(
+            before.as_array().is_some_and(Vec::is_empty),
+            "clean before the deletion: {before:?}"
+        );
+
+        fs::remove_file(&base_path).expect("delete base.lua");
+        let base_uri = crate::uri::path_to_uri(&base_path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({
+                    "changes": [{ "uri": base_uri.to_string(), "type": 3 }],
+                }),
+            })
+            .expect("didChangeWatchedFiles");
+        let after = drain(&client);
+
+        let republished = published_diagnostics(&after, &main_uri).expect(
+            "main.lua must be republished by the DELETED event itself, not left \
+             for the next keystroke",
+        );
+        assert!(
+            republished.as_array().is_some_and(|d| !d.is_empty()),
+            "s.id must now be flagged now that Base is gone: {republished:?}"
+        );
+    }
+
+    /// H1: a batch of D deleted files must republish each open document
+    /// exactly once (O total), not once per deleted file (D×O) — a branch
+    /// switch or `git clean` deletes many files in a single
+    /// `didChangeWatchedFiles` notification, and calling
+    /// `republish_open_docs` (a fresh `Analysis` snapshot plus a full
+    /// diagnostics pass per open document) from inside the per-event loop
+    /// instead of once after it turns that single batch into a
+    /// multiplicative, user-visible stall. Two deleted files, three open
+    /// documents: republished-open-doc notifications must total 3, not 6.
+    #[test]
+    fn a_batch_of_deleted_files_republishes_open_docs_once_each_not_once_per_deletion() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+
+        let del_paths: Vec<_> = ["del1.lua", "del2.lua"]
+            .iter()
+            .map(|name| {
+                let path = root.join(name);
+                fs::write(&path, "local x = 1\n").expect("write deleted file");
+                path
+            })
+            .collect();
+
+        let open_uris: Vec<_> = ["open1.lua", "open2.lua", "open3.lua"]
+            .iter()
+            .map(|name| {
+                let path = root.join(name);
+                let source = "local x = 1\n";
+                fs::write(&path, source).expect("write open file");
+                path
+            })
+            .collect();
+        server.bootstrap();
+        drop(drain(&client));
+
+        let open_uris: Vec<_> = open_uris
+            .into_iter()
+            .map(|path| {
+                let uri = crate::uri::path_to_uri(&path);
+                server
+                    .handle_notification(Notification {
+                        method: DidOpenTextDocument::METHOD.to_string(),
+                        params: json!({
+                            "textDocument": {
+                                "uri": uri.to_string(),
+                                "languageId": "lua",
+                                "version": 1,
+                                "text": "local x = 1\n",
+                            },
+                        }),
+                    })
+                    .expect("didOpen");
+                uri
+            })
+            .collect();
+        drop(drain(&client));
+
+        for path in &del_paths {
+            fs::remove_file(path).expect("delete file");
+        }
+        let changes: Vec<Value> = del_paths
+            .iter()
+            .map(|path| json!({ "uri": crate::uri::path_to_uri(path).to_string(), "type": 3 }))
+            .collect();
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({ "changes": changes }),
+            })
+            .expect("didChangeWatchedFiles");
+        let after = drain(&client);
+
+        let republish_count = after
+            .iter()
+            .filter(|m| match m {
+                Message::Notification(not) => {
+                    not.method == PublishDiagnostics::METHOD
+                        && open_uris.iter().any(|u| not.params["uri"] == *u.as_str())
+                }
+                _ => false,
+            })
+            .count();
+        assert_eq!(
+            republish_count,
+            open_uris.len(),
+            "2 deleted files × 3 open docs must republish each open doc once (3), \
+             not once per deletion (6): {after:?}"
+        );
+    }
+
+    /// The last `textDocument/publishDiagnostics` notification for `uri` in
+    /// `messages`, if any.
+    fn published_diagnostics(messages: &[Message], uri: &lsp_types::Uri) -> Option<Value> {
+        messages.iter().rev().find_map(|m| match m {
+            Message::Notification(not)
+                if not.method == PublishDiagnostics::METHOD
+                    && not.params["uri"] == *uri.as_str() =>
+            {
+                Some(not.params["diagnostics"].clone())
+            }
+            _ => None,
+        })
     }
 
     // === Malformed messages ===============================================

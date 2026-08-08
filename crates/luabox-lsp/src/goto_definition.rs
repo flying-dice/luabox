@@ -154,6 +154,7 @@ fn member_definition(
             member.text(),
             ambient.ambient_paths(),
             ambient.sema_cache(),
+            ambient.search_order_cache(),
         )
     {
         let span = found.span;
@@ -366,6 +367,34 @@ mod tests {
     /// The `(line, character)` start of a location.
     fn start_of(location: &Location) -> (u32, u32) {
         (location.range.start.line, location.range.start.character)
+    }
+
+    /// M2 (round 6 review): goto-definition's target must agree with
+    /// hover's type and description on the same precedence winner — the
+    /// review's own repro (`hover.rs`'s
+    /// `hovers_type_and_description_agree_on_the_precedence_winner` pins
+    /// the other two). `locate_field`'s parent-chain walk used to be
+    /// breadth-first, which could land on `B`'s `---@field f` (line 3) even
+    /// though the checker's own depth-first merge resolves `X`'s (line 1).
+    #[test]
+    fn goto_definition_agrees_with_hovers_precedence_winner() {
+        let src = "\
+---@class X
+---@field f string the f from X
+---@class B
+---@field f number the f from B
+---@class A : X
+---@class C : A, B
+
+---@type C
+local c = nil
+print(c.f)
+";
+        let location = at(src, "f)", 0).expect("definition");
+        assert_eq!(
+            location.range.start.line, 1,
+            "must land on X's own `---@field f` (line 1), not B's (line 3): {location:?}"
+        );
     }
 
     #[test]

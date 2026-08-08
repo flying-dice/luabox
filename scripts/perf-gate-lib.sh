@@ -16,11 +16,36 @@
 # scope. Every function below fails closed (checks its own inputs) rather
 # than leaning on the caller's `set -e`.
 
-# scale_budget_ms <base_ms> <factor> — LUABOX_PERF_FACTOR's float multiply.
-# Plain `awk` (POSIX, present on every CI/dev box this repo targets) does
-# the float arithmetic; everything downstream stays integer ms.
+# scale_budget_ms <base_ms> <factor> [ceiling_ms] — LUABOX_PERF_FACTOR's
+# float multiply, optionally capped.
+#
+# Plain `awk` (POSIX, present on every CI/dev box this repo targets) does the
+# float arithmetic; everything downstream stays integer ms.
+#
+# The optional third argument closes a sensitivity hole the round 6 budget
+# rebase opened (local merge-gate finding). `LUABOX_PERF_FACTOR` exists to
+# absorb slow, shared CI hardware, so it multiplies the WHOLE budget — but a
+# base budget already carries ~3x headroom over a measured baseline by this
+# file's own convention, and multiplying headroom by headroom compounds.
+# Concretely, for the `check (warm)` leg against its ~2.5 s measured
+# baseline:
+#
+#   base   CI ceiling (x4)   sensitivity
+#   1000              4000   1.6x   <- before the rebase
+#   7500             30000    12x   <- after, unbounded by anything
+#
+# A 12x ceiling is not a gate. The cap keeps a leg's CI budget within a
+# stated multiple of what it actually costs, so raising a base to stop a
+# flaky local FAIL cannot silently blind CI as a side effect. A leg passing
+# no ceiling is unchanged.
 scale_budget_ms() {
-  awk -v b="$1" -v f="$2" 'BEGIN { printf "%d", b * f }'
+  local scaled
+  scaled="$(awk -v b="$1" -v f="$2" 'BEGIN { printf "%d", b * f }')"
+  local ceiling="${3:-}"
+  if [[ -n "$ceiling" && "$scaled" -gt "$ceiling" ]]; then
+    scaled="$ceiling"
+  fi
+  printf '%s' "$scaled"
 }
 
 # assert_lua_file_count <dir> <expected> — N38: a peak-RSS (or wall-time)

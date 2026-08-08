@@ -24,7 +24,7 @@ use crate::db::Db;
 use crate::input::{Project, SourceFile};
 use crate::value::{
     Annotations, BindingTypes, Diagnostics, LoweredHandle, ModuleExport, ModuleSurfaceChecked,
-    OutgoingCalls, ParsedModule, ProjectTypes, TypeEnvHandle,
+    OutgoingCalls, ParsedModule, ProjectAmbient, ProjectTypes, TypeEnvHandle,
 };
 
 /// Parse a file into a lossless syntax tree.
@@ -109,14 +109,19 @@ pub fn module_export(db: &dyn Db, file: SourceFile, project: Project) -> ModuleE
     db.push_log(format!("module_export({})", display(db, file)));
     let parsed = parse(db, file);
     let name = display(db, file);
-    let base = stdlib_defs(file.dialect(db));
-    let ambient = base.with_project_types(project_types_checked(db, project).types().iter());
+    let ambient = project_ambient(db, project, file.dialect(db));
     let externals = ExternalTypes {
         requires: HashMap::new(),
         fn_param_seeds: dependent_seeds(db, file, project),
     };
     ModuleExport::new(
-        infer_display_types(parsed.parse(), &name, Some(&ambient), Some(&externals)).module_export,
+        infer_display_types(
+            parsed.parse(),
+            &name,
+            Some(ambient.ambient()),
+            Some(&externals),
+        )
+        .module_export,
     )
 }
 
@@ -133,8 +138,7 @@ pub fn binding_types(db: &dyn Db, file: SourceFile, project: Project) -> Binding
     db.push_log(format!("binding_types({})", display(db, file)));
     let parsed = parse(db, file);
     let name = display(db, file);
-    let base = stdlib_defs(file.dialect(db));
-    let ambient = base.with_project_types(project_types_checked(db, project).types().iter());
+    let ambient = project_ambient(db, project, file.dialect(db));
     let externals = ExternalTypes {
         requires: require_exports(db, file, project),
         fn_param_seeds: dependent_seeds(db, file, project),
@@ -142,7 +146,7 @@ pub fn binding_types(db: &dyn Db, file: SourceFile, project: Project) -> Binding
     BindingTypes::new(infer_display_types(
         parsed.parse(),
         &name,
-        Some(&ambient),
+        Some(ambient.ambient()),
         Some(&externals),
     ))
 }
@@ -203,10 +207,28 @@ pub(crate) fn module_export_checked(
     db.push_log(format!("module_export_checked({})", display(db, file)));
     let parsed = parse(db, file);
     let name = display(db, file);
-    let base = stdlib_defs(file.dialect(db));
-    let ambient = base.with_project_types(project_types_checked(db, project).types().iter());
-    let surface = luabox_types::module_surface(parsed.parse(), &name, Some(&ambient));
+    let ambient = project_ambient(db, project, file.dialect(db));
+    let surface = luabox_types::module_surface(parsed.parse(), &name, Some(ambient.ambient()));
     ModuleExport::new(surface.export)
+}
+
+/// The project-merged ambient layer for `dialect` (M18, round 6 review): see
+/// [`ProjectAmbient`]'s doc for why this collapses [`module_export`]/
+/// [`binding_types`]/[`module_export_checked`]'s shared
+/// `with_project_types` merge from O(N) per call (O(N²) total across a
+/// full-project display pass) to one merge per `(project revision,
+/// dialect)`, sharing [`project_types_checked`]'s own memoized collection
+/// underneath it rather than re-merging over it on every call.
+///
+/// `no_eq`: [`ProjectAmbient`] wraps a non-comparable `Ambient` (see
+/// [`TypeEnvHandle`]'s doc for the same shape), so this query never
+/// backdates — a re-merge always yields a fresh layer.
+#[salsa::tracked(no_eq)]
+pub(crate) fn project_ambient(db: &dyn Db, project: Project, dialect: Dialect) -> ProjectAmbient {
+    db.push_log("project_ambient()".to_string());
+    let base = stdlib_defs(dialect);
+    let merged = base.with_project_types(project_types_checked(db, project).types().iter());
+    ProjectAmbient::new(merged)
 }
 
 /// Module string → **check-mode** export type, for every static `require`

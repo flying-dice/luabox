@@ -209,9 +209,28 @@ impl AnalysisHost {
     /// front-end calls this today, so a session that never drains it still
     /// only ever retains the trace's capped tail (round 5 review N23)
     /// rather than growing without bound.
+    ///
+    /// The drained list can be **lossy** (M46, round 6 review): past
+    /// [`crate::db::MAX_EXECUTION_LOG_ENTRIES`] entries since the last
+    /// drain, the oldest are evicted, so a query's *absence* from the
+    /// result can mean either "never ran" or "ran, but was evicted" — call
+    /// [`Self::execution_log_overflowed`] *first* to tell them apart; this
+    /// call resets that flag along with the entries it drains.
     #[must_use]
     pub fn take_execution_log(&self) -> Vec<String> {
         self.db.take_logs()
+    }
+
+    /// Whether the trace [`Self::take_execution_log`] is about to drain has
+    /// evicted at least one entry since the last drain (M46, round 6
+    /// review) — call before draining, since draining clears this flag
+    /// along with the entries. A caller (or test) asserting a query is
+    /// *absent* from the drained log must check this first: `true` means
+    /// the absence proves nothing, because the missing entry may simply
+    /// have aged out.
+    #[must_use]
+    pub fn execution_log_overflowed(&self) -> bool {
+        self.db.log_overflowed()
     }
 
     /// Reconcile the effective VFS text/dialect for `id` into salsa, creating

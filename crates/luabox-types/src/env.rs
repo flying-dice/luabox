@@ -264,20 +264,91 @@ pub struct TypeEnv {
     /// class is one this file declares.
     local_classes: HashSet<String>,
     /// Root class names whose ancestor-chain resolution tripped
-    /// [`DiamondGuard`]'s depth cap (`LB0317`, round 5 review N2's durable
-    /// fix) — recorded, not merely detected, because [`Self::class_shape`]/
-    /// [`Self::class_shape_bound`]/[`Self::class_shape_bound_export`]/
-    /// [`Self::class_operators`] all take `&self` and run repeatedly during
-    /// inference and checking (unlike `unknown_names`/`arity_errors`/
-    /// `cyclic_aliases` above, which the `Lowerer` — a `&mut self` pass —
-    /// collects once while `build_from_items` runs): there is no `&mut
-    /// self` moment after construction for a plain field to be written
-    /// into, so this needs interior mutability. A `Mutex` rather than a
-    /// `RefCell`: `TypeEnv` lives inside `Ambient`, which
-    /// `defs.rs`'s per-dialect `OnceLock` cache holds in a `static`, so it
-    /// must stay `Sync`. Drained, not merely read, by `crate::check::run` —
-    /// see [`Self::take_depth_limit_hits`].
+    /// [`DiamondGuard`]'s depth budget specifically — [`LimitTrip::Depth`]
+    /// (`LB0317`, round 5 review N2's durable fix; split from the cost
+    /// budget's own queue, [`Self::cost_limit_hits`], by production
+    /// readiness review F1) — recorded, not merely detected, because
+    /// [`Self::class_shape`]/[`Self::class_shape_bound`]/
+    /// [`Self::class_shape_bound_export`]/[`Self::class_operators`] all take
+    /// `&self` and run repeatedly during inference and checking (unlike
+    /// `unknown_names`/`arity_errors`/`cyclic_aliases` above, which the
+    /// `Lowerer` — a `&mut self` pass — collects once while
+    /// `build_from_items` runs): there is no `&mut self` moment after
+    /// construction for a plain field to be written into, so this needs
+    /// interior mutability. A `Mutex` rather than a `RefCell`: `TypeEnv`
+    /// lives inside `Ambient`, which `defs.rs`'s per-dialect `OnceLock`
+    /// cache holds in a `static`, so it must stay `Sync`.
+    ///
+    /// This is a **one-shot report queue**, not a durable record: drained,
+    /// not merely read, by `crate::check::run` — see
+    /// [`Self::take_depth_limit_hits`]. A caller that instead needs to know
+    /// whether a class's shape is *durably* incomplete — true for the rest
+    /// of this env's life, not just until the next drain — reads
+    /// [`Self::truncated_classes`] via [`Self::class_ancestry_truncated`]
+    /// instead (round 6 review M13: before the two were split, both
+    /// consumers shared this one `Mutex`, so a peek that ran after
+    /// `take_depth_limit_hits` had already drained it for an earlier report
+    /// wrongly read a genuinely still-truncated class as fine).
     depth_limit_hits: Mutex<HashSet<String>>,
+    /// Root class names whose ancestor-chain resolution tripped
+    /// [`DiamondGuard`]'s cost budget specifically — [`LimitTrip::Cost`]
+    /// (`LB0319`, [`crate::codes::CLASS_COST_LIMIT`], production readiness
+    /// review F1). The cost-side sibling of [`Self::depth_limit_hits`]:
+    /// same one-shot-report-queue shape, same `Mutex` reason, drained by
+    /// [`Self::take_cost_limit_hits`] rather than conflated with the
+    /// depth-side queue — a walk that tripped the *cost* budget without ever
+    /// coming close to [`MAX_ANCESTRY_DEPTH`] needs its own diagnostic
+    /// (`LB0319`, "resolution too costly", fixed by removing a conflicting
+    /// diamond) rather than depth's ("too deep", fixed by flattening the
+    /// hierarchy) — reporting one as the other actively misleads about what
+    /// to fix.
+    cost_limit_hits: Mutex<HashSet<String>>,
+    /// Root class names whose ancestor-chain resolution has **ever** tripped
+    /// either of [`DiamondGuard`]'s two budgets on this env — written
+    /// alongside [`Self::depth_limit_hits`] or [`Self::cost_limit_hits`] (
+    /// whichever [`LimitTrip`] variant a walk actually tripped) by the same
+    /// [`Self::note_limit_trip`] call, but never drained, because a
+    /// truncated class's shape stays incomplete for the rest of this env's
+    /// lifetime and every later peek needs to see that, not just the first
+    /// one to ask before anything else drained a report queue (round 6
+    /// review M13). Read by [`Self::class_ancestry_truncated`], whose two
+    /// callers both need exactly this durable answer: a same-file inference
+    /// query deciding whether an absent field is provably undefined (see
+    /// that method's own doc comment), and an [`crate::defs::Ambient`]'s
+    /// long-lived env, which never runs through `crate::check::run` and so
+    /// never drains either report queue at all — this field would grow
+    /// monotonically for that caller too if it were one of those `Mutex`es,
+    /// but since nothing ever drains it in the first place, splitting it out
+    /// changes nothing for that lifecycle beyond no longer being at the
+    /// mercy of an unrelated drain. One shared durable record for both trip
+    /// kinds, unlike the two separate report queues: a caller asking "is
+    /// this class's shape incomplete" does not need to know *why*, only that
+    /// it is.
+    truncated_classes: Mutex<HashSet<String>>,
+    /// Every class name a true `---@class` cycle (`A : A`, or `A : B` / `B :
+    /// A`) was found to reach — not merely the query root, but each distinct
+    /// name [`DiamondGuard::should_apply`]'s cycle guard ever refused to
+    /// recurse into, so a mutual cycle spanning several classes is reported
+    /// against all of them, not just whichever one happened to be queried
+    /// first (round 6 review M67). Termination alone (what the cycle guard
+    /// already gave, before this field existed) leaves the user no
+    /// diagnostic that their `: Parent` list does not mean what they wrote.
+    /// A one-shot report queue, the same shape and same reason as
+    /// [`Self::depth_limit_hits`] (see its doc for why this needs a
+    /// `Mutex`): drained, not merely read, via
+    /// [`Self::take_cyclic_class_hits`].
+    ///
+    /// `crate::codes::CYCLIC_CLASS` (`LB0318`) is the code this drains into,
+    /// and `crate::check::report_cyclic_class_hits` is the call site that
+    /// drains it — both landed alongside this field, at the same point in
+    /// `crate::check::run` as [`Self::depth_limit_hits`]'s own
+    /// `report_depth_limit_hits` (round 6 review M67). This doc comment
+    /// used to claim otherwise — "no consumer drains this yet", "no `LB0xxx`
+    /// code exists" — which every finder in a later merge-gate pass flagged
+    /// independently (production readiness review F2): true when first
+    /// written, false by the time `CYCLIC_CLASS`/`report_cyclic_class_hits`
+    /// shipped, and never updated.
+    cyclic_class_hits: Mutex<HashSet<String>>,
 }
 
 /// The cycle-guard + memo bookkeeping shared by [`TypeEnv::collect_class`]
@@ -285,10 +356,11 @@ pub struct TypeEnv {
 /// review finding 7 — before this, each function hand-rolled its own
 /// `on_path: HashSet<String>` plus `memo: Vec<(String, Vec<Ty>)>` pair with
 /// the identical enter/exit logic). One owner now; both walks call
-/// [`Self::visit`] and neither touches `on_path`/`resolved`/`generation`
-/// directly — there is no separate "did you check `Skip`?" step to forget
-/// (round 5 review N15): [`Self::visit`] itself decides whether the body
-/// runs, and records the visit on the way out regardless of whether it did.
+/// [`DiamondGuard::visit`] and neither touches `on_path`/`resolved`/
+/// `generation` directly — there is no separate "did you check `Skip`?"
+/// step to forget (round 5 review N15): [`DiamondGuard::visit`] itself
+/// decides whether the body runs, and records the visit on the way out
+/// regardless of whether it did.
 ///
 /// Round 5 shipped a version of this guard that skipped a repeat visit to
 /// `(name, args)` unless `name` had *ever*, anywhere in the whole call, been
@@ -338,22 +410,31 @@ pub struct TypeEnv {
 /// 100   116.31ms                     1.06ms
 /// ```
 ///
-/// The conflicting column's growth (≈2.8x per doubling of k, i.e. roughly
-/// O(k^2.8) over this range) is bounded and nowhere near the 2.0-2.4x
-/// **per level** (not per doubling) round 5's unscoped guard measured on
-/// the same adversarial shape — the fix this replaces took 32s at k=20;
-/// this one takes 1.4ms — but it is not the flat O(k) the no-conflict shape
-/// gets, and no comment in this file claims otherwise (round 5 review
-/// N13/N14: every complexity claim here is one this test measured, not one
-/// reasoned about and left unverified).
+/// The conflicting column's growth over the two doublings this table
+/// covers — k=20→40 (8.89/1.41 ≈ 6.3x) and k=40→80 (60.96/8.89 ≈ 6.9x) — is
+/// bounded and nowhere near the 2.0-2.4x **per level** (not per doubling)
+/// round 5's unscoped guard measured on the same adversarial shape — the fix
+/// this replaces took 32s at k=20; this one takes 1.4ms — but it is not the
+/// flat O(k) the no-conflict shape gets: a ~6.3-6.9x growth per doubling
+/// works out to roughly O(k^2.7) over this range (round 6 review M15: an
+/// earlier revision of this comment wrote "≈2.8x per doubling", which is the
+/// *exponent*, not the ratio a doubling of k actually produces — the true
+/// per-doubling ratio these same four measurements imply is the ~6.3-6.9x
+/// above). No comment in this file claims otherwise beyond what these
+/// numbers show (round 5 review N13/N14: every complexity claim here is one
+/// this test measured, not one reasoned about and left unverified).
 ///
-/// `should_apply` (returned by [`Self::visit`]'s bookkeeping to the caller)
-/// answers a second, narrower question some callers need: is this
-/// particular visit a name's first-ever binding, or does it follow an
-/// earlier, different one? [`TypeEnv::collect_class`]'s indexer merge is the
-/// one consumer — see its doc comment for why fields and indexers need
-/// different answers to "which sibling wins" even though both are merged by
-/// the same walk (round 5 review N6/N7).
+/// `should_apply` is [`DiamondGuard::visit`]'s decision half, called from inside it
+/// (round 6 review M16: an earlier revision of this comment had the
+/// direction backwards, describing `should_apply` as "returned by `visit`"
+/// — `visit` itself returns `()`; the `bool` `should_apply` produces is
+/// passed *into* `body`, the closure `visit`'s caller supplies, not handed
+/// back out to that caller). It answers a second, narrower question some
+/// callers need: is this particular visit a name's first-ever binding, or
+/// does it follow an earlier, different one? [`TypeEnv::collect_class`]'s
+/// indexer merge is the one consumer — see its doc comment for why fields
+/// and indexers need different answers to "which sibling wins" even though
+/// both are merged by the same walk (round 5 review N6/N7).
 /// Ancestor-chain depth [`DiamondGuard`] refuses to recurse past (round 5
 /// review N2's durable fix — `LB0317`, [`crate::codes::CLASS_DEPTH_LIMIT`]).
 ///
@@ -398,7 +479,7 @@ pub struct TypeEnv {
 /// ceiling side.
 ///
 /// `luabox-cli::check_cmd`'s syntactic pre-check
-/// (`deep_class_chain_diagnostic`) imports this exact constant rather than
+/// (`deep_class_chain_diagnostics`) imports this exact constant rather than
 /// deriving its own ceiling: it used to guard 2,000 links deep, a number
 /// picked for its *own* (pinned-thread) crash floor with room to spare — but
 /// that number was never a promise this walk could keep. A chain past 200
@@ -408,11 +489,143 @@ pub struct TypeEnv {
 /// where resolution actually gives out (production readiness review,
 /// finding 1: a 400-class chain the pre-check certified "fine" produced a
 /// false `LB0306` on a field the truncated walk simply never reached). One
-/// number, enforced twice — once early and cheaply as `LB0001` on the raw
+/// number, enforced twice — once early and cheaply as `LB0317` on the raw
 /// annotations (catching a declared-but-never-resolved chain the walk below
-/// would otherwise never visit), once durably here for every caller that
-/// reaches a `TypeEnv` directly, CLI pre-check or not.
+/// would otherwise never visit — round 6 review M4(b): this pre-check used
+/// to hard-code `LB0001`, "syntax error", for this condition; it now emits
+/// the same `LB0317` this durable check below does), once durably here for
+/// every caller that reaches a `TypeEnv` directly, CLI pre-check or not.
 pub const MAX_ANCESTRY_DEPTH: usize = 200;
+
+/// A ceiling on the total number of *re*-resolutions one [`DiamondGuard`]-
+/// supervised walk may run `body` for — the companion budget to
+/// [`MAX_ANCESTRY_DEPTH`] (round 6 review M3; re-scoped to re-resolutions
+/// only by production readiness review F1 — see [`DiamondGuard::resolutions`]'s
+/// own doc comment for exactly which arm of `should_apply` counts and why).
+/// `MAX_ANCESTRY_DEPTH` bounds how deep any ONE recursion path can go; it
+/// says nothing about how many times a walk re-resolves a *stale repeat*,
+/// which is exactly what a genuinely conflicting diamond forces (round 5's
+/// fix note above measures this as polynomial, not O(k)). And
+/// `class_shape`/`class_operators`/etc. run once **per class** a project
+/// file declares — `luabox check` on one file with G independently-
+/// conflicting diamond groups pays this polynomial cost G times over, once
+/// per group's own root query, with nothing capping the sum.
+///
+/// **F1: counting every surviving `should_apply` arm — first bindings
+/// included — was the wrong quantity, not merely the wrong number.** A
+/// first-ever binding of a name, and a genuinely new distinct binding of an
+/// already-seen name, are each visited at most once per distinct `(name,
+/// args)` pair the ancestor graph actually contains — bounded by what the
+/// source declares, not by how many times a conflict forces a re-walk. A
+/// wide, shallow, **non-conflicting** hierarchy (120 independent 5-deep
+/// mixin chains, one class inheriting all 120 — 601 classes, max recursion
+/// depth 6, zero diamond conflicts anywhere) visits every one of those 601
+/// names exactly once: 601 first-bindings, zero re-resolutions. Counting
+/// first-bindings put that single, entirely legitimate query over any
+/// budget in the few-hundred range — measured this session, this exact
+/// fixture through `luabox check`, release build:
+///
+/// ```text
+/// binary                          verdict    time
+/// merge base (`develop`)          clean      0.017-0.053s
+/// this constant counting all arms error[LB0317], exit 1   —
+/// this constant, re-resolutions only (F1 fix) clean      0.023-0.034s
+/// ```
+///
+/// Re-scoping the counter to only the stale-generation re-resolution arm —
+/// the walk a conflicting diamond actually forces, not the linear discovery
+/// pass every hierarchy pays once regardless of conflicts — fixes the false
+/// rejection by construction: the wide fixture's `DiamondGuard::resolutions`
+/// is 0 under the new counting, for any budget above 0.
+///
+/// The constant itself is re-derived from a direct measurement of
+/// `DiamondGuard::resolutions` under the new counting (not chosen by
+/// symmetry with `MAX_ANCESTRY_DEPTH`, and not carried over unexamined from
+/// the old counting's value): a release-build sweep of `collect_class`
+/// alone (no CLI, no parse/harvest overhead — gathered with a throwaway
+/// instrument, not left in the tree), uncapped, over
+/// `conflicting_diamond_source(k)` — every level genuinely disagreeing —
+/// gives
+///
+/// ```text
+/// k     resolutions   collect_class alone
+/// 20    190           ~150µs
+/// 40    780           ~552µs
+/// 60    1,770         ~1.37ms
+/// 80    3,160         ~2.12ms
+/// 100   4,950         ~3.18ms
+/// ```
+///
+/// Exactly `k(k-1)/2` at every sampled point — the re-resolution count for
+/// this fixture is a clean triangular number, not the ~O(k^2.7) the OLD
+/// counting measured on the same fixture (that earlier growth rate mixed in
+/// the O(k) linear first-visit pass at every level, which is why it did not
+/// reduce to a closed form). A project file resolves one `DiamondGuard`
+/// walk **per declared class**, so `luabox check`'s real per-group cost is
+/// the *sum* of k walks of depth 1, 2, ..., k, each individually capped by
+/// this budget once its own re-resolution count crosses it.
+///
+/// 200 was picked by working back from CLI wall-clock time on the single
+/// most adversarial shape this budget exists for —
+/// `conflicting_diamond_group` at k=190 (every level conflicting, the
+/// deepest a group can go before nearing [`MAX_ANCESTRY_DEPTH`] itself) —
+/// measured this session, release `luabox check`:
+///
+/// ```text
+/// fixture                              develop   uncapped (new counting)   budget=200 (new counting)
+/// 1 group  (197 lines,  191 classes)   0.011-0.059s   >90s (times out)         0.14s
+/// 10 groups (1970 lines, 1910 classes) 0.060-0.197s   not attempted             1.44-1.48s
+/// ```
+///
+/// The uncapped row confirms the pathology this budget exists for is still
+/// very real under the new counting (a single k=190 conflicting group alone
+/// does not finish in 90s) — re-scoping the counter to re-resolutions only
+/// fixes F1's false positive, it does not remove the need for a cap. At
+/// budget=200, both rows land under 1.5s, comfortably faster on both
+/// fixtures than the *previous* (F1-buggy) `budget=500` figures this doc
+/// used to cite (0.21s / 2.13s) despite the new counting letting every
+/// individual class's walk run substantially more real, legitimate first-
+/// visit work before capping. `k(k-1)/2 ≤ 200` holds through k=20 (`20·19/2
+/// = 190`), so any hierarchy with up to 20 full levels of genuine,
+/// cascading generic-diamond disagreement resolves completely, uncapped —
+/// [`MAX_ANCESTRY_DEPTH`]'s own doc argues no real hierarchy comes within an
+/// order of magnitude of 200 *levels*; the same argument applies more
+/// strongly to 20 full levels of actual disagreement at every one of them,
+/// which is a far rarer shape than mere depth. See
+/// `env::tests::a_k_level_diamond_with_conflicting_bindings_grows_no_worse_than_linearly_with_group_count`
+/// for the regression test this measurement backs, and
+/// `env::tests::a_wide_shallow_non_conflicting_hierarchy_resolves_cleanly_and_cheaply`
+/// for F1's own regression test.
+pub const MAX_ANCESTRY_RESOLUTIONS: u64 = 200;
+
+/// Which of [`DiamondGuard`]'s two budgets a walk tripped first, carrying the
+/// ancestor name whose visit was refused when it did — production-readiness
+/// review F1. Before this split, both budgets set the same
+/// `depth_exceeded: Option<String>` field, so a walk that tripped only the
+/// *cost* budget ([`MAX_ANCESTRY_RESOLUTIONS`]) was reported identically to
+/// one that tripped the *depth* budget ([`MAX_ANCESTRY_DEPTH`]) — `LB0317`,
+/// "too deep", with a "flatten the hierarchy" remedy that does not fit a
+/// wide-but-shallow hierarchy whose actual problem is a conflicting diamond.
+/// [`TypeEnv::note_limit_trip`] is the sole production reader: it matches on
+/// the variant to decide which report queue to file `root` under
+/// (`LB0317`/[`crate::codes::CLASS_DEPTH_LIMIT`] or
+/// `LB0319`/[`crate::codes::CLASS_COST_LIMIT`]) — it does not need either
+/// variant's own carried name, since it always records the top-level query
+/// root, not the (possibly deeper) ancestor whose visit was actually
+/// refused. Each variant still carries that ancestor name, for tests that
+/// need to assert exactly who a trip is attributed to independent of which
+/// budget caused it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LimitTrip {
+    /// [`MAX_ANCESTRY_DEPTH`] tripped: recursing further would add a native
+    /// stack frame past the crash floor that constant is set to stay clear
+    /// of.
+    Depth(String),
+    /// [`MAX_ANCESTRY_RESOLUTIONS`] tripped: total re-resolution work for
+    /// this walk exceeded the budget, regardless of how deep any one path
+    /// went.
+    Cost(String),
+}
 
 #[derive(Default)]
 struct DiamondGuard {
@@ -430,15 +643,58 @@ struct DiamondGuard {
     /// Bumped once per genuinely new distinct binding of an already-seen
     /// name — see the type doc comment.
     generation: u64,
-    /// Set the first time a visit would push `on_path` past
-    /// [`MAX_ANCESTRY_DEPTH`] — the ancestor name whose visit was refused.
-    /// Sticky: `should_apply` refuses every further attempt on this guard
-    /// too, once set, so a pathological chain does not resolve partway down
-    /// some branches and stop short on others depending on visit order.
-    /// Read back by [`TypeEnv::class_shape_bound`] and its siblings, right
-    /// after their own top-level `collect_class`/`collect_operators` call
-    /// returns, to record `LB0317` (round 5 review N2's durable fix).
-    depth_exceeded: Option<String>,
+    /// Total number of times `body` has run to **re**-resolve a key already
+    /// on record (`should_apply`'s `Some(_) => ...` stale-generation arm),
+    /// incremented at the exact point that arm decides to return
+    /// `Some(..)` — production-readiness review F1. Deliberately **not**
+    /// incremented for a name's first-ever binding, nor for a genuinely new
+    /// distinct binding of an already-seen name (`should_apply`'s
+    /// `None => ...` arm): both of those are bounded by what the source
+    /// itself declares — one `should_apply` call per distinct `(name,
+    /// args)` pair the ancestor graph actually contains — and are not the
+    /// pathology this budget exists to bound. The pathology is *re*-visiting
+    /// a key that was already resolved once, because some *other* binding
+    /// disagreed with it since — the generation-stamped re-walk a
+    /// conflicting diamond forces, which can revisit the same key
+    /// arbitrarily many times as further disagreements keep invalidating it.
+    /// A version of this counter that incremented on every surviving arm
+    /// (first bindings included) rejected legitimate wide-but-shallow
+    /// hierarchies with no conflict anywhere in them — see
+    /// [`MAX_ANCESTRY_RESOLUTIONS`]'s own doc comment for the measurement
+    /// that caught it.
+    resolutions: u64,
+    /// Set the first time a visit would exceed [`MAX_ANCESTRY_DEPTH`] or
+    /// [`MAX_ANCESTRY_RESOLUTIONS`] — which budget, and the ancestor name
+    /// whose visit was refused. Sticky: `should_apply` refuses every further
+    /// attempt on this guard too, once set, so a pathological chain does not
+    /// resolve partway down some branches and stop short on others depending
+    /// on visit order. Read back by [`TypeEnv::class_shape_bound`] and its
+    /// siblings, right after their own top-level `collect_class`/
+    /// `collect_operators` call returns, via [`TypeEnv::note_limit_trip`],
+    /// to record `LB0317` or `LB0319` (round 5 review N2's durable fix;
+    /// split into the two variants by production-readiness review F1 — see
+    /// [`LimitTrip`]'s own doc comment for why one shared `Option<String>`
+    /// was wrong).
+    limit_exceeded: Option<LimitTrip>,
+    /// Ancestor names `should_apply` refused because they were already on
+    /// the current recursion path — a true `---@class` cycle (`A : A`, or
+    /// `A : B` / `B : A`), not a diamond (round 6 review M67). The guard
+    /// against this back-edge keeps the walk from looping forever, but
+    /// terminating silently gives the user no signal that their `: Parent`
+    /// list does not mean what they wrote — a cyclic class's own field
+    /// reads back as reachable, with nothing to say the chain never
+    /// actually reached anywhere else. Not sticky like `limit_exceeded`
+    /// (a cycle on one branch does not invalidate an unrelated sibling
+    /// branch the same visit resolves cleanly): every name this walk ever
+    /// refused this way is collected, not just the first, so
+    /// [`TypeEnv::note_cyclic`] can report every class the cycle actually
+    /// reaches, not merely that one was found somewhere. `should_apply`
+    /// only allocates the `String` this inserts the first time a given name
+    /// is refused this way — a borrowed `contains` check first (production
+    /// readiness review F3) keeps every later repeat of the same back-edge,
+    /// which a per-keystroke walk over an unresolved cycle hits often,
+    /// allocation-free.
+    cyclic: HashSet<String>,
 }
 
 impl DiamondGuard {
@@ -460,10 +716,25 @@ impl DiamondGuard {
             return;
         };
         body(self, is_first_binding);
-        self.resolved
-            .entry(name.to_string())
-            .or_default()
-            .insert(args.to_vec(), self.generation);
+        // Reuse the existing `resolved` entry for `name` (and, inside it,
+        // for `args`) whenever either is already on record, rather than
+        // reallocating an owned `String`/`Vec<Ty>` key only to immediately
+        // discard it in favour of the one already there (round 6 review
+        // M14): a repeat visit — the common case on any diamond shape,
+        // since every ancestor reached through more than one path is
+        // visited again on every subsequent reference to it — already has
+        // both as existing map keys; only a name's or a binding's genuine
+        // first appearance needs a fresh allocation here.
+        let bindings = match self.resolved.get_mut(name) {
+            Some(bindings) => bindings,
+            None => self.resolved.entry(name.to_string()).or_default(),
+        };
+        match bindings.get_mut(args) {
+            Some(slot) => *slot = self.generation,
+            None => {
+                bindings.insert(args.to_vec(), self.generation);
+            }
+        }
         self.on_path.remove(name);
     }
 
@@ -473,11 +744,20 @@ impl DiamondGuard {
     /// means the caller must run its body and this guard is now waiting for
     /// the bookkeeping `visit` performs on return.
     fn should_apply(&mut self, name: &str, args: &[Ty]) -> Option<bool> {
-        if self.depth_exceeded.is_some() {
+        if self.limit_exceeded.is_some() {
             return None; // already tripped — refuse everything else too
         }
         if self.on_path.contains(name) {
-            return None; // true cycle
+            // True cycle (round 6 review M67). Borrowed lookup first
+            // (production readiness review F3): a per-keystroke walk over an
+            // unresolved cycle hits this same back-edge repeatedly, and only
+            // the first refusal of a given `name` is new information —
+            // `cyclic.insert` allocates a fresh `String` only then, not on
+            // every later repeat of a name already on record.
+            if !self.cyclic.contains(name) {
+                self.cyclic.insert(name.to_string());
+            }
+            return None;
         }
         if self.on_path.len() >= MAX_ANCESTRY_DEPTH {
             // A genuinely new level, not a cycle back-edge (checked above):
@@ -486,32 +766,72 @@ impl DiamondGuard {
             // `MAX_ANCESTRY_DEPTH` is set to stay clear of (see its doc
             // comment). Refuse here, before that frame exists, rather than
             // let the process find its own limit.
-            self.depth_exceeded = Some(name.to_string());
+            self.limit_exceeded = Some(LimitTrip::Depth(name.to_string()));
             return None;
         }
-        self.on_path.insert(name.to_string());
-        let mut is_first_binding = true;
-        if let Some(bindings) = self.resolved.get(name) {
-            is_first_binding = false;
-            if let Some(&resolved_at) = bindings.get(args) {
-                if resolved_at == self.generation {
-                    self.on_path.remove(name);
+        // Borrowed lookups only, so the common up-to-date-repeat case (any
+        // diamond shape re-checks most ancestors far more often than it
+        // re-resolves them) costs nothing beyond the lookup itself: `on_path`
+        // is touched only once we already know `body` will run (round 6
+        // review M14 — this used to insert `name.to_string()` into `on_path`
+        // unconditionally, before it could even ask this question, then
+        // immediately remove it again on exactly this bail path).
+        //
+        // `is_stale_reresolution` is `true` only for the middle arm below —
+        // a key already resolved once, now invalidated by some *other*
+        // binding disagreeing with it since. That, and only that, is the
+        // total-work budget's business (production readiness review F1):
+        // a name's first-ever binding and a genuinely new distinct binding
+        // of an already-seen name (the other two arms) are each visited at
+        // most once per distinct `(name, args)` pair the ancestor graph
+        // actually contains, bounded by the source itself, not by how many
+        // times a diamond conflict forces a re-walk. See `resolutions`'s own
+        // doc comment for why counting either of those as "resolutions"
+        // rejected legitimate wide-but-shallow hierarchies with no conflict
+        // anywhere in them.
+        let (is_first_binding, is_stale_reresolution) = match self.resolved.get(name) {
+            None => (true, false),
+            Some(bindings) => match bindings.get(args) {
+                Some(&resolved_at) if resolved_at == self.generation => {
                     return None; // up to date; nothing has disagreed since
                 }
                 // Stale: something else disagreed with `name`'s binding
                 // since this exact key was last resolved. Fall through and
-                // re-resolve it now, restoring it to the current
-                // generation — `on_path` stays inserted for `visit`'s
-                // bookkeeping to remove.
-            } else {
+                // re-resolve it now, restoring it to the current generation —
+                // this is THE re-resolution the total-work budget counts.
+                Some(_) => (false, true),
                 // A genuinely new distinct binding of an already-seen name:
-                // a real diamond disagreement. Advance the generation so
-                // every other key resolved before this point is now stale
-                // and will re-assert itself the next (and only the next)
-                // time it is visited.
-                self.generation += 1;
+                // a real diamond disagreement, discovered for the first
+                // time. Advance the generation so every other key resolved
+                // before this point is now stale and will re-assert itself
+                // the next (and only the next) time it is visited — but this
+                // visit itself is not a re-resolution of anything; nothing
+                // was invalidated to produce it.
+                None => {
+                    self.generation += 1;
+                    (false, false)
+                }
+            },
+        };
+        // The total-work budget (round 6 review M3, re-scoped to
+        // re-resolutions only by production readiness review F1): only a
+        // stale re-resolution counts as the genuine, potentially-unbounded
+        // work this budget exists to cap. Checked, not merely counted: once
+        // a walk has re-resolved `MAX_ANCESTRY_RESOLUTIONS` stale keys, this
+        // attempt — the one that would push it over — is refused via the
+        // same sticky `limit_exceeded` flag and truncation path
+        // `MAX_ANCESTRY_DEPTH` uses, but filed as `LimitTrip::Cost` rather
+        // than `LimitTrip::Depth` so the two are reported as the distinct
+        // diagnostics they are (`LB0319` vs `LB0317` — see [`LimitTrip`]'s
+        // doc comment).
+        if is_stale_reresolution {
+            self.resolutions += 1;
+            if self.resolutions > MAX_ANCESTRY_RESOLUTIONS {
+                self.limit_exceeded = Some(LimitTrip::Cost(name.to_string()));
+                return None;
             }
         }
+        self.on_path.insert(name.to_string());
         Some(is_first_binding)
     }
 }
@@ -609,17 +929,22 @@ enum IndexerResolution {
 ///   reached twice with different bindings (a diamond): the **last**-visited
 ///   edge wins, exactly like fields (`indexer-F`).
 fn indexer_resolution(exists: bool, arrival: MemberArrival) -> IndexerResolution {
-    match (exists, arrival) {
-        (
-            true,
-            MemberArrival::AncestorFold {
-                is_first_binding: false,
-            },
-        ) => IndexerResolution::Overwrite,
-        (true, MemberArrival::Duplicate | MemberArrival::AncestorFold { .. }) => {
-            IndexerResolution::Keep
-        }
-        (false, _) => IndexerResolution::Insert,
+    // Derived from `member_wins` rather than hand-maintained separately
+    // (round 6 review M10): a map's `insert` can express "overwrite" or
+    // "insert fresh" but not "leave the existing slot alone", which is why
+    // this needs its own three-way `IndexerResolution` — but *which* of
+    // those three applies is exactly the same "does an incoming value
+    // replace what's on record" question `member_wins` already answers, so
+    // this asks it that question rather than re-deriving the rule inline.
+    // The `V` parameter is never inspected (see `member_wins`'s own doc
+    // comment) so a unit reference stands in for the indexer slot's actual
+    // value.
+    if !exists {
+        IndexerResolution::Insert
+    } else if member_wins(Some(&()), arrival) {
+        IndexerResolution::Overwrite
+    } else {
+        IndexerResolution::Keep
     }
 }
 
@@ -683,6 +1008,21 @@ fn adopt_params_if_unset(existing: &mut Vec<String>, incoming: &[String]) {
     }
 }
 
+/// Append `parent` to a class's own `parents` list unless an ancestor of the
+/// same name is already on it — parents dedupe by NAME, so two declarations
+/// naming one parent (with possibly different type arguments) are the same
+/// edge in the chain and the **first** wins, matching every other
+/// duplicate-declaration axis in this file (round 6 review M9: this body used
+/// to be hand-copied, identically, into `absorb_block`'s same-file
+/// re-declaration case and `merge_file_types`'s cross-file case — the one
+/// member kind with no single owner in the table the rest of this section is
+/// named after).
+fn push_parent_ref(parents: &mut Vec<ParentRef>, parent: ParentRef) {
+    if !parents.iter().any(|p| p.name == parent.name) {
+        parents.push(parent);
+    }
+}
+
 impl TypeEnv {
     /// Build the environment for one parsed file.
     #[must_use]
@@ -734,7 +1074,7 @@ impl TypeEnv {
         // Build generic `---@class Name<T>` templates before the main pass so
         // references (`Name<number>`) resolve regardless of declaration order,
         // and ambient generic classes are reachable too (#84).
-        lowerer.generic_classes = collect_generic_classes(items, &root, ambient, &decl);
+        lowerer.generic_classes = collect_generic_classes(items, &root, ambient, &decl, &env);
         for item in items {
             lowerer.generics = block_generics(item);
             env.absorb_block(item, &mut lowerer, &root);
@@ -845,6 +1185,7 @@ impl TypeEnv {
     /// member-wise with the existing (defs) declaration winning same-name
     /// collisions, and a carrier attachment never shadowing a `---@field`;
     /// enums merge first-wins.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn merge_file_types(&mut self, file: &FileTypes) {
         // First-wins, matching every other axis of this merge: the first
         // file to declare a name is the one a "declared here" secondary
@@ -892,9 +1233,7 @@ impl TypeEnv {
                             },
                             None => parent.clone(),
                         };
-                        if !existing.parents.iter().any(|p| p.name == parent.name) {
-                            existing.parents.push(parent);
-                        }
+                        push_parent_ref(&mut existing.parents, parent);
                     }
                     let subst = |field: &FieldTy| match &rename {
                         Some(map) => FieldTy {
@@ -929,6 +1268,17 @@ impl TypeEnv {
                     // entries, which `TypeEnv::collect_class`'s consumer then
                     // resolved by walk order — a second, silent precedence
                     // rule disagreeing with this file's own first-wins one.
+                    // Built once for this class, not re-scanned per incoming
+                    // entry (round 6 review M55): `.iter().any()` here cost
+                    // O(existing.indexers.len()) on every incoming indexer,
+                    // making a class with K `---@field [K] V` entries cost
+                    // O(K²) to merge.
+                    let mut indexer_index: HashMap<Ty, usize> = existing
+                        .indexers
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (k, _))| (k.clone(), i))
+                        .collect();
                     for (key, value) in &def.indexers {
                         let indexer = match &rename {
                             Some(map) => (
@@ -937,11 +1287,12 @@ impl TypeEnv {
                             ),
                             None => (key.clone(), value.clone()),
                         };
-                        let exists = existing.indexers.iter().any(|(k, _)| *k == indexer.0);
+                        let exists = indexer_index.contains_key(&indexer.0);
                         if matches!(
                             indexer_resolution(exists, MemberArrival::Duplicate),
                             IndexerResolution::Insert
                         ) {
+                            indexer_index.insert(indexer.0.clone(), existing.indexers.len());
                             existing.indexers.push(indexer);
                         }
                     }
@@ -1198,6 +1549,17 @@ impl TypeEnv {
         root: &SyntaxNode,
     ) {
         let mut current_class: Option<String> = None;
+        // O(1) dedup lookup for the current class's indexer entries (round 6
+        // review M55): the tags loop below can add thousands of `---@field
+        // [K] V` entries to one class one tag at a time, and re-scanning
+        // `class.indexers` with `.iter().any()` on every single tag made a
+        // class with K indexer entries cost O(K²). This mirrors
+        // `class.indexers`' key set — invalidated (rebuilt lazily, on next
+        // use) whenever `current_class` changes rather than on every tag, so
+        // it costs O(K) total to build across the whole loop, not O(K) per
+        // tag.
+        let mut indexer_index: HashMap<Ty, usize> = HashMap::new();
+        let mut indexer_index_for: Option<String> = None;
         // The positional unification a re-declaration's field bodies need when
         // it spells the class's type parameters differently from the canonical
         // (first) list — `None` while the two agree, which is the common case.
@@ -1384,9 +1746,7 @@ impl TypeEnv {
                                     },
                                     None => parent,
                                 };
-                                if !existing.parents.iter().any(|p| p.name == parent.name) {
-                                    existing.parents.push(parent);
-                                }
+                                push_parent_ref(&mut existing.parents, parent);
                             }
                         }
                     }
@@ -1427,8 +1787,10 @@ impl TypeEnv {
                             // remove or rename this one" — and now the stored
                             // type agrees with the message. luals unions the
                             // two declared types instead; luabox keeps the
-                            // first deterministically and warns, the same trade
-                            // it makes for duplicate aliases and enums (#110).
+                            // first deterministically and warns (#110) — a
+                            // duplicate `---@enum` keeps the first too
+                            // (`Tag::Enum` below), though nothing currently
+                            // warns on it (round 6 review M53).
                             if !member_wins(class.fields.get(name), MemberArrival::Duplicate) {
                                 continue;
                             }
@@ -1468,11 +1830,21 @@ impl TypeEnv {
                             // whichever it walked last — the opposite winner
                             // from every other duplicate-member axis in this
                             // block, none of which warned either.
-                            let exists = class.indexers.iter().any(|(k, _)| *k == key);
+                            if indexer_index_for.as_deref() != current_class.as_deref() {
+                                indexer_index = class
+                                    .indexers
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, (k, _))| (k.clone(), i))
+                                    .collect();
+                                indexer_index_for.clone_from(&current_class);
+                            }
+                            let exists = indexer_index.contains_key(&key);
                             if matches!(
                                 indexer_resolution(exists, MemberArrival::Duplicate),
                                 IndexerResolution::Insert
                             ) {
+                                indexer_index.insert(key.clone(), class.indexers.len());
                                 class.indexers.push((key, ty));
                             }
                         }
@@ -1511,8 +1883,21 @@ impl TypeEnv {
                     type_span = Some(t.span.start..t.span.end);
                 }
                 Tag::Enum(e) if !e.name.is_empty() => {
-                    let def = enum_def(e, item.target, root);
-                    self.enums.insert(e.name.clone(), def);
+                    // First declaration wins, matching every other same-file
+                    // duplicate-declaration axis in this block (round 6
+                    // review M53: this used to `insert` unconditionally —
+                    // last-wins, silently, the one axis in this file that
+                    // disagreed with "the file boundary does not change the
+                    // merge" and with its own neighbouring `Tag::Field` arm's
+                    // comment, which already claimed enums made this same
+                    // trade). No diagnostic fires on the dropped duplicate
+                    // yet — unlike `LB0311` for fields, nothing scans for a
+                    // repeated `---@enum` name — so this only fixes which
+                    // declaration's members are kept, not silence about it.
+                    if member_wins(self.enums.get(&e.name), MemberArrival::Duplicate) {
+                        let def = enum_def(e, item.target, root);
+                        self.enums.insert(e.name.clone(), def);
+                    }
                 }
                 Tag::Overload(o) => {
                     if let Ty::Function(func) = lowerer.lower(&o.ty) {
@@ -1677,7 +2062,19 @@ impl TypeEnv {
                 continue;
             };
             if let Some(def) = self.classes.get_mut(class) {
-                def.visibility.insert(member, scope);
+                // First declaration wins (round 6 review M6): this used to
+                // write unconditionally, so two standalone visibility blocks
+                // for one member in one file left file order deciding the
+                // winner (last-wins), while `merge_file_types`'s identical
+                // cross-file case already routed through `member_wins` and
+                // got first-wins — the same member kind deciding its own
+                // precedence two different ways depending on which side of a
+                // file boundary the duplicate landed on, against
+                // `push_operator_overload`'s own stated invariant that "the
+                // file boundary does not change the merge".
+                if member_wins(def.visibility.get(&member), MemberArrival::Duplicate) {
+                    def.visibility.insert(member, scope);
+                }
             }
         }
     }
@@ -1757,7 +2154,16 @@ impl TypeEnv {
                     def.fields.insert(member.clone(), merged);
                 }
                 None => {
-                    def.methods.insert(member.clone(), attached);
+                    // First declaration wins (round 6 review M7 — the
+                    // identical defect as M6, one member kind over): this
+                    // used to write unconditionally, so a defs package
+                    // declaring one carrier member twice published the
+                    // **last** signature in one file and the **first** split
+                    // across two, disagreeing with `merge_file_types`'s
+                    // cross-file carrier/method handling above.
+                    if member_wins(def.methods.get(member), MemberArrival::Duplicate) {
+                        def.methods.insert(member.clone(), attached);
+                    }
                 }
             }
         }
@@ -1830,7 +2236,8 @@ impl TypeEnv {
         let mut shape = TableTy::default();
         let mut guard = DiamondGuard::default();
         self.collect_class(name, args, &mut shape, &mut guard, false);
-        self.note_depth_limit(&guard, name);
+        self.note_limit_trip(&guard, name);
+        self.note_cyclic(&guard);
         Some(shape)
     }
 
@@ -1885,22 +2292,97 @@ impl TypeEnv {
         let mut shape = TableTy::default();
         let mut guard = DiamondGuard::default();
         self.collect_class(name, args, &mut shape, &mut guard, true);
-        self.note_depth_limit(&guard, name);
+        self.note_limit_trip(&guard, name);
+        self.note_cyclic(&guard);
         Some(shape)
     }
 
-    /// Record that resolving `root`'s shape/operators tripped
-    /// [`DiamondGuard`]'s depth cap, if it did — the shared tail
+    /// Record that resolving `root`'s shape/operators tripped one of
+    /// [`DiamondGuard`]'s two budgets, if it did, filing it under the right
+    /// report queue for which one — the shared tail
     /// [`Self::class_shape_bound`], [`Self::class_shape_bound_export`] and
     /// [`Self::class_operators`] each run once their own top-level
-    /// `collect_class`/`collect_operators` call returns.
-    fn note_depth_limit(&self, guard: &DiamondGuard, root: &str) {
-        if guard.depth_exceeded.is_some() {
-            self.depth_limit_hits
+    /// `collect_class`/`collect_operators` call returns. Renamed from
+    /// `note_depth_limit` (production readiness review F1): before
+    /// [`LimitTrip`] existed there was only one budget and one queue to file
+    /// a trip under; now there are two, and this is the single place that
+    /// decides which.
+    fn note_limit_trip(&self, guard: &DiamondGuard, root: &str) {
+        let queue = match &guard.limit_exceeded {
+            Some(LimitTrip::Depth(_)) => &self.depth_limit_hits,
+            Some(LimitTrip::Cost(_)) => &self.cost_limit_hits,
+            None => return,
+        };
+        queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root.to_string());
+        // Durable record (round 6 review M13): written every time alongside
+        // whichever drainable report queue above just got `root`, but never
+        // cleared by this env, so `class_ancestry_truncated` keeps answering
+        // truthfully for `root` after `take_depth_limit_hits`/
+        // `take_cost_limit_hits` empties that queue for an unrelated report.
+        // One shared durable set for both trip kinds (production readiness
+        // review F1): a truncated shape is equally incomplete either way, so
+        // a caller asking only "is this incomplete" does not need to know
+        // which budget did it.
+        self.truncated_classes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root.to_string());
+    }
+
+    /// Record every class name `guard`'s walk found a true `---@class`
+    /// cycle at (round 6 review M67) — the cyclic-class counterpart of
+    /// [`Self::note_limit_trip`], with the same call sites and the same
+    /// one-shot-report-queue shape, but unlike that one this reports every
+    /// name [`DiamondGuard::cyclic`] collected, not just the query root: a
+    /// mutual `A : B` / `B : A` cycle should be attributed to whichever
+    /// class the walk actually looped back onto, which is not always the
+    /// class a caller happened to query first.
+    fn note_cyclic(&self, guard: &DiamondGuard) {
+        if !guard.cyclic.is_empty() {
+            self.cyclic_class_hits
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(root.to_string());
+                .extend(guard.cyclic.iter().cloned());
         }
+    }
+
+    /// Fold every [`DiamondGuard`] limit trip `other` recorded into this
+    /// env's own ledgers — the fix for the silent-bypass hole production
+    /// readiness measurement R1 found: [`collect_generic_classes`] resolves
+    /// each `---@class Name<T>` template on a throwaway `discovery: TypeEnv`
+    /// (its own `class_shape` call, same as any other), and that env used to
+    /// be dropped the moment the template map was built. `note_limit_trip`/
+    /// `note_cyclic` had already filed the trip faithfully — just into
+    /// `discovery`'s `depth_limit_hits`/`cost_limit_hits`/`truncated_classes`/
+    /// `cyclic_class_hits`, never `self`'s — so a `Name<Args>` reference
+    /// resolved entirely through the discovery-built template (the common
+    /// case: `lower_named` substitutes straight from the template, never
+    /// re-walking `self`'s own ancestry for that name) left `self`'s ledgers
+    /// with no record the walk ever ran long, and
+    /// `crate::check::report_depth_limit_hits`/`report_cost_limit_hits` had
+    /// nothing to drain. Reached only through a non-generic leaf class did
+    /// the checker fall back to walking `self` directly, tripping `self`'s
+    /// own ledgers the ordinary way — which is why that path always reported
+    /// correctly while the direct-name path stayed silent. `other` is
+    /// discarded by its caller right after this call, so a plain read +
+    /// extend (not a drain) is enough; `self`'s own drain-on-report contract
+    /// ([`Self::take_depth_limit_hits`] etc.) is untouched.
+    fn absorb_limit_trips(&self, other: &TypeEnv) {
+        fn extend(dst: &Mutex<HashSet<String>>, src: &Mutex<HashSet<String>>) {
+            let src = src
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            dst.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(src.iter().cloned());
+        }
+        extend(&self.depth_limit_hits, &other.depth_limit_hits);
+        extend(&self.cost_limit_hits, &other.cost_limit_hits);
+        extend(&self.truncated_classes, &other.truncated_classes);
+        extend(&self.cyclic_class_hits, &other.cyclic_class_hits);
     }
 
     /// Drain every depth-limit hit (`LB0317`) recorded since the env was
@@ -1908,7 +2390,10 @@ impl TypeEnv {
     /// can trip the guard on every reference within a file's check, not
     /// just once). `crate::check::run` calls this once per file, after both
     /// inference and the checker have finished querying `self`, and turns
-    /// each name into one diagnostic.
+    /// each name into one diagnostic. [`Self::take_cost_limit_hits`] is the
+    /// cost-budget counterpart — a walk trips at most one of the two
+    /// (`limit_exceeded` is a single `Option`), so a root class never
+    /// appears in both.
     pub(crate) fn take_depth_limit_hits(&self) -> Vec<String> {
         std::mem::take(
             &mut *self
@@ -1920,10 +2405,56 @@ impl TypeEnv {
         .collect()
     }
 
-    /// Whether resolving `name`'s ancestor chain has ever tripped
-    /// [`DiamondGuard`]'s depth cap on this env (`LB0317`) — a *peek*, unlike
-    /// [`Self::take_depth_limit_hits`], which drains. Two callers need this
-    /// answer without draining the ledger `crate::check::run` still owns:
+    /// Drain every cost-limit hit (`LB0319`, [`crate::codes::CLASS_COST_LIMIT`])
+    /// recorded since the env was built — root class names only,
+    /// deduplicated, the cost-budget counterpart of
+    /// [`Self::take_depth_limit_hits`] with the identical drain-once
+    /// contract and call-site shape (production readiness review F1). A
+    /// walk that ran past [`MAX_ANCESTRY_RESOLUTIONS`] re-resolutions
+    /// without ever recursing anywhere near [`MAX_ANCESTRY_DEPTH`] drains
+    /// here, not into `take_depth_limit_hits` — see [`LimitTrip`]'s doc
+    /// comment for why conflating the two misleads about the fix.
+    pub(crate) fn take_cost_limit_hits(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .cost_limit_hits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_iter()
+        .collect()
+    }
+
+    /// Drain every true-cycle hit recorded since the env was built —
+    /// deduplicated, every class the cycle reaches rather than only the name
+    /// that happened to be queried (round 6 review M67, the cyclic-class
+    /// counterpart of [`Self::take_depth_limit_hits`], with the identical
+    /// drain-once contract). `crate::check::report_cyclic_class_hits` turns
+    /// each name into one `LB0318` exactly as `report_depth_limit_hits` does
+    /// for `LB0317`, drained at the same point in `crate::check::run` and
+    /// with the same three attribution tiers.
+    pub(crate) fn take_cyclic_class_hits(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .cyclic_class_hits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_iter()
+        .collect()
+    }
+
+    /// Whether resolving `name`'s ancestor chain has ever tripped either of
+    /// [`DiamondGuard`]'s two budgets on this env (`LB0317` or `LB0319`) — a
+    /// *durable peek* against [`Self::truncated_classes`], which nothing
+    /// ever drains, unlike [`Self::take_depth_limit_hits`]/
+    /// [`Self::take_cost_limit_hits`]'s one-shot report queues (round 6
+    /// review M13: this used to peek the *drainable* `depth_limit_hits`
+    /// ledger directly, so a class truncated while checking one file no
+    /// longer read as truncated once `crate::check::run` drained that ledger
+    /// into that file's own `LB0317` diagnostics — correct only for the
+    /// caller that runs strictly before the drain, wrong for every caller
+    /// that might run after). Two callers need this durable answer:
     ///
     /// - A field lookup that just called `class_shape`/`class_shape_bound`
     ///   for `name` and came up empty (`crate::infer`'s `lookup_shape_field`/
@@ -1932,22 +2463,22 @@ impl TypeEnv {
     ///   an absent member there is not provably undefined — `LB0317` alone
     ///   is the honest diagnostic, not `LB0317` *and* a false `LB0306`/
     ///   `LB0303` for a field that exists past the cutoff (production
-    ///   readiness review, finding 1).
+    ///   readiness review, finding 1). This query can run *after*
+    ///   `report_depth_limit_hits` has already drained the report queue for
+    ///   an earlier class in the same file, so it cannot share that queue.
     /// - An LSP surface reading through [`crate::defs::Ambient`]'s own
     ///   long-lived env (`Ambient::class_members`/`class_members_bound`),
-    ///   which never runs through `check::run` and so is never drained —
-    ///   [`crate::defs::Ambient::class_ancestry_truncated`] exposes this same
-    ///   peek so hover/completion/goto-definition/signature-help can say so
-    ///   too, instead of silently showing fewer members than the class
-    ///   actually declares with the Problems panel none the wiser (finding
-    ///   2).
-    ///
-    /// Reading, not draining, is correct for both: the answer must still be
-    /// there for `take_depth_limit_hits` to drain into `LB0317` afterwards,
-    /// and it must still be there the *next* time an LSP surface asks, since
-    /// nothing else ever clears an `Ambient`'s own env.
+    ///   which never runs through `check::run` and so never drains
+    ///   `depth_limit_hits` or `cost_limit_hits` at all — [`crate::defs::Ambient::class_ancestry_truncated`]
+    ///   exposes this same peek so hover/completion/goto-definition/
+    ///   signature-help can say so too, instead of silently showing fewer
+    ///   members than the class actually declares with the Problems panel
+    ///   none the wiser (finding 2). This caller's set would only ever grow
+    ///   regardless of which field backed it, since nothing drains an
+    ///   `Ambient`'s env either way — splitting the field changes nothing for
+    ///   this lifecycle, only for the check-path one above.
     pub(crate) fn class_ancestry_truncated(&self, name: &str) -> bool {
-        self.depth_limit_hits
+        self.truncated_classes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(name)
@@ -2212,15 +2743,29 @@ impl TypeEnv {
             // separate first-wins rule for indexers unchanged (round 5
             // review N7) — this loop only decides between *already-merged*
             // per-class indexer lists.
+            // Built once for this class node, not re-scanned per indexer
+            // (round 6 review M55): `.iter().any()`/`.iter_mut().find()`
+            // here cost O(shape.indexers.len()) on every one of this
+            // class's own indexers, making a class with K `---@field [K]
+            // V` entries cost O(K²) to resolve.
+            let mut indexer_index: HashMap<Ty, usize> = shape
+                .indexers
+                .iter()
+                .enumerate()
+                .map(|(i, (k, _))| (k.clone(), i))
+                .collect();
             for (key, value) in &def.indexers {
                 let key = crate::generics::subst_ty(key, &bound);
                 let value = crate::generics::subst_ty(value, &bound);
-                let exists = shape.indexers.iter().any(|(k, _)| *k == key);
+                let exists = indexer_index.contains_key(&key);
                 match indexer_resolution(exists, MemberArrival::AncestorFold { is_first_binding }) {
-                    IndexerResolution::Insert => shape.indexers.push((key, value)),
+                    IndexerResolution::Insert => {
+                        indexer_index.insert(key.clone(), shape.indexers.len());
+                        shape.indexers.push((key, value));
+                    }
                     IndexerResolution::Overwrite => {
-                        if let Some(slot) = shape.indexers.iter_mut().find(|(k, _)| *k == key) {
-                            slot.1 = value;
+                        if let Some(&pos) = indexer_index.get(&key) {
+                            shape.indexers[pos].1 = value;
                         }
                     }
                     IndexerResolution::Keep => {} // first-listed for this key already stands
@@ -2248,10 +2793,22 @@ impl TypeEnv {
         start: &str,
         mut visit: impl FnMut(&str, Option<&ClassDef>) -> std::ops::ControlFlow<T>,
     ) -> Option<T> {
-        let mut stack = vec![start.to_string()];
+        let mut stack = vec![(start.to_string(), 0usize)];
         let mut seen = HashSet::new();
-        while let Some(name) = stack.pop() {
+        while let Some((name, depth)) = stack.pop() {
             if !seen.insert(name.clone()) {
+                continue;
+            }
+            // The same cap `DiamondGuard` refuses to recurse past in
+            // `collect_class`/`collect_operators` (round 6 review M12):
+            // without it, this walk reaches ancestors `class_shape` itself
+            // truncates away, so `is_subclass`/`class_method_names`/
+            // `member_visibility` could disagree with the merged shape about
+            // how far the chain actually reaches — an upcast `is_subclass`
+            // approves that the truncated shape then fails with a spurious
+            // "missing" diagnostic, because the field it promised was never
+            // actually merged in.
+            if depth >= MAX_ANCESTRY_DEPTH {
                 continue;
             }
             let def = self.classes.get(&name);
@@ -2273,7 +2830,12 @@ impl TypeEnv {
                 // `class_method_names` (accumulates a set) and `is_subclass`
                 // (`Break` on name match) are unaffected by traversal order
                 // either way.
-                stack.extend(def.parents.iter().rev().map(|p| p.name.clone()));
+                stack.extend(
+                    def.parents
+                        .iter()
+                        .rev()
+                        .map(|p| (p.name.clone(), depth + 1)),
+                );
             }
         }
         None
@@ -2306,7 +2868,8 @@ impl TypeEnv {
         let mut out: Vec<(String, OperatorSig)> = Vec::new();
         let mut guard = DiamondGuard::default();
         self.collect_operators(name, &[], op, &mut out, &mut guard);
-        self.note_depth_limit(&guard, name);
+        self.note_limit_trip(&guard, name);
+        self.note_cyclic(&guard);
         out.into_iter().map(|(_owner, sig)| sig).collect()
     }
 
@@ -2856,21 +3419,154 @@ fn block_generics(item: &luacats::AnnotatedItem) -> HashSet<String> {
 /// nothing this function could ever return, so check for one — a single
 /// pass over each item's already-harvested tags, no lowering, no absorb —
 /// before paying for the discovery env at all.
+/// Whether `expr`, or anything nested inside it, is a bare-or-instantiated
+/// reference to one of `names` — recurses through every `TypeExprKind` a
+/// `Named` node can be nested inside (optional, array, union, tuple, table,
+/// function signature, parenthesised) so a reference buried inside
+/// `(Box<T>)[]` or `{ x: Box }` is still found. Literal/error leaves carry
+/// no nested type expressions and short-circuit to `false`.
+fn type_expr_references_any(expr: &luacats::TypeExpr, names: &HashSet<String>) -> bool {
+    match &expr.kind {
+        TypeExprKind::Named { name, args } => {
+            names.contains(name) || args.iter().any(|a| type_expr_references_any(a, names))
+        }
+        TypeExprKind::Optional(inner) | TypeExprKind::Array(inner) | TypeExprKind::Paren(inner) => {
+            type_expr_references_any(inner, names)
+        }
+        TypeExprKind::Union(items) | TypeExprKind::Tuple(items) => {
+            items.iter().any(|t| type_expr_references_any(t, names))
+        }
+        TypeExprKind::Table(fields) => fields.iter().any(|f| match f {
+            luacats::TableField::Named { ty, .. } => type_expr_references_any(ty, names),
+            luacats::TableField::Indexer { key, value } => {
+                type_expr_references_any(key, names) || type_expr_references_any(value, names)
+            }
+        }),
+        TypeExprKind::Fun { params, returns } => {
+            params.iter().any(|p| {
+                p.ty.as_ref()
+                    .is_some_and(|ty| type_expr_references_any(ty, names))
+            }) || returns
+                .iter()
+                .any(|r| type_expr_references_any(&r.ty, names))
+        }
+        TypeExprKind::StringLit(_)
+        | TypeExprKind::NumberLit(_)
+        | TypeExprKind::BoolLit(_)
+        | TypeExprKind::Backtick(_)
+        | TypeExprKind::Error => false,
+    }
+}
+
+/// Whether `tag` carries any type expression that references one of `names`
+/// — exhaustive over every [`Tag`] variant so a new tag kind that grows a
+/// `TypeExpr` field later must be added here explicitly rather than silently
+/// falling through a wildcard arm and under-triggering the scan it backs
+/// (round 6 review M56).
+fn tag_references_any(tag: &Tag, names: &HashSet<String>) -> bool {
+    match tag {
+        Tag::Class(c) => c.parents.iter().any(|p| type_expr_references_any(p, names)),
+        Tag::Field(f) => type_expr_references_any(&f.ty, names),
+        Tag::Param(p) => type_expr_references_any(&p.ty, names),
+        Tag::Return(r) => r
+            .items
+            .iter()
+            .any(|item| type_expr_references_any(&item.ty, names)),
+        Tag::Type(t) => t.types.iter().any(|ty| type_expr_references_any(ty, names)),
+        Tag::Alias(a) => {
+            a.ty.as_ref()
+                .is_some_and(|ty| type_expr_references_any(ty, names))
+                || a.members
+                    .iter()
+                    .any(|m| type_expr_references_any(&m.ty, names))
+        }
+        Tag::Generic(g) => g.params.iter().any(|p| {
+            p.constraint
+                .as_ref()
+                .is_some_and(|ty| type_expr_references_any(ty, names))
+        }),
+        Tag::Overload(o) => type_expr_references_any(&o.ty, names),
+        Tag::Cast(c) => c
+            .ops
+            .iter()
+            .any(|op| type_expr_references_any(&op.ty, names)),
+        Tag::Operator(o) => {
+            o.input
+                .as_ref()
+                .is_some_and(|ty| type_expr_references_any(ty, names))
+                || type_expr_references_any(&o.result, names)
+        }
+        Tag::Vararg(v) => type_expr_references_any(&v.ty, names),
+        Tag::Enum(_)
+        | Tag::Meta(_)
+        | Tag::See(_)
+        | Tag::Deprecated(_)
+        | Tag::Nodiscard(_)
+        | Tag::Async(_)
+        | Tag::Diagnostic(_)
+        | Tag::Version(_)
+        | Tag::Source(_)
+        | Tag::Package(_)
+        | Tag::Private(_)
+        | Tag::Protected(_)
+        | Tag::Unknown(_) => false,
+    }
+}
+
 fn collect_generic_classes(
     items: &[luacats::AnnotatedItem],
     root: &SyntaxNode,
     ambient: Option<&crate::defs::Ambient>,
     decl: &Declared,
+    env: &TypeEnv,
 ) -> BTreeMap<String, GenericClass> {
-    let file_has_generics = items.iter().any(|item| {
-        item.block
-            .tags
-            .iter()
-            .any(|tag| matches!(tag, Tag::Class(c) if !c.params.is_empty()))
-    });
-    let ambient_has_generics =
-        ambient.is_some_and(|a| a.env.classes.values().any(|def| !def.params.is_empty()));
-    if !file_has_generics && !ambient_has_generics {
+    // Every name a `Named` reference site would need `generic_classes` to
+    // resolve — file-declared generic classes plus ambient ones. Cheap to
+    // gather (no absorb, no lowering): `ambient.env.classes` is already an
+    // in-memory map, and the file-declared half is the same single pass
+    // over already-harvested tags the old `file_has_generics` bool used,
+    // just keeping the names instead of collapsing them to a bool.
+    let mut generic_names: HashSet<String> = HashSet::new();
+    for item in items {
+        for tag in &item.block.tags {
+            if let Tag::Class(c) = tag
+                && !c.params.is_empty()
+            {
+                generic_names.insert(c.name.clone());
+            }
+        }
+    }
+    if let Some(ambient) = ambient {
+        generic_names.extend(
+            ambient
+                .env
+                .classes
+                .iter()
+                .filter(|(_, def)| !def.params.is_empty())
+                .map(|(name, _)| name.clone()),
+        );
+    }
+    // Round 6 review M56: the old guard asked "does a generic class exist
+    // ANYWHERE" (file or ambient) — true the moment ambient ships even ONE
+    // generic class, which re-arms the full discovery-and-resolve pass
+    // below for every file in the project, whether or not that file ever
+    // writes the `Name<...>`/bare-`Name` reference syntax that could
+    // possibly need it. This scan asks the file-local question instead:
+    // does THIS file's own annotations reference one of `generic_names` at
+    // all (bare or with `<Args>`) — the exact condition
+    // `Lowerer::lower_named` checks (`self.generic_classes.get(name)`) when
+    // it decides whether a template exists for a name it is lowering. A
+    // file that never writes any of these names cannot possibly read a
+    // different answer from `generic_classes` than an empty map would give,
+    // so skipping the discovery pass for it changes nothing observable.
+    let file_references_generics = !generic_names.is_empty()
+        && items.iter().any(|item| {
+            item.block
+                .tags
+                .iter()
+                .any(|tag| tag_references_any(tag, &generic_names))
+        });
+    if !file_references_generics {
         return BTreeMap::new();
     }
 
@@ -2900,6 +3596,11 @@ fn collect_generic_classes(
             );
         }
     }
+    // R1 fix (production readiness measurement): forward any budget trip
+    // `discovery`'s own walk recorded onto the real env's ledgers before
+    // `discovery` is dropped — see `TypeEnv::absorb_limit_trips`'s doc for
+    // why this is the only place that can happen.
+    env.absorb_limit_trips(&discovery);
     out
 }
 
@@ -3588,6 +4289,144 @@ mod tests {
     }
 
     #[test]
+    fn indexer_resolution_matches_an_independent_truth_table() {
+        // Round 6 review M10: `indexer_resolution` used to hand-maintain its
+        // own three-way decision 48 lines apart from `member_wins`'s
+        // two-way one, with nothing enforcing the two stayed in agreement —
+        // exhaustive over every `(exists, arrival)` combination, against a
+        // literal expected outcome rather than either function's own logic,
+        // so this stays a real check before *and* after `indexer_resolution`
+        // is rewritten to call `member_wins` internally (not a tautology
+        // that would pass no matter what either body says).
+        let cases = [
+            (false, MemberArrival::Duplicate, "Insert"),
+            (
+                false,
+                MemberArrival::AncestorFold {
+                    is_first_binding: true,
+                },
+                "Insert",
+            ),
+            (
+                false,
+                MemberArrival::AncestorFold {
+                    is_first_binding: false,
+                },
+                "Insert",
+            ),
+            (true, MemberArrival::Duplicate, "Keep"),
+            (
+                true,
+                MemberArrival::AncestorFold {
+                    is_first_binding: true,
+                },
+                "Keep",
+            ),
+            (
+                true,
+                MemberArrival::AncestorFold {
+                    is_first_binding: false,
+                },
+                "Overwrite",
+            ),
+        ];
+        for (exists, arrival, expected) in cases {
+            let got = match indexer_resolution(exists, arrival) {
+                IndexerResolution::Insert => "Insert",
+                IndexerResolution::Overwrite => "Overwrite",
+                IndexerResolution::Keep => "Keep",
+            };
+            assert_eq!(got, expected, "exists={exists} arrival={arrival:?}");
+        }
+    }
+
+    #[test]
+    fn a_class_with_thousands_of_indexer_fields_dedupes_in_bounded_time() {
+        // Round 6 review M55: the same-file indexer dedup in `absorb_block`
+        // (the `FieldKey::Indexer` arm of its `Tag::Field` match) used to
+        // scan `class.indexers` with a plain `.iter().any(..)` on every one
+        // of a class's `---@field [K] V` tags, so a single class with K such
+        // fields cost O(K²) to absorb — quadratic growth confirmed on a
+        // release CLI build: K=5,000/10,000/20,000 measured 0.269s/1.009s/
+        // 3.078s before this fix's `indexer_index` cache, 0.026s/0.045s/
+        // 0.089s after (linear). `absorb_block` calls `indexer_resolution`
+        // once per tag either way, so this is the one seam actually
+        // exercised by "many `---@field [K] V` entries on one class" (the
+        // finding's own repro shape) — `merge_file_types`'s and
+        // `collect_class`'s own indexer loops got the identical fix but are
+        // batch merges of an already-built list, not a per-tag scan, so
+        // they were never the dominant K² cost here.
+        //
+        // K=20,000 (matching the CLI table above) with a 5s ceiling (this
+        // file's other bounded-time tests' convention): comfortably fast
+        // after the fix (well under 1s even on this unoptimized debug
+        // build); reverting just the `indexer_index` cache reproduces a
+        // real timeout here, confirmed by hand.
+        let k = 20_000;
+        let mut source = String::from("---@class Big\n");
+        for i in 0..k {
+            use std::fmt::Write as _;
+            let _ = writeln!(source, "---@field [{i}] number");
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let env = env_of(&source);
+            let def = env.classes.get("Big").map(|def| def.indexers.len());
+            let _ = tx.send(def);
+        });
+        let len = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect(
+                "absorbing 20,000 indexer fields on one class must finish well under 5s; \
+                 an O(K²) regression would not return in this process's lifetime",
+            )
+            .expect("the class is declared");
+        assert_eq!(len, k, "every distinct indexer key must survive the dedup");
+    }
+
+    #[test]
+    fn parents_dedupe_by_name_identically_whether_the_redeclaration_is_same_file_or_cross_file() {
+        // Round 6 review M9: the `parents` cell had no single owner — an
+        // identical dedupe-by-name, first-wins body was hand-copied into
+        // `absorb_block`'s same-file re-declaration case and
+        // `merge_file_types`'s cross-file case, the one member kind missing
+        // from the table every other kind in this section is named after.
+        // Both seams now call the shared `push_parent_ref`; this pins that
+        // they still agree once it is the only body either one runs.
+        let same_file = env_of(
+            "\
+---@class Base<T>
+---@class Dup : Base<number>
+---@class Dup : Base<string>
+",
+        );
+        let def = same_file.classes.get("Dup").expect("class declared");
+        assert_eq!(
+            def.parents,
+            vec![ParentRef {
+                name: "Base".to_string(),
+                args: vec![Ty::Number],
+            }],
+            "same-file: the first-declared parent binding must win"
+        );
+
+        let mut cross_file = TypeEnv::default();
+        cross_file.merge_file_types(&surface(
+            "---@class Base<T>\n---@class Dup : Base<number>\n",
+        ));
+        cross_file.merge_file_types(&surface("---@class Dup : Base<string>\n"));
+        let def = cross_file.classes.get("Dup").expect("merged class");
+        assert_eq!(
+            def.parents,
+            vec![ParentRef {
+                name: "Base".to_string(),
+                args: vec![Ty::Number],
+            }],
+            "cross-file: the first-declared parent binding must win, matching same-file"
+        );
+    }
+
+    #[test]
     fn merging_a_renamed_redeclaration_substitutes_its_parents_type_arguments() {
         // F38 (cross-file seam): the base declares `Both<T>`; the incoming
         // file re-declares it as `Both<U> : Container<U>` — its OWN
@@ -4081,6 +4920,230 @@ mod tests {
     }
 
     #[test]
+    fn class_ancestry_truncated_survives_take_depth_limit_hits_draining() {
+        // Round 6 review M13: `class_ancestry_truncated` used to peek the
+        // same `Mutex` `take_depth_limit_hits` drains, so a class the check
+        // path had already reported (and therefore drained) silently
+        // stopped reading as truncated for every later query — even though
+        // its shape is still, durably, incomplete. Reproduces the exact
+        // sequence `crate::check::run` exercises: resolve the truncated
+        // class (trips the guard), drain the report queue once (as
+        // `report_depth_limit_hits` does at the end of one file's check),
+        // then ask the durable peek again — it must still say truncated.
+        let n = MAX_ANCESTRY_DEPTH;
+        let mut src = String::from("---@class C0\n---@field item number\n");
+        for i in 1..=n {
+            use std::fmt::Write as _;
+            let _ = writeln!(src, "---@class C{i} : C{}", i - 1);
+        }
+        let env = env_of(&src);
+        let root = format!("C{n}");
+        env.class_shape(&root)
+            .expect("the class is declared, even though its ancestry is truncated");
+        assert!(
+            env.class_ancestry_truncated(&root),
+            "must read truncated immediately after resolution trips the guard"
+        );
+        let drained = env.take_depth_limit_hits();
+        assert_eq!(
+            drained,
+            vec![root.clone()],
+            "the report queue must drain the hit exactly once"
+        );
+        assert!(
+            env.class_ancestry_truncated(&root),
+            "a durable peek must still say truncated after the one-shot report queue has \
+             drained — the class's shape is no less incomplete just because it was already \
+             reported once"
+        );
+    }
+
+    #[test]
+    fn a_self_referential_class_cycle_is_recorded_for_reporting() {
+        // Round 6 review M67: `---@class A : A` resolves silently — the true-
+        // cycle guard keeps the walk from looping forever, so `A`'s own
+        // field still resolves fine, but nothing said the cyclic `: A` parent
+        // was ignored. `DiamondGuard::should_apply`'s cycle branch now
+        // records the name it refused, and `note_cyclic`/
+        // `take_cyclic_class_hits` surface it the same way the depth-limit
+        // guard's own hits are surfaced — proving the resolver-side half of
+        // this finding without needing the (out-of-scope) diagnostic wired
+        // up yet.
+        let env = env_of(
+            "\
+---@class A : A
+---@field item number
+",
+        );
+        let shape = env.class_shape("A").expect("declared class");
+        assert_eq!(
+            shape.fields["item"].ty,
+            Ty::Number,
+            "the class's own field must still resolve despite the cyclic parent"
+        );
+        assert_eq!(
+            env.take_cyclic_class_hits(),
+            vec!["A".to_string()],
+            "a self-referential parent must be recorded as a true-cycle hit"
+        );
+    }
+
+    #[test]
+    fn a_mutual_class_cycle_is_recorded_for_reporting() {
+        // The other half of M67: `A : B` / `B : A` behaves identically to
+        // the self-referential case — both classes' own fields resolve, and
+        // the cycle back to the query root is recorded once resolution
+        // reaches it.
+        let env = env_of(
+            "\
+---@class A : B
+---@field a number
+---@class B : A
+---@field b string
+",
+        );
+        let shape = env.class_shape("A").expect("declared class");
+        assert_eq!(shape.fields["a"].ty, Ty::Number, "A's own field resolves");
+        assert_eq!(
+            shape.fields["b"].ty,
+            Ty::String,
+            "B's field resolves too, reached before the walk loops back onto A"
+        );
+        assert_eq!(
+            env.take_cyclic_class_hits(),
+            vec!["A".to_string()],
+            "querying A's shape must record the cycle the walk loops back into"
+        );
+    }
+
+    #[test]
+    fn a_cycle_reached_through_an_innocent_subclass_is_attributed_to_the_cyclic_classes_not_the_query_root()
+     {
+        // Round 6 review M53: `note_cyclic` used to record the QUERY ROOT
+        // (mirroring `note_depth_limit`), which is wrong for this shape —
+        // `D` itself is not cyclic, it merely extends `C`, and `C : B` / `B
+        // : C` is the actual cycle. Recording `D` would point a future
+        // diagnostic at an innocent class and say nothing about the two
+        // that actually loop. `note_cyclic` now records every name
+        // `DiamondGuard::cyclic` collected — the class(es) the walk actually
+        // found already on its path — so querying `D`'s shape must report
+        // `C` (or `B`, whichever the walk re-visits first), never `D`.
+        let env = env_of(
+            "\
+---@class D : C
+---@class C : B
+---@field c string
+---@class B : C
+---@field b string
+",
+        );
+        env.class_shape("D").expect("declared class");
+        let hits = env.take_cyclic_class_hits();
+        assert!(
+            !hits.contains(&"D".to_string()),
+            "the query root is not itself cyclic and must not be reported: {hits:?}"
+        );
+        assert!(
+            hits.contains(&"C".to_string()) || hits.contains(&"B".to_string()),
+            "one of the two classes that actually form the cycle must be reported: {hits:?}"
+        );
+    }
+
+    /// A global allocator that counts every allocation made by the
+    /// **current thread only** — via a `thread_local` counter, so
+    /// concurrently-running tests on other threads (the default under
+    /// `cargo test`) never pollute a reading taken on this thread. Exists
+    /// solely to prove production readiness review F3: `should_apply`'s
+    /// true-cycle branch used to `cyclic.insert(name.to_string())`
+    /// unconditionally on every refusal of an already-recorded name — a
+    /// fresh heap allocation per repeat, on what can be a per-keystroke LSP
+    /// walk over an unresolved cycle. Scoped to `#[cfg(test)]`, so it never
+    /// becomes this crate's allocator for any real caller — only for
+    /// `cargo test -p luabox-types`'s own test binary.
+    #[cfg(test)]
+    #[allow(unsafe_code)]
+    mod alloc_probe {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static COUNT: Cell<u64> = const { Cell::new(0) };
+        }
+
+        pub(super) struct CountingAlloc;
+
+        // SAFETY: every method delegates straight to `System`, which is
+        // itself a valid `GlobalAlloc`; the only addition is a same-thread
+        // counter increment around the delegate call, which touches no
+        // allocator state and cannot violate any of `GlobalAlloc`'s safety
+        // requirements on its own. This crate otherwise denies
+        // `unsafe_code` (workspace `Cargo.toml`); `GlobalAlloc` cannot be
+        // implemented without it, so this module — test-only, and the sole
+        // reason F3's allocation-count proof needs `unsafe` at all — opts
+        // back in explicitly rather than weakening the crate-wide lint.
+        unsafe impl GlobalAlloc for CountingAlloc {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                COUNT.with(|c| c.set(c.get() + 1));
+                unsafe { System.alloc(layout) }
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+
+        pub(super) fn current_thread_alloc_count() -> u64 {
+            COUNT.with(Cell::get)
+        }
+    }
+    #[cfg(test)]
+    #[global_allocator]
+    static ALLOC_PROBE: alloc_probe::CountingAlloc = alloc_probe::CountingAlloc;
+
+    #[test]
+    fn a_repeat_cycle_refusal_of_an_already_recorded_name_allocates_nothing() {
+        // Production readiness review F3: the true-cycle branch of
+        // `should_apply` refuses every visit to a name already on `on_path`
+        // — the common case is the SAME back-edge hit over and over on a
+        // walk that keeps re-entering an unresolved cycle (an LSP re-running
+        // inference on every keystroke, say). Only the FIRST such refusal of
+        // a given name is new information for `cyclic`; every later repeat
+        // must find it via a borrowed `contains` lookup and skip the
+        // allocating `insert` entirely.
+        let mut guard = DiamondGuard::default();
+        guard.on_path.insert("A".to_string());
+
+        // Prime: the first refusal of "A" is a genuine first-ever insert —
+        // it MAY allocate (a fresh `String`, and possibly the `HashSet`'s
+        // own first backing table). Excluded from the measured delta below
+        // on purpose: this test is about REPEATS, not the unavoidable
+        // one-time cost of recording a name for the first time.
+        assert!(guard.should_apply("A", &[]).is_none());
+        assert_eq!(guard.cyclic.len(), 1);
+
+        let before = alloc_probe::current_thread_alloc_count();
+        for _ in 0..999 {
+            assert!(
+                guard.should_apply("A", &[]).is_none(),
+                "a true cycle back-edge must always be refused"
+            );
+        }
+        let after = alloc_probe::current_thread_alloc_count();
+
+        assert_eq!(
+            guard.cyclic.len(),
+            1,
+            "repeat refusals of the same name must not grow the set"
+        );
+        assert_eq!(
+            after,
+            before,
+            "999 repeat refusals of an already-recorded cyclic name allocated {} times; \
+             only the FIRST refusal of a given name may allocate",
+            after - before
+        );
+    }
+
+    #[test]
     fn a_class_chain_past_the_ancestry_limit_does_not_crash() {
         // The ceiling side, and the durable half of round 5 review N2: a
         // chain deep enough to abort the process outright under the OLD,
@@ -4138,6 +5201,34 @@ mod tests {
                 "must not overflow a 2 MiB stack at 250x the ancestry limit — \
                  the depth cap must have bounded native recursion long before this",
             );
+    }
+
+    #[test]
+    fn is_subclass_does_not_reach_further_than_the_shape_walk_does() {
+        // Round 6 review M12: `walk_ancestor_names` had no depth cap while
+        // `collect_class` (via `DiamondGuard`) truncates at
+        // `MAX_ANCESTRY_DEPTH` — so `is_subclass` could approve an upcast to
+        // an ancestor `class_shape` had already truncated away, which is
+        // exactly the "is_subclass says yes, the merged shape says the
+        // field doesn't exist" split the finding describes. A single-parent
+        // chain of `MAX_ANCESTRY_DEPTH + 10` classes puts the root, `C0`,
+        // 9 classes past where the cap already refuses to recurse further
+        // (the boundary tests above pin the cap trips at exactly
+        // `MAX_ANCESTRY_DEPTH` classes deep) — `is_subclass` must agree
+        // with `collect_class` that `C0` is unreachable, not silently walk
+        // further than the shape it is supposed to describe ever does.
+        let n = MAX_ANCESTRY_DEPTH + 10;
+        let mut src = String::from("---@class C0\n---@field item number\n");
+        for i in 1..=n {
+            use std::fmt::Write as _;
+            let _ = writeln!(src, "---@class C{i} : C{}", i - 1);
+        }
+        let env = env_of(&src);
+        assert!(
+            !env.is_subclass(&format!("C{n}"), "C0"),
+            "an ancestor `collect_class` truncates away before reaching must not be \
+             reported reachable by `is_subclass` either"
+        );
     }
 
     #[test]
@@ -4220,6 +5311,102 @@ mod tests {
         );
     }
 
+    /// A [`conflicting_diamond_source`]-shaped group, but with every class
+    /// name given `prefix` so several independent groups can share one file
+    /// without colliding — the "one file, G independently-conflicting
+    /// diamond groups" shape [`MAX_ANCESTRY_RESOLUTIONS`]'s own doc measures
+    /// (round 6 review M3): `MAX_ANCESTRY_DEPTH` bounds one group's
+    /// recursion depth, but says nothing about the *sum* across groups, so
+    /// this is the fixture that actually exercises the total-work budget
+    /// rather than the single-group depth cap.
+    fn conflicting_diamond_group(prefix: &str, k: usize) -> String {
+        use std::fmt::Write as _;
+
+        let mut src = format!("---@class {prefix}A0<T>\n---@field item T\n");
+        for i in 1..=k {
+            let _ = writeln!(
+                src,
+                "---@class {prefix}A{i}<T> : {prefix}A{}<T>, {prefix}A{}<number>",
+                i - 1,
+                i - 1
+            );
+        }
+        src
+    }
+
+    #[test]
+    fn a_k_level_diamond_with_conflicting_bindings_grows_no_worse_than_linearly_with_group_count() {
+        // Round 6 review M3: `a_k_level_diamond_with_conflicting_bindings_resolves_in_bounded_time`
+        // above is a single wall-clock ceiling on ONE group at k=60 — it
+        // asserts nothing about how cost scales with either k or the number
+        // of independently-conflicting groups one file can contain, so a
+        // regression that keeps each individual group's own resolution
+        // O(k²) (removing `MAX_ANCESTRY_RESOLUTIONS`'s cap entirely, or
+        // widening it back past any real bound) would still pass it. This
+        // test is the missing growth assertion.
+        //
+        // Deliberately asserted on `DiamondGuard::resolutions` — a
+        // deterministic count — rather than wall-clock time: a shared,
+        // possibly-contended CI/dev box can make even a fast, correctly-
+        // budgeted resolution take an unpredictable amount of *wall* time
+        // (this file's own `diamond_perf_sweep`/bounded-time tests already
+        // accept that risk for a single, generous ceiling, but a *ratio*
+        // between two separately-timed runs is far more exposed to exactly
+        // that noise). `resolutions` is what the budget in `should_apply`
+        // actually caps, so it is the direct, noise-free way to prove total
+        // work grows with group count and not with each group's own k² —
+        // see `MAX_ANCESTRY_RESOLUTIONS`'s own doc for the CLI wall-clock
+        // numbers this same fixture produces (2.29s → 0.21s for 1 group,
+        // 25.28s → 2.13s for 10, budgeted vs not).
+        let k = 190;
+        let groups = 10;
+        let mut multi_source = String::new();
+        for g in 0..groups {
+            multi_source.push_str(&conflicting_diamond_group(&format!("G{g}_"), k));
+        }
+        let env = env_of(&multi_source);
+
+        let mut total_resolutions: u64 = 0;
+        for g in 0..groups {
+            let mut shape = TableTy::default();
+            let mut guard = DiamondGuard::default();
+            env.collect_class(
+                &format!("G{g}_A{k}"),
+                &[Ty::String],
+                &mut shape,
+                &mut guard,
+                false,
+            );
+            assert!(
+                matches!(shape.fields["item"].ty, Ty::Number | Ty::String),
+                "group {g}'s own resolution must still produce a real field type"
+            );
+            assert!(
+                guard.resolutions <= MAX_ANCESTRY_RESOLUTIONS + 1,
+                "group {g} alone must be capped by the total-work budget: {} resolutions, \
+                 budget {MAX_ANCESTRY_RESOLUTIONS}",
+                guard.resolutions
+            );
+            total_resolutions += guard.resolutions;
+        }
+
+        // The growth assertion itself: G independently-conflicting groups
+        // must cost at most G times one group's own (budget-capped) cost —
+        // linear in group count — never something that also grows with k on
+        // top of that. A regression that widened or removed the per-group
+        // cap would make an individual group's own `resolutions` exceed the
+        // per-group assertion above; a regression that capped correctly
+        // per-group but somehow let cost accumulate ACROSS groups (sharing
+        // one `DiamondGuard`, say) would be caught here instead.
+        let per_group_ceiling = MAX_ANCESTRY_RESOLUTIONS + 1;
+        assert!(
+            total_resolutions <= per_group_ceiling * u64::try_from(groups).unwrap(),
+            "total resolutions across {groups} groups ({total_resolutions}) exceeded \
+             {groups} × the per-group budget ({per_group_ceiling}) — total work is no \
+             longer bounded linearly by group count"
+        );
+    }
+
     /// Not run by default — `cargo test -p luabox-types --lib -- --ignored
     /// --nocapture env::tests::diamond_perf_sweep` prints the k-vs-time
     /// tables round 4 review R1 asked for, plus (round 5 review N36) a
@@ -4235,9 +5422,10 @@ mod tests {
     /// unlike this test, is *not* `#[ignore]`d.
     ///
     /// The range used to stop at k=100 — round 4 review finding 5 found
-    /// that too small to tell O(k) from the `Vec`-memo's actual O(k²)
-    /// apart (both finish in low milliseconds through k=100, so the claim
-    /// was unfalsifiable from this table alone). Extended to k=1600 (release
+    /// that too small to tell `O(k)` from the `Vec`-memo's slower,
+    /// super-linear growth apart (both finish in low milliseconds through
+    /// k=100, so the claim was unfalsifiable from this table alone).
+    /// Extended to k=1600 (release
     /// build; k=3200 stack-overflows on the walk's recursion depth, a
     /// separate, pre-existing limit unrelated to the memo) — measured, this
     /// fixed [`DiamondGuard`]'s `HashSet` memo against a reverted `Vec`-memo
@@ -4249,12 +5437,20 @@ mod tests {
     ///   800    13.16ms                28.12ms
     ///   1600   30.00ms                60.64ms
     ///
-    /// The `HashSet` column roughly doubles per doubling of k (linear); the
-    /// `Vec` column's k=800 and k=1600 points are already ~2x the
-    /// `HashSet` column's and widening. Both totals still include this
-    /// fixture's O(k) source-text parse/harvest cost, which is why the
-    /// `HashSet` column is not perfectly flat-doubling — the memo lookup
-    /// itself is O(1) amortized; the walk around it is inherently O(k).
+    /// The `HashSet` column roughly doubles per doubling of k (linear). The
+    /// `Vec` column grows faster — 2.12x / 3.02x / 2.16x per doubling
+    /// (k=200→400, 400→800, 800→1600) — but that is well short of the ~4x a
+    /// truly quadratic memo would produce over the same doublings (round 6
+    /// review M15: an earlier revision of this comment claimed the gap
+    /// between the two columns was "widening"; measured, the `Vec`/`HashSet`
+    /// ratio is 2.14x at k=800 and 2.02x at k=1600 — flat to slightly
+    /// *shrinking*, not widening). What these four points do show is that
+    /// the `Vec` memo is consistently, non-trivially slower than the
+    /// `HashSet` one across the whole range, not that the gap is
+    /// accelerating. Both totals still include this fixture's O(k)
+    /// source-text parse/harvest cost, which is why the `HashSet` column is
+    /// not perfectly flat-doubling — the memo lookup itself is O(1)
+    /// amortized; the walk around it is inherently O(k).
     #[test]
     #[ignore = "manual measurement, not a CI assertion — see doc comment"]
     fn diamond_perf_sweep() {
@@ -4280,6 +5476,271 @@ mod tests {
             assert_eq!(shape.fields["item"].ty, Ty::Number);
             eprintln!("k={k:<4} lines={:<5} {elapsed:?}", source.lines().count());
         }
+    }
+
+    /// A wide, shallow, **non-conflicting** mixin hierarchy: `width`
+    /// independent 5-deep single-inheritance chains (`Base{i}` ->
+    /// `Lay{i}_1` -> ... -> `Lay{i}_4`), one `Wide` class inheriting every
+    /// chain's deepest link. At `width=120` this is 601 classes total, max
+    /// recursion depth 6, and — the property this fixture exists to pin —
+    /// **zero diamond conflicts anywhere**: every one of the 601 names is
+    /// visited exactly once, by exactly one path. Production readiness
+    /// review F1: the OLD `DiamondGuard::resolutions` counting (every
+    /// surviving `should_apply` arm, first bindings included) put this
+    /// single, entirely legitimate query over any few-hundred budget —
+    /// `MAX_ANCESTRY_RESOLUTIONS`'s own doc comment has the measured before/
+    /// after numbers this fixture produced through `luabox check` itself.
+    fn wide_mixin_source(width: usize) -> String {
+        use std::fmt::Write as _;
+
+        let mut src = String::new();
+        for i in 0..width {
+            let _ = writeln!(src, "---@class Base{i}\n---@field b{i} number");
+            for d in 1..=4 {
+                let prev = if d == 1 {
+                    format!("Base{i}")
+                } else {
+                    format!("Lay{i}_{}", d - 1)
+                };
+                let _ = writeln!(src, "---@class Lay{i}_{d} : {prev}");
+            }
+        }
+        let parents: Vec<String> = (0..width).map(|i| format!("Lay{i}_4")).collect();
+        let _ = writeln!(src, "---@class Wide : {}", parents.join(", "));
+        src
+    }
+
+    #[test]
+    fn a_wide_shallow_non_conflicting_hierarchy_resolves_cleanly_and_cheaply() {
+        // Production readiness review F1's own regression test: before the
+        // fix, `DiamondGuard::resolutions` counted this fixture's ~601
+        // first-ever-binding visits as if they were re-resolutions, tripping
+        // the budget and truncating `Wide`'s shape with a false `LB0317`
+        // even though this hierarchy has no diamond conflict anywhere in it
+        // (measured, merge base: clean, 0.09s). Re-scoping the counter to
+        // only the stale-generation re-resolution arm fixes this by
+        // construction — see `wide_mixin_source`'s own doc comment.
+        let env = env_of(&wide_mixin_source(120));
+
+        let shape = env
+            .class_shape_bound("Wide", &[])
+            .expect("Wide is declared");
+        assert_eq!(
+            shape.fields.len(),
+            120,
+            "every one of the 120 independent mixin chains must contribute its own field \
+             — a truncated walk would merge fewer than all 120"
+        );
+        assert_eq!(
+            shape.fields["b0"].ty,
+            Ty::Number,
+            "a representative field's type must still resolve correctly, not just be present"
+        );
+        assert!(
+            env.take_depth_limit_hits().is_empty(),
+            "a 601-class / depth-6 hierarchy is nowhere near MAX_ANCESTRY_DEPTH"
+        );
+        assert!(
+            env.take_cost_limit_hits().is_empty(),
+            "a hierarchy with zero diamond conflicts must never trip the re-resolution \
+             budget, regardless of how many classes it declares"
+        );
+        assert!(
+            !env.class_ancestry_truncated("Wide"),
+            "Wide's shape must not be recorded as durably truncated either"
+        );
+    }
+
+    #[test]
+    fn a_conflicting_diamond_trips_the_cost_budget_distinctly_from_the_depth_budget() {
+        // Production readiness review F1: `LimitTrip` splits what used to be
+        // one shared `depth_exceeded: Option<String>` field into `Depth` and
+        // `Cost` variants, so a walk that ran out of re-resolution budget
+        // without ever nesting anywhere near `MAX_ANCESTRY_DEPTH` reports as
+        // `LB0319` (cost), not `LB0317` (depth) — reporting one as the other
+        // actively misleads about the fix (flatten the hierarchy vs. remove
+        // a conflicting diamond). k=50 gives `50*49/2 = 1225` re-resolutions
+        // if run to completion — comfortably past `MAX_ANCESTRY_RESOLUTIONS`
+        // (200) — while needing nowhere near 200 levels of `on_path` depth
+        // to get there.
+        let k = 50;
+        let source = conflicting_diamond_source(k);
+        let env = env_of(&source);
+        let root = format!("A{k}");
+
+        // R1 (production readiness measurement) changed what `env_of` alone
+        // already leaves in `take_cost_limit_hits` before the explicit query
+        // below ever runs: `conflicting_diamond_source` is self-referential
+        // (every `Ai<T>` names `A(i-1)` in its own `parents`), so
+        // `TypeEnv::build_from_items`'s discovery pass
+        // (`collect_generic_classes`) resolves a template for every one of
+        // A0..A50 while constructing `env` — and, since that pass's trips
+        // now reach `env`'s own ledger instead of a throwaway discovery env
+        // nobody drained (the exact silent-bypass R1 fixed), every class
+        // from A21 on (the first `i` whose `i(i-1)/2` re-resolution count,
+        // `MAX_ANCESTRY_RESOLUTIONS`'s own doc comment, exceeds 200) is
+        // already a cost-limit hit before `class_shape_bound` below is ever
+        // called. This test's own claim — a pure cost trip drains into
+        // `take_cost_limit_hits`, not the depth queue — is unaffected; only
+        // the exact membership of the drained set grew from "just the
+        // queried root" to "every class construction alone already proved
+        // over budget, plus the queried root" (which construction had
+        // already included, since A50 is itself past the threshold).
+        let mut expected_from_construction: Vec<String> =
+            (21..=k).map(|i| format!("A{i}")).collect();
+        expected_from_construction.sort();
+
+        let shape = env.class_shape_bound(&root, &[Ty::String]);
+        assert!(
+            shape.is_some(),
+            "a cost-budget trip truncates the shape, it does not refuse to produce one"
+        );
+
+        let mut hits = env.take_cost_limit_hits();
+        hits.sort();
+        assert_eq!(
+            hits, expected_from_construction,
+            "a pure cost trip must drain into take_cost_limit_hits, not the depth queue — \
+             expected every class construction's own discovery pass already proved over \
+             budget (A21..=A{k}), the queried root (A{k}) among them"
+        );
+        assert!(
+            env.take_depth_limit_hits().is_empty(),
+            "this walk never approaches MAX_ANCESTRY_DEPTH — it must not also appear as a \
+             depth-limit hit"
+        );
+        assert!(
+            env.class_ancestry_truncated(&root),
+            "the shape is genuinely incomplete regardless of which budget truncated it, so \
+             the durable truncation record must still be set"
+        );
+    }
+
+    #[test]
+    fn a_cost_trip_is_recorded_as_the_cost_variant_not_the_depth_variant() {
+        // Unit-level companion to the end-to-end test above, driving
+        // `DiamondGuard` directly: oscillates one name `"X"` through a
+        // stream of distinct bindings, each new one invalidating (via a
+        // `generation` bump) an earlier one due for a genuine stale
+        // re-resolution on its next visit — the exact re-resolution pattern
+        // `MAX_ANCESTRY_RESOLUTIONS` bounds — entirely at the top level, so
+        // `on_path` never exceeds a handful of entries. Proves `LimitTrip`
+        // picks `Cost`, not `Depth`, purely from which budget actually gave
+        // out, independent of any real class-hierarchy fixture.
+        let mut guard = DiamondGuard::default();
+        let v0 = [Ty::Named("V0".to_string())];
+        guard.visit("X", &v0, |_, _| {});
+        for i in 1..=(MAX_ANCESTRY_RESOLUTIONS + 5) {
+            let vi = [Ty::Named(format!("V{i}"))];
+            // A new distinct binding: bumps `generation`, staling `v0`'s
+            // now-outdated entry — no `resolutions` cost of its own.
+            guard.visit("X", &vi, |_, _| {});
+            // Re-resolving `v0` here is THE re-resolution this budget
+            // counts: `v0` was resolved before, and something else (the
+            // line above) has disagreed with `"X"` since.
+            guard.visit("X", &v0, |_, _| {});
+        }
+
+        assert_eq!(
+            guard.limit_exceeded,
+            Some(LimitTrip::Cost("X".to_string())),
+            "oscillating one name past the resolutions budget, with on_path never nested, \
+             must trip the COST budget, attributed to the name whose visit was refused"
+        );
+        assert!(
+            guard.on_path.len() < 5,
+            "this scenario never nests — a cost trip must not incidentally look like a depth \
+             trip by way of a deep on_path"
+        );
+    }
+
+    #[test]
+    fn a_walk_with_exactly_the_resolution_budget_completes_cleanly() {
+        // R3 (production readiness issue): the depth budget has an adjacent
+        // pair pinning exactly-at-limit (clean) vs one-past (reports) —
+        // `class_ancestry_depth_limit.rs`'s
+        // `a_chain_exactly_at_the_ancestry_limit_reads_the_root_field_with_no_diagnostics`
+        // / `a_chain_one_class_past_the_ancestry_limit_is_reported_at_the_integration_level`,
+        // added for round 6 review M64 after exactly this class of
+        // regression (`>=` silently weakening from `>`) slipped past every
+        // other test. The cost budget had nothing equivalent —
+        // `should_apply`'s `if self.resolutions > MAX_ANCESTRY_RESOLUTIONS`
+        // could weaken to `>=` and nothing here would notice. A Lua fixture
+        // cannot pin this boundary directly: `conflicting_diamond_source(k)`'s
+        // resolutions count is the triangular number `k(k-1)/2`
+        // (`MAX_ANCESTRY_RESOLUTIONS`'s own doc comment), which never lands
+        // on `MAX_ANCESTRY_RESOLUTIONS` for any integer `k` — so, like the
+        // test above, this oscillates one name directly through
+        // `DiamondGuard::visit` instead, which can hit any exact count.
+        let mut guard = DiamondGuard::default();
+        let v0 = [Ty::Named("V0".to_string())];
+        guard.visit("X", &v0, |_, _| {});
+        for i in 1..=MAX_ANCESTRY_RESOLUTIONS {
+            let vi = [Ty::Named(format!("V{i}"))];
+            // A new distinct binding: bumps `generation`, staling `v0`'s
+            // now-outdated entry — no `resolutions` cost of its own.
+            guard.visit("X", &vi, |_, _| {});
+            // Re-resolving `v0` here is the one re-resolution this
+            // iteration counts.
+            guard.visit("X", &v0, |_, _| {});
+        }
+
+        assert_eq!(
+            guard.resolutions, MAX_ANCESTRY_RESOLUTIONS,
+            "the oscillation must have driven exactly the budgeted number of \
+             re-resolutions, not one more or fewer"
+        );
+        assert_eq!(
+            guard.limit_exceeded, None,
+            "exactly MAX_ANCESTRY_RESOLUTIONS re-resolutions must not trip the guard — \
+             `should_apply`'s check is `self.resolutions > MAX_ANCESTRY_RESOLUTIONS`, \
+             which is false at equality"
+        );
+    }
+
+    #[test]
+    fn a_walk_with_one_more_resolution_than_the_budget_trips_the_cost_limit() {
+        // The adjacent case: one more oscillation than the test above — the
+        // smallest walk the guard must refuse. Paired with the test above
+        // the same way `class_ancestry_depth_limit.rs`'s pair is: the exact
+        // transition is now pinned by two adjacent assertions, not one
+        // boundary and a gap a `>`-to-`>=` weakening could hide in.
+        let mut guard = DiamondGuard::default();
+        let v0 = [Ty::Named("V0".to_string())];
+        guard.visit("X", &v0, |_, _| {});
+        for i in 1..=(MAX_ANCESTRY_RESOLUTIONS + 1) {
+            let vi = [Ty::Named(format!("V{i}"))];
+            guard.visit("X", &vi, |_, _| {});
+            guard.visit("X", &v0, |_, _| {});
+        }
+
+        assert_eq!(
+            guard.resolutions,
+            MAX_ANCESTRY_RESOLUTIONS + 1,
+            "the oscillation must have driven exactly one more than the budgeted number \
+             of re-resolutions"
+        );
+        assert_eq!(
+            guard.limit_exceeded,
+            Some(LimitTrip::Cost("X".to_string())),
+            "the smallest walk that re-resolves one more than the budget must trip the \
+             cost limit — the guard's boundary moved"
+        );
+
+        // Wire the trip through to the report queue too, matching the
+        // integration-level assertion the depth-side boundary pair carries
+        // (`class_ancestry_depth_limit.rs`'s pair asserts on `LB0317`
+        // itself via `check_file`; there is no equivalent Lua fixture here
+        // to drive `check_file` with, so this asserts the same wiring one
+        // level down, directly against the ledger `report_cost_limit_hits`
+        // drains).
+        let env = env_of("");
+        env.note_limit_trip(&guard, "Root");
+        assert_eq!(env.take_cost_limit_hits(), vec!["Root".to_string()]);
+        assert!(
+            env.take_depth_limit_hits().is_empty(),
+            "a pure cost trip at the exact boundary must not also file as a depth hit"
+        );
     }
 
     #[test]
@@ -4497,6 +5958,34 @@ local Color = { blue = 2 }
     }
 
     #[test]
+    fn a_same_file_duplicate_enum_declaration_is_also_first_wins() {
+        // Round 6 review M53: `absorb_block`'s `Tag::Enum` arm used to
+        // `insert` unconditionally, so a same-FILE duplicate `---@enum` was
+        // last-wins — the one axis in this block that disagreed with every
+        // other same-file duplicate-declaration rule (fields, methods,
+        // indexers, visibility, parents, operators, type params all keep
+        // the first) and with `merging_enums_is_first_wins` just above,
+        // which already pins the identical rule for the CROSS-file seam.
+        // "The file boundary does not change the merge" only held here by
+        // accident of which seam a duplicate happened to cross.
+        let env = env_of(
+            "\
+---@enum Color
+local Color = { red = 1 }
+---@enum Color
+local Color2 = { blue = 2 }
+",
+        );
+        let members = env.enum_members("Color").expect("enum declared");
+        assert_eq!(
+            members,
+            vec![("red".to_string(), Ty::NumberLit("1".into()))],
+            "the first same-file `---@enum Color` declaration must win, matching the \
+             cross-file rule and every other duplicate-declaration axis in this file"
+        );
+    }
+
+    #[test]
     fn a_file_surface_carries_its_enum_definitions() {
         let types = surface(
             "\
@@ -4587,6 +6076,72 @@ local Flags = { on = true, off = false, none = nil }
     }
 
     // --- carriers & standalone visibility --------------------------------
+
+    #[test]
+    fn a_same_file_duplicate_standalone_visibility_is_first_wins_like_cross_file() {
+        // Round 6 review M6: `absorb_standalone_visibility` used to write
+        // unconditionally, so two standalone visibility blocks for one
+        // member in ONE file were last-wins, while `merge_file_types`'s
+        // identical cross-file case already routed through `member_wins`
+        // and was first-wins — one member kind deciding its own precedence
+        // two different ways depending on which side of a file boundary the
+        // duplicate landed on. `---@private` is declared first here; a
+        // last-wins bug reports `protected`.
+        let env = env_of(
+            "\
+---@class Solo
+local Solo = {}
+---@private
+function Solo:hide() end
+---@protected
+function Solo:hide() end
+",
+        );
+        let def = env.classes.get("Solo").expect("class declared");
+        assert_eq!(
+            def.visibility.get("hide"),
+            Some(&FieldScope::Private),
+            "the FIRST standalone visibility declaration must win, matching \
+             merge_file_types's cross-file rule for the identical duplicate"
+        );
+    }
+
+    #[test]
+    fn a_same_file_duplicate_carrier_method_is_first_wins() {
+        // Round 6 review M7: `absorb_carrier_members` used to write
+        // unconditionally, so a package declaring one carrier member twice
+        // in ONE file published the LAST signature — the identical defect
+        // as M6, one member kind over. Two `function Widget.get()`
+        // attachments with different `---@return` types; only a real
+        // first-wins rule keeps the first one's `string`.
+        let (env, _) = TypeEnv::build_ambient(&[{
+            let source = "\
+---@class Widget
+local M = {}
+---@return string
+function M.get() end
+---@return number
+function M.get() end
+";
+            let parsed = parse(source, Dialect::Lua54);
+            assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
+            let items = luacats::harvest(&parsed);
+            (parsed, items)
+        }]);
+        let def = env.classes.get("Widget").expect("class declared");
+        let Some(FieldTy {
+            ty: Ty::Function(sig),
+            ..
+        }) = def.methods.get("get")
+        else {
+            panic!("`get` must be folded in as a carrier method: {def:?}");
+        };
+        assert_eq!(
+            sig.returns,
+            vec![Ty::String],
+            "the FIRST carrier attachment's signature must win, not the last"
+        );
+    }
 
     #[test]
     fn a_global_assignment_carrier_maps_back_to_its_class() {
@@ -4968,6 +6523,64 @@ function partial(a, b) end
                 .collect::<Vec<_>>(),
             Vec::<String>::new(),
             "a correctly-typed field must be accepted once Box<number> resolves"
+        );
+    }
+
+    #[test]
+    fn a_file_that_never_names_an_ambient_generic_class_skips_the_discovery_pass() {
+        // Round 6 review M56: the pre-scan used to ask "does a generic class
+        // exist ANYWHERE" (file or ambient) — one generic class in ambient
+        // re-armed the full discovery-and-resolve pass for every file in the
+        // project, whether or not that file ever wrote the class's name at
+        // all. This file's annotations never mention `Box` in any form (no
+        // `Box<...>`, no bare `Box`), so the fixed, file-scoped scan must
+        // find nothing to build a template for, regardless of the ambient's
+        // own generic class — proven directly against
+        // `collect_generic_classes`'s own return value, not just indirectly
+        // through a diagnostic outcome.
+        let ambient = pure_generic_ambient();
+        let parsed = parse("---@type string\nlocal unrelated = \"x\"\n", Dialect::Lua54);
+        assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
+        let items = luacats::harvest(&parsed);
+        let root = parsed.syntax();
+        let mut decl = Declared::default();
+        for name in ambient.env.classes.keys() {
+            decl.classes.insert(name.clone());
+        }
+        decl.absorb_tags(&items);
+        let templates =
+            collect_generic_classes(&items, &root, Some(&ambient), &decl, &TypeEnv::default());
+        assert!(
+            templates.is_empty(),
+            "a file that never names the ambient's generic class must skip building a \
+             template for it: {templates:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_reference_to_an_ambient_generic_class_still_builds_its_template() {
+        // The other half of M56: the fix must not go too far — a file that
+        // names the ambient generic class at all, even a BARE reference with
+        // no `<Args>`, still needs `generic_classes` populated (`lower_named`
+        // checks the same name regardless of whether the reference carries
+        // arguments), so the scan must not narrow to "written with `<...>`
+        // only".
+        let ambient = pure_generic_ambient();
+        let parsed = parse("---@type Box\nlocal b\n", Dialect::Lua54);
+        assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
+        let items = luacats::harvest(&parsed);
+        let root = parsed.syntax();
+        let mut decl = Declared::default();
+        for name in ambient.env.classes.keys() {
+            decl.classes.insert(name.clone());
+        }
+        decl.absorb_tags(&items);
+        let templates =
+            collect_generic_classes(&items, &root, Some(&ambient), &decl, &TypeEnv::default());
+        assert!(
+            templates.contains_key("Box"),
+            "a bare reference to a generic ambient class must still trigger its template: \
+             {templates:?}"
         );
     }
 }

@@ -25,11 +25,31 @@ to construct two genuinely different candidates (nothing to disagree about)
 is marked **N/A**; a cell where the checker's output cannot be attributed to
 either candidate — it names neither — is marked **unobservable**.
 
-The full fixture corpus (every Lua source file), raw JSON verdicts from both
-binaries, and the current/develop diff live in the scratch report this page
-was built from — `merge-matrix.md`, produced alongside this page but not
-committed to the repository. Every cell in the tables below names its
-fixture id so the corpus can be turned into table-driven tests directly.
+Every cell in the tables below names its fixture id, and every fixture id is
+a variant of `crates/luabox-types/tests/class_merge_precedence_matrix.rs`'s
+`CELLS` array — the actual Lua source, the actual `(code, message)`
+diagnostics measured for it, and (for the cells this section discusses) both
+binaries' outputs are that file's own content, not a separate corpus this
+page summarizes secondhand. Round 6 review M42: an earlier edition of this
+paragraph cited a `merge-matrix.md` "scratch report this page was built
+from" as the provenance for both the doc and the test file; it was never
+committed (`find . -name 'merge-matrix*'` returns nothing), so neither this
+page nor the 1883-line test could be re-derived or audited by anyone who
+did not already trust whoever wrote them. There is now exactly one fixture
+corpus, and a real, committed, re-runnable way to measure it:
+`class_merge_precedence_matrix.rs`'s `regen_merge_matrix_provenance`
+(`#[ignore]`d — it shells out to a real `luabox check` subprocess rather
+than this crate's own code, so it does not belong in the default `cargo
+test` run) runs every `CELLS` variant through an actual release binary and
+writes what it measured to `docs/03-reference/merge-matrix-provenance.md`,
+optionally against a second binary (`LUABOX_DEVELOP_BIN`) for a genuine
+current-vs-develop diff — see that test's doc comment for the exact command.
+`merge-matrix-provenance.md` in this directory is that command's own
+committed output, last regenerated against this page's `current` and a
+release binary built at `git merge-base HEAD origin/develop`
+(`210700e24283d25b5c74bcf98fbdb750f425b398`); it, not this paragraph, is the
+citable source for every "measured" and "confirmed by direct measurement"
+claim below.
 
 ## Arrival shapes
 
@@ -45,15 +65,34 @@ fixture id so the corpus can be turned into table-driven tests directly.
 
 ## Findings — read this first
 
-**No undeclared current-vs-develop regression was found.** Every place the
-two binaries disagree is `develop`'s diamond guard / parent-argument
-substitution leaking a class's own type-parameter name (`V`, `T`) into the
-diagnostic instead of resolving it — `current` fixes all of them, and every
-one is covered by an existing `CHANGELOG.md` Unreleased entry ("A
-`---@class Sub : Base<number>` binds its parent's type parameter", "A
-generic `---@class`'s type parameters are scoped to the declaration that
+**One undeclared current-vs-develop regression was found: visibility's
+unrelated-parents shape flips which parent's scope is enforced, and the
+direction that ships silently is the dangerous one.** Round 6 review M40
+re-measured `---@class P1` / `---@field private x number`, `---@class P2` /
+`---@field x number` (no visibility at all — public), `---@class C : P1,
+P2`, `local y = c.x` against both binaries
+(`docs/03-reference/merge-matrix-provenance.md`): `current` (first-listed —
+finding 4 below) reads `P1` and correctly reports `LB0312`, refusing the
+read; `develop` (last-listed) reads `P2` and reports nothing at all — a
+member one parent declared `private` is silently exposed as public the
+moment an unrelated second parent that does not restrict it is listed
+second. That is a real winner reversal with a real consequence (a private
+member becomes externally readable with no diagnostic), not a cosmetic
+difference, and it was not named in `CHANGELOG.md` or anywhere else before
+this correction. See finding 4's matrix row for the narrower, both-error
+fixture (`private` vs. `protected`) this page originally measured, which
+disagrees on *which* class is named in the error but not on whether one
+fires — the public-vs-private fixture above is the one that shows the
+silent-acceptance direction plainly.
+
+Every *other* place the two binaries disagree is `develop`'s diamond guard /
+parent-argument substitution leaking a class's own type-parameter name (`V`,
+`T`) into the diagnostic instead of resolving it — `current` fixes all of
+them, and every one is covered by an existing `CHANGELOG.md` Unreleased
+entry ("A `---@class Sub : Base<number>` binds its parent's type parameter",
+"A generic `---@class`'s type parameters are scoped to the declaration that
 writes them", "Indexer precedence now follows one measured rule per seam").
-None of these are winner *reversals* — `develop` never produces an
+None of *these* are winner *reversals* — `develop` never produces an
 observable winner for these cells; it names a type variable, not one of the
 two candidate values.
 
@@ -255,8 +294,9 @@ Legend: **first** = first declaration / first-listed parent / first-visited
 ancestry edge wins. **last** = last declaration / last-listed parent /
 last-visited edge wins. **scan** = every value is kept and the first one
 whose shape matches at the use site wins (operators only). "Fixture id"
-names the project in `merge-matrix.md` (and `fixtures*.json` next to it)
-that this cell was measured with.
+names the variant in `crates/luabox-types/tests/class_merge_precedence_matrix.rs`'s
+`CELLS` array that this cell was measured with — see this page's provenance
+paragraph above for how to reproduce every measurement in this file.
 
 ### `---@field`
 
@@ -264,12 +304,53 @@ that this cell was measured with.
 |---|---|---|---|
 | single | resolves (baseline) | yes | `field-A-single` |
 | dup-same-file | **first** declaration (+ `LB0311` warning) | yes | `field-B-absorb-block-dup-same-file` |
-| dup-cross-file | **first**-processed file | yes | `field-C-merge-file-types-dup-cross-file` (+ `-reversed`) |
-| unrelated-parents | **first**-listed parent (finding 6, fixed: was last-listed — see Findings) | **no** — this rule is `current`-only, and is a correction against luals rather than against `develop`: `develop` also resolved last-listed, matching luals 3.13.5's own `compiler.lua:369-375`/`424` (confirmed by direct measurement against the pinned binary) is what changed, not this page's earlier `develop` comparison | `field-D-unrelated-parents` (+ `-swapped`) |
+| dup-cross-file | **first**-processed file | yes | `field-C-merge-file-types-dup-cross-file`, `field-C-merge-file-types-dup-cross-file-reversed` |
+| unrelated-parents | **first**-listed parent (finding 6, fixed: was last-listed — see Findings) | **no** — `develop` is **last**-listed, the opposite of `current` and of luals (round 6 review M41 correction: an earlier edition of this cell read as "develop … matching luals", which is backwards). `develop` resolves the identical last-listed rule `current` had before finding 6's fix; luals 3.13.5 resolves first-listed (`compiler.lua:369-375`/`424`, confirmed by direct measurement against the pinned binary) and `current` now matches it. What changed this round is `current`'s own rule, brought into line with luals — not this page's earlier `develop` comparison, which was already correctly "no". See `docs/03-reference/02-limitations.md`'s "Correction" note for the same fact stated in prose, and `merge-matrix-provenance.md` for both binaries' raw output on this fixture | `field-D-unrelated-parents`, `field-D-unrelated-parents-swapped` |
 | diamond-identical | resolves to the agreed value | **no** — develop leaks the raw type-parameter name instead of resolving (declared fix, see Findings) | `field-E-diamond-identical-binding` |
-| diamond-conflicting | **last**-visited ancestry edge | **no** — develop unobservable (leaks raw name); current confirmed both directions | `field-F-diamond-conflicting-binding` (+ `-swapped`) |
+| diamond-conflicting | **last**-visited ancestry edge | **no** — develop unobservable (leaks raw name); current confirmed both directions | `field-F-diamond-conflicting-binding`, `field-F-diamond-conflicting-binding-swapped` |
 | bound-vs-bare (bound half) | parent argument substitutes correctly | **no** — develop never binds it (declared fix) | `field-G-generic-bound-vs-bare` |
 | bound-vs-bare (bare half) | stays free; reads `unknown` in diagnostic text (finding 5, fixed: used to leak the literal parameter name) | **no** — develop still leaks the raw name, this rule is `current`-only | `field-G-generic-bound-vs-bare` |
+
+**Why `unrelated-parents` and `diamond-conflicting` answer "who wins?"
+differently for the identical syntax `C : A, B` (round 6 review M54).** Read
+the two rows above side by side and they look like a contradiction:
+unrelated-parents resolves **first**-listed, diamond-conflicting resolves
+**last**-visited, and both are triggered by writing `---@class C : A, B`.
+The difference is not the syntax — it is what `A` and `B` are contributing:
+
+- **unrelated-parents** (`field-D-unrelated-parents`): `A` and `B` each
+  declare `x` *themselves* — two independent, unrelated declarations that
+  happen to share a name. `C`'s two parents are peers with nothing in
+  common but the key. This is exactly the shape lua-language-server 3.13.5
+  resolves (`script/vm/compiler.lua:369-375`/`424`), and it resolves it
+  first-listed — so luabox matches it, first-listed, because there is an
+  oracle here and this page's whole purpose is to be a drop-in for it
+  (finding 6).
+- **diamond-conflicting** (`field-F-diamond-conflicting-binding`): `A` and
+  `B` declare *nothing themselves* — both are `: Base<V>`, binding the
+  *same inherited* generic ancestor's `item` field to different type
+  arguments (`A : Base<number>`, `B : Base<string>`). `C`'s two parents are
+  not peers; they are two different bindings of one shared ancestor reached
+  twice. lua-language-server 3.13.5 has no generic classes at all — there is
+  no `Base<V>` for it to bind two ways, so there is no oracle to check this
+  rule against, unlike unrelated-parents. It resolves last-visited because
+  that is the ancestry walk's own natural order (the last binding of a
+  repeatedly-reached ancestor overwrites the earlier one), not because
+  anyone chose it to mirror or oppose the unrelated-parents rule.
+
+**The split is intended, and it is expected to survive** — not a staging
+post waiting to be unified. Forcing these two rules to agree would mean
+picking one of two bad options: either make luabox disagree with luals on
+the shape luals *does* have (unrelated-parents), or invent a "matching"
+answer for the shape luals *cannot express* (diamond-conflicting) with
+nothing to check it against. Reasoning "the table should be symmetric, so
+whichever rule is newer should adopt the older one's direction" — with no
+per-shape oracle check — is the exact mistake that produced round 5's
+regression (last-wins was extended from a real cell to cells that had never
+been measured against luals at all). If a future change ever proposes
+unifying these two rows, the question to ask is not "does this look more
+consistent" — it is "does lua-language-server have this shape, and if so,
+what does it do."
 
 ### Method (carrier-attached: `function Class:method()`)
 
@@ -277,10 +358,11 @@ that this cell was measured with.
 |---|---|---|---|
 | single | resolves (baseline) | yes | `method-A-single` |
 | dup-same-file (two carriers, one class) | **first**-declared carrier, in statement order | yes | `method-B-two-carriers-same-file` |
-| dup-cross-file | **first**-processed file, matching every other member kind's dup-cross-file rule (finding 2, fixed: was unobservable — both binaries used to type the call `unknown`) | **no** — develop still unobservable, this rule is `current`-only | `method-C-merge-file-types-cross-file` (+ `-reversed`), zero-dup repro: `method-cross-file-signature-gap` (+ field control) |
-| unrelated-parents | **first**-listed parent, matching field-D (finding 1 fixed the N/A gap — `LB0306` regardless of order; finding 6 then flipped the winner from last-listed to first-listed, same root cause and same fix as field-D) | **no** — this rule is `current`-only for the same reason as field-D: luals resolves the first-listed parent (compiler.lua:369-375, and the method/carrier lookup runs inside the identical `searchClass` recursion the `extends` walk drives, so it is subject to the same gate — see Findings) | `method-D-unrelated-parents` (+ `-swapped`), repro: `method-inheritance-gap-same-file` (+ cross-file control) |
+| dup-cross-file | **first**-processed file, matching every other member kind's dup-cross-file rule (finding 2, fixed: was unobservable — both binaries used to type the call `unknown`) | **no** — develop still unobservable, this rule is `current`-only | `method-C-merge-file-types-cross-file`, `method-C-merge-file-types-cross-file-reversed`, zero-dup repro: `method-cross-file-signature-gap`, `method-cross-file-signature-gap-field-control` |
+| unrelated-parents | **first**-listed parent, matching field-D (finding 1 fixed the N/A gap — `LB0306` regardless of order; finding 6 then flipped the winner from last-listed to first-listed, same root cause and same fix as field-D) | **no** — this rule is `current`-only for the same reason as field-D: luals resolves the first-listed parent (compiler.lua:369-375, and the method/carrier lookup runs inside the identical `searchClass` recursion the `extends` walk drives, so it is subject to the same gate — see Findings) | `method-D-unrelated-parents`, `method-D-unrelated-parents-swapped`, repro: `method-inheritance-gap-same-file`, `method-inheritance-cross-file-control` |
 | diamond-identical | resolves to the agreed value (finding 1, fixed: was N/A, same reason) | **no** — develop still N/A | `method-E-diamond-identical` |
-| diamond-conflicting | **N/A** — methods carry no type parameter to bind two ways. The substitute test this row used to pin (declaration overriding an inherited attachment) was retired: that shape is not actually a diamond-conflict at all — it is two *unrelated* parents (one inheriting a carrier attachment, the other declaring its own field), so finding 6 governs it, and it now resolves first-listed-wins like every other unrelated-parents cell, not "declaration always wins" | yes | `method-F-diamond-conflicting-unrelated-ancestor-declaration` |
+| diamond-conflicting | **N/A** — methods carry no type parameter to bind two ways | — | — |
+| unrelated-ancestor-declaration-vs-attachment (finding 6 repro; round 6 review M44) | **first**-listed parent wins, matching `unrelated-parents` above. The substitute test the `diamond-conflicting` row used to pin here (declaration overriding an inherited attachment) was retired: measured, that shape is not actually a diamond-conflict at all — it is two *unrelated* parents (one inheriting a carrier attachment, the other declaring its own field), so finding 6 governs it, and it resolves first-listed-wins like every other unrelated-parents cell, not "declaration always wins". Kept as its own row rather than folded into `unrelated-parents` because it exercises the field/method key-locking boundary (B's own `---@field` is never even visited) that the plain unrelated-parents fixture does not | yes | `method-F-diamond-conflicting-unrelated-ancestor-declaration` |
 | declaration-vs-attachment (same name, same class) | `---@field` declaration's type wins over the carrier attachment | yes | `method-G-field-declaration-beats-attachment` |
 
 ### Indexer (`---@field [K] V`)
@@ -288,11 +370,11 @@ that this cell was measured with.
 | Arrival shape | Winner | Same in develop? | Fixture id |
 |---|---|---|---|
 | single | resolves (baseline) | yes | `indexer-A-single` |
-| dup-same-file | **first** declaration, silently (no warning, unlike named fields) | yes | `indexer-B-absorb-block-dup-same-file` |
+| dup-same-file | **first** declaration, plus `LB0311` — same as named fields (round 6 review M11; luals 3.13.5 reports `duplicate-doc-field` here too, measured) | no — develop resolved this identically but reported nothing | `indexer-B-absorb-block-dup-same-file` |
 | dup-cross-file | **first**-processed file | yes | `indexer-C-merge-file-types-dup-cross-file` |
-| unrelated-parents | **first**-listed parent | yes | `indexer-D-unrelated-parents` (+ `-swapped`) |
+| unrelated-parents | **first**-listed parent | yes | `indexer-D-unrelated-parents`, `indexer-D-unrelated-parents-swapped` |
 | diamond-identical | resolves to the agreed value | **no** — develop leaks raw name (declared fix) | `indexer-E-diamond-identical-binding` |
-| diamond-conflicting | **last**-visited ancestry edge | **no** — develop unobservable; current confirmed both directions | `indexer-F-diamond-conflicting-binding` (+ `-swapped`) |
+| diamond-conflicting | **last**-visited ancestry edge | **no** — develop unobservable; current confirmed both directions | `indexer-F-diamond-conflicting-binding`, `indexer-F-diamond-conflicting-binding-swapped` |
 | bound-vs-bare (bound half) | substitutes correctly | **no** — develop never binds it (declared fix) | `indexer-G-generic-bound-vs-bare` |
 | bound-vs-bare (bare half) | reads `unknown` (finding 5, fixed: used to leak the literal parameter name) | **no** — develop still leaks the raw name, this rule is `current`-only | `indexer-G-generic-bound-vs-bare` |
 
@@ -360,9 +442,9 @@ accumulation matches.
 | single | resolves (baseline) — luals parity: both scan the class's own declared overloads | yes | `operator-A-single` |
 | dup-same-file | **first** overload matched by the "first input that accepts" scan (#114) — luals parity, same scan mechanism (`checkOperators`, `operator.lua:66-95`) | yes | `operator-B-absorb-block-dup-same-file` |
 | dup-cross-file | **first**-processed file's overload, same scan mechanism — luals parity | yes | `operator-C-merge-file-types-dup-cross-file` |
-| unrelated-parents | **first**-listed parent — luabox-only extension, no luals rule to match (see above) | yes | `operator-D-unrelated-parents` (+ `-swapped`) |
+| unrelated-parents | **first**-listed parent — luabox-only extension, no luals rule to match (see above) | yes | `operator-D-unrelated-parents`, `operator-D-unrelated-parents-swapped` |
 | diamond-identical | resolves to the agreed value — luabox-only extension, no luals rule to match | **no** — develop leaks raw name (declared fix) | `operator-E-diamond-identical-binding` |
-| diamond-conflicting | **last**-visited ancestry edge — internally consistent with field/indexer's rule for the identical shape (finding 3, fixed: was first-visited), confirmed both directions, but luabox-only: no luals rule to match | **no** — develop unobservable (leaks raw name in both checks, not just one) | `operator-F-diamond-conflicting-binding` (+ `-swapped`) |
+| diamond-conflicting | **last**-visited ancestry edge — internally consistent with field/indexer's rule for the identical shape (finding 3, fixed: was first-visited), confirmed both directions, but luabox-only: no luals rule to match | **no** — develop unobservable (leaks raw name in both checks, not just one) | `operator-F-diamond-conflicting-binding`, `operator-F-diamond-conflicting-binding-swapped` |
 | bound-vs-bare | not separately fixtured; substitution follows the same `collect_operators` binding as fields/indexers — luabox-only extension | — | — |
 
 ### Type parameter (a class's own `<T, U, ...>` list)
@@ -381,8 +463,8 @@ accumulation matches.
 |---|---|---|---|
 | single | enforces (baseline) | yes | `visibility-A-single-private` |
 | dup-same-file, conflicting scopes | **first** declaration wins **atomically** with the field itself — the second `---@field` line is skipped whole, scope included, before its own scope is ever read | yes | `visibility-B-absorb-block-conflicting-scopes` |
-| dup-cross-file, conflicting scopes | **first**-processed file | yes | `visibility-C-merge-file-types-conflicting-scopes` (+ `-reversed`) |
-| unrelated-parents, conflicting scopes | **first**-listed parent — matches indexer/operator's first-listed rule for the identical shape (finding 4, fixed: was last-listed via a LIFO `walk_ancestor_names` stack pop order; the stack now pushes reversed, so ordinary declaration-order traversal decides it, the same left-to-right rule every other seam in this document already reads for "first") | yes | `visibility-D-unrelated-parents-conflicting-scope` (+ `-swapped`) |
+| dup-cross-file, conflicting scopes | **first**-processed file | yes | `visibility-C-merge-file-types-conflicting-scopes`, `visibility-C-merge-file-types-conflicting-scopes-reversed` |
+| unrelated-parents, conflicting scopes | **first**-listed parent — matches indexer/operator's first-listed rule for the identical shape (finding 4, fixed: was last-listed via a LIFO `walk_ancestor_names` stack pop order; the stack now pushes reversed, so ordinary declaration-order traversal decides it, the same left-to-right rule every other seam in this document already reads for "first") | **no** (round 6 review M40, re-measured — an earlier edition of this cell said "yes"; it was checked only on a fixture where both parents restrict the member, so the flip only changed *which* class's error fires, not *whether* one does) — `develop` is **last**-listed, not first: on `private` (P1, first-listed) vs. `protected` (P2, last-listed), `current` reports `LB0312` naming `P1`, `develop` reports `LB0312` naming `P2`; on `private` (P1) vs. no visibility at all (P2, public, last-listed), `current` still correctly refuses the read and `develop` silently allows it with no diagnostic at all — the dangerous direction, since a member one parent declared `private` becomes externally readable. See the Findings section above for the worked example and both binaries' full output | `visibility-D-unrelated-parents-conflicting-scope`, `visibility-D-unrelated-parents-conflicting-scope-swapped` |
 | diamond, same owner reached twice | unambiguous — both edges reach the identical declaration, nothing to arbitrate | yes | `visibility-E-diamond-identical-owner` |
 | diamond-conflicting | **N/A** — visibility isn't parameterized by generic arguments, so a diamond cannot bind it two different ways | — | — |
 

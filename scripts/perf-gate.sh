@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # SPEC.md §16.1 perf gates (CI-blocking): cold start < 50 ms; `check` on a
 # 100-kLOC corpus < 1 s warm (LSP keystroke-to-diagnostics gate is future
-# work, not covered here).
+# work, not covered here). The §16.1 "<1s" figure is the ORIGINAL
+# acceptance target; CHECK_BUDGET_BASE_MS (perf-gate-budgets.env) no longer
+# equals it — see the Env: block below and that file's own comment for why.
 #
 # Gates: cold start, `fmt --check` throughput (kept as a wider safety
 # net), the real `check` gate (live since GL#6), a diagnostics-heavy
@@ -36,6 +38,30 @@
 #                        this; if a dev's machine can't hit 1.0, that's a
 #                        machine problem, not evidence the gate is wrong.
 #                        Example: LUABOX_PERF_FACTOR=3 scripts/perf-gate.sh
+#
+#                        #58 review round 6, M37: that stance only holds if
+#                        the FACTOR=1.0 budgets themselves are honest about
+#                        a normal machine's real cost. They were not:
+#                        CHECK_BUDGET_BASE_MS was 1000 ms (SPEC.md §16.1's
+#                        acceptance figure, restated verbatim as a budget)
+#                        against a measured 2279-2981 ms `check` on this
+#                        box, factor 1.0, five runs, every one a FAIL on a
+#                        correct, unmodified checkout — passing in CI only
+#                        because ci.yml sets LUABOX_PERF_FACTOR=4.0.
+#                        DIAG_CHECK_BUDGET_BASE_MS was flaky the same way
+#                        (1 FAIL in 5 runs, 1863 ms against a 1500 ms
+#                        budget). Fixed here as (a): rebase the FACTOR=1.0
+#                        budgets on real measurement with stated headroom
+#                        (perf-gate-budgets.env's own comments carry the
+#                        numbers), not (b) change what FACTOR=1.0 means by
+#                        machine-detecting a default — this repo's runtimes
+#                        do not auto-detect their own environment to decide
+#                        whether to enforce a bound, and a gate whose
+#                        pass/fail line moves with undetected host speed is
+#                        a worse surprise than a budget that was simply
+#                        wrong. The quote above still holds for a genuinely
+#                        slow or loaded machine; it no longer has to cover
+#                        for a stale constant too.
 #   LUABOX_RSS_BUDGET_MIB
 #                        integer ceiling (MiB) for the peak-RSS leg.
 #                        Default 300. Deliberately NOT scaled by
@@ -74,38 +100,26 @@ source "$repo_root/scripts/perf-gate-lib.sh"
 
 factor="${LUABOX_PERF_FACTOR:-1.0}"
 
-cold_start_budget_base_ms=50
-fmt_budget_base_ms=2000
-check_budget_base_ms=1000
-# Diagnostics-heavy legs, on one file holding `diag_corpus_findings`
-# findings. Calibrated on the dev baseline (see CHANGELOG "Fixed", wave 8):
-#   lint   357 ms fixed / 14 163 ms with the quadratic lookup restored
-#   check  663 ms fixed /  4 183 ms ditto
-# The budgets sit ~3x above the fixed numbers (headroom for a noisy box,
-# on top of LUABOX_PERF_FACTOR) and ~3-12x below the broken ones.
-diag_lint_budget_base_ms=1200
-diag_check_budget_base_ms=1500
-# The same two corpora with nothing suppressed, so every finding is also
-# *rendered*. Calibrated the same way (dev baseline, 20 k findings):
-#   lint   162 ms fixed /  9 295 ms with the quadratic renderer restored
-#   check  788 ms fixed / 15 462 ms ditto
-# Budgets ~3x above the fixed numbers and >=6x below the broken ones.
-# Rendered `lint` is *faster* than the suppressed leg above because
-# resolving 20 k `---@luabox-ignore` directives costs more than printing
-# 20 k frames — the suppressed leg is not a subset of this one, which is
-# why both stay.
-diag_lint_rendered_budget_base_ms=600
-diag_check_rendered_budget_base_ms=2400
-diag_corpus_findings=20000
-# Peak-RSS ceiling for `check` on the 100-kLOC corpus, in MiB. decisions/07
-# accepted 64 -> 123 MiB; measured 123 MiB (three runs, identical) on the dev
-# baseline, so the budget sits at ~2.4x that. Wide on purpose: this is a
-# ceiling that catches a *regime* change (a whole-project structure retained,
-# a per-file clone that used to be a borrow), not a 10% drift — allocator
-# behaviour and page-cache pressure vary too much between machines for a tight
-# memory gate to mean anything. NOT scaled by LUABOX_PERF_FACTOR; see the Env
-# block above.
-rss_budget_mib=300
+# The nine budget constants below (cold start through rss_budget_mib) used
+# to be hand-carried here AND in perf-gate.ps1 with no shared source — one
+# rule, two copies, free to drift (#58 review round 6, M50). They now live
+# once, with their calibration rationale, in perf-gate-budgets.env; this is
+# a plain KEY=VALUE file, valid as a `source`d shell fragment as-is.
+# perf-gate.ps1 reads the same file through perf-gate-lib.ps1's
+# Read-PerfBudgets.
+# shellcheck source=perf-gate-budgets.env
+source "$repo_root/scripts/perf-gate-budgets.env"
+cold_start_budget_base_ms="$COLD_START_BUDGET_BASE_MS"
+fmt_budget_base_ms="$FMT_BUDGET_BASE_MS"
+check_budget_base_ms="$CHECK_BUDGET_BASE_MS"
+check_ceiling_ms="$CHECK_CEILING_MS"
+diag_lint_budget_base_ms="$DIAG_LINT_BUDGET_BASE_MS"
+diag_check_budget_base_ms="$DIAG_CHECK_BUDGET_BASE_MS"
+diag_check_ceiling_ms="$DIAG_CHECK_CEILING_MS"
+diag_lint_rendered_budget_base_ms="$DIAG_LINT_RENDERED_BUDGET_BASE_MS"
+diag_check_rendered_budget_base_ms="$DIAG_CHECK_RENDERED_BUDGET_BASE_MS"
+diag_corpus_findings="$DIAG_CORPUS_FINDINGS"
+rss_budget_mib="$RSS_BUDGET_MIB"
 
 # scale_budget_ms (perf-gate-lib.sh) does the float multiply; everything
 # else is integer ms from here on.
@@ -114,15 +128,32 @@ fmt_budget=$(scale_budget_ms "$fmt_budget_base_ms" "$factor")
 
 echo "perf-gate: LUABOX_PERF_FACTOR=${factor} (cold-start budget ${cold_start_budget} ms, fmt budget ${fmt_budget} ms)"
 
-echo "perf-gate: building release binaries..."
-cargo build --release -p luabox-cli
-cargo build --release --manifest-path tools/gen-corpus/Cargo.toml --target-dir target/gen-corpus
+# LUABOX_BIN / GEN_CORPUS_BIN: override the two binaries this gate measures
+# and skip the `cargo build` entirely when BOTH are set. Unset in every real
+# use — CI and a plain dev run always build and measure the genuine release
+# binaries; this is not a way to dodge the build for an actual perf run. It
+# exists as the seam scripts/tests/perf-gate-selftest.sh needs to run THIS
+# FILE for real against a stub `luabox`/`gen-corpus` whose timing and RSS
+# are under the test's control (#58 review round 6, M28: a self-test that
+# never actually executes this script's ten threshold comparisons cannot
+# tell a neutered comparison, a deleted leg or a widened budget from a
+# working one — the previous self-test proved only that perf-gate-lib.sh's
+# pure functions worked, and grepped this file's TEXT for four strings to
+# stand in for everything else).
+if [[ -n "${LUABOX_BIN:-}" && -n "${GEN_CORPUS_BIN:-}" ]]; then
+  luabox_bin="$LUABOX_BIN"
+  gen_corpus_bin="$GEN_CORPUS_BIN"
+else
+  echo "perf-gate: building release binaries..."
+  cargo build --release -p luabox-cli
+  cargo build --release --manifest-path tools/gen-corpus/Cargo.toml --target-dir target/gen-corpus
 
-luabox_bin="$repo_root/target/release/luabox"
-gen_corpus_bin="$repo_root/target/gen-corpus/release/gen-corpus"
-if [[ -f "${luabox_bin}.exe" ]]; then
-  luabox_bin="${luabox_bin}.exe"
-  gen_corpus_bin="${gen_corpus_bin}.exe"
+  luabox_bin="$repo_root/target/release/luabox"
+  gen_corpus_bin="$repo_root/target/gen-corpus/release/gen-corpus"
+  if [[ -f "${luabox_bin}.exe" ]]; then
+    luabox_bin="${luabox_bin}.exe"
+    gen_corpus_bin="${gen_corpus_bin}.exe"
+  fi
 fi
 
 corpus_dir="$(mktemp -d)"
@@ -134,6 +165,17 @@ echo "perf-gate: generating ~100 kLOC corpus into ${corpus_dir} ..."
 write_perf_manifest "$corpus_dir/luabox.toml" "perf-gate-corpus" true
 
 fail=0
+
+# #58 review round 6, M30: this corpus (the CHECK GATE / PEAK-RSS GATE
+# legs' input) and the four diagnostics-heavy corpora below were the two
+# generated-corpus shapes with NO file-count assertion — only the
+# RETAINED-TYPEENV REGRESSION GATE's corpus had one (N38). Reproduced before
+# this fix: a corpus of zero files still printed "PASS check peak RSS: 11
+# MiB < 300 MiB" — a measurement of nothing, read as a clean run. `|| fail=1`
+# rather than `exit 1`: the run keeps going (so a developer sees every
+# other leg's result in one pass) but the overall gate cannot come back
+# green on a broken corpus.
+assert_lua_file_count "$corpus_dir/src" 50 || fail=1
 
 # --- Cold start: MIN of N runs -------------------------------------------
 # Min (not mean/median) is the right statistic for a cold-start *ceiling*:
@@ -182,9 +224,13 @@ else
 fi
 
 # --- CHECK GATE ------------------------------------------------------------
-# SPEC.md §16.1: `check` on the 100-kLOC corpus < 1 s warm. Live since
-# GL#6; the fmt --check gate above stays as the wider safety net.
-check_budget=$(scale_budget_ms "$check_budget_base_ms" "$factor")
+# SPEC.md §16.1 named `check` on the 100-kLOC corpus < 1 s warm as the
+# original acceptance target. CHECK_BUDGET_BASE_MS no longer equals that
+# figure — #58 review round 6, M37 found it FAILING on real hardware at
+# FACTOR=1.0; see perf-gate-budgets.env's own comment for the real numbers
+# this session measured and the headroom the rebased budget carries. Live
+# since GL#6; the fmt --check gate above stays as the wider safety net.
+check_budget=$(scale_budget_ms "$check_budget_base_ms" "$factor" "$check_ceiling_ms")
 echo
 echo "perf-gate: check throughput on corpus (warm)..."
 ( cd "$corpus_dir" && "$luabox_bin" check >/dev/null 2>&1 ) || true
@@ -377,7 +423,7 @@ fi
 # only its own pair — and stdout goes to /dev/null in both, so the gate
 # times the toolchain, not the terminal.
 diag_lint_budget=$(scale_budget_ms "$diag_lint_budget_base_ms" "$factor")
-diag_check_budget=$(scale_budget_ms "$diag_check_budget_base_ms" "$factor")
+diag_check_budget=$(scale_budget_ms "$diag_check_budget_base_ms" "$factor" "$diag_check_ceiling_ms")
 diag_lint_rendered_budget=$(scale_budget_ms "$diag_lint_rendered_budget_base_ms" "$factor")
 diag_check_rendered_budget=$(scale_budget_ms "$diag_check_rendered_budget_base_ms" "$factor")
 
@@ -445,6 +491,13 @@ awk -v n="$diag_corpus_findings" 'BEGIN {
   }
   print "return p"
 }' > "$diag_dir/check-rendered/src/main.lua"
+
+# #58 review round 6, M30: each diagnostics-heavy corpus is one file; a
+# truncated awk run or a wrong path would leave one of the four legs below
+# timing an empty directory instead of diag_corpus_findings findings.
+for project in lint check lint-rendered check-rendered; do
+  assert_lua_file_count "$diag_dir/$project/src" 1 || fail=1
+done
 
 echo
 echo "perf-gate: lint on a diagnostics-heavy file (warm)..."

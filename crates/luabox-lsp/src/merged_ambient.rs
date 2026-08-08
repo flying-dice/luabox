@@ -30,11 +30,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use luabox_db::Analysis;
 use luabox_syntax::luacats::{TypeExpr, TypeExprKind};
 use luabox_types::ty::TableTy;
 use luabox_types::{Ambient, FileTypes};
 
-use crate::sema::{self, FileSemaCache};
+use crate::sema::{self, FileSemaCache, SearchOrderCache};
 
 /// The merged ambient layer, plus a per-instance memo of resolved class
 /// shapes, keyed on the *rendered* reference (`sema::render_type`) rather
@@ -64,6 +65,24 @@ pub struct MergedAmbient {
     /// goto-definition right after it, instead of rebuilding every workspace
     /// file's `FileSema` from scratch on each call.
     sema_cache: FileSemaCache,
+    /// [`crate::sema::search_order`]'s cache (M57, round 6 review), living
+    /// here at the same per-revision lifetime as [`Self::sema_cache`]: a
+    /// repeat `locate_field` walk for the same class name at this revision
+    /// (a sibling field's hover, or the goto-definition right after it)
+    /// reuses the computed file-visit order — and the `may_declare_class`
+    /// text scan that built it — instead of recomputing both from scratch.
+    search_order_cache: SearchOrderCache,
+    /// [`sema::is_declared_alias_or_enum`]'s cache, keyed by name, living at
+    /// the same per-revision lifetime as [`Self::search_order_cache`] (H2):
+    /// the underlying scan is `analysis.files().any(...)` — every project
+    /// file's every annotation's every tag, uncached — called from
+    /// `requires::require_struct_fields` on every hover and completion
+    /// against a `require`d binding whose receiver carries no class
+    /// reference of its own, i.e. the per-keystroke path. Without this, a
+    /// sibling field's hover right after another one at the same name and
+    /// revision re-ran the full scan for no reason, exactly the shape M57's
+    /// `search_order_cache` was added to close for `may_declare_class`.
+    alias_or_enum_cache: RefCell<HashMap<String, bool>>,
 }
 
 impl MergedAmbient {
@@ -85,6 +104,8 @@ impl MergedAmbient {
             shapes: RefCell::new(HashMap::new()),
             ambient_paths: HashSet::new(),
             sema_cache: FileSemaCache::default(),
+            search_order_cache: SearchOrderCache::default(),
+            alias_or_enum_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -117,6 +138,32 @@ impl MergedAmbient {
     #[must_use]
     pub fn sema_cache(&self) -> &FileSemaCache {
         &self.sema_cache
+    }
+
+    /// [`crate::sema::search_order`]'s shared cache for this revision (M57)
+    /// — see the field doc for why living here closes the same cross-call
+    /// reuse gap [`Self::sema_cache`] closes for `FileSema`.
+    #[must_use]
+    pub fn search_order_cache(&self) -> &SearchOrderCache {
+        &self.search_order_cache
+    }
+
+    /// [`sema::is_declared_alias_or_enum`], memoised per name for this
+    /// instance's lifetime (H2) — the `requires::require_struct_fields`
+    /// counterpart of [`Self::class_members`]: the first call for a name
+    /// scans every project file's annotations once; every later call for the
+    /// same name at this revision, from any surface, reuses the answer
+    /// instead of re-running `analysis.files().any(...)`.
+    #[must_use]
+    pub fn is_declared_alias_or_enum(&self, analysis: &Analysis, name: &str) -> bool {
+        if let Some(cached) = self.alias_or_enum_cache.borrow().get(name) {
+            return *cached;
+        }
+        let found = sema::is_declared_alias_or_enum(analysis, name);
+        self.alias_or_enum_cache
+            .borrow_mut()
+            .insert(name.to_string(), found);
+        found
     }
 
     /// The raw merged layer, for callers that must hand it to a
@@ -211,6 +258,15 @@ mod tests {
     }
 
     fn merged(src: &str) -> MergedAmbient {
+        let analysis = analysis_of(src);
+        let base = build_ambient(Dialect::Lua54, &[]);
+        MergedAmbient::build(&base, &analysis.project_types(), &[])
+    }
+
+    /// The bare [`Analysis`] snapshot [`merged`] builds a [`MergedAmbient`]
+    /// from — exposed separately for [`is_declared_alias_or_enum`] tests,
+    /// which need the `Analysis` itself, not just the layer built from it.
+    fn analysis_of(src: &str) -> Analysis {
         let root = PathBuf::from(if cfg!(windows) { r"C:\ws" } else { "/ws" });
         let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
         host.set_root(root.clone());
@@ -219,9 +275,7 @@ mod tests {
             dialect: Dialect::Lua54,
             text: src.to_string(),
         });
-        let analysis = host.snapshot();
-        let base = build_ambient(Dialect::Lua54, &[]);
-        MergedAmbient::build(&base, &analysis.project_types(), &[])
+        host.snapshot()
     }
 
     #[test]
@@ -255,6 +309,62 @@ mod tests {
         assert!(ambient.class_members("Nope").is_none());
         assert!(ambient.class_members("Nope").is_none());
         assert_eq!(ambient.shapes.borrow().len(), 1);
+    }
+
+    // === is_declared_alias_or_enum (H2) ====================================
+
+    #[test]
+    fn is_declared_alias_or_enum_finds_an_alias() {
+        let ambient = merged("---@alias Foo string\n");
+        let analysis = analysis_of("---@alias Foo string\n");
+        assert!(ambient.is_declared_alias_or_enum(&analysis, "Foo"));
+    }
+
+    #[test]
+    fn is_declared_alias_or_enum_declines_an_undeclared_name() {
+        let ambient = merged("---@alias Foo string\n");
+        let analysis = analysis_of("---@alias Foo string\n");
+        assert!(!ambient.is_declared_alias_or_enum(&analysis, "Nope"));
+    }
+
+    /// H2: the underlying scan (`sema::is_declared_alias_or_enum`) is
+    /// `analysis.files().any(...)` — every project file's every annotation's
+    /// every tag, uncached — and it sits on `require_struct_fields`'s
+    /// per-keystroke path (every hover/completion against a `require`d
+    /// binding). This must be memoised per name for the `MergedAmbient`'s
+    /// revision lifetime the same way `class_members` already is.
+    ///
+    /// Proved without instrumenting the scan itself: the *same* `ambient`
+    /// (and so the same cache) is asked about `"Foo"` against two different
+    /// `Analysis` snapshots — the first genuinely declares `Foo`, the second
+    /// declares nothing at all. If the scan re-ran on the second call, it
+    /// would correctly see `alias_absent` and answer `false`. It must
+    /// instead answer the first call's memoised `true` — the only way that
+    /// happens is if the second call never re-scanned.
+    #[test]
+    fn is_declared_alias_or_enum_memoises_the_same_name_across_calls() {
+        let ambient = merged("---@alias Foo string\n");
+        let alias_present = analysis_of("---@alias Foo string\n");
+        assert!(ambient.is_declared_alias_or_enum(&alias_present, "Foo"));
+
+        let alias_absent = analysis_of("local x = 1\n");
+        assert!(
+            ambient.is_declared_alias_or_enum(&alias_absent, "Foo"),
+            "expected the memoised answer from the first call, not a rescan \
+             of `alias_absent` (which declares no `Foo` at all)"
+        );
+        assert_eq!(ambient.alias_or_enum_cache.borrow().len(), 1);
+    }
+
+    /// A `false` answer is memoised too, exactly like `class_members`'s own
+    /// negative-answer memo (`class_members_memoises_a_negative_answer`).
+    #[test]
+    fn is_declared_alias_or_enum_memoises_a_negative_answer() {
+        let ambient = merged("---@alias Foo string\n");
+        let analysis = analysis_of("---@alias Foo string\n");
+        assert!(!ambient.is_declared_alias_or_enum(&analysis, "Nope"));
+        assert!(!ambient.is_declared_alias_or_enum(&analysis, "Nope"));
+        assert_eq!(ambient.alias_or_enum_cache.borrow().len(), 1);
     }
 
     // === class_members_of (#48) ============================================

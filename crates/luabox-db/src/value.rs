@@ -25,7 +25,7 @@ use luabox_hir::LoweredFile;
 use luabox_syntax::lua;
 use luabox_syntax::luacats::AnnotatedItem;
 use luabox_types::ty::Ty;
-use luabox_types::{DisplayTypes, InferredBinding, InferredReturn, TypeEnv};
+use luabox_types::{Ambient, DisplayTypes, InferredBinding, InferredReturn, TypeEnv};
 
 /// Replace `*old` with `new` when they differ, reporting whether it changed.
 ///
@@ -321,6 +321,54 @@ unsafe impl salsa::Update for BindingTypes {
     unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
         // SAFETY: forwarded from the `Update` contract.
         unsafe { replace_if_ne(old_pointer, new_value) }
+    }
+}
+
+/// The memoized project-merged ambient layer for one `(project revision,
+/// dialect)` (M18, round 6 review): [`luabox_types::Ambient::with_project_types`]
+/// applied to [`ProjectTypes`] — the O(N) merge `module_export`/
+/// `binding_types`/`module_export_checked` each used to redo from scratch
+/// on **every one** of their N per-file calls in a full-project display
+/// pass, even though [`project_types_checked`](crate::query::project_types_checked)
+/// (the collection the merge runs over) was itself already memoized —
+/// O(N) work per call, O(N²) total. This wrapper's own tracked query
+/// (`project_ambient` in `query.rs`) makes the merge itself the memoized
+/// unit: it runs once per `(project revision, dialect)` and every per-file
+/// caller shares the `Arc`.
+///
+/// [`Ambient`] wraps a [`TypeEnv`] and is not comparable (see
+/// [`TypeEnvHandle`]'s doc for the same shape), so this handle compares by
+/// `Arc` identity and its query opts out of backdating.
+#[derive(Clone, Debug)]
+pub struct ProjectAmbient(Arc<Ambient>);
+
+impl ProjectAmbient {
+    pub(crate) fn new(ambient: Ambient) -> Self {
+        Self(Arc::new(ambient))
+    }
+
+    /// The merged ambient layer: dialect stdlib + `[types] defs` (the
+    /// caller's `base`) with every project file's workspace-global classes/
+    /// enums folded in.
+    #[must_use]
+    pub fn ambient(&self) -> &Ambient {
+        &self.0
+    }
+}
+
+// SAFETY: fully-owned `Arc` payload. `Ambient` is not `PartialEq` (it wraps
+// a `TypeEnv`), so we fall back to `Arc`-identity comparison, exactly like
+// [`TypeEnvHandle`]: distinct allocations always replace.
+unsafe impl salsa::Update for ProjectAmbient {
+    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
+        // SAFETY: forwarded from the `Update` contract.
+        let old = unsafe { &mut *old_pointer };
+        if Arc::ptr_eq(&old.0, &new_value.0) {
+            false
+        } else {
+            *old = new_value;
+            true
+        }
     }
 }
 

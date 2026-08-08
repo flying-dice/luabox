@@ -43,6 +43,28 @@ fn mentioning<'a>(log: &'a [String], needle: &str) -> Vec<&'a String> {
     log.iter().filter(|l| l.contains(needle)).collect()
 }
 
+/// Assert `needle` never ran, per `log` — but refuse to answer at all when
+/// `overflowed` is set (M46, round 6 review): once the trace has evicted an
+/// entry, `needle`'s absence from `log` no longer proves it did not run —
+/// it may simply have aged out — so an absence assertion taken over a lossy
+/// trace is not proof of anything and must not be trusted the way it was
+/// before the cap existed. Callers must read
+/// [`luabox_db::AnalysisHost::execution_log_overflowed`] *before* draining
+/// (draining resets it) and pass that here.
+#[track_caller]
+fn assert_absent(log: &[String], overflowed: bool, needle: &str) {
+    assert!(
+        !overflowed,
+        "the execution trace overflowed (evicted at least one entry) since \
+         the last drain — an absence assertion for {needle:?} cannot be \
+         trusted against a lossy trace: {log:?}"
+    );
+    assert!(
+        mentioning(log, needle).is_empty(),
+        "expected {needle:?} not to have run, but it did: {log:?}"
+    );
+}
+
 #[test]
 fn diagnostics_parity_with_check_file() {
     let mut host = host();
@@ -793,6 +815,77 @@ fn project_types_checked_is_memoized_once_across_a_display_pass_over_many_files(
     );
 }
 
+/// M18 (round 6 review): `project_types_checked_is_memoized_once_across_a_display_pass_over_many_files`
+/// above only counts `project_types_checked()` — the *collection* of every
+/// file's `FileTypes`. That collection was already memoized; the bug is the
+/// `Ambient::with_project_types` *merge* built over it, which
+/// `module_export`/`binding_types`/`module_export_checked` each used to run
+/// again from scratch on every one of their N per-file calls — invisible to
+/// a test that only ever counts the collection step. This counts the merge
+/// itself (`project_ambient()`, `query.rs`'s newly-tracked query) across the
+/// identical N-file display pass, and fails the same way the collection-only
+/// test would have failed to catch: red before `project_ambient` existed
+/// (the merge ran once per file, N times), green after (once per revision).
+#[test]
+fn project_ambient_merge_is_memoized_once_across_a_display_pass_over_many_files() {
+    const N: usize = 25;
+    let mut host = host();
+    let changes: Vec<Change> = (0..N)
+        .map(|i| {
+            set(
+                &format!("f{i}.lua"),
+                &format!("---@class C{i}\n---@field x number\nlocal M = {{}}\nreturn M\n"),
+            )
+        })
+        .collect();
+    host.apply_changes(changes);
+    let _ = host.take_execution_log();
+
+    let snap = host.snapshot();
+    for i in 0..N {
+        let _ = snap.binding_types(Path::new(&format!("f{i}.lua")));
+    }
+    let log = host.take_execution_log();
+
+    let merge_runs = mentioning(&log, "project_ambient()");
+    assert_eq!(
+        merge_runs.len(),
+        1,
+        "the `with_project_types` merge itself must execute once per \
+         revision, not once per file touched ({N} files, log: {log:?})"
+    );
+}
+
+/// M18's own real-numbers sweep: a full `binding_types` display pass (the
+/// LSP's inlayHint sweep) at N=20/80/160, wall-clock. Manual — run
+/// explicitly with `cargo test -p luabox-db --release -- --ignored \
+/// --nocapture project_types_sweep_wall_time` — since a wall-clock
+/// assertion in the default suite would be flaky across machines; the
+/// round 6 report carries the numbers this prints.
+#[test]
+#[ignore = "manual wall-clock measurement, see the doc comment"]
+fn project_types_sweep_wall_time() {
+    for n in [20usize, 80, 160] {
+        let mut host = host();
+        let changes: Vec<Change> = (0..n)
+            .map(|i| {
+                set(
+                    &format!("f{i}.lua"),
+                    &format!("---@class C{i}\n---@field x number\nlocal M = {{}}\nreturn M\n"),
+                )
+            })
+            .collect();
+        host.apply_changes(changes);
+        let snap = host.snapshot();
+        let start = std::time::Instant::now();
+        for i in 0..n {
+            let _ = snap.binding_types(Path::new(&format!("f{i}.lua")));
+        }
+        let elapsed = start.elapsed();
+        eprintln!("N={n}: {elapsed:?}");
+    }
+}
+
 #[test]
 fn set_dialect_reparses_the_file_under_the_new_dialect() {
     // LuaJIT-only `0x10ULL` is a parse error under 5.4.
@@ -883,5 +976,62 @@ fn execution_log_never_grows_past_its_cap() {
         "execution log grew past its cap of {MAX_EXECUTION_LOG_ENTRIES}: {} entries \
          after {edits} undrained revisions — the bound regressed",
         log.len()
+    );
+}
+
+/// M46 (round 6 review): the cap above silently broke the trace's original
+/// "complete list of queries since the last drain" invariant — a query
+/// whose entry was evicted to make room for newer ones is now
+/// indistinguishable, from the drained `Vec<String>` alone, from a query
+/// that genuinely never ran. This proves both halves: first, that the trap
+/// is real (the probed query's own entry really is silently absent from the
+/// raw log after enough undrained revisions to overflow the cap); second,
+/// that `execution_log_overflowed` correctly flags it and `assert_absent`
+/// refuses to certify the absence once it is set — where an un-guarded
+/// `mentioning(&log, needle).is_empty()` check would have passed, wrongly,
+/// exactly as it would for a query that truly never ran.
+#[test]
+fn an_absence_assertion_over_an_overflowed_trace_is_not_trusted() {
+    let mut host = host();
+
+    // One revision whose own entry we will probe for later.
+    host.apply_change(set("probe.lua", GOOD));
+    let _ = host.snapshot().diagnostics(Path::new("probe.lua"));
+    assert!(
+        !host.execution_log_overflowed(),
+        "nothing has overflowed yet"
+    );
+
+    // Push far more undrained revisions than the cap holds, so the probe's
+    // own entry — logged first, evicted first — ages out.
+    for i in 0..(MAX_EXECUTION_LOG_ENTRIES * 2) {
+        host.apply_change(set(&format!("filler{i}.lua"), GOOD));
+        let _ = host
+            .snapshot()
+            .diagnostics(Path::new(&format!("filler{i}.lua")));
+    }
+
+    // Read the flag *before* draining — draining resets it.
+    let overflowed = host.execution_log_overflowed();
+    assert!(
+        overflowed,
+        "this many undrained pushes must overflow the cap"
+    );
+
+    let log = host.take_execution_log();
+    assert!(
+        mentioning(&log, "diagnostics(probe.lua)").is_empty(),
+        "the probe's own entry really was evicted — this is the false-\
+         absence trap M46 describes: {log:?}"
+    );
+
+    // The dedicated helper must refuse to certify that absence.
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_absent(&log, overflowed, "diagnostics(probe.lua)");
+    }));
+    assert!(
+        refused.is_err(),
+        "assert_absent must panic rather than certify an absence over an \
+         overflowed trace"
     );
 }

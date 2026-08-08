@@ -39,8 +39,10 @@ gate="$here/luals-differential.sh"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-pass=0
-fail=0
+# Round 6 review M49: the pass/fail counters, the exit-plus-`!needle`
+# assertion and M35's "measured nothing" guard live in one place now.
+# shellcheck source=scripts/tests/selftest-lib.sh
+. "$here/selftest-lib.sh"
 
 # --- stub tools ------------------------------------------------------------
 mkdir -p "$work/bin"
@@ -160,41 +162,9 @@ newcorpus() {
 }
 
 # assert <name> <want-exit> <got-exit> <log> <needle>...
-# A needle prefixed with `!` must be ABSENT from the log.
-assert() {
-    local name="$1" want_exit="$2" got_exit="$3" log="$4"
-    shift 4
-    local ok=1 report=""
-    [ "$got_exit" = "$want_exit" ] || {
-        ok=0
-        report="$report expected exit $want_exit"
-    }
-    local needle
-    for needle in "$@"; do
-        case "$needle" in
-        !*)
-            if grep -qF -- "${needle#!}" "$log"; then
-                ok=0
-                report="$report present-but-should-be-absent:[${needle#!}]"
-            fi
-            ;;
-        *)
-            if ! grep -qF -- "$needle" "$log"; then
-                ok=0
-                report="$report missing:[$needle]"
-            fi
-            ;;
-        esac
-    done
-    if [ "$ok" = 1 ]; then
-        echo "PASS  $name (exit $got_exit)"
-        pass=$((pass + 1))
-    else
-        echo "FAIL  $name: got exit $got_exit.$report" >&2
-        sed 's/^/        /' "$log" >&2
-        fail=$((fail + 1))
-    fi
-}
+# This file's local name for selftest-lib.sh's `assert_exit`, kept so the
+# call sites below read as they always have.
+assert() { assert_exit "$@"; }
 
 # run <name> <want-exit> <corpus-dir> <needle>...
 # Standard invocation: stub luabox + stub luals, real (missing) LUALS_REQUIRED.
@@ -561,6 +531,4 @@ got=$?
 assert expected_tsv_missing_fails 1 "$got" "$log" \
     "error: no expectations at"
 
-echo
-echo "luals-differential-selftest: $pass passed, $fail failed"
-[ "$fail" -eq 0 ]
+selftest_report luals-differential-selftest

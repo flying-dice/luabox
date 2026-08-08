@@ -31,10 +31,17 @@ on:
       # luabox-db even though `check` never calls into it — a broken
       # luabox-db is a broken build of the binary this job also needs, and a
       # paths filter that cannot see that source just times out or silently
-      # doesn't run. Cargo.lock, the workspace Cargo.toml and
-      # rust-toolchain.toml are the pin `--locked` resolves against — a
-      # dependency or toolchain bump can move a row's codes column exactly
-      # like a source change would.
+      # doesn't run. Cargo.lock alone is the pin `--locked` resolves
+      # against and enforces (a `Cargo.toml` whose intent needs a `Cargo.lock`
+      # update `--locked` would then refuse to paper over, failing the build
+      # loudly rather than drifting silently). The workspace Cargo.toml and
+      # rust-toolchain.toml are listed here for a DIFFERENT reason each,
+      # neither of which `--locked` covers: a Cargo.toml edit can change what
+      # Cargo.lock is supposed to say, and rust-toolchain.toml pins the
+      # compiler whose own codegen and diagnostics this binary depends on —
+      # a dependency, manifest or toolchain bump can all move a row's codes
+      # column exactly like a source change would, just via three different
+      # mechanisms, not one.
       - "crates/luabox-types/**"
       - "crates/luabox-cli/**"
       - "crates/luabox-hir/**"

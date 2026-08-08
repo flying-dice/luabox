@@ -162,56 +162,184 @@ if ! command -v python3 >/dev/null 2>&1; then
     echo "error: python3 not found on PATH — required to parse 'luabox check --format json' output" >&2
     exit 1
 fi
+# M32: every per-case `luabox check` below now runs under `timeout` — a hang
+# (the exponential class-merge cost M3 measured, or any future one) must
+# fail the case loudly instead of wedging the job until the CI-level
+# timeout-minutes kills the whole run with no per-case attribution at all.
+if ! command -v timeout >/dev/null 2>&1; then
+    echo "error: timeout not found on PATH — required to bound each case's luabox invocation" >&2
+    exit 1
+fi
+# VERDICT_CASE_TIMEOUT overrides the per-case wall-clock budget, seconds —
+# the same override-seam LUABOX/VERDICT_CORPUS already give the self-test,
+# used there to drive a deliberately-slow stub without waiting 30s for it.
+case_timeout="${VERDICT_CASE_TIMEOUT:-30}"
 
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+# M32: on any failure (a case FAIL, or an early `exit 1`), $work is the only
+# reproducible artifact — the project luabox actually saw. Unconditionally
+# `rm -rf`ing it on every exit destroyed that artifact before the operator
+# could open it. Preserve it, and print its path where the operator will
+# actually see it (the stream carrying the summary — see the FAIL-report
+# stream fix below), the same way mutants-gate.sh:65-81 deliberately exempts
+# its own out_dir from its scratch-file cleanup trap for the identical
+# reason. Only a clean, zero-failure, zero-exit-code run gets cleaned up.
+finish() {
+    local rc=$?
+    if [ "${fails:-0}" -gt 0 ] || [ "$rc" != 0 ]; then
+        echo
+        echo "verdict-differential: FAILED — work dir preserved for inspection: $work"
+        echo "verdict-differential: corpus: $corpus"
+    else
+        rm -rf "$work"
+    fi
+}
+trap finish EXIT
 mkdir -p "$work/src"
-printf '[package]\nname = "vdiff"\nversion = "0.1.0"\nedition = "5.4"\n\n[types]\nstrict = true\n' \
-    > "$work/luabox.toml"
 
-# copy_case_deps <case> — populates $work/src for <case>: the case's own
-# file as main.lua, plus every module its .deps sidecar names, copied under
-# their own names so `require("name")` resolves. Every dep name is checked
-# against a path-traversal shape before it is used as a cp destination —
-# read verbatim from a PR-authored .deps sidecar, the same guard
-# luals-differential.sh carries (F27). `rm -f` first so a previous case's
-# dependency files can never leak into this one's verdict (the same bug
-# luals-differential.sh's self-test pins as stale_dep_file_cleared_between_cases).
-copy_case_deps() {
-    local case_name="$1" src="$corpus/$1.lua" dep
-    rm -f "$work/src"/*.lua
-    if [ ! -f "$src" ]; then
-        echo "FAIL  $case_name: expected.tsv names it, but $src does not exist" >&2
-        return 1
+# default_manifest — the manifest every case gets unless it ships its own
+# override (write_case_manifest below). strict mode, flat src/, no ambient
+# defs. This exact content is what M60 found unassertable: every case
+# before this round shared this ONE hardcoded manifest, written by an
+# unprotected printf nothing downstream ever read back — deleting these two
+# lines left the self-test fully green, because the stub luabox never
+# opened luabox.toml at all. write_case_manifest below now echoes what it
+# wrote to THIS script's own stdout, per case, so the content is assertable
+# without needing the (real or stubbed) luabox binary's cooperation — see
+# manifest_strict_true_survives_in_default_manifest.
+default_manifest() {
+    printf '[package]\nname = "vdiff"\nversion = "0.1.0"\nedition = "5.4"\n\n[types]\nstrict = true\n'
+}
+
+# write_case_manifest <case> — $corpus/<case>.toml verbatim, if the case
+# ships one; default_manifest otherwise. M33: before this, one hardcoded
+# manifest served every case and no corpus row could exercise `[types]
+# defs`, `strict = false`, or anything else default_manifest does not say —
+# the same escape hatch `.deps` already gives a case that needs more than
+# one source file, now given to the manifest itself. Echoes a one-line,
+# whitespace-collapsed summary of what it wrote (M60) — cheap, always
+# printed regardless of the row's own pass/fail, and testable independent
+# of whether the (stubbed or real) luabox binary ever opens the file.
+write_case_manifest() {
+    local case_name="$1" override="$corpus/$1.toml"
+    if [ -f "$override" ]; then
+        cp "$override" "$work/luabox.toml"
+    else
+        default_manifest >"$work/luabox.toml"
     fi
-    cp "$src" "$work/src/main.lua"
-    if [ -f "$corpus/$case_name.deps" ]; then
-        while IFS= read -r dep || [ -n "$dep" ]; do
-            [ -n "$dep" ] || continue
-            case "$dep" in
-            */*|.|..)
-                echo "FAIL  $case_name: unsafe dependency name '$dep' in $case_name.deps — must be a plain filename in this directory, no path separators" >&2
-                return 1
-                ;;
-            esac
-            if ! cp "$corpus/$dep" "$work/src/$dep" 2>/dev/null; then
-                echo "FAIL  $case_name: could not copy dependency '$dep' named in $case_name.deps" >&2
-                return 1
-            fi
-        done <"$corpus/$case_name.deps"
-    fi
+    echo "  manifest[$case_name]: $(tr '\n' ' ' <"$work/luabox.toml" | tr -s ' ')"
+}
+
+# copy_sidecar <case> <ext> <dest> — copies every file $corpus/<case>.<ext>
+# names (one per line, blank lines skipped) into $work/<dest>/, preserving
+# its filename so `require("name")` (dest=src) or `[types] defs = ["name"]`
+# (dest=defs, filename "name.d.lua") resolves it. Shared by copy_case_deps's
+# `.deps` handling (project modules) and its new `.defs` handling (ambient
+# definition packages, M33) — same path-traversal guard either way, read
+# verbatim from a PR-authored sidecar, the same guard luals-differential.sh
+# carries (F27).
+copy_sidecar() {
+    local case_name="$1" ext="$2" dest="$3" sidecar="$corpus/$1.$2" dep
+    [ -f "$sidecar" ] || return 0
+    mkdir -p "$work/$dest"
+    while IFS= read -r dep || [ -n "$dep" ]; do
+        [ -n "$dep" ] || continue
+        case "$dep" in
+        */*|.|..)
+            echo "FAIL  $case_name: unsafe dependency name '$dep' in $case_name.$ext — must be a plain filename in this directory, no path separators"
+            return 1
+            ;;
+        esac
+        if ! cp "$corpus/$dep" "$work/$dest/$dep" 2>/dev/null; then
+            echo "FAIL  $case_name: could not copy dependency '$dep' named in $case_name.$ext"
+            return 1
+        fi
+    done <"$sidecar"
     return 0
 }
 
+# copy_case_deps <case> — populates $work/src (and, if the case ships a
+# .defs sidecar, $work/defs) for <case>: the case's own file as main.lua,
+# plus every module its .deps sidecar names, copied under their own names
+# so `require("name")` resolves, plus every ambient package its .defs
+# sidecar names. `rm -f`/`rm -rf` first so a previous case's dependency or
+# defs files can never leak into this one's verdict (the same bug
+# luals-differential.sh's self-test pins as stale_dep_file_cleared_between_cases,
+# now extended to the new defs/ directory).
+copy_case_deps() {
+    local case_name="$1" src="$corpus/$1.lua"
+    rm -f "$work/src"/*.lua
+    rm -rf "$work/defs"
+    if [ ! -f "$src" ]; then
+        echo "FAIL  $case_name: expected.tsv names it, but $src does not exist"
+        return 1
+    fi
+    cp "$src" "$work/src/main.lua"
+    copy_sidecar "$case_name" deps src || return 1
+    copy_sidecar "$case_name" defs defs || return 1
+    return 0
+}
+
+# report_measured_diagnostics <case> — dumps each diagnostic measure_case
+# just captured (last.json): code, message, and file:line, turning the raw
+# byte-offset span back into a line number against the file it names. M32:
+# the code SET alone (what the pass/fail decision itself uses) tells the
+# operator WHICH rule moved, never WHAT changed or WHERE — called only when
+# there is a FAIL to explain.
+report_measured_diagnostics() {
+    local case_name="$1"
+    [ -s "$work/last.json" ] || return 0
+    python3 -c '
+import json, os, sys
+root = sys.argv[1]
+try:
+    data = json.load(open(os.path.join(root, "last.json")))
+except (OSError, ValueError):
+    sys.exit(0)
+for d in data:
+    code = d.get("code", "?")
+    msg = d.get("message", "")
+    loc = "?"
+    for lab in d.get("labels") or []:
+        span = lab.get("span") or {}
+        f, rng = span.get("file"), span.get("range") or {}
+        start = rng.get("start")
+        if f and start is not None:
+            try:
+                with open(os.path.join(root, f), "rb") as fh:
+                    line = fh.read().count(b"\n", 0, start) + 1
+                loc = f"{f}:{line}"
+            except OSError:
+                loc = f
+            break
+    print(f"      {code}  {loc}  {msg}")
+' "$work"
+}
+
 # measure_case <case> — runs the CURRENT $luabox over the file set
-# copy_case_deps just populated and sets MEASURED_VERDICT (clean|diag) and
-# MEASURED_CODES (sorted, comma-joined LB codes, or empty for clean).
-# `--format json` keeps stdout pure JSON, so the exact diagnostic code SET
-# can be asserted, not just "the summary line wasn't all-zero" — see the
-# header for why that distinction is the whole point of this file.
+# copy_case_deps just populated and sets MEASURED_VERDICT (clean|diag),
+# MEASURED_CODES (sorted, comma-joined LB codes, or empty for clean) and
+# MEASURED_EXIT (luabox's own exit status). `--format json` keeps stdout
+# pure JSON, so the exact diagnostic code SET can be asserted, not just "the
+# summary line wasn't all-zero" — see the header for why that distinction
+# is the whole point of this file. `timeout` bounds the run (M32); $rc=124
+# is timeout's own sentinel for "killed after $case_timeout s".
 measure_case() {
-    local case_name="$1" out codes_rc
-    out="$( (cd "$work" && "$luabox" check --format json) 2>"$work/luabox.err" )"
+    local case_name="$1" out codes_rc rc
+    out="$( (cd "$work" && timeout "$case_timeout" "$luabox" check --format json) 2>"$work/luabox.err" )"
+    rc=$?
+    MEASURED_EXIT="$rc"
+    printf '%s' "$out" >"$work/last.json"
+    # M32: a kill from `timeout` (rc=124) leaves $out empty or mid-write —
+    # never valid JSON — so this is checked BEFORE attempting to parse it,
+    # not folded into the generic parse-failure branch below, where it
+    # would report as a confusing JSON error instead of the timeout it
+    # actually is.
+    if [ "$rc" = 124 ]; then
+        echo "FAIL  $case_name: luabox timed out after ${case_timeout}s (VERDICT_CASE_TIMEOUT) — raise the budget or fix the underlying perf bug"
+        sed 's/^/      /' "$work/luabox.err"
+        return 1
+    fi
     MEASURED_CODES="$(printf '%s' "$out" | python3 -c '
 import json, sys
 data = json.load(sys.stdin)
@@ -219,16 +347,28 @@ print(",".join(sorted({d["code"] for d in data})))
 ' 2>"$work/codes.err")"
     codes_rc=$?
     if [ "$codes_rc" != 0 ]; then
-        echo "FAIL  $case_name: could not parse 'luabox check --format json' output as JSON:" >&2
-        sed 's/^/      /' "$work/codes.err" >&2
-        echo "      stderr:" >&2
-        sed 's/^/      /' "$work/luabox.err" >&2
+        echo "FAIL  $case_name: could not parse 'luabox check --format json' output as JSON:"
+        sed 's/^/      /' "$work/codes.err"
+        echo "      stderr:"
+        sed 's/^/      /' "$work/luabox.err"
         return 1
     fi
     if [ -z "$MEASURED_CODES" ]; then
         MEASURED_VERDICT="clean"
     else
         MEASURED_VERDICT="diag"
+    fi
+    # M31: the gate never used to inspect luabox's own exit status at all —
+    # a binary that failed outright (crash, panic, an internal error before
+    # it ever type-checked anything) and printed `[]` on the way out was
+    # recorded as a clean, passing verdict. A nonzero exit paired with an
+    # empty diagnostics array is never a legitimate clean reading; fail the
+    # MEASUREMENT itself rather than let it stand in for "clean" against
+    # expected.tsv.
+    if [ "$MEASURED_VERDICT" = "clean" ] && [ "$rc" != 0 ]; then
+        echo "FAIL  $case_name: luabox exited $rc but printed an empty diagnostics array — a nonzero exit is never a legitimate 'clean' reading"
+        sed 's/^/      /' "$work/luabox.err"
+        return 1
     fi
     return 0
 }
@@ -240,12 +380,13 @@ print(",".join(sorted({d["code"] for d in data})))
 if [ "$print_mode" = 1 ]; then
     for f in "$corpus"/*.lua; do
         base="$(basename "$f" .lua)"
-        # A file only ever named by another case's .deps sidecar is a
-        # support module, not a case of its own — skip it the same way the
-        # unclaimed-corpus sweep below does.
-        if grep -qxF "$base.lua" "$corpus"/*.deps 2>/dev/null; then
+        # A file only ever named by another case's .deps or .defs sidecar
+        # is a support module, not a case of its own — skip it the same way
+        # the unclaimed-corpus sweep below does.
+        if grep -qxF "$base.lua" "$corpus"/*.deps "$corpus"/*.defs 2>/dev/null; then
             continue
         fi
+        write_case_manifest "$base"
         if ! copy_case_deps "$base"; then
             echo "error: regeneration aborted on $base" >&2
             exit 1
@@ -285,10 +426,11 @@ while IFS=$'\t' read -r case_name want_verdict want_codes note; do
     # which only requires a note where its two columns disagree), so an
     # empty note is unconditionally refused (see header).
     if [ -z "${note:-}" ]; then
-        echo "FAIL  $case_name: note column is empty — every row must say what regression shape it pins, in writing" >&2
+        echo "FAIL  $case_name: note column is empty — every row must say what regression shape it pins, in writing"
         fails=$((fails + 1))
     fi
 
+    write_case_manifest "$case_name"
     if ! copy_case_deps "$case_name"; then
         fails=$((fails + 1))
         continue
@@ -299,10 +441,12 @@ while IFS=$'\t' read -r case_name want_verdict want_codes note; do
     fi
 
     if [ "$MEASURED_VERDICT" != "$want_verdict" ]; then
-        echo "FAIL  $case_name: luabox is '$MEASURED_VERDICT', expected.tsv says '$want_verdict' (codes: ${MEASURED_CODES:-none})" >&2
+        echo "FAIL  $case_name: luabox is '$MEASURED_VERDICT', expected.tsv says '$want_verdict' (codes: ${MEASURED_CODES:-none})"
+        report_measured_diagnostics "$case_name"
         fails=$((fails + 1))
     elif [ "$MEASURED_CODES" != "$want_codes" ]; then
-        echo "FAIL  $case_name: luabox codes are '$MEASURED_CODES', expected.tsv says '$want_codes'" >&2
+        echo "FAIL  $case_name: luabox codes are '$MEASURED_CODES', expected.tsv says '$want_codes'"
+        report_measured_diagnostics "$case_name"
         fails=$((fails + 1))
     fi
 
@@ -311,8 +455,9 @@ done < "$expected"
 
 # Every corpus file must be claimed by a row — an unclaimed case is coverage
 # that silently isn't (the no-silent-caps rule). Files named by a `.deps`
-# sidecar are support modules for a cross-file case, not cases.
-support="$(cat "$corpus"/*.deps 2>/dev/null || true)"
+# or `.defs` sidecar are support modules for a cross-file/ambient-defs case,
+# not cases.
+support="$(cat "$corpus"/*.deps "$corpus"/*.defs 2>/dev/null || true)"
 for src in "$corpus"/*.lua; do
     base="$(basename "$src")"
     name="$(basename "$src" .lua)"
@@ -320,7 +465,7 @@ for src in "$corpus"/*.lua; do
         continue
     fi
     if [ -z "${seen[$name]:-}" ]; then
-        echo "FAIL  $name.lua exists in the corpus but expected.tsv has no row for it" >&2
+        echo "FAIL  $name.lua exists in the corpus but expected.tsv has no row for it"
         fails=$((fails + 1))
     fi
 done
@@ -330,7 +475,7 @@ done
 # rows" — the exact "cannot fail because it measures nothing" shape the task
 # brief calls out. Refuse it outright rather than let it read as green.
 if [ "$rows" -eq 0 ]; then
-    echo "verdict-differential: NO ROWS MEASURED — expected.tsv has no case rows (only comments/header?) or the corpus is empty; this gate must never pass by measuring nothing" >&2
+    echo "verdict-differential: NO ROWS MEASURED — expected.tsv has no case rows (only comments/header?) or the corpus is empty; this gate must never pass by measuring nothing"
     exit 1
 fi
 

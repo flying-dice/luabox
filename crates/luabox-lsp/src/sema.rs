@@ -531,6 +531,52 @@ fn contains(range: TextRange, offset: usize) -> bool {
     start <= offset && offset <= end && !(offset == end && start == end)
 }
 
+/// Whether `name` names an `---@alias` or `---@enum` declared anywhere in
+/// the project — both are workspace-global, exactly like a class (M20,
+/// round 6 review): `requires::require_struct_fields`'s gate must block the
+/// `require`d module's raw structural export whenever an explicit
+/// `---@type` annotation names *anything* real, not only a class.
+/// `Ambient::class_members_of` (via [`crate::merged_ambient::MergedAmbient`])
+/// already answers "is this a class that resolves", but has no counterpart
+/// for an alias — and nothing public in `luabox-types` exposes
+/// `TypeEnv::resolve_named`/`lower_bound_args`'s alias expansion from
+/// outside that crate (round 6 report: the accessor this would need to
+/// follow the alias through to what it expands to, rather than merely
+/// confirm it is declared).
+///
+/// This existence check is the best available substitute without that
+/// accessor: it cannot tell what the alias/enum expands to, only that the
+/// name is real, which is enough to stop a genuine annotation from being
+/// mistaken for one that resolves to nothing and falling back to the
+/// `require`d module's plain table shape — the confidently-wrong answer M20
+/// reported (`(field) mod.x: 42` where the alias's real type is `string`).
+///
+/// Unbounded and uncached by itself — `analysis.files().any(...)` scans
+/// every project file's every annotation's every tag on each call (H2).
+/// Every production call site goes through
+/// [`crate::merged_ambient::MergedAmbient::is_declared_alias_or_enum`]
+/// instead, which memoises the answer per name for the revision's lifetime,
+/// exactly the way [`crate::merged_ambient::MergedAmbient::class_members`]
+/// memoises `Ambient::class_members`; call this bare function directly only
+/// from a test or another cache's own miss path.
+#[must_use]
+pub fn is_declared_alias_or_enum(analysis: &Analysis, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    analysis.files().any(|path| {
+        analysis.annotations(path).is_some_and(|annotations| {
+            annotations.items().iter().any(|item| {
+                item.block.tags.iter().any(|tag| match tag {
+                    Tag::Alias(a) => a.name == name,
+                    Tag::Enum(e) => e.name == name,
+                    _ => false,
+                })
+            })
+        })
+    })
+}
+
 /// Where a `class`'s `member` field is textually declared: the file, its
 /// `---@field` description, and the tag's span in that file.
 pub struct FieldSource {
@@ -657,6 +703,53 @@ pub struct FieldSource {
 /// `.d.lua`-named tier, leaving the — typically much larger — rest of the
 /// project unfiltered, even though the doc's own no-false-negative argument
 /// never depended on the `.d.lua` suffix).
+///
+/// **Two separate orderings are in play here, and only one of them is what
+/// the paragraphs above describe** (round 6 review M2): everything above is
+/// about *file*-visit order for **one** class name — which file wins when
+/// more than one project file declares the same name. It says nothing about
+/// *parent-chain* order — the order distinct class names are visited in —
+/// which is the axis round 6's precedence flip actually changed and this
+/// function used to get wrong: it queued every parent **breadth-first**
+/// (`class`, then all its immediate parents, then all of *their* parents,
+/// ...) while `luabox_types::env::TypeEnv::collect_class` — the checker's
+/// own authority for the same merge — resolves **depth-first preorder**
+/// (a class's own declaration, then its first-listed parent's *entire*
+/// subtree, then its second-listed parent's, ...). For `C : A, B` with
+/// `A : X` and both `X` and `B` declaring the same field, BFS visits `X`
+/// and `B` in the same generation and (depending on queue order) could
+/// return either; DFS preorder always reaches `X` — `A`'s own subtree —
+/// before `B`, agreeing with `collect_class`. [`locate_field_dfs`] now
+/// walks depth-first preorder for exactly this reason, so hover's type
+/// (resolved through `collect_class` via
+/// [`crate::merged_ambient::MergedAmbient::class_members_of`]), its
+/// description, and goto-definition's target agree on the common,
+/// non-diamond case this fixes.
+///
+/// What this still cannot match: a genuine *diamond* conflict — the same
+/// generic ancestor reached through two parents bound to different type
+/// arguments, where `collect_class` keeps the **last**-visited edge rather
+/// than the first — and a class whose own field declarations are split
+/// across more than one file with a *per-field*, not per-file, winner.
+/// Both need `collect_class`'s own per-key winner (which file/owner
+/// contributed each resolved field), and nothing public in `luabox-types`
+/// exposes that today — `TypeEnv::class_shape_bound`/
+/// `class_shape_bound_export` are `pub(crate)` and their `TableTy` result
+/// carries no owner, only a type (round 6 report: the accessor this would
+/// need, filed rather than added here since `env.rs` is owned by another
+/// concurrent change).
+/// The invariants of one field lookup: everything [`locate_field`]'s
+/// recursive walk carries unchanged from frame to frame, so the walk itself
+/// threads only what actually varies (the class, the member, the path-scoped
+/// cycle guard, the depth).
+struct LookupCtx<'a> {
+    analysis: &'a Analysis,
+    current: &'a Path,
+    ambient_paths: &'a HashSet<PathBuf>,
+    sema_cache: &'a FileSemaCache,
+    search_order_cache: &'a SearchOrderCache,
+}
+
 #[must_use]
 pub fn locate_field(
     analysis: &Analysis,
@@ -665,42 +758,146 @@ pub fn locate_field(
     member: &str,
     ambient_paths: &HashSet<PathBuf>,
     sema_cache: &FileSemaCache,
+    search_order_cache: &SearchOrderCache,
 ) -> Option<FieldSource> {
-    let mut queue: std::collections::VecDeque<String> =
-        std::collections::VecDeque::from([class.to_string()]);
-    let mut seen = HashSet::new();
-    while let Some(name) = queue.pop_front() {
-        if !seen.insert(name.clone()) {
+    let mut on_path = HashSet::new();
+    let ctx = LookupCtx {
+        analysis,
+        current,
+        ambient_paths,
+        sema_cache,
+        search_order_cache,
+    };
+    locate_field_dfs(&ctx, class, member, &mut on_path, 0)
+}
+
+/// [`locate_field`]'s depth-first preorder walk over the parent chain (M2),
+/// bounded by [`luabox_types::MAX_ANCESTRY_DEPTH`] (M45, round 6 review): a
+/// pathological chain the checker itself refuses to resolve past that depth
+/// must not send this walk recursing past it either — an LSP field lookup
+/// with no bound at all would keep walking a 10 000-class chain the checker
+/// already gave up on at 200. `on_path` is a path-scoped cycle guard (not a
+/// once-ever `seen` set): removed on the way back out of each frame, so a
+/// diamond — the same class reachable through two different parents — is
+/// still visited on the second parent's branch, only a true cycle (`A : B`,
+/// `B : A`) is refused.
+fn locate_field_dfs(
+    ctx: &LookupCtx<'_>,
+    class: &str,
+    member: &str,
+    on_path: &mut HashSet<String>,
+    depth: usize,
+) -> Option<FieldSource> {
+    if depth >= luabox_types::MAX_ANCESTRY_DEPTH || !on_path.insert(class.to_string()) {
+        return None;
+    }
+    let found = locate_field_in_class(ctx, class, member, on_path, depth);
+    on_path.remove(class);
+    found
+}
+
+/// [`locate_field_dfs`]'s per-class body, two passes: `class`'s own
+/// `---@field` declaration wins over *any* parent's, across every candidate
+/// file in [`search_order`]'s order — matching `absorb_block`/
+/// `merge_file_types`'s own-declaration union running to completion before
+/// `collect_class` ever looks at a parent — and only once no candidate file
+/// declares the field itself does the second pass recurse into each
+/// candidate's parents, depth-first, file order then listed-parent order.
+fn locate_field_in_class(
+    ctx: &LookupCtx<'_>,
+    class: &str,
+    member: &str,
+    on_path: &mut HashSet<String>,
+    depth: usize,
+) -> Option<FieldSource> {
+    let order = search_order(
+        ctx.analysis,
+        ctx.current,
+        class,
+        ctx.ambient_paths,
+        ctx.search_order_cache,
+    );
+    for path in order.iter() {
+        let Some(sema) = cached_file_sema(ctx.sema_cache, ctx.analysis, path) else {
             continue;
+        };
+        let map = sema.classes();
+        let Some(decl) = map.get(class) else {
+            continue;
+        };
+        if let Some(field) = decl
+            .fields
+            .iter()
+            .find(|f| matches!(&f.key, FieldKey::Name(n) if n == member))
+        {
+            return Some(FieldSource {
+                path: sema.path.clone(),
+                desc: field.desc.clone(),
+                span: field.span,
+            });
         }
-        let order = search_order(analysis, current, &name, ambient_paths);
-        for &path in &order {
-            let Some(sema) = cached_file_sema(sema_cache, analysis, path) else {
+    }
+    for path in order.iter() {
+        let Some(sema) = cached_file_sema(ctx.sema_cache, ctx.analysis, path) else {
+            continue;
+        };
+        let map = sema.classes();
+        let Some(decl) = map.get(class) else {
+            continue;
+        };
+        for parent in &decl.tag.parents {
+            let Some(parent_name) = named_of(parent) else {
                 continue;
             };
-            let map = sema.classes();
-            let Some(decl) = map.get(name.as_str()) else {
-                continue;
-            };
-            if let Some(field) = decl
-                .fields
-                .iter()
-                .find(|f| matches!(&f.key, FieldKey::Name(n) if n == member))
-            {
-                return Some(FieldSource {
-                    path: sema.path.clone(),
-                    desc: field.desc.clone(),
-                    span: field.span,
-                });
-            }
-            for parent in &decl.tag.parents {
-                if let Some(parent_name) = named_of(parent) {
-                    queue.push_back(parent_name);
-                }
+            if let Some(found) = locate_field_dfs(ctx, &parent_name, member, on_path, depth + 1) {
+                return Some(found);
             }
         }
     }
     None
+}
+
+/// The declared `<T, U, ...>` type-parameter names of `class`'s own
+/// `---@class` declaration, searched across every project file the same way
+/// [`locate_field`] does (M21, round 6 review) — used only to tell whether a
+/// resolved field's type is a bare reference's own **unbound** parameter
+/// (`Box.item: T` for `---@type Box`, no `<...>` arguments), which
+/// `luabox check` renders `unknown` through
+/// `TypeEnv::class_shape_bound_export`'s erasure (`hover.rs`'s member route
+/// used to skip that erasure entirely and leak the literal parameter name).
+///
+/// That erasing path is `pub(crate)` in `luabox-types`, with no
+/// `Ambient`-level counterpart reachable from this crate (round 6 report:
+/// the accessor this would need — an `Ambient::class_members_of_export` or
+/// similar, mirroring [`Self::class_own_params`]'s sibling
+/// `Ambient::class_members_of` but calling the export/erasing variant),
+/// so hover approximates the erasure here instead of reaching for it: only
+/// the *directly*-referenced class's own literal parameters are recognised
+/// — a free parameter inherited from a deeper, differently-named ancestor
+/// parameter (propagated through the substitution chain `collect_class`
+/// itself performs across the whole parent chain) is not, and still renders
+/// as its literal ancestor-parameter name. Narrower than the checker's own
+/// erasure, but correct for the common, single-level generic shape the
+/// round 6 repro and `hover-require.feature`'s own scenario both use.
+#[must_use]
+pub fn class_own_params(
+    analysis: &Analysis,
+    current: &Path,
+    class: &str,
+    ambient_paths: &HashSet<PathBuf>,
+    sema_cache: &FileSemaCache,
+    search_order_cache: &SearchOrderCache,
+) -> Vec<String> {
+    let order = search_order(analysis, current, class, ambient_paths, search_order_cache);
+    for path in order.iter() {
+        let Some(sema) = cached_file_sema(sema_cache, analysis, path) else {
+            continue;
+        };
+        if let Some(decl) = sema.classes().get(class) {
+            return decl.tag.params.clone();
+        }
+    }
+    Vec::new()
 }
 
 /// A cache of built [`FileSema`]s keyed by path, shared across calls at the
@@ -737,36 +934,60 @@ fn cached_file_sema(
     Some(built)
 }
 
-/// [`locate_field`]'s file visit order for one BFS class name: `current`
-/// first (the common case — the cursor's own file, checked before anything
-/// else is built, R10), then every *genuinely ambient* file
+/// [`search_order`]'s cache, keyed by `(current, class name)` — living
+/// alongside [`FileSemaCache`] at the same per-revision lifetime, inside
+/// [`crate::merged_ambient::MergedAmbient`] (M57, round 6 review): before
+/// this, every one of [`locate_field_dfs`]'s steps re-ran `search_order`
+/// from scratch, including its [`may_declare_class`] text scan over every
+/// candidate file, even for a class name the *same* revision had already
+/// computed an order for moments earlier — a sibling field's hover, or the
+/// goto-definition right after it. Measured (17 MB of defs, hover cost
+/// linear in ancestry depth before this fix): 33 / 121 / 292 / 558 ms at
+/// depth 2 / 10 / 30 / 60, with a second/third hover or goto-def at the
+/// same class and revision costing the same as the first — zero reuse.
+pub type SearchOrderCache = RefCell<HashMap<(PathBuf, String), Rc<Vec<PathBuf>>>>;
+
+/// [`locate_field`]'s file visit order for one class name in the parent-chain
+/// walk: `current` first (the common case — the cursor's own file, checked
+/// before anything else is built, R10), then every *genuinely ambient* file
 /// (`ambient_paths`, N18 — a real `[types] defs` entry, the one case
 /// `merge_file_types` itself gives elevated precedence over ordinary load
 /// order) that [`may_declare_class`] says could hold the tag, sorted, then
 /// every other project file that could hold it, sorted — see
 /// [`locate_field`]'s own doc for why this order matches the type merge's
-/// real precedence. A `.d.lua`-suffixed file that is *not* in `ambient_paths`
-/// gets no special tier — the merge has no notion of that suffix at all — so
-/// it is filtered and ordered exactly like any other project file. Recomputed
-/// per BFS name (parent-chain classes can live in different files than the
-/// class the walk started from, so a filter keyed on the *original* class
-/// would wrongly hide a parent's own declaration elsewhere).
+/// real precedence **for one class name**; it says nothing about the order
+/// *different* class names are visited in relative to each other — that is
+/// [`locate_field_dfs`]'s job, not this function's. A `.d.lua`-suffixed file
+/// that is *not* in `ambient_paths` gets no special tier — the merge has no
+/// notion of that suffix at all — so it is filtered and ordered exactly like
+/// any other project file. Recomputed per class name in the walk
+/// (parent-chain classes can live in different files than the class the
+/// walk started from, so a filter keyed on the *original* class would
+/// wrongly hide a parent's own declaration elsewhere) but memoised in
+/// `cache` across calls at one revision (M57): a repeat visit to the same
+/// `(current, name)` pair reuses the previous order rather than re-scanning
+/// every candidate file's text again.
 ///
-/// Cheap regardless: this builds no `FileSema` — [`Analysis::files`] is a
-/// handful of path comparisons, and [`may_declare_class`] scans text
-/// [`Analysis::file_text`] already has cached, not a fresh parse. The
-/// `FileSema`s the returned paths name are the expensive part, and this
-/// function builds none of them. The filter now covers every non-`current`
-/// file uniformly (N21: it used to apply only to `.d.lua`-named files,
-/// leaving the — typically much larger — rest of the project unfiltered,
-/// even though the doc's own no-false-negative argument never depended on
-/// the `.d.lua` suffix).
-fn search_order<'a>(
-    analysis: &'a Analysis,
-    current: &'a Path,
+/// Cheap on a cache miss regardless: this builds no `FileSema` —
+/// [`Analysis::files`] is a handful of path comparisons, and
+/// [`may_declare_class`] scans text [`Analysis::file_text`] already has
+/// cached, not a fresh parse. The `FileSema`s the returned paths name are
+/// the expensive part, and this function builds none of them. The filter
+/// covers every non-`current` file uniformly (N21: it used to apply only to
+/// `.d.lua`-named files, leaving the — typically much larger — rest of the
+/// project unfiltered, even though the doc's own no-false-negative argument
+/// never depended on the `.d.lua` suffix).
+fn search_order(
+    analysis: &Analysis,
+    current: &Path,
     name: &str,
     ambient_paths: &HashSet<PathBuf>,
-) -> Vec<&'a Path> {
+    cache: &SearchOrderCache,
+) -> Rc<Vec<PathBuf>> {
+    let key = (current.to_path_buf(), name.to_string());
+    if let Some(found) = cache.borrow().get(&key) {
+        return Rc::clone(found);
+    }
     let may_declare = |p: &&Path| {
         analysis
             .file_text(p)
@@ -791,18 +1012,23 @@ fn search_order<'a>(
     // `current`, unless `current` *is* the ambient file, in which case it is
     // already in the winning tier and the R10 "check current first" shortcut
     // still applies.
-    if ambient_paths.contains(current) {
+    let order: Vec<PathBuf> = if ambient_paths.contains(current) {
         std::iter::once(current)
             .chain(ambient)
             .chain(rest)
+            .map(Path::to_path_buf)
             .collect()
     } else {
         ambient
             .into_iter()
             .chain(std::iter::once(current))
             .chain(rest)
+            .map(Path::to_path_buf)
             .collect()
-    }
+    };
+    let order = Rc::new(order);
+    cache.borrow_mut().insert(key, Rc::clone(&order));
+    order
 }
 
 /// Whether `text` could possibly hold a `---@class [(exact)] name` tag — a
@@ -1420,6 +1646,13 @@ mod tests {
         FileSemaCache::default()
     }
 
+    /// A fresh, empty [`SearchOrderCache`] — the `search_order` counterpart
+    /// of [`no_cache`] (M57's cross-call sharing is proven separately, in
+    /// `locate_field_reuses_a_shared_search_order_cache_across_separate_calls`).
+    fn no_order_cache() -> SearchOrderCache {
+        SearchOrderCache::default()
+    }
+
     #[test]
     fn locate_field_finds_a_field_declared_in_the_same_file() {
         let analysis = analyze_files(&[(
@@ -1434,6 +1667,7 @@ mod tests {
             "x",
             &no_ambient(),
             &no_cache(),
+            &no_order_cache(),
         )
         .expect("found");
         assert_eq!(found.path, root().join("main.lua"));
@@ -1458,14 +1692,33 @@ mod tests {
         ]);
         let current = root().join("main.lua");
         let cache = no_cache();
-        locate_field(&analysis, &current, "Point", "x", &no_ambient(), &cache).expect("found");
+        let order_cache = no_order_cache();
+        locate_field(
+            &analysis,
+            &current,
+            "Point",
+            "x",
+            &no_ambient(),
+            &cache,
+            &order_cache,
+        )
+        .expect("found");
         let first_built = Rc::clone(
             cache
                 .borrow()
                 .get(&root().join("point.lua"))
                 .expect("point.lua cached after the first call"),
         );
-        locate_field(&analysis, &current, "Point", "x", &no_ambient(), &cache).expect("found");
+        locate_field(
+            &analysis,
+            &current,
+            "Point",
+            "x",
+            &no_ambient(),
+            &cache,
+            &order_cache,
+        )
+        .expect("found");
         let second_built = Rc::clone(
             cache
                 .borrow()
@@ -1475,6 +1728,81 @@ mod tests {
         assert!(
             Rc::ptr_eq(&first_built, &second_built),
             "expected the second call to reuse the first call's built FileSema, not rebuild it"
+        );
+    }
+
+    /// [`SearchOrderCache`]'s own cross-call sharing (M57, round 6 review):
+    /// a `search_order` call for the same `(current, name)` pair at the same
+    /// revision must reuse the first call's computed order rather than
+    /// re-scanning every candidate file's text again.
+    #[test]
+    fn locate_field_reuses_a_shared_search_order_cache_across_separate_calls() {
+        let analysis = analyze_files(&[
+            ("main.lua", "---@class Sub : Base\n---@field name string\n"),
+            ("base.lua", "---@class Base\n---@field id number\n"),
+        ]);
+        let current = root().join("main.lua");
+        let order_cache = no_order_cache();
+        let first = search_order(&analysis, &current, "Base", &no_ambient(), &order_cache);
+        let second = search_order(&analysis, &current, "Base", &no_ambient(), &order_cache);
+        assert!(
+            Rc::ptr_eq(&first, &second),
+            "expected the second call to reuse the first call's computed order"
+        );
+    }
+
+    /// H4: the test above proves the *whole computed order* is reused on a
+    /// cache hit, but does not by itself isolate that
+    /// [`may_declare_class`]'s text scan specifically is what gets skipped,
+    /// as opposed to some other explanation that happens to produce the same
+    /// `Rc`. Proved directly here: the same cache is asked the same
+    /// `(current, "Base")` key against two *different* `Analysis` snapshots
+    /// — the first where `base.lua` genuinely declares `---@class Base`, the
+    /// second where `base.lua` has been rewritten to declare nothing at all.
+    /// If `may_declare_class` re-ran against the second snapshot's text,
+    /// `base.lua` would fail the filter and be missing from the returned
+    /// order. It must instead still contain `base.lua` — the cached order
+    /// from the first call — which is only possible if the second call's
+    /// `may_declare_class` scan never ran.
+    #[test]
+    fn search_order_cache_skips_the_may_declare_class_scan_on_a_repeat_call() {
+        let base_declares = analyze_files(&[
+            ("main.lua", "---@class Sub : Base\n---@field name string\n"),
+            ("base.lua", "---@class Base\n---@field id number\n"),
+        ]);
+        let current = root().join("main.lua");
+        let order_cache = no_order_cache();
+        let first = search_order(
+            &base_declares,
+            &current,
+            "Base",
+            &no_ambient(),
+            &order_cache,
+        );
+        assert!(
+            first.contains(&root().join("base.lua")),
+            "sanity: the first call must find base.lua while it still declares Base: {first:?}"
+        );
+
+        let base_no_longer_declares = analyze_files(&[
+            ("main.lua", "---@class Sub : Base\n---@field name string\n"),
+            ("base.lua", "local B = {}\nreturn B\n"),
+        ]);
+        let second = search_order(
+            &base_no_longer_declares,
+            &current,
+            "Base",
+            &no_ambient(),
+            &order_cache,
+        );
+        assert!(
+            second.contains(&root().join("base.lua")),
+            "expected the cached order (still containing base.lua) — a rescan of \
+             `base_no_longer_declares`'s text would have excluded it: {second:?}"
+        );
+        assert!(
+            Rc::ptr_eq(&first, &second),
+            "the cache hit must return the exact first-call Rc, not a fresh computation"
         );
     }
 
@@ -1498,6 +1826,7 @@ mod tests {
             "x",
             &no_ambient(),
             &no_cache(),
+            &no_order_cache(),
         )
         .expect("found");
         assert_eq!(found.path, root().join("point.lua"));
@@ -1514,8 +1843,16 @@ mod tests {
             ("base.lua", "---@class Base\n---@field id number\n"),
         ]);
         let current = root().join("main.lua");
-        let found = locate_field(&analysis, &current, "Sub", "id", &no_ambient(), &no_cache())
-            .expect("found");
+        let found = locate_field(
+            &analysis,
+            &current,
+            "Sub",
+            "id",
+            &no_ambient(),
+            &no_cache(),
+            &no_order_cache(),
+        )
+        .expect("found");
         assert_eq!(found.path, root().join("base.lua"));
     }
 
@@ -1530,7 +1867,8 @@ mod tests {
                 "Point",
                 "nope",
                 &no_ambient(),
-                &no_cache()
+                &no_cache(),
+                &no_order_cache()
             )
             .is_none()
         );
@@ -1541,7 +1879,16 @@ mod tests {
         let analysis = analyze_files(&[("main.lua", "---@class Point\n---@field x number\n")]);
         let current = root().join("main.lua");
         assert!(
-            locate_field(&analysis, &current, "Nope", "x", &no_ambient(), &no_cache()).is_none()
+            locate_field(
+                &analysis,
+                &current,
+                "Nope",
+                "x",
+                &no_ambient(),
+                &no_cache(),
+                &no_order_cache()
+            )
+            .is_none()
         );
     }
 
@@ -1562,7 +1909,8 @@ mod tests {
                 "Greeter",
                 "greet",
                 &no_ambient(),
-                &no_cache()
+                &no_cache(),
+                &no_order_cache()
             )
             .is_none()
         );
@@ -1580,11 +1928,44 @@ mod tests {
         let (analysis, path) = sema_of(src);
         // The cycle guard stops the walk; each side's own field is still
         // found, and the mutual reference does not hang the lookup.
-        assert!(locate_field(&analysis, &path, "A", "a", &no_ambient(), &no_cache()).is_some());
-        assert!(locate_field(&analysis, &path, "B", "b", &no_ambient(), &no_cache()).is_some());
+        assert!(
+            locate_field(
+                &analysis,
+                &path,
+                "A",
+                "a",
+                &no_ambient(),
+                &no_cache(),
+                &no_order_cache()
+            )
+            .is_some()
+        );
+        assert!(
+            locate_field(
+                &analysis,
+                &path,
+                "B",
+                "b",
+                &no_ambient(),
+                &no_cache(),
+                &no_order_cache()
+            )
+            .is_some()
+        );
         // The cycle also means each side can see the other's field, exactly
         // as `env::collect_class`'s own cycle guard resolves it.
-        assert!(locate_field(&analysis, &path, "A", "b", &no_ambient(), &no_cache()).is_some());
+        assert!(
+            locate_field(
+                &analysis,
+                &path,
+                "A",
+                "b",
+                &no_ambient(),
+                &no_cache(),
+                &no_order_cache()
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -1596,7 +1977,18 @@ mod tests {
         let (analysis, path) = sema_of(src);
         // The structural-table parent has no name to walk to; `Odd`'s own
         // field is still found, and the lookup does not panic on the shape.
-        assert!(locate_field(&analysis, &path, "Odd", "own", &no_ambient(), &no_cache()).is_some());
+        assert!(
+            locate_field(
+                &analysis,
+                &path,
+                "Odd",
+                "own",
+                &no_ambient(),
+                &no_cache(),
+                &no_order_cache()
+            )
+            .is_some()
+        );
     }
 
     // === defs-vs-project authority (round 4 review R11, round 5 review N18) =
@@ -1636,6 +2028,7 @@ mod tests {
             "id",
             &ambient_paths,
             &no_cache(),
+            &no_order_cache(),
         )
         .expect("found");
         assert_eq!(found.path, root().join("defs/widget.d.lua"));
@@ -1671,6 +2064,7 @@ mod tests {
             "id",
             &no_ambient(),
             &no_cache(),
+            &no_order_cache(),
         )
         .expect("found");
         assert_eq!(found.path, root().join("a_widget.lua"));
@@ -1697,6 +2091,7 @@ mod tests {
             "id",
             &no_ambient(),
             &no_cache(),
+            &no_order_cache(),
         )
         .expect("found");
         assert_eq!(found.path, root().join("a_widget.lua"));
@@ -1765,14 +2160,20 @@ mod tests {
             ),
         ]);
         let current = root().join("main.lua");
-        let order = search_order(&analysis, &current, "Widget", &no_ambient());
+        let order = search_order(
+            &analysis,
+            &current,
+            "Widget",
+            &no_ambient(),
+            &no_order_cache(),
+        );
         assert!(
-            !order.contains(&root().join("defs/unrelated.d.lua").as_path()),
+            !order.contains(&root().join("defs/unrelated.d.lua")),
             "{order:?}"
         );
         // `current` is still visited (first, since the defs tier is empty
         // after filtering) — this is not just "returns nothing".
-        assert!(order.contains(&current.as_path()), "{order:?}");
+        assert!(order.contains(&current), "{order:?}");
     }
 
     /// N21: the cheap [`may_declare_class`] pre-filter used to apply only to
@@ -1788,12 +2189,15 @@ mod tests {
             ("unrelated.lua", "---@class Other\n---@field y number\n"),
         ]);
         let current = root().join("main.lua");
-        let order = search_order(&analysis, &current, "Widget", &no_ambient());
-        assert!(
-            !order.contains(&root().join("unrelated.lua").as_path()),
-            "{order:?}"
+        let order = search_order(
+            &analysis,
+            &current,
+            "Widget",
+            &no_ambient(),
+            &no_order_cache(),
         );
-        assert!(order.contains(&current.as_path()), "{order:?}");
+        assert!(!order.contains(&root().join("unrelated.lua")), "{order:?}");
+        assert!(order.contains(&current), "{order:?}");
     }
 
     /// The regression finding 2 explicitly warns against: filtering the defs
@@ -1812,8 +2216,16 @@ mod tests {
             ),
         ]);
         let current = root().join("main.lua");
-        let found = locate_field(&analysis, &current, "Sub", "id", &no_ambient(), &no_cache())
-            .expect("found");
+        let found = locate_field(
+            &analysis,
+            &current,
+            "Sub",
+            "id",
+            &no_ambient(),
+            &no_cache(),
+            &no_order_cache(),
+        )
+        .expect("found");
         assert_eq!(found.path, root().join("defs/base.d.lua"));
         assert_eq!(found.desc.as_deref(), Some("the id from base"));
     }
@@ -1844,10 +2256,76 @@ mod tests {
             "id",
             &no_ambient(),
             &no_cache(),
+            &no_order_cache(),
         )
         .expect("found");
         assert_eq!(found.path, root().join("defs/widget.d.lua"));
         assert_eq!(found.desc.as_deref(), Some("the id from defs"));
+    }
+
+    // === ancestry depth bound (M45, round 6 review) =======================
+
+    /// `luabox check` refuses to resolve a class chain past
+    /// `MAX_ANCESTRY_DEPTH` (`env.rs`'s `DiamondGuard`); before this fix
+    /// `locate_field`'s own parent-chain walk had no equivalent bound at
+    /// all, so an LSP field lookup on a pathological (e.g. generated) chain
+    /// kept walking — and kept paying `search_order`'s per-class file scan —
+    /// far past the depth the checker itself already gave up resolving.
+    #[test]
+    fn locate_field_is_bounded_by_the_same_ancestry_depth_limit_the_checker_enforces() {
+        let n = luabox_types::MAX_ANCESTRY_DEPTH + 5;
+        let mut src = String::from("---@class C0\n---@field item number\n");
+        for i in 1..=n {
+            use std::fmt::Write as _;
+            let _ = writeln!(src, "---@class C{i} : C{}", i - 1);
+        }
+        let (analysis, path) = sema_of(&src);
+        let leaf = format!("C{n}");
+        assert!(
+            locate_field(
+                &analysis,
+                &path,
+                &leaf,
+                "item",
+                &no_ambient(),
+                &no_cache(),
+                &no_order_cache(),
+            )
+            .is_none(),
+            "a chain this deep must not resolve past the checker's own \
+             {}-class limit",
+            luabox_types::MAX_ANCESTRY_DEPTH
+        );
+    }
+
+    /// The floor-side control: a chain of exactly `MAX_ANCESTRY_DEPTH`
+    /// classes (well within the cap, matching `env.rs`'s own
+    /// `a_class_chain_at_the_ancestry_limit_resolves_fully_and_correctly`
+    /// fixture) still resolves fully — the bound above must not be
+    /// off-by-one in the refusing direction.
+    #[test]
+    fn locate_field_resolves_fully_at_a_chain_just_inside_the_ancestry_depth_limit() {
+        let n = luabox_types::MAX_ANCESTRY_DEPTH - 1;
+        let mut src = String::from("---@class C0\n---@field item number\n");
+        for i in 1..=n {
+            use std::fmt::Write as _;
+            let _ = writeln!(src, "---@class C{i} : C{}", i - 1);
+        }
+        let (analysis, path) = sema_of(&src);
+        let leaf = format!("C{n}");
+        assert!(
+            locate_field(
+                &analysis,
+                &path,
+                &leaf,
+                "item",
+                &no_ambient(),
+                &no_cache(),
+                &no_order_cache(),
+            )
+            .is_some(),
+            "a chain within the limit must still resolve"
+        );
     }
 
     // === functions() ======================================================

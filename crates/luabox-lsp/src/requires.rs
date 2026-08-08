@@ -196,17 +196,35 @@ pub fn export_fields(ty: &Ty) -> Option<&BTreeMap<String, FieldTy>> {
 /// diagnostics for the same file. A *resolves* check falls back to the
 /// table shape exactly when the annotation cannot answer for member access,
 /// matching what the checker itself would do.
+///
+/// `class_members_of` only ever answers for a **class** (M20, round 6
+/// review): an explicit `---@type` naming an `---@alias` — even one that
+/// itself expands to a class — is not a class by that check, so before this
+/// fix the gate treated it the same as `---@type Bogus` and fell through to
+/// the structural export, while `luabox check` enforces the alias's real
+/// (possibly incompatible) type through the same annotation. Confidently
+/// answering off the wrong shape is worse than the honest `None` a fully
+/// unresolvable annotation gets, so [`sema::is_declared_alias_or_enum`] adds
+/// a second, narrower "resolves" check for exactly the alias/enum case
+/// `class_members_of` cannot itself see — see its own doc for why it cannot
+/// go further and actually expand the alias.
 #[must_use]
 pub fn require_struct_fields<'s, 'a>(
     sema: &'s FileSema,
     exports: &'a RequireExports,
     ambient: &MergedAmbient,
+    analysis: &Analysis,
     binding: &Binding,
 ) -> Option<(&'s str, &'a BTreeMap<String, FieldTy>)> {
-    if let Some(ty) = receiver_type(sema, exports, binding)
-        && ambient.class_members_of(&ty).is_some()
-    {
-        return None;
+    if let Some(ty) = receiver_type(sema, exports, binding) {
+        if ambient.class_members_of(&ty).is_some() {
+            return None;
+        }
+        if let Some(name) = crate::sema::named_of(&ty)
+            && ambient.is_declared_alias_or_enum(analysis, &name)
+        {
+            return None;
+        }
     }
     let module = require_module_of(sema, binding)?;
     let fields = exports.get(module).and_then(export_fields)?;

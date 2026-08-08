@@ -29,7 +29,37 @@ const KNOWN_RULES: &[&str] = &[
     "duplicate-doc-field",
     "invisible",
     "await-in-sync",
+    RULE_CLASS_ANCESTRY_TOO_DEEP,
+    RULE_CYCLIC_CLASS_ANCESTRY,
+    RULE_CLASS_ANCESTRY_TOO_COSTLY,
 ];
+
+/// The suppression name for `LB0317`.
+///
+/// Most entries in [`KNOWN_RULES`] are luals' own diagnostic names, because
+/// most `LB03xx` codes have a luals counterpart and a user moving between the
+/// two tools should not have to learn a second vocabulary. `LB0317` and
+/// `LB0318` have no counterpart — luals has neither the recursive class merge
+/// the depth cap protects nor any cyclic-class diagnostic — so they carry
+/// luabox-only names here.
+///
+/// They are *here*, in the one owner, rather than in a second scanner
+/// (round 6 review M4(b)): the CLI's syntactic pre-check
+/// (`luabox_cli::check_cmd::deep_class_chain_diagnostics`) runs before the
+/// type pass and so cannot use [`DirectiveScan`] itself, but it reads this
+/// constant, so the two emitters of `LB0317` cannot disagree about what
+/// silences it. They did: the pre-check honored the comment and the
+/// checker-side drain ignored it, so a file-wide `disable` suppressed some of
+/// a project's `LB0317`s and not others.
+pub const RULE_CLASS_ANCESTRY_TOO_DEEP: &str = "class-ancestry-too-deep";
+
+/// The suppression name for `LB0318`. See
+/// [`RULE_CLASS_ANCESTRY_TOO_DEEP`].
+pub const RULE_CYCLIC_CLASS_ANCESTRY: &str = "cyclic-class-ancestry";
+
+/// The suppression name for `LB0319`. See
+/// [`RULE_CLASS_ANCESTRY_TOO_DEEP`].
+pub const RULE_CLASS_ANCESTRY_TOO_COSTLY: &str = "class-ancestry-too-costly";
 
 /// The luals rule name that maps onto a checker [`Code`], or `None` when the
 /// code carries no `---@diagnostic`-suppressible name.
@@ -44,11 +74,40 @@ pub(crate) fn rule_for_code(code: Code) -> Option<&'static str> {
         codes::DUPLICATE_DOC_FIELD => Some("duplicate-doc-field"),
         codes::INVISIBLE => Some("invisible"),
         codes::AWAIT_IN_SYNC => Some("await-in-sync"),
+        codes::CLASS_DEPTH_LIMIT => Some(RULE_CLASS_ANCESTRY_TOO_DEEP),
+        codes::CYCLIC_CLASS => Some(RULE_CYCLIC_CLASS_ANCESTRY),
+        codes::CLASS_COST_LIMIT => Some(RULE_CLASS_ANCESTRY_TOO_COSTLY),
         // LB0310 (duplicate-doc-alias) is a project-assembly finding, like the
         // LB0307 class collision — it never flows through this per-file filter,
         // so it has no entry here.
         _ => None,
     }
+}
+
+/// Parse a `---@diagnostic <action>: <rule>[, <rule>...]` directive's body —
+/// everything after the `@diagnostic` marker, however it was captured — into
+/// its trimmed action keyword and an iterator of trimmed rule names. Strips
+/// the trailing `]`/`=` a block-comment-form directive
+/// (`--[[@diagnostic disable: foo]]`) can leave on the last name, exactly as
+/// [`DirectiveScan::scan`] always has.
+///
+/// Shared by [`DirectiveScan::scan`] (a raw-text scan over a whole file,
+/// run once the type pass has diagnostics to filter — after `KNOWN_RULES`
+/// narrows the match) and `luabox_cli::check_cmd`'s syntactic `LB0317`
+/// pre-check (run over already-harvested `Tag::Diagnostic` bodies, before
+/// any [`crate::TypeEnv`] exists for a [`DirectiveScan`] to run against).
+/// Before this, the two hand-rolled the identical `split_once(':')` +
+/// comma-split + trim (round 6 review G5) — one owner now, so a future
+/// change to the comment grammar cannot update one scanner and miss the
+/// other.
+pub fn parse_directive_body(rest: &str) -> Option<(&str, impl Iterator<Item = &str> + Clone)> {
+    let (action, names) = rest.trim().split_once(':')?;
+    Some((
+        action.trim(),
+        names
+            .split(',')
+            .map(|n| n.trim().trim_end_matches([']', '=']).trim()),
+    ))
 }
 
 /// Per-rule suppression state: whether a bare `disable` covered the whole file
@@ -77,22 +136,18 @@ impl DirectiveScan {
             };
             // `rest` is e.g. ` disable: deprecated, foo]` — split the action
             // from the comma-separated name list.
-            let Some((action, names)) = rest.trim().split_once(':') else {
+            let Some((action, names)) = parse_directive_body(rest) else {
                 continue;
             };
             let matched: Vec<&'static str> = names
-                .split(',')
-                .filter_map(|n| {
-                    let n = n.trim().trim_end_matches([']', '=']).trim();
-                    KNOWN_RULES.iter().copied().find(|&rule| rule == n)
-                })
+                .filter_map(|n| KNOWN_RULES.iter().copied().find(|&rule| rule == n))
                 .collect();
             if matched.is_empty() {
                 continue;
             }
             for rule in matched {
                 let state = out.rules.entry(rule).or_default();
-                match action.trim() {
+                match action {
                     "disable" => state.file_wide = true,
                     // Both line forms record the *comment* line; `suppresses`
                     // fans out to the line below, covering the trailing form
@@ -194,6 +249,25 @@ mod tests {
         );
         assert_eq!(rule_for_code(codes::INVISIBLE), Some("invisible"));
         assert_eq!(rule_for_code(codes::AWAIT_IN_SYNC), Some("await-in-sync"));
+        // R2 (production readiness issue): this mapping used to stop at
+        // `AWAIT_IN_SYNC`, leaving the three ancestry-guard codes — the
+        // newest, and the ones with luabox-only rule names rather than a
+        // luals-shared one (see `RULE_CLASS_ANCESTRY_TOO_DEEP`'s doc for
+        // why) — unpinned. A regression that dropped one of their
+        // `match` arms (or renamed its rule string) would compile clean and
+        // fail nothing here.
+        assert_eq!(
+            rule_for_code(codes::CLASS_DEPTH_LIMIT),
+            Some(RULE_CLASS_ANCESTRY_TOO_DEEP)
+        );
+        assert_eq!(
+            rule_for_code(codes::CYCLIC_CLASS),
+            Some(RULE_CYCLIC_CLASS_ANCESTRY)
+        );
+        assert_eq!(
+            rule_for_code(codes::CLASS_COST_LIMIT),
+            Some(RULE_CLASS_ANCESTRY_TOO_COSTLY)
+        );
         assert_eq!(rule_for_code(codes::TYPE_MISMATCH), None);
     }
 
@@ -208,6 +282,11 @@ mod tests {
             (codes::DUPLICATE_DOC_FIELD, "duplicate-doc-field"),
             (codes::INVISIBLE, "invisible"),
             (codes::AWAIT_IN_SYNC, "await-in-sync"),
+            // R2: the three ancestry-guard codes, extending this table past
+            // `AWAIT_IN_SYNC` the same way the test above does.
+            (codes::CLASS_DEPTH_LIMIT, RULE_CLASS_ANCESTRY_TOO_DEEP),
+            (codes::CYCLIC_CLASS, RULE_CYCLIC_CLASS_ANCESTRY),
+            (codes::CLASS_COST_LIMIT, RULE_CLASS_ANCESTRY_TOO_COSTLY),
         ] {
             assert_eq!(rule_for_code(code), Some(rule), "{code}");
         }
@@ -217,5 +296,8 @@ mod tests {
         assert_eq!(codes::DUPLICATE_DOC_FIELD.to_string(), "LB0311");
         assert_eq!(codes::INVISIBLE.to_string(), "LB0312");
         assert_eq!(codes::AWAIT_IN_SYNC.to_string(), "LB0316");
+        assert_eq!(codes::CLASS_DEPTH_LIMIT.to_string(), "LB0317");
+        assert_eq!(codes::CYCLIC_CLASS.to_string(), "LB0318");
+        assert_eq!(codes::CLASS_COST_LIMIT.to_string(), "LB0319");
     }
 }

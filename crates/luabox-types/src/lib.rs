@@ -72,8 +72,13 @@ pub mod ty;
 mod version;
 
 pub use assign::{Exactness, assignable};
+pub use codes::{CLASS_COST_LIMIT, CLASS_DEPTH_LIMIT, CYCLIC_CLASS};
 pub use defs::{
     Ambient, DefFile, alias_collisions, build_ambient, build_ambient_checked, stdlib as stdlib_defs,
+};
+pub use directive::{
+    RULE_CLASS_ANCESTRY_TOO_COSTLY, RULE_CLASS_ANCESTRY_TOO_DEEP, RULE_CYCLIC_CLASS_ANCESTRY,
+    parse_directive_body,
 };
 pub use env::{FileTypes, MAX_ANCESTRY_DEPTH, TypeEnv};
 pub use infer::{ExternalTypes, InferredBinding, InferredReturn};
@@ -230,6 +235,20 @@ impl FileArtifacts {
     pub fn requires(&self) -> Vec<String> {
         requires_of(&self.lowered)
     }
+
+    /// This file's harvested LuaCATS annotation blocks — [`Self::new`]'s own
+    /// `luacats::harvest` call, exposed so a caller that already built
+    /// `FileArtifacts` for other reasons (module surface, checking) can
+    /// reuse the same harvest for its own annotation-only walk instead of
+    /// harvesting the file a second time (round 6 review M19:
+    /// `luabox-cli`'s `check_cmd::deep_class_chain_diagnostics` used to call
+    /// `luacats::harvest` again, serially, for every project file, even
+    /// though this is the exact harvest `FileArtifacts::new` already built
+    /// for the same file).
+    #[must_use]
+    pub fn items(&self) -> &[luacats::AnnotatedItem] {
+        &self.items
+    }
 }
 
 /// Compute one file's [`ModuleSurface`]: the reified `require`-export type
@@ -312,8 +331,16 @@ pub fn module_surface_with_artifacts(
 /// shipping again. `build_file_env` still exists for a caller with a good
 /// reason to hold `env` across two calls of its own on ONE file — just
 /// budget the same tradeoff before reaching for it across many.
+// Round 6 review M47: this used to be `pub fn` with zero callers outside
+// this file — round 5 raised the same finding (N51) and it was answered
+// with a longer doc comment instead of a visibility change. Grepped the
+// whole workspace immediately before this edit: every reference to
+// `build_file_env` outside this file is a doc comment or intra-doc link
+// (`check_cmd.rs:366`, and the `[`build_file_env`]` links in this file's own
+// docs below), never a call. Private — the doc comment above still stands as
+// the record of why the function exists and what NOT to do with it.
 #[must_use]
-pub fn build_file_env(
+fn build_file_env(
     parse: &lua::Parse,
     artifacts: &FileArtifacts,
     ambient: Option<&Ambient>,
@@ -335,12 +362,10 @@ pub fn build_file_env(
 /// files (see [`build_file_env`]'s doc comment for the full table), and is
 /// now caught by `scripts/perf-gate.sh`'s "RETAINED-TYPEENV REGRESSION
 /// GATE" leg (500-file corpus, budget 100 MiB).
+// M47: same as `build_file_env` above — zero external callers, verified by
+// the same workspace grep.
 #[must_use]
-pub fn module_surface_from_env(
-    env: &TypeEnv,
-    file: &str,
-    artifacts: &FileArtifacts,
-) -> ModuleSurface {
+fn module_surface_from_env(env: &TypeEnv, file: &str, artifacts: &FileArtifacts) -> ModuleSurface {
     let items = &artifacts.items;
     let outcome = infer::run(
         &artifacts.lowered,
@@ -459,8 +484,75 @@ pub fn check_file_with_artifacts<S: std::hash::BuildHasher>(
     requires: &HashMap<String, Ty, S>,
     artifacts: &FileArtifacts,
 ) -> Vec<Diagnostic> {
+    check_file_with_artifacts_and_sources(
+        parse, file, strictness, edition, ambient, requires, artifacts, None,
+    )
+}
+
+/// A project file name → that file's source text lookup, called on demand by
+/// [`check_file_with_artifacts_and_sources`]'s cross-file suppression scan.
+/// Named so the signatures that carry it read as "a source resolver", not a
+/// `dyn Fn` clippy flags as too complex to leave inline.
+pub type SourceResolver<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// [`check_file_with_artifacts`] plus a cross-file source resolver — the fix
+/// for the `---@diagnostic disable` escape hatch not working cross-file
+/// (production readiness review G1).
+///
+/// A `---@class` cycle/depth-limit diagnostic (`LB0317`/`LB0318`) can carry a
+/// primary label whose span belongs to a **different** project file than
+/// `file` — the `cross_file_class_decl_span` attribution tier in
+/// [`check::report_depth_limit_hits`]/[`check::report_cyclic_class_hits`]
+/// fires whenever the offending class is declared in a file other than the
+/// one whose check pass happened to trip the resolver's guard. The
+/// suppression scan below must honor *that* file's own
+/// `---@diagnostic disable` directives, at *that* file's own line numbers —
+/// never this file's, which is what the plain [`check_file_with_artifacts`]
+/// used to do unconditionally (reusing `file`'s `LineIndex` against another
+/// file's byte offsets — silently wrong line numbers feeding suppression, so
+/// a correctly-scoped `disable-line` could hit or miss arbitrarily).
+///
+/// `other_sources` resolves a project file name (a diagnostic's foreign
+/// `Span::file`) to that file's source text, on demand — called at most once
+/// per distinct foreign file a suppressible diagnostic actually names, never
+/// for a file with nothing to suppress. `None` (what
+/// [`check_file_with_artifacts`] passes) means "no cross-file lookup is
+/// available": a cross-file diagnostic is then left **unsuppressed** rather
+/// than checked against the wrong file — the safe default, and a strict
+/// correctness improvement over the old always-wrong-when-foreign behaviour,
+/// not merely "no worse". Only a caller that holds every project file's
+/// source in reach — `luabox-cli`'s `check_cmd::check_one` — can supply a
+/// resolver and get full cross-file suppression.
+#[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one more link in the check_file → check_file_with_ambient → \
+              check_file_with_requires → check_file_with_artifacts entry-point \
+              ladder, each threading exactly one more caller-supplied input \
+              through to check_file_from_env; splitting these into a struct \
+              would just move the same nine names one level down"
+)]
+pub fn check_file_with_artifacts_and_sources<S: std::hash::BuildHasher>(
+    parse: &lua::Parse,
+    file: &str,
+    strictness: Strictness,
+    edition: lua::Dialect,
+    ambient: Option<&Ambient>,
+    requires: &HashMap<String, Ty, S>,
+    artifacts: &FileArtifacts,
+    other_sources: Option<SourceResolver<'_>>,
+) -> Vec<Diagnostic> {
     let env = build_file_env(parse, artifacts, ambient);
-    check_file_from_env(&env, parse, file, strictness, edition, requires, artifacts)
+    check_file_from_env(
+        &env,
+        parse,
+        file,
+        strictness,
+        edition,
+        requires,
+        artifacts,
+        other_sources,
+    )
 }
 
 /// [`check_file_with_artifacts`] over an already-built [`TypeEnv`]
@@ -475,8 +567,15 @@ pub fn check_file_with_artifacts<S: std::hash::BuildHasher>(
 /// shape at N=500 files (measured table in [`build_file_env`]'s doc
 /// comment), now a CI-blocking leg in `scripts/perf-gate.sh`
 /// ("RETAINED-TYPEENV REGRESSION GATE", 500-file corpus, budget 100 MiB).
+// M47: same as `build_file_env` above — zero external callers, verified by
+// the same workspace grep.
 #[must_use]
-pub fn check_file_from_env<S: std::hash::BuildHasher>(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the bottom of the check_file* entry-point ladder — see \
+              check_file_with_artifacts_and_sources's identical allow"
+)]
+fn check_file_from_env<S: std::hash::BuildHasher>(
     env: &TypeEnv,
     parse: &lua::Parse,
     file: &str,
@@ -484,6 +583,7 @@ pub fn check_file_from_env<S: std::hash::BuildHasher>(
     edition: lua::Dialect,
     requires: &HashMap<String, Ty, S>,
     artifacts: &FileArtifacts,
+    other_sources: Option<SourceResolver<'_>>,
 ) -> Vec<Diagnostic> {
     let items = &artifacts.items;
     // A `---@meta` definition package: its `---@class` declarations are
@@ -550,26 +650,63 @@ pub fn check_file_from_env<S: std::hash::BuildHasher>(
     // Honor luals' `---@diagnostic disable*: <rule>` for the checker
     // diagnostics that carry a luals rule name (`undefined-field` → LB0306,
     // `deprecated` → LB0308, `discard-returns` → LB0309, `duplicate-doc-field`
-    // → LB0311). One scan serves them all; see `directive.rs` for why it does
-    // not reuse the linter's engine.
+    // → LB0311, `cyclic-class-ancestry` → LB0318, ...). One scan serves them
+    // all; see `directive.rs` for why it does not reuse the linter's engine.
     if diags
         .iter()
         .any(|d| directive::rule_for_code(d.code).is_some())
     {
         let source = parse.syntax().text().to_string();
         let sup = directive::DirectiveScan::scan(&source);
-        if sup.any() {
+        // Worth building the `LineIndex` + running the per-diagnostic scan
+        // when either this file's own directives might suppress something,
+        // OR a cross-file resolver is in reach: a diagnostic can carry a
+        // primary label belonging to a file OTHER than `file` (G1 — see
+        // `check_file_with_artifacts_and_sources`'s doc comment), which this
+        // file's own (empty) `sup` would never see, but a foreign file's
+        // directives still might suppress.
+        if sup.any() || other_sources.is_some() {
             // One table for the file: a newline count from byte 0 per
             // diagnostic is O(diagnostics x file size).
             let lines = LineIndex::new(&source);
+            // Lazily built per foreign file a diagnostic's primary label
+            // actually names — most files never trip this at all, and a
+            // project with many files must not pay for scanning every one
+            // just because one of them has a suppressible diagnostic.
+            let mut foreign: HashMap<String, (directive::DirectiveScan, LineIndex)> =
+                HashMap::new();
             diags.retain(|d| {
                 let Some(rule) = directive::rule_for_code(d.code) else {
                     return true;
                 };
-                let line = d
-                    .primary_label()
-                    .map_or(0, |l| lines.line_of(l.span.range.start));
-                !sup.suppresses(rule, line)
+                let Some(label) = d.primary_label() else {
+                    return true;
+                };
+                if label.span.file == file {
+                    let line = lines.line_of(label.span.range.start);
+                    return !sup.suppresses(rule, line);
+                }
+                // A cross-file primary label (`cross_file_class_decl_span`):
+                // suppression-check it against ITS OWN declaring file's
+                // directives and line index, never this file's — reusing
+                // `lines` (built from `file`'s source) against another
+                // file's byte offsets is exactly the bug this fixes.
+                let Some(resolve) = other_sources else {
+                    // No resolver: cannot determine correctly. Never
+                    // suppress rather than guess with the wrong file's line
+                    // index — the safe default (see the doc comment on
+                    // `check_file_with_artifacts_and_sources`).
+                    return true;
+                };
+                let (foreign_sup, foreign_lines) =
+                    foreign.entry(label.span.file.clone()).or_insert_with(|| {
+                        let text = resolve(&label.span.file).unwrap_or_default();
+                        let scan = directive::DirectiveScan::scan(&text);
+                        let idx = LineIndex::new(&text);
+                        (scan, idx)
+                    });
+                let line = foreign_lines.line_of(label.span.range.start);
+                !foreign_sup.suppresses(rule, line)
             });
         }
     }

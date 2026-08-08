@@ -34,11 +34,35 @@
 # comment on the `mutants` job in .github/workflows/mutants.yml, which
 # retired the job's own explicit pin because two hand-maintained copies of
 # the same scope were free to drift apart with nothing to notice (F4).
-# Widening the scope waits on #60, whose finding is that check.rs's fallback
-# is largely shadowed by inference, so auditing it before that cleanup would
-# allowlist noise rather than kill it. Not per-PR either way: a full run
-# costs tens of minutes, which is why it rides a schedule instead of the
-# merge path.
+# Widening luabox-types/src/check.rs into this list waits on #60, whose
+# finding is that check.rs's fallback is largely shadowed by inference, so
+# auditing it before that cleanup would allowlist noise rather than kill it.
+#
+# check_cmd.rs (luabox-cli) and lib.rs (luabox-types) are a DIFFERENT,
+# unblocked gap (#58 review round 6, M27): they are the two files the
+# RETAINED-TYPEENV REGRESSION GATE in perf-gate.sh exists to guard
+# (run_passes/check_one and build_file_env respectively) and are outside
+# this scope today — of the 24 non-test source files the round-6 delta
+# touched, only 3 were in scope. Measured, not guessed: adding both widens
+# the scope from 468 to 563 generated mutants (--list, this head:
+# check_cmd.rs alone contributes 59, lib.rs 36 — a ~20% increase, not an
+# order-of-magnitude one, so cost alone does not forbid widening). What DOES
+# forbid it this round: nobody has run the full audit over those 95 mutants
+# and reviewed what survives. Flipping FILES' default before that review
+# would either fail the very next scheduled/dispatch run on unreviewed NEW
+# survivors, or force waiving them without the review the allowlist's own
+# discipline requires (see the file header above) — worse than staying
+# narrow with the cost written down. Widening is therefore future work: run
+# `cargo mutants -p luabox-types -p luabox-cli --file
+# crates/luabox-types/src/lib.rs --file crates/luabox-cli/src/check_cmd.rs`,
+# review the survivors, extend mutants-allowlist.txt, THEN add both paths to
+# default_files below (and `-p luabox-cli` to the cargo-mutants invocation —
+# checked: passing an extra `-p` that owns none of the `--file` paths in a
+# given run is a no-op, so it is safe to add unconditionally ahead of time).
+# Not per-PR at any scope: a full run costs tens of minutes, which is why it
+# rides a schedule instead of the merge path — `mutants-pr`
+# (.github/workflows/mutants.yml) is the bounded, blocking exception (#58
+# review round 6, M22), and inherits whatever FILES defaults to here.
 set -u
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -47,6 +71,20 @@ repo="$here/../.."
 # against fixture expectations and a stub cargo-mutants; CI and every human
 # run take the default.
 allowlist="${ALLOWLIST:-$here/mutants-allowlist.txt}"
+# IN_DIFF is a seam for .github/workflows/mutants.yml's `mutants-pr` job
+# (#58 review round 6, M22): a path to a git diff file, passed straight
+# through to `cargo mutants --in-diff`, restricting the run to mutants in
+# code the diff touches. This is what lets a PR get an automatic, BLOCKING
+# measurement of the code it changed without paying the full scope's
+# tens-of-minutes cost on every push — see mutants.yml's file header. Unset
+# (the default) is every other run: no diff restriction, the ordinary shape
+# every check below already assumes. Two things change when it IS set (both
+# guarded by `in_diff` below, not by a separate code path): a run that
+# generates 0 mutants is expected, not a failure — a diff can legitimately
+# touch none of the scope — and a waived line with no live evidence this run
+# is reported as NOT MEASURED, not as proven dead, because a diff-bounded
+# run never even attempted the mutants outside its hunks.
+in_diff="${IN_DIFF:-}"
 # default_files is the scope of record — see SCOPE_OF_RECORD below — as well
 # as FILES' own default, from the one place both are written down.
 default_files="crates/luabox-types/src/env.rs,crates/luabox-types/src/defs.rs,crates/luabox-types/src/generics.rs,crates/luabox-types/src/infer/reify.rs"
@@ -164,11 +202,24 @@ if [ -n "$waived_files" ]; then
     fi
 fi
 
-echo "mutants-gate: cargo mutants -p luabox-types ${file_args[*]} (this takes a while)"
+diff_args=()
+if [ -n "$in_diff" ]; then
+    if [ ! -f "$in_diff" ]; then
+        echo "error: IN_DIFF names a diff file that does not exist: $in_diff" >&2
+        exit 1
+    fi
+    diff_args=(--in-diff "$in_diff")
+fi
+
+if [ -n "$in_diff" ]; then
+    echo "mutants-gate: cargo mutants -p luabox-types ${file_args[*]} --in-diff $in_diff (bounded to a diff, this is quick)"
+else
+    echo "mutants-gate: cargo mutants -p luabox-types ${file_args[*]} (this takes a while)"
+fi
 # Exit 3 = missed mutants, exit 4 = only timeouts. Both are judged below by
 # the allowlist comparison rather than by the exit code; anything else is a
 # real failure.
-(cd "$repo" && cargo mutants -p luabox-types "${file_args[@]}" -o "$out_dir")
+(cd "$repo" && cargo mutants -p luabox-types "${file_args[@]}" "${diff_args[@]}" -o "$out_dir")
 status=$?
 case "$status" in
 0 | 3 | 4) ;;
@@ -221,6 +272,16 @@ unviable="$results/unviable.txt"
 count_lines() { grep -c . "$1" 2>/dev/null || true; }
 generated=$(($(count_lines "$caught") + $(count_lines "$missed") + $(count_lines "$timeout") + $(count_lines "$unviable")))
 if [ "$generated" -eq 0 ]; then
+    # A diff-bounded run generating nothing is not the same fact as a
+    # full-scope run generating nothing: the latter means the scope is
+    # broken (a rename, a build failure — see the FAILED branch below); the
+    # former just means this PR's diff does not touch anything mutable in
+    # $files, which is ordinary and not evidence of anything wrong.
+    if [ -n "$in_diff" ]; then
+        echo
+        echo "mutants-gate: OK — the diff at $in_diff touches nothing mutable in scope ($files); nothing to audit this run"
+        exit 0
+    fi
     echo
     echo "mutants-gate: FAILED — the run generated 0 mutants, so nothing was audited" >&2
     echo "mutants-gate:   an empty run is not a clean one. Check the scope ($files) and that" >&2
@@ -389,10 +450,23 @@ END {
             for (b = a + 1; b <= rl; b++)
                 if (lkey2[b] < lkey2[a]) { t = lkey2[a]; lkey2[a] = lkey2[b]; lkey2[b] = t; t = lidx[a]; lidx[a] = lidx[b]; lidx[b] = t }
         pairs = (rw < rl) ? rw : rl
+        # More than one pair sharing this key is the SHIFT mirror of the
+        # STALE tie Pass 0 above already hedges: the SET of (waived, live)
+        # matches at this key is proven by the key itself, but WHICH
+        # specific reviewed reason belongs at WHICH specific new position is
+        # a position-rank pick among interchangeable candidates, not
+        # individual proof -- two different reviewed reasons can re-pin
+        # onto the same live mutant depending only on iteration/sort order
+        # if the reader trusts the pairing as fact (#58 review round 6,
+        # M26; the committed allowlist env.rs:759:30 and :762:27 share one
+        # mutation text, which is exactly this shape). shift_ambig marks
+        # every pair drawn from such a key so the report below can hedge it
+        # the same way the STALE case already hedges that tie.
+        shift_ambig = (pairs > 1) ? "TIE" : ""
         for (a = 1; a <= pairs; a++) {
             j = ridx[a]; i = lidx[a]
             wtaken[k, j] = 1; ltaken[k, i] = 1
-            print "SHIFT\t" wline[k, j] "\t" lline[k, i]
+            print "SHIFT\t" wline[k, j] "\t" lline[k, i] "\t" shift_ambig
             if (lkind[k, i] == "T") print "TIMEOUT\t" lline[k, i]
         }
         delete ridx; delete rkey; delete lidx; delete lkey2
@@ -413,7 +487,7 @@ new_timeouts=0
 shifts=0
 stale=0
 repin="$(mktemp)"
-while IFS=$'\t' read -r kind a b; do
+while IFS=$'\t' read -r kind a b c; do
     case "$kind" in
     NEW)
         if [ "$a" = "T" ]; then
@@ -426,7 +500,18 @@ while IFS=$'\t' read -r kind a b; do
         fails=$((fails + 1))
         ;;
     SHIFT)
-        echo "NOTE  waived mutant moved (same file and mutation, new position — re-pin, do not re-review):"
+        # $c == TIE (set by the classifier's Pass 2, above) means this pair
+        # was drawn from a key with more than one candidate on each side —
+        # the SET of matches is proven, but WHICH specific reviewed reason
+        # belongs at WHICH specific new position is a position-rank pick,
+        # not individual proof (N34's STALE-side hedge, mirrored — #58
+        # review round 6, M26). Say so instead of stating the pairing as
+        # fact on that side too.
+        if [ "$c" = "TIE" ]; then
+            echo "NOTE  waived mutant PROBABLY moved — multiple reviewed lines share this exact mutation text, so WHICH one belongs at the position below is a position-rank pick, not individual proof. Verify by hand before re-pinning:"
+        else
+            echo "NOTE  waived mutant moved (same file and mutation, new position — re-pin, do not re-review):"
+        fi
         echo "        was: $a"
         echo "        now: $b"
         printf '%s\t%s\n' "$a" "$b" >>"$repin"
@@ -440,12 +525,19 @@ while IFS=$'\t' read -r kind a b; do
         # i.e. a test now kills it. A line that only moved is a SHIFT above and
         # is still unkilled, so it is not stale and must not be pruned.
         #
+        # In IN_DIFF mode this is a DIFFERENT fact: a diff-bounded run never
+        # even attempts a mutant outside its hunks, so "no live evidence this
+        # run" here means "not measured", not "proven dead" — reported that
+        # way, and never as grounds to prune (#58 review round 6, M22).
+        #
         # $b == TIE (set by the classifier's Pass 0, above) means THIS line
         # was picked by position rank among several sharing the same
         # mutation text, with fewer caught.txt entries than candidates —
         # some line in that group is proven dead, this one specifically is
         # not (N34). Say so instead of stating the pick as fact.
-        if [ "$b" = "TIE" ]; then
+        if [ -n "$in_diff" ]; then
+            echo "NOTE  allowlist line not touched by this diff-bounded run (outside the PR's changed hunks) — no conclusion, do not prune from this alone: $a"
+        elif [ "$b" = "TIE" ]; then
             echo "NOTE  allowlist line PROBABLY no longer survives — proven dead is one of several reviewed lines sharing this exact mutation text; WHICH one is a position-rank pick, not individual proof. Verify by hand before pruning: $a"
         else
             echo "NOTE  allowlist line no longer survives (a test now kills it — prune it): $a"
@@ -476,7 +568,12 @@ rm -f "$classified"
 # the stale list, not something this gate can distinguish mechanically without
 # a generated-count baseline to compare against (which would need its own
 # provenance — see mutants-allowlist.txt's header).
-if [ "$waived_total" -gt 0 ] && [ "$stale" -eq "$waived_total" ]; then
+# Skipped entirely in IN_DIFF mode: a diff-bounded run legitimately
+# generates nothing for every waived line outside its hunks, so "100% of
+# the allowlist has no live evidence this run" is the ordinary shape of a
+# small diff, not a scope pointed at the wrong place. See the STALE case
+# above for the per-line wording that keeps this distinction honest.
+if [ -z "$in_diff" ] && [ "$waived_total" -gt 0 ] && [ "$stale" -eq "$waived_total" ]; then
     echo
     echo "mutants-gate: FAILED — every one of the $waived_total reviewed lines went stale in one run" >&2
     echo "mutants-gate:   that is what an audit pointed at the wrong scope looks like. Confirm the" >&2
@@ -486,8 +583,10 @@ fi
 
 total="$(count_lines "$missed")"
 timed_out="$(count_lines "$timeout")"
+stale_label="stale allowlist line(s)"
+[ -n "$in_diff" ] && stale_label="allowlist line(s) not touched by this diff (not measured, not pruned)"
 echo
-echo "mutants-gate: $generated mutant(s) generated, $total survivor(s), $timed_out timed out, $new new, $new_timeouts new timed out, $shifts shifted, $stale stale allowlist line(s)"
+echo "mutants-gate: $generated mutant(s) generated, $total survivor(s), $timed_out timed out, $new new, $new_timeouts new timed out, $shifts shifted, $stale $stale_label"
 if [ "$shifts" -gt 0 ]; then
     echo "mutants-gate: re-pin the $shifts shifted line(s) — replace column 1, reasons unchanged:"
     while IFS=$'\t' read -r was now; do

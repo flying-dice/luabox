@@ -58,81 +58,52 @@ $PSNativeCommandUseErrorActionPreference = $false
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
 
-# New-PerfManifest -Path -Name -Strict — every generated corpus below needs
-# a luabox.toml differing only in `name` and whether `[types] strict = true`
-# is present; two near-identical here-strings (the bash gate's N42 finding
-# applies here too) is exactly the kind of duplication that lets one copy
-# drift from the other silently. One writer, one place to read the shape
-# from — mirrors scripts/perf-gate-lib.sh's write_perf_manifest.
-function New-PerfManifest {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$Name,
-        [bool]$Strict = $false
-    )
-    $body = @"
-[package]
-name = "$Name"
-version = "0.0.0"
-edition = "5.4"
+# perf-gate-lib.ps1 holds every piece of judgement that does not need a real
+# binary (New-PerfManifest, Read-PerfBudgets, Test-LuaFileCount,
+# ConvertTo-ScaledBudgetMs) — mirrors scripts/perf-gate-lib.sh's split, and
+# is what scripts/tests/perf-gate-selftest.ps1 dot-sources to test this
+# file's judgement in milliseconds (#58 review round 6, M51).
+. (Join-Path $PSScriptRoot "perf-gate-lib.ps1")
 
-[build]
-target = "5.4"
-out = "dist"
+# The nine budget constants below used to be a second, hand-carried copy of
+# scripts/perf-gate.sh's own — one rule, two copies, free to drift (#58
+# review round 6, M50). They now live once, with their calibration
+# rationale, in perf-gate-budgets.env; Read-PerfBudgets parses the same
+# KEY=VALUE file scripts/perf-gate.sh `source`s directly.
+$PerfBudgets = Read-PerfBudgets (Join-Path $PSScriptRoot "perf-gate-budgets.env")
+$ColdStartBudgetBaseMs = $PerfBudgets["COLD_START_BUDGET_BASE_MS"]
+$FmtBudgetBaseMs = $PerfBudgets["FMT_BUDGET_BASE_MS"]
+$CheckBudgetBaseMs = $PerfBudgets["CHECK_BUDGET_BASE_MS"]
+$DiagLintBudgetBaseMs = $PerfBudgets["DIAG_LINT_BUDGET_BASE_MS"]
+$DiagCheckBudgetBaseMs = $PerfBudgets["DIAG_CHECK_BUDGET_BASE_MS"]
+$DiagLintRenderedBudgetBaseMs = $PerfBudgets["DIAG_LINT_RENDERED_BUDGET_BASE_MS"]
+$DiagCheckRenderedBudgetBaseMs = $PerfBudgets["DIAG_CHECK_RENDERED_BUDGET_BASE_MS"]
+$DiagCorpusFindings = $PerfBudgets["DIAG_CORPUS_FINDINGS"]
+# NOT scaled by -Factor: a slow or loaded machine runs the same allocations,
+# it just takes longer over them, so a CPU multiplier has no business
+# loosening a memory ceiling. $env:LUABOX_RSS_BUDGET_MIB overrides it, for
+# when the budget itself is being renegotiated.
+$RssBudgetMib = $(if ($env:LUABOX_RSS_BUDGET_MIB) { [int]$env:LUABOX_RSS_BUDGET_MIB } else { $PerfBudgets["RSS_BUDGET_MIB"] })
 
-"@
-    if ($Strict) {
-        $body += @"
-[types]
-strict = true
-
-"@
-    }
-    $body += "[dependencies]"
-    Set-Content -Path $Path -Value $body -NoNewline
-}
-
-$ColdStartBudgetBaseMs = 50
-$FmtBudgetBaseMs = 2000
-$CheckBudgetBaseMs = 1000
-# Diagnostics-heavy legs, on one file holding $DiagCorpusFindings findings.
-# Calibrated on the Linux dev baseline (see CHANGELOG "Fixed", wave 8):
-#   lint   357 ms fixed / 14 163 ms with the quadratic lookup restored
-#   check  663 ms fixed /  4 183 ms ditto
-# The budgets sit ~3x above the fixed numbers (headroom for a noisy box, on
-# top of -Factor) and ~3-12x below the broken ones.
-$DiagLintBudgetBaseMs = 1200
-$DiagCheckBudgetBaseMs = 1500
-# The same two corpora with nothing suppressed, so every finding is also
-# *rendered*. Calibrated the same way (Linux dev baseline, 20 k findings):
-#   lint   162 ms fixed /  9 295 ms with the quadratic renderer restored
-#   check  788 ms fixed / 15 462 ms ditto
-# Budgets ~3x above the fixed numbers and >=6x below the broken ones.
-# Rendered `lint` is *faster* than the suppressed leg above because
-# resolving 20 k `---@luabox-ignore` directives costs more than printing
-# 20 k frames — the suppressed leg is not a subset of this one, which is
-# why both stay.
-$DiagLintRenderedBudgetBaseMs = 600
-$DiagCheckRenderedBudgetBaseMs = 2400
-$DiagCorpusFindings = 20000
-# Peak-RSS ceiling for `check` on the 100-kLOC corpus, in MiB. decisions/07
-# accepted 64 -> 123 MiB; measured 123 MiB on the Linux dev baseline, so the
-# budget sits at ~2.4x that. Wide on purpose: this catches a *regime* change
-# (a whole-project structure retained, a per-file clone that used to be a
-# borrow), not a 10% drift — and Windows working-set accounting differs from
-# Linux RSS enough that a tight number would only produce false failures.
-$RssBudgetMib = $(if ($env:LUABOX_RSS_BUDGET_MIB) { [int]$env:LUABOX_RSS_BUDGET_MIB } else { 300 })
-
-$coldStartBudget = $ColdStartBudgetBaseMs * $Factor
-$fmtBudget = $FmtBudgetBaseMs * $Factor
+$coldStartBudget = ConvertTo-ScaledBudgetMs $ColdStartBudgetBaseMs $Factor
+$fmtBudget = ConvertTo-ScaledBudgetMs $FmtBudgetBaseMs $Factor
 
 Write-Host "perf-gate: LUABOX_PERF_FACTOR=$Factor (cold-start budget $([math]::Round($coldStartBudget)) ms, fmt budget $([math]::Round($fmtBudget)) ms)"
 
-Write-Host "perf-gate: building release binaries..."
-cargo build --release -p luabox-cli
-if ($LASTEXITCODE -ne 0) { throw "cargo build -p luabox-cli failed (exit $LASTEXITCODE)" }
-cargo build --release --manifest-path tools/gen-corpus/Cargo.toml --target-dir target/gen-corpus
-if ($LASTEXITCODE -ne 0) { throw "cargo build gen-corpus failed (exit $LASTEXITCODE)" }
+# $env:LUABOX_BIN / $env:GEN_CORPUS_BIN: override the two binaries this gate
+# measures and skip the `cargo build` entirely when BOTH are set — the
+# PowerShell counterpart of scripts/perf-gate.sh's own LUABOX_BIN/
+# GEN_CORPUS_BIN seam (#58 review round 6, M28/M51). Unset in every real
+# use; this exists for scripts/tests/perf-gate-selftest.ps1 to run this
+# file for real against a stub.
+$useStubBinaries = $env:LUABOX_BIN -and $env:GEN_CORPUS_BIN
+if (-not $useStubBinaries) {
+    Write-Host "perf-gate: building release binaries..."
+    cargo build --release -p luabox-cli
+    if ($LASTEXITCODE -ne 0) { throw "cargo build -p luabox-cli failed (exit $LASTEXITCODE)" }
+    cargo build --release --manifest-path tools/gen-corpus/Cargo.toml --target-dir target/gen-corpus
+    if ($LASTEXITCODE -ne 0) { throw "cargo build gen-corpus failed (exit $LASTEXITCODE)" }
+}
 
 # From here on, native calls are redirected with `*>` so their output can
 # be suppressed/measured cleanly. PowerShell wraps a redirected native
@@ -143,10 +114,15 @@ if ($LASTEXITCODE -ne 0) { throw "cargo build gen-corpus failed (exit $LASTEXITC
 # "Continue" and check $LASTEXITCODE explicitly where it matters instead.
 $ErrorActionPreference = "Continue"
 
-$luaboxBin = Join-Path $repoRoot "target/release/luabox.exe"
-if (-not (Test-Path $luaboxBin)) { $luaboxBin = Join-Path $repoRoot "target/release/luabox" }
-$genCorpusBin = Join-Path $repoRoot "target/gen-corpus/release/gen-corpus.exe"
-if (-not (Test-Path $genCorpusBin)) { $genCorpusBin = Join-Path $repoRoot "target/gen-corpus/release/gen-corpus" }
+if ($useStubBinaries) {
+    $luaboxBin = $env:LUABOX_BIN
+    $genCorpusBin = $env:GEN_CORPUS_BIN
+} else {
+    $luaboxBin = Join-Path $repoRoot "target/release/luabox.exe"
+    if (-not (Test-Path $luaboxBin)) { $luaboxBin = Join-Path $repoRoot "target/release/luabox" }
+    $genCorpusBin = Join-Path $repoRoot "target/gen-corpus/release/gen-corpus.exe"
+    if (-not (Test-Path $genCorpusBin)) { $genCorpusBin = Join-Path $repoRoot "target/gen-corpus/release/gen-corpus" }
+}
 
 $corpusDir = Join-Path ([System.IO.Path]::GetTempPath()) ("luabox-perf-corpus-" + [System.Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $corpusDir -Force | Out-Null
@@ -159,6 +135,20 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "gen-corpus failed (exit $LASTEXITCODE)" }
 
     New-PerfManifest -Path (Join-Path $corpusDir "luabox.toml") -Name "perf-gate-corpus" -Strict $true
+
+    # #58 review round 6, M30: the retained-TypeEnv corpus below was the
+    # ONLY one of three generated corpora wired to a file-count assertion —
+    # this one (the CHECK GATE / PEAK-RSS GATE legs' corpus) and the four
+    # diagnostics-heavy corpora further down could print PASS against an
+    # empty directory with nothing catching it. Fails the whole gate rather
+    # than skipping just this leg — matching perf-gate.sh's own `|| fail=1`
+    # wiring for the same three corpora, and decisions/07's "the ceiling
+    # side of the bargain" no longer resting on an unaudited assumption
+    # that generation actually ran.
+    if (-not (Test-LuaFileCount (Join-Path $corpusDir "src") 50)) {
+        Write-Host "FAIL 100-kLOC corpus generation: see the error above — the CHECK GATE and PEAK-RSS GATE legs below would not be measuring what their PASS/FAIL lines claim"
+        $fail = $true
+    }
 
     # --- Cold start: MIN of N runs ----------------------------------------
     # Min (not mean/median) is the right statistic for a cold-start
@@ -213,7 +203,7 @@ try {
     # --- CHECK GATE ----------------------------------------------------------
     # SPEC.md §16.1: `check` on the 100-kLOC corpus < 1 s warm. Live since
     # GL#6; the fmt --check gate above stays as the wider safety net.
-    $checkBudget = $CheckBudgetBaseMs * $Factor
+    $checkBudget = ConvertTo-ScaledBudgetMs $CheckBudgetBaseMs $Factor
     Write-Host ""
     Write-Host "perf-gate: check throughput on corpus (warm)..."
     Push-Location $corpusDir
@@ -298,7 +288,7 @@ try {
     $RetainedEnvCorpusFiles = 500
     $RetainedEnvRssBudgetMib = $(if ($env:LUABOX_RETAINED_ENV_RSS_BUDGET_MIB) { [int]$env:LUABOX_RETAINED_ENV_RSS_BUDGET_MIB } else { 100 })
     $RetainedEnvCheckBudgetBaseMs = 4000
-    $retainedEnvCheckBudget = $RetainedEnvCheckBudgetBaseMs * $Factor
+    $retainedEnvCheckBudget = ConvertTo-ScaledBudgetMs $RetainedEnvCheckBudgetBaseMs $Factor
 
     Write-Host ""
     Write-Host "perf-gate: generating $RetainedEnvCorpusFiles-file retained-TypeEnv regression corpus..."
@@ -331,10 +321,11 @@ try {
 
     # Windows counterpart of the bash gate's N38 fix: a PASS printed against
     # a corpus that was not actually generated the way the budgets below
-    # assume is not evidence of anything.
-    $actualLuaFiles = (Get-ChildItem -Path $retainedEnvSrc -Filter "*.lua" -File).Count
-    if ($actualLuaFiles -ne $RetainedEnvCorpusFiles) {
-        Write-Host ("FAIL retained-TypeEnv regression: corpus has {0} .lua file(s), expected {1} — the generation step did not run as this leg's budget assumes" -f $actualLuaFiles, $RetainedEnvCorpusFiles)
+    # assume is not evidence of anything. Routed through Test-LuaFileCount
+    # (perf-gate-lib.ps1) rather than a bespoke Get-ChildItem check here, so
+    # this and the two wirings above/below are one function, not three
+    # hand-rolled counts free to drift (#58 review round 6, M30/M50).
+    if (-not (Test-LuaFileCount $retainedEnvSrc $RetainedEnvCorpusFiles)) {
         $fail = $true
     } else {
         Write-Host ""
@@ -404,10 +395,10 @@ try {
     # column per label. Neither subsumes the other — a regression in
     # either half moves only its own pair — and stdout is discarded in
     # both, so the gate times the toolchain, not the terminal.
-    $diagLintBudget = $DiagLintBudgetBaseMs * $Factor
-    $diagCheckBudget = $DiagCheckBudgetBaseMs * $Factor
-    $diagLintRenderedBudget = $DiagLintRenderedBudgetBaseMs * $Factor
-    $diagCheckRenderedBudget = $DiagCheckRenderedBudgetBaseMs * $Factor
+    $diagLintBudget = ConvertTo-ScaledBudgetMs $DiagLintBudgetBaseMs $Factor
+    $diagCheckBudget = ConvertTo-ScaledBudgetMs $DiagCheckBudgetBaseMs $Factor
+    $diagLintRenderedBudget = ConvertTo-ScaledBudgetMs $DiagLintRenderedBudgetBaseMs $Factor
+    $diagCheckRenderedBudget = ConvertTo-ScaledBudgetMs $DiagCheckRenderedBudgetBaseMs $Factor
 
     $diagRoot = Join-Path $corpusDir "diagnostics-heavy"
     foreach ($project in @("lint", "check", "lint-rendered", "check-rendered")) {
@@ -473,6 +464,18 @@ try {
     }
     $checkRenderedLines.Add("return p")
     Set-Content -Path (Join-Path $diagRoot "check-rendered/src/main.lua") -Value $checkRenderedLines
+
+    # #58 review round 6, M30: each diagnostics-heavy corpus is one file: a
+    # truncated Set-Content or a wrong path would leave one of the four legs
+    # below timing an empty directory instead of $DiagCorpusFindings
+    # findings, exactly the "PASS on nothing" shape the CHECK GATE and
+    # RETAINED-TYPEENV REGRESSION GATE legs above are now wired against too.
+    foreach ($project in @("lint", "check", "lint-rendered", "check-rendered")) {
+        if (-not (Test-LuaFileCount (Join-Path $diagRoot "$project/src") 1)) {
+            Write-Host "FAIL diagnostics-heavy corpus generation ($project): see the error above"
+            $fail = $true
+        }
+    }
 
     Write-Host ""
     Write-Host "perf-gate: lint on a diagnostics-heavy file (warm)..."

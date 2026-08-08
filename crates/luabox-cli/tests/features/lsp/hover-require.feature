@@ -467,6 +467,43 @@ Feature: luabox lsp — hover and completion on a `require` binding
     Then the completion list contains "x"
     And completion item "x" has detail "Point.x: number"
 
+  Scenario: hover stops answering from a module deleted behind the editor's back
+    # Round 4 review R28 named this gap; round 5 review N45 asked for a
+    # black-box scenario alongside the white-box protocol proof
+    # (`server.rs`'s `a_watched_delete_publishes_empty_diagnostics_for_the_deleted_file`
+    # and its sibling), and round 6 review M48 found the deferral still
+    # undone and self-admittedly untracked. `point.lua` is deleted on disk
+    # and reported the way a real editor's file watcher would
+    # (`workspace/didChangeWatchedFiles`, `FileChangeType::DELETED`); `main.lua`
+    # must stop resolving through it — the binding falls back to `unknown`
+    # (the same answer an unresolved `require` gets, see "requiring a module
+    # that does not exist hovers gracefully" above) and the field access,
+    # which has nothing left to resolve against at all, goes null rather than
+    # keep confidently answering from the deleted file's last known shape.
+    Given a file "point.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+      local P = {}
+      return P
+      """
+    And a file "main.lua" containing:
+      """
+      local p = require("point")
+      print(p.x)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I hover at 1:6 in "main.lua"
+    Then the hover text contains "local p: Point"
+    When I hover at 1:8 in "main.lua"
+    Then the hover text contains "Point.x"
+    When the file "point.lua" is deleted
+    And I hover at 1:6 in "main.lua"
+    Then the hover text contains "local p: unknown"
+    When I hover at 1:8 in "main.lua"
+    Then the reply is null
+
   Scenario: hover tracks an edit to the declaring file
     # Pins the merged-ambient cache's invalidation: the first hover populates
     # the revision-keyed cache, the didChange to the OTHER file must
@@ -596,14 +633,21 @@ Feature: luabox lsp — hover and completion on a `require` binding
     When I hover at 2:8 in "main.lua"
     Then the hover text contains "Box.item: number"
 
-  # Round 4 review R32: this is a one-variable *control*, not #48 coverage —
-  # the pre-fix bare-name lookup produces the identical `Box.item: T` answer
-  # for this fixture (measured on both binaries), so it cannot distinguish
-  # the fix from its absence by itself. It stands beside the falsifiable
-  # bound-case scenario above (which the pre-fix lookup gets wrong, answering
-  # `T` where the fix answers `number`) to show the fix does not change the
-  # *unbound* answer — not to stand in for coverage of the bound one.
-  Scenario: control — an unbound generic class still hovers its free type parameter
+  # Round 4 review R32 kept this as a one-variable *control* beside the
+  # falsifiable bound case above, and pinned `Box.item: T` — the answer the
+  # pre-#48 bare-name lookup also gave, so it distinguished nothing.
+  #
+  # Round 6 review M21 measured what the checker says at the same position
+  # and it is not `T`. `luabox check --path` on this exact fixture reports
+  # `expected `number`, found `unknown`` — a left-unbound parameter crosses
+  # the reference boundary erased, the same `require`-boundary rule (#56)
+  # the export path applies, so the name `T` is never shown to a consumer
+  # who cannot bind it. Hover rendered the literal `T` and disagreed with
+  # the checker about the same field at the same character.
+  #
+  # So this scenario now pins agreement with the checker, and it IS
+  # falsifiable: the pre-M21 hover answers `T` here and fails it.
+  Scenario: control — an unbound generic parameter hovers erased, as the checker renders it
     Given a file "box.lua" containing:
       """
       ---@class Box<T>
@@ -618,4 +662,4 @@ Feature: luabox lsp — hover and completion on a `require` binding
     And the language server is running
     And the document "main.lua" is open
     When I hover at 2:8 in "main.lua"
-    Then the hover text contains "Box.item: T"
+    Then the hover text contains "Box.item: unknown"

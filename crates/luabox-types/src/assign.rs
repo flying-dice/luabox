@@ -89,8 +89,47 @@ impl Ctx<'_> {
             if v == t {
                 return true;
             }
+            // Declared ancestry is nominal: `---@class Child : Parent` makes
+            // a `Child` flow wherever a `Parent` is demanded, whatever the
+            // merged shapes say. Without this the two are compared
+            // structurally, so a subclass that *overrides* an inherited
+            // member at an incompatible type — the whole point of overriding
+            // — fails the upcast its own declaration promises.
+            //
+            // Measured against lua-language-server 3.13.5, which resolves
+            // this nominally: `Child : Parent` with `---@field v number` over
+            // `Parent`'s `---@field v string` passes `takes(child)` there and
+            // is rejected here. This restores that half.
+            //
+            // Strictly a loosening — it only ever turns a rejection into an
+            // acceptance, so it cannot introduce a false positive. The
+            // *tightening* half of nominality (luals also rejects an
+            // undeclared class that happens to match structurally, where
+            // luabox accepts it) is a core semantic change to every LB0300
+            // and is deliberately NOT made here — see #68.
+            //
+            // The declaration-site obligation is unaffected:
+            // `Checker::check_class_conformance` still verifies a `---@class
+            // Name : Parent` carrier against every member `Parent` declares,
+            // so an override that does not satisfy its base is still
+            // reported — at the declaration, which is where luals-style
+            // nominality wants it, rather than at every use.
+            //
+            // Ordered AFTER the coinduction guard, not before it (local
+            // merge-gate finding): `is_subclass` runs its own
+            // `walk_ancestor_names` and memoises nothing across calls, so
+            // asking it first made every re-entry on an already-in-flight
+            // pair re-walk the ancestry that the `seen` short-circuit answers
+            // in O(1). Structurally recursive named types (`A.next: B`,
+            // `B.next: A`, unrelated by declared ancestry) re-paid that walk
+            // at every nesting level. The guard is a pure short-circuit —
+            // returning `true` for a pair already in flight — so consulting
+            // it first cannot change any answer, only skip work.
             let pair = (v.clone(), t.clone());
             if self.seen.contains(&pair) {
+                return true;
+            }
+            if self.env.is_subclass(v, t) {
                 return true;
             }
             self.seen.push(pair);
@@ -851,6 +890,83 @@ mod tests {
         ok(&value, &target);
         // …but a non-optional target field does not.
         no(&value, &table(&[("a", Ty::Number, false)]));
+    }
+
+    // --- nominal ancestry -------------------------------------------------
+
+    /// Build a `TypeEnv` from one file of LuaCATS source, the way the
+    /// recursion-guard test below does.
+    fn env_from(src: &str) -> TypeEnv {
+        let mut env = TypeEnv::default();
+        env.merge_file_types(&{
+            let parsed = luabox_syntax::lua::parse(src, luabox_syntax::lua::Dialect::Lua54);
+            let items = luabox_syntax::luacats::harvest(&parsed);
+            let inner = TypeEnv::build_from_items(&parsed, &items, None);
+            crate::env::FileTypes::collect(
+                &items,
+                &inner,
+                &std::collections::HashMap::new(),
+                "nom.lua",
+            )
+        });
+        env
+    }
+
+    /// A subclass flows where its declared ancestor is demanded even when it
+    /// overrides an inherited member at an incompatible type — the nominal
+    /// half of luals 3.13.5's class assignability, measured against the
+    /// pinned binary. Structural comparison rejects this, which made
+    /// overriding a member break every upcast the declaration promises.
+    #[test]
+    fn a_subclass_upcasts_to_its_declared_ancestor_despite_an_incompatible_override() {
+        let env = env_from(
+            "\
+---@class NomP
+---@field v string
+---@class NomChild : NomP
+---@field v number
+---@class NomGrand : NomChild
+",
+        );
+        // Direct parent, and transitively through a grandparent.
+        for child in ["NomChild", "NomGrand"] {
+            assert!(
+                assignable(
+                    &env,
+                    Exactness::Strict,
+                    &Ty::Named(child.into()),
+                    &Ty::Named("NomP".into())
+                ),
+                "{child} should upcast to its declared ancestor NomP"
+            );
+        }
+        // The other direction is still refused: a parent is not a child.
+        assert!(!assignable(
+            &env,
+            Exactness::Strict,
+            &Ty::Named("NomP".into()),
+            &Ty::Named("NomChild".into())
+        ));
+    }
+
+    /// The nominal rule is ancestry, not name-similarity: an unrelated class
+    /// gets no free pass, and (until #68) still resolves structurally.
+    #[test]
+    fn an_unrelated_class_does_not_upcast_by_the_nominal_rule() {
+        let env = env_from(
+            "\
+---@class NomBase
+---@field v string
+---@class NomOther
+---@field v number
+",
+        );
+        assert!(!assignable(
+            &env,
+            Exactness::Strict,
+            &Ty::Named("NomOther".into()),
+            &Ty::Named("NomBase".into())
+        ));
     }
 
     // --- recursion guard --------------------------------------------------

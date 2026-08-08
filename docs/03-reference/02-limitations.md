@@ -115,6 +115,42 @@ whole. That is the escape hatch — your declaration corrects the packaged one
 rather than merging with it — and it is a different axis from duplicate
 declarations in code you wrote.
 
+### Malformed `---@class` headers give no diagnostic at the declaration (round 6 review M66 — tracking issue not yet filed)
+
+Every row above assumes `---@class` parses into a well-formed class at all.
+Four ways a header can fail to — a missing name, a name token the grammar
+can't lex as an identifier, a trailing comma in the `extends` list, and a
+bare `---@class` with nothing after it — are not covered by the precedence
+matrix or the verdict corpus, and two of the four currently give **no
+diagnostic anywhere**, at the declaration or otherwise. Measured against this
+version's release binary, `[types] strict = true`:
+
+| Shape | luabox (this version) | lua-language-server 3.13.5 |
+|---|---|---|
+| `---@class : Base` (no name, colon parent) | silent: `rc=0`, 0 errors, 0 warnings | `luadoc-miss-class-name` ("`<class name> expected`") at the declaration, plus `doc-field-no-class` on the `---@field` line beneath it |
+| `---@class 123abc` (non-identifier name) | silent: `rc=0`, 0 errors, 0 warnings | identical to the row above — luals treats a name token it can't lex as an identifier the same as a missing name |
+| `---@class A : P,` (trailing comma, `P` undeclared) | `LB0305 unknown type name \`P\`` at the declaration — `P` resolves through the ordinary undeclared-parent path (the same one `---@class A : Missing` already uses correctly); the trailing comma itself raises nothing | `luadoc-miss-class-extends-name` ("`<class extends name> expected`") at the comma, **plus** an ordinary `undefined-doc-class` on `P` — luals reports both the malformation and the undeclared parent, luabox only the latter |
+| bare `---@class` (no name, no colon) | silent at the declaration; the only signal is `LB0305 unknown type name` two lines later, at a *consumer*'s `---@type` reference to the name the class never got | `luadoc-miss-class-name` + `doc-field-no-class` at the declaration — same as the `: Base` row |
+
+luals reports a real diagnostic at the declaration for all four shapes; it is
+never silent. luabox is silent at the declaration for three of the four (the
+`A : P,` row's `LB0305` fires on the ordinary undeclared-parent check, not on
+the malformed extends-list syntax itself) and, for the fourth, only ever
+surfaces the problem indirectly, at a use site arbitrarily far from the
+actual mistake. A class-generator template with a typo'd header (a missing
+`class` name in a machine-generated `---@class` block, say) produces a class
+that simply does not exist, with nothing at the point of generation to say
+so — the failure surfaces later, and only if something happens to reference
+the missing name.
+
+The fix belongs in `luacats::harvest`, which currently drops a header it
+cannot parse into a class rather than emitting anything for it — no `LB0xxx`
+code is assigned for this condition yet. `crates/luabox-types/tests/class_merge_precedence_matrix.rs`'s
+`malformed_class_headers_m66` test (`#[ignore]`d) pins today's measured
+behaviour, including the `A : P,` correction above, so a regression on either
+side is visible the day someone runs it by hand, and so there is a concrete
+check to update once the harvest fix lands.
+
 ### LuaCATS tags: the full vocabulary is enforced
 
 Every LuaCATS tag now influences checking, navigation, or docs — nothing is

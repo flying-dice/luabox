@@ -146,7 +146,7 @@ fn member_hover(
         // place both hover and completion check that before falling back to
         // the table shape.
         if let Some((module, fields)) =
-            requires::require_struct_fields(sema, exports, ambient, binding)
+            requires::require_struct_fields(sema, exports, ambient, analysis, binding)
             && let Some(field) = fields.get(member.text())
         {
             let q = if field.optional { "?" } else { "" };
@@ -164,13 +164,19 @@ fn member_hover(
         // arguments exactly as the checker monomorphises the same
         // reference at its use site (#48): `Box<number>`'s `item` hovers
         // `number`, not the free `T` a bare-name lookup would leave it as.
+        // A *bare* reference's own free parameter (M21, round 6 review) is
+        // separately erased to `unknown` below, in `erase_unbound_own_param`
+        // — matching `TypeEnv::class_shape_bound_export`'s erasure, which
+        // this member route used to skip.
         if let Some(ty) = requires::receiver_type(sema, exports, binding)
             && let Some(class) = sema::named_of(&ty)
             && let Some(shape) = ambient.class_members_of(&ty)
         {
             if let Some(field) = shape.fields.get(member.text()) {
                 let q = if field.optional { "?" } else { "" };
-                let code = format!("(field) {class}.{}{q}: {}", member.text(), field.ty);
+                let rendered =
+                    erase_unbound_own_param(&ty, &field.ty, &class, analysis, &sema.path, ambient);
+                let code = format!("(field) {class}.{}{q}: {rendered}", member.text());
                 let docs = sema::locate_field(
                     analysis,
                     &sema.path,
@@ -178,6 +184,7 @@ fn member_hover(
                     member.text(),
                     ambient.ambient_paths(),
                     ambient.sema_cache(),
+                    ambient.search_order_cache(),
                 )
                 .and_then(|found| found.desc)
                 .unwrap_or_default();
@@ -229,6 +236,51 @@ fn member_hover(
         member.text_range(),
         sema,
     ))
+}
+
+/// Render a resolved class field's type the way `luabox check` does for a
+/// **bare** (unbound, no `<...>` arguments) generic reference (M21, round 6
+/// review): the checker erases `class`'s own free trailing type parameters
+/// to `unknown` at the exact reference site
+/// (`TypeEnv::class_shape_bound_export`), so a bare `---@type Box` on
+/// `---@class Box<T> / ---@field item T` renders `item: unknown`, not the
+/// literal `item: T` a plain, non-erasing lookup leaves it as. `field_ty`
+/// renders unchanged (via its `Display` impl) whenever the reference is
+/// bound (`args` non-empty — the checker's own monomorphisation already
+/// substituted a real type there, #48) or is not itself exactly one of
+/// `class`'s own declared parameters — see [`sema::class_own_params`]'s doc
+/// for the narrower, single-level approximation this uses in place of the
+/// checker's own (unreachable from this crate) erasing accessor.
+fn erase_unbound_own_param(
+    ty: &luabox_syntax::luacats::TypeExpr,
+    field_ty: &Ty,
+    class: &str,
+    analysis: &Analysis,
+    current: &std::path::Path,
+    ambient: &MergedAmbient,
+) -> String {
+    let luabox_syntax::luacats::TypeExprKind::Named { args, .. } = &ty.kind else {
+        return field_ty.to_string();
+    };
+    if !args.is_empty() {
+        return field_ty.to_string();
+    }
+    let Ty::Named(name) = field_ty else {
+        return field_ty.to_string();
+    };
+    let own_params = sema::class_own_params(
+        analysis,
+        current,
+        class,
+        ambient.ambient_paths(),
+        ambient.sema_cache(),
+        ambient.search_order_cache(),
+    );
+    if own_params.iter().any(|p| p == name) {
+        "unknown".to_string()
+    } else {
+        field_ty.to_string()
+    }
 }
 
 /// Hover for a global name: an annotated/declared function or a class name.
@@ -786,6 +838,70 @@ print(p.z)
         assert!(text.contains("(field) m.x: 42"), "{text}");
     }
 
+    /// M20 (round 6 review): the R7 gate is a *resolves* check, but before
+    /// this fix `require_struct_fields` only recognised a **class** as
+    /// resolving (`ambient.class_members_of`) — an explicit `---@type`
+    /// naming an `---@alias` (even one that itself expands to a class) fell
+    /// through to the raw structural export and hovered the confidently
+    /// wrong `(field) m.x: 42`, while `luabox check` enforces the alias's
+    /// real type through the same annotation. Confidently wrong is worse
+    /// than the honest `None` a fully unresolvable annotation gets (round
+    /// 5's behaviour for the equivalent shape) — this crate cannot expand
+    /// the alias itself (`sema::is_declared_alias_or_enum`'s own doc), so
+    /// `None` is the fixed answer, not the fully-correct `Point.x: string`.
+    #[test]
+    fn an_annotation_naming_an_alias_is_not_treated_as_the_structural_export() {
+        let files = [
+            (
+                "main.lua",
+                "---@alias Foo Point\n\n---@class Point\n---@field x string the point's x\n\n---@type Foo\nlocal m = require(\"m\")\nprint(m.x)\n",
+            ),
+            ("m.lua", "local M = {}\nM.x = 42\nreturn M\n"),
+        ];
+        assert_eq!(at_files(&files, "x)", 0), None);
+    }
+
+    /// H3 (claim C23): the require-vs-annotation gate accepts *any*
+    /// resolvable annotated type, not only a class (M20) —
+    /// `an_annotation_naming_an_alias_is_not_treated_as_the_structural_export`
+    /// above only ever exercised the alias half of that claim; nothing
+    /// exercised an `---@enum`, the gate's other non-class case
+    /// (`sema::is_declared_alias_or_enum` checks both `Tag::Alias` and
+    /// `Tag::Enum` in the same pass). Reverting the gate to classes-only
+    /// (dropping the `is_declared_alias_or_enum` arm from
+    /// `requires::require_struct_fields`) turns both of these back into the
+    /// confidently wrong `(field) m.x: 42` structural export instead of the
+    /// honest `None` — proved by hand: reverting that arm, running this
+    /// test, and confirming RED before restoring it.
+    #[test]
+    fn an_annotation_naming_an_alias_or_enum_is_not_treated_as_the_structural_export() {
+        let alias_files = [
+            (
+                "main.lua",
+                "---@alias Foo string\n\n---@type Foo\nlocal m = require(\"m\")\nprint(m.x)\n",
+            ),
+            ("m.lua", "local M = {}\nM.x = 42\nreturn M\n"),
+        ];
+        assert_eq!(
+            at_files(&alias_files, "x)", 0),
+            None,
+            "an alias-annotated binding must reject the structural export"
+        );
+
+        let enum_files = [
+            (
+                "main.lua",
+                "---@enum Bar\nlocal B = { a = 1 }\n\n---@type Bar\nlocal m = require(\"m\")\nprint(m.x)\n",
+            ),
+            ("m.lua", "local M = {}\nM.x = 42\nreturn M\n"),
+        ];
+        assert_eq!(
+            at_files(&enum_files, "x)", 0),
+            None,
+            "an enum-annotated binding must reject the structural export"
+        );
+    }
+
     #[test]
     fn a_require_of_a_module_that_does_not_exist_hovers_gracefully() {
         let files = [("main.lua", "local m = require(\"absent\")\nprint(m)\n")];
@@ -965,18 +1081,23 @@ print(p.z)
         assert!(!text.contains(": T"), "{text}");
     }
 
-    /// The one-variable control, both directions: the identical class
-    /// referenced bare stays lenient — the free `T` — exactly as it did
-    /// before #48, and exactly as `class_members_of`'s own unbound case
-    /// documents.
+    /// M21 (round 6 review): the identical class referenced bare must hover
+    /// `unknown`, not the literal free parameter name `T` — the answer this
+    /// test asserted *before* the fix, and the answer `luabox check` never
+    /// gave (the checker's own `class_shape_bound_export` erases a bare
+    /// reference's free trailing parameters at the reference site; hover's
+    /// member route used to skip that erasure entirely). Renamed from
+    /// `an_unbound_generic_receiver_still_hovers_leniently`: "leniently"
+    /// described the *old*, wrong behaviour this fix reverses.
     #[test]
-    fn an_unbound_generic_receiver_still_hovers_leniently() {
+    fn an_unbound_generic_receivers_free_parameter_hovers_as_unknown() {
         let files = [
             ("main.lua", "---@type Box\nlocal b = nil\nprint(b.item)\n"),
             ("box.lua", "---@class Box<T>\n---@field item T\n"),
         ];
         let text = at_files(&files, "item)", 0).expect("hover");
-        assert!(text.contains("Box.item: T"), "{text}");
+        assert!(text.contains("Box.item: unknown"), "{text}");
+        assert!(!text.contains(": T"), "{text}");
     }
 
     // === a dynamic-access class agrees with the checker's leniency (#53) ==
@@ -1020,6 +1141,51 @@ print(p.z)
     // lowering time (`lower.rs`'s own doc). No test declared this shape on
     // either surface before; this pins hover's half.
 
+    // === precedence-flip parity between hover's type and description (M2) =
+    //
+    // Round 6 review, finding M2: after the precedence flip, hover's *type*
+    // (resolved through the merged ambient — the same authority
+    // `luabox check` uses) and its *description*/goto-definition target
+    // (resolved through `sema::locate_field`) could name two different
+    // ancestors for the same field. `locate_field` walked the parent chain
+    // breadth-first while `TypeEnv::collect_class` resolves depth-first
+    // preorder; for `C : A, B` with `A : X` and both `X` and `B` declaring
+    // `f`, BFS could return `B`'s value while the checker resolved `X`'s.
+
+    /// The review's own repro, reproduced here: three declarations of `f`
+    /// reachable from `C`, the checker's own merge (via the ambient) landing
+    /// on `X`'s. All three answers a hover renders — the type, the
+    /// description, and (in `goto_definition.rs`'s sibling test) the jump
+    /// target — must agree on the same winner.
+    #[test]
+    fn hovers_type_and_description_agree_on_the_precedence_winner() {
+        let src = "\
+---@class X
+---@field f string the f from X
+---@class B
+---@field f number the f from B
+---@class A : X
+---@class C : A, B
+
+---@type C
+local c = nil
+print(c.f)
+";
+        let text = at(src, "f)", 0).expect("hover");
+        assert!(
+            text.contains("C.f: string"),
+            "the type must agree with `luabox check`'s own resolution (X's): {text}"
+        );
+        assert!(
+            text.contains("the f from X"),
+            "the description must name the same winner as the type: {text}"
+        );
+        assert!(
+            !text.contains("the f from B"),
+            "B's declaration must not win: {text}"
+        );
+    }
+
     #[test]
     fn an_alias_typed_field_hovers_with_the_alias_expanded() {
         let src = "\
@@ -1048,5 +1214,157 @@ print(c.dir)
             "See:\n  * a.b\n  * c.d"
         );
         assert_eq!(see_lines(&[]), "See:");
+    }
+
+    // === search_order cache wall time by ancestry depth (M57) =============
+
+    /// M57's own real-numbers sweep (round 6 review): `search_order` — and
+    /// its `may_declare_class` text scan — used to be recomputed from
+    /// scratch on every `locate_field` call, even a repeat hover of the
+    /// *same* class at the *same* revision. A representative stand-in for
+    /// the review's 17 MB defs corpus (many padded "noise" classes, so the
+    /// per-file scan has real bytes to walk) plus one linear ancestry chain
+    /// of the probed depth. Manual — run explicitly with `cargo test -p
+    /// luabox-lsp --release -- --ignored --nocapture
+    /// search_order_cache_wall_time_by_depth`; the round 6 report carries
+    /// the before/after numbers this prints.
+    #[test]
+    #[ignore = "manual wall-clock measurement, see the doc comment"]
+    fn search_order_cache_wall_time_by_depth() {
+        use std::fmt::Write as _;
+        for depth in [2usize, 10, 30, 60] {
+            let mut files: Vec<(String, String)> = Vec::new();
+            for i in 0..400 {
+                let mut src = format!("---@class Noise{i}\n");
+                for f in 0..20 {
+                    let _ = writeln!(
+                        src,
+                        "---@field f{f} number field number {f} of Noise{i}, padding this \
+                         declaration out the way a real defs file's documentation comments would"
+                    );
+                }
+                files.push((format!("noise{i}.lua"), src));
+            }
+            let mut chain = String::from("---@class Depth0\n---@field item number\n");
+            for i in 1..=depth {
+                let _ = writeln!(chain, "---@class Depth{i} : Depth{}", i - 1);
+            }
+            let _ = write!(
+                chain,
+                "\n---@type Depth{depth}\nlocal x = nil\nprint(x.item)\n"
+            );
+            files.push(("main.lua".to_string(), chain));
+
+            let root = root();
+            let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
+            host.set_root(root.clone());
+            for (rel, text) in &files {
+                host.apply_change(Change::SetFileText {
+                    path: root.join(rel),
+                    dialect: Dialect::Lua54,
+                    text: text.clone(),
+                });
+            }
+            let analysis = host.snapshot();
+            let main_path = root.join("main.lua");
+            let sema = FileSema::new(&analysis, &main_path).expect("sema");
+            let exports = RequireExports::resolve(&analysis, &main_path, &RockSurfaces::default());
+            let base = luabox_types::stdlib_defs(luabox_syntax::lua::Dialect::Lua54);
+            let ambient = MergedAmbient::build(base, &analysis.project_types(), &[]);
+            let main_src = &files.last().expect("main.lua present").1;
+            let offset = offset_of(main_src, "item)", 0);
+
+            let first_start = std::time::Instant::now();
+            hover(&sema, offset, &exports, &ambient, &analysis).expect("first hover");
+            let first = first_start.elapsed();
+
+            let repeat_start = std::time::Instant::now();
+            for _ in 0..3 {
+                hover(&sema, offset, &exports, &ambient, &analysis).expect("repeat hover");
+            }
+            let repeat = repeat_start.elapsed() / 3;
+
+            eprintln!("depth={depth}: first={first:?} repeat(avg of 3)={repeat:?}");
+        }
+    }
+
+    // === is_declared_alias_or_enum cache wall time by file count (H2) =====
+
+    /// H2's own real-numbers sweep: `sema::is_declared_alias_or_enum` is
+    /// `analysis.files().any(...)` — every project file's every annotation
+    /// item's every tag, uncached — reached from `require_struct_fields` on
+    /// every hover/completion against a `require`d binding whose explicit
+    /// `---@type` names an alias or enum rather than a class (the M20 gate,
+    /// `an_annotation_naming_an_alias_is_not_treated_as_the_structural_export`
+    /// exercises the same gate for correctness). A representative stand-in
+    /// for "a few hundred files with a sizeable defs set": padded noise
+    /// classes (20 fields each, the same shape [`search_order_cache_wall_time_by_depth`]
+    /// uses) so the per-file annotation scan has real tags to walk, plus one
+    /// file whose `require`d binding is annotated `---@type Foo` naming an
+    /// alias declared in a dedicated file. Manual — run explicitly with
+    /// `cargo test -p luabox-lsp --release -- --ignored --nocapture
+    /// is_declared_alias_or_enum_cache_wall_time_by_file_count`.
+    #[test]
+    #[ignore = "manual wall-clock measurement, see the doc comment"]
+    fn is_declared_alias_or_enum_cache_wall_time_by_file_count() {
+        use std::fmt::Write as _;
+        for n in [100usize, 300, 600] {
+            let mut files: Vec<(String, String)> = Vec::new();
+            for i in 0..n {
+                let mut src = format!("---@class Noise{i}\n");
+                for f in 0..20 {
+                    let _ = writeln!(
+                        src,
+                        "---@field f{f} number field number {f} of Noise{i}, padding this \
+                         declaration out the way a real defs file's documentation comments would"
+                    );
+                }
+                files.push((format!("noise{i}.lua"), src));
+            }
+            files.push((
+                "foo_alias.lua".to_string(),
+                "---@alias Foo string\n".to_string(),
+            ));
+            let main_src = "---@type Foo\nlocal m = require(\"m\")\nprint(m.x)\n".to_string();
+            files.push((
+                "m.lua".to_string(),
+                "local M = {}\nM.x = 42\nreturn M\n".to_string(),
+            ));
+            files.push(("main.lua".to_string(), main_src.clone()));
+
+            let root = root();
+            let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
+            host.set_root(root.clone());
+            for (rel, text) in &files {
+                host.apply_change(Change::SetFileText {
+                    path: root.join(rel),
+                    dialect: Dialect::Lua54,
+                    text: text.clone(),
+                });
+            }
+            let analysis = host.snapshot();
+            let main_path = root.join("main.lua");
+            let sema = FileSema::new(&analysis, &main_path).expect("sema");
+            let exports = RequireExports::resolve(&analysis, &main_path, &RockSurfaces::default());
+            let base = luabox_types::stdlib_defs(luabox_syntax::lua::Dialect::Lua54);
+            let ambient = MergedAmbient::build(base, &analysis.project_types(), &[]);
+            let offset = offset_of(&main_src, "x)", 0);
+
+            let first_start = std::time::Instant::now();
+            let result = hover(&sema, offset, &exports, &ambient, &analysis);
+            let first = first_start.elapsed();
+            assert!(
+                result.is_none(),
+                "the gate must reject the structural export"
+            );
+
+            let repeat_start = std::time::Instant::now();
+            for _ in 0..3 {
+                let _ = hover(&sema, offset, &exports, &ambient, &analysis);
+            }
+            let repeat = repeat_start.elapsed() / 3;
+
+            eprintln!("files={n}: first={first:?} repeat(avg of 3)={repeat:?}");
+        }
     }
 }

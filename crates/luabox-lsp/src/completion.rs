@@ -61,7 +61,12 @@ pub fn completion(
 
     let mut items: BTreeMap<String, CompletionItem> = BTreeMap::new();
     if let Some(trigger) = trigger {
-        member_items(sema, text, start - 1, trigger, exports, ambient, &mut items);
+        let resolvers = Resolvers {
+            analysis,
+            exports,
+            ambient,
+        };
+        member_items(sema, text, start - 1, trigger, &resolvers, &mut items);
     } else {
         scope_items(sema, offset, &mut items);
         // Auto-require runs after scope items so names already in scope
@@ -89,13 +94,23 @@ pub fn completion(
 /// receiver's class members resolved through the workspace ambient (#56) —
 /// which already includes every class *this* file declares, so there is one
 /// lookup, not a file-local one shadowed by a cross-file fallback (#46).
+/// The three shared resolution sources a member-completion route reads, in
+/// one value: the project database, the `require`-export resolution the type
+/// pass checks against, and the merged workspace ambient. Every route needs
+/// the same three, unchanged, so they travel together rather than as three
+/// positional parameters each.
+struct Resolvers<'a> {
+    analysis: &'a Analysis,
+    exports: &'a RequireExports,
+    ambient: &'a MergedAmbient,
+}
+
 fn member_items(
     sema: &FileSema,
     text: &str,
     dot_offset: usize,
     trigger: u8,
-    exports: &RequireExports,
-    ambient: &MergedAmbient,
+    resolvers: &Resolvers<'_>,
     items: &mut BTreeMap<String, CompletionItem>,
 ) {
     let bytes = text.as_bytes();
@@ -111,8 +126,8 @@ fn member_items(
         reason = "dot_offset indexes an ASCII `.`/`:` and recv_start walks back over ASCII identifier bytes, so both are char boundaries"
     )]
     let receiver = &text[recv_start..dot_offset];
-    require_member_items(sema, receiver, recv_start, trigger, exports, ambient, items);
-    ambient_member_items(sema, receiver, recv_start, trigger, exports, ambient, items);
+    require_member_items(sema, receiver, recv_start, trigger, resolvers, items);
+    ambient_member_items(sema, receiver, recv_start, trigger, resolvers, items);
 }
 
 /// Members of a `require` binding: the named fields of the required module's
@@ -131,15 +146,19 @@ fn require_member_items(
     receiver: &str,
     recv_start: usize,
     trigger: u8,
-    exports: &RequireExports,
-    ambient: &MergedAmbient,
+    resolvers: &Resolvers<'_>,
     items: &mut BTreeMap<String, CompletionItem>,
 ) {
     let Some(binding) = sema.visible_binding_named(receiver, recv_start) else {
         return;
     };
-    let Some((module, fields)) = requires::require_struct_fields(sema, exports, ambient, binding)
-    else {
+    let Some((module, fields)) = requires::require_struct_fields(
+        sema,
+        resolvers.exports,
+        resolvers.ambient,
+        resolvers.analysis,
+        binding,
+    ) else {
         return;
     };
     for (name, field) in fields {
@@ -188,14 +207,13 @@ fn ambient_member_items(
     receiver: &str,
     recv_start: usize,
     trigger: u8,
-    exports: &RequireExports,
-    ambient: &MergedAmbient,
+    resolvers: &Resolvers<'_>,
     items: &mut BTreeMap<String, CompletionItem>,
 ) {
     let Some(binding) = sema.visible_binding_named(receiver, recv_start) else {
         return;
     };
-    let Some(ty) = requires::receiver_type(sema, exports, binding) else {
+    let Some(ty) = requires::receiver_type(sema, resolvers.exports, binding) else {
         return;
     };
     let Some(class) = sema::named_of(&ty) else {
@@ -205,7 +223,7 @@ fn ambient_member_items(
     // the checker monomorphises the same reference at its use site (#48):
     // `Box<number>`'s `item` offers `number`, not the free `T` a bare-name
     // lookup would leave it as.
-    let Some(shape) = ambient.class_members_of(&ty) else {
+    let Some(shape) = resolvers.ambient.class_members_of(&ty) else {
         return;
     };
     for (name, field) in &shape.fields {

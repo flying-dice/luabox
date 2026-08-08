@@ -46,6 +46,9 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 orig_path="$PATH"
 
+# shellcheck source=selftest-lib.sh
+source "$here/selftest-lib.sh"
+
 # A stub cargo-mutants: writes the outcome files staged in $STUB_OUTCOMES
 # (one `name:line` per line, name in caught|missed|timeout|unviable) into the
 # -o directory, then exits $STUB_EXIT. `cargo mutants` dispatches to whatever
@@ -106,9 +109,6 @@ LIST
 # Real files, so the scope check passes for every case that is not about it.
 scope="crates/luabox-types/src/env.rs"
 
-pass=0
-fail=0
-
 # run <name> <exit-expected> <outcomes-file> <stub-exit> <needle>...
 # A needle prefixed with `!` must be ABSENT from the log rather than present
 # — a second, unrelated failure path can supply the same "expected" string a
@@ -132,37 +132,7 @@ run() {
         FILES="$files" ALLOWLIST="$list" SCOPE_OF_RECORD="$record" MUTANTS_OUT="$work/out-$name" \
         bash "$gate" >"$log" 2>&1
     local got=$?
-    local ok=1
-    local report=""
-    [ "$got" = "$want_exit" ] || {
-        ok=0
-        report="$report expected exit $want_exit"
-    }
-    local needle
-    for needle in "$@"; do
-        case "$needle" in
-        !*)
-            if grep -qF -- "${needle#!}" "$log"; then
-                ok=0
-                report="$report present-but-should-be-absent:[${needle#!}]"
-            fi
-            ;;
-        *)
-            if ! grep -qF -- "$needle" "$log"; then
-                ok=0
-                report="$report missing:[$needle]"
-            fi
-            ;;
-        esac
-    done
-    if [ "$ok" = 1 ]; then
-        echo "PASS  $name (exit $got)"
-        pass=$((pass + 1))
-    else
-        echo "FAIL  $name: got exit $got.$report" >&2
-        sed 's/^/        /' "$log" >&2
-        fail=$((fail + 1))
-    fi
+    assert_exit "$name" "$want_exit" "$got" "$log" "$@"
 }
 
 steady="$work/steady.txt"
@@ -229,6 +199,39 @@ OUT
 run shifted_batch_is_not_new 0 "$shifted" 3 "3 shifted" "0 new" "re-pin the 3 shifted" \
     "was: crates/luabox-types/src/env.rs:298:30" "now: crates/luabox-types/src/env.rs:309:30" \
     "old: crates/luabox-types/src/env.rs:298:30" "new: crates/luabox-types/src/env.rs:309:30"
+
+# #58 review round 6, M26: N34 hedged the STALE side of exactly this
+# ambiguity ("PROBABLY ... a position-rank pick, not individual proof") but
+# left the SHIFT side printing "re-pin, do not re-review" unhedged for the
+# mirror-image guess — live in the committed allowlist today, where
+# env.rs:759:30 and :762:27 share one mutation text. Two waived lines
+# sharing a key (no caught.txt evidence either way) both move to two live
+# survivors sharing the same key: the SET of matches is proven (both keys
+# match), but WHICH reviewed reason belongs at WHICH new position is a
+# position-rank pick among interchangeable candidates — swap the two waived
+# lines' reasons and the report would look identical. Both SHIFT lines here
+# must carry the hedge, not the confident "re-pin, do not re-review" wording
+# shifted_batch_is_not_new above legitimately keeps for its own unambiguous
+# pairs (checked directly: mutants-gate.sh's `shift_ambig = (pairs > 1) ?
+# "TIE" : ""` line neutered to `shift_ambig = ""` reproduces the pre-fix
+# unhedged wording on this exact fixture).
+multi_shift="$work/multi-shift.txt"
+cat >"$multi_shift" <<'OUT'
+missed:crates/luabox-types/src/env.rs:500:1: replace TypeEnv::is_class -> bool with true
+missed:crates/luabox-types/src/env.rs:600:1: replace TypeEnv::is_class -> bool with true
+OUT
+multi_shift_allowlist="$work/multi-shift-allowlist.txt"
+cat >"$multi_shift_allowlist" <<'LIST'
+crates/luabox-types/src/env.rs:10:1: replace TypeEnv::is_class -> bool with true	[equivalent] first reason
+crates/luabox-types/src/env.rs:15:1: replace TypeEnv::is_class -> bool with true	[equivalent] second reason
+LIST
+ALLOWLIST_OVERRIDE="$multi_shift_allowlist" \
+    run shift_pairing_is_hedged_when_ambiguous 0 "$multi_shift" 3 \
+    "2 shifted" \
+    "PROBABLY moved" "position-rank pick, not individual proof" \
+    "was: crates/luabox-types/src/env.rs:10:1" "now: crates/luabox-types/src/env.rs:500:1" \
+    "was: crates/luabox-types/src/env.rs:15:1" "now: crates/luabox-types/src/env.rs:600:1" \
+    "!waived mutant moved (same file and mutation, new position — re-pin, do not re-review)"
 
 # The mixed batch that defeated the old rule: two shifts and one genuinely
 # new mutant in the same run. Counts alone cannot separate them; the key can.
@@ -772,6 +775,48 @@ ALLOWLIST_OVERRIDE="$take0_allowlist" \
     "!prune it): crates/luabox-types/src/env.rs:60:1" \
     "!was: crates/luabox-types/src/env.rs:50:1"
 
+# #58 review round 6, M25: the case directly above lists its two waived
+# lines in ASCENDING position order in the allowlist FILE (50 before 60),
+# which is also their encounter order — so it never isolates Pass 0's own
+# tie-break sort (mutants-gate.sh's `rkey0`/`ridx0` selection-sort block)
+# from the plain encounter order the W lines arrive in: deleting that sort
+# left this file 31/31 green, because sorting an already-sorted array is a
+# no-op (confirmed directly against mutants-gate.sh with the sort block
+# removed and this fixture — see below — re-run against it). Reversed here:
+# the allowlist FILE lists the HIGH position (80) first and the LOW
+# position (20) second — encounter order is [80, 60]... no: [80, 20] —
+# while nc=1 (one caught entry) still proves exactly one of the two dead.
+# Correct (sorted) behaviour retires the LOWER position (20) as STALE
+# regardless of file order and leaves 80 open for Pass 2 to pair with the
+# live survivor at 90. Confirmed by deleting the same `rkey0`/`ridx0` sort
+# block mutants-gate.sh's pass0_retires_lowest_position_first case above
+# checks: WITH the sort this fixture prints "STALE ...:20:1" (PROBABLY) and
+# "was: ...:80:1 / now: ...:90:1"; WITHOUT it, encounter order (not
+# position) decides, and the whole pairing flips — "STALE ...:80:1" and
+# "was: ...:20:1 / now: ...:90:1" instead: two different reviewed reasons
+# re-pinned onto the same live mutant depending on whether the sort runs,
+# exit 0 either way, exactly what the review found unproven by the
+# ascending-order case alone.
+descending_allowlist="$work/descending-allowlist.txt"
+cat >"$descending_allowlist" <<'LIST'
+crates/luabox-types/src/env.rs:80:1: replace TypeEnv::is_class -> bool with true	[equivalent] higher position, listed FIRST in the file
+crates/luabox-types/src/env.rs:20:1: replace TypeEnv::is_class -> bool with true	[equivalent] lower position, listed SECOND in the file
+LIST
+descending_outcomes="$work/descending-outcomes.txt"
+cat >"$descending_outcomes" <<'OUT'
+caught:crates/luabox-types/src/env.rs:999:1: replace TypeEnv::is_class -> bool with true
+missed:crates/luabox-types/src/env.rs:90:1: replace TypeEnv::is_class -> bool with true
+OUT
+ALLOWLIST_OVERRIDE="$descending_allowlist" \
+    run pass0_tie_break_sort_is_load_bearing_on_descending_allowlist 0 "$descending_outcomes" 3 \
+    "1 stale" \
+    "PROBABLY no longer survives" "position-rank pick, not individual proof" \
+    "crates/luabox-types/src/env.rs:20:1" \
+    "was: crates/luabox-types/src/env.rs:80:1" "now: crates/luabox-types/src/env.rs:90:1" \
+    "!prune it): crates/luabox-types/src/env.rs:20:1" \
+    "!prune it): crates/luabox-types/src/env.rs:80:1" \
+    "!was: crates/luabox-types/src/env.rs:20:1"
+
 # `| sort` at the end of the classification pipeline — mixed_batch_output_is_
 # sorted above already discloses that its own 2-key fixture happens to come
 # out in sorted order from gawk's unsorted hash iteration anyway, so it does
@@ -817,6 +862,4 @@ else
     fail=$((fail + 1))
 fi
 
-echo
-echo "mutants-gate-selftest: $pass passed, $fail failed"
-[ "$fail" -eq 0 ]
+selftest_report "mutants-gate-selftest"

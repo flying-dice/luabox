@@ -1,6 +1,14 @@
 //! The `LB03xx` diagnostic codes this crate emits — the Semantics block of the
 //! `luabox-diag` registry.
 //!
+//! Three of these are `pub`: `LB0317`, `LB0318` and `LB0319` are emitted by
+//! `luabox-cli`'s own syntactic pre-check as well as by this crate, and a
+//! code number written as a `Code::new(317)` literal on the far side of a
+//! crate boundary is a constant with two owners and no compiler-enforced
+//! link between them (local merge-gate finding; the *suppression-name* half
+//! of the same pair had already drifted once). The rest stay `pub(crate)` —
+//! nothing outside this crate emits them.
+//!
 //! One `const` per code, so both emission sites and the code *comparisons* on
 //! the check path (`---@diagnostic` suppression, cascade collapsing) speak in
 //! [`Code`] values. `Code` is a `Copy` newtype over a `u16` with derived
@@ -56,7 +64,42 @@ pub(crate) const AWAIT_IN_SYNC: Code = Code::new(316);
 /// trips on `on_path.len()`, the depth of the *current recursion path*, so
 /// `---@class A : B, C` with one branch past the cap reports this exactly as
 /// a strict chain does. The CLI's separate syntactic pre-check
-/// (`check_cmd::deep_class_chain_diagnostic`) *is* single-parent-only — it
-/// treats a multi-parent class as a root and does not follow it — so the two
-/// guards differ in reach and only that one deserves the qualifier.
-pub(crate) const CLASS_DEPTH_LIMIT: Code = Code::new(317);
+/// (`check_cmd::deep_class_chain_diagnostics`) follows every named parent
+/// too (round 6 review M4(c) — it used to treat any multi-parent class as a
+/// root and not follow it at all, so the identical depth flipped from
+/// `error`/exit 1 to `warning`/exit 0 the moment an unrelated second parent
+/// was added), so the two guards agree on reach; what the pre-check still
+/// does not follow is a parent expressed as anything other than a bare
+/// name (a union, a table literal, a generic argument, ...) — it
+/// under-counts there rather than duplicating this resolver's own walk.
+pub const CLASS_DEPTH_LIMIT: Code = Code::new(317);
+/// A `---@class` that is its own ancestor — `---@class A : A`, or a mutual
+/// `A : B` / `B : A` (round 6 review M67). [`CYCLIC_ALIAS`]'s counterpart on
+/// the class axis: `DiamondGuard`'s `on_path` guard already stops the walk,
+/// so this never crashed, but the cycle resolved *silently* and a user whose
+/// intent was to inherit from something else got no signal at all.
+///
+/// luabox-only, like [`CLASS_DEPTH_LIMIT`] — measured against the pinned
+/// lua-language-server 3.13.5, which reports nothing for either shape.
+/// Deliberately stricter, and downgradable the same way every other `LB03xx`
+/// is: `[types] strict = false` makes it a warning and `---@diagnostic
+/// disable[-line|-next-line]: cyclic-class-ancestry` suppresses it
+/// ([`crate::directive::RULE_CYCLIC_CLASS_ANCESTRY`], the single owner of
+/// that name).
+pub const CYCLIC_CLASS: Code = Code::new(318);
+/// A `---@class` ancestry whose *resolution cost* — not its depth — exceeds
+/// what the merge walk will spend on it (`env::MAX_ANCESTRY_RESOLUTIONS`).
+///
+/// Distinct from [`CLASS_DEPTH_LIMIT`] because the cause and the remedy are
+/// different, and reporting one as the other actively misleads. The depth cap
+/// protects the native stack and is fixed by *flattening*; this bounds the
+/// re-resolution a conflicting diamond forces and is fixed by making the
+/// conflict go away — binding a shared generic ancestor the same way on every
+/// branch, or not reaching it twice.
+///
+/// It counts **re**-resolutions only. A wide, shallow hierarchy — one
+/// `---@class` per generated binding, hundreds of them, each visited once —
+/// costs one visit per node, resolves in linear time, and must not trip this:
+/// measured, a 601-class / depth-6 hierarchy checks in 0.09 s. Counting first
+/// visits rejected exactly that shape (round 6 review, local merge-gate).
+pub const CLASS_COST_LIMIT: Code = Code::new(319);

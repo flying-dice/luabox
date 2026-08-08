@@ -54,9 +54,9 @@ use crate::assign::{
     Exactness, LiteralConformance, assignable, classify_literal, is_integral_literal,
 };
 use crate::codes::{
-    AWAIT_IN_SYNC, CLASS_DEPTH_LIMIT, CYCLIC_ALIAS, DEPRECATED, DISCARD_RETURNS,
-    DUPLICATE_DOC_FIELD, GENERIC_ARITY, MISSING_FIELD, RETURN_MISMATCH, TYPE_MISMATCH,
-    UNKNOWN_FIELD, UNKNOWN_TYPE_NAME, WRONG_ARG_COUNT,
+    AWAIT_IN_SYNC, CLASS_COST_LIMIT, CLASS_DEPTH_LIMIT, CYCLIC_ALIAS, CYCLIC_CLASS, DEPRECATED,
+    DISCARD_RETURNS, DUPLICATE_DOC_FIELD, GENERIC_ARITY, MISSING_FIELD, RETURN_MISMATCH,
+    TYPE_MISMATCH, UNKNOWN_FIELD, UNKNOWN_TYPE_NAME, WRONG_ARG_COUNT,
 };
 use crate::env::{self, MAX_ANCESTRY_DEPTH, TypeEnv};
 use crate::ty::{FieldTy, FunctionTy, OperatorSig, ParamTy, TableTy, Ty};
@@ -180,50 +180,200 @@ pub(crate) fn run(
     checker.check_deferred_carriers();
     checker.check_class_conformance();
 
-    // A `---@class` ancestor chain too deep for `DiamondGuard` to walk
-    // safely (LB0317, round 5 review N2's durable fix): every
-    // `class_shape`/`class_shape_bound`/`class_operators` query made above
-    // — and every one inference made building `inference`, before this
-    // function started — shares `typeenv`'s depth-limit ledger, so draining
-    // it here, after both have finished querying `typeenv` for this file,
-    // catches every root class whose resolution the guard refused to
-    // finish, not just the ones this pass itself queried.
-    for name in typeenv.take_depth_limit_hits() {
-        let limit_note = format!(
-            "exceeds the {MAX_ANCESTRY_DEPTH}-class ancestry limit this checker enforces to \
-             avoid a stack overflow while resolving it"
-        );
-        let remedy = "flatten the hierarchy or use composition instead of a long \
-             inheritance chain — members above the limit are not included in this \
-             class's resolved shape"
-            .to_string();
-        if let Some(range) = typeenv.class_decl_span(&name) {
-            checker.report_full(
-                CLASS_DEPTH_LIMIT,
-                range,
-                format!("`{name}`'s `---@class` ancestry is too deep to resolve safely"),
-                limit_note,
-                Some(remedy),
-            );
-        } else if let Some((decl_file, range)) = typeenv.cross_file_class_decl_span(&name) {
-            checker.diags.push(
-                Diagnostic::new(
-                    CLASS_DEPTH_LIMIT,
-                    severity,
-                    format!("`{name}`'s `---@class` ancestry is too deep to resolve safely"),
-                )
-                .with_label(Label::primary(Span::new(decl_file, range), limit_note))
-                .with_note(remedy),
-            );
-        }
-        // Else: no locatable declaration in this project (an ambient /
-        // `[types] defs` class) — the crash is still prevented; there is
-        // simply nothing here to point a diagnostic at.
-    }
+    report_depth_limit_hits(&mut checker, typeenv, file, severity);
+    report_cyclic_class_hits(&mut checker, typeenv, file, severity);
+    report_cost_limit_hits(&mut checker, typeenv, file, severity);
 
     let mut diags = checker.diags;
     diags.sort_by_key(|d| d.primary_label().map_or(0, |l| l.span.range.start));
     diags
+}
+
+/// One `---@class` ancestry-ledger drain → diagnostics: the three-tier
+/// attribution [`report_depth_limit_hits`] (`LB0317`), [`report_cyclic_class_hits`]
+/// (`LB0318`) and [`report_cost_limit_hits`] (`LB0319`) all need — this
+/// file's own declaration, another project file's declaration, and (round 6
+/// review M5) the consuming file for a class only an ambient `[types] defs`
+/// package declares, so a class with no in-project span still gets a
+/// diagnostic rather than leaving `luabox check` green on a project the LSP
+/// reports red on. Before this the three drains hand-copied ~55 identical
+/// lines apiece, differing only in `code` and the message text (production
+/// readiness review G3) — one mechanism now, parameterised by the drained
+/// names, the diagnostic `code`, and the closures that produce each
+/// diagnostic's headline/detail/remedy text from the offending class name.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the whole point is one signature all three call sites share \
+              instead of three ~55-line hand-copies (G3) — splitting the \
+              parameters into a struct would just move the same nine names \
+              one level down, not reduce them"
+)]
+fn report_ancestry_hits(
+    checker: &mut Checker<'_>,
+    typeenv: &TypeEnv,
+    file: &str,
+    severity: Severity,
+    code: Code,
+    hits: Vec<String>,
+    headline: impl Fn(&str) -> String,
+    detail: impl Fn(&str) -> String,
+    remedy: impl Fn(&str) -> String,
+) {
+    for name in hits {
+        let headline_msg = headline(&name);
+        let detail_msg = detail(&name);
+        let remedy_msg = remedy(&name);
+        if let Some(range) = typeenv.class_decl_span(&name) {
+            checker.report_full(code, range, headline_msg, detail_msg, Some(remedy_msg));
+        } else if let Some((decl_file, range)) = typeenv.cross_file_class_decl_span(&name) {
+            checker.diags.push(
+                Diagnostic::new(code, severity, headline_msg)
+                    .with_label(Label::primary(Span::new(decl_file, range), detail_msg))
+                    .with_note(remedy_msg),
+            );
+        } else {
+            // No locatable declaration anywhere in this project: `name` is
+            // an ambient / `[types] defs` class. This *file's* own
+            // resolution is exactly what tripped the guard, so attribute the
+            // diagnostic to the file that consumed it, at its start — there
+            // is no more specific in-project span, since the class itself is
+            // declared nowhere this project owns.
+            checker.diags.push(
+                Diagnostic::new(code, severity, headline_msg)
+                    .with_label(Label::primary(Span::new(file, 0..0), detail_msg))
+                    .with_note(format!(
+                        "`{name}` is declared in an ambient `[types] defs` package, not this \
+                         project's own source, so there is no in-project declaration to point at \
+                         directly — {remedy_msg}"
+                    )),
+            );
+        }
+    }
+}
+
+/// Drain `typeenv`'s depth-limit ledger into `LB0317` diagnostics.
+///
+/// A `---@class` ancestor chain too deep for `DiamondGuard` to walk safely
+/// (round 5 review N2's durable fix): every
+/// `class_shape`/`class_shape_bound`/`class_operators` query [`run`] made —
+/// and every one inference made building its `InferenceView`, before [`run`]
+/// started — shares `typeenv`'s ledger, so draining it here, after both have
+/// finished querying `typeenv` for this file, catches every root class whose
+/// resolution the guard refused to finish, not just the ones the check pass
+/// itself queried.
+fn report_depth_limit_hits(
+    checker: &mut Checker<'_>,
+    typeenv: &TypeEnv,
+    file: &str,
+    severity: Severity,
+) {
+    report_ancestry_hits(
+        checker,
+        typeenv,
+        file,
+        severity,
+        CLASS_DEPTH_LIMIT,
+        typeenv.take_depth_limit_hits(),
+        |name| format!("`{name}`'s `---@class` ancestry is too deep to resolve safely"),
+        |_name| {
+            format!(
+                "exceeds the {MAX_ANCESTRY_DEPTH}-class ancestry limit this checker enforces to \
+                 avoid a stack overflow while resolving it"
+            )
+        },
+        |_name| {
+            "flatten the hierarchy or use composition instead of a long inheritance chain — \
+             members above the limit are not included in this class's resolved shape"
+                .to_string()
+        },
+    );
+}
+
+/// Drain `typeenv`'s cyclic-class ledger into `LB0318` diagnostics (round 6
+/// review M67).
+///
+/// `DiamondGuard`'s `on_path` set already refuses a true cycle — `---@class
+/// A : A`, or a mutual `A : B` / `B : A` — so this was never a crash. It was
+/// silence: the class resolved with whatever members the walk reached before
+/// the back-edge, and a user who meant to inherit from something else got no
+/// signal anywhere. [`CYCLIC_ALIAS`] has reported the alias-axis version of
+/// exactly this since #123; this is the class axis, drained the same way and
+/// at the same point as [`report_depth_limit_hits`].
+///
+/// Every class the cycle *reaches* is reported, not just the name that
+/// happened to be queried first — `env`'s `note_cyclic` records the whole
+/// refused set, so an innocent subclass that merely inherits into a cycle
+/// does not get named as its cause.
+///
+/// **Per-file draining, not per-project** (production readiness review G2):
+/// each project file gets its own `TypeEnv`, so a cycle spanning N files is
+/// independently rediscovered by every one of those files' own checks —
+/// this function alone cannot dedupe across files, since it never sees
+/// another file's `typeenv`. `luabox-cli`'s `check_cmd::run_passes`
+/// dedupes the resulting diagnostics project-wide, by `(code, primary span)`
+/// — the class's declaration span is the same regardless of which file's
+/// pass emitted the diagnostic pointing at it (`class_decl_span`/
+/// `cross_file_class_decl_span` both resolve to the one true declaration
+/// site), so that key collapses every file's rediscovery back to one
+/// diagnostic per class, matching what a single-file cycle already reports.
+/// A direct `luabox_types::check_file*` caller that is not the CLI (the LSP,
+/// this crate's own tests) does not get that dedup — there is no
+/// project-wide aggregation point below the CLI to hang it on.
+fn report_cyclic_class_hits(
+    checker: &mut Checker<'_>,
+    typeenv: &TypeEnv,
+    file: &str,
+    severity: Severity,
+) {
+    report_ancestry_hits(
+        checker,
+        typeenv,
+        file,
+        severity,
+        CYCLIC_CLASS,
+        typeenv.take_cyclic_class_hits(),
+        |name| format!("`{name}`'s `---@class` ancestry is cyclic"),
+        |name| format!("`{name}` is reachable from its own `---@class` parent list"),
+        |_name| {
+            "break the cycle: a class cannot extend itself, directly or through its ancestors — \
+             members past the back-edge are not in the resolved shape"
+                .to_string()
+        },
+    );
+}
+
+/// Drain `typeenv`'s cost-limit ledger into `LB0319` diagnostics — the
+/// resolution-*cost* budget's counterpart to [`report_depth_limit_hits`]'s
+/// *depth* budget (`env::MAX_ANCESTRY_RESOLUTIONS` vs `MAX_ANCESTRY_DEPTH`,
+/// production readiness review G3/F1). Reported separately from `LB0317`
+/// because the cause and the remedy differ: a wide diamond re-resolved on
+/// conflicting paths, not a chain deep enough to overflow the stack —
+/// reporting one as the other would misdirect the fix.
+fn report_cost_limit_hits(
+    checker: &mut Checker<'_>,
+    typeenv: &TypeEnv,
+    file: &str,
+    severity: Severity,
+) {
+    report_ancestry_hits(
+        checker,
+        typeenv,
+        file,
+        severity,
+        CLASS_COST_LIMIT,
+        typeenv.take_cost_limit_hits(),
+        |name| format!("`{name}`'s `---@class` ancestry is too costly to resolve safely"),
+        |_name| {
+            "re-resolving this ancestry's conflicting diamonds exceeded the resolution-cost \
+             budget this checker enforces to keep the merge walk from going polynomial"
+                .to_string()
+        },
+        |_name| {
+            "bind a shared generic ancestor the same way on every branch, or restructure the \
+             hierarchy so it is not re-reached along multiple conflicting paths"
+                .to_string()
+        },
+    );
 }
 
 /// A scope binding. Only `---@type` bindings are *checked* on assignment
@@ -1877,22 +2027,59 @@ impl Checker<'_> {
     }
 }
 
-/// Detect a `---@field` name declared more than once for the same
-/// `---@class` in this file — luals `duplicate-doc-field` (`LB0311`, #113).
+/// Detect a `---@field` declared more than once for the same `---@class` in
+/// this file — luals `duplicate-doc-field` (`LB0311`, #113).
 ///
 /// Scoped to a single file: the same declarations checked standalone or in a
 /// project yield the same finding, so the CLI and the LSP agree. The first
-/// declaration of a name wins (its type is the one the checker uses); every
-/// later `---@field` of that name on the same class is reported at its own
-/// span, with a note pointing back. Indexer fields (`---@field [K] V`) are not
-/// named and never collide.
+/// declaration wins (its type is the one the checker uses); every later
+/// `---@field` for the same key on the same class is reported at its own
+/// span, with a note pointing back.
+///
+/// **Both** field kinds collide, named and indexer (round 6 review M11).
+/// This function used to skip `---@field [K] V` entirely — its doc comment
+/// asserted indexers "are not named and never collide" — so a conflicting
+/// indexer resolved *silently* while the identical conflict on a named field
+/// warned. That asymmetry survived this PR's own indexer work: round 6 moved
+/// the indexer onto the named field's **resolution** rule
+/// ([`crate::env::indexer_resolution`], now derived from `member_wins`)
+/// without moving it onto the **diagnostic** rule, leaving one rule with two
+/// mechanisms — the defect class every round of this review has found.
+///
+/// Measured against the oracle: lua-language-server 3.13.5 reports
+/// `duplicate-doc-field` for a repeated `---@field [string] T` exactly as it
+/// does for a repeated `---@field a T`, rendering the key as `[string]`.
+/// (luals reports it at *both* declarations where luabox reports the later
+/// one; that rendering difference is pre-existing and shared with the named
+/// case, so the two kinds stay internally consistent, which is what M11 is
+/// about.)
+///
+/// Indexer identity is the **lowered [`Ty`]** of the key, not its source
+/// text, so `[string]` and `[ string ]` are one key and an alias resolving to
+/// `string` collides with `string` — the same identity
+/// `TypeEnv::collect_class`'s own indexer merge keys on. Deriving it from a
+/// second, independent notion of "same key" is how the two would drift apart
+/// again.
 pub(crate) fn duplicate_doc_fields(
     items: &[luabox_syntax::luacats::AnnotatedItem],
     file: &str,
 ) -> Vec<Diagnostic> {
     use luabox_syntax::luacats::{FieldKey, Tag};
 
-    let mut seen: HashMap<String, HashSet<String>> = HashMap::new();
+    /// One `---@field` key on one class, as this pass compares them.
+    #[derive(PartialEq, Eq, Hash)]
+    enum SeenKey {
+        Name(String),
+        Indexer(Ty),
+    }
+
+    // The lowerer the indexer key is resolved through — the same path
+    // `TypeEnv` uses, so both seams agree on when two keys are the same key.
+    let mut declared = crate::lower::Declared::default();
+    declared.absorb_tags(items);
+    let mut lowerer = crate::lower::Lowerer::new(&declared);
+
+    let mut seen: HashMap<String, HashSet<SeenKey>> = HashMap::new();
     let mut diags = Vec::new();
     for item in items {
         // Fields belong to the most recent `---@class` in the same block
@@ -1904,19 +2091,31 @@ pub(crate) fn duplicate_doc_fields(
             match tag {
                 Tag::Class(c) if !c.name.is_empty() => current = Some(c.name.clone()),
                 Tag::Field(f) => {
-                    let (Some(class), FieldKey::Name(name)) = (current.as_ref(), &f.key) else {
+                    let Some(class) = current.as_ref() else {
                         continue;
                     };
-                    if !seen.entry(class.clone()).or_default().insert(name.clone()) {
+                    // `label` is what the user reads; `key` is what decides
+                    // identity. For an indexer they differ: the label is the
+                    // key's source-shaped rendering (`[string]`, matching
+                    // luals' own message), the key is its lowered `Ty`.
+                    let (key, label) = match &f.key {
+                        FieldKey::Name(name) => (SeenKey::Name(name.clone()), name.clone()),
+                        FieldKey::Indexer(expr) => {
+                            let ty = lowerer.lower(expr);
+                            let label = format!("[{ty}]");
+                            (SeenKey::Indexer(ty), label)
+                        }
+                    };
+                    if !seen.entry(class.clone()).or_default().insert(key) {
                         diags.push(
                             Diagnostic::new(
                                 DUPLICATE_DOC_FIELD,
                                 Severity::Warning,
-                                format!("duplicate field `{name}` on class `{class}`"),
+                                format!("duplicate field `{label}` on class `{class}`"),
                             )
                             .with_label(Label::primary(
                                 Span::new(file, f.span.start..f.span.end),
-                                format!("`{name}` is already declared on `{class}`"),
+                                format!("`{label}` is already declared on `{class}`"),
                             ))
                             .with_note(
                                 "the first declaration wins; remove or rename this one".to_string(),

@@ -168,6 +168,16 @@ static REGISTRY: &[Entry] = &[
         explain: LB0317,
     },
     Entry {
+        code: Code::new(318),
+        title: "cyclic `---@class` ancestry",
+        explain: LB0318,
+    },
+    Entry {
+        code: Code::new(319),
+        title: "`---@class` ancestry too costly to resolve",
+        explain: LB0319,
+    },
+    Entry {
         code: Code::new(500),
         title: "malformed `---@luabox-ignore`",
         explain: LB0500,
@@ -1275,8 +1285,81 @@ measured floor turns that into this message.
 **What to do.** A 200-deep inheritance chain is almost always generated
 code or a mistake — a cycle written as a chain, or a generator emitting one
 class per row. Flatten the hierarchy, or declare the members you actually
-read on a class nearer the leaf. A genuine cycle (`A : B`, `B : A`) is a
-different diagnostic and terminates safely on its own.
+read on a class nearer the leaf. A genuine cycle (`A : B`, `B : A`) is
+LB0318, not this, and terminates safely on its own.
+";
+
+const LB0318: &str = "\
+# LB0318: cyclic `---@class` ancestry
+
+A `---@class` is its own ancestor — directly (`---@class A : A`) or through
+a loop (`A : B`, `B : A`). The resolver stops at the back-edge, so nothing
+crashes and nothing hangs, but every member declared past it is **not** in
+the resolved shape.
+
+```lua
+---@class Node : Node        -- LB0318: `Node` is its own parent
+---@field value string
+
+---@class A : B              -- LB0318: `A` is reachable from `A`
+---@class B : A
+```
+
+**Why this is reported.** Before this diagnostic existed the cycle resolved
+in silence: the class kept whatever members the walk reached before the
+back-edge, and a user who meant to extend something else — a typo, a
+copy-paste, a rename that closed a loop — got no signal anywhere. The
+alias axis has reported its own version of this as LB0314 since #123; this
+is the class axis.
+
+**What to do.** Break the loop. A class cannot extend itself, so one of the
+`---@class X : Y` lines names the wrong parent. If the two types genuinely
+refer to each other, that is a *field* relationship, not an inheritance one
+— `---@field other B` on `A` is fine and is not a cycle.
+
+**Note.** lua-language-server 3.13.5 reports nothing for either shape;
+luabox is deliberately stricter here. `[types] strict = false` downgrades it
+to a warning, and `---@diagnostic disable[-line|-next-line]:
+cyclic-class-ancestry` suppresses it. The rule name is luabox's own rather
+than a luals one, for the same reason LB0317's is: luals has no counterpart
+to name.
+";
+
+const LB0319: &str = "\
+# LB0319: `---@class` ancestry too costly to resolve
+
+Resolving this class forced the merge walk to re-resolve the same ancestors
+more times than it will spend. Members past the point it stopped are **not**
+in the resolved shape.
+
+This is about *cost*, not depth — LB0317 is the depth one, and the fix for it
+(flatten the hierarchy) does not help here. What drives this is a **diamond
+conflict**: the same generic ancestor reached through more than one parent,
+bound differently on each branch, so every disagreement invalidates work
+already done and the walk redoes it.
+
+```lua
+---@class Box<T>
+---@field item T
+
+---@class L1 : Box<number>
+---@class R1 : Box<string>
+---@class C1 : L1, R1     -- `Box` reached twice, bound two ways
+
+-- ... repeated across many such groups ...
+```
+
+**What to do.** Make the conflict go away rather than making the hierarchy
+smaller: bind a shared generic ancestor the same way on every branch that
+reaches it, or restructure so it is reached once. A hierarchy that is merely
+*large* — hundreds of generated `---@class` declarations, each visited once —
+does not trip this and never should; if you are seeing it on a hierarchy with
+no repeated generic ancestor, that is a bug worth reporting.
+
+**Escape hatches.** `[types] strict = false` downgrades it to a warning, and
+`---@diagnostic disable[-line|-next-line]: class-ancestry-too-costly`
+suppresses it. Both silence the diagnostic without restoring the missing
+members — the walk still stops.
 ";
 
 const LB0500: &str = "\
