@@ -349,13 +349,16 @@ because it "matches" a rule that turned out to be wrong. The first three
 rows (single, dup-same-file, dup-cross-file) are the genuine luals-parity
 part of this table: luals resolves a single class's *own* declared
 overloads by the identical "first whose input accepts the operand" scan
-(`operator.lua:111-116`), a union-of-declarations-then-first-match mechanism
-luabox's own accumulation matches.
+(`checkOperators`, `operator.lua:66-95` — it walks `operators` in declaration
+order and returns on the first whose operand `vm.isSubType` accepts; the
+`getSets` loop at `:111-116` is only what calls it, once per `doc.class`
+set), a union-of-declarations-then-first-match mechanism luabox's own
+accumulation matches.
 
 | Arrival shape | Winner | Same in develop? | Fixture id |
 |---|---|---|---|
 | single | resolves (baseline) — luals parity: both scan the class's own declared overloads | yes | `operator-A-single` |
-| dup-same-file | **first** overload matched by the "first input that accepts" scan (#114) — luals parity, same scan mechanism (`operator.lua:111-116`) | yes | `operator-B-absorb-block-dup-same-file` |
+| dup-same-file | **first** overload matched by the "first input that accepts" scan (#114) — luals parity, same scan mechanism (`checkOperators`, `operator.lua:66-95`) | yes | `operator-B-absorb-block-dup-same-file` |
 | dup-cross-file | **first**-processed file's overload, same scan mechanism — luals parity | yes | `operator-C-merge-file-types-dup-cross-file` |
 | unrelated-parents | **first**-listed parent — luabox-only extension, no luals rule to match (see above) | yes | `operator-D-unrelated-parents` (+ `-swapped`) |
 | diamond-identical | resolves to the agreed value — luabox-only extension, no luals rule to match | **no** — develop leaks raw name (declared fix) | `operator-E-diamond-identical-binding` |

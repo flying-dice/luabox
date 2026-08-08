@@ -47,8 +47,16 @@ pub(crate) const NON_EXHAUSTIVE_IF: Code = Code::new(315);
 /// Call to a `---@async` function from a non-async enclosing function (luals
 /// `await-in-sync`).
 pub(crate) const AWAIT_IN_SYNC: Code = Code::new(316);
-/// A `---@class` single-parent ancestry deep enough to trip the class-shape/
-/// operator walk's depth cap before it can overflow the stack (round 5
-/// review N2's durable fix, `env::MAX_ANCESTRY_DEPTH`). luabox-only — no
-/// luals equivalent, since luals has no such recursive merge to protect.
+/// A `---@class` ancestry deep enough to trip the class-shape/operator
+/// walk's depth cap before it can overflow the stack (round 5 review N2's
+/// durable fix, `env::MAX_ANCESTRY_DEPTH`). luabox-only — no luals
+/// equivalent, since luals has no such recursive merge to protect.
+///
+/// **Not restricted to a single-parent chain**: `DiamondGuard::should_apply`
+/// trips on `on_path.len()`, the depth of the *current recursion path*, so
+/// `---@class A : B, C` with one branch past the cap reports this exactly as
+/// a strict chain does. The CLI's separate syntactic pre-check
+/// (`check_cmd::deep_class_chain_diagnostic`) *is* single-parent-only — it
+/// treats a multi-parent class as a root and does not follow it — so the two
+/// guards differ in reach and only that one deserves the qualifier.
 pub(crate) const CLASS_DEPTH_LIMIT: Code = Code::new(317);

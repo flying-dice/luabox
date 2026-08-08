@@ -1775,12 +1775,93 @@ fn class_merge_precedence_matrix_matches_the_documented_matrix() {
         failures.len(),
         failures.join("\n")
     );
-    // Sanity floor: every fixtured cell in the corpus actually ran. A drop
-    // here means a row's `variants` silently emptied out, not that the
-    // matrix shrank.
+    // Every fixtured variant in the corpus actually ran. This was a `>= 45`
+    // floor while the real count was 52, which meant an entire `Cell` could
+    // be deleted — seven variants' worth — with this suite still green. A
+    // merge-gate finder proved it by removing the row that pins carrier
+    // methods resolving to the first-listed parent and watching both tests
+    // pass. The floor is now the exact count, so a row that disappears is a
+    // failure rather than a smaller number nobody reads.
+    assert_eq!(
+        checked, EXPECTED_FIXTURED_VARIANTS,
+        "the matrix ran {checked} fixtured variants, expected          {EXPECTED_FIXTURED_VARIANTS} — if you added or removed a cell,          update this count and the published table together"
+    );
+}
+
+/// The number of fixtured variants across every row of [`CELLS`]. Exact, not
+/// a floor: see the assertion above for why.
+const EXPECTED_FIXTURED_VARIANTS: usize = 51;
+
+/// Every fixture id named by the published matrix
+/// (`docs/03-reference/03-class-merge-precedence.md`) exists as a variant in
+/// [`CELLS`], and vice versa.
+///
+/// This is the check that makes "adding a member kind or an arrival shape
+/// forces a row" true rather than aspirational. Without it the table and the
+/// tests drift independently: the doc can describe a cell nothing measures,
+/// or a cell can be dropped from the tests while the doc still claims it is
+/// pinned. Both have happened on this page already.
+///
+/// The doc is the source of truth for *which* cells exist; this file is the
+/// source of truth for what each one resolves to. Cells the doc marks N/A or
+/// unobservable name no fixture id, so they are absent from both sides and
+/// stay that way.
+#[test]
+fn the_published_matrix_and_the_test_table_name_the_same_fixtures() {
+    let doc = include_str!("../../../docs/03-reference/03-class-merge-precedence.md");
+    let mut documented: Vec<String> = Vec::new();
+    for line in doc.lines() {
+        // Fixture ids live in the last column of each table row, in backticks,
+        // shaped `<kind>-<letter>-<slug>` (plus optional `-swapped` twins
+        // written as a bare `` (+ `-swapped`) `` suffix, which the row's own
+        // `variants` cover and which are not separate ids).
+        if !line.starts_with('|') {
+            continue;
+        }
+        for token in line.split('`') {
+            let looks_like_id = token
+                .split_once('-')
+                .and_then(|(_, rest)| rest.split_once('-'))
+                .is_some_and(|(letter, _)| {
+                    letter.len() == 1 && letter.chars().all(|c| c.is_ascii_uppercase())
+                });
+            if looks_like_id && !documented.contains(&token.to_string()) {
+                documented.push(token.to_string());
+            }
+        }
+    }
     assert!(
-        checked >= 45,
-        "expected at least 45 fixtured variants across the matrix, ran {checked}"
+        documented.len() >= 30,
+        "parsed only {} fixture ids from the published matrix — the table's          shape changed and this parser no longer reads it, which would make          this test vacuous",
+        documented.len()
+    );
+
+    let tested: Vec<&str> = CELLS
+        .iter()
+        .flat_map(|cell| cell.variants.iter().map(|v| v.fixture_id))
+        .collect();
+
+    // Checked in one direction deliberately: every fixture id the published
+    // table names must be measured here. That is the direction that catches
+    // a deleted row — the doc still advertises the cell while nothing pins
+    // it, which the exact-count assertion above cannot see on its own.
+    //
+    // The reverse is not asserted, because the table writes a swapped twin
+    // as a `(+ `-swapped`)` suffix on its sibling's id rather than as its own
+    // entry, and names a few finding-specific repro fixtures in prose.
+    // Requiring every tested id to appear verbatim would fail on that
+    // formatting rather than on drift; the exact count bounds the test side.
+    let missing_from_tests: Vec<&String> = documented
+        .iter()
+        .filter(|id| !tested.iter().any(|t| t == &id.as_str()))
+        .collect();
+
+    assert!(
+        missing_from_tests.is_empty(),
+        "the published matrix names {} fixture(s) this table does not \
+         measure: {missing_from_tests:?} — a documented cell with no test is \
+         a claim nothing checks",
+        missing_from_tests.len()
     );
 }
 
