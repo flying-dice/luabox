@@ -260,7 +260,7 @@ workflow:
 .install-cargo-mutants:
   script:
     - |
-      have="$(cargo-mutants --version 2>/dev/null | awk '{print $2}' || true)"
+      have="$(cargo mutants --version 2>/dev/null | awk '{print $2}' || true)"
       if [ "$have" != "$CARGO_MUTANTS_VERSION" ]; then
         echo "installing cargo-mutants $CARGO_MUTANTS_VERSION (found: ${have:-none})"
         curl -sSL -f --retry 3 -o /tmp/cargo-mutants.tar.gz \
@@ -272,7 +272,7 @@ workflow:
         chmod +x "$CARGO_HOME/bin/cargo-mutants"
         rm -f /tmp/cargo-mutants.tar.gz
       fi
-      cargo-mutants --version
+      cargo mutants --version
 
 # cargo-llvm-cov, same story: upstream prebuilt, unpinned `latest` exactly as
 # taiki-e/install-action resolves it for ci.yml's two coverage jobs.
@@ -507,6 +507,10 @@ luals-differential-selftest:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes: *changes-luabox-gates
+    # web/api = a human explicitly requesting a run on a chosen ref; like
+    # Actions' workflow_dispatch, that ignores the path filter.
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "api"'
     - if: '$CI_COMMIT_BRANCH == "main"'
       changes: *changes-luabox-gates
   script:
@@ -524,6 +528,10 @@ verdict-differential-selftest:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes: *changes-luabox-gates
+    # web/api = a human explicitly requesting a run on a chosen ref; like
+    # Actions' workflow_dispatch, that ignores the path filter.
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "api"'
     - if: '$CI_COMMIT_BRANCH == "main"'
       changes: *changes-luabox-gates
   script:
@@ -859,6 +867,10 @@ verdict-differential:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes: *changes-luabox-gates
+    # web/api = a human explicitly requesting a run on a chosen ref; like
+    # Actions' workflow_dispatch, that ignores the path filter.
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "api"'
     - if: '$CI_COMMIT_BRANCH == "main"'
       changes: *changes-luabox-gates
   script:
@@ -888,6 +900,10 @@ luals-parity:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes: *changes-luabox-gates
+    # web/api = a human explicitly requesting a run on a chosen ref; like
+    # Actions' workflow_dispatch, that ignores the path filter.
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "api"'
     - if: '$CI_COMMIT_BRANCH == "main"'
       changes: *changes-luabox-gates
   cache:
@@ -965,6 +981,10 @@ mutants-pr:
     GIT_DEPTH: "0"
     MUTANTS_OUT: $CI_PROJECT_DIR/mutants-out
   rules:
+    # MR-only, deliberately: the diff seam below is
+    # CI_MERGE_REQUEST_DIFF_BASE_SHA, which only exists on MR pipelines. An
+    # explicit web/api run on a ref gets the FULL `mutants` job instead —
+    # the same split the source's workflow_dispatch makes.
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes: *changes-mutants
   script:
