@@ -7620,13 +7620,28 @@ take(b.value)
     fn truncation_discovered_while_building_a_generic_template_still_answers_truncated() {
         let k = 50;
         let ambient = costly_generic_ambient(k);
-        let env = env_with_ambient(&format!("---@type A{k}<string>\nlocal x\n"), &ambient);
+        // thread + recv_timeout, like the k-level group test above: this
+        // walk finishes fast ONLY because the resolution budget trips. A
+        // budget counter that stops advancing (`+=` weakened to `*=` — 0
+        // stays 0 forever) turns this k=50 conflicting group into the
+        // round-5 exponential, and an unbounded test then HANGS the whole
+        // suite instead of failing — cargo-mutants reads that as a timeout,
+        // not a kill.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let env = env_with_ambient(&format!("---@type A{k}<string>\nlocal x\n"), &ambient);
+            let _ = tx.send((env.class_ancestry_truncated("A22"), ()));
+        });
+        let (truncated, ()) = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("a budget-capped k=50 discovery walk must finish in seconds");
+        let env_truncated = truncated;
         // A22 tripped the budget during discovery but is NOT the referenced
         // root, so the roots-scoped report queues drop it — the unscoped
         // truncation ledger must still answer for it, or member-checking
         // leniency would treat its silently-incomplete shape as complete.
         assert!(
-            env.class_ancestry_truncated("A22"),
+            env_truncated,
             "a class the discovery walk gave up on must read as truncated in the consuming \
              file's env even when it is not the referenced root"
         );
@@ -7653,9 +7668,18 @@ take(b.value)
         // file references THAT ancestor.
         let k = 50;
         let ambient = costly_generic_ambient(k);
-        let env = env_with_ambient(&format!("---@type A{k}<string>\nlocal x\n"), &ambient);
+        // Bounded for the same reason as the truncation test above: with a
+        // dead budget counter this walk is the round-5 exponential.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let env = env_with_ambient(&format!("---@type A{k}<string>\nlocal x\n"), &ambient);
+            let _ = tx.send(env.take_cost_limit_hits());
+        });
+        let hits = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("a budget-capped k=50 discovery walk must finish in seconds");
         assert_eq!(
-            env.take_cost_limit_hits(),
+            hits,
             vec![format!("A{k}")],
             "naming one over-budget root must report that root once, not every over-budget \
              class the discovery walk happened to resolve on the way"
@@ -7676,6 +7700,51 @@ take(b.value)
             env.take_cost_limit_hits().is_empty(),
             "a file that references no generic class must carry no cost-limit hit"
         );
+    }
+
+    #[test]
+    fn a_cyclic_ambient_alias_pair_terminates_the_pre_scan() {
+        // Round-8 mutants-pr survivor at the alias-following seam
+        // (`decl.aliases.contains_key(&found) && expanded.insert(...)`):
+        // with `&&` weakened to `||`, `expanded.insert` never runs for a
+        // real alias, so a cyclic ambient alias pair re-queues itself
+        // forever and the pre-scan never returns. The `expanded` set IS the
+        // termination argument; this pins it with a bound so the failure is
+        // a fast red, not a hung suite.
+        let ambient = crate::defs::Ambient::build(&[
+            "---@meta\n---@class LoopBox<T>\n---@field value T\n---@alias LoopA LoopB\n---@alias LoopB LoopA\n",
+        ]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let env = env_with_ambient("---@type LoopA\nlocal x\n", &ambient);
+            let _ = tx.send(env.take_cost_limit_hits().len());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+            "a cyclic ambient alias pair must terminate the pre-scan — each alias expands \
+             at most once",
+        );
+    }
+
+    #[test]
+    fn a_wide_diamond_is_subclass_miss_completes_in_bounded_time() {
+        // Round-8 mutants-pr survivor at `walk_ancestor_names`' skip guard
+        // (`Some(&previous) if previous <= depth => continue`): with the
+        // guard weakened to never match, every re-reach re-expands its whole
+        // subtree — answers stay right, cost goes exponential on a diamond,
+        // and no assertion can see "slower but correct". The bound IS the
+        // assertion: a full MISS over the grandparent-diamond shape pops
+        // O(V) nodes with the skip and ~1.6^k without it.
+        let src = conflicting_diamond_source(60);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let env = env_of(&src);
+            let _ = tx.send(env.is_subclass("A60", "NotAnAncestorAtAll"));
+        });
+        let is_sub = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+            "a k=60 diamond miss must complete in bounded time — the expanded_at \
+                     skip is what makes the walk O(V), not exponential",
+        );
+        assert!(!is_sub, "the probe class is not an ancestor");
     }
 
     #[test]
