@@ -220,8 +220,25 @@ default_manifest() {
 # whitespace-collapsed summary of what it wrote (M60) — cheap, always
 # printed regardless of the row's own pass/fail, and testable independent
 # of whether the (stubbed or real) luabox binary ever opens the file.
+#
+# The name guard is the same rejection copy_sidecar applies to a sidecar's
+# CONTENTS, applied here to the case NAME — which arrives from column 1 of a
+# PR-authored expected.tsv and is pasted straight into two corpus paths
+# ($corpus/<case>.toml here, $corpus/<case>.lua in copy_case_deps). A row
+# named `../../../etc/passwd` or `../other-corpus/case` reads a file outside
+# the corpus directory and copies it into the project this gate then measures
+# — the identical traversal copy_sidecar already refuses, left open on the
+# column that feeds it. Rejected here rather than in copy_case_deps because
+# this runs FIRST on both call paths, so a bad row never reaches any `cp` at
+# all. Returns nonzero; both callers fail the row on it.
 write_case_manifest() {
     local case_name="$1" override="$corpus/$1.toml"
+    case "$case_name" in
+    */* | . | ..)
+        echo "FAIL  $case_name: unsafe case name — expected.tsv's case column must be a plain filename in the corpus directory, no path separators"
+        return 1
+        ;;
+    esac
     if [ -f "$override" ]; then
         cp "$override" "$work/luabox.toml"
     else
@@ -317,9 +334,15 @@ for d in data:
 }
 
 # measure_case <case> — runs the CURRENT $luabox over the file set
-# copy_case_deps just populated and sets MEASURED_VERDICT (clean|diag),
-# MEASURED_CODES (sorted, comma-joined LB codes, or empty for clean) and
-# MEASURED_EXIT (luabox's own exit status). `--format json` keeps stdout
+# copy_case_deps just populated and sets MEASURED_VERDICT (clean|diag) and
+# MEASURED_CODES (sorted, comma-joined LB codes, or empty for clean). The
+# exit status is JUDGED here (the rc=124 timeout branch and the M31
+# nonzero-exit-with-empty-diagnostics branch below both read it) but is
+# deliberately NOT exported: an earlier revision also assigned it to a
+# MEASURED_EXIT global that this comment advertised and no caller ever read
+# — a documented output nothing consumed, which is a smaller version of the
+# same "claimed but unmeasured" defect this whole gate exists to refuse.
+# `--format json` keeps stdout
 # pure JSON, so the exact diagnostic code SET can be asserted, not just "the
 # summary line wasn't all-zero" — see the header for why that distinction
 # is the whole point of this file. `timeout` bounds the run (M32); $rc=124
@@ -328,7 +351,6 @@ measure_case() {
     local case_name="$1" out codes_rc rc
     out="$( (cd "$work" && timeout "$case_timeout" "$luabox" check --format json) 2>"$work/luabox.err" )"
     rc=$?
-    MEASURED_EXIT="$rc"
     printf '%s' "$out" >"$work/last.json"
     # M32: a kill from `timeout` (rc=124) leaves $out empty or mid-write —
     # never valid JSON — so this is checked BEFORE attempting to parse it,
@@ -386,7 +408,10 @@ if [ "$print_mode" = 1 ]; then
         if grep -qxF "$base.lua" "$corpus"/*.deps "$corpus"/*.defs 2>/dev/null; then
             continue
         fi
-        write_case_manifest "$base"
+        if ! write_case_manifest "$base"; then
+            echo "error: regeneration aborted on $base" >&2
+            exit 1
+        fi
         if ! copy_case_deps "$base"; then
             echo "error: regeneration aborted on $base" >&2
             exit 1
@@ -430,7 +455,10 @@ while IFS=$'\t' read -r case_name want_verdict want_codes note; do
         fails=$((fails + 1))
     fi
 
-    write_case_manifest "$case_name"
+    if ! write_case_manifest "$case_name"; then
+        fails=$((fails + 1))
+        continue
+    fi
     if ! copy_case_deps "$case_name"; then
         fails=$((fails + 1))
         continue
@@ -469,6 +497,28 @@ for src in "$corpus"/*.lua; do
         fails=$((fails + 1))
     fi
 done
+
+# The same rule for the SIDECARS, which the *.lua sweep above cannot see. A
+# `.toml`, `.deps` or `.defs` file is keyed to a case by filename alone
+# (write_case_manifest/copy_sidecar both look up `$corpus/<case>.<ext>`), so
+# renaming a case and forgetting its sidecar leaves the sidecar on disk,
+# committed, reviewed — and never opened again. The failure is silent in the
+# worst way for a `.toml`: the case that was supposed to run under
+# `strict = false` (or a `[types] defs` entry) quietly reverts to
+# default_manifest and keeps passing, so the row still goes green while the
+# thing it was written to pin is no longer configured at all. Same
+# no-silent-caps rule as the unclaimed-*.lua sweep above, applied to the
+# other three file kinds this corpus directory holds.
+shopt -s nullglob
+for sidecar in "$corpus"/*.toml "$corpus"/*.deps "$corpus"/*.defs; do
+    file="$(basename "$sidecar")"
+    name="${file%.*}"
+    if [ -z "${seen[$name]:-}" ]; then
+        echo "FAIL  $file exists in the corpus but expected.tsv has no row for case '$name' — an orphan sidecar is a silent no-op override"
+        fails=$((fails + 1))
+    fi
+done
+shopt -u nullglob
 
 # A corpus with no rows (an empty or comments-only expected.tsv, or an empty
 # corpus directory) would otherwise sail through as "0 failures across 0

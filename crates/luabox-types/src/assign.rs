@@ -101,9 +101,21 @@ impl Ctx<'_> {
             // `Parent`'s `---@field v string` passes `takes(child)` there and
             // is rejected here. This restores that half.
             //
-            // Strictly a loosening — it only ever turns a rejection into an
-            // acceptance, so it cannot introduce a false positive. The
-            // *tightening* half of nominality (luals also rejects an
+            // A loosening at the pair level — it only ever turns this
+            // comparison's rejection into an acceptance. That is NOT the
+            // same as "cannot change any downstream verdict": overload
+            // resolution is first-accepting-signature-wins, so accepting the
+            // primary here can select a different overload than structural
+            // comparison would, whose return type then produces a NEW
+            // diagnostic at the call's use site. Measured against
+            // lua-language-server 3.13.5 on exactly that shape (primary
+            // takes `Parent` returning `number`, `---@overload` takes a
+            // structural twin returning `string`, result fed to a `string`
+            // slot): luals selects the same overloads and reports the same
+            // one diagnostic at the same position — the flip is oracle
+            // parity, pinned by
+            // `a_nominal_upcast_drives_overload_selection_like_luals` below.
+            // The *tightening* half of nominality (luals also rejects an
             // undeclared class that happens to match structurally, where
             // luabox accepts it) is a core semantic change to every LB0300
             // and is deliberately NOT made here — see #68.

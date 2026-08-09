@@ -8,8 +8,9 @@
 //! already holds the file's HIR — and is re-tagged to the toolchain source on
 //! the way out, since it is not a lint rule.
 
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
 use luabox_db::Analysis;
@@ -98,23 +99,60 @@ pub struct CheckCtx<'a> {
     pub known_globals: &'a HashSet<String>,
 }
 
-/// Diagnostics for one `.lua` file known to `analysis`, plus the line index
-/// used to convert them. `None` when the file is unknown.
+/// One check pass's LSP diagnostics, split by the file each one's primary
+/// span actually belongs to.
+///
+/// Almost everything lands in [`Self::own`]: a parse error, a dialect
+/// violation, a lint finding and the overwhelming majority of type
+/// diagnostics all point inside the very file that was checked. The
+/// exception is the cross-file `---@class` ancestry pair `LB0317`/`LB0318`,
+/// whose `cross_file_class_decl_span` attribution tier
+/// (`luabox_types::check`) deliberately points at the offending class's
+/// **declaration**, which routinely lives in a different project file than
+/// the one whose pass tripped the guard.
+#[derive(Default)]
+pub struct FileDiagnostics {
+    /// Diagnostics whose primary span is in the checked file itself,
+    /// converted through that file's own [`LineIndex`].
+    pub own: Vec<Diagnostic>,
+    /// Diagnostics whose primary span names a *different* project file,
+    /// grouped by that file's path and converted through **its** own
+    /// [`LineIndex`] — never the checked file's.
+    ///
+    /// A caller publishes each group under its own document URI. Ordered
+    /// (a `BTreeMap`) so a batch of publishes is deterministic.
+    pub foreign: BTreeMap<PathBuf, Vec<Diagnostic>>,
+}
+
+/// Diagnostics for one `.lua` file known to `analysis`, split by the file
+/// each one really belongs to. `None` when the file is unknown.
+///
+/// **Every diagnostic is converted through its own span file's line index**
+/// (production readiness review, finding 4). The type pass is handed one
+/// file to check but can hand back a diagnostic whose primary span belongs
+/// to another (see [`FileDiagnostics`]); this used to convert the whole
+/// batch through the checked file's [`LineIndex`] on the reasoning that
+/// "LSP diagnostics are already per-document, so the lossy path is fine".
+/// That reasoning holds only while every span is same-file. Once one is not,
+/// a foreign byte offset resolved against the wrong text is not merely
+/// imprecise — [`LineIndex::range`] clamps an out-of-bounds offset, so a
+/// cycle declared deep in a long file rendered at the *end* of a short one,
+/// under a message about a class that file never mentions.
 #[must_use]
 pub fn diagnostics(
     analysis: &Analysis,
     path: &Path,
     dialect: Dialect,
     ctx: &CheckCtx<'_>,
-) -> Option<Vec<Diagnostic>> {
+) -> Option<FileDiagnostics> {
     let text = analysis.file_text(path)?;
     let index = LineIndex::new(text);
     let parsed = analysis.parse(path)?;
-    let mut out = Vec::new();
+    let mut out = FileDiagnostics::default();
 
     // 1. Parse errors (the tree is recovered; later passes still run).
     for err in parsed.errors() {
-        out.push(diagnostic(
+        out.own.push(diagnostic(
             &index,
             usize::from(err.range.start())..usize::from(err.range.end()),
             DiagnosticSeverity::ERROR,
@@ -125,7 +163,7 @@ pub fn diagnostics(
 
     // 2. Dialect legality against the project edition.
     for err in validate::validate(parsed.parse(), dialect) {
-        out.push(diagnostic(
+        out.own.push(diagnostic(
             &index,
             usize::from(err.range.start())..usize::from(err.range.end()),
             DiagnosticSeverity::ERROR,
@@ -143,9 +181,11 @@ pub fn diagnostics(
     // editor exactly as under `luabox check`; the project's workspace-global
     // classes (declared in any checked file, member attachments included —
     // luals parity) merge beneath the defs layer the same way `check_cmd`
-    // merges them. The span file name is dropped on conversion (LSP
-    // diagnostics are already per-document), so the lossy path is fine.
+    // merges them. This is the one pass that can produce a foreign span, so
+    // it routes each diagnostic through `push_routed` rather than converting
+    // the batch against `index` — see [`FileDiagnostics`].
     let rel = path.to_string_lossy();
+    let mut foreign_indices: HashMap<PathBuf, LineIndex> = HashMap::new();
     // The project's and the rock tree's `require` answers, merged by the one
     // resolver every surface shares (#54) — hover and completion read the very
     // same map, so a `require` binding cannot type one way here and another
@@ -162,7 +202,14 @@ pub fn diagnostics(
         // Type diagnostics are all `LB03xx`, so this publishes under
         // `TYPE_SOURCE` today — but through the band authority inside
         // `convert`, so a code moving band moves its source with it.
-        out.push(convert(&index, &diag));
+        push_routed(
+            &mut out,
+            analysis,
+            &rel,
+            &index,
+            &mut foreign_indices,
+            &diag,
+        );
     }
 
     // 4. Lint findings — the `luabox lint` engine (SPEC.md §9), published
@@ -185,11 +232,65 @@ pub fn diagnostics(
             // matcher keys its quick fixes off. The band is `luabox_diag`'s
             // to define ([`luabox_diag::Code::is_lint`]) — an open-coded
             // `number() / 100 == 5` here was a contract nothing asserted.
-            out.push(convert(&index, diag));
+            //
+            // Lint spans are always this file's: `lint_source` is handed
+            // `rel` and this file's text and never resolves anything across
+            // the project, so there is nothing here to route.
+            out.own.push(convert(&index, diag));
         }
     }
 
     Some(out)
+}
+
+/// Convert `diag` through the line index of the file its **primary span**
+/// names, and file it under [`FileDiagnostics::own`] or
+/// [`FileDiagnostics::foreign`] accordingly (production readiness review,
+/// finding 4).
+///
+/// `foreign_indices` memoises the line index of each distinct foreign file
+/// the batch actually names: building one is a full byte scan of that file's
+/// text, and a cycle spanning N classes declared in the same file reports
+/// once per class.
+///
+/// A foreign span naming something `analysis` cannot resolve to text — an
+/// ambient/defs tier span, or a logical name that is not a project path — is
+/// **dropped**. There is no line index that could convert it, and no
+/// document URI to publish it under; the alternative this replaces (convert
+/// it against whichever file happened to be checked) is what produced a
+/// diagnostic at a clamped position in a file the message was not about.
+fn push_routed(
+    out: &mut FileDiagnostics,
+    analysis: &Analysis,
+    rel: &str,
+    index: &LineIndex,
+    foreign_indices: &mut HashMap<PathBuf, LineIndex>,
+    diag: &luabox_diag::Diagnostic,
+) {
+    let Some(label) = diag.primary_label() else {
+        // No span at all: `convert` maps it to 0..0, which is as true of
+        // this file as of any other, so it stays with the checked file.
+        out.own.push(convert(index, diag));
+        return;
+    };
+    if label.span.file == rel {
+        out.own.push(convert(index, diag));
+        return;
+    }
+    let other = PathBuf::from(&label.span.file);
+    let other_index = match foreign_indices.entry(other.clone()) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => {
+            let Some(text) = analysis.file_text(&other) else {
+                return;
+            };
+            entry.insert(LineIndex::new(text))
+        }
+    };
+    out.foreign
+        .entry(other)
+        .or_default()
+        .push(convert(other_index, diag));
 }
 
 /// Convert a toolchain [`luabox_diag::Diagnostic`] to an LSP diagnostic through
@@ -262,6 +363,7 @@ fn diagnostic(
 )]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
     use std::path::PathBuf;
 
     use luabox_db::{AnalysisHost, Change};
@@ -304,7 +406,9 @@ mod tests {
             lint: &lint,
             known_globals: &known_globals,
         };
-        diagnostics(&analysis, &path, dialect, &ctx).expect("diagnostics")
+        diagnostics(&analysis, &path, dialect, &ctx)
+            .expect("diagnostics")
+            .own
     }
 
     fn codes(diags: &[Diagnostic]) -> Vec<&str> {
@@ -315,6 +419,138 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    // === cross-file spans (production readiness review, finding 4) ========
+
+    /// The two-file `---@class` cycle: `a.lua` declares `A : B` and resolves
+    /// `B`; `c.lua` declares `B : A`, padded so its declaration sits at a
+    /// byte offset `a.lua`'s text cannot even contain.
+    ///
+    /// Checking `a.lua` produces an `LB0318` about `B`, and
+    /// `cross_file_class_decl_span` points it at `B`'s declaration — in
+    /// `c.lua`. Converted against `a.lua`'s line index (what this used to
+    /// do), that offset clamps to `a.lua`'s end and the diagnostic renders in
+    /// `a.lua`'s panel, past its last line, under a message naming a class
+    /// `a.lua` never declares. It must instead come back under `c.lua`'s
+    /// path, at `c.lua`'s own line.
+    #[test]
+    fn a_cross_file_ancestry_diagnostic_lands_on_its_own_file_at_its_own_line() {
+        let (found, a_text, c_text) = cross_file_cycle();
+
+        assert!(
+            !codes(&found.own).contains(&"LB0318"),
+            "the cycle is `B`'s, declared in c.lua — it does not belong to a.lua: {:?}",
+            found.own
+        );
+        let (path, foreign) = found
+            .foreign
+            .iter()
+            .next()
+            .expect("the LB0318 is filed under the file its span names");
+        assert_eq!(path, &path_for("c.lua"));
+        assert_eq!(codes(foreign), vec!["LB0318"]);
+
+        // `---@class B : A` is the last line of a padded file, and a.lua is
+        // far shorter — a conversion through a.lua's index could not have
+        // produced this line at all, only a clamp to a.lua's last one.
+        let declared_on = u32::try_from(
+            c_text
+                .lines()
+                .position(|line| line.starts_with("---@class B"))
+                .expect("c.lua declares B"),
+        )
+        .expect("a small line count");
+        assert_eq!(foreign[0].range.start.line, declared_on);
+        assert!(
+            declared_on > u32::try_from(a_text.lines().count()).expect("a small line count"),
+            "the fixture only proves anything if c.lua's declaration is past \
+             a.lua's last line"
+        );
+
+        // And a.lua's own panel carries only a.lua's own findings, none of
+        // them clamped to its end.
+        let last_line = u32::try_from(a_text.lines().count()).expect("a small line count");
+        for diag in &found.own {
+            assert!(
+                diag.range.start.line < last_line,
+                "nothing may render at a clamped position: {diag:?}"
+            );
+        }
+    }
+
+    /// A foreign span naming a file `analysis` cannot resolve to text has no
+    /// line index to convert through and no document URI to publish under,
+    /// so it is dropped rather than rendered somewhere arbitrary. Pinned via
+    /// the same fixture with `c.lua` absent from the host: `a.lua` still
+    /// checks, and no group is filed for a file that does not exist.
+    #[test]
+    fn a_foreign_span_naming_an_unknown_file_is_dropped_not_misplaced() {
+        let root = Path::new(if cfg!(windows) { r"C:\ws" } else { "/ws" });
+        let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
+        host.set_root(root.to_path_buf());
+        host.apply_change(Change::SetFileText {
+            path: path_for("a.lua"),
+            dialect: Dialect::Lua54,
+            text: "---@class A : B\n\n---@type B\nlocal v = nil\nlocal _ = v.whatever\n"
+                .to_string(),
+        });
+        let analysis = host.snapshot();
+        let base = build_ambient(Dialect::Lua54, &[]);
+        let known_globals = base.global_names().clone();
+        let rocks = RockSurfaces::default();
+        let ambient = MergedAmbient::build(&base, &analysis.project_types(), rocks.types());
+        let lint = LintConfig::new();
+        let ctx = CheckCtx {
+            strictness: Strictness::Warn,
+            ambient: &ambient,
+            rocks: &rocks,
+            lint: &lint,
+            known_globals: &known_globals,
+        };
+        let found =
+            diagnostics(&analysis, &path_for("a.lua"), Dialect::Lua54, &ctx).expect("diagnostics");
+        assert!(found.foreign.is_empty(), "nothing to file");
+    }
+
+    /// The finding-4 fixture: `(a.lua's diagnostics, a.lua text, c.lua text)`.
+    fn cross_file_cycle() -> (FileDiagnostics, String, String) {
+        let a_text =
+            "---@class A : B\n\n---@type B\nlocal v = nil\nlocal _ = v.whatever\n".to_string();
+        // Padding, so `B`'s declaration offset is well past a.lua's length —
+        // the whole point of the fixture.
+        let mut c_text = String::new();
+        for i in 0..40 {
+            let _ = writeln!(c_text, "-- padding line {i}");
+        }
+        c_text.push_str("---@class B : A\n---@field id number\n");
+
+        let root = Path::new(if cfg!(windows) { r"C:\ws" } else { "/ws" });
+        let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
+        host.set_root(root.to_path_buf());
+        for (rel, text) in [("a.lua", &a_text), ("c.lua", &c_text)] {
+            host.apply_change(Change::SetFileText {
+                path: path_for(rel),
+                dialect: Dialect::Lua54,
+                text: text.clone(),
+            });
+        }
+        let analysis = host.snapshot();
+        let base = build_ambient(Dialect::Lua54, &[]);
+        let known_globals = base.global_names().clone();
+        let rocks = RockSurfaces::default();
+        let ambient = MergedAmbient::build(&base, &analysis.project_types(), rocks.types());
+        let lint = LintConfig::new();
+        let ctx = CheckCtx {
+            strictness: Strictness::Warn,
+            ambient: &ambient,
+            rocks: &rocks,
+            lint: &lint,
+            known_globals: &known_globals,
+        };
+        let found =
+            diagnostics(&analysis, &path_for("a.lua"), Dialect::Lua54, &ctx).expect("diagnostics");
+        (found, a_text, c_text)
     }
 
     #[test]

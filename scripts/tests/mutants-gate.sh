@@ -52,17 +52,23 @@
 # would either fail the very next scheduled/dispatch run on unreviewed NEW
 # survivors, or force waiving them without the review the allowlist's own
 # discipline requires (see the file header above) — worse than staying
-# narrow with the cost written down. Widening is therefore future work: run
+# narrow with the cost written down. Widening is therefore future work,
+# TRACKED AS #71 (which carries this plan so it stops living only here): run
 # `cargo mutants -p luabox-types -p luabox-cli --file
 # crates/luabox-types/src/lib.rs --file crates/luabox-cli/src/check_cmd.rs`,
 # review the survivors, extend mutants-allowlist.txt, THEN add both paths to
 # default_files below (and `-p luabox-cli` to the cargo-mutants invocation —
 # checked: passing an extra `-p` that owns none of the `--file` paths in a
-# given run is a no-op, so it is safe to add unconditionally ahead of time).
-# Not per-PR at any scope: a full run costs tens of minutes, which is why it
-# rides a schedule instead of the merge path — `mutants-pr`
+# given run is a no-op, so it is safe to add unconditionally ahead of time),
+# after which mutants.yml's `mutants-pr` diff step follows automatically.
+# Not per-PR at any scope: a full run costs tens of minutes, which is
+# why it rides a schedule instead of the merge path — `mutants-pr`
 # (.github/workflows/mutants.yml) is the bounded, blocking exception (#58
-# review round 6, M22), and inherits whatever FILES defaults to here.
+# review round 6, M22). Its diff step greps `default_files` out of THIS
+# file's assignment below (anchored `^default_files="`), so the scope has
+# one owner; renaming or restructuring that assignment must move the
+# workflow's extraction with it — the step fails loudly, not silently, if
+# the grep stops matching.
 set -u
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -216,13 +222,43 @@ if [ -n "$in_diff" ]; then
 else
     echo "mutants-gate: cargo mutants -p luabox-types ${file_args[*]} (this takes a while)"
 fi
-# Exit 3 = missed mutants, exit 4 = only timeouts. Both are judged below by
-# the allowlist comparison rather than by the exit code; anything else is a
-# real failure.
+# cargo-mutants signals the SHAPE of the run in its exit code, and only three
+# of those shapes mean "the run classified mutants, go read the outcome
+# files". MEASURED against cargo-mutants 27.1.0 with four probe runs
+# (2026-08-09), because the mapping this block carried before was guessed and
+# every value in it was wrong:
+#   0 — every mutant caught (or none generated at all).
+#   2 — missed mutants, no timeouts.
+#   3 — at least one TIMEOUT, whether or not anything was also missed (a run
+#       with both still exits 3; timeout outranks missed).
+#   4 — the UNMUTATED BASELINE failed to build or test. Nothing was mutated,
+#       nothing was measured — and cargo-mutants still writes all four
+#       outcome files, all EMPTY. That is the trap: 4 accepted as judgeable
+#       falls through to generated=0 below, which under IN_DIFF prints
+#       "OK — the diff touches nothing mutable" and exits 0. A broken
+#       baseline would read as a green PR gate — the exact absence-of-signal-
+#       as-coverage failure this whole gate exists to catch, at its own front
+#       door. So 4 is fatal here, named explicitly rather than folded into
+#       the catch-all, because "your tests don't compile" deserves a better
+#       message than "cargo-mutants failed with exit 4".
+# 0/2/3 are judged below by the allowlist comparison rather than by the exit
+# code — which of the two a survivor lands in is a property of the runner's
+# load, not of the code (see the timeout.txt comment below). Anything else is
+# an unknown shape and stays fatal.
 (cd "$repo" && cargo mutants -p luabox-types "${file_args[@]}" "${diff_args[@]}" -o "$out_dir")
 status=$?
 case "$status" in
-0 | 3 | 4) ;;
+0 | 2 | 3) ;;
+4)
+    echo
+    echo "mutants-gate: FAILED — baseline build/test failed, nothing was measured" >&2
+    echo "mutants-gate:   cargo-mutants exited 4: the UNMUTATED tree does not build or its tests do not" >&2
+    echo "mutants-gate:   pass, so not one mutant was run. The four outcome files it wrote are all empty," >&2
+    echo "mutants-gate:   which is indistinguishable from a clean run by line count alone — this gate will" >&2
+    echo "mutants-gate:   not read that as coverage. Fix the tree ('cargo test -p luabox-types'), then" >&2
+    echo "mutants-gate:   re-run. Full log: $out_dir/mutants.out/log" >&2
+    exit 1
+    ;;
 *)
     echo "error: cargo-mutants failed with exit $status" >&2
     exit "$status"

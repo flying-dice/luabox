@@ -51,6 +51,19 @@ release binary built at `git merge-base HEAD origin/develop`
 citable source for every "measured" and "confirmed by direct measurement"
 claim below.
 
+**A develop diff is not an oracle.** `merge-matrix-provenance.md` answers
+"did luabox's own answer change?", which is the wrong question for any cell
+where lua-language-server has an opinion — it can only ever say the two
+binaries differ, never which of them is right. Every cell measured against
+luals itself is pinned in the `#57` parity corpus instead
+(`scripts/tests/luals-differential`, run by `scripts/tests/luals-differential.sh`
+against the pinned 3.13.5 binary): a row there records both tools' verdicts
+on one fixture and fails CI when they drift apart, or — for a cell where
+luabox deliberately differs — records that difference as intentional so it
+cannot quietly become accidental. Cells this page cites a row id for are
+oracle-pinned; cells that cite only a `CELLS` fixture id are measured against
+luabox alone.
+
 ## Arrival shapes
 
 | Shape | Meaning | Seam it exercises |
@@ -65,9 +78,20 @@ claim below.
 
 ## Findings — read this first
 
-**One undeclared current-vs-develop regression was found: visibility's
-unrelated-parents shape flips which parent's scope is enforced, and the
-direction that ships silently is the dangerous one.** Round 6 review M40
+**Two undeclared current-vs-develop *order-precedence* divergences have been
+found, not one.** Both are genuine winner reversals — the same member
+resolves to a different type on the two binaries — and in both `current` is
+the one that matches lua-language-server 3.13.5 while `develop` does not. An
+earlier edition of this section named only the first of them and called it
+"one undeclared regression"; that count was wrong, and it was wrong in the
+direction that understates. Both are now pinned against the **oracle
+itself**, not merely against `develop`, as rows of the `#57` parity corpus in
+`scripts/tests/luals-differential` — a develop-comparison can only ever tell
+you the two binaries differ, never which of them is right.
+
+**Divergence 1 — visibility, unrelated-parents shape: which parent's scope
+is enforced flips, and the direction that ships silently is the dangerous
+one.** Round 6 review M40
 re-measured `---@class P1` / `---@field private x number`, `---@class P2` /
 `---@field x number` (no visibility at all — public), `---@class C : P1,
 P2`, `local y = c.x` against both binaries
@@ -85,7 +109,42 @@ disagrees on *which* class is named in the error but not on whether one
 fires — the public-vs-private fixture above is the one that shows the
 silent-acceptance direction plainly.
 
-Every *other* place the two binaries disagree is `develop`'s diamond guard /
+**Divergence 2 — a base listed *before* its own subclass: `---@class C :
+Base, Sub` where `Sub : Base` overrides a member `Base` also declares.**
+Measured this round against lua-language-server 3.13.5 (the pinned binary,
+sha-verified) as well as against both luabox binaries. `current` resolves the
+contended member first-listed — to `Base`'s type — and luals resolves it the
+same way; `develop` resolves it to `Sub`'s. The **mixin** variant of the same
+shape (`C : Mixin, Sub`, the shared ancestor reached through both parents)
+divides the two binaries identically, and again `current` is the half that
+agrees with luals. This is the same first-listed rule finding 6 established
+for the flat unrelated-parents shape, showing up on the shape where one
+"unrelated" parent is in fact the other's ancestor — which is why it was not
+caught by finding 6's own fixtures, and why it went unnamed here until now.
+Corpus rows: `ancestor_parent_first_listed_wins` and
+`mixin_diamond_first_listed_wins`.
+
+**A third behavioural delta, on the same fixtures but not an
+order-precedence one:** the *upcast* half — passing a `C` where the
+ancestor's type is wanted. `develop` rejects it; `current` and luals both
+accept it. Unlike the two divergences above, this one is already declared —
+it is `CHANGELOG.md`'s "A class now flows to any ancestor it declares, even
+when it overrides an inherited member at an incompatible type" entry — so it
+is listed here for completeness of the current-vs-develop picture, not as a
+newly found gap. Corpus row: `mixin_diamond_upcast_to_parent`.
+
+**What is *not* claimed.** luabox is more permissive than luals on one
+neighbouring cell: the completeness obligation a table literal owes a class
+whose parent contributes members through a **carrier** only, with no
+`---@field` declaring them. That divergence is pre-existing, is not a
+regression against `develop`, and is not fixed this round — it is recorded as
+**intentional** by corpus row `carrier_only_parent_literal`, with
+`carrier_and_field_parents_literal` as its agreeing counterpart, so the
+permissive cell is bounded by a fixture rather than left as an unstated
+"probably fine".
+
+Every place the two binaries disagree *other than the three above* is
+`develop`'s diamond guard /
 parent-argument substitution leaking a class's own type-parameter name (`V`,
 `T`) into the diagnostic instead of resolving it — `current` fixes all of
 them, and every one is covered by an existing `CHANGELOG.md` Unreleased

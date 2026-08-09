@@ -105,10 +105,17 @@ cat >"$stub_luals" <<'STUB'
 #!/bin/bash
 # stub lua-language-server: understands only `--check <dir> --checklevel=X
 # --check_out_path=<path>`. Writes a check.json exactly like a real --check
-# run would: keyed by file:// URI, one array per flagged file, and — because
-# a real 0-problem run writes nothing, which luals-differential.sh's
-# `[ -f "$luals_json" ]` depends on — nothing at all when nothing is
-# flagged. Flags a file by scanning it for `-- STUB-LUALS-DIAG: <code>`.
+# run would — and "exactly" was wrong here until 2026-08-09: this stub used
+# to write NOTHING on a 0-problem run, on the strength of a claim in
+# luals-differential.sh's own comment. Measured directly against
+# lua-language-server 3.13.5: a clean run writes the file, containing the two
+# bytes `[]` — a JSON ARRAY, where a run WITH problems writes an OBJECT keyed
+# by file:// URI. The stub's wrong shape is what let the driver's parser call
+# .items() unconditionally for a full round: no fixture here ever reached it
+# with a clean corpus, because the driver's `[ -f "$luals_json" ]` skipped the
+# parse entirely. Both shapes are produced now, so the all-clean path is
+# actually exercised. Flags a file by scanning it for
+# `-- STUB-LUALS-DIAG: <code>`.
 # STUB_LUALS_FAIL_EXIT (+ STUB_LUALS_FAIL_MSG) forces a tool failure instead,
 # for the "three failure modes, one message" case (F26).
 dir=""
@@ -149,6 +156,8 @@ shopt -u nullglob
 json="$json}"
 if [ "$found" = 1 ]; then
     printf '%s' "$json" >"$out_path"
+else
+    printf '[]' >"$out_path"
 fi
 exit 0
 STUB
@@ -530,5 +539,42 @@ LUABOX="$stub_luabox" LUALS="$stub_luals" LUALS_CORPUS="$no_expected_corpus" \
 got=$?
 assert expected_tsv_missing_fails 1 "$got" "$log" \
     "error: no expectations at"
+
+# 23: the ALL-CLEAN corpus shape — lua-language-server 3.13.5 writes the two
+# bytes `[]` (a JSON ARRAY) to --check_out_path when it finds no problems at
+# all, where every other run writes an OBJECT keyed by file:// URI (measured
+# 2026-08-09; the stub above reproduces both). The driver's parser called
+# `.items()` on whatever it loaded, so this shape died with an AttributeError
+# — and no fixture in this file could reach it, because every corpus here had
+# at least one luals-flagged case and the stub used to write nothing at all
+# when it had none, which the driver's `[ -f "$luals_json" ]` then skipped.
+# Both cases below therefore have to be clean on the LUALS side specifically:
+# the first is clean on both columns, the second still flags luabox, which
+# proves the array shape is read as "luals flagged nothing" rather than as
+# "the luals column silently stopped being compared". `!Traceback` and
+# `!could not parse` are the discriminating needles — an AttributeError from
+# the parser exits nonzero with its own message, not with either verdict.
+all_clean_corpus="$(newcorpus luals-all-clean)"
+cat >"$all_clean_corpus/only_case.lua" <<'LUA'
+-- nothing flagged by either tool
+LUA
+printf '# case\tluabox\tcodes\tluals\tnote\nonly_case\tclean\t-\tclean\tcontrol\n' \
+    >"$all_clean_corpus/expected.tsv"
+run luals_empty_array_is_zero_diagnostics 0 "$all_clean_corpus" \
+    "both columns match" \
+    "!Traceback" "!could not parse"
+
+# The same array shape with the luabox column NON-clean: proves the parse
+# produced an empty-but-USABLE result the per-case comparison then ran
+# against, rather than the luals column being skipped wholesale.
+all_clean_luabox_diag_corpus="$(newcorpus luals-clean-luabox-diag)"
+cat >"$all_clean_luabox_diag_corpus/only_case.lua" <<'LUA'
+-- STUB-LUABOX-DIAG: LB0300
+LUA
+printf '# case\tluabox\tcodes\tluals\tnote\nonly_case\tdiag\tLB0300\tclean\tluabox flags it, luals has no equivalent rule\n' \
+    >"$all_clean_luabox_diag_corpus/expected.tsv"
+run luals_empty_array_still_compares_the_luals_column 0 "$all_clean_luabox_diag_corpus" \
+    "both columns match" \
+    "!Traceback" "!luals is 'diag'"
 
 selftest_report luals-differential-selftest

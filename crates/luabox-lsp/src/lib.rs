@@ -102,6 +102,7 @@ mod line_index;
 mod merged_ambient;
 mod references;
 mod rename;
+mod render;
 mod requires;
 mod selection_range;
 mod sema;

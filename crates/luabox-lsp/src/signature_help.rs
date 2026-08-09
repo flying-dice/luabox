@@ -24,6 +24,7 @@ use luabox_types::ty::{FunctionTy, Ty};
 use rowan::TextRange;
 
 use crate::merged_ambient::MergedAmbient;
+use crate::render::OwnParamErasure;
 use crate::requires::{self, RequireExports};
 use crate::sema::{self, FileSema, SigParam};
 
@@ -356,13 +357,20 @@ fn signature_from_class_field(
     let shape = ambient.class_members_of(ty)?;
     let field = shape.fields.get(member)?;
     let fun = as_function_ty(&field.ty)?;
+    // A *bare* generic reference's own free parameters render `unknown`, the
+    // same erasure hover applies to a plain field of the same reference (M21)
+    // and the same one `class_shape_bound_export` enforces — resolved once
+    // per reference here rather than per rendered type, since a signature
+    // renders one per parameter plus one per return (production readiness
+    // review, finding 3).
+    let erasure = OwnParamErasure::at_reference(ty, &class, analysis, current, ambient);
     let mut params: Vec<RenderedParam> = fun
         .params
         .iter()
         .map(|p| {
             let q = if p.optional { "?" } else { "" };
             RenderedParam {
-                label: format!("{}{q}: {}", p.name, p.ty),
+                label: format!("{}{q}: {}", p.name, erasure.render(&p.ty)),
                 vararg: false,
                 doc: None,
             }
@@ -370,7 +378,7 @@ fn signature_from_class_field(
         .collect();
     if let Some(vararg_ty) = &fun.varargs {
         params.push(RenderedParam {
-            label: format!("...: {vararg_ty}"),
+            label: format!("...: {}", erasure.render(vararg_ty)),
             vararg: true,
             doc: None,
         });
@@ -389,7 +397,7 @@ fn signature_from_class_field(
     Some(Signature {
         name: format!("{class}{sep}{member}"),
         params,
-        returns: fun.returns.iter().map(ToString::to_string).collect(),
+        returns: fun.returns.iter().map(|r| erasure.render(r)).collect(),
         doc,
     })
 }
@@ -641,6 +649,54 @@ p:translate(1, 2)
         assert_eq!(help.active_parameter, Some(0));
     }
 
+    // === a bare generic receiver's own free parameters (M21) ==============
+
+    /// Production readiness review, finding 3: `hover` erases a **bare**
+    /// (unbound) generic reference's own free type parameters to `unknown`
+    /// at the reference site, exactly as `luabox check`'s
+    /// `class_shape_bound_export` does. Signature help renders the *same*
+    /// resolved field — a `fun(...)`-typed member off the same
+    /// `class_members_of` shape — and rendered its parameter and return
+    /// types raw, so the signature popup said `T` while the hover on the
+    /// identical symbol said `unknown`. One shared renderer
+    /// (`crate::render::OwnParamErasure`) now serves both.
+    #[test]
+    fn a_bare_generic_receivers_signature_erases_its_own_free_parameters() {
+        let src = "\
+---@class Box<T>
+---@field put fun(item: T): T
+
+---@type Box
+local b = nil
+b:put(1)
+";
+        let (analysis, path) = analyze(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let offset = src.rfind("put(1)").unwrap() + "put(".len();
+        let help = help_at(&analysis, &path, &sema, offset).expect("signature help");
+        assert_eq!(labels(&help), vec!["Box:put(item: unknown): unknown"]);
+    }
+
+    /// The one-variable control: bound at the reference site, the checker's
+    /// own monomorphisation (#48) has already substituted a real type, so
+    /// nothing is erased.
+    #[test]
+    fn a_bound_generic_receivers_signature_keeps_its_substituted_argument() {
+        let src = "\
+---@class Box<T>
+---@field put fun(item: T): T
+
+---@type Box<number>
+local b = nil
+b:put(1)
+";
+        let (analysis, path) = analyze(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let offset = src.rfind("put(1)").unwrap() + "put(".len();
+        let help = help_at(&analysis, &path, &sema, offset).expect("signature help");
+        assert_eq!(labels(&help), vec!["Box:put(item: number): number"]);
+    }
+
     /// R8: a class field's `---@field` description must reach signature
     /// help's `documentation` — the same text hover already shows for the
     /// identical field (`hover::method_call_name_hovers_as_the_class_field`).
@@ -863,16 +919,23 @@ M.helper(1)
         assert_eq!(labels(&help), vec!["Box:get(): number"]);
     }
 
-    /// The one-variable control: the identical class referenced bare stays
-    /// lenient — the free `T` — exactly as it did before #48.
+    /// The one-variable control: the identical class referenced bare erases
+    /// its own free parameter to `unknown` (M21), the same answer hover
+    /// gives for a plain field of the same reference.
+    ///
+    /// Renamed from `an_unbound_generic_receivers_method_stays_lenient`,
+    /// which pinned the pre-M21 raw `T` across a *second* surface —
+    /// production readiness review finding 3's whole point: M21 landed the
+    /// erasure in `hover.rs` alone, and the tests on the other surfaces
+    /// pinned the disagreement rather than catching it.
     #[test]
-    fn an_unbound_generic_receivers_method_stays_lenient() {
+    fn an_unbound_generic_receivers_method_erases_its_free_return_type() {
         let files = [
             ("main.lua", "---@type Box\nlocal b = nil\nb:get()\n"),
             ("box.lua", "---@class Box<T>\n---@field get fun(): T\n"),
         ];
         let help = help_after_open_files(&files, "get(").expect("signature help");
-        assert_eq!(labels(&help), vec!["Box:get(): T"]);
+        assert_eq!(labels(&help), vec!["Box:get(): unknown"]);
     }
 
     #[test]

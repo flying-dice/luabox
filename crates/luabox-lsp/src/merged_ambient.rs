@@ -72,17 +72,41 @@ pub struct MergedAmbient {
     /// reuses the computed file-visit order — and the `may_declare_class`
     /// text scan that built it — instead of recomputing both from scratch.
     search_order_cache: SearchOrderCache,
-    /// [`sema::is_declared_alias_or_enum`]'s cache, keyed by name, living at
-    /// the same per-revision lifetime as [`Self::search_order_cache`] (H2):
-    /// the underlying scan is `analysis.files().any(...)` — every project
-    /// file's every annotation's every tag, uncached — called from
+    /// [`sema::is_declared_alias_or_enum`]'s cache (H2): the underlying scan
+    /// is `analysis.files().any(...)` — every project file's every
+    /// annotation's every tag, uncached — called from
     /// `requires::require_struct_fields` on every hover and completion
     /// against a `require`d binding whose receiver carries no class
     /// reference of its own, i.e. the per-keystroke path. Without this, a
     /// sibling field's hover right after another one at the same name and
     /// revision re-ran the full scan for no reason, exactly the shape M57's
     /// `search_order_cache` was added to close for `may_declare_class`.
-    alias_or_enum_cache: RefCell<HashMap<String, bool>>,
+    alias_or_enum_cache: RefCell<AliasOrEnumCache>,
+}
+
+/// [`MergedAmbient::is_declared_alias_or_enum`]'s memo, keyed by
+/// `Analysis::revision` as well as by name.
+///
+/// The revision is not decoration. Unlike this type's other caches — which
+/// are keyed on nothing but a name because their input is `self`, fixed at
+/// construction — this one answers about an `Analysis` the *caller* supplies
+/// per call, so a name-only key silently made the second call's `analysis`
+/// argument dead (production readiness review, finding 5). Production is
+/// safe by construction (`server.rs::merged_ambient` rebuilds the whole
+/// layer whenever `Analysis::revision` moves, so every caller in one
+/// instance's life passes snapshots of the same revision) — but "safe
+/// because no caller can currently break it" is not a contract a signature
+/// may assert and not keep. Keying on the revision the answers were computed
+/// at makes the parameter load-bearing again: a snapshot from a different
+/// revision drops the memo and rescans, so the answer is always about the
+/// `Analysis` that was handed in. `AnalysisHost` guarantees the converse
+/// direction the memo depends on — equal revisions mean identical inputs.
+#[derive(Default)]
+struct AliasOrEnumCache {
+    /// The `Analysis::revision` `answers` were computed against; `None`
+    /// until the first query.
+    revision: Option<u64>,
+    answers: HashMap<String, bool>,
 }
 
 impl MergedAmbient {
@@ -105,7 +129,7 @@ impl MergedAmbient {
             ambient_paths: HashSet::new(),
             sema_cache: FileSemaCache::default(),
             search_order_cache: SearchOrderCache::default(),
-            alias_or_enum_cache: RefCell::new(HashMap::new()),
+            alias_or_enum_cache: RefCell::default(),
         }
     }
 
@@ -148,21 +172,34 @@ impl MergedAmbient {
         &self.search_order_cache
     }
 
-    /// [`sema::is_declared_alias_or_enum`], memoised per name for this
-    /// instance's lifetime (H2) — the `requires::require_struct_fields`
+    /// [`sema::is_declared_alias_or_enum`] for `analysis`, memoised per
+    /// `(revision, name)` (H2) — the `requires::require_struct_fields`
     /// counterpart of [`Self::class_members`]: the first call for a name
     /// scans every project file's annotations once; every later call for the
-    /// same name at this revision, from any surface, reuses the answer
-    /// instead of re-running `analysis.files().any(...)`.
+    /// same name against a snapshot of the same revision, from any surface,
+    /// reuses the answer instead of re-running `analysis.files().any(...)`.
+    ///
+    /// A snapshot at a *different* revision is rescanned, not answered from
+    /// the memo — see [`AliasOrEnumCache`] for why the parameter has to mean
+    /// that.
     #[must_use]
     pub fn is_declared_alias_or_enum(&self, analysis: &Analysis, name: &str) -> bool {
-        if let Some(cached) = self.alias_or_enum_cache.borrow().get(name) {
-            return *cached;
+        let revision = analysis.revision();
+        {
+            let cache = self.alias_or_enum_cache.borrow();
+            if cache.revision == Some(revision)
+                && let Some(found) = cache.answers.get(name)
+            {
+                return *found;
+            }
         }
         let found = sema::is_declared_alias_or_enum(analysis, name);
-        self.alias_or_enum_cache
-            .borrow_mut()
-            .insert(name.to_string(), found);
+        let mut cache = self.alias_or_enum_cache.borrow_mut();
+        if cache.revision != Some(revision) {
+            cache.answers.clear();
+            cache.revision = Some(revision);
+        }
+        cache.answers.insert(name.to_string(), found);
         found
     }
 
@@ -263,19 +300,41 @@ mod tests {
         MergedAmbient::build(&base, &analysis.project_types(), &[])
     }
 
+    /// The workspace root every test file lives under.
+    fn root() -> PathBuf {
+        PathBuf::from(if cfg!(windows) { r"C:\ws" } else { "/ws" })
+    }
+
     /// The bare [`Analysis`] snapshot [`merged`] builds a [`MergedAmbient`]
     /// from — exposed separately for [`is_declared_alias_or_enum`] tests,
     /// which need the `Analysis` itself, not just the layer built from it.
     fn analysis_of(src: &str) -> Analysis {
-        let root = PathBuf::from(if cfg!(windows) { r"C:\ws" } else { "/ws" });
+        host_of(src).snapshot()
+    }
+
+    /// The [`AnalysisHost`] behind [`analysis_of`], kept alive so a test can
+    /// take *several* snapshots of it. Revisions are only comparable within
+    /// one host (`AnalysisHost::revision`'s own contract: equal revisions
+    /// mean identical inputs), so any test about the revision key has to
+    /// hold the host, not two independent ones.
+    fn host_of(src: &str) -> AnalysisHost {
         let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
-        host.set_root(root.clone());
+        host.set_root(root());
         host.apply_change(Change::SetFileText {
-            path: root.join("main.lua"),
+            path: root().join("main.lua"),
             dialect: Dialect::Lua54,
             text: src.to_string(),
         });
-        host.snapshot()
+        host
+    }
+
+    /// [`merged`], handing back the host the layer was built from.
+    fn merged_with_host(src: &str) -> (MergedAmbient, AnalysisHost) {
+        let host = host_of(src);
+        let analysis = host.snapshot();
+        let base = build_ambient(Dialect::Lua54, &[]);
+        let merged = MergedAmbient::build(&base, &analysis.project_types(), &[]);
+        (merged, host)
     }
 
     #[test]
@@ -334,26 +393,58 @@ mod tests {
     /// binding). This must be memoised per name for the `MergedAmbient`'s
     /// revision lifetime the same way `class_members` already is.
     ///
-    /// Proved without instrumenting the scan itself: the *same* `ambient`
-    /// (and so the same cache) is asked about `"Foo"` against two different
-    /// `Analysis` snapshots — the first genuinely declares `Foo`, the second
-    /// declares nothing at all. If the scan re-ran on the second call, it
-    /// would correctly see `alias_absent` and answer `false`. It must
-    /// instead answer the first call's memoised `true` — the only way that
-    /// happens is if the second call never re-scanned.
+    /// Proved without instrumenting the scan itself: two snapshots of the
+    /// *same* host at the same revision (no change applied between them, so
+    /// `Analysis::revision` cannot have moved) must cost one scan, which the
+    /// single cache entry witnesses.
     #[test]
-    fn is_declared_alias_or_enum_memoises_the_same_name_across_calls() {
-        let ambient = merged("---@alias Foo string\n");
-        let alias_present = analysis_of("---@alias Foo string\n");
-        assert!(ambient.is_declared_alias_or_enum(&alias_present, "Foo"));
+    fn is_declared_alias_or_enum_memoises_the_same_name_at_the_same_revision() {
+        let (ambient, host) = merged_with_host("---@alias Foo string\n");
+        assert!(ambient.is_declared_alias_or_enum(&host.snapshot(), "Foo"));
+        assert!(ambient.is_declared_alias_or_enum(&host.snapshot(), "Foo"));
+        assert_eq!(ambient.alias_or_enum_cache.borrow().answers.len(), 1);
+    }
 
-        let alias_absent = analysis_of("local x = 1\n");
-        assert!(
-            ambient.is_declared_alias_or_enum(&alias_absent, "Foo"),
-            "expected the memoised answer from the first call, not a rescan \
-             of `alias_absent` (which declares no `Foo` at all)"
+    /// The honest half of the contract the memo used to break (production
+    /// readiness review, finding 5): the method takes an `Analysis`, so its
+    /// answer must be about *that* `Analysis`. Keyed on the name alone, the
+    /// parameter went dead after the first call — a second snapshot that no
+    /// longer declares `Foo` still got `true`, and the test that stood here
+    /// pinned exactly that stale answer as if it were the feature.
+    ///
+    /// Same host, so the revisions are comparable and the edit really does
+    /// move one: the alias is removed, and the answer moves with it.
+    ///
+    /// The first snapshot is scoped and dropped before the edit. An
+    /// `Analysis` holds a clone of the host's salsa handle, and
+    /// `apply_change`'s write blocks until every outstanding one is
+    /// released — holding it across the edit deadlocks the test rather than
+    /// failing it.
+    #[test]
+    fn is_declared_alias_or_enum_rescans_a_snapshot_from_a_later_revision() {
+        let (ambient, mut host) = merged_with_host("---@alias Foo string\n");
+        let before_revision = {
+            let before = host.snapshot();
+            assert!(ambient.is_declared_alias_or_enum(&before, "Foo"));
+            before.revision()
+        };
+
+        host.apply_change(Change::SetFileText {
+            path: root().join("main.lua"),
+            dialect: Dialect::Lua54,
+            text: "local x = 1\n".to_string(),
+        });
+        let after = host.snapshot();
+        assert_ne!(
+            before_revision,
+            after.revision(),
+            "the edit must move the revision, or this proves nothing"
         );
-        assert_eq!(ambient.alias_or_enum_cache.borrow().len(), 1);
+        assert!(
+            !ambient.is_declared_alias_or_enum(&after, "Foo"),
+            "a snapshot at a different revision must be rescanned, not \
+             answered from the previous revision's memo"
+        );
     }
 
     /// A `false` answer is memoised too, exactly like `class_members`'s own
@@ -364,7 +455,7 @@ mod tests {
         let analysis = analysis_of("---@alias Foo string\n");
         assert!(!ambient.is_declared_alias_or_enum(&analysis, "Nope"));
         assert!(!ambient.is_declared_alias_or_enum(&analysis, "Nope"));
-        assert_eq!(ambient.alias_or_enum_cache.borrow().len(), 1);
+        assert_eq!(ambient.alias_or_enum_cache.borrow().answers.len(), 1);
     }
 
     // === class_members_of (#48) ============================================

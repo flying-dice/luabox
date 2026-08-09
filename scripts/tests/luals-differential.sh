@@ -133,8 +133,14 @@ printf '[package]\nname = "lualsdiff"\nversion = "0.1.0"\nedition = "5.4"\n\n[ty
     > "$work/luabox.toml"
 
 # One luals run over the whole corpus; per-case verdicts parsed out of the
-# JSON afterwards. (--check writes to <out>/check.json; a run with zero
-# problems writes nothing, which is a valid "all clean".) Both streams are
+# JSON afterwards. (--check writes to <out>/check.json. MEASURED against
+# lua-language-server 3.13.5, 2026-08-09: a run with zero problems DOES write
+# the file — it writes the two bytes `[]`, a JSON ARRAY, where a run with
+# problems writes an OBJECT keyed by file URI. An earlier revision of this
+# comment claimed the file was not written at all on a clean run, and the
+# parser below trusted that by calling .items() unconditionally, so the
+# all-clean corpus shape died with an AttributeError instead of reading as
+# "nothing flagged". Both shapes are handled below.) Both streams are
 # captured to a file, not /dev/null: a bad flag, an unwritable
 # --check_out_path, a workspace load error and an OOM all currently produce
 # the same one-line "failed to run" message with nothing to tell them apart
@@ -177,6 +183,22 @@ codes = set(sys.argv[5:])
 
 with open(check_path) as f:
     data = json.load(f)
+
+# lua-language-server 3.13.5 writes an OBJECT (file-URI -> diagnostics) when
+# it found problems and the empty ARRAY `[]` when it found none — measured,
+# see the shell comment above. An empty mapping is the same fact, so both
+# normalise to "no file has any hit"; anything else is a shape this parser
+# does not understand and must not silently read as clean.
+if isinstance(data, list):
+    if data:
+        sys.exit(
+            "luals --check wrote a non-empty JSON array, which this parser "
+            "does not understand (3.13.5 writes `[]` for a clean run and an "
+            "object keyed by file URI otherwise)"
+        )
+    data = {}
+elif not isinstance(data, dict):
+    sys.exit(f"luals --check wrote unexpected JSON of type {type(data).__name__}")
 
 # Parity-set codes actually reported, per underlying file (basename, no
 # .lua). This is per-FILE — the union into per-CASE file sets happens below.

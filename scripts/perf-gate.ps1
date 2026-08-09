@@ -65,17 +65,23 @@ Set-Location $repoRoot
 # file's judgement in milliseconds (#58 review round 6, M51).
 . (Join-Path $PSScriptRoot "perf-gate-lib.ps1")
 
-# The nine budget constants below used to be a second, hand-carried copy of
+# The budget constants below used to be a second, hand-carried copy of
 # scripts/perf-gate.sh's own — one rule, two copies, free to drift (#58
 # review round 6, M50). They now live once, with their calibration
 # rationale, in perf-gate-budgets.env; Read-PerfBudgets parses the same
-# KEY=VALUE file scripts/perf-gate.sh `source`s directly.
+# KEY=VALUE file scripts/perf-gate.sh `source`s directly. Read every key
+# that file defines: a key honoured by one reader and ignored by the other
+# is the same drift M50 closed, just quieter — which is exactly what
+# happened to CHECK_CEILING_MS/DIAG_CHECK_CEILING_MS between the round 6
+# rebase and the local merge-gate that found them unread here.
 $PerfBudgets = Read-PerfBudgets (Join-Path $PSScriptRoot "perf-gate-budgets.env")
 $ColdStartBudgetBaseMs = $PerfBudgets["COLD_START_BUDGET_BASE_MS"]
 $FmtBudgetBaseMs = $PerfBudgets["FMT_BUDGET_BASE_MS"]
 $CheckBudgetBaseMs = $PerfBudgets["CHECK_BUDGET_BASE_MS"]
+$CheckCeilingMs = $PerfBudgets["CHECK_CEILING_MS"]
 $DiagLintBudgetBaseMs = $PerfBudgets["DIAG_LINT_BUDGET_BASE_MS"]
 $DiagCheckBudgetBaseMs = $PerfBudgets["DIAG_CHECK_BUDGET_BASE_MS"]
+$DiagCheckCeilingMs = $PerfBudgets["DIAG_CHECK_CEILING_MS"]
 $DiagLintRenderedBudgetBaseMs = $PerfBudgets["DIAG_LINT_RENDERED_BUDGET_BASE_MS"]
 $DiagCheckRenderedBudgetBaseMs = $PerfBudgets["DIAG_CHECK_RENDERED_BUDGET_BASE_MS"]
 $DiagCorpusFindings = $PerfBudgets["DIAG_CORPUS_FINDINGS"]
@@ -201,9 +207,15 @@ try {
     }
 
     # --- CHECK GATE ----------------------------------------------------------
-    # SPEC.md §16.1: `check` on the 100-kLOC corpus < 1 s warm. Live since
-    # GL#6; the fmt --check gate above stays as the wider safety net.
-    $checkBudget = ConvertTo-ScaledBudgetMs $CheckBudgetBaseMs $Factor
+    # SPEC.md §16.1 named `check` on the 100-kLOC corpus < 1 s warm as the
+    # original acceptance target. CHECK_BUDGET_BASE_MS no longer equals that
+    # figure — #58 review round 6, M37 found it FAILING on real hardware at
+    # FACTOR=1.0; see perf-gate-budgets.env's own comment for the real
+    # numbers that session measured and the headroom the rebased budget
+    # carries. Live since GL#6; the fmt --check gate above stays as the wider
+    # safety net. -CheckCeilingMs caps the SCALED budget, mirroring
+    # perf-gate.sh's third argument at the same leg.
+    $checkBudget = ConvertTo-ScaledBudgetMs $CheckBudgetBaseMs $Factor -CeilingMs $CheckCeilingMs
     Write-Host ""
     Write-Host "perf-gate: check throughput on corpus (warm)..."
     Push-Location $corpusDir
@@ -396,7 +408,7 @@ try {
     # either half moves only its own pair — and stdout is discarded in
     # both, so the gate times the toolchain, not the terminal.
     $diagLintBudget = ConvertTo-ScaledBudgetMs $DiagLintBudgetBaseMs $Factor
-    $diagCheckBudget = ConvertTo-ScaledBudgetMs $DiagCheckBudgetBaseMs $Factor
+    $diagCheckBudget = ConvertTo-ScaledBudgetMs $DiagCheckBudgetBaseMs $Factor -CeilingMs $DiagCheckCeilingMs
     $diagLintRenderedBudget = ConvertTo-ScaledBudgetMs $DiagLintRenderedBudgetBaseMs $Factor
     $diagCheckRenderedBudget = ConvertTo-ScaledBudgetMs $DiagCheckRenderedBudgetBaseMs $Factor
 

@@ -493,8 +493,10 @@ Feature: luabox check — cross-file require resolution (#85)
     # own candidate diagnostic for BOTH `A` and `B` — 4 candidates for this
     # 2-class cycle where the identical shape written in one file produces
     # 2. `luabox_cli::check_cmd::dedupe_ancestry_diagnostics` collapses the
-    # duplicates by `(code, primary span)` after every file's diagnostics
-    # converge, so exactly one `LB0318` survives per class: 2, not 4.
+    # duplicates by `(code, primary span, message)` after every file's
+    # diagnostics converge, so exactly one `LB0318` survives per class: 2,
+    # not 4. The message is in the key because the ambient tier has no
+    # distinguishing span at all — see that function's own doc comment.
     And stdout contains exactly 2 occurrence of "LB0318"
 
   Scenario: a require cycle across three class carriers dedupes to one diagnostic per class
@@ -515,8 +517,8 @@ Feature: luabox check — cross-file require resolution (#85)
     #
     # The expected count (3) is measured against the built binary, not
     # guessed: `luabox_cli::check_cmd::dedupe_ancestry_diagnostics` collapses
-    # by `(code, primary span)`, and each class's declaration span is
-    # distinct, so each of the three survives exactly once.
+    # by `(code, primary span, message)`, and each class's declaration span
+    # is distinct, so each of the three survives exactly once.
     Given a strict project with edition "5.4"
     And a file "src/a.lua" containing:
       """
@@ -574,7 +576,11 @@ Feature: luabox check — cross-file require resolution (#85)
     When I run "luabox check"
     Then the command succeeds
     And stdout contains "LB0318"
-    And stderr contains "0 errors"
+    # The tight form, measured against the built binary: bare `0 errors` is a
+    # substring of `10 errors` too, so it cannot tell a downgrade from a
+    # flood. Every sibling scenario in this file already spells the whole
+    # summary line out.
+    And stderr contains "check: 0 errors, 2 warnings in 3 files"
 
   Scenario: the cyclic-class diagnostic is suppressible from its own declaring file alone
     # M67's escape hatch, half two, and production readiness review G1. The
@@ -706,6 +712,46 @@ Feature: luabox check — cross-file require resolution (#85)
     When I run "luabox check"
     Then the command fails
     And stdout contains "LB0306"
+
+  Scenario: a cross-file class cycle between two non-ASCII class names dedupes to one diagnostic each
+    # Production readiness review, finding 7. Two of this file's mechanisms
+    # are keyed on the class NAME as it reaches a `Diagnostic` — the
+    # cross-file dedup (`(code, primary span, message)`, and the message is
+    # the only place the name survives) and the `exactly N occurrence`
+    # counting the cycle scenarios above assert with. Both had zero non-ASCII
+    # coverage: every cycle fixture in this file uses `A`/`B`/`C`, so a
+    # regression that truncated, normalised or byte-sliced a name would still
+    # dedup and count correctly on ASCII and silently collapse two Greek
+    # classes into one.
+    #
+    # Greek rather than CJK on purpose: the sibling scenario below already
+    # covers a CJK name on the export boundary, and Greek is the case where a
+    # careless `char_indices`/byte-offset slice produces a DIFFERENT wrong
+    # answer (2-byte code points) than CJK does (3-byte).
+    #
+    # Measured against the built binary: 2 errors, one per class, each naming
+    # its own class and attributed to its own declaring file.
+    Given a strict project with edition "5.4"
+    And a file "src/a.lua" containing:
+      """
+      local B = require("b")
+      ---@class Ωμέγα : Δέλτα
+      local M = {}
+      return M
+      """
+    And a file "src/b.lua" containing:
+      """
+      local A = require("a")
+      ---@class Δέλτα : Ωμέγα
+      local M = {}
+      return M
+      """
+    When I run "luabox check"
+    Then the command fails
+    And stdout contains exactly 2 occurrence of "LB0318"
+    And stdout contains "`Ωμέγα`'s `---@class` ancestry is cyclic"
+    And stdout contains "`Δέλτα`'s `---@class` ancestry is cyclic"
+    And stderr contains "check: 2 errors, 0 warnings in 2 files"
 
   Scenario: a unicode class name crosses the export boundary
     # Round 4 review R28: chaos gap (c) — the "very long class name" scenario

@@ -585,6 +585,18 @@ pub struct FieldSource {
     pub span: Span,
 }
 
+/// The invariants of one field lookup: everything [`locate_field`]'s
+/// recursive walk carries unchanged from frame to frame, so the walk itself
+/// threads only what actually varies (the class, the member, the once-ever
+/// visited set, the depth).
+struct LookupCtx<'a> {
+    analysis: &'a Analysis,
+    current: &'a Path,
+    ambient_paths: &'a HashSet<PathBuf>,
+    sema_cache: &'a FileSemaCache,
+    search_order_cache: &'a SearchOrderCache,
+}
+
 /// [`FieldSource`] for `class.member`, searched across every project file's
 /// own `---@class` annotations, walking the parent chain **across files**
 /// (#51, #54) — the cross-file counterpart of [`collect_fields`], which can
@@ -735,21 +747,8 @@ pub struct FieldSource {
 /// contributed each resolved field), and nothing public in `luabox-types`
 /// exposes that today — `TypeEnv::class_shape_bound`/
 /// `class_shape_bound_export` are `pub(crate)` and their `TableTy` result
-/// carries no owner, only a type (round 6 report: the accessor this would
-/// need, filed rather than added here since `env.rs` is owned by another
-/// concurrent change).
-/// The invariants of one field lookup: everything [`locate_field`]'s
-/// recursive walk carries unchanged from frame to frame, so the walk itself
-/// threads only what actually varies (the class, the member, the path-scoped
-/// cycle guard, the depth).
-struct LookupCtx<'a> {
-    analysis: &'a Analysis,
-    current: &'a Path,
-    ambient_paths: &'a HashSet<PathBuf>,
-    sema_cache: &'a FileSemaCache,
-    search_order_cache: &'a SearchOrderCache,
-}
-
+/// carries no owner, only a type. The `luabox-types` accessor this would
+/// need is tracked as issue #70.
 #[must_use]
 pub fn locate_field(
     analysis: &Analysis,
@@ -760,7 +759,7 @@ pub fn locate_field(
     sema_cache: &FileSemaCache,
     search_order_cache: &SearchOrderCache,
 ) -> Option<FieldSource> {
-    let mut on_path = HashSet::new();
+    let mut visited = HashSet::new();
     let ctx = LookupCtx {
         analysis,
         current,
@@ -768,7 +767,7 @@ pub fn locate_field(
         sema_cache,
         search_order_cache,
     };
-    locate_field_dfs(&ctx, class, member, &mut on_path, 0)
+    locate_field_dfs(&ctx, class, member, &mut visited, 0)
 }
 
 /// [`locate_field`]'s depth-first preorder walk over the parent chain (M2),
@@ -776,24 +775,47 @@ pub fn locate_field(
 /// pathological chain the checker itself refuses to resolve past that depth
 /// must not send this walk recursing past it either — an LSP field lookup
 /// with no bound at all would keep walking a 10 000-class chain the checker
-/// already gave up on at 200. `on_path` is a path-scoped cycle guard (not a
-/// once-ever `seen` set): removed on the way back out of each frame, so a
-/// diamond — the same class reachable through two different parents — is
-/// still visited on the second parent's branch, only a true cycle (`A : B`,
-/// `B : A`) is refused.
+/// already gave up on at 200.
+///
+/// `visited` is a **once-ever** set, never unwound on the way back out
+/// (production readiness review, finding 1). The M2 rewrite that made this
+/// walk depth-first replaced the previous BFS's once-ever `seen` set with a
+/// path-scoped guard that *was* unwound per frame, so a class reachable
+/// through two parents was re-expanded once per distinct path to it rather
+/// than once per node: on the repo's own `conflicting_diamond_source` shape
+/// (`A{i} : A{i-1}<T>, A{i-1}<number>` — both parents naming the same
+/// class) that is 2^k node visits, and the depth cap above never fires
+/// because a wide-shallow lattice's *depth* stays small. A **miss** is the
+/// case that pays it in full, and misses are routine here: [`FileSema::classes`]
+/// harvests only `---@field` tags, so every `function C:method()` carrier
+/// member is a miss ([`crate::goto_definition`] and
+/// [`crate::signature_help`] both call in for any member name once the
+/// class has an indexer or array part). The server is single-threaded with
+/// no request cancellation, so one such miss stalls every other request,
+/// shutdown included.
+///
+/// First-visit-wins costs nothing in precedence, and in particular preserves
+/// the preorder ordering M2 established: this is a *first-match* search that
+/// returns the instant a candidate is found, so a class that is re-reached
+/// later can only ever have returned `None` the first time — and it would
+/// return `None` again, since its answer depends on nothing that varies
+/// between frames (`member`, the file set and the class graph are all fixed
+/// for one call). Refusing the re-entry therefore drops only repeated work,
+/// never a winner: the winner is the earliest node in preorder that declares
+/// `member`, and that node's *first* visit is its earliest preorder
+/// occurrence. The set also subsumes the old cycle guard — a true cycle
+/// (`A : B`, `B : A`) cannot re-enter a node it has already entered.
 fn locate_field_dfs(
     ctx: &LookupCtx<'_>,
     class: &str,
     member: &str,
-    on_path: &mut HashSet<String>,
+    visited: &mut HashSet<String>,
     depth: usize,
 ) -> Option<FieldSource> {
-    if depth >= luabox_types::MAX_ANCESTRY_DEPTH || !on_path.insert(class.to_string()) {
+    if depth >= luabox_types::MAX_ANCESTRY_DEPTH || !visited.insert(class.to_string()) {
         return None;
     }
-    let found = locate_field_in_class(ctx, class, member, on_path, depth);
-    on_path.remove(class);
-    found
+    locate_field_in_class(ctx, class, member, visited, depth)
 }
 
 /// [`locate_field_dfs`]'s per-class body, two passes: `class`'s own
@@ -803,11 +825,21 @@ fn locate_field_dfs(
 /// `collect_class` ever looks at a parent — and only once no candidate file
 /// declares the field itself does the second pass recurse into each
 /// candidate's parents, depth-first, file order then listed-parent order.
+///
+/// Both passes read one `declarations` list built up front rather than
+/// re-deriving it per pass (production readiness review, finding 7):
+/// [`FileSema::classes`] walks every annotation item in a file and allocates
+/// a fresh `HashMap` of *every* class it declares, so calling it once per
+/// pass paid that whole-file build twice for each candidate file, on every
+/// class in the ancestry walk. Collecting first changes nothing about the
+/// two-pass precedence — the same candidate files in the same
+/// [`search_order`] order, own-declarations exhausted before any parent is
+/// followed.
 fn locate_field_in_class(
     ctx: &LookupCtx<'_>,
     class: &str,
     member: &str,
-    on_path: &mut HashSet<String>,
+    visited: &mut HashSet<String>,
     depth: usize,
 ) -> Option<FieldSource> {
     let order = search_order(
@@ -817,14 +849,18 @@ fn locate_field_in_class(
         ctx.ambient_paths,
         ctx.search_order_cache,
     );
-    for path in order.iter() {
-        let Some(sema) = cached_file_sema(ctx.sema_cache, ctx.analysis, path) else {
-            continue;
-        };
-        let map = sema.classes();
-        let Some(decl) = map.get(class) else {
-            continue;
-        };
+    let semas: Vec<Rc<FileSema>> = order
+        .iter()
+        .filter_map(|path| cached_file_sema(ctx.sema_cache, ctx.analysis, path))
+        .collect();
+    let declarations: Vec<(&FileSema, ClassDecl<'_>)> = semas
+        .iter()
+        .filter_map(|sema| {
+            let mut map = sema.classes();
+            map.remove(class).map(|decl| (&**sema, decl))
+        })
+        .collect();
+    for (sema, decl) in &declarations {
         if let Some(field) = decl
             .fields
             .iter()
@@ -837,19 +873,12 @@ fn locate_field_in_class(
             });
         }
     }
-    for path in order.iter() {
-        let Some(sema) = cached_file_sema(ctx.sema_cache, ctx.analysis, path) else {
-            continue;
-        };
-        let map = sema.classes();
-        let Some(decl) = map.get(class) else {
-            continue;
-        };
+    for (_, decl) in &declarations {
         for parent in &decl.tag.parents {
             let Some(parent_name) = named_of(parent) else {
                 continue;
             };
-            if let Some(found) = locate_field_dfs(ctx, &parent_name, member, on_path, depth + 1) {
+            if let Some(found) = locate_field_dfs(ctx, &parent_name, member, visited, depth + 1) {
                 return Some(found);
             }
         }
@@ -2326,6 +2355,125 @@ mod tests {
             .is_some(),
             "a chain within the limit must still resolve"
         );
+    }
+
+    // === ancestry width bound (production readiness review, finding 1) ====
+
+    /// `luabox-types`' own `conflicting_diamond_source` shape, k levels of
+    /// `A{i} : A{i-1}<T>, A{i-1}<number>` — both listed parents naming the
+    /// *same* class, so the ancestry is a lattice of k+1 nodes but 2^k
+    /// distinct root-to-leaf **paths**. The M2 DFS rewrite unwound its
+    /// `on_path` guard on the way out of every frame, so it re-expanded per
+    /// path, not per node; the [`luabox_types::MAX_ANCESTRY_DEPTH`] cap
+    /// above never catches it, because the *depth* here is only k.
+    ///
+    /// A **miss** is what pays that in full — and misses are the routine
+    /// case ([`locate_field_dfs`]'s own doc: a carrier-attached
+    /// `function C:method()` is never in [`FileSema::classes`]'s
+    /// `---@field`-only harvest). Run on a background thread with a bounded
+    /// `recv_timeout`, the same idiom `luabox_types::env`'s
+    /// `a_deep_diamond_resolves_without_exponential_blowup` uses, so an
+    /// exponential regression fails this test instead of hanging the suite.
+    /// k = 25 is ~33M path expansions pre-fix (minutes at best) against 26
+    /// node expansions after it.
+    #[test]
+    fn locate_field_expands_a_wide_diamond_ancestry_once_per_class_not_once_per_path() {
+        use std::fmt::Write as _;
+
+        let k = 25_usize;
+        let mut src = String::from("---@class A0<T>\n---@field item T\n");
+        for i in 1..=k {
+            let _ = writeln!(
+                src,
+                "---@class A{i}<T> : A{prev}<T>, A{prev}<number>",
+                prev = i - 1
+            );
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (analysis, path) = sema_of(&src);
+            let found = locate_field(
+                &analysis,
+                &path,
+                &format!("A{k}"),
+                "absent",
+                &no_ambient(),
+                &no_cache(),
+                &no_order_cache(),
+            );
+            let _ = tx.send(found.is_some());
+        });
+        let found = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+            "a k=25 diamond miss must complete in well under 10s once each class \
+             is expanded once; the per-path walk it replaced is O(2^25)",
+        );
+        assert!(
+            !found,
+            "no ancestor declares `absent` — the walk must miss, not merely terminate"
+        );
+    }
+
+    /// The correctness control for the once-ever set: a diamond whose
+    /// *shared* ancestor is the only declarer of the field must still be
+    /// reached through the first parent's subtree, and a class reachable
+    /// through two parents must not lose a field the second parent declares
+    /// when the first branch has already visited (and rejected) a sibling.
+    #[test]
+    fn locate_field_still_finds_a_field_only_a_shared_diamond_ancestor_declares() {
+        let (analysis, path) = sema_of(
+            "\
+---@class Base
+---@field item number
+
+---@class Left : Base
+---@class Right : Base
+---@class Leaf : Left, Right
+",
+        );
+        let found = locate_field(
+            &analysis,
+            &path,
+            "Leaf",
+            "item",
+            &no_ambient(),
+            &no_cache(),
+            &no_order_cache(),
+        )
+        .expect("`Base.item` is reachable through either parent");
+        assert_eq!(found.path, path);
+    }
+
+    /// Preorder precedence (M2) survives the once-ever set: for
+    /// `Leaf : Left, Right` with `Left : Deep`, both `Deep` and `Right`
+    /// declaring `item`, `Left`'s *entire* subtree is visited before
+    /// `Right`, so `Deep`'s description wins — the same answer the
+    /// path-scoped guard gave.
+    #[test]
+    fn locate_field_keeps_preorder_precedence_across_a_diamond() {
+        let (analysis, path) = sema_of(
+            "\
+---@class Deep
+---@field item number from the deep left ancestor
+
+---@class Right
+---@field item number from the right parent
+
+---@class Left : Deep
+---@class Leaf : Left, Right
+",
+        );
+        let found = locate_field(
+            &analysis,
+            &path,
+            "Leaf",
+            "item",
+            &no_ambient(),
+            &no_cache(),
+            &no_order_cache(),
+        )
+        .expect("both branches declare `item`");
+        assert_eq!(found.desc.as_deref(), Some("from the deep left ancestor"));
     }
 
     // === functions() ======================================================

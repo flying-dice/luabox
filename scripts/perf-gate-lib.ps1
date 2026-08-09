@@ -11,7 +11,7 @@
 
 # Read-PerfBudgets <path> — parses the KEY=VALUE file both perf-gate.sh
 # (via a plain bash `source`) and this script read as the one owner of the
-# nine budget constants (#58 review round 6, M50: these used to be a second,
+# budget constants (#58 review round 6, M50: these used to be a second,
 # hand-carried copy in this file, free to drift from perf-gate.sh's own).
 # Blank lines and lines starting with `#` are comments. Fails loudly (throws)
 # on a missing file or a line that is not `KEY=INTEGER` — a budgets file
@@ -70,19 +70,38 @@ strict = true
     Set-Content -Path $Path -Value $body -NoNewline
 }
 
-# ConvertTo-ScaledBudgetMs <BaseMs> <Factor> — the -Factor float multiply
-# every timed leg's budget goes through, extracted so the self-test can
-# pin the truncate-vs-round behaviour directly, the same property
+# ConvertTo-ScaledBudgetMs <BaseMs> <Factor> [-CeilingMs] — the -Factor float
+# multiply every timed leg's budget goes through, extracted so the self-test
+# can pin the truncate-vs-round behaviour directly, the same property
 # perf-gate-lib.sh's scale_budget_ms self-test pins on the bash side.
 # `[int]` truncates toward zero in PowerShell for a positive double, which
 # is the same "truncates, does not round" contract scale_budget_ms's `%d`
 # printf format gives on the bash side.
+#
+# -CeilingMs mirrors scale_budget_ms's optional third argument, added on the
+# bash side by the round 6 budget rebase and left off this one — the parity
+# drift a local merge-gate found: perf-gate.ps1 reads the SAME
+# perf-gate-budgets.env, so CHECK_CEILING_MS/DIAG_CHECK_CEILING_MS were sitting
+# in the shared file being honoured by one reader and silently ignored by the
+# other. -Factor absorbs slow shared hardware by multiplying the WHOLE budget,
+# but a base budget already carries ~3x headroom over a measured baseline by
+# convention, and multiplying headroom by headroom compounds: at -Factor 4.0
+# the 7500 ms `check` base becomes a 30000 ms ceiling, ~12x the ~2.5 s
+# baseline. Capping the SCALED value keeps CI's ceiling within a stated
+# multiple of what the leg actually costs. 0 (the default) means "no cap",
+# matching the bash side's empty third argument — a leg passing no ceiling is
+# unchanged.
 function ConvertTo-ScaledBudgetMs {
     param(
         [Parameter(Mandatory)][double]$BaseMs,
-        [Parameter(Mandatory)][double]$Factor
+        [Parameter(Mandatory)][double]$Factor,
+        [double]$CeilingMs = 0
     )
-    return [int]($BaseMs * $Factor)
+    $scaled = [int]($BaseMs * $Factor)
+    if ($CeilingMs -gt 0 -and $scaled -gt $CeilingMs) {
+        return [int]$CeilingMs
+    }
+    return $scaled
 }
 
 # Test-LuaFileCount <Dir> <Expected> — N38/M30's fix: a peak-RSS (or

@@ -288,13 +288,24 @@ fn collect_diagnostics(
         files.push(result?);
     }
 
-    // A `---@class` chain deep enough to overflow the pinned stack has to be
-    // caught HERE, before the surface pass below recurses over it — see
-    // `deep_class_chain_diagnostics`.
-    let depth_diags = deep_class_chain_diagnostics(&files, project.strictness);
-    if !depth_diags.is_empty() {
-        return Ok((depth_diags, files.len()));
-    }
+    // A `---@class` chain past the ancestry ceiling is reported HERE,
+    // syntactically, before the surface pass below resolves anything — see
+    // `deep_class_chain_diagnostics`. It no longer *short-circuits* the run:
+    // it used to `return` the moment it found anything, which silently
+    // disabled every other pass in the command (#61 local merge-gate, the
+    // short-circuit finding) — a 201-link chain in one file hid the syntax errors in
+    // another, an `Error`-severity `LB1002` was discarded because a
+    // `Warning`-severity depth diagnostic got there first, and adding a
+    // `---@diagnostic disable` comment therefore made `check` report MORE
+    // findings, not fewer. The pinned-stack protection that early return was
+    // reasoned from is not this pre-check's to give: `MAX_ANCESTRY_DEPTH`'s
+    // `DiamondGuard` cap refuses to recurse past 200 links inside the
+    // resolution walk itself, for every caller. Re-measured on this branch
+    // before the early return was deleted, with the full pipeline running
+    // over the chain: a 2,500-link chain and a 50,000-link chain (the latter
+    // with `---@type C50000` + a field read, so the resolver actually walks
+    // it) both complete and report, no SIGABRT.
+    let chains = deep_class_chain_diagnostics(&files, project.strictness);
 
     // Cross-file pre-pass (#85): reify every project file's surface up
     // front — its `require`-export type (keyed by canonical path) plus its
@@ -468,6 +479,7 @@ fn collect_diagnostics(
     for file_diags in per_file {
         diags.extend(file_diags);
     }
+    merge_depth_chain_diagnostics(&mut diags, chains);
     // A cross-file `---@class` cycle is one project-wide finding, not one
     // per file that happens to resolve it: `luabox_types::TypeEnv` is built
     // fresh per file (deliberately — see `build_file_env`'s doc comment), so
@@ -478,17 +490,94 @@ fn collect_diagnostics(
     // `LB0318`s where the identical cycle written in one file emits 2.
     // Deduped here, after every file's diagnostics have converged into one
     // list — the one place that can see across files — by `(code, primary
-    // span)`: `TypeEnv::class_decl_span`/`cross_file_class_decl_span` always
-    // resolve a given class name to the SAME declaration span regardless of
-    // which file's pass queried it, so this collapses every file's
-    // rediscovery back to the one true diagnostic per class. `LB0317` (the
-    // depth-limit sibling) shares the same per-file-TypeEnv architecture and
-    // so shares the same theoretical exposure — confirmed by test, not
-    // merely assumed — so it rides the same dedup rather than only the
-    // `LB0318` case that is guaranteed to hit it.
+    // span, message)`: `TypeEnv::class_decl_span`/`cross_file_class_decl_span`
+    // always resolve a given class name to the SAME declaration span
+    // regardless of which file's pass queried it, so that key collapses every
+    // file's rediscovery back to the one true diagnostic per class. The
+    // message is in the key because the ambient tier has no distinguishing
+    // span at all — see [`dedupe_ancestry_diagnostics`]'s own doc comment for
+    // the measurement. `LB0317` (the depth-limit sibling) shares the same
+    // per-file-TypeEnv architecture and so shares the same theoretical
+    // exposure — confirmed by test, not merely assumed — so it rides the same
+    // dedup rather than only the `LB0318` case that is guaranteed to hit it.
     dedupe_ancestry_diagnostics(&mut diags);
+    sort_for_render(&mut diags);
 
     Ok((diags, lua_files.len()))
+}
+
+/// Fold the syntactic pre-check's `LB0317`s into the converged diagnostic
+/// list, so an over-limit chain costs ONE diagnostic across both mechanisms
+/// that can see it.
+///
+/// The resolver-side drain (`luabox_types::check::report_depth_limit_hits`)
+/// reports whichever class's resolution tripped the guard, in different words
+/// and — measured on a 400-link chain with `---@type C400` — at a different
+/// class of the SAME chain: the pre-check's `C201` and the drain's `C400`.
+/// Neither [`dedupe_ancestry_diagnostics`]'s `(code, span, message)` key nor
+/// an aligned message would collapse those. [`DeepChains::covered`] carries
+/// every over-limit class's declaration site, so the drain's rediscoveries of
+/// a chain the pre-check already named are dropped and the pre-check's own —
+/// the first link over the limit, the actionable one — is what survives.
+///
+/// Deliberately unconditional on suppression: a `---@diagnostic disable` that
+/// silences the pre-check silences the whole chain, rather than silencing the
+/// first link and leaving the drain's copy of the same chain standing. One
+/// rule disagreeing with itself across two mechanisms is exactly what the
+/// production readiness review's finding 3 was about.
+///
+/// A class declared only in an ambient `[types] defs` package has no
+/// in-project declaration for the pre-check to see (it scans project files
+/// only, `DefFiles::Exclude`), so it is never covered and the drain's
+/// diagnostic for it is untouched — that tier is the one thing keeping
+/// `luabox check` from going green on a project the LSP reports red on
+/// (round 6 review M5).
+fn merge_depth_chain_diagnostics(diags: &mut Vec<Diagnostic>, chains: DeepChains) {
+    if !chains.covered.is_empty() {
+        diags.retain(|d| {
+            d.code != LB0317_CLASS_ANCESTRY_TOO_DEEP || !chains.covers(d.primary_label())
+        });
+    }
+    diags.extend(chains.diags);
+}
+
+/// The order `check` renders its findings in: by file, then by position in
+/// that file, then — for findings that genuinely share a span — by code and
+/// message.
+///
+/// The last two keys are not decoration. `luabox_types`' ancestry drains
+/// attribute a class with no in-project declaration to `Span::new(file, 0..0)`
+/// (`check::report_ancestry_hits`'s third arm), so every ambient-tier hit in
+/// one file carries the IDENTICAL span, and the ledger they are drained from
+/// is hash-ordered. Sorting on `range.start` alone therefore left their
+/// relative order down to hashmap iteration: measured on a project with two
+/// over-limit `[types] defs` chains, 12 consecutive runs of the same binary
+/// over the same unchanged sources printed the two `LB0317`s in one order 10
+/// times and the other order twice. A diff-based CI gate cannot tell that
+/// apart from a real change (production readiness review, finding 5). Code
+/// and message are what remain to separate two findings at one span, and both
+/// are deterministic.
+///
+/// Applied once, here, over the whole converged list — not per pass and not
+/// per file. `finish`'s only other caller passes a single diagnostic, which is
+/// already sorted.
+fn sort_for_render(diags: &mut [Diagnostic]) {
+    /// Where a diagnostic points, borrowed rather than cloned: this runs
+    /// `O(n log n)` times, and the file name is the whole key's first
+    /// component. A project-assembly finding carries no label at all
+    /// (`LB1002`, `LB0307`) and sorts to the front, where it already
+    /// rendered.
+    fn place(diag: &Diagnostic) -> (&str, usize, usize) {
+        diag.primary_label().map_or(("", 0, 0), |l| {
+            (l.span.file.as_str(), l.span.range.start, l.span.range.end)
+        })
+    }
+    diags.sort_by(|a, b| {
+        place(a)
+            .cmp(&place(b))
+            .then_with(|| a.code.number().cmp(&b.code.number()))
+            .then_with(|| a.message.cmp(&b.message))
+    });
 }
 
 /// Hard ceiling on a `---@class` inheritance chain, checked syntactically —
@@ -517,14 +606,39 @@ fn collect_diagnostics(
 /// including ones this pre-check never runs ahead of (the LSP request path,
 /// an embedder calling `luabox_lsp::run_stdio` directly).
 ///
-/// [`MAX_ANCESTRY_DEPTH`]'s check: every over-limit class declared anywhere
-/// in the project (round 6 review M17 — `HashMap` iteration order used to
-/// pick one arbitrary deepest class via `max_by_key` and silently drop every
-/// other over-limit chain; every one is now reported, sorted by declaring
-/// span so the order is deterministic regardless of hashmap or harvest
-/// order, matching the sort [`luabox_types::check`]'s own `LB0317` path
-/// already applies to its whole diagnostic list). Empty when every declared
-/// chain is within bounds.
+/// [`MAX_ANCESTRY_DEPTH`]'s check: **the first link over the limit in every
+/// over-limit chain** — the class whose own parent is still within bounds,
+/// which is the one place a reader can act on. Round 6 review M17 replaced a
+/// `max_by_key` that let `HashMap` iteration order pick one arbitrary chain
+/// and silently dropped every other; the fix reported every over-limit
+/// *class*, which on a single long chain is a different failure: one 2,500-link
+/// chain produced 2,300 separate errors and 835 KB of output, all of them
+/// restating one mistake (round 6 review M17, re-measured by the #61 local
+/// merge-gate's per-link-flood finding). Reporting the frontier keeps M17's actual
+/// requirement — N independent chains still produce N diagnostics, none of
+/// them dropped — while a chain costs one diagnostic however long it is. The
+/// message carries the measured total: the chain's deepest class and its
+/// depth. Sorted by declaring span, so the order is deterministic regardless
+/// of hashmap or harvest order.
+///
+/// Also returned: the declaration spans of every over-limit class, not only
+/// the reported frontier ones ([`DeepChains::covered`]). That is what lets
+/// [`collect_diagnostics`] drop the resolver-side drain's own `LB0317` for a
+/// chain already named here, so one chain is one diagnostic across BOTH
+/// mechanisms.
+///
+/// Empty when every declared chain is within bounds.
+///
+/// A class declared with an empty name — what a bare `---@class` typo
+/// harvests as — is skipped outright, mirroring the `!c.name.is_empty()`
+/// guards `luabox_types::env`'s own harvest sites apply. Folding those into
+/// one synthetic `""` node made unrelated files collide: measured, a bare
+/// `---@class` in `a.lua` won the first-wins `parents_of[""]` entry with an
+/// empty parent list, which pinned `""`'s depth at 0 and made a genuinely
+/// over-limit chain ending in `---@class : C200` in `z.lua` VANISH from the
+/// report entirely (production readiness review, finding 4). The same
+/// collapse also mis-attributed one file's chain to another file's typo, and
+/// produced a diagnostic whose message named the class as `` ` ` ``.
 ///
 /// Each diagnostic carries the same code as the durable resolver-side guard
 /// (`LB0317`, [`Code::new`]`(317)` — round 6 review M4(b): this pre-check
@@ -536,12 +650,10 @@ fn collect_diagnostics(
 /// hard-coded [`Diagnostic::error`] call gave unconditionally regardless of
 /// the manifest (M4(b): "`[types] strict = false` does not downgrade it").
 /// `---@diagnostic disable[-line|-next-line]: class-ancestry-too-deep` in
-/// the declaring file suppresses one class's diagnostic the same way
-/// (M4(b)'s suppression half) — a pre-check-local mirror of
-/// `luabox_types::directive`'s file-wide/line-scoped semantics (that module
-/// is `luabox-types`-private and its rule vocabulary mirrors luals' own
-/// diagnostic names; `LB0317` is luabox-only with no luals equivalent, so it
-/// gets its own name here rather than being folded onto that list).
+/// the declaring file suppresses one chain's diagnostic the same way
+/// (M4(b)'s suppression half) — through [`luabox_types::DirectiveScan`]
+/// itself, the same scanner the checker-side `LB0317` is filtered by, rather
+/// than a look-alike of it (see [`suppressed`]).
 ///
 /// A parent expressed as anything other than a bare name (a union, a table
 /// literal, ...) does not extend a chain this walk follows — the heuristic
@@ -563,13 +675,13 @@ fn collect_diagnostics(
 /// Depth is computed iteratively — an explicit stack, not a recursive walk
 /// — precisely so this check cannot itself overflow on the input it exists
 /// to reject; see [`class_depths`].
-fn deep_class_chain_diagnostics(files: &[SourceFile], strictness: Strictness) -> Vec<Diagnostic> {
+fn deep_class_chain_diagnostics(files: &[SourceFile], strictness: Strictness) -> DeepChains {
     // `Strictness::None` disables every type diagnostic project-wide
     // (`luabox_types`'s own `strictness != Strictness::None` gate, `lib.rs`)
     // — `LB0317` is one of them, so this pre-check honors the same gate
     // rather than scanning for a result nothing would ever report.
     if strictness == Strictness::None {
-        return Vec::new();
+        return DeepChains::default();
     }
     let severity = if strictness == Strictness::Strict {
         Severity::Error
@@ -577,10 +689,175 @@ fn deep_class_chain_diagnostics(files: &[SourceFile], strictness: Strictness) ->
         Severity::Warning
     };
 
-    // name -> (declaring file index, span); name -> every named parent
-    // (a bare `Name`, not a union/table/generic-argument expression). First
-    // declaration of a name wins, matching this module's other project-wide
-    // merges (`with_project_types`'s "defs win").
+    let ClassGraph {
+        declared_at,
+        parents_of,
+    } = harvest_class_graph(files);
+    let depth = class_depths(&parents_of);
+    let over_limit = |name: &str| depth.get(name).is_some_and(|&d| d > MAX_ANCESTRY_DEPTH);
+    // Every over-limit class's declaration site, whether or not it is the
+    // link this reports: that is what `collect_diagnostics` matches the
+    // resolver-side drain's own `LB0317` against.
+    let covered: HashSet<(String, usize, usize)> = depth
+        .keys()
+        .filter(|name| over_limit(name))
+        .filter_map(|name| {
+            let &(file_idx, span) = declared_at.get(name)?;
+            Some((files[file_idx].rel.clone(), span.start, span.end))
+        })
+        .collect();
+
+    // The FIRST link over the limit in each chain: over-limit, but with no
+    // over-limit parent. One diagnostic per chain however long that chain
+    // runs, and still one per chain when a project declares several — round 6
+    // review M17's actual requirement, which the "every over-limit class"
+    // reading of it overshot.
+    let mut frontier: Vec<&str> = depth
+        .keys()
+        .map(String::as_str)
+        .filter(|name| {
+            over_limit(name)
+                && !parents_of
+                    .get(*name)
+                    .into_iter()
+                    .flatten()
+                    .any(|parent| over_limit(parent))
+        })
+        .collect();
+    if frontier.is_empty() {
+        return DeepChains {
+            diags: Vec::new(),
+            covered,
+        };
+    }
+    // Deterministic regardless of the `HashMap` iteration order above (M17):
+    // sort by declaring span, matching the whole-file sort
+    // `luabox_types::check::run` already applies to its own `LB0317`
+    // diagnostics.
+    frontier.sort_by_key(|name| declared_at.get(*name).map(|&(idx, span)| (idx, span.start)));
+
+    let deepest = deepest_descendants(&parents_of, &depth);
+    // One [`luabox_types::DirectiveScan`] + [`LineIndex`] per file that has a
+    // reported chain, not one per class: both are O(file size) to build, and
+    // the old shape rebuilt them for every over-limit class — 2,300 rebuilds
+    // of one 2,500-line file on the per-link-flood fixture below.
+    let mut directives: HashMap<usize, (luabox_types::DirectiveScan, LineIndex)> = HashMap::new();
+    let diags = frontier
+        .into_iter()
+        .filter_map(|name| {
+            let &(file_idx, span) = declared_at.get(name)?;
+            let file = &files[file_idx];
+            let (rules, lines) = directives.entry(file_idx).or_insert_with(|| {
+                let text = file.parse.syntax().text().to_string();
+                (
+                    luabox_types::DirectiveScan::scan(&text),
+                    LineIndex::new(&text),
+                )
+            });
+            if suppressed(rules, lines, span) {
+                return None;
+            }
+            let &link_depth = depth.get(name)?;
+            // The measured total this link commits the chain to, not just
+            // this link's own depth: a reader who flattens here needs to know
+            // how far below the limit the chain still runs.
+            let tail = match deepest.get(name) {
+                Some(&(deepest_depth, deepest_name)) if deepest_name != name => format!(
+                    "; it is the first link over the limit in a chain that runs \
+                     {deepest_depth} classes deep, down to `{deepest_name}`"
+                ),
+                _ => String::new(),
+            };
+            Some(
+                Diagnostic::new(
+                    LB0317_CLASS_ANCESTRY_TOO_DEEP,
+                    severity,
+                    format!(
+                        "`{name}`'s `---@class` ancestry is {link_depth} classes deep, over \
+                         the {MAX_ANCESTRY_DEPTH}-class limit this checker enforces to avoid a \
+                         stack overflow while resolving it{tail} — flatten the hierarchy or use \
+                         composition instead of a long inheritance chain"
+                    ),
+                )
+                .with_label(Label::primary(
+                    Span::new(file.rel.as_str(), span.start..span.end),
+                    "first class over the limit",
+                )),
+            )
+        })
+        .collect();
+    DeepChains { diags, covered }
+}
+
+/// What [`deep_class_chain_diagnostics`] hands back: the diagnostics it wants
+/// rendered, and the declaration sites of every over-limit class it saw —
+/// including the ones it deliberately did not report, since those are exactly
+/// the classes the resolver-side `LB0317` drain would name for a chain this
+/// pre-check has already covered.
+#[derive(Default)]
+struct DeepChains {
+    diags: Vec<Diagnostic>,
+    /// `(file, decl start, decl end)` per over-limit class.
+    covered: HashSet<(String, usize, usize)>,
+}
+
+impl DeepChains {
+    /// Whether `label` points at the declaration of a class this pre-check
+    /// already accounted for.
+    fn covers(&self, label: Option<&Label>) -> bool {
+        label.is_some_and(|l| {
+            self.covered
+                .contains(&(l.span.file.clone(), l.span.range.start, l.span.range.end))
+        })
+    }
+}
+
+/// For every class in `depth`, the deepest class reachable *below* it along
+/// declared `---@class` parent edges, as `(that class's depth, its name)` —
+/// the measured total [`deep_class_chain_diagnostics`] puts in the message of
+/// the one link it reports per chain.
+///
+/// Computed by relaxing `depth` in descending order rather than by a second
+/// graph walk: a class's depth is `1 +` its deepest parent's, so a child is
+/// always processed before the parent it feeds, and one pass over the sorted
+/// nodes suffices. The `(depth, name)` maximum makes the answer independent
+/// of `HashMap` order when two branches tie.
+fn deepest_descendants<'a>(
+    parents_of: &'a HashMap<String, Vec<String>>,
+    depth: &'a HashMap<String, usize>,
+) -> HashMap<&'a str, (usize, &'a str)> {
+    let mut by_depth: Vec<(&str, usize)> = depth.iter().map(|(n, &d)| (n.as_str(), d)).collect();
+    // Name breaks the tie so the walk order — and so the reported deepest
+    // class of a tied chain — cannot depend on hashmap iteration.
+    by_depth.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let mut deepest: HashMap<&str, (usize, &str)> =
+        by_depth.iter().map(|&(n, d)| (n, (d, n))).collect();
+    for (name, _) in by_depth {
+        let Some(&reach) = deepest.get(name) else {
+            continue;
+        };
+        for parent in parents_of.get(name).into_iter().flatten() {
+            if let Some(slot) = deepest.get_mut(parent.as_str())
+                && *slot < reach
+            {
+                *slot = reach;
+            }
+        }
+    }
+    deepest
+}
+
+/// Every `---@class` the project declares, as the two maps
+/// [`deep_class_chain_diagnostics`] walks: name -> (declaring file index,
+/// declaring span), and name -> every named parent (a bare `Name`, not a
+/// union/table/generic-argument expression). First declaration of a name
+/// wins, matching this module's other project-wide merges
+/// (`with_project_types`'s "defs win").
+///
+/// An empty name is not a declaration at all and is dropped on both sides —
+/// see [`deep_class_chain_diagnostics`]'s doc comment for what folding every
+/// bare `---@class` typo in a project into one synthetic node cost.
+fn harvest_class_graph(files: &[SourceFile]) -> ClassGraph {
     let mut declared_at: HashMap<String, (usize, luacats::Span)> = HashMap::new();
     let mut parents_of: HashMap<String, Vec<String>> = HashMap::new();
     for (file_idx, file) in files.iter().enumerate() {
@@ -589,6 +866,9 @@ fn deep_class_chain_diagnostics(files: &[SourceFile], strictness: Strictness) ->
                 let luacats::Tag::Class(class) = tag else {
                     continue;
                 };
+                if class.name.is_empty() {
+                    continue;
+                }
                 declared_at
                     .entry(class.name.clone())
                     .or_insert((file_idx, class.span));
@@ -597,7 +877,9 @@ fn deep_class_chain_diagnostics(files: &[SourceFile], strictness: Strictness) ->
                         .parents
                         .iter()
                         .filter_map(|parent| match &parent.kind {
-                            luacats::TypeExprKind::Named { name, .. } => Some(name.clone()),
+                            luacats::TypeExprKind::Named { name, .. } if !name.is_empty() => {
+                                Some(name.clone())
+                            }
                             _ => None,
                         })
                         .collect()
@@ -605,49 +887,19 @@ fn deep_class_chain_diagnostics(files: &[SourceFile], strictness: Strictness) ->
             }
         }
     }
-
-    let depth = class_depths(&parents_of);
-    let mut over_limit: Vec<(&str, usize)> = depth
-        .iter()
-        .filter(|&(_, &d)| d > MAX_ANCESTRY_DEPTH)
-        .map(|(name, &d)| (name.as_str(), d))
-        .collect();
-    if over_limit.is_empty() {
-        return Vec::new();
+    ClassGraph {
+        declared_at,
+        parents_of,
     }
-    // Deterministic regardless of the `HashMap` iteration order above (M17):
-    // sort by declaring span, matching the whole-file sort
-    // `luabox_types::check::run` already applies to its own `LB0317`
-    // diagnostics.
-    over_limit
-        .sort_by_key(|&(name, _)| declared_at.get(name).map(|&(idx, span)| (idx, span.start)));
+}
 
-    over_limit
-        .into_iter()
-        .filter_map(|(name, max_depth)| {
-            let &(file_idx, span) = declared_at.get(name)?;
-            let file = &files[file_idx];
-            if suppressed(file, span) {
-                return None;
-            }
-            Some(
-                Diagnostic::new(
-                    LB0317_CLASS_ANCESTRY_TOO_DEEP,
-                    severity,
-                    format!(
-                        "`{name}`'s `---@class` ancestry is {max_depth} classes deep, over \
-                         the {MAX_ANCESTRY_DEPTH}-class limit this checker enforces to avoid a \
-                         stack overflow while resolving it — flatten the hierarchy or use \
-                         composition instead of a long inheritance chain"
-                    ),
-                )
-                .with_label(Label::primary(
-                    Span::new(file.rel.as_str(), span.start..span.end),
-                    "deepest class in the chain",
-                )),
-            )
-        })
-        .collect()
+/// The project's declared `---@class` inheritance graph, as
+/// [`harvest_class_graph`] reads it off the harvested annotations.
+struct ClassGraph {
+    /// Class name -> the file index and span of its first declaration.
+    declared_at: HashMap<String, (usize, luacats::Span)>,
+    /// Class name -> the names of every parent it declares by bare name.
+    parents_of: HashMap<String, Vec<String>>,
 }
 
 /// The ancestor-chain depth of every class named as a key or a value in
@@ -709,71 +961,30 @@ fn class_depths(parents_of: &HashMap<String, Vec<String>>) -> HashMap<String, us
 /// declared at `span` in `file` (round 6 review M4(b) — the old hard-coded
 /// `Diagnostic::error` bypassed every suppression mechanism).
 ///
-/// This pre-check runs before `luabox_types`' own per-file directive scan
-/// gets a chance to, so it needs its own file-wide-or-line-scoped reader of
-/// the same comment syntax. What it does **not** get is its own *name*: the
-/// rule string comes from `luabox_types::RULE_CLASS_ANCESTRY_TOO_DEEP`, the
-/// single owner, which also has the entry that makes the checker-side
-/// `LB0317` suppressible.
+/// Both the rule *name* and the *scanner* come from `luabox-types`, the one
+/// owner: `RULE_CLASS_ANCESTRY_TOO_DEEP` is the string the checker-side
+/// `LB0317` filter also keys on, and [`luabox_types::DirectiveScan`] is the
+/// scanner that filter also runs.
 ///
-/// Both halves are needed and neither is sufficient. Measured before the
-/// name was registered in that owner: a file-wide `---@diagnostic disable:
-/// class-ancestry-too-deep` silenced this pre-check's 18 diagnostics on a
-/// 220-link chain and left the checker-side drain's own `LB0317` standing —
-/// one rule, two mechanisms, disagreeing, with the CHANGELOG documenting the
-/// behaviour of only one of them.
-///
-/// The comment *parsing* (action keyword + comma-separated rule names) is
-/// shared with `luabox_types::DirectiveScan::scan` via
-/// [`luabox_types::parse_directive_body`] rather than hand-rolled a second
-/// time (production readiness review G5) — this scanner still needs its own
-/// *walk* (over already-harvested `Tag::Diagnostic` bodies, since no
-/// `TypeEnv` exists yet at this point in the pipeline for `DirectiveScan` to
-/// run against), just not its own copy of the split-and-trim.
-fn suppressed(file: &SourceFile, span: luacats::Span) -> bool {
-    const RULE: &str = luabox_types::RULE_CLASS_ANCESTRY_TOO_DEEP;
-    let mut file_wide = false;
-    // Byte offsets of the `disable-line`/`disable-next-line` comments; only
-    // converted to line numbers below, and only if there is at least one —
-    // rebuilding a `LineIndex` (an O(file size) pass) for the overwhelming
-    // majority of files, which have no such comment at all, would be pure
-    // waste on the hot common case.
-    let mut line_comment_offsets: Vec<usize> = Vec::new();
-    for item in file.artifacts.items() {
-        for tag in &item.block.tags {
-            let luacats::Tag::Diagnostic(tag) = tag else {
-                continue;
-            };
-            let Some(text) = tag.text.as_deref() else {
-                continue;
-            };
-            let Some((action, mut names)) = luabox_types::parse_directive_body(text) else {
-                continue;
-            };
-            if !names.any(|n| n == RULE) {
-                continue;
-            }
-            match action {
-                "disable" => file_wide = true,
-                "disable-line" | "disable-next-line" => line_comment_offsets.push(tag.span.start),
-                _ => {}
-            }
-        }
-    }
-    if file_wide {
-        return true;
-    }
-    if line_comment_offsets.is_empty() {
-        return false;
-    }
-    let index = LineIndex::new(&file.parse.syntax().text().to_string());
-    let target_line = index.line_of(span.start);
-    line_comment_offsets
-        .into_iter()
-        .map(|offset| index.line_of(offset))
-        // A comment on line L covers L (trailing form) and L+1 (comment
-        // above), matching `luabox_types::directive`'s semantics.
-        .any(|line| line == target_line || line + 1 == target_line)
+/// This used to be a hand-rolled walk over already-harvested
+/// `Tag::Diagnostic` bodies, on the premise that "no `TypeEnv` exists yet at
+/// this point in the pipeline for `DirectiveScan` to run against". That
+/// premise was false — [`luabox_types::DirectiveScan::scan`] takes a `&str`
+/// and nothing else — and the copy recognised a narrower comment grammar than
+/// the original: measured, `--[[@diagnostic disable: class-ancestry-too-deep]]`
+/// and a plain `--@diagnostic disable: class-ancestry-too-deep` each silenced
+/// the checker-side `LB0317` and left this one standing, because the harvester
+/// only yields a `Tag::Diagnostic` for the `---@` form (production readiness
+/// review, finding 3). One rule, one scanner, one answer.
+fn suppressed(
+    rules: &luabox_types::DirectiveScan,
+    lines: &LineIndex,
+    declared: luacats::Span,
+) -> bool {
+    rules.suppresses(
+        luabox_types::RULE_CLASS_ANCESTRY_TOO_DEEP,
+        lines.line_of(declared.start),
+    )
 }
 
 /// One project file, read and parsed once: everything both halves of the
@@ -1453,15 +1664,37 @@ mod tests {
         // for the warn-mode side).
         let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
         write(tmp.path(), "src/main.lua", &class_chain_source(2_500));
-        // One error per over-limit class (C201..=C2500, round 6 review
-        // M17 — every over-limit chain is reported, not just one), and
-        // nothing from the (otherwise well-formed) chain itself.
+        // ONE error: the first link over the limit. Round 6 review M17's fix
+        // reported every over-limit class instead, which on a single chain
+        // meant `2_500 - MAX_ANCESTRY_DEPTH` = 2,300 separate errors and
+        // 835 KB of output for one mistake (#61 local merge-gate, the
+        // per-link-flood finding). N independent chains still produce N diagnostics —
+        // `three_over_limit_chains_are_all_reported_in_deterministic_source_order`
+        // is the test that keeps this from regressing back to M17's
+        // one-per-project `max_by_key`.
         let error = check(tmp.path(), None, Format::Human)
             .unwrap_err()
             .to_string();
-        assert_eq!(
-            error,
-            format!("check failed with {} error(s)", 2_500 - MAX_ANCESTRY_DEPTH)
+        assert_eq!(error, "check failed with 1 error(s)");
+    }
+
+    #[test]
+    fn one_long_chain_reports_its_first_over_limit_link_and_its_measured_total_depth() {
+        // Finding 2's other half: the single diagnostic must still carry the
+        // measurement the 2,300 individually restated — where the chain
+        // crosses the limit AND how far past it the chain actually runs, so
+        // "flatten this" has a scope.
+        let files = [source_file("main.lua", &class_chain_source(2_500))];
+        let diags = deep_class_chain_diagnostics(&files, Strictness::Strict).diags;
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        let message = &diags[0].message;
+        assert!(
+            message.contains(&format!("`C{}`", MAX_ANCESTRY_DEPTH + 1)),
+            "must name the first link over the limit: {message}"
+        );
+        assert!(
+            message.contains("runs 2500 classes deep, down to `C2500`"),
+            "must carry the chain's measured total depth: {message}"
         );
     }
 
@@ -1497,7 +1730,7 @@ mod tests {
 
     #[test]
     fn the_pre_check_ceiling_and_the_resolver_cap_are_the_same_number() {
-        // Production readiness review finding 1: before this pre-check
+        // An earlier #61 local merge-gate round: before this pre-check
         // imported `luabox_types::MAX_ANCESTRY_DEPTH` instead of keeping its
         // own, looser, separately-reasoned figure (2,000), a 400-class
         // single-inheritance chain — well inside what this pre-check's
@@ -1506,12 +1739,17 @@ mod tests {
         // resolver's own cap sat at 200 all along), producing a false
         // `LB0306` `undefined field` for a field the pre-check's own message
         // a moment earlier had certified as within bounds. Now the two
-        // share one constant, so every class from C201 through C400 is
-        // caught HERE, early and cheaply, before resolution ever gets a
-        // chance to truncate anything: 200 depth diagnostics (round 6
-        // review M17 — every over-limit class, not just one), never the
-        // pre-check's silence followed by a wrong `LB0306` from the
-        // checker.
+        // share one constant, so the chain is caught HERE, early and cheaply,
+        // before resolution ever gets a chance to truncate anything: one
+        // depth diagnostic at `C201`, never the pre-check's silence followed
+        // by a wrong `LB0306` from the checker.
+        //
+        // Exactly one, not two: `---@type C400` makes the resolver walk the
+        // chain too, so its own `LB0317` drain fires as well — measured, on
+        // `C400`, in different words than the pre-check's `C201`. Two
+        // diagnostics for one chain from two mechanisms is what
+        // `collect_diagnostics`'s coverage filter exists to collapse
+        // (production readiness review, finding 1(c)).
         let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
         let mut src = class_chain_source(400);
         src.push_str("\n---@type C400\nlocal x = {}\nlocal y = x.item\n");
@@ -1519,7 +1757,23 @@ mod tests {
         let error = check(tmp.path(), None, Format::Human)
             .unwrap_err()
             .to_string();
-        assert_eq!(error, "check failed with 200 error(s)");
+        assert_eq!(error, "check failed with 1 error(s)");
+        let diags = check_diagnostics(tmp.path());
+        let depth: Vec<&Diagnostic> = diags
+            .iter()
+            .filter(|d| d.code == LB0317_CLASS_ANCESTRY_TOO_DEEP)
+            .collect();
+        assert_eq!(depth.len(), 1, "one chain, one LB0317: {depth:?}");
+        assert!(
+            depth[0]
+                .message
+                .contains(&format!("`C{}`", MAX_ANCESTRY_DEPTH + 1)),
+            "the surviving one is the pre-check's actionable first link: {depth:?}"
+        );
+        assert!(
+            !diags.iter().any(|d| d.code == Code::new(306)),
+            "no truncated-shape LB0306 for a field the chain really declares: {diags:?}"
+        );
     }
 
     /// A source file with `n` `---@class`-named chains, one per `prefix` in
@@ -1547,19 +1801,23 @@ mod tests {
     }
 
     /// A `k`-level generic diamond, mirroring `luabox-types`' own
-    /// `conflicting_diamond_source` test fixture: `A0<T>` then, for `i` in
-    /// `1..=k`, `Ai<T> : A(i-1)<T>, A(i-1)<number>` — a shape whose
-    /// re-resolution *cost*, not depth, is what trips `LB0319`
+    /// `conflicting_diamond_source` test fixture: `A0<T>`, `A1<T> : A0<T>`,
+    /// then for `i` in `2..=k`, `Ai<T> : A(i-1)<T>, A(i-2)<number>` — the
+    /// disagreeing edge points at the *grandparent* so the two parents keep
+    /// distinct names (a same-name pair now dedupes to one edge and stops
+    /// being a diamond at all). The shape's re-resolution *cost*, not its
+    /// depth, is what trips `LB0319`
     /// (`luabox_types::env::MAX_ANCESTRY_RESOLUTIONS`'s own doc comment
     /// carries the measurement behind the exact `k` this needs).
     fn conflicting_diamond_source(k: usize) -> String {
-        let mut src = String::from("---@class A0<T>\n---@field item T\n");
-        for i in 1..=k {
+        let mut src = String::from("---@class A0<T>\n---@field item T\n---@class A1<T> : A0<T>\n");
+        for i in 2..=k {
             use std::fmt::Write as _;
             let _ = writeln!(
                 src,
-                "---@class A{i}<T> : A{prev}<T>, A{prev}<number>",
-                prev = i - 1
+                "---@class A{i}<T> : A{parent}<T>, A{grandparent}<number>",
+                parent = i - 1,
+                grandparent = i - 2
             );
         }
         src
@@ -1590,7 +1848,7 @@ mod tests {
         // this round introduced for exactly this condition, was unreachable
         // from this path.
         let files = [source_file("main.lua", &class_chain_source(2_500))];
-        let diags = deep_class_chain_diagnostics(&files, Strictness::Strict);
+        let diags = deep_class_chain_diagnostics(&files, Strictness::Strict).diags;
         assert!(!diags.is_empty());
         for diag in &diags {
             assert_eq!(diag.code, LB0317_CLASS_ANCESTRY_TOO_DEEP, "{diag:?}");
@@ -1608,7 +1866,7 @@ mod tests {
         let mut src = String::from("---@diagnostic disable: class-ancestry-too-deep\n");
         src.push_str(&class_chain_source(2_500));
         let files = [source_file("main.lua", &src)];
-        let diags = deep_class_chain_diagnostics(&files, Strictness::Strict);
+        let diags = deep_class_chain_diagnostics(&files, Strictness::Strict).diags;
         assert!(diags.is_empty(), "{diags:?}");
     }
 
@@ -1620,8 +1878,82 @@ mod tests {
         let mut src = String::from("---@diagnostic disable: undefined-field\n");
         src.push_str(&class_chain_source(2_500));
         let files = [source_file("main.lua", &src)];
-        let diags = deep_class_chain_diagnostics(&files, Strictness::Strict);
+        let diags = deep_class_chain_diagnostics(&files, Strictness::Strict).diags;
         assert!(!diags.is_empty());
+    }
+
+    /// [`class_chain_source`] with `comment` inserted on its own line
+    /// directly above `---@class C{target}` — so a `disable-next-line`
+    /// written there covers exactly that declaration and nothing else.
+    fn class_chain_source_with_comment_above(n: usize, target: usize, comment: &str) -> String {
+        let chain = class_chain_source(n);
+        let needle = format!("---@class C{target} : C{}\n", target - 1);
+        assert!(chain.contains(&needle), "the chain must declare C{target}");
+        chain.replacen(&needle, &format!("{comment}\n{needle}"), 1)
+    }
+
+    #[test]
+    fn a_block_comment_diagnostic_disable_suppresses_the_depth_diagnostic() {
+        // Production readiness review, finding 3. This pre-check used to walk
+        // already-harvested `Tag::Diagnostic` bodies, which the LuaCATS
+        // harvester only produces for the `---@` form — so
+        // `--[[@diagnostic disable: class-ancestry-too-deep]]` silenced the
+        // CHECKER-side `LB0317` (`luabox_types::DirectiveScan` splits raw text
+        // on `@diagnostic`, block comment or not) and left this one standing.
+        // One rule, two mechanisms, two grammars, two answers.
+        let mut src = String::from("--[[@diagnostic disable: class-ancestry-too-deep]]\n");
+        src.push_str(&class_chain_source(2_500));
+        let files = [source_file("main.lua", &src)];
+        let diags = deep_class_chain_diagnostics(&files, Strictness::Strict).diags;
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn a_plain_double_dash_diagnostic_disable_suppresses_the_depth_diagnostic() {
+        // Finding 3's other reported grammar: a plain `--@diagnostic` line,
+        // with no doc-comment `---` prefix. Same story as the block-comment
+        // form above — accepted by `DirectiveScan`, invisible to the harvested
+        // -tag walk this used to do.
+        let mut src = String::from("--@diagnostic disable: class-ancestry-too-deep\n");
+        src.push_str(&class_chain_source(2_500));
+        let files = [source_file("main.lua", &src)];
+        let diags = deep_class_chain_diagnostics(&files, Strictness::Strict).diags;
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn a_line_scoped_disable_directly_above_the_reported_class_suppresses_it() {
+        // The line-scoped path had ZERO tests either side (finding 3): every
+        // existing suppression test used the file-wide `disable`, which needs
+        // no line arithmetic at all, so nothing pinned that this pre-check
+        // resolves the offset of the class it reports to the right line —
+        // and nothing would have caught it resolving offsets against a
+        // different file's `LineIndex`.
+        let src = class_chain_source_with_comment_above(
+            2_500,
+            MAX_ANCESTRY_DEPTH + 1,
+            "---@diagnostic disable-next-line: class-ancestry-too-deep",
+        );
+        let files = [source_file("main.lua", &src)];
+        let diags = deep_class_chain_diagnostics(&files, Strictness::Strict).diags;
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn a_line_scoped_disable_on_the_wrong_line_does_not_suppress_it() {
+        // The negative half, and the one that actually fails if the line
+        // arithmetic is replaced by "any line-scoped disable anywhere in the
+        // file counts" — which is what the old hand-rolled scanner degraded
+        // to whenever its offset->line conversion went wrong. `C0` is nowhere
+        // near the class this reports (`C201`).
+        let src = class_chain_source_with_comment_above(
+            2_500,
+            1,
+            "---@diagnostic disable-next-line: class-ancestry-too-deep",
+        );
+        let files = [source_file("main.lua", &src)];
+        let diags = deep_class_chain_diagnostics(&files, Strictness::Strict).diags;
+        assert_eq!(diags.len(), 1, "{diags:?}");
     }
 
     #[test]
@@ -1631,7 +1963,7 @@ mod tests {
         // too rather than reporting a diagnostic the rest of the pipeline
         // would never have produced.
         let files = [source_file("main.lua", &class_chain_source(2_500))];
-        let diags = deep_class_chain_diagnostics(&files, Strictness::None);
+        let diags = deep_class_chain_diagnostics(&files, Strictness::None).diags;
         assert!(diags.is_empty(), "{diags:?}");
     }
 
@@ -1646,8 +1978,8 @@ mod tests {
         let n = MAX_ANCESTRY_DEPTH + 50;
         let single = [source_file("single.lua", &class_chain_source(n))];
         let multi = [source_file("multi.lua", &multi_parent_chain_source(n))];
-        let single_diags = deep_class_chain_diagnostics(&single, Strictness::Strict);
-        let multi_diags = deep_class_chain_diagnostics(&multi, Strictness::Strict);
+        let single_diags = deep_class_chain_diagnostics(&single, Strictness::Strict).diags;
+        let multi_diags = deep_class_chain_diagnostics(&multi, Strictness::Strict).diags;
         assert_eq!(single_diags.len(), multi_diags.len());
         assert!(!single_diags.is_empty());
         let deepest = format!("C{n}");
@@ -1670,7 +2002,7 @@ mod tests {
         src.push_str(&named_chain_source("B", n));
         src.push_str(&named_chain_source("C", n));
         let files = [source_file("main.lua", &src)];
-        let diags = deep_class_chain_diagnostics(&files, Strictness::Strict);
+        let diags = deep_class_chain_diagnostics(&files, Strictness::Strict).diags;
         let names: Vec<String> = diags
             .iter()
             .map(|d| {
@@ -1685,6 +2017,222 @@ mod tests {
             names,
             vec![format!("A{n}"), format!("B{n}"), format!("C{n}")]
         );
+    }
+
+    #[test]
+    fn a_depth_diagnostic_does_not_disable_the_rest_of_the_check() {
+        // Production readiness review, finding 1. The pre-check used to
+        // `return` its diagnostics the moment it found any, which skipped
+        // EVERY remaining pass in the command: parse errors, dialect
+        // legality, control flow, the type pass and the `[types] defs`
+        // resolution report all silently stopped existing for the rest of
+        // that run. Measured on this shape before the fix — a 201-link chain
+        // in one file, plain syntax errors in another, default (warn)
+        // strictness — `luabox check` printed the one depth warning, no
+        // `LB0001` at all, and exited 0.
+        let tmp = project(&manifest("5.4", ""));
+        write(tmp.path(), "src/deep.lua", &class_chain_source(201));
+        write(
+            tmp.path(),
+            "src/broken.lua",
+            "local x = = 1\nfunction f( end\n",
+        );
+        let diags = check_diagnostics(tmp.path());
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == LB0317_CLASS_ANCESTRY_TOO_DEEP),
+            "the depth warning is still reported: {diags:?}"
+        );
+        assert!(
+            diags.iter().any(|d| d.code == Code::new(1)),
+            "and so are the syntax errors it used to hide: {diags:?}"
+        );
+        let error = check(tmp.path(), None, Format::Human)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("check failed with"), "{error}");
+    }
+
+    #[test]
+    fn an_error_manifest_diagnostic_is_not_discarded_by_a_warning_depth_diagnostic() {
+        // Finding 1's severity-inversion half, the sharpest form of it: the
+        // discarded finding was `LB1002` — an `Error` — and what discarded it
+        // was a `Warning`. The same project with the deep chain removed
+        // reported `LB1002` and failed; with the chain present it reported
+        // the depth warning alone and exited 0, so a project could not
+        // resolve its own `[types] defs` and `check` said nothing about it.
+        let tmp = project(&manifest("5.4", "\n[types]\ndefs = [\"ghost\"]\n"));
+        write(tmp.path(), "src/deep.lua", &class_chain_source(201));
+        let diags = check_diagnostics(tmp.path());
+        assert!(
+            diags.iter().any(|d| d.code == Code::new(1002)),
+            "the unresolved-defs error survives the depth warning: {diags:?}"
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == LB0317_CLASS_ANCESTRY_TOO_DEEP),
+            "and the depth warning is still there too: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn suppressing_the_depth_diagnostic_changes_nothing_else_about_the_report() {
+        // Finding 1's inverted-causality half. With the early return in
+        // place, adding a `---@diagnostic disable: class-ancestry-too-deep`
+        // comment made `luabox check` go from exit 0 with one warning to
+        // exit 1 with four errors: silencing a diagnostic *revealed* four
+        // others, because it was the pre-check returning non-empty — not the
+        // diagnostic's severity — that had been ending the run. A suppression
+        // comment may only remove the thing it names.
+        let codes_of = |suppression: &str| -> Vec<u16> {
+            let tmp = project(&manifest("5.4", ""));
+            let mut deep = String::from(suppression);
+            deep.push_str(&class_chain_source(201));
+            write(tmp.path(), "src/deep.lua", &deep);
+            write(
+                tmp.path(),
+                "src/broken.lua",
+                "local x = = 1\nfunction f( end\n",
+            );
+            let mut codes: Vec<u16> = check_diagnostics(tmp.path())
+                .iter()
+                .filter(|d| d.code != LB0317_CLASS_ANCESTRY_TOO_DEEP)
+                .map(|d| d.code.number())
+                .collect();
+            codes.sort_unstable();
+            codes
+        };
+        assert_eq!(
+            codes_of(""),
+            codes_of("---@diagnostic disable: class-ancestry-too-deep\n")
+        );
+        assert!(
+            !codes_of("").is_empty(),
+            "the fixture must report something"
+        );
+    }
+
+    #[test]
+    fn a_bare_class_typo_in_one_file_cannot_change_the_verdict_on_another() {
+        // Production readiness review, finding 4. A bare `---@class` harvests
+        // as a class whose name is the empty string, and the pre-check used
+        // to enter it into `declared_at`/`parents_of` under the key `""` like
+        // any other name. First-wins then made every empty-named declaration
+        // in the project ONE node, shared across files that have nothing to
+        // do with each other: measured, `z.lua` alone reported its chain,
+        // and adding an unrelated `---@class` typo in `a.lua` — which won the
+        // `parents_of[""]` entry with an empty parent list, pinning `""`'s
+        // depth at 0 — made that same chain VANISH from the report. The
+        // guard failed open, in the one direction a limit check must never
+        // fail, and a second symptom of the same collapse attributed one
+        // file's chain to the other file's typo.
+        //
+        // The claim under test is the invariant, not either verdict: adding
+        // a file that declares nothing nameable may not change what is
+        // reported about a file it never mentions. Asserted for both the
+        // shape whose deepest link is itself unnamed and one whose chain is
+        // named end to end, since the collapse could only ever be observed
+        // through the former.
+        let verdict = |chain: &str, typo: bool| -> Vec<String> {
+            let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
+            write(tmp.path(), "src/z.lua", chain);
+            if typo {
+                write(
+                    tmp.path(),
+                    "src/a.lua",
+                    "---@class\nlocal q = 1\nreturn q\n",
+                );
+            }
+            let mut reported: Vec<String> = check_diagnostics(tmp.path())
+                .iter()
+                .filter(|d| d.code == LB0317_CLASS_ANCESTRY_TOO_DEEP)
+                .map(|d| {
+                    let label = d
+                        .primary_label()
+                        .expect("an ancestry-guard diagnostic always carries a primary label");
+                    format!("{}: {}", label.span.file, d.message)
+                })
+                .collect();
+            reported.sort();
+            reported
+        };
+        let unnamed_tail = format!("{}---@class : C200\n", class_chain_source(200));
+        assert_eq!(verdict(&unnamed_tail, false), verdict(&unnamed_tail, true));
+        let named = class_chain_source(201);
+        assert_eq!(verdict(&named, false), verdict(&named, true));
+        assert_eq!(
+            verdict(&named, true).len(),
+            1,
+            "the named chain is over the limit and must be reported either way"
+        );
+    }
+
+    #[test]
+    fn an_empty_named_class_never_produces_a_diagnostic_that_names_no_class() {
+        // Finding 4's other symptom: with `""` treated as a class name, a
+        // chain ending in `---@class : C200` produced a diagnostic whose
+        // message read "``'s `---@class` ancestry is 201 classes deep" —
+        // pointing the reader at a class that does not exist and cannot be
+        // renamed, flattened or suppressed by name. An unnamed `---@class` is
+        // a syntax problem for the harvester to report, not an ancestry one.
+        let files = [source_file(
+            "z.lua",
+            &format!("{}---@class : C200\n", class_chain_source(200)),
+        )];
+        let diags = deep_class_chain_diagnostics(&files, Strictness::Strict).diags;
+        assert!(
+            !diags.iter().any(|d| d.message.contains("``")),
+            "no diagnostic may name the empty class: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn two_diagnostics_sharing_one_span_always_render_in_the_same_order() {
+        use std::fmt::Write as _;
+        // Production readiness review, finding 5. `report_ancestry_hits`'s
+        // ambient tier attributes every class with no in-project declaration
+        // to `Span::new(file, 0..0)`, so two over-limit `[types] defs` chains
+        // consumed by one file produce two diagnostics at the IDENTICAL span,
+        // drained from a hash-ordered ledger. Sorting on `range.start` alone
+        // left their relative order to hashmap iteration: 12 consecutive runs
+        // of the same binary over the same sources printed one order 10 times
+        // and the other twice. `sort_for_render`'s code/message tie-breakers
+        // are what make this assertion meaningful rather than lucky.
+        let tmp = project(&manifest("5.4", "\n[types]\ndefs = [\"deep\"]\n"));
+        let n = MAX_ANCESTRY_DEPTH + 50;
+        let mut defs_src = String::from("---@meta\n");
+        for prefix in ["A", "B"] {
+            let _ = writeln!(defs_src, "---@class {prefix}0\n---@field f{prefix} string");
+            for i in 1..=n {
+                let _ = writeln!(defs_src, "---@class {prefix}{i} : {prefix}{}", i - 1);
+            }
+        }
+        write(tmp.path(), "defs/deep.d.lua", &defs_src);
+        write(
+            tmp.path(),
+            "src/main.lua",
+            &format!("---@type A{n}\nlocal a\n---@type B{n}\nlocal b\nprint(a.fA, b.fB)\n"),
+        );
+        let named: Vec<String> = check_diagnostics(tmp.path())
+            .iter()
+            .filter(|d| d.code == LB0317_CLASS_ANCESTRY_TOO_DEEP)
+            .map(|d| d.message.clone())
+            .collect();
+        assert_eq!(named.len(), 2, "{named:?}");
+        assert!(named[0].contains(&format!("A{n}")), "{named:?}");
+        assert!(named[1].contains(&format!("B{n}")), "{named:?}");
+        // Same sources, same binary, again: the claim is *stability*, so one
+        // observation of the right order proves nothing on its own.
+        for _ in 0..8 {
+            let again: Vec<String> = check_diagnostics(tmp.path())
+                .iter()
+                .filter(|d| d.code == LB0317_CLASS_ANCESTRY_TOO_DEEP)
+                .map(|d| d.message.clone())
+                .collect();
+            assert_eq!(again, named, "the order must not vary between runs");
+        }
     }
 
     #[test]

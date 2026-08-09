@@ -243,8 +243,19 @@ and that rule is now written into the policy rather than left to judgement.
     separately, the type pass's own depth-limit drain. Registering the rule
     name in only one of them silenced only that one, so a file-wide `disable`
     left the other's diagnostic standing (measured on a 220-link chain: 18
-    suppressed, 1 surviving). The name now lives in a single owner,
-    `luabox_types::RULE_CLASS_ANCESTRY_TOO_DEEP`, which both read.
+    suppressed, 1 surviving).
+
+    Sharing the rule *name* turned out not to be enough, and an earlier
+    edition of this entry claimed it was. The two emitters also had two
+    *scanners*: the pre-check hand-rolled a walk over harvested
+    `---@diagnostic` tags, which recognises a narrower comment grammar than
+    the checker's own `DirectiveScan` — measured, `--[[@diagnostic disable:
+    class-ancestry-too-deep]]` and a plain `--@diagnostic disable: …` each
+    silenced the checker-side `LB0317` and left the pre-check's standing.
+    Both halves are unified as of this round: one scanner
+    (`luabox_types::DirectiveScan`), one grammar, one rule name
+    (`luabox_types::RULE_CLASS_ANCESTRY_TOO_DEEP`), both emitters — every
+    spelling of the directive that silences either now silences both.
   - **A second, unrelated parent silently flipped the verdict.** The
     pre-check only followed a class's single named parent, so
     `---@class C : A, B` at a depth that would be refused as `---@class C :
@@ -276,6 +287,86 @@ and that rule is now written into the policy rather than left to judgement.
   checking against it is silently incomplete.
 
 ### Fixed
+
+The entries below correct work introduced **inside this same Unreleased
+block** — the `---@class` ancestry limits, the indexer half of
+`duplicate-doc-field`, and the duplicate-declaration merge rules. None of them
+is a regression against `0.2.0` or `develop`; each is a defect in an
+unreleased change, found by the production readiness review and fixed before
+the block ships.
+
+- **A file's own `---@enum` again shadows a same-named `[types] defs` enum,
+  as `---@class` always has and as this block's own duplicate-merge entry
+  documents** (production readiness review). Routing `---@enum`
+  through the same first-wins `member_wins` rule as duplicate `---@class`
+  declarations (round 6 review M53) made the check ask the wrong question:
+  `build_from_items` seeds `env.enums` from the ambient layer *before* any of
+  the file's own blocks are absorbed, so "is this name already present?" was
+  true for every ambient enum, and the file's declaration lost to the
+  definition package's. Measured at `d20cd47`: `enum_members("Color")`
+  returned the defs package's members for a file that declared `---@enum
+  Color` itself. `absorb_block` now distinguishes "seeded from the ambient"
+  (shadow it whole) from "this file already declared it" (first-wins, M53's
+  actual rule), the same split `local_classes` already gave `---@class`. A
+  same-file duplicate `---@enum` is still first-wins.
+
+- **`luabox check` no longer stops after the `---@class` depth pre-check**
+  (production readiness review). The pre-check used to `return` the
+  moment it found an over-limit chain, silently disabling every later pass in
+  the command: a 201-link chain in one file hid the syntax errors in another,
+  an `Error`-severity `LB1002` was discarded because a `Warning`-severity
+  depth finding got there first, and adding a `---@diagnostic disable` comment
+  therefore made `check` report **more** findings, not fewer. The crash
+  protection that early return was reasoned from was never this pre-check's to
+  give — `MAX_ANCESTRY_DEPTH`'s `DiamondGuard` cap refuses to recurse past 200
+  links inside the resolution walk itself, for every caller. Re-measured with
+  the full pipeline running over the chain: 2,500 links and 50,000 links (the
+  latter with a `---@type` + field read, so the resolver actually walks it)
+  both complete and report.
+
+- **One `LB0317` per over-limit chain, not one per over-limit class.** Round 6
+  review M17 fixed a `max_by_key` that let hashmap order pick one arbitrary
+  chain and dropped every other, but reporting every over-limit *class*
+  traded that for the opposite failure: one 2,500-link chain produced 2,300
+  separate errors and 835 KB of output, all restating a single mistake. The
+  pre-check now reports the **frontier** — the first link over the limit,
+  whose own parent is still within bounds, the one place a reader can act —
+  once per chain however long the chain runs, with the chain's deepest class
+  and measured depth in the message. N independent chains still produce N
+  diagnostics. The resolver-side drain's rediscovery of a chain the pre-check
+  already named is dropped, so one chain is one diagnostic across both
+  mechanisms.
+
+- **`LB0317`/`LB0318`/`LB0319` now report in a fixed order.** The three
+  ancestry ledgers are hash sets, and a class with no in-project declaration
+  is attributed to the consuming file at offset `0..0`, so every ambient-tier
+  hit in one file carries an identical span and the span sort could not break
+  the tie. Measured on a project with two over-limit `[types] defs` chains: 12
+  consecutive runs of the same binary over unchanged sources printed the two
+  `LB0317`s in one order 10 times and the other order twice — indistinguishable
+  from a real change to a diff-based CI gate. Fixed at both ends: the drains
+  sort by class name before emitting, and `luabox check`'s render order now
+  falls through to code and message for findings that genuinely share a span.
+
+- **`LB0319`'s message names the budget it enforces.** It said only that the
+  ancestry was "too costly", where its `LB0317` sibling has always
+  interpolated `MAX_ANCESTRY_DEPTH` — leaving a user no figure to measure
+  their hierarchy against. It now names `MAX_ANCESTRY_RESOLUTIONS`.
+
+- **`duplicate-doc-field` (`LB0311`) no longer fires on distinct
+  `---@field [K] V` indexer keys.** Extending the check to indexers (round 6
+  review M11) keyed them on the lowered key type resolved through a
+  *file-local* context, so every key naming a type the file does not itself
+  declare collapsed to one `unknown` type: two indexers keyed on two different
+  `[types] defs` classes, or on two different project-file classes, were
+  reported as a duplicate `[unknown]` on a class with no duplicate at all, and
+  so were a generic class's own two type parameters (`---@class Keyed<T, U>`
+  with `[T]` and `[U]`), which were never put in scope for the key at all. Key
+  identity is now the lowered type **paired with the names that lowering could
+  not resolve**: two keys collide when both resolve to the same type, or both
+  fail on the same names. `[T]` and `[U]` are distinct, `[T]` twice is still a
+  duplicate, and an unresolvable key now reads back as the name the user wrote
+  rather than as `[unknown]`.
 
 - **The `---@diagnostic disable` escape hatch for `LB0317`/`LB0318` did not
   work cross-file, even though the CHANGELOG entries above and the

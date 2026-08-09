@@ -38,14 +38,26 @@ every `doc.class` set carrying the name). A class carried more than once
 carriers.
 
 A same-name **field** declared twice is where luabox and luals part company.
-luabox keeps the **first** declaration, wherever it was written — inside one
-`---@class` block, in a second block for the same class, or in another file —
-and warns at the loser as `duplicate-doc-field` (`LB0311`), the same
-deterministic first-wins trade it makes for duplicate aliases (`LB0310`) and
-enums. luals instead *unions* the two declared types into `string|number`.
-Choosing the union would make a mistyped duplicate silently widen the field
-rather than be reported, so the warning plus a stable winner reads as the more
-useful answer.
+Within one file luabox keeps the **first** declaration — inside one
+`---@class` block or a second block for the same class — and warns at the
+loser as `duplicate-doc-field` (`LB0311`), the same deterministic first-wins
+trade it makes for duplicate aliases (`LB0310`) and enums. luals instead
+*unions* the two declared types into `string|number`. Choosing the union
+would make a mistyped duplicate silently widen the field rather than be
+reported, so the warning plus a stable winner reads as the more useful
+answer.
+
+**Across files the story is worse, and is tracked as
+[#73](https://github.com/flying-dice/luabox/issues/73): the winner is not
+project-wide and nothing warns.** Measured (this release and the merge base,
+byte-identical): the declaration in the *referencing* file wins, a file
+declaring neither gets the alphabetically-first declaring file's binding, and
+no `LB0311` fires — a project can hold `x: string` in one file and
+`x: number` in another, read both, and check clean. The same rule reaches
+generic parent instantiations (`C : Box<number>` here, `C : Box<string>`
+there) through this release's new parent-argument substitution. One rule,
+two mechanisms, only one of which diagnoses — until #73 lands, keep a class's
+declarations in one file if its members must mean one thing.
 
 **That reasoning was reached without consulting luals' implementation, and is
 being revisited** ([#67](https://github.com/flying-dice/luabox/issues/67)).
@@ -115,7 +127,68 @@ whole. That is the escape hatch — your declaration corrects the packaged one
 rather than merging with it — and it is a different axis from duplicate
 declarations in code you wrote.
 
-### Malformed `---@class` headers give no diagnostic at the declaration (round 6 review M66 — tracking issue not yet filed)
+### `---@class` ancestry is bounded: 200 links deep, 200 re-resolutions wide (`LB0317` / `LB0318` / `LB0319`)
+
+Resolving a `---@class` walks its ancestors recursively. Two hard limits bound
+that walk, and a class that trips either one resolves **incompletely** —
+members past the point the walk stopped are not in its shape, so reads of them
+are unchecked. Both limits are luabox's own; there is nothing to opt out of
+them beyond the strictness ladder below.
+
+| Limit | Value | What trips it | Code | Fix |
+|---|---|---|---|---|
+| `MAX_ANCESTRY_DEPTH` | 200 links | a single-inheritance chain longer than 200 (`C0`, `C1 : C0`, … `C201 : C200`) | `LB0317` | flatten the hierarchy, or declare the members you actually read nearer the leaf |
+| — | — | a class reachable from itself (`A : A`, or `A : B` / `B : A`) | `LB0318` | break the loop; a mutual reference is a `---@field`, not an `extends` |
+| `MAX_ANCESTRY_RESOLUTIONS` | 200 re-resolutions | the same generic ancestor reached through more than one parent and **bound differently on each branch**, repeated enough times (`L1 : Box<number>`, `R1 : Box<string>`, `C1 : L1, R1`, ×N) | `LB0319` | bind a shared generic ancestor the same way on every branch, or restructure so it is reached once |
+
+The two budgets bound different things and are reported separately on purpose:
+depth protects the native stack (an unbounded walk aborts the process on a
+host with a small thread stack — an editor embedding the language server is
+exactly such a host), while the cost budget bounds the *re*-work a diamond
+conflict forces. Flattening a hierarchy fixes the first and does nothing for
+the second, so reporting one as the other advises the wrong fix. The cost
+budget counts **re**-resolutions only: a hierarchy that is merely large —
+hundreds of generated `---@class` declarations, each visited once — does not
+trip it.
+
+**The strictness ladder is the same as every other `LB03xx`.** `[types]
+strict = true` reports `error` (exit 1); `[types] strict = false` downgrades
+to `warning` (exit 0); `Strictness::None`, reachable programmatically but not
+from a manifest, reports nothing. Per-rule suppression uses luabox's own rule
+names — luals has no counterpart to borrow:
+
+| Code | `---@diagnostic disable[-line\|-next-line]:` name |
+|---|---|
+| `LB0317` | `class-ancestry-too-deep` |
+| `LB0318` | `cyclic-class-ancestry` |
+| `LB0319` | `class-ancestry-too-costly` |
+
+**Suppression is scoped to the file that DECLARES the class**, not the file
+that read it. All three diagnostics are anchored at the `---@class` line the
+message names, so a directive has to sit in *that* file — a
+`disable-next-line` above the declaration, or a file-wide `disable` at the top
+of it. A directive in the file that merely consumes the class does nothing,
+even though that is where the error was reported from.
+
+The one exception is a class declared **only in a `[types] defs` package**.
+Nothing in the project declares it, and a definition package's own comments
+are never scanned for directives, so there is no declaration line to reach:
+the diagnostic attaches to **line 1 of each consuming file** instead. That is
+where the directive goes — a file-wide `---@diagnostic disable:
+class-ancestry-too-deep` at the top of the consuming file, or a
+`disable-line` on line 1 itself — both measured against the shipping binary.
+A directive written next to the declaration inside the `.d.lua` has no effect:
+definition packages are not project sources and are never scanned for
+directives at all.
+
+**lua-language-server 3.13.5 reports nothing for any of these three shapes**
+(measured against the pinned binary). A deep chain, a cycle, and a conflicting
+generic diamond are all silently accepted there, so luabox is deliberately
+stricter on all three — a project clean under `lua-language-server --check`
+can fail `luabox check` on ancestry alone. `luabox explain LB0317` (and
+`LB0318`, `LB0319`) prints the full worked fix for each.
+
+### Malformed `---@class` headers give no diagnostic at the declaration (round 6 review M66 — [#69](https://github.com/flying-dice/luabox/issues/69))
 
 Every row above assumes `---@class` parses into a well-formed class at all.
 Four ways a header can fail to — a missing name, a name token the grammar
@@ -145,7 +218,11 @@ the missing name.
 
 The fix belongs in `luacats::harvest`, which currently drops a header it
 cannot parse into a class rather than emitting anything for it — no `LB0xxx`
-code is assigned for this condition yet. `crates/luabox-types/tests/class_merge_precedence_matrix.rs`'s
+code is assigned for this condition yet. It is tracked as
+[#69](https://github.com/flying-dice/luabox/issues/69); an earlier edition of
+this section said the tracking issue was "not yet filed", which was true when
+written and is not now.
+`crates/luabox-types/tests/class_merge_precedence_matrix.rs`'s
 `malformed_class_headers_m66` test (`#[ignore]`d) pins today's measured
 behaviour, including the `A : P,` correction above, so a regression on either
 side is visible the day someone runs it by hand, and so there is a concrete

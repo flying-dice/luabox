@@ -17,6 +17,7 @@ use luabox_hir::BindingKind;
 use luabox_types::ty::Ty;
 
 use crate::merged_ambient::MergedAmbient;
+use crate::render::OwnParamErasure;
 use crate::requires::{self, RequireExports};
 use crate::sema::{self, FileSema};
 
@@ -89,11 +90,6 @@ pub fn completion(
     items.into_values().collect()
 }
 
-/// Fields/methods of the receiver identifier ending at `dot_offset`: a
-/// `require` binding's module's structural export first (#54), then the
-/// receiver's class members resolved through the workspace ambient (#56) —
-/// which already includes every class *this* file declares, so there is one
-/// lookup, not a file-local one shadowed by a cross-file fallback (#46).
 /// The three shared resolution sources a member-completion route reads, in
 /// one value: the project database, the `require`-export resolution the type
 /// pass checks against, and the merged workspace ambient. Every route needs
@@ -105,6 +101,11 @@ struct Resolvers<'a> {
     ambient: &'a MergedAmbient,
 }
 
+/// Fields/methods of the receiver identifier ending at `dot_offset`: a
+/// `require` binding's module's structural export first (#54), then the
+/// receiver's class members resolved through the workspace ambient (#56) —
+/// which already includes every class *this* file declares, so there is one
+/// lookup, not a file-local one shadowed by a cross-file fallback (#46).
 fn member_items(
     sema: &FileSema,
     text: &str,
@@ -222,10 +223,20 @@ fn ambient_member_items(
     // Monomorphised against the reference's own type arguments, exactly as
     // the checker monomorphises the same reference at its use site (#48):
     // `Box<number>`'s `item` offers `number`, not the free `T` a bare-name
-    // lookup would leave it as.
+    // lookup would leave it as. A *bare* reference's own free parameters go
+    // through the erasure hover already applied (M21) — one shared renderer,
+    // so the detail line and the hover on the same symbol cannot disagree
+    // (production readiness review, finding 3).
     let Some(shape) = resolvers.ambient.class_members_of(&ty) else {
         return;
     };
+    let erasure = OwnParamErasure::at_reference(
+        &ty,
+        &class,
+        resolvers.analysis,
+        &sema.path,
+        resolvers.ambient,
+    );
     for (name, field) in &shape.fields {
         let is_fun = crate::signature_help::as_function_ty(&field.ty).is_some();
         // After `:` only methods make sense.
@@ -244,7 +255,7 @@ fn ambient_member_items(
         items.entry(name.clone()).or_insert_with(|| CompletionItem {
             label: name.clone(),
             kind: Some(kind),
-            detail: Some(format!("{class}.{name}: {}", field.ty)),
+            detail: Some(format!("{class}.{name}: {}", erasure.render(&field.ty))),
             ..CompletionItem::default()
         });
     }
@@ -794,16 +805,28 @@ b.
         );
     }
 
-    /// The one-variable control: the identical class referenced bare stays
-    /// lenient — the free `T` — exactly as it did before #48.
+    /// The one-variable control: the identical class referenced bare erases
+    /// its own free parameter to `unknown` (M21), the same answer
+    /// `hover::an_unbound_generic_receivers_free_parameter_hovers_as_unknown`
+    /// gives for the same symbol in the same buffer, and the same one
+    /// `luabox check` enforces through `class_shape_bound_export`.
+    ///
+    /// Renamed from `an_unbound_generic_receiver_still_offers_the_free_parameter`,
+    /// which pinned the pre-M21 raw `T` — the divergence the production
+    /// readiness review found (finding 3): M21 landed the erasure in
+    /// `hover.rs` alone, so the popup said `T` while the hover one keystroke
+    /// later said `unknown`.
     #[test]
-    fn an_unbound_generic_receiver_still_offers_the_free_parameter() {
+    fn an_unbound_generic_receivers_free_parameter_completes_as_unknown() {
         let files = [
             ("main.lua", "---@type Box\nlocal b = nil\nb.\n"),
             ("box.lua", "---@class Box<T>\n---@field item T\n"),
         ];
         let items = after(&files, "b.");
-        assert_eq!(item(&items, "item").detail.as_deref(), Some("Box.item: T"));
+        assert_eq!(
+            item(&items, "item").detail.as_deref(),
+            Some("Box.item: unknown")
+        );
     }
 
     // === an alias-typed class field (round 4 review R27) ==================

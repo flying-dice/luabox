@@ -62,11 +62,12 @@ on:
       # own `--in-diff` diffs against to exist at all — mutants-gate.sh's
       # own "scoped file does not exist" check is exactly what fires when
       # they do not. Reproduced: rename env.rs on a branch and re-run the
-      # self-test locally — 4 passed, 27 failed (checked against this
-      # file's current 31-case suite; re-grep before trusting the count
-      # next time a case is added or removed — an earlier revision of this
-      # comment claimed "22 failed" against a "26-case suite", which was
-      # already stale the day it was written, #58 review round 6, M24).
+      # self-test locally — most of the suite goes red at once (no case
+      # count here on purpose: two revisions of this comment each pinned a
+      # number that was stale on arrival — "22 failed / 26-case suite",
+      # then "27 failed / 31-case suite" against what is now a 41-case
+      # suite. The self-test prints its own counts; trust its output, not
+      # this prose — #58 review round 6, M24, twice).
       # `scripts/tests/mutants-*`
       # covers the gate script, its self-test and the committed allowlist as
       # one rule. The workflow file is self-referential for the same reason
@@ -185,15 +186,37 @@ jobs:
           tool: cargo-mutants@27.1.0
 
       - name: Compute the PR's diff over the mutation scope
+        # The path list is READ OUT OF mutants-gate.sh's own `default_files`
+        # line rather than written here a second time: two hand-maintained
+        # copies of one scope drift, and this exact job is the one that would
+        # then silently under-diff a PR touching only the newly-scoped file
+        # (the same defect the `&mutants_scope_paths` anchor above exists to
+        # prevent for `paths:`, one level down — #58 local merge-gate; the
+        # widening plan is #71). The grep is anchored to the assignment, and
+        # the guard below fails the job loudly if the extraction ever stops
+        # matching instead of diffing against nothing.
         run: |
+          default_files="$(grep -oP '^default_files="\K[^"]+' scripts/tests/mutants-gate.sh)"
+          if [ -z "$default_files" ]; then
+            echo "::error::could not extract default_files from scripts/tests/mutants-gate.sh — the scope's single owner moved; fix this extraction with it" >&2
+            exit 1
+          fi
+          echo "mutants-pr: scope (from mutants-gate.sh): $default_files"
+          # shellcheck disable=SC2086 -- comma-separated list becomes word-split paths deliberately
           git diff --merge-base "${{ github.event.pull_request.base.sha }}" HEAD \
-            -- crates/luabox-types/src/env.rs crates/luabox-types/src/defs.rs \
-               crates/luabox-types/src/generics.rs crates/luabox-types/src/infer/reify.rs \
+            -- ${default_files//,/ } \
             > "$RUNNER_TEMP/pr.diff"
           echo "mutants-pr: diff has $(wc -l < "$RUNNER_TEMP/pr.diff") line(s) over the mutation scope"
 
       - name: Run the mutation gate, bounded to this PR's diff
+        # Skipped when the diff is empty: the gate itself would report "OK —
+        # the diff touches nothing mutable" after paying for a full baseline
+        # build; checking the file first spends nothing to conclude the same.
         run: |
+          if [ ! -s "$RUNNER_TEMP/pr.diff" ]; then
+            echo "mutants-pr: empty diff over the mutation scope — nothing to audit this run"
+            exit 0
+          fi
           MUTANTS_OUT="$RUNNER_TEMP/mutants" \
             IN_DIFF="$RUNNER_TEMP/pr.diff" \
             bash scripts/tests/mutants-gate.sh

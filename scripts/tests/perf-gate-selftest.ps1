@@ -14,9 +14,11 @@
     mirrors, using the same PowerShell idioms perf-gate.ps1 and
     perf-gate-lib.ps1 already use elsewhere in this repo, but it has not
     been exercised even once. scripts/tests/perf-gate-selftest.ps1 needs a
-    real `pwsh` run — a CI leg for that (Windows runner, `pwsh -File
-    scripts/tests/perf-gate-selftest.ps1`) is added alongside this file so
-    the first real execution happens in CI, not silently deferred forever.
+    real `pwsh` run — ci.yml's `perf-gate-selftest-ps1` job (windows-latest,
+    `shell: pwsh`) is that leg, so the first real execution happens in CI,
+    not silently deferred forever. If that job is red and this file has not
+    changed, the failure is this suite meeting reality for the first time —
+    fix the .ps1 side to match the bash semantics it mirrors, not the test.
 
     Two parts, mirroring perf-gate-selftest.sh:
 
@@ -108,6 +110,26 @@ Test-Equal "ConvertTo-ScaledBudgetMs CI factor (4.0)" (ConvertTo-ScaledBudgetMs 
 # accident: 100 * 1.678 = 167.8 (truncate -> 167, round -> 168).
 Test-Equal "ConvertTo-ScaledBudgetMs truncates, does not round" (ConvertTo-ScaledBudgetMs 100 1.678) 167
 
+# The optional ceiling, mirroring perf-gate-selftest.sh's four scale_budget_ms
+# ceiling cases one for one (same base/factor/ceiling triples, same expected
+# values). -Factor multiplies a base that already carries ~3x headroom, so
+# CI's effective ceiling for the check leg had reached ~12x its measured
+# baseline before the cap existed. The cases without a ceiling above are the
+# control: a leg passing none must be unchanged.
+Test-Equal "ConvertTo-ScaledBudgetMs caps a scaled budget at its ceiling" `
+    (ConvertTo-ScaledBudgetMs 7500 4.0 -CeilingMs 8000) 8000
+Test-Equal "ConvertTo-ScaledBudgetMs leaves a scaled budget under its ceiling alone" `
+    (ConvertTo-ScaledBudgetMs 7500 1.0 -CeilingMs 8000) 7500
+Test-Equal "ConvertTo-ScaledBudgetMs ceiling equal to the scaled value does not cap" `
+    (ConvertTo-ScaledBudgetMs 2000 2.0 -CeilingMs 4000) 4000
+# The bash side spells "no ceiling" as an empty third argument; PowerShell's
+# is the default 0, asserted both ways so a future change to the sentinel
+# cannot quietly start capping every uncapped leg to zero.
+Test-Equal "ConvertTo-ScaledBudgetMs with no ceiling behaves as if uncapped" `
+    (ConvertTo-ScaledBudgetMs 1000 4.0) 4000
+Test-Equal "ConvertTo-ScaledBudgetMs with a zero ceiling behaves as if uncapped" `
+    (ConvertTo-ScaledBudgetMs 1000 4.0 -CeilingMs 0) 4000
+
 # --- Test-LuaFileCount -------------------------------------------------------
 $work = Join-Path ([System.IO.Path]::GetTempPath()) ("perf-gate-selftest-" + [System.Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $work -Force | Out-Null
@@ -176,6 +198,20 @@ try {
         $script:fail++
     }
 
+    # The two ceiling keys specifically. They were added to the shared
+    # budgets file by the round 6 rebase and read by perf-gate.sh alone —
+    # perf-gate.ps1 ignored them for a full round, which is the M50 drift in
+    # its quietest form (one file, two readers, one of them partial). Pinned
+    # by name so a key that lands in perf-gate-budgets.env and never reaches
+    # this side again fails here rather than in production.
+    if ($budgets["CHECK_CEILING_MS"] -gt 0 -and $budgets["DIAG_CHECK_CEILING_MS"] -gt 0) {
+        Write-Host "PASS  Read-PerfBudgets exposes the ceiling keys perf-gate.ps1 applies"
+        $script:pass++
+    } else {
+        Write-Host "FAIL  Read-PerfBudgets: expected positive CHECK_CEILING_MS and DIAG_CHECK_CEILING_MS"
+        $script:fail++
+    }
+
     $malformed = Join-Path $work "malformed-budgets.env"
     Set-Content -Path $malformed -Value @("GOOD_KEY=1", "not a key=value line at all")
     $threw = $false
@@ -198,7 +234,19 @@ try {
 # and what it structurally cannot (the three RSS-measuring legs, which use
 # raw Process.Start() rather than the `&` call operator).
 
-if ($env:PERF_GATE_SELFTEST_SKIP_BEHAVIORAL) {
+# PERF_GATE_SELFTEST_SKIP_BEHAVIORAL drops Part 2 — every case that runs
+# perf-gate.ps1 for real. It exists for local iteration on Part 1 alone.
+#
+# It does NOT produce a pass (decisions/12 section 3, local merge-gate
+# finding): the earlier version of this switch dropped a third of the suite
+# and still exited 0 with a clean "N passed, 0 failed" line — a green verdict
+# over a suite whose behavioural half never ran. The final verdict below is
+# PARTIAL and the exit code nonzero whenever this variable is set, so the
+# only way to get a green perf-gate-selftest is to run all of it.
+# perf-gate-selftest.sh carries the identical rule for the identical
+# variable; the two must not diverge.
+$skipBehavioral = [bool]$env:PERF_GATE_SELFTEST_SKIP_BEHAVIORAL
+if ($skipBehavioral) {
     Write-Host "SKIP  Part 2 (behavioural perf-gate.ps1 runs) - PERF_GATE_SELFTEST_SKIP_BEHAVIORAL set"
 } else {
 
@@ -254,10 +302,23 @@ for ($i = 0; $i -lt $files; $i++) {
 }
 '@ | Set-Content -Path $stubGenCorpus
 
+# The full set of FAIL lines a run of every leg could print. Every member
+# except the one a case targets is asserted ABSENT, so a case cannot pass
+# because it got the right exit code and the right FAIL line while some other
+# comparison also (wrongly) fired. This list must name all TEN legs, not just
+# the seven Part 2 can drive: the three RSS-measuring legs are ones this file
+# cannot make fail on purpose (see the header — Process.Start() cannot launch
+# a .ps1 stub), but they can still fail by ACCIDENT, and leaving them out of
+# the absence sweep is exactly the "asserted the right thing while something
+# else broke" gap the sweep exists for. Mirrors perf-gate-selftest.sh's
+# all_fail_needles, which has carried all ten from the start.
 $allFailNeedles = @(
     "FAIL cold start:",
     "FAIL fmt --check (warm):",
     "FAIL check (warm):",
+    "FAIL check peak RSS:",
+    "FAIL retained-TypeEnv regression, peak RSS:",
+    "FAIL retained-TypeEnv regression, wall time:",
     "FAIL lint (diagnostics-heavy):",
     "FAIL check (diagnostics-heavy):",
     "FAIL lint (diagnostics-heavy, rendered):",
@@ -335,8 +396,45 @@ Remove-Item -Recurse -Force $gwork -ErrorAction SilentlyContinue
 
 } # PERF_GATE_SELFTEST_SKIP_BEHAVIORAL
 
+# The gate on the skip switch itself — mirrors
+# perf-gate-selftest.sh's skip_behavioral_refuses_to_report_a_full_pass.
+# Re-invokes THIS file with the variable set and requires the child to refuse
+# to call itself green: nonzero exit and a PARTIAL verdict, with the counts
+# still printed (what is withheld is the VERDICT, not the data). Only run
+# when the variable is not already set, or the child would spawn a
+# grandchild without bound.
+if (-not $skipBehavioral) {
+    $partialLog = Join-Path ([System.IO.Path]::GetTempPath()) ("perf-gate-selftest-partial-" + [System.Guid]::NewGuid().ToString("N") + ".log")
+    $env:PERF_GATE_SELFTEST_SKIP_BEHAVIORAL = "1"
+    pwsh -File $MyInvocation.MyCommand.Path *> $partialLog
+    $partialExit = $LASTEXITCODE
+    Remove-Item Env:\PERF_GATE_SELFTEST_SKIP_BEHAVIORAL -ErrorAction SilentlyContinue
+    $partialText = Get-Content -Path $partialLog -Raw
+    Remove-Item -Force $partialLog -ErrorAction SilentlyContinue
+    if ($partialExit -ne 0 -and
+        $partialText.Contains("PARTIAL - behavioural cases skipped (local-iteration mode)") -and
+        $partialText.Contains("SKIP  Part 2") -and
+        $partialText.Contains("0 failed") -and
+        -not $partialText.Contains("ALL GATES PASSED")) {
+        Write-Host "PASS  skip_behavioral_refuses_to_report_a_full_pass (exit $partialExit)"
+        $script:pass++
+    } else {
+        Write-Host "FAIL  skip_behavioral_refuses_to_report_a_full_pass: expected a nonzero exit and a PARTIAL verdict, got exit $partialExit"
+        Write-Host $partialText
+        $script:fail++
+    }
+}
+
 Write-Host ""
 Write-Host "perf-gate-selftest (PowerShell): $script:pass passed, $script:fail failed"
+if ($skipBehavioral) {
+    Write-Host "perf-gate-selftest: PARTIAL - behavioural cases skipped (local-iteration mode)"
+    Write-Host "perf-gate-selftest:   PERF_GATE_SELFTEST_SKIP_BEHAVIORAL was set, so every case that runs"
+    Write-Host "perf-gate-selftest:   perf-gate.ps1 for real was dropped - the counts above are Part 1 only"
+    Write-Host "perf-gate-selftest:   and are not evidence that the gate's threshold comparisons are"
+    Write-Host "perf-gate-selftest:   load-bearing. Re-run without the variable before treating this green."
+    exit 1
+}
 if ($script:fail -eq 0 -and $script:pass -gt 0) {
     exit 0
 } else {

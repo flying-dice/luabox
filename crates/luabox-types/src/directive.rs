@@ -46,9 +46,10 @@ const KNOWN_RULES: &[&str] = &[
 /// They are *here*, in the one owner, rather than in a second scanner
 /// (round 6 review M4(b)): the CLI's syntactic pre-check
 /// (`luabox_cli::check_cmd::deep_class_chain_diagnostics`) runs before the
-/// type pass and so cannot use [`DirectiveScan`] itself, but it reads this
-/// constant, so the two emitters of `LB0317` cannot disagree about what
-/// silences it. They did: the pre-check honored the comment and the
+/// type pass, but it reads this constant — and, since the production
+/// readiness review's finding 3, runs [`DirectiveScan`] itself rather than a
+/// look-alike of it — so the two emitters of `LB0317` cannot disagree about
+/// what silences it. They did: the pre-check honored the comment and the
 /// checker-side drain ignored it, so a file-wide `disable` suppressed some of
 /// a project's `LB0317`s and not others.
 pub const RULE_CLASS_ANCESTRY_TOO_DEEP: &str = "class-ancestry-too-deep";
@@ -91,15 +92,13 @@ pub(crate) fn rule_for_code(code: Code) -> Option<&'static str> {
 /// (`--[[@diagnostic disable: foo]]`) can leave on the last name, exactly as
 /// [`DirectiveScan::scan`] always has.
 ///
-/// Shared by [`DirectiveScan::scan`] (a raw-text scan over a whole file,
-/// run once the type pass has diagnostics to filter — after `KNOWN_RULES`
-/// narrows the match) and `luabox_cli::check_cmd`'s syntactic `LB0317`
-/// pre-check (run over already-harvested `Tag::Diagnostic` bodies, before
-/// any [`crate::TypeEnv`] exists for a [`DirectiveScan`] to run against).
-/// Before this, the two hand-rolled the identical `split_once(':')` +
-/// comma-split + trim (round 6 review G5) — one owner now, so a future
-/// change to the comment grammar cannot update one scanner and miss the
-/// other.
+/// Used by [`DirectiveScan::scan`] (a raw-text scan over a whole file) and
+/// exported for any front-end that has already captured a directive body some
+/// other way. It was extracted (round 6 review G5) because
+/// `luabox_cli::check_cmd`'s `LB0317` pre-check hand-rolled the identical
+/// `split_once(':')` + comma-split + trim; that pre-check now runs
+/// [`DirectiveScan`] itself, which is the stronger form of the same fix — one
+/// scanner rather than two scanners sharing one parser.
 pub fn parse_directive_body(rest: &str) -> Option<(&str, impl Iterator<Item = &str> + Clone)> {
     let (action, names) = rest.trim().split_once(':')?;
     Some((
@@ -120,14 +119,28 @@ struct RuleState {
 
 /// All `---@diagnostic disable*` directives in a source, indexed by luals rule
 /// name — a superset scan reused across every checker diagnostic.
+///
+/// `pub` because it has a second caller outside this crate: `luabox-cli`'s
+/// syntactic `LB0317` pre-check (`check_cmd::deep_class_chain_diagnostics`)
+/// runs before the type pass, and used to hand-roll its own reader of the
+/// same comment syntax over already-harvested `Tag::Diagnostic` bodies. That
+/// copy recognised a *different* grammar than this one — it never saw
+/// `--[[@diagnostic disable: ...]]` or a plain `--@diagnostic ...`, both of
+/// which this scanner accepts (it splits raw text on `@diagnostic`, not on a
+/// harvested LuaCATS tag), so one rule name silenced the checker-side
+/// `LB0317` and not the pre-check's (production readiness review, finding 3).
+/// The premise that justified the copy — "no `TypeEnv` exists yet at that
+/// point in the pipeline for `DirectiveScan` to run against" — was simply
+/// false: [`Self::scan`] takes a `&str` and nothing else. One scanner now,
+/// so the two emitters of `LB0317` cannot disagree about what silences it.
 #[derive(Default)]
-pub(crate) struct DirectiveScan {
+pub struct DirectiveScan {
     rules: HashMap<&'static str, RuleState>,
 }
 
 impl DirectiveScan {
     /// Scan `source` for `---@diagnostic` comments naming any [`KNOWN_RULES`].
-    pub(crate) fn scan(source: &str) -> Self {
+    pub fn scan(source: &str) -> Self {
         let mut out = Self::default();
         for (i, line) in source.lines().enumerate() {
             let comment_line = i + 1;
@@ -164,7 +177,7 @@ impl DirectiveScan {
     }
 
     /// Whether any recognised directive was found (a cheap short-circuit).
-    pub(crate) fn any(&self) -> bool {
+    pub fn any(&self) -> bool {
         self.rules
             .values()
             .any(|s| s.file_wide || !s.lines.is_empty())
@@ -173,7 +186,7 @@ impl DirectiveScan {
     /// Whether a diagnostic for luals `rule` on 1-based `line` is suppressed. A
     /// line directive covers its own line (trailing form) and the line below
     /// (comment-above form), matching `suppress.rs`.
-    pub(crate) fn suppresses(&self, rule: &str, line: usize) -> bool {
+    pub fn suppresses(&self, rule: &str, line: usize) -> bool {
         let Some(state) = self.rules.get(rule) else {
             return false;
         };

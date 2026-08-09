@@ -214,11 +214,20 @@ fn report_ancestry_hits(
     file: &str,
     severity: Severity,
     code: Code,
-    hits: Vec<String>,
+    mut hits: Vec<String>,
     headline: impl Fn(&str) -> String,
     detail: impl Fn(&str) -> String,
     remedy: impl Fn(&str) -> String,
 ) {
+    // The three ledgers are `HashSet`s, so a drain hands back an
+    // iteration-order-dependent `Vec` — and every hit attributed to a
+    // consuming file (the ambient/defs case below) gets the same `0..0`
+    // primary span, so `run`'s span sort cannot break the tie either. Two
+    // runs over the same project would then print the same findings in
+    // different orders (production readiness review). Sorted here,
+    // at the source, so every consumer — CLI, LSP, this crate's own tests —
+    // gets one order rather than each having to impose its own.
+    hits.sort();
     for name in hits {
         let headline_msg = headline(&name);
         let detail_msg = detail(&name);
@@ -364,9 +373,12 @@ fn report_cost_limit_hits(
         typeenv.take_cost_limit_hits(),
         |name| format!("`{name}`'s `---@class` ancestry is too costly to resolve safely"),
         |_name| {
-            "re-resolving this ancestry's conflicting diamonds exceeded the resolution-cost \
-             budget this checker enforces to keep the merge walk from going polynomial"
-                .to_string()
+            format!(
+                "re-resolving this ancestry's conflicting diamonds exceeded the \
+                 {}-re-resolution budget this checker enforces to keep the merge walk from \
+                 going polynomial",
+                env::MAX_ANCESTRY_RESOLUTIONS
+            )
         },
         |_name| {
             "bind a shared generic ancestor the same way on every branch, or restructure the \
@@ -2060,9 +2072,43 @@ impl Checker<'_> {
 /// `TypeEnv::collect_class`'s own indexer merge keys on. Deriving it from a
 /// second, independent notion of "same key" is how the two would drift apart
 /// again.
-pub(crate) fn duplicate_doc_fields(
+///
+/// **A lowered `Ty` alone is not that identity, though** (production
+/// readiness review). This pass lowers through a context it builds
+/// itself, and that context is weaker than the one `collect_class` merges
+/// against in two ways, each of which used to collapse distinct keys onto
+/// [`Ty::Unknown`] and fire `LB0311` on a class with no duplicate at all:
+///
+/// - a key naming a type declared **elsewhere** — a `[types] defs` package,
+///   or another project file merged in through
+///   [`crate::Ambient::with_project_types`] — is undeclared as far as a
+///   file-local [`crate::lower::Declared`] is concerned, so `[KA]` and
+///   `[KB]` both lowered to `unknown` and read as one key; and
+/// - a class's **own** type parameters (`---@class Keyed<T, U>`, and any
+///   `---@generic` on the same doc block) were never put in scope at all, so
+///   `[T]` and `[U]` did the same.
+///
+/// So identity is the pair (lowered [`Ty`], the type names that lowering
+/// could **not** resolve). Two keys are the same key when both resolve to
+/// the same type, or both fail to resolve on the same names — `[T]` and
+/// `[U]` are distinct, `[T]` twice is a duplicate, `[KA]` twice is a
+/// duplicate, and `[KA]` against `[KB]` is not. The unresolved half is the
+/// only part that reads on a *name*: it is what a resolved identity cannot
+/// yet answer, not a second notion of sameness competing with the first.
+///
+/// The `ambient` argument closes the remaining half of the gap: an
+/// alias declared in a definition package expands here exactly as it does in
+/// `TypeEnv::build_from_items`, so `[MyAlias]` collides with `[string]` when
+/// the package says `---@alias MyAlias string`. Ambient *class*/*enum* names
+/// are deliberately not seeded — [`TypeEnv`] exposes no enumeration of them,
+/// and the unresolved-name half of the key already tells those apart
+/// correctly without one. The one production caller
+/// (`crate::check_file_from_env`) threads the same `ambient` its
+/// [`TypeEnv`] was built from, so the two lowerings cannot drift.
+pub(crate) fn duplicate_doc_fields_with_ambient(
     items: &[luabox_syntax::luacats::AnnotatedItem],
     file: &str,
+    ambient: Option<&crate::defs::Ambient>,
 ) -> Vec<Diagnostic> {
     use luabox_syntax::luacats::{FieldKey, Tag};
 
@@ -2070,12 +2116,23 @@ pub(crate) fn duplicate_doc_fields(
     #[derive(PartialEq, Eq, Hash)]
     enum SeenKey {
         Name(String),
-        Indexer(Ty),
+        /// The lowered key type, paired with the type names this pass could
+        /// not resolve while lowering it (in source order, so two spellings
+        /// of the same unresolved key match and two different ones do not).
+        Indexer(Ty, Vec<String>),
     }
 
     // The lowerer the indexer key is resolved through — the same path
     // `TypeEnv` uses, so both seams agree on when two keys are the same key.
+    // Ambient aliases go in beneath the file's own declarations, exactly as
+    // `TypeEnv::build_from_items` seeds them, so a same-named file alias
+    // still shadows the package's.
     let mut declared = crate::lower::Declared::default();
+    if let Some(ambient) = ambient {
+        for (name, alias) in &ambient.aliases {
+            declared.aliases.insert(name.clone(), alias.clone());
+        }
+    }
     declared.absorb_tags(items);
     let mut lowerer = crate::lower::Lowerer::new(&declared);
 
@@ -2087,6 +2144,20 @@ pub(crate) fn duplicate_doc_fields(
         // seen-set is keyed by class *name* so a class split across blocks in
         // one file still collides.
         let mut current: Option<String> = None;
+        // The type parameters this doc block's own annotations may name —
+        // a generic class's `<T, U>` and any `---@generic` on the block.
+        // Mirrors `env::block_generics`, which is private to that module and
+        // so cannot be shared with this one without widening it.
+        lowerer.generics = item
+            .block
+            .tags
+            .iter()
+            .flat_map(|tag| match tag {
+                Tag::Generic(g) => g.params.iter().map(|p| p.name.clone()).collect(),
+                Tag::Class(c) => c.params.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
         for tag in &item.block.tags {
             match tag {
                 Tag::Class(c) if !c.name.is_empty() => current = Some(c.name.clone()),
@@ -2097,13 +2168,26 @@ pub(crate) fn duplicate_doc_fields(
                     // `label` is what the user reads; `key` is what decides
                     // identity. For an indexer they differ: the label is the
                     // key's source-shaped rendering (`[string]`, matching
-                    // luals' own message), the key is its lowered `Ty`.
+                    // luals' own message), the key is its lowered `Ty` plus
+                    // whatever that lowering left unresolved.
                     let (key, label) = match &f.key {
                         FieldKey::Name(name) => (SeenKey::Name(name.clone()), name.clone()),
                         FieldKey::Indexer(expr) => {
+                            let before = lowerer.unknown_names.len();
                             let ty = lowerer.lower(expr);
-                            let label = format!("[{ty}]");
-                            (SeenKey::Indexer(ty), label)
+                            let unresolved: Vec<String> = lowerer.unknown_names[before..]
+                                .iter()
+                                .map(|(name, _)| name.clone())
+                                .collect();
+                            // A key that is *only* an unresolvable name reads
+                            // back as that name, not as `[unknown]`: the user
+                            // wrote `[KA]` and grepping for `unknown` finds
+                            // nothing they can act on.
+                            let label = match (&ty, unresolved.as_slice()) {
+                                (Ty::Unknown, [only]) => format!("[{only}]"),
+                                _ => format!("[{ty}]"),
+                            };
+                            (SeenKey::Indexer(ty, unresolved), label)
                         }
                     };
                     if !seen.entry(class.clone()).or_default().insert(key) {
@@ -2256,4 +2340,193 @@ fn plural(n: usize) -> &'static str {
 
 fn was_were(n: usize) -> &'static str {
     if n == 1 { "was" } else { "were" }
+}
+
+#[cfg(test)]
+mod tests {
+    // test code — panics document assumptions
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use std::fmt::Write as _;
+
+    use super::*;
+    use crate::Strictness;
+
+    /// An `---@alias` declared by a definition package expands here exactly as
+    /// it does in `TypeEnv::build_from_items`, so `[MyAlias]` and `[string]`
+    /// are one key — the genuine duplicate a file-local lowering context
+    /// cannot see, and the one this function's doc comment used to claim it
+    /// already caught (production readiness review).
+    ///
+    /// Pinned at this seam for directness; the production path threads the
+    /// same `ambient` through `crate::check_file_from_env`, so this and the
+    /// public API exercise one lowering context — see
+    /// [`duplicate_doc_fields_with_ambient`]'s own doc comment.
+    #[test]
+    fn a_defs_declared_alias_key_collides_with_its_expansion() {
+        let ambient = crate::defs::Ambient::build(&["---@meta\n---@alias MyAlias string\n"]);
+        let src = "\
+---@class Keyed
+---@field [MyAlias] number
+---@field [string] string
+local K = {}
+";
+        let parse = lua::parse(src, lua::Dialect::Lua54);
+        let items = luabox_syntax::luacats::harvest(&parse);
+        let diags = duplicate_doc_fields_with_ambient(&items, "test.lua", Some(&ambient));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(
+            diags[0]
+                .message
+                .contains("duplicate field `[string]` on class `Keyed`"),
+            "{}",
+            diags[0].message
+        );
+    }
+
+    /// `LB0319`'s detail names the budget it enforces, the way `LB0317`'s
+    /// sibling has always named `MAX_ANCESTRY_DEPTH` (production readiness
+    /// review). A user told only that a walk was "too costly" has no
+    /// figure to measure their hierarchy against.
+    #[test]
+    fn the_cost_limit_detail_names_the_budget() {
+        // `env::tests::conflicting_diamond_source`'s shape: every level binds
+        // its grandparent a second, conflicting way, so the walk re-resolves
+        // a shared ancestor rather than merely descending. k=60 is well
+        // inside `MAX_ANCESTRY_DEPTH`, so this can only ever trip the COST
+        // budget — an `LB0317` here would mean the fixture stopped testing
+        // what it names.
+        let mut src = String::from("---@class A0<T>\n---@field item T\n---@class A1<T> : A0<T>\n");
+        for i in 2..=60 {
+            let _ = writeln!(
+                src,
+                "---@class A{i}<T> : A{parent}<T>, A{grandparent}<number>",
+                parent = i - 1,
+                grandparent = i - 2
+            );
+        }
+        src.push_str("---@type A60<string>\nlocal a\nprint(a.item)\n");
+        let parse = lua::parse(&src, lua::Dialect::Lua54);
+        let diags = crate::check_file(&parse, "test.lua", Strictness::Strict, lua::Dialect::Lua54);
+        let cost: Vec<&Diagnostic> = diags
+            .iter()
+            .filter(|d| d.code == CLASS_COST_LIMIT)
+            .collect();
+        assert!(!cost.is_empty(), "must report LB0319: {diags:?}");
+        let detail = &cost[0]
+            .primary_label()
+            .expect("an ancestry-guard diagnostic always carries a primary label")
+            .message;
+        assert!(
+            detail.contains(&format!(
+                "{}-re-resolution budget",
+                env::MAX_ANCESTRY_RESOLUTIONS
+            )),
+            "{detail}"
+        );
+    }
+
+    /// Two over-limit ancestries declared by a definition package both land on
+    /// the consuming file's `0..0` anchor, so [`run`]'s span sort cannot order
+    /// them — only [`report_ancestry_hits`]' own name sort can (production
+    /// readiness review). The ledgers are `HashSet`s and each check
+    /// builds a fresh one, so an unsorted drain varies run to run; twenty runs
+    /// agreeing on one order is what pins it.
+    #[test]
+    fn ambient_ancestry_hits_report_in_a_fixed_order() {
+        let mut defs = String::from("---@meta\n---@class A0\n---@class Z0\n");
+        for i in 1..=(MAX_ANCESTRY_DEPTH + 5) {
+            let _ = writeln!(defs, "---@class A{i} : A{}", i - 1);
+            let _ = writeln!(defs, "---@class Z{i} : Z{}", i - 1);
+        }
+        let deepest = MAX_ANCESTRY_DEPTH + 5;
+        let src =
+            format!("---@type A{deepest}\nlocal a = {{}}\n---@type Z{deepest}\nlocal z = {{}}\n");
+        let ambient = crate::defs::Ambient::build(&[defs.as_str()]);
+        let parse = lua::parse(&src, lua::Dialect::Lua54);
+
+        let names: Vec<Vec<String>> = (0..20)
+            .map(|_| {
+                crate::check_file_with_ambient(
+                    &parse,
+                    "test.lua",
+                    Strictness::Strict,
+                    lua::Dialect::Lua54,
+                    Some(&ambient),
+                )
+                .iter()
+                .filter(|d| d.code == CLASS_DEPTH_LIMIT)
+                .map(|d| d.message.clone())
+                .collect()
+            })
+            .collect();
+
+        assert_eq!(names[0].len(), 2, "both chains must report: {:?}", names[0]);
+        assert!(
+            names[0][0].contains(&format!("`A{deepest}`")),
+            "the name sort puts the `A` chain first: {:?}",
+            names[0]
+        );
+        for run in &names {
+            assert_eq!(run, &names[0], "every run must report the same order");
+        }
+    }
+
+    /// The nominal-upcast short-circuit (`assign.rs`) is a loosening at the
+    /// pair level, but overload resolution is first-accepting-signature-wins,
+    /// so it can flip WHICH overload a call selects — and therefore the
+    /// call's result type, and therefore a downstream diagnostic. Measured
+    /// against lua-language-server 3.13.5 on this exact fixture: luals
+    /// accepts `Child` for the `Parent` primary nominally (returns `number`,
+    /// diag at the `string` slot) and rejects the structurally identical
+    /// `Other` (falls to the `---@overload` returning `string`, clean) — the
+    /// same two verdicts at the same call sites this pins.
+    #[test]
+    fn a_nominal_upcast_drives_overload_selection_like_luals() {
+        let src = "\
+---@class OvParent
+---@field v string
+---@class OvChild : OvParent
+---@field v number
+---@class OvOther
+---@field v number
+
+---@param p OvParent
+---@return number
+---@overload fun(p: OvOther): string
+local function f(p)
+    local _ = p
+    return 1
+end
+
+---@param s string
+local function takes_string(s)
+    local _ = s
+end
+
+---@type OvChild
+local c
+---@type OvOther
+local o
+takes_string(f(c))
+takes_string(f(o))
+";
+        let parse = lua::parse(src, lua::Dialect::Lua54);
+        let diags = crate::check_file(&parse, "test.lua", Strictness::Strict, lua::Dialect::Lua54);
+        let lb0300: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == crate::codes::TYPE_MISMATCH)
+            .collect();
+        assert_eq!(
+            lb0300.len(),
+            1,
+            "exactly the nominal call site errors, like luals: {diags:?}"
+        );
+        assert!(
+            lb0300[0].message.contains("`string`") && lb0300[0].message.contains("`number`"),
+            "the diagnostic is the selected primary's `number` return failing \
+             the `string` slot, not a rejection of the call itself: {}",
+            lb0300[0].message
+        );
+    }
 }

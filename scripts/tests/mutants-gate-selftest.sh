@@ -59,6 +59,24 @@ source "$here/selftest-lib.sh"
 # one seam this stub has for staging N32: a real cargo-mutants run that never
 # writes one of the four files at all, which is a different fact from writing
 # it empty (see mutants-gate.sh's outcome-file existence check).
+#
+# STUB_EXIT is the OTHER half of the staging, and every case below picks it to
+# match the outcomes it stages, from the mapping MEASURED against cargo-mutants
+# 27.1.0 (2026-08-09, four probe runs — the same measurement mutants-gate.sh's
+# `case "$status"` comment records):
+#   0 — nothing missed, nothing timed out (all caught / all unviable / none
+#       generated at all).
+#   2 — at least one MISSED mutant and no timeouts.
+#   3 — at least one TIMEOUT, whether or not anything was also missed.
+#   4 — the unmutated baseline failed; nothing was measured, and all four
+#       outcome files are written EMPTY.
+# A case staging a missed mutant under exit 3 (or vice versa) is a fixture the
+# real tool would never produce, so it cannot pin the gate's judgement of the
+# real tool — the pre-2026-08-09 revision of this file did exactly that for
+# every case, against a `case "$status"` arm of `0|3|4` in which every value
+# was wrong. Keep the code and the staged outcomes consistent when adding a
+# case; the arms are load-bearing (an exit the gate does not accept never
+# reaches classification at all).
 mkdir -p "$work/bin"
 cat >"$work/bin/cargo-mutants" <<'STUB'
 #!/bin/bash
@@ -113,10 +131,11 @@ scope="crates/luabox-types/src/env.rs"
 # A needle prefixed with `!` must be ABSENT from the log rather than present
 # — a second, unrelated failure path can supply the same "expected" string a
 # deleted line was supposed to produce, and a needle can only prove presence.
-# FILES_OVERRIDE / ALLOWLIST_OVERRIDE / SCOPE_OF_RECORD_OVERRIDE (set by the
-# caller as temporary variable assignments on the `run` call itself)
-# substitute for the fixture scope/allowlist/scope-of-record without
-# hand-rolling a second invocation of the gate. SCOPE_OF_RECORD defaults to
+# FILES_OVERRIDE / ALLOWLIST_OVERRIDE / SCOPE_OF_RECORD_OVERRIDE /
+# IN_DIFF_OVERRIDE (set by the caller as temporary variable assignments on
+# the `run` call itself) substitute for the fixture
+# scope/allowlist/scope-of-record/diff-bound without hand-rolling a second
+# invocation of the gate. SCOPE_OF_RECORD defaults to
 # $scope (the same single file FILES defaults to), matching the gate's own
 # "SCOPE_OF_RECORD defaults to the same list FILES defaults to" — so every
 # case below that does not name the R19 guard gets FILES == SCOPE_OF_RECORD
@@ -128,8 +147,14 @@ run() {
     local files="${FILES_OVERRIDE:-$scope}"
     local list="${ALLOWLIST_OVERRIDE:-$allowlist}"
     local record="${SCOPE_OF_RECORD_OVERRIDE:-$scope}"
+    # IN_DIFF_OVERRIDE stages the diff-bounded mode `mutants-pr` runs in. It
+    # is passed as the empty string when unset, which is exactly what the gate
+    # reads for "not set" (`in_diff="${IN_DIFF:-}"`), so every case that does
+    # not name it gets the ordinary full-scope shape.
+    local diff="${IN_DIFF_OVERRIDE:-}"
     STUB_OUTCOMES="$outcomes" STUB_EXIT="$stub_exit" \
         FILES="$files" ALLOWLIST="$list" SCOPE_OF_RECORD="$record" MUTANTS_OUT="$work/out-$name" \
+        IN_DIFF="$diff" \
         bash "$gate" >"$log" 2>&1
     local got=$?
     assert_exit "$name" "$want_exit" "$got" "$log" "$@"
@@ -150,7 +175,7 @@ OUT
 # echoed — on this, the ordinary successful-run path, and (by the same
 # unconditional line, before any of the early-exit checks) on every other
 # path too, so an out_dir nobody remembered to print is never unreachable.
-run steady_state 0 "$steady" 3 "3 survivor(s)" "all reviewed" "0 shifted" "0 new" "report directory:"
+run steady_state 0 "$steady" 2 "3 survivor(s)" "all reviewed" "0 shifted" "0 new" "report directory:"
 
 # The round-1 gap: a run where every survivor timed out. Unkilled is unkilled.
 flap="$work/flap.txt"
@@ -159,7 +184,7 @@ timeout:crates/luabox-types/src/env.rs:298:30: replace > with >= in TypeEnv::bui
 missed:crates/luabox-types/src/env.rs:301:27: replace > with >= in TypeEnv::build_from_items
 missed:crates/luabox-types/src/env.rs:1333:9: replace TypeEnv::is_class -> bool with true
 OUT
-run waived_line_flaps_to_timeout 0 "$flap" 4 "timed out this run rather than surviving" "0 shifted"
+run waived_line_flaps_to_timeout 0 "$flap" 3 "timed out this run rather than surviving" "0 shifted"
 
 new_timeout="$work/new-timeout.txt"
 cat >"$new_timeout" <<'OUT'
@@ -172,7 +197,7 @@ OUT
 # numbering) separately from the per-mutant FAIL echo, and the "unkilled,
 # not killed" hint pins the remediation text at :252-255 — both survive a
 # gate that still fails for an unrelated reason unless asserted by name.
-run new_timeout_fails 1 "$new_timeout" 4 \
+run new_timeout_fails 1 "$new_timeout" 3 \
     "new timed-out mutant" "brand_new" "1 new timed out" "unkilled, not killed"
 
 new_survivor="$work/new.txt"
@@ -182,7 +207,7 @@ missed:crates/luabox-types/src/env.rs:298:30: replace > with >= in TypeEnv::buil
 missed:crates/luabox-types/src/env.rs:301:27: replace > with >= in TypeEnv::build_from_items
 missed:crates/luabox-types/src/env.rs:1333:9: replace TypeEnv::is_class -> bool with true
 OUT
-run new_survivor_fails 1 "$new_survivor" 3 "new surviving mutant" "brand_new" "1 new"
+run new_survivor_fails 1 "$new_survivor" 2 "new surviving mutant" "brand_new" "1 new"
 
 # The round-2 finding: a shift is a MEASURED pairing, not a reader's guess.
 # All three waived mutants move; nothing is new; the run passes and prints
@@ -196,7 +221,7 @@ missed:crates/luabox-types/src/env.rs:309:30: replace > with >= in TypeEnv::buil
 missed:crates/luabox-types/src/env.rs:312:27: replace > with >= in TypeEnv::build_from_items
 missed:crates/luabox-types/src/env.rs:1344:9: replace TypeEnv::is_class -> bool with true
 OUT
-run shifted_batch_is_not_new 0 "$shifted" 3 "3 shifted" "0 new" "re-pin the 3 shifted" \
+run shifted_batch_is_not_new 0 "$shifted" 2 "3 shifted" "0 new" "re-pin the 3 shifted" \
     "was: crates/luabox-types/src/env.rs:298:30" "now: crates/luabox-types/src/env.rs:309:30" \
     "old: crates/luabox-types/src/env.rs:298:30" "new: crates/luabox-types/src/env.rs:309:30"
 
@@ -226,7 +251,7 @@ crates/luabox-types/src/env.rs:10:1: replace TypeEnv::is_class -> bool with true
 crates/luabox-types/src/env.rs:15:1: replace TypeEnv::is_class -> bool with true	[equivalent] second reason
 LIST
 ALLOWLIST_OVERRIDE="$multi_shift_allowlist" \
-    run shift_pairing_is_hedged_when_ambiguous 0 "$multi_shift" 3 \
+    run shift_pairing_is_hedged_when_ambiguous 0 "$multi_shift" 2 \
     "2 shifted" \
     "PROBABLY moved" "position-rank pick, not individual proof" \
     "was: crates/luabox-types/src/env.rs:10:1" "now: crates/luabox-types/src/env.rs:500:1" \
@@ -242,7 +267,7 @@ missed:crates/luabox-types/src/env.rs:312:27: replace > with >= in TypeEnv::buil
 missed:crates/luabox-types/src/env.rs:1344:9: replace TypeEnv::is_class -> bool with true
 missed:crates/luabox-types/src/env.rs:915:5: replace TypeEnv::brand_new with ()
 OUT
-run mixed_shift_and_new_batch 1 "$mixed" 3 "3 shifted" "1 new" "brand_new"
+run mixed_shift_and_new_batch 1 "$mixed" 2 "3 shifted" "1 new" "brand_new"
 
 # `sort` (mutants-gate.sh, end of the classification pipeline) is what makes
 # the report's line order reproducible run over run, independent of the
@@ -275,7 +300,7 @@ missed:crates/luabox-types/src/env.rs:298:30: replace > with >= in TypeEnv::buil
 missed:crates/luabox-types/src/env.rs:301:27: replace > with >= in TypeEnv::build_from_items
 caught:crates/luabox-types/src/env.rs:1333:9: replace TypeEnv::is_class -> bool with true
 OUT
-run one_killed_waiver_is_stale_not_failure 0 "$killed" 3 "prune it" "1 stale"
+run one_killed_waiver_is_stale_not_failure 0 "$killed" 2 "prune it" "1 stale"
 
 # F1's exact shape: a waived mutant is PROVEN caught (its own line appears
 # verbatim in caught.txt, at its own position) in the same run a different,
@@ -291,7 +316,7 @@ missed:crates/luabox-types/src/env.rs:301:27: replace > with >= in TypeEnv::buil
 missed:crates/luabox-types/src/env.rs:315:19: replace > with >= in TypeEnv::build_from_items
 missed:crates/luabox-types/src/env.rs:1333:9: replace TypeEnv::is_class -> bool with true
 OUT
-run f1_caught_proof_beats_shared_key 1 "$proven_kill" 3 \
+run f1_caught_proof_beats_shared_key 1 "$proven_kill" 2 \
     "new surviving mutant" "315:19" "1 new" "0 shifted" "1 stale" \
     "!was: crates/luabox-types/src/env.rs:298:30"
 
@@ -316,7 +341,7 @@ missed:crates/luabox-types/src/env.rs:1333:9: replace TypeEnv::is_class -> bool 
 caught:crates/luabox-types/src/env.rs:915:19: replace > with >= in TypeEnv::build_from_items
 missed:crates/luabox-types/src/env.rs:305:11: replace > with >= in TypeEnv::build_from_items
 OUT
-run r18_killed_and_shifted_beats_shared_key 1 "$killed_and_shifted" 3 \
+run r18_killed_and_shifted_beats_shared_key 1 "$killed_and_shifted" 2 \
     "new surviving mutant" "305:11" "1 new" "0 shifted" "1 stale" "prune it" \
     "!was: crates/luabox-types/src/env.rs:298:30" \
     "!now: crates/luabox-types/src/env.rs:305:11"
@@ -343,7 +368,7 @@ missed:crates/luabox-types/src/env.rs:301:27: replace > with >= in TypeEnv::buil
 missed:crates/luabox-types/src/env.rs:1333:9: replace TypeEnv::is_class -> bool with true
 OUT
 export STUB_SKIP_OUTCOME_FILES="caught"
-run caught_file_missing_fails_loudly 1 "$steady_no_caught" 3 \
+run caught_file_missing_fails_loudly 1 "$steady_no_caught" 2 \
     "did not write" "caught.txt" "!all reviewed"
 unset STUB_SKIP_OUTCOME_FILES
 
@@ -366,7 +391,7 @@ missed:crates/luabox-types/src/env.rs:323:27: replace > with >= in TypeEnv::buil
 missed:crates/luabox-types/src/env.rs:320:30: replace > with >= in TypeEnv::build_from_items
 OUT
 crossed_log="$work/pass2_pairing.log"
-STUB_OUTCOMES="$crossed" STUB_EXIT=3 \
+STUB_OUTCOMES="$crossed" STUB_EXIT=2 \
     FILES="$scope" ALLOWLIST="$crossed_allowlist" SCOPE_OF_RECORD="$scope" MUTANTS_OUT="$work/out-pass2-pairing" \
     bash "$gate" >"$crossed_log" 2>&1
 crossed_exit=$?
@@ -401,7 +426,7 @@ missed:crates/luabox-types/src/env.rs:320:30: replace > with >= in TypeEnv::buil
 missed:crates/luabox-types/src/env.rs:323:27: replace > with >= in TypeEnv::build_from_items
 OUT
 reversed_log="$work/pass2_waived_side_sort.log"
-STUB_OUTCOMES="$reversed" STUB_EXIT=3 \
+STUB_OUTCOMES="$reversed" STUB_EXIT=2 \
     FILES="$scope" ALLOWLIST="$reversed_allowlist" SCOPE_OF_RECORD="$scope" MUTANTS_OUT="$work/out-waived-sort" \
     bash "$gate" >"$reversed_log" 2>&1
 reversed_exit=$?
@@ -442,7 +467,7 @@ missed:crates/luabox-types/src/env.rs:106:1: replace TypeEnv::is_class -> bool w
 missed:crates/luabox-types/src/env.rs:900:1: replace > with >= in TypeEnv::build_from_items
 OUT
 key_log="$work/key_is_load_bearing.log"
-STUB_OUTCOMES="$key_outcomes" STUB_EXIT=3 \
+STUB_OUTCOMES="$key_outcomes" STUB_EXIT=2 \
     FILES="$scope" ALLOWLIST="$key_allowlist" SCOPE_OF_RECORD="$scope" MUTANTS_OUT="$work/out-key-load-bearing" \
     bash "$gate" >"$key_log" 2>&1
 key_exit=$?
@@ -506,7 +531,7 @@ run whole_allowlist_stale_fails 1 "$elsewhere" 0 "went stale in one run" "wrong 
 # this case's exit code and its one positive needle without the line under
 # test ever running.
 FILES_OVERRIDE="crates/luabox-types/src/renamed_by_a_refactor.rs" \
-    run missing_scope_file_fails 1 "$steady" 3 "scoped file does not exist" \
+    run missing_scope_file_fails 1 "$steady" 2 "scoped file does not exist" \
     "!narrows the audit below the scope of record" \
     "!waives mutants in a file this run's scope does not audit"
 
@@ -523,7 +548,7 @@ FILES_OVERRIDE="crates/luabox-types/src/renamed_by_a_refactor.rs" \
 # passes, so its absence is the one thing that specifically proves the exit
 # happened there and cargo-mutants was never reached.
 ALLOWLIST_OVERRIDE="$work/does-not-exist.txt" \
-    run missing_allowlist_fails 1 "$steady" 3 "no allowlist at" "!report directory:" "!new surviving mutant"
+    run missing_allowlist_fails 1 "$steady" 2 "no allowlist at" "!report directory:" "!new surviving mutant"
 
 # F4: a scope naming a file that EXISTS but excludes a file the allowlist
 # waives mutants in must fail before spending the run — not silently audit a
@@ -535,7 +560,7 @@ ALLOWLIST_OVERRIDE="$work/does-not-exist.txt" \
 # scope-of-record narrowing itself is exercised by its own case below.
 FILES_OVERRIDE="crates/luabox-types/src/defs.rs" \
     SCOPE_OF_RECORD_OVERRIDE="crates/luabox-types/src/defs.rs" \
-    run scope_excludes_a_waived_file_fails 1 "$steady" 3 \
+    run scope_excludes_a_waived_file_fails 1 "$steady" 2 \
     "the allowlist waives mutants in a file this run's scope does not audit" \
     "crates/luabox-types/src/env.rs"
 
@@ -551,7 +576,7 @@ FILES_OVERRIDE="crates/luabox-types/src/defs.rs" \
 # documented surface takes, regardless of what the allowlist references.
 FILES_OVERRIDE="crates/luabox-types/src/env.rs" \
     SCOPE_OF_RECORD_OVERRIDE="crates/luabox-types/src/env.rs,crates/luabox-types/src/defs.rs,crates/luabox-types/src/generics.rs,crates/luabox-types/src/infer/reify.rs" \
-    run scope_of_record_narrowing_fails 1 "$steady" 3 \
+    run scope_of_record_narrowing_fails 1 "$steady" 2 \
     "narrows the audit below the scope of record" \
     "crates/luabox-types/src/defs.rs" \
     "!the allowlist waives mutants in a file this run's scope does not audit"
@@ -569,7 +594,7 @@ mkdir -p "$relout_dir"
 relout_log="$work/relative-mutants-out.log"
 (
     cd "$relout_dir" || exit 1
-    STUB_OUTCOMES="$steady" STUB_EXIT=3 \
+    STUB_OUTCOMES="$steady" STUB_EXIT=2 \
         FILES="$scope" ALLOWLIST="$allowlist" SCOPE_OF_RECORD="$scope" MUTANTS_OUT="relout" \
         bash "$gate" >"$relout_log" 2>&1
 )
@@ -630,13 +655,44 @@ else
     fail=$((fail + 1))
 fi
 
-# The `case "$status"` arms and the `:83-84` propagation: a real crash (OOM,
-# a panic, a killed process) is neither 3 (missed) nor 4 (timeout-only), and
-# the gate's own exit code must be the propagated status, not a fixed 1 —
-# 137 (128+SIGKILL) is what an OOM-killed cargo-mutants would report, and is
-# far enough from every other exit code in this file that a gate which
-# always exits 1 on error cannot pass this by accident.
+# The `case "$status"` catch-all arm and its propagation: a real crash (OOM,
+# a panic, a killed process) is none of the four measured shapes (0/2/3
+# judgeable, 4 baseline-failed), and the gate's own exit code must be the
+# propagated status, not a fixed 1 — 137 (128+SIGKILL) is what an OOM-killed
+# cargo-mutants would report, and is far enough from every other exit code in
+# this file that a gate which always exits 1 on error cannot pass this by
+# accident.
 run status_137_propagates 137 "$steady" 137 "cargo-mutants failed with exit 137"
+
+# The 4 arm specifically (2026-08-09): cargo-mutants exits 4 when the
+# UNMUTATED baseline fails to build or test — and still writes all four
+# outcome files, all EMPTY (measured, probe D). Under the old `0|3|4` arm that
+# fell straight through to the generated==0 branch, which in IN_DIFF mode
+# prints "OK — the diff touches nothing mutable" and exits 0: a tree whose
+# tests do not even compile reading as a green PR gate. Both modes are pinned
+# here because only the IN_DIFF one had the exit-0 sink; the non-IN_DIFF one
+# would have failed anyway, but with the WRONG diagnosis ("the run generated 0
+# mutants" points at the scope, not at the baseline), which is why the
+# `!generated 0 mutants` needle rides both. Proven by restoring `0 | 2 | 3 | 4)`
+# in mutants-gate.sh: the IN_DIFF case flips to exit 0 and the non-IN_DIFF
+# case to the 0-mutants message, and both needles below miss.
+run baseline_failure_fails_loudly 1 "$empty" 4 \
+    "baseline build/test failed, nothing was measured" \
+    "the UNMUTATED tree does not build" \
+    "!generated 0 mutants" "!all reviewed"
+
+in_diff_file="$work/pr.diff"
+cat >"$in_diff_file" <<'DIFF'
+--- a/crates/luabox-types/src/env.rs
++++ b/crates/luabox-types/src/env.rs
+@@ -298,7 +298,7 @@
+-    if a > b {
++    if a >= b {
+DIFF
+IN_DIFF_OVERRIDE="$in_diff_file" \
+    run baseline_failure_fails_loudly_in_diff_mode 1 "$empty" 4 \
+    "baseline build/test failed, nothing was measured" \
+    "!touches nothing mutable in scope" "!generated 0 mutants"
 
 # N33 (#58 review round 5): five load-bearing lines the earlier cases above
 # never exercised, found by deleting each of mutants-gate.sh's 232 non-
@@ -682,7 +738,7 @@ fi
 # the stub ignores every argument except -o. Reuses the ordinary $scope
 # fixture and pins the flag for it by name.
 file_args_log="$work/file_args.log"
-STUB_OUTCOMES="$steady" STUB_EXIT=3 \
+STUB_OUTCOMES="$steady" STUB_EXIT=2 \
     FILES="$scope" ALLOWLIST="$allowlist" SCOPE_OF_RECORD="$scope" MUTANTS_OUT="$work/out-file-args" \
     bash "$gate" >"$file_args_log" 2>&1
 if grep -qF -- "cargo mutants -p luabox-types --file crates/luabox-types/src/env.rs" "$file_args_log"; then
@@ -715,7 +771,7 @@ missed:crates/luabox-types/src/env.rs:20:1: replace TypeEnv::is_class -> bool wi
 missed:crates/luabox-types/src/env.rs:95:1: replace TypeEnv::is_class -> bool with true
 OUT
 sortpos_log="$work/sortpos_zero_pads_numerically.log"
-STUB_OUTCOMES="$sortpos_outcomes" STUB_EXIT=3 \
+STUB_OUTCOMES="$sortpos_outcomes" STUB_EXIT=2 \
     FILES="$scope" ALLOWLIST="$sortpos_allowlist" SCOPE_OF_RECORD="$scope" MUTANTS_OUT="$work/out-sortpos" \
     bash "$gate" >"$sortpos_log" 2>&1
 sortpos_exit=$?
@@ -766,7 +822,7 @@ caught:crates/luabox-types/src/env.rs:999:1: replace TypeEnv::is_class -> bool w
 missed:crates/luabox-types/src/env.rs:70:1: replace TypeEnv::is_class -> bool with true
 OUT
 ALLOWLIST_OVERRIDE="$take0_allowlist" \
-    run pass0_retires_lowest_position_first 0 "$take0_outcomes" 3 \
+    run pass0_retires_lowest_position_first 0 "$take0_outcomes" 2 \
     "1 stale" \
     "PROBABLY no longer survives" "position-rank pick, not individual proof" \
     "crates/luabox-types/src/env.rs:50:1" \
@@ -808,7 +864,7 @@ caught:crates/luabox-types/src/env.rs:999:1: replace TypeEnv::is_class -> bool w
 missed:crates/luabox-types/src/env.rs:90:1: replace TypeEnv::is_class -> bool with true
 OUT
 ALLOWLIST_OVERRIDE="$descending_allowlist" \
-    run pass0_tie_break_sort_is_load_bearing_on_descending_allowlist 0 "$descending_outcomes" 3 \
+    run pass0_tie_break_sort_is_load_bearing_on_descending_allowlist 0 "$descending_outcomes" 2 \
     "1 stale" \
     "PROBABLY no longer survives" "position-rank pick, not individual proof" \
     "crates/luabox-types/src/env.rs:20:1" \
@@ -861,5 +917,104 @@ else
     sed 's/^/        /' "$sort_log" >&2
     fail=$((fail + 1))
 fi
+
+# ---------------------------------------------------------------------------
+# IN_DIFF mode (2026-08-09). `mutants-pr` (.github/workflows/mutants.yml) is
+# the only BLOCKING mutation job on the merge path, and it is the only caller
+# that sets IN_DIFF — yet until this block not one case in this file ever set
+# it, so all four of the branches the flag exists to switch shipped with zero
+# coverage. Three of them are exit-0 paths, which is the worst possible
+# combination: a bug in any of them is a green PR gate.
+# ---------------------------------------------------------------------------
+
+# The guard on the flag's own input. A CI job that computes the diff path
+# wrongly (an empty base ref, a path relative to the wrong cwd) must fail
+# here, not pass the nonexistent path to cargo-mutants — which accepts
+# `--in-diff` against a file it cannot read by erroring out with a code this
+# gate would then propagate as an opaque crash. `!bounded to a diff` is the
+# load-bearing needle: the "does not exist" echo sits BEFORE the target exit,
+# so it survives the line's deletion; the command-line echo that names the
+# diff only ever runs after it.
+IN_DIFF_OVERRIDE="$work/no-such.diff" \
+    run in_diff_missing_file_fails 1 "$steady" 2 \
+    "IN_DIFF names a diff file that does not exist" \
+    "!bounded to a diff" "!all reviewed"
+
+# The exit-0 path the baseline_failure case above shares a sink with, in its
+# LEGITIMATE form: a PR whose diff genuinely touches nothing mutable in scope.
+# This must stay exit 0 (a docs-only PR cannot be made to fail the mutation
+# gate), and must NOT print the full-scope "generated 0 mutants" failure —
+# which is what the branch would collapse to if the `[ -n "$in_diff" ]` test
+# guarding it were deleted.
+IN_DIFF_OVERRIDE="$in_diff_file" \
+    run in_diff_zero_generated_is_ok 0 "$empty" 0 \
+    "touches nothing mutable in scope" "nothing to audit this run" \
+    "!generated 0 mutants" "!nothing was audited"
+
+# A waived line with no live evidence in a diff-bounded run is NOT proven
+# dead: the run never attempted it. Reporting it as "a test now kills it —
+# prune it" would walk a reviewer into deleting a reviewed waiver for a
+# survivor that is still alive and simply outside the PR's hunks. The fixture
+# stages 298:30 and 301:27 live and 1333:9 absent with NO caught.txt entry, so
+# the residual line has no evidence of any kind — the exact shape the diff
+# bound produces. Both wordings are asserted, the per-line NOTE and the
+# summary's stale_label, because they are two independent lines
+# (mutants-gate.sh's STALE case and its `stale_label` assignment) and either
+# can rot without the other.
+in_diff_stale="$work/in-diff-stale.txt"
+cat >"$in_diff_stale" <<'OUT'
+missed:crates/luabox-types/src/env.rs:298:30: replace > with >= in TypeEnv::build_from_items
+missed:crates/luabox-types/src/env.rs:301:27: replace > with >= in TypeEnv::build_from_items
+OUT
+IN_DIFF_OVERRIDE="$in_diff_file" \
+    run in_diff_untouched_waiver_is_not_measured_not_pruned 0 "$in_diff_stale" 2 \
+    "not touched by this diff-bounded run" "do not prune from this alone" \
+    "not measured, not pruned" \
+    "!prune it" "!1 stale allowlist line(s)"
+
+# The total-staleness FAIL is the gate's scope-drift alarm, and it is
+# DELIBERATELY skipped under IN_DIFF: a small diff touching none of the waived
+# lines makes 100% staleness the ordinary outcome, not evidence of a
+# misaimed audit. Same fixture as whole_allowlist_stale_fails above, which
+# pins the alarm firing at full scope — this case pins it silent under the
+# flag, so the pair discriminates the `[ -z "$in_diff" ]` conjunct
+# specifically rather than the guard as a whole. Delete that conjunct from
+# mutants-gate.sh and this case goes RED (exit 1, "went stale in one run"),
+# while whole_allowlist_stale_fails stays green: every mutants-pr run over a
+# diff that misses the allowlist would fail the PR.
+IN_DIFF_OVERRIDE="$in_diff_file" \
+    run in_diff_skips_total_staleness_fail 0 "$elsewhere" 0 \
+    "not measured, not pruned" "OK" \
+    "!went stale in one run" "!wrong scope"
+
+# ---------------------------------------------------------------------------
+# selftest-lib.sh's own report guard (decisions/12 §2: a guard with no
+# discriminating case is a decoration). `selftest_report` returns
+# `fail -eq 0 && pass -gt 0`; the second conjunct is what stops a suite whose
+# cases all silently vanished — a corpus wiring break, a helper rename — from
+# exiting 0 on "0 passed, 0 failed". Nothing in this directory could exercise
+# it, because every suite that sources the library runs at least one case
+# before reporting. A child bash that sources the library and reports having
+# run NOTHING can, and costs one process.
+#
+# Both halves are asserted so the case discriminates the conjunct rather than
+# the function: with `[ "$pass" -gt 0 ]` deleted the zero-case run exits 0 and
+# the first assertion goes RED; the one-case control stays green either way
+# and proves the empty-suite failure is not simply "selftest_report always
+# fails".
+# ---------------------------------------------------------------------------
+lib_zero_log="$work/selftest_lib_zero_cases.log"
+bash -c 'set -u; source "$1"; selftest_report "empty-suite"' _ "$here/selftest-lib.sh" \
+    >"$lib_zero_log" 2>&1
+lib_zero_exit=$?
+assert_exit selftest_report_fails_a_suite_that_ran_no_cases 1 "$lib_zero_exit" "$lib_zero_log" \
+    "empty-suite: 0 passed, 0 failed"
+
+lib_one_log="$work/selftest_lib_one_case.log"
+bash -c 'set -u; source "$1"; check control ok ok; selftest_report "one-case-suite"' _ "$here/selftest-lib.sh" \
+    >"$lib_one_log" 2>&1
+lib_one_exit=$?
+assert_exit selftest_report_passes_a_suite_that_ran_one_case 0 "$lib_one_exit" "$lib_one_log" \
+    "one-case-suite: 1 passed, 0 failed"
 
 selftest_report "mutants-gate-selftest"

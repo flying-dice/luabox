@@ -542,11 +542,16 @@ run luabox_zero_exit_clean_control_passes 0 "$exit_zero_clean_corpus" \
 # droppable, and a case can override it.
 # ============================================================================
 
-# 25: the DEFAULT manifest's `strict = true` line survives into what the
-# stub actually saw. Before M60, this line was written by an unprotected
-# printf nothing ever read back — deleting it left every case in this file
-# green. The stub now dumps luabox.toml verbatim; assert the line is really
-# in there.
+# 25: the DEFAULT manifest's `strict = true` line survives into what was
+# actually written to disk. Before M60, this line was written by an
+# unprotected printf nothing ever read back — deleting it left every case in
+# this file green. The reader is the DRIVER, not the stub (an earlier
+# revision of this comment said "the stub now dumps luabox.toml verbatim",
+# contradicting the stub's own header three hundred lines up, which is
+# explicit that it never opens the manifest at all):
+# verdict-differential.sh's write_case_manifest echoes a whitespace-collapsed
+# dump of what it wrote to its OWN stdout, per case, so the assertion holds
+# whether the binary under test is the stub or the real luabox.
 default_manifest_corpus="$(newcorpus default-manifest)"
 cat >"$default_manifest_corpus/only_case.lua" <<'LUA'
 -- STUB-LUABOX-DIAG: LB0300
@@ -617,5 +622,67 @@ printf '# case\tverdict\tcodes\tnote\ncarrier\tdiag\tLB0300,LB0306\tblank lines 
 run deps_blank_line_is_skipped 0 "$deps_blank_line_corpus" \
     "match expected.tsv" \
     "!luabox codes are"
+
+# ============================================================================
+# 29: the case-NAME path-traversal guard in write_case_manifest. copy_sidecar
+# has refused `*/*|.|..` in a sidecar's CONTENTS since F27; column 1 of
+# expected.tsv is the same class of PR-authored input feeding the same class
+# of path (`$corpus/<case>.toml`, `$corpus/<case>.lua`) and was unguarded.
+# The row below names a case OUTSIDE the corpus directory — a real file, so
+# the case cannot pass merely because the path does not resolve: without the
+# guard the driver copies $work/escape-target.lua in as main.lua and measures
+# it, reporting the traversal as an ordinary code mismatch (or, with a
+# matching row, as a clean PASS). `!STUB-ESCAPE` is the discriminating needle:
+# that marker's code only reaches the log if the outside file was actually
+# read.
+cat >"$work/escape-target.lua" <<'LUA'
+-- STUB-LUABOX-DIAG: LB0399
+LUA
+traversal_corpus="$(newcorpus case-name-traversal)"
+cat >"$traversal_corpus/only_case.lua" <<'LUA'
+-- a legitimate sibling row, so the corpus is not empty
+LUA
+printf '# case\tverdict\tcodes\tnote\nonly_case\tclean\t-\tcontrol\n../escape-target\tdiag\tLB0399\ttraversal attempt\n' \
+    >"$traversal_corpus/expected.tsv"
+run case_name_path_traversal_is_refused 1 "$traversal_corpus" \
+    "unsafe case name" "no path separators" \
+    "!LB0399"
+
+# ============================================================================
+# 30: the orphan-sidecar sweep. A `.toml`, `.deps` or `.defs` whose case was
+# renamed stays on disk and is never opened again — for a `.toml` that means
+# the case silently reverts to default_manifest while its row keeps passing,
+# which is the unclaimed-*.lua defect on a file kind that sweep cannot see.
+# The corpus below is otherwise entirely healthy (its one row measures and
+# matches), so the only thing that can fail it is the new sweep: `!luabox
+# codes are` and `!has no row for it` prove no measurement or *.lua-sweep
+# failure is standing in for it. Deleting the sweep leaves this corpus green
+# at exit 0.
+orphan_corpus="$(newcorpus orphan-sidecar)"
+cat >"$orphan_corpus/only_case.lua" <<'LUA'
+-- STUB-LUABOX-DIAG: LB0300
+LUA
+printf 'strict = false\n' >"$orphan_corpus/renamed_away.toml"
+printf '# case\tverdict\tcodes\tnote\nonly_case\tdiag\tLB0300\tcontrol\n' \
+    >"$orphan_corpus/expected.tsv"
+run orphan_toml_sidecar_is_refused 1 "$orphan_corpus" \
+    "renamed_away.toml exists in the corpus" "silent no-op override" \
+    "!luabox codes are" "!has no row for it"
+
+# The same sweep on a `.defs` orphan — a different glob arm of the same loop,
+# and the one whose absence is quietest of all (a case whose ambient defs
+# package stopped being copied still typechecks, just against nothing).
+orphan_defs_corpus="$(newcorpus orphan-defs)"
+cat >"$orphan_defs_corpus/only_case.lua" <<'LUA'
+-- STUB-LUABOX-DIAG: LB0300
+LUA
+cat >"$orphan_defs_corpus/ambient.d.lua" <<'LUA'
+-- an ambient package no surviving case names
+LUA
+printf 'ambient.d.lua\n' >"$orphan_defs_corpus/renamed_away.defs"
+printf '# case\tverdict\tcodes\tnote\nonly_case\tdiag\tLB0300\tcontrol\n' \
+    >"$orphan_defs_corpus/expected.tsv"
+run orphan_defs_sidecar_is_refused 1 "$orphan_defs_corpus" \
+    "renamed_away.defs exists in the corpus" "silent no-op override"
 
 selftest_report verdict-differential-selftest

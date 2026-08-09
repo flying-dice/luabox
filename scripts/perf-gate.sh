@@ -100,7 +100,7 @@ source "$repo_root/scripts/perf-gate-lib.sh"
 
 factor="${LUABOX_PERF_FACTOR:-1.0}"
 
-# The nine budget constants below (cold start through rss_budget_mib) used
+# The budget constants below (cold start through rss_budget_mib) used
 # to be hand-carried here AND in perf-gate.ps1 with no shared source — one
 # rule, two copies, free to drift (#58 review round 6, M50). They now live
 # once, with their calibration rationale, in perf-gate-budgets.env; this is

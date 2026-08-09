@@ -77,8 +77,8 @@ pub use defs::{
     Ambient, DefFile, alias_collisions, build_ambient, build_ambient_checked, stdlib as stdlib_defs,
 };
 pub use directive::{
-    RULE_CLASS_ANCESTRY_TOO_COSTLY, RULE_CLASS_ANCESTRY_TOO_DEEP, RULE_CYCLIC_CLASS_ANCESTRY,
-    parse_directive_body,
+    DirectiveScan, RULE_CLASS_ANCESTRY_TOO_COSTLY, RULE_CLASS_ANCESTRY_TOO_DEEP,
+    RULE_CYCLIC_CLASS_ANCESTRY, parse_directive_body,
 };
 pub use env::{FileTypes, MAX_ANCESTRY_DEPTH, TypeEnv};
 pub use infer::{ExternalTypes, InferredBinding, InferredReturn};
@@ -549,6 +549,7 @@ pub fn check_file_with_artifacts_and_sources<S: std::hash::BuildHasher>(
         file,
         strictness,
         edition,
+        ambient,
         requires,
         artifacts,
         other_sources,
@@ -581,6 +582,7 @@ fn check_file_from_env<S: std::hash::BuildHasher>(
     file: &str,
     strictness: Strictness,
     edition: lua::Dialect,
+    ambient: Option<&Ambient>,
     requires: &HashMap<String, Ty, S>,
     artifacts: &FileArtifacts,
     other_sources: Option<SourceResolver<'_>>,
@@ -644,7 +646,12 @@ fn check_file_from_env<S: std::hash::BuildHasher>(
         // Duplicate `---@field` on one class (luals `duplicate-doc-field`,
         // LB0311) — a per-file doc-consistency finding, so it is emitted here
         // alongside the type diagnostics and suppressed under `None` like them.
-        diags.extend(check::duplicate_doc_fields(items, file));
+        // `ambient` matters to the key identity: a defs-declared alias in an
+        // indexer key must collide with its expansion, and only the ambient
+        // layer can resolve it (`duplicate_doc_fields_with_ambient`'s doc).
+        diags.extend(check::duplicate_doc_fields_with_ambient(
+            items, file, ambient,
+        ));
     }
 
     // Honor luals' `---@diagnostic disable*: <rule>` for the checker

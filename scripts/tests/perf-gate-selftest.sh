@@ -216,7 +216,22 @@ fi
 # process that allocates and touches that many MiB before exiting (`exec`,
 # not a subshell, so the allocation is attributed to the exact process
 # scripts/peak-rss.py waits on — a subshell's usage would not be).
-if [ -n "${PERF_GATE_SELFTEST_SKIP_BEHAVIORAL:-}" ]; then
+# PERF_GATE_SELFTEST_SKIP_BEHAVIORAL drops Part 2 — every case that runs
+# perf-gate.sh for real, which is where the seconds go and where all ten
+# threshold comparisons are actually proven load-bearing. It exists for local
+# iteration on Part 1 alone.
+#
+# It does NOT produce a pass (decisions/12 §3, local merge-gate finding): the
+# earlier version of this switch dropped a third of the suite and still let
+# the run exit 0 with a clean "N passed, 0 failed" line — a green verdict
+# over a suite whose behavioural half never ran, which is the same
+# absence-of-signal-as-coverage shape this whole file exists to catch in
+# perf-gate.sh. The final verdict below is PARTIAL and the exit code is
+# nonzero whenever this variable is set, so the only way to get a green
+# perf-gate-selftest is to actually run all of it. perf-gate-selftest.ps1
+# carries the identical rule for the identical variable.
+skip_behavioral="${PERF_GATE_SELFTEST_SKIP_BEHAVIORAL:-}"
+if [ -n "$skip_behavioral" ]; then
     echo "SKIP  Part 2 (behavioural perf-gate.sh runs) — PERF_GATE_SELFTEST_SKIP_BEHAVIORAL set"
 else
 
@@ -469,4 +484,31 @@ STUB_RETAINED_RSS_MIB=5
 
 fi # PERF_GATE_SELFTEST_SKIP_BEHAVIORAL
 
+# The gate on the skip switch itself. Re-invokes THIS file with
+# PERF_GATE_SELFTEST_SKIP_BEHAVIORAL set and requires the child to refuse to
+# call itself green: nonzero exit, PARTIAL verdict, and the "0 failed" line
+# still printed (so the count stays readable — what is withheld is the
+# VERDICT, not the data). Only run when the variable is NOT already set, or
+# the child would spawn a grandchild and so on without bound; that guard is
+# also why the child's own copy of this case is silently absent rather than
+# skipped noisily. Costs one Part-1-only run (milliseconds).
+if [ -z "$skip_behavioral" ]; then
+    partial_log="$work/skip-behavioral-partial.log"
+    PERF_GATE_SELFTEST_SKIP_BEHAVIORAL=1 bash "$0" >"$partial_log" 2>&1
+    partial_exit=$?
+    assert_exit skip_behavioral_refuses_to_report_a_full_pass 1 "$partial_exit" "$partial_log" \
+        "PARTIAL — behavioural cases skipped (local-iteration mode)" \
+        "SKIP  Part 2" "0 failed" "!ALL GATES PASSED"
+fi
+
 selftest_report "perf-gate-selftest"
+report_status=$?
+if [ -n "$skip_behavioral" ]; then
+    echo "perf-gate-selftest: PARTIAL — behavioural cases skipped (local-iteration mode)"
+    echo "perf-gate-selftest:   PERF_GATE_SELFTEST_SKIP_BEHAVIORAL was set, so every case that runs"
+    echo "perf-gate-selftest:   perf-gate.sh for real was dropped — the counts above are Part 1 only and"
+    echo "perf-gate-selftest:   are not evidence that the gate's threshold comparisons are load-bearing."
+    echo "perf-gate-selftest:   Re-run without the variable before treating this suite as green."
+    exit 1
+fi
+exit "$report_status"

@@ -3585,18 +3585,32 @@ fn a_watched_delete_of_a_require_target_stops_it_resolving() {
 }
 
 #[test]
-fn a_watched_change_to_an_open_document_does_not_republish() {
-    // The editor overlay wins over disk, so re-reading disk changes nothing
-    // visible and the server stays quiet for that document.
+fn a_watched_change_to_an_open_document_republishes_from_the_overlay_not_disk() {
+    // The editor overlay wins over disk: re-reading disk cannot change what
+    // an open buffer's diagnostics are computed from.
+    //
+    // It does change what they are computed *against* — the workspace type
+    // surface every open document was last checked with — so the batch
+    // republishes every open document once (production readiness review,
+    // finding 2), the same way a DELETED batch already did. This test used
+    // to assert the server stayed silent for `mod.lua`, which conflated the
+    // two: the overlay winning is about the *content* of the answer, not
+    // about whether an answer is sent. Disk now holds the clean text; the
+    // republished set must still carry the overlay's error.
     let client = start(&[("mod.lua", TYPE_OK)]);
     let mod_uri = client.uri("mod.lua");
     assert_eq!(client.open(&mod_uri, TYPE_ERROR).len(), 1);
     std::fs::write(client.root.join("mod.lua"), TYPE_OK).expect("rewrite");
     client.notify_watched_change("mod.lua");
 
-    let other = client.uri("other.lua");
-    client.open_async(&other, TYPE_OK);
-    assert_eq!(client.next_diagnostics().uri.as_str(), other.as_str());
+    let republished = client.next_diagnostics();
+    assert_eq!(republished.uri.as_str(), mod_uri.as_str());
+    assert_eq!(
+        republished.diagnostics.len(),
+        1,
+        "the overlay's erroneous text, not the clean text now on disk: {:?}",
+        republished.diagnostics
+    );
     client.shutdown();
 }
 

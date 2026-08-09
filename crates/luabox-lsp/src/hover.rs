@@ -12,6 +12,7 @@ use luabox_types::ty::Ty;
 use rowan::TextRange;
 
 use crate::merged_ambient::MergedAmbient;
+use crate::render::OwnParamErasure;
 use crate::requires::{self, RequireExports};
 use crate::sema::{self, FileSema};
 
@@ -165,17 +166,21 @@ fn member_hover(
         // reference at its use site (#48): `Box<number>`'s `item` hovers
         // `number`, not the free `T` a bare-name lookup would leave it as.
         // A *bare* reference's own free parameter (M21, round 6 review) is
-        // separately erased to `unknown` below, in `erase_unbound_own_param`
+        // separately erased to `unknown` through `render::OwnParamErasure`
         // — matching `TypeEnv::class_shape_bound_export`'s erasure, which
-        // this member route used to skip.
+        // this member route used to skip. That renderer is shared with
+        // completion and signature help now, so all three agree about the
+        // same field of the same reference (production readiness review,
+        // finding 3).
         if let Some(ty) = requires::receiver_type(sema, exports, binding)
             && let Some(class) = sema::named_of(&ty)
             && let Some(shape) = ambient.class_members_of(&ty)
         {
             if let Some(field) = shape.fields.get(member.text()) {
                 let q = if field.optional { "?" } else { "" };
-                let rendered =
-                    erase_unbound_own_param(&ty, &field.ty, &class, analysis, &sema.path, ambient);
+                let erasure =
+                    OwnParamErasure::at_reference(&ty, &class, analysis, &sema.path, ambient);
+                let rendered = erasure.render(&field.ty);
                 let code = format!("(field) {class}.{}{q}: {rendered}", member.text());
                 let docs = sema::locate_field(
                     analysis,
@@ -236,51 +241,6 @@ fn member_hover(
         member.text_range(),
         sema,
     ))
-}
-
-/// Render a resolved class field's type the way `luabox check` does for a
-/// **bare** (unbound, no `<...>` arguments) generic reference (M21, round 6
-/// review): the checker erases `class`'s own free trailing type parameters
-/// to `unknown` at the exact reference site
-/// (`TypeEnv::class_shape_bound_export`), so a bare `---@type Box` on
-/// `---@class Box<T> / ---@field item T` renders `item: unknown`, not the
-/// literal `item: T` a plain, non-erasing lookup leaves it as. `field_ty`
-/// renders unchanged (via its `Display` impl) whenever the reference is
-/// bound (`args` non-empty — the checker's own monomorphisation already
-/// substituted a real type there, #48) or is not itself exactly one of
-/// `class`'s own declared parameters — see [`sema::class_own_params`]'s doc
-/// for the narrower, single-level approximation this uses in place of the
-/// checker's own (unreachable from this crate) erasing accessor.
-fn erase_unbound_own_param(
-    ty: &luabox_syntax::luacats::TypeExpr,
-    field_ty: &Ty,
-    class: &str,
-    analysis: &Analysis,
-    current: &std::path::Path,
-    ambient: &MergedAmbient,
-) -> String {
-    let luabox_syntax::luacats::TypeExprKind::Named { args, .. } = &ty.kind else {
-        return field_ty.to_string();
-    };
-    if !args.is_empty() {
-        return field_ty.to_string();
-    }
-    let Ty::Named(name) = field_ty else {
-        return field_ty.to_string();
-    };
-    let own_params = sema::class_own_params(
-        analysis,
-        current,
-        class,
-        ambient.ambient_paths(),
-        ambient.sema_cache(),
-        ambient.search_order_cache(),
-    );
-    if own_params.iter().any(|p| p == name) {
-        "unknown".to_string()
-    } else {
-        field_ty.to_string()
-    }
 }
 
 /// Hover for a global name: an annotated/declared function or a class name.

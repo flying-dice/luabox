@@ -1287,6 +1287,44 @@ code or a mistake — a cycle written as a chain, or a generator emitting one
 class per row. Flatten the hierarchy, or declare the members you actually
 read on a class nearer the leaf. A genuine cycle (`A : B`, `B : A`) is
 LB0318, not this, and terminates safely on its own.
+
+**Escape hatches.** `[types] strict = false` downgrades it to a warning, and
+`---@diagnostic disable[-line|-next-line]: class-ancestry-too-deep`
+suppresses it. Both silence the diagnostic without restoring the missing
+members — the walk still stops at the limit.
+
+**Where the directive goes: the file that DECLARES the class**, not the file
+that reads it. The diagnostic is anchored at the `---@class` line the message
+names, so that is the line a directive has to reach:
+
+```lua
+-- shapes.lua — the file that DECLARES C201
+---@diagnostic disable-next-line: class-ancestry-too-deep
+---@class C201 : C200
+```
+
+```lua
+-- main.lua — the file that merely READS it: this does nothing
+---@diagnostic disable-next-line: class-ancestry-too-deep
+---@type C201
+local c = {}
+```
+
+This holds across files: a class another project file declares is suppressed
+from *that* file, not from the one whose check reported it.
+
+**The exception: a class declared only in a `[types] defs` package.** Nothing
+in the project declares it, and a definition package's own comments are never
+scanned for directives, so there is no declaration line to reach. The
+diagnostic attaches to **line 1 of each consuming file** instead, and that is
+where the directive goes — a file-wide `---@diagnostic disable:
+class-ancestry-too-deep` at the top, or a `disable-line` on line 1 itself:
+
+```lua
+---@diagnostic disable: class-ancestry-too-deep
+---@type C201   -- C201 comes from defs/, not from this project
+local c = {}
+```
 ";
 
 const LB0318: &str = "\
@@ -1323,6 +1361,25 @@ to a warning, and `---@diagnostic disable[-line|-next-line]:
 cyclic-class-ancestry` suppresses it. The rule name is luabox's own rather
 than a luals one, for the same reason LB0317's is: luals has no counterpart
 to name.
+
+**Where the directive goes: the file that DECLARES the class**, not the file
+that reads it — the diagnostic is anchored at the `---@class` line the
+message names, and every class the cycle reaches is named separately, so a
+mutual `A : B` / `B : A` spanning two files needs the directive in both:
+
+```lua
+-- node.lua — where `Node` is declared
+---@diagnostic disable-next-line: cyclic-class-ancestry
+---@class Node : Node
+```
+
+A directive in a file that merely *reads* `Node` does nothing.
+
+**The exception: a class declared only in a `[types] defs` package.** Nothing
+in the project declares it, and a definition package's own comments are never
+scanned for directives, so the diagnostic attaches to **line 1 of each
+consuming file** instead. Put a file-wide `---@diagnostic disable:
+cyclic-class-ancestry` at the top of that file, or a `disable-line` on line 1.
 ";
 
 const LB0319: &str = "\
@@ -1360,6 +1417,28 @@ no repeated generic ancestor, that is a bug worth reporting.
 `---@diagnostic disable[-line|-next-line]: class-ancestry-too-costly`
 suppresses it. Both silence the diagnostic without restoring the missing
 members — the walk still stops.
+
+**Where the directive goes: the file that DECLARES the class**, not the file
+that reads it. The diagnostic is anchored at the `---@class` line the message
+names — the root of the walk, which is usually the class *at the bottom* of
+the diamond, not the shared ancestor it kept re-resolving:
+
+```lua
+-- shapes.lua — where `C1` is declared
+---@diagnostic disable-next-line: class-ancestry-too-costly
+---@class C1 : L1, R1
+```
+
+A directive in a file that merely *reads* `C1` does nothing, and this holds
+across files: a class another project file declares is suppressed from *that*
+file.
+
+**The exception: a class declared only in a `[types] defs` package.** Nothing
+in the project declares it, and a definition package's own comments are never
+scanned for directives, so the diagnostic attaches to **line 1 of each
+consuming file** instead. Put a file-wide `---@diagnostic disable:
+class-ancestry-too-costly` at the top of that file, or a `disable-line` on
+line 1.
 ";
 
 const LB0500: &str = "\

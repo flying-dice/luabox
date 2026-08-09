@@ -2153,19 +2153,35 @@ fn every_na_cell_is_documented_and_every_documented_na_row_is_a_cell() {
 /// scan cannot safely tell "this cell's own rule is first, unlike a sibling
 /// which is last" apart from an actual contradiction, and guessing wrong
 /// would make this test itself the next source of drift.
+/// The ordering claim a "who wins" prose string makes, read from its
+/// **headline** — everything before the first `(`.
+///
+/// Both this file's `Cell::winner` fields and the published matrix's Winner
+/// column state the rule first and then qualify it in parentheses ("first
+/// declaration (+ `LB0311` warning)", "**first**-listed parent (finding 6,
+/// fixed: was last-listed)"). Reading the whole string means a cell that
+/// merely *narrates* the rule it used to have reads as claiming both
+/// directions at once and gets skipped — which is how the most interesting
+/// rows, the ones whose rule changed, ended up unchecked. The headline is
+/// the claim; the parenthetical is history.
+///
+/// `None` means the headline names neither direction (a baseline resolve, an
+/// agreement case, a kind-vs-kind rule) or both (a genuinely ambiguous
+/// sentence this file will not guess at) — nothing checkable either way.
+fn claimed_direction(prose: &str) -> Option<Direction> {
+    let headline = prose.split('(').next().unwrap_or(prose).to_lowercase();
+    match (headline.contains("first"), headline.contains("last")) {
+        (true, false) => Some(Direction::First),
+        (false, true) => Some(Direction::Last),
+        _ => None,
+    }
+}
+
 #[test]
 fn winner_prose_names_the_same_direction_as_its_direction_flag() {
     let mut failures = Vec::new();
     for cell in CELLS {
-        let lower = cell.winner.to_lowercase();
-        let says_first = lower.contains("first");
-        let says_last = lower.contains("last");
-        let claimed = match (says_first, says_last) {
-            (true, false) => Some(Direction::First),
-            (false, true) => Some(Direction::Last),
-            _ => None, // neither, or both — not a single checkable claim
-        };
-        if let Some(claimed) = claimed
+        if let Some(claimed) = claimed_direction(cell.winner)
             && claimed != cell.direction
         {
             failures.push(format!(
@@ -2178,6 +2194,128 @@ fn winner_prose_names_the_same_direction_as_its_direction_flag() {
     assert!(
         failures.is_empty(),
         "{} cell(s) whose winner prose disagrees with their own direction flag:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// The **published matrix's own Winner column** must claim the same ordering
+/// rule as the [`Cell`] it names — the last unchecked half of the doc↔code
+/// contract (production readiness review).
+///
+/// [`the_published_matrix_and_the_test_table_name_the_same_fixtures`] already
+/// cross-checks the *fixture id* column both directions, and
+/// [`winner_prose_names_the_same_direction_as_its_direction_flag`] pins each
+/// cell's own prose against its own flag — but between them, nothing ever
+/// compared the doc's Winner column to `CELLS`. Editing a published cell from
+/// "first-listed" to "last-listed" changed the rule this page tells users
+/// luabox follows and left every test in this file green: the fixture ids
+/// still matched, and the cell's private `winner`/`direction` pair still
+/// agreed with each other. The page is the artifact users read; an unchecked
+/// column in it is exactly the drift `Cell::direction` was introduced to stop
+/// one level down.
+///
+/// A row is matched to cells by the fixture ids in its last column, not by
+/// its shape text — several rows deliberately group a primary fixture with
+/// repro fixtures owned by other (non-directional) cells, so the assertion is
+/// "the direction this row claims is the direction of at least one cell it
+/// names", not "of every cell it names". The converse half then closes the
+/// gap that would leave: every cell with a real ordering rule must be claimed
+/// by some row, so deleting a Winner column's direction word is a failure too,
+/// not a silent downgrade to unchecked.
+#[test]
+fn the_published_matrix_winner_column_agrees_with_each_cells_direction() {
+    const KIND_PREFIXES: &[&str] = &[
+        "field-",
+        "method-",
+        "indexer-",
+        "operator-",
+        "typeparam-",
+        "visibility-",
+    ];
+    let doc = include_str!("../../../docs/03-reference/03-class-merge-precedence.md");
+
+    let mut by_id: std::collections::HashMap<&str, &Cell> = std::collections::HashMap::new();
+    for cell in CELLS {
+        for variant in cell.variants {
+            by_id.insert(variant.fixture_id, cell);
+        }
+    }
+
+    let mut failures = Vec::new();
+    let mut claimed_rows = 0usize;
+    let mut covered: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
+
+    for line in doc.lines() {
+        if !line.starts_with('|') {
+            continue;
+        }
+        let cols: Vec<&str> = line
+            .trim_end()
+            .trim_matches('|')
+            .split('|')
+            .map(str::trim)
+            .collect();
+        // Every matrix table is `| Arrival shape | Winner | Same in develop? |
+        // Fixture id |`. Anything else — the arrival-shape glossary at the top
+        // of the page, a separator, a header — is not a cell row.
+        if cols.len() != 4 {
+            continue;
+        }
+        let ids: Vec<&str> = cols[3]
+            .split('`')
+            .filter(|token| KIND_PREFIXES.iter().any(|p| token.starts_with(p)))
+            .collect();
+        if ids.is_empty() {
+            continue;
+        }
+        let Some(claimed) = claimed_direction(cols[1]) else {
+            continue;
+        };
+        claimed_rows += 1;
+
+        let named: Vec<&Cell> = ids.iter().filter_map(|id| by_id.get(id).copied()).collect();
+        let agreeing: Vec<&&Cell> = named.iter().filter(|c| c.direction == claimed).collect();
+        if agreeing.is_empty() {
+            failures.push(format!(
+                "published row `{}` claims {claimed:?} in its Winner column, but no cell it \
+                 names resolves that way — {:?}\n  Winner column: {}",
+                cols[0],
+                named
+                    .iter()
+                    .map(|c| format!("{}/{} is {:?}", c.kind, c.shape, c.direction))
+                    .collect::<Vec<_>>(),
+                cols[1]
+            ));
+        }
+        for cell in agreeing {
+            covered.insert((cell.kind, cell.shape));
+        }
+    }
+
+    assert!(
+        claimed_rows >= 15,
+        "read only {claimed_rows} directional Winner column(s) out of the published matrix — \
+         the table's column layout changed and this parser no longer reads it, which would \
+         make this test vacuous"
+    );
+
+    for cell in CELLS
+        .iter()
+        .filter(|c| c.direction != Direction::Other && !c.variants.is_empty())
+    {
+        if !covered.contains(&(cell.kind, cell.shape)) {
+            failures.push(format!(
+                "{}/{} resolves {:?}, but no published matrix row naming its fixtures says so \
+                 in its Winner column — the page no longer states the rule this table measures",
+                cell.kind, cell.shape, cell.direction
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} disagreement(s) between the published matrix's Winner column and CELLS:\n{}",
         failures.len(),
         failures.join("\n")
     );

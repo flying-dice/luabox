@@ -163,18 +163,35 @@ jobs:
   #
   # perf-gate-selftest below is the gate on the gate, same discipline (and
   # same reason) as mutants.yml's gate-selftest and luals-parity.yml's
-  # differential-selftest: scripts/tests/perf-gate-selftest.sh drives the
-  # pure judgement functions scripts/perf-gate-lib.sh factors out of legs 4
-  # and 5 (the corpus-file-count check, the budget-scaling arithmetic, the
-  # manifest writer) without a release build or a real corpus — seconds, not
-  # the several minutes below it.
+  # differential-selftest. It is no longer seconds-cheap: Part 1 covers the
+  # pure judgement functions scripts/perf-gate-lib.sh factors out, and the
+  # behavioural half added for #58 round 6 (M28) invokes the REAL
+  # scripts/perf-gate.sh a dozen times against stub binaries — generated
+  # corpora plus ~28s of deliberate stub sleeps, minutes on a shared
+  # runner. The timeout tracks that measured cost with headroom; 5 minutes
+  # fit only the pre-M28 suite and would turn a slow runner into a red PR.
   perf-gate-selftest:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Self-test perf-gate-lib.sh's judgement
         run: bash scripts/tests/perf-gate-selftest.sh
+
+  # First real execution surface for the PowerShell mirror: the three .ps1
+  # gate files ship alongside the bash ones (#58 round 6, M51) but no
+  # developer machine here runs pwsh, so without this leg 600+ lines of
+  # gate code would reach main having never been executed — the
+  # audit-nothing shape decisions/12 exists to refuse. windows-latest
+  # because perf-gate.ps1's real consumers are Windows runners.
+  perf-gate-selftest-ps1:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Self-test perf-gate-lib.ps1's judgement
+        shell: pwsh
+        run: ./scripts/tests/perf-gate-selftest.ps1
 
   perf-gates:
     needs: perf-gate-selftest

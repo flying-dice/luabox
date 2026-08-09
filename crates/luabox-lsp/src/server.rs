@@ -2006,8 +2006,12 @@ impl Server {
             lint: &self.lint,
             known_globals: &self.known_globals,
         };
-        let type_diags =
-            diagnostics::diagnostics(&snapshot, &sema.path, self.dialect, &ctx).unwrap_or_default();
+        // `own` only: a quick fix is matched against ranges in *this*
+        // document, so a diagnostic whose span belongs to another file has
+        // nothing here to attach to (production readiness review, finding 4).
+        let type_diags = diagnostics::diagnostics(&snapshot, &sema.path, self.dialect, &ctx)
+            .map(|found| found.own)
+            .unwrap_or_default();
         actions.extend(code_action::code_actions(
             &sema,
             inferred.as_ref(),
@@ -2129,9 +2133,20 @@ impl Server {
     /// deleted `.lua` file's text is cleared to empty rather than left as-is
     /// (N24) — everything it exported or declared must stop resolving for
     /// every other file that referenced it, which leaving the last-known
-    /// text in place would not do. Diagnostics for any changed (including
-    /// deleted) file that is currently open are republished; a manifest
-    /// change republishes every open document via [`Self::reload_config`].
+    /// text in place would not do.
+    ///
+    /// Diagnostics for a changed file that is **not** shadowed by an editor
+    /// overlay are published for its own URI directly — an open buffer's
+    /// come from the overlay, so re-reading disk changes nothing visible
+    /// there. On top of that, any batch touching a `.lua` file at all —
+    /// created, changed or deleted — republishes every *open* document once,
+    /// after the loop, because the workspace surface those documents were
+    /// last checked against has moved. A manifest change republishes them
+    /// the same way via [`Self::reload_config`], which subsumes it.
+    ///
+    /// The sentence this replaces claimed the open files were the ones
+    /// republished and the others were not, which was the inverse of the
+    /// code on both counts (production readiness review, finding 2).
     fn watched_files_changed(
         &mut self,
         params: &DidChangeWatchedFilesParams,
@@ -2212,6 +2227,24 @@ impl Server {
                 if !self.open_docs.contains_key(&path) {
                     self.publish_lua(&event.uri, &path)?;
                 }
+                // The CREATED/CHANGED counterpart of M58's deleted-file
+                // republish (production readiness review, finding 2).
+                // Deletion is not the only event that moves the merged
+                // workspace ambient out from under an already-open consumer:
+                // a `git checkout` *restoring* a dependency, or an external
+                // edit adding the `---@field` an open buffer was being
+                // flagged for missing, arrives here as CREATED or CHANGED.
+                // The publish above covers the changed file's own URI and
+                // nothing else, so before this an open consumer kept a stale
+                // `LB0306` until its own next keystroke — M58's exact
+                // asymmetry, in the arm M58 did not touch.
+                //
+                // Flagged, acted on once after the loop, same idiom as the
+                // DELETED arm and `reload`: `republish_open_docs` re-checks
+                // every open document from scratch, so calling it per event
+                // turns a C-file batch against O open documents into C×O
+                // full diagnostics passes (H1).
+                republish_open = true;
             }
         }
         if reload {
@@ -2262,6 +2295,21 @@ impl Server {
 
     /// Publish the current diagnostics for one `.lua` file from a fresh
     /// snapshot.
+    ///
+    /// Checking one file can produce a diagnostic that belongs to **another**
+    /// — the cross-file `---@class` ancestry pair `LB0317`/`LB0318` points at
+    /// the offending class's declaration, wherever that lives
+    /// ([`diagnostics::FileDiagnostics`]). Each such group is published under
+    /// its own document URI, at its own file's line numbers, rather than
+    /// rendered inside this document at an offset its text cannot carry
+    /// (production readiness review, finding 4).
+    ///
+    /// A `publishDiagnostics` notification *replaces* the whole set for its
+    /// URI, so a foreign group goes out merged with that file's own
+    /// diagnostics — publishing the group alone would blank whatever the
+    /// other document was already showing. Only that file's `own` half is
+    /// merged in: its foreign half (which can point back here) is left to its
+    /// own publish, so this cannot recurse.
     fn publish_lua(&mut self, uri: &Uri, path: &Path) -> anyhow::Result<()> {
         let analysis: Analysis = self.host.snapshot();
         let merged = self.merged_ambient(&analysis);
@@ -2272,9 +2320,16 @@ impl Server {
             lint: &self.lint,
             known_globals: &self.known_globals,
         };
-        let diags =
+        let found =
             diagnostics::diagnostics(&analysis, path, self.dialect, &ctx).unwrap_or_default();
-        self.publish(uri, diags)
+        for (other_path, foreign) in found.foreign {
+            let mut all = diagnostics::diagnostics(&analysis, &other_path, self.dialect, &ctx)
+                .map(|other| other.own)
+                .unwrap_or_default();
+            all.extend(foreign);
+            self.publish(&crate::uri::path_to_uri(&other_path), all)?;
+        }
+        self.publish(uri, found.own)
     }
 
     fn publish(&self, uri: &Uri, diagnostics: Vec<lsp_types::Diagnostic>) -> anyhow::Result<()> {
@@ -2390,6 +2445,7 @@ fn workspace_symbol_key(info: &SymbolInformation) -> (String, String, u32, u32, 
     reason = "test code — panics document assumptions"
 )]
 mod tests {
+    use std::fmt::Write as _;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -3462,6 +3518,148 @@ return use
         assert!(
             republished.as_array().is_some_and(|d| !d.is_empty()),
             "s.id must now be flagged now that Base is gone: {republished:?}"
+        );
+    }
+
+    /// Production readiness review, finding 4, end to end: checking one
+    /// document can produce an `LB0318` about a class declared in *another*
+    /// file. It must reach the user as a diagnostic on that other document,
+    /// at that document's own line — not inside the checked document at a
+    /// position clamped into its (shorter) text.
+    ///
+    /// `c.lua`'s declaration is padded well past `a.lua`'s length, so the
+    /// line asserted below is one a conversion through `a.lua`'s index could
+    /// not have produced.
+    #[test]
+    fn a_cross_file_cycle_publishes_its_diagnostic_on_the_declaring_document() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let a_path = root.join("a.lua");
+        let c_path = root.join("c.lua");
+        let a_source = "---@class A : B\n\n---@type B\nlocal v = nil\nlocal _ = v.whatever\n";
+        let mut c_source = String::new();
+        for i in 0..40 {
+            let _ = writeln!(c_source, "-- padding line {i}");
+        }
+        c_source.push_str("---@class B : A\n---@field id number\n");
+        fs::write(&a_path, a_source).expect("write a.lua");
+        fs::write(&c_path, &c_source).expect("write c.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        let a_uri = crate::uri::path_to_uri(&a_path);
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": a_uri.to_string(),
+                        "languageId": "lua",
+                        "version": 1,
+                        "text": a_source,
+                    },
+                }),
+            })
+            .expect("didOpen");
+        let published = drain(&client);
+
+        let c_uri = crate::uri::path_to_uri(&c_path);
+        let for_c = published_diagnostics(&published, &c_uri)
+            .expect("the cycle's own declaring document is published too");
+        let cyclic = for_c
+            .as_array()
+            .expect("an array")
+            .iter()
+            .find(|d| d["code"] == "LB0318")
+            .unwrap_or_else(|| panic!("expected LB0318 on c.lua: {for_c:?}"));
+        let declared_on = c_source
+            .lines()
+            .position(|line| line.starts_with("---@class B"))
+            .expect("c.lua declares B");
+        assert_eq!(cyclic["range"]["start"]["line"], json!(declared_on));
+
+        let for_a = published_diagnostics(&published, &a_uri).expect("a.lua is published");
+        let a_lines = u64::try_from(a_source.lines().count()).expect("a small line count");
+        for diag in for_a.as_array().expect("an array") {
+            assert_ne!(diag["code"], json!("LB0318"), "{diag:?}");
+            assert!(
+                diag["range"]["start"]["line"].as_u64().expect("a line") < a_lines,
+                "nothing may render at a clamped position: {diag:?}"
+            );
+        }
+    }
+
+    /// Production readiness review, finding 2: the CREATED/CHANGED mirror of
+    /// the test above. M58 taught the DELETED arm to republish open
+    /// consumers and stopped there, so the event that *restores* a
+    /// dependency — a `git checkout` of a branch that has `base.lua`, an
+    /// external edit that adds the missing `---@field` — left every open
+    /// consumer showing the diagnostic the restore had just fixed, until
+    /// that buffer's own next keystroke.
+    ///
+    /// Same shape as the deletion test, run backwards: `main.lua` is open
+    /// and flagged because `base.lua` does not exist; `base.lua` is written
+    /// and announced as CREATED; `main.lua`'s stale diagnostic must clear in
+    /// that same batch.
+    #[test]
+    fn a_created_watched_file_republishes_diagnostics_for_an_open_consumer() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let base_path = root.join("base.lua");
+        let main_path = root.join("main.lua");
+        let source = "\
+---@class Sub : Base
+
+---@param s Sub
+local function use(s) print(s.id) end
+
+return use
+";
+        fs::write(&main_path, source).expect("write main.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        let main_uri = crate::uri::path_to_uri(&main_path);
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": main_uri.to_string(),
+                        "languageId": "lua",
+                        "version": 1,
+                        "text": source,
+                    },
+                }),
+            })
+            .expect("didOpen");
+        let opened = drain(&client);
+        let before = published_diagnostics(&opened, &main_uri)
+            .expect("didOpen publishes main.lua's diagnostics");
+        assert!(
+            before.as_array().is_some_and(|d| !d.is_empty()),
+            "s.id must be flagged while Base is absent: {before:?}"
+        );
+
+        fs::write(&base_path, "---@class Base\n---@field id number\n").expect("write base.lua");
+        let base_uri = crate::uri::path_to_uri(&base_path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({
+                    "changes": [{ "uri": base_uri.to_string(), "type": 1 }],
+                }),
+            })
+            .expect("didChangeWatchedFiles");
+        let after = drain(&client);
+
+        let republished = published_diagnostics(&after, &main_uri).expect(
+            "main.lua must be republished by the CREATED event itself, not left \
+             for the next keystroke",
+        );
+        assert!(
+            republished.as_array().is_some_and(Vec::is_empty),
+            "s.id resolves now that Base exists: {republished:?}"
         );
     }
 
