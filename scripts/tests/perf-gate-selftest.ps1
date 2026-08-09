@@ -51,7 +51,10 @@ param()
 $ErrorActionPreference = "Stop"
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$repo = Split-Path -Parent $here
+# Two levels up from scripts/tests — mirrors the bash selftest's
+# `repo="$here/../.."`; one level (an earlier revision's mistake) lands on
+# scripts/ and doubles the path of everything joined below it.
+$repo = Split-Path -Parent (Split-Path -Parent $here)
 $lib = Join-Path $here "../perf-gate-lib.ps1"
 $gate = Join-Path $here "../perf-gate.ps1"
 
@@ -300,6 +303,9 @@ New-Item -ItemType Directory -Path $out -Force | Out-Null
 for ($i = 0; $i -lt $files; $i++) {
     New-Item -ItemType File -Path (Join-Path $out "mod_$i.lua") -Force | Out-Null
 }
+# Explicit: a `&`-invoked .ps1 that ends without `exit` leaves $LASTEXITCODE
+# unset in the caller, which the gate's post-invocation check reads as failure.
+exit 0
 '@ | Set-Content -Path $stubGenCorpus
 
 # The full set of FAIL lines a run of every leg could print. Every member
@@ -326,7 +332,7 @@ $allFailNeedles = @(
 )
 
 function Invoke-Gate {
-    param([string]$Name, [int]$WantExit, [string]$WantFailNeedle = "")
+    param([string]$Name, [int]$WantExit, [string]$WantFailNeedle = "", [string[]]$AlsoPresent = @())
     $log = Join-Path $gwork "$Name.log"
     $env:LUABOX_BIN = $stubLuabox
     $env:GEN_CORPUS_BIN = $stubGenCorpus
@@ -344,6 +350,9 @@ function Invoke-Gate {
         if ($shouldBePresent -and -not $isPresent) { $ok = $false; $report += " missing:[$needle]" }
         if (-not $shouldBePresent -and $isPresent) { $ok = $false; $report += " present-but-should-be-absent:[$needle]" }
     }
+    foreach ($needle in $AlsoPresent) {
+        if (-not $logText.Contains($needle)) { $ok = $false; $report += " missing:[$needle]" }
+    }
     if ($ok) {
         Write-Host "PASS  $Name (exit $got)"
         $script:pass++
@@ -358,7 +367,14 @@ function Invoke-Gate {
 $env:STUB_VERSION_MS = "0"; $env:STUB_FMT_MS = "0"; $env:STUB_CHECK_100K_MS = "0"
 $env:STUB_DIAG_LINT_MS = "0"; $env:STUB_DIAG_CHECK_MS = "0"
 $env:STUB_DIAG_LINT_RENDERED_MS = "0"; $env:STUB_DIAG_CHECK_RENDERED_MS = "0"
-Invoke-Gate "all_legs_pass_when_fast" 0
+# The two AlsoPresent needles pin the stub-mode SKIP lines for the
+# Process-launched legs (see the file header's disclosed gap): if the gate
+# ever stops printing them — the skip silently widening, or the legs
+# silently running against a stub — this case goes red.
+Invoke-Gate "all_legs_pass_when_fast" 0 -AlsoPresent @(
+    "SKIP check peak RSS: stub binaries cannot be process-launched",
+    "SKIP retained-TypeEnv regression: stub binaries cannot be process-launched"
+)
 
 # One case per comparison this stub can drive: exactly that leg's FAIL,
 # nothing else. Budgets are the REAL ones from perf-gate-budgets.env (no

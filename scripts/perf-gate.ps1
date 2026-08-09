@@ -137,6 +137,12 @@ $fail = $false
 
 try {
     Write-Host "perf-gate: generating ~100 kLOC corpus into $corpusDir ..."
+    # Prime $LASTEXITCODE: a GEN_CORPUS_BIN override pointing at a .ps1 that
+    # never calls `exit` leaves it UNSET after `&` (only native commands and
+    # explicit script `exit` write it), and the check below would then throw
+    # "gen-corpus failed (exit )" on a run that succeeded — the shape the
+    # first real execution of the self-test hit.
+    $global:LASTEXITCODE = 0
     & $genCorpusBin --out (Join-Path $corpusDir "src") --seed 42 --files 50 --lines-per-file 2000
     if ($LASTEXITCODE -ne 0) { throw "gen-corpus failed (exit $LASTEXITCODE)" }
 
@@ -251,28 +257,37 @@ try {
     # memory ceiling. $env:LUABOX_RSS_BUDGET_MIB overrides it, for when the
     # budget itself is being renegotiated.
     Write-Host ""
-    Write-Host "perf-gate: peak RSS of check on corpus (warm)..."
-    $info = [System.Diagnostics.ProcessStartInfo]::new()
-    $info.FileName = $luaboxBin
-    $info.Arguments = "check"
-    $info.WorkingDirectory = $corpusDir
-    $info.UseShellExecute = $false
-    $info.RedirectStandardOutput = $true
-    $info.RedirectStandardError = $true
-    $proc = [System.Diagnostics.Process]::Start($info)
-    # Drain both pipes before waiting, or a report larger than the pipe buffer
-    # deadlocks the child — the same hazard tests/broken_pipe.rs works around.
-    $proc.StandardOutput.ReadToEnd() | Out-Null
-    $proc.StandardError.ReadToEnd() | Out-Null
-    $proc.WaitForExit()
-    $rssMib = [int]($proc.PeakWorkingSet64 / 1MB)
-    $proc.Dispose()
-    if ($rssMib -lt $RssBudgetMib) {
-        Write-Host ("PASS check peak RSS: {0} MiB < {1} MiB" -f $rssMib, $RssBudgetMib)
+    if ($useStubBinaries) {
+        # A .ps1 stub cannot be launched through Process.Start's FileName
+        # (Windows wants a true executable there), so under stub binaries
+        # this leg is SKIPPED, loudly — the self-test asserts this exact
+        # line is present so the skip cannot silently widen to real runs.
+        # See perf-gate-selftest.ps1's header for the disclosed gap.
+        Write-Host "SKIP check peak RSS: stub binaries cannot be process-launched"
     } else {
-        Write-Host ("FAIL check peak RSS: {0} MiB >= {1} MiB" -f $rssMib, $RssBudgetMib)
-        Write-Host "     decisions/07 accepted 123 MiB on this corpus"
-        $fail = $true
+        Write-Host "perf-gate: peak RSS of check on corpus (warm)..."
+        $info = [System.Diagnostics.ProcessStartInfo]::new()
+        $info.FileName = $luaboxBin
+        $info.Arguments = "check"
+        $info.WorkingDirectory = $corpusDir
+        $info.UseShellExecute = $false
+        $info.RedirectStandardOutput = $true
+        $info.RedirectStandardError = $true
+        $proc = [System.Diagnostics.Process]::Start($info)
+        # Drain both pipes before waiting, or a report larger than the pipe buffer
+        # deadlocks the child — the same hazard tests/broken_pipe.rs works around.
+        $proc.StandardOutput.ReadToEnd() | Out-Null
+        $proc.StandardError.ReadToEnd() | Out-Null
+        $proc.WaitForExit()
+        $rssMib = [int]($proc.PeakWorkingSet64 / 1MB)
+        $proc.Dispose()
+        if ($rssMib -lt $RssBudgetMib) {
+            Write-Host ("PASS check peak RSS: {0} MiB < {1} MiB" -f $rssMib, $RssBudgetMib)
+        } else {
+            Write-Host ("FAIL check peak RSS: {0} MiB >= {1} MiB" -f $rssMib, $RssBudgetMib)
+            Write-Host "     decisions/07 accepted 123 MiB on this corpus"
+            $fail = $true
+        }
     }
 
     # --- RETAINED-TYPEENV REGRESSION GATE -------------------------------------
@@ -337,7 +352,14 @@ try {
     # (perf-gate-lib.ps1) rather than a bespoke Get-ChildItem check here, so
     # this and the two wirings above/below are one function, not three
     # hand-rolled counts free to drift (#58 review round 6, M30/M50).
-    if (-not (Test-LuaFileCount $retainedEnvSrc $RetainedEnvCorpusFiles)) {
+    if ($useStubBinaries) {
+        # Same Process.Start constraint as the PEAK-RSS GATE above: both of
+        # this leg's measurements launch the binary by FileName, which a
+        # .ps1 stub cannot satisfy. Skipped loudly; the self-test asserts
+        # this line so the skip cannot widen to real runs.
+        Write-Host ""
+        Write-Host "SKIP retained-TypeEnv regression: stub binaries cannot be process-launched"
+    } elseif (-not (Test-LuaFileCount $retainedEnvSrc $RetainedEnvCorpusFiles)) {
         $fail = $true
     } else {
         Write-Host ""
@@ -571,6 +593,16 @@ try {
     } else {
         Write-Host "perf-gate: GATES FAILED"
     }
+} catch {
+    # $ErrorActionPreference is "Continue" from the fmt/lint stderr note
+    # above, so without this catch an exception mid-legs (a binary that
+    # fails to launch, a corpus write error) would abort every REMAINING
+    # leg, run the finally, and fall through to `exit 0` with $fail still
+    # false — a gate that measured half of what it claims and called it
+    # green. Measured, not hypothetical: the .ps1 self-test's first real
+    # execution hit exactly this via the RSS leg. Any abort is a FAIL.
+    Write-Host "FAIL perf-gate: aborted before all legs ran: $_"
+    $fail = $true
 } finally {
     Remove-Item -Recurse -Force $corpusDir -ErrorAction SilentlyContinue
 }

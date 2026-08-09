@@ -97,9 +97,12 @@ function ConvertTo-ScaledBudgetMs {
         [Parameter(Mandatory)][double]$Factor,
         [double]$CeilingMs = 0
     )
-    $scaled = [int]($BaseMs * $Factor)
+    # [Math]::Floor, not a bare [int] cast: PowerShell's [int] rounds
+    # (167.5 -> 168) where bash's $(( )) integer arithmetic truncates —
+    # measured drift between the two readers of the same budgets file.
+    $scaled = [int][Math]::Floor($BaseMs * $Factor)
     if ($CeilingMs -gt 0 -and $scaled -gt $CeilingMs) {
-        return [int]$CeilingMs
+        return [int][Math]::Floor($CeilingMs)
     }
     return $scaled
 }
