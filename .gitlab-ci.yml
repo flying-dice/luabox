@@ -298,6 +298,11 @@ workflow:
 .rules-ci:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    # An explicit human-requested run on a chosen ref (UI button or
+    # `glab ci run`) runs the ci class — that is what asking for a
+    # pipeline on a feature branch means.
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "api"'
     - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "main"'
 
 # The four path-filtered workflows all use `push: branches:[main]` for their
@@ -482,6 +487,7 @@ mutants-gate-selftest:
       changes: *changes-mutants
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
     - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "api"'
     - if: '$CI_COMMIT_BRANCH == "main"'
       changes: *changes-mutants
   script:
@@ -799,6 +805,7 @@ differential:
       changes: *changes-differential
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
     - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "api"'
     - if: '$CI_COMMIT_BRANCH == "main"'
       changes: *changes-differential
   script:
@@ -1040,6 +1047,7 @@ fuzz:
       changes: *changes-fuzz
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
     - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "api"'
   variables:
     CARGO_HOME: $CI_PROJECT_DIR/.cargo
   cache:
@@ -1141,6 +1149,7 @@ mutants:
       when: never
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
     - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "api"'
     - if: '$CI_COMMIT_BRANCH == "main"'
       changes: *changes-mutants
   script:
