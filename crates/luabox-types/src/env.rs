@@ -7235,6 +7235,44 @@ take(b.value)
         crate::defs::Ambient::build(&[Box::leak(src.into_boxed_str()) as &str])
     }
 
+    /// `absorb_limit_trips` folds FOUR ledgers, and only the two report
+    /// queues are roots-scoped; `truncated_classes` and `cyclic_class_hits`
+    /// fold unscoped, deliberately (their consumers — leniency and cycle
+    /// reporting — need every class the walk actually gave up on, not just
+    /// the ones this file names). The two tests below are what kill the
+    /// `extend`-becomes-`()` mutant the first properly-judged `mutants-pr`
+    /// run surfaced: without the unscoped fold, a cycle or truncation found
+    /// only by the discovery walk silently never reaches the real env.
+    #[test]
+    fn a_cycle_discovered_while_building_a_generic_template_still_reports_lb0318() {
+        let ambient = crate::defs::Ambient::build(&[
+            "---@meta\n---@class GCycA<T> : GCycB<T>\n---@class GCycB<T> : GCycA<T>\n",
+        ]);
+        let env = env_with_ambient("---@type GCycA<string>\nlocal x\n", &ambient);
+        let hits = env.take_cyclic_class_hits();
+        assert!(
+            hits.iter().any(|name| name == "GCycA" || name == "GCycB"),
+            "a cyclic generic ancestry resolved only by the template discovery walk must \
+             still fold its cycle record into the consuming file's env: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn truncation_discovered_while_building_a_generic_template_still_answers_truncated() {
+        let k = 50;
+        let ambient = costly_generic_ambient(k);
+        let env = env_with_ambient(&format!("---@type A{k}<string>\nlocal x\n"), &ambient);
+        // A22 tripped the budget during discovery but is NOT the referenced
+        // root, so the roots-scoped report queues drop it — the unscoped
+        // truncation ledger must still answer for it, or member-checking
+        // leniency would treat its silently-incomplete shape as complete.
+        assert!(
+            env.class_ancestry_truncated("A22"),
+            "a class the discovery walk gave up on must read as truncated in the consuming \
+             file's env even when it is not the referenced root"
+        );
+    }
+
     #[test]
     fn a_consuming_file_surfaces_a_cost_trip_only_for_the_root_it_names() {
         // Finding 3. `collect_generic_classes` resolves a template for
