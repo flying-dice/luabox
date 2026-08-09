@@ -77,8 +77,13 @@ pub use assign::{Exactness, assignable};
 // and the message, owned here because BOTH `luabox check` and the LSP run it
 // (round 12 review R12-1: it shipped inside `luabox-cli`, so the editor was
 // silent on the exact fixture the feature targets).
+// `class_cycles` is deliberately NOT re-exported (round 13 review, clean-code
+// note): a workspace grep found no caller outside the module — both surfaces
+// consume `ClassGraph::cycle_sites` — and a bare parent-map entry point is an
+// invitation to a third harvest with its own parent rule, which is the drift
+// R13-C just closed.
 pub use class_graph::{
-    CYCLIC_CLASS_LABEL, ClassCycleSite, ClassGraph, class_cycles, cyclic_class_message,
+    CYCLIC_CLASS_LABEL, ClassCycleSite, ClassDeclaration, ClassGraph, cyclic_class_message,
 };
 pub use codes::{CLASS_COST_LIMIT, CLASS_DEPTH_LIMIT, CYCLIC_CLASS};
 pub use defs::{

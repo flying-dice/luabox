@@ -16,7 +16,6 @@ use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
 use luabox_db::Analysis;
 use luabox_lint::{LintConfig, lint_source};
 use luabox_syntax::lua::{Dialect, validate};
-use luabox_syntax::luacats;
 use luabox_types::{
     CYCLIC_CLASS, ClassGraph, DirectiveScan, RULE_CIRCLE_DOC_CLASS, RockSurfaces, Strictness,
     check_file_with_requires,
@@ -101,6 +100,19 @@ pub struct CheckCtx<'a> {
     /// The `undefined-global` known-globals baseline (dialect stdlib + project
     /// and dependency defs), built the same way `luabox lint` builds it.
     pub known_globals: &'a HashSet<String>,
+    /// The workspace's declared-`---@class` cycle pass
+    /// ([`class_cycle_diagnostics`]), derived by the caller and cached on the
+    /// host revision exactly as [`Self::ambient`] is.
+    ///
+    /// Owned by the caller for the same reason the merge is (round 13 review,
+    /// noted cost): every pass over every file derives the SAME answer from
+    /// the same workspace, so computing it inside [`diagnostics`] meant
+    /// re-collecting and re-Tarjan-ing every class the project declares on
+    /// every keystroke of every open buffer. It is a function of the analysis
+    /// and the strictness alone — both of which move the host revision — so
+    /// the revision is a complete cache key, with none of the manual
+    /// invalidation `merged_ambient` needs for its unrevisioned base layers.
+    pub cycles: &'a ClassCycles,
 }
 
 /// One check pass's LSP diagnostics, split by the file each one's primary
@@ -215,11 +227,12 @@ pub fn diagnostics(
     // same map, so a `require` binding cannot type one way here and another
     // way under the cursor.
     let requires = RequireExports::resolve(analysis, path, ctx.rocks);
-    // The declaration-driven `---@class` cycle pass, run BEFORE the type
-    // pass so its `covered` set can drop the resolver's rediscovery of a
-    // cycle it has already named — the same hand-off `luabox check` makes
+    // The declaration-driven `---@class` cycle pass, derived by the caller
+    // (once per host revision, not once per publish) but consumed BEFORE the
+    // type pass, so its `covered` set can drop the resolver's rediscovery of
+    // a cycle it has already named — the same hand-off `luabox check` makes
     // between its pre-check and `env::note_cyclic`'s drain (R12-1).
-    let cycles = class_cycle_diagnostics(analysis, ctx.strictness);
+    let cycles = ctx.cycles;
     for diag in check_file_with_requires(
         parsed.parse(),
         &rel,
@@ -247,21 +260,7 @@ pub fn diagnostics(
     // cycle member declared in ANOTHER project file lands under that file's
     // own URI, at its own line, whether or not it is open — but filed under
     // `workspace`, because that is what it is: see `FileDiagnostics`.
-    for diag in &cycles.diags {
-        let Some(label) = diag.primary_label() else {
-            continue;
-        };
-        let named = label.span.file.clone();
-        let Some(target_index) =
-            line_index_for(analysis, &rel, &index, &mut foreign_indices, &named)
-        else {
-            continue;
-        };
-        out.workspace
-            .entry(PathBuf::from(named))
-            .or_default()
-            .push(convert(target_index, diag));
-    }
+    out.workspace = route_workspace(analysis, cycles, Some((&rel, &index)), &mut foreign_indices);
 
     // 4. Lint findings — the `luabox lint` engine (SPEC.md §9), published
     // alongside the type diagnostics. `lint_source` applies the `[lint]`
@@ -294,9 +293,69 @@ pub fn diagnostics(
     Some(out)
 }
 
+/// The workspace-derived half **alone**, for a publish that has no file to
+/// check but must still leave the ledger's workspace slot correct.
+///
+/// The `didClose` of a document with no disk backing is that publish (round
+/// 13 review R13-A): the overlay is dropped, so the declarations it was
+/// contributing to the workspace class graph are gone, and a cycle that only
+/// existed because of them is genuinely over. Recording "not recomputed"
+/// there left the last answer standing — an `LB0318` naming a class nothing
+/// declares any more, pinned to a valid open file, until any next pass
+/// anywhere.
+///
+/// Same routing as [`diagnostics`]'s workspace half, over the same
+/// caller-derived pass: this is the one answer about the whole workspace, so
+/// publishing it needs no checked file at all.
+#[must_use]
+pub fn workspace_diagnostics(
+    analysis: &Analysis,
+    cycles: &ClassCycles,
+) -> BTreeMap<PathBuf, Vec<Diagnostic>> {
+    route_workspace(analysis, cycles, None, &mut HashMap::new())
+}
+
+/// File the workspace pass's diagnostics under the document each one's
+/// declaration lives in, converted through **that** file's line index.
+///
+/// `checked` is the in-flight file's `(path, index)` when there is one, so a
+/// cycle declared in the very file being checked reuses the index that pass
+/// already built; `None` when the caller has no checked file
+/// ([`workspace_diagnostics`]).
+///
+/// A finding whose declaring file `analysis` cannot resolve to text is
+/// dropped, for the reason [`line_index_for`] gives: there is no index that
+/// could place it and no document to place it on.
+fn route_workspace(
+    analysis: &Analysis,
+    cycles: &ClassCycles,
+    checked: Option<(&str, &LineIndex)>,
+    foreign_indices: &mut HashMap<PathBuf, LineIndex>,
+) -> BTreeMap<PathBuf, Vec<Diagnostic>> {
+    let mut out: BTreeMap<PathBuf, Vec<Diagnostic>> = BTreeMap::new();
+    for diag in &cycles.diags {
+        let Some(label) = diag.primary_label() else {
+            continue;
+        };
+        let named = label.span.file.clone();
+        let Some(target_index) = line_index_for(analysis, checked, foreign_indices, &named) else {
+            continue;
+        };
+        out.entry(PathBuf::from(named))
+            .or_default()
+            .push(convert(target_index, diag));
+    }
+    out
+}
+
 /// One workspace cycle pass: the `LB0318`s the declared `---@class` graph
 /// alone proves, and the declaration sites they account for.
-struct ClassCycles {
+///
+/// Public because the caller owns it now: it is derived once per host
+/// revision and handed to every publish through [`CheckCtx::cycles`], rather
+/// than recomputed inside each [`diagnostics`] call. The contents stay
+/// private — a caller only ever passes one back in.
+pub struct ClassCycles {
     /// One diagnostic per declaration that carries a cycle edge, its primary
     /// span naming the **declaring** file — routed by [`push_routed`] like
     /// every other cross-file ancestry finding.
@@ -348,9 +407,14 @@ impl ClassCycles {
 /// One pass over every project file's **memoized** annotation harvest
 /// (`Analysis::annotations` is a salsa query — an unchanged file is a
 /// refcount bump, not a re-harvest), plus a `HashMap` walk proportional to
-/// the declared class graph. It runs per publish, i.e. per keystroke, in
-/// the same order of cost as the merged-ambient rebuild that already does
-/// (`Server::merged_ambient`'s own doc measures that one).
+/// the declared class graph — the same order of cost as the merged-ambient
+/// rebuild (`Server::merged_ambient`'s own doc measures that one), and paid
+/// on the same schedule: once per host revision, cached beside it
+/// (`Server::cycle_pass`), not once per publish. The version this replaces
+/// ran here, inside every [`diagnostics`] call, so a project's whole class
+/// graph was re-collected and re-Tarjan'd on every keystroke of every open
+/// buffer for an answer that cannot differ between them (round 13 review,
+/// noted cost).
 ///
 /// The `---@diagnostic disable[-line|-next-line]: circle-doc-class` escape
 /// hatch is honoured out of the **declaring** file's own text, through
@@ -360,7 +424,8 @@ impl ClassCycles {
 ///
 /// Empty under [`Strictness::None`], which disables every type diagnostic
 /// project-wide.
-fn class_cycle_diagnostics(analysis: &Analysis, strictness: Strictness) -> ClassCycles {
+#[must_use]
+pub fn class_cycle_diagnostics(analysis: &Analysis, strictness: Strictness) -> ClassCycles {
     let mut cycles = ClassCycles {
         diags: Vec::new(),
         covered: HashSet::new(),
@@ -383,28 +448,13 @@ fn class_cycle_diagnostics(analysis: &Analysis, strictness: Strictness) -> Class
         let Some(items) = analysis.annotations(file) else {
             continue;
         };
-        for item in items.items() {
-            for tag in &item.block.tags {
-                let luacats::Tag::Class(class) = tag else {
-                    continue;
-                };
-                graph.declare(
-                    &class.name,
-                    idx,
-                    class.span.start..class.span.end,
-                    class
-                        .parents
-                        .iter()
-                        .filter_map(|parent| match &parent.kind {
-                            luacats::TypeExprKind::Named { name, .. } if !name.is_empty() => {
-                                Some(name.clone())
-                            }
-                            _ => None,
-                        })
-                        .collect(),
-                );
-            }
-        }
+        // The per-item rule is the seam's, not this module's (round 13 review
+        // R13-C): `Tag::Class`, the empty-name drop and the bare-`Named`
+        // parent filter used to be open-coded here AND in `check_cmd`, so a
+        // widened parent shape applied to one surface would have moved the
+        // editor and not the command line, silently — the very split this
+        // pass exists to close.
+        graph.declare_file(idx, items.items());
     }
 
     // Built only for the files a cycle actually touches — a workspace with
@@ -469,7 +519,8 @@ fn push_routed(
         return;
     };
     let named = label.span.file.clone();
-    let Some(target_index) = line_index_for(analysis, rel, index, foreign_indices, &named) else {
+    let Some(target_index) = line_index_for(analysis, Some((rel, index)), foreign_indices, &named)
+    else {
         return;
     };
     let converted = convert(target_index, diag);
@@ -487,6 +538,9 @@ fn push_routed(
 /// the checked file's own when it names that, otherwise the named file's,
 /// memoised in `foreign_indices`.
 ///
+/// `checked` is `None` for a caller with no file in flight
+/// ([`workspace_diagnostics`]), where every index is built from `analysis`.
+///
 /// `None` when `analysis` cannot resolve `file` to text — an ambient/defs
 /// tier span, or a logical name that is not a project path. Such a
 /// diagnostic is **dropped** by both callers: there is no line index that
@@ -500,12 +554,13 @@ fn push_routed(
 /// class.
 fn line_index_for<'a>(
     analysis: &Analysis,
-    rel: &str,
-    index: &'a LineIndex,
+    checked: Option<(&str, &'a LineIndex)>,
     foreign_indices: &'a mut HashMap<PathBuf, LineIndex>,
     file: &str,
 ) -> Option<&'a LineIndex> {
-    if file == rel {
+    if let Some((rel, index)) = checked
+        && file == rel
+    {
         return Some(index);
     }
     match foreign_indices.entry(PathBuf::from(file)) {
@@ -623,12 +678,14 @@ mod tests {
         let known_globals = base.global_names().clone();
         let ambient = MergedAmbient::build(&base, &analysis.project_types(), rocks.types());
         let lint = LintConfig::new();
+        let cycles = class_cycle_diagnostics(&analysis, Strictness::Warn);
         let ctx = CheckCtx {
             strictness: Strictness::Warn,
             ambient: &ambient,
             rocks,
             lint: &lint,
             known_globals: &known_globals,
+            cycles: &cycles,
         };
         diagnostics(&analysis, &path, dialect, &ctx)
             .expect("diagnostics")
@@ -747,12 +804,14 @@ mod tests {
         let rocks = RockSurfaces::default();
         let ambient = MergedAmbient::build(&base, &analysis.project_types(), rocks.types());
         let lint = LintConfig::new();
+        let cycles = class_cycle_diagnostics(&analysis, Strictness::Warn);
         let ctx = CheckCtx {
             strictness: Strictness::Warn,
             ambient: &ambient,
             rocks: &rocks,
             lint: &lint,
             known_globals: &known_globals,
+            cycles: &cycles,
         };
         let found =
             diagnostics(&analysis, &path_for("a.lua"), Dialect::Lua54, &ctx).expect("diagnostics");
@@ -787,12 +846,14 @@ mod tests {
         let rocks = RockSurfaces::default();
         let ambient = MergedAmbient::build(&base, &analysis.project_types(), rocks.types());
         let lint = LintConfig::new();
+        let cycles = class_cycle_diagnostics(&analysis, Strictness::Warn);
         let ctx = CheckCtx {
             strictness: Strictness::Warn,
             ambient: &ambient,
             rocks: &rocks,
             lint: &lint,
             known_globals: &known_globals,
+            cycles: &cycles,
         };
         let found =
             diagnostics(&analysis, &path_for("a.lua"), Dialect::Lua54, &ctx).expect("diagnostics");
@@ -801,8 +862,10 @@ mod tests {
 
     // === the declaration-driven cycle pass (round 12 review R12-1) ========
 
-    /// Check `checked` in a workspace made of `files`, at `strictness`.
-    fn workspace_diagnostics(
+    /// Check `checked` in a workspace made of `files`, at `strictness` — the
+    /// whole [`diagnostics`] pass, not just its workspace half (which is
+    /// [`workspace_diagnostics`], a different function with a similar job).
+    fn check_in_workspace(
         files: &[(&str, &str)],
         checked: &str,
         strictness: Strictness,
@@ -823,12 +886,14 @@ mod tests {
         let rocks = RockSurfaces::default();
         let ambient = MergedAmbient::build(&base, &analysis.project_types(), rocks.types());
         let lint = LintConfig::new();
+        let cycles = class_cycle_diagnostics(&analysis, strictness);
         let ctx = CheckCtx {
             strictness,
             ambient: &ambient,
             rocks: &rocks,
             lint: &lint,
             known_globals: &known_globals,
+            cycles: &cycles,
         };
         diagnostics(&analysis, &path_for(checked), Dialect::Lua54, &ctx).expect("diagnostics")
     }
@@ -854,7 +919,7 @@ mod tests {
     /// source. Editor and CI now agree, and both agree with the oracle.
     #[test]
     fn an_unreferenced_self_cycle_is_reported_in_the_editor() {
-        let found = workspace_diagnostics(
+        let found = check_in_workspace(
             &[("types.lua", "---@class Widget : Widget\n")],
             "types.lua",
             Strictness::Warn,
@@ -878,7 +943,7 @@ mod tests {
     /// does (measured: one `circle-doc-class` per declaration).
     #[test]
     fn an_unreferenced_mutual_cycle_is_reported_on_both_declaring_files() {
-        let found = workspace_diagnostics(
+        let found = check_in_workspace(
             &[
                 ("a.lua", "---@class RingA : RingB\n"),
                 ("b.lua", "---@class RingB : RingA\n"),
@@ -905,20 +970,20 @@ mod tests {
     #[test]
     fn the_editors_cycle_pass_honours_strictness_and_the_declaring_files_directive() {
         let cyclic = [("types.lua", "---@class Widget : Widget\n")];
-        let strict = workspace_diagnostics(&cyclic, "types.lua", Strictness::Strict);
+        let strict = check_in_workspace(&cyclic, "types.lua", Strictness::Strict);
         assert_eq!(
             strict.workspace[&path_for("types.lua")][0].severity,
             Some(DiagnosticSeverity::ERROR)
         );
-        let warn = workspace_diagnostics(&cyclic, "types.lua", Strictness::Warn);
+        let warn = check_in_workspace(&cyclic, "types.lua", Strictness::Warn);
         assert_eq!(
             warn.workspace[&path_for("types.lua")][0].severity,
             Some(DiagnosticSeverity::WARNING)
         );
-        let off = workspace_diagnostics(&cyclic, "types.lua", Strictness::None);
+        let off = check_in_workspace(&cyclic, "types.lua", Strictness::None);
         assert!(off.workspace.is_empty(), "{:?}", off.workspace);
 
-        let suppressed = workspace_diagnostics(
+        let suppressed = check_in_workspace(
             &[(
                 "types.lua",
                 "---@diagnostic disable: circle-doc-class\n---@class Widget : Widget\n",
@@ -940,7 +1005,7 @@ mod tests {
     /// rediscovery.
     #[test]
     fn a_resolved_cycle_is_reported_once_not_once_per_mechanism() {
-        let found = workspace_diagnostics(
+        let found = check_in_workspace(
             &[(
                 "main.lua",
                 "---@class RingA : RingB\n---@field a string\n\
@@ -973,12 +1038,63 @@ mod tests {
         }
     }
 
+    /// The same dedup, **across files** — the axis the same-file test above
+    /// cannot reach (round 13 review, noted coverage gap).
+    ///
+    /// `covers` matches the resolver's finding against `(file, start, end)`,
+    /// and the two sides derive that file string by different routes: the
+    /// workspace pass takes it from `Analysis::files()`, the resolver from
+    /// `TypeEnv::cross_file_class_decl_span`, which carries the name the
+    /// declaring file was merged under. Same-file, both routes are the
+    /// checked path and a mismatch is invisible; cross-file, a formatting
+    /// difference between them would make every dedup miss and publish two
+    /// `LB0318` for one declaration — one from each mechanism, at the same
+    /// span, in different words.
+    ///
+    /// `a.lua` declares `A : B` and RESOLVES `B` (the `---@type` and the
+    /// member read are what make the resolver walk it at all); `c.lua`
+    /// declares `B : A`. Two declarations, two diagnostics, both from the
+    /// workspace pass.
+    #[test]
+    fn a_cross_file_resolved_cycle_is_deduped_by_declaration_not_doubled() {
+        let (found, _, _) = cross_file_cycle();
+        let cyclic = |diags: &[Diagnostic]| {
+            diags
+                .iter()
+                .filter(|d| d.code == Some(NumberOrString::String("LB0318".to_owned())))
+                .count()
+        };
+        assert_eq!(
+            cyclic(&found.own),
+            0,
+            "the resolver's rediscovery of `A`'s cycle is covered by the \
+             workspace pass, so a.lua's own half carries none: {:?}",
+            found.own
+        );
+        assert_eq!(
+            found
+                .foreign
+                .values()
+                .map(|group| cyclic(group))
+                .sum::<usize>(),
+            0,
+            "and neither does the cross-file contribution half for `B`'s: {:?}",
+            found.foreign
+        );
+        let published: usize = found.workspace.values().map(|g| cyclic(g)).sum();
+        assert_eq!(
+            published, 2,
+            "one per declaration — and exactly one mechanism publishes them: {:?}",
+            found.workspace
+        );
+    }
+
     /// The over-report guard on the editor path: an acyclic hierarchy —
     /// diamond, chain, and a subclass hanging off nothing cyclic — produces
     /// no cycle diagnostics at all.
     #[test]
     fn an_acyclic_workspace_publishes_no_cycle_diagnostics() {
-        let found = workspace_diagnostics(
+        let found = check_in_workspace(
             &[
                 ("top.lua", "---@class Top\n---@class Left : Top\n"),
                 (
@@ -1178,12 +1294,14 @@ want(mylib.point(1, 2))
         let ambient = MergedAmbient::build(&base, &analysis.project_types(), &[]);
         let lint = LintConfig::new();
         let rocks = RockSurfaces::default();
+        let cycles = class_cycle_diagnostics(&analysis, Strictness::Warn);
         let ctx = CheckCtx {
             strictness: Strictness::Warn,
             ambient: &ambient,
             rocks: &rocks,
             lint: &lint,
             known_globals: &known_globals,
+            cycles: &cycles,
         };
         assert!(diagnostics(&analysis, &path_for("absent.lua"), Dialect::Lua54, &ctx).is_none());
     }

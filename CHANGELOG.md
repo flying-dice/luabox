@@ -233,8 +233,10 @@ and that rule is now written into the policy rather than left to judgement.
   so the two surfaces cannot drift apart again.
 
   **One diagnostic per declaration that carries a cycle edge** — the same
-  count and the same attribution luals gives, measured against the pinned
-  3.13.5. Two `---@class` declarations of one name **union** their parents
+  count and the same attribution luals gives on the shapes measured against
+  the pinned 3.13.5, up to luals' own 999-ancestor walk cap, above which
+  luabox's unbounded walk still reports a ring luals is silent on. Two
+  `---@class` declarations of one name **union** their parents
   (as this project's semantics have always documented), so a class declared
   plainly and reopened with a back-edge is a cycle, reported once, on the
   reopening line; the same cyclic class declared in two files is reported in

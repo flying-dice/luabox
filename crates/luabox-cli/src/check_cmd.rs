@@ -47,7 +47,7 @@ use anyhow::{Context, bail};
 use luabox_diag::{Code, Diagnostic, Format, Label, Severity, Span};
 use luabox_manifest::layout::{self, DefFiles, DefSource};
 use luabox_manifest::model::{Build, DialectId, Manifest};
-use luabox_syntax::{Dialect, LineIndex, lua, luacats};
+use luabox_syntax::{Dialect, LineIndex, lua};
 use luabox_types::ty::Ty;
 use luabox_types::{
     Ambient, DefFile, MAX_ANCESTRY_DEPTH, Strictness, build_ambient_checked, stdlib_defs,
@@ -600,7 +600,7 @@ fn sort_for_render(diags: &mut [Diagnostic]) {
 /// The `---@class` ancestry pre-check: everything about a declared class
 /// hierarchy that can be judged **syntactically** — from each file's
 /// already-harvested annotations ([`luabox_types::FileArtifacts::items`], not
-/// a fresh [`luacats::harvest`] — see the round 6 review M19 note below), not
+/// a fresh `luacats::harvest` — see the round 6 review M19 note below), not
 /// the type env — before [`luabox_types::module_surface_with_artifacts`] gets
 /// anywhere near it.
 ///
@@ -637,7 +637,9 @@ fn sort_for_render(diags: &mut [Diagnostic]) {
 ///
 /// [`MAX_ANCESTRY_DEPTH`]'s check: **the first link over the limit in every
 /// over-limit chain** — the class whose own parent is still within bounds,
-/// which is the one place a reader can act on. Round 6 review M17 replaced a
+/// which is the one place a reader can act on, reported at the declaration
+/// of that class which actually lists the deep parent ([`deep_declaration`],
+/// round 13 review). Round 6 review M17 replaced a
 /// `max_by_key` that let `HashMap` iteration order pick one arbitrary chain
 /// and silently dropped every other; the fix reported every over-limit
 /// *class*, which on a single long chain is a different failure: one 2,500-link
@@ -718,7 +720,7 @@ fn class_ancestry_precheck(files: &[SourceFile], strictness: Strictness) -> Ance
         Severity::Warning
     };
 
-    let HarvestedClasses { declared_at, graph } = harvest_class_graph(files);
+    let graph = harvest_class_graph(files);
     // The union of every declaration's parents (`ClassGraph::parents`), not
     // the first declaration's alone — round 12 review R12-2, and the
     // semantics `docs/03-reference/02-limitations.md` already documents for
@@ -746,20 +748,26 @@ fn class_ancestry_precheck(files: &[SourceFile], strictness: Strictness) -> Ance
     // `the_smallest_over_limit_chain_reports_the_pre_checks_actionable_link_once`.
     let chain_classes = |name: &str| depth.get(name).map(|&d| d + 1);
     let over_limit = |name: &str| chain_classes(name).is_some_and(|c| c > MAX_ANCESTRY_DEPTH);
-    // Every over-limit class's declaration site, whether or not it is the
-    // link this reports: that is what `collect_diagnostics` matches the
-    // resolver-side drain's own `LB0317` against.
+    // EVERY declaration site of every over-limit class, whether or not it is
+    // the link this reports: that is what `collect_diagnostics` matches the
+    // resolver-side drain's own `LB0317` against, and the resolver names the
+    // FIRST declaration (`env::merge_file_types`' first-wins) while this
+    // half now reports the one carrying the deep parent
+    // ([`deep_declaration`]). Covering every declaration is what keeps one
+    // chain one diagnostic across both mechanisms whichever site each picks
+    // — the same "cover the non-reporting sites too" rule the cycle half has
+    // followed since round 12.
     precheck.covered.extend(
         depth
             .keys()
             .filter(|name| over_limit(name))
-            .filter_map(|name| {
-                let &(file_idx, span) = declared_at.get(name)?;
+            .flat_map(|name| graph.declarations(name))
+            .filter_map(|decl| {
                 Some((
                     LB0317_CLASS_ANCESTRY_TOO_DEEP.number(),
-                    files[file_idx].rel.clone(),
-                    span.start,
-                    span.end,
+                    files.get(decl.file)?.rel.clone(),
+                    decl.span.start,
+                    decl.span.end,
                 ))
             }),
     );
@@ -788,19 +796,27 @@ fn class_ancestry_precheck(files: &[SourceFile], strictness: Strictness) -> Ance
     // sort by declaring span, matching the whole-file sort
     // `luabox_types::check::run` already applies to its own `LB0317`
     // diagnostics.
-    frontier.sort_by_key(|name| declared_at.get(*name).map(|&(idx, span)| (idx, span.start)));
+    // Sorted by the FIRST declaration, not the reported one: the order is
+    // "where this class enters the project", which a later reopening must not
+    // move.
+    frontier.sort_by_key(|name| {
+        graph
+            .declarations(name)
+            .next()
+            .map(|decl| (decl.file, decl.span.start))
+    });
 
     let deepest = deepest_descendants(&parents_of, &depth);
     let diags = frontier
         .into_iter()
         .filter_map(|name| {
-            let &(file_idx, span) = declared_at.get(name)?;
-            let file = &files[file_idx];
+            let decl = deep_declaration(&graph, &parents_of, &depth, name)?;
+            let file = files.get(decl.file)?;
             if directives.suppresses(
                 files,
-                file_idx,
+                decl.file,
                 luabox_types::RULE_CLASS_ANCESTRY_TOO_DEEP,
-                span,
+                decl.span.start,
             ) {
                 return None;
             }
@@ -830,7 +846,7 @@ fn class_ancestry_precheck(files: &[SourceFile], strictness: Strictness) -> Ance
                     ),
                 )
                 .with_label(Label::primary(
-                    Span::new(file.rel.as_str(), span.start..span.end),
+                    Span::new(file.rel.as_str(), decl.span.clone()),
                     "first class over the limit",
                 )),
             )
@@ -915,11 +931,12 @@ fn cyclic_class_diagnostics(
             // for above, but not a site luals reports, so not one this does.
             continue;
         }
-        let span = luacats::Span {
-            start: site.span.start,
-            end: site.span.end,
-        };
-        if directives.suppresses(files, site.file, luabox_types::RULE_CIRCLE_DOC_CLASS, span) {
+        if directives.suppresses(
+            files,
+            site.file,
+            luabox_types::RULE_CIRCLE_DOC_CLASS,
+            site.span.start,
+        ) {
             continue;
         }
         precheck.diags.push(
@@ -984,8 +1001,8 @@ struct DirectiveCache {
 }
 
 impl DirectiveCache {
-    /// Whether `rule` is disabled at the line `declared` starts on, in
-    /// `files[file_idx]`'s own source.
+    /// Whether `rule` is disabled at the line byte offset `declared_start`
+    /// falls on, in `files[file_idx]`'s own source.
     ///
     /// Both the rule *name* and the *scanner* come from `luabox-types`, the
     /// one owner: `RULE_CLASS_ANCESTRY_TOO_DEEP` / `RULE_CIRCLE_DOC_CLASS`
@@ -1010,7 +1027,7 @@ impl DirectiveCache {
         files: &[SourceFile],
         file_idx: usize,
         rule: &str,
-        declared: luacats::Span,
+        declared_start: usize,
     ) -> bool {
         let (rules, lines) = self.by_file.entry(file_idx).or_insert_with(|| {
             let text = files[file_idx].parse.syntax().text().to_string();
@@ -1019,7 +1036,7 @@ impl DirectiveCache {
                 LineIndex::new(&text),
             )
         });
-        rules.suppresses(rule, lines.line_of(declared.start))
+        rules.suppresses(rule, lines.line_of(declared_start))
     }
 }
 
@@ -1058,77 +1075,71 @@ fn deepest_descendants<'a>(
     deepest
 }
 
-/// Every `---@class` the project declares, in the two shapes
-/// [`class_ancestry_precheck`]'s halves walk: the shared
-/// [`luabox_types::ClassGraph`] — **every** declaration of every name, which
-/// is what the cycle half attributes per declaration and what unions their
-/// parents (round 12 review R12-2) — and, for the depth half, name ->
-/// (declaring file index, declaring span) with the first declaration
-/// winning, matching this module's other project-wide merges
-/// (`with_project_types`'s "defs win").
+/// Every `---@class` the project declares — **every** declaration of every
+/// name, which is what the cycle half attributes per declaration and what
+/// unions their parents (round 12 review R12-2), and what the depth half
+/// then walks through [`luabox_types::ClassGraph::parents`].
 ///
-/// The depth half stays first-wins on purpose: it reports one link per
-/// over-limit CHAIN (round 6 review M17, re-measured by the per-link-flood
-/// finding), so a reopened class is one chain and one report wherever it was
-/// first declared. The cycle half is per-declaration because that is what
-/// the oracle does — measured, `---@class R : R` in two files draws two
-/// `circle-doc-class` from luals, and a reopened class draws one, on the
-/// declaration that closes the loop.
+/// The per-item extraction rule is **not** this module's: `Tag::Class`, the
+/// empty-name drop and the bare-`Named` parent filter all live in
+/// [`luabox_types::ClassGraph::declare_file`], which `luabox-lsp` calls over
+/// its own file iteration for the very same graph (round 13 review R13-C —
+/// the two used to open-code the identical `filter_map` independently, so
+/// the CLI/LSP parity the seam exists to guarantee lived in two places and
+/// would have diverged silently the moment one was touched).
 ///
-/// The same parents-of-a-declaration filter feeds both: a parent expressed
-/// as anything other than a bare `Name` (a union, a table literal, a generic
-/// argument) is not an edge either half follows — it under-counts rather
-/// than duplicating `luabox-types`' own resolution.
-///
-/// An empty name is not a declaration at all and is dropped on both sides —
-/// see [`class_ancestry_precheck`]'s doc comment for what folding every
-/// bare `---@class` typo in a project into one synthetic node cost.
-fn harvest_class_graph(files: &[SourceFile]) -> HarvestedClasses {
-    let mut declared_at: HashMap<String, (usize, luacats::Span)> = HashMap::new();
+/// What stays here is only the file iteration: this surface enumerates
+/// `SourceFile::artifacts`, the LSP enumerates `Analysis::annotations`.
+fn harvest_class_graph(files: &[SourceFile]) -> luabox_types::ClassGraph {
     let mut graph = luabox_types::ClassGraph::default();
     for (file_idx, file) in files.iter().enumerate() {
-        for item in file.artifacts.items() {
-            for tag in &item.block.tags {
-                let luacats::Tag::Class(class) = tag else {
-                    continue;
-                };
-                if class.name.is_empty() {
-                    continue;
-                }
-                declared_at
-                    .entry(class.name.clone())
-                    .or_insert((file_idx, class.span));
-                graph.declare(
-                    &class.name,
-                    file_idx,
-                    class.span.start..class.span.end,
-                    class
-                        .parents
-                        .iter()
-                        .filter_map(|parent| match &parent.kind {
-                            luacats::TypeExprKind::Named { name, .. } if !name.is_empty() => {
-                                Some(name.clone())
-                            }
-                            _ => None,
-                        })
-                        .collect(),
-                );
-            }
-        }
+        graph.declare_file(file_idx, file.artifacts.items());
     }
-    HarvestedClasses { declared_at, graph }
+    graph
 }
 
-/// The project's declared `---@class` inheritance graph, as
-/// [`harvest_class_graph`] reads it off the harvested annotations.
-struct HarvestedClasses {
-    /// Class name -> the file index and span of its **first** declaration —
-    /// the depth half's report site.
-    declared_at: HashMap<String, (usize, luacats::Span)>,
-    /// Every declaration of every class, the shape the shared cycle seam
-    /// (and, through [`luabox_types::ClassGraph::parents`], the depth half's
-    /// unioned edge set) walks.
-    graph: luabox_types::ClassGraph,
+/// The declaration of `name` an `LB0317` belongs on: the first whose **own**
+/// parent list names the ancestor that gives `name` its depth.
+///
+/// Round 13 review, reopened-deep residual. This used to be the first
+/// declaration of the name unconditionally, which put the finding on the
+/// wrong line for a reopened class:
+///
+/// ```lua
+/// ---@class Foo            -- <- the report landed here, no parent in sight
+/// ---@class Foo : C200     -- <- the line that actually made the chain deep
+/// ```
+///
+/// `LB0318` has attributed per contributing declaration since round 12
+/// (`ClassCycleSite::reports`), so the same class could carry its cycle
+/// finding on the reopening line and its depth finding on the plain one.
+/// Same rule, both codes now.
+///
+/// The deepest parent breaks ties by name so the choice cannot depend on
+/// harvest or hashmap order; the fallback is the first declaration, for the
+/// shapes that have no named parent at all (which cannot be over-limit, but
+/// need not panic to say so).
+fn deep_declaration<'a>(
+    graph: &'a luabox_types::ClassGraph,
+    parents_of: &HashMap<String, Vec<String>>,
+    depth: &HashMap<String, usize>,
+    name: &str,
+) -> Option<luabox_types::ClassDeclaration<'a>> {
+    let deepest_parent = parents_of.get(name).into_iter().flatten().max_by(|a, b| {
+        depth
+            .get(a.as_str())
+            .cmp(&depth.get(b.as_str()))
+            // Deeper wins; between equals the earlier name does, so the
+            // answer is a function of the declarations alone.
+            .then_with(|| b.cmp(a))
+    });
+    deepest_parent
+        .and_then(|parent| {
+            graph
+                .declarations(name)
+                .find(|decl| decl.parents.iter().any(|listed| listed == parent))
+        })
+        .or_else(|| graph.declarations(name).next())
 }
 
 /// The ancestor-chain depth of every class named as a key or a value in
@@ -2995,6 +3006,86 @@ mod tests {
         let diags = class_ancestry_precheck(&files, Strictness::Strict).diags;
         assert_eq!(diags.len(), 1, "{diags:?}");
         assert!(diags[0].message.contains("`B`'s"), "{diags:?}");
+    }
+
+    #[test]
+    fn a_reopened_class_reports_its_depth_at_the_declaration_that_carries_the_deep_parent() {
+        // Round 13 review, the reopened-deep residual. `LB0318` has
+        // attributed per CONTRIBUTING declaration since R12-2; `LB0317` was
+        // still first-declaration-wins, so one class could carry its cycle
+        // finding on the reopening line and its depth finding on a plain
+        // `---@class Deep` line with no parent in sight — a "first class over
+        // the limit" label pointing at a declaration that names no parent at
+        // all, which is not a link anyone can flatten.
+        //
+        // `C0..C199` is 200 classes, exactly at the ceiling. `Deep` reopens
+        // onto `C199` and is 201, the first over it — and only the reopening
+        // declaration says so.
+        let mut src = class_chain_source(MAX_ANCESTRY_DEPTH - 1);
+        src.push_str("---@class Deep\n---@class Deep : C199\n");
+        let files = [source_file("main.lua", &src)];
+
+        let diags = class_ancestry_precheck(&files, Strictness::Strict).diags;
+        assert_eq!(
+            diags.len(),
+            1,
+            "one over-limit chain, one diagnostic — reopening a class does not \
+             make it two: {diags:?}"
+        );
+        assert_eq!(diags[0].code, LB0317_CLASS_ANCESTRY_TOO_DEEP);
+        let label = diags[0].primary_label().expect("points at a declaration");
+        assert!(
+            src.find("---@class Deep\n")
+                .expect("declared plainly first")
+                < src.rfind("---@class Deep : C199").expect("then reopened"),
+            "the plain declaration must come FIRST, or this proves nothing"
+        );
+        // The span is the `---@class` tag itself, so its text says which
+        // declaration was picked without any offset arithmetic.
+        assert_eq!(
+            src.get(label.span.range.clone()),
+            Some("@class Deep : C199"),
+            "the report belongs on the declaration that lists the deep parent, \
+             not on the plain first one: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn every_declaration_of_an_over_limit_class_is_covered_so_the_resolver_is_not_doubled() {
+        // The other half of the attribution move above: this pre-check now
+        // reports the CONTRIBUTING declaration while the resolver's own
+        // `LB0317` names the FIRST one (`env::merge_file_types`' first-wins).
+        // If `covered` followed the report site, the two mechanisms would
+        // point at different spans for one chain and the dedup would miss —
+        // one chain, two diagnostics. Covering every declaration is what
+        // keeps the answer at one whichever site each picks.
+        use std::fmt::Write as _;
+
+        let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
+        let mut src = class_chain_source(MAX_ANCESTRY_DEPTH - 1);
+        src.push_str("---@class Deep\n---@class Deep : C199\n");
+        // A live reference, so the resolver actually walks the chain and its
+        // own drain fires — without this the dedup is never exercised.
+        let _ = write!(
+            src,
+            "\n---@param v Deep\nlocal function use(v)\n  return v.item\nend\nreturn use\n"
+        );
+        write(tmp.path(), "src/main.lua", &src);
+
+        let diags = check_diagnostics(tmp.path());
+        let depth: Vec<&Diagnostic> = diags
+            .iter()
+            .filter(|d| d.code == LB0317_CLASS_ANCESTRY_TOO_DEEP)
+            .collect();
+        assert_eq!(
+            depth.len(),
+            1,
+            "one chain, one `LB0317` across BOTH mechanisms: {depth:?}"
+        );
+        assert!(
+            depth[0].message.contains("`Deep`'s"),
+            "and it is the pre-check's actionable one: {depth:?}"
+        );
     }
 
     // -- SCC shapes end to end (R12-3) ------------------------------------

@@ -1398,7 +1398,10 @@ carries a cycle edge**. A class declared plainly and then reopened with a
 back-edge (`---@class W` then `---@class W : W`) is one finding, on the
 reopening line — the plain declaration is not a cycle edge. The same cyclic
 class declared in two files is two findings, one per file. Both measured
-against the pinned 3.13.5.
+against the pinned 3.13.5. Parity holds on the shapes measured, up to luals'
+own ceiling: its walk stops after 999 ancestors, so an inheritance ring of
+~1,000 or more declarations is silent there while luabox's unbounded walk
+still reports it.
 
 **Escape hatches.** `[types] strict = false` downgrades it to a warning, and
 `---@diagnostic disable[-line|-next-line]: circle-doc-class` suppresses it.

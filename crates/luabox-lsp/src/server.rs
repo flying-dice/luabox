@@ -658,6 +658,28 @@ struct ForeignLedger {
     workspace: BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>,
 }
 
+/// Whether one completed pass derived the workspace-derived findings, and if
+/// so what they are.
+///
+/// An enum rather than [`ForeignLedger::record`]'s former `Option<map>`
+/// positional parameter (round 13 review, clean-code note). The two states
+/// are opposite instructions — "here is the whole workspace answer, replace
+/// yours" versus "I did not look, keep yours" — and `Option` spells the first
+/// one's *empty* case exactly like a mistake: a `Some(BTreeMap::new())`
+/// slipped in by a caller that had nothing to say would read as "the
+/// workspace has no cycles" and wipe every one of them off every document
+/// until the next pass anywhere put them back. Named variants make that
+/// call site say which it means.
+enum WorkspaceScan {
+    /// This pass derived the whole workspace answer. It **replaces** the
+    /// stored one, and the targets of both the old and the new are
+    /// republished — an empty map here is a real, measured "no cycles left".
+    Recomputed(BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>),
+    /// This pass derived nothing about the workspace; the stored answer
+    /// stands, and no document is republished on its account.
+    Skipped,
+}
+
 impl ForeignLedger {
     /// Record one completed pass over `source` and answer with every path
     /// whose published set may have moved, in sorted order.
@@ -669,18 +691,16 @@ impl ForeignLedger {
     /// diagnostic clear: a target that has just dropped out is still
     /// republished, now without it.
     ///
-    /// `workspace` is `None` for a publish that did **not** recompute the
-    /// workspace-derived findings — the scratch-buffer `didClose` path,
-    /// which records "this file contributes nothing" without running a check
-    /// pass. Passing an empty map there instead would read as "the workspace
-    /// has no cycles", wiping every one of them off every document until the
-    /// next keystroke anywhere put them back.
+    /// `workspace` is [`WorkspaceScan::Skipped`] for a publish that did
+    /// **not** derive the workspace-derived findings — a path the analysis
+    /// does not know, which has no answer to give about anything. See that
+    /// type for why this is not an `Option`.
     fn record(
         &mut self,
         source: &Path,
         own: Vec<lsp_types::Diagnostic>,
         foreign: BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>,
-        workspace: Option<BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>>,
+        workspace: WorkspaceScan,
     ) -> Vec<PathBuf> {
         let mut affected: BTreeSet<PathBuf> = BTreeSet::new();
         affected.insert(source.to_path_buf());
@@ -688,7 +708,7 @@ impl ForeignLedger {
             affected.extend(previous.keys().cloned());
         }
         affected.extend(foreign.keys().cloned());
-        if let Some(workspace) = workspace {
+        if let WorkspaceScan::Recomputed(workspace) = workspace {
             affected.extend(self.workspace.keys().cloned());
             affected.extend(workspace.keys().cloned());
             self.workspace = workspace;
@@ -785,6 +805,21 @@ struct Server {
     /// `RefCell` for the same reason as [`Self::pending`]: the read paths run
     /// behind `&self`, and the server is single-threaded.
     merged_ambient: RefCell<Option<(u64, Rc<MergedAmbient>)>>,
+    /// The declared-`---@class` cycle pass for the whole workspace, cached on
+    /// the host revision beside [`Self::merged_ambient`] and by the same
+    /// pattern (round 13 review, noted cost).
+    ///
+    /// Every publish derives the SAME answer from the same workspace — that
+    /// is the whole reason it lives in one ledger slot rather than per
+    /// contributor — so recomputing it inside every [`diagnostics::diagnostics`]
+    /// call meant re-collecting every `---@class` the project declares, and
+    /// re-running Tarjan over them, on every keystroke of every open buffer.
+    ///
+    /// Unlike the merge, this needs **no** manual invalidation: its only
+    /// inputs are the analysis and the strictness, and both move the host
+    /// revision ([`luabox_db::AnalysisHost::apply_change`]), so there is no
+    /// staleness the key cannot see.
+    class_cycles: RefCell<Option<(u64, Rc<diagnostics::ClassCycles>)>>,
     /// The resolved `[lint]` configuration, driving the lint pass in
     /// [`Self::publish_lua`] and the quick-fixes in [`Self::code_actions`].
     lint: LintConfig,
@@ -971,6 +1006,7 @@ impl Server {
             ambient_alias_names: config.def_alias_names,
             rocks: RockSurfaces::default(),
             merged_ambient: RefCell::new(None),
+            class_cycles: RefCell::new(None),
             lint: config.lint,
             known_globals,
             open_docs: BTreeMap::new(),
@@ -1886,6 +1922,28 @@ impl Server {
         merged
     }
 
+    /// The workspace's declared-`---@class` cycle pass at `snapshot`'s
+    /// revision, computed at most once per revision — see
+    /// [`Self::class_cycles`]' field doc.
+    ///
+    /// Deliberately unlogged, unlike [`Self::merged_ambient`]'s rebuild: that
+    /// log exists because the merge's cache key cannot see its own base
+    /// layers moving (N22/#59), and this one's can.
+    fn cycle_pass(&self, snapshot: &Analysis) -> Rc<diagnostics::ClassCycles> {
+        let revision = snapshot.revision();
+        if let Some((cached_at, cycles)) = self.class_cycles.borrow().as_ref()
+            && *cached_at == revision
+        {
+            return Rc::clone(cycles);
+        }
+        let cycles = Rc::new(diagnostics::class_cycle_diagnostics(
+            snapshot,
+            self.strictness,
+        ));
+        *self.class_cycles.borrow_mut() = Some((revision, Rc::clone(&cycles)));
+        cycles
+    }
+
     /// The callee's resolved signature(s) while `position` sits inside a
     /// call's argument list (see [`crate::signature_help`]).
     fn signature_help(&self, uri: &Uri, position: lsp_types::Position) -> Option<SignatureHelp> {
@@ -2184,12 +2242,14 @@ impl Server {
         // byte-identical to the published one) drive add-missing-field.
         let inferred = snapshot.binding_types(&sema.path);
         let merged = self.merged_ambient(&snapshot);
+        let cycles = self.cycle_pass(&snapshot);
         let ctx = diagnostics::CheckCtx {
             strictness: self.strictness,
             ambient: &merged,
             rocks: &self.rocks,
             lint: &self.lint,
             known_globals: &self.known_globals,
+            cycles: &cycles,
         };
         // `own` only: a quick fix is matched against ranges in *this*
         // document, so a diagnostic whose span belongs to another file has
@@ -2473,15 +2533,56 @@ impl Server {
                 .apply_change(Change::ClearOverlay { path: path.clone() });
             self.publish_lua(uri, &path)
         } else {
-            // A scratch buffer with no disk backing: it stops contributing
-            // the instant it closes, so this goes through the ledger rather
-            // than publishing an empty set straight to the wire (F4). An
-            // untracked clear here would leave a cycle it had painted onto a
-            // real project file's panel with nothing left to ever remove it.
+            // A buffer with no disk backing: it stops contributing the
+            // instant it closes, so this goes through the ledger rather than
+            // publishing an empty set straight to the wire (F4). An untracked
+            // clear here would leave a cycle it had painted onto a real
+            // project file's panel with nothing left to ever remove it.
             self.host
                 .apply_change(Change::ClearOverlay { path: path.clone() });
-            self.publish_recorded(uri, &path, Vec::new(), BTreeMap::new(), None)
+            // And the workspace half is recomputed, not skipped (round 13
+            // review R13-A). The overlay that just went away was carrying
+            // this file's `---@class` declarations, so a cycle that only
+            // closed through them is now genuinely gone — but the cycle set
+            // is workspace-derived and lives in ONE ledger slot, so "not
+            // recomputed" left the last answer standing on every other
+            // member's document. Measured sequence: `a.lua` and
+            // `b.lua` declare a mutual cycle and are both open, `a.lua` is
+            // deleted on disk (the watched-DELETE arm blanks the disk text
+            // but the overlay still shadows it, so the cycle survives that
+            // pass), the user closes the orphaned tab — `read_to_string`
+            // fails, the overlay drops, and `b.lua` kept an `LB0318` naming
+            // a class nothing declares any more until it was itself touched.
+            // A false error on a clean open file, and the same "painted with
+            // nothing to remove it" class F4 closed for the other two slots.
+            //
+            // Recomputing is the honest answer, not a clear: it runs the
+            // same workspace pass over the post-`ClearOverlay` snapshot, so
+            // every cycle that survives this close survives in the ledger.
+            let workspace = self.workspace_findings();
+            self.publish_recorded(
+                uri,
+                &path,
+                Vec::new(),
+                BTreeMap::new(),
+                WorkspaceScan::Recomputed(workspace),
+            )
         }
+    }
+
+    /// The workspace-derived findings as of the current host state, with no
+    /// file in flight — [`diagnostics::workspace_diagnostics`] over a fresh
+    /// snapshot.
+    ///
+    /// Routes [`Self::cycle_pass`]' answer and nothing else, for the one
+    /// caller that must leave the ledger's workspace slot correct without
+    /// having a file to check ([`Self::close`]). The `ClearOverlay` that
+    /// precedes it has just moved the revision, so this genuinely derives a
+    /// new pass rather than reusing the cached one — which is the point.
+    fn workspace_findings(&self) -> BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>> {
+        let analysis: Analysis = self.host.snapshot();
+        let cycles = self.cycle_pass(&analysis);
+        diagnostics::workspace_diagnostics(&analysis, &cycles)
     }
 
     /// Publish the current diagnostics for one `.lua` file from a fresh
@@ -2526,12 +2627,14 @@ impl Server {
         let analysis: Analysis = self.host.snapshot();
         let found = {
             let merged = self.merged_ambient(&analysis);
+            let cycles = self.cycle_pass(&analysis);
             let ctx = diagnostics::CheckCtx {
                 strictness: self.strictness,
                 ambient: &merged,
                 rocks: &self.rocks,
                 lint: &self.lint,
                 known_globals: &self.known_globals,
+                cycles: &cycles,
             };
             diagnostics::diagnostics(&analysis, path, self.dialect, &ctx)
         };
@@ -2539,11 +2642,15 @@ impl Server {
         // empty own half — but must NOT publish an empty *workspace* half:
         // that map is the whole answer, not this file's share of it, and a
         // default-constructed one would read as "the workspace has no
-        // cycles" and wipe every one of them off every document. `None` is
-        // "not recomputed"; see `ForeignLedger::record`.
+        // cycles" and wipe every one of them off every document. That is
+        // what `WorkspaceScan::Skipped` says, in the one place it is true.
         let (own, foreign, workspace) = match found {
-            Some(found) => (found.own, found.foreign, Some(found.workspace)),
-            None => (Vec::new(), BTreeMap::new(), None),
+            Some(found) => (
+                found.own,
+                found.foreign,
+                WorkspaceScan::Recomputed(found.workspace),
+            ),
+            None => (Vec::new(), BTreeMap::new(), WorkspaceScan::Skipped),
         };
         self.publish_recorded(uri, path, own, foreign, workspace)
     }
@@ -2562,7 +2669,7 @@ impl Server {
         path: &Path,
         own: Vec<lsp_types::Diagnostic>,
         foreign: BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>,
-        workspace: Option<BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>>,
+        workspace: WorkspaceScan,
     ) -> anyhow::Result<()> {
         for target in self.foreign.record(path, own, foreign, workspace) {
             let set = self.foreign.published_set(&target);
@@ -2707,8 +2814,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        CodeActionOrCommand, ErrorCode, ForeignLedger, ProjectConfig, PublishDiagnostics, Server,
-        ambient_def_sources, apply_content_changes, root_path,
+        CodeActionOrCommand, ErrorCode, ForeignLedger, ProjectConfig, PublishDiagnostics, Rc,
+        Server, WorkspaceScan, ambient_def_sources, apply_content_changes, root_path,
     };
 
     /// A ranged change replacing `[start, end)` with `text`.
@@ -4059,6 +4166,33 @@ return use
             .expect("didChange");
     }
 
+    /// A `textDocument/didClose` for `path`.
+    fn did_close(server: &mut Server, path: &Path) {
+        server
+            .handle_notification(Notification {
+                method: DidCloseTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": crate::uri::path_to_uri(path).to_string() },
+                }),
+            })
+            .expect("didClose");
+    }
+
+    /// A `workspace/didChangeWatchedFiles` announcing `typ` for `path`.
+    fn watched(server: &mut Server, path: &Path, typ: u8) {
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({
+                    "changes": [{
+                        "uri": crate::uri::path_to_uri(path).to_string(),
+                        "type": typ,
+                    }],
+                }),
+            })
+            .expect("didChangeWatchedFiles");
+    }
+
     /// The diagnostic codes of the last publish for `path` in `messages`.
     fn published_codes(messages: &[Message], path: &Path) -> Option<Vec<String>> {
         let uri = crate::uri::path_to_uri(path);
@@ -4282,13 +4416,13 @@ return use
             &a1,
             Vec::new(),
             BTreeMap::from([(target.clone(), vec![ledger_diagnostic("from a1")])]),
-            None,
+            WorkspaceScan::Skipped,
         );
         let affected = ledger.record(
             &a2,
             Vec::new(),
             BTreeMap::from([(target.clone(), vec![ledger_diagnostic("from a2")])]),
-            None,
+            WorkspaceScan::Skipped,
         );
         assert!(affected.contains(&target), "{affected:?}");
         assert_eq!(
@@ -4302,7 +4436,7 @@ return use
         // contributor — or a `published_set` that read only the publishing
         // one — would take a2's finding down with it and leave a real
         // finding invisible until a2.lua is itself touched.
-        let affected = ledger.record(&a1, Vec::new(), BTreeMap::new(), None);
+        let affected = ledger.record(&a1, Vec::new(), BTreeMap::new(), WorkspaceScan::Skipped);
         assert!(
             affected.contains(&target),
             "the target of a group that just went away is still republished: {affected:?}"
@@ -4318,8 +4452,10 @@ return use
     ///
     /// Both halves matter. Merging would put one cycle on a document once
     /// per file the session ever checked; treating "did not compute" as
-    /// "computed empty" would wipe every cycle off every document on a
-    /// scratch-buffer `didClose`, which runs no check pass at all.
+    /// "computed empty" would wipe every cycle off every document the moment
+    /// a publish for a path the analysis does not know went through
+    /// ([`Server::publish_lua`]'s `None` arm, the one remaining
+    /// [`WorkspaceScan::Skipped`] caller).
     #[test]
     fn the_workspace_half_is_replaced_by_a_pass_and_untouched_by_one_that_skips_it() {
         let target = PathBuf::from("c.lua");
@@ -4332,7 +4468,7 @@ return use
             &a1,
             Vec::new(),
             BTreeMap::new(),
-            Some(BTreeMap::from([
+            WorkspaceScan::Recomputed(BTreeMap::from([
                 (target.clone(), vec![ledger_diagnostic("cycle")]),
                 (stale.clone(), vec![ledger_diagnostic("other cycle")]),
             ])),
@@ -4342,7 +4478,7 @@ return use
             &a2,
             Vec::new(),
             BTreeMap::new(),
-            Some(BTreeMap::from([(
+            WorkspaceScan::Recomputed(BTreeMap::from([(
                 target.clone(),
                 vec![ledger_diagnostic("cycle")],
             )])),
@@ -4357,11 +4493,11 @@ return use
 
         // A publish that computed nothing (the scratch-buffer didClose path)
         // must not read as "the workspace is clean".
-        ledger.record(&a1, Vec::new(), BTreeMap::new(), None);
+        ledger.record(&a1, Vec::new(), BTreeMap::new(), WorkspaceScan::Skipped);
         assert_eq!(
             ledger_messages(&ledger, &target),
             vec!["cycle".to_owned()],
-            "`None` keeps the stored answer; an empty map would have wiped it"
+            "`Skipped` keeps the stored answer; `Recomputed(empty)` would have wiped it"
         );
     }
 
@@ -4420,6 +4556,183 @@ return use
             1,
             "fixing one contributor must clear its group and keep the \
              other's, not clear the target: {codes:?}"
+        );
+    }
+
+    /// Round 13 review, the per-keystroke workspace rebuild: the cycle pass
+    /// is derived at most once per host revision, and a new revision derives
+    /// a new one.
+    ///
+    /// Asserted on identity, not on a log line: the answer is a pure function
+    /// of the analysis and the strictness, so two computations at one
+    /// revision are indistinguishable by their contents and only `Rc::ptr_eq`
+    /// can tell a cache hit from an honest recompute. Drop the revision check
+    /// in `cycle_pass` and the first assertion fails; drop the store and the
+    /// same one does.
+    #[test]
+    fn the_workspace_cycle_pass_is_derived_once_per_revision() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("main.lua");
+        fs::write(&path, "---@class Ring : Ring\n").expect("write main.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        // Scoped: an outstanding `Analysis` blocks the host's next
+        // `apply_change`, so the snapshot must not outlive the reads it is
+        // for. The `Rc` may — it holds diagnostics, not the database.
+        let (first, before) = {
+            let snapshot = server.host.snapshot();
+            let first = server.cycle_pass(&snapshot);
+            let second = server.cycle_pass(&snapshot);
+            assert!(
+                Rc::ptr_eq(&first, &second),
+                "a second read at the same revision must reuse the pass, not \
+                 re-collect every `---@class` in the workspace"
+            );
+            (first, snapshot.revision())
+        };
+
+        // A keystroke bumps the revision, and the answer may genuinely have
+        // moved with it — the cache must not outlive its key.
+        did_open(&mut server, &path, "---@class Ring : Ring\n-- typed\n");
+        drop(drain(&client));
+        let after = server.host.snapshot();
+        assert_ne!(after.revision(), before, "the edit landed");
+        assert!(
+            !Rc::ptr_eq(&first, &server.cycle_pass(&after)),
+            "a new revision derives a new pass"
+        );
+    }
+
+    /// R13-A: the close of a document with no disk backing must recompute
+    /// the workspace half, not skip it — the cycle it was holding up is
+    /// genuinely over the instant its overlay drops.
+    ///
+    /// The exact sequence, in order, because every step matters:
+    ///
+    /// 1. `a.lua` and `b.lua` declare a mutual `---@class` cycle; both open.
+    ///    `b.lua`'s panel carries an `LB0318`.
+    /// 2. `a.lua` is deleted on disk and announced. The watched-DELETE arm
+    ///    blanks the DISK text, but the editor overlay still shadows it, so
+    ///    `A` is still declared and the cycle is still real — asserted,
+    ///    because if it cleared here the step below would prove nothing.
+    /// 3. The user closes the orphaned tab. `read_to_string` fails, the
+    ///    overlay drops, and now nothing in the workspace declares `A`.
+    ///
+    /// At step 3 the close handler passed `workspace: None` — "not
+    /// recomputed" — so the stored answer stood: `b.lua` kept an error naming
+    /// a class that no longer exists anywhere, on a clean open file, until a
+    /// keystroke, a config reload or reopening `a.lua` happened to run
+    /// another pass. RED at `d1a7381`: `b.lua` is not in the affected set at
+    /// all, so the `expect` below fires.
+    #[test]
+    fn closing_a_deleted_buffer_clears_the_cycle_it_was_the_last_declaration_of() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let a_path = root.join("a.lua");
+        let b_path = root.join("b.lua");
+        let a_source = "---@class A : B\n";
+        let b_source = "---@class B : A\n";
+        fs::write(&a_path, a_source).expect("write a.lua");
+        fs::write(&b_path, b_source).expect("write b.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        did_open(&mut server, &a_path, a_source);
+        did_open(&mut server, &b_path, b_source);
+        let opened = drain(&client);
+        assert!(
+            published_codes(&opened, &b_path)
+                .expect("b.lua is published")
+                .contains(&"LB0318".to_string()),
+            "the cycle must be on b.lua's panel first: {opened:?}"
+        );
+
+        fs::remove_file(&a_path).expect("delete a.lua");
+        watched(&mut server, &a_path, 3);
+        let deleted = drain(&client);
+        assert!(
+            published_codes(&deleted, &b_path)
+                .expect("the DELETE republishes every open document")
+                .contains(&"LB0318".to_string()),
+            "the overlay still declares `A`, so the cycle is still real here — \
+             if it cleared now, the close below would prove nothing: {deleted:?}"
+        );
+
+        did_close(&mut server, &a_path);
+        let closed = drain(&client);
+        let codes = published_codes(&closed, &b_path).expect(
+            "b.lua must be republished by the close that removed the cycle's \
+             last remaining declaration",
+        );
+        assert!(
+            !codes.contains(&"LB0318".to_string()),
+            "nothing declares `A` any more; the cycle must leave b.lua's panel \
+             in this batch, not on some later keystroke: {codes:?}"
+        );
+    }
+
+    /// R13-C: a cycle that exists ONLY because two files' declarations of one
+    /// name union, reported by the editor, attributed per declaration.
+    ///
+    /// `a.lua` declares `A` plainly, `b.lua` reopens it as `A : B`, `c.lua`
+    /// declares `B : A`. No single file contains a cycle; the union does. The
+    /// server builds its own graph over its own file iteration, and until
+    /// this test nothing exercised that path across files — the CLI's union
+    /// tests could not, because they run the other surface's harvest.
+    ///
+    /// Attribution is the other half: `b.lua` and `c.lua` carry the finding
+    /// because their OWN parent lists close the loop; `a.lua`'s plain
+    /// `---@class A` does not and must stay clean, exactly as luals leaves it.
+    #[test]
+    fn the_editor_reports_a_cycle_formed_only_by_the_union_across_files() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let a_path = root.join("a.lua");
+        let b_path = root.join("b.lua");
+        let c_path = root.join("c.lua");
+        let (a_source, b_source, c_source) =
+            ("---@class A\n", "---@class A : B\n", "---@class B : A\n");
+        fs::write(&a_path, a_source).expect("write a.lua");
+        fs::write(&b_path, b_source).expect("write b.lua");
+        fs::write(&c_path, c_source).expect("write c.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        did_open(&mut server, &a_path, a_source);
+        let published = drain(&client);
+
+        for (path, member) in [(&b_path, "`A`'s"), (&c_path, "`B`'s")] {
+            let diags = published_diagnostics(&published, &crate::uri::path_to_uri(path))
+                .unwrap_or_else(|| panic!("{} must be published", path.display()));
+            let cyclic: Vec<&Value> = diags
+                .as_array()
+                .expect("an array")
+                .iter()
+                .filter(|d| d["code"] == "LB0318")
+                .collect();
+            assert_eq!(
+                cyclic.len(),
+                1,
+                "one finding on the declaration that closes the loop: {diags:?}"
+            );
+            assert!(
+                cyclic[0]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains(member)),
+                "{} names its own class: {cyclic:?}",
+                path.display()
+            );
+        }
+
+        // The declaration that opened `A` without a parent is not a cycle
+        // edge, so it draws nothing — the union finds the cycle, it does not
+        // flatten the blame onto every declaration of a member.
+        let for_a =
+            published_codes(&published, &a_path).expect("a.lua is published, it was opened");
+        assert!(
+            !for_a.contains(&"LB0318".to_string()),
+            "the plain `---@class A` is innocent: {for_a:?}"
         );
     }
 

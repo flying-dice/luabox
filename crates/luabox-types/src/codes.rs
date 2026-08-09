@@ -98,6 +98,12 @@ pub const CLASS_DEPTH_LIMIT: Code = Code::new(317);
 /// declaration that carries a cycle edge, and deduped against this ledger's
 /// findings by declaration site.
 ///
+/// That parity is claimed on the shapes measured, up to luals's own ceiling:
+/// its walk stops after 999 ancestors
+/// (`script/core/diagnostics/circle-doc-class.lua:27`), while
+/// [`crate::ClassGraph`]'s Tarjan walk is unbounded, so a ring of ~1,000+
+/// declarations is reported here and silent there.
+///
 /// **Both** surfaces run it (round 12 review R12-1) — `luabox check`, in
 /// `check_cmd::cyclic_class_diagnostics`, over the project's files; and the
 /// LSP, in `luabox_lsp::diagnostics::class_cycle_diagnostics`, over the

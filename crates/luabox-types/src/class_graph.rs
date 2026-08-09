@@ -43,7 +43,7 @@
 //! Every declaration whose **own** parent list names a member of its own
 //! strongly connected component — a *cycle edge*. Measured against the
 //! pinned lua-language-server 3.13.5 (2026-08-09, `--checklevel=Warning`),
-//! which is exactly what it does:
+//! which reports exactly this on each shape below:
 //!
 //! | fixture | luals `circle-doc-class` |
 //! |---|---|
@@ -56,6 +56,14 @@
 //! | `---@class Sub : A` behind a cyclic `A`/`B` | **2** — the innocent subclass is not reported |
 //! | a DAG/diamond with no cycle | **0** |
 //!
+//! Parity is claimed **on the shapes measured, up to luals's own ceiling**:
+//! its walk is capped at 999 ancestors
+//! (`script/core/diagnostics/circle-doc-class.lua:27`, `for i = 1, 999`), so
+//! an inheritance ring of ~1,000 or more declarations is silent there while
+//! the Tarjan walk below is unbounded (the 50,001-node test) and still
+//! reports it — a divergence toward correctness, on a shape no real project
+//! has.
+//!
 //! [`ClassGraph::cycle_sites`] answers with every declaration site of every
 //! cycle member — the innocent ones included, flagged
 //! [`ClassCycleSite::reports`]` == false` — because a caller needs the
@@ -63,6 +71,7 @@
 //! *accounted for*, and the resolver-side rediscovery of the same cycle must
 //! be deduped against all of them, not only the ones that printed.
 
+use luabox_syntax::luacats;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::ops::Range;
@@ -115,6 +124,24 @@ pub struct ClassCycleSite {
     pub reports: bool,
 }
 
+/// One recorded `---@class` declaration, borrowed: where it is and the
+/// parents **that declaration** lists.
+///
+/// What a caller needs to attribute a finding about one class to the
+/// declaration that actually caused it — the rule [`ClassCycleSite::reports`]
+/// applies to `LB0318`, and `luabox check`'s ancestry-depth half applies to
+/// `LB0317` (round 13 review, reopened-deep residual).
+#[derive(Debug, Clone, Copy)]
+pub struct ClassDeclaration<'a> {
+    /// The caller's index for the declaring file — whatever
+    /// [`ClassGraph::declare`] was handed.
+    pub file: usize,
+    /// The `---@class` tag span, in the declaring file.
+    pub span: &'a Range<usize>,
+    /// The parents this declaration itself lists — not the union.
+    pub parents: &'a [String],
+}
+
 impl ClassGraph {
     /// Record one `---@class` declaration. `parents` is the names it lists
     /// by bare name; a parent expressed as anything else (a union, a table
@@ -140,6 +167,57 @@ impl ClassGraph {
             });
     }
 
+    /// Record every `---@class` one project file's harvested annotations
+    /// declare — the whole per-item extraction rule, in one place.
+    ///
+    /// Both surfaces that report `LB0318` call this: `luabox check` over its
+    /// `SourceFile::artifacts`, `luabox-lsp` over `Analysis::annotations`.
+    /// Each keeps its own file iteration (they enumerate different things),
+    /// but the rule for turning one annotated item into graph edges —
+    /// `Tag::Class`, drop the empty name, keep only bare non-empty `Named`
+    /// parents — lives here and nowhere else.
+    ///
+    /// Round 13 review R13-C: the two used to open-code it independently, so
+    /// the CLI/LSP parity this whole seam exists to guarantee was itself a
+    /// convention held in two places. A widened parent shape (a generic
+    /// argument, a parenthesised name) or a relaxed empty-name rule applied
+    /// to one of them would have moved one surface and not the other,
+    /// silently — exactly the editor/CLI split the module doc opens with.
+    pub fn declare_file(&mut self, file: usize, items: &[luacats::AnnotatedItem]) {
+        for item in items {
+            for tag in &item.block.tags {
+                let luacats::Tag::Class(class) = tag else {
+                    continue;
+                };
+                self.declare(
+                    &class.name,
+                    file,
+                    class.span.start..class.span.end,
+                    class.parents.iter().filter_map(named_parent).collect(),
+                );
+            }
+        }
+    }
+
+    /// Every declaration of `name`, in harvest order — empty for a name
+    /// nothing declares (a parent naming an ambient or undeclared class).
+    ///
+    /// The first is the "declared here" site every other project-wide merge
+    /// in this workspace picks (`env::merge_file_types`' first-wins); the one
+    /// whose `parents` names a given ancestor is the one a finding about that
+    /// ancestor belongs on.
+    pub fn declarations(&self, name: &str) -> impl Iterator<Item = ClassDeclaration<'_>> {
+        self.decls
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(|decl| ClassDeclaration {
+                file: decl.file,
+                span: &decl.span,
+                parents: &decl.parents,
+            })
+    }
+
     /// Name -> the **union** of every declaration's named parents, first
     /// mention first, deduplicated.
     ///
@@ -149,9 +227,15 @@ impl ClassGraph {
     pub fn parents(&self) -> HashMap<String, Vec<String>> {
         let mut out: HashMap<String, Vec<String>> = HashMap::with_capacity(self.decls.len());
         for (name, decls) in &self.decls {
+            // Order is the union's contract (first mention first), membership
+            // is not: a `Vec::contains` scan per parent is O(P²) in the
+            // parents one name accumulates across every declaration of it,
+            // which a widely-reopened class in a large project does have
+            // (round 13 review, clean-code note).
+            let mut seen: HashSet<&str> = HashSet::new();
             let mut parents: Vec<String> = Vec::new();
             for parent in decls.iter().flat_map(|decl| &decl.parents) {
-                if !parents.contains(parent) {
+                if seen.insert(parent.as_str()) {
                     parents.push(parent.clone());
                 }
             }
@@ -196,6 +280,21 @@ impl ClassGraph {
         }
         sites.sort_by(|a, b| (a.file, a.span.start, &a.name).cmp(&(b.file, b.span.start, &b.name)));
         sites
+    }
+}
+
+/// The one parent-extraction rule [`ClassGraph::declare_file`] applies: a
+/// `---@class` parent is an edge this graph follows only when it is written
+/// as a bare, non-empty name.
+///
+/// A parent expressed as anything else — a union, a table literal, a generic
+/// argument — is deliberately not an edge: the graph under-counts there
+/// rather than duplicating `luabox-types`' own resolution, and both surfaces
+/// under-count identically because they share this function.
+fn named_parent(parent: &luacats::TypeExpr) -> Option<String> {
+    match &parent.kind {
+        luacats::TypeExprKind::Named { name, .. } if !name.is_empty() => Some(name.clone()),
+        _ => None,
     }
 }
 
@@ -286,10 +385,13 @@ fn enter<'a>(
 /// ordinary, acyclic class, and reporting those would flag every DAG in
 /// every project. The self-edge is recorded by the edge walk that already
 /// visits it rather than re-scanned from the parent list afterwards.
+///
+/// Not public: [`ClassGraph::cycle_sites`] is the whole of what both callers
+/// consume, and a bare `HashMap<String, Vec<String>>` entry point invites a
+/// third harvest with its own parent rule — the very drift R13-C closed
+/// (round 13 review, clean-code note; the re-export had no caller).
 #[must_use]
-pub fn class_cycles<S: BuildHasher>(
-    parents_of: &HashMap<String, Vec<String>, S>,
-) -> Vec<Vec<String>> {
+fn class_cycles<S: BuildHasher>(parents_of: &HashMap<String, Vec<String>, S>) -> Vec<Vec<String>> {
     let mut nodes: HashMap<&str, NodeState> = HashMap::new();
     let mut component: Vec<&str> = Vec::new();
     let mut self_edged: HashSet<&str> = HashSet::new();
@@ -408,7 +510,11 @@ mod tests {
     ///
     /// RED-proven by dropping the `group.len() > 1 || self_edged` filter:
     /// every one of these five singleton components is then reported as a
-    /// cycle and this test fails (it is the only one that does).
+    /// cycle. Measured: **6** of this module's tests fail on that mutation
+    /// (the earlier "it is the only one that does" was wrong — round 13
+    /// review). This is the one whose fixture is a real multi-branch
+    /// hierarchy, so it is where an over-report is distinguishable from the
+    /// degenerate one- and two-node cases the others pin.
     #[test]
     fn an_acyclic_hierarchy_reports_no_cycle_at_all() {
         let dag = graph(&[
@@ -691,6 +797,86 @@ mod tests {
         declared(&mut graph, "", 0, 0, &[""]);
         assert!(graph.parents().is_empty());
         assert!(graph.cycle_sites().is_empty());
+    }
+
+    // === the shared harvest (round 13 review R13-C) ======================
+
+    /// The extraction rule itself, at its one owner: parse a file, hand its
+    /// annotated items to [`ClassGraph::declare_file`], and check what became
+    /// an edge.
+    ///
+    /// Both `luabox check` and `luabox-lsp` reach the graph through this
+    /// function now, so this test is the parity pin for the rule — measured,
+    /// diverging it here fails 23 CLI tests and 7 LSP tests at once, which is
+    /// what "one rule, two callers" is supposed to mean.
+    fn harvested(src: &str) -> ClassGraph {
+        let parsed = luabox_syntax::lua::parse(src, luabox_syntax::lua::Dialect::Lua54);
+        let items = luacats::harvest(&parsed);
+        let mut graph = ClassGraph::default();
+        graph.declare_file(7, &items);
+        graph
+    }
+
+    #[test]
+    fn the_shared_harvest_keeps_bare_named_parents_and_drops_everything_else() {
+        let graph = harvested(
+            "---@class Plain : Base\n\
+             ---@class Multi : Base, Other\n\
+             ---@class Fancy : Base|Other\n\
+             ---@class Generic : Box<Base>\n\
+             ---@class Bare\n\
+             ---@class\n",
+        );
+        let parents = graph.parents();
+
+        assert_eq!(parents.get("Plain"), Some(&vec!["Base".to_owned()]));
+        assert_eq!(
+            parents.get("Multi"),
+            Some(&vec!["Base".to_owned(), "Other".to_owned()]),
+            "every named parent is an edge, not just a lone one"
+        );
+        assert_eq!(
+            parents.get("Fancy"),
+            Some(&Vec::new()),
+            "a union is not a bare name: under-count rather than duplicate \
+             the resolver's own walk"
+        );
+        assert_eq!(
+            parents.get("Generic").map(Vec::len),
+            Some(1),
+            "a generic application resolves to its own head name, not to its \
+             argument: {parents:?}"
+        );
+        assert_eq!(parents.get("Bare"), Some(&Vec::new()));
+        assert!(
+            !parents.contains_key(""),
+            "a bare `---@class` typo is not a declaration: {parents:?}"
+        );
+    }
+
+    #[test]
+    fn the_shared_harvest_records_every_declaration_against_its_file() {
+        let graph = harvested("---@class Widget\n---@class Widget : Base\n");
+        let decls: Vec<(usize, usize, Vec<String>)> = graph
+            .declarations("Widget")
+            .map(|decl| (decl.file, decl.span.start, decl.parents.to_vec()))
+            .collect();
+        assert_eq!(
+            decls.len(),
+            2,
+            "reopening is a second declaration: {decls:?}"
+        );
+        assert!(decls.iter().all(|(file, ..)| *file == 7), "{decls:?}");
+        assert!(
+            decls[0].1 < decls[1].1 && decls[0].2.is_empty(),
+            "harvest order, and each declaration's OWN parents: {decls:?}"
+        );
+        assert_eq!(decls[1].2, vec!["Base".to_owned()]);
+        assert_eq!(
+            graph.declarations("Nothing").count(),
+            0,
+            "a name nothing declares has no declarations"
+        );
     }
 
     // === the message =====================================================
