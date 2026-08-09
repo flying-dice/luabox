@@ -102,6 +102,19 @@ and that rule is now written into the policy rather than left to judgement.
   only way to keep this PR's behavior from reaching your CI is not
   upgrading past it — pin the `luabox` binary version.
 
+- **The language server no longer re-checks every foreign file it notifies,
+  and a never-opened file's panel is cross-file findings only until it is
+  first opened.** Publishing a diagnostic that belongs to another file used
+  to re-run that file's whole check pass — parse, validate, type-check, lint
+  — once per notified target, per keystroke, single-threaded. It now reuses
+  the file's own half from the last pass over that file. The visible
+  consequence, stated rather than left in a code comment: a document nobody
+  has opened yet shows only the cross-file group that named it, not its own
+  findings, until it is itself checked — opening it, editing it, or a
+  watched-file event for it publishes it in full and merges the two halves
+  back together. Additive and self-healing; nothing the client already
+  displays is contradicted or withdrawn.
+
 ### Added
 
 - **Hover and completion resolve class members through the checker's
@@ -204,7 +217,19 @@ and that rule is now written into the policy rather than left to judgement.
   "reports nothing for either shape (measured)"; that was asserted, never
   measured, and is false — it is now measured, in the `luals-differential`
   corpus rows `cyclic_class_self` and `cyclic_class_mutual`, which re-derive
-  both columns on every run. Consequently the suppression name is luals' own:
+  both columns on every run.
+
+  **Reported from the declaration, like luals — not only when something
+  resolves the class.** `luabox check` finds cycles in the declared
+  `---@class` graph up front, so `---@class Widget : Widget` sitting in a
+  types file nothing requires is a finding on the command line, exactly as it
+  already was in the editor. Until this change `LB0318` was filed only by the
+  resolver's back-edge, so an unreferenced cyclic class was flagged by the
+  language server and silent in CI while this entry claimed flat parity —
+  the gap is measured and closed by the corpus row
+  `cyclic_class_unreferenced` (a cyclic class with zero uses: both tools
+  report). One diagnostic per class either way: the syntactic pre-check and
+  the resolver's own rediscovery are deduped by declaration site. Consequently the suppression name is luals' own:
   `---@diagnostic disable[-line|-next-line]: circle-doc-class` (it was spelt
   `cyclic-class-ancestry` in this branch's earlier rounds — corrected before
   release, so no comment in the wild breaks, and a luals user's existing

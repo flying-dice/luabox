@@ -64,7 +64,7 @@ pub(crate) const AWAIT_IN_SYNC: Code = Code::new(316);
 /// trips on `on_path.len()`, the depth of the *current recursion path*, so
 /// `---@class A : B, C` with one branch past the cap reports this exactly as
 /// a strict chain does. The CLI's separate syntactic pre-check
-/// (`check_cmd::deep_class_chain_diagnostics`) follows every named parent
+/// (`check_cmd::class_ancestry_precheck`) follows every named parent
 /// too (round 6 review M4(c) — it used to treat any multi-parent class as a
 /// root and not follow it at all, so the identical depth flipped from
 /// `error`/exit 1 to `warning`/exit 0 the moment an unrelated second parent
@@ -85,7 +85,20 @@ pub const CLASS_DEPTH_LIMIT: Code = Code::new(317);
 /// against the pinned binary (corpus rows `cyclic_class_self` /
 /// `cyclic_class_mutual`). This doc previously claimed luals "reports nothing
 /// for either shape"; that was asserted, never measured, and round 8 measured
-/// it false. Downgradable the same way every other `LB03xx` is: `[types]
+/// it false.
+///
+/// Parity **on the declaration**, not merely on a resolved class (round 11
+/// review R11-1). This ledger is filled by [`crate::env::TypeEnv::note_cyclic`]
+/// from a resolution walk, so on its own it says nothing about a class no
+/// file references — and luals' check fires from the `---@class` node alone
+/// (measured against the pinned binary on a fixture with zero uses; corpus
+/// row `cyclic_class_unreferenced`). `luabox check` closes that half
+/// syntactically, in `check_cmd::cyclic_class_diagnostics`, which walks the
+/// declared class graph for strongly connected components before anything is
+/// resolved and dedupes its findings against this ledger's by declaration
+/// site. A direct `check_file*` caller below the CLI (the LSP, this crate's
+/// tests) still sees only the resolution-driven half — the LSP resolves what
+/// it displays, so the same cycle surfaces there when the file is opened. Downgradable the same way every other `LB03xx` is: `[types]
 /// strict = false` makes it a warning and `---@diagnostic
 /// disable[-line|-next-line]: circle-doc-class` suppresses it —
 /// luals' own rule name ([`crate::directive::RULE_CIRCLE_DOC_CLASS`], the

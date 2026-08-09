@@ -495,7 +495,7 @@ pub struct TypeEnv {
 /// ceiling side.
 ///
 /// `luabox-cli::check_cmd`'s syntactic pre-check
-/// (`deep_class_chain_diagnostics`) imports this exact constant rather than
+/// (`class_ancestry_precheck`) imports this exact constant rather than
 /// deriving its own ceiling: it used to guard 2,000 links deep, a number
 /// picked for its *own* (pinned-thread) crash floor with room to spare — but
 /// that number was never a promise this walk could keep. A chain past 200
@@ -4394,6 +4394,50 @@ mod tests {
         TypeEnv::build(&parsed)
     }
 
+    /// The wall-clock ceiling a bounded test gets unless it names its own.
+    ///
+    /// Several tests in this module assert a *termination* property: a walk
+    /// that is O(V) with its guard in place and exponential (or infinite)
+    /// without it. No assertion on the returned value can see "correct but
+    /// exponential", so the bound IS the assertion — and it exists so that a
+    /// mutant which kills the guard fails FAST rather than hanging the suite,
+    /// which cargo-mutants would read as a timeout rather than a kill.
+    ///
+    /// One number, one rationale, one place to change it (round 11 review
+    /// R11-3's clean-code note: the scaffold was copy-pasted across ~7 tests
+    /// with 5/10/20/30s constants scattered through them, which is the
+    /// policy drift that produced R11-3 itself). 10s is comfortably above
+    /// every bounded fixture's measured runtime here — the slowest, the
+    /// k=50 conflicting-diamond discovery walks, run well under a second on
+    /// an unoptimized debug build — and comfortably below
+    /// `mutants-gate.sh`'s own `--timeout 90`, so the in-test bound always
+    /// fires first and a slow mutant is a KILL, not a gate-failing TIMEOUT.
+    /// A test needing more must say so with [`run_bounded_within`] AND stay
+    /// under that 90s ceiling.
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Run `body` on its own thread and fail — fast — if it has not finished
+    /// within [`BOUND`]. `what` completes the sentence "…must finish within
+    /// the bound: ".
+    fn run_bounded<T: Send + 'static>(what: &str, body: impl FnOnce() -> T + Send + 'static) -> T {
+        run_bounded_within(BOUND, what, body)
+    }
+
+    /// [`run_bounded`] with an explicit ceiling, for a fixture whose cost is
+    /// genuinely different from the rest.
+    fn run_bounded_within<T: Send + 'static>(
+        bound: std::time::Duration,
+        what: &str,
+        body: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(body());
+        });
+        rx.recv_timeout(bound)
+            .unwrap_or_else(|_| panic!("{what} must finish within {bound:?}"))
+    }
+
     #[test]
     fn a_single_parents_own_field_declaration_overrides_its_inherited_value() {
         // production-readiness-assessment-9natxz A1's own regression: the
@@ -4769,8 +4813,8 @@ mod tests {
         // batch merges of an already-built list, not a per-tag scan, so
         // they were never the dominant K² cost here.
         //
-        // K=20,000 (matching the CLI table above) with a 5s ceiling (this
-        // file's other bounded-time tests' convention): comfortably fast
+        // K=20,000 (matching the CLI table above) under this module's shared
+        // bound (`run_bounded`/`BOUND`): comfortably fast
         // after the fix (well under 1s even on this unoptimized debug
         // build); reverting just the `indexer_index` cache reproduces a
         // real timeout here, confirmed by hand.
@@ -4780,19 +4824,15 @@ mod tests {
             use std::fmt::Write as _;
             let _ = writeln!(source, "---@field [{i}] number");
         }
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let env = env_of(&source);
-            let def = env.classes.get("Big").map(|def| def.indexers.len());
-            let _ = tx.send(def);
-        });
-        let len = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect(
-                "absorbing 20,000 indexer fields on one class must finish well under 5s; \
-                 an O(K²) regression would not return in this process's lifetime",
-            )
-            .expect("the class is declared");
+        let len = run_bounded(
+            "absorbing 20,000 indexer fields on one class — an O(K²) regression would not \
+             return in this process's lifetime",
+            move || {
+                let env = env_of(&source);
+                env.classes.get("Big").map(|def| def.indexers.len())
+            },
+        )
+        .expect("the class is declared");
         assert_eq!(len, k, "every distinct indexer key must survive the dedup");
     }
 
@@ -5219,19 +5259,15 @@ mod tests {
         // hanging the suite.
         let k = 60;
         let source = conflicting_diamond_source(k);
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let env = env_of(&source);
-            let shape = env.class_shape_bound(&format!("A{k}"), &[Ty::String]);
-            let _ = tx.send(shape);
-        });
-        let shape = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect(
-                "a k=60 conflicting diamond must resolve in well under 5s; \
-                 an exponential regression would not return in this process's lifetime",
-            )
-            .expect("the top-level diamond class is declared");
+        let shape = run_bounded(
+            "a k=60 conflicting diamond's resolution — an exponential regression would not \
+             return in this process's lifetime",
+            move || {
+                let env = env_of(&source);
+                env.class_shape_bound(&format!("A{k}"), &[Ty::String])
+            },
+        )
+        .expect("the top-level diamond class is declared");
         // Termination and a non-corrupted shape is what this test is for;
         // the guard's *correctness* on conflicting bindings (which binding
         // wins) is pinned by `duplicate_class_merge.rs`'s dedicated
@@ -5721,19 +5757,15 @@ mod tests {
         // catches a wrong-shape regression the timeout alone would not.
         let k = 60;
         let source = diamond_source(k);
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let env = env_of(&source);
-            let shape = env.class_shape(&format!("L{k}C"));
-            let _ = tx.send(shape);
-        });
-        let shape = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect(
-                "a k=60 diamond must resolve in well under 5s on the memoised path; \
-                 an O(2^60) regression would not return in this process's lifetime",
-            )
-            .expect("the top-level diamond class is declared");
+        let shape = run_bounded(
+            "a k=60 diamond's resolution on the memoised path — an O(2^60) regression would \
+             not return in this process's lifetime",
+            move || {
+                let env = env_of(&source);
+                env.class_shape(&format!("L{k}C"))
+            },
+        )
+        .expect("the top-level diamond class is declared");
         assert_eq!(
             shape.fields["item"].ty,
             Ty::Number,
@@ -5811,34 +5843,38 @@ mod tests {
             multi_source.push_str(&conflicting_diamond_group(&format!("G{g}_"), k));
         }
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let env = env_of(&multi_source);
-            let mut per_group = Vec::with_capacity(groups);
-            for g in 0..groups {
-                let mut shape = TableTy::default();
-                let mut guard = DiamondGuard::default();
-                env.collect_class(
-                    &format!("G{g}_A{k}"),
-                    &[Ty::String],
-                    &mut shape,
-                    &mut guard,
-                    false,
-                );
-                per_group.push((
-                    shape.fields.get("item").map(|f| f.ty.clone()),
-                    guard.resolutions,
-                ));
-            }
-            let _ = tx.send(per_group);
-        });
-        let per_group = rx.recv_timeout(std::time::Duration::from_secs(30)).expect(
-            "10 independently-conflicting k=190 diamond groups must resolve in well under \
-             30s when the total-work budget is actually capping each one (measured ~5s in a \
-             debug build) — a single uncapped k=190 group alone measures >90s \
-             (MAX_ANCESTRY_RESOLUTIONS's own doc comment); a resolutions counter that never \
-             advances blows this well past any reasonable timeout rather than merely \
-             miscounting",
+        // The one fixture in this module that genuinely needs more than
+        // `BOUND`: ten k=190 groups measure ~5s in a debug build, so a 10s
+        // ceiling would be a 2x margin on a contended runner. 30s keeps ~6x
+        // and still sits well inside `mutants-gate.sh`'s `--timeout 90`, so
+        // this bound fires before cargo-mutants' does (round 11 R11-3).
+        let per_group = run_bounded_within(
+            std::time::Duration::from_secs(30),
+            "10 independently-conflicting k=190 diamond groups, with the total-work budget \
+             capping each one (measured ~5s in a debug build) — a single uncapped k=190 \
+             group alone measures >90s (MAX_ANCESTRY_RESOLUTIONS's own doc comment), and a \
+             resolutions counter that never advances blows past any reasonable timeout \
+             rather than merely miscounting",
+            move || {
+                let env = env_of(&multi_source);
+                let mut per_group = Vec::with_capacity(groups);
+                for g in 0..groups {
+                    let mut shape = TableTy::default();
+                    let mut guard = DiamondGuard::default();
+                    env.collect_class(
+                        &format!("G{g}_A{k}"),
+                        &[Ty::String],
+                        &mut shape,
+                        &mut guard,
+                        false,
+                    );
+                    per_group.push((
+                        shape.fields.get("item").map(|f| f.ty.clone()),
+                        guard.resolutions,
+                    ));
+                }
+                per_group
+            },
         );
 
         let mut total_resolutions: u64 = 0;
@@ -7627,15 +7663,10 @@ take(b.value)
         // round-5 exponential, and an unbounded test then HANGS the whole
         // suite instead of failing — cargo-mutants reads that as a timeout,
         // not a kill.
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        let env_truncated = run_bounded("a budget-capped k=50 discovery walk", move || {
             let env = env_with_ambient(&format!("---@type A{k}<string>\nlocal x\n"), &ambient);
-            let _ = tx.send((env.class_ancestry_truncated("A22"), ()));
+            env.class_ancestry_truncated("A22")
         });
-        let (truncated, ()) = rx
-            .recv_timeout(std::time::Duration::from_secs(20))
-            .expect("a budget-capped k=50 discovery walk must finish in seconds");
-        let env_truncated = truncated;
         // A22 tripped the budget during discovery but is NOT the referenced
         // root, so the roots-scoped report queues drop it — the unscoped
         // truncation ledger must still answer for it, or member-checking
@@ -7670,14 +7701,10 @@ take(b.value)
         let ambient = costly_generic_ambient(k);
         // Bounded for the same reason as the truncation test above: with a
         // dead budget counter this walk is the round-5 exponential.
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        let hits = run_bounded("a budget-capped k=50 discovery walk", move || {
             let env = env_with_ambient(&format!("---@type A{k}<string>\nlocal x\n"), &ambient);
-            let _ = tx.send(env.take_cost_limit_hits());
+            env.take_cost_limit_hits()
         });
-        let hits = rx
-            .recv_timeout(std::time::Duration::from_secs(20))
-            .expect("a budget-capped k=50 discovery walk must finish in seconds");
         assert_eq!(
             hits,
             vec![format!("A{k}")],
@@ -7714,14 +7741,13 @@ take(b.value)
         let ambient = crate::defs::Ambient::build(&[
             "---@meta\n---@class LoopBox<T>\n---@field value T\n---@alias LoopA LoopB\n---@alias LoopB LoopA\n",
         ]);
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let env = env_with_ambient("---@type LoopA\nlocal x\n", &ambient);
-            let _ = tx.send(env.take_cost_limit_hits().len());
-        });
-        rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
-            "a cyclic ambient alias pair must terminate the pre-scan — each alias expands \
-             at most once",
+        run_bounded(
+            "a cyclic ambient alias pair's pre-scan — each alias expands at most once, which \
+             is the termination argument",
+            move || {
+                let env = env_with_ambient("---@type LoopA\nlocal x\n", &ambient);
+                env.take_cost_limit_hits().len()
+            },
         );
     }
 
@@ -7735,16 +7761,77 @@ take(b.value)
         // assertion: a full MISS over the grandparent-diamond shape pops
         // O(V) nodes with the skip and ~1.6^k without it.
         let src = conflicting_diamond_source(60);
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let env = env_of(&src);
-            let _ = tx.send(env.is_subclass("A60", "NotAnAncestorAtAll"));
-        });
-        let is_sub = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
-            "a k=60 diamond miss must complete in bounded time — the expanded_at \
-                     skip is what makes the walk O(V), not exponential",
+        let is_sub = run_bounded(
+            "a k=60 diamond `is_subclass` miss — the expanded_at skip is what makes the walk \
+             O(V), not exponential",
+            move || {
+                let env = env_of(&src);
+                env.is_subclass("A60", "NotAnAncestorAtAll")
+            },
         );
         assert!(!is_sub, "the probe class is not an ancestor");
+    }
+
+    #[test]
+    fn a_union_vs_union_upcast_over_a_deep_diamond_completes_in_bounded_time() {
+        // Round 11 review R11-5. The bound above exercises ONE env-level
+        // `is_subclass`. `assign.rs` calls it per named pair inside a
+        // union-vs-union conformance walk with no union-size cap and no
+        // result cache, so the worst case is M x K walks, not one — and
+        // nothing measured that compounded path. The claim standing in for a
+        // measurement was "realistic input is ~1ms; an adversarial deep
+        // diamond across wide unions could cost tens of seconds".
+        //
+        // MEASURED, on the most adversarial shape this file can build — 50
+        // value members drawn from the k=60 conflicting diamond against 50
+        // target members whose only assignable one is LAST, so neither
+        // `all` nor `any` short-circuits and all 2,500 pairs are paid:
+        //
+        //   release  0.58 s   (2,450 `is_subclass` misses alone: 0.22 s)
+        //   debug    7.73 s   (2,450 `is_subclass` misses alone: 2.52 s)
+        //
+        // So: bounded, not "tens of seconds", and no `is_subclass` memo was
+        // added. A per-`Ctx` result cache would not have helped this shape
+        // anyway — every one of the 2,500 pairs is DISTINCT, so a memo pays
+        // an allocation and a hash per pair and returns no hit, while the
+        // realistic input it would also tax is two or three members wide.
+        // Note the split, too: the ancestry walks are only a third of the
+        // cost; the rest is the named-resolution-plus-structural-compare
+        // fallback each miss falls through to, which no `is_subclass` cache
+        // touches.
+        //
+        // The committed fixture is the same shape at 15 x 15 (210 pairs,
+        // 0.91 s debug) rather than 50 x 50: the property being pinned is
+        // TERMINATION IN POLYNOMIAL TIME — a walk that goes exponential blows
+        // any of these bounds by orders of magnitude — and a 7.7 s test would
+        // more than double this crate's suite to measure the same fact.
+        let mut src = conflicting_diamond_source(60);
+        for i in 0..14 {
+            use std::fmt::Write as _;
+            // Declared, so a miss cannot short-circuit on "an undeclared
+            // target name resolves to unknown, therefore assignable", and
+            // distinctly shaped, so it cannot pass structurally either.
+            let _ = write!(src, "---@class Foreign{i}\n---@field foreign{i} string\n");
+        }
+        let value = Ty::Union((46..=60).map(|i| Ty::Named(format!("A{i}"))).collect());
+        let mut target: Vec<Ty> = (0..14).map(|i| Ty::Named(format!("Foreign{i}"))).collect();
+        // The one member every value member IS assignable to, placed LAST so
+        // the 14 misses ahead of it are paid once per value member.
+        target.push(Ty::Named("A0".to_owned()));
+        let target = Ty::Union(target);
+        let assignable = run_bounded(
+            "a 15x15 union-vs-union upcast over a k=60 conflicting diamond — 210 uncached \
+             `is_subclass` walks through `assign.rs`'s conformance path",
+            move || {
+                let env = env_of(&src);
+                crate::assign::assignable(&env, crate::assign::Exactness::Strict, &value, &target)
+            },
+        );
+        assert!(
+            assignable,
+            "every member of the value union descends from `A0`, the last member of the \
+             target union — a false here means the fixture stopped paying the full product"
+        );
     }
 
     #[test]

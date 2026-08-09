@@ -1382,6 +1382,14 @@ stricter; the two tools agree that a cyclic `---@class` is a finding, and the
 measure that agreement against the pinned binary rather than asserting it.
 (LB0317 and LB0319 *are* luabox-only; this one is not.)
 
+Parity **on the declaration**, not only on a class something resolves: luals
+fires from the `---@class` node itself, and so does `luabox check` — a cyclic
+class in a types file nothing references anywhere is reported by both. That
+was not true before: LB0318 came only from the resolver's back-edge, so an
+unreferenced cycle was flagged in the editor and silent on the command line.
+The corpus row `cyclic_class_unreferenced` (a self-parent class with zero
+uses — no `---@type`, no local, no member read) is the measurement.
+
 **Escape hatches.** `[types] strict = false` downgrades it to a warning, and
 `---@diagnostic disable[-line|-next-line]: circle-doc-class` suppresses it.
 That name is luals' own, so the directive you already write for

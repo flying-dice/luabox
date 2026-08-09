@@ -750,6 +750,30 @@ else
     fail=$((fail + 1))
 fi
 
+# timeout_args=(--timeout "$mutant_timeout") — round 11 review R11-3. Without
+# an explicit --timeout, cargo-mutants derives max(baseline x 5, 20s), which
+# races the 5/10/20/30s in-test `recv_timeout` bounds several luabox-types
+# tests use to turn a dead budget counter into a fast panic: below a ~6s
+# baseline the 30s bound loses, its mutant is classified TIMEOUT instead of
+# CAUGHT, and the gate fails on a NEW timeout for a test that would have
+# killed it. The flag has no observable effect on the stub (which ignores
+# every argument but -o), so the printed command line is what pins it —
+# exactly as file_args_scopes_cargo_mutants_to_files pins --file. Proven by
+# deleting the flag from the invocation and re-running: this case, and only
+# this case, fails.
+timeout_args_log="$work/timeout_args.log"
+STUB_OUTCOMES="$steady" STUB_EXIT=2 \
+    FILES="$scope" ALLOWLIST="$allowlist" SCOPE_OF_RECORD="$scope" MUTANTS_OUT="$work/out-timeout-args" \
+    bash "$gate" >"$timeout_args_log" 2>&1
+if grep -qE -- "cargo mutants -p luabox-types .*--timeout 90" "$timeout_args_log"; then
+    echo "PASS  timeout_args_bounds_each_mutant_above_every_in_test_bound"
+    pass=$((pass + 1))
+else
+    echo "FAIL  timeout_args_bounds_each_mutant_above_every_in_test_bound: expected --timeout 90 in the printed command line" >&2
+    sed 's/^/        /' "$timeout_args_log" >&2
+    fail=$((fail + 1))
+fi
+
 # sortpos() (the zero-padding awk function feeding both selection sorts) —
 # every fixture above uses positions of equal digit width, so lexicographic
 # and numeric order coincide and the function's actual job (making "100"

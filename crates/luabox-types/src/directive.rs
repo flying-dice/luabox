@@ -46,7 +46,7 @@ const KNOWN_RULES: &[&str] = &[
 ///
 /// They are *here*, in the one owner, rather than in a second scanner
 /// (round 6 review M4(b)): the CLI's syntactic pre-check
-/// (`luabox_cli::check_cmd::deep_class_chain_diagnostics`) runs before the
+/// (`luabox_cli::check_cmd::class_ancestry_precheck`) runs before the
 /// type pass, but it reads this constant — and, since the production
 /// readiness review's finding 3, runs [`DirectiveScan`] itself rather than a
 /// look-alike of it — so the two emitters of `LB0317` cannot disagree about
@@ -139,7 +139,7 @@ struct RuleState {
 /// name — a superset scan reused across every checker diagnostic.
 ///
 /// `pub` because it has a second caller outside this crate: `luabox-cli`'s
-/// syntactic `LB0317` pre-check (`check_cmd::deep_class_chain_diagnostics`)
+/// syntactic `LB0317` pre-check (`check_cmd::class_ancestry_precheck`)
 /// runs before the type pass, and used to hand-roll its own reader of the
 /// same comment syntax over already-harvested `Tag::Diagnostic` bodies. That
 /// copy recognised a *different* grammar than this one — it never saw

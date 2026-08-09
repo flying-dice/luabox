@@ -141,6 +141,11 @@ them beyond the strictness ladder below.
 | — | — | a class reachable from itself (`A : A`, or `A : B` / `B : A`) | `LB0318` | break the loop; a mutual reference is a `---@field`, not an `extends` |
 | `MAX_ANCESTRY_RESOLUTIONS` | 200 re-resolutions | the same generic ancestor reached through more than one parent and **bound differently on each branch**, repeated enough times (`L1 : Box<number>`, `R1 : Box<string>`, `C1 : L1, R1`, ×N) | `LB0319` | bind a shared generic ancestor the same way on every branch, or restructure so it is reached once |
 
+`LB0318` is the one of the three that does not wait for a walk: `luabox check`
+also finds cycles in the *declared* class graph before anything is resolved,
+so a cyclic class in a types file nothing references is reported too — see the
+measurement below. The other two are properties of the resolution itself.
+
 The two budgets bound different things and are reported separately on purpose:
 depth protects the native stack (an unbounded walk aborts the process on a
 host with a small thread stack — an editor embedding the language server is
@@ -207,15 +212,22 @@ directives at all.
 | a 260-link straight chain | **silent** — no depth budget at all | corpus row `deep_chain_over_depth_limit` (intentional divergence) |
 | `---@class A : A` | reports `circle-doc-class` | corpus row `cyclic_class_self` (agreement) |
 | `A : B` / `B : A` | reports `circle-doc-class` on both | corpus row `cyclic_class_mutual` (agreement) |
+| a cyclic class **nothing references** | reports `circle-doc-class` — its check is declaration-driven | corpus row `cyclic_class_unreferenced` (agreement) |
 | a conflicting generic diamond | silent — 3.13.5 has no generic classes at all | not separately pinned; see the generics rows |
 
 So LB0317 and LB0319 are luabox being deliberately stricter (a project clean
 under `lua-language-server --check` can fail `luabox check` on depth or cost
-alone), while **LB0318 is parity** — both tools reject a cyclic `---@class`.
-An earlier draft of this page said luals "reports nothing for any of these
-three shapes"; the cycle half of that was asserted rather than measured, and
-is false. The corpus rows above are the measurement, re-derived on every run
-of `scripts/tests/luals-differential.sh` rather than restated here.
+alone), while **LB0318 is parity** — both tools reject a cyclic `---@class`,
+and both reject it **from the declaration alone**, whether or not anything in
+the project ever resolves the class. An earlier draft of this page said luals
+"reports nothing for any of these three shapes"; the cycle half of that was
+asserted rather than measured, and is false. A later one claimed the parity
+flatly while luabox's own LB0318 came only from a resolution walk, so a
+cyclic class in an unreferenced types file was flagged by the editor and
+green in `luabox check`; the CLI now finds cycles syntactically, in the
+declared `---@class` graph, before anything is resolved. The corpus rows
+above are the measurement, re-derived on every run of
+`scripts/tests/luals-differential.sh` rather than restated here.
 `luabox explain LB0317` (and `LB0318`, `LB0319`) prints the full worked fix
 for each.
 

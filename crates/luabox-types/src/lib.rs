@@ -246,7 +246,7 @@ impl FileArtifacts {
     /// `FileArtifacts` for other reasons (module surface, checking) can
     /// reuse the same harvest for its own annotation-only walk instead of
     /// harvesting the file a second time (round 6 review M19:
-    /// `luabox-cli`'s `check_cmd::deep_class_chain_diagnostics` used to call
+    /// `luabox-cli`'s `check_cmd::class_ancestry_precheck` used to call
     /// `luacats::harvest` again, serially, for every project file, even
     /// though this is the exact harvest `FileArtifacts::new` already built
     /// for the same file).

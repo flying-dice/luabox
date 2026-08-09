@@ -561,15 +561,30 @@ mod tests {
     /// project file for the scan to find it in — exactly a dependency's
     /// `lua_modules/<dep>/defs/`, which `layout::collect_lua_files` excludes
     /// from the source walk.
+    ///
+    /// Both spellings (R11-6b). [`alias_or_enum_names`] matches `Tag::Alias`
+    /// and `Tag::Enum` in **separate** arms, so "the enum shares the alias's
+    /// code" is only true from the `HashSet` lookup down; this test asked
+    /// about an alias alone. Measured, not assumed: disabling the `Tag::Enum`
+    /// arm now fails here as well as at
+    /// `alias_or_enum_names_harvests_both_spellings_and_nothing_else` and
+    /// `hover::tests::an_annotation_naming_a_dependency_defs_alias_or_enum_is_not_the_structural_export`
+    /// — the arm was already killed by those two, so this closes the shape of
+    /// the gap at this tier rather than a live escape.
     #[test]
     fn is_declared_alias_or_enum_answers_for_an_ambient_only_name() {
         let ambient = merged("local x = 1\n").with_ambient_alias_names(alias_or_enum_names(&[
             "---@meta\n\n---@alias DepAlias string\n".to_string(),
+            "---@meta\n\n---@enum DepEnum\nlocal E = { a = 1 }\n".to_string(),
         ]));
         let analysis = analysis_of("local x = 1\n");
         assert!(
             ambient.is_declared_alias_or_enum(&analysis, "DepAlias"),
             "no project file declares it; the ambient layer does"
+        );
+        assert!(
+            ambient.is_declared_alias_or_enum(&analysis, "DepEnum"),
+            "and the ambient layer's other spelling answers the same way"
         );
         assert!(
             !ambient.is_declared_alias_or_enum(&analysis, "NotDeclaredAnywhere"),

@@ -10,7 +10,9 @@
 //! - types, docs, classes, and signatures come from the LuaCATS annotation
 //!   harvest — the same producer the typechecker reads.
 
-use std::cell::{Cell, RefCell};
+#[cfg(test)]
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -44,6 +46,14 @@ pub struct FileSema {
     /// the only thing that can tell a memo that is doing its job from one
     /// that silently rebuilds, and the alternative — a `pub fn` nothing but
     /// a test calls — is dead public surface on a semver-bound type.
+    ///
+    /// `#[cfg(test)]` (round 11 review): it is test-observability state, so a
+    /// production build carries neither the counter nor the increment. Safe
+    /// to gate — unlike the `merged_ambient` rebuild trace R26 refused to
+    /// gate, nothing outside this crate's own tests observes it, and what it
+    /// measures (an internal memo's build count) is not externally observable
+    /// behaviour that a release build could silently lose.
+    #[cfg(test)]
     index_builds: Cell<usize>,
     /// [`Self::class_index`]'s memo, built on first use and reused for this
     /// `FileSema`'s lifetime — which [`FileSemaCache`] makes one revision
@@ -178,6 +188,7 @@ impl FileSema {
             root,
             annotations,
             lowered,
+            #[cfg(test)]
             index_builds: Cell::new(0),
             class_index: RefCell::new(None),
         })
@@ -319,6 +330,7 @@ impl FileSema {
         if let Some(found) = self.class_index.borrow().as_ref() {
             return Rc::clone(found);
         }
+        #[cfg(test)]
         self.index_builds.set(self.index_builds.get() + 1);
         let built = Rc::new(ClassIndex::build(self.items()));
         *self.class_index.borrow_mut() = Some(Rc::clone(&built));

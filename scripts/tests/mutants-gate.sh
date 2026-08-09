@@ -238,10 +238,38 @@ if [ -n "$in_diff" ]; then
     diff_args=(--in-diff "$in_diff")
 fi
 
+# Per-mutant test timeout, in seconds — round 11 review R11-3, and NOT a
+# decoration.
+#
+# With no --timeout, cargo-mutants derives its own: max(baseline x 5, 20s).
+# Several luabox-types tests are themselves bounded, on purpose — they spawn
+# the walk on a thread and `recv_timeout` it, so that a mutant which kills a
+# budget counter (making the walk exponential) is a fast PANIC rather than a
+# hang. Those in-test bounds are currently 5s, 10s, 20s and 30s. That is a
+# race with the derived timeout, and one side of it is deterministically
+# lost: the 30s bound needs baseline >= 6s to survive at all. Below that,
+# cargo-mutants SIGKILLs the whole test binary before the 30s `recv` fires,
+# classifies the run TIMEOUT rather than CAUGHT, and drags an unwaived
+# mutant to a NEW-timeout gate FAIL — even though the 20s tests in the same
+# binary already panicked and killed it. One over-budget bound poisons the
+# mutant. The two 20s bounds sit exactly on the 20s floor, a dead heat once
+# baseline <= 4s. Green today only because the baseline happens to be slow
+# enough, which is a property of the runner, not of the code: a faster
+# machine, a warmer cache or a fixture speedup flips it red with no change
+# here at all.
+#
+# 90s is above EVERY test-side bound (max 30s) with 3x margin, so the
+# in-test `recv_timeout` always fires first and a slow mutant is a KILL, not
+# a TIMEOUT. It is a ceiling on genuinely hung mutants, nothing else: no
+# unbounded test in scope runs anywhere near it. Raise the in-test bounds and
+# this number must move with them — it is the outer bound of the same policy,
+# not an independent knob.
+mutant_timeout="${MUTANT_TIMEOUT:-90}"
+timeout_args=(--timeout "$mutant_timeout")
 if [ -n "$in_diff" ]; then
-    echo "mutants-gate: cargo mutants -p luabox-types ${file_args[*]} --in-diff $in_diff (bounded to a diff, this is quick)"
+    echo "mutants-gate: cargo mutants -p luabox-types ${file_args[*]} --timeout $mutant_timeout --in-diff $in_diff (bounded to a diff, this is quick)"
 else
-    echo "mutants-gate: cargo mutants -p luabox-types ${file_args[*]} (this takes a while)"
+    echo "mutants-gate: cargo mutants -p luabox-types ${file_args[*]} --timeout $mutant_timeout (this takes a while)"
 fi
 # cargo-mutants signals the SHAPE of the run in its exit code, and only three
 # of those shapes mean "the run classified mutants, go read the outcome
@@ -266,7 +294,7 @@ fi
 # code — which of the two a survivor lands in is a property of the runner's
 # load, not of the code (see the timeout.txt comment below). Anything else is
 # an unknown shape and stays fatal.
-(cd "$repo" && cargo mutants -p luabox-types "${file_args[@]}" "${diff_args[@]}" -o "$out_dir")
+(cd "$repo" && cargo mutants -p luabox-types "${file_args[@]}" "${timeout_args[@]}" "${diff_args[@]}" -o "$out_dir")
 status=$?
 case "$status" in
 0 | 2 | 3) ;;

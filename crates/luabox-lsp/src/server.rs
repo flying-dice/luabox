@@ -616,7 +616,9 @@ fn harvest_rock_tree(root: &Path, version_dir: &str, ambient: &Ambient) -> RockS
 /// contributor **replaces** its whole entry, so a group that is no longer
 /// produced is a group that is no longer in the ledger, which is what makes
 /// clearing fall out rather than needing its own path.
-/// [`Self::own`] is each file's same-file half, as of the last pass over it.
+/// [`Self::own`] is each file's same-file half, as of the last pass over it,
+/// and prunes on the same rule (R11-4): both halves store only what a pass
+/// actually produced, so neither grows an entry per file in the workspace.
 /// A published set is then, for any target, that target's own half plus every
 /// contributor's group for it — with `BTreeMap` ordering throughout, so the
 /// merge is a function of the workspace and nothing else.
@@ -629,6 +631,14 @@ struct ForeignLedger {
     contributions: BTreeMap<PathBuf, BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>>,
     /// Path → the own half of the last pass over that file, i.e. exactly the
     /// same-file diagnostics that file's URI is currently showing.
+    ///
+    /// Self-pruning on the same rule as [`Self::contributions`] (R11-4): a
+    /// pass that produces nothing removes the entry rather than storing an
+    /// empty vector. [`Self::published_set`] reads this map through
+    /// `unwrap_or_default`, so an absent entry and an empty one are the same
+    /// answer — and storing the empty one would grow `own` by an entry per
+    /// distinct file ever checked, never freed for the life of the session,
+    /// which is precisely the unbounded growth `contributions` avoids.
     own: BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>,
 }
 
@@ -658,7 +668,11 @@ impl ForeignLedger {
         } else {
             self.contributions.insert(source.to_path_buf(), foreign);
         }
-        self.own.insert(source.to_path_buf(), own);
+        if own.is_empty() {
+            self.own.remove(source);
+        } else {
+            self.own.insert(source.to_path_buf(), own);
+        }
         affected.into_iter().collect()
     }
 
@@ -2633,8 +2647,8 @@ mod tests {
 
     use lsp_server::{Connection, Message, Notification, Request, RequestId};
     use lsp_types::notification::{
-        DidChangeConfiguration, DidChangeTextDocument, DidChangeWatchedFiles, DidOpenTextDocument,
-        Notification as _,
+        DidChangeConfiguration, DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument,
+        DidOpenTextDocument, Notification as _,
     };
     use lsp_types::request::{HoverRequest, Request as _};
     use lsp_types::{Position, Range, TextDocumentContentChangeEvent, TraceValue};
@@ -4162,6 +4176,158 @@ return use
         assert_eq!(
             published, expected,
             "a republish batch must be in path order, not hash order"
+        );
+    }
+
+    /// R11-6a, the **fix-one-keep-other transition**: two contributors, one
+    /// target. The tests above cover a single contributor's clear and both
+    /// contributors present from the start; neither covers what happens to
+    /// contributor *B*'s group when contributor *A* is re-checked and stops
+    /// producing one. `published_set` rebuilds the target from every live
+    /// contributor, so B's finding must survive A's clear — a publish that
+    /// cleared the target wholesale (or dropped every contributor's entry for
+    /// it) would take B's finding down with A's and leave a real cycle
+    /// invisible until `a2.lua` is itself touched.
+    ///
+    /// Proved by hand, the way the F7 gate test above was: `record` was
+    /// temporarily taught to strip a stale target from **every** contributor
+    /// rather than only from `source`'s own entry. This test went RED (0
+    /// cycles on `c.lua` instead of 1) and the four F4 tests above all stayed
+    /// GREEN under that same variant — which is exactly why this one had to
+    /// exist.
+    #[test]
+    fn fixing_one_contributor_keeps_the_other_contributors_group_on_the_target() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let (a1_source, c1) = cycle_pair("1");
+        let (a2_source, c2) = cycle_pair("2");
+        let c_source = format!("{c1}{c2}");
+        let a1_path = root.join("a1.lua");
+        let a2_path = root.join("a2.lua");
+        let c_path = root.join("c.lua");
+        fs::write(&a1_path, &a1_source).expect("write a1.lua");
+        fs::write(&a2_path, &a2_source).expect("write a2.lua");
+        fs::write(&c_path, &c_source).expect("write c.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        did_open(&mut server, &a1_path, &a1_source);
+        did_open(&mut server, &a2_path, &a2_source);
+        let opened = drain(&client);
+        assert_eq!(
+            published_codes(&opened, &c_path)
+                .expect("c.lua is published")
+                .iter()
+                .filter(|code| *code == "LB0318")
+                .count(),
+            2,
+            "both contributors must be on c.lua before the fix, or the \
+             transition below proves nothing: {opened:?}"
+        );
+
+        // Fix `a1.lua` alone: `A1` no longer inherits `B1`, so a1 contributes
+        // nothing. `a2.lua` is untouched and its cycle is still real.
+        did_change(&mut server, &a1_path, "---@class A1\n");
+        let fixed = drain(&client);
+        let codes = published_codes(&fixed, &c_path)
+            .expect("c.lua must be republished by the edit that fixed a1's cycle");
+        assert_eq!(
+            codes.iter().filter(|code| *code == "LB0318").count(),
+            1,
+            "fixing one contributor must clear its group and keep the \
+             other's, not clear the target: {codes:?}"
+        );
+    }
+
+    /// R11-4: `own` is the twin of `contributions` and must self-prune the
+    /// same way. A didClose of a buffer with no disk backing records an empty
+    /// own half — and an empty entry is indistinguishable from an absent one
+    /// at `published_set`, so storing it buys nothing and grows the map by one
+    /// entry per distinct file ever checked in a session.
+    #[test]
+    fn a_did_close_prunes_the_files_empty_own_half_from_the_ledger() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let path = root.join("scratch.lua");
+        let source = "local x = \n";
+        fs::write(&path, source).expect("write scratch.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        did_open(&mut server, &path, source);
+        drop(drain(&client));
+        assert!(
+            server
+                .foreign
+                .own
+                .get(&path)
+                .is_some_and(|own| !own.is_empty()),
+            "the syntax error must be recorded as a non-empty own half first, \
+             or the prune below proves nothing"
+        );
+
+        // No disk backing left, so `close` takes the scratch-buffer path and
+        // records an empty own half through the ledger.
+        fs::remove_file(&path).expect("delete scratch.lua");
+        server
+            .handle_notification(Notification {
+                method: DidCloseTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": crate::uri::path_to_uri(&path).to_string() },
+                }),
+            })
+            .expect("didClose");
+
+        assert!(
+            !server.foreign.own.contains_key(&path),
+            "an empty own half must be removed, not stored: {:?}",
+            server.foreign.own.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// R11-4, the other path `contributions` is pruned on: a watched DELETE
+    /// empties the file's text, so its next pass has nothing to report and
+    /// records an empty own half. Same leak, same prune.
+    #[test]
+    fn a_watched_delete_prunes_the_files_empty_own_half_from_the_ledger() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let path = root.join("orphan.lua");
+        let uri = crate::uri::path_to_uri(&path);
+        fs::write(&path, "local x = \n").expect("write orphan.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        // CHANGED, not open: publishes from disk and records the own half.
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({ "changes": [{ "uri": uri.to_string(), "type": 2 }] }),
+            })
+            .expect("didChangeWatchedFiles");
+        drop(drain(&client));
+        assert!(
+            server
+                .foreign
+                .own
+                .get(&path)
+                .is_some_and(|own| !own.is_empty()),
+            "the syntax error must be recorded as a non-empty own half first, \
+             or the prune below proves nothing"
+        );
+
+        fs::remove_file(&path).expect("delete orphan.lua");
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({ "changes": [{ "uri": uri.to_string(), "type": 3 }] }),
+            })
+            .expect("didChangeWatchedFiles");
+
+        assert!(
+            !server.foreign.own.contains_key(&path),
+            "a deleted file must leave no empty own entry behind: {:?}",
+            server.foreign.own.keys().collect::<Vec<_>>()
         );
     }
 
