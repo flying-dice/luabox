@@ -248,8 +248,7 @@ fn global_hover(sema: &FileSema, name: &str, token_range: TextRange) -> Option<H
     if let Some(info) = sema.functions().into_iter().find(|f| f.name == name) {
         return Some(reply(&info.sig, &info.docs, &info.sees, token_range, sema));
     }
-    let classes = sema.classes();
-    let info = classes.get(name)?;
+    let info = sema.class_named(name)?;
     Some(reply(
         &format!("class {name}"),
         &info.docs,
@@ -379,6 +378,43 @@ mod tests {
     /// [`at_with`] across `files` and no rock tree.
     fn at_files(files: &[(&str, &str)], needle: &str, nth: usize) -> Option<String> {
         at_with(files, needle, nth, &RockSurfaces::default())
+    }
+
+    /// [`at_files`] over a workspace with a **dependency** definition package
+    /// (round 8 review, F7).
+    ///
+    /// `defs` stands in for `lua_modules/<dep>/defs/*.d.lua`: contributed to
+    /// the ambient layer the way `server.rs` contributes it, and — the whole
+    /// point — deliberately **not** written into the analysis, because
+    /// `layout::collect_lua_files` excludes that directory from the source
+    /// walk, so those files are never in `Analysis::files()` for the real
+    /// server either.
+    fn at_files_with_defs(
+        files: &[(&str, &str)],
+        defs: &[&str],
+        needle: &str,
+        nth: usize,
+    ) -> Option<String> {
+        let src = files[0].1;
+        let (analysis, path) = analyze_files(files);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let rocks = RockSurfaces::default();
+        let exports = RequireExports::resolve(&analysis, &path, &rocks);
+        let sources: Vec<String> = defs.iter().map(|d| (*d).to_string()).collect();
+        let base = luabox_types::build_ambient(luabox_syntax::lua::Dialect::Lua54, &sources);
+        let ambient = MergedAmbient::build(&base, &analysis.project_types(), rocks.types())
+            .with_ambient_alias_names(crate::merged_ambient::alias_or_enum_names(&sources));
+        hover(
+            &sema,
+            offset_of(src, needle, nth),
+            &exports,
+            &ambient,
+            &analysis,
+        )
+        .map(|h| match h.contents {
+            HoverContents::Markup(markup) => markup.value,
+            other => panic!("expected markup hover contents, got {other:?}"),
+        })
     }
 
     /// The rendered markdown of the hover at the `nth` occurrence of `needle`.
@@ -862,6 +898,72 @@ print(p.z)
         );
     }
 
+    /// F7 (round 8 review): M20's shape one tier down. The two tests above
+    /// declare their alias/enum in a *project* file, which
+    /// `sema::is_declared_alias_or_enum`'s `analysis.files()` scan finds. A
+    /// **dependency**'s defs never appear in that set at any revision —
+    /// `layout::collect_lua_files` excludes `lua_modules/<dep>/defs/` from
+    /// the source walk entirely — while `luabox check` enforces exactly those
+    /// declarations through the merged ambient. So the gate saw
+    /// `---@type DepAlias` as resolving to nothing and fell through to the
+    /// `require`d module's raw structural export: `(field) m.x: 42`,
+    /// confidently wrong about a binding the checker types as a `string`.
+    ///
+    /// Both spellings, because the ambient tier has the same two:
+    /// `---@alias` and `---@enum`.
+    #[test]
+    fn an_annotation_naming_a_dependency_defs_alias_or_enum_is_not_the_structural_export() {
+        let module = ("m.lua", "local M = {}\nM.x = 42\nreturn M\n");
+
+        let alias_defs = ["---@meta\n\n---@alias DepAlias string\n"];
+        let alias_files = [
+            (
+                "main.lua",
+                "---@type DepAlias\nlocal m = require(\"m\")\nprint(m.x)\n",
+            ),
+            module,
+        ];
+        assert_eq!(
+            at_files_with_defs(&alias_files, &alias_defs, "x)", 0),
+            None,
+            "a dependency-defs alias must reject the structural export the \
+             same way a project-file one does"
+        );
+
+        let enum_defs = ["---@meta\n\n---@enum DepEnum\nlocal E = { a = 1 }\n"];
+        let enum_files = [
+            (
+                "main.lua",
+                "---@type DepEnum\nlocal m = require(\"m\")\nprint(m.x)\n",
+            ),
+            module,
+        ];
+        assert_eq!(
+            at_files_with_defs(&enum_files, &enum_defs, "x)", 0),
+            None,
+            "and so must a dependency-defs enum"
+        );
+    }
+
+    /// The control the fix must not break: with the ambient layer carrying no
+    /// alias of that name, an annotation naming nothing at all still falls
+    /// back to the structural export (round 5's behaviour, unchanged) — the
+    /// fallback must recognise what the ambient really declares, not answer
+    /// `true` for every name it is asked about.
+    #[test]
+    fn an_annotation_naming_nothing_the_dependency_defs_declare_still_falls_back() {
+        let files = [
+            (
+                "main.lua",
+                "---@type NotInTheDefs\nlocal m = require(\"m\")\nprint(m.x)\n",
+            ),
+            ("m.lua", "local M = {}\nM.x = 42\nreturn M\n"),
+        ];
+        let defs = ["---@meta\n\n---@alias DepAlias string\n"];
+        let text = at_files_with_defs(&files, &defs, "x)", 0).expect("hover");
+        assert!(text.contains("(field) m.x: 42"), "{text}");
+    }
+
     #[test]
     fn a_require_of_a_module_that_does_not_exist_hovers_gracefully() {
         let files = [("main.lua", "local m = require(\"absent\")\nprint(m)\n")];
@@ -1187,7 +1289,10 @@ print(c.dir)
     /// of the probed depth. Manual — run explicitly with `cargo test -p
     /// luabox-lsp --release -- --ignored --nocapture
     /// search_order_cache_wall_time_by_depth`; the round 6 report carries
-    /// the before/after numbers this prints.
+    /// the before/after numbers this prints. This probe backs no CI claim
+    /// (round 8 review F10): M57's FUNCTIONAL pin is the non-ignored
+    /// `search_order_cache_skips_the_may_declare_class_scan_on_a_repeat_call`
+    /// in sema.rs — this one only puts wall-clock numbers on it by hand.
     #[test]
     #[ignore = "manual wall-clock measurement, see the doc comment"]
     fn search_order_cache_wall_time_by_depth() {

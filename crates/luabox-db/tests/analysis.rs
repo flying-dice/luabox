@@ -861,7 +861,10 @@ fn project_ambient_merge_is_memoized_once_across_a_display_pass_over_many_files(
 /// explicitly with `cargo test -p luabox-db --release -- --ignored \
 /// --nocapture project_types_sweep_wall_time` — since a wall-clock
 /// assertion in the default suite would be flaky across machines; the
-/// round 6 report carries the numbers this prints.
+/// round 6 report carries the numbers this prints. This probe backs no CI
+/// claim (round 8 review F10): M18's FUNCTIONAL pin is the non-ignored
+/// `project_ambient_merge_is_memoized_once_across_a_display_pass_over_many_files`
+/// above — this one only puts wall-clock numbers on it by hand.
 #[test]
 #[ignore = "manual wall-clock measurement, see the doc comment"]
 fn project_types_sweep_wall_time() {

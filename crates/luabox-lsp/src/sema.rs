@@ -10,7 +10,7 @@
 //! - types, docs, classes, and signatures come from the LuaCATS annotation
 //!   harvest — the same producer the typechecker reads.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -37,6 +37,82 @@ pub struct FileSema {
     pub root: SyntaxNode,
     annotations: Annotations,
     lowered: LoweredHandle,
+    /// How many times this file's class map has actually been derived — the
+    /// measurement surface behind [`Self::class_index`]'s memo (round 8
+    /// review, F23). Read by this module's own tests, which is why it is a
+    /// private field and not a public accessor: a reuse-count assertion is
+    /// the only thing that can tell a memo that is doing its job from one
+    /// that silently rebuilds, and the alternative — a `pub fn` nothing but
+    /// a test calls — is dead public surface on a semver-bound type.
+    index_builds: Cell<usize>,
+    /// [`Self::class_index`]'s memo, built on first use and reused for this
+    /// `FileSema`'s lifetime — which [`FileSemaCache`] makes one revision
+    /// (round 8 review, F23).
+    class_index: RefCell<Option<Rc<ClassIndex>>>,
+}
+
+/// A file's `---@class` declarations located by **position** — the item and
+/// tag indices each declaration and its own `---@field` tags sit at — rather
+/// than by borrow (round 8 review, F23).
+///
+/// Positions are what make the memo possible. [`ClassDecl`] borrows the
+/// harvested tags out of the [`FileSema`] that owns them, so a map of
+/// `ClassDecl`s cannot be cached *inside* that same `FileSema` without a
+/// self-referential borrow; indices carry the identical information, own
+/// nothing, and re-resolve to the same borrows in O(1) whenever a caller
+/// actually needs one ([`FileSema::class_at`]).
+struct ClassIndex {
+    /// Class name → where it is declared.
+    sites: HashMap<String, ClassSite>,
+}
+
+/// One [`ClassIndex`] entry: the annotation item, the `---@class` tag's index
+/// within that item's tag list, and the indices of the `---@field` tags that
+/// attach to it.
+struct ClassSite {
+    item: usize,
+    tag: usize,
+    fields: Vec<usize>,
+}
+
+impl ClassIndex {
+    /// Harvest every `---@class` in `items`.
+    ///
+    /// The rule this encodes is the one [`FileSema::classes`] used to encode
+    /// inline, unchanged: a class tag opens a declaration, later `---@field`
+    /// tags *in the same annotation item* attach to the most recent one, and
+    /// a second declaration of the same name replaces the first outright (its
+    /// fields included). Both readers go through this one copy now, so the
+    /// memoised lookup and the enumerating one cannot drift on what a
+    /// duplicate name or a stray field means.
+    fn build(items: &[AnnotatedItem]) -> ClassIndex {
+        let mut sites: HashMap<String, ClassSite> = HashMap::new();
+        for (item_index, item) in items.iter().enumerate() {
+            let mut current: Option<&str> = None;
+            for (tag_index, tag) in item.block.tags.iter().enumerate() {
+                match tag {
+                    Tag::Class(c) if !c.name.is_empty() => {
+                        current = Some(&c.name);
+                        sites.insert(
+                            c.name.clone(),
+                            ClassSite {
+                                item: item_index,
+                                tag: tag_index,
+                                fields: Vec::new(),
+                            },
+                        );
+                    }
+                    Tag::Field(_) => {
+                        if let Some(site) = current.and_then(|name| sites.get_mut(name)) {
+                            site.fields.push(tag_index);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        ClassIndex { sites }
+    }
 }
 
 /// A `---@class` declaration harvested from the file.
@@ -102,6 +178,8 @@ impl FileSema {
             root,
             annotations,
             lowered,
+            index_builds: Cell::new(0),
+            class_index: RefCell::new(None),
         })
     }
 
@@ -227,36 +305,78 @@ impl FileSema {
 
     // === Annotations ======================================================
 
-    /// Every `---@class` in the file, by name.
+    /// This file's [`ClassIndex`], derived once and reused (round 8 review,
+    /// F23).
+    ///
+    /// The derivation is a walk over every annotation item and every tag in
+    /// it; the map it used to build carried a fully-materialised
+    /// [`ClassDecl`] per class, joined doc lines and `---@see` list included.
+    /// [`locate_field`]'s DFS asks each candidate file for **one** class per
+    /// frame, so paying that whole-file derivation per frame made a
+    /// `MAX_ANCESTRY_DEPTH`-deep walk over `F` candidate files cost `F × 200`
+    /// derivations — on the single-threaded server, inside a hover.
+    fn class_index(&self) -> Rc<ClassIndex> {
+        if let Some(found) = self.class_index.borrow().as_ref() {
+            return Rc::clone(found);
+        }
+        self.index_builds.set(self.index_builds.get() + 1);
+        let built = Rc::new(ClassIndex::build(self.items()));
+        *self.class_index.borrow_mut() = Some(Rc::clone(&built));
+        built
+    }
+
+    /// The [`ClassDecl`] at `site`, re-borrowed out of this file's harvested
+    /// items. `None` only if the index and the items disagree, which they
+    /// cannot: both come from the same `annotations` handle, and neither is
+    /// mutable after construction.
+    fn class_at(&self, site: &ClassSite) -> Option<ClassDecl<'_>> {
+        let item = self.items().get(site.item)?;
+        let Some(Tag::Class(tag)) = item.block.tags.get(site.tag) else {
+            return None;
+        };
+        let fields = site
+            .fields
+            .iter()
+            .filter_map(|index| match item.block.tags.get(*index) {
+                Some(Tag::Field(f)) => Some(f),
+                _ => None,
+            })
+            .collect();
+        Some(ClassDecl {
+            tag,
+            fields,
+            docs: docs_of(item),
+            sees: sees_of(item),
+        })
+    }
+
+    /// The file's `---@class` declaration of `name`, if it has one — the
+    /// single-class lookup [`locate_field`]'s per-frame question actually is,
+    /// answered off the memoised index instead of by rebuilding the whole
+    /// map (round 8 review, F23).
+    #[must_use]
+    pub fn class_named(&self, name: &str) -> Option<ClassDecl<'_>> {
+        let index = self.class_index();
+        let site = index.sites.get(name)?;
+        self.class_at(site)
+    }
+
+    /// Every `---@class` in the file, by name — for the surfaces that
+    /// genuinely enumerate ([`crate::symbols`], [`crate::references`],
+    /// [`crate::goto_implementation`]). Materialised from the same memoised
+    /// index [`Self::class_named`] reads, so the two cannot disagree about
+    /// what this file declares.
     #[must_use]
     pub fn classes(&self) -> HashMap<&str, ClassDecl<'_>> {
-        let mut out = HashMap::new();
-        for item in self.items() {
-            let mut current: Option<&str> = None;
-            for tag in &item.block.tags {
-                match tag {
-                    Tag::Class(c) if !c.name.is_empty() => {
-                        current = Some(&c.name);
-                        out.insert(
-                            c.name.as_str(),
-                            ClassDecl {
-                                tag: c,
-                                fields: Vec::new(),
-                                docs: docs_of(item),
-                                sees: sees_of(item),
-                            },
-                        );
-                    }
-                    Tag::Field(f) => {
-                        if let Some(info) = current.and_then(|n| out.get_mut(n)) {
-                            info.fields.push(f);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        out
+        let index = self.class_index();
+        index
+            .sites
+            .values()
+            .filter_map(|site| {
+                let decl = self.class_at(site)?;
+                Some((decl.tag.name.as_str(), decl))
+            })
+            .collect()
     }
 
     /// The annotation item whose target statement contains `range`
@@ -587,8 +707,8 @@ pub struct FieldSource {
 
 /// The invariants of one field lookup: everything [`locate_field`]'s
 /// recursive walk carries unchanged from frame to frame, so the walk itself
-/// threads only what actually varies (the class, the member, the once-ever
-/// visited set, the depth).
+/// threads only what actually varies (the class, the member, the
+/// depth-carrying visited map, the depth).
 struct LookupCtx<'a> {
     analysis: &'a Analysis,
     current: &'a Path,
@@ -759,7 +879,7 @@ pub fn locate_field(
     sema_cache: &FileSemaCache,
     search_order_cache: &SearchOrderCache,
 ) -> Option<FieldSource> {
-    let mut visited = HashSet::new();
+    let mut visited = HashMap::new();
     let ctx = LookupCtx {
         analysis,
         current,
@@ -777,44 +897,86 @@ pub fn locate_field(
 /// with no bound at all would keep walking a 10 000-class chain the checker
 /// already gave up on at 200.
 ///
-/// `visited` is a **once-ever** set, never unwound on the way back out
-/// (production readiness review, finding 1). The M2 rewrite that made this
-/// walk depth-first replaced the previous BFS's once-ever `seen` set with a
-/// path-scoped guard that *was* unwound per frame, so a class reachable
-/// through two parents was re-expanded once per distinct path to it rather
-/// than once per node: on the repo's own `conflicting_diamond_source` shape
-/// (`A{i} : A{i-1}<T>, A{i-1}<number>` — both parents naming the same
-/// class) that is 2^k node visits, and the depth cap above never fires
-/// because a wide-shallow lattice's *depth* stays small. A **miss** is the
-/// case that pays it in full, and misses are routine here: [`FileSema::classes`]
-/// harvests only `---@field` tags, so every `function C:method()` carrier
-/// member is a miss ([`crate::goto_definition`] and
-/// [`crate::signature_help`] both call in for any member name once the
-/// class has an indexer or array part). The server is single-threaded with
-/// no request cancellation, so one such miss stalls every other request,
-/// shutdown included.
+/// `visited` is never unwound on the way back out (production readiness
+/// review, finding 1). The M2 rewrite that made this walk depth-first
+/// replaced the previous BFS's once-ever `seen` set with a path-scoped guard
+/// that *was* unwound per frame, so a class reachable through two parents was
+/// re-expanded once per distinct path to it rather than once per node: on the
+/// repo's own `conflicting_diamond_source` shape (`A{i} : A{i-1}<T>,
+/// A{i-1}<number>` — both parents naming the same class) that is 2^k node
+/// visits, and the depth cap above never fires because a wide-shallow
+/// lattice's *depth* stays small. A **miss** is the case that pays it in
+/// full, and misses are routine here: [`FileSema::classes`] harvests only
+/// `---@field` tags, so every `function C:method()` carrier member is a miss
+/// ([`crate::goto_definition`] and [`crate::signature_help`] both call in for
+/// any member name once the class has an indexer or array part). The server
+/// is single-threaded with no request cancellation, so one such miss stalls
+/// every other request, shutdown included.
 ///
-/// First-visit-wins costs nothing in precedence, and in particular preserves
-/// the preorder ordering M2 established: this is a *first-match* search that
-/// returns the instant a candidate is found, so a class that is re-reached
-/// later can only ever have returned `None` the first time — and it would
-/// return `None` again, since its answer depends on nothing that varies
-/// between frames (`member`, the file set and the class graph are all fixed
-/// for one call). Refusing the re-entry therefore drops only repeated work,
-/// never a winner: the winner is the earliest node in preorder that declares
-/// `member`, and that node's *first* visit is its earliest preorder
-/// occurrence. The set also subsumes the old cycle guard — a true cycle
-/// (`A : B`, `B : A`) cannot re-enter a node it has already entered.
+/// # Why the entry carries the depth it was inserted at (round 8 review, F2)
+///
+/// It used to be a once-ever *set*, on the argument that a re-reached class
+/// "can only ever have returned `None` the first time, and would return
+/// `None` again, since its answer depends on nothing that varies between
+/// frames". `depth` varies between frames, and `depth` gates the recursion
+/// one line below — so that argument was false for exactly the class whose
+/// **first** reach was near the cap. `Y` first expanded at
+/// `MAX_ANCESTRY_DEPTH - 1` pushes its own parents at `MAX_ANCESTRY_DEPTH`,
+/// where they are dropped: `Y` is marked visited with its subtree
+/// unexplored. A later *shallow* reach of `Y` — where those parents are well
+/// inside the cap — hit the set and returned `None`, so a member declared
+/// above `Y` had no hover, no goto-definition and no signature-help target.
+/// Which of the two reaches happens first is decided by the order `Y`'s
+/// child lists its parents (`A : B1, Y` loses it, `A : Y, B1` finds it), so
+/// the same class graph answered two ways.
+///
+/// The entry now records the depth the class was expanded at, and a re-reach
+/// at a **strictly shallower** depth re-expands it. That is depth relaxation
+/// (Bellman-Ford's, run eagerly by the DFS rather than in rounds): every
+/// expansion of a node at depth `d` offers its parents `d + 1`, and a parent
+/// holding a larger recorded depth takes the improvement and re-expands. A
+/// node's recorded depth only ever falls, and it is bounded below by 0 and
+/// above by `MAX_ANCESTRY_DEPTH`, so each node is expanded at most
+/// `MAX_ANCESTRY_DEPTH` times: **O(V·D)**, not the exponential per-path walk
+/// finding 1 removed, and the `k = 25` bounded-time diamond test above it
+/// stays green (a chain-first DFS reaches every `A{i}` at its minimal depth
+/// on the first pass, so nothing relaxes and the walk is still `k + 1`
+/// expansions).
+///
+/// **The winner is stable under this, and *more* stable than before.**
+/// Relaxation converges to `reach(n)` — the minimum, over every path from
+/// the queried class to `n`, of that path's length — so the set of expanded
+/// classes is exactly `{ n : reach(n) < MAX_ANCESTRY_DEPTH }`, a property of
+/// the class graph alone. Parent order no longer decides *which* classes get
+/// expanded, only the order they are expanded in; the previous set made
+/// membership depend on which reach happened to land first. Within that set
+/// the search is unchanged: it is first-match, returning the instant a
+/// candidate declares `member`, so the winner is the earliest class in the
+/// preorder M2 established (own declarations across every candidate file,
+/// then each listed parent's entire subtree in order) that declares it. A
+/// re-expansion can only *add* classes to that preorder — never reorder the
+/// prefix already walked — so it changes the answer only where the old walk
+/// returned a later declaration, or none at all, because an earlier one had
+/// been poisoned. The map still subsumes the cycle guard: a true cycle
+/// (`A : B`, `B : A`) re-reaches each node at a strictly *greater* depth
+/// every time round, which is refused, so it terminates on the first lap.
 fn locate_field_dfs(
     ctx: &LookupCtx<'_>,
     class: &str,
     member: &str,
-    visited: &mut HashSet<String>,
+    visited: &mut HashMap<String, usize>,
     depth: usize,
 ) -> Option<FieldSource> {
-    if depth >= luabox_types::MAX_ANCESTRY_DEPTH || !visited.insert(class.to_string()) {
+    if depth >= luabox_types::MAX_ANCESTRY_DEPTH {
         return None;
     }
+    match visited.get(class) {
+        // Already expanded from at least this close: its subtree was walked
+        // with a cut no tighter than the one this frame would apply, so
+        // re-expanding it cannot reach anything new.
+        Some(&seen) if seen <= depth => return None,
+        _ => visited.insert(class.to_string(), depth),
+    };
     locate_field_in_class(ctx, class, member, visited, depth)
 }
 
@@ -839,7 +1001,7 @@ fn locate_field_in_class(
     ctx: &LookupCtx<'_>,
     class: &str,
     member: &str,
-    visited: &mut HashSet<String>,
+    visited: &mut HashMap<String, usize>,
     depth: usize,
 ) -> Option<FieldSource> {
     let order = search_order(
@@ -855,10 +1017,7 @@ fn locate_field_in_class(
         .collect();
     let declarations: Vec<(&FileSema, ClassDecl<'_>)> = semas
         .iter()
-        .filter_map(|sema| {
-            let mut map = sema.classes();
-            map.remove(class).map(|decl| (&**sema, decl))
-        })
+        .filter_map(|sema| sema.class_named(class).map(|decl| (&**sema, decl)))
         .collect();
     for (sema, decl) in &declarations {
         if let Some(field) = decl
@@ -922,7 +1081,7 @@ pub fn class_own_params(
         let Some(sema) = cached_file_sema(sema_cache, analysis, path) else {
             continue;
         };
-        if let Some(decl) = sema.classes().get(class) {
+        if let Some(decl) = sema.class_named(class) {
             return decl.tag.params.clone();
         }
     }
@@ -2474,6 +2633,157 @@ mod tests {
         )
         .expect("both branches declare `item`");
         assert_eq!(found.desc.as_deref(), Some("from the deep left ancestor"));
+    }
+
+    // === depth-carrying visited set (round 8 review, F2) ==================
+
+    /// A class reachable both **deep** (one link under the cap, so its own
+    /// parents are cut) and **shallow** (where they are not), with the field
+    /// declared above it. F2's shape, mirroring `env.rs`'s F1:
+    ///
+    /// - `Z` declares `item`, `Y : Z`,
+    /// - a `B1 … B198` chain ending `B198 : Y`,
+    /// - `A : B1, Y` — `Y` is at depth 199 through the chain and depth 1
+    ///   direct.
+    ///
+    /// Through the chain, `Y` is expanded at 199 and its parent `Z` lands at
+    /// exactly [`luabox_types::MAX_ANCESTRY_DEPTH`], where the cut drops it:
+    /// `Y`'s subtree is unexplored. A once-ever `visited` set then refuses
+    /// `A`'s *direct* `Y` edge at depth 1, so `Z.item` is never found —
+    /// hover, goto-definition and signature help all answer nothing — and
+    /// swapping `A`'s parents to `Y, B1` finds it. One class graph, two
+    /// answers, decided by the order parents happen to be listed in.
+    fn near_cap_two_reach_source(parents: &str) -> String {
+        use std::fmt::Write as _;
+        // A(0) → B1(1) … B198(198) → Y(199) → Z(200): `Z` is exactly at the
+        // cap through the chain, and at depth 2 through `A : … Y`.
+        let links = luabox_types::MAX_ANCESTRY_DEPTH - 2;
+        let mut src = String::from(
+            "---@class Z\n---@field item number the deep declaration\n\n---@class Y : Z\n",
+        );
+        for i in 1..links {
+            let _ = writeln!(src, "---@class B{i} : B{}", i + 1);
+        }
+        let _ = writeln!(src, "---@class B{links} : Y");
+        let _ = writeln!(src, "---@class A : {parents}");
+        src
+    }
+
+    #[test]
+    fn locate_field_re_expands_a_class_first_reached_too_deep_to_expand_its_parents() {
+        for parents in ["B1, Y", "Y, B1"] {
+            let (analysis, path) = sema_of(&near_cap_two_reach_source(parents));
+            let found = locate_field(
+                &analysis,
+                &path,
+                "A",
+                "item",
+                &no_ambient(),
+                &no_cache(),
+                &no_order_cache(),
+            )
+            .unwrap_or_else(|| {
+                panic!(
+                    "`Z.item` is two links from `A` through the direct `Y` edge; \
+                     the near-cap reach through the chain must not poison it \
+                     (parents: `{parents}`)"
+                )
+            });
+            assert_eq!(
+                found.desc.as_deref(),
+                Some("the deep declaration"),
+                "and the winner must be the same one in either parent order"
+            );
+        }
+    }
+
+    // === class-map memo (round 8 review, F23) =============================
+
+    /// The DFS hot path used to rebuild a candidate file's *whole* class map
+    /// — [`FileSema::classes`] walks every annotation item in the file and
+    /// allocates a fresh [`ClassDecl`] (joined doc lines and `---@see` list
+    /// included) for every class it declares — once per class visited in the
+    /// ancestry walk. `SearchOrderCache` memoises only the cheap
+    /// `may_declare_class` text scan around it, and `FileSemaCache` memoises
+    /// only the parse, so a walk `MAX_ANCESTRY_DEPTH` classes deep over `F`
+    /// candidate files derived `F × 200` class maps on the single-threaded
+    /// server, per request.
+    ///
+    /// Measured directly, because a memo that quietly rebuilds is
+    /// indistinguishable from one that works by any behavioural assertion: a
+    /// 199-class chain in one file, one miss lookup (a miss is the case that
+    /// walks the chain to the end — [`locate_field_dfs`]'s own doc on why
+    /// misses are routine), and the file's class map must be derived
+    /// **once**, not once per class.
+    #[test]
+    fn a_deep_ancestry_walk_derives_each_candidate_files_class_map_once() {
+        use std::fmt::Write as _;
+        let n = luabox_types::MAX_ANCESTRY_DEPTH - 1;
+        let mut src = String::from("---@class C0\n---@field item number\n");
+        for i in 1..=n {
+            let _ = writeln!(src, "---@class C{i} : C{}", i - 1);
+        }
+        let (analysis, path) = sema_of(&src);
+        let cache = no_cache();
+        let sema = cached_file_sema(&cache, &analysis, &path).expect("the file is known");
+        let before = sema.index_builds.get();
+
+        assert!(
+            locate_field(
+                &analysis,
+                &path,
+                &format!("C{n}"),
+                "absent",
+                &no_ambient(),
+                &cache,
+                &no_order_cache(),
+            )
+            .is_none(),
+            "no class in the chain declares `absent` — the walk must miss"
+        );
+
+        assert_eq!(
+            sema.index_builds.get() - before,
+            1,
+            "a {n}-class walk over one candidate file must derive its class \
+             map once, not once per class"
+        );
+    }
+
+    /// The memo is per [`FileSema`], and `FileSemaCache` gives one `FileSema`
+    /// per path for a revision's lifetime — so the reuse above holds across
+    /// separate `locate_field` calls sharing that cache (a hover and the
+    /// goto-definition right after it), not merely within one walk.
+    #[test]
+    fn a_second_lookup_through_a_shared_sema_cache_reuses_the_class_map() {
+        let analysis = analyze_files(&[(
+            "main.lua",
+            "---@class Base\n---@field item number\n\n---@class Leaf : Base\n",
+        )]);
+        let current = root().join("main.lua");
+        let cache = no_cache();
+        let order = no_order_cache();
+        for _ in 0..2 {
+            assert!(
+                locate_field(
+                    &analysis,
+                    &current,
+                    "Leaf",
+                    "item",
+                    &no_ambient(),
+                    &cache,
+                    &order,
+                )
+                .is_some(),
+                "`Base.item` resolves through `Leaf`"
+            );
+        }
+        let sema = cached_file_sema(&cache, &analysis, &current).expect("the file is known");
+        assert_eq!(
+            sema.index_builds.get(),
+            1,
+            "two walks over one cached `FileSema` must share one class map"
+        );
     }
 
     // === functions() ======================================================

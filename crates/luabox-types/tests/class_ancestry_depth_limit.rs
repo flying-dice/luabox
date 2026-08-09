@@ -247,6 +247,18 @@ fn a_depth_limit_diagnostic_attributed_to_another_file_honors_that_files_own_dis
 
     // No resolver: the diagnostic — attributed to `chain.lua` — must
     // survive rather than be checked against the wrong file.
+    //
+    // This arm is also the pin for a DOCUMENTED USER-VISIBLE LIMIT, not just
+    // an internal safety property (round 8 review F8). `None` is exactly what
+    // the language server passes — it checks one open document and has no
+    // resolver — so "survives unsuppressed" is what an editor shows while
+    // `luabox check`, which does pass a resolver (the arm below), goes green
+    // on the same workspace. That divergence is now stated as a measured
+    // exception in `luabox explain LB0317`/`LB0318`/`LB0319` and in
+    // docs/03-reference/02-limitations.md's editor/CLI parity claim; the two
+    // arms here are what those texts describe. Reversing this arm to
+    // "suppressed" would make the docs wrong, not just the behaviour
+    // different.
     let unsuppressed = check_file_with_artifacts_and_sources(
         &consumer_parse,
         "consumer.lua",

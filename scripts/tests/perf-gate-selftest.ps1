@@ -6,19 +6,21 @@
 .DESCRIPTION
     #58 review round 6, M51: perf-gate.ps1 had NO self-test at all, and
     New-PerfManifest was a hand-reimplementation of perf-gate-lib.sh's
-    write_perf_manifest with nothing proving the two stay equivalent. This
-    file is unverified — there is no `pwsh` on the Linux box this round's
-    fixes were made and reviewed on (checked directly: `which pwsh` finds
-    nothing), so nothing here has actually been RUN. It is written to the
-    same structure and against the same properties as the bash self-test it
-    mirrors, using the same PowerShell idioms perf-gate.ps1 and
-    perf-gate-lib.ps1 already use elsewhere in this repo, but it has not
-    been exercised even once. scripts/tests/perf-gate-selftest.ps1 needs a
-    real `pwsh` run — ci.yml's `perf-gate-selftest-ps1` job (windows-latest,
-    `shell: pwsh`) is that leg, so the first real execution happens in CI,
-    not silently deferred forever. If that job is red and this file has not
-    changed, the failure is this suite meeting reality for the first time —
-    fix the .ps1 side to match the bash semantics it mirrors, not the test.
+    write_perf_manifest with nothing proving the two stay equivalent.
+
+    RUN STATUS. Earlier revisions of this header said this file was
+    unverified because no `pwsh` existed on the Linux box it was written on.
+    That is no longer true: #58 review round 8 ran this suite under
+    PowerShell 7.4.6 on Linux, in full, and every case here — including the
+    round-8 additions — has actually executed. What a Linux pwsh run does
+    NOT cover is the Windows-only half of perf-gate.ps1: Process.Start's
+    FileName semantics, PeakWorkingSet64 and the working-set accounting the
+    three RSS-measuring legs read. ci.yml's `perf-gate-selftest-ps1` job
+    (windows-latest, `shell: pwsh`) is the platform leg for that, and stays
+    the gate for it. If that job is red and this file has not changed, the
+    failure is a Windows-specific behaviour this suite cannot see from
+    Linux — fix the .ps1 side to match the bash semantics it mirrors, not
+    the test.
 
     Two parts, mirroring perf-gate-selftest.sh:
 
@@ -33,7 +35,10 @@
     perf-gate.sh's own LUABOX_BIN/GEN_CORPUS_BIN). It covers the SEVEN of
     perf-gate.ps1's ten threshold comparisons that are measured through the
     `& $luaboxBin ...` + Stopwatch pattern: cold start, fmt --check (warm),
-    check (warm), and the four diagnostics-heavy timing legs. It does NOT
+    check (warm), and the four diagnostics-heavy timing legs — plus, since
+    round 8, the two judgements that are not threshold comparisons at all:
+    the abort-mid-legs catch (F11) and a ceiling actually binding at a high
+    -Factor (F15b). It does NOT
     cover the check-peak-RSS leg or the retained-TypeEnv leg (RSS AND wall
     time both) — those three go through raw
     [System.Diagnostics.Process]::Start() with $info.FileName set directly
@@ -215,6 +220,57 @@ try {
         $script:fail++
     }
 
+    # #58 review round 8, F15b: the round 6 rebase capped two of the EIGHT
+    # scaled legs, so the other six ran unbounded at CI's factor 4.0 — the
+    # "a 12x ceiling is not a gate" condition perf-gate-lib.sh's own comment
+    # names, left live on three quarters of the gate. Pinned by name on both
+    # sides (perf-gate-selftest.sh carries the identical list) because a leg
+    # that LOSES its ceiling looks exactly like a leg that never had one.
+    foreach ($key in @(
+        "COLD_START_CEILING_MS", "FMT_CEILING_MS", "CHECK_CEILING_MS",
+        "RETAINED_ENV_CHECK_CEILING_MS", "DIAG_LINT_CEILING_MS",
+        "DIAG_CHECK_CEILING_MS", "DIAG_LINT_RENDERED_CEILING_MS",
+        "DIAG_CHECK_RENDERED_CEILING_MS")) {
+        if ($budgets[$key] -gt 0) {
+            Write-Host "PASS  perf-gate-budgets.env defines a positive $key (F15b: all 8 scaled legs are capped)"
+            $script:pass++
+        } else {
+            Write-Host "FAIL  perf-gate-budgets.env has no positive $key"
+            $script:fail++
+        }
+    }
+
+    # #58 review round 8, F16: the RETAINED-TYPEENV REGRESSION GATE's three
+    # constants were bare literals in perf-gate.ps1 AND perf-gate.sh — the
+    # one leg guarding a ~25x peak-RSS regression was the one whose budget
+    # could drift between Linux and Windows with nothing to notice, contra
+    # M50. They live in the shared file now; pinned by name so a key that
+    # never reaches it fails here instead of on a Windows runner later.
+    foreach ($key in @(
+        "RETAINED_ENV_CORPUS_FILES", "RETAINED_ENV_RSS_BUDGET_MIB",
+        "RETAINED_ENV_CHECK_BUDGET_BASE_MS")) {
+        if ($budgets[$key] -gt 0) {
+            Write-Host "PASS  perf-gate-budgets.env defines $key (F16: no longer hand-carried in both gates)"
+            $script:pass++
+        } else {
+            Write-Host "FAIL  perf-gate-budgets.env does not define $key"
+            $script:fail++
+        }
+    }
+
+    # A ceiling BELOW its own base would silently re-tighten the FACTOR=1.0
+    # budget every base in that file was calibrated at — the cap bounds the
+    # FACTOR, never the calibration. Checked as a relation between the
+    # committed numbers, on both readers.
+    $inverted = @()
+    foreach ($leg in @("COLD_START", "FMT", "CHECK", "RETAINED_ENV_CHECK",
+        "DIAG_LINT", "DIAG_CHECK", "DIAG_LINT_RENDERED", "DIAG_CHECK_RENDERED")) {
+        if ($budgets["${leg}_CEILING_MS"] -lt $budgets["${leg}_BUDGET_BASE_MS"]) {
+            $inverted += $leg
+        }
+    }
+    Test-Equal "every ceiling in perf-gate-budgets.env is >= its own base" ($inverted -join ",") ""
+
     $malformed = Join-Path $work "malformed-budgets.env"
     Set-Content -Path $malformed -Value @("GOOD_KEY=1", "not a key=value line at all")
     $threw = $false
@@ -281,7 +337,21 @@ switch ($cmd) {
     "check" {
         if ($cwd -like "*diagnostics-heavy*check-rendered") { Wait-Ms $env:STUB_DIAG_CHECK_RENDERED_MS; exit 1 }
         elseif ($cwd -like "*diagnostics-heavy*check") { Wait-Ms $env:STUB_DIAG_CHECK_MS; exit 1 }
-        else { Wait-Ms $env:STUB_CHECK_100K_MS; exit 0 }
+        else {
+            # STUB_THROW_ON_CHECK_100K: raise a TERMINATING error from inside
+            # the stub, mid-run, on the 100-kLOC corpus's `check (warm)` leg —
+            # i.e. after cold start and fmt have already reported PASS and
+            # before any diagnostics-heavy leg has run. `throw` propagates out
+            # of a `&`-invoked .ps1 into the caller's scope regardless of
+            # $ErrorActionPreference, which is exactly the shape perf-gate.ps1's
+            # own catch exists for: a binary that fails to launch, a corpus
+            # write error, the RSS leg's Process.Start blowing up. Drives the
+            # abort-mid-legs case below (#58 review round 8, F11).
+            if ($env:STUB_THROW_ON_CHECK_100K) {
+                throw "stub-luabox: simulated mid-run failure on the 100-kLOC check leg"
+            }
+            Wait-Ms $env:STUB_CHECK_100K_MS; exit 0
+        }
     }
     default {
         Write-Error "stub-luabox: unsupported invocation: $($args -join ' ')"
@@ -328,11 +398,29 @@ $allFailNeedles = @(
     "FAIL lint (diagnostics-heavy):",
     "FAIL check (diagnostics-heavy):",
     "FAIL lint (diagnostics-heavy, rendered):",
-    "FAIL check (diagnostics-heavy, rendered):"
+    "FAIL check (diagnostics-heavy, rendered):",
+    # #58 review round 8, F11: perf-gate.ps1's abort-mid-legs catch — the
+    # guard against "half a gate reading as green", and the only one of the
+    # five defects that round found which had NO self-test at all — was
+    # absent from this sweep, so no case asserted it either present OR
+    # absent. Deleting the catch outright left this suite fully green. It is
+    # a FAIL line like any other now: every case asserts it absent except
+    # abort_mid_legs_fails_loudly, which asserts it present.
+    "FAIL perf-gate: aborted before all legs ran:"
 )
 
 function Invoke-Gate {
-    param([string]$Name, [int]$WantExit, [string]$WantFailNeedle = "", [string[]]$AlsoPresent = @())
+    param(
+        [string]$Name,
+        [int]$WantExit,
+        [string]$WantFailNeedle = "",
+        [string[]]$AlsoPresent = @(),
+        # The `!needle` half of perf-gate-selftest.sh's vocabulary
+        # (selftest-lib.sh's assert_exit): a case that can only prove a
+        # string PRESENT cannot prove the right code path fired. $allFailNeedles
+        # covers the ten leg FAILs automatically; this is for everything else
+        # a case needs gone — a verdict line, another leg's PASS.
+        [string[]]$AlsoAbsent = @())
     $log = Join-Path $gwork "$Name.log"
     $env:LUABOX_BIN = $stubLuabox
     $env:GEN_CORPUS_BIN = $stubGenCorpus
@@ -352,6 +440,9 @@ function Invoke-Gate {
     }
     foreach ($needle in $AlsoPresent) {
         if (-not $logText.Contains($needle)) { $ok = $false; $report += " missing:[$needle]" }
+    }
+    foreach ($needle in $AlsoAbsent) {
+        if ($logText.Contains($needle)) { $ok = $false; $report += " present-but-should-be-absent:[$needle]" }
     }
     if ($ok) {
         Write-Host "PASS  $Name (exit $got)"
@@ -407,6 +498,53 @@ $env:STUB_DIAG_LINT_RENDERED_MS = "0"
 $env:STUB_DIAG_CHECK_RENDERED_MS = "3000"
 Invoke-Gate "diag_check_rendered_threshold_is_live" 1 "FAIL check (diagnostics-heavy, rendered):"
 $env:STUB_DIAG_CHECK_RENDERED_MS = "0"
+
+# --- F11: the abort-mid-legs catch ------------------------------------------
+# perf-gate.ps1's catch is the guard against a gate that measured half of
+# what it claims and called it green: $ErrorActionPreference is "Continue"
+# through the legs (the fmt/lint-stderr note), so without the catch an
+# exception thrown mid-run aborts every REMAINING leg, runs the finally, and
+# falls through to `exit 0` with $fail still $false. Round 6 recorded that as
+# MEASURED, not hypothetical — the .ps1 selftest's first real execution hit
+# it through the RSS leg — and then shipped the fix with no case behind it
+# (#58 review round 8, F11: delete the `catch` block and this suite stayed
+# fully green, the one silently-green defect of the five being the one with
+# no test).
+#
+# The stub raises a terminating error on the 100-kLOC `check` leg, so the
+# abort lands strictly BETWEEN legs: cold start and fmt have already printed
+# PASS, and check (warm) and everything after it never run. That ordering is
+# asserted both ways — the two earlier PASSes present, the aborted leg's own
+# PASS absent — so the case cannot pass on an exception thrown before the
+# gate did anything, which would prove nothing about "aborted BEFORE ALL LEGS
+# ran". Restore the catch's absence and this goes RED on the missing needle;
+# no other case in the file changes.
+$env:STUB_THROW_ON_CHECK_100K = "1"
+Invoke-Gate "abort_mid_legs_fails_loudly" 1 "FAIL perf-gate: aborted before all legs ran:" `
+    -AlsoPresent @("PASS cold start:", "PASS fmt --check (warm):") `
+    -AlsoAbsent @("PASS check (warm):", "perf-gate: ALL GATES PASSED")
+Remove-Item Env:\STUB_THROW_ON_CHECK_100K -ErrorAction SilentlyContinue
+
+# --- F15b: a newly-capped leg's ceiling is actually WIRED --------------------
+# Part 1 proves the eight ceiling keys exist and that ConvertTo-ScaledBudgetMs
+# honours -CeilingMs. Neither proves perf-gate.ps1 PASSES one at a given leg —
+# which is the exact gap F15b names, and the exact shape of the drift the
+# round 6 local merge-gate found (CHECK_CEILING_MS/DIAG_CHECK_CEILING_MS sat
+# in the shared file honoured by the bash reader and silently ignored here).
+# Every case above runs at the default factor 1.0, where scaled == base and
+# no ceiling can bind.
+#
+# Same leg and same numbers as perf-gate-selftest.sh's twin case: at
+# LUABOX_PERF_FACTOR=100 the uncapped cold-start budget is 50 * 100 = 5000 ms
+# and the capped one is COLD_START_CEILING_MS = 150 ms; a 200 ms stub
+# `--version` sits between them. Drop -CeilingMs from perf-gate.ps1's
+# $coldStartBudget line and the 5000 ms budget swallows it: the FAIL needle
+# vanishes, exit goes 1 -> 0, RED.
+$env:LUABOX_PERF_FACTOR = "100"
+$env:STUB_VERSION_MS = "200"
+Invoke-Gate "cold_start_ceiling_is_wired_at_a_high_factor" 1 "FAIL cold start:"
+$env:STUB_VERSION_MS = "0"
+Remove-Item Env:\LUABOX_PERF_FACTOR -ErrorAction SilentlyContinue
 
 Remove-Item -Recurse -Force $gwork -ErrorAction SilentlyContinue
 

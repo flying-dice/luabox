@@ -93,6 +93,27 @@ allowlist="${ALLOWLIST:-$here/mutants-allowlist.txt}"
 in_diff="${IN_DIFF:-}"
 # default_files is the scope of record — see SCOPE_OF_RECORD below — as well
 # as FILES' own default, from the one place both are written down.
+#
+# WHAT A GREEN RUN OF THIS GATE DOES AND DOES NOT CLAIM (#58 review round 8,
+# F13). These four files are the whole mutation surface, for the FULL
+# scheduled audit and for mutants.yml's per-PR `mutants-pr` alike — the
+# latter reads this exact assignment to build its `--in-diff` path list, so
+# a PR's diff is intersected with these four paths and nothing else. On
+# #58's own delta that is 4 files against 36 non-test source files touched:
+# `mutants-pr`'s green "148 in-diff mutants" is evidence about the merge
+# seam in luabox-types, and is not evidence about the largest new logic in
+# that delta — `push_routed`, `locate_field_dfs`, check_cmd.rs's
+# reconciliation passes, assign.rs's nominal upcast — every one of which is
+# outside these four paths and therefore outside every mutation number this
+# repo publishes. Read any claim resting on this gate at that width, not at
+# the delta's.
+#
+# Nothing about the scope changes this round: widening it is #71, and the
+# reason it waits is written out below (nobody has reviewed what survives
+# over the additional ~95 mutants, and waiving them unreviewed would break
+# the allowlist's own discipline). What changes here is that the limit is
+# stated where the scope is defined, instead of being inferable only by
+# comparing this line against a PR's file list.
 default_files="crates/luabox-types/src/env.rs,crates/luabox-types/src/defs.rs,crates/luabox-types/src/generics.rs,crates/luabox-types/src/infer/reify.rs"
 files="${FILES:-$default_files}"
 
@@ -260,7 +281,25 @@ case "$status" in
     exit 1
     ;;
 *)
+    # #58 review round 8, F14: this arm used to print the bare number and
+    # nothing else. It is the arm a real crash lands in — an OOM kill (137),
+    # a panic, a signal — i.e. precisely the case where the operator has the
+    # least context and the run left the most behind. The exit code is still
+    # PROPAGATED verbatim (mutants-gate-selftest.sh's status_137_propagates
+    # pins that a gate which always exits 1 on error is not acceptable), and
+    # the first line still names it, so nothing that greps this text moves.
     echo "error: cargo-mutants failed with exit $status" >&2
+    echo "error:   not one of the four measured shapes (0/2/3 judgeable, 4 baseline-failed) — this is a" >&2
+    echo "error:   crash, a signal (137 = 128+SIGKILL, i.e. OOM-killed on most runners) or a cargo-mutants" >&2
+    echo "error:   version whose exit codes this gate has not measured. Nothing was classified." >&2
+    echo "error:   Report directory: $out_dir" >&2
+    echo "error:   Full log:         $out_dir/mutants.out/log" >&2
+    echo "error:   Scope this run:   $files" >&2
+    if [ -n "$in_diff" ]; then
+        echo "error:   Diff-bounded:     $in_diff" >&2
+    fi
+    echo "error:   In CI, that directory is uploaded as the run's mutants report artifact — the runner's" >&2
+    echo "error:   own copy is gone by the time anyone reads this line." >&2
     exit "$status"
     ;;
 esac

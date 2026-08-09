@@ -39,6 +39,73 @@ jobs:
       - run: cargo test --manifest-path tools/differ/Cargo.toml
         if: matrix.os == 'ubuntu-latest'
 
+  # The `#[ignore]`d tests that CI can run deterministically (#58 review
+  # round 8, F10). `cargo test --workspace` in `check` above skips every
+  # `#[ignore]`d test by construction, and no job passed `--ignored`, so
+  # four claims in this repo's review record were "pinned" by tests nothing
+  # ever executed — the behaviour they name could flip green and stay green.
+  # Two of the four are deterministic and belong in CI:
+  #
+  #   malformed_class_headers_m66  M66's pin. It asserts today's MEASURED
+  #                                behaviour for malformed `---@class`
+  #                                headers — a known bug, deliberately
+  #                                pinned so the day it changes is visible.
+  #                                Pure, in-process, no binary, no clock.
+  #   regen_merge_matrix_provenance  M42's pin, and the only test that reads
+  #                                the merge-matrix fixtures through a real
+  #                                `luabox check` SUBPROCESS the way a user's
+  #                                project is checked (the fast in-process
+  #                                test covers the library path only). Needs
+  #                                a release binary, hence the build step.
+  #
+  # The other two — search_order_cache_wall_time_by_depth and
+  # project_types_sweep_wall_time (the perf halves of M57/M18) — are NOT
+  # wired here and stay `#[ignore]`d: they assert wall-clock bounds, which
+  # is flaky-by-design on a shared runner. Citing them as CI-enforced proof
+  # is what F10 refuses; running them here would trade a false claim for a
+  # red-on-Tuesday pipeline. perf-gate.sh is where this repo gates time.
+  #
+  # regen_merge_matrix_provenance WRITES
+  # docs/03-reference/merge-matrix-provenance.md — that is its job. This
+  # runs it for its ASSERTIONS (it panics on a missing/unusable binary and
+  # on a fixture project it cannot materialise or parse) and then discards
+  # the write, because the committed doc was generated with
+  # LUABOX_DEVELOP_BIN pointing at a develop-built binary and this job has
+  # no such binary, so its output legitimately differs in the develop
+  # column. `git diff --exit-code` after the restore is the guard that the
+  # discard is complete: if this test ever starts writing somewhere else,
+  # this job fails rather than leaving CI's checkout quietly modified.
+  ignored-deterministic-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ignored-deterministic-tests
+      # regen_merge_matrix_provenance shells out to a real release binary
+      # and asserts it exists before doing anything else.
+      - run: cargo build --release -p luabox-cli
+      # Both names are passed as explicit filters, so this leg runs exactly
+      # these two and cannot silently pick up a future `#[ignore]`d test in
+      # the same target — including a wall-time one, which is the thing the
+      # comment above says is deliberately not wired. Verified locally at
+      # this head: "2 passed; 0 failed; 0 ignored; 7 filtered out".
+      # Quoted: an unquoted YAML plain scalar treats ` #` as a comment
+      # start, which silently truncated this name to "Run the deterministic".
+      - name: "Run the deterministic #[ignore]d tests"
+        run: >
+          cargo test -p luabox-types --test class_merge_precedence_matrix
+          -- --ignored malformed_class_headers_m66 regen_merge_matrix_provenance
+      - name: Discard the provenance doc regeneration and assert nothing else changed
+        if: always()
+        run: |
+          git checkout -- docs/03-reference/merge-matrix-provenance.md
+          git diff --exit-code
+
   # Dual line-coverage gates (cargo-llvm-cov), measured as two ISOLATED
   # suites so each style of testing independently guarantees behaviour:
   #   - unit: every in-process test (libs, bins, per-crate tests/) with the
@@ -178,12 +245,20 @@ jobs:
       - name: Self-test perf-gate-lib.sh's judgement
         run: bash scripts/tests/perf-gate-selftest.sh
 
-  # First real execution surface for the PowerShell mirror: the three .ps1
-  # gate files ship alongside the bash ones (#58 round 6, M51) but no
-  # developer machine here runs pwsh, so without this leg 600+ lines of
-  # gate code would reach main having never been executed — the
-  # audit-nothing shape decisions/12 exists to refuse. windows-latest
-  # because perf-gate.ps1's real consumers are Windows runners.
+  # The WINDOWS execution surface for the PowerShell mirror: the three .ps1
+  # gate files ship alongside the bash ones (#58 round 6, M51) and without
+  # this leg 600+ lines of gate code would reach main never having run on
+  # the platform they exist for — the audit-nothing shape decisions/12
+  # exists to refuse. windows-latest because perf-gate.ps1's real consumers
+  # are Windows runners.
+  #
+  # It is no longer the FIRST execution of that suite: #58 review round 8
+  # ran scripts/tests/perf-gate-selftest.ps1 under pwsh 7.4.6 on Linux
+  # before touching it (see that file's own header for what that run
+  # covered and the two legs it structurally cannot). What this job adds
+  # that a Linux pwsh cannot is the Windows-only half — Process.Start's
+  # FileName semantics, PeakWorkingSet64, the working-set accounting the
+  # RSS legs read — so it stays the gate on the platform, not a duplicate.
   perf-gate-selftest-ps1:
     runs-on: windows-latest
     timeout-minutes: 20
@@ -209,10 +284,24 @@ jobs:
       # the tooling up front, the way draft-install-mock does.
       - name: Assert python3 is available (peak-RSS legs depend on it)
         run: python3 --version
-      # GitHub-hosted runners are ~3x slower and noisier than the dev
-      # baseline the budgets were calibrated on (observed: warm check
-      # 3145 ms vs the 1000 ms budget). The factor scales every budget;
-      # regressions still fail, just against shared-runner reality.
+      # GitHub-hosted runners are slower and noisier than the dev box every
+      # budget in scripts/perf-gate-budgets.env was calibrated on, so each
+      # leg's BASE is multiplied by this factor here. Deliberately no ms
+      # figures in this comment (#58 review round 8, F18): the previous one
+      # cited "warm check 3145 ms vs the 1000 ms budget" and survived the
+      # round 6 rebase that replaced that 1000 ms budget entirely, so the
+      # next person tuning this number reasoned from a budget the repo no
+      # longer had. Every base, every ceiling and the measurement each was
+      # derived from live in perf-gate-budgets.env, next to the constant
+      # they justify, and are what this factor should be read against.
+      #
+      # Raising this factor no longer widens a budget without bound: each of
+      # the eight scaled legs also carries a *_CEILING_MS cap on the SCALED
+      # value, so a leg's effective budget here is min(base x factor,
+      # ceiling) — see that file's "CEILING keys" note for why a factor
+      # multiplying a base that already carries its own headroom is how a
+      # gate goes blind. Regressions still fail, just against shared-runner
+      # reality.
       - run: bash scripts/perf-gate.sh
         env:
           LUABOX_PERF_FACTOR: "4.0"

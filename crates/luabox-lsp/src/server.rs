@@ -29,7 +29,7 @@
 //!   closed stdin, a dead [`Connection`] — end the loop.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
@@ -342,6 +342,11 @@ struct ProjectConfig {
     /// from the same resolution so the two can never disagree about what is
     /// genuinely ambient.
     def_paths: HashSet<PathBuf>,
+    /// The `---@alias`/`---@enum` names `def_sources` declares (round 8
+    /// review, F7) — [`merged_ambient::alias_or_enum_names`] over the very
+    /// same `Vec`, so the names and the layer built from those texts cannot
+    /// name different things.
+    def_alias_names: HashSet<String>,
     /// The `lua_modules/share/lua/<X.Y>/` version directory whose installed rock
     /// sources are harvested for their type surfaces (#30) — chosen by `[build]
     /// target` (the edition when unset), exactly as `luabox check` chooses it, so
@@ -365,6 +370,7 @@ impl ProjectConfig {
             out_dir: None,
             def_sources: Vec::new(),
             def_paths: HashSet::new(),
+            def_alias_names: HashSet::new(),
             rock_version_dir: luabox_bundle::rocks_version_dir(Dialect::Lua54),
             lint: LintConfig::new(),
             unknown_lint_rules: Vec::new(),
@@ -380,6 +386,11 @@ impl ProjectConfig {
         // shared with `luabox lint` — including the unknown-rule-id check the
         // manifest parser cannot do (CC-M8).
         let (lint, unknown_lint_rules) = LintConfig::from_manifest(&manifest.lint);
+        // One resolution, read twice (F7): the alias/enum names are harvested
+        // from the exact `Vec` the ambient layer is built from, not from a
+        // second walk that could resolve a different set of files.
+        let def_sources = ambient_def_sources(root, &manifest);
+        let def_alias_names = crate::merged_ambient::alias_or_enum_names(&def_sources);
         Self {
             // `Manifest::parse` types `[package] edition` as a closed
             // `DialectId`, so this maps inward exhaustively — there is no
@@ -387,7 +398,8 @@ impl ProjectConfig {
             dialect: syntax_dialect(manifest.package.edition),
             strictness: Strictness::from_manifest_flag(manifest.types.strict),
             out_dir: Some(root.join(&manifest.build.out)),
-            def_sources: ambient_def_sources(root, &manifest),
+            def_sources,
+            def_alias_names,
             def_paths: ambient_def_paths(root, &manifest),
             rock_version_dir: luabox_bundle::rocks_version_dir(syntax_dialect(
                 manifest.build.target,
@@ -570,6 +582,103 @@ fn harvest_rock_tree(root: &Path, version_dir: &str, ambient: &Ambient) -> RockS
     harvested
 }
 
+/// The bookkeeping behind cross-file diagnostics (round 8 review, F4).
+///
+/// # What it is for
+///
+/// Checking one file can produce a diagnostic whose primary span belongs to
+/// **another** — the `LB0317`/`LB0318` `---@class` ancestry pair points at
+/// the offending class's declaration, wherever it lives
+/// ([`diagnostics::FileDiagnostics`]). LSP has no way to say "add this one
+/// diagnostic to that document": `publishDiagnostics` **replaces** the whole
+/// set for a URI. So publishing a foreign group means publishing everything
+/// that document should show, which means knowing everything that document
+/// should show — and the code this replaces knew none of it. It published a
+/// foreign group and forgot it had, which produced four distinct failures
+/// with one root cause:
+///
+/// - **never cleared** — fix the cycle in the declaring file and the new pass
+///   produces no foreign group at all, so the loop that would have
+///   republished the other document never runs; its stale diagnostic stayed
+///   until that document was itself touched;
+/// - **vanished on a keystroke** — the group is produced by the *consuming*
+///   file's pass, so publishing the file it was painted onto replaced that
+///   file's set with its own half alone;
+/// - **last writer won** — two consumers each producing a group for one
+///   target: whichever published last replaced the other's finding;
+/// - **nondeterministic** — a batch republish walked a `HashMap`, so which of
+///   the two survived depended on hash order.
+///
+/// # The record
+///
+/// [`Self::contributions`] is the cross-file half: contributor → target →
+/// that pass's group. It is authoritative and total — a pass over a
+/// contributor **replaces** its whole entry, so a group that is no longer
+/// produced is a group that is no longer in the ledger, which is what makes
+/// clearing fall out rather than needing its own path.
+/// [`Self::own`] is each file's same-file half, as of the last pass over it.
+/// A published set is then, for any target, that target's own half plus every
+/// contributor's group for it — with `BTreeMap` ordering throughout, so the
+/// merge is a function of the workspace and nothing else.
+#[derive(Default)]
+struct ForeignLedger {
+    /// Contributor path → (target path → the group that pass produced for
+    /// that target). A contributor with nothing to contribute has no entry:
+    /// [`Self::record`] removes it rather than storing an empty map, so
+    /// `contributions` never grows an entry per file in the workspace.
+    contributions: BTreeMap<PathBuf, BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>>,
+    /// Path → the own half of the last pass over that file, i.e. exactly the
+    /// same-file diagnostics that file's URI is currently showing.
+    own: BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>,
+}
+
+impl ForeignLedger {
+    /// Record one completed pass over `source` and answer with every path
+    /// whose published set may have moved, in sorted order.
+    ///
+    /// The affected set is the union of what `source` contributed *before*
+    /// this pass, what it contributes now, and `source` itself. The first
+    /// term is what makes a cleared diagnostic clear: a target that has just
+    /// dropped out of `source`'s groups is still republished, now without it.
+    fn record(
+        &mut self,
+        source: &Path,
+        own: Vec<lsp_types::Diagnostic>,
+        foreign: BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>,
+    ) -> Vec<PathBuf> {
+        let mut affected: BTreeSet<PathBuf> = BTreeSet::new();
+        affected.insert(source.to_path_buf());
+        if let Some(previous) = self.contributions.get(source) {
+            affected.extend(previous.keys().cloned());
+        }
+        affected.extend(foreign.keys().cloned());
+
+        if foreign.is_empty() {
+            self.contributions.remove(source);
+        } else {
+            self.contributions.insert(source.to_path_buf(), foreign);
+        }
+        self.own.insert(source.to_path_buf(), own);
+        affected.into_iter().collect()
+    }
+
+    /// Everything `target`'s document should currently show: its own half,
+    /// then every contributor's group for it, contributors in path order.
+    ///
+    /// Every contributor is merged, not just the one that happens to be
+    /// publishing — two consumers reporting different findings against one
+    /// declaring file both appear, and neither erases the other.
+    fn published_set(&self, target: &Path) -> Vec<lsp_types::Diagnostic> {
+        let mut out = self.own.get(target).cloned().unwrap_or_default();
+        for groups in self.contributions.values() {
+            if let Some(group) = groups.get(target) {
+                out.extend(group.iter().cloned());
+            }
+        }
+        out
+    }
+}
+
 /// The server state: the analysis host over the project's `.lua` files.
 struct Server {
     connection: Connection,
@@ -588,6 +697,14 @@ struct Server {
     /// `sema::locate_field` can tell a genuinely ambient `.d.lua` file from
     /// one that merely looks like one.
     ambient_paths: HashSet<PathBuf>,
+    /// The `---@alias`/`---@enum` names [`Self::ambient`]'s definition
+    /// sources declare (round 8 review, F7) — project *and* dependency defs,
+    /// installed into every [`MergedAmbient`] so
+    /// `requires::require_struct_fields`'s gate can recognise a
+    /// dependency-declared alias the `analysis.files()` scan structurally
+    /// cannot see. Names only, not the source texts: a large definition
+    /// package is megabytes, and the gate asks only for a name.
+    ambient_alias_names: HashSet<String>,
     /// The type surfaces harvested from the project's vendored luarocks tree
     /// (#30), built once at startup alongside [`Self::ambient`]: rock classes,
     /// enums and aliases, plus each rock module's `require`-export type. Merged
@@ -629,7 +746,16 @@ struct Server {
     /// The currently open documents (by path → URI), tracked from
     /// didOpen/didClose so a `workspace/didChangeConfiguration` can republish
     /// diagnostics for every open buffer after a settings change.
-    open_docs: HashMap<PathBuf, Uri>,
+    ///
+    /// A `BTreeMap`, not a `HashMap` (round 8 review, F4): a batch republish
+    /// walks this map and publishes as it goes, so hash order made *which*
+    /// document published last — and, before the ledger below, which
+    /// cross-file group survived — depend on nothing the workspace can see.
+    /// The same unchanged workspace emitted different diagnostics run to run.
+    open_docs: BTreeMap<PathBuf, Uri>,
+    /// Which file contributed which cross-file diagnostic to which other
+    /// file, and each file's own half — see [`ForeignLedger`].
+    foreign: ForeignLedger,
     /// Whether the client advertised `window.workDoneProgress`. Every
     /// `$/progress` the server sends is gated on this — a client that did not
     /// ask for progress receives none, on any path.
@@ -792,11 +918,13 @@ impl Server {
             out_dir: config.out_dir,
             ambient,
             ambient_paths: config.def_paths,
+            ambient_alias_names: config.def_alias_names,
             rocks: RockSurfaces::default(),
             merged_ambient: RefCell::new(None),
             lint: config.lint,
             known_globals,
-            open_docs: HashMap::new(),
+            open_docs: BTreeMap::new(),
+            foreign: ForeignLedger::default(),
             progress,
             trace: Cell::new(trace),
             progress_seq: Cell::new(0),
@@ -898,6 +1026,7 @@ impl Server {
         self.known_globals = ambient.global_names().clone();
         self.ambient = ambient;
         self.ambient_paths = config.def_paths;
+        self.ambient_alias_names = config.def_alias_names;
         self.rocks = self.harvest_announced(config.rock_version_dir, RELOAD_HARVEST_PROGRESS);
         // The merge's BASE layers just changed while the host (and so the
         // revision) did not — the one staleness the revision key cannot see.
@@ -943,6 +1072,11 @@ impl Server {
     /// Republish diagnostics for every currently open document from a fresh
     /// snapshot — used after a configuration reload changes the cached
     /// strictness/lint/ambient so the visible diagnostics reflect it.
+    ///
+    /// In path order, because [`Self::open_docs`] is a `BTreeMap` (F4): each
+    /// iteration publishes as it goes, so the walk order is externally
+    /// observable, and hash order made an unchanged workspace produce
+    /// different batches run to run.
     fn republish_open_docs(&mut self) -> anyhow::Result<()> {
         for (path, uri) in self.open_docs.clone() {
             self.publish_lua(&uri, &path)?;
@@ -1681,7 +1815,8 @@ impl Server {
         }
         let merged = Rc::new(
             MergedAmbient::build(&self.ambient, &snapshot.project_types(), self.rocks.types())
-                .with_ambient_paths(self.ambient_paths.clone()),
+                .with_ambient_paths(self.ambient_paths.clone())
+                .with_ambient_alias_names(self.ambient_alias_names.clone()),
         );
         // N22: gated on the negotiated trace level, not unconditional — see
         // the `trace` field doc. A keystroke bumps the revision every time
@@ -2288,8 +2423,14 @@ impl Server {
                 .apply_change(Change::ClearOverlay { path: path.clone() });
             self.publish_lua(uri, &path)
         } else {
-            self.host.apply_change(Change::ClearOverlay { path });
-            self.publish(uri, Vec::new())
+            // A scratch buffer with no disk backing: it stops contributing
+            // the instant it closes, so this goes through the ledger rather
+            // than publishing an empty set straight to the wire (F4). An
+            // untracked clear here would leave a cycle it had painted onto a
+            // real project file's panel with nothing left to ever remove it.
+            self.host
+                .apply_change(Change::ClearOverlay { path: path.clone() });
+            self.publish_recorded(uri, &path, Vec::new(), BTreeMap::new())
         }
     }
 
@@ -2305,31 +2446,72 @@ impl Server {
     /// (production readiness review, finding 4).
     ///
     /// A `publishDiagnostics` notification *replaces* the whole set for its
-    /// URI, so a foreign group goes out merged with that file's own
-    /// diagnostics — publishing the group alone would blank whatever the
-    /// other document was already showing. Only that file's `own` half is
-    /// merged in: its foreign half (which can point back here) is left to its
-    /// own publish, so this cannot recurse.
+    /// URI, so every publish here goes through [`ForeignLedger`], which is
+    /// the record of what each document should be showing — see its doc for
+    /// the four failures the un-recorded version produced.
+    ///
+    /// # Exactly one diagnostics pass per publish (round 8 review, F19)
+    ///
+    /// There is one `diagnostics::diagnostics` call in this function and it
+    /// is not in a loop, so a publish costs one whole-file pass (parse +
+    /// validate + type-check + lint) no matter how many URIs it ends up
+    /// notifying. The version this replaces ran a **further** full pass per
+    /// foreign target, per publish — i.e. per keystroke, single-threaded, no
+    /// debounce — purely to recover that target's own half, which the ledger
+    /// now already holds.
+    ///
+    /// What that costs, stated rather than hidden: a target's own half is the
+    /// one from the last pass over *that* file, so a document nobody has
+    /// opened shows the cross-file group alone until it is itself checked
+    /// (opening it, editing it, or a watched-file event for it — each of
+    /// which publishes it in full and merges the groups back in). That is
+    /// strictly what the client is already displaying for that URI plus the
+    /// group being added: re-stating a file's own half from the ledger can
+    /// never contradict the panel, because the ledger *is* what was put in
+    /// the panel. The alternative — re-deriving every foreign target's whole
+    /// file on every keystroke of every open buffer — is the O(open ×
+    /// foreign) stall F19 measures, paid to refresh diagnostics for
+    /// documents the user never asked about.
     fn publish_lua(&mut self, uri: &Uri, path: &Path) -> anyhow::Result<()> {
         let analysis: Analysis = self.host.snapshot();
-        let merged = self.merged_ambient(&analysis);
-        let ctx = diagnostics::CheckCtx {
-            strictness: self.strictness,
-            ambient: &merged,
-            rocks: &self.rocks,
-            lint: &self.lint,
-            known_globals: &self.known_globals,
+        let found = {
+            let merged = self.merged_ambient(&analysis);
+            let ctx = diagnostics::CheckCtx {
+                strictness: self.strictness,
+                ambient: &merged,
+                rocks: &self.rocks,
+                lint: &self.lint,
+                known_globals: &self.known_globals,
+            };
+            diagnostics::diagnostics(&analysis, path, self.dialect, &ctx).unwrap_or_default()
         };
-        let found =
-            diagnostics::diagnostics(&analysis, path, self.dialect, &ctx).unwrap_or_default();
-        for (other_path, foreign) in found.foreign {
-            let mut all = diagnostics::diagnostics(&analysis, &other_path, self.dialect, &ctx)
-                .map(|other| other.own)
-                .unwrap_or_default();
-            all.extend(foreign);
-            self.publish(&crate::uri::path_to_uri(&other_path), all)?;
+        self.publish_recorded(uri, path, found.own, found.foreign)
+    }
+
+    /// Fold one pass's result into the ledger and publish every document it
+    /// moved — the checked file itself included, and in sorted path order so
+    /// a batch is reproducible.
+    ///
+    /// `uri` is used verbatim for `path`'s own notification rather than
+    /// re-derived, so a document keeps the exact URI spelling its client
+    /// opened it under; the other affected paths have no client-supplied URI
+    /// to preserve.
+    fn publish_recorded(
+        &mut self,
+        uri: &Uri,
+        path: &Path,
+        own: Vec<lsp_types::Diagnostic>,
+        foreign: BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>,
+    ) -> anyhow::Result<()> {
+        for target in self.foreign.record(path, own, foreign) {
+            let set = self.foreign.published_set(&target);
+            if target == path {
+                self.publish(uri, set)?;
+            } else {
+                self.publish(&crate::uri::path_to_uri(&target), set)?;
+            }
         }
-        self.publish(uri, found.own)
+        Ok(())
     }
 
     fn publish(&self, uri: &Uri, diagnostics: Vec<lsp_types::Diagnostic>) -> anyhow::Result<()> {
@@ -2451,7 +2633,8 @@ mod tests {
 
     use lsp_server::{Connection, Message, Notification, Request, RequestId};
     use lsp_types::notification::{
-        DidChangeTextDocument, DidChangeWatchedFiles, DidOpenTextDocument, Notification as _,
+        DidChangeConfiguration, DidChangeTextDocument, DidChangeWatchedFiles, DidOpenTextDocument,
+        Notification as _,
     };
     use lsp_types::request::{HoverRequest, Request as _};
     use lsp_types::{Position, Range, TextDocumentContentChangeEvent, TraceValue};
@@ -3750,6 +3933,235 @@ return use
             open_uris.len(),
             "2 deleted files × 3 open docs must republish each open doc once (3), \
              not once per deletion (6): {after:?}"
+        );
+    }
+
+    // === cross-file diagnostic bookkeeping (round 8 review, F4) ===========
+
+    /// The `a.lua`/`c.lua` cycle fixture the finding-4 test above uses: `a`
+    /// consumes `B` and so is the file whose pass produces the `LB0318`, and
+    /// `B` is declared in `c`, so the diagnostic belongs to `c`'s document.
+    /// `c` is padded well past `a`'s length for the same reason as there.
+    fn cycle_pair(suffix: &str) -> (String, String) {
+        let a = format!(
+            "---@class A{suffix} : B{suffix}\n\n---@type B{suffix}\n\
+             local v = nil\nlocal _ = v.whatever\n"
+        );
+        let mut c = String::new();
+        for i in 0..40 {
+            let _ = writeln!(c, "-- padding line {i}");
+        }
+        let _ = writeln!(c, "---@class B{suffix} : A{suffix}");
+        let _ = writeln!(c, "---@field id number");
+        (a, c)
+    }
+
+    /// `textDocument/didOpen` for `path` carrying `text`.
+    fn did_open(server: &mut Server, path: &Path, text: &str) {
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": crate::uri::path_to_uri(path).to_string(),
+                        "languageId": "lua",
+                        "version": 1,
+                        "text": text,
+                    },
+                }),
+            })
+            .expect("didOpen");
+    }
+
+    /// A whole-document `textDocument/didChange` for `path`.
+    fn did_change(server: &mut Server, path: &Path, text: &str) {
+        server
+            .handle_notification(Notification {
+                method: DidChangeTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": crate::uri::path_to_uri(path).to_string(), "version": 2 },
+                    "contentChanges": [{ "text": text }],
+                }),
+            })
+            .expect("didChange");
+    }
+
+    /// The diagnostic codes of the last publish for `path` in `messages`.
+    fn published_codes(messages: &[Message], path: &Path) -> Option<Vec<String>> {
+        let uri = crate::uri::path_to_uri(path);
+        published_diagnostics(messages, &uri).map(|diags| {
+            diags
+                .as_array()
+                .expect("an array")
+                .iter()
+                .map(|d| d["code"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+    }
+
+    /// F4, the **clear**: the group is produced by `a.lua`'s pass, so fixing
+    /// `a.lua` means the next pass produces no group at all — and the code
+    /// this pins replaced only ever republished the targets of groups it had
+    /// *just produced*, so "no group" meant "nothing to republish" and
+    /// `c.lua`'s panel kept a diagnostic about a cycle that no longer
+    /// existed, until `c.lua` was itself touched.
+    #[test]
+    fn fixing_the_declaring_file_clears_its_cross_file_diagnostic_in_the_same_batch() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let (a_source, c_source) = cycle_pair("");
+        let a_path = root.join("a.lua");
+        let c_path = root.join("c.lua");
+        fs::write(&a_path, &a_source).expect("write a.lua");
+        fs::write(&c_path, &c_source).expect("write c.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        did_open(&mut server, &a_path, &a_source);
+        let opened = drain(&client);
+        assert!(
+            published_codes(&opened, &c_path)
+                .expect("c.lua is published")
+                .contains(&"LB0318".to_string()),
+            "the cycle must reach c.lua's panel first: {opened:?}"
+        );
+
+        // The fix: `A` no longer inherits `B`, so nothing is cyclic.
+        did_change(&mut server, &a_path, "---@class A\n");
+        let fixed = drain(&client);
+        let codes = published_codes(&fixed, &c_path).expect(
+            "c.lua must be republished by the edit that fixed the cycle, not \
+             left showing it until c.lua is itself touched",
+        );
+        assert!(
+            !codes.contains(&"LB0318".to_string()),
+            "the cleared cycle must leave c.lua's panel: {codes:?}"
+        );
+    }
+
+    /// F4, the **keystroke**: the group lives on `c.lua`'s document but is
+    /// produced by `a.lua`'s pass, so publishing `c.lua` — which a keystroke
+    /// in it does — used to replace its set with its own half alone and the
+    /// diagnostic silently disappeared. Typing in a file must not delete a
+    /// finding about it.
+    #[test]
+    fn editing_the_painted_on_file_keeps_the_cross_file_diagnostic_another_file_produced() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let (a_source, c_source) = cycle_pair("");
+        let a_path = root.join("a.lua");
+        let c_path = root.join("c.lua");
+        fs::write(&a_path, &a_source).expect("write a.lua");
+        fs::write(&c_path, &c_source).expect("write c.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        did_open(&mut server, &a_path, &a_source);
+        drop(drain(&client));
+
+        // Open `c.lua` and type in it. Neither its own pass nor the edit
+        // touches `a.lua`'s finding, so it must still be there afterwards.
+        did_open(&mut server, &c_path, &c_source);
+        let opened = drain(&client);
+        assert!(
+            published_codes(&opened, &c_path)
+                .expect("c.lua is published on open")
+                .contains(&"LB0318".to_string()),
+            "opening the painted-on file must not blank the finding: {opened:?}"
+        );
+
+        did_change(&mut server, &c_path, &format!("{c_source}-- a keystroke\n"));
+        let typed = drain(&client);
+        assert!(
+            published_codes(&typed, &c_path)
+                .expect("c.lua is published on the keystroke")
+                .contains(&"LB0318".to_string()),
+            "and neither must a keystroke in it: {typed:?}"
+        );
+    }
+
+    /// F4, **two producers**: `c.lua` declares two cyclic classes, each
+    /// completed by a different consumer. Both consumers' findings belong to
+    /// `c.lua`'s document, so both must be on it — the code this pins let
+    /// whichever consumer published last replace the other's.
+    #[test]
+    fn two_files_contributing_cross_file_diagnostics_to_one_target_both_show() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        let (a1_source, c1) = cycle_pair("1");
+        let (a2_source, c2) = cycle_pair("2");
+        let c_source = format!("{c1}{c2}");
+        let a1_path = root.join("a1.lua");
+        let a2_path = root.join("a2.lua");
+        let c_path = root.join("c.lua");
+        fs::write(&a1_path, &a1_source).expect("write a1.lua");
+        fs::write(&a2_path, &a2_source).expect("write a2.lua");
+        fs::write(&c_path, &c_source).expect("write c.lua");
+        server.bootstrap();
+        drop(drain(&client));
+
+        did_open(&mut server, &a1_path, &a1_source);
+        did_open(&mut server, &a2_path, &a2_source);
+        let opened = drain(&client);
+
+        let codes = published_codes(&opened, &c_path).expect("c.lua is published");
+        let cycles = codes.iter().filter(|c| *c == "LB0318").count();
+        assert_eq!(
+            cycles, 2,
+            "both consumers' findings belong to c.lua's document; the second \
+             publish must merge with the first, not replace it: {codes:?}"
+        );
+    }
+
+    /// F4, **determinism**: a batch republish publishes as it walks the open
+    /// documents, so the walk order is on the wire. Over a `HashMap` that
+    /// order was hash order — an unchanged workspace emitted a differently
+    /// ordered batch run to run, and (before the ledger) a different
+    /// surviving cross-file group with it.
+    #[test]
+    fn a_batch_republish_walks_the_open_documents_in_path_order() {
+        let (dir, mut server, client) = test_server();
+        let root = dir.path();
+        // Opened in an order that is not the sorted one, so passing this
+        // cannot be an accident of insertion order.
+        let opened_in = ["e.lua", "a.lua", "d.lua", "b.lua", "c.lua"];
+        let paths: Vec<PathBuf> = opened_in.iter().map(|name| root.join(name)).collect();
+        for path in &paths {
+            fs::write(path, "local x = 1\n").expect("write");
+        }
+        server.bootstrap();
+        drop(drain(&client));
+        for path in &paths {
+            did_open(&mut server, path, "local x = 1\n");
+        }
+        drop(drain(&client));
+
+        server
+            .handle_notification(Notification {
+                method: DidChangeConfiguration::METHOD.to_string(),
+                params: json!({ "settings": {} }),
+            })
+            .expect("didChangeConfiguration");
+        let batch = drain(&client);
+
+        let published: Vec<String> = batch
+            .iter()
+            .filter_map(|m| match m {
+                Message::Notification(not) if not.method == PublishDiagnostics::METHOD => {
+                    Some(not.params["uri"].as_str().unwrap_or_default().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        let expected: Vec<String> = sorted
+            .iter()
+            .map(|p| crate::uri::path_to_uri(p).to_string())
+            .collect();
+        assert_eq!(
+            published, expected,
+            "a republish batch must be in path order, not hash order"
         );
     }
 

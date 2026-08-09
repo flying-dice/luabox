@@ -61,16 +61,33 @@ cat >"$stub_luabox" <<'STUB'
 # mid-write, a truncated pipe) rather than a well-formed "0 diagnostics" or
 # "N diagnostics" answer. This exists to drive
 # luals-differential.sh:311-318, the `codes_rc != 0` handler.
+#
+# Two more markers, for the guards #58 review round 8, F12 added:
+#   -- STUB-LUABOX-EXIT-NONZERO  well-formed `[]` on stdout, NONZERO exit —
+#                                a crash/panic/internal error that never got
+#                                as far as typechecking. Indistinguishable
+#                                from a genuinely clean project by output
+#                                alone, which is the whole point (M31).
+#   -- STUB-LUABOX-HANG          sleeps well past a small LUALS_CASE_TIMEOUT
+#                                so `timeout` kills it (rc=124) — the hang
+#                                shape M32 bounds.
 if [ "${1:-}" != "check" ]; then
     echo "stub-luabox: unsupported invocation: $*" >&2
     exit 2
 fi
 codes=()
 break_json=0
+exit_nonzero=0
 shopt -s nullglob
 for f in src/*.lua; do
     if grep -qF -- '-- STUB-LUABOX-BREAK-JSON' "$f"; then
         break_json=1
+    fi
+    if grep -qF -- '-- STUB-LUABOX-EXIT-NONZERO' "$f"; then
+        exit_nonzero=1
+    fi
+    if grep -qF -- '-- STUB-LUABOX-HANG' "$f"; then
+        sleep 30
     fi
     while IFS= read -r code; do
         codes+=("$code")
@@ -84,6 +101,10 @@ if [ "$break_json" = 1 ]; then
 fi
 if [ "${#codes[@]}" -eq 0 ]; then
     printf '[]\n'
+    if [ "$exit_nonzero" = 1 ]; then
+        echo "check: internal error: stub forced a nonzero exit with no diagnostics" >&2
+        exit 3
+    fi
     echo "check: 0 errors, 0 warnings in 1 files" >&2
     exit 0
 fi
@@ -118,6 +139,18 @@ cat >"$stub_luals" <<'STUB'
 # `-- STUB-LUALS-DIAG: <code>`.
 # STUB_LUALS_FAIL_EXIT (+ STUB_LUALS_FAIL_MSG) forces a tool failure instead,
 # for the "three failure modes, one message" case (F26).
+#
+# `--version` is answered FIRST, above the forced-failure branch: the driver
+# now version-gates the luals column (#58 review round 8, F12) and runs
+# `--version` before `--check`, so a stub that failed on every invocation
+# would make the F26 case above exercise the version guard instead of the
+# --check-failure path it was written for. STUB_LUALS_VERSION drives the
+# mismatch case; the default is the pinned version every other case needs to
+# get past the gate.
+if [ "${1:-}" = "--version" ]; then
+    echo "${STUB_LUALS_VERSION:-3.13.5}"
+    exit 0
+fi
 dir=""
 out_path=""
 prev=""
@@ -576,5 +609,119 @@ printf '# case\tluabox\tcodes\tluals\tnote\nonly_case\tdiag\tLB0300\tclean\tluab
 run luals_empty_array_still_compares_the_luals_column 0 "$all_clean_luabox_diag_corpus" \
     "both columns match" \
     "!Traceback" "!luals is 'diag'"
+
+# ============================================================================
+# round-8 (F12): the three guards the sibling driver (verdict-differential.sh)
+# carried and this one did not — luabox's own exit status (M31), a per-case
+# `timeout` (M32), and a luals VERSION check rather than PATH presence alone.
+# Each case below was proven by deleting the guard it names from
+# luals-differential.sh and re-running this file.
+# ============================================================================
+
+# 24: M31 for this driver — the stub prints a well-formed empty diagnostics
+# array and exits NONZERO, the shape a crash or an internal error before any
+# typechecking produces. expected.tsv says `clean`, and without the guard
+# that is exactly what the row reads as: a green parity claim backed by a
+# binary that measured nothing. `!both columns match` is the discriminating
+# needle — the pre-fix behaviour is a fully green run, not a different
+# failure.
+nonzero_exit_corpus="$(newcorpus luabox-nonzero-exit)"
+cat >"$nonzero_exit_corpus/only_case.lua" <<'LUA'
+-- STUB-LUABOX-EXIT-NONZERO
+LUA
+printf '# case\tluabox\tcodes\tluals\tnote\nonly_case\tclean\t-\tclean\tcontrol\n' \
+    >"$nonzero_exit_corpus/expected.tsv"
+run luabox_nonzero_exit_with_no_diagnostics_fails 1 "$nonzero_exit_corpus" \
+    "luabox exited 3 but printed an empty diagnostics array" \
+    "!both columns match"
+
+# 25: the control for 24 — a nonzero exit alongside REAL diagnostics is the
+# ORDINARY shape of `luabox check` (it exits nonzero because it found
+# something), and must stay a passing row. Without this, the guard above
+# could be written as a bare "nonzero exit fails" and every diag row in the
+# real corpus would go red; with it, the guard is pinned to the exact
+# clean-verdict-with-nonzero-exit combination that is never legitimate.
+nonzero_with_diag_corpus="$(newcorpus luabox-nonzero-with-diag)"
+cat >"$nonzero_with_diag_corpus/only_case.lua" <<'LUA'
+-- the stub exits 1 whenever it reports codes; that is normal, not a failure
+-- STUB-LUABOX-DIAG: LB0300
+LUA
+printf '# case\tluabox\tcodes\tluals\tnote\nonly_case\tdiag\tLB0300\tclean\tluabox flags it, luals has no equivalent rule\n' \
+    >"$nonzero_with_diag_corpus/expected.tsv"
+run luabox_nonzero_exit_with_diagnostics_is_normal 0 "$nonzero_with_diag_corpus" \
+    "both columns match" \
+    "!is never a legitimate 'clean' reading"
+
+# 26: M32 for this driver — the stub hangs (30s) against a 1s
+# LUALS_CASE_TIMEOUT, so `timeout` kills it and returns its 124 sentinel.
+# Without the timeout the case would sit for 30s and then report a JSON
+# parse error; without the rc=124 branch specifically it reports that same
+# confusing parse error instead of the hang it actually is, which is why the
+# needle names the timeout and `!could not parse` rides along.
+hang_corpus="$(newcorpus luabox-hang)"
+cat >"$hang_corpus/only_case.lua" <<'LUA'
+-- STUB-LUABOX-HANG
+LUA
+printf '# case\tluabox\tcodes\tluals\tnote\nonly_case\tclean\t-\tclean\tcontrol\n' \
+    >"$hang_corpus/expected.tsv"
+log="$work/luabox_case_timeout_fails.log"
+LUABOX="$stub_luabox" LUALS="$stub_luals" LUALS_CORPUS="$hang_corpus" \
+    LUALS_CASE_TIMEOUT=1 bash "$gate" >"$log" 2>&1
+got=$?
+assert luabox_case_timeout_fails 1 "$got" "$log" \
+    "luabox timed out after 1s (LUALS_CASE_TIMEOUT)" \
+    "!could not parse 'luabox check --format json' output as JSON"
+
+# 27: the luals VERSION gate — PATH presence alone let a local re-run answer
+# a "measured against 3.13.5" note with whatever luals the developer had
+# installed, under the same banner, because the pin lived only in
+# luals-parity.yml's download step. `!both columns match` and `!SKIP` are
+# the discriminators: the pre-fix behaviour is a fully green run against the
+# wrong tool, not a skip and not a row failure.
+log="$work/luals_version_mismatch_fails.log"
+LUABOX="$stub_luabox" LUALS="$stub_luals" LUALS_CORPUS="$skip_corpus" \
+    STUB_LUALS_VERSION="3.12.0" bash "$gate" >"$log" 2>&1
+got=$?
+assert luals_version_mismatch_fails 1 "$got" "$log" \
+    "reports version '3.12.0', which does not contain the" \
+    "expected '3.13.5'" \
+    "!both columns match" \
+    "!SKIP  luals column"
+
+# 28: and the override is real — re-measuring the corpus against a new luals
+# is a deliberate act, not something the gate can refuse forever. Same
+# mismatched stub version, now named explicitly, must run to completion.
+override_corpus="$(newcorpus version-override)"
+cat >"$override_corpus/only_case.lua" <<'LUA'
+-- STUB-LUABOX-DIAG: LB0300
+LUA
+printf '# case\tluabox\tcodes\tluals\tnote\nonly_case\tdiag\tLB0300\tclean\tluabox flags it, luals has no equivalent rule\n' \
+    >"$override_corpus/expected.tsv"
+log="$work/luals_expected_version_override.log"
+LUABOX="$stub_luabox" LUALS="$stub_luals" LUALS_CORPUS="$override_corpus" \
+    STUB_LUALS_VERSION="3.12.0" LUALS_EXPECTED_VERSION="3.12.0" \
+    bash "$gate" >"$log" 2>&1
+got=$?
+assert luals_expected_version_override_is_honoured 0 "$got" "$log" \
+    "both columns match" \
+    "!does not contain the"
+
+# 29: `timeout` is a declared, checked dependency, the same way python3 is
+# (case 13). The scrubbed PATH here KEEPS python3 — otherwise the python3
+# guard fires first and this case proves nothing about the timeout one.
+scrubbed_no_timeout="$work/bin-no-timeout"
+mkdir -p "$scrubbed_no_timeout"
+for b in bash grep sed awk cp rm mkdir cat basename dirname mktemp printf \
+    sort uniq paste tr command true false head python3; do
+    p="$(command -v "$b" 2>/dev/null)"
+    [ -n "$p" ] && ln -sf "$p" "$scrubbed_no_timeout/$b"
+done
+log="$work/timeout_absent_fails_loudly.log"
+PATH="$scrubbed_no_timeout" LUABOX="$stub_luabox" LUALS="$stub_luals" \
+    LUALS_CORPUS="$skip_corpus" bash "$gate" >"$log" 2>&1
+got=$?
+assert timeout_absent_fails_loudly 1 "$got" "$log" \
+    "timeout not found on PATH — required to bound each case's luabox invocation" \
+    "!python3 not found on PATH"
 
 selftest_report luals-differential-selftest

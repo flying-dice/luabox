@@ -97,6 +97,15 @@ check "scale_budget_ms ceiling equal to the scaled value does not cap" \
     "$(scale_budget_ms 2000 2.0 4000)" "4000"
 check "scale_budget_ms with an empty ceiling behaves as if uncapped" \
     "$(scale_budget_ms 1000 4.0 "")" "4000"
+# #58 review round 8, F15a: `0` is the OTHER spelling of "no ceiling", and it
+# used to mean the opposite here — `[[ -n "0" ]]` is true, so a 0 clamped
+# every budget to 0 while perf-gate-lib.ps1's ConvertTo-ScaledBudgetMs has
+# documented 0 as its "no cap" DEFAULT since it was written. One shared
+# perf-gate-budgets.env value, two readers, opposite behaviour, and no case
+# on this side to notice. Pinned on both sides now — the .ps1 selftest
+# carries the identical case, deliberately with the identical numbers.
+check "scale_budget_ms with a zero ceiling behaves as if uncapped" \
+    "$(scale_budget_ms 1000 4.0 0)" "4000"
 
 # --- assert_lua_file_count --------------------------------------------------
 # N38's exact fix: the leg this backs (RETAINED-TYPEENV REGRESSION GATE)
@@ -199,6 +208,93 @@ PYEOF
 else
     echo "SKIP  write_perf_manifest (strict) TOML-validity check — no python3 tomllib (needs 3.11+)"
 fi
+
+# --- read_perf_budgets -------------------------------------------------------
+# #58 review round 8, F15c: perf-gate.sh read the shared budgets file with a
+# bare `source`, which accepts every shell construct there is, while
+# perf-gate-lib.ps1's Read-PerfBudgets has always thrown on any line that is
+# not KEY=INTEGER — one file, two readers, one of them with no validation at
+# all. A budgets file that half-parses is not a fact about the budgets:
+# `CHECK_BUDGET_BASE_MS=75O0` (letter O) is a valid assignment that every
+# downstream `-lt` coerces to 0, failing every timed leg for no stated reason.
+budgets_env="$repo/scripts/perf-gate-budgets.env"
+check_true "read_perf_budgets accepts the real perf-gate-budgets.env" \
+    read_perf_budgets "$budgets_env"
+# It must actually EXPORT into the caller's scope, not merely validate: the
+# whole reason perf-gate.sh can drop its bare `source` is that this function
+# leaves every KEY set exactly as `source` did.
+check "read_perf_budgets sets a key in the caller's scope" \
+    "${CHECK_BUDGET_BASE_MS:-unset}" "7500"
+
+# #58 review round 8, F16: the RETAINED-TYPEENV REGRESSION GATE's three
+# constants were bare literals in perf-gate.sh AND perf-gate.ps1 — the one
+# leg guarding a ~25x peak-RSS regression was also the one whose budget could
+# drift between the two OSes unnoticed. Pinned by NAME here (and in the .ps1
+# selftest) so a key that leaves the shared file, or never reaches it in the
+# first place, fails a test rather than a Windows CI run six weeks later.
+for key in RETAINED_ENV_CORPUS_FILES RETAINED_ENV_RSS_BUDGET_MIB \
+    RETAINED_ENV_CHECK_BUDGET_BASE_MS RETAINED_ENV_CHECK_CEILING_MS; do
+    if [ -n "${!key:-}" ]; then
+        echo "PASS  perf-gate-budgets.env defines $key (F16: no longer hand-carried in both gates)"
+        pass=$((pass + 1))
+    else
+        echo "FAIL  perf-gate-budgets.env does not define $key" >&2
+        fail=$((fail + 1))
+    fi
+done
+
+# All EIGHT scaled legs must carry a ceiling (F15b) — the round 6 rebase
+# wired two and left six unbounded at CI's LUABOX_PERF_FACTOR=4.0. Pinned by
+# name for the same reason as the F16 block above: a leg that loses its
+# ceiling loses it silently, because an absent ceiling is spelled the same
+# way as a leg that never had one.
+for key in COLD_START_CEILING_MS FMT_CEILING_MS CHECK_CEILING_MS \
+    RETAINED_ENV_CHECK_CEILING_MS DIAG_LINT_CEILING_MS DIAG_CHECK_CEILING_MS \
+    DIAG_LINT_RENDERED_CEILING_MS DIAG_CHECK_RENDERED_CEILING_MS; do
+    if [ -n "${!key:-}" ] && [ "${!key}" -gt 0 ]; then
+        echo "PASS  perf-gate-budgets.env defines a positive $key (F15b: all 8 scaled legs are capped)"
+        pass=$((pass + 1))
+    else
+        echo "FAIL  perf-gate-budgets.env has no positive $key" >&2
+        fail=$((fail + 1))
+    fi
+done
+
+# A ceiling BELOW its own base would silently re-tighten the FACTOR=1.0
+# budget every base in that file was calibrated at — the cap is supposed to
+# bound the FACTOR, never the calibration. Checked as a relation between the
+# committed numbers, so a future edit to either half cannot break it quietly.
+ceiling_inversion=""
+for leg in COLD_START FMT CHECK RETAINED_ENV_CHECK DIAG_LINT DIAG_CHECK \
+    DIAG_LINT_RENDERED DIAG_CHECK_RENDERED; do
+    base_key="${leg}_BUDGET_BASE_MS"
+    ceiling_key="${leg}_CEILING_MS"
+    if [ "${!ceiling_key}" -lt "${!base_key}" ]; then
+        ceiling_inversion="$ceiling_inversion $ceiling_key(${!ceiling_key})<$base_key(${!base_key})"
+    fi
+done
+check "every ceiling in perf-gate-budgets.env is >= its own base" \
+    "${ceiling_inversion}" ""
+
+malformed_env="$work/malformed-budgets.env"
+printf '# a comment\nGOOD_KEY=1\nnot a key=value line at all\n' >"$malformed_env"
+check_false "read_perf_budgets rejects a malformed line rather than sourcing it" \
+    read_perf_budgets "$malformed_env"
+# It must reject BEFORE sourcing, or the "rejection" still executed the file.
+# GOOD_KEY sits above the malformed line: a validate-while-sourcing reader
+# would have set it by the time it noticed.
+check "read_perf_budgets does not source a file it rejects" \
+    "${GOOD_KEY:-unset}" "unset"
+# A value that is not an integer is the typo shape this exists for — valid
+# bash, silently coerced to 0 by every comparison downstream.
+noninteger_env="$work/noninteger-budgets.env"
+printf 'CHECK_BUDGET_BASE_MS=75O0\n' >"$noninteger_env"
+check_false "read_perf_budgets rejects a non-integer value (the 75O0 typo shape)" \
+    read_perf_budgets "$noninteger_env"
+check "read_perf_budgets leaves an earlier good value untouched when it rejects" \
+    "${CHECK_BUDGET_BASE_MS:-unset}" "7500"
+check_false "read_perf_budgets fails on a missing budgets file" \
+    read_perf_budgets "$work/no-such-budgets.env"
 
 # ============================================================================
 # Part 2 — scripts/perf-gate.sh, run for real against a stub luabox.
@@ -481,6 +577,30 @@ STUB_RETAINED_RSS_MIB=5 STUB_RETAINED_RSS_MIB_UNPINNED=150 \
     run_gate retained_env_rayon_pin_is_live 0 "" "PASS retained-TypeEnv regression, peak RSS:"
 unset STUB_RETAINED_RSS_MIB_UNPINNED
 STUB_RETAINED_RSS_MIB=5
+
+# --- F15b: a newly-capped leg's ceiling is actually WIRED, not merely
+# present in perf-gate-budgets.env -----------------------------------------
+# The Part 1 cases above prove the eight ceiling keys exist and that
+# scale_budget_ms honours a third argument. Neither proves perf-gate.sh
+# PASSES one at a given leg — the exact gap F15b found: CHECK_CEILING_MS and
+# DIAG_CHECK_CEILING_MS sat in the shared file being read by one gate and
+# ignored by the other for a full round, and every case above runs at the
+# default LUABOX_PERF_FACTOR=1.0, where scaled == base and no ceiling can
+# ever bind.
+#
+# Cold start is the leg chosen (cheapest: ten 200 ms stub sleeps, ~2 s) and
+# the numbers are picked so the two readings are far apart and unambiguous:
+# at LUABOX_PERF_FACTOR=100 the UNCAPPED budget is 50 * 100 = 5000 ms and the
+# CAPPED one is COLD_START_CEILING_MS = 150 ms. A 200 ms `--version` sits
+# between them, so this case FAILS the cold-start leg only while the ceiling
+# is wired; drop the third argument at perf-gate.sh's cold_start_budget line
+# (or set COLD_START_CEILING_MS=0) and the 5000 ms budget swallows it, the
+# expected FAIL needle vanishes, exit goes 1 -> 0, and the case goes RED.
+# Every other leg is fast, and at factor 100 every other budget is enormous,
+# so nothing else can fire.
+STUB_VERSION_S=0.2 LUABOX_PERF_FACTOR=100 \
+    run_gate cold_start_ceiling_is_wired_at_a_high_factor 1 "FAIL cold start:"
+unset STUB_VERSION_S
 
 fi # PERF_GATE_SELFTEST_SKIP_BEHAVIORAL
 

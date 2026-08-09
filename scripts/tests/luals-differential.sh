@@ -53,6 +53,16 @@
 # LB0300 on top of it only fires when the FIRST declaration's type is what's
 # actually kept.
 #
+# Three things are checked before any row is measured, because a driver that
+# cannot tell "measured and clean" from "did not measure" is the defect this
+# whole directory exists to refuse: luals's VERSION must be the one the
+# parity claims name (LUALS_EXPECTED_VERSION), every per-case `luabox check`
+# runs under `timeout` (LUALS_CASE_TIMEOUT), and a nonzero luabox exit with
+# an empty diagnostics array fails the measurement instead of reading as
+# `clean`. The sibling driver (verdict-differential.sh) grew the last two as
+# M31/M32 and the version pin lived only in the workflow; all three are here
+# now (#58 review round 8, F12).
+#
 # No lua-language-server on PATH (and no LUALS env) means the luals column
 # SKIPs, loudly, and the luabox column still runs — UNLESS LUALS_REQUIRED=1
 # is set, in which case a missing luals binary is a hard failure rather than
@@ -76,12 +86,35 @@ expected="$corpus/expected.tsv"
 luabox="${LUABOX:-$here/../../target/release/luabox}"
 luals="${LUALS:-lua-language-server}"
 luals_required="${LUALS_REQUIRED:-0}"
+# LUALS_EXPECTED_VERSION — the version every "measured against 3.13.5" claim
+# in this file, in expected.tsv's divergence notes and in
+# docs/02-limitations.md is a claim ABOUT (#58 review round 8, F12). Until
+# now this script checked only that SOME lua-language-server was on PATH:
+# the pin lived exclusively in .github/workflows/luals-parity.yml's
+# LUALS_VERSION/LUALS_SHA256 download step, so the workflow measured 3.13.5
+# and every local re-run — the artifact a reviewer actually reaches for when
+# checking one of those notes — measured whatever the developer's package
+# manager installed, under the same banner. Overridable, because bumping the
+# pin is a deliberate change that re-measures every row (see this file's
+# header and the intentional-divergence rows); keep it in step with the
+# workflow's LUALS_VERSION.
+luals_expected_version="${LUALS_EXPECTED_VERSION:-3.13.5}"
+# LUALS_CASE_TIMEOUT — per-case wall-clock budget for the `luabox check`
+# below, seconds. verdict-differential.sh's sibling driver has carried this
+# since M32; this one did not, so a hang here wedged the merge-blocking job
+# until the workflow's own timeout-minutes killed it with no per-case
+# attribution at all (#58 review round 8, F12). Same name shape and same
+# default as VERDICT_CASE_TIMEOUT.
+case_timeout="${LUALS_CASE_TIMEOUT:-30}"
 
 # The diagnostic codes that constitute the type-parity surface. Everything
 # else luals reports (style, unused locals, …) is out of scope for the
 # comparison — .luarc.json in the corpus disables the noisiest, and this set
 # is the positive filter.
-parity_codes="param-type-mismatch missing-parameter undefined-field undefined-doc-name duplicate-doc-field assign-type-mismatch return-type-mismatch missing-return missing-fields cast-local-type undefined-global"
+# circle-doc-class is in the set as of round 8 (F9): the corpus carries two
+# cyclic-class rows, and without the code here a luals cycle emission is
+# filtered out and reads as "clean" — the exact silent gap F9 named.
+parity_codes="param-type-mismatch missing-parameter undefined-field undefined-doc-name duplicate-doc-field assign-type-mismatch return-type-mismatch missing-return missing-fields cast-local-type undefined-global circle-doc-class"
 
 if [ ! -x "$luabox" ]; then
     echo "error: no luabox binary at $luabox (build with: cargo build --release --bin luabox, or set LUABOX)" >&2
@@ -124,6 +157,35 @@ fi
 if [ "$luals_column" = 1 ] && ! command -v python3 >/dev/null 2>&1; then
     echo "error: python3 not found on PATH — required to parse $luals's --check output" >&2
     exit 1
+fi
+# M32's `timeout` guard, applied to this driver too (#58 review round 8,
+# F12): declared up front, like python3 above, rather than surfacing as
+# "timeout: command not found" once per row.
+if ! command -v timeout >/dev/null 2>&1; then
+    echo "error: timeout not found on PATH — required to bound each case's luabox invocation" >&2
+    exit 1
+fi
+# The version this run's luals column is actually measured against must be
+# the version this repo's parity claims name. PATH presence alone let a
+# local re-run answer a "measured against 3.13.5" note with a different
+# tool and report "both columns match" (F12). Checked, not assumed — and a
+# mismatch is fatal rather than advisory, for the same reason LUALS_REQUIRED
+# exists: a parity gate that quietly measures something else is worth less
+# than one that refuses.
+if [ "$luals_column" = 1 ]; then
+    luals_version_out="$("$luals" --version 2>&1 | tr -d '\r')"
+    case "$luals_version_out" in
+    *"$luals_expected_version"*) ;;
+    *)
+        echo "error: $luals reports version '${luals_version_out}', which does not contain the" >&2
+        echo "error:   expected '${luals_expected_version}'. Every parity note in expected.tsv and every" >&2
+        echo "error:   'measured against ${luals_expected_version}' claim in the docs is a claim about THAT" >&2
+        echo "error:   version; a run against another one is not evidence for or against them. Install the" >&2
+        echo "error:   pinned build (see .github/workflows/luals-parity.yml's LUALS_VERSION), or set" >&2
+        echo "error:   LUALS_EXPECTED_VERSION deliberately if you are re-measuring the corpus against a new one." >&2
+        exit 1
+        ;;
+    esac
 fi
 
 work="$(mktemp -d)"
@@ -322,7 +384,20 @@ while IFS=$'\t' read -r case_name want_luabox want_codes want_luals note; do
     # regression, a parse error — indistinguishably, and it is the only
     # automated pin for the computed-key and __index narrowings the
     # limitations doc cites this gate for).
-    out="$( (cd "$work" && "$luabox" check --format json) 2>"$work/luabox.err" )"
+    out="$( (cd "$work" && timeout "$case_timeout" "$luabox" check --format json) 2>"$work/luabox.err" )"
+    luabox_rc=$?
+    # A kill from `timeout` (rc=124, its own sentinel) leaves $out empty or
+    # mid-write — never valid JSON — so it is checked BEFORE the parse, not
+    # folded into the generic parse-failure branch below where it would
+    # report as a confusing JSON error instead of the hang it actually is.
+    # Same handling, same ordering, same reasoning as the sibling driver's
+    # measure_case (verdict-differential.sh, M32).
+    if [ "$luabox_rc" = 124 ]; then
+        echo "FAIL  $case_name: luabox timed out after ${case_timeout}s (LUALS_CASE_TIMEOUT) — raise the budget or fix the underlying perf bug" >&2
+        sed 's/^/      /' "$work/luabox.err" >&2
+        fails=$((fails + 1))
+        continue
+    fi
     py_codes_err="$work/luabox-codes.err"
     got_codes="$(printf '%s' "$out" | python3 -c '
 import json, sys
@@ -342,6 +417,21 @@ print(",".join(sorted({d["code"] for d in data})))
         got_luabox="clean"
     else
         got_luabox="diag"
+    fi
+    # M31, applied to this driver too (#58 review round 8, F12): this gate
+    # never inspected luabox's own exit status at all, so a binary that
+    # failed outright — a crash, a panic, an internal error before it ever
+    # typechecked anything — and printed `[]` on the way out was recorded as
+    # a clean, passing verdict against a row claiming `clean`. A nonzero exit
+    # paired with an empty diagnostics array is never a legitimate clean
+    # reading; fail the MEASUREMENT rather than let it stand in for one.
+    # (`diag` with a nonzero exit is the ORDINARY shape — `luabox check`
+    # exits nonzero precisely because it found something.)
+    if [ "$got_luabox" = "clean" ] && [ "$luabox_rc" != 0 ]; then
+        echo "FAIL  $case_name: luabox exited $luabox_rc but printed an empty diagnostics array — a nonzero exit is never a legitimate 'clean' reading" >&2
+        sed 's/^/      /' "$work/luabox.err" >&2
+        fails=$((fails + 1))
+        continue
     fi
     if [ "$got_luabox" != "$want_luabox" ]; then
         echo "FAIL  $case_name: luabox is '$got_luabox', expected.tsv says '$want_luabox' (codes: ${got_codes:-none})" >&2

@@ -513,7 +513,7 @@ fn collect_diagnostics(
 /// The resolver-side drain (`luabox_types::check::report_depth_limit_hits`)
 /// reports whichever class's resolution tripped the guard, in different words
 /// and — measured on a 400-link chain with `---@type C400` — at a different
-/// class of the SAME chain: the pre-check's `C201` and the drain's `C400`.
+/// class of the SAME chain: the pre-check's `C200` and the drain's `C400`.
 /// Neither [`dedupe_ancestry_diagnostics`]'s `(code, span, message)` key nor
 /// an aligned message would collapse those. [`DeepChains::covered`] carries
 /// every over-limit class's declaration site, so the drain's rediscoveries of
@@ -694,7 +694,24 @@ fn deep_class_chain_diagnostics(files: &[SourceFile], strictness: Strictness) ->
         parents_of,
     } = harvest_class_graph(files);
     let depth = class_depths(&parents_of);
-    let over_limit = |name: &str| depth.get(name).is_some_and(|&d| d > MAX_ANCESTRY_DEPTH);
+    // [`class_depths`] counts EDGES to the deepest root; the limit counts
+    // CLASSES on the resolution path, and `DiamondGuard`'s path includes the
+    // class being resolved (`on_path.len() >= MAX_ANCESTRY_DEPTH` refuses the
+    // class that would take the path PAST the limit, so its first trip is a
+    // chain of `MAX_ANCESTRY_DEPTH + 1` classes —
+    // `env::tests::a_class_chain_one_class_past_the_ancestry_limit_already_truncates`).
+    // Converting to the limit's own unit here is what makes this module's
+    // "one number, enforced twice" claim true (PR #61 round-8 F3): comparing
+    // the raw edge count with `>` put this side's first trip at
+    // `MAX_ANCESTRY_DEPTH + 2` classes, one whole chain size later than the
+    // resolver's. At exactly `MAX_ANCESTRY_DEPTH + 1` classes WITH a live
+    // reference, this pre-check certified the chain as in-bounds, `covered`
+    // stayed empty, and the resolver's non-actionable "`C200`'s ancestry is
+    // too deep to resolve safely" reached the user unsuppressed in place of
+    // the actionable first-link report — measured at 825c61c by
+    // `the_smallest_over_limit_chain_reports_the_pre_checks_actionable_link_once`.
+    let chain_classes = |name: &str| depth.get(name).map(|&d| d + 1);
+    let over_limit = |name: &str| chain_classes(name).is_some_and(|c| c > MAX_ANCESTRY_DEPTH);
     // Every over-limit class's declaration site, whether or not it is the
     // link this reports: that is what `collect_diagnostics` matches the
     // resolver-side drain's own `LB0317` against.
@@ -757,14 +774,17 @@ fn deep_class_chain_diagnostics(files: &[SourceFile], strictness: Strictness) ->
             if suppressed(rules, lines, span) {
                 return None;
             }
-            let &link_depth = depth.get(name)?;
+            let link_classes = chain_classes(name)?;
             // The measured total this link commits the chain to, not just
             // this link's own depth: a reader who flattens here needs to know
-            // how far below the limit the chain still runs.
+            // how far below the limit the chain still runs. Same edge->class
+            // conversion as `over_limit`, so every number in the message is
+            // in the unit the limit is stated in.
             let tail = match deepest.get(name) {
                 Some(&(deepest_depth, deepest_name)) if deepest_name != name => format!(
                     "; it is the first link over the limit in a chain that runs \
-                     {deepest_depth} classes deep, down to `{deepest_name}`"
+                     {} classes deep, down to `{deepest_name}`",
+                    deepest_depth + 1
                 ),
                 _ => String::new(),
             };
@@ -773,7 +793,7 @@ fn deep_class_chain_diagnostics(files: &[SourceFile], strictness: Strictness) ->
                     LB0317_CLASS_ANCESTRY_TOO_DEEP,
                     severity,
                     format!(
-                        "`{name}`'s `---@class` ancestry is {link_depth} classes deep, over \
+                        "`{name}`'s `---@class` ancestry is {link_classes} classes deep, over \
                          the {MAX_ANCESTRY_DEPTH}-class limit this checker enforces to avoid a \
                          stack overflow while resolving it{tail} — flatten the hierarchy or use \
                          composition instead of a long inheritance chain"
@@ -1689,12 +1709,17 @@ mod tests {
         assert_eq!(diags.len(), 1, "{diags:?}");
         let message = &diags[0].message;
         assert!(
-            message.contains(&format!("`C{}`", MAX_ANCESTRY_DEPTH + 1)),
-            "must name the first link over the limit: {message}"
+            message.contains(&format!("`C{MAX_ANCESTRY_DEPTH}`")),
+            "must name the first link over the limit — `C{}`, whose own path is \
+             `MAX_ANCESTRY_DEPTH + 1` classes long, the smallest the limit refuses \
+             (PR #61 round-8 F3 moved this one class up from `C{}`): {message}",
+            MAX_ANCESTRY_DEPTH,
+            MAX_ANCESTRY_DEPTH + 1
         );
         assert!(
-            message.contains("runs 2500 classes deep, down to `C2500`"),
-            "must carry the chain's measured total depth: {message}"
+            message.contains("runs 2501 classes deep, down to `C2500`"),
+            "must carry the chain's measured total, in classes — `C0..C2500` inclusive: \
+             {message}"
         );
     }
 
@@ -1715,17 +1740,113 @@ mod tests {
 
     #[test]
     fn a_class_chain_at_or_under_the_ceiling_checks_normally() {
-        // The floor side of the same guard: a chain of exactly
-        // `MAX_ANCESTRY_DEPTH` must not be refused — this is a regression
-        // check on the boundary (`<=`, not `<`) as much as it is on the
-        // feature existing at all.
-        let tmp = project(&manifest("5.4", ""));
-        write(
-            tmp.path(),
-            "src/main.lua",
-            &class_chain_source(MAX_ANCESTRY_DEPTH),
+        // The floor side of the same guard: the LARGEST chain that must not
+        // be refused — `MAX_ANCESTRY_DEPTH` classes, `C0..C(MAX - 1)`, the
+        // exact size `env::tests::a_class_chain_at_the_ancestry_limit_resolves_fully_and_correctly`
+        // pins from the resolver's side.
+        //
+        // PR #61 round-8 F3, both halves. The size was one class too large
+        // (`class_chain_source(MAX)` declares `C0..C200`, MAX + 1 classes —
+        // already the resolver's first truncating size), and the fixture
+        // declared the chain without ever REFERENCING it, so the resolver
+        // never walked it and the test could not tell the two boundaries
+        // apart. A `---@param` of the deepest class plus a member read makes
+        // resolution happen, which is the only way this asserts anything
+        // about the resolver at all.
+        use std::fmt::Write as _;
+
+        let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
+        let n = MAX_ANCESTRY_DEPTH - 1;
+        let mut src = class_chain_source(n);
+        // A `---@param` + member read, not `---@type C{n} local x = {}`:
+        // an empty table literal against an IN-BOUNDS class owes the root's
+        // `item` field, so the literal shape would report `LB0300`/`LB0306`
+        // for the fixture rather than for the boundary under test.
+        let _ = write!(
+            src,
+            "\n---@param v C{n}\nlocal function use(v)\n  return v.item\nend\nreturn use\n"
         );
+        write(tmp.path(), "src/main.lua", &src);
         check(tmp.path(), None, Format::Human).expect("a chain at the ceiling is not refused");
+        let diags = check_diagnostics(tmp.path());
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.code == LB0317_CLASS_ANCESTRY_TOO_DEEP),
+            "the largest in-bounds chain, actually resolved, must produce no depth diagnostic \
+             from EITHER mechanism: {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|d| d.code == Code::new(306)),
+            "nor a truncated-shape `LB0306` for the root field it really inherits: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn the_smallest_over_limit_chain_reports_the_pre_checks_actionable_link_once() {
+        // PR #61 round-8 F3. `MAX_ANCESTRY_DEPTH` is one number enforced
+        // twice, but the two enforcements counted in different units: the
+        // resolver counts CLASSES on the path (`on_path.len() >= MAX`, first
+        // trip at MAX + 1 classes) while this pre-check compared an EDGE
+        // count (`depth`, one less than the class count) against the same
+        // constant with `>` — first trip at MAX + 2 classes. The gap is
+        // exactly one chain size wide.
+        //
+        // Measured at 825c61c on this fixture (MAX + 1 = 201 classes, `C0..C200`,
+        // WITH a live reference so the resolver walks it): the pre-check
+        // certified the chain as in-bounds, so `covered` stayed empty and
+        // nothing suppressed the resolver's drain — the user got
+        // "`C200`'s `---@class` ancestry is too deep to resolve safely",
+        // which names no link to flatten, instead of the pre-check's
+        // actionable first-class-over-the-limit report. Both sides now count
+        // classes, so the smallest chain either mechanism objects to is the
+        // same chain.
+        use std::fmt::Write as _;
+
+        let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
+        let n = MAX_ANCESTRY_DEPTH;
+        let mut src = class_chain_source(n);
+        // A `---@param` + member read, not `---@type C{n} local x = {}`:
+        // an empty table literal against an IN-BOUNDS class owes the root's
+        // `item` field, so the literal shape would report `LB0300`/`LB0306`
+        // for the fixture rather than for the boundary under test.
+        let _ = write!(
+            src,
+            "\n---@param v C{n}\nlocal function use(v)\n  return v.item\nend\nreturn use\n"
+        );
+        write(tmp.path(), "src/main.lua", &src);
+        let error = check(tmp.path(), None, Format::Human)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "check failed with 1 error(s)");
+        let diags = check_diagnostics(tmp.path());
+        let depth: Vec<&Diagnostic> = diags
+            .iter()
+            .filter(|d| d.code == LB0317_CLASS_ANCESTRY_TOO_DEEP)
+            .collect();
+        assert_eq!(
+            depth.len(),
+            1,
+            "one chain, one `LB0317` — the pre-check's `covered` set must swallow the \
+             resolver's drain for the same chain: {depth:?}"
+        );
+        assert!(
+            depth[0].message.contains(&format!("`C{n}`'s")),
+            "the surviving one names the first link over the limit, `C{n}`: {depth:?}"
+        );
+        assert!(
+            depth[0].message.contains(&format!(
+                "ancestry is {} classes deep",
+                MAX_ANCESTRY_DEPTH + 1
+            )),
+            "and measures it in the same unit the limit is stated in — classes on the path, \
+             `C0..C{n}` inclusive: {depth:?}"
+        );
+        assert!(
+            !depth[0].message.contains("too deep to resolve safely"),
+            "the non-actionable resolver-side wording must not be what reaches the user: \
+             {depth:?}"
+        );
     }
 
     #[test]
@@ -1741,12 +1862,12 @@ mod tests {
         // a moment earlier had certified as within bounds. Now the two
         // share one constant, so the chain is caught HERE, early and cheaply,
         // before resolution ever gets a chance to truncate anything: one
-        // depth diagnostic at `C201`, never the pre-check's silence followed
+        // depth diagnostic at `C200`, never the pre-check's silence followed
         // by a wrong `LB0306` from the checker.
         //
         // Exactly one, not two: `---@type C400` makes the resolver walk the
         // chain too, so its own `LB0317` drain fires as well — measured, on
-        // `C400`, in different words than the pre-check's `C201`. Two
+        // `C400`, in different words than the pre-check's `C200`. Two
         // diagnostics for one chain from two mechanisms is what
         // `collect_diagnostics`'s coverage filter exists to collapse
         // (production readiness review, finding 1(c)).
@@ -1767,7 +1888,7 @@ mod tests {
         assert!(
             depth[0]
                 .message
-                .contains(&format!("`C{}`", MAX_ANCESTRY_DEPTH + 1)),
+                .contains(&format!("`C{MAX_ANCESTRY_DEPTH}`")),
             "the surviving one is the pre-check's actionable first link: {depth:?}"
         );
         assert!(
@@ -1931,7 +2052,7 @@ mod tests {
         // different file's `LineIndex`.
         let src = class_chain_source_with_comment_above(
             2_500,
-            MAX_ANCESTRY_DEPTH + 1,
+            MAX_ANCESTRY_DEPTH,
             "---@diagnostic disable-next-line: class-ancestry-too-deep",
         );
         let files = [source_file("main.lua", &src)];
@@ -1945,7 +2066,7 @@ mod tests {
         // arithmetic is replaced by "any line-scoped disable anywhere in the
         // file counts" — which is what the old hand-rolled scanner degraded
         // to whenever its offset->line conversion went wrong. `C0` is nowhere
-        // near the class this reports (`C201`).
+        // near the class this reports (`C200`).
         let src = class_chain_source_with_comment_above(
             2_500,
             1,
@@ -2001,6 +2122,10 @@ mod tests {
         let mut src = named_chain_source("A", n);
         src.push_str(&named_chain_source("B", n));
         src.push_str(&named_chain_source("C", n));
+        // The reported link is the FIRST over the limit, not the deepest:
+        // `{prefix}MAX_ANCESTRY_DEPTH`, whose own path is one class past what
+        // the resolver walks (PR #61 round-8 F3).
+        let first = MAX_ANCESTRY_DEPTH;
         let files = [source_file("main.lua", &src)];
         let diags = deep_class_chain_diagnostics(&files, Strictness::Strict).diags;
         let names: Vec<String> = diags
@@ -2015,7 +2140,11 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec![format!("A{n}"), format!("B{n}"), format!("C{n}")]
+            vec![
+                format!("A{first}"),
+                format!("B{first}"),
+                format!("C{first}")
+            ]
         );
     }
 

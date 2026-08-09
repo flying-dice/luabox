@@ -196,15 +196,30 @@ jobs:
         # the guard below fails the job loudly if the extraction ever stops
         # matching instead of diffing against nothing.
         run: |
-          default_files="$(grep -oP '^default_files="\K[^"]+' scripts/tests/mutants-gate.sh)"
+          # `|| true` is load-bearing (#58 review round 8, F14). GitHub runs
+          # every `run:` step under `bash -e -o pipefail`, so a non-matching
+          # grep exits 1 and aborts the step AT THIS ASSIGNMENT — which made
+          # the guard below, and its ::error:: annotation naming the actual
+          # fix, unreachable code. The step still failed, but as a bare
+          # nonzero exit from a grep, i.e. as the least informative version
+          # of exactly the message the guard was written to print. Tolerating
+          # the failure here is what lets the guard run.
+          default_files="$(grep -oP '^default_files="\K[^"]+' scripts/tests/mutants-gate.sh || true)"
           if [ -z "$default_files" ]; then
             echo "::error::could not extract default_files from scripts/tests/mutants-gate.sh — the scope's single owner moved; fix this extraction with it" >&2
             exit 1
           fi
           echo "mutants-pr: scope (from mutants-gate.sh): $default_files"
-          # shellcheck disable=SC2086 -- comma-separated list becomes word-split paths deliberately
+          # A real bash array, not `${default_files//,/ }` unquoted (F14):
+          # the unquoted form is word-split AND glob-expanded by the shell,
+          # so a scope path containing a shell metacharacter or matching a
+          # file in the runner's cwd would diff something other than the
+          # scope. No path does that today — this is the robustness half of
+          # the finding, fixed because the honest fix is the same length as
+          # the `# shellcheck disable=SC2086` that used to sit here.
+          IFS=',' read -ra scope_paths <<< "$default_files"
           git diff --merge-base "${{ github.event.pull_request.base.sha }}" HEAD \
-            -- ${default_files//,/ } \
+            -- "${scope_paths[@]}" \
             > "$RUNNER_TEMP/pr.diff"
           echo "mutants-pr: diff has $(wc -l < "$RUNNER_TEMP/pr.diff") line(s) over the mutation scope"
 
@@ -227,7 +242,15 @@ jobs:
         with:
           name: mutants-pr-report
           path: ${{ runner.temp }}/mutants/mutants.out
-          if-no-files-found: ignore
+          # `warn`, not `ignore` (#58 review round 8, F14). This upload is the
+          # only way an operator reads the report a failing run points them
+          # at — mutants-gate.sh prints "Full log: $out_dir/mutants.out/log"
+          # for a runner directory that ceases to exist the moment the job
+          # ends. `ignore` meant the one case where that pointer matters most
+          # (the run died before writing anything) produced neither an
+          # artifact nor a line saying so. It stays non-fatal: an empty diff
+          # legitimately uploads nothing.
+          if-no-files-found: warn
 
   mutants:
     needs: gate-selftest
@@ -281,4 +304,7 @@ jobs:
         with:
           name: mutants-report
           path: ${{ runner.temp }}/mutants/mutants.out
-          if-no-files-found: ignore
+          # `warn`, same reason as mutants-pr-report above (F14): a run that
+          # produced no report is a fact worth one line in the log, not
+          # silence.
+          if-no-files-found: warn

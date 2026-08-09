@@ -198,11 +198,18 @@ and that rule is now written into the policy rather than left to judgement.
   with the same attribution tiers (this file's declaration, another project
   file's, then the consuming file for an ambient `[types] defs` class).
 
-  luabox-only and deliberately stricter than the oracle — lua-language-server
-  3.13.5 reports nothing for either shape (measured against the pinned
-  binary). It honors the full strictness ladder like every other `LB03xx`:
-  `[types] strict = false` downgrades it to `warning`, and `---@diagnostic
-  disable[-line|-next-line]: cyclic-class-ancestry` suppresses it.
+  **Parity with the oracle, not luabox being stricter.** lua-language-server
+  3.13.5 reports `circle-doc-class` ("Circularly inherited classes") on both
+  shapes at `--checklevel=Warning`. Earlier drafts of this entry claimed it
+  "reports nothing for either shape (measured)"; that was asserted, never
+  measured, and is false — it is now measured, in the `luals-differential`
+  corpus rows `cyclic_class_self` and `cyclic_class_mutual`, which re-derive
+  both columns on every run. Consequently the suppression name is luals' own:
+  `---@diagnostic disable[-line|-next-line]: circle-doc-class` (it was spelt
+  `cyclic-class-ancestry` in this branch's earlier rounds — corrected before
+  release, so no comment in the wild breaks, and a luals user's existing
+  directive now works unchanged). It honors the full strictness ladder like
+  every other `LB03xx`: `[types] strict = false` downgrades it to `warning`.
   `luabox explain LB0318` describes the fix.
 
 - **A `---@class` ancestry-depth limit (`LB0317`, `MAX_ANCESTRY_DEPTH = 200`)**
@@ -221,6 +228,14 @@ and that rule is now written into the policy rather than left to judgement.
   single-inheritance chain; a generated-bindings project (one `---@class`
   per table/message/IDL node) is the realistic shape that reaches this. See
   `luabox explain LB0317`.
+
+  **luabox-only, and now measured as such.** lua-language-server 3.13.5
+  reports nothing on a straight 260-link chain — probed directly against the
+  pinned binary at `--checklevel=Warning`, and pinned as an intentional
+  divergence in the `luals-differential` corpus row
+  `deep_chain_over_depth_limit`. So this narrowing has no oracle counterpart
+  to converge on; unlike `LB0318` above, where the equivalent claim turned
+  out to be false, this one holds under measurement.
 
   Two bugs in the CLI's own pre-check (`check_cmd::deep_class_chain_diagnostics`)
   shipped alongside the limit in an earlier build of this same block, both
@@ -335,7 +350,12 @@ the block ships.
   and measured depth in the message. N independent chains still produce N
   diagnostics. The resolver-side drain's rediscovery of a chain the pre-check
   already named is dropped, so one chain is one diagnostic across both
-  mechanisms.
+  mechanisms. Round 8 review F3 then found the two mechanisms disagreeing on
+  the boundary itself — the pre-check counted edges where the resolver counts
+  classes on the path, so a 201-class chain slipped past the pre-check and
+  drew the resolver's non-actionable message instead. Both now count classes
+  and first trip at 201; the reported frontier is the first class past the
+  200-class limit.
 
 - **`LB0317`/`LB0318`/`LB0319` now report in a fixed order.** The three
   ancestry ledgers are hash sets, and a class with no in-project declaration

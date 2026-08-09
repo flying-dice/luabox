@@ -64,7 +64,8 @@
 #                        for a stale constant too.
 #   LUABOX_RSS_BUDGET_MIB
 #                        integer ceiling (MiB) for the peak-RSS leg.
-#                        Default 300. Deliberately NOT scaled by
+#                        Default RSS_BUDGET_MIB (perf-gate-budgets.env, 300
+#                        today). Deliberately NOT scaled by
 #                        LUABOX_PERF_FACTOR: a slow or loaded machine runs
 #                        the same allocations, it just takes longer over
 #                        them, so a CPU multiplier has no business
@@ -73,7 +74,9 @@
 #   LUABOX_RETAINED_ENV_RSS_BUDGET_MIB
 #                        integer ceiling (MiB) for the RETAINED-TYPEENV
 #                        REGRESSION GATE below, the peak-RSS leg's sibling
-#                        on a different corpus. Default 100. Same rule as
+#                        on a different corpus. Default
+#                        RETAINED_ENV_RSS_BUDGET_MIB
+#                        (perf-gate-budgets.env, 100 today). Same rule as
 #                        LUABOX_RSS_BUDGET_MIB above: not scaled by
 #                        LUABOX_PERF_FACTOR, for the same reason.
 #
@@ -107,24 +110,35 @@ factor="${LUABOX_PERF_FACTOR:-1.0}"
 # a plain KEY=VALUE file, valid as a `source`d shell fragment as-is.
 # perf-gate.ps1 reads the same file through perf-gate-lib.ps1's
 # Read-PerfBudgets.
-# shellcheck source=perf-gate-budgets.env
-source "$repo_root/scripts/perf-gate-budgets.env"
+#
+# read_perf_budgets, not a bare `source` (#58 review round 8, F15c): the
+# PowerShell reader has always refused a line that is not KEY=INTEGER and
+# this side accepted anything bash accepts, which is every shell command
+# there is. Same regex on both readers now; see perf-gate-lib.sh.
+read_perf_budgets "$repo_root/scripts/perf-gate-budgets.env" || exit 1
 cold_start_budget_base_ms="$COLD_START_BUDGET_BASE_MS"
+cold_start_ceiling_ms="$COLD_START_CEILING_MS"
 fmt_budget_base_ms="$FMT_BUDGET_BASE_MS"
+fmt_ceiling_ms="$FMT_CEILING_MS"
 check_budget_base_ms="$CHECK_BUDGET_BASE_MS"
 check_ceiling_ms="$CHECK_CEILING_MS"
 diag_lint_budget_base_ms="$DIAG_LINT_BUDGET_BASE_MS"
+diag_lint_ceiling_ms="$DIAG_LINT_CEILING_MS"
 diag_check_budget_base_ms="$DIAG_CHECK_BUDGET_BASE_MS"
 diag_check_ceiling_ms="$DIAG_CHECK_CEILING_MS"
 diag_lint_rendered_budget_base_ms="$DIAG_LINT_RENDERED_BUDGET_BASE_MS"
+diag_lint_rendered_ceiling_ms="$DIAG_LINT_RENDERED_CEILING_MS"
 diag_check_rendered_budget_base_ms="$DIAG_CHECK_RENDERED_BUDGET_BASE_MS"
+diag_check_rendered_ceiling_ms="$DIAG_CHECK_RENDERED_CEILING_MS"
 diag_corpus_findings="$DIAG_CORPUS_FINDINGS"
 rss_budget_mib="$RSS_BUDGET_MIB"
 
 # scale_budget_ms (perf-gate-lib.sh) does the float multiply; everything
-# else is integer ms from here on.
-cold_start_budget=$(scale_budget_ms "$cold_start_budget_base_ms" "$factor")
-fmt_budget=$(scale_budget_ms "$fmt_budget_base_ms" "$factor")
+# else is integer ms from here on. Every scaled leg passes its ceiling —
+# all EIGHT now, not the two the round 6 rebase wired (#58 review round 8,
+# F15b); the per-key rationale for each number is in perf-gate-budgets.env.
+cold_start_budget=$(scale_budget_ms "$cold_start_budget_base_ms" "$factor" "$cold_start_ceiling_ms")
+fmt_budget=$(scale_budget_ms "$fmt_budget_base_ms" "$factor" "$fmt_ceiling_ms")
 
 echo "perf-gate: LUABOX_PERF_FACTOR=${factor} (cold-start budget ${cold_start_budget} ms, fmt budget ${fmt_budget} ms)"
 
@@ -343,10 +357,20 @@ fi
 # convention, and — unlike the MiB budget two paragraphs up — IS scaled by
 # LUABOX_PERF_FACTOR, because wall time genuinely is slower on a slow
 # machine where a fixed allocation count is not.
-retained_env_corpus_files=500
-retained_env_rss_budget_mib="${LUABOX_RETAINED_ENV_RSS_BUDGET_MIB:-100}"
-retained_env_check_budget_base_ms=4000
-retained_env_check_budget=$(scale_budget_ms "$retained_env_check_budget_base_ms" "$factor")
+#
+# The three constants below were bare literals HERE and again in
+# perf-gate.ps1 until #58 review round 8, F16 — the one-rule-two-copies
+# shape M50 moved every other budget into perf-gate-budgets.env to end,
+# still live on the single leg guarding the ~25x regression above, i.e. the
+# one where a Linux/Windows drift would cost the most and show the least.
+# The numbers now come from the shared file both readers parse; the
+# CALIBRATION (the table above, the 3x headroom, the rayon pin) stays here,
+# where it was measured.
+retained_env_corpus_files="$RETAINED_ENV_CORPUS_FILES"
+retained_env_rss_budget_mib="${LUABOX_RETAINED_ENV_RSS_BUDGET_MIB:-$RETAINED_ENV_RSS_BUDGET_MIB}"
+retained_env_check_budget_base_ms="$RETAINED_ENV_CHECK_BUDGET_BASE_MS"
+retained_env_check_ceiling_ms="$RETAINED_ENV_CHECK_CEILING_MS"
+retained_env_check_budget=$(scale_budget_ms "$retained_env_check_budget_base_ms" "$factor" "$retained_env_check_ceiling_ms")
 echo
 if command -v python3 >/dev/null 2>&1; then
   echo "perf-gate: generating ${retained_env_corpus_files}-file retained-TypeEnv regression corpus..."
@@ -422,10 +446,10 @@ fi
 # label. Neither subsumes the other — a regression in either half moves
 # only its own pair — and stdout goes to /dev/null in both, so the gate
 # times the toolchain, not the terminal.
-diag_lint_budget=$(scale_budget_ms "$diag_lint_budget_base_ms" "$factor")
+diag_lint_budget=$(scale_budget_ms "$diag_lint_budget_base_ms" "$factor" "$diag_lint_ceiling_ms")
 diag_check_budget=$(scale_budget_ms "$diag_check_budget_base_ms" "$factor" "$diag_check_ceiling_ms")
-diag_lint_rendered_budget=$(scale_budget_ms "$diag_lint_rendered_budget_base_ms" "$factor")
-diag_check_rendered_budget=$(scale_budget_ms "$diag_check_rendered_budget_base_ms" "$factor")
+diag_lint_rendered_budget=$(scale_budget_ms "$diag_lint_rendered_budget_base_ms" "$factor" "$diag_lint_rendered_ceiling_ms")
+diag_check_rendered_budget=$(scale_budget_ms "$diag_check_rendered_budget_base_ms" "$factor" "$diag_check_rendered_ceiling_ms")
 
 diag_dir="$corpus_dir/diagnostics-heavy"
 mkdir -p "$diag_dir/lint/src" "$diag_dir/check/src"

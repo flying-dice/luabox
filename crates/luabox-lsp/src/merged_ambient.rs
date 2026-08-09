@@ -82,6 +82,66 @@ pub struct MergedAmbient {
     /// revision re-ran the full scan for no reason, exactly the shape M57's
     /// `search_order_cache` was added to close for `may_declare_class`.
     alias_or_enum_cache: RefCell<AliasOrEnumCache>,
+    /// Every `---@alias`/`---@enum` name the **ambient** definition layer
+    /// declares — [`Self::is_declared_alias_or_enum`]'s fallback for the tier
+    /// the project-file scan structurally cannot see (round 8 review, F7).
+    ///
+    /// [`sema::is_declared_alias_or_enum`] scans `analysis.files()`. A
+    /// *dependency*'s defs (`lua_modules/<dep>/defs/`) are contributed to the
+    /// `Ambient` that `luabox check` enforces, but
+    /// `layout::collect_lua_files` excludes that directory from the source
+    /// walk entirely — they are never in `analysis.files()` at any revision,
+    /// so no amount of scanning finds them. Without this set,
+    /// `requires::require_struct_fields`'s gate saw a dependency-declared
+    /// alias as "resolves to nothing" and fell through to the `require`d
+    /// module's raw structural export: M20's confidently-wrong shape,
+    /// reopened one tier down.
+    ///
+    /// Empty unless a caller opts in via [`Self::with_ambient_alias_names`];
+    /// `server.rs` is the one production caller, harvesting it from the very
+    /// `def_sources` slice `base` was built from.
+    ambient_alias_or_enum: HashSet<String>,
+}
+
+/// Every `---@alias`/`---@enum` name declared by a set of ambient definition
+/// sources — [`MergedAmbient::with_ambient_alias_names`]'s input (round 8
+/// review, F7).
+///
+/// Parsed with `Dialect::Lua54` because that is exactly what
+/// `luabox_types::defs::Ambient::build` parses definition sources with ("they
+/// use only the common syntax; parse them with the richest dialect so nothing
+/// is rejected"). Reading the same texts with a different dialect than the
+/// layer itself was built with is how the two would come to disagree about
+/// what the ambient declares.
+///
+/// Names only. Expanding an ambient alias body needs `luabox-types`'
+/// `pub(crate)` lowering (see [`sema::is_declared_alias_or_enum`]'s own doc
+/// for why this crate declines to reimplement it); the gate this feeds asks
+/// only whether the annotation names *something the checker will resolve*,
+/// which a name answers.
+#[must_use]
+pub fn alias_or_enum_names(sources: &[String]) -> HashSet<String> {
+    use luabox_syntax::lua::{self, Dialect};
+    use luabox_syntax::luacats::{self, Tag};
+
+    let mut out = HashSet::new();
+    for source in sources {
+        let parse = lua::parse(source, Dialect::Lua54);
+        for item in luacats::harvest(&parse) {
+            for tag in &item.block.tags {
+                match tag {
+                    Tag::Alias(a) if !a.name.is_empty() => {
+                        out.insert(a.name.clone());
+                    }
+                    Tag::Enum(e) if !e.name.is_empty() => {
+                        out.insert(e.name.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    out
 }
 
 /// [`MergedAmbient::is_declared_alias_or_enum`]'s memo, keyed by
@@ -130,7 +190,19 @@ impl MergedAmbient {
             sema_cache: FileSemaCache::default(),
             search_order_cache: SearchOrderCache::default(),
             alias_or_enum_cache: RefCell::default(),
+            ambient_alias_or_enum: HashSet::new(),
         }
+    }
+
+    /// Attach the `---@alias`/`---@enum` names the ambient definition layer
+    /// declares (round 8 review, F7) — [`alias_or_enum_names`] over the same
+    /// `def_sources` slice `base` was built from, so the two cannot disagree
+    /// about what is ambient. A plain [`Self::build`] leaves it empty, which
+    /// is the correct answer for a layer built with no defs at all.
+    #[must_use]
+    pub fn with_ambient_alias_names(mut self, names: HashSet<String>) -> Self {
+        self.ambient_alias_or_enum = names;
+        self
     }
 
     /// Attach the set of paths that are genuinely part of `base`'s ambient
@@ -182,6 +254,14 @@ impl MergedAmbient {
     /// A snapshot at a *different* revision is rescanned, not answered from
     /// the memo — see [`AliasOrEnumCache`] for why the parameter has to mean
     /// that.
+    ///
+    /// **Two tiers, not one** (round 8 review, F7): the project-file scan,
+    /// then [`Self::ambient_alias_or_enum`] for what that scan structurally
+    /// cannot reach. Ordered scan-first only because the scan is the tier
+    /// that varies with the revision; the answer is the union, and a name
+    /// declared in both tiers is the same `true` either way. The union is
+    /// what gets memoised, so the ambient half costs one hash lookup on the
+    /// miss path and nothing at all afterwards.
     #[must_use]
     pub fn is_declared_alias_or_enum(&self, analysis: &Analysis, name: &str) -> bool {
         let revision = analysis.revision();
@@ -193,7 +273,8 @@ impl MergedAmbient {
                 return *found;
             }
         }
-        let found = sema::is_declared_alias_or_enum(analysis, name);
+        let found = sema::is_declared_alias_or_enum(analysis, name)
+            || self.ambient_alias_or_enum.contains(name);
         let mut cache = self.alias_or_enum_cache.borrow_mut();
         if cache.revision != Some(revision) {
             cache.answers.clear();
@@ -456,6 +537,44 @@ mod tests {
         assert!(!ambient.is_declared_alias_or_enum(&analysis, "Nope"));
         assert!(!ambient.is_declared_alias_or_enum(&analysis, "Nope"));
         assert_eq!(ambient.alias_or_enum_cache.borrow().answers.len(), 1);
+    }
+
+    // === ambient alias/enum names (round 8 review, F7) ====================
+
+    #[test]
+    fn alias_or_enum_names_harvests_both_spellings_and_nothing_else() {
+        let sources = vec![
+            "---@meta\n\n---@alias DepAlias string\n---@class DepClass\n".to_string(),
+            "---@meta\n\n---@enum DepEnum\nlocal E = { a = 1 }\n".to_string(),
+        ];
+        let names = alias_or_enum_names(&sources);
+        assert!(names.contains("DepAlias"));
+        assert!(names.contains("DepEnum"));
+        assert!(
+            !names.contains("DepClass"),
+            "a class is not an alias or an enum: {names:?}"
+        );
+    }
+
+    /// The tier the `analysis.files()` scan structurally cannot reach: the
+    /// name is declared **only** in the ambient layer, and there is no
+    /// project file for the scan to find it in — exactly a dependency's
+    /// `lua_modules/<dep>/defs/`, which `layout::collect_lua_files` excludes
+    /// from the source walk.
+    #[test]
+    fn is_declared_alias_or_enum_answers_for_an_ambient_only_name() {
+        let ambient = merged("local x = 1\n").with_ambient_alias_names(alias_or_enum_names(&[
+            "---@meta\n\n---@alias DepAlias string\n".to_string(),
+        ]));
+        let analysis = analysis_of("local x = 1\n");
+        assert!(
+            ambient.is_declared_alias_or_enum(&analysis, "DepAlias"),
+            "no project file declares it; the ambient layer does"
+        );
+        assert!(
+            !ambient.is_declared_alias_or_enum(&analysis, "NotDeclaredAnywhere"),
+            "and the fallback must not answer `true` for everything"
+        );
     }
 
     // === class_members_of (#48) ============================================

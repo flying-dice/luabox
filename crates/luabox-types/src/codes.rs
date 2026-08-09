@@ -79,13 +79,17 @@ pub const CLASS_DEPTH_LIMIT: Code = Code::new(317);
 /// so this never crashed, but the cycle resolved *silently* and a user whose
 /// intent was to inherit from something else got no signal at all.
 ///
-/// luabox-only, like [`CLASS_DEPTH_LIMIT`] — measured against the pinned
-/// lua-language-server 3.13.5, which reports nothing for either shape.
-/// Deliberately stricter, and downgradable the same way every other `LB03xx`
-/// is: `[types] strict = false` makes it a warning and `---@diagnostic
-/// disable[-line|-next-line]: cyclic-class-ancestry` suppresses it
-/// ([`crate::directive::RULE_CYCLIC_CLASS_ANCESTRY`], the single owner of
-/// that name).
+/// **Parity, not luabox being stricter** — unlike [`CLASS_DEPTH_LIMIT`].
+/// lua-language-server 3.13.5 reports `circle-doc-class` ("Circularly
+/// inherited classes") on *both* shapes at `--checklevel=Warning`, measured
+/// against the pinned binary (corpus rows `cyclic_class_self` /
+/// `cyclic_class_mutual`). This doc previously claimed luals "reports nothing
+/// for either shape"; that was asserted, never measured, and round 8 measured
+/// it false. Downgradable the same way every other `LB03xx` is: `[types]
+/// strict = false` makes it a warning and `---@diagnostic
+/// disable[-line|-next-line]: circle-doc-class` suppresses it —
+/// luals' own rule name ([`crate::directive::RULE_CIRCLE_DOC_CLASS`], the
+/// single owner of it), so the muscle-memory directive works unchanged.
 pub const CYCLIC_CLASS: Code = Code::new(318);
 /// A `---@class` ancestry whose *resolution cost* — not its depth — exceeds
 /// what the merge walk will spend on it (`env::MAX_ANCESTRY_RESOLUTIONS`).

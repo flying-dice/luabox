@@ -30,7 +30,7 @@ const KNOWN_RULES: &[&str] = &[
     "invisible",
     "await-in-sync",
     RULE_CLASS_ANCESTRY_TOO_DEEP,
-    RULE_CYCLIC_CLASS_ANCESTRY,
+    RULE_CIRCLE_DOC_CLASS,
     RULE_CLASS_ANCESTRY_TOO_COSTLY,
 ];
 
@@ -39,9 +39,10 @@ const KNOWN_RULES: &[&str] = &[
 /// Most entries in [`KNOWN_RULES`] are luals' own diagnostic names, because
 /// most `LB03xx` codes have a luals counterpart and a user moving between the
 /// two tools should not have to learn a second vocabulary. `LB0317` and
-/// `LB0318` have no counterpart — luals has neither the recursive class merge
-/// the depth cap protects nor any cyclic-class diagnostic — so they carry
-/// luabox-only names here.
+/// `LB0319` have no counterpart — luals has neither the recursive class merge
+/// the depth cap protects nor the re-resolution budget — so they carry
+/// luabox-only names. `LB0318` is the exception and borrows luals' own
+/// `circle-doc-class` (see [`RULE_CIRCLE_DOC_CLASS`]).
 ///
 /// They are *here*, in the one owner, rather than in a second scanner
 /// (round 6 review M4(b)): the CLI's syntactic pre-check
@@ -54,9 +55,23 @@ const KNOWN_RULES: &[&str] = &[
 /// a project's `LB0317`s and not others.
 pub const RULE_CLASS_ANCESTRY_TOO_DEEP: &str = "class-ancestry-too-deep";
 
-/// The suppression name for `LB0318`. See
-/// [`RULE_CLASS_ANCESTRY_TOO_DEEP`].
-pub const RULE_CYCLIC_CLASS_ANCESTRY: &str = "cyclic-class-ancestry";
+/// The suppression name for `LB0318` — **luals' own rule name**, not a
+/// luabox invention.
+///
+/// This constant was `cyclic-class-ancestry` until round 8, on the stated
+/// rationale that "luals has no cyclic-class diagnostic to name". That was an
+/// assertion nobody had measured, and it is false: lua-language-server 3.13.5
+/// ships `circle-doc-class` ("Circularly inherited classes") and reports it on
+/// *both* shapes LB0318 covers — `---@class A : A` and the mutual `A : B` /
+/// `B : A` pair — at `--checklevel=Warning` (probed directly against the
+/// pinned binary; the corpus rows `cyclic_class_self` and
+/// `cyclic_class_mutual` are that measurement, committed). LB0318 is
+/// therefore *parity*, not luabox being stricter, and the rule name follows
+/// the same principle every other shared entry in [`KNOWN_RULES`] does: a
+/// user moving between the two tools types the name they already know.
+///
+/// Renamed before release, so no suppression comment in the wild breaks.
+pub const RULE_CIRCLE_DOC_CLASS: &str = "circle-doc-class";
 
 /// The suppression name for `LB0319`. See
 /// [`RULE_CLASS_ANCESTRY_TOO_DEEP`].
@@ -76,7 +91,7 @@ pub(crate) fn rule_for_code(code: Code) -> Option<&'static str> {
         codes::INVISIBLE => Some("invisible"),
         codes::AWAIT_IN_SYNC => Some("await-in-sync"),
         codes::CLASS_DEPTH_LIMIT => Some(RULE_CLASS_ANCESTRY_TOO_DEEP),
-        codes::CYCLIC_CLASS => Some(RULE_CYCLIC_CLASS_ANCESTRY),
+        codes::CYCLIC_CLASS => Some(RULE_CIRCLE_DOC_CLASS),
         codes::CLASS_COST_LIMIT => Some(RULE_CLASS_ANCESTRY_TOO_COSTLY),
         // LB0310 (duplicate-doc-alias) is a project-assembly finding, like the
         // LB0307 class collision — it never flows through this per-file filter,
@@ -92,14 +107,17 @@ pub(crate) fn rule_for_code(code: Code) -> Option<&'static str> {
 /// (`--[[@diagnostic disable: foo]]`) can leave on the last name, exactly as
 /// [`DirectiveScan::scan`] always has.
 ///
-/// Used by [`DirectiveScan::scan`] (a raw-text scan over a whole file) and
-/// exported for any front-end that has already captured a directive body some
-/// other way. It was extracted (round 6 review G5) because
-/// `luabox_cli::check_cmd`'s `LB0317` pre-check hand-rolled the identical
-/// `split_once(':')` + comma-split + trim; that pre-check now runs
-/// [`DirectiveScan`] itself, which is the stronger form of the same fix — one
-/// scanner rather than two scanners sharing one parser.
-pub fn parse_directive_body(rest: &str) -> Option<(&str, impl Iterator<Item = &str> + Clone)> {
+/// It was extracted (round 6 review G5) because `luabox_cli::check_cmd`'s
+/// `LB0317` pre-check hand-rolled the identical `split_once(':')` +
+/// comma-split + trim, and was published crate-wide so that pre-check could
+/// call it. That pre-check now runs [`DirectiveScan`] itself — the stronger
+/// form of the same fix, one scanner rather than two scanners sharing one
+/// parser — which left this with **no caller outside this module** and no
+/// reason to be public (round 8 review F22; measured by workspace grep, the
+/// only call site is [`DirectiveScan::scan`] below). Private accordingly:
+/// the interface is `DirectiveScan`, and a `pub` item is a semver promise,
+/// not documentation.
+fn parse_directive_body(rest: &str) -> Option<(&str, impl Iterator<Item = &str> + Clone)> {
     let (action, names) = rest.trim().split_once(':')?;
     Some((
         action.trim(),
@@ -264,18 +282,17 @@ mod tests {
         assert_eq!(rule_for_code(codes::AWAIT_IN_SYNC), Some("await-in-sync"));
         // R2 (production readiness issue): this mapping used to stop at
         // `AWAIT_IN_SYNC`, leaving the three ancestry-guard codes — the
-        // newest, and the ones with luabox-only rule names rather than a
-        // luals-shared one (see `RULE_CLASS_ANCESTRY_TOO_DEEP`'s doc for
-        // why) — unpinned. A regression that dropped one of their
-        // `match` arms (or renamed its rule string) would compile clean and
-        // fail nothing here.
+        // newest, and the two with luabox-only rule names (see
+        // `RULE_CLASS_ANCESTRY_TOO_DEEP`'s doc for why) — unpinned. A
+        // regression that dropped one of their `match` arms (or renamed its
+        // rule string) would compile clean and fail nothing here.
         assert_eq!(
             rule_for_code(codes::CLASS_DEPTH_LIMIT),
             Some(RULE_CLASS_ANCESTRY_TOO_DEEP)
         );
         assert_eq!(
             rule_for_code(codes::CYCLIC_CLASS),
-            Some(RULE_CYCLIC_CLASS_ANCESTRY)
+            Some(RULE_CIRCLE_DOC_CLASS)
         );
         assert_eq!(
             rule_for_code(codes::CLASS_COST_LIMIT),
@@ -298,7 +315,7 @@ mod tests {
             // R2: the three ancestry-guard codes, extending this table past
             // `AWAIT_IN_SYNC` the same way the test above does.
             (codes::CLASS_DEPTH_LIMIT, RULE_CLASS_ANCESTRY_TOO_DEEP),
-            (codes::CYCLIC_CLASS, RULE_CYCLIC_CLASS_ANCESTRY),
+            (codes::CYCLIC_CLASS, RULE_CIRCLE_DOC_CLASS),
             (codes::CLASS_COST_LIMIT, RULE_CLASS_ANCESTRY_TOO_COSTLY),
         ] {
             assert_eq!(rule_for_code(code), Some(rule), "{code}");
@@ -312,5 +329,34 @@ mod tests {
         assert_eq!(codes::CLASS_DEPTH_LIMIT.to_string(), "LB0317");
         assert_eq!(codes::CYCLIC_CLASS.to_string(), "LB0318");
         assert_eq!(codes::CLASS_COST_LIMIT.to_string(), "LB0319");
+    }
+
+    /// The three ancestry-guard rule names as literal strings — the tests
+    /// above compare `rule_for_code` against the constants, so they stay green
+    /// through a rename of the constants' *values*, which is exactly the thing
+    /// a user's `---@diagnostic` comment depends on.
+    ///
+    /// `LB0318` is spelt `circle-doc-class` on purpose: it is
+    /// lua-language-server's own name for this diagnostic, measured firing on
+    /// both LB0318 shapes against the pinned 3.13.5 binary (corpus rows
+    /// `cyclic_class_self` / `cyclic_class_mutual`). Round 8 renamed it from
+    /// the invented `cyclic-class-ancestry`; this assertion is what stops it
+    /// drifting back.
+    #[test]
+    fn the_ancestry_guard_rule_names_are_the_spellings_users_type() {
+        assert_eq!(RULE_CLASS_ANCESTRY_TOO_DEEP, "class-ancestry-too-deep");
+        assert_eq!(RULE_CIRCLE_DOC_CLASS, "circle-doc-class");
+        assert_eq!(RULE_CLASS_ANCESTRY_TOO_COSTLY, "class-ancestry-too-costly");
+        // …and each is actually recognised by the scanner, so a name that
+        // exists as a constant but never made it into `KNOWN_RULES` fails here
+        // rather than silently swallowing the user's directive.
+        for rule in [
+            RULE_CLASS_ANCESTRY_TOO_DEEP,
+            RULE_CIRCLE_DOC_CLASS,
+            RULE_CLASS_ANCESTRY_TOO_COSTLY,
+        ] {
+            let scan = DirectiveScan::scan(&format!("---@diagnostic disable: {rule}\n"));
+            assert!(scan.suppresses(rule, 42), "{rule} is not in KNOWN_RULES");
+        }
     }
 }

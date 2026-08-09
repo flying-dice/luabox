@@ -38,14 +38,68 @@
 # stated multiple of what it actually costs, so raising a base to stop a
 # flaky local FAIL cannot silently blind CI as a side effect. A leg passing
 # no ceiling is unchanged.
+#
+# "No ceiling" has TWO spellings, and both mean the same thing on both
+# readers (#58 review round 8, F15a). An omitted/empty third argument is
+# bash's natural one. A ceiling of 0 is the other, and it used to mean the
+# OPPOSITE here: `[[ -n "0" ]]` is true, so 0 clamped every budget to 0 and
+# failed every timed leg, while perf-gate-lib.ps1's ConvertTo-ScaledBudgetMs
+# has documented 0 as its "no cap" DEFAULT since it was written — one shared
+# perf-gate-budgets.env value, two readers, opposite behaviour, and no
+# selftest case on the bash side to notice. `-gt 0` is the fix; a negative
+# ceiling reads as "no cap" too, since no scaled budget can sit under one.
 scale_budget_ms() {
   local scaled
   scaled="$(awk -v b="$1" -v f="$2" 'BEGIN { printf "%d", b * f }')"
   local ceiling="${3:-}"
-  if [[ -n "$ceiling" && "$scaled" -gt "$ceiling" ]]; then
+  if [[ -n "$ceiling" && "$ceiling" -gt 0 && "$scaled" -gt "$ceiling" ]]; then
     scaled="$ceiling"
   fi
   printf '%s' "$scaled"
+}
+
+# read_perf_budgets <path> — validate scripts/perf-gate-budgets.env, then
+# `source` it, so every KEY it defines lands as a shell variable in the
+# caller's scope exactly as the bare `source` perf-gate.sh used to do.
+#
+# The validation is the point (#58 review round 8, F15c). perf-gate-lib.ps1's
+# Read-PerfBudgets has always hard-rejected any line that is not
+# `KEY=INTEGER`, on the stated grounds that "a budgets file that half-parses
+# is not a fact about the budgets". The bash side had no such pass: `source`
+# executes the file, so `CHECK_BUDGET_BASE_MS=75O0` (letter O) is a perfectly
+# valid assignment that every downstream `[[ "$check_ms" -lt "$budget" ]]`
+# then coerces to 0 — every timed leg FAILING with no explanation — and
+# `RSS_BUDGET_MIB=$(rm -rf ~)` is a perfectly valid command substitution. The
+# file is repo-controlled, so the second shape is robustness rather than a
+# live attack path; the first is a plain typo away. One rule, both readers,
+# same regex (`^[A-Z_][A-Z0-9_]*=-?[0-9]+$`), same fail-loudly verdict.
+#
+# Deliberately still `source` after validating, rather than parsing the
+# KEY/VALUE pairs into variables by hand: the file's own header promises it
+# is valid bash as-is, and a second, hand-rolled assignment mechanism here is
+# one more thing that can disagree with the PowerShell reader.
+read_perf_budgets() {
+  local path="$1" line trimmed lineno=0
+  if [[ ! -f "$path" ]]; then
+    echo "error: read_perf_budgets: no budgets file at $path" >&2
+    return 1
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lineno=$((lineno + 1))
+    # Same two skips as Read-PerfBudgets: blank (after trimming) and comment.
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    [[ -z "$trimmed" || "$trimmed" == '#'* ]] && continue
+    if [[ ! "$trimmed" =~ ^[A-Z_][A-Z0-9_]*=-?[0-9]+$ ]]; then
+      echo "error: read_perf_budgets: malformed line ${lineno} in ${path}: ${line}" >&2
+      echo "error:   every non-comment line must be KEY=INTEGER — no quoting, no spaces around '=';" >&2
+      echo "error:   this file is sourced as shell, so anything else either sets a budget to a value" >&2
+      echo "error:   the comparisons below coerce to 0 or runs as a command" >&2
+      return 1
+    fi
+  done <"$path"
+  # shellcheck disable=SC1090
+  source "$path"
 }
 
 # assert_lua_file_count <dir> <expected> — N38: a peak-RSS (or wall-time)

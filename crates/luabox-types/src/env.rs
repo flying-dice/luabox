@@ -992,6 +992,65 @@ fn indexer_resolution(exists: bool, arrival: MemberArrival) -> IndexerResolution
     }
 }
 
+/// The `HashMap<Ty, usize>` side of the indexer-dedupe pair: which key sits
+/// at which position in a `Vec<(Ty, Ty)>` of `---@field [K] V` entries.
+///
+/// The single owner of that pairing (PR #61 round-8 F20). Three seams merge
+/// indexers — the same-file/cross-file duplicate fold
+/// ([`TypeEnv::merge_file_types`]), the per-tag fold
+/// ([`TypeEnv::absorb_block`]) and the ancestor fold
+/// ([`TypeEnv::collect_class`]) — and each carried its own hand-copied
+/// `.iter().enumerate().map(|(i, (k, _))| (k.clone(), i)).collect()` plus its
+/// own `contains_key` / `insert(len())` / `push` sequence. Three copies of one
+/// invariant is three chances for the index and the vector to disagree about
+/// which `---@field [K] V` counts as a duplicate, and any change to indexer-key
+/// canonicalisation had to be made three times. The invariant now lives here:
+/// nothing outside this type decides what an entry's position is, and
+/// `absorb` is the only way an entry reaches the vector at all.
+///
+/// The entry list is passed in per call rather than owned, because the seams
+/// hold it differently — one has it behind a `&mut` field re-borrowed per tag
+/// and keeps this index alive across those borrows, one owns it outright.
+/// `index_of` is what makes that safe to state: an [`IndexerIndex`] is only
+/// ever valid for the entry list it was built from.
+#[derive(Default)]
+struct IndexerIndex {
+    index_of: HashMap<Ty, usize>,
+}
+
+impl IndexerIndex {
+    /// The index for an entry list that already has entries in it — the
+    /// O(K) build the O(K²) `.iter().any()` re-scan replaced (round 6 review
+    /// M55).
+    fn of(entries: &[(Ty, Ty)]) -> Self {
+        IndexerIndex {
+            index_of: entries
+                .iter()
+                .enumerate()
+                .map(|(i, (key, _))| (key.clone(), i))
+                .collect(),
+        }
+    }
+
+    /// Merge one arriving `[key] value` into `entries` under
+    /// [`indexer_resolution`]'s precedence for `arrival`, keeping the index in
+    /// step whichever way it resolves.
+    fn absorb(&mut self, entries: &mut Vec<(Ty, Ty)>, key: Ty, value: Ty, arrival: MemberArrival) {
+        match indexer_resolution(self.index_of.contains_key(&key), arrival) {
+            IndexerResolution::Insert => {
+                self.index_of.insert(key.clone(), entries.len());
+                entries.push((key, value));
+            }
+            IndexerResolution::Overwrite => {
+                if let Some(&position) = self.index_of.get(&key) {
+                    entries[position].1 = value;
+                }
+            }
+            IndexerResolution::Keep => {} // first-listed for this key already stands
+        }
+    }
+}
+
 /// `---@operator` accumulation — the one kind where nothing picks a winner
 /// between two conflicting values at merge time: every declared overload
 /// joins one scan list, and *resolution* (inference, #114) tries each in
@@ -1331,28 +1390,21 @@ impl TypeEnv {
                     // O(existing.indexers.len()) on every incoming indexer,
                     // making a class with K `---@field [K] V` entries cost
                     // O(K²) to merge.
-                    let mut indexer_index: HashMap<Ty, usize> = existing
-                        .indexers
-                        .iter()
-                        .enumerate()
-                        .map(|(i, (k, _))| (k.clone(), i))
-                        .collect();
+                    let mut indexers = IndexerIndex::of(&existing.indexers);
                     for (key, value) in &def.indexers {
-                        let indexer = match &rename {
+                        let (key, value) = match &rename {
                             Some(map) => (
                                 crate::generics::subst_ty(key, map),
                                 crate::generics::subst_ty(value, map),
                             ),
                             None => (key.clone(), value.clone()),
                         };
-                        let exists = indexer_index.contains_key(&indexer.0);
-                        if matches!(
-                            indexer_resolution(exists, MemberArrival::Duplicate),
-                            IndexerResolution::Insert
-                        ) {
-                            indexer_index.insert(indexer.0.clone(), existing.indexers.len());
-                            existing.indexers.push(indexer);
-                        }
+                        indexers.absorb(
+                            &mut existing.indexers,
+                            key,
+                            value,
+                            MemberArrival::Duplicate,
+                        );
                     }
                     // Operator signatures follow the same positional rename
                     // as fields/methods/indexers above (round 4 review R5):
@@ -1616,8 +1668,8 @@ impl TypeEnv {
         // use) whenever `current_class` changes rather than on every tag, so
         // it costs O(K) total to build across the whole loop, not O(K) per
         // tag.
-        let mut indexer_index: HashMap<Ty, usize> = HashMap::new();
-        let mut indexer_index_for: Option<String> = None;
+        let mut indexers = IndexerIndex::default();
+        let mut indexers_for: Option<String> = None;
         // The positional unification a re-declaration's field bodies need when
         // it spells the class's type parameters differently from the canonical
         // (first) list — `None` while the two agree, which is the common case.
@@ -1905,23 +1957,11 @@ impl TypeEnv {
                             // whichever it walked last — the opposite winner
                             // from every other duplicate-member axis in this
                             // block, none of which warned either.
-                            if indexer_index_for.as_deref() != current_class.as_deref() {
-                                indexer_index = class
-                                    .indexers
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, (k, _))| (k.clone(), i))
-                                    .collect();
-                                indexer_index_for.clone_from(&current_class);
+                            if indexers_for.as_deref() != current_class.as_deref() {
+                                indexers = IndexerIndex::of(&class.indexers);
+                                indexers_for.clone_from(&current_class);
                             }
-                            let exists = indexer_index.contains_key(&key);
-                            if matches!(
-                                indexer_resolution(exists, MemberArrival::Duplicate),
-                                IndexerResolution::Insert
-                            ) {
-                                indexer_index.insert(key.clone(), class.indexers.len());
-                                class.indexers.push((key, ty));
-                            }
+                            indexers.absorb(&mut class.indexers, key, ty, MemberArrival::Duplicate);
                         }
                     }
                 }
@@ -2884,36 +2924,26 @@ impl TypeEnv {
             // here cost O(shape.indexers.len()) on every one of this
             // class's own indexers, making a class with K `---@field [K]
             // V` entries cost O(K²) to resolve.
-            let mut indexer_index: HashMap<Ty, usize> = shape
-                .indexers
-                .iter()
-                .enumerate()
-                .map(|(i, (k, _))| (k.clone(), i))
-                .collect();
+            let mut indexers = IndexerIndex::of(&shape.indexers);
             for (key, value) in &def.indexers {
                 let key = crate::generics::subst_ty(key, &bound);
                 let value = crate::generics::subst_ty(value, &bound);
-                let exists = indexer_index.contains_key(&key);
-                match indexer_resolution(exists, MemberArrival::AncestorFold { is_first_binding }) {
-                    IndexerResolution::Insert => {
-                        indexer_index.insert(key.clone(), shape.indexers.len());
-                        shape.indexers.push((key, value));
-                    }
-                    IndexerResolution::Overwrite => {
-                        if let Some(&pos) = indexer_index.get(&key) {
-                            shape.indexers[pos].1 = value;
-                        }
-                    }
-                    IndexerResolution::Keep => {} // first-listed for this key already stands
-                }
+                indexers.absorb(
+                    &mut shape.indexers,
+                    key,
+                    value,
+                    MemberArrival::AncestorFold { is_first_binding },
+                );
             }
         });
     }
 
     /// The shared shape of [`Self::class_method_names`], [`Self::member_visibility`]
-    /// and [`Self::is_subclass`] (round 5 review N12): a `seen`-guarded walk
+    /// and [`Self::is_subclass`] (round 5 review N12): a guarded walk
     /// of `name` and its ancestor chain, visiting each distinct class name at
-    /// most once. Deliberately **not** [`DiamondGuard`] — none of the three
+    /// most once (a name may be *expanded* more than once — see the
+    /// `expanded_at` comment on the depth cut — but `visit` sees it once).
+    /// Deliberately **not** [`DiamondGuard`] — none of the three
     /// cares which *type arguments* an edge binds, only whether a name has
     /// been reached before, so the extra machinery `DiamondGuard` needs to
     /// tell "same ancestor, different binding" apart from a true repeat
@@ -2948,7 +2978,29 @@ impl TypeEnv {
         mut visit: impl FnMut(&str, Option<&ClassDef>) -> std::ops::ControlFlow<T>,
     ) -> Option<T> {
         let mut stack = vec![(start.to_string(), 0usize)];
-        let mut seen = HashSet::new();
+        // Name -> the SHALLOWEST depth this walk has expanded that name at.
+        // Not a bare set (PR #61 round-8 F1): the depth cut below applies to
+        // the node being popped, but what it silently throws away is that
+        // node's PARENTS, pushed at `depth + 1`. A node first expanded at
+        // `MAX - 1` is itself under the cap, records itself, and pushes
+        // parents that are then dropped at `MAX` — so a bare set made the
+        // later shallow re-reach of that node a no-op and deleted its whole
+        // subtree from the walk. Recording the depth lets a strictly
+        // shallower re-reach re-expand: same node, parents now pushed at a
+        // depth the cap accepts. Terminates because a name's recorded depth
+        // strictly decreases on each re-expansion and is floored at 0, so a
+        // name expands at most `MAX_ANCESTRY_DEPTH` times however tangled the
+        // graph. Not free on ordinary shapes either — any diamond whose
+        // SHORTER path to a shared ancestor is listed second re-expands that
+        // ancestor once (`A : B, D` with `B : D` reaches `D` at 2 then at 1)
+        // — but one extra expansion per such node is what buys an answer that
+        // does not depend on parent order, and the cap keeps the worst case
+        // bounded rather than merely unlikely.
+        let mut expanded_at: HashMap<String, usize> = HashMap::new();
+        // Separate from `expanded_at` so `visit` keeps its documented
+        // once-per-name contract: a re-expansion re-pushes parents, it does
+        // not re-announce a name the caller has already been given.
+        let mut visited = HashSet::new();
         while let Some((name, depth)) = stack.pop() {
             // The same cap `DiamondGuard` refuses to recurse past in
             // `collect_class`/`collect_operators` (round 6 review M12):
@@ -2960,9 +3012,10 @@ impl TypeEnv {
             // "missing" diagnostic, because the field it promised was never
             // actually merged in.
             //
-            // Checked BEFORE `seen` (PR #61 finding 4): `seen` records what
-            // this walk has *expanded*, not what it has merely popped, so a
-            // name first reached past the cap must leave no trace — the same
+            // Checked BEFORE `expanded_at` (PR #61 finding 4): that map
+            // records what this walk has *expanded*, not what it has merely
+            // popped, so a name first reached past the cap must leave no
+            // trace at any depth — the same
             // name may sit at a perfectly reachable depth on another branch
             // still to be popped, and marking it here poisoned it
             // permanently. Measured at d20cd47: `---@class A : C1, X` with a
@@ -2974,11 +3027,16 @@ impl TypeEnv {
             if depth >= MAX_ANCESTRY_DEPTH {
                 continue;
             }
-            if !seen.insert(name.clone()) {
-                continue;
-            }
+            match expanded_at.get(&name) {
+                // Already expanded from here or nearer the root: everything
+                // this pop could push is already on (or through) the stack.
+                Some(&previous) if previous <= depth => continue,
+                _ => expanded_at.insert(name.clone(), depth),
+            };
             let def = self.classes.get(&name);
-            if let std::ops::ControlFlow::Break(result) = visit(&name, def) {
+            if visited.insert(name.clone())
+                && let std::ops::ControlFlow::Break(result) = visit(&name, def)
+            {
                 return Some(result);
             }
             if let Some(def) = def {
@@ -3533,7 +3591,12 @@ fn merge_keep_first<V>(into: &mut BTreeMap<String, V>, from: BTreeMap<String, V>
 /// `---@generic T` parameters plus any `---@class Name<T>`'s own `<T>`
 /// params. Both lower to `Ty::Named` placeholders rather than tripping
 /// LB0305 (#84).
-fn block_generics(item: &luacats::AnnotatedItem) -> HashSet<String> {
+///
+/// `pub(crate)` because `check::duplicate_doc_fields_with_ambient` lowers
+/// the same indexer keys and must use the SAME notion of "in-scope generic
+/// name" — two copies of this rule made LB0311 fire or miss per seam
+/// (round 8 review F21).
+pub(crate) fn block_generics(item: &luacats::AnnotatedItem) -> HashSet<String> {
     let mut names = HashSet::new();
     for tag in &item.block.tags {
         match tag {
@@ -3656,11 +3719,34 @@ fn collect_type_expr_references(
 /// silently falling through a wildcard arm and under-triggering the scan it
 /// backs (round 6 review M56). The collecting counterpart of
 /// [`collect_type_expr_references`], for the same reason (PR #61 finding 3).
+///
+/// Exhaustive over the variants is not the same as exhaustive over the
+/// **fields** (PR #61 round-8 F5): the match arms are what the compiler
+/// checks, and a payload struct carrying two `TypeExpr`s can lose one
+/// silently. There are fourteen such fields across the payloads —
+/// `ClassTag::parents`, `FieldTag::key` (when `FieldKey::Indexer`),
+/// `FieldTag::ty`, `ParamTag::ty`, `ReturnItem::ty`, `TypeTag::types`,
+/// `AliasTag::ty`, `AliasMember::ty`, `GenericParam::constraint`,
+/// `OverloadTag::ty`, `CastOp::ty`, `OperatorTag::input`,
+/// `OperatorTag::result`, `VarargTag::ty` — and every one is walked below.
+/// `EnumTag`/`MetaTag`/`SimpleTag`/`UnknownTag` carry no type expression at
+/// all.
 fn collect_tag_references(tag: &Tag, names: &HashSet<String>, out: &mut HashSet<String>) {
     let mut collect = |ty: &luacats::TypeExpr| collect_type_expr_references(ty, names, out);
     match tag {
         Tag::Class(c) => c.parents.iter().for_each(&mut collect),
-        Tag::Field(f) => collect(&f.ty),
+        Tag::Field(f) => {
+            // The KEY as well as the value (PR #61 round-8 F5): a
+            // `---@field [Box<number>] string` carries a whole `TypeExpr` in
+            // `FieldKey::Indexer` that is NOT reachable from `f.ty`, so a
+            // file whose only generic reference was written there built no
+            // template and never ran the LB0313 arity check. `FieldKey::Name`
+            // is a plain `String` and references nothing.
+            if let luacats::FieldKey::Indexer(key) = &f.key {
+                collect(key);
+            }
+            collect(&f.ty);
+        }
         Tag::Param(p) => collect(&p.ty),
         Tag::Return(r) => r.items.iter().for_each(|item| collect(&item.ty)),
         Tag::Type(t) => t.types.iter().for_each(&mut collect),
@@ -3763,14 +3849,71 @@ fn collect_generic_classes(
     // trip-forwarding below is scoped to exactly this set (finding 3).
     let mut referenced: HashSet<String> = HashSet::new();
     if !generic_names.is_empty() {
+        // Alias names are scanned for alongside the generic ones (PR #61
+        // round-8 F6). A generic class can be reached through an alias BODY
+        // that this file never writes: `---@alias Boxed Box<number>` shipped
+        // by the ambient, `---@type Boxed` written here, and the file names
+        // neither `Box` nor anything else in `generic_names`. A
+        // FILE-declared alias was covered by accident — its own `Tag::Alias`
+        // is in `items`, so the body got scanned like any other tag — which
+        // is precisely why the gap was invisible. Measured at 825c61c:
+        // `expand_alias` lowered the ambient alias's body against an empty
+        // template map and produced an unsubstituted `Ty::Named("Box")`,
+        // whose `value` stayed the free `T`.
+        //
+        // Cost is the same order as `generic_names` itself — one clone of the
+        // already-in-memory alias key set per file build, no lowering and no
+        // absorb — so this does not walk back M56's saving: what M56 bought
+        // was skipping the discovery-and-resolve pass, and a file that names
+        // no generic and no alias still skips it.
+        let mut probe = generic_names.clone();
+        probe.extend(decl.aliases.keys().cloned());
+        let mut hits: HashSet<String> = HashSet::new();
         for item in items {
             for tag in &item.block.tags {
-                collect_tag_references(tag, &generic_names, &mut referenced);
+                collect_tag_references(tag, &probe, &mut hits);
             }
         }
         for cast in inline_as {
-            collect_type_expr_references(&cast.ty, &generic_names, &mut referenced);
+            collect_type_expr_references(&cast.ty, &probe, &mut hits);
         }
+        // Follow every referenced alias into its body, transitively — one
+        // alias may name another (`Outer` -> `Inner` -> `Box<number>`), and
+        // `expand_alias` follows the whole chain, so the scan deciding
+        // whether a template exists for what it lands on must too. `expanded`
+        // bounds each alias to a single expansion, so a cyclic ambient alias
+        // terminates here rather than spinning.
+        let mut queue: Vec<String> = hits
+            .iter()
+            .filter(|name| decl.aliases.contains_key(*name))
+            .cloned()
+            .collect();
+        let mut expanded: HashSet<String> = queue.iter().cloned().collect();
+        while let Some(name) = queue.pop() {
+            let Some(alias) = decl.aliases.get(&name) else {
+                continue;
+            };
+            let mut body: HashSet<String> = HashSet::new();
+            if let Some(ty) = alias.ty.as_ref() {
+                collect_type_expr_references(ty, &probe, &mut body);
+            }
+            for member in &alias.members {
+                collect_type_expr_references(&member.ty, &probe, &mut body);
+            }
+            for found in body {
+                if decl.aliases.contains_key(&found) && expanded.insert(found.clone()) {
+                    queue.push(found.clone());
+                }
+                hits.insert(found);
+            }
+        }
+        // Back down to generic classes alone: `referenced` scopes the
+        // trip-forwarding at the end of this function (finding 3), and an
+        // alias name is not a class whose budget could have tripped.
+        referenced = hits
+            .into_iter()
+            .filter(|name| generic_names.contains(name))
+            .collect();
     }
     if referenced.is_empty() {
         return BTreeMap::new();
@@ -4492,6 +4635,68 @@ mod tests {
             def.indexers,
             vec![(Ty::String, Ty::Number)],
             "the first file's conflicting indexer value must win, not the second's"
+        );
+    }
+
+    #[test]
+    fn all_three_indexer_seams_dedupe_one_key_the_same_way() {
+        // PR #61 round-8 F20. The `HashMap<Ty, usize>` scaffold that pairs an
+        // indexer key with its slot was hand-copied at three sites —
+        // `merge_file_types`' duplicate fold, `absorb_block`'s per-tag fold,
+        // and `collect_class`'s ancestor fold — in three local shapes, so any
+        // change to which `---@field [K] V` counts as a duplicate had to be
+        // made three times or the copies diverged. They now share
+        // `IndexerIndex`, and this is what fails if one grows its own again.
+        //
+        // Each seam is fed the same three tags, and the shape makes BOTH
+        // halves of "what counts as a duplicate key" observable:
+        //  - `[string|number]` arrives twice with different values, so a seam
+        //    that stopped deduping shows up as a surplus entry; and
+        //  - `[string|boolean]` is a NEAR MISS — a distinct `Ty` that any
+        //    canonicalisation shallower than `Ty`'s own equality (a rendered
+        //    name, the union's first member, the key's discriminant) collapses
+        //    onto the first key, losing an entry. A bare `[string]` fixture
+        //    cannot tell those apart; a compound key can.
+        let first = "---@field [string|number] number\n";
+        let repeat = "---@field [string|number] boolean\n";
+        let near_miss = "---@field [string|boolean] string\n";
+
+        // Seam 1 — `merge_file_types`, two files re-declaring one class.
+        let mut cross_file = TypeEnv::default();
+        cross_file.merge_file_types(&surface(&format!("---@class M\n{first}{near_miss}")));
+        cross_file.merge_file_types(&surface(&format!("---@class M\n{repeat}")));
+        let cross_file = cross_file.classes["M"].indexers.clone();
+
+        // Seam 2 — `absorb_block`, three tags on one declaration.
+        let in_file = env_of(&format!("---@class A\n{first}{near_miss}{repeat}")).classes["A"]
+            .indexers
+            .clone();
+
+        // Seam 3 — `collect_class`, two unrelated parents, the repeat
+        // arriving from the second-listed one.
+        let ancestor_fold = env_of(&format!(
+            "---@class P1\n{first}{near_miss}---@class P2\n{repeat}---@class C : P1, P2\n"
+        ))
+        .class_shape("C")
+        .expect("C is declared")
+        .indexers;
+
+        assert_eq!(
+            cross_file,
+            vec![
+                (Ty::Union(vec![Ty::String, Ty::Number]), Ty::Number),
+                (Ty::Union(vec![Ty::String, Ty::Boolean]), Ty::String),
+            ],
+            "two distinct keys, two slots, each holding its first-declared value"
+        );
+        assert_eq!(
+            in_file, cross_file,
+            "the same-file fold must canonicalise the key exactly as the cross-file one does"
+        );
+        assert_eq!(
+            ancestor_fold, cross_file,
+            "and so must the ancestor fold — three seams, one rule about what a duplicate \
+             indexer key IS"
         );
     }
 
@@ -6765,6 +6970,37 @@ function partial(a, b) end
         crate::defs::Ambient::build(&["---@meta\n---@class Box<T>\n---@field value T\n"])
     }
 
+    /// [`collect_generic_classes`]'s pre-scan result for `source` seen
+    /// against `ambient` — the ambient-layer counterpart of
+    /// [`generic_templates_of`], and the one seam every ambient pre-scan test
+    /// below goes through so "what the scan decides" is measured one way.
+    fn generic_templates_against(
+        source: &str,
+        ambient: &crate::defs::Ambient,
+    ) -> BTreeMap<String, GenericClass> {
+        let parsed = parse(source, Dialect::Lua54);
+        assert_eq!(parsed.errors(), &[], "fixture must parse cleanly: {source}");
+        let items = luacats::harvest(&parsed);
+        let root = parsed.syntax();
+        let mut decl = Declared::default();
+        for name in ambient.env.classes.keys() {
+            decl.classes.insert(name.clone());
+        }
+        for (name, alias) in &ambient.aliases {
+            decl.aliases.insert(name.clone(), alias.clone());
+        }
+        decl.absorb_tags(&items);
+        let inline_as = luacats::harvest_inline_as(&parsed);
+        collect_generic_classes(
+            &items,
+            &inline_as,
+            &root,
+            Some(ambient),
+            &decl,
+            &TypeEnv::default(),
+        )
+    }
+
     #[test]
     fn a_generic_class_declared_only_in_the_ambient_still_instantiates() {
         // The consuming file declares no class of its own (`file_has_generics`
@@ -6833,24 +7069,8 @@ function partial(a, b) end
         // `collect_generic_classes`'s own return value, not just indirectly
         // through a diagnostic outcome.
         let ambient = pure_generic_ambient();
-        let parsed = parse("---@type string\nlocal unrelated = \"x\"\n", Dialect::Lua54);
-        assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
-        let items = luacats::harvest(&parsed);
-        let root = parsed.syntax();
-        let mut decl = Declared::default();
-        for name in ambient.env.classes.keys() {
-            decl.classes.insert(name.clone());
-        }
-        decl.absorb_tags(&items);
-        let inline_as = luacats::harvest_inline_as(&parsed);
-        let templates = collect_generic_classes(
-            &items,
-            &inline_as,
-            &root,
-            Some(&ambient),
-            &decl,
-            &TypeEnv::default(),
-        );
+        let templates =
+            generic_templates_against("---@type string\nlocal unrelated = \"x\"\n", &ambient);
         assert!(
             templates.is_empty(),
             "a file that never names the ambient's generic class must skip building a \
@@ -6867,28 +7087,111 @@ function partial(a, b) end
         // arguments), so the scan must not narrow to "written with `<...>`
         // only".
         let ambient = pure_generic_ambient();
-        let parsed = parse("---@type Box\nlocal b\n", Dialect::Lua54);
-        assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
-        let items = luacats::harvest(&parsed);
-        let root = parsed.syntax();
-        let mut decl = Declared::default();
-        for name in ambient.env.classes.keys() {
-            decl.classes.insert(name.clone());
-        }
-        decl.absorb_tags(&items);
-        let inline_as = luacats::harvest_inline_as(&parsed);
-        let templates = collect_generic_classes(
-            &items,
-            &inline_as,
-            &root,
-            Some(&ambient),
-            &decl,
-            &TypeEnv::default(),
-        );
+        let templates = generic_templates_against("---@type Box\nlocal b\n", &ambient);
         assert!(
             templates.contains_key("Box"),
             "a bare reference to a generic ambient class must still trigger its template: \
              {templates:?}"
+        );
+    }
+
+    /// An ambient whose generic class is reachable only THROUGH an alias the
+    /// ambient also declares — `Boxed` names `Box<number>`, and a consuming
+    /// file that writes `---@type Boxed` names neither `Box` nor anything
+    /// else in `generic_names` (PR #61 round-8 F6).
+    fn aliased_generic_ambient() -> crate::defs::Ambient {
+        crate::defs::Ambient::build(&[
+            "---@meta\n---@class Box<T>\n---@field value T\n---@alias Boxed Box<number>\n",
+        ])
+    }
+
+    #[test]
+    fn an_ambient_alias_to_a_generic_class_still_builds_the_template() {
+        // PR #61 round-8 F6. The M56 pre-scan matches names in
+        // `generic_names` — file-declared generic classes plus ambient ones —
+        // and a file whose only generic reference is `---@type Boxed` names
+        // none of them. A FILE-declared `---@alias Boxed Box<number>` is
+        // covered by accident (its own `Tag::Alias` is in `items`, so the
+        // body is scanned like any other tag); an AMBIENT one has no tag in
+        // this file to scan, so `referenced` read empty and the whole
+        // discovery pass was skipped.
+        let templates =
+            generic_templates_against("---@type Boxed\nlocal b\n", &aliased_generic_ambient());
+        assert!(
+            templates.contains_key("Box"),
+            "a generic class reachable only through an AMBIENT alias body must still get its \
+             template: {templates:?}"
+        );
+    }
+
+    #[test]
+    fn an_ambient_alias_chain_to_a_generic_class_is_followed_to_the_end() {
+        // Alias-to-alias: `Outer` -> `Inner` -> `Box<number>`. One level of
+        // expansion is not the rule — `expand_alias` follows the whole chain,
+        // so the pre-scan that decides whether a template exists for what it
+        // lands on must follow it too. Bounded: each alias is expanded at
+        // most once, so a cyclic ambient alias cannot spin here.
+        let ambient =
+            crate::defs::Ambient::build(&["---@meta\n---@class Box<T>\n---@field value T\n\
+             ---@alias Inner Box<number>\n---@alias Outer Inner\n"]);
+        let templates = generic_templates_against("---@type Outer\nlocal b\n", &ambient);
+        assert!(
+            templates.contains_key("Box"),
+            "an alias chain must be followed to whatever generic sits at the end of it: \
+             {templates:?}"
+        );
+    }
+
+    #[test]
+    fn an_ambient_alias_to_nothing_generic_still_skips_the_discovery_pass() {
+        // F6's control, and the half that keeps the fix from undoing M56: an
+        // ambient alias whose body names no generic class must leave the
+        // pre-scan exactly where it was — empty map, discovery pass skipped.
+        // Without this, "follow every referenced alias" degrades back into
+        // "any project with a generic class anywhere re-absorbs every file".
+        let ambient = crate::defs::Ambient::build(&[
+            "---@meta\n---@class Box<T>\n---@field value T\n---@alias Plain string\n",
+        ]);
+        let templates = generic_templates_against("---@type Plain\nlocal p\n", &ambient);
+        assert!(
+            templates.is_empty(),
+            "an alias body that names nothing generic arms nothing: {templates:?}"
+        );
+    }
+
+    #[test]
+    fn an_ambient_alias_to_a_generic_binds_its_member_in_both_directions() {
+        // F6 end to end, both error directions through the public entry
+        // point. Measured at 825c61c on this ambient: `expand_alias` lowered
+        // `Boxed`'s body with an empty template map, so `Box<number>` fell
+        // through to an unsubstituted `Ty::Named("Box")` whose `value` is
+        // still the free `T`.
+        let ambient = aliased_generic_ambient();
+        let diagnose = |source: &str| -> Vec<String> {
+            let parsed = lua::parse(source, Dialect::Lua54);
+            assert_eq!(parsed.errors(), &[], "fixture must parse cleanly: {source}");
+            crate::check_file_with_ambient(
+                &parsed,
+                "test.lua",
+                crate::Strictness::Strict,
+                Dialect::Lua54,
+                Some(&ambient),
+            )
+            .iter()
+            .map(|d| d.code.to_string())
+            .collect()
+        };
+        assert_eq!(
+            diagnose("---@type Boxed\nlocal b = { value = \"x\" }\n"),
+            vec!["LB0300"],
+            "the false NEGATIVE half: `value` is bound to `number` through the alias, so a \
+             string literal must be rejected"
+        );
+        assert_eq!(
+            diagnose("---@type Boxed\nlocal b = { value = 1 }\n"),
+            Vec::<String>::new(),
+            "the false POSITIVE half: the same binding given a conforming literal must stay \
+             clean — this is a substitution, not a blanket rejection"
         );
     }
 
@@ -6955,6 +7258,62 @@ function partial(a, b) end
             templates.contains_key("Box"),
             "a generic class named only as an indexer's VALUE type must still trigger its \
              template: {templates:?}"
+        );
+    }
+
+    /// PR #61 round-8 F5 — `Tag::Field`'s arm walked `f.ty` and nothing
+    /// else, so a generic named in the FIELD KEY itself
+    /// (`---@field [Box<number>] string`, `FieldKey::Indexer(TypeExpr)`)
+    /// was invisible to the scan. Distinct from the two indexer tests
+    /// above: those put the indexer inside `f.ty` as a table literal
+    /// (`---@field data { [Box]: string }`), which the `f.ty` walk reaches
+    /// anyway — the key of the `---@field` tag itself is a separate
+    /// `TypeExpr` on a separate struct field, and it was the only one of
+    /// the fourteen `TypeExpr`-carrying sites across every `Tag` payload
+    /// that nothing scanned.
+    #[test]
+    fn a_field_key_only_reference_to_a_generic_class_is_still_seen() {
+        let templates = generic_templates_of(
+            "\
+---@class Box<T>
+---@field value T
+---@class Holder
+---@field [Box<number>] string
+",
+        );
+        assert!(
+            templates.contains_key("Box"),
+            "a generic class named only in a `---@field`'s own indexer KEY must still trigger \
+             its template: {templates:?}"
+        );
+    }
+
+    #[test]
+    fn a_wrong_argument_count_in_a_field_key_alone_still_reports_lb0313() {
+        // F5's consequence, end to end: with no template built, `lower_named`
+        // falls through to a bare `Ty::Named("Box")` and the LB0313 arity
+        // check (`lower.rs:203`, gated on `generic_classes.get(name)`) never
+        // runs at all. Measured at 825c61c on this fixture: zero arity
+        // errors for `Box<number, string>` against a one-parameter `Box<T>`,
+        // where the same reference anywhere else in the file reports one.
+        let env = env_of(
+            "\
+---@class Box<T>
+---@field value T
+---@class Holder
+---@field [Box<number, string>] boolean
+",
+        );
+        let reported: Vec<(&str, usize, usize)> = env
+            .arity_errors
+            .iter()
+            .map(|e| (e.name.as_str(), e.expected, e.got))
+            .collect();
+        assert_eq!(
+            reported,
+            vec![("Box", 1, 2)],
+            "a wrong-arity generic reference is a wrong-arity generic reference wherever it is \
+             written — the field key is not an exemption"
         );
     }
 
@@ -7353,6 +7712,55 @@ take(b.value)
             env_of(&shallow_first).is_subclass("A", "X"),
             "the control: listing the same two parents the other way round must give the \
              same answer — an order-dependent `is_subclass` is the bug"
+        );
+    }
+
+    #[test]
+    fn a_near_cap_nodes_whole_subtree_survives_a_later_shallow_re_reach() {
+        // PR #61 round-8 F1. Finding 4 moved the depth cut ahead of
+        // `seen.insert` for the *popped node*, which fixed the node case
+        // (`a_directly_listed_parent_is_a_subclass_even_behind_a_too_deep_sibling`)
+        // and left the SUBTREE case open: a node first expanded at depth
+        // `MAX-1` is under the cap, so it marks itself `seen` and pushes its
+        // own parents at depth `MAX`, where they are dropped. The later
+        // SHALLOW re-reach of that same node then hits `seen` and never
+        // re-expands — its parents are lost for the whole walk, not just for
+        // the over-deep branch.
+        //
+        // `Z` / `Y : Z` / a 198-link `B` chain ending at `Y` / `A : B1, Y`
+        // puts `Y` at depth 199 through the chain (expanded: 199 < 200) and
+        // `Z` at 200 (dropped), while `A` lists `Y` itself at depth 1, from
+        // which `Z` sits at a perfectly reachable depth 2.
+        //
+        // Measured at 825c61c: `is_subclass("A", "Z")` was `false` with the
+        // chain listed first and `true` on swapping the two parents — an
+        // order-dependent answer that `assign.rs`'s nominal upcast turns into
+        // a spurious `LB0300` (that path reads `is_subclass` directly and is
+        // NOT gated behind `class_ancestry_truncated`, unlike the member-read
+        // `LB0306` family).
+        use std::fmt::Write as _;
+
+        let mut src = String::from("---@class Z\n---@field marker boolean\n---@class Y : Z\n");
+        let _ = writeln!(src, "---@class B198 : Y");
+        for i in (1..198).rev() {
+            let _ = writeln!(src, "---@class B{i} : B{}", i + 1);
+        }
+        let deep_first = env_of(&format!("{src}---@class A : B1, Y\n"));
+        let shallow_first = env_of(&format!("{src}---@class A : Y, B1\n"));
+        assert!(
+            deep_first.is_subclass("A", "Y"),
+            "the node case (already pinned): `Y` is listed directly on `A`"
+        );
+        assert!(
+            deep_first.is_subclass("A", "Z"),
+            "the subtree case: `Z` sits one link BELOW the near-cap `Y`, at depth 2 from `A` \
+             through the parent `A` declares itself — an earlier sibling's chain reaching `Y` \
+             near the cap must not delete `Y`'s parents from the whole walk"
+        );
+        assert!(
+            shallow_first.is_subclass("A", "Z"),
+            "the control: the same two parents the other way round must give the same answer — \
+             an order-dependent `is_subclass` is the bug"
         );
     }
 

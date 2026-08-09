@@ -76,14 +76,19 @@ Set-Location $repoRoot
 # rebase and the local merge-gate that found them unread here.
 $PerfBudgets = Read-PerfBudgets (Join-Path $PSScriptRoot "perf-gate-budgets.env")
 $ColdStartBudgetBaseMs = $PerfBudgets["COLD_START_BUDGET_BASE_MS"]
+$ColdStartCeilingMs = $PerfBudgets["COLD_START_CEILING_MS"]
 $FmtBudgetBaseMs = $PerfBudgets["FMT_BUDGET_BASE_MS"]
+$FmtCeilingMs = $PerfBudgets["FMT_CEILING_MS"]
 $CheckBudgetBaseMs = $PerfBudgets["CHECK_BUDGET_BASE_MS"]
 $CheckCeilingMs = $PerfBudgets["CHECK_CEILING_MS"]
 $DiagLintBudgetBaseMs = $PerfBudgets["DIAG_LINT_BUDGET_BASE_MS"]
+$DiagLintCeilingMs = $PerfBudgets["DIAG_LINT_CEILING_MS"]
 $DiagCheckBudgetBaseMs = $PerfBudgets["DIAG_CHECK_BUDGET_BASE_MS"]
 $DiagCheckCeilingMs = $PerfBudgets["DIAG_CHECK_CEILING_MS"]
 $DiagLintRenderedBudgetBaseMs = $PerfBudgets["DIAG_LINT_RENDERED_BUDGET_BASE_MS"]
+$DiagLintRenderedCeilingMs = $PerfBudgets["DIAG_LINT_RENDERED_CEILING_MS"]
 $DiagCheckRenderedBudgetBaseMs = $PerfBudgets["DIAG_CHECK_RENDERED_BUDGET_BASE_MS"]
+$DiagCheckRenderedCeilingMs = $PerfBudgets["DIAG_CHECK_RENDERED_CEILING_MS"]
 $DiagCorpusFindings = $PerfBudgets["DIAG_CORPUS_FINDINGS"]
 # NOT scaled by -Factor: a slow or loaded machine runs the same allocations,
 # it just takes longer over them, so a CPU multiplier has no business
@@ -91,8 +96,11 @@ $DiagCorpusFindings = $PerfBudgets["DIAG_CORPUS_FINDINGS"]
 # when the budget itself is being renegotiated.
 $RssBudgetMib = $(if ($env:LUABOX_RSS_BUDGET_MIB) { [int]$env:LUABOX_RSS_BUDGET_MIB } else { $PerfBudgets["RSS_BUDGET_MIB"] })
 
-$coldStartBudget = ConvertTo-ScaledBudgetMs $ColdStartBudgetBaseMs $Factor
-$fmtBudget = ConvertTo-ScaledBudgetMs $FmtBudgetBaseMs $Factor
+# Every scaled leg passes its ceiling — all EIGHT, not the two the round 6
+# rebase wired (#58 review round 8, F15b: the other six ran unbounded at
+# CI's factor 4.0). Per-key rationale lives in perf-gate-budgets.env.
+$coldStartBudget = ConvertTo-ScaledBudgetMs $ColdStartBudgetBaseMs $Factor -CeilingMs $ColdStartCeilingMs
+$fmtBudget = ConvertTo-ScaledBudgetMs $FmtBudgetBaseMs $Factor -CeilingMs $FmtCeilingMs
 
 Write-Host "perf-gate: LUABOX_PERF_FACTOR=$Factor (cold-start budget $([math]::Round($coldStartBudget)) ms, fmt budget $([math]::Round($fmtBudget)) ms)"
 
@@ -279,7 +287,20 @@ try {
         $proc.StandardOutput.ReadToEnd() | Out-Null
         $proc.StandardError.ReadToEnd() | Out-Null
         $proc.WaitForExit()
-        $rssMib = [int]($proc.PeakWorkingSet64 / 1MB)
+        # [Math]::Floor, not a bare [int] cast — the same split
+        # ConvertTo-ScaledBudgetMs fixes one function away in
+        # perf-gate-lib.ps1, applied to the MiB conversion (#58 review round
+        # 8, F17). PowerShell's [int] ROUNDS (299.6 -> 300); the Linux
+        # sibling reads the same number through scripts/peak-rss.py, which
+        # does `int(mib)` and TRUNCATES (299.6 -> 299). At 299.6 MiB against
+        # the 300 MiB budget that is a Windows FAIL and a Linux PASS on one
+        # measurement — a per-OS verdict split in the leg that exists to
+        # enforce decisions/07's accepted ceiling on both. Correct by
+        # inspection only: this leg and the retained-env one below are both
+        # inside the disclosed Process.Start stub-skip (a .ps1 stub cannot be
+        # launched by FileName), so no perf-gate-selftest.ps1 case can
+        # execute either line — see that file's header for the gap.
+        $rssMib = [int][Math]::Floor($proc.PeakWorkingSet64 / 1MB)
         $proc.Dispose()
         if ($rssMib -lt $RssBudgetMib) {
             Write-Host ("PASS check peak RSS: {0} MiB < {1} MiB" -f $rssMib, $RssBudgetMib)
@@ -312,10 +333,19 @@ try {
     # every timed leg — this is the Windows half of the bash gate's N37 fix:
     # previously this leg measured peak RSS only, so `check` could regress
     # arbitrarily here and stay green.
-    $RetainedEnvCorpusFiles = 500
-    $RetainedEnvRssBudgetMib = $(if ($env:LUABOX_RETAINED_ENV_RSS_BUDGET_MIB) { [int]$env:LUABOX_RETAINED_ENV_RSS_BUDGET_MIB } else { 100 })
-    $RetainedEnvCheckBudgetBaseMs = 4000
-    $retainedEnvCheckBudget = ConvertTo-ScaledBudgetMs $RetainedEnvCheckBudgetBaseMs $Factor
+    #
+    # The three constants below were bare literals here and again in
+    # perf-gate.sh (~:346) until #58 review round 8, F16 — the exact
+    # one-rule-two-copies drift M50 moved every other budget into
+    # perf-gate-budgets.env to end, left live on the ONE leg guarding the
+    # ~25x regression, i.e. the one where a Linux/Windows split would show
+    # least and cost most. Numbers from the shared file; the calibration
+    # narrative stays in perf-gate.sh's leg comment, where it was measured.
+    $RetainedEnvCorpusFiles = $PerfBudgets["RETAINED_ENV_CORPUS_FILES"]
+    $RetainedEnvRssBudgetMib = $(if ($env:LUABOX_RETAINED_ENV_RSS_BUDGET_MIB) { [int]$env:LUABOX_RETAINED_ENV_RSS_BUDGET_MIB } else { $PerfBudgets["RETAINED_ENV_RSS_BUDGET_MIB"] })
+    $RetainedEnvCheckBudgetBaseMs = $PerfBudgets["RETAINED_ENV_CHECK_BUDGET_BASE_MS"]
+    $RetainedEnvCheckCeilingMs = $PerfBudgets["RETAINED_ENV_CHECK_CEILING_MS"]
+    $retainedEnvCheckBudget = ConvertTo-ScaledBudgetMs $RetainedEnvCheckBudgetBaseMs $Factor -CeilingMs $RetainedEnvCheckCeilingMs
 
     Write-Host ""
     Write-Host "perf-gate: generating $RetainedEnvCorpusFiles-file retained-TypeEnv regression corpus..."
@@ -394,7 +424,13 @@ try {
             $retainedProc.WaitForExit()
             $sw.Stop()
             $retainedEnvMs = $sw.Elapsed.TotalMilliseconds
-            $retainedEnvRssMib = [int]($retainedProc.PeakWorkingSet64 / 1MB)
+            # [Math]::Floor for the same reason as the PEAK-RSS GATE's own
+            # conversion above (#58 review round 8, F17): peak-rss.py
+            # truncates, PowerShell's [int] rounds, and this leg's 100 MiB
+            # ceiling is compared against a number both OSes must derive the
+            # same way. Also inside the stub-skip, so also unexercised by any
+            # selftest case.
+            $retainedEnvRssMib = [int][Math]::Floor($retainedProc.PeakWorkingSet64 / 1MB)
             $retainedProc.Dispose()
         } finally {
             if ($prevRayonThreads) { $env:RAYON_NUM_THREADS = $prevRayonThreads } else { Remove-Item Env:\RAYON_NUM_THREADS -ErrorAction SilentlyContinue }
@@ -429,10 +465,10 @@ try {
     # column per label. Neither subsumes the other — a regression in
     # either half moves only its own pair — and stdout is discarded in
     # both, so the gate times the toolchain, not the terminal.
-    $diagLintBudget = ConvertTo-ScaledBudgetMs $DiagLintBudgetBaseMs $Factor
+    $diagLintBudget = ConvertTo-ScaledBudgetMs $DiagLintBudgetBaseMs $Factor -CeilingMs $DiagLintCeilingMs
     $diagCheckBudget = ConvertTo-ScaledBudgetMs $DiagCheckBudgetBaseMs $Factor -CeilingMs $DiagCheckCeilingMs
-    $diagLintRenderedBudget = ConvertTo-ScaledBudgetMs $DiagLintRenderedBudgetBaseMs $Factor
-    $diagCheckRenderedBudget = ConvertTo-ScaledBudgetMs $DiagCheckRenderedBudgetBaseMs $Factor
+    $diagLintRenderedBudget = ConvertTo-ScaledBudgetMs $DiagLintRenderedBudgetBaseMs $Factor -CeilingMs $DiagLintRenderedCeilingMs
+    $diagCheckRenderedBudget = ConvertTo-ScaledBudgetMs $DiagCheckRenderedBudgetBaseMs $Factor -CeilingMs $DiagCheckRenderedCeilingMs
 
     $diagRoot = Join-Path $corpusDir "diagnostics-heavy"
     foreach ($project in @("lint", "check", "lint-rendered", "check-rendered")) {

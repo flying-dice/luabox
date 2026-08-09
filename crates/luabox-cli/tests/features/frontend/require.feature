@@ -584,10 +584,15 @@ Feature: luabox check — cross-file require resolution (#85)
 
   Scenario: the cyclic-class diagnostic is suppressible from its own declaring file alone
     # M67's escape hatch, half two, and production readiness review G1. The
-    # rule name is luabox's own — lua-language-server 3.13.5 has no
-    # counterpart to borrow one from (measured against the pinned binary: it
-    # reports nothing for this shape) — and it has exactly one owner,
-    # `luabox_types::RULE_CYCLIC_CLASS_ANCESTRY`.
+    # rule name is `circle-doc-class` — lua-language-server's OWN name for
+    # this diagnostic, which it does report on both LB0318 shapes (measured
+    # against the pinned 3.13.5 binary; round 8 corrected the earlier
+    # unmeasured claim that it reports nothing here, and renamed the rule
+    # from the invented `cyclic-class-ancestry` to match). One owner still:
+    # `luabox_types::RULE_CIRCLE_DOC_CLASS`. This scenario is what makes the
+    # name user-visible — it types the directive a luals user would type, so
+    # a drift back to a luabox-only spelling fails here, not just in the
+    # unit test on the constant.
     #
     # A prior version of this scenario put the SAME `---@diagnostic disable`
     # comment in BOTH files, which cannot fail even when the escape hatch is
@@ -605,7 +610,7 @@ Feature: luabox check — cross-file require resolution (#85)
     Given a strict project with edition "5.4"
     And a file "src/a.lua" containing:
       """
-      ---@diagnostic disable: cyclic-class-ancestry
+      ---@diagnostic disable: circle-doc-class
       ---@class SupA : SupB
       local M = {}
       return M

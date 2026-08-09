@@ -46,12 +46,12 @@
 #
 # POSITIONS — the cheaper claim, and the only one current at THIS head.
 # Verified 2026-08-09 with cargo-mutants 27.1.0 against the tree as
-# committed (after the #61 local merge-gate's fix wave, which moved most of
-# env.rs): `cargo mutants -p luabox-types --file <each of the four scope
-# files> --list` enumerated 485 mutants, every one of the 17 keys below was
-# found in that enumeration (nothing ABSENT — no waiver names a mutation
-# this head no longer generates; the count moved 492 -> 485 because the fix
-# wave renamed the M56 pre-scan helpers, whose mutants were killed, not
+# committed (after the round-8 fix wave, which moved env.rs again): `cargo
+# mutants -p luabox-types --file <each of the four scope files> --list`
+# enumerated 491 mutants, every one of the 17 keys below was found in that
+# enumeration (nothing ABSENT — no waiver names a mutation this head no
+# longer generates; the count has moved 492 -> 485 -> 491 across the two fix
+# waves as helpers were renamed and split, their mutants killed, not
 # waived), and all 14 drifted positions were re-pinned to the listed values
 # with their reasons byte-unchanged, disambiguated by COLUMN within each
 # shared (file, mutation-text) key — same-column candidate unique in every
@@ -123,17 +123,17 @@
 crates/luabox-types/src/env.rs:159:38: replace match guard !c.name.is_empty() with true in FileTypes::collect	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
 crates/luabox-types/src/env.rs:181:37: replace match guard !e.name.is_empty() with true in FileTypes::collect	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
 crates/luabox-types/src/env.rs:186:38: replace match guard !a.name.is_empty() with true in FileTypes::collect	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
-crates/luabox-types/src/env.rs:1670:34: replace match guard !c.name.is_empty() with true in TypeEnv::absorb_block	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
-crates/luabox-types/src/env.rs:1928:37: replace match guard !o.op.is_empty() with true in TypeEnv::absorb_block	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
-crates/luabox-types/src/env.rs:1960:33: replace match guard !e.name.is_empty() with true in TypeEnv::absorb_block	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
-crates/luabox-types/src/env.rs:2003:33: replace match guard !c.var.is_empty() with true in TypeEnv::absorb_block	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
-crates/luabox-types/src/env.rs:3945:34: replace match guard !c.name.is_empty() with true in carrier_var_classes	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
-crates/luabox-types/src/env.rs:1157:30: replace > with >= in TypeEnv::build_from_items	[defensive] whitespace-walk bound on the inline-@as anchor; anchor==0 needs a cast with no expression before it, which the grammar does not produce
-crates/luabox-types/src/env.rs:1160:27: replace > with >= in TypeEnv::build_from_items	[defensive] whitespace-walk bound on the inline-@as anchor; anchor==0 needs a cast with no expression before it, which the grammar does not produce
-crates/luabox-types/src/env.rs:3190:9: replace TypeEnv::typed_local_span -> Option<std::ops::Range<usize>> with None	[label] declared-here span for the duplicate-field note; suites assert codes, not label spans
-crates/luabox-types/src/env.rs:3238:9: replace TypeEnv::is_class -> bool with true	[equivalent] measured, not assumed: two candidate separating shapes (alias-typed local from a literal, alias-typed parameter) behave identically under the mutation — alias reads take the shape/alias arms, so the Named-absence arm this gates appears to see only real class names in practice; the alias leniency itself is now pinned in undefined_field.rs either way
-crates/luabox-types/src/env.rs:3852:22: replace && with || in class_param_unification	[equivalent] with || the guard admits only cases whose rename map is the identity (own==canonical) or empty (own empty) — a no-op substitution either way
-crates/luabox-types/src/env.rs:2097:9: replace TypeEnv::attach_typed_functions with ()	[gap] measured twice: the dotted call-site probe passes in BOTH worlds — the local-table shape path independently checks these calls, so the attachment's only unshared consumers are cross-crate dotted-name lookups with no shape in scope; a defs-path probe is the remaining kill candidate
-crates/luabox-types/src/env.rs:2111:16: delete ! in TypeEnv::attach_typed_functions	[gap] measured twice: the dotted call-site probe passes in BOTH worlds — the local-table shape path independently checks these calls, so the attachment's only unshared consumers are cross-crate dotted-name lookups with no shape in scope; a defs-path probe is the remaining kill candidate
-crates/luabox-types/src/env.rs:3448:9: delete match arm Expr::Field(field) in assign_target_name	[gap] measured twice: the dotted call-site probe passes in BOTH worlds — the local-table shape path independently checks these calls, so the attachment's only unshared consumers are cross-crate dotted-name lookups with no shape in scope; a defs-path probe is the remaining kill candidate
-crates/luabox-types/src/env.rs:1158:28: replace -= with /= in TypeEnv::build_from_items	[hang] the inline-@as anchor walk: `anchor /= 1` leaves anchor unchanged, so the whitespace-skip while-loop never terminates when the preceding byte is whitespace — detected only as a hang; the run timeout is the kill
+crates/luabox-types/src/env.rs:1722:34: replace match guard !c.name.is_empty() with true in TypeEnv::absorb_block	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
+crates/luabox-types/src/env.rs:1968:37: replace match guard !o.op.is_empty() with true in TypeEnv::absorb_block	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
+crates/luabox-types/src/env.rs:2000:33: replace match guard !e.name.is_empty() with true in TypeEnv::absorb_block	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
+crates/luabox-types/src/env.rs:2043:33: replace match guard !c.var.is_empty() with true in TypeEnv::absorb_block	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
+crates/luabox-types/src/env.rs:4088:34: replace match guard !c.name.is_empty() with true in carrier_var_classes	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
+crates/luabox-types/src/env.rs:1216:30: replace > with >= in TypeEnv::build_from_items	[defensive] whitespace-walk bound on the inline-@as anchor; anchor==0 needs a cast with no expression before it, which the grammar does not produce
+crates/luabox-types/src/env.rs:1219:27: replace > with >= in TypeEnv::build_from_items	[defensive] whitespace-walk bound on the inline-@as anchor; anchor==0 needs a cast with no expression before it, which the grammar does not produce
+crates/luabox-types/src/env.rs:3248:9: replace TypeEnv::typed_local_span -> Option<std::ops::Range<usize>> with None	[label] declared-here span for the duplicate-field note; suites assert codes, not label spans
+crates/luabox-types/src/env.rs:3296:9: replace TypeEnv::is_class -> bool with true	[equivalent] measured, not assumed: two candidate separating shapes (alias-typed local from a literal, alias-typed parameter) behave identically under the mutation — alias reads take the shape/alias arms, so the Named-absence arm this gates appears to see only real class names in practice; the alias leniency itself is now pinned in undefined_field.rs either way
+crates/luabox-types/src/env.rs:3995:22: replace && with || in class_param_unification	[equivalent] with || the guard admits only cases whose rename map is the identity (own==canonical) or empty (own empty) — a no-op substitution either way
+crates/luabox-types/src/env.rs:2137:9: replace TypeEnv::attach_typed_functions with ()	[gap] measured twice: the dotted call-site probe passes in BOTH worlds — the local-table shape path independently checks these calls, so the attachment's only unshared consumers are cross-crate dotted-name lookups with no shape in scope; a defs-path probe is the remaining kill candidate
+crates/luabox-types/src/env.rs:2151:16: delete ! in TypeEnv::attach_typed_functions	[gap] measured twice: the dotted call-site probe passes in BOTH worlds — the local-table shape path independently checks these calls, so the attachment's only unshared consumers are cross-crate dotted-name lookups with no shape in scope; a defs-path probe is the remaining kill candidate
+crates/luabox-types/src/env.rs:3506:9: delete match arm Expr::Field(field) in assign_target_name	[gap] measured twice: the dotted call-site probe passes in BOTH worlds — the local-table shape path independently checks these calls, so the attachment's only unshared consumers are cross-crate dotted-name lookups with no shape in scope; a defs-path probe is the remaining kill candidate
+crates/luabox-types/src/env.rs:1217:28: replace -= with /= in TypeEnv::build_from_items	[hang] the inline-@as anchor walk: `anchor /= 1` leaves anchor unchanged, so the whitespace-skip while-loop never terminates when the preceding byte is whitespace — detected only as a hang; the run timeout is the kill

@@ -154,14 +154,19 @@ trip it.
 **The strictness ladder is the same as every other `LB03xx`.** `[types]
 strict = true` reports `error` (exit 1); `[types] strict = false` downgrades
 to `warning` (exit 0); `Strictness::None`, reachable programmatically but not
-from a manifest, reports nothing. Per-rule suppression uses luabox's own rule
-names — luals has no counterpart to borrow:
+from a manifest, reports nothing. Per-rule suppression names:
 
-| Code | `---@diagnostic disable[-line\|-next-line]:` name |
-|---|---|
-| `LB0317` | `class-ancestry-too-deep` |
-| `LB0318` | `cyclic-class-ancestry` |
-| `LB0319` | `class-ancestry-too-costly` |
+| Code | `---@diagnostic disable[-line\|-next-line]:` name | whose name |
+|---|---|---|
+| `LB0317` | `class-ancestry-too-deep` | luabox's own — luals has no depth budget to name |
+| `LB0318` | `circle-doc-class` | **luals'** — its own name for the same finding |
+| `LB0319` | `class-ancestry-too-costly` | luabox's own — luals has no cost budget to name |
+
+`LB0318` borrows luals' spelling because luals reports this shape too (see
+the measurement below), so the directive a luals user already writes silences
+LB0318 unchanged. It was `cyclic-class-ancestry` in pre-release drafts of this
+page, on an unmeasured claim that luals had no counterpart; the name was
+corrected before release, so nothing in the wild breaks.
 
 **Suppression is scoped to the file that DECLARES the class**, not the file
 that read it. All three diagnostics are anchored at the `---@class` line the
@@ -169,6 +174,19 @@ message names, so a directive has to sit in *that* file — a
 `disable-next-line` above the declaration, or a file-wide `disable` at the top
 of it. A directive in the file that merely consumes the class does nothing,
 even though that is where the error was reported from.
+
+**The cross-file form works under `luabox check` only.** When the declaration
+is in file A and the diagnostic is reported while checking file B, `luabox
+check` reads A's directives and suppresses it; the **language server does
+not** — it checks one open document at a time and never sees A's directives,
+so the editor keeps showing the diagnostic even though the CLI is green. This
+is the one measured exception to the editor/CLI parity claim made later in
+this page, it applies to all three ancestry codes, and it has no issue of its
+own yet — it belongs to the same LSP-parity family as
+[#70](https://github.com/flying-dice/luabox/issues/70). Same-file suppression
+behaves identically in both. No workaround beyond fixing the ancestry itself
+or suppressing from the file the editor has open, which only works when that
+is also the declaring file.
 
 The one exception is a class declared **only in a `[types] defs` package**.
 Nothing in the project declares it, and a definition package's own comments
@@ -181,12 +199,25 @@ A directive written next to the declaration inside the `.d.lua` has no effect:
 definition packages are not project sources and are never scanned for
 directives at all.
 
-**lua-language-server 3.13.5 reports nothing for any of these three shapes**
-(measured against the pinned binary). A deep chain, a cycle, and a conflicting
-generic diamond are all silently accepted there, so luabox is deliberately
-stricter on all three — a project clean under `lua-language-server --check`
-can fail `luabox check` on ancestry alone. `luabox explain LB0317` (and
-`LB0318`, `LB0319`) prints the full worked fix for each.
+**Measured against lua-language-server 3.13.5** (the pinned binary,
+`--checklevel=Warning`) — and the answer is not the same for all three:
+
+| shape | luals 3.13.5 | pinned by |
+|---|---|---|
+| a 260-link straight chain | **silent** — no depth budget at all | corpus row `deep_chain_over_depth_limit` (intentional divergence) |
+| `---@class A : A` | reports `circle-doc-class` | corpus row `cyclic_class_self` (agreement) |
+| `A : B` / `B : A` | reports `circle-doc-class` on both | corpus row `cyclic_class_mutual` (agreement) |
+| a conflicting generic diamond | silent — 3.13.5 has no generic classes at all | not separately pinned; see the generics rows |
+
+So LB0317 and LB0319 are luabox being deliberately stricter (a project clean
+under `lua-language-server --check` can fail `luabox check` on depth or cost
+alone), while **LB0318 is parity** — both tools reject a cyclic `---@class`.
+An earlier draft of this page said luals "reports nothing for any of these
+three shapes"; the cycle half of that was asserted rather than measured, and
+is false. The corpus rows above are the measurement, re-derived on every run
+of `scripts/tests/luals-differential.sh` rather than restated here.
+`luabox explain LB0317` (and `LB0318`, `LB0319`) prints the full worked fix
+for each.
 
 ### Malformed `---@class` headers give no diagnostic at the declaration (round 6 review M66 — [#69](https://github.com/flying-dice/luabox/issues/69))
 
@@ -223,10 +254,13 @@ code is assigned for this condition yet. It is tracked as
 this section said the tracking issue was "not yet filed", which was true when
 written and is not now.
 `crates/luabox-types/tests/class_merge_precedence_matrix.rs`'s
-`malformed_class_headers_m66` test (`#[ignore]`d) pins today's measured
-behaviour, including the `A : P,` correction above, so a regression on either
-side is visible the day someone runs it by hand, and so there is a concrete
-check to update once the harvest fix lands.
+`malformed_class_headers_m66` test pins today's measured behaviour, including
+the `A : P,` correction above, so a regression on either side is visible and
+there is a concrete check to update once the harvest fix lands. That test is
+executed by CI as of round 8 — an earlier edition of this line said it was
+`#[ignore]`d and that a regression would surface "the day someone runs it by
+hand", which is not a pin at all: a claim backed only by a test nothing runs
+can go stale green (round 8 review F10).
 
 ### LuaCATS tags: the full vocabulary is enforced
 
@@ -934,6 +968,18 @@ workspace-global identity, which is what luals resolves a require to — and
 hover/completion resolve class members through the **same merged ambient
 environment** the checker enforces, so the editor cannot offer what
 `luabox check` rejects or omit what it accepts.
+
+**One measured exception, on suppression rather than resolution.** A
+`---@diagnostic disable: class-ancestry-too-deep` / `circle-doc-class` /
+`class-ancestry-too-costly` written in the file that DECLARES the class
+silences the diagnostic under `luabox check` but not in the editor: the
+language server checks one document at a time and cannot read the declaring
+file's directives, so it emits what the CLI has been told to drop. The
+resolution claim above is unaffected — the same members resolve the same way
+in both — but "the editor omits what `luabox check` accepts" does not hold
+for cross-file-suppressed ancestry diagnostics. Detail and scope are in the
+ancestry-limits section above; no issue of its own yet, same LSP-parity
+family as [#70](https://github.com/flying-dice/luabox/issues/70).
 
 The table below is still measured, not assumed — the same fixtures pin the
 new behaviour: `crates/luabox-cli/tests/features/lsp/hover-require.feature`

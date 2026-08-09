@@ -1288,6 +1288,14 @@ class per row. Flatten the hierarchy, or declare the members you actually
 read on a class nearer the leaf. A genuine cycle (`A : B`, `B : A`) is
 LB0318, not this, and terminates safely on its own.
 
+**luabox-only.** lua-language-server 3.13.5 reports nothing on a straight
+inheritance chain of 260 links — measured directly against the pinned binary
+at `--checklevel=Warning`, and pinned as the `luals` column of the
+`luals-differential` corpus row `deep_chain_over_depth_limit`, an intentional
+divergence. luals resolves such a chain without a depth budget, so a project
+clean under `lua-language-server --check` can fail `luabox check` on this
+code alone. (LB0318, the cycle case, is the opposite: luals reports it too.)
+
 **Escape hatches.** `[types] strict = false` downgrades it to a warning, and
 `---@diagnostic disable[-line|-next-line]: class-ancestry-too-deep`
 suppresses it. Both silence the diagnostic without restoring the missing
@@ -1310,8 +1318,19 @@ names, so that is the line a directive has to reach:
 local c = {}
 ```
 
-This holds across files: a class another project file declares is suppressed
-from *that* file, not from the one whose check reported it.
+This holds across files **under `luabox check`**: a class another project file
+declares is suppressed from *that* file, not from the one whose check reported
+it.
+
+**Editor caveat — cross-file suppression is CLI-only today.** The language
+server checks one open document at a time and has no way to read the
+declaring file's directives, so it never suppresses a diagnostic whose
+`---@class` line lives in another file. Concretely: the directive above
+greens `luabox check`, and the editor keeps showing LB0317 on the consuming
+file until the limit itself is fixed. Same-file suppression works in both.
+This is an editor/CLI parity gap in the same family as
+<https://github.com/flying-dice/luabox/issues/70>; it has no issue of its own
+yet.
 
 **The exception: a class declared only in a `[types] defs` package.** Nothing
 in the project declares it, and a definition package's own comments are never
@@ -1355,12 +1374,18 @@ is the class axis.
 refer to each other, that is a *field* relationship, not an inheritance one
 — `---@field other B` on `A` is fine and is not a cycle.
 
-**Note.** lua-language-server 3.13.5 reports nothing for either shape;
-luabox is deliberately stricter here. `[types] strict = false` downgrades it
-to a warning, and `---@diagnostic disable[-line|-next-line]:
-cyclic-class-ancestry` suppresses it. The rule name is luabox's own rather
-than a luals one, for the same reason LB0317's is: luals has no counterpart
-to name.
+**Parity with lua-language-server.** luals 3.13.5 reports `circle-doc-class`
+(\"Circularly inherited classes\") on both shapes above — the self-parent and
+the mutual pair — at its default check level. This is not luabox being
+stricter; the two tools agree that a cyclic `---@class` is a finding, and the
+`luals-differential` corpus rows `cyclic_class_self` and `cyclic_class_mutual`
+measure that agreement against the pinned binary rather than asserting it.
+(LB0317 and LB0319 *are* luabox-only; this one is not.)
+
+**Escape hatches.** `[types] strict = false` downgrades it to a warning, and
+`---@diagnostic disable[-line|-next-line]: circle-doc-class` suppresses it.
+That name is luals' own, so the directive you already write for
+`circle-doc-class` silences LB0318 unchanged — no second vocabulary.
 
 **Where the directive goes: the file that DECLARES the class**, not the file
 that reads it — the diagnostic is anchored at the `---@class` line the
@@ -1369,17 +1394,22 @@ mutual `A : B` / `B : A` spanning two files needs the directive in both:
 
 ```lua
 -- node.lua — where `Node` is declared
----@diagnostic disable-next-line: cyclic-class-ancestry
+---@diagnostic disable-next-line: circle-doc-class
 ---@class Node : Node
 ```
 
 A directive in a file that merely *reads* `Node` does nothing.
 
+**Editor caveat.** Cross-file suppression is honoured by `luabox check` only
+— the language server has no view of the declaring file's directives, so a
+cycle declared elsewhere stays red in the editor until the cycle is broken.
+Same as LB0317; see `luabox explain LB0317` for the detail.
+
 **The exception: a class declared only in a `[types] defs` package.** Nothing
 in the project declares it, and a definition package's own comments are never
 scanned for directives, so the diagnostic attaches to **line 1 of each
 consuming file** instead. Put a file-wide `---@diagnostic disable:
-cyclic-class-ancestry` at the top of that file, or a `disable-line` on line 1.
+circle-doc-class` at the top of that file, or a `disable-line` on line 1.
 ";
 
 const LB0319: &str = "\
@@ -1430,8 +1460,9 @@ the diamond, not the shared ancestor it kept re-resolving:
 ```
 
 A directive in a file that merely *reads* `C1` does nothing, and this holds
-across files: a class another project file declares is suppressed from *that*
-file.
+across files **under `luabox check`**: a class another project file declares
+is suppressed from *that* file. The editor does not honour the cross-file
+form — see the caveat under `luabox explain LB0317`.
 
 **The exception: a class declared only in a `[types] defs` package.** Nothing
 in the project declares it, and a definition package's own comments are never

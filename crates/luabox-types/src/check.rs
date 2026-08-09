@@ -2146,18 +2146,12 @@ pub(crate) fn duplicate_doc_fields_with_ambient(
         let mut current: Option<String> = None;
         // The type parameters this doc block's own annotations may name —
         // a generic class's `<T, U>` and any `---@generic` on the block.
-        // Mirrors `env::block_generics`, which is private to that module and
-        // so cannot be shared with this one without widening it.
-        lowerer.generics = item
-            .block
-            .tags
-            .iter()
-            .flat_map(|tag| match tag {
-                Tag::Generic(g) => g.params.iter().map(|p| p.name.clone()).collect(),
-                Tag::Class(c) => c.params.clone(),
-                _ => Vec::new(),
-            })
-            .collect();
+        // One owner (`env::block_generics`, round 8 review F21): this pass
+        // and `TypeEnv` lower the same `---@field [K] V` indexer keys, and a
+        // generic name one treats as a `Ty::Named` placeholder while the
+        // other lowers to `unknown` makes two keys that are the same key
+        // look different — LB0311 then fires or misses per seam.
+        lowerer.generics = crate::env::block_generics(item);
         for tag in &item.block.tags {
             match tag {
                 Tag::Class(c) if !c.name.is_empty() => current = Some(c.name.clone()),
