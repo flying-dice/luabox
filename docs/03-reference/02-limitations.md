@@ -37,6 +37,11 @@ every `doc.class` set carrying the name). A class carried more than once
 (`---@class Two` over two different tables) collects the members of both
 carriers.
 
+The union is what the cycle check (`LB0318`, below) walks too: `---@class W`
+followed by `---@class W : W` is a cycle, because `W`'s parents are the union
+of both declarations — it was not, for one release candidate, and the shape
+was silent in luabox while luals reported it.
+
 A same-name **field** declared twice is where luabox and luals part company.
 Within one file luabox keeps the **first** declaration — inside one
 `---@class` block or a second block for the same class — and warns at the
@@ -213,20 +218,27 @@ directives at all.
 | `---@class A : A` | reports `circle-doc-class` | corpus row `cyclic_class_self` (agreement) |
 | `A : B` / `B : A` | reports `circle-doc-class` on both | corpus row `cyclic_class_mutual` (agreement) |
 | a cyclic class **nothing references** | reports `circle-doc-class` — its check is declaration-driven | corpus row `cyclic_class_unreferenced` (agreement) |
+| a class declared plainly and **reopened** with a back-edge (`---@class W` then `---@class W : W`) | reports `circle-doc-class` **once**, on the reopening declaration | corpus row `cyclic_class_reopened` (agreement) |
+| the same cyclic class declared in **two files** | reports `circle-doc-class` **twice**, one per declaration | `check_cmd::tests::a_cyclic_class_declared_in_two_files_reports_once_per_declaration` (the corpus compares the code *set*, never the count) |
 | a conflicting generic diamond | silent — 3.13.5 has no generic classes at all | not separately pinned; see the generics rows |
 
 So LB0317 and LB0319 are luabox being deliberately stricter (a project clean
 under `lua-language-server --check` can fail `luabox check` on depth or cost
 alone), while **LB0318 is parity** — both tools reject a cyclic `---@class`,
 and both reject it **from the declaration alone**, whether or not anything in
-the project ever resolves the class. An earlier draft of this page said luals
-"reports nothing for any of these three shapes"; the cycle half of that was
-asserted rather than measured, and is false. A later one claimed the parity
-flatly while luabox's own LB0318 came only from a resolution walk, so a
-cyclic class in an unreferenced types file was flagged by the editor and
-green in `luabox check`; the CLI now finds cycles syntactically, in the
-declared `---@class` graph, before anything is resolved. The corpus rows
-above are the measurement, re-derived on every run of
+the project ever resolves the class, on **both** luabox surfaces: `luabox
+check` and the language server run the same declared-graph cycle pass, so a
+cycle is never red in one and green in the other. Attribution matches too:
+one diagnostic per declaration that carries a cycle edge, which is why the
+reopened row above is one and the two-file row is two. An earlier draft of
+this page said luals "reports nothing for any of these three shapes"; the
+cycle half of that was asserted rather than measured, and is false. A later
+one claimed the parity flatly while luabox's own LB0318 came only from a
+resolution walk, so a cyclic class in an unreferenced types file was flagged
+by the editor and green in `luabox check`. The round after that closed the
+CLI half only, and the divergence simply changed sign — CI red, editor green
+— until the cycle pass moved into `luabox-types` where both surfaces run it.
+The corpus rows above are the measurement, re-derived on every run of
 `scripts/tests/luals-differential.sh` rather than restated here.
 `luabox explain LB0317` (and `LB0318`, `LB0319`) prints the full worked fix
 for each.

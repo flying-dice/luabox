@@ -60,6 +60,7 @@
 
 mod assign;
 mod check;
+mod class_graph;
 mod codes;
 mod defs;
 mod directive;
@@ -72,6 +73,13 @@ pub mod ty;
 mod version;
 
 pub use assign::{Exactness, assignable};
+// The declaration-driven `LB0318` seam — the algorithm, the report-site rule
+// and the message, owned here because BOTH `luabox check` and the LSP run it
+// (round 12 review R12-1: it shipped inside `luabox-cli`, so the editor was
+// silent on the exact fixture the feature targets).
+pub use class_graph::{
+    CYCLIC_CLASS_LABEL, ClassCycleSite, ClassGraph, class_cycles, cyclic_class_message,
+};
 pub use codes::{CLASS_COST_LIMIT, CLASS_DEPTH_LIMIT, CYCLIC_CLASS};
 pub use defs::{
     Ambient, DefFile, alias_collisions, build_ambient, build_ambient_checked, stdlib as stdlib_defs,

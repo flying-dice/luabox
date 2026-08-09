@@ -718,14 +718,15 @@ fn class_ancestry_precheck(files: &[SourceFile], strictness: Strictness) -> Ance
         Severity::Warning
     };
 
-    let ClassGraph {
-        declared_at,
-        parents_of,
-    } = harvest_class_graph(files);
+    let HarvestedClasses { declared_at, graph } = harvest_class_graph(files);
+    // The union of every declaration's parents (`ClassGraph::parents`), not
+    // the first declaration's alone — round 12 review R12-2, and the
+    // semantics `docs/03-reference/02-limitations.md` already documents for
+    // a reopened class. Both halves of this pre-check walk it.
+    let parents_of = graph.parents();
     // One scan per file, shared by both halves of the pre-check below.
     let mut directives = DirectiveCache::default();
-    let mut precheck =
-        cyclic_class_diagnostics(files, &declared_at, &parents_of, severity, &mut directives);
+    let mut precheck = cyclic_class_diagnostics(files, &graph, severity, &mut directives);
     let depth = class_depths(&parents_of);
     // [`class_depths`] counts EDGES to the deepest root; the limit counts
     // CLASSES on the resolution path, and `DiamondGuard`'s path includes the
@@ -856,8 +857,17 @@ fn class_ancestry_precheck(files: &[SourceFile], strictness: Strictness) -> Ance
 /// declarations of the mutual shape. luals is declaration-driven; so is
 /// this. The corpus pins it as `cyclic_class_unreferenced`.
 ///
-/// Same graph as the depth half — [`harvest_class_graph`]'s `declared_at` /
-/// `parents_of`, project files only — and the same three properties:
+/// The graph, the strongly-connected-component walk, the choice of which
+/// declaration sites report and the message text are **not** this module's
+/// (round 12 review R12-1): they live in [`luabox_types::ClassGraph`], which
+/// `luabox-lsp` runs over the same workspace on every publish. A cycle check
+/// that only `luabox check` runs is the editor/CLI split this repo treats as
+/// blocking, inverted — CI red on a fixture the editor calls clean. What
+/// stays here is what is genuinely this surface's: the harvest, the
+/// severity ladder, the `---@diagnostic` suppression scan, and the `covered`
+/// hand-off to the resolver-side drain.
+///
+/// So, per cycle site [`luabox_types::ClassGraph::cycle_sites`] hands back:
 ///
 /// - the strictness ladder (`Error` under `[types] strict = true`,
 ///   `Warning` otherwise, nothing under [`Strictness::None`], applied by the
@@ -865,179 +875,66 @@ fn class_ancestry_precheck(files: &[SourceFile], strictness: Strictness) -> Ance
 /// - `---@diagnostic disable[-line|-next-line]: circle-doc-class` in the
 ///   **declaring** file, honored through [`luabox_types::DirectiveScan`] —
 ///   luals' own rule name ([`luabox_types::RULE_CIRCLE_DOC_CLASS`]), not a
-///   luabox-only spelling,
-/// - a `covered` set of every cycle member's declaration site, so
+///   luabox-only spelling — and per DECLARATION, so disabling one
+///   declaration of a reopened class leaves the other reported,
+/// - a `covered` set of every cycle member's declaration site — the
+///   non-reporting ones included — so
 ///   [`merge_ancestry_precheck_diagnostics`] drops the resolver-side
-///   rediscovery of a cycle already named here and one class stays one
+///   rediscovery of a cycle already named here and one declaration stays one
 ///   diagnostic across BOTH mechanisms.
 ///
-/// Cycles are found as strongly connected components
-/// ([`cyclic_class_groups`]), not by looking for a literal self-edge: a
-/// mutual `A : B` / `B : A` is a cycle no single declaration contains, and
-/// every member of it is its own ancestor. Each member is reported once, at
-/// its own declaration, naming the other members — which is both what luals
-/// does and what makes the finding actionable when the loop is closed three
-/// files away from the class you are reading.
+/// Cycles are found as strongly connected components, not by looking for a
+/// literal self-edge: a mutual `A : B` / `B : A` is a cycle no single
+/// declaration contains, and every member of it is its own ancestor. One
+/// diagnostic per **declaration that carries a cycle edge**, naming the other
+/// members — measured to be exactly what luals does, including the count
+/// when a cyclic class is declared twice (see the seam's module doc for the
+/// measurement table).
 fn cyclic_class_diagnostics(
     files: &[SourceFile],
-    declared_at: &HashMap<String, (usize, luacats::Span)>,
-    parents_of: &HashMap<String, Vec<String>>,
+    graph: &luabox_types::ClassGraph,
     severity: Severity,
     directives: &mut DirectiveCache,
 ) -> AncestryPreCheck {
     let mut precheck = AncestryPreCheck::default();
-    for group in cyclic_class_groups(parents_of) {
-        // Deterministic regardless of `HashMap` iteration order, matching
-        // the depth half: report in declaring-span order.
-        let mut members: Vec<&str> = group.clone();
-        members.sort_by_key(|name| declared_at.get(*name).map(|&(idx, span)| (idx, span.start)));
-        for name in members {
-            let Some(&(file_idx, span)) = declared_at.get(name) else {
-                // A cycle member with no in-project declaration cannot be
-                // pointed at here; the resolver-side drain's ambient tier
-                // (`report_ancestry_hits`'s third arm) still reports it,
-                // which is why it is deliberately NOT added to `covered`.
-                continue;
-            };
-            let file = &files[file_idx];
-            precheck.covered.insert((
-                LB0318_CIRCLE_DOC_CLASS.number(),
-                file.rel.clone(),
-                span.start,
-                span.end,
-            ));
-            if directives.suppresses(files, file_idx, luabox_types::RULE_CIRCLE_DOC_CLASS, span) {
-                continue;
-            }
-            let others: Vec<String> = group
-                .iter()
-                .filter(|member| **member != name)
-                .map(|member| format!("`{member}`"))
-                .collect();
-            let tail = if others.is_empty() {
-                ": it lists itself as its own `---@class` parent".to_owned()
-            } else {
-                format!(": the cycle runs back to it through {}", others.join(", "))
-            };
-            precheck.diags.push(
-                Diagnostic::new(
-                    LB0318_CIRCLE_DOC_CLASS,
-                    severity,
-                    format!(
-                        "`{name}`'s `---@class` ancestry is cyclic{tail} — break the cycle: a \
-                         class cannot extend itself, directly or through its ancestors, and \
-                         members past the back-edge are not in the resolved shape"
-                    ),
-                )
-                .with_label(Label::primary(
-                    Span::new(file.rel.as_str(), span.start..span.end),
-                    "`---@class` reachable from its own parent list",
-                )),
-            );
-        }
-    }
-    precheck
-}
-
-/// Every set of `---@class` names that is reachable from itself along
-/// declared parent edges — the strongly connected components of `parents_of`
-/// with a cycle in them, each returned sorted, the whole list sorted, so the
-/// answer does not depend on `HashMap` iteration order.
-///
-/// Tarjan's algorithm, driven by an **explicit stack** rather than native
-/// recursion, for exactly the reason [`class_depths`] is: this walk runs over
-/// input a user controls the depth of, and a pre-check that overflows the
-/// stack on a pathological hierarchy is worse than no pre-check at all.
-///
-/// A single-node component counts only when the class names itself as its
-/// own parent (`---@class A : A`); every other single node is an ordinary,
-/// acyclic class.
-fn cyclic_class_groups(parents_of: &HashMap<String, Vec<String>>) -> Vec<Vec<&str>> {
-    /// One node's state on the explicit DFS stack: which class, and how many
-    /// of its parents have been visited so far.
-    #[derive(Clone, Copy)]
-    struct Frame<'a> {
-        name: &'a str,
-        next_parent: usize,
-    }
-
-    let mut index: HashMap<&str, usize> = HashMap::new();
-    let mut low: HashMap<&str, usize> = HashMap::new();
-    let mut on_stack: HashSet<&str> = HashSet::new();
-    let mut component: Vec<&str> = Vec::new();
-    let mut next_index = 0;
-    let mut groups: Vec<Vec<&str>> = Vec::new();
-
-    let mut roots: Vec<&str> = parents_of.keys().map(String::as_str).collect();
-    roots.sort_unstable();
-    for root in roots {
-        if index.contains_key(root) {
+    for site in graph.cycle_sites() {
+        let Some(file) = files.get(site.file) else {
+            // Unreachable while the only builder of this graph is
+            // `harvest_class_graph`, which indexes into this very slice —
+            // degrade rather than index-panic if a second one ever appears.
+            continue;
+        };
+        precheck.covered.insert((
+            LB0318_CIRCLE_DOC_CLASS.number(),
+            file.rel.clone(),
+            site.span.start,
+            site.span.end,
+        ));
+        if !site.reports {
+            // An innocent second declaration of a cyclic class: accounted
+            // for above, but not a site luals reports, so not one this does.
             continue;
         }
-        index.insert(root, next_index);
-        low.insert(root, next_index);
-        next_index += 1;
-        component.push(root);
-        on_stack.insert(root);
-        let mut frames = vec![Frame {
-            name: root,
-            next_parent: 0,
-        }];
-        while let Some(top) = frames.len().checked_sub(1) {
-            let Frame { name, next_parent } = frames[top];
-            let parents = parents_of.get(name).map_or(&[][..], Vec::as_slice);
-            if let Some(parent) = parents.get(next_parent).map(String::as_str) {
-                frames[top].next_parent += 1;
-                if let Some(&parent_index) = index.get(parent) {
-                    if on_stack.contains(parent) {
-                        let updated = low[name].min(parent_index);
-                        low.insert(name, updated);
-                    }
-                } else {
-                    index.insert(parent, next_index);
-                    low.insert(parent, next_index);
-                    next_index += 1;
-                    component.push(parent);
-                    on_stack.insert(parent);
-                    frames.push(Frame {
-                        name: parent,
-                        next_parent: 0,
-                    });
-                }
-                continue;
-            }
-            // Every parent visited: this node is finished. If it is the root
-            // of a component, everything above it on the component stack is
-            // that component.
-            let name_low = low[name];
-            if name_low == index[name] {
-                let mut group: Vec<&str> = Vec::new();
-                while let Some(member) = component.pop() {
-                    on_stack.remove(member);
-                    group.push(member);
-                    if member == name {
-                        break;
-                    }
-                }
-                let self_parent = parents_of
-                    .get(name)
-                    .into_iter()
-                    .flatten()
-                    .any(|parent| parent == name);
-                if group.len() > 1 || self_parent {
-                    group.sort_unstable();
-                    groups.push(group);
-                }
-            }
-            frames.pop();
-            if let Some(caller) = frames.last() {
-                let updated = low[caller.name].min(name_low);
-                low.insert(caller.name, updated);
-            }
+        let span = luacats::Span {
+            start: site.span.start,
+            end: site.span.end,
+        };
+        if directives.suppresses(files, site.file, luabox_types::RULE_CIRCLE_DOC_CLASS, span) {
+            continue;
         }
+        precheck.diags.push(
+            Diagnostic::new(
+                LB0318_CIRCLE_DOC_CLASS,
+                severity,
+                luabox_types::cyclic_class_message(&site.name, &site.others),
+            )
+            .with_label(Label::primary(
+                Span::new(file.rel.as_str(), site.span.clone()),
+                luabox_types::CYCLIC_CLASS_LABEL,
+            )),
+        );
     }
-    groups.sort();
-    groups
+    precheck
 }
 
 /// What [`class_ancestry_precheck`] hands back: the diagnostics it wants
@@ -1161,19 +1058,34 @@ fn deepest_descendants<'a>(
     deepest
 }
 
-/// Every `---@class` the project declares, as the two maps
-/// [`class_ancestry_precheck`] walks: name -> (declaring file index,
-/// declaring span), and name -> every named parent (a bare `Name`, not a
-/// union/table/generic-argument expression). First declaration of a name
-/// wins, matching this module's other project-wide merges
+/// Every `---@class` the project declares, in the two shapes
+/// [`class_ancestry_precheck`]'s halves walk: the shared
+/// [`luabox_types::ClassGraph`] — **every** declaration of every name, which
+/// is what the cycle half attributes per declaration and what unions their
+/// parents (round 12 review R12-2) — and, for the depth half, name ->
+/// (declaring file index, declaring span) with the first declaration
+/// winning, matching this module's other project-wide merges
 /// (`with_project_types`'s "defs win").
+///
+/// The depth half stays first-wins on purpose: it reports one link per
+/// over-limit CHAIN (round 6 review M17, re-measured by the per-link-flood
+/// finding), so a reopened class is one chain and one report wherever it was
+/// first declared. The cycle half is per-declaration because that is what
+/// the oracle does — measured, `---@class R : R` in two files draws two
+/// `circle-doc-class` from luals, and a reopened class draws one, on the
+/// declaration that closes the loop.
+///
+/// The same parents-of-a-declaration filter feeds both: a parent expressed
+/// as anything other than a bare `Name` (a union, a table literal, a generic
+/// argument) is not an edge either half follows — it under-counts rather
+/// than duplicating `luabox-types`' own resolution.
 ///
 /// An empty name is not a declaration at all and is dropped on both sides —
 /// see [`class_ancestry_precheck`]'s doc comment for what folding every
 /// bare `---@class` typo in a project into one synthetic node cost.
-fn harvest_class_graph(files: &[SourceFile]) -> ClassGraph {
+fn harvest_class_graph(files: &[SourceFile]) -> HarvestedClasses {
     let mut declared_at: HashMap<String, (usize, luacats::Span)> = HashMap::new();
-    let mut parents_of: HashMap<String, Vec<String>> = HashMap::new();
+    let mut graph = luabox_types::ClassGraph::default();
     for (file_idx, file) in files.iter().enumerate() {
         for item in file.artifacts.items() {
             for tag in &item.block.tags {
@@ -1186,7 +1098,10 @@ fn harvest_class_graph(files: &[SourceFile]) -> ClassGraph {
                 declared_at
                     .entry(class.name.clone())
                     .or_insert((file_idx, class.span));
-                parents_of.entry(class.name.clone()).or_insert_with(|| {
+                graph.declare(
+                    &class.name,
+                    file_idx,
+                    class.span.start..class.span.end,
                     class
                         .parents
                         .iter()
@@ -1196,24 +1111,24 @@ fn harvest_class_graph(files: &[SourceFile]) -> ClassGraph {
                             }
                             _ => None,
                         })
-                        .collect()
-                });
+                        .collect(),
+                );
             }
         }
     }
-    ClassGraph {
-        declared_at,
-        parents_of,
-    }
+    HarvestedClasses { declared_at, graph }
 }
 
 /// The project's declared `---@class` inheritance graph, as
 /// [`harvest_class_graph`] reads it off the harvested annotations.
-struct ClassGraph {
-    /// Class name -> the file index and span of its first declaration.
+struct HarvestedClasses {
+    /// Class name -> the file index and span of its **first** declaration —
+    /// the depth half's report site.
     declared_at: HashMap<String, (usize, luacats::Span)>,
-    /// Class name -> the names of every parent it declares by bare name.
-    parents_of: HashMap<String, Vec<String>>,
+    /// Every declaration of every class, the shape the shared cycle seam
+    /// (and, through [`luabox_types::ClassGraph::parents`], the depth half's
+    /// unioned edge set) walks.
+    graph: luabox_types::ClassGraph,
 }
 
 /// The ancestor-chain depth of every class named as a key or a value in
@@ -1833,13 +1748,26 @@ mod tests {
     /// Run `body` on its own thread and fail — fast — if it has not finished
     /// within [`BOUND`]. `what` completes the sentence "…must finish within
     /// the bound: ".
+    /// The two failure modes are told apart, not both reported as the slow
+    /// one (round 12 review): `Disconnected` means the worker dropped its
+    /// sender without sending — it panicked, in microseconds — and blaming
+    /// that on a timeout it never came close to hitting is exactly the
+    /// caught-vs-timeout confusion this helper exists to protect in the
+    /// mutants gate.
     fn run_bounded<T: Send + 'static>(what: &str, body: impl FnOnce() -> T + Send + 'static) -> T {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(body());
         });
-        rx.recv_timeout(BOUND)
-            .unwrap_or_else(|_| panic!("{what} must finish within {BOUND:?}"))
+        match rx.recv_timeout(BOUND) {
+            Ok(value) => value,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("{what} must finish within {BOUND:?}")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("{what} panicked (see the worker thread's own message above)")
+            }
+        }
     }
 
     /// [`check_diagnostics`] under [`run_bounded`], for the k=190
@@ -2957,10 +2885,222 @@ mod tests {
             diags.iter().all(|d| d.code == LB0318_CIRCLE_DOC_CLASS),
             "{diags:?}"
         );
+        // BOTH messages, not just the first: "each member names the others"
+        // is a claim about every diagnostic in the pair, and asserting it on
+        // `diags[0]` alone leaves the second free to name the wrong class —
+        // or the same one twice (round 12 review, clean-code note).
         assert!(
-            diags[0].message.contains("`Ring`") && diags[0].message.contains("`Loop`"),
-            "each member names the other members of its cycle: {diags:?}"
+            diags[0].message.contains("`Ring`'s") && diags[0].message.contains("through `Loop`"),
+            "the first names itself and its partner: {diags:?}"
         );
+        assert!(
+            diags[1].message.contains("`Loop`'s") && diags[1].message.contains("through `Ring`"),
+            "and so does the second: {diags:?}"
+        );
+    }
+
+    // -- union harvest and per-declaration attribution (R12-2) ------------
+
+    #[test]
+    fn a_reopened_class_closes_the_cycle_at_the_declaration_that_carries_the_back_edge() {
+        // R12-2. `harvest_class_graph` was first-declaration-wins, so a
+        // class declared plainly and then REOPENED with a back-edge onto
+        // itself harvested `Widget -> []` from the first declaration and the
+        // `: Widget` edge was dropped: `luabox check` green, luals red.
+        // Redeclaration is not rejected — it merges, and this repo's own
+        // limitations page documents that two `---@class` declarations of a
+        // name union their parents, "which is what luals does". The cycle
+        // graph now unions them too.
+        //
+        // Attribution measured against the pinned luals 3.13.5 (2026-08-09,
+        // `--checklevel=Warning`) on this exact source: ONE
+        // `circle-doc-class`, on the SECOND declaration — the one carrying
+        // the edge. The plain first declaration draws nothing.
+        let files = [source_file(
+            "main.lua",
+            "---@class Widget\n---@class Widget : Widget\n",
+        )];
+        let diags = class_ancestry_precheck(&files, Strictness::Strict).diags;
+        assert_eq!(
+            diags.len(),
+            1,
+            "one per edge-carrying declaration: {diags:?}"
+        );
+        assert_eq!(diags[0].code, LB0318_CIRCLE_DOC_CLASS);
+        let label = diags[0].primary_label().expect("points at a declaration");
+        assert!(
+            label.span.range.start > "---@class Widget\n".len() - 1,
+            "the reopening declaration is the one reported, not the plain first one: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_cyclic_class_declared_in_two_files_reports_once_per_declaration() {
+        // The other half of R12-2's attribution axis: a cyclic class
+        // declared in K files draws K `circle-doc-class` from luals — one
+        // per declaration — where a per-CLASS answer would draw one.
+        // Measured against the pinned 3.13.5 on this exact pair of files:
+        // TWO hits, one in each.
+        //
+        // Pinned here rather than in the luals corpus deliberately: that
+        // driver compares the SET of codes a case reports, never the count,
+        // and a corpus row therefore cannot tell one LB0318 from two. The
+        // count is the whole finding, so it is asserted where counts exist.
+        let files = [
+            source_file("a.lua", "---@class Ring : Ring\n"),
+            source_file("b.lua", "---@class Ring : Ring\n"),
+        ];
+        let diags = class_ancestry_precheck(&files, Strictness::Strict).diags;
+        assert_eq!(diags.len(), 2, "one per declaration: {diags:?}");
+        let files_named: Vec<&str> = diags
+            .iter()
+            .filter_map(|d| d.primary_label().map(|l| l.span.file.as_str()))
+            .collect();
+        assert_eq!(files_named, vec!["a.lua", "b.lua"], "{diags:?}");
+    }
+
+    #[test]
+    fn an_innocent_second_declaration_of_a_cyclic_class_is_not_reported() {
+        // Measured: luals reports the declaration that closes the loop and
+        // NOT a second, innocent declaration of the same class — so the
+        // union that finds the cycle must not also flatten the attribution
+        // onto every declaration of a member.
+        let files = [source_file(
+            "main.lua",
+            "---@class Plain\n---@class A : Plain\n---@class A : B\n---@class B : A\n",
+        )];
+        let diags = class_ancestry_precheck(&files, Strictness::Strict).diags;
+        assert_eq!(diags.len(), 2, "`A : Plain` is not a cycle edge: {diags:?}");
+        let starts: Vec<usize> = diags
+            .iter()
+            .filter_map(|d| d.primary_label().map(|l| l.span.range.start))
+            .collect();
+        let innocent = "---@class Plain\n".len();
+        assert!(
+            starts.iter().all(|&start| start > innocent),
+            "the innocent `A : Plain` declaration must not be one of them: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_disable_over_one_declaration_leaves_the_other_reported() {
+        // Suppression is per declaration, because reporting is: silencing
+        // the reopening line of a class must not silence its partner's own
+        // declaration three lines down.
+        let files = [source_file(
+            "main.lua",
+            "---@diagnostic disable-next-line: circle-doc-class\n\
+             ---@class A : B\n---@class B : A\n",
+        )];
+        let diags = class_ancestry_precheck(&files, Strictness::Strict).diags;
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("`B`'s"), "{diags:?}");
+    }
+
+    // -- SCC shapes end to end (R12-3) ------------------------------------
+
+    #[test]
+    fn an_acyclic_hierarchy_reports_no_cycle_and_a_three_cycle_reports_all_three() {
+        // The over-report guard and the ≥3-node shape, through the real
+        // `luabox check` pipeline rather than the seam's own unit tests
+        // (`luabox_types::class_graph`): a diamond, a chain and an innocent
+        // subclass of a cyclic class all sit in the same project as a
+        // three-class ring, and exactly the ring's three members are
+        // reported. Measured against the pinned luals 3.13.5: zero
+        // `circle-doc-class` for the diamond, three for the ring, none for
+        // the subclass hanging off it.
+        let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
+        write(
+            tmp.path(),
+            "src/main.lua",
+            "---@class Top\n---@class Left : Top\n---@class Right : Top\n\
+             ---@class Bottom : Left, Right\n\
+             ---@class TriA : TriB\n---@class TriB : TriC\n---@class TriC : TriA\n\
+             ---@class SubOfRing : TriA\n",
+        );
+        let diags = check_diagnostics(tmp.path());
+        let cyclic: Vec<&Diagnostic> = diags
+            .iter()
+            .filter(|d| d.code == LB0318_CIRCLE_DOC_CLASS)
+            .collect();
+        assert_eq!(cyclic.len(), 3, "the ring, and only the ring: {diags:?}");
+        for name in ["TriA", "TriB", "TriC"] {
+            assert_eq!(
+                cyclic
+                    .iter()
+                    .filter(|d| d.message.contains(&format!("`{name}`'s")))
+                    .count(),
+                1,
+                "{name} once: {cyclic:?}"
+            );
+        }
+        assert!(
+            !cyclic.iter().any(|d| d.message.contains("`SubOfRing`")
+                || d.message.contains("`Bottom`")
+                || d.message.contains("`Top`")),
+            "reachable from a cycle is not the same as being in one: {cyclic:?}"
+        );
+    }
+
+    // -- the covered set is keyed by CODE, not span alone (R12-4) ---------
+
+    #[test]
+    fn a_class_that_is_both_cyclic_and_too_deep_reports_both_codes_at_its_declaration() {
+        // R11-1 code-keyed `AncestryPreCheck::covered` for exactly this
+        // shape and nothing exercised it (round 12 review R12-4). One
+        // declaration, two independent facts: `Ring` lists ITSELF as a
+        // parent (LB0318, found syntactically here) and also inherits the
+        // bottom of a 200-class chain, which the RESOLVER's `DiamondGuard`
+        // refuses to walk (LB0317, "too deep to resolve safely" — the
+        // drain's wording, not this pre-check's).
+        //
+        // The pre-check's own depth walk stops at the back-edge and records
+        // `Ring` at depth 0, so it never covers this span under LB0317 — the
+        // resolver is the only source of that half. Revert `covered` to
+        // span-only keying and `covers(LB0317, ..)` starts matching the
+        // LB0318 entry, the resolver's depth finding is dropped as a
+        // "rediscovery" of a cycle, and this test is the one that fails: a
+        // silent false negative in the type checker, which is strictly worse
+        // than the duplicate the dedup exists to remove.
+        use std::fmt::Write as _;
+
+        let mut src = String::from("---@class Deep0\n");
+        for i in 1..MAX_ANCESTRY_DEPTH {
+            let _ = writeln!(src, "---@class Deep{i} : Deep{}", i - 1);
+        }
+        let _ = write!(
+            src,
+            "---@class Ring : Ring, Deep{}\n---@field own string\n---@type Ring\nlocal node\n\
+             local _ = node.own\n",
+            MAX_ANCESTRY_DEPTH - 1
+        );
+        let tmp = project(&manifest("5.4", "\n[types]\nstrict = true\n"));
+        write(tmp.path(), "src/main.lua", &src);
+
+        let diags = check_diagnostics(tmp.path());
+        let at_ring: Vec<&Diagnostic> = diags
+            .iter()
+            .filter(|d| d.message.contains("`Ring`"))
+            .collect();
+        let codes: Vec<Code> = at_ring.iter().map(|d| d.code).collect();
+        assert!(
+            codes.contains(&LB0318_CIRCLE_DOC_CLASS),
+            "the cycle must survive: {diags:?}"
+        );
+        assert!(
+            codes.contains(&LB0317_CLASS_ANCESTRY_TOO_DEEP),
+            "and so must the depth finding — covering one code must not swallow the other: \
+             {diags:?}"
+        );
+        assert_eq!(codes.len(), 2, "one of each, no duplicates: {at_ring:?}");
+        // Both really are the same declaration, which is the only reason the
+        // key's code component is load-bearing at all.
+        let spans: HashSet<(usize, usize)> = at_ring
+            .iter()
+            .filter_map(|d| d.primary_label())
+            .map(|l| (l.span.range.start, l.span.range.end))
+            .collect();
+        assert_eq!(spans.len(), 1, "at one span: {at_ring:?}");
     }
 
     #[test]

@@ -640,6 +640,22 @@ struct ForeignLedger {
     /// distinct file ever checked, never freed for the life of the session,
     /// which is precisely the unbounded growth `contributions` avoids.
     own: BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>,
+    /// Path → the workspace-derived findings that belong to it, as of the
+    /// last pass that computed them — the declared-`---@class` cycle set
+    /// (`diagnostics::class_cycle_diagnostics`, round 12 review R12-1).
+    ///
+    /// **Not** per contributor, unlike [`Self::contributions`], and that is
+    /// the whole point. Every pass over any file derives the SAME answer for
+    /// the whole workspace, so filing it as a contribution would put one
+    /// cycle on a document once per file the session had ever checked, and
+    /// each of those copies would go stale on its own: fixing the file that
+    /// closed the loop clears the copy contributed by the pass that just ran
+    /// and leaves every other contributor's standing until they are
+    /// themselves re-checked. One authoritative map, replaced whole by each
+    /// pass that computes it, has neither problem — the same reason
+    /// `contributions` replaces a contributor's whole entry rather than
+    /// merging into it.
+    workspace: BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>,
 }
 
 impl ForeignLedger {
@@ -647,14 +663,24 @@ impl ForeignLedger {
     /// whose published set may have moved, in sorted order.
     ///
     /// The affected set is the union of what `source` contributed *before*
-    /// this pass, what it contributes now, and `source` itself. The first
-    /// term is what makes a cleared diagnostic clear: a target that has just
-    /// dropped out of `source`'s groups is still republished, now without it.
+    /// this pass, what it contributes now, `source` itself, and — when this
+    /// pass recomputed one — the targets of the previous and the new
+    /// workspace answer. The "before" terms are what make a cleared
+    /// diagnostic clear: a target that has just dropped out is still
+    /// republished, now without it.
+    ///
+    /// `workspace` is `None` for a publish that did **not** recompute the
+    /// workspace-derived findings — the scratch-buffer `didClose` path,
+    /// which records "this file contributes nothing" without running a check
+    /// pass. Passing an empty map there instead would read as "the workspace
+    /// has no cycles", wiping every one of them off every document until the
+    /// next keystroke anywhere put them back.
     fn record(
         &mut self,
         source: &Path,
         own: Vec<lsp_types::Diagnostic>,
         foreign: BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>,
+        workspace: Option<BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>>,
     ) -> Vec<PathBuf> {
         let mut affected: BTreeSet<PathBuf> = BTreeSet::new();
         affected.insert(source.to_path_buf());
@@ -662,6 +688,11 @@ impl ForeignLedger {
             affected.extend(previous.keys().cloned());
         }
         affected.extend(foreign.keys().cloned());
+        if let Some(workspace) = workspace {
+            affected.extend(self.workspace.keys().cloned());
+            affected.extend(workspace.keys().cloned());
+            self.workspace = workspace;
+        }
 
         if foreign.is_empty() {
             self.contributions.remove(source);
@@ -682,8 +713,13 @@ impl ForeignLedger {
     /// Every contributor is merged, not just the one that happens to be
     /// publishing — two consumers reporting different findings against one
     /// declaring file both appear, and neither erases the other.
+    ///
+    /// The workspace-derived half sits between the two: after the target's
+    /// own findings, before the per-contributor ones, and once — see
+    /// [`Self::workspace`].
     fn published_set(&self, target: &Path) -> Vec<lsp_types::Diagnostic> {
         let mut out = self.own.get(target).cloned().unwrap_or_default();
+        out.extend(self.workspace.get(target).into_iter().flatten().cloned());
         for groups in self.contributions.values() {
             if let Some(group) = groups.get(target) {
                 out.extend(group.iter().cloned());
@@ -2444,7 +2480,7 @@ impl Server {
             // real project file's panel with nothing left to ever remove it.
             self.host
                 .apply_change(Change::ClearOverlay { path: path.clone() });
-            self.publish_recorded(uri, &path, Vec::new(), BTreeMap::new())
+            self.publish_recorded(uri, &path, Vec::new(), BTreeMap::new(), None)
         }
     }
 
@@ -2497,9 +2533,19 @@ impl Server {
                 lint: &self.lint,
                 known_globals: &self.known_globals,
             };
-            diagnostics::diagnostics(&analysis, path, self.dialect, &ctx).unwrap_or_default()
+            diagnostics::diagnostics(&analysis, path, self.dialect, &ctx)
         };
-        self.publish_recorded(uri, path, found.own, found.foreign)
+        // No pass at all (a path the analysis does not know) publishes an
+        // empty own half — but must NOT publish an empty *workspace* half:
+        // that map is the whole answer, not this file's share of it, and a
+        // default-constructed one would read as "the workspace has no
+        // cycles" and wipe every one of them off every document. `None` is
+        // "not recomputed"; see `ForeignLedger::record`.
+        let (own, foreign, workspace) = match found {
+            Some(found) => (found.own, found.foreign, Some(found.workspace)),
+            None => (Vec::new(), BTreeMap::new(), None),
+        };
+        self.publish_recorded(uri, path, own, foreign, workspace)
     }
 
     /// Fold one pass's result into the ledger and publish every document it
@@ -2516,8 +2562,9 @@ impl Server {
         path: &Path,
         own: Vec<lsp_types::Diagnostic>,
         foreign: BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>,
+        workspace: Option<BTreeMap<PathBuf, Vec<lsp_types::Diagnostic>>>,
     ) -> anyhow::Result<()> {
-        for target in self.foreign.record(path, own, foreign) {
+        for target in self.foreign.record(path, own, foreign, workspace) {
             let set = self.foreign.published_set(&target);
             if target == path {
                 self.publish(uri, set)?;
@@ -2657,8 +2704,10 @@ mod tests {
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
+    use std::collections::BTreeMap;
+
     use super::{
-        CodeActionOrCommand, ErrorCode, ProjectConfig, PublishDiagnostics, Server,
+        CodeActionOrCommand, ErrorCode, ForeignLedger, ProjectConfig, PublishDiagnostics, Server,
         ambient_def_sources, apply_content_changes, root_path,
     };
 
@@ -3778,7 +3827,17 @@ return use
         let for_a = published_diagnostics(&published, &a_uri).expect("a.lua is published");
         let a_lines = u64::try_from(a_source.lines().count()).expect("a small line count");
         for diag in for_a.as_array().expect("an array") {
-            assert_ne!(diag["code"], json!("LB0318"), "{diag:?}");
+            // `A` is a member of the same cycle and IS declared in a.lua, so
+            // a.lua carries its own `LB0318` — luals reports both
+            // declarations of a mutual cycle and, as of round 12 R12-1, so
+            // does this server. What may never appear here is `B`'s, whose
+            // declaration lives in c.lua.
+            assert!(
+                !diag["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("`B`'s `---@class` ancestry")),
+                "{diag:?}"
+            );
             assert!(
                 diag["range"]["start"]["line"].as_u64().expect("a line") < a_lines,
                 "nothing may render at a clamped position: {diag:?}"
@@ -4179,15 +4238,140 @@ return use
         );
     }
 
-    /// R11-6a, the **fix-one-keep-other transition**: two contributors, one
-    /// target. The tests above cover a single contributor's clear and both
-    /// contributors present from the start; neither covers what happens to
-    /// contributor *B*'s group when contributor *A* is re-checked and stops
-    /// producing one. `published_set` rebuilds the target from every live
-    /// contributor, so B's finding must survive A's clear — a publish that
-    /// cleared the target wholesale (or dropped every contributor's entry for
-    /// it) would take B's finding down with A's and leave a real cycle
-    /// invisible until `a2.lua` is itself touched.
+    /// A hand-built diagnostic for the ledger tests below, distinguishable
+    /// by `message` alone.
+    fn ledger_diagnostic(message: &str) -> lsp_types::Diagnostic {
+        lsp_types::Diagnostic {
+            message: message.to_owned(),
+            ..lsp_types::Diagnostic::default()
+        }
+    }
+
+    /// The messages `target`'s document would currently show.
+    fn ledger_messages(ledger: &ForeignLedger, target: &Path) -> Vec<String> {
+        ledger
+            .published_set(target)
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
+    }
+
+    /// F4 (**two producers**) and R11-6a (**fix one, keep the other**), at
+    /// the ledger rather than through the server.
+    ///
+    /// These two properties used to be pinned end to end on the cross-file
+    /// `LB0318` fixtures below. They no longer can be: as of round 12 R12-1
+    /// the declared-class cycle set is derived from the WORKSPACE, so it
+    /// travels in [`ForeignLedger::workspace`] and no longer exercises
+    /// [`ForeignLedger::contributions`] at all — measured, by deleting the
+    /// whole contributor merge from `published_set`: the entire suite stayed
+    /// green. The per-contributor mechanism is still live (every other
+    /// cross-file ancestry finding — `LB0317`'s and `LB0319`'s
+    /// `cross_file_class_decl_span` tier — travels in it), and pinning it on
+    /// a real 200-class fixture costs a full editor check pass per
+    /// keystroke of the test. So it is pinned here, on the map itself, where
+    /// the mutation that would break it fails immediately.
+    #[test]
+    fn two_contributors_groups_for_one_target_both_appear_and_clear_independently() {
+        let target = PathBuf::from("c.lua");
+        let a1 = PathBuf::from("a1.lua");
+        let a2 = PathBuf::from("a2.lua");
+        let mut ledger = ForeignLedger::default();
+
+        ledger.record(
+            &a1,
+            Vec::new(),
+            BTreeMap::from([(target.clone(), vec![ledger_diagnostic("from a1")])]),
+            None,
+        );
+        let affected = ledger.record(
+            &a2,
+            Vec::new(),
+            BTreeMap::from([(target.clone(), vec![ledger_diagnostic("from a2")])]),
+            None,
+        );
+        assert!(affected.contains(&target), "{affected:?}");
+        assert_eq!(
+            ledger_messages(&ledger, &target),
+            vec!["from a1".to_owned(), "from a2".to_owned()],
+            "the second contributor merges with the first, it does not replace it"
+        );
+
+        // a1 is re-checked and no longer produces anything: its group goes,
+        // a2's stays. A `record` that stripped the target from every
+        // contributor — or a `published_set` that read only the publishing
+        // one — would take a2's finding down with it and leave a real
+        // finding invisible until a2.lua is itself touched.
+        let affected = ledger.record(&a1, Vec::new(), BTreeMap::new(), None);
+        assert!(
+            affected.contains(&target),
+            "the target of a group that just went away is still republished: {affected:?}"
+        );
+        assert_eq!(
+            ledger_messages(&ledger, &target),
+            vec!["from a2".to_owned()]
+        );
+    }
+
+    /// R12-1: the workspace half is REPLACED by each pass that computes it,
+    /// never merged — and a pass that did not compute it leaves it alone.
+    ///
+    /// Both halves matter. Merging would put one cycle on a document once
+    /// per file the session ever checked; treating "did not compute" as
+    /// "computed empty" would wipe every cycle off every document on a
+    /// scratch-buffer `didClose`, which runs no check pass at all.
+    #[test]
+    fn the_workspace_half_is_replaced_by_a_pass_and_untouched_by_one_that_skips_it() {
+        let target = PathBuf::from("c.lua");
+        let stale = PathBuf::from("gone.lua");
+        let a1 = PathBuf::from("a1.lua");
+        let a2 = PathBuf::from("a2.lua");
+        let mut ledger = ForeignLedger::default();
+
+        ledger.record(
+            &a1,
+            Vec::new(),
+            BTreeMap::new(),
+            Some(BTreeMap::from([
+                (target.clone(), vec![ledger_diagnostic("cycle")]),
+                (stale.clone(), vec![ledger_diagnostic("other cycle")]),
+            ])),
+        );
+        // a2's pass sees the same workspace minus `gone.lua`'s cycle.
+        let affected = ledger.record(
+            &a2,
+            Vec::new(),
+            BTreeMap::new(),
+            Some(BTreeMap::from([(
+                target.clone(),
+                vec![ledger_diagnostic("cycle")],
+            )])),
+        );
+        assert!(
+            affected.contains(&stale),
+            "a target that dropped out of the workspace answer is republished without it: \
+             {affected:?}"
+        );
+        assert_eq!(ledger_messages(&ledger, &target), vec!["cycle".to_owned()]);
+        assert!(ledger_messages(&ledger, &stale).is_empty());
+
+        // A publish that computed nothing (the scratch-buffer didClose path)
+        // must not read as "the workspace is clean".
+        ledger.record(&a1, Vec::new(), BTreeMap::new(), None);
+        assert_eq!(
+            ledger_messages(&ledger, &target),
+            vec!["cycle".to_owned()],
+            "`None` keeps the stored answer; an empty map would have wiped it"
+        );
+    }
+
+    /// R11-6a, the **fix-one-keep-other transition**, end to end. Two
+    /// contributors, one target: what happens to the OTHER finding when one
+    /// file is re-checked and its own goes away. Since R12-1 the cycle set
+    /// is workspace-derived, so what this fixture exercises end to end is
+    /// [`ForeignLedger::workspace`]'s wholesale replacement — the
+    /// per-contributor half of the same property is pinned on the ledger
+    /// directly, above.
     ///
     /// Proved by hand, the way the F7 gate test above was: `record` was
     /// temporarily taught to strip a stale target from **every** contributor

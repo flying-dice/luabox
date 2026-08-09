@@ -16,7 +16,11 @@ use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
 use luabox_db::Analysis;
 use luabox_lint::{LintConfig, lint_source};
 use luabox_syntax::lua::{Dialect, validate};
-use luabox_types::{RockSurfaces, Strictness, check_file_with_requires};
+use luabox_syntax::luacats;
+use luabox_types::{
+    CYCLIC_CLASS, ClassGraph, DirectiveScan, RULE_CIRCLE_DOC_CLASS, RockSurfaces, Strictness,
+    check_file_with_requires,
+};
 
 use crate::line_index::LineIndex;
 use crate::merged_ambient::MergedAmbient;
@@ -122,6 +126,26 @@ pub struct FileDiagnostics {
     /// A caller publishes each group under its own document URI. Ordered
     /// (a `BTreeMap`) so a batch of publishes is deterministic.
     pub foreign: BTreeMap<PathBuf, Vec<Diagnostic>>,
+    /// Findings about the **workspace**, not about the checked file: the
+    /// declared-`---@class` cycle pass ([`class_cycle_diagnostics`]) walks
+    /// every project file's class graph, so every pass over any file derives
+    /// the same answer for the same declarations.
+    ///
+    /// Kept apart from [`Self::foreign`] because the two have different
+    /// lifetimes in the ledger, and mixing them was measurably wrong:
+    /// `foreign` is a *contribution* — "what MY pass found about your file"
+    /// — and the ledger merges every contributor's, which for a
+    /// workspace-derived answer means one cycle appearing once per file the
+    /// session ever checked, each copy going stale independently (fix one
+    /// file and the other contributors' copies survive until they are
+    /// themselves re-checked). This half is the whole answer as of the last
+    /// pass, and the ledger REPLACES it wholesale — see
+    /// `crate::server::ForeignLedger`.
+    ///
+    /// Grouped by the file each finding's declaration lives in and converted
+    /// through **that** file's [`LineIndex`], exactly like `foreign`; the
+    /// checked file's own share is in here too, not in `own`.
+    pub workspace: BTreeMap<PathBuf, Vec<Diagnostic>>,
 }
 
 /// Diagnostics for one `.lua` file known to `analysis`, split by the file
@@ -191,6 +215,11 @@ pub fn diagnostics(
     // same map, so a `require` binding cannot type one way here and another
     // way under the cursor.
     let requires = RequireExports::resolve(analysis, path, ctx.rocks);
+    // The declaration-driven `---@class` cycle pass, run BEFORE the type
+    // pass so its `covered` set can drop the resolver's rediscovery of a
+    // cycle it has already named — the same hand-off `luabox check` makes
+    // between its pre-check and `env::note_cyclic`'s drain (R12-1).
+    let cycles = class_cycle_diagnostics(analysis, ctx.strictness);
     for diag in check_file_with_requires(
         parsed.parse(),
         &rel,
@@ -199,6 +228,9 @@ pub fn diagnostics(
         Some(ctx.ambient.get()),
         requires.by_module(),
     ) {
+        if cycles.covers(&diag) {
+            continue;
+        }
         // Type diagnostics are all `LB03xx`, so this publishes under
         // `TYPE_SOURCE` today — but through the band authority inside
         // `convert`, so a code moving band moves its source with it.
@@ -210,6 +242,25 @@ pub fn diagnostics(
             &mut foreign_indices,
             &diag,
         );
+    }
+    // Routed the same way every other cross-file ancestry finding is — a
+    // cycle member declared in ANOTHER project file lands under that file's
+    // own URI, at its own line, whether or not it is open — but filed under
+    // `workspace`, because that is what it is: see `FileDiagnostics`.
+    for diag in &cycles.diags {
+        let Some(label) = diag.primary_label() else {
+            continue;
+        };
+        let named = label.span.file.clone();
+        let Some(target_index) =
+            line_index_for(analysis, &rel, &index, &mut foreign_indices, &named)
+        else {
+            continue;
+        };
+        out.workspace
+            .entry(PathBuf::from(named))
+            .or_default()
+            .push(convert(target_index, diag));
     }
 
     // 4. Lint findings — the `luabox lint` engine (SPEC.md §9), published
@@ -243,22 +294,166 @@ pub fn diagnostics(
     Some(out)
 }
 
+/// One workspace cycle pass: the `LB0318`s the declared `---@class` graph
+/// alone proves, and the declaration sites they account for.
+struct ClassCycles {
+    /// One diagnostic per declaration that carries a cycle edge, its primary
+    /// span naming the **declaring** file — routed by [`push_routed`] like
+    /// every other cross-file ancestry finding.
+    diags: Vec<luabox_diag::Diagnostic>,
+    /// `(declaring file, span)` of every cycle member's declaration, the
+    /// reported and the merely-accounted-for alike.
+    covered: HashSet<(String, usize, usize)>,
+}
+
+impl ClassCycles {
+    /// Whether `diag` is the resolver's rediscovery of a cycle this pass has
+    /// already named at the same declaration.
+    fn covers(&self, diag: &luabox_diag::Diagnostic) -> bool {
+        diag.code == CYCLIC_CLASS
+            && diag.primary_label().is_some_and(|label| {
+                self.covered.contains(&(
+                    label.span.file.clone(),
+                    label.span.range.start,
+                    label.span.range.end,
+                ))
+            })
+    }
+}
+
+/// The editor's half of `LB0318`: every `---@class` in the workspace that is
+/// its own ancestor, reported at its own declaration, whether or not
+/// anything in the project ever resolves it (round 12 review R12-1).
+///
+/// # Why this exists
+///
+/// `LB0318` has two mechanisms. One is resolution-driven — `env::note_cyclic`
+/// files a hit when `DiamondGuard` takes a back-edge — and it is the only one
+/// this server used to run. Resolution is *reference*-driven, so a types file
+/// containing nothing but `---@class Widget : Widget` resolved nothing, filed
+/// nothing, and the editor stayed green on the exact fixture the feature
+/// targets, while `luabox check` reported it. That is the editor-vs-CLI split
+/// this repo treats as blocking (`check.rs`: "rather than leaving `luabox
+/// check` green on a project the LSP reports red on"), inverted — and a
+/// shipped doc comment claimed the opposite was true.
+///
+/// The algorithm is not this module's: [`luabox_types::ClassGraph`] owns the
+/// strongly-connected-component walk, the singleton-self-edge filter, the
+/// per-declaration report rule and the message, and `luabox check` runs the
+/// very same seam over the very same graph shape. What is this module's is
+/// the workspace the graph is built from and the editor's routing.
+///
+/// # Cost
+///
+/// One pass over every project file's **memoized** annotation harvest
+/// (`Analysis::annotations` is a salsa query — an unchanged file is a
+/// refcount bump, not a re-harvest), plus a `HashMap` walk proportional to
+/// the declared class graph. It runs per publish, i.e. per keystroke, in
+/// the same order of cost as the merged-ambient rebuild that already does
+/// (`Server::merged_ambient`'s own doc measures that one).
+///
+/// The `---@diagnostic disable[-line|-next-line]: circle-doc-class` escape
+/// hatch is honoured out of the **declaring** file's own text, through
+/// [`luabox_types::DirectiveScan`] — the same scanner, the same luals rule
+/// name and the same 1-based line convention the CLI pre-check uses, so a
+/// directive that silences the finding in CI silences it in the editor.
+///
+/// Empty under [`Strictness::None`], which disables every type diagnostic
+/// project-wide.
+fn class_cycle_diagnostics(analysis: &Analysis, strictness: Strictness) -> ClassCycles {
+    let mut cycles = ClassCycles {
+        diags: Vec::new(),
+        covered: HashSet::new(),
+    };
+    if strictness == Strictness::None {
+        return cycles;
+    }
+    let severity = if strictness == Strictness::Strict {
+        luabox_diag::Severity::Error
+    } else {
+        luabox_diag::Severity::Warning
+    };
+
+    // Sorted, so a file's index — and so the order of the sites below — is a
+    // function of the workspace and not of the host's file map.
+    let mut files: Vec<PathBuf> = analysis.files().map(Path::to_path_buf).collect();
+    files.sort();
+    let mut graph = ClassGraph::default();
+    for (idx, file) in files.iter().enumerate() {
+        let Some(items) = analysis.annotations(file) else {
+            continue;
+        };
+        for item in items.items() {
+            for tag in &item.block.tags {
+                let luacats::Tag::Class(class) = tag else {
+                    continue;
+                };
+                graph.declare(
+                    &class.name,
+                    idx,
+                    class.span.start..class.span.end,
+                    class
+                        .parents
+                        .iter()
+                        .filter_map(|parent| match &parent.kind {
+                            luacats::TypeExprKind::Named { name, .. } if !name.is_empty() => {
+                                Some(name.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect(),
+                );
+            }
+        }
+    }
+
+    // Built only for the files a cycle actually touches — a workspace with
+    // no cycle scans nothing.
+    let mut suppression: HashMap<PathBuf, Option<(DirectiveScan, luabox_syntax::LineIndex)>> =
+        HashMap::new();
+    for site in graph.cycle_sites() {
+        let Some(decl) = files.get(site.file) else {
+            continue;
+        };
+        let named = decl.to_string_lossy().into_owned();
+        cycles
+            .covered
+            .insert((named.clone(), site.span.start, site.span.end));
+        if !site.reports {
+            continue;
+        }
+        let scan = suppression.entry(decl.clone()).or_insert_with(|| {
+            let text = analysis.file_text(decl)?;
+            let lines = luabox_syntax::LineIndex::new(&text);
+            Some((DirectiveScan::scan(&text), lines))
+        });
+        if let Some((rules, lines)) = scan.as_ref()
+            && rules.suppresses(RULE_CIRCLE_DOC_CLASS, lines.line_of(site.span.start))
+        {
+            continue;
+        }
+        cycles.diags.push(
+            luabox_diag::Diagnostic::new(
+                CYCLIC_CLASS,
+                severity,
+                luabox_types::cyclic_class_message(&site.name, &site.others),
+            )
+            .with_label(luabox_diag::Label::primary(
+                luabox_diag::Span::new(named.as_str(), site.span.clone()),
+                luabox_types::CYCLIC_CLASS_LABEL,
+            )),
+        );
+    }
+    cycles
+}
+
 /// Convert `diag` through the line index of the file its **primary span**
 /// names, and file it under [`FileDiagnostics::own`] or
 /// [`FileDiagnostics::foreign`] accordingly (production readiness review,
 /// finding 4).
 ///
-/// `foreign_indices` memoises the line index of each distinct foreign file
-/// the batch actually names: building one is a full byte scan of that file's
-/// text, and a cycle spanning N classes declared in the same file reports
-/// once per class.
-///
-/// A foreign span naming something `analysis` cannot resolve to text — an
-/// ambient/defs tier span, or a logical name that is not a project path — is
-/// **dropped**. There is no line index that could convert it, and no
-/// document URI to publish it under; the alternative this replaces (convert
-/// it against whichever file happened to be checked) is what produced a
-/// diagnostic at a clamped position in a file the message was not about.
+/// See [`line_index_for`] for the memoisation and for what happens to a span
+/// naming a file `analysis` cannot resolve to text.
 fn push_routed(
     out: &mut FileDiagnostics,
     analysis: &Analysis,
@@ -273,24 +468,53 @@ fn push_routed(
         out.own.push(convert(index, diag));
         return;
     };
-    if label.span.file == rel {
-        out.own.push(convert(index, diag));
+    let named = label.span.file.clone();
+    let Some(target_index) = line_index_for(analysis, rel, index, foreign_indices, &named) else {
         return;
-    }
-    let other = PathBuf::from(&label.span.file);
-    let other_index = match foreign_indices.entry(other.clone()) {
-        Entry::Occupied(entry) => entry.into_mut(),
-        Entry::Vacant(entry) => {
-            let Some(text) = analysis.file_text(&other) else {
-                return;
-            };
-            entry.insert(LineIndex::new(text))
-        }
     };
-    out.foreign
-        .entry(other)
-        .or_default()
-        .push(convert(other_index, diag));
+    let converted = convert(target_index, diag);
+    if named == rel {
+        out.own.push(converted);
+    } else {
+        out.foreign
+            .entry(PathBuf::from(named))
+            .or_default()
+            .push(converted);
+    }
+}
+
+/// The [`LineIndex`] a diagnostic naming `file` must be converted through:
+/// the checked file's own when it names that, otherwise the named file's,
+/// memoised in `foreign_indices`.
+///
+/// `None` when `analysis` cannot resolve `file` to text — an ambient/defs
+/// tier span, or a logical name that is not a project path. Such a
+/// diagnostic is **dropped** by both callers: there is no line index that
+/// could convert it and no document URI to publish it under, and the
+/// alternative (convert it against whichever file happened to be checked) is
+/// what produced a diagnostic at a clamped position in a file the message was
+/// not about.
+///
+/// Memoised because building one is a full byte scan of that file's text, and
+/// a cycle spanning N classes declared in the same file reports once per
+/// class.
+fn line_index_for<'a>(
+    analysis: &Analysis,
+    rel: &str,
+    index: &'a LineIndex,
+    foreign_indices: &'a mut HashMap<PathBuf, LineIndex>,
+    file: &str,
+) -> Option<&'a LineIndex> {
+    if file == rel {
+        return Some(index);
+    }
+    match foreign_indices.entry(PathBuf::from(file)) {
+        Entry::Occupied(entry) => Some(entry.into_mut()),
+        Entry::Vacant(entry) => {
+            let text = analysis.file_text(entry.key())?;
+            Some(entry.insert(LineIndex::new(text)))
+        }
+    }
 }
 
 /// Convert a toolchain [`luabox_diag::Diagnostic`] to an LSP diagnostic through
@@ -427,29 +651,51 @@ mod tests {
     /// `B`; `c.lua` declares `B : A`, padded so its declaration sits at a
     /// byte offset `a.lua`'s text cannot even contain.
     ///
-    /// Checking `a.lua` produces an `LB0318` about `B`, and
-    /// `cross_file_class_decl_span` points it at `B`'s declaration — in
-    /// `c.lua`. Converted against `a.lua`'s line index (what this used to
+    /// Checking `a.lua` produces an `LB0318` about `B`, whose declaration is
+    /// in `c.lua`. Converted against `a.lua`'s line index (what this used to
     /// do), that offset clamps to `a.lua`'s end and the diagnostic renders in
     /// `a.lua`'s panel, past its last line, under a message naming a class
     /// `a.lua` never declares. It must instead come back under `c.lua`'s
     /// path, at `c.lua`'s own line.
+    ///
+    /// `A` is a member of the same cycle and is declared in `a.lua`, so its
+    /// own `LB0318` belongs in `a.lua`'s half — luals reports both
+    /// declarations of a mutual cycle, one in each file (measured), and as of
+    /// round 12 R12-1 so does this server. What this fixture is about is the
+    /// ROUTING: `B`'s finding must not be rendered in `a.lua`.
     #[test]
     fn a_cross_file_ancestry_diagnostic_lands_on_its_own_file_at_its_own_line() {
         let (found, a_text, c_text) = cross_file_cycle();
 
         assert!(
-            !codes(&found.own).contains(&"LB0318"),
-            "the cycle is `B`'s, declared in c.lua — it does not belong to a.lua: {:?}",
+            !found
+                .own
+                .iter()
+                .any(|d| d.message.contains("`B`'s `---@class` ancestry")),
+            "the cycle member declared in c.lua does not belong to a.lua: {:?}",
             found.own
         );
-        let (path, foreign) = found
-            .foreign
-            .iter()
-            .next()
+        let foreign = found
+            .workspace
+            .get(&path_for("c.lua"))
             .expect("the LB0318 is filed under the file its span names");
-        assert_eq!(path, &path_for("c.lua"));
         assert_eq!(codes(foreign), vec!["LB0318"]);
+        assert!(
+            foreign[0].message.contains("`B`'s `---@class` ancestry"),
+            "c.lua's group is c.lua's own declaration: {foreign:?}"
+        );
+        // `A`'s own half of the same cycle is filed under a.lua, at a.lua's
+        // line — the parity behaviour, and the routing this fixture is about
+        // works in both directions.
+        let mine = found
+            .workspace
+            .get(&path_for("a.lua"))
+            .expect("a.lua declares a member of the same cycle");
+        assert_eq!(codes(mine), vec!["LB0318"]);
+        assert!(
+            mine[0].message.contains("`A`'s `---@class` ancestry"),
+            "{mine:?}"
+        );
 
         // `---@class B : A` is the last line of a padded file, and a.lua is
         // far shorter — a conversion through a.lua's index could not have
@@ -551,6 +797,199 @@ mod tests {
         let found =
             diagnostics(&analysis, &path_for("a.lua"), Dialect::Lua54, &ctx).expect("diagnostics");
         (found, a_text, c_text)
+    }
+
+    // === the declaration-driven cycle pass (round 12 review R12-1) ========
+
+    /// Check `checked` in a workspace made of `files`, at `strictness`.
+    fn workspace_diagnostics(
+        files: &[(&str, &str)],
+        checked: &str,
+        strictness: Strictness,
+    ) -> FileDiagnostics {
+        let root = Path::new(if cfg!(windows) { r"C:\ws" } else { "/ws" });
+        let mut host = AnalysisHost::new(Dialect::Lua54, strictness);
+        host.set_root(root.to_path_buf());
+        for (rel, text) in files {
+            host.apply_change(Change::SetFileText {
+                path: path_for(rel),
+                dialect: Dialect::Lua54,
+                text: (*text).to_string(),
+            });
+        }
+        let analysis = host.snapshot();
+        let base = build_ambient(Dialect::Lua54, &[]);
+        let known_globals = base.global_names().clone();
+        let rocks = RockSurfaces::default();
+        let ambient = MergedAmbient::build(&base, &analysis.project_types(), rocks.types());
+        let lint = LintConfig::new();
+        let ctx = CheckCtx {
+            strictness,
+            ambient: &ambient,
+            rocks: &rocks,
+            lint: &lint,
+            known_globals: &known_globals,
+        };
+        diagnostics(&analysis, &path_for(checked), Dialect::Lua54, &ctx).expect("diagnostics")
+    }
+
+    /// Every workspace-half message, in publish order.
+    fn workspace_messages(found: &FileDiagnostics, rel: &str) -> Vec<String> {
+        found
+            .workspace
+            .get(&path_for(rel))
+            .into_iter()
+            .flatten()
+            .map(|d| d.message.clone())
+            .collect()
+    }
+
+    /// R12-1, THE fixture: a types file containing nothing but a self-cyclic
+    /// `---@class` — no `---@type`, no local, no member read, zero uses
+    /// anywhere. `luabox check` has reported `LB0318` here since round 11;
+    /// this server reported NOTHING, because its only mechanism was
+    /// `env::note_cyclic`, which fires from a resolution walk, and nothing
+    /// resolves a class no file references. Measured against the pinned
+    /// lua-language-server 3.13.5: `circle-doc-class` fires on exactly this
+    /// source. Editor and CI now agree, and both agree with the oracle.
+    #[test]
+    fn an_unreferenced_self_cycle_is_reported_in_the_editor() {
+        let found = workspace_diagnostics(
+            &[("types.lua", "---@class Widget : Widget\n")],
+            "types.lua",
+            Strictness::Warn,
+        );
+        let messages = workspace_messages(&found, "types.lua");
+        assert_eq!(messages.len(), 1, "{found:?}", found = found.workspace);
+        assert!(
+            messages[0].contains("`Widget`'s `---@class` ancestry is cyclic"),
+            "{messages:?}"
+        );
+        let published = &found.workspace[&path_for("types.lua")];
+        assert_eq!(codes(published), vec!["LB0318"]);
+        assert_eq!(published[0].source.as_deref(), Some(TYPE_SOURCE));
+        assert_eq!(published[0].range.start.line, 0);
+    }
+
+    /// The mutual shape, with zero uses, across two files — a cycle no
+    /// single declaration contains, found from the WORKSPACE graph rather
+    /// than from whatever the checked file happens to resolve. Both members
+    /// are reported, each in its own declaring file, which is what luals
+    /// does (measured: one `circle-doc-class` per declaration).
+    #[test]
+    fn an_unreferenced_mutual_cycle_is_reported_on_both_declaring_files() {
+        let found = workspace_diagnostics(
+            &[
+                ("a.lua", "---@class RingA : RingB\n"),
+                ("b.lua", "---@class RingB : RingA\n"),
+            ],
+            "a.lua",
+            Strictness::Warn,
+        );
+        assert!(
+            workspace_messages(&found, "a.lua")[0].contains("`RingA`'s"),
+            "{found:?}",
+            found = found.workspace
+        );
+        assert!(
+            workspace_messages(&found, "b.lua")[0].contains("`RingB`'s"),
+            "the partner's half lands on the partner's document, whether or not it is open: {:?}",
+            found.workspace
+        );
+    }
+
+    /// The strictness ladder in the editor, and the escape hatch: the same
+    /// `---@diagnostic disable: circle-doc-class` that silences the CLI
+    /// silences this, scanned out of the DECLARING file's own text through
+    /// `luabox_types::DirectiveScan`.
+    #[test]
+    fn the_editors_cycle_pass_honours_strictness_and_the_declaring_files_directive() {
+        let cyclic = [("types.lua", "---@class Widget : Widget\n")];
+        let strict = workspace_diagnostics(&cyclic, "types.lua", Strictness::Strict);
+        assert_eq!(
+            strict.workspace[&path_for("types.lua")][0].severity,
+            Some(DiagnosticSeverity::ERROR)
+        );
+        let warn = workspace_diagnostics(&cyclic, "types.lua", Strictness::Warn);
+        assert_eq!(
+            warn.workspace[&path_for("types.lua")][0].severity,
+            Some(DiagnosticSeverity::WARNING)
+        );
+        let off = workspace_diagnostics(&cyclic, "types.lua", Strictness::None);
+        assert!(off.workspace.is_empty(), "{:?}", off.workspace);
+
+        let suppressed = workspace_diagnostics(
+            &[(
+                "types.lua",
+                "---@diagnostic disable: circle-doc-class\n---@class Widget : Widget\n",
+            )],
+            "types.lua",
+            Strictness::Warn,
+        );
+        assert!(
+            suppressed.workspace.is_empty(),
+            "the declaring file's own directive suppresses it in the editor too: {:?}",
+            suppressed.workspace
+        );
+    }
+
+    /// A cycle something DOES resolve is discovered twice — syntactically by
+    /// the workspace pass and again by `env::note_cyclic` during the
+    /// resolution walk. One declaration is one diagnostic, exactly as under
+    /// `luabox check`: the pass's `covered` set drops the resolver's
+    /// rediscovery.
+    #[test]
+    fn a_resolved_cycle_is_reported_once_not_once_per_mechanism() {
+        let found = workspace_diagnostics(
+            &[(
+                "main.lua",
+                "---@class RingA : RingB\n---@field a string\n\
+                 ---@class RingB : RingA\n---@field b string\n\
+                 ---@type RingA\nlocal node = nil\nlocal _ = node.a\n",
+            )],
+            "main.lua",
+            Strictness::Warn,
+        );
+        let cyclic: Vec<&Diagnostic> = found
+            .own
+            .iter()
+            .chain(found.workspace.values().flatten())
+            .filter(|d| d.code == Some(NumberOrString::String("LB0318".to_owned())))
+            .collect();
+        assert_eq!(
+            cyclic.len(),
+            2,
+            "one per declaration, not per mechanism: {cyclic:?}"
+        );
+        for name in ["RingA", "RingB"] {
+            assert_eq!(
+                cyclic
+                    .iter()
+                    .filter(|d| d.message.contains(&format!("`{name}`'s")))
+                    .count(),
+                1,
+                "{name} once: {cyclic:?}"
+            );
+        }
+    }
+
+    /// The over-report guard on the editor path: an acyclic hierarchy —
+    /// diamond, chain, and a subclass hanging off nothing cyclic — produces
+    /// no cycle diagnostics at all.
+    #[test]
+    fn an_acyclic_workspace_publishes_no_cycle_diagnostics() {
+        let found = workspace_diagnostics(
+            &[
+                ("top.lua", "---@class Top\n---@class Left : Top\n"),
+                (
+                    "bottom.lua",
+                    "---@class Right : Top\n---@class Bottom : Left, Right\n",
+                ),
+            ],
+            "top.lua",
+            Strictness::Warn,
+        );
+        assert!(found.workspace.is_empty(), "{:?}", found.workspace);
     }
 
     #[test]

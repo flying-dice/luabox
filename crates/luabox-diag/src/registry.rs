@@ -1383,12 +1383,22 @@ measure that agreement against the pinned binary rather than asserting it.
 (LB0317 and LB0319 *are* luabox-only; this one is not.)
 
 Parity **on the declaration**, not only on a class something resolves: luals
-fires from the `---@class` node itself, and so does `luabox check` — a cyclic
-class in a types file nothing references anywhere is reported by both. That
-was not true before: LB0318 came only from the resolver's back-edge, so an
-unreferenced cycle was flagged in the editor and silent on the command line.
-The corpus row `cyclic_class_unreferenced` (a self-parent class with zero
-uses — no `---@type`, no local, no member read) is the measurement.
+fires from the `---@class` node itself, and so do both luabox surfaces — a
+cyclic class in a types file nothing references anywhere is reported by
+`luabox check` AND by the language server, which run the one declared-graph
+cycle pass. That was not true before: LB0318 came only from the resolver's
+back-edge, so an unreferenced cycle was flagged in the editor and silent on
+the command line; the fix for that landed on the CLI alone for one release
+candidate and merely swapped the sides. The corpus row
+`cyclic_class_unreferenced` (a self-parent class with zero uses — no
+`---@type`, no local, no member read) is the measurement.
+
+Attribution matches the oracle too: **one diagnostic per declaration that
+carries a cycle edge**. A class declared plainly and then reopened with a
+back-edge (`---@class W` then `---@class W : W`) is one finding, on the
+reopening line — the plain declaration is not a cycle edge. The same cyclic
+class declared in two files is two findings, one per file. Both measured
+against the pinned 3.13.5.
 
 **Escape hatches.** `[types] strict = false` downgrades it to a warning, and
 `---@diagnostic disable[-line|-next-line]: circle-doc-class` suppresses it.
@@ -1408,10 +1418,12 @@ mutual `A : B` / `B : A` spanning two files needs the directive in both:
 
 A directive in a file that merely *reads* `Node` does nothing.
 
-**Editor caveat.** Cross-file suppression is honoured by `luabox check` only
-— the language server has no view of the declaring file's directives, so a
-cycle declared elsewhere stays red in the editor until the cycle is broken.
-Same as LB0317; see `luabox explain LB0317` for the detail.
+**The directive works in the editor too**, unlike LB0317's: the language
+server's own cycle pass reads the DECLARING file's text through the same
+directive scanner the command line uses, so a `disable-next-line:
+circle-doc-class` written next to the declaration silences it in both places
+— including when the declaring file is not the one you have open. (LB0317
+still has the older caveat; see `luabox explain LB0317`.)
 
 **The exception: a class declared only in a `[types] defs` package.** Nothing
 in the project declares it, and a definition package's own comments are never

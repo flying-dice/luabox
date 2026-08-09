@@ -394,3 +394,65 @@ Feature: luabox lsp — published diagnostics
     And the language server is running
     When I open "main.lua"
     Then the diagnostics for "main.lua" do not include LB0306
+
+  # --- the declaration-driven `---@class` cycle check (round 12 R12-1) ----
+  # `LB0318` used to reach the editor only through the resolver's back-edge,
+  # which is reference-driven: a types file nothing in the project touches
+  # resolved nothing, so the editor was GREEN on a cycle `luabox check`
+  # reported red — the editor/CLI split this repo treats as blocking, with
+  # the sides swapped. The server now runs the same declaration-driven
+  # strongly-connected-component pass the CLI does, over the workspace's own
+  # `---@class` graph. Measured against the pinned lua-language-server
+  # 3.13.5: `circle-doc-class` fires on both fixtures below.
+
+  Scenario: an unreferenced self-cyclic class is reported in the editor
+    Given a strict project with edition "5.4"
+    And a file "types.lua" containing:
+      """
+      ---@class Widget : Widget
+      """
+    And the language server is running
+    When I open "types.lua"
+    Then the diagnostics for "types.lua" include LB0318
+    And diagnostic LB0318 in "types.lua" is an error
+
+  # `a.lua` is never opened: the graph is the workspace's, so the partner's
+  # half of the cycle reaches its own document anyway.
+  Scenario: a mutual cycle is reported on the file that declares each member
+    Given a strict project with edition "5.4"
+    And a file "a.lua" containing:
+      """
+      ---@class RingA : RingB
+      """
+    And a file "b.lua" containing:
+      """
+      ---@class RingB : RingA
+      """
+    And the language server is running
+    When I open "b.lua"
+    Then the diagnostics for "b.lua" include LB0318
+    And the diagnostics for "a.lua" include LB0318
+
+  Scenario: the declaring file's own disable silences the cycle in the editor
+    Given a strict project with edition "5.4"
+    And a file "types.lua" containing:
+      """
+      ---@diagnostic disable-next-line: circle-doc-class
+      ---@class Widget : Widget
+      """
+    And the language server is running
+    When I open "types.lua"
+    Then the diagnostics for "types.lua" do not include LB0318
+
+  Scenario: an acyclic hierarchy draws no cycle diagnostic
+    Given a strict project with edition "5.4"
+    And a file "main.lua" containing:
+      """
+      ---@class Top
+      ---@class Left : Top
+      ---@class Right : Top
+      ---@class Bottom : Left, Right
+      """
+    And the language server is running
+    When I open "main.lua"
+    Then the diagnostics for "main.lua" are empty

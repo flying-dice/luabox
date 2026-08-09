@@ -4425,6 +4425,13 @@ mod tests {
 
     /// [`run_bounded`] with an explicit ceiling, for a fixture whose cost is
     /// genuinely different from the rest.
+    ///
+    /// The two failure modes are told apart, not both reported as the slow
+    /// one (round 12 review): `Disconnected` means the worker dropped its
+    /// sender without sending — it panicked, in microseconds — and blaming
+    /// that on a timeout it never came close to hitting is exactly the
+    /// caught-vs-timeout confusion this helper exists to protect in the
+    /// mutants gate.
     fn run_bounded_within<T: Send + 'static>(
         bound: std::time::Duration,
         what: &str,
@@ -4434,8 +4441,15 @@ mod tests {
         std::thread::spawn(move || {
             let _ = tx.send(body());
         });
-        rx.recv_timeout(bound)
-            .unwrap_or_else(|_| panic!("{what} must finish within {bound:?}"))
+        match rx.recv_timeout(bound) {
+            Ok(value) => value,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("{what} must finish within {bound:?}")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("{what} panicked (see the worker thread's own message above)")
+            }
+        }
     }
 
     #[test]

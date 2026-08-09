@@ -92,13 +92,27 @@ pub const CLASS_DEPTH_LIMIT: Code = Code::new(317);
 /// from a resolution walk, so on its own it says nothing about a class no
 /// file references — and luals' check fires from the `---@class` node alone
 /// (measured against the pinned binary on a fixture with zero uses; corpus
-/// row `cyclic_class_unreferenced`). `luabox check` closes that half
-/// syntactically, in `check_cmd::cyclic_class_diagnostics`, which walks the
-/// declared class graph for strongly connected components before anything is
-/// resolved and dedupes its findings against this ledger's by declaration
-/// site. A direct `check_file*` caller below the CLI (the LSP, this crate's
-/// tests) still sees only the resolution-driven half — the LSP resolves what
-/// it displays, so the same cycle surfaces there when the file is opened. Downgradable the same way every other `LB03xx` is: `[types]
+/// row `cyclic_class_unreferenced`). That half is closed **syntactically**,
+/// by [`crate::ClassGraph`]: strongly connected components of the declared
+/// `---@class` graph, found before anything is resolved, reported at every
+/// declaration that carries a cycle edge, and deduped against this ledger's
+/// findings by declaration site.
+///
+/// **Both** surfaces run it (round 12 review R12-1) — `luabox check`, in
+/// `check_cmd::cyclic_class_diagnostics`, over the project's files; and the
+/// LSP, in `luabox_lsp::diagnostics::class_cycle_diagnostics`, over the
+/// workspace's, publishing each member under its own declaring document.
+/// One seam, one algorithm, one message. It shipped CLI-only for one round,
+/// and this comment claimed instead that "the LSP resolves what it displays,
+/// so the same cycle surfaces there when the file is opened": it did not —
+/// resolution is reference-driven, which is the whole reason the syntactic
+/// half exists — and the editor was green on the exact fixture the feature
+/// targets while CI was red. A direct `check_file*` caller that is neither
+/// (this crate's own tests, an embedder calling the checker) still sees only
+/// the resolution-driven half; running the declaration-driven one is one
+/// [`crate::ClassGraph`] away.
+///
+/// Downgradable the same way every other `LB03xx` is: `[types]
 /// strict = false` makes it a warning and `---@diagnostic
 /// disable[-line|-next-line]: circle-doc-class` suppresses it —
 /// luals' own rule name ([`crate::directive::RULE_CIRCLE_DOC_CLASS`], the

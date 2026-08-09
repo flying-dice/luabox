@@ -327,7 +327,12 @@ fn report_depth_limit_hits(
 /// diagnostic per class, matching what a single-file cycle already reports.
 /// A direct `luabox_types::check_file*` caller that is not the CLI (the LSP,
 /// this crate's own tests) does not get that dedup — there is no
-/// project-wide aggregation point below the CLI to hang it on.
+/// project-wide aggregation point below the CLI to hang it on. What the LSP
+/// does have, since round 12 R12-1, is the declaration-driven pass this
+/// ledger's findings are deduped against on BOTH surfaces
+/// ([`crate::ClassGraph`]): the syntactic answer is workspace-wide by
+/// construction, and a hit here whose declaration it already named is
+/// dropped rather than published twice.
 fn report_cyclic_class_hits(
     checker: &mut Checker<'_>,
     typeenv: &TypeEnv,

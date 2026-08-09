@@ -220,16 +220,27 @@ and that rule is now written into the policy rather than left to judgement.
   both columns on every run.
 
   **Reported from the declaration, like luals — not only when something
-  resolves the class.** `luabox check` finds cycles in the declared
-  `---@class` graph up front, so `---@class Widget : Widget` sitting in a
-  types file nothing requires is a finding on the command line, exactly as it
-  already was in the editor. Until this change `LB0318` was filed only by the
-  resolver's back-edge, so an unreferenced cyclic class was flagged by the
-  language server and silent in CI while this entry claimed flat parity —
-  the gap is measured and closed by the corpus row
-  `cyclic_class_unreferenced` (a cyclic class with zero uses: both tools
-  report). One diagnostic per class either way: the syntactic pre-check and
-  the resolver's own rediscovery are deduped by declaration site. Consequently the suppression name is luals' own:
+  resolves the class, and on both surfaces.** `luabox check` and the language
+  server both find cycles in the declared `---@class` graph up front, so
+  `---@class Widget : Widget` sitting in a types file nothing requires is a
+  finding on the command line AND in the editor. Until this change `LB0318`
+  was filed only by the resolver's back-edge, which is reference-driven, so
+  an unreferenced cyclic class was silent everywhere while this entry claimed
+  flat parity; an earlier draft of this entry then claimed the editor had
+  been reporting it all along, which was never true. The gap is measured and
+  closed by the corpus row `cyclic_class_unreferenced` (a cyclic class with
+  zero uses: both tools report), and the shared pass lives in `luabox-types`
+  so the two surfaces cannot drift apart again.
+
+  **One diagnostic per declaration that carries a cycle edge** — the same
+  count and the same attribution luals gives, measured against the pinned
+  3.13.5. Two `---@class` declarations of one name **union** their parents
+  (as this project's semantics have always documented), so a class declared
+  plainly and reopened with a back-edge is a cycle, reported once, on the
+  reopening line; the same cyclic class declared in two files is reported in
+  each. A cycle something *does* resolve is still one diagnostic: the
+  syntactic pass and the resolver's own rediscovery are deduped by
+  declaration site. Consequently the suppression name is luals' own:
   `---@diagnostic disable[-line|-next-line]: circle-doc-class` (it was spelt
   `cyclic-class-ancestry` in this branch's earlier rounds — corrected before
   release, so no comment in the wild breaks, and a luals user's existing

@@ -86,6 +86,14 @@ for arg in "$@"; do
     [ "$prev" = "-o" ] && out="$arg"
     prev="$arg"
 done
+# The REAL invocation, one argument per line, for the flag assertions below
+# (round 12 review R12-5): those used to grep the gate's own echoed command
+# string, which is a *second* rendering of the arguments and can agree with
+# the claim while the array actually handed to this process does not. What
+# the tool receives is what matters, and this is the only place that sees it.
+if [ -n "${STUB_ARGV_OUT:-}" ]; then
+    printf '%s\n' "$@" >"$STUB_ARGV_OUT"
+fi
 mkdir -p "$out/mutants.out"
 skip=",${STUB_SKIP_OUTCOME_FILES:-},"
 for kind in caught missed timeout unviable; do
@@ -737,15 +745,30 @@ fi
 # luabox-types` over the WHOLE crate without failing a single one, because
 # the stub ignores every argument except -o. Reuses the ordinary $scope
 # fixture and pins the flag for it by name.
+#
+# Asserted against the argv the stub actually RECEIVED, not against the
+# gate's echoed command string (round 12 review R12-5, applied to both flag
+# cases): the echo is a second rendering of the same intent, and a gate that
+# printed `--file …` while invoking cargo-mutants without it would satisfy a
+# grep of the log. `argv_has <file> <flag> <value>` matches the flag and its
+# value as ADJACENT lines, so a flag whose value drifted onto another
+# argument cannot pass either.
+argv_has() {
+    local argv="$1" flag="$2" value="$3"
+    grep -A1 -x -F -- "$flag" "$argv" 2>/dev/null | grep -qx -F -- "$value"
+}
+
 file_args_log="$work/file_args.log"
-STUB_OUTCOMES="$steady" STUB_EXIT=2 \
+file_args_argv="$work/file_args.argv"
+STUB_OUTCOMES="$steady" STUB_EXIT=2 STUB_ARGV_OUT="$file_args_argv" \
     FILES="$scope" ALLOWLIST="$allowlist" SCOPE_OF_RECORD="$scope" MUTANTS_OUT="$work/out-file-args" \
     bash "$gate" >"$file_args_log" 2>&1
-if grep -qF -- "cargo mutants -p luabox-types --file crates/luabox-types/src/env.rs" "$file_args_log"; then
+if argv_has "$file_args_argv" --file crates/luabox-types/src/env.rs; then
     echo "PASS  file_args_scopes_cargo_mutants_to_files"
     pass=$((pass + 1))
 else
-    echo "FAIL  file_args_scopes_cargo_mutants_to_files: expected --file crates/luabox-types/src/env.rs in the printed command line" >&2
+    echo "FAIL  file_args_scopes_cargo_mutants_to_files: expected --file crates/luabox-types/src/env.rs in the argv cargo-mutants was invoked with" >&2
+    sed 's/^/        argv: /' "$file_args_argv" >&2 2>/dev/null || true
     sed 's/^/        /' "$file_args_log" >&2
     fail=$((fail + 1))
 fi
@@ -756,20 +779,27 @@ fi
 # tests use to turn a dead budget counter into a fast panic: below a ~6s
 # baseline the 30s bound loses, its mutant is classified TIMEOUT instead of
 # CAUGHT, and the gate fails on a NEW timeout for a test that would have
-# killed it. The flag has no observable effect on the stub (which ignores
-# every argument but -o), so the printed command line is what pins it —
-# exactly as file_args_scopes_cargo_mutants_to_files pins --file. Proven by
-# deleting the flag from the invocation and re-running: this case, and only
-# this case, fails.
+# killed it.
+#
+# Asserted against the argv cargo-mutants was really invoked with (round 12
+# review R12-5). This case used to grep the gate's own echoed command line,
+# which is a SECOND rendering of the same intent: drop `"${timeout_args[@]}"`
+# from the `cargo mutants` call while leaving the `echo` above it untouched
+# — the exact echo-vs-invocation drift this repo flags elsewhere — and the
+# old assertion stayed green while every mutant ran under cargo-mutants'
+# derived timeout again. Proven by making exactly that edit and re-running:
+# this case, and only this case, fails.
 timeout_args_log="$work/timeout_args.log"
-STUB_OUTCOMES="$steady" STUB_EXIT=2 \
+timeout_args_argv="$work/timeout_args.argv"
+STUB_OUTCOMES="$steady" STUB_EXIT=2 STUB_ARGV_OUT="$timeout_args_argv" \
     FILES="$scope" ALLOWLIST="$allowlist" SCOPE_OF_RECORD="$scope" MUTANTS_OUT="$work/out-timeout-args" \
     bash "$gate" >"$timeout_args_log" 2>&1
-if grep -qE -- "cargo mutants -p luabox-types .*--timeout 90" "$timeout_args_log"; then
+if argv_has "$timeout_args_argv" --timeout 90; then
     echo "PASS  timeout_args_bounds_each_mutant_above_every_in_test_bound"
     pass=$((pass + 1))
 else
-    echo "FAIL  timeout_args_bounds_each_mutant_above_every_in_test_bound: expected --timeout 90 in the printed command line" >&2
+    echo "FAIL  timeout_args_bounds_each_mutant_above_every_in_test_bound: expected --timeout 90 in the argv cargo-mutants was invoked with" >&2
+    sed 's/^/        argv: /' "$timeout_args_argv" >&2 2>/dev/null || true
     sed 's/^/        /' "$timeout_args_log" >&2
     fail=$((fail + 1))
 fi

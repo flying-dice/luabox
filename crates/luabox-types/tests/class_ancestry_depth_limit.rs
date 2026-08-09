@@ -8,7 +8,7 @@
 //! The class-shape/operator resolution walk (`TypeEnv::collect_class`/
 //! `collect_operators`) is the recursive merge behind every `---@class`
 //! reference. Unlike `luabox-cli`'s own syntactic pre-check
-//! (`check_cmd::deep_class_chain_diagnostic`, which imports and checks
+//! (`check_cmd::class_ancestry_precheck`, which imports and checks
 //! against this same `MAX_ANCESTRY_DEPTH` constant — round 6 review M52: an
 //! earlier revision of this comment named a separate `MAX_CLASS_CHAIN_DEPTH`
 //! constant that no longer exists; the CLI pre-check stopped keeping its own
