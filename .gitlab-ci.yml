@@ -127,6 +127,19 @@
 # is applied job-by-job via `.deny-warnings`, matching each source workflow's
 # own `env:` block.
 
+# Transient runner-host failures (a Docker Hub pull timing out on DNS, the
+# runner's own infrastructure hiccuping) retry twice before failing the job —
+# measured need: pipeline 13612 lost two jobs to one registry DNS flake while
+# seventeen siblings ran green off the cached image. Script failures do NOT
+# retry: a red gate is a signal, never a flake to paper over.
+default:
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - api_failure
+      - stuck_or_timeout_failure
+
 stages:
   - selftest # the gates on the gates: seconds-to-minutes, no cargo build
   - check    # fmt/clippy/test, coverage, examples
