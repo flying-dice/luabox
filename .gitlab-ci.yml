@@ -1,153 +1,1148 @@
-# GitLab CI for the private origin
-# (gitlab.beluga-sirius.ts.net:flying-dice/luabox). Internal check/test only.
-# Mirrors .github/workflows/ci.yml's `check` job (fmt/clippy/test) and both
-# coverage gates (`coverage-unit`, `coverage-e2e`), including the per-crate
-# floor.
+# GitLab CI — the pipeline of record for gitlab.beluga-sirius.ts.net:flying-dice/luabox.
 #
-# Releases are NOT cut here: the release pipeline of record is
-# .github/workflows/release.yml on the public GitHub remote
-# (github.com/flying-dice/luabox) — tag build + binaries + SHA256SUMS +
-# install scripts + smoke-gated go-live. No editor artifact is built by
-# either remote: luabox-vscode and luabox-jetbrains live in their own repos
-# and release their own .vsix/plugin zip. See RELEASING.md. See GL#94.
+# This file is a PORT of six GitHub Actions workflows, not a new pipeline:
+#   .github/workflows/ci.yml                  -> check, ignored-deterministic-tests,
+#                                                coverage-unit, coverage-e2e,
+#                                                perf-gate-selftest, perf-gate-selftest-ps1,
+#                                                perf-gates, examples, draft-install-mock
+#   .github/workflows/mutants.yml             -> mutants-gate-selftest, mutants-pr, mutants
+#   .github/workflows/differential.yml        -> differential
+#   .github/workflows/verdict-differential.yml-> verdict-differential-selftest, verdict-differential
+#   .github/workflows/luals-parity.yml        -> luals-differential-selftest, luals-parity
+#   .github/workflows/fuzz.yml                -> fuzz (parallel:matrix over three targets)
 #
-# Divergence from .github/workflows/ci.yml (intentional, noted here rather
-# than silently dropped):
-#   - No `os` matrix for `check`/`test` — this pipeline runs on whatever
-#     Linux shared runner the instance provides. Windows/macOS coverage
-#     lives on GitHub Actions, not as a check gate here.
-#   - `perf-gates` (scripts/perf-gate.sh) and `examples` (scripts/examples.sh)
-#     are not mirrored, for two different reasons that both still hold:
-#     perf-gate.sh asserts wall-clock budgets and needs a stable, unshared
-#     runner to mean anything (LUABOX_PERF_FACTOR can absorb a slow machine,
-#     but not an unpredictable one — a gate that flakes teaches people to
-#     re-run it); examples.sh needs a provisioned `lua5.1` + `unzip`, and the
-#     instance's shared runners are not guaranteed to allow `apt-get`.
-#     GitHub Actions remains their home until the instance has a runner that
-#     can promise both. Tracked as a follow-up, not an oversight.
-#   - The coverage jobs below install cargo-llvm-cov from its upstream
-#     release tarball rather than via `taiki-e/install-action` (an Actions-only
-#     mechanism). Same binary, same version selection (latest), no compile.
+# .github/workflows/release.yml is DELIBERATELY NOT ported (GL#74 scope): it is
+# tag-driven and owner-gated, and the release pipeline of record stays on the
+# public GitHub remote. See RELEASING.md.
+#
+# The Actions workflows stay in place and keep running on the GitHub mirror —
+# retiring them is a later decision, and until then the mirror is what still
+# covers the two platforms this instance cannot (see NARROWING below).
+#
+# ---------------------------------------------------------------------------
+# NARROWING (measured, 2026-08-09 — not an oversight, and not silent)
+# ---------------------------------------------------------------------------
+# Runners on this instance (GET /projects/40/runners, then GET /runners/<id>):
+# five online, all `platform: linux`, `architecture: amd64`, runner 18.11.2 —
+# but only ONE of them (id 3) has `run_untagged: true`. The other four are
+# persona-tagged (starscream/skywarp/thundercracker/shockwave) with
+# `run_untagged: false`, so every untagged job in this file lands on that one
+# runner. Nothing here is tagged, deliberately: tagging would pin CI to a
+# persona's runner and starve it.
+#
+# The executor is DOCKER, not shell — the API does not expose it, so it was
+# read off a live trace on this instance instead (project 34, job 14583:
+# `Preparing the "docker" executor` / `Using Docker executor with image
+# node:22-bookworm-slim`). That is why every job below names an `image:` and
+# runs `apt-get` as root with no `sudo` (the Actions originals used `sudo`
+# because GitHub's runners are shell hosts; a container has no sudo installed
+# and does not need one).
+#
+#   1. ci.yml's `check` runs a 3-OS matrix (ubuntu/macos/windows). There are no
+#      macOS or Windows runners here, so it narrows to LINUX ONLY. Windows and
+#      macOS coverage stays on the GitHub mirror's Actions until this instance
+#      has runners for them. The matrix's ubuntu-only extra step (`cargo test
+#      --manifest-path tools/differ/Cargo.toml`) therefore simply always runs.
+#   2. ci.yml's `perf-gate-selftest-ps1` runs on `windows-latest`. Here it runs
+#      under Linux `pwsh` (pinned tarball, see the job). That job's own header
+#      in scripts/tests/perf-gate-selftest.ps1 already records what a Linux
+#      pwsh run covers and the three legs it structurally cannot (Process.Start
+#      FileName semantics, PeakWorkingSet64, working-set accounting) — those
+#      stay the GitHub job's business. Running the suite on Linux is strictly
+#      more than not running 600+ lines of gate code at all, which is the
+#      audit-nothing shape decisions/12 refuses.
+#   3. Nothing else narrows. Every other Actions job has a 1:1 job below with
+#      the same steps, the same order, the same timeout and the same artifacts.
+#
+# ---------------------------------------------------------------------------
+# IMAGE
+# ---------------------------------------------------------------------------
+# ONE image for every job: `rust:1.92-trixie` (Debian 13). Reasons, in order:
+#   - It carries rustup, so `cargo`/`rustc` resolve rust-toolchain.toml
+#     (channel 1.92.0, components rustfmt+clippy) exactly as they do locally —
+#     the toolchain is pinned by the repo, never by the image tag. The image's
+#     own toolchain is 1.92.0 too, so that resolution is a no-op rather than a
+#     download; `rustup component add` in `.rust` below covers the components
+#     the official image's `--profile minimal` install omits.
+#   - It carries git, curl, wget and bash, which the gate scripts and the
+#     runner's own clone step need.
+#   - Debian trixie's archive carries all five Lua runtimes the differential
+#     job installs (lua5.1, lua5.2, lua5.3, lua5.4, luajit — checked against
+#     packages.debian.org/trixie, 2026-08-09). That is the ONLY reason
+#     differential.yml pins `ubuntu-22.04` instead of `-latest`: lua5.2 was
+#     dropped from later Ubuntu releases. Trixie still has it, so the pin's
+#     purpose survives the port on a Debian base.
+#   - A second base image would be a second pull on a single shared runner for
+#     no capability we need. Everything else (python3, jq, unzip, libicu, the
+#     Lua runtimes) is one `apt_install` line in the job that needs it.
+# Pinned to `-trixie` rather than bare `rust:1.92` on purpose: the bare tag
+# follows Debian's default and would move the apt archive under the
+# differential job's feet without anyone editing this file.
+#
+# ---------------------------------------------------------------------------
+# CACHING
+# ---------------------------------------------------------------------------
+# Swatinem/rust-cache has no GitLab equivalent, and this instance has NO shared
+# cache server (the runner's own trace says so: "No URL provided, cache will
+# not be downloaded from shared cache server. Instead a local version of cache
+# will be extracted"), so caches are local to that one untagged runner — which
+# is exactly where every job in this file lands, so they hit. Two entries per
+# rust job, both keyed on Cargo.lock + rust-toolchain.toml so a dependency or
+# toolchain bump invalidates them:
+#   - `cargo-home`: the registry/git checkouts and installed cargo subcommands,
+#     shared by every job (identical content, one copy).
+#   - `target-<job>`: the build directory, keyed PER JOB, mirroring the
+#     per-job `key:` the Actions workflows pass to rust-cache. Jobs here do not
+#     agree on RUSTFLAGS (see DENY-WARNINGS below) or on profile, and a shared
+#     target dir would make them evict each other's artifacts every run.
+# CARGO_HOME is moved inside the project directory because GitLab can only
+# cache paths under $CI_PROJECT_DIR; $CARGO_HOME/bin is put back on PATH so
+# directly-invoked subcommands (mutants-gate.sh does `command -v
+# cargo-mutants`) still resolve.
+#
+# ---------------------------------------------------------------------------
+# TIMEOUTS
+# ---------------------------------------------------------------------------
+# Every `timeout-minutes:` in the source is ported verbatim as `timeout:`. The
+# jobs the source leaves UNTIMED are the problem: they inherit the platform
+# default, and the two platforms disagree by an order of magnitude — GitHub
+# Actions defaults to 360 minutes, this project's GitLab default is 60
+# (`build_timeout: 3600`, checked 2026-08-09). Silently inheriting 60 would be
+# a tightening nobody chose, and a cold-cache first run on one shared runner is
+# exactly where it would bite. So the six heavy untimed jobs (check,
+# coverage-unit, coverage-e2e, examples, differential, perf-gates) carry an
+# explicit `timeout: 2h`: bounded, so a hang still dies with a signal, and
+# generous, so a cold cache does not. The seconds-to-minutes jobs keep the
+# project default.
+#
+# ---------------------------------------------------------------------------
+# DENY-WARNINGS
+# ---------------------------------------------------------------------------
+# `RUSTFLAGS: -Dwarnings` is NOT global here, because it is not global there:
+# ci.yml, differential.yml and verdict-differential.yml set it; mutants.yml,
+# luals-parity.yml and fuzz.yml set no RUSTFLAGS at all. That is not cosmetic
+# for mutants — a mutant that provokes a warning would fail to compile under
+# -Dwarnings and be counted `unviable` instead of caught-or-missed, which
+# silently changes the very set mutants-allowlist.txt is keyed on. So the flag
+# is applied job-by-job via `.deny-warnings`, matching each source workflow's
+# own `env:` block.
 
 stages:
-  - check
-  - test
-  - coverage
+  - selftest # the gates on the gates: seconds-to-minutes, no cargo build
+  - check    # fmt/clippy/test, coverage, examples
+  - gate     # the merge-blocking measurements
+  - audit    # the full mutation sweep (schedule / manual / main only)
 
 variables:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -Dwarnings
-  # Cache-friendly: keep cargo's registry/git checkouts inside the project
-  # dir so the `cache:` key below actually covers them.
-  CARGO_HOME: ${CI_PROJECT_DIR}/.cargo
+  # Pinned tool versions. Each mirrors a pin in the workflow it came from;
+  # bumping one is a deliberate change that re-measures whatever it gates.
+  CARGO_MUTANTS_VERSION: "27.1.0" # mutants.yml: taiki-e/install-action cargo-mutants@27.1.0
+  LUALS_VERSION: "3.13.5"         # luals-parity.yml env
+  LUALS_SHA256: "5d4316291b8c79b145002318fbb7cc294a327c314e2711e590609b178478eb59"
+  # PowerShell for the .ps1 gate self-test. 7.4.6 is the version
+  # scripts/tests/perf-gate-selftest.ps1's own header records as the one that
+  # ran this suite under Linux for #58 review round 8 — same version, so a red
+  # job here is a code change, not a runtime change. sha256 from the release's
+  # published hashes.sha256, same discipline as the luals pin above.
+  PWSH_VERSION: "7.4.6"
+  PWSH_SHA256: "6f6015203c47806c5cc444c19d8ed019695e610fbd948154264bf9ca8e157561"
 
-default:
-  # rust-version in Cargo.toml (workspace.package) is 1.92; keep this in
-  # lockstep with that and with the `dtolnay/rust-toolchain` pin in
-  # .github/workflows/ci.yml.
-  image: rust:1.92
-  cache:
-    key:
-      files:
-        - Cargo.lock
-    paths:
-      - .cargo/registry/cache
-      - .cargo/registry/index
-      - target
-  before_script:
-    - rustc --version && cargo --version
-
+# Run on merge requests and on pushes to the two long-lived branches, plus the
+# two triggers the scheduled/dispatched Actions jobs need (`schedule` is
+# mutants.yml/differential.yml/fuzz.yml's cron; `web` is this instance's
+# `workflow_dispatch`). The `$CI_OPEN_MERGE_REQUESTS` rule is the standard
+# guard against a branch pipeline and an MR pipeline both firing for one push.
+# The schedules themselves are NOT defined here — they are instance-side
+# (Project -> CI/CD -> Schedules) and are the operator's to create.
 workflow:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "main"'
 
-# check/test/coverage jobs run for MRs and pushes to main. Tag pipelines are
-# handled by GitHub Actions (.github/workflows/release.yml), not here.
-.check_rules: &check_rules
+# ===========================================================================
+# Templates
+# ===========================================================================
+
+# `apt_install` is defined once and used by every job that needs a package.
+# Shell functions survive across before_script/script because the runner
+# concatenates both into a single shell, so this is one definition, not one
+# per job — the `apt-get update && apt-get install` pair was the most
+# copy-pasteable thing in the port.
+.apt-helper:
+  before_script:
+    - |
+      apt_install() {
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "$@"
+      }
+
+# Every job runs in the same image; this is the non-cargo variant (the gate
+# self-tests, which stub the binaries they drive and need no toolchain).
+.linux:
+  image: rust:1.92-trixie
+  before_script:
+    - !reference [.apt-helper, before_script]
+
+# The two cargo cache entries, anchored individually rather than as one list:
+# luals-parity needs these two PLUS its own, and a YAML alias cannot splice a
+# list into a list (nor can `!reference` — verified against this instance's
+# merged config, which nested it). Two map aliases compose cleanly.
+.cache-cargo-home: &cache-cargo-home
+  key:
+    prefix: cargo-home
+    files:
+      - Cargo.lock
+      - rust-toolchain.toml
+  paths:
+    - .cargo/registry/index
+    - .cargo/registry/cache
+    - .cargo/git/db
+    - .cargo/bin
+
+.cache-cargo-target: &cache-cargo-target
+  key:
+    prefix: target-$CI_JOB_NAME_SLUG
+    files:
+      - Cargo.lock
+      - rust-toolchain.toml
+  paths:
+    - target
+    # tools/differ is workspace-EXCLUDED and builds into its own target dir
+    # (`--manifest-path tools/differ/Cargo.toml`), which `target` above does
+    # not cover. Harmlessly empty in the jobs that never build it.
+    - tools/differ/target
+
+.rust:
+  extends: .linux
+  variables:
+    CARGO_HOME: $CI_PROJECT_DIR/.cargo
+  cache:
+    - *cache-cargo-home
+    - *cache-cargo-target
+  before_script:
+    - !reference [.apt-helper, before_script]
+    # $CARGO_HOME moved for caching, so put its bin dir back on PATH: cargo
+    # finds `cargo-<sub>` there by itself, but mutants-gate.sh checks
+    # `command -v cargo-mutants` and cargo-fuzz is invoked as `cargo fuzz`
+    # from a shell that must see it too.
+    - export PATH="$CARGO_HOME/bin:$PATH"
+    # rust-toolchain.toml pins 1.92.0 + rustfmt + clippy. The image ships
+    # 1.92.0 with rustup's `minimal` profile, i.e. WITHOUT those two
+    # components, so add them explicitly rather than relying on rustup's
+    # toolchain-file component handling — cheap, idempotent, and it makes
+    # "the job ran the toolchain this repo pins" a fact rather than an
+    # inference.
+    - rustup component add rustfmt clippy
+    - rustc --version && cargo --version && rustup show active-toolchain
+
+# ci.yml / differential.yml / verdict-differential.yml set this in `env:`;
+# mutants.yml, luals-parity.yml and fuzz.yml deliberately do not. See the
+# DENY-WARNINGS note in the header for why that difference is load-bearing.
+.deny-warnings:
+  variables:
+    RUSTFLAGS: "-Dwarnings"
+
+# Installs the pinned cargo-mutants from its upstream release tarball — the
+# same prebuilt binary taiki-e/install-action fetches, which has no GitLab
+# equivalent. Version-checked rather than existence-checked: $CARGO_HOME/bin
+# is cached, so an existence test alone would let a stale build survive a pin
+# bump, and the allowlist keys on cargo-mutants' verbatim output.
+.install-cargo-mutants:
+  script:
+    - |
+      have="$(cargo-mutants --version 2>/dev/null | awk '{print $2}' || true)"
+      if [ "$have" != "$CARGO_MUTANTS_VERSION" ]; then
+        echo "installing cargo-mutants $CARGO_MUTANTS_VERSION (found: ${have:-none})"
+        curl -sSL -f --retry 3 -o /tmp/cargo-mutants.tar.gz \
+          "https://github.com/sourcefrog/cargo-mutants/releases/download/v${CARGO_MUTANTS_VERSION}/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz"
+        mkdir -p "$CARGO_HOME/bin"
+        # The tarball is a bare `cargo-mutants` at its root (checked against
+        # v27.1.0's asset), so it unpacks straight into the bin dir.
+        tar xzf /tmp/cargo-mutants.tar.gz -C "$CARGO_HOME/bin" cargo-mutants
+        chmod +x "$CARGO_HOME/bin/cargo-mutants"
+        rm -f /tmp/cargo-mutants.tar.gz
+      fi
+      cargo-mutants --version
+
+# cargo-llvm-cov, same story: upstream prebuilt, unpinned `latest` exactly as
+# taiki-e/install-action resolves it for ci.yml's two coverage jobs.
+.install-cargo-llvm-cov:
+  script:
+    - rustup component add llvm-tools-preview
+    - mkdir -p "$CARGO_HOME/bin"
+    - >
+      curl --proto '=https' --tlsv1.2 -fsSL --retry 3
+      https://github.com/taiki-e/cargo-llvm-cov/releases/latest/download/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz
+      | tar xzf - -C "$CARGO_HOME/bin"
+    - cargo llvm-cov --version
+
+# ---------------------------------------------------------------------------
+# Trigger rules
+# ---------------------------------------------------------------------------
+# ci.yml is `push: branches:[main]` + `pull_request` with no paths filter. This
+# repo lands MRs on develop and promotes to main, so the branch half is widened
+# to develop as well: an unfiltered gate that only fires after promotion is one
+# that never gates the branch the work actually lands on. Deliberately NOT
+# widened for the path-filtered gates, whose rules are written per job below —
+# see the note under "Trigger rules" that follows.
+.rules-ci:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "main"'
+
+# The four path-filtered workflows all use `push: branches:[main]` for their
+# branch trigger, and that stays exactly as narrow here. Their jobs cost
+# 15-120 minutes each; running them on every merge into develop as well would
+# put the whole scheduled/promotion budget on the merge path, which is the
+# tradeoff those workflows' own headers say they are avoiding. Merge requests
+# still get every one of them, which is where an author can act on the result.
+#
+# `changes:` is the port of Actions' `paths:`. On MR pipelines it is evaluated
+# against the MR's diff base, which is what `pull_request.paths` means. On
+# branch pipelines GitLab evaluates it against the push's commit range and
+# errs toward running when it cannot determine one — the safe direction for a
+# gate.
+
+.changes-mutants: &changes-mutants
+  # Verbatim from mutants.yml's `&mutants_scope_paths` anchor, with its
+  # self-reference retargeted from the workflow file to this one. The reason
+  # `crates/**` is the WHOLE tree and not just luabox-types is in that
+  # anchor's comment: the test that kills a mutant is not necessarily in the
+  # crate that was mutated.
+  - "crates/**/*"
+  - "scripts/tests/mutants-*"
+  - ".gitlab-ci.yml"
+  - "Cargo.toml"
+  - "Cargo.lock"
+  - "rust-toolchain.toml"
+
+.changes-differential: &changes-differential
+  - "crates/luabox-lower/**/*"
+  - "crates/luabox-syntax/**/*"
+  - "crates/luabox-hir/**/*"
+  - "crates/luabox-bundle/**/*"
+  - "corpus/differ/**/*"
+  - "tools/differ/**/*"
+  - "scripts/tests/control-flow-differential.sh"
+  - "scripts/tests/control-flow-matrix/**/*"
+  - "crates/luabox-diag/**/*"
+  - "crates/luabox-cli/**/*"
+  - "crates/luabox-lint/**/*"
+  - "scripts/tests/lb0510-matrix.sh"
+  - "scripts/tests/lb0510-matrix/**/*"
+  - ".gitlab-ci.yml"
+
+# luals-parity and verdict-differential build the SAME binary the SAME way
+# (`cargo build --locked --release --bin luabox`), so luals-parity.yml derives
+# the binary's full dependency closure and verdict-differential.yml copies it
+# verbatim — every crate reachable by walking luabox-cli's Cargo.toml,
+# including luabox-lsp's own dependency luabox-db even though `check` never
+# calls into it: a broken luabox-db is a broken build of the binary both jobs
+# need, and a filter that cannot see that source just times out or silently
+# doesn't run. Cargo.lock is the pin `--locked` resolves against; the workspace
+# Cargo.toml and rust-toolchain.toml are listed for a different reason each,
+# neither of which `--locked` covers.
+#
+# ONE list backs BOTH gates here, and it carries both gates' driver/self-test/
+# corpus paths as well. The source keeps four hand-maintained copies of this
+# closure (push + pull_request in each of two files) and its own comments
+# record what that costs; the port refuses to reproduce that. The price is
+# that a change to only verdict-differential.sh also starts luals-parity, and
+# vice versa — an occasional extra 30-minute run, in the safe direction. The
+# alternative is two lists free to disagree, which is the defect, not the cost.
+.changes-luabox-gates: &changes-luabox-gates
+  - "crates/luabox-types/**/*"
+  - "crates/luabox-cli/**/*"
+  - "crates/luabox-hir/**/*"
+  - "crates/luabox-syntax/**/*"
+  - "crates/luabox-diag/**/*"
+  - "crates/luabox-manifest/**/*"
+  - "crates/luabox-lint/**/*"
+  - "crates/luabox-lsp/**/*"
+  - "crates/luabox-lower/**/*"
+  - "crates/luabox-bundle/**/*"
+  - "crates/luabox-db/**/*"
+  - "Cargo.toml"
+  - "Cargo.lock"
+  - "rust-toolchain.toml"
+  - ".gitlab-ci.yml"
+  # Each gate's own inputs, listed explicitly and not swept in by a directory
+  # glob alone: an MR touching only a driver or only a self-test must still
+  # start both of that gate's jobs (a prior round shipped a self-test CI never
+  # ran at all — R23/F25).
+  - "scripts/tests/luals-differential.sh"
+  - "scripts/tests/luals-differential-selftest.sh"
+  - "scripts/tests/luals-differential/**/*"
+  - "scripts/tests/verdict-differential.sh"
+  - "scripts/tests/verdict-differential-selftest.sh"
+  - "scripts/tests/verdict-differential/**/*"
+
+.changes-fuzz: &changes-fuzz
+  - "crates/luabox-syntax/**/*"
+  - "fuzz/**/*"
+  - ".gitlab-ci.yml"
+
+# ===========================================================================
+# stage: selftest — the gates on the gates (decisions/12)
+# ===========================================================================
+
+# ci.yml: perf-gate-selftest. Part 1 covers scripts/perf-gate-lib.sh's pure
+# judgement functions; Part 2 (M28) invokes the REAL scripts/perf-gate.sh a
+# dozen times against stub binaries — generated corpora plus ~28s of
+# deliberate stub sleeps, so minutes on a shared runner, which is what the
+# 15-minute budget tracks. 5 minutes fit only the pre-M28 suite and would turn
+# a slow runner into a red MR. No cargo: the binaries are stubs.
+perf-gate-selftest:
+  extends: [.linux, .rules-ci]
+  stage: selftest
+  timeout: 15m
+  needs: []
+  script:
+    # The peak-RSS legs of the real gate read scripts/peak-rss.py; the
+    # self-test drives them.
+    - apt_install python3
+    - bash scripts/tests/perf-gate-selftest.sh
+
+# ci.yml: perf-gate-selftest-ps1, narrowed from windows-latest to Linux pwsh —
+# see NARROWING (2) in the header for exactly what that keeps and what it
+# hands back to the GitHub mirror.
+#
+# The first-real-execution discipline this job exists for ports unchanged: the
+# three .ps1 gate files ship alongside the bash ones (#58 round 6, M51), and
+# without a job that RUNS them, 600+ lines of gate code would reach main
+# having never executed on any platform — the audit-nothing shape decisions/12
+# refuses. This is not that suite's first run (round 8 ran it under pwsh 7.4.6
+# on Linux by hand, which is the version pinned above); it is the job that
+# keeps it from becoming code nothing runs again.
+perf-gate-selftest-ps1:
+  extends: [.linux, .rules-ci]
+  stage: selftest
+  timeout: 20m
+  needs: []
+  cache:
+    - key: pwsh-$PWSH_VERSION
+      paths:
+        - .pwsh
+  script:
+    # pwsh is a .NET application and needs ICU for culture-sensitive
+    # formatting and comparison. libicu-dev is the one package name that is
+    # stable across Debian releases (the versioned runtime package is not),
+    # and it pulls the matching runtime. Running pwsh in
+    # DOTNET_SYSTEM_GLOBALIZATION_INVARIANT mode instead would change how the
+    # suite's millisecond figures parse and compare — not a substitution to
+    # make under a gate that judges numbers.
+    - apt_install libicu-dev
+    - |
+      if [ ! -x "$CI_PROJECT_DIR/.pwsh/pwsh" ]; then
+        # -f so a missing/renamed asset fails here as a fetch error rather
+        # than one line later as `sha256sum: FAILED`, which reads identically
+        # to tampering and hides the actual fix (bump the pin). Same
+        # reasoning as luals-parity's install step below.
+        curl -sSL -f --retry 3 -o pwsh.tar.gz \
+          "https://github.com/PowerShell/PowerShell/releases/download/v${PWSH_VERSION}/powershell-${PWSH_VERSION}-linux-x64.tar.gz"
+        echo "${PWSH_SHA256}  pwsh.tar.gz" | sha256sum -c -
+        mkdir -p "$CI_PROJECT_DIR/.pwsh"
+        tar xzf pwsh.tar.gz -C "$CI_PROJECT_DIR/.pwsh"
+        chmod +x "$CI_PROJECT_DIR/.pwsh/pwsh"
+        rm -f pwsh.tar.gz
+      fi
+    - pwsh_bin="$CI_PROJECT_DIR/.pwsh/pwsh"
+    - $pwsh_bin --version
+    - $pwsh_bin -NoProfile -File ./scripts/tests/perf-gate-selftest.ps1
+
+# mutants.yml: gate-selftest (renamed — this file holds four self-tests and
+# `gate-selftest` names none of them). Seconds, no cargo-mutants, no build, so
+# it runs ahead of the jobs it guards. Both #58 review rounds found the gate
+# reporting OK for a run that proved nothing; its cases are that class of
+# defect, staged.
+#
+# It still installs the toolchain (via .rust) for the reason mutants.yml gives:
+# the gate shells out through `cargo`, a rustup shim that resolves
+# rust-toolchain.toml before ever reaching the stubbed cargo-mutants this
+# self-test substitutes. Resolving once up front means a toolchain problem
+# fails as itself, not as "cargo-mutants failed with exit 1" on each of the
+# suite's gate invocations.
+mutants-gate-selftest:
+  extends: .rust
+  stage: selftest
+  timeout: 5m
+  needs: []
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *changes-mutants
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
     - if: '$CI_COMMIT_BRANCH == "main"'
-
-fmt:
-  stage: check
-  <<: *check_rules
+      changes: *changes-mutants
   script:
-    - rustup component add rustfmt
+    - bash scripts/tests/mutants-gate-selftest.sh
+
+# luals-parity.yml: differential-selftest (renamed for the same reason as
+# above). R23/F25 found this driver's self-test existed but nothing in CI ever
+# ran it. Both binaries the driver drives are stubbed by the self-test itself
+# (STUB-LUABOX-DIAG / STUB-LUALS-DIAG markers), so no toolchain, no cargo
+# build and no pinned luals download — seconds, not the 30-minute budget of
+# the job it guards.
+luals-differential-selftest:
+  extends: .linux
+  stage: selftest
+  timeout: 5m
+  needs: []
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *changes-luabox-gates
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes: *changes-luabox-gates
+  script:
+    - apt_install python3
+    - bash scripts/tests/luals-differential-selftest.sh
+
+# verdict-differential.yml: verdict-differential-selftest. Same discipline,
+# same reason; luabox is stubbed by the self-test (STUB-LUABOX-DIAG markers,
+# no real typecheck), so no toolchain and no release build.
+verdict-differential-selftest:
+  extends: .linux
+  stage: selftest
+  timeout: 5m
+  needs: []
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *changes-luabox-gates
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes: *changes-luabox-gates
+  script:
+    - apt_install python3
+    - bash scripts/tests/verdict-differential-selftest.sh
+
+# ci.yml: draft-install-mock. scripts/install.sh's draft-release path
+# (LUABOX_DRAFT_INSTALL=1) needs a draft release, a token that can see it, and
+# asset endpoints that 302 to storage — so nothing exercised it until a real
+# `v*` tag ran release.yml's verify job, i.e. the first run of that code was a
+# production release. This runs the REAL installer, unmodified, against a
+# python3-stdlib mock of the release API, pointed at with the CI-only
+# LUABOX_API_BASE override. Four fast legs; no cargo, no toolchain.
+draft-install-mock:
+  extends: [.linux, .rules-ci, .deny-warnings]
+  stage: selftest
+  needs: []
+  script:
+    - apt_install jq wget python3
+    # The mock and the installer's draft path both need these; assert them
+    # rather than discovering a silent SKIP in the log.
+    - jq --version && wget --version | head -1 && python3 --version
+    - bash scripts/tests/draft-install-mock.sh
+
+# ===========================================================================
+# stage: check
+# ===========================================================================
+
+# ci.yml: check. One job, the source's step order, narrowed to Linux (see
+# NARROWING (1)). The `cargo clippy ... -- -D warnings` tail is belt-and-braces
+# and stays: the workspace declares [workspace.lints.clippy] at warn, and env
+# RUSTFLAGS=-Dwarnings denies only *rustc* warnings, so without it a pedantic
+# clippy finding passes CI silently.
+check:
+  extends: [.rust, .rules-ci, .deny-warnings]
+  stage: check
+  needs: []
+  timeout: 2h # untimed in the source; see TIMEOUTS in the header
+  script:
     - cargo fmt --all --check
-
-clippy:
-  stage: check
-  <<: *check_rules
-  script:
-    - rustup component add clippy
     - cargo clippy --workspace --all-targets -- -D warnings
-
-# `cargo test --workspace` needs no external Lua runtime for this to be green,
-# because luabox spawns no interpreter and neither does its test suite. The
-# cucumber acceptance suite (crates/luabox-cli/tests/acceptance.rs) drives the
-# real luabox binary against temp-dir fixtures; the only scenarios that would
-# want an interpreter are the bundler's optional real-runtime checks, which
-# probe for `lua` on PATH and skip themselves when it is absent. So: no
-# `apt-get install lua5.1` here, unlike the GitHub Actions `examples` job,
-# which deliberately executes a built bundle to verify the compiler's output.
-test:
-  stage: test
-  <<: *check_rules
-  script:
     - cargo test --workspace
+    # tools/differ is deliberately workspace-EXCLUDED (it links real
+    # interpreters' behaviour, not the product), so nothing above compiles it —
+    # a workspace API change can silently rot it until the differential job
+    # runs (exactly what happened on #45 with the typed-Code u16 seam). In the
+    # source this step is gated to the ubuntu leg of the matrix; with the
+    # matrix narrowed to Linux it simply always runs. The full harness still
+    # runs in `differential` below.
+    - cargo test --manifest-path tools/differ/Cargo.toml
 
-# Dual line-coverage gates, mirroring .github/workflows/ci.yml's coverage-unit
-# and coverage-e2e — same two isolated suites, same floors, same per-crate
-# check. Keep the floors here and there identical: two pipelines disagreeing
-# about the bar is worse than one pipeline not having it.
-#   - unit: every in-process test with the cucumber e2e binaries excluded.
-#     Floor 95.
-#   - e2e:  the black-box cucumber suites alone. Floor 83.
-# Raise a floor as its number rises — never lower one to make an MR pass.
-.coverage_setup: &coverage_setup
-  - rustup component add llvm-tools-preview
-  # Upstream prebuilt; the Actions jobs get the same binary via
-  # taiki-e/install-action, which has no GitLab equivalent.
-  - >
-    curl --proto '=https' --tlsv1.2 -fsSL
-    https://github.com/taiki-e/cargo-llvm-cov/releases/latest/download/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz
-    | tar xzf - -C "$CARGO_HOME/bin"
-  - cargo llvm-cov --version
+# ci.yml: ignored-deterministic-tests. `cargo test --workspace` in `check`
+# skips every `#[ignore]`d test by construction and no job passed `--ignored`,
+# so four claims in this repo's review record were "pinned" by tests nothing
+# ever executed (#58 review round 8, F10). Two of the four are deterministic
+# and belong in CI:
+#   malformed_class_headers_m66     M66's pin — today's MEASURED behaviour for
+#                                   malformed `---@class` headers, a known bug
+#                                   deliberately pinned so the day it changes
+#                                   is visible. Pure, in-process, no clock.
+#   regen_merge_matrix_provenance   M42's pin, and the only test that reads the
+#                                   merge-matrix fixtures through a real
+#                                   `luabox check` SUBPROCESS. Needs a release
+#                                   binary, hence the build step.
+# The other two (search_order_cache_wall_time_by_depth,
+# project_types_sweep_wall_time) stay `#[ignore]`d: they assert wall-clock
+# bounds, which is flaky-by-design on a shared runner. perf-gate.sh is where
+# this repo gates time.
+#
+# `--exact` plus the run-count assertion is round 11 review R11-2: a libtest
+# name filter that matches NOTHING exits 0, so a rename would leave this job
+# green having executed zero tests — the F10 failure mode reproduced one level
+# up in the job built to close it.
+#
+# regen_merge_matrix_provenance WRITES
+# docs/03-reference/merge-matrix-provenance.md — that is its job. This runs it
+# for its ASSERTIONS and discards the write, because the committed doc was
+# generated with LUABOX_DEVELOP_BIN pointing at a develop-built binary that
+# this job does not have, so its output legitimately differs in the develop
+# column. `git diff --exit-code` after the restore is the guard that the
+# discard is complete.
+#
+# The restore-and-assert runs from an EXIT trap rather than an `after_script`:
+# the source marks that step `if: always()` AND expects its failure to fail the
+# job, and GitLab's after_script cannot do the second half — its exit status is
+# ignored. The trap keeps both halves.
+ignored-deterministic-tests:
+  extends: [.rust, .rules-ci, .deny-warnings]
+  stage: check
+  timeout: 20m
+  needs: []
+  script:
+    - |
+      discard_provenance_regen() {
+        rc=$?
+        echo "--- discarding the provenance doc regeneration ---"
+        git checkout -- docs/03-reference/merge-matrix-provenance.md
+        if ! git diff --exit-code; then
+          echo "error: the checkout is modified beyond the provenance doc this job discards;" >&2
+          echo "       a test started writing somewhere else — find it rather than widening the restore." >&2
+          rc=1
+        fi
+        exit "$rc"
+      }
+      trap discard_provenance_regen EXIT
+    # regen_merge_matrix_provenance shells out to a real release binary and
+    # asserts it exists before doing anything else.
+    - cargo build --release -p luabox-cli
+    - |
+      set -o pipefail
+      cargo test -p luabox-types --test class_merge_precedence_matrix \
+        -- --ignored --exact malformed_class_headers_m66 regen_merge_matrix_provenance \
+        | tee ignored-tests.log
+      passed="$(sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' ignored-tests.log)"
+      rm -f ignored-tests.log
+      if [ "$passed" != "2" ]; then
+        echo "error: expected exactly 2 deterministic #[ignore]d tests to run, libtest reported '${passed:-<no summary line>}'" >&2
+        echo "A filter that matches nothing exits 0 — this job asserts the two named tests" >&2
+        echo "actually EXECUTED. If a test was renamed, update the filters above; if one was" >&2
+        echo "added, add it here deliberately and raise this count." >&2
+        exit 1
+      fi
+
+# ci.yml: coverage-unit / coverage-e2e. Dual line-coverage gates measured as
+# two ISOLATED suites so each style of testing independently guarantees
+# behaviour:
+#   - unit: every in-process test (libs, bins, per-crate tests/) with the
+#     cucumber e2e binaries excluded. Floor 95 (measured 96.9%).
+#   - e2e:  the black-box cucumber suites alone (acceptance + lsp_acceptance
+#     driving the real binary). Floor 83 (measured 85.7%).
+# Raise a floor as its number rises — never lower one to make an MR pass, and
+# never let this file and .github/workflows/ci.yml disagree about the bar.
+#
+# One deliberate reordering versus the source: the lcov report is written
+# BEFORE the floor check, not after it under `if: always()`. GitLab has no
+# per-step `if:`, and the point of that flag is that a FAILING run still leaves
+# an artifact to read. `report` is a pure read of the same profraw data either
+# way, so emitting it first gives the same guarantee with no extra machinery.
+.coverage:
+  extends: [.rust, .rules-ci, .deny-warnings]
+  stage: check
+  needs: []
+  timeout: 2h # untimed in the source; see TIMEOUTS in the header
+  before_script:
+    - !reference [.rust, before_script]
+    - !reference [.install-cargo-llvm-cov, script]
 
 coverage-unit:
-  stage: coverage
-  <<: *check_rules
+  extends: .coverage
   script:
-    - *coverage_setup
-    # `--workspace --exclude luabox-cli` rather than ci.yml's explicit `-p`
-    # list: it selects exactly the same crates (every library crate) and does
-    # not have to be edited when a crate is added or renamed. The CLI is
-    # measured separately below because only some of its test targets belong
-    # to the unit suite.
-    - cargo llvm-cov --no-report --workspace --exclude luabox-cli
-    - cargo llvm-cov --no-report -p luabox-cli --bins --test cross_package_defs --test watch
-    - cargo llvm-cov report --fail-under-lines 95
+    - >
+      cargo llvm-cov --no-report
+      -p luabox-bundle -p luabox-db -p luabox-diag -p luabox-hir
+      -p luabox-lint -p luabox-lower -p luabox-lsp -p luabox-manifest
+      -p luabox-syntax -p luabox-types
+    # Every luabox-cli test target EXCEPT the two cucumber binaries
+    # (acceptance, lsp_acceptance), which are the e2e suite measured below. A
+    # new `tests/*.rs` has to be added here or its lines silently stop
+    # counting towards the unit floor.
+    - >
+      cargo llvm-cov --no-report
+      -p luabox-cli --bins --test cross_package_defs --test watch
+      --test broken_pipe --test atomic_rewrite --test deep_pipeline
     - cargo llvm-cov report --lcov --output-path lcov-unit.info
+    - cargo llvm-cov report --fail-under-lines 95
     # The aggregate floor above can hide a small crate eroding; this enforces
-    # the per-crate invariant the docs claim (every crate >= 92 unit lines).
-    # The rust image carries no python3, so install it for this one step.
-    - apt-get update && apt-get install -y --no-install-recommends python3
+    # the per-crate invariant the docs claim (every crate >= 92 unit lines —
+    # measured min today: luabox-cli 92.5). See #17.
+    - apt_install python3
     - python3 scripts/per-crate-coverage.py lcov-unit.info 92
   artifacts:
     when: always
+    expire_in: 30 days
     paths:
       - lcov-unit.info
 
 coverage-e2e:
-  stage: coverage
-  <<: *check_rules
+  extends: .coverage
   script:
-    - *coverage_setup
-    - cargo llvm-cov --no-report -p luabox-cli --test acceptance --test lsp_acceptance
-    - cargo llvm-cov report --fail-under-lines 83
+    - >
+      cargo llvm-cov --no-report
+      -p luabox-cli --test acceptance --test lsp_acceptance
     - cargo llvm-cov report --lcov --output-path lcov-e2e.info
+    - cargo llvm-cov report --fail-under-lines 83
   artifacts:
     when: always
+    expire_in: 30 days
     paths:
       - lcov-e2e.info
+
+# ci.yml: examples. Every example project under examples/ must pass check +
+# fmt --check + lint cleanly against the real binary, plus its per-example
+# extras (build, bundle, .love packaging) and executing the built bundle on
+# lua5.1. `unzip` inspects the .love archive; `lua5.1` executes the timemachine
+# bundle the script just built (5.4 source lowered to minified 5.1) — CI
+# executes the compiler's output to verify it, because a compiler whose emit is
+# never run is only checked against its own opinion of it. The product itself
+# still never runs Lua; the interpreter belongs to this harness, and
+# scripts/examples.sh SKIPs the run step when it is absent.
+examples:
+  extends: [.rust, .rules-ci, .deny-warnings]
+  stage: check
+  needs: []
+  timeout: 2h # untimed in the source; see TIMEOUTS in the header
+  script:
+    - cargo build --release --bin luabox
+    - apt_install unzip lua5.1
+    - bash scripts/examples.sh
+
+# ===========================================================================
+# stage: gate — the merge-blocking measurements
+# ===========================================================================
+
+# ci.yml: perf-gates. SPEC.md §16.1 — perf gates are CI-blocking.
+# scripts/perf-gate.sh is the authoritative list and holds the calibration
+# notes for every budget; it runs eight timed legs plus two memory legs, all
+# live. Legs 6-9 exist because the corpus legs 2-4 use is *clean*, so none of
+# them ever times per-diagnostic work — the blind spot that hid an
+# O(diagnostics x file size) line lookup. Leg 4 is the first memory leg
+# (decisions/07 accepted a ~1.9x peak-RSS regression and nothing enforced the
+# ceiling side of that trade until it was added); leg 5 is the second, on a
+# dedicated 500-tiny-file corpus, and pins RAYON_NUM_THREADS internally around
+# the one leg it applies to. The LSP keystroke-to-diagnostics budget in §16.1
+# is NOT gated here — no harness drives the protocol yet.
+#
+# Every *timed* budget is scaled by LUABOX_PERF_FACTOR; the RSS budgets
+# deliberately are not — a slow machine runs the same allocations.
+#
+# The factor stays at ci.yml's 4.0 across the port. It was calibrated for
+# GitHub-hosted runners, which are slower and noisier than the dev box the
+# budgets in scripts/perf-gate-budgets.env were measured on; this instance's
+# shared runner is a different machine again, and if this job proves flaky
+# here THIS is the knob — not the budgets, and not deleting the job.
+# Deliberately no ms figures in this comment (#58 review round 8, F18): every
+# base, every ceiling and the measurement each was derived from live in
+# perf-gate-budgets.env, next to the constant they justify. Raising the factor
+# does not widen a budget without bound — each scaled leg also carries a
+# *_CEILING_MS cap on the scaled value, so a leg's effective budget is
+# min(base x factor, ceiling).
+perf-gates:
+  extends: [.rust, .rules-ci, .deny-warnings]
+  stage: gate
+  timeout: 2h # untimed in the source; see TIMEOUTS in the header
+  needs:
+    - perf-gate-selftest
+  variables:
+    LUABOX_PERF_FACTOR: "4.0"
+  script:
+    - apt_install python3
+    # The peak-RSS legs SKIP loudly when python3 is missing — fine on a dev
+    # box, but CI must never run a gate with a leg silently absent. Assert the
+    # tooling up front, the way draft-install-mock does.
+    - python3 --version
+    # perf-gate.sh builds both binaries it measures itself (luabox-cli and
+    # tools/gen-corpus); the LUABOX_BIN/GEN_CORPUS_BIN seam that skips that
+    # build is for the self-test, not for real runs.
+    - bash scripts/perf-gate.sh
+
+# differential.yml: differential. Differential execution of lowered output vs
+# source on real runtimes (SPEC.md §16.1/§16.2, GL#23). Merge-blocking: any
+# MISMATCH / LOWER-ERR fails the job. Missing interpreters only SKIP their
+# pairs (the harness prints which), so a package disappearing from the archive
+# degrades coverage loudly-but-green rather than breaking the build.
+#
+# The source pins `ubuntu-22.04` (jammy), not `-latest`, because jammy carries
+# ALL five runtimes — lua5.2 was dropped from later Ubuntu releases, and the
+# 5.2 legs (bit32 polyfill backend, _ENV source dialect) are exactly the ones
+# we don't want silently skipped. Debian trixie, this file's one image, still
+# carries all five, so that pin's purpose survives the port; the best-effort
+# install with a loud warning per package is kept unchanged so a future archive
+# change still degrades to documented SKIPs.
+differential:
+  extends: [.rust, .deny-warnings]
+  stage: gate
+  needs: []
+  timeout: 2h # untimed in the source; see TIMEOUTS in the header
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *changes-differential
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes: *changes-differential
+  script:
+    - |
+      apt-get update -qq
+      for pkg in lua5.1 lua5.2 lua5.3 lua5.4 luajit; do
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "$pkg"; then
+          echo "warning: apt package $pkg is unavailable on this runner; its differential pairs will be SKIPPED" >&2
+        fi
+      done
+      echo "--- resolved interpreters ---"
+      for bin in lua5.1 lua5.2 lua5.3 lua5.4 luajit; do
+        if command -v "$bin" >/dev/null 2>&1; then
+          "$bin" -v 2>&1 | head -n 1
+        else
+          echo "missing: $bin"
+        fi
+      done
+    # The harness links luabox-lower and luabox-syntax by path, so this build
+    # also compiles the lowering crates under -Dwarnings.
+    - cargo build --release --manifest-path tools/differ/Cargo.toml
+    - cargo test --release --manifest-path tools/differ/Cargo.toml
+    - cargo run --release --manifest-path tools/differ/Cargo.toml -- --corpus corpus/differ --verbose
+    # Control-flow LEGALITY differential (#44) — a different axis from the
+    # sweep above, which executes lowered output: this one holds luabox's
+    # accept/reject verdict for goto/label/break to `luac<V> -p` as live ground
+    # truth, per version, over the committed matrix. The dialect-aware
+    # label-shadowing split is covered by construction. `luac` ships with the
+    # packages installed above.
+    - cargo build --release --bin luabox
+    - bash scripts/tests/control-flow-differential.sh
+    # LB0510 shape matrix (#47) — a third axis on the same binary: for every
+    # shape of `metatable-without-index`, both the lint verdict and what
+    # `lua5.4` actually does when the program runs. It lives here rather than
+    # with the unit suite because the runtime column needs an interpreter, and
+    # this is the job that installs one.
+    - bash scripts/tests/lb0510-matrix.sh
+
+# verdict-differential.yml: verdict-differential. `luabox check --format json`'s
+# diagnostic-code set, re-derived per case and compared to the committed
+# expectations. Merge-blocking. It measures agreement with luabox's OWN PAST
+# verdict (committed once, not re-derived from a rebuilt baseline), which is a
+# genuinely different question from luals-parity's agreement with an
+# INDEPENDENT tool — same binary, same build step, its own job.
+verdict-differential:
+  extends: [.rust, .deny-warnings]
+  stage: gate
+  timeout: 15m
+  needs:
+    - verdict-differential-selftest
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *changes-luabox-gates
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes: *changes-luabox-gates
+  script:
+    # The driver parses `--format json` with python3 and bounds every case with
+    # `timeout`; both are hard requirements it checks for and refuses to run
+    # without. coreutils (`timeout`) is in the image already.
+    - apt_install python3
+    - cargo build --locked --release --bin luabox
+    - bash scripts/tests/verdict-differential.sh
+
+# luals-parity.yml: luals-parity. Run lua-language-server over the corpus in
+# scripts/tests/luals-differential/ and compare both tools' verdicts against
+# the committed expectations. Merge-blocking.
+#
+# The luals version is PINNED (binary release, sha256-verified): the point of
+# the gate is that "matches luals" is measured against a named version, not
+# against whatever happened to be latest. Bumping the pin is a deliberate
+# change that re-measures every row. The unpacked tree is cached on the version
+# key, so a run normally pays the sha256 check and nothing else — a cache hit
+# cannot serve a different version, because the key names the version.
+luals-parity:
+  extends: .rust
+  stage: gate
+  timeout: 30m
+  needs:
+    - luals-differential-selftest
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *changes-luabox-gates
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes: *changes-luabox-gates
+  cache:
+    - *cache-cargo-home
+    - *cache-cargo-target
+    - key: luals-$LUALS_VERSION
+      paths:
+        - .luals
+  script:
+    - apt_install python3
+    - |
+      if [ ! -x "$CI_PROJECT_DIR/.luals/bin/lua-language-server" ]; then
+        # -f: a missing/renamed release asset (404 body, rc=0 without it) must
+        # fail here as a fetch error, not one line later as `sha256sum: FAILED`
+        # — which reads identically to "the pinned artifact was tampered with"
+        # on a security-shaped check and hides the actual fix (bump the pin).
+        # --retry survives a transient CDN blip instead of failing the
+        # merge-blocking job the same way.
+        curl -sSL -f --retry 3 -o luals.tar.gz \
+          "https://github.com/LuaLS/lua-language-server/releases/download/${LUALS_VERSION}/lua-language-server-${LUALS_VERSION}-linux-x64.tar.gz"
+        echo "${LUALS_SHA256}  luals.tar.gz" | sha256sum -c -
+        mkdir -p "$CI_PROJECT_DIR/.luals"
+        tar xzf luals.tar.gz -C "$CI_PROJECT_DIR/.luals"
+        rm -f luals.tar.gz
+      fi
+    - luals_bin="$CI_PROJECT_DIR/.luals/bin/lua-language-server"
+    - $luals_bin --version
+    - cargo build --locked --release --bin luabox
+    # LUALS_REQUIRED=1: the driver SKIPs (exit 0) when no luals binary is on
+    # PATH — a tolerable local convenience for a dev box, but CI always
+    # installs it above, so a SKIP here means the install produced a binary
+    # that was not where LUALS pointed (tarball layout change, a dropped LUALS=
+    # prefix). Without this, that failure mode is a green job that measured
+    # none of the parity it exists to measure (F23).
+    - LUALS="$luals_bin" LUALS_REQUIRED=1 bash scripts/tests/luals-differential.sh
+
+# mutants.yml: mutants-pr. A bounded, BLOCKING mutation run over just what an
+# MR actually changed (#58 review round 6, M22). `--in-diff` (via
+# mutants-gate.sh's IN_DIFF seam) restricts cargo-mutants to mutants in code
+# the diff touches, so this pays only for the MR's own surface, not the whole
+# four-file scope. Still judged against the same committed allowlist as the
+# FULL job: a NEW unwaived survivor or NEW timeout inside the diff fails this
+# job exactly as it would fail `mutants`. What it does NOT do is treat a waived
+# line the diff never touched as proven-dead-or-alive — it is simply not
+# re-measured this run, and is reported that way.
+#
+# THE DIFF SEAM. The source reads `github.event.pull_request.base.sha`; the
+# port reads $CI_MERGE_REQUEST_DIFF_BASE_SHA, which GitLab defines as the merge
+# base of the MR — the same commit `git diff --merge-base` resolves to, so the
+# invocation is kept verbatim rather than simplified: it stays correct if
+# GitLab ever hands back a branch tip instead. GIT_DEPTH: 0 is required for
+# it (the runner's default shallow clone of ~20 commits cannot see an older
+# merge base) and is this file's only clone-depth override.
+#
+# THIS JOB IS MERGE-REQUEST-ONLY, exactly as the source is `pull_request`-only,
+# and there is deliberately no push-to-develop fallback. A bounded diff against
+# $CI_COMMIT_BEFORE_SHA was considered and rejected: mutants.yml's branch
+# trigger runs the FULL `mutants` job, not the diff-bounded one, so a
+# push-triggered `mutants-pr` would be a NEW gate with a new failure mode
+# (the all-zeros first-push sentinel, force-pushes, and merge commits whose
+# "previous push" spans an arbitrary range), not a port of an existing one.
+# Develop pushes therefore run no mutation job at all — the same coverage the
+# source gives them — and the full audit re-measures everything on promotion
+# to main, on the schedule, and on demand from the web UI.
+mutants-pr:
+  extends: .rust
+  stage: gate
+  # A diff-bounded run over one MR's surface is a small fraction of the full
+  # job's tens of minutes — 30 minutes is headroom for an MR that touches a lot
+  # of the scoped files at once, not the expected case.
+  timeout: 30m
+  needs:
+    - mutants-gate-selftest
+  variables:
+    GIT_DEPTH: "0"
+    MUTANTS_OUT: $CI_PROJECT_DIR/mutants-out
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *changes-mutants
+  script:
+    - !reference [.install-cargo-mutants, script]
+    # The path list is READ OUT OF mutants-gate.sh's own `default_files` line
+    # rather than written here a second time: two hand-maintained copies of one
+    # scope drift, and this exact job is the one that would then silently
+    # under-diff an MR touching only the newly-scoped file. The grep is
+    # anchored to the assignment, and the guard below fails the job loudly if
+    # the extraction ever stops matching instead of diffing against nothing.
+    - |
+      # `|| true` is load-bearing (#58 review round 8, F14): a non-matching
+      # grep would otherwise abort at this assignment and make the guard
+      # below — and the message naming the actual fix — unreachable code.
+      default_files="$(grep -oP '^default_files="\K[^"]+' scripts/tests/mutants-gate.sh || true)"
+      if [ -z "$default_files" ]; then
+        echo "error: could not extract default_files from scripts/tests/mutants-gate.sh — the scope's single owner moved; fix this extraction with it" >&2
+        exit 1
+      fi
+      echo "mutants-pr: scope (from mutants-gate.sh): $default_files"
+      # A real bash array, not an unquoted `${default_files//,/ }` (F14): the
+      # unquoted form is word-split AND glob-expanded, so a scope path with a
+      # shell metacharacter, or one matching a file in the runner's cwd, would
+      # diff something other than the scope.
+      IFS=',' read -ra scope_paths <<< "$default_files"
+      mkdir -p "$CI_PROJECT_DIR/.ci-tmp"
+      git diff --merge-base "$CI_MERGE_REQUEST_DIFF_BASE_SHA" HEAD \
+        -- "${scope_paths[@]}" \
+        > "$CI_PROJECT_DIR/.ci-tmp/pr.diff"
+      echo "mutants-pr: diff has $(wc -l < "$CI_PROJECT_DIR/.ci-tmp/pr.diff") line(s) over the mutation scope"
+    # Skipped when the diff is empty: the gate itself would report "OK — the
+    # diff touches nothing mutable" after paying for a full baseline build;
+    # checking the file first spends nothing to conclude the same.
+    - |
+      if [ ! -s "$CI_PROJECT_DIR/.ci-tmp/pr.diff" ]; then
+        echo "mutants-pr: empty diff over the mutation scope — nothing to audit this run"
+        exit 0
+      fi
+      IN_DIFF="$CI_PROJECT_DIR/.ci-tmp/pr.diff" bash scripts/tests/mutants-gate.sh
+  artifacts:
+    # `when: always`, and non-fatal if absent — the GitLab counterpart of the
+    # source's `if-no-files-found: warn` (#58 review round 8, F14). This upload
+    # is the only way an operator reads the report a failing run points them
+    # at: mutants-gate.sh prints "Full log: $out_dir/mutants.out/log" for a
+    # directory that ceases to exist the moment the job ends. An empty diff
+    # legitimately uploads nothing, and GitLab warns rather than failing.
+    when: always
+    expire_in: 30 days
+    paths:
+      - mutants-out/mutants.out
+
+# ---------------------------------------------------------------------------
+# fuzz.yml: fuzz
+# ---------------------------------------------------------------------------
+# Parser fuzzing (SPEC.md §16.1, §16.2). cargo-fuzz/libFuzzer needs a
+# sanitizer-friendly toolchain, so this is Linux-only in the source too — not
+# a narrowing. MRs get a quick smoke run per target (60s); the schedule gets a
+# deeper run (600s) with a persisted corpus so coverage compounds over time.
+#
+# Actions' `strategy.matrix.target` ports to `parallel:matrix`. shape_parse
+# died with the .luab subsystem (#109) — only these three targets exist under
+# fuzz/fuzz_targets/.
+#
+# NIGHTLY: `cargo +nightly fuzz run` needs a nightly toolchain, and the image
+# ships only the pinned 1.92.0. RUSTUP_HOME stays at the image's default
+# (/usr/local/rustup) rather than moving into the project dir to be cached:
+# moving it would hide the image's preinstalled 1.92.0 and trade one nightly
+# download for two toolchain downloads. cargo-fuzz itself IS cached, in
+# $CARGO_HOME/bin, which is the port of the source's dedicated
+# actions/cache on ~/.cargo/bin/cargo-fuzz.
+fuzz:
+  extends: .linux
+  stage: gate
+  needs: []
+  parallel:
+    matrix:
+      - FUZZ_TARGET: [lua_parse, lua_fmt, luacats]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *changes-fuzz
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  variables:
+    CARGO_HOME: $CI_PROJECT_DIR/.cargo
+  cache:
+    - key:
+        prefix: fuzz-cargo-home
+        files:
+          - fuzz/Cargo.lock
+          - rust-toolchain.toml
+      paths:
+        - .cargo/registry/index
+        - .cargo/registry/cache
+        - .cargo/git/db
+        - .cargo/bin
+    - key: fuzz-target-$FUZZ_TARGET
+      paths:
+        - fuzz/target
+    # The corpus cache is the port of the source's rolling
+    # `fuzz-corpus-<target>-<run_id>` + restore-keys pair. GitLab overwrites a
+    # cache under the same key at the end of every job, which gives the same
+    # compounding behaviour with one key instead of two mechanisms. The whole
+    # `fuzz/corpus` tree is the cached path rather than one target's
+    # subdirectory: cache paths are matched before the matrix variable is a
+    # useful glob anchor, and over-capturing a sibling corpus costs disk, not
+    # correctness.
+    - key: fuzz-corpus-$FUZZ_TARGET
+      paths:
+        - fuzz/corpus
+  script:
+    - export PATH="$CARGO_HOME/bin:$PATH"
+    - rustup toolchain install nightly --profile minimal
+    - |
+      if ! command -v cargo-fuzz >/dev/null 2>&1; then
+        cargo +nightly install cargo-fuzz --locked
+      fi
+      cargo +nightly fuzz --version
+    - |
+      # The schedule is the deep run; every other trigger is the smoke run.
+      if [ "$CI_PIPELINE_SOURCE" = "schedule" ]; then
+        seconds=600
+      else
+        seconds=60
+      fi
+      echo "fuzz: $FUZZ_TARGET for ${seconds}s"
+      cd fuzz
+      cargo +nightly fuzz run "$FUZZ_TARGET" -- \
+        -max_total_time="$seconds" \
+        -error_exitcode=1
+  artifacts:
+    when: on_failure
+    expire_in: 30 days
+    paths:
+      - fuzz/artifacts/$FUZZ_TARGET/
+
+# ===========================================================================
+# stage: audit
+# ===========================================================================
+
+# mutants.yml: mutants — the FULL audit. It rides a schedule rather than the
+# merge path: a full run costs tens of minutes, and its job is to find fixtures
+# that cannot fail — the wave-21 failure mode — not to gate every push.
+# Survivors are compared against the committed allowlist
+# (scripts/tests/mutants-allowlist.txt): a NEW survivor fails the job, so the
+# periodic signal is "a test gap appeared", never a drifting score.
+#
+# Triggers, and what each is for:
+#   - schedule  the ongoing backstop. The SCHEDULE ITSELF IS NOT DEFINED HERE
+#               — GitLab pipeline schedules are instance-side (Project ->
+#               CI/CD -> Schedules) and are the operator's to create. Until one
+#               exists this leg simply never fires, which is why the other two
+#               triggers matter.
+#   - web       "Run pipeline" in the UI, this instance's `workflow_dispatch`:
+#               the only way to re-measure the WHOLE scope against an exact
+#               head (e.g. an MR's source branch) before merge. `mutants-pr`
+#               gates an MR's own changes; this is what a maintainer runs when
+#               they want CI, not just a human, to have re-measured everything
+#               else.
+#   - main      promotion. The path filter keeps a docs-only promotion from
+#               starting a 120-minute job for a reason no mutation score could
+#               move on.
+# Merge request pipelines deliberately do NOT run it — that is the source's
+# `if: github.event_name != 'pull_request'`, and it is why a claim like the
+# allowlist header's "MEASURED AGAINST THIS HEAD" is evidence from a run
+# someone did, not evidence CI enforced for the full scope on every push.
+#
+# No FILES= here: the scope's one owner is mutants-gate.sh's own
+# `default_files` default. Re-pinning it in the job is what gave the scope two
+# hand-maintained copies free to drift (F4). Widening the audited set is an
+# edit to that default plus a matching allowlist review — not this job.
+mutants:
+  extends: .rust
+  stage: audit
+  timeout: 120m
+  needs:
+    - mutants-gate-selftest
+  variables:
+    MUTANTS_OUT: $CI_PROJECT_DIR/mutants-out
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes: *changes-mutants
+  script:
+    - !reference [.install-cargo-mutants, script]
+    - bash scripts/tests/mutants-gate.sh
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - mutants-out/mutants.out
