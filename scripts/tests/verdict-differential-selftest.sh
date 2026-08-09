@@ -1,6 +1,6 @@
 #!/bin/bash
 # Self-test for the verdict regression oracle — the gate on the gate, same
-# discipline as luals-differential-selftest.sh and mutants-gate-selftest.sh.
+# discipline as luals-differential-selftest.sh.
 #
 # Why. A gate that cannot fail is worse than no gate: it reads green while
 # measuring nothing, and PR #61's five review rounds each found exactly that

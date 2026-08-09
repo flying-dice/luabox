@@ -181,7 +181,7 @@ work="$(mktemp -d)"
 # `rm -rf`ing it on every exit destroyed that artifact before the operator
 # could open it. Preserve it, and print its path where the operator will
 # actually see it (the stream carrying the summary — see the FAIL-report
-# stream fix below), the same way mutants-gate.sh:65-81 deliberately exempts
+# stream fix below), deliberately exempting
 # its own out_dir from its scratch-file cleanup trap for the identical
 # reason. Only a clean, zero-failure, zero-exit-code run gets cleaned up.
 finish() {

@@ -8,6 +8,16 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ## [Unreleased]
 
+### Removed
+
+- **Mutation testing, wholesale** (operator decision, 2026-08-09): the gate
+  script, its self-test, the reviewed allowlist and the CI jobs (diff-bounded
+  per-PR and scheduled full audit). A full audit cost ~2 hours serialized and
+  the per-push bounded run ~30 minutes, for defect yield judged below the time
+  spent. Every regression test those audits produced stays in the ordinary
+  suites — the tests were the value; the machinery was the cost.
+
+
 **Breaking: `luabox check` rejects Lua it previously accepted.** The #56
 export-seam change below is a narrowing, not a superset — a clean project
 today can fail in CI after upgrading, with no code change of its own. Read

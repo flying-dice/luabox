@@ -96,7 +96,7 @@ env:
 
 jobs:
   # The gate on the gate — same discipline as luals-parity.yml's
-  # differential-selftest and mutants.yml's gate-selftest, for the same
+  # differential-selftest, for the same
   # reason: a self-test that exists but that nothing in CI ever runs is
   # exactly as useless as no self-test (R23/F25 on the sibling gate).
   # luabox is STUBBED by the self-test itself (STUB-LUABOX-DIAG marker

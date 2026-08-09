@@ -6,7 +6,7 @@
 # Part 1 (perf-gate-lib.sh's pure functions: budget arithmetic, "was the
 # corpus actually generated", the manifest writer) runs in milliseconds —
 # no release build, no real `luabox`. This is the split every gate-with-
-# real-judgement self-test in this repo uses (scripts/tests/mutants-gate.sh,
+# real-judgement self-test in this repo uses (scripts/tests/luals-differential.sh,
 # scripts/tests/luals-differential.sh): the expensive step is not what a
 # self-test needs to prove wrong, the JUDGEMENT around it is.
 #
@@ -562,7 +562,7 @@ unset STUB_DIAG_CHECK_RENDERED_S
 # the pin intact, perf-gate.sh's own `RAYON_NUM_THREADS=4 "$luabox_bin"
 # check ...` overrides that ambient value for the one command it wraps, the
 # stub sees "4", reports the LOW RSS, and the leg PASSES. Delete the pin
-# (mutants-gate.sh's own class of mutation, applied here to perf-gate.sh)
+# (hand-applied mutations of the judged script, applied here to perf-gate.sh)
 # and the ambient 16 leaks through unchanged, the stub reports the HIGH
 # RSS, and this exact case goes RED.
 # The stub's own python3 interpreter has a baseline RSS of ~11-12 MiB on

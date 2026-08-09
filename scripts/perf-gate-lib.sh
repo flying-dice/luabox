@@ -3,7 +3,7 @@
 # (scripts/tests/perf-gate-selftest.sh). Kept free of `cargo build`, corpus
 # generation and any real `luabox` invocation so the self-test can source
 # this file directly and exercise the logic in milliseconds — the same
-# split scripts/tests/mutants-gate.sh's awk classification pipeline and
+# split the same class of judgement logic other gates factor out, and
 # scripts/tests/luals-differential.sh's driver already rely on: the
 # expensive step (a mutation run; a release build) is not what a self-test
 # needs to prove wrong, the JUDGEMENT around it is (#58 review round 5,
@@ -106,7 +106,7 @@ read_perf_budgets() {
 # PASS printed against a corpus that was not actually generated the way the
 # budget assumes — an empty directory, a truncated loop, a path a rename
 # left stale — is not evidence of anything; it is the same "auditing
-# NOTHING" gap scripts/tests/mutants-gate.sh's zero-mutants check and
+# NOTHING" gap the sibling gates' zero-input checks and
 # scripts/tests/luals-differential.sh's unclaimed-case check both close on
 # their own inputs. Counts top-level *.lua files only (this repo's
 # generated perf corpora are flat, one file per module) and fails loudly on

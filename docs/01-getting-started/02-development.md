@@ -53,48 +53,16 @@ SKIP into a failure, which is what CI sets, because a job that measures
 nothing must not report success. `LUABOX=` may be relative or absolute; the
 driver resolves it before running each case from a temp project directory.
 
-A third comparison gate runs on a schedule rather than per-PR: mutation
-testing over `luabox-types` (`scripts/tests/mutants-gate.sh`, CI job
-`mutants`). It fires weekly, on a push to the default branch, and on manual
-dispatch — the default-branch trigger matters because GitHub evaluates
-`schedule` only against the workflow file on the default branch, so a cron
-added on a feature branch is dormant until it lands there. Survivors diff against the committed allowlist in
-`scripts/tests/mutants-allowlist.txt` — a new survivor is a fixture gap and
-fails the job; a reviewed survivor is a justified line there. A **timed-out**
-mutant is judged the same way: no test killed it, the run just stopped
-waiting, so a new one fails the job rather than disappearing from the count.
-The comparison is keyed on (file, mutant text) with `line:col` informational,
-so an edit that *moves* a waived mutant is reported as a measured shift
-(both positions printed) rather than being left for a reader to tell apart
-from a real survivor. A shift has to be provable to be reported as one: a
-waived line whose mutant appears in `caught.txt` is retired as killed before
-any pairing runs, and the residual pairing is by sorted position, so a
-never-reviewed survivor cannot inherit the reason of a waiver that a test
-just killed. Anything left unpaired fails the job.
-
-Its scope is the merge-seam neighbourhood, owned by the script default
-alone — the workflow used to restate it, which is how two copies of one
-list start drifting; widening it to `check.rs` waits on #60. Three ways of
-auditing nothing fail rather than pass: a scoped path that no longer exists,
-a run that generated zero mutants, and an allowlist every line of which went
-stale at once — the same rule the luals gate applies to an unclaimed corpus
-case. A fourth is checked before the run starts: every file a waived line
-names must be inside the scope, so narrowing `FILES` cannot quietly retire
-the waivers it stops auditing.
-
-The gate has its own suite, `scripts/tests/mutants-gate-selftest.sh` (CI job
-`gate-selftest`), which runs in seconds against a stubbed cargo-mutants and
-**does** run per-PR — the full audit does not. Each case asserts an exit code
-and a discriminating string, and each was proven by deleting the gate line it
-names and confirming the suite fails. The luals differential has the same
-kind of suite in `scripts/tests/luals-differential-selftest.sh`.
+Mutation testing was removed from this repo (2026-08-09, operator decision):
+the audits cost hours per run for defect yield the team judged below the
+time spent, and the regression tests those audits produced remain in the
+ordinary suites. Do not reintroduce the machinery.
 
 ## Writing fixtures that can fail
 
 The wave-21 lesson (PR #55): the original duplicate-class fixture used the
 one shape where the defect was invisible, so the test passed while the bug
-shipped. Three rules keep that from recurring, and the mutation gate above
-audits the result:
+shipped. Three rules keep that from recurring:
 
 - **Red first.** A fixture that pins a bug must fail against the pre-fix
   binary; commit it red (with the measured count in the message), then the

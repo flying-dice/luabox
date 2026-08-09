@@ -4,7 +4,7 @@
 # needle assertion, a `!needle`-must-be-absent form — was hand-copied
 # byte-for-byte into luals-differential-selftest.sh and
 # verdict-differential-selftest.sh, re-inlined a third time in
-# mutants-gate-selftest.sh's own run(), and perf-gate-selftest.sh invented a
+# each gate selftest's own run(), and perf-gate-selftest.sh invented a
 # FIFTH, weaker vocabulary with no `!needle` support at all — one gate held
 # to a lower bar than the three it was modelled on. One copy, sourced by
 # every self-test in this directory, closes that.
@@ -26,7 +26,7 @@ fail=0
 # The exit-code-plus-needle check every self-test in this directory already
 # hand-rolled under the name `assert` (luals-differential-selftest.sh,
 # verdict-differential-selftest.sh) or inlined directly in `run()`
-# (mutants-gate-selftest.sh). A needle prefixed with `!` must be ABSENT from
+# (the gate selftests). A needle prefixed with `!` must be ABSENT from
 # the log rather than present — a second, unrelated failure path can supply
 # the same "expected" string a deleted line was supposed to produce, and a
 # bare needle can only prove presence, never that the RIGHT code path fired.
@@ -112,7 +112,7 @@ check_false() {
 # assert_exit/check) as "0 passed, 0 failed" — a clean exit 0, the exact
 # "cannot fail by measuring nothing" shape decisions/12 is titled after, one
 # level up inside the self-test itself. verdict-differential-selftest.sh
-# already carried this guard by hand; mutants-gate-selftest.sh's own
+# already carried this guard by hand; an earlier selftest's own
 # "$fail" -eq 0 line did not (it happens to be unreachable in practice
 # because that file's very first case always runs, but the guard should not
 # depend on a file's case ORDER to be true) — both now route through here.

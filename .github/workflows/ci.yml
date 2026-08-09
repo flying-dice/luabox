@@ -252,7 +252,7 @@ jobs:
   # LUABOX_RETAINED_ENV_RSS_BUDGET_MIB override those two on their own.
   #
   # perf-gate-selftest below is the gate on the gate, same discipline (and
-  # same reason) as mutants.yml's gate-selftest and luals-parity.yml's
+  # same reason) as luals-parity.yml's
   # differential-selftest. It is no longer seconds-cheap: Part 1 covers the
   # pure judgement functions scripts/perf-gate-lib.sh factors out, and the
   # behavioural half added for #58 round 6 (M28) invokes the REAL

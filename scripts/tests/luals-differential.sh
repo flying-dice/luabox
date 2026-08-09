@@ -79,7 +79,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 # (every real invocation wants the committed corpus), but it is what lets
 # luals-differential-selftest.sh (#57's answer to F25) point this script at
 # a small, disposable fixture corpus instead of the real 24-row one, the
-# same way mutants-gate.sh's FILES/ALLOWLIST/MUTANTS_OUT let its self-test
+# same way the sibling gates' env seams let their self-tests
 # substitute fixtures without hand-rolling a second copy of the gate.
 corpus="${LUALS_CORPUS:-$here/luals-differential}"
 expected="$corpus/expected.tsv"

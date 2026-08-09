@@ -12,7 +12,7 @@
 # entry that could copy outside the corpus (F27), and a "justified
 # divergence" rule that was prose, not code (F28) — and every one of them
 # was invisible because this file did not exist. This file is audited the
-# same way mutants-gate-selftest.sh audits its own gate: every case below
+# same way every gate self-test in this repo audits its gate: every case below
 # was proven, by deleting or neutering the line(s) in luals-differential.sh
 # it names and re-running this file, to fail when that line is gone.
 #
@@ -21,7 +21,7 @@
 # marker comments out of the fixture .lua files and report exactly those, so
 # a fixture pins an exact, known code set without a real typecheck or a real
 # multi-second luals startup. What is under test is the DRIVER's judgement,
-# not either tool — same division of labour as the sibling file's cargo-mutants
+# not either tool — same division of labour as the sibling selftests'
 # stub. Each fixture corpus is a few files under $work, pointed at via
 # LUALS_CORPUS (added to luals-differential.sh for exactly this reason).
 #

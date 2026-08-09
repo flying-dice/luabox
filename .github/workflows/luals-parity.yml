@@ -87,7 +87,7 @@ env:
   LUALS_SHA256: "5d4316291b8c79b145002318fbb7cc294a327c314e2711e590609b178478eb59"
 
 jobs:
-  # The gate on the gate — same discipline as mutants.yml's `gate-selftest`,
+  # The gate on the gate — same self-test discipline as this repo's other gates,
   # for the same reason: R23/F25 found this driver's own self-test existed
   # (14, now 22, non-vacuous cases) but nothing in CI ever ran it, so a PR
   # that broke luals-differential-selftest.sh's judgement — or broke the

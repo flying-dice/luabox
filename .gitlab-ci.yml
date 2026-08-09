@@ -5,7 +5,11 @@
 #                                                coverage-unit, coverage-e2e,
 #                                                perf-gate-selftest, perf-gate-selftest-ps1,
 #                                                perf-gates, examples, draft-install-mock
-#   .github/workflows/mutants.yml             -> mutants-gate-selftest, mutants-pr, mutants
+#   mutation testing                          -> REMOVED from the repo entirely
+#                                                (operator decision, 2026-08-09 —
+#                                                decisions/13; time cost above
+#                                                yield; the regression tests it
+#                                                produced remain in the suites)
 #   .github/workflows/differential.yml        -> differential
 #   .github/workflows/verdict-differential.yml-> verdict-differential-selftest, verdict-differential
 #   .github/workflows/luals-parity.yml        -> luals-differential-selftest, luals-parity
@@ -119,7 +123,7 @@
 # DENY-WARNINGS
 # ---------------------------------------------------------------------------
 # `RUSTFLAGS: -Dwarnings` is NOT global here, because it is not global there:
-# ci.yml, differential.yml and verdict-differential.yml set it; mutants.yml,
+# ci.yml, differential.yml and verdict-differential.yml set it; mutants (manual),
 # luals-parity.yml and fuzz.yml set no RUSTFLAGS at all. That is not cosmetic
 # for mutants — a mutant that provokes a warning would fail to compile under
 # -Dwarnings and be counted `unviable` instead of caught-or-missed, which
@@ -150,7 +154,6 @@ variables:
   CARGO_TERM_COLOR: always
   # Pinned tool versions. Each mirrors a pin in the workflow it came from;
   # bumping one is a deliberate change that re-measures whatever it gates.
-  CARGO_MUTANTS_VERSION: "27.1.0" # mutants.yml: taiki-e/install-action cargo-mutants@27.1.0
   LUALS_VERSION: "3.13.5"         # luals-parity.yml env
   LUALS_SHA256: "5d4316291b8c79b145002318fbb7cc294a327c314e2711e590609b178478eb59"
   # PowerShell for the .ps1 gate self-test. 7.4.6 is the version
@@ -265,27 +268,6 @@ workflow:
   variables:
     RUSTFLAGS: "-Dwarnings"
 
-# Installs the pinned cargo-mutants from its upstream release tarball — the
-# same prebuilt binary taiki-e/install-action fetches, which has no GitLab
-# equivalent. Version-checked rather than existence-checked: $CARGO_HOME/bin
-# is cached, so an existence test alone would let a stale build survive a pin
-# bump, and the allowlist keys on cargo-mutants' verbatim output.
-.install-cargo-mutants:
-  script:
-    - |
-      have="$(cargo mutants --version 2>/dev/null | awk '{print $2}' || true)"
-      if [ "$have" != "$CARGO_MUTANTS_VERSION" ]; then
-        echo "installing cargo-mutants $CARGO_MUTANTS_VERSION (found: ${have:-none})"
-        curl -sSL -f --retry 3 -o /tmp/cargo-mutants.tar.gz \
-          "https://github.com/sourcefrog/cargo-mutants/releases/download/v${CARGO_MUTANTS_VERSION}/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz"
-        mkdir -p "$CARGO_HOME/bin"
-        # The tarball is a bare `cargo-mutants` at its root (checked against
-        # v27.1.0's asset), so it unpacks straight into the bin dir.
-        tar xzf /tmp/cargo-mutants.tar.gz -C "$CARGO_HOME/bin" cargo-mutants
-        chmod +x "$CARGO_HOME/bin/cargo-mutants"
-        rm -f /tmp/cargo-mutants.tar.gz
-      fi
-      cargo mutants --version
 
 # cargo-llvm-cov, same story: upstream prebuilt, unpinned `latest` exactly as
 # taiki-e/install-action resolves it for ci.yml's two coverage jobs.
@@ -477,41 +459,6 @@ perf-gate-selftest-ps1:
     - pwsh_bin="$CI_PROJECT_DIR/.pwsh/pwsh"
     - $pwsh_bin --version
     - $pwsh_bin -NoProfile -File ./scripts/tests/perf-gate-selftest.ps1
-
-# mutants.yml: gate-selftest (renamed — this file holds four self-tests and
-# `gate-selftest` names none of them). Seconds, no cargo-mutants, no build, so
-# it runs ahead of the jobs it guards. Both #58 review rounds found the gate
-# reporting OK for a run that proved nothing; its cases are that class of
-# defect, staged.
-#
-# It still installs the toolchain (via .rust) for the reason mutants.yml gives:
-# the gate shells out through `cargo`, a rustup shim that resolves
-# rust-toolchain.toml before ever reaching the stubbed cargo-mutants this
-# self-test substitutes. Resolving once up front means a toolchain problem
-# fails as itself, not as "cargo-mutants failed with exit 1" on each of the
-# suite's gate invocations.
-mutants-gate-selftest:
-  extends: .rust
-  stage: selftest
-  timeout: 5m
-  needs: []
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes: *changes-mutants
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-    - if: '$CI_PIPELINE_SOURCE == "api"'
-    - if: '$CI_COMMIT_BRANCH == "main"'
-      changes: *changes-mutants
-  script:
-    - bash scripts/tests/mutants-gate-selftest.sh
-
-# luals-parity.yml: differential-selftest (renamed for the same reason as
-# above). R23/F25 found this driver's self-test existed but nothing in CI ever
-# ran it. Both binaries the driver drives are stubbed by the self-test itself
-# (STUB-LUABOX-DIAG / STUB-LUALS-DIAG markers), so no toolchain, no cargo
-# build and no pinned luals download — seconds, not the 30-minute budget of
-# the job it guards.
 luals-differential-selftest:
   extends: .linux
   stage: selftest
@@ -952,122 +899,6 @@ luals-parity:
     # prefix). Without this, that failure mode is a green job that measured
     # none of the parity it exists to measure (F23).
     - LUALS="$luals_bin" LUALS_REQUIRED=1 bash scripts/tests/luals-differential.sh
-
-# mutants.yml: mutants-pr. A bounded, BLOCKING mutation run over just what an
-# MR actually changed (#58 review round 6, M22). `--in-diff` (via
-# mutants-gate.sh's IN_DIFF seam) restricts cargo-mutants to mutants in code
-# the diff touches, so this pays only for the MR's own surface, not the whole
-# four-file scope. Still judged against the same committed allowlist as the
-# FULL job: a NEW unwaived survivor or NEW timeout inside the diff fails this
-# job exactly as it would fail `mutants`. What it does NOT do is treat a waived
-# line the diff never touched as proven-dead-or-alive — it is simply not
-# re-measured this run, and is reported that way.
-#
-# THE DIFF SEAM. The source reads `github.event.pull_request.base.sha`; the
-# port reads $CI_MERGE_REQUEST_DIFF_BASE_SHA, which GitLab defines as the merge
-# base of the MR — the same commit `git diff --merge-base` resolves to, so the
-# invocation is kept verbatim rather than simplified: it stays correct if
-# GitLab ever hands back a branch tip instead. GIT_DEPTH: 0 is required for
-# it (the runner's default shallow clone of ~20 commits cannot see an older
-# merge base) and is this file's only clone-depth override.
-#
-# THIS JOB IS MERGE-REQUEST-ONLY, exactly as the source is `pull_request`-only,
-# and there is deliberately no push-to-develop fallback. A bounded diff against
-# $CI_COMMIT_BEFORE_SHA was considered and rejected: mutants.yml's branch
-# trigger runs the FULL `mutants` job, not the diff-bounded one, so a
-# push-triggered `mutants-pr` would be a NEW gate with a new failure mode
-# (the all-zeros first-push sentinel, force-pushes, and merge commits whose
-# "previous push" spans an arbitrary range), not a port of an existing one.
-# Develop pushes therefore run no mutation job at all — the same coverage the
-# source gives them — and the full audit re-measures everything on promotion
-# to main, on the schedule, and on demand from the web UI.
-mutants-pr:
-  extends: .rust
-  stage: gate
-  # A diff-bounded run over one MR's surface is a small fraction of the full
-  # job's tens of minutes — 30 minutes is headroom for an MR that touches a lot
-  # of the scoped files at once, not the expected case.
-  timeout: 30m
-  needs:
-    - mutants-gate-selftest
-  variables:
-    GIT_DEPTH: "0"
-    MUTANTS_OUT: $CI_PROJECT_DIR/mutants-out
-  rules:
-    # MR-only, deliberately: the diff seam below is
-    # CI_MERGE_REQUEST_DIFF_BASE_SHA, which only exists on MR pipelines. An
-    # explicit web/api run on a ref gets the FULL `mutants` job instead —
-    # the same split the source's workflow_dispatch makes.
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes: *changes-mutants
-  script:
-    - !reference [.install-cargo-mutants, script]
-    # The path list is READ OUT OF mutants-gate.sh's own `default_files` line
-    # rather than written here a second time: two hand-maintained copies of one
-    # scope drift, and this exact job is the one that would then silently
-    # under-diff an MR touching only the newly-scoped file. The grep is
-    # anchored to the assignment, and the guard below fails the job loudly if
-    # the extraction ever stops matching instead of diffing against nothing.
-    - |
-      # `|| true` is load-bearing (#58 review round 8, F14): a non-matching
-      # grep would otherwise abort at this assignment and make the guard
-      # below — and the message naming the actual fix — unreachable code.
-      default_files="$(grep -oP '^default_files="\K[^"]+' scripts/tests/mutants-gate.sh || true)"
-      if [ -z "$default_files" ]; then
-        echo "error: could not extract default_files from scripts/tests/mutants-gate.sh — the scope's single owner moved; fix this extraction with it" >&2
-        exit 1
-      fi
-      echo "mutants-pr: scope (from mutants-gate.sh): $default_files"
-      # A real bash array, not an unquoted `${default_files//,/ }` (F14): the
-      # unquoted form is word-split AND glob-expanded, so a scope path with a
-      # shell metacharacter, or one matching a file in the runner's cwd, would
-      # diff something other than the scope.
-      IFS=',' read -ra scope_paths <<< "$default_files"
-      mkdir -p "$CI_PROJECT_DIR/.ci-tmp"
-      git diff --merge-base "$CI_MERGE_REQUEST_DIFF_BASE_SHA" HEAD \
-        -- "${scope_paths[@]}" \
-        > "$CI_PROJECT_DIR/.ci-tmp/pr.diff"
-      echo "mutants-pr: diff has $(wc -l < "$CI_PROJECT_DIR/.ci-tmp/pr.diff") line(s) over the mutation scope"
-    # Skipped when the diff is empty: the gate itself would report "OK — the
-    # diff touches nothing mutable" after paying for a full baseline build;
-    # checking the file first spends nothing to conclude the same.
-    - |
-      if [ ! -s "$CI_PROJECT_DIR/.ci-tmp/pr.diff" ]; then
-        echo "mutants-pr: empty diff over the mutation scope — nothing to audit this run"
-        exit 0
-      fi
-      IN_DIFF="$CI_PROJECT_DIR/.ci-tmp/pr.diff" bash scripts/tests/mutants-gate.sh
-  artifacts:
-    # `when: always`, and non-fatal if absent — the GitLab counterpart of the
-    # source's `if-no-files-found: warn` (#58 review round 8, F14). This upload
-    # is the only way an operator reads the report a failing run points them
-    # at: mutants-gate.sh prints "Full log: $out_dir/mutants.out/log" for a
-    # directory that ceases to exist the moment the job ends. An empty diff
-    # legitimately uploads nothing, and GitLab warns rather than failing.
-    when: always
-    expire_in: 30 days
-    paths:
-      - mutants-out/mutants.out
-
-# ---------------------------------------------------------------------------
-# fuzz.yml: fuzz
-# ---------------------------------------------------------------------------
-# Parser fuzzing (SPEC.md §16.1, §16.2). cargo-fuzz/libFuzzer needs a
-# sanitizer-friendly toolchain, so this is Linux-only in the source too — not
-# a narrowing. MRs get a quick smoke run per target (60s); the schedule gets a
-# deeper run (600s) with a persisted corpus so coverage compounds over time.
-#
-# Actions' `strategy.matrix.target` ports to `parallel:matrix`. shape_parse
-# died with the .luab subsystem (#109) — only these three targets exist under
-# fuzz/fuzz_targets/.
-#
-# NIGHTLY: `cargo +nightly fuzz run` needs a nightly toolchain, and the image
-# ships only the pinned 1.92.0. RUSTUP_HOME stays at the image's default
-# (/usr/local/rustup) rather than moving into the project dir to be cached:
-# moving it would hide the image's preinstalled 1.92.0 and trade one nightly
-# download for two toolchain downloads. cargo-fuzz itself IS cached, in
-# $CARGO_HOME/bin, which is the port of the source's dedicated
-# actions/cache on ~/.cargo/bin/cargo-fuzz.
 fuzz:
   extends: .linux
   stage: gate
@@ -1137,59 +968,3 @@ fuzz:
 # ===========================================================================
 # stage: audit
 # ===========================================================================
-
-# mutants.yml: mutants — the FULL audit. It rides a schedule rather than the
-# merge path: a full run costs tens of minutes, and its job is to find fixtures
-# that cannot fail — the wave-21 failure mode — not to gate every push.
-# Survivors are compared against the committed allowlist
-# (scripts/tests/mutants-allowlist.txt): a NEW survivor fails the job, so the
-# periodic signal is "a test gap appeared", never a drifting score.
-#
-# Triggers, and what each is for:
-#   - schedule  the ongoing backstop. The SCHEDULE ITSELF IS NOT DEFINED HERE
-#               — GitLab pipeline schedules are instance-side (Project ->
-#               CI/CD -> Schedules) and are the operator's to create. Until one
-#               exists this leg simply never fires, which is why the other two
-#               triggers matter.
-#   - web       "Run pipeline" in the UI, this instance's `workflow_dispatch`:
-#               the only way to re-measure the WHOLE scope against an exact
-#               head (e.g. an MR's source branch) before merge. `mutants-pr`
-#               gates an MR's own changes; this is what a maintainer runs when
-#               they want CI, not just a human, to have re-measured everything
-#               else.
-#   - main      promotion. The path filter keeps a docs-only promotion from
-#               starting a 120-minute job for a reason no mutation score could
-#               move on.
-# Merge request pipelines deliberately do NOT run it — that is the source's
-# `if: github.event_name != 'pull_request'`, and it is why a claim like the
-# allowlist header's "MEASURED AGAINST THIS HEAD" is evidence from a run
-# someone did, not evidence CI enforced for the full scope on every push.
-#
-# No FILES= here: the scope's one owner is mutants-gate.sh's own
-# `default_files` default. Re-pinning it in the job is what gave the scope two
-# hand-maintained copies free to drift (F4). Widening the audited set is an
-# edit to that default plus a matching allowlist review — not this job.
-mutants:
-  extends: .rust
-  stage: audit
-  timeout: 120m
-  needs:
-    - mutants-gate-selftest
-  variables:
-    MUTANTS_OUT: $CI_PROJECT_DIR/mutants-out
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      when: never
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-    - if: '$CI_PIPELINE_SOURCE == "api"'
-    - if: '$CI_COMMIT_BRANCH == "main"'
-      changes: *changes-mutants
-  script:
-    - !reference [.install-cargo-mutants, script]
-    - bash scripts/tests/mutants-gate.sh
-  artifacts:
-    when: always
-    expire_in: 30 days
-    paths:
-      - mutants-out/mutants.out

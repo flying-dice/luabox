@@ -29,3 +29,5 @@ Four gates now carry self-tests totalling 88 cases, each verified by neutering t
 A reviewer challenged (4) twice, correctly, on the grounds that a header claiming "measured against this head" has nothing in CI able to confirm it pre-merge. The resolution was to make the claim honest rather than to pay forty minutes per push. If the audit ever becomes cheap enough to run per-PR, revisit — the trade is cost, not principle.
 
 Generalisation: any check whose output is a judgement rather than a value needs a test that the judgement can come out negative. This applies to lint configurations, CI conditionals, and release gates as much as to these four.
+
+> **2026-08-09:** the mutation gate this decision repeatedly cites was removed wholesale — see decision 13. The discipline here still governs the remaining gates.
