@@ -1548,6 +1548,26 @@ mod tests {
             .0
     }
 
+    /// [`check_diagnostics`] on a background thread with a hard wall-clock
+    /// bound, for the k=190 conflicting-diamond fixtures: those finish fast
+    /// ONLY because `MAX_ANCESTRY_RESOLUTIONS` trips. Under a mutation that
+    /// stops the budget counter advancing, an unbounded check here is the
+    /// round-5 exponential — the suite then HANGS and cargo-mutants reads a
+    /// timeout instead of a kill (round 8, the one survivor the second
+    /// mutants-pr run still reported). The bound makes a dead budget a fast
+    /// red.
+    fn check_diagnostics_bounded(cwd: &Path) -> Vec<Diagnostic> {
+        let cwd = cwd.to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(check_diagnostics(&cwd));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(20)).expect(
+            "a budget-capped k=190 diamond check must finish in seconds — an \
+             unbounded run means the resolution budget never tripped",
+        )
+    }
+
     // -- discovery ---------------------------------------------------------
 
     #[test]
@@ -2488,7 +2508,7 @@ mod tests {
             "src/main.lua",
             "---@type A190<string>\nlocal a\nprint(a.item)\n",
         );
-        let diags = check_diagnostics(tmp.path());
+        let diags = check_diagnostics_bounded(tmp.path());
         assert!(
             diags
                 .iter()
@@ -2512,8 +2532,20 @@ mod tests {
         // depth-limit diagnostic once did) would pass every existing test.
         let tmp = project(&manifest("5.4", ""));
         write(tmp.path(), "src/main.lua", &conflicting_diamond_source(190));
-        check(tmp.path(), None, Format::Human)
-            .expect("a cost-limit warning outside strict mode must not fail the check");
+        // Bounded like `check_diagnostics_bounded`: a dead resolution budget
+        // makes this k=190 check the round-5 exponential.
+        let cwd = tmp.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(check(&cwd, None, Format::Human).is_ok());
+        });
+        let ok = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("a budget-capped k=190 check must finish in seconds");
+        assert!(
+            ok,
+            "a cost-limit warning outside strict mode must not fail the check"
+        );
     }
 
     #[test]
@@ -2527,8 +2559,19 @@ mod tests {
         let mut src = String::from("---@diagnostic disable: class-ancestry-too-costly\n");
         src.push_str(&conflicting_diamond_source(190));
         write(tmp.path(), "src/main.lua", &src);
-        check(tmp.path(), None, Format::Human)
-            .expect("a matching `class-ancestry-too-costly` disable comment must suppress LB0319");
+        // Bounded for the same reason as its two k=190 siblings above.
+        let cwd = tmp.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(check(&cwd, None, Format::Human).is_ok());
+        });
+        let ok = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("a budget-capped k=190 check must finish in seconds");
+        assert!(
+            ok,
+            "a matching `class-ancestry-too-costly` disable comment must suppress LB0319"
+        );
     }
 
     #[test]
@@ -2609,7 +2652,7 @@ mod tests {
             "src/main.lua",
             "---@type A190<string>\nlocal a\nprint(a.item)\n",
         );
-        let diags = check_diagnostics(tmp.path());
+        let diags = check_diagnostics_bounded(tmp.path());
         let cost: Vec<&Diagnostic> = diags
             .iter()
             .filter(|d| d.code == LB0319_CLASS_ANCESTRY_TOO_COSTLY)
