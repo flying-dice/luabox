@@ -25,7 +25,7 @@ use luabox_hir::LoweredFile;
 use luabox_syntax::lua;
 use luabox_syntax::luacats::AnnotatedItem;
 use luabox_types::ty::Ty;
-use luabox_types::{DisplayTypes, InferredBinding, InferredReturn, TypeEnv};
+use luabox_types::{Ambient, DisplayTypes, InferredBinding, InferredReturn, TypeEnv};
 
 /// Replace `*old` with `new` when they differ, reporting whether it changed.
 ///
@@ -262,11 +262,113 @@ unsafe impl salsa::Update for OutgoingCalls {
     }
 }
 
+/// The memoized project-wide class/enum contribution merge (#85, round 4
+/// review R14): every project file's [`luabox_types::FileTypes`], filtered
+/// to the files that declare anything.
+///
+/// Before this wrapper, `project_types_checked` was a plain function, not a
+/// tracked salsa query — and it has three per-file callers
+/// (`module_export`, `binding_types`, `module_export_checked`), each itself
+/// a tracked query keyed on `(file, project)`. A display pass over an
+/// N-file project calls one of those N times, and each call rebuilt this
+/// `Vec<FileTypes>` (and paid the `with_project_types` merge over it) from
+/// scratch — O(N) work per file, O(N²) total. Making the query itself
+/// tracked collapses that to O(N): the merge runs once per project
+/// revision and every per-file caller shares the memo.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectTypes(Arc<Vec<luabox_types::FileTypes>>);
+
+impl ProjectTypes {
+    pub(crate) fn new(types: Vec<luabox_types::FileTypes>) -> Self {
+        Self(Arc::new(types))
+    }
+
+    /// Every project file's workspace-global class/enum contribution.
+    #[must_use]
+    pub fn types(&self) -> &[luabox_types::FileTypes] {
+        &self.0
+    }
+}
+
+/// Lets a caller hold or pass `ProjectTypes` exactly where it used to hold
+/// or pass `&[FileTypes]` — `&project_types` deref-coerces straight through
+/// (round 4 review finding 2: `Host::project_types()` used to hand back a
+/// fresh `Vec<FileTypes>` built by `.to_vec()`ing this same slice, deep
+/// cloning every file's class/enum/alias maps on every call. `ProjectTypes`
+/// is already `Arc`-backed and cheap to clone; this `Deref` is what lets
+/// `Host::project_types()` return the wrapper itself — a refcount bump —
+/// with no source change at any of its call sites (`MergedAmbient::build`'s
+/// `&[FileTypes]` parameter, `.iter()`, `with_project_types`'s
+/// `IntoIterator`, ...).
+impl std::ops::Deref for ProjectTypes {
+    type Target = [luabox_types::FileTypes];
+
+    fn deref(&self) -> &Self::Target {
+        self.types()
+    }
+}
+
+// SAFETY: fully-owned `Arc` payload; replacement via `PartialEq`.
+unsafe impl salsa::Update for ProjectTypes {
+    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
+        // SAFETY: forwarded from the `Update` contract.
+        unsafe { replace_if_ne(old_pointer, new_value) }
+    }
+}
+
 // SAFETY: fully-owned `Arc` payload; replacement via `PartialEq`.
 unsafe impl salsa::Update for BindingTypes {
     unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
         // SAFETY: forwarded from the `Update` contract.
         unsafe { replace_if_ne(old_pointer, new_value) }
+    }
+}
+
+/// The memoized project-merged ambient layer for one `(project revision,
+/// dialect)` (M18, round 6 review): [`luabox_types::Ambient::with_project_types`]
+/// applied to [`ProjectTypes`] — the O(N) merge `module_export`/
+/// `binding_types`/`module_export_checked` each used to redo from scratch
+/// on **every one** of their N per-file calls in a full-project display
+/// pass, even though [`project_types_checked`](crate::query::project_types_checked)
+/// (the collection the merge runs over) was itself already memoized —
+/// O(N) work per call, O(N²) total. This wrapper's own tracked query
+/// (`project_ambient` in `query.rs`) makes the merge itself the memoized
+/// unit: it runs once per `(project revision, dialect)` and every per-file
+/// caller shares the `Arc`.
+///
+/// [`Ambient`] wraps a [`TypeEnv`] and is not comparable (see
+/// [`TypeEnvHandle`]'s doc for the same shape), so this handle compares by
+/// `Arc` identity and its query opts out of backdating.
+#[derive(Clone, Debug)]
+pub struct ProjectAmbient(Arc<Ambient>);
+
+impl ProjectAmbient {
+    pub(crate) fn new(ambient: Ambient) -> Self {
+        Self(Arc::new(ambient))
+    }
+
+    /// The merged ambient layer: dialect stdlib + `[types] defs` (the
+    /// caller's `base`) with every project file's workspace-global classes/
+    /// enums folded in.
+    #[must_use]
+    pub fn ambient(&self) -> &Ambient {
+        &self.0
+    }
+}
+
+// SAFETY: fully-owned `Arc` payload. `Ambient` is not `PartialEq` (it wraps
+// a `TypeEnv`), so we fall back to `Arc`-identity comparison, exactly like
+// [`TypeEnvHandle`]: distinct allocations always replace.
+unsafe impl salsa::Update for ProjectAmbient {
+    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
+        // SAFETY: forwarded from the `Update` contract.
+        let old = unsafe { &mut *old_pointer };
+        if Arc::ptr_eq(&old.0, &new_value.0) {
+            false
+        } else {
+            *old = new_value;
+            true
+        }
     }
 }
 

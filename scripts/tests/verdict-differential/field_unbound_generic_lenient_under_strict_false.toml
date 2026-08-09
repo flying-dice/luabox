@@ -1,0 +1,7 @@
+[package]
+name = "vdiff"
+version = "0.1.0"
+edition = "5.4"
+
+[types]
+strict = false

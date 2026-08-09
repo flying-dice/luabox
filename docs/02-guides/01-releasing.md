@@ -181,7 +181,12 @@ looseness made explicit rather than left ambiguous:
     before may start firing, and vice versa. A 0.x bump is fair warning,
     not a stability promise on checker output.
   - Patch bumps (`0.2.0` → `0.2.1`) are reserved for backwards-compatible
-    fixes only, same as post-1.0 SemVer.
+    fixes only, same as post-1.0 SemVer. **A change that makes `luabox check`
+    reject code it previously accepted is never a patch**, however small the
+    diff: a user's CI turning red on unchanged source is the definition of
+    backwards-incompatible here. Nothing mechanical enforces this — the bump
+    is a manual step in the checklist below — so it is the reviewer's job on
+    any PR whose CHANGELOG entry narrows a diagnostic.
 - **The LuaCATS annotation surface itself is not luabox's to version.**
   `---@class`/`---@field`/etc. follow the upstream lua-language-server
   standard; luabox tracks it rather than forking it, so annotation syntax

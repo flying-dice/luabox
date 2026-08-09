@@ -1,0 +1,139 @@
+# Reviewed surviving mutants (#58). scripts/tests/mutants-gate.sh diffs
+# the live missed set against column 1 of this file (tab-separated: the
+# cargo-mutants missed line as first seen, then the reviewed reason). A
+# survivor not listed here fails the job; a listed line that stops surviving
+# is reported as stale to prune — unless EVERY line goes stale in one run,
+# which is a scope that moved rather than an allowlist that was earned, and
+# fails.
+#
+# TIMED-OUT mutants are judged against this same file: a timeout is an
+# unkilled mutant, not a killed one, so a new one fails the job and a listed
+# line that flaps missed -> timeout stays reviewed (and is not stale).
+# The line format is identical either way, so no separate section is needed.
+#
+# LINE NUMBERS ARE INFORMATIONAL. The gate keys the comparison on (file,
+# mutant text) and pairs live mutants against these lines as a multiset —
+# same position first, then the leftovers — so an edit above a waived mutant
+# is REPORTED as a measured shift (old and new position both printed) and a
+# mutant with no (file, text) match at all is what fails the job. Re-pin the
+# printed positions when convenient; the judgement is the gate's, not the
+# reader's. Keying on the whole line put that judgement here instead, and
+# the rule's first exercise was a mixed batch — four shifts and one
+# genuinely new mutant (2026-08-05) — which the counts alone cannot separate.
+#
+# Provenance is layered — be precise about what backs what; the gate reads
+# none of this prose, so a drift here is silent (#58 F5, round-3 review).
+#
+# The [equivalent]/[defensive]/[label]/[gap] reason classes below were
+# reviewed 2026-08-02 against a 407-mutant run over the (then narrower)
+# merge-seam scope: 282 caught / 39 missed -> 13 killed by new tests in the
+# sprint extension — 11 of the original 26 [gap] lines (enum-member dotted
+# reads, collision intra-file dedup, the assign_target_name name variants,
+# version on assigned signatures, the NAME = {} classifier, own-declaration
+# conformance exclusion, the truncated-long-bracket guard). Three claimed
+# kills did NOT hold — the attach_typed_functions no-op pair and the
+# dotted-target arm survive because the local-table shape path independently
+# checks those calls — and are re-waived below with what that run showed.
+#
+# That run predates the round-3 work, which added new code to defs.rs,
+# generics.rs and infer/reify.rs — all three in this gate's default scope.
+#
+# TWO DIFFERENT CLAIMS LIVE HERE AND THEY HAVE DIFFERENT EVIDENCE. Column
+# 1's POSITIONS are one fact; "these mutants are still alive" is another. An
+# earlier revision of this paragraph covered both with a single "measured"
+# date, which reads as a stronger guarantee than anything here actually
+# backs.
+#
+# POSITIONS — the cheaper claim, and the only one current at THIS head.
+# Verified 2026-08-09 with cargo-mutants 27.1.0 against the tree as
+# committed (after the round-8 fix wave, which moved env.rs again): `cargo
+# mutants -p luabox-types --file <each of the four scope files> --list`
+# enumerated 491 mutants, every one of the 17 keys below was found in that
+# enumeration (nothing ABSENT — no waiver names a mutation this head no
+# longer generates; the count has moved 492 -> 485 -> 491 across the two fix
+# waves as helpers were renamed and split, their mutants killed, not
+# waived), and all 14 drifted positions were re-pinned to the listed values
+# with their reasons byte-unchanged, disambiguated by COLUMN within each
+# shared (file, mutation-text) key — same-column candidate unique in every
+# case. `--list` ENUMERATES, it does not TEST: this claim is
+# "the mutant still exists, here" and nothing more.
+#
+# LIVENESS — the claim the waivers themselves rest on — is NOT re-measured at
+# this head. Three weaker sources back it, and the gap between them is stated
+# rather than papered over. (1) A complete run over the full four-file scope
+# at the round-6 head, cargo-mutants 27.1.0, 2026-08-08: 463 generated / 340
+# caught / 16 missed / 1 timed out / 106 unviable, 0 new, 0 stale; per file
+# env.rs 290 caught, defs.rs 24, reify.rs 15, generics.rs 11 — every viable
+# mutant outside env.rs is CAUGHT, which is why all 17 waivers below are
+# env.rs lines. (2) A PARTIAL run at the post-round-6 head (492 generated,
+# 173 tested before the run was interrupted): 10 survivors among the tested
+# set, every one matching a line below, 0 new. (3) The diff-bounded
+# `mutants-pr` CI job, which re-measures every mutant a PR's own diff touches
+# on each push. What none of the three gives is a complete survivor set at
+# this exact head: the mutants run (2) never reached, and that no PR diff has
+# touched since, are carried on run (1) plus each line's own reasoning. A
+# `workflow_dispatch` full run against this ref is what would upgrade that.
+#
+# BE PRECISE ABOUT WHAT BACKED THIS: a manual run, not a CI-enforced one.
+# `mutants.yml`'s `pull_request` trigger structurally cannot run the `mutants`
+# job (its `if:` excludes that event, deliberately — a full run costs tens of
+# minutes and would otherwise tax every push to an open PR), so nothing in CI
+# re-measures this claim against a PR head before merge; the schedule and
+# push-to-main triggers re-measure it afterward. To have CI confirm this exact
+# head, `workflow_dispatch` runs the full job against any ref. The trade is
+# recorded in decisions/12-gates-are-self-tested-and-fail-when-they-measure-nothing.md.
+#
+# THIS COVERS FOUR FILES, NOT THE WHOLE CHANGE. The scope is the merge-seam
+# neighbourhood; the BOM fix in luacats/mod.rs, the LSP work, and luabox-db's
+# tracked-query change are all outside it and are measured by their own tests,
+# not by this score.
+#
+# Two earlier runs on this same scope FAILED, and both are worth recording
+# because they are what this file is for. The first found 8 new survivors in
+# then-new code (`generic_classes`, three `collect_free_names` arms,
+# `QuietMark::rollback`, `clone_surface`'s declaring-file span map); all
+# eight were killed with tests rather than waived, each verified by applying
+# the mutation by hand and confirming the suite fails. One of those kills
+# needed a *layered* ambient to work at all — the single-layer fixture could
+# not fail, because `merge_file_types` repopulates the span map the clone was
+# dropping. The generated count moved 438 -> 434 between that run and this
+# one because `collect_class`'s diamond guard was reworked twice since (a
+# free-parameter map that now follows the winning edge, and a memo that no
+# longer skips a repeated non-adjacent binding); both defects were caught by
+# a local review pass, not by this gate — a mutation score says nothing about
+# behaviour no test asserts.
+#
+# 17 waived below — not the "16" an earlier revision of this paragraph
+# claimed against the same set of lines; nothing here recomputes that
+# number, so it is worth re-grep'ing (`grep -vc '^#\|^$'`) rather than
+# trusting the prose the next time this file changes.
+#   [equivalent]  semantically identical / reduces to a no-op — unkillable
+#   [defensive]   guards malformed empty-name harvest output that the
+#                 public checker surface cannot name or observe
+#   [label]       affects only a secondary label/span; suites assert codes
+#   [gap]         real crate-local coverage gap, acknowledged — exercised
+#                 via the cli e2e suites or narrower than a crate test
+#                 reaches today; candidates for future kills
+#   [hang]        the mutation makes a loop non-terminating, so the only
+#                 observable effect is the suite never finishing — the run
+#                 timeout IS the detection; no assertion can complete to
+#                 kill it (surfaced by the gate's timeout rule, which the
+#                 old gate silently dropped)
+#
+crates/luabox-types/src/env.rs:159:38: replace match guard !c.name.is_empty() with true in FileTypes::collect	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
+crates/luabox-types/src/env.rs:181:37: replace match guard !e.name.is_empty() with true in FileTypes::collect	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
+crates/luabox-types/src/env.rs:186:38: replace match guard !a.name.is_empty() with true in FileTypes::collect	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
+crates/luabox-types/src/env.rs:1722:34: replace match guard !c.name.is_empty() with true in TypeEnv::absorb_block	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
+crates/luabox-types/src/env.rs:1968:37: replace match guard !o.op.is_empty() with true in TypeEnv::absorb_block	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
+crates/luabox-types/src/env.rs:2000:33: replace match guard !e.name.is_empty() with true in TypeEnv::absorb_block	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
+crates/luabox-types/src/env.rs:2043:33: replace match guard !c.var.is_empty() with true in TypeEnv::absorb_block	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
+crates/luabox-types/src/env.rs:4088:34: replace match guard !c.name.is_empty() with true in carrier_var_classes	[defensive] empty-name tag guard — an unnameable declaration cannot be observed through the checker
+crates/luabox-types/src/env.rs:1216:30: replace > with >= in TypeEnv::build_from_items	[defensive] whitespace-walk bound on the inline-@as anchor; anchor==0 needs a cast with no expression before it, which the grammar does not produce
+crates/luabox-types/src/env.rs:1219:27: replace > with >= in TypeEnv::build_from_items	[defensive] whitespace-walk bound on the inline-@as anchor; anchor==0 needs a cast with no expression before it, which the grammar does not produce
+crates/luabox-types/src/env.rs:3248:9: replace TypeEnv::typed_local_span -> Option<std::ops::Range<usize>> with None	[label] declared-here span for the duplicate-field note; suites assert codes, not label spans
+crates/luabox-types/src/env.rs:3296:9: replace TypeEnv::is_class -> bool with true	[equivalent] measured, not assumed: two candidate separating shapes (alias-typed local from a literal, alias-typed parameter) behave identically under the mutation — alias reads take the shape/alias arms, so the Named-absence arm this gates appears to see only real class names in practice; the alias leniency itself is now pinned in undefined_field.rs either way
+crates/luabox-types/src/env.rs:3995:22: replace && with || in class_param_unification	[equivalent] with || the guard admits only cases whose rename map is the identity (own==canonical) or empty (own empty) — a no-op substitution either way
+crates/luabox-types/src/env.rs:2137:9: replace TypeEnv::attach_typed_functions with ()	[gap] measured twice: the dotted call-site probe passes in BOTH worlds — the local-table shape path independently checks these calls, so the attachment's only unshared consumers are cross-crate dotted-name lookups with no shape in scope; a defs-path probe is the remaining kill candidate
+crates/luabox-types/src/env.rs:2151:16: delete ! in TypeEnv::attach_typed_functions	[gap] measured twice: the dotted call-site probe passes in BOTH worlds — the local-table shape path independently checks these calls, so the attachment's only unshared consumers are cross-crate dotted-name lookups with no shape in scope; a defs-path probe is the remaining kill candidate
+crates/luabox-types/src/env.rs:3506:9: delete match arm Expr::Field(field) in assign_target_name	[gap] measured twice: the dotted call-site probe passes in BOTH worlds — the local-table shape path independently checks these calls, so the attachment's only unshared consumers are cross-crate dotted-name lookups with no shape in scope; a defs-path probe is the remaining kill candidate
+crates/luabox-types/src/env.rs:1217:28: replace -= with /= in TypeEnv::build_from_items	[hang] the inline-@as anchor walk: `anchor /= 1` leaves anchor unchanged, so the whitespace-skip while-loop never terminates when the preceding byte is whitespace — detected only as a hang; the run timeout is the kill

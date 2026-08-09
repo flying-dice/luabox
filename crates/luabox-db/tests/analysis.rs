@@ -8,9 +8,9 @@
 
 use std::path::{Path, PathBuf};
 
-use luabox_db::{AnalysisHost, Change, Dialect, Strictness};
+use luabox_db::{AnalysisHost, Change, Dialect, MAX_EXECUTION_LOG_ENTRIES, Strictness};
 use luabox_syntax::lua;
-use luabox_types::check_file;
+use luabox_types::{check_file, check_file_with_requires, stdlib_defs};
 
 /// Source with a call-argument type error (`LB0300`) that `check_file` reports.
 const BAD: &str = "\
@@ -41,6 +41,28 @@ fn set(path: &str, text: &str) -> Change {
 /// Only the `parse(...)`/`diagnostics(...)` etc. lines mentioning `needle`.
 fn mentioning<'a>(log: &'a [String], needle: &str) -> Vec<&'a String> {
     log.iter().filter(|l| l.contains(needle)).collect()
+}
+
+/// Assert `needle` never ran, per `log` — but refuse to answer at all when
+/// `overflowed` is set (M46, round 6 review): once the trace has evicted an
+/// entry, `needle`'s absence from `log` no longer proves it did not run —
+/// it may simply have aged out — so an absence assertion taken over a lossy
+/// trace is not proof of anything and must not be trusted the way it was
+/// before the cap existed. Callers must read
+/// [`luabox_db::AnalysisHost::execution_log_overflowed`] *before* draining
+/// (draining resets it) and pass that here.
+#[track_caller]
+fn assert_absent(log: &[String], overflowed: bool, needle: &str) {
+    assert!(
+        !overflowed,
+        "the execution trace overflowed (evicted at least one entry) since \
+         the last drain — an absence assertion for {needle:?} cannot be \
+         trusted against a lossy trace: {log:?}"
+    );
+    assert!(
+        mentioning(log, needle).is_empty(),
+        "expected {needle:?} not to have run, but it did: {log:?}"
+    );
 }
 
 #[test]
@@ -509,6 +531,34 @@ fn set_root_rebases_require_resolution_and_is_visible_through_the_vfs() {
 }
 
 #[test]
+fn set_root_bumps_the_revision_like_any_other_input_write() {
+    // The revision is the cache key consumers key derived state on (the LSP's
+    // merged ambient layer), so it must move whenever an input does. `set_root`
+    // writes a salsa input; two snapshots either side of a re-root comparing
+    // equal would hand a re-rooted host a stale derivation with no signal.
+    let mut host = host();
+    let start = host.snapshot().revision();
+
+    host.set_root(PathBuf::from("/workspace"));
+    let rooted = host.snapshot().revision();
+    assert!(
+        rooted > start,
+        "set_root moved an input: {start} -> {rooted}"
+    );
+
+    // Reading, not writing, leaves it alone.
+    assert_eq!(host.snapshot().revision(), rooted);
+
+    host.apply_change(set("/workspace/main.lua", GOOD));
+    assert!(host.snapshot().revision() > rooted);
+
+    // A re-root is a re-root even when the path is one the host has seen.
+    let before = host.snapshot().revision();
+    host.set_root(PathBuf::from("/workspace"));
+    assert!(host.snapshot().revision() > before);
+}
+
+#[test]
 fn clearing_an_overlay_reverts_to_disk_and_ignores_unknown_paths() {
     let mut host = host();
     host.apply_change(set("a.lua", GOOD));
@@ -547,6 +597,299 @@ fn clearing_an_overlay_reverts_to_disk_and_ignores_unknown_paths() {
 }
 
 #[test]
+fn display_mode_resolves_a_required_carriers_class_across_files() {
+    // F44 (round 3 review) — regression: `module_export`/`binding_types` build
+    // their ambient as `stdlib_defs(dialect)` alone, with no
+    // `with_project_types` merge, unlike the check-mode path. Since #56 a
+    // declared `---@class` carrier crosses `require` as `Ty::Named(name)`
+    // rather than a structural table, so resolving anything about it in the
+    // *consumer's* display-mode inference (inlay hints) needs the carrier's
+    // own class declaration in scope — which lives in a DIFFERENT file, and
+    // was never merged in. Before #56 this never mattered: the export was
+    // already fully structural, needing no further class lookup.
+    //
+    // `widget.lua` declares a carrier class; `main.lua` requires it and
+    // calls its constructor. The constructor's return type is `Widget`
+    // (`Infer::reify_shape`'s instance-identity rule), which the display
+    // inference must resolve back to its `id: number` field to report
+    // anything useful for `v` at all — with the merge missing, `Widget`
+    // resolves to `Lookup::Opaque` (`infer.rs`) and the binding renders as
+    // unknown.
+    let widget = "\
+---@class Widget
+---@field id number
+local W = {}
+W.__index = W
+---@return Widget
+function W.make() return setmetatable({}, W) end
+return W
+";
+    let main = "\
+local m = require(\"widget\")
+local v = m.make()
+";
+    let mut host = host();
+    host.apply_changes([set("widget.lua", widget), set("main.lua", main)]);
+
+    let snap = host.snapshot();
+    let types = snap.binding_types(Path::new("main.lua")).unwrap();
+    let v_binding = types
+        .bindings()
+        .iter()
+        .find(|b| b.name == "v")
+        .expect("`v` is a binding");
+    let rendered = format!("{:?}", v_binding.ty);
+    assert!(
+        rendered.contains("Widget") || rendered.contains("\"id\""),
+        "`v`'s type must resolve through the cross-file carrier class, not \
+         stay opaque/unknown: {rendered}"
+    );
+}
+
+#[test]
+fn a_cross_file_generic_ancestor_does_not_leak_its_parameter_through_require_exports() {
+    // F42/F43 (round 3 review): the export-seam fix (#56) erases an unbound
+    // generic parameter at the `require` boundary by asking
+    // `class_params_in_scope` whether the exported class still has one free
+    // — but the round-2 fix computed that answer against a defs-only
+    // ambient (`module_surface_checked`), which cannot see a *different*
+    // project file's classes. `base.lua` declares the generic ancestor;
+    // `sub.lua` inherits it bare (`: Base`, parameter left unbound) and
+    // returns the carrier; `main.lua` requires `sub` and reads the
+    // inherited field. Every existing fixture for this guard
+    // (`cross_file_require.rs`) declares the ancestor and the child in ONE
+    // file, where `class_params_in_scope` can already see the ancestor —
+    // this is the shape that actually crosses the export seam.
+    let base = "\
+---@class Base<U>
+---@field item U
+local M = {}
+return M
+";
+    let sub = "\
+---@class Sub : Base
+local S = {}
+return S
+";
+    let main = "\
+---@param n number
+local function want(n) end
+local s = require(\"sub\")
+want(s.item)
+";
+    let mut host = host();
+    host.set_root(PathBuf::from("/proj"));
+    host.apply_changes([
+        set("/proj/base.lua", base),
+        set("/proj/sub.lua", sub),
+        set("/proj/main.lua", main),
+    ]);
+
+    let snap = host.snapshot();
+    let requires = snap
+        .require_exports(Path::new("/proj/main.lua"))
+        .expect("main.lua is a known file");
+    let project_types = snap.project_types();
+    let ambient = stdlib_defs(Dialect::Lua54).with_project_types(project_types.iter());
+
+    let parsed = lua::parse(main, Dialect::Lua54);
+    let diags = check_file_with_requires(
+        &parsed,
+        "main.lua",
+        Strictness::Strict,
+        Dialect::Lua54,
+        Some(&ambient),
+        &requires,
+    );
+    let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
+    assert_eq!(
+        codes,
+        vec!["LB0300".to_string()],
+        "the inherited, still-unbound parameter must erase to `unknown` — a \
+         cross-file leak reports `found \\`U\\`` here instead: {diags:?}"
+    );
+    assert!(
+        diags[0].message.contains("found `unknown`"),
+        "the parameter name must never reach the consumer: {}",
+        diags[0].message
+    );
+}
+
+#[test]
+fn a_watch_event_delivering_unchanged_text_does_not_bump_the_revision() {
+    // R17 (round 4 review): `workspace/didChangeWatchedFiles` (`server.rs`)
+    // calls `apply_change(SetFileText { .. })` for every non-deleted `.lua`
+    // path named in a watch event, whether or not the on-disk text actually
+    // differs from what the host already has — a save-without-edit, an
+    // unrelated watcher coalescing multiple events, a `touch`. Every
+    // revision-keyed cache downstream (the LSP's `MergedAmbient`,
+    // `server.rs:1583`) treats any bump as "the world changed" and pays a
+    // full `clone_surface` + `merge_file_types` over every project file.
+    // Re-delivering identical text must not move the revision; text that
+    // actually differs still must.
+    let mut host = host();
+    host.apply_change(set("a.lua", GOOD));
+    let after_first_write = host.snapshot().revision();
+
+    // The exact re-delivery the watcher performs: same path, same dialect,
+    // byte-identical text.
+    host.apply_change(set("a.lua", GOOD));
+    assert_eq!(
+        host.snapshot().revision(),
+        after_first_write,
+        "re-delivering unchanged text must not bump the revision"
+    );
+
+    // Text that actually differs still must.
+    host.apply_change(set("a.lua", BAD));
+    assert!(
+        host.snapshot().revision() > after_first_write,
+        "an actual edit must still bump the revision"
+    );
+}
+
+#[test]
+fn a_strictness_no_op_does_not_bump_the_revision() {
+    // Same class of fix as the watch-event case above (R17): re-applying the
+    // strictness the project already has must not move the revision either.
+    let mut host = host();
+    let start = host.snapshot().revision();
+
+    host.apply_change(Change::SetStrictness(Strictness::Strict));
+    assert_eq!(
+        host.snapshot().revision(),
+        start,
+        "the host defaults to Strict; setting it to Strict again is a no-op"
+    );
+
+    host.apply_change(Change::SetStrictness(Strictness::Warn));
+    assert!(
+        host.snapshot().revision() > start,
+        "an actual strictness change must still bump the revision"
+    );
+}
+
+#[test]
+fn project_types_checked_is_memoized_once_across_a_display_pass_over_many_files() {
+    // R14 (round 4 review): `project_types_checked` merges every project
+    // file's workspace-global class/enum contribution — the input
+    // `Ambient::with_project_types` folds beneath each file's own
+    // declarations. It has three per-file callers (`module_export`,
+    // `binding_types`, `module_export_checked`), each itself a tracked
+    // query keyed on `(file, project)`. Before it was a tracked query in
+    // its own right, a display pass over N files (the LSP's inlay-hint
+    // sweep on open) called it N times, and it rebuilt the whole
+    // `Vec<FileTypes>` collection — and the merge each caller runs over it
+    // — from scratch every single time: O(N) work per file it touched,
+    // O(N²) total, even though every `module_surface_checked` it reads is
+    // itself already memoized. Tracking it collapses that to one execution
+    // per project revision, shared by every caller.
+    const N: usize = 25;
+    let mut host = host();
+    let changes: Vec<Change> = (0..N)
+        .map(|i| {
+            set(
+                &format!("f{i}.lua"),
+                &format!("---@class C{i}\n---@field x number\nlocal M = {{}}\nreturn M\n"),
+            )
+        })
+        .collect();
+    host.apply_changes(changes);
+    let _ = host.take_execution_log();
+
+    // One display pass, touching every file's `binding_types` for the
+    // first time at this revision — exactly what an LSP opening an N-file
+    // workspace does.
+    let snap = host.snapshot();
+    for i in 0..N {
+        let _ = snap.binding_types(Path::new(&format!("f{i}.lua")));
+    }
+    let log = host.take_execution_log();
+
+    let types_runs = mentioning(&log, "project_types_checked()");
+    assert_eq!(
+        types_runs.len(),
+        1,
+        "the project-wide types merge must execute once per revision, not \
+         once per file touched ({N} files, log: {log:?})"
+    );
+}
+
+/// M18 (round 6 review): `project_types_checked_is_memoized_once_across_a_display_pass_over_many_files`
+/// above only counts `project_types_checked()` — the *collection* of every
+/// file's `FileTypes`. That collection was already memoized; the bug is the
+/// `Ambient::with_project_types` *merge* built over it, which
+/// `module_export`/`binding_types`/`module_export_checked` each used to run
+/// again from scratch on every one of their N per-file calls — invisible to
+/// a test that only ever counts the collection step. This counts the merge
+/// itself (`project_ambient()`, `query.rs`'s newly-tracked query) across the
+/// identical N-file display pass, and fails the same way the collection-only
+/// test would have failed to catch: red before `project_ambient` existed
+/// (the merge ran once per file, N times), green after (once per revision).
+#[test]
+fn project_ambient_merge_is_memoized_once_across_a_display_pass_over_many_files() {
+    const N: usize = 25;
+    let mut host = host();
+    let changes: Vec<Change> = (0..N)
+        .map(|i| {
+            set(
+                &format!("f{i}.lua"),
+                &format!("---@class C{i}\n---@field x number\nlocal M = {{}}\nreturn M\n"),
+            )
+        })
+        .collect();
+    host.apply_changes(changes);
+    let _ = host.take_execution_log();
+
+    let snap = host.snapshot();
+    for i in 0..N {
+        let _ = snap.binding_types(Path::new(&format!("f{i}.lua")));
+    }
+    let log = host.take_execution_log();
+
+    let merge_runs = mentioning(&log, "project_ambient()");
+    assert_eq!(
+        merge_runs.len(),
+        1,
+        "the `with_project_types` merge itself must execute once per \
+         revision, not once per file touched ({N} files, log: {log:?})"
+    );
+}
+
+/// M18's own real-numbers sweep: a full `binding_types` display pass (the
+/// LSP's inlayHint sweep) at N=20/80/160, wall-clock. Manual — run
+/// explicitly with `cargo test -p luabox-db --release -- --ignored \
+/// --nocapture project_types_sweep_wall_time` — since a wall-clock
+/// assertion in the default suite would be flaky across machines; the
+/// round 6 report carries the numbers this prints. This probe backs no CI
+/// claim (round 8 review F10): M18's FUNCTIONAL pin is the non-ignored
+/// `project_ambient_merge_is_memoized_once_across_a_display_pass_over_many_files`
+/// above — this one only puts wall-clock numbers on it by hand.
+#[test]
+#[ignore = "manual wall-clock measurement, see the doc comment"]
+fn project_types_sweep_wall_time() {
+    for n in [20usize, 80, 160] {
+        let mut host = host();
+        let changes: Vec<Change> = (0..n)
+            .map(|i| {
+                set(
+                    &format!("f{i}.lua"),
+                    &format!("---@class C{i}\n---@field x number\nlocal M = {{}}\nreturn M\n"),
+                )
+            })
+            .collect();
+        host.apply_changes(changes);
+        let snap = host.snapshot();
+        let start = std::time::Instant::now();
+        for i in 0..n {
+            let _ = snap.binding_types(Path::new(&format!("f{i}.lua")));
+        }
+        let elapsed = start.elapsed();
+        eprintln!("N={n}: {elapsed:?}");
+    }
+}
+
+#[test]
 fn set_dialect_reparses_the_file_under_the_new_dialect() {
     // LuaJIT-only `0x10ULL` is a parse error under 5.4.
     const JIT_ONLY: &str = "local n = 10ULL\n";
@@ -574,5 +917,124 @@ fn set_dialect_reparses_the_file_under_the_new_dialect() {
             .errors()
             .is_empty(),
         "under LuaJIT the same source is clean"
+    );
+}
+
+#[test]
+fn project_types_shares_its_allocation_across_calls_instead_of_deep_cloning() {
+    // Round 4 review finding 2: `Host::project_types()` used to end in
+    // `.types().to_vec()`, deep-cloning every project file's class/enum/
+    // alias maps on every single call. Two calls against the *same*
+    // snapshot revision now read the identical memoized `ProjectTypes`
+    // (an `Arc`-backed wrapper) and hand back a cheap `Arc` clone rather
+    // than a fresh `Vec`, so the two results' backing storage is the exact
+    // same allocation — measured here by comparing the slice's data
+    // pointer, not merely its contents (equal *contents* would pass even
+    // with the old deep clone; equal *pointer* would not).
+    const MODULE: &str = "\
+---@class Point
+---@field x number
+local M = {}
+return M
+";
+    let mut host = host();
+    host.apply_change(set("m.lua", MODULE));
+    let snap = host.snapshot();
+
+    let first = snap.project_types();
+    let second = snap.project_types();
+    assert!(
+        !first.is_empty(),
+        "the fixture declares a class, so the contribution must be non-empty"
+    );
+    assert_eq!(
+        first.as_ptr(),
+        second.as_ptr(),
+        "two calls at the same revision must share one allocation, not each \
+         deep-clone their own"
+    );
+}
+
+/// Round 5 review N23: the execution trace has no non-test drainer, so a
+/// long-running session that never calls `take_execution_log` used to grow
+/// it by roughly one entry per query invocation, per revision, forever —
+/// measured, a linear ~0.84 KiB/keystroke RSS climb over 3000 edits with no
+/// plateau. Simulate exactly that: many more revisions, each touching a
+/// fresh file (so each one logs real entries), than the cap — without ever
+/// draining in between — and assert the trace stayed at its ceiling instead
+/// of growing past it.
+#[test]
+fn execution_log_never_grows_past_its_cap() {
+    let mut host = host();
+    let edits = MAX_EXECUTION_LOG_ENTRIES * 4;
+    for i in 0..edits {
+        host.apply_change(set(&format!("f{i}.lua"), GOOD));
+        let _ = host.snapshot().diagnostics(Path::new(&format!("f{i}.lua")));
+    }
+
+    let log = host.take_execution_log();
+
+    assert!(
+        log.len() <= MAX_EXECUTION_LOG_ENTRIES,
+        "execution log grew past its cap of {MAX_EXECUTION_LOG_ENTRIES}: {} entries \
+         after {edits} undrained revisions — the bound regressed",
+        log.len()
+    );
+}
+
+/// M46 (round 6 review): the cap above silently broke the trace's original
+/// "complete list of queries since the last drain" invariant — a query
+/// whose entry was evicted to make room for newer ones is now
+/// indistinguishable, from the drained `Vec<String>` alone, from a query
+/// that genuinely never ran. This proves both halves: first, that the trap
+/// is real (the probed query's own entry really is silently absent from the
+/// raw log after enough undrained revisions to overflow the cap); second,
+/// that `execution_log_overflowed` correctly flags it and `assert_absent`
+/// refuses to certify the absence once it is set — where an un-guarded
+/// `mentioning(&log, needle).is_empty()` check would have passed, wrongly,
+/// exactly as it would for a query that truly never ran.
+#[test]
+fn an_absence_assertion_over_an_overflowed_trace_is_not_trusted() {
+    let mut host = host();
+
+    // One revision whose own entry we will probe for later.
+    host.apply_change(set("probe.lua", GOOD));
+    let _ = host.snapshot().diagnostics(Path::new("probe.lua"));
+    assert!(
+        !host.execution_log_overflowed(),
+        "nothing has overflowed yet"
+    );
+
+    // Push far more undrained revisions than the cap holds, so the probe's
+    // own entry — logged first, evicted first — ages out.
+    for i in 0..(MAX_EXECUTION_LOG_ENTRIES * 2) {
+        host.apply_change(set(&format!("filler{i}.lua"), GOOD));
+        let _ = host
+            .snapshot()
+            .diagnostics(Path::new(&format!("filler{i}.lua")));
+    }
+
+    // Read the flag *before* draining — draining resets it.
+    let overflowed = host.execution_log_overflowed();
+    assert!(
+        overflowed,
+        "this many undrained pushes must overflow the cap"
+    );
+
+    let log = host.take_execution_log();
+    assert!(
+        mentioning(&log, "diagnostics(probe.lua)").is_empty(),
+        "the probe's own entry really was evicted — this is the false-\
+         absence trap M46 describes: {log:?}"
+    );
+
+    // The dedicated helper must refuse to certify that absence.
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_absent(&log, overflowed, "diagnostics(probe.lua)");
+    }));
+    assert!(
+        refused.is_err(),
+        "assert_absent must panic rather than certify an absence over an \
+         overflowed trace"
     );
 }

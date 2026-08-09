@@ -24,6 +24,32 @@ fn strict_codes(source: &str) -> Vec<String> {
         .collect()
 }
 
+// (pre) an `---@alias` to a table shape is NOT a class: absence stays
+// lenient by design — the provable-absence rule is scoped to real LuaCATS
+// `---@class` declarations, and an alias offers no such contract (#58
+// mutation audit: the `is_class` gate at the absence site was the one arm
+// no fixture separated — widening it to "any named type" would invent
+// LB0306 on exactly this shape).
+#[test]
+fn an_alias_typed_value_stays_lenient_on_absent_members() {
+    // The `---@param` spelling reaches the named-type lookup (a local
+    // initialised from a literal takes the shape path instead, which has
+    // its own alias arm) — this is the shape that separates "is a class"
+    // from "resolves to a table".
+    let src = "\
+---@alias Conf { host: string }
+
+---@param c Conf
+local function use(c)
+  print(c.host)
+  return c.nope
+end
+
+return use
+";
+    assert_eq!(strict_codes(src), Vec::<String>::new());
+}
+
 // (a) `self.nope` inside a class method → flagged, naming field and class.
 #[test]
 fn self_read_of_undeclared_field_is_flagged() {

@@ -1,0 +1,4 @@
+-- Deliberately reference-free: no `---@type`, no local, no member read.
+-- The declaration alone must be enough for both tools (round 11 R11-1).
+---@class UnrefRing : UnrefRing
+---@field ring string

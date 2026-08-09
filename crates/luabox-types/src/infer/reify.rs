@@ -29,6 +29,69 @@ impl Infer<'_> {
         }
     }
 
+    /// [`Self::reify`] for the **module-export** position (#56).
+    ///
+    /// A returned `---@class` *carrier* crosses the `require` boundary as
+    /// the class it carries — [`Ty::Named`] — rather than as its structural
+    /// table, because the class is the workspace-global identity and it is
+    /// what luals resolves a `require` of the module to. Only the export
+    /// position does this: inside the declaring file the carrier stays
+    /// structural, so its own conformance obligations are unchanged.
+    /// (Instances need no arm here — an instance shape already reifies as
+    /// its declared name at every annotated boundary, per
+    /// [`Self::reify_shape`].)
+    ///
+    /// A carrier whose members still mention an **unbound generic parameter**
+    /// is the one class this cannot name: `Ty::Named` carries no type
+    /// arguments, so `---@class Box<T>` would cross as `Box` with its members
+    /// still typed `T` — a variable the consumer can neither name nor produce,
+    /// in a diagnostic that points at no action. It crosses instead as what a
+    /// bare `Box` reference lowers to (#84): the template with its unbound
+    /// parameters as `unknown`. The two spellings of "a generic class with
+    /// nothing bound" then agree, and `---@type Box<number>` — the annotation
+    /// that *does* bind them — reads the same either side of the `require`.
+    ///
+    /// The parameter need not be the carrier's own. A class inherits its
+    /// ancestors' `---@field`s, so `---@class Sub : Base` — a generic parent
+    /// named without arguments — leaves `Sub`'s `item` as `U` at this seam
+    /// just as `Box`'s is `T`. One rule owns both:
+    /// [`TypeEnv::class_shape_bound_export`] substitutes every parameter a
+    /// visited class leaves unbound, and this crosses as the name only when
+    /// that came out identical to the ordinary (non-erasing) resolution —
+    /// i.e. when the resolved shape is already a complete type.
+    /// `---@class Sub : Base<number>` *does* bind its parent's parameter, so
+    /// there is nothing for either resolution to disagree about and this
+    /// keeps the #56 class identity.
+    pub(super) fn reify_export(&mut self, ity: &ITy) -> Ty {
+        match ity {
+            ITy::Shape(id) => {
+                if let Some(name) = self.shapes[*id].declared.clone()
+                    && let Some(resolved) = self.env.resolve_named(&name)
+                {
+                    // A class may declare `<T>` and mention it nowhere in its
+                    // own or its ancestors' members — erasure then changes
+                    // nothing, and only a substitution that changes
+                    // *something* costs the class its name.
+                    if let Some(erased) = self
+                        .env
+                        .class_shape_bound_export(&name, &[])
+                        .map(|shape| Ty::Table(Box::new(shape)))
+                        && erased != resolved
+                    {
+                        return erased;
+                    }
+                    return Ty::Named(name);
+                }
+                self.reify_shape(*id)
+            }
+            ITy::Union(members) => {
+                let members = members.clone();
+                Ty::union(members.iter().map(|m| self.reify_export(m)).collect())
+            }
+            other => self.reify(other),
+        }
+    }
+
     fn reify_func(&mut self, body: BodyId) -> FunctionTy {
         if let Some(sig) = self.funcs.get(&body).and_then(|f| f.sig.clone()) {
             return sig;

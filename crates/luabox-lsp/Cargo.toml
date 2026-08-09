@@ -2,6 +2,7 @@
 name = "luabox-lsp"
 description = "luabox: language server over the analysis database (Frontend context)"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

@@ -88,6 +88,99 @@ impl Ambient {
         &self.global_names
     }
 
+    /// The merged member surface of a class this layer declares: parents
+    /// folded in depth-first, carrier attachments and `---@field`
+    /// declarations unioned — exactly the shape the checker resolves a
+    /// member access against. `None` for a name that is not a class here.
+    ///
+    /// This is the editor surfaces' read path (#56): hover and completion
+    /// on a class-typed value resolve members through the same ambient
+    /// environment the type pass holds (build the layer with
+    /// [`Self::with_project_types`] / [`Self::with_rock_types`] first, as
+    /// the diagnostics pipeline does), so what the editor offers is what
+    /// `luabox check` enforces — one environment, not a parallel view.
+    #[must_use]
+    pub fn class_members(&self, name: &str) -> Option<crate::ty::TableTy> {
+        self.env.class_shape(name)
+    }
+
+    /// [`Self::class_members`] with `name`'s own type parameters bound to
+    /// `args`, positionally — the shape a reference that wrote them means
+    /// (round 3 review F48). `---@type Box<number>` binds `Box`'s `T` to
+    /// `number`; `args` empty is exactly [`Self::class_members`] (every
+    /// parameter free, matching a bare `Box`). See
+    /// [`crate::env::TypeEnv::class_shape_bound`] for the substitution rule
+    /// this delegates to — the same one every other consumer of a generic
+    /// class's shape already goes through.
+    // `pub(crate)`, not `pub` (round 4 review R16): no consumer outside this
+    // module or its tests calls it directly — every external caller
+    // (`luabox-lsp`, verified: it only ever reaches this through
+    // `Self::class_members_of`) goes through `class_members_of` below, which
+    // is the crate's real reference-site API for a bound generic lookup.
+    #[must_use]
+    pub(crate) fn class_members_bound(
+        &self,
+        name: &str,
+        args: &[crate::ty::Ty],
+    ) -> Option<crate::ty::TableTy> {
+        self.env.class_shape_bound(name, args)
+    }
+
+    /// Whether `name`'s ancestor chain was too deep for the most recent
+    /// [`Self::class_members`]/[`Self::class_members_bound`]/
+    /// [`Self::class_members_of`] call to resolve fully (`LB0317`) — a class
+    /// this layer declares but whose shape above the depth cap is missing
+    /// from what those calls returned.
+    ///
+    /// This layer's `env` is long-lived (one per workspace revision, cached
+    /// behind `luabox-lsp`'s `MergedAmbient`), unlike the per-file `TypeEnv`
+    /// `crate::check::run` builds and drains on every check — nothing else
+    /// ever drains this one, so every hit since the layer was built stays
+    /// visible here for as long as the layer lives, not just the one that
+    /// just happened. Exposed so an LSP surface reading a class's members
+    /// through this layer (hover, completion, goto-definition, signature
+    /// help — none of which go through `check::run`) can tell the user their
+    /// class shape is incomplete instead of silently showing fewer members
+    /// than the class declares while the Problems panel, checking the same
+    /// file through its own `TypeEnv`, already says so (production readiness
+    /// review, finding 2 — this module's own doc above promises "one
+    /// environment, not a parallel view").
+    #[must_use]
+    pub fn class_ancestry_truncated(&self, name: &str) -> bool {
+        self.env.class_ancestry_truncated(name)
+    }
+
+    /// [`Self::class_members_bound`] from a LuaCATS type expression directly
+    /// — the reference-site half of round 3 review F48 (#56's acceptance
+    /// criterion: "no divergence between what the editor accepts and what CI
+    /// rejects"). `Self::class_members(name)` alone cannot answer this
+    /// correctly for a generic reference: extracting just the name and
+    /// asking for its (necessarily unbound) shape is exactly the shape of
+    /// the divergence this closes — hover/completion answering `T` where the
+    /// checker, which resolves the *whole* reference, answers `number`.
+    ///
+    /// `ty` is expected to be a `Named` reference (`Box`, `Box<number>`,
+    /// `mylib.Point`); anything else (`T?`, `A|B`, an array, ...) returns
+    /// `None` rather than guessing which member of a compound type the
+    /// caller meant — unwrap to the `Named` case yourself first if that is
+    /// what you have. `None` also covers a `Named` reference whose name is
+    /// not a class at all (an alias, an enum, an unresolvable name).
+    ///
+    /// The arguments are lowered against this ambient layer's own declared
+    /// names — the workspace scope every project file's own annotations
+    /// already resolve against — so a class name, alias, or nested generic
+    /// reference used as an argument (`Box<Pair<number>>`) resolves exactly
+    /// as it would inside a checked file. No `---@generic` scope applies: an
+    /// argument names a concrete type, not a template placeholder.
+    #[must_use]
+    pub fn class_members_of(&self, ty: &luacats::TypeExpr) -> Option<crate::ty::TableTy> {
+        let luacats::TypeExprKind::Named { name, args } = &ty.kind else {
+            return None;
+        };
+        let args = self.env.lower_bound_args(args, &self.aliases);
+        self.class_members_bound(name, &args)
+    }
+
     /// A new ambient layer: this one plus the workspace-global
     /// `---@class`/`---@enum`/`---@alias` declarations collected from every
     /// checked project source file (luals parity: classes, enums, and
@@ -499,6 +592,250 @@ fn report_alias(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ty::Ty;
+
+    /// A generic class's shape as harvested from a project file — the
+    /// merged ambient a real hover/completion query would hold.
+    fn box_ambient() -> Ambient {
+        let src = "---@class Box<T>\n---@field item T\nlocal B = {}\nreturn B\n";
+        let parsed = lua::parse(src, Dialect::Lua54);
+        assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
+        let types = crate::module_surface(&parsed, "box.lua", None).types;
+        stdlib(Dialect::Lua54).with_project_types([&types])
+    }
+
+    /// The [`luacats::TypeExpr`] a `---@type <src>` annotation parses to —
+    /// the shape a real LuaCATS caller (hover/completion) already holds.
+    fn type_expr(src: &str) -> luacats::TypeExpr {
+        let parsed = lua::parse(&format!("---@type {src}\nlocal b\n"), Dialect::Lua54);
+        assert_eq!(
+            parsed.errors(),
+            &[],
+            "annotation fixture must parse cleanly"
+        );
+        let items = luacats::harvest(&parsed);
+        for item in &items {
+            for tag in &item.block.tags {
+                if let Tag::Type(t) = tag {
+                    return t.types[0].clone();
+                }
+            }
+        }
+        panic!("no ---@type tag harvested from {src:?}");
+    }
+
+    #[test]
+    fn class_members_of_a_bound_reference_resolves_the_bound_type() {
+        // Round 3 review F48: `Ambient::class_members(name)` alone always
+        // resolves through `class_shape_bound(name, &[])` — every parameter
+        // free — so a caller that extracted just the name from `Box<number>`
+        // and asked for its members got `item: T`, the exact "editor accepts
+        // what CI rejects" shape #56's acceptance criterion forbids: the
+        // checker resolves the same reference to `item: number`.
+        let ambient = box_ambient();
+        let ty = type_expr("Box<number>");
+        let shape = ambient
+            .class_members_of(&ty)
+            .expect("Box<number> is a class reference");
+        assert_eq!(
+            shape.fields["item"].ty,
+            Ty::Number,
+            "the bound reference's member must resolve to the type it was bound to"
+        );
+
+        // The rejecting probe beside the accepting one: `class_members_bound`
+        // called directly with the SAME argument must agree — proving
+        // `class_members_of` is not doing anything `class_members_bound`
+        // itself would not, and that a genuinely wrong argument is
+        // distinguishable from the right one (not just "some concrete type").
+        let bound_directly = ambient
+            .class_members_bound("Box", &[Ty::String])
+            .expect("Box is a class");
+        assert_eq!(bound_directly.fields["item"].ty, Ty::String);
+        assert_ne!(bound_directly.fields["item"].ty, shape.fields["item"].ty);
+    }
+
+    #[test]
+    fn class_members_of_monomorphises_a_nested_generic_argument() {
+        // The argument list is lowered against the env's OWN generic classes
+        // (`TypeEnv::generic_classes`), which is what lets an argument that is
+        // itself a generic reference resolve: without those templates in
+        // scope, `Pair<number>` lowers to the bare `Ty::Named("Pair")` — a
+        // name carrying none of its binding — and `Box<Pair<number>>`'s member
+        // silently becomes an unresolvable reference rather than the pair's
+        // shape. Measured: three surviving mutants returned an empty or
+        // garbage template map here and no test noticed.
+        let src = "\
+---@class Pair<P>
+---@field left P
+---@field right P
+---@class Boxed<T>
+---@field item T
+local B = {}
+return B
+";
+        let parsed = lua::parse(src, Dialect::Lua54);
+        assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
+        let types = crate::module_surface(&parsed, "boxed.lua", None).types;
+        let ambient = stdlib(Dialect::Lua54).with_project_types([&types]);
+
+        let shape = ambient
+            .class_members_of(&type_expr("Boxed<Pair<number>>"))
+            .expect("Boxed<...> is a class reference");
+        let Ty::Table(inner) = &shape.fields["item"].ty else {
+            panic!(
+                "the nested argument must resolve to Pair's shape, got {:?}",
+                shape.fields["item"].ty
+            );
+        };
+        assert_eq!(inner.fields["left"].ty, Ty::Number);
+        assert_eq!(inner.fields["right"].ty, Ty::Number);
+
+        // Rejecting probe: a different nested binding is a different shape,
+        // so the argument is genuinely carried rather than erased to a
+        // catch-all table both spellings would satisfy.
+        let other = ambient
+            .class_members_of(&type_expr("Boxed<Pair<string>>"))
+            .expect("Boxed<...> is a class reference");
+        assert_ne!(other.fields["item"].ty, shape.fields["item"].ty);
+    }
+
+    #[test]
+    fn class_members_of_an_unbound_reference_stays_lenient() {
+        // The one-variable control: the identical class, referenced bare —
+        // no arguments to bind, so the member stays the free `T` (unknown
+        // downstream), exactly as `Ambient::class_members` already behaves
+        // and exactly as a bare `Box` written by hand means (#84).
+        let ambient = box_ambient();
+        let ty = type_expr("Box");
+        let shape = ambient
+            .class_members_of(&ty)
+            .expect("Box is a class reference");
+        assert_eq!(shape.fields["item"].ty, Ty::Named("T".to_string()));
+
+        // Consistent with the plain by-name lookup, which this must not
+        // diverge from for the unbound case.
+        assert_eq!(shape, ambient.class_members("Box").expect("Box is a class"));
+    }
+
+    #[test]
+    fn class_members_of_a_non_named_type_expression_is_none() {
+        // The documented boundary: `class_members_of` resolves a `Named`
+        // reference only, and only when the name is a class. A caller
+        // holding a compound type (`T?`, a union, an array, ...) — not
+        // `TypeExprKind::Named` at the syntax level at all — gets `None`
+        // rather than a guess at which member it meant; a real `Named`
+        // reference to a non-class name (`string`) is `None` for the same
+        // reason `class_members`/`class_members_bound` already are.
+        let ambient = box_ambient();
+        for src in ["Box?", "Box|nil", "Box[]", "string"] {
+            assert!(
+                ambient.class_members_of(&type_expr(src)).is_none(),
+                "{src} must not resolve as a bound class reference"
+            );
+        }
+    }
+
+    // === class_ancestry_truncated (production readiness review, finding 2,
+    // crate-level gap) =======================================================
+    //
+    // `luabox-lsp`'s `merged_ambient.rs` already pins this accessor through
+    // `MergedAmbient`'s wrapper, but that suite is out of scope for this
+    // crate's own mutation gate (`cargo mutants -p luabox-types` runs only
+    // `luabox-types`' tests). Nothing at THIS crate's level ever called
+    // `Ambient::class_ancestry_truncated` directly — every other test above
+    // reads a class's shape (`class_members`/`class_members_of`), never
+    // whether that shape was truncated — so a survivor here was a public API
+    // this crate ships with no test of its own ever exercising it.
+
+    /// A single-file `---@class C0`, `---@class C1 : C0`, ..., `Cn : C(n-1)`
+    /// chain of length `n` — the same shape `env.rs`'s own
+    /// `MAX_ANCESTRY_DEPTH` boundary tests and `merged_ambient.rs`'s
+    /// `chain_source` use.
+    fn chain_source(n: usize) -> String {
+        use std::fmt::Write as _;
+        let mut src = String::from("---@class C0\n---@field item number\n");
+        for i in 1..=n {
+            let _ = writeln!(src, "---@class C{i} : C{}", i - 1);
+        }
+        src
+    }
+
+    /// The ambient a project file contributing `chain_source(n)` would merge
+    /// into — `class_members`/`class_ancestry_truncated`'s real read path
+    /// (`with_project_types`), not the raw `TypeEnv` `env.rs`'s own tests
+    /// build directly.
+    fn chain_ambient(n: usize) -> Ambient {
+        let src = chain_source(n);
+        let parsed = lua::parse(&src, Dialect::Lua54);
+        assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
+        let types = crate::module_surface(&parsed, "chain.lua", None).types;
+        stdlib(Dialect::Lua54).with_project_types([&types])
+    }
+
+    #[test]
+    fn class_ancestry_truncated_is_false_for_a_class_within_the_depth_cap() {
+        // The floor side: a chain of exactly `MAX_ANCESTRY_DEPTH` classes
+        // resolves in full, so the deepest class's ancestry was never
+        // truncated. Pins the `-> false` direction: a mutant that always
+        // returns `false` would pass this alone, which is exactly why the
+        // `-> true` sibling test below also has to exist.
+        let n = crate::env::MAX_ANCESTRY_DEPTH - 1;
+        let ambient = chain_ambient(n);
+        let name = format!("C{n}");
+        let shape = ambient.class_members(&name).expect("the class resolves");
+        assert!(
+            shape.fields.contains_key("item"),
+            "a chain within the limit must still merge C0's field"
+        );
+        assert!(!ambient.class_ancestry_truncated(&name));
+    }
+
+    #[test]
+    fn class_ancestry_truncated_is_true_for_a_class_past_the_depth_cap() {
+        // The ceiling side: one class past `MAX_ANCESTRY_DEPTH` already loses
+        // C0's field to the cap, so the accessor must say so. Pins the
+        // `-> true` direction: a mutant that always returns `true` would
+        // pass this alone, which is exactly why the sibling test above also
+        // has to exist — only together do the two pin both directions.
+        let n = crate::env::MAX_ANCESTRY_DEPTH;
+        let ambient = chain_ambient(n);
+        let name = format!("C{n}");
+        let shape = ambient.class_members(&name).expect("the class resolves");
+        assert!(
+            !shape.fields.contains_key("item"),
+            "one class past the limit must already truncate before reaching C0's field"
+        );
+        assert!(ambient.class_ancestry_truncated(&name));
+    }
+
+    #[test]
+    fn class_ancestry_truncated_does_not_leak_across_class_names() {
+        // The query must answer for the class just resolved, not "has this
+        // layer ever seen a depth-limit hit anywhere" — a shallow class
+        // looked up after a truncated one must not inherit the previous
+        // call's `true`.
+        let deep_n = crate::env::MAX_ANCESTRY_DEPTH;
+        let src = format!(
+            "{}\n---@class Shallow\n---@field x number\n",
+            chain_source(deep_n)
+        );
+        let parsed = lua::parse(&src, Dialect::Lua54);
+        assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
+        let types = crate::module_surface(&parsed, "chain.lua", None).types;
+        let ambient = stdlib(Dialect::Lua54).with_project_types([&types]);
+
+        let deep_name = format!("C{deep_n}");
+        ambient
+            .class_members(&deep_name)
+            .expect("the deep class resolves");
+        assert!(ambient.class_ancestry_truncated(&deep_name));
+
+        ambient
+            .class_members("Shallow")
+            .expect("the shallow class resolves");
+        assert!(!ambient.class_ancestry_truncated("Shallow"));
+    }
 
     #[test]
     fn every_dialect_builds_without_unknown_type_names() {
@@ -841,6 +1178,49 @@ f(math.pi)
         let b = file_types("---@alias Name string\n");
         let diags = alias_collisions(&[], &[("a.lua".to_string(), &a), ("b.lua".to_string(), &b)]);
         assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn an_intra_file_class_repeat_is_one_collision_not_two() {
+        // The within-file dedup's whole job (#58 mutation audit): a package
+        // whose own file repeats a class collides with the OTHER package
+        // once, not once per repetition — the repeat is a duplicate
+        // declaration (the union rule's business, #49), not two claims.
+        let defs = vec![
+            DefFile {
+                file: "defs/a.d.lua".to_string(),
+                text: "---@meta\n---@class Widget\n---@field a number\n".to_string(),
+            },
+            DefFile {
+                file: "dep/defs/b.d.lua".to_string(),
+                text: "---@meta\n---@class Widget\n---@field b number\n\
+                       ---@class Widget\n---@field c number\n"
+                    .to_string(),
+            },
+        ];
+        let (_ambient, diags) = build_ambient_checked(Dialect::Lua54, &defs);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code.to_string(), "LB0307");
+    }
+
+    #[test]
+    fn an_intra_file_alias_repeat_is_one_collision_not_two() {
+        // The alias twin of the class dedup above (#113 dedups per file the
+        // same way; the duplicate-alias diagnostic within one file is
+        // LB0310's own separate report, not a package collision).
+        let defs = vec![
+            DefFile {
+                file: "a.d.lua".to_string(),
+                text: "---@meta\n---@alias Id integer\n".to_string(),
+            },
+            DefFile {
+                file: "b.d.lua".to_string(),
+                text: "---@meta\n---@alias Id string\n---@alias Id boolean\n".to_string(),
+            },
+        ];
+        let diags = alias_collisions(&defs, &[]);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code.to_string(), "LB0310");
     }
 
     #[test]

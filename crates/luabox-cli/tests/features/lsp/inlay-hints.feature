@@ -56,6 +56,65 @@ Feature: luabox lsp — inlay hints
     Then an inlay hint at 6:32 reads ": Rect"
     And an inlay hint at 6:23 reads ": number"
 
+  # Round 3 review F44, round 4 review R31: the display-mode ambient
+  # (`binding_types`, the query this surface reads) needs the project-wide
+  # class merge, not just the file's own annotations, or a required module's
+  # `---@class` carrier export stays opaque instead of resolving to the
+  # class it carries. F44's own test pinned the regression one layer down,
+  # at `binding_types` itself (`luabox-db/tests/analysis.rs`); this is the
+  # inlay-hint-level scenario nothing had reached.
+  Scenario: a required module's class-carrier binding hints with the class name
+    Given a file "widget.lua" containing:
+      """
+      ---@class Widget
+      ---@field id number
+      local W = {}
+      return W
+      """
+    And a file "main.lua" containing:
+      """
+      local w = require("widget")
+      print(w)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request inlay hints for the first 2 lines of "main.lua"
+    Then an inlay hint at 0:7 reads ": Widget"
+
+  # Round 5 review N43: the scenario above does not actually reach F44's fix.
+  # `w`'s type is a bare `require` export (`Ty::Named("Widget")`, handed over
+  # by `require_exports` unaided since #56), so it needs no cross-file merge
+  # to render — deleting the merge (`query.rs`'s `with_project_types`) left
+  # that scenario green. F44's real shape is a **constructor call**:
+  # `reify_shape`'s instance-identity rule hands the display inference a bare
+  # `Widget` for `m.make()`'s return, and only the cross-file merge lets it
+  # resolve back to the class's own declaration — `luabox-db/tests/analysis.rs`'s
+  # `display_mode_resolves_a_required_carriers_class_across_files` is the one
+  # that actually fails when the merge is deleted; this is that fixture at
+  # the surface a user sees.
+  Scenario: a required module's carrier constructor call hints with the class name
+    Given a file "widget.lua" containing:
+      """
+      ---@class Widget
+      ---@field id number
+      local W = {}
+      W.__index = W
+
+      ---@return Widget
+      function W.make() return setmetatable({}, W) end
+      return W
+      """
+    And a file "main.lua" containing:
+      """
+      local m = require("widget")
+      local v = m.make()
+      print(v)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request inlay hints for the first 3 lines of "main.lua"
+    Then an inlay hint at 1:7 reads ": Widget"
+
   Scenario: a local function name gets no binding hint, only a return hint
     Given a file "main.lua" containing:
       """

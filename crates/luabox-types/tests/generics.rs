@@ -336,3 +336,57 @@ local bad = { flag = 1 }
 ";
     assert_eq!(codes(src), vec!["LB0300"]);
 }
+
+// --- F36: an inherited indexer's KEY, not just its value, is substituted ---
+
+const MAP_CLASS: &str = "\
+---@class Map<K, V>
+---@field [K] V
+";
+
+#[test]
+fn inherited_indexer_key_is_substituted_not_left_free() {
+    // `Users : Map<integer, number>` inherits an indexer keyed on `K`. If the
+    // key is left as the free `Ty::Named(\"K\")` (only the value substituted),
+    // `assign.rs` resolves the unbound key as "matches anything", so a
+    // `string`-keyed literal is wrongly accepted with no LB0303 — the false
+    // accept `env.rs:1251` produces. The direct (non-inherited) spelling
+    // already substitutes both (`generic_class_indexer_fields_substitute_both_parameters`
+    // above); this pins the inheritance path to the same rule.
+    let bad_key = format!(
+        "{MAP_CLASS}
+---@class Users : Map<integer, number>
+
+---@type Users
+local u = {{ alpha = 1 }}
+"
+    );
+    assert_eq!(
+        codes(&bad_key),
+        vec!["LB0303"],
+        "an inherited indexer's key must reject a mismatched literal key exactly as the direct spelling does"
+    );
+
+    // The rejecting probe's pair: a correctly-keyed literal must still be
+    // accepted, so the fix is a substitution — not a blanket rejection.
+    let good_key = format!(
+        "{MAP_CLASS}
+---@class Users : Map<integer, number>
+
+---@type Users
+local u = {{ [1] = 2 }}
+"
+    );
+    assert_eq!(codes(&good_key), Vec::<String>::new());
+
+    // The value parameter must still be enforced through inheritance too.
+    let bad_value = format!(
+        "{MAP_CLASS}
+---@class Users : Map<integer, number>
+
+---@type Users
+local u = {{ [1] = \"not a number\" }}
+"
+    );
+    assert_eq!(codes(&bad_value), vec!["LB0300"]);
+}

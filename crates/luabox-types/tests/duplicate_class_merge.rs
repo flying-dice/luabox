@@ -25,57 +25,17 @@
 //! defs`) class of the same name whole — that is a different axis (the
 //! escape hatch, see `Ambient::with_rock_types`) and is unchanged.
 
-use luabox_diag::Diagnostic;
-use luabox_syntax::lua::{self, Dialect, parse};
-use luabox_types::{
-    Ambient, FileTypes, Strictness, build_ambient, check_file_with_ambient, module_surface,
-    stdlib_defs,
-};
+use luabox_syntax::lua::{Dialect, parse};
+use luabox_types::{Strictness, build_ambient, check_file_with_ambient};
 
-fn check(src: &str) -> Vec<Diagnostic> {
-    let parsed = parse(src, Dialect::Lua54);
-    assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
-    check_file_with_ambient(
-        &parsed,
-        "test.lua",
-        Strictness::Strict,
-        lua::Dialect::Lua54,
-        Some(stdlib_defs(Dialect::Lua54)),
-    )
-}
-
-fn codes(src: &str) -> Vec<String> {
-    check(src).iter().map(|d| d.code.to_string()).collect()
-}
+// F79 (round 3 review): `check`/`codes`/`surface`/`check_cross` used to be
+// ~40 lines defined here near-verbatim identically to
+// `duplicate_class_merge_property.rs` — now one shared module both import.
+mod support;
+use support::{check, check_cross, codes};
 
 fn none() -> Vec<String> {
     Vec::new()
-}
-
-/// The workspace surface one project file contributes.
-fn surface(src: &str, base: &Ambient) -> FileTypes {
-    let parsed = parse(src, Dialect::Lua54);
-    assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
-    module_surface(&parsed, "m.lua", Some(base)).types
-}
-
-/// Check `consumer` against the merged surface of every `file`.
-fn check_cross(files: &[&str], consumer: &str) -> Vec<String> {
-    let base = stdlib_defs(Dialect::Lua54);
-    let types: Vec<FileTypes> = files.iter().map(|f| surface(f, base)).collect();
-    let ambient = base.with_project_types(types.iter());
-    let parsed = parse(consumer, Dialect::Lua54);
-    assert_eq!(parsed.errors(), &[], "consumer must parse cleanly");
-    check_file_with_ambient(
-        &parsed,
-        "consumer.lua",
-        Strictness::Strict,
-        Dialect::Lua54,
-        Some(&ambient),
-    )
-    .iter()
-    .map(|d| d.code.to_string())
-    .collect()
 }
 
 // --- same-file duplicates union -------------------------------------------
@@ -318,6 +278,108 @@ fn cross_file_conflicting_field_keeps_the_first_files_type() {
 }
 
 #[test]
+fn cross_file_conflicting_parent_argument_keeps_the_first_files_binding() {
+    // F40 (round 3 review): `ParentRef { name, args }` makes "same parent,
+    // different arguments" representable — before this PR `parents` was
+    // `Vec<String>`, so the state could not even exist. Both merge seams
+    // dedup a parent by NAME alone (`env.rs`'s `merge_file_types` and
+    // `absorb_block`), so `---@class Sub : Base<number>` in one file and
+    // `---@class Sub : Base<string>` in another is not diagnosed either way
+    // — it resolves silently by fold order, the same rule
+    // `cross_file_conflicting_field_keeps_the_first_files_type` pins for a
+    // `---@field` conflict (that one *is* diagnosed, `LB0311`; this one is
+    // not — noted as a residual, not fixed here). Pinned in both directions
+    // so a future change to the fold order — or a diagnostic added later —
+    // is a deliberate edit to this test, not a silent behaviour change.
+    let base = "---@class Base<U>\n---@field item U\n";
+    let files = [
+        format!("{base}---@class Sub : Base<number>\n"),
+        format!("{base}---@class Sub : Base<string>\n"),
+    ];
+    let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
+    assert_eq!(
+        check_cross(
+            &file_refs,
+            "---@param n number\nlocal function want(n) end\n---@param s Sub\nlocal function use(s) want(s.item) end\n",
+        ),
+        none(),
+        "the first file's `Base<number>` binding must survive: item is `number`"
+    );
+    assert_eq!(
+        check_cross(
+            &file_refs,
+            "---@param str string\nlocal function want(str) end\n---@param s Sub\nlocal function use(s) want(s.item) end\n",
+        ),
+        vec!["LB0300"],
+        "the second file's `Base<string>` binding must NOT win — item is not `string`"
+    );
+
+    // Reversing which file is listed first flips the answer: this is
+    // fold-order-dependent, not a stable per-name rule, which is the shape
+    // of the residual (nothing compares the two bindings or reports a
+    // conflict).
+    let reversed: Vec<&str> = file_refs.iter().rev().copied().collect();
+    assert_eq!(
+        check_cross(
+            &reversed,
+            "---@param str string\nlocal function want(str) end\n---@param s Sub\nlocal function use(s) want(s.item) end\n",
+        ),
+        none(),
+        "with the files reversed, `Base<string>` is now first and wins: item is `string`"
+    );
+}
+
+#[test]
+fn same_file_conflicting_parent_argument_keeps_the_first_declarations_binding() {
+    // The in-file mirror of `cross_file_conflicting_parent_argument_keeps_
+    // the_first_files_binding` (round 4 review R30 — F40 was pinned at the
+    // cross-file `merge_file_types` seam and nowhere at the in-file
+    // `absorb_block` seam, which dedups a re-declared parent by NAME the
+    // same way (`env.rs`'s `absorb_block`): two `---@class Sub : Base<...>`
+    // blocks for one name in ONE file is not diagnosed as a conflict either
+    // — it resolves silently by declaration order, the same residual the
+    // cross-file test documents rather than fixes.
+    let base = "\
+---@class Base<U>
+---@field item U
+";
+    let src = format!(
+        "{base}---@class Sub : Base<number>\n---@class Sub : Base<string>\n\
+         ---@param n number\nlocal function want(n) end\n\
+         ---@param s Sub\nlocal function use(s) want(s.item) end\nreturn use\n"
+    );
+    assert_eq!(
+        codes(&src),
+        none(),
+        "the first declaration's `Base<number>` binding must survive: item is `number`"
+    );
+    let rejecting = format!(
+        "{base}---@class Sub : Base<number>\n---@class Sub : Base<string>\n\
+         ---@param str string\nlocal function want(str) end\n\
+         ---@param s Sub\nlocal function use(s) want(s.item) end\nreturn use\n"
+    );
+    assert_eq!(
+        codes(&rejecting),
+        vec!["LB0300"],
+        "the second declaration's `Base<string>` binding must NOT win — item is not `string`"
+    );
+
+    // Reversing which declaration comes first flips the answer — fold-order-
+    // dependent, not a stable per-name rule, exactly like the cross-file
+    // case: nothing here compares the two bindings or reports a conflict.
+    let reversed = format!(
+        "{base}---@class Sub : Base<string>\n---@class Sub : Base<number>\n\
+         ---@param str string\nlocal function want(str) end\n\
+         ---@param s Sub\nlocal function use(s) want(s.item) end\nreturn use\n"
+    );
+    assert_eq!(
+        codes(&reversed),
+        none(),
+        "with the declarations reversed, `Base<string>` is now first and wins: item is `string`"
+    );
+}
+
+#[test]
 fn same_file_conflicting_field_keeps_the_first_declarations_type() {
     // Identical rule in-file. `LB0311` flags the duplicate as it always has.
     let src = "\
@@ -408,6 +470,227 @@ fn a_defs_file_duplicate_class_unions_too() {
     assert_eq!(
         diags.iter().map(|d| d.code.to_string()).collect::<Vec<_>>(),
         none()
+    );
+}
+
+// --- diamond over a shared ancestor: one merge rule for all member kinds ---
+//
+// Round 4 review R2/R3/R4: the F39 fix that made `collect_class` expand a
+// diamond's shared ancestor once per edge (rather than dropping every edge
+// but the first) briefly re-expanded that ancestor on EVERY edge with no
+// memo, which changed more than cost. R2 was a later, empty sibling
+// clobbering an earlier sibling's override; R3 was fields, indexers and
+// assignability disagreeing about which parent won one and the same
+// declaration. The R1 fix (memoise `collect_class` on `(name, args)` inside
+// one `class_shape_bound` call, and make the indexer merge overwrite by key
+// like the field merge already does) resolves both by construction: a
+// shared ancestor bound identically on every edge is expanded once, so an
+// empty sibling has nothing left to re-expand, and the winning parent is
+// "last processed" for fields and indexers alike — the two tests below pin
+// that it stays that way.
+
+#[test]
+fn a_later_empty_sibling_does_not_clobber_an_earlier_siblings_field_override() {
+    // `Base.x: number`; `A : Base` overrides `x: string`; `B : Base`
+    // declares nothing at all; `C : A, B`. Before the R1 fix, `B`'s bare
+    // (re-)expansion of `Base` ran *after* `A`'s override and re-inserted
+    // `Base`'s own `x: number`, so a sibling that declares NOTHING beat one
+    // that explicitly overrides the field — measured `C.x: number`,
+    // `want(c.x)` (string param) rejected. The memo skips `B`'s redundant
+    // re-expansion of the already-fully-processed `(Base, [])`, so `A`'s
+    // override is the last write and survives.
+    let src = "\
+---@class Base
+---@field x number
+---@class A : Base
+---@field x string
+---@class B : Base
+---@class C : A, B
+---@param s string
+local function want(s) end
+---@param c C
+local function use(c) want(c.x) end
+return use
+";
+    assert_eq!(
+        codes(src),
+        none(),
+        "A's `x: string` override must survive B's later, empty visit to the same `Base`"
+    );
+    let rejecting = "\
+---@class Base
+---@field x number
+---@class A : Base
+---@field x string
+---@class B : Base
+---@class C : A, B
+---@param n number
+local function want(n) end
+---@param c C
+local function use(c) want(c.x) end
+return use
+";
+    assert_eq!(
+        codes(rejecting),
+        vec!["LB0300"],
+        "x must not have reverted to Base's own `number`"
+    );
+}
+
+#[test]
+fn conflicting_generic_diamond_bindings_agree_between_fields_indexers_and_assignability() {
+    // `Base<V>` declares both a field and an indexer typed `V`; `A :
+    // Base<number>`; `B : Base<string>`; `C : A, B` — a genuine conflicting
+    // diamond, not a repeat of one binding. Before the R1 fix this one
+    // declaration gave three different answers about which parent won:
+    // fields (`BTreeMap::insert`) took B (last inserted); indexers
+    // (`Vec::extend`, first-match consumed) effectively took A; assignability
+    // (all-pairs over both stale indexer entries) accepted neither. The fix
+    // makes indexers overwrite by key exactly as fields do, so the winner —
+    // "last processed", i.e. B, the last-listed parent — is the same answer
+    // for the field read, the indexer read, and a value checked against the
+    // class as a whole.
+    let src = "\
+---@class Base<V>
+---@field item V
+---@field [string] V
+---@class A : Base<number>
+---@class B : Base<string>
+---@class C : A, B
+---@param s string
+local function want(s) end
+---@param c C
+local function use(c)
+  want(c.item)
+  want(c[\"k\"])
+end
+return use
+";
+    assert_eq!(
+        codes(src),
+        none(),
+        "field and indexer must agree: both `string`, B's (last-listed) binding"
+    );
+    let rejecting = "\
+---@class Base<V>
+---@field item V
+---@field [string] V
+---@class A : Base<number>
+---@class B : Base<string>
+---@class C : A, B
+---@param n number
+local function want(n) end
+---@param c C
+local function use(c)
+  want(c.item)
+  want(c[\"k\"])
+end
+return use
+";
+    assert_eq!(
+        codes(rejecting),
+        vec!["LB0300", "LB0300"],
+        "A's `number` binding must not win either the field or the indexer read"
+    );
+}
+
+// --- a third edge repeating an earlier binding ------------------------------
+//
+// Round 5 review: `DiamondGuard`'s memo keys purely on `(name, args)` and
+// SKIPS any later edge with that exact key, on the doc comment's claim that
+// "every edge of a real diamond binds its shared ancestor identically... An
+// edge that binds the same ancestor differently is a different memo key, and
+// still expands on both edges." True for two edges, false for three or more:
+// when a non-adjacent LATER edge repeats an EARLIER edge's exact binding, the
+// later edge is skipped, and whichever DIFFERENTLY-bound edge sits between
+// them is left standing — not the last-listed parent `collect_class` is
+// otherwise built to prefer. The fix re-applies a repeat's cached
+// contribution instead of skipping it, so every edge still lands, in order,
+// even the ones the memo now answers from cache rather than re-walking.
+
+#[test]
+fn a_diamond_reaching_one_ancestor_through_three_edges_keeps_the_last_even_when_an_earlier_binding_repeats()
+ {
+    // `Multi : P1, P2, P3` — `P1 : Base<string>`, `P2 : Base<number>`,
+    // `P3 : Base<string>` (repeating P1's exact binding). Last-listed is P3
+    // (`string`), so this must be clean. Pre-fix: P3's `(Base, [string])` is
+    // already memoised from P1's visit, so P3's expansion is skipped and
+    // P2's `number` — the stale middle edge — is left standing; measured
+    // `LB0300: type mismatch: expected string, found number`.
+    let src = "\
+---@class Base<T>
+---@field val T
+---@class P1 : Base<string>
+---@class P2 : Base<number>
+---@class P3 : Base<string>
+---@class Multi : P1, P2, P3
+---@param s string
+local function want_string(s) end
+---@type Multi
+local m
+want_string(m.val)
+";
+    assert_eq!(
+        codes(src),
+        none(),
+        "P3 (last-listed) binds `val: string`; a repeat of P1's identical binding must \
+         still leave P3's contribution standing, not P2's stale `number` — a middle-edge \
+         win here is a false LB0300 reject"
+    );
+}
+
+#[test]
+fn a_diamond_reaching_one_ancestor_through_three_edges_the_stale_middle_edge_is_not_a_silent_accept()
+ {
+    // Mirror of the test above, same fixture, opposite probe: read `m.val`
+    // as `number` instead of `string`. The stale middle edge (`P2`) is the
+    // type the bug leaves standing, so pre-fix this reads as `number` and
+    // `want_number(m.val)` passes with NO diagnostic — silently wrong: the
+    // real type is `string` (P3, last-listed), so this must reject.
+    let src = "\
+---@class Base<T>
+---@field val T
+---@class P1 : Base<string>
+---@class P2 : Base<number>
+---@class P3 : Base<string>
+---@class Multi : P1, P2, P3
+---@param n number
+local function want_number(n) end
+---@type Multi
+local m
+want_number(m.val)
+";
+    assert_eq!(
+        codes(src),
+        vec!["LB0300"],
+        "P3 (last-listed) binds `val: string`; reading it as `number` must be rejected, \
+         not silently accepted because a stale middle edge (P2) is left standing"
+    );
+}
+
+#[test]
+fn a_diamond_reaching_one_ancestor_through_two_edges_already_keeps_the_last_control() {
+    // Two-parent control for the two tests above: same shape, one edge
+    // fewer, so no key ever repeats and both edges expand fresh either way.
+    // Passes today already — isolating the fix: it is the THIRD, repeating
+    // edge that trips the bug above, not diamonds or generic bindings on
+    // their own.
+    let src = "\
+---@class Base<T>
+---@field val T
+---@class P1 : Base<number>
+---@class P2 : Base<string>
+---@class Multi2 : P1, P2
+---@param s string
+local function want_string(s) end
+---@type Multi2
+local m
+want_string(m.val)
+";
+    assert_eq!(
+        codes(src),
+        none(),
+        "P2 (last-listed) binds `val: string` — already correct with only two edges"
     );
 }
 

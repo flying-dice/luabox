@@ -151,9 +151,16 @@ fn shape_ambient() -> Ambient {
 
 #[test]
 fn require_of_class_module_resolves_inherited_method() {
-    let ambient = shape_ambient();
+    // The module's workspace-global types merge into the consumer's ambient
+    // (`with_project_types`) exactly as the real pipeline merges every
+    // checked file's — since #56 the export IS the class name, so the
+    // carrier's member attachments must arrive via that merge, not via a
+    // structural export type.
+    let base = shape_ambient();
+    let (export_ty, types) = surface(SHAPE_MODULE, &base);
+    let ambient = base.with_project_types([&types]);
     let mut requires = HashMap::new();
-    requires.insert("shape".to_string(), export(SHAPE_MODULE, &ambient));
+    requires.insert("shape".to_string(), export_ty);
 
     // `Shape.new(2)` types as the class; `:area()` resolves through the
     // ambient class declaration and produces `number`.
@@ -172,9 +179,11 @@ want(s:area())
 
 #[test]
 fn method_misuse_on_required_class_errors_at_consumer_site() {
-    let ambient = shape_ambient();
+    let base = shape_ambient();
+    let (export_ty, types) = surface(SHAPE_MODULE, &base);
+    let ambient = base.with_project_types([&types]);
     let mut requires = HashMap::new();
-    requires.insert("shape".to_string(), export(SHAPE_MODULE, &ambient));
+    requires.insert("shape".to_string(), export_ty);
 
     // Calling a method the class does not declare is an undefined-field
     // read (LB0306), reported in the consumer at the misuse site.
@@ -184,6 +193,584 @@ local s = Shape.new(2)
 local _ = s:bogus()
 ";
     assert_eq!(codes(&check(consumer, &ambient, &requires)), vec!["LB0306"]);
+}
+
+// --- generic carriers crossing the boundary --------------------------------
+
+/// A carrier for a *generic* class — the one class name that is not a
+/// complete type on its own, since `Ty::Named` carries no type arguments.
+const BOX_MODULE: &str = "\
+---@class Box<T>
+---@field item T
+local B = {}
+return B
+";
+
+fn box_ambient_and_requires() -> (Ambient, HashMap<String, Ty>) {
+    let (export_ty, types) = surface(BOX_MODULE, stdlib());
+    let ambient = stdlib().with_project_types([&types]);
+    let mut requires = HashMap::new();
+    requires.insert("box".to_string(), export_ty);
+    (ambient, requires)
+}
+
+#[test]
+fn generic_carrier_export_never_names_its_unbound_parameter() {
+    // Crossing as `Box` would type the member `T` in the consumer — a type
+    // variable it can neither name nor produce, so the diagnostic points at no
+    // action. The unbound parameter reads `unknown`, exactly as it does for a
+    // bare `Box` written by hand.
+    let (ambient, requires) = box_ambient_and_requires();
+    let consumer = "\
+---@param n number
+local function want(n) end
+local b = require(\"box\")
+want(b.item)
+";
+    let diags = check(consumer, &ambient, &requires);
+    assert_eq!(codes(&diags), vec!["LB0300"]);
+    assert!(
+        diags[0].message.contains("found `unknown`"),
+        "{}",
+        diags[0].message
+    );
+    assert!(
+        !diags[0].message.contains("`T`"),
+        "the parameter must not reach the consumer: {}",
+        diags[0].message
+    );
+    // F72 (round 3 review) had this message append a blanket "(add
+    // `---@type <expected>` to check it)" remedy for any `unknown` mismatch.
+    // Round 4 review R12 withdrew it: `slot_range(slot)` here is `b.item`,
+    // the call-argument *expression* — not `b`'s own binding, which is
+    // where `---@type Box<number>` (the action
+    // `binding_the_type_argument_types_the_required_generic_carrier` below
+    // measures) actually has to go. A remedy anchored at a site the reader
+    // cannot annotate misdirects rather than helps, so the message no
+    // longer guesses one.
+    assert!(
+        !diags[0].message.contains("---@type"),
+        "no remedy the reader cannot act on at this site: {}",
+        diags[0].message
+    );
+}
+
+#[test]
+fn binding_the_type_argument_types_the_required_generic_carrier() {
+    // The other direction, and the action the `unknown` implies: naming the
+    // argument on the binding monomorphises the same export to `number`.
+    // Measured as a *control*, not a red pin — this held before the export
+    // stopped leaking `T` too (the `---@type` overrides the export type), and
+    // it is what makes the `unknown` above actionable rather than terminal.
+    let (ambient, requires) = box_ambient_and_requires();
+    let consumer = "\
+---@param n number
+local function want(n) end
+---@type Box<number>
+local b = require(\"box\")
+want(b.item)
+";
+    assert_eq!(
+        codes(&check(consumer, &ambient, &requires)),
+        Vec::<String>::new()
+    );
+
+    // …and a wrong argument is rejected against the bound parameter, so the
+    // members are genuinely typed rather than leniently erased.
+    let mismatched = "\
+---@param n number
+local function want(n) end
+---@type Box<string>
+local b = require(\"box\")
+want(b.item)
+";
+    assert_eq!(
+        codes(&check(mismatched, &ambient, &requires)),
+        vec!["LB0300"]
+    );
+}
+
+#[test]
+fn a_plain_carrier_still_crosses_as_the_class_itself() {
+    // The one-variable control for the two tests above: drop the `<T>` and the
+    // #56 behaviour is unchanged — the export is the class, so an undeclared
+    // member is `LB0306`.
+    const PLAIN: &str = "\
+---@class Crate
+---@field item number
+local C = {}
+return C
+";
+    let (export_ty, types) = surface(PLAIN, stdlib());
+    let ambient = stdlib().with_project_types([&types]);
+    let mut requires = HashMap::new();
+    requires.insert("crate".to_string(), export_ty);
+
+    let consumer = "\
+local c = require(\"crate\")
+local _ = c.nope
+";
+    assert_eq!(codes(&check(consumer, &ambient, &requires)), vec!["LB0306"]);
+}
+
+#[test]
+fn an_undeclared_member_on_a_generic_carrier_stays_lenient() {
+    // The documented exception to #56, pinned in the direction it actually
+    // behaves. A carrier with an unbound parameter crosses as the *template*
+    // rather than as `Ty::Named` — that is what stops `T` leaking into the
+    // consumer — and a template is a structural table, which carries no
+    // undefined-field obligation. So the read below is clean where
+    // `a_plain_carrier_still_crosses_as_the_class_itself`'s identical read is
+    // `LB0306`; the two differ by `<T>` alone.
+    //
+    // Without this pin, `reify_export`'s erasure branch is one edit away from
+    // flipping the rule back with nothing failing (round 2, finding 3).
+    let (ambient, requires) = box_ambient_and_requires();
+    let consumer = "\
+local b = require(\"box\")
+local _ = b.nope
+";
+    assert_eq!(
+        codes(&check(consumer, &ambient, &requires)),
+        Vec::<String>::new()
+    );
+}
+
+/// `---@class Sub : Base<number>` — a plain class inheriting a member whose
+/// type is the *parent's* type parameter.
+const BOUND_PARENT_MODULE: &str = "\
+---@class Base<U>
+---@field item U
+---@class Sub : Base<number>
+local S = {}
+return S
+";
+
+fn sub_ambient_and_requires(module: &str) -> (Ambient, HashMap<String, Ty>) {
+    let (export_ty, types) = surface(module, stdlib());
+    let ambient = stdlib().with_project_types([&types]);
+    let mut requires = HashMap::new();
+    requires.insert("sub".to_string(), export_ty);
+    (ambient, requires)
+}
+
+#[test]
+fn a_parent_type_argument_binds_the_inherited_member() {
+    // `: Base<number>` used to bind nothing at all: the argument was dropped
+    // at lowering, `Sub` inherited `item: U`, and the consumer was told
+    // `found `U`` — a name it can neither produce nor act on. The argument now
+    // binds the parent's parameter where the members merge, so `item` is
+    // `number` on both sides of the `require`, and `Sub` has nothing unbound
+    // left to erase: it keeps its #56 class identity.
+    let (ambient, requires) = sub_ambient_and_requires(BOUND_PARENT_MODULE);
+    let consumer = "\
+---@param n number
+local function want(n) end
+local s = require(\"sub\")
+want(s.item)
+";
+    assert_eq!(
+        codes(&check(consumer, &ambient, &requires)),
+        Vec::<String>::new()
+    );
+
+    // The rejecting probe beside the accepting one: `item` is genuinely
+    // `number`, not leniently erased to `unknown`.
+    let mismatched = "\
+---@param s string
+local function want(s) end
+local s = require(\"sub\")
+want(s.item)
+";
+    let diags = check(mismatched, &ambient, &requires);
+    assert_eq!(codes(&diags), vec!["LB0300"]);
+    assert!(
+        diags[0].message.contains("found `number`"),
+        "{}",
+        diags[0].message
+    );
+
+    // …and the class identity survives, so an undeclared member is `LB0306`.
+    let undeclared = "\
+local s = require(\"sub\")
+local _ = s.nope
+";
+    assert_eq!(
+        codes(&check(undeclared, &ambient, &requires)),
+        vec!["LB0306"]
+    );
+}
+
+#[test]
+fn a_parent_written_bare_leaves_its_parameter_unbound_and_erased() {
+    // The one-variable control: the same two classes with the argument
+    // dropped from the parent reference. Nothing binds `U`, so the seam does
+    // what it does for a carrier's own unbound parameter — cross as the
+    // template with `unknown` — rather than leak the name. That is the rule
+    // the round-2 regression broke, kept pinned for the shape that still
+    // reaches it.
+    const BARE_PARENT: &str = "\
+---@class Base<U>
+---@field item U
+---@class Sub : Base
+local S = {}
+return S
+";
+    let (ambient, requires) = sub_ambient_and_requires(BARE_PARENT);
+    let consumer = "\
+---@param n number
+local function want(n) end
+local s = require(\"sub\")
+want(s.item)
+";
+    let diags = check(consumer, &ambient, &requires);
+    assert_eq!(codes(&diags), vec!["LB0300"]);
+    assert!(
+        diags[0].message.contains("found `unknown`"),
+        "{}",
+        diags[0].message
+    );
+    assert!(
+        !diags[0].message.contains("`U`"),
+        "an inherited parameter must not reach the consumer either: {}",
+        diags[0].message
+    );
+}
+
+#[test]
+fn a_parent_argument_written_in_the_childs_own_parameter_passes_through() {
+    // Two levels, with the middle class passing its own parameter up:
+    // `Mid<M> : Slot<M>` and `Leaf : Mid<number>` means `Leaf.slot` is
+    // `number`. The binding is positional at each level, so a class's own map
+    // must reach the arguments it passes to its parent before those bind the
+    // parent's parameters — one substitution, applied on the way up.
+    const CHAIN: &str = "\
+---@class Slot<S>
+---@field slot S
+---@class Mid<M> : Slot<M>
+---@class Leaf : Mid<number>
+local L = {}
+return L
+";
+    let (ambient, requires) = sub_ambient_and_requires(CHAIN);
+    let consumer = "\
+---@param n number
+local function want(n) end
+local l = require(\"sub\")
+want(l.slot)
+";
+    assert_eq!(
+        codes(&check(consumer, &ambient, &requires)),
+        Vec::<String>::new()
+    );
+
+    let mismatched = "\
+---@param s string
+local function want(s) end
+local l = require(\"sub\")
+want(l.slot)
+";
+    assert_eq!(
+        codes(&check(mismatched, &ambient, &requires)),
+        vec!["LB0300"]
+    );
+}
+
+#[test]
+fn a_real_class_name_reused_as_an_ancestors_parameter_does_not_erase_the_export() {
+    // F43: `class_params_in_scope` collects an ancestor's *declared parameter
+    // names* unconditionally, and class names and type parameters share one
+    // namespace (`env.rs` documents the collision explicitly). `Emitter<Event>`
+    // names its OWN type parameter `Event` — legal, if confusing — and `Sub :
+    // Emitter<Click>` binds it away. `Sub`'s own (unrelated) field `pending`
+    // is typed `Event`, naming the REAL class. Pre-fix, `class_params_in_scope`
+    // reports "Event" as a parameter in scope (from `Emitter`'s declaration)
+    // with no regard for `Sub`'s parent reference already binding it, so
+    // `reify_export` erases the real class reference to `unknown` and, in the
+    // same stroke, costs the module its `Ty::Named("Sub")` identity — an
+    // undeclared member that should be `LB0306` reads as lenient instead.
+    const EVENT_DEF: &str = "\
+---@meta
+---@class Event
+---@field id number
+";
+    const COLLIDING_MODULE: &str = "\
+---@class Emitter<Event>
+---@class Sub : Emitter<Click>
+---@field pending Event
+local S = {}
+return S
+";
+    let base = build_ambient(Dialect::Lua54, &[EVENT_DEF.to_string()]);
+    let (export_ty, types) = surface(COLLIDING_MODULE, &base);
+    let ambient = base.with_project_types([&types]);
+    let mut requires = HashMap::new();
+    requires.insert("sub".to_string(), export_ty);
+
+    // The real class's identity must survive the export seam: an undeclared
+    // member is LB0306, exactly as the plain (non-generic-neighbour) carrier
+    // control (`a_plain_carrier_still_crosses_as_the_class_itself`) pins.
+    let undeclared = "\
+local s = require(\"sub\")
+local _ = s.nope
+";
+    assert_eq!(
+        codes(&check(undeclared, &ambient, &requires)),
+        vec!["LB0306"],
+        "Sub must keep its #56 class identity: Emitter's own parameter (which \
+         happens to be spelled `Event`) is bound by `Sub`'s parent reference, \
+         not left free"
+    );
+
+    // …and `pending`'s declared type is genuinely the real class `Event`
+    // (with its own `id` field), not erased to `unknown` because its name
+    // collides with an unrelated ancestor's parameter.
+    let good = "\
+local s = require(\"sub\")
+---@type number
+local n = s.pending.id
+";
+    assert_eq!(
+        codes(&check(good, &ambient, &requires)),
+        Vec::<String>::new(),
+        "`pending` must resolve as the real `Event` class, not `unknown`"
+    );
+}
+
+/// A class-carrier module, optionally opened with a UTF-8 BOM — the
+/// operator-surfaced defect behind
+/// `a_bom_prefixed_declaring_file_still_types_its_fields_across_require`.
+fn point_module(bom: bool) -> String {
+    let prefix = if bom { "\u{feff}" } else { "" };
+    format!(
+        "{prefix}\
+---@class Point
+---@field x number
+local P = {{}}
+return P
+"
+    )
+}
+
+#[test]
+fn a_bom_prefixed_declaring_file_still_types_its_fields_across_require() {
+    // `luacats::harvest`'s `resolve_target` scanned backward from a doc
+    // block for "the real token before it" to decide leading-vs-trailing,
+    // and did not treat a leading BOM as trivia (fixed in
+    // `crates/luabox-syntax/src/luacats/mod.rs`'s `collect_tokens`). A doc
+    // block that opens a BOM'd file — exactly the `---@class`/`---@field`
+    // pair every carrier module starts with — was misread as a *trailing*
+    // comment on the (nonexistent) statement containing byte 0, so its
+    // `target` came back `None`: the class never linked to the `local P =
+    // {}` carrier statement it declares. Same-file inference was unaffected
+    // (it resolves fields through `env.classes`, populated regardless), but
+    // `record_class_carrier` never marked the carrier `declared`, so
+    // `reify_export` crossed `require` as a bare structural `{}` instead of
+    // `Ty::Named("Point")` — field existence went lenient (no class to
+    // enumerate against) while every declared field's *type* silently
+    // dropped to `unknown` for want of the class shape.
+    let base = stdlib();
+    let (export_ty, types) = surface(&point_module(true), base);
+    assert_eq!(
+        export_ty,
+        Ty::Named("Point".to_string()),
+        "a BOM must not cost the carrier its class identity at the export seam"
+    );
+    let ambient = base.with_project_types([&types]);
+    let mut requires = HashMap::new();
+    requires.insert("point".to_string(), export_ty);
+
+    let clean = "\
+---@param n number
+local function want(n) end
+local p = require(\"point\")
+want(p.x)
+";
+    assert_eq!(
+        codes(&check(clean, &ambient, &requires)),
+        Vec::<String>::new(),
+        "x's declared `number` must reach the consumer, not `unknown`"
+    );
+    let rejecting = "\
+---@param s string
+local function want(s) end
+local p = require(\"point\")
+want(p.x)
+";
+    assert_eq!(
+        codes(&check(rejecting, &ambient, &requires)),
+        vec!["LB0300"],
+        "x must be genuinely typed `number`, not leniently `unknown`"
+    );
+    let existence = "\
+local p = require(\"point\")
+local _ = p.nope
+";
+    assert_eq!(
+        codes(&check(existence, &ambient, &requires)),
+        vec!["LB0306"],
+        "the class identity must survive, so an undeclared member is still flagged"
+    );
+}
+
+#[test]
+fn a_bom_free_control_beside_the_bom_pin_above_is_identical() {
+    // Same fixture, no BOM — the control the BOM test above is measured
+    // against, so a future regression in either direction shows up as a
+    // difference between this test and that one, not just a difference from
+    // some doc comment's claim.
+    let base = stdlib();
+    let (export_ty, types) = surface(&point_module(false), base);
+    assert_eq!(export_ty, Ty::Named("Point".to_string()));
+    let ambient = base.with_project_types([&types]);
+    let mut requires = HashMap::new();
+    requires.insert("point".to_string(), export_ty);
+
+    let clean = "\
+---@param n number
+local function want(n) end
+local p = require(\"point\")
+want(p.x)
+";
+    assert_eq!(
+        codes(&check(clean, &ambient, &requires)),
+        Vec::<String>::new()
+    );
+    let rejecting = "\
+---@param s string
+local function want(s) end
+local p = require(\"point\")
+want(p.x)
+";
+    assert_eq!(
+        codes(&check(rejecting, &ambient, &requires)),
+        vec!["LB0300"]
+    );
+    let existence = "\
+local p = require(\"point\")
+local _ = p.nope
+";
+    assert_eq!(
+        codes(&check(existence, &ambient, &requires)),
+        vec!["LB0306"]
+    );
+}
+
+#[test]
+fn a_genuinely_free_parameter_spelled_like_a_real_class_still_erases() {
+    // The mirror of `a_real_class_name_reused_as_an_ancestors_parameter_
+    // does_not_erase_the_export` above, in the OTHER direction (round 4
+    // review R6). That test pins the bound case: `Emitter`'s own parameter
+    // (spelled `Event`) is bound away by `Sub`'s parent reference, so a
+    // genuinely unrelated field typed `Event` must resolve as the real
+    // class. This test pins the free case: `Base`'s own parameter (spelled
+    // `Event`) is left BARE by `Sub : Base` — genuinely unbound — so
+    // `item`, typed with that very parameter, must erase to `unknown`
+    // exactly as it would if the parameter were spelled `U`.
+    //
+    // A round 3 review F43 regression inverted this: `collect_free_names`
+    // asked whether each `Ty::Named` leaf in the *resolved* shape failed to
+    // resolve as a real class, which cannot distinguish "unbound" from
+    // "bound to a real class that happens to share the parameter's
+    // spelling" — both read back as `Ty::Named("Event")`. It answered
+    // "bound" for both, so the genuinely-free case here stopped erasing:
+    // `s.item.nope` read as an undefined field *on the real `Event` class*
+    // instead of the lenient `unknown` an erased carrier gets, and
+    // `s.item.id` reached the real class's `id` field instead of `unknown`.
+    const EVENT_DEF: &str = "\
+---@meta
+---@class Event
+---@field id number
+";
+    const COLLIDING_MODULE: &str = "\
+---@class Base<Event>
+---@field item Event
+---@class Sub : Base
+local S = {}
+return S
+";
+    let base = build_ambient(Dialect::Lua54, &[EVENT_DEF.to_string()]);
+    let (export_ty, types) = surface(COLLIDING_MODULE, &base);
+    let ambient = base.with_project_types([&types]);
+    let mut requires = HashMap::new();
+    requires.insert("sub".to_string(), export_ty);
+
+    // Erased to `unknown`: an undefined-field read on it is lenient, not
+    // "undefined field `nope` on `Event`".
+    let lenient = "\
+local s = require(\"sub\")
+local _ = s.item.nope
+";
+    assert_eq!(
+        codes(&check(lenient, &ambient, &requires)),
+        Vec::<String>::new(),
+        "an erased (unknown) member must not read as the real `Event` class"
+    );
+
+    // …and it cannot supply a concrete-typed parameter either — `unknown`,
+    // not `Event`'s real (and here coincidentally well-typed) `id: number`.
+    let mismatched = "\
+---@param n number
+local function want(n) end
+local s = require(\"sub\")
+want(s.item.id)
+";
+    assert_eq!(
+        codes(&check(mismatched, &ambient, &requires)),
+        vec!["LB0300"],
+        "`item` must be `unknown`, not the real `Event`, so `.id` must not type-check as `number`"
+    );
+}
+
+#[test]
+fn undefined_member_on_a_cross_file_class_names_the_remedy_and_the_declaring_file() {
+    // F71 (round 3 review): the undefined-field diagnostic's "declared here"
+    // secondary was populated only by `absorb_block` (same-file classes), so
+    // a cross-file consumer's `p.nope` — previously-accepted Lua turned into
+    // a CI failure by #56, the case the largest number of users meet first —
+    // named a class that appears nowhere in their own file, with no pointer
+    // to `mod.lua` and no statement of what to write instead. The class's
+    // own file/span now travel through `FileTypes`/`merge_file_types`, and
+    // the message itself names the three ways to add the member.
+    const PLAIN: &str = "\
+---@class Point
+---@field x number
+local P = {}
+return P
+";
+    let (export_ty, types) = surface(PLAIN, stdlib());
+    let ambient = stdlib().with_project_types([&types]);
+    let mut requires = HashMap::new();
+    requires.insert("point".to_string(), export_ty);
+
+    let consumer = "\
+local p = require(\"point\")
+local _ = p.nope
+";
+    let diags = check(consumer, &ambient, &requires);
+    assert_eq!(codes(&diags), vec!["LB0306"]);
+    let label = diags[0].primary_label().expect("primary label");
+    assert!(
+        label.message.contains("---@field")
+            && label.message.contains("function")
+            && label.message.contains("[string]"),
+        "the label must name all three remedies: {}",
+        label.message
+    );
+    let secondary = diags[0]
+        .labels
+        .iter()
+        .find(|l| !l.primary)
+        .unwrap_or_else(|| panic!("expected a \"declared here\" secondary label: {diags:#?}"));
+    assert_eq!(
+        secondary.span.file, "mod.lua",
+        "the secondary label must point at the class's OWN file, not the consumer's: {diags:#?}"
+    );
+    assert!(
+        secondary.message.contains("`Point` declared here"),
+        "{}",
+        secondary.message
+    );
 }
 
 // --- unresolved requires and cycles ----------------------------------------
@@ -683,4 +1270,362 @@ local s
 s:close(1)
 ";
     assert_eq!(codes(&check_tagged(consumer)), vec!["LB0308", "LB0301"]);
+}
+
+// --- where a free type parameter can hide inside a member's type -----------
+//
+// `TypeEnv::class_shape_bound_export` (round 5 review N8/N9 — this replaced
+// the `class_params_in_scope` plus after-the-fact `subst_ty` pass these
+// comments originally described) decides whether an export keeps its class
+// identity (#56 enforcement) or crosses as the erased template: it
+// substitutes each visited class's own unbound trailing parameters to
+// `unknown` in that class's own `bound` map before `crate::generics::subst_ty`/
+// `subst_field` recurse through the member's type — the same general-purpose
+// substitution every direct generic instantiation already goes through, not
+// a bespoke walk with one arm per composite. A regression that skips a
+// composite during substitution is invisible in the ordinary case: the
+// parameter simply is not found, the class keeps its name, and the export
+// becomes STRICTER — an undeclared member starts reporting LB0306 instead of
+// staying lenient. Each fixture below hides the parameter one level down in a
+// different composite, so a substitution regression is a failing test rather
+// than a silent tightening. (Measured: each was a surviving mutant of the
+// `Ty::Union` / `Ty::Table` / `Ty::Function` arms before these landed.)
+
+/// Assert a carrier whose only mention of `T` is inside `member_decl` crosses
+/// as the erased template: an undeclared read stays lenient, and the declared
+/// member does not leak the parameter name into the consumer.
+fn generic_member_erases(member_decl: &str) -> Vec<String> {
+    let module = format!(
+        "\
+---@class Hidden<T>
+{member_decl}
+local H = {{}}
+return H
+"
+    );
+    let (export_ty, types) = surface(&module, stdlib());
+    let ambient = stdlib().with_project_types([&types]);
+    let mut requires = HashMap::new();
+    requires.insert("hidden".to_string(), export_ty);
+
+    let consumer = "\
+local h = require(\"hidden\")
+local _ = h.nope
+";
+    codes(&check(consumer, &ambient, &requires))
+}
+
+#[test]
+fn a_parameter_inside_a_union_member_still_erases_the_export() {
+    assert_eq!(
+        generic_member_erases("---@field maybe T|nil"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_parameter_inside_a_nested_table_member_still_erases_the_export() {
+    assert_eq!(
+        generic_member_erases("---@field nested { inner: T }"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_parameter_inside_a_function_member_still_erases_the_export() {
+    assert_eq!(
+        generic_member_erases("---@field pick fun(): T"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_plain_member_is_the_control_for_the_three_hiding_places() {
+    // One variable against the three above: the same carrier with no type
+    // parameter anywhere keeps its class identity, so the identical read IS
+    // LB0306. Without this, "clean" above could mean the rule never ran.
+    const PLAIN: &str = "\
+---@class Shown
+---@field maybe number|nil
+local S = {}
+return S
+";
+    let (export_ty, types) = surface(PLAIN, stdlib());
+    let ambient = stdlib().with_project_types([&types]);
+    let mut requires = HashMap::new();
+    requires.insert("shown".to_string(), export_ty);
+
+    let consumer = "\
+local s = require(\"shown\")
+local _ = s.nope
+";
+    assert_eq!(codes(&check(consumer, &ambient, &requires)), vec!["LB0306"]);
+}
+
+#[test]
+fn an_unknown_name_in_a_parent_argument_is_reported_once_not_twice() {
+    // The parent reference is lowered twice — once for its diagnostics, once
+    // to capture the bound arguments — and the second pass rolls its
+    // diagnostics back (`QuietMark`). Without the rollback the same LB0305
+    // is reported twice for one written mistake. Measured: a surviving
+    // mutant replaced `QuietMark::rollback` with a no-op and no test noticed.
+    let consumer = "\
+---@class Holder<H>
+---@field held H
+---@class Bad : Holder<Nope>
+local B = {}
+";
+    assert_eq!(
+        codes(&check(consumer, stdlib(), &HashMap::new())),
+        ["LB0305"]
+    );
+}
+
+#[test]
+fn the_declaring_file_label_survives_the_surface_clone() {
+    // #56's undefined-field message points a secondary label at the file that
+    // declares the class, which a consumer's own file never names. The span
+    // map is repopulated by `merge_file_types` for every file merged in the
+    // same call, so a single-layer fixture cannot see whether `clone_surface`
+    // carries it — the merge would put it back. **Layering is what
+    // separates them**: the second `with_project_types` merges only the
+    // second file, so the first file's declaring span survives solely by
+    // being cloned off the base. Measured: a surviving mutant dropped that
+    // field from the clone, and the single-layer shape stayed green.
+    const DECLARING: &str = "\
+---@class Labelled
+---@field item number
+local L = {}
+return L
+";
+    const LATER: &str = "\
+---@class Unrelated
+---@field other number
+local U = {}
+return U
+";
+    let (export_ty, types) = surface(DECLARING, stdlib());
+    let (_, later_types) = surface(LATER, stdlib());
+    let ambient = stdlib()
+        .with_project_types([&types])
+        .with_project_types([&later_types]);
+    let mut requires = HashMap::new();
+    requires.insert("labelled".to_string(), export_ty);
+
+    let consumer = "\
+local b = require(\"labelled\")
+local _ = b.nope
+";
+    let diags = check(consumer, &ambient, &requires);
+    assert_eq!(codes(&diags), vec!["LB0306"]);
+    assert!(
+        diags[0]
+            .labels
+            .iter()
+            .any(|l| !l.primary && l.span.file == "mod.lua"),
+        "the declaring file must be labelled: {:?}",
+        diags[0].labels
+    );
+}
+
+// --- diamond over a generic ancestor: one edge binds, one leaves bare ------
+//
+// Round 4 review R1 (finding 1, this pass): `collect_class`'s `free`
+// accumulator is a straight union over every edge it ever visits, but
+// `shape.fields`/`shape.indexers` are last-edge-wins (R1/R3). A diamond where
+// one parent binds a generic ancestor's parameter and a sibling parent
+// leaves it bare contributes that parameter to `free` on the bare edge, and
+// nothing removes it once the bound edge overwrites the field it produced —
+// so `free` and the winning shape disagree about whether the parameter is
+// still open. `class_params_in_scope` (which `reify_export` reads to decide
+// class identity, #56) then reports a parameter that is not actually free in
+// the resolved shape, and since the parameter happens to be spelled like a
+// real, unrelated class (`V`), `reify_export`'s substitution erases every
+// occurrence of `V` it finds — including `Ctop`'s own `other: V` field,
+// which names the real class, not the stale template parameter.
+//
+// Declaration order is the signature of the bug: `Ctop : Bone, Aone` visits
+// the bare edge (Bone -> Base, contributing "V" to the pre-fix `free`)
+// before the bound edge (Aone -> Base<number>, which overwrites `item` in
+// `shape` but never retracted "V" from `free`) — pre-fix, this order
+// silently loses the read. Swapping to `Ctop : Aone, Bone` visits the two
+// edges the other way around, and there `free`'s pre-fix (buggy) value and
+// its post-fix (retracting) value are the SAME set, because the *last*
+// visit to `Base` in this order is the bare one (`Bone`) — the established,
+// separately-pinned "last-listed-parent-wins" field-merge rule
+// (`duplicate_class_merge.rs`'s `conflicting_generic_diamond_bindings_...`)
+// already makes the bare edge win `item` on its own, with or without this
+// fix. Both orders are exercised below, on purpose, and they pin DIFFERENT
+// outcomes: that asymmetry is what proves the fix tracks `free` per-visit
+// rather than merely happening to paper over the one order in the original
+// report.
+
+/// The winning-item's underlying merge-rule outcome for a given parent
+/// order — proof of *why* the two directions below expect different
+/// results: which edge (`Base<number>` or bare `Base`) is last-listed
+/// decides whether `item` ends up bound or genuinely free, independent of
+/// this fix (`duplicate_class_merge.rs` pins the same rule for a
+/// non-generic diamond).
+fn diamond_item_type_matches_the_last_listed_parent(parents: &str, want_bound: bool) {
+    let module = diamond_over_generic_ancestor(parents);
+    let (export_ty, types) = surface(&module, stdlib());
+    let ambient = stdlib().with_project_types([&types]);
+    let mut requires = HashMap::new();
+    requires.insert("mod".to_string(), export_ty);
+
+    // `item` is optional (`item? V`), so a mismatched-type use always
+    // reports `LB0300` — bound reports "found `number`", free reports
+    // "found `unknown|nil`" (matching
+    // `generic_carrier_export_never_names_its_unbound_parameter`'s
+    // `unknown` contrast, `|nil` for the field's own optionality). Read the
+    // message rather than the bare code so bound-vs-free is unambiguous
+    // either way, and confirm the free case never leaks the parameter's own
+    // spelling (`V`) into the consumer.
+    let consumer = "\
+---@param s string
+local function want(s) end
+local m = require(\"mod\")
+want(m.item)
+";
+    let diags = check(consumer, &ambient, &requires);
+    assert_eq!(codes(&diags), vec!["LB0300"], "{parents}: {diags:?}");
+    if want_bound {
+        assert!(
+            diags[0].message.contains("found `number"),
+            "{parents}: item must be bound `number`: {}",
+            diags[0].message
+        );
+    } else {
+        assert!(
+            diags[0].message.contains("found `unknown"),
+            "{parents}: item must be erased to `unknown`, not leak a stale bind: {}",
+            diags[0].message
+        );
+        assert!(
+            !diags[0].message.contains('V'),
+            "{parents}: an inherited parameter must not reach the consumer either: {}",
+            diags[0].message
+        );
+    }
+}
+
+/// Build the diamond module: `Base<V>` is a generic ancestor with a `V`-typed
+/// field, reached twice from `Ctop` — once through a parent that binds `V`
+/// to `number` (`Aone`), once through a parent that leaves it bare (`Bone`).
+/// `Ctop` also declares its own field `other`, typed with the REAL class `V`
+/// (`---@class V` / `---@field payload string`), unrelated to the template
+/// parameter that merely happens to share its spelling. `parents` lets each
+/// direction of the diamond reuse this builder.
+fn diamond_over_generic_ancestor(parents: &str) -> String {
+    format!(
+        "\
+---@class V
+---@field payload string
+---@class Base<V>
+---@field item? V
+---@class Aone : Base<number>
+---@class Bone : Base
+---@class Ctop : {parents}
+---@field other V
+local M = {{}}
+return M
+"
+    )
+}
+
+/// `Ctop`'s own field `other` names the real class `V`. Diagnostic codes for
+/// an undeclared read off it — `["LB0306"]` proves `other` kept its real `V`
+/// identity; an empty result means the export lost it, in either edge order
+/// (round 5 review N8/N9 closed the gap that used to make this order-
+/// dependent — see `a_diamond_binding_v_first_leaves_item_free_but_other_keeps_its_own_identity`).
+fn diamond_undeclared_field_is_reported(parents: &str) -> Vec<String> {
+    let module = diamond_over_generic_ancestor(parents);
+    let (export_ty, types) = surface(&module, stdlib());
+    let ambient = stdlib().with_project_types([&types]);
+    let mut requires = HashMap::new();
+    requires.insert("mod".to_string(), export_ty);
+
+    let consumer = "\
+local m = require(\"mod\")
+local _ = m.other.nope
+";
+    codes(&check(consumer, &ambient, &requires))
+}
+
+#[test]
+fn a_diamond_binding_v_last_reports_the_undeclared_read_and_keeps_item_bound() {
+    // `Ctop : Bone, Aone` — the finder's exact repro. The bare edge
+    // (Bone -> Base) is visited first, the binding edge (Aone ->
+    // Base<number>) last, so `item` ends up genuinely bound to `number` and
+    // `Base`'s `V` has nothing left free. Pre-fix, `free` still carried "V"
+    // from the superseded first visit, so the export erased anyway —
+    // dragging `other`'s real, unrelated `V` class down with it and
+    // reporting 0 errors instead of `LB0306`.
+    diamond_item_type_matches_the_last_listed_parent("Bone, Aone", true);
+    assert_eq!(
+        diamond_undeclared_field_is_reported("Bone, Aone"),
+        vec!["LB0306"],
+        "Bone-then-Aone: `other`'s real `V` identity must survive the stale \
+         free-parameter contribution from the earlier bare edge"
+    );
+}
+
+#[test]
+fn a_diamond_binding_v_first_leaves_item_free_but_other_keeps_its_own_identity() {
+    // `Ctop : Aone, Bone` — the opposite order from the sibling test above.
+    // The binding edge runs first, the bare edge (Bone -> Base) runs last,
+    // so — per the already-pinned "last-listed-parent-wins" merge rule —
+    // Bone's bare reference wins `item`, exactly as a lone bare parent does
+    // (`a_parent_written_bare_leaves_its_parameter_unbound_and_erased`):
+    // `item` is genuinely, correctly free, and `Ctop`'s export legitimately
+    // erases it at the #56 seam.
+    diamond_item_type_matches_the_last_listed_parent("Aone, Bone", false);
+
+    // `other`'s reference to the real class `V` must survive regardless —
+    // round 5 review N8/N9: the erasure used to substitute every
+    // `Ty::Named("V")` it found anywhere in the *fully-merged* shape,
+    // unable to distinguish "`Base`'s own genuinely-free template
+    // parameter" from "`Ctop`'s own field, which happens to name the real
+    // class `V`", once both had collapsed to the identical `Ty::Named("V")`
+    // value — a real gap this exact edge order used to pay for (see the
+    // history of this test; it was pinned as a known, accepted limitation
+    // before the guard rewrite below). [`TypeEnv::collect_class`]'s
+    // `erase_free` now substitutes each visited class's own free
+    // parameters in *that class's own* `bound` map, at the exact
+    // declaration doing the substituting — `Ctop` is not generic and
+    // declares `other` itself, so nothing about `Base`'s unrelated `V`
+    // parameter, in either edge order, ever reaches it. `other` keeps its
+    // real `V` identity independent of which parent binds `Base` last.
+    assert_eq!(
+        diamond_undeclared_field_is_reported("Aone, Bone"),
+        vec!["LB0306"],
+        "Aone-then-Bone: `other`'s real `V` identity must survive `Base`'s \
+         unrelated, same-spelled free parameter regardless of edge order"
+    );
+}
+
+#[test]
+fn a_plain_class_is_the_control_for_the_diamond_over_a_generic_ancestor() {
+    // No diamond, no generic ancestor at all: `Ctop` declared with no
+    // parents. This must behave identically to the two diamond fixtures
+    // above — same read, same `LB0306` — proving the rule runs at all and
+    // is not simply lenient by default.
+    const PLAIN: &str = "\
+---@class V
+---@field payload string
+---@class Ctop
+---@field other V
+local M = {}
+return M
+";
+    let (export_ty, types) = surface(PLAIN, stdlib());
+    let ambient = stdlib().with_project_types([&types]);
+    let mut requires = HashMap::new();
+    requires.insert("mod".to_string(), export_ty);
+
+    let consumer = "\
+local m = require(\"mod\")
+local _ = m.other.nope
+";
+    assert_eq!(codes(&check(consumer, &ambient, &requires)), vec!["LB0306"]);
 }

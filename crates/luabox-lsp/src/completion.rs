@@ -14,9 +14,10 @@ use lsp_types::{
 };
 use luabox_db::Analysis;
 use luabox_hir::BindingKind;
-use luabox_syntax::luacats::FieldKey;
 use luabox_types::ty::Ty;
 
+use crate::merged_ambient::MergedAmbient;
+use crate::render::OwnParamErasure;
 use crate::requires::{self, RequireExports};
 use crate::sema::{self, FileSema};
 
@@ -31,7 +32,9 @@ const KEYWORDS: &[&str] = &[
 /// exports and reversing each target file to its `require` module path.
 /// `exports` is the shared `require` resolution ([`RequireExports`]), so
 /// members of a `require` binding come from the same map the type pass checks
-/// against (#54).
+/// against (#54). `ambient` is the merged workspace environment the same
+/// pass enforces (#56), so a class-typed receiver's members are offered with
+/// the types `luabox check` gives them, wherever the class is declared.
 #[must_use]
 pub fn completion(
     sema: &FileSema,
@@ -39,6 +42,7 @@ pub fn completion(
     analysis: &Analysis,
     project_root: &Path,
     exports: &RequireExports,
+    ambient: &MergedAmbient,
 ) -> Vec<CompletionItem> {
     let text = sema.index.text();
     let bytes = text.as_bytes();
@@ -58,7 +62,12 @@ pub fn completion(
 
     let mut items: BTreeMap<String, CompletionItem> = BTreeMap::new();
     if let Some(trigger) = trigger {
-        member_items(sema, text, start - 1, trigger, exports, &mut items);
+        let resolvers = Resolvers {
+            analysis,
+            exports,
+            ambient,
+        };
+        member_items(sema, text, start - 1, trigger, &resolvers, &mut items);
     } else {
         scope_items(sema, offset, &mut items);
         // Auto-require runs after scope items so names already in scope
@@ -68,20 +77,41 @@ pub fn completion(
             reason = "offset is a LineIndex byte offset (a char boundary); start walks back over ASCII identifier bytes, so it is one too"
         )]
         let prefix = &text[start..offset];
-        auto_require_items(sema, offset, prefix, analysis, project_root, &mut items);
+        auto_require_items(
+            sema,
+            offset,
+            prefix,
+            analysis,
+            project_root,
+            ambient,
+            &mut items,
+        );
     }
     items.into_values().collect()
 }
 
-/// Fields/methods of the receiver identifier ending at `dot_offset`: the
-/// receiver's `---@class` fields, or — for a `require` binding — the members
-/// of the required module's export type (#54).
+/// The three shared resolution sources a member-completion route reads, in
+/// one value: the project database, the `require`-export resolution the type
+/// pass checks against, and the merged workspace ambient. Every route needs
+/// the same three, unchanged, so they travel together rather than as three
+/// positional parameters each.
+struct Resolvers<'a> {
+    analysis: &'a Analysis,
+    exports: &'a RequireExports,
+    ambient: &'a MergedAmbient,
+}
+
+/// Fields/methods of the receiver identifier ending at `dot_offset`: a
+/// `require` binding's module's structural export first (#54), then the
+/// receiver's class members resolved through the workspace ambient (#56) —
+/// which already includes every class *this* file declares, so there is one
+/// lookup, not a file-local one shadowed by a cross-file fallback (#46).
 fn member_items(
     sema: &FileSema,
     text: &str,
     dot_offset: usize,
     trigger: u8,
-    exports: &RequireExports,
+    resolvers: &Resolvers<'_>,
     items: &mut BTreeMap<String, CompletionItem>,
 ) {
     let bytes = text.as_bytes();
@@ -97,47 +127,17 @@ fn member_items(
         reason = "dot_offset indexes an ASCII `.`/`:` and recv_start walks back over ASCII identifier bytes, so both are char boundaries"
     )]
     let receiver = &text[recv_start..dot_offset];
-    let Some(class) = sema.class_of_name(receiver, recv_start) else {
-        require_member_items(sema, receiver, recv_start, trigger, exports, items);
-        return;
-    };
-    for (field, declaring) in sema.class_fields(&class) {
-        let FieldKey::Name(name) = &field.key else {
-            continue;
-        };
-        let is_fun = sema::is_function_type(&field.ty);
-        // After `:` only methods make sense.
-        if trigger == b':' && !is_fun {
-            continue;
-        }
-        let kind = if is_fun {
-            if trigger == b':' {
-                CompletionItemKind::METHOD
-            } else {
-                CompletionItemKind::FUNCTION
-            }
-        } else {
-            CompletionItemKind::FIELD
-        };
-        items.insert(
-            name.clone(),
-            CompletionItem {
-                label: name.clone(),
-                kind: Some(kind),
-                detail: Some(format!(
-                    "{declaring}.{name}: {}",
-                    sema::render_type(&field.ty)
-                )),
-                ..CompletionItem::default()
-            },
-        );
-    }
+    require_member_items(sema, receiver, recv_start, trigger, resolvers, items);
+    ambient_member_items(sema, receiver, recv_start, trigger, resolvers, items);
 }
 
 /// Members of a `require` binding: the named fields of the required module's
 /// export type, out of the shared resolution the type pass checks against
 /// (#54). Declines for every receiver that is not one, so the caller's other
-/// routes are unaffected.
+/// routes are unaffected. Only when the binding carries no class reference of
+/// its own — an explicit `---@type` beats an inferred module export, the
+/// same precedence `hover::member_hover` uses (R7):
+/// `requires::require_struct_fields` is the one shared gate.
 ///
 /// Qualified by the *module* rather than the local name in the detail line,
 /// matching the hover, so an item names where it came from rather than what
@@ -147,20 +147,23 @@ fn require_member_items(
     receiver: &str,
     recv_start: usize,
     trigger: u8,
-    exports: &RequireExports,
+    resolvers: &Resolvers<'_>,
     items: &mut BTreeMap<String, CompletionItem>,
 ) {
     let Some(binding) = sema.visible_binding_named(receiver, recv_start) else {
         return;
     };
-    let Some(module) = requires::require_module_of(sema, binding) else {
-        return;
-    };
-    let Some(fields) = exports.get(module).and_then(requires::export_fields) else {
+    let Some((module, fields)) = requires::require_struct_fields(
+        sema,
+        resolvers.exports,
+        resolvers.ambient,
+        resolvers.analysis,
+        binding,
+    ) else {
         return;
     };
     for (name, field) in fields {
-        let is_fun = matches!(field.ty, Ty::Function(_));
+        let is_fun = crate::signature_help::as_function_ty(&field.ty).is_some();
         // After `:` only methods make sense.
         if trigger == b':' && !is_fun {
             continue;
@@ -183,6 +186,78 @@ fn require_member_items(
                 ..CompletionItem::default()
             },
         );
+    }
+}
+
+/// Members of a class-typed receiver resolved through the workspace ambient
+/// (#56): the receiver's annotated type names a class — declared in this
+/// file or any other (#46) — or it is a `require` binding whose module
+/// exports a class (both `---@class` spellings cross the boundary as
+/// [`Ty::Named`]). The member surface is
+/// [`crate::merged_ambient::MergedAmbient::class_members_of`], monomorphised
+/// against the reference's own type arguments (#48) — the very shape the
+/// checker enforces, so completion cannot offer what `luabox check` rejects
+/// (or omit what it accepts, or offer it at the wrong type). Declines for
+/// every other receiver.
+///
+/// Indexers are not offered (#53): an indexer declares no names, so there is
+/// nothing for it to contribute to a member list — unlike hover, which must
+/// answer for a *specific* name a dynamic-access class admits.
+fn ambient_member_items(
+    sema: &FileSema,
+    receiver: &str,
+    recv_start: usize,
+    trigger: u8,
+    resolvers: &Resolvers<'_>,
+    items: &mut BTreeMap<String, CompletionItem>,
+) {
+    let Some(binding) = sema.visible_binding_named(receiver, recv_start) else {
+        return;
+    };
+    let Some(ty) = requires::receiver_type(sema, resolvers.exports, binding) else {
+        return;
+    };
+    let Some(class) = sema::named_of(&ty) else {
+        return;
+    };
+    // Monomorphised against the reference's own type arguments, exactly as
+    // the checker monomorphises the same reference at its use site (#48):
+    // `Box<number>`'s `item` offers `number`, not the free `T` a bare-name
+    // lookup would leave it as. A *bare* reference's own free parameters go
+    // through the erasure hover already applied (M21) — one shared renderer,
+    // so the detail line and the hover on the same symbol cannot disagree
+    // (production readiness review, finding 3).
+    let Some(shape) = resolvers.ambient.class_members_of(&ty) else {
+        return;
+    };
+    let erasure = OwnParamErasure::at_reference(
+        &ty,
+        &class,
+        resolvers.analysis,
+        &sema.path,
+        resolvers.ambient,
+    );
+    for (name, field) in &shape.fields {
+        let is_fun = crate::signature_help::as_function_ty(&field.ty).is_some();
+        // After `:` only methods make sense.
+        if trigger == b':' && !is_fun {
+            continue;
+        }
+        let kind = if is_fun {
+            if trigger == b':' {
+                CompletionItemKind::METHOD
+            } else {
+                CompletionItemKind::FUNCTION
+            }
+        } else {
+            CompletionItemKind::FIELD
+        };
+        items.entry(name.clone()).or_insert_with(|| CompletionItem {
+            label: name.clone(),
+            kind: Some(kind),
+            detail: Some(format!("{class}.{name}: {}", erasure.render(&field.ty))),
+            ..CompletionItem::default()
+        });
     }
 }
 
@@ -248,6 +323,13 @@ fn scope_items(sema: &FileSema, offset: usize, items: &mut BTreeMap<String, Comp
 /// whose module is not already required here, offered with an
 /// `additionalTextEdits` insert of `local <name> = require("<module>").<name>`.
 ///
+/// A module's export is a structural table for the overwhelmingly common
+/// `local M = {} … return M` shape; a `---@class` module export is
+/// [`Ty::Named`] instead (#56, both spellings), so its members are read
+/// through the workspace ambient the same way completion's member route
+/// reads them — `auto_require_items` cannot offer a carrier module's names
+/// by any other route, since [`Ty::Named`] carries none itself.
+///
 /// Runs on every plain-position completion; the per-file `module_export` is
 /// salsa-memoized, so the cost is one cached lookup per workspace file. An
 /// empty prefix is skipped — auto-require is a targeted, prefix-driven suggest,
@@ -258,6 +340,7 @@ fn auto_require_items(
     prefix: &str,
     analysis: &Analysis,
     project_root: &Path,
+    ambient: &MergedAmbient,
     items: &mut BTreeMap<String, CompletionItem>,
 ) {
     if prefix.is_empty() {
@@ -286,50 +369,94 @@ fn auto_require_items(
         let Some(export) = analysis.module_export(file) else {
             continue;
         };
-        let Some(Ty::Table(table)) = export.ty() else {
-            continue;
-        };
-        for (name, field) in &table.fields {
-            if !name.starts_with(prefix) {
-                continue;
+        match export.ty() {
+            Some(Ty::Table(table)) => auto_require_fields(
+                sema,
+                offset,
+                prefix,
+                &module,
+                &table.fields,
+                anchor,
+                leading,
+                items,
+            ),
+            Some(Ty::Named(class)) => {
+                if let Some(shape) = ambient.class_members(class) {
+                    auto_require_fields(
+                        sema,
+                        offset,
+                        prefix,
+                        &module,
+                        &shape.fields,
+                        anchor,
+                        leading,
+                        items,
+                    );
+                }
             }
-            // Already in scope (a local/upvalue) or already offered by scope
-            // completion (a global/function/keyword) — leave it be.
-            if items.contains_key(name) || sema.visible_binding_named(name, offset).is_some() {
-                continue;
-            }
-            let kind = if matches!(field.ty, Ty::Function(_)) {
-                CompletionItemKind::FUNCTION
-            } else {
-                CompletionItemKind::VARIABLE
-            };
-            // `name` is a field of the module's exported table, so bind the
-            // field itself (`require("m").name`) — binding the whole module to
-            // a field-named local would make `name(...)` call the table.
-            let stmt = format!("local {name} = require(\"{module}\").{name}");
-            let new_text = if leading {
-                format!("\n{stmt}")
-            } else {
-                format!("{stmt}\n")
-            };
-            items.insert(
-                name.clone(),
-                CompletionItem {
-                    label: name.clone(),
-                    kind: Some(kind),
-                    detail: Some(format!("Auto import from \"{module}\"")),
-                    label_details: Some(CompletionItemLabelDetails {
-                        detail: None,
-                        description: Some(module.clone()),
-                    }),
-                    additional_text_edits: Some(vec![TextEdit {
-                        range: Range::new(anchor, anchor),
-                        new_text,
-                    }]),
-                    ..CompletionItem::default()
-                },
-            );
+            _ => {}
         }
+    }
+}
+
+/// One module's candidate names for auto-require, out of its export's field
+/// map — a structural table's own fields, or a `---@class` export's members
+/// (#49). Shared so both shapes go through the exact same offer/insert
+/// logic; only where the fields came from differs.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "an internal helper, not a public API"
+)]
+fn auto_require_fields(
+    sema: &FileSema,
+    offset: usize,
+    prefix: &str,
+    module: &str,
+    fields: &std::collections::BTreeMap<String, luabox_types::ty::FieldTy>,
+    anchor: Position,
+    leading: bool,
+    items: &mut BTreeMap<String, CompletionItem>,
+) {
+    for (name, field) in fields {
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        // Already in scope (a local/upvalue) or already offered by scope
+        // completion (a global/function/keyword) — leave it be.
+        if items.contains_key(name) || sema.visible_binding_named(name, offset).is_some() {
+            continue;
+        }
+        let kind = if crate::signature_help::as_function_ty(&field.ty).is_some() {
+            CompletionItemKind::FUNCTION
+        } else {
+            CompletionItemKind::VARIABLE
+        };
+        // `name` is a field of the module's export, so bind the field itself
+        // (`require("m").name`) — binding the whole module to a field-named
+        // local would make `name(...)` call the table.
+        let stmt = format!("local {name} = require(\"{module}\").{name}");
+        let new_text = if leading {
+            format!("\n{stmt}")
+        } else {
+            format!("{stmt}\n")
+        };
+        items.insert(
+            name.clone(),
+            CompletionItem {
+                label: name.clone(),
+                kind: Some(kind),
+                detail: Some(format!("Auto import from \"{module}\"")),
+                label_details: Some(CompletionItemLabelDetails {
+                    detail: None,
+                    description: Some(module.to_string()),
+                }),
+                additional_text_edits: Some(vec![TextEdit {
+                    range: Range::new(anchor, anchor),
+                    new_text,
+                }]),
+                ..CompletionItem::default()
+            },
+        );
     }
 }
 
@@ -425,7 +552,7 @@ mod tests {
     use luabox_types::RockSurfaces;
 
     use super::{CompletionItem, CompletionItemKind, completion};
-    use super::{FileSema, RequireExports, header_end, module_path};
+    use super::{FileSema, MergedAmbient, RequireExports, header_end, module_path};
 
     /// The workspace root every test file lives under.
     fn root() -> PathBuf {
@@ -462,7 +589,10 @@ mod tests {
         let (analysis, path) = analyze(files);
         let sema = FileSema::new(&analysis, &path).expect("sema");
         let exports = RequireExports::resolve(&analysis, &path, rocks);
-        completion(&sema, offset, &analysis, &root(), &exports)
+        // The merged workspace layer, exactly as the server builds it (#56).
+        let base = luabox_types::stdlib_defs(luabox_syntax::lua::Dialect::Lua54);
+        let ambient = MergedAmbient::build(base, &analysis.project_types(), rocks.types());
+        completion(&sema, offset, &analysis, &root(), &exports, &ambient)
     }
 
     /// Completions at the byte offset just past `needle` in the first file.
@@ -530,6 +660,54 @@ g:
         assert_eq!(items[0].kind, Some(CompletionItemKind::METHOD));
     }
 
+    /// N19: an *optional* function-typed field (`fun(...)?`, lowered to
+    /// `Ty::Function | Ty::Nil`) must be offered after `:` and carry the
+    /// `METHOD` kind — the same predicate `signature_help`'s `as_function_ty`
+    /// already uses (round 5 `an_optional_function_typed_field_still_renders_a_signature`).
+    /// Before the fix, completion's flat `matches!(field.ty, Ty::Function(_))`
+    /// missed the union, so the field was silently absent from the `:` list
+    /// while signature help rendered a full signature for it — the editor
+    /// asserting the member both does not exist and is callable off the same
+    /// keystroke sequence.
+    #[test]
+    fn a_colon_trigger_offers_an_optional_function_typed_field_too() {
+        let src = "\
+---@class C
+---@field grow fun(amount: number)? optional method
+---@field walk fun(steps: number) plain method
+
+---@type C
+local c = nil
+c:
+";
+        let items = after(&[("main.lua", src)], "c:");
+        assert_eq!(labels(&items), vec!["grow", "walk"], "{:?}", labels(&items));
+        assert_eq!(item(&items, "grow").kind, Some(CompletionItemKind::METHOD));
+        assert_eq!(item(&items, "walk").kind, Some(CompletionItemKind::METHOD));
+    }
+
+    /// N19: the same predicate drives the completion item `kind` on the
+    /// plain `.`-triggered list too — an optional function field must report
+    /// `FUNCTION`, not `FIELD`.
+    #[test]
+    fn a_dot_trigger_reports_the_function_kind_for_an_optional_function_field() {
+        let src = "\
+---@class C
+---@field grow fun(amount: number)?
+
+---@type C
+local c = nil
+c.
+";
+        let items = after(&[("main.lua", src)], "c.");
+        assert_eq!(
+            item(&items, "grow").kind,
+            Some(CompletionItemKind::FUNCTION),
+            "{:?}",
+            labels(&items)
+        );
+    }
+
     #[test]
     fn a_dot_trigger_offers_fields_and_functions_with_their_types() {
         let src = "\
@@ -572,6 +750,108 @@ b.
 ";
         let items = after(&[("main.lua", src)], "b.");
         assert_eq!(labels(&items), vec!["size"], "{:?}", labels(&items));
+    }
+
+    // === the ambient arm reaches a file-local receiver class too (#47) ====
+    //
+    // The defect: `ambient_member_items` lived only in the `else` arm of a
+    // check on the receiver's *file-local* class, so a receiver whose class
+    // was declared in this file fell straight to the file-local
+    // `class_fields` scan and never saw an inherited member whose parent
+    // lives in another file. Measured before the fix: `s.` offered `name`
+    // and omitted `id`.
+
+    #[test]
+    fn a_member_inherited_from_a_parent_declared_in_another_file_is_offered() {
+        let files = [
+            (
+                "main.lua",
+                "---@class Sub : Base\n---@field name string\n\n---@type Sub\nlocal s = nil\ns.\n",
+            ),
+            ("other.lua", "---@class Base\n---@field id number\n"),
+        ];
+        let items = after(&files, "s.");
+        assert_eq!(labels(&items), vec!["id", "name"], "{:?}", labels(&items));
+    }
+
+    /// Probing the other direction: a name neither class declares stays
+    /// absent, even once the ambient arm is reachable for a file-local
+    /// receiver.
+    #[test]
+    fn a_member_neither_class_declares_is_not_offered() {
+        let files = [
+            (
+                "main.lua",
+                "---@class Sub : Base\n---@field name string\n\n---@type Sub\nlocal s = nil\ns.\n",
+            ),
+            ("other.lua", "---@class Base\n---@field id number\n"),
+        ];
+        let items = after(&files, "s.");
+        assert!(!labels(&items).contains(&"nope"), "{:?}", labels(&items));
+    }
+
+    // === a bound generic reference resolves its type argument (#48) =======
+
+    #[test]
+    fn a_bound_generic_receivers_member_offers_the_bound_type_in_its_detail() {
+        let files = [
+            ("main.lua", "---@type Box<number>\nlocal b = nil\nb.\n"),
+            ("box.lua", "---@class Box<T>\n---@field item T\n"),
+        ];
+        let items = after(&files, "b.");
+        assert_eq!(
+            item(&items, "item").detail.as_deref(),
+            Some("Box.item: number")
+        );
+    }
+
+    /// The one-variable control: the identical class referenced bare erases
+    /// its own free parameter to `unknown` (M21), the same answer
+    /// `hover::an_unbound_generic_receivers_free_parameter_hovers_as_unknown`
+    /// gives for the same symbol in the same buffer, and the same one
+    /// `luabox check` enforces through `class_shape_bound_export`.
+    ///
+    /// Renamed from `an_unbound_generic_receiver_still_offers_the_free_parameter`,
+    /// which pinned the pre-M21 raw `T` — the divergence the production
+    /// readiness review found (finding 3): M21 landed the erasure in
+    /// `hover.rs` alone, so the popup said `T` while the hover one keystroke
+    /// later said `unknown`.
+    #[test]
+    fn an_unbound_generic_receivers_free_parameter_completes_as_unknown() {
+        let files = [
+            ("main.lua", "---@type Box\nlocal b = nil\nb.\n"),
+            ("box.lua", "---@class Box<T>\n---@field item T\n"),
+        ];
+        let items = after(&files, "b.");
+        assert_eq!(
+            item(&items, "item").detail.as_deref(),
+            Some("Box.item: unknown")
+        );
+    }
+
+    // === an alias-typed class field (round 4 review R27) ==================
+    //
+    // Completion's `ambient_member_items` resolves through the same merged
+    // `Ty` hover does (#56); no test declared an `---@alias`-typed field on
+    // either surface before. This pins completion's half.
+
+    #[test]
+    fn an_alias_typed_field_offers_the_alias_expanded_in_its_detail() {
+        let src = "\
+---@alias Direction \"up\"|\"down\"
+
+---@class Compass
+---@field dir Direction
+
+---@type Compass
+local c = nil
+c.
+";
+        let items = after(&[("main.lua", src)], "c.");
+        assert_eq!(
+            item(&items, "dir").detail.as_deref(),
+            Some("Compass.dir: \"up\"|\"down\"")
+        );
     }
 
     #[test]
@@ -653,6 +933,24 @@ local visible = 2
         );
     }
 
+    /// N19: `auto_require_fields`'s kind decision is the third of the three
+    /// sites that used to read `matches!(field.ty, Ty::Function(_))` flat —
+    /// an optional function-typed export field must still report `FUNCTION`,
+    /// not `VARIABLE`.
+    #[test]
+    fn auto_require_reports_the_function_kind_for_an_optional_function_export() {
+        let files = [
+            ("main.lua", "local x = 1\nfrob\n"),
+            (
+                "lib.lua",
+                "local M = {}\n---@type fun()?\nM.frobnicate = nil\nreturn M\n",
+            ),
+        ];
+        let items = after(&files, "frob");
+        let offered = item(&items, "frobnicate");
+        assert_eq!(offered.kind, Some(CompletionItemKind::FUNCTION));
+    }
+
     #[test]
     fn auto_require_skips_a_module_that_is_already_required() {
         let files = [
@@ -701,13 +999,73 @@ local visible = 2
         );
     }
 
+    /// #49: `module_export` reifies a declared carrier's export to
+    /// [`super::Ty::Named`] rather than a structural table (#56), and
+    /// `auto_require_items` used to match on [`super::Ty::Table`] alone —
+    /// so a carrier module's names silently stopped being offered. Measured
+    /// before the fix: typing `mak` in another file offered nothing for
+    /// `Widget.make`, though it did before the PR that introduced the
+    /// reification.
+    #[test]
+    fn auto_require_offers_a_class_carrier_modules_members() {
+        let files = [
+            ("main.lua", "local x = 1\nmak\n"),
+            (
+                "widget.lua",
+                "---@class Widget\nlocal W = {}\nfunction W.make() end\nreturn W\n",
+            ),
+        ];
+        let items = after(&files, "mak");
+        let offered = item(&items, "make");
+        assert_eq!(offered.kind, Some(CompletionItemKind::FUNCTION));
+        assert_eq!(
+            offered.detail.as_deref(),
+            Some("Auto import from \"widget\"")
+        );
+        let edits = offered
+            .additional_text_edits
+            .as_ref()
+            .expect("an import edit");
+        assert!(
+            edits[0]
+                .new_text
+                .contains("local make = require(\"widget\").make"),
+            "{edits:?}"
+        );
+    }
+
+    /// Probing the other direction: a class carrier's field the prefix does
+    /// not match stays unoffered — the fix reaches the right shape without
+    /// suppressing the prefix filter.
+    #[test]
+    fn auto_require_on_a_class_carrier_module_still_respects_the_prefix() {
+        let files = [
+            ("main.lua", "local x = 1\nmak\n"),
+            (
+                "widget.lua",
+                "---@class Widget\n---@field label string\nlocal W = {}\nfunction W.make() end\nreturn W\n",
+            ),
+        ];
+        let items = after(&files, "mak");
+        assert!(!labels(&items).contains(&"label"), "{:?}", labels(&items));
+    }
+
     #[test]
     fn a_cursor_past_the_end_of_the_file_is_clamped() {
         let src = "local x = 1\n";
         let (analysis, path) = analyze(&[("main.lua", src)]);
         let sema = FileSema::new(&analysis, &path).expect("sema");
         let exports = RequireExports::resolve(&analysis, &path, &RockSurfaces::default());
-        let items = completion(&sema, src.len() + 500, &analysis, &root(), &exports);
+        let base = luabox_types::stdlib_defs(luabox_syntax::lua::Dialect::Lua54);
+        let ambient = MergedAmbient::build(base, &analysis.project_types(), &[]);
+        let items = completion(
+            &sema,
+            src.len() + 500,
+            &analysis,
+            &root(),
+            &exports,
+            &ambient,
+        );
         assert!(labels(&items).contains(&"x"), "{:?}", labels(&items));
     }
 
@@ -777,6 +1135,87 @@ local visible = 2
         assert_eq!(
             item(&items, "version").detail.as_deref(),
             Some("other.version: \"1.0\"")
+        );
+    }
+
+    /// R7: an explicit `---@type` on a `require` binding must win over the
+    /// module's plain structural table export in completion too — the same
+    /// precedence hover uses (`an_explicit_annotation_on_a_require_binding_wins_a_member_hover_too`).
+    /// Before the fix, `require_member_items` ran unconditionally and
+    /// inserted `x` from the table shape first; `ambient_member_items`'s
+    /// `or_insert_with` could then never override it with `Point.x`.
+    #[test]
+    fn an_explicit_annotation_on_a_require_binding_wins_member_completion_too() {
+        let files = [
+            (
+                "main.lua",
+                "---@class Point\n---@field x number\n\n---@type Point\nlocal m = require(\"m\")\nm.\n",
+            ),
+            ("m.lua", "local M = {}\nM.x = 42\nreturn M\n"),
+        ];
+        let items = after(&files, "m.");
+        assert_eq!(
+            item(&items, "x").detail.as_deref(),
+            Some("Point.x: number"),
+            "{:?}",
+            labels(&items)
+        );
+    }
+
+    /// The one-variable control: with no `---@type` at all, the same module
+    /// still offers its structural export exactly as before.
+    #[test]
+    fn an_unannotated_require_bindings_member_completion_still_offers_the_structural_export() {
+        let files = [
+            ("main.lua", "local m = require(\"m\")\nm.\n"),
+            ("m.lua", "local M = {}\nM.x = 42\nreturn M\n"),
+        ];
+        let items = after(&files, "m.");
+        assert_eq!(
+            item(&items, "x").detail.as_deref(),
+            Some("m.x: 42"),
+            "{:?}",
+            labels(&items)
+        );
+    }
+
+    /// N16: `require_struct_fields`'s gate must be a *resolves* check, not a
+    /// *presence* check. `---@type table` is a real annotation but `table`
+    /// is not a class the ambient can resolve members from, so the
+    /// structural fallback must still offer `x` — before the fix, any
+    /// `---@type` at all suppressed `require_member_items` regardless of
+    /// whether the class arm (`ambient_member_items`) could resolve
+    /// anything, and the list came back empty.
+    #[test]
+    fn an_annotation_that_does_not_resolve_to_a_class_falls_back_to_the_structural_export_completion()
+     {
+        let files = [
+            ("main.lua", "---@type table\nlocal m = require(\"m\")\nm.\n"),
+            ("m.lua", "local M = {}\nM.x = 42\nreturn M\n"),
+        ];
+        let items = after(&files, "m.");
+        assert_eq!(
+            item(&items, "x").detail.as_deref(),
+            Some("m.x: 42"),
+            "{:?}",
+            labels(&items)
+        );
+    }
+
+    /// Same shape with an annotation naming a class that does not exist —
+    /// the mid-edit case.
+    #[test]
+    fn an_annotation_naming_an_undeclared_class_falls_back_to_the_structural_export_completion() {
+        let files = [
+            ("main.lua", "---@type Bogus\nlocal m = require(\"m\")\nm.\n"),
+            ("m.lua", "local M = {}\nM.x = 42\nreturn M\n"),
+        ];
+        let items = after(&files, "m.");
+        assert_eq!(
+            item(&items, "x").detail.as_deref(),
+            Some("m.x: 42"),
+            "{:?}",
+            labels(&items)
         );
     }
 

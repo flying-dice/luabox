@@ -64,6 +64,27 @@ Feature: luabox lsp — signature help
     Then the signature labels are "Point:translate(dx: number, dy: number): Point"
     And the active parameter is 0
 
+  # The receiver's class is declared in another file — hover and completion
+  # already resolved this shape through the merged workspace ambient (#56);
+  # signature help used to stay silent for the identical receiver, because
+  # it alone still resolved the class file-locally only (#50).
+  Scenario: a method call on a class declared in another file resolves
+    Given a file "shapes.lua" containing:
+      """
+      ---@class Circle
+      ---@field grow fun(amount: number)
+      """
+    And a file "main.lua" containing:
+      """
+      ---@type Circle
+      local c = nil
+      c:grow(2)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request signature help at 2:7 in "main.lua"
+    Then the signature labels are "Circle:grow(amount: number)"
+
   Scenario: an overloaded function offers every signature
     Given a file "main.lua" containing:
       """

@@ -8,9 +8,14 @@
     Gates: cold start, `fmt --check` throughput (kept as a wider safety
     net), the real `check` gate (live since GL#6), a diagnostics-heavy
     `lint` + `check` gate in two variants — findings suppressed, and
-    findings reported — and a peak-RSS gate on the same 100-kLOC corpus
+    findings reported — a peak-RSS gate on the same 100-kLOC corpus
     (decisions/07 accepted a ~1.9x RSS trade; the ceiling side of that
-    bargain is now enforced).
+    bargain is now enforced), and a second, independent peak-RSS + wall-time
+    gate (the RETAINED-TYPEENV REGRESSION GATE) on a 500-file corpus shaped
+    to catch a different regression the first RSS gate's corpus is too
+    small to widen: round 4 review R14's reverted retained-`Vec<TypeEnv>`
+    change, at ~25x peak RSS on this one at N=500 against ~5x on the
+    100-kLOC corpus.
 
     Why those last gates exist: the ~100-kLOC corpus the first three legs
     use is *clean* (`check: 0 errors, 0 warnings`), so none of them ever
@@ -53,47 +58,66 @@ $PSNativeCommandUseErrorActionPreference = $false
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
 
-$ColdStartBudgetBaseMs = 50
-$FmtBudgetBaseMs = 2000
-$CheckBudgetBaseMs = 1000
-# Diagnostics-heavy legs, on one file holding $DiagCorpusFindings findings.
-# Calibrated on the Linux dev baseline (see CHANGELOG "Fixed", wave 8):
-#   lint   357 ms fixed / 14 163 ms with the quadratic lookup restored
-#   check  663 ms fixed /  4 183 ms ditto
-# The budgets sit ~3x above the fixed numbers (headroom for a noisy box, on
-# top of -Factor) and ~3-12x below the broken ones.
-$DiagLintBudgetBaseMs = 1200
-$DiagCheckBudgetBaseMs = 1500
-# The same two corpora with nothing suppressed, so every finding is also
-# *rendered*. Calibrated the same way (Linux dev baseline, 20 k findings):
-#   lint   162 ms fixed /  9 295 ms with the quadratic renderer restored
-#   check  788 ms fixed / 15 462 ms ditto
-# Budgets ~3x above the fixed numbers and >=6x below the broken ones.
-# Rendered `lint` is *faster* than the suppressed leg above because
-# resolving 20 k `---@luabox-ignore` directives costs more than printing
-# 20 k frames — the suppressed leg is not a subset of this one, which is
-# why both stay.
-$DiagLintRenderedBudgetBaseMs = 600
-$DiagCheckRenderedBudgetBaseMs = 2400
-$DiagCorpusFindings = 20000
-# Peak-RSS ceiling for `check` on the 100-kLOC corpus, in MiB. decisions/07
-# accepted 64 -> 123 MiB; measured 123 MiB on the Linux dev baseline, so the
-# budget sits at ~2.4x that. Wide on purpose: this catches a *regime* change
-# (a whole-project structure retained, a per-file clone that used to be a
-# borrow), not a 10% drift — and Windows working-set accounting differs from
-# Linux RSS enough that a tight number would only produce false failures.
-$RssBudgetMib = $(if ($env:LUABOX_RSS_BUDGET_MIB) { [int]$env:LUABOX_RSS_BUDGET_MIB } else { 300 })
+# perf-gate-lib.ps1 holds every piece of judgement that does not need a real
+# binary (New-PerfManifest, Read-PerfBudgets, Test-LuaFileCount,
+# ConvertTo-ScaledBudgetMs) — mirrors scripts/perf-gate-lib.sh's split, and
+# is what scripts/tests/perf-gate-selftest.ps1 dot-sources to test this
+# file's judgement in milliseconds (#58 review round 6, M51).
+. (Join-Path $PSScriptRoot "perf-gate-lib.ps1")
 
-$coldStartBudget = $ColdStartBudgetBaseMs * $Factor
-$fmtBudget = $FmtBudgetBaseMs * $Factor
+# The budget constants below used to be a second, hand-carried copy of
+# scripts/perf-gate.sh's own — one rule, two copies, free to drift (#58
+# review round 6, M50). They now live once, with their calibration
+# rationale, in perf-gate-budgets.env; Read-PerfBudgets parses the same
+# KEY=VALUE file scripts/perf-gate.sh `source`s directly. Read every key
+# that file defines: a key honoured by one reader and ignored by the other
+# is the same drift M50 closed, just quieter — which is exactly what
+# happened to CHECK_CEILING_MS/DIAG_CHECK_CEILING_MS between the round 6
+# rebase and the local merge-gate that found them unread here.
+$PerfBudgets = Read-PerfBudgets (Join-Path $PSScriptRoot "perf-gate-budgets.env")
+$ColdStartBudgetBaseMs = $PerfBudgets["COLD_START_BUDGET_BASE_MS"]
+$ColdStartCeilingMs = $PerfBudgets["COLD_START_CEILING_MS"]
+$FmtBudgetBaseMs = $PerfBudgets["FMT_BUDGET_BASE_MS"]
+$FmtCeilingMs = $PerfBudgets["FMT_CEILING_MS"]
+$CheckBudgetBaseMs = $PerfBudgets["CHECK_BUDGET_BASE_MS"]
+$CheckCeilingMs = $PerfBudgets["CHECK_CEILING_MS"]
+$DiagLintBudgetBaseMs = $PerfBudgets["DIAG_LINT_BUDGET_BASE_MS"]
+$DiagLintCeilingMs = $PerfBudgets["DIAG_LINT_CEILING_MS"]
+$DiagCheckBudgetBaseMs = $PerfBudgets["DIAG_CHECK_BUDGET_BASE_MS"]
+$DiagCheckCeilingMs = $PerfBudgets["DIAG_CHECK_CEILING_MS"]
+$DiagLintRenderedBudgetBaseMs = $PerfBudgets["DIAG_LINT_RENDERED_BUDGET_BASE_MS"]
+$DiagLintRenderedCeilingMs = $PerfBudgets["DIAG_LINT_RENDERED_CEILING_MS"]
+$DiagCheckRenderedBudgetBaseMs = $PerfBudgets["DIAG_CHECK_RENDERED_BUDGET_BASE_MS"]
+$DiagCheckRenderedCeilingMs = $PerfBudgets["DIAG_CHECK_RENDERED_CEILING_MS"]
+$DiagCorpusFindings = $PerfBudgets["DIAG_CORPUS_FINDINGS"]
+# NOT scaled by -Factor: a slow or loaded machine runs the same allocations,
+# it just takes longer over them, so a CPU multiplier has no business
+# loosening a memory ceiling. $env:LUABOX_RSS_BUDGET_MIB overrides it, for
+# when the budget itself is being renegotiated.
+$RssBudgetMib = $(if ($env:LUABOX_RSS_BUDGET_MIB) { [int]$env:LUABOX_RSS_BUDGET_MIB } else { $PerfBudgets["RSS_BUDGET_MIB"] })
+
+# Every scaled leg passes its ceiling — all EIGHT, not the two the round 6
+# rebase wired (#58 review round 8, F15b: the other six ran unbounded at
+# CI's factor 4.0). Per-key rationale lives in perf-gate-budgets.env.
+$coldStartBudget = ConvertTo-ScaledBudgetMs $ColdStartBudgetBaseMs $Factor -CeilingMs $ColdStartCeilingMs
+$fmtBudget = ConvertTo-ScaledBudgetMs $FmtBudgetBaseMs $Factor -CeilingMs $FmtCeilingMs
 
 Write-Host "perf-gate: LUABOX_PERF_FACTOR=$Factor (cold-start budget $([math]::Round($coldStartBudget)) ms, fmt budget $([math]::Round($fmtBudget)) ms)"
 
-Write-Host "perf-gate: building release binaries..."
-cargo build --release -p luabox-cli
-if ($LASTEXITCODE -ne 0) { throw "cargo build -p luabox-cli failed (exit $LASTEXITCODE)" }
-cargo build --release --manifest-path tools/gen-corpus/Cargo.toml --target-dir target/gen-corpus
-if ($LASTEXITCODE -ne 0) { throw "cargo build gen-corpus failed (exit $LASTEXITCODE)" }
+# $env:LUABOX_BIN / $env:GEN_CORPUS_BIN: override the two binaries this gate
+# measures and skip the `cargo build` entirely when BOTH are set — the
+# PowerShell counterpart of scripts/perf-gate.sh's own LUABOX_BIN/
+# GEN_CORPUS_BIN seam (#58 review round 6, M28/M51). Unset in every real
+# use; this exists for scripts/tests/perf-gate-selftest.ps1 to run this
+# file for real against a stub.
+$useStubBinaries = $env:LUABOX_BIN -and $env:GEN_CORPUS_BIN
+if (-not $useStubBinaries) {
+    Write-Host "perf-gate: building release binaries..."
+    cargo build --release -p luabox-cli
+    if ($LASTEXITCODE -ne 0) { throw "cargo build -p luabox-cli failed (exit $LASTEXITCODE)" }
+    cargo build --release --manifest-path tools/gen-corpus/Cargo.toml --target-dir target/gen-corpus
+    if ($LASTEXITCODE -ne 0) { throw "cargo build gen-corpus failed (exit $LASTEXITCODE)" }
+}
 
 # From here on, native calls are redirected with `*>` so their output can
 # be suppressed/measured cleanly. PowerShell wraps a redirected native
@@ -104,10 +128,15 @@ if ($LASTEXITCODE -ne 0) { throw "cargo build gen-corpus failed (exit $LASTEXITC
 # "Continue" and check $LASTEXITCODE explicitly where it matters instead.
 $ErrorActionPreference = "Continue"
 
-$luaboxBin = Join-Path $repoRoot "target/release/luabox.exe"
-if (-not (Test-Path $luaboxBin)) { $luaboxBin = Join-Path $repoRoot "target/release/luabox" }
-$genCorpusBin = Join-Path $repoRoot "target/gen-corpus/release/gen-corpus.exe"
-if (-not (Test-Path $genCorpusBin)) { $genCorpusBin = Join-Path $repoRoot "target/gen-corpus/release/gen-corpus" }
+if ($useStubBinaries) {
+    $luaboxBin = $env:LUABOX_BIN
+    $genCorpusBin = $env:GEN_CORPUS_BIN
+} else {
+    $luaboxBin = Join-Path $repoRoot "target/release/luabox.exe"
+    if (-not (Test-Path $luaboxBin)) { $luaboxBin = Join-Path $repoRoot "target/release/luabox" }
+    $genCorpusBin = Join-Path $repoRoot "target/gen-corpus/release/gen-corpus.exe"
+    if (-not (Test-Path $genCorpusBin)) { $genCorpusBin = Join-Path $repoRoot "target/gen-corpus/release/gen-corpus" }
+}
 
 $corpusDir = Join-Path ([System.IO.Path]::GetTempPath()) ("luabox-perf-corpus-" + [System.Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $corpusDir -Force | Out-Null
@@ -116,25 +145,30 @@ $fail = $false
 
 try {
     Write-Host "perf-gate: generating ~100 kLOC corpus into $corpusDir ..."
+    # Prime $LASTEXITCODE: a GEN_CORPUS_BIN override pointing at a .ps1 that
+    # never calls `exit` leaves it UNSET after `&` (only native commands and
+    # explicit script `exit` write it), and the check below would then throw
+    # "gen-corpus failed (exit )" on a run that succeeded — the shape the
+    # first real execution of the self-test hit.
+    $global:LASTEXITCODE = 0
     & $genCorpusBin --out (Join-Path $corpusDir "src") --seed 42 --files 50 --lines-per-file 2000
     if ($LASTEXITCODE -ne 0) { throw "gen-corpus failed (exit $LASTEXITCODE)" }
 
-    $manifest = @'
-[package]
-name = "perf-gate-corpus"
-version = "0.0.0"
-edition = "5.4"
+    New-PerfManifest -Path (Join-Path $corpusDir "luabox.toml") -Name "perf-gate-corpus" -Strict $true
 
-[build]
-target = "5.4"
-out = "dist"
-
-[types]
-strict = true
-
-[dependencies]
-'@
-    Set-Content -Path (Join-Path $corpusDir "luabox.toml") -Value $manifest -NoNewline
+    # #58 review round 6, M30: the retained-TypeEnv corpus below was the
+    # ONLY one of three generated corpora wired to a file-count assertion —
+    # this one (the CHECK GATE / PEAK-RSS GATE legs' corpus) and the four
+    # diagnostics-heavy corpora further down could print PASS against an
+    # empty directory with nothing catching it. Fails the whole gate rather
+    # than skipping just this leg — matching perf-gate.sh's own `|| fail=1`
+    # wiring for the same three corpora, and decisions/07's "the ceiling
+    # side of the bargain" no longer resting on an unaudited assumption
+    # that generation actually ran.
+    if (-not (Test-LuaFileCount (Join-Path $corpusDir "src") 50)) {
+        Write-Host "FAIL 100-kLOC corpus generation: see the error above — the CHECK GATE and PEAK-RSS GATE legs below would not be measuring what their PASS/FAIL lines claim"
+        $fail = $true
+    }
 
     # --- Cold start: MIN of N runs ----------------------------------------
     # Min (not mean/median) is the right statistic for a cold-start
@@ -187,9 +221,15 @@ strict = true
     }
 
     # --- CHECK GATE ----------------------------------------------------------
-    # SPEC.md §16.1: `check` on the 100-kLOC corpus < 1 s warm. Live since
-    # GL#6; the fmt --check gate above stays as the wider safety net.
-    $checkBudget = $CheckBudgetBaseMs * $Factor
+    # SPEC.md §16.1 named `check` on the 100-kLOC corpus < 1 s warm as the
+    # original acceptance target. CHECK_BUDGET_BASE_MS no longer equals that
+    # figure — #58 review round 6, M37 found it FAILING on real hardware at
+    # FACTOR=1.0; see perf-gate-budgets.env's own comment for the real
+    # numbers that session measured and the headroom the rebased budget
+    # carries. Live since GL#6; the fmt --check gate above stays as the wider
+    # safety net. -CheckCeilingMs caps the SCALED budget, mirroring
+    # perf-gate.sh's third argument at the same leg.
+    $checkBudget = ConvertTo-ScaledBudgetMs $CheckBudgetBaseMs $Factor -CeilingMs $CheckCeilingMs
     Write-Host ""
     Write-Host "perf-gate: check throughput on corpus (warm)..."
     Push-Location $corpusDir
@@ -225,28 +265,190 @@ strict = true
     # memory ceiling. $env:LUABOX_RSS_BUDGET_MIB overrides it, for when the
     # budget itself is being renegotiated.
     Write-Host ""
-    Write-Host "perf-gate: peak RSS of check on corpus (warm)..."
-    $info = [System.Diagnostics.ProcessStartInfo]::new()
-    $info.FileName = $luaboxBin
-    $info.Arguments = "check"
-    $info.WorkingDirectory = $corpusDir
-    $info.UseShellExecute = $false
-    $info.RedirectStandardOutput = $true
-    $info.RedirectStandardError = $true
-    $proc = [System.Diagnostics.Process]::Start($info)
-    # Drain both pipes before waiting, or a report larger than the pipe buffer
-    # deadlocks the child — the same hazard tests/broken_pipe.rs works around.
-    $proc.StandardOutput.ReadToEnd() | Out-Null
-    $proc.StandardError.ReadToEnd() | Out-Null
-    $proc.WaitForExit()
-    $rssMib = [int]($proc.PeakWorkingSet64 / 1MB)
-    $proc.Dispose()
-    if ($rssMib -lt $RssBudgetMib) {
-        Write-Host ("PASS check peak RSS: {0} MiB < {1} MiB" -f $rssMib, $RssBudgetMib)
+    if ($useStubBinaries) {
+        # A .ps1 stub cannot be launched through Process.Start's FileName
+        # (Windows wants a true executable there), so under stub binaries
+        # this leg is SKIPPED, loudly — the self-test asserts this exact
+        # line is present so the skip cannot silently widen to real runs.
+        # See perf-gate-selftest.ps1's header for the disclosed gap.
+        Write-Host "SKIP check peak RSS: stub binaries cannot be process-launched"
     } else {
-        Write-Host ("FAIL check peak RSS: {0} MiB >= {1} MiB" -f $rssMib, $RssBudgetMib)
-        Write-Host "     decisions/07 accepted 123 MiB on this corpus"
+        Write-Host "perf-gate: peak RSS of check on corpus (warm)..."
+        $info = [System.Diagnostics.ProcessStartInfo]::new()
+        $info.FileName = $luaboxBin
+        $info.Arguments = "check"
+        $info.WorkingDirectory = $corpusDir
+        $info.UseShellExecute = $false
+        $info.RedirectStandardOutput = $true
+        $info.RedirectStandardError = $true
+        $proc = [System.Diagnostics.Process]::Start($info)
+        # Drain both pipes before waiting, or a report larger than the pipe buffer
+        # deadlocks the child — the same hazard tests/broken_pipe.rs works around.
+        $proc.StandardOutput.ReadToEnd() | Out-Null
+        $proc.StandardError.ReadToEnd() | Out-Null
+        $proc.WaitForExit()
+        # [Math]::Floor, not a bare [int] cast — the same split
+        # ConvertTo-ScaledBudgetMs fixes one function away in
+        # perf-gate-lib.ps1, applied to the MiB conversion (#58 review round
+        # 8, F17). PowerShell's [int] ROUNDS (299.6 -> 300); the Linux
+        # sibling reads the same number through scripts/peak-rss.py, which
+        # does `int(mib)` and TRUNCATES (299.6 -> 299). At 299.6 MiB against
+        # the 300 MiB budget that is a Windows FAIL and a Linux PASS on one
+        # measurement — a per-OS verdict split in the leg that exists to
+        # enforce decisions/07's accepted ceiling on both. Correct by
+        # inspection only: this leg and the retained-env one below are both
+        # inside the disclosed Process.Start stub-skip (a .ps1 stub cannot be
+        # launched by FileName), so no perf-gate-selftest.ps1 case can
+        # execute either line — see that file's header for the gap.
+        $rssMib = [int][Math]::Floor($proc.PeakWorkingSet64 / 1MB)
+        $proc.Dispose()
+        if ($rssMib -lt $RssBudgetMib) {
+            Write-Host ("PASS check peak RSS: {0} MiB < {1} MiB" -f $rssMib, $RssBudgetMib)
+        } else {
+            Write-Host ("FAIL check peak RSS: {0} MiB >= {1} MiB" -f $rssMib, $RssBudgetMib)
+            Write-Host "     decisions/07 accepted 123 MiB on this corpus"
+            $fail = $true
+        }
+    }
+
+    # --- RETAINED-TYPEENV REGRESSION GATE -------------------------------------
+    # Windows counterpart of scripts/perf-gate.sh's leg of the same name
+    # (round 4 review R14, reverted by round 4 review finding 6 — see
+    # check_cmd.rs's run_passes/check_one doc comments and
+    # luabox-types/src/lib.rs's build_file_env doc comment). The bash gate's
+    # comment carries the full history and the measured table (Linux, release
+    # build, three runs each):
+    #
+    #   N      transient (correct)   retained (R14, reintroduced)   ratio
+    #   100     11 MiB                 51 MiB                        4.6x
+    #   200     15 MiB                145 MiB                        9.3x
+    #   300     20 MiB                290 MiB                       14.5x
+    #   500     29 MiB                734 MiB                       25.3x
+    #
+    # Same corpus shape, same N=500, same 100 MiB budget as the bash gate —
+    # just over 3x the correct implementation's ~29 MiB, while the retained
+    # implementation misses it by ~7x. $env:LUABOX_RETAINED_ENV_RSS_BUDGET_MIB
+    # overrides the MiB ceiling; NOT scaled by -Factor, same reason as
+    # $RssBudgetMib above. The wall-time budget IS scaled by -Factor, like
+    # every timed leg — this is the Windows half of the bash gate's N37 fix:
+    # previously this leg measured peak RSS only, so `check` could regress
+    # arbitrarily here and stay green.
+    #
+    # The three constants below were bare literals here and again in
+    # perf-gate.sh (~:346) until #58 review round 8, F16 — the exact
+    # one-rule-two-copies drift M50 moved every other budget into
+    # perf-gate-budgets.env to end, left live on the ONE leg guarding the
+    # ~25x regression, i.e. the one where a Linux/Windows split would show
+    # least and cost most. Numbers from the shared file; the calibration
+    # narrative stays in perf-gate.sh's leg comment, where it was measured.
+    $RetainedEnvCorpusFiles = $PerfBudgets["RETAINED_ENV_CORPUS_FILES"]
+    $RetainedEnvRssBudgetMib = $(if ($env:LUABOX_RETAINED_ENV_RSS_BUDGET_MIB) { [int]$env:LUABOX_RETAINED_ENV_RSS_BUDGET_MIB } else { $PerfBudgets["RETAINED_ENV_RSS_BUDGET_MIB"] })
+    $RetainedEnvCheckBudgetBaseMs = $PerfBudgets["RETAINED_ENV_CHECK_BUDGET_BASE_MS"]
+    $RetainedEnvCheckCeilingMs = $PerfBudgets["RETAINED_ENV_CHECK_CEILING_MS"]
+    $retainedEnvCheckBudget = ConvertTo-ScaledBudgetMs $RetainedEnvCheckBudgetBaseMs $Factor -CeilingMs $RetainedEnvCheckCeilingMs
+
+    Write-Host ""
+    Write-Host "perf-gate: generating $RetainedEnvCorpusFiles-file retained-TypeEnv regression corpus..."
+    $retainedEnvRoot = Join-Path $corpusDir "retained-env"
+    $retainedEnvSrc = Join-Path $retainedEnvRoot "src"
+    New-Item -ItemType Directory -Path $retainedEnvSrc -Force | Out-Null
+    New-PerfManifest -Path (Join-Path $retainedEnvRoot "luabox.toml") -Name "perf-gate-retained-env" -Strict $true
+
+    for ($i = 0; $i -lt $RetainedEnvCorpusFiles; $i++) {
+        $modLines = [System.Collections.Generic.List[string]]::new()
+        if ($i -gt 0) {
+            $modLines.Add("local prev = require(`"mod_$($i - 1)`")")
+            $modLines.Add("")
+        }
+        $modLines.Add("---@class Widget${i}A")
+        $modLines.Add("---@field n number")
+        $modLines.Add("local A = { n = $i }")
+        $modLines.Add("")
+        $modLines.Add("---@class Widget${i}B")
+        $modLines.Add("---@field n number")
+        $modLines.Add("local B = { n = $i }")
+        $modLines.Add("")
+        if ($i -gt 0) {
+            $modLines.Add("return { a = A, b = B, prev = prev }")
+        } else {
+            $modLines.Add("return { a = A, b = B }")
+        }
+        Set-Content -Path (Join-Path $retainedEnvSrc "mod_$i.lua") -Value $modLines
+    }
+
+    # Windows counterpart of the bash gate's N38 fix: a PASS printed against
+    # a corpus that was not actually generated the way the budgets below
+    # assume is not evidence of anything. Routed through Test-LuaFileCount
+    # (perf-gate-lib.ps1) rather than a bespoke Get-ChildItem check here, so
+    # this and the two wirings above/below are one function, not three
+    # hand-rolled counts free to drift (#58 review round 6, M30/M50).
+    if ($useStubBinaries) {
+        # Same Process.Start constraint as the PEAK-RSS GATE above: both of
+        # this leg's measurements launch the binary by FileName, which a
+        # .ps1 stub cannot satisfy. Skipped loudly; the self-test asserts
+        # this line so the skip cannot widen to real runs.
+        Write-Host ""
+        Write-Host "SKIP retained-TypeEnv regression: stub binaries cannot be process-launched"
+    } elseif (-not (Test-LuaFileCount $retainedEnvSrc $RetainedEnvCorpusFiles)) {
         $fail = $true
+    } else {
+        Write-Host ""
+        Write-Host "perf-gate: peak RSS + wall time of check on the retained-TypeEnv regression corpus (warm)..."
+        # RAYON_NUM_THREADS=4 pinned around both the warm-up and the measured
+        # process — Windows counterpart of the bash gate's N39 fix. Peak RSS
+        # on this corpus scales with rayon parallelism x ambient size
+        # (luabox-types/src/lib.rs), so an unpinned thread count would make
+        # the 100 MiB ceiling mean something different on every runner width;
+        # pinning keeps the ceiling itself honest instead of loosening it.
+        $prevRayonThreads = $env:RAYON_NUM_THREADS
+        $env:RAYON_NUM_THREADS = "4"
+        try {
+            Push-Location $retainedEnvRoot
+            try {
+                & $luaboxBin check *> $null
+            } finally {
+                Pop-Location
+            }
+
+            $retainedInfo = [System.Diagnostics.ProcessStartInfo]::new()
+            $retainedInfo.FileName = $luaboxBin
+            $retainedInfo.Arguments = "check"
+            $retainedInfo.WorkingDirectory = $retainedEnvRoot
+            $retainedInfo.UseShellExecute = $false
+            $retainedInfo.RedirectStandardOutput = $true
+            $retainedInfo.RedirectStandardError = $true
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $retainedProc = [System.Diagnostics.Process]::Start($retainedInfo)
+            $retainedProc.StandardOutput.ReadToEnd() | Out-Null
+            $retainedProc.StandardError.ReadToEnd() | Out-Null
+            $retainedProc.WaitForExit()
+            $sw.Stop()
+            $retainedEnvMs = $sw.Elapsed.TotalMilliseconds
+            # [Math]::Floor for the same reason as the PEAK-RSS GATE's own
+            # conversion above (#58 review round 8, F17): peak-rss.py
+            # truncates, PowerShell's [int] rounds, and this leg's 100 MiB
+            # ceiling is compared against a number both OSes must derive the
+            # same way. Also inside the stub-skip, so also unexercised by any
+            # selftest case.
+            $retainedEnvRssMib = [int][Math]::Floor($retainedProc.PeakWorkingSet64 / 1MB)
+            $retainedProc.Dispose()
+        } finally {
+            if ($prevRayonThreads) { $env:RAYON_NUM_THREADS = $prevRayonThreads } else { Remove-Item Env:\RAYON_NUM_THREADS -ErrorAction SilentlyContinue }
+        }
+
+        if ($retainedEnvRssMib -lt $RetainedEnvRssBudgetMib) {
+            Write-Host ("PASS retained-TypeEnv regression, peak RSS: {0} MiB < {1} MiB" -f $retainedEnvRssMib, $RetainedEnvRssBudgetMib)
+        } else {
+            Write-Host ("FAIL retained-TypeEnv regression, peak RSS: {0} MiB >= {1} MiB" -f $retainedEnvRssMib, $RetainedEnvRssBudgetMib)
+            Write-Host "     round 4 review R14 (reverted) measured ~734 MiB on this corpus (Linux); see check_cmd.rs's run_passes doc comment"
+            $fail = $true
+        }
+        if ($retainedEnvMs -lt $retainedEnvCheckBudget) {
+            Write-Host ("PASS retained-TypeEnv regression, wall time: {0:N1} ms < {1:N1} ms" -f $retainedEnvMs, $retainedEnvCheckBudget)
+        } else {
+            Write-Host ("FAIL retained-TypeEnv regression, wall time: {0:N1} ms >= {1:N1} ms" -f $retainedEnvMs, $retainedEnvCheckBudget)
+            $fail = $true
+        }
     }
 
     # --- DIAGNOSTICS-HEAVY GATE ---------------------------------------------
@@ -263,27 +465,15 @@ strict = true
     # column per label. Neither subsumes the other — a regression in
     # either half moves only its own pair — and stdout is discarded in
     # both, so the gate times the toolchain, not the terminal.
-    $diagLintBudget = $DiagLintBudgetBaseMs * $Factor
-    $diagCheckBudget = $DiagCheckBudgetBaseMs * $Factor
-    $diagLintRenderedBudget = $DiagLintRenderedBudgetBaseMs * $Factor
-    $diagCheckRenderedBudget = $DiagCheckRenderedBudgetBaseMs * $Factor
+    $diagLintBudget = ConvertTo-ScaledBudgetMs $DiagLintBudgetBaseMs $Factor -CeilingMs $DiagLintCeilingMs
+    $diagCheckBudget = ConvertTo-ScaledBudgetMs $DiagCheckBudgetBaseMs $Factor -CeilingMs $DiagCheckCeilingMs
+    $diagLintRenderedBudget = ConvertTo-ScaledBudgetMs $DiagLintRenderedBudgetBaseMs $Factor -CeilingMs $DiagLintRenderedCeilingMs
+    $diagCheckRenderedBudget = ConvertTo-ScaledBudgetMs $DiagCheckRenderedBudgetBaseMs $Factor -CeilingMs $DiagCheckRenderedCeilingMs
 
-    $diagManifest = @'
-[package]
-name = "perf-gate-diagnostics"
-version = "0.0.0"
-edition = "5.4"
-
-[build]
-target = "5.4"
-out = "dist"
-
-[dependencies]
-'@
     $diagRoot = Join-Path $corpusDir "diagnostics-heavy"
     foreach ($project in @("lint", "check", "lint-rendered", "check-rendered")) {
         New-Item -ItemType Directory -Path (Join-Path $diagRoot "$project/src") -Force | Out-Null
-        Set-Content -Path (Join-Path $diagRoot "$project/luabox.toml") -Value $diagManifest -NoNewline
+        New-PerfManifest -Path (Join-Path $diagRoot "$project/luabox.toml") -Name "perf-gate-diagnostics" -Strict $false
     }
 
     Write-Host ""
@@ -344,6 +534,18 @@ out = "dist"
     }
     $checkRenderedLines.Add("return p")
     Set-Content -Path (Join-Path $diagRoot "check-rendered/src/main.lua") -Value $checkRenderedLines
+
+    # #58 review round 6, M30: each diagnostics-heavy corpus is one file: a
+    # truncated Set-Content or a wrong path would leave one of the four legs
+    # below timing an empty directory instead of $DiagCorpusFindings
+    # findings, exactly the "PASS on nothing" shape the CHECK GATE and
+    # RETAINED-TYPEENV REGRESSION GATE legs above are now wired against too.
+    foreach ($project in @("lint", "check", "lint-rendered", "check-rendered")) {
+        if (-not (Test-LuaFileCount (Join-Path $diagRoot "$project/src") 1)) {
+            Write-Host "FAIL diagnostics-heavy corpus generation ($project): see the error above"
+            $fail = $true
+        }
+    }
 
     Write-Host ""
     Write-Host "perf-gate: lint on a diagnostics-heavy file (warm)..."
@@ -427,6 +629,16 @@ out = "dist"
     } else {
         Write-Host "perf-gate: GATES FAILED"
     }
+} catch {
+    # $ErrorActionPreference is "Continue" from the fmt/lint stderr note
+    # above, so without this catch an exception mid-legs (a binary that
+    # fails to launch, a corpus write error) would abort every REMAINING
+    # leg, run the finally, and fall through to `exit 0` with $fail still
+    # false — a gate that measured half of what it claims and called it
+    # green. Measured, not hypothetical: the .ps1 self-test's first real
+    # execution hit exactly this via the RSS leg. Any abort is a FAIL.
+    Write-Host "FAIL perf-gate: aborted before all legs ran: $_"
+    $fail = $true
 } finally {
     Remove-Item -Recurse -Force $corpusDir -ErrorAction SilentlyContinue
 }

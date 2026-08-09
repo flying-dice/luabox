@@ -92,13 +92,31 @@ impl Checker<'_> {
             let Some(parents) = self.env.class_parents(&ob.name) else {
                 continue;
             };
-            let parents: Vec<String> = parents.to_vec();
+            let parents = parents.to_vec();
             // Members already handled — dedup across a diamond of parents.
             let mut seen: HashSet<String> = HashSet::new();
             for parent in &parents {
-                let Some(pshape) = self.env.class_shape(parent) else {
+                // The obligation is the parent **as this class named it**:
+                // `: Base<number>` obliges `item: number`, not `item: U`.
+                // Deliberately the raw (non-erasing) resolution: `field.optional`/
+                // `field.ty.admits_nil()` below decide a *real* presence
+                // obligation, and erasing an unbound `U` to `unknown` would
+                // make it `admits_nil() == true` — silently dropping the
+                // obligation instead of just misnaming it (measured: swapping
+                // this call for `class_shape_bound_export` regressed
+                // `missing member` detection entirely, production readiness
+                // review finding 5's first attempt).
+                let Some(pshape) = self.env.class_shape_bound(&parent.name, &parent.args) else {
                     continue;
                 };
+                // Display-only twin of `pshape`: the identical walk with the
+                // parent's own left-unbound parameters read as `unknown`
+                // rather than their literal name (`U`), for message text
+                // alone — the `require`-boundary rule (#56) reused at this
+                // reference site (finding 5). Never consulted for gating.
+                let display = self
+                    .env
+                    .class_shape_bound_export(&parent.name, &parent.args);
                 for (member, field) in &pshape.fields {
                     if !seen.insert(member.clone()) {
                         continue;
@@ -112,7 +130,18 @@ impl Checker<'_> {
                     if field.optional || field.ty.admits_nil() {
                         continue;
                     }
-                    self.check_class_member(&ob, parent, member, field, &provided);
+                    let display_ty = display
+                        .as_ref()
+                        .and_then(|s| s.fields.get(member))
+                        .map_or_else(|| field.ty.clone(), |f| f.ty.clone());
+                    self.check_class_member(
+                        &ob,
+                        &parent.name,
+                        member,
+                        field,
+                        &display_ty,
+                        &provided,
+                    );
                 }
             }
         }
@@ -126,6 +155,7 @@ impl Checker<'_> {
         parent: &str,
         member: &str,
         field: &FieldTy,
+        display_ty: &Ty,
         provided: &TableTy,
     ) {
         // (a) provided on the carrier (own members + `setmetatable` chain).
@@ -143,13 +173,25 @@ impl Checker<'_> {
                     &expected,
                 )
                 .map_or(String::new(), |d| format!(": {d}"));
+                // `display_ty`, not `expected`, in the printed message: the
+                // gate above must keep comparing against the real (possibly
+                // unbound) parameter type, but the text a user reads never
+                // should (finding 5, production readiness review).
+                let display_expected = if field.optional {
+                    display_ty.clone().optional()
+                } else {
+                    display_ty.clone()
+                };
                 self.report_class_conformance(
                     ob.span.clone(),
                     format!(
                         "`{}` does not satisfy `{parent}`: member `{member}` has the wrong type",
                         ob.name
                     ),
-                    format!("expected `{expected}`, found `{}`{detail}", actual.ty),
+                    format!(
+                        "expected `{display_expected}`, found `{}`{detail}",
+                        actual.ty
+                    ),
                     parent,
                 );
             }
@@ -167,7 +209,7 @@ impl Checker<'_> {
                 "`{}` does not satisfy `{parent}`: missing member `{member}`",
                 ob.name
             ),
-            format!("expected member `{member}` of type `{}`", field.ty),
+            format!("expected member `{member}` of type `{display_ty}`"),
             parent,
         );
     }
@@ -179,7 +221,7 @@ impl Checker<'_> {
         let mut stack: Vec<String> = self
             .env
             .class_parents(class)
-            .map(<[String]>::to_vec)
+            .map(|parents| parents.iter().map(|p| p.name.clone()).collect())
             .unwrap_or_default();
         let mut seen: HashSet<String> = HashSet::new();
         while let Some(parent) = stack.pop() {
@@ -192,7 +234,7 @@ impl Checker<'_> {
                 return true;
             }
             if let Some(grandparents) = self.env.class_parents(&parent) {
-                stack.extend(grandparents.iter().cloned());
+                stack.extend(grandparents.iter().map(|p| p.name.clone()));
             }
         }
         false

@@ -121,6 +121,21 @@ f({ \"a\", 2 })
 }
 
 #[test]
+fn explicit_numeric_keys_join_the_array_part() {
+    // `{ [1] = x }` is the same array item as `{ x }`. Behavioural pin
+    // from the #58 audit; measured, the conformance answer comes from a
+    // different classifier than check.rs's table_literal_ty (whose
+    // numeric-key mutant survives this probe — the shadowed-fallback
+    // finding again).
+    let src = "\
+---@param xs string[]
+local function f(xs) end
+f({ [1] = \"a\", [2] = 2 })
+";
+    assert_eq!(strict_codes(src), vec!["LB0300"]);
+}
+
+#[test]
 fn nested_table_literal_checked_field_by_field() {
     let src = "\
 ---@class Inner

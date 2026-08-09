@@ -319,18 +319,19 @@ Feature: luabox lsp — hover and completion on a `require` binding
     When I request the definition at 0:20 in "main.lua"
     Then the location is in "other.lua"
 
-  # --- the disclosed edge: a `---@class` carrier module (#54) --------------
+  # --- a `---@class` module export closes, in both spellings (#56) ---------
   #
-  # These scenarios pin what was *measured*, not what would be convenient.
-  # A module whose export is a `---@class` carrier (`---@class Point` over
-  # `local P = {}`) is a structural table as far as the per-file view the
-  # editor surfaces are built on can tell: the class's `---@field`s live in
-  # the declaring file's ambient environment, which only the type pass holds.
-  # So the binding hovers as that table, its members have no hover, and
-  # completion does not offer them. Recorded in
-  # docs/03-reference/02-limitations.md.
+  # This block used to pin the one shape the editor could not read (#54): a
+  # module whose export is a `---@class`. The class's `---@field`s live in
+  # the workspace ambient environment, and the per-file view hover and
+  # completion were built on could not reach it. Two things closed it: the
+  # export now crosses the `require` boundary as the class it carries (the
+  # workspace-global identity, which is what luals resolves a require to),
+  # and the editor surfaces resolve class members through the same ambient
+  # environment the checker uses — so what the editor offers is what
+  # `luabox check` enforces.
 
-  Scenario: a class-carrier module's binding hovers as a structural table
+  Scenario: a class-carrier module's binding hovers as the class name
     Given a file "point.lua" containing:
       """
       ---@class Point
@@ -346,10 +347,9 @@ Feature: luabox lsp — hover and completion on a `require` binding
     And the language server is running
     And the document "main.lua" is open
     When I hover at 1:6 in "main.lua"
-    Then the hover text contains "local p: {"
-    And the hover text does not contain "Point"
+    Then the hover text contains "local p: Point"
 
-  Scenario: a class-carrier module's member has no hover
+  Scenario: a class-carrier module's member hovers with its declared type
     Given a file "point.lua" containing:
       """
       ---@class Point
@@ -365,9 +365,10 @@ Feature: luabox lsp — hover and completion on a `require` binding
     And the language server is running
     And the document "main.lua" is open
     When I hover at 1:8 in "main.lua"
-    Then the reply is null
+    Then the hover text contains "Point.x"
+    And the hover text contains "number"
 
-  Scenario: a class-carrier module's members are not offered by completion
+  Scenario: a class-carrier module's members are offered by completion
     Given a file "point.lua" containing:
       """
       ---@class Point
@@ -383,9 +384,28 @@ Feature: luabox lsp — hover and completion on a `require` binding
     And the language server is running
     And the document "main.lua" is open
     When I request completion at 1:8 in "main.lua"
-    Then the completion list does not contain "x"
+    Then the completion list contains "x"
+    And completion item "x" has detail "Point.x: number"
 
-  Scenario: a class *instance* export does hover as the class name
+  Scenario: a member the class does not declare still has no hover
+    Given a file "point.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+      local P = {}
+      return P
+      """
+    And a file "main.lua" containing:
+      """
+      local p = require("point")
+      print(p.nope)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I hover at 1:8 in "main.lua"
+    Then the reply is null
+
+  Scenario: a class *instance* export hovers as the class name
     Given a file "point.lua" containing:
       """
       ---@class Point
@@ -404,3 +424,242 @@ Feature: luabox lsp — hover and completion on a `require` binding
     And the document "main.lua" is open
     When I hover at 1:6 in "main.lua"
     Then the hover text contains "local p: Point"
+
+  Scenario: a class instance module's member hovers with its declared type
+    Given a file "point.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+
+      ---@type Point
+      local P = nil
+      return P
+      """
+    And a file "main.lua" containing:
+      """
+      local p = require("point")
+      print(p.x)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I hover at 1:8 in "main.lua"
+    Then the hover text contains "Point.x"
+    And the hover text contains "number"
+
+  Scenario: a class instance module's members are offered by completion
+    Given a file "point.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+
+      ---@type Point
+      local P = nil
+      return P
+      """
+    And a file "main.lua" containing:
+      """
+      local p = require("point")
+      print(p.
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request completion at 1:8 in "main.lua"
+    Then the completion list contains "x"
+    And completion item "x" has detail "Point.x: number"
+
+  Scenario: hover stops answering from a module deleted behind the editor's back
+    # Round 4 review R28 named this gap; round 5 review N45 asked for a
+    # black-box scenario alongside the white-box protocol proof
+    # (`server.rs`'s `a_watched_delete_publishes_empty_diagnostics_for_the_deleted_file`
+    # and its sibling), and round 6 review M48 found the deferral still
+    # undone and self-admittedly untracked. `point.lua` is deleted on disk
+    # and reported the way a real editor's file watcher would
+    # (`workspace/didChangeWatchedFiles`, `FileChangeType::DELETED`); `main.lua`
+    # must stop resolving through it — the binding falls back to `unknown`
+    # (the same answer an unresolved `require` gets, see "requiring a module
+    # that does not exist hovers gracefully" above) and the field access,
+    # which has nothing left to resolve against at all, goes null rather than
+    # keep confidently answering from the deleted file's last known shape.
+    Given a file "point.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+      local P = {}
+      return P
+      """
+    And a file "main.lua" containing:
+      """
+      local p = require("point")
+      print(p.x)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I hover at 1:6 in "main.lua"
+    Then the hover text contains "local p: Point"
+    When I hover at 1:8 in "main.lua"
+    Then the hover text contains "Point.x"
+    When the file "point.lua" is deleted
+    And I hover at 1:6 in "main.lua"
+    Then the hover text contains "local p: unknown"
+    When I hover at 1:8 in "main.lua"
+    Then the reply is null
+
+  Scenario: hover tracks an edit to the declaring file
+    # Pins the merged-ambient cache's invalidation: the first hover populates
+    # the revision-keyed cache, the didChange to the OTHER file must
+    # invalidate it, and the second hover must see the member that edit
+    # introduced. A cache keyed on anything that misses cross-file edits
+    # serves the first (null) answer forever.
+    Given a file "point.lua" containing:
+      """
+      ---@class Point
+      ---@field x number
+      local P = {}
+      return P
+      """
+    And a file "main.lua" containing:
+      """
+      local p = require("point")
+      print(p.y)
+      """
+    And the language server is running
+    And the document "point.lua" is open
+    And the document "main.lua" is open
+    When I hover at 1:8 in "main.lua"
+    Then the reply is null
+    When I change "point.lua" to:
+      """
+      ---@class Point
+      ---@field x number
+      ---@field y number
+      local P = {}
+      return P
+      """
+    And I hover at 1:8 in "main.lua"
+    Then the hover text contains "Point.y"
+    And the hover text contains "number"
+
+  Scenario: a class declared in another file resolves members with no require
+    Given a file "shapes.lua" containing:
+      """
+      ---@class Circle
+      ---@field radius number
+      local C = {}
+      return C
+      """
+    And a file "main.lua" containing:
+      """
+      ---@type Circle
+      local c = nil
+      print(c.radius)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I hover at 2:8 in "main.lua"
+    Then the hover text contains "Circle.radius"
+    And the hover text contains "number"
+
+  # --- a receiver's own class is declared here, but inherits from another
+  # file (#46) --------------------------------------------------------------
+  #
+  # #56 closed cross-file *require*; this closes cross-file *inheritance*.
+  # `s`'s class (`Sub`) is declared in the same file as the receiver, so the
+  # old file-local lookup succeeded and never fell through to the ambient —
+  # an inherited member whose parent lives elsewhere hovered null though
+  # `luabox check` resolved it through the merged project classes.
+
+  Scenario: a member inherited from a parent declared in another file hovers
+    Given a file "base.lua" containing:
+      """
+      ---@class Base
+      ---@field id number
+      """
+    And a file "main.lua" containing:
+      """
+      ---@class Sub : Base
+      ---@field name string
+
+      ---@type Sub
+      local s = nil
+      print(s.id)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I hover at 5:8 in "main.lua"
+    Then the hover text contains "Sub.id"
+    And the hover text contains "number"
+
+  Scenario: a member neither the class nor its cross-file parent declares still has no hover
+    Given a file "base.lua" containing:
+      """
+      ---@class Base
+      ---@field id number
+      """
+    And a file "main.lua" containing:
+      """
+      ---@class Sub : Base
+      ---@field name string
+
+      ---@type Sub
+      local s = nil
+      print(s.nope)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I hover at 5:8 in "main.lua"
+    Then the reply is null
+
+  # --- a bound generic reference resolves its type argument (#48) ----------
+  #
+  # `---@type Box<number>` monomorphises at the reference site — the checker
+  # binds `Box`'s `T` to `number` when it resolves `b.item`. The ambient arm
+  # used to extract just the bare name `Box` and ask for its unbound shape,
+  # so hover answered `T` where the checker answered `number`.
+
+  Scenario: a bound generic class declared in another file resolves its type argument
+    Given a file "box.lua" containing:
+      """
+      ---@class Box<T>
+      ---@field item T
+      """
+    And a file "main.lua" containing:
+      """
+      ---@type Box<number>
+      local b = nil
+      print(b.item)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I hover at 2:8 in "main.lua"
+    Then the hover text contains "Box.item: number"
+
+  # Round 4 review R32 kept this as a one-variable *control* beside the
+  # falsifiable bound case above, and pinned `Box.item: T` — the answer the
+  # pre-#48 bare-name lookup also gave, so it distinguished nothing.
+  #
+  # Round 6 review M21 measured what the checker says at the same position
+  # and it is not `T`. `luabox check --path` on this exact fixture reports
+  # `expected `number`, found `unknown`` — a left-unbound parameter crosses
+  # the reference boundary erased, the same `require`-boundary rule (#56)
+  # the export path applies, so the name `T` is never shown to a consumer
+  # who cannot bind it. Hover rendered the literal `T` and disagreed with
+  # the checker about the same field at the same character.
+  #
+  # So this scenario now pins agreement with the checker, and it IS
+  # falsifiable: the pre-M21 hover answers `T` here and fails it.
+  Scenario: control — an unbound generic parameter hovers erased, as the checker renders it
+    Given a file "box.lua" containing:
+      """
+      ---@class Box<T>
+      ---@field item T
+      """
+    And a file "main.lua" containing:
+      """
+      ---@type Box
+      local b = nil
+      print(b.item)
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I hover at 2:8 in "main.lua"
+    Then the hover text contains "Box.item: unknown"

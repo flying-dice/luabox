@@ -289,7 +289,7 @@ pub(crate) fn run(
         .get(&hir.chunk())
         .filter(|data| data.returns_set)
         .and_then(|data| data.returns.first().cloned())
-        .map(|ity| infer.reify(&ity));
+        .map(|ity| infer.reify_export(&ity));
     // The final accumulated shape of every carrier local, snapshotted after
     // both passes so later `X.f = ...` / `function X:m()` extensions are all
     // in (whole-carrier conformance).
@@ -734,9 +734,16 @@ impl Infer<'_> {
 
     /// Report an absent-field read (`LB0306`). When `declared` names the
     /// `---@class` the receiver resolved to, the message is luals'
-    /// `undefined-field` phrasing and — where the class is declared in this
-    /// file — carries a "declared here" secondary label (#90). For an
-    /// inferred table it keeps the constructor/metatable phrasing.
+    /// `undefined-field` phrasing, names the three ways to declare the
+    /// member (round 3 review F71 — least-surprise for a newly-firing
+    /// diagnostic is naming the remedy, not just the symptom), and carries a
+    /// "declared here" secondary label pointing at the class's own file —
+    /// same-file via [`crate::env::TypeEnv::class_decl_span`], cross-file via
+    /// [`crate::env::TypeEnv::cross_file_class_decl_span`] (previously
+    /// silently omitted for a class declared anywhere but the file currently
+    /// checking, which is exactly the shape a `require`d carrier's members
+    /// take). For an inferred table it keeps the constructor/metatable
+    /// phrasing.
     fn report_absent(&mut self, body: BodyId, expr: ExprId, name: &str, declared: Option<&str>) {
         if self.pass != 1 {
             return;
@@ -747,7 +754,11 @@ impl Infer<'_> {
         let (message, label) = match declared {
             Some(class) => (
                 format!("undefined field `{name}` on `{class}`"),
-                format!("`{class}` declares no field `{name}`"),
+                format!(
+                    "`{class}` declares no field `{name}` — add `---@field {name} <type>`, \
+                     attach `function {class}.{name}(...)` / `function {class}:{name}(...)`, \
+                     or declare a `---@field [string] <type>` key space"
+                ),
             ),
             None => (
                 format!("cannot find field `{name}` on this table"),
@@ -758,13 +769,18 @@ impl Infer<'_> {
         };
         let mut diag = Diagnostic::new(FIELD_NOT_FOUND, self.severity, message)
             .with_label(Label::primary(Span::new(self.file, start..end), label));
-        if let Some(class) = declared
-            && let Some(range) = self.env.class_decl_span(class)
-        {
-            diag = diag.with_label(Label::secondary(
-                Span::new(self.file.to_string(), range),
-                format!("`{class}` declared here"),
-            ));
+        if let Some(class) = declared {
+            if let Some(range) = self.env.class_decl_span(class) {
+                diag = diag.with_label(Label::secondary(
+                    Span::new(self.file.to_string(), range),
+                    format!("`{class}` declared here"),
+                ));
+            } else if let Some((decl_file, range)) = self.env.cross_file_class_decl_span(class) {
+                diag = diag.with_label(Label::secondary(
+                    Span::new(decl_file, range),
+                    format!("`{class}` declared here"),
+                ));
+            }
         }
         self.diags.push(diag);
     }
@@ -868,7 +884,14 @@ impl Infer<'_> {
                 // undefined-field read (#90) — provable UNLESS the class
                 // declares an indexer / array part (dynamic access is
                 // declared, so any string key is admissible).
-                if let Some(shape) = self.env.class_shape(&class) {
+                //
+                // `class_shape_bound_export`, not `class_shape`: this reads
+                // a *value's* field, not a template on display, so a bare
+                // reference's own unbound generic parameter must not leak
+                // its literal name into the field's type (finding 5 of the
+                // production readiness review) — same rule the `require`
+                // boundary already applies (#56).
+                if let Some(shape) = self.env.class_shape_bound_export(&class, &[]) {
                     if let Some(field) = shape.fields.get(name) {
                         let ty = if field.optional {
                             field.ty.clone().optional()
@@ -879,10 +902,17 @@ impl Infer<'_> {
                     }
                     // Absence is diagnosable only for a real LuaCATS `---@class`
                     // with no indexer/array part. A dynamic-access class stays
-                    // lenient.
+                    // lenient — and so does a class whose ancestry the
+                    // `class_shape` call just above truncated (`LB0317`,
+                    // production readiness review finding 1): its shape is
+                    // admittedly incomplete, so an absent field here might
+                    // simply be declared past the cutoff. `LB0317` alone is
+                    // the honest diagnostic; a false `LB0306` on top of it is
+                    // not.
                     if self.env.is_class(&class)
                         && shape.indexers.is_empty()
                         && shape.array.is_none()
+                        && !self.env.class_ancestry_truncated(&class)
                     {
                         declared_class.get_or_insert(class);
                     } else {
@@ -967,7 +997,12 @@ impl Infer<'_> {
                 }
             }
             Ty::Named(class) => {
-                let Some(resolved) = self.env.resolve_named(class) else {
+                // `resolve_named_bound`, not `resolve_named`: a field read
+                // is a reference-consuming site (finding 5, production
+                // readiness review) — an unbound generic parameter reads as
+                // `unknown` here, the same rule the `require` boundary
+                // already applies (#56), not its own literal name.
+                let Some(resolved) = self.env.resolve_named_bound(class) else {
                     return Lookup::Opaque;
                 };
                 if let Lookup::Found(ity) = self.lookup_ty_field(&resolved, name) {
@@ -991,13 +1026,18 @@ impl Infer<'_> {
                 }
                 // Absent on a declared class → luals `undefined-field` (#90),
                 // provable only for a real LuaCATS `---@class` with no
-                // indexer/array part (dynamic access) and that resolved to a
-                // table (not an enum union).
+                // indexer/array part (dynamic access), that resolved to a
+                // table (not an enum union), and whose ancestry the
+                // `resolve_named` call above did not truncate (`LB0317`,
+                // production readiness review finding 1 — a truncated shape
+                // stays lenient on member reads, same as `lookup_shape_field`).
                 let dynamic = match &resolved {
                     Ty::Table(t) => !t.indexers.is_empty() || t.array.is_some(),
                     _ => true,
                 };
-                let provable = self.env.is_class(class) && !dynamic;
+                let provable = self.env.is_class(class)
+                    && !dynamic
+                    && !self.env.class_ancestry_truncated(class);
                 Lookup::Absent {
                     provable,
                     declared: provable.then(|| class.clone()),
@@ -1076,7 +1116,11 @@ impl Infer<'_> {
                 }
                 ity_union(parts)
             }
-            ITy::Ty(Ty::Named(class)) => match self.env.resolve_named(class) {
+            // `resolve_named_bound`: an `ipairs`/array-index element type is
+            // as much a reference-consuming site as a field read (finding 5,
+            // production readiness review) — a bare generic's unbound
+            // parameter must not leak its literal name into it.
+            ITy::Ty(Ty::Named(class)) => match self.env.resolve_named_bound(class) {
                 Some(resolved) => self.elem_ty(&ITy::Ty(resolved)),
                 None => ITy::unknown(),
             },
@@ -1125,7 +1169,9 @@ impl Infer<'_> {
                 }
                 (ity_union(keys), ity_union(values))
             }
-            ITy::Ty(Ty::Named(class)) => match self.env.resolve_named(class) {
+            // `resolve_named_bound`: same reference-consuming rule as
+            // `elem_ty` above (finding 5, production readiness review).
+            ITy::Ty(Ty::Named(class)) => match self.env.resolve_named_bound(class) {
                 Some(resolved) => self.pairs_tys(&ITy::Ty(resolved)),
                 None => (ITy::unknown(), ITy::unknown()),
             },
@@ -3165,6 +3211,102 @@ end
     }
 
     // --- display mode: cross-file (externals) ------------------------------
+
+    #[test]
+    fn check_mode_export_keeps_unannotated_returns_uncontractual() {
+        // #58 mutation audit: `has_return_annotation` on a reified
+        // unannotated function must stay `false` in Check mode — it is the
+        // flag that says "these returns are a description, not a contract"
+        // (#46), and the seams that read it live in other crates, so
+        // nothing here noticed it flipping.
+        let src = "\
+local M = {}
+
+function M.f()
+  return 1
+end
+
+return M
+";
+        let out = outcome(src);
+        let export = out.module_export.expect("module export");
+        let Ty::Table(table) = export else {
+            panic!("plain module exports structurally, got {export}");
+        };
+        let Ty::Function(f) = &table.fields.get("f").expect("field f").ty else {
+            panic!("f reifies as a function");
+        };
+        assert!(
+            !f.has_return_annotation,
+            "an unannotated body's returns are not a contract in Check mode"
+        );
+    }
+
+    #[test]
+    fn reified_shapes_exclude_metafields() {
+        // #58 mutation audit: `__index` and friends are wiring, not members
+        // — a reified export must not carry them, or every consumer of a
+        // metatable-using module sees phantom fields.
+        let src = "\
+local M = {}
+M.__index = M
+
+function M.real()
+  return 1
+end
+
+return M
+";
+        let out = outcome(src);
+        let export = out.module_export.expect("module export");
+        let rendered = export.to_string();
+        assert!(rendered.contains("real"), "{rendered}");
+        assert!(
+            !rendered.contains("__index"),
+            "metafields must not reify as members: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_returned_class_carrier_exports_as_the_class_it_carries() {
+        // The export position mirrors what luals resolves a `require` to:
+        // the returned carrier IS the class — the workspace-global identity —
+        // not the structural table it happens to be inside its own file
+        // (#56). Inside the file nothing changes; only what crosses the
+        // `require` boundary does.
+        let src = "\
+---@class Point
+---@field x number
+local P = {}
+return P
+";
+        let out = outcome(src);
+        let export = out.module_export.expect("module export");
+        assert_eq!(export.to_string(), "Point");
+    }
+
+    #[test]
+    fn a_returned_plain_table_still_exports_structurally() {
+        // Control: the overwhelmingly common `local M = {} … return M`
+        // module has no class to become — its structural surface is the
+        // export, exactly as before.
+        let src = "\
+local M = {}
+
+function M.area(w, h)
+  return w * h
+end
+
+return M
+";
+        let out = outcome(src);
+        let export = out.module_export.expect("module export");
+        let rendered = export.to_string();
+        assert!(
+            rendered.contains("area"),
+            "a plain module must keep its structural export: {rendered}"
+        );
+    }
 
     #[test]
     fn module_export_is_the_chunk_return_type() {

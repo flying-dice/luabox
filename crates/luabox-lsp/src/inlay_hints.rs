@@ -193,9 +193,41 @@ mod tests {
         (host.snapshot(), path)
     }
 
+    /// A workspace root every multi-file test lives under, so cross-file
+    /// `require` resolution finds every sibling.
+    fn root() -> PathBuf {
+        PathBuf::from(if cfg!(windows) { r"C:\ws" } else { "/ws" })
+    }
+
+    /// [`analyze`], generalised to several files sharing a workspace root —
+    /// the first file is the one under test.
+    fn analyze_files(files: &[(&str, &str)]) -> (Analysis, PathBuf) {
+        let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
+        host.set_root(root());
+        let mut first = None;
+        for (rel, text) in files {
+            let path = root().join(rel);
+            first.get_or_insert_with(|| path.clone());
+            host.apply_change(Change::SetFileText {
+                path,
+                dialect: Dialect::Lua54,
+                text: (*text).to_string(),
+            });
+        }
+        (host.snapshot(), first.expect("at least one file"))
+    }
+
     /// Hints over the byte range `start..end` of `src`.
     fn hints_in(src: &str, start: usize, end: usize) -> Vec<InlayHint> {
         let (analysis, path) = analyze(src);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let types = analysis.binding_types(&path).expect("binding types");
+        inlay_hints(&sema, types.bindings(), types.fn_returns(), start, end)
+    }
+
+    /// [`hints_in`] across `files`, hinting the first (`current`) file.
+    fn hints_in_files(files: &[(&str, &str)], start: usize, end: usize) -> Vec<InlayHint> {
+        let (analysis, path) = analyze_files(files);
         let sema = FileSema::new(&analysis, &path).expect("sema");
         let types = analysis.binding_types(&path).expect("binding types");
         inlay_hints(&sema, types.bindings(), types.fn_returns(), start, end)
@@ -249,6 +281,82 @@ local function g() return \"s\" end
             "{:?}",
             labels(&hints)
         );
+    }
+
+    // === a required module's carrier class (round 3 review F44, round 4
+    // review R31) ===========================================================
+    //
+    // F44 pinned the regression one layer down, at `binding_types` itself
+    // (`luabox-db/tests/analysis.rs`'s
+    // `display_mode_resolves_a_required_carriers_class_across_files`): the
+    // display-mode ambient needs the project-wide class merge, or a
+    // `require`d carrier's constructor return stays opaque. No test read
+    // that fix through the inlay-hint surface itself — this is that test.
+
+    #[test]
+    fn a_required_class_carrier_binding_hints_with_the_class_name() {
+        let files = [
+            ("main.lua", "local w = require(\"widget\")\nprint(w)\n"),
+            (
+                "widget.lua",
+                "---@class Widget\n---@field id number\nlocal W = {}\nreturn W\n",
+            ),
+        ];
+        let src = files[0].1;
+        let hints = hints_in_files(&files, 0, src.len());
+        assert!(labels(&hints).contains(&": Widget"), "{:?}", labels(&hints));
+    }
+
+    /// N43: the test above does not reach the fix it names. `w`'s type is a
+    /// bare `require` export — `Ty::Named("Widget")`, handed straight over
+    /// by `require_exports` — which needs no merge at all to render `:
+    /// Widget`: `luabox-db/tests/analysis.rs`'s own doc explains that a
+    /// carrier crosses `require` as `Ty::Named` since #56, so a receiver
+    /// binding a bare export is already exactly the shape the display-mode
+    /// ambient produces unaided. F44's actual shape — and the one
+    /// `display_mode_resolves_a_required_carriers_class_across_files`
+    /// pins — is a **constructor call**: `local v = m.make()` with
+    /// `---@return Widget`, where `reify_shape`'s instance-identity rule
+    /// hands back `Widget` only for the display inference to then resolve
+    /// it to `id: number` (or decline to), which needs `Widget`'s own
+    /// declaration in scope — the cross-file merge `query.rs`'s
+    /// `with_project_types` performs. Mutating that merge away left the
+    /// sibling test above green (it never asks for anything the merge
+    /// supplies) while `display_mode_resolves_a_required_carriers_class_across_files`
+    /// failed one layer down; this is the inlay-hint-surface version of the
+    /// same fixture, so the merge's effect is pinned at the surface a user
+    /// actually sees, not just at `binding_types`.
+    #[test]
+    fn a_required_carriers_constructor_call_hints_with_the_class_name() {
+        let files = [
+            (
+                "main.lua",
+                "local m = require(\"widget\")\nlocal v = m.make()\nprint(v)\n",
+            ),
+            (
+                "widget.lua",
+                "---@class Widget\n---@field id number\nlocal W = {}\nW.__index = W\n---@return Widget\nfunction W.make() return setmetatable({}, W) end\nreturn W\n",
+            ),
+        ];
+        let src = files[0].1;
+        let hints = hints_in_files(&files, 0, src.len());
+        // Position-specific, not `labels(&hints).contains(...)`: `m` itself
+        // (line 0) also hints `: Widget` off the bare `require` export,
+        // which needs no cross-file merge at all (N16/#56 — a carrier
+        // crosses `require` as `Ty::Named` unaided). A `contains` check
+        // would pass off `m`'s hint alone even if `v`'s (line 1, the
+        // constructor-call binding that actually needs the merge) rendered
+        // nothing or something else — exactly the kind of measurement gap
+        // N43 found in the sibling test above.
+        let v_hint = hints
+            .iter()
+            .find(|h| h.position.line == 1)
+            .unwrap_or_else(|| panic!("no hint on line 1 (`v`): {:?}", labels(&hints)));
+        let label = match &v_hint.label {
+            InlayHintLabel::String(s) => s.as_str(),
+            InlayHintLabel::LabelParts(parts) => panic!("expected a string label, got {parts:?}"),
+        };
+        assert_eq!(label, ": Widget");
     }
 
     #[test]

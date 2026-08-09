@@ -27,6 +27,32 @@ fn strict_codes(source: &str) -> Vec<String> {
 }
 
 #[test]
+fn each_param_binds_to_its_own_annotation_inside_the_body() {
+    // Behavioural pin (written during the #58 audit): each parameter's
+    // body-side type is its OWN annotation, probed acceptingly on two
+    // disjointly-typed parameters. Measured: inference serves this answer —
+    // the P0 scope-bind's name-match mutant survives the probe (shadowed
+    // fallback), so this guards the inference path rather than killing the
+    // check.rs copy.
+    let src = "\
+---@param s string
+local function want_string(s) end
+---@param n number
+local function want_number(n) end
+
+---@param a string
+---@param b number
+local function f(a, b)
+  want_string(a)
+  want_number(b)
+end
+
+return f
+";
+    assert_eq!(strict_codes(src), Vec::<String>::new());
+}
+
+#[test]
 fn partial_param_annotations_bind_by_name() {
     // Annotating only params 2..5 of a 6-param function must not shift
     // the tags onto the wrong positions (#74's exact repro).

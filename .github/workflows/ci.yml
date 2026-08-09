@@ -39,6 +39,96 @@ jobs:
       - run: cargo test --manifest-path tools/differ/Cargo.toml
         if: matrix.os == 'ubuntu-latest'
 
+  # The `#[ignore]`d tests that CI can run deterministically (#58 review
+  # round 8, F10). `cargo test --workspace` in `check` above skips every
+  # `#[ignore]`d test by construction, and no job passed `--ignored`, so
+  # four claims in this repo's review record were "pinned" by tests nothing
+  # ever executed — the behaviour they name could flip green and stay green.
+  # Two of the four are deterministic and belong in CI:
+  #
+  #   malformed_class_headers_m66  M66's pin. It asserts today's MEASURED
+  #                                behaviour for malformed `---@class`
+  #                                headers — a known bug, deliberately
+  #                                pinned so the day it changes is visible.
+  #                                Pure, in-process, no binary, no clock.
+  #   regen_merge_matrix_provenance  M42's pin, and the only test that reads
+  #                                the merge-matrix fixtures through a real
+  #                                `luabox check` SUBPROCESS the way a user's
+  #                                project is checked (the fast in-process
+  #                                test covers the library path only). Needs
+  #                                a release binary, hence the build step.
+  #
+  # The other two — search_order_cache_wall_time_by_depth and
+  # project_types_sweep_wall_time (the perf halves of M57/M18) — are NOT
+  # wired here and stay `#[ignore]`d: they assert wall-clock bounds, which
+  # is flaky-by-design on a shared runner. Citing them as CI-enforced proof
+  # is what F10 refuses; running them here would trade a false claim for a
+  # red-on-Tuesday pipeline. perf-gate.sh is where this repo gates time.
+  #
+  # regen_merge_matrix_provenance WRITES
+  # docs/03-reference/merge-matrix-provenance.md — that is its job. This
+  # runs it for its ASSERTIONS (it panics on a missing/unusable binary and
+  # on a fixture project it cannot materialise or parse) and then discards
+  # the write, because the committed doc was generated with
+  # LUABOX_DEVELOP_BIN pointing at a develop-built binary and this job has
+  # no such binary, so its output legitimately differs in the develop
+  # column. `git diff --exit-code` after the restore is the guard that the
+  # discard is complete: if this test ever starts writing somewhere else,
+  # this job fails rather than leaving CI's checkout quietly modified.
+  ignored-deterministic-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ignored-deterministic-tests
+      # regen_merge_matrix_provenance shells out to a real release binary
+      # and asserts it exists before doing anything else.
+      - run: cargo build --release -p luabox-cli
+      # Both names are passed as explicit `--exact` filters, so this leg runs
+      # exactly these two and cannot silently pick up a future `#[ignore]`d
+      # test in the same target — including a wall-time one, which is the
+      # thing the comment above says is deliberately not wired. Verified
+      # locally at this head: "2 passed; 0 failed; 0 ignored; 7 filtered out".
+      #
+      # `--exact` and the run-count guard are round 11 review R11-2. A libtest
+      # name filter that matches NOTHING exits 0, and neither of the two
+      # names is load-bearing for the `git diff --exit-code` step below
+      # (malformed_class_headers_m66 has no file side-effect at all), so
+      # renaming either test left this job green having executed it zero
+      # times — the F10 failure mode this job exists to close, reproduced one
+      # level up in the job built to close it. Substring matching made that
+      # worse: `--ignored regen_merge` would have kept passing after a
+      # rename to `regen_merge_matrix_provenance_v2` while quietly running a
+      # different test. So: `--exact`, and the "N passed" summary parsed and
+      # asserted to be exactly 2. A rename now fails this job loudly.
+      # Quoted: an unquoted YAML plain scalar treats ` #` as a comment
+      # start, which silently truncated this name to "Run the deterministic".
+      - name: "Run the deterministic #[ignore]d tests"
+        run: |
+          set -o pipefail
+          cargo test -p luabox-types --test class_merge_precedence_matrix \
+            -- --ignored --exact malformed_class_headers_m66 regen_merge_matrix_provenance \
+            | tee ignored-tests.log
+          passed="$(sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' ignored-tests.log)"
+          rm -f ignored-tests.log
+          if [ "$passed" != "2" ]; then
+            echo "::error::expected exactly 2 deterministic #[ignore]d tests to run, libtest reported '${passed:-<no summary line>}'" >&2
+            echo "A filter that matches nothing exits 0 — this job asserts the two named tests" >&2
+            echo "actually EXECUTED. If a test was renamed, update the filters above; if one was" >&2
+            echo "added, add it here deliberately and raise this count." >&2
+            exit 1
+          fi
+      - name: Discard the provenance doc regeneration and assert nothing else changed
+        if: always()
+        run: |
+          git checkout -- docs/03-reference/merge-matrix-provenance.md
+          git diff --exit-code
+
   # Dual line-coverage gates (cargo-llvm-cov), measured as two ISOLATED
   # suites so each style of testing independently guarantees behaviour:
   #   - unit: every in-process test (libs, bins, per-crate tests/) with the
@@ -117,31 +207,92 @@ jobs:
 
   # SPEC.md §16.1 — perf gates are CI-blocking. scripts/perf-gate.sh is the
   # authoritative list and holds the calibration notes for every budget; it
-  # currently runs seven timed legs plus one memory leg, all live:
+  # currently runs eight timed legs plus two memory legs, all live:
   #   1. cold start                     — `luabox --version`, best of 10
   #   2. `fmt --check` warm             — ~100-kLOC synthetic corpus
   #   3. `check` warm                   — same corpus; the gate §16.1 asks for
   #   4. `check` peak RSS               — same corpus; budget 300 MiB
-  #   5. `lint`, diagnostics-heavy      — 20 k findings in ONE file, suppressed
-  #   6. `check`, diagnostics-heavy     — ditto
-  #   7. `lint`, findings rendered      — the same corpus, nothing suppressed
-  #   8. `check`, findings rendered     — ditto
-  # Legs 5-8 exist because the corpus legs 2-4 use is *clean*, so none of
+  #   5. retained-TypeEnv regression, peak RSS + wall time
+  #                                      — a SEPARATE 500-tiny-file corpus;
+  #                                        RSS budget 100 MiB, wall-time
+  #                                        budget scaled like every other
+  #                                        timed leg below
+  #   6. `lint`, diagnostics-heavy      — 20 k findings in ONE file, suppressed
+  #   7. `check`, diagnostics-heavy     — ditto
+  #   8. `lint`, findings rendered      — the same corpus, nothing suppressed
+  #   9. `check`, findings rendered     — ditto
+  # Legs 6-9 exist because the corpus legs 2-4 use is *clean*, so none of
   # them ever times per-diagnostic work — the blind spot that hid an
   # O(diagnostics x file size) line lookup (32 k findings in one file: ~32 s
   # to lint; the same file with one finding: 0.35 s). The suppressed pair
   # times the bookkeeping with the renderer out of the way; the rendered pair
   # times what a user actually pays, renderer included, where a second such
   # cost lived.
-  # Leg 4 is the memory one: decisions/07 *accepted* a ~1.9x peak-RSS
+  # Leg 4 is the first memory leg: decisions/07 *accepted* a ~1.9x peak-RSS
   # regression (64 -> 123 MiB) for one read/parse per file, and nothing
   # enforced the ceiling side of that trade until it was added.
+  # Leg 5 is the SECOND memory leg (and also timed, unlike leg 4) — leg 4's
+  # 50-file corpus only widens the retained-vs-transient gap round 4 review
+  # R14 (reverted) introduced to ~3-5x, nowhere near a ceiling sized for a
+  # ~1.9x accepted trade, so a dedicated 500-tiny-file corpus reproduces the
+  # ~25x gap that shape actually has. Its RSS measurement pins
+  # RAYON_NUM_THREADS=4 — peak RSS there scales with rayon parallelism x
+  # ambient size (luabox-types/src/lib.rs), so an unpinned thread count
+  # would make its 100 MiB ceiling mean something different on every runner
+  # width; `perf-gates` itself does not need to set this — perf-gate.sh
+  # pins it internally around the one leg it applies to. That budget is
+  # $LUABOX_RETAINED_ENV_RSS_BUDGET_MIB, the sibling of
+  # $LUABOX_RSS_BUDGET_MIB below and, like it, NOT scaled by
+  # LUABOX_PERF_FACTOR.
   # The LSP keystroke-to-diagnostics budget in §16.1 is NOT gated here — no
   # harness drives the protocol yet; SPEC marks it future work.
   # Every *timed* budget is scaled by LUABOX_PERF_FACTOR (set below for this
-  # runner); the RSS budget deliberately is not — a slow machine runs the same
-  # allocations. LUABOX_RSS_BUDGET_MIB overrides that one on its own.
+  # runner); the RSS budgets deliberately are not — a slow machine runs the
+  # same allocations. LUABOX_RSS_BUDGET_MIB and
+  # LUABOX_RETAINED_ENV_RSS_BUDGET_MIB override those two on their own.
+  #
+  # perf-gate-selftest below is the gate on the gate, same discipline (and
+  # same reason) as mutants.yml's gate-selftest and luals-parity.yml's
+  # differential-selftest. It is no longer seconds-cheap: Part 1 covers the
+  # pure judgement functions scripts/perf-gate-lib.sh factors out, and the
+  # behavioural half added for #58 round 6 (M28) invokes the REAL
+  # scripts/perf-gate.sh a dozen times against stub binaries — generated
+  # corpora plus ~28s of deliberate stub sleeps, minutes on a shared
+  # runner. The timeout tracks that measured cost with headroom; 5 minutes
+  # fit only the pre-M28 suite and would turn a slow runner into a red PR.
+  perf-gate-selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Self-test perf-gate-lib.sh's judgement
+        run: bash scripts/tests/perf-gate-selftest.sh
+
+  # The WINDOWS execution surface for the PowerShell mirror: the three .ps1
+  # gate files ship alongside the bash ones (#58 round 6, M51) and without
+  # this leg 600+ lines of gate code would reach main never having run on
+  # the platform they exist for — the audit-nothing shape decisions/12
+  # exists to refuse. windows-latest because perf-gate.ps1's real consumers
+  # are Windows runners.
+  #
+  # It is no longer the FIRST execution of that suite: #58 review round 8
+  # ran scripts/tests/perf-gate-selftest.ps1 under pwsh 7.4.6 on Linux
+  # before touching it (see that file's own header for what that run
+  # covered and the two legs it structurally cannot). What this job adds
+  # that a Linux pwsh cannot is the Windows-only half — Process.Start's
+  # FileName semantics, PeakWorkingSet64, the working-set accounting the
+  # RSS legs read — so it stays the gate on the platform, not a duplicate.
+  perf-gate-selftest-ps1:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Self-test perf-gate-lib.ps1's judgement
+        shell: pwsh
+        run: ./scripts/tests/perf-gate-selftest.ps1
+
   perf-gates:
+    needs: perf-gate-selftest
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -151,15 +302,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: perf-gates
-      # The peak-RSS leg SKIPs loudly when python3 is missing — fine on a dev
+      # The peak-RSS legs SKIP loudly when python3 is missing — fine on a dev
       # box, but CI must never run a gate with a leg silently absent. Assert
       # the tooling up front, the way draft-install-mock does.
-      - name: Assert python3 is available (peak-RSS leg depends on it)
+      - name: Assert python3 is available (peak-RSS legs depend on it)
         run: python3 --version
-      # GitHub-hosted runners are ~3x slower and noisier than the dev
-      # baseline the budgets were calibrated on (observed: warm check
-      # 3145 ms vs the 1000 ms budget). The factor scales every budget;
-      # regressions still fail, just against shared-runner reality.
+      # GitHub-hosted runners are slower and noisier than the dev box every
+      # budget in scripts/perf-gate-budgets.env was calibrated on, so each
+      # leg's BASE is multiplied by this factor here. Deliberately no ms
+      # figures in this comment (#58 review round 8, F18): the previous one
+      # cited "warm check 3145 ms vs the 1000 ms budget" and survived the
+      # round 6 rebase that replaced that 1000 ms budget entirely, so the
+      # next person tuning this number reasoned from a budget the repo no
+      # longer had. Every base, every ceiling and the measurement each was
+      # derived from live in perf-gate-budgets.env, next to the constant
+      # they justify, and are what this factor should be read against.
+      #
+      # Raising this factor no longer widens a budget without bound: each of
+      # the eight scaled legs also carries a *_CEILING_MS cap on the SCALED
+      # value, so a leg's effective budget here is min(base x factor,
+      # ceiling) — see that file's "CEILING keys" note for why a factor
+      # multiplying a base that already carries its own headroom is how a
+      # gate goes blind. Regressions still fail, just against shared-runner
+      # reality.
       - run: bash scripts/perf-gate.sh
         env:
           LUABOX_PERF_FACTOR: "4.0"

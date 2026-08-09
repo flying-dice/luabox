@@ -8,7 +8,141 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 
 ## [Unreleased]
 
+**Breaking: `luabox check` rejects Lua it previously accepted.** The #56
+export-seam change below is a narrowing, not a superset — a clean project
+today can fail in CI after upgrading, with no code change of its own. Read
+the #56 entry in full before upgrading a project you run in CI; the
+"opt-out and migration" note under it is the fastest path to green if you
+hit a new failure.
+
+This block rides **0.2.0**, itself a breaking minor under the
+[0.x policy](docs/02-guides/01-releasing.md#semver-policy-for-0x) for the v1
+scope cut, so no further bump is forced — but it may not ship as a patch,
+and that rule is now written into the policy rather than left to judgement.
+
+### Changed
+
+- **A `---@class` module export crosses `require` as the class, in both
+  spellings** (#56). A returned *carrier* (`---@class Point` over
+  `local P = {}`) used to cross the boundary as the structural table it
+  happens to be — empty, since `---@field` lines declare members without
+  assigning them — so consumers got leniency: `p.x` arrived `unknown`,
+  `p.nope` was accepted, and a `---@field`-declared function was never
+  argument-checked. The export position now reifies the carrier as the
+  class it carries, the workspace-global identity luals resolves a require
+  to, making the carrier and instance spellings symmetric: members typed,
+  `p.nope` an `LB0306`, `---@field`-declared functions argument-checked.
+  Strictly narrowing for code that leaned on the old leniency — that
+  leniency was a disclosed limitation, and the shape it hid is exactly the
+  one the wave-25 review flagged. Inside the declaring file nothing
+  changes; only what crosses `require` does.
+
+  **One narrowing reaches code that works at runtime**, and it is worth
+  naming: a member attached to the carrier under a *computed* key
+  (`for _, n in ipairs(names) do H[n] = … end`) is declared nowhere, so
+  reading it through a `require` is now `LB0306`. Declaring the key space —
+  `---@field [string] fun(): string` on the class — makes it clean again.
+  Not a unilateral tightening: lua-language-server reports `undefined-field`
+  on the same read, and both verdicts are now corpus rows of the #57 parity
+  gate (`dynamic_key_carrier_require`, `dynamic_key_carrier_indexer`).
+
+  **A second runtime-working shape narrows the same way, and is not covered
+  by the computed-key fix above**: a carrier that borrows its members
+  through an undeclared `__index` — `local T = setmetatable({}, { __index =
+  Proto })` where `Proto` is a plain table nothing declares — reads
+  `t.hello` through a `require` as `LB0306` now too, for the identical
+  reason: nothing declares `hello`. lua-language-server agrees here as well
+  (`undefined-field`, corpus row `metatable_index_carrier_require`).
+  Declare the member on the class, or make `Proto` a class the carrier
+  names as a parent (`---@class Thing : Proto`).
+
+  Statically visible attachments — dotted functions, colon methods, data
+  fields, table-literal carriers, members assigned from a `require` — are
+  measured unaffected. The two shapes above (computed key, undeclared
+  `__index`) are the ones that are not.
+
+  **One class shape is excepted**, and the exception is the mechanism's
+  price rather than an oversight: a carrier whose members still mention an
+  **unbound type parameter** — `---@class Box<T>`, or a class inheriting a
+  field from a generic parent it named without arguments (`: Base`) —
+  crosses as the monomorphised template instead of as the class, because
+  `Ty::Named` carries no type arguments and a class name that means `T` in
+  the consumer names a variable it cannot produce. A template is structural,
+  so it enforces no member list: `b.nope` on a generic carrier stays clean
+  where the same read on a plain class is `LB0306`. Both directions are
+  pinned as fixtures, and `---@type Box<number>` on the binding types its
+  *declared* members correctly — it does not add enforcement: an
+  *undeclared* member on a bound generic reference is still `LB0300 "found
+  unknown"`, never `LB0306`, for the same reason. See
+  [limitations](docs/03-reference/02-limitations.md#a-class-module-export-closed-in-both-spellings-54--56).
+
+  **The narrowing also reaches vendored luarocks surfaces.** A rock's own
+  harvested types go through this same export reification, so `luabox
+  check` can newly emit `LB0306` in *your* file because an upstream rock
+  exports a dynamic-key `---@class` carrier — a shape you did not write and
+  cannot edit in place. The fix is still available, just indirect: declare
+  the rock's class yourself, indexer included, in a `[types] defs` package
+  (`[types] defs = ["defs"]`, a `defs/<rock>.lua` file); your project's own
+  declaration of a name wins outright over a rock's, not merged with it (see
+  [Using dependencies](README.md#using-dependencies) in README).
+
+  **No per-diagnostic opt-out exists for `LB0306`, and none was added.**
+  `[lint]` has per-rule `allow`/`warn`/`deny`; the checker's own `LB03xx`
+  family has no equivalent severity control in `luabox.toml`. Two blunter
+  hatches exist today and are not new: `---@diagnostic disable:
+  undefined-field` (per line or per file) suppresses this one code exactly;
+  `[types] strict = false` downgrades every type diagnostic — not `LB0306`
+  alone — from error to warning project-wide, and `check`'s exit code is
+  nonzero only on an error, so this is CI-green again but blunter than the
+  one code you meant to waive: it silences every other type mismatch along
+  with it. There is no staged, per-module migration between the two
+  hatches — a project with many affected carrier modules fixes every call
+  site in one pass or takes the whole-project downgrade. There is also no
+  flag that recovers the *old* verdicts while keeping strict mode on: the
+  only way to keep this PR's behavior from reaching your CI is not
+  upgrading past it — pin the `luabox` binary version.
+
+- **The language server no longer re-checks every foreign file it notifies,
+  and a never-opened file's panel is cross-file findings only until it is
+  first opened.** Publishing a diagnostic that belongs to another file used
+  to re-run that file's whole check pass — parse, validate, type-check, lint
+  — once per notified target, per keystroke, single-threaded. It now reuses
+  the file's own half from the last pass over that file. The visible
+  consequence, stated rather than left in a code comment: a document nobody
+  has opened yet shows only the cross-file group that named it, not its own
+  findings, until it is itself checked — opening it, editing it, or a
+  watched-file event for it publishes it in full and merges the two halves
+  back together. Additive and self-healing; nothing the client already
+  displays is contradicted or withdrawn.
+
 ### Added
+
+- **Hover and completion resolve class members through the checker's
+  ambient environment** (#56). The editor surfaces were built on a per-file
+  view, so a class declared in another file — named via `---@type`, or
+  arriving through a `require` — had no member hover and no member
+  completion even while diagnostics enforced those members. Both surfaces
+  now read the same merged defs + workspace-global + rocks environment the
+  diagnostics pipeline checks against (`Ambient::class_members`), so what
+  the editor offers is what `luabox check` enforces — the last row of the
+  `#54` limitations table, closed from both ends.
+
+- **A lua-language-server parity gate** (#57). "Matches luals" is now
+  measured, not claimed: `scripts/tests/luals-differential.sh` re-derives
+  both tools' verdicts over a corpus of parity-sensitive shapes and diffs
+  them against committed two-column expectations, where an intentional
+  divergence is a justified row rather than a hidden allowlist. CI pins
+  luals 3.13.5 by sha256. The gate's first run resolved the one guessed
+  bound from #49 by measurement: luals requires an omitted *non-trailing*
+  nil-admitting parameter exactly as luabox does.
+
+- **Property coverage for duplicate generic-class declarations** (#59). The
+  positional-unification rule that #46 needed at three separate merge seams
+  now has a single owner (`class_param_unification`), and a proptest
+  generator covers the duplicate-declaration shape space — parameter
+  spellings × field placement × declaration order × same/cross-file — with
+  behavioural probes in both directions, so the next shape in that family
+  is found by a generator instead of a reviewer.
 
 - **`luabox lint --format json|sarif|github|gitlab`.** `lint` had no
   `--format` at all, so `luabox lint --format json` exited 2 — clap rejecting
@@ -25,7 +159,547 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
   `check` already did, so a consumer that unconditionally parses stdout does
   not break on the happy path (refs #53).
 
+- **A `---@class` ancestry too costly to resolve is now reported
+  (`LB0319`), separately from one that is too deep (`LB0317`).** The
+  resolver bounds two different things. `MAX_ANCESTRY_DEPTH` protects the
+  native stack and is fixed by flattening the hierarchy;
+  `MAX_ANCESTRY_RESOLUTIONS` bounds the *re*-resolution a diamond conflict
+  forces — the same generic ancestor reached through more than one parent,
+  bound differently on each branch — and flattening does not help. Both
+  used to report as `LB0317`, so the diagnostic named the wrong cause and
+  advised the wrong fix.
+
+  The budget counts re-resolutions only. A hierarchy that is merely large —
+  hundreds of generated `---@class` declarations, each visited once —
+  resolves in linear time and does not trip it: measured, 601 classes at
+  depth 6 check clean in 0.09 s, matching the merge base. An earlier build
+  of this block counted first visits too and rejected exactly that shape.
+
+  Honours the full ladder: `[types] strict = false` downgrades it to a
+  warning, `---@diagnostic disable[-line|-next-line]:
+  class-ancestry-too-costly` suppresses it, and `luabox explain LB0319`
+  describes the fix.
+
+- **A class now flows to any ancestor it declares, even when it overrides an
+  inherited member at an incompatible type.** `---@class Child : Parent`
+  with `---@field v number` over `Parent`'s `---@field v string` used to
+  fail `takes(child)` where `takes` wants a `Parent` — the two were compared
+  structurally, so overriding a member, which is the point of overriding,
+  broke every upcast the declaration promises. Declared ancestry is now
+  nominal for this direction, matching lua-language-server 3.13.5 (measured
+  against the pinned binary, which accepts it).
+
+  Strictly a loosening: it only ever turns a rejection into an acceptance,
+  so it cannot introduce a new false positive on code that checks clean
+  today. The declaration-site obligation is unchanged — a `---@class Name :
+  Parent` carrier is still verified against every member `Parent` declares,
+  so an override that does not satisfy its base is still reported, at the
+  declaration rather than at every use.
+
+  The *tightening* half of nominality — luals also rejects an undeclared
+  class that happens to match structurally, where luabox accepts it — is a
+  core semantic change to every `LB0300` and is deliberately not made here;
+  it is tracked in #68, behind #66's per-code severity control.
+
+- **A cyclic `---@class` ancestry is now reported (`LB0318`).** `---@class A :
+  A`, and the mutual `A : B` / `B : A`, previously resolved in complete
+  silence: the resolver's own cycle guard stopped the walk at the back-edge,
+  so nothing crashed, but the class kept only the members reached before it
+  and a user whose intent was to extend something else got no signal
+  anywhere. The alias axis has reported its version of this as `LB0314` since
+  `#123`; this is the class axis, drained at the same point in the check and
+  with the same attribution tiers (this file's declaration, another project
+  file's, then the consuming file for an ambient `[types] defs` class).
+
+  **Parity with the oracle, not luabox being stricter.** lua-language-server
+  3.13.5 reports `circle-doc-class` ("Circularly inherited classes") on both
+  shapes at `--checklevel=Warning`. Earlier drafts of this entry claimed it
+  "reports nothing for either shape (measured)"; that was asserted, never
+  measured, and is false — it is now measured, in the `luals-differential`
+  corpus rows `cyclic_class_self` and `cyclic_class_mutual`, which re-derive
+  both columns on every run.
+
+  **Reported from the declaration, like luals — not only when something
+  resolves the class, and on both surfaces.** `luabox check` and the language
+  server both find cycles in the declared `---@class` graph up front, so
+  `---@class Widget : Widget` sitting in a types file nothing requires is a
+  finding on the command line AND in the editor. Until this change `LB0318`
+  was filed only by the resolver's back-edge, which is reference-driven, so
+  an unreferenced cyclic class was silent everywhere while this entry claimed
+  flat parity; an earlier draft of this entry then claimed the editor had
+  been reporting it all along, which was never true. The gap is measured and
+  closed by the corpus row `cyclic_class_unreferenced` (a cyclic class with
+  zero uses: both tools report), and the shared pass lives in `luabox-types`
+  so the two surfaces cannot drift apart again.
+
+  **One diagnostic per declaration that carries a cycle edge** — the same
+  count and the same attribution luals gives on the shapes measured against
+  the pinned 3.13.5, up to luals' own 999-ancestor walk cap, above which
+  luabox's unbounded walk still reports a ring luals is silent on. Two
+  `---@class` declarations of one name **union** their parents
+  (as this project's semantics have always documented), so a class declared
+  plainly and reopened with a back-edge is a cycle, reported once, on the
+  reopening line; the same cyclic class declared in two files is reported in
+  each. A cycle something *does* resolve is still one diagnostic: the
+  syntactic pass and the resolver's own rediscovery are deduped by
+  declaration site. Consequently the suppression name is luals' own:
+  `---@diagnostic disable[-line|-next-line]: circle-doc-class` (it was spelt
+  `cyclic-class-ancestry` in this branch's earlier rounds — corrected before
+  release, so no comment in the wild breaks, and a luals user's existing
+  directive now works unchanged). It honors the full strictness ladder like
+  every other `LB03xx`: `[types] strict = false` downgrades it to `warning`.
+  `luabox explain LB0318` describes the fix.
+
+- **A `---@class` ancestry-depth limit (`LB0317`, `MAX_ANCESTRY_DEPTH = 200`)**
+  (#56, production readiness review round 6, M4/M5). `luabox check` and the
+  LSP now both refuse to resolve a `---@class` ancestor chain deeper than
+  200 links, durably (`luabox-types`' own resolver, `DiamondGuard`) and,
+  redundantly but cheaply, syntactically ahead of it (the CLI's own
+  project-wide pre-check, so a chain nothing in the project ever references
+  is still caught, not just one the resolver happens to walk). This closes
+  the crash the limit exists to prevent (round 5 review N2 — an
+  unbounded ancestor walk could abort the whole process, uncatchably, on a
+  deep enough chain, with no diagnostic and no file name), but it is a
+  **breaking narrowing**: a chain over 200 links that `develop` and every
+  earlier round of this branch checked cleanly is `error`, exit 1, as of
+  this release. Flatten the hierarchy or use composition in place of a long
+  single-inheritance chain; a generated-bindings project (one `---@class`
+  per table/message/IDL node) is the realistic shape that reaches this. See
+  `luabox explain LB0317`.
+
+  **luabox-only, and now measured as such.** lua-language-server 3.13.5
+  reports nothing on a straight 260-link chain — probed directly against the
+  pinned binary at `--checklevel=Warning`, and pinned as an intentional
+  divergence in the `luals-differential` corpus row
+  `deep_chain_over_depth_limit`. So this narrowing has no oracle counterpart
+  to converge on; unlike `LB0318` above, where the equivalent claim turned
+  out to be false, this one holds under measurement.
+
+  Two bugs in the CLI's own pre-check (`check_cmd::deep_class_chain_diagnostics`)
+  shipped alongside the limit in an earlier build of this same block, both
+  fixed before this line ever reached a tagged release:
+
+  - **Wrong code, no working escape hatch.** The pre-check used to emit
+    `LB0001` — "syntax error" — for this condition, so `luabox explain` on
+    the code actually printed described a missing `end`/`)`/`}`, not an
+    ancestry limit, and the diagnostic was always `error` regardless of the
+    manifest. It now emits `LB0317` and honors the same strictness ladder
+    every other type diagnostic does: `[types] strict = false` downgrades it
+    to `warning` (exit 0 — the general shape of this hatch, and its blunt,
+    whole-project reach, are described in the `#56` entry above), `[types]
+    strict = true` keeps it `error`, and `[types] strict` unset from `None`
+    (reachable only programmatically, not from a manifest) reports nothing
+    at all, same as every other checker diagnostic.
+    `---@diagnostic disable[-line|-next-line]: class-ancestry-too-deep` in
+    the declaring file suppresses one class's own `LB0317` — from **both**
+    emitters. `LB0317` is reported by two of them: this CLI pre-check and,
+    separately, the type pass's own depth-limit drain. Registering the rule
+    name in only one of them silenced only that one, so a file-wide `disable`
+    left the other's diagnostic standing (measured on a 220-link chain: 18
+    suppressed, 1 surviving).
+
+    Sharing the rule *name* turned out not to be enough, and an earlier
+    edition of this entry claimed it was. The two emitters also had two
+    *scanners*: the pre-check hand-rolled a walk over harvested
+    `---@diagnostic` tags, which recognises a narrower comment grammar than
+    the checker's own `DirectiveScan` — measured, `--[[@diagnostic disable:
+    class-ancestry-too-deep]]` and a plain `--@diagnostic disable: …` each
+    silenced the checker-side `LB0317` and left the pre-check's standing.
+    Both halves are unified as of this round: one scanner
+    (`luabox_types::DirectiveScan`), one grammar, one rule name
+    (`luabox_types::RULE_CLASS_ANCESTRY_TOO_DEEP`), both emitters — every
+    spelling of the directive that silences either now silences both.
+  - **A second, unrelated parent silently flipped the verdict.** The
+    pre-check only followed a class's single named parent, so
+    `---@class C : A, B` at a depth that would be refused as `---@class C :
+    A` sailed through as `warning`/exit 0 (or, before the fix above,
+    reported nothing) purely because a second parent was added. It now
+    walks every named parent (bounded, so a pathologically wide declared
+    hierarchy cannot overflow the pre-check's own stack any more than a
+    pathologically deep one could), and reports every over-limit class in
+    the project, not just one arbitrarily chosen by hashmap order.
+
+  A class whose over-limit ancestry is declared in a `[types] defs` package
+  rather than this project's own source now still produces `LB0317`,
+  attributed to the file whose resolution reached it — previously it was
+  silently dropped, so the LSP reported the identical project red while
+  `check` stayed green on the same commit.
+
+  **`LB0317` past the limit is honest, not exhaustive.** Once a class's
+  ancestry truncates, further undefined-field reads on *that* class
+  (`LB0306`/`LB0303`) are not reported for it: the resolved shape is
+  admittedly incomplete past 200 links, so an absent member there might
+  simply be declared beyond the cutoff, and a false undefined-field on top
+  of the truncation warning would be worse than silence. In warn mode this
+  can mean a real bug on a truncated class goes unreported and `check`
+  still exits 0 — the same "strict=false silences the specific thing you
+  meant to see" tradeoff `[types] strict` always carries elsewhere (see the
+  `#56` entry's own no-per-diagnostic-opt-out note). Under `[types] strict =
+  true` the truncation itself is always `error`, so a build depending on
+  that class's member-checking staying honest cannot go green while
+  checking against it is silently incomplete.
+
 ### Fixed
+
+The entries below correct work introduced **inside this same Unreleased
+block** — the `---@class` ancestry limits, the indexer half of
+`duplicate-doc-field`, and the duplicate-declaration merge rules. None of them
+is a regression against `0.2.0` or `develop`; each is a defect in an
+unreleased change, found by the production readiness review and fixed before
+the block ships.
+
+- **A file's own `---@enum` again shadows a same-named `[types] defs` enum,
+  as `---@class` always has and as this block's own duplicate-merge entry
+  documents** (production readiness review). Routing `---@enum`
+  through the same first-wins `member_wins` rule as duplicate `---@class`
+  declarations (round 6 review M53) made the check ask the wrong question:
+  `build_from_items` seeds `env.enums` from the ambient layer *before* any of
+  the file's own blocks are absorbed, so "is this name already present?" was
+  true for every ambient enum, and the file's declaration lost to the
+  definition package's. Measured at `d20cd47`: `enum_members("Color")`
+  returned the defs package's members for a file that declared `---@enum
+  Color` itself. `absorb_block` now distinguishes "seeded from the ambient"
+  (shadow it whole) from "this file already declared it" (first-wins, M53's
+  actual rule), the same split `local_classes` already gave `---@class`. A
+  same-file duplicate `---@enum` is still first-wins.
+
+- **`luabox check` no longer stops after the `---@class` depth pre-check**
+  (production readiness review). The pre-check used to `return` the
+  moment it found an over-limit chain, silently disabling every later pass in
+  the command: a 201-link chain in one file hid the syntax errors in another,
+  an `Error`-severity `LB1002` was discarded because a `Warning`-severity
+  depth finding got there first, and adding a `---@diagnostic disable` comment
+  therefore made `check` report **more** findings, not fewer. The crash
+  protection that early return was reasoned from was never this pre-check's to
+  give — `MAX_ANCESTRY_DEPTH`'s `DiamondGuard` cap refuses to recurse past 200
+  links inside the resolution walk itself, for every caller. Re-measured with
+  the full pipeline running over the chain: 2,500 links and 50,000 links (the
+  latter with a `---@type` + field read, so the resolver actually walks it)
+  both complete and report.
+
+- **One `LB0317` per over-limit chain, not one per over-limit class.** Round 6
+  review M17 fixed a `max_by_key` that let hashmap order pick one arbitrary
+  chain and dropped every other, but reporting every over-limit *class*
+  traded that for the opposite failure: one 2,500-link chain produced 2,300
+  separate errors and 835 KB of output, all restating a single mistake. The
+  pre-check now reports the **frontier** — the first link over the limit,
+  whose own parent is still within bounds, the one place a reader can act —
+  once per chain however long the chain runs, with the chain's deepest class
+  and measured depth in the message. N independent chains still produce N
+  diagnostics. The resolver-side drain's rediscovery of a chain the pre-check
+  already named is dropped, so one chain is one diagnostic across both
+  mechanisms. Round 8 review F3 then found the two mechanisms disagreeing on
+  the boundary itself — the pre-check counted edges where the resolver counts
+  classes on the path, so a 201-class chain slipped past the pre-check and
+  drew the resolver's non-actionable message instead. Both now count classes
+  and first trip at 201; the reported frontier is the first class past the
+  200-class limit.
+
+- **`LB0317`/`LB0318`/`LB0319` now report in a fixed order.** The three
+  ancestry ledgers are hash sets, and a class with no in-project declaration
+  is attributed to the consuming file at offset `0..0`, so every ambient-tier
+  hit in one file carries an identical span and the span sort could not break
+  the tie. Measured on a project with two over-limit `[types] defs` chains: 12
+  consecutive runs of the same binary over unchanged sources printed the two
+  `LB0317`s in one order 10 times and the other order twice — indistinguishable
+  from a real change to a diff-based CI gate. Fixed at both ends: the drains
+  sort by class name before emitting, and `luabox check`'s render order now
+  falls through to code and message for findings that genuinely share a span.
+
+- **`LB0319`'s message names the budget it enforces.** It said only that the
+  ancestry was "too costly", where its `LB0317` sibling has always
+  interpolated `MAX_ANCESTRY_DEPTH` — leaving a user no figure to measure
+  their hierarchy against. It now names `MAX_ANCESTRY_RESOLUTIONS`.
+
+- **`duplicate-doc-field` (`LB0311`) no longer fires on distinct
+  `---@field [K] V` indexer keys.** Extending the check to indexers (round 6
+  review M11) keyed them on the lowered key type resolved through a
+  *file-local* context, so every key naming a type the file does not itself
+  declare collapsed to one `unknown` type: two indexers keyed on two different
+  `[types] defs` classes, or on two different project-file classes, were
+  reported as a duplicate `[unknown]` on a class with no duplicate at all, and
+  so were a generic class's own two type parameters (`---@class Keyed<T, U>`
+  with `[T]` and `[U]`), which were never put in scope for the key at all. Key
+  identity is now the lowered type **paired with the names that lowering could
+  not resolve**: two keys collide when both resolve to the same type, or both
+  fail on the same names. `[T]` and `[U]` are distinct, `[T]` twice is still a
+  duplicate, and an unresolvable key now reads back as the name the user wrote
+  rather than as `[unknown]`.
+
+- **The `---@diagnostic disable` escape hatch for `LB0317`/`LB0318` did not
+  work cross-file, even though the CHANGELOG entries above and the
+  `require.feature` scenarios document putting it in the offending class's
+  own declaring file** (production readiness review G1). Both diagnostics
+  can carry a primary label attributed to a *different* project file than
+  the one whose check pass actually tripped the resolver
+  (`TypeEnv::cross_file_class_decl_span` — a class declared in file A is
+  resolved, and its diagnostic reported, only because file B references
+  it). The suppression scan built its `---@diagnostic` directive scan and
+  line index from the *checking* file's own source unconditionally, so a
+  disable comment sitting correctly in A's declaration was invisible to the
+  pass emitting the diagnostic — and worse, the line number fed to the
+  suppression check was computed from the wrong file's line breaks, so even
+  a correctly-scoped `disable-line` could hit or miss arbitrarily.
+  `luabox_types::check_file_with_artifacts_and_sources` now threads a
+  cross-file source resolver (`luabox-cli`'s `check_cmd`, which already
+  holds every project file's source for the length of a run) into the
+  suppression scan: a diagnostic whose primary label belongs to file X is
+  suppression-checked against X's own directives and line index, never the
+  checking file's. A direct `luabox_types::check_file*` caller with no
+  resolver in reach (the LSP, an embedder) now leaves a cross-file
+  diagnostic **unsuppressed** rather than checked against the wrong file —
+  a strict correctness improvement, not merely "no worse" than before.
+
+- **A cross-file `---@class` cycle emitted four `LB0318`s for a two-class
+  cycle, where the identical shape written in one file emits two**
+  (production readiness review G2). Each project file gets its own
+  `TypeEnv` (deliberately — see `build_file_env`'s doc comment), so every
+  file whose own check pass resolves a class caught in an N-file cycle
+  independently rediscovers the *whole* cycle (`TypeEnv::note_cyclic`
+  records every name a cycle reaches, not just the one queried) and reports
+  every member of it, not just its own. `luabox check` now dedupes
+  `LB0317`/`LB0318`/`LB0319` by `(code, primary span, message)` once every
+  project file's diagnostics have converged: the declaration span a given
+  class resolves to is the same regardless of which file's pass emitted the
+  diagnostic pointing at it, so this collapses every file's rediscovery
+  back to the one true diagnostic per class — matching what the identical
+  shape written in a single file already reported. The **message** is in
+  the key because it is the only place a `Diagnostic` retains the class
+  name, and a class with no in-project declaration is attributed to the
+  consuming file at offset `0..0` — the same coordinates whichever class
+  tripped the guard. Keying on the span alone silently dropped the second
+  of two over-budget `[types] defs` classes consumed by one file.
+
+- **A type-mismatch remedy suffix was introduced and withdrawn inside this
+  same block.** Round 3 review F72 had `check_slot` append `" (add `---@type
+  <expected>` to check it)"` to a `LB0300`/`LB0304` message whenever the
+  found type was `unknown`. Round 4 review R12 withdrew it: `slot` there is
+  the mismatching *expression* — a call argument or a `return` value — never
+  the binding `---@type` actually attaches to, so the note pointed at a site
+  the reader cannot annotate; and it fired for return-type mismatches too,
+  where `---@type` is not even the applicable tag (`---@return` is). Net
+  effect on this release: none — the suffix never reached a tagged version,
+  only intermediate builds of this same Unreleased block. Noted here because
+  diagnostic text is observable output a downstream tool can grep, and this
+  one changed twice before anyone outside this PR could see either version.
+
+- **Indexer precedence now follows one measured rule per seam, and a
+  multi-parent merge no longer flips verdicts.** Two distinct rules govern
+  a same-key `---@field [K] V` indexer, and this release makes both explicit
+  after an intermediate build of this block collapsed them into one:
+
+  - **Two unrelated parents** (`---@class C : P1, P2`, each declaring the
+    key independently) resolve **first-listed-wins**, matching `develop`.
+    An intermediate build of this block made it last-wins, which turned a
+    read `develop` accepts into a false reject, and the reversed parent list
+    from a rejection into silence. Both directions are measured against a
+    binary built at the merge base and pinned.
+  - **One ancestor reached twice with different type arguments** (a generic
+    diamond) resolves **last-listed-wins**, matching the rule its `---@field`
+    members already followed, so a class's fields and its indexers cannot
+    disagree about which edge won.
+
+  Separately, a same-key indexer re-declared on one class name across two
+  `---@class` blocks now **dedups first-wins** at both merge seams (in-file
+  and cross-file), matching the `LB0311` first-wins rule for a duplicate
+  `---@field`. Previously both seams simply appended, so one merged class
+  could carry the same key twice and resolve it by scan order.
+
+- **A class inheriting a carrier-attached method (`function Class:method()`)
+  from a same-file parent now resolves it, and the method's own inferred
+  return type now crosses a `require`d project file boundary**
+  (`docs/03-reference/03-class-merge-precedence.md`, findings 1 and 2). Two
+  independent gaps, both fixed:
+
+  - **Same-file inheritance.** `---@class C : P1` where `P1`'s carrier
+    attaches `function T1:m()` in the *same file* used to read `c.m` as a
+    false `LB0306` "undefined field" — even though `m` visibly existed on
+    `P1` — while the identical shape resolved cleanly the moment `P1` moved
+    to its own file. Cross-file consumption already worked because
+    `merge_file_types` folds a class's already-collected carrier-method
+    surface in; same-file did not, because `absorb_block` discarded that
+    same surface — already correctly seeded from this file's own earlier
+    surface pass — every time it (re)declared one of this file's own
+    classes. `absorb_block` now carries a class's already-known methods
+    forward across that declaration instead of discarding them. Every other
+    axis (parents, fields, indexers, operators, visibility) is unaffected —
+    they were already, correctly, re-derived from scratch on every
+    declaration; only `methods`, which nothing else in `absorb_block` ever
+    writes, was silently losing its seeded value.
+  - **Cross-file signature transport.** `f:m()` used to type as `unknown`
+    when `Foo`'s carrier method lived in a different project file than the
+    read, even with zero cross-file duplication to arbitrate — contradicting
+    `ClassDef.methods`'s own doc comment, which promises a carrier method
+    resolves "exactly like `---@field` members" workspace-global. The
+    reifier gated a function's inferred *return* type behind the same flag
+    that (rightly) blocks an unannotated *parameter* from being seeded off
+    call-site argument types — a guess `Display` mode allows and the checker
+    must not (SPEC §19) — even though a body's own inferred return type is a
+    plain deduction, not a call-site guess, and same-file `f:m()` calls
+    already trusted it. A carrier method's inferred return type now survives
+    being published into a class's workspace-global `methods` surface;
+    everything else that flows through the same reifier — `require` exports,
+    inlay display, `: Interface` conformance's carrier fallback — is
+    untouched, so an unannotated free function still does not leak its
+    inferred signature across a `require` boundary.
+
+  Both are narrowing fixes for code that leaned on the old false negative:
+  a same-file class inheriting a carrier method it previously couldn't see,
+  or a cross-file carrier-method call whose mistyped argument previously
+  passed silently as `unknown`, may now report a real `LB0306`/`LB0300`.
+
+- **Two more class-merge precedence rules now agree with the rest of the
+  matrix instead of contradicting it, and duplicate `---@operator` overloads
+  dedupe the same way regardless of which file they repeat in**
+  (`docs/03-reference/03-class-merge-precedence.md`, findings 3 and 4). Both
+  are behaviour changes for a project relying on the old, undocumented
+  order:
+
+  - **`---@operator` diamond conflicts now resolve last-visited-edge-wins**,
+    matching `---@field` and indexer for the identical shape (one ancestor
+    reached twice through a generic diamond with conflicting type
+    arguments, e.g. `A : Base<number>`, `B : Base<string>`, `C : A, B`).
+    Previously the *first*-visited edge won — the opposite of field/indexer
+    — an artifact of operators being resolved by a first-match scan (#114)
+    rather than an overwrite, never stated as a rule anywhere. A project
+    whose diamond-conflicting classes disagree on an operator's result type
+    will see that operator's result flip to the other candidate.
+  - **Visibility's unrelated-parents shape now resolves first-listed-
+    parent-wins**, matching indexer and operator for the identical shape
+    (`---@class C : P1, P2`, both declaring conflicting visibility on the
+    same member name). Previously it resolved *last*-listed-parent-wins, via
+    a third, independent mechanism (`walk_ancestor_names`'s LIFO ancestor
+    stack) that disagreed with both. A project with such a class will see
+    the enforced scope switch to the first-listed parent's — a member that
+    read as public because a later, unrestricted parent won may now report
+    `LB0312`, and vice versa.
+  - **A duplicate `---@operator` overload, byte-identical to one already on
+    the class, now dedupes the same way whether the repeat is in the same
+    file or a different one.** The cross-file seam
+    (`TypeEnv::merge_file_types`) already deduped an identical repeat; the
+    same-file seam (`TypeEnv::absorb_block`) did not, so a literal
+    copy-paste of one `---@operator` tag onto a second `---@class` block for
+    the same name kept two identical entries where the cross-file
+    equivalent kept one. Never observable as a different resolved *result*
+    (a repeat identical to the winning entry cannot change which signature
+    the first-match scan finds), so this is a representation fix, not a
+    verdict change.
+
+- **A class inheriting one member from two unrelated parents now resolves it
+  to the *first*-listed parent's type, not the second's — a luals-parity
+  correction, not a self-consistency one**
+  (`docs/03-reference/03-class-merge-precedence.md`, finding 6). Unlike this
+  section's other class-merge findings, which were only ever checked against
+  luabox's own prior binary, this one was checked against
+  lua-language-server 3.13.5's own source (`script/vm/compiler.lua:369-375`,
+  gated by `copyToSearched` at lines 424/510) and confirmed by direct
+  measurement: swapping a class's parent order in the pinned luals binary
+  flips which parent's type it enforces, and the first-listed parent always
+  wins. luabox previously resolved `---@class C : P1, P2` to the
+  **last**-listed parent's type for both a plain `---@field` and a
+  carrier-attached method, and `docs/03-reference/02-limitations.md`
+  defended that as an intentional asymmetry against indexer/operator/
+  visibility's first-listed rule for the identical shape. That defence was
+  reasoned from luabox's own code comments, never from luals, and it was
+  backwards: luals has exactly one rule for this shape, first-listed-wins,
+  applied uniformly across every member kind that inherits at all. Both
+  seams now agree with it.
+
+  **This is a verdict-changing narrowing *and* widening, depending on which
+  parent a call site was written against** — a user whose
+  class inherits one member from two parents now gets the first parent's
+  type where they previously got the second's. A call site written against
+  the (previously winning) second parent's type may now report `LB0300`;
+  a call site written against the first parent's type, previously rejected,
+  may now go clean. Every member kind that resolves an inheritance shape at
+  all — field, carrier method, indexer, operator (as a luabox extension,
+  see below), and visibility — agrees on first-listed-wins for this shape
+  after this change; before it, field and method were the two odd ones out.
+
+- **Corrected an unfounded parity claim: luabox's inherited-`---@operator`
+  precedence never matched anything in lua-language-server, because luals
+  does not inherit operators through `: Parent` at all.**
+  `docs/03-reference/03-class-merge-precedence.md`'s operator table
+  described the unrelated-parents/diamond-identical/diamond-conflicting
+  rows as "matching field/indexer for the identical shape," which read as a
+  parity claim. It was not one: `vm.runOperator`
+  (`script/vm/operator.lua:101-120`) reads only a value's *own* class's
+  operators and never `set.extends`, confirmed by measurement (a subclass
+  inheriting its only operator-declaring ancestor's `---@operator add`
+  produces no diagnostic on either operand in luals, while the same class
+  declaring and using the operator itself flags correctly). Inherited
+  operators are a real, deliberate **luabox extension beyond luals 3.13.5**,
+  not a bug and not a parity gap — but the docs now say so plainly, with the
+  source citation, instead of implying a reference behaviour that does not
+  exist. No behaviour changed in this entry; only the claim did. Inherited
+  operator precedence itself was modelled on the same (now-corrected) field
+  rule finding 6 found backwards, so it is flagged in the docs as deserving
+  its own review — not addressed here.
+
+- **A bare reference to a generic ancestor no longer leaks its unbound type
+  parameter's literal name into `LB0300` text**
+  (`docs/03-reference/03-class-merge-precedence.md`, finding 5). `---@class
+  Sub : Base` naming a generic `Base` without `<...>` left `Base`'s own
+  parameter free, exactly as documented — but every same-file diagnostic
+  that named the free parameter's *type* printed its literal spelling
+  (`found T`, `expected member item of type T`) rather than `unknown`: a
+  type variable the reader can neither name nor produce, in a message that
+  therefore pointed at no action. This is the identical shape the #56
+  export-seam fix above already solved at the `require` boundary — reused
+  here rather than re-invented: a field read, an `ipairs`/indexer read, a
+  `: Parent` conformance obligation, and a table-literal's expected shape
+  now each read a bare ancestor's unbound parameter as `unknown`, matching
+  what a bare `Box` reference and a `require`d export already print. The
+  obligation itself is unaffected — a `: Parent` conformance check and a
+  table-literal's missing-field check still decide *whether* a member is
+  required from the parameter's real (unerased) type; only the *displayed*
+  type of an already-detected mismatch or a genuinely missing member is
+  substituted, so this is a diagnostic-text fix, not a verdict change.
+
+- **Inlay hints and hover no longer lose a require'd carrier's member types.**
+  Introduced and fixed inside this same block: when the export seam started
+  reifying against the merged project ambient, the *display*-mode queries
+  (`module_export`, `binding_types`) were left reading the defs-only ambient,
+  so a binding whose class is declared in another file silently rendered
+  `unknown` in the editor while `luabox check` typed it correctly — the exact
+  editor/CI divergence #56 exists to close. Both queries now merge project
+  types, pinned by a cross-file fixture.
+
+- **A member covered only by a declared indexer now hovers.** `---@field
+  [string] fun(): string` on a class made `h.anything` legal to the checker
+  but gave the editor nothing to show; hover now falls back to the member's
+  erased type instead of declining, matching the leniency rule the checker
+  already applied.
+
+- **A generic `---@class` carrier no longer exports its unbound type
+  parameter.** `---@class Box<T>` crossing a `require` handed the consumer
+  members typed `T` — a type variable it can neither name nor produce, so
+  `expected number, found T` pointed at no action. The export now carries the
+  same monomorphised template a bare `Box` reference lowers to: the unbound
+  parameter reads `unknown`, and `---@type Box<number>` on the binding — the
+  annotation that does bind it — types the members. The verdict is unchanged
+  either way; the diagnostic is what changed. Two parity-corpus rows now cover
+  a generic class crossing `require` in both directions.
+
+  The parameter need not be the carrier's own: a class inheriting `---@field
+  item U` from `---@class Base<U>` leaked `U` the same way. One rule now owns
+  the seam — every type parameter in scope for the resolved shape is
+  substituted, and the export crosses as the class name only when that
+  substitution changes nothing.
+
+- **A `---@class Sub : Base<number>` binds its parent's type parameter.** The
+  arguments on a parent reference were dropped when the declaration was
+  lowered — only the parent's *name* was kept — so an inherited `---@field
+  item U` stayed `U` no matter what the child bound it to: `Sub.item` typed
+  as an unbound parameter, and `: Base<number>` reported `LB0300` against its
+  own declared parent (`missing member item of type U`). Parent arguments are
+  now lowered and bound where the class members merge, at every level of the
+  chain (`---@class Mid<M> : Slot<M>` passes its own parameter up), so
+  `Sub.item` is `number`, the conformance obligation is stated in the child's
+  vocabulary, and the class keeps the #56 export identity because it has
+  nothing unbound left. A parent named *without* arguments (`: Base`) still
+  leaves its parameters free, as a bare reference always has. Reference-site
+  monomorphisation (`Cell<number>`) stays shallow by design (#84).
 
 - **A generic `---@class`'s type parameters are scoped to the declaration that
   writes them.** Two declarations of one generic class may spell the parameter
@@ -70,13 +744,19 @@ spelled out in [RELEASING.md](docs/02-guides/01-releasing.md#semver-policy-for-0
 - **The `---@class` module-export edge is written out where the other
   editor/CI edges are.** The disclosure lived only in `README.md`, and it was
   inaccurate: it described a class *carrier* module as hovering "as the class
-  name" with CI "still checking" its members. Measured, the carrier spelling
-  hovers as the structural table the carrier is, and CI does not enforce it
-  either — `p.x` crosses the boundary as `unknown` and `p.nope` is accepted.
-  The class *instance* spelling is the one where the editor is narrower than
-  CI. Both rows are now in `docs/03-reference/02-limitations.md` as a measured
-  table, pinned by fixtures on both sides, and the `requires.rs` doc comment
-  that made the same claim is corrected to match (refs #54).
+  name" with CI "still checking" its members. Measured at the time, the
+  carrier spelling hovered as the structural table the carrier is, and CI did
+  not enforce it either — `p.x` crossed the boundary as `unknown` and `p.nope`
+  was accepted. The class *instance* spelling was the one where the editor was
+  narrower than CI. Both rows are now in `docs/03-reference/02-limitations.md`
+  as a measured table, pinned by fixtures on both sides, and the `requires.rs`
+  doc comment that made the same claim is corrected to match (refs #54).
+
+  **Superseded within this same Unreleased block**: the #56 entry above closes
+  that edge — a carrier export now crosses as the class and CI does enforce
+  its members, so the measurement recorded here describes the behaviour this
+  release changes, not the behaviour it ships. The limitations table it points
+  at has been flipped to match.
 
 - **Hover and completion on a `require` binding now use the type pass's
   answer.** `local m = require("mod")` hovered `unknown` while `luabox check`

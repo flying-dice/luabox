@@ -1021,6 +1021,39 @@ fn harvest_attaches_blocks_to_statements() {
 }
 
 #[test]
+fn a_doc_block_opening_the_file_still_finds_its_target_after_a_bom_or_shebang() {
+    // `resolve_target`'s backward scan looks for "the real token before this
+    // doc-comment block" to decide leading-vs-trailing; a leading BOM or `#!`
+    // line is trivia (`SyntaxKind::is_file_prefix`) but was not treated as
+    // such here, so when a doc block opens the file right after one, the
+    // scan found the BOM/shebang token itself, read it as "a real token with
+    // no blank line before it", and misclassified the block as a *trailing*
+    // comment on the (nonexistent) statement containing byte 0 — `target`
+    // came back `None` instead of the following statement. Silent: no parse
+    // error, no diagnostic — just a class/field block that never links to
+    // its carrier statement, which is what let a BOM'd file's exported
+    // carrier lose its class identity at the `require` boundary two layers
+    // up (luabox-types' `record_class_carrier`/`reify_export`).
+    let plain = "---@class Animal\n---@field name string\nlocal M = {}\nreturn M\n";
+    let with_bom = format!("\u{feff}{plain}");
+    let with_shebang = format!("#!/usr/bin/env lua\n{plain}");
+
+    for src in [plain, &with_bom, &with_shebang] {
+        let parse = lua_parse(src, Dialect::Lua54);
+        assert_eq!(parse.errors(), &[], "fixture must parse cleanly: {src:?}");
+        let items = harvest(&parse);
+        assert_eq!(items.len(), 1, "one doc block: {src:?}");
+        let target = items[0]
+            .target
+            .unwrap_or_else(|| panic!("block must find its target statement: {src:?}"));
+        assert!(
+            src[target.start..target.end].starts_with("local M"),
+            "target must be the carrier statement, not `None`: {src:?}"
+        );
+    }
+}
+
+#[test]
 fn harvest_empty_when_no_doc_comments() {
     let parse = lua_parse("local x = 1\n-- plain\nreturn x\n", Dialect::Lua54);
     assert!(harvest(&parse).is_empty());

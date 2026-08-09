@@ -9,6 +9,13 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/flying-dice/luabox"
 rust-version = "1.92"
+# Nothing here publishes to a registry (docs/02-guides/01-releasing.md:
+# releases are GitHub Release artifacts), and these crates' APIs move with
+# the binary — `hover`/`completion` gained a required merged-ambient
+# parameter in this release alone. Saying so in the manifest is the guard:
+# a `cargo publish` from a release script or a stray `--workspace` run
+# fails here instead of pinning a shape nobody committed to keeping.
+publish = false
 
 [workspace.dependencies]
 # Intra-workspace (bounded contexts — see SPEC.md §16; luabox-diag is a

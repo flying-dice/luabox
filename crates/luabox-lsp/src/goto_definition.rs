@@ -12,25 +12,34 @@ use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
 use lsp_types::{Location, Position, Range};
+use luabox_db::Analysis;
 use luabox_hir::Resolution;
 use luabox_syntax::lua::Dialect;
 use luabox_syntax::lua::SyntaxKind;
 use luabox_syntax::lua::ast::{self, AstNode};
 use rowan::{TextRange, TextSize};
 
-use crate::sema::FileSema;
+use crate::merged_ambient::MergedAmbient;
+use crate::requires::{self, RequireExports};
+use crate::sema::{self, FileSema};
 use crate::uri::path_to_uri;
 
 /// Compute the definition location for the symbol at `offset`.
 /// `project_root` anchors `require` module resolution, and `dialect` — the
 /// project's edition — selects the `lua_modules/share/lua/<X.Y>/` version
-/// directory of a luarocks tree.
+/// directory of a luarocks tree. `analysis`, `exports` and `ambient` back
+/// the member route (#54): the same shared `require` resolution and merged
+/// workspace environment hover, completion and signature help resolve a
+/// receiver's class through (#56).
 #[must_use]
 pub fn definition(
     sema: &FileSema,
     offset: usize,
     project_root: &Path,
     dialect: Dialect,
+    analysis: &Analysis,
+    exports: &RequireExports,
+    ambient: &MergedAmbient,
 ) -> Option<Location> {
     // 1. `require("mod")` → the module file, resolved through the bundler's
     //    shared candidate search (project root, `src/`, then `lua_modules/`).
@@ -45,7 +54,7 @@ pub fn definition(
     let token = sema.ident_at(offset)?;
 
     // 2. Field / method member → the `---@field` annotation site.
-    if let Some(location) = member_definition(sema, &token) {
+    if let Some(location) = member_definition(sema, &token, analysis, exports, ambient) {
         return Some(location);
     }
 
@@ -80,7 +89,30 @@ pub fn definition(
 
 /// `recv.field` / `recv:method` → the `@field` tag span of the receiver's
 /// class, or a dotted function's declaration site.
-fn member_definition(sema: &FileSema, token: &luabox_syntax::lua::SyntaxToken) -> Option<Location> {
+///
+/// The receiver's class reference is resolved through the workspace ambient
+/// (#56, via [`requires::receiver_type`]) — declared in this file or any
+/// other, bound against its own type arguments exactly as the checker binds
+/// the same reference (#48) — so the existence check agrees with
+/// hover/completion/signature help (#46, #47, #50). A field's *existence*
+/// never depends on which concrete type a generic parameter was bound to
+/// (`item: T` is there whether `T` is bound to `number` or left free), so
+/// #48 changes nothing observable here — routed through
+/// [`crate::merged_ambient::MergedAmbient::class_members_of`] anyway, so a
+/// future divergence between the bound and unbound shapes cannot open one.
+/// The declaration site itself is then located by class *name* with
+/// [`sema::locate_field`] (#54), which searches every project file's own
+/// `---@field` annotations and walks the parent chain across files: the
+/// merged ambient's shape has no span or file to jump to, only a type, and
+/// a `---@field` tag's location does not depend on the reference's bound
+/// argument either.
+fn member_definition(
+    sema: &FileSema,
+    token: &luabox_syntax::lua::SyntaxToken,
+    analysis: &Analysis,
+    exports: &RequireExports,
+    ambient: &MergedAmbient,
+) -> Option<Location> {
     let parent = token.parent()?;
     let (receiver, member) = match parent.kind() {
         SyntaxKind::FIELD_EXPR => {
@@ -107,22 +139,41 @@ fn member_definition(sema: &FileSema, token: &luabox_syntax::lua::SyntaxToken) -
     let recv_token = recv_name.name()?;
     let recv_offset = usize::from(recv_token.text_range().start());
 
-    if let Some(class) = sema.class_of_name(recv_token.text(), recv_offset) {
-        let fields = sema.class_fields(&class);
-        let (field, _) = fields.into_iter().find(|(f, _)| {
-            matches!(&f.key, luabox_syntax::luacats::FieldKey::Name(n) if n == member.text())
-        })?;
-        let span = field.span;
+    if let Some(binding) = sema.visible_binding_named(recv_token.text(), recv_offset)
+        && let Some(ty) = requires::receiver_type(sema, exports, binding)
+        && let Some(class) = sema::named_of(&ty)
+        && ambient.class_members_of(&ty).is_some_and(|shape| {
+            shape.fields.contains_key(member.text())
+                || !shape.indexers.is_empty()
+                || shape.array.is_some()
+        })
+        && let Some(found) = sema::locate_field(
+            analysis,
+            &sema.path,
+            &class,
+            member.text(),
+            ambient.ambient_paths(),
+            ambient.sema_cache(),
+            ambient.search_order_cache(),
+        )
+    {
+        let span = found.span;
         let range = TextRange::new(
             TextSize::new(u32::try_from(span.start).ok()?),
             TextSize::new(u32::try_from(span.end).ok()?),
         );
-        if let Some(redirect) = source_redirect(sema, range) {
+        let field_sema = if found.path == sema.path {
+            None
+        } else {
+            FileSema::new(analysis, &found.path)
+        };
+        let target = field_sema.as_ref().unwrap_or(sema);
+        if let Some(redirect) = source_redirect(target, range) {
             return Some(redirect);
         }
         return Some(Location {
-            uri: path_to_uri(&sema.path),
-            range: sema.index.range(span.start..span.end),
+            uri: path_to_uri(&found.path),
+            range: target.index.range(span.start..span.end),
         });
     }
 
@@ -263,6 +314,7 @@ mod tests {
 
     fn analyze(files: &[(&str, &str)]) -> (Analysis, PathBuf) {
         let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
+        host.set_root(root());
         let mut first = None;
         for (rel, text) in files {
             let path = root().join(rel);
@@ -285,16 +337,64 @@ mod tests {
         text[from..].find(needle).expect("occurrence") + from
     }
 
+    /// Goto-definition at the `nth` occurrence of `needle` in `files`' first
+    /// file, with `exports`/`ambient` built exactly as the server builds
+    /// them (#54, #56).
+    fn at_files(files: &[(&str, &str)], needle: &str, nth: usize) -> Option<Location> {
+        let src = files[0].1;
+        let (analysis, path) = analyze(files);
+        let sema = FileSema::new(&analysis, &path).expect("sema");
+        let exports =
+            RequireExports::resolve(&analysis, &path, &luabox_types::RockSurfaces::default());
+        let base = luabox_types::stdlib_defs(luabox_syntax::lua::Dialect::Lua54);
+        let ambient = MergedAmbient::build(base, &analysis.project_types(), &[]);
+        definition(
+            &sema,
+            offset_of(src, needle, nth),
+            &root(),
+            Dialect::Lua54,
+            &analysis,
+            &exports,
+            &ambient,
+        )
+    }
+
     /// Goto-definition at the `nth` occurrence of `needle` in the first file.
     fn at(src: &str, needle: &str, nth: usize) -> Option<Location> {
-        let (analysis, path) = analyze(&[("main.lua", src)]);
-        let sema = FileSema::new(&analysis, &path).expect("sema");
-        definition(&sema, offset_of(src, needle, nth), &root(), Dialect::Lua54)
+        at_files(&[("main.lua", src)], needle, nth)
     }
 
     /// The `(line, character)` start of a location.
     fn start_of(location: &Location) -> (u32, u32) {
         (location.range.start.line, location.range.start.character)
+    }
+
+    /// M2 (round 6 review): goto-definition's target must agree with
+    /// hover's type and description on the same precedence winner — the
+    /// review's own repro (`hover.rs`'s
+    /// `hovers_type_and_description_agree_on_the_precedence_winner` pins
+    /// the other two). `locate_field`'s parent-chain walk used to be
+    /// breadth-first, which could land on `B`'s `---@field f` (line 3) even
+    /// though the checker's own depth-first merge resolves `X`'s (line 1).
+    #[test]
+    fn goto_definition_agrees_with_hovers_precedence_winner() {
+        let src = "\
+---@class X
+---@field f string the f from X
+---@class B
+---@field f number the f from B
+---@class A : X
+---@class C : A, B
+
+---@type C
+local c = nil
+print(c.f)
+";
+        let location = at(src, "f)", 0).expect("definition");
+        assert_eq!(
+            location.range.start.line, 1,
+            "must land on X's own `---@field f` (line 1), not B's (line 3): {location:?}"
+        );
     }
 
     #[test]
@@ -339,6 +439,78 @@ g:greet()
         let location = at(src, "greet()", 0).expect("definition");
         // The `---@field greet` tag site on line 1.
         assert_eq!(location.range.start.line, 1);
+    }
+
+    // === the workspace ambient reaches goto-definition too (#54) ==========
+    //
+    // Hover now names `Point.x` for a cross-file member (#46); goto-def used
+    // to stay silent for the identical receiver, because it only ever
+    // resolved through `class_of_name` — file-local. `locate_field` gives it
+    // the same cross-file, parent-chain-aware reach hover and completion
+    // already have.
+
+    #[test]
+    fn a_method_call_on_a_class_declared_in_another_file_jumps_to_its_field_tag() {
+        let files = [
+            ("main.lua", "---@type Greeter\nlocal g = nil\ng:greet()\n"),
+            (
+                "other.lua",
+                "---@class Greeter\n---@field greet fun(self: Greeter): string\n",
+            ),
+        ];
+        let location = at_files(&files, "greet()", 0).expect("definition");
+        assert!(location.uri.as_str().ends_with("other.lua"), "{location:?}");
+        assert_eq!(location.range.start.line, 1);
+    }
+
+    /// The cross-file inheritance shape (#46's fixture): the field is
+    /// declared on a *parent* class living in a third file.
+    #[test]
+    fn a_member_inherited_from_a_parent_in_another_file_jumps_to_the_parent() {
+        let files = [
+            (
+                "main.lua",
+                "---@class Sub : Base\n---@field name string\n\n---@type Sub\nlocal s = nil\nprint(s.id)\n",
+            ),
+            ("base.lua", "---@class Base\n---@field id number\n"),
+        ];
+        let location = at_files(&files, "id)", 0).expect("definition");
+        assert!(location.uri.as_str().ends_with("base.lua"), "{location:?}");
+    }
+
+    /// Probing the other direction: a member neither class declares still
+    /// has no definition once cross-file resolution is wired in.
+    #[test]
+    fn a_member_no_cross_file_ancestor_declares_has_no_definition() {
+        let files = [
+            ("main.lua", "---@type Greeter\nlocal g = nil\ng:nope()\n"),
+            (
+                "other.lua",
+                "---@class Greeter\n---@field greet fun(self: Greeter): string\n",
+            ),
+        ];
+        assert!(at_files(&files, "nope()", 0).is_none());
+    }
+
+    // === a bound generic reference still agrees with the checker (#48) ====
+    //
+    // A field's existence does not depend on which type a generic parameter
+    // is bound to, so a bound receiver must jump exactly like an unbound
+    // one — this is the "does not open a new divergence" probe for
+    // goto-definition, alongside the type-rendering probes in `hover.rs`,
+    // `completion.rs`, and `signature_help.rs`.
+
+    #[test]
+    fn a_bound_generic_receivers_member_still_jumps_to_its_field_tag() {
+        let files = [
+            (
+                "main.lua",
+                "---@type Box<number>\nlocal b = nil\nprint(b.item)\n",
+            ),
+            ("box.lua", "---@class Box<T>\n---@field item T\n"),
+        ];
+        let location = at_files(&files, "item)", 0).expect("definition");
+        assert!(location.uri.as_str().ends_with("box.lua"), "{location:?}");
     }
 
     #[test]

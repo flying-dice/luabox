@@ -166,7 +166,11 @@ enforced.
 Every remaining gap is
 documented honestly in
 [**LIMITATIONS.md**](docs/03-reference/02-limitations.md). Read it before you rely on luabox for
-anything load-bearing.
+anything load-bearing. Where two `---@class` declarations for one name
+disagree — two blocks, two files, or two parents — the winner is tabulated
+per member kind in the
+[class-merge precedence matrix](docs/03-reference/03-class-merge-precedence.md),
+including which cells lua-language-server agrees with.
 
 ---
 
@@ -291,17 +295,18 @@ it against (#54): `local m = require("rock")` shows the module's export
 type, `m.helper` shows that member's, and `m.` offers the members. Two
 things are `unknown` on both sides, by design rather than by omission — a
 dynamic `require(name)`, and `require("a") or require("b")`, name no module
-statically. A module whose export is a `---@class` is the one shape that
-does not fully close, in both of its spellings: the class's fields are
-declared in the module's own file, beyond the reach of the editor's
-per-file view, so the module's members get no hover and no completion
-either way. What is left of the binding differs between the two, and the
-difference is measured rather than assumed — a class *instance* export
-still hovers as the class name while `luabox check` fully enforces it; a
-class *carrier* export hovers as the structural table the carrier is, which
-is also all CI gets. Both are written out side by side in
+statically. A module whose export is a `---@class` closes too, in both of
+its spellings (#56): the export crosses the `require` boundary as the class
+it carries, and hover and completion resolve the class's members through
+the same merged ambient environment `luabox check` enforces — so a carrier
+or instance export hovers as the class name, its members hover with their
+declared types, completion offers them, and CI rejects what neither
+declares. One shape is excepted, in the editor and in CI alike: a **generic**
+class (`---@class Box<T>`) has no name that carries its type arguments, so it
+crosses as a structural template — its declared members type correctly, but
+an undeclared one is accepted rather than rejected. The measured rows are in
 [Known limitations](docs/03-reference/02-limitations.md). Naming the class
-directly (`---@param p Point`) enforces it on both sides — class names are
+directly (`---@param p Point`) is equivalent — class names are
 workspace-global, so the `require` is not what carries the type.
 
 Surfaces only — a vendored body is never typechecked. A type error inside a

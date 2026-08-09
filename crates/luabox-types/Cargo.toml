@@ -2,6 +2,7 @@
 name = "luabox-types"
 description = "luabox: unified type IR (LuaCATS ⊕ shapes) and inference engine (Semantics context)"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -14,6 +15,9 @@ rust-version.workspace = true
 luabox-hir.workspace = true
 luabox-syntax.workspace = true
 luabox-diag.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true

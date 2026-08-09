@@ -41,6 +41,45 @@ fn none() -> Vec<String> {
     Vec::new()
 }
 
+// --- `---@type fun(…)` attaches the signature to the assigned name --------
+//
+// The other half of the statement (#38, #58 mutation audit): beyond checking
+// the initializer, a `---@type fun(…)` over `NAME = function` registers the
+// signature under the TARGET'S name so calls to it are argument-checked.
+// The declaration half above cannot fail if the attachment silently no-ops,
+// mis-names the target, or drops one target shape — only call-site probes
+// can, one per target arm (dotted field, plain global).
+
+#[test]
+fn typed_function_field_assignment_checks_calls_by_the_dotted_name() {
+    let src = "\
+local M = {}
+---@type fun(n: number): string
+M.f = function(n) return \"s\" end
+local x = M.f(\"not a number\")
+return M
+";
+    assert_eq!(codes(src), vec!["LB0300"]);
+    let clean = "\
+local M = {}
+---@type fun(n: number): string
+M.f = function(n) return \"s\" end
+local x = M.f(1)
+return M
+";
+    assert_eq!(codes(clean), none());
+}
+
+#[test]
+fn typed_function_global_assignment_checks_calls_by_the_plain_name() {
+    let src = "\
+---@type fun(n: number): string
+handler = function(n) return \"s\" end
+local x = handler(\"not a number\")
+";
+    assert_eq!(codes(src), vec!["LB0300"]);
+}
+
 // --- the annotation is enforced on a field assignment ---------------------
 
 #[test]
