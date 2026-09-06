@@ -1,6 +1,6 @@
 # Status
 
-**Updated:** 2026-09-06 11:40 UTC · **Integration branch:** `develop` @ `1f0194e` · **Release branch:** `main` @ `75e8d66` · **Owner:** Starscream (Seekers)
+**Updated:** 2026-09-06 12:05 UTC · **Integration branch:** `develop` @ `1f0194e` · **Release branch:** `main` @ `75e8d66` · **Owner:** Starscream (Seekers)
 
 Radiator for the working project. Tracker of record is GitLab `origin`
 (decision 14); milestones in [docs/bots/ROADMAP.md](docs/bots/ROADMAP.md);
@@ -76,11 +76,13 @@ for the owner.
 
 ## Blockers
 
-- **#85 — the CI runner is out of disk (owner action).** Every untagged job
-  lands on runner 3; `.gitlab-ci.yml`'s per-job `target-<job>` caches live on
-  that one host with nothing evicting them. Jobs 28833/28838 on MR !4 died with
-  `No space left on device`; MR !2's `coverage-unit` and MR !5's pipeline share
-  the host. Until it is pruned, red pipelines are infra, not the change.
+- **#85 — the CI runner's disk cannot hold the cache design.** Pruned once;
+  refilled within 15 minutes with four pipelines restoring per-job
+  `target-<job>` caches (20271: jobs 28963/28965/28967 `No space left`). Owner
+  decision 2026-09-06: change the pipeline. Thundercracker is producing the
+  MR (one shared target cache per RUSTFLAGS profile, none on one-shot jobs;
+  decision 15). Until it merges, red pipelines on this host are infra, not the
+  change — !2 got a green run (20260) in the window after the prune.
 - The `shutdown_windows` timeouts are a fixed 10s wall-clock bound
   (`crates/luabox-lsp/tests/shutdown_windows.rs:56`) that fails only under
   CI-scale load — #84, backlog, not a regression.
