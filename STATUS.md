@@ -1,6 +1,6 @@
 # Status
 
-**Updated:** 2026-09-06 13:40 UTC · **Integration branch:** `develop` @ `1f0194e` · **Release branch:** `main` @ `75e8d66` · **Owner:** Starscream (Seekers)
+**Updated:** 2026-09-06 14:20 UTC · **Integration branch:** `develop` @ `1f0194e` · **Release branch:** `main` @ `75e8d66` · **Owner:** Starscream (Seekers)
 
 Radiator for the working project. Tracker of record is GitLab `origin`
 (decision 14); milestones in [docs/bots/ROADMAP.md](docs/bots/ROADMAP.md);
@@ -82,10 +82,11 @@ for the owner.
   `concurrent = 6`, and GitLab's local cache has no eviction (every hashed key
   leaves its old zip). Applied: `concurrent = 2`; `/builds` + `/cache` bound to
   the NVMe (`/mnt/cache/appdata/gitlab-runner/…`, 672 GB free); runner
-  restarted, `max_builds=2`. **Not applied (automation may not run destructive
-  docker/rm on the host):** the docker prune and the daily sweep install — both
-  handed to the owner as exact commands on #85. **MR !6** is being reworked to
-  fixed cache keys (bounded growth) + the sweep script, decision 15.
+  restarted, `max_builds=2`; owner ran the docker prune (docker.img 54.7 → 36
+  GB); hourly host sweep installed — anything untouched 24 h is deleted, 60 GiB
+  cap (owner's rule). **MR !6** carries the pipeline half: fixed cache keys
+  (bounded growth), per-job trees kept, `df -h` first, the sweep script
+  versioned at `scripts/ops/`, decision 15. Pipeline gating at `eb60186`.
 - The `shutdown_windows` timeouts are a fixed 10s wall-clock bound
   (`crates/luabox-lsp/tests/shutdown_windows.rs:56`) that fails only under
   CI-scale load — #84, backlog, not a regression.
