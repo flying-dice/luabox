@@ -368,6 +368,93 @@ return {{ B, M }}
     );
 }
 
+/// The shape that decides which rule LB0321 is actually following: a parent
+/// name that reads fine, an unreadable type argument, and a *wrapper* around
+/// the pair — `Base<?>?`, `Base<?>[]`, `(Base<?>)`.
+///
+/// The stop-at-a-name rule was first written to look through `?`, `[]` and
+/// parens on the premise that a name under a wrapper is still the parent. It
+/// is not. The controls below measure that directly: `: Base` inherits `b`
+/// (LB0300, ancestry enforced), while `: Base?`, `: Base[]`, `: (Base)` and
+/// `: Base|Base` each leave `A` with no members at all — LB0306 at the read,
+/// byte-identical to a header with no extends list. A wrapped entry
+/// contributes no parent, so the note ("the entry is ignored") holds of it,
+/// and an unreadable token inside one is this finding. Looking through the
+/// wrapper silenced all three shapes, which `1b544a5` reported (review of !2,
+/// `6f03acd`).
+#[test]
+fn a_wrapper_around_a_name_is_not_a_parent_so_an_error_under_one_is_reported() {
+    /// The fixture with a *read* of the inherited member: LB0300 means the
+    /// parent was wired and ancestry is enforced, LB0306 means it was dropped.
+    /// Without the read, the two are indistinguishable at the header.
+    fn fixture(extends: &str) -> String {
+        format!(
+            "\
+---@class Base
+---@field b number
+local B = {{}}
+
+---@class A{extends}
+local M = {{}}
+
+---@type A
+local a
+print(a.b)
+return {{ B, M, a }}
+"
+        )
+    }
+
+    let dropped = codes(&fixture(""), Strictness::Strict);
+    assert_eq!(
+        dropped,
+        vec!["LB0306".to_string()],
+        "no extends list: nothing is inherited, so the read of `b` is undefined",
+    );
+    assert_eq!(
+        codes(&fixture(" : Base"), Strictness::Strict),
+        vec!["LB0300".to_string()],
+        "the well-formed control: the parent is wired and `b` is inherited",
+    );
+
+    // One variable per row: the same readable name, one wrapper applied to it.
+    // Every one of them measures like *no extends list*, not like `: Base`.
+    for wrapped in [" : Base?", " : Base[]", " : (Base)", " : Base|Base"] {
+        assert_eq!(
+            codes(&fixture(wrapped), Strictness::Strict),
+            dropped,
+            "`{wrapped}` must measure like no extends list — a wrapper \
+             contributes no parent, so the name inside it is not one",
+        );
+    }
+
+    // Therefore: wrapper + unreadable type argument is an entry that names no
+    // parent *and* contains a token the parser could not read — exactly what
+    // LB0321 is for. `Base|?`, which the `_` arm already reports, is the
+    // control they must match.
+    let union_control = codes(&fixture(" : Base|?"), Strictness::Strict);
+    assert_eq!(
+        union_control,
+        vec!["LB0306".to_string(), "LB0321".to_string()],
+    );
+    for wrapped in [" : Base<?>?", " : Base<?>[]", " : (Base<?>)"] {
+        assert_eq!(
+            codes(&fixture(wrapped), Strictness::Strict),
+            union_control,
+            "`{wrapped}` drops its parent and carries an unreadable token — \
+             it must be reported, like the union shape",
+        );
+    }
+
+    // And the rule it must not undo: no wrapper, so the name at the root IS
+    // the parent, and the unreadable argument is a separate axis.
+    assert_eq!(
+        codes(&fixture(" : Base<?>"), Strictness::Strict),
+        vec!["LB0300".to_string()],
+        "`Base<?>` heads with a name at the root: parent wired, no LB0321",
+    );
+}
+
 /// One variable per control: the same header, the same undeclared parent, no
 /// trailing comma. `LB0305` stays; `LB0321` must not appear.
 #[test]
