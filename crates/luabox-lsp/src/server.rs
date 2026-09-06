@@ -5219,6 +5219,39 @@ return use
         );
     }
 
+    /// An empty batch carries no edit at all, so it is a legal no-op rather
+    /// than the "no base text" case the ranged-and-unopened guard above logs
+    /// a warning for — nothing to splice, nothing to warn about.
+    #[test]
+    fn an_empty_did_change_batch_on_an_unopened_document_is_silent() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("never_opened.lua");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": uri.to_string(), "version": 2 },
+                    "contentChanges": [],
+                }),
+            })
+            .expect("an empty didChange batch is not fatal");
+
+        let messages = drain(&client);
+        assert!(
+            published_diagnostics(&messages, &uri).is_none(),
+            "an empty batch has nothing to publish: {messages:?}"
+        );
+        assert!(
+            server.host.snapshot().file_text(&path).is_none(),
+            "and it must not invent the document in the host either"
+        );
+        assert!(
+            log_messages(&messages).is_empty(),
+            "a legal no-op must not be logged as though it were: {messages:?}"
+        );
+    }
+
     /// The other shape carries the whole document, so it needs no base text
     /// — a client that syncs in full mode, or replaces the buffer wholesale,
     /// still works on a document the server has not seen. The guard is about
