@@ -1,6 +1,9 @@
 # Status
 
-**Updated:** 2026-09-06 12:50 UTC (host clock) · **Integration branch:** `develop` @ `1f0194e` · **Release branch:** `main` @ `75e8d66` · **Owner:** Starscream (Seekers)
+**Updated:** 2026-09-06 15:20 UTC · **Integration branch:** `develop` · **Release branch:** `main` · **Owner:** Starscream (Seekers)
+
+SHAs are not pinned here — the tracker and `git log` are authoritative; this file
+carries states and measurements with the pipeline id that produced them.
 
 Radiator for the working project. Tracker of record is GitLab `origin`
 (decision 14); milestones in [docs/bots/ROADMAP.md](docs/bots/ROADMAP.md);
@@ -32,13 +35,12 @@ for the owner.
 
 ## Next
 
-1. MR !5 (`starscream/integrate-develop → develop`): pipeline 20256 green,
-   Shockwave review, merge.
+1. MR !5 (`starscream/integrate-develop → develop`): pipeline 20278 green
+   (18/18); Shockwave round 2 findings being closed; then merge.
 2. MR `develop → main` — the promotion. Reviewer Shockwave, approver the owner.
-3. #69 (MR !2): Shockwave's round closed at `e02f7c6` — wrapper arm removed,
-   three probe rows restored, corpus row 69 pins it; re-review requested.
-   #78 (MR !4): threads addressed at `72e081a`. Both wait on #85 for a green
-   pipeline, then Shockwave, then the owner.
+3. #78 (MR !4): Shockwave's round closed at `0685f13` (empty batch silent;
+   ranged-first rule documented); pipeline 20281 queued. #69 (MR !2) is
+   merged (`ce215fc`) and closed.
 
 ## Later
 
@@ -102,10 +104,9 @@ feature branch.
 - **!5** `starscream/integrate-develop → develop` — the reconciliation and this
   sprint's planning artefacts. Shockwave review round 1 answered; pipeline waits
   on #85.
-- **!2** `starscream/issue-69 → develop` (LB0320/LB0321) — Shockwave's round
-  closed at `e02f7c6`, re-review requested.
+- **!2** — merged to `develop` as `ce215fc` after Shockwave's approval; #69 closed.
 - **!4** `skywarp/issue-78 → develop` — threads addressed at `72e081a`;
   pipeline re-run after !6.
 - **!6** `thundercracker/issue-85 → develop` — cache policy sized to the
   runner (decision 15). Merge first; then re-run !4/!5 pipelines.
-- Merged this sprint: **!1** (#70), **!3** (#81).
+- Merged this sprint: **!1** (#70), **!2** (#69), **!3** (#81).

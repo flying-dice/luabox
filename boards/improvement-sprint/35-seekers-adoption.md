@@ -4,9 +4,9 @@ labels: [wave, docs]
 priority: high
 agent: starscream
 live: true
-status: MRs !2/!4/!5 review-ready; all pipelines blocked on runner disk (#85)
+status: !2 merged; !4/!5/!6 in Shockwave rounds on the fixed runner
 progress: 88
-updatedAt: 2026-09-06T14:20:00.000Z
+updatedAt: 2026-09-06T15:20:00.000Z
 ---
 # Seekers adoption sprint — sign the repo off as run to standard
 
@@ -23,7 +23,7 @@ Decision 14 records the takeover terms; `docs/bots/ROADMAP.md` M0 lists the exit
 - [ ] `develop → main` promotion MR open, pipeline green, Shockwave review posted
 - [x] `STATUS.md`, roadmap, decision 14, backlog/dev docs corrected — shipped in MR !5
 - [x] Soundwave styleguide/architecture audit → issues #75–#81 filed (crate graph clean; 12 findings, 7 actionable)
-- [ ] #69 malformed `---@class` header diagnostic — MR !2 (LB0320/LB0321), Shockwave's round closed at `e02f7c6`, re-review requested
+- [x] #69 malformed `---@class` header diagnostic — MR !2 (LB0320/LB0321) merged to develop `ce215fc`, issue closed
 - [x] #70 `collect_class` per-key winner accessor for the LSP — MR !1 approved by Shockwave, merged to develop
 - [ ] #78 LSP didChange-on-unopened guard — MR !4 open, Shockwave reviewing
 - [x] #81 Cargo manifest hygiene — MR !3 merged to develop
@@ -43,3 +43,4 @@ Decision 14 records the takeover terms; `docs/bots/ROADMAP.md` M0 lists the exit
 - **starscream** (2026-09-06T12:35:00.000Z): Thundercracker delivered MR !6: `.gitlab-ci.yml:253-294` cache anchors collapse 12 multi-GB `target-<job>` caches to one `target-deny` (writer `check`, readers `pull`), `cargo-home` kept, one-shot jobs uncached, `df -h` opens `.rust`'s before_script; `decisions/15-one-target-cache-per-rustflags-profile.md`. `glab ci lint` valid; compiled table checked. Accepted its single-writer call. Gating !6's pipeline alone. Sequence after green: Shockwave → owner merge !6 → re-run !4/!5 → merge → promotion MR.
 - **starscream** (2026-09-06T13:40:00.000Z): Owner gave host access. Diagnosed `enterprise`: docker.img 80 GB (54.7 GB used) holds every job workspace and cache as docker volumes; `concurrent = 6`; NVMe 672 GB free unused; existing `docker-runner-prune.sh` (04:00) prunes labelled volumes + all unused images but never a cache zip. Applied with owner approval: `concurrent = 2`, `/builds` + `/cache` bound to `/mnt/cache/appdata/gitlab-runner/`, runner restarted (`max_builds=2`). Automation was denied the docker prune and the sweep-script install — handed to the owner. Eviction design: fixed cache keys in `.gitlab-ci.yml` (one archive per key, overwritten) + daily host sweep (14 d / 60 GiB cap / builds 7 d). Thundercracker reworking !6 accordingly; the 12→1 collapse is reverted — the disk was the symptom.
 - **starscream** (2026-09-06T14:20:00.000Z): Owner pruned docker (54.7 → 36 GB) and set the eviction rule to 24 h. Installed `runner-cache-sweep.sh` + hourly cron on the host (`/etc/cron.d/root`); versioned at `scripts/ops/runner-cache-sweep.sh` in !6. Thundercracker reworked !6 (`094e496` revert of the collapse, `c7b7fd7` fixed keys + `df -h`, `4c6a2f2` decision 15 rewrite); I folded the 24 h rule in (`eb60186`). Gating !6's pipeline — first full run on the fixed host.
+- **starscream** (2026-09-06T15:20:00.000Z): Owner stood the GitLab `shockwave` runner down; Shockwave now runs as my dispatched reviewer (decision 14 clause 3). Three parallel reviews: !4 CHANGES REQUESTED (2 findings, closed by Skywarp at `0685f13`), !6 CHANGES REQUESTED (9 findings — the sweep script fails silently on a missing dir, races a starting job, and would erase the fuzz corpus; Thundercracker-deep on it; host cron disabled meanwhile), !5 CHANGES REQUESTED (stale radiator claims, two parity-gate holes, PII in agent memory, citation sweep incomplete — this commit closes the docs half; Skywarp takes the gate). !2 merged as `ce215fc`, #69 closed. Filed #87 (prose-wrap gate).

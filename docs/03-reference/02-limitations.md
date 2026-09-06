@@ -53,7 +53,7 @@ reported, so the warning plus a stable winner reads as the more useful
 answer.
 
 **Across files the story is worse, and is tracked as
-[#73](https://github.com/flying-dice/luabox/issues/73): the winner is not
+#73: the winner is not
 project-wide and nothing warns.** Measured (this release and the merge base,
 byte-identical): the declaration in the *referencing* file wins, a file
 declaring neither gets the alphabetically-first declaring file's binding, and
@@ -65,7 +65,7 @@ two mechanisms, only one of which diagnoses — until #73 lands, keep a class's
 declarations in one file if its members must mean one thing.
 
 **That reasoning was reached without consulting luals' implementation, and is
-being revisited** ([#67](https://github.com/flying-dice/luabox/issues/67)).
+being revisited** (#67).
 Read from `script/vm/` rather than inferred, luals unions same-rank duplicates
 for `---@field`, for a re-declared carrier method, and for a re-declared
 indexer — so a project luals checks cleanly can pick up a fresh `LB0300` here
@@ -193,7 +193,7 @@ so the editor keeps showing the diagnostic even though the CLI is green. This
 is the one measured exception to the editor/CLI parity claim made later in
 this page, it applies to all three ancestry codes, and it has no issue of its
 own yet — it belongs to the same LSP-parity family as
-[#70](https://github.com/flying-dice/luabox/issues/70). It is a *diagnostic*
+#70. It is a *diagnostic*
 divergence, and it is unrelated to which declaration each side resolves a
 member to: hover, goto-definition and `luabox check` read that from one merged
 answer. Same-file suppression behaves identically in both. No workaround
@@ -245,7 +245,7 @@ The corpus rows above are the measurement, re-derived on every run of
 `luabox explain LB0317` (and `LB0318`, `LB0319`) prints the full worked fix
 for each.
 
-### Malformed `---@class` headers give no diagnostic at the declaration (round 6 review M66 — [#69](https://github.com/flying-dice/luabox/issues/69))
+### Malformed `---@class` headers give no diagnostic at the declaration (round 6 review M66 — #69)
 
 Every row above assumes `---@class` parses into a well-formed class at all.
 Four ways a header can fail to — a missing name, a name token the grammar
@@ -276,7 +276,7 @@ the missing name.
 The fix belongs in `luacats::harvest`, which currently drops a header it
 cannot parse into a class rather than emitting anything for it — no `LB0xxx`
 code is assigned for this condition yet. It is tracked as
-[#69](https://github.com/flying-dice/luabox/issues/69); an earlier edition of
+#69; an earlier edition of
 this section said the tracking issue was "not yet filed", which was true when
 written and is not now.
 `crates/luabox-types/tests/class_merge_precedence_matrix.rs`'s
@@ -892,7 +892,7 @@ What that leaves, stated plainly:
   Neovim, OpenResty — still wants a `defs/` package. The harvest contributes
   type declarations and export types, not ambient globals.
 - **Argument checking at a rock function's call site now happens**, and this
-  bound is gone ([#46](https://github.com/flying-dice/luabox/issues/46)).
+  bound is gone (#46).
   `local m = require("rock"); m.f("wrong")` reports `LB0300`, and the wrong
   *number* of arguments reports `LB0301`, exactly as the same call written in
   the same file does — it is one shared signature-checking path, so the
@@ -1005,7 +1005,7 @@ resolution claim above is unaffected — the same members resolve the same way
 in both — but "the editor omits what `luabox check` accepts" does not hold
 for cross-file-suppressed ancestry diagnostics. Detail and scope are in the
 ancestry-limits section above; no issue of its own yet, same LSP-parity
-family as [#70](https://github.com/flying-dice/luabox/issues/70).
+family as #70.
 
 The table below is still measured, not assumed — the same fixtures pin the
 new behaviour: `crates/luabox-cli/tests/features/lsp/hover-require.feature`

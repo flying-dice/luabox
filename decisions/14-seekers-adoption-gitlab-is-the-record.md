@@ -71,7 +71,11 @@ decision must not add a second system beside it.
    (`.claude/bots-manifest.json`, `.codex/bots-manifest.json`) are generated
    per-machine with absolute paths and no in-repo consumer; they are
    `.gitignore`d and each harness regenerates them locally. Agent and skill
-   *definitions* are repo state and are committed.
+   *definitions* are repo state and are committed. So is the lead's agent
+   memory (`.claude/agent-memory/<agent>/`): it is how team lessons survive a
+   session and the harness reads it from the checkout — but it is mirrored to
+   a public remote, so it carries **no personal data**: people appear by role
+   or tracker username, never by email or other identifiers.
 7. **Quality bar is the existing one, enforced on GitLab:** fmt, clippy
    (pedantic + restriction lints, `-D warnings`), workspace tests, unit
    coverage ≥95 (per-crate ≥92), e2e ≥83, luals parity and verdict
