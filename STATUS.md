@@ -1,6 +1,6 @@
 # Status
 
-**Updated:** 2026-09-06 16:56 UTC (commit time) · **Integration branch:** `develop` · **Release branch:** `main` · **Owner:** Starscream (Seekers)
+**Updated:** 2026-09-06 17:31 UTC (commit time) · **Integration branch:** `develop` · **Release branch:** `main` · **Owner:** Starscream (Seekers)
 
 Rewritten from the tracker at every push. Commit SHAs appear only as the
 identity of a measurement (a pipeline's head); states are read from GitLab
@@ -16,8 +16,8 @@ filed, and the ready work shipped through reviewed MRs.
 
 **Health.**
 - `develop`: green — pipeline 20286 on the tree that merged !1–!4.
-- `main`: **unproven at its tip.** Its last green pipeline (20262) ran five
-  docs/memory-only commits ago; the pipelines for the later commits were
+- `main`: **unproven at its tip.** Its last green pipeline is 20280, three
+  memory-only commits behind the tip; the three pipelines after it were
   cancelled to keep the two-slot runner on the MRs. The promotion MR's own
   pipeline is the proof that matters.
 - !5 (this branch): pipeline 20293 green, 18/18 — `check` trace: 3074 passed /
@@ -28,16 +28,17 @@ filed, and the ready work shipped through reviewed MRs.
 ## Now
 
 Two MRs left before the promotion, both in Shockwave re-review:
-- **!5** `starscream/integrate-develop → develop` — round 5 returned with the
-  radiator (this file) as the only open finding; this commit is the fix:
-  every section rewritten from the tracker, not patched.
+- **!5** `starscream/integrate-develop → develop` — round 6 returned two
+  wrong sentences in this file (which pipeline last proved `main`; how many
+  findings round 5 left — five: four here, one journal stamp on the card).
+  Both corrected; the file is regenerated from the tracker at every push.
 - **!6** `thundercracker/issue-85 → develop` — round 4 in progress against the
   round-3 fix (cap alarm on the outcome, failed `rm` fatal, empty-dir `find`
   through `die`, `include:`/global `cache:` refused, 118 selftest assertions).
 
 ## Next
 
-1. !5: Shockwave round 6 on this head → merge.
+1. !5: Shockwave round 7 on this head → merge.
 2. !6: Shockwave round 4 → merge.
 3. `develop → main` promotion MR (its pipeline proves `main`'s tree; owner
    approves) → #27 tag `v0.2.0`.
@@ -90,6 +91,7 @@ Two MRs left before the promotion, both in Shockwave re-review:
 
 ## In flight
 
-- **!5** — Shockwave round 6 pending on this head.
+- **!5** — Shockwave round 7 pending on this head; round 6 confirmed pipeline
+  20295 18/18 with the same `check` figures.
 - **!6** — Shockwave round 4 in progress (pipeline 20294).
 - Merged this sprint: **!1** (#70), **!2** (#69), **!3** (#81), **!4** (#78).
