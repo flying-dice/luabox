@@ -56,12 +56,13 @@ between them they explain the whole incident:
    and it is why pruning bought minutes.
 
 The host was fixed: `concurrent = 2`, and `/cache` and `/builds` bind-mounted
-from the NVMe pool. An hourly host sweep now evicts `/cache` zips and `/builds`
-checkouts untouched for 24 h (the owner's rule), with a 60 GiB cap on `/cache`
-as the backstop, oldest first. The script and its cron line are versioned at
-`scripts/ops/runner-cache-sweep.sh` and `scripts/ops/docker-runner-cache-sweep.cron`
-and installed on the host at `/boot/config/scripts/` and
-`/boot/config/plugins/dynamix/` (`update_cron` registers it in `/etc/cron.d/root`).
+from the NVMe pool. An hourly host sweep now evicts `/cache` archives and
+`/builds` checkouts untouched for 24 h (the owner's rule), with a 200 GiB cap
+on `/cache` as the backstop, oldest first. The script and its cron line are
+versioned at `scripts/ops/runner-cache-sweep.sh` and
+`scripts/ops/docker-runner-cache-sweep.cron` and installed on the host at
+`/boot/config/scripts/` and `/boot/config/plugins/dynamix/` (`update_cron`
+registers it in `/etc/cron.d/root`).
 
 That leaves the pipeline half, and it changes what the pipeline half should be.
 The first response to this incident (commit 38d9016, superseded by this
@@ -106,18 +107,70 @@ not bound — a hashed key is unbounded whether there are twelve of them or one.
 
 4. **The host is half of this decision.** `/builds` and `/cache` on the NVMe
    bind mounts, `concurrent = 2`, and the hourly sweep (24 h for `/cache` and
-   `/builds`, 60 GiB cap on `/cache`) are load-bearing, not incidental hygiene. Fixed
-   keys are what make a sweep *sufficient*: a key that is still in use is
-   touched on every run, so it never ages out, and the only things the sweep
-   collects are keys the pipeline has genuinely stopped using — a deleted job,
-   a bumped `luals` pin, an abandoned fuzz target. Against hashed keys the same
-   sweep would be a race it loses every time a lockfile changes.
+   `/builds`, 200 GiB cap on `/cache`) are load-bearing, not incidental
+   hygiene. Fixed keys are what make a sweep *sufficient*: a key that is still
+   in use is touched on every run, so it never ages out, and the only things
+   the sweep collects are keys the pipeline has genuinely stopped using — a
+   deleted job, a bumped `luals` pin, an abandoned fuzz target. Against hashed
+   keys the same sweep would be a race it loses every time a lockfile changes.
 
-5. **`df -h "$CI_PROJECT_DIR"` is the first line of every rust job and of
-   `fuzz`.** It reports and never fails. This prevents nothing; it makes a full
-   disk legible in the first ten lines instead of arriving as an LLVM IO error
-   four hundred lines into a compile. Decision 12's principle applied to the
-   harness itself: a failure mode nobody can read is one nobody fixes.
+   Three things about that sweep are decisions, not implementation detail:
+
+   - **The cap is 200 GiB, not 60.** The unit on disk is not the key, it is
+     the key plus a ref-class suffix: the runner writes
+     `<cache>/<namespace>/<project>/<key>-protected/cache.zip` and a separate
+     `-non_protected` sibling for unprotected refs. So the steady state is
+     keys × one tree × *at most two*, and twelve build trees at ~3 GB in two
+     ref classes is ~72 GB before `cargo-home` and the corpora. A 60 GiB cap
+     would have been below the design's own steady state — a backstop
+     permanently in the pipeline's way. The pool has 672 GB free.
+   - **`fuzz-corpus-*` is exempt from the age rule.** The corpus is
+     accumulated state, not a rebuildable tree, and this instance has no
+     pipeline schedule (checked 2026-09-06: `pipeline_schedules` is empty), so
+     `fuzz` runs only on a `changes:`-matching MR or a manual run — days
+     apart. Under a 24 h rule every fuzz run would start from an empty corpus,
+     which is the one cache in this file whose loss is not merely a slower
+     job. The cap still applies to it, last, after every rebuildable archive.
+   - **The sweep refuses rather than reports zero.** A missing bind mount, a
+     failed `du`, or a `/builds` that is not `<token>/<slot>/<ns>/<project>`
+     all used to exit 0 with a healthy-looking syslog line; the depth-2
+     pre-bind layout in particular was never swept and never reported. All
+     three now exit 2 with `logger -p user.err` and delete nothing. It also
+     takes a lock, skips concurrency slots with a running job container, and
+     re-checks freshness immediately before each `rm` — it races a live
+     runner, and a review reproduced it deleting a checkout a job had just
+     started in.
+
+5. **Every cache key keeps at least one `pull-push` writer.** The sweep evicts
+   on mtime and the runner touches a local archive only when a job *writes*
+   it, so a key every job takes `policy: pull` ages out of `/cache` while jobs
+   are still reading it — arriving as an unexplained cold rebuild rather than
+   as an error. This is the pipeline-side half of the eviction contract, and
+   `scripts/tests/runner-cache-sweep-selftest.sh` asserts it against
+   `.gitlab-ci.yml` on every merge request.
+
+6. **`df -h "$CI_PROJECT_DIR"` is the first line of every rust job's script
+   and of `fuzz`, and it covers the compile phase only.** GitLab runs it at
+   the start of `step_script`, after `get_sources` and `restore_cache` —
+   traces put it at log line 38-43. Both of this incident's failure points are
+   upstream of it (`fatal: sha1 file .git/index.lock write error` during the
+   clone, `Failed to extract cache`), so it cannot explain either, and no line
+   inside a job's script could: that ground belongs to the host sweep. What it
+   does cover is where the illegible symptoms came from — it reports and never
+   fails, and it puts the disk figure in the first screen of the log instead
+   of leaving a full disk to arrive as an LLVM IO error four hundred lines
+   into a compile. Decision 12's principle applied to the harness itself: a
+   failure mode nobody can read is one nobody fixes. The claim it replaces
+   ("the first line of the job") was worth more than the line was.
+
+7. **The sweep is self-tested, like the gates.** It is the only `rm -rf` in
+   this repo and the only script here whose failure mode is destroying a
+   running job's workspace, so decision 12's rule applies with more force to
+   it than to any gate: `scripts/tests/runner-cache-sweep-selftest.sh` runs
+   the real script against fixture trees and the `runner-cache-sweep-selftest`
+   job runs it, plus `shellcheck`, on every merge request. Each of its cases
+   was verified by deleting the guard it pins and confirming the case goes
+   red.
 
 ## Consequences
 
@@ -128,13 +181,18 @@ not bound — a hashed key is unbounded whether there are twelve of them or one.
   alternative was a clean tree per bump and no upper bound on the total.
 - **Cache size is now predictable.** Twelve build-directory keys plus
   `cargo-home`, `fuzz-cargo-home`, the corpora and the two pinned tool trees.
-  One copy of each. The 60 GiB sweep cap is a ceiling with headroom, not a
-  target the pipeline races towards.
+  One archive of each per ref class — protected and non-protected refs get
+  separate directories on disk, so the bound is that count doubled at worst.
+  The 200 GiB sweep cap is a ceiling with headroom, not a target the pipeline
+  races towards.
 - **Hit-rate is back where the port had it.** `perf-gates` and
   `ignored-deterministic-tests` keep their own release trees instead of paying
   a cold release build against `check`'s debug key; coverage keeps
-  `target/llvm-cov-target`; the fuzz legs keep their nightly build directories
-  alongside the corpora they were already compounding.
+  `target/llvm-cov-target`; the fuzz legs keep their nightly-toolchain build
+  directories alongside their corpora. Those corpora compound only as fast as
+  `fuzz` actually runs, which — with no pipeline schedule on this instance — is
+  when an MR touches its `changes:` paths or someone dispatches it by hand, not
+  nightly.
 - **Two hosts' worth of state is now one contract.** The pipeline assumes the
   bind mounts, `concurrent = 2` and the sweep. That assumption is written into
   the CACHING header of `.gitlab-ci.yml`, not just here, because the file is
@@ -153,7 +211,9 @@ rather than patch:
 - **The sweep stops running, or its thresholds move.** With a 24 h window a
   `changes:`-gated job (`differential`, `verdict-differential`, `luals-parity`,
   `fuzz`) that idles for a day rebuilds cold on its next run — accepted by the
-  owner as the price of a bounded disk, not a failure. Fixed keys bound the
+  owner as the price of a bounded disk, not a failure. `fuzz` is the one
+  exception, and only for its corpus (above); if that exemption is dropped,
+  the fuzz legs stop compounding coverage and become a smoke test. Fixed keys bound the
   steady state, but a key that falls out of use (a renamed job, a bumped pin)
   is only collected by the sweep. Without it those accumulate slowly — slowly
   is not never.
@@ -165,7 +225,9 @@ rather than patch:
   runner container reverting to `volumes = ["/cache"]`. That puts multi-GB
   trees back inside the 80 GB `docker.img` and reproduces the original
   incident with the same illegible symptoms. Check this first when
-  `No space left on device` returns.
+  `No space left on device` returns — and check syslog for
+  `runner-cache-sweep: REFUSED`, which is what the sweep now says instead of
+  quietly evicting nothing.
 - **The instance gains a shared cache server (S3/GCS).** That brings its own
   eviction and moves storage off the executor's filesystem, at which point the
   sweep and possibly the fixed keys stop being the mechanism that matters.

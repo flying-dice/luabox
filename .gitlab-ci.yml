@@ -103,10 +103,18 @@
 #   - `concurrent = 2` (it was 6). At most two of these builds share the disk,
 #     the CPU and the page cache at a time.
 #   - An hourly host sweep does the eviction GitLab does not do (owner's rule,
-#     2026-09-06): `/cache` zips and `/builds` checkouts untouched for 24 h are
-#     deleted; a 60 GiB cap on `/cache` is the backstop, oldest first. Source:
+#     2026-09-06): `/cache` archives and `/builds` checkouts untouched for 24 h
+#     are deleted, with `fuzz-corpus-*` exempt from that rule (accumulated
+#     state, not a rebuildable tree — see the fuzz entry below); a 200 GiB cap
+#     on `/cache` is the backstop, oldest first, corpora drained last. It takes
+#     a lock, skips any concurrency slot with a job container running, and
+#     REFUSES (exit 2, syslog `user.err`, nothing deleted) if a bind mount is
+#     missing, if `du` fails or if `/builds` is not the layout it expects —
+#     the old version read all three as a clean sweep. Source:
 #     scripts/ops/runner-cache-sweep.sh + docker-runner-cache-sweep.cron,
-#     installed at /boot/config/scripts/ and /boot/config/plugins/dynamix/.
+#     installed at /boot/config/scripts/ and /boot/config/plugins/dynamix/,
+#     pinned by scripts/tests/runner-cache-sweep-selftest.sh in the
+#     `runner-cache-sweep-selftest` job below.
 #
 # EVERY KEY IN THIS FILE IS FIXED. A literal, or a literal plus a variable
 # naming the job, the matrix leg or a pinned version — never `key: files:`.
@@ -116,8 +124,26 @@
 # change and deletes nothing: GitLab's local cache has no eviction at all. So
 # the cache grew once per dependency bump per branch, without bound, until the
 # filesystem was full — that was the leak, not the number of caches. A fixed
-# key means exactly one archive per key, overwritten in place at job end, and
-# total cache size bounded by (keys x one tree).
+# key means exactly one archive per key, overwritten in place at job end.
+#
+# The on-disk unit is not the key, it is the key PLUS a ref-class suffix. The
+# runner writes `<cache>/<namespace>/<project>/<key>-protected/cache.zip`, and
+# a separate `-non_protected` sibling for unprotected refs (job 29041's trace:
+# `Checking cache for cargo-home-protected`). So the bound is keys x one tree
+# x AT MOST 2, not keys x one tree — twelve build trees at ~3 GB, two ref
+# classes each, is ~72 GB before `cargo-home` and the corpora. That doubling
+# is why the sweep's cap is 200 GiB rather than the 60 GiB first written here;
+# the NVMe pool has 672 GB free.
+#
+# EVERY KEY ALSO KEEPS AT LEAST ONE `pull-push` WRITER. The sweep evicts on
+# mtime, and the runner only touches a local archive when a job WRITES it:
+# `policy: pull` extracts the zip without rewriting it. A key every job takes
+# read-only therefore ages out of `/cache` while jobs are still reading it,
+# and the symptom is a silent cold rebuild, not an error. `cargo-home` is
+# `pull` in four jobs and `pull-push` in `.rust` for exactly that reason.
+# Turning the last writer of any key into a reader is a change to make on
+# purpose: scripts/tests/runner-cache-sweep-selftest.sh reads this file and
+# fails if any key loses its writer.
 #
 # The hashed key bought a guaranteed-clean tree on a lockfile bump. Cargo's
 # fingerprinting already does that — it rebuilds the units a bump invalidates
@@ -138,17 +164,31 @@
 #     disk paid for a cache that structurally misses. With fixed keys this
 #     shape is self-limiting: N rust jobs is N trees, permanently.
 #   - `fuzz-cargo-home`, `fuzz-target-<leg>`, `fuzz-corpus-<leg>`: the fuzz
-#     matrix builds under nightly against its own `fuzz/Cargo.lock`, so it
-#     does not share the workspace's keys.
+#     matrix builds under the nightly TOOLCHAIN against its own
+#     `fuzz/Cargo.lock`, so it does not share the workspace's keys. The corpus
+#     is different in kind from the other two — accumulated state, not a
+#     rebuildable tree — and this instance has NO pipeline schedule (checked
+#     2026-09-06: `pipeline_schedules` is empty), so `fuzz` runs only on an MR
+#     touching its `changes:` paths or on a manual run, i.e. days apart. A 24 h
+#     rule would hand the fuzzer an empty corpus every time, so the host sweep
+#     exempts `fuzz-corpus-*` from it and drops a corpus only under the size
+#     cap, after every rebuildable archive.
 #   - `luals-<version>`, `pwsh-<version>`: pinned third-party trees, tens of
 #     megabytes. The version IS the key; bumping a pin abandons one small
 #     archive, which the sweep collects.
 #
-# `df -h "$CI_PROJECT_DIR"` is the first line of every rust job and of `fuzz`.
-# It never fails the job; it puts the number in the first ten lines of the log
-# so a full disk is legible instead of arriving as an LLVM IO error four
-# hundred lines into a compile (decision 12's principle, applied to the
-# harness itself).
+# `df -h "$CI_PROJECT_DIR"` is the first line of every rust job's script and of
+# `fuzz`, and it is worth being exact about what that buys. The runner starts
+# it at the top of `step_script`, which is AFTER `get_sources` and after
+# `restore_cache` — traces put it at log line 38-43, not line 1. Both of #85's
+# failure points are upstream of it: the clone that died on `fatal: sha1 file
+# .git/index.lock write error`, and `Failed to extract cache`. This line cannot
+# see either, and nothing in a job's script can; that is the host sweep's
+# ground, not the pipeline's. What it covers is the compile phase that
+# follows, which is where the illegible symptoms came from — it puts the disk
+# figure in the first screen of the log instead of leaving a full disk to
+# arrive as an LLVM IO error four hundred lines into a compile. It reports and
+# never fails (decision 12's principle, applied to the harness itself).
 # CARGO_HOME is moved inside the project directory because GitLab can only
 # cache paths under $CI_PROJECT_DIR; $CARGO_HOME/bin is put back on PATH so
 # directly-invoked subcommands (mutants-gate.sh does `command -v
@@ -576,8 +616,10 @@ draft-install-mock:
 # repo: `rm -rf` from the host's cron, hourly, against the directories a live
 # runner is writing into. Decision 12 asks for a self-test wherever a script's
 # failure mode is silence; here the failure mode is deleting a job's workspace
-# mid-build, which is worse, and until this job existed neither the sweep nor
-# any other shell script in the tree had a test or a linter. The harness builds
+# mid-build, which is worse — and the sweep shipped without one. `shellcheck`
+# rides along because no job in this pipeline ran it at all: the `# shellcheck`
+# directives scattered through scripts/ were written for an author's local run
+# and nothing in CI has ever executed them. The harness builds
 # fixture trees, runs the REAL sweep against them through its env seams, and
 # asserts what it deleted and what it refused to delete — including the cases
 # that used to pass silently (a missing bind mount, a failed `du`, the pre-bind
