@@ -41,9 +41,12 @@
 #   over-cap alarm deleted entirely   -> S25, S26, S27
 #   a failed rm ignored, or the failure count never fatal -> S28, S28b
 #   empty-directory find failure logged instead of fatal -> S29
-#   cap loses the age pass's in-use guard -> S12
-#   the "everything left is in use" alarm text dropped -> S12
-#   corpus no longer drained last     -> S12c
+#   cap guard removed entirely        -> S12, S12b
+#   cap guard widened to MAX_AGE_MIN  -> S11b, S12b, S12c
+#   cap guard checks the file but not its key directory -> S12e
+#   must_keep ignores its window argument -> S11b, S12b, S12c
+#   the "touched within the last N min" alarm text dropped -> S12
+#   corpus no longer drained last     -> S12c, S12d
 #   per-candidate du failure fatal again -> S32
 #   empty-dir stderr neither re-emitted nor counted -> S31
 #   alarm reason goes back to a fixed guess -> S25, S25b, S27
@@ -65,13 +68,13 @@
 #     pass on a dev box and measure nothing in the job. What IS pinned is that
 #     a failure there is fatal (S29) and that a refused directory is named and
 #     counted (S31, through a find that reports the refusal).
-#   - Plain-before-corpus drain order is now nearly unreachable: outside the
-#     window the age pass has already taken every non-corpus archive, so the
-#     drain normally sees corpora only. S12c reaches it through the one path
-#     left — an archive the age pass could not remove — and pins the order
-#     from the CAP's own refusal line. If that path is ever closed, the
-#     ordering becomes untestable end-to-end and should be said so rather than
-#     assumed. Re-run one with:
+#   - (Resolved, so kept only as history.) Plain-before-corpus drain order was
+#     briefly unreachable, while the cap borrowed the age pass's 24 h window
+#     and could therefore only ever see corpora. With the cap guard at
+#     CAP_GUARD_MIN the ordinary case is back: an archive half an hour old is
+#     inside the age window and outside the guard, so S12c and S12d pin the
+#     order directly.
+# Re-run one with:
 #   cp scripts/ops/runner-cache-sweep.sh /tmp/mutant.sh && $EDITOR /tmp/mutant.sh
 #   RUNNER_CACHE_SWEEP_BIN=/tmp/mutant.sh bash scripts/tests/runner-cache-sweep-selftest.sh
 #   RUNNER_CACHE_SWEEP_CI_YML=/tmp/mutant-ci.yml bash scripts/tests/runner-cache-sweep-selftest.sh
@@ -544,48 +547,81 @@ assert_exit S20b_loose_file_under_builds_refuses 2 "$sweep_rc" "$sweep_log" \
 # Sizes are in KiB via CACHE_CAP_KIB so the drain runs against a one-megabyte
 # fixture instead of a two-hundred-gigabyte one.
 #
-# The archives are fuzz CORPORA, which is not decoration: since the cap took
-# the age pass's freshness guards, the only archives it can ever drain are the
-# ones OUTSIDE the window, and the only archives outside the window that
-# survive the age pass are the corpora it exempts. Anything else has already
-# been deleted by the time the drain runs.
+# Ordinary build-directory archives, an hour to five hours old: inside the 24 h
+# age window (so the age pass leaves them) and outside the 15-minute cap guard
+# (so the backstop may take them). That combination is the cap's whole job, and
+# it is the shape a real over-cap host is in.
 fx="$(mkfixture s11)"
 ns="$fx/cache/flying-dice/luabox"
-mkfile "$ns/fuzz-corpus-one-protected/cache.zip" 256
-mkfile "$ns/fuzz-corpus-two-protected/cache.zip" 256
-mkfile "$ns/fuzz-corpus-three-protected/cache.zip" 256
-mkfile "$ns/fuzz-corpus-four-protected/cache.zip" 256
-mkfile "$ns/fuzz-corpus-five-protected/cache.zip" 256
+mkfile "$ns/target-check-protected/cache.zip" 256
+mkfile "$ns/target-examples-protected/cache.zip" 256
+mkfile "$ns/target-coverage-unit-protected/cache.zip" 256
+mkfile "$ns/cargo-home-protected/cache.zip" 256
+mkfile "$ns/luals-3.13.5-protected/cache.zip" 256
 mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
-age_tree "$fx" 4320
-age_tree "$fx/builds" 30
-age_path "$ns/fuzz-corpus-one-protected/cache.zip" 5000
-age_path "$ns/fuzz-corpus-two-protected/cache.zip" 4800
-age_path "$ns/fuzz-corpus-three-protected/cache.zip" 4600
-age_path "$ns/fuzz-corpus-four-protected/cache.zip" 4400
-age_path "$ns/fuzz-corpus-five-protected/cache.zip" 4200
+age_tree "$fx" 30
+age_path "$ns/target-check-protected/cache.zip" 300
+age_path "$ns/target-examples-protected/cache.zip" 240
+age_path "$ns/target-coverage-unit-protected/cache.zip" 180
+age_path "$ns/cargo-home-protected/cache.zip" 120
+age_path "$ns/luals-3.13.5-protected/cache.zip" 60
 run_sweep s11 "$fx"
 assert_exit S11a_under_the_cap_the_step_still_reports 0 "$sweep_rc" "$sweep_log" \
-    "cache: cap summary: removed 0" "(cap 200GiB)"
-survives "S11a nothing is removed under a 200GiB cap" "$ns/fuzz-corpus-one-protected/cache.zip"
+    "cache: cap summary: removed 0" "(cap 200GiB, guard 15min)"
+survives "S11a nothing is removed under a 200GiB cap" "$ns/target-check-protected/cache.zip"
 
 run_sweep s11b "$fx" CACHE_CAP_KIB=650
 assert_exit S11b_cap_drains_oldest_first_and_stops 0 "$sweep_rc" "$sweep_log" \
-    "cache: cap summary: removed 3" "(cap 650KiB)"
-deleted "S11b the oldest archive goes first" "$ns/fuzz-corpus-one-protected/cache.zip"
-deleted "S11b then the second oldest" "$ns/fuzz-corpus-two-protected/cache.zip"
-deleted "S11b then the third" "$ns/fuzz-corpus-three-protected/cache.zip"
-survives "S11b the drain stops as soon as the tree is under the cap" "$ns/fuzz-corpus-four-protected/cache.zip"
-survives "S11b so the newest archives are kept" "$ns/fuzz-corpus-five-protected/cache.zip"
+    "cache: cap summary: removed 3" "(cap 650KiB, guard 15min)"
+deleted "S11b the oldest archive goes first" "$ns/target-check-protected/cache.zip"
+deleted "S11b then the second oldest" "$ns/target-examples-protected/cache.zip"
+deleted "S11b then the third" "$ns/target-coverage-unit-protected/cache.zip"
+survives "S11b the drain stops as soon as the tree is under the cap" "$ns/cargo-home-protected/cache.zip"
+survives "S11b so the newest archives are kept" "$ns/luals-3.13.5-protected/cache.zip"
 check_false "S11b the cap never touches the builds tree" \
     grep -qF "builds: removed" "$sweep_log"
 
-# --- S12: over the cap is not a licence to delete live archives ------------
-# Every archive here was touched inside the window — a job wrote it today — and
-# the tree is far over the cap. The drain takes none of them and the run says
-# why, instead of evicting a live cache once an hour, every hour, for as long
-# as the cap is exceeded.
+# --- S12: the cap guard protects an upload in flight, and only that --------
+# Everything here was touched five minutes ago — an archive being written is
+# the one thing a backstop must not delete. The drain takes none of them and
+# the run says why, naming the guard window rather than the age window.
 fx="$(mkfixture s12)"
+ns="$fx/cache/flying-dice/luabox"
+mkfile "$ns/fuzz-corpus-lua_parse-protected/cache.zip" 256
+mkfile "$ns/target-check-protected/cache.zip" 256
+mkfile "$ns/cargo-home-protected/cache.zip" 256
+mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
+age_tree "$fx" 5
+run_sweep s12 "$fx" CACHE_CAP_KIB=600
+assert_exit S12_the_cap_never_evicts_an_upload_in_flight 2 "$sweep_rc" "$sweep_log" \
+    "cache: cap summary: removed 0, in-use 3" \
+    "over the 600KiB cap; everything left was touched within the last 15 min (3 archive(s))" \
+    "syslog: -p user.err -t runner-cache-sweep" \
+    "!cache: cap removed"
+survives "S12 the archive being written is still there" "$ns/cargo-home-protected/cache.zip"
+survives "S12 and its neighbours" "$ns/target-check-protected/cache.zip"
+survives "S12 and the corpus" "$ns/fuzz-corpus-lua_parse-protected/cache.zip"
+
+# --- S12b: half an hour old is warm, not live ------------------------------
+# The same tree at 30 minutes: still deep inside the 24 h age window, so the
+# age pass will not touch it, and well outside the 15-minute guard, so the
+# backstop can. This is the case that makes the cap a backstop at all — with
+# the guard widened to MAX_AGE_MIN it frees nothing and alarms instead.
+age_tree "$fx/cache" 30
+run_sweep s12b "$fx" CACHE_CAP_KIB=600
+assert_exit S12b_a_warm_archive_is_drained_under_the_cap 0 "$sweep_rc" "$sweep_log" \
+    "cache: age summary: removed 0" \
+    "cache: cap summary: removed 1, in-use 0" \
+    "!REFUSED" "!PARTIALLY SWEPT"
+check_true "S12b the drain got the tree under the cap" \
+    grep -qE 'cache: cap summary: removed 1,.*tree now ~[0-9]+ KiB' "$sweep_log"
+
+# --- S12c: rebuildable archives drain before corpora -----------------------
+# The corpus is the OLDEST file in the tree, so a plain oldest-first drain eats
+# it first. It is accumulated state and the target trees are not, so it goes
+# last — and with the cap guard at 15 minutes this is an ordinary, reachable
+# path again rather than a curiosity that needed a refused `rm` to observe.
+fx="$(mkfixture s12c)"
 ns="$fx/cache/flying-dice/luabox"
 mkfile "$ns/fuzz-corpus-lua_parse-protected/cache.zip" 256
 mkfile "$ns/target-check-protected/cache.zip" 256
@@ -595,52 +631,52 @@ age_tree "$fx" 30
 age_path "$ns/fuzz-corpus-lua_parse-protected/cache.zip" 600
 age_path "$ns/target-check-protected/cache.zip" 300
 age_path "$ns/cargo-home-protected/cache.zip" 120
-run_sweep s12 "$fx" CACHE_CAP_KIB=600
-assert_exit S12_a_cap_never_evicts_an_archive_inside_the_window 2 "$sweep_rc" "$sweep_log" \
-    "cache: cap summary: removed 0, in-use 3" \
-    "over the 600KiB cap; everything left is in use (3 archive(s) inside the window)" \
-    "syslog: -p user.err -t runner-cache-sweep" \
-    "!cache: cap removed"
-survives "S12 the archive a job wrote an hour ago is still there" "$ns/cargo-home-protected/cache.zip"
-survives "S12 and so is the one from five hours ago" "$ns/target-check-protected/cache.zip"
-survives "S12 and the corpus" "$ns/fuzz-corpus-lua_parse-protected/cache.zip"
-
-# The same tree, aged out of the window: now the cap may act, and the corpus
-# the age rule exempts is what it drains. 30 KiB is above what the directories
-# alone measure and far below the archives, so the drain can reach it.
-age_tree "$fx/cache" 4320
-run_sweep s12b "$fx" CACHE_CAP_KIB=30
-assert_exit S12b_the_corpus_is_still_subject_to_the_cap 0 "$sweep_rc" "$sweep_log" \
-    "cache: cap removed $ns/fuzz-corpus-lua_parse-protected/cache.zip"
-deleted "S12b under enough pressure the corpus goes too" \
+run_sweep s12c "$fx" CACHE_CAP_KIB=600
+assert_exit S12c_the_cap_drains_rebuildable_archives_before_the_corpus 0 "$sweep_rc" "$sweep_log" \
+    "cache: cap summary: removed 1" \
+    "cache: cap removed $ns/target-check-protected/cache.zip" \
+    "!cache: cap removed $ns/fuzz-corpus-lua_parse-protected/cache.zip"
+survives "S12c the oldest file in the tree survives because it is a corpus" \
     "$ns/fuzz-corpus-lua_parse-protected/cache.zip"
+deleted "S12c the rebuildable tree went instead" "$ns/target-check-protected/cache.zip"
 
-# --- S12c: rebuildable archives are still offered to the drain first -------
-# Corpus-last ordering is nearly unobservable now: outside the window the age
-# pass has already taken every non-corpus archive, so the drain normally sees
-# corpora only. The one reachable path is an archive the age pass could not
-# remove — it is still a candidate, and it must be OFFERED before the corpus
-# is. The refusal is what makes the attempt visible in the log.
-fx="$(mkfixture s12c)"
-ns="$fx/cache/flying-dice/luabox"
-mkfile "$ns/undeletable-target-protected/cache.zip" 256
-mkfile "$ns/fuzz-corpus-lua_parse-protected/cache.zip" 256
-mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
-age_tree "$fx" 4320
-age_tree "$fx/builds" 30
-age_path "$ns/undeletable-target-protected/cache.zip" 4200
-age_path "$ns/fuzz-corpus-lua_parse-protected/cache.zip" 9000
-run_sweep s12c "$fx" CACHE_CAP_KIB=30 PATH="$work/shim-rm:$shim:$PATH"
-assert_exit S12c_the_drain_offers_rebuildable_archives_before_corpora 3 "$sweep_rc" "$sweep_log" \
-    "cache: cap FAILED to remove $ns/undeletable-target-protected/cache.zip" \
-    "cache: cap removed $ns/fuzz-corpus-lua_parse-protected/cache.zip" \
-    "2 archive(s) matched '*.zip', 1 drained, 1 refused"
-# The CAP's own refusal line, not the age pass's: both passes meet this archive
-# and only the cap's attempt says anything about drain order. Pinning the age
-# pass's line here would be an assertion that cannot fail.
-check_true "S12c the rebuildable archive is offered to the drain before the older corpus" \
-    log_line_before "cache: cap FAILED to remove $ns/undeletable-target-protected/cache.zip" \
+# --- S12d: under enough pressure the corpus goes too -----------------------
+# 30 KiB is above what the directories alone measure and far below the
+# archives, so the drain has to take all three, corpus included.
+run_sweep s12d "$fx" CACHE_CAP_KIB=30
+assert_exit S12d_the_corpus_is_still_subject_to_the_cap 0 "$sweep_rc" "$sweep_log" \
     "cache: cap removed $ns/fuzz-corpus-lua_parse-protected/cache.zip"
+deleted "S12d under enough pressure the corpus goes too" \
+    "$ns/fuzz-corpus-lua_parse-protected/cache.zip"
+check_true "S12d and it went last, after both rebuildable archives" \
+    log_line_before "cache: cap removed $ns/cargo-home-protected/cache.zip" \
+    "cache: cap removed $ns/fuzz-corpus-lua_parse-protected/cache.zip"
+
+# --- S12e: the guard watches the key DIRECTORY too -------------------------
+# The runner creates `<key>-protected/` and then writes `cache.zip` into it, so
+# during the first seconds of an upload the directory is fresh while the
+# archive still carries the previous run's mtime. Checking only the file would
+# hand the drain an archive that is being replaced right now. Here the older
+# archive is the one under an active key directory: the drain must skip it and
+# take the younger one instead, which is the opposite of its normal order.
+fx="$(mkfixture s12e)"
+ns="$fx/cache/flying-dice/luabox"
+mkfile "$ns/target-check-protected/cache.zip" 256
+mkfile "$ns/target-examples-protected/cache.zip" 256
+mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
+age_tree "$fx" 30
+age_path "$ns/target-check-protected/cache.zip" 300
+age_path "$ns/target-examples-protected/cache.zip" 120
+age_path "$ns/target-check-protected" 2
+run_sweep s12e "$fx" CACHE_CAP_KIB=400
+assert_exit S12e_the_cap_guard_covers_the_key_directory 0 "$sweep_rc" "$sweep_log" \
+    "cache: cap summary: removed 1, in-use 1" \
+    "cache: cap removed $ns/target-examples-protected/cache.zip" \
+    "!cache: cap removed $ns/target-check-protected/cache.zip"
+survives "S12e the archive under an active key directory is skipped, oldest or not" \
+    "$ns/target-check-protected/cache.zip"
+deleted "S12e and the drain takes the next one instead" \
+    "$ns/target-examples-protected/cache.zip"
 
 # --- S13: the corpus is exempt from the age rule ---------------------------
 fx="$(mkfixture s13)"

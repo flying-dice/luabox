@@ -116,6 +116,17 @@ not bound — a hashed key is unbounded whether there are twelve of them or one.
 
    Three things about that sweep are decisions, not implementation detail:
 
+   - **The cap and the age rule use different windows, on purpose.** The age
+     rule collects an archive nothing has touched for 24 h (`MAX_AGE_MIN`);
+     that is a statement about disuse. The cap only runs when the disk is
+     already over budget, and there it drains anything not touched in the last
+     15 minutes (`CAP_GUARD_MIN`) — mid-upload protection, not a second age
+     rule. Giving the cap the 24 h window was tried and reverted in review: it
+     turns the backstop into a no-op, because everything the age rule leaves
+     behind is by definition inside that window, so an over-cap host would free
+     nothing and alarm every hour. Both windows check the archive's own mtime
+     and its key directory's, since the runner creates the directory before it
+     writes the archive.
    - **The cap is 200 GiB, not 60.** The unit on disk is not the key, it is
      the key plus a ref-class suffix: the runner writes
      `<cache>/<namespace>/<project>/<key>-protected/cache.zip` and a separate
@@ -130,11 +141,7 @@ not bound — a hashed key is unbounded whether there are twelve of them or one.
      `fuzz` runs only on a `changes:`-matching MR or a manual run — days
      apart. Under a 24 h rule every fuzz run would start from an empty corpus,
      which is the one cache in this file whose loss is not merely a slower
-     job. The cap still applies to it, last, after every rebuildable archive —
-     and in practice the corpora are most of what the cap can ever take,
-     because the cap obeys the same window as the age rule: it does not evict
-     an archive whose key directory or own mtime falls inside it. An over-cap
-     tree made entirely of archives written today is reported, not evicted.
+     job. The cap still applies to it, last, after every rebuildable archive.
    - **The sweep refuses rather than reports zero, and its exit code says
      whether it had already deleted anything.** A missing bind mount, a failed
      `du`, a `/builds` that is not `<token>/<slot>/<ns>/<project>`, or a tree

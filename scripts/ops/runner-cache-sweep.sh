@@ -12,7 +12,8 @@
 # WHAT IT DELETES (owner's rule, 2026-09-06):
 #   <cache>   archives untouched for MAX_AGE_MIN (default 24 h); then, as a
 #             backstop, the oldest archives until the tree is under
-#             CACHE_CAP_GIB.
+#             CACHE_CAP_GIB — rebuildable archives first, fuzz corpora last,
+#             and nothing touched inside CAP_GUARD_MIN (default 15 min).
 #   <builds>  checkouts (<token>/<slot>/<namespace>/<project>) in which no file
 #             changed inside the window.
 #
@@ -65,12 +66,18 @@
 #     alone cannot see a job that has started but not yet written; the
 #     occupancy re-probe can, because the runner marks the slot busy for the
 #     whole job. A re-probe that cannot answer counts as busy.
-#   - Never deletes an archive whose key directory or own mtime falls inside
-#     the window — in EITHER pass. The runner creates the key directory before
-#     it writes the archive, so anything inside the window belongs to a job
-#     that ran today. Being over the cap does not change that: the cap drains
-#     what is outside the window, and if that is not enough it says so and
-#     exits non-zero rather than evicting live archives once an hour.
+#   - Never deletes an archive that is being written. TWO windows, and the
+#     difference is the point:
+#       the AGE rule uses MAX_AGE_MIN (24 h) — "nothing has used this in a
+#       day", so it is collectable;
+#       the CAP uses CAP_GUARD_MIN (15 min) — "nobody is writing this right
+#       now", so it is safe to evict under pressure.
+#     Both check the archive's own mtime and its key directory's, because the
+#     runner touches the directory before it writes the archive. Giving the cap
+#     the 24 h window instead would make it a second age rule: over a standing
+#     over-cap it would free nothing and alarm every hour. If what is outside
+#     the 15-minute guard is still not enough to get under the cap, the run
+#     says so and exits non-zero.
 #   - Never deletes an empty directory younger than the window, and re-emits
 #     every `find: cannot delete '<path>'` from that pass at `user.err`,
 #     counted like any other failed removal.
@@ -83,9 +90,9 @@
 # Every deletion is logged by PATH, not just counted: a sweep that ate
 # something it should not have is otherwise unreconstructable an hour later.
 #
-# Env overrides (CACHE_DIR, BUILDS_DIR, LOCK_FILE, MAX_AGE_MIN, CACHE_CAP_GIB,
-# CACHE_CAP_KIB, DOCKER_PS) exist for the self-test; the host runs it with none
-# of them set.
+# Env overrides (CACHE_DIR, BUILDS_DIR, LOCK_FILE, MAX_AGE_MIN, CAP_GUARD_MIN,
+# CACHE_CAP_GIB, CACHE_CAP_KIB, DOCKER_PS) exist for the self-test; the host
+# runs it with none of them set.
 # Invoked as `/bin/bash <path>` because it lives on vfat /boot, which cannot
 # carry an exec bit. Runs hourly from
 # /boot/config/plugins/dynamix/docker-runner-cache-sweep.cron; the channel is
@@ -108,6 +115,14 @@ CACHE_DIR="${CACHE_DIR:-/mnt/cache/appdata/gitlab-runner/cache}"
 BUILDS_DIR="${BUILDS_DIR:-/mnt/cache/appdata/gitlab-runner/builds}"
 LOCK_FILE="${LOCK_FILE:-/var/run/runner-cache-sweep.lock}"
 MAX_AGE_MIN="${MAX_AGE_MIN:-1440}"
+# The cap's guard, and deliberately NOT the 24 h window. The age rule answers
+# "has anything used this in a day"; the cap answers "is anyone writing this
+# right now". A backstop that refuses to touch anything used in the last day
+# is not a backstop — under a standing over-cap it would free nothing and
+# alarm hourly. Fifteen minutes covers a cache upload comfortably (the largest
+# archives here are a few GB over a local bind mount) without pretending a
+# warm archive is a live one.
+CAP_GUARD_MIN="${CAP_GUARD_MIN:-15}"
 CACHE_CAP_GIB="${CACHE_CAP_GIB:-200}"
 # The same cap expressed in KiB. Unset on the host; it is the self-test's
 # seam, so the drain loop's arithmetic can be exercised against kilobyte
@@ -182,9 +197,9 @@ signed_kib() { # signed_kib <delta-kib>
 # window, OR the scan itself failed. A scan that errored is not evidence of
 # staleness, and the safe reading of "I do not know" is "leave it alone".
 # `-quit` stops at the first hit, so a live tree costs one hit, not a walk.
-must_keep() { # must_keep <path>
-    local out
-    out="$(find "$1" -mmin -"$MAX_AGE_MIN" -print -quit 2>/dev/null)" || return 0
+must_keep() { # must_keep <path> [window-min, default MAX_AGE_MIN]
+    local window="${2:-$MAX_AGE_MIN}" out
+    out="$(find "$1" -mmin -"$window" -print -quit 2>/dev/null)" || return 0
     [ -n "$out" ]
 }
 
@@ -387,14 +402,14 @@ sweep_cache_cap() {
         [ "$size_kb" -gt "$cap_kb" ] || break
         # Deleted by the age pass or by a runner between the scan and here.
         [ -e "$f" ] || continue
-        # The SAME guards as the age pass. Being over the cap is not a licence
-        # to delete an archive a job is using: the runner touches the key
-        # directory before it writes, and it touches the archive when it
-        # writes, so anything inside the window belongs to a job that ran
-        # today. If that leaves the tree over the cap, this run says so
-        # (below) instead of evicting live data hourly.
+        # The same guard shape as the age pass, over a much shorter window.
+        # The runner touches the key directory before it writes the archive
+        # and the archive as it writes, so anything touched in the last
+        # CAP_GUARD_MIN minutes is an upload in flight — the one thing a
+        # backstop must not delete. Everything older is fair game, which is
+        # what makes this a backstop rather than a second age rule.
         parent="$(dirname -- "$f")"
-        if must_keep "$parent" || must_keep "$f"; then
+        if must_keep "$parent" "$CAP_GUARD_MIN" || must_keep "$f" "$CAP_GUARD_MIN"; then
             cap_in_use=$((cap_in_use + 1))
             continue
         fi
@@ -422,7 +437,7 @@ sweep_cache_cap() {
     # The size is an estimate — the measurement is taken once and each removed
     # file subtracted from it, rather than re-walking the whole tree per
     # deletion; the honest number is in the net line at the end.
-    log "cache: cap summary: removed $removed, in-use $cap_in_use, failed $cap_failed, unmeasured $cap_unmeasured, tree now ~$(human_kib "$size_kb") (cap $cap_label)"
+    log "cache: cap summary: removed $removed, in-use $cap_in_use, failed $cap_failed, unmeasured $cap_unmeasured, tree now ~$(human_kib "$size_kb") (cap $cap_label, guard ${CAP_GUARD_MIN}min)"
     # The alarm is on the OUTCOME, not on one of its causes. Whatever the
     # reason — nothing matched the archive glob, the candidates vanished under
     # us, a removal failed — a tree still over the cap when the drain ends
@@ -452,7 +467,7 @@ cap_alarm() { # cap_alarm <size-kb> <cap-label> <matched> <drained> <failed> <in
 
     # Everything the drain left behind belongs to a job inside the window.
     if [ "$cap_in_use" -gt 0 ] && [ "$((matched - drained))" -eq "$cap_in_use" ]; then
-        die "$head; everything left is in use ($cap_in_use archive(s) inside the window)"
+        die "$head; everything left was touched within the last ${CAP_GUARD_MIN} min ($cap_in_use archive(s))"
     fi
 
     reason="$matched archive(s) matched '*.zip', $drained drained, $cap_failed refused, $cap_in_use in use, $cap_unmeasured unmeasured"
