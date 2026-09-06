@@ -1,6 +1,6 @@
 # Status
 
-**Updated:** 2026-09-06 12:35 UTC · **Integration branch:** `develop` @ `1f0194e` · **Release branch:** `main` @ `75e8d66` · **Owner:** Starscream (Seekers)
+**Updated:** 2026-09-06 13:40 UTC · **Integration branch:** `develop` @ `1f0194e` · **Release branch:** `main` @ `75e8d66` · **Owner:** Starscream (Seekers)
 
 Radiator for the working project. Tracker of record is GitLab `origin`
 (decision 14); milestones in [docs/bots/ROADMAP.md](docs/bots/ROADMAP.md);
@@ -76,14 +76,16 @@ for the owner.
 
 ## Blockers
 
-- **#85 — the CI runner's disk cannot hold the cache design.** Pruned once;
-  refilled within 15 minutes with four pipelines restoring per-job
-  `target-<job>` caches (20271: jobs 28963/28965/28967 `No space left`). Owner
-  decision 2026-09-06: change the pipeline. **MR !6** (`thundercracker/issue-85`,
-  decision 15): 12 multi-GB build caches → 1 (`target-deny`, sole writer
-  `check`), none on one-shot jobs, `df -h` first in every Rust job. Its own
-  pipeline is the test. Until it merges, red pipelines on this host are infra,
-  not the change — !2 got a green run (20260) in the window after the prune.
+- **#85 — diagnosed and half-fixed on the host (owner-approved).** Root
+  cause was never Rust or GitLab: on `enterprise` (Unraid) job `/builds` and
+  `/cache` were anonymous docker volumes inside the 80 GB `docker.img`, with
+  `concurrent = 6`, and GitLab's local cache has no eviction (every hashed key
+  leaves its old zip). Applied: `concurrent = 2`; `/builds` + `/cache` bound to
+  the NVMe (`/mnt/cache/appdata/gitlab-runner/…`, 672 GB free); runner
+  restarted, `max_builds=2`. **Not applied (automation may not run destructive
+  docker/rm on the host):** the docker prune and the daily sweep install — both
+  handed to the owner as exact commands on #85. **MR !6** is being reworked to
+  fixed cache keys (bounded growth) + the sweep script, decision 15.
 - The `shutdown_windows` timeouts are a fixed 10s wall-clock bound
   (`crates/luabox-lsp/tests/shutdown_windows.rs:56`) that fails only under
   CI-scale load — #84, backlog, not a regression.
