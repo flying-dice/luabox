@@ -1,6 +1,6 @@
 # Status
 
-**Updated:** 2026-09-06 12:05 UTC · **Integration branch:** `develop` @ `1f0194e` · **Release branch:** `main` @ `75e8d66` · **Owner:** Starscream (Seekers)
+**Updated:** 2026-09-06 12:35 UTC · **Integration branch:** `develop` @ `1f0194e` · **Release branch:** `main` @ `75e8d66` · **Owner:** Starscream (Seekers)
 
 Radiator for the working project. Tracker of record is GitLab `origin`
 (decision 14); milestones in [docs/bots/ROADMAP.md](docs/bots/ROADMAP.md);
@@ -79,10 +79,11 @@ for the owner.
 - **#85 — the CI runner's disk cannot hold the cache design.** Pruned once;
   refilled within 15 minutes with four pipelines restoring per-job
   `target-<job>` caches (20271: jobs 28963/28965/28967 `No space left`). Owner
-  decision 2026-09-06: change the pipeline. Thundercracker is producing the
-  MR (one shared target cache per RUSTFLAGS profile, none on one-shot jobs;
-  decision 15). Until it merges, red pipelines on this host are infra, not the
-  change — !2 got a green run (20260) in the window after the prune.
+  decision 2026-09-06: change the pipeline. **MR !6** (`thundercracker/issue-85`,
+  decision 15): 12 multi-GB build caches → 1 (`target-deny`, sole writer
+  `check`), none on one-shot jobs, `df -h` first in every Rust job. Its own
+  pipeline is the test. Until it merges, red pipelines on this host are infra,
+  not the change — !2 got a green run (20260) in the window after the prune.
 - The `shutdown_windows` timeouts are a fixed 10s wall-clock bound
   (`crates/luabox-lsp/tests/shutdown_windows.rs:56`) that fails only under
   CI-scale load — #84, backlog, not a regression.
@@ -99,5 +100,8 @@ feature branch.
   on #85.
 - **!2** `starscream/issue-69 → develop` (LB0320/LB0321) — Shockwave's round
   closed at `e02f7c6`, re-review requested.
-- **!4** `skywarp/issue-78 → develop` — threads addressed at `72e081a`.
+- **!4** `skywarp/issue-78 → develop` — threads addressed at `72e081a`;
+  pipeline re-run after !6.
+- **!6** `thundercracker/issue-85 → develop` — cache policy sized to the
+  runner (decision 15). Merge first; then re-run !4/!5 pipelines.
 - Merged this sprint: **!1** (#70), **!3** (#81).

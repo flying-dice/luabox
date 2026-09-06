@@ -6,7 +6,7 @@ agent: starscream
 live: true
 status: MRs !2/!4/!5 review-ready; all pipelines blocked on runner disk (#85)
 progress: 88
-updatedAt: 2026-09-06T12:05:00.000Z
+updatedAt: 2026-09-06T12:35:00.000Z
 ---
 # Seekers adoption sprint — sign the repo off as run to standard
 
@@ -27,7 +27,8 @@ Decision 14 records the takeover terms; `docs/bots/ROADMAP.md` M0 lists the exit
 - [x] #70 `collect_class` per-key winner accessor for the LSP — MR !1 approved by Shockwave, merged to develop
 - [ ] #78 LSP didChange-on-unopened guard — MR !4 open, Shockwave reviewing
 - [x] #81 Cargo manifest hygiene — MR !3 merged to develop
-- [ ] Open issues re-triaged; owner-action issues labelled and noted
+- [x] Open issues re-triaged; owner-action issues labelled and noted
+- [ ] #85 cache policy — MR !6 (decision 15), pipeline gating; merge before re-running !4/!5
 
 ## Comments
 
@@ -39,3 +40,4 @@ Decision 14 records the takeover terms; `docs/bots/ROADMAP.md` M0 lists the exit
 - **starscream** (2026-09-06T10:50:00.000Z): Merged-tree gates green — fmt, clippy, 3032 passed / 0 failed / 7 ignored over 72 binaries, cucumber 924/924 + 235/235. Pushed and opened MR !5 into `develop` (reviewer Shockwave). Shockwave's re-review on !2 (#69) is FAIL with one blocker — `crates/luabox-types/src/check.rs:2363`'s `Optional | Array | Paren` arm silences LB0321 on wrapped `Base<?>`; dispatched Thundercracker with Shockwave's probe table as the contract. !4 (#78) threads are addressed at `72e081a` but pipeline 20253 died on **runner disk** (jobs 28833/28838, `No space left on device`) — filed #85 as owner action; the per-job `target-<job>` caches in .gitlab-ci.yml:96-108 are the structural cause.
 - **starscream** (2026-09-06T11:10:00.000Z): Thundercracker closed Shockwave's !2 round: `crates/luabox-types/src/check.rs:2360` `unnamed_parent_entry` loses its `Optional | Array | Paren` arm (`Named => None`, else `first_error()`); red-first pin in `crates/luabox-types/tests/malformed_class_headers.rs` (15/15), corpus row 69 `malformed_class_wrapped_generic_parent_argument`, explain/limitations/CHANGELOG corrected. I verified the diff and re-ran the test binary. Replied on threads `6f03acd`/`508d374`/`ba3f685`, resolved, @shockwave re-requested. Filed #86 (unreadable type argument silent everywhere — the gap the fix documents). Pipelines 20243/20253/20256 all red on the runner's disk (#85) — nothing merges until the owner prunes the host.
 - **starscream** (2026-09-06T12:05:00.000Z): Owner pruned runner 3; it refilled by 11:36 under four concurrent pipelines (20271 `check`/`coverage-unit`/`examples` `No space left`, `coverage-e2e` profile merge). Owner chose the pipeline change over growing the host. Dispatched Thundercracker on #85: `.gitlab-ci.yml:216-247` cache anchors → one target cache per RUSTFLAGS profile, none on one-shot jobs, `df -h` in `.rust` before_script, decision 15. Meanwhile: !2 green at 20260; `main` 20262 green; !5 round 1 closed at `a65bcd0` (the runner's own Starscream operator pushed `0d7142f`/`9764530` — accepted after review; I untracked the gitignored manifests it missed); !4 stuck `canceling` on the wedged runner.
+- **starscream** (2026-09-06T12:35:00.000Z): Thundercracker delivered MR !6: `.gitlab-ci.yml:253-294` cache anchors collapse 12 multi-GB `target-<job>` caches to one `target-deny` (writer `check`, readers `pull`), `cargo-home` kept, one-shot jobs uncached, `df -h` opens `.rust`'s before_script; `decisions/15-one-target-cache-per-rustflags-profile.md`. `glab ci lint` valid; compiled table checked. Accepted its single-writer call. Gating !6's pipeline alone. Sequence after green: Shockwave → owner merge !6 → re-run !4/!5 → merge → promotion MR.
