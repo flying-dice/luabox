@@ -35,6 +35,7 @@
 #   cap loop stops subtracting        -> S11b, S12, S12b
 #   cap drains strictly oldest-first  -> S12, S12b
 #   failed freshness scan reads stale -> S21
+#   per-checkout occupancy re-probe deleted, or its answer ignored -> S22, S23
 # Every mutation above was rejected by at least one case, none by a case that
 # was merely counting log lines. Re-run one with:
 #   cp scripts/ops/runner-cache-sweep.sh /tmp/mutant.sh && $EDITOR /tmp/mutant.sh
@@ -87,6 +88,32 @@ cat >"$shim/docker-slot1" <<'SHIM'
 # One job running in concurrency slot 1, named as the runner names them.
 echo "runner-zAbCd-project-40-concurrent-1-a1b2c3d4-build"
 echo "gitlab-runner"
+SHIM
+
+cat >"$shim/docker-becomes-busy" <<'SHIM'
+#!/bin/bash
+# Idle on the FIRST call (the run-level probe), and running a job in slot 0 on
+# every call after it: a job that started while the sweep was walking the tree.
+# The counter lives in a file because each call is a separate process.
+count_file="${SELFTEST_DOCKER_COUNT:?}"
+n="$(cat "$count_file" 2>/dev/null || echo 0)"
+printf '%s\n' "$((n + 1))" >"$count_file"
+if [ "$n" -ge 1 ]; then
+    echo "runner-zAbCd-project-40-concurrent-0-a1b2c3d4-build"
+fi
+SHIM
+
+cat >"$shim/docker-dies-mid-run" <<'SHIM'
+#!/bin/bash
+# Answers the run-level probe (nothing running) and then stops answering: the
+# daemon went away, or the client did, while the sweep was mid-tree.
+count_file="${SELFTEST_DOCKER_COUNT:?}"
+n="$(cat "$count_file" 2>/dev/null || echo 0)"
+printf '%s\n' "$((n + 1))" >"$count_file"
+if [ "$n" -ge 1 ]; then
+    echo "Cannot connect to the Docker daemon" >&2
+    exit 1
+fi
 SHIM
 
 cat >"$shim/docker-broken" <<'SHIM'
@@ -178,10 +205,12 @@ run_sweep() { # run_sweep <case> <fixture> [VAR=value...]
     sweep_log="$work/$case_name.log"
     sweep_syslog="$work/$case_name.syslog"
     : >"$sweep_syslog"
+    : >"$work/$case_name.dockercount"
     sweep_rc=0
     env \
         PATH="$shim:$PATH" \
         SELFTEST_LOGGER_LOG="$sweep_syslog" \
+        SELFTEST_DOCKER_COUNT="$work/$case_name.dockercount" \
         CACHE_DIR="$fx/cache" \
         BUILDS_DIR="$fx/builds" \
         LOCK_FILE="$fx/lock" \
@@ -543,6 +572,39 @@ age_tree "$fx" 30
 run_sweep s18b "$fx"
 assert_exit S18b_a_run_that_removes_nothing_reports_no_change 0 "$sweep_rc" "$sweep_log" \
     "net +0 MiB"
+
+# --- S22: a slot that goes busy DURING the sweep ---------------------------
+# The run-level occupancy probe is minutes old by the time a multi-GB tree
+# finishes scanning, and a job that has started but not yet written a file is
+# invisible to the freshness probes — the runner, however, has already marked
+# the slot busy. So occupancy is re-read per checkout, as the last thing before
+# `rm -rf`. Note the summary: the run-level probe saw slot 0 IDLE (busy slots
+# 0), which is what makes this case discriminate the re-probe rather than the
+# run-level skip.
+fx="$(mkfixture s22)"
+co="$fx/builds/zAbCd/0/flying-dice/luabox"
+mkfile "$co/target/debug/build.o" 8
+age_tree "$fx" 4320
+run_sweep s22 "$fx" DOCKER_PS="$shim/docker-becomes-busy"
+assert_exit S22_a_slot_that_goes_busy_mid_sweep_keeps_its_checkout 0 "$sweep_rc" "$sweep_log" \
+    "builds: slot 0 became busy during the sweep — kept $co" \
+    "builds: summary: removed 0, busy slots 0, in-use 0, busy on re-probe 1" \
+    "!builds: removed $co"
+survives "S22 the checkout a job just claimed is kept" "$co"
+
+# --- S23: the re-probe cannot answer ---------------------------------------
+# Same degrade as at run level, applied at the point it matters most: if the
+# occupancy question cannot be answered immediately before `rm -rf`, the answer
+# is busy.
+fx="$(mkfixture s23)"
+co="$fx/builds/zAbCd/0/flying-dice/luabox"
+mkfile "$co/target/debug/build.o" 8
+age_tree "$fx" 4320
+run_sweep s23 "$fx" DOCKER_PS="$shim/docker-dies-mid-run"
+assert_exit S23_a_re_probe_that_cannot_answer_counts_as_busy 0 "$sweep_rc" "$sweep_log" \
+    "builds: slot-occupancy re-probe unavailable — kept $co" \
+    "builds: summary: removed 0, busy slots 0, in-use 0, busy on re-probe 1"
+survives "S23 the checkout is kept when the probe stops answering" "$co"
 
 # --- S21: a freshness scan that ERRORS is not evidence of staleness --------
 # The probe is what stands between `rm -rf` and a live checkout. If it fails —

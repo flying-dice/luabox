@@ -137,9 +137,12 @@ not bound — a hashed key is unbounded whether there are twelve of them or one.
      pre-bind layout in particular was never swept and never reported. All
      three now exit 2 with `logger -p user.err` and delete nothing. It also
      takes a lock, skips concurrency slots with a running job container, and
-     re-checks freshness immediately before each `rm` — it races a live
-     runner, and a review reproduced it deleting a checkout a job had just
-     started in.
+     re-checks both freshness and slot occupancy immediately before each
+     `rm -rf` — it races a live runner, and a review reproduced it deleting a
+     checkout a job had just started in. The occupancy re-read is the one that
+     covers a job which has started but not yet written anything the mtime
+     probe could see: the runner marks the slot busy for the whole job, and a
+     probe that cannot answer counts as busy.
 
 5. **Every cache key keeps at least one `pull-push` writer.** The sweep evicts
    on mtime and the runner touches a local archive only when a job *writes*

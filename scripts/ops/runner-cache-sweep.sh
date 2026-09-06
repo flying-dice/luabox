@@ -47,12 +47,14 @@
 #     is read out of `docker ps`. If docker is unavailable or `docker ps`
 #     fails, EVERY slot is treated as busy and no checkout is removed — the
 #     one direction of that failure that cannot delete a live checkout.
-#   - Re-checks freshness immediately before every `rm`. The full-tree scan
-#     that decides a checkout is stale takes seconds on a multi-GB target dir,
-#     and a job can start inside that window (reproduced: a checkout deleted
-#     while a job was writing `.git/index.lock`). Residual window: a job that
-#     starts during the second probe. Narrowing it further means re-probing
-#     `docker ps` per checkout, which is not done here.
+#   - Re-checks freshness immediately before every `rm`, and re-reads slot
+#     occupancy per checkout as the last thing before `rm -rf`. The full-tree
+#     scan that decides a checkout is stale takes seconds on a multi-GB target
+#     dir, and a job can start inside that window (reproduced: a checkout
+#     deleted while a job was writing `.git/index.lock`). The freshness probe
+#     alone cannot see a job that has started but not yet written; the
+#     occupancy re-probe can, because the runner marks the slot busy for the
+#     whole job. A re-probe that cannot answer counts as busy.
 #   - Never deletes an archive whose key directory was touched inside the
 #     window (the runner creates that directory before writing the archive),
 #     and never deletes an empty directory younger than the window.
@@ -188,20 +190,33 @@ before="$(du_total -m "$CACHE_DIR" "$BUILDS_DIR")" ||
 busy_slots=""
 all_slots_busy=0
 
+# probe_busy_slots <announce 0|1> — re-reads slot occupancy from scratch. It
+# is called once at the top of the run (announce=1, so the picture is in the
+# log) and again immediately before every `rm -rf` (announce=0, or an hourly
+# sweep would repeat the same two lines once per checkout).
 probe_busy_slots() {
+    local announce="$1"
     local names name
+    busy_slots=""
+    all_slots_busy=0
     if [ -n "$DOCKER_PS" ]; then
         if ! names="$("$DOCKER_PS" 2>/dev/null)"; then
-            log "builds: DOCKER_PS ($DOCKER_PS) failed — treating every slot as busy"
+            if [ "$announce" = 1 ]; then
+                log "builds: DOCKER_PS ($DOCKER_PS) failed — treating every slot as busy"
+            fi
             all_slots_busy=1
             return 0
         fi
     elif ! command -v docker >/dev/null 2>&1; then
-        log "builds: docker not found — treating every slot as busy"
+        if [ "$announce" = 1 ]; then
+            log "builds: docker not found — treating every slot as busy"
+        fi
         all_slots_busy=1
         return 0
     elif ! names="$(docker ps --format '{{.Names}}' 2>/dev/null)"; then
-        log "builds: 'docker ps' failed — treating every slot as busy"
+        if [ "$announce" = 1 ]; then
+            log "builds: 'docker ps' failed — treating every slot as busy"
+        fi
         all_slots_busy=1
         return 0
     fi
@@ -222,9 +237,10 @@ probe_busy_slots() {
             ;;
         esac
     done <<<"$names"
-    if [ "${#seen[@]}" -gt 0 ]; then
+    if [ "$announce" = 1 ] && [ "${#seen[@]}" -gt 0 ]; then
         log "builds: slot(s) ${seen[*]} busy"
     fi
+    return 0
 }
 
 slot_is_busy() { # slot_is_busy <slot>
@@ -237,7 +253,7 @@ slot_is_busy() { # slot_is_busy <slot>
     return 1
 }
 
-probe_busy_slots
+probe_busy_slots 1
 
 # ---------------------------------------------------------------------------
 # 1. cache archives untouched for MAX_AGE_MIN
@@ -333,7 +349,7 @@ sweep_cache_cap() {
 # ---------------------------------------------------------------------------
 sweep_builds() {
     local list="$work/builds" token slot name d
-    local removed=0 busy=0 in_use=0
+    local removed=0 busy=0 in_use=0 busy_late=0
     local -a checkouts=()
     for token in "$BUILDS_DIR"/*; do
         for slot in "$token"/*; do
@@ -360,6 +376,23 @@ sweep_builds() {
                     in_use=$((in_use + 1))
                     continue
                 fi
+                # Last thing before the delete: re-read slot occupancy. The
+                # run-level probe is minutes old by the time a multi-GB tree
+                # finishes scanning, and the runner marks a slot busy for the
+                # WHOLE job — so this catches a job that started during the
+                # scan even before it has written a file the freshness probes
+                # above could see. A probe that cannot answer (docker gone,
+                # daemon down) counts as busy, exactly as at run level.
+                probe_busy_slots 0
+                if slot_is_busy "$name"; then
+                    busy_late=$((busy_late + 1))
+                    if [ "$all_slots_busy" = 1 ]; then
+                        log "builds: slot-occupancy re-probe unavailable — kept $d"
+                    else
+                        log "builds: slot $name became busy during the sweep — kept $d"
+                    fi
+                    continue
+                fi
                 if rm -rf -- "$d"; then
                     removed=$((removed + 1))
                     log "builds: removed $d"
@@ -373,7 +406,7 @@ sweep_builds() {
             fi
         done
     done
-    log "builds: summary: removed $removed, busy slots $busy, in-use $in_use (window ${MAX_AGE_MIN}min)"
+    log "builds: summary: removed $removed, busy slots $busy, in-use $in_use, busy on re-probe $busy_late (window ${MAX_AGE_MIN}min)"
 }
 
 sweep_cache_age
