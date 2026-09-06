@@ -126,6 +126,32 @@ impl Ambient {
         self.env.class_shape_bound(name, args)
     }
 
+    /// [`crate::env::TypeEnv::collect_class`]'s per-key winner for every
+    /// field of `name`'s merged shape (#70): member name → the class whose
+    /// own declaration claimed it, plus that declaration's site when a
+    /// project file's `---@field` wrote it.
+    ///
+    /// The declaration-site half of what [`Self::class_members`] already
+    /// answers for types. An editor surface that must point at *where* a
+    /// member is declared — hover's description, goto-definition's target —
+    /// otherwise has to re-derive the merge from the same annotations and
+    /// hope its walk agrees with the checker's; on a diamond conflict and on
+    /// a class whose `---@field`s are split across files, it does not
+    /// ([`crate::FieldOrigin`] spells out both shapes). This is the merge's
+    /// own answer, so there is nothing for the two to disagree about.
+    ///
+    /// `None` for a name this layer does not declare as a class, matching
+    /// [`Self::class_members`]. A field with no recorded site is present with
+    /// [`FieldOrigin::site`] `None` rather than absent — see
+    /// [`crate::FieldDeclSite`] for which contributions have no site to record.
+    #[must_use]
+    pub fn class_field_origins(
+        &self,
+        name: &str,
+    ) -> Option<std::collections::BTreeMap<String, crate::FieldOrigin>> {
+        self.env.class_field_origins(name)
+    }
+
     /// Whether `name`'s ancestor chain was too deep for the most recent
     /// [`Self::class_members`]/[`Self::class_members_bound`]/
     /// [`Self::class_members_of`] call to resolve fully (`LB0317`) — a class

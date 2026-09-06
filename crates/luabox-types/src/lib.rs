@@ -98,7 +98,7 @@ pub use directive::{
     DirectiveScan, RULE_CIRCLE_DOC_CLASS, RULE_CLASS_ANCESTRY_TOO_COSTLY,
     RULE_CLASS_ANCESTRY_TOO_DEEP,
 };
-pub use env::{FileTypes, MAX_ANCESTRY_DEPTH, TypeEnv};
+pub use env::{FieldDeclSite, FieldOrigin, FileTypes, MAX_ANCESTRY_DEPTH, TypeEnv};
 pub use infer::{ExternalTypes, InferredBinding, InferredReturn};
 pub use rocks::{RockFile, RockModule, RockSurfaces};
 pub use version::VersionReq;

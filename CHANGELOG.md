@@ -358,6 +358,32 @@ is a regression against `0.2.0` or `develop`; each is a defect in an
 unreleased change, found by the production readiness review and fixed before
 the block ships.
 
+- **Hover, goto-definition and `luabox check` name one `---@field`
+  declaration for a member, not three** (#70, residual of PR #61 round-6
+  finding M2). The editor surfaces re-derived the class merge from the same
+  annotations `TypeEnv::collect_class` reads rather than consuming its
+  result, so two shapes got two different answers: a genuine diamond
+  conflict, where the merge keeps the last-visited edge; and a class whose
+  own `---@field`s are split across more than one file, where the winner is
+  per-*field* and the editor's search order checks the cursor's own file
+  first while the merge takes the first *loaded* declarer. A field declared
+  in two files could hover a type resolved from one and a description quoted
+  from the other, with goto-definition jumping to the second. `collect_class`
+  now records which class — and which file — won each key as it resolves it,
+  exposed as `Ambient::class_field_origins`, and `locate_field` consumes that
+  instead of walking the parent chain itself. An override still shows the
+  documentation it overrides: a carrier attachment — `function S.greet()`
+  against a parent that documented `greet` with `---@field` — hovers the
+  parent's description and jumps to it, exactly as before, whatever type that
+  parent declared. What no longer shows is a same-named declaration on a
+  branch the merge ruled out: for `Leaf : Mid, Other` where `Mid` attaches
+  `f` as a carrier and wins the key, `Other`'s `---@field f string` is a name
+  collision rather than a declaration of `Leaf.f`, and hover no longer quotes
+  its description nor goto-definition jumps to it — previously both did,
+  putting a `string` field's prose under the `fun()` type actually being
+  shown. Editor-surface only: no diagnostic, no resolved type, and no
+  `luabox check` verdict changes.
+
 - **A file's own `---@enum` again shadows a same-named `[types] defs` enum,
   as `---@class` always has and as this block's own duplicate-merge entry
   documents** (production readiness review). Routing `---@enum`

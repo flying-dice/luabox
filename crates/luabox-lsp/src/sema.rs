@@ -25,6 +25,7 @@ use luabox_syntax::luacats::{
     AnnotatedItem, ClassTag, FieldKey, FieldTag, FunParam, FunReturn, ParamTag, Span, Tag,
     TypeExpr, TypeExprKind,
 };
+use luabox_types::FieldOrigin;
 use rowan::{TextRange, TextSize, TokenAtOffset};
 
 use crate::line_index::LineIndex;
@@ -717,16 +718,26 @@ pub struct FieldSource {
     pub span: Span,
 }
 
-/// The invariants of one field lookup: everything [`locate_field`]'s
-/// recursive walk carries unchanged from frame to frame, so the walk itself
-/// threads only what actually varies (the class, the member, the
-/// depth-carrying visited map, the depth).
-struct LookupCtx<'a> {
-    analysis: &'a Analysis,
-    current: &'a Path,
-    ambient_paths: &'a HashSet<PathBuf>,
-    sema_cache: &'a FileSemaCache,
-    search_order_cache: &'a SearchOrderCache,
+/// The invariants of one field lookup: everything [`locate_field`] carries
+/// unchanged from frame to frame, so the walk itself threads only what
+/// actually varies (the class, the member, the depth-carrying visited map,
+/// the depth).
+///
+/// One bag rather than a parameter list because the three production callers
+/// (hover, goto-definition, signature help) all fill it from the same
+/// [`crate::merged_ambient::MergedAmbient`] and thread it unchanged through
+/// the recursion. Deliberately holds **only** the search infrastructure: what
+/// is being looked up — the class, the member, and the merge's own answer for
+/// them ([`locate_field`]'s `origin`, #70) — varies per query and is passed
+/// alongside, not folded in here.
+pub struct FieldLookup<'a> {
+    pub analysis: &'a Analysis,
+    /// The file the query is asked *from* — the cursor's own.
+    pub current: &'a Path,
+    /// The genuinely `[types] defs`-configured paths (N18).
+    pub ambient_paths: &'a HashSet<PathBuf>,
+    pub sema_cache: &'a FileSemaCache,
+    pub search_order_cache: &'a SearchOrderCache,
 }
 
 /// [`FieldSource`] for `class.member`, searched across every project file's
@@ -870,36 +881,120 @@ struct LookupCtx<'a> {
 /// description, and goto-definition's target agree on the common,
 /// non-diamond case this fixes.
 ///
-/// What this still cannot match: a genuine *diamond* conflict — the same
-/// generic ancestor reached through two parents bound to different type
-/// arguments, where `collect_class` keeps the **last**-visited edge rather
-/// than the first — and a class whose own field declarations are split
-/// across more than one file with a *per-field*, not per-file, winner.
-/// Both need `collect_class`'s own per-key winner (which file/owner
-/// contributed each resolved field), and nothing public in `luabox-types`
-/// exposes that today — `TypeEnv::class_shape_bound`/
-/// `class_shape_bound_export` are `pub(crate)` and their `TableTy` result
-/// carries no owner, only a type. The `luabox-types` accessor this would
-/// need is tracked as issue #70.
+/// **Two shapes the walk above cannot reach at all, and `origin` is how
+/// they are answered instead** (#70). Traversal order fixes the *common*
+/// disagreement; it cannot fix these, because the answer is not a function
+/// of the order this walk visits things in:
+///
+/// - A genuine *diamond* conflict — the same generic ancestor reached
+///   through two parents bound to different type arguments, where
+///   `collect_class` keeps the **last**-visited edge rather than the first.
+/// - A class whose own field declarations are split across more than one
+///   file, where the winner is per-*field*, not per-file: `search_order`
+///   hoists `current` ahead of the other ordinary project files (the R10
+///   shortcut), while `merge_file_types` takes the first declarer in
+///   `Project::files(db)` order regardless of which file the cursor is in.
+///
+/// `origin` is [`luabox_types::Ambient::class_field_origins`]' answer for
+/// this member — `collect_class`'s **own** per-key winner, produced by the
+/// same walk that resolved the type, not re-derived alongside it. Given one:
+/// a recorded [`luabox_types::FieldDeclSite`] *is* the answer, returned
+/// directly with no file visited at all; an owner with no recorded site
+/// (`FieldDeclSite` lists those cases — chiefly a carrier attachment or the
+/// definition layer) **roots the walk at that class** instead of at the one
+/// the cursor named, so a same-named declaration on a branch the owner
+/// cannot reach is never visited. `None` — a class the merged layer does not
+/// declare, or a caller with no merged layer to ask — walks from the queried
+/// class, unchanged.
+///
+/// That narrowing is a **sibling filter**: it drops exactly the classes
+/// reachable from the queried class and *not* from the owner, which
+/// contributed nothing to this key — their same-named `---@field` is a name
+/// collision the merge resolved, not a declaration of the member it
+/// resolved. The owner's **own** ancestry stays reachable whatever type it
+/// declares, because that chain is the member's override lineage and
+/// [`luabox_types::assignable`] deliberately admits an override at an
+/// incompatible type (luals 3.13.5 nominal parity): a type test here would
+/// hide documentation for a shape `luabox check` calls legal.
+///
+/// Two shapes one edge apart draw the line, both pinned at all three editor
+/// surfaces (round 10 review). `Mid` attaches `f` as a carrier and wins the
+/// key; `Other` declares `---@field f string`:
+///
+/// - `Leaf : Mid, Other` — `Other` is off the owner's ancestry, so it is
+///   **filtered** and nothing is shown
+///   (`locate_field_roots_the_walk_at_the_owner_not_the_queried_class`).
+/// - `Leaf : Mid`, `Mid : Other` — `Other` is the lineage's earlier link, so
+///   it is **kept**: its description and jump target are shown under the
+///   carrier's type
+///   (`locate_field_keeps_a_ruled_out_declaration_on_the_owners_own_ancestry`).
+///
+/// The first is why this decides *whether* a declaration is shown and not
+/// only which one — it answers `None` where the unrooted walk answered with
+/// the sibling, which is the point: a `string` field's prose under a `fun()`
+/// type is the divergence #70 closes.
 #[must_use]
 pub fn locate_field(
-    analysis: &Analysis,
-    current: &Path,
+    lookup: &FieldLookup<'_>,
     class: &str,
     member: &str,
-    ambient_paths: &HashSet<PathBuf>,
-    sema_cache: &FileSemaCache,
-    search_order_cache: &SearchOrderCache,
+    origin: Option<&FieldOrigin>,
 ) -> Option<FieldSource> {
-    let mut visited = HashMap::new();
-    let ctx = LookupCtx {
-        analysis,
-        current,
-        ambient_paths,
-        sema_cache,
-        search_order_cache,
-    };
-    locate_field_dfs(&ctx, class, member, &mut visited, 0)
+    // The merge already recorded where this key was declared: no walk of any
+    // kind can improve on that, and every walk that disagrees with it is
+    // wrong by construction.
+    //
+    // The recorded path is checked against this `Analysis` before it is
+    // returned (round 8 clean-code audit, coupling finding 1), and an
+    // unresolvable one falls through to the owner-rooted walk below, exactly
+    // as an owner with no site at all does. `luabox_types::FieldDeclSite::file`
+    // is a `String` `luabox-db` produced with `Path::to_string_lossy` for
+    // *diagnostic* display; nothing in the type system says a `PathBuf` built
+    // back out of it names a file this snapshot knows, and a non-UTF-8 path
+    // round-trips through U+FFFD to one that does not. Every site the merge
+    // records comes from a project file, so this rejects nothing in practice
+    // — it is what stops "in practice" from being the only thing holding a
+    // goto-definition target together.
+    if let Some(site) = origin.and_then(|origin| origin.site.as_ref()) {
+        let path = PathBuf::from(&site.file);
+        if lookup.analysis.files().any(|known| known == path) {
+            return Some(FieldSource {
+                path,
+                desc: site.desc.clone(),
+                span: Span {
+                    start: site.span.start,
+                    end: site.span.end,
+                },
+            });
+        }
+    }
+    // Owner known, site not (or recorded but unresolvable). All the merge's
+    // answer buys here is a better **root** for the same walk: start at the
+    // class it resolved the key to rather than at the class the cursor named,
+    // so a branch it ruled out is never entered.
+    //
+    // What that drops is the owner's *siblings*, and only those — this
+    // function's doc states the rule and names the two one-edge-apart
+    // fixtures that pin each side of it (round 10 review).
+    //
+    // The walk's own two-pass shape supplies the ordering within the lineage.
+    // `locate_field_in_class` exhausts a class's own `---@field`s across every
+    // candidate file before it follows a single parent, so the nearest link
+    // wins — the owner's own declaration over the ancestor it overrides.
+    // Asking for the owner's own declarations separately first and falling
+    // back to the walk on a miss was the same thing said twice — it rebuilt
+    // the owner's declaration set a second time on exactly the case
+    // (`function S.greet()` carriers) the walk's own doc calls routine (round
+    // 9 clean-code audit, DRY finding 1).
+    //
+    // Stopping at that first pass instead — answering a miss with `None` —
+    // was a silent revert (round 9 review, thread on `sema.rs:952`). A
+    // carrier attachment declares the member with no `---@field` anywhere in
+    // the owner, so the parent's is the only description and the only jump
+    // target that exist, and the type rendered comes from the carrier either
+    // way.
+    let root = origin.map_or(class, |origin| origin.owner.as_str());
+    locate_field_dfs(lookup, root, member, &mut HashMap::new(), 0)
 }
 
 /// [`locate_field`]'s depth-first preorder walk over the parent chain (M2),
@@ -973,7 +1068,7 @@ pub fn locate_field(
 /// (`A : B`, `B : A`) re-reaches each node at a strictly *greater* depth
 /// every time round, which is refused, so it terminates on the first lap.
 fn locate_field_dfs(
-    ctx: &LookupCtx<'_>,
+    lookup: &FieldLookup<'_>,
     class: &str,
     member: &str,
     visited: &mut HashMap<String, usize>,
@@ -989,7 +1084,7 @@ fn locate_field_dfs(
         Some(&seen) if seen <= depth => return None,
         _ => visited.insert(class.to_string(), depth),
     };
-    locate_field_in_class(ctx, class, member, visited, depth)
+    locate_field_in_class(lookup, class, member, visited, depth)
 }
 
 /// [`locate_field_dfs`]'s per-class body, two passes: `class`'s own
@@ -1010,51 +1105,77 @@ fn locate_field_dfs(
 /// [`search_order`] order, own-declarations exhausted before any parent is
 /// followed.
 fn locate_field_in_class(
-    ctx: &LookupCtx<'_>,
+    lookup: &FieldLookup<'_>,
     class: &str,
     member: &str,
     visited: &mut HashMap<String, usize>,
     depth: usize,
 ) -> Option<FieldSource> {
+    scan_class_declarations(lookup, class, |declarations| {
+        if let Some(found) = own_field_source(declarations, member) {
+            return Some(found);
+        }
+        for (_, decl) in declarations {
+            for parent in &decl.tag.parents {
+                let Some(parent_name) = named_of(parent) else {
+                    continue;
+                };
+                if let Some(found) =
+                    locate_field_dfs(lookup, &parent_name, member, visited, depth + 1)
+                {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    })
+}
+
+/// Every candidate file's own `---@class class` declaration, in
+/// [`search_order`]'s order, built once and handed to `body` — the shape
+/// production readiness review finding 7 asks for (each candidate's
+/// `FileSema` and `ClassDecl` are built one time, not once per pass), phrased
+/// as a callback because the declarations borrow the `FileSema`s that back
+/// them and so cannot outlive the call that owns them.
+fn scan_class_declarations<R>(
+    lookup: &FieldLookup<'_>,
+    class: &str,
+    body: impl FnOnce(&[(&FileSema, ClassDecl<'_>)]) -> R,
+) -> R {
     let order = search_order(
-        ctx.analysis,
-        ctx.current,
+        lookup.analysis,
+        lookup.current,
         class,
-        ctx.ambient_paths,
-        ctx.search_order_cache,
+        lookup.ambient_paths,
+        lookup.search_order_cache,
     );
     let semas: Vec<Rc<FileSema>> = order
         .iter()
-        .filter_map(|path| cached_file_sema(ctx.sema_cache, ctx.analysis, path))
+        .filter_map(|path| cached_file_sema(lookup.sema_cache, lookup.analysis, path))
         .collect();
     let declarations: Vec<(&FileSema, ClassDecl<'_>)> = semas
         .iter()
         .filter_map(|sema| sema.class_named(class).map(|decl| (&**sema, decl)))
         .collect();
-    for (sema, decl) in &declarations {
-        if let Some(field) = decl
-            .fields
+    body(&declarations)
+}
+
+/// The first candidate file that declares `member` as one of the class's
+/// **own** `---@field`s, in [`search_order`]'s order.
+fn own_field_source(
+    declarations: &[(&FileSema, ClassDecl<'_>)],
+    member: &str,
+) -> Option<FieldSource> {
+    declarations.iter().find_map(|(sema, decl)| {
+        decl.fields
             .iter()
             .find(|f| matches!(&f.key, FieldKey::Name(n) if n == member))
-        {
-            return Some(FieldSource {
+            .map(|field| FieldSource {
                 path: sema.path.clone(),
                 desc: field.desc.clone(),
                 span: field.span,
-            });
-        }
-    }
-    for (_, decl) in &declarations {
-        for parent in &decl.tag.parents {
-            let Some(parent_name) = named_of(parent) else {
-                continue;
-            };
-            if let Some(found) = locate_field_dfs(ctx, &parent_name, member, visited, depth + 1) {
-                return Some(found);
-            }
-        }
-    }
-    None
+            })
+    })
 }
 
 /// The declared `<T, U, ...>` type-parameter names of `class`'s own
@@ -1839,37 +1960,67 @@ mod tests {
         HashSet::new()
     }
 
-    /// A fresh, empty [`FileSemaCache`] — every `locate_field` test builds
-    /// its own rather than sharing one (N20's cross-call sharing is proven
-    /// end-to-end in `server.rs`, not here).
+    /// A fresh, empty [`FileSemaCache`], for the two tests that inspect one
+    /// afterwards; everything else takes [`Caches`]' own.
     fn no_cache() -> FileSemaCache {
         FileSemaCache::default()
     }
 
-    /// A fresh, empty [`SearchOrderCache`] — the `search_order` counterpart
-    /// of [`no_cache`] (M57's cross-call sharing is proven separately, in
+    /// A fresh, empty [`SearchOrderCache`] — every `locate_field` test builds
+    /// its own rather than sharing one (M57's cross-call sharing is proven
+    /// separately, in
     /// `locate_field_reuses_a_shared_search_order_cache_across_separate_calls`).
     fn no_order_cache() -> SearchOrderCache {
         SearchOrderCache::default()
     }
 
+    /// The caches and path set a [`FieldLookup`] borrows, owned somewhere
+    /// that outlives the lookup — every `locate_field` test needs all three
+    /// and almost none of them cares what is in any of them, so they are
+    /// bound once here rather than spelled out per call.
+    ///
+    /// The tests that *do* care — N20's and M57's cross-call cache reuse —
+    /// build their own [`FieldLookup`] around a cache they can inspect
+    /// afterwards, which is the whole point of those two.
+    #[derive(Default)]
+    struct Caches {
+        ambient_paths: HashSet<PathBuf>,
+        sema: FileSemaCache,
+        order: SearchOrderCache,
+    }
+
+    impl Caches {
+        /// A lookup over `analysis` with the cursor in `current`.
+        fn at<'a>(&'a self, analysis: &'a Analysis, current: &'a Path) -> FieldLookup<'a> {
+            FieldLookup {
+                analysis,
+                current,
+                ambient_paths: &self.ambient_paths,
+                sema_cache: &self.sema,
+                search_order_cache: &self.order,
+            }
+        }
+
+        /// [`Self::at`] with a genuinely `[types] defs`-configured path set
+        /// (N18) rather than the empty one.
+        fn with_ambient(ambient_paths: HashSet<PathBuf>) -> Caches {
+            Caches {
+                ambient_paths,
+                ..Caches::default()
+            }
+        }
+    }
+
     #[test]
     fn locate_field_finds_a_field_declared_in_the_same_file() {
+        let caches = Caches::default();
         let analysis = analyze_files(&[(
             "main.lua",
             "---@class Point\n---@field x number the x coordinate\n",
         )]);
         let current = root().join("main.lua");
-        let found = locate_field(
-            &analysis,
-            &current,
-            "Point",
-            "x",
-            &no_ambient(),
-            &no_cache(),
-            &no_order_cache(),
-        )
-        .expect("found");
+        let found =
+            locate_field(&caches.at(&analysis, &current), "Point", "x", None).expect("found");
         assert_eq!(found.path, root().join("main.lua"));
         assert_eq!(found.desc.as_deref(), Some("the x coordinate"));
     }
@@ -1894,13 +2045,16 @@ mod tests {
         let cache = no_cache();
         let order_cache = no_order_cache();
         locate_field(
-            &analysis,
-            &current,
+            &FieldLookup {
+                analysis: &analysis,
+                current: &current,
+                ambient_paths: &no_ambient(),
+                sema_cache: &cache,
+                search_order_cache: &order_cache,
+            },
             "Point",
             "x",
-            &no_ambient(),
-            &cache,
-            &order_cache,
+            None,
         )
         .expect("found");
         let first_built = Rc::clone(
@@ -1910,13 +2064,16 @@ mod tests {
                 .expect("point.lua cached after the first call"),
         );
         locate_field(
-            &analysis,
-            &current,
+            &FieldLookup {
+                analysis: &analysis,
+                current: &current,
+                ambient_paths: &no_ambient(),
+                sema_cache: &cache,
+                search_order_cache: &order_cache,
+            },
             "Point",
             "x",
-            &no_ambient(),
-            &cache,
-            &order_cache,
+            None,
         )
         .expect("found");
         let second_built = Rc::clone(
@@ -2011,6 +2168,7 @@ mod tests {
     /// project file, not just the receiver's own.
     #[test]
     fn locate_field_finds_a_field_declared_in_another_file() {
+        let caches = Caches::default();
         let analysis = analyze_files(&[
             ("main.lua", "local p = require(\"point\")\nprint(p.x)\n"),
             (
@@ -2019,16 +2177,8 @@ mod tests {
             ),
         ]);
         let current = root().join("main.lua");
-        let found = locate_field(
-            &analysis,
-            &current,
-            "Point",
-            "x",
-            &no_ambient(),
-            &no_cache(),
-            &no_order_cache(),
-        )
-        .expect("found");
+        let found =
+            locate_field(&caches.at(&analysis, &current), "Point", "x", None).expect("found");
         assert_eq!(found.path, root().join("point.lua"));
         assert_eq!(found.desc.as_deref(), Some("the x coordinate"));
     }
@@ -2038,58 +2188,31 @@ mod tests {
     /// across files, not just within the file it started from.
     #[test]
     fn locate_field_walks_a_parent_declared_in_another_file() {
+        let caches = Caches::default();
         let analysis = analyze_files(&[
             ("main.lua", "---@class Sub : Base\n---@field name string\n"),
             ("base.lua", "---@class Base\n---@field id number\n"),
         ]);
         let current = root().join("main.lua");
-        let found = locate_field(
-            &analysis,
-            &current,
-            "Sub",
-            "id",
-            &no_ambient(),
-            &no_cache(),
-            &no_order_cache(),
-        )
-        .expect("found");
+        let found =
+            locate_field(&caches.at(&analysis, &current), "Sub", "id", None).expect("found");
         assert_eq!(found.path, root().join("base.lua"));
     }
 
     #[test]
     fn locate_field_declines_a_field_no_ancestor_declares() {
+        let caches = Caches::default();
         let analysis = analyze_files(&[("main.lua", "---@class Point\n---@field x number\n")]);
         let current = root().join("main.lua");
-        assert!(
-            locate_field(
-                &analysis,
-                &current,
-                "Point",
-                "nope",
-                &no_ambient(),
-                &no_cache(),
-                &no_order_cache()
-            )
-            .is_none()
-        );
+        assert!(locate_field(&caches.at(&analysis, &current), "Point", "nope", None,).is_none());
     }
 
     #[test]
     fn locate_field_declines_an_undeclared_class() {
+        let caches = Caches::default();
         let analysis = analyze_files(&[("main.lua", "---@class Point\n---@field x number\n")]);
         let current = root().join("main.lua");
-        assert!(
-            locate_field(
-                &analysis,
-                &current,
-                "Nope",
-                "x",
-                &no_ambient(),
-                &no_cache(),
-                &no_order_cache()
-            )
-            .is_none()
-        );
+        assert!(locate_field(&caches.at(&analysis, &current), "Nope", "x", None,).is_none());
     }
 
     /// A class assembled purely from carrier-attached methods (no
@@ -2097,27 +2220,18 @@ mod tests {
     /// find — an honest gap, not a bug (module docs).
     #[test]
     fn locate_field_declines_a_carrier_only_attachment() {
+        let caches = Caches::default();
         let analysis = analyze_files(&[(
             "main.lua",
             "---@class Greeter\nlocal G = {}\nfunction G.greet() end\n",
         )]);
         let current = root().join("main.lua");
-        assert!(
-            locate_field(
-                &analysis,
-                &current,
-                "Greeter",
-                "greet",
-                &no_ambient(),
-                &no_cache(),
-                &no_order_cache()
-            )
-            .is_none()
-        );
+        assert!(locate_field(&caches.at(&analysis, &current), "Greeter", "greet", None,).is_none());
     }
 
     #[test]
     fn inheritance_cycles_terminate() {
+        let caches = Caches::default();
         let src = "\
 ---@class A: B
 ---@field a number
@@ -2128,48 +2242,16 @@ mod tests {
         let (analysis, path) = sema_of(src);
         // The cycle guard stops the walk; each side's own field is still
         // found, and the mutual reference does not hang the lookup.
-        assert!(
-            locate_field(
-                &analysis,
-                &path,
-                "A",
-                "a",
-                &no_ambient(),
-                &no_cache(),
-                &no_order_cache()
-            )
-            .is_some()
-        );
-        assert!(
-            locate_field(
-                &analysis,
-                &path,
-                "B",
-                "b",
-                &no_ambient(),
-                &no_cache(),
-                &no_order_cache()
-            )
-            .is_some()
-        );
+        assert!(locate_field(&caches.at(&analysis, &path), "A", "a", None,).is_some());
+        assert!(locate_field(&caches.at(&analysis, &path), "B", "b", None,).is_some());
         // The cycle also means each side can see the other's field, exactly
         // as `env::collect_class`'s own cycle guard resolves it.
-        assert!(
-            locate_field(
-                &analysis,
-                &path,
-                "A",
-                "b",
-                &no_ambient(),
-                &no_cache(),
-                &no_order_cache()
-            )
-            .is_some()
-        );
+        assert!(locate_field(&caches.at(&analysis, &path), "A", "b", None,).is_some());
     }
 
     #[test]
     fn a_non_named_parent_is_skipped() {
+        let caches = Caches::default();
         let src = "\
 ---@class Odd: { x: number }
 ---@field own string
@@ -2177,18 +2259,357 @@ mod tests {
         let (analysis, path) = sema_of(src);
         // The structural-table parent has no name to walk to; `Odd`'s own
         // field is still found, and the lookup does not panic on the shape.
-        assert!(
-            locate_field(
-                &analysis,
-                &path,
-                "Odd",
-                "own",
-                &no_ambient(),
-                &no_cache(),
-                &no_order_cache()
-            )
-            .is_some()
+        assert!(locate_field(&caches.at(&analysis, &path), "Odd", "own", None,).is_some());
+    }
+
+    // === collect_class's per-key winner (#70) =============================
+
+    /// The merged layer for a workspace, built exactly as `server.rs` builds
+    /// it — what supplies [`locate_field`]'s `origin`.
+    fn merged_of(analysis: &Analysis) -> crate::merged_ambient::MergedAmbient {
+        let base = luabox_types::stdlib_defs(Dialect::Lua54);
+        crate::merged_ambient::MergedAmbient::build(base, &analysis.project_types(), &[])
+    }
+
+    /// A recorded site naming a file this `Analysis` knows is the answer,
+    /// verbatim: the span and description come straight off the record, no
+    /// class is looked up, and a class nothing in the workspace declares
+    /// still resolves.
+    #[test]
+    fn locate_field_returns_the_recorded_declaration_site_without_walking() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[
+            ("main.lua", "local x = 1\n"),
+            ("elsewhere.lua", "---@class Real\n---@field f string real\n"),
+        ]);
+        let current = root().join("main.lua");
+        let origin = FieldOrigin {
+            owner: "Ghost".to_string(),
+            site: Some(luabox_types::FieldDeclSite {
+                file: root().join("elsewhere.lua").to_string_lossy().into_owned(),
+                span: 10..20,
+                desc: Some("recorded".to_string()),
+            }),
+        };
+        let found = locate_field(&caches.at(&analysis, &current), "Ghost", "f", Some(&origin))
+            .expect("the recorded site is the answer");
+        assert_eq!(found.path, root().join("elsewhere.lua"));
+        // Not `elsewhere.lua`'s real `---@field f` ("real", at its own span):
+        // the record is taken as given, not re-derived from the file.
+        assert_eq!(found.desc.as_deref(), Some("recorded"));
+        assert_eq!((found.span.start, found.span.end), (10, 20));
+    }
+
+    /// …and a recorded site naming a file this `Analysis` does **not** know
+    /// falls through to the owner-rooted walk rather than handing a caller a
+    /// path it cannot open. `FieldDeclSite::file` is a `String` `luabox-db` rendered with
+    /// `to_string_lossy` for diagnostics; a goto-definition target built from
+    /// one has to be checked, not assumed (round 8 clean-code audit, coupling
+    /// finding 1). `Real` declares `f` itself, so the owner's own
+    /// declarations answer here; the test below it takes the same
+    /// unresolvable site to an owner that does not.
+    #[test]
+    fn locate_field_declines_a_recorded_site_in_a_file_the_analysis_does_not_know() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[("main.lua", "---@class Real\n---@field f string own\n")]);
+        let current = root().join("main.lua");
+        let origin = FieldOrigin {
+            owner: "Real".to_string(),
+            site: Some(luabox_types::FieldDeclSite {
+                file: root().join("vanished.lua").to_string_lossy().into_owned(),
+                span: 10..20,
+                desc: Some("recorded".to_string()),
+            }),
+        };
+        let found = locate_field(&caches.at(&analysis, &current), "Real", "f", Some(&origin))
+            .expect("the walk still answers");
+        assert_eq!(found.path, current, "the walk's answer, not the record's");
+        assert_eq!(found.desc.as_deref(), Some("own"));
+    }
+
+    /// The same unresolvable site against an owner that declares nothing of
+    /// its own: the fallback carries on into the owner's parents, so a member
+    /// only an ancestor documents still has a description and a jump target.
+    ///
+    /// Round 9 review, thread on `sema.rs:922` — the fallback the comment
+    /// claimed and the fallback the code took had diverged, and no test could
+    /// see it because the case above gives both the same answer.
+    #[test]
+    fn locate_field_walks_the_owners_parents_when_a_recorded_site_does_not_resolve() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[(
+            "main.lua",
+            "---@class Base\n---@field f string the b\n\n---@class Sub : Base\n",
+        )]);
+        let current = root().join("main.lua");
+        let origin = FieldOrigin {
+            owner: "Sub".to_string(),
+            site: Some(luabox_types::FieldDeclSite {
+                file: root().join("vanished.lua").to_string_lossy().into_owned(),
+                span: 10..20,
+                desc: Some("recorded".to_string()),
+            }),
+        };
+        let found = locate_field(&caches.at(&analysis, &current), "Sub", "f", Some(&origin))
+            .expect("`Base`'s declaration answers once the site is declined");
+        assert_eq!(found.path, current, "the walk's answer, not the record's");
+        assert_eq!(found.desc.as_deref(), Some("the b"));
+    }
+
+    /// The diamond half of #70 at the editor surface: two generic ancestors,
+    /// each reached through both parents on a different binding. The merge
+    /// keeps the last-visited edge — `R`'s `Q<string>` — so hover's
+    /// description and goto-definition's target must name `Q`'s `---@field`,
+    /// not `Slot`'s, which is what the unaided preorder walk reaches first.
+    ///
+    /// Round 9 review, thread on `env.rs:3104`: the issue's headline
+    /// three-declaration fixture answers the same on `develop` as it does
+    /// here, so it evidences nothing. This one does not — the `origin`-fed
+    /// call and the unaided walk disagree, and the unaided walk is `develop`.
+    #[test]
+    fn locate_field_names_the_diamonds_last_visited_edge_not_the_walks_first() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[(
+            "main.lua",
+            "---@class Slot<T>\n---@field f T the f from Slot\n\n\
+             ---@class Q<U>\n---@field f U the f from Q\n\n\
+             ---@class L : Slot<number>, Q<number>\n\n\
+             ---@class R : Slot<string>, Q<string>\n\n\
+             ---@class Both : L, R\n",
+        )]);
+        let current = root().join("main.lua");
+        let merged = merged_of(&analysis);
+        let origin = merged
+            .class_field_origin("Both", "f")
+            .expect("`Both.f` resolves");
+        assert_eq!(origin.owner, "Q", "the last-visited edge is `R`'s `Q`");
+
+        let found = locate_field(&caches.at(&analysis, &current), "Both", "f", Some(&origin))
+            .expect("`Q`'s `---@field`");
+        assert_eq!(found.desc.as_deref(), Some("the f from Q"));
+
+        let walked = locate_field(&caches.at(&analysis, &current), "Both", "f", None)
+            .expect("the unaided walk answers too");
+        assert_eq!(
+            walked.desc.as_deref(),
+            Some("the f from Slot"),
+            "preorder reaches `L`'s `Slot` first — the answer `develop` gave, \
+             quoting a class the merge did not take the type from"
         );
+    }
+
+    /// The merge's answer roots the walk, and rooting it at the *queried*
+    /// class instead is what that buys: `Leaf : Mid, Other` with `Mid`
+    /// attaching `f` as a carrier and `Other` declaring `---@field f string`.
+    /// `member_wins`' first-listed rule gives `Mid` the key, so the type the
+    /// editor renders is the carrier's `fun()` — and a walk from `Leaf`
+    /// exhausts `Mid`'s branch, reaches `Other` and quotes `the f from
+    /// Other`, a description for a declaration the checker ruled out.
+    ///
+    /// Rooted at the owner there is nothing to quote, which is the honest
+    /// answer: no `---@field` anywhere declares the member the merge took.
+    #[test]
+    fn locate_field_roots_the_walk_at_the_owner_not_the_queried_class() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[
+            (
+                "mid.lua",
+                "---@class Mid\nlocal M = {}\nfunction M.f() end\nreturn M\n",
+            ),
+            (
+                "other.lua",
+                "---@class Other\n---@field f string the f from Other\n",
+            ),
+            ("main.lua", "---@class Leaf : Mid, Other\n"),
+        ]);
+        let current = root().join("main.lua");
+        let merged = merged_of(&analysis);
+        let origin = merged
+            .class_field_origin("Leaf", "f")
+            .expect("`Leaf.f` resolves");
+        assert_eq!(origin.owner, "Mid", "first-listed parent wins the key");
+        assert!(origin.site.is_none(), "a carrier records no `---@field`");
+
+        assert!(
+            locate_field(&caches.at(&analysis, &current), "Leaf", "f", Some(&origin)).is_none(),
+            "`Mid` declares `f` with no `---@field`, and its branch ends there"
+        );
+        // Rooted at `Leaf` — what ignoring the merge's owner would do — the
+        // walk falls out of `Mid`'s branch into `Other`'s and quotes a
+        // declaration resolved from neither the type nor the owner.
+        let from_leaf = locate_field(&caches.at(&analysis, &current), "Leaf", "f", None)
+            .expect("the unaided walk reaches `Other`");
+        assert_eq!(from_leaf.desc.as_deref(), Some("the f from Other"));
+    }
+
+    /// The other side of the line the previous test draws, one edge apart:
+    /// the same three classes, the same `owner: Mid`/`site: None`/`fun()`
+    /// resolution, with `Other` reached through `Mid`'s own `: Other` rather
+    /// than as `Leaf`'s second parent. On the owner's own ancestry it is
+    /// **kept** — deliberately, and despite declaring `string` under a
+    /// `fun()` type. See [`locate_field`]'s doc for why.
+    #[test]
+    fn locate_field_keeps_a_ruled_out_declaration_on_the_owners_own_ancestry() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[
+            (
+                "mid.lua",
+                "---@class Mid : Other\nlocal M = {}\nfunction M.f() end\nreturn M\n",
+            ),
+            (
+                "other.lua",
+                "---@class Other\n---@field f string the f from Other\n",
+            ),
+            ("main.lua", "---@class Leaf : Mid\n"),
+        ]);
+        let current = root().join("main.lua");
+        let merged = merged_of(&analysis);
+        let origin = merged
+            .class_field_origin("Leaf", "f")
+            .expect("`Leaf.f` resolves");
+        assert_eq!(origin.owner, "Mid", "the carrier owns the key either way");
+        assert!(origin.site.is_none(), "a carrier records no `---@field`");
+
+        let found = locate_field(&caches.at(&analysis, &current), "Leaf", "f", Some(&origin))
+            .expect("the owner's own ancestry is walked, not filtered");
+        assert_eq!(found.path, root().join("other.lua"));
+        assert_eq!(found.desc.as_deref(), Some("the f from Other"));
+    }
+
+    /// One class, its `---@field`s split across two files, and the cursor
+    /// sitting in the file that did **not** win the merge. `search_order`
+    /// hoists `current` ahead of every other ordinary project file (the R10
+    /// shortcut), so the unaided walk answers with the cursor's own file
+    /// while `merge_file_types` took the field from the other one — the
+    /// second of the two shapes #70 exists to close, and the one no
+    /// traversal-order fix inside this module can reach.
+    #[test]
+    fn locate_field_takes_the_merges_own_file_over_its_current_first_order() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[
+            ("a.lua", "---@class Split\n---@field f string from a\n"),
+            (
+                "main.lua",
+                "---@class Split\n---@field f number from main\n",
+            ),
+        ]);
+        let current = root().join("main.lua");
+        let walked = locate_field(&caches.at(&analysis, &current), "Split", "f", None)
+            .expect("the walk finds something");
+        assert_eq!(
+            walked.path, current,
+            "the unaided walk answers with the cursor's own file"
+        );
+
+        let merged = merged_of(&analysis);
+        let origin = merged
+            .class_field_origin("Split", "f")
+            .expect("the merged layer resolves `Split.f`");
+        let found = locate_field(&caches.at(&analysis, &current), "Split", "f", Some(&origin))
+            .expect("the recorded site");
+        assert_eq!(
+            found.path,
+            root().join("a.lua"),
+            "the merge took `f` from a.lua, so that is where it is declared"
+        );
+        assert_eq!(found.desc.as_deref(), Some("from a"));
+    }
+
+    /// An owner the merge names but has no recorded site for is asked for
+    /// its **own** declarations first: an ancestor declaring the same name is
+    /// a declaration the checker demonstrably did not use, and surfacing it
+    /// over the owner's would show a description and a jump target for a type
+    /// the editor is not rendering — the class of disagreement #70 closes.
+    #[test]
+    fn locate_field_prefers_a_named_owners_own_declaration_over_an_ancestors() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[(
+            "main.lua",
+            "---@class Base\n---@field f string the base f\n\n---@class Sub : Base\n---@field f string the sub f\n",
+        )]);
+        let current = root().join("main.lua");
+        let origin = FieldOrigin {
+            owner: "Sub".to_string(),
+            site: None,
+        };
+        let found = locate_field(&caches.at(&analysis, &current), "Sub", "f", Some(&origin))
+            .expect("`Sub` declares its own `f`");
+        assert_eq!(found.desc.as_deref(), Some("the sub f"));
+    }
+
+    /// …and when the named owner declares the member with **no** `---@field`
+    /// at all — a carrier attachment, `function S.greet()` against a parent
+    /// that documented `greet` — the walk continues into its parents rather
+    /// than answering nothing.
+    ///
+    /// This is the shape the narrowing above regressed (round 9 review,
+    /// thread on `sema.rs:952`): the type rendered comes from the carrier
+    /// either way, so withholding the ancestor costs the user the only
+    /// description and the only goto-definition target that exist and buys
+    /// no agreement in return. Reached end-to-end through the merged layer
+    /// the server actually builds, which is what produces `site: None` here.
+    #[test]
+    fn locate_field_walks_a_carrier_owners_parents_for_the_field_it_never_declared() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[
+            (
+                "base.lua",
+                "---@class Base\n---@field greet fun() the greeting from Base\n",
+            ),
+            (
+                "main.lua",
+                "---@class Sub : Base\nlocal S = {}\nfunction S.greet() end\nreturn S\n",
+            ),
+        ]);
+        let current = root().join("main.lua");
+        let merged = merged_of(&analysis);
+        let origin = merged
+            .class_field_origin("Sub", "greet")
+            .expect("`Sub.greet` resolves");
+        assert_eq!(origin.owner, "Sub", "the carrier is the owner");
+        assert!(origin.site.is_none(), "a carrier records no `---@field`");
+
+        let found = locate_field(
+            &caches.at(&analysis, &current),
+            "Sub",
+            "greet",
+            Some(&origin),
+        )
+        .expect("`Base`'s `---@field` is the only declaration there is");
+        assert_eq!(found.path, root().join("base.lua"));
+        assert_eq!(found.desc.as_deref(), Some("the greeting from Base"));
+        // Identical to the unaided walk: `Base` is on the owner's own
+        // ancestry, so the sibling filter never considers it.
+        let walked = locate_field(&caches.at(&analysis, &current), "Sub", "greet", None)
+            .expect("the unaided walk finds it too");
+        assert_eq!(walked.path, found.path);
+        assert_eq!(walked.desc, found.desc);
+    }
+
+    /// An inherited field's recorded site names the **ancestor's** file, not
+    /// the queried class's — the cross-file half of the same fix, reached
+    /// end-to-end through the merged layer the server actually builds.
+    #[test]
+    fn locate_field_follows_the_merge_to_an_ancestors_own_file() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[
+            ("base.lua", "---@class Base\n---@field b string the b\n"),
+            ("main.lua", "---@class Sub : Base\n"),
+        ]);
+        let merged = merged_of(&analysis);
+        let origin = merged
+            .class_field_origin("Sub", "b")
+            .expect("`Sub.b` resolves");
+        assert_eq!(origin.owner, "Base");
+        let found = locate_field(
+            &caches.at(&analysis, &root().join("main.lua")),
+            "Sub",
+            "b",
+            Some(&origin),
+        )
+        .expect("the recorded site");
+        assert_eq!(found.path, root().join("base.lua"));
+        assert_eq!(found.desc.as_deref(), Some("the b"));
     }
 
     // === defs-vs-project authority (round 4 review R11, round 5 review N18) =
@@ -2220,17 +2641,9 @@ mod tests {
             ),
         ]);
         let current = root().join("a_widget.lua");
-        let ambient_paths = HashSet::from([root().join("defs/widget.d.lua")]);
-        let found = locate_field(
-            &analysis,
-            &current,
-            "Widget",
-            "id",
-            &ambient_paths,
-            &no_cache(),
-            &no_order_cache(),
-        )
-        .expect("found");
+        let caches = Caches::with_ambient(HashSet::from([root().join("defs/widget.d.lua")]));
+        let found =
+            locate_field(&caches.at(&analysis, &current), "Widget", "id", None).expect("found");
         assert_eq!(found.path, root().join("defs/widget.d.lua"));
         assert_eq!(found.desc.as_deref(), Some("the id from defs"));
     }
@@ -2246,6 +2659,7 @@ mod tests {
     #[test]
     fn locate_field_visits_an_unconfigured_def_named_file_no_differently_than_any_other_project_file()
      {
+        let caches = Caches::default();
         let analysis = analyze_files(&[
             (
                 "a_widget.lua",
@@ -2257,16 +2671,8 @@ mod tests {
             ),
         ]);
         let current = root().join("a_widget.lua");
-        let found = locate_field(
-            &analysis,
-            &current,
-            "Widget",
-            "id",
-            &no_ambient(),
-            &no_cache(),
-            &no_order_cache(),
-        )
-        .expect("found");
+        let found =
+            locate_field(&caches.at(&analysis, &current), "Widget", "id", None).expect("found");
         assert_eq!(found.path, root().join("a_widget.lua"));
         assert_eq!(found.desc.as_deref(), Some("the id from a_widget"));
     }
@@ -2276,6 +2682,7 @@ mod tests {
     /// unambiguous declaration resolves to.
     #[test]
     fn locate_field_still_finds_a_single_declaration_with_a_defs_file_present() {
+        let caches = Caches::default();
         let analysis = analyze_files(&[
             ("a_widget.lua", "---@class Widget\n---@field id number\n"),
             (
@@ -2284,16 +2691,8 @@ mod tests {
             ),
         ]);
         let current = root().join("a_widget.lua");
-        let found = locate_field(
-            &analysis,
-            &current,
-            "Widget",
-            "id",
-            &no_ambient(),
-            &no_cache(),
-            &no_order_cache(),
-        )
-        .expect("found");
+        let found =
+            locate_field(&caches.at(&analysis, &current), "Widget", "id", None).expect("found");
         assert_eq!(found.path, root().join("a_widget.lua"));
     }
 
@@ -2408,6 +2807,7 @@ mod tests {
     /// tier once the walk reaches it.
     #[test]
     fn locate_field_finds_a_parent_field_in_a_defs_file_that_never_mentions_the_child() {
+        let caches = Caches::default();
         let analysis = analyze_files(&[
             ("main.lua", "---@class Sub : Base\n---@field name string\n"),
             (
@@ -2416,16 +2816,8 @@ mod tests {
             ),
         ]);
         let current = root().join("main.lua");
-        let found = locate_field(
-            &analysis,
-            &current,
-            "Sub",
-            "id",
-            &no_ambient(),
-            &no_cache(),
-            &no_order_cache(),
-        )
-        .expect("found");
+        let found =
+            locate_field(&caches.at(&analysis, &current), "Sub", "id", None).expect("found");
         assert_eq!(found.path, root().join("defs/base.d.lua"));
         assert_eq!(found.desc.as_deref(), Some("the id from base"));
     }
@@ -2437,6 +2829,7 @@ mod tests {
     /// (`is_def_file` is true for it), so the field vanished from both.
     #[test]
     fn locate_field_finds_a_field_in_an_exact_class_defs_file() {
+        let caches = Caches::default();
         // No collision on purpose (N18: a `.d.lua`-named file has no
         // elevated precedence over an ordinary project file any more) — this
         // test is about `(exact)` scanning, not precedence, so `current`
@@ -2449,16 +2842,8 @@ mod tests {
             ),
         ]);
         let current = root().join("main.lua");
-        let found = locate_field(
-            &analysis,
-            &current,
-            "Widget",
-            "id",
-            &no_ambient(),
-            &no_cache(),
-            &no_order_cache(),
-        )
-        .expect("found");
+        let found =
+            locate_field(&caches.at(&analysis, &current), "Widget", "id", None).expect("found");
         assert_eq!(found.path, root().join("defs/widget.d.lua"));
         assert_eq!(found.desc.as_deref(), Some("the id from defs"));
     }
@@ -2473,6 +2858,7 @@ mod tests {
     /// far past the depth the checker itself already gave up resolving.
     #[test]
     fn locate_field_is_bounded_by_the_same_ancestry_depth_limit_the_checker_enforces() {
+        let caches = Caches::default();
         let n = luabox_types::MAX_ANCESTRY_DEPTH + 5;
         let mut src = String::from("---@class C0\n---@field item number\n");
         for i in 1..=n {
@@ -2482,16 +2868,7 @@ mod tests {
         let (analysis, path) = sema_of(&src);
         let leaf = format!("C{n}");
         assert!(
-            locate_field(
-                &analysis,
-                &path,
-                &leaf,
-                "item",
-                &no_ambient(),
-                &no_cache(),
-                &no_order_cache(),
-            )
-            .is_none(),
+            locate_field(&caches.at(&analysis, &path), &leaf, "item", None,).is_none(),
             "a chain this deep must not resolve past the checker's own \
              {}-class limit",
             luabox_types::MAX_ANCESTRY_DEPTH
@@ -2505,6 +2882,7 @@ mod tests {
     /// off-by-one in the refusing direction.
     #[test]
     fn locate_field_resolves_fully_at_a_chain_just_inside_the_ancestry_depth_limit() {
+        let caches = Caches::default();
         let n = luabox_types::MAX_ANCESTRY_DEPTH - 1;
         let mut src = String::from("---@class C0\n---@field item number\n");
         for i in 1..=n {
@@ -2514,16 +2892,7 @@ mod tests {
         let (analysis, path) = sema_of(&src);
         let leaf = format!("C{n}");
         assert!(
-            locate_field(
-                &analysis,
-                &path,
-                &leaf,
-                "item",
-                &no_ambient(),
-                &no_cache(),
-                &no_order_cache(),
-            )
-            .is_some(),
+            locate_field(&caches.at(&analysis, &path), &leaf, "item", None,).is_some(),
             "a chain within the limit must still resolve"
         );
     }
@@ -2563,15 +2932,13 @@ mod tests {
 
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            let caches = Caches::default();
             let (analysis, path) = sema_of(&src);
             let found = locate_field(
-                &analysis,
-                &path,
+                &caches.at(&analysis, &path),
                 &format!("A{k}"),
                 "absent",
-                &no_ambient(),
-                &no_cache(),
-                &no_order_cache(),
+                None,
             );
             let _ = tx.send(found.is_some());
         });
@@ -2592,6 +2959,7 @@ mod tests {
     /// when the first branch has already visited (and rejected) a sibling.
     #[test]
     fn locate_field_still_finds_a_field_only_a_shared_diamond_ancestor_declares() {
+        let caches = Caches::default();
         let (analysis, path) = sema_of(
             "\
 ---@class Base
@@ -2602,16 +2970,8 @@ mod tests {
 ---@class Leaf : Left, Right
 ",
         );
-        let found = locate_field(
-            &analysis,
-            &path,
-            "Leaf",
-            "item",
-            &no_ambient(),
-            &no_cache(),
-            &no_order_cache(),
-        )
-        .expect("`Base.item` is reachable through either parent");
+        let found = locate_field(&caches.at(&analysis, &path), "Leaf", "item", None)
+            .expect("`Base.item` is reachable through either parent");
         assert_eq!(found.path, path);
     }
 
@@ -2622,6 +2982,7 @@ mod tests {
     /// path-scoped guard gave.
     #[test]
     fn locate_field_keeps_preorder_precedence_across_a_diamond() {
+        let caches = Caches::default();
         let (analysis, path) = sema_of(
             "\
 ---@class Deep
@@ -2634,16 +2995,8 @@ mod tests {
 ---@class Leaf : Left, Right
 ",
         );
-        let found = locate_field(
-            &analysis,
-            &path,
-            "Leaf",
-            "item",
-            &no_ambient(),
-            &no_cache(),
-            &no_order_cache(),
-        )
-        .expect("both branches declare `item`");
+        let found = locate_field(&caches.at(&analysis, &path), "Leaf", "item", None)
+            .expect("both branches declare `item`");
         assert_eq!(found.desc.as_deref(), Some("from the deep left ancestor"));
     }
 
@@ -2683,24 +3036,17 @@ mod tests {
 
     #[test]
     fn locate_field_re_expands_a_class_first_reached_too_deep_to_expand_its_parents() {
+        let caches = Caches::default();
         for parents in ["B1, Y", "Y, B1"] {
             let (analysis, path) = sema_of(&near_cap_two_reach_source(parents));
-            let found = locate_field(
-                &analysis,
-                &path,
-                "A",
-                "item",
-                &no_ambient(),
-                &no_cache(),
-                &no_order_cache(),
-            )
-            .unwrap_or_else(|| {
-                panic!(
-                    "`Z.item` is two links from `A` through the direct `Y` edge; \
+            let found = locate_field(&caches.at(&analysis, &path), "A", "item", None)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`Z.item` is two links from `A` through the direct `Y` edge; \
                      the near-cap reach through the chain must not poison it \
                      (parents: `{parents}`)"
-                )
-            });
+                    )
+                });
             assert_eq!(
                 found.desc.as_deref(),
                 Some("the deep declaration"),
@@ -2742,13 +3088,16 @@ mod tests {
 
         assert!(
             locate_field(
-                &analysis,
-                &path,
+                &FieldLookup {
+                    analysis: &analysis,
+                    current: &path,
+                    ambient_paths: &no_ambient(),
+                    sema_cache: &cache,
+                    search_order_cache: &no_order_cache(),
+                },
                 &format!("C{n}"),
                 "absent",
-                &no_ambient(),
-                &cache,
-                &no_order_cache(),
+                None,
             )
             .is_none(),
             "no class in the chain declares `absent` — the walk must miss"
@@ -2778,13 +3127,16 @@ mod tests {
         for _ in 0..2 {
             assert!(
                 locate_field(
-                    &analysis,
-                    &current,
+                    &FieldLookup {
+                        analysis: &analysis,
+                        current: &current,
+                        ambient_paths: &no_ambient(),
+                        sema_cache: &cache,
+                        search_order_cache: &order,
+                    },
                     "Leaf",
                     "item",
-                    &no_ambient(),
-                    &cache,
-                    &order,
+                    None,
                 )
                 .is_some(),
                 "`Base.item` resolves through `Leaf`"

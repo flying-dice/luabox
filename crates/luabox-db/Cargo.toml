@@ -16,10 +16,5 @@ luabox-types.workspace = true
 luabox-bundle.workspace = true
 salsa.workspace = true
 
-[dev-dependencies]
-luabox-diag.workspace = true
-luabox-syntax.workspace = true
-luabox-types.workspace = true
-
 [lints]
 workspace = true
