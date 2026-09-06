@@ -90,15 +90,63 @@
 # cache server (the runner's own trace says so: "No URL provided, cache will
 # not be downloaded from shared cache server. Instead a local version of cache
 # will be extracted"), so caches are local to that one untagged runner — which
-# is exactly where every job in this file lands, so they hit. Two entries per
-# rust job, both keyed on Cargo.lock + rust-toolchain.toml so a dependency or
-# toolchain bump invalidates them:
-#   - `cargo-home`: the registry/git checkouts and installed cargo subcommands,
-#     shared by every job (identical content, one copy).
+# is exactly where every job in this file lands, so they hit.
+#
+# THE HOST CONTRACT. This design is only affordable because of what the runner
+# host now guarantees (diagnosed and applied 2026-09-06, #85, decision 15), so
+# it is written down here rather than living in a note nobody reads:
+#   - Job `/builds` and `/cache` are bind-mounted from the host's NVMe pool
+#     (672 GB free). They used to be anonymous docker volumes INSIDE the 80 GB
+#     `docker.img`, which is why a cache-size problem arrived as
+#     `rustc-LLVM ERROR: IO failure on output stream` and `ld terminated with
+#     signal 7` in jobs that had nothing to do with the cache.
+#   - `concurrent = 2` (it was 6). At most two of these builds share the disk,
+#     the CPU and the page cache at a time.
+#   - A daily host sweep does the eviction GitLab does not do: `/cache` zips
+#     untouched for >14 d, oldest first, down to a 60 GiB cap; `/builds`
+#     checkouts untouched for >7 d.
+#
+# EVERY KEY IN THIS FILE IS FIXED. A literal, or a literal plus a variable
+# naming the job, the matrix leg or a pinned version — never `key: files:`.
+# That is the actual fix, and it is what makes the sweep above sufficient.
+# A hashed key (`key: {prefix: target-x, files: [Cargo.lock,
+# rust-toolchain.toml]}`) writes a NEW zip on every lockfile or toolchain
+# change and deletes nothing: GitLab's local cache has no eviction at all. So
+# the cache grew once per dependency bump per branch, without bound, until the
+# filesystem was full — that was the leak, not the number of caches. A fixed
+# key means exactly one archive per key, overwritten in place at job end, and
+# total cache size bounded by (keys x one tree).
+#
+# The hashed key bought a guaranteed-clean tree on a lockfile bump. Cargo's
+# fingerprinting already does that — it rebuilds the units a bump invalidates
+# — so this is a storage change, not a correctness one. The cost is that a
+# stale archive can carry artifacts nobody will use again until cargo
+# overwrites them; the sweep collects a key that falls out of use entirely.
+#
+# The entries:
+#   - `cargo-home`: registry/git checkouts and installed cargo subcommands,
+#     shared by every rust job (identical content, one copy). Jobs that only
+#     CONSUME the registry take it `policy: pull`: re-uploading a
+#     multi-hundred-MB zip of content the writer already put there is disk
+#     churn for nothing.
 #   - `target-<job>`: the build directory, keyed PER JOB, mirroring the
 #     per-job `key:` the Actions workflows pass to rust-cache. Jobs here do not
 #     agree on RUSTFLAGS (see DENY-WARNINGS below) or on profile, and a shared
-#     target dir would make them evict each other's artifacts every run.
+#     target dir would make them evict each other's artifacts every run — peak
+#     disk paid for a cache that structurally misses. With fixed keys this
+#     shape is self-limiting: N rust jobs is N trees, permanently.
+#   - `fuzz-cargo-home`, `fuzz-target-<leg>`, `fuzz-corpus-<leg>`: the fuzz
+#     matrix builds under nightly against its own `fuzz/Cargo.lock`, so it
+#     does not share the workspace's keys.
+#   - `luals-<version>`, `pwsh-<version>`: pinned third-party trees, tens of
+#     megabytes. The version IS the key; bumping a pin abandons one small
+#     archive, which the sweep collects.
+#
+# `df -h "$CI_PROJECT_DIR"` is the first line of every rust job and of `fuzz`.
+# It never fails the job; it puts the number in the first ten lines of the log
+# so a full disk is legible instead of arriving as an LLVM IO error four
+# hundred lines into a compile (decision 12's principle, applied to the
+# harness itself).
 # CARGO_HOME is moved inside the project directory because GitLab can only
 # cache paths under $CI_PROJECT_DIR; $CARGO_HOME/bin is put back on PATH so
 # directly-invoked subcommands (mutants-gate.sh does `command -v
@@ -215,11 +263,7 @@ workflow:
 # config, which nested it). Map aliases compose cleanly, and `<<:` gives the
 # read-only variant without restating the key.
 .cache-cargo-home: &cache-cargo-home
-  key:
-    prefix: cargo-home
-    files:
-      - Cargo.lock
-      - rust-toolchain.toml
+  key: cargo-home
   paths:
     - .cargo/registry/index
     - .cargo/registry/cache
@@ -234,11 +278,7 @@ workflow:
   policy: pull
 
 .cache-cargo-target: &cache-cargo-target
-  key:
-    prefix: target-$CI_JOB_NAME_SLUG
-    files:
-      - Cargo.lock
-      - rust-toolchain.toml
+  key: target-$CI_JOB_NAME_SLUG
   paths:
     - target
     # tools/differ is workspace-EXCLUDED and builds into its own target dir
@@ -944,11 +984,7 @@ fuzz:
   variables:
     CARGO_HOME: $CI_PROJECT_DIR/.cargo
   cache:
-    - key:
-        prefix: fuzz-cargo-home
-        files:
-          - fuzz/Cargo.lock
-          - rust-toolchain.toml
+    - key: fuzz-cargo-home
       paths:
         - .cargo/registry/index
         - .cargo/registry/cache
@@ -969,6 +1005,8 @@ fuzz:
       paths:
         - fuzz/corpus
   script:
+    # As in `.rust` (CACHING header): report the disk first, never fail on it.
+    - df -h "$CI_PROJECT_DIR" || true
     - export PATH="$CARGO_HOME/bin:$PATH"
     - rustup toolchain install nightly --profile minimal
     - |
