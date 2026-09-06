@@ -107,6 +107,9 @@ test:
 # Raise a floor as its number rises — never lower one to make an MR pass.
 .coverage_setup: &coverage_setup
   - rustup component add llvm-tools-preview
+  # CARGO_HOME is project-local (see `variables:`) and only exists once cargo
+  # has written to it; on a cold cache the tar target is missing.
+  - mkdir -p "$CARGO_HOME/bin"
   # Upstream prebuilt; the Actions jobs get the same binary via
   # taiki-e/install-action, which has no GitLab equivalent.
   - >
