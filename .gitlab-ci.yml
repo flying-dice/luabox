@@ -120,8 +120,8 @@
 #     `logger -p user.err` if a bind mount is missing, if ANY `du` or `find`
 #     fails (the empty-directory pass included), if `/builds` is not the layout
 #     it expects, if the tree is still over the cap when the drain ends for any
-#     reason, or if any `rm` failed — the old version read all of those as a
-#     clean sweep. Exit 2 means it stopped before deleting anything; exit 3
+#     reason, if any `rm` failed, or if a window/cap value is not a positive
+#     integer — the old version read all of those as a clean sweep. Exit 2 means it stopped before deleting anything; exit 3
 #     means it had already deleted something and says how much, because
 #     "nothing was deleted" is the one thing an operator must not be told
 #     wrongly. Source:

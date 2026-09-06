@@ -52,6 +52,10 @@
 #   - Reports every failed `rm` at `user.err` by path, counts them, and exits
 #     non-zero at the end of the run. They used to reach stderr only, which
 #     cron sends to /dev/null.
+#   - Refuses before it opens the lock if MAX_AGE_MIN, CAP_GUARD_MIN,
+#     CACHE_CAP_GIB or a set CACHE_CAP_KIB is not a positive integer, or if
+#     CAP_GUARD_MIN is not shorter than MAX_AGE_MIN. Bash arithmetic reads a
+#     malformed value as 0, and a 0-minute age window deletes the cache.
 #   - `flock -n`: the hourly cron run and a manual run never overlap.
 #   - Skips any slot whose job container is running. The runner names them
 #     `runner-<token>-project-<id>-concurrent-<slot>-<hash>-build`, so the slot
@@ -114,7 +118,7 @@ LOG_TAG=runner-cache-sweep
 CACHE_DIR="${CACHE_DIR:-/mnt/cache/appdata/gitlab-runner/cache}"
 BUILDS_DIR="${BUILDS_DIR:-/mnt/cache/appdata/gitlab-runner/builds}"
 LOCK_FILE="${LOCK_FILE:-/var/run/runner-cache-sweep.lock}"
-MAX_AGE_MIN="${MAX_AGE_MIN:-1440}"
+MAX_AGE_MIN="${MAX_AGE_MIN-1440}"
 # The cap's guard, and deliberately NOT the 24 h window. The age rule answers
 # "has anything used this in a day"; the cap answers "is anyone writing this
 # right now". A backstop that refuses to touch anything used in the last day
@@ -122,8 +126,8 @@ MAX_AGE_MIN="${MAX_AGE_MIN:-1440}"
 # alarm hourly. Fifteen minutes covers a cache upload comfortably (the largest
 # archives here are a few GB over a local bind mount) without pretending a
 # warm archive is a live one.
-CAP_GUARD_MIN="${CAP_GUARD_MIN:-15}"
-CACHE_CAP_GIB="${CACHE_CAP_GIB:-200}"
+CAP_GUARD_MIN="${CAP_GUARD_MIN-15}"
+CACHE_CAP_GIB="${CACHE_CAP_GIB-200}"
 # The same cap expressed in KiB. Unset on the host; it is the self-test's
 # seam, so the drain loop's arithmetic can be exercised against kilobyte
 # fixtures instead of two hundred gigabytes of them.
@@ -207,6 +211,29 @@ must_keep() { # must_keep <path> [window-min, default MAX_AGE_MIN]
 # Preconditions. Everything that can refuse, refuses BEFORE anything is
 # deleted — decision 15's "check this first" applied to the sweep itself.
 # ---------------------------------------------------------------------------
+# The knobs come from a cron line and an env file, and bash arithmetic reads
+# anything non-numeric as 0 — `MAX_AGE_MIN=1440min` would make the age rule
+# "untouched for 0 minutes", i.e. delete everything. Validate before anything
+# opens a lock, let alone deletes: exit 2, nothing touched, the variable and
+# the offending value named.
+for _knob in MAX_AGE_MIN CAP_GUARD_MIN CACHE_CAP_GIB; do
+    _value="${!_knob}"
+    if [[ ! "$_value" =~ ^[1-9][0-9]*$ ]]; then
+        die "$_knob must be a positive integer, got: '$_value'"
+    fi
+done
+if [ -n "$CACHE_CAP_KIB" ] && [[ ! "$CACHE_CAP_KIB" =~ ^[1-9][0-9]*$ ]]; then
+    die "CACHE_CAP_KIB must be a positive integer when set, got: '$CACHE_CAP_KIB'"
+fi
+unset _knob _value
+# The two windows are not interchangeable and the cap's must be the shorter
+# one. Equal or longer turns the backstop into a second age rule: everything
+# the age pass leaves behind is inside that window by definition, so the drain
+# would free nothing and alarm every hour instead.
+if [ "$CAP_GUARD_MIN" -ge "$MAX_AGE_MIN" ]; then
+    die "CAP_GUARD_MIN ($CAP_GUARD_MIN) must be shorter than MAX_AGE_MIN ($MAX_AGE_MIN) — a cap guard as long as the age window makes the cap a second age rule and it would free nothing"
+fi
+
 if ! command -v flock >/dev/null 2>&1; then
     die "flock not found; refusing to sweep without a lock"
 fi
@@ -462,22 +489,28 @@ sweep_cache_cap() {
 cap_alarm() { # cap_alarm <size-kb> <cap-label> <matched> <drained> <failed> <in-use> <unmeasured>
     local size_kb="$1" cap_label="$2" matched="$3" drained="$4"
     local cap_failed="$5" cap_in_use="$6" cap_unmeasured="$7"
-    local head example="" reason
+    local head example="" residue="" reason
     head="cache is $(human_kib "$size_kb"), over the $cap_label cap"
 
-    # Everything the drain left behind belongs to a job inside the window.
+    # Probe the residue FIRST. The two conditions are not exclusive — a cache
+    # can hold a live archive AND a pile the glob cannot see — and answering
+    # only the first one sends the operator after the wrong thing: "everything
+    # left is in use" reads as "wait an hour", when the space is actually in a
+    # `cache.zst` no amount of waiting will collect.
+    example="$(find "$CACHE_DIR" -type f ! -name '*.zip' -print -quit 2>/dev/null)" || example=""
+    if [ -n "$example" ]; then
+        residue="; files under $CACHE_DIR do not match the '*.zip' glob this sweep drains, e.g. $example"
+    elif [ "$matched" -eq 0 ]; then
+        residue="; nothing under $CACHE_DIR matches '*.zip' and there are no other files either — the space is non-archive content"
+    fi
+
+    # Everything the drain left behind is either being written or unscannable.
     if [ "$cap_in_use" -gt 0 ] && [ "$((matched - drained))" -eq "$cap_in_use" ]; then
-        die "$head; everything left was touched within the last ${CAP_GUARD_MIN} min ($cap_in_use archive(s))"
+        die "$head; $cap_in_use archive(s) touched within the last ${CAP_GUARD_MIN} min or unscannable$residue"
     fi
 
     reason="$matched archive(s) matched '*.zip', $drained drained, $cap_failed refused, $cap_in_use in use, $cap_unmeasured unmeasured"
-    example="$(find "$CACHE_DIR" -type f ! -name '*.zip' -print -quit 2>/dev/null)" || example=""
-    if [ -n "$example" ]; then
-        reason="$reason; files under $CACHE_DIR do not match the '*.zip' glob this sweep drains, e.g. $example"
-    elif [ "$matched" -eq 0 ]; then
-        reason="$reason; nothing under $CACHE_DIR matches '*.zip' and there are no other files either — the space is non-archive content"
-    fi
-    die "$head: $reason"
+    die "$head: $reason$residue"
 }
 
 # Empty directories older than the window. An empty directory a runner created

@@ -47,6 +47,9 @@
 #   must_keep ignores its window argument -> S11b, S12b, S12c
 #   the "touched within the last N min" alarm text dropped -> S12
 #   corpus no longer drained last     -> S12c, S12d
+#   residue probed only after the in-use early return -> S33
+#   knob validation deleted           -> S34a-f
+#   the CAP_GUARD_MIN < MAX_AGE_MIN check deleted -> S35, S35b
 #   per-candidate du failure fatal again -> S32
 #   empty-dir stderr neither re-emitted nor counted -> S31
 #   alarm reason goes back to a fixed guess -> S25, S25b, S27
@@ -68,6 +71,12 @@
 #     pass on a dev box and measure nothing in the job. What IS pinned is that
 #     a failure there is fatal (S29) and that a refused directory is named and
 #     counted (S31, through a find that reports the refusal).
+#   - The alarm's "and there are no other files either — the space is
+#     non-archive content" tail. Reaching it needs a tree that is over the cap
+#     on directories alone, and tmpfs reports zero blocks for a directory, so
+#     no fixture can produce that state on every filesystem. The rest of that
+#     message — the counters and the "files do not match the glob" clause — is
+#     pinned by S25, S25b and S27.
 #   - (Resolved, so kept only as history.) Plain-before-corpus drain order was
 #     briefly unreachable, while the cap borrowed the age pass's 24 h window
 #     and could therefore only ever see corpora. With the cap guard at
@@ -78,6 +87,14 @@
 #   cp scripts/ops/runner-cache-sweep.sh /tmp/mutant.sh && $EDITOR /tmp/mutant.sh
 #   RUNNER_CACHE_SWEEP_BIN=/tmp/mutant.sh bash scripts/tests/runner-cache-sweep-selftest.sh
 #   RUNNER_CACHE_SWEEP_CI_YML=/tmp/mutant-ci.yml bash scripts/tests/runner-cache-sweep-selftest.sh
+#
+# Scratch lives under TMPDIR (the fixtures are one `mktemp -d`), and that is a
+# seam this suite is meant to be exercised through: run it once with TMPDIR on
+# a disk filesystem and once on a tmpfs. They disagree about what a directory
+# costs — 4 KiB each on ext4, nothing on tmpfs — so any threshold that leans on
+# directory overhead passes on one and fails on the other. Both runs must be
+# green:
+#   TMPDIR=/dev/shm/sweep-selftest bash scripts/tests/runner-cache-sweep-selftest.sh
 #
 #   bash scripts/tests/runner-cache-sweep-selftest.sh
 # ===========================================================================
@@ -288,6 +305,20 @@ ln -s "$shim/logger" "$nodocker/logger"
 # the suite: S1 sits one minute either side of the window, and a suite slow
 # enough to drift a minute would flip it.
 at() { printf '@%s\n' "$(($(date +%s) - $1 * 60))"; }
+
+# EVERY size threshold in this file is derived from bytes this file writes,
+# never from a round number that happens to work here. Directory overhead is
+# filesystem-dependent — ext4 charges 4 KiB per directory, tmpfs charges
+# nothing — so a cap chosen close to a tree's measured size passes on one
+# filesystem and fails on the other. Round 5 caught exactly that: a fixture
+# whose over-cap condition was carried entirely by empty directories was green
+# on ext4 and red on tmpfs, and the sweep was right both times.
+#
+# cap_kib_between <file-bytes-under> <file-bytes-over> — a cap midway between
+# the two FILE-byte totals a decision has to separate, in KiB. Midway leaves
+# half the gap as margin on each side, which is far more than any directory
+# overhead a filesystem can add.
+cap_kib_between() { printf '%s' "$((($1 + $2) / 2))"; }
 
 mkfixture() { # mkfixture <name> -> prints the fixture root
     local d="$work/fx/$1"
@@ -570,9 +601,13 @@ assert_exit S11a_under_the_cap_the_step_still_reports 0 "$sweep_rc" "$sweep_log"
     "cache: cap summary: removed 0" "(cap 200GiB, guard 15min)"
 survives "S11a nothing is removed under a 200GiB cap" "$ns/target-check-protected/cache.zip"
 
-run_sweep s11b "$fx" CACHE_CAP_KIB=650
+# Five 256 KiB archives: three removed leaves 512 KiB of file bytes, two
+# removed leaves 768 KiB. The cap goes midway, so the drain count is decided by
+# the bytes and not by whether directories cost anything here.
+s11_cap="$(cap_kib_between 512 768)"
+run_sweep s11b "$fx" CACHE_CAP_KIB="$s11_cap"
 assert_exit S11b_cap_drains_oldest_first_and_stops 0 "$sweep_rc" "$sweep_log" \
-    "cache: cap summary: removed 3" "(cap 650KiB, guard 15min)"
+    "cache: cap summary: removed 3" "(cap ${s11_cap}KiB, guard 15min)"
 deleted "S11b the oldest archive goes first" "$ns/target-check-protected/cache.zip"
 deleted "S11b then the second oldest" "$ns/target-examples-protected/cache.zip"
 deleted "S11b then the third" "$ns/target-coverage-unit-protected/cache.zip"
@@ -592,10 +627,13 @@ mkfile "$ns/target-check-protected/cache.zip" 256
 mkfile "$ns/cargo-home-protected/cache.zip" 256
 mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
 age_tree "$fx" 5
-run_sweep s12 "$fx" CACHE_CAP_KIB=600
+# Three 256 KiB archives (768 KiB of file bytes); the cap sits where one
+# removal would be needed, so a drain that ignored the guard would act.
+s12_cap="$(cap_kib_between 512 768)"
+run_sweep s12 "$fx" CACHE_CAP_KIB="$s12_cap"
 assert_exit S12_the_cap_never_evicts_an_upload_in_flight 2 "$sweep_rc" "$sweep_log" \
     "cache: cap summary: removed 0, in-use 3" \
-    "over the 600KiB cap; everything left was touched within the last 15 min (3 archive(s))" \
+    "over the ${s12_cap}KiB cap; 3 archive(s) touched within the last 15 min or unscannable" \
     "syslog: -p user.err -t runner-cache-sweep" \
     "!cache: cap removed"
 survives "S12 the archive being written is still there" "$ns/cargo-home-protected/cache.zip"
@@ -608,7 +646,7 @@ survives "S12 and the corpus" "$ns/fuzz-corpus-lua_parse-protected/cache.zip"
 # backstop can. This is the case that makes the cap a backstop at all — with
 # the guard widened to MAX_AGE_MIN it frees nothing and alarms instead.
 age_tree "$fx/cache" 30
-run_sweep s12b "$fx" CACHE_CAP_KIB=600
+run_sweep s12b "$fx" CACHE_CAP_KIB="$s12_cap"
 assert_exit S12b_a_warm_archive_is_drained_under_the_cap 0 "$sweep_rc" "$sweep_log" \
     "cache: age summary: removed 0" \
     "cache: cap summary: removed 1, in-use 0" \
@@ -631,7 +669,7 @@ age_tree "$fx" 30
 age_path "$ns/fuzz-corpus-lua_parse-protected/cache.zip" 600
 age_path "$ns/target-check-protected/cache.zip" 300
 age_path "$ns/cargo-home-protected/cache.zip" 120
-run_sweep s12c "$fx" CACHE_CAP_KIB=600
+run_sweep s12c "$fx" CACHE_CAP_KIB="$(cap_kib_between 512 768)"
 assert_exit S12c_the_cap_drains_rebuildable_archives_before_the_corpus 0 "$sweep_rc" "$sweep_log" \
     "cache: cap summary: removed 1" \
     "cache: cap removed $ns/target-check-protected/cache.zip" \
@@ -641,9 +679,9 @@ survives "S12c the oldest file in the tree survives because it is a corpus" \
 deleted "S12c the rebuildable tree went instead" "$ns/target-check-protected/cache.zip"
 
 # --- S12d: under enough pressure the corpus goes too -----------------------
-# 30 KiB is above what the directories alone measure and far below the
-# archives, so the drain has to take all three, corpus included.
-run_sweep s12d "$fx" CACHE_CAP_KIB=30
+# A cap between "everything drained" (0 file bytes) and "one 256 KiB archive
+# left": the drain has to take all three, corpus included.
+run_sweep s12d "$fx" CACHE_CAP_KIB="$(cap_kib_between 0 256)"
 assert_exit S12d_the_corpus_is_still_subject_to_the_cap 0 "$sweep_rc" "$sweep_log" \
     "cache: cap removed $ns/fuzz-corpus-lua_parse-protected/cache.zip"
 deleted "S12d under enough pressure the corpus goes too" \
@@ -668,7 +706,8 @@ age_tree "$fx" 30
 age_path "$ns/target-check-protected/cache.zip" 300
 age_path "$ns/target-examples-protected/cache.zip" 120
 age_path "$ns/target-check-protected" 2
-run_sweep s12e "$fx" CACHE_CAP_KIB=400
+# Two 256 KiB archives: one removal leaves 256 KiB, none leaves 512 KiB.
+run_sweep s12e "$fx" CACHE_CAP_KIB="$(cap_kib_between 256 512)"
 assert_exit S12e_the_cap_guard_covers_the_key_directory 0 "$sweep_rc" "$sweep_log" \
     "cache: cap summary: removed 1, in-use 1" \
     "cache: cap removed $ns/target-examples-protected/cache.zip" \
@@ -677,6 +716,76 @@ survives "S12e the archive under an active key directory is skipped, oldest or n
     "$ns/target-check-protected/cache.zip"
 deleted "S12e and the drain takes the next one instead" \
     "$ns/target-examples-protected/cache.zip"
+
+# --- S33: a live archive AND a pile the glob cannot see ---------------------
+# Both true at once, which is the case the message used to hide: the early
+# return for "everything left is in use" fired before anything looked for
+# residue, so the operator was told to wait an hour while the space sat in a
+# `cache.zst` that no amount of waiting collects.
+fx="$(mkfixture s33)"
+ns="$fx/cache/flying-dice/luabox"
+zip="$ns/target-check-protected/cache.zip"
+zst="$ns/cargo-home-protected/cache.zst"
+mkfile "$zip" 256
+mkfile "$zst" 684
+mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
+age_tree "$fx" 5
+run_sweep s33 "$fx" CACHE_CAP_KIB="$(cap_kib_between 0 684)"
+assert_exit S33_the_alarm_names_both_the_live_archive_and_the_residue 2 "$sweep_rc" "$sweep_log" \
+    "1 archive(s) touched within the last 15 min or unscannable" \
+    "do not match the '*.zip' glob this sweep drains, e.g. $zst" \
+    "syslog: -p user.err -t runner-cache-sweep"
+survives "S33 the archive being written is kept" "$zip"
+survives "S33 and the residue is left where it is" "$zst"
+
+# --- S34: a malformed knob is refused before anything is opened ------------
+# These come from a cron line and an env file. Bash arithmetic reads anything
+# non-numeric as 0, so `MAX_AGE_MIN=1440min` would mean "untouched for 0
+# minutes" — every archive and every checkout, deleted, on the next hourly run.
+fx="$(mkfixture s34)"
+knob_zip="$fx/cache/flying-dice/luabox/target-check-protected/cache.zip"
+mkfile "$knob_zip"
+mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/target/build.o"
+age_tree "$fx" 4320
+
+assert_rejects_knob() { # assert_rejects_knob <case> <needle> <VAR=value>...
+    local case_name="$1" needle="$2"
+    shift 2
+    run_sweep "$case_name" "$fx" "$@"
+    assert_exit "$case_name" 2 "$sweep_rc" "$sweep_log" \
+        "$needle" "syslog: -p user.err -t runner-cache-sweep" "!net "
+    check_true "$case_name deletes nothing" test -e "$knob_zip"
+}
+
+assert_rejects_knob S34a_a_shell_fragment_in_MAX_AGE_MIN \
+    "REFUSED: MAX_AGE_MIN must be a positive integer, got: '1;rm -rf /'" \
+    MAX_AGE_MIN='1;rm -rf /'
+assert_rejects_knob S34b_a_word_in_CAP_GUARD_MIN \
+    "REFUSED: CAP_GUARD_MIN must be a positive integer, got: 'abc'" \
+    CAP_GUARD_MIN=abc
+assert_rejects_knob S34c_a_negative_cap \
+    "REFUSED: CACHE_CAP_GIB must be a positive integer, got: '-5'" \
+    CACHE_CAP_GIB=-5
+assert_rejects_knob S34d_a_zero_window \
+    "REFUSED: MAX_AGE_MIN must be a positive integer, got: '0'" \
+    MAX_AGE_MIN=0
+assert_rejects_knob S34e_an_empty_window \
+    "REFUSED: MAX_AGE_MIN must be a positive integer, got: ''" \
+    MAX_AGE_MIN=
+assert_rejects_knob S34f_a_malformed_KiB_cap \
+    "REFUSED: CACHE_CAP_KIB must be a positive integer when set, got: 'lots'" \
+    CACHE_CAP_KIB=lots
+
+# --- S35: the cap guard has to be the shorter window -----------------------
+# Equal windows make the cap a second age rule — it would free nothing under a
+# standing over-cap and alarm hourly instead. That was measured and reverted in
+# review; this is what keeps it reverted.
+assert_rejects_knob S35_a_cap_guard_as_long_as_the_age_window \
+    "REFUSED: CAP_GUARD_MIN (1440) must be shorter than MAX_AGE_MIN (1440)" \
+    CAP_GUARD_MIN=1440
+assert_rejects_knob S35b_a_cap_guard_longer_than_the_age_window \
+    "a cap guard as long as the age window makes the cap a second age rule" \
+    CAP_GUARD_MIN=2880
 
 # --- S13: the corpus is exempt from the age rule ---------------------------
 fx="$(mkfixture s13)"
@@ -871,19 +980,28 @@ check_true "S25 the size that triggered it is legible, not rounded to ~0 MiB" \
 check_true "S25 the reason names the glob and an example of what it cannot see" \
     grep -qF "do not match the '*.zip' glob this sweep drains, e.g. $zst" "$sweep_log"
 
-# --- S25b: over the cap on directories alone -------------------------------
-# No archives, no files at all — the space is structure. Naming a file the glob
-# missed would be a lie here, so the reason says what it measured instead.
+# --- S25b: the space is in something that is not an archive at all ---------
+# Not a renamed archive this time — a runner scratch file nothing will ever
+# drain. The reason has to name the glob and point at the thing holding the
+# space, whatever it is.
+#
+# The over-cap condition is carried by 8 KiB of FILE, deliberately. The first
+# version of this case used an empty directory tree and relied on ext4 charging
+# 4 KiB a directory; on tmpfs the same tree measures 0 KiB, the sweep was
+# correctly under cap, and the case failed for a reason that had nothing to do
+# with the sweep.
 fx="$(mkfixture s25b)"
-mkdir -p "$fx/cache/flying-dice/luabox/target-check-protected/inner"
+blob="$fx/cache/flying-dice/luabox/runner-scratch.tmp"
+mkfile "$blob" 8
 mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
 age_tree "$fx" 4320
 age_tree "$fx/builds" 30
 run_sweep s25b "$fx" CACHE_CAP_KIB=1
 assert_exit S25b_over_cap_on_non_archive_content_says_so 2 "$sweep_rc" "$sweep_log" \
     "REFUSED: cache is" \
-    "there are no other files either — the space is non-archive content" \
-    "!do not match the '*.zip' glob"
+    "0 archive(s) matched '*.zip', 0 drained, 0 refused, 0 in use, 0 unmeasured" \
+    "do not match the '*.zip' glob this sweep drains, e.g. $blob"
+survives "S25b the file it cannot drain is left where it is" "$blob"
 
 # --- S26: the same alarm, after the age pass has already removed something --
 fx="$(mkfixture s26)"
@@ -915,7 +1033,10 @@ mkfile "$zip" 8
 mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
 age_tree "$fx" 4320
 age_tree "$fx/builds" 30
-run_sweep s27 "$fx" CACHE_CAP_KIB=650
+# The cap sits at half the .zst's bytes: draining every archive the glob can
+# see still leaves the tree far over it, on any filesystem.
+s27_cap="$(cap_kib_between 0 684)"
+run_sweep s27 "$fx" CACHE_CAP_KIB="$s27_cap"
 assert_exit S27_still_over_the_cap_after_the_drain_is_not_a_success 3 "$sweep_rc" "$sweep_log" \
     "cache: cap removed $zip" \
     "PARTIALLY SWEPT after 1 removal(s): cache is" \
@@ -1009,7 +1130,10 @@ age_tree "$fx/builds" 30
 age_path "$ns/fuzz-corpus-one-protected/cache.zip" 5000
 age_path "$ns/fuzz-corpus-unmeasurable-protected/cache.zip" 4800
 age_path "$ns/fuzz-corpus-three-protected/cache.zip" 4600
-run_sweep s32 "$fx" CACHE_CAP_KIB=400 PATH="$work/shim-du-path:$shim:$PATH"
+# Three 256 KiB archives, one of them unmeasurable: two removals leave 256 KiB
+# of file bytes, one leaves 512 KiB.
+run_sweep s32 "$fx" CACHE_CAP_KIB="$(cap_kib_between 256 512)" \
+    PATH="$work/shim-du-path:$shim:$PATH"
 assert_exit S32_an_unmeasurable_candidate_is_skipped_not_fatal 0 "$sweep_rc" "$sweep_log" \
     "cache: cap could not measure $ns/fuzz-corpus-unmeasurable-protected/cache.zip — skipped" \
     "cache: cap summary: removed 2, in-use 0, failed 0, unmeasured 1" \
