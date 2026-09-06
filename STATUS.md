@@ -1,6 +1,6 @@
 # Status
 
-**Updated:** 2026-09-06 15:50 UTC · **Integration branch:** `develop` · **Release branch:** `main` · **Owner:** Starscream (Seekers)
+**Updated:** 2026-09-06 16:10 UTC · **Integration branch:** `develop` · **Release branch:** `main` · **Owner:** Starscream (Seekers)
 
 SHAs are not pinned here — the tracker and `git log` are authoritative; this file
 carries states and measurements with the pipeline id that produced them.
@@ -24,14 +24,14 @@ clippy clean; the four `luabox-lsp` shutdown-window timeouts seen under load
 
 ## Now
 
-Promotion of the reconciled tree, in review as **!5**. The branch is
-`origin/develop` + `main`'s three commits (skill set, Seekers roster, the
-`$CARGO_HOME/bin` CI fix) + this sprint's planning artefacts. The
-`.gitlab-ci.yml` conflict was resolved in favour of `develop`'s pipeline of
-record, which already carries the same cold-cache fix at `:277`. Shockwave's
-first round is answered; the pipeline is red on the runner's disk (#85), not on
-the diff. Next stopping point after !5 merges: a `develop → main` promotion MR
-for the owner.
+Landing the reconciliation (**!5**) and the cache policy (**!6**) on `develop`.
+!5 is in Shockwave round 3: rounds 1–2 closed on evidence, pipeline 20285
+18/18 green, the remaining blockers are this file's own staleness, a merge
+conflict with !2's `limitations.md` section (resolved in favour of `develop`
+with the bare `#NN` citation form re-applied), three spec citations, one name
+in the memory index. !6 is in Shockwave re-review at `36628ff` (hardened
+sweep, 89-assertion selftest). Stopping point after both merge: the
+`develop → main` promotion MR for the owner.
 
 ## Next
 
@@ -87,8 +87,9 @@ for the owner.
   GB); hourly host sweep installed — anything untouched 24 h is deleted, 60 GiB
   cap (owner's rule). **MR !6** carries the pipeline half: fixed cache keys
   (bounded growth), per-job trees kept, `df -h` first, the sweep script
-  versioned at `scripts/ops/`, decision 15. Pipeline 20275 at `eb60186`: 17/17
-  green in 12 m 24 s. Shockwave review requested.
+  versioned at `scripts/ops/`, decision 15 — now hardened at `36628ff` after a
+  nine-finding review (refusals, `flock`, occupancy re-probe, corpus exempt,
+  89-assertion selftest); re-review in progress.
 - The `shutdown_windows` timeouts are a fixed 10s wall-clock bound
   (`crates/luabox-lsp/tests/shutdown_windows.rs:56`) that fails only under
   CI-scale load — #84, backlog, not a regression.
@@ -97,14 +98,10 @@ for the owner.
 
 ## In flight
 
-Branch state only — this file is the standing radiator and is not pinned to any
-feature branch.
+MR state only; SHAs live in the tracker.
 
-- **!5** `starscream/integrate-develop → develop` — the reconciliation and this
-  sprint's planning artefacts. Shockwave review round 1 answered; pipeline waits
-  on #85.
-- **!2** — merged to `develop` as `ce215fc` after Shockwave's approval; #69 closed.
-- **!4** — merged to `develop` as `cb40e10`; #78 closed (#83 follow-up open).
-- **!6** `thundercracker/issue-85 → develop` — cache policy sized to the
-  runner (decision 15). Merge first; then re-run !4/!5 pipelines.
+- **!5** `starscream/integrate-develop → develop` — Shockwave round 3;
+  pipeline green at the previous head; conflict with `develop` resolved.
+- **!6** `thundercracker/issue-85 → develop` — hardened sweep + selftest +
+  shellcheck job + decision 15; Shockwave re-review in progress.
 - Merged this sprint: **!1** (#70), **!2** (#69), **!3** (#81), **!4** (#78).

@@ -44,19 +44,23 @@ jobs:
   # `#[ignore]`d test by construction, and no job passed `--ignored`, so
   # four claims in this repo's review record were "pinned" by tests nothing
   # ever executed — the behaviour they name could flip green and stay green.
-  # Two of the four are deterministic and belong in CI:
+  # Two of the four were deterministic and belonged in CI; ONE still does:
   #
-  #   malformed_class_headers_m66  M66's pin. It asserts today's MEASURED
-  #                                behaviour for malformed `---@class`
-  #                                headers — a known bug, deliberately
-  #                                pinned so the day it changes is visible.
-  #                                Pure, in-process, no binary, no clock.
   #   regen_merge_matrix_provenance  M42's pin, and the only test that reads
   #                                the merge-matrix fixtures through a real
   #                                `luabox check` SUBPROCESS the way a user's
   #                                project is checked (the fast in-process
   #                                test covers the library path only). Needs
   #                                a release binary, hence the build step.
+  #
+  # `malformed_class_headers_m66` was the other, and it has LEFT this job
+  # (#69). It was `#[ignore]`d because it pinned a known BUG — malformed
+  # `---@class` headers going undiagnosed — and #69 fixed the bug, so it now
+  # pins a rule this repo enforces and runs in `check`'s ordinary
+  # `cargo test --workspace` alongside every other test in its file. Running
+  # it here too would double-count it, and `--ignored` SKIPS it now that the
+  # attribute is gone, which would silently drop this job to one test; the
+  # expected count below moved to 1 in the same change for that reason.
   #
   # The other two — search_order_cache_wall_time_by_depth and
   # project_types_sweep_wall_time (the perf halves of M57/M18) — are NOT
@@ -89,38 +93,38 @@ jobs:
       # regen_merge_matrix_provenance shells out to a real release binary
       # and asserts it exists before doing anything else.
       - run: cargo build --release -p luabox-cli
-      # Both names are passed as explicit `--exact` filters, so this leg runs
-      # exactly these two and cannot silently pick up a future `#[ignore]`d
-      # test in the same target — including a wall-time one, which is the
-      # thing the comment above says is deliberately not wired. Verified
-      # locally at this head: "2 passed; 0 failed; 0 ignored; 7 filtered out".
+      # The name is passed as an explicit `--exact` filter, so this leg runs
+      # exactly that one test and cannot silently pick up a future
+      # `#[ignore]`d test in the same target — including a wall-time one,
+      # which is the thing the comment above says is deliberately not wired.
+      # Verified locally at this head: "1 passed; 0 failed; 0 ignored;
+      # 8 filtered out".
       #
       # `--exact` and the run-count guard are round 11 review R11-2. A libtest
-      # name filter that matches NOTHING exits 0, and neither of the two
-      # names is load-bearing for the `git diff --exit-code` step below
-      # (malformed_class_headers_m66 has no file side-effect at all), so
-      # renaming either test left this job green having executed it zero
-      # times — the F10 failure mode this job exists to close, reproduced one
-      # level up in the job built to close it. Substring matching made that
-      # worse: `--ignored regen_merge` would have kept passing after a
-      # rename to `regen_merge_matrix_provenance_v2` while quietly running a
-      # different test. So: `--exact`, and the "N passed" summary parsed and
-      # asserted to be exactly 2. A rename now fails this job loudly.
+      # name filter that matches NOTHING exits 0, so renaming the test left
+      # this job green having executed it zero times — the F10 failure mode
+      # this job exists to close, reproduced one level up in the job built to
+      # close it. Substring matching made that worse: `--ignored regen_merge`
+      # would have kept passing after a rename to
+      # `regen_merge_matrix_provenance_v2` while quietly running a different
+      # test. So: `--exact`, and the "N passed" summary parsed and asserted to
+      # be exactly 1. A rename now fails this job loudly.
       # Quoted: an unquoted YAML plain scalar treats ` #` as a comment
       # start, which silently truncated this name to "Run the deterministic".
       - name: "Run the deterministic #[ignore]d tests"
         run: |
           set -o pipefail
           cargo test -p luabox-types --test class_merge_precedence_matrix \
-            -- --ignored --exact malformed_class_headers_m66 regen_merge_matrix_provenance \
+            -- --ignored --exact regen_merge_matrix_provenance \
             | tee ignored-tests.log
           passed="$(sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' ignored-tests.log)"
           rm -f ignored-tests.log
-          if [ "$passed" != "2" ]; then
-            echo "::error::expected exactly 2 deterministic #[ignore]d tests to run, libtest reported '${passed:-<no summary line>}'" >&2
-            echo "A filter that matches nothing exits 0 — this job asserts the two named tests" >&2
-            echo "actually EXECUTED. If a test was renamed, update the filters above; if one was" >&2
-            echo "added, add it here deliberately and raise this count." >&2
+          if [ "$passed" != "1" ]; then
+            echo "::error::expected exactly 1 deterministic #[ignore]d test to run, libtest reported '${passed:-<no summary line>}'" >&2
+            echo "A filter that matches nothing exits 0 — this job asserts the named test" >&2
+            echo "actually EXECUTED. If a test was renamed, update the filter above; if one was" >&2
+            echo "added, add it here deliberately and raise this count. If one stopped being" >&2
+            echo "#[ignore]d, drop it from the filter and LOWER this count — --ignored skips it." >&2
             exit 1
           fi
       - name: Discard the provenance doc regeneration and assert nothing else changed

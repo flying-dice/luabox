@@ -32,6 +32,8 @@ const KNOWN_RULES: &[&str] = &[
     RULE_CLASS_ANCESTRY_TOO_DEEP,
     RULE_CIRCLE_DOC_CLASS,
     RULE_CLASS_ANCESTRY_TOO_COSTLY,
+    RULE_LUADOC_MISS_CLASS_NAME,
+    RULE_LUADOC_MISS_CLASS_EXTENDS_NAME,
 ];
 
 /// The suppression name for `LB0317`.
@@ -77,6 +79,22 @@ pub const RULE_CIRCLE_DOC_CLASS: &str = "circle-doc-class";
 /// [`RULE_CLASS_ANCESTRY_TOO_DEEP`].
 pub const RULE_CLASS_ANCESTRY_TOO_COSTLY: &str = "class-ancestry-too-costly";
 
+/// The suppression name for `LB0320` — **luals' own rule name**, measured
+/// against the pinned 3.13.5 on all three shapes `LB0320` covers, not
+/// invented here. See [`RULE_CIRCLE_DOC_CLASS`] for why a shared finding
+/// borrows the oracle's vocabulary instead of coining a second one.
+///
+/// `pub(crate)`, unlike its three neighbours above: those are `pub` because
+/// `luabox-cli`'s syntactic pre-check emits `LB0317`/`LB0318`/`LB0319` too and
+/// must not disagree with this module about what silences them. `LB0320` has
+/// exactly one emitter ([`crate::check::malformed_class_headers`]), so there
+/// is no second owner to keep in step.
+pub(crate) const RULE_LUADOC_MISS_CLASS_NAME: &str = "luadoc-miss-class-name";
+
+/// The suppression name for `LB0321` — luals' own, on the same terms as
+/// [`RULE_LUADOC_MISS_CLASS_NAME`].
+pub(crate) const RULE_LUADOC_MISS_CLASS_EXTENDS_NAME: &str = "luadoc-miss-class-extends-name";
+
 /// The luals rule name that maps onto a checker [`Code`], or `None` when the
 /// code carries no `---@diagnostic`-suppressible name.
 ///
@@ -93,6 +111,8 @@ pub(crate) fn rule_for_code(code: Code) -> Option<&'static str> {
         codes::CLASS_DEPTH_LIMIT => Some(RULE_CLASS_ANCESTRY_TOO_DEEP),
         codes::CYCLIC_CLASS => Some(RULE_CIRCLE_DOC_CLASS),
         codes::CLASS_COST_LIMIT => Some(RULE_CLASS_ANCESTRY_TOO_COSTLY),
+        codes::MALFORMED_CLASS_NAME => Some(RULE_LUADOC_MISS_CLASS_NAME),
+        codes::MALFORMED_CLASS_EXTENDS_ENTRY => Some(RULE_LUADOC_MISS_CLASS_EXTENDS_NAME),
         // LB0310 (duplicate-doc-alias) is a project-assembly finding, like the
         // LB0307 class collision — it never flows through this per-file filter,
         // so it has no entry here.
@@ -298,6 +318,14 @@ mod tests {
             rule_for_code(codes::CLASS_COST_LIMIT),
             Some(RULE_CLASS_ANCESTRY_TOO_COSTLY)
         );
+        assert_eq!(
+            rule_for_code(codes::MALFORMED_CLASS_NAME),
+            Some(RULE_LUADOC_MISS_CLASS_NAME)
+        );
+        assert_eq!(
+            rule_for_code(codes::MALFORMED_CLASS_EXTENDS_ENTRY),
+            Some(RULE_LUADOC_MISS_CLASS_EXTENDS_NAME)
+        );
         assert_eq!(rule_for_code(codes::TYPE_MISMATCH), None);
     }
 
@@ -317,6 +345,14 @@ mod tests {
             (codes::CLASS_DEPTH_LIMIT, RULE_CLASS_ANCESTRY_TOO_DEEP),
             (codes::CYCLIC_CLASS, RULE_CIRCLE_DOC_CLASS),
             (codes::CLASS_COST_LIMIT, RULE_CLASS_ANCESTRY_TOO_COSTLY),
+            // M66/#69: the malformed-header pair, whose rule names come from
+            // luals and whose emitter is not the `Checker` the rest of this
+            // table's codes come from.
+            (codes::MALFORMED_CLASS_NAME, RULE_LUADOC_MISS_CLASS_NAME),
+            (
+                codes::MALFORMED_CLASS_EXTENDS_ENTRY,
+                RULE_LUADOC_MISS_CLASS_EXTENDS_NAME,
+            ),
         ] {
             assert_eq!(rule_for_code(code), Some(rule), "{code}");
         }
@@ -329,6 +365,8 @@ mod tests {
         assert_eq!(codes::CLASS_DEPTH_LIMIT.to_string(), "LB0317");
         assert_eq!(codes::CYCLIC_CLASS.to_string(), "LB0318");
         assert_eq!(codes::CLASS_COST_LIMIT.to_string(), "LB0319");
+        assert_eq!(codes::MALFORMED_CLASS_NAME.to_string(), "LB0320");
+        assert_eq!(codes::MALFORMED_CLASS_EXTENDS_ENTRY.to_string(), "LB0321");
     }
 
     /// The three ancestry-guard rule names as literal strings — the tests
@@ -347,6 +385,11 @@ mod tests {
         assert_eq!(RULE_CLASS_ANCESTRY_TOO_DEEP, "class-ancestry-too-deep");
         assert_eq!(RULE_CIRCLE_DOC_CLASS, "circle-doc-class");
         assert_eq!(RULE_CLASS_ANCESTRY_TOO_COSTLY, "class-ancestry-too-costly");
+        assert_eq!(RULE_LUADOC_MISS_CLASS_NAME, "luadoc-miss-class-name");
+        assert_eq!(
+            RULE_LUADOC_MISS_CLASS_EXTENDS_NAME,
+            "luadoc-miss-class-extends-name"
+        );
         // …and each is actually recognised by the scanner, so a name that
         // exists as a constant but never made it into `KNOWN_RULES` fails here
         // rather than silently swallowing the user's directive.
@@ -354,6 +397,8 @@ mod tests {
             RULE_CLASS_ANCESTRY_TOO_DEEP,
             RULE_CIRCLE_DOC_CLASS,
             RULE_CLASS_ANCESTRY_TOO_COSTLY,
+            RULE_LUADOC_MISS_CLASS_NAME,
+            RULE_LUADOC_MISS_CLASS_EXTENDS_NAME,
         ] {
             let scan = DirectiveScan::scan(&format!("---@diagnostic disable: {rule}\n"));
             assert!(scan.suppresses(rule, 42), "{rule} is not in KNOWN_RULES");

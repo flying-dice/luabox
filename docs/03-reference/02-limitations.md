@@ -52,26 +52,24 @@ would make a mistyped duplicate silently widen the field rather than be
 reported, so the warning plus a stable winner reads as the more useful
 answer.
 
-**Across files the story is worse, and is tracked as
-#73: the winner is not
+**Across files the story is worse, and is tracked as #73: the winner is not
 project-wide and nothing warns.** Measured (this release and the merge base,
 byte-identical): the declaration in the *referencing* file wins, a file
-declaring neither gets the alphabetically-first declaring file's binding, and
-no `LB0311` fires — a project can hold `x: string` in one file and
-`x: number` in another, read both, and check clean. The same rule reaches
+declaring neither gets the alphabetically-first declaring file's binding,
+and no `LB0311` fires — a project can hold `x: string` in one file and `x:
+number` in another, read both, and check clean. The same rule reaches
 generic parent instantiations (`C : Box<number>` here, `C : Box<string>`
 there) through this release's new parent-argument substitution. One rule,
-two mechanisms, only one of which diagnoses — until #73 lands, keep a class's
-declarations in one file if its members must mean one thing.
+two mechanisms, only one of which diagnoses — until #73 lands, keep a
+class's declarations in one file if its members must mean one thing.
 
-**That reasoning was reached without consulting luals' implementation, and is
-being revisited** (#67).
-Read from `script/vm/` rather than inferred, luals unions same-rank duplicates
-for `---@field`, for a re-declared carrier method, and for a re-declared
-indexer — so a project luals checks cleanly can pick up a fresh `LB0300` here
-purely from the resolution rule, on code the author did not change. The
-warning is worth keeping; the type resolution changing the verdict is the
-part that breaks a drop-in migration. See the
+**That reasoning was reached without consulting luals' implementation, and
+is being revisited** (#67). Read from `script/vm/` rather than inferred,
+luals unions same-rank duplicates for `---@field`, for a re-declared carrier
+method, and for a re-declared indexer — so a project luals checks cleanly
+can pick up a fresh `LB0300` here purely from the resolution rule, on code
+the author did not change. The warning is worth keeping; the type resolution
+changing the verdict is the part that breaks a drop-in migration. See the
 [class-merge precedence matrix](03-class-merge-precedence.md) for every cell
 and which of them luals agrees with.
 
@@ -185,20 +183,20 @@ message names, so a directive has to sit in *that* file — a
 of it. A directive in the file that merely consumes the class does nothing,
 even though that is where the error was reported from.
 
-**The cross-file form works under `luabox check` only.** When the declaration
-is in file A and the diagnostic is reported while checking file B, `luabox
-check` reads A's directives and suppresses it; the **language server does
-not** — it checks one open document at a time and never sees A's directives,
-so the editor keeps showing the diagnostic even though the CLI is green. This
-is the one measured exception to the editor/CLI parity claim made later in
-this page, it applies to all three ancestry codes, and it has no issue of its
-own yet — it belongs to the same LSP-parity family as
-#70. It is a *diagnostic*
-divergence, and it is unrelated to which declaration each side resolves a
-member to: hover, goto-definition and `luabox check` read that from one merged
-answer. Same-file suppression behaves identically in both. No workaround
-beyond fixing the ancestry itself or suppressing from the file the editor has
-open, which only works when that is also the declaring file.
+**The cross-file form works under `luabox check` only.** When the
+declaration is in file A and the diagnostic is reported while checking file
+B, `luabox check` reads A's directives and suppresses it; the **language
+server does not** — it checks one open document at a time and never sees A's
+directives, so the editor keeps showing the diagnostic even though the CLI
+is green. This is the one measured exception to the editor/CLI parity claim
+made later in this page, it applies to all three ancestry codes, and it has
+no issue of its own yet — it belongs to the same LSP-parity family as #70.
+It is a *diagnostic* divergence, and it is unrelated to which declaration
+each side resolves a member to: hover, goto-definition and `luabox check`
+read that from one merged answer. Same-file suppression behaves identically
+in both. No workaround beyond fixing the ancestry itself or suppressing from
+the file the editor has open, which only works when that is also the
+declaring file.
 
 The one exception is a class declared **only in a `[types] defs` package**.
 Nothing in the project declares it, and a definition package's own comments
@@ -245,48 +243,95 @@ The corpus rows above are the measurement, re-derived on every run of
 `luabox explain LB0317` (and `LB0318`, `LB0319`) prints the full worked fix
 for each.
 
-### Malformed `---@class` headers give no diagnostic at the declaration (round 6 review M66 — #69)
+### Malformed `---@class` headers: reported at the declaration, one finding per header (#69)
 
 Every row above assumes `---@class` parses into a well-formed class at all.
 Four ways a header can fail to — a missing name, a name token the grammar
 can't lex as an identifier, a trailing comma in the `extends` list, and a
-bare `---@class` with nothing after it — are not covered by the precedence
-matrix or the verdict corpus, and two of the four currently give **no
-diagnostic anywhere**, at the declaration or otherwise. Measured against this
-version's release binary, `[types] strict = true`:
+bare `---@class` with nothing after it — are now reported at the declaration
+under two codes:
 
-| Shape | luabox (this version) | lua-language-server 3.13.5 |
+| Shape | luabox | lua-language-server 3.13.5 |
 |---|---|---|
-| `---@class : Base` (no name, colon parent) | silent: `rc=0`, 0 errors, 0 warnings | `luadoc-miss-class-name` ("`<class name> expected`") at the declaration, plus `doc-field-no-class` on the `---@field` line beneath it |
-| `---@class 123abc` (non-identifier name) | silent: `rc=0`, 0 errors, 0 warnings | identical to the row above — luals treats a name token it can't lex as an identifier the same as a missing name |
-| `---@class A : P,` (trailing comma, `P` undeclared) | `LB0305 unknown type name \`P\`` at the declaration — `P` resolves through the ordinary undeclared-parent path (the same one `---@class A : Missing` already uses correctly); the trailing comma itself raises nothing | `luadoc-miss-class-extends-name` ("`<class extends name> expected`") at the comma, **plus** an ordinary `undefined-doc-class` on `P` — luals reports both the malformation and the undeclared parent, luabox only the latter |
-| bare `---@class` (no name, no colon) | silent at the declaration; the only signal is `LB0305 unknown type name` two lines later, at a *consumer*'s `---@type` reference to the name the class never got | `luadoc-miss-class-name` + `doc-field-no-class` at the declaration — same as the `: Base` row |
+| `---@class : Base` (no name, colon parent) | `LB0320` at the declaration | `luadoc-miss-class-name` ("`<class name> expected`") at the declaration, plus `doc-field-no-class` on the `---@field` line beneath it |
+| `---@class 123abc` (non-identifier name) | `LB0320` at the declaration, quoting the name back | identical to the row above — luals treats a name token it can't lex as an identifier the same as a missing name |
+| `---@class A : P,` (trailing comma, `P` undeclared) | `LB0321` at the declaration **plus** `LB0305 unknown type name \`P\`` — two mistakes, two findings | `luadoc-miss-class-extends-name` ("`<class extends name> expected`") at the comma, **plus** an ordinary `undefined-doc-class` on `P` |
+| bare `---@class` (no name, no colon) | `LB0320` at the declaration; a consumer's `---@type` reference still reports its own `LB0305` | `luadoc-miss-class-name` + `doc-field-no-class` at the declaration |
 
-luals reports a real diagnostic at the declaration for all four shapes; it is
-never silent. luabox is silent at the declaration for three of the four (the
-`A : P,` row's `LB0305` fires on the ordinary undeclared-parent check, not on
-the malformed extends-list syntax itself) and, for the fourth, only ever
-surfaces the problem indirectly, at a use site arbitrarily far from the
-actual mistake. A class-generator template with a typo'd header (a missing
-`class` name in a machine-generated `---@class` block, say) produces a class
-that simply does not exist, with nothing at the point of generation to say
-so — the failure surfaces later, and only if something happens to reference
-the missing name.
+Both tools now report at the declaration for all four shapes.
 
-The fix belongs in `luacats::harvest`, which currently drops a header it
-cannot parse into a class rather than emitting anything for it — no `LB0xxx`
-code is assigned for this condition yet. It is tracked as
-#69; an earlier edition of
-this section said the tracking issue was "not yet filed", which was true when
-written and is not now.
+**The remaining divergence is message count, not silence.** luals adds a
+`doc-field-no-class` per orphaned `---@field` under a nameless header;
+luabox reports the header once and leaves the fields alone. One mistake, one
+diagnostic: the fields are not independently wrong, and a generated block
+with twenty fields under one typo'd header would otherwise produce twenty-one
+findings for one edit. `LB0320` and `LB0321` are deliberately separate for
+the opposite reason — an unusable class *name* and a bad entry in the
+*extends list* have different causes and different fixes, and a header can
+carry both at once (`---@class :`), so each gets its own.
+
+**`LB0321` covers more than a stray separator, and says so carefully.** The
+type parser has one recovery node for an entry it cannot read, and it does not
+record *why* — so `---@class A : ?`, where a token is present and merely
+unreadable, is indistinguishable from `---@class A : P,`, where nothing is
+there at all. The message says the entry is not a class name, which holds for
+both, rather than claiming a name is missing, which would be false on the
+first. This is an error under `[types] strict = true`, so the wording has to
+be true of every shape that reaches it.
+
+**Where `LB0321` stops: a parent whose name reads.** `---@class A : Base<?>`
+is *not* this finding. The entry heads with `Base`, which resolves and whose
+members are inherited exactly as `: Base`'s are — nothing is dropped, so the
+message ("an entry that is not a class name"), the note ("the entry is
+ignored") and the remedy ("replace the entry with the parent it was meant to
+name") would all be false of it, and at `Severity::Error` the last one tells
+the user to delete a parent that works. The rule stops at a bare name and
+nowhere else. A name written *under* something is not a parent either:
+measured, `: Base?`, `: Base[]`, `: (Base)` and `: Base|Base` each leave
+their class with no members — the same as `: { x: number }`, a `fun` type,
+or no extends list at all — where `: Base` inherits. So every entry but a
+bare name contributes no parent whether or not the parser choked inside it,
+the note holds there, and an unreadable token anywhere in one is reported:
+`---@class A : Base<?>[]` is this finding, `---@class A : Base<?>` is not.
+
+An unreadable *type argument* is a real mistake and is currently reported
+nowhere: `luacats`' recovery errors do not leave the syntax crate, so
+`---@field x Base<?>` is silent on the same axis. That gap is the
+type-argument axis, not the extends-list one, and it is not what this code
+covers.
+
+**What a class name has to be.** One or more dot-separated segments
+(`geometry.Point`), each starting with a letter, `_`, or a non-ASCII
+character and continuing with letters, digits, `_` or non-ASCII. The grammar
+`luacats` lexes names with is deliberately looser — any run of
+`[A-Za-z0-9_.]` — so a mistyped name is captured whole and quoted back at the
+user rather than truncated at the first bad character into something they
+never wrote.
+
+That rule has one owner, `luacats::is_type_name`, and it lives beside the
+lexers it makes a claim about rather than in the crate that raises the
+diagnostic. `LB0320`'s message tells the user that nothing can reference the
+class; that is an assertion about the *reference-side* parser, so
+`name_is_spellable_by_the_type_parser` pins the round trip in both directions
+— every name the rule accepts parses back as itself, and every name it
+rejects does not. Loosening one lexer without the other now fails a test
+instead of silently turning the diagnostic into a false positive.
+
+**Strictness ladder and suppression, as for every other `LB03xx`:**
+
+| Code | `---@diagnostic disable[-line\|-next-line]:` name | whose name |
+|---|---|---|
+| `LB0320` | `luadoc-miss-class-name` | **luals'** — measured firing on all three shapes it covers |
+| `LB0321` | `luadoc-miss-class-extends-name` | **luals'** — same |
+
+`crates/luabox-types/tests/malformed_class_headers.rs` covers each shape
+against a control differing in exactly one respect, and
 `crates/luabox-types/tests/class_merge_precedence_matrix.rs`'s
-`malformed_class_headers_m66` test pins today's measured behaviour, including
-the `A : P,` correction above, so a regression on either side is visible and
-there is a concrete check to update once the harvest fix lands. That test is
-executed by CI as of round 8 — an earlier edition of this line said it was
-`#[ignore]`d and that a regression would surface "the day someone runs it by
-hand", which is not a pin at all: a claim backed only by a test nothing runs
-can go stale green (round 8 review F10).
+`malformed_class_headers_m66` — which pinned the *silence* while the gap was
+open, `#[ignore]`d — now pins the four shapes' diagnostics and runs in the
+default suite. The `verdict-differential` corpus carries a row per shape, so
+this axis is covered by the self-regression gate too. `luabox explain LB0320`
+(and `LB0321`) prints the full worked fix.
 
 ### LuaCATS tags: the full vocabulary is enforced
 
