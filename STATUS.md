@@ -1,6 +1,6 @@
 # Status
 
-**Updated:** 2026-09-06 15:20 UTC · **Integration branch:** `develop` · **Release branch:** `main` · **Owner:** Starscream (Seekers)
+**Updated:** 2026-09-06 15:50 UTC · **Integration branch:** `develop` · **Release branch:** `main` · **Owner:** Starscream (Seekers)
 
 SHAs are not pinned here — the tracker and `git log` are authoritative; this file
 carries states and measurements with the pipeline id that produced them.
@@ -38,9 +38,8 @@ for the owner.
 1. MR !5 (`starscream/integrate-develop → develop`): pipeline 20278 green
    (18/18); Shockwave round 2 findings being closed; then merge.
 2. MR `develop → main` — the promotion. Reviewer Shockwave, approver the owner.
-3. #78 (MR !4): Shockwave's round closed at `0685f13` (empty batch silent;
-   ranged-first rule documented); pipeline 20281 queued. #69 (MR !2) is
-   merged (`ce215fc`) and closed.
+3. #78 (MR !4) merged as `cb40e10` after review (pipeline 20281 13/13);
+   #69 (MR !2) merged as `ce215fc`. Both issues closed.
 
 ## Later
 
@@ -105,8 +104,7 @@ feature branch.
   sprint's planning artefacts. Shockwave review round 1 answered; pipeline waits
   on #85.
 - **!2** — merged to `develop` as `ce215fc` after Shockwave's approval; #69 closed.
-- **!4** `skywarp/issue-78 → develop` — threads addressed at `72e081a`;
-  pipeline re-run after !6.
+- **!4** — merged to `develop` as `cb40e10`; #78 closed (#83 follow-up open).
 - **!6** `thundercracker/issue-85 → develop` — cache policy sized to the
   runner (decision 15). Merge first; then re-run !4/!5 pipelines.
-- Merged this sprint: **!1** (#70), **!2** (#69), **!3** (#81).
+- Merged this sprint: **!1** (#70), **!2** (#69), **!3** (#81), **!4** (#78).
