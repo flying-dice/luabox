@@ -356,7 +356,24 @@ block** — the `---@class` ancestry limits, the indexer half of
 `duplicate-doc-field`, and the duplicate-declaration merge rules. None of them
 is a regression against `0.2.0` or `develop`; each is a defect in an
 unreleased change, found by the production readiness review and fixed before
-the block ships.
+the block ships. The one exception is the `didChange` entry that opens the
+list, which does correct shipped behaviour and is marked as such.
+
+- **The language server no longer invents a document from a `didChange` it
+  has no base text for** (#78, a fix against `0.2.0`). `textDocument/didChange`
+  carries *edits*, not state: a ranged change is only meaningful against text
+  the server already holds. When it held none — no `textDocument/didOpen` for
+  that path, and the workspace index never saw it — the ranged edits were
+  spliced into the empty string anyway, and the resulting fragment became the
+  document: stored as its overlay, then published as diagnostics. A file you
+  had not opened could show errors for code that exists in no buffer and on no
+  disk. A change with no `range` supplies the whole document, so it still
+  applies to an unseen path (full-sync clients are unaffected, as is a ranged
+  edit that follows a full replace in the same batch); a leading ranged change
+  against an unknown path is now dropped with a `window/logMessage` warning
+  naming the file. Relatedly, a `.lua` file the workspace index cannot read is
+  no longer skipped in silence — the path and the OS error reach the log pane,
+  which is where `luabox-lsp`'s other index failure already went.
 
 - **A file's own `---@enum` again shadows a same-named `[types] defs` enum,
   as `---@class` always has and as this block's own duplicate-merge entry

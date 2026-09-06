@@ -1213,8 +1213,23 @@ impl Server {
         let token = self.begin_progress(files.len());
 
         for (i, path) in files.into_iter().enumerate() {
-            let Ok(text) = fs::read_to_string(&path) else {
-                continue;
+            let text = match fs::read_to_string(&path) {
+                Ok(text) => text,
+                // Skipping is right — one unreadable file must not stop the
+                // index — but skipping *silently* is not: every cross-file
+                // answer this file would have contributed to is then wrong
+                // with no trace of why. `collect_lua_files` already reports
+                // its own failure; this is the per-file half of that rule.
+                Err(err) => {
+                    self.log_message(
+                        MessageType::WARNING,
+                        format!(
+                            "workspace index: skipping unreadable file {}: {err}",
+                            path.display()
+                        ),
+                    );
+                    continue;
+                }
             };
             let name = path
                 .file_name()
@@ -2320,7 +2335,10 @@ impl Server {
                 let Some(path) = uri_to_path(&uri) else {
                     return Ok(());
                 };
-                let current = self.host.snapshot().file_text(&path).unwrap_or_default();
+                let Some(current) = self.base_text_for_change(&path, &params.content_changes)
+                else {
+                    return Ok(());
+                };
                 let text = apply_content_changes(current, params.content_changes);
                 self.set_text(&uri, text)?;
             }
@@ -2502,6 +2520,46 @@ impl Server {
             self.republish_open_docs()?;
         }
         Ok(())
+    }
+
+    /// The text a `didChange` batch applies to, or `None` when the batch must
+    /// be dropped.
+    ///
+    /// `didChange` carries *edits*, not state (#78). A ranged change means
+    /// nothing without the text its range indexes into, and the server may
+    /// genuinely hold none: no `didOpen` for this path, and `bootstrap` never
+    /// saw it either (it is outside the root, or the walk skipped it). This
+    /// used to read `unwrap_or_default()`, so those edits spliced into `""` —
+    /// the resulting fragment became the overlay and got diagnostics
+    /// published for it, inventing a document the client never sent and
+    /// painting its problems pane with errors for code that does not exist.
+    ///
+    /// A batch whose *first* change is a full replace (`range: None`) needs no
+    /// base text: it supplies the whole document, and any later ranged edit in
+    /// the batch indexes into what that replace established. So the gate is on
+    /// the first change alone, not on "the batch contains a range".
+    fn base_text_for_change(
+        &self,
+        path: &Path,
+        changes: &[TextDocumentContentChangeEvent],
+    ) -> Option<String> {
+        if let Some(text) = self.host.snapshot().file_text(path) {
+            return Some(text);
+        }
+        if changes.first().is_some_and(|change| change.range.is_none()) {
+            return Some(String::new());
+        }
+        self.log_message(
+            MessageType::WARNING,
+            format!(
+                "ignoring `{}` for {}: the server holds no text for it (no \
+                 `textDocument/didOpen`, and it is not in the workspace \
+                 index), so an incremental edit has nothing to apply to",
+                DidChangeTextDocument::METHOD,
+                path.display()
+            ),
+        );
+        None
     }
 
     /// didOpen/didChange: overlay the new text, then publish diagnostics.
@@ -5127,8 +5185,7 @@ return use
         assert!(
             logged
                 .iter()
-                .any(|m| m.contains("textDocument/didChange")
-                    && m.contains("never_opened.lua")),
+                .any(|m| m.contains("textDocument/didChange") && m.contains("never_opened.lua")),
             "{logged:?}"
         );
     }
@@ -5207,8 +5264,7 @@ return use
         let (dir, mut server, client) = test_server();
         // A dangling symlink: the walk sees a `.lua` entry (it is not a
         // directory), `read_to_string` then fails on the missing target.
-        std::os::unix::fs::symlink("nowhere.lua", dir.path().join("broken.lua"))
-            .expect("symlink");
+        std::os::unix::fs::symlink("nowhere.lua", dir.path().join("broken.lua")).expect("symlink");
         server.bootstrap();
 
         let logged = log_messages(&drain(&client));
