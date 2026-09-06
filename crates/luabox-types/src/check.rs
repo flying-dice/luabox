@@ -2348,21 +2348,24 @@ pub(crate) fn malformed_class_headers(
 ///   telling the user to delete a parent that works (review of !2,
 ///   `e751bb0`). An unreadable type *argument* is a real mistake, but it is a
 ///   finding about the argument.
-/// - **Anything else, look inside.** A wrapper is applied to whatever it
-///   follows, so `: Base,, ?` parses as `Optional(Error)` and a match on the
-///   entry's own `kind` reports nothing on it — the same silence #69 exists
-///   to remove, one level down. Below a wrapper the question is unchanged, so
-///   it recurses; for every other shape — a union, a table literal, a `fun`
-///   type — the entry contributes no parent whether or not the parser choked
-///   inside it (measured: `: { x: number }` gives its class no members, the
-///   same as no extends list at all), so the note holds and any error in
-///   there is this finding.
+/// - **Anything else, look inside.** Every other shape contributes no parent
+///   at all, whether or not the parser choked inside it, so the note ("the
+///   entry is ignored") holds of it and any error anywhere in there is this
+///   finding. That includes the shapes that merely *contain* a name:
+///   measured, `: Base?`, `: Base[]`, `: (Base)` and `: Base|Base` each leave
+///   their class with no members — `LB0306` at a read of an inherited field,
+///   identical to `: { x: number }` and to no extends list at all — where
+///   bare `: Base` inherits and `LB0300` enforces ancestry. A name under a
+///   wrapper is not the parent, so looking through the wrapper to stop at it
+///   silenced `: Base<?>?`, `: Base<?>[]` and `: (Base<?>)`, each an entry
+///   that names no parent and carries a token the parser could not read
+///   (review of !2, `6f03acd`). Recursing is also what reaches a wrapped
+///   recovery node in the first place: `: Base,, ?` parses as
+///   `Optional(Error)`, and a match on the entry's own `kind` reports nothing
+///   on it — the same silence #69 exists to remove, one level down.
 fn unnamed_parent_entry(parent: &TypeExpr) -> Option<&TypeExpr> {
     match &parent.kind {
         TypeExprKind::Named { .. } => None,
-        TypeExprKind::Optional(inner) | TypeExprKind::Array(inner) | TypeExprKind::Paren(inner) => {
-            unnamed_parent_entry(inner)
-        }
         _ => parent.first_error(),
     }
 }

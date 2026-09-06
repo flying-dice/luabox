@@ -285,15 +285,20 @@ members are inherited exactly as `: Base`'s are — nothing is dropped, so the
 message ("an entry that is not a class name"), the note ("the entry is
 ignored") and the remedy ("replace the entry with the parent it was meant to
 name") would all be false of it, and at `Severity::Error` the last one tells
-the user to delete a parent that works. The rule looks through the wrappers a
-name can be written under (`?`, `[]`, parentheses) and stops at the name; an
-entry that is no name at all — a union, a table literal, a `fun` type —
-contributes no parent whether or not the parser choked inside it (measured:
-`: { x: number }` leaves its class with no members, exactly as no extends list
-would), so the note holds there and any unreadable token in one is reported. An unreadable *type argument* is a real mistake and is currently
-reported nowhere: `luacats`' recovery errors do not leave the syntax crate,
-so `---@field x Base<?>` is silent on the same axis. That gap is the type-
-argument axis, not the extends-list one, and it is not what this code covers.
+the user to delete a parent that works. The rule stops at a bare name and
+nowhere else. A name written *under* something is not a parent either:
+measured, `: Base?`, `: Base[]`, `: (Base)` and `: Base|Base` each leave
+their class with no members — the same as `: { x: number }`, a `fun` type,
+or no extends list at all — where `: Base` inherits. So every entry but a
+bare name contributes no parent whether or not the parser choked inside it,
+the note holds there, and an unreadable token anywhere in one is reported:
+`---@class A : Base<?>[]` is this finding, `---@class A : Base<?>` is not.
+
+An unreadable *type argument* is a real mistake and is currently reported
+nowhere: `luacats`' recovery errors do not leave the syntax crate, so
+`---@field x Base<?>` is silent on the same axis. That gap is the
+type-argument axis, not the extends-list one, and it is not what this code
+covers.
 
 **What a class name has to be.** One or more dot-separated segments
 (`geometry.Point`), each starting with a letter, `_`, or a non-ASCII

@@ -1599,10 +1599,13 @@ parent it was meant to name:
 **Not raised for a parent whose name reads.** `---@class A : Base<?>` keeps
 `Base` as a parent — it resolves, and its members are inherited — so the entry
 is a class name and this is not the finding, whatever the `<...>` contains.
-The rule looks through the wrappers a name can be written under (`?`, `[]`,
-parentheses) and stops there. An entry that is not a name at all — a union, a
-table literal, a `fun` type — contributes no parent either way, so an
-unreadable token anywhere inside one is this finding.
+The rule stops at a name written on its own, and nowhere else: an entry that
+is a name *under* something — `Base?`, `Base[]`, `(Base)`, `Base|Base` — is
+not a parent either, and gives its class no members at all, the same as a
+union, a table literal, a `fun` type or no extends list. Anything but a bare
+name contributes no parent, so an unreadable token anywhere inside one is
+this finding — `---@class A : Base<?>[]` is reported, `---@class A : Base<?>`
+is not.
 
 **Distinct from LB0305 and LB0320.** `---@class A : P,` with `P` undeclared
 reports LB0305 (`unknown type name \\`P\\``) *as well*: one name is spelled

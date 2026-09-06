@@ -147,10 +147,12 @@ and that rule is now written into the policy rather than left to judgement.
   that message-count difference is the only remaining divergence on this
   axis. `class_merge_precedence_matrix.rs`'s `malformed_class_headers_m66`,
   which pinned the silence while the gap was open, now pins the diagnostics
-  and is no longer `#[ignore]`d. `LB0321` stops at the first parent name it
-  can read: `---@class A : Base<?>` keeps `Base` — the name resolves and its
-  members are inherited — so only an entry the parser could not read at all
-  is this finding.
+  and is no longer `#[ignore]`d. `LB0321` stops at a parent name written on
+  its own: `---@class A : Base<?>` keeps `Base` — the name resolves and its
+  members are inherited — so it is not this finding. A name under a wrapper
+  is not a parent (`Base[]` is an array of the class, and leaves its class
+  with no members, exactly as no extends list would), so an unreadable token
+  inside one still is: `---@class A : Base<?>[]` reports it.
 
 - **Hover and completion resolve class members through the checker's
   ambient environment** (#56). The editor surfaces were built on a per-file
