@@ -114,7 +114,7 @@ build-directory caches among them go from 12 to 1.
   that actually compounds across runs — is still cached, so the gate keeps its
   memory. Only the build is repaid.
 - **Nothing about the gates themselves changes.** No floor, stage, rule,
-  timeout or script moved. Decision 14 clause 5's quality bar is untouched:
+  timeout or script moved. Decision 14 clause 7's quality bar is untouched:
   this is a change to how the pipeline stores intermediates, not to what it
   measures. A cache change that altered a verdict would be a different, worse
   decision.
