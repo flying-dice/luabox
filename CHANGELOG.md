@@ -359,23 +359,28 @@ unreleased change, found by the production readiness review and fixed before
 the block ships. The one exception is the `didChange` entry that opens the
 list, which does correct shipped behaviour and is marked as such.
 
-- **The language server no longer invents a document from a `didChange` it
-  has no base text for** (#78, a fix against `0.2.0`). `textDocument/didChange`
+- **The language server no longer invents a document from a `didChange` it has
+  no base text for** (#78, a fix against `0.2.0`). `textDocument/didChange`
   carries *edits*, not state: a ranged change is only meaningful against the
   buffer it indexes into, and only a document the client opened has one.
   Without a `textDocument/didOpen` the edits were spliced into whatever was to
-  hand anyway — the empty string, or the disk text the workspace index had
-  read — and the result became the document: stored as its overlay, then
-  published as diagnostics. A file you had not opened could show errors for
-  code that exists in no buffer, and for an indexed file they stayed: the
-  overlay shadows disk, and with no `didOpen` there is no `didClose` to drop
-  it. A change with no `range` supplies the whole document, so it still
-  applies to an unopened path (full-sync clients are unaffected, as is a
-  ranged edit that follows a full replace in the same batch); a leading ranged
-  change against an unopened path is now dropped with a `window/logMessage`
-  warning naming the file. Relatedly, a `.lua` file the workspace index cannot
-  read is no longer skipped in silence — the path and the OS error reach the
-  log pane, which is where `luabox-lsp`'s other index failure already went.
+  hand anyway — the empty string, or the disk text the workspace index had read
+  — and the result became the document: stored as its overlay, then published
+  as diagnostics. A file you had not opened could show errors for code that
+  exists in no buffer, and for an indexed file they stayed: the overlay shadows
+  disk, and with no `didOpen` there is no `didClose` to drop it. A change with
+  no `range` supplies the whole document, so it still applies to an unopened
+  path (full-sync clients are unaffected, as is a ranged edit that follows a
+  full replace in the same batch); a leading ranged change against an unopened
+  path is now dropped with a `window/logMessage` warning naming the file, while
+  an empty batch is a silent no-op — there is no edit to warn about. The rule
+  keys on a batch's first change: it is accepted iff that change is a full
+  replace, so a batch that begins ranged is dropped even if a later change in
+  it is one — one rule for an off-spec client, and a batch that already lost
+  sync once is not trusted to have found it again mid-batch. Relatedly, a
+  `.lua` file the workspace index cannot read is no longer skipped in silence —
+  the path and the OS error reach the log pane, which is where `luabox-lsp`'s
+  other index failure already went.
 
 - **A file's own `---@enum` again shadows a same-named `[types] defs` enum,
   as `---@class` always has and as this block's own duplicate-merge entry

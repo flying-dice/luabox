@@ -2545,7 +2545,12 @@ impl Server {
     /// A batch whose *first* change is a full replace (`range: None`) needs no
     /// base text: it supplies the whole document, and any later ranged edit in
     /// the batch indexes into what that replace established. So the gate is on
-    /// the first change alone, not on "the batch contains a range".
+    /// the first change alone, not on "the batch contains a range": a batch is
+    /// accepted iff its first change is a full replace, and a batch that
+    /// begins ranged is dropped even if a later change in it is one — one
+    /// rule for an off-spec client, and a batch whose first change is already
+    /// ranged is a client that has already lost sync, not one to be trusted
+    /// to have found it again mid-batch.
     fn base_text_for_change(
         &self,
         path: &Path,
@@ -2555,6 +2560,11 @@ impl Server {
             && let Some(text) = self.host.snapshot().file_text(path)
         {
             return Some(text);
+        }
+        if changes.is_empty() {
+            // An empty batch has nothing to warn about: it is a legal no-op,
+            // not an edit with no base text, so it must stay silent.
+            return None;
         }
         if changes.first().is_some_and(|change| change.range.is_none()) {
             return Some(String::new());
@@ -5313,6 +5323,55 @@ return use
         assert_eq!(
             server.host.snapshot().file_text(&path).as_deref(),
             Some("local x = 2\n"),
+        );
+    }
+
+    /// The mirror shape of the test above: a full replace *following* a
+    /// ranged edit does not rescue the batch. The gate is on the first
+    /// change alone — a batch that begins ranged already has nothing to
+    /// splice into, and a later full replace in it does not change that: an
+    /// off-spec client that lost sync once is not trusted to have found it
+    /// again mid-batch.
+    #[test]
+    fn a_batch_that_begins_ranged_is_dropped_even_if_it_ends_in_a_full_replace() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("never_opened.lua");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": uri.to_string(), "version": 2 },
+                    "contentChanges": [
+                        {
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 0 },
+                            },
+                            "text": "local x = ",
+                        },
+                        { "text": "local x = 1\n" },
+                    ],
+                }),
+            })
+            .expect("didChange");
+
+        let messages = drain(&client);
+        assert!(
+            published_diagnostics(&messages, &uri).is_none(),
+            "a batch that begins ranged is dropped whole, full replace or \
+             not: {messages:?}"
+        );
+        assert!(
+            server.host.snapshot().file_text(&path).is_none(),
+            "and it must not invent the document in the host either"
+        );
+        let logged = log_messages_at(&messages, MessageType::WARNING);
+        assert!(
+            logged
+                .iter()
+                .any(|m| m.contains("textDocument/didChange") && m.contains("never_opened.lua")),
+            "{logged:?}"
         );
     }
 
