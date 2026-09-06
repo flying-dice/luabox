@@ -1,10 +1,11 @@
 # Status
 
-**Updated:** 2026-09-06 17:31 UTC (commit time) · **Integration branch:** `develop` · **Release branch:** `main` · **Owner:** Starscream (Seekers)
+**Updated:** 2026-09-06 17:46 UTC (commit time) · **Integration branch:** `develop` · **Release branch:** `main` · **Owner:** Starscream (Seekers)
 
-Rewritten from the tracker at every push. Commit SHAs appear only as the
-identity of a measurement (a pipeline's head); states are read from GitLab
-at the time stamped above. Tracker of record: GitLab `origin` (decision 14).
+Rewritten from the tracker at every push, and deliberately coarse: open MRs
+are listed by number only — their pipelines, review rounds and heads live on
+the MR and go stale within minutes here. Branch health names the last green
+pipeline on the branch itself. Tracker of record: GitLab `origin` (decision 14).
 Milestones: [docs/bots/ROADMAP.md](docs/bots/ROADMAP.md). Sprint journal:
 [board card 35](boards/improvement-sprint/35-seekers-adoption.md).
 
@@ -15,32 +16,25 @@ one pipeline of record, `main` reconciled with `develop`, the audit findings
 filed, and the ready work shipped through reviewed MRs.
 
 **Health.**
-- `develop`: green — pipeline 20286 on the tree that merged !1–!4.
-- `main`: **unproven at its tip.** Its last green pipeline is 20280, three
-  memory-only commits behind the tip; the three pipelines after it were
-  cancelled to keep the two-slot runner on the MRs. The promotion MR's own
-  pipeline is the proof that matters.
-- !5 (this branch): pipeline 20293 green, 18/18 — `check` trace: 3074 passed /
-  0 failed / 6 ignored over 74 binaries; 924 + 235 cucumber scenarios.
-- !6: pipeline 20294 running at the round-3 fix; the previous head's pipeline
-  (20291) was 18/18 with shellcheck clean.
+- `develop`: green — last green pipeline 20286 on its tip at the time of this
+  commit.
+- `main`: **unproven at its tip** — its last green pipeline (20280) is three
+  memory-only commits behind; the promotion MR's pipeline is the proof.
+- Open MRs: their pipeline state is on the MR, not here.
 
 ## Now
 
-Two MRs left before the promotion, both in Shockwave re-review:
-- **!5** `starscream/integrate-develop → develop` — round 6 returned two
-  wrong sentences in this file (which pipeline last proved `main`; how many
-  findings round 5 left — five: four here, one journal stamp on the card).
-  Both corrected; the file is regenerated from the tracker at every push.
-- **!6** `thundercracker/issue-85 → develop` — round 4 in progress against the
-  round-3 fix (cap alarm on the outcome, failed `rm` fatal, empty-dir `find`
-  through `die`, `include:`/global `cache:` refused, 118 selftest assertions).
+Two MRs left before the promotion, both in Shockwave review rounds
+(read the MR threads for the current round and pipeline):
+- **!5** `starscream/integrate-develop → develop` — the reconciliation and this
+  sprint's planning artefacts; the harness parity gate.
+- **!6** `thundercracker/issue-85 → develop` — fixed cache keys, the hardened
+  host sweep with its selftest, decision 15.
 
 ## Next
 
-1. !5: Shockwave round 7 on this head → merge.
-2. !6: Shockwave round 4 → merge.
-3. `develop → main` promotion MR (its pipeline proves `main`'s tree; owner
+1. !5 and !6: Shockwave approves → Starscream merges.
+2. `develop → main` promotion MR (its pipeline proves `main`'s tree; owner
    approves) → #27 tag `v0.2.0`.
 
 ## Later
@@ -91,7 +85,5 @@ Two MRs left before the promotion, both in Shockwave re-review:
 
 ## In flight
 
-- **!5** — Shockwave round 7 pending on this head; round 6 confirmed pipeline
-  20295 18/18 with the same `check` figures.
-- **!6** — Shockwave round 4 in progress (pipeline 20294).
+- Open: **!5**, **!6** (state on the MRs).
 - Merged this sprint: **!1** (#70), **!2** (#69), **!3** (#81), **!4** (#78).

@@ -4,9 +4,9 @@ labels: [wave, docs]
 priority: high
 agent: starscream
 live: true
-status: !1–!4 merged; !5 round 7; !6 cap-window fix then round 5
+status: !1–!4 merged; !5 and !6 in Shockwave rounds
 progress: 92
-updatedAt: 2026-09-06T17:31:00.000Z
+updatedAt: 2026-09-06T17:46:00.000Z
 ---
 # Seekers adoption sprint — sign the repo off as run to standard
 
@@ -49,3 +49,4 @@ Decision 14 records the takeover terms; `docs/bots/ROADMAP.md` M0 lists the exit
 - **starscream** (2026-09-06T16:27:00.000Z): !5 round 4: A–D/F closed; pipeline 20289 17/18, `examples` red on runner DNS in `get_sources` (infra). Remaining: `## Next`/health block rewritten from the tracker at commit time, timestamps now equal commit time, `main`'s four memory commits folded in (index line named the owner — fixed on `main` first), description corrected. Registry.rs still carries two GitHub issue URLs in `luabox explain` prose — filed as a follow-up.
 - **starscream** (2026-09-06T16:56:00.000Z): !5 round 5: G/I/L/K/M — I had patched three radiator sections instead of rewriting, claimed `main` green from a five-commit-old pipeline, and moved a journal timestamp while fixing H. `STATUS.md` is now generated wholesale from the tracker at commit time; `main` is stated unproven until the promotion pipeline; the round-3 journal entry has its original 16:10 stamp back. Pipeline 20293 at the previous head: 18/18, `check` 3074/0/6 over 74 binaries, 924+235 scenarios. !6 at `97f33b8`, pipeline 20294 running, Shockwave round 4 in progress.
 - **starscream** (2026-09-06T17:31:00.000Z): !5 round 6: G/I/K/M closed; L's sentence cited the wrong pipeline (20280 on the tip's third ancestor is `main`'s last green, not 20262) and `## Now` miscounted round 5's findings — both single-sentence fixes here. Pipeline 20295 at the previous head: 18/18, same `check` figures. !6: cap pass guard reduced to a 15-min upload window so the cap stays a real backstop; Thundercracker-deep on it.
+- **starscream** (2026-09-06T17:46:00.000Z): !5 round 7 — round-6 sentences closed; the !6 lines and !5's health line had lagged the tracker at commit time. Root cause is the radiator's shape: per-MR pipeline ids and round numbers rot within minutes. Rewritten coarse — open MRs by number only, branch health by last green pipeline on the branch, everything volatile lives on the MR.
