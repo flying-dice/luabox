@@ -32,6 +32,13 @@ impl TypeExpr {
     /// `Optional` and reports nothing — the exact silence the diagnostic
     /// exists to remove.
     ///
+    /// It answers "is there an unreadable token anywhere in here", nothing
+    /// narrower: a [`TypeExprKind::Named`]'s generic arguments count, so
+    /// `Base<?>` carries an error even though `Base` itself read fine. A
+    /// caller asking the narrower question — whether the *expression* is
+    /// usable as the thing it is written in place of — has to say so itself;
+    /// `luabox-types`' `unnamed_parent_entry` is one, and stops at a name.
+    ///
     /// The returned node is the innermost one on the path, so a diagnostic
     /// anchors on the token the parser actually choked on rather than on the
     /// wrapper around it. The match is exhaustive by design: a new

@@ -1596,6 +1596,14 @@ parent it was meant to name:
 ---@class A : P, Q         -- the comma meant a second parent
 ```
 
+**Not raised for a parent whose name reads.** `---@class A : Base<?>` keeps
+`Base` as a parent — it resolves, and its members are inherited — so the entry
+is a class name and this is not the finding, whatever the `<...>` contains.
+The rule looks through the wrappers a name can be written under (`?`, `[]`,
+parentheses) and stops there. An entry that is not a name at all — a union, a
+table literal, a `fun` type — contributes no parent either way, so an
+unreadable token anywhere inside one is this finding.
+
 **Distinct from LB0305 and LB0320.** `---@class A : P,` with `P` undeclared
 reports LB0305 (`unknown type name \\`P\\``) *as well*: one name is spelled
 correctly and declared nowhere, the other slot has no name at all. LB0320 is

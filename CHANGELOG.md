@@ -147,7 +147,10 @@ and that rule is now written into the policy rather than left to judgement.
   that message-count difference is the only remaining divergence on this
   axis. `class_merge_precedence_matrix.rs`'s `malformed_class_headers_m66`,
   which pinned the silence while the gap was open, now pins the diagnostics
-  and is no longer `#[ignore]`d.
+  and is no longer `#[ignore]`d. `LB0321` stops at the first parent name it
+  can read: `---@class A : Base<?>` keeps `Base` — the name resolves and its
+  members are inherited — so only an entry the parser could not read at all
+  is this finding.
 
 - **Hover and completion resolve class members through the checker's
   ambient environment** (#56). The editor surfaces were built on a per-file

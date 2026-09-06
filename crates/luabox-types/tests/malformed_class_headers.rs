@@ -293,12 +293,79 @@ return { P, M }
 local M = {}
 return M
 ",
+        // A generic parent that reads cleanly end to end — clean before and
+        // after the stop-at-a-name rule below, which is why that rule needs
+        // the `P<?>` case in
+        // `an_unreadable_type_argument_does_not_make_the_parent_unreadable`
+        // rather than this one.
+        "\
+---@class P
+local P = {}
+
+---@class A : P<number>
+local M = {}
+return { P, M }
+",
     ] {
         assert!(
             !codes(src, Strictness::Strict).contains(&"LB0321".to_string()),
             "a parseable parent must not raise LB0321:\n{src}"
         );
     }
+}
+
+/// The counterpart to the wrapping shapes above, and the arm they do not
+/// cover: an unreadable *type argument* of a parent whose name reads fine.
+///
+/// The three fixtures differ in one respect each. `: Base<?>` must behave
+/// like the well-formed `: Base` — the parent is resolved and its members are
+/// inherited, so LB0300 fires on the missing member and LB0321 must not fire
+/// at all. It must *not* behave like `: ?`, where the entry really is
+/// discarded and `b` is never inherited. Reporting the middle case as "an
+/// entry that is not a class name" told the user, at `Severity::Error`, to
+/// delete a parent that works (review of !2, `e751bb0`).
+#[test]
+fn an_unreadable_type_argument_does_not_make_the_parent_unreadable() {
+    fn fixture(parents: &str) -> String {
+        format!(
+            "\
+---@class Base
+---@field b number
+local B = {{}}
+
+---@class A : {parents}
+local M = {{}}
+return {{ B, M }}
+"
+        )
+    }
+
+    let generic_argument = fixture("Base<?>");
+    assert_eq!(
+        codes(&generic_argument, Strictness::Strict),
+        codes(&fixture("Base"), Strictness::Strict),
+        "`Base<?>` must be diagnosed exactly like the well-formed `Base`:\n{generic_argument}"
+    );
+    assert_eq!(
+        codes(&generic_argument, Strictness::Strict),
+        vec!["LB0300".to_string()],
+        "the parent must still be wired — ancestry is enforced, so the missing \
+         member is the only finding: {:?}",
+        check(&generic_argument, Strictness::Strict),
+    );
+
+    // The control on the other side, and the one this shape is NOT: an entry
+    // the parser could not read at all really is discarded, so `b` is never
+    // inherited — no LB0300 about the missing member, an LB0306 at the read
+    // of it instead, and this rule fires. `an_extends_entry_that_is_not_a_...`
+    // pins that finding's own message and span; what matters here is that the
+    // two shapes measure differently at all.
+    assert_ne!(
+        codes(&generic_argument, Strictness::Strict),
+        codes(&fixture("?"), Strictness::Strict),
+        "`Base<?>` must not be diagnosed like an entry that is genuinely \
+         unreadable — the parent is wired in one and dropped in the other"
+    );
 }
 
 /// One variable per control: the same header, the same undeclared parent, no

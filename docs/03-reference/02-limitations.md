@@ -279,6 +279,22 @@ both, rather than claiming a name is missing, which would be false on the
 first. This is an error under `[types] strict = true`, so the wording has to
 be true of every shape that reaches it.
 
+**Where `LB0321` stops: a parent whose name reads.** `---@class A : Base<?>`
+is *not* this finding. The entry heads with `Base`, which resolves and whose
+members are inherited exactly as `: Base`'s are — nothing is dropped, so the
+message ("an entry that is not a class name"), the note ("the entry is
+ignored") and the remedy ("replace the entry with the parent it was meant to
+name") would all be false of it, and at `Severity::Error` the last one tells
+the user to delete a parent that works. The rule looks through the wrappers a
+name can be written under (`?`, `[]`, parentheses) and stops at the name; an
+entry that is no name at all — a union, a table literal, a `fun` type —
+contributes no parent whether or not the parser choked inside it (measured:
+`: { x: number }` leaves its class with no members, exactly as no extends list
+would), so the note holds there and any unreadable token in one is reported. An unreadable *type argument* is a real mistake and is currently
+reported nowhere: `luacats`' recovery errors do not leave the syntax crate,
+so `---@field x Base<?>` is silent on the same axis. That gap is the type-
+argument axis, not the extends-list one, and it is not what this code covers.
+
 **What a class name has to be.** One or more dot-separated segments
 (`geometry.Point`), each starting with a letter, `_`, or a non-ASCII
 character and continuing with letters, digits, `_` or non-ASCII. The grammar

@@ -49,6 +49,7 @@ use luabox_syntax::lua::ast::{
     Stmt, TableExpr,
 };
 use luabox_syntax::lua::{self, SyntaxNode};
+use luabox_syntax::luacats::{TypeExpr, TypeExprKind};
 
 use crate::assign::{
     Exactness, LiteralConformance, assignable, classify_literal, is_integral_literal,
@@ -2245,7 +2246,7 @@ pub(crate) fn malformed_class_headers(
     file: &str,
     strict: bool,
 ) -> Vec<Diagnostic> {
-    use luabox_syntax::luacats::{Tag, TypeExpr, is_type_name};
+    use luabox_syntax::luacats::{Tag, is_type_name};
 
     let severity = if strict {
         Severity::Error
@@ -2297,12 +2298,7 @@ pub(crate) fn malformed_class_headers(
             // empty, since a zero-width caret past the end of the line points
             // at nothing.
             //
-            // `first_error`, not a match on the parent's own `kind`: a
-            // postfix or grouping operator wraps whatever it follows, so
-            // `: Base,, ?` parses as `Optional(Error)` and a root-only match
-            // reports nothing on it — the same silence #69 exists to remove,
-            // one level down.
-            if let Some(bad_entry) = class.parents.iter().find_map(TypeExpr::first_error) {
+            if let Some(bad_entry) = class.parents.iter().find_map(unnamed_parent_entry) {
                 let anchor = if bad_entry.span.start < bad_entry.span.end {
                     Span::new(file, bad_entry.span.start..bad_entry.span.end)
                 } else {
@@ -2333,6 +2329,43 @@ pub(crate) fn malformed_class_headers(
 }
 
 // --- helpers -------------------------------------------------------------
+
+/// The recovery node that makes an extends-list entry name no class at all —
+/// `None` for an entry that does name one, whatever else is wrong inside it.
+/// The LB0321 half of [`malformed_class_headers`], kept here rather than on
+/// [`TypeExpr`] because it is a claim about *inheritance*, which the syntax
+/// crate neither owns nor can check.
+///
+/// Two rules, and the split between them is measured, not stylistic:
+///
+/// - **A name in front ends it.** `: Base<?>` heads with `Base`, and measures
+///   identically to the well-formed `: Base` — the parent resolves, its
+///   members are inherited, `LB0300` still enforces ancestry.
+///   Nothing is ignored, so this diagnostic's message ("an entry that is not
+///   a class name"), its note ("the entry is ignored") and its remedy
+///   ("replace the entry with the parent it was meant to name") would each be
+///   false of it, at `Severity::Error` under `[types] strict = true` —
+///   telling the user to delete a parent that works (review of !2,
+///   `e751bb0`). An unreadable type *argument* is a real mistake, but it is a
+///   finding about the argument.
+/// - **Anything else, look inside.** A wrapper is applied to whatever it
+///   follows, so `: Base,, ?` parses as `Optional(Error)` and a match on the
+///   entry's own `kind` reports nothing on it — the same silence #69 exists
+///   to remove, one level down. Below a wrapper the question is unchanged, so
+///   it recurses; for every other shape — a union, a table literal, a `fun`
+///   type — the entry contributes no parent whether or not the parser choked
+///   inside it (measured: `: { x: number }` gives its class no members, the
+///   same as no extends list at all), so the note holds and any error in
+///   there is this finding.
+fn unnamed_parent_entry(parent: &TypeExpr) -> Option<&TypeExpr> {
+    match &parent.kind {
+        TypeExprKind::Named { .. } => None,
+        TypeExprKind::Optional(inner) | TypeExprKind::Array(inner) | TypeExprKind::Paren(inner) => {
+            unnamed_parent_entry(inner)
+        }
+        _ => parent.first_error(),
+    }
+}
 
 fn range(node: &SyntaxNode) -> Range<usize> {
     let r = node.text_range();
