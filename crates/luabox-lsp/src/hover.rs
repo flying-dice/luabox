@@ -438,6 +438,115 @@ mod tests {
         );
     }
 
+    /// #70's other half at the same surface: a genuine diamond, two generic
+    /// ancestors each reached through both parents on a different binding.
+    /// The merge keeps the last-visited edge (`R`'s `Q<string>`), so the
+    /// tooltip must quote `Q`'s `---@field` — the preorder walk that used to
+    /// supply the description reaches `L`'s `Slot` first and quoted that.
+    ///
+    /// Round 9 review, thread on `env.rs:3104`: the issue's headline
+    /// three-declaration fixture answers identically before and after, so it
+    /// evidences nothing about the diamond. This shape does.
+    #[test]
+    fn a_diamond_conflicts_type_and_description_name_one_declaration() {
+        let hover = at_files(
+            &[(
+                "main.lua",
+                "---@class Slot<T>\n---@field f T the f from Slot\n\n\
+                 ---@class Q<U>\n---@field f U the f from Q\n\n\
+                 ---@class L : Slot<number>, Q<number>\n\n\
+                 ---@class R : Slot<string>, Q<string>\n\n\
+                 ---@class Both : L, R\n\n\
+                 ---@type Both\nlocal b = nil\nprint(b.f)\n",
+            )],
+            "f)",
+            0,
+        )
+        .expect("hover");
+        assert!(
+            hover.contains("(field) Both.f: string"),
+            "the type is the last-visited edge's: {hover}"
+        );
+        assert!(
+            hover.contains("the f from Q"),
+            "…and so is the description: {hover}"
+        );
+        assert!(
+            !hover.contains("the f from Slot"),
+            "the edge the merge did not take must not be quoted: {hover}"
+        );
+    }
+
+    /// A carrier attachment keeps its parent's documentation (round 9
+    /// review, thread on `sema.rs:952`). `Sub` declares `greet` by writing
+    /// the function, not with `---@field`, so the merge names `Sub` the owner
+    /// with no declaration site — and the only prose that exists for the
+    /// member is `Base`'s. Narrowing the search to the owner's own
+    /// declarations must not throw it away.
+    #[test]
+    fn a_carrier_attached_member_still_shows_its_parents_description() {
+        let hover = at_files_from(
+            &[
+                (
+                    "base.lua",
+                    "---@class Base\n---@field greet fun() the greeting from Base\n",
+                ),
+                (
+                    "main.lua",
+                    "---@class Sub : Base\nlocal S = {}\nfunction S.greet() end\n\n\
+                     ---@type Sub\nlocal s = nil\nprint(s.greet)\n",
+                ),
+            ],
+            "main.lua",
+            "greet)",
+            0,
+        )
+        .expect("hover");
+        assert!(
+            hover.contains("the greeting from Base"),
+            "the parent's `---@field` is the only description there is: {hover}"
+        );
+    }
+
+    /// …and it does not borrow one from a class the merge ruled out.
+    /// `Leaf : Mid, Other`: `Mid` attaches `f` as a carrier and wins the key
+    /// first-listed, so the tooltip renders the carrier's `fun()`. `Other`'s
+    /// `---@field f string` lost, and a walk rooted at `Leaf` rather than at
+    /// the owner reaches it — a `string` field's prose under a `fun()` type,
+    /// which is the divergence #70 closes.
+    #[test]
+    fn a_carrier_attached_member_does_not_borrow_a_ruled_out_siblings_description() {
+        let hover = at_files_from(
+            &[
+                (
+                    "mid.lua",
+                    "---@class Mid\nlocal M = {}\nfunction M.f() end\nreturn M\n",
+                ),
+                (
+                    "other.lua",
+                    "---@class Other\n---@field f string the f from Other\n",
+                ),
+                (
+                    "main.lua",
+                    "---@class Leaf : Mid, Other\n\n\
+                     ---@type Leaf\nlocal l = nil\nprint(l.f)\n",
+                ),
+            ],
+            "main.lua",
+            "f)",
+            0,
+        )
+        .expect("hover");
+        assert!(
+            hover.contains("fun()"),
+            "the type is the carrier's: {hover}"
+        );
+        assert!(
+            !hover.contains("the f from Other"),
+            "the ruled-out sibling's prose must not be quoted: {hover}"
+        );
+    }
+
     /// [`at_files`] over a workspace with a **dependency** definition package
     /// (round 8 review, F7).
     ///

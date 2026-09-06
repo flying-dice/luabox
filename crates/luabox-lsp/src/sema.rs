@@ -901,11 +901,17 @@ pub struct FieldLookup<'a> {
 /// a recorded [`luabox_types::FieldDeclSite`] *is* the answer, returned
 /// directly with no file visited at all; an owner with no recorded site
 /// (`FieldDeclSite` lists those cases — chiefly a carrier attachment or the
-/// definition layer) narrows the walk to that class's **own** declarations
-/// and stops there rather than recursing into its parents, because the merge
-/// has already said the parents lost. `None` — a class the merged layer does
-/// not declare, or a caller with no merged layer to ask — falls back to the
-/// full walk unchanged.
+/// definition layer) **roots the walk at that class** instead of at the one
+/// the cursor named, so the intermediate declarations the merge ruled out are
+/// never visited. `None` — a class the merged layer does not declare, or a
+/// caller with no merged layer to ask — walks from the queried class,
+/// unchanged.
+///
+/// That is the whole of the narrowing, and it is an ordering: it decides
+/// *which* of two declarations is shown, never whether one is shown. A
+/// carrier attachment declares the member with no `---@field` anywhere in the
+/// owner, so its parent's documentation and jump target are the only ones
+/// there are, and the walk still reaches them (round 9 review).
 #[must_use]
 pub fn locate_field(
     lookup: &FieldLookup<'_>,
@@ -918,8 +924,9 @@ pub fn locate_field(
     // wrong by construction.
     //
     // The recorded path is checked against this `Analysis` before it is
-    // returned (round 8 clean-code audit, coupling finding 1), and the walk
-    // below runs if it does not resolve. `luabox_types::FieldDeclSite::file`
+    // returned (round 8 clean-code audit, coupling finding 1), and an
+    // unresolvable one falls through to the owner-rooted walk below, exactly
+    // as an owner with no site at all does. `luabox_types::FieldDeclSite::file`
     // is a `String` `luabox-db` produced with `Path::to_string_lossy` for
     // *diagnostic* display; nothing in the type system says a `PathBuf` built
     // back out of it names a file this snapshot knows, and a non-UTF-8 path
@@ -940,18 +947,32 @@ pub fn locate_field(
             });
         }
     }
-    match origin {
-        // Owner known, site not. Its own declarations across every candidate
-        // file are the whole search space: the merge resolved the key to
-        // *this* class's contribution, so an ancestor's `---@field` for the
-        // same name is a declaration the checker demonstrably did not use,
-        // and returning it would put a description and a jump target in front
-        // of the user for a type that is not the one being shown. Missing is
-        // the honest answer, and it is the gap this function already
-        // documents above for a member no `---@field` anywhere declares.
-        Some(origin) => locate_field_in_own_declarations(lookup, &origin.owner, member),
-        None => locate_field_dfs(lookup, class, member, &mut HashMap::new(), 0),
-    }
+    // Owner known, site not (or recorded but unresolvable). All the merge's
+    // answer buys here is a better **root** for the same walk: start at the
+    // class it resolved the key to rather than at the class the cursor named,
+    // so the intermediate declarations it ruled out are never visited.
+    //
+    // The walk's own two-pass shape supplies the rest. `locate_field_in_class`
+    // exhausts a class's own `---@field`s across every candidate file before
+    // it follows a single parent, which is exactly the precedence this case
+    // needs: an ancestor's declaration for the same name is one the checker
+    // demonstrably did not use, and preferring it would put a description and
+    // a jump target in front of the user for a type that is not the one being
+    // shown. Asking for the owner's own declarations separately first and
+    // falling back to the walk on a miss was the same thing said twice — it
+    // rebuilt the owner's declaration set a second time on exactly the case
+    // (`function S.greet()` carriers) the walk's own doc calls routine (round
+    // 9 clean-code audit, DRY finding 1).
+    //
+    // Stopping at that first pass instead — answering a miss with `None` —
+    // was a silent revert (round 9 review, thread on `sema.rs:952`). A
+    // carrier attachment declares the member with no `---@field` anywhere in
+    // the owner, so the parent's is the only description and the only jump
+    // target that exist, and the type rendered comes from the carrier either
+    // way. The narrowing decides *which* of two declarations is shown; it
+    // never decides that none is.
+    let root = origin.map_or(class, |origin| origin.owner.as_str());
+    locate_field_dfs(lookup, root, member, &mut HashMap::new(), 0)
 }
 
 /// [`locate_field`]'s depth-first preorder walk over the parent chain (M2),
@@ -1085,21 +1106,6 @@ fn locate_field_in_class(
             }
         }
         None
-    })
-}
-
-/// [`locate_field_in_class`]'s **first pass alone**, for a caller that
-/// already knows from `collect_class`'s own answer that `class` is the
-/// owner of the key (#70): no parent recursion, so no `visited` map and no
-/// depth to bound — an ancestor cannot contribute a declaration the merge
-/// has already ruled out.
-fn locate_field_in_own_declarations(
-    lookup: &FieldLookup<'_>,
-    class: &str,
-    member: &str,
-) -> Option<FieldSource> {
-    scan_class_declarations(lookup, class, |declarations| {
-        own_field_source(declarations, member)
     })
 }
 
@@ -2273,11 +2279,13 @@ mod tests {
     }
 
     /// …and a recorded site naming a file this `Analysis` does **not** know
-    /// falls back to the walk rather than handing a caller a path it cannot
-    /// open. `FieldDeclSite::file` is a `String` `luabox-db` rendered with
+    /// falls through to the owner-rooted walk rather than handing a caller a
+    /// path it cannot open. `FieldDeclSite::file` is a `String` `luabox-db` rendered with
     /// `to_string_lossy` for diagnostics; a goto-definition target built from
     /// one has to be checked, not assumed (round 8 clean-code audit, coupling
-    /// finding 1).
+    /// finding 1). `Real` declares `f` itself, so the owner's own
+    /// declarations answer here; the test below it takes the same
+    /// unresolvable site to an owner that does not.
     #[test]
     fn locate_field_declines_a_recorded_site_in_a_file_the_analysis_does_not_know() {
         let caches = Caches::default();
@@ -2295,6 +2303,121 @@ mod tests {
             .expect("the walk still answers");
         assert_eq!(found.path, current, "the walk's answer, not the record's");
         assert_eq!(found.desc.as_deref(), Some("own"));
+    }
+
+    /// The same unresolvable site against an owner that declares nothing of
+    /// its own: the fallback carries on into the owner's parents, so a member
+    /// only an ancestor documents still has a description and a jump target.
+    ///
+    /// Round 9 review, thread on `sema.rs:922` — the fallback the comment
+    /// claimed and the fallback the code took had diverged, and no test could
+    /// see it because the case above gives both the same answer.
+    #[test]
+    fn locate_field_walks_the_owners_parents_when_a_recorded_site_does_not_resolve() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[(
+            "main.lua",
+            "---@class Base\n---@field f string the b\n\n---@class Sub : Base\n",
+        )]);
+        let current = root().join("main.lua");
+        let origin = FieldOrigin {
+            owner: "Sub".to_string(),
+            site: Some(luabox_types::FieldDeclSite {
+                file: root().join("vanished.lua").to_string_lossy().into_owned(),
+                span: 10..20,
+                desc: Some("recorded".to_string()),
+            }),
+        };
+        let found = locate_field(&caches.at(&analysis, &current), "Sub", "f", Some(&origin))
+            .expect("`Base`'s declaration answers once the site is declined");
+        assert_eq!(found.path, current, "the walk's answer, not the record's");
+        assert_eq!(found.desc.as_deref(), Some("the b"));
+    }
+
+    /// The diamond half of #70 at the editor surface: two generic ancestors,
+    /// each reached through both parents on a different binding. The merge
+    /// keeps the last-visited edge — `R`'s `Q<string>` — so hover's
+    /// description and goto-definition's target must name `Q`'s `---@field`,
+    /// not `Slot`'s, which is what the unaided preorder walk reaches first.
+    ///
+    /// Round 9 review, thread on `env.rs:3104`: the issue's headline
+    /// three-declaration fixture answers the same on `develop` as it does
+    /// here, so it evidences nothing. This one does not — the `origin`-fed
+    /// call and the unaided walk disagree, and the unaided walk is `develop`.
+    #[test]
+    fn locate_field_names_the_diamonds_last_visited_edge_not_the_walks_first() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[(
+            "main.lua",
+            "---@class Slot<T>\n---@field f T the f from Slot\n\n\
+             ---@class Q<U>\n---@field f U the f from Q\n\n\
+             ---@class L : Slot<number>, Q<number>\n\n\
+             ---@class R : Slot<string>, Q<string>\n\n\
+             ---@class Both : L, R\n",
+        )]);
+        let current = root().join("main.lua");
+        let merged = merged_of(&analysis);
+        let origin = merged
+            .class_field_origin("Both", "f")
+            .expect("`Both.f` resolves");
+        assert_eq!(origin.owner, "Q", "the last-visited edge is `R`'s `Q`");
+
+        let found = locate_field(&caches.at(&analysis, &current), "Both", "f", Some(&origin))
+            .expect("`Q`'s `---@field`");
+        assert_eq!(found.desc.as_deref(), Some("the f from Q"));
+
+        let walked = locate_field(&caches.at(&analysis, &current), "Both", "f", None)
+            .expect("the unaided walk answers too");
+        assert_eq!(
+            walked.desc.as_deref(),
+            Some("the f from Slot"),
+            "preorder reaches `L`'s `Slot` first — the answer `develop` gave, \
+             quoting a class the merge did not take the type from"
+        );
+    }
+
+    /// The merge's answer roots the walk, and rooting it at the *queried*
+    /// class instead is what that buys: `Leaf : Mid, Other` with `Mid`
+    /// attaching `f` as a carrier and `Other` declaring `---@field f string`.
+    /// `member_wins`' first-listed rule gives `Mid` the key, so the type the
+    /// editor renders is the carrier's `fun()` — and a walk from `Leaf`
+    /// exhausts `Mid`'s branch, reaches `Other` and quotes `the f from
+    /// Other`, a description for a declaration the checker ruled out.
+    ///
+    /// Rooted at the owner there is nothing to quote, which is the honest
+    /// answer: no `---@field` anywhere declares the member the merge took.
+    #[test]
+    fn locate_field_roots_the_walk_at_the_owner_not_the_queried_class() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[
+            (
+                "mid.lua",
+                "---@class Mid\nlocal M = {}\nfunction M.f() end\nreturn M\n",
+            ),
+            (
+                "other.lua",
+                "---@class Other\n---@field f string the f from Other\n",
+            ),
+            ("main.lua", "---@class Leaf : Mid, Other\n"),
+        ]);
+        let current = root().join("main.lua");
+        let merged = merged_of(&analysis);
+        let origin = merged
+            .class_field_origin("Leaf", "f")
+            .expect("`Leaf.f` resolves");
+        assert_eq!(origin.owner, "Mid", "first-listed parent wins the key");
+        assert!(origin.site.is_none(), "a carrier records no `---@field`");
+
+        assert!(
+            locate_field(&caches.at(&analysis, &current), "Leaf", "f", Some(&origin)).is_none(),
+            "`Mid` declares `f` with no `---@field`, and its branch ends there"
+        );
+        // Rooted at `Leaf` — what ignoring the merge's owner would do — the
+        // walk falls out of `Mid`'s branch into `Other`'s and quotes a
+        // declaration resolved from neither the type nor the owner.
+        let from_leaf = locate_field(&caches.at(&analysis, &current), "Leaf", "f", None)
+            .expect("the unaided walk reaches `Other`");
+        assert_eq!(from_leaf.desc.as_deref(), Some("the f from Other"));
     }
 
     /// One class, its `---@field`s split across two files, and the cursor
@@ -2336,31 +2459,75 @@ mod tests {
         assert_eq!(found.desc.as_deref(), Some("from a"));
     }
 
-    /// An owner the merge names but has no recorded site for stops the
-    /// search at that class's own declarations. Recursing into its parents
-    /// would surface an ancestor's `---@field` the merge has already ruled
-    /// out — a description and a jump target for a type the editor is not
-    /// showing, which is the class of disagreement #70 closes, not one to
-    /// reintroduce on the fallback path.
+    /// An owner the merge names but has no recorded site for is asked for
+    /// its **own** declarations first: an ancestor declaring the same name is
+    /// a declaration the checker demonstrably did not use, and surfacing it
+    /// over the owner's would show a description and a jump target for a type
+    /// the editor is not rendering — the class of disagreement #70 closes.
     #[test]
-    fn locate_field_stops_at_an_owner_the_merge_named_rather_than_walking_its_parents() {
+    fn locate_field_prefers_a_named_owners_own_declaration_over_an_ancestors() {
         let caches = Caches::default();
         let analysis = analyze_files(&[(
             "main.lua",
-            "---@class Base\n---@field f string\n\n---@class Sub : Base\n",
+            "---@class Base\n---@field f string the base f\n\n---@class Sub : Base\n---@field f string the sub f\n",
         )]);
         let current = root().join("main.lua");
         let origin = FieldOrigin {
             owner: "Sub".to_string(),
             site: None,
         };
-        assert!(
-            locate_field(&caches.at(&analysis, &current), "Sub", "f", Some(&origin),).is_none(),
-            "`Sub` declares no `---@field f` of its own; `Base`'s is not it"
-        );
-        // The same walk with no owner named still finds the inherited one —
-        // this narrows the search, it does not break inheritance.
-        assert!(locate_field(&caches.at(&analysis, &current), "Sub", "f", None,).is_some());
+        let found = locate_field(&caches.at(&analysis, &current), "Sub", "f", Some(&origin))
+            .expect("`Sub` declares its own `f`");
+        assert_eq!(found.desc.as_deref(), Some("the sub f"));
+    }
+
+    /// …and when the named owner declares the member with **no** `---@field`
+    /// at all — a carrier attachment, `function S.greet()` against a parent
+    /// that documented `greet` — the walk continues into its parents rather
+    /// than answering nothing.
+    ///
+    /// This is the shape the narrowing above regressed (round 9 review,
+    /// thread on `sema.rs:952`): the type rendered comes from the carrier
+    /// either way, so withholding the ancestor costs the user the only
+    /// description and the only goto-definition target that exist and buys
+    /// no agreement in return. Reached end-to-end through the merged layer
+    /// the server actually builds, which is what produces `site: None` here.
+    #[test]
+    fn locate_field_walks_a_carrier_owners_parents_for_the_field_it_never_declared() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[
+            (
+                "base.lua",
+                "---@class Base\n---@field greet fun() the greeting from Base\n",
+            ),
+            (
+                "main.lua",
+                "---@class Sub : Base\nlocal S = {}\nfunction S.greet() end\nreturn S\n",
+            ),
+        ]);
+        let current = root().join("main.lua");
+        let merged = merged_of(&analysis);
+        let origin = merged
+            .class_field_origin("Sub", "greet")
+            .expect("`Sub.greet` resolves");
+        assert_eq!(origin.owner, "Sub", "the carrier is the owner");
+        assert!(origin.site.is_none(), "a carrier records no `---@field`");
+
+        let found = locate_field(
+            &caches.at(&analysis, &current),
+            "Sub",
+            "greet",
+            Some(&origin),
+        )
+        .expect("`Base`'s `---@field` is the only declaration there is");
+        assert_eq!(found.path, root().join("base.lua"));
+        assert_eq!(found.desc.as_deref(), Some("the greeting from Base"));
+        // Identical to the unaided walk: the narrowing decides which of two
+        // declarations is shown, never whether one is.
+        let walked = locate_field(&caches.at(&analysis, &current), "Sub", "greet", None)
+            .expect("the unaided walk finds it too");
+        assert_eq!(walked.path, found.path);
+        assert_eq!(walked.desc, found.desc);
     }
 
     /// An inherited field's recorded site names the **ancestor's** file, not

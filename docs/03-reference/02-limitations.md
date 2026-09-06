@@ -193,13 +193,12 @@ so the editor keeps showing the diagnostic even though the CLI is green. This
 is the one measured exception to the editor/CLI parity claim made later in
 this page, it applies to all three ancestry codes, and it has no issue of its
 own yet — it belongs to the same LSP-parity family as
-[#70](https://github.com/flying-dice/luabox/issues/70), which is now closed:
-the editor and the checker resolve a member's declaration through one merged
-answer, so suppression is the only member of that family still open. Same-file
-suppression
-behaves identically in both. No workaround beyond fixing the ancestry itself
-or suppressing from the file the editor has open, which only works when that
-is also the declaring file.
+[#70](https://github.com/flying-dice/luabox/issues/70). It is a *diagnostic*
+divergence, and it is unrelated to which declaration each side resolves a
+member to: hover, goto-definition and `luabox check` read that from one merged
+answer. Same-file suppression behaves identically in both. No workaround
+beyond fixing the ancestry itself or suppressing from the file the editor has
+open, which only works when that is also the declaring file.
 
 The one exception is a class declared **only in a `[types] defs` package**.
 Nothing in the project declares it, and a definition package's own comments
@@ -1006,8 +1005,7 @@ resolution claim above is unaffected — the same members resolve the same way
 in both — but "the editor omits what `luabox check` accepts" does not hold
 for cross-file-suppressed ancestry diagnostics. Detail and scope are in the
 ancestry-limits section above; no issue of its own yet, same LSP-parity
-family as [#70](https://github.com/flying-dice/luabox/issues/70) — which is
-closed, leaving suppression as the family's only remaining member.
+family as [#70](https://github.com/flying-dice/luabox/issues/70).
 
 The table below is still measured, not assumed — the same fixtures pin the
 new behaviour: `crates/luabox-cli/tests/features/lsp/hover-require.feature`

@@ -406,6 +406,41 @@ mod tests {
         assert_eq!(start_of(&location), (1, 3), "a.lua's own `---@field f` tag");
     }
 
+    /// The goto-definition half of `hover.rs`'s
+    /// `a_carrier_attached_member_still_shows_its_parents_description`
+    /// (round 9 review, thread on `sema.rs:952`): a member the owner attaches
+    /// by writing the function still jumps to the parent's `---@field`, the
+    /// only declaration of it anywhere.
+    #[test]
+    fn goto_definition_reaches_a_carrier_attached_members_parent_declaration() {
+        let location = at_files_from(
+            &[
+                (
+                    "base.lua",
+                    "---@class Base\n---@field greet fun() the greeting from Base\n",
+                ),
+                (
+                    "main.lua",
+                    "---@class Sub : Base\nlocal S = {}\nfunction S.greet() end\n\n\
+                     ---@type Sub\nlocal s = nil\nprint(s.greet)\n",
+                ),
+            ],
+            "main.lua",
+            "greet)",
+            0,
+        )
+        .expect("definition");
+        assert!(
+            location.uri.to_string().ends_with("base.lua"),
+            "the parent's file is where `greet` is declared: {location:?}"
+        );
+        assert_eq!(
+            start_of(&location),
+            (1, 3),
+            "base.lua's own `---@field` tag"
+        );
+    }
+
     /// The `(line, character)` start of a location.
     fn start_of(location: &Location) -> (u32, u32) {
         (location.range.start.line, location.range.start.character)

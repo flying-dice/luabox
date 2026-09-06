@@ -371,7 +371,11 @@ the block ships.
   from the other, with goto-definition jumping to the second. `collect_class`
   now records which class — and which file — won each key as it resolves it,
   exposed as `Ambient::class_field_origins`, and `locate_field` consumes that
-  instead of walking the parent chain itself. Editor-surface only: no
+  instead of walking the parent chain itself. The merge's answer decides
+  *which* of two competing declarations the editor shows, never whether it
+  shows one at all: a carrier attachment — `function S.greet()` against a
+  parent that documented `greet` with `---@field` — still hovers the parent's
+  description and jumps to it, exactly as before. Editor-surface only: no
   diagnostic, no resolved type, and no `luabox check` verdict changes.
 
 - **A file's own `---@enum` again shadows a same-named `[types] defs` enum,

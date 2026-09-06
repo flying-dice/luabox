@@ -4856,6 +4856,51 @@ mod tests {
         );
     }
 
+    /// The diamond conflict that actually **moves** the owner: two distinct
+    /// generic ancestors, each reached through both parents on a different
+    /// binding. `Slot` is visited first through `L` and last through `R`;
+    /// `Q` is visited last of all, and last-visited-edge-wins means `Q` is
+    /// the class the resolved type came from.
+    ///
+    /// The test above it cannot pin the overwrite (round 9 review, thread on
+    /// `env.rs:3104`): with a *single* generic ancestor the overwrite writes
+    /// `owner: name` for the same `name` it just wrote, so first-wins and
+    /// last-wins record the identical owner and the assertion holds either
+    /// way. Two ancestors are the minimum shape where the two rules disagree
+    /// — flip the `origins.insert` above to `entry().or_insert()` and this
+    /// test reports `Slot` against a type resolved from `Q<string>`, which is
+    /// exactly the type/site divergence #70 exists to close.
+    #[test]
+    fn class_field_origins_names_the_last_visited_edge_when_the_diamond_moves_the_owner() {
+        let env = env_of(
+            "\
+---@class Slot<T>
+---@field f T the f from Slot
+
+---@class Q<U>
+---@field f U the f from Q
+
+---@class L : Slot<number>, Q<number>
+
+---@class R : Slot<string>, Q<string>
+
+---@class Both : L, R
+",
+        );
+        let origins = env.class_field_origins("Both").expect("Both is a class");
+        assert_eq!(
+            origins.get("f").map(|o| o.owner.as_str()),
+            Some("Q"),
+            "the last-visited edge is `R`'s `Q<string>`: {origins:?}"
+        );
+        // …and the type the same walk resolved agrees. Either half alone
+        // passes under first-wins; together they do not.
+        assert_eq!(
+            env.class_shape("Both").expect("Both resolves").fields["f"].ty,
+            Ty::String
+        );
+    }
+
     /// One class, its `---@field`s split across two files: the winner is
     /// per-*field*, and the recorded site has to name the file the merge
     /// actually took each one from — `b.lua` for the field only it declares,
