@@ -102,9 +102,11 @@
 #     signal 7` in jobs that had nothing to do with the cache.
 #   - `concurrent = 2` (it was 6). At most two of these builds share the disk,
 #     the CPU and the page cache at a time.
-#   - A daily host sweep does the eviction GitLab does not do: `/cache` zips
-#     untouched for >14 d, oldest first, down to a 60 GiB cap; `/builds`
-#     checkouts untouched for >7 d.
+#   - An hourly host sweep does the eviction GitLab does not do (owner's rule,
+#     2026-09-06): `/cache` zips and `/builds` checkouts untouched for 24 h are
+#     deleted; a 60 GiB cap on `/cache` is the backstop, oldest first. Source:
+#     scripts/ops/runner-cache-sweep.sh + docker-runner-cache-sweep.cron,
+#     installed at /boot/config/scripts/ and /boot/config/plugins/dynamix/.
 #
 # EVERY KEY IN THIS FILE IS FIXED. A literal, or a literal plus a variable
 # naming the job, the matrix leg or a pinned version — never `key: files:`.

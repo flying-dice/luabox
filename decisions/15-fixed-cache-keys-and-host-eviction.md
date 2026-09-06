@@ -56,8 +56,12 @@ between them they explain the whole incident:
    and it is why pruning bought minutes.
 
 The host was fixed: `concurrent = 2`, and `/cache` and `/builds` bind-mounted
-from the NVMe pool. A daily host sweep now evicts `/cache` zips untouched for
->14 d (oldest first, 60 GiB cap) and `/builds` checkouts untouched for >7 d.
+from the NVMe pool. An hourly host sweep now evicts `/cache` zips and `/builds`
+checkouts untouched for 24 h (the owner's rule), with a 60 GiB cap on `/cache`
+as the backstop, oldest first. The script and its cron line are versioned at
+`scripts/ops/runner-cache-sweep.sh` and `scripts/ops/docker-runner-cache-sweep.cron`
+and installed on the host at `/boot/config/scripts/` and
+`/boot/config/plugins/dynamix/` (`update_cron` registers it in `/etc/cron.d/root`).
 
 That leaves the pipeline half, and it changes what the pipeline half should be.
 The first response to this incident (commit 38d9016, superseded by this
@@ -101,8 +105,8 @@ not bound — a hashed key is unbounded whether there are twelve of them or one.
    argument, it is a write-amplification one.
 
 4. **The host is half of this decision.** `/builds` and `/cache` on the NVMe
-   bind mounts, `concurrent = 2`, and the daily sweep (14 d / 60 GiB for
-   `/cache`, 7 d for `/builds`) are load-bearing, not incidental hygiene. Fixed
+   bind mounts, `concurrent = 2`, and the hourly sweep (24 h for `/cache` and
+   `/builds`, 60 GiB cap on `/cache`) are load-bearing, not incidental hygiene. Fixed
    keys are what make a sweep *sufficient*: a key that is still in use is
    touched on every run, so it never ages out, and the only things the sweep
    collects are keys the pipeline has genuinely stopped using — a deleted job,
@@ -146,7 +150,10 @@ not bound — a hashed key is unbounded whether there are twelve of them or one.
 The host contract is an input to this decision. If it changes, re-derive
 rather than patch:
 
-- **The sweep stops running, or its thresholds move.** Fixed keys bound the
+- **The sweep stops running, or its thresholds move.** With a 24 h window a
+  `changes:`-gated job (`differential`, `verdict-differential`, `luals-parity`,
+  `fuzz`) that idles for a day rebuilds cold on its next run — accepted by the
+  owner as the price of a bounded disk, not a failure. Fixed keys bound the
   steady state, but a key that falls out of use (a renamed job, a bumped pin)
   is only collected by the sweep. Without it those accumulate slowly — slowly
   is not never.

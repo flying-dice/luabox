@@ -1,0 +1,2 @@
+# Hourly eviction for the runner's host-bound cache/builds dirs (24h rule, 60 GiB cap) — see script header
+20 * * * * /bin/bash /boot/config/scripts/runner-cache-sweep.sh > /dev/null 2>&1
