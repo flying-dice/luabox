@@ -572,6 +572,31 @@ draft-install-mock:
     - jq --version && wget --version | head -1 && python3 --version
     - bash scripts/tests/draft-install-mock.sh
 
+# scripts/ops/runner-cache-sweep.sh is the only destructive script in this
+# repo: `rm -rf` from the host's cron, hourly, against the directories a live
+# runner is writing into. Decision 12 asks for a self-test wherever a script's
+# failure mode is silence; here the failure mode is deleting a job's workspace
+# mid-build, which is worse, and until this job existed neither the sweep nor
+# any other shell script in the tree had a test or a linter. The harness builds
+# fixture trees, runs the REAL sweep against them through its env seams, and
+# asserts what it deleted and what it refused to delete — including the cases
+# that used to pass silently (a missing bind mount, a failed `du`, the pre-bind
+# depth-2 layout). Part 2 reads THIS file and fails if a cache key loses its
+# last `pull-push` writer, which is the pipeline-side half of the eviction
+# contract (see CACHING). No cargo, no toolchain: seconds.
+runner-cache-sweep-selftest:
+  extends: [.linux, .rules-ci]
+  stage: selftest
+  timeout: 10m
+  needs: []
+  script:
+    - apt_install shellcheck
+    - >
+      shellcheck -S warning
+      scripts/ops/runner-cache-sweep.sh
+      scripts/tests/runner-cache-sweep-selftest.sh
+    - bash scripts/tests/runner-cache-sweep-selftest.sh
+
 # ===========================================================================
 # stage: check
 # ===========================================================================
