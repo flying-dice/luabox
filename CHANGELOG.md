@@ -127,6 +127,28 @@ and that rule is now written into the policy rather than left to judgement.
 
 ### Added
 
+- **A malformed `---@class` header is reported at the declaration**
+  (`LB0320`, `LB0321`; #69). A header the harvester could not turn into a
+  class was dropped in silence: every consumer of a `---@class` tag guards on
+  a non-empty name, so `---@class` with nothing after it, `---@class : Base`
+  and `---@class 123abc` declared nothing and said nothing, and the only
+  signal anyone ever got was an `LB0305 unknown type name` at some later
+  `---@type` referring to the name the class never received — arbitrarily far
+  from the mistake, and absent entirely in a file nothing references. A
+  generated block with a typo'd name produced a class that silently did not
+  exist. `LB0320` now reports a header with no usable class name and `LB0321`
+  an extends-list entry that is not a class name (`---@class A : P,`,
+  `---@class A : ?`), both at the declaration, both riding the strictness
+  ladder and suppressible under
+  lua-language-server's own rule names (`luadoc-miss-class-name`,
+  `luadoc-miss-class-extends-name`) — parity, measured against the pinned
+  3.13.5, not luabox inventing strictness. luabox reports one finding per
+  header where luals adds a `doc-field-no-class` per orphaned `---@field`;
+  that message-count difference is the only remaining divergence on this
+  axis. `class_merge_precedence_matrix.rs`'s `malformed_class_headers_m66`,
+  which pinned the silence while the gap was open, now pins the diagnostics
+  and is no longer `#[ignore]`d.
+
 - **Hover and completion resolve class members through the checker's
   ambient environment** (#56). The editor surfaces were built on a per-file
   view, so a class declared in another file — named via `---@type`, or

@@ -568,6 +568,39 @@ fn take_name(s: &str, base: usize) -> Option<(String, &str, usize)> {
     Some((s[..end].to_string(), &s[end..], base + end))
 }
 
+/// Whether `name` is spelled the way a declared type name — a `---@class`
+/// name — has to be: one or more dot-separated segments (`geometry.Point`),
+/// each starting with a letter, `_`, or a non-ASCII character and continuing
+/// with letters, digits, `_` or non-ASCII.
+///
+/// This is the **acceptance** rule, deliberately stricter than [`take_name`]'s
+/// **lexing** rule directly above. `take_name` munches any run of
+/// `[A-Za-z0-9_.]` (plus non-ASCII) so a mistyped name is captured whole and
+/// can be quoted back at the user, rather than truncated at the first bad
+/// character into something they never wrote — `---@class 123abc` yields the
+/// name `123abc`, not `abc`. Whether that captured name can actually *be* a
+/// type name is this function's question.
+///
+/// It lives here, next to `take_name` and `ty::scan_ident`, because the claim
+/// it makes is about **this file's** lexers: a name this rejects is one no
+/// annotation can spell, since `ty::parse_named` reads `Ident (Dot Ident)*`
+/// and `ty::scan_token` dispatches a leading ASCII digit to `scan_number`.
+/// `name_is_spellable_by_the_type_parser` pins exactly that round trip, so a
+/// change to either lexer that moved the two apart fails a test rather than
+/// silently turning a checker diagnostic (`LB0320`, #69) into a false
+/// positive or a false negative from another crate.
+#[must_use]
+pub fn is_type_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.split('.').all(|segment| {
+            let mut chars = segment.chars();
+            chars
+                .next()
+                .is_some_and(|c| c.is_alphabetic() || c == '_' || !c.is_ascii())
+                && chars.all(|c| c.is_alphanumeric() || c == '_' || !c.is_ascii())
+        })
+}
+
 /// The first whitespace-delimited word of `s`.
 #[expect(
     clippy::string_slice,

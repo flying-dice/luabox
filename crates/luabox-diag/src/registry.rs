@@ -178,6 +178,16 @@ static REGISTRY: &[Entry] = &[
         explain: LB0319,
     },
     Entry {
+        code: Code::new(320),
+        title: "`---@class` header with no usable class name",
+        explain: LB0320,
+    },
+    Entry {
+        code: Code::new(321),
+        title: "`---@class` extends list entry that is not a class name",
+        explain: LB0321,
+    },
+    Entry {
         code: Code::new(500),
         title: "malformed `---@luabox-ignore`",
         explain: LB0500,
@@ -1493,6 +1503,112 @@ scanned for directives, so the diagnostic attaches to **line 1 of each
 consuming file** instead. Put a file-wide `---@diagnostic disable:
 class-ancestry-too-costly` at the top of that file, or a `disable-line` on
 line 1.
+";
+
+const LB0320: &str = "\
+# LB0320: `---@class` header with no usable class name
+
+A `---@class` line that does not name a class. Three spellings reach this:
+
+```lua
+---@class                  -- LB0320: nothing after the tag
+---@field x number
+
+---@class : Base           -- LB0320: a parent list where the name goes
+---@field x number
+
+---@class 123abc           -- LB0320: `123abc` is not an identifier
+---@field x number
+```
+
+**Why this is reported.** The header parses, so nothing fails loudly — and
+until this diagnostic existed, nothing was reported either. A header with no
+name declares no class at all: every `---@field` beneath it belongs to
+nothing, and the only signal anyone got was an unrelated-looking `LB0305
+unknown type name` at some later `---@type` referencing the name the class
+never received, arbitrarily far from the actual mistake. A header whose name
+is not an identifier is no better off — the class exists under a name no
+annotation can spell, so nothing can ever reference it. Either way, a
+machine-generated `---@class` block with a typo'd name produced a class that
+silently did not exist.
+
+**What to do.** Name the class. A class name is one or more dot-separated
+identifier segments — a letter, `_`, or non-ASCII character first, then
+letters, digits, `_` or non-ASCII:
+
+```lua
+---@class Point            -- fine
+---@class geometry.Point   -- fine: dotted namespaces are names too
+---@class _Private         -- fine
+---@class abc123           -- fine: digits are fine anywhere but first
+---@class (exact) Boxed<T> -- fine: `(exact)` and `<T>` are not part of the name
+---@class Derived : Base   -- the parent goes AFTER the name, not instead of it
+```
+
+**Parity with lua-language-server.** luals 3.13.5 reports
+`luadoc-miss-class-name` (\"`<class name> expected`\") at the declaration for
+all three shapes above — it treats a name token it cannot lex as an
+identifier exactly the way it treats a missing one — plus a
+`doc-field-no-class` on each orphaned `---@field` under the header. luabox
+reports the header once and leaves the fields alone: one mistake, one
+diagnostic.
+
+**A malformed *parent* is a different finding.** `---@class A : P,` names its
+class fine and has an empty slot in its extends list — that is LB0321, and
+`P` being undeclared is LB0305 on top. All three can fire on one line,
+because they are three different mistakes with three different fixes.
+
+**Escape hatches.** `[types] strict = false` downgrades it to a warning, and
+`---@diagnostic disable[-line|-next-line]: luadoc-miss-class-name` suppresses
+it — luals' own rule name, so the directive you already write works unchanged.
+";
+
+const LB0321: &str = "\
+# LB0321: `---@class` extends list entry that is not a class name
+
+A `---@class` whose `: Parent` list has an entry the type parser cannot read
+as a name — a stray separator, or a token that is not a name at all:
+
+```lua
+---@class A : P,           -- LB0321: nothing after the comma
+---@class B : P,, Q        -- LB0321: nothing between the commas
+---@class C :              -- LB0321: nothing after the colon
+---@class D : ?            -- LB0321: `?` is not a class name
+```
+
+**Why this is reported.** The entry is ignored, so the class resolves with
+fewer parents than the line appears to give it — a parent silently dropped
+from an inheritance chain, which shows up much later as a missing field or
+method rather than as a syntax problem where the syntax problem is.
+
+**Why the message does not say the name is \"missing\".** All four shapes
+above arrive as one thing internally: the type parser's recovery node, which
+records that an entry could not be read but not *why*. Saying a name is
+missing would be right for the first three and wrong for the fourth, and this
+is an error under `[types] strict = true` — so the message says what holds for
+all of them.
+
+**What to do.** Drop the stray separator, or replace the entry with the
+parent it was meant to name:
+
+```lua
+---@class A : P            -- the comma was a typo
+---@class A : P, Q         -- the comma meant a second parent
+```
+
+**Distinct from LB0305 and LB0320.** `---@class A : P,` with `P` undeclared
+reports LB0305 (`unknown type name \\`P\\``) *as well*: one name is spelled
+correctly and declared nowhere, the other slot has no name at all. LB0320 is
+the class's own name being unusable, not a parent's. Each has its own fix.
+
+**Parity with lua-language-server.** luals 3.13.5 reports
+`luadoc-miss-class-extends-name` (\"`<class extends name> expected`\") at the
+comma, alongside its own `undefined-doc-class` on `P` — both findings, the
+same way luabox reports both.
+
+**Escape hatches.** `[types] strict = false` downgrades it to a warning, and
+`---@diagnostic disable[-line|-next-line]: luadoc-miss-class-extends-name`
+suppresses it — luals' own rule name.
 ";
 
 const LB0500: &str = "\

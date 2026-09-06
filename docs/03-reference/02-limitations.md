@@ -243,48 +243,74 @@ The corpus rows above are the measurement, re-derived on every run of
 `luabox explain LB0317` (and `LB0318`, `LB0319`) prints the full worked fix
 for each.
 
-### Malformed `---@class` headers give no diagnostic at the declaration (round 6 review M66 — [#69](https://github.com/flying-dice/luabox/issues/69))
+### Malformed `---@class` headers: reported at the declaration, one finding per header ([#69](https://gitlab.beluga-sirius.ts.net/flying-dice/luabox/-/work_items/69))
 
 Every row above assumes `---@class` parses into a well-formed class at all.
 Four ways a header can fail to — a missing name, a name token the grammar
 can't lex as an identifier, a trailing comma in the `extends` list, and a
-bare `---@class` with nothing after it — are not covered by the precedence
-matrix or the verdict corpus, and two of the four currently give **no
-diagnostic anywhere**, at the declaration or otherwise. Measured against this
-version's release binary, `[types] strict = true`:
+bare `---@class` with nothing after it — are now reported at the declaration
+under two codes:
 
-| Shape | luabox (this version) | lua-language-server 3.13.5 |
+| Shape | luabox | lua-language-server 3.13.5 |
 |---|---|---|
-| `---@class : Base` (no name, colon parent) | silent: `rc=0`, 0 errors, 0 warnings | `luadoc-miss-class-name` ("`<class name> expected`") at the declaration, plus `doc-field-no-class` on the `---@field` line beneath it |
-| `---@class 123abc` (non-identifier name) | silent: `rc=0`, 0 errors, 0 warnings | identical to the row above — luals treats a name token it can't lex as an identifier the same as a missing name |
-| `---@class A : P,` (trailing comma, `P` undeclared) | `LB0305 unknown type name \`P\`` at the declaration — `P` resolves through the ordinary undeclared-parent path (the same one `---@class A : Missing` already uses correctly); the trailing comma itself raises nothing | `luadoc-miss-class-extends-name` ("`<class extends name> expected`") at the comma, **plus** an ordinary `undefined-doc-class` on `P` — luals reports both the malformation and the undeclared parent, luabox only the latter |
-| bare `---@class` (no name, no colon) | silent at the declaration; the only signal is `LB0305 unknown type name` two lines later, at a *consumer*'s `---@type` reference to the name the class never got | `luadoc-miss-class-name` + `doc-field-no-class` at the declaration — same as the `: Base` row |
+| `---@class : Base` (no name, colon parent) | `LB0320` at the declaration | `luadoc-miss-class-name` ("`<class name> expected`") at the declaration, plus `doc-field-no-class` on the `---@field` line beneath it |
+| `---@class 123abc` (non-identifier name) | `LB0320` at the declaration, quoting the name back | identical to the row above — luals treats a name token it can't lex as an identifier the same as a missing name |
+| `---@class A : P,` (trailing comma, `P` undeclared) | `LB0321` at the declaration **plus** `LB0305 unknown type name \`P\`` — two mistakes, two findings | `luadoc-miss-class-extends-name` ("`<class extends name> expected`") at the comma, **plus** an ordinary `undefined-doc-class` on `P` |
+| bare `---@class` (no name, no colon) | `LB0320` at the declaration; a consumer's `---@type` reference still reports its own `LB0305` | `luadoc-miss-class-name` + `doc-field-no-class` at the declaration |
 
-luals reports a real diagnostic at the declaration for all four shapes; it is
-never silent. luabox is silent at the declaration for three of the four (the
-`A : P,` row's `LB0305` fires on the ordinary undeclared-parent check, not on
-the malformed extends-list syntax itself) and, for the fourth, only ever
-surfaces the problem indirectly, at a use site arbitrarily far from the
-actual mistake. A class-generator template with a typo'd header (a missing
-`class` name in a machine-generated `---@class` block, say) produces a class
-that simply does not exist, with nothing at the point of generation to say
-so — the failure surfaces later, and only if something happens to reference
-the missing name.
+Both tools now report at the declaration for all four shapes.
 
-The fix belongs in `luacats::harvest`, which currently drops a header it
-cannot parse into a class rather than emitting anything for it — no `LB0xxx`
-code is assigned for this condition yet. It is tracked as
-[#69](https://github.com/flying-dice/luabox/issues/69); an earlier edition of
-this section said the tracking issue was "not yet filed", which was true when
-written and is not now.
+**The remaining divergence is message count, not silence.** luals adds a
+`doc-field-no-class` per orphaned `---@field` under a nameless header;
+luabox reports the header once and leaves the fields alone. One mistake, one
+diagnostic: the fields are not independently wrong, and a generated block
+with twenty fields under one typo'd header would otherwise produce twenty-one
+findings for one edit. `LB0320` and `LB0321` are deliberately separate for
+the opposite reason — an unusable class *name* and a bad entry in the
+*extends list* have different causes and different fixes, and a header can
+carry both at once (`---@class :`), so each gets its own.
+
+**`LB0321` covers more than a stray separator, and says so carefully.** The
+type parser has one recovery node for an entry it cannot read, and it does not
+record *why* — so `---@class A : ?`, where a token is present and merely
+unreadable, is indistinguishable from `---@class A : P,`, where nothing is
+there at all. The message says the entry is not a class name, which holds for
+both, rather than claiming a name is missing, which would be false on the
+first. This is an error under `[types] strict = true`, so the wording has to
+be true of every shape that reaches it.
+
+**What a class name has to be.** One or more dot-separated segments
+(`geometry.Point`), each starting with a letter, `_`, or a non-ASCII
+character and continuing with letters, digits, `_` or non-ASCII. The grammar
+`luacats` lexes names with is deliberately looser — any run of
+`[A-Za-z0-9_.]` — so a mistyped name is captured whole and quoted back at the
+user rather than truncated at the first bad character into something they
+never wrote.
+
+That rule has one owner, `luacats::is_type_name`, and it lives beside the
+lexers it makes a claim about rather than in the crate that raises the
+diagnostic. `LB0320`'s message tells the user that nothing can reference the
+class; that is an assertion about the *reference-side* parser, so
+`name_is_spellable_by_the_type_parser` pins the round trip in both directions
+— every name the rule accepts parses back as itself, and every name it
+rejects does not. Loosening one lexer without the other now fails a test
+instead of silently turning the diagnostic into a false positive.
+
+**Strictness ladder and suppression, as for every other `LB03xx`:**
+
+| Code | `---@diagnostic disable[-line\|-next-line]:` name | whose name |
+|---|---|---|
+| `LB0320` | `luadoc-miss-class-name` | **luals'** — measured firing on all three shapes it covers |
+| `LB0321` | `luadoc-miss-class-extends-name` | **luals'** — same |
+
+`crates/luabox-types/tests/malformed_class_headers.rs` covers each shape
+against a control differing in exactly one respect, and
 `crates/luabox-types/tests/class_merge_precedence_matrix.rs`'s
-`malformed_class_headers_m66` test pins today's measured behaviour, including
-the `A : P,` correction above, so a regression on either side is visible and
-there is a concrete check to update once the harvest fix lands. That test is
-executed by CI as of round 8 — an earlier edition of this line said it was
-`#[ignore]`d and that a regression would surface "the day someone runs it by
-hand", which is not a pin at all: a claim backed only by a test nothing runs
-can go stale green (round 8 review F10).
+`malformed_class_headers_m66` — which pinned the *silence* while the gap was
+open, `#[ignore]`d — now pins the four shapes' diagnostics and runs in the
+default suite. The `verdict-differential` corpus carries a row per shape, so
+this axis is covered by the self-regression gate too. `luabox explain LB0320`
+(and `LB0321`) prints the full worked fix.
 
 ### LuaCATS tags: the full vocabulary is enforced
 

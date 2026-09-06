@@ -1102,7 +1102,79 @@ local c = 3 --[[@as]]
 
 // === Property test: no panic over arbitrary `---@` line soup ===
 
+// === Type-name acceptance (`is_type_name`) ===
+
+/// The invariant `is_type_name`'s doc claims, and the one `LB0320`'s message
+/// asserts to the user: a name this accepts is one the type parser reads back
+/// as that exact name, and a name it rejects is one no annotation can spell.
+///
+/// Both directions matter, and they fail differently. Loosen `scan_ident` or
+/// `parse_named` without loosening `is_type_name` and the checker reports a
+/// name that now works fine; tighten either without tightening this and the
+/// checker goes quiet on a name nothing can reference. Neither would touch
+/// `luabox-types`, where the diagnostic is raised, so nothing else in the
+/// build would notice.
+#[test]
+fn name_is_spellable_by_the_type_parser() {
+    fn parses_back_as(name: &str) -> bool {
+        let mut errors = Vec::new();
+        let ty = parse_one_type(name, 0, &mut errors);
+        errors.is_empty()
+            && matches!(&ty.kind, TypeExprKind::Named { name: parsed, args }
+                if parsed == name && args.is_empty())
+    }
+
+    for accepted in [
+        "Point",
+        "geometry.Point",
+        "_Private",
+        "abc123",
+        "a.b.c",
+        "Gr\u{f6}\u{df}e",
+        "_",
+    ] {
+        assert!(is_type_name(accepted), "should accept `{accepted}`");
+        assert!(
+            parses_back_as(accepted),
+            "`{accepted}` is accepted but the type parser does not read it back as itself"
+        );
+    }
+
+    for rejected in [
+        "",       // no name at all
+        "123abc", // a leading digit dispatches to `scan_number`
+        "1", "a.", // a trailing dot leaves an empty segment
+        ".a", // as does a leading one
+        "a..b", ".", "...", // `take_name`'s vararg spelling, which is not a type name
+    ] {
+        assert!(!is_type_name(rejected), "should reject `{rejected}`");
+        assert!(
+            !parses_back_as(rejected),
+            "`{rejected}` is rejected, but the type parser reads it back as a plain name — \
+             the two rules have drifted apart"
+        );
+    }
+}
+
 proptest! {
+    /// The fuzz half of [`name_is_spellable_by_the_type_parser`]: the
+    /// generator ranges over `take_name`'s whole alphabet, junk included, so
+    /// the cases that matter are the ones the predicate lets through.
+    #[test]
+    fn every_accepted_name_round_trips(raw in "[A-Za-z0-9_.]{0,12}") {
+        if is_type_name(&raw) {
+            let mut errors = Vec::new();
+            let ty = parse_one_type(&raw, 0, &mut errors);
+            prop_assert!(errors.is_empty(), "`{}` accepted but errored: {:?}", raw, errors);
+            prop_assert!(
+                matches!(&ty.kind, TypeExprKind::Named { name, args } if *name == raw && args.is_empty()),
+                "`{}` accepted but parsed as {:?}",
+                raw,
+                ty.kind
+            );
+        }
+    }
+
     #[test]
     fn parse_block_never_panics_and_spans_stay_in_bounds(
         lines in prop::collection::vec("---@?[ -~]{0,24}", 0..8),

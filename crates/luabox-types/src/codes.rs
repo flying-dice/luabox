@@ -140,3 +140,53 @@ pub const CYCLIC_CLASS: Code = Code::new(318);
 /// measured, a 601-class / depth-6 hierarchy checks in 0.09 s. Counting first
 /// visits rejected exactly that shape (round 6 review, local merge-gate).
 pub const CLASS_COST_LIMIT: Code = Code::new(319);
+/// A `---@class` header with no usable class name — nothing after the tag
+/// (`---@class`), a parent list where the name should be (`---@class : Base`),
+/// or a name token that is not an identifier (`---@class 123abc`).
+///
+/// The header parses, so nothing fails loudly; what it does not do is produce
+/// a class. Before this code existed the header was simply *dropped* — every
+/// `---@field` under it belonged to nothing, and the only signal a user ever
+/// got was an [`UNKNOWN_TYPE_NAME`] at some later `---@type` that referenced
+/// the name the class never got, arbitrarily far from the mistake (round 6
+/// review M66, #69). A machine-generated header with a typo'd name produced a
+/// class that silently did not exist.
+///
+/// **Parity, not luabox being stricter.** lua-language-server 3.13.5 reports
+/// `luadoc-miss-class-name` ("`<class name> expected`") at the declaration for
+/// all three shapes — it treats a name token it cannot lex as an identifier
+/// the same as a missing one — plus a `doc-field-no-class` on each orphaned
+/// `---@field` beneath it. luabox reports the header itself once and leaves
+/// the fields alone: one mistake, one diagnostic.
+///
+/// Downgradable like every other `LB03xx`: `[types] strict = false` makes it a
+/// warning, and `---@diagnostic disable[-line|-next-line]:
+/// luadoc-miss-class-name` suppresses it — luals' own rule name
+/// ([`crate::directive::RULE_LUADOC_MISS_CLASS_NAME`]).
+pub(crate) const MALFORMED_CLASS_NAME: Code = Code::new(320);
+/// A `---@class` extends list entry that is not a class name — a trailing
+/// comma (`---@class A : P,`), a doubled one, a bare `:` with nothing after
+/// it, or a token the type parser cannot read as a name at all
+/// (`---@class A : ?`).
+///
+/// All of those arrive here as one thing: `luacats::TypeExprKind::Error`, the
+/// type parser's universal recovery node. It does not distinguish "there was
+/// nothing to read" from "there was something and it was not a type", so this
+/// diagnostic does not claim to either — it says the entry is not a class
+/// name, which is true of every shape that reaches it. Claiming a name is
+/// *missing* would be wrong on `: ?`, where a token is present and merely
+/// unreadable, and this fires at `Severity::Error` under `strict = true`.
+///
+/// Distinct from [`MALFORMED_CLASS_NAME`] because the cause and the remedy are
+/// different: the class exists and is usable, one *edge* of its ancestry does
+/// not. Distinct from [`UNKNOWN_TYPE_NAME`] for the same reason — `---@class
+/// A : P,` with `P` undeclared already reported LB0305 on `P`, and that
+/// finding is about a name that is spelled fine and declared nowhere, not
+/// about a list entry that has no name at all. Both fire; luals reports both
+/// too (round 6 review M66, #69).
+///
+/// **Parity.** lua-language-server 3.13.5 reports
+/// `luadoc-miss-class-extends-name` ("`<class extends name> expected`") at the
+/// comma, alongside its own `undefined-doc-class` on `P`. Suppressed by that
+/// same rule name ([`crate::directive::RULE_LUADOC_MISS_CLASS_EXTENDS_NAME`]).
+pub(crate) const MALFORMED_CLASS_EXTENDS_ENTRY: Code = Code::new(321);

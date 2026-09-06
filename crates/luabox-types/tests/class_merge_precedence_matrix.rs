@@ -2551,65 +2551,59 @@ fn regen_merge_matrix_provenance() {
     );
 }
 
-// --- malformed `---@class` header axis (round 6 review M66) -----------
+// --- malformed `---@class` header axis (round 6 review M66, #69) -------
 //
 // Everything above this line pins *which parent wins* once a class header
 // parses. `M66` is a different axis entirely: does a **malformed** header —
 // one `luacats::harvest` cannot turn into a well-formed class at all — get a
-// diagnostic pointing at the malformation, or does it get silently dropped?
-// Measured against this head's release binary (`target/release/luabox`,
-// strict mode) and, for comparison, the pinned lua-language-server 3.13.5
-// (`--check`, `--checklevel=Information`):
+// diagnostic pointing at the malformation, or is it silently dropped?
 //
-//   shape                    luabox (this head)                 luals 3.13.5
-//   ---@class : Base         silent: rc=0, 0 errors, 0 warnings  `luadoc-miss-class-name`
-//                                                                 ("<class name> expected")
-//                                                                 at the declaration, plus
-//                                                                 `doc-field-no-class` on the
-//                                                                 `---@field` beneath it
-//   ---@class 123abc         silent: rc=0, 0 errors, 0 warnings  identical to the above —
-//                                                                 luals treats a non-identifier
-//                                                                 name token the same as a
-//                                                                 missing one
-//   ---@class A : P,         LB0305 "unknown type name `P`" at   `luadoc-miss-class-extends-name`
-//   (P undeclared)           the declaration (`P` is treated      ("<class extends name>
-//                            as an ordinary — if undeclared —     expected") at the trailing
-//                            parent reference; the trailing       comma, PLUS an ordinary
-//                            comma itself raises nothing)         `undefined-doc-class` on `P`
-//   bare ---@class           silent at the declaration; the       `luadoc-miss-class-name` +
-//   (no name at all)         only signal is `LB0305 unknown       `doc-field-no-class` at the
-//                            type name` two lines later, at       declaration (same as the
-//                            the *consumer*'s `---@type`           `: Base` row above)
+// It used to be dropped. Every consumer of a `---@class` tag in this crate
+// guards on `!c.name.is_empty()`, so a header with no usable name never
+// reached the type env and there was nothing to hang a diagnostic on; two of
+// the four shapes below were silent everywhere, and a third only ever
+// surfaced at a *consumer* of the name the class never got, arbitrarily far
+// from the mistake. This test pinned that measured silence, `#[ignore]`d, so
+// the day it changed would be visible.
 //
-// luals reports a real diagnostic AT THE DECLARATION for all four shapes —
-// never silence. luabox is silent for two of the four (`: Base`, `123abc`)
-// and, for the other two, only ever reports at a *use site*, never at the
-// malformed declaration itself. The `A : P,` row corrects an earlier draft
-// of this finding, which had claimed all three non-bare shapes were silent
-// (`rc=0`) — measured fresh against this head, `A : P,` is NOT silent: `P`
-// resolves through the ordinary undeclared-parent path (the same one
-// `---@class A : Missing` already uses correctly), independent of the
-// trailing comma. Only the header-identity/name half of the axis (no name,
-// or a name luacats' grammar cannot lex as a name) is the silent gap; a
-// malformed *extends list* already surfaces through the existing
-// undeclared-name machinery.
+// #69 is that day. `check::malformed_class_headers` now reports the header
+// itself — `LB0320` for a name that cannot name a class (missing, or not an
+// identifier), `LB0321` for an extends-list slot with no name in it — and
+// the assertions below are the new, non-silent measurement. The `#[ignore]`
+// is gone with the bug: this now covers a rule the repo claims to enforce,
+// like every other test in this file, and runs in the default suite.
 //
-// The parser/harvest fix this axis is waiting on (giving `luacats::harvest`
-// a diagnostic for a header it cannot turn into a class, likely a new
-// `LB0xxx` code — none is assigned as of this review) is out of scope here;
-// see `docs/03-reference/02-limitations.md`'s "Malformed `---@class`
-// headers" section for the full write-up. This test pins today's measured
-// (partly silent) reality so a *regression* — one of the already-diagnosed
-// shapes going silent, or vice versa — fails loudly; it is `#[ignore]`d
-// because it documents a known bug rather than covering a rule this repo
-// claims to have already fixed, the way every other test in this file does.
-// Delete the `#[ignore]` and update whichever assertions the fix changes
-// once the harvest fix lands — the point of running this by hand in the
-// meantime is to notice the day that happens.
+// What each row pins, against lua-language-server 3.13.5 as the oracle:
+//
+//   shape                    luabox (this head)          luals 3.13.5
+//   ---@class : Base         LB0320 at the declaration   `luadoc-miss-class-name`
+//                                                         at the declaration, plus
+//                                                         `doc-field-no-class` on the
+//                                                         `---@field` beneath it
+//   ---@class 123abc         LB0320 at the declaration,  identical to the above —
+//                            quoting the name back        luals treats an unlexable
+//                                                         name token as a missing one
+//   ---@class A : P,         LB0321 at the declaration   `luadoc-miss-class-extends-name`
+//   (P undeclared)           PLUS the pre-existing        at the comma, PLUS an ordinary
+//                            LB0305 on `P`                `undefined-doc-class` on `P`
+//   bare ---@class           LB0320 at the declaration,  `luadoc-miss-class-name` +
+//   (no name at all)         and the consumer's LB0305    `doc-field-no-class` at the
+//                            two lines later still fires  declaration
+//
+// Both tools now report at the declaration for all four shapes. luabox
+// reports the header once and leaves the orphaned `---@field` lines alone
+// where luals adds a `doc-field-no-class` per field — one mistake, one
+// diagnostic — a message-count difference, not a silence.
+//
+// The `A : P,` row is the one that did NOT change: it was never silent, and
+// its `LB0305` fires on the ordinary undeclared-parent path, independent of
+// the trailing comma. What #69 added there is the `LB0321` beside it, so the
+// malformed *syntax* is now reported as well as the undeclared *name* —
+// exactly the pair luals reports. Its control (`---@class A : P`, no comma)
+// lives in `tests/malformed_class_headers.rs` and stays LB0305-only, so a
+// rule that fired on the shared undeclared parent rather than on the comma
+// fails there.
 #[test]
-#[ignore = "pins a known bug (M66: malformed ---@class headers), not a manual-probe \
-            convenience — see the doc comment above for why this stays out of the default \
-            suite instead of being deleted or turned green"]
 fn malformed_class_headers_m66() {
     type MalformedCase = (
         &'static str,
@@ -2625,7 +2619,7 @@ fn malformed_class_headers_m66() {
 local M = {}
 return M
 ",
-            &[],
+            &[("LB0320", "`---@class` is missing a class name")],
         ),
         (
             "non-identifier name (`---@class 123abc`)",
@@ -2635,7 +2629,7 @@ return M
 local M = {}
 return M
 ",
-            &[],
+            &[("LB0320", "`123abc` is not a valid class name")],
         ),
         (
             "trailing comma in the extends list (`---@class A : P,`)",
@@ -2645,7 +2639,13 @@ return M
 local M = {}
 return M
 ",
-            &[("LB0305", "unknown type name `P` in annotation")],
+            &[
+                (
+                    "LB0321",
+                    "`---@class` extends list has an entry that is not a class name",
+                ),
+                ("LB0305", "unknown type name `P` in annotation"),
+            ],
         ),
         (
             "bare, no name at all (`---@class`), consumer two lines later",
@@ -2658,7 +2658,10 @@ local a
 print(a.x)
 return M
 ",
-            &[("LB0305", "unknown type name `A` in annotation")],
+            &[
+                ("LB0320", "`---@class` is missing a class name"),
+                ("LB0305", "unknown type name `A` in annotation"),
+            ],
         ),
     ];
     let mut failures = Vec::new();
@@ -2677,8 +2680,8 @@ return M
     }
     assert!(
         failures.is_empty(),
-        "{} malformed-header shape(s) no longer match today's measured (partly buggy) \
-         reality — a regression, or the M66 fix landing:\n{}",
+        "{} malformed-header shape(s) no longer report at the declaration — #69 regressed, \
+         and a malformed `---@class` is silently dropped again:\n{}",
         failures.len(),
         failures.join("\n")
     );
