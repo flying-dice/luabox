@@ -90,49 +90,15 @@
 # cache server (the runner's own trace says so: "No URL provided, cache will
 # not be downloaded from shared cache server. Instead a local version of cache
 # will be extracted"), so caches are local to that one untagged runner — which
-# is exactly where every job in this file lands, so they hit.
-#
-# That locality is also the constraint. The original port gave every rust job
-# its OWN `target-<job>` cache, mirroring the per-job `key:` the Actions
-# workflows pass to rust-cache. On GitHub that is free — each key lives in a
-# hosted, evicted, per-repo cache store. Here twelve multi-GB build-directory
-# zips sat on one host's filesystem alongside the live workspace of every
-# concurrent pipeline, nothing evicted them, and the disk refilled within
-# fifteen minutes of a manual prune (measured 2026-09-06, #85, decision 15).
-#
-# So the design is deliberately smaller than the source's, and the trade is
-# hit-rate for fitting the host:
-#   - `cargo-home`: registry/git checkouts and installed cargo subcommands,
-#     shared by every rust job (identical content, one copy). This one is
-#     cheap relative to a build directory and stays as it was; jobs that only
-#     consume it take it `policy: pull`.
-#   - `target-deny`: ONE build-directory cache for the `-Dwarnings` profile,
-#     replacing the nine per-job ones. `check` is the sole writer — it builds
-#     the broadest debug tree (`clippy --all-targets`, `test --workspace`) so
-#     its artifacts are the most reusable, and a single writer keeps the
-#     cached content deterministic instead of oscillating between whichever
-#     concurrent job finished last. `ignored-deterministic-tests` and
-#     `perf-gates` read it `policy: pull`.
-#   - The key names the PROFILE, not the job, because RUSTFLAGS is what makes
-#     two build directories incompatible (see DENY-WARNINGS below). There is
-#     no `target-default` cache today: `luals-parity` is the only
-#     default-RUSTFLAGS rust job and it is one-shot (below). Add that key —
-#     do not widen `target-deny` — if that ever changes.
-#   - NO build-directory cache on the one-shot and self-contained jobs:
-#     `examples`, `differential`, `verdict-differential`, `luals-parity` build
-#     a release binary once and throw the tree away; the `*-selftest` jobs and
-#     `draft-install-mock` run no cargo at all; the `fuzz` matrix builds under
-#     nightly with a separate lockfile. They keep `cargo-home` (pull) and, for
-#     fuzz, its corpus — the caches that are small and actually compound.
-#   - Coverage caches NOTHING but `cargo-home`. `target/llvm-cov-target` holds
-#     LLVM-instrumented artifacts, the largest tree this repo produces, and
-#     `coverage-unit`/`coverage-e2e` compile disjoint target sets in the same
-#     stage: one shared key would have them overwrite each other every run,
-#     so each would extract a multi-GB zip that does not match what it is
-#     about to build and rebuild anyway. Paying peak disk for a cache that
-#     structurally misses is the worst of both.
-# Every key still includes Cargo.lock + rust-toolchain.toml, so a dependency
-# or toolchain bump invalidates it.
+# is exactly where every job in this file lands, so they hit. Two entries per
+# rust job, both keyed on Cargo.lock + rust-toolchain.toml so a dependency or
+# toolchain bump invalidates them:
+#   - `cargo-home`: the registry/git checkouts and installed cargo subcommands,
+#     shared by every job (identical content, one copy).
+#   - `target-<job>`: the build directory, keyed PER JOB, mirroring the
+#     per-job `key:` the Actions workflows pass to rust-cache. Jobs here do not
+#     agree on RUSTFLAGS (see DENY-WARNINGS below) or on profile, and a shared
+#     target dir would make them evict each other's artifacts every run.
 # CARGO_HOME is moved inside the project directory because GitLab can only
 # cache paths under $CI_PROJECT_DIR; $CARGO_HOME/bin is put back on PATH so
 # directly-invoked subcommands (mutants-gate.sh does `command -v
@@ -244,10 +210,10 @@ workflow:
     - !reference [.apt-helper, before_script]
 
 # The cargo cache entries, anchored individually rather than as one list:
-# luals-parity needs one of these PLUS its own, and a YAML alias cannot splice
-# a list into a list (nor can `!reference` — verified against this instance's
-# merged config, which nested it). Map aliases compose cleanly, and `<<:` gives
-# the read-only variants without restating the key.
+# luals-parity needs these PLUS its own, and a YAML alias cannot splice a list
+# into a list (nor can `!reference` — verified against this instance's merged
+# config, which nested it). Map aliases compose cleanly, and `<<:` gives the
+# read-only variant without restating the key.
 .cache-cargo-home: &cache-cargo-home
   key:
     prefix: cargo-home
@@ -267,14 +233,9 @@ workflow:
   <<: *cache-cargo-home
   policy: pull
 
-# ONE build directory cache for the `-Dwarnings` profile, written by `check`
-# alone. The key names the profile, not the job: a default-RUSTFLAGS job that
-# ever needs a target cache gets `target-default` and does NOT share this one,
-# because the two profiles' fingerprints differ and sharing a directory across
-# them makes every run a full rebuild (see DENY-WARNINGS in the header).
-.cache-target-deny: &cache-target-deny
+.cache-cargo-target: &cache-cargo-target
   key:
-    prefix: target-deny
+    prefix: target-$CI_JOB_NAME_SLUG
     files:
       - Cargo.lock
       - rust-toolchain.toml
@@ -285,23 +246,13 @@ workflow:
     # not cover. Harmlessly empty in the jobs that never build it.
     - tools/differ/target
 
-# Same key, read-only. One writer is the point: concurrent jobs sharing a key
-# all write at job end, last one wins, and the surviving content oscillates
-# between their disjoint artifact sets — paying the disk for a cache that
-# rarely hits. `check` writes; everyone else reads.
-.cache-target-deny-ro: &cache-target-deny-ro
-  <<: *cache-target-deny
-  policy: pull
-
 .rust:
   extends: .linux
   variables:
     CARGO_HOME: $CI_PROJECT_DIR/.cargo
-  # Registry only. A target cache is opt-in per job (see CACHING in the
-  # header): the default is no build-directory cache, because the default was
-  # what filled the runner's disk.
   cache:
     - *cache-cargo-home
+    - *cache-cargo-target
   before_script:
     # First line of every rust job. The failure this pins (#85) surfaced as
     # `rustc-LLVM ERROR: IO failure on output stream` and `ld terminated with
@@ -593,12 +544,6 @@ check:
   stage: check
   needs: []
   timeout: 2h # untimed in the source; see TIMEOUTS in the header
-  # The sole writer of the shared -Dwarnings build directory (CACHING header):
-  # this job's tree is the widest debug build in the pipeline, so it is the
-  # one worth keeping.
-  cache:
-    - *cache-cargo-home
-    - *cache-target-deny
   script:
     - cargo fmt --all --check
     - cargo clippy --workspace --all-targets -- -D warnings
@@ -652,11 +597,6 @@ ignored-deterministic-tests:
   stage: check
   timeout: 20m
   needs: []
-  # Reads check's tree, never writes: its own `cargo build --release
-  # -p luabox-cli` is a different profile and would only churn the key.
-  cache:
-    - *cache-cargo-home
-    - *cache-target-deny-ro
   script:
     - |
       discard_provenance_regen() {
@@ -709,12 +649,6 @@ ignored-deterministic-tests:
   stage: check
   needs: []
   timeout: 2h # untimed in the source; see TIMEOUTS in the header
-  # Registry only — no `target/llvm-cov-target` cache. See CACHING in the
-  # header: instrumented artifacts are the biggest tree here, and the two
-  # coverage jobs compile disjoint target sets in the same stage, so one
-  # shared key would miss on nearly every run while still costing peak disk.
-  cache:
-    - *cache-cargo-home
   before_script:
     - !reference [.rust, before_script]
     - !reference [.install-cargo-llvm-cov, script]
@@ -776,10 +710,11 @@ examples:
   stage: check
   needs: []
   timeout: 2h # untimed in the source; see TIMEOUTS in the header
-  # One-shot: one release binary, then shell scripts over examples/. Nothing
-  # downstream reuses the tree, so it is not worth a gigabyte on the host.
+  # Adds nothing to the registry `check` has not already put there, so it
+  # takes `cargo-home` read-only; its own build directory is its own key.
   cache:
     - *cache-cargo-home-ro
+    - *cache-cargo-target
   script:
     - cargo build --release --bin luabox
     - apt_install unzip lua5.1
@@ -821,12 +756,6 @@ perf-gates:
   timeout: 2h # untimed in the source; see TIMEOUTS in the header
   needs:
     - perf-gate-selftest
-  # Reads check's tree, never writes. perf-gate.sh builds its own release
-  # binaries; those are the profile this key does not hold, and writing them
-  # back would evict the debug artifacts the key exists for.
-  cache:
-    - *cache-cargo-home
-    - *cache-target-deny-ro
   variables:
     LUABOX_PERF_FACTOR: "4.0"
   script:
@@ -858,11 +787,11 @@ differential:
   stage: gate
   needs: []
   timeout: 2h # untimed in the source; see TIMEOUTS in the header
-  # Self-contained: release builds of tools/differ and the cli, then live
-  # interpreters. No build-directory cache — this job's tree was one of the
-  # three that reported `No space left on device` on 2026-09-06.
+  # Registry read-only (it installs nothing the writers have not); its own
+  # tree — cli plus the workspace-excluded tools/differ — is its own key.
   cache:
     - *cache-cargo-home-ro
+    - *cache-cargo-target
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes: *changes-differential
@@ -920,9 +849,10 @@ verdict-differential:
   needs:
     - verdict-differential-selftest
   # One `cargo build --locked --release --bin luabox`, then a python driver.
-  # Registry only.
+  # Registry read-only; own build directory under its own key.
   cache:
     - *cache-cargo-home-ro
+    - *cache-cargo-target
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes: *changes-luabox-gates
@@ -965,12 +895,9 @@ luals-parity:
     - if: '$CI_PIPELINE_SOURCE == "api"'
     - if: '$CI_COMMIT_BRANCH == "main"'
       changes: *changes-luabox-gates
-  # The pinned luals tree is the cache that matters here and it is tens of
-  # megabytes. No build-directory cache: this is the only default-RUSTFLAGS
-  # rust job, it builds one release binary, and giving it a key of its own
-  # would reintroduce a second multi-GB tree for a single build.
   cache:
     - *cache-cargo-home-ro
+    - *cache-cargo-target
     - key: luals-$LUALS_VERSION
       paths:
         - .luals
@@ -1027,11 +954,9 @@ fuzz:
         - .cargo/registry/cache
         - .cargo/git/db
         - .cargo/bin
-    # `fuzz/target` is deliberately NOT cached: three matrix legs meant three
-    # more multi-GB nightly build directories on the one runner's disk (#85,
-    # decision 15), and a 60-second smoke run does not earn them. The corpus
-    # below is the cache this job actually compounds.
-    #
+    - key: fuzz-target-$FUZZ_TARGET
+      paths:
+        - fuzz/target
     # The corpus cache is the port of the source's rolling
     # `fuzz-corpus-<target>-<run_id>` + restore-keys pair. GitLab overwrites a
     # cache under the same key at the end of every job, which gives the same
