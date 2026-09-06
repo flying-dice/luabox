@@ -46,7 +46,27 @@ decision must not add a second system beside it.
    order. Sprint tracking is a RepoDoc card on `boards/improvement-sprint/`
    (one card per sprint, journal in `## Comments`). Engineering decisions are
    `decisions/NN-slug.md` — not a parallel `docs/bots/decisions/`.
-5. **Quality bar is the existing one, enforced on GitLab:** fmt, clippy
+5. **The instruction set is checked in more than once, and CI holds the
+   copies equal.** Each harness reads only its own root: skills at
+   `.claude/skills/<name>/` (Claude) and `.agents/skills/<name>/` (Codex),
+   agent definitions at `.claude/agents/bots/<n>.md` (Claude) and
+   `.codex/agents/<n>.toml` (Codex). The duplication is the harnesses'
+   requirement, not a defect — but an unguarded duplicate is two rules wearing
+   one name, and the drift is silent. The selftest job `harness-skill-parity`
+   runs `scripts/tests/harness-skill-parity.sh`, which enforces three rules:
+   the skill trees are byte-identical apart from a named one-sided exception;
+   a Codex agent body equals its Claude twin plus the appended
+   `## Operating in Codex` section, once a small table of harness-API terms is
+   translated; and a skill that mirrors an agent definition equals that
+   agent's Codex body. The script checks rules, not an inventory, so adding a
+   skill or a bot does not require editing it. Edit an instruction in one
+   place only, and the pipeline says so.
+6. **Harness state is not repo state.** The bot manifests
+   (`.claude/bots-manifest.json`, `.codex/bots-manifest.json`) are generated
+   per-machine with absolute paths and no in-repo consumer; they are
+   `.gitignore`d and each harness regenerates them locally. Agent and skill
+   *definitions* are repo state and are committed.
+7. **Quality bar is the existing one, enforced on GitLab:** fmt, clippy
    (pedantic + restriction lints, `-D warnings`), workspace tests, unit
    coverage ≥95 (per-crate ≥92), e2e ≥83, luals parity and verdict
    differentials, self-tested gates (decision 12). Floors only move up.
