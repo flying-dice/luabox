@@ -790,6 +790,16 @@ fn check_file_from_env<S: std::hash::BuildHasher>(
         diags.extend(check::duplicate_doc_fields_with_ambient(
             items, file, ambient,
         ));
+        // A `---@class` header that cannot become a class (LB0320/LB0321,
+        // #69) — the same kind of per-file doc-consistency finding as the
+        // duplicate-field pass above, and emitted here for the same reason:
+        // it reads the harvested doc blocks, not the `TypeEnv`, because a
+        // header with no usable name never reaches the env at all.
+        diags.extend(check::malformed_class_headers(
+            items,
+            file,
+            strictness == Strictness::Strict,
+        ));
     }
 
     drain_suppressed_by_directives(&mut diags, parse, file, other_sources);

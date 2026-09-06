@@ -49,14 +49,16 @@ use luabox_syntax::lua::ast::{
     Stmt, TableExpr,
 };
 use luabox_syntax::lua::{self, SyntaxNode};
+use luabox_syntax::luacats::{TypeExpr, TypeExprKind};
 
 use crate::assign::{
     Exactness, LiteralConformance, assignable, classify_literal, is_integral_literal,
 };
 use crate::codes::{
     AWAIT_IN_SYNC, CLASS_COST_LIMIT, CLASS_DEPTH_LIMIT, CYCLIC_ALIAS, CYCLIC_CLASS, DEPRECATED,
-    DISCARD_RETURNS, DUPLICATE_DOC_FIELD, GENERIC_ARITY, MISSING_FIELD, RETURN_MISMATCH,
-    TYPE_MISMATCH, UNKNOWN_FIELD, UNKNOWN_TYPE_NAME, WRONG_ARG_COUNT,
+    DISCARD_RETURNS, DUPLICATE_DOC_FIELD, GENERIC_ARITY, MALFORMED_CLASS_EXTENDS_ENTRY,
+    MALFORMED_CLASS_NAME, MISSING_FIELD, RETURN_MISMATCH, TYPE_MISMATCH, UNKNOWN_FIELD,
+    UNKNOWN_TYPE_NAME, WRONG_ARG_COUNT,
 };
 use crate::env::{self, MAX_ANCESTRY_DEPTH, TypeEnv};
 use crate::ty::{FieldTy, FunctionTy, OperatorSig, ParamTy, TableTy, Ty};
@@ -2213,7 +2215,160 @@ pub(crate) fn duplicate_doc_fields_with_ambient(
     diags
 }
 
+/// A `---@class` header that cannot become the class it names — LB0320 (no
+/// usable name) and LB0321 (an entry in the extends list that is not a class
+/// name), both anchored at the declaration (round 6 review M66, #69).
+///
+/// A per-file doc-consistency pass, emitted from `check_file_from_env`
+/// alongside [`duplicate_doc_fields_with_ambient`] and suppressed under
+/// `Strictness::None` with it. It reads the harvested doc blocks directly
+/// rather than the [`crate::TypeEnv`], because the env is structurally
+/// incapable of carrying the finding: every consumer of a `---@class` tag in
+/// this crate guards on `!c.name.is_empty()`, so a header with no name at all
+/// is dropped before any type exists to hang a diagnostic on, and the only
+/// signal a user used to get was an [`UNKNOWN_TYPE_NAME`] at some later
+/// reference to the name the class never got.
+///
+/// **The env's guard and this pass's rule are deliberately not the same
+/// predicate.** `---@class 123abc` has a non-empty name, so the env does
+/// register a class — under a name [`luacats::is_type_name`] rejects and, by
+/// that function's round-trip invariant, no annotation can spell. That
+/// registration is inert rather than wrong, and unifying the two would change
+/// what gets declared, not what gets reported; this pass reports it and
+/// leaves the env alone.
+///
+/// One diagnostic per malformed header per code, never one per malformed
+/// entry: `---@class A : P,,` is one LB0321, the same way luals reports the
+/// first `luadoc-miss-class-extends-name` and stops. A header can still raise
+/// both codes (`---@class :`) — they are two different mistakes.
+pub(crate) fn malformed_class_headers(
+    items: &[luabox_syntax::luacats::AnnotatedItem],
+    file: &str,
+    strict: bool,
+) -> Vec<Diagnostic> {
+    use luabox_syntax::luacats::{Tag, is_type_name};
+
+    let severity = if strict {
+        Severity::Error
+    } else {
+        Severity::Warning
+    };
+    let mut diags = Vec::new();
+    for item in items {
+        for tag in &item.block.tags {
+            let Tag::Class(class) = tag else { continue };
+            let header = Span::new(file, class.span.start..class.span.end);
+            if !is_type_name(&class.name) {
+                let (message, label, note) = if class.name.is_empty() {
+                    (
+                        "`---@class` is missing a class name".to_string(),
+                        "expected a class name after `---@class`".to_string(),
+                        "this header declares no class at all, so every `---@field` under it \
+                         belongs to nothing and every reference to the name it meant to declare \
+                         is an unknown type"
+                            .to_string(),
+                    )
+                } else {
+                    (
+                        format!("`{}` is not a valid class name", class.name),
+                        format!("`{}` is not an identifier", class.name),
+                        format!(
+                            "a class name is one or more dot-separated identifiers; no \
+                             annotation can spell `{}`, so nothing can reference this class",
+                            class.name
+                        ),
+                    )
+                };
+                diags.push(
+                    Diagnostic::new(MALFORMED_CLASS_NAME, severity, message)
+                        .with_label(Label::primary(header.clone(), label))
+                        .with_note(note),
+                );
+            }
+            // `TypeExprKind::Error` is the type parser's universal recovery
+            // node, not a "missing name" node specifically: an empty span for
+            // a separator with nothing after it (`: P,`, a bare `:`), and a
+            // non-empty one over whatever token it could not read (`: ?`,
+            // `: %`, the second comma of `: P,, Q`). So the wording here says
+            // what is true of every one of them — this entry is not a class
+            // name — rather than asserting a name is *missing*, which would
+            // be a lie on the shapes where a token is present and merely
+            // unreadable. The anchor follows the same split: the offending
+            // token where there is one, the header itself where the span is
+            // empty, since a zero-width caret past the end of the line points
+            // at nothing.
+            //
+            if let Some(bad_entry) = class.parents.iter().find_map(unnamed_parent_entry) {
+                let anchor = if bad_entry.span.start < bad_entry.span.end {
+                    Span::new(file, bad_entry.span.start..bad_entry.span.end)
+                } else {
+                    header
+                };
+                diags.push(
+                    Diagnostic::new(
+                        MALFORMED_CLASS_EXTENDS_ENTRY,
+                        severity,
+                        "`---@class` extends list has an entry that is not a class name"
+                            .to_string(),
+                    )
+                    .with_label(Label::primary(
+                        anchor,
+                        "expected a parent class name here".to_string(),
+                    ))
+                    .with_note(
+                        "the entry is ignored, so this class inherits only from the parents that \
+                         are named; drop the stray separator, or replace the entry with the \
+                         parent it was meant to name"
+                            .to_string(),
+                    ),
+                );
+            }
+        }
+    }
+    diags
+}
+
 // --- helpers -------------------------------------------------------------
+
+/// The recovery node that makes an extends-list entry name no class at all —
+/// `None` for an entry that does name one, whatever else is wrong inside it.
+/// The LB0321 half of [`malformed_class_headers`], kept here rather than on
+/// [`TypeExpr`] because it is a claim about *inheritance*, which the syntax
+/// crate neither owns nor can check.
+///
+/// Two rules, and the split between them is measured, not stylistic:
+///
+/// - **A name in front ends it.** `: Base<?>` heads with `Base`, and measures
+///   identically to the well-formed `: Base` — the parent resolves, its
+///   members are inherited, `LB0300` still enforces ancestry.
+///   Nothing is ignored, so this diagnostic's message ("an entry that is not
+///   a class name"), its note ("the entry is ignored") and its remedy
+///   ("replace the entry with the parent it was meant to name") would each be
+///   false of it, at `Severity::Error` under `[types] strict = true` —
+///   telling the user to delete a parent that works (review of !2,
+///   `e751bb0`). An unreadable type *argument* is a real mistake, but it is a
+///   finding about the argument.
+/// - **Anything else, look inside.** Every other shape contributes no parent
+///   at all, whether or not the parser choked inside it, so the note ("the
+///   entry is ignored") holds of it and any error anywhere in there is this
+///   finding. That includes the shapes that merely *contain* a name:
+///   measured, `: Base?`, `: Base[]`, `: (Base)` and `: Base|Base` each leave
+///   their class with no members — `LB0306` at a read of an inherited field,
+///   identical to `: { x: number }` and to no extends list at all — where
+///   bare `: Base` inherits and `LB0300` enforces ancestry. A name under a
+///   wrapper is not the parent, so looking through the wrapper to stop at it
+///   silenced `: Base<?>?`, `: Base<?>[]` and `: (Base<?>)`, each an entry
+///   that names no parent and carries a token the parser could not read
+///   (review of !2, `6f03acd`). Recursing is also what reaches a wrapped
+///   recovery node in the first place: `: Base,, ?` parses as
+///   `Optional(Error)`, and a match on the entry's own `kind` reports nothing
+///   on it — the same silence #69 exists to remove, one level down.
+fn unnamed_parent_entry(parent: &TypeExpr) -> Option<&TypeExpr> {
+    match &parent.kind {
+        TypeExprKind::Named { .. } => None,
+        _ => parent.first_error(),
+    }
+}
 
 fn range(node: &SyntaxNode) -> Range<usize> {
     let r = node.text_range();
