@@ -77,6 +77,65 @@ pub(crate) struct ClassDef {
     pub visibility: BTreeMap<String, FieldScope>,
 }
 
+/// [`TypeEnv::field_decl_spans`]' shape: class name → field name → the
+/// `---@field` tag's span and description in the file being built. Unpaired
+/// with a file name — that is [`FieldDeclSite`]'s job, one seam later.
+type FieldDeclSpans = BTreeMap<String, BTreeMap<String, (std::ops::Range<usize>, Option<String>)>>;
+
+/// Where the `---@field` tag that won a key is written: the declaring file,
+/// the tag's span in it, and the description the tag carries.
+///
+/// Recorded at the same first-wins gate that decides the field's *type*
+/// ([`TypeEnv::absorb_block`]'s `FieldKey::Name` arm and
+/// [`TypeEnv::merge_file_types`]'s fields loop), so a declaration site can
+/// never name a file the merge did not actually take the type from — the
+/// per-field counterpart of the per-class [`TypeEnv::cross_file_class_decl_span`]
+/// (#90, round 3 review F71) this mirrors.
+///
+/// Only `---@field` declarations carried across a file boundary have one.
+/// A carrier attachment (`function C:method`), a class the definition layer
+/// declares, and a rock-harvested surface all leave it `None`: none of the
+/// three reaches this env through [`FileTypes`], which is the one seam that
+/// knows a declaring file's name at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldDeclSite {
+    /// The declaring file, exactly as [`FileTypes::collect`]'s `file`
+    /// argument spelled it — `luabox_db`'s own path string for the file, so
+    /// an LSP consumer can turn it straight back into a `Path`.
+    pub file: String,
+    /// The `---@field` tag's span in that file.
+    pub span: std::ops::Range<usize>,
+    /// The description trailing the tag, if it wrote one.
+    pub desc: Option<String>,
+}
+
+/// [`TypeEnv::collect_class`]'s **per-key winner**: which class's own
+/// declaration actually claimed a member of a merged class shape, and where
+/// that declaration is written (#70).
+///
+/// A resolved [`crate::ty::TableTy`] carries a type per key and nothing
+/// about who contributed it, so a consumer that needs the declaration site —
+/// hover's description, goto-definition's jump target — had no choice but to
+/// re-derive the merge from the same source data and hope the two walks
+/// agree. They do not on two shapes: a genuine diamond conflict (the same
+/// generic ancestor reached through two parents bound to different type
+/// arguments, where the merge keeps the **last**-visited edge) and a class
+/// whose own `---@field`s are split across more than one file (where the
+/// winner is per-*field*, not per-file). Both are decided inside the merge
+/// and nowhere else, which is why this rides out of it rather than being
+/// reconstructed outside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldOrigin {
+    /// The class whose own contribution claimed the key — the queried class
+    /// itself when it declares the member, otherwise the ancestor the merge
+    /// actually took it from.
+    pub owner: String,
+    /// Where that class declares it, when a `---@field` tag carried across a
+    /// file boundary did — see [`FieldDeclSite`] for the cases that leave this
+    /// `None`.
+    pub site: Option<FieldDeclSite>,
+}
+
 /// A declared `---@enum`: member name → value type, plus the union of all
 /// member values (what the enum *type* accepts).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +184,17 @@ pub struct FileTypes {
     /// span with no file would silently mislabel whichever file happens to be
     /// checking at the time.
     pub(crate) class_decl_spans: BTreeMap<String, (String, std::ops::Range<usize>)>,
+    /// The declaration site of each `---@field` this file writes, class name
+    /// → field name → site (#70) — the per-field counterpart of
+    /// [`Self::class_decl_spans`], carried for the same reason: a consumer
+    /// that must point at where a *member* is declared cannot get there from
+    /// the merged [`ClassDef`], whose `fields` map holds types and nothing
+    /// about who wrote them.
+    ///
+    /// Only this file's own `---@field` tags are collected — the ambient
+    /// declarations seeded beneath its env have no site here, exactly as
+    /// they contribute no `classes` entry of their own.
+    pub(crate) field_decl_spans: BTreeMap<String, BTreeMap<String, FieldDeclSite>>,
 }
 
 impl FileTypes {
@@ -176,6 +246,24 @@ impl FileTypes {
                             out.class_decl_spans
                                 .entry(c.name.clone())
                                 .or_insert((file.to_string(), range));
+                        }
+                        // Each `---@field` this file writes for the class,
+                        // stamped with the file that wrote it (#70) — the
+                        // per-field twin of the `class_decl_spans` entry
+                        // above, and first-wins for the same reason: within
+                        // one file `absorb_block` has already resolved a
+                        // duplicate, so a second `---@class` block for the
+                        // same name here re-reads sites that are already
+                        // correct.
+                        if let Some(sites) = env.field_decl_spans.get(&c.name) {
+                            let decls = out.field_decl_spans.entry(c.name.clone()).or_default();
+                            for (field, (span, desc)) in sites {
+                                decls.entry(field.clone()).or_insert_with(|| FieldDeclSite {
+                                    file: file.to_string(),
+                                    span: span.clone(),
+                                    desc: desc.clone(),
+                                });
+                            }
                         }
                     }
                     Tag::Enum(e) if !e.name.is_empty() => {
@@ -241,6 +329,26 @@ pub struct TypeEnv {
     /// *which* file the class it names lives in before it can point a
     /// secondary label at it at all.
     cross_file_class_decl_spans: BTreeMap<String, (String, std::ops::Range<usize>)>,
+    /// The `---@field` tag span and description of each member *this* file
+    /// declares, class name → field name → `(span, desc)` (#70). The
+    /// per-field twin of [`Self::class_decl_spans`], and same-file only for
+    /// the same reason: it is written by `absorb_block`, which knows the
+    /// tag's offsets but not the name of the file it is building.
+    /// [`FileTypes::collect`] pairs each entry with the declaring file on the
+    /// way out; [`Self::cross_file_field_decl_spans`] is where it lands.
+    field_decl_spans: FieldDeclSpans,
+    /// [`Self::field_decl_spans`] after [`Self::merge_file_types`] has paired
+    /// each entry with its declaring file, class name → field name →
+    /// [`FieldDeclSite`] (#70) — the per-field counterpart of
+    /// [`Self::cross_file_class_decl_spans`], and the map
+    /// [`Self::collect_class`] reads a resolved key's [`FieldOrigin::site`]
+    /// out of.
+    ///
+    /// Written at the *identical* gate that writes the field's type, in both
+    /// branches of that merge, so the two can never disagree about which
+    /// declaration won: a site here always names the file the resolved type
+    /// came from.
+    cross_file_field_decl_spans: BTreeMap<String, BTreeMap<String, FieldDeclSite>>,
     /// Ambient / global values by name: stdlib module tables (`string`,
     /// `math`, ...) and scalar globals (`_VERSION`) declared by definition
     /// packages (`---@meta` `.d.lua`). Populated only for the ambient
@@ -1179,6 +1287,17 @@ impl TypeEnv {
             env.functions = ambient.env.functions.clone();
             env.global_types = ambient.env.global_types.clone();
             env.cross_file_class_decl_spans = ambient.env.cross_file_class_decl_spans.clone();
+            // Deliberately NOT `cross_file_field_decl_spans` (#70): that map
+            // is read by exactly one caller, `class_field_origins`, which
+            // only ever runs against the long-lived `Ambient` layer
+            // `clone_surface` builds — never against a per-file check env.
+            // Seeding it here would deep-clone one entry per *field* of the
+            // whole workspace (description strings included) into every one
+            // of the N per-file environments a check builds, against the
+            // retained-`TypeEnv` budget `lib.rs` pins at 500 files / 100 MiB,
+            // to feed a read that cannot happen. Its per-class sibling above
+            // is one entry per class and *is* read here, by
+            // `cross_file_class_decl_span`'s "declared here" secondary.
         }
         let mut lowerer = Lowerer::new(&decl);
         let root = parse.syntax();
@@ -1292,6 +1411,7 @@ impl TypeEnv {
             functions: self.functions.clone(),
             global_types: self.global_types.clone(),
             cross_file_class_decl_spans: self.cross_file_class_decl_spans.clone(),
+            cross_file_field_decl_spans: self.cross_file_field_decl_spans.clone(),
             ..TypeEnv::default()
         }
     }
@@ -1316,6 +1436,15 @@ impl TypeEnv {
             match self.classes.get_mut(name) {
                 None => {
                     self.classes.insert(name.clone(), def.clone());
+                    // Every field arrives from this file, so every site it
+                    // recorded is the winning one (#70). No prior entry can
+                    // exist to merge with: a site is only ever recorded for a
+                    // class that is also inserted, so a name absent from
+                    // `classes` is absent here too.
+                    if let Some(decls) = file.field_decl_spans.get(name) {
+                        self.cross_file_field_decl_spans
+                            .insert(name.clone(), decls.clone());
+                    }
                 }
                 Some(existing) => {
                     // Type parameters follow the same first-wins rule as
@@ -1362,6 +1491,40 @@ impl TypeEnv {
                     for (field, ty) in &def.fields {
                         if member_wins(existing.fields.get(field), MemberArrival::Duplicate) {
                             existing.fields.insert(field.clone(), subst(ty));
+                            // The declaration site moves with the type it
+                            // describes, inside the same gate (#70) — that is
+                            // the whole point of recording it here rather
+                            // than re-deriving it later: a site can never
+                            // name a file the resolved type did not come
+                            // from, because the two are written together or
+                            // not at all.
+                            //
+                            // Nothing has to be *cleared* when this file has
+                            // no site for a key it wins (a carrier
+                            // attachment, or a shape inherited from the
+                            // ambient layer beneath it). Reaching here means
+                            // `existing` had no such field, and a recorded
+                            // site implies a recorded field — `absorb_block`
+                            // writes the two under one gate, and the branch
+                            // above inserts a class's sites only alongside
+                            // the class itself — so there is no earlier entry
+                            // to go stale. The assertion pins that invariant
+                            // rather than leaving it to the reader.
+                            debug_assert!(
+                                !self
+                                    .cross_file_field_decl_spans
+                                    .get(name)
+                                    .is_some_and(|sites| sites.contains_key(field)),
+                                "a recorded site for `{name}.{field}` outlived its field"
+                            );
+                            if let Some(site) =
+                                file.field_decl_spans.get(name).and_then(|d| d.get(field))
+                            {
+                                self.cross_file_field_decl_spans
+                                    .entry(name.clone())
+                                    .or_default()
+                                    .insert(field.clone(), site.clone());
+                            }
                         }
                     }
                     for (member, ty) in &def.methods {
@@ -1941,6 +2104,20 @@ impl TypeEnv {
                                     class.visibility.insert(name.clone(), scope);
                                 }
                             }
+                            // …and where it is written (#70), past the same
+                            // first-wins gate the type just cleared, so the
+                            // recorded site is always the declaration whose
+                            // type survived. `class` is dropped here — this
+                            // writes a second map on `self`, not on the
+                            // `ClassDef` — which is also why `current_class`
+                            // is re-read rather than reused through the
+                            // borrow above.
+                            if let Some(owner) = current_class.clone() {
+                                self.field_decl_spans.entry(owner).or_default().insert(
+                                    name.clone(),
+                                    (f.span.start..f.span.end, f.desc.clone()),
+                                );
+                            }
                         }
                         FieldKey::Indexer(key) => {
                             let key = lowerer.lower(key);
@@ -2366,15 +2543,57 @@ impl TypeEnv {
     /// of a user as if it meant something wants [`Self::class_shape_bound_export`]
     /// instead (finding 5 of the production readiness review).
     pub(crate) fn class_shape_bound(&self, name: &str, args: &[Ty]) -> Option<TableTy> {
+        self.class_shape_bound_with_origins(name, args, None)
+    }
+
+    /// [`Self::class_shape_bound`] plus [`collect_class`](Self::collect_class)'s
+    /// **per-key winner** for every field of the resolved shape (#70), when
+    /// `origins` is `Some` — the same single walk, not a second one, which is
+    /// the entire point: an owner map derived by any other route is a
+    /// re-implementation of the merge that can disagree with it, and on
+    /// diamond and cross-file-split shapes it did.
+    ///
+    /// `origins` is an in/out accumulator rather than a return value so the
+    /// ordinary callers — every checker path, on the hot per-file loop — pass
+    /// `None` and pay nothing at all for a surface only the editor reads.
+    /// [`Self::class_field_origins`] is the shaped-for-consumers wrapper.
+    fn class_shape_bound_with_origins(
+        &self,
+        name: &str,
+        args: &[Ty],
+        origins: Option<&mut BTreeMap<String, FieldOrigin>>,
+    ) -> Option<TableTy> {
         if !self.classes.contains_key(name) {
             return None;
         }
         let mut shape = TableTy::default();
         let mut guard = DiamondGuard::default();
-        self.collect_class(name, args, &mut shape, &mut guard, false);
+        self.collect_class(name, args, &mut shape, origins, &mut guard, false);
         self.note_limit_trip(&guard, name);
         self.note_cyclic(&guard);
         Some(shape)
+    }
+
+    /// [`collect_class`](Self::collect_class)'s resolved owner for every
+    /// field of `name`'s merged shape, keyed by member (#70): the class whose
+    /// own declaration claimed the key, and where that declaration is
+    /// written when a `---@field` in a project file wrote it.
+    ///
+    /// Resolved with every type parameter free, exactly as
+    /// [`Self::class_shape`] is: the consumer this exists for
+    /// (`luabox-lsp`'s `locate_field`) is looking for a *declaration site*,
+    /// which a reference's type arguments cannot move — they change what a
+    /// member's type resolves to, never which `---@field` tag declared it.
+    ///
+    /// `None` only when `name` is not a class here. A class with no fields
+    /// resolves to an empty map, and a field the merge took from something
+    /// with no declaration site ([`FieldDeclSite`] lists the cases) is present
+    /// with `site: None` — "the merge has no site for this" and "the merge
+    /// has never heard of this class" are different answers.
+    pub(crate) fn class_field_origins(&self, name: &str) -> Option<BTreeMap<String, FieldOrigin>> {
+        let mut origins = BTreeMap::new();
+        self.class_shape_bound_with_origins(name, &[], Some(&mut origins))?;
+        Some(origins)
     }
 
     /// [`Self::class_shape_bound`] for the **module-export** seam (#56): the
@@ -2427,7 +2646,7 @@ impl TypeEnv {
         }
         let mut shape = TableTy::default();
         let mut guard = DiamondGuard::default();
-        self.collect_class(name, args, &mut shape, &mut guard, true);
+        self.collect_class(name, args, &mut shape, None, &mut guard, true);
         self.note_limit_trip(&guard, name);
         self.note_cyclic(&guard);
         Some(shape)
@@ -2775,10 +2994,11 @@ impl TypeEnv {
         name: &str,
         args: &[Ty],
         shape: &mut TableTy,
+        mut origins: Option<&mut BTreeMap<String, FieldOrigin>>,
         guard: &mut DiamondGuard,
         erase_free: bool,
     ) {
-        guard.visit(name, args, |guard, is_first_binding| {
+        guard.visit(name, args, move |guard, is_first_binding| {
             let Some(def) = self.classes.get(name) else {
                 return;
             };
@@ -2871,6 +3091,28 @@ impl TypeEnv {
                     shape.fields.get(&member),
                     MemberArrival::AncestorFold { is_first_binding },
                 ) {
+                    // The per-key winner, recorded at the *only* point that
+                    // knows it (#70): whichever visit clears this gate last
+                    // is the class the resolved type came from, whether that
+                    // is the first-listed of two unrelated parents or the
+                    // last-visited edge of a diamond conflict. A consumer
+                    // outside this crate re-deriving the same answer from the
+                    // same declarations has to reimplement both rules and the
+                    // walk order that feeds them; reading it out of the walk
+                    // cannot drift from it.
+                    if let Some(origins) = origins.as_deref_mut() {
+                        origins.insert(
+                            member.clone(),
+                            FieldOrigin {
+                                owner: name.to_string(),
+                                site: self
+                                    .cross_file_field_decl_spans
+                                    .get(name)
+                                    .and_then(|decls| decls.get(&member))
+                                    .cloned(),
+                            },
+                        );
+                    }
                     shape.fields.insert(member, value);
                 }
             }
@@ -2883,7 +3125,14 @@ impl TypeEnv {
                     .iter()
                     .map(|arg| crate::generics::subst_ty(arg, &bound))
                     .collect();
-                self.collect_class(&parent.name, &parent_args, shape, guard, erase_free);
+                self.collect_class(
+                    &parent.name,
+                    &parent_args,
+                    shape,
+                    origins.as_deref_mut(),
+                    guard,
+                    erase_free,
+                );
             }
             // Both halves of an indexer are substituted, matching
             // `generics::subst_table` — the reference implementation every
@@ -4527,11 +4776,201 @@ mod tests {
 
     /// The workspace-global surface one source file contributes.
     fn surface(source: &str) -> FileTypes {
+        surface_of("surface.lua", source)
+    }
+
+    /// [`surface`] for a named file — what the declaration sites #70 records
+    /// are stamped with, so a test about *which file* won a field needs more
+    /// than one of them.
+    fn surface_of(file: &str, source: &str) -> FileTypes {
         let parsed = parse(source, Dialect::Lua54);
         assert_eq!(parsed.errors(), &[], "fixture must parse cleanly");
         let items = luacats::harvest(&parsed);
         let env = TypeEnv::build_from_items(&parsed, &items, None);
-        FileTypes::collect(&items, &env, &HashMap::new(), "surface.lua")
+        FileTypes::collect(&items, &env, &HashMap::new(), file)
+    }
+
+    // === collect_class's per-key winner (#70) =============================
+
+    /// The issue's own fixture: `C : A, B` with `A : X`, and both `X` and
+    /// `B` declaring their own `f`. The merge resolves `C.f` through `X` —
+    /// depth-first preorder reaches `A`'s whole subtree before `B`, and
+    /// `member_wins`' first-listed rule then blocks `B` — and the recorded
+    /// owner has to say so, because that is the single answer every editor
+    /// surface must render *and* the checker must enforce.
+    #[test]
+    fn class_field_origins_names_the_class_the_merge_actually_took_the_field_from() {
+        let env = env_of(
+            "\
+---@class X
+---@field f string the f from X
+
+---@class B
+---@field f number the f from B
+
+---@class A : X
+
+---@class C : A, B
+",
+        );
+        let origins = env.class_field_origins("C").expect("C is a class");
+        assert_eq!(
+            origins.get("f").map(|o| o.owner.as_str()),
+            Some("X"),
+            "the owner must be the class the resolved type came from: {origins:?}"
+        );
+        // …and it agrees with the type the same walk resolved, which is the
+        // whole contract: one answer, not two derived separately.
+        assert_eq!(
+            env.class_shape("C").expect("C resolves").fields["f"].ty,
+            Ty::String
+        );
+    }
+
+    /// A genuine diamond conflict — one generic ancestor reached through two
+    /// parents bound to different arguments, where `collect_class` keeps the
+    /// **last**-visited edge rather than the first (the opposite of the
+    /// unrelated-siblings rule above). The owner is the same class either
+    /// way; what the recorded winner must not do is disagree with the type,
+    /// so this pins the pair together.
+    #[test]
+    fn class_field_origins_agrees_with_the_type_on_a_diamond_conflict() {
+        let env = env_of(
+            "\
+---@class Slot<T>
+---@field item T
+
+---@class Left : Slot<number>
+
+---@class Right : Slot<string>
+
+---@class Both : Left, Right
+",
+        );
+        let origins = env.class_field_origins("Both").expect("Both is a class");
+        assert_eq!(origins.get("item").map(|o| o.owner.as_str()), Some("Slot"));
+        // Last-visited edge wins: `Right`'s `Slot<string>`, not `Left`'s.
+        assert_eq!(
+            env.class_shape("Both").expect("Both resolves").fields["item"].ty,
+            Ty::String
+        );
+    }
+
+    /// The diamond conflict that actually **moves** the owner: two distinct
+    /// generic ancestors, each reached through both parents on a different
+    /// binding. `Slot` is visited first through `L` and last through `R`;
+    /// `Q` is visited last of all, and last-visited-edge-wins means `Q` is
+    /// the class the resolved type came from.
+    ///
+    /// The test above it cannot pin the overwrite (round 9 review, thread on
+    /// `env.rs:3104`): with a *single* generic ancestor the overwrite writes
+    /// `owner: name` for the same `name` it just wrote, so first-wins and
+    /// last-wins record the identical owner and the assertion holds either
+    /// way. Two ancestors are the minimum shape where the two rules disagree
+    /// — flip the `origins.insert` above to `entry().or_insert()` and this
+    /// test reports `Slot` against a type resolved from `Q<string>`, which is
+    /// exactly the type/site divergence #70 exists to close.
+    #[test]
+    fn class_field_origins_names_the_last_visited_edge_when_the_diamond_moves_the_owner() {
+        let env = env_of(
+            "\
+---@class Slot<T>
+---@field f T the f from Slot
+
+---@class Q<U>
+---@field f U the f from Q
+
+---@class L : Slot<number>, Q<number>
+
+---@class R : Slot<string>, Q<string>
+
+---@class Both : L, R
+",
+        );
+        let origins = env.class_field_origins("Both").expect("Both is a class");
+        assert_eq!(
+            origins.get("f").map(|o| o.owner.as_str()),
+            Some("Q"),
+            "the last-visited edge is `R`'s `Q<string>`: {origins:?}"
+        );
+        // …and the type the same walk resolved agrees. Either half alone
+        // passes under first-wins; together they do not.
+        assert_eq!(
+            env.class_shape("Both").expect("Both resolves").fields["f"].ty,
+            Ty::String
+        );
+    }
+
+    /// One class, its `---@field`s split across two files: the winner is
+    /// per-*field*, and the recorded site has to name the file the merge
+    /// actually took each one from — `b.lua` for the field only it declares,
+    /// `a.lua` for the one both declare (first-wins).
+    #[test]
+    fn class_field_origins_names_the_file_the_cross_file_merge_took_each_field_from() {
+        let mut env = TypeEnv::default();
+        env.merge_file_types(&surface_of(
+            "a.lua",
+            "---@class Split\n---@field shared string from a\n---@field only_a number\n",
+        ));
+        env.merge_file_types(&surface_of(
+            "b.lua",
+            "---@class Split\n---@field shared number from b\n---@field only_b boolean\n",
+        ));
+        let origins = env.class_field_origins("Split").expect("Split is a class");
+        let file_of = |field: &str| match &origins[field].site {
+            Some(decl) => decl.file.clone(),
+            None => panic!("{field} must carry a declaration site: {origins:?}"),
+        };
+        assert_eq!(file_of("shared"), "a.lua", "first declarer wins the field");
+        assert_eq!(file_of("only_a"), "a.lua");
+        assert_eq!(file_of("only_b"), "b.lua");
+        // The site never disagrees with the type it describes.
+        let shape = env.class_shape("Split").expect("Split resolves");
+        assert_eq!(shape.fields["shared"].ty, Ty::String);
+        assert_eq!(
+            origins["shared"].site.as_ref().and_then(|d| d.desc.clone()),
+            Some("from a".to_string())
+        );
+    }
+
+    /// An ancestor's field carries the ancestor's own declaration site, not
+    /// the queried class's — the cross-file half of the diamond fix, and the
+    /// case a walk rooted at the queried class cannot get right on its own.
+    #[test]
+    fn class_field_origins_carries_an_inherited_fields_own_file() {
+        let mut env = TypeEnv::default();
+        env.merge_file_types(&surface_of(
+            "base.lua",
+            "---@class Base\n---@field b string the b\n",
+        ));
+        env.merge_file_types(&surface_of("sub.lua", "---@class Sub : Base\n"));
+        let origin = env
+            .class_field_origins("Sub")
+            .expect("Sub is a class")
+            .remove("b")
+            .expect("`b` is inherited");
+        assert_eq!(origin.owner, "Base");
+        assert_eq!(origin.site.expect("site").file, "base.lua");
+    }
+
+    /// "No site recorded" and "no such class" are different answers, and a
+    /// consumer needs both: the first says "fall back to your own search",
+    /// the second says "there is nothing to search for". A field that never
+    /// crossed a file boundary is the first case — `FileTypes` is the one
+    /// seam that knows a declaring file's name, so a `TypeEnv` built
+    /// straight from one source has the owner and no site, exactly as
+    /// [`FieldDeclSite`] documents.
+    #[test]
+    fn class_field_origins_separates_an_unrecorded_site_from_an_unknown_class() {
+        let env = env_of("---@class Local\n---@field f string\n");
+        let origins = env.class_field_origins("Local").expect("Local is a class");
+        let f = origins.get("f").expect("`f` is a resolved member");
+        assert_eq!(f.owner, "Local");
+        assert_eq!(
+            f.site, None,
+            "no file boundary was crossed, so there is no file to name"
+        );
+        assert_eq!(env.class_field_origins("Nope"), None);
     }
 
     // --- string-literal delimiters ---------------------------------------
@@ -5879,6 +6318,7 @@ mod tests {
                         &format!("G{g}_A{k}"),
                         &[Ty::String],
                         &mut shape,
+                        None,
                         &mut guard,
                         false,
                     );

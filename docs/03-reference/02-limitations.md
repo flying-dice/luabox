@@ -193,10 +193,12 @@ so the editor keeps showing the diagnostic even though the CLI is green. This
 is the one measured exception to the editor/CLI parity claim made later in
 this page, it applies to all three ancestry codes, and it has no issue of its
 own yet — it belongs to the same LSP-parity family as
-[#70](https://github.com/flying-dice/luabox/issues/70). Same-file suppression
-behaves identically in both. No workaround beyond fixing the ancestry itself
-or suppressing from the file the editor has open, which only works when that
-is also the declaring file.
+[#70](https://github.com/flying-dice/luabox/issues/70). It is a *diagnostic*
+divergence, and it is unrelated to which declaration each side resolves a
+member to: hover, goto-definition and `luabox check` read that from one merged
+answer. Same-file suppression behaves identically in both. No workaround
+beyond fixing the ancestry itself or suppressing from the file the editor has
+open, which only works when that is also the declaring file.
 
 The one exception is a class declared **only in a `[types] defs` package**.
 Nothing in the project declares it, and a definition package's own comments

@@ -26,14 +26,14 @@
 //! server's `Rc`.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use luabox_db::Analysis;
 use luabox_syntax::luacats::{TypeExpr, TypeExprKind};
 use luabox_types::ty::TableTy;
-use luabox_types::{Ambient, FileTypes};
+use luabox_types::{Ambient, FieldOrigin, FileTypes};
 
 use crate::sema::{self, FileSemaCache, SearchOrderCache};
 
@@ -101,7 +101,26 @@ pub struct MergedAmbient {
     /// `server.rs` is the one production caller, harvesting it from the very
     /// `def_sources` slice `base` was built from.
     ambient_alias_or_enum: HashSet<String>,
+    /// [`Ambient::class_field_origins`]' derivation, memoised per class name
+    /// exactly as [`Self::shapes`] memoises the shape itself (#70) — the two
+    /// are the same `collect_class` walk asked two questions, and every
+    /// surface that renders a member asks both (hover shows the type *and*
+    /// the description; goto-definition needs the site for the type
+    /// completion just offered), so a per-name miss must not cost a fresh
+    /// ancestry walk on each.
+    ///
+    /// Keyed on the bare class name, not the rendered reference
+    /// [`Self::shapes`] keys on: a reference's type arguments decide what a
+    /// member's type resolves to, never which `---@field` tag declared it, so
+    /// `Box<number>` and `Box<string>` share one answer here.
+    field_origins: RefCell<FieldOriginCache>,
 }
+
+/// [`MergedAmbient::field_origins`]' shape: class name → that class's whole
+/// resolved owner map, or `None` for a name the merged layer does not
+/// declare as a class. The negative answer is memoised too — it costs the
+/// same ancestry walk to reach.
+type FieldOriginCache = HashMap<String, Option<BTreeMap<String, FieldOrigin>>>;
 
 /// Every `---@alias`/`---@enum` name declared by a set of ambient definition
 /// sources — [`MergedAmbient::with_ambient_alias_names`]'s input (round 8
@@ -191,6 +210,7 @@ impl MergedAmbient {
             search_order_cache: SearchOrderCache::default(),
             alias_or_enum_cache: RefCell::default(),
             ambient_alias_or_enum: HashSet::new(),
+            field_origins: RefCell::new(HashMap::new()),
         }
     }
 
@@ -307,6 +327,60 @@ impl MergedAmbient {
             .borrow_mut()
             .insert(name.to_string(), shape.clone());
         shape
+    }
+
+    /// `collect_class`'s own per-key winner for `class.member` (#70), off a
+    /// per-class memo of [`Ambient::class_field_origins`] — what
+    /// [`crate::sema::locate_field`] consumes instead of re-deriving the
+    /// merge's answer from the same annotations and diverging from it on
+    /// diamond and cross-file-split shapes.
+    ///
+    /// `None` when the merged layer does not declare `class`, or declares it
+    /// with no such member — in both cases `locate_field` has nothing better
+    /// than its own walk to fall back on, which is exactly what it does.
+    #[must_use]
+    pub fn class_field_origin(&self, class: &str, member: &str) -> Option<FieldOrigin> {
+        if !self.field_origins.borrow().contains_key(class) {
+            let origins = self.ambient.class_field_origins(class);
+            self.field_origins
+                .borrow_mut()
+                .insert(class.to_string(), origins);
+        }
+        let cache = self.field_origins.borrow();
+        cache.get(class)?.as_ref()?.get(member).cloned()
+    }
+
+    /// [`sema::locate_field`] for `class.member`, wired to this layer — the
+    /// one entry point every editor surface uses.
+    ///
+    /// The `(class, member)` pair is spelled **once**: the lookup's own
+    /// context and the merge's recorded winner for that pair are both derived
+    /// here, so a caller cannot hand `locate_field` an `origin` resolved for
+    /// some *other* member and get a confidently wrong jump target back
+    /// (round 8 clean-code audit, coupling finding 3 — the three call sites
+    /// each used to repeat the pair twice and rebuild the context by hand,
+    /// which is also where the fifth invariant would have had to be added
+    /// three more times).
+    #[must_use]
+    pub fn locate_field(
+        &self,
+        analysis: &Analysis,
+        current: &Path,
+        class: &str,
+        member: &str,
+    ) -> Option<sema::FieldSource> {
+        sema::locate_field(
+            &sema::FieldLookup {
+                analysis,
+                current,
+                ambient_paths: &self.ambient_paths,
+                sema_cache: &self.sema_cache,
+                search_order_cache: &self.search_order_cache,
+            },
+            class,
+            member,
+            self.class_field_origin(class, member).as_ref(),
+        )
     }
 
     /// [`Ambient::class_members_of`], memoised (#48): a receiver's

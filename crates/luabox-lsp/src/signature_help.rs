@@ -383,17 +383,10 @@ fn signature_from_class_field(
             doc: None,
         });
     }
-    let doc = sema::locate_field(
-        analysis,
-        current,
-        &class,
-        member,
-        ambient.ambient_paths(),
-        ambient.sema_cache(),
-        ambient.search_order_cache(),
-    )
-    .and_then(|found| found.desc)
-    .unwrap_or_default();
+    let doc = ambient
+        .locate_field(analysis, current, &class, member)
+        .and_then(|found| found.desc)
+        .unwrap_or_default();
     Some(Signature {
         name: format!("{class}{sep}{member}"),
         params,
