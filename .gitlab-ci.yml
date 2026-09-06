@@ -109,13 +109,14 @@
 #     on `/cache` is the backstop, oldest first, corpora drained last. It takes
 #     a lock, skips any concurrency slot with a job container running (re-read
 #     per checkout, immediately before each `rm -rf`), and REFUSES with
-#     `logger -p user.err` if a bind mount is missing, if `du` or `find` fails,
-#     if `/builds` is not the layout it expects, or if the tree is over the cap
-#     and nothing matched the archive glob it drains — the old version read all
-#     of those as a clean sweep. Exit 2 means it stopped before deleting
-#     anything; exit 3 means it had already deleted something and says how
-#     much, because "nothing was deleted" is the one thing an operator must not
-#     be told wrongly. Source:
+#     `logger -p user.err` if a bind mount is missing, if ANY `du` or `find`
+#     fails (the empty-directory pass included), if `/builds` is not the layout
+#     it expects, if the tree is still over the cap when the drain ends for any
+#     reason, or if any `rm` failed — the old version read all of those as a
+#     clean sweep. Exit 2 means it stopped before deleting anything; exit 3
+#     means it had already deleted something and says how much, because
+#     "nothing was deleted" is the one thing an operator must not be told
+#     wrongly. Source:
 #     scripts/ops/runner-cache-sweep.sh + docker-runner-cache-sweep.cron,
 #     installed at /boot/config/scripts/ and /boot/config/plugins/dynamix/,
 #     pinned by scripts/tests/runner-cache-sweep-selftest.sh in the
@@ -643,10 +644,14 @@ runner-cache-sweep-selftest:
   needs: []
   script:
     - apt_install shellcheck
+    # selftest-lib.sh rides along because this self-test sources it: it is
+    # clean at this severity, and a linter that skips the file its subject
+    # depends on is checking half the code.
     - >
       shellcheck -S warning
       scripts/ops/runner-cache-sweep.sh
       scripts/tests/runner-cache-sweep-selftest.sh
+      scripts/tests/selftest-lib.sh
     - bash scripts/tests/runner-cache-sweep-selftest.sh
 
 # ===========================================================================

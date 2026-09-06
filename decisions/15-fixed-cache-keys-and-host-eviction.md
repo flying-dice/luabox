@@ -134,11 +134,15 @@ not bound — a hashed key is unbounded whether there are twelve of them or one.
    - **The sweep refuses rather than reports zero, and its exit code says
      whether it had already deleted anything.** A missing bind mount, a failed
      `du`, a `/builds` that is not `<token>/<slot>/<ns>/<project>`, or a tree
-     over the cap with nothing matching the archive glob it drains all used to
+     still over the cap when the drain ends, or a failed `rm`, all used to
      exit 0 with a healthy-looking syslog line; the depth-2 pre-bind layout was
-     never swept and never reported, and a renamed archive (`cache.zst` after a
+     never swept and never reported, a renamed archive (`cache.zst` after a
      runner upgrade) reproduced this incident's whole signature — a green run
-     over a full disk. All of them now log at `user.err` and exit **2 when
+     over a full disk — and an `rm` that failed wrote to a stderr cron sends to
+     /dev/null. The cap alarm is on the OUTCOME, not on any one cause: over the
+     cap when the drain finishes is a failure whether nothing matched the glob,
+     the candidates vanished, or a removal was refused. All of them now log at
+     `user.err` and exit **2 when
      nothing had been deleted yet**, so the trees are exactly as the run found
      them, or **3 when something had**, naming the count. That distinction is
      not decoration: "refused, nothing deleted" sends an operator to the wrong

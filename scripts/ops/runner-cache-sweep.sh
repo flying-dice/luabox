@@ -37,13 +37,20 @@
 # is writing into. Each guard below is load-bearing and is pinned by
 # scripts/tests/runner-cache-sweep-selftest.sh:
 #   - Refuses (`logger -p user.err`, exit 2 or 3 per the exit contract below)
-#     when CACHE_DIR or BUILDS_DIR is not a directory, when `du` or `find`
-#     fails, or when <builds> is not the depth-4 layout it assumes. A gone bind
-#     mount used to look exactly like a clean sweep: `du` printed nothing,
+#     when CACHE_DIR or BUILDS_DIR is not a directory, when ANY `du` or `find`
+#     fails — the empty-directory pass included, which used to be the one
+#     exception — or when <builds> is not the depth-4 layout it assumes. A gone
+#     bind mount used to look exactly like a clean sweep: `du` printed nothing,
 #     empty was coerced to 0, and the log line read `freed 0 MiB` in a healthy
-#     green. It also refuses when the tree is over the cap and NO archive
-#     matched the glob it drains — the same green-over-a-full-disk shape,
-#     arriving through a renamed archive rather than a missing mount.
+#     green.
+#   - Refuses when the cache tree is STILL over the cap once the drain ends,
+#     for any reason: nothing matched the archive glob (`cache.zst` after a
+#     runner upgrade), the candidates vanished, a removal failed. The bound is
+#     the thing that matters, so the alarm is on the outcome rather than on one
+#     of its causes.
+#   - Reports every failed `rm` at `user.err` by path, counts them, and exits
+#     non-zero at the end of the run. They used to reach stderr only, which
+#     cron sends to /dev/null.
 #   - `flock -n`: the hourly cron run and a manual run never overlap.
 #   - Skips any slot whose job container is running. The runner names them
 #     `runner-<token>-project-<id>-concurrent-<slot>-<hash>-build`, so the slot
@@ -120,6 +127,10 @@ err() {
 # be a lie and an operator reading it would look in the wrong place. Every
 # deletion is already logged by path above the failure.
 deletions=0
+# A failed `rm` used to reach stderr only, which cron sends to /dev/null: the
+# sweep reported success while the disk kept filling. Counted here, reported at
+# user.err by path, and fatal at the end of the run.
+failures=0
 die() {
     if [ "$deletions" -gt 0 ]; then
         err "PARTIALLY SWEPT after $deletions removal(s): $1"
@@ -327,6 +338,9 @@ sweep_cache_age() {
             removed=$((removed + 1))
             deletions=$((deletions + 1))
             log "cache: age removed $f"
+        else
+            failures=$((failures + 1))
+            err "cache: FAILED to remove $f"
         fi
     done
     log "cache: age summary: removed $removed, exempt $exempt, in-use $skipped (window ${MAX_AGE_MIN}min)"
@@ -363,15 +377,6 @@ sweep_cache_cap() {
         esac
     done
     ordered=("${plain[@]}" "${corpus[@]}")
-    # Over the cap with nothing to drain means the sweep cannot enforce the
-    # only bound this disk has, and the reason is almost always that the
-    # archives are not named what this script thinks they are (`cache.zst`
-    # after a runner upgrade, a changed cache layout). Reporting `removed 0,
-    # tree now ~0 MiB` and exiting 0 is #85's original signature: a green run
-    # over a full disk.
-    if [ "$size_kb" -gt "$cap_kb" ] && [ "${#ordered[@]}" -eq 0 ]; then
-        die "cache is $(human_kib "$size_kb"), over the $cap_label cap, and no '*.zip' archive matched under $CACHE_DIR — check the runner's archive naming/layout"
-    fi
     for f in "${ordered[@]}"; do
         [ "$size_kb" -gt "$cap_kb" ] || break
         # Deleted by the age pass or by a runner between the scan and here.
@@ -382,6 +387,9 @@ sweep_cache_cap() {
             removed=$((removed + 1))
             deletions=$((deletions + 1))
             log "cache: cap removed $f"
+        else
+            failures=$((failures + 1))
+            err "cache: FAILED to remove $f"
         fi
     done
     # Logged on every run, including the runs where it removes nothing: a cap
@@ -390,18 +398,44 @@ sweep_cache_cap() {
     # file subtracted from it, rather than re-walking the whole tree per
     # deletion; the honest number is in the net line at the end.
     log "cache: cap summary: removed $removed, tree now ~$(human_kib "$size_kb") (cap $cap_label)"
+    # The alarm is on the OUTCOME, not on one of its causes. Whatever the
+    # reason — nothing matched the archive glob, the candidates vanished under
+    # us, a removal failed — a tree still over the cap when the drain ends
+    # means the sweep cannot enforce the only bound this disk has, and saying
+    # `removed 1, tree now ~684 KiB` and exiting 0 is #85's original signature:
+    # a green run over a full disk. The empty-candidate case keeps its own
+    # reason text because it names the likeliest cause (`cache.zst` after a
+    # runner upgrade, a changed cache layout).
+    if [ "$size_kb" -gt "$cap_kb" ]; then
+        if [ "${#ordered[@]}" -eq 0 ]; then
+            die "cache is $(human_kib "$size_kb"), over the $cap_label cap, and no '*.zip' archive matched under $CACHE_DIR — check the runner's archive naming/layout"
+        fi
+        die "cache is $(human_kib "$size_kb"), over the $cap_label cap, after draining $removed of ${#ordered[@]} archive(s) — the rest could not be removed or no longer exist"
+    fi
 }
 
 # Empty directories older than the window. An empty directory a runner created
 # seconds ago is a job about to clone into it, so the window applies here too.
-# `-print0` before `-delete` so the removals can be COUNTED: they are deletions
-# like any other, and the exit contract above turns on whether anything was
-# deleted before a failure.
+#
+# `-delete` BEFORE `-print0`, deliberately: find only runs the print when the
+# delete returned true, so the count is directories actually removed. The other
+# order counts directories it failed to remove, which is the count feeding the
+# exit contract.
+#
+# A failure here dies like every other `find` failure. It used to log at info
+# and carry on, which made the header's "refuses when `du` or `find` fails" a
+# claim with an exception in it — and the one exception was the pass that
+# removes things.
 sweep_empty_dirs() { # sweep_empty_dirs <root> <label>
     local root="$1" label="$2" list="$work/empty-dirs"
     local -a gone=()
-    if ! find "$root" -mindepth 1 -type d -empty -mmin +"$MAX_AGE_MIN" -print0 -delete >"$list" 2>/dev/null; then
-        log "$label: empty-directory sweep reported an error under $root"
+    if ! find "$root" -mindepth 1 -type d -empty -mmin +"$MAX_AGE_MIN" -delete -print0 >"$list"; then
+        # Count what it managed before the failure, so the exit code is right.
+        if [ -s "$list" ]; then
+            mapfile -d '' -t gone <"$list"
+            deletions=$((deletions + ${#gone[@]}))
+        fi
+        die "empty-directory sweep failed under $root"
     fi
     [ -s "$list" ] || return 0
     mapfile -d '' -t gone <"$list"
@@ -458,6 +492,9 @@ sweep_builds() {
                     removed=$((removed + 1))
                     deletions=$((deletions + 1))
                     log "builds: removed $d"
+                else
+                    failures=$((failures + 1))
+                    err "builds: FAILED to remove $d"
                 fi
             done
             # Empty directories, but only ones older than the window: an empty
@@ -482,3 +519,10 @@ after="$(du_total -k "$CACHE_DIR" "$BUILDS_DIR")" ||
 printf -v summary 'net %s; cache+builds now %s' \
     "$(signed_kib "$((after - before))")" "$(human_kib "$after")"
 log "$summary"
+
+# Last, so the measurement above is in syslog either way: a run that could not
+# remove something it decided to remove has not done its job, whatever the
+# totals say.
+if [ "$failures" -gt 0 ]; then
+    die "$failures removal(s) failed — see the FAILED lines above"
+fi

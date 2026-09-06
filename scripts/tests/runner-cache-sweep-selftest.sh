@@ -37,14 +37,24 @@
 #   failed freshness scan reads stale -> S21
 #   per-checkout occupancy re-probe deleted, or ignored -> S22, S23
 #   every failure exits 2 (no partial code) -> S24, S26
-#   over-cap-with-no-candidates check deleted -> S25, S26
+#   over-cap alarm only on an empty candidate list -> S27
+#   over-cap alarm deleted entirely   -> S25, S26, S27
+#   a failed rm ignored, or the failure count never fatal -> S28, S28b
+#   empty-directory find failure logged instead of fatal -> S29
 #   sizes always reported in MiB      -> S18b, S25
+#   this file's own refusal on a top-level `cache:` / `include:` -> P17, P18
 # And one against .gitlab-ci.yml itself, through RUNNER_CACHE_SWEEP_CI_YML:
 #   `examples` takes its own `target` tree `policy: pull` -> P1, P1b. That
 #   mutation left this suite GREEN until the writer check expanded keys per
 #   job, which is exactly what round 2's N-3 measured.
 # Every mutation above was rejected by at least one case, none by a case that
-# was merely counting log lines. Re-run one with:
+# was merely counting log lines. One property is NOT pinned and is disclosed
+# rather than counted (decision 12 clause 2): that the empty-directory pass
+# counts only directories it actually removed rests on find's documented
+# `-delete` return value and the `-delete -print0` order. Making an rmdir fail
+# needs a permission barrier, and CI runs as root, where there is none — a case
+# built on `chmod` would pass on a dev box and measure nothing in the job. What
+# IS pinned is that a failure there is fatal (S29). Re-run one with:
 #   cp scripts/ops/runner-cache-sweep.sh /tmp/mutant.sh && $EDITOR /tmp/mutant.sh
 #   RUNNER_CACHE_SWEEP_BIN=/tmp/mutant.sh bash scripts/tests/runner-cache-sweep-selftest.sh
 #   RUNNER_CACHE_SWEEP_CI_YML=/tmp/mutant-ci.yml bash scripts/tests/runner-cache-sweep-selftest.sh
@@ -145,6 +155,38 @@ done
 exec $(command -v find) "\$@"
 SHIM
 
+mkdir -p "$work/shim-rm"
+cat >"$work/shim-rm/rm" <<SHIM
+#!/bin/bash
+# Fault injector: refuses to remove anything whose path contains
+# 'undeletable', and passes every other call to the real rm. A chmod 000
+# fixture will not do this job — CI runs as root, root ignores the mode bits,
+# and the case would quietly stop testing anything the day it left a dev box.
+for arg in "\$@"; do
+    case "\$arg" in
+    *undeletable*)
+        echo "rm: cannot remove '\$arg': Operation not permitted" >&2
+        exit 1
+        ;;
+    esac
+done
+exec $(command -v rm) "\$@"
+SHIM
+
+mkdir -p "$work/shim-find-empty"
+cat >"$work/shim-find-empty/find" <<SHIM
+#!/bin/bash
+# Fault injector: fails the empty-directory pass (the only find carrying
+# \`-empty\`) and passes every other find through.
+for arg in "\$@"; do
+    if [ "\$arg" = -empty ]; then
+        echo "find: fault injected on the empty-directory pass" >&2
+        exit 1
+    fi
+done
+exec $(command -v find) "\$@"
+SHIM
+
 mkdir -p "$work/shim-du"
 cat >"$work/shim-du/du" <<'SHIM'
 #!/bin/bash
@@ -167,7 +209,8 @@ fi
 exec $(command -v du) "\$@"
 SHIM
 
-chmod +x "$shim"/* "$work/shim-du/du" "$work/shim-du-late/du" "$work/shim-find/find"
+chmod +x "$shim"/* "$work/shim-du/du" "$work/shim-du-late/du" "$work/shim-find/find" \
+    "$work/shim-find-empty/find" "$work/shim-rm/rm"
 
 # A PATH holding everything the sweep needs EXCEPT docker, so the
 # docker-not-installed branch is exercised the way CI actually meets it (the
@@ -491,7 +534,11 @@ survives "S12 the oldest file in the tree survives because it is a corpus" \
     "$ns/fuzz-corpus-lua_parse-protected/cache.zip"
 deleted "S12 the rebuildable tree went instead" "$ns/target-check-protected/cache.zip"
 
-run_sweep s12b "$fx" CACHE_CAP_KIB=1
+# 30 KiB is above what the directories alone measure and far below the three
+# archives: the drain has to take all of them, corpus included, and can still
+# get under the cap. A cap no drain could ever reach is a permanent alarm now
+# (S27), which is correct but is not what this case is about.
+run_sweep s12b "$fx" CACHE_CAP_KIB=30
 assert_exit S12b_the_corpus_is_still_subject_to_the_cap 0 "$sweep_rc" "$sweep_log" \
     "cache: cap removed $ns/fuzz-corpus-lua_parse-protected/cache.zip"
 deleted "S12b under enough pressure the corpus goes too" \
@@ -682,7 +729,7 @@ run_sweep s25 "$fx" CACHE_CAP_KIB=1
 assert_exit S25_over_cap_with_no_candidates_refuses 2 "$sweep_rc" "$sweep_log" \
     "REFUSED: cache is" "over the 1KiB cap" "no '*.zip' archive matched" \
     "syslog: -p user.err -t runner-cache-sweep" \
-    "!cap summary: removed 0"
+    "cache: cap summary: removed 0"
 survives "S25 the archive it cannot drain is left alone" "$zst"
 check_true "S25 the size that triggered it is legible, not rounded to ~0 MiB" \
     grep -qE 'cache is [0-9]+ KiB, over the 1KiB cap' "$sweep_log"
@@ -702,6 +749,78 @@ assert_exit S26_over_cap_with_no_candidates_after_a_deletion_exits_3 3 "$sweep_r
     "!REFUSED"
 deleted "S26 the age pass's removal stands" "$zip"
 survives "S26 the archive the glob cannot see is untouched" "$zst"
+
+# --- S27: over the cap AFTER draining everything it could ------------------
+# The alarm is on the outcome, not on the empty-candidate case that happened to
+# be found first. One legacy `.zip` beside a `.zst` the glob cannot see: the
+# drain removes the zip, reports `removed 1`, and is still over the cap. That
+# used to exit 0.
+fx="$(mkfixture s27)"
+ns="$fx/cache/flying-dice/luabox"
+zst="$ns/cargo-home-protected/cache.zst"
+zip="$ns/target-check-protected/cache.zip"
+mkfile "$zst" 684
+mkfile "$zip" 8
+mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
+age_tree "$fx" 30
+run_sweep s27 "$fx" CACHE_CAP_KIB=650
+assert_exit S27_still_over_the_cap_after_the_drain_is_not_a_success 3 "$sweep_rc" "$sweep_log" \
+    "cache: cap removed $zip" \
+    "PARTIALLY SWEPT after 1 removal(s): cache is" \
+    "over the 650KiB cap, after draining 1 of 1 archive(s)" \
+    "syslog: -p user.err -t runner-cache-sweep"
+deleted "S27 it drained what it could" "$zip"
+survives "S27 and named the archive it cannot see" "$zst"
+
+# --- S28: a failed rm is reported, counted, and fatal ----------------------
+# `rm` failing wrote to stderr, which cron sends to /dev/null, and the run
+# exited 0 having removed nothing. The disk keeps filling and the log says the
+# sweep is healthy.
+fx="$(mkfixture s28)"
+ns="$fx/cache/flying-dice/luabox"
+ok_zip="$ns/target-check-protected/cache.zip"
+bad_zip="$ns/undeletable-key-protected/cache.zip"
+mkfile "$ok_zip"
+mkfile "$bad_zip"
+mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
+age_tree "$fx" 4320
+age_tree "$fx/builds" 30
+run_sweep s28 "$fx" PATH="$work/shim-rm:$shim:$PATH"
+assert_exit S28_a_failed_removal_is_reported_and_fatal 3 "$sweep_rc" "$sweep_log" \
+    "cache: FAILED to remove $bad_zip" \
+    "PARTIALLY SWEPT after 1 removal(s): 1 removal(s) failed" \
+    "net " \
+    "syslog: -p user.err -t runner-cache-sweep"
+deleted "S28 the archive it could remove is gone" "$ok_zip"
+survives "S28 the one it could not is still there" "$bad_zip"
+
+fx="$(mkfixture s28b)"
+bad_zip="$fx/cache/flying-dice/luabox/undeletable-key-protected/cache.zip"
+mkfile "$bad_zip"
+mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
+age_tree "$fx" 4320
+age_tree "$fx/builds" 30
+run_sweep s28b "$fx" PATH="$work/shim-rm:$shim:$PATH"
+assert_exit S28b_a_failed_removal_with_nothing_deleted_exits_2 2 "$sweep_rc" "$sweep_log" \
+    "cache: FAILED to remove $bad_zip" \
+    "REFUSED: 1 removal(s) failed" \
+    "!PARTIALLY SWEPT"
+survives "S28b nothing was deleted, so nothing is claimed to have been" "$bad_zip"
+
+# --- S29: the empty-directory pass obeys the same contract as every other --
+# It used to log at info and carry on, which is the one exception that made the
+# header's "refuses when du or find fails" untrue.
+fx="$(mkfixture s29)"
+zip="$fx/cache/flying-dice/luabox/target-check-protected/cache.zip"
+mkfile "$zip"
+mkdir -p "$fx/cache/flying-dice/luabox/stale-key-protected"
+mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
+age_tree "$fx" 4320
+run_sweep s29 "$fx" PATH="$work/shim-find-empty:$shim:$PATH"
+assert_exit S29_an_empty_directory_sweep_failure_is_fatal 3 "$sweep_rc" "$sweep_log" \
+    "cache: age removed $zip" \
+    "PARTIALLY SWEPT after 1 removal(s): empty-directory sweep failed under" \
+    "syslog: -p user.err -t runner-cache-sweep"
 
 echo
 echo "=== Part 2 — every cache key keeps a pull-push writer, per JOB ==="
@@ -726,7 +845,13 @@ echo "=== Part 2 — every cache key keeps a pull-push writer, per JOB ==="
 # Read straight from the YAML rather than from `glab ci config compile`: the
 # self-test runs in a build container with no glab, no token and no network,
 # and a committed snapshot of the compiled config would go stale silently —
-# the exact failure mode decisions/12 names. The cost is a parser, so it is
+# the exact failure mode decisions/12 names. It is bash rather than
+# `python3 -c 'import yaml'` for two reasons, both decided in review (round 3,
+# N-9): the rust:1.92-trixie image ships no python3, and adding an apt package
+# plus a YAML library to a self-test is a bigger surface than the parser; and
+# the refusal posture below is the contract, not a limitation of the parser —
+# a legal-but-unhandled shape is meant to go red with its name in the message
+# so the next person teaches the checker. The cost is a parser, so it is
 # written to REFUSE anything it cannot resolve — an unknown cache entry shape,
 # an unknown policy, a dangling or nested alias, an `extends` target that does
 # not exist, a variable it cannot expand, a matrix leg over more than one
@@ -1171,6 +1296,14 @@ cache_policy_report() { # cache_policy_report <yaml>
         echo "PARSE ERROR: a top-level 'default: cache:' applies to every job and is not resolved by this check"
         return 1
     fi
+    if [ -n "${BLK_SEEN[cache]:-}" ]; then
+        echo "PARSE ERROR: a top-level 'cache:' is the pipeline-wide default and applies to every job without its own; not resolved by this check"
+        return 1
+    fi
+    if [ -n "${BLK_SEEN[include]:-}" ]; then
+        echo "PARSE ERROR: a top-level 'include:' can add jobs and caches this check cannot see in one file"
+        return 1
+    fi
 
     local job entries rawkey policy key leg mvar mval leg_desc k jobs=0
     local -a legs=()
@@ -1503,6 +1636,34 @@ YML
 run_policy_check P16 "$fixtures/templates-only.yml"
 assert_exit P16_a_file_with_no_jobs_refuses_to_pass 1 "$sweep_rc" "$sweep_log" \
     "ERROR: no jobs found"
+
+cat >"$fixtures/top-level-cache.yml" <<'YML'
+cache:
+  - key: everything
+    paths:
+      - target
+
+job-a:
+  script:
+    - echo a
+YML
+run_policy_check P17 "$fixtures/top-level-cache.yml"
+assert_exit P17_a_pipeline_wide_cache_refuses 1 "$sweep_rc" "$sweep_log" \
+    "top-level 'cache:' is the pipeline-wide default" "!VIOLATION"
+
+cat >"$fixtures/include.yml" <<'YML'
+include:
+  - local: /ci/more-jobs.yml
+
+job-a:
+  cache:
+    - key: k
+      paths:
+        - target
+YML
+run_policy_check P18 "$fixtures/include.yml"
+assert_exit P18_an_include_refuses 1 "$sweep_rc" "$sweep_log" \
+    "top-level 'include:' can add jobs and caches this check cannot see"
 
 report_status=0
 selftest_report "runner-cache-sweep-selftest" || report_status=$?
