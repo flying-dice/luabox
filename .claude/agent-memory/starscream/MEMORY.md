@@ -1,0 +1,3 @@
+- [Tracker of record](project_tracker_of_record.md) — GitLab origin = live issues + CI; GitHub = mirror + release pipeline; backlog doc was stale on takeover
+- [User working style](user_working_style.md) — Jonathan runs unattended sessions; meta config straight to main; exit contract = STATUS.md + issue sync + push
+- [Bot briefs](feedback_bot_briefs.md) — bots may push from their own `starscream/issue-N` branches; verify by `glab mr list`, not assigned worktrees
