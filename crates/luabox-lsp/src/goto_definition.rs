@@ -147,25 +147,23 @@ fn member_definition(
                 || !shape.indexers.is_empty()
                 || shape.array.is_some()
         })
-        && let Some(found) = sema::locate_field(
-            analysis,
-            &sema.path,
-            &class,
-            member.text(),
-            ambient.ambient_paths(),
-            ambient.sema_cache(),
-            ambient.search_order_cache(),
-        )
+        && let Some(found) = ambient.locate_field(analysis, &sema.path, &class, member.text())
     {
         let span = found.span;
         let range = TextRange::new(
             TextSize::new(u32::try_from(span.start).ok()?),
             TextSize::new(u32::try_from(span.end).ok()?),
         );
+        // The target file's own `FileSema` — its `LineIndex` is what turns
+        // the byte span into a position, so it has to be the file the span
+        // came from. A different path this `Analysis` cannot build a sema
+        // for has no line index to offer, and falling back to the *cursor's*
+        // would publish this file's line/character for the other file's URI
+        // (round 8 clean-code audit, coupling finding 2): decline instead.
         let field_sema = if found.path == sema.path {
             None
         } else {
-            FileSema::new(analysis, &found.path)
+            Some(FileSema::new(analysis, &found.path)?)
         };
         let target = field_sema.as_ref().unwrap_or(sema);
         if let Some(redirect) = source_redirect(target, range) {
@@ -341,8 +339,30 @@ mod tests {
     /// file, with `exports`/`ambient` built exactly as the server builds
     /// them (#54, #56).
     fn at_files(files: &[(&str, &str)], needle: &str, nth: usize) -> Option<Location> {
-        let src = files[0].1;
-        let (analysis, path) = analyze(files);
+        at_files_from(files, files[0].0, needle, nth)
+    }
+
+    /// Goto-definition at the `nth` occurrence of `needle` in the first file.
+    fn at(src: &str, needle: &str, nth: usize) -> Option<Location> {
+        at_files(&[("main.lua", src)], needle, nth)
+    }
+
+    /// [`at_files`] with the cursor in a named file rather than the first one
+    /// loaded (#70) — see `hover.rs`'s `at_in` for why load order and the
+    /// cursor have to be separable to reach that shape at all.
+    fn at_files_from(
+        files: &[(&str, &str)],
+        cursor: &str,
+        needle: &str,
+        nth: usize,
+    ) -> Option<Location> {
+        let src = files
+            .iter()
+            .find(|(rel, _)| *rel == cursor)
+            .expect("the cursor file must be one of `files`")
+            .1;
+        let (analysis, _) = analyze(files);
+        let path = root().join(cursor);
         let sema = FileSema::new(&analysis, &path).expect("sema");
         let exports =
             RequireExports::resolve(&analysis, &path, &luabox_types::RockSurfaces::default());
@@ -359,9 +379,31 @@ mod tests {
         )
     }
 
-    /// Goto-definition at the `nth` occurrence of `needle` in the first file.
-    fn at(src: &str, needle: &str, nth: usize) -> Option<Location> {
-        at_files(&[("main.lua", src)], needle, nth)
+    /// #70, the goto-definition half of `hover.rs`'s
+    /// `a_cross_file_split_fields_type_and_description_name_one_declaration`:
+    /// the jump must land on the declaration the merge resolved the type
+    /// from, in the other file, not on the cursor's own losing one — three
+    /// surfaces, one declaration.
+    #[test]
+    fn goto_definition_follows_a_cross_file_splits_merge_winner() {
+        let location = at_files_from(
+            &[
+                ("a.lua", "---@class Split\n---@field f string from a\n"),
+                (
+                    "main.lua",
+                    "---@class Split\n---@field f number from main\n\n---@type Split\nlocal s = nil\nprint(s.f)\n",
+                ),
+            ],
+            "main.lua",
+            "f)",
+            0,
+        )
+        .expect("definition");
+        assert!(
+            location.uri.to_string().ends_with("a.lua"),
+            "must land in the file the merge took `f` from: {location:?}"
+        );
+        assert_eq!(start_of(&location), (1, 3), "a.lua's own `---@field f` tag");
     }
 
     /// The `(line, character)` start of a location.

@@ -182,17 +182,10 @@ fn member_hover(
                     OwnParamErasure::at_reference(&ty, &class, analysis, &sema.path, ambient);
                 let rendered = erasure.render(&field.ty);
                 let code = format!("(field) {class}.{}{q}: {rendered}", member.text());
-                let docs = sema::locate_field(
-                    analysis,
-                    &sema.path,
-                    &class,
-                    member.text(),
-                    ambient.ambient_paths(),
-                    ambient.sema_cache(),
-                    ambient.search_order_cache(),
-                )
-                .and_then(|found| found.desc)
-                .unwrap_or_default();
+                let docs = ambient
+                    .locate_field(analysis, &sema.path, &class, member.text())
+                    .and_then(|found| found.desc)
+                    .unwrap_or_default();
                 return Some(reply(&code, &docs, &[], member.text_range(), sema));
             }
             // A dynamic-access class (#53): an indexer or array part makes
@@ -355,8 +348,27 @@ mod tests {
         nth: usize,
         rocks: &RockSurfaces,
     ) -> Option<String> {
-        let src = files[0].1;
-        let (analysis, path) = analyze_files(files);
+        at_in(files, files[0].0, needle, nth, rocks)
+    }
+
+    /// [`at_with`] with the cursor in a named file rather than the first one
+    /// loaded. Load order is what `merge_file_types` resolves a same-name
+    /// collision by, so a test that needs the cursor's file to *lose* that
+    /// collision (#70) has to name the two separately.
+    fn at_in(
+        files: &[(&str, &str)],
+        cursor: &str,
+        needle: &str,
+        nth: usize,
+        rocks: &RockSurfaces,
+    ) -> Option<String> {
+        let src = files
+            .iter()
+            .find(|(rel, _)| *rel == cursor)
+            .expect("the cursor file must be one of `files`")
+            .1;
+        let (analysis, _) = analyze_files(files);
+        let path = root().join(cursor);
         let sema = FileSema::new(&analysis, &path).expect("sema");
         let exports = RequireExports::resolve(&analysis, &path, rocks);
         // The merged workspace layer, exactly as the server builds it (#56).
@@ -378,6 +390,52 @@ mod tests {
     /// [`at_with`] across `files` and no rock tree.
     fn at_files(files: &[(&str, &str)], needle: &str, nth: usize) -> Option<String> {
         at_with(files, needle, nth, &RockSurfaces::default())
+    }
+
+    /// [`at_files`] with the cursor in a file that is **not** the first one
+    /// loaded (#70) — see [`at_in`].
+    fn at_files_from(
+        files: &[(&str, &str)],
+        cursor: &str,
+        needle: &str,
+        nth: usize,
+    ) -> Option<String> {
+        at_in(files, cursor, needle, nth, &RockSurfaces::default())
+    }
+
+    /// #70: one class, its `---@field`s split across two files, cursor in the
+    /// file that **lost** the merge. The type comes from `collect_class` and
+    /// reads `string`; the description used to come from a separate walk that
+    /// checks the cursor's own file first and read `from main` — one tooltip
+    /// quoting two different declarations. Both now come from the same
+    /// resolved answer.
+    #[test]
+    fn a_cross_file_split_fields_type_and_description_name_one_declaration() {
+        let hover = at_files_from(
+            &[
+                ("a.lua", "---@class Split\n---@field f string from a\n"),
+                (
+                    "main.lua",
+                    "---@class Split\n---@field f number from main\n\n---@type Split\nlocal s = nil\nprint(s.f)\n",
+                ),
+            ],
+            "main.lua",
+            "f)",
+            0,
+        )
+        .expect("hover");
+        assert!(
+            hover.contains("(field) Split.f: string"),
+            "the type is the merge's: {hover}"
+        );
+        assert!(
+            hover.contains("from a"),
+            "…and so is the description: {hover}"
+        );
+        assert!(
+            !hover.contains("from main"),
+            "the losing declaration must not be quoted: {hover}"
+        );
     }
 
     /// [`at_files`] over a workspace with a **dependency** definition package
