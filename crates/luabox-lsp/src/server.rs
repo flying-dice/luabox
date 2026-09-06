@@ -5076,6 +5076,149 @@ return use
             "{error}"
         );
     }
+
+    // === didChange for a document the server has never seen ===============
+    //
+    // #78. `didChange` carries *edits*, not state: a ranged change is only
+    // meaningful against the text the server already holds. If it holds
+    // none — no `didOpen`, and `bootstrap` never indexed the path — then
+    // splicing that range into the empty string invents a document out of a
+    // fragment, stores it as the overlay, and publishes diagnostics for it.
+    // The client is never told; it just sees nonsense in the problems pane
+    // for a file it believes is fine.
+
+    /// The one edit shape that carries no base text of its own is dropped,
+    /// and the client is told why — no overlay written, no diagnostics for
+    /// the fragment.
+    #[test]
+    fn a_ranged_did_change_for_an_unopened_document_is_logged_and_dropped() {
+        let (dir, mut server, client) = test_server();
+        // Never written to disk, never opened, never indexed: the host has
+        // no text for it, which is precisely the state the guard is about.
+        let path = dir.path().join("never_opened.lua");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": uri.to_string(), "version": 2 },
+                    "contentChanges": [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 0 },
+                        },
+                        "text": "local x = ",
+                    }],
+                }),
+            })
+            .expect("a didChange for an unknown document is not fatal");
+
+        let messages = drain(&client);
+        assert!(
+            published_diagnostics(&messages, &uri).is_none(),
+            "an edit with no base text must not publish diagnostics for the \
+             fragment it would have spliced: {messages:?}"
+        );
+        assert!(
+            server.host.snapshot().file_text(&path).is_none(),
+            "and it must not invent the document in the host either"
+        );
+        let logged = log_messages(&messages);
+        assert!(
+            logged
+                .iter()
+                .any(|m| m.contains("textDocument/didChange")
+                    && m.contains("never_opened.lua")),
+            "{logged:?}"
+        );
+    }
+
+    /// The other shape carries the whole document, so it needs no base text
+    /// — a client that syncs in full mode, or replaces the buffer wholesale,
+    /// still works on a document the server has not seen. The guard is about
+    /// missing base text, not about the notification's provenance.
+    #[test]
+    fn a_full_text_did_change_for_an_unopened_document_is_applied() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("never_opened.lua");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": uri.to_string(), "version": 2 },
+                    "contentChanges": [{ "text": "local x = 1\n" }],
+                }),
+            })
+            .expect("didChange");
+
+        let messages = drain(&client);
+        assert!(
+            published_diagnostics(&messages, &uri).is_some(),
+            "a full-replace change is self-contained: {messages:?}"
+        );
+        assert_eq!(
+            server.host.snapshot().file_text(&path).as_deref(),
+            Some("local x = 1\n"),
+        );
+    }
+
+    /// A ranged edit that *follows* a full replace in the same batch has a
+    /// base text — the one the replace just established — so the batch is
+    /// applied whole. The guard keys on the first change, not on "any
+    /// change has a range".
+    #[test]
+    fn a_full_replace_then_a_ranged_edit_for_an_unopened_document_is_applied() {
+        let (dir, mut server, _client) = test_server();
+        let path = dir.path().join("never_opened.lua");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": uri.to_string(), "version": 2 },
+                    "contentChanges": [
+                        { "text": "local x = 1\n" },
+                        {
+                            "range": {
+                                "start": { "line": 0, "character": 10 },
+                                "end": { "line": 0, "character": 11 },
+                            },
+                            "text": "2",
+                        },
+                    ],
+                }),
+            })
+            .expect("didChange");
+
+        assert_eq!(
+            server.host.snapshot().file_text(&path).as_deref(),
+            Some("local x = 2\n"),
+        );
+    }
+
+    /// #78: a file the walk found but `bootstrap` cannot read leaves the
+    /// index quietly incomplete — every cross-file answer that file would
+    /// have contributed to is silently wrong. `collect_lua_files` already
+    /// reports its own failure; this is the per-file half of the same rule.
+    #[test]
+    #[cfg(unix)]
+    fn a_file_bootstrap_cannot_read_is_logged() {
+        let (dir, mut server, client) = test_server();
+        // A dangling symlink: the walk sees a `.lua` entry (it is not a
+        // directory), `read_to_string` then fails on the missing target.
+        std::os::unix::fs::symlink("nowhere.lua", dir.path().join("broken.lua"))
+            .expect("symlink");
+        server.bootstrap();
+
+        let logged = log_messages(&drain(&client));
+        assert!(
+            logged
+                .iter()
+                .any(|m| m.contains("broken.lua") && m.contains("index")),
+            "{logged:?}"
+        );
+    }
     /// The lint quick-fix *pairing*, not just its precondition.
     ///
     /// `code_actions` matches a fix back to the diagnostic that produced it
