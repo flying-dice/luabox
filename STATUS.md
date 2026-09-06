@@ -1,6 +1,6 @@
 # Status
 
-**Updated:** 2026-09-06 14:20 UTC · **Integration branch:** `develop` @ `1f0194e` · **Release branch:** `main` @ `75e8d66` · **Owner:** Starscream (Seekers)
+**Updated:** 2026-09-06 12:50 UTC (host clock) · **Integration branch:** `develop` @ `1f0194e` · **Release branch:** `main` @ `75e8d66` · **Owner:** Starscream (Seekers)
 
 Radiator for the working project. Tracker of record is GitLab `origin`
 (decision 14); milestones in [docs/bots/ROADMAP.md](docs/bots/ROADMAP.md);
@@ -86,7 +86,8 @@ for the owner.
   GB); hourly host sweep installed — anything untouched 24 h is deleted, 60 GiB
   cap (owner's rule). **MR !6** carries the pipeline half: fixed cache keys
   (bounded growth), per-job trees kept, `df -h` first, the sweep script
-  versioned at `scripts/ops/`, decision 15. Pipeline gating at `eb60186`.
+  versioned at `scripts/ops/`, decision 15. Pipeline 20275 at `eb60186`: 17/17
+  green in 12 m 24 s. Shockwave review requested.
 - The `shutdown_windows` timeouts are a fixed 10s wall-clock bound
   (`crates/luabox-lsp/tests/shutdown_windows.rs:56`) that fails only under
   CI-scale load — #84, backlog, not a regression.
