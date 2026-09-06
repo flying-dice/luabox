@@ -5,8 +5,8 @@ priority: high
 agent: starscream
 live: true
 status: MRs !2/!4/!5 review-ready; all pipelines blocked on runner disk (#85)
-progress: 85
-updatedAt: 2026-09-06T11:10:00.000Z
+progress: 88
+updatedAt: 2026-09-06T11:40:00.000Z
 ---
 # Seekers adoption sprint — sign the repo off as run to standard
 
@@ -21,7 +21,7 @@ Decision 14 records the takeover terms; `docs/bots/ROADMAP.md` M0 lists the exit
 - [x] Divergence found: `develop` carries PR #61 + GitLab CI port, never promoted to `main`
 - [x] `main` merged into `develop` (branch `starscream/integrate-develop`), gates green (3032/0/7, 924+235), pushed — MR !5
 - [ ] `develop → main` promotion MR open, pipeline green, Shockwave review posted
-- [ ] `STATUS.md`, roadmap, decision 14, backlog/dev docs corrected
+- [x] `STATUS.md`, roadmap, decision 14, backlog/dev docs corrected — shipped in MR !5
 - [x] Soundwave styleguide/architecture audit → issues #75–#81 filed (crate graph clean; 12 findings, 7 actionable)
 - [ ] #69 malformed `---@class` header diagnostic — MR !2 (LB0320/LB0321), Shockwave's round closed at `e02f7c6`, re-review requested
 - [x] #70 `collect_class` per-key winner accessor for the LSP — MR !1 approved by Shockwave, merged to develop

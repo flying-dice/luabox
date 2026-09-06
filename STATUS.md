@@ -1,6 +1,6 @@
 # Status
 
-**Updated:** 2026-09-06 11:10 UTC · **Branch:** `starscream/integrate-develop` · **Base:** `origin/develop` @ `1f0194e` · **Owner:** Starscream (Seekers)
+**Updated:** 2026-09-06 11:40 UTC · **Integration branch:** `develop` @ `1f0194e` · **Release branch:** `main` @ `75e8d66` · **Owner:** Starscream (Seekers)
 
 Radiator for the working project. Tracker of record is GitLab `origin`
 (decision 14); milestones in [docs/bots/ROADMAP.md](docs/bots/ROADMAP.md);
@@ -21,12 +21,14 @@ clippy clean; the four `luabox-lsp` shutdown-window timeouts seen under load
 
 ## Now
 
-Promotion of the reconciled tree. `starscream/integrate-develop` = `origin/develop`
-+ `main`'s three commits (skill set, Seekers roster, the `$CARGO_HOME/bin` CI fix)
-+ this sprint's planning artefacts. The `.gitlab-ci.yml` conflict is resolved in
-favour of `develop`'s 970-line pipeline of record, which already carries the same
-cold-cache fix at `:277`. Stopping point: gates re-run on the merged tree, then an
-MR into `develop`, then a `develop → main` promotion MR for the owner.
+Promotion of the reconciled tree, in review as **!5**. The branch is
+`origin/develop` + `main`'s three commits (skill set, Seekers roster, the
+`$CARGO_HOME/bin` CI fix) + this sprint's planning artefacts. The
+`.gitlab-ci.yml` conflict was resolved in favour of `develop`'s pipeline of
+record, which already carries the same cold-cache fix at `:277`. Shockwave's
+first round is answered; the pipeline is red on the runner's disk (#85), not on
+the diff. Next stopping point after !5 merges: a `develop → main` promotion MR
+for the owner.
 
 ## Next
 
@@ -85,10 +87,15 @@ MR into `develop`, then a `develop → main` promotion MR for the owner.
 - **Owner-gated, not team-blocked:** #27 (tag `v0.2.0`), #28 (approval-reset
   project setting), #34 (marketplace credentials). Nothing for the team to do.
 
-## Working state
+## In flight
 
-- Worktrees: `starscream/integrate-develop` (this), `skywarp/issue-78`,
-  `starscream/issue-69` (MR !2), `skywarp/issue-81` (empty, work landed via !3).
-- Uncommitted here: `STATUS.md`, `docs/bots/ROADMAP.md`,
-  `decisions/14-…`, `boards/improvement-sprint/35-…`, and the corrections to
-  `docs/04-project/01-backlog.md` + `docs/01-getting-started/02-development.md`.
+Branch state only — this file is the standing radiator and is not pinned to any
+feature branch.
+
+- **!5** `starscream/integrate-develop → develop` — the reconciliation and this
+  sprint's planning artefacts. Shockwave review round 1 answered; pipeline waits
+  on #85.
+- **!2** `starscream/issue-69 → develop` (LB0320/LB0321) — Shockwave's round
+  closed at `e02f7c6`, re-review requested.
+- **!4** `skywarp/issue-78 → develop` — threads addressed at `72e081a`.
+- Merged this sprint: **!1** (#70), **!3** (#81).
