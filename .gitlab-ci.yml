@@ -396,6 +396,21 @@ workflow:
 # stage: selftest — the gates on the gates (decisions/12)
 # ===========================================================================
 
+# No ci.yml counterpart — new with the Seekers adoption (decisions/14 clause 5).
+# The Seekers' instruction set is checked in once per harness root, because
+# each harness reads only its own. Nothing in the repo failed when the copies
+# drifted, so an edit that tightened a gate for Claude-run agents left
+# Codex-run agents on the old rule, silently. This job is the missing signal;
+# the script header states the three rules it enforces. Seconds, no cargo, no
+# packages beyond the base image.
+harness-skill-parity:
+  extends: [.linux, .rules-ci]
+  stage: selftest
+  timeout: 5m
+  needs: []
+  script:
+    - bash scripts/tests/harness-skill-parity.sh
+
 # ci.yml: perf-gate-selftest. Part 1 covers scripts/perf-gate-lib.sh's pure
 # judgement functions; Part 2 (M28) invokes the REAL scripts/perf-gate.sh a
 # dozen times against stub binaries — generated corpora plus ~28s of

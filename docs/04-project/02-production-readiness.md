@@ -184,8 +184,8 @@ What A explicitly keeps, because the core needs it:
 # 0.2.0 sign-off (2026-07-26)
 
 The accepted scope cut is executed, verified, and enforced. Tracked as
-GitHub issues #10–#13; latent bugs surfaced by the coverage waves filed
-as #14 and #15.
+issues #10–#13 (GitLab `origin`; decision 14); latent bugs surfaced by
+the coverage waves filed as #14 and #15.
 
 ## Final state
 

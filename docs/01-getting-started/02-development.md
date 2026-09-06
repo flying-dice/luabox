@@ -1,8 +1,11 @@
 # Development
 
 Everything is gated in CI; this page tells you how to run the same gates
-locally. [.github/workflows/ci.yml](../../.github/workflows/ci.yml) is
-authoritative for the exact floors and invocations.
+locally. [.gitlab-ci.yml](../../.gitlab-ci.yml) on `origin` is the pipeline
+of record for the exact floors and invocations (decision 14);
+[.github/workflows/ci.yml](../../.github/workflows/ci.yml) on the GitHub
+mirror keeps the same floors and adds the macOS/Windows matrix the GitLab
+runners cannot cover yet.
 
 ## Toolchain
 

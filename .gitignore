@@ -25,3 +25,11 @@ examples/**/doc/
 /mutants-out/
 /lcov-unit.info
 /lcov-e2e.info
+
+# Harness-generated bot manifests. Written by the local bots tooling with
+# absolute paths rooted at the generating machine's checkout, refreshed with a
+# new `updatedAt` on every regeneration, and read by nothing in this repo.
+# Each harness regenerates them locally; committing one machine's copy only
+# ever produced paths that resolve nowhere else.
+/.claude/bots-manifest.json
+/.codex/bots-manifest.json
