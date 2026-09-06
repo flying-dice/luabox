@@ -2526,13 +2526,21 @@ impl Server {
     /// be dropped.
     ///
     /// `didChange` carries *edits*, not state (#78). A ranged change means
-    /// nothing without the text its range indexes into, and the server may
-    /// genuinely hold none: no `didOpen` for this path, and `bootstrap` never
-    /// saw it either (it is outside the root, or the walk skipped it). This
-    /// used to read `unwrap_or_default()`, so those edits spliced into `""` —
-    /// the resulting fragment became the overlay and got diagnostics
-    /// published for it, inventing a document the client never sent and
-    /// painting its problems pane with errors for code that does not exist.
+    /// nothing without the buffer its range indexes into, and only an open
+    /// document has one: the client's ranges address the text it last synced,
+    /// which is the `didOpen` text plus every `didChange` since.
+    ///
+    /// "Does the host hold text?" is the wrong question to gate on.
+    /// `file_text` answers "overlay when set, disk otherwise", and
+    /// `bootstrap` indexes every `.lua` file under the root — so it says
+    /// `Some` for any indexed file, whose *disk* text no client ever agreed
+    /// to. Splicing a range into that, or into `""` as the
+    /// `unwrap_or_default()` this replaced did, invents a document: the
+    /// result becomes the overlay and gets diagnostics published for it,
+    /// painting the problems pane of a file the client never opened with
+    /// errors for code that exists in no buffer. For an indexed file it also
+    /// outlives the edit — the overlay shadows disk, and with no `didOpen`
+    /// there is no `didClose` to drop it.
     ///
     /// A batch whose *first* change is a full replace (`range: None`) needs no
     /// base text: it supplies the whole document, and any later ranged edit in
@@ -2543,7 +2551,9 @@ impl Server {
         path: &Path,
         changes: &[TextDocumentContentChangeEvent],
     ) -> Option<String> {
-        if let Some(text) = self.host.snapshot().file_text(path) {
+        if self.open_docs.contains_key(path)
+            && let Some(text) = self.host.snapshot().file_text(path)
+        {
             return Some(text);
         }
         if changes.first().is_some_and(|change| change.range.is_none()) {
@@ -2552,9 +2562,9 @@ impl Server {
         self.log_message(
             MessageType::WARNING,
             format!(
-                "ignoring `{}` for {}: the server holds no text for it (no \
-                 `textDocument/didOpen`, and it is not in the workspace \
-                 index), so an incremental edit has nothing to apply to",
+                "ignoring `{}` for {}: the server holds no buffer for it (no \
+                 `textDocument/didOpen`), so an incremental edit has nothing \
+                 to apply to",
                 DidChangeTextDocument::METHOD,
                 path.display()
             ),
@@ -2863,7 +2873,7 @@ mod tests {
         DidOpenTextDocument, Notification as _,
     };
     use lsp_types::request::{HoverRequest, Request as _};
-    use lsp_types::{Position, Range, TextDocumentContentChangeEvent, TraceValue};
+    use lsp_types::{MessageType, Position, Range, TextDocumentContentChangeEvent, TraceValue};
     use luabox_lint::LintConfig;
     use luabox_manifest::model::{Lint, LintLevel, LintTier, Manifest};
     use serde_json::{Value, json};
@@ -5048,15 +5058,33 @@ return use
 
     /// The `window/logMessage` payloads the server has sent.
     fn log_messages(messages: &[Message]) -> Vec<String> {
+        logged(messages).into_iter().map(|(_, m)| m).collect()
+    }
+
+    /// Log-pane messages at one severity. `log_messages` erases the level,
+    /// so a test that cares which pane the client paints — WARNING is a
+    /// visible complaint, LOG is not — has to key on it.
+    fn log_messages_at(messages: &[Message], typ: MessageType) -> Vec<String> {
+        logged(messages)
+            .into_iter()
+            .filter(|(t, _)| *t == typ)
+            .map(|(_, m)| m)
+            .collect()
+    }
+
+    /// Every `window/logMessage` the server has sent, severity kept.
+    fn logged(messages: &[Message]) -> Vec<(MessageType, String)> {
         messages
             .iter()
             .filter_map(|m| match m {
-                Message::Notification(not) if not.method == super::LogMessage::METHOD => Some(
+                Message::Notification(not) if not.method == super::LogMessage::METHOD => Some((
+                    serde_json::from_value(not.params["type"].clone())
+                        .expect("`window/logMessage` carries a `type`"),
                     not.params["message"]
                         .as_str()
                         .unwrap_or_default()
                         .to_owned(),
-                ),
+                )),
                 _ => None,
             })
             .collect()
@@ -5135,15 +5163,16 @@ return use
         );
     }
 
-    // === didChange for a document the server has never seen ===============
+    // === didChange for a document the client never opened ================
     //
     // #78. `didChange` carries *edits*, not state: a ranged change is only
-    // meaningful against the text the server already holds. If it holds
-    // none — no `didOpen`, and `bootstrap` never indexed the path — then
-    // splicing that range into the empty string invents a document out of a
-    // fragment, stores it as the overlay, and publishes diagnostics for it.
-    // The client is never told; it just sees nonsense in the problems pane
-    // for a file it believes is fine.
+    // meaningful against the buffer it indexes into, and only an open
+    // document has one. Without a `didOpen` there is nothing to splice into
+    // but the empty string, or — for a file `bootstrap` indexed — a disk
+    // text the client never agreed to. Either way the result is a document
+    // invented out of a fragment, stored as the overlay and published as
+    // diagnostics. The client is never told; it just sees nonsense in the
+    // problems pane for a file it believes is fine.
 
     /// The one edit shape that carries no base text of its own is dropped,
     /// and the client is told why — no overlay written, no diagnostics for
@@ -5254,6 +5283,58 @@ return use
         );
     }
 
+    /// The guard's question is "has the client opened this?", not "does the
+    /// host hold text?". `bootstrap` indexes every `.lua` file under the
+    /// root, so `file_text` answers `Some(disk text)` for all of them — an
+    /// indexed file reaches #78 by the same route (a `didChange` with no
+    /// `didOpen`) and stays there: the invented overlay shadows disk, and
+    /// with no `didOpen` there is no `didClose` to drop it, so the errors
+    /// outlive the session's every attempt to correct them.
+    #[test]
+    fn a_ranged_did_change_for_an_indexed_but_unopened_document_is_dropped() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("indexed.lua");
+        fs::write(&path, "local x = 1\n").expect("write");
+        server.bootstrap();
+        // The index pass publishes for what it read; only what the
+        // `didChange` below produces is under test.
+        drain(&client);
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": uri.to_string(), "version": 2 },
+                    "contentChanges": [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 0 },
+                        },
+                        "text": "((( ",
+                    }],
+                }),
+            })
+            .expect("a didChange for a document that was never opened is not fatal");
+
+        let messages = drain(&client);
+        assert!(
+            published_diagnostics(&messages, &uri).is_none(),
+            "the index is not a buffer the client edits against: {messages:?}"
+        );
+        assert_eq!(
+            server.host.snapshot().file_text(&path).as_deref(),
+            Some("local x = 1\n"),
+            "the indexed text must stay exactly as the walk read it"
+        );
+        let logged = log_messages_at(&messages, MessageType::WARNING);
+        assert!(
+            logged
+                .iter()
+                .any(|m| m.contains("textDocument/didChange") && m.contains("indexed.lua")),
+            "{logged:?}"
+        );
+    }
+
     /// #78: a file the walk found but `bootstrap` cannot read leaves the
     /// index quietly incomplete — every cross-file answer that file would
     /// have contributed to is silently wrong. `collect_lua_files` already
@@ -5267,14 +5348,23 @@ return use
         std::os::unix::fs::symlink("nowhere.lua", dir.path().join("broken.lua")).expect("symlink");
         server.bootstrap();
 
-        let logged = log_messages(&drain(&client));
+        // The same read `bootstrap` just failed, so the assertion pins the
+        // OS error itself rather than a paraphrase of it: drop `{err}` from
+        // the format string and this test goes red.
+        let os_error = fs::read_to_string(dir.path().join("broken.lua"))
+            .expect_err("the symlink target does not exist")
+            .to_string();
+        // At WARNING, not LOG: a hole in the index makes later cross-file
+        // answers wrong, which is a complaint, not a trace line.
+        let logged = log_messages_at(&drain(&client), MessageType::WARNING);
         assert!(
             logged
                 .iter()
-                .any(|m| m.contains("broken.lua") && m.contains("index")),
-            "{logged:?}"
+                .any(|m| m.contains("broken.lua") && m.contains(&os_error)),
+            "{logged:?} (expected the path and `{os_error}`)"
         );
     }
+
     /// The lint quick-fix *pairing*, not just its precondition.
     ///
     /// `code_actions` matches a fix back to the diagnostic that produced it
