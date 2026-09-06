@@ -131,11 +131,19 @@ not bound — a hashed key is unbounded whether there are twelve of them or one.
      apart. Under a 24 h rule every fuzz run would start from an empty corpus,
      which is the one cache in this file whose loss is not merely a slower
      job. The cap still applies to it, last, after every rebuildable archive.
-   - **The sweep refuses rather than reports zero.** A missing bind mount, a
-     failed `du`, or a `/builds` that is not `<token>/<slot>/<ns>/<project>`
-     all used to exit 0 with a healthy-looking syslog line; the depth-2
-     pre-bind layout in particular was never swept and never reported. All
-     three now exit 2 with `logger -p user.err` and delete nothing. It also
+   - **The sweep refuses rather than reports zero, and its exit code says
+     whether it had already deleted anything.** A missing bind mount, a failed
+     `du`, a `/builds` that is not `<token>/<slot>/<ns>/<project>`, or a tree
+     over the cap with nothing matching the archive glob it drains all used to
+     exit 0 with a healthy-looking syslog line; the depth-2 pre-bind layout was
+     never swept and never reported, and a renamed archive (`cache.zst` after a
+     runner upgrade) reproduced this incident's whole signature — a green run
+     over a full disk. All of them now log at `user.err` and exit **2 when
+     nothing had been deleted yet**, so the trees are exactly as the run found
+     them, or **3 when something had**, naming the count. That distinction is
+     not decoration: "refused, nothing deleted" sends an operator to the wrong
+     place when a `du` fails after the age pass has already removed archives.
+     It also
      takes a lock, skips concurrency slots with a running job container, and
      re-checks both freshness and slot occupancy immediately before each
      `rm -rf` — it races a live runner, and a review reproduced it deleting a
@@ -144,13 +152,20 @@ not bound — a hashed key is unbounded whether there are twelve of them or one.
      probe could see: the runner marks the slot busy for the whole job, and a
      probe that cannot answer counts as busy.
 
-5. **Every cache key keeps at least one `pull-push` writer.** The sweep evicts
-   on mtime and the runner touches a local archive only when a job *writes*
-   it, so a key every job takes `policy: pull` ages out of `/cache` while jobs
-   are still reading it — arriving as an unexplained cold rebuild rather than
-   as an error. This is the pipeline-side half of the eviction contract, and
+5. **Every cache key keeps at least one `pull-push` writer, counted per
+   EXPANDED key.** The sweep evicts on mtime and the runner touches a local
+   archive only when a job *writes* it, so a key every job takes `policy: pull`
+   ages out of `/cache` while jobs are still reading it — arriving as an
+   unexplained cold rebuild rather than as an error. This is the pipeline-side
+   half of the eviction contract, and
    `scripts/tests/runner-cache-sweep-selftest.sh` asserts it against
-   `.gitlab-ci.yml` on every merge request.
+   `.gitlab-ci.yml` on every merge request. It expands the keys per job first
+   (`extends` chains, `variables:`, `parallel: matrix:` legs, GitLab's
+   `CI_JOB_NAME_SLUG` rule), because `target-$CI_JOB_NAME_SLUG` is one string
+   in the file and nine archives on disk: aggregating on the string let a
+   single pull-push job vouch for all nine, and a review demonstrated
+   `examples` going read-only with the check still green. Anything it cannot
+   expand is a refusal, not a pass.
 
 6. **`df -h "$CI_PROJECT_DIR"` is the first line of every rust job's script
    and of `fuzz`, and it covers the compile phase only.** GitLab runs it at

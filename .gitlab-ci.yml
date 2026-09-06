@@ -107,10 +107,15 @@
 #     are deleted, with `fuzz-corpus-*` exempt from that rule (accumulated
 #     state, not a rebuildable tree — see the fuzz entry below); a 200 GiB cap
 #     on `/cache` is the backstop, oldest first, corpora drained last. It takes
-#     a lock, skips any concurrency slot with a job container running, and
-#     REFUSES (exit 2, syslog `user.err`, nothing deleted) if a bind mount is
-#     missing, if `du` fails or if `/builds` is not the layout it expects —
-#     the old version read all three as a clean sweep. Source:
+#     a lock, skips any concurrency slot with a job container running (re-read
+#     per checkout, immediately before each `rm -rf`), and REFUSES with
+#     `logger -p user.err` if a bind mount is missing, if `du` or `find` fails,
+#     if `/builds` is not the layout it expects, or if the tree is over the cap
+#     and nothing matched the archive glob it drains — the old version read all
+#     of those as a clean sweep. Exit 2 means it stopped before deleting
+#     anything; exit 3 means it had already deleted something and says how
+#     much, because "nothing was deleted" is the one thing an operator must not
+#     be told wrongly. Source:
 #     scripts/ops/runner-cache-sweep.sh + docker-runner-cache-sweep.cron,
 #     installed at /boot/config/scripts/ and /boot/config/plugins/dynamix/,
 #     pinned by scripts/tests/runner-cache-sweep-selftest.sh in the
@@ -142,8 +147,12 @@
 # and the symptom is a silent cold rebuild, not an error. `cargo-home` is
 # `pull` in four jobs and `pull-push` in `.rust` for exactly that reason.
 # Turning the last writer of any key into a reader is a change to make on
-# purpose: scripts/tests/runner-cache-sweep-selftest.sh reads this file and
-# fails if any key loses its writer.
+# purpose: scripts/tests/runner-cache-sweep-selftest.sh reads this file, expands
+# every key PER JOB — `extends` chains, `variables:`, `parallel: matrix:` legs
+# and GitLab's `CI_JOB_NAME_SLUG` rule — and fails if any expanded key loses its
+# last writer. Per job, because `target-$CI_JOB_NAME_SLUG` is one string here
+# and nine archives on disk: checking the string alone let one pull-push job
+# vouch for all nine. Anything it cannot expand is a refusal, not a pass.
 #
 # The hashed key bought a guaranteed-clean tree on a lockfile bump. Cargo's
 # fingerprinting already does that — it rebuilds the units a bump invalidates
@@ -623,9 +632,10 @@ draft-install-mock:
 # fixture trees, runs the REAL sweep against them through its env seams, and
 # asserts what it deleted and what it refused to delete — including the cases
 # that used to pass silently (a missing bind mount, a failed `du`, the pre-bind
-# depth-2 layout). Part 2 reads THIS file and fails if a cache key loses its
-# last `pull-push` writer, which is the pipeline-side half of the eviction
-# contract (see CACHING). No cargo, no toolchain: seconds.
+# depth-2 layout). Part 2 reads THIS file, expands every cache key per job, and
+# fails if any expanded key loses its last `pull-push` writer — the
+# pipeline-side half of the eviction contract (see CACHING). No cargo, no
+# toolchain: seconds.
 runner-cache-sweep-selftest:
   extends: [.linux, .rules-ci]
   stage: selftest

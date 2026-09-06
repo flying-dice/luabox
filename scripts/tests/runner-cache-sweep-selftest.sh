@@ -25,21 +25,29 @@
 # RUNNER_CACHE_SWEEP_BIN, and the cases it claims to pin confirmed red
 # (2026-09-06, findutils 4.10, bash 5.2). Measured:
 #   dir assertions deleted            -> S7, S8, S8b
-#   du_total coerces empty output to 0 -> S9
+#   du_total coerces empty output to 0 -> S9, S24
 #   numeric-slot assertion deleted    -> S10, S20
 #   fuzz-corpus age exemption deleted -> S13, S14
-#   busy-slot skip deleted            -> S5
-#   docker-unavailable fallback = 0   -> S6, S6b
+#   run-level busy-slot skip deleted  -> S5, S22
+#   docker-unavailable fallback = 0   -> S6, S6b, S23
 #   flock acquisition dropped         -> S15, S15b
 #   parent-directory guard deleted    -> S16
 #   cap loop stops subtracting        -> S11b, S12, S12b
 #   cap drains strictly oldest-first  -> S12, S12b
 #   failed freshness scan reads stale -> S21
-#   per-checkout occupancy re-probe deleted, or its answer ignored -> S22, S23
+#   per-checkout occupancy re-probe deleted, or ignored -> S22, S23
+#   every failure exits 2 (no partial code) -> S24, S26
+#   over-cap-with-no-candidates check deleted -> S25, S26
+#   sizes always reported in MiB      -> S18b, S25
+# And one against .gitlab-ci.yml itself, through RUNNER_CACHE_SWEEP_CI_YML:
+#   `examples` takes its own `target` tree `policy: pull` -> P1, P1b. That
+#   mutation left this suite GREEN until the writer check expanded keys per
+#   job, which is exactly what round 2's N-3 measured.
 # Every mutation above was rejected by at least one case, none by a case that
 # was merely counting log lines. Re-run one with:
 #   cp scripts/ops/runner-cache-sweep.sh /tmp/mutant.sh && $EDITOR /tmp/mutant.sh
 #   RUNNER_CACHE_SWEEP_BIN=/tmp/mutant.sh bash scripts/tests/runner-cache-sweep-selftest.sh
+#   RUNNER_CACHE_SWEEP_CI_YML=/tmp/mutant-ci.yml bash scripts/tests/runner-cache-sweep-selftest.sh
 #
 #   bash scripts/tests/runner-cache-sweep-selftest.sh
 # ===========================================================================
@@ -144,7 +152,22 @@ echo "du: /: Permission denied" >&2
 exit 1
 SHIM
 
-chmod +x "$shim"/* "$work/shim-du/du" "$work/shim-find/find"
+mkdir -p "$work/shim-du-late"
+cat >"$work/shim-du-late/du" <<SHIM
+#!/bin/bash
+# Answers the opening measurement and fails every one after it: the mount goes
+# away mid-run, once the age pass has already removed archives.
+count_file="\${SELFTEST_DU_COUNT:?}"
+n="\$(cat "\$count_file" 2>/dev/null || echo 0)"
+printf '%s\n' "\$((n + 1))" >"\$count_file"
+if [ "\$n" -ge 1 ]; then
+    echo "du: /: Input/output error" >&2
+    exit 1
+fi
+exec $(command -v du) "\$@"
+SHIM
+
+chmod +x "$shim"/* "$work/shim-du/du" "$work/shim-du-late/du" "$work/shim-find/find"
 
 # A PATH holding everything the sweep needs EXCEPT docker, so the
 # docker-not-installed branch is exercised the way CI actually meets it (the
@@ -206,11 +229,13 @@ run_sweep() { # run_sweep <case> <fixture> [VAR=value...]
     sweep_syslog="$work/$case_name.syslog"
     : >"$sweep_syslog"
     : >"$work/$case_name.dockercount"
+    : >"$work/$case_name.ducount"
     sweep_rc=0
     env \
         PATH="$shim:$PATH" \
         SELFTEST_LOGGER_LOG="$sweep_syslog" \
         SELFTEST_DOCKER_COUNT="$work/$case_name.dockercount" \
+        SELFTEST_DU_COUNT="$work/$case_name.ducount" \
         CACHE_DIR="$fx/cache" \
         BUILDS_DIR="$fx/builds" \
         LOCK_FILE="$fx/lock" \
@@ -369,8 +394,9 @@ mkfile "$fx/cache/flying-dice/luabox/cargo-home-protected/cache.zip"
 mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/target/build.o"
 age_tree "$fx" 4320
 run_sweep s9 "$fx" PATH="$work/shim-du:$shim:$PATH"
-assert_exit S9_du_failure_refuses 2 "$sweep_rc" "$sweep_log" \
+assert_exit S9_du_failure_before_any_deletion_refuses_with_2 2 "$sweep_rc" "$sweep_log" \
     "REFUSED: du failed" \
+    "!PARTIALLY SWEPT" \
     "syslog: -p user.err -t runner-cache-sweep" \
     "!net " "!cache: age summary"
 survives "S9 nothing is deleted when the measurement fails" \
@@ -561,9 +587,9 @@ age_tree "$fx" 4320
 run_sweep s18 "$fx"
 assert_exit S18_the_run_reports_a_signed_delta 0 "$sweep_rc" "$sweep_log" "!freed"
 check_true "S18 the summary is a signed delta, negative when space is released" \
-    grep -qE '^net -[0-9]+ MiB; cache\+builds now [0-9]+ MiB$' "$sweep_log"
+    grep -qE '^net -[0-9]+ (KiB|MiB); cache\+builds now [0-9]+ (KiB|MiB)$' "$sweep_log"
 check_true "S18 the delta reaches syslog, not only stdout" \
-    grep -qE 'net -[0-9]+ MiB' "$sweep_syslog"
+    grep -qE 'net -[0-9]+ (KiB|MiB)' "$sweep_syslog"
 
 fx="$(mkfixture s18b)"
 mkfile "$fx/cache/flying-dice/luabox/cargo-home-protected/cache.zip" 512
@@ -571,7 +597,7 @@ mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
 age_tree "$fx" 30
 run_sweep s18b "$fx"
 assert_exit S18b_a_run_that_removes_nothing_reports_no_change 0 "$sweep_rc" "$sweep_log" \
-    "net +0 MiB"
+    "net +0 KiB"
 
 # --- S22: a slot that goes busy DURING the sweep ---------------------------
 # The run-level occupancy probe is minutes old by the time a multi-GB tree
@@ -623,50 +649,227 @@ survives "S21 a checkout whose scan errored is kept" "$fx/builds/zAbCd/0/flying-
 survives "S21 an archive whose re-stat errored is kept" \
     "$fx/cache/flying-dice/luabox/cargo-home-protected/cache.zip"
 
-echo
-echo "=== Part 2 — every cache key keeps a pull-push writer ==="
+# --- S24: a failure AFTER the first deletion is exit 3, not exit 2 ---------
+# "REFUSED: nothing was deleted" was false the moment the age pass had removed
+# an archive and a later `du` failed — the operator reads it, believes the tree
+# is untouched, and looks in the wrong place. Two codes, and the boundary is
+# the first deletion.
+fx="$(mkfixture s24)"
+zip="$fx/cache/flying-dice/luabox/cargo-home-protected/cache.zip"
+mkfile "$zip"
+mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/target/build.o"
+age_tree "$fx" 4320
+run_sweep s24 "$fx" PATH="$work/shim-du-late:$shim:$PATH"
+assert_exit S24_a_failure_after_a_deletion_exits_3 3 "$sweep_rc" "$sweep_log" \
+    "PARTIALLY SWEPT after 1 removal(s): du failed" \
+    "cache: age removed $zip" \
+    "syslog: -p user.err -t runner-cache-sweep" \
+    "!REFUSED"
+deleted "S24 the removal it reports really happened" "$zip"
+survives "S24 and it stopped there, before the builds half" \
+    "$fx/builds/zAbCd/0/flying-dice/luabox"
 
-# Finding 9. The sweep evicts on mtime, and GitLab touches a local cache
-# archive only when a job WRITES it: `policy: pull` reads the zip out of the
-# store without rewriting it. A key every job takes read-only therefore ages
-# out under the window while jobs are still reading it, and the symptom is a
-# job that silently rebuilds from cold, not an error. The rule this asserts is
-# the pipeline half of the eviction contract: at least one writer per key.
+# --- S25: over the cap with nothing the glob can drain ---------------------
+# A runner that writes `cache.zst` (or any rename of the archive) leaves this
+# sweep with no candidates. Reporting `removed 0, tree now ~0 MiB` and exiting
+# 0 over a full disk is #85's original signature; it is an alarm now.
+fx="$(mkfixture s25)"
+zst="$fx/cache/flying-dice/luabox/cargo-home-protected/cache.zst"
+mkfile "$zst" 64
+mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
+age_tree "$fx" 4320
+run_sweep s25 "$fx" CACHE_CAP_KIB=1
+assert_exit S25_over_cap_with_no_candidates_refuses 2 "$sweep_rc" "$sweep_log" \
+    "REFUSED: cache is" "over the 1KiB cap" "no '*.zip' archive matched" \
+    "syslog: -p user.err -t runner-cache-sweep" \
+    "!cap summary: removed 0"
+survives "S25 the archive it cannot drain is left alone" "$zst"
+check_true "S25 the size that triggered it is legible, not rounded to ~0 MiB" \
+    grep -qE 'cache is [0-9]+ KiB, over the 1KiB cap' "$sweep_log"
+
+# --- S26: the same alarm, after the age pass has already removed something --
+fx="$(mkfixture s26)"
+zip="$fx/cache/flying-dice/luabox/target-check-protected/cache.zip"
+zst="$fx/cache/flying-dice/luabox/cargo-home-protected/cache.zst"
+mkfile "$zip"
+mkfile "$zst" 64
+mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
+age_tree "$fx" 4320
+run_sweep s26 "$fx" CACHE_CAP_KIB=1
+assert_exit S26_over_cap_with_no_candidates_after_a_deletion_exits_3 3 "$sweep_rc" "$sweep_log" \
+    "PARTIALLY SWEPT after 1 removal(s): cache is" \
+    "cache: age removed $zip" \
+    "!REFUSED"
+deleted "S26 the age pass's removal stands" "$zip"
+survives "S26 the archive the glob cannot see is untouched" "$zst"
+
+echo
+echo "=== Part 2 — every cache key keeps a pull-push writer, per JOB ==="
+
+# Finding 9 / N-3. The sweep evicts on mtime, and GitLab touches a local cache
+# archive only when a job WRITES it: `policy: pull` extracts the zip without
+# rewriting it. A key every job takes read-only therefore ages out under the
+# window while jobs are still reading it, and the symptom is a job that
+# silently rebuilds from cold, not an error. The rule this asserts is the
+# pipeline half of the eviction contract: at least one writer per key.
+#
+# The keys are expanded PER JOB before anything is counted. Aggregating on the
+# unexpanded string was the round-2 defect: `target-$CI_JOB_NAME_SLUG` is one
+# string in the file and nine different archives on disk, so a single
+# pull-push job covered all nine and `examples` could be flipped read-only with
+# the suite still green. Expansion needs the job set, so this reads the job
+# set: top-level jobs, their `extends` chains (last parent wins, the job's own
+# `cache:` wins over all), `variables:` from the global block and every level
+# of the chain, `parallel: matrix:` legs, and `CI_JOB_NAME_SLUG` via GitLab's
+# own slug rule.
 #
 # Read straight from the YAML rather than from `glab ci config compile`: the
 # self-test runs in a build container with no glab, no token and no network,
 # and a committed snapshot of the compiled config would go stale silently —
 # the exact failure mode decisions/12 names. The cost is a parser, so it is
-# written to REFUSE anything it does not understand (unknown cache entry
-# shape, unknown policy, dangling or nested alias, no keys at all) rather than
-# to skip it, and the fixtures below pin that refusal.
+# written to REFUSE anything it cannot resolve — an unknown cache entry shape,
+# an unknown policy, a dangling or nested alias, an `extends` target that does
+# not exist, a variable it cannot expand, a matrix leg over more than one
+# variable, a matrix job keyed on the job slug, a top-level `default: cache:`,
+# or a file with no jobs or no keys at all — rather than to skip it and pass.
+# Every one of those refusals is pinned by a fixture below.
 #
 # Known limit, stated rather than hidden: occurrences are counted wherever a
-# `cache:` block appears, including hidden templates like `.rust`. That is
-# where the pipeline's one cargo-home writer is declared, so a template no job
-# extends could in principle satisfy the rule on paper.
+# `cache:` block is reachable from a job, including through hidden templates
+# like `.rust`. That is where the pipeline's one cargo-home writer is declared.
 
 cp_reset() {
-    unset CP_KEY CP_POLICY CP_MERGE CP_READERS CP_WRITERS
-    declare -gA CP_KEY=() CP_POLICY=() CP_MERGE=() CP_READERS=() CP_WRITERS=()
+    unset CP_KEY CP_POLICY CP_MERGE BLK_SEEN BLK_CACHE BLK_HAS_CACHE BLK_EXTENDS \
+        BLK_VARS BLK_MATRIX GLOBAL_VARS EXP_VARS KEY_READERS KEY_WRITERS BLK_ORDER
+    declare -gA CP_KEY=() CP_POLICY=() CP_MERGE=() BLK_SEEN=() BLK_CACHE=() \
+        BLK_HAS_CACHE=() BLK_EXTENDS=() BLK_VARS=() BLK_MATRIX=() GLOBAL_VARS=() \
+        EXP_VARS=() KEY_READERS=() KEY_WRITERS=()
+    declare -ga BLK_ORDER=()
 }
 
-cp_record() { # cp_record <key> <policy>
-    local key="$1" policy="$2"
-    case "$policy" in
+# An unquoted YAML scalar ends at an inline ` #` comment; a quoted one ends at
+# its closing quote. Round 2 caught this the expensive way: LUALS_VERSION's
+# trailing comment became part of the cache key.
+cp_strip_comment() { # cp_strip_comment <raw value>
+    local v="$1"
+    case "$v" in
+    '"'* | "'"*)
+        printf '%s' "$v"
+        return 0
+        ;;
+    esac
+    case "$v" in
+    *' #'*) v="${v%% #*}" ;;
+    esac
+    printf '%s' "${v%"${v##*[![:space:]]}"}"
+}
+
+cp_scalar() { # cp_scalar <raw value> — comment stripped, one layer of quotes
+    local v
+    v="$(cp_strip_comment "$1")"
+    case "$v" in
+    '"'*)
+        v="${v#\"}"
+        v="${v%%\"*}"
+        ;;
+    "'"*)
+        v="${v#\'}"
+        v="${v%%\'*}"
+        ;;
+    esac
+    printf '%s' "$v"
+}
+
+# GitLab's own slug rule (Gitlab::Utils.slugify): downcase, every character
+# outside [a-z0-9] becomes '-', truncate to 63, then strip leading/trailing
+# '-'. Not squeezed: two adjacent non-alphanumerics stay two dashes.
+cp_slugify() { # cp_slugify <job name>
+    local s="${1,,}" out="" i c
+    for ((i = 0; i < ${#s}; i++)); do
+        c="${s:i:1}"
+        case "$c" in
+        [a-z0-9]) out="$out$c" ;;
+        *) out="$out-" ;;
+        esac
+    done
+    out="${out:0:63}"
+    while [ "${out#-}" != "$out" ]; do out="${out#-}"; done
+    while [ "${out%-}" != "$out" ]; do out="${out%-}"; done
+    printf '%s' "$out"
+}
+
+# $NAME and ${NAME} against EXP_VARS. No eval, and an unknown name is a
+# refusal: a key this check cannot name is a key it cannot verify.
+cp_expand() { # cp_expand <text> -> CP_EXPANDED
+    local rest="$1" out="" name c
+    while [ -n "$rest" ]; do
+        case "$rest" in
+        *'$'*)
+            out="$out${rest%%\$*}"
+            rest="${rest#*\$}"
+            name=""
+            if [ "${rest:0:1}" = "{" ]; then
+                case "$rest" in
+                *'}'*)
+                    name="${rest%%\}*}"
+                    name="${name#\{}"
+                    rest="${rest#*\}}"
+                    ;;
+                *)
+                    echo "PARSE ERROR: unterminated \${ in '$1'"
+                    return 1
+                    ;;
+                esac
+            else
+                while [ -n "$rest" ]; do
+                    c="${rest:0:1}"
+                    case "$c" in
+                    [A-Za-z0-9_]) name="$name$c" && rest="${rest:1}" ;;
+                    *) break ;;
+                    esac
+                done
+            fi
+            if [ -z "$name" ]; then
+                echo "PARSE ERROR: a bare \$ in '$1'"
+                return 1
+            fi
+            if [ -z "${EXP_VARS[$name]+set}" ]; then
+                echo "PARSE ERROR: cannot expand \$$name in '$1' — no variable, matrix value or predefined slug defines it"
+                return 1
+            fi
+            out="$out${EXP_VARS[$name]}"
+            ;;
+        *)
+            out="$out$rest"
+            rest=""
+            ;;
+        esac
+    done
+    CP_EXPANDED="$out"
+}
+
+# The helpers below are called from inside cp_parse and read its locals
+# ($top, $have_pend, $pend_key, $pend_policy) through bash's dynamic scope.
+cp_add_entry() { # cp_add_entry <raw key> <policy>
+    case "$2" in
     '' | pull | push | pull-push) ;;
     *)
-        echo "PARSE ERROR: unknown cache policy '$policy' for key '$key'"
+        echo "PARSE ERROR: unknown cache policy '$2' for key '$1'"
         return 1
         ;;
     esac
-    CP_READERS[$key]=$((${CP_READERS[$key]:-0} + 1))
-    if [ "$policy" != pull ]; then
-        CP_WRITERS[$key]=$((${CP_WRITERS[$key]:-0} + 1))
-    fi
+    BLK_CACHE[$top]="${BLK_CACHE[$top]:-}$1"$'\t'"$2"$'\n'
 }
 
-cp_record_alias() { # cp_record_alias <anchor>
+cp_flush_pending() {
+    if [ "$have_pend" = 1 ]; then
+        have_pend=0
+        cp_add_entry "$pend_key" "$pend_policy" || return 1
+    fi
+    return 0
+}
+
+cp_add_alias() { # cp_add_alias <anchor>
     local anchor="$1" key policy merge
     key="${CP_KEY[$anchor]:-}"
     policy="${CP_POLICY[$anchor]:-}"
@@ -687,25 +890,172 @@ cp_record_alias() { # cp_record_alias <anchor>
         echo "PARSE ERROR: alias *$anchor resolves to no cache key"
         return 1
     fi
-    cp_record "$key" "$policy"
+    cp_add_entry "$key" "$policy"
 }
 
-cache_policy_report() { # cache_policy_report <yaml>
-    local yml="$1" line item field value lineno=0
-    local anchor="" in_cache=0 have_pend=0 pend_key="" pend_policy=""
-    cp_reset
+cp_split_list() { # cp_split_list <"[a, b]" or scalar> — one value per line
+    local v="$1" item
+    case "$v" in
+    \[*\])
+        v="${v#\[}"
+        v="${v%\]}"
+        local IFS=,
+        for item in $v; do
+            item="${item#"${item%%[![:space:]]*}"}"
+            item="${item%"${item##*[![:space:]]}"}"
+            [ -n "$item" ] || continue
+            cp_scalar "$item"
+            printf '\n'
+        done
+        ;;
+    *)
+        cp_scalar "$v"
+        printf '\n'
+        ;;
+    esac
+}
+
+# Non-job top-level keys. Everything else that does not start with '.' is a job.
+cp_is_job() { # cp_is_job <top-level name>
+    case "$1" in
+    .*) return 1 ;;
+    stages | variables | workflow | include | default | image | services | cache | before_script | after_script) return 1 ;;
+    esac
+    return 0
+}
+
+cp_parse() { # cp_parse <yaml>
+    local yml="$1" line lineno=0 ws indent item field value name
+    local top="" anchor="" section="" pend_key="" pend_policy="" have_pend=0
     while IFS= read -r line || [ -n "$line" ]; do
         lineno=$((lineno + 1))
         line="${line%$'\r'}"
         if [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]]; then
             continue
         fi
-        if [[ "$line" =~ ^[[:space:]]{8}-[[:space:]] ]]; then
-            continue # a `paths:` entry of an inline cache item
-        elif [[ "$line" =~ ^[[:space:]]{6}([A-Za-z_]+):[[:space:]]*(.*)$ ]]; then
+        case "$line" in
+        *$'\t'*)
+            if [[ "$line" =~ ^$'\t' ]]; then
+                echo "PARSE ERROR ($yml:$lineno): tab indentation"
+                return 1
+            fi
+            ;;
+        esac
+
+        if [[ "$line" =~ ^[^[:space:]] ]]; then
+            cp_flush_pending || return 1
+            section=""
+            anchor=""
+            if [[ "$line" =~ ^([A-Za-z0-9._-]+):[[:space:]]*(\&([A-Za-z0-9_-]+)[[:space:]]*)?$ ]]; then
+                top="${BASH_REMATCH[1]}"
+                anchor="${BASH_REMATCH[3]:-}"
+            elif [[ "$line" =~ ^([A-Za-z0-9._-]+):[[:space:]] ]]; then
+                top="${BASH_REMATCH[1]}"
+            else
+                echo "PARSE ERROR ($yml:$lineno): unrecognised top-level line"
+                return 1
+            fi
+            if [ -z "${BLK_SEEN[$top]:-}" ]; then
+                BLK_SEEN[$top]=1
+                BLK_ORDER+=("$top")
+            fi
+            continue
+        fi
+
+        ws="${line%%[! ]*}"
+        indent=${#ws}
+        case "$indent" in
+        2)
+            if [ "$top" = variables ]; then
+                if [[ "$line" =~ ^[[:space:]]{2}([A-Za-z_][A-Za-z0-9_]*):[[:space:]]*(.*)$ ]]; then
+                    GLOBAL_VARS[${BASH_REMATCH[1]}]="$(cp_scalar "${BASH_REMATCH[2]}")"
+                fi
+                continue
+            fi
+            cp_flush_pending || return 1
+            if [[ "$line" =~ ^[[:space:]]{2}\<\<:[[:space:]]*\*([A-Za-z0-9_-]+) ]]; then
+                [ -z "$anchor" ] || CP_MERGE[$anchor]="${BASH_REMATCH[1]}"
+                continue
+            fi
+            if [[ ! "$line" =~ ^[[:space:]]{2}([A-Za-z_][A-Za-z0-9_]*):[[:space:]]*(.*)$ ]]; then
+                section=""
+                continue # a list item under an anchor block (.changes-*), etc.
+            fi
             field="${BASH_REMATCH[1]}"
-            value="${BASH_REMATCH[2]}"
-            if [ "$in_cache" = 1 ]; then
+            value="$(cp_strip_comment "${BASH_REMATCH[2]}")"
+            section=""
+            case "$field" in
+            cache)
+                if [ -n "$value" ]; then
+                    echo "PARSE ERROR ($yml:$lineno): inline cache value not understood"
+                    return 1
+                fi
+                section=cache
+                BLK_HAS_CACHE[$top]=1
+                ;;
+            key) [ -z "$anchor" ] || CP_KEY[$anchor]="$value" ;;
+            policy) [ -z "$anchor" ] || CP_POLICY[$anchor]="$value" ;;
+            variables) section=variables ;;
+            parallel) section=parallel ;;
+            extends)
+                if [ -z "$value" ]; then
+                    section=extends
+                else
+                    while IFS= read -r item; do
+                        [ -n "$item" ] || continue
+                        BLK_EXTENDS[$top]="${BLK_EXTENDS[$top]:-} $item"
+                    done <<<"$(cp_split_list "$value")"
+                fi
+                ;;
+            *) section=other ;;
+            esac
+            ;;
+        4)
+            case "$section" in
+            cache)
+                if [[ ! "$line" =~ ^[[:space:]]{4}-[[:space:]]*(.*)$ ]]; then
+                    echo "PARSE ERROR ($yml:$lineno): unrecognised line inside a cache block"
+                    return 1
+                fi
+                item="${BASH_REMATCH[1]}"
+                cp_flush_pending || return 1
+                if [[ "$item" =~ ^\*([A-Za-z0-9_-]+)[[:space:]]*$ ]]; then
+                    cp_add_alias "${BASH_REMATCH[1]}" || return 1
+                elif [[ "$item" =~ ^key:[[:space:]]*(.+)$ ]]; then
+                    pend_key="$(cp_scalar "${BASH_REMATCH[1]}")"
+                    pend_policy=""
+                    have_pend=1
+                else
+                    echo "PARSE ERROR ($yml:$lineno): unrecognised cache entry '$item'"
+                    return 1
+                fi
+                ;;
+            variables)
+                if [[ "$line" =~ ^[[:space:]]{4}([A-Za-z_][A-Za-z0-9_]*):[[:space:]]*(.*)$ ]]; then
+                    BLK_VARS[$top]="${BLK_VARS[$top]:-}${BASH_REMATCH[1]}"$'\t'"$(cp_scalar "${BASH_REMATCH[2]}")"$'\n'
+                fi
+                ;;
+            extends)
+                if [[ "$line" =~ ^[[:space:]]{4}-[[:space:]]*(.+)$ ]]; then
+                    BLK_EXTENDS[$top]="${BLK_EXTENDS[$top]:-} $(cp_scalar "${BASH_REMATCH[1]}")"
+                fi
+                ;;
+            parallel)
+                if [[ "$line" =~ ^[[:space:]]{4}matrix:[[:space:]]*$ ]]; then
+                    section=matrix
+                fi
+                ;;
+            esac
+            ;;
+        6)
+            case "$section" in
+            cache)
+                if [[ ! "$line" =~ ^[[:space:]]{6}([A-Za-z_]+):[[:space:]]*(.*)$ ]]; then
+                    echo "PARSE ERROR ($yml:$lineno): unrecognised line inside a cache entry"
+                    return 1
+                fi
+                field="${BASH_REMATCH[1]}"
+                value="$(cp_strip_comment "${BASH_REMATCH[2]}")"
                 case "$field" in
                 policy)
                     if [ "$have_pend" != 1 ]; then
@@ -720,88 +1070,177 @@ cache_policy_report() { # cache_policy_report <yaml>
                     return 1
                     ;;
                 esac
-            fi
-            continue
-        elif [[ "$line" =~ ^[[:space:]]{4}-[[:space:]]*(.*)$ ]]; then
-            # Every match below clobbers BASH_REMATCH, so take the item text
-            # out of it before running another one.
-            item="${BASH_REMATCH[1]}"
-            if [ "$in_cache" = 1 ]; then
-                if [ "$have_pend" = 1 ]; then
-                    cp_record "$pend_key" "$pend_policy" || return 1
-                    have_pend=0
-                fi
-                if [[ "$item" =~ ^\*([A-Za-z0-9_-]+)[[:space:]]*$ ]]; then
-                    cp_record_alias "${BASH_REMATCH[1]}" || return 1
-                elif [[ "$item" =~ ^key:[[:space:]]*(.+)$ ]]; then
-                    pend_key="${BASH_REMATCH[1]}"
-                    pend_policy=""
-                    have_pend=1
-                else
-                    echo "PARSE ERROR ($yml:$lineno): unrecognised cache entry '$item'"
-                    return 1
-                fi
-            fi
-            continue
-        elif [[ "$line" =~ ^[[:space:]]{2}([A-Za-z_]+):[[:space:]]*(.*)$ ]]; then
-            field="${BASH_REMATCH[1]}"
-            value="${BASH_REMATCH[2]}"
-            if [ "$have_pend" = 1 ]; then
-                cp_record "$pend_key" "$pend_policy" || return 1
-                have_pend=0
-            fi
-            in_cache=0
-            case "$field" in
-            cache)
-                if [ -n "$value" ]; then
-                    echo "PARSE ERROR ($yml:$lineno): inline cache value not understood"
-                    return 1
-                fi
-                in_cache=1
                 ;;
-            key) [ -z "$anchor" ] || CP_KEY[$anchor]="$value" ;;
-            policy) [ -z "$anchor" ] || CP_POLICY[$anchor]="$value" ;;
+            matrix)
+                if [[ "$line" =~ ^[[:space:]]{6}-[[:space:]]*([A-Za-z_][A-Za-z0-9_]*):[[:space:]]*(.+)$ ]]; then
+                    name="${BASH_REMATCH[1]}"
+                    while IFS= read -r item; do
+                        [ -n "$item" ] || continue
+                        BLK_MATRIX[$top]="${BLK_MATRIX[$top]:-}$name"$'\t'"$item"$'\n'
+                    done <<<"$(cp_split_list "$(cp_strip_comment "${BASH_REMATCH[2]}")")"
+                else
+                    echo "PARSE ERROR ($yml:$lineno): unrecognised matrix leg"
+                    return 1
+                fi
+                ;;
             esac
-            continue
-        elif [[ "$line" =~ ^[[:space:]]{2}\<\<:[[:space:]]*\*([A-Za-z0-9_-]+) ]]; then
-            [ -z "$anchor" ] || CP_MERGE[$anchor]="${BASH_REMATCH[1]}"
-            continue
-        elif [[ "$line" =~ ^[^[:space:]] ]]; then
-            if [ "$have_pend" = 1 ]; then
-                cp_record "$pend_key" "$pend_policy" || return 1
-                have_pend=0
+            ;;
+        8)
+            if [ "$section" = matrix ]; then
+                echo "PARSE ERROR ($yml:$lineno): a matrix leg over more than one variable is not expanded by this check"
+                return 1
             fi
-            in_cache=0
-            anchor=""
-            if [[ "$line" =~ ^[A-Za-z0-9._-]+:[[:space:]]*\&([A-Za-z0-9_-]+)[[:space:]]*$ ]]; then
-                anchor="${BASH_REMATCH[1]}"
+            ;;
+        *)
+            if [ "$section" = cache ]; then
+                echo "PARSE ERROR ($yml:$lineno): unrecognised line inside a cache block"
+                return 1
             fi
-            continue
-        fi
-        if [ "$in_cache" = 1 ]; then
-            echo "PARSE ERROR ($yml:$lineno): unrecognised line inside a cache block"
+            ;;
+        esac
+    done <"$yml"
+    cp_flush_pending || return 1
+    return 0
+}
+
+# The effective cache of a job: its own `cache:` if it declares one (an array
+# is replaced, not merged), otherwise the nearest one up the `extends` chain,
+# last-listed parent first — GitLab's own precedence.
+# NOTE: this one reports on STDERR. It is called inside a command substitution
+# (its stdout IS the entry list), so an error printed on stdout would be
+# captured as data and vanish — which is how a refusal message went missing
+# once already.
+cp_cache_of() { # cp_cache_of <name> <depth>
+    local name="$1" depth="$2" parent out
+    if [ "$depth" -gt 10 ]; then
+        echo "PARSE ERROR: extends chain deeper than 10 at '$name'" >&2
+        return 1
+    fi
+    if [ -n "${BLK_HAS_CACHE[$name]:-}" ]; then
+        printf '%s' "${BLK_CACHE[$name]:-}"
+        return 0
+    fi
+    local -a parents=()
+    read -r -a parents <<<"${BLK_EXTENDS[$name]:-}"
+    local i
+    for ((i = ${#parents[@]} - 1; i >= 0; i--)); do
+        parent="${parents[$i]}"
+        if [ -z "${BLK_SEEN[$parent]:-}" ]; then
+            echo "PARSE ERROR: '$name' extends '$parent', which is not defined in this file" >&2
             return 1
         fi
-    done <"$yml"
-    if [ "$have_pend" = 1 ]; then
-        cp_record "$pend_key" "$pend_policy" || return 1
+        out="$(cp_cache_of "$parent" "$((depth + 1))")" || return 1
+        if [ -n "$out" ]; then
+            printf '%s' "$out"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# Variables merge the other way round: ancestors first, in order, then the
+# job's own. Mutates EXP_VARS, so it must not run in a subshell.
+cp_vars_of() { # cp_vars_of <name> <depth>
+    local name="$1" depth="$2" parent k v
+    if [ "$depth" -gt 10 ]; then
+        echo "PARSE ERROR: extends chain deeper than 10 at '$name'"
+        return 1
+    fi
+    local -a parents=()
+    read -r -a parents <<<"${BLK_EXTENDS[$name]:-}"
+    for parent in "${parents[@]}"; do
+        if [ -z "${BLK_SEEN[$parent]:-}" ]; then
+            echo "PARSE ERROR: '$name' extends '$parent', which is not defined in this file"
+            return 1
+        fi
+        cp_vars_of "$parent" "$((depth + 1))" || return 1
+    done
+    while IFS=$'\t' read -r k v; do
+        [ -n "$k" ] || continue
+        EXP_VARS[$k]="$v"
+    done <<<"${BLK_VARS[$name]:-}"
+    return 0
+}
+
+cache_policy_report() { # cache_policy_report <yaml>
+    local yml="$1"
+    cp_reset
+    cp_parse "$yml" || return 1
+
+    if [ -n "${BLK_HAS_CACHE[default]:-}" ]; then
+        echo "PARSE ERROR: a top-level 'default: cache:' applies to every job and is not resolved by this check"
+        return 1
     fi
 
-    if [ "${#CP_READERS[@]}" -eq 0 ]; then
+    local job entries rawkey policy key leg mvar mval leg_desc k jobs=0
+    local -a legs=()
+    for job in "${BLK_ORDER[@]}"; do
+        cp_is_job "$job" || continue
+        jobs=$((jobs + 1))
+        entries="$(cp_cache_of "$job" 0)" || return 1
+        [ -n "$entries" ] || continue
+
+        unset EXP_VARS
+        declare -gA EXP_VARS=()
+        for k in "${!GLOBAL_VARS[@]}"; do
+            EXP_VARS[$k]="${GLOBAL_VARS[$k]}"
+        done
+        cp_vars_of "$job" 0 || return 1
+        EXP_VARS[CI_JOB_NAME_SLUG]="$(cp_slugify "$job")"
+
+        legs=()
+        if [ -n "${BLK_MATRIX[$job]:-}" ]; then
+            while IFS=$'\t' read -r mvar mval; do
+                [ -n "$mvar" ] || continue
+                legs+=("$mvar"$'\t'"$mval")
+            done <<<"${BLK_MATRIX[$job]}"
+        fi
+        [ "${#legs[@]}" -gt 0 ] || legs=("")
+
+        for leg in "${legs[@]}"; do
+            leg_desc=""
+            if [ -n "$leg" ]; then
+                mvar="${leg%%$'\t'*}"
+                mval="${leg#*$'\t'}"
+                EXP_VARS[$mvar]="$mval"
+                leg_desc=" [$mvar=$mval]"
+            fi
+            while IFS=$'\t' read -r rawkey policy; do
+                [ -n "$rawkey" ] || continue
+                if [ -n "$leg" ] && [ "${rawkey#*CI_JOB_NAME_SLUG}" != "$rawkey" ]; then
+                    echo "PARSE ERROR: job '$job' has a parallel matrix and a key on \$CI_JOB_NAME_SLUG; this check cannot reproduce the runner's slug for a matrix leg"
+                    return 1
+                fi
+                cp_expand "$rawkey" || return 1
+                key="$CP_EXPANDED"
+                KEY_READERS[$key]=$((${KEY_READERS[$key]:-0} + 1))
+                if [ "$policy" != pull ]; then
+                    KEY_WRITERS[$key]=$((${KEY_WRITERS[$key]:-0} + 1))
+                fi
+                echo "JOB $job$leg_desc -> $key ${policy:-pull-push}"
+            done <<<"$entries"
+        done
+    done
+
+    if [ "$jobs" -eq 0 ]; then
+        echo "ERROR: no jobs found in $yml — this check measured nothing"
+        return 1
+    fi
+    if [ "${#KEY_READERS[@]}" -eq 0 ]; then
         echo "ERROR: no cache keys found in $yml — this check measured nothing"
         return 1
     fi
     local -a keys=()
-    mapfile -t keys < <(printf '%s\n' "${!CP_READERS[@]}" | sort)
-    local k violations=0
+    mapfile -t keys < <(printf '%s\n' "${!KEY_READERS[@]}" | sort)
+    local violations=0
     for k in "${keys[@]}"; do
-        echo "KEY $k readers=${CP_READERS[$k]} writers=${CP_WRITERS[$k]:-0}"
-        if [ "${CP_WRITERS[$k]:-0}" -eq 0 ]; then
+        echo "KEY $k readers=${KEY_READERS[$k]} writers=${KEY_WRITERS[$k]:-0}"
+        if [ "${KEY_WRITERS[$k]:-0}" -eq 0 ]; then
             echo "VIOLATION: cache key '$k' has no pull-push writer — the sweep evicts it while jobs still read it"
             violations=$((violations + 1))
         fi
     done
-    echo "checked ${#keys[@]} cache key(s), $violations violation(s)"
+    echo "checked ${#keys[@]} cache key(s) across $jobs job(s), $violations violation(s)"
     [ "$violations" -eq 0 ]
 }
 
@@ -812,15 +1251,28 @@ run_policy_check() { # run_policy_check <case> <yaml>
 }
 
 run_policy_check P1 "$ci_yml"
-assert_exit P1_every_cache_key_in_the_real_config_has_a_writer 0 "$sweep_rc" "$sweep_log" \
+assert_exit P1_every_expanded_cache_key_in_the_real_config_has_a_writer 0 "$sweep_rc" "$sweep_log" \
     "KEY cargo-home" \
-    'KEY target-$CI_JOB_NAME_SLUG' \
-    'KEY luals-$LUALS_VERSION' \
-    'KEY pwsh-$PWSH_VERSION' \
+    "KEY target-check readers=1 writers=1" \
+    "KEY target-examples readers=1 writers=1" \
+    "KEY luals-3.13.5" \
+    "KEY pwsh-7.4.6" \
     "KEY fuzz-cargo-home" \
-    'KEY fuzz-target-$FUZZ_TARGET' \
-    'KEY fuzz-corpus-$FUZZ_TARGET' \
-    "!VIOLATION"
+    "KEY fuzz-target-lua_parse" \
+    "KEY fuzz-corpus-luacats" \
+    ", 0 violation(s)" \
+    "!VIOLATION" \
+    '!$CI_JOB_NAME_SLUG' \
+    '!$FUZZ_TARGET'
+# The JOB lines are the part that round 2 proved was missing: the key is
+# expanded per job, so `examples` reading cargo-home and WRITING its own target
+# tree are two separate facts, and either can fail on its own.
+assert_exit P1b_the_report_is_per_job_not_per_key_string 0 "$sweep_rc" "$sweep_log" \
+    "JOB examples -> cargo-home pull" \
+    "JOB examples -> target-examples pull-push" \
+    "JOB check -> target-check pull-push" \
+    "JOB fuzz [FUZZ_TARGET=luacats] -> fuzz-corpus-luacats pull-push" \
+    "JOB luals-parity -> luals-3.13.5 pull-push"
 
 fixtures="$work/yaml"
 mkdir -p "$fixtures"
@@ -922,6 +1374,135 @@ YML
 run_policy_check P8 "$fixtures/no-cache.yml"
 assert_exit P8_a_config_with_no_cache_keys_refuses_to_pass 1 "$sweep_rc" "$sweep_log" \
     "ERROR: no cache keys found"
+
+cat >"$fixtures/per-job-blind-spot.yml" <<'YML'
+.build: &build-cache
+  key: target-$CI_JOB_NAME_SLUG
+  paths:
+    - target
+
+.rust:
+  cache:
+    - *build-cache
+
+alpha:
+  extends: .rust
+  script:
+    - echo alpha
+
+beta:
+  extends: .rust
+  cache:
+    - key: target-$CI_JOB_NAME_SLUG
+      paths:
+        - target
+      policy: pull
+YML
+run_policy_check P9 "$fixtures/per-job-blind-spot.yml"
+assert_exit P9_a_per_job_key_read_only_in_one_job_is_a_violation 1 "$sweep_rc" "$sweep_log" \
+    "JOB alpha -> target-alpha pull-push" \
+    "JOB beta -> target-beta pull" \
+    "KEY target-alpha readers=1 writers=1" \
+    "VIOLATION: cache key 'target-beta' has no pull-push writer"
+
+cat >"$fixtures/matrix.yml" <<'YML'
+variables:
+  TOOL_VERSION: "1.2.3"
+
+legs:
+  parallel:
+    matrix:
+      - LEG: [one, two]
+  cache:
+    - key: corpus-$LEG
+      paths:
+        - corpus
+    - key: tool-${TOOL_VERSION}
+      paths:
+        - .tool
+YML
+run_policy_check P10 "$fixtures/matrix.yml"
+assert_exit P10_matrix_legs_and_global_variables_expand 0 "$sweep_rc" "$sweep_log" \
+    "JOB legs [LEG=one] -> corpus-one pull-push" \
+    "JOB legs [LEG=two] -> corpus-two pull-push" \
+    "KEY tool-1.2.3 readers=2 writers=2" \
+    "!VIOLATION"
+
+cat >"$fixtures/unknown-variable.yml" <<'YML'
+job-a:
+  cache:
+    - key: target-$NOBODY_DEFINES_THIS
+      paths:
+        - target
+YML
+run_policy_check P11 "$fixtures/unknown-variable.yml"
+assert_exit P11_a_key_that_cannot_be_expanded_refuses 1 "$sweep_rc" "$sweep_log" \
+    "PARSE ERROR: cannot expand \$NOBODY_DEFINES_THIS" "!VIOLATION"
+
+cat >"$fixtures/matrix-slug.yml" <<'YML'
+job-a:
+  parallel:
+    matrix:
+      - LEG: [one, two]
+  cache:
+    - key: target-$CI_JOB_NAME_SLUG
+      paths:
+        - target
+YML
+run_policy_check P12 "$fixtures/matrix-slug.yml"
+assert_exit P12_a_matrix_job_keyed_on_the_slug_refuses 1 "$sweep_rc" "$sweep_log" \
+    "cannot reproduce the runner's slug for a matrix leg"
+
+cat >"$fixtures/matrix-two-vars.yml" <<'YML'
+job-a:
+  parallel:
+    matrix:
+      - LEG: [one, two]
+        OTHER: [x, y]
+  cache:
+    - key: k-$LEG-$OTHER
+      paths:
+        - target
+YML
+run_policy_check P13 "$fixtures/matrix-two-vars.yml"
+assert_exit P13_a_multi_variable_matrix_leg_refuses 1 "$sweep_rc" "$sweep_log" \
+    "a matrix leg over more than one variable is not expanded"
+
+cat >"$fixtures/missing-template.yml" <<'YML'
+job-a:
+  extends: .not-defined-anywhere
+  script:
+    - echo a
+YML
+run_policy_check P14 "$fixtures/missing-template.yml"
+assert_exit P14_an_extends_target_that_does_not_exist_refuses 1 "$sweep_rc" "$sweep_log" \
+    "extends '.not-defined-anywhere', which is not defined"
+
+cat >"$fixtures/default-cache.yml" <<'YML'
+default:
+  cache:
+    - key: everything
+      paths:
+        - target
+
+job-a:
+  script:
+    - echo a
+YML
+run_policy_check P15 "$fixtures/default-cache.yml"
+assert_exit P15_a_top_level_default_cache_refuses 1 "$sweep_rc" "$sweep_log" \
+    "top-level 'default: cache:' applies to every job"
+
+cat >"$fixtures/templates-only.yml" <<'YML'
+.tpl:
+  cache:
+    - key: k
+      paths:
+        - target
+YML
+run_policy_check P16 "$fixtures/templates-only.yml"
+assert_exit P16_a_file_with_no_jobs_refuses_to_pass 1 "$sweep_rc" "$sweep_log" \
+    "ERROR: no jobs found"
 
 report_status=0
 selftest_report "runner-cache-sweep-selftest" || report_status=$?

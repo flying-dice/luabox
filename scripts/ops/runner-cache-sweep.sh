@@ -36,11 +36,14 @@
 # SAFETY. This is `rm -rf` running from cron against directories a live runner
 # is writing into. Each guard below is load-bearing and is pinned by
 # scripts/tests/runner-cache-sweep-selftest.sh:
-#   - Refuses (exit 2, `logger -p user.err`, nothing deleted) when CACHE_DIR or
-#     BUILDS_DIR is not a directory, when `du` fails, or when <builds> is not
-#     the depth-4 layout it assumes. A gone bind mount used to look exactly
-#     like a clean sweep: `du` printed nothing, empty was coerced to 0, and the
-#     log line read `freed 0 MiB` in a healthy green.
+#   - Refuses (`logger -p user.err`, exit 2 or 3 per the exit contract below)
+#     when CACHE_DIR or BUILDS_DIR is not a directory, when `du` or `find`
+#     fails, or when <builds> is not the depth-4 layout it assumes. A gone bind
+#     mount used to look exactly like a clean sweep: `du` printed nothing,
+#     empty was coerced to 0, and the log line read `freed 0 MiB` in a healthy
+#     green. It also refuses when the tree is over the cap and NO archive
+#     matched the glob it drains — the same green-over-a-full-disk shape,
+#     arriving through a renamed archive rather than a missing mount.
 #   - `flock -n`: the hourly cron run and a manual run never overlap.
 #   - Skips any slot whose job container is running. The runner names them
 #     `runner-<token>-project-<id>-concurrent-<slot>-<hash>-build`, so the slot
@@ -76,7 +79,13 @@
 # syslog (`logger`), because cron discards stdout and stderr.
 #
 #   exit 0 — swept, or skipped because another sweep holds the lock
-#   exit 2 — refused to sweep; nothing was deleted, the message says why
+#   exit 2 — REFUSED: the failure happened before the first deletion, so the
+#            trees are exactly as this run found them
+#   exit 3 — PARTIALLY SWEPT: the failure happened after at least one deletion.
+#            The trees have changed; every removal is in syslog by path, and
+#            the message says how many and what went wrong. This is the case
+#            "exit 2, nothing was deleted" used to claim, wrongly, whenever a
+#            `du` or `find` failed mid-run.
 # ===========================================================================
 set -euo pipefail
 shopt -s nullglob dotglob
@@ -106,7 +115,16 @@ err() {
     logger -p user.err -t "$LOG_TAG" -- "$1" 2>/dev/null || true
     printf '%s\n' "$1" >&2
 }
+# Nothing has been deleted yet -> exit 2, and the tree is exactly as the sweep
+# found it. Something has -> exit 3, because "refused, nothing deleted" would
+# be a lie and an operator reading it would look in the wrong place. Every
+# deletion is already logged by path above the failure.
+deletions=0
 die() {
+    if [ "$deletions" -gt 0 ]; then
+        err "PARTIALLY SWEPT after $deletions removal(s): $1"
+        exit 3
+    fi
     err "REFUSED: $1"
     exit 2
 }
@@ -122,6 +140,25 @@ du_total() { # du_total <-m|-k> <path>...
     total="$(printf '%s\n' "$out" | awk '{ s += $1; n += 1 } END { if (n == 0) exit 1; print s }')" || return 1
     [ -n "$total" ] || return 1
     printf '%s\n' "$total"
+}
+
+# Sizes are reported in the unit that makes them legible. `~0 MiB` is what the
+# cap step printed while sitting over a 650 KiB cap — a number that reads as
+# "nothing here" when the truth was "over the limit and unable to act".
+human_kib() { # human_kib <kib>
+    if [ "$1" -ge 1024 ]; then
+        printf '%s MiB' "$(($1 / 1024))"
+    else
+        printf '%s KiB' "$1"
+    fi
+}
+
+signed_kib() { # signed_kib <delta-kib>
+    if [ "$1" -lt 0 ]; then
+        printf -- '-%s' "$(human_kib "$((0 - $1))")"
+    else
+        printf '+%s' "$(human_kib "$1")"
+    fi
 }
 
 # True when <path> must NOT be deleted: something under it changed inside the
@@ -181,7 +218,7 @@ assert_builds_layout() {
 }
 assert_builds_layout
 
-before="$(du_total -m "$CACHE_DIR" "$BUILDS_DIR")" ||
+before="$(du_total -k "$CACHE_DIR" "$BUILDS_DIR")" ||
     die "du failed for $CACHE_DIR / $BUILDS_DIR"
 
 # ---------------------------------------------------------------------------
@@ -288,6 +325,7 @@ sweep_cache_age() {
         fi
         if rm -f -- "$f"; then
             removed=$((removed + 1))
+            deletions=$((deletions + 1))
             log "cache: age removed $f"
         fi
     done
@@ -325,6 +363,15 @@ sweep_cache_cap() {
         esac
     done
     ordered=("${plain[@]}" "${corpus[@]}")
+    # Over the cap with nothing to drain means the sweep cannot enforce the
+    # only bound this disk has, and the reason is almost always that the
+    # archives are not named what this script thinks they are (`cache.zst`
+    # after a runner upgrade, a changed cache layout). Reporting `removed 0,
+    # tree now ~0 MiB` and exiting 0 is #85's original signature: a green run
+    # over a full disk.
+    if [ "$size_kb" -gt "$cap_kb" ] && [ "${#ordered[@]}" -eq 0 ]; then
+        die "cache is $(human_kib "$size_kb"), over the $cap_label cap, and no '*.zip' archive matched under $CACHE_DIR — check the runner's archive naming/layout"
+    fi
     for f in "${ordered[@]}"; do
         [ "$size_kb" -gt "$cap_kb" ] || break
         # Deleted by the age pass or by a runner between the scan and here.
@@ -333,6 +380,7 @@ sweep_cache_cap() {
         if rm -f -- "$f"; then
             size_kb=$((size_kb - fkb))
             removed=$((removed + 1))
+            deletions=$((deletions + 1))
             log "cache: cap removed $f"
         fi
     done
@@ -341,7 +389,24 @@ sweep_cache_cap() {
     # The size is an estimate — the measurement is taken once and each removed
     # file subtracted from it, rather than re-walking the whole tree per
     # deletion; the honest number is in the net line at the end.
-    log "cache: cap summary: removed $removed, tree now ~$((size_kb / 1024)) MiB (cap $cap_label)"
+    log "cache: cap summary: removed $removed, tree now ~$(human_kib "$size_kb") (cap $cap_label)"
+}
+
+# Empty directories older than the window. An empty directory a runner created
+# seconds ago is a job about to clone into it, so the window applies here too.
+# `-print0` before `-delete` so the removals can be COUNTED: they are deletions
+# like any other, and the exit contract above turns on whether anything was
+# deleted before a failure.
+sweep_empty_dirs() { # sweep_empty_dirs <root> <label>
+    local root="$1" label="$2" list="$work/empty-dirs"
+    local -a gone=()
+    if ! find "$root" -mindepth 1 -type d -empty -mmin +"$MAX_AGE_MIN" -print0 -delete >"$list" 2>/dev/null; then
+        log "$label: empty-directory sweep reported an error under $root"
+    fi
+    [ -s "$list" ] || return 0
+    mapfile -d '' -t gone <"$list"
+    deletions=$((deletions + ${#gone[@]}))
+    log "$label: removed ${#gone[@]} empty directory(ies)"
 }
 
 # ---------------------------------------------------------------------------
@@ -365,13 +430,9 @@ sweep_builds() {
             mapfile -d '' -t checkouts <"$list"
             for d in "${checkouts[@]}"; do
                 # A checkout is live if ANY file in it changed inside the
-                # window. This walk is the slow part; the second, identical
-                # probe below is not a duplicate — it is the one whose result
-                # is acted on, taken after the walk rather than before it.
-                if must_keep "$d"; then
-                    in_use=$((in_use + 1))
-                    continue
-                fi
+                # window. This walk is the expensive part of the run, so it
+                # happens once; the occupancy re-probe below is what makes the
+                # decision current, and it costs milliseconds.
                 if must_keep "$d"; then
                     in_use=$((in_use + 1))
                     continue
@@ -395,15 +456,14 @@ sweep_builds() {
                 fi
                 if rm -rf -- "$d"; then
                     removed=$((removed + 1))
+                    deletions=$((deletions + 1))
                     log "builds: removed $d"
                 fi
             done
             # Empty directories, but only ones older than the window: an empty
             # directory a runner created seconds ago is a job about to clone
             # into it.
-            if ! find "$slot" -mindepth 1 -type d -empty -mmin +"$MAX_AGE_MIN" -delete 2>/dev/null; then
-                log "builds: empty-directory sweep reported an error under $slot"
-            fi
+            sweep_empty_dirs "$slot" builds
         done
     done
     log "builds: summary: removed $removed, busy slots $busy, in-use $in_use, busy on re-probe $busy_late (window ${MAX_AGE_MIN}min)"
@@ -411,15 +471,14 @@ sweep_builds() {
 
 sweep_cache_age
 sweep_cache_cap
-if ! find "$CACHE_DIR" -mindepth 1 -type d -empty -mmin +"$MAX_AGE_MIN" -delete 2>/dev/null; then
-    log "cache: empty-directory sweep reported an error under $CACHE_DIR"
-fi
+sweep_empty_dirs "$CACHE_DIR" cache
 sweep_builds
 
-after="$(du_total -m "$CACHE_DIR" "$BUILDS_DIR")" ||
+after="$(du_total -k "$CACHE_DIR" "$BUILDS_DIR")" ||
     die "du failed for $CACHE_DIR / $BUILDS_DIR"
 # Signed, because this number can legitimately be positive: a job writing
 # during the sweep grows the trees, and "freed -1200 MiB" was a lie in both
 # directions.
-printf -v summary 'net %+d MiB; cache+builds now %d MiB' "$((after - before))" "$after"
+printf -v summary 'net %s; cache+builds now %s' \
+    "$(signed_kib "$((after - before))")" "$(human_kib "$after")"
 log "$summary"
