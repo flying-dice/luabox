@@ -36,11 +36,14 @@ decision must not add a second system beside it.
    stays only for what this instance's runners cannot cover (macOS/Windows
    matrix) until GitLab has those runners. GitHub issues stay closed; do not
    file there.
-3. **Branch model.** `develop` is the integration branch and default. `main`
-   is the release branch, advanced only by a `develop → main` promotion MR with
-   the approval matrix satisfied (Shockwave + human CODEOWNER; the owner is
-   `jonathanturnock`). Feature branches are `<persona>/issue-<N>` off
-   `develop`, one MR each, pipeline green before review.
+3. **Branch model and who approves what.** `develop` is the integration
+   branch and default; `main` is the release branch. Feature branches are
+   `<persona>/issue-<N>` off `develop`, one MR each, pipeline green before
+   review. Into `develop`: Shockwave approves, Starscream merges — the owner
+   is not in that loop (owner's call, 2026-09-06). Into `main`: a
+   `develop → main` promotion MR that the owner (`jonathanturnock`) approves,
+   and release tags are pushed by the owner. There is no CODEOWNERS file; this
+   clause is the rule.
 4. **Planning artefacts reuse RepoDoc.** Root `STATUS.md` is the information
    radiator (`project-status` skill). `docs/bots/ROADMAP.md` holds milestones and
    order. Sprint tracking is a RepoDoc card on `boards/improvement-sprint/`
