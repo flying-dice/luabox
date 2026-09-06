@@ -1,6 +1,6 @@
 # Status
 
-**Updated:** 2026-09-06 · **Branch:** `starscream/integrate-develop` · **Base:** `origin/develop` @ `1f0194e` · **Owner:** Starscream (Seekers)
+**Updated:** 2026-09-06 11:10 UTC · **Branch:** `starscream/integrate-develop` · **Base:** `origin/develop` @ `1f0194e` · **Owner:** Starscream (Seekers)
 
 Radiator for the working project. Tracker of record is GitLab `origin`
 (decision 14); milestones in [docs/bots/ROADMAP.md](docs/bots/ROADMAP.md);
@@ -33,10 +33,10 @@ MR into `develop`, then a `develop → main` promotion MR for the owner.
 1. MR !5 (`starscream/integrate-develop → develop`): pipeline 20256 green,
    Shockwave review, merge.
 2. MR `develop → main` — the promotion. Reviewer Shockwave, approver the owner.
-3. #69 (MR !2): Thundercracker is closing Shockwave's round — the wrapper arm at
-   `check.rs:2363` must report LB0321 again on `Base<?>?`/`Base<?>[]`/`(Base<?>)`.
-   #78 (MR !4): threads addressed at `72e081a`; retry jobs after #85, re-request
-   Shockwave.
+3. #69 (MR !2): Shockwave's round closed at `e02f7c6` — wrapper arm removed,
+   three probe rows restored, corpus row 69 pins it; re-review requested.
+   #78 (MR !4): threads addressed at `72e081a`. Both wait on #85 for a green
+   pipeline, then Shockwave, then the owner.
 
 ## Later
 
@@ -48,7 +48,8 @@ MR into `develop`, then a `develop → main` promotion MR for the owner.
   structure) — do #79 first and re-measure; #75, #76, #77, #80 from the audit;
   #82 (CI check for test-only deps, raised out of #81), #83 (full-replace
   `didChange` overlay with no clearing event, raised out of #78), #84 (the
-  shutdown-window bound). #80 waits for #73 to stop editing `env.rs`.
+  shutdown-window bound), #86 (unreadable type argument never reported, raised
+  out of #69). #80 waits for #73 to stop editing `env.rs`.
 - **M4:** macOS/Windows runners on this instance, or a decision to keep the
   GitHub Actions matrix permanently.
 
