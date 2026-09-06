@@ -371,12 +371,18 @@ the block ships.
   from the other, with goto-definition jumping to the second. `collect_class`
   now records which class — and which file — won each key as it resolves it,
   exposed as `Ambient::class_field_origins`, and `locate_field` consumes that
-  instead of walking the parent chain itself. The merge's answer decides
-  *which* of two competing declarations the editor shows, never whether it
-  shows one at all: a carrier attachment — `function S.greet()` against a
-  parent that documented `greet` with `---@field` — still hovers the parent's
-  description and jumps to it, exactly as before. Editor-surface only: no
-  diagnostic, no resolved type, and no `luabox check` verdict changes.
+  instead of walking the parent chain itself. An override still shows the
+  documentation it overrides: a carrier attachment — `function S.greet()`
+  against a parent that documented `greet` with `---@field` — hovers the
+  parent's description and jumps to it, exactly as before, whatever type that
+  parent declared. What no longer shows is a same-named declaration on a
+  branch the merge ruled out: for `Leaf : Mid, Other` where `Mid` attaches
+  `f` as a carrier and wins the key, `Other`'s `---@field f string` is a name
+  collision rather than a declaration of `Leaf.f`, and hover no longer quotes
+  its description nor goto-definition jumps to it — previously both did,
+  putting a `string` field's prose under the `fun()` type actually being
+  shown. Editor-surface only: no diagnostic, no resolved type, and no
+  `luabox check` verdict changes.
 
 - **A file's own `---@enum` again shadows a same-named `[types] defs` enum,
   as `---@class` always has and as this block's own duplicate-merge entry

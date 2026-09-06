@@ -547,6 +547,50 @@ mod tests {
         );
     }
 
+    /// …and it does keep one from a class on the owner's own ancestry. The
+    /// same three classes as above with one edge moved — `Leaf : Mid`,
+    /// `Mid : Other` — resolve identically (`owner: Mid`, `site: None`,
+    /// type `fun()`), and `Other`'s `---@field f string` is now the earlier
+    /// link of the member's override lineage rather than a same-named
+    /// collision on a branch the merge dropped. It is quoted despite the type
+    /// disagreeing: the checker admits an incompatible override
+    /// (`luabox_types::assignable`, luals 3.13.5 nominal parity), so blanking
+    /// the documentation for one would diverge from the checker rather than
+    /// agree with it. See `sema::locate_field`'s doc for both sides of the
+    /// line.
+    #[test]
+    fn a_carrier_attached_member_keeps_a_ruled_out_ancestors_description() {
+        let hover = at_files_from(
+            &[
+                (
+                    "mid.lua",
+                    "---@class Mid : Other\nlocal M = {}\nfunction M.f() end\nreturn M\n",
+                ),
+                (
+                    "other.lua",
+                    "---@class Other\n---@field f string the f from Other\n",
+                ),
+                (
+                    "main.lua",
+                    "---@class Leaf : Mid\n\n\
+                     ---@type Leaf\nlocal l = nil\nprint(l.f)\n",
+                ),
+            ],
+            "main.lua",
+            "f)",
+            0,
+        )
+        .expect("hover");
+        assert!(
+            hover.contains("fun()"),
+            "the type is still the carrier's: {hover}"
+        );
+        assert!(
+            hover.contains("the f from Other"),
+            "the lineage's own earlier declaration is the only prose there is: {hover}"
+        );
+    }
+
     /// [`at_files`] over a workspace with a **dependency** definition package
     /// (round 8 review, F7).
     ///

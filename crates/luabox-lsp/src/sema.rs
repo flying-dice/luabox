@@ -902,16 +902,37 @@ pub struct FieldLookup<'a> {
 /// directly with no file visited at all; an owner with no recorded site
 /// (`FieldDeclSite` lists those cases — chiefly a carrier attachment or the
 /// definition layer) **roots the walk at that class** instead of at the one
-/// the cursor named, so the intermediate declarations the merge ruled out are
-/// never visited. `None` — a class the merged layer does not declare, or a
-/// caller with no merged layer to ask — walks from the queried class,
-/// unchanged.
+/// the cursor named, so a same-named declaration on a branch the owner
+/// cannot reach is never visited. `None` — a class the merged layer does not
+/// declare, or a caller with no merged layer to ask — walks from the queried
+/// class, unchanged.
 ///
-/// That is the whole of the narrowing, and it is an ordering: it decides
-/// *which* of two declarations is shown, never whether one is shown. A
-/// carrier attachment declares the member with no `---@field` anywhere in the
-/// owner, so its parent's documentation and jump target are the only ones
-/// there are, and the walk still reaches them (round 9 review).
+/// That narrowing is a **sibling filter**: it drops exactly the classes
+/// reachable from the queried class and *not* from the owner, which
+/// contributed nothing to this key — their same-named `---@field` is a name
+/// collision the merge resolved, not a declaration of the member it
+/// resolved. The owner's **own** ancestry stays reachable whatever type it
+/// declares, because that chain is the member's override lineage and
+/// [`luabox_types::assignable`] deliberately admits an override at an
+/// incompatible type (luals 3.13.5 nominal parity): a type test here would
+/// hide documentation for a shape `luabox check` calls legal.
+///
+/// Two shapes one edge apart draw the line, both pinned at all three editor
+/// surfaces (round 10 review). `Mid` attaches `f` as a carrier and wins the
+/// key; `Other` declares `---@field f string`:
+///
+/// - `Leaf : Mid, Other` — `Other` is off the owner's ancestry, so it is
+///   **filtered** and nothing is shown
+///   (`locate_field_roots_the_walk_at_the_owner_not_the_queried_class`).
+/// - `Leaf : Mid`, `Mid : Other` — `Other` is the lineage's earlier link, so
+///   it is **kept**: its description and jump target are shown under the
+///   carrier's type
+///   (`locate_field_keeps_a_ruled_out_declaration_on_the_owners_own_ancestry`).
+///
+/// The first is why this decides *whether* a declaration is shown and not
+/// only which one — it answers `None` where the unrooted walk answered with
+/// the sibling, which is the point: a `string` field's prose under a `fun()`
+/// type is the divergence #70 closes.
 #[must_use]
 pub fn locate_field(
     lookup: &FieldLookup<'_>,
@@ -950,17 +971,19 @@ pub fn locate_field(
     // Owner known, site not (or recorded but unresolvable). All the merge's
     // answer buys here is a better **root** for the same walk: start at the
     // class it resolved the key to rather than at the class the cursor named,
-    // so the intermediate declarations it ruled out are never visited.
+    // so a branch it ruled out is never entered.
     //
-    // The walk's own two-pass shape supplies the rest. `locate_field_in_class`
-    // exhausts a class's own `---@field`s across every candidate file before
-    // it follows a single parent, which is exactly the precedence this case
-    // needs: an ancestor's declaration for the same name is one the checker
-    // demonstrably did not use, and preferring it would put a description and
-    // a jump target in front of the user for a type that is not the one being
-    // shown. Asking for the owner's own declarations separately first and
-    // falling back to the walk on a miss was the same thing said twice — it
-    // rebuilt the owner's declaration set a second time on exactly the case
+    // What that drops is the owner's *siblings*, and only those — this
+    // function's doc states the rule and names the two one-edge-apart
+    // fixtures that pin each side of it (round 10 review).
+    //
+    // The walk's own two-pass shape supplies the ordering within the lineage.
+    // `locate_field_in_class` exhausts a class's own `---@field`s across every
+    // candidate file before it follows a single parent, so the nearest link
+    // wins — the owner's own declaration over the ancestor it overrides.
+    // Asking for the owner's own declarations separately first and falling
+    // back to the walk on a miss was the same thing said twice — it rebuilt
+    // the owner's declaration set a second time on exactly the case
     // (`function S.greet()` carriers) the walk's own doc calls routine (round
     // 9 clean-code audit, DRY finding 1).
     //
@@ -969,8 +992,7 @@ pub fn locate_field(
     // carrier attachment declares the member with no `---@field` anywhere in
     // the owner, so the parent's is the only description and the only jump
     // target that exist, and the type rendered comes from the carrier either
-    // way. The narrowing decides *which* of two declarations is shown; it
-    // never decides that none is.
+    // way.
     let root = origin.map_or(class, |origin| origin.owner.as_str());
     locate_field_dfs(lookup, root, member, &mut HashMap::new(), 0)
 }
@@ -2420,6 +2442,40 @@ mod tests {
         assert_eq!(from_leaf.desc.as_deref(), Some("the f from Other"));
     }
 
+    /// The other side of the line the previous test draws, one edge apart:
+    /// the same three classes, the same `owner: Mid`/`site: None`/`fun()`
+    /// resolution, with `Other` reached through `Mid`'s own `: Other` rather
+    /// than as `Leaf`'s second parent. On the owner's own ancestry it is
+    /// **kept** — deliberately, and despite declaring `string` under a
+    /// `fun()` type. See [`locate_field`]'s doc for why.
+    #[test]
+    fn locate_field_keeps_a_ruled_out_declaration_on_the_owners_own_ancestry() {
+        let caches = Caches::default();
+        let analysis = analyze_files(&[
+            (
+                "mid.lua",
+                "---@class Mid : Other\nlocal M = {}\nfunction M.f() end\nreturn M\n",
+            ),
+            (
+                "other.lua",
+                "---@class Other\n---@field f string the f from Other\n",
+            ),
+            ("main.lua", "---@class Leaf : Mid\n"),
+        ]);
+        let current = root().join("main.lua");
+        let merged = merged_of(&analysis);
+        let origin = merged
+            .class_field_origin("Leaf", "f")
+            .expect("`Leaf.f` resolves");
+        assert_eq!(origin.owner, "Mid", "the carrier owns the key either way");
+        assert!(origin.site.is_none(), "a carrier records no `---@field`");
+
+        let found = locate_field(&caches.at(&analysis, &current), "Leaf", "f", Some(&origin))
+            .expect("the owner's own ancestry is walked, not filtered");
+        assert_eq!(found.path, root().join("other.lua"));
+        assert_eq!(found.desc.as_deref(), Some("the f from Other"));
+    }
+
     /// One class, its `---@field`s split across two files, and the cursor
     /// sitting in the file that did **not** win the merge. `search_order`
     /// hoists `current` ahead of every other ordinary project file (the R10
@@ -2522,8 +2578,8 @@ mod tests {
         .expect("`Base`'s `---@field` is the only declaration there is");
         assert_eq!(found.path, root().join("base.lua"));
         assert_eq!(found.desc.as_deref(), Some("the greeting from Base"));
-        // Identical to the unaided walk: the narrowing decides which of two
-        // declarations is shown, never whether one is.
+        // Identical to the unaided walk: `Base` is on the owner's own
+        // ancestry, so the sibling filter never considers it.
         let walked = locate_field(&caches.at(&analysis, &current), "Sub", "greet", None)
             .expect("the unaided walk finds it too");
         assert_eq!(walked.path, found.path);

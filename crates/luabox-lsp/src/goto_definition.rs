@@ -441,6 +441,48 @@ mod tests {
         );
     }
 
+    /// The goto-definition half of `hover.rs`'s
+    /// `a_carrier_attached_member_keeps_a_ruled_out_ancestors_description`
+    /// (round 10 review): a declaration the merge did not take
+    /// the type from is still the jump target when it sits on the **owner's
+    /// own ancestry**, because that is the member's override lineage. Move
+    /// the same declaration onto a sibling branch (`Leaf : Mid, Other`) and
+    /// there is no target at all — `sema`'s
+    /// `locate_field_roots_the_walk_at_the_owner_not_the_queried_class`.
+    #[test]
+    fn goto_definition_reaches_a_ruled_out_declaration_on_the_owners_own_ancestry() {
+        let location = at_files_from(
+            &[
+                (
+                    "mid.lua",
+                    "---@class Mid : Other\nlocal M = {}\nfunction M.f() end\nreturn M\n",
+                ),
+                (
+                    "other.lua",
+                    "---@class Other\n---@field f string the f from Other\n",
+                ),
+                (
+                    "main.lua",
+                    "---@class Leaf : Mid\n\n\
+                     ---@type Leaf\nlocal l = nil\nprint(l.f)\n",
+                ),
+            ],
+            "main.lua",
+            "f)",
+            0,
+        )
+        .expect("definition");
+        assert!(
+            location.uri.to_string().ends_with("other.lua"),
+            "the lineage's own earlier link is the only declaration: {location:?}"
+        );
+        assert_eq!(
+            start_of(&location),
+            (1, 3),
+            "other.lua's own `---@field` tag"
+        );
+    }
+
     /// The `(line, character)` start of a location.
     fn start_of(location: &Location) -> (u32, u32) {
         (location.range.start.line, location.range.start.character)
