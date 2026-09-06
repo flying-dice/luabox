@@ -4,9 +4,9 @@ labels: [wave, docs]
 priority: high
 agent: starscream
 live: true
-status: #70/#81 merged to develop; #69/#78 in review; promotion MR next
+status: MR !5 open into develop; #69 round in progress; runner disk full (#85)
 progress: 75
-updatedAt: 2026-09-06T09:30:00.000Z
+updatedAt: 2026-09-06T10:50:00.000Z
 ---
 # Seekers adoption sprint — sign the repo off as run to standard
 
@@ -19,7 +19,7 @@ Decision 14 records the takeover terms; `docs/bots/ROADMAP.md` M0 lists the exit
 - [x] Pipeline red on `main` fixed — coverage jobs died on a cold cache (`$CARGO_HOME/bin` missing)
 - [x] Baseline measured on `main` 75e8d66: fmt clean, clippy clean, 2613 unit tests, 910 CLI + 214 LSP scenarios, all green
 - [x] Divergence found: `develop` carries PR #61 + GitLab CI port, never promoted to `main`
-- [ ] `main` merged into `develop` (branch `starscream/integrate-develop`), gates green, pushed
+- [x] `main` merged into `develop` (branch `starscream/integrate-develop`), gates green (3032/0/7, 924+235), pushed — MR !5
 - [ ] `develop → main` promotion MR open, pipeline green, Shockwave review posted
 - [ ] `STATUS.md`, roadmap, decision 14, backlog/dev docs corrected
 - [x] Soundwave styleguide/architecture audit → issues #75–#81 filed (crate graph clean; 12 findings, 7 actionable)
@@ -36,3 +36,4 @@ Decision 14 records the takeover terms; `docs/bots/ROADMAP.md` M0 lists the exit
 - **starscream** (2026-09-06T02:40:00.000Z): Soundwave audit returned: crate graph acyclic and SPEC §16-conformant, restriction lints honoured, no swallowed I/O errors outside crates/luabox-manifest/src/layout.rs:411-608. Filed #75 (LB0317/18 report policy duplicated CLI/LSP, LSP lacks depth pre-check), #76 (luacats doc/type render helpers duplicated doc_cmd/sema, hover collapses paragraphs), #77 (layout.rs drops unreadable rock sources silently — decided collect-and-report), #78 (server.rs:2323 didChange on unopened doc splices into empty string), #79 (CLI's direct luabox-hir dep), #80 (env.rs impl split + 11 bare allows, after #70/#73), #81 (Cargo hygiene). Dispatched Skywarp on #78, Skywarp-lite on #81.
 - **starscream** (2026-09-06T09:30:00.000Z): Session resumed. #70 (MR !1) and #81 (MR !3) are merged to `develop` (now 1f0194e) — !1 carried two review rounds from Shockwave and an extra fix, `crates/luabox-types/src/env.rs` +450 for the per-key owner plus `fix(lsp): a carrier attachment keeps its parent's ---@field` (e73087a). #69 (MR !2, new codes LB0320/LB0321) and #78 (MR !4) are open with Shockwave reviewing and pipelines running. Merged `origin/develop` into this branch (ca95e2d) — clean, no conflict this time. Suite note carried from the pre-merge run: four `crates/luabox-lsp/tests/shutdown_windows.rs:170` failures, all `the server answers within the read bound: Timeout` against a fixed 10s `READ_TIMEOUT` (`:56`) while five cargo builds ran concurrently (load 40). Re-running quiet to separate flake from regression before the promotion MR.
 - **starscream** (2026-09-06T09:45:00.000Z): Flake hypothesis confirmed — `cargo test -p luabox-lsp --test shutdown_windows` 6/6 green twice at load 1.7, 1.05s per run, against 4/6 failing at load 40. Filed #84 (scale `READ_TIMEOUT` by `LUABOX_PERF_FACTOR` or bound on progress). Wrote root `STATUS.md` per the project-status skill. Running the full workspace suite on the merged tree before opening the MR into `develop`.
+- **starscream** (2026-09-06T10:50:00.000Z): Merged-tree gates green — fmt, clippy, 3032 passed / 0 failed / 7 ignored over 72 binaries, cucumber 924/924 + 235/235. Pushed and opened MR !5 into `develop` (reviewer Shockwave). Shockwave's re-review on !2 (#69) is FAIL with one blocker — `crates/luabox-types/src/check.rs:2363`'s `Optional | Array | Paren` arm silences LB0321 on wrapped `Base<?>`; dispatched Thundercracker with Shockwave's probe table as the contract. !4 (#78) threads are addressed at `72e081a` but pipeline 20253 died on **runner disk** (jobs 28833/28838, `No space left on device`) — filed #85 as owner action; the per-job `target-<job>` caches in .gitlab-ci.yml:96-108 are the structural cause.

@@ -30,10 +30,13 @@ MR into `develop`, then a `develop → main` promotion MR for the owner.
 
 ## Next
 
-1. Full `cargo test --workspace` on the merged tree (post-`develop` merge), then
-   MR `starscream/integrate-develop → develop`, pipeline green, merge.
+1. MR !5 (`starscream/integrate-develop → develop`): pipeline 20256 green,
+   Shockwave review, merge.
 2. MR `develop → main` — the promotion. Reviewer Shockwave, approver the owner.
-3. Land #69 (MR !2) and #78 (MR !4) once Shockwave's rounds close.
+3. #69 (MR !2): Thundercracker is closing Shockwave's round — the wrapper arm at
+   `check.rs:2363` must report LB0321 again on `Base<?>?`/`Base<?>[]`/`(Base<?>)`.
+   #78 (MR !4): threads addressed at `72e081a`; retry jobs after #85, re-request
+   Shockwave.
 
 ## Later
 
@@ -70,8 +73,13 @@ MR into `develop`, then a `develop → main` promotion MR for the owner.
 
 ## Blockers
 
-- None team-side. The `shutdown_windows` timeouts are a fixed 10s wall-clock
-  bound (`crates/luabox-lsp/tests/shutdown_windows.rs:56`) that fails only under
+- **#85 — the CI runner is out of disk (owner action).** Every untagged job
+  lands on runner 3; `.gitlab-ci.yml`'s per-job `target-<job>` caches live on
+  that one host with nothing evicting them. Jobs 28833/28838 on MR !4 died with
+  `No space left on device`; MR !2's `coverage-unit` and MR !5's pipeline share
+  the host. Until it is pruned, red pipelines are infra, not the change.
+- The `shutdown_windows` timeouts are a fixed 10s wall-clock bound
+  (`crates/luabox-lsp/tests/shutdown_windows.rs:56`) that fails only under
   CI-scale load — #84, backlog, not a regression.
 - **Owner-gated, not team-blocked:** #27 (tag `v0.2.0`), #28 (approval-reset
   project setting), #34 (marketplace credentials). Nothing for the team to do.
