@@ -41,6 +41,12 @@
 #   over-cap alarm deleted entirely   -> S25, S26, S27
 #   a failed rm ignored, or the failure count never fatal -> S28, S28b
 #   empty-directory find failure logged instead of fatal -> S29
+#   cap loses the age pass's in-use guard -> S12
+#   the "everything left is in use" alarm text dropped -> S12
+#   corpus no longer drained last     -> S12c
+#   per-candidate du failure fatal again -> S32
+#   empty-dir stderr neither re-emitted nor counted -> S31
+#   alarm reason goes back to a fixed guess -> S25, S25b, S27
 #   sizes always reported in MiB      -> S18b, S25
 #   this file's own refusal on a top-level `cache:` / `include:` -> P17, P18
 # And one against .gitlab-ci.yml itself, through RUNNER_CACHE_SWEEP_CI_YML:
@@ -48,13 +54,24 @@
 #   mutation left this suite GREEN until the writer check expanded keys per
 #   job, which is exactly what round 2's N-3 measured.
 # Every mutation above was rejected by at least one case, none by a case that
-# was merely counting log lines. One property is NOT pinned and is disclosed
-# rather than counted (decision 12 clause 2): that the empty-directory pass
-# counts only directories it actually removed rests on find's documented
-# `-delete` return value and the `-delete -print0` order. Making an rmdir fail
-# needs a permission barrier, and CI runs as root, where there is none — a case
-# built on `chmod` would pass on a dev box and measure nothing in the job. What
-# IS pinned is that a failure there is fatal (S29). Re-run one with:
+# was merely counting log lines.
+#
+# Two properties are NOT pinned, and are disclosed rather than counted
+# (decision 12 clause 2):
+#   - That the empty-directory pass counts only directories it actually
+#     removed rests on find's documented `-delete` return value and the
+#     `-delete -print0` order. Making an rmdir fail needs a permission barrier,
+#     and CI runs as root, where there is none — a case built on `chmod` would
+#     pass on a dev box and measure nothing in the job. What IS pinned is that
+#     a failure there is fatal (S29) and that a refused directory is named and
+#     counted (S31, through a find that reports the refusal).
+#   - Plain-before-corpus drain order is now nearly unreachable: outside the
+#     window the age pass has already taken every non-corpus archive, so the
+#     drain normally sees corpora only. S12c reaches it through the one path
+#     left — an archive the age pass could not remove — and pins the order
+#     from the CAP's own refusal line. If that path is ever closed, the
+#     ordering becomes untestable end-to-end and should be said so rather than
+#     assumed. Re-run one with:
 #   cp scripts/ops/runner-cache-sweep.sh /tmp/mutant.sh && $EDITOR /tmp/mutant.sh
 #   RUNNER_CACHE_SWEEP_BIN=/tmp/mutant.sh bash scripts/tests/runner-cache-sweep-selftest.sh
 #   RUNNER_CACHE_SWEEP_CI_YML=/tmp/mutant-ci.yml bash scripts/tests/runner-cache-sweep-selftest.sh
@@ -173,6 +190,39 @@ done
 exec $(command -v rm) "\$@"
 SHIM
 
+mkdir -p "$work/shim-du-path"
+cat >"$work/shim-du-path/du" <<SHIM
+#!/bin/bash
+# Fault injector: cannot measure anything whose path contains 'unmeasurable'
+# (an archive replaced or unlinked under the drain), every other measurement —
+# including the tree-level ones — passes through.
+for arg in "\$@"; do
+    case "\$arg" in
+    *unmeasurable*)
+        echo "du: cannot access '\$arg': No such file or directory" >&2
+        exit 1
+        ;;
+    esac
+done
+exec $(command -v du) "\$@"
+SHIM
+
+mkdir -p "$work/shim-find-refuse"
+cat >"$work/shim-find-refuse/find" <<SHIM
+#!/bin/bash
+# Fault injector: the empty-directory pass reports one directory it could not
+# delete, exactly as GNU find words it, and exits non-zero. Everything else
+# passes through. A real permission barrier is not available under root, which
+# is what CI runs as.
+for arg in "\$@"; do
+    if [ "\$arg" = -empty ]; then
+        echo "find: cannot delete '\${SELFTEST_REFUSE_PATH:-/nowhere}': Permission denied" >&2
+        exit 1
+    fi
+done
+exec $(command -v find) "\$@"
+SHIM
+
 mkdir -p "$work/shim-find-empty"
 cat >"$work/shim-find-empty/find" <<SHIM
 #!/bin/bash
@@ -210,7 +260,8 @@ exec $(command -v du) "\$@"
 SHIM
 
 chmod +x "$shim"/* "$work/shim-du/du" "$work/shim-du-late/du" "$work/shim-find/find" \
-    "$work/shim-find-empty/find" "$work/shim-rm/rm"
+    "$work/shim-find-empty/find" "$work/shim-find-refuse/find" "$work/shim-du-path/du" \
+    "$work/shim-rm/rm"
 
 # A PATH holding everything the sweep needs EXCEPT docker, so the
 # docker-not-installed branch is exercised the way CI actually meets it (the
@@ -293,6 +344,16 @@ run_sweep() { # run_sweep <case> <fixture> [VAR=value...]
 }
 
 survives() { check_true "$1" test -e "$2"; }
+
+# log_line_before <needle-a> <needle-b> — true when a is logged before b, and
+# false if either is missing. Ordering claims need ordering assertions; a pair
+# of "is present" greps passes whichever order they came in.
+log_line_before() {
+    local a b
+    a="$(grep -nF -- "$1" "$sweep_log" | head -1 | cut -d: -f1)"
+    b="$(grep -nF -- "$2" "$sweep_log" | head -1 | cut -d: -f1)"
+    [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]
+}
 deleted() { check_false "$1" test -e "$2"; }
 
 echo "=== Part 1 — the sweep against fixture trees ==="
@@ -480,69 +541,106 @@ assert_exit S20b_loose_file_under_builds_refuses 2 "$sweep_rc" "$sweep_log" \
     "REFUSED: builds layout: expected runner-token directories"
 
 # --- S11: the cap, and the arithmetic inside it ----------------------------
-# Sizes are in KiB via CACHE_CAP_KIB so the drain runs against a five-megabyte
-# fixture instead of a two-hundred-gigabyte one. Everything here is FRESH, so
-# the age pass cannot be what removed it.
+# Sizes are in KiB via CACHE_CAP_KIB so the drain runs against a one-megabyte
+# fixture instead of a two-hundred-gigabyte one.
+#
+# The archives are fuzz CORPORA, which is not decoration: since the cap took
+# the age pass's freshness guards, the only archives it can ever drain are the
+# ones OUTSIDE the window, and the only archives outside the window that
+# survive the age pass are the corpora it exempts. Anything else has already
+# been deleted by the time the drain runs.
 fx="$(mkfixture s11)"
 ns="$fx/cache/flying-dice/luabox"
-mkfile "$ns/target-check-protected/cache.zip" 256
-mkfile "$ns/target-examples-protected/cache.zip" 256
-mkfile "$ns/target-coverage-unit-protected/cache.zip" 256
-mkfile "$ns/cargo-home-protected/cache.zip" 256
-mkfile "$ns/luals-3.13.5-protected/cache.zip" 256
+mkfile "$ns/fuzz-corpus-one-protected/cache.zip" 256
+mkfile "$ns/fuzz-corpus-two-protected/cache.zip" 256
+mkfile "$ns/fuzz-corpus-three-protected/cache.zip" 256
+mkfile "$ns/fuzz-corpus-four-protected/cache.zip" 256
+mkfile "$ns/fuzz-corpus-five-protected/cache.zip" 256
 mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
-age_tree "$fx" 30
-age_path "$ns/target-check-protected/cache.zip" 300
-age_path "$ns/target-examples-protected/cache.zip" 240
-age_path "$ns/target-coverage-unit-protected/cache.zip" 180
-age_path "$ns/cargo-home-protected/cache.zip" 120
-age_path "$ns/luals-3.13.5-protected/cache.zip" 60
+age_tree "$fx" 4320
+age_tree "$fx/builds" 30
+age_path "$ns/fuzz-corpus-one-protected/cache.zip" 5000
+age_path "$ns/fuzz-corpus-two-protected/cache.zip" 4800
+age_path "$ns/fuzz-corpus-three-protected/cache.zip" 4600
+age_path "$ns/fuzz-corpus-four-protected/cache.zip" 4400
+age_path "$ns/fuzz-corpus-five-protected/cache.zip" 4200
 run_sweep s11 "$fx"
 assert_exit S11a_under_the_cap_the_step_still_reports 0 "$sweep_rc" "$sweep_log" \
     "cache: cap summary: removed 0" "(cap 200GiB)"
-survives "S11a nothing is removed under a 200GiB cap" "$ns/target-check-protected/cache.zip"
+survives "S11a nothing is removed under a 200GiB cap" "$ns/fuzz-corpus-one-protected/cache.zip"
 
 run_sweep s11b "$fx" CACHE_CAP_KIB=650
 assert_exit S11b_cap_drains_oldest_first_and_stops 0 "$sweep_rc" "$sweep_log" \
     "cache: cap summary: removed 3" "(cap 650KiB)"
-deleted "S11b the oldest archive goes first" "$ns/target-check-protected/cache.zip"
-deleted "S11b then the second oldest" "$ns/target-examples-protected/cache.zip"
-deleted "S11b then the third" "$ns/target-coverage-unit-protected/cache.zip"
-survives "S11b the drain stops as soon as the tree is under the cap" "$ns/cargo-home-protected/cache.zip"
-survives "S11b so the newest archives are kept" "$ns/luals-3.13.5-protected/cache.zip"
+deleted "S11b the oldest archive goes first" "$ns/fuzz-corpus-one-protected/cache.zip"
+deleted "S11b then the second oldest" "$ns/fuzz-corpus-two-protected/cache.zip"
+deleted "S11b then the third" "$ns/fuzz-corpus-three-protected/cache.zip"
+survives "S11b the drain stops as soon as the tree is under the cap" "$ns/fuzz-corpus-four-protected/cache.zip"
+survives "S11b so the newest archives are kept" "$ns/fuzz-corpus-five-protected/cache.zip"
 check_false "S11b the cap never touches the builds tree" \
     grep -qF "builds: removed" "$sweep_log"
 
-# --- S12: the corpus is drained last, not oldest-first ---------------------
-# The corpus here is the OLDEST file in the tree, so a plain oldest-first drain
-# eats it first. It is accumulated state; a rebuildable target tree is not.
+# --- S12: over the cap is not a licence to delete live archives ------------
+# Every archive here was touched inside the window — a job wrote it today — and
+# the tree is far over the cap. The drain takes none of them and the run says
+# why, instead of evicting a live cache once an hour, every hour, for as long
+# as the cap is exceeded.
 fx="$(mkfixture s12)"
 ns="$fx/cache/flying-dice/luabox"
 mkfile "$ns/fuzz-corpus-lua_parse-protected/cache.zip" 256
 mkfile "$ns/target-check-protected/cache.zip" 256
 mkfile "$ns/cargo-home-protected/cache.zip" 256
+mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
 age_tree "$fx" 30
 age_path "$ns/fuzz-corpus-lua_parse-protected/cache.zip" 600
 age_path "$ns/target-check-protected/cache.zip" 300
 age_path "$ns/cargo-home-protected/cache.zip" 120
 run_sweep s12 "$fx" CACHE_CAP_KIB=600
-assert_exit S12_cap_drains_rebuildable_archives_before_the_corpus 0 "$sweep_rc" "$sweep_log" \
-    "cache: cap summary: removed 1" \
-    "cache: cap removed $ns/target-check-protected/cache.zip" \
-    "!cache: cap removed $ns/fuzz-corpus-lua_parse-protected/cache.zip"
-survives "S12 the oldest file in the tree survives because it is a corpus" \
-    "$ns/fuzz-corpus-lua_parse-protected/cache.zip"
-deleted "S12 the rebuildable tree went instead" "$ns/target-check-protected/cache.zip"
+assert_exit S12_a_cap_never_evicts_an_archive_inside_the_window 2 "$sweep_rc" "$sweep_log" \
+    "cache: cap summary: removed 0, in-use 3" \
+    "over the 600KiB cap; everything left is in use (3 archive(s) inside the window)" \
+    "syslog: -p user.err -t runner-cache-sweep" \
+    "!cache: cap removed"
+survives "S12 the archive a job wrote an hour ago is still there" "$ns/cargo-home-protected/cache.zip"
+survives "S12 and so is the one from five hours ago" "$ns/target-check-protected/cache.zip"
+survives "S12 and the corpus" "$ns/fuzz-corpus-lua_parse-protected/cache.zip"
 
-# 30 KiB is above what the directories alone measure and far below the three
-# archives: the drain has to take all of them, corpus included, and can still
-# get under the cap. A cap no drain could ever reach is a permanent alarm now
-# (S27), which is correct but is not what this case is about.
+# The same tree, aged out of the window: now the cap may act, and the corpus
+# the age rule exempts is what it drains. 30 KiB is above what the directories
+# alone measure and far below the archives, so the drain can reach it.
+age_tree "$fx/cache" 4320
 run_sweep s12b "$fx" CACHE_CAP_KIB=30
 assert_exit S12b_the_corpus_is_still_subject_to_the_cap 0 "$sweep_rc" "$sweep_log" \
     "cache: cap removed $ns/fuzz-corpus-lua_parse-protected/cache.zip"
 deleted "S12b under enough pressure the corpus goes too" \
     "$ns/fuzz-corpus-lua_parse-protected/cache.zip"
+
+# --- S12c: rebuildable archives are still offered to the drain first -------
+# Corpus-last ordering is nearly unobservable now: outside the window the age
+# pass has already taken every non-corpus archive, so the drain normally sees
+# corpora only. The one reachable path is an archive the age pass could not
+# remove — it is still a candidate, and it must be OFFERED before the corpus
+# is. The refusal is what makes the attempt visible in the log.
+fx="$(mkfixture s12c)"
+ns="$fx/cache/flying-dice/luabox"
+mkfile "$ns/undeletable-target-protected/cache.zip" 256
+mkfile "$ns/fuzz-corpus-lua_parse-protected/cache.zip" 256
+mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
+age_tree "$fx" 4320
+age_tree "$fx/builds" 30
+age_path "$ns/undeletable-target-protected/cache.zip" 4200
+age_path "$ns/fuzz-corpus-lua_parse-protected/cache.zip" 9000
+run_sweep s12c "$fx" CACHE_CAP_KIB=30 PATH="$work/shim-rm:$shim:$PATH"
+assert_exit S12c_the_drain_offers_rebuildable_archives_before_corpora 3 "$sweep_rc" "$sweep_log" \
+    "cache: cap FAILED to remove $ns/undeletable-target-protected/cache.zip" \
+    "cache: cap removed $ns/fuzz-corpus-lua_parse-protected/cache.zip" \
+    "2 archive(s) matched '*.zip', 1 drained, 1 refused"
+# The CAP's own refusal line, not the age pass's: both passes meet this archive
+# and only the cap's attempt says anything about drain order. Pinning the age
+# pass's line here would be an assertion that cannot fail.
+check_true "S12c the rebuildable archive is offered to the drain before the older corpus" \
+    log_line_before "cache: cap FAILED to remove $ns/undeletable-target-protected/cache.zip" \
+    "cache: cap removed $ns/fuzz-corpus-lua_parse-protected/cache.zip"
 
 # --- S13: the corpus is exempt from the age rule ---------------------------
 fx="$(mkfixture s13)"
@@ -727,12 +825,29 @@ mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
 age_tree "$fx" 4320
 run_sweep s25 "$fx" CACHE_CAP_KIB=1
 assert_exit S25_over_cap_with_no_candidates_refuses 2 "$sweep_rc" "$sweep_log" \
-    "REFUSED: cache is" "over the 1KiB cap" "no '*.zip' archive matched" \
+    "REFUSED: cache is" "over the 1KiB cap" \
+    "0 archive(s) matched '*.zip', 0 drained, 0 refused, 0 in use, 0 unmeasured" \
     "syslog: -p user.err -t runner-cache-sweep" \
     "cache: cap summary: removed 0"
 survives "S25 the archive it cannot drain is left alone" "$zst"
 check_true "S25 the size that triggered it is legible, not rounded to ~0 MiB" \
     grep -qE 'cache is [0-9]+ KiB, over the 1KiB cap' "$sweep_log"
+check_true "S25 the reason names the glob and an example of what it cannot see" \
+    grep -qF "do not match the '*.zip' glob this sweep drains, e.g. $zst" "$sweep_log"
+
+# --- S25b: over the cap on directories alone -------------------------------
+# No archives, no files at all — the space is structure. Naming a file the glob
+# missed would be a lie here, so the reason says what it measured instead.
+fx="$(mkfixture s25b)"
+mkdir -p "$fx/cache/flying-dice/luabox/target-check-protected/inner"
+mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
+age_tree "$fx" 4320
+age_tree "$fx/builds" 30
+run_sweep s25b "$fx" CACHE_CAP_KIB=1
+assert_exit S25b_over_cap_on_non_archive_content_says_so 2 "$sweep_rc" "$sweep_log" \
+    "REFUSED: cache is" \
+    "there are no other files either — the space is non-archive content" \
+    "!do not match the '*.zip' glob"
 
 # --- S26: the same alarm, after the age pass has already removed something --
 fx="$(mkfixture s26)"
@@ -758,19 +873,22 @@ survives "S26 the archive the glob cannot see is untouched" "$zst"
 fx="$(mkfixture s27)"
 ns="$fx/cache/flying-dice/luabox"
 zst="$ns/cargo-home-protected/cache.zst"
-zip="$ns/target-check-protected/cache.zip"
+zip="$ns/fuzz-corpus-lua_parse-protected/cache.zip"
 mkfile "$zst" 684
 mkfile "$zip" 8
 mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
-age_tree "$fx" 30
+age_tree "$fx" 4320
+age_tree "$fx/builds" 30
 run_sweep s27 "$fx" CACHE_CAP_KIB=650
 assert_exit S27_still_over_the_cap_after_the_drain_is_not_a_success 3 "$sweep_rc" "$sweep_log" \
     "cache: cap removed $zip" \
     "PARTIALLY SWEPT after 1 removal(s): cache is" \
-    "over the 650KiB cap, after draining 1 of 1 archive(s)" \
+    "1 archive(s) matched '*.zip', 1 drained, 0 refused, 0 in use, 0 unmeasured" \
     "syslog: -p user.err -t runner-cache-sweep"
 deleted "S27 it drained what it could" "$zip"
-survives "S27 and named the archive it cannot see" "$zst"
+survives "S27 and left what it cannot see" "$zst"
+check_true "S27 the reason names the glob and the .zst the drain never saw" \
+    grep -qF "do not match the '*.zip' glob this sweep drains, e.g. $zst" "$sweep_log"
 
 # --- S28: a failed rm is reported, counted, and fatal ----------------------
 # `rm` failing wrote to stderr, which cron sends to /dev/null, and the run
@@ -787,7 +905,7 @@ age_tree "$fx" 4320
 age_tree "$fx/builds" 30
 run_sweep s28 "$fx" PATH="$work/shim-rm:$shim:$PATH"
 assert_exit S28_a_failed_removal_is_reported_and_fatal 3 "$sweep_rc" "$sweep_log" \
-    "cache: FAILED to remove $bad_zip" \
+    "cache: age FAILED to remove $bad_zip" \
     "PARTIALLY SWEPT after 1 removal(s): 1 removal(s) failed" \
     "net " \
     "syslog: -p user.err -t runner-cache-sweep"
@@ -802,7 +920,7 @@ age_tree "$fx" 4320
 age_tree "$fx/builds" 30
 run_sweep s28b "$fx" PATH="$work/shim-rm:$shim:$PATH"
 assert_exit S28b_a_failed_removal_with_nothing_deleted_exits_2 2 "$sweep_rc" "$sweep_log" \
-    "cache: FAILED to remove $bad_zip" \
+    "cache: age FAILED to remove $bad_zip" \
     "REFUSED: 1 removal(s) failed" \
     "!PARTIALLY SWEPT"
 survives "S28b nothing was deleted, so nothing is claimed to have been" "$bad_zip"
@@ -821,6 +939,48 @@ assert_exit S29_an_empty_directory_sweep_failure_is_fatal 3 "$sweep_rc" "$sweep_
     "cache: age removed $zip" \
     "PARTIALLY SWEPT after 1 removal(s): empty-directory sweep failed under" \
     "syslog: -p user.err -t runner-cache-sweep"
+
+# --- S31: a directory the empty-dir pass could not delete is named ---------
+# find writes `find: cannot delete '<path>'` to stderr, and cron sends stderr
+# to /dev/null: the one record of what was refused disappeared. Re-emitted
+# through the syslog channel, by path, and counted like any other failure.
+fx="$(mkfixture s31)"
+zip="$fx/cache/flying-dice/luabox/target-check-protected/cache.zip"
+stale_dir="$fx/cache/flying-dice/luabox/stale-key-protected"
+mkfile "$zip"
+mkdir -p "$stale_dir"
+mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
+age_tree "$fx" 4320
+run_sweep s31 "$fx" PATH="$work/shim-find-refuse:$shim:$PATH" \
+    SELFTEST_REFUSE_PATH="$stale_dir"
+assert_exit S31_a_refused_directory_removal_is_named_and_counted 3 "$sweep_rc" "$sweep_log" \
+    "cache: find: cannot delete '$stale_dir': Permission denied" \
+    "empty-directory sweep failed under $fx/cache (1 removal(s) refused)" \
+    "syslog: -p user.err -t runner-cache-sweep -- cache: find: cannot delete '$stale_dir'"
+
+# --- S32: one unmeasurable candidate does not abandon the eviction ---------
+# An archive replaced or unlinked between the scan and its `du` used to abort
+# the whole drain with rc=2, leaving the tree over cap. It is one candidate:
+# skip it, say so, keep going. Only the OUTCOME decides the exit code.
+fx="$(mkfixture s32)"
+ns="$fx/cache/flying-dice/luabox"
+mkfile "$ns/fuzz-corpus-one-protected/cache.zip" 256
+mkfile "$ns/fuzz-corpus-unmeasurable-protected/cache.zip" 256
+mkfile "$ns/fuzz-corpus-three-protected/cache.zip" 256
+mkfile "$fx/builds/zAbCd/0/flying-dice/luabox/.git/HEAD"
+age_tree "$fx" 4320
+age_tree "$fx/builds" 30
+age_path "$ns/fuzz-corpus-one-protected/cache.zip" 5000
+age_path "$ns/fuzz-corpus-unmeasurable-protected/cache.zip" 4800
+age_path "$ns/fuzz-corpus-three-protected/cache.zip" 4600
+run_sweep s32 "$fx" CACHE_CAP_KIB=400 PATH="$work/shim-du-path:$shim:$PATH"
+assert_exit S32_an_unmeasurable_candidate_is_skipped_not_fatal 0 "$sweep_rc" "$sweep_log" \
+    "cache: cap could not measure $ns/fuzz-corpus-unmeasurable-protected/cache.zip — skipped" \
+    "cache: cap summary: removed 2, in-use 0, failed 0, unmeasured 1" \
+    "!REFUSED" "!PARTIALLY SWEPT"
+deleted "S32 the drain carried on past it" "$ns/fuzz-corpus-three-protected/cache.zip"
+survives "S32 and left the one it could not measure" \
+    "$ns/fuzz-corpus-unmeasurable-protected/cache.zip"
 
 echo
 echo "=== Part 2 — every cache key keeps a pull-push writer, per JOB ==="

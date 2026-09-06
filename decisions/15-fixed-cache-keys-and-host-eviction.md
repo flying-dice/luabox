@@ -130,7 +130,11 @@ not bound — a hashed key is unbounded whether there are twelve of them or one.
      `fuzz` runs only on a `changes:`-matching MR or a manual run — days
      apart. Under a 24 h rule every fuzz run would start from an empty corpus,
      which is the one cache in this file whose loss is not merely a slower
-     job. The cap still applies to it, last, after every rebuildable archive.
+     job. The cap still applies to it, last, after every rebuildable archive —
+     and in practice the corpora are most of what the cap can ever take,
+     because the cap obeys the same window as the age rule: it does not evict
+     an archive whose key directory or own mtime falls inside it. An over-cap
+     tree made entirely of archives written today is reported, not evicted.
    - **The sweep refuses rather than reports zero, and its exit code says
      whether it had already deleted anything.** A missing bind mount, a failed
      `du`, a `/builds` that is not `<token>/<slot>/<ns>/<project>`, or a tree

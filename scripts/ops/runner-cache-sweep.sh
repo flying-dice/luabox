@@ -65,9 +65,15 @@
 #     alone cannot see a job that has started but not yet written; the
 #     occupancy re-probe can, because the runner marks the slot busy for the
 #     whole job. A re-probe that cannot answer counts as busy.
-#   - Never deletes an archive whose key directory was touched inside the
-#     window (the runner creates that directory before writing the archive),
-#     and never deletes an empty directory younger than the window.
+#   - Never deletes an archive whose key directory or own mtime falls inside
+#     the window — in EITHER pass. The runner creates the key directory before
+#     it writes the archive, so anything inside the window belongs to a job
+#     that ran today. Being over the cap does not change that: the cap drains
+#     what is outside the window, and if that is not enough it says so and
+#     exits non-zero rather than evicting live archives once an hour.
+#   - Never deletes an empty directory younger than the window, and re-emits
+#     every `find: cannot delete '<path>'` from that pass at `user.err`,
+#     counted like any other failed removal.
 #
 # ASSUMPTIONS, asserted rather than hoped for: <builds>/<token>/<slot> with a
 # NUMERIC slot; checkouts two levels below a slot (<namespace>/<project>). A
@@ -340,7 +346,7 @@ sweep_cache_age() {
             log "cache: age removed $f"
         else
             failures=$((failures + 1))
-            err "cache: FAILED to remove $f"
+            err "cache: age FAILED to remove $f"
         fi
     done
     log "cache: age summary: removed $removed, exempt $exempt, in-use $skipped (window ${MAX_AGE_MIN}min)"
@@ -359,7 +365,7 @@ sweep_cache_cap() {
         cap_kb=$((CACHE_CAP_GIB * 1024 * 1024))
         cap_label="${CACHE_CAP_GIB}GiB"
     fi
-    local size_kb removed=0
+    local size_kb removed=0 cap_failed=0 cap_in_use=0 cap_unmeasured=0
     local -a rows=() plain=() corpus=() ordered=()
     size_kb="$(du_total -k "$CACHE_DIR")" || die "du failed for $CACHE_DIR"
     if ! find "$CACHE_DIR" -type f -name '*.zip' -printf '%T@\t%p\0' >"$list"; then
@@ -381,15 +387,34 @@ sweep_cache_cap() {
         [ "$size_kb" -gt "$cap_kb" ] || break
         # Deleted by the age pass or by a runner between the scan and here.
         [ -e "$f" ] || continue
-        fkb="$(du_total -k "$f")" || die "du failed for $f"
+        # The SAME guards as the age pass. Being over the cap is not a licence
+        # to delete an archive a job is using: the runner touches the key
+        # directory before it writes, and it touches the archive when it
+        # writes, so anything inside the window belongs to a job that ran
+        # today. If that leaves the tree over the cap, this run says so
+        # (below) instead of evicting live data hourly.
+        parent="$(dirname -- "$f")"
+        if must_keep "$parent" || must_keep "$f"; then
+            cap_in_use=$((cap_in_use + 1))
+            continue
+        fi
+        # A per-candidate measurement failure is not a reason to abandon the
+        # eviction: the archive was replaced or unlinked under us. Skip it,
+        # say so, keep draining. Tree-level `du` still refuses (above).
+        if ! fkb="$(du_total -k "$f")"; then
+            cap_unmeasured=$((cap_unmeasured + 1))
+            log "cache: cap could not measure $f — skipped"
+            continue
+        fi
         if rm -f -- "$f"; then
             size_kb=$((size_kb - fkb))
             removed=$((removed + 1))
             deletions=$((deletions + 1))
             log "cache: cap removed $f"
         else
+            cap_failed=$((cap_failed + 1))
             failures=$((failures + 1))
-            err "cache: FAILED to remove $f"
+            err "cache: cap FAILED to remove $f"
         fi
     done
     # Logged on every run, including the runs where it removes nothing: a cap
@@ -397,7 +422,7 @@ sweep_cache_cap() {
     # The size is an estimate — the measurement is taken once and each removed
     # file subtracted from it, rather than re-walking the whole tree per
     # deletion; the honest number is in the net line at the end.
-    log "cache: cap summary: removed $removed, tree now ~$(human_kib "$size_kb") (cap $cap_label)"
+    log "cache: cap summary: removed $removed, in-use $cap_in_use, failed $cap_failed, unmeasured $cap_unmeasured, tree now ~$(human_kib "$size_kb") (cap $cap_label)"
     # The alarm is on the OUTCOME, not on one of its causes. Whatever the
     # reason — nothing matched the archive glob, the candidates vanished under
     # us, a removal failed — a tree still over the cap when the drain ends
@@ -407,11 +432,37 @@ sweep_cache_cap() {
     # reason text because it names the likeliest cause (`cache.zst` after a
     # runner upgrade, a changed cache layout).
     if [ "$size_kb" -gt "$cap_kb" ]; then
-        if [ "${#ordered[@]}" -eq 0 ]; then
-            die "cache is $(human_kib "$size_kb"), over the $cap_label cap, and no '*.zip' archive matched under $CACHE_DIR — check the runner's archive naming/layout"
-        fi
-        die "cache is $(human_kib "$size_kb"), over the $cap_label cap, after draining $removed of ${#ordered[@]} archive(s) — the rest could not be removed or no longer exist"
+        cap_alarm "$size_kb" "$cap_label" "${#ordered[@]}" "$removed" \
+            "$cap_failed" "$cap_in_use" "$cap_unmeasured"
     fi
+}
+
+# Why the tree is still over the cap, in the terms this run actually measured:
+# how many archives matched the glob, how many were drained, how many refused,
+# how many were left alone as in-use, and whether the space is sitting in files
+# the glob cannot see. The previous version guessed ("the rest could not be
+# removed or no longer exist") and guessed wrong for the case that matters
+# most — a `cache.zst` after a runner upgrade, which no `*.zip` sweep will ever
+# touch and which reads as a mystery unless the message names the glob.
+cap_alarm() { # cap_alarm <size-kb> <cap-label> <matched> <drained> <failed> <in-use> <unmeasured>
+    local size_kb="$1" cap_label="$2" matched="$3" drained="$4"
+    local cap_failed="$5" cap_in_use="$6" cap_unmeasured="$7"
+    local head example="" reason
+    head="cache is $(human_kib "$size_kb"), over the $cap_label cap"
+
+    # Everything the drain left behind belongs to a job inside the window.
+    if [ "$cap_in_use" -gt 0 ] && [ "$((matched - drained))" -eq "$cap_in_use" ]; then
+        die "$head; everything left is in use ($cap_in_use archive(s) inside the window)"
+    fi
+
+    reason="$matched archive(s) matched '*.zip', $drained drained, $cap_failed refused, $cap_in_use in use, $cap_unmeasured unmeasured"
+    example="$(find "$CACHE_DIR" -type f ! -name '*.zip' -print -quit 2>/dev/null)" || example=""
+    if [ -n "$example" ]; then
+        reason="$reason; files under $CACHE_DIR do not match the '*.zip' glob this sweep drains, e.g. $example"
+    elif [ "$matched" -eq 0 ]; then
+        reason="$reason; nothing under $CACHE_DIR matches '*.zip' and there are no other files either — the space is non-archive content"
+    fi
+    die "$head: $reason"
 }
 
 # Empty directories older than the window. An empty directory a runner created
@@ -427,20 +478,33 @@ sweep_cache_cap() {
 # claim with an exception in it — and the one exception was the pass that
 # removes things.
 sweep_empty_dirs() { # sweep_empty_dirs <root> <label>
-    local root="$1" label="$2" list="$work/empty-dirs"
+    local root="$1" label="$2" list="$work/empty-dirs" errs="$work/empty-dirs.err"
     local -a gone=()
-    if ! find "$root" -mindepth 1 -type d -empty -mmin +"$MAX_AGE_MIN" -delete -print0 >"$list"; then
-        # Count what it managed before the failure, so the exit code is right.
-        if [ -s "$list" ]; then
-            mapfile -d '' -t gone <"$list"
-            deletions=$((deletions + ${#gone[@]}))
-        fi
-        die "empty-directory sweep failed under $root"
+    local rc=0 line refused=0
+    find "$root" -mindepth 1 -type d -empty -mmin +"$MAX_AGE_MIN" -delete -print0 \
+        >"$list" 2>"$errs" || rc=$?
+    # find's diagnostics name the directory it could not remove, and they are
+    # the only record of it. On stderr they go to cron's /dev/null; re-emitted
+    # here they reach syslog at user.err, by path, and count like any other
+    # failed removal.
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        err "$label: $line"
+        case "$line" in
+        *"cannot delete"*)
+            refused=$((refused + 1))
+            failures=$((failures + 1))
+            ;;
+        esac
+    done <"$errs"
+    if [ -s "$list" ]; then
+        mapfile -d '' -t gone <"$list"
+        deletions=$((deletions + ${#gone[@]}))
+        log "$label: removed ${#gone[@]} empty directory(ies)"
     fi
-    [ -s "$list" ] || return 0
-    mapfile -d '' -t gone <"$list"
-    deletions=$((deletions + ${#gone[@]}))
-    log "$label: removed ${#gone[@]} empty directory(ies)"
+    if [ "$rc" -ne 0 ]; then
+        die "empty-directory sweep failed under $root ($refused removal(s) refused)"
+    fi
 }
 
 # ---------------------------------------------------------------------------

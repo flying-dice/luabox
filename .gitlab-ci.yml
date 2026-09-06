@@ -106,7 +106,12 @@
 #     2026-09-06): `/cache` archives and `/builds` checkouts untouched for 24 h
 #     are deleted, with `fuzz-corpus-*` exempt from that rule (accumulated
 #     state, not a rebuildable tree — see the fuzz entry below); a 200 GiB cap
-#     on `/cache` is the backstop, oldest first, corpora drained last. It takes
+#     on `/cache` is the backstop, oldest first, corpora drained last. The cap
+#     obeys the same window: it never evicts an archive whose key directory or
+#     own mtime falls inside it, because that archive belongs to a job that ran
+#     today. If what is outside the window is not enough to get under the cap,
+#     the sweep says so and exits non-zero rather than evicting live archives
+#     hourly. It takes
 #     a lock, skips any concurrency slot with a job container running (re-read
 #     per checkout, immediately before each `rm -rf`), and REFUSES with
 #     `logger -p user.err` if a bind mount is missing, if ANY `du` or `find`
