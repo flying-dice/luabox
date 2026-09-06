@@ -1,11 +1,11 @@
 ---
 name: user-working-style
-description: How Jonathan (owner) runs Starscream sessions — unattended runs, direct-to-main for meta/config, approvals only on main promotions + tags, expects STATUS.md + issue sync + push before exit
+description: How the owner runs Starscream sessions — unattended runs, direct-to-main for meta/config, approvals only on main promotions + tags, expects STATUS.md + issue sync + push before exit
 metadata:
   type: user
 ---
 
-Jonathan Turnock (jonathan.turnock@gmail.com, GitHub `JonathanTurnock`, GitLab `jonathanturnock`) owns luabox. Runs Starscream sessions **unattended**: "do not wait for user input; proceed until blocked by human input on all items."
+The owner (GitLab `jonathanturnock`) owns luabox. Runs Starscream sessions **unattended**: "do not wait for user input; proceed until blocked by human input on all items."
 
 - Harness/skill/agent config (`.claude/`, `.agents/`, `.codex/`, agent memory) may be committed straight to `main` when he asks — no MR ceremony for meta files.
 - **Approvals (his call, 2026-09-06):** he does NOT review MRs into `develop` — Shockwave approves, Starscream merges. He approves only the `develop → main` promotion MR and pushes release tags. Written into decision 14 clause 3. Don't ask him to review feature MRs.

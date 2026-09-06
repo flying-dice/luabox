@@ -2,3 +2,4 @@
 - [User working style](user_working_style.md) — Jonathan runs unattended sessions; meta config straight to main; exit contract = STATUS.md + issue sync + push
 - [Bot briefs](feedback_bot_briefs.md) — bots may push from their own `starscream/issue-N` branches; verify by `glab mr list`, not assigned worktrees
 - [CI runner host](reference_ci_runner_host.md) — runner is a docker container on Unraid `enterprise`; builds/cache on NVMe since 2026-09-06; hourly 24h sweep; automation denied destructive host cmds
+- [No PII in memory](feedback_no_pii_in_memory.md) — memory is public-mirrored; role/username only, never email or secrets
