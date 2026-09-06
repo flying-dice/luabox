@@ -17,11 +17,16 @@
 # It checks rules, not an inventory, so it does not need updating when a skill
 # or a bot is added:
 #
-#   1. Skill trees are byte-identical, except SKILL_ONE_SIDED below.
-#   2. A Codex agent body equals its Claude twin plus an appended
-#      "## Operating in Codex" section, once the harness-API terms in
-#      CLAUDE_TO_CODEX_TERMS are translated.
-#   3. A skill that mirrors an agent definition equals that agent's Codex body.
+#   1. Skill trees are byte-identical, except SKILL_ONE_SIDED below. Every
+#      compared skill file is non-empty.
+#   2. Agent definitions exist on both sides (a Codex-only or Claude-only
+#      agent fails, except AGENT_ONE_SIDED below); a Codex agent body equals
+#      its Claude twin plus an appended "## Operating in Codex" section
+#      (the section must actually be present — deleting it and having the
+#      truncated body happen to match is not parity), once the harness-API
+#      terms in CLAUDE_TO_CODEX_TERMS are translated; neither body is empty.
+#   3. A skill that mirrors an agent definition equals that agent's Codex
+#      body, and is non-empty.
 #
 # Run it directly; it takes under a second and needs nothing but coreutils.
 set -euo pipefail
@@ -42,6 +47,11 @@ CODEX_AGENTS_DIR=.codex/agents
 #   session. Rule 3 below is what keeps that extra copy honest.
 SKILL_ONE_SIDED=starscream
 
+# Agents that exist under one harness root only, and why. Space-separated
+# stems (no extension). Empty at present — every .codex/agents/*.toml has a
+# .claude/agents/bots/*.md twin, and vice versa.
+AGENT_ONE_SIDED=
+
 # Wording that legitimately differs between the two harnesses because the
 # underlying capability is named differently. One entry per line,
 # "<claude text>\t<codex text>". Anything NOT listed here must match.
@@ -55,6 +65,24 @@ fails=0
 fail() {
     printf 'FAIL: %s\n' "$1" >&2
     fails=$((fails + 1))
+}
+
+# A byte-identical (or otherwise equal) empty pair still passes an equality
+# check. Catch that separately: content must have at least one non-blank
+# character.
+assert_nonblank() {
+    local content="$1" label="$2"
+    if ! printf '%s' "$content" | grep -q '[^[:space:]]'; then
+        fail "$label is empty or whitespace-only"
+    fi
+}
+
+is_one_sided() {
+    local needle="$1" list="$2" name
+    for name in $list; do
+        [ "$name" = "$needle" ] && return 0
+    done
+    return 1
 }
 
 # Body of a markdown definition: everything after the YAML frontmatter, with
@@ -111,7 +139,13 @@ if [ "$skill_pairs" -eq 0 ]; then
     fail "no skills found under $CLAUDE_SKILLS_DIR — this gate would pass vacuously"
 fi
 
-# --- Rules 2 and 3: agent definitions ---------------------------------------
+# A byte-identical empty file passes `diff -r` too. Every compared skill
+# file, on both roots, must actually have content.
+while IFS= read -r -d '' skill_file; do
+    assert_nonblank "$(cat "$skill_file")" "$skill_file"
+done < <(find "$CLAUDE_SKILLS_DIR" "$CODEX_SKILLS_DIR" -type f -print0)
+
+# --- Rule 2 (forward): every Claude agent has a Codex twin, body parity -----
 
 bots=0
 for claude_def in "$CLAUDE_AGENTS_DIR"/*.md; do
@@ -119,13 +153,23 @@ for claude_def in "$CLAUDE_AGENTS_DIR"/*.md; do
     codex_def="$CODEX_AGENTS_DIR/$name.toml"
 
     if [ ! -f "$codex_def" ]; then
+        is_one_sided "$name" "$AGENT_ONE_SIDED" && continue
         fail "$claude_def has no Codex twin at $codex_def"
         continue
     fi
     bots=$((bots + 1))
 
-    want=$(markdown_body "$claude_def" | translate_claude_to_codex | strip_trailing_blanks)
-    got=$(codex_body "$codex_def" | without_codex_trailer | strip_trailing_blanks)
+    claude_body=$(markdown_body "$claude_def")
+    codex_body_raw=$(codex_body "$codex_def")
+    assert_nonblank "$claude_body" "$claude_def body"
+    assert_nonblank "$codex_body_raw" "$codex_def body"
+
+    if ! printf '%s\n' "$codex_body_raw" | grep -qxF '## Operating in Codex'; then
+        fail "$codex_def is missing the '## Operating in Codex' trailer required by rule 2"
+    fi
+
+    want=$(printf '%s\n' "$claude_body" | translate_claude_to_codex | strip_trailing_blanks)
+    got=$(printf '%s\n' "$codex_body_raw" | without_codex_trailer | strip_trailing_blanks)
 
     if [ "$want" != "$got" ]; then
         fail "$codex_def has drifted from $claude_def (< Claude, > Codex):"
@@ -136,7 +180,8 @@ for claude_def in "$CLAUDE_AGENTS_DIR"/*.md; do
     mirror="$CODEX_SKILLS_DIR/$name/SKILL.md"
     [ -f "$mirror" ] || continue
     mirrored=$(markdown_body "$mirror" | strip_trailing_blanks)
-    full_codex=$(codex_body "$codex_def" | strip_trailing_blanks)
+    full_codex=$(printf '%s\n' "$codex_body_raw" | strip_trailing_blanks)
+    assert_nonblank "$mirrored" "$mirror body"
     if [ "$mirrored" != "$full_codex" ]; then
         fail "$mirror has drifted from $codex_def (< skill copy, > agent definition):"
         diff <(printf '%s\n' "$mirrored") <(printf '%s\n' "$full_codex") >&2 || true
@@ -146,6 +191,17 @@ done
 if [ "$bots" -eq 0 ]; then
     fail "no agent definitions found under $CLAUDE_AGENTS_DIR — this gate would pass vacuously"
 fi
+
+# --- Rule 2 (reverse): every Codex agent has a Claude twin -------------------
+
+for codex_def in "$CODEX_AGENTS_DIR"/*.toml; do
+    name=$(basename "$codex_def" .toml)
+    is_one_sided "$name" "$AGENT_ONE_SIDED" && continue
+    claude_def="$CLAUDE_AGENTS_DIR/$name.md"
+    if [ ! -f "$claude_def" ]; then
+        fail "$codex_def has no Claude twin at $claude_def"
+    fi
+done
 
 printf '%d skill tree(s) compared, %d agent definition pair(s) compared\n' \
     "$skill_pairs" "$bots"
