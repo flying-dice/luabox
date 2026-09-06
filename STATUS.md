@@ -1,6 +1,6 @@
 # Status
 
-**Updated:** 2026-09-06 16:10 UTC · **Integration branch:** `develop` · **Release branch:** `main` · **Owner:** Starscream (Seekers)
+**Updated:** 2026-09-06 16:27 UTC (commit time) · **Integration branch:** `develop` · **Release branch:** `main` · **Owner:** Starscream (Seekers)
 
 SHAs are not pinned here — the tracker and `git log` are authoritative; this file
 carries states and measurements with the pipeline id that produced them.
@@ -15,12 +15,13 @@ sprint detail on [board card 35](boards/improvement-sprint/35-seekers-adoption.m
 one pipeline of record, `main` reconciled with `develop`, the audit findings
 filed, and the ready work shipped through reviewed MRs.
 
-**Health: green.** Gates on `main` @ `75e8d66`: pipeline 20155 success (fmt,
-clippy, test). Local baseline there: 2613 unit tests, 910 CLI + 214 LSP cucumber
-scenarios, 0 failures. On the merged tree (`develop` @ `1f0194e` + `main`): 3032 unit
-tests / 0 failed / 7 ignored across 72 binaries, 924 + 235 scenarios, fmt and
-clippy clean; the four `luabox-lsp` shutdown-window timeouts seen under load
-40 reproduce as 6/6 green twice on a quiet host — load sensitivity, filed as #84.
+**Health: green on `develop`, promotion pending.** `develop` @ !4's merge:
+pipeline 20286 (the merged tree of !1–!4). `main`: pipeline 20262 green on its
+own tree. This branch (!5): its last completed pipeline, 20289, was 17/18 — the
+one red job, `examples`, died in `get_sources` on runner DNS, not on the diff;
+the pipeline at the current head is the evidence that counts, and this line is
+rewritten when it lands. Unit/scenario counts are read from that pipeline's
+`check` job trace, not carried forward from an older tree.
 
 ## Now
 
@@ -35,11 +36,9 @@ sweep, 89-assertion selftest). Stopping point after both merge: the
 
 ## Next
 
-1. MR !5 (`starscream/integrate-develop → develop`): pipeline 20278 green
-   (18/18); Shockwave round 2 findings being closed; then merge.
-2. MR `develop → main` — the promotion. Reviewer Shockwave, approver the owner.
-3. #78 (MR !4) merged as `cb40e10` after review (pipeline 20281 13/13);
-   #69 (MR !2) merged as `ce215fc`. Both issues closed.
+1. !5: pipeline at the current head green → Shockwave round 5 → merge.
+2. !6: pipeline 20291 at `31c61fd` → Shockwave round 3 → merge.
+3. `develop → main` promotion MR (owner approves) → #27 tag `v0.2.0`.
 
 ## Later
 
