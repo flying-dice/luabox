@@ -373,9 +373,9 @@ list, which does correct shipped behaviour and is marked as such.
   applies to an unopened path (full-sync clients are unaffected, as is a
   ranged edit that follows a full replace in the same batch); a leading ranged
   change against an unopened path is now dropped with a `window/logMessage`
-  warning naming the file. Relatedly, a `.lua` file the workspace index cannot read is
-  no longer skipped in silence — the path and the OS error reach the log pane,
-  which is where `luabox-lsp`'s other index failure already went.
+  warning naming the file. Relatedly, a `.lua` file the workspace index cannot
+  read is no longer skipped in silence — the path and the OS error reach the
+  log pane, which is where `luabox-lsp`'s other index failure already went.
 
 - **A file's own `---@enum` again shadows a same-named `[types] defs` enum,
   as `---@class` always has and as this block's own duplicate-merge entry

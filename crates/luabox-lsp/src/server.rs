@@ -5163,7 +5163,7 @@ return use
         );
     }
 
-    // === didChange for a document the client never opened ================
+    // === didChange for a document the client never opened =================
     //
     // #78. `didChange` carries *edits*, not state: a ranged change is only
     // meaningful against the buffer it indexes into, and only an open
