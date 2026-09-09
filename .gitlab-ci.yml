@@ -838,6 +838,8 @@ coverage-unit:
 coverage-e2e:
   extends: .coverage
   script:
+    # Strict LÖVE regressions inspect emitted ZIP contents, not only filenames.
+    - apt_install python3
     - >
       cargo llvm-cov --no-report
       -p luabox-cli --test acceptance --test lsp_acceptance

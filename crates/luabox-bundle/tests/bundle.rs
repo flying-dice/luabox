@@ -977,3 +977,28 @@ fn illegal_module_names_have_no_candidates() {
         ]
     );
 }
+
+#[test]
+fn strict_policy_rejects_transitive_missing_modules_and_allows_exact_externals() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "src/main.lua", "return require('util')");
+    write(tmp.path(), "src/util.lua", "return require('socket.core')");
+    let req = request(
+        tmp.path(),
+        Path::new("src/main.lua"),
+        Dialect::Lua51,
+        Dialect::Lua51,
+    );
+    assert!(bundle(&req).is_ok(), "default preserves runtime requires");
+    let error = luabox_bundle::bundle_with_policy(&req, true, &[]).unwrap_err();
+    assert!(
+        matches!(&error, BundleError::Unresolved { file, module } if file == "src/util.lua" && module == "socket.core")
+    );
+    assert!(error.to_string().contains("--external socket.core"));
+    assert!(luabox_bundle::bundle_with_policy(&req, true, &["socket".into()]).is_err());
+    let bundled =
+        luabox_bundle::bundle_with_policy(&req, true, &["socket.core".into(), "util".into()])
+            .unwrap();
+    assert_eq!(bundled.modules, 1, "allowlisted local modules still inline");
+    assert!(bundled.text.contains("require('socket.core')"));
+}

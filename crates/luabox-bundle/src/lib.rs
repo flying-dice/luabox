@@ -114,6 +114,8 @@ pub struct DynamicRequireSite {
 /// Why a bundle could not be produced.
 #[derive(Debug)]
 pub enum BundleError {
+    /// Strict bundling found an unresolved literal require.
+    Unresolved { file: String, module: String },
     /// A module file could not be read.
     Io { path: PathBuf, message: String },
     /// A module failed to parse, or its lowered output failed residual
@@ -141,6 +143,10 @@ pub enum BundleError {
 impl fmt::Display for BundleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            BundleError::Unresolved { file, module } => write!(
+                f,
+                "`{file}`: cannot resolve module `{module}`; add its implementation or explicitly allow the runtime module with --external {module}"
+            ),
             BundleError::Io { path, message } => {
                 write!(f, "cannot read `{}`: {message}", path.display())
             }
@@ -211,6 +217,24 @@ struct Module {
     reason = "the only expect is an internal invariant: non-entry modules always carry a map key"
 )]
 pub fn bundle(req: &BundleRequest<'_>) -> Result<Bundle, BundleError> {
+    bundle_with_policy(req, false, &[])
+}
+
+/// Bundle with optional strict resolution and exact-name runtime externals.
+/// Local modules still resolve normally, even when allowlisted.
+///
+/// # Errors
+/// Returns bundle errors, including unresolved modules under strict policy.
+#[allow(
+    clippy::too_many_lines,
+    clippy::missing_panics_doc,
+    reason = "graph discovery and emission form one pipeline"
+)]
+pub fn bundle_with_policy(
+    req: &BundleRequest<'_>,
+    strict: bool,
+    externals: &[String],
+) -> Result<Bundle, BundleError> {
     let entry_path = canonical(&req.root.join(req.entry));
     let mut warnings = Vec::new();
 
@@ -236,6 +260,12 @@ pub fn bundle(req: &BundleRequest<'_>) -> Result<Bundle, BundleError> {
             // rock tree is materialized for the interpreter the bundle ships
             // against, not for the dialect the sources are written in.
             let Some(path) = resolve::resolve(req.root, &name, req.target) else {
+                if strict && !externals.contains(&name) {
+                    return Err(BundleError::Unresolved {
+                        file: modules[index].file.clone(),
+                        module: name,
+                    });
+                }
                 continue; // external: left as a runtime `require`
             };
             if path == entry_path {

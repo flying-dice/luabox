@@ -4,6 +4,11 @@ date: 2026-09-06
 ---
 # Decision 14 — The Seekers own luabox; GitLab is the tracker and pipeline of record; `develop` integrates, `main` releases
 
+> Partially superseded by [decision 16](16-vanilla-installer-owned-harnesses.md):
+> vanilla installer-owned roles, no committed agent memory, and the active
+> GitLab Shockwave review integration replace the corresponding roster,
+> memory and dispatch requirements below. Original decision text is retained.
+
 ## Context
 
 On takeover (2026-09-06) the repo told two stories. `docs/04-project/01-backlog.md`

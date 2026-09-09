@@ -279,6 +279,19 @@ hand-vendored or sibling package has. A compiled C module
 alongside your bundle. `lua_modules/` is never walked as project source:
 `check`, `lint`, `fmt` and `build` skip it whatever it contains.
 
+For release builds, opt into strict literal-module resolution:
+```sh
+luabox build --bundle --strict-bundle --external socket.core --external lfs
+```
+Without `--strict-bundle`, unresolved literal requires retain the existing runtime
+behavior. Strict mode fails with the importing file and module name, including
+transitive imports. Repeat `--external` for intentional runtime modules; names
+match exactly (no glob or prefix matching). This allowlist does not prevent a
+local Lua implementation from being bundled. Strict mode applies to plain,
+LÖVE and Neovim bundles, requires bundle output, and cannot be combined with
+`--no-bundle`. Dynamic requires still fail under the existing bundler policy.
+These options are CLI-only; they do not change the manifest schema.
+
 **An installed rock's *types* come along too, with no configuration.** A rock
 that documents itself for lua-language-server has already written the
 signatures, and they ship inside it — so `luabox check` reads the installed

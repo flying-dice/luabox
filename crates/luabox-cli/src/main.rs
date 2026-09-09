@@ -181,6 +181,12 @@ enum Command {
         /// Force tree-mode emit even if `[build] bundle = true`
         #[arg(long = "no-bundle")]
         no_bundle: bool,
+        /// Fail on unresolved literal requires when bundling
+        #[arg(long, conflicts_with = "no_bundle")]
+        strict_bundle: bool,
+        /// Allow an unresolved runtime module by exact name (repeatable)
+        #[arg(long = "external", requires = "strict_bundle")]
+        externals: Vec<String>,
         /// Emit a `.map` beside each bundle for `luabox unmap`
         #[arg(long)]
         sourcemap: bool,
@@ -347,6 +353,8 @@ fn run(command: Command) -> anyhow::Result<()> {
             entry,
             bundle,
             no_bundle,
+            strict_bundle,
+            externals,
             sourcemap,
             minify,
             mode,
@@ -366,6 +374,8 @@ fn run(command: Command) -> anyhow::Result<()> {
                     outfile,
                     entry,
                     bundle,
+                    strict_bundle,
+                    externals,
                     sourcemap,
                     minify,
                     mode: mode.map(Into::into),
@@ -743,6 +753,8 @@ mod tests {
             entry,
             bundle,
             no_bundle,
+            strict_bundle,
+            externals,
             sourcemap,
             minify,
             mode,
@@ -756,6 +768,8 @@ mod tests {
         assert!(entry.is_empty());
         assert!(!bundle);
         assert!(!no_bundle);
+        assert!(!strict_bundle);
+        assert!(externals.is_empty());
         assert!(!sourcemap);
         assert!(!minify);
         assert_eq!(mode, None);
@@ -821,6 +835,36 @@ mod tests {
             reject(&["build", "--bundle", "--no-bundle"]),
             clap::error::ErrorKind::ArgumentConflict
         );
+    }
+
+    #[test]
+    fn strict_bundle_flags_require_explicit_policy() {
+        assert_eq!(
+            reject(&["build", "--strict-bundle", "--no-bundle"]),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+        assert_eq!(
+            reject(&["build", "--external", "socket"]),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        let Command::Build {
+            strict_bundle,
+            externals,
+            ..
+        } = parse(&[
+            "build",
+            "--bundle",
+            "--strict-bundle",
+            "--external",
+            "socket",
+            "--external",
+            "lfs",
+        ])
+        else {
+            panic!("expected Build");
+        };
+        assert!(strict_bundle);
+        assert_eq!(externals, ["socket", "lfs"]);
     }
 
     #[test]
