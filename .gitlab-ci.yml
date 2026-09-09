@@ -805,6 +805,10 @@ ignored-deterministic-tests:
   before_script:
     - !reference [.rust, before_script]
     - !reference [.install-cargo-llvm-cov, script]
+    # Restored workspace binaries may embed another runner slot's paths.
+    # Clear them once before measurement; --no-report preserves profiles
+    # between the two unit suites, so never clean between those runs.
+    - cargo llvm-cov clean --workspace
 
 coverage-unit:
   extends: .coverage
