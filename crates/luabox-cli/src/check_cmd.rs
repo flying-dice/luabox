@@ -1290,17 +1290,13 @@ fn check_one(
     // target. Checking only the edition let exactly that combination through
     // (Shockwave round 2).
     //
-    // This lowers the file rather than reusing the HIR inside `artifacts`:
-    // `luabox_types::FileArtifacts` keeps its lowering private. The same pass
-    // runs off the lint engine's own lowering and the LSP's memoized one, so
-    // all three frontends return the same verdict. Lowering is dialect-free,
-    // so both passes read one lowering.
+    // Reuse the HIR already cached in `artifacts`. Lowering is dialect-free,
+    // so both passes read the same lowering as the type checker.
     if parse.errors().is_empty() {
-        let lowered = luabox_hir::lower(parse);
         let control_flow_passes = dialect_passes(project.dialect, passes.control_flow);
         let mut findings = Findings::default();
         for (i, dialect) in control_flow_passes.iter().copied().enumerate() {
-            for diag in luabox_hir::validate::control_flow(rel, &lowered, dialect) {
+            for diag in artifacts.control_flow(rel, dialect) {
                 let range = diag.primary_label().map_or(0..0, |l| l.span.range.clone());
                 let key = (diag.code.number(), range.start, range.end);
                 let diag = if i > 0 && !findings.contains(key) {

@@ -1339,7 +1339,7 @@ declaring file's directives, so it never suppresses a diagnostic whose
 greens `luabox check`, and the editor keeps showing LB0317 on the consuming
 file until the limit itself is fixed. Same-file suppression works in both.
 This is an editor/CLI parity gap in the same family as
-<https://github.com/flying-dice/luabox/issues/70>; it has no issue of its own
+#70; it has no issue of its own
 yet.
 
 **The exception: a class declared only in a `[types] defs` package.** Nothing
@@ -1908,7 +1908,7 @@ Counter.__index = Counter   -- <- instance lookups now reach the methods
 ## Why the type checker does not report this
 
 It used to (as `LB0306`, undefined field), and that was **removed on
-purpose** in [#33](https://github.com/flying-dice/luabox/issues/33): luals
+purpose** in #33: luals
 folds carrier attachments into the class off the carrier *binding*, with no
 metatable reasoning, so `c:value()` resolves there — signature, `---@deprecated`
 and all — whether or not `__index` exists. luabox matches that, and the
@@ -2197,6 +2197,18 @@ entry.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explain_pages_do_not_link_the_retired_issue_tracker() {
+        let retired_tracker = ["github.com/flying-dice/luabox", "issues"].join("/");
+        for entry in all() {
+            assert!(
+                !entry.explain.contains(&retired_tracker),
+                "{} links the retired issue tracker",
+                entry.code
+            );
+        }
+    }
 
     /// Every registered code is reachable through the public lookup, by the
     /// same rendered string a user types at `luabox explain`.
