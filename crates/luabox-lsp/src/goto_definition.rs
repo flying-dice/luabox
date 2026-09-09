@@ -45,7 +45,7 @@ pub fn definition(
     //    shared candidate search (project root, `src/`, then `lua_modules/`).
     if let Some(edge) = sema.require_at(offset) {
         let module = edge.module.clone();
-        return resolve_module(project_root, &module, dialect).map(|path| Location {
+        return resolve_module(analysis, project_root, &module, dialect).map(|path| Location {
             uri: path_to_uri(&path),
             range: Range::new(Position::new(0, 0), Position::new(0, 0)),
         });
@@ -191,9 +191,7 @@ fn member_definition(
         && let Some((module, fields)) =
             requires::require_struct_fields(sema, exports, ambient, analysis, binding)
         && fields.contains_key(member.text())
-        && let Some(path) = luabox_bundle::resolve_candidates(project_root, module, dialect)
-            .into_iter()
-            .find(|path| analysis.file_text(path).is_some())
+        && let Some(path) = resolve_module(analysis, project_root, module, dialect)
         && let Some(target) = FileSema::new(analysis, &path)
         && let Some(range) = exported_member_range(&target, member.text())
     {
@@ -214,21 +212,84 @@ fn exported_member_range(sema: &FileSema, member: &str) -> Option<TextRange> {
         ast::Stmt::Return(ret) => ret.exprs()?.exprs().next(),
         _ => None,
     })?;
-    let ast::Expr::Name(name) = returned else {
-        return None;
+    let name = match returned {
+        ast::Expr::Table(table) => return table_member_range(&table, member),
+        ast::Expr::Name(name) => name,
+        _ => return None,
     };
     let name = name.name()?;
     let binding =
         sema.visible_binding_named(name.text(), usize::from(name.text_range().start()))?;
     let dotted = format!("{}.{}", name.text(), member);
     let method = format!("{}:{}", name.text(), member);
-    sema.functions().into_iter().find_map(|info| {
+    let function = sema.functions().into_iter().find_map(|info| {
         if info.name != dotted && info.name != method {
             return None;
         }
         let owner =
             sema.visible_binding_named(name.text(), usize::from(info.decl_range.start()))?;
         (owner.range == binding.range).then_some(info.decl_range)
+    });
+    if function.is_some() {
+        return function;
+    }
+
+    // Assignment-form exports, including `M.greet = local_function`.
+    for stmt in block.stmts() {
+        let ast::Stmt::Assign(assign) = stmt else {
+            continue;
+        };
+        let Some(targets) = assign.targets() else {
+            continue;
+        };
+        for target in targets.exprs() {
+            let ast::Expr::Field(field) = target else {
+                continue;
+            };
+            let Some(token) = field.field_name() else {
+                continue;
+            };
+            if token.text() != member {
+                continue;
+            }
+            let Some(ast::Expr::Name(base)) = field.base() else {
+                continue;
+            };
+            let Some(base) = base.name() else {
+                continue;
+            };
+            if let Some(owner) =
+                sema.visible_binding_named(base.text(), usize::from(base.text_range().start()))
+                && owner.range == binding.range
+            {
+                return Some(token.text_range());
+            }
+        }
+    }
+
+    // A returned local can declare its fields directly in its initializer.
+    block.stmts().find_map(|stmt| {
+        let ast::Stmt::Local(local) = stmt else {
+            return None;
+        };
+        let index = local.names().position(|name| {
+            name.name()
+                .is_some_and(|token| token.text_range() == binding.range)
+        })?;
+        let ast::Expr::Table(table) = local.values()?.exprs().nth(index)? else {
+            return None;
+        };
+        table_member_range(&table, member)
+    })
+}
+
+fn table_member_range(table: &ast::TableExpr, member: &str) -> Option<TextRange> {
+    table.fields().find_map(|field| {
+        let ast::TableField::Name(field) = field else {
+            return None;
+        };
+        let name = field.name()?;
+        (name.text() == member).then_some(name.text_range())
     })
 }
 
@@ -333,16 +394,17 @@ fn normalize(path: &Path) -> PathBuf {
 /// Resolve `module` to its file through the bundler's shared candidate
 /// ordering ([`luabox_bundle::resolve_candidates`], SPEC.md §7: project root,
 /// then `src/`, then the `lua_modules/` trees — flat and luarocks), picking the first
-/// candidate that exists on disk — exactly the bundler's `resolve`.
-///
-/// This is the workspace's single source of truth for `require` resolution
-/// (the same algorithm `luabox check` and the bundler use), so goto-def can
-/// never disagree with them: a module under `src/` or a dependency now jumps
-/// where the build would actually load it from.
-fn resolve_module(root: &Path, module: &str, dialect: Dialect) -> Option<PathBuf> {
+/// candidate in the current analysis, including unsaved editor overlays.
+/// Both require-string and exported-member navigation use this contract.
+fn resolve_module(
+    analysis: &Analysis,
+    root: &Path,
+    module: &str,
+    dialect: Dialect,
+) -> Option<PathBuf> {
     luabox_bundle::resolve_candidates(root, module, dialect)
         .into_iter()
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| analysis.file_text(candidate).is_some())
 }
 
 #[cfg(test)]
@@ -817,9 +879,74 @@ M.helper(1)
     }
 
     #[test]
-    fn a_require_string_jumps_to_the_start_of_the_module_file() {
-        // Nothing exists on disk under the fake root, so resolution declines.
+    fn a_require_string_declines_a_module_missing_from_analysis() {
+        // No project file or editor overlay supplies this module.
         assert!(at("local m = require(\"other\")\n", "other", 0).is_none());
+    }
+
+    #[test]
+    fn require_string_resolves_an_unsaved_overlay_module() {
+        let mut host = AnalysisHost::new(Dialect::Lua54, Strictness::Warn);
+        host.set_root(root());
+        let path = root().join("main.lua");
+        host.apply_change(Change::SetFileText {
+            path: path.clone(),
+            dialect: Dialect::Lua54,
+            text: "local m = require('fresh')\n".into(),
+        });
+        let target = root().join("src/fresh.lua");
+        host.apply_change(Change::SetOverlay {
+            path: target.clone(),
+            text: "return {}\n".into(),
+        });
+        let analysis = host.snapshot();
+        let sema = FileSema::new(&analysis, &path).unwrap();
+        let exports =
+            RequireExports::resolve(&analysis, &path, &luabox_types::RockSurfaces::default());
+        let ambient = MergedAmbient::build(
+            luabox_types::stdlib_defs(Dialect::Lua54),
+            &analysis.project_types(),
+            &[],
+        );
+        let location = definition(
+            &sema,
+            20,
+            &root(),
+            Dialect::Lua54,
+            &analysis,
+            &exports,
+            &ambient,
+        )
+        .expect("unsaved module");
+        assert_eq!(location.uri, path_to_uri(&target));
+        assert_eq!(
+            location.range,
+            Range::new(Position::new(0, 0), Position::new(0, 0))
+        );
+    }
+
+    #[test]
+    fn imported_table_literal_and_assignment_members_have_definitions() {
+        for module in [
+            "return { greet = function() end }\n",
+            "local M = { greet = function() end }\nreturn M\n",
+            "local M = {}\nM.greet = function() end\nreturn M\n",
+        ] {
+            let location = at_files(
+                &[
+                    ("main.lua", "local g = require('mod')\ng.greet()\n"),
+                    ("mod.lua", module),
+                ],
+                "greet()",
+                0,
+            )
+            .expect(module);
+            assert_eq!(location.uri, path_to_uri(&root().join("mod.lua")));
+            let (analysis, path) = analyze(&[("mod.lua", module)]);
+            let sema = FileSema::new(&analysis, &path).unwrap();
+            let start = module.find("greet").unwrap();
+            assert_eq!(location.range, sema.index.range(start..start + 5));
+        }
     }
 
     #[test]

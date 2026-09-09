@@ -55,6 +55,46 @@ Feature: luabox lsp — goto definition, type definition, and implementation
     Then the location is in "src/greeter.lua"
     And the location starts at 3:11
 
+  Scenario: definition follows assignment members in an unsaved exporting buffer
+    Given a file "src/greeter.lua" containing:
+      """
+      return {}
+      """
+    And a file "main.lua" containing:
+      """
+      local g = require("greeter")
+      print(g.greet())
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    And the document "src/greeter.lua" is open
+    When I change "src/greeter.lua" to:
+      """
+      -- Unsaved editor contents, not the disk's empty table.
+      local M = {}
+      M.greet = function() return "hello" end
+      return M
+      """
+    And I request the definition at 1:9 in "main.lua"
+    Then the location is in "src/greeter.lua"
+    And the location starts at 2:2
+
+  Scenario: definition follows a directly returned table literal member
+    Given a file "greeter.lua" containing:
+      """
+      return { greet = function() return "hello" end }
+      """
+    And a file "main.lua" containing:
+      """
+      local g = require("greeter")
+      print(g.greet())
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request the definition at 1:9 in "main.lua"
+    Then the location is in "greeter.lua"
+    And the location starts at 0:9
+
   Scenario: definition follows a ---@source redirect on a file's only statement
     Given a file "main.lua" containing:
       """

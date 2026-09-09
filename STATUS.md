@@ -1,8 +1,12 @@
 # Status
 
-**Updated:** 2026-09-06 17:46 UTC (commit time) · **Integration branch:** `develop` · **Release branch:** `main` · **Owner:** Starscream (Seekers)
+**Updated:** 2026-09-06 17:46 UTC (commit time) · **Integration branch:** `develop` · **Release branch:** `main` · **Owner role:** lead (vanilla roster; decision 16)
 
-Rewritten from the tracker at every push, and deliberately coarse: open MRs
+This is the historical 2026-09-06 tracker snapshot, not current branch health.
+Current roster/memory policy is [decision 16](decisions/16-vanilla-installer-owned-harnesses.md).
+Persona names and completed-process descriptions below describe that snapshot.
+Consult GitLab for live work; this policy correction does not refresh ticket or
+pipeline status. The snapshot is deliberately coarse: open MRs
 are listed by number only — their pipelines, review rounds and heads live on
 the MR and go stale within minutes here. Branch health names the last green
 pipeline on the branch itself. Tracker of record: GitLab `origin` (decision 14).

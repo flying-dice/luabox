@@ -138,6 +138,61 @@ fn check_watch_reruns_on_file_change() {
     );
 }
 
+/// File-set and manifest changes must invalidate the project, not merely an
+/// existing file's cached syntax. Each assertion waits for the expected verdict.
+#[test]
+fn check_watch_tracks_create_rename_delete_and_manifest_recovery() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let manifest = root.join("luabox.toml");
+    std::fs::write(&manifest, "[package]\nedition = \"5.4\"\n").unwrap();
+    std::fs::write(root.join("main.lua"), "print('ok')\n").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_luabox"))
+        .args(["check", "--watch"])
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (tx, rx) = mpsc::channel();
+    forward_lines(child.stdout.take().unwrap(), tx.clone());
+    forward_lines(child.stderr.take().unwrap(), tx);
+    let outcome = std::panic::catch_unwind(|| {
+        let wait = |needle: &str| {
+            assert!(
+                wait_for_line(&rx, Duration::from_secs(20), |line| line.contains(needle)),
+                "watch never reported {needle}"
+            );
+        };
+        wait("watch: ok");
+        std::fs::write(root.join("broken.lua"), "local x = (\n").unwrap();
+        wait("LB0001");
+        wait("watch: failed:");
+        std::fs::rename(root.join("broken.lua"), root.join("renamed.lua")).unwrap();
+        wait("renamed.lua");
+        wait("watch: failed:");
+        std::fs::remove_file(root.join("renamed.lua")).unwrap();
+        wait("watch: ok");
+        std::fs::write(&manifest, "[package\n").unwrap();
+        // A previous parse failure can still arrive from the stderr reader
+        // after stdout's success. Demand the manifest-specific failure, not
+        // any stale generic verdict from the broken Lua file.
+        assert!(
+            wait_for_line(&rx, Duration::from_secs(20), |line| {
+                line.contains("watch: failed:") && line.contains("luabox.toml")
+            }),
+            "watch never reported the malformed manifest"
+        );
+        std::fs::write(&manifest, "[package]\nedition = \"5.4\"\n").unwrap();
+        wait("watch: ok");
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+    if let Err(error) = outcome {
+        std::panic::resume_unwind(error);
+    }
+}
+
 /// One edit must produce a *bounded* number of reruns and then quiet down.
 ///
 /// The bug this pins (round-4 F2): notify's inotify backend also subscribes

@@ -838,3 +838,33 @@ fn project_with_edition_target_mode_and_description(
 ) {
     write_manifest_with_target_and_mode(world, &edition, &target, &mode, Some(&description));
 }
+
+#[then(expr = "entry {string} in archive {string} contains {string}")]
+fn archive_entry_contains(
+    world: &mut AcceptanceWorld,
+    entry: String,
+    archive: String,
+    needle: String,
+) {
+    let path = world.dir.path().join(&archive);
+    for python in ["python3", "python"] {
+        let output = std::process::Command::new(python)
+            .args(["-c", "import sys, zipfile; sys.stdout.buffer.write(zipfile.ZipFile(sys.argv[1]).read(sys.argv[2]))"])
+            .arg(&path)
+            .arg(&entry)
+            .output();
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            let text = String::from_utf8(output.stdout).expect("UTF-8 Lua archive entry");
+            assert!(
+                text.contains(&needle),
+                "entry {entry} of {archive} does not contain {needle}: {text}"
+            );
+            return;
+        }
+    }
+    panic!(
+        "cannot read {entry} from {archive}; a working Python zipfile implementation is required"
+    );
+}

@@ -336,3 +336,45 @@ Feature: luabox build — single-file require-graph bundling
     When I run "luabox build --mode nvim-plugin --strict-bundle"
     Then the command fails
     And stderr contains "cannot resolve module"
+
+  Scenario: strict bundling allows exact runtime externals in a real love archive
+    Given a project with edition "5.1" targeting "5.1" using mode "love"
+    And a file "src/main.lua" containing:
+      """
+      local socket = require("socket.core")
+      local fs = require("lfs")
+      print(socket, fs)
+      """
+    When I run "luabox build --strict-bundle --external socket.core --external lfs"
+    Then the command succeeds
+    And the file "dist/fixture.love" exists
+    And the archive "dist/fixture.love" contains "main.lua"
+    And entry "main.lua" in archive "dist/fixture.love" contains 'require("socket.core")'
+    And entry "main.lua" in archive "dist/fixture.love" contains 'require("lfs")'
+
+  Scenario: strict bundling rejects unlisted modules before creating a love archive
+    Given a project with edition "5.1" targeting "5.1" using mode "love"
+    And a file "src/main.lua" containing:
+      """
+      print(require("socket.core"))
+      """
+    When I run "luabox build --strict-bundle --external socket"
+    Then the command fails
+    And stderr contains "cannot resolve module"
+    And stderr contains "--external socket.core"
+    And the file "dist/fixture.love" does not exist
+
+  Scenario: strict bundling allows exact runtime externals in a real Neovim plugin
+    Given a project with edition "5.1" targeting "5.1" using mode "nvim-plugin"
+    And a file "src/main.lua" containing:
+      """
+      local socket = require("socket.core")
+      local fs = require("lfs")
+      print(socket, fs)
+      """
+    When I run "luabox build --strict-bundle --external socket.core --external lfs"
+    Then the command succeeds
+    And "dist/fixture/lua/fixture/init.lua" contains 'require("socket.core")'
+    And "dist/fixture/lua/fixture/init.lua" contains 'require("lfs")'
+    And the file "dist/fixture/plugin/fixture.lua" exists
+    And the file "dist/fixture/doc/fixture.txt" exists
