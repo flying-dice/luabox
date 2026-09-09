@@ -138,6 +138,84 @@ fn check_watch_reruns_on_file_change() {
     );
 }
 
+/// Collect one phase without assuming stdout and stderr reader ordering.
+/// Each marker is a conjunction of substrings on one line. Keep every line
+/// across phases so a timeout reports the complete observed transcript.
+fn wait_for_markers(
+    rx: &mpsc::Receiver<String>,
+    timeout: Duration,
+    markers: &[&[&str]],
+    transcript: &mut Vec<String>,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let mut seen = vec![false; markers.len()];
+    while seen.iter().any(|matched| !matched) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let line = if remaining.is_zero() {
+            None
+        } else {
+            rx.recv_timeout(remaining).ok()
+        };
+        let Some(line) = line else {
+            let missing: Vec<_> = markers
+                .iter()
+                .zip(&seen)
+                .filter_map(|(marker, seen)| (!seen).then_some(marker))
+                .collect();
+            return Err(format!(
+                "watch did not report {missing:?}\nFull transcript:\n{}",
+                transcript.join("\n")
+            ));
+        };
+        for (marker, matched) in markers.iter().zip(&mut seen) {
+            *matched |= marker.iter().all(|needle| line.contains(needle));
+        }
+        transcript.push(line);
+    }
+    Ok(())
+}
+
+#[test]
+fn watch_phase_collects_diagnostic_and_verdict_in_either_order() {
+    for lines in [
+        ["watch: failed: check failed", "broken.lua: LB0001"],
+        ["broken.lua: LB0001", "watch: failed: check failed"],
+    ] {
+        let (tx, rx) = mpsc::channel();
+        for line in lines {
+            tx.send(line.to_owned()).unwrap();
+        }
+        drop(tx);
+        let mut transcript = Vec::new();
+        wait_for_markers(
+            &rx,
+            Duration::from_secs(1),
+            &[&["LB0001"], &["watch: failed:"]],
+            &mut transcript,
+        )
+        .unwrap();
+        assert_eq!(transcript, lines);
+    }
+}
+
+#[test]
+fn watch_phase_reports_all_lines_and_rejects_an_unrelated_failure() {
+    let (tx, rx) = mpsc::channel();
+    tx.send("watch: failed: Lua check failed".into()).unwrap();
+    tx.send("other output".into()).unwrap();
+    drop(tx);
+    let mut transcript = vec!["previous phase".into()];
+    let error = wait_for_markers(
+        &rx,
+        Duration::from_secs(1),
+        &[&["watch: failed:", "luabox.toml"]],
+        &mut transcript,
+    )
+    .unwrap_err();
+    assert!(error.contains("luabox.toml"));
+    assert!(error.contains("previous phase\nwatch: failed: Lua check failed\nother output"));
+}
+
 /// File-set and manifest changes must invalidate the project, not merely an
 /// existing file's cached syntax. Each assertion waits for the expected verdict.
 #[test]
@@ -158,33 +236,28 @@ fn check_watch_tracks_create_rename_delete_and_manifest_recovery() {
     forward_lines(child.stdout.take().unwrap(), tx.clone());
     forward_lines(child.stderr.take().unwrap(), tx);
     let outcome = std::panic::catch_unwind(|| {
-        let wait = |needle: &str| {
-            assert!(
-                wait_for_line(&rx, Duration::from_secs(20), |line| line.contains(needle)),
-                "watch never reported {needle}"
-            );
+        let mut transcript = Vec::new();
+        let mut wait = |markers: &[&[&str]]| {
+            if let Err(error) =
+                wait_for_markers(&rx, Duration::from_secs(20), markers, &mut transcript)
+            {
+                panic!("{error}");
+            }
         };
-        wait("watch: ok");
+        wait(&[&["watch: ok"]]);
         std::fs::write(root.join("broken.lua"), "local x = (\n").unwrap();
-        wait("LB0001");
-        wait("watch: failed:");
+        wait(&[&["LB0001"], &["watch: failed:"]]);
         std::fs::rename(root.join("broken.lua"), root.join("renamed.lua")).unwrap();
-        wait("renamed.lua");
-        wait("watch: failed:");
+        wait(&[&["renamed.lua"], &["watch: failed:"]]);
         std::fs::remove_file(root.join("renamed.lua")).unwrap();
-        wait("watch: ok");
+        wait(&[&["watch: ok"]]);
         std::fs::write(&manifest, "[package\n").unwrap();
         // A previous parse failure can still arrive from the stderr reader
         // after stdout's success. Demand the manifest-specific failure, not
         // any stale generic verdict from the broken Lua file.
-        assert!(
-            wait_for_line(&rx, Duration::from_secs(20), |line| {
-                line.contains("watch: failed:") && line.contains("luabox.toml")
-            }),
-            "watch never reported the malformed manifest"
-        );
+        wait(&[&["watch: failed:", "luabox.toml"]]);
         std::fs::write(&manifest, "[package]\nedition = \"5.4\"\n").unwrap();
-        wait("watch: ok");
+        wait(&[&["watch: ok"]]);
     });
     let _ = child.kill();
     let _ = child.wait();
