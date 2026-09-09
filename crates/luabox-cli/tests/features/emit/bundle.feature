@@ -293,3 +293,46 @@ Feature: luabox build — single-file require-graph bundling
     Then the command succeeds
     And stdout contains "minified"
     And "dist/main.lua" does not contain "descriptive_name"
+
+  Scenario: strict bundling reports missing literal modules with a remedy
+    Given a project with edition "5.1" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      print(require("missing"))
+      """
+    When I run "luabox build --bundle --strict-bundle"
+    Then the command fails
+    And stderr contains "cannot resolve module"
+    And stderr contains "--external missing"
+    And the file "dist/main.lua" does not exist
+
+  Scenario: strict bundling allows explicitly declared runtime modules
+    Given a project with edition "5.1" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      print(require("socket"))
+      """
+    When I run "luabox build --bundle --strict-bundle --external socket"
+    Then the command succeeds
+    And "dist/main.lua" contains 'require("socket")'
+
+  Scenario: strict bundling refuses to silently run in tree mode
+    Given a project with edition "5.1" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      print("hello")
+      """
+    When I run "luabox build --strict-bundle"
+    Then the command fails
+    And stderr contains "--strict-bundle requires bundle output"
+    And the file "dist/src/main.lua" does not exist
+
+  Scenario: strict bundling applies to Neovim packaging too
+    Given a project with edition "5.1" targeting "5.1"
+    And a file "src/main.lua" containing:
+      """
+      print(require("missing"))
+      """
+    When I run "luabox build --mode nvim-plugin --strict-bundle"
+    Then the command fails
+    And stderr contains "cannot resolve module"

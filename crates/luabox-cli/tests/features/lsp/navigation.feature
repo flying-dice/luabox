@@ -35,6 +35,26 @@ Feature: luabox lsp — goto definition, type definition, and implementation
     When I request the definition at 0:22 in "main.lua"
     Then the location is in "util/helpers.lua"
 
+  Scenario: definition follows an imported plain table function to its exporting module
+    Given a file "src/greeter.lua" containing:
+      """
+      -- No class annotation: an ordinary exported Lua table.
+
+      local M = {}
+      function M.greet() return "hello" end
+      return M
+      """
+    And a file "main.lua" containing:
+      """
+      local g = require("greeter")
+      print(g.greet())
+      """
+    And the language server is running
+    And the document "main.lua" is open
+    When I request the definition at 1:9 in "main.lua"
+    Then the location is in "src/greeter.lua"
+    And the location starts at 3:11
+
   Scenario: definition follows a ---@source redirect on a file's only statement
     Given a file "main.lua" containing:
       """

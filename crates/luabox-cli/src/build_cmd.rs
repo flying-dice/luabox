@@ -73,6 +73,10 @@ pub struct BuildOptions {
     /// `--bundle` / `--no-bundle`: `Some(true)`/`Some(false)`; `None` defers
     /// to `[build] bundle`.
     pub bundle: Option<bool>,
+    /// Reject unresolved literal requires in bundle mode.
+    pub strict_bundle: bool,
+    /// Exact runtime module names permitted under strict resolution.
+    pub externals: Vec<String>,
     /// `--sourcemap`: presence ORs with `[build] sourcemap`.
     pub sourcemap: bool,
     /// `--minify`: presence ORs with `[build] minify`.
@@ -133,6 +137,9 @@ pub fn run(cwd: &Path, opts: &BuildOptions) -> anyhow::Result<()> {
     // even when `--out` overrides the manifest's.
     project.out_dir = Some(out_dir.clone());
 
+    if !do_bundle && opts.strict_bundle {
+        bail!("--strict-bundle requires bundle output; use --bundle or a packaging mode");
+    }
     if !do_bundle {
         // Tree mode ignores the bundle-only knobs (`entry`, `outfile`,
         // `sourcemap`, `minify`) — there is no require graph to walk.
@@ -204,6 +211,7 @@ pub fn run(cwd: &Path, opts: &BuildOptions) -> anyhow::Result<()> {
         sourcemap,
         package_name,
         description: project.description.as_deref(),
+        policy: (opts.strict_bundle, &opts.externals),
         entry: &entries[0],
     };
 
@@ -221,6 +229,7 @@ pub fn run(cwd: &Path, opts: &BuildOptions) -> anyhow::Result<()> {
             sourcemap,
             &entries,
             outfile.as_deref(),
+            (opts.strict_bundle, &opts.externals),
         ),
     }
 }
@@ -464,9 +473,14 @@ struct EmitCtx<'a> {
     package_name: &'a str,
     description: Option<&'a str>,
     entry: &'a Path,
+    policy: (bool, &'a [String]),
 }
 
 /// Bundle one entry file plus its static require graph.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "threads effective bundle configuration"
+)]
 fn bundle_one(
     root: &Path,
     entry: &Path,
@@ -475,6 +489,7 @@ fn bundle_one(
     target: Dialect,
     minify: bool,
     sourcemap: bool,
+    policy: (bool, &[String]),
 ) -> anyhow::Result<luabox_bundle::Bundle> {
     let request = BundleRequest {
         root,
@@ -485,7 +500,8 @@ fn bundle_one(
         minify,
         sourcemap,
     };
-    let bundle = luabox_bundle::bundle(&request).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let bundle = luabox_bundle::bundle_with_policy(&request, policy.0, policy.1)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     render_warnings(&bundle, root)?;
     Ok(bundle)
 }
@@ -506,6 +522,7 @@ fn emit_plain(
     sourcemap: bool,
     entries: &[PathBuf],
     outfile: Option<&Path>,
+    policy: (bool, &[String]),
 ) -> anyhow::Result<()> {
     for entry in entries {
         let out_path = match outfile {
@@ -526,7 +543,9 @@ fn emit_plain(
             || "bundle.lua".to_owned(),
             |n| n.to_string_lossy().into_owned(),
         );
-        let bundle = bundle_one(root, entry, &name, edition, target, minify, sourcemap)?;
+        let bundle = bundle_one(
+            root, entry, &name, edition, target, minify, sourcemap, policy,
+        )?;
         fs::write(&out_path, &bundle.text)
             .with_context(|| format!("cannot write `{}`", out_path.display()))?;
         if let Some(map) = &bundle.map {
@@ -560,6 +579,7 @@ fn emit_love(ctx: &EmitCtx<'_>) -> anyhow::Result<()> {
         ctx.target,
         ctx.minify,
         false,
+        ctx.policy,
     )?;
     let love_path = modes::emit_love(
         ctx.root,
@@ -591,6 +611,7 @@ fn emit_nvim(ctx: &EmitCtx<'_>) -> anyhow::Result<()> {
         ctx.target,
         ctx.minify,
         ctx.sourcemap,
+        ctx.policy,
     )?;
     let plugin_root =
         modes::emit_nvim_plugin(ctx.out_dir, ctx.package_name, &bundle.text, ctx.description)?;
@@ -713,6 +734,8 @@ mod tests {
             outfile: None,
             entry: Vec::new(),
             bundle: None,
+            strict_bundle: false,
+            externals: Vec::new(),
             sourcemap: false,
             minify: false,
             mode: None,

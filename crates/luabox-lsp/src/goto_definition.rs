@@ -54,7 +54,15 @@ pub fn definition(
     let token = sema.ident_at(offset)?;
 
     // 2. Field / method member → the `---@field` annotation site.
-    if let Some(location) = member_definition(sema, &token, analysis, exports, ambient) {
+    if let Some(location) = member_definition(
+        sema,
+        &token,
+        analysis,
+        exports,
+        ambient,
+        project_root,
+        dialect,
+    ) {
         return Some(location);
     }
 
@@ -112,6 +120,8 @@ fn member_definition(
     analysis: &Analysis,
     exports: &RequireExports,
     ambient: &MergedAmbient,
+    project_root: &Path,
+    dialect: Dialect,
 ) -> Option<Location> {
     let parent = token.parent()?;
     let (receiver, member) = match parent.kind() {
@@ -175,10 +185,51 @@ fn member_definition(
         });
     }
 
+    // Structural module exports have no class annotation to locate. Follow
+    // the require binding and the module's returned table, not its import alias.
+    if let Some(binding) = sema.visible_binding_named(recv_token.text(), recv_offset)
+        && let Some((module, fields)) =
+            requires::require_struct_fields(sema, exports, ambient, analysis, binding)
+        && fields.contains_key(member.text())
+        && let Some(path) = luabox_bundle::resolve_candidates(project_root, module, dialect)
+            .into_iter()
+            .find(|path| analysis.file_text(path).is_some())
+        && let Some(target) = FileSema::new(analysis, &path)
+        && let Some(range) = exported_member_range(&target, member.text())
+    {
+        return Some(here(&target, range));
+    }
+
     // Dotted function: `M.helper` → its declaration.
     let dotted = format!("{}.{}", recv_token.text(), member.text());
     let info = sema.functions().into_iter().find(|f| f.name == dotted)?;
     Some(here(sema, info.decl_range))
+}
+
+/// Follow only the module-level return, never a nested function's return.
+/// Compare bindings so a shadowed table cannot steal the definition.
+fn exported_member_range(sema: &FileSema, member: &str) -> Option<TextRange> {
+    let block = ast::SourceFile::cast(sema.root.clone())?.block()?;
+    let returned = block.stmts().find_map(|stmt| match stmt {
+        ast::Stmt::Return(ret) => ret.exprs()?.exprs().next(),
+        _ => None,
+    })?;
+    let ast::Expr::Name(name) = returned else {
+        return None;
+    };
+    let name = name.name()?;
+    let binding =
+        sema.visible_binding_named(name.text(), usize::from(name.text_range().start()))?;
+    let dotted = format!("{}.{}", name.text(), member);
+    let method = format!("{}:{}", name.text(), member);
+    sema.functions().into_iter().find_map(|info| {
+        if info.name != dotted && info.name != method {
+            return None;
+        }
+        let owner =
+            sema.visible_binding_named(name.text(), usize::from(info.decl_range.start()))?;
+        (owner.range == binding.range).then_some(info.decl_range)
+    })
 }
 
 fn here(sema: &FileSema, range: TextRange) -> Location {
@@ -345,6 +396,62 @@ mod tests {
     /// Goto-definition at the `nth` occurrence of `needle` in the first file.
     fn at(src: &str, needle: &str, nth: usize) -> Option<Location> {
         at_files(&[("main.lua", src)], needle, nth)
+    }
+
+    #[test]
+    fn imported_plain_table_method_resolves_in_src_directory() {
+        let location = at_files(
+            &[
+                ("main.lua", "local g = require('greeter')\ng:greet()\n"),
+                (
+                    "src/greeter.lua",
+                    "local M = {}\nfunction M:greet() return 'hello' end\nreturn M\n",
+                ),
+            ],
+            "greet()",
+            0,
+        )
+        .expect("imported method definition");
+        assert_eq!(location.uri, path_to_uri(&root().join("src/greeter.lua")));
+        assert_eq!(
+            location.range,
+            Range::new(Position::new(1, 11), Position::new(1, 16))
+        );
+    }
+
+    #[test]
+    fn imported_plain_table_does_not_jump_to_shadowed_exporter() {
+        let location = at_files(
+            &[
+                ("main.lua", "local g = require('greeter')\ng.greet()\n"),
+                ("greeter.lua", "local M = {}\nfunction M.greet() end\nlocal M = {}\nfunction M.greet() end\nreturn M\n"),
+            ], "greet()", 0,
+        ).expect("second exported binding");
+        assert_eq!(location.range.start, Position::new(3, 11));
+    }
+
+    #[test]
+    fn imported_plain_table_function_uses_exporting_files_range() {
+        let location = at_files(
+            &[
+                (
+                    "main.lua",
+                    "local g = require('greeter')\nprint(g.greet())\n",
+                ),
+                (
+                    "greeter.lua",
+                    "-- module\n\nlocal M = {}\nfunction M.greet() return 'hello' end\nreturn M\n",
+                ),
+            ],
+            "greet()",
+            0,
+        )
+        .expect("imported function definition");
+        assert_eq!(location.uri, path_to_uri(&root().join("greeter.lua")));
+        assert_eq!(
+            location.range,
+            Range::new(Position::new(3, 11), Position::new(3, 16))
+        );
     }
 
     /// [`at_files`] with the cursor in a named file rather than the first one
