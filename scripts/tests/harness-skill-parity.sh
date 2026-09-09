@@ -40,12 +40,12 @@ CLAUDE_AGENTS_DIR=.claude/agents/bots
 CODEX_AGENTS_DIR=.codex/agents
 
 # Skills that exist under one harness root only, and why.
-#   starscream — the tech-lead role. Claude loads it as an agent definition
-#   (.claude/agents/bots/starscream.md) and has no .claude/skills twin; Codex
-#   has the agent definition too (.codex/agents/starscream.toml) and ALSO
-#   exposes it as a skill so `$starscream` adopts the role in a primary
+#   lead — the tech-lead role. Claude loads it as an agent definition
+#   (.claude/agents/bots/lead.md) and has no .claude/skills twin; Codex
+#   has the agent definition too (.codex/agents/lead.toml) and ALSO
+#   exposes it as a skill so `$lead` adopts the role in a primary
 #   session. Rule 3 below is what keeps that extra copy honest.
-SKILL_ONE_SIDED=starscream
+SKILL_ONE_SIDED=lead
 
 # Agents that exist under one harness root only, and why. Space-separated
 # stems (no extension). Empty at present — every .codex/agents/*.toml has a
