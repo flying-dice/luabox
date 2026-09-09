@@ -2449,6 +2449,9 @@ impl Server {
                     dialect: self.dialect,
                     text: String::new(),
                 });
+                // #83: a confirmed delete is authoritative — retire any
+                // orphan overlay left shadowing this path before publishing.
+                self.retire_orphan_overlay(&path);
                 if !self.open_docs.contains_key(&path) {
                     self.publish_lua(&event.uri, &path)?;
                 }
@@ -2484,6 +2487,10 @@ impl Server {
                     dialect: self.dialect,
                     text,
                 });
+                // #83: prefer this successfully read disk state over an
+                // unopened buffer's overlay. A failed read must leave the
+                // overlay intact because there is no replacement text.
+                self.retire_orphan_overlay(&path);
                 // Republish only if the file is not shadowed by an editor
                 // overlay — an open buffer's diagnostics come from the overlay,
                 // not disk, so re-reading disk changes nothing visible there.
@@ -2520,6 +2527,21 @@ impl Server {
             self.republish_open_docs()?;
         }
         Ok(())
+    }
+
+    /// Retire an unopened buffer's overlay after an authoritative disk update
+    /// (#83). Full-replace `didChange` is accepted without `didOpen`, but that
+    /// overlay cannot rely on a later `didClose` to clear it.
+    ///
+    /// Call only after a confirmed deletion or successful read; failed reads
+    /// supply no replacement state. `open_docs` protects genuine editor
+    /// buffers, and clearing an absent overlay is a safe no-op.
+    fn retire_orphan_overlay(&mut self, path: &Path) {
+        if !self.open_docs.contains_key(path) {
+            self.host.apply_change(Change::ClearOverlay {
+                path: path.to_path_buf(),
+            });
+        }
     }
 
     /// The text a `didChange` batch applies to, or `None` when the batch must
@@ -5323,6 +5345,374 @@ return use
         assert_eq!(
             server.host.snapshot().file_text(&path).as_deref(),
             Some("local x = 2\n"),
+        );
+    }
+
+    // #83: the overlay a self-contained full replace writes for a document
+    // the client never opened is an *orphan* — no `didOpen` happened, so no
+    // `didClose` will ever arrive to drop it, and `file_text` prefers the
+    // overlay over disk for the life of the session. Every later
+    // authoritative disk update — the `workspace/didChangeWatchedFiles`
+    // arms below — was written for the "open buffer shadows disk" case and
+    // skipped the orphan the same way, so the unopened buffer shadowed disk
+    // permanently. The rule: an authoritative watched-file event retires an
+    // orphan overlay; a genuinely open document's overlay is untouched.
+
+    /// The acceptance case: full replace with no `didOpen`, then the file
+    /// changes on disk and the client reports it. Disk wins.
+    #[test]
+    fn a_watched_change_retires_an_unopened_full_replace_overlay() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("orphan.lua");
+        fs::write(&path, "local disk = 1\n").expect("write");
+        server.bootstrap();
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": uri.to_string(), "version": 2 },
+                    "contentChanges": [{ "text": "local overlay = 1\n" }],
+                }),
+            })
+            .expect("didChange");
+        assert_eq!(
+            server.host.snapshot().file_text(&path).as_deref(),
+            Some("local overlay = 1\n"),
+            "the full replace is still self-contained and still applies"
+        );
+        drop(drain(&client));
+
+        fs::write(&path, "local disk = 2\n").expect("rewrite");
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({
+                    "changes": [{ "uri": uri.to_string(), "type": 2 }],
+                }),
+            })
+            .expect("didChangeWatchedFiles");
+
+        assert_eq!(
+            server.host.snapshot().file_text(&path).as_deref(),
+            Some("local disk = 2\n"),
+            "an orphan overlay must not permanently shadow disk"
+        );
+        let messages = drain(&client);
+        assert!(
+            published_diagnostics(&messages, &uri).is_some(),
+            "and the retired document is republished from disk: {messages:?}"
+        );
+    }
+
+    /// Review correction: retirement must not race ahead of the disk read
+    /// it is meant to be authoritative *from*. A `CHANGED` event whose
+    /// `fs::read_to_string` fails (the file does not exist, here — the
+    /// unreadable case in general) has produced no disk state to make the
+    /// orphan stale with, so the overlay must survive it untouched. A later
+    /// `CHANGED` event for the same path that *does* read successfully then
+    /// retires it, same as any other successful watched read.
+    #[test]
+    fn an_unreadable_watched_file_preserves_its_orphan_overlay() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("orphan.lua");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": uri.to_string(), "version": 2 },
+                    "contentChanges": [{ "text": "local overlay = 1\n" }],
+                }),
+            })
+            .expect("didChange");
+        drop(drain(&client));
+
+        // No `fs::write` here — the path does not exist on disk, so the
+        // watched read below fails.
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({
+                    "changes": [{ "uri": uri.to_string(), "type": 2 }],
+                }),
+            })
+            .expect("didChangeWatchedFiles");
+        assert_eq!(
+            server.host.snapshot().file_text(&path).as_deref(),
+            Some("local overlay = 1\n"),
+            "a failed read has no authoritative disk state to retire the \
+             orphan with"
+        );
+
+        // Now the file exists, and a subsequent `CHANGED` event reads it
+        // successfully — the deferred retirement happens on this pass.
+        fs::write(&path, "local disk = 2\n").expect("write");
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({
+                    "changes": [{ "uri": uri.to_string(), "type": 2 }],
+                }),
+            })
+            .expect("didChangeWatchedFiles");
+        assert_eq!(
+            server.host.snapshot().file_text(&path).as_deref(),
+            Some("local disk = 2\n"),
+            "a later successful read still retires the orphan"
+        );
+    }
+
+    /// The deletion/recreation pair, on a document that only ever existed as
+    /// an orphan overlay. `DELETED` blanks it (nothing on disk declares
+    /// anything any more) and `CREATED` reflects what was actually written.
+    #[test]
+    fn a_watched_delete_then_create_retires_an_unopened_full_replace_overlay() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("orphan.lua");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": uri.to_string(), "version": 2 },
+                    "contentChanges": [{ "text": "local overlay = 1\n" }],
+                }),
+            })
+            .expect("didChange");
+        drop(drain(&client));
+
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({
+                    "changes": [{ "uri": uri.to_string(), "type": 3 }],
+                }),
+            })
+            .expect("didChangeWatchedFiles");
+        assert_eq!(
+            server.host.snapshot().file_text(&path).as_deref(),
+            Some(""),
+            "a delete must reach through the orphan overlay, not stop at it"
+        );
+        drop(drain(&client));
+
+        fs::write(&path, "local disk = 3\n").expect("recreate");
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({
+                    "changes": [{ "uri": uri.to_string(), "type": 1 }],
+                }),
+            })
+            .expect("didChangeWatchedFiles");
+        assert_eq!(
+            server.host.snapshot().file_text(&path).as_deref(),
+            Some("local disk = 3\n"),
+            "the recreated file is what the workspace sees"
+        );
+    }
+
+    /// The delete/recreate control for a *genuinely open* document: its
+    /// overlay is not an orphan, so it must survive both watched-file
+    /// events untouched, the same as the single-`CHANGED`-event control
+    /// below — the file being fully gone and coming back on disk in the
+    /// meantime changes nothing about whose text the buffer shows.
+    #[test]
+    fn a_watched_delete_then_create_leaves_an_open_documents_overlay_alone() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("open.lua");
+        fs::write(&path, "local disk = 1\n").expect("write");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": uri.to_string(),
+                        "languageId": "lua",
+                        "version": 1,
+                        "text": "local unsaved = 1\n",
+                    },
+                }),
+            })
+            .expect("didOpen");
+        drop(drain(&client));
+
+        fs::remove_file(&path).expect("delete");
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({
+                    "changes": [{ "uri": uri.to_string(), "type": 3 }],
+                }),
+            })
+            .expect("didChangeWatchedFiles");
+        assert_eq!(
+            server.host.snapshot().file_text(&path).as_deref(),
+            Some("local unsaved = 1\n"),
+            "an open buffer's unsaved text survives its backing file being \
+             deleted on disk"
+        );
+        drop(drain(&client));
+
+        fs::write(&path, "local disk = 2\n").expect("recreate");
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({
+                    "changes": [{ "uri": uri.to_string(), "type": 1 }],
+                }),
+            })
+            .expect("didChangeWatchedFiles");
+        assert_eq!(
+            server.host.snapshot().file_text(&path).as_deref(),
+            Some("local unsaved = 1\n"),
+            "and survives the file being recreated too"
+        );
+    }
+
+    /// The one-variable control: a *genuinely open* document's overlay is
+    /// what the user is looking at, and no watched-file event may blank it
+    /// out from under them — the #83 fix retires orphans only.
+    #[test]
+    fn a_watched_change_leaves_an_open_documents_overlay_alone() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("open.lua");
+        fs::write(&path, "local disk = 1\n").expect("write");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": uri.to_string(),
+                        "languageId": "lua",
+                        "version": 1,
+                        "text": "local unsaved = 1\n",
+                    },
+                }),
+            })
+            .expect("didOpen");
+        drop(drain(&client));
+
+        fs::write(&path, "local disk = 2\n").expect("rewrite");
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({
+                    "changes": [{ "uri": uri.to_string(), "type": 2 }],
+                }),
+            })
+            .expect("didChangeWatchedFiles");
+
+        assert_eq!(
+            server.host.snapshot().file_text(&path).as_deref(),
+            Some("local unsaved = 1\n"),
+            "an open buffer's unsaved text survives an external write"
+        );
+    }
+
+    /// A `didOpen` *after* an orphan full replace hands the document's
+    /// lifecycle back to the client: it is a real buffer now, so a watched
+    /// change must not retire the overlay it opened with.
+    #[test]
+    fn a_did_open_after_a_full_replace_makes_the_overlay_the_clients_again() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("orphan.lua");
+        fs::write(&path, "local disk = 1\n").expect("write");
+        let uri = crate::uri::path_to_uri(&path);
+        server
+            .handle_notification(Notification {
+                method: DidChangeTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": uri.to_string(), "version": 2 },
+                    "contentChanges": [{ "text": "local overlay = 1\n" }],
+                }),
+            })
+            .expect("didChange");
+        server
+            .handle_notification(Notification {
+                method: DidOpenTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": uri.to_string(),
+                        "languageId": "lua",
+                        "version": 3,
+                        "text": "local opened = 1\n",
+                    },
+                }),
+            })
+            .expect("didOpen");
+        drop(drain(&client));
+
+        fs::write(&path, "local disk = 2\n").expect("rewrite");
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({
+                    "changes": [{ "uri": uri.to_string(), "type": 2 }],
+                }),
+            })
+            .expect("didChangeWatchedFiles");
+
+        assert_eq!(
+            server.host.snapshot().file_text(&path).as_deref(),
+            Some("local opened = 1\n"),
+            "the document is open now; its overlay is not an orphan"
+        );
+    }
+
+    /// The unused half of the same bookkeeping: after `didClose` the
+    /// document is neither open nor an orphan, so a later full replace makes
+    /// it an orphan again and a watched change still retires it. Guards
+    /// against tracking that only ever grows.
+    #[test]
+    fn a_full_replace_after_a_did_close_is_an_orphan_again() {
+        let (dir, mut server, client) = test_server();
+        let path = dir.path().join("cycled.lua");
+        fs::write(&path, "local disk = 1\n").expect("write");
+        let uri = crate::uri::path_to_uri(&path);
+        for method in [DidOpenTextDocument::METHOD, DidCloseTextDocument::METHOD] {
+            server
+                .handle_notification(Notification {
+                    method: method.to_string(),
+                    params: json!({
+                        "textDocument": {
+                            "uri": uri.to_string(),
+                            "languageId": "lua",
+                            "version": 1,
+                            "text": "local opened = 1\n",
+                        },
+                    }),
+                })
+                .expect("open/close");
+        }
+        server
+            .handle_notification(Notification {
+                method: DidChangeTextDocument::METHOD.to_string(),
+                params: json!({
+                    "textDocument": { "uri": uri.to_string(), "version": 2 },
+                    "contentChanges": [{ "text": "local overlay = 1\n" }],
+                }),
+            })
+            .expect("didChange");
+        drop(drain(&client));
+
+        fs::write(&path, "local disk = 2\n").expect("rewrite");
+        server
+            .handle_notification(Notification {
+                method: DidChangeWatchedFiles::METHOD.to_string(),
+                params: json!({
+                    "changes": [{ "uri": uri.to_string(), "type": 2 }],
+                }),
+            })
+            .expect("didChangeWatchedFiles");
+
+        assert_eq!(
+            server.host.snapshot().file_text(&path).as_deref(),
+            Some("local disk = 2\n"),
+            "a closed document's later full replace is an orphan like any other"
         );
     }
 
