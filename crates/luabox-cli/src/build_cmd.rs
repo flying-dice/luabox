@@ -420,8 +420,8 @@ fn lower_one(
             // above drop them: their ranges index the lowered text, and the
             // renderer would resolve `rel` against the *source* on disk.
             if parse.errors().is_empty() {
-                let lowered_hir = luabox_hir::lower(&parse);
-                for finding in luabox_hir::validate::control_flow(rel, &lowered_hir, target) {
+                let artifacts = luabox_types::FileArtifacts::new(&parse);
+                for finding in artifacts.control_flow(rel, target) {
                     residual = true;
                     diags.push(Diagnostic::error(finding.code, finding.message).with_note(
                         format!(
